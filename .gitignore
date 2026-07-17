@@ -2,17 +2,25 @@
 /target
 **/*.rs.bk
 
-# Secrets and local config (never commit)
+# Secrets and local environment (never commit)
 .env
+.env.*
 *.env
 /etc/propolis/
+*.pem
+*.key
 
-# Runtime artifacts
+# Runtime artifacts and local data
 /feed
+/data
 *.db
 *.db-wal
 *.db-shm
 
-# OS / editor
+# OS and editor
 .DS_Store
+Thumbs.db
 *.swp
+*~
+.idea/
+.vscode/

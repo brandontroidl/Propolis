@@ -1,0 +1,18 @@
+# Rust build
+/target
+**/*.rs.bk
+
+# Secrets and local config (never commit)
+.env
+*.env
+/etc/propolis/
+
+# Runtime artifacts
+/feed
+*.db
+*.db-wal
+*.db-shm
+
+# OS / editor
+.DS_Store
+*.swp

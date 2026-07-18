@@ -24,7 +24,7 @@
 //!
 //! ## Frozen field order and encoding
 //!
-//! 1. `source_ip`  - `to_string()` bytes, length-prefixed (u32 LE length + bytes).
+//! 1. `source_ip`  - `to_string()` bytes, length-prefixed (u64 LE length + bytes).
 //! 2. `wan_ip`     - presence byte (`0` = `None`, `1` = `Some`), then if
 //!    present, `to_string()` bytes, length-prefixed.
 //! 3. `sensor`     - UTF-8 bytes, length-prefixed.
@@ -50,13 +50,17 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::types::EventInput;
 
-/// Appends `bytes` to `buf` preceded by its length as a little-endian `u32`.
+/// Appends `bytes` to `buf` preceded by its length as a little-endian `u64`.
 ///
 /// This is the framing primitive that keeps variable-length fields from
 /// blurring together: a reader (or another encoder) always knows exactly
-/// how many bytes belong to this field before the next one starts.
+/// how many bytes belong to this field before the next one starts. The
+/// length prefix is `u64` (not `u32`) so that a field at or beyond 4 GiB
+/// cannot silently wrap and collide with a shorter field's encoding;
+/// `bytes.len()` is `usize`, and the `as u64` cast is lossless on every
+/// platform we support (no 128-bit-pointer targets).
 fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
     buf.extend_from_slice(bytes);
 }
 
@@ -177,6 +181,34 @@ mod tests {
         let mut e2 = e.clone();
         e2.wan_ip = Some("203.0.113.50".parse().unwrap());
         assert_ne!(chain_hash(None, &e), chain_hash(None, &e2));
+    }
+
+    /// Pins the exact frozen-encoding output for a fixed `EventInput`.
+    ///
+    /// golden vector - if this changes, the frozen encoding changed; that
+    /// breaks all chains and must be a deliberate, documented decision.
+    #[test]
+    fn golden_chain_hash_is_stable() {
+        let event = EventInput::from_signal(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            "sensor-golden".into(),
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            "2026-07-17T00:00:00Z".parse().unwrap(),
+            serde_json::json!({}),
+        );
+
+        let hash = chain_hash(None, &event);
+
+        let expected: [u8; 32] = [
+            117, 64, 177, 139, 8, 38, 105, 160, 97, 173, 48, 168, 50, 243, 227, 136, 125, 143,
+            174, 61, 242, 91, 114, 102, 155, 19, 250, 105, 18, 25, 120, 100,
+        ];
+
+        let hex_string: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(hash, expected, "golden hash mismatch - hex: {}", hex_string);
     }
 
     proptest! {

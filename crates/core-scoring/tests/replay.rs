@@ -8,7 +8,7 @@
 use core_scoring::domain::enums::{Protocol, SignalType};
 use core_scoring::domain::types::EventInput;
 use core_scoring::repository::{
-    append_event, read_stored_score, rebuild_projection, verify_chain, ChainStatus, RepoError,
+    ChainStatus, RepoError, append_event, read_stored_score, rebuild_projection, verify_chain,
 };
 
 use chrono::Utc;
@@ -103,11 +103,16 @@ async fn replay_equals_incremental(pool: PgPool) -> Result<(), RepoError> {
         append_event(&pool, e).await?;
     }
     let ip = IP.parse().unwrap();
-    let stored = read_stored_score(&pool, ip).await?.expect("projection row exists");
+    let stored = read_stored_score(&pool, ip)
+        .await?
+        .expect("projection row exists");
     let replayed = rebuild_projection(&pool, ip).await?;
 
     // Full field equality: replay must equal the incrementally-stored row.
-    assert_eq!(replayed, stored, "replay must equal the incremental projection");
+    assert_eq!(
+        replayed, stored,
+        "replay must equal the incremental projection"
+    );
     // Belt-and-suspenders on the fields the stream was designed to exercise.
     assert_eq!(replayed.raw_score, stored.raw_score);
     assert_eq!(replayed.category_breakdown, stored.category_breakdown);
@@ -116,8 +121,14 @@ async fn replay_equals_incremental(pool: PgPool) -> Result<(), RepoError> {
     assert_eq!(replayed.distinct_categories, stored.distinct_categories);
     assert_eq!(replayed.max_confidence, stored.max_confidence);
     assert_eq!(replayed.eligible, stored.eligible);
-    assert_eq!(replayed.recommended_for_vendor, stored.recommended_for_vendor);
-    assert_eq!(replayed.recommended_for_blocklist, stored.recommended_for_blocklist);
+    assert_eq!(
+        replayed.recommended_for_vendor,
+        stored.recommended_for_vendor
+    );
+    assert_eq!(
+        replayed.recommended_for_blocklist,
+        stored.recommended_for_blocklist
+    );
     assert_eq!(replayed.tier, stored.tier);
     assert_eq!(replayed.distinct_wan_count, 3, "A, B, C authenticated /24s");
     assert_eq!(replayed.distinct_sensor_count, 3, "s1, s2, s3");
@@ -151,7 +162,9 @@ async fn intact_chain_verifies(pool: PgPool) -> Result<(), RepoError> {
 /// `Broken` on this untampered chain. The fix normalizes `observed_at` to
 /// microseconds BEFORE both hashing and inserting, so the two agree.
 #[sqlx::test(migrations = "./migrations")]
-async fn verify_chain_intact_with_sub_microsecond_timestamps(pool: PgPool) -> Result<(), RepoError> {
+async fn verify_chain_intact_with_sub_microsecond_timestamps(
+    pool: PgPool,
+) -> Result<(), RepoError> {
     // Deterministic sub-µs value: 789 ns beyond the microsecond boundary.
     let mut e0 = ev(
         "2026-07-17T00:00:00Z",

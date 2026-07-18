@@ -7,7 +7,7 @@
 
 use core_scoring::domain::enums::{Protocol, SignalType};
 use core_scoring::domain::types::EventInput;
-use core_scoring::repository::{append_event, read_score, RepoError};
+use core_scoring::repository::{RepoError, append_event, read_score};
 
 use rust_decimal_macros::dec;
 use sqlx::PgPool;
@@ -52,7 +52,11 @@ fn honeypot_input(ip: &str, ts: &str, weight: u32) -> EventInput {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn append_updates_projection_atomically(pool: PgPool) -> Result<(), RepoError> {
-    let s = append_event(&pool, auth_honeypot_input("203.0.113.7", "2026-07-17T00:00:00Z")).await?;
+    let s = append_event(
+        &pool,
+        auth_honeypot_input("203.0.113.7", "2026-07-17T00:00:00Z"),
+    )
+    .await?;
     assert_eq!(s.event_count, 1);
     assert!(s.has_confirmed_real);
     Ok(())
@@ -79,10 +83,18 @@ async fn double_decay_guard_across_one_half_life(pool: PgPool) -> Result<(), Rep
     // event A at t0; READ at t0+6h (projects raw to ~half); event B at t0+6h.
     // The write path for B must read the UN-projected stored raw, not the
     // read-projected one.
-    let _a = append_event(&pool, honeypot_input("203.0.113.7", "2026-07-17T00:00:00Z", 40)).await?;
+    let _a = append_event(
+        &pool,
+        honeypot_input("203.0.113.7", "2026-07-17T00:00:00Z", 40),
+    )
+    .await?;
     // A pure read in between must NOT persist the projected value.
     let _ = read_score(&pool, "203.0.113.7".parse().unwrap()).await?;
-    let b = append_event(&pool, honeypot_input("203.0.113.7", "2026-07-17T06:00:00Z", 40)).await?;
+    let b = append_event(
+        &pool,
+        honeypot_input("203.0.113.7", "2026-07-17T06:00:00Z", 40),
+    )
+    .await?;
     // stored raw at B = decay(40, 6h) + 40 = 20 + 40 = 60 (NOT decay(decay(40)) + 40).
     assert!((b.raw_score - dec!(60)).abs() < dec!(0.01));
     Ok(())
@@ -97,11 +109,31 @@ async fn double_decay_guard_across_one_half_life(pool: PgPool) -> Result<(), Rep
 /// argued from the module-level doc comment and code inspection.
 #[sqlx::test(migrations = "./migrations")]
 async fn ledger_chain_is_linear_after_multiple_appends(pool: PgPool) -> Result<(), RepoError> {
-    append_event(&pool, honeypot_input("203.0.113.7", "2026-07-17T00:00:00Z", 40)).await?;
-    append_event(&pool, auth_honeypot_input("198.51.100.9", "2026-07-17T00:01:00Z")).await?;
-    append_event(&pool, honeypot_input("203.0.113.7", "2026-07-17T00:02:00Z", 50)).await?;
-    append_event(&pool, honeypot_input("198.51.100.9", "2026-07-17T00:03:00Z", 60)).await?;
-    append_event(&pool, honeypot_input("203.0.113.7", "2026-07-17T00:04:00Z", 70)).await?;
+    append_event(
+        &pool,
+        honeypot_input("203.0.113.7", "2026-07-17T00:00:00Z", 40),
+    )
+    .await?;
+    append_event(
+        &pool,
+        auth_honeypot_input("198.51.100.9", "2026-07-17T00:01:00Z"),
+    )
+    .await?;
+    append_event(
+        &pool,
+        honeypot_input("203.0.113.7", "2026-07-17T00:02:00Z", 50),
+    )
+    .await?;
+    append_event(
+        &pool,
+        honeypot_input("198.51.100.9", "2026-07-17T00:03:00Z", 60),
+    )
+    .await?;
+    append_event(
+        &pool,
+        honeypot_input("203.0.113.7", "2026-07-17T00:04:00Z", 70),
+    )
+    .await?;
 
     let rows: Vec<(Option<Vec<u8>>, Vec<u8>)> =
         sqlx::query_as("SELECT prev_hash, hash FROM event ORDER BY id")

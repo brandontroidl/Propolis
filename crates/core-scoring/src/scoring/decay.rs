@@ -22,8 +22,8 @@ pub fn decay(prev: Decimal, elapsed_seconds: i64, half_life_seconds: i64) -> Dec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
     use proptest::prelude::*;
+    use rust_decimal_macros::dec;
 
     #[test]
     fn clamps_nonpositive_elapsed() {

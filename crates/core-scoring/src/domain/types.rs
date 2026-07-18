@@ -111,9 +111,15 @@ mod tests {
     #[test]
     fn from_signal_fills_weight_confidence_category_from_table() {
         let e = EventInput::from_signal(
-            "203.0.113.7".parse().unwrap(), None, "sensor-a".into(),
-            SignalType::HoneypotCommandExec, Protocol::Tcp, true,
-            "2026-07-17T00:00:00Z".parse().unwrap(), serde_json::json!({}));
+            "203.0.113.7".parse().unwrap(),
+            None,
+            "sensor-a".into(),
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            "2026-07-17T00:00:00Z".parse().unwrap(),
+            serde_json::json!({}),
+        );
         assert_eq!(e.weight, 60);
         assert_eq!(e.confidence, dec!(0.950));
         assert_eq!(e.category, Category::Honeypot);
@@ -124,7 +130,10 @@ mod tests {
     fn validate_rejects_out_of_range_confidence() {
         let mut e = sample_event();
         e.confidence = dec!(1.5);
-        assert!(matches!(e.validate(), Err(ValidationError::ConfidenceOutOfRange)));
+        assert!(matches!(
+            e.validate(),
+            Err(ValidationError::ConfidenceOutOfRange)
+        ));
     }
 
     #[test]

@@ -12,3 +12,6 @@ pub const BREADTH_PER_WAN: Decimal = dec!(0.15);
 
 /// Upper bound on the breadth-factor bonus (i.e. factor saturates at `1 + BREADTH_CAP`).
 pub const BREADTH_CAP: Decimal = dec!(0.60);
+
+/// Minimum effective score to qualify for blocklist recommendation.
+pub const BLOCKLIST_FLOOR: Decimal = dec!(50);

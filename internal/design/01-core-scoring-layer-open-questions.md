@@ -65,7 +65,13 @@ The four are coupled: **Q1→Q2→Q3 form one interlocking package**; Q4 stands 
 The panel went past the 4 knobs into structural refinements the build must absorb:
 1. `distinct_wan_count` **derivation changes** (auth-filter + `/24`/ASN dedupe) — logic, not schema shape;
    raw data already exists in `event.wan_ip` / `event.authenticated`.
-2. `max_confidence` semantics change to live-decayed — logic.
+2. `max_confidence` semantics change to live-decayed — logic. **Refinement ratified 2026-07-17
+   (during build):** the ratified rule ("only events whose decayed weight is still > 0 contribute") is
+   asymptotically vacuous (decay never reaches 0) and the projection stores no per-event confidences, so
+   it is defined concretely as: `category_breakdown` stores per category `{weight, max_confidence}`, and
+   the top-level `max_confidence` is the max over categories whose decayed weight exceeds the 0.5 live
+   floor (same floor as `distinct_categories`) of that category's stored max confidence. Category-
+   granularity, JSONB-content only (no SQL schema change). Folded into `01-core-scoring-layer.md`.
 3. **`ip_score` frozen shape amends additively:** the single `recommended BOOLEAN` splits into
    `recommended_for_vendor` + `recommended_for_blocklist`; add `BLOCKLIST_FLOOR` as a fixed constant.
    This is an additive amendment to `internal/architecture/frozen-contracts.md` and needs sign-off.

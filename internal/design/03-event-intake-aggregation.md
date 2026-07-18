@@ -12,7 +12,7 @@ One shared score, not per-node scores. Breadth across the operator's WAN IPs rai
 
 ## Dependencies
 
-Sub-project 1 (core spine): the ledger, scoring, and breadth model. Sub-project 2 (sensor framework): the signed-event producers this layer consumes.
+Sub-project 1 (core scoring layer): the ledger, scoring, and breadth model. Sub-project 2 (sensor framework): the signed-event producers this layer consumes.
 
 ## Key open questions
 

@@ -12,7 +12,7 @@ Give the pipeline a non-spoofable leg. The catch-all supplies breadth signal; th
 
 ## Dependencies
 
-Sub-project 1 (core spine): the event schema, signal categories, and hash-chained ledger the sensors target.
+Sub-project 1 (core scoring layer): the event schema, signal categories, and hash-chained ledger the sensors target.
 
 ## Key open questions
 

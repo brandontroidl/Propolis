@@ -1,4 +1,4 @@
-# 05 - Feed builder + exporters + publisher
+# 05 - Blocklist feed builder + exporters + publisher
 
 Status: design pending (not yet brainstormed)
 
@@ -12,7 +12,7 @@ Publish only what the operator has approved, in a form that cannot collateral-bl
 
 ## Dependencies
 
-Sub-project 1 (core spine): the score and snapshot the builder reads. Sub-project 4 (review + reporting): the approved-IP set that is the feed's only source.
+Sub-project 1 (core scoring layer): the score and snapshot the builder reads. Sub-project 4 (review + reporting): the approved-IP set that is the feed's only source.
 
 ## Key open questions
 

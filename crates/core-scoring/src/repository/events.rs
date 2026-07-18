@@ -36,7 +36,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use sqlx::{PgPool, Postgres, Row};
 
 use crate::domain::enums::Category;
@@ -92,6 +92,34 @@ const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
 pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, RepoError> {
     // 1. Validate first: a malformed event writes NOTHING (no tx opened).
     event.validate()?;
+
+    // 1b. Normalize the storage-lossy fields to their STORED precision BEFORE
+    // both hashing and inserting, so the bytes we hash are byte-identical to the
+    // bytes storage returns on read. `verify_chain` reconstructs each event FROM
+    // storage and re-hashes; if we hashed a value more precise than the column
+    // can hold, the re-hash would never match and an UNTAMPERED chain would
+    // falsely verify as `Broken`. The principle is "hash what you store":
+    //   - `observed_at` is `TIMESTAMPTZ` (microsecond precision) -> truncate the
+    //     sub-µs nanoseconds so the inserted value already carries no precision
+    //     the column would drop (e.g. a raw `Utc::now()` carries nanoseconds).
+    //   - `confidence` is `NUMERIC(4,3)` (scale 3) -> round to 3 decimal places
+    //     so the inserted value already has the scale the column returns.
+    //   - `metadata` is `JSONB` and is intentionally NOT rewritten here: the
+    //     documented canonical metadata form (JSON integers, strings, and nested
+    //     objects/arrays thereof) round-trips unchanged, because sqlx re-parses
+    //     stored `JSONB` into a `BTreeMap`-backed `serde_json::Value` whose
+    //     lexicographic key order already matches the in-memory value's (this
+    //     crate does not enable serde_json's `preserve_order`). Floating-point
+    //     JSON numbers are NOT guaranteed stable across the `JSONB` round-trip
+    //     and are outside that canonical form. Verified by
+    //     `verify_chain_intact_with_rich_metadata`.
+    // `canonical_bytes`/`chain_hash` stay unchanged (deterministic already);
+    // normalization belongs here at the append boundary.
+    let event = EventInput {
+        observed_at: event.observed_at.trunc_subsecs(6),
+        confidence: event.confidence.round_dp(3),
+        ..event
+    };
 
     let mut tx = pool.begin().await?;
 

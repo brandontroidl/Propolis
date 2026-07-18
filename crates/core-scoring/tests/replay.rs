@@ -11,6 +11,7 @@ use core_scoring::repository::{
     append_event, read_stored_score, rebuild_projection, verify_chain, ChainStatus, RepoError,
 };
 
+use chrono::Utc;
 use sqlx::PgPool;
 
 const IP: &str = "203.0.113.7";
@@ -135,6 +136,70 @@ async fn intact_chain_verifies(pool: PgPool) -> Result<(), RepoError> {
     for e in sample_stream() {
         append_event(&pool, e).await?;
     }
+    assert_eq!(verify_chain(&pool).await?, ChainStatus::Intact);
+    Ok(())
+}
+
+/// An untampered chain whose events carry SUB-MICROSECOND `observed_at`
+/// precision still verifies as `Intact`.
+///
+/// The `observed_at` column is `TIMESTAMPTZ` (microsecond precision), so a
+/// nanosecond-precision timestamp is lossily truncated on write. Before the
+/// storage-normalization fix, `append_event` hashed the full-precision
+/// in-memory value but stored the truncated one, so `verify_chain` (which
+/// re-hashes from storage) recomputed a different hash and falsely reported
+/// `Broken` on this untampered chain. The fix normalizes `observed_at` to
+/// microseconds BEFORE both hashing and inserting, so the two agree.
+#[sqlx::test(migrations = "./migrations")]
+async fn verify_chain_intact_with_sub_microsecond_timestamps(pool: PgPool) -> Result<(), RepoError> {
+    // Deterministic sub-µs value: 789 ns beyond the microsecond boundary.
+    let mut e0 = ev(
+        "2026-07-17T00:00:00Z",
+        SignalType::HoneypotCommandExec,
+        Some("198.51.100.1"),
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    e0.observed_at = "2026-07-17T00:00:00.123456789Z".parse().unwrap();
+    append_event(&pool, e0).await?;
+
+    // A realistic sub-µs source: the system clock on this platform carries
+    // nanosecond resolution, so `Utc::now()` routinely has sub-µs digits.
+    let mut e1 = ev(
+        "2026-07-17T00:00:30Z",
+        SignalType::HoneypotLoginAttempt,
+        Some("198.51.100.1"),
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    e1.observed_at = Utc::now();
+    append_event(&pool, e1).await?;
+
+    assert_eq!(verify_chain(&pool).await?, ChainStatus::Intact);
+    Ok(())
+}
+
+/// An untampered chain whose event carries nested / numeric / string metadata
+/// still verifies as `Intact`, exercising the `JSONB` round-trip: the bytes
+/// hashed at append time must equal the bytes `verify_chain` re-hashes after
+/// reading the value back out of `JSONB`.
+#[sqlx::test(migrations = "./migrations")]
+async fn verify_chain_intact_with_rich_metadata(pool: PgPool) -> Result<(), RepoError> {
+    let mut e = ev(
+        "2026-07-17T00:00:00Z",
+        SignalType::HoneypotCommandExec,
+        Some("198.51.100.1"),
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    // Out-of-order keys, nesting, integers, strings, and an array: covers the
+    // documented canonical metadata form (integers/strings/nested objects and
+    // arrays thereof).
+    e.metadata = serde_json::json!({"z": 1, "a": {"n": 42, "s": "x"}, "list": [3, 2, 1]});
+    append_event(&pool, e).await?;
     assert_eq!(verify_chain(&pool).await?, ChainStatus::Intact);
     Ok(())
 }

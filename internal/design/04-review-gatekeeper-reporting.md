@@ -12,7 +12,7 @@ Turn a recommended IP into a ratified report without ever auto-firing. The queue
 
 ## Dependencies
 
-Sub-project 1 (core spine): the score, snapshot, and eligibility/weight/recommendation model the queue reads.
+Sub-project 1 (core scoring layer): the score, snapshot, and eligibility/weight/recommendation model the queue reads.
 
 ## Key open questions
 

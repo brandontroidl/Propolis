@@ -101,9 +101,10 @@ fn reconstruct_event(row: &PgRow) -> Result<EventInput, RepoError> {
 /// event. Returns the final projection, anchored (like the stored row) at the
 /// last event's `observed_at`.
 ///
-/// Fails closed with [`RepoError::Corrupt`] if the source has no events (there
-/// is no projection to rebuild) or a stored value cannot be parsed.
-pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<IpScore, RepoError> {
+/// Returns `Ok(None)` if the source has no events (nothing to rebuild, matching
+/// `read_score`); fails closed with [`RepoError::Corrupt`] only if a stored value
+/// cannot be parsed.
+pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<Option<IpScore>, RepoError> {
     let rows = sqlx::query(
         "SELECT host(source_ip) AS source_ip, host(wan_ip) AS wan_ip, sensor, signal_type, \
                 protocol, authenticated, category, weight, confidence, observed_at, metadata \
@@ -114,9 +115,7 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<IpScore, Re
     .await?;
 
     if rows.is_empty() {
-        return Err(RepoError::Corrupt(format!(
-            "no events to replay for source {ip}"
-        )));
+        return Ok(None);
     }
 
     let events: Vec<EventInput> = rows
@@ -179,7 +178,7 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<IpScore, Re
     }
 
     // Non-empty by the guard above, so the fold always produced a value.
-    Ok(acc.expect("non-empty ledger yields a projection"))
+    Ok(acc)
 }
 
 /// Verify the whole-ledger hash chain, tamper-evidently.

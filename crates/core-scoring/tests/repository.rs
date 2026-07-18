@@ -87,3 +87,39 @@ async fn double_decay_guard_across_one_half_life(pool: PgPool) -> Result<(), Rep
     assert!((b.raw_score - dec!(60)).abs() < dec!(0.01));
     Ok(())
 }
+
+/// The hash chain is unbroken after several appends across multiple sources:
+/// row 1 has no predecessor, and every later row's `prev_hash` equals the
+/// immediately prior row's `hash`, in `id` order. This verifies chain
+/// linkage deterministically (single-threaded, sequential appends); it does
+/// not attempt to exercise concurrent appends, which is inherently flaky —
+/// the advisory lock that prevents forking under concurrency is instead
+/// argued from the module-level doc comment and code inspection.
+#[sqlx::test(migrations = "./migrations")]
+async fn ledger_chain_is_linear_after_multiple_appends(pool: PgPool) -> Result<(), RepoError> {
+    append_event(&pool, honeypot_input("203.0.113.7", "2026-07-17T00:00:00Z", 40)).await?;
+    append_event(&pool, auth_honeypot_input("198.51.100.9", "2026-07-17T00:01:00Z")).await?;
+    append_event(&pool, honeypot_input("203.0.113.7", "2026-07-17T00:02:00Z", 50)).await?;
+    append_event(&pool, honeypot_input("198.51.100.9", "2026-07-17T00:03:00Z", 60)).await?;
+    append_event(&pool, honeypot_input("203.0.113.7", "2026-07-17T00:04:00Z", 70)).await?;
+
+    let rows: Vec<(Option<Vec<u8>>, Vec<u8>)> =
+        sqlx::query_as("SELECT prev_hash, hash FROM event ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(rows.len(), 5);
+    assert!(rows[0].0.is_none(), "first row must have no predecessor");
+    for i in 1..rows.len() {
+        let (prev_hash_i, _) = &rows[i];
+        let (_, hash_prior) = &rows[i - 1];
+        assert_eq!(
+            prev_hash_i.as_deref(),
+            Some(hash_prior.as_slice()),
+            "row {i}'s prev_hash must equal row {}'s hash",
+            i - 1
+        );
+    }
+    Ok(())
+}

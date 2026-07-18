@@ -5,6 +5,33 @@
 //! we never depend on an INET/ipnetwork type mapping. All queries use the
 //! RUNTIME `sqlx::query*` API (not the compile-time macros) so the build does
 //! not require a live database or an offline cache.
+//!
+//! # Single-writer model
+//!
+//! `append_event` serializes ALL appends against a single, transaction-scoped
+//! Postgres advisory lock (`pg_advisory_xact_lock`, keyed on
+//! [`APPEND_LOCK_KEY`]). The lock is acquired as the first statement inside
+//! the transaction, before the chain-head read, so the chain-head read +
+//! event INSERT + projection read + `ip_score` UPSERT all execute as one
+//! serialized critical section. This guarantees, under any number of
+//! concurrent callers:
+//!
+//! - the tamper-evident hash chain cannot fork (no two appends can read the
+//!   same `prev_hash` and both insert against it);
+//! - the `ip_score` projection UPSERT cannot lose an update to a
+//!   last-write-wins race;
+//! - the dedup window read (`MAX(observed_at)` for the same `source_ip` +
+//!   `signal_type`) cannot be bypassed by an interleaved concurrent insert.
+//!
+//! `pg_advisory_xact_lock` auto-releases at transaction end (commit or
+//! rollback), so a failed/rolled-back append never leaves the lock held.
+//!
+//! This implements the design's "projection advancement is single-writer per
+//! deployment" assumption at the database level. It serializes appends within
+//! ONE Postgres instance; it does not decide WHICH process/node is the writer
+//! of record in a multi-node deployment — that is cluster-level leader
+//! election, the responsibility of sub-project 7, layered on top of this
+//! DB-level guard.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -47,6 +74,14 @@ impl From<ValidationError> for RepoError {
     }
 }
 
+/// The single global advisory-lock key used to serialize every call to
+/// `append_event` against every other call, within one Postgres instance.
+/// Fixed and arbitrary (any stable `i64` works); documented here so its
+/// value is never accidentally reused for an unrelated lock. Held for the
+/// lifetime of the append transaction via `pg_advisory_xact_lock`, which
+/// auto-releases on commit or rollback.
+const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
+
 /// Append one event to the ledger and update the `ip_score` projection in a
 /// single transaction, returning the new projection.
 ///
@@ -59,6 +94,16 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     event.validate()?;
 
     let mut tx = pool.begin().await?;
+
+    // 0. Serialize this append against every other concurrent append BEFORE
+    // reading the chain head: this is what turns "read head, insert, read
+    // projection, upsert" into one atomic critical section. See the
+    // module-level "Single-writer model" doc comment for why this is safe
+    // and what it does/does not guarantee across a multi-node deployment.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(APPEND_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
 
     // 2a. Chain head hash (None for the first event ever).
     let prev_head: Option<Vec<u8>> =

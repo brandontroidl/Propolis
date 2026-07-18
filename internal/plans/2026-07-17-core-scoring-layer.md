@@ -12,7 +12,7 @@
 
 - **Language:** Rust 2024 edition; toolchain pinned via `rust-toolchain.toml`. Workspace root at repo root; this crate is `crates/core-scoring`.
 - **Dependency vetting:** frozen-lockfile installs; review the `Cargo.lock` diff; pin versions; confirm each crate's current API against its docs before use (do not code crate APIs from memory). No install scripts run.
-- **No float for scores.** `raw_score`, `confidence`, `max_confidence`, breakdown weights, and the breadth factor use `rust_decimal::Decimal`, never `f64`. Decay's `0.5^x` is computed in `Decimal` or via a checked integer/rational path, never by casting a score through `f64`.
+- **No float for scores.** All stored and accumulated values — `raw_score`, `confidence`, `max_confidence`, breakdown weights, the breadth factor — are `rust_decimal::Decimal`, never `f64`. The ONE permitted `f64` touchpoint is the decay factor's transcendental exponent `0.5^(elapsed/half_life)` (no exact decimal form exists): compute it in `f64`, convert to `Decimal`, multiply into the `Decimal` score. Scores are never accumulated or stored through `f64`. Task 7 documents this as the single sanctioned touchpoint.
 - **Fail closed.** Any error path — DB error, unreadable value, malformed event — leaves an IP NOT eligible and NOT recommended. A guard whose input is absent or unreadable denies.
 - **Append-only ledger.** The `event` repository issues INSERT only; never UPDATE/DELETE in the normal path. Corrections are new appended events.
 - **Data minimization.** `metadata` JSONB holds only sanitized, PII-free content. Passwords/payloads are dropped upstream (at the sensor) and are out of scope here; the repository must not add a code path that could persist them.

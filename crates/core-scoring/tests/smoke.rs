@@ -7,8 +7,8 @@
 //! against.
 
 use core_scoring::{
-    signal_weight, Category, EventInput, FeedTier, IpScore, Protocol, ReviewState, SignalType,
-    ValidationError,
+    Category, EventInput, FeedTier, IpScore, Protocol, ReviewState, SignalType, ValidationError,
+    signal_weight,
 };
 
 #[test]

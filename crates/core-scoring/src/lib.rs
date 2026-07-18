@@ -18,5 +18,7 @@ mod scoring;
 
 pub use domain::enums::{Category, FeedTier, Protocol, ReviewState, SignalType};
 pub use domain::types::{EventInput, IpScore, ValidationError};
-pub use domain::weights::{signal_weight, SignalWeight};
-pub use repository::{append_event, read_score, rebuild_projection, verify_chain, ChainStatus, RepoError};
+pub use domain::weights::{SignalWeight, signal_weight};
+pub use repository::{
+    ChainStatus, RepoError, append_event, read_score, rebuild_projection, verify_chain,
+};

@@ -10,5 +10,5 @@
 pub mod events;
 pub mod replay;
 
-pub use events::{append_event, read_score, read_stored_score, RepoError};
-pub use replay::{rebuild_projection, verify_chain, ChainStatus};
+pub use events::{RepoError, append_event, read_score, read_stored_score};
+pub use replay::{ChainStatus, rebuild_projection, verify_chain};

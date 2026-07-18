@@ -109,10 +109,7 @@ pub fn apply_event(
     let event_count = prev_event_count + 1;
 
     // Step 5: derived facts over the LIVE-decayed breakdown.
-    let distinct_categories = breakdown
-        .values()
-        .filter(|s| s.weight > LIVE_FLOOR)
-        .count() as i32;
+    let distinct_categories = breakdown.values().filter(|s| s.weight > LIVE_FLOOR).count() as i32;
     // Live-decayed confidence: categories whose weight has decayed to/below the
     // floor no longer hold the tier confidence gate open. Empty -> 0 (fail-closed).
     let max_confidence = breakdown

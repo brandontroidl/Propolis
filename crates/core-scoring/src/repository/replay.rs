@@ -136,8 +136,11 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<IpScore, Re
             .filter(|e| e.signal_type == event.signal_type)
             .map(|e| e.observed_at)
             .max();
+        // Symmetric window, mirroring the append path (events.rs) exactly so
+        // replay == incremental: dedup only within DEDUP_WINDOW_SECONDS in either
+        // time direction, never treating a negative (out-of-order) elapsed as a dup.
         let deduped = match prior_observed {
-            Some(prior) => (event.observed_at - prior).num_seconds() <= DEDUP_WINDOW_SECONDS,
+            Some(prior) => (event.observed_at - prior).num_seconds().abs() <= DEDUP_WINDOW_SECONDS,
             None => false,
         };
 

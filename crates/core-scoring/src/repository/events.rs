@@ -190,8 +190,12 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     .bind(new_id)
     .fetch_one(&mut *tx)
     .await?;
+    // Symmetric window: dedup only a same-signal observation within DEDUP_WINDOW_SECONDS in
+    // EITHER time direction. A one-sided `elapsed <= WINDOW` treats any negative elapsed
+    // (an out-of-order/earlier-timestamped event from a buffered or clock-skewed sensor) as a
+    // duplicate and silently drops its weight, suppressing a genuine attacker's score.
     let deduped = match prior_observed {
-        Some(prior) => (event.observed_at - prior).num_seconds() <= DEDUP_WINDOW_SECONDS,
+        Some(prior) => (event.observed_at - prior).num_seconds().abs() <= DEDUP_WINDOW_SECONDS,
         None => false,
     };
 

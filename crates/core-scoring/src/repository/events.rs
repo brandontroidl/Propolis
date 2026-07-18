@@ -261,6 +261,17 @@ pub async fn read_score(pool: &PgPool, ip: IpAddr) -> Result<Option<IpScore>, Re
     Ok(Some(stored))
 }
 
+/// Read the stored `ip_score` row AS STORED - no decay-to-now projection.
+///
+/// Unlike [`read_score`], this returns the raw persisted projection exactly as
+/// the incremental append path last wrote it (its `raw_score` still anchored at
+/// the last event's `observed_at`). This is the correct comparison target for
+/// replay verification: `rebuild_projection` reproduces this stored value, not a
+/// value re-decayed to the current wall clock.
+pub async fn read_stored_score(pool: &PgPool, ip: IpAddr) -> Result<Option<IpScore>, RepoError> {
+    read_stored_ip_score(pool, ip).await
+}
+
 /// Read the stored `ip_score` row AS STORED (no projection), mapping it into an
 /// `IpScore`. Returns `Ok(None)` when absent. Fails closed with
 /// `RepoError::Corrupt` if the stored IP or `category_breakdown` cannot be

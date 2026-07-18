@@ -8,5 +8,7 @@
 //! double-decay guard depends on the stored value staying un-projected.
 
 pub mod events;
+pub mod replay;
 
-pub use events::{append_event, read_score, RepoError};
+pub use events::{append_event, read_score, read_stored_score, RepoError};
+pub use replay::{rebuild_projection, verify_chain, ChainStatus};

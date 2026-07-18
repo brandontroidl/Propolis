@@ -4,6 +4,11 @@ use rust_decimal_macros::dec;
 /// Default half-life for score decay, in seconds (6 hours).
 pub const HALF_LIFE_SECONDS: i64 = 21600;
 
+/// Dedup window, in seconds: a repeat sighting of the same `(source_ip,
+/// signal_type)` within this window records the event but adds no weight.
+/// Chosen default (60s) - a fixed source constant, not runtime-configurable.
+pub const DEDUP_WINDOW_SECONDS: i64 = 60;
+
 /// Upper bound a score is clamped to.
 pub const SCORE_CAP: Decimal = dec!(100);
 

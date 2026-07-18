@@ -59,6 +59,39 @@ async fn verify_chain_intact_with_low_scale_confidence(pool: PgPool) -> Result<(
     Ok(())
 }
 
+/// Two same-signal events 6h apart, appended in REVERSE chronological order (a buffered/skewed
+/// sensor delivering the earlier event second). The second append is 6h from the prior
+/// observation, far outside the 60s dedup window, so it must NOT be deduped — its weight must be
+/// added, not silently dropped (a one-sided `elapsed <= 60` treats any negative elapsed as a dup).
+#[sqlx::test(migrations = "./migrations")]
+async fn out_of_order_event_outside_window_is_not_deduped(pool: PgPool) -> Result<(), RepoError> {
+    let later = ev(
+        "2026-07-17T06:00:00Z",
+        SignalType::SuricataSev1,
+        None,
+        "s1",
+        Protocol::Udp,
+        false,
+    );
+    append_event(&pool, later).await?;
+    let earlier = ev(
+        "2026-07-17T00:00:00Z",
+        SignalType::SuricataSev1,
+        None,
+        "s1",
+        Protocol::Udp,
+        false,
+    );
+    let s = append_event(&pool, earlier).await?;
+    assert_eq!(s.event_count, 2);
+    assert!(
+        s.raw_score > dec!(30),
+        "out-of-order event's weight was dropped: raw_score = {}",
+        s.raw_score
+    );
+    Ok(())
+}
+
 /// A multi-event stream for one source that exercises: a confirmed-real latch,
 /// a within-window dedup (e1 repeats e0's signal_type inside 60s), three
 /// distinct authenticated-TCP WAN vantages across three /24s (breadth), one

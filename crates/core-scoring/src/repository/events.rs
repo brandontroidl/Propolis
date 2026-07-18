@@ -10,10 +10,14 @@
 //!
 //! `append_event` serializes ALL appends against a single, transaction-scoped
 //! Postgres advisory lock (`pg_advisory_xact_lock`, keyed on
-//! [`APPEND_LOCK_KEY`]). The lock is acquired as the first statement inside
-//! the transaction, before the chain-head read, so the chain-head read +
-//! event INSERT + projection read + `ip_score` UPSERT all execute as one
-//! serialized critical section. This guarantees, under any number of
+//! [`APPEND_LOCK_KEY`]). The transaction first pins `READ COMMITTED` isolation
+//! (required for the lock to serialize correctly), then acquires the lock before
+//! the chain-head read, so the chain-head read + event INSERT + projection read +
+//! `ip_score` UPSERT all execute as one serialized critical section. Under READ
+//! COMMITTED each statement takes a fresh snapshot, so once the lock is granted
+//! the chain-head read sees the prior appender's committed row (under REPEATABLE
+//! READ / SERIALIZABLE the snapshot would freeze before the lock and the chain
+//! could fork — hence the explicit pin). This guarantees, under any number of
 //! concurrent callers:
 //!
 //! - the tamper-evident hash chain cannot fork (no two appends can read the
@@ -128,6 +132,17 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     };
 
     let mut tx = pool.begin().await?;
+
+    // Pin READ COMMITTED for this transaction regardless of the server's default
+    // isolation. The advisory-lock serialization below is only correct under READ
+    // COMMITTED, where each statement takes a fresh snapshot so the post-lock
+    // chain-head read sees the prior appender's just-committed row. Under REPEATABLE
+    // READ / SERIALIZABLE the tx snapshot freezes at the first statement (before the
+    // lock is granted), so the head read would miss a concurrent commit and the chain
+    // could fork. Must be the first statement in the transaction.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await?;
 
     // 0. Serialize this append against every other concurrent append BEFORE
     // reading the chain head: this is what turns "read head, insert, read

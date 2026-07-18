@@ -12,6 +12,7 @@ use core_scoring::repository::{
 };
 
 use chrono::Utc;
+use rust_decimal_macros::dec;
 use sqlx::PgPool;
 
 const IP: &str = "203.0.113.7";
@@ -37,6 +38,25 @@ fn ev(
         ts.parse().unwrap(),
         serde_json::json!({}),
     )
+}
+
+/// A caller supplies confidence 0.9 (scale 1), value-equal to HoneypotConnection's table 0.900
+/// (scale 3), so validate() accepts it. The append hash must normalize confidence to scale-3
+/// (matching the NUMERIC(4,3) column) or verify_chain false-breaks on this untampered row.
+#[sqlx::test(migrations = "./migrations")]
+async fn verify_chain_intact_with_low_scale_confidence(pool: PgPool) -> Result<(), RepoError> {
+    let mut e = ev(
+        "2026-07-17T00:00:00Z",
+        SignalType::HoneypotConnection,
+        Some("198.51.100.1"),
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    e.confidence = dec!(0.9);
+    append_event(&pool, e).await?;
+    assert!(matches!(verify_chain(&pool).await?, ChainStatus::Intact));
+    Ok(())
 }
 
 /// A multi-event stream for one source that exercises: a confirmed-real latch,

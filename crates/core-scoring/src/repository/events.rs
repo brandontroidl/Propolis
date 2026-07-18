@@ -115,9 +115,15 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     //     `verify_chain_intact_with_rich_metadata`.
     // `canonical_bytes`/`chain_hash` stay unchanged (deterministic already);
     // normalization belongs here at the append boundary.
+    // Normalize confidence to EXACTLY scale-3 to match the NUMERIC(4,3) column. `round_dp(3)`
+    // only trims excess scale, it never pads (dec!(0.9).round_dp(3) stays "0.9"), so a value-equal
+    // low-scale confidence would hash as "0.9" here but read back as "0.900" from storage and
+    // false-break verify_chain. `rescale(3)` pads (and rounds if >3dp, unreachable after validate()).
+    let mut confidence = event.confidence;
+    confidence.rescale(3);
     let event = EventInput {
         observed_at: event.observed_at.trunc_subsecs(6),
-        confidence: event.confidence.round_dp(3),
+        confidence,
         ..event
     };
 

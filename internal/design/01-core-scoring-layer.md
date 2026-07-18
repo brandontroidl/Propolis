@@ -186,9 +186,11 @@ CREATE TABLE ip_score (
 
 `ip_score` is a derived projection, rebuildable from the ledger. `raw_score` is the stored,
 un-projected value anchored at `decay_anchor`; readers project it to now (see Scoring math).
-`category_breakdown` maps each category to its decayed accumulated weight and is the source of
-the `distinct_categories` count. `tier` is nullable: NULL means "not tiered" and is distinct
-from `aggressive`/`standard`.
+`category_breakdown` maps each category to an object holding both its decayed accumulated weight and
+the maximum confidence seen for that category (JSONB content; no SQL schema change). It is the source
+of the `distinct_categories` count (categories whose decayed weight exceeds 0.5) and of the live-decayed
+`max_confidence` (see Tier gate). `tier` is nullable: NULL means "not tiered" and is distinct from
+`aggressive`/`standard`.
 
 ## Scoring math (recommended, tunable)
 
@@ -319,9 +321,12 @@ STANDARD    if  raw_score >= 75  AND  max_confidence >= 0.70   (tested after AGG
 otherwise   ->  None
 ```
 
-`max_confidence` here is computed over the currently-DECAYED live breakdown (only events whose decayed
-weight is still > 0 contribute), never a sticky lifetime maximum, so a faded high-confidence event
-stops holding a tier open. A score of 92 with confidence 0.80 is STANDARD, not AGGRESSIVE: the
+`max_confidence` here is live-decayed, never a sticky lifetime maximum: it is the maximum, over
+categories whose decayed breakdown weight exceeds the 0.5 live floor (the same floor as
+`distinct_categories`), of that category's stored max confidence. Because decay is asymptotic and never
+reaches exactly 0, the 0.5 floor — not a literal "> 0" — is what makes a category drop out; a category
+that fades below 0.5 stops contributing its confidence, so a faded high-confidence event stops holding a
+tier open. A score of 92 with confidence 0.80 is STANDARD, not AGGRESSIVE: the
 confidence floor is not met. `tier` and `eligible` are independent facts; an IP can be eligible with
 `tier = None`.
 

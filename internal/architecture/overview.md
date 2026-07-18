@@ -164,7 +164,7 @@ choice.
 
 The system is built foundation-first, each layer complete before the next:
 
-1. Core spine: domain model, PostgreSQL schema, event ledger, scoring projection, and breadth model.
+1. Core scoring layer: domain model, PostgreSQL schema, event ledger, scoring projection, and breadth model.
 2. Native sensor framework, the catch-all sensor, and one TCP-auth sensor.
 3. Event intake and multi-node aggregation.
 4. Review queue, submission gatekeeper, and vendor reporting.

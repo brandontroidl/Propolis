@@ -6,3 +6,9 @@ pub const HALF_LIFE_SECONDS: i64 = 21600;
 
 /// Upper bound a score is clamped to.
 pub const SCORE_CAP: Decimal = dec!(100);
+
+/// Breadth-factor increment per additional distinct WAN vantage beyond the first.
+pub const BREADTH_PER_WAN: Decimal = dec!(0.15);
+
+/// Upper bound on the breadth-factor bonus (i.e. factor saturates at `1 + BREADTH_CAP`).
+pub const BREADTH_CAP: Decimal = dec!(0.60);

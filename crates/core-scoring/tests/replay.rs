@@ -92,6 +92,15 @@ async fn out_of_order_event_outside_window_is_not_deduped(pool: PgPool) -> Resul
     Ok(())
 }
 
+/// An IP with no events has no projection: rebuild_projection returns Ok(None) (matching
+/// read_score), never an error or a panic.
+#[sqlx::test(migrations = "./migrations")]
+async fn rebuild_projection_empty_source_returns_none(pool: PgPool) -> Result<(), RepoError> {
+    let out = rebuild_projection(&pool, "203.0.113.250".parse().unwrap()).await?;
+    assert!(out.is_none());
+    Ok(())
+}
+
 /// A multi-event stream for one source that exercises: a confirmed-real latch,
 /// a within-window dedup (e1 repeats e0's signal_type inside 60s), three
 /// distinct authenticated-TCP WAN vantages across three /24s (breadth), one
@@ -159,7 +168,9 @@ async fn replay_equals_incremental(pool: PgPool) -> Result<(), RepoError> {
     let stored = read_stored_score(&pool, ip)
         .await?
         .expect("projection row exists");
-    let replayed = rebuild_projection(&pool, ip).await?;
+    let replayed = rebuild_projection(&pool, ip)
+        .await?
+        .expect("appended stream yields a projection");
 
     // Full field equality: replay must equal the incrementally-stored row.
     assert_eq!(

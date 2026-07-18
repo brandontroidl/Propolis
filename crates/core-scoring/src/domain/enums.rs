@@ -2,7 +2,7 @@
 #[sqlx(type_name = "protocol_enum", rename_all = "lowercase")]
 pub enum Protocol { Tcp, Udp, Icmp }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize, sqlx::Type)]
 #[sqlx(type_name = "category_enum", rename_all = "lowercase")]
 pub enum Category { Honeypot, Ids, Network, Waf, Auth }
 

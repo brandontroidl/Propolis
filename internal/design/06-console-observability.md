@@ -12,7 +12,7 @@ Give the operator one place to review recommended IPs, act on the approval gate,
 
 ## Dependencies
 
-Sub-project 1 (core spine). Consumes sub-project 3 (intake and aggregation) for the per-WAN attribution it surfaces and sub-project 4 (review and reporting) for the queue it drives.
+Sub-project 1 (core scoring layer). Consumes sub-project 3 (intake and aggregation) for the per-WAN attribution it surfaces and sub-project 4 (review and reporting) for the queue it drives.
 
 ## Key open questions
 

@@ -8,7 +8,7 @@ Propolis is an internet-facing defensive platform. Its sensors sit on the open
 WAN and parse attacker-controlled bytes, so the language choice is a security
 decision before it is a productivity one. The old system was Python, chosen for
 convenience, and the rebuild is an explicit move off it toward a more efficient,
-lower-footprint runtime. The scoring spine and multi-node aggregation also need
+lower-footprint runtime. The core scoring layer and multi-node aggregation also need
 predictable latency and a strong way to keep the system's invariants from being
 violated at runtime.
 

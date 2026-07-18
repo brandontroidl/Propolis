@@ -20,7 +20,7 @@
 //!   (C) breadth raises the effective score (and so the blocklist
 //!       recommendation) but never the RAW score the vendor tier is gated on.
 
-use core_scoring::{append_event, EventInput, FeedTier, Protocol, RepoError, SignalType};
+use core_scoring::{EventInput, FeedTier, Protocol, RepoError, SignalType, append_event};
 
 use sqlx::PgPool;
 
@@ -139,8 +139,14 @@ async fn spoof_without_confirmed_real_stays_unreportable(pool: PgPool) -> Result
     // diversity, and authenticated WAN breadth — so the negative assertions
     // below are not vacuous.
     assert_eq!(s.event_count, 5);
-    assert!(s.distinct_categories >= 2, "expected multi-category corroboration to have accrued");
-    assert!(s.distinct_wan_count >= 2, "expected authenticated-WAN breadth to have accrued");
+    assert!(
+        s.distinct_categories >= 2,
+        "expected multi-category corroboration to have accrued"
+    );
+    assert!(
+        s.distinct_wan_count >= 2,
+        "expected authenticated-WAN breadth to have accrued"
+    );
 
     // The load-bearing assertions: no confirmed-real event was ever fed, so
     // eligibility and the vendor recommendation must stay false regardless.
@@ -275,7 +281,9 @@ async fn breadth_raises_blocklist_never_vendor_tier(pool: PgPool) -> Result<(), 
     // 40 + 15; e3 deduped, adds 0. Seconds-scale decay against a 6h half-life
     // is negligible, so compare with a small epsilon.
     assert!((s.raw_score - rust_decimal_macros::dec!(55)).abs() < rust_decimal_macros::dec!(0.5));
-    assert!(s.raw_score >= rust_decimal_macros::dec!(50) && s.raw_score < rust_decimal_macros::dec!(75));
+    assert!(
+        s.raw_score >= rust_decimal_macros::dec!(50) && s.raw_score < rust_decimal_macros::dec!(75)
+    );
     assert_eq!(s.distinct_wan_count, 3);
 
     assert!(s.eligible);
@@ -283,7 +291,10 @@ async fn breadth_raises_blocklist_never_vendor_tier(pool: PgPool) -> Result<(), 
     // The load-bearing assertions: breadth-boosted effective score clears the
     // blocklist floor, but the vendor tier is gated on RAW alone and RAW never
     // reached 75, so tier/vendor recommendation stay off.
-    assert!(s.recommended_for_blocklist, "effective 55*1.3=71.5 >= 50 floor");
+    assert!(
+        s.recommended_for_blocklist,
+        "effective 55*1.3=71.5 >= 50 floor"
+    );
     assert_eq!(s.tier, None, "tier is gated on raw (55), never effective");
     assert!(!s.recommended_for_vendor);
 

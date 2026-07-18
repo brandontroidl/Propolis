@@ -32,7 +32,7 @@ use sqlx::{PgPool, Row};
 use crate::domain::enums::{Category, Protocol, SignalType};
 use crate::domain::types::{EventInput, IpScore};
 use crate::hashing::chain_hash;
-use crate::scoring::breadth::{distinct_wan_count, WanVantage};
+use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 use crate::scoring::constants::{DEDUP_WINDOW_SECONDS, HALF_LIFE_SECONDS};
 use crate::scoring::engine::apply_event;
 

@@ -42,10 +42,10 @@ use sqlx::{PgPool, Postgres, Row};
 use crate::domain::enums::Category;
 use crate::domain::types::{EventInput, IpScore, ValidationError};
 use crate::hashing::chain_hash;
-use crate::scoring::breadth::{distinct_wan_count, WanVantage};
+use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 use crate::scoring::constants::{DEDUP_WINDOW_SECONDS, HALF_LIFE_SECONDS};
 use crate::scoring::decay::decay;
-use crate::scoring::engine::{apply_event, CategoryStat};
+use crate::scoring::engine::{CategoryStat, apply_event};
 
 /// Errors from the repository layer. Every variant is a fail-closed outcome:
 /// the caller gets an error and (for the append path) the transaction rolls
@@ -205,7 +205,8 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     let mut vantages: Vec<WanVantage> = Vec::with_capacity(vantage_rows.len());
     for row in vantage_rows {
         let wan: String = row.try_get("wan")?;
-        let saw_authenticated_tcp: bool = row.try_get::<Option<bool>, _>("auth_tcp")?.unwrap_or(false);
+        let saw_authenticated_tcp: bool =
+            row.try_get::<Option<bool>, _>("auth_tcp")?.unwrap_or(false);
         let wan_ip: IpAddr = wan
             .parse()
             .map_err(|e| RepoError::Corrupt(format!("stored wan_ip {wan}: {e}")))?;

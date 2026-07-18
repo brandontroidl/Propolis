@@ -58,6 +58,16 @@ impl EventInput {
         if self.sensor.is_empty() {
             return Err(ValidationError::SensorEmpty);
         }
+        // The signal weight table is the single source of truth for category/weight/confidence
+        // per signal_type. Enforce that coupling at the write gate so a caller that builds
+        // EventInput directly (bypassing from_signal) cannot desync a non-honeypot signal into
+        // category=Honeypot to forge the confirmed-real latch (is_confirmed_real gates on
+        // category), nor set an out-of-table weight that would corrupt the ledger. Decimal
+        // equality is by value, so a scale variant of the same confidence (0.95 vs 0.950) passes.
+        let w = signal_weight(self.signal_type);
+        if self.category != w.category || self.weight != w.weight || self.confidence != w.confidence {
+            return Err(ValidationError::SignalTypeMismatch);
+        }
         Ok(())
     }
 }
@@ -66,6 +76,9 @@ impl EventInput {
 pub enum ValidationError {
     ConfidenceOutOfRange,
     SensorEmpty,
+    /// `category`/`weight`/`confidence` do not match `signal_weight(signal_type)` — a desynced
+    /// event that could forge the confirmed-real latch or corrupt the ledger weight.
+    SignalTypeMismatch,
 }
 
 /// Read model mirroring the `ip_score` table columns.
@@ -141,5 +154,37 @@ mod tests {
         let mut e = sample_event();
         e.sensor = String::new();
         assert!(matches!(e.validate(), Err(ValidationError::SensorEmpty)));
+    }
+
+    #[test]
+    fn validate_blocks_confirmed_real_forge_via_signal_type_desync() {
+        // A SuricataSev3 (category Ids, weight 5, conf 0.300) relabeled as an authenticated
+        // Honeypot handshake must be rejected: is_confirmed_real gates on category, so this
+        // desync would otherwise forge has_confirmed_real from a non-honeypot signal.
+        let mut forged = EventInput::from_signal(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            "sensor-a".into(),
+            SignalType::SuricataSev3,
+            Protocol::Tcp,
+            true,
+            "2026-07-17T00:00:00Z".parse().unwrap(),
+            serde_json::json!({}),
+        );
+        forged.category = Category::Honeypot;
+        forged.weight = 80;
+        forged.confidence = dec!(0.98);
+        assert!(matches!(
+            forged.validate(),
+            Err(ValidationError::SignalTypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_scale_variant_confidence_equal_by_value() {
+        // 0.95 (scale 2) is value-equal to the table's 0.950 (scale 3): must not be rejected.
+        let mut e = sample_event();
+        e.confidence = dec!(0.95);
+        assert!(e.validate().is_ok());
     }
 }

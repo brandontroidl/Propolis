@@ -141,6 +141,77 @@ async fn read_score_rederives_stale_flags_after_decay(pool: PgPool) -> Result<()
     Ok(())
 }
 
+/// verify_chain must detect tampering of EVERY canonical field, not just `weight`. Especially the
+/// three anti-spoof-critical columns is_confirmed_real gates on (protocol, authenticated, category):
+/// flipping any of them post-insert must break the chain. Each field is tampered (-> Broken) then
+/// restored (-> Intact) so all are exercised on one row.
+#[sqlx::test(migrations = "./migrations")]
+async fn tampering_any_canonical_field_breaks_the_chain(pool: PgPool) -> Result<(), RepoError> {
+    let e = ev(
+        "2026-07-17T00:00:00Z",
+        SignalType::HoneypotCommandExec,
+        Some("198.51.100.1"),
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    append_event(&pool, e).await?;
+
+    let cases: &[(&str, &str)] = &[
+        ("UPDATE event SET authenticated = false WHERE id = 1", "UPDATE event SET authenticated = true WHERE id = 1"),
+        ("UPDATE event SET category = 'ids' WHERE id = 1", "UPDATE event SET category = 'honeypot' WHERE id = 1"),
+        ("UPDATE event SET protocol = 'udp' WHERE id = 1", "UPDATE event SET protocol = 'tcp' WHERE id = 1"),
+        ("UPDATE event SET signal_type = 'port_scan' WHERE id = 1", "UPDATE event SET signal_type = 'honeypot_command_exec' WHERE id = 1"),
+        ("UPDATE event SET source_ip = '203.0.113.99'::inet WHERE id = 1", "UPDATE event SET source_ip = '203.0.113.7'::inet WHERE id = 1"),
+        ("UPDATE event SET wan_ip = '198.51.100.9'::inet WHERE id = 1", "UPDATE event SET wan_ip = '198.51.100.1'::inet WHERE id = 1"),
+        ("UPDATE event SET observed_at = '2026-07-18T00:00:00Z' WHERE id = 1", "UPDATE event SET observed_at = '2026-07-17T00:00:00Z' WHERE id = 1"),
+        ("UPDATE event SET confidence = 0.111 WHERE id = 1", "UPDATE event SET confidence = 0.950 WHERE id = 1"),
+        ("UPDATE event SET sensor = 'tampered' WHERE id = 1", "UPDATE event SET sensor = 's1' WHERE id = 1"),
+        ("UPDATE event SET metadata = '{\"x\":1}'::jsonb WHERE id = 1", "UPDATE event SET metadata = '{}'::jsonb WHERE id = 1"),
+    ];
+    for &(tamper, restore) in cases {
+        // raw_sql: these are audited, test-controlled static literals (no injection surface);
+        // sqlx::query()'s lint rejects non-literal &str.
+        sqlx::raw_sql(tamper).execute(&pool).await?;
+        assert!(
+            matches!(verify_chain(&pool).await?, ChainStatus::Broken { .. }),
+            "tamper not detected: {tamper}"
+        );
+        sqlx::raw_sql(restore).execute(&pool).await?;
+        assert!(
+            matches!(verify_chain(&pool).await?, ChainStatus::Intact),
+            "restore not clean: {restore}"
+        );
+    }
+    Ok(())
+}
+
+/// The corrupt-`category_breakdown` fail-closed path must return `RepoError::Corrupt`, never panic,
+/// when the stored JSON is not a valid CategoryStat map. Guards the guard the "never panics on
+/// corrupt data" invariant depends on.
+#[sqlx::test(migrations = "./migrations")]
+async fn corrupt_category_breakdown_fails_closed(pool: PgPool) -> Result<(), RepoError> {
+    let e = ev(
+        "2026-07-17T00:00:00Z",
+        SignalType::HoneypotCommandExec,
+        None,
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    append_event(&pool, e).await?;
+    sqlx::query(
+        "UPDATE ip_score SET category_breakdown = '{\"garbage\": true}'::jsonb \
+         WHERE source_ip = $1::inet",
+    )
+    .bind(IP)
+    .execute(&pool)
+    .await?;
+    let r = read_score(&pool, IP.parse().unwrap()).await;
+    assert!(matches!(r, Err(RepoError::Corrupt(_))), "expected Corrupt, got {r:?}");
+    Ok(())
+}
+
 /// A multi-event stream for one source that exercises: a confirmed-real latch,
 /// a within-window dedup (e1 repeats e0's signal_type inside 60s), three
 /// distinct authenticated-TCP WAN vantages across three /24s (breadth), one

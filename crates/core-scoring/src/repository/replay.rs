@@ -101,9 +101,10 @@ fn reconstruct_event(row: &PgRow) -> Result<EventInput, RepoError> {
 /// event. Returns the final projection, anchored (like the stored row) at the
 /// last event's `observed_at`.
 ///
-/// Fails closed with [`RepoError::Corrupt`] if the source has no events (there
-/// is no projection to rebuild) or a stored value cannot be parsed.
-pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<IpScore, RepoError> {
+/// Returns `Ok(None)` if the source has no events (nothing to rebuild, matching
+/// `read_score`); fails closed with [`RepoError::Corrupt`] only if a stored value
+/// cannot be parsed.
+pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<Option<IpScore>, RepoError> {
     let rows = sqlx::query(
         "SELECT host(source_ip) AS source_ip, host(wan_ip) AS wan_ip, sensor, signal_type, \
                 protocol, authenticated, category, weight, confidence, observed_at, metadata \
@@ -114,9 +115,7 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<IpScore, Re
     .await?;
 
     if rows.is_empty() {
-        return Err(RepoError::Corrupt(format!(
-            "no events to replay for source {ip}"
-        )));
+        return Ok(None);
     }
 
     let events: Vec<EventInput> = rows
@@ -136,8 +135,11 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<IpScore, Re
             .filter(|e| e.signal_type == event.signal_type)
             .map(|e| e.observed_at)
             .max();
+        // Symmetric window, mirroring the append path (events.rs) exactly so
+        // replay == incremental: dedup only within DEDUP_WINDOW_SECONDS in either
+        // time direction, never treating a negative (out-of-order) elapsed as a dup.
         let deduped = match prior_observed {
-            Some(prior) => (event.observed_at - prior).num_seconds() <= DEDUP_WINDOW_SECONDS,
+            Some(prior) => (event.observed_at - prior).num_seconds().abs() <= DEDUP_WINDOW_SECONDS,
             None => false,
         };
 
@@ -176,7 +178,7 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<IpScore, Re
     }
 
     // Non-empty by the guard above, so the fold always produced a value.
-    Ok(acc.expect("non-empty ledger yields a projection"))
+    Ok(acc)
 }
 
 /// Verify the whole-ledger hash chain, tamper-evidently.
@@ -186,6 +188,11 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<IpScore, Re
 /// stored `hash`, and checks `row.prev_hash == prev_row.hash` (the first row
 /// must have `prev_hash IS NULL`). Returns `Broken { first_bad_id }` at the
 /// FIRST row failing either check, else `Intact`.
+///
+/// LIMITATION (unsigned chain): this detects content mutation, reordering, and head/middle
+/// deletion, but NOT tail truncation — deleting the newest event(s) leaves a shorter but internally
+/// self-consistent prefix that reads `Intact`. Closing that needs a signed, externally-anchored
+/// chain tip (out of scope here; recorded in `internal/audit/2026-07-18-core-scoring-audit.md`).
 pub async fn verify_chain(pool: &PgPool) -> Result<ChainStatus, RepoError> {
     let rows = sqlx::query(
         "SELECT id, prev_hash, hash, host(source_ip) AS source_ip, host(wan_ip) AS wan_ip, \

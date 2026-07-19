@@ -10,10 +10,14 @@
 //!
 //! `append_event` serializes ALL appends against a single, transaction-scoped
 //! Postgres advisory lock (`pg_advisory_xact_lock`, keyed on
-//! [`APPEND_LOCK_KEY`]). The lock is acquired as the first statement inside
-//! the transaction, before the chain-head read, so the chain-head read +
-//! event INSERT + projection read + `ip_score` UPSERT all execute as one
-//! serialized critical section. This guarantees, under any number of
+//! [`APPEND_LOCK_KEY`]). The transaction first pins `READ COMMITTED` isolation
+//! (required for the lock to serialize correctly), then acquires the lock before
+//! the chain-head read, so the chain-head read + event INSERT + projection read +
+//! `ip_score` UPSERT all execute as one serialized critical section. Under READ
+//! COMMITTED each statement takes a fresh snapshot, so once the lock is granted
+//! the chain-head read sees the prior appender's committed row (under REPEATABLE
+//! READ / SERIALIZABLE the snapshot would freeze before the lock and the chain
+//! could fork — hence the explicit pin). This guarantees, under any number of
 //! concurrent callers:
 //!
 //! - the tamper-evident hash chain cannot fork (no two appends can read the
@@ -44,8 +48,7 @@ use crate::domain::types::{EventInput, IpScore, ValidationError};
 use crate::hashing::chain_hash;
 use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 use crate::scoring::constants::{DEDUP_WINDOW_SECONDS, HALF_LIFE_SECONDS};
-use crate::scoring::decay::decay;
-use crate::scoring::engine::{CategoryStat, apply_event};
+use crate::scoring::engine::{CategoryStat, apply_event, project_to_now};
 
 /// Errors from the repository layer. Every variant is a fail-closed outcome:
 /// the caller gets an error and (for the append path) the transaction rolls
@@ -115,13 +118,30 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     //     `verify_chain_intact_with_rich_metadata`.
     // `canonical_bytes`/`chain_hash` stay unchanged (deterministic already);
     // normalization belongs here at the append boundary.
+    // Normalize confidence to EXACTLY scale-3 to match the NUMERIC(4,3) column. `round_dp(3)`
+    // only trims excess scale, it never pads (dec!(0.9).round_dp(3) stays "0.9"), so a value-equal
+    // low-scale confidence would hash as "0.9" here but read back as "0.900" from storage and
+    // false-break verify_chain. `rescale(3)` pads (and rounds if >3dp, unreachable after validate()).
+    let mut confidence = event.confidence;
+    confidence.rescale(3);
     let event = EventInput {
         observed_at: event.observed_at.trunc_subsecs(6),
-        confidence: event.confidence.round_dp(3),
+        confidence,
         ..event
     };
 
     let mut tx = pool.begin().await?;
+
+    // Pin READ COMMITTED for this transaction regardless of the server's default
+    // isolation. The advisory-lock serialization below is only correct under READ
+    // COMMITTED, where each statement takes a fresh snapshot so the post-lock
+    // chain-head read sees the prior appender's just-committed row. Under REPEATABLE
+    // READ / SERIALIZABLE the tx snapshot freezes at the first statement (before the
+    // lock is granted), so the head read would miss a concurrent commit and the chain
+    // could fork. Must be the first statement in the transaction.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await?;
 
     // 0. Serialize this append against every other concurrent append BEFORE
     // reading the chain head: this is what turns "read head, insert, read
@@ -184,8 +204,12 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     .bind(new_id)
     .fetch_one(&mut *tx)
     .await?;
+    // Symmetric window: dedup only a same-signal observation within DEDUP_WINDOW_SECONDS in
+    // EITHER time direction. A one-sided `elapsed <= WINDOW` treats any negative elapsed
+    // (an out-of-order/earlier-timestamped event from a buffered or clock-skewed sensor) as a
+    // duplicate and silently drops its weight, suppressing a genuine attacker's score.
     let deduped = match prior_observed {
-        Some(prior) => (event.observed_at - prior).num_seconds() <= DEDUP_WINDOW_SECONDS,
+        Some(prior) => (event.observed_at - prior).num_seconds().abs() <= DEDUP_WINDOW_SECONDS,
         None => false,
     };
 
@@ -275,19 +299,18 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     Ok(new_score)
 }
 
-/// Read the stored projection for `ip` and project its `raw_score` to now.
+/// Read the stored projection for `ip`, projected to now: `raw_score` and each category weight are
+/// decayed to now and the gate flags (eligible/tier/recommendations/`max_confidence`) are
+/// RE-DERIVED, so the returned facts are current rather than frozen at the last write (a category
+/// that has decayed below the 0.5 floor drops eligibility/tier).
 ///
-/// PURE read: the projected value is NEVER written back. The stored raw score
-/// stays un-projected so a later append reads it un-decayed (double-decay
-/// guard). Other fields are returned as stored; full read-time re-derivation of
-/// the gate flags is out of scope for this task.
+/// PURE read: the projected value is NEVER written back — the stored row stays un-projected so a
+/// later append reads its raw score un-decayed (double-decay guard).
 pub async fn read_score(pool: &PgPool, ip: IpAddr) -> Result<Option<IpScore>, RepoError> {
-    let Some(mut stored) = read_stored_ip_score(pool, ip).await? else {
+    let Some(stored) = read_stored_ip_score(pool, ip).await? else {
         return Ok(None);
     };
-    let elapsed = (Utc::now() - stored.decay_anchor).num_seconds();
-    stored.raw_score = decay(stored.raw_score, elapsed, HALF_LIFE_SECONDS);
-    Ok(Some(stored))
+    Ok(Some(project_to_now(stored, Utc::now(), HALF_LIFE_SECONDS)))
 }
 
 /// Read the stored `ip_score` row AS STORED - no decay-to-now projection.

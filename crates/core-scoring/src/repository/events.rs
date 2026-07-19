@@ -48,8 +48,7 @@ use crate::domain::types::{EventInput, IpScore, ValidationError};
 use crate::hashing::chain_hash;
 use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 use crate::scoring::constants::{DEDUP_WINDOW_SECONDS, HALF_LIFE_SECONDS};
-use crate::scoring::decay::decay;
-use crate::scoring::engine::{CategoryStat, apply_event};
+use crate::scoring::engine::{CategoryStat, apply_event, project_to_now};
 
 /// Errors from the repository layer. Every variant is a fail-closed outcome:
 /// the caller gets an error and (for the append path) the transaction rolls
@@ -300,19 +299,18 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     Ok(new_score)
 }
 
-/// Read the stored projection for `ip` and project its `raw_score` to now.
+/// Read the stored projection for `ip`, projected to now: `raw_score` and each category weight are
+/// decayed to now and the gate flags (eligible/tier/recommendations/`max_confidence`) are
+/// RE-DERIVED, so the returned facts are current rather than frozen at the last write (a category
+/// that has decayed below the 0.5 floor drops eligibility/tier).
 ///
-/// PURE read: the projected value is NEVER written back. The stored raw score
-/// stays un-projected so a later append reads it un-decayed (double-decay
-/// guard). Other fields are returned as stored; full read-time re-derivation of
-/// the gate flags is out of scope for this task.
+/// PURE read: the projected value is NEVER written back — the stored row stays un-projected so a
+/// later append reads its raw score un-decayed (double-decay guard).
 pub async fn read_score(pool: &PgPool, ip: IpAddr) -> Result<Option<IpScore>, RepoError> {
-    let Some(mut stored) = read_stored_ip_score(pool, ip).await? else {
+    let Some(stored) = read_stored_ip_score(pool, ip).await? else {
         return Ok(None);
     };
-    let elapsed = (Utc::now() - stored.decay_anchor).num_seconds();
-    stored.raw_score = decay(stored.raw_score, elapsed, HALF_LIFE_SECONDS);
-    Ok(Some(stored))
+    Ok(Some(project_to_now(stored, Utc::now(), HALF_LIFE_SECONDS)))
 }
 
 /// Read the stored `ip_score` row AS STORED - no decay-to-now projection.

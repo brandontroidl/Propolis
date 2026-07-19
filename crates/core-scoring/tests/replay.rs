@@ -8,7 +8,8 @@
 use core_scoring::domain::enums::{Protocol, SignalType};
 use core_scoring::domain::types::EventInput;
 use core_scoring::repository::{
-    ChainStatus, RepoError, append_event, read_stored_score, rebuild_projection, verify_chain,
+    ChainStatus, RepoError, append_event, read_score, read_stored_score, rebuild_projection,
+    verify_chain,
 };
 
 use chrono::Utc;
@@ -98,6 +99,45 @@ async fn out_of_order_event_outside_window_is_not_deduped(pool: PgPool) -> Resul
 async fn rebuild_projection_empty_source_returns_none(pool: PgPool) -> Result<(), RepoError> {
     let out = rebuild_projection(&pool, "203.0.113.250".parse().unwrap()).await?;
     assert!(out.is_none());
+    Ok(())
+}
+
+/// read_score must re-derive the gate flags at read time. An IP eligible + tiered at write whose
+/// categories have long since decayed below the 0.5 live floor must read back eligible=false /
+/// tier=None, not the stale write-time flags (a consumer reporting off stale flags would file a
+/// vendor report for a near-zero-score IP — the false-tier the design guards against).
+#[sqlx::test(migrations = "./migrations")]
+async fn read_score_rederives_stale_flags_after_decay(pool: PgPool) -> Result<(), RepoError> {
+    // Far-past events: eligible + tiered at write; by "now" (years later, thousands of
+    // half-lives) every category weight has decayed to ~0.
+    let e0 = ev(
+        "2020-01-01T00:00:00Z",
+        SignalType::HoneypotCommandExec,
+        Some("198.51.100.1"),
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    append_event(&pool, e0).await?;
+    let e1 = ev(
+        "2020-01-01T00:00:10Z",
+        SignalType::SuricataSev1,
+        None,
+        "s2",
+        Protocol::Udp,
+        false,
+    );
+    let stored = append_event(&pool, e1).await?;
+    assert!(stored.eligible, "should be eligible at write");
+    assert!(stored.tier.is_some(), "should be tiered at write");
+
+    let now = read_score(&pool, IP.parse().unwrap())
+        .await?
+        .expect("row exists");
+    assert!(!now.eligible, "read_score returned a stale eligible flag");
+    assert!(now.tier.is_none(), "read_score returned a stale tier");
+    assert!(!now.recommended_for_vendor);
+    assert!(now.has_confirmed_real, "sticky latch must not decay");
     Ok(())
 }
 

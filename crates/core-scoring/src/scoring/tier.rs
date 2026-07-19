@@ -49,4 +49,18 @@ mod tests {
         assert!(!recommended_for_blocklist(true, dec!(49)));
         assert!(!recommended_for_blocklist(false, dec!(90))); // eligibility-gated
     }
+
+    #[test]
+    fn tier_boundaries_exact() {
+        // Floors are inclusive (>=): exactly on both STANDARD axes -> Standard.
+        assert_eq!(tier(dec!(75), dec!(0.70)), Some(FeedTier::Standard));
+        // Just below either STANDARD axis -> None.
+        assert_eq!(tier(dec!(74.999), dec!(0.70)), None);
+        assert_eq!(tier(dec!(75), dec!(0.699)), None);
+        // Exactly on both AGGRESSIVE axes -> Aggressive; a hair below conf drops to Standard.
+        assert_eq!(tier(dec!(90), dec!(0.95)), Some(FeedTier::Aggressive));
+        assert_eq!(tier(dec!(90), dec!(0.949)), Some(FeedTier::Standard));
+        // Below AGGRESSIVE raw with high conf -> Standard (still clears STANDARD raw).
+        assert_eq!(tier(dec!(89.999), dec!(0.99)), Some(FeedTier::Standard));
+    }
 }

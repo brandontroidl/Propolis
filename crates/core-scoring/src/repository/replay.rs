@@ -188,6 +188,11 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<Option<IpSc
 /// stored `hash`, and checks `row.prev_hash == prev_row.hash` (the first row
 /// must have `prev_hash IS NULL`). Returns `Broken { first_bad_id }` at the
 /// FIRST row failing either check, else `Intact`.
+///
+/// LIMITATION (unsigned chain): this detects content mutation, reordering, and head/middle
+/// deletion, but NOT tail truncation — deleting the newest event(s) leaves a shorter but internally
+/// self-consistent prefix that reads `Intact`. Closing that needs a signed, externally-anchored
+/// chain tip (out of scope here; recorded in `internal/audit/2026-07-18-core-scoring-audit.md`).
 pub async fn verify_chain(pool: &PgPool) -> Result<ChainStatus, RepoError> {
     let rows = sqlx::query(
         "SELECT id, prev_hash, hash, host(source_ip) AS source_ip, host(wan_ip) AS wan_ip, \

@@ -212,6 +212,37 @@ async fn corrupt_category_breakdown_fails_closed(pool: PgPool) -> Result<(), Rep
     Ok(())
 }
 
+/// Breadth requires tcp AND authenticated on the SAME event per WAN (bool_or over the conjunction),
+/// not "some tcp" OR "some authenticated" separately. A WAN with only a tcp-unauthenticated event
+/// and a udp-authenticated event must NOT count as an authenticated vantage. Exercises the real SQL
+/// aggregation (the engine-level proptest feeds arbitrary counts and can't catch a decomposed-OR bug).
+#[sqlx::test(migrations = "./migrations")]
+async fn breadth_requires_tcp_and_auth_on_same_event(pool: PgPool) -> Result<(), RepoError> {
+    // WAN A: honeypot tcp+auth -> a real authenticated vantage.
+    append_event(
+        &pool,
+        ev("2026-07-17T00:00:00Z", SignalType::HoneypotCommandExec, Some("198.51.100.1"), "s1", Protocol::Tcp, true),
+    )
+    .await?;
+    // WAN B: tcp but NOT authenticated.
+    append_event(
+        &pool,
+        ev("2026-07-17T00:00:01Z", SignalType::PortScan, Some("203.0.113.20"), "s2", Protocol::Tcp, false),
+    )
+    .await?;
+    // WAN B again: authenticated but UDP (not tcp). WAN B never had a tcp+auth event.
+    let s = append_event(
+        &pool,
+        ev("2026-07-17T00:00:02Z", SignalType::CatchallProbe, Some("203.0.113.20"), "s2", Protocol::Udp, true),
+    )
+    .await?;
+    assert_eq!(
+        s.distinct_wan_count, 1,
+        "WAN B (tcp-unauth + udp-auth) must not count as an authenticated vantage"
+    );
+    Ok(())
+}
+
 /// A multi-event stream for one source that exercises: a confirmed-real latch,
 /// a within-window dedup (e1 repeats e0's signal_type inside 60s), three
 /// distinct authenticated-TCP WAN vantages across three /24s (breadth), one

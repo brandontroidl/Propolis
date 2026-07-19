@@ -158,16 +158,46 @@ async fn tampering_any_canonical_field_breaks_the_chain(pool: PgPool) -> Result<
     append_event(&pool, e).await?;
 
     let cases: &[(&str, &str)] = &[
-        ("UPDATE event SET authenticated = false WHERE id = 1", "UPDATE event SET authenticated = true WHERE id = 1"),
-        ("UPDATE event SET category = 'ids' WHERE id = 1", "UPDATE event SET category = 'honeypot' WHERE id = 1"),
-        ("UPDATE event SET protocol = 'udp' WHERE id = 1", "UPDATE event SET protocol = 'tcp' WHERE id = 1"),
-        ("UPDATE event SET signal_type = 'port_scan' WHERE id = 1", "UPDATE event SET signal_type = 'honeypot_command_exec' WHERE id = 1"),
-        ("UPDATE event SET source_ip = '203.0.113.99'::inet WHERE id = 1", "UPDATE event SET source_ip = '203.0.113.7'::inet WHERE id = 1"),
-        ("UPDATE event SET wan_ip = '198.51.100.9'::inet WHERE id = 1", "UPDATE event SET wan_ip = '198.51.100.1'::inet WHERE id = 1"),
-        ("UPDATE event SET observed_at = '2026-07-18T00:00:00Z' WHERE id = 1", "UPDATE event SET observed_at = '2026-07-17T00:00:00Z' WHERE id = 1"),
-        ("UPDATE event SET confidence = 0.111 WHERE id = 1", "UPDATE event SET confidence = 0.950 WHERE id = 1"),
-        ("UPDATE event SET sensor = 'tampered' WHERE id = 1", "UPDATE event SET sensor = 's1' WHERE id = 1"),
-        ("UPDATE event SET metadata = '{\"x\":1}'::jsonb WHERE id = 1", "UPDATE event SET metadata = '{}'::jsonb WHERE id = 1"),
+        (
+            "UPDATE event SET authenticated = false WHERE id = 1",
+            "UPDATE event SET authenticated = true WHERE id = 1",
+        ),
+        (
+            "UPDATE event SET category = 'ids' WHERE id = 1",
+            "UPDATE event SET category = 'honeypot' WHERE id = 1",
+        ),
+        (
+            "UPDATE event SET protocol = 'udp' WHERE id = 1",
+            "UPDATE event SET protocol = 'tcp' WHERE id = 1",
+        ),
+        (
+            "UPDATE event SET signal_type = 'port_scan' WHERE id = 1",
+            "UPDATE event SET signal_type = 'honeypot_command_exec' WHERE id = 1",
+        ),
+        (
+            "UPDATE event SET source_ip = '203.0.113.99'::inet WHERE id = 1",
+            "UPDATE event SET source_ip = '203.0.113.7'::inet WHERE id = 1",
+        ),
+        (
+            "UPDATE event SET wan_ip = '198.51.100.9'::inet WHERE id = 1",
+            "UPDATE event SET wan_ip = '198.51.100.1'::inet WHERE id = 1",
+        ),
+        (
+            "UPDATE event SET observed_at = '2026-07-18T00:00:00Z' WHERE id = 1",
+            "UPDATE event SET observed_at = '2026-07-17T00:00:00Z' WHERE id = 1",
+        ),
+        (
+            "UPDATE event SET confidence = 0.111 WHERE id = 1",
+            "UPDATE event SET confidence = 0.950 WHERE id = 1",
+        ),
+        (
+            "UPDATE event SET sensor = 'tampered' WHERE id = 1",
+            "UPDATE event SET sensor = 's1' WHERE id = 1",
+        ),
+        (
+            "UPDATE event SET metadata = '{\"x\":1}'::jsonb WHERE id = 1",
+            "UPDATE event SET metadata = '{}'::jsonb WHERE id = 1",
+        ),
     ];
     for &(tamper, restore) in cases {
         // raw_sql: these are audited, test-controlled static literals (no injection surface);
@@ -208,7 +238,10 @@ async fn corrupt_category_breakdown_fails_closed(pool: PgPool) -> Result<(), Rep
     .execute(&pool)
     .await?;
     let r = read_score(&pool, IP.parse().unwrap()).await;
-    assert!(matches!(r, Err(RepoError::Corrupt(_))), "expected Corrupt, got {r:?}");
+    assert!(
+        matches!(r, Err(RepoError::Corrupt(_))),
+        "expected Corrupt, got {r:?}"
+    );
     Ok(())
 }
 
@@ -221,19 +254,40 @@ async fn breadth_requires_tcp_and_auth_on_same_event(pool: PgPool) -> Result<(),
     // WAN A: honeypot tcp+auth -> a real authenticated vantage.
     append_event(
         &pool,
-        ev("2026-07-17T00:00:00Z", SignalType::HoneypotCommandExec, Some("198.51.100.1"), "s1", Protocol::Tcp, true),
+        ev(
+            "2026-07-17T00:00:00Z",
+            SignalType::HoneypotCommandExec,
+            Some("198.51.100.1"),
+            "s1",
+            Protocol::Tcp,
+            true,
+        ),
     )
     .await?;
     // WAN B: tcp but NOT authenticated.
     append_event(
         &pool,
-        ev("2026-07-17T00:00:01Z", SignalType::PortScan, Some("203.0.113.20"), "s2", Protocol::Tcp, false),
+        ev(
+            "2026-07-17T00:00:01Z",
+            SignalType::PortScan,
+            Some("203.0.113.20"),
+            "s2",
+            Protocol::Tcp,
+            false,
+        ),
     )
     .await?;
     // WAN B again: authenticated but UDP (not tcp). WAN B never had a tcp+auth event.
     let s = append_event(
         &pool,
-        ev("2026-07-17T00:00:02Z", SignalType::CatchallProbe, Some("203.0.113.20"), "s2", Protocol::Udp, true),
+        ev(
+            "2026-07-17T00:00:02Z",
+            SignalType::CatchallProbe,
+            Some("203.0.113.20"),
+            "s2",
+            Protocol::Udp,
+            true,
+        ),
     )
     .await?;
     assert_eq!(

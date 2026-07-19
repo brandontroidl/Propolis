@@ -65,7 +65,8 @@ impl EventInput {
         // category), nor set an out-of-table weight that would corrupt the ledger. Decimal
         // equality is by value, so a scale variant of the same confidence (0.95 vs 0.950) passes.
         let w = signal_weight(self.signal_type);
-        if self.category != w.category || self.weight != w.weight || self.confidence != w.confidence {
+        if self.category != w.category || self.weight != w.weight || self.confidence != w.confidence
+        {
             return Err(ValidationError::SignalTypeMismatch);
         }
         Ok(())

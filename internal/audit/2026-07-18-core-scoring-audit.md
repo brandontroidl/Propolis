@@ -19,14 +19,23 @@ FIXED + committed:
   claim was wrong). Converted to the real minor fix: `rebuild_projection` returns `Ok(None)` for an
   empty source (was `Err(Corrupt)`), matching `read_score` — commit `4310282`.
 
-REMAINING (not yet done):
-- #5 `read_score` re-derive gate flags at read-time (important; LATENT — no consumer yet; meaty refactor
-  extracting the derive logic from `apply_event`).
-- #8-10 public-API completeness (expose `effective_score`/breadth constants; export `CategoryStat`;
-  `read_stored_score` -> `pub(crate)`) — for future sub-projects 4/5/6.
-- #11-16 missing security/coverage tests (Corrupt fail-closed, per-field tamper detection, IPv6 /64,
-  real-breadth anti-spoof property, effective_score cap, exact-floor boundaries).
-- #17-19 document/defer (ingested_at not hashed; verify_chain tail-truncation; per-category weight cap).
+ALSO FIXED + committed:
+- #5 `read_score` re-derives gate flags at read time (shared `derive_projection` extracted from
+  `apply_event`; pure, never persisted) — commit `7e0fd20`.
+- #11 Corrupt fail-closed test + #12 per-field tamper detection (all 11 canonical fields) — `fb16d00`.
+- #13 IPv6 `/64` dedupe test + #15 `effective_score` cap test + #16 exact tier-floor boundaries — `209edad`.
+- #14 real-DB breadth test (tcp AND auth required on the same event) — `f7cb2d9`.
+- #18 `verify_chain` tail-truncation limitation documented in code.
+
+DEFERRED (deliberately):
+- #8-10 public-API completeness -> to sub-project 4 (finalize the surface there; making
+  `read_stored_score` `pub(crate)` now would break the integration test that legitimately uses it).
+- #17 `ingested_at` not in the content hash -> accepted (set by DB DEFAULT at insert, after the hash
+  is computed; unused by scoring).
+- #19 per-category weight uncapped -> accepted (scoring unaffected: the 0.5 floor and gates do not
+  depend on the cap).
+
+NEXT: full serial re-audit + suite, then merge `hardening/core-scoring-audit-fixes` -> `main`.
 
 ## A. Real defects — fix (code)
 

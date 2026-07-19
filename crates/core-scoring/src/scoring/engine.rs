@@ -10,7 +10,9 @@
 //! guard) and never recomputes breadth itself.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -108,10 +110,42 @@ pub fn apply_event(
         || is_confirmed_real(event.protocol, event.authenticated, event.category);
     let event_count = prev_event_count + 1;
 
-    // Step 5: derived facts over the LIVE-decayed breakdown.
+    // Steps 5-6: derive facts + assemble. Both decay_anchor and last_seen are `now`
+    // (the event's observed_at) because an event WAS seen at this instant.
+    derive_projection(
+        event.source_ip,
+        new_raw,
+        breakdown,
+        has_confirmed_real,
+        event_count,
+        distinct_wan_count,
+        distinct_sensor_count,
+        first_seen,
+        now,
+        now,
+    )
+}
+
+/// Compute all derived facts (eligibility, tier, recommendations, live-decayed `max_confidence`)
+/// over an already-decayed `breakdown` + `raw_score`, and assemble the `IpScore`. Single source of
+/// truth for the derivation, shared by [`apply_event`] (write path) and [`project_to_now`] (read
+/// path) so the gate logic cannot drift between them.
+#[allow(clippy::too_many_arguments)]
+fn derive_projection(
+    source_ip: IpAddr,
+    raw_score: Decimal,
+    breakdown: BTreeMap<Category, CategoryStat>,
+    has_confirmed_real: bool,
+    event_count: i32,
+    distinct_wan_count: i32,
+    distinct_sensor_count: i32,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+    decay_anchor: DateTime<Utc>,
+) -> IpScore {
     let distinct_categories = breakdown.values().filter(|s| s.weight > LIVE_FLOOR).count() as i32;
-    // Live-decayed confidence: categories whose weight has decayed to/below the
-    // floor no longer hold the tier confidence gate open. Empty -> 0 (fail-closed).
+    // Live-decayed confidence: a category whose weight has decayed to/below the floor no longer
+    // holds the tier confidence gate open. Empty -> 0 (fail-closed).
     let max_confidence = breakdown
         .values()
         .filter(|s| s.weight > LIVE_FLOOR)
@@ -124,20 +158,19 @@ pub fn apply_event(
         event_count as u32,
         distinct_categories as u32,
     );
-    let effective = effective_score(new_raw, distinct_wan_count as u32);
-    let feed_tier = tier(new_raw, max_confidence); // RAW score, not effective.
+    let effective = effective_score(raw_score, distinct_wan_count as u32);
+    let feed_tier = tier(raw_score, max_confidence); // RAW score, not effective.
     let rec_vendor = recommended_for_vendor(is_eligible, feed_tier);
     let rec_blocklist = recommended_for_blocklist(is_eligible, effective);
 
-    // Step 6: assemble. The map is well-formed Decimals, so serialization
-    // cannot fail; a failure would be a bug, not a runtime input error.
+    // The map is well-formed Decimals, so serialization cannot fail.
     let category_breakdown =
         serde_json::to_value(&breakdown).expect("CategoryStat map serializes to JSON");
 
     IpScore {
-        source_ip: event.source_ip,
-        raw_score: new_raw,
-        decay_anchor: now,
+        source_ip,
+        raw_score,
+        decay_anchor,
         max_confidence,
         event_count,
         distinct_categories,
@@ -146,12 +179,44 @@ pub fn apply_event(
         distinct_wan_count,
         distinct_sensor_count,
         first_seen,
-        last_seen: now,
+        last_seen,
         eligible: is_eligible,
         recommended_for_vendor: rec_vendor,
         recommended_for_blocklist: rec_blocklist,
         tier: feed_tier,
     }
+}
+
+/// Project a stored projection forward to `now` for a READ: decay `raw_score` and each category's
+/// weight to `now`, then RE-DERIVE the gate flags over the live-decayed breakdown, so a read
+/// reflects the current state rather than the flags frozen at the last write. Pure; the caller must
+/// NOT persist the result (the stored row stays un-projected for the double-decay guard).
+/// `last_seen` is unchanged (no new event was seen); `decay_anchor` becomes `now`.
+pub(crate) fn project_to_now(
+    stored: IpScore,
+    now: DateTime<Utc>,
+    half_life_seconds: i64,
+) -> IpScore {
+    let elapsed = (now - stored.decay_anchor).num_seconds();
+    let raw_score = decay(stored.raw_score, elapsed, half_life_seconds);
+    let mut breakdown: BTreeMap<Category, CategoryStat> =
+        serde_json::from_value(stored.category_breakdown)
+            .expect("category_breakdown is a well-formed CategoryStat map");
+    for stat in breakdown.values_mut() {
+        stat.weight = decay(stat.weight, elapsed, half_life_seconds);
+    }
+    derive_projection(
+        stored.source_ip,
+        raw_score,
+        breakdown,
+        stored.has_confirmed_real,
+        stored.event_count,
+        stored.distinct_wan_count,
+        stored.distinct_sensor_count,
+        stored.first_seen,
+        stored.last_seen,
+        now,
+    )
 }
 
 #[cfg(test)]

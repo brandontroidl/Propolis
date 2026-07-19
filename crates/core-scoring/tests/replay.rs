@@ -8,10 +8,12 @@
 use core_scoring::domain::enums::{Protocol, SignalType};
 use core_scoring::domain::types::EventInput;
 use core_scoring::repository::{
-    ChainStatus, RepoError, append_event, read_stored_score, rebuild_projection, verify_chain,
+    ChainStatus, RepoError, append_event, read_score, read_stored_score, rebuild_projection,
+    verify_chain,
 };
 
 use chrono::Utc;
+use rust_decimal_macros::dec;
 use sqlx::PgPool;
 
 const IP: &str = "203.0.113.7";
@@ -37,6 +39,208 @@ fn ev(
         ts.parse().unwrap(),
         serde_json::json!({}),
     )
+}
+
+/// A caller supplies confidence 0.9 (scale 1), value-equal to HoneypotConnection's table 0.900
+/// (scale 3), so validate() accepts it. The append hash must normalize confidence to scale-3
+/// (matching the NUMERIC(4,3) column) or verify_chain false-breaks on this untampered row.
+#[sqlx::test(migrations = "./migrations")]
+async fn verify_chain_intact_with_low_scale_confidence(pool: PgPool) -> Result<(), RepoError> {
+    let mut e = ev(
+        "2026-07-17T00:00:00Z",
+        SignalType::HoneypotConnection,
+        Some("198.51.100.1"),
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    e.confidence = dec!(0.9);
+    append_event(&pool, e).await?;
+    assert!(matches!(verify_chain(&pool).await?, ChainStatus::Intact));
+    Ok(())
+}
+
+/// Two same-signal events 6h apart, appended in REVERSE chronological order (a buffered/skewed
+/// sensor delivering the earlier event second). The second append is 6h from the prior
+/// observation, far outside the 60s dedup window, so it must NOT be deduped — its weight must be
+/// added, not silently dropped (a one-sided `elapsed <= 60` treats any negative elapsed as a dup).
+#[sqlx::test(migrations = "./migrations")]
+async fn out_of_order_event_outside_window_is_not_deduped(pool: PgPool) -> Result<(), RepoError> {
+    let later = ev(
+        "2026-07-17T06:00:00Z",
+        SignalType::SuricataSev1,
+        None,
+        "s1",
+        Protocol::Udp,
+        false,
+    );
+    append_event(&pool, later).await?;
+    let earlier = ev(
+        "2026-07-17T00:00:00Z",
+        SignalType::SuricataSev1,
+        None,
+        "s1",
+        Protocol::Udp,
+        false,
+    );
+    let s = append_event(&pool, earlier).await?;
+    assert_eq!(s.event_count, 2);
+    assert!(
+        s.raw_score > dec!(30),
+        "out-of-order event's weight was dropped: raw_score = {}",
+        s.raw_score
+    );
+    Ok(())
+}
+
+/// An IP with no events has no projection: rebuild_projection returns Ok(None) (matching
+/// read_score), never an error or a panic.
+#[sqlx::test(migrations = "./migrations")]
+async fn rebuild_projection_empty_source_returns_none(pool: PgPool) -> Result<(), RepoError> {
+    let out = rebuild_projection(&pool, "203.0.113.250".parse().unwrap()).await?;
+    assert!(out.is_none());
+    Ok(())
+}
+
+/// read_score must re-derive the gate flags at read time. An IP eligible + tiered at write whose
+/// categories have long since decayed below the 0.5 live floor must read back eligible=false /
+/// tier=None, not the stale write-time flags (a consumer reporting off stale flags would file a
+/// vendor report for a near-zero-score IP — the false-tier the design guards against).
+#[sqlx::test(migrations = "./migrations")]
+async fn read_score_rederives_stale_flags_after_decay(pool: PgPool) -> Result<(), RepoError> {
+    // Far-past events: eligible + tiered at write; by "now" (years later, thousands of
+    // half-lives) every category weight has decayed to ~0.
+    let e0 = ev(
+        "2020-01-01T00:00:00Z",
+        SignalType::HoneypotCommandExec,
+        Some("198.51.100.1"),
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    append_event(&pool, e0).await?;
+    let e1 = ev(
+        "2020-01-01T00:00:10Z",
+        SignalType::SuricataSev1,
+        None,
+        "s2",
+        Protocol::Udp,
+        false,
+    );
+    let stored = append_event(&pool, e1).await?;
+    assert!(stored.eligible, "should be eligible at write");
+    assert!(stored.tier.is_some(), "should be tiered at write");
+
+    let now = read_score(&pool, IP.parse().unwrap())
+        .await?
+        .expect("row exists");
+    assert!(!now.eligible, "read_score returned a stale eligible flag");
+    assert!(now.tier.is_none(), "read_score returned a stale tier");
+    assert!(!now.recommended_for_vendor);
+    assert!(now.has_confirmed_real, "sticky latch must not decay");
+    Ok(())
+}
+
+/// verify_chain must detect tampering of EVERY canonical field, not just `weight`. Especially the
+/// three anti-spoof-critical columns is_confirmed_real gates on (protocol, authenticated, category):
+/// flipping any of them post-insert must break the chain. Each field is tampered (-> Broken) then
+/// restored (-> Intact) so all are exercised on one row.
+#[sqlx::test(migrations = "./migrations")]
+async fn tampering_any_canonical_field_breaks_the_chain(pool: PgPool) -> Result<(), RepoError> {
+    let e = ev(
+        "2026-07-17T00:00:00Z",
+        SignalType::HoneypotCommandExec,
+        Some("198.51.100.1"),
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    append_event(&pool, e).await?;
+
+    let cases: &[(&str, &str)] = &[
+        ("UPDATE event SET authenticated = false WHERE id = 1", "UPDATE event SET authenticated = true WHERE id = 1"),
+        ("UPDATE event SET category = 'ids' WHERE id = 1", "UPDATE event SET category = 'honeypot' WHERE id = 1"),
+        ("UPDATE event SET protocol = 'udp' WHERE id = 1", "UPDATE event SET protocol = 'tcp' WHERE id = 1"),
+        ("UPDATE event SET signal_type = 'port_scan' WHERE id = 1", "UPDATE event SET signal_type = 'honeypot_command_exec' WHERE id = 1"),
+        ("UPDATE event SET source_ip = '203.0.113.99'::inet WHERE id = 1", "UPDATE event SET source_ip = '203.0.113.7'::inet WHERE id = 1"),
+        ("UPDATE event SET wan_ip = '198.51.100.9'::inet WHERE id = 1", "UPDATE event SET wan_ip = '198.51.100.1'::inet WHERE id = 1"),
+        ("UPDATE event SET observed_at = '2026-07-18T00:00:00Z' WHERE id = 1", "UPDATE event SET observed_at = '2026-07-17T00:00:00Z' WHERE id = 1"),
+        ("UPDATE event SET confidence = 0.111 WHERE id = 1", "UPDATE event SET confidence = 0.950 WHERE id = 1"),
+        ("UPDATE event SET sensor = 'tampered' WHERE id = 1", "UPDATE event SET sensor = 's1' WHERE id = 1"),
+        ("UPDATE event SET metadata = '{\"x\":1}'::jsonb WHERE id = 1", "UPDATE event SET metadata = '{}'::jsonb WHERE id = 1"),
+    ];
+    for &(tamper, restore) in cases {
+        // raw_sql: these are audited, test-controlled static literals (no injection surface);
+        // sqlx::query()'s lint rejects non-literal &str.
+        sqlx::raw_sql(tamper).execute(&pool).await?;
+        assert!(
+            matches!(verify_chain(&pool).await?, ChainStatus::Broken { .. }),
+            "tamper not detected: {tamper}"
+        );
+        sqlx::raw_sql(restore).execute(&pool).await?;
+        assert!(
+            matches!(verify_chain(&pool).await?, ChainStatus::Intact),
+            "restore not clean: {restore}"
+        );
+    }
+    Ok(())
+}
+
+/// The corrupt-`category_breakdown` fail-closed path must return `RepoError::Corrupt`, never panic,
+/// when the stored JSON is not a valid CategoryStat map. Guards the guard the "never panics on
+/// corrupt data" invariant depends on.
+#[sqlx::test(migrations = "./migrations")]
+async fn corrupt_category_breakdown_fails_closed(pool: PgPool) -> Result<(), RepoError> {
+    let e = ev(
+        "2026-07-17T00:00:00Z",
+        SignalType::HoneypotCommandExec,
+        None,
+        "s1",
+        Protocol::Tcp,
+        true,
+    );
+    append_event(&pool, e).await?;
+    sqlx::query(
+        "UPDATE ip_score SET category_breakdown = '{\"garbage\": true}'::jsonb \
+         WHERE source_ip = $1::inet",
+    )
+    .bind(IP)
+    .execute(&pool)
+    .await?;
+    let r = read_score(&pool, IP.parse().unwrap()).await;
+    assert!(matches!(r, Err(RepoError::Corrupt(_))), "expected Corrupt, got {r:?}");
+    Ok(())
+}
+
+/// Breadth requires tcp AND authenticated on the SAME event per WAN (bool_or over the conjunction),
+/// not "some tcp" OR "some authenticated" separately. A WAN with only a tcp-unauthenticated event
+/// and a udp-authenticated event must NOT count as an authenticated vantage. Exercises the real SQL
+/// aggregation (the engine-level proptest feeds arbitrary counts and can't catch a decomposed-OR bug).
+#[sqlx::test(migrations = "./migrations")]
+async fn breadth_requires_tcp_and_auth_on_same_event(pool: PgPool) -> Result<(), RepoError> {
+    // WAN A: honeypot tcp+auth -> a real authenticated vantage.
+    append_event(
+        &pool,
+        ev("2026-07-17T00:00:00Z", SignalType::HoneypotCommandExec, Some("198.51.100.1"), "s1", Protocol::Tcp, true),
+    )
+    .await?;
+    // WAN B: tcp but NOT authenticated.
+    append_event(
+        &pool,
+        ev("2026-07-17T00:00:01Z", SignalType::PortScan, Some("203.0.113.20"), "s2", Protocol::Tcp, false),
+    )
+    .await?;
+    // WAN B again: authenticated but UDP (not tcp). WAN B never had a tcp+auth event.
+    let s = append_event(
+        &pool,
+        ev("2026-07-17T00:00:02Z", SignalType::CatchallProbe, Some("203.0.113.20"), "s2", Protocol::Udp, true),
+    )
+    .await?;
+    assert_eq!(
+        s.distinct_wan_count, 1,
+        "WAN B (tcp-unauth + udp-auth) must not count as an authenticated vantage"
+    );
+    Ok(())
 }
 
 /// A multi-event stream for one source that exercises: a confirmed-real latch,
@@ -106,7 +310,9 @@ async fn replay_equals_incremental(pool: PgPool) -> Result<(), RepoError> {
     let stored = read_stored_score(&pool, ip)
         .await?
         .expect("projection row exists");
-    let replayed = rebuild_projection(&pool, ip).await?;
+    let replayed = rebuild_projection(&pool, ip)
+        .await?
+        .expect("appended stream yields a projection");
 
     // Full field equality: replay must equal the incrementally-stored row.
     assert_eq!(

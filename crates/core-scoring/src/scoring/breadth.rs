@@ -123,4 +123,43 @@ mod tests {
         ];
         assert_eq!(distinct_wan_count(&v), 1);
     }
+
+    #[test]
+    fn same_64_counts_once() {
+        // Two IPv6 addresses in the same /64 (first 8 bytes equal) collapse to one vantage.
+        let v = vec![
+            WanVantage {
+                wan_ip: "2001:db8:1:2::1".parse().unwrap(),
+                saw_authenticated_tcp: true,
+            },
+            WanVantage {
+                wan_ip: "2001:db8:1:2::ffff".parse().unwrap(),
+                saw_authenticated_tcp: true,
+            },
+        ];
+        assert_eq!(distinct_wan_count(&v), 1);
+    }
+
+    #[test]
+    fn different_64_counts_twice() {
+        let v = vec![
+            WanVantage {
+                wan_ip: "2001:db8:1:2::1".parse().unwrap(),
+                saw_authenticated_tcp: true,
+            },
+            WanVantage {
+                wan_ip: "2001:db8:1:3::1".parse().unwrap(),
+                saw_authenticated_tcp: true,
+            },
+        ];
+        assert_eq!(distinct_wan_count(&v), 2);
+    }
+
+    #[test]
+    fn effective_score_clamps_at_score_cap() {
+        // raw 90 * breadth_factor(5)=1.60 = 144 -> clamped to SCORE_CAP (100).
+        assert_eq!(effective_score(dec!(90), 5), dec!(100));
+        // Below the cap passes through: 40 * 1.60 = 64.
+        assert_eq!(effective_score(dec!(40), 5), dec!(64));
+    }
 }

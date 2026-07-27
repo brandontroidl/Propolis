@@ -1,4 +1,4 @@
-# ADR-0010: Sensor-to-intake integrity model — channel isolation, not sensor-side signing
+# ADR-0010: Sensor-to-intake integrity model - channel isolation, not sensor-side signing
 
 Status: accepted (2026-07-20)
 
@@ -8,7 +8,7 @@ Status: accepted (2026-07-20)
 interface, to be settled at sub-project 2 design time before sub-projects 2 and 3 fork. The scope
 stub (`design/02-sensor-framework.md`) described sensors emitting "signed events." Settling the wire
 format forced the question of what "signed" means when the security posture
-(`security/posture.md` §2) states that no secrets — no keys of any kind — reach a sensor process.
+(`security/posture.md` §2) states that no secrets - no keys of any kind - reach a sensor process.
 
 A cryptographic signature requires a signing key. A signing key is a secret. Placing one on an
 internet-facing sensor both violates the no-secrets posture and defends against nothing: the primary
@@ -26,7 +26,7 @@ one-directional channel and the ledger hash chain at intake."
 1. **Trust boundary: the OS-enforced one-directional channel.** A sensor's OS user has write-only
    access to its own log and quarantine spool; intake has read-only access. This is enforced by
    filesystem permissions and service-manager mounts (kernel-enforced), not by convention. A sensor
-   compromise can spoil that sensor's own event lines and reach nothing else — exactly the blast
+   compromise can spoil that sensor's own event lines and reach nothing else - exactly the blast
    radius `security/posture.md` §2 already accepts. Intake treats sensor input as untrusted data and
    validates every record (parseable source IP, known signal type, in-range fields) before it enters
    the ledger.
@@ -65,10 +65,10 @@ one-directional channel and the ledger hash chain at intake."
 
 ## Rejected alternatives
 
-- **Per-sensor HMAC / signature on each event line** — rejected: needs a key on the sensor (violates
+- **Per-sensor HMAC / signature on each event line** - rejected: needs a key on the sensor (violates
   the no-secrets posture) and does not defend against sensor compromise, the primary threat, since the
   compromised process holds the key. It would defend only against a distinct local writer to the log
   directory, which filesystem permissions already prevent.
-- **Sign at a privileged local agent between sensor and intake** — rejected for this layer: it adds a
+- **Sign at a privileged local agent between sensor and intake** - rejected for this layer: it adds a
   secret-bearing component alongside every sensor for a guarantee the OS channel boundary and the
   ledger chain already provide; premature and higher-surface.

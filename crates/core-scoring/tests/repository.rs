@@ -104,7 +104,7 @@ async fn double_decay_guard_across_one_half_life(pool: PgPool) -> Result<(), Rep
 /// row 1 has no predecessor, and every later row's `prev_hash` equals the
 /// immediately prior row's `hash`, in `id` order. This verifies chain
 /// linkage deterministically (single-threaded, sequential appends); it does
-/// not attempt to exercise concurrent appends, which is inherently flaky —
+/// not attempt to exercise concurrent appends, which is inherently flaky -
 /// the advisory lock that prevents forking under concurrency is instead
 /// argued from the module-level doc comment and code inspection.
 #[sqlx::test(migrations = "./migrations")]

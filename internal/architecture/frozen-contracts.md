@@ -37,10 +37,33 @@ constants, which score feeds the tier gate, the recommendation threshold, the ha
 `design/01-core-scoring-layer-open-questions.md`); they are logic/values, not shapes, and migrations
 are additive, so the schema freezes independently of them.
 
-## Deferred — the highest-risk interface, NOT yet freezable
+## Frozen now (canonical: `design/02-sensor-framework.md`)
 
-- **Sensor → intake signed-event wire format.** Flagged open in both `design/02-sensor-framework.md:19`
-  and `design/03-event-intake-aggregation.md:19`. It belongs to sub-project 2's design (not yet done).
-  It is **not** the same as the `event` *storage* shape above — it is the on-the-wire, signed format a
-  sensor emits to intake. This MUST be settled at sub-project 2 design time, before 02 and 03 fork,
-  because 03 consumes it. Recorded here so it is not lost.
+4. **Sensor → intake wire contract** (`02-sensor-framework.md` § The sensor to intake wire contract).
+   Settled and frozen 2026-07-20, closing the deferred item below. It is **not** the `event` *storage*
+   shape above — it is the on-the-wire format a sensor emits to intake, which sub-project 3 consumes.
+   Three parts: (a) the **event record** — one NDJSON line carrying exactly the facts
+   `EventInput::from_signal` needs (`v`, `source_ip`, `wan_ip`, `sensor`, `signal_type`, `protocol`,
+   `authenticated`, `observed_at` at µs, `metadata`, optional `sample`); the sensor never emits
+   weight/confidence/category (intake derives them from `signal_type`). (b) the **sample side channel**
+   — captured file bodies in an isolated quarantine spool named by SHA-256, referenced from the event,
+   never inline. (c) the **integrity model** — the amendment below. The one canonical type lives in
+   `crates/sensor-wire`, imported by both the sensors and intake so it cannot drift.
+   - Two properties of the record are frozen with it, not left to the implementation. `metadata`
+     carries a mandatory **`protocol_label`** on every event from a protocol-speaking sensor: the
+     exact lowercase L7 label (`ssh`, `telnet`, `ftp`), distinct from the L4 `protocol` enum, which
+     sub-project 4 reads to derive a protocol-specific vendor report category. And every
+     attacker-controlled value in `metadata` has passed the **capture sanitization contract** before
+     it reaches the record, which is what stops an attacker-supplied newline from forging an event
+     line in a newline-delimited transport. Both are canonical in `02-sensor-framework.md`.
+   - **Amendment 2026-07-20 (ADR-0010):** the wording "signed events" is replaced by "structured,
+     channel-isolated events." Sensor-side cryptographic signing is impossible under the no-secrets
+     posture (a key is a secret) and pointless against sensor compromise. Integrity is the OS
+     one-directional channel (trust boundary) plus the ledger hash chain applied at intake
+     (tamper-evidence). See ADR-0010.
+
+## Deferred — resolved, retained for history
+
+- **Sensor → intake signed-event wire format** — RESOLVED 2026-07-20 and moved to "Frozen now" (item 4
+  above). Was flagged open in `design/02-sensor-framework.md` and `design/03-event-intake-aggregation.md`.
+  The "signed" framing was amended per ADR-0010.

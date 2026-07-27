@@ -1,30 +1,30 @@
-# Core scoring layer — post-merge adversarial audit (2026-07-18)
+# Core scoring layer - post-merge adversarial audit (2026-07-18)
 
 **Method:** 8 independent discipline-grounded auditors read the merged `crates/core-scoring` source
 (commit `fb6bd7f`). Two lenses (anti-spoof, fail-closed) returned **no** findings. The adversarial
 verify phase did **not** complete (session usage limit), so these are **auditor leads, not
-panel-verified** — except the two marked [SOURCE-VERIFIED], which the orchestrator personally confirmed
+panel-verified** - except the two marked [SOURCE-VERIFIED], which the orchestrator personally confirmed
 against source. Everything else needs source-verification before a fix lands.
 
 Status (updated 2026-07-18): fixes in progress on branch `hardening/core-scoring-audit-fixes` (off
 `main`; `main`/`origin` still at `fb6bd7f`). Full serial suite green after each fix (48 tests).
 
 FIXED + committed:
-- #1 confidence `rescale(3)` (was incomplete `round_dp`) — commit `82b520d`.
-- #2 `validate()` enforces signal_type coupling → blocks the confirmed-real forge — commit `e5e4366`.
+- #1 confidence `rescale(3)` (was incomplete `round_dp`) - commit `82b520d`.
+- #2 `validate()` enforces signal_type coupling → blocks the confirmed-real forge - commit `e5e4366`.
 - #3 unbounded weight → SUBSUMED by #2 (weight must equal the small table value).
-- #4 symmetric dedup window (out-of-order events keep their weight) — commit `c9a8a93`.
-- #6 pin READ COMMITTED so the append advisory lock serializes correctly — commit `a864767`.
-- #7 CORRECTION: no panic existed (empty source was already guarded — an earlier grep-without-reading
+- #4 symmetric dedup window (out-of-order events keep their weight) - commit `c9a8a93`.
+- #6 pin READ COMMITTED so the append advisory lock serializes correctly - commit `a864767`.
+- #7 CORRECTION: no panic existed (empty source was already guarded - an earlier grep-without-reading
   claim was wrong). Converted to the real minor fix: `rebuild_projection` returns `Ok(None)` for an
-  empty source (was `Err(Corrupt)`), matching `read_score` — commit `4310282`.
+  empty source (was `Err(Corrupt)`), matching `read_score` - commit `4310282`.
 
 ALSO FIXED + committed:
 - #5 `read_score` re-derives gate flags at read time (shared `derive_projection` extracted from
-  `apply_event`; pure, never persisted) — commit `7e0fd20`.
-- #11 Corrupt fail-closed test + #12 per-field tamper detection (all 11 canonical fields) — `fb16d00`.
-- #13 IPv6 `/64` dedupe test + #15 `effective_score` cap test + #16 exact tier-floor boundaries — `209edad`.
-- #14 real-DB breadth test (tcp AND auth required on the same event) — `f7cb2d9`.
+  `apply_event`; pure, never persisted) - commit `7e0fd20`.
+- #11 Corrupt fail-closed test + #12 per-field tamper detection (all 11 canonical fields) - `fb16d00`.
+- #13 IPv6 `/64` dedupe test + #15 `effective_score` cap test + #16 exact tier-floor boundaries - `209edad`.
+- #14 real-DB breadth test (tcp AND auth required on the same event) - `f7cb2d9`.
 - #18 `verify_chain` tail-truncation limitation documented in code.
 
 DEFERRED (deliberately):
@@ -37,7 +37,7 @@ DEFERRED (deliberately):
 
 NEXT: full serial re-audit + suite, then merge `hardening/core-scoring-audit-fixes` -> `main`.
 
-## A. Real defects — fix (code)
+## A. Real defects - fix (code)
 
 1. **[SOURCE-VERIFIED] Confidence hash normalization is incomplete → `verify_chain` false-breaks.**
    `repository/events.rs:120` uses `confidence.round_dp(3)`, which trims excess scale but does not PAD;
@@ -63,7 +63,7 @@ NEXT: full serial re-audit + suite, then merge `hardening/core-scoring-audit-fix
 
 4. **Dedup window is one-sided → out-of-order events always dedupe (false-negative).**
    `events.rs:187-190` (and mirrored `replay.rs:139-142`): `deduped = (observed_at - prior).num_seconds()
-   <= 60`. A negative elapsed (event arrives with an EARLIER `observed_at` than the prior recorded one —
+   <= 60`. A negative elapsed (event arrives with an EARLIER `observed_at` than the prior recorded one -
    ordinary under buffered sensors / multi-collector clock skew) is trivially `<= 60`, so the event is
    deduped and its full weight is dropped from `raw_score`, suppressing a genuinely severe confirmed-real
    attacker below the tier/blocklist floors. **Fix:** symmetric window `elapsed.abs() <= 60` in both
@@ -72,7 +72,7 @@ NEXT: full serial re-audit + suite, then merge `hardening/core-scoring-audit-fix
 5. **`read_score` returns a live-projected `raw_score` alongside stale write-time gate flags.**
    `events.rs:284-291` decays only `raw_score`; `eligible`/`tier`/`recommended_*`/`max_confidence`/
    `distinct_categories` are returned as computed at the last write. A quiet-since-write IP reads back
-   `raw_score ~= 0` yet `tier: Aggressive, recommended_for_vendor: true` — the exact false-tier the design
+   `raw_score ~= 0` yet `tier: Aggressive, recommended_for_vendor: true` - the exact false-tier the design
    guards against at write time. **Fix:** `read_score` re-derives the gate flags at now (decay the
    breakdown + rerun the gates), OR is restricted to not return misleading flags. Design choice to confirm.
 
@@ -100,12 +100,12 @@ NEXT: full serial re-audit + suite, then merge `hardening/core-scoring-audit-fix
 10. **`read_stored_score` is public but is a test-only comparison helper** (`repository/mod.rs:13`); a
     consumer could call it instead of `read_score` and get an un-decayed score. **Fix:** `pub(crate)`.
 
-## C. Missing tests (add — these guard load-bearing invariants)
+## C. Missing tests (add - these guard load-bearing invariants)
 
-11. **`RepoError::Corrupt` fail-closed path has zero test coverage** — no test writes malformed
+11. **`RepoError::Corrupt` fail-closed path has zero test coverage** - no test writes malformed
     `category_breakdown` via SQL and asserts `Err(Corrupt)` (not panic). A future refactor could reintroduce
     the panic silently.
-12. **Tamper detection tests only mutate the `weight` column** — 8 of 11 canonical fields untested,
+12. **Tamper detection tests only mutate the `weight` column** - 8 of 11 canonical fields untested,
     including `authenticated`/`category`/`protocol` (the anti-spoof-critical ones). Add per-field tamper
     tests via real SQL + `verify_chain`.
 13. **IPv6 `/64` dedupe branch untested** (`breadth.rs:35-41`).
@@ -113,7 +113,7 @@ NEXT: full serial re-audit + suite, then merge `hardening/core-scoring-audit-fix
     arbitrary `wan: i32` straight into `apply_event`; never calls `distinct_wan_count`). Add a test that
     drives the real breadth path with adversarial vantage shapes.
 15. **`effective_score` SCORE_CAP clamp never tested** (raw*factor > 100).
-16. **Exact-floor boundary tests missing** — STANDARD floor (raw 75 / conf 0.70) and the 0.5 live-floor
+16. **Exact-floor boundary tests missing** - STANDARD floor (raw 75 / conf 0.70) and the 0.5 live-floor
     exactly, per the spec's own testing-strategy section.
 
 ## D. Document / defer (design-level, minor)
@@ -121,7 +121,7 @@ NEXT: full serial re-audit + suite, then merge `hardening/core-scoring-audit-fix
 17. **`ingested_at` is stored but not in the content hash.** Largely unavoidable (set by DB `DEFAULT
     now()` at insert, after the hash is computed) and unused by scoring; document as out of the
     content-hash envelope, or move ingestion time into the hashed payload if forensic integrity is required.
-18. **`verify_chain` has no head/length anchor** — tail-truncation of the newest events leaves a valid
+18. **`verify_chain` has no head/length anchor** - tail-truncation of the newest events leaves a valid
     prefix that reads `Intact`. Inherent to an unsigned chain; needs a signed head/tip anchor to close.
     Document as a known limitation.
 19. **Per-category `category_breakdown` weight is uncapped** while `raw_score` caps at 100; a consumer

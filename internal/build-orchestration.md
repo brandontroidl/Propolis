@@ -16,7 +16,7 @@ single sub-project's build (subagent fan-out). We never run two sub-project *bui
   and holds the security gate.
 - **In-session fan-out is the engine.** Extra hands come from `Agent`/`Workflow` subagents spawned
   *inside* the orchestrator, not from additional terminals. Rationale: one orchestrator + fan-out beats
-  N coordinating sessions for a single coherent task (operating-doctrine §6) — separate sessions add
+  N coordinating sessions for a single coherent task (operating-doctrine §6) - separate sessions add
   merge/drift/coordination cost without reducing the work.
 - **Optional live-ops terminal**, added only when there is a running node to watch (drive the `verify`
   skill against the real path, tail logs). Not needed until an upper layer runs.
@@ -26,7 +26,7 @@ single sub-project's build (subagent fan-out). We never run two sub-project *bui
 
 ## The panel (evidence-judged design debate)
 
-Used to resolve open design questions and pressure-test decisions. Not politics — the seat whose
+Used to resolve open design questions and pressure-test decisions. Not politics - the seat whose
 position has the best *evidenced* outcome for the project wins.
 
 - **Mechanism:** an in-session `Workflow`. Bounded rounds, many fast round-trips.
@@ -41,10 +41,10 @@ position has the best *evidenced* outcome for the project wins.
 
 ## Model-tier roles
 
-- **Fable** — fast/cheap primary brain for build tasks; a panel seat.
-- **Opus** — orchestration, hardest design reasoning, the security gate, a panel seat.
-- **Sonnet** — mid build tasks; a panel seat.
-- **Haiku** — mechanical/cheap sweeps (grep, boilerplate, formatting); the cheap-skeptic panel seat.
+- **Fable** - fast/cheap primary brain for build tasks; a panel seat.
+- **Opus** - orchestration, hardest design reasoning, the security gate, a panel seat.
+- **Sonnet** - mid build tasks; a panel seat.
+- **Haiku** - mechanical/cheap sweeps (grep, boilerplate, formatting); the cheap-skeptic panel seat.
 
 ## The serial build loop
 
@@ -53,11 +53,11 @@ position has the best *evidenced* outcome for the project wins.
    sensor→intake **signed-event format** (flagged in docs 02 and 03 as the highest-risk unspecified
    interface). Migrations stay additive.
 2. Then, **per sub-project, in roadmap order**, the three-stage cycle:
-   - **Spec** — design settled and written (panel resolves open questions) before any code.
-   - **Plan** — spec decomposed into an ordered, verifiable implementation plan (`writing-plans`).
-   - **Build** — small, independently-verified increments; subagent fan-out on disjoint tasks;
+   - **Spec** - design settled and written (panel resolves open questions) before any code.
+   - **Plan** - spec decomposed into an ordered, verifiable implementation plan (`writing-plans`).
+   - **Build** - small, independently-verified increments; subagent fan-out on disjoint tasks;
      mutation serialized on contended files.
-3. A sub-project is **done only when the whole loop is wired end-to-end and verified** — not when the
+3. A sub-project is **done only when the whole loop is wired end-to-end and verified** - not when the
    happy path compiles. The next sub-project's spec begins only then.
 
 ## Guardrails every worker/subagent carries

@@ -77,7 +77,7 @@ impl EventInput {
 pub enum ValidationError {
     ConfidenceOutOfRange,
     SensorEmpty,
-    /// `category`/`weight`/`confidence` do not match `signal_weight(signal_type)` — a desynced
+    /// `category`/`weight`/`confidence` do not match `signal_weight(signal_type)` - a desynced
     /// event that could forge the confirmed-real latch or corrupt the ledger weight.
     SignalTypeMismatch,
 }

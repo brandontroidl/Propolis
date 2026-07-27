@@ -233,12 +233,12 @@ cost.
 decayed = prev * 0.5 ^ (elapsed_seconds / half_life_seconds)
 ```
 
-- `half_life_seconds` default 21600 (6 hours) — ratified as the SOLE operator-tunable scoring knob;
+- `half_life_seconds` default 21600 (6 hours) - ratified as the SOLE operator-tunable scoring knob;
   every other threshold is a fixed source constant. Do NOT shorten it for multi-WAN and do NOT tie it
   to WAN count: decay is monotonic in inter-arrival time, so no half-life value neutralizes multi-WAN
   fan-in, and shortening permanently suppresses a confirmed-real slow attacker. Rider (enforce as a
   merge gate): any new high-frequency signal type must justify its confidence value against the
-  consolidation math before merge — a careless high confidence on a high-volume signal is the one path
+  consolidation math before merge - a careless high confidence on a high-volume signal is the one path
   that turns consolidation into a false-tier vector at any half-life.
 - Score is capped at 100 after accumulation.
 - Clock-skew clamp: if `elapsed_seconds <= 0`, return `prev` unchanged. Decay only ever
@@ -270,7 +270,7 @@ factor = 1 + min(BREADTH_CAP, BREADTH_PER_WAN * max(0, distinct_wan_count - 1))
 effective_score = min(100, raw_score * factor)
 ```
 
-Settled values (ratified; magnitude is provisional — revalidate against real multi-WAN traces once
+Settled values (ratified; magnitude is provisional - revalidate against real multi-WAN traces once
 collected, and expect to tune down):
 
 - `BREADTH_PER_WAN = 0.15`
@@ -324,7 +324,7 @@ otherwise   ->  None
 `max_confidence` here is live-decayed, never a sticky lifetime maximum: it is the maximum, over
 categories whose decayed breakdown weight exceeds the 0.5 live floor (the same floor as
 `distinct_categories`), of that category's stored max confidence. Because decay is asymptotic and never
-reaches exactly 0, the 0.5 floor — not a literal "> 0" — is what makes a category drop out; a category
+reaches exactly 0, the 0.5 floor - not a literal "> 0" - is what makes a category drop out; a category
 that fades below 0.5 stops contributing its confidence, so a faded high-confidence event stops holding a
 tier open. A score of 92 with confidence 0.80 is STANDARD, not AGGRESSIVE: the
 confidence floor is not met. `tier` and `eligible` are independent facts; an IP can be eligible with
@@ -339,7 +339,7 @@ recommended_for_vendor     = eligible AND tier is not None          (tier on raw
 recommended_for_blocklist  = eligible AND effective_score >= BLOCKLIST_FLOOR
 ```
 
-`BLOCKLIST_FLOOR = 50` is a fixed source constant (provisional — the blocklist is published publicly,
+`BLOCKLIST_FLOOR = 50` is a fixed source constant (provisional - the blocklist is published publicly,
 so a floor set too low degrades the list for third-party consumers, not just the operator; validate
 against real data and instrument over/under-inclusion). Any "report to vendor" action is structurally
 absent from the blocklist path, so the blocklist floor can never leak into the vendor surface.
@@ -387,14 +387,14 @@ scoring path rather than mocks.
   does not increment `distinct_wan_count` (authenticated-vantage filter); two WAN IPs in the same
   `/24` count once (dedupe). A spoofed multi-WAN burst yields `distinct_wan_count` of at most 1.
 - Tier runs on raw, not effective: an eligible IP with `raw_score = 60` and `effective_score = 96`
-  (high breadth) tiers `None` — breadth cannot promote it to a vendor tier.
+  (high breadth) tiers `None` - breadth cannot promote it to a vendor tier.
 - Live-decayed confidence: an IP whose only high-confidence event has decayed to zero weight no longer
   meets the tier confidence floor, even if its lifetime maximum confidence was high.
 - Split recommendation: `recommended_for_vendor` is true only when the raw tier is not None;
   `recommended_for_blocklist` is true only when `effective_score >= BLOCKLIST_FLOOR`; each requires
   `eligible`. A broad-but-low confirmed-real IP can be blocklist-recommended while vendor-None.
 
-## Open questions — RESOLVED
+## Open questions - RESOLVED
 
 All four were resolved by an evidence-judged panel and ratified by the operator on 2026-07-17. The
 settled decisions are folded into the sections above; full rationale and surviving dissent live in
@@ -402,7 +402,7 @@ settled decisions are folded into the sections above; full rationale and survivi
 
 1. Breadth constants: `0.15` / `0.60`, WAN-breadth only (sensor-breadth rejected), with a hardened
    `distinct_wan_count` denominator (authenticated-vantage filter + `/24`/ASN dedupe). Magnitude is
-   provisional — revalidate on real multi-WAN traces.
+   provisional - revalidate on real multi-WAN traces.
 2. Which score feeds the tier gate: the RAW decayed score, not the breadth-boosted score. Plus:
    `max_confidence` in the tier gate is the live-decayed value, not a sticky lifetime maximum.
 3. Recommendation: split into `recommended_for_vendor` (raw tier) and `recommended_for_blocklist`

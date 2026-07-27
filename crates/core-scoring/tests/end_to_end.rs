@@ -1,5 +1,5 @@
 //! End-to-end scenarios against a real Postgres, using ONLY the crate's
-//! public API (`core_scoring::...`) — no submodule paths.
+//! public API (`core_scoring::...`) - no submodule paths.
 //!
 //! Run with `DATABASE_URL` exported (see `.env`):
 //!   set -a; . ./.env; set +a; cargo test -p core-scoring --test end_to_end
@@ -10,9 +10,9 @@
 //! invariant end-to-end (real DB, real transactional append path, real
 //! projection read), not just at the pure-function level:
 //!
-//!   (A) breadth from non-confirmed-real signals — even genuine (not spoofed)
+//!   (A) breadth from non-confirmed-real signals - even genuine (not spoofed)
 //!       authenticated-TCP breadth across several distinct WANs, multiple
-//!       categories, and multiple events — never confers eligibility, because
+//!       categories, and multiple events - never confers eligibility, because
 //!       no event was ever tcp+authenticated+honeypot.
 //!   (B) one confirmed-real honeypot event plus a second corroborating
 //!       category crosses into eligible, with the tier/vendor recommendation
@@ -51,7 +51,7 @@ fn ev(
 /// (A) Spoof stays unreportable: several NON-confirmed-real events from one
 /// source, spread across three distinct authenticated-TCP WAN vantages (real
 /// breadth, not the spoofed unauthenticated kind) and three distinct
-/// categories (Auth, Waf, Network) — but never a tcp+authenticated+honeypot
+/// categories (Auth, Waf, Network) - but never a tcp+authenticated+honeypot
 /// event. `has_confirmed_real` must never latch, so `eligible` and
 /// `recommended_for_vendor` must stay false no matter how much breadth,
 /// category diversity, or event count accrues.
@@ -59,7 +59,7 @@ fn ev(
 async fn spoof_without_confirmed_real_stays_unreportable(pool: PgPool) -> Result<(), RepoError> {
     const IP: &str = "203.0.113.50";
 
-    // Auth category, tcp+authenticated, on wan1 — real (non-spoofed) breadth.
+    // Auth category, tcp+authenticated, on wan1 - real (non-spoofed) breadth.
     append_event(
         &pool,
         ev(
@@ -90,7 +90,7 @@ async fn spoof_without_confirmed_real_stays_unreportable(pool: PgPool) -> Result
     )
     .await?;
 
-    // Waf category, tcp+authenticated, on a third distinct /24 WAN vantage —
+    // Waf category, tcp+authenticated, on a third distinct /24 WAN vantage -
     // three real authenticated vantages now, plus a third distinct category.
     append_event(
         &pool,
@@ -136,7 +136,7 @@ async fn spoof_without_confirmed_real_stays_unreportable(pool: PgPool) -> Result
     .await?;
 
     // Sanity: this scenario really did accrue event count, category
-    // diversity, and authenticated WAN breadth — so the negative assertions
+    // diversity, and authenticated WAN breadth - so the negative assertions
     // below are not vacuous.
     assert_eq!(s.event_count, 5);
     assert!(
@@ -160,7 +160,7 @@ async fn spoof_without_confirmed_real_stays_unreportable(pool: PgPool) -> Result
 /// (B) Confirmed-real, corroborated -> eligible + tiered.
 ///
 /// One `honeypot_malware_upload` (tcp+authenticated) event alone raises raw
-/// to 80 (weight 80, confidence 0.980, category Honeypot) — already above the
+/// to 80 (weight 80, confidence 0.980, category Honeypot) - already above the
 /// STANDARD floor (raw >= 75) on its own. A second, small `suricata_sev3`
 /// event (weight 5, confidence 0.300, category Ids) supplies the second
 /// distinct category and second event `eligible` requires, without pushing
@@ -220,7 +220,7 @@ async fn confirmed_real_plus_second_category_is_eligible_and_tiered(
 /// `suricata_sev2` event (weight 15, Ids) for the second category. A THIRD
 /// event repeats `honeypot_connection` within the dedup window (so it adds NO
 /// weight) but on a third distinct authenticated-TCP WAN vantage, so it still
-/// raises `distinct_wan_count` to 3 — breadth accrued without inflating raw.
+/// raises `distinct_wan_count` to 3 - breadth accrued without inflating raw.
 /// `effective_score = raw * breadth_factor(3) = 55 * 1.3 = 71.5 >= 50`, so
 /// blocklist fires; but `tier` is computed from RAW (55 < 75), so it stays
 /// `None` and the vendor recommendation stays false.
@@ -259,7 +259,7 @@ async fn breadth_raises_blocklist_never_vendor_tier(pool: PgPool) -> Result<(), 
     .await?;
 
     // e3: SAME signal_type as e1, 50s after e1 -> within the 60s dedup window,
-    // so it adds NO weight — but it lands on wan3, a third distinct
+    // so it adds NO weight - but it lands on wan3, a third distinct
     // authenticated-TCP vantage, so distinct_wan_count still rises to 3.
     let s = append_event(
         &pool,

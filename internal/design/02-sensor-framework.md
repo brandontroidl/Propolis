@@ -38,7 +38,7 @@ These are established at the foundation and are not relitigated here; this layer
   vendor reports and the published feed, both in later layers.
 - **Least authority.** Each sensor runs unprivileged under its own dedicated OS user, holds no
   database handle, holds no secrets (no vendor API keys, no DB credentials, no push tokens), and
-  carries only `CAP_NET_BIND_SERVICE` when it must bind a privileged port — granted by the service
+  carries only `CAP_NET_BIND_SERVICE` when it must bind a privileged port - granted by the service
   manager, never by root.
 - **PII dropped at capture.** Passwords and raw payload bodies are dropped at the sensor, at capture
   time, and never enter an emitted event. Where a credential must be read to parse a record, it is
@@ -50,14 +50,14 @@ These are established at the foundation and are not relitigated here; this layer
 
 Four crates, added to the workspace:
 
-- `crates/sensor-wire` — the on-disk event record and sample-reference types (serde). One
+- `crates/sensor-wire` - the on-disk event record and sample-reference types (serde). One
   definition, imported by both the sensors (producer) and sub-project 3 intake (consumer), so the
   wire shape has a single source of truth and cannot drift into two clones.
-- `crates/sensor-framework` — the shared harness (library). Depends on `sensor-wire`. Has no
+- `crates/sensor-framework` - the shared harness (library). Depends on `sensor-wire`. Has no
   database dependency and no secret-bearing dependency, so a sensor built on it cannot hold either by
   construction.
-- `crates/sensor-catchall` — the catch-all listener (binary).
-- `crates/sensor-ssh` — the SSH honeypot (binary).
+- `crates/sensor-catchall` - the catch-all listener (binary).
+- `crates/sensor-ssh` - the SSH honeypot (binary).
 
 Each sensor binary is a thin composition: it configures the framework with its port set and its
 per-connection handler, and the handler emits events. The framework owns everything that must be
@@ -66,11 +66,11 @@ uniform across sensors; a sensor owns only its protocol-specific capture logic.
 ### Vendored cryptographic primitives
 
 The SSH honeypot needs real, correct SSH crypto (a client verifies the key exchange and MAC, so it
-cannot be faked). The SSH *server* — the binary packet protocol, the handshake orchestration, the
-authentication state machine, the fake shell, and all capture — is self-authored Propolis code. The
+cannot be faked). The SSH *server* - the binary packet protocol, the handshake orchestration, the
+authentication state machine, the fake shell, and all capture - is self-authored Propolis code. The
 raw cryptographic *primitives* underneath it (curve25519 key exchange, an ed25519 host key,
-ChaCha20-Poly1305, the hashes) are the small, foundational RustCrypto primitive crates — the same
-family as the `sha2` the core scoring layer already ships for its hash chain — and their pinned
+ChaCha20-Poly1305, the hashes) are the small, foundational RustCrypto primitive crates - the same
+family as the `sha2` the core scoring layer already ships for its hash chain - and their pinned
 source is vendored into the tree (`cargo vendor` + `.cargo/config.toml`), so the build never fetches
 them and no upstream project can be abandoned out from under Propolis. Rationale and the rejected
 alternatives (a third-party SSH server library; reimplementing the primitives) are recorded in
@@ -110,7 +110,7 @@ needs, and nothing derived:
   single source of truth, and `validate()` rejects any record whose signal type is unknown.
 - `observed_at` is UTC at microsecond precision, matching the ledger's hash normalization.
 - `metadata` is sanitized and PII-free: an indicator such as the offered username, the command
-  string, or a probe banner — never a password, never a full payload body. Every attacker-controlled
+  string, or a probe banner - never a password, never a full payload body. Every attacker-controlled
   value in it has passed the capture sanitization contract below; that is a hard precondition of the
   wire format, not a quality-of-implementation matter.
 - `metadata.protocol_label` is the **exact lowercase L7 protocol label**, and it is mandatory on
@@ -128,11 +128,11 @@ needs, and nothing derived:
   attacker-controlled string carried as an indicator only; it is sanitized like any other metadata
   value and is never used as a path component (see Sample side channel).
 
-`wan_ip` is the local WAN IP the connection arrived on — the per-hit WAN attribution the breadth
+`wan_ip` is the local WAN IP the connection arrived on - the per-hit WAN attribution the breadth
 model depends on. The framework resolves it from the accepted connection's local socket address,
 mapped through an operator-supplied local-address to WAN-IP table where NAT or DNAT is in play (the
-operator's WAN IPs are NAT'd to the host). Where no mapping applies — a corroborating sensor with no
-bindable WAN IP — `wan_ip` is null, exactly as the ledger column allows. Aggregating these across
+operator's WAN IPs are NAT'd to the host). Where no mapping applies - a corroborating sensor with no
+bindable WAN IP - `wan_ip` is null, exactly as the ledger column allows. Aggregating these across
 collector nodes is sub-project 3's job; this layer's job is to stamp each event with the WAN IP it
 landed on.
 
@@ -175,7 +175,7 @@ framework writes each captured body to an isolated quarantine spool directory, o
 SHA-256, size-bounded, with no-execute permissions, and never opened or executed by any Propolis
 process. The event references it by SHA-256. Intake reads event and spool together. The SHA-256 is
 both the spool dedup key and, downstream, the VirusTotal lookup key (SP4/SP8). The quarantine store,
-retention, and the operator-approved forward to VirusTotal are downstream layers — this layer only
+retention, and the operator-approved forward to VirusTotal are downstream layers - this layer only
 captures the body sterile and references it.
 
 Four properties of the spool are load-bearing rather than incidental:
@@ -202,11 +202,11 @@ Four properties of the spool are load-bearing rather than incidental:
 The scope's original wording ("signed events") is amended here, because the no-secrets posture makes
 sensor-side cryptographic signing both impossible and pointless: a signature needs a key, a key is a
 secret forbidden on a sensor, and a compromised sensor holding its own signing key would hand that
-key to the attacker — defending against nothing. The real, stronger model has two parts:
+key to the attacker - defending against nothing. The real, stronger model has two parts:
 
 1. **Trust boundary: the OS-enforced one-directional channel.** The sensor's OS user has write-only
    access to its log and spool; intake has read-only access. A sensor compromise can spoil *that
-   sensor's own* lines and reach nothing else — precisely the blast radius the posture already
+   sensor's own* lines and reach nothing else - precisely the blast radius the posture already
    accepts. This boundary is filesystem permissions plus service-manager mounts, kernel-enforced.
 2. **Tamper-evidence: the ledger hash chain (sub-project 1),** applied by intake as it appends each
    event. Altering ingested evidence breaks the chain and is detectable. Integrity of the durable
@@ -222,7 +222,7 @@ cursor (inode, offset, and a content fingerprint, rotation- and truncation-aware
 delivery. This is chosen over a local socket or a message broker because events survive on disk when
 intake is down, so the sensor's hot path never blocks on intake liveness (a hard rule: a protective
 or emit path must never await a downstream that can hang), it is crash-safe, and it keeps the sensor
-trivial — append a line, no network client, no connection state, no database handle. The multi-node
+trivial - append a line, no network client, no connection state, no database handle. The multi-node
 aggregation transport (a direct PostgreSQL write per collector versus a broker in front of intake) is
 sub-project 3's decision; this layer fixes only the sensor to local-log contract.
 
@@ -274,15 +274,15 @@ The framework provides, once, for every sensor:
   no-execute, and return the reference for the event.
 
 A per-connection handler that panics or errors never crashes the accept loop: the framework isolates
-each connection, drops the offending one, and keeps serving — the never-raise contract, at the
+each connection, drops the offending one, and keeps serving - the never-raise contract, at the
 connection boundary.
 
 ## Catch-all listener
 
 Signal `catchall_probe` (category `network`, `authenticated = false`). A from-scratch raw TCP and UDP
 listener across an operator-configured port set (a validated, bounded config; a wide default on the
-order of the old ~50 ports). For each hit it captures a bounded record — a truncated payload sample, a
-banner, and the full observed length — and emits one event. It emulates no protocol and presents no
+order of the old ~50 ports). For each hit it captures a bounded record - a truncated payload sample, a
+banner, and the full observed length - and emits one event. It emulates no protocol and presents no
 service beyond accepting the connection or datagram. UDP is log-only: the listener records the
 datagram and sends nothing back, by construction, so it can never be a reflection or amplification
 vector. A bind failure on any single port is non-fatal.
@@ -302,13 +302,13 @@ key exchange is a multi-round-trip cryptographic proof that the source address i
 user-authentication is the point at which the confirmed-real semantics apply. The server captures the
 offered **username** (an indicator) and drops the password at capture. It accepts the authentication
 (so the attacker reaches the shell and reveals intent) and emits `honeypot_login_attempt` with
-`authenticated = true` — the event that sets `has_confirmed_real` in the ledger.
+`authenticated = true` - the event that sets `has_confirmed_real` in the ledger.
 
 ### Fake shell
 
 On an accepted session the server presents a fake interactive shell backed by an in-memory fake
 filesystem with canned responses. Every command the attacker types is captured as
-`honeypot_command_exec` — the primary telemetry of this sensor, the attacker's actual command
+`honeypot_command_exec` - the primary telemetry of this sensor, the attacker's actual command
 sequence and tooling. An SCP or SFTP transfer is captured as `honeypot_malware_upload` (or
 `honeypot_file_download`): the file body is written sterile to the quarantine spool and the event
 references it by SHA-256; the password and no unbounded content ever enter an event.
@@ -364,8 +364,8 @@ test asserts the sensor opens no outbound connection across a full captured sess
 The honeypot generates and persists its own SSH host key locally, because an SSH server must have one
 and because persisting it stops the honeypot from fingerprinting itself as freshly minted on every
 restart. This host key is not a platform secret: no vendor, database, session, or push credential
-reaches the sensor (the posture is unchanged), and compromise of a honeypot's host key is immaterial
-— impersonating a honeypot has no value. The interaction with the no-secrets posture is recorded in
+reaches the sensor (the posture is unchanged), and compromise of a honeypot's host key is immaterial -
+impersonating a honeypot has no value. The interaction with the no-secrets posture is recorded in
 ADR-0011.
 
 ## Isolation and deployment
@@ -522,7 +522,7 @@ Verified against the real capture and emit path, not mocks. Load-bearing invaria
 Ratified with the operator on 2026-07-20:
 
 1. First TCP-auth honeypot protocol: **SSH**.
-2. Emulation depth: **fake shell (Cowrie-class)** — full command logging plus sterile upload capture,
+2. Emulation depth: **fake shell (Cowrie-class)** - full command logging plus sterile upload capture,
    chosen over the lower-surface login-capture depth for its richer attacker telemetry, under the
    architectural never-exec guarantee.
 3. Malware handling: **sterile capture in this layer** (quarantine spool by SHA-256); the
@@ -533,15 +533,15 @@ Ratified with the operator on 2026-07-20:
 5. SSH implementation: **self-authored SSH server + vendored, pinned crypto primitives in-tree**; no
    third-party SSH server or honeypot library; primitives not reimplemented (ADR-0011).
 
-## Open questions — deferred to their owning layer (not open for this spec)
+## Open questions - deferred to their owning layer (not open for this spec)
 
 These are named so they are not lost, and are explicitly out of scope here:
 
 - Multi-node aggregation transport, backpressure when a collector outruns intake, cross-node dedup of
-  the same hit, and scorer leader election — all sub-project 3.
-- The quarantine store, retention, and the operator-approved VirusTotal and vendor forward paths —
+  the same hit, and scorer leader election - all sub-project 3.
+- The quarantine store, retention, and the operator-approved VirusTotal and vendor forward paths -
   sub-projects 4 and 8.
-- The remaining native sensors (Redis, ADB, malware-capture, credential) — sub-project 8.
+- The remaining native sensors (Redis, ADB, malware-capture, credential) - sub-project 8.
 - **An out-of-band fetcher for captured URLs**, if an operator ever wants the artifact behind one.
   Never the sensor and never inline (see No attacker-directed fetch): a separate disposable process
   in its own network namespace with a default-deny egress allowlist, scheme restriction, resolution

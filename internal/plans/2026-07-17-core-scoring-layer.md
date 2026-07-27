@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build sub-project 1 — the Rust + PostgreSQL library that owns the domain vocabulary, the append-only hash-chained event ledger, the derived per-IP score projection, and the scoring/eligibility/tier/recommendation logic — testable in isolation with no sensors and no live traffic.
+**Goal:** Build sub-project 1 - the Rust + PostgreSQL library that owns the domain vocabulary, the append-only hash-chained event ledger, the derived per-IP score projection, and the scoring/eligibility/tier/recommendation logic - testable in isolation with no sensors and no live traffic.
 
-**Architecture:** Event-sourced. Collectors append immutable events to a hash-chained `event` ledger; the per-IP `ip_score` row is a derived projection, decayed-to-now on read and rebuildable by replay. The crate has no network listeners, no vendor clients, no scheduler — it is a library, a schema, and a scoring function. Canonical spec: `internal/design/01-core-scoring-layer.md`; ratified parameter decisions: `internal/design/01-core-scoring-layer-open-questions.md`; frozen interface contracts: `internal/architecture/frozen-contracts.md`.
+**Architecture:** Event-sourced. Collectors append immutable events to a hash-chained `event` ledger; the per-IP `ip_score` row is a derived projection, decayed-to-now on read and rebuildable by replay. The crate has no network listeners, no vendor clients, no scheduler - it is a library, a schema, and a scoring function. Canonical spec: `internal/design/01-core-scoring-layer.md`; ratified parameter decisions: `internal/design/01-core-scoring-layer-open-questions.md`; frozen interface contracts: `internal/architecture/frozen-contracts.md`.
 
 **Tech Stack:** Rust (2024 edition), `sqlx` (raw SQL + compile-time checking + migrations, async/tokio), `rust_decimal` (exact NUMERIC), `sha2` (SHA-256 chain), `proptest` (property tests), `thiserror` (typed errors), `serde`/`serde_json` (canonical encoding + JSONB).
 
@@ -12,11 +12,11 @@
 
 - **Language:** Rust 2024 edition; toolchain pinned via `rust-toolchain.toml`. Workspace root at repo root; this crate is `crates/core-scoring`.
 - **Dependency vetting:** frozen-lockfile installs; review the `Cargo.lock` diff; pin versions; confirm each crate's current API against its docs before use (do not code crate APIs from memory). No install scripts run.
-- **No float for scores.** All stored and accumulated values — `raw_score`, `confidence`, `max_confidence`, breakdown weights, the breadth factor — are `rust_decimal::Decimal`, never `f64`. The ONE permitted `f64` touchpoint is the decay factor's transcendental exponent `0.5^(elapsed/half_life)` (no exact decimal form exists): compute it in `f64`, convert to `Decimal`, multiply into the `Decimal` score. Scores are never accumulated or stored through `f64`. Task 7 documents this as the single sanctioned touchpoint.
-- **Fail closed.** Any error path — DB error, unreadable value, malformed event — leaves an IP NOT eligible and NOT recommended. A guard whose input is absent or unreadable denies.
+- **No float for scores.** All stored and accumulated values - `raw_score`, `confidence`, `max_confidence`, breakdown weights, the breadth factor - are `rust_decimal::Decimal`, never `f64`. The ONE permitted `f64` touchpoint is the decay factor's transcendental exponent `0.5^(elapsed/half_life)` (no exact decimal form exists): compute it in `f64`, convert to `Decimal`, multiply into the `Decimal` score. Scores are never accumulated or stored through `f64`. Task 7 documents this as the single sanctioned touchpoint.
+- **Fail closed.** Any error path - DB error, unreadable value, malformed event - leaves an IP NOT eligible and NOT recommended. A guard whose input is absent or unreadable denies.
 - **Append-only ledger.** The `event` repository issues INSERT only; never UPDATE/DELETE in the normal path. Corrections are new appended events.
 - **Data minimization.** `metadata` JSONB holds only sanitized, PII-free content. Passwords/payloads are dropped upstream (at the sensor) and are out of scope here; the repository must not add a code path that could persist them.
-- **Constants are fixed source values, not runtime-tunable** — except `half_life_seconds` (the sole operator-tunable knob). Ratified values: `BREADTH_PER_WAN = 0.15`, `BREADTH_CAP = 0.60`, `SCORE_CAP = 100`, `HALF_LIFE_SECONDS = 21600`, `BLOCKLIST_FLOOR = 50`, `DISTINCT_CATEGORY_FLOOR = 0.5` (strict), tier floors AGGRESSIVE `raw>=90 & conf>=0.95` / STANDARD `raw>=75 & conf>=0.70`.
+- **Constants are fixed source values, not runtime-tunable** - except `half_life_seconds` (the sole operator-tunable knob). Ratified values: `BREADTH_PER_WAN = 0.15`, `BREADTH_CAP = 0.60`, `SCORE_CAP = 100`, `HALF_LIFE_SECONDS = 21600`, `BLOCKLIST_FLOOR = 50`, `DISTINCT_CATEGORY_FLOOR = 0.5` (strict), tier floors AGGRESSIVE `raw>=90 & conf>=0.95` / STANDARD `raw>=75 & conf>=0.70`.
 - **Load-bearing invariant (test-asserted):** breadth affects the effective score and the blocklist recommendation only. It never feeds the tier gate or the vendor recommendation, never sets `has_confirmed_real`, and never makes an ineligible IP eligible. Only a confirmed-real event (`protocol=tcp AND authenticated=true AND category=honeypot`) opens eligibility.
 - **Commits:** conventional, lowercase, why-focused body, no AI-attribution trailer, no emoji.
 
@@ -44,7 +44,7 @@ fn crate_builds_and_links() {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p core-scoring --test smoke`
-Expected: FAIL — `VERSION_MARKER` not found / crate does not build.
+Expected: FAIL - `VERSION_MARKER` not found / crate does not build.
 
 - [ ] **Step 3: Write minimal scaffold**
 
@@ -135,7 +135,7 @@ mod tests {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p core-scoring domain::enums`
-Expected: FAIL — types not defined.
+Expected: FAIL - types not defined.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -205,7 +205,7 @@ git commit -m "feat(core-scoring): domain enums and confirmed-real predicate"
 
 **Interfaces:**
 - Consumes: `SignalType`, `Category` (Task 2).
-- Produces: `pub struct SignalWeight { pub weight: u32, pub confidence: Decimal, pub category: Category }` and `pub fn signal_weight(SignalType) -> SignalWeight` (total — every variant has exactly one row).
+- Produces: `pub struct SignalWeight { pub weight: u32, pub confidence: Decimal, pub category: Category }` and `pub fn signal_weight(SignalType) -> SignalWeight` (total - every variant has exactly one row).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -232,7 +232,7 @@ mod tests {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p core-scoring domain::weights`
-Expected: FAIL — `signal_weight` not defined.
+Expected: FAIL - `signal_weight` not defined.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -295,7 +295,7 @@ git commit -m "feat(core-scoring): 16-row signal weight table"
   - `pub struct EventInput { source_ip: IpAddr, wan_ip: Option<IpAddr>, sensor: String, signal_type: SignalType, protocol: Protocol, authenticated: bool, category: Category, weight: u32, confidence: Decimal, observed_at: DateTime<Utc>, metadata: serde_json::Value }`
   - `pub struct IpScore { ... all ip_score columns ... }` (read model).
   - `EventInput::from_signal(source_ip, wan_ip, sensor, signal_type, protocol, authenticated, observed_at, metadata) -> EventInput` that fills `weight`/`confidence`/`category` from `signal_weight` so a caller cannot desync them.
-  - `EventInput::validate(&self) -> Result<(), ValidationError>` and `pub enum ValidationError { ConfidenceOutOfRange, SensorEmpty }` — the spec's append-path validation. Confidence must be in `[0, 1]`; `sensor` non-empty. (Most invalidity is already unrepresentable: `source_ip`/`wan_ip` are typed `IpAddr`, `signal_type`/`protocol`/`category` are typed enums, so a malformed IP or unknown signal type cannot be constructed here — those are rejected at the intake boundary in sub-project 3.)
+  - `EventInput::validate(&self) -> Result<(), ValidationError>` and `pub enum ValidationError { ConfidenceOutOfRange, SensorEmpty }` - the spec's append-path validation. Confidence must be in `[0, 1]`; `sensor` non-empty. (Most invalidity is already unrepresentable: `source_ip`/`wan_ip` are typed `IpAddr`, `signal_type`/`protocol`/`category` are typed enums, so a malformed IP or unknown signal type cannot be constructed here - those are rejected at the intake boundary in sub-project 3.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -326,7 +326,7 @@ mod tests {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p core-scoring domain::types`
-Expected: FAIL — types not defined.
+Expected: FAIL - types not defined.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -373,8 +373,8 @@ async fn migrations_apply_and_expose_expected_columns(pool: sqlx::PgPool) -> sql
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p core-scoring --test migrations` (needs a reachable Postgres; `sqlx::test` provisions a disposable DB — confirm `DATABASE_URL` and the `sqlx::test` setup against current sqlx docs).
-Expected: FAIL — no migrations.
+Run: `cargo test -p core-scoring --test migrations` (needs a reachable Postgres; `sqlx::test` provisions a disposable DB - confirm `DATABASE_URL` and the `sqlx::test` setup against current sqlx docs).
+Expected: FAIL - no migrations.
 
 - [ ] **Step 3: Write the migrations**
 
@@ -430,11 +430,11 @@ fn prev_hash_is_bound_into_the_chain() {
 - [ ] **Step 2: Run to verify fail**
 
 Run: `cargo test -p core-scoring hashing`
-Expected: FAIL — not defined.
+Expected: FAIL - not defined.
 
 - [ ] **Step 3: Implement**
 
-`canonical_bytes` serializes fields in a FIXED order with length-prefixed encoding (not `serde_json`, whose key order is not guaranteed): e.g. write each field as `len(u32 LE) || bytes` for strings/IPs/metadata (metadata via `serde_json::to_vec` of a `BTreeMap`-sorted value), fixed-width for numerics (`confidence` as its `Decimal` string bytes, `weight` as `u32 LE`, timestamps as RFC3339 bytes). `chain_hash` feeds `prev.unwrap_or(&[])` then `canonical_bytes` into `sha2::Sha256`. Document that the encoding is frozen — changing it breaks all existing chains.
+`canonical_bytes` serializes fields in a FIXED order with length-prefixed encoding (not `serde_json`, whose key order is not guaranteed): e.g. write each field as `len(u32 LE) || bytes` for strings/IPs/metadata (metadata via `serde_json::to_vec` of a `BTreeMap`-sorted value), fixed-width for numerics (`confidence` as its `Decimal` string bytes, `weight` as `u32 LE`, timestamps as RFC3339 bytes). `chain_hash` feeds `prev.unwrap_or(&[])` then `canonical_bytes` into `sha2::Sha256`. Document that the encoding is frozen - changing it breaks all existing chains.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -523,7 +523,7 @@ git commit -m "feat(core-scoring): decay math with clock-skew clamp"
 **Interfaces:**
 - Consumes: constants (Task 7).
 - Produces:
-  - `pub fn distinct_wan_count(vantages: &[WanVantage]) -> u32` where `WanVantage { wan_ip: IpAddr, saw_authenticated_tcp: bool }` — counts a WAN only if `saw_authenticated_tcp`, deduped by `/24` (IPv4) / `/64` (IPv6).
+  - `pub fn distinct_wan_count(vantages: &[WanVantage]) -> u32` where `WanVantage { wan_ip: IpAddr, saw_authenticated_tcp: bool }` - counts a WAN only if `saw_authenticated_tcp`, deduped by `/24` (IPv4) / `/64` (IPv6).
   - `pub fn breadth_factor(distinct_wan_count: u32) -> Decimal` = `1 + min(BREADTH_CAP, BREADTH_PER_WAN * max(0, n-1))`.
   - `pub fn effective_score(raw_score: Decimal, distinct_wan_count: u32) -> Decimal` = `min(100, raw_score * factor)`.
 
@@ -560,7 +560,7 @@ fn same_24_counts_once() {
 Run: `cargo test -p core-scoring scoring::breadth`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement** the three functions. For `/24` dedupe, mask IPv4 to the high 24 bits (IPv6 to /64) and collect authenticated vantages into a `HashSet` of masked prefixes; count the set size. (ASN dedupe is deferred/best-effort per the ratified decision and is out of scope for this task — leave a documented extension point, no stub code.)
+- [ ] **Step 3: Implement** the three functions. For `/24` dedupe, mask IPv4 to the high 24 bits (IPv6 to /64) and collect authenticated vantages into a `HashSet` of masked prefixes; count the set size. (ASN dedupe is deferred/best-effort per the ratified decision and is out of scope for this task - leave a documented extension point, no stub code.)
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -604,11 +604,11 @@ fn distinct_categories_floor_is_strict_at_half() {
 }
 ```
 
-- [ ] **Step 2: Run to verify fail** — `cargo test -p core-scoring scoring::eligibility`; FAIL.
+- [ ] **Step 2: Run to verify fail** - `cargo test -p core-scoring scoring::eligibility`; FAIL.
 
 - [ ] **Step 3: Implement** both functions (`> dec!(0.5)` strict; `eligible = has_confirmed_real && event_count >= 2 && distinct_categories >= 2`).
 
-- [ ] **Step 4: Run to verify pass** — PASS.
+- [ ] **Step 4: Run to verify pass** - PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -628,7 +628,7 @@ git commit -m "feat(core-scoring): eligibility gate with strict category floor"
 **Interfaces:**
 - Consumes: `FeedTier`, constants, `effective_score` (Task 8).
 - Produces:
-  - `pub fn tier(raw_score: Decimal, max_confidence: Decimal) -> Option<FeedTier>` — on RAW score, AGGRESSIVE tested first.
+  - `pub fn tier(raw_score: Decimal, max_confidence: Decimal) -> Option<FeedTier>` - on RAW score, AGGRESSIVE tested first.
   - `pub fn recommended_for_vendor(eligible: bool, tier: Option<FeedTier>) -> bool`.
   - `pub fn recommended_for_blocklist(eligible: bool, effective_score: Decimal) -> bool` (`effective_score >= 50`).
 
@@ -656,11 +656,11 @@ fn recommendation_split() {
 }
 ```
 
-- [ ] **Step 2: Run to verify fail** — FAIL.
+- [ ] **Step 2: Run to verify fail** - FAIL.
 
-- [ ] **Step 3: Implement** — AGGRESSIVE `raw>=90 && conf>=0.95`, else STANDARD `raw>=75 && conf>=0.70`, else None; the two recommendation functions.
+- [ ] **Step 3: Implement** - AGGRESSIVE `raw>=90 && conf>=0.95`, else STANDARD `raw>=75 && conf>=0.70`, else None; the two recommendation functions.
 
-- [ ] **Step 4: Run to verify pass** — PASS.
+- [ ] **Step 4: Run to verify pass** - PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -679,7 +679,7 @@ git commit -m "feat(core-scoring): raw-score tier gate and split recommendation"
 
 **Interfaces:**
 - Consumes: everything in `scoring/`, `EventInput`, `IpScore`, `is_confirmed_real`.
-- Produces: `pub fn apply_event(prev: Option<IpScore>, event: &EventInput, half_life_seconds: i64) -> IpScore` — the pure accumulate step: decays the stored `raw_score` from `prev.decay_anchor` to `event.observed_at`, decays each category breakdown weight by the same factor, adds this event's weight (capped 100), sets a fresh `decay_anchor = event.observed_at`, updates `max_confidence` over the live-decayed breakdown, `event_count += 1`, `has_confirmed_real |= is_confirmed_real(...)`, recomputes `distinct_categories`, `eligible`, `tier`, `recommended_for_vendor`, `recommended_for_blocklist`. Dedup handling (same source+signal within window: no weight added, but decay-to-now, refresh `last_seen`, union protocol, recompute flags) lives here behind a `deduped: bool` parameter.
+- Produces: `pub fn apply_event(prev: Option<IpScore>, event: &EventInput, half_life_seconds: i64) -> IpScore` - the pure accumulate step: decays the stored `raw_score` from `prev.decay_anchor` to `event.observed_at`, decays each category breakdown weight by the same factor, adds this event's weight (capped 100), sets a fresh `decay_anchor = event.observed_at`, updates `max_confidence` over the live-decayed breakdown, `event_count += 1`, `has_confirmed_real |= is_confirmed_real(...)`, recomputes `distinct_categories`, `eligible`, `tier`, `recommended_for_vendor`, `recommended_for_blocklist`. Dedup handling (same source+signal within window: no weight added, but decay-to-now, refresh `last_seen`, union protocol, recompute flags) lives here behind a `deduped: bool` parameter.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -703,11 +703,11 @@ proptest! {
 }
 ```
 
-- [ ] **Step 2: Run to verify fail** — FAIL.
+- [ ] **Step 2: Run to verify fail** - FAIL.
 
-- [ ] **Step 3: Implement** `apply_event` composing Tasks 7-10. Breadth (`distinct_wan_count`/`effective_score`) is threaded from the repository layer's vantage set (Task 12); in the pure engine, accept the current `distinct_wan_count` on `prev`/passed in and compute `effective_score` for the blocklist flag only. The engine must read the UN-projected stored `raw_score` (the caller passes the stored value, never a read-projected one) — see Task 12's double-decay guard.
+- [ ] **Step 3: Implement** `apply_event` composing Tasks 7-10. Breadth (`distinct_wan_count`/`effective_score`) is threaded from the repository layer's vantage set (Task 12); in the pure engine, accept the current `distinct_wan_count` on `prev`/passed in and compute `effective_score` for the blocklist flag only. The engine must read the UN-projected stored `raw_score` (the caller passes the stored value, never a read-projected one) - see Task 12's double-decay guard.
 
-- [ ] **Step 4: Run to verify pass** — PASS.
+- [ ] **Step 4: Run to verify pass** - PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -718,7 +718,7 @@ git commit -m "feat(core-scoring): pure projection accumulate step"
 
 ---
 
-### Task 12: Repository — append path + projection (real Postgres)
+### Task 12: Repository - append path + projection (real Postgres)
 
 **Files:**
 - Create: `crates/core-scoring/src/repository/mod.rs`, `crates/core-scoring/src/repository/events.rs`
@@ -728,8 +728,8 @@ git commit -m "feat(core-scoring): pure projection accumulate step"
 - Consumes: engine (Task 11), hashing (Task 6), migrations (Task 5).
 - Produces:
   - `pub enum RepoError { Db(sqlx::Error), Invalid(ValidationError), Chain(String) }` (via `thiserror`; `From<sqlx::Error>` and `From<ValidationError>`). Fail-closed: any variant means the caller gets an error and NO projection was committed (the transaction rolls back).
-  - `append_event(&PgPool, EventInput) -> Result<IpScore, RepoError>` — calls `event.validate()?` FIRST (a malformed event is rejected by error, never a panic, and nothing is written), then in ONE transaction: read the current chain head hash, compute `chain_hash`, INSERT the event, read the UN-PROJECTED stored `ip_score` row, call `apply_event`, UPSERT the projection, commit. Dedup window checked on `(source_ip, signal_type)`.
-  - `read_score(&PgPool, IpAddr) -> Result<Option<IpScore>, RepoError>` — reads the stored row and projects `raw_score` to now as a pure read (never writes back).
+  - `append_event(&PgPool, EventInput) -> Result<IpScore, RepoError>` - calls `event.validate()?` FIRST (a malformed event is rejected by error, never a panic, and nothing is written), then in ONE transaction: read the current chain head hash, compute `chain_hash`, INSERT the event, read the UN-PROJECTED stored `ip_score` row, call `apply_event`, UPSERT the projection, commit. Dedup window checked on `(source_ip, signal_type)`.
+  - `read_score(&PgPool, IpAddr) -> Result<Option<IpScore>, RepoError>` - reads the stored row and projects `raw_score` to now as a pure read (never writes back).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -762,11 +762,11 @@ async fn double_decay_guard_across_one_half_life(pool: PgPool) -> Result<(), Rep
 }
 ```
 
-- [ ] **Step 2: Run to verify fail** — FAIL.
+- [ ] **Step 2: Run to verify fail** - FAIL.
 
 - [ ] **Step 3: Implement** the transactional append (INSERT-only on `event`; `INSERT ... ON CONFLICT (source_ip) DO UPDATE` on `ip_score`) and the read-projection. Confirm `sqlx` transaction + `query!`/`query_as!` macro usage against current sqlx docs. The stored `raw_score`/`decay_anchor` are read WITHIN the transaction before `apply_event`.
 
-- [ ] **Step 4: Run to verify pass** — PASS.
+- [ ] **Step 4: Run to verify pass** - PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -785,8 +785,8 @@ git commit -m "feat(core-scoring): transactional append path and read projection
 
 **Interfaces:**
 - Produces:
-  - `rebuild_projection(&PgPool, IpAddr) -> Result<IpScore, RepoError>` — replays that IP's events in observed order via `apply_event` from empty.
-  - `verify_chain(&PgPool) -> Result<ChainStatus, RepoError>` — recomputes each row's hash + linkage; returns `Intact` or `Broken { first_bad_id }`.
+  - `rebuild_projection(&PgPool, IpAddr) -> Result<IpScore, RepoError>` - replays that IP's events in observed order via `apply_event` from empty.
+  - `verify_chain(&PgPool) -> Result<ChainStatus, RepoError>` - recomputes each row's hash + linkage; returns `Intact` or `Broken { first_bad_id }`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -808,11 +808,11 @@ async fn tampering_breaks_the_chain(pool: PgPool) -> Result<(), RepoError> {
 }
 ```
 
-- [ ] **Step 2: Run to verify fail** — FAIL.
+- [ ] **Step 2: Run to verify fail** - FAIL.
 
 - [ ] **Step 3: Implement** replay (compare projected-to-same-instant to avoid decay-anchor drift in the equality) and chain verification. For replay equality, project both to a common instant before comparing.
 
-- [ ] **Step 4: Run to verify pass** — PASS.
+- [ ] **Step 4: Run to verify pass** - PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -830,15 +830,15 @@ git commit -m "feat(core-scoring): replay rebuild and hash-chain verification"
 - Test: `crates/core-scoring/tests/end_to_end.rs`
 
 **Interfaces:**
-- Produces: the crate's public surface — `append_event`, `read_score`, `rebuild_projection`, `verify_chain`, `EventInput`, `IpScore`, the enums, and `signal_weight`. Nothing else is `pub`.
+- Produces: the crate's public surface - `append_event`, `read_score`, `rebuild_projection`, `verify_chain`, `EventInput`, `IpScore`, the enums, and `signal_weight`. Nothing else is `pub`.
 
-- [ ] **Step 1: Write the failing test** — an end-to-end scenario against a real DB: a spoofable multi-WAN UDP sweep (no confirmed-real) never becomes `eligible`; a confirmed-real honeypot session plus a second category crosses into `eligible` and the correct tier/recommendation; breadth raises `recommended_for_blocklist` but never the vendor tier.
+- [ ] **Step 1: Write the failing test** - an end-to-end scenario against a real DB: a spoofable multi-WAN UDP sweep (no confirmed-real) never becomes `eligible`; a confirmed-real honeypot session plus a second category crosses into `eligible` and the correct tier/recommendation; breadth raises `recommended_for_blocklist` but never the vendor tier.
 
-- [ ] **Step 2: Run to verify fail** — FAIL (API not re-exported).
+- [ ] **Step 2: Run to verify fail** - FAIL (API not re-exported).
 
 - [ ] **Step 3: Implement** the re-exports; delete the smoke marker (update Task 1's `smoke.rs` if it still references it).
 
-- [ ] **Step 4: Run to verify pass** — `cargo test -p core-scoring` (full suite, serial: `--test-threads=1` for the DB tests if they contend).
+- [ ] **Step 4: Run to verify pass** - `cargo test -p core-scoring` (full suite, serial: `--test-threads=1` for the DB tests if they contend).
 
 - [ ] **Step 5: Commit**
 
@@ -851,7 +851,7 @@ git commit -m "feat(core-scoring): public api surface and end-to-end scenario"
 
 ## Notes for the implementer
 
-- **Verify crate APIs against current docs before coding** each `sqlx`/`rust_decimal`/`proptest` step — these evolve; the snippets here are the shape, not a pinned API.
+- **Verify crate APIs against current docs before coding** each `sqlx`/`rust_decimal`/`proptest` step - these evolve; the snippets here are the shape, not a pinned API.
 - **The double-decay guard (Task 12) is the subtle one.** A repository test double where the un-projected read and the projected read return the same value hides the bug; it is caught only by the real-engine + real-repository integration test spanning at least one half-life.
 - **Run the full suite serially before any merge** (`cargo test -p core-scoring -- --test-threads=1`); the `sqlx::test` DB tests can contend otherwise.
 - **Every constant traces to** `internal/design/01-core-scoring-layer-open-questions.md` (ratified) or `01-core-scoring-layer.md`. Do not introduce a new tunable; `half_life_seconds` is the only one.

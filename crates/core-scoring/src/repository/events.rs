@@ -17,7 +17,7 @@
 //! COMMITTED each statement takes a fresh snapshot, so once the lock is granted
 //! the chain-head read sees the prior appender's committed row (under REPEATABLE
 //! READ / SERIALIZABLE the snapshot would freeze before the lock and the chain
-//! could fork — hence the explicit pin). This guarantees, under any number of
+//! could fork - hence the explicit pin). This guarantees, under any number of
 //! concurrent callers:
 //!
 //! - the tamper-evident hash chain cannot fork (no two appends can read the
@@ -33,7 +33,7 @@
 //! This implements the design's "projection advancement is single-writer per
 //! deployment" assumption at the database level. It serializes appends within
 //! ONE Postgres instance; it does not decide WHICH process/node is the writer
-//! of record in a multi-node deployment — that is cluster-level leader
+//! of record in a multi-node deployment - that is cluster-level leader
 //! election, the responsibility of sub-project 7, layered on top of this
 //! DB-level guard.
 
@@ -304,7 +304,7 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
 /// RE-DERIVED, so the returned facts are current rather than frozen at the last write (a category
 /// that has decayed below the 0.5 floor drops eligibility/tier).
 ///
-/// PURE read: the projected value is NEVER written back — the stored row stays un-projected so a
+/// PURE read: the projected value is NEVER written back - the stored row stays un-projected so a
 /// later append reads its raw score un-decayed (double-decay guard).
 pub async fn read_score(pool: &PgPool, ip: IpAddr) -> Result<Option<IpScore>, RepoError> {
     let Some(stored) = read_stored_ip_score(pool, ip).await? else {

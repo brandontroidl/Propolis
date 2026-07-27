@@ -10,7 +10,7 @@ The build is foundation-first. Each layer is built complete before the next begi
 
 Each sub-project is a self-contained unit of work with its own three-stage cycle:
 
-1. **Spec** - the design is settled and written down before any code. The spec names the scope, the invariants the layer must hold, the data shapes and interfaces it owns, and the decisions it closes. Specs live in `docs/superpowers/specs/`.
+1. **Spec** - the design is settled and written down before any code. The spec names the scope, the invariants the layer must hold, the data shapes and interfaces it owns, and the decisions it closes. Specs live in `internal/design/`.
 2. **Plan** - the spec is decomposed into an ordered, verifiable implementation plan.
 3. **Build** - the plan is executed in small, independently verified increments.
 
@@ -26,12 +26,12 @@ Several invariants are established at the foundation and are load-bearing for ev
 
 ## Sub-projects
 
-Eight sub-projects, built in order. Only sub-project 1 has a full written spec so far; sub-projects 2 through 8 are scope stubs that receive their own spec at the start of their own cycle.
+Eight sub-projects, built in order. Sub-projects 1 and 2 have full written specs; sub-projects 3 through 8 are scope stubs that receive their own spec at the start of their own cycle.
 
 | # | Sub-project | Scope | Status |
 |---|---|---|---|
-| 1 | Core scoring layer | Domain model, PostgreSQL schema and event ledger, scoring and decay, the eligibility/weight/recommendation model, and the multi-WAN breadth model. The foundation every later layer imports and depends on. | In design, spec written |
-| 2 | Native sensor framework + catch-all + one TCP-auth sensor | The framework for self-authored, safe-by-construction passive sensors, plus the catch-all listener and one honeypot that produces authenticated TCP-handshake events (the confirmed-real signal the eligibility floor requires). | Design pending |
+| 1 | Core scoring layer | Domain model, PostgreSQL schema and event ledger, scoring and decay, the eligibility/weight/recommendation model, and the multi-WAN breadth model. The foundation every later layer imports and depends on. | **Built and merged** (`crates/core-scoring`), post-merge audit and hardening merged, accepted limitations in ADR-0009 |
+| 2 | Native sensor framework + catch-all + one TCP-auth sensor | The framework for self-authored, safe-by-construction passive sensors, plus the catch-all listener and one honeypot that produces authenticated TCP-handshake events (the confirmed-real signal the eligibility floor requires). | **Spec written** (`design/02-sensor-framework.md`), wire contract frozen, ADR-0010 and ADR-0011 accepted; plan and build pending |
 | 3 | Event intake + multi-node aggregation | Ingest of sensor output into the event ledger with per-hit WAN attribution, and aggregation of all WAN-IP collectors into one shared attacker score so cross-sensor and cross-WAN breadth counts. | Design pending |
 | 4 | Review queue + gatekeeper + reporting | The operator review queue, the per-vendor submission gatekeeper, and the vendor reporting path. The mandatory human-approval gate lives here. | Design pending |
 | 5 | Feed builder + exporters + publisher | Build of the tiered public blocklist from approved IPs, the export formats, and out-of-band publication, with fail-closed validation before publish. | Design pending |
@@ -39,4 +39,4 @@ Eight sub-projects, built in order. Only sub-project 1 has a full written spec s
 | 7 | Runtime composition + multi-node coordination + deployment | The composition root that wires the process, coordination across nodes in a cluster deployment, and the deployment and hardening artifacts. | Design pending |
 | 8 | Remaining native sensors | The remaining self-authored sensors: Redis, ADB, malware-capture, and credential. | Design pending |
 
-Sub-project 1, the core scoring layer, is the only sub-project with a full spec. Sub-projects 2 through 8 are scope stubs: the one-to-two-sentence scope above fixes their boundary, but each earns its full spec, plan, and build when its cycle begins, on the current goals' merits.
+Sub-projects 3 through 8 are scope stubs: the one-to-two-sentence scope above fixes their boundary, but each earns its full spec, plan, and build when its cycle begins, on the current goals' merits.

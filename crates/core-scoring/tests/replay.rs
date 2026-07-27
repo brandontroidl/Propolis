@@ -62,7 +62,7 @@ async fn verify_chain_intact_with_low_scale_confidence(pool: PgPool) -> Result<(
 
 /// Two same-signal events 6h apart, appended in REVERSE chronological order (a buffered/skewed
 /// sensor delivering the earlier event second). The second append is 6h from the prior
-/// observation, far outside the 60s dedup window, so it must NOT be deduped — its weight must be
+/// observation, far outside the 60s dedup window, so it must NOT be deduped - its weight must be
 /// added, not silently dropped (a one-sided `elapsed <= 60` treats any negative elapsed as a dup).
 #[sqlx::test(migrations = "./migrations")]
 async fn out_of_order_event_outside_window_is_not_deduped(pool: PgPool) -> Result<(), RepoError> {
@@ -105,7 +105,7 @@ async fn rebuild_projection_empty_source_returns_none(pool: PgPool) -> Result<()
 /// read_score must re-derive the gate flags at read time. An IP eligible + tiered at write whose
 /// categories have long since decayed below the 0.5 live floor must read back eligible=false /
 /// tier=None, not the stale write-time flags (a consumer reporting off stale flags would file a
-/// vendor report for a near-zero-score IP — the false-tier the design guards against).
+/// vendor report for a near-zero-score IP - the false-tier the design guards against).
 #[sqlx::test(migrations = "./migrations")]
 async fn read_score_rederives_stale_flags_after_decay(pool: PgPool) -> Result<(), RepoError> {
     // Far-past events: eligible + tiered at write; by "now" (years later, thousands of

@@ -1,0 +1,165 @@
+# Propolis feed - hardened systemd unit.
+#
+# Realizes internal/design/05-blocklist-feed.md's "Publisher"/"Configuration", following the
+# three-layer hardening pattern (least authority, resource caps, containment) established by
+# internal/design/02-sensor-framework.md and applied identically to deploy/intake.service /
+# deploy/review.service. Hardening is asserted by
+# crates/sensor-framework/tests/deploy_test.rs (feed_unit_has_hardening_directives), not by this
+# comment - a directive dropped here fails that test rather than being noticed in production.
+#
+# Key differences from deploy/intake.service and deploy/review.service:
+#   - A periodic BUILD, not a continuous tailer/poller: wakes on PROPOLIS_FEED_BUILD_INTERVAL_SECS
+#     (default 900s / 15min), queries ip_score once, publishes, sleeps. No inbound listener, same
+#     as intake/review.
+#   - Unlike review (writes nothing to disk) and unlike intake (writes only a small cursor file),
+#     this unit's whole purpose is to WRITE the published feed to disk
+#     (crates/feed/src/publisher.rs's atomic write-then-rename), so it is the only one of the
+#     three DB-client units carrying a ReadWritePaths grant.
+#   - That grant is scoped to /var/lib/propolis/feed - THIS SERVICE'S OWN dedicated root - never
+#     the shared /var/lib/propolis (which also holds intake's /var/lib/propolis/cursors). Granting
+#     the shared parent would let a compromised feed process read/corrupt another service's state
+#     even though ProtectSystem=strict already keeps the rest of the filesystem read-only from
+#     this unit's perspective; scoping to a dedicated subtree keeps that least-authority property
+#     intact. PROPOLIS_FEED_OUTPUT_DIR defaults to /var/lib/propolis/feed/current - one level
+#     inside the granted root - because Publisher::publish's atomic swap needs to create sibling
+#     staging/previous directories alongside the published directory (rename(2) replaces a
+#     directory ENTRY within a shared parent; it cannot atomically replace a non-empty directory's
+#     contents from the inside). See that file's module doc comment for the full reasoning.
+#   - UMask=0022 (world-readable files, world-executable/traversable directories), unlike
+#     intake's/review's 0077: this is the one Propolis binary whose entire purpose is publishing a
+#     PUBLIC artifact (internal/design/05-blocklist-feed.md's own opening line: "publishes a
+#     two-tier public blocklist"). Whatever out-of-band mechanism the operator adds to distribute
+#     it (rsync, a web server, S3 sync - the design's "Publish transport": "local directory...
+#     Out-of-band distribution... is the operator's deployment concern") will typically run as a
+#     different, unrelated user (e.g. a web server's own service account), so group-only
+#     readability (the sensors' 0027 convention, for a same-host Propolis-internal reader) would
+#     just force a second permission-widening step the operator has to remember. World-readable
+#     content, root-owned/non-writable elsewhere thanks to ProtectSystem=strict, carries no
+#     meaningful additional exposure for data whose entire purpose is public distribution.
+#
+# Prerequisites this unit assumes and does not itself create:
+#   - a dedicated, unprivileged system user/group `propolis-feed` (no login shell, no home
+#     directory), matching the convention already established for `propolis-intake`/
+#     `propolis-review`.
+#   - /etc/propolis/feed.env (mode 0600, owned by propolis-feed), carrying this process's
+#     configuration. Env vars (crates/feed/src/main.rs): DATABASE_URL (required, PostgreSQL
+#     connection string); PROPOLIS_FEED_OUTPUT_DIR (default /var/lib/propolis/feed/current);
+#     PROPOLIS_FEED_BUILD_INTERVAL_SECS (default 900); PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS (default
+#     24); PROPOLIS_FEED_STANDARD_TTL_HOURS (default 48); PROPOLIS_FEED_ALLOWLIST (comma-separated
+#     CIDRs the operator exempts, e.g. "203.0.113.0/24,9.9.9.9/32" - each entry MUST carry an
+#     explicit prefix length, a bare address is rejected at startup); PROPOLIS_FEED_DELIST
+#     (comma-separated IPs explicitly removed from the feed, e.g. "198.51.100.5,198.51.100.6").
+#   - /var/lib/propolis/feed, owned by propolis-feed (this service's dedicated writable root -
+#     matches the ReadWritePaths entry below and PROPOLIS_FEED_OUTPUT_DIR's default parent).
+#   - PostgreSQL reachable at DATABASE_URL, already holding core-scoring's migrations applied -
+#     provisioned and managed independently of this unit. This process only ever reads ip_score;
+#     it never writes to it.
+#   - the built binary at /usr/local/bin/feed (crates/feed, bin target "feed").
+#   - whatever out-of-band mechanism distributes /var/lib/propolis/feed/current's contents
+#     (rsync, a web server document root, S3 sync, ...) - entirely the operator's own concern, not
+#     created or managed by this unit or this crate.
+
+[Unit]
+Description=Propolis feed - blocklist feed builder and publisher
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=propolis-feed
+Group=propolis-feed
+EnvironmentFile=/etc/propolis/feed.env
+ExecStart=/usr/local/bin/feed
+Restart=always
+RestartSec=10
+
+# --- Least authority ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict mounts the whole filesystem read-only except /dev, /proc, and /sys;
+# systemd.exec(5) is explicit that those three subtrees need their own directives to be
+# protected - PrivateDevices, ProtectKernelTunables, and ProtectControlGroups respectively.
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# Matches intake's own reasoning (this file's header): a PostgreSQL connection, which may be a
+# remote/shared instance over TCP (AF_INET/AF_INET6) or a same-host instance over a Unix socket
+# (AF_UNIX) depending on deployment.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# This service's own dedicated writable root - see this file's header for why it is scoped here
+# and not to the shared /var/lib/propolis.
+ReadWritePaths=/var/lib/propolis/feed
+
+# --- No privileged port binding ---
+# feed binds no port at all - it is a PostgreSQL client and a local file publisher, never a
+# network listener - so unlike the sensor units it carries no AmbientCapabilities/
+# CapabilityBoundingSet grant, exactly like intake/review.
+CapabilityBoundingSet=
+
+# --- Resource caps ---
+# Conservative starting point for one PgPool plus a periodic (not continuous) build/publish cycle:
+# nothing here is reachable from the internet (no inbound listener), so these bound a runaway
+# build loop or leak, not an attacker - matches intake's/review's own reasoning and starting
+# values. Revisit if the configured entry counts or build interval grow materially.
+MemoryMax=256M
+TasksMax=32
+CPUQuota=50%
+LimitNOFILE=1024
+
+# --- Containment ---
+# PLACEHOLDER. @system-service minus @privileged/@resources is a broad starting allowlist for
+# development, not the shipped filter, matching every other Propolis unit. Before production
+# deployment:
+#   1. Run `strace -c -f /usr/local/bin/feed` under representative load (a populated ip_score
+#      table producing entries in both tiers, at least one full build-publish cycle observed).
+#   2. Derive the minimum syscall set from the trace.
+#   3. Replace the two SystemCallFilter lines below with that exact allowlist.
+#   4. Re-test under the restricted filter, and repeat whenever the binary's syscall surface
+#      changes (a dependency bump, a new code path).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Recommended alongside SystemCallFilter by systemd.exec(5): without it, a non-native syscall ABI
+# (e.g. x32 on x86_64) could reach a syscall the native-name allowlist above did not intend to
+# admit.
+SystemCallArchitectures=native
+# NOTE: the correct systemd directive is MemoryDenyWriteExecute (no trailing "-ion" - see
+# deploy/sensor-catchall.service's fuller note and crates/sensor-framework/tests/deploy_test.rs's
+# module doc for the verified correction; this unit uses the same corrected spelling).
+MemoryDenyWriteExecute=yes
+
+# --- Supplementary hardening (not required by the spec's test; matches intake.service's/
+# review.service's set, applicable to the same workload shape: async network I/O plus local file
+# writes, no kernel/namespace/clock/IPC/realtime/SUID use, no privileged capabilities to conflict
+# with a user namespace) ---
+PrivateUsers=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+# 0022 (files 0644, directories 0755): see this file's header for why this unit alone among the
+# three DB-client units defaults to world-readable output rather than the 0077/0027 owner-/
+# group-only conventions the others use.
+UMask=0022
+#
+# Deliberately NOT added, each for a concrete reason rather than an oversight:
+#   - PrivateNetwork=: feed's entire purpose is reaching PostgreSQL over the network; this would
+#     disable networking outright.
+#   - IPAddressDeny=/IPAddressAllow=: matches intake's/review's identical reasoning - feed's one
+#     outbound destination is DATABASE_URL's host, not known at unit-authoring time (resolved from
+#     EnvironmentFile at runtime), and IPAddressAllow= takes literal IPs/CIDRs, not hostnames. A
+#     future improvement once the DB endpoint is stable infrastructure, not a one-line addition
+#     today.
+#   - RootDirectory=/RootImage=: real chroot/image-root hardening needs a prepared minimal root
+#     tree provisioned outside this unit file - a legitimate future hardening step, not a one-line
+#     addition here (matches intake's/review's identical deferral).
+
+[Install]
+WantedBy=multi-user.target

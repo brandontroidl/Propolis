@@ -3,7 +3,9 @@
 //! requires, and that the log rotation policy is size-based with a survivable rotation mode.
 //! Lives in `sensor-framework` (the crate every sensor binary depends on) rather than in either
 //! sensor's own crate, because the directive set - and the failure mode it guards - is shared
-//! across every sensor `deploy/` ships, not specific to one.
+//! across every sensor `deploy/` ships, not specific to one. Also covers `intake.service`
+//! (sub-project 3): `intake` is not a sensor and does not depend on this crate, but its
+//! hardening is asserted here too rather than splitting `deploy/`'s test coverage across crates.
 //!
 //! Per the design doc: "The unit hardening is asserted by test, not by documentation. A
 //! directive that exists only in prose is one careless edit away from silently disappearing,

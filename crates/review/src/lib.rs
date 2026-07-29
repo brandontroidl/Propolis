@@ -1,14 +1,17 @@
 //! Public API surface for `review`: the review queue, gatekeeper, vendor
-//! adapters, and submission runner for sub-project 4. The crate scaffold,
-//! migrations, the review queue state machine, the gatekeeper, the vendor
-//! adapters, and the submission runner are wired; the operator CLI and the
-//! daemon binary land in a later task.
+//! adapters, submission runner, and operator CLI for sub-project 4. The crate
+//! scaffold, migrations, the review queue state machine, the gatekeeper, the
+//! vendor adapters, the submission runner, and the operator CLI are wired;
+//! `src/main.rs` (the `review` binary) composes them into the submission
+//! daemon and CLI dispatch.
 
+pub mod cli;
 pub mod gatekeeper;
 pub mod queue;
 pub mod submit;
 pub mod vendor;
 
+pub use cli::{Cli, CliError, Command};
 pub use gatekeeper::{GateReason, GateResult, VendorConfig, check};
 pub use queue::{QueueEntry, ReviewError, ReviewQueue};
 pub use submit::{SubmissionRunner, SubmitError, SubmitResult};

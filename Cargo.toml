@@ -5,4 +5,5 @@ members = [
     "crates/sensor-wire",
     "crates/sensor-framework",
     "crates/sensor-catchall",
+    "crates/sensor-ssh",
 ]

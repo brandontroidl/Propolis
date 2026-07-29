@@ -18,23 +18,13 @@ mod tests {
     #[test]
     fn crypto_crates_available() {
         // Verify the crypto primitives are importable.
-        use chacha20poly1305::aead::{Aead, KeyInit};
-        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-        use std::convert::TryFrom;
-
-        // Verify each crypto crate can be imported and basic types are accessible
         let _ephemeral_secret_type = std::any::type_name::<x25519_dalek::EphemeralSecret>();
         let _signing_key_type = std::any::type_name::<ed25519_dalek::SigningKey>();
-        let _cipher_type = std::any::type_name::<ChaCha20Poly1305>();
 
-        // Test ChaCha20Poly1305 with a known key
-        let key_bytes = [1u8; 32];
-        let key = chacha20poly1305::Key::from(key_bytes);
-        let cipher = ChaCha20Poly1305::new(&key);
-        let nonce = Nonce::try_from(&b"unique nonce"[..]).unwrap();
-        let ct = cipher.encrypt(&nonce, b"test".as_ref()).unwrap();
-        let pt = cipher.decrypt(&nonce, ct.as_ref()).unwrap();
-        assert_eq!(pt, b"test");
+        // chacha20 + poly1305 are the primitives the transport cipher uses directly
+        // (ADR-0011's pivot from the AEAD wrapper to raw primitives).
+        let _chacha_type = std::any::type_name::<chacha20::ChaCha20Legacy>();
+        let _poly_type = std::any::type_name::<poly1305::Poly1305>();
     }
 
     #[test]

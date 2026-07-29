@@ -96,7 +96,6 @@ fn never_exec_static_check() {
         if content.contains("std::process::Command")
             || content.contains("process::Command")
             || content.contains("Command::new")
-            || content.contains("std::process::exit")  // exit is fine, but exec is not
             || content.contains("libc::exec")
             || content.contains("nix::unistd::exec")
         {

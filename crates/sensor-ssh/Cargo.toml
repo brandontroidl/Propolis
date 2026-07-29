@@ -3,6 +3,10 @@ name = "sensor-ssh"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "sensor-ssh"
+path = "src/main.rs"
+
 [dependencies]
 sensor-wire = { path = "../sensor-wire" }
 sensor-framework = { path = "../sensor-framework" }
@@ -16,7 +20,6 @@ sha2 = "0.11.0"
 rand = { version = "0.10.2", features = ["std"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
-chacha20poly1305 = "0.11.0"
 chacha20 = { version = "0.10.1", features = ["legacy"] }
 poly1305 = "0.9.1"
 

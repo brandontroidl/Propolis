@@ -1,0 +1,129 @@
+//! The sensor-to-intake wire format: frozen NDJSON event record and sample side-channel
+//! reference. One definition, imported by every sensor (producer) and by intake (SP3,
+//! consumer), so the wire shape has a single source of truth and cannot drift into two
+//! clones. See `internal/design/02-sensor-framework.md` for the frozen contract and
+//! ADR-0010 for the integrity model this format participates in.
+
+use std::net::IpAddr;
+
+use chrono::{DateTime, Utc};
+
+pub const VERSION_MARKER: &str = "sensor-wire";
+pub const WIRE_VERSION: u32 = 1;
+
+// Signal type constants - the snake_case wire values matching core-scoring's SignalType serde.
+// Only the subset a sensor built in this sub-project can emit; the remaining SignalType
+// variants (Suricata, WAF, port scan, ...) originate from other layers.
+pub const SIGNAL_CATCHALL_PROBE: &str = "catchall_probe";
+pub const SIGNAL_HONEYPOT_CONNECTION: &str = "honeypot_connection";
+pub const SIGNAL_HONEYPOT_LOGIN_ATTEMPT: &str = "honeypot_login_attempt";
+pub const SIGNAL_HONEYPOT_COMMAND_EXEC: &str = "honeypot_command_exec";
+pub const SIGNAL_HONEYPOT_MALWARE_UPLOAD: &str = "honeypot_malware_upload";
+pub const SIGNAL_HONEYPOT_FILE_DOWNLOAD: &str = "honeypot_file_download";
+
+// Protocol constants - lowercase wire values matching core-scoring's Protocol serde.
+pub const PROTO_TCP: &str = "tcp";
+pub const PROTO_UDP: &str = "udp";
+pub const PROTO_ICMP: &str = "icmp";
+
+/// One sensor-observed event, exactly the facts `core-scoring`'s `EventInput::from_signal`
+/// needs and nothing derived: a sensor never computes `weight`, `confidence`, or `category`.
+///
+/// `signal_type` and `protocol` are plain `String`s rather than `core-scoring`'s enums so this
+/// crate carries no dependency on `core-scoring` (or its database dependency); intake validates
+/// the string against the known set on ingest. Use the `SIGNAL_*` / `PROTO_*` constants above
+/// rather than hand-typing the literals.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SensorEvent {
+    pub v: u32,
+    pub source_ip: IpAddr,
+    pub wan_ip: Option<IpAddr>,
+    pub sensor: String,
+    pub signal_type: String,
+    pub protocol: String,
+    pub authenticated: bool,
+    // RFC 3339 via chrono's default serde (matches core-scoring's hashing.rs, which hashes
+    // observed_at as RFC 3339 string bytes). Do NOT switch to chrono::serde::ts_microseconds:
+    // that serializes as an integer timestamp, not RFC 3339, and would break the hash chain.
+    pub observed_at: DateTime<Utc>,
+    pub metadata: serde_json::Value,
+    pub sample: Option<SampleRef>,
+}
+
+/// Reference to a captured file body written to the quarantine spool, named by its SHA-256.
+/// `orig_name` is attacker-controlled and carried as a sanitized indicator only; it is never
+/// used as a path component.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SampleRef {
+    pub sha256: String,
+    pub size: u64,
+    pub orig_name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_event() -> SensorEvent {
+        SensorEvent {
+            v: WIRE_VERSION,
+            source_ip: "203.0.113.7".parse().unwrap(),
+            wan_ip: Some("198.51.100.4".parse().unwrap()),
+            sensor: "ssh".into(),
+            signal_type: SIGNAL_HONEYPOT_COMMAND_EXEC.into(),
+            protocol: PROTO_TCP.into(),
+            authenticated: true,
+            observed_at: "2026-07-20T14:03:11.482913Z".parse().unwrap(),
+            metadata: serde_json::json!({ "protocol_label": "ssh", "command": "uname -a" }),
+            sample: None,
+        }
+    }
+
+    #[test]
+    fn round_trip_serde() {
+        let event = sample_event();
+        let json = serde_json::to_string(&event).unwrap();
+        let back: SensorEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn ndjson_single_line() {
+        let event = sample_event();
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains('\n'), "wire record must be a single line");
+        assert!(!json.contains('\r'), "wire record must not contain CR");
+    }
+
+    #[test]
+    fn sample_ref_round_trip() {
+        let event = SensorEvent {
+            sample: Some(SampleRef {
+                sha256: "a".repeat(64),
+                size: 12345,
+                orig_name: "malware.bin".into(),
+            }),
+            ..sample_event()
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: SensorEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event.sample, back.sample);
+    }
+
+    #[test]
+    fn null_wan_ip_serializes() {
+        let event = SensorEvent {
+            wan_ip: None,
+            ..sample_event()
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"wan_ip\":null"));
+        let back: SensorEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wan_ip, None);
+    }
+
+    #[test]
+    fn version_marker() {
+        assert_eq!(VERSION_MARKER, "sensor-wire");
+    }
+}

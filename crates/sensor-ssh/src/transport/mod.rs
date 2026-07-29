@@ -33,6 +33,8 @@ use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub mod cipher;
+pub mod kex;
+pub mod keys;
 
 // ---- SSH message type constants (RFC 4253 section 12; channel types are RFC 4254) ----
 
@@ -257,6 +259,96 @@ fn encode_packet_unencrypted(payload: &[u8]) -> Result<Vec<u8>, TransportError> 
     packet.extend_from_slice(&padding);
 
     Ok(packet)
+}
+
+// ---- Encrypted binary packet framing (chacha20-poly1305@openssh.com) ----
+
+/// Write `payload` as one encrypted SSH binary packet: build the inner framing
+/// (`padding_length || payload || padding`), encrypt it with `cipher` at sequence number `seq`,
+/// and write the result (encrypted length + encrypted body + Poly1305 tag) in a single call.
+pub async fn write_packet_encrypted<W>(
+    writer: &mut W,
+    cipher: &mut cipher::TransportCipher,
+    seq: u32,
+    payload: &[u8],
+) -> Result<(), TransportError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let padding_length = compute_padding_length(payload.len());
+    let inner_len = 1 + payload.len() + padding_length as usize;
+
+    let mut inner = Vec::with_capacity(inner_len);
+    inner.push(padding_length);
+    inner.extend_from_slice(payload);
+    let mut padding = vec![0u8; padding_length as usize];
+    rand::rng().fill(&mut padding[..]);
+    inner.extend_from_slice(&padding);
+
+    let encrypted = cipher.encrypt(seq, &inner);
+    writer.write_all(&encrypted).await?;
+    Ok(())
+}
+
+/// Read one encrypted SSH binary packet. Reads the 4-byte encrypted length field first,
+/// decrypts it to learn the packet body size, bounds-checks against `MAX_PACKET_SIZE`, reads
+/// the remaining encrypted body + 16-byte Poly1305 tag, authenticates and decrypts, then strips
+/// the inner framing to return only the payload.
+pub async fn read_packet_encrypted<R>(
+    reader: &mut R,
+    cipher: &mut cipher::TransportCipher,
+    seq: u32,
+) -> Result<Vec<u8>, TransportError>
+where
+    R: AsyncRead + Unpin,
+{
+    // Read the 4-byte encrypted length field.
+    let mut enc_len = [0u8; 4];
+    reader.read_exact(&mut enc_len).await?;
+
+    // Decrypt the length to know how many body bytes follow.
+    let packet_length = cipher.decrypt_length(seq, &enc_len);
+
+    if packet_length == 0 {
+        return Err(TransportError::Malformed(
+            "encrypted packet_length is zero; too small to hold padding_length",
+        ));
+    }
+    if packet_length > MAX_PACKET_SIZE {
+        return Err(TransportError::TooLarge {
+            claimed: packet_length,
+            max: MAX_PACKET_SIZE,
+        });
+    }
+
+    // Read the encrypted body + the 16-byte Poly1305 tag.
+    let remaining = packet_length as usize + cipher::TAG_LEN;
+    let mut rest = vec![0u8; remaining];
+    reader.read_exact(&mut rest).await?;
+
+    // Reassemble the full wire blob for the cipher's decrypt (which re-derives the header
+    // decryption and authenticates the whole thing).
+    let mut full = Vec::with_capacity(4 + remaining);
+    full.extend_from_slice(&enc_len);
+    full.extend_from_slice(&rest);
+
+    let inner = cipher
+        .decrypt(seq, &full)
+        .map_err(|_| TransportError::Malformed("encrypted packet authentication failed"))?;
+
+    // Parse inner framing: padding_length(1) || payload || padding.
+    if inner.is_empty() {
+        return Err(TransportError::Malformed("decrypted packet body is empty"));
+    }
+    let padding_length = inner[0] as usize;
+    let payload_len = (inner.len())
+        .checked_sub(1)
+        .and_then(|r| r.checked_sub(padding_length))
+        .ok_or(TransportError::Malformed(
+            "padding_length exceeds decrypted packet body",
+        ))?;
+
+    Ok(inner[1..1 + payload_len].to_vec())
 }
 
 /// The smallest padding (always `MIN_PADDING..MIN_PADDING + BLOCK_SIZE`, i.e. 4-11 bytes here)

@@ -150,3 +150,170 @@ proptest::proptest! {
         let _ = key.verify(b"some data", &bytes);
     }
 }
+
+// ---- Task 11: key exchange + encrypted channel ----
+
+#[tokio::test]
+async fn key_exchange_completes_and_encrypted_channel_works() {
+    use sensor_ssh::hostkey::HostKey;
+    use sensor_ssh::transport::kex::{
+        build_client_ecdh_init, complete_kex_client, perform_kex_server,
+    };
+    use sensor_ssh::transport::{
+        SSH_MSG_IGNORE, SSH_MSG_NEWKEYS, build_kexinit, read_packet_encrypted,
+        read_packet_unencrypted, write_packet_encrypted, write_packet_unencrypted,
+    };
+
+    let host_key = HostKey::generate();
+    let (mut client_stream, mut server_stream) = tokio::io::duplex(8192);
+
+    // Server side: send KEXINIT, receive client KEXINIT + ECDH_INIT, perform key exchange.
+    let server_task = tokio::spawn({
+        let host_key = host_key.clone();
+        async move {
+            let server_kexinit = build_kexinit();
+            write_packet_unencrypted(&mut server_stream, &server_kexinit)
+                .await
+                .unwrap();
+            let client_kexinit_pkt = read_packet_unencrypted(&mut server_stream).await.unwrap();
+            let client_ecdh_init = read_packet_unencrypted(&mut server_stream).await.unwrap();
+            let session_keys = perform_kex_server(
+                &mut server_stream,
+                &host_key,
+                &client_kexinit_pkt.payload,
+                &server_kexinit,
+                "SSH-2.0-TestClient",
+                "SSH-2.0-TestServer",
+                &client_ecdh_init.payload,
+            )
+            .await
+            .unwrap();
+            let _newkeys = read_packet_unencrypted(&mut server_stream).await.unwrap();
+            write_packet_unencrypted(&mut server_stream, &[SSH_MSG_NEWKEYS])
+                .await
+                .unwrap();
+            (server_stream, session_keys)
+        }
+    });
+
+    // Client side: receive server KEXINIT, send client KEXINIT + ECDH_INIT, complete key exchange.
+    let client_kexinit = build_kexinit();
+    let server_kexinit_pkt = read_packet_unencrypted(&mut client_stream).await.unwrap();
+    write_packet_unencrypted(&mut client_stream, &client_kexinit)
+        .await
+        .unwrap();
+    let (client_ephemeral, client_ecdh_init) = build_client_ecdh_init();
+    write_packet_unencrypted(&mut client_stream, &client_ecdh_init)
+        .await
+        .unwrap();
+    let ecdh_reply = read_packet_unencrypted(&mut client_stream).await.unwrap();
+    let client_keys = complete_kex_client(
+        client_ephemeral,
+        &ecdh_reply.payload,
+        &client_kexinit,
+        &server_kexinit_pkt.payload,
+        "SSH-2.0-TestClient",
+        "SSH-2.0-TestServer",
+    )
+    .unwrap();
+    write_packet_unencrypted(&mut client_stream, &[SSH_MSG_NEWKEYS])
+        .await
+        .unwrap();
+    let _newkeys = read_packet_unencrypted(&mut client_stream).await.unwrap();
+
+    let (mut server_stream, server_keys) = server_task.await.unwrap();
+
+    // Both sides must derive the same session keys.
+    assert_eq!(client_keys.session_id, server_keys.session_id);
+
+    // Test encrypted communication: server -> client.
+    let mut server_enc = server_keys.server_to_client_cipher();
+    let mut client_dec = client_keys.server_to_client_cipher();
+    let test_payload = vec![SSH_MSG_IGNORE, 0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o'];
+    write_packet_encrypted(&mut server_stream, &mut server_enc, 0, &test_payload)
+        .await
+        .unwrap();
+    let decrypted = read_packet_encrypted(&mut client_stream, &mut client_dec, 0)
+        .await
+        .unwrap();
+    assert_eq!(decrypted, test_payload);
+}
+
+#[test]
+fn session_key_derivation_deterministic() {
+    use sensor_ssh::transport::keys::derive_keys;
+    let shared_secret = [0x42u8; 32];
+    let exchange_hash = [0x43u8; 32];
+    let session_id = exchange_hash;
+    let keys1 = derive_keys(&shared_secret, &exchange_hash, &session_id);
+    let keys2 = derive_keys(&shared_secret, &exchange_hash, &session_id);
+    assert_eq!(keys1.client_to_server_key, keys2.client_to_server_key);
+    assert_eq!(keys1.server_to_client_key, keys2.server_to_client_key);
+    assert_eq!(keys1.session_id, keys2.session_id);
+}
+
+#[test]
+fn session_key_derivation_different_inputs_produce_different_keys() {
+    use sensor_ssh::transport::keys::derive_keys;
+    let keys_a = derive_keys(&[0x42u8; 32], &[0x43u8; 32], &[0x43u8; 32]);
+    let keys_b = derive_keys(&[0x99u8; 32], &[0x43u8; 32], &[0x43u8; 32]);
+    assert_ne!(
+        keys_a.client_to_server_key, keys_b.client_to_server_key,
+        "different shared secrets must produce different keys"
+    );
+}
+
+#[test]
+fn session_keys_cipher_split_is_correct_length() {
+    use sensor_ssh::transport::keys::derive_keys;
+    let keys = derive_keys(&[0x11u8; 32], &[0x22u8; 32], &[0x22u8; 32]);
+    assert_eq!(keys.client_to_server_key.len(), 64);
+    assert_eq!(keys.server_to_client_key.len(), 64);
+    // Must be able to construct ciphers without panic.
+    let _c2s = keys.client_to_server_cipher();
+    let _s2c = keys.server_to_client_cipher();
+}
+
+#[test]
+fn mpint_encoding_handles_leading_high_bit() {
+    use sensor_ssh::transport::kex::encode_mpint;
+    // Value with MSB set: must get a leading zero byte.
+    let val = [0xFF; 32];
+    let encoded = encode_mpint(&val);
+    let len = u32::from_be_bytes(encoded[0..4].try_into().unwrap()) as usize;
+    assert_eq!(len, 33, "MSB-set value needs a leading zero byte");
+    assert_eq!(
+        encoded[4], 0,
+        "leading byte must be zero for positive mpint"
+    );
+
+    // Value with MSB clear: no padding needed.
+    let mut val2 = [0u8; 32];
+    val2[0] = 0x7F;
+    val2[1] = 0xAB;
+    let encoded2 = encode_mpint(&val2);
+    let len2 = u32::from_be_bytes(encoded2[0..4].try_into().unwrap()) as usize;
+    assert_eq!(len2, 32, "MSB-clear value needs no padding");
+    assert_eq!(encoded2[4], 0x7F);
+}
+
+#[test]
+fn mpint_encoding_strips_leading_zeros() {
+    use sensor_ssh::transport::kex::encode_mpint;
+    let mut val = [0u8; 32];
+    val[30] = 0x01;
+    val[31] = 0x02;
+    let encoded = encode_mpint(&val);
+    let len = u32::from_be_bytes(encoded[0..4].try_into().unwrap()) as usize;
+    assert_eq!(len, 2, "leading zeros must be stripped");
+    assert_eq!(&encoded[4..6], &[0x01, 0x02]);
+}
+
+#[test]
+fn mpint_encoding_all_zeros() {
+    use sensor_ssh::transport::kex::encode_mpint;
+    let val = [0u8; 32];
+    let encoded = encode_mpint(&val);
+    // mpint zero: 4-byte length of 0, no value bytes
+    assert_eq!(encoded, vec![0, 0, 0, 0]);
+}

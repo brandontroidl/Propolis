@@ -48,8 +48,11 @@ use poly1305::universal_hash::KeyInit as Poly1305KeyInit;
 use poly1305::{Key as Poly1305Key, Poly1305};
 
 /// Poly1305 authentication tag length (RFC 8439 section 2.5, unchanged by the
-/// pre-standardization construction this module implements).
-const TAG_LEN: usize = 16;
+/// pre-standardization construction this module implements). `pub` because the
+/// transport layer needs it to know how many bytes follow the encrypted payload on
+/// the wire when reading an encrypted packet incrementally (4-byte encrypted length,
+/// then `packet_length` encrypted body bytes, then `TAG_LEN` tag bytes).
+pub const TAG_LEN: usize = 16;
 /// SSH binary packet `packet_length` field width (RFC 4253 section 6).
 const LENGTH_LEN: usize = 4;
 
@@ -112,6 +115,18 @@ impl TransportCipher {
             main_key: *main_key,
             header_key: *header_key,
         }
+    }
+
+    /// Decrypt the 4-byte encrypted packet-length field for a given sequence number, returning
+    /// the plaintext `packet_length` value. Used by `read_packet_encrypted` to learn how many
+    /// more bytes to read from the wire before passing the full blob to `decrypt` for
+    /// authentication and payload decryption. This is a pure stateless derivation (header key +
+    /// nonce from seq), so calling it before `decrypt` on the same seq does not interfere.
+    pub fn decrypt_length(&self, seq: u32, encrypted_length: &[u8; 4]) -> u32 {
+        let nonce = nonce_from_seq(seq);
+        let mut buf = *encrypted_length;
+        apply_header_keystream(&self.header_key, &nonce, &mut buf);
+        u32::from_be_bytes(buf)
     }
 
     /// Encrypt `payload` for sequence number `seq`, returning

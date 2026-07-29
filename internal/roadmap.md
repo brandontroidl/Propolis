@@ -26,15 +26,15 @@ Several invariants are established at the foundation and are load-bearing for ev
 
 ## Sub-projects
 
-Eight sub-projects, built in order. Sub-projects 1 through 3 are built and merged; sub-project 4 is entering its spec stage; sub-projects 5 through 8 are scope stubs that receive their own spec at the start of their own cycle.
+Eight sub-projects, built in order. Sub-projects 1 through 3 are built and merged; sub-projects 4-5 are entering their build stages; sub-projects 6 through 8 are scope stubs that receive their own spec at the start of their own cycle.
 
 | # | Sub-project | Scope | Status |
 |---|---|---|---|
 | 1 | Core scoring layer | Domain model, PostgreSQL schema and event ledger, scoring and decay, the eligibility/weight/recommendation model, and the multi-WAN breadth model. The foundation every later layer imports and depends on. | **Built and merged** (`crates/core-scoring`), post-merge audit and hardening merged, accepted limitations in ADR-0009 |
 | 2 | Native sensor framework + catch-all + one TCP-auth sensor | The framework for self-authored, safe-by-construction passive sensors, plus the catch-all listener and one honeypot that produces authenticated TCP-handshake events (the confirmed-real signal the eligibility floor requires). | **Built and merged** (`crates/sensor-wire`, `crates/sensor-framework`, `crates/sensor-catchall`, `crates/sensor-ssh`, `deploy/`), all dependencies vendored in-tree, wire contract frozen, ADR-0010 and ADR-0011 accepted |
 | 3 | Event intake + multi-node aggregation | Ingest of sensor output into the event ledger with per-hit WAN attribution, and aggregation of all WAN-IP collectors into one shared attacker score so cross-sensor and cross-WAN breadth counts. | **Built and merged** (`crates/intake`), direct-PG aggregation, durable cursor, rotation-aware tailer |
-| 4 | Review queue + gatekeeper + reporting | The operator review queue, the per-vendor submission gatekeeper, and the vendor reporting path. The mandatory human-approval gate lives here. | **Spec pending** |
-| 5 | Feed builder + exporters + publisher | Build of the tiered public blocklist from approved IPs, the export formats, and out-of-band publication, with fail-closed validation before publish. | Design pending |
+| 4 | Review queue + gatekeeper + reporting | The operator review queue, the per-vendor submission gatekeeper, and the vendor reporting path. The mandatory human-approval gate lives here. | **Built and merged** (`crates/review`), human-approval gate, AbuseIPDB/DShield/OTX adapters, fail-closed gatekeeper |
+| 5 | Feed builder + exporters + publisher | Build of the tiered public blocklist from approved IPs, the export formats, and out-of-band publication, with fail-closed validation before publish. | **Spec pending** |
 | 6 | Web console + observability | The loopback operator console for review and inspection, plus logging, metrics, and health. | Design pending |
 | 7 | Runtime composition + multi-node coordination + deployment | The composition root that wires the process, coordination across nodes in a cluster deployment, and the deployment and hardening artifacts. | Design pending |
 | 8 | Remaining native sensors | The remaining self-authored sensors: Redis, ADB, malware-capture, and credential. | Design pending |

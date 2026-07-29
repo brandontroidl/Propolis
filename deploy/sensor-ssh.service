@@ -1,0 +1,147 @@
+# Propolis SSH honeypot sensor - hardened systemd unit.
+#
+# Realizes internal/design/02-sensor-framework.md's "Isolation and deployment": three layers
+# (least authority, resource caps, containment), each answering a different failure. Hardening
+# is asserted by crates/sensor-framework/tests/deploy_test.rs, not by this comment - per the
+# spec's "The unit hardening is asserted by test, not by documentation," a directive dropped
+# here fails that test rather than being noticed in production.
+#
+# Prerequisites this unit assumes and does not itself create:
+#   - a dedicated, unprivileged system user/group `propolis-ssh` (no login shell, no home
+#     directory, holds no database handle and no secrets per the spec's "Least authority" -
+#     the host key below is not a platform secret, see internal/design/02-sensor-framework.md's
+#     "Host key" and ADR-0011).
+#   - /etc/propolis/ssh.env (mode 0600, owned by propolis-ssh), carrying this sensor's
+#     configuration. Env vars (crates/sensor-ssh/src/main.rs): PROPOLIS_SSH_BIND (required, one
+#     ip:port), PROPOLIS_SSH_WAN_MAP (optional, comma-separated local=wan pairs),
+#     PROPOLIS_SSH_LOG_PATH, PROPOLIS_SSH_SPOOL_DIR, PROPOLIS_SSH_HOST_KEY_PATH.
+#   - /var/log/propolis/ssh (event log) and /var/spool/propolis/ssh (upload quarantine),
+#     owned by propolis-ssh.
+#   - /var/lib/propolis/ssh (persistent state - the host key), owned by propolis-ssh. The host
+#     key is generated on first start and reused after, "so the honeypot does not fingerprint
+#     itself as freshly minted on every restart" (design doc's "Host key"); it needs a writable
+#     path distinct from the log and spool, which is why this unit grants a third ReadWritePaths
+#     entry that sensor-catchall.service does not need.
+#   - the spool directory backed by a noexec,nosuid,nodev mount, not merely a directory with
+#     restrictive permission bits - see the ReadWritePaths comment below.
+
+[Unit]
+Description=Propolis SSH honeypot sensor
+After=network.target
+
+[Service]
+Type=simple
+User=propolis-ssh
+Group=propolis-ssh
+EnvironmentFile=/etc/propolis/ssh.env
+ExecStart=/usr/local/bin/sensor-ssh
+Restart=always
+RestartSec=10
+
+# --- Least authority ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict mounts the whole filesystem read-only except /dev, /proc, and /sys;
+# systemd.exec(5) is explicit that those three subtrees need their own directives to be
+# protected - PrivateDevices, ProtectKernelTunables, and ProtectControlGroups respectively.
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+# Grants exactly this sensor's own log, spool, and host-key state directories; ProtectSystem=strict
+# makes everything else read-only. The spool path MUST be backed by a noexec,nosuid,nodev mount
+# (an fstab bind mount or a dedicated small filesystem) - internal/design/02-sensor-framework.md's
+# "Sample side channel": "The spool is a noexec,nosuid,nodev mount, not merely a directory of
+# non-executable files. Permission bits are one chmod away from being wrong." This unit grants
+# the path; it cannot enforce the mount option, which is a deployment-time (fstab/provisioning)
+# concern verified against the running system, not the unit file.
+ReadWritePaths=/var/log/propolis/ssh /var/spool/propolis/ssh /var/lib/propolis/ssh
+
+# --- Privileged port binding ---
+# SSH is conventionally port 22 (privileged), so the honeypot needs CAP_NET_BIND_SERVICE
+# without root - design doc: "carries only CAP_NET_BIND_SERVICE when it must bind a
+# privileged port - granted by the service manager, never by root."
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- Resource caps ---
+# Bound the aggregate a flood can consume. The framework's per-connection bounds
+# (crates/sensor-framework/src/bounds.rs: read/idle timeouts, max session duration, max captured
+# bytes, a concurrent-connection cap) bound one attacker; these bound all of them together. The
+# SSH session does real key-exchange crypto and holds a fake filesystem and shell state per
+# session, so it gets a higher ceiling than the catch-all's single-packet-and-done handler.
+MemoryMax=512M
+TasksMax=128
+CPUQuota=75%
+LimitNOFILE=4096
+
+# --- Containment ---
+# PLACEHOLDER. @system-service minus @privileged/@resources is a broad starting allowlist for
+# development, not the shipped filter. The spec requires the exact syscall set be derived
+# empirically against the running binary (strace -c / seccomp-tools) and re-derived whenever the
+# sensor's syscall surface changes. This sensor is the higher-priority case for getting the real
+# allowlist right: it is a self-authored parser of hostile binary SSH packets pre-authentication,
+# and the spec's own rationale for this layer is exactly that scenario - "a self-authored SSH
+# implementation parsing hostile binary packets: unsafe code, a dependency, or a logic error
+# reachable pre-authentication... A tight filter downgrades memory corruption from remote code
+# execution to a crash." Before production deployment:
+#   1. Run `strace -c -f /usr/local/bin/sensor-ssh` (or seccomp-tools trace) under a
+#      representative captured session (connect, key exchange, login, shell commands, an
+#      SCP/SFTP upload) - drive it with a real client, not a handshake stub, so the trace covers
+#      the fake shell and transfer paths too.
+#   2. Derive the minimum syscall set from the trace.
+#   3. Replace the two SystemCallFilter lines below with that exact allowlist.
+#   4. Re-test that the sensor still functions correctly under the restricted filter, and repeat
+#      this whenever the binary's syscall surface changes (a dependency bump, a new code path).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Recommended alongside SystemCallFilter by systemd.exec(5) ("SystemCallArchitectures=native or
+# similar"): without it, a non-native syscall ABI (e.g. x32 on x86_64) could reach a syscall the
+# native-name allowlist above did not intend to admit.
+SystemCallArchitectures=native
+# NOTE: the governing spec (internal/design/02-sensor-framework.md's "Containment") and this
+# task's brief both spell this directive "MemoryDenyWriteExecution". The real systemd directive
+# is "MemoryDenyWriteExecute" (no "-ion") - confirmed against this host's installed systemd
+# (258.10-1.fc43): `systemd-analyze verify` rejects the "-ion" spelling as an unknown key
+# ("ignoring"), i.e. it silently installs no seccomp rule at all, and the exact string
+# "MemoryDenyWriteExecute" (with the format strings this setting logs on failure) is present in
+# /usr/lib64/systemd/libsystemd-shared-258.10-1.fc43.so. The spelling below is the one that
+# actually enforces W^X; deploy_test.rs asserts this corrected spelling, not the spec's.
+MemoryDenyWriteExecute=yes
+
+# --- Supplementary hardening (not required by the spec's test; each line verified with
+# `systemd-analyze security --offline=yes` against this host's systemd 258.10) ---
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+# 0027, not the stricter 0077: leaves the created log/spool files group-readable so a future
+# SP3 intake process (its own dedicated OS user, added as a supplementary member of this group)
+# can be granted read access without loosening past group scope. No group is wired up yet - SP3
+# owns that provisioning - so today this is equivalent to owner-only access.
+UMask=0027
+#
+# Deliberately NOT added, each for a concrete reason rather than an oversight (same reasoning as
+# sensor-catchall.service):
+#   - PrivateNetwork=: this sensor's entire purpose is to be a network listener.
+#   - IPAddressDeny=/IPAddressAllow=: a honeypot must accept inbound from arbitrary internet
+#     source addresses by design, so an allow list would have to be "any" - present but inert.
+#   - PrivateUsers=: interaction with AmbientCapabilities=CAP_NET_BIND_SERVICE was not verified
+#     against this systemd version; risking a silent privileged-bind failure is worse than the
+#     0.2 exposure delta `systemd-analyze security` assigns to leaving it unset.
+#   - RootDirectory=/RootImage=: real chroot/image-root hardening needs a prepared minimal root
+#     tree (the binary plus its shared libraries, including the vendored crypto crates' compiled
+#     artifacts - see ADR-0011) provisioned outside this unit file - a legitimate future
+#     hardening step, not a one-line addition here.
+
+[Install]
+WantedBy=multi-user.target

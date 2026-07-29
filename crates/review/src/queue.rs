@@ -183,6 +183,24 @@ impl ReviewQueue {
 
         rows.into_iter().map(row_to_entry).collect()
     }
+
+    /// List every Approved entry, oldest-decided first: `submit::SubmissionRunner`'s
+    /// input population. Every Approved row has `decided_at` set (see
+    /// [`Self::decide`]), so ordering by it is a stable FIFO over operator
+    /// approvals - the runner works through a backlog in the order the
+    /// operator actually approved it, not surface order.
+    pub async fn list_approved(&self, pool: &PgPool) -> Result<Vec<QueueEntry>, ReviewError> {
+        let rows = sqlx::query(
+            "SELECT host(source_ip) AS source_ip, state, score_at_surface, \
+                    categories_at_surface, surfaced_at, decided_at, notes \
+             FROM review_queue WHERE state = $1 ORDER BY decided_at ASC",
+        )
+        .bind(ReviewState::Approved)
+        .fetch_all(pool)
+        .await?;
+
+        rows.into_iter().map(row_to_entry).collect()
+    }
 }
 
 fn row_to_entry(row: PgRow) -> Result<QueueEntry, ReviewError> {

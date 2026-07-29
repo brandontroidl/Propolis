@@ -4,4 +4,5 @@
 
 pub mod converter;
 pub mod cursor;
+pub mod runner;
 pub mod tailer;

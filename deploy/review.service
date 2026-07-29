@@ -1,0 +1,156 @@
+# Propolis review - hardened systemd unit.
+#
+# internal/design/04-review-gatekeeper-reporting.md has no "Isolation and deployment" section of
+# its own (unlike 02-/03-); this unit instead follows the three-layer hardening pattern (least
+# authority, resource caps, containment) that section established, applied to a non-sensor,
+# database-consuming binary exactly as deploy/intake.service already does - review is
+# architecturally the same shape as intake (a PostgreSQL client with no inbound listener), plus
+# one addition: outbound HTTPS to vendor abuse-reporting APIs. Hardening is asserted by
+# crates/sensor-framework/tests/deploy_test.rs (review_unit_has_hardening_directives), not by this
+# comment - a directive dropped here fails that test rather than being noticed in production.
+#
+# Key differences from deploy/intake.service:
+#   - Outbound HTTPS: the submission daemon calls AbuseIPDB/DShield/OTX over HTTPS
+#     (internal/design/04-review-gatekeeper-reporting.md's "Vendor adapters"), the platform's one
+#     other legitimate outbound path besides the published blocklist feed
+#     (internal/security/posture.md's "Report integrity"). RestrictAddressFamilies is
+#     AF_INET/AF_INET6 only - no AF_UNIX: unlike intake (which intentionally widens for a
+#     same-host PostgreSQL-over-Unix-socket deployment), this unit carries exactly the
+#     AF_INET/AF_INET6 pair, so a local-socket PostgreSQL connection is out of scope for this
+#     binary without revisiting that directive.
+#   - No filesystem access to sensor logs at all - review never reads /var/log/propolis (unlike
+#     intake, which tails every sensor's log). It reads and writes exclusively through PostgreSQL
+#     (review_queue/vendor_submission, plus core-scoring's ip_score - read-only from this
+#     binary's perspective) via DATABASE_URL. No ReadOnlyPaths/ReadWritePaths directive is needed
+#     beyond ProtectSystem=strict's own default (the whole filesystem read-only except /dev,
+#     /proc, /sys) - this binary writes nothing to the local filesystem at all.
+#   - Carries vendor API keys in addition to DATABASE_URL (via EnvironmentFile) - never logged
+#     (crates/review/src/vendor/mod.rs's own doc comment: an adapter "never place[s] it in
+#     VendorReport, VendorResponse, or VendorError").
+#
+# Prerequisites this unit assumes and does not itself create:
+#   - a dedicated, unprivileged system user/group `propolis-review` (no login shell, no home
+#     directory), matching the convention already established for `propolis-intake`.
+#   - /etc/propolis/review.env (mode 0600, owned by propolis-review), carrying this process's
+#     configuration. Env vars (crates/review/src/main.rs): DATABASE_URL (required, PostgreSQL
+#     connection string); PROPOLIS_VENDOR_ABUSEIPDB_KEY/_URL, PROPOLIS_VENDOR_DSHIELD_KEY/_USER/_URL,
+#     PROPOLIS_VENDOR_OTX_KEY/_URL (all optional - a missing/empty key fails that vendor closed,
+#     never crashes the daemon); PROPOLIS_QUEUE_SCAN_INTERVAL_SECS (default 60);
+#     PROPOLIS_SUBMIT_POLL_INTERVAL_SECS (default 30); and per-vendor
+#     PROPOLIS_VENDOR_<NAME>_ENABLED (default false), _COOLDOWN_HOURS (default 24), _RATE_LIMIT
+#     (default 100), _RATE_WINDOW_HOURS (default 1), for NAME in ABUSEIPDB/DSHIELD/OTX.
+#   - PostgreSQL reachable at DATABASE_URL - provisioned and managed independently of this unit,
+#     already holding core-scoring's and this crate's own migrations applied.
+#   - the built binary at /usr/local/bin/review (crates/review, bin target "review"), invoked with
+#     the `daemon` subcommand (see ExecStart) - the operator CLI subcommands
+#     (approve/reject/snooze/list/history) are run ad hoc from a shell, not via this unit.
+
+[Unit]
+Description=Propolis review - review queue, gatekeeper, and vendor submission daemon
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=propolis-review
+Group=propolis-review
+EnvironmentFile=/etc/propolis/review.env
+ExecStart=/usr/local/bin/review daemon
+Restart=always
+RestartSec=10
+
+# --- Least authority ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict mounts the whole filesystem read-only except /dev, /proc, and /sys;
+# systemd.exec(5) is explicit that those three subtrees need their own directives to be
+# protected - PrivateDevices, ProtectKernelTunables, and ProtectControlGroups respectively.
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# Outbound HTTPS to vendor APIs (AbuseIPDB/DShield/OTX) plus the PostgreSQL connection - both
+# AF_INET and AF_INET6, no AF_UNIX (see this file's header: unlike intake, a local-socket
+# PostgreSQL connection is out of scope for this unit as specified).
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# --- No privileged port binding ---
+# review binds no port at all - it is a PostgreSQL client and an outbound HTTPS client to vendor
+# APIs, never a network listener - so unlike the sensor units it carries no
+# AmbientCapabilities/CapabilityBoundingSet grant, exactly like intake.
+CapabilityBoundingSet=
+
+# --- Resource caps ---
+# Conservative starting point for one PgPool plus the two poll-loop tasks (queue scan, submission
+# poll) and their shared outbound HTTP client: nothing here is reachable from the internet (no
+# inbound listener), so these bound a runaway loop or leak, not an attacker - matches intake's own
+# reasoning and starting values. Revisit if the configured poll intervals or vendor count grow
+# materially beyond today's three vendors.
+MemoryMax=256M
+TasksMax=32
+CPUQuota=50%
+LimitNOFILE=1024
+
+# --- Containment ---
+# PLACEHOLDER. @system-service minus @privileged/@resources is a broad starting allowlist for
+# development, not the shipped filter, matching intake.service and both sensor units. Before
+# production deployment:
+#   1. Run `strace -c -f /usr/local/bin/review daemon` under representative load (a populated
+#      queue, at least one approved entry, at least one enabled vendor actually reachable).
+#   2. Derive the minimum syscall set from the trace.
+#   3. Replace the two SystemCallFilter lines below with that exact allowlist.
+#   4. Re-test under the restricted filter, and repeat whenever the binary's syscall surface
+#      changes (a dependency bump, a new code path).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Recommended alongside SystemCallFilter by systemd.exec(5): without it, a non-native syscall ABI
+# (e.g. x32 on x86_64) could reach a syscall the native-name allowlist above did not intend to
+# admit.
+SystemCallArchitectures=native
+# NOTE: the correct systemd directive is MemoryDenyWriteExecute (no trailing "-ion" - see
+# deploy/sensor-catchall.service's fuller note and crates/sensor-framework/tests/deploy_test.rs's
+# module doc for the verified correction; this unit uses the same corrected spelling).
+MemoryDenyWriteExecute=yes
+
+# --- Supplementary hardening (not required by the spec's test; matches intake.service's set,
+# applicable to the same workload shape: async network I/O, no kernel/namespace/clock/IPC/
+# realtime/SUID use, no privileged capabilities to conflict with a user namespace) ---
+PrivateUsers=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+# 0077: this binary writes nothing to disk at all (no cursor directory, no local state), so no
+# created file's group-readability depends on this value - set for consistency with intake's own
+# owner-only default rather than because anything here needs it.
+UMask=0077
+#
+# Deliberately NOT added, each for a concrete reason rather than an oversight:
+#   - PrivateNetwork=: review's entire purpose is outbound network access (PostgreSQL plus vendor
+#     APIs); this would disable networking outright.
+#   - ReadOnlyPaths=/ReadWritePaths=: review touches no path on disk beyond what
+#     ProtectSystem=strict/PrivateTmp already handle - it is a pure network client (PostgreSQL in,
+#     vendor HTTPS out), unlike intake (which tails sensor log files) or the sensors themselves
+#     (which write them).
+#   - IPAddressDeny=/IPAddressAllow=: review's outbound destinations are DATABASE_URL's host plus
+#     three vendor API hosts (api.abuseipdb.com, www.dshield.org, otx.alienvault.com) - real
+#     candidates for an allow-list in principle, matching intake's identical reasoning for its own
+#     DATABASE_URL host. Not added here for the same reason: none of the four hosts are known at
+#     unit-authoring time (all are resolved from EnvironmentFile/adapter defaults at runtime, and
+#     IPAddressAllow= takes literal IPs/CIDRs, not hostnames), so hardcoding one would silently
+#     drift from the operator's actual configuration on the next key rotation or vendor endpoint
+#     change. A future improvement once those endpoints are pinned infrastructure, not a one-line
+#     addition today.
+#   - RootDirectory=/RootImage=: real chroot/image-root hardening needs a prepared minimal root
+#     tree provisioned outside this unit file - a legitimate future hardening step, not a one-line
+#     addition here (matches intake.service's identical deferral).
+
+[Install]
+WantedBy=multi-user.target

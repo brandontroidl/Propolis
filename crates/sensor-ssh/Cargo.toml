@@ -1,0 +1,25 @@
+[package]
+name = "sensor-ssh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sensor-wire = { path = "../sensor-wire" }
+sensor-framework = { path = "../sensor-framework" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+chrono = { version = "0.4.45", features = ["serde"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+sha2 = "0.11.0"
+rand = { version = "0.10.2", features = ["std"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+chacha20poly1305 = "0.11.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+russh = "0.62.4"
+russh-keys = "0.50.0-beta.7"
+proptest = "1.11.0"

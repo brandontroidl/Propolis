@@ -1,11 +1,12 @@
 //! Public API surface for `review`: the review queue, gatekeeper, vendor
-//! adapters, and submission daemon for sub-project 4. Task 1 wires the crate
-//! scaffold, migrations, and the review queue state machine only; the
-//! gatekeeper, vendor adapters, submission daemon, and CLI land in later
-//! tasks.
+//! adapters, and submission daemon for sub-project 4. The crate scaffold,
+//! migrations, the review queue state machine, and the gatekeeper are wired;
+//! vendor adapters, the submission daemon, and the CLI land in later tasks.
 
+pub mod gatekeeper;
 pub mod queue;
 
+pub use gatekeeper::{GateReason, GateResult, VendorConfig, check};
 pub use queue::{QueueEntry, ReviewError, ReviewQueue};
 
 /// This crate's own migrator, tracked under a table name distinct from

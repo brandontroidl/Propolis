@@ -77,7 +77,7 @@ Injected as a scope-guard preamble on every execution-capable subagent:
 
 ## Current target
 
-Sub-project 1 (the core scoring layer) is spec-complete: the shared interface contracts are frozen
-(`architecture/frozen-contracts.md`) and its 4 open design questions are resolved and operator-ratified
-(`design/01-core-scoring-layer-open-questions.md`). Next: the Plan stage (decompose the spec into an ordered
-implementation plan), then Build.
+Sub-project 1 is built and merged (`crates/core-scoring`), post-merge audit and hardening merged,
+accepted limitations in ADR-0009. Sub-project 2 (sensor framework) is spec-complete
+(`design/02-sensor-framework.md`), wire contract frozen, ADR-0010 and ADR-0011 accepted. Implementation
+plan written (`plans/2026-07-28-sensor-framework.md`). Next: the Build stage.

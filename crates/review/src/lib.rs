@@ -1,15 +1,17 @@
 //! Public API surface for `review`: the review queue, gatekeeper, vendor
-//! adapters, and submission daemon for sub-project 4. The crate scaffold,
-//! migrations, the review queue state machine, the gatekeeper, and the
-//! vendor adapters are wired; the submission daemon and the CLI land in
-//! later tasks.
+//! adapters, and submission runner for sub-project 4. The crate scaffold,
+//! migrations, the review queue state machine, the gatekeeper, the vendor
+//! adapters, and the submission runner are wired; the operator CLI and the
+//! daemon binary land in a later task.
 
 pub mod gatekeeper;
 pub mod queue;
+pub mod submit;
 pub mod vendor;
 
 pub use gatekeeper::{GateReason, GateResult, VendorConfig, check};
 pub use queue::{QueueEntry, ReviewError, ReviewQueue};
+pub use submit::{SubmissionRunner, SubmitError, SubmitResult};
 pub use vendor::{
     AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter, VendorError, VendorReport,
     VendorResponse, build_categories, build_dshield_categories, build_otx_categories,

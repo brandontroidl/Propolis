@@ -29,11 +29,21 @@ use sensor_wire::{
 
 // ---- SCP receiver ----
 
+/// Hard ceiling on the in-memory body the SCP receiver will accumulate. Matches
+/// `start_test_server`'s spool `max_file_size` (10 MB). Without this cap the attacker-declared
+/// size field (a `u64`) would grow the buffer to the declared value before the spool's own
+/// per-file check ever fires - an unbounded in-memory allocation on an internet-facing parser.
+/// Once the cap is reached, bytes are still consumed (to keep the protocol state machine
+/// aligned) but not stored.
+const MAX_CAPTURE_BODY: usize = 10_000_000;
+
 enum ScpState {
     /// Waiting for `C<mode> <size> <filename>\n` from the client.
     WaitHeader,
-    /// Reading exactly `expected` bytes of file body.
-    ReadingBody { expected: u64 },
+    /// Reading exactly `expected` bytes of file body. `consumed` tracks how many body bytes
+    /// have been read from the wire (for protocol framing), which may exceed
+    /// `MAX_CAPTURE_BODY` - the body itself stops growing at that cap.
+    ReadingBody { expected: u64, consumed: usize },
     /// Waiting for the trailing `\0` from the client.
     WaitTrailer,
     /// Transfer complete (or failed); no more processing.
@@ -90,10 +100,12 @@ impl ScpReceiver {
                             if let Some((size, name)) = parse_scp_header(&self.line_buf) {
                                 self.filename = name;
                                 self.body.clear();
-                                // Cap reservation to avoid a malicious size field from
-                                // exhausting memory before the body even arrives.
-                                self.body.reserve(size.min(10_000_000) as usize);
-                                self.state = ScpState::ReadingBody { expected: size };
+                                let capped = (size as usize).min(MAX_CAPTURE_BODY);
+                                self.body.reserve(capped);
+                                self.state = ScpState::ReadingBody {
+                                    expected: size,
+                                    consumed: 0,
+                                };
                                 response.push(0); // acknowledge header
                             } else {
                                 self.state = ScpState::Done;
@@ -108,13 +120,25 @@ impl ScpReceiver {
                         }
                     }
                 }
-                ScpState::ReadingBody { expected } => {
-                    let remaining = expected as usize - self.body.len();
+                ScpState::ReadingBody {
+                    expected,
+                    ref mut consumed,
+                } => {
+                    let wire_remaining = (expected as usize).saturating_sub(*consumed);
                     let available = data.len() - offset;
-                    let take = remaining.min(available);
-                    self.body.extend_from_slice(&data[offset..offset + take]);
+                    let take = wire_remaining.min(available);
+
+                    // Only store bytes up to the memory cap; the rest is drained to keep
+                    // the protocol state machine aligned with the wire.
+                    let storable = MAX_CAPTURE_BODY.saturating_sub(self.body.len()).min(take);
+                    if storable > 0 {
+                        self.body
+                            .extend_from_slice(&data[offset..offset + storable]);
+                    }
+
+                    *consumed += take;
                     offset += take;
-                    if self.body.len() >= expected as usize {
+                    if *consumed >= expected as usize {
                         self.state = ScpState::WaitTrailer;
                     }
                 }
@@ -196,8 +220,15 @@ const SSH_FX_OP_UNSUPPORTED: u32 = 8;
 const SSH_FXF_WRITE: u32 = 0x0000_0002;
 const SSH_FXF_CREAT: u32 = 0x0000_0008;
 
-/// Cap on accumulated file body per SFTP handle, matching `ScpReceiver`'s reservation bound.
+/// Cap on accumulated file body per SFTP handle, matching `ScpReceiver`'s `MAX_CAPTURE_BODY`.
 const SFTP_MAX_FILE_BODY: usize = 10_000_000;
+
+/// Maximum SFTP packet length the handler will reassemble. A single SFTP packet larger than
+/// this is rejected at framing time rather than accumulated in memory. 256 KB is generous for
+/// any legitimate SFTP operation (data chunks are typically <= 64 KB, bounded further by the
+/// SSH channel's own max-packet-size of 32 KB) while preventing the attacker-controlled u32
+/// length field from growing the reassembly buffer to ~4 GB.
+const SFTP_MAX_PACKET_SIZE: usize = 262_144;
 
 /// Per-handle state for an open SFTP file.
 struct SftpOpenFile {
@@ -239,6 +270,13 @@ impl SftpHandler {
                 break;
             }
             let pkt_len = u32::from_be_bytes(self.buf[..4].try_into().expect("4 bytes")) as usize;
+            if pkt_len > SFTP_MAX_PACKET_SIZE {
+                // An attacker-declared length this large would grow the reassembly buffer
+                // to gigabytes before the packet is ever parsed. Reject it by clearing the
+                // buffer - the framing is irrecoverable at this point anyway.
+                self.buf.clear();
+                break;
+            }
             if self.buf.len() < 4 + pkt_len {
                 break; // incomplete packet
             }
@@ -485,5 +523,128 @@ mod tests {
         assert_eq!(pkt[4], SSH_FXP_HANDLE);
         let id = u32::from_be_bytes(pkt[5..9].try_into().unwrap());
         assert_eq!(id, 7);
+    }
+
+    // ---- Memory-cap tests (review finding: unbounded growth is a DoS vector) ----
+
+    /// Helper: build a minimal CaptureHandoff backed by a tempdir. The handoff's worker is
+    /// never started (no events emitted), but `submit` succeeds without blocking.
+    fn test_handoff() -> Arc<CaptureHandoff> {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let spool =
+            sensor_framework::QuarantineSpool::new(spool_dir, MAX_CAPTURE_BODY as u64, 100_000_000);
+        let emitter = sensor_framework::EventEmitter::new(dir.path().join("events.jsonl"));
+        // Leak the tempdir so it outlives the handoff (the test is short-lived anyway).
+        std::mem::forget(dir);
+        Arc::new(CaptureHandoff::new(spool, emitter, 16))
+    }
+
+    #[test]
+    fn scp_body_capped_at_max_capture_body() {
+        // An attacker declares a body larger than MAX_CAPTURE_BODY. The receiver must not
+        // grow self.body beyond the cap, but must still advance through the declared byte
+        // count to keep the protocol state machine aligned with the wire (so the trailing
+        // \0 and final ack still land correctly).
+        let handoff = test_handoff();
+        let (mut scp, _initial) = ScpReceiver::new("127.0.0.1".parse().unwrap(), None, handoff);
+
+        // Header declaring 12 MB (above the 10 MB cap).
+        let declared: usize = 12_000_000;
+        let header = format!("C0644 {declared} huge.bin\n");
+        scp.feed(header.as_bytes());
+
+        // Feed the full declared body in 1 MB chunks.
+        let chunk = vec![0xAA; 1_000_000];
+        for _ in 0..12 {
+            scp.feed(&chunk);
+        }
+        // The body must be capped; the wire must be fully consumed.
+        assert!(
+            scp.body.len() <= MAX_CAPTURE_BODY,
+            "body grew to {} bytes, cap is {MAX_CAPTURE_BODY}",
+            scp.body.len()
+        );
+        assert_eq!(scp.body.len(), MAX_CAPTURE_BODY);
+
+        // Send trailing \0 - the state machine must still be aligned.
+        let response = scp.feed(&[0x00]);
+        assert_eq!(response, vec![0x00], "final ack must still arrive");
+    }
+
+    #[test]
+    fn sftp_rejects_oversized_packet() {
+        // An attacker sends a 4-byte SFTP length field declaring a packet larger than
+        // SFTP_MAX_PACKET_SIZE. The handler must clear its buffer rather than accumulating
+        // data toward that length.
+        let handoff = test_handoff();
+        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, handoff);
+
+        // Forge a length header claiming 1 GB.
+        let huge_len: u32 = 1_000_000_000;
+        let mut bad_data = Vec::new();
+        bad_data.extend_from_slice(&huge_len.to_be_bytes());
+        // Follow with some junk bytes (far less than the declared length).
+        bad_data.extend_from_slice(&[0xFF; 1024]);
+
+        let response = sftp.feed(&bad_data);
+
+        // The handler must have cleared its buffer rather than waiting to reassemble 1 GB.
+        assert!(
+            sftp.buf.is_empty(),
+            "buffer should be cleared on oversized packet, has {} bytes",
+            sftp.buf.len()
+        );
+        // No valid SFTP response is produced for the rejected packet.
+        assert!(response.is_empty());
+    }
+
+    #[test]
+    fn sftp_oversized_length_rejected_as_soon_as_header_readable() {
+        // The attacker sends just the 4-byte length in one feed. The cap must fire
+        // immediately once the 4 bytes are present - it must not wait for body bytes
+        // to arrive before checking.
+        let handoff = test_handoff();
+        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, handoff);
+
+        let huge_len: u32 = 500_000;
+        let response = sftp.feed(&huge_len.to_be_bytes());
+
+        assert!(
+            sftp.buf.is_empty(),
+            "buffer should be cleared as soon as the oversized length header is readable"
+        );
+        assert!(response.is_empty());
+
+        // Subsequent feeds must not accumulate either.
+        let response = sftp.feed(&[0xBB; 1024]);
+        // The 1024 bytes are a new (incomplete) packet with no valid length yet.
+        assert!(sftp.buf.len() <= 1024);
+        assert!(response.is_empty());
+    }
+
+    #[test]
+    fn sftp_oversized_length_split_across_feeds() {
+        // The attacker trickles the 4-byte length header across two feeds: the first
+        // delivers only 2 bytes (not enough to read the length), the second delivers the
+        // remaining 2 bytes. The check must fire on the second feed.
+        let handoff = test_handoff();
+        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, handoff);
+
+        let huge_len: u32 = 1_000_000;
+        let header = huge_len.to_be_bytes();
+
+        // First feed: only 2 of the 4 length bytes.
+        sftp.feed(&header[..2]);
+        assert_eq!(sftp.buf.len(), 2, "not enough bytes to read length yet");
+
+        // Second feed: remaining 2 bytes complete the length.
+        let response = sftp.feed(&header[2..]);
+        assert!(
+            sftp.buf.is_empty(),
+            "buffer should be cleared once the oversized length is fully readable"
+        );
+        assert!(response.is_empty());
     }
 }

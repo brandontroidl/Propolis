@@ -4,10 +4,10 @@ pub const VERSION_MARKER: &str = "sensor-ssh";
 // Each task adds its module here as pub so integration tests can import it.
 pub mod auth;
 pub mod channel;
+pub mod fakefs;
 pub mod hostkey;
+pub mod shell;
 pub mod transport;
-// pub mod shell;
-// pub mod fakefs;
 // pub mod transfer;
 //
 // pub fn start_test_server(...) for integration tests (Task 14).

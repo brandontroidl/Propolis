@@ -17,6 +17,8 @@ rand = { version = "0.10.2", features = ["std"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
 chacha20poly1305 = "0.11.0"
+chacha20 = { version = "0.10.1", features = ["legacy"] }
+poly1305 = "0.9.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

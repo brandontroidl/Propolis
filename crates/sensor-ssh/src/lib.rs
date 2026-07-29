@@ -2,7 +2,7 @@ pub const VERSION_MARKER: &str = "sensor-ssh";
 
 // Modules added incrementally by later tasks (9-14).
 // Each task adds its module here as pub so integration tests can import it.
-// pub mod transport;
+pub mod transport;
 // pub mod hostkey;
 // pub mod auth;
 // pub mod channel;
@@ -18,7 +18,7 @@ mod tests {
     fn crypto_crates_available() {
         // Verify the crypto primitives are importable.
         use chacha20poly1305::aead::{Aead, KeyInit};
-        use chacha20poly1305::{Nonce, ChaCha20Poly1305};
+        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
         use std::convert::TryFrom;
 
         // Verify each crypto crate can be imported and basic types are accessible

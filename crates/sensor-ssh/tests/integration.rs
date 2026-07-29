@@ -14,11 +14,11 @@ struct TestHandler;
 impl russh::client::Handler for TestHandler {
     type Error = russh::Error;
 
-    fn check_server_key(
+    async fn check_server_key(
         &mut self,
         _key: &russh::keys::PublicKey,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(true) }
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
     }
 }
 
@@ -98,9 +98,7 @@ async fn ssh_handshake_and_session_with_real_client() {
         "missing honeypot_login_attempt event; got: {signal_types:?}"
     );
     assert!(
-        signal_types
-            .iter()
-            .any(|s| *s == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC),
+        signal_types.contains(&sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC),
         "missing honeypot_command_exec event; got: {signal_types:?}"
     );
 

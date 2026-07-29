@@ -313,7 +313,15 @@ fn sensor_ssh_has_no_http_client_dependency() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let content = std::fs::read_to_string(&manifest)
         .unwrap_or_else(|e| panic!("could not read {}: {e}", manifest.display()));
-    let banned = ["reqwest", "hyper", "ureq", "curl", "isahc", "surf", "attohttpc"];
+    let banned = [
+        "reqwest",
+        "hyper",
+        "ureq",
+        "curl",
+        "isahc",
+        "surf",
+        "attohttpc",
+    ];
     // Check direct dependencies in Cargo.toml (the primary guard).
     for crate_name in &banned {
         assert!(

@@ -4,9 +4,9 @@
 //! Lives in `sensor-framework` (the crate every sensor binary depends on) rather than in either
 //! sensor's own crate, because the directive set - and the failure mode it guards - is shared
 //! across every sensor `deploy/` ships, not specific to one. Also covers `intake.service`
-//! (sub-project 3) and `review.service` (sub-project 4): neither is a sensor and neither depends
-//! on this crate, but their hardening is asserted here too rather than splitting `deploy/`'s test
-//! coverage across crates.
+//! (sub-project 3), `review.service` (sub-project 4), and `feed.service` (sub-project 5): none of
+//! the three is a sensor and none depends on this crate, but their hardening is asserted here too
+//! rather than splitting `deploy/`'s test coverage across crates.
 //!
 //! Per the design doc: "The unit hardening is asserted by test, not by documentation. A
 //! directive that exists only in prose is one careless edit away from silently disappearing,
@@ -218,6 +218,56 @@ fn review_unit_has_hardening_directives() {
         unit.contains("MemoryDenyWriteExecute=yes"),
         "missing MemoryDenyWriteExecute (note the corrected spelling - see this file's module \
          doc; \"MemoryDenyWriteExecution\" is not a real systemd directive)"
+    );
+}
+
+/// `feed` (sub-project 5) is architecturally close to `intake`/`review` - a PostgreSQL client with
+/// no inbound listener - but unlike either of them, its whole purpose is to WRITE the published
+/// feed to disk (`crates/feed/src/publisher.rs`'s atomic write-then-rename), so it is the only one
+/// of the three that must also carry a `ReadWritePaths` grant. That grant must stay scoped to this
+/// service's own dedicated directory rather than widening to the shared `/var/lib/propolis` root
+/// intake also writes under (see `deploy/feed.service`'s own header comment for the full
+/// reasoning) - checked explicitly below, not just "some ReadWritePaths exists", so a silent
+/// broadening to the shared parent would fail this test.
+#[test]
+fn feed_unit_has_hardening_directives() {
+    let unit = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/feed.service"
+    ))
+    .unwrap();
+    assert!(unit.contains("NoNewPrivileges=yes"));
+    assert!(unit.contains("ProtectSystem=strict"));
+    assert!(unit.contains("ProtectHome=yes"));
+    assert!(unit.contains("PrivateTmp=yes"));
+    assert!(
+        unit.contains("RestrictAddressFamilies="),
+        "feed needs a PostgreSQL connection"
+    );
+    // feed binds no port at all, so no CAP_NET_BIND_SERVICE needed.
+    assert!(unit.contains("User="));
+    let user_line = unit.lines().find(|l| l.starts_with("User=")).unwrap();
+    assert_ne!(user_line, "User=root");
+    assert!(unit.contains("MemoryMax="));
+    assert!(unit.contains("TasksMax="));
+    assert!(unit.contains("CPUQuota="));
+    assert!(unit.contains("LimitNOFILE="));
+    assert!(unit.contains("SystemCallFilter="));
+    assert!(
+        unit.contains("MemoryDenyWriteExecute=yes"),
+        "missing MemoryDenyWriteExecute (note the corrected spelling - see this file's module \
+         doc; \"MemoryDenyWriteExecution\" is not a real systemd directive)"
+    );
+    assert!(
+        unit.contains("ReadWritePaths=/var/lib/propolis/feed"),
+        "feed publishes files and needs a write grant scoped to its own dedicated directory, \
+         never blanket filesystem access"
+    );
+    assert!(
+        !unit.contains("ReadWritePaths=/var/lib/propolis\n")
+            && !unit.contains("ReadWritePaths=/var/lib/propolis "),
+        "the write grant must not widen to the shared /var/lib/propolis root that other \
+         services (e.g. intake's cursor directory) also live under"
     );
 }
 

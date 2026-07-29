@@ -51,6 +51,7 @@ pub fn encode_mpint(bytes: &[u8]) -> Vec<u8> {
 
 /// Compute the exchange hash H = SHA-256(V_C || V_S || I_C || I_S || K_S || Q_C || Q_S || K)
 /// with each component SSH-string encoded and K as SSH mpint.
+#[allow(clippy::too_many_arguments)]
 fn compute_exchange_hash(
     v_c: &str,
     v_s: &str,

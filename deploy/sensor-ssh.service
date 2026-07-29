@@ -6,28 +6,15 @@
 # spec's "The unit hardening is asserted by test, not by documentation," a directive dropped
 # here fails that test rather than being noticed in production.
 #
-# KNOWN GAP, flagged rather than silently worked around: as of this task, crates/sensor-ssh has
-# no `src/main.rs` and no `[[bin]]` target (Cargo.toml lists only library dependencies; the crate
-# currently exposes `server::start_test_server(addr, log_path, spool_dir, host_key_path)`, used
-# only by crates/sensor-ssh/tests/integration.rs). `cargo build -p sensor-ssh` therefore does not
-# produce a `/usr/local/bin/sensor-ssh` executable today. This unit is written against the
-# binary's INTENDED interface (mirroring `start_test_server`'s parameters and sensor-catchall's
-# env-var convention), so it is ready the moment that binary composition task lands, but it is
-# not yet deployable as-is. This is a carry-forward gap from the plan's Task 14 (which scoped a
-# `main.rs` composition step that the shipped commit did not include), not something introduced
-# or silently patched over here.
-#
 # Prerequisites this unit assumes and does not itself create:
 #   - a dedicated, unprivileged system user/group `propolis-ssh` (no login shell, no home
 #     directory, holds no database handle and no secrets per the spec's "Least authority" -
 #     the host key below is not a platform secret, see internal/design/02-sensor-framework.md's
 #     "Host key" and ADR-0011).
 #   - /etc/propolis/ssh.env (mode 0600, owned by propolis-ssh), carrying this sensor's
-#     configuration. PROPOSED env vars, matching `start_test_server`'s parameters and
-#     sensor-catchall's ENV_* naming convention (crates/sensor-catchall/src/main.rs): SSH_BIND_ADDR
-#     (required, one ip:port - the SSH honeypot binds a single port, unlike the catch-all's wide
-#     port set), SSH_LOG_PATH, SSH_SPOOL_DIR, SSH_HOST_KEY_PATH. Reconcile these against the real
-#     env var names once `main.rs` is written; do not assume they are frozen.
+#     configuration. Env vars (crates/sensor-ssh/src/main.rs): PROPOLIS_SSH_BIND (required, one
+#     ip:port), PROPOLIS_SSH_WAN_MAP (optional, comma-separated local=wan pairs),
+#     PROPOLIS_SSH_LOG_PATH, PROPOLIS_SSH_SPOOL_DIR, PROPOLIS_SSH_HOST_KEY_PATH.
 #   - /var/log/propolis/ssh (event log) and /var/spool/propolis/ssh (upload quarantine),
 #     owned by propolis-ssh.
 #   - /var/lib/propolis/ssh (persistent state - the host key), owned by propolis-ssh. The host

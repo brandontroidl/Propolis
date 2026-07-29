@@ -4,8 +4,11 @@
 //! exchange, encrypted transport, user authentication, channel management, and shell/transfer
 //! data flow.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+use sensor_framework::WanResolver;
 
 /// Minimal russh client handler that accepts any host key (this is a test against our own
 /// honeypot, not a connection to a third party).
@@ -29,11 +32,13 @@ async fn ssh_handshake_and_session_with_real_client() {
     let spool_dir = dir.path().join("spool");
     let host_key_path = dir.path().join("host_key");
 
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
     let (addr, handle) = sensor_ssh::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
         spool_dir,
         host_key_path,
+        wan_resolver,
     )
     .await
     .unwrap();
@@ -154,11 +159,13 @@ async fn no_outbound_connections() {
 
     let dir = tempfile::tempdir().unwrap();
     let spool_dir = dir.path().join("spool");
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
     let (addr, handle) = sensor_ssh::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         dir.path().join("events.jsonl"),
         spool_dir,
         dir.path().join("host_key"),
+        wan_resolver,
     )
     .await
     .unwrap();

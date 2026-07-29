@@ -12,7 +12,8 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-use sensor_framework::{CaptureHandoff, EventEmitter, QuarantineSpool};
+use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::{CaptureHandoff, EventEmitter, QuarantineSpool, WanResolver};
 
 use crate::auth::AuthState;
 use crate::channel::{ChannelAction, handle_channel_open, handle_channel_request};
@@ -29,6 +30,11 @@ use crate::transport::{
     SSH_MSG_SERVICE_REQUEST, SSH_MSG_UNIMPLEMENTED, SSH_MSG_USERAUTH_REQUEST,
 };
 
+/// Cap on the shell line buffer: if an attacker sends a continuous stream of non-newline bytes,
+/// the buffer is flushed as a partial line once it hits this limit. Typing is still captured but
+/// memory stays bounded. 8 KiB is generous for any real command line.
+const MAX_LINE_LEN: usize = 8192;
+
 /// The handler active on a given channel.
 enum ChannelHandler {
     /// Awaiting a channel request to determine the handler type.
@@ -43,11 +49,16 @@ enum ChannelHandler {
 
 /// Start the SSH honeypot server on `addr` (use `:0` for ephemeral). Returns the bound
 /// address and a join handle for the listener task.
+///
+/// `wan_resolver` maps the listener's local address to the operator's WAN IP (see
+/// `sensor_framework::WanResolver`). Tests that do not need WAN attribution pass an empty
+/// resolver; production passes the operator-configured map.
 pub async fn start_test_server(
     addr: SocketAddr,
     log_path: PathBuf,
     spool_dir: PathBuf,
     host_key_path: PathBuf,
+    wan_resolver: Arc<WanResolver>,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
     // Load or generate the host key.
     let host_key = if host_key_path.exists() {
@@ -82,8 +93,11 @@ pub async fn start_test_server(
             let host_key = host_key.clone();
             let emitter = emitter.clone();
             let handoff = handoff.clone();
+            let wan_resolver = wan_resolver.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_session(stream, peer_addr, host_key, emitter, handoff).await
+                if let Err(e) =
+                    handle_session(stream, peer_addr, host_key, emitter, handoff, wan_resolver)
+                        .await
                 {
                     tracing::debug!(error = %e, peer = %peer_addr, "SSH session ended");
                 }
@@ -102,6 +116,7 @@ async fn handle_session(
     host_key: HostKey,
     emitter: Arc<EventEmitter>,
     handoff: Arc<CaptureHandoff>,
+    wan_resolver: Arc<WanResolver>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ---- Phase 1: version exchange ----
     let (client_version, server_version) =
@@ -153,8 +168,14 @@ async fn handle_session(
     let mut c2s_seq: u32 = 3;
     let mut s2c_seq: u32 = 3;
 
-    let source_ip: IpAddr = peer_addr.ip();
-    let mut auth_state = AuthState::new(source_ip, None);
+    // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped
+    // IPv6 address (::ffff:a.b.c.d from a dual-stack listener) matches the operator's
+    // plain-IPv4 WAN map entry.
+    let norm_peer = normalize_dual_stack(peer_addr);
+    let source_ip: IpAddr = norm_peer.ip();
+    let local_addr = stream.local_addr().map(normalize_dual_stack).ok();
+    let wan_ip = local_addr.and_then(|la| wan_resolver.resolve(la.ip()));
+    let mut auth_state = AuthState::new(source_ip, wan_ip);
 
     // Emit honeypot_connection (authenticated=false, pre-auth).
     let conn_event = auth_state.emit_connection_event();
@@ -237,7 +258,7 @@ async fn handle_session(
                     ChannelAction::Shell => {
                         let ctx = EmitContext {
                             source_ip,
-                            wan_ip: None,
+                            wan_ip,
                             authenticated: auth_state.is_authenticated(),
                         };
                         let shell = FakeShell::new(FakeFs::new(), ctx);
@@ -252,7 +273,7 @@ async fn handle_session(
                         // Emit a command_exec event for the exec command itself.
                         let shell_ctx = EmitContext {
                             source_ip,
-                            wan_ip: None,
+                            wan_ip,
                             authenticated: auth_state.is_authenticated(),
                         };
                         let mut shell = FakeShell::new(FakeFs::new(), shell_ctx);
@@ -263,7 +284,8 @@ async fn handle_session(
 
                         if cmd.starts_with("scp -t ") {
                             // SCP server mode.
-                            let (scp, initial) = ScpReceiver::new(source_ip, None, handoff.clone());
+                            let (scp, initial) =
+                                ScpReceiver::new(source_ip, wan_ip, handoff.clone());
                             handler = ChannelHandler::Scp(scp);
                             let data_pkt = build_channel_data(ch_id, &initial);
                             write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &data_pkt)
@@ -284,7 +306,7 @@ async fn handle_session(
                     }
                     ChannelAction::Subsystem(name) => {
                         if name == "sftp" {
-                            let sftp = SftpHandler::new(source_ip, None, handoff.clone());
+                            let sftp = SftpHandler::new(source_ip, wan_ip, handoff.clone());
                             handler = ChannelHandler::Sftp(sftp);
                         }
                     }
@@ -324,6 +346,17 @@ async fn handle_session(
                                 }
                             } else {
                                 line_buf.push(byte);
+                                // Flush the buffer as a partial line when the cap is
+                                // reached so an attacker streaming non-newline bytes
+                                // cannot grow memory without bound.
+                                if line_buf.len() >= MAX_LINE_LEN {
+                                    let line = String::from_utf8_lossy(line_buf).to_string();
+                                    line_buf.clear();
+                                    let (_output, events) = shell.handle_input(&line);
+                                    for event in &events {
+                                        let _ = emitter.append(event).await;
+                                    }
+                                }
                             }
                         }
                         if !responses.is_empty() {

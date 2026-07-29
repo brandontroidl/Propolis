@@ -4,8 +4,9 @@
 //! Lives in `sensor-framework` (the crate every sensor binary depends on) rather than in either
 //! sensor's own crate, because the directive set - and the failure mode it guards - is shared
 //! across every sensor `deploy/` ships, not specific to one. Also covers `intake.service`
-//! (sub-project 3): `intake` is not a sensor and does not depend on this crate, but its
-//! hardening is asserted here too rather than splitting `deploy/`'s test coverage across crates.
+//! (sub-project 3) and `review.service` (sub-project 4): neither is a sensor and neither depends
+//! on this crate, but their hardening is asserted here too rather than splitting `deploy/`'s test
+//! coverage across crates.
 //!
 //! Per the design doc: "The unit hardening is asserted by test, not by documentation. A
 //! directive that exists only in prose is one careless edit away from silently disappearing,
@@ -175,6 +176,43 @@ fn intake_unit_has_hardening_directives() {
     let user_line = unit.lines().find(|l| l.starts_with("User=")).unwrap();
     assert_ne!(user_line, "User=root");
     assert!(unit.contains("MemoryMax="));
+    assert!(unit.contains("SystemCallFilter="));
+    assert!(
+        unit.contains("MemoryDenyWriteExecute=yes"),
+        "missing MemoryDenyWriteExecute (note the corrected spelling - see this file's module \
+         doc; \"MemoryDenyWriteExecution\" is not a real systemd directive)"
+    );
+}
+
+/// `review` (sub-project 4) is architecturally the same shape as `intake`: a PostgreSQL client
+/// with no inbound listener and no sensor log access. Unlike `intake`, it also makes outbound
+/// HTTPS calls to vendor abuse-reporting APIs
+/// (`internal/design/04-review-gatekeeper-reporting.md`'s "Vendor adapters"), so - unlike
+/// `intake_unit_has_hardening_directives` above, which does not assert `RestrictAddressFamilies`
+/// at all - this test asserts it explicitly, matching the task brief's stated requirement.
+#[test]
+fn review_unit_has_hardening_directives() {
+    let unit = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/review.service"
+    ))
+    .unwrap();
+    assert!(unit.contains("NoNewPrivileges=yes"));
+    assert!(unit.contains("ProtectSystem=strict"));
+    assert!(unit.contains("ProtectHome=yes"));
+    assert!(unit.contains("PrivateTmp=yes"));
+    assert!(
+        unit.contains("RestrictAddressFamilies=AF_INET AF_INET6"),
+        "review needs outbound HTTPS to vendor APIs plus a PostgreSQL connection"
+    );
+    // review binds no port at all, so no CAP_NET_BIND_SERVICE needed.
+    assert!(unit.contains("User="));
+    let user_line = unit.lines().find(|l| l.starts_with("User=")).unwrap();
+    assert_ne!(user_line, "User=root");
+    assert!(unit.contains("MemoryMax="));
+    assert!(unit.contains("TasksMax="));
+    assert!(unit.contains("CPUQuota="));
+    assert!(unit.contains("LimitNOFILE="));
     assert!(unit.contains("SystemCallFilter="));
     assert!(
         unit.contains("MemoryDenyWriteExecute=yes"),

@@ -6,11 +6,12 @@ pub mod auth;
 pub mod channel;
 pub mod fakefs;
 pub mod hostkey;
+pub mod server;
 pub mod shell;
+pub mod transfer;
 pub mod transport;
-// pub mod transfer;
-//
-// pub fn start_test_server(...) for integration tests (Task 14).
+
+pub use server::start_test_server;
 
 #[cfg(test)]
 mod tests {

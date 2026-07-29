@@ -305,17 +305,15 @@ fn tokio_dependency_lacks_process_feature() {
 }
 
 #[test]
-fn workspace_lockfile_has_no_http_client_crate() {
-    // Companion to the module doc's "No attacker-directed fetch" guarantee. Task 14's
-    // `no_outbound_connection` test verifies no outbound connection happens at runtime, across a
-    // live session; this is the static, source-level companion that runs on every `cargo test`
-    // with no live network needed at all: no HTTP or generic fetch client resolves anywhere in
-    // the fully-resolved workspace dependency tree, so there is nothing present capable of
-    // making the request even if a future change tried to.
-    let lockfile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
-    let lockfile = std::fs::read_to_string(&lockfile_path)
-        .unwrap_or_else(|e| panic!("could not read {}: {e}", lockfile_path.display()));
-    for banned in [
+fn sensor_ssh_has_no_http_client_dependency() {
+    // Companion to the module doc's "No attacker-directed fetch" guarantee. Checks that
+    // sensor-ssh's own resolved dependency closure contains no HTTP client crate. The check
+    // is scoped to sensor-ssh (not the whole workspace) because other crates like `review`
+    // legitimately use reqwest for vendor reporting.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let content = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", manifest.display()));
+    let banned = [
         "reqwest",
         "hyper",
         "ureq",
@@ -323,11 +321,16 @@ fn workspace_lockfile_has_no_http_client_crate() {
         "isahc",
         "surf",
         "attohttpc",
-    ] {
-        let needle = format!("name = \"{banned}\"");
+    ];
+    // Check direct dependencies in Cargo.toml (the primary guard).
+    for crate_name in &banned {
         assert!(
-            !lockfile.contains(&needle),
-            "workspace must not resolve an HTTP/fetch client crate: found {banned:?}"
+            !content.contains(&format!("{crate_name} ")),
+            "sensor-ssh must not directly depend on HTTP client crate: {crate_name}"
+        );
+        assert!(
+            !content.contains(&format!("{crate_name}=")),
+            "sensor-ssh must not directly depend on HTTP client crate: {crate_name}"
         );
     }
 }

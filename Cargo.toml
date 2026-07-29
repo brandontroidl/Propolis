@@ -1,3 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/core-scoring", "crates/sensor-wire", "crates/sensor-framework"]
+members = [
+    "crates/core-scoring",
+    "crates/sensor-wire",
+    "crates/sensor-framework",
+    "crates/sensor-catchall",
+]

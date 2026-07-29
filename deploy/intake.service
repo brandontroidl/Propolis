@@ -1,0 +1,152 @@
+# Propolis intake - hardened systemd unit.
+#
+# Realizes internal/design/03-event-intake-aggregation.md's "Isolation and deployment", itself
+# following the three-layer pattern (least authority, resource caps, containment) established by
+# internal/design/02-sensor-framework.md and deploy/sensor-catchall.service /
+# deploy/sensor-ssh.service. Hardening is asserted by
+# crates/sensor-framework/tests/deploy_test.rs (intake_unit_has_hardening_directives), not by this
+# comment - a directive dropped here fails that test rather than being noticed in production.
+#
+# Key differences from the sensor units, per the design doc's "Isolation and deployment":
+#   - Has a database handle: the first binary in the stack that holds PostgreSQL credentials
+#     (via EnvironmentFile), so it needs no AmbientCapabilities (no privileged port bind - it
+#     binds no port at all, it is a consumer, not a listener).
+#   - Read-only access to every sensor's log directory; the only writable path is the cursor
+#     directory.
+#
+# Prerequisites this unit assumes and does not itself create:
+#   - a dedicated, unprivileged system user/group `propolis-intake` (no login shell, no home
+#     directory, per the spec's "Least authority").
+#   - `propolis-intake` added as a SUPPLEMENTARY member of each sensor's own group
+#     (`propolis-catchall`, `propolis-ssh`, ...): those units' `UMask=0027` leaves created log
+#     files group-readable specifically so this process can read them without loosening past
+#     group scope (see deploy/sensor-catchall.service's UMask comment - "No group is wired up
+#     yet - SP3 owns that provisioning" - this is that provisioning step). ReadOnlyPaths below
+#     grants the path; it cannot grant the underlying file permission bits.
+#   - /etc/propolis/intake.env (mode 0600, owned by propolis-intake), carrying this process's
+#     configuration. Env vars (crates/intake/src/main.rs): DATABASE_URL (required, PostgreSQL
+#     connection string), PROPOLIS_SENSOR_LOGS (required, comma-separated name:path pairs, e.g.
+#     "catchall:/var/log/propolis/catchall/events.jsonl,ssh:/var/log/propolis/ssh/events.jsonl"),
+#     PROPOLIS_CURSOR_DIR (default /var/lib/propolis/cursors), PROPOLIS_POLL_INTERVAL_MS
+#     (default 1000).
+#   - /var/lib/propolis/cursors, owned by propolis-intake (matches PROPOLIS_CURSOR_DIR's
+#     default and the ReadWritePaths entry below).
+#   - PostgreSQL reachable at DATABASE_URL - provisioned and managed independently of this unit.
+#   - the built binary at /usr/local/bin/intake (crates/intake, bin target "intake").
+
+[Unit]
+Description=Propolis intake - sensor log ingestion to event ledger
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=propolis-intake
+Group=propolis-intake
+EnvironmentFile=/etc/propolis/intake.env
+ExecStart=/usr/local/bin/intake
+Restart=always
+RestartSec=10
+
+# --- Least authority ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict mounts the whole filesystem read-only except /dev, /proc, and /sys;
+# systemd.exec(5) is explicit that those three subtrees need their own directives to be
+# protected - PrivateDevices, ProtectKernelTunables, and ProtectControlGroups respectively.
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# Tighter than the sensor units' AF_INET/AF_INET6-only set: intake is not a network listener,
+# so AF_UNIX is added for the case DATABASE_URL points at a local PostgreSQL over a Unix socket
+# (a single-node deployment) rather than TCP (a remote/shared PostgreSQL across collector
+# nodes) - internal/design/03-event-intake-aggregation.md's "Isolation and deployment": "only
+# AF_INET/AF_INET6 for the PostgreSQL connection, or AF_UNIX if using a local socket."
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Every sensor's log directory, read-only - intake never writes to a sensor's log directory
+# (internal/design/03-event-intake-aggregation.md's "One-directional log flow"). A single parent
+# entry covers every sensor subdirectory under it (today: catchall, ssh) without needing an
+# update each time a sensor is added.
+ReadOnlyPaths=/var/log/propolis
+# The cursor directory is the only writable path besides /tmp (PrivateTmp above).
+ReadWritePaths=/var/lib/propolis/cursors
+
+# --- No privileged port binding ---
+# Intake binds no port at all - it is a consumer of sensor logs and a PostgreSQL client, not a
+# network listener - so unlike the sensor units it carries no AmbientCapabilities /
+# CapabilityBoundingSet grant.
+CapabilityBoundingSet=
+
+# --- Resource caps ---
+# Conservative starting point for a handful of tailer tasks plus one PgPool: no per-connection
+# flood risk like the sensor units face (nothing here is reachable from the internet), so these
+# bound a runaway loop or leak, not an attacker. Revisit MemoryMax/TasksMax if the configured
+# sensor count or PgPool size grows materially beyond today's two sensors (catchall, ssh).
+MemoryMax=256M
+TasksMax=32
+CPUQuota=50%
+LimitNOFILE=1024
+
+# --- Containment ---
+# PLACEHOLDER. @system-service minus @privileged/@resources is a broad starting allowlist for
+# development, not the shipped filter. As with the sensor units, the spec requires the exact
+# syscall set be derived empirically against the running binary and re-derived whenever its
+# syscall surface changes. Before production deployment:
+#   1. Run `strace -c -f /usr/local/bin/intake` under representative load (a running batch of
+#      sensor events flowing through all configured tailers, including a copytruncate rotation).
+#   2. Derive the minimum syscall set from the trace.
+#   3. Replace the two SystemCallFilter lines below with that exact allowlist.
+#   4. Re-test under the restricted filter, and repeat whenever the binary's syscall surface
+#      changes (a dependency bump, a new code path).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Recommended alongside SystemCallFilter by systemd.exec(5): without it, a non-native syscall ABI
+# (e.g. x32 on x86_64) could reach a syscall the native-name allowlist above did not intend to
+# admit.
+SystemCallArchitectures=native
+# NOTE: the correct systemd directive is MemoryDenyWriteExecute (no trailing "-ion" - see
+# deploy/sensor-catchall.service's fuller note and crates/sensor-framework/tests/deploy_test.rs's
+# module doc for the verified correction; this unit uses the same corrected spelling).
+MemoryDenyWriteExecute=yes
+
+# --- Supplementary hardening (not required by the spec's test; each line verified with
+# `systemd-analyze security --offline=yes` against this host's systemd 258.10 for this workload:
+# async file/socket I/O, no kernel/namespace/clock/IPC/realtime/SUID use, no privileged
+# capabilities to conflict with a user namespace) ---
+PrivateUsers=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+# 0077, stricter than the sensor units' 0027: nothing else needs group access to the cursor
+# files this process creates (unlike a sensor's event log, which SP3's own intake process must
+# read - the reason those units use 0027 instead), so owner-only is the tighter correct choice
+# here.
+UMask=0077
+#
+# Deliberately NOT added, each for a concrete reason rather than an oversight:
+#   - PrivateNetwork=: intake's entire purpose is to reach PostgreSQL over the network; this
+#     would disable networking outright.
+#   - IPAddressDeny=/IPAddressAllow=: unlike the sensors (which must accept inbound from
+#     arbitrary internet addresses by design), intake only ever makes one outbound connection to
+#     the operator-configured DATABASE_URL host - a real candidate for an allow-list in
+#     principle. Not added here because that host is resolved from an env var at runtime, not
+#     known at unit-authoring time, and IPAddressAllow= takes literal IPs/CIDRs, not hostnames -
+#     hardcoding one here would silently drift from /etc/propolis/intake.env's actual value on
+#     the next DB migration or failover. A future improvement once the DB endpoint is stable
+#     infrastructure, not a one-line addition today.
+#   - RootDirectory=/RootImage=: real chroot/image-root hardening needs a prepared minimal root
+#     tree (this binary plus its shared libraries, including the PostgreSQL client libraries)
+#     provisioned outside this unit file - a legitimate future hardening step, not a one-line
+#     addition here.
+
+[Install]
+WantedBy=multi-user.target

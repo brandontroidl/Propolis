@@ -1,13 +1,19 @@
 //! Public API surface for `review`: the review queue, gatekeeper, vendor
 //! adapters, and submission daemon for sub-project 4. The crate scaffold,
-//! migrations, the review queue state machine, and the gatekeeper are wired;
-//! vendor adapters, the submission daemon, and the CLI land in later tasks.
+//! migrations, the review queue state machine, the gatekeeper, and the
+//! vendor adapters are wired; the submission daemon and the CLI land in
+//! later tasks.
 
 pub mod gatekeeper;
 pub mod queue;
+pub mod vendor;
 
 pub use gatekeeper::{GateReason, GateResult, VendorConfig, check};
 pub use queue::{QueueEntry, ReviewError, ReviewQueue};
+pub use vendor::{
+    AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter, VendorError, VendorReport,
+    VendorResponse, build_categories, build_dshield_categories, build_otx_categories,
+};
 
 /// This crate's own migrator, tracked under a table name distinct from
 /// core-scoring's default `_sqlx_migrations`.

@@ -98,6 +98,15 @@ impl AuthState {
         self.authenticated
     }
 
+    /// The username captured by `handle_userauth` - already sanitized, since it is stored from
+    /// the same `username` binding placed in that event's metadata - or `None` before the first
+    /// user-authentication request. Added for the fake shell (Task 13): the session orchestrator
+    /// wires `AuthState` and `FakeShell` together and may want the shell's persona to reflect the
+    /// identity the attacker actually claimed, rather than a hardcoded name.
+    pub fn username(&self) -> Option<&str> {
+        self.username.as_deref()
+    }
+
     /// The `honeypot_connection` event: emitted once, immediately after transport establishment
     /// and before the service-request/userauth flow even starts, so `authenticated = false`
     /// unconditionally here regardless of what happens later in the session.

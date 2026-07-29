@@ -141,6 +141,24 @@ fn emit_connection_event_is_unauthenticated_ssh_connection() {
 }
 
 #[test]
+fn username_getter_returns_none_before_authentication() {
+    // Carry-forward from Task 12 for the fake shell (Task 13): `username()` added to `AuthState`
+    // so the session orchestrator can reflect the attacker's claimed identity in the shell
+    // persona. `None` before any userauth request matches `is_authenticated`'s own pre-auth
+    // default.
+    let state = AuthState::new("203.0.113.7".parse().unwrap(), None);
+    assert_eq!(state.username(), None);
+}
+
+#[test]
+fn username_getter_returns_captured_username_after_userauth() {
+    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None);
+    let userauth = build_password_userauth(b"admin", b"pass");
+    state.handle_userauth(&userauth).unwrap();
+    assert_eq!(state.username(), Some("admin"));
+}
+
+#[test]
 fn handle_userauth_rejects_empty_payload() {
     let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None);
     let result = state.handle_userauth(&[]);

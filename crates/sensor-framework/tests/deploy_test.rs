@@ -3,7 +3,9 @@
 //! requires, and that the log rotation policy is size-based with a survivable rotation mode.
 //! Lives in `sensor-framework` (the crate every sensor binary depends on) rather than in either
 //! sensor's own crate, because the directive set - and the failure mode it guards - is shared
-//! across every sensor `deploy/` ships, not specific to one.
+//! across every sensor `deploy/` ships, not specific to one. Also covers `intake.service`
+//! (sub-project 3): `intake` is not a sensor and does not depend on this crate, but its
+//! hardening is asserted here too rather than splitting `deploy/`'s test coverage across crates.
 //!
 //! Per the design doc: "The unit hardening is asserted by test, not by documentation. A
 //! directive that exists only in prose is one careless edit away from silently disappearing,
@@ -147,6 +149,37 @@ fn logrotate_config_exists_and_is_size_based() {
     assert!(
         config.contains("copytruncate") || config.contains("postrotate"),
         "must use copytruncate or a reopen-on-signal mechanism"
+    );
+}
+
+/// `intake` (sub-project 3) is a database-holding consumer, not an internet-facing listener like
+/// the two sensors above: no port bind, so no `CAP_NET_BIND_SERVICE` - but it must still clear
+/// the same least-authority/resource-cap/containment floor
+/// `internal/design/03-event-intake-aggregation.md`'s "Isolation and deployment" requires.
+/// Checked directly (not via `assert_unit_hardened`) since its required directive set differs
+/// from the sensors' (no `RestrictAddressFamilies`/capability assertions here).
+#[test]
+fn intake_unit_has_hardening_directives() {
+    let unit = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/intake.service"
+    ))
+    .unwrap();
+    assert!(unit.contains("NoNewPrivileges=yes"));
+    assert!(unit.contains("ProtectSystem=strict"));
+    assert!(unit.contains("ProtectHome=yes"));
+    assert!(unit.contains("PrivateTmp=yes"));
+    // Intake does not bind ports, so no CAP_NET_BIND_SERVICE needed.
+    // But it does need network access to PostgreSQL.
+    assert!(unit.contains("User="));
+    let user_line = unit.lines().find(|l| l.starts_with("User=")).unwrap();
+    assert_ne!(user_line, "User=root");
+    assert!(unit.contains("MemoryMax="));
+    assert!(unit.contains("SystemCallFilter="));
+    assert!(
+        unit.contains("MemoryDenyWriteExecute=yes"),
+        "missing MemoryDenyWriteExecute (note the corrected spelling - see this file's module \
+         doc; \"MemoryDenyWriteExecution\" is not a real systemd directive)"
     );
 }
 

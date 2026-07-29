@@ -3009,9 +3009,11 @@ dependencies = [
 name = "sensor-ssh"
 version = "0.1.0"
 dependencies = [
+ "chacha20 0.10.1",
  "chacha20poly1305",
  "chrono",
  "ed25519-dalek 3.0.0",
+ "poly1305 0.9.1",
  "proptest",
  "rand 0.10.2",
  "russh",

@@ -32,6 +32,8 @@
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub mod cipher;
+
 // ---- SSH message type constants (RFC 4253 section 12; channel types are RFC 4254) ----
 
 pub const SSH_MSG_DISCONNECT: u8 = 1;

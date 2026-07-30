@@ -761,11 +761,13 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
  "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

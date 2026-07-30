@@ -1,0 +1,15 @@
+</script>
+<div class="topnav">
+<a class="wordmark" href="/">Propolis</a>
+{% block nav %}
+<nav>
+<a href="/" class="{% if active_nav == "dashboard" %}active{% endif %}">Dashboard</a>
+<a href="/queue" class="{% if active_nav == "queue" %}active{% endif %}">Review queue</a>
+</nav>
+{% endblock %}
+</div>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

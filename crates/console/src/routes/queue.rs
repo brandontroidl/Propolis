@@ -22,8 +22,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Form, Router};
-use chrono::{DateTime, Utc};
-use core_scoring::{Category, FeedTier, IpScore, ReviewState, read_score};
+use core_scoring::{Category, IpScore, ReviewState, read_score};
 use minijinja::context;
 use review::queue::ReviewQueue;
 use rust_decimal::prelude::ToPrimitive;
@@ -32,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::auth::Session;
 use crate::routes::error::AppError;
+use crate::routes::format::{format_timestamp, tier_label};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -268,23 +268,12 @@ fn row_view(
     }
 }
 
-fn format_timestamp(dt: DateTime<Utc>) -> String {
-    dt.format("%Y-%m-%d %H:%M UTC").to_string()
-}
-
 fn review_state_label(s: ReviewState) -> &'static str {
     match s {
         ReviewState::Pending => "pending",
         ReviewState::Approved => "approved",
         ReviewState::Rejected => "rejected",
         ReviewState::Snoozed => "snoozed",
-    }
-}
-
-fn tier_label(t: FeedTier) -> &'static str {
-    match t {
-        FeedTier::Aggressive => "aggressive",
-        FeedTier::Standard => "standard",
     }
 }
 

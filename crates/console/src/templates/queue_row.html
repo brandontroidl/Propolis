@@ -1,5 +1,5 @@
 <tr id="row-{{ row.ip }}">
-  <td class="ip">{{ row.ip }}</td>
+  <td class="ip"><a href="/ip/{{ row.ip }}">{{ row.ip }}</a></td>
   <td class="score"><span class="meter"><span class="meter-fill" style="--pct: {{ row.score_pct }}%"></span></span>{{ row.score }}</td>
   <td>
     {% if row.tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>

@@ -1,6 +1,6 @@
-//! HTTP-level tests for the dashboard, review queue, and login pages
-//! (`internal/plans/2026-07-30-console-observability.md`, task 2) via axum's `oneshot` test
-//! utilities - no real TCP listener.
+//! HTTP-level tests for the dashboard, review queue, login, IP detail, feed status, and metrics
+//! pages (`internal/plans/2026-07-30-console-observability.md`, tasks 2-4) via axum's `oneshot`
+//! test utilities - no real TCP listener.
 //!
 //! Each test runs against a fresh, isolated database (`#[sqlx::test(migrations = false)]`
 //! provisions and later drops a per-test Postgres database; `migrate` below then applies
@@ -15,6 +15,7 @@
 //! here is layered with `MockConnectInfo`, axum's documented test-only substitute.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -47,12 +48,17 @@ async fn migrate(pool: &PgPool) {
 }
 
 fn test_state(db: PgPool) -> AppState {
+    test_state_with_feed_dir(db, None)
+}
+
+fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> AppState {
     AppState {
         db,
         sessions: Arc::new(SessionStore::new(test_secret())),
         passwords: Arc::new(PasswordStore::new(TEST_PASSWORD)),
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
+        feed_output_dir,
     }
 }
 
@@ -65,6 +71,29 @@ fn test_app(state: AppState) -> Router {
 async fn body_text(response: Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// Like [`ev`] but with an explicit `wan_ip` - `routes::detail`'s per-WAN breakdown query
+/// (`WHERE wan_ip IS NOT NULL`) has nothing to show for any event `ev` itself produces.
+fn ev_with_wan(
+    ip: &str,
+    wan_ip: &str,
+    sensor: &str,
+    signal: SignalType,
+    protocol: Protocol,
+    authenticated: bool,
+    ts: &str,
+) -> EventInput {
+    EventInput::from_signal(
+        ip.parse().unwrap(),
+        Some(wan_ip.parse().unwrap()),
+        sensor.into(),
+        signal,
+        protocol,
+        authenticated,
+        ts.parse().unwrap(),
+        serde_json::json!({}),
+    )
 }
 
 fn ev(
@@ -522,4 +551,275 @@ async fn login_rate_limited_after_five_failed_attempts(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(sixth.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+// --- detail ---
+
+#[sqlx::test(migrations = false)]
+async fn detail_shows_events_for_seeded_ip(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.50", 60).await;
+    // A distinct signal type from `seed_recommended`'s own fixed recipe (HoneypotLoginAttempt,
+    // SshBruteForce, CatchallProbe), so this event's presence in the rendered page is
+    // attributable specifically to THIS append, not to the seed's baseline events.
+    append_event(
+        &pool,
+        ev_with_wan(
+            "203.0.113.50",
+            "198.51.100.9",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.50",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("203.0.113.50"),
+        "IP missing from page: {body}"
+    );
+    assert!(
+        body.contains("198.51.100.9"),
+        "per-WAN breakdown missing the seeded WAN IP: {body}"
+    );
+    assert!(
+        body.contains("PortScan"),
+        "evidence timeline missing the added event's signal type: {body}"
+    );
+    assert!(
+        body.contains(">Standard<"),
+        "score summary missing the Standard tier badge: {body}"
+    );
+    assert!(
+        body.contains("honeypot"),
+        "category breakdown missing: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_unknown_ip_returns_404(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.99",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/ip/203.0.113.50", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+// --- feed ---
+
+#[sqlx::test(migrations = false)]
+async fn feed_page_shows_no_builds_when_unconfigured(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(body.contains("No feed builds yet"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_page_reads_manifest_correctly(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":3,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":11,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}}}"#,
+    )
+    .unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("2026-07-29T14:00:00Z"),
+        "missing build time: {body}"
+    );
+    assert!(
+        body.contains(r#"class="mono">3</td>"#),
+        "missing aggressive count: {body}"
+    );
+    assert!(
+        body.contains(r#"class="mono">11</td>"#),
+        "missing standard count: {body}"
+    );
+    assert!(
+        body.contains("2026-07-30T14:00:00Z"),
+        "missing aggressive valid_until: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/feed", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+// --- metrics ---
+
+#[sqlx::test(migrations = false)]
+async fn metrics_returns_prometheus_text_format(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.60", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    // No session cookie at all: a Prometheus scraper cannot complete an interactive login.
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let body = body_text(response).await;
+    assert!(body.contains("# TYPE propolis_ips_scored gauge"));
+    assert!(
+        body.contains("propolis_ips_scored 1\n"),
+        "expected exactly one scored IP: {body}"
+    );
+    assert!(
+        body.contains("propolis_review_queue_pending 1\n"),
+        "expected exactly one pending review entry: {body}"
+    );
+    assert!(body.contains("propolis_ips_recommended_vendor 1\n"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn metrics_includes_vendor_submissions_by_vendor_and_status(pool: PgPool) {
+    migrate(&pool).await;
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.70")
+    .bind("abuseipdb")
+    .bind("key-1")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(true)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let app = test_app(state);
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(
+            r#"propolis_vendor_submissions_total{vendor="abuseipdb",status="success"} 1"#
+        ),
+        "missing vendor submission metric line: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn metrics_includes_feed_entries_when_manifest_present(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":4,"sha256":"x","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":9,"sha256":"y","valid_until":"2026-07-31T14:00:00Z"}}}"#,
+    )
+    .unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let app = test_app(state);
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(body.contains(r#"propolis_feed_entries{tier="aggressive"} 4"#));
+    assert!(body.contains(r#"propolis_feed_entries{tier="standard"} 9"#));
+    // 2026-07-29T14:00:00Z as Unix seconds (`date -u -d "2026-07-29T14:00:00Z" +%s`) - an exact
+    // value, not a loose prefix match, so a wrong parse (wrong field, wrong unit) cannot pass by
+    // accident.
+    assert!(
+        body.contains("propolis_feed_last_build_timestamp 1785333600\n"),
+        "missing or wrong last-build-timestamp gauge: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn metrics_omits_feed_entries_when_unconfigured(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(!body.contains("propolis_feed_entries"));
 }

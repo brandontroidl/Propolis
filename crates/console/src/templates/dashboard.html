@@ -26,7 +26,7 @@
   <tbody>
     {% for s in recent_submissions %}
     <tr>
-      <td class="ip">{{ s.source_ip }}</td>
+      <td class="ip"><a href="/ip/{{ s.source_ip }}">{{ s.source_ip }}</a></td>
       <td>{{ s.vendor }}</td>
       <td class="seen">{{ s.submitted_at }}</td>
       <td>

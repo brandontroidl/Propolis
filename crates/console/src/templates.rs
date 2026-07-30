@@ -25,6 +25,8 @@ const DASHBOARD_HTML: &str = include_str!("templates/dashboard.html");
 const QUEUE_HTML: &str = include_str!("templates/queue.html");
 const QUEUE_ROW_HTML: &str = include_str!("templates/queue_row.html");
 const LOGIN_HTML: &str = include_str!("templates/login.html");
+const DETAIL_HTML: &str = include_str!("templates/detail.html");
+const FEED_HTML: &str = include_str!("templates/feed.html");
 
 /// Builds the environment once at startup (`AppState::templates`); cheap to construct (five small
 /// templates) but shared via `Arc` so the source is parsed exactly once per process rather than
@@ -41,6 +43,10 @@ pub fn environment() -> Environment<'static> {
         .expect("queue_row.html must be a valid template");
     env.add_template("login.html", LOGIN_HTML)
         .expect("login.html must be a valid template");
+    env.add_template("detail.html", DETAIL_HTML)
+        .expect("detail.html must be a valid template");
+    env.add_template("feed.html", FEED_HTML)
+        .expect("feed.html must be a valid template");
     env
 }
 

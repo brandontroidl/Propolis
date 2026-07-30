@@ -35,6 +35,7 @@ fn test_state(db: PgPool) -> AppState {
         passwords: Arc::new(PasswordStore::new("correct horse battery staple")),
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
+        feed_output_dir: None,
     }
 }
 

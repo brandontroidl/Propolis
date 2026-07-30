@@ -4,9 +4,10 @@
 //! Lives in `sensor-framework` (the crate every sensor binary depends on) rather than in either
 //! sensor's own crate, because the directive set - and the failure mode it guards - is shared
 //! across every sensor `deploy/` ships, not specific to one. Also covers `intake.service`
-//! (sub-project 3), `review.service` (sub-project 4), and `feed.service` (sub-project 5): none of
-//! the three is a sensor and none depends on this crate, but their hardening is asserted here too
-//! rather than splitting `deploy/`'s test coverage across crates.
+//! (sub-project 3), `review.service` (sub-project 4), `feed.service` (sub-project 5), and
+//! `console.service` (sub-project 6): none of the four is a sensor and none depends on this
+//! crate, but their hardening is asserted here too rather than splitting `deploy/`'s test
+//! coverage across crates.
 //!
 //! Per the design doc: "The unit hardening is asserted by test, not by documentation. A
 //! directive that exists only in prose is one careless edit away from silently disappearing,
@@ -268,6 +269,59 @@ fn feed_unit_has_hardening_directives() {
             && !unit.contains("ReadWritePaths=/var/lib/propolis "),
         "the write grant must not widen to the shared /var/lib/propolis root that other \
          services (e.g. intake's cursor directory) also live under"
+    );
+}
+
+/// `console` (sub-project 6) is the only unit in this deploy set that is BOTH a network listener
+/// (like the two sensor units) and a PostgreSQL client (like intake/review/feed) - see that file's
+/// own header comment for the full architectural reasoning. Checked directly rather than via
+/// `assert_unit_hardened` (which assumes a sensor's `RestrictAddressFamilies=AF_INET AF_INET6`
+/// wording, which console shares, but also a `CapabilityBoundingSet` grant, which console
+/// deliberately omits - its bound port, 8080, is unprivileged).
+#[test]
+fn console_unit_has_hardening_directives() {
+    let unit = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/console.service"
+    ))
+    .unwrap();
+    assert!(unit.contains("NoNewPrivileges=yes"));
+    assert!(unit.contains("ProtectSystem=strict"));
+    assert!(unit.contains("ProtectHome=yes"));
+    assert!(unit.contains("PrivateTmp=yes"));
+    assert!(
+        unit.contains("RestrictAddressFamilies=AF_INET AF_INET6"),
+        "console needs both a loopback HTTP listener and a PostgreSQL connection"
+    );
+    assert!(unit.contains("User="), "missing User directive");
+    let user_line = unit.lines().find(|l| l.starts_with("User=")).unwrap();
+    assert_ne!(user_line, "User=root", "must not run as root");
+    assert!(unit.contains("MemoryMax="));
+    assert!(unit.contains("TasksMax="));
+    assert!(unit.contains("CPUQuota="));
+    assert!(unit.contains("LimitNOFILE="));
+    assert!(unit.contains("SystemCallFilter="));
+    assert!(
+        unit.contains("MemoryDenyWriteExecute=yes"),
+        "missing MemoryDenyWriteExecute (note the corrected spelling - see this file's module \
+         doc; \"MemoryDenyWriteExecution\" is not a real systemd directive)"
+    );
+    // Binds an unprivileged port (8080, > 1024) - unlike sensor-ssh's port 22, this never needs
+    // CAP_NET_BIND_SERVICE, so (unlike the two sensor units) it carries no AmbientCapabilities
+    // grant, and CapabilityBoundingSet is explicitly emptied rather than left at its broad
+    // default.
+    assert!(!unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
+    assert!(unit.contains("CapabilityBoundingSet="));
+    // Read-only access to feed's own publish directory (for routes::feed / routes::metrics to
+    // read manifest.json) - never widened to a write grant, and never widened past feed's own
+    // dedicated directory.
+    assert!(
+        unit.contains("ReadOnlyPaths=/var/lib/propolis/feed"),
+        "console reads feed's manifest.json for the feed status page and /metrics, read-only"
+    );
+    assert!(
+        !unit.contains("ReadWritePaths="),
+        "console writes nothing to the local filesystem at all (in-memory sessions only)"
     );
 }
 

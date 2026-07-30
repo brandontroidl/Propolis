@@ -108,6 +108,14 @@ impl SessionStore {
         }
     }
 
+    /// This store's configured session TTL. The login route uses it to set the session cookie's
+    /// `Max-Age` so the client-side cookie lifetime matches the server-side one - otherwise the
+    /// cookie would default to a browser-session-lifetime cookie, outliving or (more likely)
+    /// disappearing well before the server actually expires the session.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// Creates a new session and returns `(session_id, cookie_value)`. Cookie attributes
     /// (`HttpOnly`/`Secure`/`SameSite`/`Max-Age`) are the login route's concern, not this store's -
     /// this only produces the value that goes inside the cookie.

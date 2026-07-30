@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Feed status - Propolis{% endblock %}
+{% block content %}
+<h1>Feed status</h1>
+{% if has_build %}
+<div class="stat-row">
+  <div class="stat-card">
+    <div class="label">Last build</div>
+    <div class="value seen" style="font-size:1.1rem">{{ build_time }}</div>
+  </div>
+</div>
+<h2 class="section-title">Entry counts by tier</h2>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Tier</th><th>Entries</th><th>Valid until</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><span class="tier tier-aggressive">Aggressive</span></td>
+      <td class="mono">{{ aggressive_count }}</td>
+      <td class="seen">{{ aggressive_valid_until }}</td>
+    </tr>
+    <tr>
+      <td><span class="tier tier-standard">Standard</span></td>
+      <td class="mono">{{ standard_count }}</td>
+      <td class="seen">{{ standard_valid_until }}</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No feed builds yet.</p>
+{% endif %}
+{% endblock %}

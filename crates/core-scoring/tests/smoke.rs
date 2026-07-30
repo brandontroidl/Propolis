@@ -8,7 +8,7 @@
 
 use core_scoring::{
     Category, EventInput, FeedTier, IpScore, Protocol, ReviewState, SignalType, ValidationError,
-    signal_weight,
+    effective_score, signal_weight,
 };
 
 #[test]
@@ -44,4 +44,9 @@ fn public_api_surface_is_reachable_and_wired() {
     // check: this would fail to compile if any field's type were not `pub` and
     // reachable from outside the crate).
     let _ip_score_shape: fn(&IpScore) -> Option<FeedTier> = |s| s.tier;
+
+    // `effective_score` is reachable at the crate root (the console's IP detail page's one
+    // consumer of `scoring::breadth`, otherwise crate-private - see lib.rs's doc comment).
+    use rust_decimal_macros::dec;
+    assert_eq!(effective_score(dec!(90), 5), dec!(100));
 }

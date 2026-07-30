@@ -1,0 +1,162 @@
+# Propolis console - hardened systemd unit.
+#
+# Realizes internal/design/06-console-observability.md's "Bind model"/"Configuration", following
+# the three-layer hardening pattern (least authority, resource caps, containment) established by
+# internal/design/02-sensor-framework.md and applied identically to deploy/intake.service,
+# deploy/review.service, and deploy/feed.service. Hardening is asserted by
+# crates/sensor-framework/tests/deploy_test.rs (console_unit_has_hardening_directives), not by
+# this comment - a directive dropped here fails that test rather than being noticed in production.
+#
+# Key differences from deploy/intake.service / deploy/review.service / deploy/feed.service:
+#   - The only unit in this deploy set that is BOTH a network LISTENER (like the two sensor units)
+#     AND a PostgreSQL client (like intake/review/feed): it serves the operator's browser over
+#     loopback HTTP (PROPOLIS_CONSOLE_BIND, default 127.0.0.1:8080 - this design's own closed
+#     decision #4, "Bind model: loopback only by default") while reading/writing ip_score,
+#     review_queue, and vendor_submission over DATABASE_URL.
+#   - Binds an UNPRIVILEGED port (8080, > 1024), unlike sensor-ssh's port 22: no
+#     AmbientCapabilities/CapabilityBoundingSet grant is needed just because this unit listens -
+#     CAP_NET_BIND_SERVICE is only for binding a port below 1024.
+#   - Read-only access to the feed publisher's output directory (PROPOLIS_FEED_OUTPUT_DIR, when
+#     configured), so routes::feed / routes::metrics can read manifest.json for feed status -
+#     mirrors intake.service's own ReadOnlyPaths grant onto another service's directory (there:
+#     the sensors' logs; here: feed's publish directory). Unlike intake's case, no supplementary
+#     group membership is needed to actually read the files: deploy/feed.service's own UMask=0022
+#     already makes every published file world-readable (feed's entire purpose is publishing a
+#     PUBLIC artifact - see that file's own UMask comment), so this unit's own separate OS user
+#     can read it without joining propolis-feed's group.
+#   - Writes nothing to the local filesystem at all (sessions are in-memory only - see
+#     crates/console/src/auth.rs's SessionStore doc comment - and every other read/write goes
+#     through PostgreSQL), so - like review.service - it carries no ReadWritePaths grant beyond
+#     what PrivateTmp already provides.
+#
+# Prerequisites this unit assumes and does not itself create:
+#   - a dedicated, unprivileged system user/group `propolis-console` (no login shell, no home
+#     directory), matching the convention already established for `propolis-intake`/
+#     `propolis-review`/`propolis-feed`.
+#   - /etc/propolis/console.env (mode 0600, owned by propolis-console), carrying this process's
+#     configuration. Env vars (crates/console/src/main.rs): DATABASE_URL (required, PostgreSQL
+#     connection string); PROPOLIS_CONSOLE_BIND (default 127.0.0.1:8080); PROPOLIS_CONSOLE_PASSWORD
+#     (required - the operator's console password, hashed with Argon2id at startup and never
+#     written to disk); PROPOLIS_CONSOLE_SESSION_SECRET (optional 64-hex-char / 32-byte HMAC key -
+#     generated fresh on startup when unset, which changes nothing in practice since sessions are
+#     in-memory only and a restart already clears them); PROPOLIS_FEED_OUTPUT_DIR (optional - the
+#     same directory deploy/feed.service publishes to, e.g. /var/lib/propolis/feed/current; a
+#     missing/unset value simply renders "No feed builds yet" on the feed status page rather than
+#     failing startup).
+#   - PostgreSQL reachable at DATABASE_URL, already holding core-scoring's and review's migrations
+#     applied - provisioned and managed independently of this unit. This process reads ip_score
+#     (never writes it) and reads/writes review_queue and vendor_submission (the latter read-only
+#     from this binary's perspective - only the review daemon writes submission results).
+#   - the built binary at /usr/local/bin/console (crates/console, bin target "console").
+#   - if PROPOLIS_FEED_OUTPUT_DIR is set: that directory (and its manifest.json) already exists,
+#     owned by propolis-feed per deploy/feed.service's own prerequisites - this unit only reads it.
+
+[Unit]
+Description=Propolis console - operator web console and observability endpoints
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=propolis-console
+Group=propolis-console
+EnvironmentFile=/etc/propolis/console.env
+ExecStart=/usr/local/bin/console
+Restart=always
+RestartSec=10
+
+# --- Least authority ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict mounts the whole filesystem read-only except /dev, /proc, and /sys;
+# systemd.exec(5) is explicit that those three subtrees need their own directives to be
+# protected - PrivateDevices, ProtectKernelTunables, and ProtectControlGroups respectively.
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# Both the loopback HTTP listener (PROPOLIS_CONSOLE_BIND) and the PostgreSQL connection need
+# AF_INET/AF_INET6 - unlike intake/review/feed (DB-client-only units, where this family grant
+# exists solely for the outbound DB connection), this unit ALSO needs it for the inbound accept
+# loop. No AF_UNIX: matches review.service's more conservative choice - nothing here calls for a
+# local-socket PostgreSQL deployment mode.
+RestrictAddressFamilies=AF_INET AF_INET6
+# Read-only access to the feed publisher's output directory, when PROPOLIS_FEED_OUTPUT_DIR is
+# configured - see this file's header for why no supplementary group membership is also needed.
+# Harmless when PROPOLIS_FEED_OUTPUT_DIR is unset or the directory does not exist yet: this grants
+# access to the PATH, it does not require the path to be populated.
+ReadOnlyPaths=/var/lib/propolis/feed
+
+# --- No privileged port binding ---
+# 8080 is unprivileged (> 1024): binding it needs no capability at all, unlike sensor-ssh's port
+# 22. This unit is a listener but never touches a privileged port, so - like intake/review/feed -
+# it carries no AmbientCapabilities/CapabilityBoundingSet grant.
+CapabilityBoundingSet=
+
+# --- Resource caps ---
+# A single operator's browser sessions plus one PgPool: modest concurrency, but still a genuine
+# network listener (unlike intake/review/feed), so LimitNOFILE/TasksMax sit a little above their
+# DB-client-only baseline (256M/32/50%/1024) to cover keep-alive connections and HTMX polling
+# without materially widening the actual resource ceiling. Revisit if concurrent operator sessions
+# or request volume grow beyond a single-operator console's expected shape.
+MemoryMax=256M
+TasksMax=64
+CPUQuota=50%
+LimitNOFILE=4096
+
+# --- Containment ---
+# PLACEHOLDER. @system-service minus @privileged/@resources is a broad starting allowlist for
+# development, not the shipped filter, matching every other Propolis unit. Before production
+# deployment:
+#   1. Run `strace -c -f /usr/local/bin/console` under representative load (a login, a dashboard
+#      load, a queue approve/reject/snooze, an IP detail page load, a feed status load, and a
+#      /metrics scrape).
+#   2. Derive the minimum syscall set from the trace.
+#   3. Replace the two SystemCallFilter lines below with that exact allowlist.
+#   4. Re-test under the restricted filter, and repeat whenever the binary's syscall surface
+#      changes (a dependency bump, a new code path).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Recommended alongside SystemCallFilter by systemd.exec(5): without it, a non-native syscall ABI
+# (e.g. x32 on x86_64) could reach a syscall the native-name allowlist above did not intend to
+# admit.
+SystemCallArchitectures=native
+# NOTE: the correct systemd directive is MemoryDenyWriteExecute (no trailing "-ion" - see
+# deploy/sensor-catchall.service's fuller note and crates/sensor-framework/tests/deploy_test.rs's
+# module doc for the verified correction; this unit uses the same corrected spelling).
+MemoryDenyWriteExecute=yes
+
+# --- Supplementary hardening (not required by the spec's test; matches intake's/review's/feed's
+# set, applicable to the same workload shape: async network I/O plus PostgreSQL client, no
+# kernel/namespace/clock/IPC/realtime/SUID use, no privileged capabilities to conflict with a user
+# namespace) ---
+PrivateUsers=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+# 0077: this binary writes nothing to the local filesystem at all (in-memory sessions, no cursor
+# file, no local state) - matches review.service's identical reasoning and choice.
+UMask=0077
+#
+# Deliberately NOT added, each for a concrete reason rather than an oversight:
+#   - PrivateNetwork=: this unit's entire purpose is network I/O (serving the operator's browser
+#     and reaching PostgreSQL); this would disable networking outright.
+#   - IPAddressDeny=/IPAddressAllow=: an inbound allow-list is unnecessary for a loopback-only
+#     listener (PROPOLIS_CONSOLE_BIND defaults to 127.0.0.1, unreachable off-host by construction),
+#     and an outbound allow-list would need DATABASE_URL's host, which - matching intake's/
+#     review's/feed's identical reasoning - is resolved from EnvironmentFile at runtime, not known
+#     at unit-authoring time, and IPAddressAllow= takes literal IPs/CIDRs, not hostnames.
+#   - RootDirectory=/RootImage=: real chroot/image-root hardening needs a prepared minimal root
+#     tree provisioned outside this unit file - a legitimate future hardening step, not a one-line
+#     addition here (matches every other Propolis unit's identical deferral).
+
+[Install]
+WantedBy=multi-user.target

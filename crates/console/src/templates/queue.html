@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Review queue - Propolis{% endblock %}
+{% block content %}
+<h1>Review queue <span class="dim">({{ pending_count }} pending)</span></h1>
+{% if rows %}
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>IP</th>
+      <th><a href="/queue?sort=score" class="{% if sort == "score" %}active{% endif %}">Score</a></th>
+      <th>Tier</th>
+      <th>Categories</th>
+      <th><a href="/queue?sort=event_count" class="{% if sort == "event_count" %}active{% endif %}">Events</a></th>
+      <th><a href="/queue?sort=first_seen" class="{% if sort == "first_seen" %}active{% endif %}">First seen</a></th>
+      <th><a href="/queue?sort=last_seen" class="{% if sort == "last_seen" %}active{% endif %}">Last seen</a></th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}{% include "queue_row.html" %}{% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">Nothing pending review.</p>
+{% endif %}
+{% endblock %}

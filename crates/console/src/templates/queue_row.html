@@ -1,0 +1,29 @@
+<tr id="row-{{ row.ip }}">
+  <td class="ip"><a href="/ip/{{ row.ip }}">{{ row.ip }}</a></td>
+  <td class="score"><span class="meter"><span class="meter-fill" style="--pct: {{ row.score_pct }}%"></span></span>{{ row.score }}</td>
+  <td>
+    {% if row.tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>
+    {% elif row.tier == "standard" %}<span class="tier tier-standard">Standard</span>
+    {% else %}<span class="tier tier-none">-</span>{% endif %}
+  </td>
+  <td>{{ row.categories }}</td>
+  <td class="mono">{{ row.event_count }}</td>
+  <td class="seen">{{ row.first_seen }}</td>
+  <td class="seen">{{ row.last_seen }}</td>
+  <td>
+    {% if row.is_pending %}
+    <div class="actions">
+      <textarea name="notes" placeholder="Notes (optional)">{{ row.notes }}</textarea>
+      <input type="hidden" name="csrf_token" value="{{ row.csrf_token }}">
+      <div class="buttons">
+        <button type="button" class="btn-approve" hx-post="/queue/{{ row.ip }}/approve" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Approve</button>
+        <button type="button" class="btn-reject" hx-post="/queue/{{ row.ip }}/reject" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Reject</button>
+        <button type="button" class="btn-snooze" hx-post="/queue/{{ row.ip }}/snooze" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Snooze</button>
+      </div>
+    </div>
+    {% else %}
+    <span class="state-pill state-{{ row.state }}">{{ row.state }}</span>
+    {% if row.notes %}<div class="dim" style="margin-top:0.35rem;font-size:0.78rem;">{{ row.notes }}</div>{% endif %}
+    {% endif %}
+  </td>
+</tr>

@@ -9,4 +9,5 @@ members = [
     "crates/intake",
     "crates/review",
     "crates/feed",
+    "crates/console",
 ]

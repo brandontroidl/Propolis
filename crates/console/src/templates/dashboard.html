@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - Propolis{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+<div class="stat-row">
+  <div class="stat-card">
+    <div class="label">Total scored IPs</div>
+    <div class="value">{{ total_scored_ips }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Pending review</div>
+    <div class="value">{{ pending_reviews }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Approved today</div>
+    <div class="value">{{ approved_today }}</div>
+  </div>
+</div>
+<h2 class="section-title">Recent vendor submissions</h2>
+{% if recent_submissions %}
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr><th>IP</th><th>Vendor</th><th>Submitted</th><th>Result</th></tr>
+  </thead>
+  <tbody>
+    {% for s in recent_submissions %}
+    <tr>
+      <td class="ip"><a href="/ip/{{ s.source_ip }}">{{ s.source_ip }}</a></td>
+      <td>{{ s.vendor }}</td>
+      <td class="seen">{{ s.submitted_at }}</td>
+      <td>
+        {% if s.success %}<span class="state-pill state-approved">Sent</span>
+        {% else %}<span class="state-pill state-rejected">Failed</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No vendor submissions yet.</p>
+{% endif %}
+{% endblock %}

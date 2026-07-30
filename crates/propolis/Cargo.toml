@@ -1,0 +1,30 @@
+[package]
+name = "propolis"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "propolis"
+path = "src/main.rs"
+
+[dependencies]
+console = { path = "../console" }
+core-scoring = { path = "../core-scoring" }
+feed = { path = "../feed" }
+intake = { path = "../intake" }
+review = { path = "../review" }
+
+axum = "0.8.9"
+chrono = "0.4.45"
+hex = "0.4.3"
+ipnet = "2.12.0"
+rand = { version = "0.10.2", features = ["std"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+sqlx = { version = "0.9.0", features = ["postgres", "runtime-tokio", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio-util = "0.7.16"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

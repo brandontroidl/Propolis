@@ -1,0 +1,194 @@
+# Propolis unified daemon - hardened systemd unit.
+#
+# Realizes internal/design/07-runtime-coordination-deployment.md's "Deployment unit", following
+# the three-layer hardening pattern (least authority, resource caps, containment) established by
+# internal/design/02-sensor-framework.md and applied identically to deploy/intake.service,
+# deploy/review.service, deploy/feed.service, and deploy/console.service. Hardening is asserted by
+# crates/sensor-framework/tests/deploy_test.rs (propolis_unit_has_hardening_directives), not by
+# this comment - a directive dropped here fails that test rather than being noticed in production.
+#
+# This unit supersedes deploy/intake.service, deploy/review.service, deploy/feed.service, and
+# deploy/console.service for production: one process now runs all four subsystems (intake tailers,
+# review submission, feed builder, console server) as concurrent tokio tasks sharing one PgPool
+# (internal/design/07-runtime-coordination-deployment.md's "Architecture"). Those four units stay
+# in the repo for development/testing only - see that design doc's "What gets retired" - and
+# deploy/install.sh does not install them.
+#
+# Key differences from the four retired units, each because this one process now does what all
+# four used to do separately:
+#   - Resource caps are the highest in the deploy set (MemoryMax=1G, TasksMax=256, CPUQuota=100%,
+#     LimitNOFILE=4096, vs. each retired unit's 256-512M/32-128/50-75%/1024-4096): one process now
+#     holds four PgPool-sharing subsystems' worth of concurrency instead of one.
+#   - RestrictAddressFamilies carries all three families any of the four separately needed: AF_UNIX
+#     (intake's own widening, for a same-host PostgreSQL-over-Unix-socket deployment) plus
+#     AF_INET/AF_INET6 (review's outbound HTTPS to vendor APIs and console's inbound loopback
+#     listener).
+#   - ReadOnlyPaths=/var/log/propolis: identical to intake.service's own grant - the intake
+#     subsystem tails every sensor's log, read-only. Needs supplementary group membership to
+#     actually read the files: `propolis` must be added as a member of both `propolis-catchall`
+#     and `propolis-ssh` (those units' own UMask=0027 leaves created log files group-readable
+#     specifically for this) - deploy/install.sh does this via `usermod -aG`.
+#   - ReadWritePaths=/var/lib/propolis: WIDER than intake.service's `/var/lib/propolis/cursors` and
+#     feed.service's `/var/lib/propolis/feed` - deliberately so, and not a regression of either
+#     file's own reasoning. feed.service's header warns against widening its own grant to this
+#     shared parent specifically because a compromised FEED PROCESS could then reach INTAKE's
+#     separate cursor state - two different OS users, two different processes. That boundary is
+#     moot here: intake's and feed's roles now run as the same process under the same `propolis`
+#     user, so there is no second process's state left to protect against. The boundary that still
+#     matters - ProtectSystem=strict keeping the rest of the filesystem read-only - is unchanged.
+#     Covers cursors (crates/intake), feed's published output (crates/feed), and a reserved
+#     `spool` subdirectory (not read or written by any code path yet - provisioned by
+#     deploy/install.sh for forward compatibility, see that script's own comments).
+#   - UMask=0022, not intake's/review's 0077 or console's 0077: matches feed.service's choice and
+#     for the same reason - this process's feed subsystem publishes a PUBLIC blocklist artifact
+#     that an out-of-band mechanism (rsync, a web server, S3 sync), typically running as a
+#     different unrelated user, must be able to read (see deploy/feed.service's own UMask comment
+#     for the full reasoning). The one file this process ALSO creates under a stricter-sounding
+#     path, intake's cursor file, holds no secret - only a tailer's inode/offset/fingerprint
+#     bookkeeping - so world-readability there costs nothing, while owner-only would break the
+#     feed's entire publish purpose. One process, one UMask: the wider requirement wins.
+#
+# Prerequisites this unit assumes and does not itself create (all provisioned by
+# deploy/install.sh):
+#   - a dedicated, unprivileged system user/group `propolis` (no login shell, no home directory),
+#     added as a supplementary member of `propolis-catchall` and `propolis-ssh` (see above).
+#   - /etc/propolis/propolis.env (mode 0600, owned by propolis), carrying this process's
+#     configuration - internal/design/07-runtime-coordination-deployment.md's "Unified
+#     configuration" has the full example. Env vars (crates/propolis/src/config.rs):
+#     DATABASE_URL (required), PROPOLIS_DB_MAX_CONNECTIONS (default 10),
+#     PROPOLIS_SENSOR_LOGS (required, comma-separated name:path pairs),
+#     PROPOLIS_CURSOR_DIR (default /var/lib/propolis/cursors),
+#     PROPOLIS_POLL_INTERVAL_MS (default 1000), PROPOLIS_REVIEW_ENABLED (default true),
+#     PROPOLIS_QUEUE_SCAN_INTERVAL_SECS (default 60), PROPOLIS_SUBMIT_POLL_INTERVAL_SECS
+#     (default 30), PROPOLIS_VENDOR_{ABUSEIPDB,DSHIELD,OTX}_{KEY,URL,ENABLED,COOLDOWN_HOURS,
+#     RATE_LIMIT,RATE_WINDOW_HOURS} (DSHIELD also takes _USER), PROPOLIS_FEED_ENABLED
+#     (default true), PROPOLIS_FEED_OUTPUT_DIR (default /var/lib/propolis/feed/current),
+#     PROPOLIS_FEED_BUILD_INTERVAL_SECS (default 900), PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS
+#     (default 24), PROPOLIS_FEED_STANDARD_TTL_HOURS (default 48), PROPOLIS_FEED_ALLOWLIST
+#     (optional CIDR list), PROPOLIS_FEED_DELIST (optional IP list), PROPOLIS_CONSOLE_BIND
+#     (default 127.0.0.1:8080), PROPOLIS_CONSOLE_PASSWORD (required),
+#     PROPOLIS_CONSOLE_SESSION_SECRET (optional 64-hex-char/32-byte key - unset generates a fresh
+#     random one on every start, which only means sessions do not survive a restart, matching
+#     console.service's own identical, already-accepted behavior).
+#   - /var/log/propolis/{catchall,ssh}, owned by their respective sensor users (unchanged from
+#     deploy/sensor-catchall.service / deploy/sensor-ssh.service).
+#   - /var/lib/propolis/{cursors,feed,spool}, owned by propolis.
+#   - PostgreSQL reachable at DATABASE_URL. This binary runs its own migrations
+#     (core-scoring + review) at startup - provisioning the database server itself, and its
+#     reachability, stays an independent operator/DBA concern.
+#   - the built binary at /usr/local/bin/propolis (crates/propolis, bin target "propolis").
+
+[Unit]
+Description=Propolis unified daemon (intake + review + feed + console)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=propolis
+Group=propolis
+EnvironmentFile=/etc/propolis/propolis.env
+ExecStart=/usr/local/bin/propolis
+# Unlike the retired units' Restart=always: this daemon's own supervisor (crates/propolis/src/
+# supervisor.rs) already restarts a panicked SUBSYSTEM with backoff without the process exiting, so
+# a process-level exit only ever happens on a genuine fail-fast condition (bad config, database
+# unreachable, migration failure - each an explicit std::process::exit(1) in main.rs) or an
+# operator-issued stop (SIGTERM/SIGINT, a clean exit 0). on-failure restarts the former and leaves
+# the latter alone, matching internal/design/07-runtime-coordination-deployment.md's own example
+# unit exactly.
+Restart=on-failure
+RestartSec=5
+
+# --- Least authority ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict mounts the whole filesystem read-only except /dev, /proc, and /sys;
+# systemd.exec(5) is explicit that those three subtrees need their own directives to be
+# protected - PrivateDevices, ProtectKernelTunables, and ProtectControlGroups respectively.
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# All three families: AF_UNIX for a same-host PostgreSQL-over-Unix-socket deployment (matching
+# intake's own widening), AF_INET/AF_INET6 for outbound HTTPS to vendor APIs (matching review) and
+# the console's inbound loopback listener (matching console.service).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Every sensor's log directory, read-only - matches intake.service's identical grant and reasoning.
+ReadOnlyPaths=/var/log/propolis
+# This unit's own writable root - cursors, feed output, and a reserved spool subdirectory. See this
+# file's header for why the union grant is correct here even though feed.service's own comment
+# warns against it for ITSELF.
+ReadWritePaths=/var/lib/propolis
+
+# --- No privileged port binding ---
+# The console listener binds an unprivileged port (8080 by default, > 1024, matching
+# console.service) - no AmbientCapabilities/CapabilityBoundingSet grant needed.
+CapabilityBoundingSet=
+
+# --- Resource caps ---
+# Higher than any individual retired unit's own cap - see this file's header. Revisit if the
+# configured sensor count, vendor count, or concurrent console session volume grows materially.
+MemoryMax=1G
+TasksMax=256
+CPUQuota=100%
+LimitNOFILE=4096
+
+# --- Containment ---
+# PLACEHOLDER. @system-service minus @privileged/@resources is a broad starting allowlist for
+# development, not the shipped filter, matching every other Propolis unit. Before production
+# deployment:
+#   1. Run `strace -c -f /usr/local/bin/propolis` under representative load covering all four
+#      subsystems (sensor events flowing through the tailers, a populated review queue with at
+#      least one enabled vendor, at least one feed build/publish cycle, and console traffic: a
+#      login, dashboard load, queue action, IP detail page, feed status page, /metrics scrape).
+#   2. Derive the minimum syscall set from the trace.
+#   3. Replace the two SystemCallFilter lines below with that exact allowlist.
+#   4. Re-test under the restricted filter, and repeat whenever the binary's syscall surface
+#      changes (a dependency bump, a new code path).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Recommended alongside SystemCallFilter by systemd.exec(5): without it, a non-native syscall ABI
+# (e.g. x32 on x86_64) could reach a syscall the native-name allowlist above did not intend to
+# admit.
+SystemCallArchitectures=native
+# NOTE: the correct systemd directive is MemoryDenyWriteExecute (no trailing "-ion" - see
+# deploy/sensor-catchall.service's fuller note and crates/sensor-framework/tests/deploy_test.rs's
+# module doc for the verified correction; this unit uses the same corrected spelling).
+MemoryDenyWriteExecute=yes
+
+# --- Supplementary hardening (not required by the spec's test; matches intake's/review's/feed's/
+# console's set, applicable to the same workload shape: async network I/O plus local file writes,
+# no kernel/namespace/clock/IPC/realtime/SUID use, no privileged capabilities to conflict with a
+# user namespace) ---
+PrivateUsers=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+# 0022: see this file's header for why this unit's feed-publishing role forces the same
+# world-readable choice as feed.service, even though it also writes intake's cursor file.
+UMask=0022
+#
+# Deliberately NOT added, each for a concrete reason rather than an oversight (matches the retired
+# units' identical deferrals):
+#   - PrivateNetwork=: this unit's entire purpose is network I/O (PostgreSQL, vendor HTTPS, and the
+#     console's own inbound listener); this would disable networking outright.
+#   - IPAddressDeny=/IPAddressAllow=: the outbound destinations (DATABASE_URL's host plus three
+#     vendor API hosts) are resolved from EnvironmentFile/adapter defaults at runtime, not known at
+#     unit-authoring time, and IPAddressAllow= takes literal IPs/CIDRs, not hostnames - matches
+#     intake's/review's/feed's identical reasoning. The console's own inbound side needs no
+#     allow-list either: it is loopback-only by default (PROPOLIS_CONSOLE_BIND=127.0.0.1:8080),
+#     unreachable off-host by construction.
+#   - RootDirectory=/RootImage=: real chroot/image-root hardening needs a prepared minimal root
+#     tree provisioned outside this unit file - a legitimate future hardening step, not a one-line
+#     addition here (matches every retired unit's identical deferral).
+
+[Install]
+WantedBy=multi-user.target

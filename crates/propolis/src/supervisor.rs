@@ -1,0 +1,222 @@
+//! Per-subsystem task supervision with restart-on-panic and exponential backoff.
+//!
+//! `spawn_supervised` wraps a subsystem factory in a tokio task that catches panics (via
+//! `JoinHandle` inspection) and restarts the subsystem with exponential backoff (1s, 2s, 4s, 8s,
+//! 16s, cap 60s). Three consecutive panics within 60 seconds stops restarting that subsystem and
+//! logs an alert; the counter resets after 5 minutes of healthy operation.
+
+use std::future::Future;
+use std::time::{Duration, Instant};
+
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_CONSECUTIVE_PANICS: u32 = 3;
+const PANIC_WINDOW: Duration = Duration::from_secs(60);
+const HEALTHY_RESET: Duration = Duration::from_secs(300);
+
+/// Spawns `factory(cancel.child_token())` as a supervised tokio task. If the task panics, it is
+/// restarted with exponential backoff. Three consecutive panics within 60 seconds stops
+/// restarting. The failure counter resets after 5 minutes of healthy operation.
+///
+/// A clean return (the task's future completes without panicking) is treated as intentional
+/// shutdown - no restart.
+pub fn spawn_supervised<F, Fut>(
+    name: &'static str,
+    cancel: CancellationToken,
+    factory: F,
+) -> JoinHandle<()>
+where
+    F: Fn(CancellationToken) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut consecutive_panics: u32 = 0;
+        let mut first_panic_at: Option<Instant> = None;
+        let mut backoff = INITIAL_BACKOFF;
+
+        loop {
+            if cancel.is_cancelled() {
+                tracing::info!(subsystem = name, "supervisor: cancelled, not restarting");
+                return;
+            }
+
+            let child_token = cancel.child_token();
+            let started_at = Instant::now();
+            let handle = tokio::spawn(factory(child_token));
+
+            match handle.await {
+                // Clean return - the task chose to exit (e.g. cancellation token fired).
+                Ok(()) => {
+                    tracing::info!(subsystem = name, "supervisor: subsystem exited cleanly");
+                    return;
+                }
+                // Panic - the JoinError is a panic.
+                Err(join_error) => {
+                    let elapsed_healthy = started_at.elapsed();
+
+                    // Reset the panic counter if the subsystem ran healthy for long enough.
+                    if elapsed_healthy >= HEALTHY_RESET {
+                        consecutive_panics = 0;
+                        first_panic_at = None;
+                        backoff = INITIAL_BACKOFF;
+                    }
+
+                    consecutive_panics += 1;
+                    let now = Instant::now();
+                    if first_panic_at.is_none() {
+                        first_panic_at = Some(now);
+                    }
+
+                    tracing::error!(
+                        subsystem = name,
+                        panic = %join_error,
+                        consecutive = consecutive_panics,
+                        "supervisor: subsystem panicked"
+                    );
+
+                    // Check if we've hit the consecutive panic limit within the window.
+                    if consecutive_panics >= MAX_CONSECUTIVE_PANICS
+                        && let Some(first) = first_panic_at
+                        && now.duration_since(first) < PANIC_WINDOW
+                    {
+                        tracing::error!(
+                            subsystem = name,
+                            consecutive = consecutive_panics,
+                            "supervisor: {} consecutive panics within {}s, stopping restarts",
+                            MAX_CONSECUTIVE_PANICS,
+                            PANIC_WINDOW.as_secs()
+                        );
+                        return;
+                    }
+                    if consecutive_panics >= MAX_CONSECUTIVE_PANICS {
+                        // Outside the window - reset and keep going.
+                        consecutive_panics = 1;
+                        first_panic_at = Some(now);
+                        backoff = INITIAL_BACKOFF;
+                    }
+
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+
+                    tracing::info!(
+                        subsystem = name,
+                        backoff_secs = backoff.as_secs(),
+                        "supervisor: restarting after backoff"
+                    );
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = cancel.cancelled() => {
+                            tracing::info!(subsystem = name, "supervisor: cancelled during backoff");
+                            return;
+                        }
+                    }
+
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[tokio::test]
+    async fn clean_exit_does_not_restart() {
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicU32::new(0));
+        let count_clone = count.clone();
+
+        let handle = spawn_supervised("test-clean", cancel.clone(), move |_token| {
+            let count = count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        handle.await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_supervisor() {
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicU32::new(0));
+        let count_clone = count.clone();
+
+        let handle = spawn_supervised("test-cancel", cancel.clone(), move |token| {
+            let count = count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                token.cancelled().await;
+            }
+        });
+
+        // Give the task a moment to start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        cancel.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn panics_trigger_restart() {
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicU32::new(0));
+        let count_clone = count.clone();
+
+        let handle = spawn_supervised("test-panic", cancel.clone(), move |_token| {
+            let count = count_clone.clone();
+            async move {
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    panic!("test panic #{n}");
+                }
+                // Third invocation exits cleanly, stopping the supervisor.
+            }
+        });
+
+        // The supervisor will restart after each panic (with backoff). Eventually the third
+        // call exits cleanly.
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("supervisor should finish within timeout")
+            .unwrap();
+
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn three_rapid_panics_stops_restarting() {
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicU32::new(0));
+        let count_clone = count.clone();
+
+        let handle = spawn_supervised("test-rapid-panic", cancel.clone(), move |_token| {
+            let count = count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                panic!("rapid panic");
+            }
+        });
+
+        // After 3 rapid panics the supervisor should give up. The backoff (1s + 2s) means
+        // this takes about 3s. Allow generous timeout.
+        tokio::time::timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("supervisor should stop after 3 rapid panics")
+            .unwrap();
+
+        // Exactly 3 attempts: the first, plus two restarts, then give up.
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+}

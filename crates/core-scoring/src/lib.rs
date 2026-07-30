@@ -8,8 +8,18 @@
 //! (`core_scoring::domain::enums::Protocol`,
 //! `core_scoring::repository::{append_event, ...}`); narrowing those to
 //! private would break the existing, already-passing test suite. `hashing`
-//! and `scoring` are internal engine/chain-hashing details with no external
-//! consumer and are crate-private.
+//! and `scoring` stay crate-private - internal engine/chain-hashing details -
+//! except for one cherry-picked re-export: `effective_score`. The console's IP
+//! detail page (`internal/design/06-console-observability.md`'s "Score
+//! summary: raw score, effective score, ...") needs the breadth-adjusted score
+//! the blocklist recommendation gate actually uses, not just the boolean
+//! `IpScore::recommended_for_blocklist` flag. Re-exporting the one pure
+//! function (rather than widening `scoring` to `pub mod`) keeps every other
+//! scoring internal - constants, the engine, tier/eligibility logic - exactly
+//! as private as before, and keeps this the single source of truth for the
+//! breadth-bonus formula (a consumer computing its own copy from
+//! `IpScore::raw_score`/`distinct_wan_count` would silently drift from this
+//! crate's constants on the next tuning change).
 
 pub mod domain;
 mod hashing;
@@ -22,3 +32,4 @@ pub use domain::weights::{SignalWeight, signal_weight};
 pub use repository::{
     ChainStatus, RepoError, append_event, read_score, rebuild_projection, verify_chain,
 };
+pub use scoring::breadth::effective_score;

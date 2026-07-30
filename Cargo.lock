@@ -2868,6 +2868,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "propolis"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "console",
+ "core-scoring",
+ "feed",
+ "hex",
+ "intake",
+ "ipnet",
+ "rand 0.10.2",
+ "reqwest",
+ "review",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "proptest"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

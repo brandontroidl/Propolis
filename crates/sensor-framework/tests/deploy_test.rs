@@ -4,10 +4,10 @@
 //! Lives in `sensor-framework` (the crate every sensor binary depends on) rather than in either
 //! sensor's own crate, because the directive set - and the failure mode it guards - is shared
 //! across every sensor `deploy/` ships, not specific to one. Also covers `intake.service`
-//! (sub-project 3), `review.service` (sub-project 4), `feed.service` (sub-project 5), and
-//! `console.service` (sub-project 6): none of the four is a sensor and none depends on this
-//! crate, but their hardening is asserted here too rather than splitting `deploy/`'s test
-//! coverage across crates.
+//! (sub-project 3), `review.service` (sub-project 4), `feed.service` (sub-project 5),
+//! `console.service` (sub-project 6), and `propolis.service` plus `install.sh` (sub-project 7):
+//! none of these depends on this crate, but their hardening (and, for `install.sh`, its control
+//! flow) is asserted here too rather than splitting `deploy/`'s test coverage across crates.
 //!
 //! Per the design doc: "The unit hardening is asserted by test, not by documentation. A
 //! directive that exists only in prose is one careless edit away from silently disappearing,
@@ -325,6 +325,78 @@ fn console_unit_has_hardening_directives() {
     );
 }
 
+/// `propolis` (sub-project 7) is the unified daemon superseding `intake`/`review`/`feed`/`console`
+/// for production - see `deploy/propolis.service`'s own header comment for the full architectural
+/// reasoning. Checked directly (like `console_unit_has_hardening_directives`, not via
+/// `assert_unit_hardened`) because its required directive set matches none of the existing shapes
+/// exactly: it is simultaneously a network listener (the console subsystem), a sensor-log reader
+/// (the intake subsystem, like `intake.service`), a vendor-API HTTPS client (the review subsystem,
+/// like `review.service`), and a local file publisher (the feed subsystem, like `feed.service`).
+#[test]
+fn propolis_unit_has_hardening_directives() {
+    let unit = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/propolis.service"
+    ))
+    .unwrap();
+
+    assert!(unit.contains("NoNewPrivileges=yes"));
+    assert!(unit.contains("ProtectSystem=strict"));
+    assert!(unit.contains("ProtectHome=yes"));
+    assert!(unit.contains("PrivateTmp=yes"));
+    // Needs all three families at once - see deploy/propolis.service's own header for why this is
+    // the one unit in the deploy set that does (AF_UNIX for a same-host PostgreSQL socket, plus
+    // AF_INET/AF_INET6 for outbound vendor HTTPS and the console's inbound listener).
+    assert!(
+        unit.contains("RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX"),
+        "propolis needs AF_UNIX (local PostgreSQL) in addition to AF_INET/AF_INET6 (vendor HTTPS \
+         and the console listener)"
+    );
+
+    assert!(unit.contains("User="), "missing User directive");
+    let user_line = unit.lines().find(|l| l.starts_with("User=")).unwrap();
+    assert_ne!(user_line, "User=root", "must not run as root");
+
+    // Binds only an unprivileged port (console, default 8080) - no capability grant needed, same
+    // as console.service.
+    assert!(
+        !unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"),
+        "propolis binds no privileged port"
+    );
+    assert!(unit.contains("CapabilityBoundingSet="));
+
+    // Resource caps - presence only (not exact values): these are operational tuning knobs, not a
+    // security boundary, so pinning exact numbers here would block a legitimate re-tune.
+    assert!(unit.contains("MemoryMax="));
+    assert!(unit.contains("TasksMax="));
+    assert!(unit.contains("CPUQuota="));
+    assert!(unit.contains("LimitNOFILE="));
+
+    assert!(unit.contains("SystemCallFilter="));
+    assert!(
+        unit.contains("MemoryDenyWriteExecute=yes"),
+        "missing MemoryDenyWriteExecute (note the corrected spelling - see this file's module \
+         doc; \"MemoryDenyWriteExecution\" is not a real systemd directive)"
+    );
+
+    // Read-only across every sensor's log tree (the intake subsystem tails all of them) - matches
+    // intake.service's identical grant, checked as an exact line so a future edit cannot silently
+    // narrow or widen it to a different path.
+    assert!(
+        unit.lines().any(|l| l == "ReadOnlyPaths=/var/log/propolis"),
+        "propolis's intake subsystem must read every sensor's log directory"
+    );
+    // Writable across the whole /var/lib/propolis tree - deliberately wider than intake's own
+    // /var/lib/propolis/cursors and feed's own /var/lib/propolis/feed (see deploy/propolis.service's
+    // header for why the union is correct once cursors and feed output are written by the same
+    // process rather than two separate ones).
+    assert!(
+        unit.lines()
+            .any(|l| l == "ReadWritePaths=/var/lib/propolis"),
+        "propolis's intake and feed subsystems both need this shared writable root"
+    );
+}
+
 /// The rotation policy must cover both sensors' logs, at the exact paths their systemd units
 /// grant write access to (`ReadWritePaths`) - a policy that rotates the wrong path silently
 /// protects nothing.
@@ -342,5 +414,94 @@ fn logrotate_config_covers_both_sensor_logs() {
     assert!(
         config.contains("/var/log/propolis/ssh/events.jsonl"),
         "must rotate the SSH honeypot's log"
+    );
+}
+
+/// `deploy/install.sh` is a real (if small) bash program - control flow, idempotent helpers, a
+/// `--dry-run` mode - not declarative config like the unit files above, so a text-content check
+/// would not catch a broken script. This test exercises it for real, needing no root and mutating
+/// nothing: a syntax check, matching `bash -n`'s own definition of "parses".
+#[test]
+fn install_script_is_valid_bash() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/install.sh");
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(script)
+        .status()
+        .expect("failed to invoke `bash -n` on deploy/install.sh");
+    assert!(
+        status.success(),
+        "deploy/install.sh has a bash syntax error"
+    );
+}
+
+/// Runs `install.sh --dry-run` for real (no root, no mutation - every mutating command in the
+/// script is routed through its own `run()` wrapper, which only ever prints under `--dry-run`) and
+/// asserts the reported actions match `internal/design/07-runtime-coordination-deployment.md`'s
+/// "Install script" step list: the three users, every directory sub-project 7 and the two sensor
+/// units need, the three production binaries and unit files, the logrotate config, and the final
+/// `daemon-reload` - plus, as a regression guard on `deploy/install.sh`'s own "What gets retired"
+/// scoping, that none of the four now-superseded per-subsystem units get installed alongside it.
+#[test]
+fn install_script_dry_run_reports_expected_actions() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/install.sh");
+    let output = std::process::Command::new(script)
+        .arg("--dry-run")
+        .output()
+        .expect("failed to run deploy/install.sh --dry-run");
+    assert!(
+        output.status.success(),
+        "install.sh --dry-run exited non-zero; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for user in ["propolis", "propolis-catchall", "propolis-ssh"] {
+        assert!(stdout.contains(user), "dry-run output missing user {user}");
+    }
+    for dir in [
+        "/etc/propolis",
+        "/var/log/propolis/catchall",
+        "/var/log/propolis/ssh",
+        "/var/lib/propolis/cursors",
+        "/var/lib/propolis/feed",
+        "/var/lib/propolis/spool",
+        "/var/spool/propolis/catchall",
+        "/var/spool/propolis/ssh",
+    ] {
+        assert!(
+            stdout.contains(dir),
+            "dry-run output missing directory {dir}"
+        );
+    }
+    for bin in ["propolis", "sensor-catchall", "sensor-ssh"] {
+        assert!(stdout.contains(bin), "dry-run output missing binary {bin}");
+    }
+    for unit in [
+        "propolis.service",
+        "sensor-catchall.service",
+        "sensor-ssh.service",
+    ] {
+        assert!(stdout.contains(unit), "dry-run output missing unit {unit}");
+    }
+    for retired in [
+        "intake.service",
+        "review.service",
+        "feed.service",
+        "console.service",
+    ] {
+        assert!(
+            !stdout.contains(retired),
+            "install.sh must not install the retired {retired} - it is superseded by \
+             propolis.service in production"
+        );
+    }
+    assert!(
+        stdout.contains("logrotate"),
+        "dry-run output missing logrotate step"
+    );
+    assert!(
+        stdout.contains("daemon-reload"),
+        "dry-run output missing final daemon-reload step"
     );
 }

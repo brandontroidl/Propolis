@@ -747,14 +747,22 @@ dependencies = [
  "argon2 0.5.3",
  "axum",
  "axum-extra",
+ "chrono",
+ "core-scoring",
  "hex",
  "hmac 0.13.0",
  "http-body-util",
+ "minijinja",
  "rand 0.10.2",
+ "review",
+ "rust_decimal",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
  "subtle",
+ "thiserror 2.0.18",
+ "time",
  "tokio",
  "tower",
  "tracing",
@@ -2254,10 +2262,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memo-map"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38d1115007560874e373613744c6fba374c17688327a71c1476d1a5954cc857b"
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "minijinja"
+version = "2.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb3d648e68cea56d9858d535ee28f9538404e2dd8cb08ed0bd05dca379477f39"
+dependencies = [
+ "memo-map",
+ "serde",
+]
 
 [[package]]
 name = "miniz_oxide"

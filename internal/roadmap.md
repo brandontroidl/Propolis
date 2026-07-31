@@ -26,7 +26,7 @@ Several invariants are established at the foundation and are load-bearing for ev
 
 ## Sub-projects
 
-Eight sub-projects, built in order. Sub-projects 1 through 3 are built and merged; sub-projects 4-5 are entering their build stages; sub-projects 6 through 8 are scope stubs that receive their own spec at the start of their own cycle.
+Eight sub-projects, built in order. All eight are built and merged.
 
 | # | Sub-project | Scope | Status |
 |---|---|---|---|
@@ -35,8 +35,6 @@ Eight sub-projects, built in order. Sub-projects 1 through 3 are built and merge
 | 3 | Event intake + multi-node aggregation | Ingest of sensor output into the event ledger with per-hit WAN attribution, and aggregation of all WAN-IP collectors into one shared attacker score so cross-sensor and cross-WAN breadth counts. | **Built and merged** (`crates/intake`), direct-PG aggregation, durable cursor, rotation-aware tailer |
 | 4 | Review queue + gatekeeper + reporting | The operator review queue, the per-vendor submission gatekeeper, and the vendor reporting path. The mandatory human-approval gate lives here. | **Built and merged** (`crates/review`), human-approval gate, AbuseIPDB/DShield/OTX adapters, fail-closed gatekeeper |
 | 5 | Feed builder + exporters + publisher | Build of the tiered public blocklist from approved IPs, the export formats, and out-of-band publication, with fail-closed validation before publish. | **Built and merged** (`crates/feed`), two-tier export with anti-deanonymization coarsening, fail-closed publisher |
-| 6 | Web console + observability | The loopback operator console for review and inspection, plus logging, metrics, and health. | **Spec pending** |
+| 6 | Web console + observability | The loopback operator console for review and inspection, plus logging, metrics, and health. | **Built and merged** (`crates/console`), dashboard, review queue, IP detail, feed status, metrics, login with rate-limited auth |
 | 7 | Runtime composition + deployment | The composition root that wires the four DB-connected services into one unified daemon process, with hardened deployment unit and install script. | **Built and merged** (`crates/propolis`, `deploy/propolis.service`, `deploy/install.sh`) |
-| 8 | Remaining native sensors | Seven additional protocol-specific honeypot sensors: Telnet, Redis, ADB, HTTP, FTP, SMTP, and credential multi-protocol (VNC, MySQL, MSSQL, PostgreSQL, MongoDB). | **Spec pending** |
-
-Sub-projects 3 through 8 are scope stubs: the one-to-two-sentence scope above fixes their boundary, but each earns its full spec, plan, and build when its cycle begins, on the current goals' merits.
+| 8 | Remaining native sensors | Seven additional protocol-specific honeypot sensors: Telnet, Redis, ADB, HTTP, FTP, SMTP, and credential multi-protocol (VNC, MySQL, MSSQL, PostgreSQL, MongoDB). | **Built and merged** (`crates/sensor-telnet`, `sensor-redis`, `sensor-adb`, `sensor-http`, `sensor-ftp`, `sensor-smtp`, `sensor-cred`), 7 hardened systemd units, install.sh updated |

@@ -10,6 +10,7 @@ members = [
     "crates/sensor-redis",
     "crates/sensor-adb",
     "crates/sensor-http",
+    "crates/sensor-ftp",
     "crates/intake",
     "crates/review",
     "crates/feed",

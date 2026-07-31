@@ -260,6 +260,7 @@ async fn handle_session(
                             source_ip,
                             wan_ip,
                             authenticated: auth_state.is_authenticated(),
+                            protocol_label: "ssh".to_string(),
                         };
                         let shell = FakeShell::new(FakeFs::new(), ctx);
                         handler = ChannelHandler::Shell(shell, Vec::new());
@@ -275,6 +276,7 @@ async fn handle_session(
                             source_ip,
                             wan_ip,
                             authenticated: auth_state.is_authenticated(),
+                            protocol_label: "ssh".to_string(),
                         };
                         let mut shell = FakeShell::new(FakeFs::new(), shell_ctx);
                         let (output, events) = shell.handle_input(&cmd);

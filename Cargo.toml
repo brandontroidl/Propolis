@@ -8,6 +8,7 @@ members = [
     "crates/sensor-ssh",
     "crates/sensor-telnet",
     "crates/sensor-redis",
+    "crates/sensor-adb",
     "crates/intake",
     "crates/review",
     "crates/feed",

@@ -3822,6 +3822,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensor-telnet"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sensor-wire"
 version = "0.1.0"
 dependencies = [

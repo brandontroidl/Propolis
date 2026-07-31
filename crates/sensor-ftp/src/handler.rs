@@ -1,0 +1,321 @@
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+
+use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::sanitize_value;
+use sensor_framework::{CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, WanResolver};
+use sensor_wire::{
+    PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
+    SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
+};
+
+const PROTOCOL_LABEL: &str = "ftp";
+const MAX_LINE_LEN: usize = 8192;
+const MAX_USERNAME_LEN: usize = 255;
+const MAX_STOR_BODY: usize = 10_000_000;
+
+const BANNER: &[u8] = b"220 FTP server ready\r\n";
+const CANNED_LIST: &str = "\
+-rw-r--r--   1 root  root      4096 Jan  1 00:00 readme.txt\r\n\
+drwxr-xr-x   2 root  root      4096 Jan  1 00:00 pub\r\n";
+
+pub async fn handle_connection(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    emitter: Arc<EventEmitter>,
+    wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
+    handoff: Arc<CaptureHandoff>,
+) {
+    let norm_peer = normalize_dual_stack(peer_addr);
+    let source_ip: IpAddr = norm_peer.ip();
+    let wan_ip = stream
+        .local_addr()
+        .ok()
+        .map(normalize_dual_stack)
+        .and_then(|local| wan_resolver.resolve(local.ip()));
+
+    let _ = emitter.append(&connection_event(source_ip, wan_ip)).await;
+
+    let mut reader = BufReader::new(stream);
+    if write_line(&mut reader, BANNER).await.is_err() {
+        return;
+    }
+
+    let mut username = String::new();
+    let mut logged_in = false;
+    let mut total_read: u64 = 0;
+    let mut pasv_listener: Option<TcpListener> = None;
+
+    loop {
+        let Some(line) = read_line_bounded(&mut reader, &bounds, &mut total_read).await else {
+            return;
+        };
+        let (cmd, arg) = split_ftp_command(&line);
+
+        match cmd {
+            "USER" => {
+                username = sanitize_value(arg, MAX_USERNAME_LEN);
+                let _ = write_line(&mut reader, b"331 Password required\r\n").await;
+            }
+            "PASS" => {
+                // Password read to advance protocol; immediately dropped.
+                logged_in = true;
+                let _ = emitter
+                    .append(&login_event(source_ip, wan_ip, &username))
+                    .await;
+                let _ = write_line(&mut reader, b"230 Login successful\r\n").await;
+            }
+            "SYST" => {
+                let _ = write_line(&mut reader, b"215 UNIX Type: L8\r\n").await;
+            }
+            "FEAT" => {
+                let _ = write_line(&mut reader, b"211-Features:\r\n PASV\r\n UTF8\r\n211 End\r\n")
+                    .await;
+            }
+            "PWD" | "XPWD" => {
+                let _ = write_line(&mut reader, b"257 \"/\" is current directory\r\n").await;
+            }
+            "CWD" | "XCWD" => {
+                let _ = write_line(&mut reader, b"250 Directory changed\r\n").await;
+            }
+            "TYPE" => {
+                let _ = write_line(&mut reader, b"200 Type set\r\n").await;
+            }
+            "PASV" | "EPSV" => {
+                match TcpListener::bind("127.0.0.1:0").await {
+                    Ok(listener) => {
+                        let data_addr = listener.local_addr().unwrap();
+                        let resp = if cmd == "PASV" {
+                            let ip = data_addr.ip();
+                            let port = data_addr.port();
+                            let ip_str = match ip {
+                                IpAddr::V4(v4) => {
+                                    let o = v4.octets();
+                                    format!("{},{},{},{}", o[0], o[1], o[2], o[3])
+                                }
+                                IpAddr::V6(_) => "127,0,0,1".to_string(),
+                            };
+                            format!(
+                                "227 Entering Passive Mode ({},{},{}).\r\n",
+                                ip_str,
+                                port >> 8,
+                                port & 0xFF
+                            )
+                        } else {
+                            format!("229 Entering Extended Passive Mode (|||{}|)\r\n", data_addr.port())
+                        };
+                        pasv_listener = Some(listener);
+                        let _ = write_line(&mut reader, resp.as_bytes()).await;
+                    }
+                    Err(_) => {
+                        let _ =
+                            write_line(&mut reader, b"425 Cannot open data connection\r\n").await;
+                    }
+                }
+            }
+            "LIST" | "NLST" => {
+                if let Some(ref listener) = pasv_listener {
+                    let _ = write_line(&mut reader, b"150 Opening data connection\r\n").await;
+                    if let Ok(Ok((mut data, _))) = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        listener.accept(),
+                    )
+                    .await
+                    {
+                        let _ = data.write_all(CANNED_LIST.as_bytes()).await;
+                        drop(data);
+                    }
+                    let _ = write_line(&mut reader, b"226 Transfer complete\r\n").await;
+                } else {
+                    let _ = write_line(&mut reader, b"425 Use PASV first\r\n").await;
+                }
+            }
+            "STOR" => {
+                let filename = sanitize_value(arg, 255);
+                if let Some(ref listener) = pasv_listener {
+                    let _ = write_line(&mut reader, b"150 Opening data connection\r\n").await;
+                    if let Ok(Ok((mut data, _))) = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        listener.accept(),
+                    )
+                    .await
+                    {
+                        let mut body = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                data.read(&mut chunk),
+                            )
+                            .await
+                            {
+                                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                                Ok(Ok(n)) => {
+                                    let take = MAX_STOR_BODY.saturating_sub(body.len()).min(n);
+                                    body.extend_from_slice(&chunk[..take]);
+                                    if body.len() >= MAX_STOR_BODY {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        drop(data);
+
+                        let orig_name = filename.clone();
+                        let job = CaptureJob {
+                            body,
+                            orig_name,
+                            event_builder: Box::new(move |sample: SampleRef| SensorEvent {
+                                v: WIRE_VERSION,
+                                source_ip,
+                                wan_ip,
+                                sensor: PROTOCOL_LABEL.to_string(),
+                                signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
+                                protocol: PROTO_TCP.to_string(),
+                                authenticated: logged_in,
+                                observed_at: chrono::Utc::now(),
+                                metadata: serde_json::json!({
+                                    "protocol_label": PROTOCOL_LABEL,
+                                    "sha256": sample.sha256,
+                                    "size": sample.size,
+                                    "orig_name": sample.orig_name,
+                                }),
+                                sample: Some(sample),
+                            }),
+                        };
+                        let _ = handoff.submit(job);
+                    }
+                    let _ = write_line(&mut reader, b"226 Transfer complete\r\n").await;
+                } else {
+                    let _ = write_line(&mut reader, b"425 Use PASV first\r\n").await;
+                }
+            }
+            "RETR" => {
+                let _ = write_line(&mut reader, b"550 Permission denied\r\n").await;
+            }
+            "PORT" | "EPRT" => {
+                let _ = write_line(&mut reader, b"502 Not implemented\r\n").await;
+            }
+            "QUIT" => {
+                let _ = write_line(&mut reader, b"221 Goodbye\r\n").await;
+                return;
+            }
+            "NOOP" => {
+                let _ = write_line(&mut reader, b"200 OK\r\n").await;
+            }
+            _ => {
+                let _ = write_line(&mut reader, b"502 Not implemented\r\n").await;
+            }
+        }
+    }
+}
+
+fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
+    SensorEvent {
+        v: WIRE_VERSION,
+        source_ip,
+        wan_ip,
+        sensor: PROTOCOL_LABEL.to_string(),
+        signal_type: SIGNAL_HONEYPOT_CONNECTION.to_string(),
+        protocol: PROTO_TCP.to_string(),
+        authenticated: false,
+        observed_at: chrono::Utc::now(),
+        metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
+        sample: None,
+    }
+}
+
+fn login_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, username: &str) -> SensorEvent {
+    SensorEvent {
+        v: WIRE_VERSION,
+        source_ip,
+        wan_ip,
+        sensor: PROTOCOL_LABEL.to_string(),
+        signal_type: SIGNAL_HONEYPOT_LOGIN_ATTEMPT.to_string(),
+        protocol: PROTO_TCP.to_string(),
+        authenticated: true,
+        observed_at: chrono::Utc::now(),
+        metadata: serde_json::json!({
+            "protocol_label": PROTOCOL_LABEL,
+            "username": username,
+        }),
+        sample: None,
+    }
+}
+
+fn split_ftp_command(line: &str) -> (&str, &str) {
+    let trimmed = line.trim();
+    if let Some(idx) = trimmed.find(' ') {
+        let cmd = &trimmed[..idx];
+        let arg = trimmed[idx + 1..].trim();
+        (cmd, arg)
+    } else {
+        (trimmed, "")
+    }
+}
+
+async fn write_line(reader: &mut BufReader<TcpStream>, data: &[u8]) -> Result<(), ()> {
+    reader.get_mut().write_all(data).await.map_err(|_| ())
+}
+
+async fn read_line_bounded(
+    reader: &mut BufReader<TcpStream>,
+    bounds: &ConnectionBounds,
+    total: &mut u64,
+) -> Option<String> {
+    if *total >= bounds.max_captured_bytes {
+        return None;
+    }
+    let timeout = if *total == 0 {
+        bounds.read_timeout
+    } else {
+        bounds.idle_timeout
+    };
+
+    let mut line = String::new();
+    match tokio::time::timeout(timeout, reader.read_line(&mut line)).await {
+        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => None,
+        Ok(Ok(n)) => {
+            *total += n as u64;
+            if line.len() > MAX_LINE_LEN {
+                line.truncate(MAX_LINE_LEN);
+            }
+            let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+            Some(trimmed)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_event_is_unauthenticated_with_ftp_label() {
+        let event = connection_event("203.0.113.7".parse().unwrap(), None);
+        assert!(!event.authenticated);
+        assert_eq!(event.sensor, "ftp");
+        assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
+    }
+
+    #[test]
+    fn login_event_is_authenticated_and_carries_username() {
+        let event = login_event("203.0.113.7".parse().unwrap(), None, "admin");
+        assert!(event.authenticated);
+        assert_eq!(event.sensor, "ftp");
+        assert_eq!(event.signal_type, SIGNAL_HONEYPOT_LOGIN_ATTEMPT);
+        assert_eq!(event.metadata.get("username").and_then(|v| v.as_str()), Some("admin"));
+        assert!(event.metadata.get("password").is_none());
+    }
+
+    #[test]
+    fn split_ftp_command_splits_correctly() {
+        assert_eq!(split_ftp_command("USER admin"), ("USER", "admin"));
+        assert_eq!(split_ftp_command("QUIT"), ("QUIT", ""));
+        assert_eq!(split_ftp_command("STOR /tmp/file name.bin"), ("STOR", "/tmp/file name.bin"));
+    }
+}

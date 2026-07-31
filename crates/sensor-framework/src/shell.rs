@@ -1,17 +1,19 @@
 //! The fake interactive shell (Task 13) presented to an attacker after SSH authentication
-//! succeeds. See "Fake shell", "Never-exec", and "No attacker-directed fetch" in
+//! succeeds. Originally part of `sensor-ssh`; moved here (Task 1 of the remaining-sensors plan)
+//! so `sensor-telnet`/`sensor-adb` can reuse it without depending on sensor-ssh. See "Fake
+//! shell", "Never-exec", and "No attacker-directed fetch" in
 //! `internal/design/02-sensor-framework.md`: this module sits on the two highest-priority
 //! security surfaces in the platform, and both governing invariants are enforced by
 //! construction, not by care.
 //!
-//! **Never-exec.** No file in this crate's `src/` imports a process-spawning facility: no
-//! `Command` type pulled in from `std`'s `process` module, no `exec`-family call, no dynamic
-//! evaluation of any kind. Every command below returns a hand-written, static or
-//! lightly-interpolated string; there is no code path from an attacker-typed byte to a real
-//! shell, syscall, or interpreter. `never_exec_static_check` in `tests/shell_test.rs` asserts
-//! this at the source level (as plain substring matches, so this doc comment is deliberately
-//! phrased to describe those APIs without spelling out their exact paths) across every file in
-//! `src/`, not just this one.
+//! **Never-exec.** No file in this crate's `src/`, nor in `sensor-ssh`'s, imports a
+//! process-spawning facility: no `Command` type pulled in from `std`'s `process` module, no
+//! `exec`-family call, no dynamic evaluation of any kind. Every command below returns a
+//! hand-written, static or lightly-interpolated string; there is no code path from an
+//! attacker-typed byte to a real shell, syscall, or interpreter. `never_exec_static_check` in
+//! `sensor-ssh`'s `tests/shell_test.rs` asserts this at the source level (as plain substring
+//! matches, so this doc comment is deliberately phrased to describe those APIs without spelling
+//! out their exact paths) across every file in both crates' `src/`, not just this one.
 //!
 //! **No attacker-directed fetch.** `wget`/`curl` return a canned transcript and perform zero
 //! network I/O. This is guaranteed the same way never-exec is: this crate (and the whole
@@ -28,10 +30,10 @@
 
 use std::net::IpAddr;
 
-use sensor_framework::sanitize_value;
 use sensor_wire::{PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SensorEvent, WIRE_VERSION};
 
 use crate::fakefs::FakeFs;
+use crate::sanitize_value;
 
 /// Cap applied to the sanitized command line captured in `metadata.command`. Matches
 /// `auth::MAX_METADATA_STRING_LEN`'s convention of a generous, fixed bound on an
@@ -48,10 +50,18 @@ const MAX_URL_LEN: usize = 512;
 /// rather than hardcoded `true` - the shell is only ever reached post-authentication in practice,
 /// but a future caller (a pre-auth probe, a non-interactive path) must not have its events
 /// silently mis-tagged by a hardcoded value.
+///
+/// `protocol_label` exists because this shell is shared across protocols (SSH, Telnet, and per
+/// the design spec eventually ADB): it names both the emitted event's top-level `sensor` field
+/// and its `metadata.protocol_label` entry, so `handle_input` never hardcodes which sensor is
+/// driving it. Every current and planned caller uses the same string for both - there is no
+/// observed case where a `FakeShell` consumer's `sensor` name differs from its `protocol_label` -
+/// so one field covers both rather than two that would only ever be set identically.
 pub struct EmitContext {
     pub source_ip: IpAddr,
     pub wan_ip: Option<IpAddr>,
     pub authenticated: bool,
+    pub protocol_label: String,
 }
 
 /// The fake interactive shell. One instance per SSH session; `cwd` is the only mutable state,
@@ -91,13 +101,13 @@ impl FakeShell {
             v: WIRE_VERSION,
             source_ip: self.ctx.source_ip,
             wan_ip: self.ctx.wan_ip,
-            sensor: "ssh".into(),
+            sensor: self.ctx.protocol_label.clone(),
             signal_type: SIGNAL_HONEYPOT_COMMAND_EXEC.into(),
             protocol: PROTO_TCP.into(),
             authenticated: self.ctx.authenticated,
             observed_at: chrono::Utc::now(),
             metadata: serde_json::json!({
-                "protocol_label": "ssh",
+                "protocol_label": self.ctx.protocol_label,
                 "command": sanitized_cmd,
             }),
             sample: None,

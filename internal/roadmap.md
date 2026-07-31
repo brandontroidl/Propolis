@@ -36,7 +36,7 @@ Eight sub-projects, built in order. Sub-projects 1 through 3 are built and merge
 | 4 | Review queue + gatekeeper + reporting | The operator review queue, the per-vendor submission gatekeeper, and the vendor reporting path. The mandatory human-approval gate lives here. | **Built and merged** (`crates/review`), human-approval gate, AbuseIPDB/DShield/OTX adapters, fail-closed gatekeeper |
 | 5 | Feed builder + exporters + publisher | Build of the tiered public blocklist from approved IPs, the export formats, and out-of-band publication, with fail-closed validation before publish. | **Built and merged** (`crates/feed`), two-tier export with anti-deanonymization coarsening, fail-closed publisher |
 | 6 | Web console + observability | The loopback operator console for review and inspection, plus logging, metrics, and health. | **Spec pending** |
-| 7 | Runtime composition + multi-node coordination + deployment | The composition root that wires the process, coordination across nodes in a cluster deployment, and the deployment and hardening artifacts. | Design pending |
-| 8 | Remaining native sensors | The remaining self-authored sensors: Redis, ADB, malware-capture, and credential. | Design pending |
+| 7 | Runtime composition + deployment | The composition root that wires the four DB-connected services into one unified daemon process, with hardened deployment unit and install script. | **Built and merged** (`crates/propolis`, `deploy/propolis.service`, `deploy/install.sh`) |
+| 8 | Remaining native sensors | Seven additional protocol-specific honeypot sensors: Telnet, Redis, ADB, HTTP, FTP, SMTP, and credential multi-protocol (VNC, MySQL, MSSQL, PostgreSQL, MongoDB). | **Spec pending** |
 
 Sub-projects 3 through 8 are scope stubs: the one-to-two-sentence scope above fixes their boundary, but each earns its full spec, plan, and build when its cycle begins, on the current goals' merits.

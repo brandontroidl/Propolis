@@ -11,6 +11,7 @@ members = [
     "crates/sensor-adb",
     "crates/sensor-http",
     "crates/sensor-ftp",
+    "crates/sensor-smtp",
     "crates/intake",
     "crates/review",
     "crates/feed",

@@ -1,0 +1,21 @@
+[package]
+name = "sensor-telnet"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sensor-telnet"
+path = "src/main.rs"
+
+[dependencies]
+sensor-wire = { path = "../sensor-wire" }
+sensor-framework = { path = "../sensor-framework" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
+serde_json = "1.0.151"
+chrono = { version = "0.4.45", features = ["serde"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+proptest = "1.11.0"

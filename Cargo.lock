@@ -3768,11 +3768,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
+name = "sensor-adb"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sensor-catchall"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "core-scoring",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sensor-cred"
+version = "0.1.0"
+dependencies = [
+ "chrono",
  "sensor-framework",
  "sensor-wire",
  "serde_json",
@@ -3798,6 +3828,64 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensor-ftp"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sensor-http"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sensor-redis"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sensor-smtp"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sensor-ssh"
 version = "0.1.0"
 dependencies = [
@@ -3819,6 +3907,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x25519-dalek",
+]
+
+[[package]]
+name = "sensor-telnet"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

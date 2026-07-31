@@ -3798,6 +3798,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensor-redis"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sensor-ssh"
 version = "0.1.0"
 dependencies = [

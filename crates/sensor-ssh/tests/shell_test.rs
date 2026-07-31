@@ -88,11 +88,32 @@ fn fakefs_uses_rfc5737_addresses() {
 
 #[test]
 fn never_exec_static_check() {
-    // Verify that sensor-ssh source does not import process-spawning facilities.
+    // Verify that neither sensor-ssh's nor sensor-framework's source imports process-spawning
+    // facilities. sensor-framework is included because FakeFs/FakeShell (the two highest-priority
+    // security surfaces per shell.rs's module doc) moved out of sensor-ssh/src into
+    // sensor-framework/src in Task 1 of the remaining-sensors plan - the never-exec guarantee
+    // must keep holding wherever the file lives, not just in the crate that originally housed it.
     let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let framework_src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("sensor-framework")
+        .join("src");
+    let ssh_files = walkdir_or_manual(&src_dir);
+    let framework_files = walkdir_or_manual(&framework_src_dir);
+    assert!(
+        !ssh_files.is_empty(),
+        "expected to find sensor-ssh source files at {}",
+        src_dir.display()
+    );
+    assert!(
+        !framework_files.is_empty(),
+        "expected to find sensor-framework source files at {}",
+        framework_src_dir.display()
+    );
+
     let mut found_exec = Vec::new();
-    for entry in walkdir_or_manual(&src_dir) {
-        let content = std::fs::read_to_string(&entry).unwrap_or_default();
+    for entry in ssh_files.iter().chain(framework_files.iter()) {
+        let content = std::fs::read_to_string(entry).unwrap_or_default();
         if content.contains("std::process::Command")
             || content.contains("process::Command")
             || content.contains("Command::new")
@@ -104,7 +125,7 @@ fn never_exec_static_check() {
     }
     assert!(
         found_exec.is_empty(),
-        "sensor-ssh must not contain process-spawning code: {found_exec:?}"
+        "sensor-ssh/sensor-framework must not contain process-spawning code: {found_exec:?}"
     );
 }
 

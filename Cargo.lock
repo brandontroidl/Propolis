@@ -3768,6 +3768,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
+name = "sensor-adb"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sensor-catchall"
 version = "0.1.0"
 dependencies = [

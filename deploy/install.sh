@@ -9,6 +9,7 @@
 #
 #   - deploy/propolis.service                        (the unified daemon)
 #   - deploy/sensor-catchall.service, deploy/sensor-ssh.service   (unchanged from sub-project 2)
+#   - deploy/sensor-{telnet,redis,adb,http,ftp,smtp,cred}.service (sub-project 8 sensors)
 #
 # deploy/intake.service, deploy/review.service, deploy/feed.service, and deploy/console.service are
 # deliberately NOT installed here - internal/design/07-runtime-coordination-deployment.md's "What
@@ -91,12 +92,18 @@ log "1/7 creating OS users"
 ensure_user propolis
 ensure_user propolis-catchall
 ensure_user propolis-ssh
+ensure_user propolis-telnet
+ensure_user propolis-redis
+ensure_user propolis-adb
+ensure_user propolis-http
+ensure_user propolis-ftp
+ensure_user propolis-smtp
+ensure_user propolis-cred
 
-# propolis reads both sensors' logs (ReadOnlyPaths=/var/log/propolis in propolis.service). The
-# files themselves are group-readable (UMask=0027 in both sensor units), so propolis needs
-# supplementary membership in each sensor's own group - mirrors deploy/intake.service's identical,
-# already-shipped prerequisite for the same reason.
-run usermod -aG propolis-catchall,propolis-ssh propolis
+# propolis reads all sensors' logs (ReadOnlyPaths=/var/log/propolis in propolis.service). The
+# files themselves are group-readable (UMask=0027 in sensor units), so propolis needs
+# supplementary membership in each sensor's own group.
+run usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-cred propolis
 
 # ---- 2. directories ----
 
@@ -115,6 +122,13 @@ ensure_dir /etc/propolis                  0755 root              root
 ensure_dir /var/log/propolis              0755 root              root
 ensure_dir /var/log/propolis/catchall     0750 propolis-catchall propolis-catchall
 ensure_dir /var/log/propolis/ssh          0750 propolis-ssh      propolis-ssh
+ensure_dir /var/log/propolis/telnet      0750 propolis-telnet   propolis-telnet
+ensure_dir /var/log/propolis/redis       0750 propolis-redis    propolis-redis
+ensure_dir /var/log/propolis/adb         0750 propolis-adb      propolis-adb
+ensure_dir /var/log/propolis/http        0750 propolis-http     propolis-http
+ensure_dir /var/log/propolis/ftp         0750 propolis-ftp      propolis-ftp
+ensure_dir /var/log/propolis/smtp        0750 propolis-smtp     propolis-smtp
+ensure_dir /var/log/propolis/cred        0750 propolis-cred     propolis-cred
 ensure_dir /var/lib/propolis              0755 root              root
 ensure_dir /var/lib/propolis/cursors      0750 propolis          propolis
 # 0755, not cursors' 0750: this is feed's PUBLIC output tree (see deploy/propolis.service's own
@@ -138,6 +152,8 @@ ensure_dir /var/lib/propolis/spool        0750 propolis          propolis
 ensure_dir /var/spool/propolis            0755 root              root
 ensure_dir /var/spool/propolis/catchall   0750 propolis-catchall propolis-catchall
 ensure_dir /var/spool/propolis/ssh        0750 propolis-ssh      propolis-ssh
+ensure_dir /var/spool/propolis/adb       0750 propolis-adb      propolis-adb
+ensure_dir /var/spool/propolis/ftp       0750 propolis-ftp      propolis-ftp
 
 cat <<'EOF'
     NOT DONE BY THIS SCRIPT - back each spool directory with a noexec,nosuid,nodev mount before
@@ -145,6 +161,8 @@ cat <<'EOF'
 
         tmpfs /var/spool/propolis/catchall tmpfs noexec,nosuid,nodev,size=256M 0 0
         tmpfs /var/spool/propolis/ssh      tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/adb      tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/ftp      tmpfs noexec,nosuid,nodev,size=256M 0 0
         tmpfs /var/lib/propolis/spool      tmpfs noexec,nosuid,nodev,size=256M 0 0
 
     Size each mount for the expected upload/sample volume; a dedicated backing partition works
@@ -156,7 +174,7 @@ EOF
 # ---- 4. binaries ----
 
 log "4/7 installing binaries to /usr/local/bin"
-for bin in propolis sensor-catchall sensor-ssh; do
+for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-cred; do
     src="$BUILD_DIR/$bin"
     dst="/usr/local/bin/$bin"
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -173,7 +191,7 @@ done
 # ---- 5. systemd units ----
 
 log "5/7 installing systemd units"
-for unit in propolis.service sensor-catchall.service sensor-ssh.service; do
+for unit in propolis.service sensor-catchall.service sensor-ssh.service sensor-telnet.service sensor-redis.service sensor-adb.service sensor-http.service sensor-ftp.service sensor-smtp.service sensor-cred.service; do
     run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
 
@@ -191,5 +209,5 @@ if [ "$DRY_RUN" -eq 1 ]; then
     log "dry-run complete - no changes were made."
 else
     log "done. Services are installed but NOT started or enabled, and the database is untouched."
-    log "Next: populate /etc/propolis/{propolis,catchall,ssh}.env, then 'systemctl enable --now <unit>' per service."
+    log "Next: populate /etc/propolis/*.env files, then 'systemctl enable --now <unit>' per service."
 fi

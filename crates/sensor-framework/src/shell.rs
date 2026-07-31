@@ -1,17 +1,19 @@
 //! The fake interactive shell (Task 13) presented to an attacker after SSH authentication
-//! succeeds. See "Fake shell", "Never-exec", and "No attacker-directed fetch" in
+//! succeeds. Originally part of `sensor-ssh`; moved here (Task 1 of the remaining-sensors plan)
+//! so `sensor-telnet`/`sensor-adb` can reuse it without depending on sensor-ssh. See "Fake
+//! shell", "Never-exec", and "No attacker-directed fetch" in
 //! `internal/design/02-sensor-framework.md`: this module sits on the two highest-priority
 //! security surfaces in the platform, and both governing invariants are enforced by
 //! construction, not by care.
 //!
-//! **Never-exec.** No file in this crate's `src/` imports a process-spawning facility: no
-//! `Command` type pulled in from `std`'s `process` module, no `exec`-family call, no dynamic
-//! evaluation of any kind. Every command below returns a hand-written, static or
-//! lightly-interpolated string; there is no code path from an attacker-typed byte to a real
-//! shell, syscall, or interpreter. `never_exec_static_check` in `tests/shell_test.rs` asserts
-//! this at the source level (as plain substring matches, so this doc comment is deliberately
-//! phrased to describe those APIs without spelling out their exact paths) across every file in
-//! `src/`, not just this one.
+//! **Never-exec.** No file in this crate's `src/`, nor in `sensor-ssh`'s, imports a
+//! process-spawning facility: no `Command` type pulled in from `std`'s `process` module, no
+//! `exec`-family call, no dynamic evaluation of any kind. Every command below returns a
+//! hand-written, static or lightly-interpolated string; there is no code path from an
+//! attacker-typed byte to a real shell, syscall, or interpreter. `never_exec_static_check` in
+//! `sensor-ssh`'s `tests/shell_test.rs` asserts this at the source level (as plain substring
+//! matches, so this doc comment is deliberately phrased to describe those APIs without spelling
+//! out their exact paths) across every file in both crates' `src/`, not just this one.
 //!
 //! **No attacker-directed fetch.** `wget`/`curl` return a canned transcript and perform zero
 //! network I/O. This is guaranteed the same way never-exec is: this crate (and the whole
@@ -28,10 +30,10 @@
 
 use std::net::IpAddr;
 
-use sensor_framework::sanitize_value;
 use sensor_wire::{PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SensorEvent, WIRE_VERSION};
 
 use crate::fakefs::FakeFs;
+use crate::sanitize_value;
 
 /// Cap applied to the sanitized command line captured in `metadata.command`. Matches
 /// `auth::MAX_METADATA_STRING_LEN`'s convention of a generous, fixed bound on an

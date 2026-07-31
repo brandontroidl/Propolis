@@ -50,10 +50,18 @@ const MAX_URL_LEN: usize = 512;
 /// rather than hardcoded `true` - the shell is only ever reached post-authentication in practice,
 /// but a future caller (a pre-auth probe, a non-interactive path) must not have its events
 /// silently mis-tagged by a hardcoded value.
+///
+/// `protocol_label` exists because this shell is shared across protocols (SSH, Telnet, and per
+/// the design spec eventually ADB): it names both the emitted event's top-level `sensor` field
+/// and its `metadata.protocol_label` entry, so `handle_input` never hardcodes which sensor is
+/// driving it. Every current and planned caller uses the same string for both - there is no
+/// observed case where a `FakeShell` consumer's `sensor` name differs from its `protocol_label` -
+/// so one field covers both rather than two that would only ever be set identically.
 pub struct EmitContext {
     pub source_ip: IpAddr,
     pub wan_ip: Option<IpAddr>,
     pub authenticated: bool,
+    pub protocol_label: String,
 }
 
 /// The fake interactive shell. One instance per SSH session; `cwd` is the only mutable state,
@@ -93,13 +101,13 @@ impl FakeShell {
             v: WIRE_VERSION,
             source_ip: self.ctx.source_ip,
             wan_ip: self.ctx.wan_ip,
-            sensor: "ssh".into(),
+            sensor: self.ctx.protocol_label.clone(),
             signal_type: SIGNAL_HONEYPOT_COMMAND_EXEC.into(),
             protocol: PROTO_TCP.into(),
             authenticated: self.ctx.authenticated,
             observed_at: chrono::Utc::now(),
             metadata: serde_json::json!({
-                "protocol_label": "ssh",
+                "protocol_label": self.ctx.protocol_label,
                 "command": sanitized_cmd,
             }),
             sample: None,

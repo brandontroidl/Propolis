@@ -3799,6 +3799,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensor-cred"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sensor-framework"
 version = "0.1.0"
 dependencies = [

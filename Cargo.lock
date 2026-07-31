@@ -3814,6 +3814,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensor-ftp"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "sensor-framework",
+ "sensor-wire",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sensor-http"
 version = "0.1.0"
 dependencies = [

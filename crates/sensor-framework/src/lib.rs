@@ -7,9 +7,11 @@
 pub mod bounds;
 pub mod config;
 pub mod emit;
+pub mod fakefs;
 pub mod handoff;
 pub mod listener;
 pub mod sanitize;
+pub mod shell;
 pub mod spool;
 pub mod wan;
 

@@ -9,6 +9,7 @@ members = [
     "crates/sensor-telnet",
     "crates/sensor-redis",
     "crates/sensor-adb",
+    "crates/sensor-http",
     "crates/intake",
     "crates/review",
     "crates/feed",

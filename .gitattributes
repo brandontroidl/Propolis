@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.rs text diff=rust
+*.toml text
+*.md text
+*.yml text
+*.sh text eol=lf
+*.service text
+Cargo.lock -diff linguist-generated
+vendor/** linguist-vendored

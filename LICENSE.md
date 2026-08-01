@@ -9,7 +9,7 @@ for, use this software to make money, whether in a product or service you sell,
 in the internal operations of a for-profit organization, or otherwise with an
 anticipated commercial application, you need a separate commercial license from
 the author. To arrange one, contact the maintainer through this project's GitHub
-repository: open a Discussion, or reach @brandontroidl.
+repository: open a Discussion, or contact the maintainer via their [GitHub profile](https://github.com/brandontroidl).
 
 ---
 
@@ -17,7 +17,7 @@ repository: open a Discussion, or reach @brandontroidl.
 
 <https://polyformproject.org/licenses/noncommercial/1.0.0>
 
-Required Notice: Copyright 2026 Brandon Troidl
+Required Notice: Copyright 2026 btroidl
 
 ## Acceptance
 

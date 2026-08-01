@@ -5,7 +5,7 @@
 If you find a security issue in Propolis, please report it privately rather than opening a public
 issue.
 
-**Email:** brandonstroidl@icloud.com
+**Email:** see [GitHub profile](https://github.com/brandontroidl)
 
 Include:
 - A description of the issue and its impact

@@ -18,3 +18,4 @@ tracing-subscriber = "0.3.23"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+review = { path = "../review" }

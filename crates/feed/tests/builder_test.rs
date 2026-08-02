@@ -24,6 +24,7 @@ use std::net::IpAddr;
 use chrono::{DateTime, Timelike, Utc};
 use core_scoring::{EventInput, FeedTier, Protocol, SignalType, append_event, read_score};
 use feed::{ExclusionEngine, FeedBuilder, FeedConfig};
+use review::queue::ReviewQueue;
 use sqlx::PgPool;
 
 async fn setup_pool() -> PgPool {
@@ -34,6 +35,7 @@ async fn setup_pool() -> PgPool {
         .run(&pool)
         .await
         .unwrap();
+    review::migrator().run(&pool).await.unwrap();
     pool
 }
 
@@ -41,6 +43,11 @@ async fn setup_pool() -> PgPool {
 /// the module doc comment for why this is required for rerun-safety, not merely tidy.
 async fn reset_ip(pool: &PgPool, ip: IpAddr) {
     let ip_txt = ip.to_string();
+    sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
+        .bind(&ip_txt)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM ip_score WHERE source_ip = $1::inet")
         .bind(&ip_txt)
         .execute(pool)
@@ -98,6 +105,11 @@ async fn seed_qualifying(
     )
     .await
     .unwrap();
+    // The feed builder now requires operator approval (INNER JOIN review_queue WHERE
+    // state='approved'). Populate and approve the entry so the feed can see it.
+    let queue = ReviewQueue::new();
+    queue.populate(pool).await.unwrap();
+    queue.approve(pool, ip, None).await.unwrap();
 }
 
 #[tokio::test]
@@ -335,5 +347,43 @@ async fn db_error_during_build_fails_closed() {
     assert!(
         result.is_err(),
         "a closed pool must fail the build, not return a partial/empty snapshot"
+    );
+}
+
+#[tokio::test]
+async fn eligible_ip_without_approval_is_excluded_from_feed() {
+    let pool = setup_pool().await;
+    let now = Utc::now();
+    let ip: IpAddr = "45.10.30.99".parse().unwrap();
+    reset_ip(&pool, ip).await;
+
+    // Seed events that cross the eligibility gate (confirmed-real + multi-category),
+    // but do NOT approve through the review queue.
+    append_event(&pool, ev(ip, SignalType::HoneypotMalwareUpload, Protocol::Tcp, true, now))
+        .await
+        .unwrap();
+    append_event(
+        &pool,
+        ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
+    )
+    .await
+    .unwrap();
+
+    let score = read_score(&pool, ip).await.unwrap().unwrap();
+    assert!(
+        score.eligible && score.recommended_for_blocklist,
+        "precondition: IP must be eligible and recommended"
+    );
+
+    let exclusions = ExclusionEngine::new(Vec::new(), Vec::new());
+    let config = FeedConfig::default();
+    let snapshot = FeedBuilder::build(&pool, &exclusions, &config)
+        .await
+        .unwrap();
+
+    assert!(
+        !snapshot.aggressive.iter().any(|e| e.source_ip == ip)
+            && !snapshot.standard.iter().any(|e| e.source_ip == ip),
+        "an eligible IP without operator approval must NOT appear in the feed"
     );
 }

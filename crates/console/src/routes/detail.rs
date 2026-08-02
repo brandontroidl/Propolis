@@ -38,8 +38,9 @@ use sqlx::Row;
 
 use crate::AppState;
 use crate::auth::Session;
+use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
-use crate::routes::format::{format_timestamp, tier_label};
+use crate::routes::format::{format_relative_time, format_timestamp, tier_label};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/ip/{ip}", get(detail))
@@ -48,6 +49,7 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Serialize)]
 struct EvidenceRow {
     observed_at: String,
+    relative_time: String,
     sensor: String,
     signal_type: String,
     protocol: String,
@@ -114,6 +116,7 @@ async fn detail(
         let observed_at: DateTime<Utc> = row.try_get("observed_at")?;
         evidence.push(EvidenceRow {
             observed_at: format_timestamp(observed_at),
+            relative_time: format_relative_time(observed_at),
             sensor: row.try_get("sensor")?,
             signal_type: format!("{signal_type:?}"),
             protocol: format!("{protocol:?}"),
@@ -173,11 +176,19 @@ async fn detail(
         .sessions
         .generate_csrf(&session.id)
         .unwrap_or_default();
+    let BaseContext {
+        pending_count,
+        uptime,
+        version,
+    } = base_context(&state.db, state.startup_time, state.version).await;
 
     let tmpl = state.templates.get_template("detail.html")?;
     let html = tmpl.render(context! {
         csrf_token,
         active_nav => "detail",
+        pending_count,
+        uptime,
+        version,
         ip => ip.to_string(),
         raw_score => format!("{:.1}", score.raw_score),
         raw_score_pct => raw_f64.clamp(0.0, 100.0).round() as u32,

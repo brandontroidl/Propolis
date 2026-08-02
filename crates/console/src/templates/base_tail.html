@@ -1,16 +1,24 @@
 </script>
+{% block topnav %}
 <div class="topnav">
 <a class="wordmark" href="/">Propolis</a>
 {% block nav %}
 <nav>
 <a href="/" class="{% if active_nav == "dashboard" %}active{% endif %}">Dashboard</a>
-<a href="/queue" class="{% if active_nav == "queue" %}active{% endif %}">Review queue</a>
+<a href="/queue" class="{% if active_nav == "queue" %}active{% endif %}">Review queue{% if pending_count > 0 %} <span class="badge">{{ pending_count }}</span>{% endif %}</a>
 <a href="/feed" class="{% if active_nav == "feed" %}active{% endif %}">Feed status</a>
 </nav>
+<div class="right">
+<span class="nav-meta mono dim">up {{ uptime }}</span>
+<span class="nav-meta mono dim">v{{ version }}</span>
+<a href="/logout">Sign out</a>
+</div>
 {% endblock %}
 </div>
+{% endblock %}
 <main>
 {% block content %}{% endblock %}
 </main>
+<div class="status-line">propolis v{{ version }} - up {{ uptime }}</div>
 </body>
 </html>

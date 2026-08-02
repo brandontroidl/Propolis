@@ -203,6 +203,8 @@ async fn main() {
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
         feed_output_dir: config.feed_output_dir,
+        startup_time: chrono::Utc::now(),
+        version: env!("CARGO_PKG_VERSION"),
     };
 
     tracing::info!(bind = %bind_addr, "console: starting");

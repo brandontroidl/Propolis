@@ -193,6 +193,8 @@ async fn run_console(
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
         feed_output_dir,
+        startup_time: chrono::Utc::now(),
+        version: env!("CARGO_PKG_VERSION"),
     };
 
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {

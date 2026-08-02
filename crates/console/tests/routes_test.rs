@@ -59,6 +59,8 @@ fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> App
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
         feed_output_dir,
+        startup_time: chrono::Utc::now(),
+        version: "test",
     }
 }
 
@@ -243,16 +245,36 @@ async fn dashboard_authenticated_returns_stats(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains(r#"<div class="value">3</div>"#),
+        body.contains(
+            "<div class=\"label\">Total scored IPs</div>\n    <div class=\"value\">3</div>"
+        ),
         "expected total_scored_ips=3 in the rendered stats: {body}"
     );
     assert!(
-        body.contains(r#"<div class="value">2</div>"#),
-        "expected pending_reviews=2 in the rendered stats: {body}"
+        body.contains(r#"class="stat-card stat-card-accent""#),
+        "pending_reviews > 0 must render the accent border: {body}"
     );
     assert!(
-        body.contains(r#"<div class="value">0</div>"#),
+        body.contains(r#"<a href="/queue">2</a>"#),
+        "expected pending_reviews=2 linked to /queue: {body}"
+    );
+    assert!(
+        body.contains(
+            "<div class=\"label\">Approved today</div>\n    <div class=\"value\">0</div>"
+        ),
         "expected approved_today=0 in the rendered stats: {body}"
+    );
+    assert!(
+        body.contains("<div class=\"label\">Events / hour</div>\n    <div class=\"value\">7</div>"),
+        "expected events_last_hour=7 (all seeded events are within the last minute): {body}"
+    );
+    assert!(
+        body.contains("<div class=\"label\">Feed entries</div>\n    <div class=\"value\">--</div>"),
+        "expected the feed-entries placeholder when no feed_output_dir is configured: {body}"
+    );
+    assert!(
+        !body.contains(r#"<div class="value" style="font-size:0.95rem">--</div>"#),
+        "expected a real top-attacker IP (not the placeholder) given ip_score rows exist: {body}"
     );
     assert!(body.contains("Dashboard"));
 }
@@ -267,6 +289,225 @@ async fn dashboard_unauthenticated_redirects_to_login(pool: PgPool) {
 
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_shows_recent_activity_and_protocol_distribution(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.80",
+            "cowrie",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.81",
+            "suricata",
+            SignalType::SuricataSev2,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("<td>cowrie</td>") && body.contains("<td>honeypot_login_attempt</td>"),
+        "recent-activity row missing cowrie/honeypot_login_attempt: {body}"
+    );
+    assert!(
+        body.contains(r#"href="/ip/203.0.113.80">203.0.113.80</a>"#),
+        "recent-activity row missing source IP link: {body}"
+    );
+    assert!(
+        body.contains("<tr><td>cowrie</td><td class=\"mono\">1</td></tr>"),
+        "protocol-distribution row missing cowrie count: {body}"
+    );
+    assert!(
+        body.contains("<tr><td>suricata</td><td class=\"mono\">1</td></tr>"),
+        "protocol-distribution row missing suricata count: {body}"
+    );
+    assert!(
+        !body.contains("waiting for sensor events"),
+        "empty-state message should not render once events exist: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_events_last_hour_excludes_events_older_than_an_hour(pool: PgPool) {
+    migrate(&pool).await;
+    let now = chrono::Utc::now();
+    let two_hours_ago = now - chrono::Duration::hours(2);
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.90",
+            "cowrie",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            true,
+            &now.to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.90",
+            "cowrie",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            true,
+            &two_hours_ago.to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("<div class=\"label\">Events / hour</div>\n    <div class=\"value\">1</div>"),
+        "expected events_last_hour=1, excluding the event from 2 hours ago: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_top_attacker_shows_highest_scoring_ip(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.95", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<div class="label">Top attacker</div>"#),
+        "missing top attacker card: {body}"
+    );
+    assert!(
+        body.contains(r#"href="/ip/203.0.113.95">203.0.113.95</a>"#),
+        "expected the sole ip_score row's IP as top attacker: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_feed_entries_sums_tier_counts_from_manifest(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":4,"sha256":"x","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":9,"sha256":"y","valid_until":"2026-07-31T14:00:00Z"}}}"#,
+    )
+    .unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // aggressive(4) + standard(9) = 13, proving the real `tiers.aggressive.count` /
+    // `tiers.standard.count` manifest shape is read correctly (not a flat `aggressive_count` key,
+    // which this fixture's manifest does not have).
+    assert!(
+        body.contains("<div class=\"label\">Feed entries</div>\n    <div class=\"value\">13</div>"),
+        "expected feed_entries = aggressive(4) + standard(9) = 13: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_empty_state_shows_placeholders(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("waiting for sensor events - start a sensor to begin collecting"),
+        "missing empty recent-activity message: {body}"
+    );
+    assert!(
+        body.contains("waiting for sensor events</p>"),
+        "missing empty protocol-distribution message: {body}"
+    );
+    assert!(
+        body.contains("no vendor submissions yet"),
+        "missing empty vendor-submissions message: {body}"
+    );
+    assert!(
+        body.contains("<div class=\"label\">Feed entries</div>\n    <div class=\"value\">--</div>"),
+        "expected the feed-entries placeholder when unconfigured: {body}"
+    );
+    assert!(
+        body.contains(r#"<div class="value" style="font-size:0.95rem">--</div>"#),
+        "expected the top-attacker placeholder when no ip_score rows exist: {body}"
+    );
 }
 
 // --- queue ---
@@ -466,6 +707,61 @@ async fn queue_sort_by_first_seen_orders_oldest_first(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrations = false)]
+async fn queue_page_empty_state_is_contextual(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(
+            r#"<p class="empty-line">queue empty - no IPs have crossed the recommendation threshold yet</p>"#
+        ),
+        "expected the contextual empty-queue message: {body}"
+    );
+    assert!(
+        !body.contains("Nothing pending review"),
+        "old empty-state copy must be gone: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_page_table_uses_compact_class(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.42", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<table class="table-compact">"#),
+        "expected the queue table to use the compact density class: {body}"
+    );
+}
+
 // --- login ---
 
 #[sqlx::test(migrations = false)]
@@ -551,6 +847,193 @@ async fn login_rate_limited_after_five_failed_attempts(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(sixth.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_page_hides_topnav_entirely(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/login", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains(r#"class="topnav""#),
+        "login page must not render the topnav bar at all: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_page_shows_version(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/login", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(
+            r#"<p class="dim" style="text-align:center;font-size:0.72rem;margin-top:1rem;">vtest</p>"#
+        ),
+        "expected the login page's own version line: {body}"
+    );
+    assert!(
+        body.contains("propolis vtest - up"),
+        "expected the shared footer status line to show a real version, not blank: {body}"
+    );
+}
+
+// --- logout ---
+
+#[sqlx::test(migrations = false)]
+async fn logout_clears_session_and_redirects(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/logout",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .expect("logout must clear the session cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.starts_with(&format!("{}=", auth::SESSION_COOKIE)));
+    assert!(
+        set_cookie.contains("Max-Age=0"),
+        "expected an immediately-expiring cookie: {set_cookie}"
+    );
+
+    // Verified server-side, not just a client-side cookie clear: the same cookie value must no
+    // longer authenticate a protected route afterward.
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn logout_without_session_redirects_to_login(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/logout", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+// --- shared chrome (nav badge, sign-out, footer) ---
+
+#[sqlx::test(migrations = false)]
+async fn nav_shows_pending_badge_when_reviews_pending(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.80", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<span class="badge">1</span>"#),
+        "expected a pending-count badge on the review queue nav link: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn nav_hides_pending_badge_when_queue_empty(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains(r#"class="badge""#),
+        "no pending reviews, so no badge should render: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn authenticated_page_shows_sign_out_and_footer_status(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"href="/logout""#),
+        "missing sign-out link: {body}"
+    );
+    assert!(body.contains("Sign out"));
+    assert!(
+        body.contains(r#"<div class="status-line">propolis v"#),
+        "missing footer status line: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_page_has_no_sign_out_link(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/login", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("Sign out"),
+        "login page must not show a sign-out link before authentication: {body}"
+    );
 }
 
 // --- detail ---
@@ -646,10 +1129,132 @@ async fn detail_unauthenticated_redirects_to_login(pool: PgPool) {
     assert_eq!(response.headers().get("location").unwrap(), "/login");
 }
 
+#[sqlx::test(migrations = false)]
+async fn detail_page_has_back_link_to_queue(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.51", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.51",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p><a href="/queue">&larr; back to queue</a></p>"#),
+        "expected a back-to-queue link above the IP heading: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_page_tables_use_compact_class(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.52", 60).await;
+    append_event(
+        &pool,
+        ev_with_wan(
+            "203.0.113.52",
+            "198.51.100.20",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.52")
+    .bind("abuseipdb")
+    .bind("detail-table-compact-key")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(true)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.52",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let table_open_count = body.matches("<table").count();
+    let compact_count = body.matches(r#"<table class="table-compact">"#).count();
+    assert!(
+        table_open_count >= 5,
+        "expected all 5 detail-page tables to render for this fixture: {body}"
+    );
+    assert_eq!(
+        table_open_count, compact_count,
+        "every table on the detail page must use the compact density class: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_evidence_row_shows_relative_time(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.53", 60).await;
+    append_event(
+        &pool,
+        ev_with_wan(
+            "203.0.113.53",
+            "198.51.100.21",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            true,
+            &(chrono::Utc::now() - chrono::Duration::seconds(90)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.53",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<td class="seen dim">1m ago</td>"#),
+        "expected the evidence timeline to show a relative-time column: {body}"
+    );
+}
+
 // --- feed ---
 
 #[sqlx::test(migrations = false)]
-async fn feed_page_shows_no_builds_when_unconfigured(pool: PgPool) {
+async fn feed_page_shows_disabled_empty_state_when_unconfigured(pool: PgPool) {
     migrate(&pool).await;
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -665,7 +1270,36 @@ async fn feed_page_shows_no_builds_when_unconfigured(pool: PgPool) {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
-    assert!(body.contains("No feed builds yet"));
+    assert!(
+        body.contains(r#"<p class="empty-line">feed builder is disabled on this node</p>"#),
+        "expected the disabled-feed empty state when feed_output_dir is unconfigured: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_page_shows_awaiting_first_build_when_configured_but_no_manifest(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // No manifest.json written: the directory is configured but no build has run yet.
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">feed enabled - awaiting first build</p>"#),
+        "expected the awaiting-first-build empty state when configured but no manifest exists: {body}"
+    );
 }
 
 #[sqlx::test(migrations = false)]

@@ -15,6 +15,7 @@ pub mod health;
 pub mod login;
 pub mod metrics;
 pub mod queue;
+pub(crate) mod sparkline;
 
 use axum::Router;
 use axum::middleware;

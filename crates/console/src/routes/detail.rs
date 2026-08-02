@@ -1,7 +1,7 @@
 //! `GET /ip/:ip` - the IP detail page (`internal/design/06-console-observability.md`, "Pages" >
 //! "IP detail"). Session-gated: mounted under the `protected` group in `routes::mod`.
 //!
-//! Four read-only queries, all scoped to the one path-param IP:
+//! Five read-only queries, all scoped to the one path-param IP:
 //! - the score summary via `core_scoring::read_score` (decayed to now, same as `routes::queue`)
 //!   plus `core_scoring::effective_score` for the breadth-adjusted number the blocklist
 //!   recommendation gate actually uses;
@@ -19,6 +19,16 @@
 //! guessing an IP), not a database/template failure, so it is handled directly rather than
 //! through `AppError` (whose every variant renders a generic 503 - see that module's doc
 //! comment): a 404 here says something true and specific, a 503 would not.
+//!
+//! Chart (sub-project 6, console-charts, task 4): a per-IP 7-day event timeline, one more
+//! Chart.js chart fed by `Chart` (the global `routes::dashboard`'s templates already load). Its
+//! query is supplementary rather than core content - same soft-fail policy `routes::dashboard`'s
+//! own doc comment establishes for its charts ("a slow or errored chart query degrades to an
+//! empty chart... never a 503"), unlike this module's other four queries, which all hard-fail via
+//! `?`: an IP whose score/evidence/WAN/submission data cannot be read is a broken page, but one
+//! whose 7-day sparkline query hiccups is still a perfectly usable detail page minus one chart.
+//! `generate_series` zero-fills all 7 buckets unconditionally, so - like the dashboard's own main
+//! timeline - the chart always renders, never gated behind an empty-state check.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -28,7 +38,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use core_scoring::{Category, Protocol, SignalType, effective_score, read_score};
 use minijinja::context;
 use rust_decimal::Decimal;
@@ -172,6 +182,33 @@ async fn detail(
         });
     }
 
+    // 7 daily buckets, oldest to newest, zero-filled where a day had no events for this IP -
+    // always exactly 7 rows (the `generate_series` bound is unconditional), matching the
+    // dashboard's own always-populated hourly timeline. Supplementary: soft-fails to an empty
+    // chart rather than the whole page, per the module doc comment.
+    let ip_timeline_rows = sqlx::query(
+        "SELECT bucket::date, COALESCE(cnt, 0) AS cnt \
+         FROM generate_series(current_date - interval '6 days', current_date, interval '1 day') AS bucket \
+         LEFT JOIN ( \
+             SELECT date_trunc('day', observed_at)::date AS day, COUNT(*) AS cnt \
+             FROM event \
+             WHERE source_ip = $1::inet AND observed_at >= current_date - interval '6 days' \
+             GROUP BY day \
+         ) sub ON sub.day = bucket::date \
+         ORDER BY bucket",
+    )
+    .bind(ip.to_string())
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let mut ip_timeline_labels: Vec<String> = Vec::with_capacity(ip_timeline_rows.len());
+    let mut ip_timeline_data: Vec<i64> = Vec::with_capacity(ip_timeline_rows.len());
+    for row in ip_timeline_rows {
+        let bucket: NaiveDate = row.try_get("bucket")?;
+        ip_timeline_labels.push(bucket.format("%b %-d").to_string());
+        ip_timeline_data.push(row.try_get("cnt")?);
+    }
+
     let csrf_token = state
         .sessions
         .generate_csrf(&session.id)
@@ -181,6 +218,14 @@ async fn detail(
         uptime,
         version,
     } = base_context(&state.db, state.startup_time, state.version).await;
+
+    // Shadowed into their JSON-string form right before the template needs them - see
+    // `routes::dashboard`'s doc comment for why a string (rendered with `|safe`) rather than a
+    // native minijinja list: minijinja auto-escapes every `.html` template, so an un-`|safe`'d
+    // JSON string's own quotes would be HTML-entity-escaped into a JS syntax error.
+    let ip_timeline_labels =
+        serde_json::to_string(&ip_timeline_labels).unwrap_or_else(|_| "[]".into());
+    let ip_timeline_data = serde_json::to_string(&ip_timeline_data).unwrap_or_else(|_| "[]".into());
 
     let tmpl = state.templates.get_template("detail.html")?;
     let html = tmpl.render(context! {
@@ -210,6 +255,8 @@ async fn detail(
         per_wan,
         categories,
         submissions,
+        ip_timeline_labels,
+        ip_timeline_data,
     })?;
     Ok(Html(html).into_response())
 }

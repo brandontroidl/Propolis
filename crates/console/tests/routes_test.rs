@@ -344,12 +344,18 @@ async fn dashboard_shows_recent_activity_and_protocol_distribution(pool: PgPool)
         "recent-activity row missing source IP link: {body}"
     );
     assert!(
-        body.contains("<tr><td>cowrie</td><td class=\"mono\">1</td></tr>"),
-        "protocol-distribution row missing cowrie count: {body}"
+        body.contains(r#"<canvas id="protoChart""#),
+        "protocol-distribution chart canvas missing once events exist: {body}"
+    );
+    // Chart data is now in <script type="application/json"> elements which minijinja HTML-escapes.
+    // The browser's .textContent unescapes them; in the raw HTML, quotes are &quot; entities.
+    assert!(
+        body.contains("application/json") && body.contains("proto-labels"),
+        "protocol-distribution chart data element missing: {body}"
     );
     assert!(
-        body.contains("<tr><td>suricata</td><td class=\"mono\">1</td></tr>"),
-        "protocol-distribution row missing suricata count: {body}"
+        !body.contains("<tr><td>cowrie</td><td class=\"mono\">1</td></tr>"),
+        "old protocol-distribution text table must be replaced by the chart, not kept alongside it: {body}"
     );
     assert!(
         !body.contains("waiting for sensor events"),
@@ -507,6 +513,225 @@ async fn dashboard_empty_state_shows_placeholders(pool: PgPool) {
     assert!(
         body.contains(r#"<div class="value" style="font-size:0.95rem">--</div>"#),
         "expected the top-attacker placeholder when no ip_score rows exist: {body}"
+    );
+    // Both chart sections gate independently on their own source list (`protocol_dist` /
+    // `has_attackers`) - this fixture has neither events nor ip_score rows, so both must show the
+    // page's existing empty-state copy rather than an empty canvas.
+    assert_eq!(
+        body.matches("waiting for sensor events</p>").count(),
+        2,
+        "expected the empty-state message for both the protocol-distribution and top-attackers charts: {body}"
+    );
+    assert!(
+        !body.contains(r#"<canvas id="protoChart""#) && !body.contains(r#"<canvas id="attackerChart""#),
+        "an empty chart canvas must not render when its source list is empty: {body}"
+    );
+    // The events timeline has no empty-state branch - it always renders 24 zero-filled buckets (a
+    // flat line), per the brief's explicit "still renders with all zeros" requirement.
+    assert!(
+        body.contains(r#"<canvas id="timelineChart""#),
+        "the timeline chart must always render, even with no events: {body}"
+    );
+    assert_eq!(
+        body.matches("<polyline").count(),
+        2,
+        "expected both sparklines (events/hour, total scored IPs) to render as flat lines at zero: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_timeline_chart_reflects_hourly_event_counts(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.85",
+            "cowrie",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // `now()`'s event always lands in the LAST of the 24 ascending-ordered hourly buckets (the
+    // current hour), so the rendered `timeline_data` array's final element must be 1 regardless of
+    // what wall-clock hour the test happens to run in - a broken query (wrong join condition, wrong
+    // window) would instead leave every bucket at 0 and this substring would not appear.
+    assert!(
+        body.contains(r#"id="timeline-data">"#),
+        "timeline chart data element missing: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_top_attackers_chart_shows_scored_ip(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.86", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<canvas id="attackerChart""#),
+        "top-attackers chart canvas missing once ip_score rows exist: {body}"
+    );
+    let script = &body[body
+        .find(r#"id="attackerChart""#)
+        .expect("attacker chart canvas missing")..];
+    assert!(
+        script.contains("203.0.113.86"),
+        "top-attackers chart JSON missing the seeded IP: {script}"
+    );
+    assert!(
+        !script.contains("waiting for sensor events"),
+        "empty-state text must not render alongside the chart: {script}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_sparklines_appear_in_correct_stat_cards(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.87",
+            "cowrie",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert_eq!(
+        body.matches("<polyline").count(),
+        2,
+        "expected exactly two sparklines (events/hour, total scored IPs): {body}"
+    );
+    // Bounded by the immediately-following stat card's own label in the stat-row's fixed order, so
+    // each sparkline is checked for landing inside the RIGHT card, not merely somewhere on the page.
+    let scored_start = body
+        .find(r#"<div class="label">Total scored IPs</div>"#)
+        .expect("Total scored IPs stat card missing");
+    let approved_start = body
+        .find(r#"<div class="label">Approved today</div>"#)
+        .expect("Approved today stat card missing");
+    assert!(
+        body[scored_start..approved_start].contains("<svg"),
+        "expected an SVG sparkline inside the Total scored IPs card: {body}"
+    );
+    let events_start = body
+        .find(r#"<div class="label">Events / hour</div>"#)
+        .expect("Events / hour stat card missing");
+    let feed_start = body
+        .find(r#"<div class="label">Feed entries</div>"#)
+        .expect("Feed entries stat card missing");
+    assert!(
+        body[events_start..feed_start].contains("<svg"),
+        "expected an SVG sparkline inside the Events / hour card: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_vendor_submissions_table_shows_at_most_three_rows(pool: PgPool) {
+    migrate(&pool).await;
+    let base = chrono::Utc::now();
+    let ips = [
+        "203.0.113.201",
+        "203.0.113.202",
+        "203.0.113.203",
+        "203.0.113.204",
+        "203.0.113.205",
+    ];
+    for (i, ip) in ips.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO vendor_submission \
+             (source_ip, vendor, idempotency_key, categories, comment, success, submitted_at) \
+             VALUES ($1::inet, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(*ip)
+        .bind("abuseipdb")
+        .bind(format!("compact-table-key-{i}"))
+        .bind(vec!["18".to_string()])
+        .bind("test comment")
+        .bind(true)
+        .bind(base - chrono::Duration::seconds(i as i64))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // `submitted_at DESC` + a 3-row template truncation: IPs .201/.202/.203 (indices 0-2) carry the
+    // most recent timestamps and must be the ones shown; .204/.205 (the oldest two of the five) must
+    // be truncated.
+    assert!(body.contains("203.0.113.201"), "newest submission missing: {body}");
+    assert!(body.contains("203.0.113.202"), "2nd-newest submission missing: {body}");
+    assert!(body.contains("203.0.113.203"), "3rd-newest submission missing: {body}");
+    assert!(
+        !body.contains("203.0.113.204"),
+        "4th-newest submission must be truncated from the compact table: {body}"
+    );
+    assert!(
+        !body.contains("203.0.113.205"),
+        "5th-newest (oldest) submission must be truncated from the compact table: {body}"
     );
 }
 
@@ -1248,6 +1473,52 @@ async fn detail_evidence_row_shows_relative_time(pool: PgPool) {
     assert!(
         body.contains(r#"<td class="seen dim">1m ago</td>"#),
         "expected the evidence timeline to show a relative-time column: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_ip_timeline_chart_reflects_daily_event_counts(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.54", 60).await;
+    // A distinct event exactly 6 days before now: the OLDEST of the chart's 7 daily buckets
+    // (`current_date - 6 days`), the far boundary of the window.
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.54",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            false,
+            &(chrono::Utc::now() - chrono::Duration::days(6)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.54",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<canvas id="chart-ip-timeline""#),
+        "IP timeline chart canvas missing: {body}"
+    );
+    // Chart data is in <script type="application/json"> elements (HTML-escaped by minijinja).
+    // The browser's .textContent unescapes them; we verify the data elements are present.
+    assert!(
+        body.contains(r#"id="ip-timeline-labels">"#) && body.contains(r#"id="ip-timeline-data">"#),
+        "IP timeline chart data elements missing: {body}"
     );
 }
 

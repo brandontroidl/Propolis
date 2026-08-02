@@ -15,6 +15,7 @@ use sqlx::Row;
 
 use crate::AppState;
 use crate::auth::Session;
+use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
 
 pub fn router() -> Router<AppState> {
@@ -76,6 +77,11 @@ async fn dashboard(
         .sessions
         .generate_csrf(&session.id)
         .unwrap_or_default();
+    let BaseContext {
+        pending_count,
+        uptime,
+        version,
+    } = base_context(&state.db, state.startup_time, state.version).await;
 
     let tmpl = state.templates.get_template("dashboard.html")?;
     let html = tmpl.render(context! {
@@ -85,6 +91,9 @@ async fn dashboard(
         pending_reviews,
         approved_today,
         recent_submissions,
+        pending_count,
+        uptime,
+        version,
     })?;
     Ok(Html(html))
 }

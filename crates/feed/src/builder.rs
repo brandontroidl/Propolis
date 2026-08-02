@@ -1,7 +1,7 @@
 //! The feed builder: reads approved, eligible, recommended-for-blocklist IP scores from
-//! `ip_score`, re-derives their gate flags decayed to now, groups by tier, applies exclusions,
-//! and coarsens every timestamp to an hour boundary. See
-//! `internal/design/05-blocklist-feed.md` ("The feed builder").
+//! `ip_score`, gated on operator approval in `review_queue`, re-derives their gate flags
+//! decayed to now, groups by tier, applies exclusions, and coarsens every timestamp to an
+//! hour boundary. See `internal/design/05-blocklist-feed.md` ("The feed builder").
 
 use std::net::IpAddr;
 
@@ -104,8 +104,10 @@ impl FeedBuilder {
         let build_time = coarsen_to_hour(Utc::now());
 
         let rows = sqlx::query(
-            "SELECT host(source_ip) AS source_ip FROM ip_score \
-             WHERE recommended_for_blocklist = true AND eligible = true",
+            "SELECT host(s.source_ip) AS source_ip FROM ip_score s \
+             INNER JOIN review_queue q ON q.source_ip = s.source_ip \
+             WHERE s.recommended_for_blocklist = true AND s.eligible = true \
+               AND q.state = 'approved'",
         )
         .fetch_all(pool)
         .await?;

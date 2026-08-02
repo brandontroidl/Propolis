@@ -10,6 +10,23 @@
 //! tier counts via `routes::feed::read_manifest` (the same helper `routes::feed`/`routes::metrics`
 //! already use), rather than re-parsing the file - see that function's doc comment for the on-disk
 //! shape.
+//!
+//! Charts and sparklines (sub-project 6, console-charts): three Chart.js charts (events timeline,
+//! protocol distribution, top attackers) and two SVG sparklines (`routes::sparkline::render`, in
+//! the "Events / hour" and "Total scored IPs" stat cards), all fed by supplementary,
+//! soft-failing queries per the same policy as above - a slow or errored chart query degrades to
+//! an empty chart/flat sparkline, never a 503. Chart.js needs its datasets as JS array literals
+//! inside an inline `<script>`, so each array is serialized with `serde_json::to_string` into a
+//! `String` *before* it reaches the template, then injected with the `|safe` filter - `templates`'s
+//! doc comment establishes that minijinja auto-escapes every `.html` template, so without `|safe`
+//! the JSON's own quotes would be HTML-entity-escaped and produce a JS syntax error rather than an
+//! array literal. `protocol_dist` (a `Vec`, already in context for its own truthiness check) stays
+//! as-is; `proto_labels`/`proto_data` are new, separately-named JSON-string siblings derived from
+//! it. The events timeline always renders (24 buckets, zero-filled by the query's own
+//! `generate_series`/`COALESCE`) even with no events; the protocol-distribution and top-attackers
+//! charts instead hide their `<canvas>` and show the same "waiting for sensor events" copy the
+//! page already uses elsewhere when their source list is empty (`protocol_dist` and the new
+//! `has_attackers` respectively) - an empty Chart.js canvas has nothing worth looking at.
 
 use axum::extract::State;
 use axum::response::Html;
@@ -25,6 +42,7 @@ use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
 use crate::routes::feed::read_manifest;
 use crate::routes::format::format_relative_time;
+use crate::routes::sparkline;
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/", get(dashboard))
@@ -120,6 +138,78 @@ async fn dashboard(
             count: row.try_get("cnt")?,
         });
     }
+    let proto_labels: Vec<String> = protocol_dist.iter().map(|p| p.sensor.clone()).collect();
+    let proto_data: Vec<i64> = protocol_dist.iter().map(|p| p.count).collect();
+
+    // 24 hourly buckets, oldest to newest, zero-filled where an hour had no events - always
+    // exactly 24 rows (the `generate_series` bound is unconditional), so the timeline chart and
+    // the events sparkline below always have real (possibly all-zero) data, never an empty array.
+    let timeline_rows = sqlx::query(
+        "SELECT bucket, COALESCE(cnt, 0) AS cnt \
+         FROM generate_series( \
+             date_trunc('hour', now()) - interval '23 hours', \
+             date_trunc('hour', now()), \
+             interval '1 hour' \
+         ) AS bucket \
+         LEFT JOIN ( \
+             SELECT date_trunc('hour', observed_at) AS hour, COUNT(*) AS cnt \
+             FROM event \
+             WHERE observed_at >= now() - interval '24 hours' \
+             GROUP BY hour \
+         ) sub ON sub.hour = bucket \
+         ORDER BY bucket",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let mut timeline_labels: Vec<String> = Vec::with_capacity(timeline_rows.len());
+    let mut timeline_data: Vec<i64> = Vec::with_capacity(timeline_rows.len());
+    for row in timeline_rows {
+        let bucket: chrono::DateTime<chrono::Utc> = row.try_get("bucket")?;
+        timeline_labels.push(bucket.format("%H:00").to_string());
+        timeline_data.push(row.try_get("cnt")?);
+    }
+
+    let attacker_rows = sqlx::query(
+        "SELECT host(source_ip) AS ip, raw_score::float8 AS score \
+         FROM ip_score ORDER BY raw_score DESC LIMIT 10",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let mut attacker_labels: Vec<String> = Vec::with_capacity(attacker_rows.len());
+    let mut attacker_data: Vec<f64> = Vec::with_capacity(attacker_rows.len());
+    for row in attacker_rows {
+        attacker_labels.push(row.try_get("ip")?);
+        attacker_data.push(row.try_get("score")?);
+    }
+    // Drives the top-attackers chart's empty-state gate in the template: `attacker_labels` is
+    // JSON-stringified below, and a non-empty JSON string (even `"[]"`) is truthy in minijinja, so
+    // the template cannot tell "no rows" from "some rows" by checking that string directly.
+    let has_attackers = !attacker_labels.is_empty();
+
+    // 7-day cumulative trend for the "Total scored IPs" sparkline: a running total (not a daily
+    // delta), so its rightmost point matches the stat card's own displayed value - the same
+    // reasoning the stat-tile convention in the dataviz skill gives for a sparkline's trend arm.
+    // `ip_score` has no index on `first_seen`, so each of the 7 correlated-subquery evaluations
+    // below is a sequential scan; fine at this project's single-node scale (a dashboard an
+    // operator loads occasionally, not a hot path) - a single-pass running-sum rewrite is not
+    // worth the added complexity here.
+    let scored_trend_rows = sqlx::query(
+        "SELECT bucket::date, (SELECT COUNT(*) FROM ip_score WHERE first_seen <= bucket + interval '1 day') AS cnt \
+         FROM generate_series(current_date - interval '6 days', current_date, interval '1 day') AS bucket \
+         ORDER BY bucket",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let mut scored_trend_data: Vec<i64> = Vec::with_capacity(scored_trend_rows.len());
+    for row in scored_trend_rows {
+        scored_trend_data.push(row.try_get("cnt")?);
+    }
+
+    let events_sparkline = sparkline::render(&timeline_data, 120, 24, "#d99a3d");
+    let scored_sparkline = sparkline::render(&scored_trend_data, 120, 24, "#d99a3d");
 
     // -1 signals "no data" (unconfigured, missing, or unparsable manifest) -> the template
     // displays "--"; `read_manifest` already collapses every one of those cases to `None`.
@@ -161,6 +251,15 @@ async fn dashboard(
         version,
     } = base_context(&state.db, state.startup_time, state.version).await;
 
+    // Shadowed into their JSON-string form right before the template needs them - see the module
+    // doc comment for why a string (rendered with `|safe`) rather than a native minijinja list.
+    let timeline_labels = serde_json::to_string(&timeline_labels).unwrap_or_else(|_| "[]".into());
+    let timeline_data = serde_json::to_string(&timeline_data).unwrap_or_else(|_| "[]".into());
+    let proto_labels = serde_json::to_string(&proto_labels).unwrap_or_else(|_| "[]".into());
+    let proto_data = serde_json::to_string(&proto_data).unwrap_or_else(|_| "[]".into());
+    let attacker_labels = serde_json::to_string(&attacker_labels).unwrap_or_else(|_| "[]".into());
+    let attacker_data = serde_json::to_string(&attacker_data).unwrap_or_else(|_| "[]".into());
+
     let tmpl = state.templates.get_template("dashboard.html")?;
     let html = tmpl.render(context! {
         csrf_token,
@@ -175,6 +274,15 @@ async fn dashboard(
         recent_events,
         protocol_dist,
         recent_submissions,
+        timeline_labels,
+        timeline_data,
+        proto_labels,
+        proto_data,
+        attacker_labels,
+        attacker_data,
+        has_attackers,
+        events_sparkline,
+        scored_sparkline,
         pending_count,
         uptime,
         version,

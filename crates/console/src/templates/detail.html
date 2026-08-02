@@ -83,6 +83,28 @@
 <p class="empty">No WAN vantage recorded for this IP.</p>
 {% endif %}
 
+<h2 class="section-title">Activity (7 days)</h2>
+<div class="chart-box-compact">
+  <canvas id="chart-ip-timeline" role="img" aria-label="Events per day, last 7 days"></canvas>
+</div>
+<script>
+new Chart(document.getElementById('chart-ip-timeline'), {
+    type: 'line',
+    data: {
+        labels: {{ ip_timeline_labels|safe }},
+        datasets: [{
+            data: {{ ip_timeline_data|safe }},
+            borderColor: '#d99a3d',
+            borderWidth: 2,
+            pointRadius: 3,
+            pointBackgroundColor: '#d99a3d',
+            tension: 0.3
+        }]
+    },
+    options: { scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }, maintainAspectRatio: false }
+});
+</script>
+
 <h2 class="section-title">Evidence timeline <span class="dim">(last {{ evidence|length }})</span></h2>
 {% if evidence %}
 <div class="table-wrap">

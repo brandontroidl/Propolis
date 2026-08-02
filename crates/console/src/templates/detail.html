@@ -87,8 +87,8 @@
 <div class="chart-box-compact">
   <canvas id="chart-ip-timeline" role="img" aria-label="Events per day, last 7 days"></canvas>
 </div>
-<script type="application/json" id="ip-timeline-labels">{{ ip_timeline_labels }}</script>
-<script type="application/json" id="ip-timeline-data">{{ ip_timeline_data }}</script>
+<script type="application/json" id="ip-timeline-labels">{{ ip_timeline_labels|safe }}</script>
+<script type="application/json" id="ip-timeline-data">{{ ip_timeline_data|safe }}</script>
 <script>
 new Chart(document.getElementById('chart-ip-timeline'), {
     type: 'line',

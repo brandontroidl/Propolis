@@ -83,6 +83,12 @@ CREATE ROLE propolis WITH LOGIN PASSWORD '...';
 CREATE DATABASE propolis OWNER propolis;
 ```
 
+**Important:** If running PostgreSQL in a container (podman/docker), ensure `pg_hba.conf` does
+NOT contain `host all all all trust`. Replace it with a scoped rule for the container network
+only (e.g., `host all all 10.88.0.0/16 md5` for the default podman network). The `trust` rule
+means any process that can reach the container's port has full database access without a
+password.
+
 ## 5. Configure the services
 
 Create environment files in `/etc/propolis/`. Each file should be mode `0600`, owned by its

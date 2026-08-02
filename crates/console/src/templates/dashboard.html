@@ -35,8 +35,8 @@
 <div class="chart-box">
   <canvas id="timelineChart" role="img" aria-label="Events per hour, last 24 hours"></canvas>
 </div>
-<script type="application/json" id="timeline-labels">{{ timeline_labels }}</script>
-<script type="application/json" id="timeline-data">{{ timeline_data }}</script>
+<script type="application/json" id="timeline-labels">{{ timeline_labels|safe }}</script>
+<script type="application/json" id="timeline-data">{{ timeline_data|safe }}</script>
 <script>
 new Chart(document.getElementById('timelineChart'), {
   type: 'line',
@@ -96,8 +96,8 @@ new Chart(document.getElementById('timelineChart'), {
     <div class="chart-box-sm">
       <canvas id="protoChart" role="img" aria-label="Event count by sensor, last 24 hours"></canvas>
     </div>
-    <script type="application/json" id="proto-labels">{{ proto_labels }}</script>
-    <script type="application/json" id="proto-data">{{ proto_data }}</script>
+    <script type="application/json" id="proto-labels">{{ proto_labels|safe }}</script>
+    <script type="application/json" id="proto-data">{{ proto_data|safe }}</script>
     <script>
     new Chart(document.getElementById('protoChart'), {
       type: 'bar',
@@ -132,8 +132,8 @@ new Chart(document.getElementById('timelineChart'), {
     <div class="chart-box-sm">
       <canvas id="attackerChart" role="img" aria-label="Top 10 attacking IPs by raw score"></canvas>
     </div>
-    <script type="application/json" id="attacker-labels">{{ attacker_labels }}</script>
-    <script type="application/json" id="attacker-data">{{ attacker_data }}</script>
+    <script type="application/json" id="attacker-labels">{{ attacker_labels|safe }}</script>
+    <script type="application/json" id="attacker-data">{{ attacker_data|safe }}</script>
     <script>
     new Chart(document.getElementById('attackerChart'), {
       type: 'bar',

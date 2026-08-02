@@ -20,6 +20,7 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 ReadWritePaths=/var/log/propolis/adb /var/spool/propolis/adb
+CapabilityBoundingSet=
 
 MemoryMax=256M
 TasksMax=128

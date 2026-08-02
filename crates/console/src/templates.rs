@@ -6,18 +6,32 @@
 //! interpolated with `{{ }}` is HTML-escaped unless a template explicitly opts out with the `|safe`
 //! filter (which nothing here does).
 //!
-//! `base.html`'s source is assembled at COMPILE TIME from three pieces - `base_head.html`, the
-//! vendored `htmx.min.js`, and `base_tail.html` - via `concat!(include_str!(..), ..)`, so the ~50KB
-//! minified HTMX distribution never has to be hand-transcribed into an HTML file or spliced in at
-//! runtime; `concat!` accepts `include_str!` results because they expand to string literals before
-//! `concat!` sees them. `htmx.min.js` is the unmodified, upstream `htmx.org@2.0.10` distribution
-//! (cross-checked byte-for-byte against two independent CDNs mirroring the same published npm
-//! package: unpkg and jsdelivr) - no CDN dependency at runtime, per the task's global constraint.
+//! `base.html`'s source is assembled at COMPILE TIME from five pieces: `base_head.html`, the
+//! vendored `chart.min.js`, `chart_defaults.html`, the vendored `htmx.min.js`, and `base_tail.html`,
+//! joined via `concat!(include_str!(..), ..)`, so neither the ~200KB minified Chart.js distribution
+//! nor the ~50KB minified HTMX distribution ever has to be hand-transcribed into an HTML file or
+//! spliced in at runtime; `concat!` accepts `include_str!` results because they expand to string
+//! literals before `concat!` sees them. `htmx.min.js` is the unmodified, upstream `htmx.org@2.0.10`
+//! distribution (cross-checked byte-for-byte against two independent CDNs mirroring the same
+//! published npm package: unpkg and jsdelivr), no CDN dependency at runtime, per the task's global
+//! constraint. `chart.min.js` is the unmodified, upstream `chart.js@4.5.1` UMD distribution (same
+//! byte-for-byte cross-check against unpkg and jsdelivr) and sets `window.Chart` on load.
+//!
+//! `base_head.html` ends mid-tag, with `<body>` followed by an unclosed `<script>` - this opens the
+//! Chart.js script tag; `chart_defaults.html` closes it, adds a second self-contained `<script>`
+//! block applying the console's dark theme to `Chart.defaults`, then opens a third, unclosed
+//! `<script>` tag for HTMX; `base_tail.html` closes that one and continues the page. Chart.js loads
+//! before HTMX only because that ordering lets `base_head.html`'s existing trailing `<script>` be
+//! reused as-is; the two libraries are independent (each only attaches its own global) and every
+//! inline `<script>` in `base_tail.html` and the child page templates runs later still, inside
+//! `<main>`, so load order between them is not otherwise significant.
 
 use minijinja::Environment;
 
 const BASE_HTML: &str = concat!(
     include_str!("templates/base_head.html"),
+    include_str!("templates/chart.min.js"),
+    include_str!("templates/chart_defaults.html"),
     include_str!("templates/htmx.min.js"),
     include_str!("templates/base_tail.html"),
 );

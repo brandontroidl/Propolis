@@ -1484,6 +1484,65 @@ async fn detail_evidence_row_shows_relative_time(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrations = false)]
+async fn detail_ip_timeline_chart_reflects_daily_event_counts(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.54", 60).await;
+    // A distinct event exactly 6 days before now: the OLDEST of the chart's 7 daily buckets
+    // (`current_date - 6 days`), the far boundary of the window.
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.54",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            false,
+            &(chrono::Utc::now() - chrono::Duration::days(6)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.54",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<canvas id="chart-ip-timeline""#),
+        "IP timeline chart canvas missing: {body}"
+    );
+    let script = &body[body
+        .find(r#"id="chart-ip-timeline""#)
+        .expect("IP timeline chart canvas missing")..];
+    // Proves the `|safe` filter is applied to the labels array: without it, minijinja's
+    // auto-escape would turn each label's `"` into `&#34;`, so a literal unescaped `labels: ["`
+    // substring can only appear if the JSON rendered through intact (same reasoning as the
+    // dashboard's own `|safe` proof in `dashboard_shows_recent_activity_and_protocol_distribution`).
+    assert!(
+        script.contains("labels: [\""),
+        "IP timeline chart labels missing or HTML-escaped: {script}"
+    );
+    // 7 buckets, oldest (`current_date - 6 days`) to newest (today): the event appended 6 days ago
+    // must land in the FIRST bucket, and `seed_recommended`'s own 3 events (all ~60s ago, today)
+    // must land in the LAST - a broken join or window bound would instead zero-fill both or
+    // misplace one.
+    assert!(
+        script.contains("data: [1,0,0,0,0,0,3]"),
+        "IP timeline chart data missing the 6-days-ago and today buckets: {script}"
+    );
+}
+
 // --- feed ---
 
 #[sqlx::test(migrations = false)]

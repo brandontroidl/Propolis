@@ -40,7 +40,7 @@ use crate::AppState;
 use crate::auth::Session;
 use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
-use crate::routes::format::{format_timestamp, tier_label};
+use crate::routes::format::{format_relative_time, format_timestamp, tier_label};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/ip/{ip}", get(detail))
@@ -49,6 +49,7 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Serialize)]
 struct EvidenceRow {
     observed_at: String,
+    relative_time: String,
     sensor: String,
     signal_type: String,
     protocol: String,
@@ -115,6 +116,7 @@ async fn detail(
         let observed_at: DateTime<Utc> = row.try_get("observed_at")?;
         evidence.push(EvidenceRow {
             observed_at: format_timestamp(observed_at),
+            relative_time: format_relative_time(observed_at),
             sensor: row.try_get("sensor")?,
             signal_type: format!("{signal_type:?}"),
             protocol: format!("{protocol:?}"),

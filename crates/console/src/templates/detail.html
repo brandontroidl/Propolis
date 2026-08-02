@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ ip }} - Propolis{% endblock %}
 {% block content %}
+<p><a href="/queue">&larr; back to queue</a></p>
 <h1 class="mono">{{ ip }}</h1>
 <div class="stat-row">
   <div class="stat-card">
@@ -30,7 +31,7 @@
 
 <h2 class="section-title">Recommendations &amp; evidence summary</h2>
 <div class="table-wrap">
-<table>
+<table class="table-compact">
   <tbody>
     <tr><td>Recommended for vendor report</td><td>{% if recommended_for_vendor %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
     <tr><td>Recommended for blocklist</td><td>{% if recommended_for_blocklist %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
@@ -49,7 +50,7 @@
 <h2 class="section-title">Category breakdown</h2>
 {% if categories %}
 <div class="table-wrap">
-<table>
+<table class="table-compact">
   <thead><tr><th>Category</th><th>Weight (live)</th><th>Max confidence</th></tr></thead>
   <tbody>
     {% for c in categories %}
@@ -65,7 +66,7 @@
 <h2 class="section-title">Per-WAN breadth <span class="dim">(internal only - never published to the feed or a vendor)</span></h2>
 {% if per_wan %}
 <div class="table-wrap">
-<table>
+<table class="table-compact">
   <thead><tr><th>WAN IP</th><th>Events</th><th>Authenticated TCP seen</th></tr></thead>
   <tbody>
     {% for w in per_wan %}
@@ -85,12 +86,13 @@
 <h2 class="section-title">Evidence timeline <span class="dim">(last {{ evidence|length }})</span></h2>
 {% if evidence %}
 <div class="table-wrap">
-<table>
-  <thead><tr><th>Observed</th><th>Sensor</th><th>Signal</th><th>Protocol</th><th>Auth</th><th>WAN IP</th></tr></thead>
+<table class="table-compact">
+  <thead><tr><th>Observed</th><th>Age</th><th>Sensor</th><th>Signal</th><th>Protocol</th><th>Auth</th><th>WAN IP</th></tr></thead>
   <tbody>
     {% for e in evidence %}
     <tr>
       <td class="seen">{{ e.observed_at }}</td>
+      <td class="seen dim">{{ e.relative_time }}</td>
       <td>{{ e.sensor }}</td>
       <td>{{ e.signal_type }}</td>
       <td>{{ e.protocol }}</td>
@@ -108,7 +110,7 @@
 <h2 class="section-title">Submission history</h2>
 {% if submissions %}
 <div class="table-wrap">
-<table>
+<table class="table-compact">
   <thead><tr><th>Submitted</th><th>Vendor</th><th>Categories</th><th>Response</th><th>Result</th></tr></thead>
   <tbody>
     {% for s in submissions %}

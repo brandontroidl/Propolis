@@ -120,5 +120,5 @@ fn session_cookie(value: String, peer_ip: IpAddr, ttl: std::time::Duration) -> C
 
 fn render(state: &AppState, error: Option<&str>) -> Result<String, AppError> {
     let tmpl = state.templates.get_template("login.html")?;
-    Ok(tmpl.render(context! { error })?)
+    Ok(tmpl.render(context! { error, version => state.version })?)
 }

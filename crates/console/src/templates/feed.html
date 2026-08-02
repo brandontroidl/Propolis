@@ -28,6 +28,6 @@
 </table>
 </div>
 {% else %}
-<p class="empty">No feed builds yet.</p>
+<p class="empty-line">{% if feed_disabled %}feed builder is disabled on this node{% else %}feed enabled - awaiting first build{% endif %}</p>
 {% endif %}
 {% endblock %}

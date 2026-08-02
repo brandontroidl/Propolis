@@ -5,6 +5,7 @@
 //! new page added in a later task only needs to `.merge()` into `protected` below to be
 //! session-gated automatically.
 
+pub(crate) mod context;
 pub mod dashboard;
 pub mod detail;
 pub mod error;

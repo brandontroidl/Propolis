@@ -179,6 +179,15 @@ impl SessionStore {
         bool::from(stored.as_bytes().ct_eq(token.as_bytes()))
     }
 
+    /// Removes `session_id` from the store, invalidating it immediately. Called on logout: clearing
+    /// only the client-side cookie would leave a captured or previously-issued cookie value valid
+    /// server-side until the session's TTL elapses on its own, which defeats the point of a
+    /// "sign out" action. A no-op if `session_id` names no active session (already expired,
+    /// already logged out, or never existed) - logout is idempotent by design.
+    pub fn destroy(&self, session_id: &str) {
+        self.sessions.write().unwrap().remove(session_id);
+    }
+
     fn sign(&self, id: &str) -> String {
         let mut mac =
             HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts a key of any length");

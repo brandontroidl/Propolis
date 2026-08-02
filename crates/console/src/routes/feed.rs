@@ -2,10 +2,13 @@
 //! status"). Session-gated: mounted under the `protected` group in `routes::mod`.
 //!
 //! Reads `manifest.json` from the configured feed output directory
-//! (`AppState::feed_output_dir`, from `PROPOLIS_FEED_OUTPUT_DIR`). Absent config, a missing file,
-//! or malformed JSON all render the same "No feed builds yet" state - never a hard error: a feed
-//! build that has not run yet (or is not deployed on this host at all) is normal, expected state,
-//! not a failure. `routes::metrics` reuses [`read_manifest`] for `propolis_feed_entries`.
+//! (`AppState::feed_output_dir`, from `PROPOLIS_FEED_OUTPUT_DIR`). A missing file or malformed
+//! JSON both collapse to `None` via [`read_manifest`] - never a hard error: a feed build that has
+//! not run yet is normal, expected state, not a failure. The empty state's copy then distinguishes
+//! *why* there is no build, via `feed_disabled` (`true` when `feed_output_dir` itself is `None`,
+//! i.e. this node has no feed builder configured at all): "feed builder is disabled on this node"
+//! vs. "feed enabled - awaiting first build" for a configured directory with no manifest yet.
+//! `routes::metrics` reuses [`read_manifest`] for `propolis_feed_entries`.
 //!
 //! [`Manifest`] mirrors the JSON SHAPE `feed::publisher::Manifest` writes
 //! (`crates/feed/src/publisher.rs`), deliberately as its own Deserialize-only type rather than a
@@ -26,6 +29,7 @@ use serde::Deserialize;
 
 use crate::AppState;
 use crate::auth::Session;
+use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
 
 pub fn router() -> Router<AppState> {
@@ -63,16 +67,26 @@ async fn feed_page(
     Extension(session): Extension<Session>,
 ) -> Result<Html<String>, AppError> {
     let manifest = state.feed_output_dir.as_deref().and_then(read_manifest);
+    let feed_disabled = state.feed_output_dir.is_none();
     let csrf_token = state
         .sessions
         .generate_csrf(&session.id)
         .unwrap_or_default();
+    let BaseContext {
+        pending_count,
+        uptime,
+        version,
+    } = base_context(&state.db, state.startup_time, state.version).await;
 
     let tmpl = state.templates.get_template("feed.html")?;
     let html = match manifest {
         Some(m) => tmpl.render(context! {
             csrf_token,
             active_nav => "feed",
+            pending_count,
+            uptime,
+            version,
+            feed_disabled,
             has_build => true,
             build_time => m.build_time,
             aggressive_count => m.tiers.aggressive.count,
@@ -83,6 +97,10 @@ async fn feed_page(
         None => tmpl.render(context! {
             csrf_token,
             active_nav => "feed",
+            pending_count,
+            uptime,
+            version,
+            feed_disabled,
             has_build => false,
         })?,
     };

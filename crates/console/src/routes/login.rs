@@ -41,7 +41,9 @@ use crate::auth::SESSION_COOKIE;
 use crate::routes::error::AppError;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/login", get(login_form).post(login_submit))
+    Router::new()
+        .route("/login", get(login_form).post(login_submit))
+        .route("/logout", get(logout))
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +82,28 @@ async fn login_submit(
     Ok((CookieJar::new().add(cookie), Redirect::to("/")).into_response())
 }
 
+/// `GET /logout`: ends the operator's session and sends them back to the login form. Destroys the
+/// session server-side via [`crate::auth::SessionStore::destroy`], not just the client-side cookie,
+/// so a leaked or previously-synced cookie value cannot go on authenticating after the operator
+/// believes they have signed out. Mounted alongside `/login` outside the `protected` group (see
+/// `routes::mod`), so it works the same way whether or not the caller currently holds a valid
+/// session: no cookie, an expired session, or a tampered cookie all fall through to the same
+/// "clear and redirect" response rather than erroring - matching the plain `<a href="/logout">`
+/// link in `base_tail.html`, which carries no state of its own to validate against.
+async fn logout(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if let Some(cookie) = jar.get(SESSION_COOKIE)
+        && let Some(session) = state.sessions.validate(cookie.value())
+    {
+        state.sessions.destroy(&session.id);
+    }
+    // Matches `session_cookie`'s `Path=/` below so the browser recognizes this as the same cookie
+    // to overwrite; `CookieJar::remove` only emits a `Set-Cookie` removal header at all when `jar`
+    // (built from the incoming request's own `Cookie:` header) actually contained this cookie,
+    // so hitting `/logout` with none present is a clean no-op rather than sending a pointless header.
+    let jar = jar.remove(Cookie::build(SESSION_COOKIE).path("/").build());
+    (jar, Redirect::to("/login")).into_response()
+}
+
 /// Builds the session cookie: `HttpOnly` always, `SameSite=Strict` always, `Secure` unless the
 /// peer is loopback (a loopback-only console has no TLS to require - see the design spec's
 /// "Sessions": "Secure (when not on localhost)"), and `Max-Age` tracking the store's own TTL so the
@@ -96,5 +120,5 @@ fn session_cookie(value: String, peer_ip: IpAddr, ttl: std::time::Duration) -> C
 
 fn render(state: &AppState, error: Option<&str>) -> Result<String, AppError> {
     let tmpl = state.templates.get_template("login.html")?;
-    Ok(tmpl.render(context! { error })?)
+    Ok(tmpl.render(context! { error, version => state.version })?)
 }

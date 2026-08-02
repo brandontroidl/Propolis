@@ -288,10 +288,8 @@ async fn mongodb_saslstart_captures_username() {
     let ismaster_msg = build_op_msg(1, &ismaster_bson);
     conn.write_all(&ismaster_msg).await.unwrap();
 
-    // Read isMaster response
-    let mut resp = read_mongo_response(&mut conn).await;
+    let _ = read_mongo_response(&mut conn).await;
 
-    // Send saslStart with SCRAM username embedded
     let mut payload = Vec::new();
     payload.extend_from_slice(b"n,,n=mongouser,r=somerandomnonce");
     let sasl_bson = build_test_bson_with_binary(
@@ -303,9 +301,7 @@ async fn mongodb_saslstart_captures_username() {
     let sasl_msg = build_op_msg(2, &sasl_bson);
     conn.write_all(&sasl_msg).await.unwrap();
 
-    // Read response (we don't need to validate it)
-    resp = read_mongo_response(&mut conn).await;
-    let _ = resp;
+    let _ = read_mongo_response(&mut conn).await;
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let events = srv.events().await;

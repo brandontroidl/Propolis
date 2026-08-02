@@ -75,17 +75,6 @@ impl FtpClient {
         line
     }
 
-    async fn read_multiline_reply(&mut self) -> String {
-        let mut result = String::new();
-        loop {
-            let line = self.read_reply().await;
-            let done = line.len() >= 4 && line.as_bytes()[3] == b' ';
-            result.push_str(&line);
-            if done { break; }
-        }
-        result
-    }
-
     async fn send(&mut self, cmd: &str) -> String {
         self.reader
             .get_mut()
@@ -108,13 +97,6 @@ impl FtpClient {
         parse_pasv_addr(&r)
     }
 
-    async fn epsv(&mut self) -> u16 {
-        let r = self.send("EPSV").await;
-        assert!(r.starts_with("229"), "EPSV reply: {r}");
-        let start = r.find("|||").unwrap() + 3;
-        let end = r[start..].find('|').unwrap() + start;
-        r[start..end].parse().unwrap()
-    }
 }
 
 fn parse_pasv_addr(reply: &str) -> std::net::SocketAddr {

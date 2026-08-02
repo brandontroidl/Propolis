@@ -15,6 +15,7 @@ pub mod templates;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use minijinja::Environment;
 use sqlx::PgPool;
 
@@ -38,4 +39,15 @@ pub struct AppState {
     /// console and the `feed` binary are independently deployed services that share this
     /// directory by convention, not a required dependency (`routes::feed`'s own doc comment).
     pub feed_output_dir: Option<PathBuf>,
+    /// Process start time, stamped once when the constructing binary builds `AppState`
+    /// (`console::main` for the standalone binary, `propolis::run_console` for the unified
+    /// daemon) - `routes::context::base_context` derives every page's displayed uptime from this
+    /// rather than re-reading the OS clock at process-start time, which is not otherwise
+    /// observable after the fact. `Copy`, so no `Arc` wrapping needed (unlike `sessions` etc.,
+    /// which wrap non-`Clone` interior state).
+    pub startup_time: DateTime<Utc>,
+    /// The running binary's own crate version (`env!("CARGO_PKG_VERSION")`), stamped by whichever
+    /// binary constructed this `AppState` - so the console always displays the version of the
+    /// process actually serving the page, not a fixed constant baked into this library crate.
+    pub version: &'static str,
 }

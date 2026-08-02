@@ -36,6 +36,8 @@ fn test_state(db: PgPool) -> AppState {
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
         feed_output_dir: None,
+        startup_time: chrono::Utc::now(),
+        version: "test",
     }
 }
 
@@ -94,6 +96,26 @@ fn hmac_valid_but_unknown_session_rejected() {
     let verifier = SessionStore::new(secret);
     let (_, cookie) = issuer.create();
     assert!(verifier.validate(&cookie).is_none());
+}
+
+#[test]
+fn destroyed_session_rejected() {
+    // Logout must invalidate server-side, not just clear the client cookie: a session that has
+    // been destroyed must fail validation even though the cookie's HMAC tag is still perfectly
+    // valid (unlike `tampered_cookie_rejected`, nothing here is corrupted - the session was
+    // deliberately ended).
+    let store = SessionStore::new(test_secret());
+    let (id, cookie) = store.create();
+    store.destroy(&id);
+    assert!(store.validate(&cookie).is_none());
+}
+
+#[test]
+fn destroying_unknown_session_is_a_no_op() {
+    // Logout is idempotent: hitting it twice, or with a cookie for a session that already expired
+    // or never existed, must not panic.
+    let store = SessionStore::new(test_secret());
+    store.destroy("no-such-session");
 }
 
 // --- CSRF ---

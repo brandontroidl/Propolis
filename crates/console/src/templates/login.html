@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Sign in - Propolis{% endblock %}
-{% block nav %}{% endblock %}
+{% block topnav %}{% endblock %}
 {% block content %}
 <div class="login-shell">
   <div class="login-card">
@@ -10,6 +10,7 @@
       <input type="password" name="password" placeholder="Operator password" autocomplete="current-password" autofocus required>
       <button type="submit">Sign in</button>
     </form>
+    <p class="dim" style="text-align:center;font-size:0.72rem;margin-top:1rem;">v{{ version }}</p>
   </div>
 </div>
 {% endblock %}

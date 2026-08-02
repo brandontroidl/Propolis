@@ -69,6 +69,8 @@ async fn smoke_health_and_ready(pool: PgPool) {
             login_rate_limiter: Arc::new(console::auth::RateLimiter::default()),
             templates: Arc::new(console::templates::environment()),
             feed_output_dir: Some(feed_dir.path().to_path_buf()),
+            startup_time: chrono::Utc::now(),
+            version: "test",
         };
 
         let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();

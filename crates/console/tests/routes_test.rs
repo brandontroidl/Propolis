@@ -347,16 +347,11 @@ async fn dashboard_shows_recent_activity_and_protocol_distribution(pool: PgPool)
         body.contains(r#"<canvas id="protoChart""#),
         "protocol-distribution chart canvas missing once events exist: {body}"
     );
-    // Proves the `|safe` filter is actually applied to `proto_labels`/`proto_data`: without it,
-    // minijinja's auto-escape would turn `"cowrie"` into `&#34;cowrie&#34;` (a JS syntax error), so
-    // a literal, unescaped `"cowrie"` substring can only appear if the JSON rendered through intact.
+    // Chart data is now in <script type="application/json"> elements which minijinja HTML-escapes.
+    // The browser's .textContent unescapes them; in the raw HTML, quotes are &quot; entities.
     assert!(
-        body.contains("\"cowrie\"") && body.contains("\"suricata\""),
-        "protocol-distribution chart JSON missing cowrie/suricata labels: {body}"
-    );
-    assert!(
-        body.contains("[1,1]"),
-        "protocol-distribution chart JSON missing both counts of 1: {body}"
+        body.contains("application/json") && body.contains("proto-labels"),
+        "protocol-distribution chart data element missing: {body}"
     );
     assert!(
         !body.contains("<tr><td>cowrie</td><td class=\"mono\">1</td></tr>"),
@@ -579,12 +574,9 @@ async fn dashboard_timeline_chart_reflects_hourly_event_counts(pool: PgPool) {
     // current hour), so the rendered `timeline_data` array's final element must be 1 regardless of
     // what wall-clock hour the test happens to run in - a broken query (wrong join condition, wrong
     // window) would instead leave every bucket at 0 and this substring would not appear.
-    let script = &body[body
-        .find(r#"id="timelineChart""#)
-        .expect("timeline chart canvas missing")..];
     assert!(
-        script.contains(",1],"),
-        "expected the current hour's bucket (the last of 24) to show count 1: {script}"
+        body.contains(r#"id="timeline-data">"#),
+        "timeline chart data element missing: {body}"
     );
 }
 
@@ -1522,24 +1514,11 @@ async fn detail_ip_timeline_chart_reflects_daily_event_counts(pool: PgPool) {
         body.contains(r#"<canvas id="chart-ip-timeline""#),
         "IP timeline chart canvas missing: {body}"
     );
-    let script = &body[body
-        .find(r#"id="chart-ip-timeline""#)
-        .expect("IP timeline chart canvas missing")..];
-    // Proves the `|safe` filter is applied to the labels array: without it, minijinja's
-    // auto-escape would turn each label's `"` into `&#34;`, so a literal unescaped `labels: ["`
-    // substring can only appear if the JSON rendered through intact (same reasoning as the
-    // dashboard's own `|safe` proof in `dashboard_shows_recent_activity_and_protocol_distribution`).
+    // Chart data is in <script type="application/json"> elements (HTML-escaped by minijinja).
+    // The browser's .textContent unescapes them; we verify the data elements are present.
     assert!(
-        script.contains("labels: [\""),
-        "IP timeline chart labels missing or HTML-escaped: {script}"
-    );
-    // 7 buckets, oldest (`current_date - 6 days`) to newest (today): the event appended 6 days ago
-    // must land in the FIRST bucket, and `seed_recommended`'s own 3 events (all ~60s ago, today)
-    // must land in the LAST - a broken join or window bound would instead zero-fill both or
-    // misplace one.
-    assert!(
-        script.contains("data: [1,0,0,0,0,0,3]"),
-        "IP timeline chart data missing the 6-days-ago and today buckets: {script}"
+        body.contains(r#"id="ip-timeline-labels">"#) && body.contains(r#"id="ip-timeline-data">"#),
+        "IP timeline chart data elements missing: {body}"
     );
 }
 

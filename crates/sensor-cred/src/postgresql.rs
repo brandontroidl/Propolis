@@ -43,7 +43,7 @@ pub async fn handle_connection(
         return;
     }
     let msg_len = i32::from_be_bytes(len_buf) as usize;
-    if msg_len < 8 || msg_len > MAX_STARTUP_MSG {
+    if !(8..=MAX_STARTUP_MSG).contains(&msg_len) {
         return;
     }
 
@@ -70,7 +70,7 @@ pub async fn handle_connection(
             return;
         }
         let msg_len2 = i32::from_be_bytes(len_buf2) as usize;
-        if msg_len2 < 8 || msg_len2 > MAX_STARTUP_MSG {
+        if !(8..=MAX_STARTUP_MSG).contains(&msg_len2) {
             return;
         }
         body = vec![0u8; msg_len2 - 4];
@@ -109,7 +109,7 @@ pub async fn handle_connection(
         return;
     }
     let pw_body_len = i32::from_be_bytes(pw_len) as usize;
-    if pw_body_len < 4 || pw_body_len > 1024 {
+    if !(4..=1024).contains(&pw_body_len) {
         return;
     }
     let mut _pw_body = vec![0u8; pw_body_len - 4];

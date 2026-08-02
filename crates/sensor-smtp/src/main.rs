@@ -16,10 +16,10 @@ const DEFAULT_LOG_PATH: &str = "/var/log/propolis/smtp/events.jsonl";
 fn parse_wan_map(raw: &str) -> HashMap<IpAddr, IpAddr> {
     let mut map = HashMap::new();
     for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some((local, wan)) = entry.split_once('=') {
-            if let (Ok(l), Ok(w)) = (local.trim().parse::<IpAddr>(), wan.trim().parse::<IpAddr>()) {
-                map.insert(l, w);
-            }
+        if let Some((local, wan)) = entry.split_once('=')
+            && let (Ok(l), Ok(w)) = (local.trim().parse::<IpAddr>(), wan.trim().parse::<IpAddr>())
+        {
+            map.insert(l, w);
         }
     }
     map

@@ -47,10 +47,11 @@ pub async fn handle_connection(
 
     let mut reader = BoundedReader::new(bounds);
 
-    loop {
-        let Some(request) = reader.read_request(&mut stream).await else {
-            return;
-        };
+    let Some(request) = reader.read_request(&mut stream).await else {
+        return;
+    };
+
+    {
 
         let method = sanitize_value(&request.method, 16);
         let path = sanitize_value(&request.path, 2048);
@@ -113,14 +114,7 @@ pub async fn handle_connection(
         if stream.write_all(response.as_bytes()).await.is_err() {
             return;
         }
-        if stream.write_all(body).await.is_err() {
-            return;
-        }
-
-        // HTTP/1.1 keep-alive is common; Connection: close tells the client we are done
-        // after one request-response. Real scanners typically send one request per connection
-        // anyway, and serving more than one would only add complexity with no intel gain.
-        return;
+        let _ = stream.write_all(body).await;
     }
 }
 
@@ -149,10 +143,9 @@ struct HttpRequest {
 
 impl HttpRequest {
     fn header(&self, name: &str) -> Option<&str> {
-        let lower = name.to_ascii_lowercase();
         self.headers
             .iter()
-            .find(|(k, _)| k.to_ascii_lowercase() == lower)
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
 }
@@ -245,7 +238,7 @@ impl BoundedReader {
 
         let content_length: usize = headers
             .iter()
-            .find(|(k, _)| k.to_ascii_lowercase() == "content-length")
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
             .and_then(|(_, v)| v.parse().ok())
             .unwrap_or(0);
 

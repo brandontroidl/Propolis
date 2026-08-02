@@ -169,7 +169,7 @@ async fn read_tds_packet(
 
     let pkt_type = header[0];
     let length = u16::from_be_bytes([header[2], header[3]]) as usize;
-    if length < 8 || length > MAX_TDS_PACKET {
+    if !(8..=MAX_TDS_PACKET).contains(&length) {
         return None;
     }
 

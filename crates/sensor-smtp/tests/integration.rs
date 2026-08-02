@@ -177,7 +177,7 @@ async fn never_relays_no_outbound_smtp() {
     let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let c = count.clone();
-    let task = tokio::spawn(async move { loop { if let Ok(_) = target.accept().await { c.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } } });
+    let task = tokio::spawn(async move { loop { if target.accept().await.is_ok() { c.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } } });
 
     let srv = TestServer::start().await;
     let mut client = SmtpClient::connect(srv.addr).await;

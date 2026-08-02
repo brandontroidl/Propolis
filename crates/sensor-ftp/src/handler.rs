@@ -284,7 +284,7 @@ async fn read_line_bounded(
             if line.len() > MAX_LINE_LEN {
                 line.truncate(MAX_LINE_LEN);
             }
-            let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+            let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
             Some(trimmed)
         }
     }

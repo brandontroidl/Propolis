@@ -194,10 +194,10 @@ fn data_event(
 
 fn extract_angle_bracket(s: &str) -> String {
     let trimmed = s.trim();
-    if let Some(start) = trimmed.find('<') {
-        if let Some(end) = trimmed[start..].find('>') {
-            return trimmed[start + 1..start + end].to_string();
-        }
+    if let (Some(start), Some(end)) = (trimmed.find('<'), trimmed.find('>'))
+        && start < end
+    {
+        return trimmed[start + 1..end].to_string();
     }
     trimmed.to_string()
 }
@@ -259,15 +259,14 @@ fn b64_val(b: u8) -> Option<u8> {
 }
 
 fn extract_header(body: &str, name: &str) -> String {
-    let lower_name = name.to_ascii_lowercase();
     for line in body.lines() {
         if line.is_empty() {
-            break; // end of headers
+            break;
         }
-        if let Some(value) = line.split_once(':') {
-            if value.0.trim().to_ascii_lowercase() == lower_name {
-                return value.1.trim().to_string();
-            }
+        if let Some((key, value)) = line.split_once(':')
+            && key.trim().eq_ignore_ascii_case(name)
+        {
+            return value.trim().to_string();
         }
     }
     String::new()
@@ -298,7 +297,7 @@ async fn read_line_bounded(
             if line.len() > MAX_LINE_LEN {
                 line.truncate(MAX_LINE_LEN);
             }
-            Some(line.trim_end_matches(|c| c == '\r' || c == '\n').to_string())
+            Some(line.trim_end_matches(['\r', '\n']).to_string())
         }
     }
 }
@@ -317,7 +316,7 @@ async fn read_data_body(
             break;
         }
         // Dot-stuffing: a line starting with "." has the leading dot removed
-        let actual = if line.starts_with('.') { &line[1..] } else { &line };
+        let actual = line.strip_prefix('.').unwrap_or(&line);
         if body.len() + actual.len() < MAX_DATA_BODY {
             body.push_str(actual);
             body.push('\n');

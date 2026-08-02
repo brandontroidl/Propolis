@@ -105,7 +105,7 @@ async fn read_mongo_msg(stream: &mut TcpStream, timeout: std::time::Duration) ->
     let request_id = i32::from_le_bytes([header[4], header[5], header[6], header[7]]);
     let opcode = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
 
-    if msg_length < 16 || msg_length > MAX_MSG_SIZE {
+    if !(16..=MAX_MSG_SIZE).contains(&msg_length) {
         return None;
     }
 

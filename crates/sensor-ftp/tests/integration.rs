@@ -232,7 +232,7 @@ async fn no_outbound_connections() {
     let target_addr = target.local_addr().unwrap();
     let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let c = count.clone();
-    let task = tokio::spawn(async move { loop { if let Ok(_) = target.accept().await { c.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } } });
+    let task = tokio::spawn(async move { loop { if target.accept().await.is_ok() { c.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } } });
 
     let srv = TestServer::start().await;
     let mut client = FtpClient::connect(srv.addr).await;

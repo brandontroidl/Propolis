@@ -26,6 +26,7 @@ use serde::Deserialize;
 
 use crate::AppState;
 use crate::auth::Session;
+use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
 
 pub fn router() -> Router<AppState> {
@@ -67,12 +68,20 @@ async fn feed_page(
         .sessions
         .generate_csrf(&session.id)
         .unwrap_or_default();
+    let BaseContext {
+        pending_count,
+        uptime,
+        version,
+    } = base_context(&state.db, state.startup_time, state.version).await;
 
     let tmpl = state.templates.get_template("feed.html")?;
     let html = match manifest {
         Some(m) => tmpl.render(context! {
             csrf_token,
             active_nav => "feed",
+            pending_count,
+            uptime,
+            version,
             has_build => true,
             build_time => m.build_time,
             aggressive_count => m.tiers.aggressive.count,
@@ -83,6 +92,9 @@ async fn feed_page(
         None => tmpl.render(context! {
             csrf_token,
             active_nav => "feed",
+            pending_count,
+            uptime,
+            version,
             has_build => false,
         })?,
     };

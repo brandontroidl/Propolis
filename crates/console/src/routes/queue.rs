@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::auth::Session;
+use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
 use crate::routes::format::{format_timestamp, tier_label};
 
@@ -157,11 +158,24 @@ async fn queue_page(
         })
         .collect();
 
+    // `pending_count` is the shared sitewide count from `base_context` (the same query the
+    // nav/footer badge uses on every page) rather than `rows.len()`: the two are equal in normal
+    // operation, but `pending` above silently omits any entry missing its `ip_score` projection,
+    // so sourcing the heading from the same canonical count keeps this page's own "N pending"
+    // consistent with what the rest of the console shows for the same number.
+    let BaseContext {
+        pending_count,
+        uptime,
+        version,
+    } = base_context(&state.db, state.startup_time, state.version).await;
+
     let tmpl = state.templates.get_template("queue.html")?;
     let html = tmpl.render(context! {
         csrf_token,
         active_nav => "queue",
-        pending_count => rows.len(),
+        pending_count,
+        uptime,
+        version,
         rows,
         sort => query.sort.as_str(),
     })?;

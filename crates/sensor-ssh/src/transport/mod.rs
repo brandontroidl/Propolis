@@ -234,7 +234,7 @@ where
 /// Build the wire bytes for one unencrypted packet. Split out from `write_packet_unencrypted` so
 /// the framing math is independently unit-testable without a stream.
 fn encode_packet_unencrypted(payload: &[u8]) -> Result<Vec<u8>, TransportError> {
-    let padding_length = compute_padding_length(payload.len());
+    let padding_length = compute_padding_length_unencrypted(payload.len());
     let packet_length_usize = 1 + payload.len() + padding_length as usize;
     let packet_length: u32 =
         packet_length_usize
@@ -276,7 +276,7 @@ pub async fn write_packet_encrypted<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let padding_length = compute_padding_length(payload.len());
+    let padding_length = compute_padding_length_encrypted(payload.len());
     let inner_len = 1 + payload.len() + padding_length as usize;
 
     let mut inner = Vec::with_capacity(inner_len);
@@ -352,15 +352,27 @@ where
     Ok(inner[1..1 + payload_len].to_vec())
 }
 
-/// The smallest padding (always `MIN_PADDING..MIN_PADDING + BLOCK_SIZE`, i.e. 4-11 bytes here)
-/// that brings `1 (the padding_length byte) + payload_len + padding_length` to a multiple of
-/// `BLOCK_SIZE`, per RFC 4253 section 6's "minimum four bytes, padded to the cipher block size"
-/// rule. A `base` that is already block-aligned still gets a full block of padding rather than
-/// zero, since the RFC's four-byte minimum applies unconditionally.
-fn compute_padding_length(payload_len: usize) -> u8 {
+/// Padding for unencrypted packets. RFC 4253 section 6: "the total length of
+/// (packet_length || padding_length || payload || random padding) MUST be a multiple of
+/// the cipher block size or 8." The 4-byte packet_length prefix is included in the
+/// alignment target.
+fn compute_padding_length_unencrypted(payload_len: usize) -> u8 {
+    let base = 4 + 1 + payload_len;
+    let remainder = base % BLOCK_SIZE;
+    let mut padding_length = if remainder == 0 { 0 } else { BLOCK_SIZE - remainder };
+    if padding_length < MIN_PADDING {
+        padding_length += BLOCK_SIZE;
+    }
+    padding_length as u8
+}
+
+/// Padding for encrypted packets (chacha20-poly1305@openssh.com). The 4-byte packet_length
+/// is encrypted separately with the header key, so the body alignment (padding_length ||
+/// payload || padding) excludes it. The body must be a multiple of 8.
+fn compute_padding_length_encrypted(payload_len: usize) -> u8 {
     let base = 1 + payload_len;
     let remainder = base % BLOCK_SIZE;
-    let mut padding_length = BLOCK_SIZE - remainder;
+    let mut padding_length = if remainder == 0 { 0 } else { BLOCK_SIZE - remainder };
     if padding_length < MIN_PADDING {
         padding_length += BLOCK_SIZE;
     }
@@ -572,19 +584,24 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
-    fn compute_padding_length_meets_minimum_and_block_alignment() {
+    fn compute_padding_length_unencrypted_aligns_total_frame() {
         for payload_len in 0..=200usize {
-            let padding_length = compute_padding_length(payload_len);
-            assert!(
-                padding_length as usize >= MIN_PADDING,
-                "payload_len={payload_len} produced padding_length={padding_length}"
-            );
-            let total = 1 + payload_len + padding_length as usize;
-            assert_eq!(
-                total % BLOCK_SIZE,
-                0,
-                "payload_len={payload_len}: total {total} is not block-aligned"
-            );
+            let padding_length = compute_padding_length_unencrypted(payload_len);
+            assert!(padding_length as usize >= MIN_PADDING);
+            let total = 4 + 1 + payload_len + padding_length as usize;
+            assert_eq!(total % BLOCK_SIZE, 0,
+                "payload_len={payload_len}: total wire frame {total} not block-aligned");
+        }
+    }
+
+    #[test]
+    fn compute_padding_length_encrypted_aligns_body_only() {
+        for payload_len in 0..=200usize {
+            let padding_length = compute_padding_length_encrypted(payload_len);
+            assert!(padding_length as usize >= MIN_PADDING);
+            let body = 1 + payload_len + padding_length as usize;
+            assert_eq!(body % BLOCK_SIZE, 0,
+                "payload_len={payload_len}: encrypted body {body} not block-aligned");
         }
     }
 

@@ -555,6 +555,157 @@ async fn login_rate_limited_after_five_failed_attempts(pool: PgPool) {
     assert_eq!(sixth.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
+// --- logout ---
+
+#[sqlx::test(migrations = false)]
+async fn logout_clears_session_and_redirects(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/logout",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .expect("logout must clear the session cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.starts_with(&format!("{}=", auth::SESSION_COOKIE)));
+    assert!(
+        set_cookie.contains("Max-Age=0"),
+        "expected an immediately-expiring cookie: {set_cookie}"
+    );
+
+    // Verified server-side, not just a client-side cookie clear: the same cookie value must no
+    // longer authenticate a protected route afterward.
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn logout_without_session_redirects_to_login(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/logout", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+// --- shared chrome (nav badge, sign-out, footer) ---
+
+#[sqlx::test(migrations = false)]
+async fn nav_shows_pending_badge_when_reviews_pending(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.80", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<span class="badge">1</span>"#),
+        "expected a pending-count badge on the review queue nav link: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn nav_hides_pending_badge_when_queue_empty(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains(r#"class="badge""#),
+        "no pending reviews, so no badge should render: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn authenticated_page_shows_sign_out_and_footer_status(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"href="/logout""#),
+        "missing sign-out link: {body}"
+    );
+    assert!(body.contains("Sign out"));
+    assert!(
+        body.contains(r#"<div class="status-line">propolis v"#),
+        "missing footer status line: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_page_has_no_sign_out_link(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/login", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("Sign out"),
+        "login page must not show a sign-out link before authentication: {body}"
+    );
+}
+
 // --- detail ---
 
 #[sqlx::test(migrations = false)]

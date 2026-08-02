@@ -707,6 +707,61 @@ async fn queue_sort_by_first_seen_orders_oldest_first(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrations = false)]
+async fn queue_page_empty_state_is_contextual(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(
+            r#"<p class="empty-line">queue empty - no IPs have crossed the recommendation threshold yet</p>"#
+        ),
+        "expected the contextual empty-queue message: {body}"
+    );
+    assert!(
+        !body.contains("Nothing pending review"),
+        "old empty-state copy must be gone: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_page_table_uses_compact_class(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.42", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<table class="table-compact">"#),
+        "expected the queue table to use the compact density class: {body}"
+    );
+}
+
 // --- login ---
 
 #[sqlx::test(migrations = false)]
@@ -792,6 +847,42 @@ async fn login_rate_limited_after_five_failed_attempts(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(sixth.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_page_hides_topnav_entirely(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/login", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains(r#"class="topnav""#),
+        "login page must not render the topnav bar at all: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_page_shows_version(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/login", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(
+            r#"<p class="dim" style="text-align:center;font-size:0.72rem;margin-top:1rem;">vtest</p>"#
+        ),
+        "expected the login page's own version line: {body}"
+    );
+    assert!(
+        body.contains("propolis vtest - up"),
+        "expected the shared footer status line to show a real version, not blank: {body}"
+    );
 }
 
 // --- logout ---
@@ -1038,10 +1129,132 @@ async fn detail_unauthenticated_redirects_to_login(pool: PgPool) {
     assert_eq!(response.headers().get("location").unwrap(), "/login");
 }
 
+#[sqlx::test(migrations = false)]
+async fn detail_page_has_back_link_to_queue(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.51", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.51",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p><a href="/queue">&larr; back to queue</a></p>"#),
+        "expected a back-to-queue link above the IP heading: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_page_tables_use_compact_class(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.52", 60).await;
+    append_event(
+        &pool,
+        ev_with_wan(
+            "203.0.113.52",
+            "198.51.100.20",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.52")
+    .bind("abuseipdb")
+    .bind("detail-table-compact-key")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(true)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.52",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let table_open_count = body.matches("<table").count();
+    let compact_count = body.matches(r#"<table class="table-compact">"#).count();
+    assert!(
+        table_open_count >= 5,
+        "expected all 5 detail-page tables to render for this fixture: {body}"
+    );
+    assert_eq!(
+        table_open_count, compact_count,
+        "every table on the detail page must use the compact density class: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_evidence_row_shows_relative_time(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.53", 60).await;
+    append_event(
+        &pool,
+        ev_with_wan(
+            "203.0.113.53",
+            "198.51.100.21",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            true,
+            &(chrono::Utc::now() - chrono::Duration::seconds(90)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.53",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<td class="seen dim">1m ago</td>"#),
+        "expected the evidence timeline to show a relative-time column: {body}"
+    );
+}
+
 // --- feed ---
 
 #[sqlx::test(migrations = false)]
-async fn feed_page_shows_no_builds_when_unconfigured(pool: PgPool) {
+async fn feed_page_shows_disabled_empty_state_when_unconfigured(pool: PgPool) {
     migrate(&pool).await;
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -1057,7 +1270,36 @@ async fn feed_page_shows_no_builds_when_unconfigured(pool: PgPool) {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
-    assert!(body.contains("No feed builds yet"));
+    assert!(
+        body.contains(r#"<p class="empty-line">feed builder is disabled on this node</p>"#),
+        "expected the disabled-feed empty state when feed_output_dir is unconfigured: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_page_shows_awaiting_first_build_when_configured_but_no_manifest(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // No manifest.json written: the directory is configured but no build has run yet.
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">feed enabled - awaiting first build</p>"#),
+        "expected the awaiting-first-build empty state when configured but no manifest exists: {body}"
+    );
 }
 
 #[sqlx::test(migrations = false)]

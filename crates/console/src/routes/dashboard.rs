@@ -38,11 +38,6 @@ async fn dashboard(
         .fetch_one(&state.db)
         .await?;
 
-    let pending_reviews: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM review_queue WHERE state = 'pending'")
-            .fetch_one(&state.db)
-            .await?;
-
     // `current_date` is a DATE; Postgres implicitly casts it to a TIMESTAMPTZ at local-midnight
     // for the `>=` comparison against `decided_at` (matches the design spec's own query text).
     let approved_today: i64 = sqlx::query_scalar(
@@ -88,7 +83,7 @@ async fn dashboard(
         csrf_token,
         active_nav => "dashboard",
         total_scored_ips,
-        pending_reviews,
+        pending_reviews => pending_count,
         approved_today,
         recent_submissions,
         pending_count,

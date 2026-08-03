@@ -251,8 +251,8 @@ async fn dashboard_authenticated_returns_stats(pool: PgPool) {
         "expected total_scored_ips=3 in the rendered stats: {body}"
     );
     assert!(
-        body.contains(r#"class="stat-card stat-card-accent""#),
-        "pending_reviews > 0 must render the accent border: {body}"
+        body.contains(r#"class="stat-hero stat-hero--attention""#),
+        "pending_reviews > 0 must render the attention hero stat: {body}"
     );
     assert!(
         body.contains(r#"<a href="/queue">2</a>"#),
@@ -273,8 +273,8 @@ async fn dashboard_authenticated_returns_stats(pool: PgPool) {
         "expected the feed-entries placeholder when no feed_output_dir is configured: {body}"
     );
     assert!(
-        !body.contains(r#"<div class="value" style="font-size:0.95rem">--</div>"#),
-        "expected a real top-attacker IP (not the placeholder) given ip_score rows exist: {body}"
+        body.contains(r#"href="/ip/203.0.113.10">"#) || body.contains(r#"href="/ip/203.0.113.11">"#),
+        "expected one of the seeded IPs as top attacker in the hero stat: {body}"
     );
     assert!(body.contains("Dashboard"));
 }
@@ -336,8 +336,8 @@ async fn dashboard_shows_recent_activity_and_protocol_distribution(pool: PgPool)
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains("<td>cowrie</td>") && body.contains("<td>honeypot_login_attempt</td>"),
-        "recent-activity row missing cowrie/honeypot_login_attempt: {body}"
+        body.contains("<td>Cowrie login attempt</td>"),
+        "recent-activity row missing human-readable activity label: {body}"
     );
     assert!(
         body.contains(r#"href="/ip/203.0.113.80">203.0.113.80</a>"#),
@@ -354,8 +354,8 @@ async fn dashboard_shows_recent_activity_and_protocol_distribution(pool: PgPool)
         "protocol-distribution chart data element missing: {body}"
     );
     assert!(
-        !body.contains("<tr><td>cowrie</td><td class=\"mono\">1</td></tr>"),
-        "old protocol-distribution text table must be replaced by the chart, not kept alongside it: {body}"
+        !body.contains("<tr><td>cowrie</td>"),
+        "raw sensor name must not appear in any table: {body}"
     );
     assert!(
         !body.contains("waiting for sensor events"),
@@ -435,12 +435,8 @@ async fn dashboard_top_attacker_shows_highest_scoring_ip(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains(r#"<div class="label">Top attacker</div>"#),
-        "missing top attacker card: {body}"
-    );
-    assert!(
-        body.contains(r#"href="/ip/203.0.113.95">203.0.113.95</a>"#),
-        "expected the sole ip_score row's IP as top attacker: {body}"
+        body.contains(r#"href="/ip/203.0.113.95">"#),
+        "expected the sole ip_score row's IP as top attacker in the hero stat: {body}"
     );
 }
 
@@ -511,8 +507,8 @@ async fn dashboard_empty_state_shows_placeholders(pool: PgPool) {
         "expected the feed-entries placeholder when unconfigured: {body}"
     );
     assert!(
-        body.contains(r#"<div class="value" style="font-size:0.95rem">--</div>"#),
-        "expected the top-attacker placeholder when no ip_score rows exist: {body}"
+        body.contains("stat-hero--nominal"),
+        "expected the nominal hero stat when pending_reviews=0: {body}"
     );
     // Both chart sections gate independently on their own source list (`protocol_dist` /
     // `has_attackers`) - this fixture has neither events nor ip_score rows, so both must show the
@@ -1308,8 +1304,8 @@ async fn detail_shows_events_for_seeded_ip(pool: PgPool) {
         "per-WAN breakdown missing the seeded WAN IP: {body}"
     );
     assert!(
-        body.contains("PortScan"),
-        "evidence timeline missing the added event's signal type: {body}"
+        body.contains("port scan"),
+        "evidence timeline missing the activity label for the added event: {body}"
     );
     assert!(
         body.contains(">Standard<"),

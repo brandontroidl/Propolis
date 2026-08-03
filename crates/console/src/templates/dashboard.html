@@ -1,22 +1,27 @@
 {% extends "base.html" %}
 {% block title %}Dashboard - Propolis{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
-<div class="stat-row">
-  <div class="stat-card{% if pending_reviews > 0 %} stat-card-accent{% endif %}">
-    <div class="label">Pending review</div>
-    <div class="value"><a href="/queue">{{ pending_reviews }}</a></div>
+<div class="stat-hero{% if pending_reviews > 0 %} stat-hero--attention{% else %} stat-hero--nominal{% endif %}">
+  <div class="stat-hero-value"><a href="/queue">{{ pending_reviews }}</a></div>
+  <div class="stat-hero-label">pending review</div>
+  <div class="stat-hero-sub">
+    <span><strong>{% if events_last_hour >= 0 %}{{ events_last_hour }}{% else %}--{% endif %}</strong> events/hr</span>
+    <span><strong>{{ total_scored_ips }}</strong> scored IPs</span>
+    {% if top_attacker_ip != "--" %}<span>top: <a href="/ip/{{ top_attacker_ip }}"><strong>{{ top_attacker_ip }}</strong></a></span>{% endif %}
   </div>
-  <div class="stat-card">
+</div>
+
+<div class="stat-row">
+  <div class="stat-card stat-card--info">
     <div class="label">Total scored IPs</div>
     <div class="value">{{ total_scored_ips }}</div>
     {{ scored_sparkline|safe }}
   </div>
-  <div class="stat-card">
+  <div class="stat-card stat-card--good">
     <div class="label">Approved today</div>
     <div class="value">{{ approved_today }}</div>
   </div>
-  <div class="stat-card">
+  <div class="stat-card stat-card--info">
     <div class="label">Events / hour</div>
     <div class="value">{% if events_last_hour >= 0 %}{{ events_last_hour }}{% else %}--{% endif %}</div>
     {{ events_sparkline|safe }}
@@ -25,15 +30,15 @@
     <div class="label">Feed entries</div>
     <div class="value">{% if feed_entries >= 0 %}{{ feed_entries }}{% else %}--{% endif %}</div>
   </div>
-  <div class="stat-card">
-    <div class="label">Top attacker</div>
-    <div class="value" style="font-size:0.95rem">{% if top_attacker_ip != "--" %}<a href="/ip/{{ top_attacker_ip }}">{{ top_attacker_ip }}</a>{% else %}--{% endif %}</div>
-  </div>
 </div>
 
-<h2 class="section-title">Events timeline (24h)</h2>
-<div class="chart-box">
-  <canvas id="timelineChart" role="img" aria-label="Events per hour, last 24 hours"></canvas>
+<div class="panel">
+  <div class="panel-head panel-head--blue">Events timeline <span class="dim">24h</span></div>
+  <div class="panel-body">
+    <div class="chart-box">
+      <canvas id="timelineChart" role="img" aria-label="Events per hour, last 24 hours"></canvas>
+    </div>
+  </div>
 </div>
 <script type="application/json" id="timeline-labels">{{ timeline_labels|safe }}</script>
 <script type="application/json" id="timeline-data">{{ timeline_data|safe }}</script>
@@ -44,14 +49,14 @@ new Chart(document.getElementById('timelineChart'), {
     labels: JSON.parse(document.getElementById('timeline-labels').textContent),
     datasets: [{
       data: JSON.parse(document.getElementById('timeline-data').textContent),
-      borderColor: '#d99a3d',
-      backgroundColor: 'rgba(217, 154, 61, 0.1)',
+      borderColor: '#3987e5',
+      backgroundColor: 'rgba(57, 135, 229, 0.08)',
       borderWidth: 2,
       fill: true,
       tension: 0,
       pointRadius: 0,
       pointHoverRadius: 4,
-      pointHoverBackgroundColor: '#d99a3d',
+      pointHoverBackgroundColor: '#3987e5',
       pointHoverBorderColor: '#0f1417',
       pointHoverBorderWidth: 2,
     }],
@@ -68,122 +73,129 @@ new Chart(document.getElementById('timelineChart'), {
 });
 </script>
 
-<h2 class="section-title">Recent activity</h2>
-{% if recent_events %}
-<div class="table-wrap">
-<table class="table-compact">
-  <thead><tr><th>When</th><th>Sensor</th><th>Signal</th><th>Source</th></tr></thead>
-  <tbody>
-    {% for e in recent_events %}
-    <tr>
-      <td class="seen mono">{{ e.relative_time }}</td>
-      <td>{{ e.sensor }}</td>
-      <td>{{ e.signal_type }}</td>
-      <td class="ip"><a href="/ip/{{ e.source_ip }}">{{ e.source_ip }}</a></td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+<div class="grid-2">
+  <div class="panel">
+    <div class="panel-head panel-head--blue">Protocol distribution <span class="dim">24h</span></div>
+    <div class="panel-body">
+      {% if protocol_dist %}
+      <div class="chart-box-sm">
+        <canvas id="protoChart" role="img" aria-label="Event count by sensor, last 24 hours"></canvas>
+      </div>
+      {% else %}
+      <p class="empty-line">waiting for sensor events</p>
+      {% endif %}
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-head panel-head--orange">Top attackers</div>
+    <div class="panel-body">
+      {% if has_attackers %}
+      <div class="chart-box-sm">
+        <canvas id="attackerChart" role="img" aria-label="Top 10 attacking IPs by raw score"></canvas>
+      </div>
+      {% else %}
+      <p class="empty-line">waiting for sensor events</p>
+      {% endif %}
+    </div>
+  </div>
 </div>
-{% else %}
-<p class="empty-line">waiting for sensor events - start a sensor to begin collecting</p>
+{% if protocol_dist %}
+<script type="application/json" id="proto-labels">{{ proto_labels|safe }}</script>
+<script type="application/json" id="proto-data">{{ proto_data|safe }}</script>
+<script>
+new Chart(document.getElementById('protoChart'), {
+  type: 'bar',
+  data: {
+    labels: JSON.parse(document.getElementById('proto-labels').textContent),
+    datasets: [{
+      data: JSON.parse(document.getElementById('proto-data').textContent),
+      backgroundColor: '#3987e5',
+      borderRadius: 4,
+      maxBarThickness: 20,
+    }],
+  },
+  options: {
+    indexAxis: 'y',
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: { beginAtZero: true, ticks: { precision: 0 } },
+      y: { grid: { display: false } },
+    },
+    plugins: { tooltip: { displayColors: false } },
+  },
+});
+</script>
+{% endif %}
+{% if has_attackers %}
+<script type="application/json" id="attacker-labels">{{ attacker_labels|safe }}</script>
+<script type="application/json" id="attacker-data">{{ attacker_data|safe }}</script>
+<script>
+new Chart(document.getElementById('attackerChart'), {
+  type: 'bar',
+  data: {
+    labels: JSON.parse(document.getElementById('attacker-labels').textContent),
+    datasets: [{
+      data: JSON.parse(document.getElementById('attacker-data').textContent),
+      backgroundColor: '#d95926',
+      borderRadius: 4,
+      maxBarThickness: 20,
+    }],
+  },
+  options: {
+    indexAxis: 'y',
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: { beginAtZero: true },
+      y: { grid: { display: false } },
+    },
+    plugins: { tooltip: { displayColors: false } },
+  },
+});
+</script>
 {% endif %}
 
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-top:2rem;">
-  <div>
-    <h2 class="section-title" style="margin-top:0">Protocol distribution (24h)</h2>
-    {% if protocol_dist %}
-    <div class="chart-box-sm">
-      <canvas id="protoChart" role="img" aria-label="Event count by sensor, last 24 hours"></canvas>
-    </div>
-    <script type="application/json" id="proto-labels">{{ proto_labels|safe }}</script>
-    <script type="application/json" id="proto-data">{{ proto_data|safe }}</script>
-    <script>
-    new Chart(document.getElementById('protoChart'), {
-      type: 'bar',
-      data: {
-        labels: JSON.parse(document.getElementById('proto-labels').textContent),
-        datasets: [{
-          data: JSON.parse(document.getElementById('proto-data').textContent),
-          backgroundColor: '#5a7a96',
-          borderRadius: 4,
-          maxBarThickness: 24,
-        }],
-      },
-      options: {
-        indexAxis: 'y',
-        responsive: true,
-        maintainAspectRatio: false,
-        scales: {
-          x: { beginAtZero: true, ticks: { precision: 0 } },
-          y: { grid: { display: false } },
-        },
-        plugins: { tooltip: { displayColors: false } },
-      },
-    });
-    </script>
-    {% else %}
-    <p class="empty-line">waiting for sensor events</p>
-    {% endif %}
-  </div>
-  <div>
-    <h2 class="section-title" style="margin-top:0">Top attackers</h2>
-    {% if has_attackers %}
-    <div class="chart-box-sm">
-      <canvas id="attackerChart" role="img" aria-label="Top 10 attacking IPs by raw score"></canvas>
-    </div>
-    <script type="application/json" id="attacker-labels">{{ attacker_labels|safe }}</script>
-    <script type="application/json" id="attacker-data">{{ attacker_data|safe }}</script>
-    <script>
-    new Chart(document.getElementById('attackerChart'), {
-      type: 'bar',
-      data: {
-        labels: JSON.parse(document.getElementById('attacker-labels').textContent),
-        datasets: [{
-          data: JSON.parse(document.getElementById('attacker-data').textContent),
-          backgroundColor: '#c1533d',
-          borderRadius: 4,
-          maxBarThickness: 24,
-        }],
-      },
-      options: {
-        indexAxis: 'y',
-        responsive: true,
-        maintainAspectRatio: false,
-        scales: {
-          x: { beginAtZero: true },
-          y: { grid: { display: false } },
-        },
-        plugins: { tooltip: { displayColors: false } },
-      },
-    });
-    </script>
-    {% else %}
-    <p class="empty-line">waiting for sensor events</p>
-    {% endif %}
+<div class="panel">
+  <div class="panel-head">Recent activity</div>
+  {% if recent_events %}
+  <table class="table-compact">
+    <thead><tr><th>When</th><th>Activity</th><th>Source</th></tr></thead>
+    <tbody>
+      {% for e in recent_events %}
+      <tr>
+        <td class="seen mono">{{ e.relative_time }}</td>
+        <td>{{ e.activity }}</td>
+        <td class="ip"><a href="/ip/{{ e.source_ip }}">{{ e.source_ip }}</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">waiting for sensor events - start a sensor to begin collecting</p>
+  {% endif %}
+</div>
 
-    <h2 class="section-title">Recent vendor submissions</h2>
-    {% if recent_submissions %}
-    <div class="table-wrap">
-    <table class="table-compact">
-      <thead><tr><th>IP</th><th>Vendor</th><th>Submitted</th><th>Result</th></tr></thead>
-      <tbody>
-        {% for s in recent_submissions %}
-        {% if loop.index <= 3 %}
-        <tr>
-          <td class="ip"><a href="/ip/{{ s.source_ip }}">{{ s.source_ip }}</a></td>
-          <td>{{ s.vendor }}</td>
-          <td class="seen">{{ s.submitted_at }}</td>
-          <td>{% if s.success %}<span class="state-pill state-approved">Sent</span>{% else %}<span class="state-pill state-rejected">Failed</span>{% endif %}</td>
-        </tr>
-        {% endif %}
-        {% endfor %}
-      </tbody>
-    </table>
-    </div>
-    {% else %}
-    <p class="empty-line">no vendor submissions yet</p>
-    {% endif %}
-  </div>
+<div class="panel">
+  <div class="panel-head">Recent vendor submissions</div>
+  {% if recent_submissions %}
+  <table class="table-compact">
+    <thead><tr><th>IP</th><th>Vendor</th><th>Submitted</th><th>Result</th></tr></thead>
+    <tbody>
+      {% for s in recent_submissions %}
+      {% if loop.index <= 3 %}
+      <tr>
+        <td class="ip"><a href="/ip/{{ s.source_ip }}">{{ s.source_ip }}</a></td>
+        <td>{{ s.vendor }}</td>
+        <td class="seen">{{ s.submitted_at }}</td>
+        <td>{% if s.success %}<span class="state-pill state-approved">Sent</span>{% else %}<span class="state-pill state-rejected">Failed</span>{% endif %}</td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">no vendor submissions yet</p>
+  {% endif %}
 </div>
 {% endblock %}

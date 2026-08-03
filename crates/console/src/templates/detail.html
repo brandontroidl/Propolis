@@ -4,11 +4,11 @@
 <p><a href="/queue">&larr; back to queue</a></p>
 <h1 class="mono">{{ ip }}</h1>
 <div class="stat-row">
-  <div class="stat-card">
+  <div class="stat-card stat-card--attention">
     <div class="label">Raw score</div>
     <div class="value"><span class="meter"><span class="meter-fill" style="--pct: {{ raw_score_pct }}%"></span></span>{{ raw_score }}</div>
   </div>
-  <div class="stat-card">
+  <div class="stat-card stat-card--attention">
     <div class="label">Effective score</div>
     <div class="value"><span class="meter"><span class="meter-fill" style="--pct: {{ effective_score_pct }}%"></span></span>{{ effective_score }}</div>
   </div>
@@ -29,63 +29,31 @@
   </div>
 </div>
 
-<h2 class="section-title">Recommendations &amp; evidence summary</h2>
-<div class="table-wrap">
-<table class="table-compact">
-  <tbody>
-    <tr><td>Recommended for vendor report</td><td>{% if recommended_for_vendor %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
-    <tr><td>Recommended for blocklist</td><td>{% if recommended_for_blocklist %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
-    <tr><td>Confirmed-real latch</td><td>{% if has_confirmed_real %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
-    <tr><td>Event count</td><td class="mono">{{ event_count }}</td></tr>
-    <tr><td>Distinct categories (live)</td><td class="mono">{{ distinct_categories }}</td></tr>
-    <tr><td>Distinct WAN vantages</td><td class="mono">{{ distinct_wan_count }}</td></tr>
-    <tr><td>Distinct sensors</td><td class="mono">{{ distinct_sensor_count }}</td></tr>
-    <tr><td>Max confidence (live)</td><td class="mono">{{ max_confidence }}</td></tr>
-    <tr><td>First seen</td><td class="seen">{{ first_seen }}</td></tr>
-    <tr><td>Last seen</td><td class="seen">{{ last_seen }}</td></tr>
-  </tbody>
-</table>
+<div class="panel">
+  <div class="panel-head">Recommendations and evidence summary</div>
+  <table class="table-compact">
+    <tbody>
+      <tr><td>Recommended for vendor report</td><td>{% if recommended_for_vendor %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
+      <tr><td>Recommended for blocklist</td><td>{% if recommended_for_blocklist %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
+      <tr><td>Confirmed-real latch</td><td>{% if has_confirmed_real %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
+      <tr><td>Event count</td><td class="mono">{{ event_count }}</td></tr>
+      <tr><td>Distinct categories (live)</td><td class="mono">{{ distinct_categories }}</td></tr>
+      <tr><td>Distinct WAN vantages</td><td class="mono">{{ distinct_wan_count }}</td></tr>
+      <tr><td>Distinct sensors</td><td class="mono">{{ distinct_sensor_count }}</td></tr>
+      <tr><td>Max confidence (live)</td><td class="mono">{{ max_confidence }}</td></tr>
+      <tr><td>First seen</td><td class="seen">{{ first_seen }}</td></tr>
+      <tr><td>Last seen</td><td class="seen">{{ last_seen }}</td></tr>
+    </tbody>
+  </table>
 </div>
 
-<h2 class="section-title">Category breakdown</h2>
-{% if categories %}
-<div class="table-wrap">
-<table class="table-compact">
-  <thead><tr><th>Category</th><th>Weight (live)</th><th>Max confidence</th></tr></thead>
-  <tbody>
-    {% for c in categories %}
-    <tr><td>{{ c.category }}</td><td class="mono">{{ c.weight }}</td><td class="mono">{{ c.max_confidence }}</td></tr>
-    {% endfor %}
-  </tbody>
-</table>
-</div>
-{% else %}
-<p class="empty">No category data.</p>
-{% endif %}
-
-<h2 class="section-title">Per-WAN breadth <span class="dim">(internal only - never published to the feed or a vendor)</span></h2>
-{% if per_wan %}
-<div class="table-wrap">
-<table class="table-compact">
-  <thead><tr><th>WAN IP</th><th>Events</th><th>Authenticated TCP seen</th></tr></thead>
-  <tbody>
-    {% for w in per_wan %}
-    <tr>
-      <td class="ip">{{ w.wan_ip }}</td>
-      <td class="mono">{{ w.event_count }}</td>
-      <td>{% if w.has_authenticated %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-</div>
-{% else %}
-<p class="empty">No WAN vantage recorded for this IP.</p>
-{% endif %}
-
-<h2 class="section-title">Activity (7 days)</h2>
-<div class="chart-box-compact">
-  <canvas id="chart-ip-timeline" role="img" aria-label="Events per day, last 7 days"></canvas>
+<div class="panel">
+  <div class="panel-head panel-head--blue">Activity <span class="dim">7 days</span></div>
+  <div class="panel-body">
+    <div class="chart-box-compact">
+      <canvas id="chart-ip-timeline" role="img" aria-label="Events per day, last 7 days"></canvas>
+    </div>
+  </div>
 </div>
 <script type="application/json" id="ip-timeline-labels">{{ ip_timeline_labels|safe }}</script>
 <script type="application/json" id="ip-timeline-data">{{ ip_timeline_data|safe }}</script>
@@ -96,60 +64,107 @@ new Chart(document.getElementById('chart-ip-timeline'), {
         labels: JSON.parse(document.getElementById('ip-timeline-labels').textContent),
         datasets: [{
             data: JSON.parse(document.getElementById('ip-timeline-data').textContent),
-            borderColor: '#d99a3d',
+            borderColor: '#3987e5',
+            backgroundColor: 'rgba(57, 135, 229, 0.08)',
             borderWidth: 2,
+            fill: true,
             pointRadius: 3,
-            pointBackgroundColor: '#d99a3d',
+            pointBackgroundColor: '#3987e5',
+            pointBorderColor: '#0f1417',
+            pointBorderWidth: 2,
             tension: 0.3
         }]
     },
-    options: { scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }, maintainAspectRatio: false }
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+            x: { grid: { display: false } },
+            y: { beginAtZero: true, ticks: { precision: 0 } }
+        },
+        plugins: { tooltip: { displayColors: false } }
+    }
 });
 </script>
 
-<h2 class="section-title">Evidence timeline <span class="dim">(last {{ evidence|length }})</span></h2>
-{% if evidence %}
-<div class="table-wrap">
-<table class="table-compact">
-  <thead><tr><th>Observed</th><th>Age</th><th>Sensor</th><th>Signal</th><th>Protocol</th><th>Auth</th><th>WAN IP</th></tr></thead>
-  <tbody>
-    {% for e in evidence %}
-    <tr>
-      <td class="seen">{{ e.observed_at }}</td>
-      <td class="seen dim">{{ e.relative_time }}</td>
-      <td>{{ e.sensor }}</td>
-      <td>{{ e.signal_type }}</td>
-      <td>{{ e.protocol }}</td>
-      <td>{% if e.authenticated %}yes{% else %}no{% endif %}</td>
-      <td class="ip">{{ e.wan_ip }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+<div class="panel">
+  <div class="panel-head">Category breakdown</div>
+  {% if categories %}
+  <table class="table-compact">
+    <thead><tr><th>Category</th><th>Weight (live)</th><th>Max confidence</th></tr></thead>
+    <tbody>
+      {% for c in categories %}
+      <tr><td>{{ c.category }}</td><td class="mono">{{ c.weight }}</td><td class="mono">{{ c.max_confidence }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">No category data.</p>
+  {% endif %}
 </div>
-{% else %}
-<p class="empty">No events recorded for this IP.</p>
-{% endif %}
 
-<h2 class="section-title">Submission history</h2>
+<div class="panel">
+  <div class="panel-head">Per-WAN breadth <span class="dim">internal only</span></div>
+  {% if per_wan %}
+  <table class="table-compact">
+    <thead><tr><th>WAN IP</th><th>Events</th><th>Authenticated TCP seen</th></tr></thead>
+    <tbody>
+      {% for w in per_wan %}
+      <tr>
+        <td class="ip">{{ w.wan_ip }}</td>
+        <td class="mono">{{ w.event_count }}</td>
+        <td>{% if w.has_authenticated %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">No WAN vantage recorded for this IP.</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">Evidence timeline <span class="dim">last {{ evidence|length }}</span></div>
+  {% if evidence %}
+  <table class="table-compact">
+    <thead><tr><th>Observed</th><th>Age</th><th>Activity</th><th>Protocol</th><th>Auth</th><th>WAN IP</th></tr></thead>
+    <tbody>
+      {% for e in evidence %}
+      <tr>
+        <td class="seen">{{ e.observed_at }}</td>
+        <td class="seen dim">{{ e.relative_time }}</td>
+        <td>{{ e.activity }}</td>
+        <td>{{ e.protocol }}</td>
+        <td>{% if e.authenticated %}yes{% else %}no{% endif %}</td>
+        <td class="ip">{{ e.wan_ip }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">No events recorded for this IP.</p>
+  {% endif %}
+</div>
+
 {% if submissions %}
-<div class="table-wrap">
-<table class="table-compact">
-  <thead><tr><th>Submitted</th><th>Vendor</th><th>Categories</th><th>Response</th><th>Result</th></tr></thead>
-  <tbody>
-    {% for s in submissions %}
-    <tr>
-      <td class="seen">{{ s.submitted_at }}</td>
-      <td>{{ s.vendor }}</td>
-      <td>{{ s.categories }}</td>
-      <td class="mono">{{ s.response_status }}</td>
-      <td>{% if s.success %}<span class="state-pill state-approved">Sent</span>{% else %}<span class="state-pill state-rejected">Failed</span>{% endif %}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+<div class="panel">
+  <div class="panel-head">Submission history</div>
+  <table class="table-compact">
+    <thead><tr><th>Submitted</th><th>Vendor</th><th>Categories</th><th>Response</th><th>Result</th></tr></thead>
+    <tbody>
+      {% for s in submissions %}
+      <tr>
+        <td class="seen">{{ s.submitted_at }}</td>
+        <td>{{ s.vendor }}</td>
+        <td>{{ s.categories }}</td>
+        <td class="mono">{{ s.response_status }}</td>
+        <td>{% if s.success %}<span class="state-pill state-approved">Sent</span>{% else %}<span class="state-pill state-rejected">Failed</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
 </div>
 {% else %}
-<p class="empty">No vendor submissions for this IP.</p>
+<p class="empty" style="margin-top:1.5rem">No vendor submissions for this IP.</p>
 {% endif %}
 {% endblock %}

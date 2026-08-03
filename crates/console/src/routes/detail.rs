@@ -50,7 +50,7 @@ use crate::AppState;
 use crate::auth::Session;
 use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
-use crate::routes::format::{format_relative_time, format_timestamp, tier_label};
+use crate::routes::format::{format_activity, format_relative_time, format_timestamp, tier_label};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/ip/{ip}", get(detail))
@@ -60,8 +60,7 @@ pub fn router() -> Router<AppState> {
 struct EvidenceRow {
     observed_at: String,
     relative_time: String,
-    sensor: String,
-    signal_type: String,
+    activity: String,
     protocol: String,
     authenticated: bool,
     wan_ip: String,
@@ -121,14 +120,24 @@ async fn detail(
     .await?;
     let mut evidence = Vec::with_capacity(evidence_rows.len());
     for row in evidence_rows {
+        let sensor: String = row.try_get("sensor")?;
         let signal_type: SignalType = row.try_get("signal_type")?;
         let protocol: Protocol = row.try_get("protocol")?;
         let observed_at: DateTime<Utc> = row.try_get("observed_at")?;
+        let signal_str = format!("{signal_type:?}");
+        let signal_snake = signal_str
+            .chars()
+            .fold(String::new(), |mut s, c| {
+                if c.is_uppercase() && !s.is_empty() {
+                    s.push('_');
+                }
+                s.push(c.to_ascii_lowercase());
+                s
+            });
         evidence.push(EvidenceRow {
             observed_at: format_timestamp(observed_at),
             relative_time: format_relative_time(observed_at),
-            sensor: row.try_get("sensor")?,
-            signal_type: format!("{signal_type:?}"),
+            activity: format_activity(&sensor, &signal_snake),
             protocol: format!("{protocol:?}"),
             authenticated: row.try_get("authenticated")?,
             wan_ip: row

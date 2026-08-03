@@ -41,7 +41,7 @@ use crate::auth::Session;
 use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
 use crate::routes::feed::read_manifest;
-use crate::routes::format::format_relative_time;
+use crate::routes::format::{format_activity, format_relative_time, format_sensor_label};
 use crate::routes::sparkline;
 
 pub fn router() -> Router<AppState> {
@@ -59,14 +59,13 @@ struct RecentSubmission {
 #[derive(Debug, Serialize)]
 struct RecentEvent {
     relative_time: String,
-    sensor: String,
-    signal_type: String,
+    activity: String,
     source_ip: String,
 }
 
 #[derive(Debug, Serialize)]
 struct ProtocolCount {
-    sensor: String,
+    label: String,
     count: i64,
 }
 
@@ -115,10 +114,11 @@ async fn dashboard(
     let mut recent_events = Vec::with_capacity(recent_event_rows.len());
     for row in recent_event_rows {
         let observed_at: chrono::DateTime<chrono::Utc> = row.try_get("observed_at")?;
+        let sensor: String = row.try_get("sensor")?;
+        let signal_type: String = row.try_get("signal_type")?;
         recent_events.push(RecentEvent {
             relative_time: format_relative_time(observed_at),
-            sensor: row.try_get("sensor")?,
-            signal_type: row.try_get("signal_type")?,
+            activity: format_activity(&sensor, &signal_type),
             source_ip: row.try_get("source_ip")?,
         });
     }
@@ -133,12 +133,13 @@ async fn dashboard(
     .unwrap_or_default();
     let mut protocol_dist = Vec::with_capacity(protocol_rows.len());
     for row in protocol_rows {
+        let sensor: String = row.try_get("sensor")?;
         protocol_dist.push(ProtocolCount {
-            sensor: row.try_get("sensor")?,
+            label: format_sensor_label(&sensor),
             count: row.try_get("cnt")?,
         });
     }
-    let proto_labels: Vec<String> = protocol_dist.iter().map(|p| p.sensor.clone()).collect();
+    let proto_labels: Vec<String> = protocol_dist.iter().map(|p| p.label.clone()).collect();
     let proto_data: Vec<i64> = protocol_dist.iter().map(|p| p.count).collect();
 
     // 24 hourly buckets, oldest to newest, zero-filled where an hour had no events - always
@@ -208,8 +209,8 @@ async fn dashboard(
         scored_trend_data.push(row.try_get("cnt")?);
     }
 
-    let events_sparkline = sparkline::render(&timeline_data, 120, 24, "#d99a3d");
-    let scored_sparkline = sparkline::render(&scored_trend_data, 120, 24, "#d99a3d");
+    let events_sparkline = sparkline::render(&timeline_data, 120, 24, "#3987e5");
+    let scored_sparkline = sparkline::render(&scored_trend_data, 120, 24, "#3987e5");
 
     // -1 signals "no data" (unconfigured, missing, or unparsable manifest) -> the template
     // displays "--"; `read_manifest` already collapses every one of those cases to `None`.

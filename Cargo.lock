@@ -1315,6 +1315,7 @@ dependencies = [
  "chrono",
  "core-scoring",
  "ipnet",
+ "review",
  "serde",
  "serde_json",
  "sha2 0.11.0",

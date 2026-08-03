@@ -19,6 +19,69 @@ pub(crate) fn tier_label(t: FeedTier) -> &'static str {
     }
 }
 
+/// Maps a raw sensor name to a display label for chart axes and table headers.
+pub(crate) fn format_sensor_label(sensor: &str) -> String {
+    match sensor {
+        "ssh" => "SSH".into(),
+        "ftp" => "FTP".into(),
+        "http" => "HTTP".into(),
+        "vnc" => "VNC".into(),
+        "redis" => "Redis".into(),
+        "mysql" => "MySQL".into(),
+        "postgresql" => "PostgreSQL".into(),
+        "mongodb" => "MongoDB".into(),
+        "catchall" | "catchall-sensor" => "General".into(),
+        other => {
+            let mut s = other.to_string();
+            if let Some(first) = s.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            s
+        }
+    }
+}
+
+/// Combines a sensor name and signal type into a plain-language activity label. The sensor
+/// provides the service context (SSH, FTP, Redis), the signal type describes what happened.
+pub(crate) fn format_activity(sensor: &str, signal_type: &str) -> String {
+    let service = match sensor {
+        "ssh" => "SSH".to_string(),
+        "ftp" => "FTP".to_string(),
+        "http" => "HTTP".to_string(),
+        "vnc" => "VNC".to_string(),
+        "redis" => "Redis".to_string(),
+        "mysql" => "MySQL".to_string(),
+        "postgresql" => "PostgreSQL".to_string(),
+        "mongodb" => "MongoDB".to_string(),
+        "catchall" | "catchall-sensor" => String::new(),
+        other => format_sensor_label(other),
+    };
+    let action = match signal_type {
+        "honeypot_login_attempt" => "login attempt",
+        "honeypot_connection" => "connection",
+        "honeypot_command_exec" => "command execution",
+        "honeypot_malware_upload" => "malware upload",
+        "honeypot_file_download" => "file download",
+        "ssh_brute_force" => "SSH brute force",
+        "port_scan" => "port scan",
+        "syn_flood" => "SYN flood",
+        "blocked_connection" => "blocked connection",
+        "waf_sqli_xss" => "SQLi/XSS attempt",
+        "waf_generic_block" => "WAF block",
+        "suricata_sev1" => "IDS alert (critical)",
+        "suricata_sev2" => "IDS alert (high)",
+        "suricata_sev3" => "IDS alert (medium)",
+        "catchall_probe" => "probe",
+        "remote_auth_failure" => "auth failure",
+        other => other,
+    };
+    if service.is_empty() || action.starts_with("SSH") || action.starts_with("IDS") {
+        action.to_string()
+    } else {
+        format!("{service} {action}")
+    }
+}
+
 /// Coarsens a UTC timestamp to "how long ago", in the largest whole unit that fits - used by the
 /// dashboard's recent-activity table, where an exact `format_timestamp` value is more precision
 /// than an operator scanning twenty rows needs.

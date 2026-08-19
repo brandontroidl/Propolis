@@ -50,10 +50,10 @@ impl DShield {
         let nonce_bytes: [u8; 8] = rand::random();
         let nonce = base64::engine::general_purpose::STANDARD.encode(nonce_bytes);
 
-        let msg = format!("{}{}", nonce, self.user_id);
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.api_key.as_bytes())
+        let hmac_key = format!("{}{}", nonce, self.user_id);
+        let mut mac = Hmac::<Sha256>::new_from_slice(hmac_key.as_bytes())
             .expect("HMAC accepts any key length");
-        mac.update(msg.as_bytes());
+        mac.update(self.api_key.as_bytes());
         let hash = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
 
         format!("ISC-HMAC-SHA256 Credentials={hash} Userid={} Nonce={nonce}", self.user_id)
@@ -127,6 +127,12 @@ impl VendorAdapter for DShield {
             .header("User-Agent", "Propolis/0.1")
             .json(&payload);
 
-        send_and_classify(builder).await
+        match send_and_classify(builder).await {
+            Ok(resp) if resp.body.starts_with("ERROR") => Err(VendorError::Permanent {
+                status: resp.status,
+                body: resp.body,
+            }),
+            other => other,
+        }
     }
 }

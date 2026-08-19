@@ -32,7 +32,10 @@ pub async fn scan_spool(
     config: &VtConfig,
     spool_dirs: &[(&str, PathBuf)],
 ) -> Vec<VtResult> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
     let mut results = Vec::new();
     let mut requests_today: u32 = 0;
 
@@ -130,7 +133,7 @@ async fn lookup_hash(
     }
     if status != 200 {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("VT returned {status}: {}", &body[..body.len().min(200)]));
+        return Err(format!("VT returned {status}: {}", body.chars().take(200).collect::<String>()));
     }
 
     let body: serde_json::Value = resp
@@ -188,7 +191,7 @@ async fn upload_sample(
         Ok(())
     } else {
         let body = resp.text().await.unwrap_or_default();
-        Err(format!("VT upload returned {status}: {}", &body[..body.len().min(200)]))
+        Err(format!("VT upload returned {status}: {}", body.chars().take(200).collect::<String>()))
     }
 }
 

@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "console"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2 0.5.3",
  "axum",
@@ -813,7 +813,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core-scoring"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -1313,7 +1313,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "feed"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "core-scoring",
@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "intake"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "core-scoring",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "propolis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "chrono",
@@ -3193,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "review"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -3778,7 +3778,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sensor-adb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-catchall"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "core-scoring",
@@ -3809,7 +3809,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-cred"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "sensor-framework",
@@ -3823,7 +3823,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-framework"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "sensor-wire",
@@ -3839,7 +3839,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-ftp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "sensor-framework",
@@ -3854,7 +3854,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "sensor-framework",
@@ -3868,7 +3868,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-redis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -3883,7 +3883,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-smtp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "sensor-framework",
@@ -3897,7 +3897,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-ssh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20 0.10.1",
  "chrono",
@@ -3921,7 +3921,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-telnet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -3936,7 +3936,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-wire"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",

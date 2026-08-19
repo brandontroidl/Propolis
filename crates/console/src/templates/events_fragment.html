@@ -1,0 +1,7 @@
+{% include "session_cards.html" %}
+{#- Out-of-band swap: htmx matches this by id anywhere in the current DOM regardless of the
+    request's own `hx-target`, so the "Load more" button that triggered this request is replaced
+    in place - with a fresh button carrying the next cursor, or with nothing once the last page has
+    been reached - while the session cards above land via the request's normal `beforeend` swap
+    into `#evidence-timeline`. `routes::detail`'s module doc comment explains the two-swap split. -#}
+<div id="load-more-container" hx-swap-oob="true">{% if has_more_events %}<button hx-get="/ip/{{ ip }}/events?cursor={{ next_cursor }}" hx-target="#evidence-timeline" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}</div>

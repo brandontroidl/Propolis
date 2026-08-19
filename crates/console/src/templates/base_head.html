@@ -178,6 +178,27 @@ h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 1.25rem; }
 .panel-head--orange { border-top: 2px solid var(--chart-orange); }
 .panel-head--alert { border-top: 2px solid var(--alert); }
 .panel-body { padding: 0.5rem 0.9rem 0.9rem; }
+
+/* -- Range selector (adjustable chart time windows, detail + dashboard charts) -- */
+.range-selector { display: flex; gap: 0.3rem; }
+.range-btn {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.15rem 0.5rem;
+  cursor: pointer;
+}
+.range-btn:hover { color: var(--text); border-color: var(--border-bright); text-decoration: none; }
+.range-btn.active { color: var(--brand); border-color: var(--brand); background: var(--attention-dim); }
+
+/* -- Evidence timeline "Load more" (detail page, HTMX cursor pagination) -- */
+#load-more-container { padding: 0.7rem 0.9rem; text-align: center; border-top: 1px solid var(--border); }
+#load-more-container:empty { display: none; }
+.load-more { width: 100%; max-width: 220px; }
 .panel .chart-box { height: 180px; margin: 0; }
 .panel .chart-box-sm { height: 200px; }
 .panel .chart-box-compact { height: 110px; margin: 0; }

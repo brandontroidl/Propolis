@@ -23,31 +23,43 @@
 //! through `AppError` (whose every variant renders a generic 503 - see that module's doc
 //! comment): a 404 here says something true and specific, a 503 would not.
 //!
-//! Chart (sub-project 6, console-charts, task 4): a per-IP 7-day event timeline, one more
-//! Chart.js chart fed by `Chart` (the global `routes::dashboard`'s templates already load). Its
-//! query is supplementary rather than core content - same soft-fail policy `routes::dashboard`'s
-//! own doc comment establishes for its charts ("a slow or errored chart query degrades to an
-//! empty chart... never a 503"), unlike this module's other four queries, which all hard-fail via
-//! `?`: an IP whose score/evidence/WAN/submission data cannot be read is a broken page, but one
-//! whose 7-day sparkline query hiccups is still a perfectly usable detail page minus one chart.
-//! `generate_series` zero-fills all 7 buckets unconditionally, so - like the dashboard's own main
-//! timeline - the chart always renders, never gated behind an empty-state check.
+//! Chart (sub-project 6, console-charts, task 4): a per-IP event timeline, one more Chart.js chart
+//! fed by `Chart` (the global `routes::dashboard`'s templates already load). Its query is
+//! supplementary rather than core content - same soft-fail policy `routes::dashboard`'s own doc
+//! comment establishes for its charts ("a slow or errored chart query degrades to an empty
+//! chart... never a 503"), unlike this module's other four queries, which all hard-fail via `?`:
+//! an IP whose score/evidence/WAN/submission data cannot be read is a broken page, but one whose
+//! timeline query hiccups is still a perfectly usable detail page minus one chart. `generate_series`
+//! zero-fills every bucket unconditionally, so - like the dashboard's own main timeline - the
+//! chart always renders, never gated behind an empty-state check. Defaults to a 7-day daily-bucket
+//! window (`detail`); `chart_fragment` (console-forensics task 4) serves the same series at an
+//! operator-adjustable range ("24h"/"7d"/"30d") as an HTMX fragment the range-selector buttons swap
+//! into `#detail-chart-container`, never re-rendering the whole page for a range change.
+//!
+//! Evidence timeline pagination (console-forensics task 4): `detail` renders only the first
+//! `EVIDENCE_PAGE_SIZE` rows; `events_fragment` serves subsequent pages via a `(observed_at, id)`
+//! keyset cursor - a plain `OFFSET` would re-scan and re-sort every prior page on each request and
+//! silently skip or duplicate rows if new events land between page loads, both avoided by keying on
+//! the last row actually rendered. The "Load more" button's response replaces itself (an HTMX
+//! out-of-band swap on `#load-more-container`) with either a fresh button carrying the next cursor
+//! or nothing, while the new rows themselves land via a normal `beforeend` swap into
+//! `#evidence-timeline` - see `templates/events_fragment.html`.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use core_scoring::{Category, Protocol, SignalType, effective_score, read_score};
 use minijinja::context;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{PgPool, Row};
 
 use crate::AppState;
 use crate::auth::Session;
@@ -58,8 +70,16 @@ use crate::routes::format::{
 };
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/ip/{ip}", get(detail))
+    Router::new()
+        .route("/ip/{ip}", get(detail))
+        .route("/ip/{ip}/events", get(events_fragment))
+        .route("/ip/{ip}/chart", get(chart_fragment))
 }
+
+/// Both `detail`'s initial page load and `events_fragment`'s subsequent pages fetch at most this
+/// many rows per query; a page coming back exactly this size is the "there may be more" signal
+/// (`fetch_evidence_rows`'s doc comment) - there is no separate `COUNT(*)` query.
+const EVIDENCE_PAGE_SIZE: i64 = 200;
 
 /// One `event` row as rendered in a session card's body (or the "Ungrouped events" table for
 /// pre-`session_id` rows). `activity` and `detail` are both pre-formatted display strings; the
@@ -160,44 +180,12 @@ async fn detail(
     let raw_f64 = score.raw_score.to_f64().unwrap_or(0.0);
     let effective_f64 = effective.to_f64().unwrap_or(0.0);
 
-    let evidence_rows = sqlx::query(
-        "SELECT id, host(wan_ip) AS wan_ip, sensor, signal_type, protocol, authenticated, \
-                observed_at, metadata, session_id::text AS session_id \
-         FROM event WHERE source_ip = $1::inet ORDER BY observed_at DESC LIMIT 200",
-    )
-    .bind(ip.to_string())
-    .fetch_all(&state.db)
-    .await?;
-    let mut all_events = Vec::with_capacity(evidence_rows.len());
-    for row in evidence_rows {
-        let sensor: String = row.try_get("sensor")?;
-        let signal_type: SignalType = row.try_get("signal_type")?;
-        let protocol: Protocol = row.try_get("protocol")?;
-        let observed_at: DateTime<Utc> = row.try_get("observed_at")?;
-        let metadata: serde_json::Value = row.try_get("metadata")?;
-        let signal_snake = signal_type_snake(signal_type);
-        let metadata_json =
-            serde_json::to_string_pretty(&metadata).unwrap_or_else(|_| "{}".to_string());
-        all_events.push(EventRow {
-            id: row.try_get("id")?,
-            observed_at: format_timestamp(observed_at),
-            relative_time: format_relative_time(observed_at),
-            activity: format_activity(&sensor, &signal_snake),
-            detail: extract_detail(&signal_snake, &metadata),
-            protocol: format!("{protocol:?}"),
-            authenticated: row.try_get("authenticated")?,
-            wan_ip: row
-                .try_get::<Option<String>, _>("wan_ip")?
-                .unwrap_or_else(|| "-".to_string()),
-            metadata_json,
-            session_id: row.try_get("session_id")?,
-            raw_observed_at: observed_at,
-            sensor_raw: sensor,
-            signal_type_raw: signal_snake,
-            metadata,
-        });
-    }
+    let all_events = fetch_evidence_rows(&state.db, ip, None).await?;
     let total_event_count = all_events.len();
+    let has_more_events = all_events.len() as i64 == EVIDENCE_PAGE_SIZE;
+    let next_cursor = all_events
+        .last()
+        .map(|e| format_cursor(e.raw_observed_at, e.id));
     let (sessions, ungrouped) = group_into_sessions(all_events, 3);
 
     let wan_rows = sqlx::query(
@@ -245,32 +233,13 @@ async fn detail(
         });
     }
 
-    // 7 daily buckets, oldest to newest, zero-filled where a day had no events for this IP -
-    // always exactly 7 rows (the `generate_series` bound is unconditional), matching the
-    // dashboard's own always-populated hourly timeline. Supplementary: soft-fails to an empty
-    // chart rather than the whole page, per the module doc comment.
-    let ip_timeline_rows = sqlx::query(
-        "SELECT bucket::date, COALESCE(cnt, 0) AS cnt \
-         FROM generate_series(current_date - interval '6 days', current_date, interval '1 day') AS bucket \
-         LEFT JOIN ( \
-             SELECT date_trunc('day', observed_at)::date AS day, COUNT(*) AS cnt \
-             FROM event \
-             WHERE source_ip = $1::inet AND observed_at >= current_date - interval '6 days' \
-             GROUP BY day \
-         ) sub ON sub.day = bucket::date \
-         ORDER BY bucket",
-    )
-    .bind(ip.to_string())
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let mut ip_timeline_labels: Vec<String> = Vec::with_capacity(ip_timeline_rows.len());
-    let mut ip_timeline_data: Vec<i64> = Vec::with_capacity(ip_timeline_rows.len());
-    for row in ip_timeline_rows {
-        let bucket: NaiveDate = row.try_get("bucket")?;
-        ip_timeline_labels.push(bucket.format("%b %-d").to_string());
-        ip_timeline_data.push(row.try_get("cnt")?);
-    }
+    // Default range: 7 daily buckets, oldest to newest, zero-filled where a day had no events for
+    // this IP - always exactly 7 rows (the `generate_series` bound is unconditional), matching
+    // the dashboard's own always-populated hourly timeline. Supplementary: soft-fails to an empty
+    // chart rather than the whole page, per the module doc comment. `chart_fragment` (below) reuses
+    // the same helper for the adjustable-range HTMX endpoint the "24h/7d/30d" buttons hit.
+    let (ip_timeline_labels, ip_timeline_data) = detail_daily_series(&state.db, ip, 6).await;
+    let current_range = "7d";
 
     let csrf_token = state
         .sessions
@@ -317,13 +286,283 @@ async fn detail(
         sessions,
         ungrouped,
         total_event_count,
+        has_more_events,
+        next_cursor,
         per_wan,
         categories,
         submissions,
         ip_timeline_labels,
         ip_timeline_data,
+        current_range,
     })?;
     Ok(Html(html).into_response())
+}
+
+/// `GET /ip/{ip}/events?cursor=<observed_at>,<id>` - the "Load more" HTMX endpoint for the
+/// evidence timeline (module doc comment). `cursor` is `None` on a malformed or unparsable value
+/// (fails closed: a bad cursor returns an empty fragment rather than guessing a start point that
+/// could duplicate or skip rows already on the page) as well as when the parameter is entirely
+/// absent, which real "Load more" clicks never send - the button's own `next_cursor` always comes
+/// from `format_cursor` - but a defensive default all the same.
+async fn events_fragment(
+    State(state): State<AppState>,
+    Path(ip): Path<IpAddr>,
+    Query(params): Query<EventsCursorQuery>,
+) -> Result<Html<String>, AppError> {
+    let cursor = match params.cursor.as_deref() {
+        None => None,
+        Some(raw) => match parse_cursor(raw) {
+            Some(c) => Some(c),
+            None => {
+                tracing::warn!(%ip, cursor = raw, "malformed events pagination cursor; returning empty fragment");
+                return Ok(Html(String::new()));
+            }
+        },
+    };
+
+    let events = fetch_evidence_rows(&state.db, ip, cursor).await?;
+    let has_more_events = events.len() as i64 == EVIDENCE_PAGE_SIZE;
+    let next_cursor = events
+        .last()
+        .map(|e| format_cursor(e.raw_observed_at, e.id));
+    // No auto-expanded card on a "Load more" page - `recent_expanded: 0` - unlike the initial
+    // page load's newest-first cards, these are all strictly older than what is already on
+    // screen, so none of them is "the current activity" an operator lands on an open view of.
+    let (sessions, ungrouped) = group_into_sessions(events, 0);
+
+    let tmpl = state.templates.get_template("events_fragment.html")?;
+    let html = tmpl.render(context! {
+        ip => ip.to_string(),
+        sessions,
+        ungrouped,
+        has_more_events,
+        next_cursor,
+    })?;
+    Ok(Html(html))
+}
+
+/// `GET /ip/{ip}/chart?range=<24h|7d|30d>` - the range-selector HTMX endpoint for the per-IP
+/// activity chart (module doc comment). Renders the same fragment template `detail`'s initial page
+/// load includes, so the two never drift into two different chart markups.
+async fn chart_fragment(
+    State(state): State<AppState>,
+    Path(ip): Path<IpAddr>,
+    Query(params): Query<ChartRangeQuery>,
+) -> Result<Html<String>, AppError> {
+    let current_range = normalize_detail_range(params.range.as_deref());
+    let (labels, data) = detail_chart_series(&state.db, ip, current_range).await;
+    let ip_timeline_labels = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".into());
+    let ip_timeline_data = serde_json::to_string(&data).unwrap_or_else(|_| "[]".into());
+
+    let tmpl = state.templates.get_template("detail_chart_fragment.html")?;
+    let html = tmpl.render(context! {
+        current_range,
+        ip_timeline_labels,
+        ip_timeline_data,
+    })?;
+    Ok(Html(html))
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsCursorQuery {
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartRangeQuery {
+    #[serde(default)]
+    range: Option<String>,
+}
+
+/// Normalizes the `?range=` query param to one of the three range-selector buttons
+/// (`templates/detail.html`'s `chart-range` selector); anything else - missing, malformed, or a
+/// value from a future/removed button - falls back to the same "7d" default `detail`'s own initial
+/// render uses, rather than erroring on an operator-editable query string.
+fn normalize_detail_range(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some("24h") => "24h",
+        Some("30d") => "30d",
+        _ => "7d",
+    }
+}
+
+async fn detail_chart_series(db: &PgPool, ip: IpAddr, range: &str) -> (Vec<String>, Vec<i64>) {
+    match range {
+        "24h" => detail_hourly_series(db, ip).await,
+        "30d" => detail_daily_series(db, ip, 29).await,
+        _ => detail_daily_series(db, ip, 6).await,
+    }
+}
+
+/// `days + 1` daily buckets (oldest to newest, zero-filled) for this IP's activity chart - shared
+/// by `detail`'s default 7-day render (`days: 6`) and `chart_fragment`'s "7d"/"30d" buttons.
+/// Soft-fails to two empty vectors on a query error, per the module doc comment's chart policy.
+async fn detail_daily_series(db: &PgPool, ip: IpAddr, days: i32) -> (Vec<String>, Vec<i64>) {
+    let rows = sqlx::query(
+        "SELECT bucket::date AS bucket, COALESCE(cnt, 0) AS cnt \
+         FROM generate_series(current_date - ($2::int * interval '1 day'), current_date, interval '1 day') AS bucket \
+         LEFT JOIN ( \
+             SELECT date_trunc('day', observed_at)::date AS day, COUNT(*) AS cnt \
+             FROM event \
+             WHERE source_ip = $1::inet AND observed_at >= current_date - ($2::int * interval '1 day') \
+             GROUP BY day \
+         ) sub ON sub.day = bucket::date \
+         ORDER BY bucket",
+    )
+    .bind(ip.to_string())
+    .bind(days)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Ok(bucket), Ok(cnt)) = (
+            row.try_get::<NaiveDate, _>("bucket"),
+            row.try_get::<i64, _>("cnt"),
+        ) else {
+            continue;
+        };
+        labels.push(bucket.format("%b %-d").to_string());
+        data.push(cnt);
+    }
+    (labels, data)
+}
+
+/// 24 hourly buckets (oldest to newest, zero-filled) for this IP's activity chart -
+/// `chart_fragment`'s "24h" button, mirroring `routes::dashboard`'s own site-wide hourly timeline
+/// query but scoped to one IP.
+async fn detail_hourly_series(db: &PgPool, ip: IpAddr) -> (Vec<String>, Vec<i64>) {
+    let rows = sqlx::query(
+        "SELECT bucket, COALESCE(cnt, 0) AS cnt \
+         FROM generate_series( \
+             date_trunc('hour', now()) - interval '23 hours', \
+             date_trunc('hour', now()), \
+             interval '1 hour' \
+         ) AS bucket \
+         LEFT JOIN ( \
+             SELECT date_trunc('hour', observed_at) AS hour, COUNT(*) AS cnt \
+             FROM event WHERE source_ip = $1::inet AND observed_at >= now() - interval '24 hours' \
+             GROUP BY hour \
+         ) sub ON sub.hour = bucket \
+         ORDER BY bucket",
+    )
+    .bind(ip.to_string())
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Ok(bucket), Ok(cnt)) = (
+            row.try_get::<DateTime<Utc>, _>("bucket"),
+            row.try_get::<i64, _>("cnt"),
+        ) else {
+            continue;
+        };
+        labels.push(bucket.format("%H:00").to_string());
+        data.push(cnt);
+    }
+    (labels, data)
+}
+
+/// Fetches up to [`EVIDENCE_PAGE_SIZE`] `event` rows for `ip`, newest first, optionally starting
+/// strictly after a `(observed_at, id)` keyset cursor (`detail`'s doc comment explains why keyset
+/// rather than `OFFSET`). Both `detail`'s first page and `events_fragment`'s subsequent ones call
+/// this - one query shape, one row-decoding path, so a future column addition only has to change
+/// one place. The `id` tiebreak in `ORDER BY` (added by console-forensics task 4; task 3's original
+/// query sorted on `observed_at` alone) is load-bearing for pagination correctness: several events
+/// can share the same `observed_at` value, and without a deterministic secondary sort a page
+/// boundary drawn between two same-timestamp rows could re-serve or skip one on the next page.
+async fn fetch_evidence_rows(
+    db: &PgPool,
+    ip: IpAddr,
+    cursor: Option<(DateTime<Utc>, i64)>,
+) -> Result<Vec<EventRow>, AppError> {
+    let rows =
+        match cursor {
+            Some((cursor_time, cursor_id)) => sqlx::query(
+                "SELECT id, host(wan_ip) AS wan_ip, sensor, signal_type, protocol, authenticated, \
+                        observed_at, metadata, session_id::text AS session_id \
+                 FROM event WHERE source_ip = $1::inet AND (observed_at, id) < ($2, $3) \
+                 ORDER BY observed_at DESC, id DESC LIMIT $4",
+            )
+            .bind(ip.to_string())
+            .bind(cursor_time)
+            .bind(cursor_id)
+            .bind(EVIDENCE_PAGE_SIZE)
+            .fetch_all(db)
+            .await?,
+            None => sqlx::query(
+                "SELECT id, host(wan_ip) AS wan_ip, sensor, signal_type, protocol, authenticated, \
+                        observed_at, metadata, session_id::text AS session_id \
+                 FROM event WHERE source_ip = $1::inet \
+                 ORDER BY observed_at DESC, id DESC LIMIT $2",
+            )
+            .bind(ip.to_string())
+            .bind(EVIDENCE_PAGE_SIZE)
+            .fetch_all(db)
+            .await?,
+        };
+
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let sensor: String = row.try_get("sensor")?;
+        let signal_type: SignalType = row.try_get("signal_type")?;
+        let protocol: Protocol = row.try_get("protocol")?;
+        let observed_at: DateTime<Utc> = row.try_get("observed_at")?;
+        let metadata: serde_json::Value = row.try_get("metadata")?;
+        let signal_snake = signal_type_snake(signal_type);
+        let metadata_json =
+            serde_json::to_string_pretty(&metadata).unwrap_or_else(|_| "{}".to_string());
+        events.push(EventRow {
+            id: row.try_get("id")?,
+            observed_at: format_timestamp(observed_at),
+            relative_time: format_relative_time(observed_at),
+            activity: format_activity(&sensor, &signal_snake),
+            detail: extract_detail(&signal_snake, &metadata),
+            protocol: format!("{protocol:?}"),
+            authenticated: row.try_get("authenticated")?,
+            wan_ip: row
+                .try_get::<Option<String>, _>("wan_ip")?
+                .unwrap_or_else(|| "-".to_string()),
+            metadata_json,
+            session_id: row.try_get("session_id")?,
+            raw_observed_at: observed_at,
+            sensor_raw: sensor,
+            signal_type_raw: signal_snake,
+            metadata,
+        });
+    }
+    Ok(events)
+}
+
+/// Parses a `?cursor=<observed_at>,<id>` value (`format_cursor`'s own output - see that function's
+/// doc comment for why the timestamp half is always `Z`-suffixed) back into the pair
+/// `fetch_evidence_rows` binds into its `(observed_at, id) < (...)` predicate. `None` on any
+/// malformed input; `events_fragment` fails closed on that rather than guessing a start point.
+fn parse_cursor(raw: &str) -> Option<(DateTime<Utc>, i64)> {
+    let (time_part, id_part) = raw.split_once(',')?;
+    let observed_at = DateTime::parse_from_rfc3339(time_part)
+        .ok()?
+        .with_timezone(&Utc);
+    let id = id_part.parse::<i64>().ok()?;
+    Some((observed_at, id))
+}
+
+/// Renders the keyset cursor for the row `(observed_at, id)` - the last row of a page - as the
+/// `?cursor=` value the next "Load more" click sends. Always forces the UTC `Z` suffix
+/// (`to_rfc3339_opts(.., true)`) rather than chrono's default `+00:00`: the button's `hx-get` href
+/// carries this string verbatim in a query string, and axum's `Query` extractor decodes query
+/// values as `application/x-www-form-urlencoded`, where an unescaped `+` means a literal space -
+/// `+00:00` would silently corrupt into `<space>00:00` and fail to parse back. No comma or `+`
+/// ever appears in the formatted output, so no URL-encoding is needed for the value to round-trip.
+fn format_cursor(observed_at: DateTime<Utc>, id: i64) -> String {
+    format!(
+        "{},{id}",
+        observed_at.to_rfc3339_opts(SecondsFormat::Micros, true)
+    )
 }
 
 /// Every category ever contributed for this IP, with its CURRENT (live-decayed) weight - not
@@ -795,5 +1034,53 @@ mod tests {
         let (groups, ungrouped) = group_into_sessions(rows, 3);
         assert!(groups.is_empty());
         assert_eq!(ungrouped.len(), 1);
+    }
+
+    #[test]
+    fn format_cursor_round_trips_through_parse_cursor() {
+        let observed_at = Utc::now() - Duration::seconds(12345);
+        let cursor = format_cursor(observed_at, 987);
+        let (parsed_time, parsed_id) = parse_cursor(&cursor).expect("cursor should parse");
+        // `to_rfc3339_opts` with `Micros` truncates below microsecond precision; `Utc::now()`
+        // itself is already sub-microsecond in practice on every platform this runs on, so a
+        // microsecond-level round-trip comparison is exact, not approximate.
+        assert_eq!(
+            parsed_time.timestamp_micros(),
+            observed_at.timestamp_micros()
+        );
+        assert_eq!(parsed_id, 987);
+    }
+
+    #[test]
+    fn format_cursor_never_emits_a_plus_sign() {
+        // A `+00:00` UTC offset (chrono's default `to_rfc3339` form) would decode as a literal
+        // space through axum's `application/x-www-form-urlencoded` `Query` extractor - see
+        // `format_cursor`'s doc comment. The forced `Z` suffix must never regress to `+00:00`.
+        let cursor = format_cursor(Utc::now(), 1);
+        assert!(
+            !cursor.contains('+'),
+            "cursor must not contain '+': {cursor}"
+        );
+        assert!(
+            cursor.ends_with("Z,1"),
+            "cursor must end in Z,<id>: {cursor}"
+        );
+    }
+
+    #[test]
+    fn parse_cursor_rejects_malformed_input() {
+        assert!(parse_cursor("not-a-timestamp,12").is_none());
+        assert!(parse_cursor("2026-01-01T00:00:00Z").is_none()); // missing ",<id>"
+        assert!(parse_cursor("2026-01-01T00:00:00Z,not-an-id").is_none());
+        assert!(parse_cursor("").is_none());
+    }
+
+    #[test]
+    fn normalize_detail_range_accepts_known_values_and_defaults_to_7d() {
+        assert_eq!(normalize_detail_range(Some("24h")), "24h");
+        assert_eq!(normalize_detail_range(Some("7d")), "7d");
+        assert_eq!(normalize_detail_range(Some("30d")), "30d");
+        assert_eq!(normalize_detail_range(Some("bogus")), "7d");
+        assert_eq!(normalize_detail_range(None), "7d");
     }
 }

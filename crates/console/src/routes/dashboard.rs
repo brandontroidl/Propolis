@@ -28,13 +28,13 @@
 //! page already uses elsewhere when their source list is empty (`protocol_dist` and the new
 //! `has_attackers` respectively) - an empty Chart.js canvas has nothing worth looking at.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::Html;
 use axum::routing::get;
 use axum::{Extension, Router};
 use minijinja::context;
-use serde::Serialize;
-use sqlx::Row;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
 
 use crate::AppState;
 use crate::auth::Session;
@@ -45,7 +45,9 @@ use crate::routes::format::{format_activity, format_relative_time, format_sensor
 use crate::routes::sparkline;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/", get(dashboard))
+    Router::new()
+        .route("/", get(dashboard))
+        .route("/dashboard/chart", get(dashboard_chart_fragment))
 }
 
 #[derive(Debug, Serialize)]
@@ -142,34 +144,13 @@ async fn dashboard(
     let proto_labels: Vec<String> = protocol_dist.iter().map(|p| p.label.clone()).collect();
     let proto_data: Vec<i64> = protocol_dist.iter().map(|p| p.count).collect();
 
-    // 24 hourly buckets, oldest to newest, zero-filled where an hour had no events - always
-    // exactly 24 rows (the `generate_series` bound is unconditional), so the timeline chart and
-    // the events sparkline below always have real (possibly all-zero) data, never an empty array.
-    let timeline_rows = sqlx::query(
-        "SELECT bucket, COALESCE(cnt, 0) AS cnt \
-         FROM generate_series( \
-             date_trunc('hour', now()) - interval '23 hours', \
-             date_trunc('hour', now()), \
-             interval '1 hour' \
-         ) AS bucket \
-         LEFT JOIN ( \
-             SELECT date_trunc('hour', observed_at) AS hour, COUNT(*) AS cnt \
-             FROM event \
-             WHERE observed_at >= now() - interval '24 hours' \
-             GROUP BY hour \
-         ) sub ON sub.hour = bucket \
-         ORDER BY bucket",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let mut timeline_labels: Vec<String> = Vec::with_capacity(timeline_rows.len());
-    let mut timeline_data: Vec<i64> = Vec::with_capacity(timeline_rows.len());
-    for row in timeline_rows {
-        let bucket: chrono::DateTime<chrono::Utc> = row.try_get("bucket")?;
-        timeline_labels.push(bucket.format("%H:00").to_string());
-        timeline_data.push(row.try_get("cnt")?);
-    }
+    // Default range: 24 hourly buckets, oldest to newest, zero-filled where an hour had no events
+    // - always exactly 24 rows (the `generate_series` bound is unconditional), so the timeline
+    // chart and the events sparkline below always have real (possibly all-zero) data, never an
+    // empty array. `dashboard_chart_fragment` (below) reuses the same helper for the
+    // adjustable-range HTMX endpoint the "1h/24h/7d/30d" buttons hit.
+    let (timeline_labels, timeline_data) = hourly_series(&state.db).await;
+    let current_range = "24h";
 
     let attacker_rows = sqlx::query(
         "SELECT host(source_ip) AS ip, raw_score::float8 AS score \
@@ -287,6 +268,181 @@ async fn dashboard(
         pending_count,
         uptime,
         version,
+        current_range,
     })?;
     Ok(Html(html))
+}
+
+/// `GET /dashboard/chart?range=<1h|24h|7d|30d>` - the range-selector HTMX endpoint for the
+/// dashboard's events timeline chart. Renders the same fragment template `dashboard`'s initial
+/// page load includes, so the two never drift into two different chart markups.
+async fn dashboard_chart_fragment(
+    State(state): State<AppState>,
+    Query(params): Query<ChartRangeQuery>,
+) -> Result<Html<String>, AppError> {
+    let current_range = normalize_dashboard_range(params.range.as_deref());
+    let (labels, data) = match current_range {
+        "1h" => five_minute_series(&state.db).await,
+        "7d" => daily_series(&state.db, 6).await,
+        "30d" => daily_series(&state.db, 29).await,
+        _ => hourly_series(&state.db).await,
+    };
+    let timeline_labels = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".into());
+    let timeline_data = serde_json::to_string(&data).unwrap_or_else(|_| "[]".into());
+
+    let tmpl = state
+        .templates
+        .get_template("dashboard_chart_fragment.html")?;
+    let html = tmpl.render(context! {
+        current_range,
+        timeline_labels,
+        timeline_data,
+    })?;
+    Ok(Html(html))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartRangeQuery {
+    #[serde(default)]
+    range: Option<String>,
+}
+
+/// Normalizes the `?range=` query param to one of the four range-selector buttons
+/// (`templates/dashboard.html`'s `dashboard-chart-range` selector); anything else - missing,
+/// malformed, or a value from a future/removed button - falls back to the same "24h" default
+/// `dashboard`'s own initial render uses, rather than erroring on an operator-editable query string.
+fn normalize_dashboard_range(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some("1h") => "1h",
+        Some("7d") => "7d",
+        Some("30d") => "30d",
+        _ => "24h",
+    }
+}
+
+/// 24 hourly buckets (oldest to newest, zero-filled), site-wide - the dashboard timeline's default
+/// range and the "24h" range-selector button. Soft-fails to two empty vectors on a query error,
+/// per the module doc comment's chart policy.
+async fn hourly_series(db: &PgPool) -> (Vec<String>, Vec<i64>) {
+    let rows = sqlx::query(
+        "SELECT bucket, COALESCE(cnt, 0) AS cnt \
+         FROM generate_series( \
+             date_trunc('hour', now()) - interval '23 hours', \
+             date_trunc('hour', now()), \
+             interval '1 hour' \
+         ) AS bucket \
+         LEFT JOIN ( \
+             SELECT date_trunc('hour', observed_at) AS hour, COUNT(*) AS cnt \
+             FROM event \
+             WHERE observed_at >= now() - interval '24 hours' \
+             GROUP BY hour \
+         ) sub ON sub.hour = bucket \
+         ORDER BY bucket",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Ok(bucket), Ok(cnt)) = (
+            row.try_get::<chrono::DateTime<chrono::Utc>, _>("bucket"),
+            row.try_get::<i64, _>("cnt"),
+        ) else {
+            continue;
+        };
+        labels.push(bucket.format("%H:00").to_string());
+        data.push(cnt);
+    }
+    (labels, data)
+}
+
+/// `days + 1` daily buckets (oldest to newest, zero-filled), site-wide - the "7d"/"30d"
+/// range-selector buttons.
+async fn daily_series(db: &PgPool, days: i32) -> (Vec<String>, Vec<i64>) {
+    let rows = sqlx::query(
+        "SELECT bucket::date AS bucket, COALESCE(cnt, 0) AS cnt \
+         FROM generate_series(current_date - ($1::int * interval '1 day'), current_date, interval '1 day') AS bucket \
+         LEFT JOIN ( \
+             SELECT date_trunc('day', observed_at)::date AS day, COUNT(*) AS cnt \
+             FROM event \
+             WHERE observed_at >= current_date - ($1::int * interval '1 day') \
+             GROUP BY day \
+         ) sub ON sub.day = bucket::date \
+         ORDER BY bucket",
+    )
+    .bind(days)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Ok(bucket), Ok(cnt)) = (
+            row.try_get::<chrono::NaiveDate, _>("bucket"),
+            row.try_get::<i64, _>("cnt"),
+        ) else {
+            continue;
+        };
+        labels.push(bucket.format("%b %-d").to_string());
+        data.push(cnt);
+    }
+    (labels, data)
+}
+
+/// 12 five-minute buckets (oldest to newest, zero-filled), site-wide - the "1h" range-selector
+/// button, the one range finer than an hourly bucket. `date_bin` (PostgreSQL 14+; this project
+/// targets current PostgreSQL - see `.github/workflows/ci.yml`'s `postgres:18` service image)
+/// aligns each bucket to a fixed 5-minute grid from an arbitrary UTC origin, the same way
+/// `date_trunc('hour', ..)` aligns the other ranges to the hour - without a shared origin, "now"
+/// rounded down to the nearest 5 minutes would drift by up to 4 minutes between the
+/// `generate_series` bound and each row's own bucket, silently misaligning some events into the
+/// wrong bucket.
+async fn five_minute_series(db: &PgPool) -> (Vec<String>, Vec<i64>) {
+    let rows = sqlx::query(
+        "SELECT bucket, COALESCE(cnt, 0) AS cnt \
+         FROM generate_series( \
+             date_bin('5 minutes', now(), TIMESTAMPTZ '2000-01-01 00:00:00+00') - interval '55 minutes', \
+             date_bin('5 minutes', now(), TIMESTAMPTZ '2000-01-01 00:00:00+00'), \
+             interval '5 minutes' \
+         ) AS bucket \
+         LEFT JOIN ( \
+             SELECT date_bin('5 minutes', observed_at, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS slot, COUNT(*) AS cnt \
+             FROM event \
+             WHERE observed_at >= now() - interval '1 hour' \
+             GROUP BY slot \
+         ) sub ON sub.slot = bucket \
+         ORDER BY bucket",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Ok(bucket), Ok(cnt)) = (
+            row.try_get::<chrono::DateTime<chrono::Utc>, _>("bucket"),
+            row.try_get::<i64, _>("cnt"),
+        ) else {
+            continue;
+        };
+        labels.push(bucket.format("%H:%M").to_string());
+        data.push(cnt);
+    }
+    (labels, data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_dashboard_range_accepts_known_values_and_defaults_to_24h() {
+        assert_eq!(normalize_dashboard_range(Some("1h")), "1h");
+        assert_eq!(normalize_dashboard_range(Some("24h")), "24h");
+        assert_eq!(normalize_dashboard_range(Some("7d")), "7d");
+        assert_eq!(normalize_dashboard_range(Some("30d")), "30d");
+        assert_eq!(normalize_dashboard_range(Some("bogus")), "24h");
+        assert_eq!(normalize_dashboard_range(None), "24h");
+    }
 }

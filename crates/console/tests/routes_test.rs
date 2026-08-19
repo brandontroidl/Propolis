@@ -1694,6 +1694,351 @@ async fn detail_mixes_session_cards_with_ungrouped_events(pool: PgPool) {
     );
 }
 
+/// Extracts the `?cursor=...` value from a "Load more" button's `hx-get` attribute in a rendered
+/// detail page or events fragment - `routes::detail::format_cursor`'s output, HTML-attribute
+/// position. Colons, dots, and commas are never HTML-escaped by minijinja (only
+/// `< > & " ' /`), so the raw cursor string appears verbatim between `cursor=` and the closing
+/// quote - no unescaping needed.
+fn extract_next_cursor(body: &str, ip: &str) -> String {
+    let marker = format!("/ip/{ip}/events?cursor=");
+    let start = body
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no Load more button (cursor href) found in body: {body}"))
+        + marker.len();
+    let rest = &body[start..];
+    let end = rest
+        .find('"')
+        .expect("cursor value in hx-get attribute must be quoted");
+    rest[..end].to_string()
+}
+
+// --- detail: evidence timeline pagination (console-forensics task 4) ---
+
+#[sqlx::test(migrations = false)]
+async fn detail_evidence_timeline_paginates_past_the_first_page(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.70";
+    let now = chrono::Utc::now();
+    // 205 events, strictly increasing timestamps (index 0 oldest, index 204 newest, one second
+    // apart) - 5 more than `EVIDENCE_PAGE_SIZE` (200, `routes::detail`'s private constant; mirrored
+    // here as a literal since it is not part of this crate's public API). The first page (`GET
+    // /ip/{ip}`) must show only the newest 200 (indices 5..=204); the remaining 5 oldest
+    // (indices 0..=4) must appear only via the "Load more" fragment.
+    for i in 0..205i64 {
+        let session_id = Uuid::now_v7();
+        append_event(
+            &pool,
+            ev_with_session(
+                ip,
+                "ssh-sensor",
+                SignalType::HoneypotCommandExec,
+                Protocol::Tcp,
+                true,
+                &(now - chrono::Duration::seconds(205 - i)).to_rfc3339(),
+                // The `-end` suffix guards against substring false-positives: without it,
+                // `pg-marker-4` is itself a substring of `pg-marker-40`..`pg-marker-49`, so a
+                // `!body.contains("pg-marker-4")` assertion would wrongly fail as soon as any of
+                // those (all on the first page) rendered.
+                serde_json::json!({ "command": format!("pg-marker-{i}-end") }),
+                session_id,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+
+    let first_page = app
+        .clone()
+        .oneshot(get_request(&format!("/ip/{ip}"), Some(&cookie_header)))
+        .await
+        .unwrap();
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_body = body_text(first_page).await;
+    assert!(
+        first_body.contains("pg-marker-204-end"),
+        "newest event must be on the first page: {first_body}"
+    );
+    assert!(
+        !first_body.contains("pg-marker-4-end"),
+        "the 5 oldest events must NOT be on the first page: {first_body}"
+    );
+    assert!(
+        first_body.contains(r#"id="load-more-container""#),
+        "expected a Load more container when more than 200 events exist: {first_body}"
+    );
+
+    let cursor = extract_next_cursor(&first_body, ip);
+    let second_page = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}/events?cursor={cursor}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_page.status(), StatusCode::OK);
+    let second_body = body_text(second_page).await;
+    for i in 0..5 {
+        assert!(
+            second_body.contains(&format!("pg-marker-{i}-end")),
+            "expected the 5 oldest events (index {i}) on the second page: {second_body}"
+        );
+    }
+    assert!(
+        !second_body.contains("pg-marker-204-end"),
+        "the newest (first-page) event must not be re-sent on the second page: {second_body}"
+    );
+    assert!(
+        !second_body.contains("<!doctype html>"),
+        "an HTMX fragment must not carry the full base-page wrapper: {second_body}"
+    );
+    // Exactly 205 events total, so the second page (5 rows) is the last one: its own "Load more"
+    // out-of-band swap must be empty, not a fresh button.
+    assert!(
+        !second_body.contains("class=\"load-more\""),
+        "the last page must not offer a further Load more button: {second_body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_evidence_timeline_omits_load_more_under_the_page_size(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.71", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.71",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("class=\"load-more\""),
+        "fewer than 200 events must not show a Load more button: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn events_fragment_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/ip/203.0.113.72/events", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn events_fragment_malformed_cursor_returns_an_empty_fragment(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.73", 60).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.73/events?cursor=not-a-valid-cursor",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    // Fails closed (`routes::detail::events_fragment`'s doc comment): a malformed cursor never
+    // guesses a start point, it returns an empty 200 rather than a 500 or leaking the wrong page.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert_eq!(body, "", "a malformed cursor must yield an empty fragment");
+}
+
+// --- detail: adjustable chart time range (console-forensics task 4) ---
+
+#[sqlx::test(migrations = false)]
+async fn detail_chart_fragment_24h_range_returns_hourly_buckets(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.74";
+    append_event(
+        &pool,
+        ev(
+            ip,
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}/chart?range=24h"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per hour, last 24 hours""#),
+        "expected the 24h range's hourly aria-label: {body}"
+    );
+    assert!(
+        body.contains(r#"<canvas id="chart-ip-timeline""#),
+        "chart canvas missing from the range fragment: {body}"
+    );
+    assert!(
+        !body.contains("<!doctype html>"),
+        "an HTMX fragment must not carry the full base-page wrapper: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_chart_fragment_unknown_range_falls_back_to_7d(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.75", 60).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.75/chart?range=not-a-real-range",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per day, last 7 days""#),
+        "an unrecognized range must fall back to the page's own 7d default: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_chart_fragment_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/ip/203.0.113.76/chart?range=24h", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+// --- dashboard: adjustable chart time range (console-forensics task 4) ---
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_chart_fragment_1h_range_returns_five_minute_buckets(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.77",
+            "cowrie",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/dashboard/chart?range=1h",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per 5 minutes, last hour""#),
+        "expected the 1h range's five-minute aria-label: {body}"
+    );
+    assert!(
+        body.contains(r#"<canvas id="timelineChart""#),
+        "chart canvas missing from the range fragment: {body}"
+    );
+    assert!(
+        !body.contains("<!doctype html>"),
+        "an HTMX fragment must not carry the full base-page wrapper: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_chart_fragment_30d_range_returns_daily_buckets(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/dashboard/chart?range=30d",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per day, last 30 days""#),
+        "expected the 30d range's daily aria-label: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_chart_fragment_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/dashboard/chart?range=24h", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
 // --- feed ---
 
 #[sqlx::test(migrations = false)]

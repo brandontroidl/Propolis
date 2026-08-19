@@ -2,39 +2,11 @@
 <div class="chart-box">
   <canvas id="timelineChart" role="img" aria-label="{{ chart_aria }}"></canvas>
 </div>
-<script type="application/json" id="timeline-labels">{{ timeline_labels|safe }}</script>
-<script type="application/json" id="timeline-data">{{ timeline_data|safe }}</script>
-<script>
-(function () {
-    var existing = Chart.getChart('timelineChart');
-    if (existing) existing.destroy();
-    new Chart(document.getElementById('timelineChart'), {
-        type: 'line',
-        data: {
-            labels: JSON.parse(document.getElementById('timeline-labels').textContent),
-            datasets: [{
-                data: JSON.parse(document.getElementById('timeline-data').textContent),
-                borderColor: '#3987e5',
-                backgroundColor: 'rgba(57, 135, 229, 0.08)',
-                borderWidth: 2,
-                fill: true,
-                tension: 0,
-                pointRadius: 0,
-                pointHoverRadius: 4,
-                pointHoverBackgroundColor: '#3987e5',
-                pointHoverBorderColor: '#0f1417',
-                pointHoverBorderWidth: 2,
-            }],
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { grid: { display: false } },
-                y: { beginAtZero: true, ticks: { precision: 0 } },
-            },
-            plugins: { tooltip: { displayColors: false } },
-        },
-    });
-})();
-</script>
+<div id="timeline-labels" style="display:none">{{ timeline_labels|safe }}</div>
+<div id="timeline-data" style="display:none">{{ timeline_data|safe }}</div>
+<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" onload="
+  var el=document.getElementById('timelineChart');
+  var existing=Chart.getChart(el);
+  if(existing)existing.destroy();
+  new Chart(el,{type:'line',data:{labels:JSON.parse(document.getElementById('timeline-labels').textContent),datasets:[{data:JSON.parse(document.getElementById('timeline-data').textContent),borderColor:'#3987e5',backgroundColor:'rgba(57,135,229,0.08)',borderWidth:2,fill:true,tension:0,pointRadius:0,pointHoverRadius:4,pointHoverBackgroundColor:'#3987e5',pointHoverBorderColor:'#0f1417',pointHoverBorderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{grid:{display:false}},y:{beginAtZero:true,ticks:{precision:0}}},plugins:{tooltip:{displayColors:false}}}});
+" width="1" height="1" style="display:none">

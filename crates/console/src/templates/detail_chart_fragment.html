@@ -2,38 +2,11 @@
 <div class="chart-box-compact">
   <canvas id="chart-ip-timeline" role="img" aria-label="{{ chart_aria }}"></canvas>
 </div>
-<script type="application/json" id="ip-timeline-labels">{{ ip_timeline_labels|safe }}</script>
-<script type="application/json" id="ip-timeline-data">{{ ip_timeline_data|safe }}</script>
-<script>
-(function () {
-    var existing = Chart.getChart('chart-ip-timeline');
-    if (existing) existing.destroy();
-    new Chart(document.getElementById('chart-ip-timeline'), {
-        type: 'line',
-        data: {
-            labels: JSON.parse(document.getElementById('ip-timeline-labels').textContent),
-            datasets: [{
-                data: JSON.parse(document.getElementById('ip-timeline-data').textContent),
-                borderColor: '#3987e5',
-                backgroundColor: 'rgba(57, 135, 229, 0.08)',
-                borderWidth: 2,
-                fill: true,
-                pointRadius: 3,
-                pointBackgroundColor: '#3987e5',
-                pointBorderColor: '#0f1417',
-                pointBorderWidth: 2,
-                tension: 0.3
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: { grid: { display: false } },
-                y: { beginAtZero: true, ticks: { precision: 0 } }
-            },
-            plugins: { tooltip: { displayColors: false } }
-        }
-    });
-})();
-</script>
+<div id="ip-timeline-labels" style="display:none">{{ ip_timeline_labels|safe }}</div>
+<div id="ip-timeline-data" style="display:none">{{ ip_timeline_data|safe }}</div>
+<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" onload="
+  var el=document.getElementById('chart-ip-timeline');
+  var existing=Chart.getChart(el);
+  if(existing)existing.destroy();
+  new Chart(el,{type:'line',data:{labels:JSON.parse(document.getElementById('ip-timeline-labels').textContent),datasets:[{data:JSON.parse(document.getElementById('ip-timeline-data').textContent),borderColor:'#3987e5',backgroundColor:'rgba(57,135,229,0.08)',borderWidth:2,fill:true,pointRadius:3,pointBackgroundColor:'#3987e5',pointBorderColor:'#0f1417',pointBorderWidth:2,tension:0.3}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{grid:{display:false}},y:{beginAtZero:true,ticks:{precision:0}}},plugins:{tooltip:{displayColors:false}}}});
+" width="1" height="1" style="display:none">

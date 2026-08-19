@@ -45,6 +45,9 @@ const SESSION_CARDS_HTML: &str = include_str!("templates/session_cards.html");
 const EVENTS_FRAGMENT_HTML: &str = include_str!("templates/events_fragment.html");
 const DETAIL_CHART_FRAGMENT_HTML: &str = include_str!("templates/detail_chart_fragment.html");
 const DASHBOARD_CHART_FRAGMENT_HTML: &str = include_str!("templates/dashboard_chart_fragment.html");
+const SEARCH_HTML: &str = include_str!("templates/search.html");
+const SEARCH_EVENTS_ROWS_HTML: &str = include_str!("templates/search_events_rows.html");
+const SEARCH_EVENTS_FRAGMENT_HTML: &str = include_str!("templates/search_events_fragment.html");
 
 /// Builds the environment once at startup (`AppState::templates`); cheap to construct (five small
 /// templates) but shared via `Arc` so the source is parsed exactly once per process rather than
@@ -81,6 +84,14 @@ pub fn environment() -> Environment<'static> {
         DASHBOARD_CHART_FRAGMENT_HTML,
     )
     .expect("dashboard_chart_fragment.html must be a valid template");
+    // Console-forensics task 5: event/IP search page plus its own load-more fragment pair, same
+    // full-page/fragment split as `session_cards.html`/`events_fragment.html` above.
+    env.add_template("search.html", SEARCH_HTML)
+        .expect("search.html must be a valid template");
+    env.add_template("search_events_rows.html", SEARCH_EVENTS_ROWS_HTML)
+        .expect("search_events_rows.html must be a valid template");
+    env.add_template("search_events_fragment.html", SEARCH_EVENTS_FRAGMENT_HTML)
+        .expect("search_events_fragment.html must be a valid template");
     env
 }
 

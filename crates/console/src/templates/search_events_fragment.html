@@ -1,0 +1,6 @@
+{% include "search_events_rows.html" %}
+{#- Out-of-band swap, same two-swap split `events_fragment.html` uses (see `routes::detail`'s
+    module doc comment): the rows above land via the request's own `beforeend` swap into
+    `#search-results-body`, while this replaces the "Load more" button in place - with a fresh
+    button carrying the next cursor, or with nothing once the last page has been reached. -#}
+<div id="load-more-container" hx-swap-oob="true">{% if has_more %}<button hx-get="/search/events" hx-include="#search-filter-form" hx-vals='{"cursor": "{{ next_cursor }}"}' hx-target="#search-results-body" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}</div>

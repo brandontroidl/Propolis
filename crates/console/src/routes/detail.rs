@@ -542,7 +542,9 @@ async fn fetch_evidence_rows(
 /// doc comment for why the timestamp half is always `Z`-suffixed) back into the pair
 /// `fetch_evidence_rows` binds into its `(observed_at, id) < (...)` predicate. `None` on any
 /// malformed input; `events_fragment` fails closed on that rather than guessing a start point.
-fn parse_cursor(raw: &str) -> Option<(DateTime<Utc>, i64)> {
+/// `pub(crate)` because `routes::search` (console-forensics task 5) reuses the same cursor
+/// encoding for event search pagination - see that module's doc comment.
+pub(crate) fn parse_cursor(raw: &str) -> Option<(DateTime<Utc>, i64)> {
     let (time_part, id_part) = raw.split_once(',')?;
     let observed_at = DateTime::parse_from_rfc3339(time_part)
         .ok()?
@@ -558,7 +560,7 @@ fn parse_cursor(raw: &str) -> Option<(DateTime<Utc>, i64)> {
 /// values as `application/x-www-form-urlencoded`, where an unescaped `+` means a literal space -
 /// `+00:00` would silently corrupt into `<space>00:00` and fail to parse back. No comma or `+`
 /// ever appears in the formatted output, so no URL-encoding is needed for the value to round-trip.
-fn format_cursor(observed_at: DateTime<Utc>, id: i64) -> String {
+pub(crate) fn format_cursor(observed_at: DateTime<Utc>, id: i64) -> String {
     format!(
         "{},{id}",
         observed_at.to_rfc3339_opts(SecondsFormat::Micros, true)
@@ -588,7 +590,9 @@ fn category_rows(breakdown: &serde_json::Value) -> Vec<CategoryRow> {
 /// DB's `signal_type_enum` and this module's own `extract_detail`/`format_activity` match arms
 /// both key on the wire's `snake_case` spelling (`honeypot_command_exec`), so every caller that
 /// needs the string form converts through here rather than re-deriving the fold independently.
-fn signal_type_snake(signal_type: SignalType) -> String {
+/// `pub(crate)` because `routes::search` (console-forensics task 5) reuses it for the same
+/// conversion on event search result rows.
+pub(crate) fn signal_type_snake(signal_type: SignalType) -> String {
     let pascal = format!("{signal_type:?}");
     pascal.chars().fold(String::new(), |mut s, c| {
         if c.is_uppercase() && !s.is_empty() {

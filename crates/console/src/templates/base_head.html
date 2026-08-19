@@ -76,6 +76,18 @@ a:hover { color: var(--brand-hover); text-decoration: underline; }
 .topnav .right { margin-left: auto; display: flex; align-items: center; gap: 1rem; }
 .badge { background: var(--brand); color: #1a1006; font-size: 0.65rem; font-weight: 700; padding: 0.1rem 0.4rem; border-radius: 3px; margin-left: 0.3rem; font-family: var(--font-mono); }
 .nav-meta { font-size: 0.72rem; }
+
+/* -- Nav bar search (console-forensics task 5) -- */
+.nav-search input[type="text"] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.78rem;
+  width: 170px;
+}
+.nav-search input[type="text"]:focus { border-color: var(--border-bright); outline: none; }
 main {
   max-width: 1100px;
   margin: 0 auto;
@@ -335,6 +347,34 @@ button:hover { border-color: var(--text-muted); }
 .btn-reject:hover { background: var(--alert-dim); }
 .btn-snooze { border-color: var(--info); color: var(--info-text); }
 .btn-snooze:hover { background: var(--info-dim); }
+
+/* -- Search filter form (console-forensics task 5) -- */
+.filter-form {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.9rem 1rem;
+  margin-bottom: 0.75rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 0.8rem;
+  align-items: flex-end;
+}
+.filter-form .field { display: flex; flex-direction: column; gap: 0.25rem; }
+.filter-form label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+.filter-form input[type="text"],
+.filter-form input[type="date"],
+.filter-form select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 0.4rem 0.55rem;
+  font-size: 0.82rem;
+}
+.filter-form input:focus,
+.filter-form select:focus { border-color: var(--border-bright); outline: none; }
+.search-mode-tabs { margin-bottom: 1rem; }
 
 /* -- Empty states -- */
 .empty { color: var(--text-muted); padding: 2rem 1rem; text-align: center; border: 1px dashed var(--border); border-radius: 6px; }

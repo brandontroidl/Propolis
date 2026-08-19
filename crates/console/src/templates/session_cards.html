@@ -1,5 +1,5 @@
 {% for session in sessions %}
-<details class="session-card" {% if session.expanded %}open{% endif %}>
+<details class="session-card" id="session-{{ session.session_id }}" {% if session.expanded %}open{% endif %}>
   <summary class="session-header">
     <span class="session-time mono">{{ session.start_time }}</span>
     <span class="dim">{{ session.start_relative }}</span>

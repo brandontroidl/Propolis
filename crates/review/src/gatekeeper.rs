@@ -15,7 +15,7 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
-use core_scoring::IpScore;
+use core_scoring::{IpScore, is_reserved_ip};
 
 /// Per-vendor gate configuration: the fields the check sequence reads.
 ///
@@ -54,6 +54,10 @@ pub enum GateResult {
 /// diagnosable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GateReason {
+    /// The address is in a reserved or special-purpose range (RFC1918, loopback, link-local,
+    /// documentation, multicast, IPv6 ULA...) and must never be reported to a third party,
+    /// regardless of score, approval, or configuration. Not operator-overridable.
+    Reserved,
     Disabled,
     Cooldown,
     RateLimit,
@@ -72,6 +76,17 @@ pub async fn check(
     config: &VendorConfig,
     current_score: &IpScore,
 ) -> GateResult {
+    // FIRST, and ahead of every operator-configurable check: an address in a reserved range must
+    // never leave this system, whatever the score says and whoever approved it. The blocklist feed
+    // has always filtered these (twice - at build and again at publish); this path had no such
+    // guard, so an operator's own RFC1918 host could earn `recommended_for_vendor` from routine
+    // sensor testing and be one approval away from being reported to three public vendors as an
+    // attacker. Deliberately not overridable by config: there is no legitimate reason to report
+    // one of these to a third party.
+    if is_reserved_ip(ip) {
+        return GateResult::Held(GateReason::Reserved);
+    }
+
     if !config.enabled {
         return GateResult::Held(GateReason::Disabled);
     }

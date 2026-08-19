@@ -23,6 +23,7 @@
 
 pub mod domain;
 mod hashing;
+pub mod net;
 pub mod repository;
 mod scoring;
 
@@ -32,4 +33,5 @@ pub use domain::weights::{SignalWeight, signal_weight};
 pub use repository::{
     ChainStatus, RepoError, append_event, read_score, rebuild_projection, verify_chain,
 };
+pub use net::is_reserved_ip;
 pub use scoring::breadth::effective_score;

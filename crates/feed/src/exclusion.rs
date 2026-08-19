@@ -5,52 +5,13 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::LazyLock;
 
 use ipnet::IpNet;
 
-/// Special-purpose ranges no blocklist entry may ever carry, regardless of operator
-/// configuration: RFC1918 private space, RFC5737 documentation ranges, loopback, link-local,
-/// multicast, the limited broadcast address, and their IPv6 equivalents (loopback, link-local,
-/// unique-local, multicast, and the documentation range). Fixed and not operator-configurable,
-/// so this is computed once and shared by every `ExclusionEngine` instance.
-static RESERVED_RANGES: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
-    [
-        // RFC1918 private address space.
-        "10.0.0.0/8",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        // RFC5737 documentation ranges (TEST-NET-1/2/3).
-        "192.0.2.0/24",
-        "198.51.100.0/24",
-        "203.0.113.0/24",
-        // Loopback.
-        "127.0.0.0/8",
-        "::1/128",
-        // Link-local.
-        "169.254.0.0/16",
-        "fe80::/10",
-        // Multicast.
-        "224.0.0.0/4",
-        "ff00::/8",
-        // Limited broadcast.
-        "255.255.255.255/32",
-        // IPv6 unique local addresses (ULA).
-        "fc00::/7",
-        // IPv6 documentation range.
-        "2001:db8::/32",
-    ]
-    .iter()
-    .map(|s| {
-        s.parse()
-            .expect("hardcoded reserved-range literal must parse")
-    })
-    .collect()
-});
-
-fn is_reserved(ip: IpAddr) -> bool {
-    RESERVED_RANGES.iter().any(|net| net.contains(&ip))
-}
+/// The reserved-range table now lives in `core_scoring::net` so the vendor submission path can
+/// apply the identical rule - it previously had no such guard at all. This is a delegation, not a
+/// second definition: one list, both outbound paths.
+use core_scoring::is_reserved_ip as is_reserved;
 
 /// Fail-closed address filter. `is_excluded` is a total, infallible function over
 /// already-validated in-memory data, so there is no "cannot evaluate" outcome at this layer - an

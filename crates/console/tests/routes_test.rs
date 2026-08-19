@@ -2381,6 +2381,194 @@ async fn feed_unauthenticated_redirects_to_login(pool: PgPool) {
     assert_eq!(response.headers().get("location").unwrap(), "/login");
 }
 
+#[sqlx::test(migrations = false)]
+async fn feed_entries_tab_lists_only_approved_recommended_ips_under_their_tier(pool: PgPool) {
+    migrate(&pool).await;
+    // Approved + recommended: must appear, under its (Standard) tier.
+    seed_recommended(&pool, "203.0.113.70", 60).await;
+    // Recommended but still PENDING (never approved): must be omitted - the entries query joins
+    // on `rq.state = 'approved'`, not merely `recommended_for_blocklist`.
+    seed_recommended(&pool, "203.0.113.71", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":0,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":1,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}}}"#,
+    )
+    .unwrap();
+    let state = test_state_with_feed_dir(pool.clone(), Some(tmp.path().to_path_buf()));
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.70/approve",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed?tab=entries",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<a href="/ip/203.0.113.70">203.0.113.70</a>"#),
+        "approved+recommended IP missing a detail-page link: {body}"
+    );
+    assert!(
+        !body.contains("203.0.113.71"),
+        "still-pending IP must not appear in the entries tab: {body}"
+    );
+    let standard_panel = body
+        .find("Standard tier")
+        .expect("Standard tier panel missing");
+    let ip_pos = body
+        .find("203.0.113.70")
+        .expect("approved IP missing from body");
+    assert!(
+        ip_pos > standard_panel,
+        "203.0.113.70 (raw ~85, Standard tier) must render under the Standard tier panel: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_entries_tab_shows_awaiting_build_state_when_no_manifest(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // No manifest.json written and no entries approved: entries tab must show the same
+    // "awaiting first build" empty state as the status tab, per the design's framing of this tab
+    // as listing "the actual IPs in the current published feed" - there is no published feed yet.
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed?tab=entries",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">feed enabled - awaiting first build</p>"#),
+        "expected the awaiting-first-build empty state on the entries tab: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_returns_file_content_with_correct_type(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("aggressive.json"), r#"{"entries":[]}"#).unwrap();
+    std::fs::write(tmp.path().join("standard.csv"), "ip,score\n").unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/feed/download/aggressive/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let body = body_text(response).await;
+    assert_eq!(body, r#"{"entries":[]}"#);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed/download/standard/csv",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-type").unwrap(), "text/csv");
+    let body = body_text(response).await;
+    assert_eq!(body, "ip,score\n");
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_404s_when_feed_disabled(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed/download/aggressive/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_404s_on_unknown_tier_or_format(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("aggressive.json"), "{}").unwrap();
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/feed/download/nonsense/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/feed/download/aggressive/exe",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // The manifest exists but this particular file was never written (e.g. a build that failed
+    // partway) - still 404, not a 503 or a panic.
+    let response = app
+        .oneshot(get_request(
+            "/feed/download/standard/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 // --- metrics ---
 
 #[sqlx::test(migrations = false)]

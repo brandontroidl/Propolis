@@ -2,32 +2,103 @@
 {% block title %}Feed status - Propolis{% endblock %}
 {% block content %}
 <h1>Feed status</h1>
-{% if has_build %}
-<div class="stat-row">
-  <div class="stat-card stat-card--good">
-    <div class="label">Last build</div>
-    <div class="value seen" style="font-size:1.1rem">{{ build_time }}</div>
-  </div>
+<div class="tab-bar">
+  {% for tab_name in ["status", "entries"] %}
+  <a href="/feed?tab={{ tab_name }}" class="tab {% if tab == tab_name %}active{% endif %}">{{ tab_name | capitalize }}</a>
+  {% endfor %}
 </div>
-<div class="panel">
-  <div class="panel-head">Entry counts by tier</div>
-  <table>
-    <thead><tr><th>Tier</th><th>Entries</th><th>Valid until</th></tr></thead>
-    <tbody>
-      <tr>
-        <td><span class="tier tier-aggressive">Aggressive</span></td>
-        <td class="mono">{{ aggressive_count }}</td>
-        <td class="seen">{{ aggressive_valid_until }}</td>
-      </tr>
-      <tr>
-        <td><span class="tier tier-standard">Standard</span></td>
-        <td class="mono">{{ standard_count }}</td>
-        <td class="seen">{{ standard_valid_until }}</td>
-      </tr>
-    </tbody>
-  </table>
-</div>
+
+{% if tab == "entries" %}
+  {% if has_build %}
+    <div class="panel">
+      <div class="panel-head">
+        <span>Aggressive tier <span class="dim">({{ aggressive_entries | length }})</span></span>
+        <div class="range-selector">
+          <a href="/feed/download/aggressive/txt" class="range-btn">TXT</a>
+          <a href="/feed/download/aggressive/json" class="range-btn">JSON</a>
+          <a href="/feed/download/aggressive/csv" class="range-btn">CSV</a>
+          <a href="/feed/download/aggressive/cidr" class="range-btn">CIDR</a>
+        </div>
+      </div>
+      {% if aggressive_entries %}
+      <table class="table-compact">
+        <thead><tr><th>IP</th><th>Score</th><th>Events</th><th>First seen</th><th>Last seen</th></tr></thead>
+        <tbody>
+          {% for r in aggressive_entries %}
+          <tr>
+            <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
+            <td class="mono"><span class="meter"><span class="meter-fill meter-fill--crit" style="--pct: {{ r.score_pct }}%"></span></span>{{ r.score }}</td>
+            <td class="mono">{{ r.event_count }}</td>
+            <td class="seen">{{ r.first_seen }}</td>
+            <td class="seen">{{ r.last_seen }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="empty-line">no aggressive-tier entries recommended for the blocklist</p>
+      {% endif %}
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <span>Standard tier <span class="dim">({{ standard_entries | length }})</span></span>
+        <div class="range-selector">
+          <a href="/feed/download/standard/txt" class="range-btn">TXT</a>
+          <a href="/feed/download/standard/json" class="range-btn">JSON</a>
+          <a href="/feed/download/standard/csv" class="range-btn">CSV</a>
+          <a href="/feed/download/standard/cidr" class="range-btn">CIDR</a>
+        </div>
+      </div>
+      {% if standard_entries %}
+      <table class="table-compact">
+        <thead><tr><th>IP</th><th>Score</th><th>Events</th><th>First seen</th><th>Last seen</th></tr></thead>
+        <tbody>
+          {% for r in standard_entries %}
+          <tr>
+            <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
+            <td class="mono"><span class="meter"><span class="meter-fill meter-fill--warn" style="--pct: {{ r.score_pct }}%"></span></span>{{ r.score }}</td>
+            <td class="mono">{{ r.event_count }}</td>
+            <td class="seen">{{ r.first_seen }}</td>
+            <td class="seen">{{ r.last_seen }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="empty-line">no standard-tier entries recommended for the blocklist</p>
+      {% endif %}
+    </div>
+  {% else %}
+  <p class="empty-line">{% if feed_disabled %}feed builder is disabled on this node{% else %}feed enabled - awaiting first build{% endif %}</p>
+  {% endif %}
 {% else %}
-<p class="empty-line">{% if feed_disabled %}feed builder is disabled on this node{% else %}feed enabled - awaiting first build{% endif %}</p>
+  {% if has_build %}
+  <div class="stat-row">
+    <div class="stat-card stat-card--good">
+      <div class="label">Last build</div>
+      <div class="value seen" style="font-size:1.1rem">{{ build_time }}</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">Entry counts by tier</div>
+    <table>
+      <thead><tr><th>Tier</th><th>Entries</th><th>Valid until</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="tier tier-aggressive">Aggressive</span></td>
+          <td class="mono">{{ aggressive_count }}</td>
+          <td class="seen">{{ aggressive_valid_until }}</td>
+        </tr>
+        <tr>
+          <td><span class="tier tier-standard">Standard</span></td>
+          <td class="mono">{{ standard_count }}</td>
+          <td class="seen">{{ standard_valid_until }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty-line">{% if feed_disabled %}feed builder is disabled on this node{% else %}feed enabled - awaiting first build{% endif %}</p>
+  {% endif %}
 {% endif %}
 {% endblock %}

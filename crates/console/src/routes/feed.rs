@@ -43,9 +43,8 @@ use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use core_scoring::FeedTier;
+use core_scoring::{FeedTier, read_score};
 use minijinja::context;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -198,45 +197,70 @@ struct FeedEntryRow {
 async fn fetch_feed_entries(
     db: &PgPool,
 ) -> Result<(Vec<FeedEntryRow>, Vec<FeedEntryRow>), AppError> {
+    // Candidate set matches `feed::FeedBuilder::build`'s own query exactly. The stored gate
+    // columns are only a cheap prefilter here: they were computed when the row was last
+    // written, so an IP that has since decayed below the gates is still selected and is
+    // rejected by the re-derive below.
     let rows = sqlx::query(
-        "SELECT host(rq.source_ip) AS ip, isc.raw_score, isc.event_count, \
-                isc.first_seen, isc.last_seen, isc.tier \
-         FROM review_queue rq \
-         JOIN ip_score isc ON rq.source_ip = isc.source_ip \
-         WHERE rq.state = 'approved' AND isc.recommended_for_blocklist = TRUE \
-         ORDER BY isc.tier, isc.raw_score DESC",
+        "SELECT host(s.source_ip) AS ip FROM ip_score s \
+         INNER JOIN review_queue q ON q.source_ip = s.source_ip \
+         WHERE s.recommended_for_blocklist = true AND s.eligible = true \
+           AND q.state = 'approved'",
     )
     .fetch_all(db)
     .await?;
 
-    let mut aggressive = Vec::new();
-    let mut standard = Vec::new();
+    let mut aggressive: Vec<(f64, FeedEntryRow)> = Vec::new();
+    let mut standard: Vec<(f64, FeedEntryRow)> = Vec::new();
+
     for row in rows {
-        let ip: String = row.try_get("ip")?;
-        let tier: Option<FeedTier> = row.try_get("tier")?;
-        let Some(tier) = tier else {
-            tracing::warn!(
-                %ip,
-                "feed entries: approved + recommended_for_blocklist row has no tier; omitting"
-            );
+        let ip_text: String = row.try_get("ip")?;
+        let Ok(ip) = ip_text.parse::<std::net::IpAddr>() else {
+            tracing::warn!(%ip_text, "feed entries: unparseable stored source_ip; omitting");
             continue;
         };
-        let raw_score: Decimal = row.try_get("raw_score")?;
-        let score_f64 = raw_score.to_f64().unwrap_or(0.0);
+
+        // Re-derive against the current wall clock, exactly as the feed builder does before
+        // publishing. Reading the stored columns instead shows each IP's score frozen at its
+        // last event, so an entry that has decayed out of the published file would still be
+        // listed here - this page and the file it describes must not disagree.
+        let Some(score) = read_score(db, ip).await? else {
+            continue;
+        };
+        if !score.eligible || !score.recommended_for_blocklist {
+            continue;
+        }
+        let Some(tier) = score.tier else {
+            tracing::warn!(%ip, "feed entries: passes gates but tier=None; omitting fail-closed");
+            continue;
+        };
+
+        let score_f64 = score.raw_score.to_f64().unwrap_or(0.0);
         let entry = FeedEntryRow {
-            ip,
-            score: format!("{raw_score:.1}"),
+            ip: ip_text,
+            score: format!("{:.1}", score.raw_score),
             score_pct: score_f64.clamp(0.0, 100.0).round() as u32,
-            event_count: row.try_get("event_count")?,
-            first_seen: format_timestamp(row.try_get("first_seen")?),
-            last_seen: format_timestamp(row.try_get("last_seen")?),
+            event_count: score.event_count,
+            first_seen: format_timestamp(score.first_seen),
+            last_seen: format_timestamp(score.last_seen),
         };
         match tier {
-            FeedTier::Aggressive => aggressive.push(entry),
-            FeedTier::Standard => standard.push(entry),
+            FeedTier::Aggressive => aggressive.push((score_f64, entry)),
+            FeedTier::Standard => standard.push((score_f64, entry)),
         }
     }
-    Ok((aggressive, standard))
+
+    // Sort on the full-precision decayed score, not the rounded percentage the meter uses.
+    let by_score_desc = |a: &(f64, FeedEntryRow), b: &(f64, FeedEntryRow)| {
+        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+    };
+    aggressive.sort_by(by_score_desc);
+    standard.sort_by(by_score_desc);
+
+    Ok((
+        aggressive.into_iter().map(|(_, e)| e).collect(),
+        standard.into_iter().map(|(_, e)| e).collect(),
+    ))
 }
 
 /// `GET /feed/download/{tier}/{format}` - streams one export file straight off disk (module doc

@@ -22,11 +22,13 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Form, Router};
+use chrono::{DateTime, Utc};
 use core_scoring::{Category, IpScore, ReviewState, read_score};
 use minijinja::context;
 use review::queue::ReviewQueue;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
 
 use crate::AppState;
 use crate::auth::Session;
@@ -85,10 +87,48 @@ impl SortKey {
     }
 }
 
+/// Tab accepted via `?tab=`, matching this task's "pending/approved/rejected/snoozed" review
+/// queue history tabs. `Pending` is the default (unchanged page behavior for a bare `/queue`
+/// hit); the other three list historical decisions straight from `review_queue` since
+/// `ReviewQueue` exposes no per-state listing beyond `list_pending`/`list_approved`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Tab {
+    #[default]
+    Pending,
+    Approved,
+    Rejected,
+    Snoozed,
+}
+
+impl Tab {
+    fn as_str(self) -> &'static str {
+        match self {
+            Tab::Pending => "pending",
+            Tab::Approved => "approved",
+            Tab::Rejected => "rejected",
+            Tab::Snoozed => "snoozed",
+        }
+    }
+
+    /// The `review_queue.state` value this tab lists, or `None` for `Pending` (handled by the
+    /// existing `ReviewQueue::list_pending` path, which additionally sorts by the `?sort=` key).
+    fn review_state(self) -> Option<ReviewState> {
+        match self {
+            Tab::Pending => None,
+            Tab::Approved => Some(ReviewState::Approved),
+            Tab::Rejected => Some(ReviewState::Rejected),
+            Tab::Snoozed => Some(ReviewState::Snoozed),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct QueueQuery {
     #[serde(default)]
     sort: SortKey,
+    #[serde(default)]
+    tab: Tab,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +140,11 @@ struct ActionForm {
 
 /// One row's display data: every numeric/timestamp field is pre-formatted in Rust rather than in
 /// the template, keeping the template free of `Decimal`/`DateTime` formatting logic.
+///
+/// Shared by the pending tab (rendered via `queue_row.html`, `is_pending: true`, `decided_at`/
+/// `submissions` empty) and the approved/rejected/snoozed history tabs (rendered via
+/// `queue_history_row.html`, `is_pending: false`, `decided_at` populated, `submissions` populated
+/// only on the approved tab).
 #[derive(Debug, Serialize)]
 struct QueueRowView {
     ip: String,
@@ -112,6 +157,8 @@ struct QueueRowView {
     event_count: i32,
     first_seen: String,
     last_seen: String,
+    decided_at: String,
+    submissions: String,
     notes: String,
     csrf_token: String,
 }
@@ -121,48 +168,21 @@ async fn queue_page(
     Extension(session): Extension<Session>,
     Query(query): Query<QueueQuery>,
 ) -> Result<Html<String>, AppError> {
-    let entries = ReviewQueue::new().list_pending(&state.db).await?;
-
-    let mut pending = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let ip = entry.source_ip;
-        match read_score(&state.db, ip).await? {
-            Some(score) => pending.push((ip, entry.notes, score)),
-            None => {
-                // Cannot happen via the normal populate path (see `review::queue`'s doc comment),
-                // but the pending row is unusable without a projection - skip it, don't crash the
-                // whole page over one stale/corrupt entry.
-                tracing::warn!(
-                    %ip,
-                    "pending review entry has no ip_score projection; omitting from queue page"
-                );
-            }
-        }
-    }
-    sort_pending(&mut pending, query.sort);
-
     let csrf_token = state
         .sessions
         .generate_csrf(&session.id)
         .unwrap_or_default();
-    let rows: Vec<QueueRowView> = pending
-        .into_iter()
-        .map(|(ip, notes, score)| {
-            row_view(
-                ip,
-                ReviewState::Pending,
-                notes.as_deref(),
-                &score,
-                &csrf_token,
-            )
-        })
-        .collect();
+
+    let rows: Vec<QueueRowView> = match query.tab.review_state() {
+        None => pending_rows(&state.db, query.sort, &csrf_token).await?,
+        Some(review_state) => history_rows(&state.db, review_state).await?,
+    };
 
     // `pending_count` is the shared sitewide count from `base_context` (the same query the
     // nav/footer badge uses on every page) rather than `rows.len()`: the two are equal in normal
-    // operation, but `pending` above silently omits any entry missing its `ip_score` projection,
-    // so sourcing the heading from the same canonical count keeps this page's own "N pending"
-    // consistent with what the rest of the console shows for the same number.
+    // operation, but `pending_rows` below silently omits any entry missing its `ip_score`
+    // projection, so sourcing the heading from the same canonical count keeps this page's own "N
+    // pending" consistent with what the rest of the console shows for the same number.
     let BaseContext {
         pending_count,
         uptime,
@@ -178,6 +198,7 @@ async fn queue_page(
         version,
         rows,
         sort => query.sort.as_str(),
+        tab => query.tab.as_str(),
     })?;
     Ok(Html(html))
 }
@@ -192,6 +213,130 @@ fn sort_pending(rows: &mut [(IpAddr, Option<String>, IpScore)], key: SortKey) {
         // Most recently active first - the freshest signal.
         SortKey::LastSeen => rows.sort_by_key(|r| Reverse(r.2.last_seen)),
         SortKey::EventCount => rows.sort_by_key(|r| Reverse(r.2.event_count)),
+    }
+}
+
+/// The pending tab: every open `review_queue` entry, sorted by `sort`, each joined against its
+/// live (decayed-to-now) `ip_score` projection. Unchanged behavior from before tab support -
+/// factored out of `queue_page` so it sits alongside its `history_rows` sibling below.
+async fn pending_rows(
+    pool: &PgPool,
+    sort: SortKey,
+    csrf_token: &str,
+) -> Result<Vec<QueueRowView>, AppError> {
+    let entries = ReviewQueue::new().list_pending(pool).await?;
+
+    let mut pending = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let ip = entry.source_ip;
+        match read_score(pool, ip).await? {
+            Some(score) => pending.push((ip, entry.notes, score)),
+            None => {
+                // Cannot happen via the normal populate path (see `review::queue`'s doc comment),
+                // but the pending row is unusable without a projection - skip it, don't crash the
+                // whole page over one stale/corrupt entry.
+                tracing::warn!(
+                    %ip,
+                    "pending review entry has no ip_score projection; omitting from queue page"
+                );
+            }
+        }
+    }
+    sort_pending(&mut pending, sort);
+
+    Ok(pending
+        .into_iter()
+        .map(|(ip, notes, score)| {
+            row_view(
+                ip,
+                ReviewState::Pending,
+                notes.as_deref(),
+                &score,
+                csrf_token,
+            )
+        })
+        .collect())
+}
+
+/// The approved/rejected/snoozed tabs: `review_queue` exposes no `list_pending`-style method for
+/// these states (only `list_pending` and `list_approved` exist, and the latter sorts by
+/// `decided_at ASC` for the submission runner's FIFO, not the newest-first order an operator
+/// browsing history wants), so query directly here rather than adding narrow one-off methods to
+/// `ReviewQueue` for a console-only display need. Newest-decided first, capped at 100 rows - a
+/// history browse, not a paginated audit log.
+async fn history_rows(
+    pool: &PgPool,
+    review_state: ReviewState,
+) -> Result<Vec<QueueRowView>, AppError> {
+    let db_rows = sqlx::query(
+        "SELECT host(source_ip) AS ip, decided_at, notes \
+         FROM review_queue WHERE state = $1 ORDER BY decided_at DESC LIMIT 100",
+    )
+    .bind(review_state)
+    .fetch_all(pool)
+    .await?;
+
+    let mut rows = Vec::with_capacity(db_rows.len());
+    for db_row in db_rows {
+        let ip_text: String = db_row.try_get("ip")?;
+        let Ok(ip) = ip_text.parse::<IpAddr>() else {
+            // Cannot happen via any write path here (`source_ip` is a stored `inet`, and
+            // `host()` always renders a valid address text) - fail closed on the one row rather
+            // than the whole tab if it ever does.
+            tracing::warn!(
+                ip = %ip_text,
+                ?review_state,
+                "review_queue row has unparseable source_ip; omitting from history tab"
+            );
+            continue;
+        };
+        let decided_at: Option<DateTime<Utc>> = db_row.try_get("decided_at")?;
+        let notes: Option<String> = db_row.try_get("notes")?;
+
+        let Some(score) = read_score(pool, ip).await? else {
+            tracing::warn!(
+                %ip,
+                ?review_state,
+                "history review entry has no ip_score projection; omitting from queue page"
+            );
+            continue;
+        };
+
+        // Submission counts are only meaningful once a decision has actually been forwarded to
+        // vendors, so only the approved tab pays for the extra per-row query.
+        let submissions = match review_state {
+            ReviewState::Approved => submission_summary(pool, ip).await?,
+            _ => String::new(),
+        };
+
+        rows.push(history_row_view(
+            ip,
+            review_state,
+            decided_at,
+            notes.as_deref(),
+            &score,
+            submissions,
+        ));
+    }
+    Ok(rows)
+}
+
+/// "N/M vendors" for `ip`'s `vendor_submission` rows, or "-" when none exist yet (an approved IP
+/// the submission runner has not picked up yet).
+async fn submission_summary(pool: &PgPool, ip: IpAddr) -> Result<String, AppError> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) FILTER (WHERE success) AS succeeded, COUNT(*) AS total \
+         FROM vendor_submission WHERE source_ip = $1::inet",
+    )
+    .bind(ip.to_string())
+    .fetch_one(pool)
+    .await?;
+    let succeeded: i64 = row.try_get("succeeded")?;
+    let total: i64 = row.try_get("total")?;
+    if total == 0 {
+        Ok("-".to_string())
+    } else {
+        Ok(format!("{succeeded}/{total} vendors"))
     }
 }
 
@@ -277,9 +422,28 @@ fn row_view(
         event_count: score.event_count,
         first_seen: format_timestamp(score.first_seen),
         last_seen: format_timestamp(score.last_seen),
+        decided_at: String::new(),
+        submissions: String::new(),
         notes: notes.unwrap_or_default().to_string(),
         csrf_token: csrf_token.to_string(),
     }
+}
+
+/// A history-tab row (approved/rejected/snoozed): no action buttons, so no `csrf_token` needed;
+/// `decided_at` and `submissions` are populated instead of left blank as they are for a pending
+/// row.
+fn history_row_view(
+    ip: IpAddr,
+    review_state: ReviewState,
+    decided_at: Option<DateTime<Utc>>,
+    notes: Option<&str>,
+    score: &IpScore,
+    submissions: String,
+) -> QueueRowView {
+    let mut row = row_view(ip, review_state, notes, score, "");
+    row.decided_at = decided_at.map(format_timestamp).unwrap_or_default();
+    row.submissions = submissions;
+    row
 }
 
 fn review_state_label(s: ReviewState) -> &'static str {

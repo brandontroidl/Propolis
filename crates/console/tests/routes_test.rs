@@ -1019,6 +1019,239 @@ async fn queue_page_table_uses_compact_class(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrations = false)]
+async fn queue_tab_bar_marks_the_requested_tab_active(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=approved",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<a href="/queue?tab=approved" class="tab active">Approved</a>"#),
+        "expected the approved tab link to carry the active class: {body}"
+    );
+    assert!(
+        body.contains(r#"<a href="/queue?tab=pending" class="tab ">Pending</a>"#),
+        "expected the pending tab link to render without the active class: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_approved_tab_lists_decided_entries_with_submission_summary(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.60", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    // Decide it via the real approve route (not a raw UPDATE) so `decided_at`/`notes` land
+    // exactly as the operator flow sets them.
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.60/approve",
+            format!("csrf_token={csrf_token}&notes=looks-malicious"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.60")
+    .bind("abuseipdb")
+    .bind("queue-approved-tab-key-1")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(true)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.60")
+    .bind("otx")
+    .bind("queue-approved-tab-key-2")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(false)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=approved",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("203.0.113.60"),
+        "approved IP missing from the approved tab: {body}"
+    );
+    assert!(
+        body.contains("looks-malicious"),
+        "decision notes missing from the approved tab: {body}"
+    );
+    // minijinja auto-escapes "/" to "&#x2f;" in interpolated text - assert the escaped form
+    // actually rendered, matching what the browser (which unescapes it back to "1/2 vendors")
+    // shows the operator.
+    assert!(
+        body.contains("1&#x2f;2 vendors"),
+        "expected the 1-succeeded-of-2 submission summary on the approved tab: {body}"
+    );
+    // Action buttons only make sense for still-open (pending) decisions. Checks the quoted
+    // `class="btn-approve"` markup specifically, not a bare "btn-approve" substring: base_head.html's
+    // static CSS always has a `.btn-approve { ... }` rule on every page regardless of this row's
+    // data, matching the doctrine's own "no discriminating fixture" trap.
+    assert!(
+        !body.contains(r#"class="btn-approve""#)
+            && !body.contains(r#"class="btn-reject""#)
+            && !body.contains(r#"class="btn-snooze""#),
+        "approved tab must not render pending-only action buttons: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_approved_tab_shows_dash_when_no_submissions_yet(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.61", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.61/approve",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=approved",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("203.0.113.61"),
+        "approved IP missing from the approved tab: {body}"
+    );
+    assert!(
+        body.contains("<td>-</td>"),
+        "expected a dash submission summary for an IP with no vendor_submission rows yet: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_rejected_and_snoozed_tabs_list_only_their_own_state(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.62", 60).await;
+    seed_recommended(&pool, "203.0.113.63", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.62/reject",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.63/snooze",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let rejected_body = body_text(
+        app.clone()
+            .oneshot(get_request(
+                "/queue?tab=rejected",
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(rejected_body.contains("203.0.113.62"), "{rejected_body}");
+    assert!(!rejected_body.contains("203.0.113.63"), "{rejected_body}");
+
+    let snoozed_body = body_text(
+        app.oneshot(get_request(
+            "/queue?tab=snoozed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(snoozed_body.contains("203.0.113.63"), "{snoozed_body}");
+    assert!(!snoozed_body.contains("203.0.113.62"), "{snoozed_body}");
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_history_tab_empty_state_names_the_tab(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=rejected",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">no rejected entries yet</p>"#),
+        "expected a tab-specific empty-state message: {body}"
+    );
+}
+
 // --- login ---
 
 #[sqlx::test(migrations = false)]

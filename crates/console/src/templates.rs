@@ -38,6 +38,7 @@ const BASE_HTML: &str = concat!(
 const DASHBOARD_HTML: &str = include_str!("templates/dashboard.html");
 const QUEUE_HTML: &str = include_str!("templates/queue.html");
 const QUEUE_ROW_HTML: &str = include_str!("templates/queue_row.html");
+const QUEUE_HISTORY_ROW_HTML: &str = include_str!("templates/queue_history_row.html");
 const LOGIN_HTML: &str = include_str!("templates/login.html");
 const DETAIL_HTML: &str = include_str!("templates/detail.html");
 const FEED_HTML: &str = include_str!("templates/feed.html");
@@ -62,6 +63,10 @@ pub fn environment() -> Environment<'static> {
         .expect("queue.html must be a valid template");
     env.add_template("queue_row.html", QUEUE_ROW_HTML)
         .expect("queue_row.html must be a valid template");
+    // The approved/rejected/snoozed history tabs (console-forensics task 6): decided_at/notes/
+    // submissions instead of the pending tab's action buttons - see `routes::queue`'s doc comment.
+    env.add_template("queue_history_row.html", QUEUE_HISTORY_ROW_HTML)
+        .expect("queue_history_row.html must be a valid template");
     env.add_template("login.html", LOGIN_HTML)
         .expect("login.html must be a valid template");
     env.add_template("detail.html", DETAIL_HTML)

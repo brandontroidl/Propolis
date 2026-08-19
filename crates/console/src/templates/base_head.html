@@ -207,6 +207,19 @@ h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 1.25rem; }
 .range-btn:hover { color: var(--text); border-color: var(--border-bright); text-decoration: none; }
 .range-btn.active { color: var(--brand); border-color: var(--brand); background: var(--attention-dim); }
 
+/* -- Tab bar (review queue state tabs: pending/approved/rejected/snoozed) -- */
+.tab-bar { display: flex; gap: 0.3rem; margin: 0.75rem 0 1rem; border-bottom: 1px solid var(--border); }
+.tab {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  padding: 0.4rem 0.75rem;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab:hover { color: var(--text); border-color: var(--border-bright); text-decoration: none; }
+.tab.active { color: var(--brand); border-color: var(--brand); }
+
 /* -- Evidence timeline "Load more" (detail page, HTMX cursor pagination) -- */
 #load-more-container { padding: 0.7rem 0.9rem; text-align: center; border-top: 1px solid var(--border); }
 #load-more-container:empty { display: none; }

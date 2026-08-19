@@ -388,3 +388,113 @@ async fn eligible_ip_without_approval_is_excluded_from_feed() {
         "an eligible IP without operator approval must NOT appear in the feed"
     );
 }
+
+#[tokio::test]
+async fn entries_carry_the_distinct_signal_types_the_address_actually_triggered() {
+    // `distinct_categories` is a count over five coarse sensor classes and says nothing about what
+    // an address did. This is the field a consumer filters on to keep malware uploaders and drop
+    // port-scan noise, so it must reflect the events actually recorded, deduplicated and sorted.
+    let pool = setup_pool().await;
+    let now = Utc::now();
+    let ip: IpAddr = "45.10.30.77".parse().unwrap();
+
+    reset_ip(&pool, ip).await;
+    // Two events of the SAME type, so a missing DISTINCT would show up as a duplicate, plus two
+    // others - seeded out of alphabetical order so the sort is proven rather than coincidental.
+    append_event(
+        &pool,
+        ev(ip, SignalType::HoneypotMalwareUpload, Protocol::Tcp, true, now),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(ip, SignalType::HoneypotMalwareUpload, Protocol::Tcp, true, now),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(ip, SignalType::SshBruteForce, Protocol::Tcp, false, now),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
+    )
+    .await
+    .unwrap();
+    let queue = ReviewQueue::new();
+    queue.populate(&pool).await.unwrap();
+    queue.approve(&pool, ip, None).await.unwrap();
+
+    let snapshot = FeedBuilder::build(
+        &pool,
+        &ExclusionEngine::new(Vec::new(), Vec::new()),
+        &FeedConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    let entry = snapshot
+        .aggressive
+        .iter()
+        .chain(snapshot.standard.iter())
+        .find(|e| e.source_ip == ip)
+        .expect("seeded IP must be in the feed");
+
+    assert_eq!(
+        entry.categories,
+        [
+            "catchall_probe",
+            "honeypot_malware_upload",
+            "ssh_brute_force"
+        ],
+        "expected the deduplicated, sorted wire vocabulary"
+    );
+}
+
+#[tokio::test]
+async fn retention_windows_are_built_with_their_configured_label_and_duration() {
+    // The window label is the published filename (`all-{label}.txt`) and the retention it carries
+    // is what that file's header states, so a window whose label and duration disagree would
+    // advertise a coverage it does not have.
+    let pool = setup_pool().await;
+    let now = Utc::now();
+    let ip: IpAddr = "45.10.30.78".parse().unwrap();
+    seed_qualifying(&pool, ip, SignalType::HoneypotMalwareUpload, now).await;
+
+    let config = FeedConfig {
+        windows: vec![
+            ("7d".into(), chrono::Duration::days(7)),
+            ("90d".into(), chrono::Duration::days(90)),
+        ],
+        ..FeedConfig::default()
+    };
+    let snapshot = FeedBuilder::build(
+        &pool,
+        &ExclusionEngine::new(Vec::new(), Vec::new()),
+        &config,
+    )
+    .await
+    .unwrap();
+
+    let labels: Vec<&str> = snapshot.windows.iter().map(|w| w.label.as_str()).collect();
+    assert_eq!(labels, ["7d", "90d"]);
+    assert_eq!(snapshot.windows[0].retention, chrono::Duration::days(7));
+    assert_eq!(snapshot.windows[1].retention, chrono::Duration::days(90));
+
+    // A just-seeded address falls inside every window, and the windows nest.
+    for window in &snapshot.windows {
+        assert!(
+            window.entries.iter().any(|e| e.source_ip == ip),
+            "{} must contain the freshly-seeded address",
+            window.label
+        );
+        // Validity is anchored on the entry's own last activity, carrying the window's retention.
+        let entry = window.entries.iter().find(|e| e.source_ip == ip).unwrap();
+        assert_eq!(entry.valid_until - entry.valid_from, window.retention);
+    }
+    assert!(snapshot.windows[1].entries.len() >= snapshot.windows[0].entries.len());
+}

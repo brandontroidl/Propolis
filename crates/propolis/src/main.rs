@@ -451,6 +451,16 @@ async fn main() {
         let feed_config = FeedConfig {
             aggressive_ttl: chrono::Duration::seconds(config.feed_aggressive_ttl.as_secs() as i64),
             standard_ttl: chrono::Duration::seconds(config.feed_standard_ttl.as_secs() as i64),
+            windows: config
+                .feed_windows
+                .iter()
+                .map(|(label, dur)| {
+                    (
+                        label.clone(),
+                        chrono::Duration::seconds(dur.as_secs() as i64),
+                    )
+                })
+                .collect(),
         };
         let output_dir = config.feed_output_dir.clone();
         let build_interval = config.feed_build_interval;

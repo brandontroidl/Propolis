@@ -22,6 +22,11 @@ const DEFAULT_FEED_OUTPUT_DIR: &str = "/var/lib/propolis/feed/current";
 const DEFAULT_FEED_BUILD_INTERVAL_SECS: u64 = 900;
 const DEFAULT_AGGRESSIVE_TTL_HOURS: u64 = 24;
 const DEFAULT_STANDARD_TTL_HOURS: u64 = 48;
+/// Retention feeds published as `all-{label}.*` alongside the two tiered feeds. The two tiers
+/// answer "block this now"; these answer "what has this address done lately", which is the
+/// question a firewall operator building a long-horizon list actually asks. Nested by
+/// construction, so a consumer picks exactly one file rather than merging several.
+const DEFAULT_FEED_WINDOWS: &str = "24h,7d,30d,60d,90d";
 const DEFAULT_CONSOLE_BIND: &str = "127.0.0.1:8080";
 const DEFAULT_COOLDOWN_HOURS: u32 = 24;
 const DEFAULT_RATE_LIMIT: u32 = 100;
@@ -58,6 +63,9 @@ pub struct PropolisConfig {
     pub feed_standard_ttl: Duration,
     pub feed_allowlist: Vec<IpNet>,
     pub feed_delist: Vec<IpAddr>,
+    /// `(label, retention)` pairs driving the `all-{label}.*` feeds. The label is both the
+    /// filename suffix and the source the duration is parsed from, so the two cannot drift.
+    pub feed_windows: Vec<(String, Duration)>,
     // Console
     pub console_bind: SocketAddr,
     pub console_password: String,
@@ -182,6 +190,40 @@ fn parse_cidr_list(raw: &str) -> Result<Vec<IpNet>, ConfigError> {
                 value: s.to_string(),
                 reason: "not a valid CIDR",
             })
+        })
+        .collect()
+}
+
+/// Parse `PROPOLIS_FEED_WINDOWS` - a comma-separated list of `<count><unit>` labels such as
+/// `24h,7d,30d` - into `(label, retention)` pairs.
+///
+/// The label IS the duration's source rather than a separate field, so a filename can never
+/// advertise a window the builder does not actually apply. Only `h` and `d` are accepted and the
+/// count must be a positive integer, which also makes every label filename-safe by construction:
+/// no separate path sanitisation is needed before it reaches `all-{label}.txt`.
+///
+/// Fails closed on any malformed entry rather than skipping it - a typo that silently dropped a
+/// window would publish a short list under a long window's name.
+fn parse_window_list(raw: &str) -> Result<Vec<(String, Duration)>, ConfigError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let invalid = || ConfigError::Invalid {
+                field: "PROPOLIS_FEED_WINDOWS",
+                value: s.to_string(),
+                reason: "expected a positive count followed by 'h' or 'd', e.g. 24h or 30d",
+            };
+            let (count, unit_secs) = match s.as_bytes().last() {
+                Some(b'h') => (&s[..s.len() - 1], 3_600),
+                Some(b'd') => (&s[..s.len() - 1], 86_400),
+                _ => return Err(invalid()),
+            };
+            let count: u64 = count.parse().map_err(|_| invalid())?;
+            if count == 0 {
+                return Err(invalid());
+            }
+            Ok((s.to_string(), Duration::from_secs(count * unit_secs)))
         })
         .collect()
 }
@@ -323,6 +365,9 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
     )?;
     let feed_allowlist = parse_cidr_list(&env::var("PROPOLIS_FEED_ALLOWLIST").unwrap_or_default())?;
     let feed_delist = parse_ip_list(&env::var("PROPOLIS_FEED_DELIST").unwrap_or_default())?;
+    let feed_windows = parse_window_list(
+        &env::var("PROPOLIS_FEED_WINDOWS").unwrap_or_else(|_| DEFAULT_FEED_WINDOWS.to_string()),
+    )?;
 
     let bind_raw =
         env::var("PROPOLIS_CONSOLE_BIND").unwrap_or_else(|_| DEFAULT_CONSOLE_BIND.to_string());
@@ -358,6 +403,7 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         feed_standard_ttl: Duration::from_secs(feed_standard_ttl_hours * 3600),
         feed_allowlist,
         feed_delist,
+        feed_windows,
         console_bind,
         console_password,
         console_session_secret,
@@ -392,5 +438,43 @@ mod tests {
     #[test]
     fn parse_sensor_logs_rejects_entry_without_colon() {
         assert!(parse_sensor_logs("not-a-pair").is_err());
+    }
+
+    #[test]
+    fn parse_window_list_reads_hours_and_days() {
+        let windows = parse_window_list("24h, 7d,90d").unwrap();
+        assert_eq!(
+            windows,
+            vec![
+                ("24h".to_string(), Duration::from_secs(86_400)),
+                ("7d".to_string(), Duration::from_secs(604_800)),
+                ("90d".to_string(), Duration::from_secs(7_776_000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_window_list_accepts_the_shipped_default() {
+        let windows = parse_window_list(DEFAULT_FEED_WINDOWS).unwrap();
+        assert_eq!(windows.len(), 5);
+        // Nested by construction: each window must strictly contain the one before it, or a
+        // consumer picking a single file would not get a superset of the shorter ones.
+        assert!(windows.windows(2).all(|p| p[0].1 < p[1].1));
+    }
+
+    #[test]
+    fn parse_window_list_fails_closed_on_bad_entries() {
+        // A silently-skipped entry would publish a short list under a long window's filename.
+        for raw in ["30", "30w", "0d", "-1d", "d", "thirty-d", "30 d"] {
+            assert!(
+                parse_window_list(raw).is_err(),
+                "{raw} must be rejected, not skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_window_list_empty_disables_retention_feeds() {
+        assert!(parse_window_list("").unwrap().is_empty());
     }
 }

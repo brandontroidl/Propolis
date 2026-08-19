@@ -39,6 +39,13 @@ fn sample_entries() -> Vec<FeedEntry> {
             last_seen: dt("2026-07-29T13:00:00Z"),
             event_count: 47,
             distinct_categories: 3,
+            // Deliberately different per entry, and deliberately not the same length as
+            // `distinct_categories`: an exporter that emitted the count, or the wrong entry's
+            // signals, would otherwise still match.
+            categories: vec![
+                "honeypot_command_exec".into(),
+                "ssh_brute_force".into(),
+            ],
             valid_from: dt(GENERATED),
             valid_until: dt(VALID_UNTIL),
         },
@@ -49,6 +56,7 @@ fn sample_entries() -> Vec<FeedEntry> {
             last_seen: dt("2026-07-28T09:00:00Z"),
             event_count: 12,
             distinct_categories: 2,
+            categories: vec!["port_scan".into()],
             valid_from: dt(GENERATED),
             valid_until: dt(VALID_UNTIL),
         },
@@ -146,9 +154,29 @@ fn json_entries_have_exactly_the_documented_fields_no_more_no_less() {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["categories", "events", "first_seen", "ip", "last_seen"],
+            vec![
+                "categories",
+                "events",
+                "first_seen",
+                "ip",
+                "last_seen",
+                "signals"
+            ],
             "an entry must carry exactly these fields - anything else (raw_score, \
              max_confidence, a per-entry tier label) is a deanonymization leak"
+        );
+        // `signals` is a closed enum of activity labels, deliberately admitted to this set: it
+        // describes what the ADDRESS did, which is the feed's purpose. The scoring internals the
+        // guard above exists to keep out - raw_score, max_confidence, the decay anchor - are what
+        // would let a reader invert the model, and none of them are derivable from a label set.
+        let signals = obj["signals"].as_array().expect("signals must be an array");
+        assert!(
+            signals
+                .iter()
+                .all(|s| s.as_str().is_some_and(|s| s
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))),
+            "signals must stay the closed wire vocabulary, never free-form text: {signals:?}"
         );
     }
 }
@@ -198,12 +226,23 @@ fn csv_header_row_matches_the_spec_columns_exactly() {
     let out = export_csv(&sample_entries());
     assert_eq!(
         out.lines().next(),
-        Some("ip,first_seen,last_seen,categories,events")
+        Some("ip,first_seen,last_seen,categories,events,signals")
     );
 }
 
 #[test]
-fn csv_rows_are_parseable_with_five_columns_correctly_mapped_per_ip() {
+fn csv_signal_column_is_semicolon_joined_so_it_can_never_introduce_a_comma() {
+    // The exporter writes fields with plain `format!` rather than a CSV writer, which is only safe
+    // while no field can contain a delimiter. `signals` is the first multi-valued column, so this
+    // guards the invariant the whole exporter rests on.
+    let out = export_csv(&sample_entries());
+    let first = out.lines().nth(1).unwrap();
+    assert_eq!(first.split(',').count(), 6, "row: {first}");
+    assert!(first.ends_with("honeypot_command_exec;ssh_brute_force"), "row: {first}");
+}
+
+#[test]
+fn csv_rows_are_parseable_with_six_columns_correctly_mapped_per_ip() {
     let out = export_csv(&sample_entries());
     let rows: Vec<Vec<&str>> = out
         .lines()
@@ -218,7 +257,8 @@ fn csv_rows_are_parseable_with_five_columns_correctly_mapped_per_ip() {
             "2026-07-20T10:00:00Z",
             "2026-07-29T13:00:00Z",
             "3",
-            "47"
+            "47",
+            "honeypot_command_exec;ssh_brute_force"
         ]
     );
     assert_eq!(
@@ -228,7 +268,8 @@ fn csv_rows_are_parseable_with_five_columns_correctly_mapped_per_ip() {
             "2026-07-21T11:00:00Z",
             "2026-07-28T09:00:00Z",
             "2",
-            "12"
+            "12",
+            "port_scan"
         ]
     );
 }
@@ -238,7 +279,7 @@ fn csv_zero_entries_is_header_only() {
     let out = export_csv(&[]);
     assert_eq!(
         out.lines().collect::<Vec<_>>(),
-        vec!["ip,first_seen,last_seen,categories,events"]
+        vec!["ip,first_seen,last_seen,categories,events,signals"]
     );
 }
 
@@ -266,6 +307,7 @@ fn cidr_ipv6_entries_are_slash_128_host_routes_never_slash_32() {
         last_seen: dt(GENERATED),
         event_count: 5,
         distinct_categories: 2,
+        categories: vec!["catchall_probe".into()],
         valid_from: dt(GENERATED),
         valid_until: dt(VALID_UNTIL),
     });

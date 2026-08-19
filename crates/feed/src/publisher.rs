@@ -127,12 +127,34 @@ impl Publisher {
             &snapshot.standard,
         )?;
 
+        // Retention feeds, published alongside the two tiered ones as `all-{label}.*`. Each is
+        // already scoped to its window by the builder; the retention carried on the `WindowFeed`
+        // sets the file header's stated validity, so an empty window still states the window it
+        // covers rather than falling back to a guess.
+        let mut windows = Vec::with_capacity(snapshot.windows.len());
+        for window in &snapshot.windows {
+            let manifest_entry = write_tier(
+                &staging,
+                &format!("all-{}", window.label),
+                snapshot.build_time,
+                snapshot.build_time + window.retention,
+                &window.entries,
+            )?;
+            windows.push(WindowManifest {
+                label: window.label.clone(),
+                count: manifest_entry.count,
+                sha256: manifest_entry.sha256,
+                valid_until: manifest_entry.valid_until,
+            });
+        }
+
         let manifest = Manifest {
             build_time: format_timestamp(snapshot.build_time),
             tiers: ManifestTiers {
                 aggressive,
                 standard,
             },
+            windows,
         };
         let manifest_json = serde_json::to_string(&manifest)?;
         write_file_synced(&staging.join("manifest.json"), manifest_json.as_bytes())?;
@@ -144,21 +166,31 @@ impl Publisher {
 
 /// Fails the whole build on the first entry that should never have reached a `FeedSnapshot` at
 /// all. See the module doc comment for why this is whole-snapshot, not per-entry.
+/// Covers the retention feeds as well as the two tiers. They are built by the same code path and
+/// so carry the same risk, and a reserved address leaking into `all-90d.txt` discredits the feed
+/// exactly as much as one leaking into `aggressive.txt` - a check that only guards the surfaces
+/// that existed when it was written stops guarding as soon as a new one is added.
 fn revalidate(snapshot: &FeedSnapshot, exclusions: &ExclusionEngine) -> Result<(), PublishError> {
-    for (tier, entries) in [
-        (FeedTier::Aggressive, &snapshot.aggressive),
-        (FeedTier::Standard, &snapshot.standard),
-    ] {
+    let tiered = [
+        ("aggressive".to_string(), &snapshot.aggressive),
+        ("standard".to_string(), &snapshot.standard),
+    ];
+    let windowed = snapshot
+        .windows
+        .iter()
+        .map(|w| (format!("all-{}", w.label), &w.entries));
+
+    for (feed, entries) in tiered.into_iter().chain(windowed) {
         for entry in entries {
             if exclusions.is_excluded(entry.source_ip) {
                 tracing::error!(
                     ip = %entry.source_ip,
-                    tier = ?tier,
+                    %feed,
                     "publisher: entry failed re-validation against exclusions; rejecting the entire build"
                 );
                 return Err(PublishError::ExclusionViolation {
                     ip: entry.source_ip,
-                    tier,
+                    tier: entry.tier,
                 });
             }
         }
@@ -320,6 +352,19 @@ fn swap_into_place(staging: &Path, output_dir: &Path) -> io::Result<()> {
 struct Manifest {
     build_time: String,
     tiers: ManifestTiers,
+    /// One entry per retention feed. Additive: a consumer reading only `tiers` is unaffected, and
+    /// an unconfigured deployment publishes an empty array.
+    windows: Vec<WindowManifest>,
+}
+
+/// A retention feed's manifest entry. Carries `label` because - unlike the two fixed tiers - the
+/// set of windows is operator-configured, so a consumer cannot know the filenames in advance.
+#[derive(Debug, Serialize)]
+struct WindowManifest {
+    label: String,
+    count: usize,
+    sha256: String,
+    valid_until: String,
 }
 
 #[derive(Debug, Serialize)]

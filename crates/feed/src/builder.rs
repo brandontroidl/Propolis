@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use chrono::{DateTime, Duration, Timelike, Utc};
 use sqlx::{PgPool, Row};
 
-use core_scoring::{FeedTier, RepoError, read_score};
+use core_scoring::{FeedTier, RepoError};
 
 use crate::exclusion::ExclusionEngine;
 
@@ -38,8 +38,30 @@ pub struct FeedEntry {
     pub last_seen: DateTime<Utc>,
     pub event_count: i32,
     pub distinct_categories: i32,
+    /// The distinct signal types this address triggered, as the wire vocabulary
+    /// (`ssh_brute_force`, `honeypot_malware_upload`, ...), sorted and deduplicated.
+    ///
+    /// `distinct_categories` above is a bare count over five coarse sensor classes, which tells a
+    /// consumer how much corroboration an entry has but nothing about what the address actually
+    /// did. This is the "what did it do" half, and it is what makes an entry actionable: an
+    /// operator can drop the port-scan noise and keep the addresses that got as far as uploading
+    /// malware.
+    pub categories: Vec<String>,
     pub valid_from: DateTime<Utc>,
     pub valid_until: DateTime<Utc>,
+}
+
+/// One retention feed, published as `all-{label}.*`.
+///
+/// `retention` travels with the entries rather than being looked up separately at publish time:
+/// the exported file header states the window it covers, and deriving that from an entry (or from
+/// a config lookup keyed by label) lets a file advertise a window its contents were not selected
+/// for - and an empty window has no entry to derive it from at all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFeed {
+    pub label: String,
+    pub retention: Duration,
+    pub entries: Vec<FeedEntry>,
 }
 
 /// An immutable, timestamped build of the two-tier blocklist. `aggressive` and `standard` are
@@ -50,6 +72,9 @@ pub struct FeedSnapshot {
     pub build_time: DateTime<Utc>,
     pub aggressive: Vec<FeedEntry>,
     pub standard: Vec<FeedEntry>,
+    /// One entry per configured retention window, published as `all-{label}.*`. Empty when no
+    /// windows are configured.
+    pub windows: Vec<WindowFeed>,
 }
 
 /// Builder-scoped configuration: how long each tier's entries stay valid from the coarsened build
@@ -61,16 +86,39 @@ pub struct FeedSnapshot {
 pub struct FeedConfig {
     pub aggressive_ttl: Duration,
     pub standard_ttl: Duration,
+    /// Additional retention feeds, published as `all-{label}.*` alongside the two tiered feeds.
+    /// Each holds every approved entry whose `last_seen` falls inside the window, regardless of
+    /// tier, so the windows nest (30d contains everything in 7d). Empty disables them.
+    pub windows: Vec<(String, Duration)>,
 }
 
 impl Default for FeedConfig {
-    /// The spec's ratified defaults: Aggressive 24h, Standard 48h from coarsened build time.
+    /// The spec's ratified defaults: Aggressive 24h, Standard 48h. Retention windows default to
+    /// empty so an unconfigured deployment publishes exactly the two files it always has.
     fn default() -> Self {
         Self {
             aggressive_ttl: Duration::hours(24),
             standard_ttl: Duration::hours(48),
+            windows: Vec::new(),
         }
     }
+}
+
+/// One approved IP as stored, before it is materialised into per-feed [`FeedEntry`] values.
+///
+/// Every field is read AS STORED - the values as of the IP's last event - never re-derived
+/// against the current wall clock. That is the whole point: a re-derived tier slides across the
+/// 90/75 thresholds as the score decays, so the same IP is filed as aggressive on one render and
+/// standard on the next, and no two views taken minutes apart agree. Freezing the tier at
+/// observation time means an IP enters one file and stays there for its window.
+struct Candidate {
+    ip: IpAddr,
+    tier: FeedTier,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+    event_count: i32,
+    distinct_categories: i32,
+    categories: Vec<String>,
 }
 
 /// Stateless namespace for the build step (mirrors the design's `FeedBuilder::build`).
@@ -79,21 +127,23 @@ pub struct FeedBuilder;
 impl FeedBuilder {
     /// Build a `FeedSnapshot` from the current `ip_score` projection.
     ///
-    /// 1. Pre-filters candidates on the STORED `recommended_for_blocklist`/`eligible` flags
-    ///    (cheap, index-friendly). Decay only ever shrinks a score, so a row this filter excludes
-    ///    can never newly qualify after decay - the filter is a sound superset, never a false
-    ///    negative.
-    /// 2. Re-derives every candidate on the current wall clock via `core_scoring::read_score`,
-    ///    and re-checks `eligible`/`recommended_for_blocklist` on THAT fresh value - the stale
-    ///    stored flags are never trusted past step 1.
-    /// 3. Drops any candidate whose fresh `tier` is `None`: `recommended_for_blocklist` is gated
-    ///    on the breadth-boosted effective score while `tier` is gated on the raw score alone, so
-    ///    a candidate can satisfy the first without the second (see `core-scoring`'s
-    ///    `breadth_raises_blocklist_never_vendor_tier` end-to-end test). The design calls this
-    ///    "should not happen if the scoring logic is consistent", but fail-closed means excluding
-    ///    it rather than assuming a tier.
-    /// 4. Applies `exclusions.is_excluded` (reserved ranges, operator allowlist, delist).
-    /// 5. Coarsens every timestamp to the hour and computes `valid_until` from the tier's TTL.
+    /// Membership is decided by RETENTION, not by a live-decayed score:
+    ///
+    /// 1. Selects approved candidates on the STORED `recommended_for_blocklist`/`eligible` flags,
+    ///    reading `tier`, `first_seen`, `last_seen` and the evidence counts AS STORED - i.e. as of
+    ///    each IP's last event.
+    /// 2. Applies `exclusions.is_excluded` (reserved ranges, operator allowlist, delist).
+    /// 3. Keeps an entry while `last_seen` falls inside the relevant window: the tier's TTL for
+    ///    `aggressive`/`standard`, or the window's own duration for each configured retention
+    ///    feed. `valid_from`/`valid_until` are anchored on `last_seen`, so the published validity
+    ///    window is the truth about when the entry expires.
+    ///
+    /// This deliberately does NOT re-derive scores against the current wall clock. Doing so made
+    /// tier membership a function of when a page happened to render: an IP sliding from 90.0 to
+    /// 89.0 silently moved from the aggressive file to the standard one, entries vanished roughly
+    /// 2.5h after their last event while the file advertised 24-48h validity, and no two views
+    /// taken minutes apart ever agreed on the counts. Decay still governs scoring, the review
+    /// queue and the vendor gates - it just no longer decides what is published.
     ///
     /// Any database error aborts the whole build (`FeedError`); there is no partial snapshot.
     pub async fn build(
@@ -103,17 +153,26 @@ impl FeedBuilder {
     ) -> Result<FeedSnapshot, FeedError> {
         let build_time = coarsen_to_hour(Utc::now());
 
+        // The `categories` subquery is correlated but cheap: the outer set is already narrowed to
+        // approved, eligible, tiered candidates, and `event_source_ip_idx` covers the lookup. It
+        // reads `signal_type::text` rather than mapping through the Rust enum because the database
+        // enum's labels ARE the wire vocabulary (`0001_enums.sql`), so there is no second casing
+        // to keep in sync - and `SignalType`'s Serialize is frozen to bare Rust identifiers for
+        // chain hashing, which is the wrong vocabulary to publish.
         let rows = sqlx::query(
-            "SELECT host(s.source_ip) AS source_ip FROM ip_score s \
+            "SELECT host(s.source_ip) AS source_ip, s.tier, s.first_seen, s.last_seen, \
+                    s.event_count, s.distinct_categories, \
+                    ARRAY(SELECT DISTINCT e.signal_type::text FROM event e \
+                          WHERE e.source_ip = s.source_ip ORDER BY 1) AS categories \
+             FROM ip_score s \
              INNER JOIN review_queue q ON q.source_ip = s.source_ip \
              WHERE s.recommended_for_blocklist = true AND s.eligible = true \
-               AND q.state = 'approved'",
+               AND q.state = 'approved' AND s.tier IS NOT NULL",
         )
         .fetch_all(pool)
         .await?;
 
-        let mut aggressive = Vec::new();
-        let mut standard = Vec::new();
+        let mut candidates = Vec::with_capacity(rows.len());
 
         for row in rows {
             let ip_text: String = row.try_get("source_ip")?;
@@ -129,61 +188,49 @@ impl FeedBuilder {
                 }
             };
 
-            // Re-derive on the current wall clock; never trust the stale stored flags past this
-            // point (see the doc comment above).
-            let Some(score) = read_score(pool, ip).await? else {
-                // No delete path exists on `ip_score` (upsert-only), so this is unreachable in
-                // practice; handled defensively rather than assumed.
-                tracing::warn!(%ip, "feed builder: ip_score row vanished between query and read");
-                continue;
-            };
-
-            if !score.eligible || !score.recommended_for_blocklist {
-                continue; // decayed below the gate since the row was last written
-            }
-
-            let Some(tier) = score.tier else {
-                tracing::warn!(
-                    %ip,
-                    "feed builder: recommended_for_blocklist but tier=None, excluding fail-closed"
-                );
-                continue;
-            };
-
             if exclusions.is_excluded(ip) {
                 continue;
             }
 
-            let valid_from = build_time;
-            let valid_until = valid_from
-                + match tier {
-                    FeedTier::Aggressive => config.aggressive_ttl,
-                    FeedTier::Standard => config.standard_ttl,
-                };
-
-            let entry = FeedEntry {
-                source_ip: ip,
-                tier,
-                first_seen: coarsen_to_hour(score.first_seen),
-                last_seen: coarsen_to_hour(score.last_seen),
-                event_count: score.event_count,
-                distinct_categories: score.distinct_categories,
-                valid_from,
-                valid_until,
+            // `tier IS NOT NULL` in the query above already excluded the untiered rows, so this
+            // only fails on a value the enum cannot represent - fail closed rather than guess.
+            let Some(tier): Option<FeedTier> = row.try_get("tier")? else {
+                tracing::warn!(%ip, "feed builder: stored tier unreadable, excluding fail-closed");
+                continue;
             };
 
-            match tier {
-                FeedTier::Aggressive => aggressive.push(entry),
-                FeedTier::Standard => standard.push(entry),
-            }
+            candidates.push(Candidate {
+                ip,
+                tier,
+                first_seen: row.try_get("first_seen")?,
+                last_seen: row.try_get("last_seen")?,
+                event_count: row.try_get("event_count")?,
+                distinct_categories: row.try_get("distinct_categories")?,
+                categories: row.try_get("categories")?,
+            });
         }
 
-        aggressive.sort_by_key(|e| e.source_ip);
-        standard.sort_by_key(|e| e.source_ip);
+        let now = Utc::now();
+        let aggressive = materialize(&candidates, now, config.aggressive_ttl, |c| {
+            c.tier == FeedTier::Aggressive
+        });
+        let standard = materialize(&candidates, now, config.standard_ttl, |c| {
+            c.tier == FeedTier::Standard
+        });
+        let windows: Vec<WindowFeed> = config
+            .windows
+            .iter()
+            .map(|(label, retention)| WindowFeed {
+                label: label.clone(),
+                retention: *retention,
+                entries: materialize(&candidates, now, *retention, |_| true),
+            })
+            .collect();
 
         tracing::info!(
             aggressive = aggressive.len(),
             standard = standard.len(),
+            windows = windows.len(),
             "feed builder: build complete"
         );
 
@@ -191,8 +238,44 @@ impl FeedBuilder {
             build_time,
             aggressive,
             standard,
+            windows,
         })
     }
+}
+
+/// Select the candidates that `include` accepts and whose last event falls inside `ttl`, and
+/// materialise them as [`FeedEntry`] values whose validity window is anchored on that last event.
+///
+/// Anchoring on `last_seen` rather than on build time is what makes the published `valid_until`
+/// mean what it says: an entry is carried for a fixed period after the activity that justified it,
+/// and leaves when that period lapses. Anchoring on build time instead would restart every
+/// entry's clock on each build, so nothing would ever expire.
+fn materialize(
+    candidates: &[Candidate],
+    now: DateTime<Utc>,
+    ttl: Duration,
+    include: impl Fn(&Candidate) -> bool,
+) -> Vec<FeedEntry> {
+    let mut out: Vec<FeedEntry> = candidates
+        .iter()
+        .filter(|c| include(c) && now - c.last_seen < ttl)
+        .map(|c| {
+            let valid_from = coarsen_to_hour(c.last_seen);
+            FeedEntry {
+                source_ip: c.ip,
+                tier: c.tier,
+                first_seen: coarsen_to_hour(c.first_seen),
+                last_seen: valid_from,
+                event_count: c.event_count,
+                distinct_categories: c.distinct_categories,
+                categories: c.categories.clone(),
+                valid_from,
+                valid_until: valid_from + ttl,
+            }
+        })
+        .collect();
+    out.sort_by_key(|e| e.source_ip);
+    out
 }
 
 /// Truncate `dt` to its hour boundary (minutes, seconds, and nanoseconds zeroed).
@@ -240,5 +323,139 @@ mod tests {
         let cfg = FeedConfig::default();
         assert_eq!(cfg.aggressive_ttl, Duration::hours(24));
         assert_eq!(cfg.standard_ttl, Duration::hours(48));
+    }
+
+    /// A candidate last seen `hours_ago`, with a deliberately non-default value in every field so
+    /// a carry-forward that drops one is visible rather than passing on a matching default.
+    fn candidate(last_octet: u8, tier: FeedTier, hours_ago: i64, now: DateTime<Utc>) -> Candidate {
+        Candidate {
+            ip: format!("198.51.100.{last_octet}").parse().unwrap(),
+            tier,
+            first_seen: now - Duration::hours(hours_ago + 500),
+            last_seen: now - Duration::hours(hours_ago),
+            event_count: 37,
+            distinct_categories: 3,
+            categories: vec!["ssh_brute_force".into(), "honeypot_command_exec".into()],
+        }
+    }
+
+    fn now_fixed() -> DateTime<Utc> {
+        "2026-08-19T12:30:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn an_entry_leaves_the_feed_once_its_ttl_lapses_since_last_activity() {
+        let now = now_fixed();
+        let cands = [
+            candidate(1, FeedTier::Aggressive, 2, now),
+            candidate(2, FeedTier::Aggressive, 23, now),
+            candidate(3, FeedTier::Aggressive, 25, now),
+        ];
+
+        let out = materialize(&cands, now, Duration::hours(24), |_| true);
+
+        let kept: Vec<String> = out.iter().map(|e| e.source_ip.to_string()).collect();
+        assert_eq!(kept, ["198.51.100.1", "198.51.100.2"]);
+    }
+
+    #[test]
+    fn validity_is_anchored_on_last_activity_not_on_build_time() {
+        // The defect this guards: anchoring on build time restarts every entry's clock on each
+        // build, so an address seen once and never again is republished with a fresh 24h validity
+        // forever. Anchoring on last_seen means the published valid_until is the truth.
+        let now = now_fixed();
+        let cands = [candidate(1, FeedTier::Aggressive, 20, now)];
+
+        let out = materialize(&cands, now, Duration::hours(24), |_| true);
+
+        let entry = &out[0];
+        assert_eq!(entry.valid_from, coarsen_to_hour(now - Duration::hours(20)));
+        assert_eq!(entry.valid_until, entry.valid_from + Duration::hours(24));
+        // Four hours of validity left, not a fresh twenty-four.
+        assert_eq!(entry.valid_until - now, Duration::hours(3) + Duration::minutes(30));
+    }
+
+    #[test]
+    fn tier_is_taken_as_stored_so_membership_cannot_slide_between_builds() {
+        // Both candidates carry identical evidence; only the stored tier differs. If the builder
+        // re-derived tier from a decaying score, these would not stay in separate files.
+        let now = now_fixed();
+        let cands = [
+            candidate(1, FeedTier::Aggressive, 1, now),
+            candidate(2, FeedTier::Standard, 1, now),
+        ];
+
+        let aggressive = materialize(&cands, now, Duration::hours(24), |c| {
+            c.tier == FeedTier::Aggressive
+        });
+        let standard = materialize(&cands, now, Duration::hours(48), |c| {
+            c.tier == FeedTier::Standard
+        });
+
+        assert_eq!(aggressive.len(), 1);
+        assert_eq!(aggressive[0].source_ip.to_string(), "198.51.100.1");
+        assert_eq!(standard.len(), 1);
+        assert_eq!(standard[0].source_ip.to_string(), "198.51.100.2");
+    }
+
+    #[test]
+    fn retention_windows_nest_and_ignore_tier() {
+        let now = now_fixed();
+        let cands = [
+            candidate(1, FeedTier::Aggressive, 2, now),
+            candidate(2, FeedTier::Standard, 100, now),
+            candidate(3, FeedTier::Standard, 1_000, now),
+        ];
+
+        let day = materialize(&cands, now, Duration::days(1), |_| true);
+        let week = materialize(&cands, now, Duration::days(7), |_| true);
+        let month = materialize(&cands, now, Duration::days(90), |_| true);
+
+        assert_eq!(day.len(), 1);
+        assert_eq!(week.len(), 2);
+        assert_eq!(month.len(), 3);
+        // A consumer picks one file and gets a superset of every shorter one.
+        for shorter in [&day, &week] {
+            for entry in shorter {
+                assert!(month.iter().any(|m| m.source_ip == entry.source_ip));
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_counts_survive_materialisation() {
+        // The stored evidence is what an operator judges an entry by; a carry-forward that
+        // zeroed it would still produce a well-formed feed.
+        let now = now_fixed();
+        let out = materialize(
+            &[candidate(1, FeedTier::Aggressive, 1, now)],
+            now,
+            Duration::hours(24),
+            |_| true,
+        );
+        assert_eq!(out[0].event_count, 37);
+        assert_eq!(out[0].distinct_categories, 3);
+        assert_eq!(
+            out[0].categories,
+            ["ssh_brute_force", "honeypot_command_exec"]
+        );
+        assert_eq!(out[0].tier, FeedTier::Aggressive);
+        assert_eq!(
+            out[0].first_seen,
+            coarsen_to_hour(now - Duration::hours(501))
+        );
+    }
+
+    #[test]
+    fn entries_are_sorted_by_ip() {
+        let now = now_fixed();
+        let cands = [
+            candidate(30, FeedTier::Aggressive, 1, now),
+            candidate(4, FeedTier::Aggressive, 1, now),
+            candidate(200, FeedTier::Aggressive, 1, now),
+        ];
+        let out = materialize(&cands, now, Duration::hours(24), |_| true);
+        let ips: Vec<String> = out.iter().map(|e| e.source_ip.to_string()).collect();
+        assert_eq!(ips, ["198.51.100.4", "198.51.100.30", "198.51.100.200"]);
     }
 }

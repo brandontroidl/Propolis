@@ -277,6 +277,10 @@ async fn main() {
     let feed_config = FeedConfig {
         aggressive_ttl: chrono::Duration::hours(config.aggressive_ttl_hours as i64),
         standard_ttl: chrono::Duration::hours(config.standard_ttl_hours as i64),
+        // Retention windows are configured on the unified `propolis` daemon, which supersedes
+        // this binary in production (see deploy/install.sh). This dev/test binary publishes the
+        // two tiered feeds only.
+        windows: Vec::new(),
     };
 
     tracing::info!(

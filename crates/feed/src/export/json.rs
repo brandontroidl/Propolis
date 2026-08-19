@@ -34,6 +34,11 @@ struct Entry {
     last_seen: String,
     categories: i32,
     events: i32,
+    /// The distinct signal types this address triggered (`ssh_brute_force`,
+    /// `honeypot_malware_upload`, ...). Added alongside the pre-existing `categories` COUNT rather
+    /// than replacing it: the published JSON is a shipped format, so this is additive and a
+    /// consumer reading only the old fields is unaffected.
+    signals: Vec<String>,
 }
 
 /// Render `entries` (already built, sorted, and exclusion-filtered by `FeedBuilder`) as this
@@ -62,6 +67,7 @@ pub fn export_json(
                 last_seen: format_timestamp(e.last_seen),
                 categories: e.distinct_categories,
                 events: e.event_count,
+                signals: e.categories.clone(),
             })
             .collect(),
     };

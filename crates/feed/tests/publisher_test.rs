@@ -56,6 +56,7 @@ fn entry(
         last_seen: build_time,
         event_count: 2,
         distinct_categories: 2,
+        categories: vec!["ssh_brute_force".into(), "port_scan".into()],
         valid_from: build_time,
         valid_until: build_time + ttl,
     }
@@ -81,6 +82,7 @@ fn fail_closed_rejects_the_entire_build_when_any_entry_is_excluded() {
         build_time,
         aggressive: vec![legit],
         standard: vec![leaked],
+        windows: Vec::new(),
     };
 
     let tmp = tempfile::tempdir().unwrap();
@@ -101,6 +103,92 @@ fn fail_closed_rejects_the_entire_build_when_any_entry_is_excluded() {
 }
 
 #[test]
+fn fail_closed_rejects_a_violation_hiding_in_a_retention_window() {
+    // The re-validation pass originally iterated only the two tiers, so an address leaking into a
+    // retention feed was published unchecked - a check that only guards the surfaces which existed
+    // when it was written stops guarding the moment a new one is added. A reserved address in
+    // all-90d.txt discredits the feed exactly as much as one in aggressive.txt.
+    let config = FeedConfig::default();
+    let build_time = dt("2026-07-29T14:00:00Z");
+    let leaked = entry(ip("192.168.4.4"), FeedTier::Standard, build_time, &config);
+
+    let snapshot = FeedSnapshot {
+        build_time,
+        aggressive: Vec::new(),
+        standard: Vec::new(),
+        windows: vec![feed::WindowFeed {
+            label: "90d".into(),
+            retention: chrono::Duration::days(90),
+            entries: vec![leaked],
+        }],
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let output_dir = tmp.path().join("current");
+
+    match Publisher::publish(&snapshot, &output_dir, &permissive(), &config) {
+        Err(PublishError::ExclusionViolation { ip: bad_ip, .. }) => {
+            assert_eq!(bad_ip, ip("192.168.4.4"));
+        }
+        other => panic!("expected ExclusionViolation, got {other:?}"),
+    }
+    assert!(
+        !output_dir.exists(),
+        "a rejected build must never create the output directory"
+    );
+}
+
+#[test]
+fn retention_windows_are_written_as_all_label_files_and_listed_in_the_manifest() {
+    let config = FeedConfig::default();
+    let build_time = dt("2026-07-29T14:00:00Z");
+    let e = entry(ip("45.10.30.11"), FeedTier::Standard, build_time, &config);
+
+    let snapshot = FeedSnapshot {
+        build_time,
+        aggressive: Vec::new(),
+        standard: Vec::new(),
+        windows: vec![
+            feed::WindowFeed {
+                label: "7d".into(),
+                retention: chrono::Duration::days(7),
+                entries: vec![e.clone()],
+            },
+            feed::WindowFeed {
+                label: "90d".into(),
+                retention: chrono::Duration::days(90),
+                entries: vec![e],
+            },
+        ],
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let output_dir = tmp.path().join("current");
+    Publisher::publish(&snapshot, &output_dir, &permissive(), &config).unwrap();
+
+    // Every format the tiers get, the windows get too.
+    for ext in [
+        "txt", "json", "csv", "cidr", "ipset", "nft", "pf", "alias", "hosts", "rpz",
+    ] {
+        assert!(
+            output_dir.join(format!("all-7d.{ext}")).exists(),
+            "all-7d.{ext} must be published"
+        );
+    }
+
+    let manifest = manifest_json(&output_dir);
+    let windows = manifest["windows"].as_array().expect("windows array");
+    assert_eq!(windows.len(), 2);
+    assert_eq!(windows[0]["label"], "7d");
+    assert_eq!(windows[0]["count"], 1);
+    assert_eq!(windows[1]["label"], "90d");
+
+    // The stated validity must be the window's own retention, not a tier TTL or a default.
+    assert_eq!(windows[0]["valid_until"], "2026-08-05T14:00:00Z");
+    assert_eq!(windows[1]["valid_until"], "2026-10-27T14:00:00Z");
+}
+
+#[test]
 fn fail_closed_rejects_when_the_violation_is_in_the_aggressive_tier_too() {
     let config = FeedConfig::default();
     let build_time = dt("2026-07-29T14:00:00Z");
@@ -110,6 +198,7 @@ fn fail_closed_rejects_when_the_violation_is_in_the_aggressive_tier_too() {
         build_time,
         aggressive: vec![leaked],
         standard: Vec::new(),
+        windows: Vec::new(),
     };
 
     let tmp = tempfile::tempdir().unwrap();
@@ -141,6 +230,7 @@ fn operator_delisted_ip_bypassing_the_builder_is_also_rejected() {
             &config,
         )],
         standard: Vec::new(),
+        windows: Vec::new(),
     };
     let exclusions = ExclusionEngine::new(Vec::new(), vec![delisted_ip]);
 
@@ -163,6 +253,7 @@ fn empty_feed_publishes_normally_with_zero_counts() {
         build_time,
         aggressive: Vec::new(),
         standard: Vec::new(),
+        windows: Vec::new(),
     };
 
     let tmp = tempfile::tempdir().unwrap();
@@ -186,7 +277,7 @@ fn empty_feed_publishes_normally_with_zero_counts() {
     let agg_txt = std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap();
     assert!(agg_txt.contains("# Entries: 0"));
     let std_csv = std::fs::read_to_string(output_dir.join("standard.csv")).unwrap();
-    assert_eq!(std_csv, "ip,first_seen,last_seen,categories,events\n");
+    assert_eq!(std_csv, "ip,first_seen,last_seen,categories,events,signals\n");
 }
 
 // ---------- manifest correctness ----------
@@ -207,6 +298,7 @@ fn manifest_has_correct_counts_checksums_and_valid_until() {
             build_time,
             &config,
         )],
+        windows: Vec::new(),
     };
 
     let tmp = tempfile::tempdir().unwrap();
@@ -260,6 +352,7 @@ fn manifest_valid_until_is_correct_even_for_a_zero_entry_tier() {
             build_time,
             &config,
         )],
+        windows: Vec::new(),
     };
 
     let tmp = tempfile::tempdir().unwrap();
@@ -290,6 +383,7 @@ fn atomic_publish_replaces_the_old_version_wholesale_never_mixing_old_and_new() 
             &config,
         )],
         standard: Vec::new(),
+        windows: Vec::new(),
     };
 
     let tmp = tempfile::tempdir().unwrap();
@@ -309,6 +403,7 @@ fn atomic_publish_replaces_the_old_version_wholesale_never_mixing_old_and_new() 
             &config,
         )],
         standard: Vec::new(),
+        windows: Vec::new(),
     };
     assert!(Publisher::publish(&bad_v2, &output_dir, &permissive(), &config).is_err());
     let still_v1 = std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap();
@@ -328,6 +423,7 @@ fn atomic_publish_replaces_the_old_version_wholesale_never_mixing_old_and_new() 
             &config,
         )],
         standard: Vec::new(),
+        windows: Vec::new(),
     };
     Publisher::publish(&snapshot_v2, &output_dir, &permissive(), &config).unwrap();
     let v2_txt = std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap();
@@ -358,6 +454,7 @@ fn publish_works_when_output_dir_does_not_exist_yet_first_ever_publish() {
         build_time,
         aggressive: Vec::new(),
         standard: Vec::new(),
+        windows: Vec::new(),
     };
 
     let tmp = tempfile::tempdir().unwrap();
@@ -375,6 +472,7 @@ fn root_path_as_output_dir_is_rejected_before_any_write() {
         build_time: dt("2026-07-29T14:00:00Z"),
         aggressive: Vec::new(),
         standard: Vec::new(),
+        windows: Vec::new(),
     };
     let result = Publisher::publish(&snapshot, Path::new("/"), &permissive(), &config);
     assert!(matches!(result, Err(PublishError::InvalidOutputDir(_))));

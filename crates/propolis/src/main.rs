@@ -484,6 +484,7 @@ async fn main() {
             upload_unknown: config.vt_upload_unknown,
             scan_interval_secs: config.vt_scan_interval_secs,
             request_delay_ms: 15_000,
+            daily_limit: 450,
         };
 
         handles.push(spawn_supervised("virustotal", cancel.clone(), move |token| {

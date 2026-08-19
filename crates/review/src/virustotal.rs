@@ -16,6 +16,7 @@ pub struct VtConfig {
     pub upload_unknown: bool,
     pub scan_interval_secs: u64,
     pub request_delay_ms: u64,
+    pub daily_limit: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,7 @@ pub async fn scan_spool(
 ) -> Vec<VtResult> {
     let client = reqwest::Client::new();
     let mut results = Vec::new();
+    let mut requests_today: u32 = 0;
 
     for (sensor, dir) in spool_dirs {
         let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
@@ -48,7 +50,13 @@ pub async fn scan_spool(
                 continue;
             }
 
+            if requests_today >= config.daily_limit {
+                tracing::info!(limit = config.daily_limit, "vt: daily request limit reached, pausing until next cycle");
+                return results;
+            }
+
             tokio::time::sleep(tokio::time::Duration::from_millis(config.request_delay_ms)).await;
+            requests_today += 1;
 
             match lookup_hash(&client, &config.api_key, &name).await {
                 Ok(Some(result)) => {

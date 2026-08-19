@@ -19,7 +19,7 @@ use std::net::IpAddr;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Form, Router};
 use chrono::{DateTime, Utc};
@@ -42,6 +42,7 @@ pub fn router() -> Router<AppState> {
         .route("/queue/{ip}/approve", post(approve))
         .route("/queue/{ip}/reject", post(reject))
         .route("/queue/{ip}/snooze", post(snooze))
+        .route("/ip/{ip}/delist", post(delist))
 }
 
 /// The three operator decisions a pending entry can receive. A dedicated enum (rather than
@@ -401,6 +402,33 @@ async fn act(
     let tmpl = state.templates.get_template("queue_row.html")?;
     let html = tmpl.render(context! { row })?;
     Ok(Html(html).into_response())
+}
+
+async fn delist(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(ip): Path<IpAddr>,
+    Form(form): Form<ActionForm>,
+) -> Result<Response, AppError> {
+    if !state.sessions.validate_csrf(&session.id, &form.csrf_token) {
+        return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
+    }
+
+    sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
+        .bind(ip.to_string())
+        .execute(&state.db)
+        .await?;
+
+    sqlx::query(
+        "UPDATE ip_score SET eligible = FALSE, recommended_for_vendor = FALSE, \
+         recommended_for_blocklist = FALSE WHERE source_ip = $1::inet",
+    )
+    .bind(ip.to_string())
+    .execute(&state.db)
+    .await?;
+
+    tracing::info!(%ip, "ip delisted from feed and queue");
+    Ok(Redirect::to(&format!("/ip/{ip}")).into_response())
 }
 
 fn row_view(

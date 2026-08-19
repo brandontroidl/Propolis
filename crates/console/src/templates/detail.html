@@ -2,7 +2,13 @@
 {% block title %}{{ ip }} - Propolis{% endblock %}
 {% block content %}
 <p><a href="/queue">&larr; back to queue</a></p>
-<h1 class="mono">{{ ip }}</h1>
+<div style="display:flex;align-items:center;gap:1rem;">
+<h1 class="mono" style="margin:0;">{{ ip }}</h1>
+<form method="post" action="/ip/{{ ip }}/delist" style="margin:0;">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit" class="btn-danger" onclick="return confirm('Delist {{ ip }} from the feed and queue?')">Delist</button>
+</form>
+</div>
 <div class="stat-row">
   <div class="stat-card stat-card--attention">
     <div class="label">Raw score</div>

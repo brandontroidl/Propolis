@@ -4,7 +4,7 @@
 //! Endpoint contract verified live against `docs.abuseipdb.com` while
 //! implementing this adapter: `POST /api/v2/report`,
 //! `application/x-www-form-urlencoded` body (not JSON), auth via the
-//! `X-Key` header. The live docs' duplicate-report response text
+//! `Key` header. The live docs' duplicate-report response text
 //! ("You can only report the same IP address ... once in 15 minutes") does
 //! not literally contain the design spec's paraphrase "already reported",
 //! and AbuseIPDB does not document any other use of 429 - so this adapter
@@ -65,7 +65,7 @@ impl VendorAdapter for AbuseIpDb {
         let builder = self
             .client
             .post(url)
-            .header("X-Key", &self.api_key)
+            .header("Key", &self.api_key)
             .header("Accept", "application/json")
             .form(&payload);
 

@@ -266,6 +266,10 @@ impl SubmissionRunner {
                 if success {
                     result.submitted += 1;
                 } else {
+                    tracing::warn!(
+                        %ip, vendor = %name, ?status, body = %body.chars().take(200).collect::<String>(),
+                        "vendor submission failed"
+                    );
                     result.failed += 1;
                 }
             }

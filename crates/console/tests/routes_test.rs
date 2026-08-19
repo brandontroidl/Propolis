@@ -66,6 +66,8 @@ fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> App
         startup_time: chrono::Utc::now(),
         version: "test",
         log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),
+        events_ingested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
 }
 
@@ -310,7 +312,8 @@ async fn dashboard_authenticated_returns_stats(pool: PgPool) {
         "expected the feed-entries placeholder when no feed_output_dir is configured: {body}"
     );
     assert!(
-        body.contains(r#"href="/ip/203.0.113.10">"#) || body.contains(r#"href="/ip/203.0.113.11">"#),
+        body.contains(r#"href="/ip/203.0.113.10">"#)
+            || body.contains(r#"href="/ip/203.0.113.11">"#),
         "expected one of the seeded IPs as top attacker in the hero stat: {body}"
     );
     assert!(body.contains("Dashboard"));
@@ -556,7 +559,8 @@ async fn dashboard_empty_state_shows_placeholders(pool: PgPool) {
         "expected the empty-state message for both the protocol-distribution and top-attackers charts: {body}"
     );
     assert!(
-        !body.contains(r#"<canvas id="protoChart""#) && !body.contains(r#"<canvas id="attackerChart""#),
+        !body.contains(r#"<canvas id="protoChart""#)
+            && !body.contains(r#"<canvas id="attackerChart""#),
         "an empty chart canvas must not render when its source list is empty: {body}"
     );
     // The events timeline has no empty-state branch - it always renders 24 zero-filled buckets (a
@@ -755,8 +759,14 @@ async fn dashboard_vendor_submissions_table_shows_at_most_three_rows(pool: PgPoo
     // `submitted_at DESC` + a 3-row template truncation: IPs .201/.202/.203 (indices 0-2) carry the
     // most recent timestamps and must be the ones shown; .204/.205 (the oldest two of the five) must
     // be truncated.
-    assert!(body.contains("203.0.113.201"), "newest submission missing: {body}");
-    assert!(body.contains("203.0.113.202"), "2nd-newest submission missing: {body}");
+    assert!(
+        body.contains("203.0.113.201"),
+        "newest submission missing: {body}"
+    );
+    assert!(
+        body.contains("203.0.113.202"),
+        "2nd-newest submission missing: {body}"
+    );
     assert!(
         body.contains("203.0.113.203"),
         "3rd-newest submission missing: {body}"
@@ -1851,9 +1861,18 @@ async fn detail_groups_events_sharing_session_id_into_an_expanded_session_card(p
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
+    // Matched by structure, not by the exact attribute string: the card later gained an `id` for
+    // deep-linking, which silently broke an exact-text assertion while the behaviour it guards was
+    // never affected. Assert that the card's opening tag carries `open`, and let the rest of the
+    // tag change freely.
+    let card_tag = body
+        .split_once(r#"<details class="session-card""#)
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .map(|(tag, _)| tag)
+        .expect("expected a session card to render");
     assert!(
-        body.contains(r#"<details class="session-card" open>"#),
-        "expected the sole (most-recent) session card to render expanded: {body}"
+        card_tag.contains("open"),
+        "expected the sole (most-recent) session card to render expanded, tag was: {card_tag}"
     );
     assert!(
         body.contains(r#"<span class="session-user mono">user: root</span>"#),
@@ -2381,37 +2400,58 @@ async fn feed_unauthenticated_redirects_to_login(pool: PgPool) {
     assert_eq!(response.headers().get("location").unwrap(), "/login");
 }
 
+/// Writes a published feed export the entries tab can read back, in the shape
+/// `feed::export::export_json` produces.
+fn write_published_feed(dir: &std::path::Path, name: &str, entries: &str) {
+    std::fs::write(
+        dir.join(format!("{name}.json")),
+        format!(
+            r#"{{"meta":{{"generator":"propolis","tier":"{name}","generated":"2026-07-29T14:00:00Z","valid_until":"2026-07-31T14:00:00Z","count":0}},"entries":[{entries}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
 #[sqlx::test(migrations = false)]
-async fn feed_entries_tab_lists_only_approved_recommended_ips_under_their_tier(pool: PgPool) {
+async fn feed_entries_tab_lists_what_was_published_not_a_fresh_derivation(pool: PgPool) {
     migrate(&pool).await;
-    // Approved + recommended: must appear, under its (Standard) tier.
-    seed_recommended(&pool, "203.0.113.70", 60).await;
-    // Recommended but still PENDING (never approved): must be omitted - the entries query joins
-    // on `rq.state = 'approved'`, not merely `recommended_for_blocklist`.
-    seed_recommended(&pool, "203.0.113.71", 60).await;
+    // The database deliberately DISAGREES with the published files: an approved, recommended
+    // address that is not in any published feed, and published addresses with no database rows at
+    // all. The old implementation re-derived this tab from exactly these tables and so disagreed
+    // with the files it claimed to describe - the 8-vs-7 mismatch. The page must report the
+    // published feed, so the database's opinion must not appear here.
+    seed_recommended(&pool, "203.0.113.99", 60).await;
     ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .approve(&pool, "203.0.113.99".parse().unwrap(), None)
+        .await
+        .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("manifest.json"),
-        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":0,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":1,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}}}"#,
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":1,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":1,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}},"windows":[{"label":"7d","count":2,"sha256":"f00d","valid_until":"2026-08-05T14:00:00Z"}]}"#,
     )
     .unwrap();
-    let state = test_state_with_feed_dir(pool.clone(), Some(tmp.path().to_path_buf()));
-    let (session_id, cookie) = state.sessions.create();
-    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
-    let app = test_app(state);
+    write_published_feed(
+        tmp.path(),
+        "aggressive",
+        r#"{"ip":"203.0.113.70","first_seen":"2026-07-20T10:00:00Z","last_seen":"2026-07-29T13:00:00Z","categories":3,"events":47,"signals":["honeypot_malware_upload","ssh_brute_force"]}"#,
+    );
+    write_published_feed(
+        tmp.path(),
+        "standard",
+        r#"{"ip":"203.0.113.71","first_seen":"2026-07-21T10:00:00Z","last_seen":"2026-07-28T13:00:00Z","categories":2,"events":12,"signals":["port_scan"]}"#,
+    );
+    write_published_feed(
+        tmp.path(),
+        "all-7d",
+        r#"{"ip":"203.0.113.72","first_seen":"2026-07-22T10:00:00Z","last_seen":"2026-07-27T13:00:00Z","categories":1,"events":5,"signals":["catchall_probe"]}"#,
+    );
 
-    let response = app
-        .clone()
-        .oneshot(form_request(
-            "/queue/203.0.113.70/approve",
-            format!("csrf_token={csrf_token}"),
-            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let state = test_state_with_feed_dir(pool.clone(), Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
 
     let response = app
         .oneshot(get_request(
@@ -2423,23 +2463,30 @@ async fn feed_entries_tab_lists_only_approved_recommended_ips_under_their_tier(p
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
+
+    for ip in ["203.0.113.70", "203.0.113.71", "203.0.113.72"] {
+        assert!(
+            body.contains(&format!(r#"<a href="/ip/{ip}">{ip}</a>"#)),
+            "published address {ip} missing a detail-page link: {body}"
+        );
+    }
     assert!(
-        body.contains(r#"<a href="/ip/203.0.113.70">203.0.113.70</a>"#),
-        "approved+recommended IP missing a detail-page link: {body}"
+        !body.contains("203.0.113.99"),
+        "an approved address absent from the published files must NOT be listed: {body}"
     );
+
+    // Each address under the panel for the file it was actually published in.
+    let agg = body.find("Aggressive tier").expect("aggressive panel");
+    let std_p = body.find("Standard tier").expect("standard panel");
+    let win = body.find("Last 7d").expect("retention panel");
+    assert!(body.find("203.0.113.70").unwrap() > agg);
+    assert!(body.find("203.0.113.71").unwrap() > std_p);
+    assert!(body.find("203.0.113.72").unwrap() > win);
+
+    // Activity labels are what make an entry actionable, so they must reach the page.
     assert!(
-        !body.contains("203.0.113.71"),
-        "still-pending IP must not appear in the entries tab: {body}"
-    );
-    let standard_panel = body
-        .find("Standard tier")
-        .expect("Standard tier panel missing");
-    let ip_pos = body
-        .find("203.0.113.70")
-        .expect("approved IP missing from body");
-    assert!(
-        ip_pos > standard_panel,
-        "203.0.113.70 (raw ~85, Standard tier) must render under the Standard tier panel: {body}"
+        body.contains("honeypot_malware_upload, ssh_brute_force"),
+        "activity labels missing: {body}"
     );
 }
 
@@ -2526,6 +2573,74 @@ async fn feed_download_404s_when_feed_disabled(pool: PgPool) {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_serves_retention_feeds_but_refuses_anything_path_shaped(pool: PgPool) {
+    // The retention feeds are operator-configured, so the accepted names cannot be a literal list
+    // and are matched by shape instead. Every rejected name below names a file that ACTUALLY
+    // EXISTS in the feed directory, so the name check is the only thing standing between the
+    // request and a 200 - a rejected name that happens to match no file would 404 either way and
+    // would prove nothing about the guard.
+    migrate(&pool).await;
+    let feed_dir = tempfile::tempdir().unwrap();
+    let feed_dir = feed_dir.path();
+    std::fs::write(feed_dir.join("all-90d.txt"), "203.0.113.7\n").unwrap();
+    for decoy in [
+        // Written by the publisher itself, but not a feed anyone should be able to pull.
+        "manifest.txt",
+        // Plausible neighbours in the same directory.
+        "secret.txt",
+        "all-.txt",
+        "all-.txt.txt",
+        "all-90.txt",
+        "all-90x.txt",
+        "all-9.0d.txt",
+        "aggressive..txt",
+    ] {
+        std::fs::write(feed_dir.join(decoy), "must not be served").unwrap();
+    }
+
+    let state = test_state_with_feed_dir(pool, Some(feed_dir.to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let cookie_hdr = format!("{}={cookie}", auth::SESSION_COOKIE);
+
+    let response = app
+        .clone()
+        .oneshot(get_request("/feed/download/all-90d/txt", Some(&cookie_hdr)))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a configured retention feed must be downloadable"
+    );
+
+    for name in [
+        "manifest",
+        "secret",
+        "all-",
+        "all-.txt",
+        "all-90",
+        "all-90x",
+        "all-9.0d",
+        "aggressive.",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/feed/download/{name}/txt"),
+                Some(&cookie_hdr),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{name:?} names a real file on disk and must still be refused"
+        );
+    }
 }
 
 #[sqlx::test(migrations = false)]

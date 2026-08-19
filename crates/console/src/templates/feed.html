@@ -8,78 +8,67 @@
   {% endfor %}
 </div>
 
+{% macro download_row(feed) %}
+<div class="range-selector">
+  <a href="/feed/download/{{ feed }}/txt" class="range-btn">TXT</a>
+  <a href="/feed/download/{{ feed }}/json" class="range-btn">JSON</a>
+  <a href="/feed/download/{{ feed }}/csv" class="range-btn">CSV</a>
+  <a href="/feed/download/{{ feed }}/cidr" class="range-btn">CIDR</a>
+  <a href="/feed/download/{{ feed }}/ipset" class="range-btn">ipset</a>
+  <a href="/feed/download/{{ feed }}/nft" class="range-btn">nftables</a>
+  <a href="/feed/download/{{ feed }}/pf" class="range-btn">pf</a>
+  <a href="/feed/download/{{ feed }}/alias" class="range-btn">pfSense</a>
+  <a href="/feed/download/{{ feed }}/hosts" class="range-btn">hosts</a>
+  <a href="/feed/download/{{ feed }}/rpz" class="range-btn">RPZ</a>
+</div>
+{% endmacro %}
+
+{% macro entry_table(rows, empty_text) %}
+{% if rows %}
+<table class="table-compact">
+  <thead><tr><th>IP</th><th>Events</th><th>Activity</th><th>First seen</th><th>Last seen</th></tr></thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
+      <td class="mono">{{ r.event_count }}</td>
+      <td class="dim">{{ r.signals }}</td>
+      <td class="seen">{{ r.first_seen }}</td>
+      <td class="seen">{{ r.last_seen }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty-line">{{ empty_text }}</p>
+{% endif %}
+{% endmacro %}
+
 {% if tab == "entries" %}
   {% if has_build %}
     <div class="panel">
       <div class="panel-head">
         <span>Aggressive tier <span class="dim">({{ aggressive_entries | length }})</span></span>
-        <div class="range-selector">
-          <a href="/feed/download/aggressive/txt" class="range-btn">TXT</a>
-          <a href="/feed/download/aggressive/json" class="range-btn">JSON</a>
-          <a href="/feed/download/aggressive/csv" class="range-btn">CSV</a>
-          <a href="/feed/download/aggressive/cidr" class="range-btn">CIDR</a>
-          <a href="/feed/download/aggressive/ipset" class="range-btn">ipset</a>
-          <a href="/feed/download/aggressive/nft" class="range-btn">nftables</a>
-          <a href="/feed/download/aggressive/pf" class="range-btn">pf</a>
-          <a href="/feed/download/aggressive/alias" class="range-btn">pfSense</a>
-          <a href="/feed/download/aggressive/hosts" class="range-btn">hosts</a>
-          <a href="/feed/download/aggressive/rpz" class="range-btn">RPZ</a>
-        </div>
+        {{ download_row("aggressive") }}
       </div>
-      {% if aggressive_entries %}
-      <table class="table-compact">
-        <thead><tr><th>IP</th><th>Score</th><th>Events</th><th>First seen</th><th>Last seen</th></tr></thead>
-        <tbody>
-          {% for r in aggressive_entries %}
-          <tr>
-            <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
-            <td class="mono"><span class="meter"><span class="meter-fill meter-fill--crit" style="--pct: {{ r.score_pct }}%"></span></span>{{ r.score }}</td>
-            <td class="mono">{{ r.event_count }}</td>
-            <td class="seen">{{ r.first_seen }}</td>
-            <td class="seen">{{ r.last_seen }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      {% else %}
-      <p class="empty-line">no aggressive-tier entries recommended for the blocklist</p>
-      {% endif %}
+      {{ entry_table(aggressive_entries, "no addresses in the aggressive tier") }}
     </div>
     <div class="panel">
       <div class="panel-head">
         <span>Standard tier <span class="dim">({{ standard_entries | length }})</span></span>
-        <div class="range-selector">
-          <a href="/feed/download/standard/txt" class="range-btn">TXT</a>
-          <a href="/feed/download/standard/json" class="range-btn">JSON</a>
-          <a href="/feed/download/standard/csv" class="range-btn">CSV</a>
-          <a href="/feed/download/standard/cidr" class="range-btn">CIDR</a>
-          <a href="/feed/download/standard/ipset" class="range-btn">ipset</a>
-          <a href="/feed/download/standard/nft" class="range-btn">nftables</a>
-          <a href="/feed/download/standard/pf" class="range-btn">pf</a>
-          <a href="/feed/download/standard/alias" class="range-btn">pfSense</a>
-          <a href="/feed/download/standard/hosts" class="range-btn">hosts</a>
-          <a href="/feed/download/standard/rpz" class="range-btn">RPZ</a>
-        </div>
+        {{ download_row("standard") }}
       </div>
-      {% if standard_entries %}
-      <table class="table-compact">
-        <thead><tr><th>IP</th><th>Score</th><th>Events</th><th>First seen</th><th>Last seen</th></tr></thead>
-        <tbody>
-          {% for r in standard_entries %}
-          <tr>
-            <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
-            <td class="mono"><span class="meter"><span class="meter-fill meter-fill--warn" style="--pct: {{ r.score_pct }}%"></span></span>{{ r.score }}</td>
-            <td class="mono">{{ r.event_count }}</td>
-            <td class="seen">{{ r.first_seen }}</td>
-            <td class="seen">{{ r.last_seen }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      {% else %}
-      <p class="empty-line">no standard-tier entries recommended for the blocklist</p>
-      {% endif %}
+      {{ entry_table(standard_entries, "no addresses in the standard tier") }}
     </div>
+    {% for label, rows in window_entries %}
+    <div class="panel">
+      <div class="panel-head">
+        <span>Last {{ label }} <span class="dim">({{ rows | length }})</span></span>
+        {{ download_row("all-" ~ label) }}
+      </div>
+      {{ entry_table(rows, "no activity in this window") }}
+    </div>
+    {% endfor %}
   {% else %}
   <p class="empty-line">{% if feed_disabled %}feed builder is disabled on this node{% else %}feed enabled - awaiting first build{% endif %}</p>
   {% endif %}
@@ -92,7 +81,7 @@
     </div>
   </div>
   <div class="panel">
-    <div class="panel-head">Entry counts by tier</div>
+    <div class="panel-head">Blocklist tiers</div>
     <table>
       <thead><tr><th>Tier</th><th>Entries</th><th>Valid until</th></tr></thead>
       <tbody>
@@ -109,6 +98,24 @@
       </tbody>
     </table>
   </div>
+  {% if windows %}
+  <div class="panel">
+    <div class="panel-head">Retention feeds <span class="dim">every approved address active in the window, regardless of tier</span></div>
+    <table>
+      <thead><tr><th>Window</th><th>Entries</th><th>Valid until</th><th>File</th></tr></thead>
+      <tbody>
+        {% for w in windows %}
+        <tr>
+          <td>Last {{ w.label }}</td>
+          <td class="mono">{{ w.count }}</td>
+          <td class="seen">{{ w.valid_until }}</td>
+          <td class="mono dim">all-{{ w.label }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
   {% else %}
   <p class="empty-line">{% if feed_disabled %}feed builder is disabled on this node{% else %}feed enabled - awaiting first build{% endif %}</p>
   {% endif %}

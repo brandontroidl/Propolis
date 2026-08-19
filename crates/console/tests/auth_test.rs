@@ -39,6 +39,8 @@ fn test_state(db: PgPool) -> AppState {
         startup_time: chrono::Utc::now(),
         version: "test",
         log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),
+        events_ingested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
 }
 

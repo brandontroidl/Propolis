@@ -18,23 +18,25 @@
 //! `feed::publisher::Manifest` is crate-private there too (no consumer needed it publicly before
 //! this).
 //!
-//! Entries tab (console-forensics task 8): `?tab=entries` lists the IPs actually recommended for
-//! the blocklist, grouped by tier - a live query over `review_queue`/`ip_score`, not a parse of
-//! the published feed files themselves (those are plain-text/CSV/JSON export formats, not a
-//! convenient read-back source, and the DB is the current live truth the next build will publish
-//! from). This can drift slightly from the last published `manifest.json` snapshot (a decision
-//! made after the last build, or score decay since) - an accepted, momentary skew, the same kind
-//! `routes::queue`'s live-decayed re-read already accepts for the review queue itself.
+//! Entries tab: `?tab=entries` lists the addresses actually IN the published feed, read back from
+//! the `{feed}.json` export files rather than re-queried from the database.
 //!
-//! Download endpoint (console-forensics task 8): `GET /feed/download/{tier}/{format}` streams one
-//! of the four export files `feed::publisher::write_tier` writes per tier
-//! (`{tier}.{txt,json,csv,cidr}`) straight off disk. `tier` and `format` are both matched against
-//! a fixed allow-list before ever touching the filesystem - never interpolated into the path
-//! unchecked - so this cannot become a traversal primitive over an operator-editable URL segment.
-//! 404 (not the generic `AppError` 503) on every "nothing to serve" case alike: feed disabled,
-//! unknown tier/format, or the build simply hasn't produced that file yet - all normal, expected
-//! states rather than a database/template failure, mirroring `routes::detail`'s own direct-404
-//! treatment of "no such IP" rather than routing through `AppError`.
+//! It used to be a live query that re-derived each address's score decayed to the moment of the
+//! request, and decided tier and membership from that. Since the builder decided the same things
+//! from its own re-derivation at a different moment, the two disagreed constantly and visibly: the
+//! Status tab reported 8 entries in a tier while Entries listed 7, and both were "correct" for the
+//! instant they ran. Reading the published files removes the disagreement by construction - there
+//! is no second derivation left to drift. The page now describes the feed as published, which is
+//! what an operator is actually asking when they open it, and it agrees with `manifest.json`
+//! because both come from the same build.
+//!
+//! Download endpoint: `GET /feed/download/{feed}/{format}` streams one export file straight off
+//! disk. `feed` and `format` are both matched against a fixed pattern before ever touching the
+//! filesystem - never interpolated into the path unchecked - so this cannot become a traversal
+//! primitive over an operator-editable URL segment. 404 (not the generic `AppError` 503) on every
+//! "nothing to serve" case alike: feed disabled, unknown feed/format, or the build simply hasn't
+//! produced that file yet - all normal, expected states rather than a database/template failure,
+//! mirroring `routes::detail`'s own direct-404 treatment of "no such IP".
 
 use std::path::Path;
 
@@ -43,11 +45,8 @@ use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use core_scoring::{FeedTier, read_score};
 use minijinja::context;
-use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
 
 use crate::AppState;
 use crate::auth::Session;
@@ -90,6 +89,11 @@ struct FeedQuery {
 pub(crate) struct Manifest {
     pub(crate) build_time: String,
     pub(crate) tiers: ManifestTiers,
+    /// Retention feeds. `default` rather than required so a `manifest.json` written by a build
+    /// from before retention feeds existed still parses instead of collapsing the whole page to
+    /// the "no builds yet" empty state.
+    #[serde(default)]
+    pub(crate) windows: Vec<WindowManifest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +104,13 @@ pub(crate) struct ManifestTiers {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TierManifest {
+    pub(crate) count: usize,
+    pub(crate) valid_until: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct WindowManifest {
+    pub(crate) label: String,
     pub(crate) count: usize,
     pub(crate) valid_until: String,
 }
@@ -129,11 +140,27 @@ async fn feed_page(
         version,
     } = base_context(&state.db, state.startup_time, state.version).await;
 
-    // Only the entries tab needs the join - the status tab's context below is unchanged from
-    // before this task, so there is no reason to pay for the query on every `/feed` hit.
-    let (aggressive_entries, standard_entries) = match query.tab {
-        Tab::Entries => fetch_feed_entries(&state.db).await?,
-        Tab::Status => (Vec::new(), Vec::new()),
+    // Only the entries tab reads the export files back; the status tab needs only the manifest.
+    let dir = state.feed_output_dir.as_deref();
+    let (aggressive_entries, standard_entries, window_entries) = match query.tab {
+        Tab::Entries => {
+            let windows: Vec<(String, Vec<FeedEntryRow>)> = manifest
+                .as_ref()
+                .map(|m| m.windows.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|w| {
+                    read_published_feed(dir, &format!("all-{}", w.label))
+                        .map(|rows| (w.label.clone(), rows))
+                })
+                .collect();
+            (
+                read_published_feed(dir, "aggressive").unwrap_or_default(),
+                read_published_feed(dir, "standard").unwrap_or_default(),
+                windows,
+            )
+        }
+        Tab::Status => (Vec::new(), Vec::new(), Vec::new()),
     };
     let tab = query.tab.as_str();
 
@@ -152,9 +179,11 @@ async fn feed_page(
             aggressive_valid_until => m.tiers.aggressive.valid_until,
             standard_count => m.tiers.standard.count,
             standard_valid_until => m.tiers.standard.valid_until,
+            windows => m.windows,
             tab,
             aggressive_entries,
             standard_entries,
+            window_entries,
         })?,
         None => tmpl.render(context! {
             csrf_token,
@@ -164,103 +193,82 @@ async fn feed_page(
             version,
             feed_disabled,
             has_build => false,
+            windows => Vec::<WindowManifest>::new(),
             tab,
             aggressive_entries,
             standard_entries,
+            window_entries,
         })?,
     };
     Ok(Html(html))
 }
 
-/// One IP recommended for the blocklist, as rendered in the entries tab's per-tier table. Every
-/// numeric/timestamp field is pre-formatted in Rust, matching `routes::detail`/`routes::queue`'s
-/// own convention of keeping the template free of `Decimal`/`DateTime` formatting logic.
+/// One address as it appears in a published feed file, ready to render.
+///
+/// There is deliberately no score column. The score is what the page used to lead with, and it was
+/// actively misleading: it is a live-decaying value, while feed membership is now fixed at
+/// observation time, so an operator watching a score tick down below a tier threshold reasonably
+/// expected the entry to move and it did not. The per-address score still lives on the detail page,
+/// one click away, where it is not standing next to a membership claim it does not govern.
 #[derive(Debug, Serialize)]
 struct FeedEntryRow {
     ip: String,
-    score: String,
-    score_pct: u32,
     event_count: i32,
     first_seen: String,
     last_seen: String,
+    /// The activity labels this address triggered, joined for display.
+    signals: String,
 }
 
-/// The entries tab's query (module doc comment): every IP with an *approved* `review_queue`
-/// decision whose live `ip_score` still recommends it for the blocklist, split into the
-/// aggressive/standard buckets the template renders as two panels.
+/// One published feed file's parsed contents.
+#[derive(Debug, Deserialize)]
+struct PublishedFeed {
+    entries: Vec<PublishedEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublishedEntry {
+    ip: String,
+    first_seen: String,
+    last_seen: String,
+    events: i32,
+    /// Absent in files written before activity labels existed, so defaulted rather than required:
+    /// an older file must still render, not blank the tab.
+    #[serde(default)]
+    signals: Vec<String>,
+}
+
+/// Reads `{name}.json` from the feed output directory and renders its entries.
 ///
-/// A row whose `tier` is `NULL` is dropped with a warning rather than guessed into a bucket: per
-/// `core-scoring`'s own schema, `tier` is only ever set alongside `recommended_for_blocklist`, so
-/// this should not occur in practice (the same "should not happen but fail closed, not panic"
-/// posture `routes::error::AppError::missing_projection` documents for the analogous case on the
-/// detail page).
-async fn fetch_feed_entries(
-    db: &PgPool,
-) -> Result<(Vec<FeedEntryRow>, Vec<FeedEntryRow>), AppError> {
-    // Candidate set matches `feed::FeedBuilder::build`'s own query exactly. The stored gate
-    // columns are only a cheap prefilter here: they were computed when the row was last
-    // written, so an IP that has since decayed below the gates is still selected and is
-    // rejected by the re-derive below.
-    let rows = sqlx::query(
-        "SELECT host(s.source_ip) AS ip FROM ip_score s \
-         INNER JOIN review_queue q ON q.source_ip = s.source_ip \
-         WHERE s.recommended_for_blocklist = true AND s.eligible = true \
-           AND q.state = 'approved'",
+/// `None` for every "not available" case alike - no feed directory configured, the file absent
+/// because the build has not produced it, or unparseable - matching [`read_manifest`]'s posture.
+/// A feed that exists but is empty returns `Some(vec![])`, which the template distinguishes from
+/// `None`: "nothing in this feed" is a different statement from "no build yet".
+fn read_published_feed(dir: Option<&Path>, name: &str) -> Option<Vec<FeedEntryRow>> {
+    let bytes = std::fs::read(dir?.join(format!("{name}.json"))).ok()?;
+    let parsed: PublishedFeed = serde_json::from_slice(&bytes).ok()?;
+    Some(
+        parsed
+            .entries
+            .into_iter()
+            .map(|e| FeedEntryRow {
+                ip: e.ip,
+                event_count: e.events,
+                first_seen: display_timestamp(&e.first_seen),
+                last_seen: display_timestamp(&e.last_seen),
+                signals: e.signals.join(", "),
+            })
+            .collect(),
     )
-    .fetch_all(db)
-    .await?;
+}
 
-    let mut aggressive: Vec<(f64, FeedEntryRow)> = Vec::new();
-    let mut standard: Vec<(f64, FeedEntryRow)> = Vec::new();
-
-    for row in rows {
-        let ip_text: String = row.try_get("ip")?;
-        let Ok(ip) = ip_text.parse::<std::net::IpAddr>() else {
-            tracing::warn!(%ip_text, "feed entries: unparseable stored source_ip; omitting");
-            continue;
-        };
-
-        // Re-derive against the current wall clock, exactly as the feed builder does before
-        // publishing. Reading the stored columns instead shows each IP's score frozen at its
-        // last event, so an entry that has decayed out of the published file would still be
-        // listed here - this page and the file it describes must not disagree.
-        let Some(score) = read_score(db, ip).await? else {
-            continue;
-        };
-        if !score.eligible || !score.recommended_for_blocklist {
-            continue;
-        }
-        let Some(tier) = score.tier else {
-            tracing::warn!(%ip, "feed entries: passes gates but tier=None; omitting fail-closed");
-            continue;
-        };
-
-        let score_f64 = score.raw_score.to_f64().unwrap_or(0.0);
-        let entry = FeedEntryRow {
-            ip: ip_text,
-            score: format!("{:.1}", score.raw_score),
-            score_pct: score_f64.clamp(0.0, 100.0).round() as u32,
-            event_count: score.event_count,
-            first_seen: format_timestamp(score.first_seen),
-            last_seen: format_timestamp(score.last_seen),
-        };
-        match tier {
-            FeedTier::Aggressive => aggressive.push((score_f64, entry)),
-            FeedTier::Standard => standard.push((score_f64, entry)),
-        }
-    }
-
-    // Sort on the full-precision decayed score, not the rounded percentage the meter uses.
-    let by_score_desc = |a: &(f64, FeedEntryRow), b: &(f64, FeedEntryRow)| {
-        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-    };
-    aggressive.sort_by(by_score_desc);
-    standard.sort_by(by_score_desc);
-
-    Ok((
-        aggressive.into_iter().map(|(_, e)| e).collect(),
-        standard.into_iter().map(|(_, e)| e).collect(),
-    ))
+/// Re-formats an exported RFC 3339 timestamp into the console's own display format, so these rows
+/// read the same as every other timestamp in the UI. Falls back to the raw string rather than
+/// blanking the cell if it does not parse - a display concern is never worth losing the row over.
+fn display_timestamp(raw: &str) -> String {
+    raw.parse::<chrono::DateTime<chrono::Utc>>()
+        .map(format_timestamp)
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 /// `GET /feed/download/{tier}/{format}` - streams one export file straight off disk (module doc
@@ -274,7 +282,7 @@ async fn download_feed(
     let Some(dir) = state.feed_output_dir.as_deref() else {
         return download_not_found();
     };
-    if !matches!(tier.as_str(), "aggressive" | "standard") {
+    if !is_known_feed_name(&tier) {
         return download_not_found();
     }
     let (extension, content_type) = match format.as_str() {
@@ -309,6 +317,27 @@ async fn download_feed(
             download_not_found()
         }
     }
+}
+
+/// The set of feed names this endpoint will build a path from: the two fixed tiers, plus
+/// `all-{count}{h|d}` for the operator-configured retention feeds.
+///
+/// The retention set is configurable, so it cannot be a literal list here - but it is still an
+/// exact pattern, not a sanitisation pass. Every accepted name is `[a-z]+` or `all-` followed by
+/// digits and a single unit character, which admits no `.`, `/`, or `\`, so no accepted value can
+/// traverse out of the feed directory. Validating the shape rather than stripping bad characters
+/// is what keeps that true: a stripper has to anticipate every encoding, a shape check does not.
+fn is_known_feed_name(name: &str) -> bool {
+    if matches!(name, "aggressive" | "standard") {
+        return true;
+    }
+    let Some(window) = name.strip_prefix("all-") else {
+        return false;
+    };
+    let Some((count, unit)) = window.split_at_checked(window.len().saturating_sub(1)) else {
+        return false;
+    };
+    matches!(unit, "h" | "d") && !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn download_not_found() -> Response {

@@ -103,10 +103,13 @@ pub fn environment() -> Environment<'static> {
         .expect("logs.html must be a valid template");
     env.add_template("ips.html", IPS_HTML)
         .expect("ips.html must be a valid template");
+    env.add_template("integrity.html", INTEGRITY_HTML)
+        .expect("integrity.html must be a valid template");
     env
 }
 
 const IPS_HTML: &str = include_str!("templates/ips.html");
+const INTEGRITY_HTML: &str = include_str!("templates/integrity.html");
 
 #[cfg(test)]
 mod tests {

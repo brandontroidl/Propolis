@@ -30,7 +30,10 @@
 
 use std::net::IpAddr;
 
-use sensor_wire::{PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SensorEvent, WIRE_VERSION};
+use sensor_wire::{
+    PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_FILE_DOWNLOAD, SensorEvent,
+    WIRE_VERSION,
+};
 
 use crate::fakefs::FakeFs;
 use crate::sanitize_value;
@@ -118,7 +121,32 @@ impl FakeShell {
         let parts: Vec<&str> = line.split_whitespace().collect();
         let output = self.dispatch(&parts);
 
-        (output, vec![event])
+        let mut events = vec![event];
+
+        if matches!(parts.first().copied(), Some("wget") | Some("curl")) {
+            let url = first_non_flag_arg(&parts[1..]).unwrap_or("");
+            if !url.is_empty() {
+                let sanitized_url = sanitize_value(url, MAX_URL_LEN);
+                events.push(SensorEvent {
+                    v: WIRE_VERSION,
+                    source_ip: self.ctx.source_ip,
+                    wan_ip: self.ctx.wan_ip,
+                    sensor: self.ctx.protocol_label.clone(),
+                    signal_type: SIGNAL_HONEYPOT_FILE_DOWNLOAD.into(),
+                    protocol: PROTO_TCP.into(),
+                    authenticated: self.ctx.authenticated,
+                    observed_at: chrono::Utc::now(),
+                    metadata: serde_json::json!({
+                        "protocol_label": self.ctx.protocol_label,
+                        "url": sanitized_url,
+                    }),
+                    sample: None,
+                    session_id: self.ctx.session_id,
+                });
+            }
+        }
+
+        (output, events)
     }
 
     /// Produce the canned terminal output for one already-tokenized, non-empty command line.

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Chain integrity - Propolis{% endblock %}
+{% block content %}
+<h2>Chain integrity</h2>
+
+<div class="panel">
+  <div class="panel-head">Event chain</div>
+  <div class="panel-body">
+    <p>{{ event_count }} events in the ledger. Each event carries a SHA-256 hash chained to its predecessor.</p>
+    <form method="post" action="/integrity/verify" style="margin-top:1rem;">
+      <button type="submit" class="btn">Verify chain</button>
+    </form>
+    {% if verified %}
+    <div style="margin-top:1rem;padding:0.8rem;border:1px solid {% if intact %}var(--good){% else %}var(--alert){% endif %};border-radius:4px;">
+      {% if intact %}
+      <span style="color:var(--good-text);">{{ status }}</span>
+      {% else %}
+      <span style="color:var(--alert-text);">{{ status }}</span>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

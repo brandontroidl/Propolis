@@ -54,7 +54,7 @@ pub fn export_pfsense_alias(_tier_name: &str, entries: &[FeedEntry]) -> String {
 }
 
 pub fn export_hosts(entries: &[FeedEntry]) -> String {
-    let mut out = String::from("# Propolis blocklist - reverse DNS sinkhole\n");
+    let mut out = String::from("# Propolis blocklist - reverse DNS sinkhole\n# IPv6 entries omitted (no reverse-DNS sinkhole format)\n");
     for entry in entries {
         let ip = entry.source_ip;
         let reversed = match ip {
@@ -71,7 +71,7 @@ pub fn export_hosts(entries: &[FeedEntry]) -> String {
 
 pub fn export_rpz(tier_name: &str, generated: DateTime<Utc>, entries: &[FeedEntry]) -> String {
     let mut out = format!(
-        "; Propolis RPZ - {} tier\n; Generated: {}\n$TTL 300\n",
+        "; Propolis RPZ - {} tier\n; Generated: {}\n; IPv6 entries omitted\n$TTL 300\n",
         tier_name,
         format_timestamp(generated),
     );

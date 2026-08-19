@@ -18,6 +18,7 @@ pub mod login;
 pub mod logs;
 pub mod metrics;
 pub mod queue;
+pub mod samples;
 pub mod search;
 pub(crate) mod sparkline;
 
@@ -37,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .merge(search::router())
         .merge(ips::router())
         .merge(integrity::router())
+        .merge(samples::router())
         .merge(logs::router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

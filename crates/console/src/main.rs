@@ -226,6 +226,8 @@ async fn main() {
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
         log_buffer,
+        events_ingested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     tracing::info!(bind = %bind_addr, "console: starting");

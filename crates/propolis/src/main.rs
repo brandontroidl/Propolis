@@ -46,6 +46,8 @@ async fn run_intake_sensor(
     cursor_dir: PathBuf,
     poll_interval: Duration,
     cancel: CancellationToken,
+    ingested_counter: Arc<std::sync::atomic::AtomicU64>,
+    rejected_counter: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let SensorLogConfig { name, log_path } = sensor;
     let tailer = LogTailer::new(log_path, cursor_dir);
@@ -64,6 +66,8 @@ async fn run_intake_sensor(
         let result = runner.run_batch().await;
 
         if result.ingested > 0 || result.rejected > 0 || result.errors > 0 {
+            ingested_counter.fetch_add(result.ingested as u64, std::sync::atomic::Ordering::Relaxed);
+            rejected_counter.fetch_add(result.rejected as u64, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 sensor = %name,
                 ingested = result.ingested,
@@ -190,6 +194,8 @@ async fn run_console(
     session_secret: [u8; 32],
     feed_output_dir: Option<PathBuf>,
     log_buffer: Arc<LogBuffer>,
+    events_ingested: Arc<std::sync::atomic::AtomicU64>,
+    events_rejected: Arc<std::sync::atomic::AtomicU64>,
     cancel: CancellationToken,
 ) {
     let passwords = Arc::new(PasswordStore::new(&password));
@@ -203,6 +209,8 @@ async fn run_console(
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
         log_buffer,
+        events_ingested,
+        events_rejected,
     };
 
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
@@ -374,6 +382,9 @@ async fn main() {
     let cancel = CancellationToken::new();
     let mut handles = Vec::new();
 
+    let events_ingested = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let events_rejected = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // 5. Spawn intake tailers - one supervised task per sensor log.
     for sensor in config.sensor_logs {
         let pool = pool.clone();
@@ -381,6 +392,8 @@ async fn main() {
         let poll_interval = config.poll_interval;
         let cancel = cancel.clone();
         let sensor_name: &'static str = Box::leak(sensor.name.clone().into_boxed_str());
+        let ing = events_ingested.clone();
+        let rej = events_rejected.clone();
 
         handles.push(spawn_supervised(
             sensor_name,
@@ -389,8 +402,10 @@ async fn main() {
                 let sensor = sensor.clone();
                 let pool = pool.clone();
                 let cursor_dir = cursor_dir.clone();
+                let ing = ing.clone();
+                let rej = rej.clone();
                 async move {
-                    run_intake_sensor(sensor, pool, cursor_dir, poll_interval, token).await;
+                    run_intake_sensor(sensor, pool, cursor_dir, poll_interval, token, ing, rej).await;
                 }
             },
         ));
@@ -473,12 +488,16 @@ async fn main() {
             None
         };
         let log_buffer = log_buffer.clone();
+        let ing = events_ingested.clone();
+        let rej = events_rejected.clone();
 
         handles.push(spawn_supervised("console", cancel.clone(), move |token| {
             let pool = pool_c.clone();
             let password = password.clone();
             let feed_dir = feed_output_dir.clone();
             let log_buffer = log_buffer.clone();
+            let ing = ing.clone();
+            let rej = rej.clone();
             async move {
                 run_console(
                     pool,
@@ -487,6 +506,8 @@ async fn main() {
                     session_secret,
                     feed_dir,
                     log_buffer,
+                    ing,
+                    rej,
                     token,
                 )
                 .await;

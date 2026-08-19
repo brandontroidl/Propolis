@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Captured samples - Propolis{% endblock %}
+{% block content %}
+<h2>Captured samples <span class="dim">({{ total }})</span></h2>
+
+{% if samples %}
+<table class="table-compact">
+  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th></th></tr></thead>
+  <tbody>
+    {% for s in samples %}
+    <tr>
+      <td class="mono" title="{{ s.sha256 }}">{{ s.sha256_short }}...</td>
+      <td class="mono">{{ s.size }}</td>
+      <td>{{ s.sensor }}</td>
+      <td><a href="/samples/download/{{ s.sha256 }}" class="range-btn">Download</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty-line">no captured samples in the spool</p>
+{% endif %}
+{% endblock %}

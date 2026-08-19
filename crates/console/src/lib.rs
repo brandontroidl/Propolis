@@ -57,4 +57,6 @@ pub struct AppState {
     /// `templates` and installed as a `tracing_subscriber::Layer` by whichever binary constructs
     /// this `AppState` - see `log_buffer`'s own module doc comment.
     pub log_buffer: Arc<LogBuffer>,
+    pub events_ingested: Arc<std::sync::atomic::AtomicU64>,
+    pub events_rejected: Arc<std::sync::atomic::AtomicU64>,
 }

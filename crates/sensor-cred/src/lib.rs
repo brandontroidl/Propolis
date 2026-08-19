@@ -38,17 +38,24 @@ async fn start_with<F, Fut>(
     handler: F,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)>
 where
-    F: Fn(tokio::net::TcpStream, SocketAddr, Arc<EventEmitter>, Arc<WanResolver>, ConnectionBounds) -> Fut
+    F: Fn(
+            tokio::net::TcpStream,
+            SocketAddr,
+            sensor_framework::Uuid,
+            Arc<EventEmitter>,
+            Arc<WanResolver>,
+            ConnectionBounds,
+        ) -> Fut
         + Send
         + Sync
         + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    run_tcp_listener(addr, bounds.clone(), move |stream, peer| {
+    run_tcp_listener(addr, bounds.clone(), move |stream, peer, session_id| {
         let emitter = emitter.clone();
         let wan_resolver = wan_resolver.clone();
         let bounds = bounds.clone();
-        handler(stream, peer, emitter, wan_resolver, bounds)
+        handler(stream, peer, session_id, emitter, wan_resolver, bounds)
     })
     .await
 }

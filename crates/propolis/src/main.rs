@@ -21,6 +21,7 @@ use supervisor::spawn_supervised;
 
 use console::AppState;
 use console::auth::{PasswordStore, RateLimiter, SessionStore};
+use console::log_buffer::LogBuffer;
 use feed::{ExclusionEngine, FeedBuilder, FeedConfig, Publisher};
 use intake::runner::IntakeRunner;
 use intake::tailer::LogTailer;
@@ -29,6 +30,11 @@ use review::submit::SubmissionRunner;
 use review::vendor::{AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many recent tracing events `console::routes::logs`'s viewer keeps in memory for a
+/// freshly loaded page (`console::log_buffer::LogBuffer::new`'s own doc comment - live-streamed
+/// entries after that are unbounded by this, only by the browser tab's own cap).
+const LOG_BUFFER_CAPACITY: usize = 1000;
 
 // ---- subsystem loops ----
 
@@ -183,6 +189,7 @@ async fn run_console(
     password: String,
     session_secret: [u8; 32],
     feed_output_dir: Option<PathBuf>,
+    log_buffer: Arc<LogBuffer>,
     cancel: CancellationToken,
 ) {
     let passwords = Arc::new(PasswordStore::new(&password));
@@ -195,6 +202,7 @@ async fn run_console(
         feed_output_dir,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
+        log_buffer,
     };
 
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
@@ -297,13 +305,24 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
-    // Tracing: honor RUST_LOG if set, otherwise default to info.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Tracing: honor RUST_LOG if set, otherwise default to info. The console's live `/logs`
+    // viewer (`console::routes::logs`) needs a copy of every event this process logs, so
+    // `LogBufferLayer` is layered onto the same subscriber stack as the existing `fmt` output
+    // rather than given a separate filter of its own - see that layer's own doc comment for why
+    // adding the `EnvFilter` via `.with()` here is what makes it see exactly what `fmt` prints,
+    // no more.
+    let log_buffer = Arc::new(LogBuffer::new(LOG_BUFFER_CAPACITY));
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .with(console::log_buffer::LogBufferLayer::new(log_buffer.clone()))
+            .init();
+    }
 
     // 1. Parse and validate config (fail fast).
     let config = match config::load_config() {
@@ -453,13 +472,24 @@ async fn main() {
         } else {
             None
         };
+        let log_buffer = log_buffer.clone();
 
         handles.push(spawn_supervised("console", cancel.clone(), move |token| {
             let pool = pool_c.clone();
             let password = password.clone();
             let feed_dir = feed_output_dir.clone();
+            let log_buffer = log_buffer.clone();
             async move {
-                run_console(pool, bind, password, session_secret, feed_dir, token).await;
+                run_console(
+                    pool,
+                    bind,
+                    password,
+                    session_secret,
+                    feed_dir,
+                    log_buffer,
+                    token,
+                )
+                .await;
             }
         }));
     }

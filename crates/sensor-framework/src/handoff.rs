@@ -230,6 +230,7 @@ mod tests {
             observed_at: chrono::Utc::now(),
             metadata: serde_json::json!({}),
             sample,
+            session_id: None,
         }
     }
 

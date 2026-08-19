@@ -21,7 +21,7 @@ fn test_bounds() -> ConnectionBounds {
 async fn tcp_accept_and_handler_called() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(1);
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let (bound_addr, handle) = run_tcp_listener(addr, test_bounds(), move |stream, peer| {
+    let (bound_addr, handle) = run_tcp_listener(addr, test_bounds(), move |stream, peer, _id| {
         let tx = tx.clone();
         async move {
             let _ = tx.send(peer).await;
@@ -72,7 +72,7 @@ async fn bind_failure_non_fatal() {
     let blocked_addr = blocker.local_addr().unwrap();
     // run_tcp_listener on the blocked port should return an error for that port
     // but not crash. (If the API binds multiple ports, a single failure is non-fatal.)
-    let result = run_tcp_listener(blocked_addr, test_bounds(), |_s, _p| async {}).await;
+    let result = run_tcp_listener(blocked_addr, test_bounds(), |_s, _p, _id| async {}).await;
     assert!(result.is_err());
     drop(blocker);
 }
@@ -82,7 +82,7 @@ async fn handler_panic_does_not_crash_accept_loop() {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let count = call_count.clone();
-    let (bound_addr, handle) = run_tcp_listener(addr, test_bounds(), move |_stream, _peer| {
+    let (bound_addr, handle) = run_tcp_listener(addr, test_bounds(), move |_stream, _peer, _id| {
         let count = count.clone();
         async move {
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -169,7 +169,7 @@ async fn max_concurrent_refuses_excess_connections_immediately() {
     let hold = Arc::new(tokio::sync::Notify::new());
     let started2 = started.clone();
     let hold2 = hold.clone();
-    let (bound_addr, handle) = run_tcp_listener(addr, bounds, move |stream, _peer| {
+    let (bound_addr, handle) = run_tcp_listener(addr, bounds, move |stream, _peer, _id| {
         let started = started2.clone();
         let hold = hold2.clone();
         async move {
@@ -221,7 +221,7 @@ async fn max_concurrent_caps_peak_concurrent_handlers() {
     let peak = Arc::new(AtomicU32::new(0));
     let active2 = active.clone();
     let peak2 = peak.clone();
-    let (bound_addr, handle) = run_tcp_listener(addr, bounds, move |stream, _peer| {
+    let (bound_addr, handle) = run_tcp_listener(addr, bounds, move |stream, _peer, _id| {
         let active = active2.clone();
         let peak = peak2.clone();
         async move {
@@ -269,7 +269,7 @@ async fn max_duration_aborts_long_running_handler() {
         ..test_bounds()
     };
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let (bound_addr, handle) = run_tcp_listener(addr, bounds, move |stream, _peer| async move {
+    let (bound_addr, handle) = run_tcp_listener(addr, bounds, move |stream, _peer, _id| async move {
         tokio::time::sleep(Duration::from_secs(3600)).await;
         drop(stream); // never reached within this test's lifetime if max_duration works.
     })

@@ -63,6 +63,7 @@ fn ev(
         authenticated,
         "2026-07-17T00:00:00Z".parse().unwrap(),
         serde_json::json!({}),
+        None,
     )
 }
 

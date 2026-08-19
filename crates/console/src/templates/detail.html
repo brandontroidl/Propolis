@@ -48,44 +48,22 @@
 </div>
 
 <div class="panel">
-  <div class="panel-head panel-head--blue">Activity <span class="dim">7 days</span></div>
+  <div class="panel-head panel-head--blue">
+    Activity
+    <div class="range-selector" id="chart-range">
+      {% for r in ["24h", "7d", "30d"] %}
+      <a hx-get="/ip/{{ ip }}/chart?range={{ r }}"
+         hx-target="#detail-chart-container" hx-swap="innerHTML"
+         class="range-btn {% if r == current_range %}active{% endif %}">{{ r }}</a>
+      {% endfor %}
+    </div>
+  </div>
   <div class="panel-body">
-    <div class="chart-box-compact">
-      <canvas id="chart-ip-timeline" role="img" aria-label="Events per day, last 7 days"></canvas>
+    <div id="detail-chart-container">
+      {% include "detail_chart_fragment.html" %}
     </div>
   </div>
 </div>
-<script type="application/json" id="ip-timeline-labels">{{ ip_timeline_labels|safe }}</script>
-<script type="application/json" id="ip-timeline-data">{{ ip_timeline_data|safe }}</script>
-<script>
-new Chart(document.getElementById('chart-ip-timeline'), {
-    type: 'line',
-    data: {
-        labels: JSON.parse(document.getElementById('ip-timeline-labels').textContent),
-        datasets: [{
-            data: JSON.parse(document.getElementById('ip-timeline-data').textContent),
-            borderColor: '#3987e5',
-            backgroundColor: 'rgba(57, 135, 229, 0.08)',
-            borderWidth: 2,
-            fill: true,
-            pointRadius: 3,
-            pointBackgroundColor: '#3987e5',
-            pointBorderColor: '#0f1417',
-            pointBorderWidth: 2,
-            tension: 0.3
-        }]
-    },
-    options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        scales: {
-            x: { grid: { display: false } },
-            y: { beginAtZero: true, ticks: { precision: 0 } }
-        },
-        plugins: { tooltip: { displayColors: false } }
-    }
-});
-</script>
 
 <div class="panel">
   <div class="panel-head">Category breakdown</div>
@@ -124,26 +102,15 @@ new Chart(document.getElementById('chart-ip-timeline'), {
 </div>
 
 <div class="panel">
-  <div class="panel-head">Evidence timeline <span class="dim">last {{ evidence|length }}</span></div>
-  {% if evidence %}
-  <table class="table-compact">
-    <thead><tr><th>Observed</th><th>Age</th><th>Activity</th><th>Protocol</th><th>Auth</th><th>WAN IP</th></tr></thead>
-    <tbody>
-      {% for e in evidence %}
-      <tr>
-        <td class="seen">{{ e.observed_at }}</td>
-        <td class="seen dim">{{ e.relative_time }}</td>
-        <td>{{ e.activity }}</td>
-        <td>{{ e.protocol }}</td>
-        <td>{% if e.authenticated %}yes{% else %}no{% endif %}</td>
-        <td class="ip">{{ e.wan_ip }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% else %}
-  <p class="empty-line">No events recorded for this IP.</p>
-  {% endif %}
+  <div class="panel-head">Evidence timeline <span class="dim">{{ total_event_count }} events</span></div>
+  <div class="panel-body" id="evidence-timeline">
+    {% include "session_cards.html" %}
+
+    {% if not sessions and not ungrouped %}
+    <p class="empty-line">No events recorded for this IP.</p>
+    {% endif %}
+  </div>
+  <div id="load-more-container">{% if has_more_events %}<button hx-get="/ip/{{ ip }}/events?cursor={{ next_cursor }}" hx-target="#evidence-timeline" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}</div>
 </div>
 
 {% if submissions %}

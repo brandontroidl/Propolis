@@ -13,8 +13,10 @@ pub mod feed;
 mod format;
 pub mod health;
 pub mod login;
+pub mod logs;
 pub mod metrics;
 pub mod queue;
+pub mod search;
 pub(crate) mod sparkline;
 
 use axum::Router;
@@ -30,6 +32,8 @@ pub fn router(state: AppState) -> Router {
         .merge(queue::router())
         .merge(detail::router())
         .merge(feed::router())
+        .merge(search::router())
+        .merge(logs::router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_session,

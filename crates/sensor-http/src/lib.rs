@@ -15,12 +15,13 @@ pub async fn start_test_server(
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
     let emitter = Arc::new(EventEmitter::new(log_path));
 
-    run_tcp_listener(addr, bounds.clone(), move |stream, peer| {
+    run_tcp_listener(addr, bounds.clone(), move |stream, peer, session_id| {
         let emitter = emitter.clone();
         let wan_resolver = wan_resolver.clone();
         let bounds = bounds.clone();
         async move {
-            handler::handle_connection(stream, peer, emitter, wan_resolver, bounds).await;
+            handler::handle_connection(stream, peer, session_id, emitter, wan_resolver, bounds)
+                .await;
         }
     })
     .await

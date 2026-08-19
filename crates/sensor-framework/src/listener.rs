@@ -42,9 +42,11 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 /// accepting. A bind failure on this one address is returned as `Err` rather than panicking; see
 /// the module doc for why that alone is what makes one bad port non-fatal to a sensor as a whole.
 ///
-/// `handler` receives the raw, unwrapped `TcpStream` and the peer address - not a WAN-resolved
-/// address, not a bounded reader (see the module doc and `bounds.rs`). It is called once per
-/// accepted connection.
+/// `handler` receives the raw, unwrapped `TcpStream`, the peer address - not a WAN-resolved
+/// address, not a bounded reader (see the module doc and `bounds.rs`) - and a `uuid::Uuid` v7
+/// session id minted fresh for this connection, so every event a handler emits over the
+/// connection's lifetime can be stamped with a stable, time-ordered identifier. It is called once
+/// per accepted connection.
 ///
 /// Two bounds this function enforces directly, without the handler's cooperation:
 /// - `max_concurrent`: a `tokio::sync::Semaphore` seeded with `bounds.max_concurrent` permits.
@@ -73,7 +75,7 @@ pub async fn run_tcp_listener<F, Fut>(
     handler: F,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)>
 where
-    F: Fn(TcpStream, SocketAddr) -> Fut + Send + 'static,
+    F: Fn(TcpStream, SocketAddr, uuid::Uuid) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let listener = TcpListener::bind(addr).await?;
@@ -105,7 +107,8 @@ where
                 }
             };
 
-            let fut = handler(stream, peer);
+            let session_id = uuid::Uuid::now_v7();
+            let fut = handler(stream, peer, session_id);
             tokio::spawn(async move {
                 // Held for the connection's whole lifetime; dropped (releasing the permit) when
                 // this outer task ends, which happens only once the inner task below has already

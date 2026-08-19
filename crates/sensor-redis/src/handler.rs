@@ -25,7 +25,7 @@ use tokio::net::TcpStream;
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
-use sensor_framework::{ConnectionBounds, EventEmitter, WanResolver};
+use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
     SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
@@ -56,7 +56,7 @@ const READ_CHUNK_SIZE: usize = 1024;
 /// The `honeypot_connection` event: emitted once, immediately after accept, before any RESP
 /// command is read - `authenticated = false` unconditionally, regardless of what an `AUTH` later
 /// in the session does.
-fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
+fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -68,6 +68,7 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
         observed_at: chrono::Utc::now(),
         metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
         sample: None,
+        session_id: Some(session_id),
     }
 }
 
@@ -123,16 +124,18 @@ fn canned_config_get() -> Vec<u8> {
 pub struct Session {
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
+    session_id: Uuid,
     authenticated: bool,
 }
 
 impl Session {
     /// `source_ip`/`wan_ip` are this connection's real attributes; every event this type ever
     /// emits carries them verbatim, matching sensor-ssh's `AuthState::new` convention.
-    pub fn new(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> Self {
+    pub fn new(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> Self {
         Self {
             source_ip,
             wan_ip,
+            session_id,
             authenticated: false,
         }
     }
@@ -164,6 +167,7 @@ impl Session {
             observed_at: chrono::Utc::now(),
             metadata,
             sample: None,
+            session_id: Some(self.session_id),
         }
     }
 
@@ -355,6 +359,7 @@ impl Session {
 pub async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
+    session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
@@ -367,12 +372,12 @@ pub async fn handle_connection(
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
-    let conn_event = connection_event(source_ip, wan_ip);
+    let conn_event = connection_event(source_ip, wan_ip, session_id);
     if emitter.append(&conn_event).await.is_err() {
         tracing::error!(%peer_addr, "redis: failed to append connection event");
     }
 
-    let mut session = Session::new(source_ip, wan_ip);
+    let mut session = Session::new(source_ip, wan_ip, session_id);
     let mut reader = RespReader::new(bounds);
 
     loop {
@@ -495,7 +500,7 @@ mod tests {
 
     #[test]
     fn connection_event_is_unauthenticated_with_redis_label() {
-        let event = connection_event(ip("203.0.113.7"), None);
+        let event = connection_event(ip("203.0.113.7"), None, Uuid::now_v7());
         assert!(!event.authenticated);
         assert_eq!(event.sensor, "redis");
         assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
@@ -517,7 +522,7 @@ mod tests {
 
     #[test]
     fn ping_replies_pong_with_no_events() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["PING"]));
         assert_eq!(response, resp::simple_string("PONG"));
         assert!(events.is_empty());
@@ -525,7 +530,7 @@ mod tests {
 
     #[test]
     fn command_dispatch_is_case_insensitive() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, _events) = session.dispatch(&args(&["ping"]));
         assert_eq!(response, resp::simple_string("PONG"));
     }
@@ -536,7 +541,7 @@ mod tests {
 
     #[test]
     fn auth_replies_ok_and_sets_authenticated() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         assert!(!session.is_authenticated());
         let (response, events) = session.dispatch(&args(&["AUTH", "hunter2"]));
         assert_eq!(response, resp::simple_string("OK"));
@@ -549,7 +554,7 @@ mod tests {
 
     #[test]
     fn auth_password_never_appears_in_event_metadata() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (_response, events) = session.dispatch(&args(&["AUTH", "SuperSecretPassword123"]));
         let event_json = serde_json::to_string(&events[0]).unwrap();
         assert!(!event_json.contains("SuperSecretPassword123"));
@@ -562,7 +567,7 @@ mod tests {
 
     #[test]
     fn auth_missing_password_argument_is_error_and_no_event() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["AUTH"]));
         assert!(response.starts_with(b"-"), "expected an error reply");
         assert!(events.is_empty());
@@ -573,7 +578,7 @@ mod tests {
     fn auth_accepts_acl_style_username_and_password() {
         // Redis 6+'s `AUTH <username> <password>` form - both dropped identically to the
         // single-password form.
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["AUTH", "default", "hunter2"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert_eq!(events.len(), 1);
@@ -588,7 +593,7 @@ mod tests {
 
     #[test]
     fn info_returns_canned_bulk_string_with_no_events() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["INFO"]));
         assert!(response.starts_with(b"$"), "INFO must reply a bulk string");
         let text = String::from_utf8_lossy(&response);
@@ -599,7 +604,7 @@ mod tests {
 
     #[test]
     fn config_get_returns_array_with_no_events() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["CONFIG", "GET", "*"]));
         assert!(response.starts_with(b"*"), "CONFIG GET must reply an array");
         assert!(events.is_empty());
@@ -611,7 +616,7 @@ mod tests {
 
     #[test]
     fn set_replies_ok_and_emits_command_exec_with_key_and_value() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["SET", "foo", "bar"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert_eq!(events.len(), 1);
@@ -633,7 +638,7 @@ mod tests {
 
     #[test]
     fn set_command_exec_authenticated_field_reflects_session_state() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (_r, events) = session.dispatch(&args(&["SET", "foo", "bar"]));
         assert!(
             !events[0].authenticated,
@@ -650,7 +655,7 @@ mod tests {
 
     #[test]
     fn set_wrong_arity_is_error_and_no_event() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["SET", "onlykey"]));
         assert!(response.starts_with(b"-"));
         assert!(events.is_empty());
@@ -658,7 +663,7 @@ mod tests {
 
     #[test]
     fn set_value_containing_crlf_is_sanitized_in_metadata() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (_response, events) = session.dispatch(&args(&[
             "SET",
             "key",
@@ -675,7 +680,7 @@ mod tests {
 
     #[test]
     fn get_always_replies_nil() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["GET", "foo"]));
         assert_eq!(response, resp::nil_bulk_string());
         assert!(
@@ -688,7 +693,7 @@ mod tests {
     fn get_after_set_still_returns_nil() {
         // Deliberate simplification (see the module doc): this honeypot never actually stores
         // anything, so GET is unconditionally nil even immediately after a SET of the same key.
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         session.dispatch(&args(&["SET", "foo", "bar"]));
         let (response, _events) = session.dispatch(&args(&["GET", "foo"]));
         assert_eq!(response, resp::nil_bulk_string());
@@ -696,7 +701,7 @@ mod tests {
 
     #[test]
     fn get_wrong_arity_is_error() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, _events) = session.dispatch(&args(&["GET"]));
         assert!(response.starts_with(b"-"));
     }
@@ -707,7 +712,7 @@ mod tests {
 
     #[test]
     fn config_set_dir_is_logged_as_indicator() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["CONFIG", "SET", "dir", "/etc/cron.d"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert_eq!(events.len(), 1);
@@ -729,7 +734,7 @@ mod tests {
 
     #[test]
     fn config_set_dbfilename_is_logged_as_indicator() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (_response, events) =
             session.dispatch(&args(&["CONFIG", "SET", "dbfilename", "shell.php"]));
         assert_eq!(events.len(), 1);
@@ -741,7 +746,7 @@ mod tests {
 
     #[test]
     fn config_set_dir_param_match_is_case_insensitive() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (_response, events) = session.dispatch(&args(&["CONFIG", "SET", "DIR", "/tmp/x"]));
         assert_eq!(
             events.len(),
@@ -755,7 +760,7 @@ mod tests {
         // Only dir/dbfilename are named as filesystem-write indicators by the design spec; a
         // benign CONFIG SET must still succeed (this sensor never really persists config either
         // way) but must not manufacture an indicator event for it.
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["CONFIG", "SET", "maxmemory", "100mb"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert!(events.is_empty());
@@ -763,7 +768,7 @@ mod tests {
 
     #[test]
     fn config_unknown_subcommand_is_error() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["CONFIG", "RESETSTAT"]));
         assert!(response.starts_with(b"-"));
         assert!(events.is_empty());
@@ -775,7 +780,7 @@ mod tests {
 
     #[test]
     fn slaveof_is_logged_as_indicator() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["SLAVEOF", "198.51.100.50", "6379"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert_eq!(events.len(), 1);
@@ -796,7 +801,7 @@ mod tests {
 
     #[test]
     fn replicaof_no_one_is_logged_with_command_name_preserved() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["REPLICAOF", "NO", "ONE"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert_eq!(
@@ -811,7 +816,7 @@ mod tests {
 
     #[test]
     fn eval_replies_error_and_emits_command_exec() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&[
             "EVAL",
             "return redis.call('set', KEYS[1], ARGV[1])",
@@ -829,7 +834,7 @@ mod tests {
 
     #[test]
     fn script_replies_error_and_emits_command_exec() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["SCRIPT", "LOAD", "return 1"]));
         assert!(response.starts_with(b"-"));
         assert_eq!(events.len(), 1);
@@ -845,7 +850,7 @@ mod tests {
 
     #[test]
     fn unknown_command_replies_error_with_no_events() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["FOOBARBAZ"]));
         assert!(response.starts_with(b"-ERR"));
         let text = String::from_utf8_lossy(&response);
@@ -859,8 +864,8 @@ mod tests {
 
     #[test]
     fn every_emitted_event_carries_redis_protocol_label_and_sensor() {
-        let mut session = Session::new(ip("203.0.113.7"), None);
-        let mut all_events = vec![connection_event(ip("203.0.113.7"), None)];
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut all_events = vec![connection_event(ip("203.0.113.7"), None, Uuid::now_v7())];
         all_events.extend(session.dispatch(&args(&["AUTH", "pw"])).1);
         all_events.extend(session.dispatch(&args(&["SET", "k", "v"])).1);
         all_events.extend(session.dispatch(&args(&["CONFIG", "SET", "dir", "/tmp"])).1);

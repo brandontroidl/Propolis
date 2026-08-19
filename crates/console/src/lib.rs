@@ -9,6 +9,7 @@
 //! `internal/design/06-console-observability.md`.
 
 pub mod auth;
+pub mod log_buffer;
 pub mod routes;
 pub mod templates;
 
@@ -20,6 +21,7 @@ use minijinja::Environment;
 use sqlx::PgPool;
 
 use auth::{PasswordStore, RateLimiter, SessionStore};
+use log_buffer::LogBuffer;
 
 /// Shared state handed to every route and to the auth middleware. `PgPool` clones cheaply (it is
 /// already reference-counted internally); the other fields wrap an `RwLock` internally, which is
@@ -50,4 +52,9 @@ pub struct AppState {
     /// binary constructed this `AppState` - so the console always displays the version of the
     /// process actually serving the page, not a fixed constant baked into this library crate.
     pub version: &'static str,
+    /// Shared ring buffer + broadcast channel of recent tracing events, backing `routes::logs`
+    /// (`internal/design/11-console-forensics.md`, task 7). Built once at startup alongside
+    /// `templates` and installed as a `tracing_subscriber::Layer` by whichever binary constructs
+    /// this `AppState` - see `log_buffer`'s own module doc comment.
+    pub log_buffer: Arc<LogBuffer>,
 }

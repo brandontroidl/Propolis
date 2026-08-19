@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use console::auth::{PasswordStore, RateLimiter, SessionStore};
+use console::log_buffer::{LogBuffer, LogBufferLayer};
 use console::{AppState, routes};
 use rand::RngExt;
 use sqlx::PgPool;
@@ -33,6 +34,11 @@ const ENV_FEED_OUTPUT_DIR: &str = "PROPOLIS_FEED_OUTPUT_DIR";
 /// default") - an operator who wants the console reachable elsewhere binds it explicitly via
 /// `PROPOLIS_CONSOLE_BIND`, e.g. behind their own reverse proxy.
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
+
+/// How many recent tracing events `routes::logs`'s viewer keeps in memory for a freshly loaded
+/// page - see `log_buffer::LogBuffer::new`'s own doc comment. Matches `propolis::main`'s own
+/// constant for the unified daemon binary.
+const LOG_BUFFER_CAPACITY: usize = 1000;
 
 struct Config {
     database_url: String,
@@ -164,7 +170,21 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    // The live `/logs` viewer (`routes::logs`) needs a copy of every event this process logs, so
+    // `LogBufferLayer` is layered onto the subscriber alongside the default `fmt` output rather
+    // than filtered separately - see that layer's own doc comment (`console::log_buffer`).
+    let log_buffer = Arc::new(LogBuffer::new(LOG_BUFFER_CAPACITY));
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .with(LogBufferLayer::new(log_buffer.clone()))
+            .init();
+    }
 
     let config = match load_config_from_env() {
         Ok(c) => c,
@@ -205,6 +225,7 @@ async fn main() {
         feed_output_dir: config.feed_output_dir,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
+        log_buffer,
     };
 
     tracing::info!(bind = %bind_addr, "console: starting");

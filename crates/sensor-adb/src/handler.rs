@@ -32,7 +32,9 @@ use sensor_framework::fakefs::FakeFs;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell};
-use sensor_framework::{CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, WanResolver};
+use sensor_framework::{
+    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
+};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
     WIRE_VERSION,
@@ -57,7 +59,7 @@ const MAX_SYNC_BODY: usize = 10_000_000;
 
 const SHELL_PROMPT: &[u8] = b"root@server01:~# ";
 
-fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
+fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -69,6 +71,7 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
         observed_at: chrono::Utc::now(),
         metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
         sample: None,
+        session_id: Some(session_id),
     }
 }
 
@@ -100,6 +103,7 @@ struct SyncState {
     pending_send: Option<PendingSend>,
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
+    session_id: Uuid,
 }
 
 struct PendingSend {
@@ -108,12 +112,13 @@ struct PendingSend {
 }
 
 impl SyncState {
-    fn new(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> Self {
+    fn new(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> Self {
         Self {
             buf: Vec::new(),
             pending_send: None,
             source_ip,
             wan_ip,
+            session_id,
         }
     }
 
@@ -243,6 +248,7 @@ impl SyncState {
     fn build_capture_job(&self, pending: PendingSend) -> CaptureJob {
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
+        let session_id = self.session_id;
         CaptureJob {
             body: pending.body,
             orig_name: pending.orig_name,
@@ -262,6 +268,7 @@ impl SyncState {
                     "orig_name": sample.orig_name,
                 }),
                 sample: Some(sample),
+                session_id: Some(session_id),
             }),
         }
     }
@@ -344,6 +351,7 @@ impl MessageReader {
 pub async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
+    session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
@@ -361,7 +369,7 @@ pub async fn handle_connection(
 
     // Emit honeypot_connection (authenticated=false) before anything else - the TCP handshake
     // itself is the observation, independent of whether a CNXN ever arrives.
-    let conn_event = connection_event(source_ip, wan_ip);
+    let conn_event = connection_event(source_ip, wan_ip, session_id);
     if emitter.append(&conn_event).await.is_err() {
         tracing::error!(%peer_addr, "adb: failed to append connection event");
     }
@@ -401,6 +409,7 @@ pub async fn handle_connection(
                     &mut next_stream_id,
                     source_ip,
                     wan_ip,
+                    session_id,
                     &emitter,
                     peer_addr,
                 )
@@ -457,6 +466,7 @@ async fn handle_open(
     next_stream_id: &mut u32,
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
+    session_id: Uuid,
     emitter: &Arc<EventEmitter>,
     peer_addr: SocketAddr,
 ) -> Result<(), ()> {
@@ -477,6 +487,7 @@ async fn handle_open(
                 wan_ip,
                 authenticated: false,
                 protocol_label: PROTOCOL_LABEL.to_string(),
+                session_id: Some(session_id),
             };
             let mut shell = FakeShell::new(FakeFs::new(), ctx);
 
@@ -528,7 +539,7 @@ async fn handle_open(
                 server_id,
                 Stream {
                     client_local_id,
-                    kind: StreamKind::Sync(SyncState::new(source_ip, wan_ip)),
+                    kind: StreamKind::Sync(SyncState::new(source_ip, wan_ip, session_id)),
                 },
             );
         }
@@ -629,8 +640,10 @@ mod tests {
 
     #[test]
     fn connection_event_is_unauthenticated_with_adb_label() {
-        let event = connection_event("203.0.113.7".parse().unwrap(), None);
+        let session_id = Uuid::now_v7();
+        let event = connection_event("203.0.113.7".parse().unwrap(), None, session_id);
         assert!(!event.authenticated);
+        assert_eq!(event.session_id, Some(session_id));
         assert_eq!(event.sensor, "adb");
         assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
         assert_eq!(event.protocol, PROTO_TCP);
@@ -645,7 +658,7 @@ mod tests {
     }
 
     fn test_sync_state() -> SyncState {
-        SyncState::new("203.0.113.7".parse().unwrap(), None)
+        SyncState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7())
     }
 
     #[test]

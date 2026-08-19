@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Search - Propolis{% endblock %}
+{% block content %}
+<h1>Search</h1>
+
+<form id="search-filter-form" class="filter-form" method="get" action="{% if mode == "ips" %}/search/ips{% else %}/search/events{% endif %}">
+  <div class="field">
+    <label for="f-q">Query</label>
+    <input type="text" id="f-q" name="q" value="{{ form.q }}" placeholder="metadata text..." autocomplete="off">
+  </div>
+  <div class="field">
+    <label for="f-sensor">Sensor</label>
+    <select id="f-sensor" name="sensor">
+      <option value="">Any</option>
+      {% for s in sensors %}<option value="{{ s }}" {% if form.sensor == s %}selected{% endif %}>{{ s }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-signal-type">Signal type</label>
+    <select id="f-signal-type" name="signal_type">
+      <option value="">Any</option>
+      {% for t in signal_types %}<option value="{{ t }}" {% if form.signal_type == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+    </select>
+  </div>
+  {% if mode != "ips" %}
+  <div class="field">
+    <label for="f-ip">Source IP</label>
+    <input type="text" id="f-ip" name="ip" value="{{ form.ip }}" placeholder="203.0.113.7" autocomplete="off">
+  </div>
+  {% endif %}
+  <div class="field">
+    <label for="f-from">From</label>
+    <input type="date" id="f-from" name="from" value="{{ form.from }}">
+  </div>
+  <div class="field">
+    <label for="f-to">To</label>
+    <input type="date" id="f-to" name="to" value="{{ form.to }}">
+  </div>
+  <button type="submit">Search</button>
+</form>
+
+<div class="range-selector search-mode-tabs">
+  <a href="/search/events{% if events_query_string %}?{{ events_query_string }}{% endif %}" class="range-btn {% if mode != "ips" %}active{% endif %}">Events</a>
+  <a href="/search/ips{% if ips_query_string %}?{{ ips_query_string }}{% endif %}" class="range-btn {% if mode == "ips" %}active{% endif %}">By IP</a>
+</div>
+
+{% if mode == "ips" %}
+  {% if not searched %}
+  <p class="empty-line">Enter at least one filter to search.</p>
+  {% elif ip_rows %}
+  <div class="panel">
+    <table class="table-compact">
+      <thead><tr><th>IP</th><th>Matches</th><th>Score</th><th>Tier</th><th>First seen</th><th>Last seen</th></tr></thead>
+      <tbody>
+        {% for r in ip_rows %}
+        <tr>
+          <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
+          <td class="mono">{{ r.match_count }}</td>
+          <td class="mono"><span class="meter"><span class="meter-fill" style="--pct: {{ r.score_pct }}%"></span></span>{{ r.score }}</td>
+          <td>
+            {% if r.tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>
+            {% elif r.tier == "standard" %}<span class="tier tier-standard">Standard</span>
+            {% else %}<span class="tier tier-none">-</span>{% endif %}
+          </td>
+          <td class="seen">{{ r.first_seen }}</td>
+          <td class="seen">{{ r.last_seen }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty-line">no IPs match these filters</p>
+  {% endif %}
+{% else %}
+  {% if not searched %}
+  <p class="empty-line">Enter at least one filter to search.</p>
+  {% elif rows %}
+  <div class="panel">
+    <table class="table-compact">
+      <thead><tr><th>Time</th><th>Source IP</th><th>Activity</th><th>Detail</th><th>Session</th></tr></thead>
+      <tbody id="search-results-body">
+        {% include "search_events_rows.html" %}
+      </tbody>
+    </table>
+    <div id="load-more-container">{% if has_more %}<button hx-get="/search/events" hx-include="#search-filter-form" hx-vals='{"cursor": "{{ next_cursor }}"}' hx-target="#search-results-body" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}</div>
+  </div>
+  {% else %}
+  <p class="empty-line">no events match these filters</p>
+  {% endif %}
+{% endif %}
+{% endblock %}

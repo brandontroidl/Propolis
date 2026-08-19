@@ -167,8 +167,8 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     let new_id: i64 = sqlx::query_scalar(
         "INSERT INTO event \
          (source_ip, wan_ip, sensor, signal_type, protocol, authenticated, category, \
-          weight, confidence, observed_at, metadata, prev_hash, hash) \
-         VALUES ($1::inet, $2::inet, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+          weight, confidence, observed_at, metadata, prev_hash, hash, session_id) \
+         VALUES ($1::inet, $2::inet, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
          RETURNING id",
     )
     .bind(event.source_ip.to_string())
@@ -184,6 +184,7 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     .bind(&event.metadata)
     .bind(prev_head.as_deref())
     .bind(hash.as_slice())
+    .bind(event.session_id)
     .fetch_one(&mut *tx)
     .await?;
 

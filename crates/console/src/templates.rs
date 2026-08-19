@@ -38,9 +38,18 @@ const BASE_HTML: &str = concat!(
 const DASHBOARD_HTML: &str = include_str!("templates/dashboard.html");
 const QUEUE_HTML: &str = include_str!("templates/queue.html");
 const QUEUE_ROW_HTML: &str = include_str!("templates/queue_row.html");
+const QUEUE_HISTORY_ROW_HTML: &str = include_str!("templates/queue_history_row.html");
 const LOGIN_HTML: &str = include_str!("templates/login.html");
 const DETAIL_HTML: &str = include_str!("templates/detail.html");
 const FEED_HTML: &str = include_str!("templates/feed.html");
+const SESSION_CARDS_HTML: &str = include_str!("templates/session_cards.html");
+const EVENTS_FRAGMENT_HTML: &str = include_str!("templates/events_fragment.html");
+const DETAIL_CHART_FRAGMENT_HTML: &str = include_str!("templates/detail_chart_fragment.html");
+const DASHBOARD_CHART_FRAGMENT_HTML: &str = include_str!("templates/dashboard_chart_fragment.html");
+const SEARCH_HTML: &str = include_str!("templates/search.html");
+const SEARCH_EVENTS_ROWS_HTML: &str = include_str!("templates/search_events_rows.html");
+const SEARCH_EVENTS_FRAGMENT_HTML: &str = include_str!("templates/search_events_fragment.html");
+const LOGS_HTML: &str = include_str!("templates/logs.html");
 
 /// Builds the environment once at startup (`AppState::templates`); cheap to construct (five small
 /// templates) but shared via `Arc` so the source is parsed exactly once per process rather than
@@ -55,12 +64,43 @@ pub fn environment() -> Environment<'static> {
         .expect("queue.html must be a valid template");
     env.add_template("queue_row.html", QUEUE_ROW_HTML)
         .expect("queue_row.html must be a valid template");
+    // The approved/rejected/snoozed history tabs (console-forensics task 6): decided_at/notes/
+    // submissions instead of the pending tab's action buttons - see `routes::queue`'s doc comment.
+    env.add_template("queue_history_row.html", QUEUE_HISTORY_ROW_HTML)
+        .expect("queue_history_row.html must be a valid template");
     env.add_template("login.html", LOGIN_HTML)
         .expect("login.html must be a valid template");
     env.add_template("detail.html", DETAIL_HTML)
         .expect("detail.html must be a valid template");
     env.add_template("feed.html", FEED_HTML)
         .expect("feed.html must be a valid template");
+    // Fragments (console-forensics task 4): partial templates rendered standalone by an HTMX
+    // endpoint's handler (no `base.html` wrapper) and also `{% include %}`-ed from the full page
+    // template that shows the same content on first load, so the two never drift into two
+    // different markups for the same data - `detail.rs`/`dashboard.rs`'s own doc comments explain
+    // each one's endpoint.
+    env.add_template("session_cards.html", SESSION_CARDS_HTML)
+        .expect("session_cards.html must be a valid template");
+    env.add_template("events_fragment.html", EVENTS_FRAGMENT_HTML)
+        .expect("events_fragment.html must be a valid template");
+    env.add_template("detail_chart_fragment.html", DETAIL_CHART_FRAGMENT_HTML)
+        .expect("detail_chart_fragment.html must be a valid template");
+    env.add_template(
+        "dashboard_chart_fragment.html",
+        DASHBOARD_CHART_FRAGMENT_HTML,
+    )
+    .expect("dashboard_chart_fragment.html must be a valid template");
+    // Console-forensics task 5: event/IP search page plus its own load-more fragment pair, same
+    // full-page/fragment split as `session_cards.html`/`events_fragment.html` above.
+    env.add_template("search.html", SEARCH_HTML)
+        .expect("search.html must be a valid template");
+    env.add_template("search_events_rows.html", SEARCH_EVENTS_ROWS_HTML)
+        .expect("search_events_rows.html must be a valid template");
+    env.add_template("search_events_fragment.html", SEARCH_EVENTS_FRAGMENT_HTML)
+        .expect("search_events_fragment.html must be a valid template");
+    // Console-forensics task 7: live system log viewer (`routes::logs`).
+    env.add_template("logs.html", LOGS_HTML)
+        .expect("logs.html must be a valid template");
     env
 }
 

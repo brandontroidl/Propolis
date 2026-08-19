@@ -45,6 +45,7 @@ fn ev(
         authenticated,
         ts.parse().unwrap(),
         serde_json::json!({}),
+        None,
     )
 }
 

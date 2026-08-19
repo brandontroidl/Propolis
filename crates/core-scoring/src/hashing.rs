@@ -151,6 +151,7 @@ mod tests {
             true,
             "2026-07-17T00:00:00Z".parse().unwrap(),
             serde_json::json!({"note": "test", "count": 3}),
+            None,
         )
     }
 
@@ -198,6 +199,7 @@ mod tests {
             true,
             "2026-07-17T00:00:00Z".parse().unwrap(),
             serde_json::json!({}),
+            None,
         );
 
         let hash = chain_hash(None, &event);

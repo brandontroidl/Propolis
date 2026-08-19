@@ -23,6 +23,7 @@ fn auth_honeypot_input(ip: &str, ts: &str) -> EventInput {
         true,
         ts.parse().unwrap(),
         serde_json::json!({}),
+        None,
     )
 }
 
@@ -47,6 +48,7 @@ fn honeypot_input(ip: &str, ts: &str, weight: u32) -> EventInput {
         true,
         ts.parse().unwrap(),
         serde_json::json!({}),
+        None,
     )
 }
 

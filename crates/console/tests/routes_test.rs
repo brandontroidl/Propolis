@@ -17,6 +17,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -24,12 +25,15 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use console::auth::{self, PasswordStore, RateLimiter, SessionStore};
+use console::log_buffer::LogEntry;
 use console::{AppState, routes};
 use core_scoring::{EventInput, Protocol, SignalType, append_event};
+use futures::StreamExt;
 use http_body_util::BodyExt;
 use review::queue::ReviewQueue;
 use sqlx::{PgPool, Row};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const TEST_PASSWORD: &str = "s3cret-test-operator-password";
 const TEST_PEER: SocketAddr =
@@ -61,6 +65,7 @@ fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> App
         feed_output_dir,
         startup_time: chrono::Utc::now(),
         version: "test",
+        log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),
     }
 }
 
@@ -95,6 +100,7 @@ fn ev_with_wan(
         authenticated,
         ts.parse().unwrap(),
         serde_json::json!({}),
+        None,
     )
 }
 
@@ -115,6 +121,37 @@ fn ev(
         authenticated,
         ts.parse().unwrap(),
         serde_json::json!({}),
+        None,
+    )
+}
+
+/// Like [`ev`] but carrying a non-empty `metadata` payload and a `session_id` -
+/// `routes::detail`'s session-grouping (task 3, `internal/design/11-console-forensics.md`
+/// section 2) groups every event sharing a `session_id` into one collapsible card, and the
+/// evidence timeline's "Detail" column extracts from `metadata` by `signal_type`. Same
+/// eight-argument shape as `core_scoring::EventInput::from_signal` itself (which this wraps),
+/// allowed there for the same reason.
+#[allow(clippy::too_many_arguments)]
+fn ev_with_session(
+    ip: &str,
+    sensor: &str,
+    signal: SignalType,
+    protocol: Protocol,
+    authenticated: bool,
+    ts: &str,
+    metadata: serde_json::Value,
+    session_id: Uuid,
+) -> EventInput {
+    EventInput::from_signal(
+        ip.parse().unwrap(),
+        None,
+        sensor.into(),
+        signal,
+        protocol,
+        authenticated,
+        ts.parse().unwrap(),
+        metadata,
+        Some(session_id),
     )
 }
 
@@ -720,7 +757,10 @@ async fn dashboard_vendor_submissions_table_shows_at_most_three_rows(pool: PgPoo
     // be truncated.
     assert!(body.contains("203.0.113.201"), "newest submission missing: {body}");
     assert!(body.contains("203.0.113.202"), "2nd-newest submission missing: {body}");
-    assert!(body.contains("203.0.113.203"), "3rd-newest submission missing: {body}");
+    assert!(
+        body.contains("203.0.113.203"),
+        "3rd-newest submission missing: {body}"
+    );
     assert!(
         !body.contains("203.0.113.204"),
         "4th-newest submission must be truncated from the compact table: {body}"
@@ -980,6 +1020,239 @@ async fn queue_page_table_uses_compact_class(pool: PgPool) {
     assert!(
         body.contains(r#"<table class="table-compact">"#),
         "expected the queue table to use the compact density class: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_tab_bar_marks_the_requested_tab_active(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=approved",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<a href="/queue?tab=approved" class="tab active">Approved</a>"#),
+        "expected the approved tab link to carry the active class: {body}"
+    );
+    assert!(
+        body.contains(r#"<a href="/queue?tab=pending" class="tab ">Pending</a>"#),
+        "expected the pending tab link to render without the active class: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_approved_tab_lists_decided_entries_with_submission_summary(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.60", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    // Decide it via the real approve route (not a raw UPDATE) so `decided_at`/`notes` land
+    // exactly as the operator flow sets them.
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.60/approve",
+            format!("csrf_token={csrf_token}&notes=looks-malicious"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.60")
+    .bind("abuseipdb")
+    .bind("queue-approved-tab-key-1")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(true)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.60")
+    .bind("otx")
+    .bind("queue-approved-tab-key-2")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(false)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=approved",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("203.0.113.60"),
+        "approved IP missing from the approved tab: {body}"
+    );
+    assert!(
+        body.contains("looks-malicious"),
+        "decision notes missing from the approved tab: {body}"
+    );
+    // minijinja auto-escapes "/" to "&#x2f;" in interpolated text - assert the escaped form
+    // actually rendered, matching what the browser (which unescapes it back to "1/2 vendors")
+    // shows the operator.
+    assert!(
+        body.contains("1&#x2f;2 vendors"),
+        "expected the 1-succeeded-of-2 submission summary on the approved tab: {body}"
+    );
+    // Action buttons only make sense for still-open (pending) decisions. Checks the quoted
+    // `class="btn-approve"` markup specifically, not a bare "btn-approve" substring: base_head.html's
+    // static CSS always has a `.btn-approve { ... }` rule on every page regardless of this row's
+    // data, matching the doctrine's own "no discriminating fixture" trap.
+    assert!(
+        !body.contains(r#"class="btn-approve""#)
+            && !body.contains(r#"class="btn-reject""#)
+            && !body.contains(r#"class="btn-snooze""#),
+        "approved tab must not render pending-only action buttons: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_approved_tab_shows_dash_when_no_submissions_yet(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.61", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.61/approve",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=approved",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("203.0.113.61"),
+        "approved IP missing from the approved tab: {body}"
+    );
+    assert!(
+        body.contains("<td>-</td>"),
+        "expected a dash submission summary for an IP with no vendor_submission rows yet: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_rejected_and_snoozed_tabs_list_only_their_own_state(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.62", 60).await;
+    seed_recommended(&pool, "203.0.113.63", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.62/reject",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.63/snooze",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let rejected_body = body_text(
+        app.clone()
+            .oneshot(get_request(
+                "/queue?tab=rejected",
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(rejected_body.contains("203.0.113.62"), "{rejected_body}");
+    assert!(!rejected_body.contains("203.0.113.63"), "{rejected_body}");
+
+    let snoozed_body = body_text(
+        app.oneshot(get_request(
+            "/queue?tab=snoozed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(snoozed_body.contains("203.0.113.63"), "{snoozed_body}");
+    assert!(!snoozed_body.contains("203.0.113.62"), "{snoozed_body}");
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_history_tab_empty_state_names_the_tab(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=rejected",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">no rejected entries yet</p>"#),
+        "expected a tab-specific empty-state message: {body}"
     );
 }
 
@@ -1423,13 +1696,23 @@ async fn detail_page_tables_use_compact_class(pool: PgPool) {
     let body = body_text(response).await;
     let table_open_count = body.matches("<table").count();
     let compact_count = body.matches(r#"<table class="table-compact">"#).count();
+    // The evidence timeline intentionally uses its own `evidence-table` class rather than
+    // `table-compact` (task 3's session-card redesign - `internal/design/11-console-forensics.md`,
+    // "Template: session cards"): this fixture's events all carry `session_id = None`
+    // (`ev`/`ev_with_wan` pass `None`), so they render as exactly one "Ungrouped events" table.
+    let evidence_count = body.matches(r#"<table class="evidence-table">"#).count();
     assert!(
         table_open_count >= 5,
         "expected all 5 detail-page tables to render for this fixture: {body}"
     );
     assert_eq!(
-        table_open_count, compact_count,
-        "every table on the detail page must use the compact density class: {body}"
+        table_open_count,
+        compact_count + evidence_count,
+        "every table on the detail page must use either the compact density class or the evidence-table class: {body}"
+    );
+    assert_eq!(
+        evidence_count, 1,
+        "expected exactly one evidence table for the fixture's ungrouped events: {body}"
     );
 }
 
@@ -1516,6 +1799,481 @@ async fn detail_ip_timeline_chart_reflects_daily_event_counts(pool: PgPool) {
         body.contains(r#"id="ip-timeline-labels">"#) && body.contains(r#"id="ip-timeline-data">"#),
         "IP timeline chart data elements missing: {body}"
     );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_groups_events_sharing_session_id_into_an_expanded_session_card(pool: PgPool) {
+    migrate(&pool).await;
+    let start = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let session_id = Uuid::now_v7();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.60",
+            "ssh-sensor",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            &start.to_rfc3339(),
+            serde_json::json!({ "username": "root" }),
+            session_id,
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.60",
+            "ssh-sensor",
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            &(start + chrono::Duration::seconds(5)).to_rfc3339(),
+            serde_json::json!({ "command": "whoami" }),
+            session_id,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.60",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<details class="session-card" open>"#),
+        "expected the sole (most-recent) session card to render expanded: {body}"
+    );
+    assert!(
+        body.contains(r#"<span class="session-user mono">user: root</span>"#),
+        "expected the session header to show the credential used: {body}"
+    );
+    assert!(
+        body.contains(r#"<td class="mono">whoami</td>"#),
+        "expected the command-exec event row to show the command in its Detail column: {body}"
+    );
+    assert!(
+        body.contains("2 events"),
+        "expected the session header to show the event count: {body}"
+    );
+    assert!(
+        !body.contains("Ungrouped events"),
+        "no event in this fixture lacks a session_id, so no ungrouped section should render: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_mixes_session_cards_with_ungrouped_events(pool: PgPool) {
+    migrate(&pool).await;
+    let now = chrono::Utc::now();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.61",
+            "ssh-sensor",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &now.to_rfc3339(),
+            serde_json::json!({ "protocol_label": "ssh" }),
+            Uuid::now_v7(),
+        ),
+    )
+    .await
+    .unwrap();
+    // Pre-existing data from before session tracking: no session_id.
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.61",
+            "catchall-sensor",
+            SignalType::CatchallProbe,
+            Protocol::Udp,
+            false,
+            &(now - chrono::Duration::seconds(120)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.61",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"class="session-card""#),
+        "expected the session-tagged event to render as a session card: {body}"
+    );
+    assert!(
+        body.contains("Ungrouped events"),
+        "expected the pre-session-tracking event to render in the Ungrouped events section: {body}"
+    );
+}
+
+/// Extracts the `?cursor=...` value from a "Load more" button's `hx-get` attribute in a rendered
+/// detail page or events fragment - `routes::detail::format_cursor`'s output, HTML-attribute
+/// position. Colons, dots, and commas are never HTML-escaped by minijinja (only
+/// `< > & " ' /`), so the raw cursor string appears verbatim between `cursor=` and the closing
+/// quote - no unescaping needed.
+fn extract_next_cursor(body: &str, ip: &str) -> String {
+    let marker = format!("/ip/{ip}/events?cursor=");
+    let start = body
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no Load more button (cursor href) found in body: {body}"))
+        + marker.len();
+    let rest = &body[start..];
+    let end = rest
+        .find('"')
+        .expect("cursor value in hx-get attribute must be quoted");
+    rest[..end].to_string()
+}
+
+// --- detail: evidence timeline pagination (console-forensics task 4) ---
+
+#[sqlx::test(migrations = false)]
+async fn detail_evidence_timeline_paginates_past_the_first_page(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.70";
+    let now = chrono::Utc::now();
+    // 205 events, strictly increasing timestamps (index 0 oldest, index 204 newest, one second
+    // apart) - 5 more than `EVIDENCE_PAGE_SIZE` (200, `routes::detail`'s private constant; mirrored
+    // here as a literal since it is not part of this crate's public API). The first page (`GET
+    // /ip/{ip}`) must show only the newest 200 (indices 5..=204); the remaining 5 oldest
+    // (indices 0..=4) must appear only via the "Load more" fragment.
+    for i in 0..205i64 {
+        let session_id = Uuid::now_v7();
+        append_event(
+            &pool,
+            ev_with_session(
+                ip,
+                "ssh-sensor",
+                SignalType::HoneypotCommandExec,
+                Protocol::Tcp,
+                true,
+                &(now - chrono::Duration::seconds(205 - i)).to_rfc3339(),
+                // The `-end` suffix guards against substring false-positives: without it,
+                // `pg-marker-4` is itself a substring of `pg-marker-40`..`pg-marker-49`, so a
+                // `!body.contains("pg-marker-4")` assertion would wrongly fail as soon as any of
+                // those (all on the first page) rendered.
+                serde_json::json!({ "command": format!("pg-marker-{i}-end") }),
+                session_id,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+
+    let first_page = app
+        .clone()
+        .oneshot(get_request(&format!("/ip/{ip}"), Some(&cookie_header)))
+        .await
+        .unwrap();
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_body = body_text(first_page).await;
+    assert!(
+        first_body.contains("pg-marker-204-end"),
+        "newest event must be on the first page: {first_body}"
+    );
+    assert!(
+        !first_body.contains("pg-marker-4-end"),
+        "the 5 oldest events must NOT be on the first page: {first_body}"
+    );
+    assert!(
+        first_body.contains(r#"id="load-more-container""#),
+        "expected a Load more container when more than 200 events exist: {first_body}"
+    );
+
+    let cursor = extract_next_cursor(&first_body, ip);
+    let second_page = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}/events?cursor={cursor}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_page.status(), StatusCode::OK);
+    let second_body = body_text(second_page).await;
+    for i in 0..5 {
+        assert!(
+            second_body.contains(&format!("pg-marker-{i}-end")),
+            "expected the 5 oldest events (index {i}) on the second page: {second_body}"
+        );
+    }
+    assert!(
+        !second_body.contains("pg-marker-204-end"),
+        "the newest (first-page) event must not be re-sent on the second page: {second_body}"
+    );
+    assert!(
+        !second_body.contains("<!doctype html>"),
+        "an HTMX fragment must not carry the full base-page wrapper: {second_body}"
+    );
+    // Exactly 205 events total, so the second page (5 rows) is the last one: its own "Load more"
+    // out-of-band swap must be empty, not a fresh button.
+    assert!(
+        !second_body.contains("class=\"load-more\""),
+        "the last page must not offer a further Load more button: {second_body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_evidence_timeline_omits_load_more_under_the_page_size(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.71", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.71",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("class=\"load-more\""),
+        "fewer than 200 events must not show a Load more button: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn events_fragment_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/ip/203.0.113.72/events", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn events_fragment_malformed_cursor_returns_an_empty_fragment(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.73", 60).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.73/events?cursor=not-a-valid-cursor",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    // Fails closed (`routes::detail::events_fragment`'s doc comment): a malformed cursor never
+    // guesses a start point, it returns an empty 200 rather than a 500 or leaking the wrong page.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert_eq!(body, "", "a malformed cursor must yield an empty fragment");
+}
+
+// --- detail: adjustable chart time range (console-forensics task 4) ---
+
+#[sqlx::test(migrations = false)]
+async fn detail_chart_fragment_24h_range_returns_hourly_buckets(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.74";
+    append_event(
+        &pool,
+        ev(
+            ip,
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}/chart?range=24h"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per hour, last 24 hours""#),
+        "expected the 24h range's hourly aria-label: {body}"
+    );
+    assert!(
+        body.contains(r#"<canvas id="chart-ip-timeline""#),
+        "chart canvas missing from the range fragment: {body}"
+    );
+    assert!(
+        !body.contains("<!doctype html>"),
+        "an HTMX fragment must not carry the full base-page wrapper: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_chart_fragment_unknown_range_falls_back_to_7d(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.75", 60).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.75/chart?range=not-a-real-range",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per day, last 7 days""#),
+        "an unrecognized range must fall back to the page's own 7d default: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_chart_fragment_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/ip/203.0.113.76/chart?range=24h", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+// --- dashboard: adjustable chart time range (console-forensics task 4) ---
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_chart_fragment_1h_range_returns_five_minute_buckets(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.77",
+            "cowrie",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/dashboard/chart?range=1h",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per 5 minutes, last hour""#),
+        "expected the 1h range's five-minute aria-label: {body}"
+    );
+    assert!(
+        body.contains(r#"<canvas id="timelineChart""#),
+        "chart canvas missing from the range fragment: {body}"
+    );
+    assert!(
+        !body.contains("<!doctype html>"),
+        "an HTMX fragment must not carry the full base-page wrapper: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_chart_fragment_30d_range_returns_daily_buckets(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/dashboard/chart?range=30d",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per day, last 30 days""#),
+        "expected the 30d range's daily aria-label: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_chart_fragment_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/dashboard/chart?range=24h", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
 }
 
 // --- feed ---
@@ -1623,6 +2381,194 @@ async fn feed_unauthenticated_redirects_to_login(pool: PgPool) {
     assert_eq!(response.headers().get("location").unwrap(), "/login");
 }
 
+#[sqlx::test(migrations = false)]
+async fn feed_entries_tab_lists_only_approved_recommended_ips_under_their_tier(pool: PgPool) {
+    migrate(&pool).await;
+    // Approved + recommended: must appear, under its (Standard) tier.
+    seed_recommended(&pool, "203.0.113.70", 60).await;
+    // Recommended but still PENDING (never approved): must be omitted - the entries query joins
+    // on `rq.state = 'approved'`, not merely `recommended_for_blocklist`.
+    seed_recommended(&pool, "203.0.113.71", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":0,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":1,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}}}"#,
+    )
+    .unwrap();
+    let state = test_state_with_feed_dir(pool.clone(), Some(tmp.path().to_path_buf()));
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.70/approve",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed?tab=entries",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<a href="/ip/203.0.113.70">203.0.113.70</a>"#),
+        "approved+recommended IP missing a detail-page link: {body}"
+    );
+    assert!(
+        !body.contains("203.0.113.71"),
+        "still-pending IP must not appear in the entries tab: {body}"
+    );
+    let standard_panel = body
+        .find("Standard tier")
+        .expect("Standard tier panel missing");
+    let ip_pos = body
+        .find("203.0.113.70")
+        .expect("approved IP missing from body");
+    assert!(
+        ip_pos > standard_panel,
+        "203.0.113.70 (raw ~85, Standard tier) must render under the Standard tier panel: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_entries_tab_shows_awaiting_build_state_when_no_manifest(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // No manifest.json written and no entries approved: entries tab must show the same
+    // "awaiting first build" empty state as the status tab, per the design's framing of this tab
+    // as listing "the actual IPs in the current published feed" - there is no published feed yet.
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed?tab=entries",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">feed enabled - awaiting first build</p>"#),
+        "expected the awaiting-first-build empty state on the entries tab: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_returns_file_content_with_correct_type(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("aggressive.json"), r#"{"entries":[]}"#).unwrap();
+    std::fs::write(tmp.path().join("standard.csv"), "ip,score\n").unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/feed/download/aggressive/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let body = body_text(response).await;
+    assert_eq!(body, r#"{"entries":[]}"#);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed/download/standard/csv",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-type").unwrap(), "text/csv");
+    let body = body_text(response).await;
+    assert_eq!(body, "ip,score\n");
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_404s_when_feed_disabled(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed/download/aggressive/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_404s_on_unknown_tier_or_format(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("aggressive.json"), "{}").unwrap();
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/feed/download/nonsense/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/feed/download/aggressive/exe",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // The manifest exists but this particular file was never written (e.g. a build that failed
+    // partway) - still 404, not a 503 or a panic.
+    let response = app
+        .oneshot(get_request(
+            "/feed/download/standard/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 // --- metrics ---
 
 #[sqlx::test(migrations = false)]
@@ -1723,4 +2669,134 @@ async fn metrics_omits_feed_entries_when_unconfigured(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(!body.contains("propolis_feed_entries"));
+}
+
+// --- logs ---
+
+#[sqlx::test(migrations = false)]
+async fn logs_page_renders_snapshot_with_level_based_markup(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    state.log_buffer.push(LogEntry {
+        timestamp: "2026-08-19T00:00:00Z".to_string(),
+        level: "ERROR".to_string(),
+        target: "propolis::intake".to_string(),
+        message: "<script>alert(1)</script>".to_string(),
+    });
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/logs",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"class="log-line level-error""#),
+        "expected the seeded ERROR entry to render with error-level markup: {body}"
+    );
+    assert!(
+        body.contains("propolis::intake"),
+        "expected the seeded entry's target in the rendered page: {body}"
+    );
+    // minijinja auto-escapes every interpolated value (`templates.rs`'s own doc comment) - a raw
+    // log message containing HTML metacharacters must never reach the page unescaped.
+    assert!(
+        !body.contains("<script>alert"),
+        "log message markup leaked into the page unescaped: {body}"
+    );
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;&#x2f;script&gt;"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_page_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/logs", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_stream_is_sse_and_broadcasts_pushed_entries(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let log_buffer = state.log_buffer.clone();
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/logs/stream",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "unexpected content-type for the SSE endpoint: {content_type}"
+    );
+
+    // `logs_stream`'s handler subscribes to the broadcast channel synchronously before
+    // returning the response (`routes::logs`'s own doc comment), so by the time `oneshot`
+    // resolves above, the subscription already exists - a push here is guaranteed to reach it,
+    // no race window to paper over with a sleep.
+    log_buffer.push(LogEntry {
+        timestamp: "2026-08-19T00:00:00Z".to_string(),
+        level: "WARN".to_string(),
+        target: "propolis::review".to_string(),
+        message: "queue scan degraded".to_string(),
+    });
+
+    let mut body = response.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("timed out waiting for the first SSE frame")
+        .expect("stream ended before any frame arrived")
+        .expect("error reading SSE frame");
+    let text = String::from_utf8(chunk.to_vec()).unwrap();
+
+    assert!(
+        text.contains(r#""level":"WARN""#),
+        "expected the pushed entry's level in the SSE frame: {text}"
+    );
+    assert!(
+        text.contains(r#""target":"propolis::review""#),
+        "expected the pushed entry's target in the SSE frame: {text}"
+    );
+    assert!(
+        text.contains(r#""message":"queue scan degraded""#),
+        "expected the pushed entry's message in the SSE frame: {text}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_stream_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/logs/stream", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
 }

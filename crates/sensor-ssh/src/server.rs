@@ -90,14 +90,22 @@ pub async fn start_test_server(
             let Ok((stream, peer_addr)) = listener.accept().await else {
                 continue;
             };
+            let session_id = sensor_framework::Uuid::now_v7();
             let host_key = host_key.clone();
             let emitter = emitter.clone();
             let handoff = handoff.clone();
             let wan_resolver = wan_resolver.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_session(stream, peer_addr, host_key, emitter, handoff, wan_resolver)
-                        .await
+                if let Err(e) = handle_session(
+                    stream,
+                    peer_addr,
+                    session_id,
+                    host_key,
+                    emitter,
+                    handoff,
+                    wan_resolver,
+                )
+                .await
                 {
                     tracing::debug!(error = %e, peer = %peer_addr, "SSH session ended");
                 }
@@ -113,6 +121,7 @@ pub async fn start_test_server(
 async fn handle_session(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
+    session_id: sensor_framework::Uuid,
     host_key: HostKey,
     emitter: Arc<EventEmitter>,
     handoff: Arc<CaptureHandoff>,
@@ -175,7 +184,7 @@ async fn handle_session(
     let source_ip: IpAddr = norm_peer.ip();
     let local_addr = stream.local_addr().map(normalize_dual_stack).ok();
     let wan_ip = local_addr.and_then(|la| wan_resolver.resolve(la.ip()));
-    let mut auth_state = AuthState::new(source_ip, wan_ip);
+    let mut auth_state = AuthState::new(source_ip, wan_ip, session_id);
 
     // Emit honeypot_connection (authenticated=false, pre-auth).
     let conn_event = auth_state.emit_connection_event();
@@ -261,6 +270,7 @@ async fn handle_session(
                             wan_ip,
                             authenticated: auth_state.is_authenticated(),
                             protocol_label: "ssh".to_string(),
+                            session_id: Some(session_id),
                         };
                         let shell = FakeShell::new(FakeFs::new(), ctx);
                         handler = ChannelHandler::Shell(shell, Vec::new());
@@ -277,6 +287,7 @@ async fn handle_session(
                             wan_ip,
                             authenticated: auth_state.is_authenticated(),
                             protocol_label: "ssh".to_string(),
+                            session_id: Some(session_id),
                         };
                         let mut shell = FakeShell::new(FakeFs::new(), shell_ctx);
                         let (output, events) = shell.handle_input(&cmd);
@@ -287,7 +298,7 @@ async fn handle_session(
                         if cmd.starts_with("scp -t ") {
                             // SCP server mode.
                             let (scp, initial) =
-                                ScpReceiver::new(source_ip, wan_ip, handoff.clone());
+                                ScpReceiver::new(source_ip, wan_ip, session_id, handoff.clone());
                             handler = ChannelHandler::Scp(scp);
                             let data_pkt = build_channel_data(ch_id, &initial);
                             write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &data_pkt)
@@ -308,7 +319,8 @@ async fn handle_session(
                     }
                     ChannelAction::Subsystem(name) => {
                         if name == "sftp" {
-                            let sftp = SftpHandler::new(source_ip, wan_ip, handoff.clone());
+                            let sftp =
+                                SftpHandler::new(source_ip, wan_ip, session_id, handoff.clone());
                             handler = ChannelHandler::Sftp(sftp);
                         }
                     }

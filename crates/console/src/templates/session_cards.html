@@ -1,0 +1,60 @@
+{% for session in sessions %}
+<details class="session-card" id="session-{{ session.session_id }}" {% if session.expanded %}open{% endif %}>
+  <summary class="session-header">
+    <span class="session-time mono">{{ session.start_time }}</span>
+    <span class="dim">{{ session.start_relative }}</span>
+    <span class="session-meta">{{ session.sensor }} / {{ session.protocol }}</span>
+    {% if session.username %}<span class="session-user mono">user: {{ session.username }}</span>{% endif %}
+    {% if session.command_count > 0 %}<span class="dim">{{ session.command_count }} command{% if session.command_count != 1 %}s{% endif %}</span>{% endif %}
+    <span class="session-count dim">{{ session.event_count }} event{% if session.event_count != 1 %}s{% endif %}, {{ session.duration }}</span>
+  </summary>
+  <div class="table-wrap">
+    <table class="evidence-table">
+      <thead><tr><th>Time</th><th>Activity</th><th>Detail</th><th></th></tr></thead>
+      <tbody>
+        {% for event in session.events %}
+        <tr>
+          <td class="seen dim">{{ event.relative_time }}</td>
+          <td>{{ event.activity }}</td>
+          <td class="mono">{{ event.detail }}</td>
+          <td>
+            <details class="raw-toggle">
+              <summary>raw</summary>
+              <pre class="raw-json">{{ event.metadata_json }}</pre>
+            </details>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</details>
+{% endfor %}
+
+{% if ungrouped %}
+<h3 class="section-title">Ungrouped events <span class="dim">(predate session tracking)</span></h3>
+<div class="table-wrap">
+  <table class="evidence-table">
+    <thead><tr><th>Observed</th><th>Age</th><th>Activity</th><th>Detail</th><th>Protocol</th><th>Auth</th><th>WAN IP</th><th></th></tr></thead>
+    <tbody>
+      {% for event in ungrouped %}
+      <tr>
+        <td class="seen">{{ event.observed_at }}</td>
+        <td class="seen dim">{{ event.relative_time }}</td>
+        <td>{{ event.activity }}</td>
+        <td class="mono">{{ event.detail }}</td>
+        <td>{{ event.protocol }}</td>
+        <td>{% if event.authenticated %}yes{% else %}no{% endif %}</td>
+        <td class="ip">{{ event.wan_ip }}</td>
+        <td>
+          <details class="raw-toggle">
+            <summary>raw</summary>
+            <pre class="raw-json">{{ event.metadata_json }}</pre>
+          </details>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}

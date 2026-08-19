@@ -1,0 +1,9 @@
+{% for r in rows %}
+<tr>
+  <td class="seen">{{ r.observed_at }}</td>
+  <td class="ip"><a href="/ip/{{ r.source_ip }}">{{ r.source_ip }}</a></td>
+  <td>{{ r.activity }}</td>
+  <td class="mono">{{ r.detail }}</td>
+  <td>{% if r.session_id %}<a href="/ip/{{ r.source_ip }}#session-{{ r.session_id }}" class="mono">{{ r.session_short }}&hellip;</a>{% else %}<span class="dim">-</span>{% endif %}</td>
+</tr>
+{% endfor %}

@@ -254,12 +254,13 @@ async fn main() {
         let bounds = config.bounds.clone();
         let tcp_emitter = emitter.clone();
         let tcp_wan_resolver = wan_resolver.clone();
-        match run_tcp_listener(*addr, bounds.clone(), move |stream, peer| {
+        match run_tcp_listener(*addr, bounds.clone(), move |stream, peer, session_id| {
             let emitter = tcp_emitter.clone();
             let wan_resolver = tcp_wan_resolver.clone();
             let bounds = bounds.clone();
             async move {
-                handler::handle_tcp(stream, peer, &wan_resolver, &emitter, &bounds).await;
+                handler::handle_tcp(stream, peer, session_id, &wan_resolver, &emitter, &bounds)
+                    .await;
             }
         })
         .await

@@ -49,12 +49,12 @@ pub async fn start_test_listener(
     let emitter = Arc::new(EventEmitter::new(log_path));
     let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
     let bounds = test_bounds();
-    run_tcp_listener(addr, bounds.clone(), move |stream, peer| {
+    run_tcp_listener(addr, bounds.clone(), move |stream, peer, session_id| {
         let emitter = emitter.clone();
         let wan_resolver = wan_resolver.clone();
         let bounds = bounds.clone();
         async move {
-            handler::handle_tcp(stream, peer, &wan_resolver, &emitter, &bounds).await;
+            handler::handle_tcp(stream, peer, session_id, &wan_resolver, &emitter, &bounds).await;
         }
     })
     .await

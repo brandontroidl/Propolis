@@ -2,27 +2,51 @@
 {% block title %}Review queue - Propolis{% endblock %}
 {% block content %}
 <h1>Review queue <span class="dim">({{ pending_count }} pending)</span></h1>
+<div class="tab-bar">
+  {% for tab_name in ["pending", "approved", "rejected", "snoozed"] %}
+  <a href="/queue?tab={{ tab_name }}" class="tab {% if tab == tab_name %}active{% endif %}">{{ tab_name | capitalize }}</a>
+  {% endfor %}
+</div>
 {% if rows %}
 <div class="panel">
 <table class="table-compact">
   <thead>
     <tr>
       <th>IP</th>
+      {% if tab == "pending" %}
       <th><a href="/queue?sort=score" class="{% if sort == "score" %}active{% endif %}">Score</a></th>
+      {% else %}
+      <th>Score</th>
+      {% endif %}
       <th>Tier</th>
       <th>Categories</th>
+      {% if tab == "pending" %}
       <th><a href="/queue?sort=event_count" class="{% if sort == "event_count" %}active{% endif %}">Events</a></th>
       <th><a href="/queue?sort=first_seen" class="{% if sort == "first_seen" %}active{% endif %}">First seen</a></th>
       <th><a href="/queue?sort=last_seen" class="{% if sort == "last_seen" %}active{% endif %}">Last seen</a></th>
       <th>Actions</th>
+      {% else %}
+      <th>Events</th>
+      <th>Decided</th>
+      {% if tab == "approved" %}<th>Submissions</th>{% endif %}
+      <th>Notes</th>
+      {% endif %}
     </tr>
   </thead>
   <tbody>
-    {% for row in rows %}{% include "queue_row.html" %}{% endfor %}
+    {% if tab == "pending" %}
+      {% for row in rows %}{% include "queue_row.html" %}{% endfor %}
+    {% else %}
+      {% for row in rows %}{% include "queue_history_row.html" %}{% endfor %}
+    {% endif %}
   </tbody>
 </table>
 </div>
 {% else %}
+{% if tab == "pending" %}
 <p class="empty-line">queue empty - no IPs have crossed the recommendation threshold yet</p>
+{% else %}
+<p class="empty-line">no {{ tab }} entries yet</p>
+{% endif %}
 {% endif %}
 {% endblock %}

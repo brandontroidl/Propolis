@@ -220,6 +220,18 @@ impl RateLimiter {
     pub fn check(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
         let mut attempts = self.attempts.write().unwrap();
+
+        if attempts.len() > 10_000 {
+            attempts.retain(|_, v| {
+                v.retain(|&t| now.duration_since(t) < self.window);
+                !v.is_empty()
+            });
+        }
+
+        if attempts.len() > 50_000 {
+            return false;
+        }
+
         let entry = attempts.entry(ip).or_default();
         entry.retain(|&t| now.duration_since(t) < self.window);
         if entry.len() >= self.max_attempts {

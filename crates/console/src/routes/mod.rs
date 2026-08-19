@@ -50,5 +50,17 @@ pub fn router(state: AppState) -> Router {
         .merge(metrics::router())
         .merge(login::router())
         .merge(protected)
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+async fn security_headers(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(axum::http::header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+    headers.insert(axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    resp
 }

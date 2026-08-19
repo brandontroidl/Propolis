@@ -94,6 +94,14 @@ async fn download_sample(AxumPath(sha256): AxumPath<String>) -> Response {
                         header::CONTENT_DISPOSITION,
                         format!("attachment; filename=\"{sha256}\""),
                     ),
+                    (
+                        header::HeaderName::from_static("x-content-type-options"),
+                        "nosniff".to_string(),
+                    ),
+                    (
+                        header::HeaderName::from_static("content-security-policy"),
+                        "default-src 'none'".to_string(),
+                    ),
                 ],
                 bytes,
             )

@@ -97,7 +97,7 @@ struct Filters {
 impl Filters {
     fn from_params(p: &SearchParams) -> Self {
         Filters {
-            q: normalize(&p.q),
+            q: normalize(&p.q).map(|s| s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")),
             sensor: normalize(&p.sensor),
             signal_type: normalize(&p.signal_type),
             ip: normalize(&p.ip),
@@ -472,7 +472,7 @@ async fn fetch_search_events(
         "SELECT id, host(source_ip) AS source_ip, sensor, signal_type, observed_at, metadata, \
                 session_id::text AS session_id \
          FROM event \
-         WHERE ($1::text IS NULL OR metadata::text ILIKE '%' || $1 || '%') \
+         WHERE ($1::text IS NULL OR metadata::text ILIKE '%' || $1 || '%' ESCAPE '\\') \
            AND ($2::text IS NULL OR sensor = $2) \
            AND ($3::text IS NULL OR signal_type::text = $3) \
            AND ($4::inet IS NULL OR source_ip = $4::inet) \
@@ -527,7 +527,7 @@ async fn fetch_search_ips(db: &PgPool, filters: &Filters) -> Result<Vec<SearchIp
         "SELECT host(source_ip) AS source_ip, COUNT(*) AS match_count, \
                 MIN(observed_at) AS first_seen, MAX(observed_at) AS last_seen \
          FROM event \
-         WHERE ($1::text IS NULL OR metadata::text ILIKE '%' || $1 || '%') \
+         WHERE ($1::text IS NULL OR metadata::text ILIKE '%' || $1 || '%' ESCAPE '\\') \
            AND ($2::text IS NULL OR sensor = $2) \
            AND ($3::text IS NULL OR signal_type::text = $3) \
            AND ($4::timestamptz IS NULL OR observed_at >= $4) \

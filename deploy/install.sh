@@ -129,12 +129,16 @@ ensure_dir /var/log/propolis/http        0750 propolis-http     propolis-http
 ensure_dir /var/log/propolis/ftp         0750 propolis-ftp      propolis-ftp
 ensure_dir /var/log/propolis/smtp        0750 propolis-smtp     propolis-smtp
 ensure_dir /var/log/propolis/cred        0750 propolis-cred     propolis-cred
-ensure_dir /var/lib/propolis              0755 root              root
+ensure_dir /var/lib/propolis              0755 propolis          propolis
 ensure_dir /var/lib/propolis/cursors      0750 propolis          propolis
 # 0755, not cursors' 0750: this is feed's PUBLIC output tree (see deploy/propolis.service's own
 # UMask=0022 comment) - the operator's out-of-band distribution mechanism, typically a different
 # unrelated user, must be able to traverse in and read it.
 ensure_dir /var/lib/propolis/feed         0755 propolis          propolis
+# sensor-ssh stores its generated host key here (reused across restarts so the honeypot does not
+# fingerprint itself as freshly minted). Listed in sensor-ssh.service's ReadWritePaths, so it
+# must exist or ProtectSystem=strict's bind-mount setup fails with NAMESPACE.
+ensure_dir /var/lib/propolis/ssh          0750 propolis-ssh      propolis-ssh
 
 # ---- 3. spool directories (mount points only - see printed fstab guidance below) ----
 

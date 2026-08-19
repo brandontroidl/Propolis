@@ -94,7 +94,23 @@ password.
 Create environment files in `/etc/propolis/`. Each file should be mode `0600`, owned by its
 respective service user.
 
+**Generate secrets first** (you will need these for `propolis.env` below):
+
+```bash
+# Console login password - pick something strong
+CONSOLE_PW="$(openssl rand -base64 24)"
+echo "Console password: $CONSOLE_PW"
+
+# Session signing secret - must be exactly 64 hex characters (32 bytes)
+SESSION_SECRET="$(openssl rand -hex 32)"
+echo "Session secret:   $SESSION_SECRET"
+```
+
 ### `/etc/propolis/propolis.env` (the unified daemon)
+
+Replace `YOUR_PASSWORD`, `$CONSOLE_PW`, and `$SESSION_SECRET` with the real values.
+Do not use the placeholder strings literally - the daemon validates the session secret
+format and will refuse to start.
 
 ```bash
 # Database (required)
@@ -121,8 +137,8 @@ PROPOLIS_FEED_BUILD_INTERVAL_SECS=900
 
 # Console (loopback only by default)
 PROPOLIS_CONSOLE_BIND=127.0.0.1:8080
-PROPOLIS_CONSOLE_PASSWORD=CHANGE_ME
-PROPOLIS_CONSOLE_SESSION_SECRET=CHANGE_ME_64_HEX_CHARS
+PROPOLIS_CONSOLE_PASSWORD=<your console password>
+PROPOLIS_CONSOLE_SESSION_SECRET=<output of openssl rand -hex 32>
 ```
 
 ### `/etc/propolis/ssh.env` (SSH sensor)
@@ -142,21 +158,56 @@ PROPOLIS_CATCHALL_WAN_MAP=10.0.0.1=198.51.100.1
 PROPOLIS_CATCHALL_LOG_PATH=/var/log/propolis/catchall/events.jsonl
 ```
 
-### Sensor env files (telnet, redis, adb, http, ftp, smtp, cred)
+### Remaining sensor env files
 
-Each sensor follows the same pattern. The env var prefix matches the sensor name
-(`PROPOLIS_TELNET_*`, `PROPOLIS_REDIS_*`, etc.). Required: `*_BIND` (ip:port).
-Optional: `*_WAN_MAP`, `*_LOG_PATH`, `*_SPOOL_DIR` (for sensors with upload capture),
-timeout/concurrency overrides.
+Each sensor follows the same pattern: the env var prefix matches the sensor name, only
+`*_BIND` is required, and `*_WAN_MAP`, `*_LOG_PATH`, `*_SPOOL_DIR` (for sensors with upload
+capture), and timeout/concurrency overrides are optional. **Every sensor needs its env file
+created before starting the service, even if it contains only the bind address.**
 
-Example `/etc/propolis/telnet.env`:
+`/etc/propolis/telnet.env`:
 
 ```bash
 PROPOLIS_TELNET_BIND=0.0.0.0:23
-PROPOLIS_TELNET_WAN_MAP=10.0.0.1=198.51.100.1
+# PROPOLIS_TELNET_WAN_MAP=10.0.0.1=198.51.100.1
 ```
 
-Example `/etc/propolis/cred.env` (one binary, multiple protocol listeners):
+`/etc/propolis/redis.env`:
+
+```bash
+PROPOLIS_REDIS_BIND=0.0.0.0:6379
+# PROPOLIS_REDIS_WAN_MAP=10.0.0.1=198.51.100.1
+```
+
+`/etc/propolis/adb.env`:
+
+```bash
+PROPOLIS_ADB_BIND=0.0.0.0:5555
+# PROPOLIS_ADB_WAN_MAP=10.0.0.1=198.51.100.1
+```
+
+`/etc/propolis/http.env`:
+
+```bash
+PROPOLIS_HTTP_BIND=0.0.0.0:80
+# PROPOLIS_HTTP_WAN_MAP=10.0.0.1=198.51.100.1
+```
+
+`/etc/propolis/ftp.env`:
+
+```bash
+PROPOLIS_FTP_BIND=0.0.0.0:21
+# PROPOLIS_FTP_WAN_MAP=10.0.0.1=198.51.100.1
+```
+
+`/etc/propolis/smtp.env`:
+
+```bash
+PROPOLIS_SMTP_BIND=0.0.0.0:25
+# PROPOLIS_SMTP_WAN_MAP=10.0.0.1=198.51.100.1
+```
+
+`/etc/propolis/cred.env` (one binary, multiple protocol listeners):
 
 ```bash
 PROPOLIS_CRED_VNC_BIND=0.0.0.0:5900
@@ -164,8 +215,19 @@ PROPOLIS_CRED_MYSQL_BIND=0.0.0.0:3306
 PROPOLIS_CRED_MSSQL_BIND=0.0.0.0:1433
 PROPOLIS_CRED_PG_BIND=0.0.0.0:5432
 PROPOLIS_CRED_MONGO_BIND=0.0.0.0:27017
-PROPOLIS_CRED_WAN_MAP=10.0.0.1=198.51.100.1
+# PROPOLIS_CRED_WAN_MAP=10.0.0.1=198.51.100.1
 PROPOLIS_CRED_LOG_DIR=/var/log/propolis/cred
+```
+
+Set ownership and permissions on each file:
+
+```bash
+for sensor in catchall ssh telnet redis adb http ftp smtp cred; do
+    chown "propolis-${sensor}:propolis-${sensor}" "/etc/propolis/${sensor}.env"
+    chmod 0600 "/etc/propolis/${sensor}.env"
+done
+chown propolis:propolis /etc/propolis/propolis.env
+chmod 0600 /etc/propolis/propolis.env
 ```
 
 The `WAN_MAP` value is a comma-separated list of `local_ip=wan_ip` pairs mapping this host's

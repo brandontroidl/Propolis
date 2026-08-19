@@ -420,7 +420,7 @@ async fn delist(
         .await?;
 
     sqlx::query(
-        "UPDATE ip_score SET eligible = FALSE, recommended_for_vendor = FALSE, \
+        "UPDATE ip_score SET delisted = TRUE, eligible = FALSE, recommended_for_vendor = FALSE, \
          recommended_for_blocklist = FALSE WHERE source_ip = $1::inet",
     )
     .bind(ip.to_string())

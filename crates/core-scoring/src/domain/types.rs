@@ -104,6 +104,7 @@ pub struct IpScore {
     pub recommended_for_vendor: bool,
     pub recommended_for_blocklist: bool,
     pub tier: Option<FeedTier>,
+    pub delisted: bool,
 }
 
 #[cfg(test)]

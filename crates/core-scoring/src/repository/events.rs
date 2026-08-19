@@ -257,8 +257,8 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
         "INSERT INTO ip_score \
          (source_ip, raw_score, decay_anchor, max_confidence, event_count, distinct_categories, \
           category_breakdown, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
-          first_seen, last_seen, eligible, recommended_for_vendor, recommended_for_blocklist, tier) \
-         VALUES ($1::inet, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+          first_seen, last_seen, eligible, recommended_for_vendor, recommended_for_blocklist, tier, delisted) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
          ON CONFLICT (source_ip) DO UPDATE SET \
            raw_score = EXCLUDED.raw_score, \
            decay_anchor = EXCLUDED.decay_anchor, \
@@ -292,6 +292,7 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     .bind(new_score.recommended_for_vendor)
     .bind(new_score.recommended_for_blocklist)
     .bind(new_score.tier)
+    .bind(new_score.delisted)
     .execute(&mut *tx)
     .await?;
 
@@ -337,7 +338,7 @@ where
         "SELECT host(source_ip) AS source_ip, raw_score, decay_anchor, max_confidence, \
                 event_count, distinct_categories, category_breakdown, has_confirmed_real, \
                 distinct_wan_count, distinct_sensor_count, first_seen, last_seen, eligible, \
-                recommended_for_vendor, recommended_for_blocklist, tier \
+                recommended_for_vendor, recommended_for_blocklist, tier, delisted \
          FROM ip_score WHERE source_ip = $1::inet",
     )
     .bind(ip.to_string())
@@ -376,5 +377,6 @@ where
         recommended_for_vendor: row.try_get("recommended_for_vendor")?,
         recommended_for_blocklist: row.try_get("recommended_for_blocklist")?,
         tier: row.try_get("tier")?,
+        delisted: row.try_get("delisted")?,
     }))
 }

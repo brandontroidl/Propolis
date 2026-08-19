@@ -5,7 +5,7 @@
 //! `github.com/DShield-ISC/dshield/srv/dshield/DShield.py`.
 //!
 //! Auth: `X-ISC-Authorization: ISC-HMAC-SHA256 Credentials=<hash> Userid=<id> Nonce=<nonce>`
-//! where hash = base64(HMAC-SHA256(key=api_key, msg=nonce+userid)).
+//! where hash = base64(HMAC-SHA256(key=nonce+userid, msg=api_key)).
 //!
 //! The `api_key` field arrives as `"userid:apikey"` from config.rs (which concatenates
 //! PROPOLIS_VENDOR_DSHIELD_USER and PROPOLIS_VENDOR_DSHIELD_KEY). This adapter splits

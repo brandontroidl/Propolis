@@ -61,13 +61,14 @@ pub fn apply_event(
     let now = event.observed_at;
 
     // Step 1-2: seed or decay prior state to `now`.
-    let (decayed_raw, mut breakdown, first_seen, prev_event_count, prev_has_confirmed_real) =
+    let (decayed_raw, mut breakdown, first_seen, prev_event_count, prev_has_confirmed_real, delisted) =
         match prev {
             None => (
                 dec!(0),
                 BTreeMap::<Category, CategoryStat>::new(),
                 now,
                 0i32,
+                false,
                 false,
             ),
             Some(p) => {
@@ -76,7 +77,6 @@ pub fn apply_event(
                 let mut map: BTreeMap<Category, CategoryStat> =
                     serde_json::from_value(p.category_breakdown)
                         .expect("category_breakdown is a well-formed CategoryStat map");
-                // Confidence does not decay; only the accumulated weight does.
                 for stat in map.values_mut() {
                     stat.weight = decay(stat.weight, elapsed, half_life_seconds);
                 }
@@ -86,6 +86,7 @@ pub fn apply_event(
                     p.first_seen,
                     p.event_count,
                     p.has_confirmed_real,
+                    p.delisted,
                 )
             }
         };
@@ -123,6 +124,7 @@ pub fn apply_event(
         first_seen,
         now,
         now,
+        delisted,
     )
 }
 
@@ -142,6 +144,7 @@ fn derive_projection(
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
     decay_anchor: DateTime<Utc>,
+    delisted: bool,
 ) -> IpScore {
     let distinct_categories = breakdown.values().filter(|s| s.weight > LIVE_FLOOR).count() as i32;
     // Live-decayed confidence: a category whose weight has decayed to/below the floor no longer
@@ -157,6 +160,7 @@ fn derive_projection(
         has_confirmed_real,
         event_count as u32,
         distinct_categories as u32,
+        delisted,
     );
     let effective = effective_score(raw_score, distinct_wan_count as u32);
     let feed_tier = tier(raw_score, max_confidence); // RAW score, not effective.
@@ -184,6 +188,7 @@ fn derive_projection(
         recommended_for_vendor: rec_vendor,
         recommended_for_blocklist: rec_blocklist,
         tier: feed_tier,
+        delisted,
     }
 }
 
@@ -216,6 +221,7 @@ pub(crate) fn project_to_now(
         stored.first_seen,
         stored.last_seen,
         now,
+        stored.delisted,
     )
 }
 

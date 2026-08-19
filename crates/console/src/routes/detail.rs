@@ -359,6 +359,10 @@ async fn chart_fragment(
         current_range,
         ip_timeline_labels,
         ip_timeline_data,
+        // Both needed by the out-of-band range-selector swap: `ip` builds each button's
+        // hx-get URL, `is_fragment` gates the block off on the full-page render.
+        ip => ip.to_string(),
+        is_fragment => true,
     })?;
     Ok(Html(html))
 }

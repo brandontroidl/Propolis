@@ -10,3 +10,13 @@
   if(existing)existing.destroy();
   new Chart(el,{type:'line',data:{labels:JSON.parse(document.getElementById('ip-timeline-labels').textContent),datasets:[{data:JSON.parse(document.getElementById('ip-timeline-data').textContent),borderColor:'#3987e5',backgroundColor:'rgba(57,135,229,0.08)',borderWidth:2,fill:true,pointRadius:3,pointBackgroundColor:'#3987e5',pointBorderColor:'#0f1417',pointBorderWidth:2,tension:0.3}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{grid:{display:false}},y:{beginAtZero:true,ticks:{precision:0}}},plugins:{tooltip:{displayColors:false}}}});
 " width="1" height="1" style="display:none">
+{# See dashboard_chart_fragment.html for why this is an out-of-band swap and why it is guarded. #}
+{% if is_fragment %}
+<div class="range-selector" id="chart-range" hx-swap-oob="true">
+  {% for r in ["24h", "7d", "30d"] %}
+  <a hx-get="/ip/{{ ip }}/chart?range={{ r }}"
+     hx-target="#detail-chart-container" hx-swap="innerHTML"
+     class="range-btn {% if r == current_range %}active{% endif %}">{{ r }}</a>
+  {% endfor %}
+</div>
+{% endif %}

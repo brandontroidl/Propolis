@@ -10,3 +10,17 @@
   if(existing)existing.destroy();
   new Chart(el,{type:'line',data:{labels:JSON.parse(document.getElementById('timeline-labels').textContent),datasets:[{data:JSON.parse(document.getElementById('timeline-data').textContent),borderColor:'#3987e5',backgroundColor:'rgba(57,135,229,0.08)',borderWidth:2,fill:true,tension:0,pointRadius:0,pointHoverRadius:4,pointHoverBackgroundColor:'#3987e5',pointHoverBorderColor:'#0f1417',pointHoverBorderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,scales:{x:{grid:{display:false}},y:{beginAtZero:true,ticks:{precision:0}}},plugins:{tooltip:{displayColors:false}}}});
 " width="1" height="1" style="display:none">
+{# The range selector lives in the panel HEAD, outside this fragment's swap target, so a plain
+   swap leaves its `active` class frozen at whatever the initial page render set. Re-render it
+   here as an out-of-band swap (matched by id) so the highlighted button tracks the chart.
+   Guarded: the full-page render `{% include %}`s this file and already emits the selector
+   itself, so emitting it again there would duplicate it. #}
+{% if is_fragment %}
+<div class="range-selector" id="dashboard-chart-range" hx-swap-oob="true">
+  {% for r in ["1h", "24h", "7d", "30d"] %}
+  <a hx-get="/dashboard/chart?range={{ r }}"
+     hx-target="#dashboard-chart-container" hx-swap="innerHTML"
+     class="range-btn {% if r == current_range %}active{% endif %}">{{ r }}</a>
+  {% endfor %}
+</div>
+{% endif %}

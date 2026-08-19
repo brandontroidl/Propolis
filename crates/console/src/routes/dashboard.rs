@@ -299,6 +299,9 @@ async fn dashboard_chart_fragment(
         current_range,
         timeline_labels,
         timeline_data,
+        // Emits the out-of-band range-selector swap; unset on the full-page render, which
+        // includes this template inline and draws the selector itself.
+        is_fragment => true,
     })?;
     Ok(Html(html))
 }

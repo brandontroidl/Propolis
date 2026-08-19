@@ -258,6 +258,12 @@ async fn download_feed(
         "csv" => ("csv", "text/csv"),
         "txt" => ("txt", "text/plain"),
         "cidr" => ("cidr", "text/plain"),
+        "ipset" => ("ipset", "text/plain"),
+        "nft" => ("nft", "text/plain"),
+        "pf" => ("pf", "text/plain"),
+        "alias" => ("alias", "text/plain"),
+        "hosts" => ("hosts", "text/plain"),
+        "rpz" => ("rpz", "text/plain"),
         _ => return download_not_found(),
     };
 

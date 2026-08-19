@@ -212,6 +212,30 @@ fn write_tier(
         &staging.join(format!("{name}.cidr")),
         export_cidr(entries).as_bytes(),
     )?;
+    write_file_synced(
+        &staging.join(format!("{name}.ipset")),
+        crate::export::export_ipset(name, entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.nft")),
+        crate::export::export_nftables(name, entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.pf")),
+        crate::export::export_pf(name, generated, entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.alias")),
+        crate::export::export_pfsense_alias(name, entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.hosts")),
+        crate::export::export_hosts(entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.rpz")),
+        crate::export::export_rpz(name, generated, entries).as_bytes(),
+    )?;
 
     // Integrity self-check: re-read the plain-text file just written and confirm its on-disk
     // digest matches what was just generated, before that digest is recorded in `manifest.json` -

@@ -12,11 +12,15 @@
 
 pub mod cidr;
 pub mod csv;
+pub mod firewall;
 pub mod json;
 pub mod plaintext;
 
 pub use cidr::export_cidr;
 pub use csv::export_csv;
+pub use firewall::{
+    export_hosts, export_ipset, export_nftables, export_pf, export_pfsense_alias, export_rpz,
+};
 pub use json::export_json;
 pub use plaintext::export_plaintext;
 

@@ -2,8 +2,8 @@
 <div class="chart-box">
   <canvas id="timelineChart" role="img" aria-label="{{ chart_aria }}"></canvas>
 </div>
-<div id="timeline-labels" style="display:none">{{ timeline_labels|safe }}</div>
-<div id="timeline-data" style="display:none">{{ timeline_data|safe }}</div>
+<script type="application/json" id="timeline-labels">{{ timeline_labels|safe }}</script>
+<script type="application/json" id="timeline-data">{{ timeline_data|safe }}</script>
 <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" onload="
   var el=document.getElementById('timelineChart');
   var existing=Chart.getChart(el);

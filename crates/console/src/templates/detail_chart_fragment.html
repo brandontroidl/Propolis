@@ -2,8 +2,8 @@
 <div class="chart-box-compact">
   <canvas id="chart-ip-timeline" role="img" aria-label="{{ chart_aria }}"></canvas>
 </div>
-<div id="ip-timeline-labels" style="display:none">{{ ip_timeline_labels|safe }}</div>
-<div id="ip-timeline-data" style="display:none">{{ ip_timeline_data|safe }}</div>
+<script type="application/json" id="ip-timeline-labels">{{ ip_timeline_labels|safe }}</script>
+<script type="application/json" id="ip-timeline-data">{{ ip_timeline_data|safe }}</script>
 <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" onload="
   var el=document.getElementById('chart-ip-timeline');
   var existing=Chart.getChart(el);

@@ -17,6 +17,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -24,8 +25,10 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use console::auth::{self, PasswordStore, RateLimiter, SessionStore};
+use console::log_buffer::LogEntry;
 use console::{AppState, routes};
 use core_scoring::{EventInput, Protocol, SignalType, append_event};
+use futures::StreamExt;
 use http_body_util::BodyExt;
 use review::queue::ReviewQueue;
 use sqlx::{PgPool, Row};
@@ -2478,4 +2481,134 @@ async fn metrics_omits_feed_entries_when_unconfigured(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(!body.contains("propolis_feed_entries"));
+}
+
+// --- logs ---
+
+#[sqlx::test(migrations = false)]
+async fn logs_page_renders_snapshot_with_level_based_markup(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    state.log_buffer.push(LogEntry {
+        timestamp: "2026-08-19T00:00:00Z".to_string(),
+        level: "ERROR".to_string(),
+        target: "propolis::intake".to_string(),
+        message: "<script>alert(1)</script>".to_string(),
+    });
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/logs",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"class="log-line level-error""#),
+        "expected the seeded ERROR entry to render with error-level markup: {body}"
+    );
+    assert!(
+        body.contains("propolis::intake"),
+        "expected the seeded entry's target in the rendered page: {body}"
+    );
+    // minijinja auto-escapes every interpolated value (`templates.rs`'s own doc comment) - a raw
+    // log message containing HTML metacharacters must never reach the page unescaped.
+    assert!(
+        !body.contains("<script>alert"),
+        "log message markup leaked into the page unescaped: {body}"
+    );
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;&#x2f;script&gt;"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_page_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/logs", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_stream_is_sse_and_broadcasts_pushed_entries(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let log_buffer = state.log_buffer.clone();
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/logs/stream",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "unexpected content-type for the SSE endpoint: {content_type}"
+    );
+
+    // `logs_stream`'s handler subscribes to the broadcast channel synchronously before
+    // returning the response (`routes::logs`'s own doc comment), so by the time `oneshot`
+    // resolves above, the subscription already exists - a push here is guaranteed to reach it,
+    // no race window to paper over with a sleep.
+    log_buffer.push(LogEntry {
+        timestamp: "2026-08-19T00:00:00Z".to_string(),
+        level: "WARN".to_string(),
+        target: "propolis::review".to_string(),
+        message: "queue scan degraded".to_string(),
+    });
+
+    let mut body = response.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("timed out waiting for the first SSE frame")
+        .expect("stream ended before any frame arrived")
+        .expect("error reading SSE frame");
+    let text = String::from_utf8(chunk.to_vec()).unwrap();
+
+    assert!(
+        text.contains(r#""level":"WARN""#),
+        "expected the pushed entry's level in the SSE frame: {text}"
+    );
+    assert!(
+        text.contains(r#""target":"propolis::review""#),
+        "expected the pushed entry's target in the SSE frame: {text}"
+    );
+    assert!(
+        text.contains(r#""message":"queue scan degraded""#),
+        "expected the pushed entry's message in the SSE frame: {text}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_stream_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/logs/stream", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
 }

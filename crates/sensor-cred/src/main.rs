@@ -85,10 +85,14 @@ async fn main() {
                 handles.push(handle);
             }
             Err(e) => {
-                tracing::error!(protocol = pc.protocol, addr = %pc.bind, error = %e, "sensor-cred: failed to start");
-                std::process::exit(1);
+                tracing::error!(protocol = pc.protocol, addr = %pc.bind, error = %e, "sensor-cred: failed to start; skipping protocol");
             }
         }
+    }
+
+    if handles.is_empty() {
+        tracing::error!("sensor-cred: all configured protocols failed to bind; exiting");
+        std::process::exit(1);
     }
 
     shutdown_signal().await;

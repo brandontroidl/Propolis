@@ -5,9 +5,9 @@
 //! `otx.alienvault.com/assets/static/external_api.html` while implementing
 //! this adapter: `POST /api/v1/pulses/create`, JSON body with `name`,
 //! `public`, `description`, `tags`, and an `indicators` array of
-//! `{indicator, type, description}`. The docs did not name the auth header
-//! explicitly; `X-OTX-API-Key` is OTX's documented convention elsewhere and
-//! is used here [unverified against a live authenticated call].
+//! `{indicator, type, description}`. Auth via `X-OTX-API-Key` header.
+//! Pulses must be `public: true` or OTX rejects with a ToS error.
+//! Verified live 2026-08-19.
 
 use async_trait::async_trait;
 
@@ -63,7 +63,7 @@ impl VendorAdapter for OtxAdapter {
         let ip = report.source_ip.to_string();
         let payload = PulsePayload {
             name: format!("propolis: {ip} ({})", report.evidence_window.1.to_rfc3339()),
-            public: false,
+            public: true,
             description: report.comment.clone(),
             tags: report.categories.clone(),
             indicators: vec![Indicator {

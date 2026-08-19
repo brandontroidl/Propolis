@@ -81,6 +81,7 @@ fn well_known_port(tag: &str) -> u16 {
 struct SubmitPayload {
     r#type: String,
     logs: Vec<LogEntry>,
+    authheader: String,
 }
 
 #[derive(serde::Serialize)]
@@ -108,6 +109,8 @@ impl VendorAdapter for DShield {
         let tag = report.categories.first().map(String::as_str).unwrap_or("");
         let log_type = log_type_for_tag(tag);
 
+        let auth_header = self.build_auth_header();
+
         let payload = SubmitPayload {
             r#type: log_type.to_string(),
             logs: vec![LogEntry {
@@ -115,9 +118,8 @@ impl VendorAdapter for DShield {
                 source: report.source_ip.to_string(),
                 port: well_known_port(tag),
             }],
+            authheader: auth_header.clone(),
         };
-
-        let auth_header = self.build_auth_header();
 
         let builder = self
             .client

@@ -5,10 +5,14 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.91"
+base64 = "0.22.1"
 clap = { version = "4.6.4", features = ["derive"] }
 core-scoring = { path = "../core-scoring" }
 chrono = { version = "0.4.45", features = ["serde"] }
+hmac = "0.13.0"
+rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "form"] }
+sha2 = "0.11.0"
 rust_decimal = { version = "1.42.1", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

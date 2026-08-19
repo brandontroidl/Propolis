@@ -1,31 +1,20 @@
-//! DShield HTTP adapter. See
-//! `internal/design/04-review-gatekeeper-reporting.md` ("DShield adapter").
+//! DShield / SANS ISC submission adapter.
 //!
-//! Two simplifications versus the spec's prose, both forced by the shapes
-//! already frozen elsewhere in this sub-project rather than chosen here:
+//! Submits honeypot observations to `POST /submitapi/` using ISC's HMAC-SHA256
+//! authentication, verified against the reference client at
+//! `github.com/DShield-ISC/dshield/srv/dshield/DShield.py`.
 //!
-//! - The spec's payload wants "destination port" and "protocol", but
-//!   [`VendorReport`] (frozen by this task's own brief) carries neither a
-//!   port nor an L4/L7 protocol field, only `categories`. This adapter
-//!   treats `categories` as already holding DShield's tag (via
-//!   [`super::build_dshield_categories`] - `"ssh"`, `"telnet"`, `"ftp"`,
-//!   `"scan"`, `"web"`, or `"intrusion"`) and derives a canonical
-//!   `dest_port` from the three protocol-speaking tags via
-//!   [`well_known_port`] (0 for the three generic tags, which have no
-//!   single canonical port).
-//! - The spec says DShield auth is "API key + user ID", but the frozen
-//!   `VendorConfig`/`FullVendorConfig` (design spec "Configuration") has
-//!   only one credential field, `api_key`. This adapter sends only that
-//!   single value (as the `X-Api-Key` header); there is nowhere to carry a
-//!   separate user ID without adding a field to that frozen struct, which
-//!   is a decision for whoever owns the spec, not this task.
+//! Auth: `X-ISC-Authorization: ISC-HMAC-SHA256 Credentials=<hash> Userid=<id> Nonce=<nonce>`
+//! where hash = base64(HMAC-SHA256(key=api_key, msg=nonce+userid)).
 //!
-//! DShield's real submission API was not reachable to verify live while
-//! implementing this (see task report); the payload shape below follows the
-//! design spec's abstracted description as given, not a verified wire
-//! contract.
+//! The `api_key` field arrives as `"userid:apikey"` from config.rs (which concatenates
+//! PROPOLIS_VENDOR_DSHIELD_USER and PROPOLIS_VENDOR_DSHIELD_KEY). This adapter splits
+//! on the first `:` to recover both parts.
 
 use async_trait::async_trait;
+use base64::Engine;
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 
 use super::{VendorAdapter, VendorError, VendorReport, VendorResponse, send_and_classify};
 
@@ -33,6 +22,7 @@ pub const DEFAULT_BASE_URL: &str = "https://www.dshield.org";
 
 pub struct DShield {
     client: reqwest::Client,
+    user_id: String,
     api_key: String,
     base_url: String,
 }
@@ -40,20 +30,44 @@ pub struct DShield {
 impl DShield {
     pub fn new(
         client: reqwest::Client,
-        api_key: impl Into<String>,
+        combined_key: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
+        let combined = combined_key.into();
+        let (user_id, api_key) = match combined.split_once(':') {
+            Some((u, k)) => (u.to_string(), k.to_string()),
+            None => (String::new(), combined),
+        };
         Self {
             client,
-            api_key: api_key.into(),
+            user_id,
+            api_key,
             base_url: base_url.into(),
         }
     }
+
+    fn build_auth_header(&self) -> String {
+        let nonce_bytes: [u8; 8] = rand::random();
+        let nonce = base64::engine::general_purpose::STANDARD.encode(nonce_bytes);
+
+        let msg = format!("{}{}", nonce, self.user_id);
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.api_key.as_bytes())
+            .expect("HMAC accepts any key length");
+        mac.update(msg.as_bytes());
+        let hash = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+        format!("ISC-HMAC-SHA256 Credentials={hash} Userid={} Nonce={nonce}", self.user_id)
+    }
 }
 
-/// The canonical well-known port for the three protocol-speaking DShield
-/// tags; 0 (not applicable) for the three generic tags, which name a class
-/// of activity rather than a single service.
+fn log_type_for_tag(tag: &str) -> &str {
+    match tag {
+        "ssh" => "sshlogin",
+        "telnet" => "telnetlogin",
+        _ => "firewall",
+    }
+}
+
 fn well_known_port(tag: &str) -> u16 {
     match tag {
         "ssh" => 22,
@@ -64,11 +78,16 @@ fn well_known_port(tag: &str) -> u16 {
 }
 
 #[derive(serde::Serialize)]
-struct SubmitPayload<'a> {
-    ip: String,
+struct SubmitPayload {
+    r#type: String,
+    logs: Vec<LogEntry>,
+}
+
+#[derive(serde::Serialize)]
+struct LogEntry {
+    time: i64,
+    source: String,
     port: u16,
-    protocol: &'a str,
-    timestamp: String,
 }
 
 #[async_trait]
@@ -78,18 +97,34 @@ impl VendorAdapter for DShield {
     }
 
     async fn submit(&self, report: &VendorReport) -> Result<VendorResponse, VendorError> {
-        let url = format!("{}/api/submit", self.base_url);
+        if self.user_id.is_empty() || self.api_key.is_empty() {
+            return Err(VendorError::Permanent {
+                status: 0,
+                body: "DShield requires both PROPOLIS_VENDOR_DSHIELD_USER and PROPOLIS_VENDOR_DSHIELD_KEY".into(),
+            });
+        }
+
+        let url = format!("{}/submitapi/", self.base_url);
         let tag = report.categories.first().map(String::as_str).unwrap_or("");
+        let log_type = log_type_for_tag(tag);
+
         let payload = SubmitPayload {
-            ip: report.source_ip.to_string(),
-            port: well_known_port(tag),
-            protocol: tag,
-            timestamp: report.evidence_window.1.to_rfc3339(),
+            r#type: log_type.to_string(),
+            logs: vec![LogEntry {
+                time: report.evidence_window.1.timestamp(),
+                source: report.source_ip.to_string(),
+                port: well_known_port(tag),
+            }],
         };
+
+        let auth_header = self.build_auth_header();
+
         let builder = self
             .client
             .post(url)
-            .header("X-Api-Key", &self.api_key)
+            .header("X-ISC-Authorization", &auth_header)
+            .header("X-ISC-LogType", log_type)
+            .header("User-Agent", "Propolis/0.1")
             .json(&payload);
 
         send_and_classify(builder).await

@@ -101,8 +101,12 @@ pub fn environment() -> Environment<'static> {
     // Console-forensics task 7: live system log viewer (`routes::logs`).
     env.add_template("logs.html", LOGS_HTML)
         .expect("logs.html must be a valid template");
+    env.add_template("ips.html", IPS_HTML)
+        .expect("ips.html must be a valid template");
     env
 }
+
+const IPS_HTML: &str = include_str!("templates/ips.html");
 
 #[cfg(test)]
 mod tests {

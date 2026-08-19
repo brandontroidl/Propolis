@@ -12,6 +12,7 @@ pub mod error;
 pub mod feed;
 mod format;
 pub mod health;
+pub mod ips;
 pub mod login;
 pub mod logs;
 pub mod metrics;
@@ -33,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .merge(detail::router())
         .merge(feed::router())
         .merge(search::router())
+        .merge(ips::router())
         .merge(logs::router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

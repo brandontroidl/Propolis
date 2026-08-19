@@ -153,7 +153,7 @@ async fn dashboard(
     let current_range = "24h";
 
     let attacker_rows = sqlx::query(
-        "SELECT host(source_ip) AS ip, raw_score::float8 AS score \
+        "SELECT host(source_ip) AS ip, raw_score::float8 AS score, event_count \
          FROM ip_score ORDER BY raw_score DESC LIMIT 10",
     )
     .fetch_all(&state.db)
@@ -161,8 +161,10 @@ async fn dashboard(
     .unwrap_or_default();
     let mut attacker_labels: Vec<String> = Vec::with_capacity(attacker_rows.len());
     let mut attacker_data: Vec<f64> = Vec::with_capacity(attacker_rows.len());
-    for row in attacker_rows {
-        attacker_labels.push(row.try_get("ip")?);
+    for row in &attacker_rows {
+        let ip: String = row.try_get("ip")?;
+        let count: i32 = row.try_get("event_count")?;
+        attacker_labels.push(format!("{ip} ({count})"));
         attacker_data.push(row.try_get("score")?);
     }
     // Drives the top-attackers chart's empty-state gate in the template: `attacker_labels` is

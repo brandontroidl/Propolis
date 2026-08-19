@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}All IPs - Propolis{% endblock %}
+{% block content %}
+<h2>Scored IPs <span class="dim">({{ total }})</span></h2>
+
+<table class="table-compact">
+  <thead>
+    <tr>
+      <th><a href="/ips?sort=score&dir={% if sort == 'score' and dir == 'desc' %}asc{% else %}desc{% endif %}">Score{% if sort == 'score' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
+      <th>IP</th>
+      <th>Tier</th>
+      <th><a href="/ips?sort=events&dir={% if sort == 'events' and dir == 'desc' %}asc{% else %}desc{% endif %}">Events{% if sort == 'events' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
+      <th>Categories</th>
+      <th>WANs</th>
+      <th><a href="/ips?sort=first&dir={% if sort == 'first' and dir == 'desc' %}asc{% else %}desc{% endif %}">First seen{% if sort == 'first' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
+      <th><a href="/ips?sort=last&dir={% if sort == 'last' and dir == 'desc' %}asc{% else %}desc{% endif %}">Last seen{% if sort == 'last' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
+      <th>Eligible</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for ip in ips %}
+    <tr>
+      <td class="mono"><strong>{{ ip.raw_score }}</strong></td>
+      <td><a href="/ip/{{ ip.ip }}">{{ ip.ip }}</a></td>
+      <td>{% if ip.tier != "-" %}<span class="tier-{{ ip.tier }}">{{ ip.tier }}</span>{% else %}<span class="dim">-</span>{% endif %}</td>
+      <td class="mono">{{ ip.event_count }}</td>
+      <td class="mono">{{ ip.distinct_categories }}</td>
+      <td class="mono">{{ ip.distinct_wan_count }}</td>
+      <td class="dim">{{ ip.first_seen }}</td>
+      <td><span class="dim" title="{{ ip.last_seen }}">{{ ip.last_seen_relative }}</span></td>
+      <td>{% if ip.eligible %}yes{% else %}<span class="dim">no</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if total == 0 %}
+<p class="empty-line">no scored IPs yet</p>
+{% endif %}
+{% endblock %}

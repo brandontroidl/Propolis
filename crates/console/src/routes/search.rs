@@ -107,12 +107,17 @@ impl Filters {
     }
 
     /// At least one filter present - the gate that decides whether the handlers run a query at
-    /// all (module doc comment).
-    fn any_provided(&self) -> bool {
+    /// all (module doc comment). `mode` matters: `ip` is not a filter parameter for IP search -
+    /// `fetch_search_ips`'s SQL never binds it, per the design's "same filter parameters ...
+    /// except `ip` and `cursor`" - so an `ip`-only request in `"ips"` mode must not count as
+    /// "searched". Without this, `GET /search/ips?ip=1.2.3.4` would pass this gate on the strength
+    /// of a filter that then gets silently dropped before it ever reaches SQL, running a fully
+    /// unfiltered full-table aggregate scan instead of the empty/no-filter state.
+    fn any_provided(&self, mode: &str) -> bool {
         self.q.is_some()
             || self.sensor.is_some()
             || self.signal_type.is_some()
-            || self.ip.is_some()
+            || (mode != "ips" && self.ip.is_some())
             || self.from.is_some()
             || self.to.is_some()
     }
@@ -129,15 +134,28 @@ impl Filters {
         self.to.as_deref().and_then(parse_date_bound_end)
     }
 
-    /// Builds the `q=..&sensor=..&...` query string the Events/By IP mode-switch tabs append to
-    /// their target href, carrying every currently-set filter forward (module doc comment). Never
+    /// Builds the `q=..&sensor=..&...` query string the Events mode-switch tab appends to its
+    /// target href, carrying every currently-set filter forward (module doc comment). Never
     /// includes `cursor` - switching modes always starts that mode's own result set from the top.
     fn query_string(&self) -> String {
+        self.query_string_impl(true)
+    }
+
+    /// Same as [`Filters::query_string`], but never includes `ip` - used for the By IP mode-switch
+    /// tab's href, since `ip` is not a valid filter parameter in IP-search mode
+    /// ([`Filters::any_provided`]'s doc comment). Without this, following that tab would carry an
+    /// `ip` filter into a mode that silently ignores it - the same gap `any_provided`'s `mode`
+    /// parameter closes on the gate side, closed here on the link side.
+    fn query_string_excluding_ip(&self) -> String {
+        self.query_string_impl(false)
+    }
+
+    fn query_string_impl(&self, include_ip: bool) -> String {
         [
             ("q", &self.q),
             ("sensor", &self.sensor),
             ("signal_type", &self.signal_type),
-            ("ip", &self.ip),
+            ("ip", if include_ip { &self.ip } else { &None }),
             ("from", &self.from),
             ("to", &self.to),
         ]
@@ -277,7 +295,7 @@ async fn search_events(
 ) -> Result<Html<String>, AppError> {
     let filters = Filters::from_params(&params);
     let is_htmx = headers.get("HX-Request").is_some();
-    let searched = filters.any_provided();
+    let searched = filters.any_provided("events");
 
     if !searched {
         // A "Load more" click always carries its page's original filters forward via
@@ -337,7 +355,7 @@ async fn search_ips(
     Query(params): Query<SearchParams>,
 ) -> Result<Html<String>, AppError> {
     let filters = Filters::from_params(&params);
-    let searched = filters.any_provided();
+    let searched = filters.any_provided("ips");
     let ip_rows = if searched {
         fetch_search_ips(&state.db, &filters).await?
     } else {
@@ -381,7 +399,12 @@ async fn render_search_page(
         version,
     } = base_context(&state.db, state.startup_time, state.version).await;
     let form = FormValues::from(filters);
-    let query_string = filters.query_string();
+    // Two different query strings, not one shared between both mode-switch tabs: the By IP tab's
+    // href must never carry `ip` forward, since it is not a valid filter in that mode
+    // (`Filters::query_string_excluding_ip`'s doc comment - the link-side half of the same gap
+    // `any_provided`'s `mode` parameter closes on the gate side).
+    let events_query_string = filters.query_string();
+    let ips_query_string = filters.query_string_excluding_ip();
 
     let tmpl = state.templates.get_template("search.html")?;
     let html = tmpl.render(context! {
@@ -399,7 +422,8 @@ async fn render_search_page(
         has_more,
         next_cursor,
         ip_rows,
-        query_string,
+        events_query_string,
+        ips_query_string,
     })?;
     Ok(Html(html))
 }
@@ -589,7 +613,8 @@ mod tests {
     #[test]
     fn filters_any_provided_is_false_with_no_filters() {
         let filters = Filters::from_params(&params(None));
-        assert!(!filters.any_provided());
+        assert!(!filters.any_provided("events"));
+        assert!(!filters.any_provided("ips"));
     }
 
     #[test]
@@ -597,9 +622,40 @@ mod tests {
         let mut p = params(Some("   "));
         p.sensor = Some("ssh".to_string());
         let filters = Filters::from_params(&p);
-        assert!(filters.any_provided());
+        assert!(filters.any_provided("events"));
+        assert!(filters.any_provided("ips"));
         assert_eq!(filters.q, None);
         assert_eq!(filters.sensor, Some("ssh".to_string()));
+    }
+
+    /// The review finding this test guards: `GET /search/ips?ip=1.2.3.4` with no other filter must
+    /// NOT pass the "at least one filter" gate, since `fetch_search_ips` never binds `ip` - an
+    /// `ip`-only request in IP-search mode has to be treated as "no filter provided", or it would
+    /// pass the gate and then run a fully unfiltered full-table aggregate scan.
+    #[test]
+    fn filters_any_provided_excludes_ip_only_in_ip_mode() {
+        let mut p = params(None);
+        p.ip = Some("203.0.113.7".to_string());
+        let filters = Filters::from_params(&p);
+        assert!(
+            filters.any_provided("events"),
+            "ip alone is a valid filter for event search"
+        );
+        assert!(
+            !filters.any_provided("ips"),
+            "ip alone must not count as a filter for IP search"
+        );
+    }
+
+    /// An `ip` filter alongside a real IP-search-applicable filter still counts as searched - only
+    /// an `ip`-ONLY request is affected.
+    #[test]
+    fn filters_any_provided_ip_mode_still_searches_on_a_real_filter_alongside_ip() {
+        let mut p = params(None);
+        p.ip = Some("203.0.113.7".to_string());
+        p.sensor = Some("ssh".to_string());
+        let filters = Filters::from_params(&p);
+        assert!(filters.any_provided("ips"));
     }
 
     #[test]
@@ -659,6 +715,24 @@ mod tests {
     fn query_string_is_empty_with_no_filters() {
         let filters = Filters::from_params(&params(None));
         assert_eq!(filters.query_string(), "");
+    }
+
+    /// The link-side half of the review finding: the By IP mode-switch tab's href must never carry
+    /// `ip` forward, since it is not a valid filter in that mode.
+    #[test]
+    fn query_string_excluding_ip_omits_ip_but_keeps_other_filters() {
+        let mut p = params(Some("cat /etc/passwd"));
+        p.sensor = Some("ssh".to_string());
+        p.ip = Some("203.0.113.7".to_string());
+        let filters = Filters::from_params(&p);
+        assert_eq!(
+            filters.query_string(),
+            "q=cat%20%2Fetc%2Fpasswd&sensor=ssh&ip=203.0.113.7"
+        );
+        assert_eq!(
+            filters.query_string_excluding_ip(),
+            "q=cat%20%2Fetc%2Fpasswd&sensor=ssh"
+        );
     }
 
     #[test]

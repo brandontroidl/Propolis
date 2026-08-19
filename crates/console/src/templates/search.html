@@ -40,8 +40,8 @@
 </form>
 
 <div class="range-selector search-mode-tabs">
-  <a href="/search/events{% if query_string %}?{{ query_string }}{% endif %}" class="range-btn {% if mode != "ips" %}active{% endif %}">Events</a>
-  <a href="/search/ips{% if query_string %}?{{ query_string }}{% endif %}" class="range-btn {% if mode == "ips" %}active{% endif %}">By IP</a>
+  <a href="/search/events{% if events_query_string %}?{{ events_query_string }}{% endif %}" class="range-btn {% if mode != "ips" %}active{% endif %}">Events</a>
+  <a href="/search/ips{% if ips_query_string %}?{{ ips_query_string }}{% endif %}" class="range-btn {% if mode == "ips" %}active{% endif %}">By IP</a>
 </div>
 
 {% if mode == "ips" %}

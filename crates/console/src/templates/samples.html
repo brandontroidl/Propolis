@@ -5,13 +5,26 @@
 
 {% if samples %}
 <table class="table-compact">
-  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th></th></tr></thead>
+  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>VirusTotal</th><th></th></tr></thead>
   <tbody>
     {% for s in samples %}
     <tr>
       <td class="mono" title="{{ s.sha256 }}">{{ s.sha256_short }}...</td>
       <td class="mono">{{ s.size }}</td>
       <td>{{ s.sensor }}</td>
+      <td>
+        {% if s.vt_detected is defined and s.vt_detected is not none %}
+          {% if s.vt_detected == -1 %}
+            <span class="dim">pending</span>
+          {% elif s.vt_detected > 0 %}
+            <a href="{{ s.vt_link }}" target="_blank" style="color:var(--alert-text);">{{ s.vt_detected }}/{{ s.vt_total }} detected</a>
+          {% else %}
+            <a href="{{ s.vt_link }}" target="_blank" style="color:var(--good-text);">clean (0/{{ s.vt_total }})</a>
+          {% endif %}
+        {% else %}
+          <span class="dim">not scanned</span>
+        {% endif %}
+      </td>
       <td><a href="/samples/download/{{ s.sha256 }}" class="range-btn">Download</a></td>
     </tr>
     {% endfor %}

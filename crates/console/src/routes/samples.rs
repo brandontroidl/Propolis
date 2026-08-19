@@ -24,10 +24,23 @@ struct SampleRow {
     sha256_short: String,
     size: String,
     sensor: String,
+    vt_detected: Option<i32>,
+    vt_total: Option<i32>,
+    vt_link: String,
 }
 
 async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let base = base_context(&state.db, state.startup_time, state.version).await;
+
+    let vt_results: std::collections::HashMap<String, (i32, i32, String)> = sqlx::query_as::<_, (String, i32, i32, String)>(
+        "SELECT sha256, detected, total, vt_link FROM sample_analysis"
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(sha, d, t, l)| (sha, (d, t, l)))
+    .collect();
 
     let mut samples = Vec::new();
     for (sensor, dir) in spool_dirs() {
@@ -36,11 +49,15 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                 if let Ok(meta) = entry.metadata().await {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+                        let vt = vt_results.get(&name);
                         samples.push(SampleRow {
                             sha256_short: name[..12].to_string(),
                             sha256: name,
                             size: format_bytes(meta.len()),
                             sensor: sensor.to_string(),
+                            vt_detected: vt.map(|(d, _, _)| *d),
+                            vt_total: vt.map(|(_, t, _)| *t),
+                            vt_link: vt.map(|(_, _, l)| l.clone()).unwrap_or_default(),
                         });
                     }
                 }

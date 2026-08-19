@@ -476,7 +476,45 @@ async fn main() {
         tracing::info!("propolis: feed subsystem disabled");
     }
 
-    // 8. Spawn console web server.
+    // 8. Spawn VirusTotal scanner if enabled.
+    if config.vt_enabled {
+        let pool_vt = pool.clone();
+        let vt_config = review::virustotal::VtConfig {
+            api_key: config.vt_api_key.clone(),
+            upload_unknown: config.vt_upload_unknown,
+            scan_interval_secs: config.vt_scan_interval_secs,
+            request_delay_ms: 15_000,
+        };
+
+        handles.push(spawn_supervised("virustotal", cancel.clone(), move |token| {
+            let pool = pool_vt.clone();
+            let vt_config = vt_config.clone();
+            async move {
+                let spool_dirs: Vec<(&str, std::path::PathBuf)> = vec![
+                    ("ssh", std::path::PathBuf::from("/var/spool/propolis/ssh")),
+                    ("adb", std::path::PathBuf::from("/var/spool/propolis/adb")),
+                    ("ftp", std::path::PathBuf::from("/var/spool/propolis/ftp")),
+                    ("catchall", std::path::PathBuf::from("/var/spool/propolis/catchall")),
+                ];
+                loop {
+                    if token.is_cancelled() {
+                        tracing::info!("virustotal: scanner stopped");
+                        return;
+                    }
+                    review::virustotal::scan_spool(&pool, &vt_config, &spool_dirs).await;
+                    review::virustotal::cleanup_old_samples(&spool_dirs, 30).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(vt_config.scan_interval_secs)) => {}
+                        _ = token.cancelled() => {}
+                    }
+                }
+            }
+        }));
+    } else {
+        tracing::info!("propolis: virustotal scanner disabled");
+    }
+
+    // 9. Spawn console web server.
     {
         let pool_c = pool.clone();
         let bind = config.console_bind;

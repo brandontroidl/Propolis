@@ -10,6 +10,7 @@ pub mod gatekeeper;
 pub mod queue;
 pub mod submit;
 pub mod vendor;
+pub mod virustotal;
 
 pub use cli::{Cli, CliError, Command};
 pub use gatekeeper::{GateReason, GateResult, VendorConfig, check};

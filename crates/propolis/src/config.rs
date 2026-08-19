@@ -62,6 +62,11 @@ pub struct PropolisConfig {
     pub console_bind: SocketAddr,
     pub console_password: String,
     pub console_session_secret: [u8; 32],
+    // VirusTotal
+    pub vt_enabled: bool,
+    pub vt_api_key: String,
+    pub vt_upload_unknown: bool,
+    pub vt_scan_interval_secs: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -331,6 +336,11 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
     let console_password = require_env("PROPOLIS_CONSOLE_PASSWORD")?;
     let console_session_secret = load_session_secret()?;
 
+    let vt_api_key = env::var("PROPOLIS_VT_KEY").unwrap_or_default();
+    let vt_enabled = parse_bool_flag("PROPOLIS_VT_ENABLED", false) && !vt_api_key.is_empty();
+    let vt_upload_unknown = parse_bool_flag("PROPOLIS_VT_UPLOAD", false);
+    let vt_scan_interval_secs = parse_u32("PROPOLIS_VT_SCAN_INTERVAL_SECS", 300)? as u64;
+
     Ok(PropolisConfig {
         database_url,
         db_max_connections,
@@ -351,6 +361,10 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         console_bind,
         console_password,
         console_session_secret,
+        vt_enabled,
+        vt_api_key,
+        vt_upload_unknown,
+        vt_scan_interval_secs,
     })
 }
 

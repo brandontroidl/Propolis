@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use sensor_framework::listener::normalize_dual_stack;
-use sensor_framework::{ConnectionBounds, EventEmitter, WanResolver};
+use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
 };
@@ -25,6 +25,7 @@ const SECURITY_RESULT_OK: &[u8] = &[0, 0, 0, 0];
 pub async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
+    session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
@@ -37,7 +38,9 @@ pub async fn handle_connection(
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
-    let _ = emitter.append(&connection_event(source_ip, wan_ip)).await;
+    let _ = emitter
+        .append(&connection_event(source_ip, wan_ip, session_id))
+        .await;
 
     let timeout = bounds.read_timeout;
 
@@ -80,13 +83,15 @@ pub async fn handle_connection(
     }
 
     // Can't extract plaintext from DES challenge-response, but the attempt itself is the signal
-    let _ = emitter.append(&login_event(source_ip, wan_ip)).await;
+    let _ = emitter
+        .append(&login_event(source_ip, wan_ip, session_id))
+        .await;
 
     // 7. Server -> Client: SecurityResult OK
     let _ = stream.write_all(SECURITY_RESULT_OK).await;
 }
 
-fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
+fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -98,10 +103,11 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
         observed_at: chrono::Utc::now(),
         metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
         sample: None,
+        session_id: Some(session_id),
     }
 }
 
-fn login_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
+fn login_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -113,6 +119,7 @@ fn login_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
         observed_at: chrono::Utc::now(),
         metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
         sample: None,
+        session_id: Some(session_id),
     }
 }
 

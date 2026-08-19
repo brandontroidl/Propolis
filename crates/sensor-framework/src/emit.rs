@@ -70,6 +70,7 @@ mod tests {
             observed_at: "2026-07-20T14:03:11.482913Z".parse().unwrap(),
             metadata: serde_json::json!({"command": "uname -a"}),
             sample: None,
+            session_id: None,
         }
     }
 

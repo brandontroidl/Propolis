@@ -149,6 +149,7 @@ fn authenticated_flag_reflects_context_not_hardcoded() {
         wan_ip: None,
         authenticated: false,
         protocol_label: "ssh".to_string(),
+        session_id: None,
     };
     let mut shell = FakeShell::new(fs, ctx);
     let (_output, events) = shell.handle_input("whoami");
@@ -166,6 +167,7 @@ fn source_ip_and_wan_ip_come_from_context() {
         wan_ip: Some(wan_ip),
         authenticated: true,
         protocol_label: "ssh".to_string(),
+        session_id: None,
     };
     let mut shell = FakeShell::new(fs, ctx);
     let (_output, events) = shell.handle_input("id");
@@ -380,6 +382,7 @@ fn test_emit_ctx() -> sensor_ssh::shell::EmitContext {
         wan_ip: Some("198.51.100.4".parse().unwrap()),
         authenticated: true,
         protocol_label: "ssh".to_string(),
+        session_id: None,
     }
 }
 

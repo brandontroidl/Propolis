@@ -12,7 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use chrono::Utc;
 use sensor_framework::listener::normalize_dual_stack;
-use sensor_framework::{ConnectionBounds, EventEmitter, WanResolver, to_hex_bounded};
+use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver, to_hex_bounded};
 use sensor_wire::{PROTO_TCP, PROTO_UDP, SIGNAL_CATCHALL_PROBE, SensorEvent, WIRE_VERSION};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -33,6 +33,7 @@ const MAX_HEX_SAMPLE_BYTES: usize = 256;
 pub async fn handle_tcp(
     mut stream: TcpStream,
     peer: SocketAddr,
+    session_id: Uuid,
     wan_resolver: &WanResolver,
     emitter: &EventEmitter,
     bounds: &ConnectionBounds,
@@ -53,7 +54,7 @@ pub async fn handle_tcp(
     let captured = read_bounded(&mut stream, bounds).await;
     drop(stream); // Close after capture. No response of any kind is ever written.
 
-    let event = build_event(peer.ip(), wan_ip, PROTO_TCP, &captured);
+    let event = build_event(peer.ip(), wan_ip, PROTO_TCP, &captured, session_id);
     if let Err(e) = emitter.append(&event).await {
         tracing::error!(%peer, error = %e, "catchall: failed to append tcp event");
     }
@@ -107,8 +108,12 @@ pub async fn handle_udp(
     wan_resolver: &WanResolver,
     emitter: &EventEmitter,
 ) {
+    // UDP has no persistent connection to mint a session id for at accept time (see
+    // `run_udp_listener`'s module doc), so one is minted fresh per datagram here - each datagram
+    // is its own independent observation.
+    let session_id = Uuid::now_v7();
     let wan_ip = wan_resolver.resolve(local_ip);
-    let event = build_event(peer.ip(), wan_ip, PROTO_UDP, &data);
+    let event = build_event(peer.ip(), wan_ip, PROTO_UDP, &data, session_id);
     if let Err(e) = emitter.append(&event).await {
         tracing::error!(%peer, error = %e, "catchall: failed to append udp event");
     }
@@ -122,6 +127,7 @@ fn build_event(
     wan_ip: Option<IpAddr>,
     protocol: &str,
     captured: &[u8],
+    session_id: Uuid,
 ) -> SensorEvent {
     SensorEvent {
         v: WIRE_VERSION,
@@ -137,6 +143,7 @@ fn build_event(
             "observed_len": captured.len(),
         }),
         sample: None,
+        session_id: Some(session_id),
     }
 }
 
@@ -149,12 +156,20 @@ mod tests {
 
     #[test]
     fn build_event_has_no_protocol_label_and_is_never_authenticated() {
-        let event = build_event("203.0.113.7".parse().unwrap(), None, PROTO_TCP, b"probe");
+        let session_id = Uuid::now_v7();
+        let event = build_event(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            PROTO_TCP,
+            b"probe",
+            session_id,
+        );
         assert!(!event.authenticated);
         assert!(event.metadata.get("protocol_label").is_none());
         assert_eq!(event.sensor, "catchall");
         assert_eq!(event.signal_type, SIGNAL_CATCHALL_PROBE);
         assert_eq!(event.sample, None);
+        assert_eq!(event.session_id, Some(session_id));
     }
 
     #[test]
@@ -164,6 +179,7 @@ mod tests {
             None,
             PROTO_TCP,
             b"\xde\xad\xbe\xef",
+            Uuid::now_v7(),
         );
         assert_eq!(event.metadata["payload_hex"], "deadbeef");
         assert_eq!(event.metadata["observed_len"], 4);
@@ -174,7 +190,13 @@ mod tests {
         // The hex sample and the observed length are two different numbers once the true capture
         // exceeds MAX_HEX_SAMPLE_BYTES: the record must still show the full observed length.
         let long = vec![0xABu8; 1000];
-        let event = build_event("203.0.113.7".parse().unwrap(), None, PROTO_UDP, &long);
+        let event = build_event(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            PROTO_UDP,
+            &long,
+            Uuid::now_v7(),
+        );
         let hex = event.metadata["payload_hex"].as_str().unwrap();
         assert_eq!(hex.len(), MAX_HEX_SAMPLE_BYTES * 2);
         assert_eq!(event.metadata["observed_len"], 1000);

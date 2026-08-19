@@ -3828,6 +3828,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]

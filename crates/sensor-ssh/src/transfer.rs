@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use sensor_framework::{CaptureHandoff, CaptureJob};
+use sensor_framework::{CaptureHandoff, CaptureJob, Uuid};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
 };
@@ -60,6 +60,7 @@ pub struct ScpReceiver {
     body: Vec<u8>,
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
+    session_id: Uuid,
     handoff: Arc<CaptureHandoff>,
 }
 
@@ -69,6 +70,7 @@ impl ScpReceiver {
     pub fn new(
         source_ip: IpAddr,
         wan_ip: Option<IpAddr>,
+        session_id: Uuid,
         handoff: Arc<CaptureHandoff>,
     ) -> (Self, Vec<u8>) {
         (
@@ -79,6 +81,7 @@ impl ScpReceiver {
                 body: Vec::new(),
                 source_ip,
                 wan_ip,
+                session_id,
                 handoff,
             },
             vec![0u8], // initial ready-acknowledge
@@ -161,6 +164,7 @@ impl ScpReceiver {
         let orig_name = self.filename.clone();
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
+        let session_id = self.session_id;
 
         let _ = self.handoff.submit(CaptureJob {
             body,
@@ -181,6 +185,7 @@ impl ScpReceiver {
                     "orig_name": sample.orig_name,
                 }),
                 sample: Some(sample),
+                session_id: Some(session_id),
             }),
         });
     }
@@ -244,17 +249,24 @@ pub struct SftpHandler {
     next_handle: u32,
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
+    session_id: Uuid,
     handoff: Arc<CaptureHandoff>,
 }
 
 impl SftpHandler {
-    pub fn new(source_ip: IpAddr, wan_ip: Option<IpAddr>, handoff: Arc<CaptureHandoff>) -> Self {
+    pub fn new(
+        source_ip: IpAddr,
+        wan_ip: Option<IpAddr>,
+        session_id: Uuid,
+        handoff: Arc<CaptureHandoff>,
+    ) -> Self {
         Self {
             buf: Vec::new(),
             handles: HashMap::new(),
             next_handle: 0,
             source_ip,
             wan_ip,
+            session_id,
             handoff,
         }
     }
@@ -409,6 +421,7 @@ impl SftpHandler {
     fn submit_capture(&self, file: SftpOpenFile) {
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
+        let session_id = self.session_id;
 
         let _ = self.handoff.submit(CaptureJob {
             body: file.body,
@@ -429,6 +442,7 @@ impl SftpHandler {
                     "orig_name": sample.orig_name,
                 }),
                 sample: Some(sample),
+                session_id: Some(session_id),
             }),
         });
     }
@@ -548,7 +562,7 @@ mod tests {
         // count to keep the protocol state machine aligned with the wire (so the trailing
         // \0 and final ack still land correctly).
         let handoff = test_handoff();
-        let (mut scp, _initial) = ScpReceiver::new("127.0.0.1".parse().unwrap(), None, handoff);
+        let (mut scp, _initial) = ScpReceiver::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
 
         // Header declaring 12 MB (above the 10 MB cap).
         let declared: usize = 12_000_000;
@@ -579,7 +593,7 @@ mod tests {
         // SFTP_MAX_PACKET_SIZE. The handler must clear its buffer rather than accumulating
         // data toward that length.
         let handoff = test_handoff();
-        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, handoff);
+        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
 
         // Forge a length header claiming 1 GB.
         let huge_len: u32 = 1_000_000_000;
@@ -606,7 +620,7 @@ mod tests {
         // immediately once the 4 bytes are present - it must not wait for body bytes
         // to arrive before checking.
         let handoff = test_handoff();
-        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, handoff);
+        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
 
         let huge_len: u32 = 500_000;
         let response = sftp.feed(&huge_len.to_be_bytes());
@@ -630,7 +644,7 @@ mod tests {
         // delivers only 2 bytes (not enough to read the length), the second delivers the
         // remaining 2 bytes. The check must fire on the second feed.
         let handoff = test_handoff();
-        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, handoff);
+        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
 
         let huge_len: u32 = 1_000_000;
         let header = huge_len.to_be_bytes();

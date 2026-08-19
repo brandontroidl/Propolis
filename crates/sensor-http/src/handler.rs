@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
-use sensor_framework::{ConnectionBounds, EventEmitter, WanResolver};
+use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION, SensorEvent, WIRE_VERSION,
 };
@@ -28,6 +28,7 @@ const RESPONSE_ROBOTS: &str = "User-agent: *\nDisallow: /\n";
 pub async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
+    session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
@@ -40,7 +41,7 @@ pub async fn handle_connection(
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
-    let conn_event = connection_event(source_ip, wan_ip);
+    let conn_event = connection_event(source_ip, wan_ip, session_id);
     if emitter.append(&conn_event).await.is_err() {
         tracing::error!(%peer_addr, "http: failed to append connection event");
     }
@@ -98,6 +99,7 @@ pub async fn handle_connection(
             observed_at: chrono::Utc::now(),
             metadata,
             sample: None,
+            session_id: Some(session_id),
         };
         let _ = emitter.append(&event).await;
 
@@ -118,7 +120,7 @@ pub async fn handle_connection(
     }
 }
 
-fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
+fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -130,6 +132,7 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> SensorEvent {
         observed_at: chrono::Utc::now(),
         metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
         sample: None,
+        session_id: Some(session_id),
     }
 }
 
@@ -282,7 +285,7 @@ mod tests {
 
     #[test]
     fn connection_event_is_unauthenticated_with_http_label() {
-        let event = connection_event("203.0.113.7".parse().unwrap(), None);
+        let event = connection_event("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
         assert!(!event.authenticated);
         assert_eq!(event.sensor, "http");
         assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);

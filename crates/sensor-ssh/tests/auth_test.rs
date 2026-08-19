@@ -5,6 +5,7 @@
 
 use proptest::prelude::*;
 use sensor_ssh::auth::{AuthError, AuthState};
+use sensor_framework::Uuid;
 use sensor_ssh::channel::{
     ChannelAction, ChannelError, handle_channel_open, handle_channel_request,
 };
@@ -19,6 +20,7 @@ fn authenticated_false_before_userauth() {
     let state = AuthState::new(
         "203.0.113.7".parse().unwrap(),
         Some("198.51.100.4".parse().unwrap()),
+        Uuid::now_v7(),
     );
     assert!(!state.is_authenticated());
 }
@@ -28,6 +30,7 @@ fn authenticated_true_after_userauth_success() {
     let mut state = AuthState::new(
         "203.0.113.7".parse().unwrap(),
         Some("198.51.100.4".parse().unwrap()),
+        Uuid::now_v7(),
     );
     let userauth_request = build_password_userauth(b"attacker", b"password123");
     let (response, events) = state.handle_userauth(&userauth_request).unwrap();
@@ -47,6 +50,7 @@ fn password_never_in_event() {
     let mut state = AuthState::new(
         "203.0.113.7".parse().unwrap(),
         Some("198.51.100.4".parse().unwrap()),
+        Uuid::now_v7(),
     );
     let password = b"s3cret_p@ssw0rd!";
     let userauth = build_password_userauth(b"root", password);
@@ -63,6 +67,7 @@ fn username_captured_in_metadata() {
     let mut state = AuthState::new(
         "203.0.113.7".parse().unwrap(),
         Some("198.51.100.4".parse().unwrap()),
+        Uuid::now_v7(),
     );
     let userauth = build_password_userauth(b"admin", b"pass");
     let (_response, events) = state.handle_userauth(&userauth).unwrap();
@@ -75,6 +80,7 @@ fn username_with_injection_is_sanitized() {
     let mut state = AuthState::new(
         "203.0.113.7".parse().unwrap(),
         Some("198.51.100.4".parse().unwrap()),
+        Uuid::now_v7(),
     );
     let evil_name = b"root\r\n{\"v\":1,\"signal_type\":\"evil\"}";
     let userauth = build_password_userauth(evil_name, b"pass");
@@ -93,6 +99,7 @@ fn authenticated_latch_stays_true() {
     let mut state = AuthState::new(
         "203.0.113.7".parse().unwrap(),
         Some("198.51.100.4".parse().unwrap()),
+        Uuid::now_v7(),
     );
     let userauth = build_password_userauth(b"root", b"pass");
     state.handle_userauth(&userauth).unwrap();
@@ -117,6 +124,7 @@ fn emit_connection_event_is_unauthenticated_ssh_connection() {
     let state = AuthState::new(
         "203.0.113.7".parse().unwrap(),
         Some("198.51.100.4".parse().unwrap()),
+        Uuid::now_v7(),
     );
     let event = state.emit_connection_event();
     assert_eq!(event.signal_type, sensor_wire::SIGNAL_HONEYPOT_CONNECTION);
@@ -146,13 +154,13 @@ fn username_getter_returns_none_before_authentication() {
     // so the session orchestrator can reflect the attacker's claimed identity in the shell
     // persona. `None` before any userauth request matches `is_authenticated`'s own pre-auth
     // default.
-    let state = AuthState::new("203.0.113.7".parse().unwrap(), None);
+    let state = AuthState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
     assert_eq!(state.username(), None);
 }
 
 #[test]
 fn username_getter_returns_captured_username_after_userauth() {
-    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None);
+    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
     let userauth = build_password_userauth(b"admin", b"pass");
     state.handle_userauth(&userauth).unwrap();
     assert_eq!(state.username(), Some("admin"));
@@ -160,7 +168,7 @@ fn username_getter_returns_captured_username_after_userauth() {
 
 #[test]
 fn handle_userauth_rejects_empty_payload() {
-    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None);
+    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
     let result = state.handle_userauth(&[]);
     assert!(matches!(result, Err(AuthError::MalformedPacket)));
     // A rejected parse must never latch authenticated.
@@ -169,7 +177,7 @@ fn handle_userauth_rejects_empty_payload() {
 
 #[test]
 fn handle_userauth_rejects_truncated_password_field() {
-    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None);
+    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
     // Well-formed username/service/"password"-method prefix, then cut off before the FALSE
     // byte and password string RFC 4252 section 8 requires.
     let mut buf = vec![transport::SSH_MSG_USERAUTH_REQUEST];
@@ -184,7 +192,7 @@ fn handle_userauth_rejects_truncated_password_field() {
 
 #[test]
 fn non_password_method_is_accepted_with_no_password_key_in_metadata() {
-    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None);
+    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
     let mut buf = vec![transport::SSH_MSG_USERAUTH_REQUEST];
     push_ssh_string(&mut buf, b"probe");
     push_ssh_string(&mut buf, b"ssh-connection");
@@ -207,7 +215,7 @@ fn method_with_injection_is_sanitized() {
     // The method name is exactly as attacker-controlled as the username (a client may claim any
     // string here) and it is embedded directly in `metadata.method`; it must clear the same
     // `sanitize_value` chokepoint before it does.
-    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None);
+    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
     let mut buf = vec![transport::SSH_MSG_USERAUTH_REQUEST];
     push_ssh_string(&mut buf, b"root");
     push_ssh_string(&mut buf, b"ssh-connection");
@@ -323,7 +331,7 @@ proptest! {
     fn handle_userauth_never_panics_on_arbitrary_bytes(
         bytes in proptest::collection::vec(any::<u8>(), 0..=512)
     ) {
-        let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None);
+        let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
         let _ = state.handle_userauth(&bytes);
     }
 

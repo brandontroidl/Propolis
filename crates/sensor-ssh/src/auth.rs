@@ -22,7 +22,7 @@
 
 use std::net::IpAddr;
 
-use sensor_framework::sanitize_value;
+use sensor_framework::{Uuid, sanitize_value};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
 };
@@ -44,6 +44,7 @@ pub struct AuthState {
     username: Option<String>,
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
+    session_id: Uuid,
 }
 
 /// Errors this module's parsing can produce. Every variant is constructed from a checked
@@ -85,12 +86,13 @@ impl From<std::io::Error> for AuthError {
 impl AuthState {
     /// `source_ip`/`wan_ip` are this connection's real attributes; there is no default or
     /// placeholder address, because every event this type ever emits carries them verbatim.
-    pub fn new(source_ip: IpAddr, wan_ip: Option<IpAddr>) -> Self {
+    pub fn new(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> Self {
         Self {
             authenticated: false,
             username: None,
             source_ip,
             wan_ip,
+            session_id,
         }
     }
 
@@ -122,6 +124,7 @@ impl AuthState {
             observed_at: chrono::Utc::now(),
             metadata: serde_json::json!({ "protocol_label": "ssh" }),
             sample: None,
+            session_id: Some(self.session_id),
         }
     }
 
@@ -167,6 +170,7 @@ impl AuthState {
                 "method": method,
             }),
             sample: None,
+            session_id: Some(self.session_id),
         };
 
         // Always accept: see the module doc for why.

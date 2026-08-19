@@ -62,6 +62,7 @@ pub struct EmitContext {
     pub wan_ip: Option<IpAddr>,
     pub authenticated: bool,
     pub protocol_label: String,
+    pub session_id: Option<uuid::Uuid>,
 }
 
 /// The fake interactive shell. One instance per SSH session; `cwd` is the only mutable state,
@@ -111,6 +112,7 @@ impl FakeShell {
                 "command": sanitized_cmd,
             }),
             sample: None,
+            session_id: self.ctx.session_id,
         };
 
         let parts: Vec<&str> = line.split_whitespace().collect();

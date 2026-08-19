@@ -30,6 +30,7 @@ use http_body_util::BodyExt;
 use review::queue::ReviewQueue;
 use sqlx::{PgPool, Row};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const TEST_PASSWORD: &str = "s3cret-test-operator-password";
 const TEST_PEER: SocketAddr =
@@ -117,6 +118,36 @@ fn ev(
         ts.parse().unwrap(),
         serde_json::json!({}),
         None,
+    )
+}
+
+/// Like [`ev`] but carrying a non-empty `metadata` payload and a `session_id` -
+/// `routes::detail`'s session-grouping (task 3, `internal/design/11-console-forensics.md`
+/// section 2) groups every event sharing a `session_id` into one collapsible card, and the
+/// evidence timeline's "Detail" column extracts from `metadata` by `signal_type`. Same
+/// eight-argument shape as `core_scoring::EventInput::from_signal` itself (which this wraps),
+/// allowed there for the same reason.
+#[allow(clippy::too_many_arguments)]
+fn ev_with_session(
+    ip: &str,
+    sensor: &str,
+    signal: SignalType,
+    protocol: Protocol,
+    authenticated: bool,
+    ts: &str,
+    metadata: serde_json::Value,
+    session_id: Uuid,
+) -> EventInput {
+    EventInput::from_signal(
+        ip.parse().unwrap(),
+        None,
+        sensor.into(),
+        signal,
+        protocol,
+        authenticated,
+        ts.parse().unwrap(),
+        metadata,
+        Some(session_id),
     )
 }
 
@@ -722,7 +753,10 @@ async fn dashboard_vendor_submissions_table_shows_at_most_three_rows(pool: PgPoo
     // be truncated.
     assert!(body.contains("203.0.113.201"), "newest submission missing: {body}");
     assert!(body.contains("203.0.113.202"), "2nd-newest submission missing: {body}");
-    assert!(body.contains("203.0.113.203"), "3rd-newest submission missing: {body}");
+    assert!(
+        body.contains("203.0.113.203"),
+        "3rd-newest submission missing: {body}"
+    );
     assert!(
         !body.contains("203.0.113.204"),
         "4th-newest submission must be truncated from the compact table: {body}"
@@ -1425,13 +1459,23 @@ async fn detail_page_tables_use_compact_class(pool: PgPool) {
     let body = body_text(response).await;
     let table_open_count = body.matches("<table").count();
     let compact_count = body.matches(r#"<table class="table-compact">"#).count();
+    // The evidence timeline intentionally uses its own `evidence-table` class rather than
+    // `table-compact` (task 3's session-card redesign - `internal/design/11-console-forensics.md`,
+    // "Template: session cards"): this fixture's events all carry `session_id = None`
+    // (`ev`/`ev_with_wan` pass `None`), so they render as exactly one "Ungrouped events" table.
+    let evidence_count = body.matches(r#"<table class="evidence-table">"#).count();
     assert!(
         table_open_count >= 5,
         "expected all 5 detail-page tables to render for this fixture: {body}"
     );
     assert_eq!(
-        table_open_count, compact_count,
-        "every table on the detail page must use the compact density class: {body}"
+        table_open_count,
+        compact_count + evidence_count,
+        "every table on the detail page must use either the compact density class or the evidence-table class: {body}"
+    );
+    assert_eq!(
+        evidence_count, 1,
+        "expected exactly one evidence table for the fixture's ungrouped events: {body}"
     );
 }
 
@@ -1517,6 +1561,136 @@ async fn detail_ip_timeline_chart_reflects_daily_event_counts(pool: PgPool) {
     assert!(
         body.contains(r#"id="ip-timeline-labels">"#) && body.contains(r#"id="ip-timeline-data">"#),
         "IP timeline chart data elements missing: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_groups_events_sharing_session_id_into_an_expanded_session_card(pool: PgPool) {
+    migrate(&pool).await;
+    let start = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let session_id = Uuid::now_v7();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.60",
+            "ssh-sensor",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            &start.to_rfc3339(),
+            serde_json::json!({ "username": "root" }),
+            session_id,
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.60",
+            "ssh-sensor",
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            &(start + chrono::Duration::seconds(5)).to_rfc3339(),
+            serde_json::json!({ "command": "whoami" }),
+            session_id,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.60",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<details class="session-card" open>"#),
+        "expected the sole (most-recent) session card to render expanded: {body}"
+    );
+    assert!(
+        body.contains(r#"<span class="session-user mono">user: root</span>"#),
+        "expected the session header to show the credential used: {body}"
+    );
+    assert!(
+        body.contains(r#"<td class="mono">whoami</td>"#),
+        "expected the command-exec event row to show the command in its Detail column: {body}"
+    );
+    assert!(
+        body.contains("2 events"),
+        "expected the session header to show the event count: {body}"
+    );
+    assert!(
+        !body.contains("Ungrouped events"),
+        "no event in this fixture lacks a session_id, so no ungrouped section should render: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_mixes_session_cards_with_ungrouped_events(pool: PgPool) {
+    migrate(&pool).await;
+    let now = chrono::Utc::now();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.61",
+            "ssh-sensor",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &now.to_rfc3339(),
+            serde_json::json!({ "protocol_label": "ssh" }),
+            Uuid::now_v7(),
+        ),
+    )
+    .await
+    .unwrap();
+    // Pre-existing data from before session tracking: no session_id.
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.61",
+            "catchall-sensor",
+            SignalType::CatchallProbe,
+            Protocol::Udp,
+            false,
+            &(now - chrono::Duration::seconds(120)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.61",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"class="session-card""#),
+        "expected the session-tagged event to render as a session card: {body}"
+    );
+    assert!(
+        body.contains("Ungrouped events"),
+        "expected the pre-session-tracking event to render in the Ungrouped events section: {body}"
     );
 }
 

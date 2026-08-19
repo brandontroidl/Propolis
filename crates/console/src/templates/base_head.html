@@ -216,6 +216,55 @@ td.ip, td.score, td.seen { font-family: var(--font-mono); font-variant-numeric: 
 .table-compact th, .table-compact td { padding: 0.4rem 0.7rem; font-size: 0.82rem; }
 .table-compact .meter { width: 44px; height: 4px; }
 
+/* -- Session cards (detail page evidence timeline) -- */
+.session-card { border: 1px solid var(--border); border-radius: 5px; margin-bottom: 0.5rem; overflow: hidden; }
+.session-card:last-child { margin-bottom: 0; }
+.session-card > summary.session-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1rem;
+  padding: 0.55rem 0.9rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  background: var(--surface-raised);
+  list-style: none;
+}
+/* `display: flex` above drops the browser's native <summary> disclosure triangle (both Chromium
+   and Firefox only render it under `display: list-item`), so the expand/collapse affordance is
+   redrawn by hand here rather than lost. */
+.session-card > summary.session-header::-webkit-details-marker { display: none; }
+.session-card > summary.session-header::before {
+  content: "\25B8";
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  transition: transform 120ms ease;
+}
+.session-card[open] > summary.session-header::before { transform: rotate(90deg); }
+.session-card > summary.session-header:hover { background: var(--border); }
+.session-card[open] > summary.session-header { border-bottom: 1px solid var(--border); }
+.session-time { color: var(--text); }
+.session-meta { color: var(--text-muted); }
+.session-user { color: var(--info-text); }
+.session-count { margin-left: auto; white-space: nowrap; }
+.evidence-table th, .evidence-table td { padding: 0.4rem 0.7rem; font-size: 0.8rem; }
+.raw-toggle { display: inline-block; }
+.raw-toggle > summary { cursor: pointer; color: var(--text-muted); font-size: 0.72rem; }
+.raw-toggle > summary:hover { color: var(--text); }
+.raw-json {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.6rem;
+  margin: 0.4rem 0 0;
+  max-width: 520px;
+}
+
 /* -- Tier pills -- */
 .tier { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 3px; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
 .tier-aggressive { background: var(--alert-dim); color: var(--alert-text); }

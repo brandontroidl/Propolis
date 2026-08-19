@@ -8,6 +8,7 @@
 <a href="/queue" class="{% if active_nav == "queue" %}active{% endif %}">Review queue{% if pending_count > 0 %} <span class="badge">{{ pending_count }}</span>{% endif %}</a>
 <a href="/feed" class="{% if active_nav == "feed" %}active{% endif %}">Feed status</a>
 <a href="/search/events" class="{% if active_nav == "search" %}active{% endif %}">Search</a>
+<a href="/logs" class="{% if active_nav == "logs" %}active{% endif %}">Logs</a>
 </nav>
 <div class="right">
 <form action="/search/events" method="get" class="nav-search">

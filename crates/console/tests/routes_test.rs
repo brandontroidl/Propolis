@@ -62,6 +62,7 @@ fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> App
         feed_output_dir,
         startup_time: chrono::Utc::now(),
         version: "test",
+        log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),
     }
 }
 

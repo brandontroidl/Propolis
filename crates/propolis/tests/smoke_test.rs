@@ -71,6 +71,7 @@ async fn smoke_health_and_ready(pool: PgPool) {
             feed_output_dir: Some(feed_dir.path().to_path_buf()),
             startup_time: chrono::Utc::now(),
             version: "test",
+            log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),
         };
 
         let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();

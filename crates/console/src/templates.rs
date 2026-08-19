@@ -49,6 +49,7 @@ const DASHBOARD_CHART_FRAGMENT_HTML: &str = include_str!("templates/dashboard_ch
 const SEARCH_HTML: &str = include_str!("templates/search.html");
 const SEARCH_EVENTS_ROWS_HTML: &str = include_str!("templates/search_events_rows.html");
 const SEARCH_EVENTS_FRAGMENT_HTML: &str = include_str!("templates/search_events_fragment.html");
+const LOGS_HTML: &str = include_str!("templates/logs.html");
 
 /// Builds the environment once at startup (`AppState::templates`); cheap to construct (five small
 /// templates) but shared via `Arc` so the source is parsed exactly once per process rather than
@@ -97,6 +98,9 @@ pub fn environment() -> Environment<'static> {
         .expect("search_events_rows.html must be a valid template");
     env.add_template("search_events_fragment.html", SEARCH_EVENTS_FRAGMENT_HTML)
         .expect("search_events_fragment.html must be a valid template");
+    // Console-forensics task 7: live system log viewer (`routes::logs`).
+    env.add_template("logs.html", LOGS_HTML)
+        .expect("logs.html must be a valid template");
     env
 }
 

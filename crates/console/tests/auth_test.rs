@@ -38,6 +38,7 @@ fn test_state(db: PgPool) -> AppState {
         feed_output_dir: None,
         startup_time: chrono::Utc::now(),
         version: "test",
+        log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),
     }
 }
 

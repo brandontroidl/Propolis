@@ -389,6 +389,53 @@ button:hover { border-color: var(--text-muted); }
 .filter-form select:focus { border-color: var(--border-bright); outline: none; }
 .search-mode-tabs { margin-bottom: 1rem; }
 
+/* -- Log viewer (console-forensics task 7) -- */
+.log-viewer {
+  height: 65vh;
+  min-height: 320px;
+  overflow-y: auto;
+  background: var(--bg);
+  padding: 0.4rem 0;
+}
+.log-lines { display: flex; flex-direction: column; }
+.log-line {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.15rem 0.9rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-left: 2px solid transparent;
+}
+.log-line.level-error { background: var(--alert-dim); border-left-color: var(--alert); }
+.log-line.level-warn { background: var(--attention-dim); border-left-color: var(--attention); }
+.log-time { color: var(--text-faint); flex: 0 0 auto; }
+.log-level-badge {
+  flex: 0 0 auto;
+  display: inline-block;
+  min-width: 3.6em;
+  text-align: center;
+  font-weight: 700;
+  font-size: 0.68rem;
+  letter-spacing: 0.03em;
+  padding: 0 0.3em;
+  border-radius: 3px;
+  color: var(--text-muted);
+}
+.log-level-badge-error { background: var(--alert-dim); color: var(--alert-text); }
+.log-level-badge-warn { background: var(--attention-dim); color: var(--attention-text); }
+.log-level-badge-info { color: var(--text-muted); }
+.log-level-badge-debug, .log-level-badge-trace { color: var(--text-faint); }
+.log-target { color: var(--text-faint); flex: 0 0 auto; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-message { color: var(--text-muted); flex: 1 1 auto; }
+.log-line.level-error .log-message { color: var(--alert-text); }
+.log-line.level-warn .log-message { color: var(--attention-text); }
+.log-line.level-debug .log-message, .log-line.level-trace .log-message { color: var(--text-faint); }
+#log-connection-status { margin-left: 0.6rem; text-transform: none; letter-spacing: 0; }
+#log-pause-toggle.active { border-color: var(--brand); color: var(--brand); }
+
 /* -- Empty states -- */
 .empty { color: var(--text-muted); padding: 2rem 1rem; text-align: center; border: 1px dashed var(--border); border-radius: 6px; }
 .empty-line { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.82rem; padding: 1.25rem 0.9rem; }

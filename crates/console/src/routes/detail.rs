@@ -105,6 +105,14 @@ struct SessionGroup {
     event_count: usize,
     events: Vec<EventRow>,
     expanded: bool,
+    /// The latest `observed_at` in the group, formatted like `start_time`. Not rendered by the
+    /// template (there's no "session end" field in the card header - `duration` already conveys
+    /// the span) - it exists purely as [`group_into_sessions`]'s sort key, per the design spec's
+    /// "Order sessions by most recent first (latest `observed_at` in each group)": sorting on
+    /// `start_time` instead would put a still-ongoing long session behind a short session that
+    /// started later but both started and ended after it.
+    #[serde(skip)]
+    end_time: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -488,13 +496,17 @@ fn group_into_sessions(
                 username,
                 command_count,
                 event_count: events.len(),
+                end_time: format_timestamp(end),
                 events,
                 expanded: false,
             }
         })
         .collect();
 
-    groups.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+    // Most-recent-first by session END (latest `observed_at` in the group) -
+    // `internal/design/11-console-forensics.md`'s "Order sessions by most recent first (latest
+    // `observed_at` in each group)", not by when each session started.
+    groups.sort_by(|a, b| b.end_time.cmp(&a.end_time));
     for (i, g) in groups.iter_mut().enumerate() {
         g.expanded = i < recent_expanded;
     }
@@ -747,6 +759,34 @@ mod tests {
         assert!(groups[0].expanded);
         assert!(groups[1].expanded);
         assert!(!groups[2].expanded);
+    }
+
+    #[test]
+    fn group_into_sessions_orders_by_end_time_not_start_time() {
+        // "sess-long" starts long before "sess-short" but is still running: its last event is
+        // more recent than "sess-short"'s. Sorting by `start_time` (the bug) would put
+        // "sess-short" first, since it started more recently even though it ended earlier -
+        // sorting by `end_time` (the design spec's "latest observed_at in each group") puts
+        // "sess-long" first instead.
+        let rows = vec![
+            event_row(Some("sess-long"), "honeypot_connection", 500, json!({})),
+            event_row(
+                Some("sess-long"),
+                "honeypot_command_exec",
+                50,
+                json!({ "command": "id" }),
+            ),
+            event_row(Some("sess-short"), "honeypot_connection", 100, json!({})),
+            event_row(
+                Some("sess-short"),
+                "honeypot_command_exec",
+                90,
+                json!({ "command": "id" }),
+            ),
+        ];
+        let (groups, _) = group_into_sessions(rows, 3);
+        let ids: Vec<&str> = groups.iter().map(|g| g.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["sess-long", "sess-short"]);
     }
 
     #[test]

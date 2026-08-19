@@ -19,6 +19,7 @@ pub struct EventInput {
     pub confidence: Decimal,
     pub observed_at: DateTime<Utc>,
     pub metadata: serde_json::Value,
+    pub session_id: Option<uuid::Uuid>,
 }
 
 impl EventInput {
@@ -34,6 +35,7 @@ impl EventInput {
         authenticated: bool,
         observed_at: DateTime<Utc>,
         metadata: serde_json::Value,
+        session_id: Option<uuid::Uuid>,
     ) -> Self {
         let w = signal_weight(signal_type);
         EventInput {
@@ -48,6 +50,7 @@ impl EventInput {
             confidence: w.confidence,
             observed_at,
             metadata,
+            session_id,
         }
     }
 
@@ -119,6 +122,7 @@ mod tests {
             true,
             "2026-07-17T00:00:00Z".parse().unwrap(),
             serde_json::json!({}),
+            None,
         )
     }
 
@@ -133,6 +137,7 @@ mod tests {
             true,
             "2026-07-17T00:00:00Z".parse().unwrap(),
             serde_json::json!({}),
+            None,
         );
         assert_eq!(e.weight, 60);
         assert_eq!(e.confidence, dec!(0.950));
@@ -171,6 +176,7 @@ mod tests {
             true,
             "2026-07-17T00:00:00Z".parse().unwrap(),
             serde_json::json!({}),
+            None,
         );
         forged.category = Category::Honeypot;
         forged.weight = 80;

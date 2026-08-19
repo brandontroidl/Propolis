@@ -30,6 +30,7 @@ fn public_api_surface_is_reachable_and_wired() {
         true,
         "2026-07-17T00:00:00Z".parse().unwrap(),
         serde_json::json!({}),
+        None,
     );
     assert_eq!(event.weight, 80);
     assert_eq!(event.category, Category::Honeypot);

@@ -95,6 +95,7 @@ fn ev_with_wan(
         authenticated,
         ts.parse().unwrap(),
         serde_json::json!({}),
+        None,
     )
 }
 
@@ -115,6 +116,7 @@ fn ev(
         authenticated,
         ts.parse().unwrap(),
         serde_json::json!({}),
+        None,
     )
 }
 

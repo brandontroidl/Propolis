@@ -76,6 +76,7 @@ fn ev(
         authenticated,
         observed_at,
         serde_json::json!({}),
+        None,
     )
 }
 

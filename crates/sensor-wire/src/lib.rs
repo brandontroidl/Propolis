@@ -48,6 +48,8 @@ pub struct SensorEvent {
     pub observed_at: DateTime<Utc>,
     pub metadata: serde_json::Value,
     pub sample: Option<SampleRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<uuid::Uuid>,
 }
 
 /// Reference to a captured file body written to the quarantine spool, named by its SHA-256.
@@ -76,6 +78,7 @@ mod tests {
             observed_at: "2026-07-20T14:03:11.482913Z".parse().unwrap(),
             metadata: serde_json::json!({ "protocol_label": "ssh", "command": "uname -a" }),
             sample: None,
+            session_id: None,
         }
     }
 
@@ -125,5 +128,33 @@ mod tests {
     #[test]
     fn version_marker() {
         assert_eq!(VERSION_MARKER, "sensor-wire");
+    }
+
+    #[test]
+    fn deserialize_without_session_id() {
+        let json = r#"{"v":1,"source_ip":"1.2.3.4","sensor":"test","signal_type":"catchall_probe","protocol":"tcp","authenticated":false,"observed_at":"2024-01-01T00:00:00Z","metadata":{}}"#;
+        let event: SensorEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.session_id, None);
+    }
+
+    #[test]
+    fn serde_round_trip_with_session_id() {
+        let sid = uuid::Uuid::now_v7();
+        let event = SensorEvent {
+            v: WIRE_VERSION,
+            source_ip: "1.2.3.4".parse().unwrap(),
+            wan_ip: None,
+            sensor: "test".into(),
+            signal_type: SIGNAL_CATCHALL_PROBE.into(),
+            protocol: PROTO_TCP.into(),
+            authenticated: false,
+            observed_at: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+            sample: None,
+            session_id: Some(sid),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: SensorEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_id, Some(sid));
     }
 }

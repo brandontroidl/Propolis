@@ -51,6 +51,7 @@ pub fn convert(event: SensorEvent) -> Result<EventInput, ConvertError> {
         event.authenticated,
         event.observed_at,
         metadata,
+        event.session_id,
     );
 
     input.validate().map_err(ConvertError::Validation)?;

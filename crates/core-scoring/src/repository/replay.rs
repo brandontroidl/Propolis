@@ -89,6 +89,10 @@ fn reconstruct_event(row: &PgRow) -> Result<EventInput, RepoError> {
         confidence: row.try_get::<Decimal, _>("confidence")?,
         observed_at: row.try_get::<DateTime<Utc>, _>("observed_at")?,
         metadata: row.try_get("metadata")?,
+        // Not selected by the query below: session_id is not part of the frozen
+        // chain_hash encoding (see hashing.rs) and is not consumed by apply_event,
+        // so replay/verify_chain do not need to reconstruct it.
+        session_id: None,
     })
 }
 

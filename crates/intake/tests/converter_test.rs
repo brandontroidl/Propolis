@@ -13,6 +13,7 @@ fn sample_wire_event() -> SensorEvent {
         observed_at: "2026-07-20T14:03:11.482913Z".parse().unwrap(),
         metadata: serde_json::json!({"protocol_label": "ssh", "command": "uname -a"}),
         sample: None,
+        session_id: None,
     }
 }
 
@@ -81,6 +82,21 @@ fn preserves_existing_metadata_when_folding_sample() {
     assert_eq!(input.metadata["command"], "uname -a");
     // Sample fields added.
     assert_eq!(input.metadata["sample_sha256"], "b".repeat(64));
+}
+
+#[test]
+fn passes_session_id_through() {
+    let sid = uuid::Uuid::now_v7();
+    let mut event = sample_wire_event();
+    event.session_id = Some(sid);
+    let input = convert(event).unwrap();
+    assert_eq!(input.session_id, Some(sid));
+}
+
+#[test]
+fn none_session_id_passes_through_as_none() {
+    let input = convert(sample_wire_event()).unwrap();
+    assert_eq!(input.session_id, None);
 }
 
 #[test]

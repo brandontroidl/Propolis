@@ -243,6 +243,7 @@ mod tests {
             true,
             ts(t),
             serde_json::json!({}),
+            None,
         )
     }
 
@@ -257,6 +258,7 @@ mod tests {
             false,
             ts(t),
             serde_json::json!({}),
+            None,
         )
     }
 
@@ -285,6 +287,7 @@ mod tests {
             true,
             ts("2026-07-17T00:00:00Z"),
             serde_json::json!({}),
+            None,
         );
         let s1 = apply_event(None, &e1, HALF_LIFE, false, 1, 1);
         assert_eq!(s1.raw_score, dec!(80));
@@ -303,6 +306,7 @@ mod tests {
             true,
             later,
             serde_json::json!({}),
+            None,
         );
         let s2 = apply_event(Some(s1), &e2, HALF_LIFE, true, 1, 1);
         assert!(s2.raw_score < dec!(0.5));
@@ -358,6 +362,7 @@ mod tests {
                         auth,
                         base + Duration::seconds(acc),
                         serde_json::json!({}),
+                        None,
                     );
                     (e, wan)
                 })

@@ -8,7 +8,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::WanResolver;
+use sensor_framework::{ConnectionBounds, WanResolver};
+
+/// Bounds for a test server: production's shape, with a `max_duration` long enough that no test
+/// here can be cut off by it. Deliberately not tiny - a too-short duration would make these tests
+/// fail intermittently under load for a reason unrelated to what they assert.
+fn test_bounds() -> ConnectionBounds {
+    ConnectionBounds {
+        read_timeout: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(60),
+        max_duration: Duration::from_secs(120),
+        max_captured_bytes: 1_000_000,
+        max_concurrent: 64,
+    }
+}
 
 /// Minimal russh client handler that accepts any host key (this is a test against our own
 /// honeypot, not a connection to a third party).
@@ -33,12 +46,13 @@ async fn ssh_handshake_and_session_with_real_client() {
     let host_key_path = dir.path().join("host_key");
 
     let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
-    let (addr, handle) = sensor_ssh::start_test_server(
+    let (addr, handle) = sensor_ssh::serve(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
         spool_dir,
         host_key_path,
         wan_resolver,
+        test_bounds(),
     )
     .await
     .unwrap();
@@ -160,12 +174,13 @@ async fn no_outbound_connections() {
     let dir = tempfile::tempdir().unwrap();
     let spool_dir = dir.path().join("spool");
     let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
-    let (addr, handle) = sensor_ssh::start_test_server(
+    let (addr, handle) = sensor_ssh::serve(
         "127.0.0.1:0".parse().unwrap(),
         dir.path().join("events.jsonl"),
         spool_dir,
         dir.path().join("host_key"),
         wan_resolver,
+        test_bounds(),
     )
     .await
     .unwrap();
@@ -195,4 +210,102 @@ async fn no_outbound_connections() {
         0,
         "sensor must open ZERO outbound connections"
     );
+}
+
+// ---------------------------------------------------------------------
+// Connection bounds
+//
+// This sensor hand-rolled its own accept loop and so had none of the framework bounds every
+// other sensor gets: no concurrency cap, no session-duration cap, and a bare `continue` on
+// accept errors. Nothing in the session path imposes a deadline either - every phase awaits a
+// socket read with no timeout - so a peer that connected and then went quiet held its connection,
+// and its descriptor, forever. Verified against the live sensor before the fix: a connection left
+// idle after KEXINIT was still open 75 seconds later.
+//
+// Both tests below fail against that old loop, which is the point of them.
+// ---------------------------------------------------------------------
+
+/// A silent peer must be disconnected once `max_duration` elapses.
+#[tokio::test]
+async fn an_idle_session_is_dropped_once_max_duration_elapses() {
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bounds = ConnectionBounds {
+        max_duration: Duration::from_secs(1),
+        ..test_bounds()
+    };
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        bounds,
+    )
+    .await
+    .unwrap();
+
+    // Connect and then say nothing at all - the shape that used to leak a descriptor per peer.
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    // The server greets first, so drain whatever it sends before waiting for the close.
+    let mut scratch = [0u8; 1024];
+    let closed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match stream.read(&mut scratch).await {
+                Ok(0) => return true,  // FIN: the session was dropped, as it must be
+                Ok(_) => continue,     // banner/KEXINIT; keep waiting
+                Err(_) => return true, // reset also counts as disconnected
+            }
+        }
+    })
+    .await;
+
+    handle.abort();
+    assert_eq!(
+        closed,
+        Ok(true),
+        "an idle session must be dropped once max_duration elapses, not held indefinitely"
+    );
+}
+
+/// Beyond `max_concurrent`, further connections are refused immediately rather than queued -
+/// an accepted-but-waiting connection is itself the unbounded resource the cap exists to prevent.
+#[tokio::test]
+async fn concurrency_beyond_max_concurrent_is_refused_not_queued() {
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bounds = ConnectionBounds {
+        max_concurrent: 1,
+        max_duration: Duration::from_secs(30),
+        ..test_bounds()
+    };
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        bounds,
+    )
+    .await
+    .unwrap();
+
+    // First connection takes the only permit and holds it by staying silent.
+    let mut first = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut scratch = [0u8; 1024];
+    let _ = tokio::time::timeout(Duration::from_secs(5), first.read(&mut scratch)).await;
+
+    // Second connection: accepted at the TCP layer, then closed without a byte of SSH.
+    let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(10), second.read(&mut scratch)).await;
+
+    handle.abort();
+    match got {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("second connection got {n} bytes; the cap did not apply"),
+        Err(_) => panic!("second connection was left hanging - queued, not refused"),
+    }
 }

@@ -1,19 +1,25 @@
 //! SSH session composition (Task 14): wires transport, key exchange, authentication, channel
 //! management, the fake shell, and SCP/SFTP capture into a complete honeypot SSH server. The
-//! entry point is `start_test_server`, which binds a listener, accepts connections, and spawns
-//! a per-connection `handle_session` task. Each session performs the full SSH handshake using
-//! this crate's own primitives (see ADR-0011), then dispatches channel data to the appropriate
-//! handler.
+//! entry point is [`serve`], which binds a listener through the framework's
+//! `run_tcp_listener` and spawns a per-connection `handle_session` task. Each session performs
+//! the full SSH handshake using this crate's own primitives (see ADR-0011), then dispatches
+//! channel data to the appropriate handler.
+//!
+//! [`serve`] was named `start_test_server` until it was noticed that the production binary calls
+//! it - the name had stopped describing what it was for, and it read as though the internet-facing
+//! honeypot were a test fixture. Renamed rather than aliased so there is one name for one thing.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
-use sensor_framework::listener::normalize_dual_stack;
-use sensor_framework::{CaptureHandoff, EventEmitter, QuarantineSpool, WanResolver};
+use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
+use sensor_framework::{
+    CaptureHandoff, ConnectionBounds, EventEmitter, QuarantineSpool, WanResolver,
+};
 
 use crate::auth::AuthState;
 use crate::channel::{ChannelAction, handle_channel_open, handle_channel_request};
@@ -53,12 +59,28 @@ enum ChannelHandler {
 /// `wan_resolver` maps the listener's local address to the operator's WAN IP (see
 /// `sensor_framework::WanResolver`). Tests that do not need WAN attribution pass an empty
 /// resolver; production passes the operator-configured map.
-pub async fn start_test_server(
+///
+/// `bounds` is enforced by `sensor_framework::listener::run_tcp_listener`, the same accept loop
+/// every other sensor uses. This function used to hand-roll its own loop and consequently had
+/// none of it: no concurrency cap, no session-duration cap, and a bare `continue` on accept
+/// errors. Nothing in `handle_session` below imposes a deadline either - every phase awaits a
+/// socket read with no timeout - so a peer that completed the handshake and then went quiet held
+/// its connection, and its file descriptor, indefinitely. Confirmed against the live sensor: a
+/// connection left idle after KEXINIT was still open 75 seconds later, where telnet closes an
+/// idle session in 30.
+///
+/// That combination is monotonic: connections accumulate, and once descriptors run out `accept`
+/// fails immediately and repeatedly, which the old loop retried with no backoff - a busy-spin at
+/// the exact moment the service is already failing. `run_tcp_listener` caps concurrency with a
+/// semaphore, runs each session inside `tokio::time::timeout(max_duration, ...)`, and backs off
+/// on accept errors.
+pub async fn serve(
     addr: SocketAddr,
     log_path: PathBuf,
     spool_dir: PathBuf,
     host_key_path: PathBuf,
     wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
     // Load or generate the host key.
     let host_key = if host_key_path.exists() {
@@ -82,20 +104,13 @@ pub async fn start_test_server(
     let handoff = Arc::new(CaptureHandoff::new(spool, EventEmitter::new(log_path), 64));
     let _worker = handoff.start_worker();
 
-    let listener = TcpListener::bind(addr).await?;
-    let bound_addr = listener.local_addr()?;
-
-    let handle = tokio::spawn(async move {
-        loop {
-            let Ok((stream, peer_addr)) = listener.accept().await else {
-                continue;
-            };
-            let session_id = sensor_framework::Uuid::now_v7();
+    let (bound_addr, handle) =
+        run_tcp_listener(addr, bounds, move |stream, peer_addr, session_id| {
             let host_key = host_key.clone();
             let emitter = emitter.clone();
             let handoff = handoff.clone();
             let wan_resolver = wan_resolver.clone();
-            tokio::spawn(async move {
+            async move {
                 if let Err(e) = handle_session(
                     stream,
                     peer_addr,
@@ -109,9 +124,9 @@ pub async fn start_test_server(
                 {
                     tracing::debug!(error = %e, peer = %peer_addr, "SSH session ended");
                 }
-            });
-        }
-    });
+            }
+        })
+        .await?;
 
     Ok((bound_addr, handle))
 }

@@ -15,7 +15,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sensor_framework::{WanResolver, shutdown_signal};
+use std::time::Duration;
+
+use sensor_framework::{ConnectionBounds, WanResolver, shutdown_signal};
 use sensor_ssh::hostkey::HostKey;
 
 const ENV_BIND: &str = "PROPOLIS_SSH_BIND";
@@ -23,10 +25,24 @@ const ENV_WAN_MAP: &str = "PROPOLIS_SSH_WAN_MAP";
 const ENV_HOST_KEY_PATH: &str = "PROPOLIS_SSH_HOST_KEY_PATH";
 const ENV_LOG_PATH: &str = "PROPOLIS_SSH_LOG_PATH";
 const ENV_SPOOL_DIR: &str = "PROPOLIS_SSH_SPOOL_DIR";
+const ENV_READ_TIMEOUT_MS: &str = "PROPOLIS_SSH_READ_TIMEOUT_MS";
+const ENV_IDLE_TIMEOUT_MS: &str = "PROPOLIS_SSH_IDLE_TIMEOUT_MS";
+const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_SSH_MAX_DURATION_SECS";
+const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_SSH_MAX_CAPTURED_BYTES";
+const ENV_MAX_CONCURRENT: &str = "PROPOLIS_SSH_MAX_CONCURRENT";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/ssh/events.jsonl";
 const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/ssh";
 const DEFAULT_HOST_KEY_PATH: &str = "/var/lib/propolis/ssh/host_key";
+
+// Deliberately identical to sensor-telnet's defaults. Both are unauthenticated, internet-facing
+// TCP honeypots with the same exposure, so two different sets of numbers would be a difference
+// with no reason behind it - and the reason each bound exists is the same for both.
+const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_MAX_DURATION_SECS: u64 = 600;
+const DEFAULT_MAX_CAPTURED_BYTES: u64 = 1_000_000;
+const DEFAULT_MAX_CONCURRENT: u32 = 256;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -35,6 +51,7 @@ struct Config {
     host_key_path: PathBuf,
     log_path: PathBuf,
     spool_dir: PathBuf,
+    bounds: ConnectionBounds,
 }
 
 #[derive(Debug, PartialEq)]
@@ -43,6 +60,13 @@ enum ConfigError {
     NoBind,
     InvalidBind(String),
     InvalidWanMapEntry(String),
+    /// A bound was present but zero or unparseable. Rejected rather than defaulted: silently
+    /// substituting a default for a misconfigured bound is how a guard gets disabled without
+    /// anyone noticing.
+    InvalidBound {
+        field: &'static str,
+        value: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -56,6 +80,12 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "invalid {ENV_WAN_MAP} entry {s:?}, expected local_ip=wan_ip"
             ),
+            ConfigError::InvalidBound { field, value } => {
+                write!(
+                    f,
+                    "invalid {field} value {value:?}, expected a positive integer"
+                )
+            }
         }
     }
 }
@@ -102,13 +132,87 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_SPOOL_DIR));
 
+    let bounds = ConnectionBounds {
+        read_timeout: Duration::from_millis(parse_positive_u64(
+            env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
+            DEFAULT_READ_TIMEOUT_MS,
+            ENV_READ_TIMEOUT_MS,
+        )?),
+        idle_timeout: Duration::from_millis(parse_positive_u64(
+            env::var(ENV_IDLE_TIMEOUT_MS).ok().as_deref(),
+            DEFAULT_IDLE_TIMEOUT_MS,
+            ENV_IDLE_TIMEOUT_MS,
+        )?),
+        max_duration: Duration::from_secs(parse_positive_u64(
+            env::var(ENV_MAX_DURATION_SECS).ok().as_deref(),
+            DEFAULT_MAX_DURATION_SECS,
+            ENV_MAX_DURATION_SECS,
+        )?),
+        max_captured_bytes: parse_positive_u64(
+            env::var(ENV_MAX_CAPTURED_BYTES).ok().as_deref(),
+            DEFAULT_MAX_CAPTURED_BYTES,
+            ENV_MAX_CAPTURED_BYTES,
+        )?,
+        max_concurrent: parse_positive_u32(
+            env::var(ENV_MAX_CONCURRENT).ok().as_deref(),
+            DEFAULT_MAX_CONCURRENT,
+            ENV_MAX_CONCURRENT,
+        )?,
+    };
+
     Ok(Config {
         bind_addr,
         wan_map,
         host_key_path,
         log_path,
         spool_dir,
+        bounds,
     })
+}
+
+/// Parse an optional positive `u64` bound: `None` (the env var was unset) falls back to
+/// `default`; present-but-zero or present-but-unparseable are both rejected.
+fn parse_positive_u64(
+    raw: Option<&str>,
+    default: u64,
+    field: &'static str,
+) -> Result<u64, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value: u64 = raw.parse().map_err(|_| ConfigError::InvalidBound {
+        field,
+        value: raw.to_string(),
+    })?;
+    if value == 0 {
+        return Err(ConfigError::InvalidBound {
+            field,
+            value: raw.to_string(),
+        });
+    }
+    Ok(value)
+}
+
+/// `u32` counterpart of [`parse_positive_u64`] (for `max_concurrent`), same rules.
+fn parse_positive_u32(
+    raw: Option<&str>,
+    default: u32,
+    field: &'static str,
+) -> Result<u32, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value: u32 = raw.parse().map_err(|_| ConfigError::InvalidBound {
+        field,
+        value: raw.to_string(),
+    })?;
+    if value == 0 {
+        return Err(ConfigError::InvalidBound {
+            field,
+            value: raw.to_string(),
+        });
+    }
+    Ok(value)
 }
 
 #[tokio::main]
@@ -166,12 +270,13 @@ async fn main() {
 
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
 
-    let (bound, handle) = match sensor_ssh::start_test_server(
+    let (bound, handle) = match sensor_ssh::serve(
         config.bind_addr,
         config.log_path,
         config.spool_dir,
         config.host_key_path,
         wan_resolver,
+        config.bounds,
     )
     .await
     {

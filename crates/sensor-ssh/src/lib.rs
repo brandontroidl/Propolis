@@ -16,7 +16,7 @@ pub mod transport;
 pub use sensor_framework::fakefs;
 pub use sensor_framework::shell;
 
-pub use server::start_test_server;
+pub use server::serve;
 
 #[cfg(test)]
 mod tests {

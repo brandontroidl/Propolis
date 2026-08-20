@@ -153,6 +153,14 @@ PROPOLIS_SSH_BIND=0.0.0.0:22
 PROPOLIS_SSH_WAN_MAP=10.0.0.1=198.51.100.1
 PROPOLIS_SSH_LOG_PATH=/var/log/propolis/ssh/events.jsonl
 PROPOLIS_SSH_SPOOL_DIR=/var/spool/propolis/ssh
+# Connection bounds. Optional - these are the defaults, shown because raising max_concurrent or
+# max_duration on an internet-facing listener is how descriptors run out. A value of 0 is
+# rejected at startup rather than treated as "unlimited".
+PROPOLIS_SSH_READ_TIMEOUT_MS=30000
+PROPOLIS_SSH_IDLE_TIMEOUT_MS=60000
+PROPOLIS_SSH_MAX_DURATION_SECS=600
+PROPOLIS_SSH_MAX_CAPTURED_BYTES=1000000
+PROPOLIS_SSH_MAX_CONCURRENT=256
 ```
 
 ### `/etc/propolis/catchall.env` (catch-all sensor)

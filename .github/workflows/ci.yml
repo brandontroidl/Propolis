@@ -4,6 +4,17 @@ name: CI
 # test suite against a real PostgreSQL. Runs on every push and pull request so nothing merges
 # un-gated. The toolchain is pinned via rust-toolchain.toml (matched rustc + clippy + rustfmt).
 #
+# These are three INDEPENDENT jobs, deliberately, not three steps in one. As a single sequential
+# job it bailed on the first failure, so an unformatted tree meant clippy and the entire test suite
+# never executed - which is exactly what happened, for more than thirty consecutive commits. During
+# that window four test files stopped compiling, several tests drifted out of sync with the code
+# they cover, and two tests encoded vendor-API bugs that were consequently found the expensive way,
+# live against the vendor. Every commit was visibly red the whole time and the red read as noise,
+# because a formatting nit and a dead test suite looked identical from the outside.
+#
+# Split this way, each job's status says something specific and a cheap failure cannot hide an
+# expensive one. The cost is that clippy and tests no longer share a warm cache; that is worth it.
+#
 # Supply-chain hardening: every action is pinned to a commit SHA (a moved or compromised tag cannot
 # swap it out), the postgres image is pinned to a digest, and build/test use --locked (frozen
 # lockfile). Update these pins deliberately, reviewing the diff.
@@ -16,9 +27,50 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  quality:
-    name: fmt + clippy + tests
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned Rust toolchain + components
+        uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96.1 branch, 2026-07-16
+        with:
+          components: rustfmt
+
+      # No cargo cache: rustfmt parses sources and builds nothing, so a cache would cost more to
+      # restore than the step takes to run.
+      - name: Format check
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned Rust toolchain + components
+        uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96.1 branch, 2026-07-16
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # --all-targets is load-bearing beyond linting: it compiles the test targets too, so a test
+      # file that no longer compiles fails HERE rather than vanishing silently from the suite. That
+      # is the failure this job now guards, and it needs no database to do it.
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  tests:
+    name: tests
     runs-on: ubuntu-latest
 
     services:
@@ -37,7 +89,6 @@ jobs:
     env:
       # sqlx::test provisions a fresh database per test on this server (superuser, trust auth).
       DATABASE_URL: postgres://postgres@localhost:5432/postgres
-      CARGO_TERM_COLOR: always
 
     steps:
       - name: Checkout
@@ -45,17 +96,48 @@ jobs:
 
       - name: Install pinned Rust toolchain + components
         uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96.1 branch, 2026-07-16
-        with:
-          components: clippy, rustfmt
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Format check
-        run: cargo fmt --all --check
-
-      - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
+      # pipefail is not optional: a shell pipeline reports the LAST command's status, so without it
+      # `cargo test | tee` would report tee's success and this step would pass on a red suite.
       - name: Tests (serial, frozen lockfile)
-        run: cargo test --workspace --locked -- --test-threads=1
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked -- --test-threads=1 2>&1 | tee /tmp/test-output.txt
+
+      # Publishes how much actually ran. A suite can be green because it passed or because it was
+      # barely there - filtered, skipped, or reduced to a handful of binaries - and those look the
+      # same on the status badge. Printing the totals makes a sudden drop visible to a human
+      # scanning the run, which is the signal that was missing when four test files silently
+      # stopped compiling. Advisory: it never fails the job, so it cannot become a flaky gate.
+      - name: Report test totals
+        if: always()
+        run: |
+          if [ ! -f /tmp/test-output.txt ]; then
+            echo "No test output captured (the suite did not get far enough to produce any)." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Sum the labelled fields themselves rather than a positional offset into the summary
+          # line. Keying on position looked equivalent and was not: on a "test result: FAILED."
+          # line the first number is that binary's PASSED count, so the table reported the wrong
+          # figure under "Failed" - precise, confidently rendered, and wrong.
+          sum_field() {
+            grep -oE "[0-9]+ $1" /tmp/test-output.txt | awk '{s += $1} END {print s + 0}'
+          }
+          passed=$(sum_field passed)
+          failed=$(sum_field failed)
+          ignored=$(sum_field ignored)
+          binaries=$(grep -cE '^[[:space:]]+Running ' /tmp/test-output.txt || true)
+          {
+            echo "### Test totals"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Passed | $passed |"
+            echo "| Failed | $failed |"
+            echo "| Ignored | $ignored |"
+            echo "| Test binaries | $binaries |"
+          } >> "$GITHUB_STEP_SUMMARY"

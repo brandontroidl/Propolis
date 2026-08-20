@@ -166,10 +166,24 @@ PROPOLIS_SSH_MAX_CONCURRENT=256
 ### `/etc/propolis/catchall.env` (catch-all sensor)
 
 ```bash
-PROPOLIS_CATCHALL_BIND=0.0.0.0:0
-PROPOLIS_CATCHALL_WAN_MAP=10.0.0.1=198.51.100.1
-PROPOLIS_CATCHALL_LOG_PATH=/var/log/propolis/catchall/events.jsonl
+# NOTE: the catch-all is the one sensor whose variables are NOT prefixed PROPOLIS_, and it takes
+# a comma-separated LIST of addresses rather than a single one. This file previously documented
+# PROPOLIS_CATCHALL_BIND=0.0.0.0:0, which the binary does not read: it would refuse to start with
+# "CATCHALL_BIND_ADDRS must name at least one bind address". Check `systemctl status
+# sensor-catchall` if you configured this host from the older instructions.
+CATCHALL_BIND_ADDRS=0.0.0.0:23,0.0.0.0:102,0.0.0.0:445,0.0.0.0:1433,0.0.0.0:3389
+CATCHALL_WAN_MAP=10.0.0.1=198.51.100.1
+CATCHALL_LOG_PATH=/var/log/propolis/catchall/events.jsonl
 ```
+
+Bind whichever unserved ports you want recorded. Port 102 is worth including: it is Siemens S7comm,
+and the sequential scanning of it that five US agencies flagged on 2026-08-19 (NSA, CISA, FBI, DOE,
+EPA) is exactly what a catch-all listener is for. Note the limit, though - a catch-all records a
+`catchall_probe`, which is `Category::Network` and never `authenticated`, so it cannot satisfy the
+`confirmed_real` gate on its own. A host that only ever scans port 102 is visible in the console and
+corroborates other signals from the same address, but is never published or reported by itself.
+Making S7comm reconnaissance publishable in its own right needs a sensor that speaks enough of the
+protocol to record which data blocks were read or written.
 
 ### Remaining sensor env files
 

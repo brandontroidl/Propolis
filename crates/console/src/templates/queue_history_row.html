@@ -1,13 +1,13 @@
 <tr id="row-{{ row.ip }}">
   <td class="ip"><a href="/ip/{{ row.ip }}">{{ row.ip }}</a></td>
-  <td class="score"><span class="meter"><span class="meter-fill" style="--pct: {{ row.score_pct }}%"></span></span>{{ row.score }}</td>
+  <td class="score"><span class="meter"><span class="meter-fill{% if row.score_pct >= 90 %} meter-fill--crit{% elif row.score_pct >= 75 %} meter-fill--high{% elif row.score_pct >= 50 %} meter-fill--warn{% endif %}" style="--pct: {{ row.score_pct }}%"></span></span>{{ row.score }}</td>
   <td>
     {% if row.tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>
     {% elif row.tier == "standard" %}<span class="tier tier-standard">Standard</span>
     {% else %}<span class="tier tier-none">-</span>{% endif %}
   </td>
   <td>{{ row.categories }}</td>
-  <td class="mono">{{ row.event_count }}</td>
+  <td class="count">{{ row.event_count }}</td>
   <td class="seen">{{ row.decided_at }}</td>
   {% if row.state == "approved" %}<td>{{ row.submissions }}</td>{% endif %}
   <td class="dim">{{ row.notes }}</td>

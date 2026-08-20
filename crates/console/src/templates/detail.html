@@ -12,11 +12,11 @@
 <div class="stat-row">
   <div class="stat-card stat-card--attention">
     <div class="label">Raw score</div>
-    <div class="value"><span class="meter"><span class="meter-fill" style="--pct: {{ raw_score_pct }}%"></span></span>{{ raw_score }}</div>
+    <div class="value"><span class="meter"><span class="meter-fill{% if raw_score_pct >= 90 %} meter-fill--crit{% elif raw_score_pct >= 75 %} meter-fill--high{% elif raw_score_pct >= 50 %} meter-fill--warn{% endif %}" style="--pct: {{ raw_score_pct }}%"></span></span>{{ raw_score }}</div>
   </div>
   <div class="stat-card stat-card--attention">
     <div class="label">Effective score</div>
-    <div class="value"><span class="meter"><span class="meter-fill" style="--pct: {{ effective_score_pct }}%"></span></span>{{ effective_score }}</div>
+    <div class="value"><span class="meter"><span class="meter-fill{% if effective_score_pct >= 90 %} meter-fill--crit{% elif effective_score_pct >= 75 %} meter-fill--high{% elif effective_score_pct >= 50 %} meter-fill--warn{% endif %}" style="--pct: {{ effective_score_pct }}%"></span></span>{{ effective_score }}</div>
   </div>
   <div class="stat-card">
     <div class="label">Tier</div>

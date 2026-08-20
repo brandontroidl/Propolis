@@ -50,13 +50,13 @@
   {% elif ip_rows %}
   <div class="panel">
     <table class="table-compact">
-      <thead><tr><th>IP</th><th>Matches</th><th>Score</th><th>Tier</th><th>First seen</th><th>Last seen</th></tr></thead>
+      <thead><tr><th>IP</th><th class="count">Matches</th><th>Score</th><th>Tier</th><th>First seen</th><th>Last seen</th></tr></thead>
       <tbody>
         {% for r in ip_rows %}
         <tr>
           <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
-          <td class="mono">{{ r.match_count }}</td>
-          <td class="mono"><span class="meter"><span class="meter-fill" style="--pct: {{ r.score_pct }}%"></span></span>{{ r.score }}</td>
+          <td class="count">{{ r.match_count }}</td>
+          <td class="mono"><span class="meter"><span class="meter-fill{% if r.score_pct >= 90 %} meter-fill--crit{% elif r.score_pct >= 75 %} meter-fill--high{% elif r.score_pct >= 50 %} meter-fill--warn{% endif %}" style="--pct: {{ r.score_pct }}%"></span></span>{{ r.score }}</td>
           <td>
             {% if r.tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>
             {% elif r.tier == "standard" %}<span class="tier tier-standard">Standard</span>

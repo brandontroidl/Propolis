@@ -8,19 +8,25 @@
   {% endfor %}
 </div>
 
+{# One format dropdown + one download link, per tier. The tier is fixed by the panel it sits in,
+   so the operator picks only the format. Defaults to the .txt href so it still works with JS off;
+   the page-level listener below rewrites the href as the format select changes. #}
 {% macro download_row(feed) %}
-<div class="range-selector">
-  <a href="/feed/download/{{ feed }}/txt" class="range-btn">TXT</a>
-  <a href="/feed/download/{{ feed }}/json" class="range-btn">JSON</a>
-  <a href="/feed/download/{{ feed }}/csv" class="range-btn">CSV</a>
-  <a href="/feed/download/{{ feed }}/cidr" class="range-btn">CIDR</a>
-  <a href="/feed/download/{{ feed }}/ipset" class="range-btn">ipset</a>
-  <a href="/feed/download/{{ feed }}/nft" class="range-btn">nftables</a>
-  <a href="/feed/download/{{ feed }}/pf" class="range-btn">pf</a>
-  <a href="/feed/download/{{ feed }}/alias" class="range-btn">pfSense</a>
-  <a href="/feed/download/{{ feed }}/hosts" class="range-btn">hosts</a>
-  <a href="/feed/download/{{ feed }}/rpz" class="range-btn">RPZ</a>
-</div>
+<span class="dl">
+  <select class="dl-fmt" aria-label="Download format for {{ feed }}">
+    <option value="txt">TXT</option>
+    <option value="json">JSON</option>
+    <option value="csv">CSV</option>
+    <option value="cidr">CIDR</option>
+    <option value="ipset">ipset</option>
+    <option value="nft">nftables</option>
+    <option value="pf">pf</option>
+    <option value="alias">pfSense</option>
+    <option value="hosts">hosts</option>
+    <option value="rpz">RPZ</option>
+  </select>
+  <a class="dl-go" data-feed="{{ feed }}" href="/feed/download/{{ feed }}/txt" download>Download</a>
+</span>
 {% endmacro %}
 
 {% macro entry_table(rows, empty_text) %}
@@ -120,4 +126,13 @@
   <p class="empty-line">{% if feed_disabled %}feed builder is disabled on this node{% else %}feed enabled - awaiting first build{% endif %}</p>
   {% endif %}
 {% endif %}
+<script>
+// Point each panel's Download link at the format its own select currently shows. One delegated
+// listener covers every download_row() on the page; the .txt href in the markup is the no-JS default.
+document.addEventListener('change', function (e) {
+  if (!e.target.classList || !e.target.classList.contains('dl-fmt')) return;
+  var go = e.target.parentElement.querySelector('.dl-go');
+  if (go) go.href = '/feed/download/' + go.dataset.feed + '/' + e.target.value;
+});
+</script>
 {% endblock %}

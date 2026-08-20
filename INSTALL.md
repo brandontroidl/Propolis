@@ -132,7 +132,13 @@ PROPOLIS_SUBMIT_POLL_INTERVAL_SECS=30
 
 # Feed (set PROPOLIS_FEED_ENABLED=false to disable on this node)
 PROPOLIS_FEED_ENABLED=true
-PROPOLIS_FEED_OUTPUT_DIR=/var/lib/propolis/feed
+# Note the trailing /current, and do not drop it. The publisher swaps a whole directory into place
+# atomically, which means creating sibling staging/previous directories NEXT TO this one - so this
+# path must sit one level inside the writable root, not at it. Pointing it at /var/lib/propolis/feed
+# puts those siblings in /var/lib/propolis: that happens to work under propolis.service, which
+# grants the wider ReadWritePaths=/var/lib/propolis, and fails under feed.service, which grants only
+# /var/lib/propolis/feed. This file previously documented the shorter path.
+PROPOLIS_FEED_OUTPUT_DIR=/var/lib/propolis/feed/current
 PROPOLIS_FEED_BUILD_INTERVAL_SECS=900
 # Retention feeds, published as all-{label}.* alongside the two tiers. Each carries every approved
 # address whose last activity falls inside the window, regardless of tier, so the windows nest.

@@ -64,7 +64,8 @@
 #     RATE_LIMIT,RATE_WINDOW_HOURS} (DSHIELD also takes _USER), PROPOLIS_FEED_ENABLED
 #     (default true), PROPOLIS_FEED_OUTPUT_DIR (default /var/lib/propolis/feed/current),
 #     PROPOLIS_FEED_BUILD_INTERVAL_SECS (default 900), PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS
-#     (default 24), PROPOLIS_FEED_STANDARD_TTL_HOURS (default 48), PROPOLIS_FEED_ALLOWLIST
+#     (default 24), PROPOLIS_FEED_STANDARD_TTL_HOURS (default 48), PROPOLIS_FEED_WINDOWS
+#     (default 24h,7d,30d,60d,90d - retention feeds published as all-{label}.*), PROPOLIS_FEED_ALLOWLIST
 #     (optional CIDR list), PROPOLIS_FEED_DELIST (optional IP list), PROPOLIS_CONSOLE_BIND
 #     (default 127.0.0.1:8080), PROPOLIS_CONSOLE_PASSWORD (required),
 #     PROPOLIS_CONSOLE_SESSION_SECRET (optional 64-hex-char/32-byte key - unset generates a fresh

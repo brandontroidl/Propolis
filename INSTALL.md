@@ -134,6 +134,11 @@ PROPOLIS_SUBMIT_POLL_INTERVAL_SECS=30
 PROPOLIS_FEED_ENABLED=true
 PROPOLIS_FEED_OUTPUT_DIR=/var/lib/propolis/feed
 PROPOLIS_FEED_BUILD_INTERVAL_SECS=900
+# Retention feeds, published as all-{label}.* alongside the two tiers. Each carries every approved
+# address whose last activity falls inside the window, regardless of tier, so the windows nest.
+# The label is parsed for its own duration (<count>h or <count>d), so a filename cannot advertise a
+# window the builder does not apply. Set empty to publish only the two tiered feeds.
+PROPOLIS_FEED_WINDOWS=24h,7d,30d,60d,90d
 
 # Console (loopback only by default)
 PROPOLIS_CONSOLE_BIND=127.0.0.1:8080

@@ -8,6 +8,17 @@ threat-intelligence platform.
 Check `manifest.json`'s `build_time` for when these files were actually produced, and each file's
 own `valid_until` header for when its contents expire. Do not infer freshness from the commit date.
 
+## Layout
+
+```
+tiers/        aggressive.*  standard.*        block this now
+retention/    all-24h.* … all-90d.*          active in the last N
+manifest.json                                 build time, counts, digests, validity
+```
+
+`tiers/` holds the two curated block-now lists; `retention/` holds the windowed
+"active-in-the-last-N" lists. `manifest.json` at the root indexes every feed by name.
+
 ## What makes an entry
 
 Every IP in this list did all four of these:
@@ -30,8 +41,8 @@ afterwards. An entry enters one tier's file and stays there until its window lap
 
 | Tier | Raw score | Confidence | Carried for |
 |---|---|---|---|
-| `aggressive` | ≥ 90 | ≥ 0.95 | 24 hours after last activity |
-| `standard` | ≥ 75 | ≥ 0.70 | 48 hours after last activity |
+| `tiers/aggressive` | ≥ 90 | ≥ 0.95 | 24 hours after last activity |
+| `tiers/standard` | ≥ 75 | ≥ 0.70 | 48 hours after last activity |
 
 Both tiers additionally require an effective score of **≥ 50** when the entry was scored.
 
@@ -51,19 +62,19 @@ list.
 
 | File | Contains |
 |---|---|
-| `all-24h.*` | every approved address active in the last 24 hours |
-| `all-7d.*` | last 7 days |
-| `all-30d.*` | last 30 days |
-| `all-60d.*` | last 60 days |
-| `all-90d.*` | last 90 days |
+| `retention/all-24h.*` | every approved address active in the last 24 hours |
+| `retention/all-7d.*` | last 7 days |
+| `retention/all-30d.*` | last 30 days |
+| `retention/all-60d.*` | last 60 days |
+| `retention/all-90d.*` | last 90 days |
 
 These ignore tier and **nest**: `all-90d` is a superset of `all-30d`, which is a superset of
 `all-7d`. Pick exactly one; there is never a reason to merge two.
 
 ## Formats
 
-Every feed ships in all ten formats. Substitute `standard`, `all-30d`, or any other feed name for
-`aggressive` in any path.
+Every feed ships in all ten formats, under `tiers/` (aggressive, standard) or `retention/` (all-*).
+Substitute `tiers/standard`, `retention/all-30d`, or any other feed path for `tiers/aggressive` below.
 
 | File | Use with | Notes |
 |---|---|---|
@@ -102,7 +113,7 @@ semicolon-separated. No score or confidence value is published, in either format
 Firewall → Aliases → URLs. Point a URL Table alias at:
 
 ```
-https://raw.githubusercontent.com/brandontroidl/blocklist/main/aggressive.alias
+https://raw.githubusercontent.com/brandontroidl/blocklist/main/tiers/aggressive.alias
 ```
 
 Set the refresh frequency to 1 day. The alias updates itself.
@@ -120,7 +131,7 @@ nft add rule inet filter input ip saddr $propolis_aggressive drop
 ### ipset + iptables
 
 ```bash
-curl -sO https://raw.githubusercontent.com/brandontroidl/blocklist/main/aggressive.ipset
+curl -sO https://raw.githubusercontent.com/brandontroidl/blocklist/main/tiers/aggressive.ipset
 ipset restore < aggressive.ipset
 iptables -I INPUT -m set --match-set propolis_aggressive src -j DROP
 ```

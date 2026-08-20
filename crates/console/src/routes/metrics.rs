@@ -142,6 +142,28 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, AppError> {
         )
         .unwrap();
 
+        // Retention feeds get their own metric rather than another `propolis_feed_entries` series:
+        // that metric's label is `tier`, and a retention window is not a tier - reusing it would
+        // make `sum(propolis_feed_entries)` double-count, since every tiered entry also appears in
+        // the windows it falls inside. Emitted even when empty, so a window that has silently
+        // stopped publishing is visible as a zero rather than as an absent series.
+        if !manifest.windows.is_empty() {
+            writeln!(
+                out,
+                "# HELP propolis_feed_window_entries Entry count per retention feed in the last published build."
+            )
+            .unwrap();
+            writeln!(out, "# TYPE propolis_feed_window_entries gauge").unwrap();
+            for window in &manifest.windows {
+                writeln!(
+                    out,
+                    "propolis_feed_window_entries{{window=\"{}\"}} {}",
+                    window.label, window.count
+                )
+                .unwrap();
+            }
+        }
+
         if let Ok(build_time) = DateTime::parse_from_rfc3339(&manifest.build_time) {
             push_gauge(
                 &mut out,

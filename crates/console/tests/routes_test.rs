@@ -2772,6 +2772,46 @@ async fn metrics_includes_feed_entries_when_manifest_present(pool: PgPool) {
         body.contains("propolis_feed_last_build_timestamp 1785333600\n"),
         "missing or wrong last-build-timestamp gauge: {body}"
     );
+    // A manifest from a build with no retention feeds must not emit the window metric at all,
+    // rather than emitting an empty HELP/TYPE pair with no series under it.
+    assert!(
+        !body.contains("propolis_feed_window_entries"),
+        "window metric must be absent when no windows are configured: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn metrics_reports_each_retention_feed_separately_from_the_tiers(pool: PgPool) {
+    // The retention feeds had no metric, so a window that stopped publishing was invisible from
+    // outside the box. They get their own metric rather than another propolis_feed_entries series:
+    // every tiered entry also appears in the windows containing it, so reusing that metric would
+    // make summing it double-count.
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":4,"sha256":"x","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":9,"sha256":"y","valid_until":"2026-07-31T14:00:00Z"}},"windows":[{"label":"24h","count":11,"sha256":"a","valid_until":"2026-07-30T14:00:00Z"},{"label":"90d","count":0,"sha256":"b","valid_until":"2026-10-27T14:00:00Z"}]}"#,
+    )
+    .unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let app = test_app(state);
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"propolis_feed_window_entries{window="24h"} 11"#),
+        "missing 24h window series: {body}"
+    );
+    // Emitted even at zero: an absent series and a silently-empty feed look the same on a graph,
+    // and the second is the one worth alerting on.
+    assert!(
+        body.contains(r#"propolis_feed_window_entries{window="90d"} 0"#),
+        "an empty window must still report, as a zero: {body}"
+    );
+    // The tier metric is untouched, so existing dashboards keep working.
+    assert!(body.contains(r#"propolis_feed_entries{tier="aggressive"} 4"#));
 }
 
 #[sqlx::test(migrations = false)]

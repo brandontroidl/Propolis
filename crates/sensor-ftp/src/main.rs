@@ -39,7 +39,9 @@ impl std::fmt::Display for ConfigError {
             ConfigError::NoBind => write!(f, "{ENV_BIND} must be set"),
             ConfigError::InvalidBind(s) => write!(f, "invalid {ENV_BIND}: {s:?}"),
             ConfigError::InvalidWanMapEntry(s) => write!(f, "invalid {ENV_WAN_MAP} entry: {s:?}"),
-            ConfigError::InvalidBound { field, value } => write!(f, "{field} must be positive, got {value:?}"),
+            ConfigError::InvalidBound { field, value } => {
+                write!(f, "{field} must be positive, got {value:?}")
+            }
         }
     }
 }
@@ -75,11 +77,31 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         log_path,
         spool_dir,
         bounds: ConnectionBounds {
-            read_timeout: Duration::from_millis(parse_positive_u64(env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(), DEFAULT_READ_TIMEOUT_MS, ENV_READ_TIMEOUT_MS)?),
-            idle_timeout: Duration::from_millis(parse_positive_u64(env::var(ENV_IDLE_TIMEOUT_MS).ok().as_deref(), DEFAULT_IDLE_TIMEOUT_MS, ENV_IDLE_TIMEOUT_MS)?),
-            max_duration: Duration::from_secs(parse_positive_u64(env::var(ENV_MAX_DURATION_SECS).ok().as_deref(), DEFAULT_MAX_DURATION_SECS, ENV_MAX_DURATION_SECS)?),
-            max_captured_bytes: parse_positive_u64(env::var(ENV_MAX_CAPTURED_BYTES).ok().as_deref(), DEFAULT_MAX_CAPTURED_BYTES, ENV_MAX_CAPTURED_BYTES)?,
-            max_concurrent: parse_positive_u32(env::var(ENV_MAX_CONCURRENT).ok().as_deref(), DEFAULT_MAX_CONCURRENT, ENV_MAX_CONCURRENT)?,
+            read_timeout: Duration::from_millis(parse_positive_u64(
+                env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
+                DEFAULT_READ_TIMEOUT_MS,
+                ENV_READ_TIMEOUT_MS,
+            )?),
+            idle_timeout: Duration::from_millis(parse_positive_u64(
+                env::var(ENV_IDLE_TIMEOUT_MS).ok().as_deref(),
+                DEFAULT_IDLE_TIMEOUT_MS,
+                ENV_IDLE_TIMEOUT_MS,
+            )?),
+            max_duration: Duration::from_secs(parse_positive_u64(
+                env::var(ENV_MAX_DURATION_SECS).ok().as_deref(),
+                DEFAULT_MAX_DURATION_SECS,
+                ENV_MAX_DURATION_SECS,
+            )?),
+            max_captured_bytes: parse_positive_u64(
+                env::var(ENV_MAX_CAPTURED_BYTES).ok().as_deref(),
+                DEFAULT_MAX_CAPTURED_BYTES,
+                ENV_MAX_CAPTURED_BYTES,
+            )?,
+            max_concurrent: parse_positive_u32(
+                env::var(ENV_MAX_CONCURRENT).ok().as_deref(),
+                DEFAULT_MAX_CONCURRENT,
+                ENV_MAX_CONCURRENT,
+            )?,
         },
     })
 }
@@ -87,25 +109,57 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
 fn parse_wan_map(raw: &str) -> Result<HashMap<IpAddr, IpAddr>, ConfigError> {
     let mut map = HashMap::new();
     for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (local, wan) = entry.split_once('=').ok_or_else(|| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
-        let local: IpAddr = local.trim().parse().map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
-        let wan: IpAddr = wan.trim().parse().map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
+        let (local, wan) = entry
+            .split_once('=')
+            .ok_or_else(|| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
+        let local: IpAddr = local
+            .trim()
+            .parse()
+            .map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
+        let wan: IpAddr = wan
+            .trim()
+            .parse()
+            .map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
         map.insert(local, wan);
     }
     Ok(map)
 }
 
-fn parse_positive_u64(raw: Option<&str>, default: u64, field: &'static str) -> Result<u64, ConfigError> {
+fn parse_positive_u64(
+    raw: Option<&str>,
+    default: u64,
+    field: &'static str,
+) -> Result<u64, ConfigError> {
     let Some(raw) = raw else { return Ok(default) };
-    let value: u64 = raw.parse().map_err(|_| ConfigError::InvalidBound { field, value: raw.to_string() })?;
-    if value == 0 { return Err(ConfigError::InvalidBound { field, value: raw.to_string() }); }
+    let value: u64 = raw.parse().map_err(|_| ConfigError::InvalidBound {
+        field,
+        value: raw.to_string(),
+    })?;
+    if value == 0 {
+        return Err(ConfigError::InvalidBound {
+            field,
+            value: raw.to_string(),
+        });
+    }
     Ok(value)
 }
 
-fn parse_positive_u32(raw: Option<&str>, default: u32, field: &'static str) -> Result<u32, ConfigError> {
+fn parse_positive_u32(
+    raw: Option<&str>,
+    default: u32,
+    field: &'static str,
+) -> Result<u32, ConfigError> {
     let Some(raw) = raw else { return Ok(default) };
-    let value: u32 = raw.parse().map_err(|_| ConfigError::InvalidBound { field, value: raw.to_string() })?;
-    if value == 0 { return Err(ConfigError::InvalidBound { field, value: raw.to_string() }); }
+    let value: u32 = raw.parse().map_err(|_| ConfigError::InvalidBound {
+        field,
+        value: raw.to_string(),
+    })?;
+    if value == 0 {
+        return Err(ConfigError::InvalidBound {
+            field,
+            value: raw.to_string(),
+        });
+    }
     Ok(value)
 }
 
@@ -127,10 +181,16 @@ async fn main() {
     let bounds = config.bounds;
 
     let wan_resolver = Arc::new(WanResolver::new(wan_map));
-    let (bound, handle) = match sensor_ftp::start_test_server(bind_addr, log_path, spool_dir, wan_resolver, bounds).await {
-        Ok(pair) => pair,
-        Err(e) => { tracing::error!(addr = %bind_addr, error = %e, "sensor-ftp: failed to start"); std::process::exit(1); }
-    };
+    let (bound, handle) =
+        match sensor_ftp::start_test_server(bind_addr, log_path, spool_dir, wan_resolver, bounds)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!(addr = %bind_addr, error = %e, "sensor-ftp: failed to start");
+                std::process::exit(1);
+            }
+        };
 
     tracing::info!(local = %bound, "sensor-ftp: listening");
     shutdown_signal().await;

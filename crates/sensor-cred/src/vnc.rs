@@ -51,7 +51,10 @@ pub async fn handle_connection(
 
     // 2. Client -> Server: protocol version
     let mut client_version = [0u8; RFB_VERSION_LEN];
-    if timed_read_exact(&mut stream, &mut client_version, timeout).await.is_err() {
+    if timed_read_exact(&mut stream, &mut client_version, timeout)
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -62,7 +65,10 @@ pub async fn handle_connection(
 
     // 4. Client -> Server: selected security type
     let mut selected = [0u8; 1];
-    if timed_read_exact(&mut stream, &mut selected, timeout).await.is_err() {
+    if timed_read_exact(&mut stream, &mut selected, timeout)
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -78,7 +84,10 @@ pub async fn handle_connection(
 
     // 6. Client -> Server: 16-byte DES-encrypted response
     let mut response = [0u8; VNC_AUTH_RESPONSE_LEN];
-    if timed_read_exact(&mut stream, &mut response, timeout).await.is_err() {
+    if timed_read_exact(&mut stream, &mut response, timeout)
+        .await
+        .is_err()
+    {
         return;
     }
 

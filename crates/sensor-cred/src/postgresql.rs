@@ -42,7 +42,10 @@ pub async fn handle_connection(
 
     // 1. Read StartupMessage (no message type byte - just length + protocol + params)
     let mut len_buf = [0u8; 4];
-    if timed_read_exact(&mut stream, &mut len_buf, timeout).await.is_err() {
+    if timed_read_exact(&mut stream, &mut len_buf, timeout)
+        .await
+        .is_err()
+    {
         return;
     }
     let msg_len = i32::from_be_bytes(len_buf) as usize;
@@ -51,7 +54,10 @@ pub async fn handle_connection(
     }
 
     let mut body = vec![0u8; msg_len - 4];
-    if timed_read_exact(&mut stream, &mut body, timeout).await.is_err() {
+    if timed_read_exact(&mut stream, &mut body, timeout)
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -69,7 +75,10 @@ pub async fn handle_connection(
         }
         // Client will resend StartupMessage without SSL
         let mut len_buf2 = [0u8; 4];
-        if timed_read_exact(&mut stream, &mut len_buf2, timeout).await.is_err() {
+        if timed_read_exact(&mut stream, &mut len_buf2, timeout)
+            .await
+            .is_err()
+        {
             return;
         }
         let msg_len2 = i32::from_be_bytes(len_buf2) as usize;
@@ -77,7 +86,10 @@ pub async fn handle_connection(
             return;
         }
         body = vec![0u8; msg_len2 - 4];
-        if timed_read_exact(&mut stream, &mut body, timeout).await.is_err() {
+        if timed_read_exact(&mut stream, &mut body, timeout)
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -100,7 +112,10 @@ pub async fn handle_connection(
 
     // 3. Read PasswordMessage ('p' + length + md5hash)
     let mut type_buf = [0u8; 1];
-    if timed_read_exact(&mut stream, &mut type_buf, timeout).await.is_err() {
+    if timed_read_exact(&mut stream, &mut type_buf, timeout)
+        .await
+        .is_err()
+    {
         return;
     }
     if type_buf[0] != b'p' {
@@ -108,7 +123,10 @@ pub async fn handle_connection(
     }
 
     let mut pw_len = [0u8; 4];
-    if timed_read_exact(&mut stream, &mut pw_len, timeout).await.is_err() {
+    if timed_read_exact(&mut stream, &mut pw_len, timeout)
+        .await
+        .is_err()
+    {
         return;
     }
     let pw_body_len = i32::from_be_bytes(pw_len) as usize;
@@ -116,7 +134,10 @@ pub async fn handle_connection(
         return;
     }
     let mut _pw_body = vec![0u8; pw_body_len - 4];
-    if timed_read_exact(&mut stream, &mut _pw_body, timeout).await.is_err() {
+    if timed_read_exact(&mut stream, &mut _pw_body, timeout)
+        .await
+        .is_err()
+    {
         return;
     }
     // Password hash is read only to advance the protocol; discarded.

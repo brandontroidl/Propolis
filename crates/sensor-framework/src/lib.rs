@@ -22,5 +22,5 @@ pub use handoff::{CaptureDropped, CaptureHandoff, CaptureJob};
 pub use listener::{run_tcp_listener, run_udp_listener, shutdown_signal};
 pub use sanitize::{sanitize_value, to_hex_bounded};
 pub use spool::{QuarantineSpool, SpoolError};
-pub use wan::WanResolver;
 pub use uuid::Uuid;
+pub use wan::WanResolver;

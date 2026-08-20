@@ -61,35 +61,41 @@ pub fn apply_event(
     let now = event.observed_at;
 
     // Step 1-2: seed or decay prior state to `now`.
-    let (decayed_raw, mut breakdown, first_seen, prev_event_count, prev_has_confirmed_real, delisted) =
-        match prev {
-            None => (
-                dec!(0),
-                BTreeMap::<Category, CategoryStat>::new(),
-                now,
-                0i32,
-                false,
-                false,
-            ),
-            Some(p) => {
-                let elapsed = (now - p.decay_anchor).num_seconds();
-                let decayed_raw = decay(p.raw_score, elapsed, half_life_seconds);
-                let mut map: BTreeMap<Category, CategoryStat> =
-                    serde_json::from_value(p.category_breakdown)
-                        .expect("category_breakdown is a well-formed CategoryStat map");
-                for stat in map.values_mut() {
-                    stat.weight = decay(stat.weight, elapsed, half_life_seconds);
-                }
-                (
-                    decayed_raw,
-                    map,
-                    p.first_seen,
-                    p.event_count,
-                    p.has_confirmed_real,
-                    p.delisted,
-                )
+    let (
+        decayed_raw,
+        mut breakdown,
+        first_seen,
+        prev_event_count,
+        prev_has_confirmed_real,
+        delisted,
+    ) = match prev {
+        None => (
+            dec!(0),
+            BTreeMap::<Category, CategoryStat>::new(),
+            now,
+            0i32,
+            false,
+            false,
+        ),
+        Some(p) => {
+            let elapsed = (now - p.decay_anchor).num_seconds();
+            let decayed_raw = decay(p.raw_score, elapsed, half_life_seconds);
+            let mut map: BTreeMap<Category, CategoryStat> =
+                serde_json::from_value(p.category_breakdown)
+                    .expect("category_breakdown is a well-formed CategoryStat map");
+            for stat in map.values_mut() {
+                stat.weight = decay(stat.weight, elapsed, half_life_seconds);
             }
-        };
+            (
+                decayed_raw,
+                map,
+                p.first_seen,
+                p.event_count,
+                p.has_confirmed_real,
+                p.delisted,
+            )
+        }
+    };
 
     // Step 3: add this event's contribution unless it is a deduped sighting.
     let new_raw = if deduped {

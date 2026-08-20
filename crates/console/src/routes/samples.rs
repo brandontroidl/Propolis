@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
+use axum::Router;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use minijinja::context;
 use serde::Serialize;
 
@@ -32,15 +32,16 @@ struct SampleRow {
 async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let base = base_context(&state.db, state.startup_time, state.version).await;
 
-    let vt_results: std::collections::HashMap<String, (i32, i32, String)> = sqlx::query_as::<_, (String, i32, i32, String)>(
-        "SELECT sha256, detected, total, vt_link FROM sample_analysis"
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(|(sha, d, t, l)| (sha, (d, t, l)))
-    .collect();
+    let vt_results: std::collections::HashMap<String, (i32, i32, String)> =
+        sqlx::query_as::<_, (String, i32, i32, String)>(
+            "SELECT sha256, detected, total, vt_link FROM sample_analysis",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(sha, d, t, l)| (sha, (d, t, l)))
+        .collect();
 
     let mut samples = Vec::new();
     for (sensor, dir) in spool_dirs() {

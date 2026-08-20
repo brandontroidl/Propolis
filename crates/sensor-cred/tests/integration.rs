@@ -39,11 +39,18 @@ impl TestServer {
         )
         .await
         .unwrap();
-        TestServer { addr, log_path, handle, _dir: dir }
+        TestServer {
+            addr,
+            log_path,
+            handle,
+            _dir: dir,
+        }
     }
 
     async fn events(&self) -> Vec<sensor_wire::SensorEvent> {
-        let content = tokio::fs::read_to_string(&self.log_path).await.unwrap_or_default();
+        let content = tokio::fs::read_to_string(&self.log_path)
+            .await
+            .unwrap_or_default();
         content
             .lines()
             .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad event: {e}: {l}")))
@@ -89,9 +96,18 @@ async fn vnc_auth_attempt_emits_login_event() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let events = srv.events().await;
-    let login = events.iter().find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT).unwrap();
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .unwrap();
     assert!(login.authenticated);
-    assert_eq!(login.metadata.get("protocol_label").and_then(|v| v.as_str()), Some("vnc"));
+    assert_eq!(
+        login
+            .metadata
+            .get("protocol_label")
+            .and_then(|v| v.as_str()),
+        Some("vnc")
+    );
     srv.handle.abort();
 }
 
@@ -138,16 +154,29 @@ async fn mysql_handshake_captures_username() {
     // Read OK
     let mut ok_header = [0u8; 4];
     conn.read_exact(&mut ok_header).await.unwrap();
-    let ok_len = (ok_header[0] as usize) | ((ok_header[1] as usize) << 8) | ((ok_header[2] as usize) << 16);
+    let ok_len =
+        (ok_header[0] as usize) | ((ok_header[1] as usize) << 8) | ((ok_header[2] as usize) << 16);
     let mut ok_body = vec![0u8; ok_len];
     conn.read_exact(&mut ok_body).await.unwrap();
     assert_eq!(ok_body[0], 0x00); // OK packet
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let events = srv.events().await;
-    let login = events.iter().find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT).unwrap();
-    assert_eq!(login.metadata.get("username").and_then(|v| v.as_str()), Some("testuser"));
-    assert_eq!(login.metadata.get("protocol_label").and_then(|v| v.as_str()), Some("mysql"));
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .unwrap();
+    assert_eq!(
+        login.metadata.get("username").and_then(|v| v.as_str()),
+        Some("testuser")
+    );
+    assert_eq!(
+        login
+            .metadata
+            .get("protocol_label")
+            .and_then(|v| v.as_str()),
+        Some("mysql")
+    );
     assert!(login.metadata.get("password").is_none());
     srv.handle.abort();
 }
@@ -189,8 +218,10 @@ async fn mssql_login7_captures_username() {
     // Username length at 50-51: 2 chars
     login7[50..52].copy_from_slice(&2u16.to_le_bytes());
     // "sa" as UTF-16LE at offset 94
-    login7[94] = b's'; login7[95] = 0;
-    login7[96] = b'a'; login7[97] = 0;
+    login7[94] = b's';
+    login7[95] = 0;
+    login7[96] = b'a';
+    login7[97] = 0;
 
     let login7_pkt = wrap_tds(0x10, &login7);
     conn.write_all(&login7_pkt).await.unwrap();
@@ -206,9 +237,21 @@ async fn mssql_login7_captures_username() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let events = srv.events().await;
-    let login = events.iter().find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT).unwrap();
-    assert_eq!(login.metadata.get("username").and_then(|v| v.as_str()), Some("sa"));
-    assert_eq!(login.metadata.get("protocol_label").and_then(|v| v.as_str()), Some("mssql"));
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .unwrap();
+    assert_eq!(
+        login.metadata.get("username").and_then(|v| v.as_str()),
+        Some("sa")
+    );
+    assert_eq!(
+        login
+            .metadata
+            .get("protocol_label")
+            .and_then(|v| v.as_str()),
+        Some("mssql")
+    );
     srv.handle.abort();
 }
 
@@ -252,7 +295,10 @@ async fn postgresql_captures_username() {
     let body_len = i32::from_be_bytes(auth_len) as usize - 4;
     let mut auth_body = vec![0u8; body_len];
     conn.read_exact(&mut auth_body).await.unwrap();
-    assert_eq!(i32::from_be_bytes([auth_body[0], auth_body[1], auth_body[2], auth_body[3]]), 5); // MD5
+    assert_eq!(
+        i32::from_be_bytes([auth_body[0], auth_body[1], auth_body[2], auth_body[3]]),
+        5
+    ); // MD5
 
     // Send PasswordMessage
     let pw = b"md5fakehashvalue00000000000000000\0";
@@ -270,9 +316,21 @@ async fn postgresql_captures_username() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let events = srv.events().await;
-    let login = events.iter().find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT).unwrap();
-    assert_eq!(login.metadata.get("username").and_then(|v| v.as_str()), Some("pgadmin"));
-    assert_eq!(login.metadata.get("protocol_label").and_then(|v| v.as_str()), Some("postgresql"));
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .unwrap();
+    assert_eq!(
+        login.metadata.get("username").and_then(|v| v.as_str()),
+        Some("pgadmin")
+    );
+    assert_eq!(
+        login
+            .metadata
+            .get("protocol_label")
+            .and_then(|v| v.as_str()),
+        Some("postgresql")
+    );
     srv.handle.abort();
 }
 
@@ -292,12 +350,7 @@ async fn mongodb_saslstart_captures_username() {
 
     let mut payload = Vec::new();
     payload.extend_from_slice(b"n,,n=mongouser,r=somerandomnonce");
-    let sasl_bson = build_test_bson_with_binary(
-        "saslStart",
-        "admin",
-        "SCRAM-SHA-1",
-        &payload,
-    );
+    let sasl_bson = build_test_bson_with_binary("saslStart", "admin", "SCRAM-SHA-1", &payload);
     let sasl_msg = build_op_msg(2, &sasl_bson);
     conn.write_all(&sasl_msg).await.unwrap();
 
@@ -305,8 +358,17 @@ async fn mongodb_saslstart_captures_username() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let events = srv.events().await;
-    let login = events.iter().find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT).unwrap();
-    assert_eq!(login.metadata.get("protocol_label").and_then(|v| v.as_str()), Some("mongodb"));
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .unwrap();
+    assert_eq!(
+        login
+            .metadata
+            .get("protocol_label")
+            .and_then(|v| v.as_str()),
+        Some("mongodb")
+    );
     assert!(login.authenticated);
     srv.handle.abort();
 }
@@ -413,7 +475,9 @@ async fn connection_event_emitted_on_bare_connect() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let events = srv.events().await;
         assert!(
-            events.iter().any(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_CONNECTION),
+            events
+                .iter()
+                .any(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_CONNECTION),
             "{proto}: connection event missing"
         );
         srv.handle.abort();
@@ -433,7 +497,10 @@ fn never_exec_static_check() {
             found.push(entry.display().to_string());
         }
     }
-    assert!(found.is_empty(), "sensor-cred must not spawn processes: {found:?}");
+    assert!(
+        found.is_empty(),
+        "sensor-cred must not spawn processes: {found:?}"
+    );
 }
 
 #[tokio::test]
@@ -442,7 +509,9 @@ async fn malformed_input_does_not_crash_listeners() {
         let srv = TestServer::start(proto).await;
         for seed in 0..3u8 {
             if let Ok(mut conn) = TcpStream::connect(srv.addr).await {
-                let garbage: Vec<u8> = (0..1024u32).map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed)).collect();
+                let garbage: Vec<u8> = (0..1024u32)
+                    .map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed))
+                    .collect();
                 let _ = conn.write_all(&garbage).await;
                 drop(conn);
             }
@@ -461,8 +530,11 @@ fn walk_rs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() { walk(&path, files); }
-                else if path.extension().is_some_and(|e| e == "rs") { files.push(path); }
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
             }
         }
     }

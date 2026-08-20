@@ -149,11 +149,7 @@ pub async fn handle_connection(
     }
 }
 
-fn connection_event(
-    source_ip: IpAddr,
-    wan_ip: Option<IpAddr>,
-    session_id: Uuid,
-) -> SensorEvent {
+fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -331,12 +327,7 @@ mod tests {
     fn login_event_metadata_never_has_a_password_key() {
         // There is no `password` argument to `login_event` at all - this test documents that
         // guarantee at the type level: the function cannot leak what it is never given.
-        let event = login_event(
-            "203.0.113.7".parse().unwrap(),
-            None,
-            "root",
-            Uuid::now_v7(),
-        );
+        let event = login_event("203.0.113.7".parse().unwrap(), None, "root", Uuid::now_v7());
         assert!(event.metadata.get("password").is_none());
     }
 }

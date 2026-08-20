@@ -27,11 +27,15 @@ fn parse_wan_map(raw: &str) -> HashMap<IpAddr, IpAddr> {
 }
 
 fn parse_positive_u64(raw: Option<&str>, default: u64) -> u64 {
-    raw.and_then(|s| s.parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(default)
+    raw.and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
 }
 
 fn parse_positive_u32(raw: Option<&str>, default: u32) -> u32 {
-    raw.and_then(|s| s.parse::<u32>().ok()).filter(|&v| v > 0).unwrap_or(default)
+    raw.and_then(|s| s.parse::<u32>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
 }
 
 #[tokio::main]
@@ -45,11 +49,26 @@ async fn main() {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_DIR));
 
     let bounds = ConnectionBounds {
-        read_timeout: Duration::from_millis(parse_positive_u64(env::var("PROPOLIS_CRED_READ_TIMEOUT_MS").ok().as_deref(), 30_000)),
-        idle_timeout: Duration::from_millis(parse_positive_u64(env::var("PROPOLIS_CRED_IDLE_TIMEOUT_MS").ok().as_deref(), 60_000)),
-        max_duration: Duration::from_secs(parse_positive_u64(env::var("PROPOLIS_CRED_MAX_DURATION_SECS").ok().as_deref(), 60)),
-        max_captured_bytes: parse_positive_u64(env::var("PROPOLIS_CRED_MAX_CAPTURED_BYTES").ok().as_deref(), 100_000),
-        max_concurrent: parse_positive_u32(env::var("PROPOLIS_CRED_MAX_CONCURRENT").ok().as_deref(), 256),
+        read_timeout: Duration::from_millis(parse_positive_u64(
+            env::var("PROPOLIS_CRED_READ_TIMEOUT_MS").ok().as_deref(),
+            30_000,
+        )),
+        idle_timeout: Duration::from_millis(parse_positive_u64(
+            env::var("PROPOLIS_CRED_IDLE_TIMEOUT_MS").ok().as_deref(),
+            60_000,
+        )),
+        max_duration: Duration::from_secs(parse_positive_u64(
+            env::var("PROPOLIS_CRED_MAX_DURATION_SECS").ok().as_deref(),
+            60,
+        )),
+        max_captured_bytes: parse_positive_u64(
+            env::var("PROPOLIS_CRED_MAX_CAPTURED_BYTES").ok().as_deref(),
+            100_000,
+        ),
+        max_concurrent: parse_positive_u32(
+            env::var("PROPOLIS_CRED_MAX_CONCURRENT").ok().as_deref(),
+            256,
+        ),
     };
 
     // Parse per-protocol bind addresses from env
@@ -72,14 +91,24 @@ async fn main() {
     }
 
     if ports.is_empty() {
-        tracing::error!("sensor-cred: no bind addresses configured; set at least one PROPOLIS_CRED_*_BIND");
+        tracing::error!(
+            "sensor-cred: no bind addresses configured; set at least one PROPOLIS_CRED_*_BIND"
+        );
         std::process::exit(1);
     }
 
     let mut handles = Vec::new();
     for pc in &ports {
         let log_path = log_dir.join(format!("{}.jsonl", pc.protocol));
-        match sensor_cred::start_listener(pc.bind, log_path, wan_resolver.clone(), bounds.clone(), pc.protocol).await {
+        match sensor_cred::start_listener(
+            pc.bind,
+            log_path,
+            wan_resolver.clone(),
+            bounds.clone(),
+            pc.protocol,
+        )
+        .await
+        {
             Ok((bound, handle)) => {
                 tracing::info!(protocol = pc.protocol, local = %bound, "sensor-cred: listening");
                 handles.push(handle);

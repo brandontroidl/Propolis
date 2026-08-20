@@ -372,7 +372,10 @@ mod tests {
         assert_eq!(entry.valid_from, coarsen_to_hour(now - Duration::hours(20)));
         assert_eq!(entry.valid_until, entry.valid_from + Duration::hours(24));
         // Four hours of validity left, not a fresh twenty-four.
-        assert_eq!(entry.valid_until - now, Duration::hours(3) + Duration::minutes(30));
+        assert_eq!(
+            entry.valid_until - now,
+            Duration::hours(3) + Duration::minutes(30)
+        );
     }
 
     #[test]

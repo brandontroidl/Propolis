@@ -1,4 +1,9 @@
-pub fn eligible(has_confirmed_real: bool, event_count: u32, _distinct_categories: u32, delisted: bool) -> bool {
+pub fn eligible(
+    has_confirmed_real: bool,
+    event_count: u32,
+    _distinct_categories: u32,
+    delisted: bool,
+) -> bool {
     !delisted && has_confirmed_real && event_count >= 2
 }
 

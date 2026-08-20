@@ -18,9 +18,7 @@ pub fn export_ipset(tier_name: &str, entries: &[FeedEntry]) -> String {
 
 pub fn export_nftables(tier_name: &str, entries: &[FeedEntry]) -> String {
     let set_name = format!("propolis_{tier_name}");
-    let mut out = format!(
-        "define {set_name} = {{\n"
-    );
+    let mut out = format!("define {set_name} = {{\n");
     for (i, entry) in entries.iter().enumerate() {
         if i > 0 {
             out.push_str(",\n");
@@ -54,7 +52,9 @@ pub fn export_pfsense_alias(_tier_name: &str, entries: &[FeedEntry]) -> String {
 }
 
 pub fn export_hosts(entries: &[FeedEntry]) -> String {
-    let mut out = String::from("# Propolis blocklist - reverse DNS sinkhole\n# IPv6 entries omitted (no reverse-DNS sinkhole format)\n");
+    let mut out = String::from(
+        "# Propolis blocklist - reverse DNS sinkhole\n# IPv6 entries omitted (no reverse-DNS sinkhole format)\n",
+    );
     for entry in entries {
         let ip = entry.source_ip;
         let reversed = match ip {

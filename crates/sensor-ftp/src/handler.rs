@@ -78,8 +78,11 @@ pub async fn handle_connection(
                 let _ = write_line(&mut reader, b"215 UNIX Type: L8\r\n").await;
             }
             "FEAT" => {
-                let _ = write_line(&mut reader, b"211-Features:\r\n PASV\r\n UTF8\r\n211 End\r\n")
-                    .await;
+                let _ = write_line(
+                    &mut reader,
+                    b"211-Features:\r\n PASV\r\n UTF8\r\n211 End\r\n",
+                )
+                .await;
             }
             "PWD" | "XPWD" => {
                 let _ = write_line(&mut reader, b"257 \"/\" is current directory\r\n").await;
@@ -90,46 +93,44 @@ pub async fn handle_connection(
             "TYPE" => {
                 let _ = write_line(&mut reader, b"200 Type set\r\n").await;
             }
-            "PASV" | "EPSV" => {
-                match TcpListener::bind("127.0.0.1:0").await {
-                    Ok(listener) => {
-                        let data_addr = listener.local_addr().unwrap();
-                        let resp = if cmd == "PASV" {
-                            let ip = data_addr.ip();
-                            let port = data_addr.port();
-                            let ip_str = match ip {
-                                IpAddr::V4(v4) => {
-                                    let o = v4.octets();
-                                    format!("{},{},{},{}", o[0], o[1], o[2], o[3])
-                                }
-                                IpAddr::V6(_) => "127,0,0,1".to_string(),
-                            };
-                            format!(
-                                "227 Entering Passive Mode ({},{},{}).\r\n",
-                                ip_str,
-                                port >> 8,
-                                port & 0xFF
-                            )
-                        } else {
-                            format!("229 Entering Extended Passive Mode (|||{}|)\r\n", data_addr.port())
+            "PASV" | "EPSV" => match TcpListener::bind("127.0.0.1:0").await {
+                Ok(listener) => {
+                    let data_addr = listener.local_addr().unwrap();
+                    let resp = if cmd == "PASV" {
+                        let ip = data_addr.ip();
+                        let port = data_addr.port();
+                        let ip_str = match ip {
+                            IpAddr::V4(v4) => {
+                                let o = v4.octets();
+                                format!("{},{},{},{}", o[0], o[1], o[2], o[3])
+                            }
+                            IpAddr::V6(_) => "127,0,0,1".to_string(),
                         };
-                        pasv_listener = Some(listener);
-                        let _ = write_line(&mut reader, resp.as_bytes()).await;
-                    }
-                    Err(_) => {
-                        let _ =
-                            write_line(&mut reader, b"425 Cannot open data connection\r\n").await;
-                    }
+                        format!(
+                            "227 Entering Passive Mode ({},{},{}).\r\n",
+                            ip_str,
+                            port >> 8,
+                            port & 0xFF
+                        )
+                    } else {
+                        format!(
+                            "229 Entering Extended Passive Mode (|||{}|)\r\n",
+                            data_addr.port()
+                        )
+                    };
+                    pasv_listener = Some(listener);
+                    let _ = write_line(&mut reader, resp.as_bytes()).await;
                 }
-            }
+                Err(_) => {
+                    let _ = write_line(&mut reader, b"425 Cannot open data connection\r\n").await;
+                }
+            },
             "LIST" | "NLST" => {
                 if let Some(ref listener) = pasv_listener {
                     let _ = write_line(&mut reader, b"150 Opening data connection\r\n").await;
-                    if let Ok(Ok((mut data, _))) = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        listener.accept(),
-                    )
-                    .await
+                    if let Ok(Ok((mut data, _))) =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                            .await
                     {
                         let _ = data.write_all(CANNED_LIST.as_bytes()).await;
                         drop(data);
@@ -143,11 +144,9 @@ pub async fn handle_connection(
                 let filename = sanitize_value(arg, 255);
                 if let Some(ref listener) = pasv_listener {
                     let _ = write_line(&mut reader, b"150 Opening data connection\r\n").await;
-                    if let Ok(Ok((mut data, _))) = tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        listener.accept(),
-                    )
-                    .await
+                    if let Ok(Ok((mut data, _))) =
+                        tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+                            .await
                     {
                         let mut body = Vec::new();
                         let mut chunk = [0u8; 4096];
@@ -326,7 +325,10 @@ mod tests {
         assert!(event.authenticated);
         assert_eq!(event.sensor, "ftp");
         assert_eq!(event.signal_type, SIGNAL_HONEYPOT_LOGIN_ATTEMPT);
-        assert_eq!(event.metadata.get("username").and_then(|v| v.as_str()), Some("admin"));
+        assert_eq!(
+            event.metadata.get("username").and_then(|v| v.as_str()),
+            Some("admin")
+        );
         assert!(event.metadata.get("password").is_none());
     }
 
@@ -334,6 +336,9 @@ mod tests {
     fn split_ftp_command_splits_correctly() {
         assert_eq!(split_ftp_command("USER admin"), ("USER", "admin"));
         assert_eq!(split_ftp_command("QUIT"), ("QUIT", ""));
-        assert_eq!(split_ftp_command("STOR /tmp/file name.bin"), ("STOR", "/tmp/file name.bin"));
+        assert_eq!(
+            split_ftp_command("STOR /tmp/file name.bin"),
+            ("STOR", "/tmp/file name.bin")
+        );
     }
 }

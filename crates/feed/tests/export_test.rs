@@ -42,10 +42,7 @@ fn sample_entries() -> Vec<FeedEntry> {
             // Deliberately different per entry, and deliberately not the same length as
             // `distinct_categories`: an exporter that emitted the count, or the wrong entry's
             // signals, would otherwise still match.
-            categories: vec![
-                "honeypot_command_exec".into(),
-                "ssh_brute_force".into(),
-            ],
+            categories: vec!["honeypot_command_exec".into(), "ssh_brute_force".into()],
             valid_from: dt(GENERATED),
             valid_until: dt(VALID_UNTIL),
         },
@@ -171,11 +168,9 @@ fn json_entries_have_exactly_the_documented_fields_no_more_no_less() {
         // would let a reader invert the model, and none of them are derivable from a label set.
         let signals = obj["signals"].as_array().expect("signals must be an array");
         assert!(
-            signals
-                .iter()
-                .all(|s| s.as_str().is_some_and(|s| s
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))),
+            signals.iter().all(|s| s.as_str().is_some_and(|s| s
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))),
             "signals must stay the closed wire vocabulary, never free-form text: {signals:?}"
         );
     }
@@ -238,7 +233,10 @@ fn csv_signal_column_is_semicolon_joined_so_it_can_never_introduce_a_comma() {
     let out = export_csv(&sample_entries());
     let first = out.lines().nth(1).unwrap();
     assert_eq!(first.split(',').count(), 6, "row: {first}");
-    assert!(first.ends_with("honeypot_command_exec;ssh_brute_force"), "row: {first}");
+    assert!(
+        first.ends_with("honeypot_command_exec;ssh_brute_force"),
+        "row: {first}"
+    );
 }
 
 #[test]

@@ -1,7 +1,7 @@
+use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::Html;
 use axum::routing::get;
-use axum::Router;
 use minijinja::context;
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +57,11 @@ async fn ip_list(
         .map(|r| IpRow {
             ip: r.ip,
             raw_score: format!("{:.1}", r.score),
-            tier: if r.tier.is_empty() { "-".into() } else { r.tier },
+            tier: if r.tier.is_empty() {
+                "-".into()
+            } else {
+                r.tier
+            },
             event_count: r.event_count,
             distinct_categories: r.distinct_categories,
             distinct_wan_count: r.distinct_wan_count,

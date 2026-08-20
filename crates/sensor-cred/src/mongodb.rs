@@ -48,7 +48,12 @@ pub async fn handle_connection(
         // Check if this is an OP_MSG (opcode 2013)
         if msg.opcode != OP_MSG {
             // Send a generic error for legacy opcodes
-            let _ = send_op_msg_reply(&mut stream, msg.request_id, r#"{"ok":0,"errmsg":"unsupported"}"#).await;
+            let _ = send_op_msg_reply(
+                &mut stream,
+                msg.request_id,
+                r#"{"ok":0,"errmsg":"unsupported"}"#,
+            )
+            .await;
             continue;
         }
 
@@ -61,7 +66,10 @@ pub async fn handle_connection(
         // Try to extract command name and username from the BSON-ish payload
         let payload_str = String::from_utf8_lossy(&msg.body[4..]);
 
-        if payload_str.contains("isMaster") || payload_str.contains("ismaster") || payload_str.contains("hello") {
+        if payload_str.contains("isMaster")
+            || payload_str.contains("ismaster")
+            || payload_str.contains("hello")
+        {
             let _ = send_op_msg_reply(
                 &mut stream,
                 msg.request_id,
@@ -121,7 +129,11 @@ async fn read_mongo_msg(stream: &mut TcpStream, timeout: std::time::Duration) ->
             .ok()?;
     }
 
-    Some(MongoMsg { request_id, opcode, body })
+    Some(MongoMsg {
+        request_id,
+        opcode,
+        body,
+    })
 }
 
 async fn send_op_msg_reply(stream: &mut TcpStream, request_id: i32, json: &str) -> Result<(), ()> {

@@ -42,10 +42,18 @@ enum ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConfigError::NoBind => write!(f, "{ENV_BIND} must be set to a single ip:port bind address"),
+            ConfigError::NoBind => {
+                write!(f, "{ENV_BIND} must be set to a single ip:port bind address")
+            }
             ConfigError::InvalidBind(s) => write!(f, "invalid {ENV_BIND} address {s:?}"),
-            ConfigError::InvalidWanMapEntry(s) => write!(f, "invalid {ENV_WAN_MAP} entry {s:?}, expected local_ip=wan_ip"),
-            ConfigError::InvalidBound { field, value } => write!(f, "{field} must be a positive integer, got {value:?} (zero never means unlimited)"),
+            ConfigError::InvalidWanMapEntry(s) => write!(
+                f,
+                "invalid {ENV_WAN_MAP} entry {s:?}, expected local_ip=wan_ip"
+            ),
+            ConfigError::InvalidBound { field, value } => write!(
+                f,
+                "{field} must be a positive integer, got {value:?} (zero never means unlimited)"
+            ),
         }
     }
 }
@@ -58,47 +66,98 @@ fn parse_wan_map(raw: &str) -> Result<HashMap<IpAddr, IpAddr>, ConfigError> {
         let (local, wan) = entry
             .split_once('=')
             .ok_or_else(|| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
-        let local: IpAddr = local.trim().parse().map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
-        let wan: IpAddr = wan.trim().parse().map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
+        let local: IpAddr = local
+            .trim()
+            .parse()
+            .map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
+        let wan: IpAddr = wan
+            .trim()
+            .parse()
+            .map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
         map.insert(local, wan);
     }
     Ok(map)
 }
 
-fn parse_positive_u64(raw: Option<&str>, default: u64, field: &'static str) -> Result<u64, ConfigError> {
+fn parse_positive_u64(
+    raw: Option<&str>,
+    default: u64,
+    field: &'static str,
+) -> Result<u64, ConfigError> {
     let Some(raw) = raw else { return Ok(default) };
-    let value: u64 = raw.parse().map_err(|_| ConfigError::InvalidBound { field, value: raw.to_string() })?;
+    let value: u64 = raw.parse().map_err(|_| ConfigError::InvalidBound {
+        field,
+        value: raw.to_string(),
+    })?;
     if value == 0 {
-        return Err(ConfigError::InvalidBound { field, value: raw.to_string() });
+        return Err(ConfigError::InvalidBound {
+            field,
+            value: raw.to_string(),
+        });
     }
     Ok(value)
 }
 
-fn parse_positive_u32(raw: Option<&str>, default: u32, field: &'static str) -> Result<u32, ConfigError> {
+fn parse_positive_u32(
+    raw: Option<&str>,
+    default: u32,
+    field: &'static str,
+) -> Result<u32, ConfigError> {
     let Some(raw) = raw else { return Ok(default) };
-    let value: u32 = raw.parse().map_err(|_| ConfigError::InvalidBound { field, value: raw.to_string() })?;
+    let value: u32 = raw.parse().map_err(|_| ConfigError::InvalidBound {
+        field,
+        value: raw.to_string(),
+    })?;
     if value == 0 {
-        return Err(ConfigError::InvalidBound { field, value: raw.to_string() });
+        return Err(ConfigError::InvalidBound {
+            field,
+            value: raw.to_string(),
+        });
     }
     Ok(value)
 }
 
 fn load_config_from_env() -> Result<Config, ConfigError> {
     let bind_raw = env::var(ENV_BIND).map_err(|_| ConfigError::NoBind)?;
-    let bind_addr: SocketAddr = bind_raw.trim().parse().map_err(|_| ConfigError::InvalidBind(bind_raw.clone()))?;
+    let bind_addr: SocketAddr = bind_raw
+        .trim()
+        .parse()
+        .map_err(|_| ConfigError::InvalidBind(bind_raw.clone()))?;
     let wan_map = parse_wan_map(&env::var(ENV_WAN_MAP).unwrap_or_default())?;
-    let log_path = env::var(ENV_LOG_PATH).map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_PATH));
+    let log_path = env::var(ENV_LOG_PATH)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_PATH));
 
     Ok(Config {
         bind_addr,
         wan_map,
         log_path,
         bounds: ConnectionBounds {
-            read_timeout: Duration::from_millis(parse_positive_u64(env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(), DEFAULT_READ_TIMEOUT_MS, ENV_READ_TIMEOUT_MS)?),
-            idle_timeout: Duration::from_millis(parse_positive_u64(env::var(ENV_IDLE_TIMEOUT_MS).ok().as_deref(), DEFAULT_IDLE_TIMEOUT_MS, ENV_IDLE_TIMEOUT_MS)?),
-            max_duration: Duration::from_secs(parse_positive_u64(env::var(ENV_MAX_DURATION_SECS).ok().as_deref(), DEFAULT_MAX_DURATION_SECS, ENV_MAX_DURATION_SECS)?),
-            max_captured_bytes: parse_positive_u64(env::var(ENV_MAX_CAPTURED_BYTES).ok().as_deref(), DEFAULT_MAX_CAPTURED_BYTES, ENV_MAX_CAPTURED_BYTES)?,
-            max_concurrent: parse_positive_u32(env::var(ENV_MAX_CONCURRENT).ok().as_deref(), DEFAULT_MAX_CONCURRENT, ENV_MAX_CONCURRENT)?,
+            read_timeout: Duration::from_millis(parse_positive_u64(
+                env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
+                DEFAULT_READ_TIMEOUT_MS,
+                ENV_READ_TIMEOUT_MS,
+            )?),
+            idle_timeout: Duration::from_millis(parse_positive_u64(
+                env::var(ENV_IDLE_TIMEOUT_MS).ok().as_deref(),
+                DEFAULT_IDLE_TIMEOUT_MS,
+                ENV_IDLE_TIMEOUT_MS,
+            )?),
+            max_duration: Duration::from_secs(parse_positive_u64(
+                env::var(ENV_MAX_DURATION_SECS).ok().as_deref(),
+                DEFAULT_MAX_DURATION_SECS,
+                ENV_MAX_DURATION_SECS,
+            )?),
+            max_captured_bytes: parse_positive_u64(
+                env::var(ENV_MAX_CAPTURED_BYTES).ok().as_deref(),
+                DEFAULT_MAX_CAPTURED_BYTES,
+                ENV_MAX_CAPTURED_BYTES,
+            )?,
+            max_concurrent: parse_positive_u32(
+                env::var(ENV_MAX_CONCURRENT).ok().as_deref(),
+                DEFAULT_MAX_CONCURRENT,
+                ENV_MAX_CONCURRENT,
+            )?,
         },
     })
 }
@@ -155,7 +214,10 @@ mod tests {
 
     #[test]
     fn parse_wan_map_rejects_malformed() {
-        assert!(matches!(parse_wan_map("not-valid"), Err(ConfigError::InvalidWanMapEntry(_))));
+        assert!(matches!(
+            parse_wan_map("not-valid"),
+            Err(ConfigError::InvalidWanMapEntry(_))
+        ));
     }
 
     #[test]
@@ -173,6 +235,9 @@ mod tests {
 
     #[test]
     fn parse_positive_u64_rejects_zero() {
-        assert!(matches!(parse_positive_u64(Some("0"), 42, "x"), Err(ConfigError::InvalidBound { .. })));
+        assert!(matches!(
+            parse_positive_u64(Some("0"), 42, "x"),
+            Err(ConfigError::InvalidBound { .. })
+        ));
     }
 }

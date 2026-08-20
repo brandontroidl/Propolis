@@ -359,7 +359,11 @@ where
 fn compute_padding_length_unencrypted(payload_len: usize) -> u8 {
     let base = 4 + 1 + payload_len;
     let remainder = base % BLOCK_SIZE;
-    let mut padding_length = if remainder == 0 { 0 } else { BLOCK_SIZE - remainder };
+    let mut padding_length = if remainder == 0 {
+        0
+    } else {
+        BLOCK_SIZE - remainder
+    };
     if padding_length < MIN_PADDING {
         padding_length += BLOCK_SIZE;
     }
@@ -372,7 +376,11 @@ fn compute_padding_length_unencrypted(payload_len: usize) -> u8 {
 fn compute_padding_length_encrypted(payload_len: usize) -> u8 {
     let base = 1 + payload_len;
     let remainder = base % BLOCK_SIZE;
-    let mut padding_length = if remainder == 0 { 0 } else { BLOCK_SIZE - remainder };
+    let mut padding_length = if remainder == 0 {
+        0
+    } else {
+        BLOCK_SIZE - remainder
+    };
     if padding_length < MIN_PADDING {
         padding_length += BLOCK_SIZE;
     }
@@ -589,8 +597,11 @@ mod tests {
             let padding_length = compute_padding_length_unencrypted(payload_len);
             assert!(padding_length as usize >= MIN_PADDING);
             let total = 4 + 1 + payload_len + padding_length as usize;
-            assert_eq!(total % BLOCK_SIZE, 0,
-                "payload_len={payload_len}: total wire frame {total} not block-aligned");
+            assert_eq!(
+                total % BLOCK_SIZE,
+                0,
+                "payload_len={payload_len}: total wire frame {total} not block-aligned"
+            );
         }
     }
 
@@ -600,8 +611,11 @@ mod tests {
             let padding_length = compute_padding_length_encrypted(payload_len);
             assert!(padding_length as usize >= MIN_PADDING);
             let body = 1 + payload_len + padding_length as usize;
-            assert_eq!(body % BLOCK_SIZE, 0,
-                "payload_len={payload_len}: encrypted body {body} not block-aligned");
+            assert_eq!(
+                body % BLOCK_SIZE,
+                0,
+                "payload_len={payload_len}: encrypted body {body} not block-aligned"
+            );
         }
     }
 

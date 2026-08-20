@@ -102,8 +102,11 @@ pub async fn handle_connection(
             rcpt_to.push(extract_angle_bracket(&line[8..]));
             let _ = write_reply(&mut reader, b"250 OK\r\n").await;
         } else if upper == "DATA" {
-            let _ = write_reply(&mut reader, b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
-                .await;
+            let _ = write_reply(
+                &mut reader,
+                b"354 Start mail input; end with <CRLF>.<CRLF>\r\n",
+            )
+            .await;
             let body = read_data_body(&mut reader, &bounds, &mut total_read).await;
             let subject = extract_header(&body, "Subject");
             let _ = emitter
@@ -360,13 +363,19 @@ mod tests {
             Uuid::now_v7(),
         );
         assert!(event.authenticated);
-        assert_eq!(event.metadata.get("username").and_then(|v| v.as_str()), Some("admin"));
+        assert_eq!(
+            event.metadata.get("username").and_then(|v| v.as_str()),
+            Some("admin")
+        );
         assert!(event.metadata.get("password").is_none());
     }
 
     #[test]
     fn extract_angle_bracket_works() {
-        assert_eq!(extract_angle_bracket("<user@example.com>"), "user@example.com");
+        assert_eq!(
+            extract_angle_bracket("<user@example.com>"),
+            "user@example.com"
+        );
         assert_eq!(extract_angle_bracket("  <a@b>  "), "a@b");
         assert_eq!(extract_angle_bracket("plain"), "plain");
     }

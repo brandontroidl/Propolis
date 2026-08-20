@@ -277,7 +277,10 @@ fn empty_feed_publishes_normally_with_zero_counts() {
     let agg_txt = std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap();
     assert!(agg_txt.contains("# Entries: 0"));
     let std_csv = std::fs::read_to_string(output_dir.join("standard.csv")).unwrap();
-    assert_eq!(std_csv, "ip,first_seen,last_seen,categories,events,signals\n");
+    assert_eq!(
+        std_csv,
+        "ip,first_seen,last_seen,categories,events,signals\n"
+    );
 }
 
 // ---------- manifest correctness ----------

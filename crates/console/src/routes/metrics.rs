@@ -152,8 +152,12 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, AppError> {
         }
     }
 
-    let ingested = state.events_ingested.load(std::sync::atomic::Ordering::Relaxed);
-    let rejected = state.events_rejected.load(std::sync::atomic::Ordering::Relaxed);
+    let ingested = state
+        .events_ingested
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let rejected = state
+        .events_rejected
+        .load(std::sync::atomic::Ordering::Relaxed);
     writeln!(out, "# HELP propolis_events_ingested_total Total events successfully ingested since process start.").unwrap();
     writeln!(out, "# TYPE propolis_events_ingested_total counter").unwrap();
     writeln!(out, "propolis_events_ingested_total {ingested}").unwrap();

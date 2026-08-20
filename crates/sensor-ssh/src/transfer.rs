@@ -562,7 +562,8 @@ mod tests {
         // count to keep the protocol state machine aligned with the wire (so the trailing
         // \0 and final ack still land correctly).
         let handoff = test_handoff();
-        let (mut scp, _initial) = ScpReceiver::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let (mut scp, _initial) =
+            ScpReceiver::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
 
         // Header declaring 12 MB (above the 10 MB cap).
         let declared: usize = 12_000_000;
@@ -593,7 +594,8 @@ mod tests {
         // SFTP_MAX_PACKET_SIZE. The handler must clear its buffer rather than accumulating
         // data toward that length.
         let handoff = test_handoff();
-        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let mut sftp =
+            SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
 
         // Forge a length header claiming 1 GB.
         let huge_len: u32 = 1_000_000_000;
@@ -620,7 +622,8 @@ mod tests {
         // immediately once the 4 bytes are present - it must not wait for body bytes
         // to arrive before checking.
         let handoff = test_handoff();
-        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let mut sftp =
+            SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
 
         let huge_len: u32 = 500_000;
         let response = sftp.feed(&huge_len.to_be_bytes());
@@ -644,7 +647,8 @@ mod tests {
         // delivers only 2 bytes (not enough to read the length), the second delivers the
         // remaining 2 bytes. The check must fire on the second feed.
         let handoff = test_handoff();
-        let mut sftp = SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let mut sftp =
+            SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
 
         let huge_len: u32 = 1_000_000;
         let header = huge_len.to_be_bytes();

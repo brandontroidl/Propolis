@@ -63,7 +63,13 @@ pub async fn start_test_server(
         let handoff = handoff.clone();
         async move {
             handler::handle_connection(
-                stream, peer, session_id, emitter, wan_resolver, bounds, handoff,
+                stream,
+                peer,
+                session_id,
+                emitter,
+                wan_resolver,
+                bounds,
+                handoff,
             )
             .await;
         }

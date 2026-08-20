@@ -360,9 +360,18 @@ async fn eligible_ip_without_approval_is_excluded_from_feed() {
 
     // Seed events that cross the eligibility gate (confirmed-real + multi-category),
     // but do NOT approve through the review queue.
-    append_event(&pool, ev(ip, SignalType::HoneypotMalwareUpload, Protocol::Tcp, true, now))
-        .await
-        .unwrap();
+    append_event(
+        &pool,
+        ev(
+            ip,
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            now,
+        ),
+    )
+    .await
+    .unwrap();
     append_event(
         &pool,
         ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
@@ -403,13 +412,25 @@ async fn entries_carry_the_distinct_signal_types_the_address_actually_triggered(
     // others - seeded out of alphabetical order so the sort is proven rather than coincidental.
     append_event(
         &pool,
-        ev(ip, SignalType::HoneypotMalwareUpload, Protocol::Tcp, true, now),
+        ev(
+            ip,
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            now,
+        ),
     )
     .await
     .unwrap();
     append_event(
         &pool,
-        ev(ip, SignalType::HoneypotMalwareUpload, Protocol::Tcp, true, now),
+        ev(
+            ip,
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            now,
+        ),
     )
     .await
     .unwrap();

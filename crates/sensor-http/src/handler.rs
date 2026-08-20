@@ -53,7 +53,6 @@ pub async fn handle_connection(
     };
 
     {
-
         let method = sanitize_value(&request.method, 16);
         let path = sanitize_value(&request.path, 2048);
         let user_agent = request
@@ -205,7 +204,11 @@ impl BoundedReader {
         }
     }
 
-    async fn parse_request(&mut self, header_end: usize, stream: &mut TcpStream) -> Option<HttpRequest> {
+    async fn parse_request(
+        &mut self,
+        header_end: usize,
+        stream: &mut TcpStream,
+    ) -> Option<HttpRequest> {
         let header_bytes = self.buf[..header_end].to_vec();
         // Drain the headers plus the \r\n\r\n separator
         self.buf.drain(..header_end + 4);
@@ -224,7 +227,10 @@ impl BoundedReader {
         // HTTP version is optional for robustness
 
         let (path, query) = if let Some(idx) = raw_path.find('?') {
-            (raw_path[..idx].to_string(), Some(raw_path[idx + 1..].to_string()))
+            (
+                raw_path[..idx].to_string(),
+                Some(raw_path[idx + 1..].to_string()),
+            )
         } else {
             (raw_path, None)
         };
@@ -275,8 +281,7 @@ impl BoundedReader {
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 #[cfg(test)]
@@ -291,7 +296,10 @@ mod tests {
         assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
         assert_eq!(event.protocol, PROTO_TCP);
         assert_eq!(
-            event.metadata.get("protocol_label").and_then(|v| v.as_str()),
+            event
+                .metadata
+                .get("protocol_label")
+                .and_then(|v| v.as_str()),
             Some("http")
         );
     }

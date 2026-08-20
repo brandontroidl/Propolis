@@ -97,7 +97,11 @@ struct Filters {
 impl Filters {
     fn from_params(p: &SearchParams) -> Self {
         Filters {
-            q: normalize(&p.q).map(|s| s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")),
+            q: normalize(&p.q).map(|s| {
+                s.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            }),
             sensor: normalize(&p.sensor),
             signal_type: normalize(&p.signal_type),
             ip: normalize(&p.ip),

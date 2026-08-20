@@ -269,12 +269,13 @@ async fn max_duration_aborts_long_running_handler() {
         ..test_bounds()
     };
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let (bound_addr, handle) = run_tcp_listener(addr, bounds, move |stream, _peer, _id| async move {
-        tokio::time::sleep(Duration::from_secs(3600)).await;
-        drop(stream); // never reached within this test's lifetime if max_duration works.
-    })
-    .await
-    .unwrap();
+    let (bound_addr, handle) =
+        run_tcp_listener(addr, bounds, move |stream, _peer, _id| async move {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(stream); // never reached within this test's lifetime if max_duration works.
+        })
+        .await
+        .unwrap();
 
     let mut conn = TcpStream::connect(bound_addr).await.unwrap();
     let mut buf = [0u8; 1];

@@ -56,7 +56,10 @@ impl DShield {
         mac.update(self.api_key.as_bytes());
         let hash = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
 
-        format!("ISC-HMAC-SHA256 Credentials={hash} Userid={} Nonce={nonce}", self.user_id)
+        format!(
+            "ISC-HMAC-SHA256 Credentials={hash} Userid={} Nonce={nonce}",
+            self.user_id
+        )
     }
 }
 

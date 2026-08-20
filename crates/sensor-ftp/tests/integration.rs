@@ -41,11 +41,19 @@ impl TestServer {
         )
         .await
         .unwrap();
-        TestServer { addr, log_path, spool_dir, handle, _dir: dir }
+        TestServer {
+            addr,
+            log_path,
+            spool_dir,
+            handle,
+            _dir: dir,
+        }
     }
 
     async fn events(&self) -> Vec<sensor_wire::SensorEvent> {
-        let content = tokio::fs::read_to_string(&self.log_path).await.unwrap_or_default();
+        let content = tokio::fs::read_to_string(&self.log_path)
+            .await
+            .unwrap_or_default();
         content
             .lines()
             .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad event: {e}: {l}")))
@@ -60,7 +68,9 @@ struct FtpClient {
 impl FtpClient {
     async fn connect(addr: std::net::SocketAddr) -> FtpClient {
         let stream = TcpStream::connect(addr).await.unwrap();
-        let mut client = FtpClient { reader: BufReader::new(stream) };
+        let mut client = FtpClient {
+            reader: BufReader::new(stream),
+        };
         let banner = client.read_reply().await;
         assert!(banner.starts_with("220"), "banner: {banner}");
         client
@@ -96,13 +106,15 @@ impl FtpClient {
         assert!(r.starts_with("227"), "PASV reply: {r}");
         parse_pasv_addr(&r)
     }
-
 }
 
 fn parse_pasv_addr(reply: &str) -> std::net::SocketAddr {
     let start = reply.find('(').unwrap() + 1;
     let end = reply.find(')').unwrap();
-    let nums: Vec<u8> = reply[start..end].split(',').map(|s| s.parse().unwrap()).collect();
+    let nums: Vec<u8> = reply[start..end]
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect();
     let ip = std::net::Ipv4Addr::new(nums[0], nums[1], nums[2], nums[3]);
     let port = (nums[4] as u16) << 8 | nums[5] as u16;
     std::net::SocketAddr::new(ip.into(), port)
@@ -115,10 +127,19 @@ async fn login_and_credential_capture() {
     client.login("admin", "secret123").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let events = srv.events().await;
-    let login = events.iter().find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT).unwrap();
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .unwrap();
     assert!(login.authenticated);
-    assert_eq!(login.metadata.get("username").and_then(|v| v.as_str()), Some("admin"));
-    assert!(login.metadata.get("password").is_none(), "password must never appear in events");
+    assert_eq!(
+        login.metadata.get("username").and_then(|v| v.as_str()),
+        Some("admin")
+    );
+    assert!(
+        login.metadata.get("password").is_none(),
+        "password must never appear in events"
+    );
     srv.handle.abort();
 }
 
@@ -128,7 +149,12 @@ async fn stor_upload_captured_in_spool() {
     let mut client = FtpClient::connect(srv.addr).await;
     client.login("root", "toor").await;
     let data_addr = client.pasv().await;
-    client.reader.get_mut().write_all(b"STOR /tmp/evil.bin\r\n").await.unwrap();
+    client
+        .reader
+        .get_mut()
+        .write_all(b"STOR /tmp/evil.bin\r\n")
+        .await
+        .unwrap();
     let r = client.read_reply().await;
     assert!(r.starts_with("150"), "STOR 150: {r}");
 
@@ -142,7 +168,10 @@ async fn stor_upload_captured_in_spool() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     let events = srv.events().await;
-    let upload = events.iter().find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD).unwrap();
+    let upload = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .unwrap();
     let sample = upload.sample.as_ref().unwrap();
     assert_eq!(sample.size, body.len() as u64);
 
@@ -150,7 +179,9 @@ async fn stor_upload_captured_in_spool() {
     let expected_hash = sensor_framework::to_hex_bounded(&Sha256::digest(body), 32);
     assert_eq!(sample.sha256, expected_hash);
 
-    let on_disk = tokio::fs::read(srv.spool_dir.join(&sample.sha256)).await.unwrap();
+    let on_disk = tokio::fs::read(srv.spool_dir.join(&sample.sha256))
+        .await
+        .unwrap();
     assert_eq!(on_disk, body);
     srv.handle.abort();
 }
@@ -187,7 +218,13 @@ async fn protocol_label_ftp_on_all_events() {
     for event in &events {
         assert_eq!(event.sensor, "ftp");
         assert_eq!(event.protocol, sensor_wire::PROTO_TCP);
-        assert_eq!(event.metadata.get("protocol_label").and_then(|v| v.as_str()), Some("ftp"));
+        assert_eq!(
+            event
+                .metadata
+                .get("protocol_label")
+                .and_then(|v| v.as_str()),
+            Some("ftp")
+        );
     }
     srv.handle.abort();
 }
@@ -207,7 +244,10 @@ fn never_exec_static_check() {
             found.push(entry.display().to_string());
         }
     }
-    assert!(found.is_empty(), "sensor-ftp must not spawn processes: {found:?}");
+    assert!(
+        found.is_empty(),
+        "sensor-ftp must not spawn processes: {found:?}"
+    );
 }
 
 #[tokio::test]
@@ -215,7 +255,9 @@ async fn malformed_input_does_not_crash_listener() {
     let srv = TestServer::start().await;
     for seed in 0..5u8 {
         if let Ok(mut conn) = TcpStream::connect(srv.addr).await {
-            let garbage: Vec<u8> = (0..2048u32).map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed)).collect();
+            let garbage: Vec<u8> = (0..2048u32)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed))
+                .collect();
             let _ = conn.write_all(&garbage).await;
             drop(conn);
         }
@@ -232,12 +274,24 @@ async fn no_outbound_connections() {
     let target_addr = target.local_addr().unwrap();
     let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let c = count.clone();
-    let task = tokio::spawn(async move { loop { if target.accept().await.is_ok() { c.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } } });
+    let task = tokio::spawn(async move {
+        loop {
+            if target.accept().await.is_ok() {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
 
     let srv = TestServer::start().await;
     let mut client = FtpClient::connect(srv.addr).await;
     client.login("root", "x").await;
-    let r = client.send(&format!("PORT 127,0,0,1,{},{}", target_addr.port() >> 8, target_addr.port() & 0xFF)).await;
+    let r = client
+        .send(&format!(
+            "PORT 127,0,0,1,{},{}",
+            target_addr.port() >> 8,
+            target_addr.port() & 0xFF
+        ))
+        .await;
     assert!(r.starts_with("502"));
     let r = client.send("RETR /etc/passwd").await;
     assert!(r.starts_with("550"));
@@ -245,7 +299,11 @@ async fn no_outbound_connections() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     srv.handle.abort();
     task.abort();
-    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0, "sensor-ftp must open zero outbound connections");
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "sensor-ftp must open zero outbound connections"
+    );
 }
 
 #[tokio::test]
@@ -255,7 +313,12 @@ async fn list_returns_canned_directory() {
     client.login("root", "x").await;
     let data_addr = client.pasv().await;
 
-    client.reader.get_mut().write_all(b"LIST\r\n").await.unwrap();
+    client
+        .reader
+        .get_mut()
+        .write_all(b"LIST\r\n")
+        .await
+        .unwrap();
     let r = client.read_reply().await;
     assert!(r.starts_with("150"), "LIST 150: {r}");
 
@@ -275,8 +338,11 @@ fn walk_rs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() { walk(&path, files); }
-                else if path.extension().is_some_and(|e| e == "rs") { files.push(path); }
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
             }
         }
     }

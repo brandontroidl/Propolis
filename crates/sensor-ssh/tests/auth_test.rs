@@ -4,8 +4,8 @@
 //! socket, no live server.
 
 use proptest::prelude::*;
-use sensor_ssh::auth::{AuthError, AuthState};
 use sensor_framework::Uuid;
+use sensor_ssh::auth::{AuthError, AuthState};
 use sensor_ssh::channel::{
     ChannelAction, ChannelError, handle_channel_open, handle_channel_request,
 };

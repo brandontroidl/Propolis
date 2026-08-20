@@ -1,8 +1,8 @@
-pub mod vnc;
-pub mod mysql;
-pub mod mssql;
-pub mod postgresql;
 pub mod mongodb;
+pub mod mssql;
+pub mod mysql;
+pub mod postgresql;
+pub mod vnc;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,10 +22,46 @@ pub async fn start_listener(
 
     match protocol {
         "vnc" => start_with(addr, bounds, emitter, wan_resolver, vnc::handle_connection).await,
-        "mysql" => start_with(addr, bounds, emitter, wan_resolver, mysql::handle_connection).await,
-        "mssql" => start_with(addr, bounds, emitter, wan_resolver, mssql::handle_connection).await,
-        "postgresql" => start_with(addr, bounds, emitter, wan_resolver, postgresql::handle_connection).await,
-        "mongodb" => start_with(addr, bounds, emitter, wan_resolver, mongodb::handle_connection).await,
+        "mysql" => {
+            start_with(
+                addr,
+                bounds,
+                emitter,
+                wan_resolver,
+                mysql::handle_connection,
+            )
+            .await
+        }
+        "mssql" => {
+            start_with(
+                addr,
+                bounds,
+                emitter,
+                wan_resolver,
+                mssql::handle_connection,
+            )
+            .await
+        }
+        "postgresql" => {
+            start_with(
+                addr,
+                bounds,
+                emitter,
+                wan_resolver,
+                postgresql::handle_connection,
+            )
+            .await
+        }
+        "mongodb" => {
+            start_with(
+                addr,
+                bounds,
+                emitter,
+                wan_resolver,
+                mongodb::handle_connection,
+            )
+            .await
+        }
         _ => panic!("unknown protocol: {protocol}"),
     }
 }

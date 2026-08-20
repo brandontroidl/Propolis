@@ -30,8 +30,8 @@ mod scoring;
 pub use domain::enums::{Category, FeedTier, Protocol, ReviewState, SignalType};
 pub use domain::types::{EventInput, IpScore, ValidationError};
 pub use domain::weights::{SignalWeight, signal_weight};
+pub use net::is_reserved_ip;
 pub use repository::{
     ChainStatus, RepoError, append_event, read_score, rebuild_projection, verify_chain,
 };
-pub use net::is_reserved_ip;
 pub use scoring::breadth::effective_score;

@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -22,6 +22,7 @@ use crate::scoring::breadth::effective_score;
 use crate::scoring::constants::SCORE_CAP;
 use crate::scoring::decay::decay;
 use crate::scoring::eligibility::eligible;
+use crate::scoring::persistence::persistence_points;
 use crate::scoring::tier::{recommended_for_blocklist, recommended_for_vendor, tier};
 
 /// Per-category accumulator stored inside `IpScore.category_breakdown`.
@@ -68,6 +69,8 @@ pub fn apply_event(
         prev_event_count,
         prev_has_confirmed_real,
         delisted,
+        prev_active_days,
+        prev_last_active_day,
     ) = match prev {
         None => (
             dec!(0),
@@ -76,6 +79,8 @@ pub fn apply_event(
             0i32,
             false,
             false,
+            0i32,
+            None::<NaiveDate>,
         ),
         Some(p) => {
             let elapsed = (now - p.decay_anchor).num_seconds();
@@ -93,7 +98,26 @@ pub fn apply_event(
                 p.event_count,
                 p.has_confirmed_real,
                 p.delisted,
+                p.active_days,
+                Some(p.last_active_day),
             )
+        }
+    };
+
+    // Distinct-active-day counter (never decays): this event opens a new active day iff its UTC
+    // date is strictly later than the last one counted. Same-day repeats and out-of-order older
+    // events do not add a day. Computed here in the pure fold so the incremental path and a full
+    // replay (which folds these same events in order) produce an identical count.
+    let event_day = now.date_naive();
+    let (active_days, last_active_day) = match prev_last_active_day {
+        None => (1, event_day),
+        Some(last) => {
+            let days = if event_day > last {
+                prev_active_days + 1
+            } else {
+                prev_active_days
+            };
+            (days, std::cmp::max(last, event_day))
         }
     };
 
@@ -127,6 +151,8 @@ pub fn apply_event(
         event_count,
         distinct_wan_count,
         distinct_sensor_count,
+        active_days,
+        last_active_day,
         first_seen,
         now,
         now,
@@ -147,6 +173,8 @@ fn derive_projection(
     event_count: i32,
     distinct_wan_count: i32,
     distinct_sensor_count: i32,
+    active_days: i32,
+    last_active_day: NaiveDate,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
     decay_anchor: DateTime<Utc>,
@@ -168,8 +196,17 @@ fn derive_projection(
         distinct_categories as u32,
         delisted,
     );
-    let effective = effective_score(raw_score, distinct_wan_count as u32);
-    let feed_tier = tier(raw_score, max_confidence); // RAW score, not effective.
+    // Persistence lifts the GATE-facing score, never the stored raw. A methodical attacker seen
+    // across many distinct days climbs the tiers even though the 6h decay keeps each day's raw
+    // low; the stored raw_score stays the decayed accumulation so the next decay cannot
+    // double-count the bonus. The confidence axis of `tier` and the `eligible` gate still apply,
+    // so a persistent low-confidence scanner is lifted but never actually promoted.
+    let gated_raw = std::cmp::min(
+        SCORE_CAP,
+        raw_score + persistence_points(active_days as i64),
+    );
+    let effective = effective_score(gated_raw, distinct_wan_count as u32);
+    let feed_tier = tier(gated_raw, max_confidence); // gated raw (base + persistence), not effective.
     let rec_vendor = recommended_for_vendor(is_eligible, feed_tier);
     let rec_blocklist = recommended_for_blocklist(is_eligible, effective);
 
@@ -188,6 +225,8 @@ fn derive_projection(
         has_confirmed_real,
         distinct_wan_count,
         distinct_sensor_count,
+        active_days,
+        last_active_day,
         first_seen,
         last_seen,
         eligible: is_eligible,
@@ -224,6 +263,8 @@ pub(crate) fn project_to_now(
         stored.event_count,
         stored.distinct_wan_count,
         stored.distinct_sensor_count,
+        stored.active_days,
+        stored.last_active_day,
         stored.first_seen,
         stored.last_seen,
         now,
@@ -282,6 +323,115 @@ mod tests {
         let e2 = udp_probe_event("2026-07-20T00:00:00Z"); // days later, decayed
         let s2 = apply_event(Some(s1), &e2, HALF_LIFE, false, 1, 1);
         assert!(s2.has_confirmed_real); // still true, never unset
+    }
+
+    fn command_exec_at(when: DateTime<Utc>) -> EventInput {
+        EventInput::from_signal(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            "sensor-a".into(),
+            SignalType::HoneypotCommandExec, // weight 60, conf 0.950, honeypot
+            Protocol::Tcp,
+            true,
+            when,
+            serde_json::json!({}),
+            None,
+        )
+    }
+
+    /// Fold `days` once-a-day command-exec events for one IP, 24h apart (far past the 60s dedup
+    /// window, so each adds weight). A once-a-day attacker's base raw converges to ~64 (60 plus the
+    /// residual of four half-lives of decay), which never reaches a tier on its own - persistence
+    /// is what promotes it.
+    fn daily_command_exec(days: i64) -> IpScore {
+        let start = ts("2026-01-01T00:00:00Z");
+        let mut acc: Option<IpScore> = None;
+        for d in 0..days {
+            let e = command_exec_at(start + Duration::days(d));
+            acc = Some(apply_event(acc, &e, HALF_LIFE, false, 1, 1));
+        }
+        acc.unwrap()
+    }
+
+    #[test]
+    fn active_days_counts_distinct_days_not_events() {
+        // Three events in ONE day -> 1 active day (a burst is not persistence).
+        let start = ts("2026-01-01T00:00:00Z");
+        let mut acc: Option<IpScore> = None;
+        for h in [0i64, 1, 2] {
+            let e = command_exec_at(start + Duration::hours(h));
+            acc = Some(apply_event(acc, &e, HALF_LIFE, false, 1, 1));
+        }
+        assert_eq!(acc.unwrap().active_days, 1);
+        // Three events on three distinct days -> 3 active days.
+        assert_eq!(daily_command_exec(3).active_days, 3);
+    }
+
+    #[test]
+    fn short_lived_addresses_are_scored_exactly_as_before_persistence() {
+        // At <= PERSIST_GRACE_DAYS the bonus is 0, so a base-~64 attacker is NOT tiered: the
+        // persistence change is inert for short-lived addresses (both directions of the guard).
+        let s = daily_command_exec(2);
+        assert_eq!(s.active_days, 2);
+        assert!(
+            s.raw_score < dec!(75),
+            "base raw {} unexpectedly >= 75",
+            s.raw_score
+        );
+        assert_eq!(s.tier, None);
+    }
+
+    #[test]
+    fn thirty_active_days_reaches_standard() {
+        let s = daily_command_exec(30);
+        assert_eq!(s.active_days, 30);
+        // The stored base raw stays below Standard on its own; only persistence lifts the gate.
+        assert!(
+            s.raw_score < dec!(75),
+            "base raw {} should stay below Standard",
+            s.raw_score
+        );
+        assert_eq!(s.tier, Some(crate::domain::enums::FeedTier::Standard));
+    }
+
+    #[test]
+    fn sixty_active_days_reaches_aggressive() {
+        let s = daily_command_exec(60);
+        assert_eq!(s.active_days, 60);
+        // Command-exec confidence (0.95) clears the AGGRESSIVE confidence axis; persistence carries
+        // the score axis over 90.
+        assert_eq!(s.tier, Some(crate::domain::enums::FeedTier::Aggressive));
+    }
+
+    #[test]
+    fn persistent_low_confidence_scanner_is_never_promoted() {
+        // A once-a-day port-scanner over 90 distinct days: the persistence bonus lifts the gate
+        // score, but PortScan confidence (0.60) never clears even the STANDARD 0.70 axis, and it is
+        // not confirmed-real, so it stays untiered and unrecommended. Persistence cannot promote noise.
+        let start = ts("2026-01-01T00:00:00Z");
+        let mut acc: Option<IpScore> = None;
+        for d in 0..90 {
+            let e = udp_probe_event_at(start + Duration::days(d));
+            acc = Some(apply_event(acc, &e, HALF_LIFE, false, 1, 1));
+        }
+        let s = acc.unwrap();
+        assert_eq!(s.active_days, 90);
+        assert_eq!(s.tier, None);
+        assert!(!s.recommended_for_vendor);
+    }
+
+    fn udp_probe_event_at(when: DateTime<Utc>) -> EventInput {
+        EventInput::from_signal(
+            "198.51.100.9".parse().unwrap(),
+            None,
+            "sensor-a".into(),
+            SignalType::PortScan, // weight 20, conf 0.600, network, never confirmed-real
+            Protocol::Udp,
+            false,
+            when,
+            serde_json::json!({}),
+            None,
+        )
     }
 
     /// A high-confidence category whose weight decays below the 0.5 live floor

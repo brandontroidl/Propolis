@@ -20,3 +20,22 @@ pub const BREADTH_CAP: Decimal = dec!(0.60);
 
 /// Minimum effective score to qualify for blocklist recommendation.
 pub const BLOCKLIST_FLOOR: Decimal = dec!(50);
+
+/// Persistence bonus - distinct-active-day points ADDED to the gate-facing score, so slow but
+/// methodical attackers that the 6h decay would otherwise erase still earn their way onto the
+/// tiers. The day count is unbounded and never decays (`ip_score.active_days`); the bonus itself
+/// saturates at [`PERSIST_CAP`]. Additive, not multiplicative: a fixed day->tier mapping cannot be
+/// hit by a multiplier, whose effect scales with per-session intensity.
+///
+/// Calibrated so a once-a-day authenticated attacker (command-exec, base ~60) reaches STANDARD
+/// (75) at ~30 distinct active days and AGGRESSIVE (90) at ~60. Short-lived addresses accrue
+/// nothing (grace), so their score is unchanged from before persistence existed. The confidence
+/// and eligibility gates still apply, so a persistent low-confidence scanner is never promoted.
+pub const PERSIST_PER_DAY: Decimal = dec!(0.55);
+
+/// Distinct active days that earn no bonus. Two days is not persistence, and matches the
+/// `event_count >= 2` eligibility floor - below this the score is byte-for-byte what it was.
+pub const PERSIST_GRACE_DAYS: i64 = 2;
+
+/// Upper bound on the persistence bonus, in score points.
+pub const PERSIST_CAP: Decimal = dec!(60);

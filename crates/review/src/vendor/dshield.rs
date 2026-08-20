@@ -63,22 +63,22 @@ impl DShield {
     }
 }
 
-fn log_type_for_tag(tag: &str) -> &str {
-    match tag {
-        "ssh" => "sshlogin",
-        "telnet" => "telnetlogin",
-        _ => "firewall",
-    }
-}
-
-fn well_known_port(tag: &str) -> u16 {
-    match tag {
-        "ssh" => 22,
-        "telnet" => 23,
-        "ftp" => 21,
-        _ => 0,
-    }
-}
+/// The log-type this adapter submits under, and the schema `LogEntry` below implements.
+///
+/// ISC accepts several (`firewall`, `sshlogin`, `telnetlogin`, `404report`, `httprequest`,
+/// `webhoneypot`, `cowrie`), each with its OWN per-entry field names, and it does not reject an
+/// entry whose fields it does not recognise - it answers `OK <n> Bytes received` and drops the
+/// record. That is precisely what happened here: entries were sent as `{time, source, port}`,
+/// which matches no schema ISC defines, so every submission was accepted and none was ever
+/// attributed to the account.
+///
+/// `cowrie` is the honeypot-session schema, verified against Cowrie's own DShield output plugin
+/// (`cowrie/src/cowrie/output/dshield.py`). It is used here in preference to `firewall` because
+/// it needs no field this crate would have to invent: the `firewall` schema wants
+/// `sip`/`dip`/`sport`/`dport`/`proto`, of which only the source IP is actually known at
+/// submission time - a destination IP and an attacker source port would both have to be
+/// fabricated or omitted, and a fabricated field is how a record gets silently dropped.
+const LOG_TYPE: &str = "cowrie";
 
 #[derive(serde::Serialize)]
 struct SubmitPayload {
@@ -87,11 +87,23 @@ struct SubmitPayload {
     authheader: String,
 }
 
+/// One honeypot session, in ISC's `cowrie` schema.
+///
+/// `user` and `last_command` are carried as empty strings rather than omitted: the fields are part
+/// of the schema, and this crate's `VendorReport` does not currently thread the captured username
+/// or command through to the vendor layer. Populating them is a worthwhile follow-up - both are
+/// already captured per session - but it means transmitting attacker-supplied strings to a third
+/// party, which is an operator's decision to make rather than a detail to slip in with a bug fix.
+///
+/// There is deliberately no `password` field even though the schema defines one. This honeypot
+/// drops captured passwords immediately by design and has none to send.
 #[derive(serde::Serialize)]
 struct LogEntry {
-    time: i64,
-    source: String,
-    port: u16,
+    timestamp: String,
+    source_ip: String,
+    user: String,
+    #[serde(rename = "lastcommand")]
+    last_command: String,
 }
 
 #[async_trait]
@@ -109,17 +121,15 @@ impl VendorAdapter for DShield {
         }
 
         let url = format!("{}/submitapi/", self.base_url);
-        let tag = report.categories.first().map(String::as_str).unwrap_or("");
-        let log_type = log_type_for_tag(tag);
-
         let auth_header = self.build_auth_header();
 
         let payload = SubmitPayload {
-            r#type: log_type.to_string(),
+            r#type: LOG_TYPE.to_string(),
             logs: vec![LogEntry {
-                time: report.evidence_window.1.timestamp(),
-                source: report.source_ip.to_string(),
-                port: well_known_port(tag),
+                timestamp: report.evidence_window.1.to_rfc3339(),
+                source_ip: report.source_ip.to_string(),
+                user: String::new(),
+                last_command: String::new(),
             }],
             authheader: auth_header.clone(),
         };
@@ -128,7 +138,7 @@ impl VendorAdapter for DShield {
             .client
             .post(url)
             .header("X-ISC-Authorization", &auth_header)
-            .header("X-ISC-LogType", log_type)
+            .header("X-ISC-LogType", LOG_TYPE)
             .header("User-Agent", "Propolis/0.1")
             .json(&payload);
 

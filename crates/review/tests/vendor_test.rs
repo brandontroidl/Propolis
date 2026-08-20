@@ -433,22 +433,49 @@ async fn dshield_payload_has_ip_port_and_protocol() {
         auth.starts_with("ISC-HMAC-SHA256 Credentials=") && auth.contains("Userid=test-user"),
         "unexpected auth header: {auth}"
     );
-    // ISC's own log-type vocabulary, not the protocol tag: "telnetlogin", not "telnet".
     assert_eq!(
         captured.headers.get("x-isc-logtype").map(String::as_str),
-        Some("telnetlogin")
+        Some("cowrie")
     );
 
     let json: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
-    assert_eq!(json["type"], "telnetlogin");
+    assert_eq!(json["type"], "cowrie");
     assert_eq!(
         json["authheader"], *auth,
         "the body's authheader must carry the same credential as the header"
     );
+    // The entry must use ISC's OWN field names for the declared log type. This is the assertion
+    // that was missing: ISC does not reject an entry whose fields it cannot read - it answers
+    // "OK <n> Bytes received" and silently drops the record - so the adapter looked healthy for
+    // weeks while sending {time, source, port}, which matches no schema ISC defines, and not one
+    // submission was ever attributed to the account. Field names verified against Cowrie's own
+    // DShield output plugin.
     let log = &json["logs"][0];
-    assert_eq!(log["source"], "203.0.113.50");
-    assert_eq!(log["port"], 23);
-    assert!(log.get("time").is_some());
+    let mut keys: Vec<&str> = log
+        .as_object()
+        .expect("log entry object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["lastcommand", "source_ip", "timestamp", "user"],
+        "entry must carry exactly ISC's cowrie-schema fields"
+    );
+    assert_eq!(log["source_ip"], "203.0.113.50");
+    assert!(
+        log["timestamp"].as_str().is_some_and(|t| t.contains('T')),
+        "timestamp must be RFC 3339, got {:?}",
+        log["timestamp"]
+    );
+
+    // Never a password field: this honeypot drops captured passwords on capture and has none to
+    // send, so the schema's password slot must stay absent rather than be filled with a blank.
+    assert!(
+        log.get("password").is_none(),
+        "a password must never be transmitted to a third party"
+    );
 }
 
 #[tokio::test]

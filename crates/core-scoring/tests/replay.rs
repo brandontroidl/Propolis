@@ -103,10 +103,18 @@ async fn rebuild_projection_empty_source_returns_none(pool: PgPool) -> Result<()
     Ok(())
 }
 
-/// read_score must re-derive the gate flags at read time. An IP eligible + tiered at write whose
-/// categories have long since decayed below the 0.5 live floor must read back eligible=false /
-/// tier=None, not the stale write-time flags (a consumer reporting off stale flags would file a
-/// vendor report for a near-zero-score IP - the false-tier the design guards against).
+/// read_score must re-derive the DECAY-DERIVED gate flags at read time. An IP tiered at write
+/// whose categories have long since decayed below the 0.5 live floor must read back tier=None and
+/// recommended_for_vendor=false, not the stale write-time flags - a consumer reporting off those
+/// would file a vendor report for a near-zero-score address.
+///
+/// `eligible` is deliberately NOT in that set and must stay true. It is derived from
+/// `has_confirmed_real` (a sticky latch) and `event_count` (monotonic), neither of which decays:
+/// an address that genuinely authenticated to a honeypot twice did so permanently, and eligibility
+/// records that fact rather than current threat level. This test previously asserted eligible
+/// flipped to false, which was correct only before eligibility stopped requiring multiple live
+/// categories; it kept passing nowhere because the CI gate died at the format step before ever
+/// reaching the tests.
 #[sqlx::test(migrations = "./migrations")]
 async fn read_score_rederives_stale_flags_after_decay(pool: PgPool) -> Result<(), RepoError> {
     // Far-past events: eligible + tiered at write; by "now" (years later, thousands of
@@ -135,10 +143,20 @@ async fn read_score_rederives_stale_flags_after_decay(pool: PgPool) -> Result<()
     let now = read_score(&pool, IP.parse().unwrap())
         .await?
         .expect("row exists");
-    assert!(!now.eligible, "read_score returned a stale eligible flag");
     assert!(now.tier.is_none(), "read_score returned a stale tier");
-    assert!(!now.recommended_for_vendor);
+    assert!(
+        !now.recommended_for_vendor,
+        "a fully-decayed address must not be recommended to vendors"
+    );
+    assert!(
+        !now.recommended_for_blocklist,
+        "a fully-decayed address must not be recommended for the blocklist"
+    );
     assert!(now.has_confirmed_real, "sticky latch must not decay");
+    assert!(
+        now.eligible,
+        "eligibility records a fact about the past and must not decay away"
+    );
     Ok(())
 }
 

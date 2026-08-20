@@ -32,9 +32,12 @@ fn write_event_line(path: &std::path::Path, event: &SensorEvent) {
     writeln!(f, "{line}").unwrap();
 }
 
-#[tokio::test]
-async fn ingest_single_event_appears_in_ledger() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn ingest_single_event_appears_in_ledger(pool: PgPool) {
+    sqlx::migrate!("../core-scoring/migrations")
+        .run(&pool)
+        .await
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("events.jsonl");
 
@@ -65,12 +68,14 @@ async fn ingest_single_event_appears_in_ledger() {
     assert!(score.is_some());
     let score = score.unwrap();
     assert!(score.has_confirmed_real);
-    // NOT eligible: core_scoring::scoring::eligibility::eligible requires event_count >= 2 AND
-    // distinct_categories >= 2 (the anti-spoof two-corroborating-signals gate), and this batch
-    // ingested exactly one event in one category. Asserting `eligible` here would mean either
-    // this test or the gate is wrong; the gate is deliberate and covered by its own tests
-    // (core-scoring's `eligibility_requires_all_three_legs` and the end-to-end scenario (B) in
-    // core-scoring/tests/end_to_end.rs), so this test asserts the real, intended behavior instead.
+    // NOT eligible: `core_scoring::scoring::eligibility::eligible` requires event_count >= 2 (the
+    // anti-spoof corroboration gate) and this batch ingested exactly one event. The gate is
+    // deliberate and covered by its own tests, so this asserts the intended behaviour rather than
+    // restating the implementation.
+    //
+    // This is why the test needs its own database: `event_count` accumulates permanently per
+    // source IP, so on the shared, never-reset database a second run of this same test would push
+    // the count to 2 and flip the assertion. It passed once and failed on re-run.
     assert!(!score.eligible);
 }
 
@@ -128,9 +133,20 @@ async fn unknown_signal_type_rejected_cursor_advances() {
     assert!(score.is_some());
 }
 
-#[tokio::test]
-async fn hash_chain_intact_after_ingestion() {
-    let pool = setup_pool().await;
+/// Runs on its OWN database, unlike every other test in this file.
+///
+/// `verify_chain` is a whole-table assertion: it walks every row in `event` and checks the hash
+/// linkage end to end. On the database this suite otherwise shares, other crates' tests legitimately
+/// `DELETE FROM event` to reset their own fixtures, and deleting any row from a hash-chained table
+/// severs the chain - so this test failed for a reason that had nothing to do with intake, and would
+/// fail for every future run of `cargo test --workspace` against one database. A global assertion
+/// needs an isolated database by its nature; the per-IP tests around it do not.
+#[sqlx::test(migrations = false)]
+async fn hash_chain_intact_after_ingestion(pool: PgPool) {
+    sqlx::migrate!("../core-scoring/migrations")
+        .run(&pool)
+        .await
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("events.jsonl");
 

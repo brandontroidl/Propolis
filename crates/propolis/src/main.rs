@@ -66,8 +66,10 @@ async fn run_intake_sensor(
         let result = runner.run_batch().await;
 
         if result.ingested > 0 || result.rejected > 0 || result.errors > 0 {
-            ingested_counter.fetch_add(result.ingested as u64, std::sync::atomic::Ordering::Relaxed);
-            rejected_counter.fetch_add(result.rejected as u64, std::sync::atomic::Ordering::Relaxed);
+            ingested_counter
+                .fetch_add(result.ingested as u64, std::sync::atomic::Ordering::Relaxed);
+            rejected_counter
+                .fetch_add(result.rejected as u64, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 sensor = %name,
                 ingested = result.ingested,
@@ -186,8 +188,12 @@ async fn run_feed_loop(
     }
 }
 
-/// Console web server. Mirrors `console/src/main.rs`.
-async fn run_console(
+/// What the console subsystem needs from the daemon at startup.
+///
+/// Grouped rather than passed as a long parameter list: this had grown to nine positional
+/// arguments, four of them `Arc`s of similar shape, which is exactly the arrangement where a
+/// caller silently swaps two and nothing complains. Named fields make the call site checkable.
+struct ConsoleRuntime {
     pool: PgPool,
     bind_addr: SocketAddr,
     password: String,
@@ -196,8 +202,20 @@ async fn run_console(
     log_buffer: Arc<LogBuffer>,
     events_ingested: Arc<std::sync::atomic::AtomicU64>,
     events_rejected: Arc<std::sync::atomic::AtomicU64>,
-    cancel: CancellationToken,
-) {
+}
+
+/// Console web server. Mirrors `console/src/main.rs`.
+async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
+    let ConsoleRuntime {
+        pool,
+        bind_addr,
+        password,
+        session_secret,
+        feed_output_dir,
+        log_buffer,
+        events_ingested,
+        events_rejected,
+    } = rt;
     let passwords = Arc::new(PasswordStore::new(&password));
     let state = AppState {
         db: pool,
@@ -405,7 +423,8 @@ async fn main() {
                 let ing = ing.clone();
                 let rej = rej.clone();
                 async move {
-                    run_intake_sensor(sensor, pool, cursor_dir, poll_interval, token, ing, rej).await;
+                    run_intake_sensor(sensor, pool, cursor_dir, poll_interval, token, ing, rej)
+                        .await;
                 }
             },
         ));
@@ -549,14 +568,16 @@ async fn main() {
             let rej = rej.clone();
             async move {
                 run_console(
-                    pool,
-                    bind,
-                    password,
-                    session_secret,
-                    feed_dir,
-                    log_buffer,
-                    ing,
-                    rej,
+                    ConsoleRuntime {
+                        pool,
+                        bind_addr: bind,
+                        password,
+                        session_secret,
+                        feed_output_dir: feed_dir,
+                        log_buffer,
+                        events_ingested: ing,
+                        events_rejected: rej,
+                    },
                     token,
                 )
                 .await;

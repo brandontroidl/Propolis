@@ -2,9 +2,14 @@
 //!
 //! Shares the persistent `propolis_test` database with the other crates'
 //! tests (see the project's `local-gate-toolchain` note). Every test uses a
-//! distinct source IP (RFC5737 documentation range, `203.0.113.240-247`,
-//! disjoint from `queue_test.rs`'s `192.0.2.210-214`/`198.51.100.215/217`/
-//! `203.0.113.216` and `gatekeeper_test.rs`'s `203.0.113.230-239`). Most
+//! distinct source IP, `45.10.32.240-247`, disjoint from `queue_test.rs`'s
+//! RFC5737 fixtures and from `gatekeeper_test.rs`'s `45.10.31.230-240`.
+//!
+//! These are ordinary public addresses, not the RFC5737 documentation ranges
+//! used elsewhere, and must stay that way: the gatekeeper's first check
+//! refuses every reserved range outright, so a documentation-range fixture is
+//! held as `Reserved` before the runner behaviour under test is ever reached.
+//! Most
 //! tests use a vendor name unique to that test so no cross-run cleanup
 //! beyond the per-IP `reset` below is needed; the one test that exercises
 //! the REAL `"dshield"` name (to prove `submit::categories_for_vendor`'s
@@ -367,7 +372,7 @@ async fn seed_and_approve(pool: &PgPool, ip: &str) {
 #[tokio::test]
 async fn run_once_submits_with_real_protocol_label_mapping() {
     let pool = setup_pool().await;
-    let ip = "203.0.113.240";
+    let ip = "45.10.32.240";
     let ip_addr: IpAddr = ip.parse().unwrap();
     reset(&pool, ip).await;
     reset_vendor(&pool, "dshield").await;
@@ -408,7 +413,7 @@ async fn run_once_submits_with_real_protocol_label_mapping() {
 #[tokio::test]
 async fn run_once_holds_disabled_vendor_without_writing_a_row() {
     let pool = setup_pool().await;
-    let ip = "203.0.113.241";
+    let ip = "45.10.32.241";
     reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
 
@@ -431,7 +436,7 @@ async fn run_once_holds_disabled_vendor_without_writing_a_row() {
 #[tokio::test]
 async fn run_once_records_failed_submission() {
     let pool = setup_pool().await;
-    let ip = "203.0.113.242";
+    let ip = "45.10.32.242";
     let ip_addr: IpAddr = ip.parse().unwrap();
     reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
@@ -462,7 +467,7 @@ async fn run_once_records_failed_submission() {
 #[tokio::test]
 async fn run_once_is_idempotent_across_a_failed_then_successful_retry() {
     let pool = setup_pool().await;
-    let ip = "203.0.113.243";
+    let ip = "45.10.32.243";
     let ip_addr: IpAddr = ip.parse().unwrap();
     reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
@@ -517,7 +522,7 @@ async fn run_once_is_idempotent_across_a_failed_then_successful_retry() {
 #[tokio::test]
 async fn run_once_repeat_call_after_success_is_held_by_cooldown_not_resubmitted() {
     let pool = setup_pool().await;
-    let ip = "203.0.113.244";
+    let ip = "45.10.32.244";
     let ip_addr: IpAddr = ip.parse().unwrap();
     reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
@@ -557,7 +562,7 @@ async fn run_once_repeat_call_after_success_is_held_by_cooldown_not_resubmitted(
 #[tokio::test]
 async fn run_once_ignores_entries_that_are_not_approved() {
     let pool = setup_pool().await;
-    let ip = "203.0.113.245";
+    let ip = "45.10.32.245";
     let ip_addr: IpAddr = ip.parse().unwrap();
     reset(&pool, ip).await;
     seed_recommended_ssh(&pool, ip).await;
@@ -590,7 +595,7 @@ async fn run_once_ignores_entries_that_are_not_approved() {
 #[tokio::test]
 async fn run_once_gates_each_configured_vendor_independently() {
     let pool = setup_pool().await;
-    let ip = "203.0.113.246";
+    let ip = "45.10.32.246";
     let ip_addr: IpAddr = ip.parse().unwrap();
     reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
@@ -625,7 +630,7 @@ async fn run_once_gates_each_configured_vendor_independently() {
 #[tokio::test]
 async fn run_once_holds_vendor_with_no_matching_gatekeeper_config() {
     let pool = setup_pool().await;
-    let ip = "203.0.113.247";
+    let ip = "45.10.32.247";
     reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
 

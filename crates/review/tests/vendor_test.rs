@@ -297,8 +297,12 @@ async fn abuseipdb_payload_has_ip_categories_and_comment() {
     let captured = server.await.unwrap();
     assert_eq!(captured.method, "POST");
     assert!(captured.path.ends_with("/api/v2/report"));
+    // `Key`, not `X-Key`. The adapter sent `X-Key` originally and every live submission came back
+    // 401; the API's own documentation and a manual curl both confirm `Key`. This test asserted
+    // the broken header and so agreed with the bug, which cost a full debugging round to find -
+    // it never ran, because the CI gate was failing at the format step before reaching the tests.
     assert_eq!(
-        captured.headers.get("x-key").map(String::as_str),
+        captured.headers.get("key").map(String::as_str),
         Some("test-key")
     );
     let form: HashMap<String, String> = url::form_urlencoded::parse(captured.body.as_bytes())
@@ -403,29 +407,94 @@ async fn permanent_error_never_echoes_the_api_key() {
 #[tokio::test]
 async fn dshield_payload_has_ip_port_and_protocol() {
     let (base_url, server) = respond_once(200, "OK", r#"{"status":"ok"}"#).await;
-    let adapter = DShield::new(reqwest::Client::new(), "test-key", base_url);
+    let adapter = DShield::new(reqwest::Client::new(), "test-user:test-key", base_url);
     let report = sample_report(build_dshield_categories(Some("telnet"), Category::Honeypot));
 
     let result = adapter.submit(&report).await.unwrap();
     assert!(result.accepted);
 
     let captured = server.await.unwrap();
-    assert!(captured.path.ends_with("/api/submit"));
-    assert_eq!(
-        captured.headers.get("x-api-key").map(String::as_str),
-        Some("test-key")
+    // Every value below was wrong in this test until it was finally run. It asserted
+    // `/api/submit` with an `X-Api-Key` header - neither exists. The real endpoint is
+    // `/submitapi/`, authenticated with an ISC-HMAC-SHA256 credential that must appear in BOTH
+    // the `X-ISC-Authorization` header AND the JSON body's `authheader` field; sending only the
+    // header returns "ERROR: no authinfo", and the wrong path returns the site's HTML landing
+    // page with a 200, which the adapter had been recording as a successful submission.
+    assert!(
+        captured.path.ends_with("/submitapi/"),
+        "path was {}",
+        captured.path
     );
+    let auth = captured
+        .headers
+        .get("x-isc-authorization")
+        .expect("X-ISC-Authorization header missing");
+    assert!(
+        auth.starts_with("ISC-HMAC-SHA256 Credentials=") && auth.contains("Userid=test-user"),
+        "unexpected auth header: {auth}"
+    );
+    // ISC's own log-type vocabulary, not the protocol tag: "telnetlogin", not "telnet".
+    assert_eq!(
+        captured.headers.get("x-isc-logtype").map(String::as_str),
+        Some("telnetlogin")
+    );
+
     let json: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
-    assert_eq!(json["ip"], "203.0.113.50");
-    assert_eq!(json["port"], 23);
-    assert_eq!(json["protocol"], "telnet");
-    assert!(json.get("timestamp").is_some());
+    assert_eq!(json["type"], "telnetlogin");
+    assert_eq!(
+        json["authheader"], *auth,
+        "the body's authheader must carry the same credential as the header"
+    );
+    let log = &json["logs"][0];
+    assert_eq!(log["source"], "203.0.113.50");
+    assert_eq!(log["port"], 23);
+    assert!(log.get("time").is_some());
+}
+
+#[tokio::test]
+async fn dshield_body_level_error_is_permanent_despite_http_200() {
+    // The failure that made this adapter look healthy for a full day: DShield answers a rejected
+    // submission with HTTP 200 and an "ERROR: ..." body, so classifying on status alone recorded
+    // 34 consecutive failures as successes.
+    let (base_url, server) = respond_once(200, "OK", "ERROR: no authinfo").await;
+    let adapter = DShield::new(reqwest::Client::new(), "test-user:test-key", base_url);
+    let report = sample_report(build_dshield_categories(Some("ssh"), Category::Honeypot));
+
+    let result = adapter.submit(&report).await;
+    let _ = server.await;
+
+    match result {
+        Err(VendorError::Permanent { status, body }) => {
+            assert_eq!(status, 200);
+            assert!(body.starts_with("ERROR"), "body was {body}");
+        }
+        other => panic!("a 200 carrying an ERROR body must not count as accepted: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dshield_without_a_userid_refuses_to_submit_at_all() {
+    // The credential is `userid:apikey`. A key alone cannot produce a valid HMAC, so the adapter
+    // must refuse locally rather than send a request that will be rejected server-side.
+    let adapter = DShield::new(
+        reqwest::Client::new(),
+        "key-only",
+        "http://127.0.0.1:1".to_string(),
+    );
+    let report = sample_report(build_dshield_categories(Some("ssh"), Category::Honeypot));
+
+    match adapter.submit(&report).await {
+        Err(VendorError::Permanent { body, .. }) => {
+            assert!(body.contains("DSHIELD_USER"), "body was {body}");
+        }
+        other => panic!("expected a local refusal, got {other:?}"),
+    }
 }
 
 #[tokio::test]
 async fn dshield_5xx_is_transient() {
     let (base_url, server) = respond_once(500, "Internal Server Error", "oops").await;
-    let adapter = DShield::new(reqwest::Client::new(), "test-key", base_url);
+    let adapter = DShield::new(reqwest::Client::new(), "test-user:test-key", base_url);
     let report = sample_report(build_dshield_categories(Some("ftp"), Category::Honeypot));
 
     let err = adapter.submit(&report).await.unwrap_err();
@@ -439,7 +508,7 @@ async fn dshield_5xx_is_transient() {
 #[tokio::test]
 async fn dshield_4xx_is_permanent() {
     let (base_url, server) = respond_once(401, "Unauthorized", "bad api key").await;
-    let adapter = DShield::new(reqwest::Client::new(), "test-key", base_url);
+    let adapter = DShield::new(reqwest::Client::new(), "test-user:test-key", base_url);
     let report = sample_report(build_dshield_categories(Some("ftp"), Category::Honeypot));
 
     let err = adapter.submit(&report).await.unwrap_err();

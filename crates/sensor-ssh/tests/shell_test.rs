@@ -35,13 +35,44 @@ fn wget_produces_canned_output_no_network() {
         output.contains("Connecting to") || output.contains("saved"),
         "wget must produce plausible canned output"
     );
-    assert_eq!(events.len(), 1);
+    // Two events, not one: the command execution itself, plus a separate file-download signal
+    // carrying the target URL. The download signal is the point - it is what lets an operator see
+    // which payload an attacker reached for, and it is scored on its own.
+    assert_eq!(events.len(), 2, "expected command-exec plus file-download");
+    assert_eq!(
+        events[0].signal_type,
+        sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC
+    );
     let cmd = events[0]
         .metadata
         .get("command")
         .and_then(|v| v.as_str())
         .unwrap();
     assert!(cmd.contains("wget"));
+
+    assert_eq!(
+        events[1].signal_type,
+        sensor_wire::SIGNAL_HONEYPOT_FILE_DOWNLOAD
+    );
+    assert_eq!(
+        events[1].metadata.get("url").and_then(|v| v.as_str()),
+        Some("http://203.0.113.99/malware.bin"),
+        "the download signal must carry the URL the attacker asked for"
+    );
+}
+
+#[test]
+fn wget_without_a_url_emits_only_the_command_event() {
+    // No target means nothing was downloaded; emitting a file-download signal anyway would inflate
+    // the score for a bare typo.
+    let fs = sensor_ssh::fakefs::FakeFs::new();
+    let mut shell = sensor_ssh::shell::FakeShell::new(fs, test_emit_ctx());
+    let (_output, events) = shell.handle_input("wget");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].signal_type,
+        sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC
+    );
 }
 
 #[test]

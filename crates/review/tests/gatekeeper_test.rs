@@ -2,10 +2,17 @@
 //!
 //! Shares the persistent `propolis_test` database with other crates' tests
 //! (see the project's `local-gate-toolchain` note). Every test uses a distinct
-//! source IP (RFC5737 documentation range, disjoint from `queue_test.rs`'s
-//! `192.0.2.210-214`/`198.51.100.215`/`198.51.100.217`/`203.0.113.216`) and a
-//! distinct vendor name, so tests never interfere with each other or with
-//! leftover rows from other crates' test runs. `reset_vendor` deletes any
+//! source IP from `45.10.31.0/24` and a distinct vendor name, so tests never
+//! interfere with each other or with leftover rows from other crates' test
+//! runs.
+//!
+//! These fixtures are ordinary public addresses rather than the RFC5737
+//! documentation ranges used elsewhere in the project, and must stay that way:
+//! the gate's first check now refuses every reserved range outright, so a
+//! documentation-range fixture is held as `Reserved` before reaching the check
+//! actually under test. That is the gate working, not a fixture accident - see
+//! `reserved_ranges_are_refused_ahead_of_every_configurable_check`.
+//! `reset_vendor` deletes any
 //! leftover `vendor_submission` rows for a test's vendor name before seeding,
 //! matching `queue_test.rs`'s `reset_ip` discipline for rerun-safety against
 //! the persistent, never-reset database. Run with `--test-threads=1`.
@@ -84,6 +91,7 @@ fn fake_score(ip: IpAddr, raw_score: Decimal, categories: &[&str]) -> IpScore {
         recommended_for_vendor: true,
         recommended_for_blocklist: false,
         tier: None,
+        delisted: false,
     }
 }
 
@@ -123,7 +131,7 @@ async fn insert_submission(pool: &PgPool, ip: &str, vendor: &str, submitted_at: 
 #[tokio::test]
 async fn vendor_disabled_is_held() {
     let pool = setup_pool().await;
-    let ip: IpAddr = "203.0.113.230".parse().unwrap();
+    let ip: IpAddr = "45.10.31.230".parse().unwrap();
     let config = VendorConfig {
         enabled: false,
         ..permissive_config("disabled-vendor")
@@ -138,7 +146,7 @@ async fn vendor_disabled_is_held() {
 async fn within_cooldown_is_held() {
     let pool = setup_pool().await;
     let vendor = "cooldown-active-vendor";
-    let ip = "203.0.113.231";
+    let ip = "45.10.31.231";
     reset_vendor(&pool, vendor).await;
     // A successful submission 1 hour ago, well inside a 24-hour cooldown.
     insert_submission(&pool, ip, vendor, Utc::now() - Duration::hours(1)).await;
@@ -154,7 +162,7 @@ async fn within_cooldown_is_held() {
 async fn cooldown_expired_allows_pass() {
     let pool = setup_pool().await;
     let vendor = "cooldown-expired-vendor";
-    let ip = "203.0.113.232";
+    let ip = "45.10.31.232";
     reset_vendor(&pool, vendor).await;
     // A successful submission 48 hours ago, outside a 24-hour cooldown.
     insert_submission(&pool, ip, vendor, Utc::now() - Duration::hours(48)).await;
@@ -175,14 +183,14 @@ async fn rate_limit_exceeded_is_held() {
     // window - rate limit is vendor-wide, not per-IP.
     insert_submission(
         &pool,
-        "203.0.113.233",
+        "45.10.31.233",
         vendor,
         Utc::now() - Duration::hours(1),
     )
     .await;
     insert_submission(
         &pool,
-        "203.0.113.234",
+        "45.10.31.234",
         vendor,
         Utc::now() - Duration::hours(2),
     )
@@ -193,7 +201,7 @@ async fn rate_limit_exceeded_is_held() {
         rate_window_hours: 24,
         ..permissive_config(vendor)
     };
-    let checked_ip: IpAddr = "203.0.113.235".parse().unwrap();
+    let checked_ip: IpAddr = "45.10.31.235".parse().unwrap();
     let score = fake_score(checked_ip, Decimal::from(80), &["Honeypot"]);
 
     let result = check(&pool, checked_ip, &config, &score).await;
@@ -203,7 +211,7 @@ async fn rate_limit_exceeded_is_held() {
 #[tokio::test]
 async fn score_below_floor_is_held() {
     let pool = setup_pool().await;
-    let ip: IpAddr = "203.0.113.236".parse().unwrap();
+    let ip: IpAddr = "45.10.31.236".parse().unwrap();
     let config = VendorConfig {
         score_floor: Some(Decimal::from(50)),
         ..permissive_config("scorefloor-vendor")
@@ -217,7 +225,7 @@ async fn score_below_floor_is_held() {
 #[tokio::test]
 async fn no_matching_category_is_held() {
     let pool = setup_pool().await;
-    let ip: IpAddr = "203.0.113.237".parse().unwrap();
+    let ip: IpAddr = "45.10.31.237".parse().unwrap();
     let config = VendorConfig {
         category_filter: Some(vec!["Waf".to_string()]),
         ..permissive_config("category-vendor")
@@ -231,7 +239,7 @@ async fn no_matching_category_is_held() {
 #[tokio::test]
 async fn all_checks_pass() {
     let pool = setup_pool().await;
-    let ip: IpAddr = "203.0.113.238".parse().unwrap();
+    let ip: IpAddr = "45.10.31.238".parse().unwrap();
     let config = VendorConfig {
         score_floor: Some(Decimal::from(50)),
         category_filter: Some(vec!["Honeypot".to_string(), "Waf".to_string()]),
@@ -247,7 +255,7 @@ async fn all_checks_pass() {
 async fn db_error_during_check_fails_closed() {
     let pool = setup_pool().await;
     pool.close().await;
-    let ip: IpAddr = "203.0.113.239".parse().unwrap();
+    let ip: IpAddr = "45.10.31.239".parse().unwrap();
     let config = permissive_config("dberror-vendor");
     let score = fake_score(ip, Decimal::from(80), &["Honeypot"]);
 
@@ -255,5 +263,55 @@ async fn db_error_during_check_fails_closed() {
     assert!(
         matches!(result, GateResult::Held(GateReason::DbError(_))),
         "a closed pool must fail closed, not panic or silently pass: got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn reserved_ranges_are_refused_ahead_of_every_configurable_check() {
+    // The operator's own workstation, 10.20.30.109, reached eligible and recommended_for_vendor
+    // purely from local SSH testing against the honeypot. Nothing in the gate stopped it: the
+    // sequence ran enabled -> cooldown -> rate limit -> score floor -> category filter, all of
+    // them operator-configurable, none of them about the address itself. One Approve click would
+    // have reported a private LAN address to AbuseIPDB, DShield and OTX as an attacker.
+    let pool = setup_pool().await;
+    let config = permissive_config("reserved-vendor");
+
+    for addr in [
+        "10.20.30.109",
+        "192.168.1.50",
+        "172.16.0.1",
+        "127.0.0.1",
+        "169.254.1.1",
+        "203.0.113.9",
+        "198.51.100.9",
+        "192.0.2.9",
+        "::1",
+        "fe80::1",
+        "fc00::1",
+        "2001:db8::1",
+    ] {
+        let ip: IpAddr = addr.parse().unwrap();
+        // A maximal score and a matching category: every other gate would pass this.
+        let score = fake_score(ip, Decimal::from(100), &["Honeypot"]);
+        assert_eq!(
+            check(&pool, ip, &config, &score).await,
+            GateResult::Held(GateReason::Reserved),
+            "{addr} must never be reportable to a third party"
+        );
+    }
+
+    // The check must be specific: an ordinary public address still passes. A guard verified only
+    // on its deny branch is half-verified, and over-blocking real reports is its own failure.
+    let public: IpAddr = "45.10.31.240".parse().unwrap();
+    reset_vendor(&pool, "reserved-vendor").await;
+    assert_eq!(
+        check(
+            &pool,
+            public,
+            &config,
+            &fake_score(public, Decimal::from(100), &["Honeypot"])
+        )
+        .await,
+        GateResult::Pass
     );
 }

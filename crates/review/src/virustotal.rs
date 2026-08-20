@@ -54,7 +54,10 @@ pub async fn scan_spool(
             }
 
             if requests_today >= config.daily_limit {
-                tracing::info!(limit = config.daily_limit, "vt: daily request limit reached, pausing until next cycle");
+                tracing::info!(
+                    limit = config.daily_limit,
+                    "vt: daily request limit reached, pausing until next cycle"
+                );
                 return results;
             }
 
@@ -133,7 +136,10 @@ async fn lookup_hash(
     }
     if status != 200 {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("VT returned {status}: {}", body.chars().take(200).collect::<String>()));
+        return Err(format!(
+            "VT returned {status}: {}",
+            body.chars().take(200).collect::<String>()
+        ));
     }
 
     let body: serde_json::Value = resp
@@ -142,8 +148,8 @@ async fn lookup_hash(
         .map_err(|e| format!("json parse error: {e}"))?;
 
     let stats = &body["data"]["attributes"]["last_analysis_stats"];
-    let detected = stats["malicious"].as_i64().unwrap_or(0)
-        + stats["suspicious"].as_i64().unwrap_or(0);
+    let detected =
+        stats["malicious"].as_i64().unwrap_or(0) + stats["suspicious"].as_i64().unwrap_or(0);
     let total = stats["malicious"].as_i64().unwrap_or(0)
         + stats["suspicious"].as_i64().unwrap_or(0)
         + stats["undetected"].as_i64().unwrap_or(0)
@@ -171,7 +177,8 @@ async fn upload_sample(
     let mut body = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(
-        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{sha256}\"\r\n").as_bytes(),
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{sha256}\"\r\n")
+            .as_bytes(),
     );
     body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
     body.extend_from_slice(&bytes);
@@ -180,7 +187,10 @@ async fn upload_sample(
     let resp = client
         .post("https://www.virustotal.com/api/v3/files")
         .header("x-apikey", api_key)
-        .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
         .body(body)
         .send()
         .await
@@ -191,7 +201,10 @@ async fn upload_sample(
         Ok(())
     } else {
         let body = resp.text().await.unwrap_or_default();
-        Err(format!("VT upload returned {status}: {}", body.chars().take(200).collect::<String>()))
+        Err(format!(
+            "VT upload returned {status}: {}",
+            body.chars().take(200).collect::<String>()
+        ))
     }
 }
 
@@ -213,8 +226,8 @@ async fn store_result(pool: &PgPool, result: &VtResult, sensor: &str) -> Result<
 }
 
 pub async fn cleanup_old_samples(spool_dirs: &[(&str, PathBuf)], max_age_days: u64) {
-    let cutoff = std::time::SystemTime::now()
-        - std::time::Duration::from_secs(max_age_days * 86400);
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(max_age_days * 86400);
     let mut removed = 0u64;
 
     for (_sensor, dir) in spool_dirs {
@@ -226,14 +239,12 @@ pub async fn cleanup_old_samples(spool_dirs: &[(&str, PathBuf)], max_age_days: u
             if name.len() != 64 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
                 continue;
             }
-            if let Ok(meta) = entry.metadata().await {
-                if let Ok(modified) = meta.modified() {
-                    if modified < cutoff {
-                        if tokio::fs::remove_file(entry.path()).await.is_ok() {
-                            removed += 1;
-                        }
-                    }
-                }
+            if let Ok(meta) = entry.metadata().await
+                && let Ok(modified) = meta.modified()
+                && modified < cutoff
+                && tokio::fs::remove_file(entry.path()).await.is_ok()
+            {
+                removed += 1;
             }
         }
     }

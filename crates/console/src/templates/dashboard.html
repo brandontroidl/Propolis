@@ -39,6 +39,7 @@
       {% for r in ["1h", "24h", "7d", "30d"] %}
       <a hx-get="/dashboard/chart?range={{ r }}"
          hx-target="#dashboard-chart-container" hx-swap="innerHTML"
+         hx-sync="closest .range-selector:replace"
          class="range-btn {% if r == current_range %}active{% endif %}">{{ r }}</a>
       {% endfor %}
     </div>

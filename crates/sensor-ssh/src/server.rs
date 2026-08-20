@@ -26,6 +26,7 @@ use crate::channel::{ChannelAction, handle_channel_open, handle_channel_request}
 use crate::fakefs::FakeFs;
 use crate::hostkey::HostKey;
 use crate::shell::{EmitContext, FakeShell};
+use crate::timeout_stream::TimeoutStream;
 use crate::transfer::{ScpReceiver, SftpHandler};
 use crate::transport::cipher::TransportCipher;
 use crate::transport::kex::perform_kex_server;
@@ -104,12 +105,18 @@ pub async fn serve(
     let handoff = Arc::new(CaptureHandoff::new(spool, EventEmitter::new(log_path), 64));
     let _worker = handoff.start_worker();
 
+    let read_timeout = bounds.read_timeout;
+    let idle_timeout = bounds.idle_timeout;
     let (bound_addr, handle) =
         run_tcp_listener(addr, bounds, move |stream, peer_addr, session_id| {
             let host_key = host_key.clone();
             let emitter = emitter.clone();
             let handoff = handoff.clone();
             let wan_resolver = wan_resolver.clone();
+            // Wrapped once here rather than at each read: every transport function is generic over
+            // AsyncRead/AsyncWrite, so the whole session inherits the per-read bound - including
+            // any read added later, which a per-call-site timeout would miss.
+            let stream = TimeoutStream::new(stream, read_timeout, idle_timeout);
             async move {
                 if let Err(e) = handle_session(
                     stream,
@@ -134,7 +141,7 @@ pub async fn serve(
 /// Handle one SSH connection end to end: version exchange, key exchange, authentication,
 /// channel management, and data dispatch.
 async fn handle_session(
-    mut stream: TcpStream,
+    mut stream: TimeoutStream<TcpStream>,
     peer_addr: SocketAddr,
     session_id: sensor_framework::Uuid,
     host_key: HostKey,
@@ -197,7 +204,7 @@ async fn handle_session(
     // plain-IPv4 WAN map entry.
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
-    let local_addr = stream.local_addr().map(normalize_dual_stack).ok();
+    let local_addr = stream.get_ref().local_addr().map(normalize_dual_stack).ok();
     let wan_ip = local_addr.and_then(|la| wan_resolver.resolve(la.ip()));
     let mut auth_state = AuthState::new(source_ip, wan_ip, session_id);
 
@@ -445,8 +452,8 @@ async fn handle_session(
 // ---- Helpers ----
 
 /// Write one encrypted packet and increment the sequence number.
-async fn write_encrypted(
-    stream: &mut TcpStream,
+async fn write_encrypted<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
     cipher: &mut TransportCipher,
     seq: &mut u32,
     payload: &[u8],

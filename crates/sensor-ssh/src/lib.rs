@@ -6,6 +6,7 @@ pub mod auth;
 pub mod channel;
 pub mod hostkey;
 pub mod server;
+pub mod timeout_stream;
 pub mod transfer;
 pub mod transport;
 

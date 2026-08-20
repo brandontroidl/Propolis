@@ -309,3 +309,61 @@ async fn concurrency_beyond_max_concurrent_is_refused_not_queued() {
         Err(_) => panic!("second connection was left hanging - queued, not refused"),
     }
 }
+
+/// A peer that connects mid-handshake and then goes quiet must be dropped at the READ timeout,
+/// not held until `max_duration`.
+///
+/// `max_duration` is set to 60s here deliberately, far beyond the 15s deadline below: if this
+/// passes, the close can only have come from the per-read timeout, so the assertion cannot be
+/// satisfied by the session cap that already existed. Before the per-read bound, a peer could hold
+/// a connection slot for the full 600s default this way, for the cost of one TCP handshake.
+#[tokio::test]
+async fn a_peer_that_stalls_mid_handshake_is_dropped_at_the_read_timeout() {
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bounds = ConnectionBounds {
+        read_timeout: Duration::from_secs(1),
+        idle_timeout: Duration::from_secs(1),
+        max_duration: Duration::from_secs(60),
+        ..test_bounds()
+    };
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        bounds,
+    )
+    .await
+    .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Send a valid client identification so the server proceeds into key exchange, then stop.
+    // This is the shape that used to cost nothing to hold: past the accept, never completing.
+    use tokio::io::AsyncWriteExt;
+    stream
+        .write_all(b"SSH-2.0-StalledClient\r\n")
+        .await
+        .unwrap();
+
+    let mut scratch = [0u8; 4096];
+    let closed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match stream.read(&mut scratch).await {
+                Ok(0) => return true,
+                Ok(_) => continue, // banner + KEXINIT; keep waiting for the close
+                Err(_) => return true,
+            }
+        }
+    })
+    .await;
+
+    handle.abort();
+    assert_eq!(
+        closed,
+        Ok(true),
+        "a stalled handshake must be dropped at the read timeout, well before max_duration"
+    );
+}

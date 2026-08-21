@@ -219,6 +219,7 @@ const SSH_FXP_HANDLE: u8 = 102;
 
 // SFTP status codes.
 const SSH_FX_OK: u32 = 0;
+const SSH_FX_FAILURE: u32 = 4;
 const SSH_FX_OP_UNSUPPORTED: u32 = 8;
 
 // SFTP open pflags.
@@ -227,6 +228,13 @@ const SSH_FXF_CREAT: u32 = 0x0000_0008;
 
 /// Cap on accumulated file body per SFTP handle, matching `ScpReceiver`'s `MAX_CAPTURE_BODY`.
 const SFTP_MAX_FILE_BODY: usize = 10_000_000;
+
+/// Max concurrently-open SFTP handles per session, and a ceiling on the TOTAL body bytes resident
+/// across ALL open handles. The per-file cap alone does not bound memory: a client can open many
+/// handles and write the per-file max to each without ever closing. These bound the count and the
+/// sum so one SFTP session cannot OOM the process.
+const SFTP_MAX_OPEN_HANDLES: usize = 64;
+const SFTP_MAX_SESSION_BYTES: usize = 20_000_000;
 
 /// Maximum SFTP packet length the handler will reassemble. A single SFTP packet larger than
 /// this is rejected at framing time rather than accumulated in memory. 256 KB is generous for
@@ -246,6 +254,9 @@ struct SftpOpenFile {
 pub struct SftpHandler {
     buf: Vec<u8>,
     handles: HashMap<String, SftpOpenFile>,
+    /// Running sum of body bytes across all currently-open handles, bounded by
+    /// `SFTP_MAX_SESSION_BYTES`; decremented when a handle closes.
+    resident_body: usize,
     next_handle: u32,
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
@@ -263,6 +274,7 @@ impl SftpHandler {
         Self {
             buf: Vec::new(),
             handles: HashMap::new(),
+            resident_body: 0,
             next_handle: 0,
             source_ip,
             wan_ip,
@@ -356,6 +368,12 @@ impl SftpHandler {
             return build_status(id, SSH_FX_OP_UNSUPPORTED);
         }
 
+        // Bound the number of concurrently-open handles: an attacker can OPEN without CLOSE to grow
+        // the handles map (and its bodies) without limit.
+        if self.handles.len() >= SFTP_MAX_OPEN_HANDLES {
+            return build_status(id, SSH_FX_FAILURE);
+        }
+
         let handle_str = format!("h{}", self.next_handle);
         self.next_handle += 1;
 
@@ -388,13 +406,25 @@ impl SftpHandler {
         };
 
         let handle_str = String::from_utf8_lossy(&handle);
-        if let Some(file) = self.handles.get_mut(handle_str.as_ref()) {
-            if file.body.len() + data.len() <= SFTP_MAX_FILE_BODY {
-                file.body.extend_from_slice(&data);
+        // Store only up to the smaller of the per-file and per-SESSION remaining room, so many open
+        // handles cannot sum past SFTP_MAX_SESSION_BYTES. Excess is acknowledged but dropped.
+        let session_room = SFTP_MAX_SESSION_BYTES.saturating_sub(self.resident_body);
+        let stored = if let Some(file) = self.handles.get_mut(handle_str.as_ref()) {
+            let file_room = SFTP_MAX_FILE_BODY.saturating_sub(file.body.len());
+            let storable = data.len().min(file_room).min(session_room);
+            if storable > 0 {
+                file.body.extend_from_slice(&data[..storable]);
             }
-            build_status(id, SSH_FX_OK)
+            Some(storable)
         } else {
-            build_status(id, SSH_FX_OP_UNSUPPORTED)
+            None
+        };
+        match stored {
+            Some(storable) => {
+                self.resident_body += storable;
+                build_status(id, SSH_FX_OK)
+            }
+            None => build_status(id, SSH_FX_OP_UNSUPPORTED),
         }
     }
 
@@ -409,6 +439,7 @@ impl SftpHandler {
 
         let handle_str = String::from_utf8_lossy(&handle);
         if let Some(file) = self.handles.remove(handle_str.as_ref()) {
+            self.resident_body = self.resident_body.saturating_sub(file.body.len());
             if !file.body.is_empty() {
                 self.submit_capture(file);
             }
@@ -614,6 +645,43 @@ mod tests {
         );
         // No valid SFTP response is produced for the rejected packet.
         assert!(response.is_empty());
+    }
+
+    #[test]
+    fn sftp_open_handles_are_capped() {
+        fn open_pkt(id: u32, filename: &str) -> Vec<u8> {
+            let mut body = vec![SSH_FXP_OPEN];
+            body.extend_from_slice(&id.to_be_bytes());
+            body.extend_from_slice(&(filename.len() as u32).to_be_bytes());
+            body.extend_from_slice(filename.as_bytes());
+            body.extend_from_slice(&SSH_FXF_WRITE.to_be_bytes());
+            let mut pkt = (body.len() as u32).to_be_bytes().to_vec();
+            pkt.extend_from_slice(&body);
+            pkt
+        }
+
+        let handoff = test_handoff();
+        let mut sftp =
+            SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+
+        // INIT (version 3), then open the cap's worth of write handles without ever closing:
+        // each must return a HANDLE.
+        let mut init = vec![SSH_FXP_INIT];
+        init.extend_from_slice(&3u32.to_be_bytes());
+        let mut init_pkt = (init.len() as u32).to_be_bytes().to_vec();
+        init_pkt.extend_from_slice(&init);
+        let _ = sftp.feed(&init_pkt);
+
+        for i in 0..SFTP_MAX_OPEN_HANDLES as u32 {
+            let resp = sftp.feed(&open_pkt(i, &format!("f{i}")));
+            assert_eq!(resp[4], SSH_FXP_HANDLE, "open {i} should return a handle");
+        }
+        // The next OPEN must be refused with a STATUS carrying SSH_FX_FAILURE, not another handle -
+        // the guard against an OPEN-without-CLOSE flood OOM.
+        let resp = sftp.feed(&open_pkt(999, "overflow"));
+        assert_eq!(resp[4], SSH_FXP_STATUS, "over-cap open must be a STATUS");
+        let code = u32::from_be_bytes([resp[9], resp[10], resp[11], resp[12]]);
+        assert_eq!(code, SSH_FX_FAILURE, "over-cap open must be SSH_FX_FAILURE");
     }
 
     #[test]

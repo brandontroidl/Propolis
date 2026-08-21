@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
 
 #[derive(Debug, Clone)]
@@ -17,6 +17,72 @@ pub struct VtConfig {
     pub scan_interval_secs: u64,
     pub request_delay_ms: u64,
     pub daily_limit: u32,
+}
+
+/// A request budget that caps VirusTotal calls per UTC day.
+///
+/// The scanner re-invokes `scan_spool` every `scan_interval_secs` (minutes), so a counter local
+/// to a single `scan_spool` call resets every cycle and never enforces a DAILY cap - the caller
+/// must own one `DailyBudget` across all cycles and thread it in. The budget resets itself when
+/// the UTC date rolls over.
+#[derive(Debug)]
+pub struct DailyBudget {
+    limit: u32,
+    used: u32,
+    day: NaiveDate,
+}
+
+impl DailyBudget {
+    pub fn new(limit: u32, today: NaiveDate) -> Self {
+        Self {
+            limit,
+            used: 0,
+            day: today,
+        }
+    }
+
+    /// Reserve one request against today's budget, resetting first if the UTC day has changed.
+    /// Returns `false` (consuming nothing) when the day's limit is already exhausted.
+    pub fn try_consume(&mut self, now: DateTime<Utc>) -> bool {
+        let today = now.date_naive();
+        if today != self.day {
+            self.day = today;
+            self.used = 0;
+        }
+        if self.used >= self.limit {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(ts: &str) -> DateTime<Utc> {
+        ts.parse::<DateTime<Utc>>().unwrap()
+    }
+
+    #[test]
+    fn budget_refuses_past_limit_then_resets_on_new_utc_day() {
+        let day1 = at("2026-08-21T23:00:00Z");
+        let mut budget = DailyBudget::new(2, day1.date_naive());
+
+        assert!(budget.try_consume(day1), "1st request within limit");
+        assert!(budget.try_consume(day1), "2nd request within limit");
+        assert!(
+            !budget.try_consume(day1),
+            "3rd request the same day must be refused"
+        );
+
+        let day2 = at("2026-08-22T00:05:00Z");
+        assert!(
+            budget.try_consume(day2),
+            "budget must reset on the new UTC day"
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -31,13 +97,13 @@ pub async fn scan_spool(
     pool: &PgPool,
     config: &VtConfig,
     spool_dirs: &[(&str, PathBuf)],
+    budget: &mut DailyBudget,
 ) -> Vec<VtResult> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
     let mut results = Vec::new();
-    let mut requests_today: u32 = 0;
 
     for (sensor, dir) in spool_dirs {
         let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
@@ -53,16 +119,15 @@ pub async fn scan_spool(
                 continue;
             }
 
-            if requests_today >= config.daily_limit {
+            if !budget.try_consume(Utc::now()) {
                 tracing::info!(
                     limit = config.daily_limit,
-                    "vt: daily request limit reached, pausing until next cycle"
+                    "vt: daily request limit reached, pausing until the UTC day rolls over"
                 );
                 return results;
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(config.request_delay_ms)).await;
-            requests_today += 1;
 
             match lookup_hash(&client, &config.api_key, &name).await {
                 Ok(Some(result)) => {

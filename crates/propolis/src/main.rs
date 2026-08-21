@@ -526,12 +526,17 @@ async fn main() {
                     ("ftp", std::path::PathBuf::from("/var/spool/propolis/ftp")),
                     ("catchall", std::path::PathBuf::from("/var/spool/propolis/catchall")),
                 ];
+                // One budget owned across every scan cycle so the cap is per DAY, not per cycle.
+                let mut budget = review::virustotal::DailyBudget::new(
+                    vt_config.daily_limit,
+                    chrono::Utc::now().date_naive(),
+                );
                 loop {
                     if token.is_cancelled() {
                         tracing::info!("virustotal: scanner stopped");
                         return;
                     }
-                    review::virustotal::scan_spool(&pool, &vt_config, &spool_dirs).await;
+                    review::virustotal::scan_spool(&pool, &vt_config, &spool_dirs, &mut budget).await;
                     review::virustotal::cleanup_old_samples(&spool_dirs, 30).await;
                     tokio::select! {
                         _ = tokio::time::sleep(tokio::time::Duration::from_secs(vt_config.scan_interval_secs)) => {}

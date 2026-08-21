@@ -71,7 +71,40 @@ async fn get_root_returns_200_html() {
     let resp = send_request(srv.addr, "GET / HTTP/1.1\r\nHost: test\r\n\r\n").await;
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "response: {resp}");
     assert!(resp.contains("Content-Type: text/html"));
-    assert!(resp.contains("It works!"));
+    assert!(resp.contains("Welcome to nginx!"), "response: {resp}");
+    // The two headers whose absence fingerprinted this sensor must now be present.
+    assert!(
+        resp.contains("Server: nginx/1.18.0 (Ubuntu)"),
+        "missing Server header: {resp}"
+    );
+    assert!(resp.contains("\r\nDate: "), "missing Date header: {resp}");
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn head_sends_headers_without_a_body() {
+    let srv = TestServer::start().await;
+    let resp = send_request(srv.addr, "HEAD / HTTP/1.1\r\nHost: test\r\n\r\n").await;
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "response: {resp}");
+    assert!(
+        resp.contains("Content-Length: "),
+        "HEAD must still advertise Content-Length: {resp}"
+    );
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+    assert!(body.is_empty(), "HEAD returned a body: {body:?}");
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn disallowed_method_returns_405() {
+    let srv = TestServer::start().await;
+    let resp = send_request(
+        srv.addr,
+        "POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 405"), "response: {resp}");
+    assert!(resp.contains("405 Not Allowed"), "response: {resp}");
     srv.handle.abort();
 }
 

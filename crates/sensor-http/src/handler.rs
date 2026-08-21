@@ -18,12 +18,64 @@ const MAX_HEADER_BLOCK: usize = 16384;
 const MAX_BODY_CAPTURE: usize = 65536;
 const READ_CHUNK_SIZE: usize = 4096;
 
-const RESPONSE_200_HTML: &str = "\
-<!DOCTYPE html>
-<html><head><title>Welcome</title></head>
-<body><h1>It works!</h1><p>Server is running.</p></body></html>";
+/// The impersonated server. Coherent with the shared persona (an Ubuntu host): this is the exact
+/// `Server` token an Ubuntu-packaged nginx emits. A missing or mismatched Server (and, worse, the
+/// previously-absent Date header) is what a service scanner keys on.
+const SERVER_BANNER: &str = "nginx/1.18.0 (Ubuntu)";
+
+/// A fixed, plausible mtime for the served static pages, so `Last-Modified` is stable across
+/// requests (a real file's mtime does not move) and the `ETag` mtime component agrees with it.
+const PAGE_LAST_MODIFIED: &str = "Tue, 16 Jan 2024 10:24:30 GMT";
+const PAGE_MTIME_EPOCH: u64 = 1_705_400_670; // == PAGE_LAST_MODIFIED, for the ETag mtime field
+
+/// The verbatim Ubuntu-packaged nginx default index (`index.nginx-debian.html`). The old page said
+/// "It works!" - Apache's phrase, not nginx's - which contradicted any nginx Server header.
+const RESPONSE_200_HTML: &str = "<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href=\"http://nginx.org/\">nginx.org</a>.<br/>
+Commercial support is available at
+<a href=\"http://nginx.com/\">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+";
 
 const RESPONSE_ROBOTS: &str = "User-agent: *\nDisallow: /\n";
+
+/// nginx's generated 404 page (its exact markup, ending with the Server token).
+const NGINX_404_HTML: &str = "<html>
+<head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx/1.18.0 (Ubuntu)</center>
+</body>
+</html>
+";
+
+/// nginx's generated 405 page (returned for any method other than GET/HEAD on a static resource).
+const NGINX_405_HTML: &str = "<html>
+<head><title>405 Not Allowed</title></head>
+<body>
+<center><h1>405 Not Allowed</h1></center>
+<hr><center>nginx/1.18.0 (Ubuntu)</center>
+</body>
+</html>
+";
 
 pub async fn handle_connection(
     mut stream: TcpStream,
@@ -102,21 +154,77 @@ pub async fn handle_connection(
         };
         let _ = emitter.append(&event).await;
 
-        let (status, content_type, body) = match request.path.as_str() {
-            "/" => ("200 OK", "text/html", RESPONSE_200_HTML.as_bytes()),
-            "/robots.txt" => ("200 OK", "text/plain", RESPONSE_ROBOTS.as_bytes()),
-            _ => ("404 Not Found", "text/plain", b"Not Found" as &[u8]),
-        };
-
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        if stream.write_all(response.as_bytes()).await.is_err() {
-            return;
-        }
-        let _ = stream.write_all(body).await;
+        let response = build_response(&request.method, &request.path);
+        let _ = stream.write_all(&response).await;
     }
+}
+
+/// The IMF-fixdate `Date` header value for now (e.g. `Tue, 16 Jan 2024 10:24:30 GMT`), regenerated
+/// per response as every real HTTP server does. Its previous absence was a one-request tell.
+fn http_date_now() -> String {
+    chrono::Utc::now()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
+}
+
+/// Build the full response an Ubuntu nginx sends for `(method, path)`: GET/HEAD are served (a static
+/// 200 carries Last-Modified/ETag/Accept-Ranges; HEAD omits the body), an unknown path is nginx's
+/// 404, and any other method is nginx's 405. Deferred as documented low-interaction limits, not
+/// folded in here: keep-alive, echoing/validating the request's HTTP version, conditional (If-*) and
+/// Range requests, and chunked request bodies.
+fn build_response(method: &str, path: &str) -> Vec<u8> {
+    let date = http_date_now();
+    let is_head = method == "HEAD";
+
+    // Only GET/HEAD are valid on nginx-served static content; every other method is 405.
+    if method != "GET" && !is_head {
+        return error_response("405 Not Allowed", NGINX_405_HTML, &date, false);
+    }
+
+    let (content_type, body): (&str, &[u8]) = match path {
+        "/" => ("text/html", RESPONSE_200_HTML.as_bytes()),
+        "/robots.txt" => ("text/plain", RESPONSE_ROBOTS.as_bytes()),
+        _ => return error_response("404 Not Found", NGINX_404_HTML, &date, is_head),
+    };
+
+    // A static 200 in nginx's header order, with the file-serving headers a real nginx adds.
+    let etag = format!("\"{:x}-{:x}\"", PAGE_MTIME_EPOCH, body.len());
+    let head = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Server: {SERVER_BANNER}\r\n\
+         Date: {date}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Last-Modified: {PAGE_LAST_MODIFIED}\r\n\
+         Connection: close\r\n\
+         ETag: {etag}\r\n\
+         Accept-Ranges: bytes\r\n\r\n",
+        body.len()
+    );
+    let mut out = head.into_bytes();
+    if !is_head {
+        out.extend_from_slice(body);
+    }
+    out
+}
+
+/// An nginx error response (404/405): the generated HTML page with Server/Date and no static-file
+/// headers. `is_head` omits the body while keeping the Content-Length, as nginx does.
+fn error_response(status: &str, body: &str, date: &str, is_head: bool) -> Vec<u8> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\n\
+         Server: {SERVER_BANNER}\r\n\
+         Date: {date}\r\n\
+         Content-Type: text/html\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let mut out = head.into_bytes();
+    if !is_head {
+        out.extend_from_slice(body.as_bytes());
+    }
+    out
 }
 
 fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {

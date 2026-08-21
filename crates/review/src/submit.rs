@@ -363,7 +363,9 @@ fn build_report(
         breakdown.len(),
         if breakdown.len() == 1 { "y" } else { "ies" },
         current_score.first_seen.to_rfc3339(),
-        current_score.raw_score,
+        // Round for the human-facing comment: the raw Decimal carries ~26 digits, which reads as a
+        // bug on a public OTX pulse. One decimal place is ample for a 0-100 score.
+        current_score.raw_score.round_dp(1),
     );
 
     Ok(VendorReport {

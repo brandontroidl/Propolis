@@ -150,6 +150,9 @@ async fn dashboard(
     // empty array. `dashboard_chart_fragment` (below) reuses the same helper for the
     // adjustable-range HTMX endpoint the "1h/24h/7d/30d" buttons hit.
     let (timeline_labels, timeline_data) = hourly_series(&state.db).await;
+    // The status band's "Events / 24h" cell: the 24 hourly buckets are already computed and
+    // zero-filled, so their sum is the day's total at no extra query cost.
+    let events_24h: i64 = timeline_data.iter().sum();
     let current_range = "24h";
 
     let attacker_rows = sqlx::query(
@@ -252,6 +255,7 @@ async fn dashboard(
         pending_reviews => pending_count,
         approved_today,
         events_last_hour,
+        events_24h,
         feed_entries,
         top_attacker_ip,
         top_attacker_score,

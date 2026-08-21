@@ -6,10 +6,10 @@
 <table class="table-compact">
   <thead>
     <tr>
-      <th><a href="/ips?sort=score&dir={% if sort == 'score' and dir == 'desc' %}asc{% else %}desc{% endif %}">Score{% if sort == 'score' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
+      <th class="count"><a href="/ips?sort=score&dir={% if sort == 'score' and dir == 'desc' %}asc{% else %}desc{% endif %}">Score{% if sort == 'score' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
       <th>IP</th>
       <th>Tier</th>
-      <th><a href="/ips?sort=events&dir={% if sort == 'events' and dir == 'desc' %}asc{% else %}desc{% endif %}">Events{% if sort == 'events' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
+      <th class="count"><a href="/ips?sort=events&dir={% if sort == 'events' and dir == 'desc' %}asc{% else %}desc{% endif %}">Events{% if sort == 'events' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
       <th>Categories</th>
       <th>WANs</th>
       <th><a href="/ips?sort=first&dir={% if sort == 'first' and dir == 'desc' %}asc{% else %}desc{% endif %}">First seen{% if sort == 'first' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
@@ -20,10 +20,10 @@
   <tbody>
     {% for ip in ips %}
     <tr>
-      <td class="mono"><strong>{{ ip.raw_score }}</strong></td>
+      <td class="count"><strong>{{ ip.raw_score }}</strong></td>
       <td><a href="/ip/{{ ip.ip }}">{{ ip.ip }}</a></td>
       <td>{% if ip.tier != "-" %}<span class="tier-{{ ip.tier }}">{{ ip.tier }}</span>{% else %}<span class="dim">-</span>{% endif %}</td>
-      <td class="mono">{{ ip.event_count }}</td>
+      <td class="count">{{ ip.event_count }}</td>
       <td class="mono">{{ ip.distinct_categories }}</td>
       <td class="mono">{{ ip.distinct_wan_count }}</td>
       <td class="dim">{{ ip.first_seen }}</td>

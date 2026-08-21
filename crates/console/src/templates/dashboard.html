@@ -1,34 +1,28 @@
 {% extends "base.html" %}
 {% block title %}Dashboard - Propolis{% endblock %}
 {% block content %}
-<div class="stat-hero{% if pending_reviews > 0 %} stat-hero--attention{% else %} stat-hero--nominal{% endif %}">
-  <div class="stat-hero-value"><a href="/queue">{{ pending_reviews }}</a></div>
-  <div class="stat-hero-label">pending review</div>
-  <div class="stat-hero-sub">
-    <span><strong>{% if events_last_hour >= 0 %}{{ events_last_hour }}{% else %}--{% endif %}</strong> events/hr</span>
-    <span><strong>{{ total_scored_ips }}</strong> scored IPs</span>
-    {% if top_attacker_ip != "--" %}<span>top: <a href="/ip/{{ top_attacker_ip }}"><strong>{{ top_attacker_ip }}</strong></a></span>{% endif %}
+{# Status band — the one thing read first. Leads with the question the console exists to answer:
+   does anything need me right now? Every cell is backed by data already in this route's context. #}
+<div class="band">
+  <div class="cell{% if pending_reviews > 0 %} cell--call{% endif %}">
+    <span class="label">Waiting on you</span>
+    <div class="v {% if pending_reviews > 0 %}v--call{% else %}v--ok{% endif %}"><a href="/queue">{{ pending_reviews }}</a></div>
+    <div class="foot">{% if pending_reviews > 0 %}in the review queue{% else %}queue clear{% endif %}</div>
   </div>
-</div>
-
-<div class="stat-row">
-  <div class="stat-card stat-card--info">
-    <div class="label">Total scored IPs</div>
-    <div class="value">{{ total_scored_ips }}</div>
-    {{ scored_sparkline|safe }}
+  <div class="cell">
+    <span class="label">Events / 24h</span>
+    <div class="v">{{ events_24h }}</div>
+    <div class="foot">{% if events_last_hour >= 0 %}+{{ events_last_hour }} in the last hour{% else %}last 24 hours{% endif %}</div>
   </div>
-  <div class="stat-card stat-card--good">
-    <div class="label">Approved today</div>
-    <div class="value">{{ approved_today }}</div>
+  <div class="cell">
+    <span class="label">Scored IPs</span>
+    <div class="v">{{ total_scored_ips }}</div>
+    <div class="foot">{% if top_attacker_ip != "--" %}top <a href="/ip/{{ top_attacker_ip }}">{{ top_attacker_ip }}</a>{% else %}no attackers yet{% endif %}</div>
   </div>
-  <div class="stat-card stat-card--info">
-    <div class="label">Events / hour</div>
-    <div class="value">{% if events_last_hour >= 0 %}{{ events_last_hour }}{% else %}--{% endif %}</div>
-    {{ events_sparkline|safe }}
-  </div>
-  <div class="stat-card">
-    <div class="label">Feed entries</div>
-    <div class="value">{% if feed_entries >= 0 %}{{ feed_entries }}{% else %}--{% endif %}</div>
+  <div class="cell">
+    <span class="label">Published</span>
+    <div class="v {% if feed_entries >= 0 %}v--ok{% endif %}">{% if feed_entries >= 0 %}{{ feed_entries }}{% else %}--{% endif %}</div>
+    <div class="foot">aggressive + standard &middot; {{ approved_today }} approved today</div>
   </div>
 </div>
 
@@ -87,7 +81,7 @@ new Chart(document.getElementById('protoChart'), {
     labels: JSON.parse(document.getElementById('proto-labels').textContent),
     datasets: [{
       data: JSON.parse(document.getElementById('proto-data').textContent),
-      backgroundColor: '#3987e5',
+      backgroundColor: '#4c8ff0',
       borderRadius: 4,
       maxBarThickness: 20,
     }],
@@ -115,7 +109,7 @@ new Chart(document.getElementById('attackerChart'), {
     labels: JSON.parse(document.getElementById('attacker-labels').textContent),
     datasets: [{
       data: JSON.parse(document.getElementById('attacker-data').textContent),
-      backgroundColor: '#d95926',
+      backgroundColor: '#f2751d',
       borderRadius: 4,
       maxBarThickness: 20,
     }],

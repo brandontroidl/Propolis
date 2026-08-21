@@ -35,3 +35,4 @@ pub use repository::{
     ChainStatus, RepoError, append_event, read_score, rebuild_projection, verify_chain,
 };
 pub use scoring::breadth::effective_score;
+pub use scoring::persistence::persistence_points;

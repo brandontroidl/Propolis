@@ -40,7 +40,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use chrono::{DateTime, SubsecRound, Utc};
+use chrono::{DateTime, NaiveDate, SubsecRound, Utc};
 use sqlx::{PgPool, Postgres, Row};
 
 use crate::domain::enums::Category;
@@ -257,8 +257,9 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
         "INSERT INTO ip_score \
          (source_ip, raw_score, decay_anchor, max_confidence, event_count, distinct_categories, \
           category_breakdown, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
-          first_seen, last_seen, eligible, recommended_for_vendor, recommended_for_blocklist, tier, delisted) \
-         VALUES ($1::inet, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+          first_seen, last_seen, eligible, recommended_for_vendor, recommended_for_blocklist, tier, delisted, \
+          active_days, last_active_day) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
          ON CONFLICT (source_ip) DO UPDATE SET \
            raw_score = EXCLUDED.raw_score, \
            decay_anchor = EXCLUDED.decay_anchor, \
@@ -274,7 +275,9 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
            eligible = EXCLUDED.eligible, \
            recommended_for_vendor = EXCLUDED.recommended_for_vendor, \
            recommended_for_blocklist = EXCLUDED.recommended_for_blocklist, \
-           tier = EXCLUDED.tier",
+           tier = EXCLUDED.tier, \
+           active_days = EXCLUDED.active_days, \
+           last_active_day = EXCLUDED.last_active_day",
     )
     .bind(new_score.source_ip.to_string())
     .bind(new_score.raw_score)
@@ -293,6 +296,8 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     .bind(new_score.recommended_for_blocklist)
     .bind(new_score.tier)
     .bind(new_score.delisted)
+    .bind(new_score.active_days)
+    .bind(new_score.last_active_day)
     .execute(&mut *tx)
     .await?;
 
@@ -338,7 +343,8 @@ where
         "SELECT host(source_ip) AS source_ip, raw_score, decay_anchor, max_confidence, \
                 event_count, distinct_categories, category_breakdown, has_confirmed_real, \
                 distinct_wan_count, distinct_sensor_count, first_seen, last_seen, eligible, \
-                recommended_for_vendor, recommended_for_blocklist, tier, delisted \
+                recommended_for_vendor, recommended_for_blocklist, tier, delisted, \
+                active_days, last_active_day \
          FROM ip_score WHERE source_ip = $1::inet",
     )
     .bind(ip.to_string())
@@ -371,6 +377,16 @@ where
         has_confirmed_real: row.try_get("has_confirmed_real")?,
         distinct_wan_count: row.try_get("distinct_wan_count")?,
         distinct_sensor_count: row.try_get("distinct_sensor_count")?,
+        active_days: row.try_get("active_days")?,
+        // Backfilled to last_seen's date by migration 0010; fall back to it defensively so a NULL
+        // can never panic the read path.
+        last_active_day: row
+            .try_get::<Option<NaiveDate>, _>("last_active_day")?
+            .unwrap_or_else(|| {
+                row.try_get::<DateTime<Utc>, _>("last_seen")
+                    .map(|ls| ls.date_naive())
+                    .unwrap_or_default()
+            }),
         first_seen: row.try_get("first_seen")?,
         last_seen: row.try_get("last_seen")?,
         eligible: row.try_get("eligible")?,

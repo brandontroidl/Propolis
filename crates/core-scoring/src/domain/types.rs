@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 
 use crate::domain::enums::{Category, FeedTier, Protocol, SignalType};
@@ -98,6 +98,12 @@ pub struct IpScore {
     pub has_confirmed_real: bool,
     pub distinct_wan_count: i32,
     pub distinct_sensor_count: i32,
+    /// Unbounded, non-decaying count of distinct calendar days this address was seen. Drives the
+    /// persistence bonus (`scoring::persistence`); folded in `engine::apply_event`.
+    pub active_days: i32,
+    /// The most recent calendar day (UTC) counted into `active_days`, so the next event knows
+    /// whether it opens a new active day. Bookkeeping for the counter, not itself a score input.
+    pub last_active_day: NaiveDate,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub eligible: bool,

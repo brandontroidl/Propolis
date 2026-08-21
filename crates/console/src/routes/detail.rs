@@ -54,7 +54,9 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
-use core_scoring::{Category, Protocol, SignalType, effective_score, read_score};
+use core_scoring::{
+    Category, Protocol, SignalType, effective_score, persistence_points, read_score,
+};
 use minijinja::context;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -280,6 +282,11 @@ async fn detail(
         distinct_categories => score.distinct_categories,
         distinct_wan_count => score.distinct_wan_count,
         distinct_sensor_count => score.distinct_sensor_count,
+        // Persistence: distinct active days and the score-point bonus they earn. Shown so a tier
+        // driven by persistence (raw below the tier floor, but many active days) is legible rather
+        // than looking like a contradiction.
+        active_days => score.active_days,
+        persistence_bonus => format!("{:.0}", persistence_points(score.active_days as i64)),
         max_confidence => format!("{:.3}", score.max_confidence),
         first_seen => format_timestamp(score.first_seen),
         last_seen => format_timestamp(score.last_seen),

@@ -85,6 +85,8 @@ fn fake_score(ip: IpAddr, raw_score: Decimal, categories: &[&str]) -> IpScore {
         has_confirmed_real: true,
         distinct_wan_count: 1,
         distinct_sensor_count: 1,
+        active_days: 1,
+        last_active_day: now.date_naive(),
         first_seen: now,
         last_seen: now,
         eligible: true,

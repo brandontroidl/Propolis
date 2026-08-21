@@ -53,6 +53,13 @@ pub async fn handle_connection(
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
+    // The interface the control connection arrived on: the passive data listener binds here (not
+    // loopback) so a remote client can reach it. Captured before `stream` is consumed by the reader.
+    let control_local_ip = stream
+        .local_addr()
+        .ok()
+        .map(|a| normalize_dual_stack(a).ip());
+
     let _ = emitter
         .append(&connection_event(source_ip, wan_ip, session_id))
         .await;
@@ -132,38 +139,60 @@ pub async fn handle_connection(
             "REST" => {
                 let _ = write_line(&mut reader, b"350 Restart position accepted (0).\r\n").await;
             }
-            "PASV" | "EPSV" => match TcpListener::bind("127.0.0.1:0").await {
-                Ok(listener) => {
-                    let data_addr = listener.local_addr().unwrap();
-                    let resp = if cmd == "PASV" {
-                        let ip = data_addr.ip();
-                        let port = data_addr.port();
-                        let ip_str = match ip {
-                            IpAddr::V4(v4) => {
-                                let o = v4.octets();
-                                format!("{},{},{},{}", o[0], o[1], o[2], o[3])
+            "PASV" | "EPSV" => {
+                // Bind the data listener on the interface the control connection arrived on (not
+                // loopback), so a remote client can actually connect to it, and advertise the
+                // address the client should dial: the mapped WAN IP if this node is behind NAT, else
+                // the control-local IP. The operator must allow the ephemeral passive data-port
+                // range inbound (and forward it, if NATed) for the data channel to complete.
+                let bind_ip =
+                    control_local_ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                match TcpListener::bind((bind_ip, 0)).await {
+                    Ok(listener) => {
+                        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+                        let resp = if cmd == "PASV" {
+                            // 227 must carry an IPv4 host to dial: prefer the WAN IPv4, else the
+                            // bound IPv4; if neither is a usable IPv4 (IPv6-only control), refuse
+                            // rather than advertise an unreachable address.
+                            let advertise_v4 = match wan_ip {
+                                Some(IpAddr::V4(v4)) => Some(v4),
+                                _ => match bind_ip {
+                                    IpAddr::V4(v4) if !v4.is_unspecified() => Some(v4),
+                                    _ => None,
+                                },
+                            };
+                            match advertise_v4 {
+                                Some(v4) => {
+                                    let o = v4.octets();
+                                    format!(
+                                        "227 Entering Passive Mode ({},{},{},{},{},{}).\r\n",
+                                        o[0],
+                                        o[1],
+                                        o[2],
+                                        o[3],
+                                        port >> 8,
+                                        port & 0xFF
+                                    )
+                                }
+                                None => {
+                                    "522 Use EPSV; PASV requires an IPv4 address.\r\n".to_string()
+                                }
                             }
-                            IpAddr::V6(_) => "127,0,0,1".to_string(),
+                        } else {
+                            format!("229 Entering Extended Passive Mode (|||{port}|)\r\n")
                         };
-                        format!(
-                            "227 Entering Passive Mode ({},{},{}).\r\n",
-                            ip_str,
-                            port >> 8,
-                            port & 0xFF
-                        )
-                    } else {
-                        format!(
-                            "229 Entering Extended Passive Mode (|||{}|)\r\n",
-                            data_addr.port()
-                        )
-                    };
-                    pasv_listener = Some(listener);
-                    let _ = write_line(&mut reader, resp.as_bytes()).await;
+                        // Only arm the listener when a passive reply actually opened it.
+                        if resp.starts_with("227") || resp.starts_with("229") {
+                            pasv_listener = Some(listener);
+                        }
+                        let _ = write_line(&mut reader, resp.as_bytes()).await;
+                    }
+                    Err(_) => {
+                        let _ =
+                            write_line(&mut reader, b"425 Cannot open data connection\r\n").await;
+                    }
                 }
-                Err(_) => {
-                    let _ = write_line(&mut reader, b"425 Cannot open data connection\r\n").await;
-                }
-            },
+            }
             "LIST" | "NLST" => {
                 if let Some(ref listener) = pasv_listener {
                     let _ =

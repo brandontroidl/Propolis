@@ -36,6 +36,18 @@ drwxr-xr-x    2 0        0            4096 Jan 16  2024 pub\r\n";
 /// NLST is bare names only (LIST is the long form above); serving the long listing for NLST was a tell.
 const CANNED_NLST: &str = "readme.txt\r\npub\r\n";
 
+/// Whether a passive data connection may be trusted as belonging to this control session.
+///
+/// A real FTP server (vsftpd's default `pasv_promiscuous=NO`) refuses a passive data connection
+/// whose source IP differs from the control connection's. Without this check an off-path attacker
+/// can race the ephemeral passive port, connect first, and have their upload captured and attributed
+/// to the CONTROL connection's `source_ip` - poisoning threat-intel attribution, which is the whole
+/// point of the platform. The data connection's source PORT always differs, so compare the
+/// normalized IP only.
+fn data_peer_matches(control_ip: IpAddr, data_peer: SocketAddr) -> bool {
+    normalize_dual_stack(data_peer).ip() == control_ip
+}
+
 pub async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -197,17 +209,19 @@ pub async fn handle_connection(
                 if let Some(ref listener) = pasv_listener {
                     let _ =
                         write_line(&mut reader, b"150 Here comes the directory listing.\r\n").await;
-                    if let Ok(Ok((mut data, _))) =
+                    if let Ok(Ok((mut data, data_peer))) =
                         tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
                             .await
                     {
-                        // LIST is the long ls -l form; NLST is bare names only.
-                        let payload = if cmd == "NLST" {
-                            CANNED_NLST
-                        } else {
-                            CANNED_LIST
-                        };
-                        let _ = data.write_all(payload.as_bytes()).await;
+                        if data_peer_matches(source_ip, data_peer) {
+                            // LIST is the long ls -l form; NLST is bare names only.
+                            let payload = if cmd == "NLST" {
+                                CANNED_NLST
+                            } else {
+                                CANNED_LIST
+                            };
+                            let _ = data.write_all(payload.as_bytes()).await;
+                        }
                         drop(data);
                     }
                     let _ = write_line(&mut reader, b"226 Directory send OK.\r\n").await;
@@ -219,10 +233,20 @@ pub async fn handle_connection(
                 let filename = sanitize_value(arg, 255);
                 if let Some(ref listener) = pasv_listener {
                     let _ = write_line(&mut reader, b"150 Ok to send data.\r\n").await;
-                    if let Ok(Ok((mut data, _))) =
+                    if let Ok(Ok((mut data, data_peer))) =
                         tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
                             .await
                     {
+                        // Refuse a data connection whose source IP is not the control peer's: it is
+                        // an off-path hijacker racing the passive port, and capturing its upload
+                        // would attribute the sample to the control connection's source_ip.
+                        if !data_peer_matches(source_ip, data_peer) {
+                            drop(data);
+                            let _ =
+                                write_line(&mut reader, b"425 Security: bad IP connecting.\r\n")
+                                    .await;
+                            continue;
+                        }
                         let mut body = Vec::new();
                         let mut chunk = [0u8; 4096];
                         loop {
@@ -424,5 +448,28 @@ mod tests {
             split_ftp_command("STOR /tmp/file name.bin"),
             ("STOR", "/tmp/file name.bin")
         );
+    }
+
+    #[test]
+    fn data_peer_must_match_control_ip() {
+        let control: IpAddr = "203.0.113.7".parse().unwrap();
+
+        // Same host, different source port on the data channel: allowed.
+        assert!(data_peer_matches(
+            control,
+            "203.0.113.7:51000".parse().unwrap()
+        ));
+
+        // A different host racing the passive port: refused (this is the hijack we block).
+        assert!(!data_peer_matches(
+            control,
+            "198.51.100.9:51000".parse().unwrap()
+        ));
+
+        // The same host arriving as an IPv4-mapped IPv6 peer must still match after normalization.
+        assert!(data_peer_matches(
+            control,
+            "[::ffff:203.0.113.7]:51000".parse().unwrap()
+        ));
     }
 }

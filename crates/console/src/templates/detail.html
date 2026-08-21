@@ -44,7 +44,7 @@
   <table class="table-compact">
     <tbody>
       <tr><td>Recommended for vendor report</td><td>{% if recommended_for_vendor %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
-      <tr><td>Recommended for blocklist</td><td>{% if recommended_for_blocklist %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
+      <tr><td>Recommended for blocklist (live score)</td><td>{% if recommended_for_blocklist %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span> <span class="dim">- may still be published via a retention window (by last seen), which does not use the live score</span>{% endif %}</td></tr>
       <tr><td>Confirmed-real latch</td><td>{% if has_confirmed_real %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
       <tr><td>Event count</td><td class="mono">{{ event_count }}</td></tr>
       <tr><td>Distinct categories (live)</td><td class="mono">{{ distinct_categories }}</td></tr>

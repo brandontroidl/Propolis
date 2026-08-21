@@ -143,6 +143,11 @@ impl VendorAdapter for DShield {
             authheader: auth_header.clone(),
         };
 
+        // TEMPORARY DIAGNOSTIC (remove once the DShield 500 root cause is found): ISC returns an
+        // empty body on the 500, so the response tells us nothing. Log the exact request JSON we send
+        // whenever ISC does not cleanly accept it, to see the failing timestamp/source_ip.
+        let request_json = serde_json::to_string(&payload).unwrap_or_default();
+
         let builder = self
             .client
             .post(url)
@@ -151,7 +156,17 @@ impl VendorAdapter for DShield {
             .header("User-Agent", "Propolis/0.1")
             .json(&payload);
 
-        match send_and_classify(builder).await {
+        let result = send_and_classify(builder).await;
+        let cleanly_accepted =
+            matches!(&result, Ok(resp) if resp.accepted && !resp.body.starts_with("ERROR"));
+        if !cleanly_accepted {
+            tracing::warn!(
+                dshield_request = %request_json,
+                "dshield: submission not accepted (diagnostic: request body above)"
+            );
+        }
+
+        match result {
             Ok(resp) if resp.body.starts_with("ERROR") => Err(VendorError::Permanent {
                 status: resp.status,
                 body: resp.body,

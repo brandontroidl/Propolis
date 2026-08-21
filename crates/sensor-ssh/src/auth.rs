@@ -27,7 +27,9 @@ use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
 };
 
-use crate::transport::{SSH_MSG_USERAUTH_REQUEST, SSH_MSG_USERAUTH_SUCCESS};
+use crate::transport::{
+    SSH_MSG_USERAUTH_FAILURE, SSH_MSG_USERAUTH_REQUEST, SSH_MSG_USERAUTH_SUCCESS,
+};
 
 /// Cap applied to every attacker-controlled string this module embeds in an event (`username`,
 /// `method`): generous for any real value, bounded so a client cannot inflate an event record by
@@ -143,12 +145,23 @@ impl AuthState {
     ) -> Result<(Vec<u8>, Vec<SensorEvent>), AuthError> {
         let (username_raw, _service, method_raw, _password) = parse_userauth_request(payload)?;
 
-        let username = sanitize_value(
-            &String::from_utf8_lossy(&username_raw),
-            MAX_METADATA_STRING_LEN,
-        );
         let method = sanitize_value(
             &String::from_utf8_lossy(&method_raw),
+            MAX_METADATA_STRING_LEN,
+        );
+
+        // A real server rejects the `none` method (RFC 4252 section 5.2) with USERAUTH_FAILURE
+        // listing the methods that can continue. `none` is the cheapest honeypot-detection probe
+        // (ssh -o PreferredAuthentications=none), so the old unconditional SUCCESS was an instant
+        // tell. It carries no credential, so there is nothing to capture: reject it without latching
+        // auth or emitting a login event. The client then proceeds to a real method (password),
+        // which is still accepted below - the capture path is unchanged.
+        if method == "none" {
+            return Ok((build_userauth_failure(), vec![]));
+        }
+
+        let username = sanitize_value(
+            &String::from_utf8_lossy(&username_raw),
             MAX_METADATA_STRING_LEN,
         );
 
@@ -177,6 +190,19 @@ impl AuthState {
         let response = vec![SSH_MSG_USERAUTH_SUCCESS];
         Ok((response, vec![event]))
     }
+}
+
+/// Build an `SSH_MSG_USERAUTH_FAILURE` (RFC 4252 section 5.1): the name-list of methods that can
+/// still continue, then `partial success = false`. Used to reject the `none` probe so the server
+/// behaves like a real OpenSSH offering publickey + password.
+fn build_userauth_failure() -> Vec<u8> {
+    const METHODS: &[u8] = b"publickey,password";
+    let mut out = Vec::with_capacity(1 + 4 + METHODS.len() + 1);
+    out.push(SSH_MSG_USERAUTH_FAILURE);
+    out.extend_from_slice(&(METHODS.len() as u32).to_be_bytes());
+    out.extend_from_slice(METHODS);
+    out.push(0); // partial success = false
+    out
 }
 
 /// `(username, service_name, method, password)`, as parsed by `parse_userauth_request`.

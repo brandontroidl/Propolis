@@ -17,6 +17,7 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
+use sensor_framework::persona;
 use sensor_framework::{
     CaptureHandoff, ConnectionBounds, EventEmitter, QuarantineSpool, WanResolver,
 };
@@ -304,9 +305,10 @@ async fn handle_session(
                         };
                         let shell = FakeShell::new(FakeFs::new(), ctx);
                         handler = ChannelHandler::Shell(shell, Vec::new());
-                        // Send an initial prompt.
-                        let prompt = b"root@server01:~# ";
-                        let data_pkt = build_channel_data(ch_id, prompt);
+                        // Send an initial prompt, hostname from the shared persona so it matches
+                        // uname / the fake filesystem / the other sensors.
+                        let prompt = persona::root_prompt(&persona::hostname());
+                        let data_pkt = build_channel_data(ch_id, prompt.as_bytes());
                         write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &data_pkt)
                             .await?;
                     }
@@ -401,7 +403,9 @@ async fn handle_session(
                                             responses.extend_from_slice(output.as_bytes());
                                         }
                                     }
-                                    responses.extend_from_slice(b"root@server01:~# ");
+                                    responses.extend_from_slice(
+                                        persona::root_prompt(&persona::hostname()).as_bytes(),
+                                    );
                                 }
                                 // Backspace / DEL: erase the last char on screen too.
                                 0x7f | 0x08 => {

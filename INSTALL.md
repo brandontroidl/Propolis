@@ -172,7 +172,7 @@ PROPOLIS_SSH_MAX_CONCURRENT=256
 # unique constant banner would let one Shodan/Censys query enumerate every node. Set this per host
 # so the fleet does not share one value. (The key-exchange offer is a minimal fixed set, so a
 # determined HASSH probe can still fingerprint the server regardless of this banner.)
-PROPOLIS_SSH_BANNER=OpenSSH_9.6p1 Ubuntu-3ubuntu13.5
+PROPOLIS_SSH_BANNER=OpenSSH_8.9p1 Ubuntu-3ubuntu0.10
 ```
 
 ### `/etc/propolis/catchall.env` (catch-all sensor)

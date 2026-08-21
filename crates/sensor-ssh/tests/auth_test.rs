@@ -196,18 +196,37 @@ fn non_password_method_is_accepted_with_no_password_key_in_metadata() {
     let mut buf = vec![transport::SSH_MSG_USERAUTH_REQUEST];
     push_ssh_string(&mut buf, b"probe");
     push_ssh_string(&mut buf, b"ssh-connection");
-    push_ssh_string(&mut buf, b"none");
-    // "none" (RFC 4252 section 5.2) carries no method-specific fields at all.
+    push_ssh_string(&mut buf, b"publickey");
+    // publickey (unlike password) carries no plaintext password, and unlike `none` it is still
+    // accepted, so it exercises the "non-password method leaves no password key" guarantee.
     let (response, events) = state.handle_userauth(&buf).unwrap();
     assert!(state.is_authenticated());
     assert_eq!(response[0], transport::SSH_MSG_USERAUTH_SUCCESS);
     assert_eq!(
         events[0].metadata.get("method").and_then(|v| v.as_str()),
-        Some("none")
+        Some("publickey")
     );
     // The structural guarantee, not just "the password value is absent": a method that never
     // carried a password must leave no "password" key in metadata at all.
     assert!(events[0].metadata.get("password").is_none());
+}
+
+#[test]
+fn none_method_is_rejected_like_a_real_server() {
+    // `none` (RFC 4252 section 5.2) is the cheapest honeypot-detection probe. A real server rejects
+    // it with USERAUTH_FAILURE and grants nothing; the old code granted SUCCESS, an instant tell.
+    let mut state = AuthState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
+    let mut buf = vec![transport::SSH_MSG_USERAUTH_REQUEST];
+    push_ssh_string(&mut buf, b"probe");
+    push_ssh_string(&mut buf, b"ssh-connection");
+    push_ssh_string(&mut buf, b"none");
+    let (response, events) = state.handle_userauth(&buf).unwrap();
+    assert_eq!(response[0], transport::SSH_MSG_USERAUTH_FAILURE);
+    assert!(!state.is_authenticated(), "none must not latch auth");
+    assert!(
+        events.is_empty(),
+        "none is a probe, not a login attempt to record"
+    );
 }
 
 #[test]

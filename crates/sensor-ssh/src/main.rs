@@ -32,16 +32,16 @@ const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_SSH_MAX_CAPTURED_BYTES";
 const ENV_MAX_CONCURRENT: &str = "PROPOLIS_SSH_MAX_CONCURRENT";
 const ENV_BANNER: &str = "PROPOLIS_SSH_BANNER";
 
-/// The software-version sent in `SSH-2.0-<this>`. Default is a common current OpenSSH-on-Ubuntu
-/// string so the honeypot blends into the internet's largest SSH population rather than standing
-/// out: a unique constant banner (the previous `netsshd_1.0`) let one Shodan/Censys query enumerate
-/// every Propolis node and zero real hosts, which is the worst outcome for a trap. Operators SHOULD
-/// still set `PROPOLIS_SSH_BANNER` per host so the fleet does not share one value. Caveat: the
-/// key-exchange offer (`transport::build_kexinit`) is a minimal set fixed by the pinned crypto
-/// (ADR-0011), so a determined HASSHServer probe can still tell this from a real OpenSSH regardless
-/// of the banner; aligning the KEXINIT is a separate follow-up that needs more crypto than the ADR
-/// currently permits.
-const DEFAULT_BANNER: &str = "OpenSSH_9.6p1 Ubuntu-3ubuntu13.5";
+/// The software-version sent in `SSH-2.0-<this>`. Defaults to the OpenSSH build the shared persona
+/// claims (an Ubuntu 22.04 host -> OpenSSH 8.9p1), so the banner blends into the internet's largest
+/// SSH population AND does not contradict the handshake. The previous default claimed 9.6p1, whose
+/// real KEXINIT always advertises the kex-strict / ext-info Terrapin mitigation that this server
+/// does not emit, so a Terrapin scanner flagged the mismatch; 8.9p1 predates those, so omitting them
+/// is consistent. Operators SHOULD still set `PROPOLIS_SSH_BANNER` per host so the fleet does not
+/// share one value. Residual: the KEXINIT algorithm set is a minimal fixed offer (ADR-0011), so a
+/// HASSHServer probe can still distinguish this from a real OpenSSH; aligning the KEXINIT needs more
+/// crypto than the ADR currently permits and is tracked as a separate follow-up.
+const DEFAULT_BANNER: &str = sensor_framework::persona::OPENSSH_VERSION;
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/ssh/events.jsonl";
 const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/ssh";

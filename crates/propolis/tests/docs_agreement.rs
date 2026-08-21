@@ -36,11 +36,11 @@ fn collect_src(dir: &Path, out: &mut String) {
                 continue;
             }
             collect_src(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            if let Ok(text) = fs::read_to_string(&path) {
-                out.push_str(&text);
-                out.push('\n');
-            }
+        } else if path.extension().is_some_and(|e| e == "rs")
+            && let Ok(text) = fs::read_to_string(&path)
+        {
+            out.push_str(&text);
+            out.push('\n');
         }
     }
 }

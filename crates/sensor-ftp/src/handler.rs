@@ -19,10 +19,22 @@ const MAX_LINE_LEN: usize = 8192;
 const MAX_USERNAME_LEN: usize = 255;
 const MAX_STOR_BODY: usize = 10_000_000;
 
-const BANNER: &[u8] = b"220 FTP server ready\r\n";
+// Impersonate vsFTPd 3.0.5 end to end: the banner, the FEAT block, and every response string below
+// are that daemon's real output. A banner that matches no daemon - or a banner and FEAT that do not
+// belong to the same daemon - is itself the fingerprint.
+const BANNER: &[u8] = b"220 (vsFTPd 3.0.5)\r\n";
+
+/// The one advertised regular file, kept consistent across LIST, SIZE and MDTM (an epoch mtime and a
+/// listing size that disagreed with SIZE were tells). vsftpd renders numeric uid/gid by default and,
+/// for a file older than six months, the year form of the date.
+const CANNED_FILE: &str = "readme.txt";
+const CANNED_FILE_SIZE: u64 = 4096;
+const CANNED_FILE_MDTM: &str = "20240116102430"; // YYYYMMDDHHMMSS, == the LIST date
 const CANNED_LIST: &str = "\
--rw-r--r--   1 root  root      4096 Jan  1 00:00 readme.txt\r\n\
-drwxr-xr-x   2 root  root      4096 Jan  1 00:00 pub\r\n";
+-rw-r--r--    1 0        0            4096 Jan 16  2024 readme.txt\r\n\
+drwxr-xr-x    2 0        0            4096 Jan 16  2024 pub\r\n";
+/// NLST is bare names only (LIST is the long form above); serving the long listing for NLST was a tell.
+const CANNED_NLST: &str = "readme.txt\r\npub\r\n";
 
 pub async fn handle_connection(
     stream: TcpStream,
@@ -64,7 +76,7 @@ pub async fn handle_connection(
         match cmd {
             "USER" => {
                 username = sanitize_value(arg, MAX_USERNAME_LEN);
-                let _ = write_line(&mut reader, b"331 Password required\r\n").await;
+                let _ = write_line(&mut reader, b"331 Please specify the password.\r\n").await;
             }
             "PASS" => {
                 // Password read to advance protocol; immediately dropped.
@@ -72,26 +84,53 @@ pub async fn handle_connection(
                 let _ = emitter
                     .append(&login_event(source_ip, wan_ip, &username, session_id))
                     .await;
-                let _ = write_line(&mut reader, b"230 Login successful\r\n").await;
+                let _ = write_line(&mut reader, b"230 Login successful.\r\n").await;
             }
             "SYST" => {
                 let _ = write_line(&mut reader, b"215 UNIX Type: L8\r\n").await;
             }
             "FEAT" => {
+                // vsftpd 3.0.5's FEAT, limited to what this sensor actually backs (SIZE/MDTM/REST
+                // are implemented below; EPRT is omitted since active mode is not supported).
                 let _ = write_line(
                     &mut reader,
-                    b"211-Features:\r\n PASV\r\n UTF8\r\n211 End\r\n",
+                    b"211-Features:\r\n EPSV\r\n MDTM\r\n PASV\r\n REST STREAM\r\n SIZE\r\n TVFS\r\n UTF8\r\n211 End\r\n",
                 )
                 .await;
             }
             "PWD" | "XPWD" => {
-                let _ = write_line(&mut reader, b"257 \"/\" is current directory\r\n").await;
+                let _ = write_line(&mut reader, b"257 \"/\" is the current directory\r\n").await;
             }
             "CWD" | "XCWD" => {
-                let _ = write_line(&mut reader, b"250 Directory changed\r\n").await;
+                let _ = write_line(&mut reader, b"250 Directory successfully changed.\r\n").await;
             }
             "TYPE" => {
-                let _ = write_line(&mut reader, b"200 Type set\r\n").await;
+                // vsftpd validates the type argument rather than blindly accepting it.
+                let reply: &[u8] = match arg.to_ascii_uppercase().as_str() {
+                    "I" | "L 8" | "L8" => b"200 Switching to Binary mode.\r\n",
+                    "A" | "A N" => b"200 Switching to ASCII mode.\r\n",
+                    _ => b"500 Unrecognised TYPE command.\r\n",
+                };
+                let _ = write_line(&mut reader, reply).await;
+            }
+            "SIZE" => {
+                let reply = if sanitize_value(arg, 255) == CANNED_FILE {
+                    format!("213 {CANNED_FILE_SIZE}\r\n")
+                } else {
+                    "550 Could not get file size.\r\n".to_string()
+                };
+                let _ = write_line(&mut reader, reply.as_bytes()).await;
+            }
+            "MDTM" => {
+                let reply = if sanitize_value(arg, 255) == CANNED_FILE {
+                    format!("213 {CANNED_FILE_MDTM}\r\n")
+                } else {
+                    "550 Could not get file modification time.\r\n".to_string()
+                };
+                let _ = write_line(&mut reader, reply.as_bytes()).await;
+            }
+            "REST" => {
+                let _ = write_line(&mut reader, b"350 Restart position accepted (0).\r\n").await;
             }
             "PASV" | "EPSV" => match TcpListener::bind("127.0.0.1:0").await {
                 Ok(listener) => {
@@ -127,23 +166,30 @@ pub async fn handle_connection(
             },
             "LIST" | "NLST" => {
                 if let Some(ref listener) = pasv_listener {
-                    let _ = write_line(&mut reader, b"150 Opening data connection\r\n").await;
+                    let _ =
+                        write_line(&mut reader, b"150 Here comes the directory listing.\r\n").await;
                     if let Ok(Ok((mut data, _))) =
                         tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
                             .await
                     {
-                        let _ = data.write_all(CANNED_LIST.as_bytes()).await;
+                        // LIST is the long ls -l form; NLST is bare names only.
+                        let payload = if cmd == "NLST" {
+                            CANNED_NLST
+                        } else {
+                            CANNED_LIST
+                        };
+                        let _ = data.write_all(payload.as_bytes()).await;
                         drop(data);
                     }
-                    let _ = write_line(&mut reader, b"226 Transfer complete\r\n").await;
+                    let _ = write_line(&mut reader, b"226 Directory send OK.\r\n").await;
                 } else {
-                    let _ = write_line(&mut reader, b"425 Use PASV first\r\n").await;
+                    let _ = write_line(&mut reader, b"425 Use PORT or PASV first.\r\n").await;
                 }
             }
             "STOR" => {
                 let filename = sanitize_value(arg, 255);
                 if let Some(ref listener) = pasv_listener {
-                    let _ = write_line(&mut reader, b"150 Opening data connection\r\n").await;
+                    let _ = write_line(&mut reader, b"150 Ok to send data.\r\n").await;
                     if let Ok(Ok((mut data, _))) =
                         tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
                             .await
@@ -194,26 +240,28 @@ pub async fn handle_connection(
                         };
                         let _ = handoff.submit(job);
                     }
-                    let _ = write_line(&mut reader, b"226 Transfer complete\r\n").await;
+                    let _ = write_line(&mut reader, b"226 Transfer complete.\r\n").await;
                 } else {
-                    let _ = write_line(&mut reader, b"425 Use PASV first\r\n").await;
+                    let _ = write_line(&mut reader, b"425 Use PORT or PASV first.\r\n").await;
                 }
             }
             "RETR" => {
-                let _ = write_line(&mut reader, b"550 Permission denied\r\n").await;
+                let _ = write_line(&mut reader, b"550 Failed to open file.\r\n").await;
             }
             "PORT" | "EPRT" => {
-                let _ = write_line(&mut reader, b"502 Not implemented\r\n").await;
+                // Known commands, but active mode is unimplemented -> 502 (not 500, which is for an
+                // unrecognized verb). This also keeps the sensor from ever dialing out.
+                let _ = write_line(&mut reader, b"502 Command not implemented.\r\n").await;
             }
             "QUIT" => {
-                let _ = write_line(&mut reader, b"221 Goodbye\r\n").await;
+                let _ = write_line(&mut reader, b"221 Goodbye.\r\n").await;
                 return;
             }
             "NOOP" => {
-                let _ = write_line(&mut reader, b"200 OK\r\n").await;
+                let _ = write_line(&mut reader, b"200 NOOP ok.\r\n").await;
             }
             _ => {
-                let _ = write_line(&mut reader, b"502 Not implemented\r\n").await;
+                let _ = write_line(&mut reader, b"500 Unknown command.\r\n").await;
             }
         }
     }

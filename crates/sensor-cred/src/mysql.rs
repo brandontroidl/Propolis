@@ -66,12 +66,18 @@ pub async fn handle_connection(
 }
 
 fn build_greeting() -> Vec<u8> {
+    // Per-connection random thread id and scramble. A real MySQL server varies both on every
+    // connection; the old constants (id 1, an all-0x42 scramble) were a one-packet honeypot tell
+    // and made the challenge-response replayable.
+    let conn_id: u32 = (rand::random::<u32>() % 50_000) + 1000;
+    let scramble: [u8; 20] = rand::random();
+
     let mut payload = Vec::new();
     payload.push(0x0a); // protocol version 10
     payload.extend_from_slice(b"5.7.42\0"); // server version (never embed the project name here - a
     // banner that names the honeypot lets a scanner find every node by searching for it)
-    payload.extend_from_slice(&1u32.to_le_bytes()); // connection id
-    payload.extend_from_slice(&[0x42; 8]); // auth-plugin-data part 1
+    payload.extend_from_slice(&conn_id.to_le_bytes()); // connection id
+    payload.extend_from_slice(&scramble[..8]); // auth-plugin-data part 1
     payload.push(0x00); // filler
     // capability flags lower: CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION
     payload.extend_from_slice(&0x0200_f7ffu32.to_le_bytes()[..2]);
@@ -81,7 +87,8 @@ fn build_greeting() -> Vec<u8> {
     payload.extend_from_slice(&0x0200_f7ffu32.to_le_bytes()[2..4]);
     payload.push(21); // auth-plugin-data length
     payload.extend_from_slice(&[0x00; 10]); // reserved
-    payload.extend_from_slice(&[0x42; 13]); // auth-plugin-data part 2 (12 + NUL)
+    payload.extend_from_slice(&scramble[8..20]); // auth-plugin-data part 2 (12 bytes)
+    payload.push(0x00); // NUL terminator for auth-plugin-data
     payload.extend_from_slice(b"mysql_native_password\0");
 
     wrap_packet(0, &payload)
@@ -189,5 +196,16 @@ mod tests {
         assert_eq!(extract_nul_string(b"root\0extra"), "root");
         assert_eq!(extract_nul_string(b"admin"), "admin");
         assert_eq!(extract_nul_string(b"\0"), "");
+    }
+
+    #[test]
+    fn greeting_randomizes_per_connection() {
+        // With the old constant thread id and all-0x42 scramble every greeting was byte-identical,
+        // a one-packet honeypot tell and a replayable auth challenge. Two greetings must now differ.
+        assert_ne!(
+            build_greeting(),
+            build_greeting(),
+            "greeting must vary per connection (random thread id + scramble)"
+        );
     }
 }

@@ -76,8 +76,9 @@ pub async fn handle_connection(
         return; // only VNC Auth supported
     }
 
-    // 5. Server -> Client: 16-byte challenge (static - honeypot, not real security)
-    let challenge = [0x42u8; VNC_AUTH_CHALLENGE_LEN];
+    // 5. Server -> Client: 16-byte challenge. Per-connection random: a real RFB server sends a
+    // fresh random challenge, and a constant one is both a fingerprint and a replayable DES auth.
+    let challenge: [u8; VNC_AUTH_CHALLENGE_LEN] = rand::random();
     if stream.write_all(&challenge).await.is_err() {
         return;
     }

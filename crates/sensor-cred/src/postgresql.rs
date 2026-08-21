@@ -99,7 +99,8 @@ pub async fn handle_connection(
     let username = sanitize_value(&username, 255);
 
     // 2. Send AuthenticationMD5Password challenge
-    let salt = [0x42u8; 4]; // static salt - honeypot
+    let salt: [u8; 4] = rand::random(); // per-connection random MD5 salt (a constant salt is a
+    // one-packet tell and lets the challenge-response be replayed)
     let mut auth_msg = Vec::new();
     auth_msg.push(b'R'); // Authentication message type
     let body_len: i32 = 4 + 4 + 4; // length + auth_type + salt

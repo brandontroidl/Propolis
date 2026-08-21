@@ -405,7 +405,7 @@ async fn permanent_error_never_echoes_the_api_key() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn dshield_payload_has_ip_port_and_protocol() {
+async fn dshield_payload_uses_cowrie_schema_fields() {
     let (base_url, server) = respond_once(200, "OK", r#"{"status":"ok"}"#).await;
     let adapter = DShield::new(reqwest::Client::new(), "test-user:test-key", base_url);
     let report = sample_report(build_dshield_categories(Some("telnet"), Category::Honeypot));
@@ -444,12 +444,11 @@ async fn dshield_payload_has_ip_port_and_protocol() {
         json["authheader"], *auth,
         "the body's authheader must carry the same credential as the header"
     );
-    // The entry must use ISC's OWN field names for the declared log type. This is the assertion
-    // that was missing: ISC does not reject an entry whose fields it cannot read - it answers
-    // "OK <n> Bytes received" and silently drops the record - so the adapter looked healthy for
-    // weeks while sending {time, source, port}, which matches no schema ISC defines, and not one
-    // submission was ever attributed to the account. Field names verified against Cowrie's own
-    // DShield output plugin.
+    // The entry must carry EXACTLY Cowrie's cowrie-schema field set. ISC does not reject an entry
+    // whose fields it cannot read - it answers "OK <n> Bytes received" - but it silently DROPS a
+    // cowrie record missing an expected key, attributing nothing. A four-field entry (no
+    // password/hassh/banner) submitted cleanly yet never appeared on the account's report; the fix
+    // is to match `cowrie/src/cowrie/output/dshield.py`'s seven fields exactly.
     let log = &json["logs"][0];
     let mut keys: Vec<&str> = log
         .as_object()
@@ -460,8 +459,16 @@ async fn dshield_payload_has_ip_port_and_protocol() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        vec!["lastcommand", "source_ip", "timestamp", "user"],
-        "entry must carry exactly ISC's cowrie-schema fields"
+        vec![
+            "banner",
+            "hassh",
+            "lastcommand",
+            "password",
+            "source_ip",
+            "timestamp",
+            "user",
+        ],
+        "entry must carry exactly Cowrie's cowrie-schema fields, or ISC drops it"
     );
     assert_eq!(log["source_ip"], "203.0.113.50");
     assert!(
@@ -470,11 +477,12 @@ async fn dshield_payload_has_ip_port_and_protocol() {
         log["timestamp"]
     );
 
-    // Never a password field: this honeypot drops captured passwords on capture and has none to
-    // send, so the schema's password slot must stay absent rather than be filled with a blank.
-    assert!(
-        log.get("password").is_none(),
-        "a password must never be transmitted to a third party"
+    // The password field is PRESENT (the schema requires it, or the record is dropped) but always
+    // EMPTY: this honeypot drops captured passwords on capture, so its content is never a
+    // credential - the field's presence is required, its value is not.
+    assert_eq!(
+        log["password"], "",
+        "the password field must be present but empty - never a transmitted credential"
     );
 }
 

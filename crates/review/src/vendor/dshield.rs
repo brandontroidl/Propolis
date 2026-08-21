@@ -89,21 +89,27 @@ struct SubmitPayload {
 
 /// One honeypot session, in ISC's `cowrie` schema.
 ///
-/// `user` and `last_command` are carried as empty strings rather than omitted: the fields are part
-/// of the schema, and this crate's `VendorReport` does not currently thread the captured username
-/// or command through to the vendor layer. Populating them is a worthwhile follow-up - both are
-/// already captured per session - but it means transmitting attacker-supplied strings to a third
-/// party, which is an operator's decision to make rather than a detail to slip in with a bug fix.
+/// The field set matches Cowrie's own DShield output plugin EXACTLY (verified against
+/// `cowrie/src/cowrie/output/dshield.py`, which sends `timestamp, source_ip, user, password,
+/// lastcommand, hassh, banner` per log). DShield silently DROPS a cowrie record that is missing any
+/// of those keys - it answers `OK <n> Bytes received` and attributes nothing - which is why an
+/// earlier four-field entry (no `password`/`hassh`/`banner`) submitted cleanly yet never showed up
+/// on the account's report. Every field is therefore present; the ones this crate does not thread
+/// through (`user`, `last_command`, `hassh`, `banner`) are empty strings.
 ///
-/// There is deliberately no `password` field even though the schema defines one. This honeypot
-/// drops captured passwords immediately by design and has none to send.
+/// `password` is present but ALWAYS empty: this honeypot drops captured passwords by design, so it
+/// has none to send. Sending an empty string satisfies the schema without transmitting a
+/// credential - the field's presence is required for attribution, its content is not.
 #[derive(serde::Serialize)]
 struct LogEntry {
     timestamp: String,
     source_ip: String,
     user: String,
+    password: String,
     #[serde(rename = "lastcommand")]
     last_command: String,
+    hassh: String,
+    banner: String,
 }
 
 #[async_trait]
@@ -129,7 +135,10 @@ impl VendorAdapter for DShield {
                 timestamp: report.evidence_window.1.to_rfc3339(),
                 source_ip: report.source_ip.to_string(),
                 user: String::new(),
+                password: String::new(),
                 last_command: String::new(),
+                hassh: String::new(),
+                banner: String::new(),
             }],
             authheader: auth_header.clone(),
         };

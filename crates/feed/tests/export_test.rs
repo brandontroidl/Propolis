@@ -34,7 +34,7 @@ fn sample_entries() -> Vec<FeedEntry> {
     vec![
         FeedEntry {
             source_ip: ip("203.0.113.7"),
-            tier: FeedTier::Aggressive,
+            tier: Some(FeedTier::Aggressive),
             first_seen: dt("2026-07-20T10:00:00Z"),
             last_seen: dt("2026-07-29T13:00:00Z"),
             event_count: 47,
@@ -48,7 +48,7 @@ fn sample_entries() -> Vec<FeedEntry> {
         },
         FeedEntry {
             source_ip: ip("203.0.113.12"),
-            tier: FeedTier::Aggressive,
+            tier: Some(FeedTier::Aggressive),
             first_seen: dt("2026-07-21T11:00:00Z"),
             last_seen: dt("2026-07-28T09:00:00Z"),
             event_count: 12,
@@ -300,7 +300,7 @@ fn cidr_ipv6_entries_are_slash_128_host_routes_never_slash_32() {
     let mut entries = sample_entries();
     entries.push(FeedEntry {
         source_ip: ip("2003:aaaa:bbbb::7"),
-        tier: FeedTier::Aggressive,
+        tier: Some(FeedTier::Aggressive),
         first_seen: dt(GENERATED),
         last_seen: dt(GENERATED),
         event_count: 5,

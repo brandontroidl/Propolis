@@ -33,7 +33,10 @@ pub enum FeedError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedEntry {
     pub source_ip: IpAddr,
-    pub tier: FeedTier,
+    /// `None` for a volume-listed flood published only in the retention windows; `Some` for a
+    /// score-tiered entry. Not serialized into the published files (each file's tier is its own
+    /// name/label); used to route entries between the tier files and to re-validate.
+    pub tier: Option<FeedTier>,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub event_count: i32,
@@ -113,7 +116,10 @@ impl Default for FeedConfig {
 /// observation time means an IP enters one file and stays there for its window.
 struct Candidate {
     ip: IpAddr,
-    tier: FeedTier,
+    /// `None` for a volume-listed flood (no score-tier). Such a candidate is excluded from the
+    /// aggressive/standard tier files (which filter on `Some(tier)`) and appears only in the
+    /// retention windows.
+    tier: Option<FeedTier>,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
     event_count: i32,
@@ -201,7 +207,50 @@ impl FeedBuilder {
 
             candidates.push(Candidate {
                 ip,
-                tier,
+                tier: Some(tier),
+                first_seen: row.try_get("first_seen")?,
+                last_seen: row.try_get("last_seen")?,
+                event_count: row.try_get("event_count")?,
+                distinct_categories: row.try_get("distinct_categories")?,
+                categories: row.try_get("categories")?,
+            });
+        }
+
+        // Volume-listed floods: recommended for the blocklist on connection volume alone (no
+        // confirmed-real latch, so eligible = false, so tier = NULL and no operator approval). They
+        // are auto-published into the RETENTION windows only - never the score-tiered files - so a
+        // hyperactive flooder the dedup would otherwise erase still gets blocked. `eligible = false`
+        // AND `recommended_for_blocklist = true` uniquely identifies them (see core-scoring's
+        // derive_projection). Exclusions still apply, the same as for merit candidates.
+        let volume_rows = sqlx::query(
+            "SELECT host(s.source_ip) AS source_ip, s.first_seen, s.last_seen, \
+                    s.event_count, s.distinct_categories, \
+                    ARRAY(SELECT DISTINCT e.signal_type::text FROM event e \
+                          WHERE e.source_ip = s.source_ip ORDER BY 1) AS categories \
+             FROM ip_score s \
+             WHERE s.recommended_for_blocklist = true AND s.eligible = false",
+        )
+        .fetch_all(pool)
+        .await?;
+
+        for row in volume_rows {
+            let ip_text: String = row.try_get("source_ip")?;
+            let ip: IpAddr = match ip_text.parse() {
+                Ok(ip) => ip,
+                Err(_) => {
+                    tracing::warn!(
+                        ip_text = %ip_text,
+                        "feed builder: unparseable stored source_ip (volume), excluding"
+                    );
+                    continue;
+                }
+            };
+            if exclusions.is_excluded(ip) {
+                continue;
+            }
+            candidates.push(Candidate {
+                ip,
+                tier: None,
                 first_seen: row.try_get("first_seen")?,
                 last_seen: row.try_get("last_seen")?,
                 event_count: row.try_get("event_count")?,
@@ -212,10 +261,10 @@ impl FeedBuilder {
 
         let now = Utc::now();
         let aggressive = materialize(&candidates, now, config.aggressive_ttl, |c| {
-            c.tier == FeedTier::Aggressive
+            c.tier == Some(FeedTier::Aggressive)
         });
         let standard = materialize(&candidates, now, config.standard_ttl, |c| {
-            c.tier == FeedTier::Standard
+            c.tier == Some(FeedTier::Standard)
         });
         let windows: Vec<WindowFeed> = config
             .windows
@@ -330,7 +379,7 @@ mod tests {
     fn candidate(last_octet: u8, tier: FeedTier, hours_ago: i64, now: DateTime<Utc>) -> Candidate {
         Candidate {
             ip: format!("198.51.100.{last_octet}").parse().unwrap(),
-            tier,
+            tier: Some(tier),
             first_seen: now - Duration::hours(hours_ago + 500),
             last_seen: now - Duration::hours(hours_ago),
             event_count: 37,
@@ -389,10 +438,10 @@ mod tests {
         ];
 
         let aggressive = materialize(&cands, now, Duration::hours(24), |c| {
-            c.tier == FeedTier::Aggressive
+            c.tier == Some(FeedTier::Aggressive)
         });
         let standard = materialize(&cands, now, Duration::hours(48), |c| {
-            c.tier == FeedTier::Standard
+            c.tier == Some(FeedTier::Standard)
         });
 
         assert_eq!(aggressive.len(), 1);
@@ -426,6 +475,33 @@ mod tests {
     }
 
     #[test]
+    fn a_volume_flood_lands_in_retention_but_not_the_tier_files() {
+        let now = now_fixed();
+        // A volume-listed flood carries no score-tier (None). It must be excluded from the
+        // aggressive/standard files (which filter on Some(tier)) and appear only in the
+        // tier-agnostic retention windows.
+        let mut flood = candidate(9, FeedTier::Aggressive, 1, now);
+        flood.tier = None;
+        let cands = [flood];
+
+        let aggressive = materialize(&cands, now, Duration::hours(24), |c| {
+            c.tier == Some(FeedTier::Aggressive)
+        });
+        let standard = materialize(&cands, now, Duration::hours(48), |c| {
+            c.tier == Some(FeedTier::Standard)
+        });
+        let retention = materialize(&cands, now, Duration::days(1), |_| true);
+
+        assert!(
+            aggressive.is_empty(),
+            "volume flood must not be in aggressive"
+        );
+        assert!(standard.is_empty(), "volume flood must not be in standard");
+        assert_eq!(retention.len(), 1, "volume flood must be in retention");
+        assert_eq!(retention[0].tier, None);
+    }
+
+    #[test]
     fn evidence_counts_survive_materialisation() {
         // The stored evidence is what an operator judges an entry by; a carry-forward that
         // zeroed it would still produce a well-formed feed.
@@ -442,7 +518,7 @@ mod tests {
             out[0].categories,
             ["ssh_brute_force", "honeypot_command_exec"]
         );
-        assert_eq!(out[0].tier, FeedTier::Aggressive);
+        assert_eq!(out[0].tier, Some(FeedTier::Aggressive));
         assert_eq!(
             out[0].first_seen,
             coarsen_to_hour(now - Duration::hours(501))

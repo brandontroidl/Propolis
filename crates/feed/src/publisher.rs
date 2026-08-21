@@ -51,7 +51,7 @@ pub enum PublishError {
         "entry {ip} in the {tier:?} tier failed publisher re-validation against exclusions; \
          rejecting the entire build"
     )]
-    ExclusionViolation { ip: IpAddr, tier: FeedTier },
+    ExclusionViolation { ip: IpAddr, tier: Option<FeedTier> },
 
     /// `output_dir` has no file-name component (e.g. `/`), so a same-filesystem sibling staging
     /// directory cannot be derived. Fails closed rather than falling back to a system temp

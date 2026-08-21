@@ -149,7 +149,7 @@ async fn aggressive_and_standard_entries_are_built_sorted_and_isolated_by_tier()
         .iter()
         .filter(|e| e.source_ip == agg_hi || e.source_ip == agg_lo)
     {
-        assert_eq!(entry.tier, FeedTier::Aggressive);
+        assert_eq!(entry.tier, Some(FeedTier::Aggressive));
         assert_eq!(entry.event_count, 2);
         assert_eq!(entry.distinct_categories, 2);
         assert_eq!(entry.valid_from, snapshot.build_time);
@@ -164,7 +164,7 @@ async fn aggressive_and_standard_entries_are_built_sorted_and_isolated_by_tier()
         .iter()
         .find(|e| e.source_ip == std_ip)
         .expect("standard-tier IP missing from snapshot");
-    assert_eq!(std_entry.tier, FeedTier::Standard);
+    assert_eq!(std_entry.tier, Some(FeedTier::Standard));
     assert_eq!(std_entry.event_count, 2);
     assert_eq!(std_entry.distinct_categories, 2);
     assert_eq!(
@@ -333,7 +333,7 @@ async fn ipv6_source_ip_is_supported_end_to_end() {
         .iter()
         .find(|e| e.source_ip == ip)
         .expect("ipv6 ip missing from snapshot");
-    assert_eq!(entry.tier, FeedTier::Aggressive);
+    assert_eq!(entry.tier, Some(FeedTier::Aggressive));
     assert!(matches!(entry.source_ip, IpAddr::V6(_)));
 }
 

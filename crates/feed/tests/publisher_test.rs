@@ -51,7 +51,7 @@ fn entry(
     };
     FeedEntry {
         source_ip,
-        tier,
+        tier: Some(tier),
         first_seen: build_time,
         last_seen: build_time,
         event_count: 2,
@@ -92,7 +92,7 @@ fn fail_closed_rejects_the_entire_build_when_any_entry_is_excluded() {
     match result {
         Err(PublishError::ExclusionViolation { ip: bad_ip, tier }) => {
             assert_eq!(bad_ip, ip("10.0.0.1"));
-            assert_eq!(tier, FeedTier::Standard);
+            assert_eq!(tier, Some(FeedTier::Standard));
         }
         other => panic!("expected ExclusionViolation, got {other:?}"),
     }
@@ -207,7 +207,7 @@ fn fail_closed_rejects_when_the_violation_is_in_the_aggressive_tier_too() {
     assert!(matches!(
         result,
         Err(PublishError::ExclusionViolation {
-            tier: FeedTier::Aggressive,
+            tier: Some(FeedTier::Aggressive),
             ..
         })
     ));

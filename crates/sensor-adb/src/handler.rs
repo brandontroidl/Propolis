@@ -458,6 +458,11 @@ pub async fn handle_connection(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Max concurrently-open ADB streams per connection. Each accepted interactive/sync OPEN pins a
+/// `Stream` (a FakeShell plus its fake filesystem) in the streams map; a real device also bounds
+/// concurrent streams, and this stops an OPEN flood from amplifying wire bytes into unbounded heap.
+const MAX_STREAMS_PER_CONN: usize = 32;
+
 async fn handle_open(
     stream: &mut TcpStream,
     header: &Header,
@@ -476,6 +481,16 @@ async fn handle_open(
         // session that violates this from the very first stream it opens.
         return Err(());
     }
+
+    // Cap concurrently-open streams. Without this, a client that floods OPEN with a fresh id and
+    // never CLSEs pins a FakeShell + FakeFs per stream (~30 wire bytes amplified to KBs of resident
+    // heap each), OOM-killing the sensor. Once the cap is hit, refuse further opens with a CLSE
+    // (arg0=0 marks a failed open) instead of allocating another stream.
+    if streams.len() >= MAX_STREAMS_PER_CONN {
+        write_or_err(stream, &adb_proto::build_clse(0, client_local_id)).await?;
+        return Ok(());
+    }
+
     let dest = String::from_utf8_lossy(data).into_owned();
 
     match adb_proto::classify_destination(&dest) {

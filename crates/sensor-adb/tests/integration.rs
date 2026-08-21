@@ -630,6 +630,31 @@ async fn concurrent_shell_and_sync_streams_on_one_connection() {
 }
 
 #[tokio::test]
+async fn open_flood_is_capped_with_close_not_unbounded_streams() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+
+    // Fill the per-connection stream table (MAX_STREAMS_PER_CONN = 32) with sync streams.
+    for local_id in 1..=32u32 {
+        let _ = open_stream(&mut conn, local_id, "sync:").await;
+    }
+    // The next OPEN must be refused with a CLSE (not OKAY) rather than allocating another
+    // FakeShell/FakeFs - the guard against an OPEN-flood OOM.
+    conn.write_all(&adb_proto::build_open(33, "sync:"))
+        .await
+        .unwrap();
+    let (header, _) = read_message(&mut conn).await;
+    assert_eq!(
+        header.command,
+        adb_proto::A_CLSE,
+        "the 33rd concurrent OPEN must be refused with CLSE, got {:#x}",
+        header.command
+    );
+    srv.handle.abort();
+}
+
+#[tokio::test]
 async fn unsupported_open_destination_is_refused_with_close_not_okay() {
     let srv = TestServer::start().await;
     let mut conn = TcpStream::connect(srv.addr).await.unwrap();

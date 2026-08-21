@@ -226,7 +226,8 @@ impl SubmissionRunner {
                             | GateReason::RateLimit
                             | GateReason::ScoreFloor
                             | GateReason::CategoryFilter
-                            | GateReason::Disabled => {
+                            | GateReason::Disabled
+                            | GateReason::Stale => {
                                 tracing::debug!(%ip, vendor = %name, ?reason, "submission held");
                             }
                             // Rare and worth surfacing: a reserved-range IP that reached an approved

@@ -131,6 +131,35 @@ async fn insert_submission(pool: &PgPool, ip: &str, vendor: &str, submitted_at: 
 }
 
 #[tokio::test]
+async fn stale_last_seen_is_held() {
+    let pool = setup_pool().await;
+    let ip: IpAddr = "45.10.31.243".parse().unwrap();
+    let config = permissive_config("stale-vendor");
+    // Active three days ago: older than the freshness window, so it must not be submitted (a
+    // days-old attack is not current honeypot activity, and vendors reject the stale timestamp).
+    let mut score = fake_score(ip, Decimal::from(80), &["Honeypot"]);
+    score.last_seen = Utc::now() - Duration::days(3);
+
+    let result = check(&pool, ip, &config, &score).await;
+    assert_eq!(result, GateResult::Held(GateReason::Stale));
+}
+
+#[tokio::test]
+async fn recent_last_seen_passes_the_freshness_gate() {
+    let pool = setup_pool().await;
+    let vendor = "fresh-vendor";
+    let ip: IpAddr = "45.10.31.244".parse().unwrap();
+    reset_vendor(&pool, vendor).await;
+    let config = permissive_config(vendor);
+    // Active one hour ago: comfortably inside the freshness window, so every other check applies.
+    let mut score = fake_score(ip, Decimal::from(80), &["Honeypot"]);
+    score.last_seen = Utc::now() - Duration::hours(1);
+
+    let result = check(&pool, ip, &config, &score).await;
+    assert_eq!(result, GateResult::Pass);
+}
+
+#[tokio::test]
 async fn vendor_disabled_is_held() {
     let pool = setup_pool().await;
     let ip: IpAddr = "45.10.31.230".parse().unwrap();

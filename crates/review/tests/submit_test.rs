@@ -58,6 +58,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{Duration, Utc};
 use core_scoring::{EventInput, Protocol, SignalType, append_event};
 use sqlx::{PgPool, Row};
 
@@ -219,6 +220,12 @@ fn ev(
 /// metadata added so `submit::category_protocol_labels` has something to
 /// find.
 async fn seed_recommended_ssh(pool: &PgPool, ip: &str) {
+    // Recent, ordered event times (a few minutes ago) so the seeded IP passes the gatekeeper's
+    // freshness gate. Only recency and order matter here; no assertion references these timestamps.
+    let base = Utc::now() - Duration::minutes(5);
+    let t0 = base.to_rfc3339();
+    let t1 = (base + Duration::seconds(10)).to_rfc3339();
+    let t2 = (base + Duration::seconds(20)).to_rfc3339();
     append_event(
         pool,
         ev(
@@ -227,7 +234,7 @@ async fn seed_recommended_ssh(pool: &PgPool, ip: &str) {
             SignalType::HoneypotLoginAttempt,
             Protocol::Tcp,
             true,
-            "2026-07-17T00:00:00Z",
+            &t0,
             serde_json::json!({"protocol_label": "ssh"}),
         ),
     )
@@ -241,7 +248,7 @@ async fn seed_recommended_ssh(pool: &PgPool, ip: &str) {
             SignalType::SshBruteForce,
             Protocol::Tcp,
             true,
-            "2026-07-17T00:00:10Z",
+            &t1,
             serde_json::json!({"protocol_label": "ssh"}),
         ),
     )
@@ -255,7 +262,7 @@ async fn seed_recommended_ssh(pool: &PgPool, ip: &str) {
             SignalType::CatchallProbe,
             Protocol::Udp,
             false,
-            "2026-07-17T00:00:20Z",
+            &t2,
             serde_json::json!({}),
         ),
     )

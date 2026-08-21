@@ -39,3 +39,14 @@ pub const PERSIST_GRACE_DAYS: i64 = 2;
 
 /// Upper bound on the persistence bonus, in score points.
 pub const PERSIST_CAP: Decimal = dec!(60);
+
+/// Connection-volume path onto the blocklist, independent of the confirmed-real latch. On a
+/// honeypot every unsolicited connection is hostile, but the 60s same-signal dedup collapses a
+/// continuous connection flood to a SINGLE scored event, so a high-volume flooder never earns a
+/// score. An IP whose cumulative `event_count` crosses this threshold AND is still active within
+/// [`VOLUME_LIST_WINDOW_SECONDS`] is recommended for the blocklist on volume alone. Cumulative count
+/// is the volume proxy (the model has no windowed counter); the recency gate keeps a long-stopped
+/// flood from lingering. Vendor reporting still requires confirmed-real, so a bare flood is blocked
+/// locally but never reported upstream.
+pub const VOLUME_LIST_THRESHOLD: u32 = 1000;
+pub const VOLUME_LIST_WINDOW_SECONDS: i64 = 86_400;

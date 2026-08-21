@@ -23,7 +23,9 @@ use crate::scoring::constants::SCORE_CAP;
 use crate::scoring::decay::decay;
 use crate::scoring::eligibility::eligible;
 use crate::scoring::persistence::persistence_points;
-use crate::scoring::tier::{recommended_for_blocklist, recommended_for_vendor, tier};
+use crate::scoring::tier::{
+    recommended_by_volume, recommended_for_blocklist, recommended_for_vendor, tier,
+};
 
 /// Per-category accumulator stored inside `IpScore.category_breakdown`.
 ///
@@ -208,7 +210,13 @@ fn derive_projection(
     let effective = effective_score(gated_raw, distinct_wan_count as u32);
     let feed_tier = tier(gated_raw, max_confidence); // gated raw (base + persistence), not effective.
     let rec_vendor = recommended_for_vendor(is_eligible, feed_tier);
-    let rec_blocklist = recommended_for_blocklist(is_eligible, effective);
+    // A high-volume connection flood is recommended for the blocklist on volume alone (no
+    // confirmed-real latch): dedup collapses such a flood to one scored event, so the merit path
+    // never fires. Vendor reporting still gates on confirmed-real (rec_vendor above), so a bare
+    // flood is blocked locally but not reported upstream.
+    let seconds_since_last_seen = (decay_anchor - last_seen).num_seconds();
+    let rec_blocklist = recommended_for_blocklist(is_eligible, effective)
+        || recommended_by_volume(delisted, event_count as u32, seconds_since_last_seen);
 
     // The map is well-formed Decimals, so serialization cannot fail.
     let category_breakdown =
@@ -432,6 +440,30 @@ mod tests {
             serde_json::json!({}),
             None,
         )
+    }
+
+    #[test]
+    fn a_high_volume_flood_is_blocklisted_on_volume_without_confirmed_real() {
+        // A connection/probe flood: many non-confirmed-real events. Dedup keeps the score near zero
+        // and the confirmed-real latch never sets, so the merit path never recommends it - but
+        // crossing the volume threshold while recently active must.
+        let threshold = crate::scoring::constants::VOLUME_LIST_THRESHOLD as i64;
+        let base = ts("2026-08-21T00:00:00Z");
+        let mut acc: Option<IpScore> = None;
+        for i in 0..threshold {
+            let e = udp_probe_event_at(base + Duration::seconds(i));
+            acc = Some(apply_event(acc, &e, HALF_LIFE, i > 0, 1, 1));
+        }
+        let s = acc.unwrap();
+        assert!(!s.has_confirmed_real, "flood must not be confirmed-real");
+        assert!(s.event_count >= threshold as i32);
+        assert!(
+            s.recommended_for_blocklist,
+            "a recent high-volume flood must be blocklisted on volume (raw {}, count {})",
+            s.raw_score, s.event_count
+        );
+        // Vendor reporting still requires confirmed-real, so a bare flood is NOT reported upstream.
+        assert!(!s.recommended_for_vendor);
     }
 
     /// A high-confidence category whose weight decays below the 0.5 live floor

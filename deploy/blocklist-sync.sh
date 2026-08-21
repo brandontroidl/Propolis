@@ -76,15 +76,24 @@ fi
 # README, and LICENSE are untouched.
 find "$REPO" -maxdepth 1 -type f \( -name 'aggressive.*' -o -name 'standard.*' -o -name 'all-*.*' \) -delete
 
-# --- Commit & push (clean no-op when nothing changed) -----------------------------------------
+# --- Commit & push ----------------------------------------------------------------------------
 cd "$REPO"
 git add -A
 if git diff --cached --quiet; then
-  echo "blocklist-sync: no changes since last build"
-  exit 0
+  echo "blocklist-sync: no new build to commit"
+else
+  build_time="$(sed -n 's/.*"build_time"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' manifest.json | head -n1)"
+  git commit -q -m "feed: ${build_time:-update}"
 fi
 
-build_time="$(sed -n 's/.*"build_time"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' manifest.json | head -n1)"
-git commit -q -m "feed: ${build_time:-update}"
-git push -q origin HEAD
-echo "blocklist-sync: pushed (${build_time:-unknown build time})"
+# Always attempt the push, even when nothing new was committed: an earlier run may have committed
+# locally but FAILED to push (the classic cause is cron having no SSH agent for the git remote), and
+# a "no new changes -> skip push" flow would strand that commit forever. `git push` is a clean no-op
+# when the branch is already up to date, and ships any stranded commit otherwise.
+if git push -q origin HEAD; then
+  echo "blocklist-sync: pushed (HEAD $(git rev-parse --short HEAD))"
+else
+  echo "blocklist-sync: git push FAILED - the local commit is not on the remote. Under cron this is" \
+       "almost always missing SSH auth (no agent / passphrase key). See the deploy README." >&2
+  exit 1
+fi

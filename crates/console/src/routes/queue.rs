@@ -43,6 +43,7 @@ pub fn router() -> Router<AppState> {
         .route("/queue/{ip}/reject", post(reject))
         .route("/queue/{ip}/snooze", post(snooze))
         .route("/ip/{ip}/delist", post(delist))
+        .route("/ip/{ip}/delete", post(delete_ip))
 }
 
 /// The three operator decisions a pending entry can receive. A dedicated enum (rather than
@@ -429,6 +430,46 @@ async fn delist(
 
     tracing::info!(%ip, "ip delisted from feed and queue");
     Ok(Redirect::to(&format!("/ip/{ip}")).into_response())
+}
+
+/// `POST /ip/{ip}/delete` - purge an address's derived state (scoring projection, review-queue
+/// entry, and vendor-submission history), for a false positive or a test address an operator wants
+/// gone rather than merely delisted.
+///
+/// The append-only, hash-chained `event` ledger is deliberately NOT touched: deleting a link would
+/// break `verify_chain` for the whole ledger, and the projection deleted here can always be rebuilt
+/// from it. So this is "forget the scoring/review state", not a ledger edit - if the same address
+/// sends another event, or the projection is replayed, it reappears (which is correct: the ledger
+/// is the source of truth). Same CSRF gate as `delist`.
+async fn delete_ip(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(ip): Path<IpAddr>,
+    Form(form): Form<ActionForm>,
+) -> Result<Response, AppError> {
+    if !state.sessions.validate_csrf(&session.id, &form.csrf_token) {
+        return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
+    }
+
+    // Literal statements (sqlx requires a static SQL string, and it is the right guard here): the
+    // ONLY dynamic value is the bound `$1` IP, never the table name.
+    let ip_str = ip.to_string();
+    sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
+        .bind(&ip_str)
+        .execute(&state.db)
+        .await?;
+    sqlx::query("DELETE FROM vendor_submission WHERE source_ip = $1::inet")
+        .bind(&ip_str)
+        .execute(&state.db)
+        .await?;
+    sqlx::query("DELETE FROM ip_score WHERE source_ip = $1::inet")
+        .bind(&ip_str)
+        .execute(&state.db)
+        .await?;
+
+    tracing::info!(%ip, "ip purged from scoring/review/vendor state (event ledger retained)");
+    // The ip_score row is gone, so /ip/{ip} would 404 - send the operator back to the queue.
+    Ok(Redirect::to("/queue").into_response())
 }
 
 fn row_view(

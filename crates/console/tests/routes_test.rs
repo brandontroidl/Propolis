@@ -785,6 +785,61 @@ async fn approve_changes_state_verified_via_db(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn delete_purges_scoring_state_but_keeps_the_event_ledger(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.40", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    let scored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ip_score WHERE source_ip = $1::inet")
+            .bind("203.0.113.40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(scored, 1, "precondition: the IP is scored before delete");
+
+    let response = app
+        .oneshot(form_request(
+            "/ip/203.0.113.40/delete",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    // Derived state gone; the append-only, hash-chained event ledger is retained by design.
+    let scored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ip_score WHERE source_ip = $1::inet")
+            .bind("203.0.113.40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(scored, 0, "ip_score must be deleted");
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM review_queue WHERE source_ip = $1::inet")
+            .bind("203.0.113.40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, 0, "review_queue must be deleted");
+    let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event WHERE source_ip = $1::inet")
+        .bind("203.0.113.40")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        events > 0,
+        "the event ledger must be retained (append-only, hash-chained)"
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn reject_changes_state(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.31", 60).await;

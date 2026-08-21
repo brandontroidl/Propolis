@@ -6,7 +6,11 @@
 <h1 class="mono" style="margin:0;">{{ ip }}</h1>
 <form method="post" action="/ip/{{ ip }}/delist" style="margin:0;">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-  <button type="submit" class="btn-danger" onclick="return confirm('Delist {{ ip }} from the feed and queue?')">Delist</button>
+  <button type="submit" class="btn-snooze" onclick="return confirm('Delist {{ ip }} from the feed and queue? (keeps its history)')">Delist</button>
+</form>
+<form method="post" action="/ip/{{ ip }}/delete" style="margin:0;">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit" class="btn-danger" onclick="return confirm('Delete {{ ip }} from scoring, review, and vendor history? The event ledger is kept. This cannot be undone from the UI.')">Delete</button>
 </form>
 </div>
 <div class="stat-row">

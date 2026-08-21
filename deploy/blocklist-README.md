@@ -23,12 +23,12 @@ manifest.json                                 build time, counts, digests, valid
 
 Every IP in this list did all four of these:
 
-1. **Connected to a honeypot service** and completed an authenticated session — not a port
+1. **Connected to a honeypot service** and completed an authenticated session - not a port
    scan, not a bare TCP connect. Unauthenticated probes are recorded but never published.
 2. **Did it more than once.** Single-event IPs are excluded.
 3. **Scored above the publication floor** when it was last seen (see below).
 4. **Was approved by a human.** No IP reaches this list automatically. An operator reviews the
-   captured session — the commands run, the credentials tried, the files uploaded — and
+   captured session - the commands run, the credentials tried, the files uploaded - and
    approves or rejects it individually.
 
 That last point is the main thing separating this from an automated feed. It is also why the
@@ -47,7 +47,7 @@ afterwards. An entry enters one tier's file and stays there until its window lap
 Both tiers additionally require an effective score of **≥ 50** when the entry was scored.
 
 Use `standard` unless you have a specific reason not to. `aggressive` is a narrower, higher-
-confidence subset — appropriate for automated blocking on systems where a false positive is
+confidence subset - appropriate for automated blocking on systems where a false positive is
 cheap to recover from.
 
 Each entry's `valid_from` / `valid_until` are anchored on its own last activity, not on the build
@@ -95,7 +95,7 @@ windows.
 ### Per-entry fields
 
 The `.json` and `.csv` formats carry, per address: `first_seen`, `last_seen`, `events` (how many
-observations back it), `categories` (how many distinct sensor classes saw it), and `signals` — the
+observations back it), `categories` (how many distinct sensor classes saw it), and `signals` - the
 distinct activity types it triggered:
 
 ```
@@ -154,7 +154,7 @@ Scores are not cumulative counters. They decay.
   additional vantage, capped at +60%. Scores are capped at 100 regardless.
 
 Decay decides whether an address **qualifies** and which tier it lands in, both evaluated when it
-was last seen. It does not decide how long the entry is then carried — that is the fixed window in
+was last seen. It does not decide how long the entry is then carried - that is the fixed window in
 the tables above, measured from that same last activity. An IP that stops attacking still falls out
 of the list on its own; it does so on a stated schedule rather than by sliding continuously between
 files.

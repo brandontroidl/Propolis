@@ -3,7 +3,7 @@
 # blocklist-sync.sh - publish the built feed into the public blocklist repo, split into
 #   tiers/       aggressive.* standard.*      (block-this-now)
 #   retention/   all-<window>.*               (active-in-the-last-N)
-# with manifest.json at the repo root, then commit and push.
+# with manifest.json and this directory's blocklist-README.md at the repo root, then commit and push.
 #
 # Runs on the honeypot node from cron, after the feed publisher's atomic swap. The split lives HERE,
 # at the push - the publisher's flat output, the manifest contract, and the console are unchanged by
@@ -17,6 +17,9 @@
 #   PROPOLIS_FEED_OUTPUT_DIR   the publisher's flat output holding manifest.json
 #   PROPOLIS_BLOCKLIST_REPO    the git checkout that is pushed        (default below)
 set -euo pipefail
+
+# Where this script lives, so it can publish its sibling README alongside the feed.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # --- Resolve the feed source ------------------------------------------------------------------
 # Prefer an explicit override; otherwise take whichever standard location actually holds a build.
@@ -61,6 +64,12 @@ if [ "${#retention_files[@]}" -gt 0 ]; then
   cp -f "${retention_files[@]}" "$REPO/retention/"
 fi
 cp -f "$SRC/manifest.json" "$REPO/manifest.json"
+
+# Keep the repo's public README in sync with the packaged one, so the layout docs and raw-URL
+# examples never drift from what this script actually publishes.
+if [ -f "$SCRIPT_DIR/blocklist-README.md" ]; then
+    cp -f "$SCRIPT_DIR/blocklist-README.md" "$REPO/README.md"
+fi
 
 # Drop any stale FLAT feed files the pre-folder layout left at the repo root, so the repo converges
 # on tiers/ + retention/ instead of carrying both copies. Matches only feed filenames; manifest.json,

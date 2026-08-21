@@ -24,6 +24,41 @@
     <div class="v {% if feed_entries >= 0 %}v--ok{% endif %}">{% if feed_entries >= 0 %}{{ feed_entries }}{% else %}--{% endif %}</div>
     <div class="foot">aggressive + standard &middot; {{ approved_today }} approved today</div>
   </div>
+  <div class="cell">
+    <span class="label">Last event</span>
+    <div class="v {% if pipeline_fresh %}v--ok{% else %}v--call{% endif %}" style="font-size:1.25rem">{{ last_event_ago }}</div>
+    <div class="foot">{% if pipeline_fresh %}intake live{% else %}check sensors{% endif %}</div>
+  </div>
+</div>
+
+{# Most active - the signature: each row's 24-cell strip shows the last 24h of activity, cell colour
+   = worst signal that hour (severity height-floor + cap in the CSS), height = volume. #}
+<div class="panel">
+  <div class="panel-head">Most active <span class="dim">last 24h</span></div>
+  {% if most_active %}
+  <table class="table-compact">
+    <thead><tr>
+      <th style="width:150px">Address</th>
+      <th style="width:190px">Activity &middot; 24h</th>
+      <th class="count" style="width:70px">Events</th>
+      <th>What it did</th>
+      <th style="width:90px">Last seen</th>
+    </tr></thead>
+    <tbody>
+      {% for r in most_active %}
+      <tr>
+        <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
+        <td><span class="strip">{% for c in r.strip %}<i style="height:{{ c.height }}px"{% if c.class %} class="{{ c.class }}"{% endif %}></i>{% endfor %}</span></td>
+        <td class="count">{{ r.event_count }}</td>
+        <td><span class="sev-tags">{% for t in r.tags %}<span class="sev sev--{{ t.sev }}">{{ t.label }}</span>{% endfor %}</span></td>
+        <td class="seen dim">{{ r.last_seen }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">waiting for sensor events</p>
+  {% endif %}
 </div>
 
 <div class="panel">
@@ -45,30 +80,16 @@
   </div>
 </div>
 
-<div class="grid-2">
-  <div class="panel">
-    <div class="panel-head panel-head--blue">Protocol distribution <span class="dim">24h</span></div>
-    <div class="panel-body">
-      {% if protocol_dist %}
-      <div class="chart-box-sm">
-        <canvas id="protoChart" role="img" aria-label="Event count by sensor, last 24 hours"></canvas>
-      </div>
-      {% else %}
-      <p class="empty-line">waiting for sensor events</p>
-      {% endif %}
+<div class="panel">
+  <div class="panel-head panel-head--blue">Protocol distribution <span class="dim">24h</span></div>
+  <div class="panel-body">
+    {% if protocol_dist %}
+    <div class="chart-box-sm">
+      <canvas id="protoChart" role="img" aria-label="Event count by sensor, last 24 hours"></canvas>
     </div>
-  </div>
-  <div class="panel">
-    <div class="panel-head panel-head--orange">Top attackers</div>
-    <div class="panel-body">
-      {% if has_attackers %}
-      <div class="chart-box-sm">
-        <canvas id="attackerChart" role="img" aria-label="Top 10 attacking IPs by raw score"></canvas>
-      </div>
-      {% else %}
-      <p class="empty-line">waiting for sensor events</p>
-      {% endif %}
-    </div>
+    {% else %}
+    <p class="empty-line">waiting for sensor events</p>
+    {% endif %}
   </div>
 </div>
 {% if protocol_dist %}
@@ -95,45 +116,6 @@ new Chart(document.getElementById('protoChart'), {
       y: { grid: { display: false } },
     },
     plugins: { tooltip: { displayColors: false } },
-  },
-});
-</script>
-{% endif %}
-{% if has_attackers %}
-<script type="application/json" id="attacker-labels">{{ attacker_labels|safe }}</script>
-<script type="application/json" id="attacker-data">{{ attacker_data|safe }}</script>
-<script>
-new Chart(document.getElementById('attackerChart'), {
-  type: 'bar',
-  data: {
-    labels: JSON.parse(document.getElementById('attacker-labels').textContent),
-    datasets: [{
-      data: JSON.parse(document.getElementById('attacker-data').textContent),
-      backgroundColor: '#f2751d',
-      borderRadius: 4,
-      maxBarThickness: 20,
-    }],
-  },
-  options: {
-    indexAxis: 'y',
-    responsive: true,
-    maintainAspectRatio: false,
-    scales: {
-      x: { beginAtZero: true },
-      y: { grid: { display: false } },
-    },
-    onHover: function(evt, elements) {
-      evt.native.target.style.cursor = elements.length > 0 ? 'pointer' : 'default';
-    },
-    plugins: { tooltip: { displayColors: false } },
-    onClick: function(evt, elements) {
-      if (elements.length > 0) {
-        var idx = elements[0].index;
-        var label = JSON.parse(document.getElementById('attacker-labels').textContent)[idx];
-        var ip = label.split(' ')[0];
-        window.location.href = '/ip/' + ip;
-      }
-    },
   },
 });
 </script>

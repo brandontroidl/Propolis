@@ -11,21 +11,20 @@
 //! already use), rather than re-parsing the file - see that function's doc comment for the on-disk
 //! shape.
 //!
-//! Charts (sub-project 6, console-charts): three Chart.js charts (events timeline, protocol
-//! distribution, top attackers), all fed by supplementary, soft-failing queries per the same
-//! policy as above - a slow or errored chart query degrades to an empty chart, never a 503.
-//! Chart.js needs its datasets as JS array literals
-//! inside an inline `<script>`, so each array is serialized with `serde_json::to_string` into a
-//! `String` *before* it reaches the template, then injected with the `|safe` filter - `templates`'s
-//! doc comment establishes that minijinja auto-escapes every `.html` template, so without `|safe`
-//! the JSON's own quotes would be HTML-entity-escaped and produce a JS syntax error rather than an
-//! array literal. `protocol_dist` (a `Vec`, already in context for its own truthiness check) stays
-//! as-is; `proto_labels`/`proto_data` are new, separately-named JSON-string siblings derived from
-//! it. The events timeline always renders (24 buckets, zero-filled by the query's own
-//! `generate_series`/`COALESCE`) even with no events; the protocol-distribution and top-attackers
-//! charts instead hide their `<canvas>` and show the same "waiting for sensor events" copy the
-//! page already uses elsewhere when their source list is empty (`protocol_dist` and the new
-//! `has_attackers` respectively) - an empty Chart.js canvas has nothing worth looking at.
+//! Charts + the most-active strip (sub-project 6, console-charts): two Chart.js charts (events
+//! timeline, protocol distribution) and the "most active" table, whose per-IP 24-hour activity
+//! strips (`most_active_rows`) replaced the old top-attackers bar chart - the chart duplicated
+//! information the strip table shows better. All are fed by supplementary, soft-failing queries: a
+//! slow or errored query degrades to an empty chart / the "waiting for sensor events" copy, never a
+//! 503. Chart.js needs its datasets as JS array literals inside an inline `<script>`, so each array
+//! is serialized with `serde_json::to_string` into a `String` *before* it reaches the template, then
+//! injected with the `|safe` filter - `templates`'s doc comment establishes that minijinja
+//! auto-escapes every `.html` template, so without `|safe` the JSON's own quotes would be
+//! HTML-entity-escaped and produce a JS syntax error rather than an array literal. The events
+//! timeline always renders (24 buckets, zero-filled by the query's own `generate_series`/`COALESCE`)
+//! even with no events; the protocol-distribution chart instead hides its `<canvas>` and shows the
+//! "waiting for sensor events" copy when `protocol_dist` is empty - an empty Chart.js canvas has
+//! nothing worth looking at.
 
 use axum::extract::{Query, State};
 use axum::response::Html;
@@ -40,7 +39,10 @@ use crate::auth::Session;
 use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
 use crate::routes::feed::read_manifest;
-use crate::routes::format::{format_activity, format_relative_time, format_sensor_label};
+use crate::routes::format::{
+    format_activity, format_relative_time, format_sensor_label, severity_rank, signal_severity,
+    signal_tag_label,
+};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -69,6 +71,33 @@ struct ProtocolCount {
     count: i64,
 }
 
+/// One hourly cell of an IP's 24-hour activity strip. `height` is a pixel height derived from the
+/// hour's event volume (sqrt-scaled so small-but-real hours stay visible); `class` is the strip
+/// severity class (`s1`..`s4`, or empty for an idle hour) from the worst signal that hour.
+#[derive(Debug, Serialize)]
+struct StripCell {
+    height: u32,
+    class: &'static str,
+}
+
+/// A "what it did" severity tag for the most-active table.
+#[derive(Debug, Serialize)]
+struct SigTag {
+    label: &'static str,
+    sev: &'static str,
+}
+
+/// One row of the dashboard's "most active" table: an attacker IP with its 24-hour activity strip
+/// and the worst signals it triggered.
+#[derive(Debug, Serialize)]
+struct MostActiveRow {
+    ip: String,
+    event_count: i64,
+    last_seen: String,
+    strip: Vec<StripCell>,
+    tags: Vec<SigTag>,
+}
+
 async fn dashboard(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
@@ -94,6 +123,23 @@ async fn dashboard(
     .fetch_one(&state.db)
     .await
     .unwrap_or(0);
+
+    // Honest pipeline-health signal: the age of the most recent event. This is a real, verifiable
+    // fact (intake wrote something this recently), never a hardcoded "OK" that could disagree with
+    // reality. Fresh (< 1h) reads green; stale reads amber ("check sensors"). No events yet -> not
+    // fresh, so a brand-new node does not claim health it cannot show.
+    let last_event: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT max(observed_at) FROM event")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(None);
+    let (last_event_ago, pipeline_fresh) = match last_event {
+        Some(t) => (
+            format_relative_time(t),
+            (chrono::Utc::now() - t).num_minutes() < 60,
+        ),
+        None => ("none".to_string(), false),
+    };
 
     let top_attacker: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
         "SELECT host(source_ip), raw_score::text FROM ip_score ORDER BY raw_score DESC LIMIT 1",
@@ -153,25 +199,9 @@ async fn dashboard(
     let events_24h: i64 = timeline_data.iter().sum();
     let current_range = "24h";
 
-    let attacker_rows = sqlx::query(
-        "SELECT host(source_ip) AS ip, raw_score::float8 AS score, event_count \
-         FROM ip_score ORDER BY raw_score DESC LIMIT 10",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let mut attacker_labels: Vec<String> = Vec::with_capacity(attacker_rows.len());
-    let mut attacker_data: Vec<f64> = Vec::with_capacity(attacker_rows.len());
-    for row in &attacker_rows {
-        let ip: String = row.try_get("ip")?;
-        let count: i32 = row.try_get("event_count")?;
-        attacker_labels.push(format!("{ip} ({count})"));
-        attacker_data.push(row.try_get("score")?);
-    }
-    // Drives the top-attackers chart's empty-state gate in the template: `attacker_labels` is
-    // JSON-stringified below, and a non-empty JSON string (even `"[]"`) is truthy in minijinja, so
-    // the template cannot tell "no rows" from "some rows" by checking that string directly.
-    let has_attackers = !attacker_labels.is_empty();
+    // The "most active" table with its 24-hour activity strips - the signature dashboard element.
+    // Soft-fails to empty (shows the waiting-for-events copy) rather than 503 on a query error.
+    let most_active = most_active_rows(&state.db).await;
 
     // -1 signals "no data" (unconfigured, missing, or unparsable manifest) -> the template
     // displays "--"; `read_manifest` already collapses every one of those cases to `None`.
@@ -219,8 +249,6 @@ async fn dashboard(
     let timeline_data = serde_json::to_string(&timeline_data).unwrap_or_else(|_| "[]".into());
     let proto_labels = serde_json::to_string(&proto_labels).unwrap_or_else(|_| "[]".into());
     let proto_data = serde_json::to_string(&proto_data).unwrap_or_else(|_| "[]".into());
-    let attacker_labels = serde_json::to_string(&attacker_labels).unwrap_or_else(|_| "[]".into());
-    let attacker_data = serde_json::to_string(&attacker_data).unwrap_or_else(|_| "[]".into());
 
     let tmpl = state.templates.get_template("dashboard.html")?;
     let html = tmpl.render(context! {
@@ -231,6 +259,8 @@ async fn dashboard(
         approved_today,
         events_last_hour,
         events_24h,
+        last_event_ago,
+        pipeline_fresh,
         feed_entries,
         top_attacker_ip,
         top_attacker_score,
@@ -241,15 +271,141 @@ async fn dashboard(
         timeline_data,
         proto_labels,
         proto_data,
-        attacker_labels,
-        attacker_data,
-        has_attackers,
+        most_active,
         pending_count,
         uptime,
         version,
         current_range,
     })?;
     Ok(Html(html))
+}
+
+/// The top attacker IPs of the last 24 hours, each with a 24-cell hourly activity strip (worst
+/// signal per hour drives the cell colour, event volume its height) and its worst signals as
+/// severity tags. Soft-fails to an empty vec on any query error, per the module's chart policy.
+async fn most_active_rows(db: &PgPool) -> Vec<MostActiveRow> {
+    use std::collections::{BTreeSet, HashMap};
+
+    // One pass: the busiest few source IPs in the window, joined back to their own events grouped by
+    // hour, with the distinct signal types seen in each hour so the strip can colour each cell by
+    // the worst signal that hour rather than only the IP's overall worst.
+    let rows = sqlx::query(
+        "WITH top AS ( \
+             SELECT source_ip, COUNT(*) AS cnt, MAX(observed_at) AS last_seen \
+             FROM event WHERE observed_at >= now() - interval '24 hours' \
+             GROUP BY source_ip ORDER BY cnt DESC, MAX(observed_at) DESC LIMIT 6 \
+         ) \
+         SELECT host(t.source_ip) AS ip, t.cnt, t.last_seen, \
+                (EXTRACT(EPOCH FROM (date_trunc('hour', now()) - date_trunc('hour', e.observed_at))) / 3600)::int AS hours_ago, \
+                COUNT(*) AS hr_cnt, \
+                array_agg(DISTINCT e.signal_type::text) AS hr_sigs \
+         FROM top t \
+         JOIN event e ON e.source_ip = t.source_ip AND e.observed_at >= now() - interval '24 hours' \
+         GROUP BY t.source_ip, t.cnt, t.last_seen, date_trunc('hour', e.observed_at) \
+         ORDER BY t.cnt DESC, hours_ago",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    struct Acc {
+        cnt: i64,
+        last_seen: chrono::DateTime<chrono::Utc>,
+        hours: HashMap<i32, (i64, u8)>, // hours_ago -> (event count, worst severity rank)
+        sigs: BTreeSet<String>,
+        order: usize,
+    }
+    let mut accs: HashMap<String, Acc> = HashMap::new();
+    let mut next_order = 0usize;
+    for row in &rows {
+        let Ok(ip) = row.try_get::<String, _>("ip") else {
+            continue;
+        };
+        let Ok(last_seen) = row.try_get::<chrono::DateTime<chrono::Utc>, _>("last_seen") else {
+            continue;
+        };
+        let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+        let hours_ago: i32 = row.try_get("hours_ago").unwrap_or(-1);
+        let hr_cnt: i64 = row.try_get("hr_cnt").unwrap_or(0);
+        let hr_sigs: Vec<String> = row.try_get("hr_sigs").unwrap_or_default();
+        let worst = hr_sigs
+            .iter()
+            .map(|s| severity_rank(signal_severity(s)))
+            .max()
+            .unwrap_or(0);
+        let acc = accs.entry(ip).or_insert_with(|| {
+            let o = next_order;
+            next_order += 1;
+            Acc {
+                cnt,
+                last_seen,
+                hours: HashMap::new(),
+                sigs: BTreeSet::new(),
+                order: o,
+            }
+        });
+        if (0..24).contains(&hours_ago) {
+            acc.hours.insert(hours_ago, (hr_cnt, worst));
+        }
+        acc.sigs.extend(hr_sigs);
+    }
+
+    let mut result: Vec<(usize, MostActiveRow)> = accs
+        .into_iter()
+        .map(|(ip, acc)| {
+            let max_hr = acc
+                .hours
+                .values()
+                .map(|(c, _)| *c)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            // 24 cells, oldest (left) to newest (right): cell h is the hour (23 - h) hours ago.
+            let strip = (0..24)
+                .map(|h| match acc.hours.get(&(23 - h)) {
+                    Some((c, sev)) if *c > 0 => {
+                        let frac = (*c as f64).sqrt() / (max_hr as f64).sqrt();
+                        StripCell {
+                            height: (2.0 + 24.0 * frac).round() as u32,
+                            class: match *sev {
+                                4 => "s4",
+                                3 => "s3",
+                                2 => "s2",
+                                1 => "s1",
+                                _ => "",
+                            },
+                        }
+                    }
+                    _ => StripCell {
+                        height: 2,
+                        class: "",
+                    },
+                })
+                .collect();
+            let mut tags: Vec<SigTag> = acc
+                .sigs
+                .iter()
+                .map(|s| SigTag {
+                    label: signal_tag_label(s),
+                    sev: signal_severity(s),
+                })
+                .collect();
+            tags.sort_by_key(|t| std::cmp::Reverse(severity_rank(t.sev)));
+            tags.truncate(3);
+            (
+                acc.order,
+                MostActiveRow {
+                    ip,
+                    event_count: acc.cnt,
+                    last_seen: format_relative_time(acc.last_seen),
+                    strip,
+                    tags,
+                },
+            )
+        })
+        .collect();
+    result.sort_by_key(|(o, _)| *o);
+    result.into_iter().map(|(_, r)| r).collect()
 }
 
 /// `GET /dashboard/chart?range=<1h|24h|7d|30d>` - the range-selector HTMX endpoint for the

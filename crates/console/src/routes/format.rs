@@ -82,6 +82,62 @@ pub(crate) fn format_activity(sensor: &str, signal_type: &str) -> String {
     }
 }
 
+/// Maps a signal type to a severity rung for the console's temperature ramp: `crit` (malware),
+/// `high` (hands-on-keyboard: command exec, file download), `watch` (credential attempts / IDS
+/// escalations that want a look), or `low` (scans and probes - noise). Drives the `.sev--*` tags and
+/// the activity strip's `.s1..s4` cells. The single source of truth for signal-to-colour, so the
+/// two never disagree. An unknown signal is treated as `low` (fail-quiet: a new signal reads as
+/// noise until someone classifies it, never as a false alarm).
+pub(crate) fn signal_severity(signal_type: &str) -> &'static str {
+    match signal_type {
+        "honeypot_malware_upload" => "crit",
+        "honeypot_command_exec" | "honeypot_file_download" => "high",
+        "honeypot_login_attempt"
+        | "ssh_brute_force"
+        | "remote_auth_failure"
+        | "waf_sqli_xss"
+        | "suricata_sev1" => "watch",
+        _ => "low",
+    }
+}
+
+/// A short "what it did" label for a signal type, for the dashboard's severity tags. Shorter than
+/// [`format_activity`] (no service prefix) since the tags sit in a narrow column.
+pub(crate) fn signal_tag_label(signal_type: &str) -> &'static str {
+    match signal_type {
+        "honeypot_malware_upload" => "malware upload",
+        "honeypot_command_exec" => "command exec",
+        "honeypot_file_download" => "file download",
+        "honeypot_login_attempt" => "login attempt",
+        "honeypot_connection" => "connection",
+        "ssh_brute_force" => "ssh brute",
+        "remote_auth_failure" => "auth failure",
+        "port_scan" => "port scan",
+        "syn_flood" => "syn flood",
+        "blocked_connection" => "blocked",
+        "waf_sqli_xss" => "sqli/xss",
+        "waf_generic_block" => "waf block",
+        "catchall_probe" => "probe",
+        "suricata_sev1" => "ids critical",
+        "suricata_sev2" => "ids high",
+        "suricata_sev3" => "ids medium",
+        // The signal set is a closed enum, so every real value is covered above; a future/unknown
+        // one reads as generic "activity" rather than leaking a raw enum name into the UI.
+        _ => "activity",
+    }
+}
+
+/// Rank a severity rung so tags/cells can be ordered worst-first (higher = more severe).
+pub(crate) fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "crit" => 4,
+        "high" => 3,
+        "watch" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
 /// Coarsens a UTC timestamp to "how long ago", in the largest whole unit that fits - used by the
 /// dashboard's recent-activity table, where an exact `format_timestamp` value is more precision
 /// than an operator scanning twenty rows needs.

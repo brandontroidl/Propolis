@@ -609,7 +609,7 @@ async fn dashboard_timeline_chart_reflects_hourly_event_counts(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
-async fn dashboard_top_attackers_chart_shows_scored_ip(pool: PgPool) {
+async fn dashboard_most_active_shows_active_ip_with_strip(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.86", 60).await;
 
@@ -628,19 +628,16 @@ async fn dashboard_top_attackers_chart_shows_scored_ip(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains(r#"<canvas id="attackerChart""#),
-        "top-attackers chart canvas missing once ip_score rows exist: {body}"
-    );
-    let script = &body[body
-        .find(r#"id="attackerChart""#)
-        .expect("attacker chart canvas missing")..];
-    assert!(
-        script.contains("203.0.113.86"),
-        "top-attackers chart JSON missing the seeded IP: {script}"
+        body.contains(r#"href="/ip/203.0.113.86">203.0.113.86</a>"#),
+        "most-active table missing the active IP: {body}"
     );
     assert!(
-        !script.contains("waiting for sensor events"),
-        "empty-state text must not render alongside the chart: {script}"
+        body.contains(r#"<span class="strip">"#),
+        "most-active row missing its 24h activity strip: {body}"
+    );
+    assert!(
+        body.contains(r#"class="sev sev--"#),
+        "most-active row missing severity tags for what the IP did: {body}"
     );
 }
 

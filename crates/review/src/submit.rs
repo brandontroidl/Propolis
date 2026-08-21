@@ -100,7 +100,7 @@ use sqlx::{PgPool, Row};
 
 use core_scoring::{Category, IpScore, read_score};
 
-use crate::gatekeeper::{self, GateResult, VendorConfig};
+use crate::gatekeeper::{self, GateReason, GateResult, VendorConfig};
 use crate::queue::{ReviewError, ReviewQueue};
 use crate::vendor::{
     VendorAdapter, VendorError, VendorReport, build_categories, build_dshield_categories,
@@ -217,7 +217,25 @@ impl SubmissionRunner {
 
                 match gatekeeper::check(&self.pool, ip, config, &current_score).await {
                     GateResult::Held(reason) => {
-                        tracing::info!(%ip, vendor = %name, ?reason, "submission held");
+                        match &reason {
+                            // Expected steady state: an already-sent (cooldown), rate-limited,
+                            // below-floor, category-filtered, or disabled-vendor submission is held
+                            // on every poll. One INFO line per (ip, vendor) every pass drowns the
+                            // log; the per-pass `held=N` summary keeps the count visible.
+                            GateReason::Cooldown
+                            | GateReason::RateLimit
+                            | GateReason::ScoreFloor
+                            | GateReason::CategoryFilter
+                            | GateReason::Disabled => {
+                                tracing::debug!(%ip, vendor = %name, ?reason, "submission held");
+                            }
+                            // Rare and worth surfacing: a reserved-range IP that reached an approved
+                            // vendor submission should never have been approved, and a DbError means
+                            // the gate could not be evaluated (fail-closed).
+                            GateReason::Reserved | GateReason::DbError(_) => {
+                                tracing::warn!(%ip, vendor = %name, ?reason, "submission held");
+                            }
+                        }
                         result.held += 1;
                         continue;
                     }

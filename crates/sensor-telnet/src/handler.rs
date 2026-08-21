@@ -147,6 +147,11 @@ pub async fn handle_connection(
             }
         }
 
+        // The shared shell emits bare LF line endings; a telnet NVT terminal needs CR-LF or the
+        // cursor never returns to column 0 (each new line renders indented - a visible tell). The
+        // banner/prompts above already use \r\n; translate the command output to match.
+        let output = output.replace('\n', "\r\n");
+
         if is_exit {
             let _ = stream.write_all(output.as_bytes()).await;
             return;
@@ -270,20 +275,30 @@ impl LineReader {
                 return None;
             }
 
-            for byte in data {
-                if byte == b'\n' || byte == b'\r' {
-                    if !self.current.is_empty() {
-                        self.pending
-                            .push_back(String::from_utf8_lossy(&self.current).into_owned());
-                        self.current.clear();
-                    }
-                } else {
-                    self.current.push(byte);
-                    if self.current.len() >= MAX_LINE_LEN {
-                        self.pending
-                            .push_back(String::from_utf8_lossy(&self.current).into_owned());
-                        self.current.clear();
-                    }
+            self.feed(&data);
+        }
+    }
+
+    /// Extract complete lines from already-IAC-filtered `data` into `pending`. Splits on CR or LF
+    /// (an empty line-ending is ignored, so a CR-LF or CR-NUL pair collapses to one terminator), and
+    /// DROPS NUL bytes: a real telnet client transmits a bare Enter as CR-NUL (RFC 854 s.4.3), so a
+    /// stray NUL left in the stream would otherwise orphan into the FOLLOWING line as a leading
+    /// `\0`, making every subsequent command fail to match (`echo` -> "command not found") and
+    /// defeating the `exit`/`logout` check.
+    fn feed(&mut self, data: &[u8]) {
+        for &byte in data {
+            if byte == b'\n' || byte == b'\r' {
+                if !self.current.is_empty() {
+                    self.pending
+                        .push_back(String::from_utf8_lossy(&self.current).into_owned());
+                    self.current.clear();
+                }
+            } else if byte != 0 {
+                self.current.push(byte);
+                if self.current.len() >= MAX_LINE_LEN {
+                    self.pending
+                        .push_back(String::from_utf8_lossy(&self.current).into_owned());
+                    self.current.clear();
                 }
             }
         }
@@ -293,6 +308,35 @@ impl LineReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_bounds() -> ConnectionBounds {
+        ConnectionBounds {
+            read_timeout: std::time::Duration::from_secs(30),
+            idle_timeout: std::time::Duration::from_secs(30),
+            max_duration: std::time::Duration::from_secs(600),
+            max_captured_bytes: 65_536,
+            max_concurrent: 256,
+        }
+    }
+
+    #[test]
+    fn crnul_enter_does_not_orphan_nul_into_the_next_command() {
+        let mut reader = LineReader::new(test_bounds());
+        // A real telnet client transmits a bare Enter as CR-NUL (RFC 854 s.4.3). Two commands, each
+        // terminated that way: the NUL after the first must not corrupt the second command.
+        reader.feed(b"echo one\r\x00echo two\r\x00");
+        assert_eq!(reader.pending.pop_front().as_deref(), Some("echo one"));
+        assert_eq!(
+            reader.pending.pop_front().as_deref(),
+            Some("echo two"),
+            "the NUL from the first CR-NUL Enter must not orphan onto the next command"
+        );
+        assert!(reader.pending.is_empty());
+        assert!(
+            reader.current.is_empty(),
+            "no orphaned NUL left dangling in the line buffer"
+        );
+    }
 
     #[test]
     fn connection_event_is_unauthenticated_with_telnet_label() {

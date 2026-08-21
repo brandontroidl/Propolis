@@ -505,3 +505,31 @@ fn install_script_dry_run_reports_expected_actions() {
         "dry-run output missing final daemon-reload step"
     );
 }
+
+/// `/var/lib/propolis` must be created root-owned, not propolis-owned. POSIX write permission on a
+/// directory lets its owner unlink/rename ANY child regardless of the child's own owner, so a
+/// propolis-owned parent lets a compromised `propolis` daemon swap the sibling
+/// `/var/lib/propolis/ssh` host-key directory (owned by propolis-ssh) for a symlink that
+/// sensor-ssh.service's `ProtectSystem=strict` bind-mount setup would then follow into an
+/// attacker-chosen path. propolis writes only into its own children (cursors/, feed/, spool/),
+/// never the shared root, so root ownership of the parent costs it nothing.
+#[test]
+fn install_script_var_lib_root_is_root_owned() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/install.sh");
+    let output = std::process::Command::new(script)
+        .arg("--dry-run")
+        .output()
+        .expect("failed to run deploy/install.sh --dry-run");
+    assert!(
+        output.status.success(),
+        "install.sh --dry-run exited non-zero; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("-o root -g root /var/lib/propolis\n"),
+        "the shared /var/lib/propolis root must be created root:root so a compromised propolis \
+         cannot rename the sibling propolis-ssh host-key directory; dry-run output:\n{stdout}"
+    );
+}

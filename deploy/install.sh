@@ -129,7 +129,12 @@ ensure_dir /var/log/propolis/http        0750 propolis-http     propolis-http
 ensure_dir /var/log/propolis/ftp         0750 propolis-ftp      propolis-ftp
 ensure_dir /var/log/propolis/smtp        0750 propolis-smtp     propolis-smtp
 ensure_dir /var/log/propolis/cred        0750 propolis-cred     propolis-cred
-ensure_dir /var/lib/propolis              0755 propolis          propolis
+# root-owned, NOT propolis: write permission on this directory would let a compromised propolis
+# daemon unlink/rename any child regardless of the child's own owner - including the sibling
+# /var/lib/propolis/ssh host-key dir (propolis-ssh), which it could swap for a symlink that
+# sensor-ssh.service's ProtectSystem=strict bind-mount would then follow. propolis writes only into
+# its own children below (cursors/, feed/, spool/), never this shared root, so it loses nothing.
+ensure_dir /var/lib/propolis              0755 root              root
 ensure_dir /var/lib/propolis/cursors      0750 propolis          propolis
 # 0755, not cursors' 0750: this is feed's PUBLIC output tree (see deploy/propolis.service's own
 # UMask=0022 comment) - the operator's out-of-band distribution mechanism, typically a different

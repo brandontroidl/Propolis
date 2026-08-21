@@ -167,6 +167,12 @@ PROPOLIS_SSH_IDLE_TIMEOUT_MS=60000
 PROPOLIS_SSH_MAX_DURATION_SECS=600
 PROPOLIS_SSH_MAX_CAPTURED_BYTES=1000000
 PROPOLIS_SSH_MAX_CONCURRENT=256
+# The software-version sent in the SSH banner (SSH-2.0-<this>). Default is a common current
+# OpenSSH-on-Ubuntu string so the honeypot blends into the internet's largest SSH population; a
+# unique constant banner would let one Shodan/Censys query enumerate every node. Set this per host
+# so the fleet does not share one value. (The key-exchange offer is a minimal fixed set, so a
+# determined HASSH probe can still fingerprint the server regardless of this banner.)
+PROPOLIS_SSH_BANNER=OpenSSH_9.6p1 Ubuntu-3ubuntu13.5
 ```
 
 ### `/etc/propolis/catchall.env` (catch-all sensor)

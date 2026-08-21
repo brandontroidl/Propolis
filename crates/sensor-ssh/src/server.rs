@@ -82,7 +82,11 @@ pub async fn serve(
     host_key_path: PathBuf,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
+    banner: String,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
+    // The software-version this server sends in `SSH-2.0-<banner>`. Shared read-only across all
+    // sessions, so one `Arc` rather than a clone per connection.
+    let banner = Arc::new(banner);
     // Load or generate the host key.
     let host_key = if host_key_path.exists() {
         HostKey::load(&host_key_path)?
@@ -113,6 +117,7 @@ pub async fn serve(
             let emitter = emitter.clone();
             let handoff = handoff.clone();
             let wan_resolver = wan_resolver.clone();
+            let banner = banner.clone();
             // Wrapped once here rather than at each read: every transport function is generic over
             // AsyncRead/AsyncWrite, so the whole session inherits the per-read bound - including
             // any read added later, which a per-call-site timeout would miss.
@@ -126,6 +131,7 @@ pub async fn serve(
                     emitter,
                     handoff,
                     wan_resolver,
+                    banner,
                 )
                 .await
                 {
@@ -140,6 +146,7 @@ pub async fn serve(
 
 /// Handle one SSH connection end to end: version exchange, key exchange, authentication,
 /// channel management, and data dispatch.
+#[allow(clippy::too_many_arguments)]
 async fn handle_session(
     mut stream: TimeoutStream<TcpStream>,
     peer_addr: SocketAddr,
@@ -148,10 +155,11 @@ async fn handle_session(
     emitter: Arc<EventEmitter>,
     handoff: Arc<CaptureHandoff>,
     wan_resolver: Arc<WanResolver>,
+    banner: Arc<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ---- Phase 1: version exchange ----
     let (client_version, server_version) =
-        transport::do_version_exchange_server(&mut stream).await?;
+        transport::do_version_exchange_server_with_version(&mut stream, &banner).await?;
 
     // ---- Phase 2: key exchange ----
 

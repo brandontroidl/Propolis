@@ -30,6 +30,18 @@ const ENV_IDLE_TIMEOUT_MS: &str = "PROPOLIS_SSH_IDLE_TIMEOUT_MS";
 const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_SSH_MAX_DURATION_SECS";
 const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_SSH_MAX_CAPTURED_BYTES";
 const ENV_MAX_CONCURRENT: &str = "PROPOLIS_SSH_MAX_CONCURRENT";
+const ENV_BANNER: &str = "PROPOLIS_SSH_BANNER";
+
+/// The software-version sent in `SSH-2.0-<this>`. Default is a common current OpenSSH-on-Ubuntu
+/// string so the honeypot blends into the internet's largest SSH population rather than standing
+/// out: a unique constant banner (the previous `netsshd_1.0`) let one Shodan/Censys query enumerate
+/// every Propolis node and zero real hosts, which is the worst outcome for a trap. Operators SHOULD
+/// still set `PROPOLIS_SSH_BANNER` per host so the fleet does not share one value. Caveat: the
+/// key-exchange offer (`transport::build_kexinit`) is a minimal set fixed by the pinned crypto
+/// (ADR-0011), so a determined HASSHServer probe can still tell this from a real OpenSSH regardless
+/// of the banner; aligning the KEXINIT is a separate follow-up that needs more crypto than the ADR
+/// currently permits.
+const DEFAULT_BANNER: &str = "OpenSSH_9.6p1 Ubuntu-3ubuntu13.5";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/ssh/events.jsonl";
 const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/ssh";
@@ -52,6 +64,7 @@ struct Config {
     log_path: PathBuf,
     spool_dir: PathBuf,
     bounds: ConnectionBounds,
+    banner: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -160,6 +173,8 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         )?,
     };
 
+    let banner = env::var(ENV_BANNER).unwrap_or_else(|_| DEFAULT_BANNER.to_string());
+
     Ok(Config {
         bind_addr,
         wan_map,
@@ -167,6 +182,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         log_path,
         spool_dir,
         bounds,
+        banner,
     })
 }
 
@@ -277,6 +293,7 @@ async fn main() {
         config.host_key_path,
         wan_resolver,
         config.bounds,
+        config.banner,
     )
     .await
     {

@@ -53,6 +53,7 @@ async fn ssh_handshake_and_session_with_real_client() {
         host_key_path,
         wan_resolver,
         test_bounds(),
+        "OpenSSH_9.6p1".to_string(),
     )
     .await
     .unwrap();
@@ -181,6 +182,7 @@ async fn no_outbound_connections() {
         dir.path().join("host_key"),
         wan_resolver,
         test_bounds(),
+        "OpenSSH_9.6p1".to_string(),
     )
     .await
     .unwrap();
@@ -242,6 +244,7 @@ async fn an_idle_session_is_dropped_once_max_duration_elapses() {
         dir.path().join("host_key"),
         Arc::new(WanResolver::new(HashMap::new())),
         bounds,
+        "OpenSSH_9.6p1".to_string(),
     )
     .await
     .unwrap();
@@ -289,6 +292,7 @@ async fn concurrency_beyond_max_concurrent_is_refused_not_queued() {
         dir.path().join("host_key"),
         Arc::new(WanResolver::new(HashMap::new())),
         bounds,
+        "OpenSSH_9.6p1".to_string(),
     )
     .await
     .unwrap();
@@ -335,6 +339,7 @@ async fn a_peer_that_stalls_mid_handshake_is_dropped_at_the_read_timeout() {
         dir.path().join("host_key"),
         Arc::new(WanResolver::new(HashMap::new())),
         bounds,
+        "OpenSSH_9.6p1".to_string(),
     )
     .await
     .unwrap();

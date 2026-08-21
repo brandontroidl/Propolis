@@ -255,11 +255,11 @@ fn extract_bson_string(data: &[u8], key: &str) -> Option<String> {
                     // cannot produce a reversed or out-of-bounds slice range that panics the handler.
                     if str_len >= 1 {
                         let str_len = str_len as usize;
-                        if let Some(end) = str_start.checked_add(str_len) {
-                            if end <= data.len() {
-                                let s = String::from_utf8_lossy(&data[str_start..end - 1]);
-                                return Some(s.into_owned());
-                            }
+                        if let Some(end) = str_start.checked_add(str_len)
+                            && end <= data.len()
+                        {
+                            let s = String::from_utf8_lossy(&data[str_start..end - 1]);
+                            return Some(s.into_owned());
                         }
                     }
                 }

@@ -11,11 +11,10 @@
 //! already use), rather than re-parsing the file - see that function's doc comment for the on-disk
 //! shape.
 //!
-//! Charts and sparklines (sub-project 6, console-charts): three Chart.js charts (events timeline,
-//! protocol distribution, top attackers) and two SVG sparklines (`routes::sparkline::render`, in
-//! the "Events / hour" and "Total scored IPs" stat cards), all fed by supplementary,
-//! soft-failing queries per the same policy as above - a slow or errored chart query degrades to
-//! an empty chart/flat sparkline, never a 503. Chart.js needs its datasets as JS array literals
+//! Charts (sub-project 6, console-charts): three Chart.js charts (events timeline, protocol
+//! distribution, top attackers), all fed by supplementary, soft-failing queries per the same
+//! policy as above - a slow or errored chart query degrades to an empty chart, never a 503.
+//! Chart.js needs its datasets as JS array literals
 //! inside an inline `<script>`, so each array is serialized with `serde_json::to_string` into a
 //! `String` *before* it reaches the template, then injected with the `|safe` filter - `templates`'s
 //! doc comment establishes that minijinja auto-escapes every `.html` template, so without `|safe`
@@ -42,7 +41,6 @@ use crate::routes::context::{BaseContext, base_context};
 use crate::routes::error::AppError;
 use crate::routes::feed::read_manifest;
 use crate::routes::format::{format_activity, format_relative_time, format_sensor_label};
-use crate::routes::sparkline;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -175,29 +173,6 @@ async fn dashboard(
     // the template cannot tell "no rows" from "some rows" by checking that string directly.
     let has_attackers = !attacker_labels.is_empty();
 
-    // 7-day cumulative trend for the "Total scored IPs" sparkline: a running total (not a daily
-    // delta), so its rightmost point matches the stat card's own displayed value - the same
-    // reasoning the stat-tile convention in the dataviz skill gives for a sparkline's trend arm.
-    // `ip_score` has no index on `first_seen`, so each of the 7 correlated-subquery evaluations
-    // below is a sequential scan; fine at this project's single-node scale (a dashboard an
-    // operator loads occasionally, not a hot path) - a single-pass running-sum rewrite is not
-    // worth the added complexity here.
-    let scored_trend_rows = sqlx::query(
-        "SELECT bucket::date, (SELECT COUNT(*) FROM ip_score WHERE first_seen <= bucket + interval '1 day') AS cnt \
-         FROM generate_series(current_date - interval '6 days', current_date, interval '1 day') AS bucket \
-         ORDER BY bucket",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let mut scored_trend_data: Vec<i64> = Vec::with_capacity(scored_trend_rows.len());
-    for row in scored_trend_rows {
-        scored_trend_data.push(row.try_get("cnt")?);
-    }
-
-    let events_sparkline = sparkline::render(&timeline_data, 120, 24, "#3987e5");
-    let scored_sparkline = sparkline::render(&scored_trend_data, 120, 24, "#3987e5");
-
     // -1 signals "no data" (unconfigured, missing, or unparsable manifest) -> the template
     // displays "--"; `read_manifest` already collapses every one of those cases to `None`.
     let feed_entries: i64 = state
@@ -269,8 +244,6 @@ async fn dashboard(
         attacker_labels,
         attacker_data,
         has_attackers,
-        events_sparkline,
-        scored_sparkline,
         pending_count,
         uptime,
         version,

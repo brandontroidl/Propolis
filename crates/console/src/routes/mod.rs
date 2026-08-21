@@ -20,7 +20,6 @@ pub mod metrics;
 pub mod queue;
 pub mod samples;
 pub mod search;
-pub(crate) mod sparkline;
 
 use axum::Router;
 use axum::middleware;

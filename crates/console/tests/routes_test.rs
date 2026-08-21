@@ -284,37 +284,33 @@ async fn dashboard_authenticated_returns_stats(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains(
-            "<div class=\"label\">Total scored IPs</div>\n    <div class=\"value\">3</div>"
-        ),
-        "expected total_scored_ips=3 in the rendered stats: {body}"
+        body.contains("<span class=\"label\">Scored IPs</span>\n    <div class=\"v\">3</div>"),
+        "expected total_scored_ips=3 in the status band: {body}"
     );
     assert!(
-        body.contains(r#"class="stat-hero stat-hero--attention""#),
-        "pending_reviews > 0 must render the attention hero stat: {body}"
+        body.contains(r#"class="cell cell--call""#),
+        "pending_reviews > 0 must render the band's call cell: {body}"
     );
     assert!(
         body.contains(r#"<a href="/queue">2</a>"#),
         "expected pending_reviews=2 linked to /queue: {body}"
     );
     assert!(
-        body.contains(
-            "<div class=\"label\">Approved today</div>\n    <div class=\"value\">0</div>"
-        ),
-        "expected approved_today=0 in the rendered stats: {body}"
+        body.contains("0 approved today"),
+        "expected approved_today=0 in the Published cell foot: {body}"
     );
     assert!(
-        body.contains("<div class=\"label\">Events / hour</div>\n    <div class=\"value\">7</div>"),
-        "expected events_last_hour=7 (all seeded events are within the last minute): {body}"
+        body.contains("+7 in the last hour"),
+        "expected events_last_hour=7 in the Events/24h foot: {body}"
     );
     assert!(
-        body.contains("<div class=\"label\">Feed entries</div>\n    <div class=\"value\">--</div>"),
+        body.contains(r#"<span class="label">Published</span>"#) && body.contains(">--</div>"),
         "expected the feed-entries placeholder when no feed_output_dir is configured: {body}"
     );
     assert!(
         body.contains(r#"href="/ip/203.0.113.10">"#)
             || body.contains(r#"href="/ip/203.0.113.11">"#),
-        "expected one of the seeded IPs as top attacker in the hero stat: {body}"
+        "expected one of the seeded IPs as top attacker in the band: {body}"
     );
     assert!(body.contains("Dashboard"));
 }
@@ -450,8 +446,8 @@ async fn dashboard_events_last_hour_excludes_events_older_than_an_hour(pool: PgP
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains("<div class=\"label\">Events / hour</div>\n    <div class=\"value\">1</div>"),
-        "expected events_last_hour=1, excluding the event from 2 hours ago: {body}"
+        body.contains("+1 in the last hour"),
+        "expected events_last_hour=1 in the band foot, excluding the event from 2 hours ago: {body}"
     );
 }
 
@@ -508,8 +504,8 @@ async fn dashboard_feed_entries_sums_tier_counts_from_manifest(pool: PgPool) {
     // `tiers.standard.count` manifest shape is read correctly (not a flat `aggressive_count` key,
     // which this fixture's manifest does not have).
     assert!(
-        body.contains("<div class=\"label\">Feed entries</div>\n    <div class=\"value\">13</div>"),
-        "expected feed_entries = aggressive(4) + standard(9) = 13: {body}"
+        body.contains("<div class=\"v v--ok\">13</div>"),
+        "expected feed_entries = aggressive(4) + standard(9) = 13 in the Published cell: {body}"
     );
 }
 
@@ -543,12 +539,12 @@ async fn dashboard_empty_state_shows_placeholders(pool: PgPool) {
         "missing empty vendor-submissions message: {body}"
     );
     assert!(
-        body.contains("<div class=\"label\">Feed entries</div>\n    <div class=\"value\">--</div>"),
+        body.contains(r#"<span class="label">Published</span>"#) && body.contains(">--</div>"),
         "expected the feed-entries placeholder when unconfigured: {body}"
     );
     assert!(
-        body.contains("stat-hero--nominal"),
-        "expected the nominal hero stat when pending_reviews=0: {body}"
+        body.contains("queue clear"),
+        "expected the queue-clear band state when pending_reviews=0: {body}"
     );
     // Both chart sections gate independently on their own source list (`protocol_dist` /
     // `has_attackers`) - this fixture has neither events nor ip_score rows, so both must show the
@@ -568,11 +564,6 @@ async fn dashboard_empty_state_shows_placeholders(pool: PgPool) {
     assert!(
         body.contains(r#"<canvas id="timelineChart""#),
         "the timeline chart must always render, even with no events: {body}"
-    );
-    assert_eq!(
-        body.matches("<polyline").count(),
-        2,
-        "expected both sparklines (events/hour, total scored IPs) to render as flat lines at zero: {body}"
     );
 }
 
@@ -650,66 +641,6 @@ async fn dashboard_top_attackers_chart_shows_scored_ip(pool: PgPool) {
     assert!(
         !script.contains("waiting for sensor events"),
         "empty-state text must not render alongside the chart: {script}"
-    );
-}
-
-#[sqlx::test(migrations = false)]
-async fn dashboard_sparklines_appear_in_correct_stat_cards(pool: PgPool) {
-    migrate(&pool).await;
-    append_event(
-        &pool,
-        ev(
-            "203.0.113.87",
-            "cowrie",
-            SignalType::HoneypotConnection,
-            Protocol::Tcp,
-            true,
-            &chrono::Utc::now().to_rfc3339(),
-        ),
-    )
-    .await
-    .unwrap();
-
-    let state = test_state(pool);
-    let (_, cookie) = state.sessions.create();
-    let app = test_app(state);
-
-    let response = app
-        .oneshot(get_request(
-            "/",
-            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_text(response).await;
-    assert_eq!(
-        body.matches("<polyline").count(),
-        2,
-        "expected exactly two sparklines (events/hour, total scored IPs): {body}"
-    );
-    // Bounded by the immediately-following stat card's own label in the stat-row's fixed order, so
-    // each sparkline is checked for landing inside the RIGHT card, not merely somewhere on the page.
-    let scored_start = body
-        .find(r#"<div class="label">Total scored IPs</div>"#)
-        .expect("Total scored IPs stat card missing");
-    let approved_start = body
-        .find(r#"<div class="label">Approved today</div>"#)
-        .expect("Approved today stat card missing");
-    assert!(
-        body[scored_start..approved_start].contains("<svg"),
-        "expected an SVG sparkline inside the Total scored IPs card: {body}"
-    );
-    let events_start = body
-        .find(r#"<div class="label">Events / hour</div>"#)
-        .expect("Events / hour stat card missing");
-    let feed_start = body
-        .find(r#"<div class="label">Feed entries</div>"#)
-        .expect("Feed entries stat card missing");
-    assert!(
-        body[events_start..feed_start].contains("<svg"),
-        "expected an SVG sparkline inside the Events / hour card: {body}"
     );
 }
 

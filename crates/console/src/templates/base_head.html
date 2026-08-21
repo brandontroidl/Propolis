@@ -8,14 +8,14 @@
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 2 L4 6 L4 12 Q4 18 12 22 Q20 18 20 12 L20 6 Z' fill='%23eaa72c'/%3E%3C/svg%3E">
 <style>
 /* ============================================================================
-   Propolis console — "watch floor".
+   Propolis console - "watch floor".
    One operator watching one honeypot. The interface's whole job is to answer
    "does anything need me right now?" and otherwise stay quiet.
 
    THESIS: temperature = attention. The floor is cool slate; a scan is just
    noise and is rendered in the same grey as faint text. Warmth is spent only
-   on things that want the operator — amber (review), orange (hands on the
-   keyboard), red (live intrusion) — and green means handled. Colour is
+   on things that want the operator - amber (review), orange (hands on the
+   keyboard), red (live intrusion) - and green means handled. Colour is
    meaning here, never decoration: a grey row is a fine row.
 
    Token NAMES are kept stable (inline styles in several templates read
@@ -38,7 +38,7 @@
 
   /* -- Interactive & wayfinding = COOL. Links, selected tabs, the focus ring: all blue, off the
         heat axis, so on-screen WARMTH only ever means severity. This is what keeps the thesis
-        honest — amber that is also a link colour stops meaning "look here". -- */
+        honest - amber that is also a link colour stops meaning "look here". -- */
   --link:            #7fb0f5;
   --link-hover:      #9cc4f8;
 
@@ -138,7 +138,7 @@ a:hover { color: var(--link-hover); text-decoration: underline; }
 .topnav nav a:hover { color: var(--text); text-decoration: none; background: var(--surface-raised); }
 .topnav nav a.active { color: var(--text); background: var(--surface-raised); border-bottom-color: var(--link); }
 .topnav .right { margin-left: auto; display: flex; align-items: center; gap: 1rem; }
-/* Utility links (Sign out) are chrome, not attention — never the warm accent. */
+/* Utility links (logout, uptime, version) are chrome, not attention - never the warm accent. */
 .topnav .right a { color: var(--text-muted); }
 .topnav .right a:hover { color: var(--text); }
 /* The pending badge is a legitimate attention signal (work is waiting), so it keeps the amber. */
@@ -169,7 +169,7 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 .page-title { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-muted); font-weight: 600; margin: 0 0 1rem; }
 .page-sub { color: var(--text-faint); font-size: 0.8rem; margin: 0 0 1.5rem; }
 
-/* ===================== Status band — the one thing read first ==============
+/* ===================== Status band - the one thing read first ==============
    A row of cells that frames operator state. The lead cell is "waiting on you":
    the console opens on the question it exists to answer. */
 .band {
@@ -188,7 +188,7 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 .band .cell--alarm { background: linear-gradient(180deg, var(--alert-dim), var(--surface)); }
 .band .cell .label { display: block; margin-bottom: 0.55rem; }
 /* Inventory numbers recede to muted ink; only an actionable cell (--call) or an alarm gets bright
-   warm ink and extra size, so the one number that means "act" wins the eye — not the largest count. */
+   warm ink and extra size, so the one number that means "act" wins the eye - not the largest count. */
 .band .cell .v { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 1.75rem; font-weight: 700; line-height: 1; letter-spacing: -0.02em; color: var(--text-muted); }
 .band .cell .v a { color: inherit; }
 .band .cell .v small { font-size: 0.9rem; color: var(--text-faint); font-weight: 500; margin-left: 0.3rem; }
@@ -253,7 +253,7 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 .panel-head--alert { box-shadow: inset 0 2px 0 var(--alert); color: var(--alert-text); }
 .panel-body { padding: 0.75rem 0.95rem 0.95rem; }
 
-/* ===================== Severity tags — "what it did" =======================
+/* ===================== Severity tags - "what it did" =======================
    The vocabulary that makes colour mean something. Driven off signal_type on
    the route side; a tag with no severity class stays neutral grey ("noise"). */
 .sev-tags { display: flex; gap: 0.35rem; flex-wrap: wrap; align-items: center; }
@@ -276,7 +276,7 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 .dot--crit { background: var(--alert); } .dot--high { background: var(--high); }
 .dot--watch { background: var(--attention); } .dot--low { background: var(--low); }
 
-/* ===================== Activity strip — the signature =======================
+/* ===================== Activity strip - the signature =======================
    24 cells, one per hour. Colour = worst signal that hour; height = volume.
    Reads burst / sustained / one-shot at a glance without parsing timestamps. */
 .strip { display: inline-flex; align-items: flex-end; gap: 1.5px; height: 26px; }
@@ -290,7 +290,7 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 .strip i.s4 { background: var(--alert); }
 /* Severity must beat volume: a HIGH/CRIT hour gets a height FLOOR so it can never render shorter
    than a tall scan bar, and a light top cap gives a NON-COLOUR channel (survives red-green CB and
-   ranks the worst hours) — height alone already carries volume, so the cap does the ordering work. */
+   ranks the worst hours) - height alone already carries volume, so the cap does the ordering work. */
 .strip i.s3 { min-height: 15px; box-shadow: inset 0 2px 0 rgba(231, 237, 243, 0.30); }
 .strip i.s4 { min-height: 20px; box-shadow: inset 0 3px 0 rgba(231, 237, 243, 0.55); }
 

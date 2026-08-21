@@ -15,11 +15,14 @@
 
 use std::collections::HashMap;
 
+use crate::persona;
+
 /// A static, read-only snapshot of a plausible Linux filesystem. Built fresh by `new()` for
 /// every session; `FakeShell` never mutates it, only tracks its own working directory alongside
-/// it.
+/// it. The hostname- and OS-bearing files are sourced from [`crate::persona`] so they cannot
+/// contradict the shell's `uname`, the sensor prompts, or the other sensors' banners.
 pub struct FakeFs {
-    files: HashMap<&'static str, &'static str>,
+    files: HashMap<&'static str, String>,
     dirs: HashMap<&'static str, Vec<&'static str>>,
 }
 
@@ -31,8 +34,10 @@ impl Default for FakeFs {
 
 impl FakeFs {
     pub fn new() -> Self {
-        let mut files = HashMap::new();
-        files.insert("/etc/hostname", "server01\n");
+        let host = persona::hostname();
+
+        let mut files: HashMap<&'static str, String> = HashMap::new();
+        files.insert("/etc/hostname", format!("{host}\n"));
         files.insert(
             "/etc/passwd",
             "root:x:0:0:root:/root:/bin/bash\n\
@@ -43,37 +48,43 @@ impl FakeFs {
              www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n\
              nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n\
              sshd:x:105:65534::/run/sshd:/usr/sbin/nologin\n\
-             ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n",
+             ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n"
+                .to_string(),
         );
         files.insert(
             "/etc/hosts",
-            "127.0.0.1 localhost\n\
-             127.0.1.1 server01\n\
-             \n\
-             ::1 localhost ip6-localhost ip6-loopback\n\
-             ff02::1 ip6-allnodes\n\
-             ff02::2 ip6-allrouters\n",
+            format!(
+                "127.0.0.1 localhost\n\
+                 127.0.1.1 {host}\n\
+                 \n\
+                 ::1 localhost ip6-localhost ip6-loopback\n\
+                 ff02::1 ip6-allnodes\n\
+                 ff02::2 ip6-allrouters\n"
+            ),
         );
         files.insert(
             "/etc/os-release",
-            "NAME=\"Ubuntu\"\n\
-             VERSION=\"22.04.4 LTS (Jammy Jellyfish)\"\n\
-             ID=ubuntu\n\
-             ID_LIKE=debian\n\
-             PRETTY_NAME=\"Ubuntu 22.04.4 LTS\"\n\
-             VERSION_ID=\"22.04\"\n",
+            format!(
+                "NAME=\"{name}\"\n\
+                 VERSION=\"{version}\"\n\
+                 ID=ubuntu\n\
+                 ID_LIKE=debian\n\
+                 PRETTY_NAME=\"{pretty}\"\n\
+                 VERSION_ID=\"{vid}\"\n",
+                name = persona::OS_NAME,
+                version = persona::OS_VERSION,
+                pretty = persona::OS_PRETTY,
+                vid = persona::OS_VERSION_ID,
+            ),
         );
-        files.insert(
-            "/proc/version",
-            "Linux version 5.15.0-91-generic (buildd@lcy02-amd64-051) \
-             (gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0) #101-Ubuntu SMP\n",
-        );
+        files.insert("/proc/version", format!("{}\n", persona::proc_version()));
         files.insert(
             "/proc/cpuinfo",
             "processor\t: 0\n\
              vendor_id\t: GenuineIntel\n\
              model name\t: Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz\n\
-             cpu cores\t: 1\n",
+             cpu cores\t: 1\n"
+                .to_string(),
         );
 
         let mut dirs = HashMap::new();

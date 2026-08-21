@@ -10,6 +10,7 @@ pub mod emit;
 pub mod fakefs;
 pub mod handoff;
 pub mod listener;
+pub mod persona;
 pub mod sanitize;
 pub mod shell;
 pub mod spool;

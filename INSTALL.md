@@ -338,6 +338,12 @@ in the sections above; the rest are optional overrides with sensible defaults. T
 `*_READ_TIMEOUT_MS` / `*_IDLE_TIMEOUT_MS` / `*_MAX_DURATION_SECS` / `*_MAX_CAPTURED_BYTES` /
 `*_MAX_CONCURRENT` bounds all default to the same values shown for SSH above.
 
+**shared persona (all sensors)**
+
+- `PROPOLIS_HOSTNAME` - the hostname the fake shell, fake filesystem (`/etc/hostname`, `/etc/hosts`),
+  and `uname` present. Defaults to `server01`. Set it once, globally (in a shared env sourced by
+  every sensor), so the sensors cannot disagree with each other on the host identity.
+
 **intake / database**
 
 - `PROPOLIS_CURSOR_DIR`

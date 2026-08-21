@@ -36,6 +36,7 @@ use sensor_wire::{
 };
 
 use crate::fakefs::FakeFs;
+use crate::persona;
 use crate::sanitize_value;
 
 /// Cap applied to the sanitized command line captured in `metadata.command`. Matches
@@ -315,9 +316,9 @@ fn busybox_banner() -> String {
 fn cmd_uname(parts: &[&str]) -> String {
     if parts.len() > 1 {
         // Any flag at all gets the full banner; this is a canned-response shell, not a faithful
-        // per-flag `uname` reimplementation, so `-a`/`-r`/`-s`/... are treated alike.
-        "Linux server01 5.15.0-91-generic #101-Ubuntu SMP x86_64 x86_64 x86_64 GNU/Linux\n"
-            .to_string()
+        // per-flag `uname` reimplementation, so `-a`/`-r`/`-s`/... are treated alike. Host and
+        // kernel come from persona so `uname` cannot disagree with /etc/os-release or the prompt.
+        format!("{}\n", persona::uname_all(&persona::hostname()))
     } else {
         "Linux\n".to_string()
     }

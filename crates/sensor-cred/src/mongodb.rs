@@ -247,11 +247,20 @@ fn extract_bson_string(data: &[u8], key: &str) -> Option<String> {
                         data[value_start + 1],
                         data[value_start + 2],
                         data[value_start + 3],
-                    ]) as usize;
+                    ]);
                     let str_start = value_start + 4;
-                    if str_len > 0 && str_start + str_len <= data.len() {
-                        let s = String::from_utf8_lossy(&data[str_start..str_start + str_len - 1]);
-                        return Some(s.into_owned());
+                    // The BSON string length is a signed i32 that INCLUDES the trailing NUL, so a
+                    // valid value is >= 1. Check the sign BEFORE casting to usize (a negative length
+                    // cast to usize wraps to a huge value) and use checked_add, so a crafted length
+                    // cannot produce a reversed or out-of-bounds slice range that panics the handler.
+                    if str_len >= 1 {
+                        let str_len = str_len as usize;
+                        if let Some(end) = str_start.checked_add(str_len) {
+                            if end <= data.len() {
+                                let s = String::from_utf8_lossy(&data[str_start..end - 1]);
+                                return Some(s.into_owned());
+                            }
+                        }
                     }
                 }
             }
@@ -323,5 +332,28 @@ mod tests {
         let declared_len = i32::from_le_bytes([doc[0], doc[1], doc[2], doc[3]]) as usize;
         assert_eq!(declared_len, doc.len());
         assert_eq!(*doc.last().unwrap(), 0x00); // terminator
+    }
+
+    #[test]
+    fn extract_bson_string_rejects_negative_length_without_panicking() {
+        // A crafted BSON string field with a NEGATIVE i32 length: cast to usize this wraps huge, and
+        // the old slice math produced a reversed / out-of-bounds range that panicked the connection
+        // handler. It must now return None, not panic.
+        let mut data = vec![0x02u8]; // string type marker
+        data.extend_from_slice(b"user\0"); // key (BSON keys are NUL-terminated cstrings)
+        data.extend_from_slice(&(-1i32).to_le_bytes()); // negative length
+        data.extend_from_slice(b"junk");
+        assert_eq!(extract_bson_string(&data, "user"), None);
+    }
+
+    #[test]
+    fn extract_bson_string_reads_a_valid_value() {
+        // Positive control: a well-formed field is still extracted (BSON length includes the NUL).
+        let value = b"admin\0";
+        let mut data = vec![0x02u8];
+        data.extend_from_slice(b"user\0"); // NUL-terminated key
+        data.extend_from_slice(&(value.len() as i32).to_le_bytes());
+        data.extend_from_slice(value);
+        assert_eq!(extract_bson_string(&data, "user").as_deref(), Some("admin"));
     }
 }

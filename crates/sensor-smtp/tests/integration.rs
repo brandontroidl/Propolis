@@ -131,6 +131,55 @@ async fn ehlo_advertises_auth() {
 }
 
 #[tokio::test]
+async fn banner_and_ehlo_impersonate_ubuntu_postfix() {
+    let srv = TestServer::start().await;
+    let stream = TcpStream::connect(srv.addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+
+    // Banner: persona hostname + Postfix (Ubuntu), never the RFC2606 placeholder mail.example.com.
+    let mut banner = String::new();
+    reader.read_line(&mut banner).await.unwrap();
+    assert!(banner.contains("server01"), "banner host: {banner}");
+    assert!(
+        banner.contains("ESMTP Postfix (Ubuntu)"),
+        "banner: {banner}"
+    );
+    assert!(
+        !banner.contains("example.com"),
+        "banner leaks placeholder: {banner}"
+    );
+
+    // EHLO: real Postfix caps, no "Hello" token, terminating on a capability not a bare "250 OK".
+    reader.write_all(b"EHLO probe\r\n").await.unwrap();
+    let mut ehlo = String::new();
+    loop {
+        let mut l = String::new();
+        reader.read_line(&mut l).await.unwrap();
+        ehlo.push_str(&l);
+        if l.starts_with("250 ") {
+            break;
+        }
+    }
+    assert!(
+        !ehlo.contains("Hello"),
+        "EHLO carries the non-Postfix 'Hello' token: {ehlo}"
+    );
+    assert!(
+        ehlo.contains("250-STARTTLS"),
+        "EHLO missing STARTTLS: {ehlo}"
+    );
+    assert!(
+        ehlo.contains("250-PIPELINING"),
+        "EHLO missing PIPELINING: {ehlo}"
+    );
+    assert!(
+        ehlo.trim_end().ends_with("250 CHUNKING"),
+        "EHLO must terminate on a real capability: {ehlo}"
+    );
+    srv.handle.abort();
+}
+
+#[tokio::test]
 async fn auth_plain_credential_capture() {
     let srv = TestServer::start().await;
     let mut client = SmtpClient::connect(srv.addr).await;

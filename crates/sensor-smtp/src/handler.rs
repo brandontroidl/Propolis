@@ -5,6 +5,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::persona;
 use sensor_framework::sanitize_value;
 use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
 use sensor_wire::{
@@ -17,14 +18,15 @@ const MAX_LINE_LEN: usize = 8192;
 const MAX_DATA_BODY: usize = 65536;
 const MAX_USERNAME_LEN: usize = 255;
 
-const BANNER: &[u8] = b"220 mail.example.com ESMTP Postfix\r\n";
-
-const EHLO_RESPONSE: &str = "\
-250-mail.example.com Hello\r\n\
-250-SIZE 10485760\r\n\
-250-8BITMIME\r\n\
-250-AUTH PLAIN LOGIN\r\n\
-250 OK\r\n";
+/// A Postfix-style short queue id (uppercase base36-ish), minted per accepted message so the DATA
+/// reply reads `... queued as <ID>` like a real Postfix instead of a bare "250 OK".
+fn queue_id() -> String {
+    const ALPHA: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let raw: [u8; 11] = rand::random();
+    raw.iter()
+        .map(|b| ALPHA[*b as usize % ALPHA.len()] as char)
+        .collect()
+}
 
 pub async fn handle_connection(
     stream: TcpStream,
@@ -46,8 +48,29 @@ pub async fn handle_connection(
         .append(&connection_event(source_ip, wan_ip, session_id))
         .await;
 
+    // The advertised identity comes from the shared persona so the SMTP hostname matches uname /
+    // the other sensors, never the RFC2606 placeholder mail.example.com. The banner and EHLO
+    // capability set impersonate a stock Ubuntu Postfix; every advertised capability has a matching
+    // handler/reply below, since advertising one the server does not honor is itself a tell.
+    let host = persona::hostname();
+    let banner = format!("220 {host} ESMTP Postfix (Ubuntu)\r\n");
+    let ehlo_reply = format!(
+        "250-{host}\r\n\
+         250-PIPELINING\r\n\
+         250-SIZE 10240000\r\n\
+         250-ETRN\r\n\
+         250-STARTTLS\r\n\
+         250-AUTH PLAIN LOGIN\r\n\
+         250-ENHANCEDSTATUSCODES\r\n\
+         250-8BITMIME\r\n\
+         250-DSN\r\n\
+         250-SMTPUTF8\r\n\
+         250 CHUNKING\r\n"
+    );
+    let helo_reply = format!("250 {host}\r\n");
+
     let mut reader = BufReader::new(stream);
-    if write_reply(&mut reader, BANNER).await.is_err() {
+    if write_reply(&mut reader, banner.as_bytes()).await.is_err() {
         return;
     }
 
@@ -61,8 +84,20 @@ pub async fn handle_connection(
         };
         let upper = line.to_ascii_uppercase();
 
-        if upper.starts_with("EHLO") || upper.starts_with("HELO") {
-            let _ = write_reply(&mut reader, EHLO_RESPONSE.as_bytes()).await;
+        if upper.starts_with("EHLO") {
+            let _ = write_reply(&mut reader, ehlo_reply.as_bytes()).await;
+        } else if upper.starts_with("HELO") {
+            // HELO gets a single-line greeting; only EHLO returns the multiline extension list.
+            let _ = write_reply(&mut reader, helo_reply.as_bytes()).await;
+        } else if upper.starts_with("STARTTLS") {
+            // Advertised in EHLO, so it must be answered - but this low-interaction sensor has no
+            // TLS. Postfix's own "TLS temporarily unavailable" reply is realistic and needs no
+            // handshake, unlike a 502 that would contradict the advertised STARTTLS capability.
+            let _ = write_reply(
+                &mut reader,
+                b"454 4.7.0 TLS not available due to local problem\r\n",
+            )
+            .await;
         } else if upper.starts_with("AUTH PLAIN ") {
             // AUTH PLAIN <base64(NUL user NUL pass)> - decode username, drop password
             let encoded = line[11..].trim();
@@ -97,16 +132,12 @@ pub async fn handle_connection(
         } else if upper.starts_with("MAIL FROM:") {
             mail_from = extract_angle_bracket(&line[10..]);
             rcpt_to.clear();
-            let _ = write_reply(&mut reader, b"250 OK\r\n").await;
+            let _ = write_reply(&mut reader, b"250 2.1.0 Ok\r\n").await;
         } else if upper.starts_with("RCPT TO:") {
             rcpt_to.push(extract_angle_bracket(&line[8..]));
-            let _ = write_reply(&mut reader, b"250 OK\r\n").await;
+            let _ = write_reply(&mut reader, b"250 2.1.5 Ok\r\n").await;
         } else if upper == "DATA" {
-            let _ = write_reply(
-                &mut reader,
-                b"354 Start mail input; end with <CRLF>.<CRLF>\r\n",
-            )
-            .await;
+            let _ = write_reply(&mut reader, b"354 End data with <CR><LF>.<CR><LF>\r\n").await;
             let body = read_data_body(&mut reader, &bounds, &mut total_read).await;
             let subject = extract_header(&body, "Subject");
             let _ = emitter
@@ -120,20 +151,28 @@ pub async fn handle_connection(
                     session_id,
                 ))
                 .await;
-            let _ = write_reply(&mut reader, b"250 OK\r\n").await;
+            // Postfix acknowledges an accepted message with a queue id, not a bare "250 OK".
+            let reply = format!("250 2.0.0 Ok: queued as {}\r\n", queue_id());
+            let _ = write_reply(&mut reader, reply.as_bytes()).await;
         } else if upper.starts_with("RSET") {
             mail_from.clear();
             rcpt_to.clear();
-            let _ = write_reply(&mut reader, b"250 OK\r\n").await;
+            let _ = write_reply(&mut reader, b"250 2.0.0 Ok\r\n").await;
         } else if upper.starts_with("NOOP") {
-            let _ = write_reply(&mut reader, b"250 OK\r\n").await;
+            let _ = write_reply(&mut reader, b"250 2.0.0 Ok\r\n").await;
         } else if upper.starts_with("QUIT") {
-            let _ = write_reply(&mut reader, b"221 Bye\r\n").await;
+            let _ = write_reply(&mut reader, b"221 2.0.0 Bye\r\n").await;
             return;
-        } else if upper.starts_with("VRFY") || upper.starts_with("EXPN") {
-            let _ = write_reply(&mut reader, b"252 Cannot verify\r\n").await;
+        } else if upper.starts_with("VRFY") {
+            let _ = write_reply(
+                &mut reader,
+                b"252 2.0.0 Cannot VRFY user, but will accept message and attempt delivery\r\n",
+            )
+            .await;
+        } else if upper.starts_with("EXPN") {
+            let _ = write_reply(&mut reader, b"502 5.5.1 Command not implemented\r\n").await;
         } else {
-            let _ = write_reply(&mut reader, b"502 Not implemented\r\n").await;
+            let _ = write_reply(&mut reader, b"502 5.5.2 Error: command not recognized\r\n").await;
         }
     }
 }

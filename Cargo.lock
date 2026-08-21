@@ -3889,6 +3889,7 @@ name = "sensor-smtp"
 version = "0.3.0"
 dependencies = [
  "chrono",
+ "rand 0.10.2",
  "sensor-framework",
  "sensor-wire",
  "serde_json",

@@ -463,6 +463,7 @@ pub async fn handle_connection(
 /// concurrent streams, and this stops an OPEN flood from amplifying wire bytes into unbounded heap.
 const MAX_STREAMS_PER_CONN: usize = 32;
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_open(
     stream: &mut TcpStream,
     header: &Header,

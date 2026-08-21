@@ -372,35 +372,63 @@ async fn handle_session(
 
                 match &mut handler {
                     ChannelHandler::Shell(shell, line_buf) => {
+                        // A real interactive session runs the client terminal in raw mode and relies
+                        // on the SERVER to echo keystrokes. Without that echo the attacker types into
+                        // a blank screen and the session looks frozen (and no-echo is itself a tell,
+                        // since every real shell echoes). So each printable byte is echoed as it
+                        // arrives, backspace erases on screen, and Enter echoes CR-LF and shows a
+                        // fresh prompt - even for an empty line, as a real shell does.
                         let mut responses = Vec::new();
+                        let mut prev_cr = false;
                         for &byte in data {
-                            if byte == b'\n' || byte == b'\r' {
-                                if !line_buf.is_empty() {
-                                    let line = String::from_utf8_lossy(line_buf).to_string();
-                                    line_buf.clear();
-                                    let (output, events) = shell.handle_input(&line);
-                                    for event in &events {
-                                        let _ = emitter.append(event).await;
+                            match byte {
+                                b'\r' | b'\n' => {
+                                    // Swallow the LF of a CR-LF pair so Enter is one line, not two.
+                                    if byte == b'\n' && prev_cr {
+                                        prev_cr = false;
+                                        continue;
                                     }
-                                    if !output.is_empty() {
-                                        responses.extend_from_slice(output.as_bytes());
+                                    prev_cr = byte == b'\r';
+                                    responses.extend_from_slice(b"\r\n");
+                                    if !line_buf.is_empty() {
+                                        let line = String::from_utf8_lossy(line_buf).to_string();
+                                        line_buf.clear();
+                                        let (output, events) = shell.handle_input(&line);
+                                        for event in &events {
+                                            let _ = emitter.append(event).await;
+                                        }
+                                        if !output.is_empty() {
+                                            responses.extend_from_slice(output.as_bytes());
+                                        }
                                     }
-                                    // Send next prompt.
                                     responses.extend_from_slice(b"root@server01:~# ");
                                 }
-                            } else {
-                                line_buf.push(byte);
-                                // Flush the buffer as a partial line when the cap is
-                                // reached so an attacker streaming non-newline bytes
-                                // cannot grow memory without bound.
-                                if line_buf.len() >= MAX_LINE_LEN {
-                                    let line = String::from_utf8_lossy(line_buf).to_string();
-                                    line_buf.clear();
-                                    let (_output, events) = shell.handle_input(&line);
-                                    for event in &events {
-                                        let _ = emitter.append(event).await;
+                                // Backspace / DEL: erase the last char on screen too.
+                                0x7f | 0x08 => {
+                                    prev_cr = false;
+                                    if line_buf.pop().is_some() {
+                                        responses.extend_from_slice(b"\x08 \x08");
                                     }
                                 }
+                                // Printable byte: buffer and echo it.
+                                b if b >= 0x20 => {
+                                    prev_cr = false;
+                                    line_buf.push(b);
+                                    responses.push(b);
+                                    // Flush a too-long line so a stream of non-newline bytes cannot
+                                    // grow memory without bound.
+                                    if line_buf.len() >= MAX_LINE_LEN {
+                                        let line = String::from_utf8_lossy(line_buf).to_string();
+                                        line_buf.clear();
+                                        let (_output, events) = shell.handle_input(&line);
+                                        for event in &events {
+                                            let _ = emitter.append(event).await;
+                                        }
+                                    }
+                                }
+                                // Other control bytes (tab, Ctrl-*, escape sequences): consume
+                                // without echo, matching a shell in a minimal cooked-ish mode.
+                                _ => prev_cr = false,
                             }
                         }
                         if !responses.is_empty() {

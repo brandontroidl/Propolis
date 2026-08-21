@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use sensor_framework::listener::normalize_dual_stack;
@@ -345,15 +345,25 @@ async fn read_line_bounded(
     } else {
         bounds.idle_timeout
     };
-    let mut line = String::new();
-    match tokio::time::timeout(timeout, reader.read_line(&mut line)).await {
+    // Bound the bytes buffered for ONE line: a client that never sends a newline would otherwise
+    // make `read_line` grow the buffer to the whole line before any cap applied (unbounded
+    // allocation -> OOM). Read through a `take` limited to MAX_LINE_LEN and never past the remaining
+    // capture budget, so an over-long line is chopped, not buffered whole. Decoding the bounded byte
+    // buffer with `from_utf8_lossy` also removes the old `String::truncate` char-boundary panic on a
+    // multibyte character straddling the limit.
+    let remaining = bounds.max_captured_bytes.saturating_sub(*total);
+    let cap = (MAX_LINE_LEN as u64).min(remaining).max(1);
+    let mut buf = Vec::new();
+    let mut limited = (&mut *reader).take(cap);
+    match tokio::time::timeout(timeout, limited.read_until(b'\n', &mut buf)).await {
         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => None,
         Ok(Ok(n)) => {
             *total += n as u64;
-            if line.len() > MAX_LINE_LEN {
-                line.truncate(MAX_LINE_LEN);
-            }
-            Some(line.trim_end_matches(['\r', '\n']).to_string())
+            Some(
+                String::from_utf8_lossy(&buf)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string(),
+            )
         }
     }
 }

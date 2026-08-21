@@ -180,6 +180,28 @@ async fn banner_and_ehlo_impersonate_ubuntu_postfix() {
 }
 
 #[tokio::test]
+async fn unterminated_over_long_line_is_chopped_and_answered() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    // A blob well over MAX_LINE_LEN (8192) with NO newline. The old read_line blocked waiting for a
+    // newline while buffering the whole thing (unbounded -> OOM); the bounded reader returns after
+    // the cap and the server answers. If this hung, read_reply's timeout would panic the test.
+    let blob = "A".repeat(20_000);
+    client
+        .reader
+        .get_mut()
+        .write_all(blob.as_bytes())
+        .await
+        .unwrap();
+    let r = client.read_reply().await;
+    assert!(
+        r.starts_with("50"),
+        "an unterminated over-long line must be chopped and answered, not buffered whole: {r}"
+    );
+    srv.handle.abort();
+}
+
+#[tokio::test]
 async fn auth_plain_credential_capture() {
     let srv = TestServer::start().await;
     let mut client = SmtpClient::connect(srv.addr).await;

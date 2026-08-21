@@ -336,16 +336,23 @@ async fn read_line_bounded(
         bounds.idle_timeout
     };
 
-    let mut line = String::new();
-    match tokio::time::timeout(timeout, reader.read_line(&mut line)).await {
+    // Bound the bytes buffered for ONE line: a client that never sends a newline would otherwise
+    // make `read_line` grow the buffer to the whole line before any cap applied (unbounded
+    // allocation -> OOM), and this is pre-auth. Read through a `take` limited to MAX_LINE_LEN and
+    // never past the remaining capture budget, so an over-long line is chopped, not buffered whole.
+    let remaining = bounds.max_captured_bytes.saturating_sub(*total);
+    let cap = (MAX_LINE_LEN as u64).min(remaining).max(1);
+    let mut buf = Vec::new();
+    let mut limited = (&mut *reader).take(cap);
+    match tokio::time::timeout(timeout, limited.read_until(b'\n', &mut buf)).await {
         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => None,
         Ok(Ok(n)) => {
             *total += n as u64;
-            if line.len() > MAX_LINE_LEN {
-                line.truncate(MAX_LINE_LEN);
-            }
-            let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
-            Some(trimmed)
+            Some(
+                String::from_utf8_lossy(&buf)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string(),
+            )
         }
     }
 }

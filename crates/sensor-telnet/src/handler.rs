@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 
 use sensor_framework::fakefs::FakeFs;
 use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::persona;
 use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell};
 use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
@@ -41,9 +42,7 @@ const MAX_USERNAME_LEN: usize = 255;
 /// chance to apply `MAX_LINE_LEN`/the total-captured cap.
 const READ_CHUNK_SIZE: usize = 1024;
 
-const PROMPT_LOGIN: &[u8] = b"login: ";
 const PROMPT_PASSWORD: &[u8] = b"Password: ";
-const SHELL_PROMPT: &[u8] = b"root@server01:~# ";
 
 /// Handle one accepted Telnet connection end to end: negotiation, login, then the fake shell.
 /// Never panics and never propagates an I/O error to the caller - any read/write failure or
@@ -81,9 +80,21 @@ pub async fn handle_connection(
         return;
     }
 
+    // A real telnetd prints the network issue banner then a hostname-qualified login prompt. Both
+    // come from the shared persona so the hostname matches uname / the shell prompt / the other
+    // sensors, instead of a bare "login:" with no host and a cross-instance-constant shell prompt.
+    let host = persona::hostname();
+    let shell_prompt = persona::root_prompt(&host);
+
+    let issue = format!("{}\r\n", persona::OS_PRETTY);
+    if stream.write_all(issue.as_bytes()).await.is_err() {
+        return;
+    }
+
     let mut reader = LineReader::new(bounds);
 
-    if stream.write_all(PROMPT_LOGIN).await.is_err() {
+    let login_prompt = format!("{host} login: ");
+    if stream.write_all(login_prompt.as_bytes()).await.is_err() {
         return;
     }
     let Some(username_raw) = reader.read_line(&mut stream).await else {
@@ -119,7 +130,7 @@ pub async fn handle_connection(
     };
     let mut shell = FakeShell::new(FakeFs::new(), ctx);
 
-    if stream.write_all(SHELL_PROMPT).await.is_err() {
+    if stream.write_all(shell_prompt.as_bytes()).await.is_err() {
         return;
     }
 
@@ -142,7 +153,7 @@ pub async fn handle_connection(
         }
 
         let mut response = output.into_bytes();
-        response.extend_from_slice(SHELL_PROMPT);
+        response.extend_from_slice(shell_prompt.as_bytes());
         if stream.write_all(&response).await.is_err() {
             return;
         }

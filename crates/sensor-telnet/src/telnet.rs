@@ -27,16 +27,17 @@ const DONT: u8 = 254;
 const SB: u8 = 250;
 const SE: u8 = 240;
 
-/// Telnet Echo option (RFC 857).
-const OPT_ECHO: u8 = 1;
-/// Telnet Suppress Go Ahead option (RFC 858).
+/// Telnet Suppress Go Ahead option (RFC 858) - the only option this sensor offers.
 const OPT_SGA: u8 = 3;
 
-/// The bytes to send immediately after accepting a connection: `IAC WILL ECHO` followed by
-/// `IAC WILL SGA` - exactly the sequence the design spec's protocol flow names
-/// (`255 251 1`, `255 251 3`).
+/// The bytes to send immediately after accepting a connection: `IAC WILL SGA` (`255 251 3`).
+///
+/// The sensor offers Suppress-Go-Ahead only and runs the login/shell in line mode, where the
+/// CLIENT echoes locally. It deliberately does NOT offer `WILL ECHO`: promising server-side echo
+/// and then never echoing a byte (the previous behaviour) is a contradiction a client's option
+/// state machine catches at once, so the honest posture is to not claim echo at all.
 pub fn negotiation_preamble() -> Vec<u8> {
-    vec![IAC, WILL, OPT_ECHO, IAC, WILL, OPT_SGA]
+    vec![IAC, WILL, OPT_SGA]
 }
 
 /// Which negotiation verb [`IacFilter`] is midway through parsing the option byte for.
@@ -123,7 +124,15 @@ impl IacFilter {
                         // The client proposed enabling an option, or asked us to: refuse both,
                         // per the module doc's negotiation policy.
                         Verb::Will => response_out.extend_from_slice(&[IAC, DONT, byte]),
-                        Verb::Do => response_out.extend_from_slice(&[IAC, WONT, byte]),
+                        // We offered WILL SGA, so a client DO SGA is the agreement - reply nothing
+                        // (RFC 854 loop avoidance). A DO for any option we did not offer (including
+                        // ECHO, which we no longer claim) is refused with WONT. The old code
+                        // blanket-refused even our own SGA, contradicting the preamble.
+                        Verb::Do => {
+                            if byte != OPT_SGA {
+                                response_out.extend_from_slice(&[IAC, WONT, byte]);
+                            }
+                        }
                         // WONT/DONT are already-refused notices; never reply to one (RFC 854's
                         // loop-avoidance rule).
                         Verb::WontOrDont => {}
@@ -154,11 +163,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn negotiation_preamble_is_will_echo_will_sga() {
-        assert_eq!(
-            negotiation_preamble(),
-            vec![IAC, WILL, OPT_ECHO, IAC, WILL, OPT_SGA]
+    fn negotiation_preamble_is_will_sga_only() {
+        // ECHO is deliberately not offered (see negotiation_preamble): the sensor never echoes, so
+        // claiming server echo would be a self-contradiction.
+        assert_eq!(negotiation_preamble(), vec![IAC, WILL, OPT_SGA]);
+    }
+
+    #[test]
+    fn client_do_sga_gets_no_reply_because_we_offered_it() {
+        let mut filter = IacFilter::new();
+        let mut data = Vec::new();
+        let mut resp = Vec::new();
+        filter.process(&[IAC, DO, OPT_SGA], &mut data, &mut resp);
+        assert!(
+            resp.is_empty(),
+            "DO for our own offered SGA is agreement, not something to refuse"
         );
+    }
+
+    #[test]
+    fn client_do_echo_is_refused_since_we_never_offered_it() {
+        let mut filter = IacFilter::new();
+        let mut data = Vec::new();
+        let mut resp = Vec::new();
+        const OPT_ECHO: u8 = 1; // RFC 857; the sensor deliberately does not offer it
+        filter.process(&[IAC, DO, OPT_ECHO], &mut data, &mut resp);
+        assert_eq!(resp, vec![IAC, WONT, OPT_ECHO]);
     }
 
     #[test]

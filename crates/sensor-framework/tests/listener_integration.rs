@@ -43,7 +43,7 @@ async fn tcp_accept_and_handler_called() {
 async fn udp_receives_and_never_responds() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let (bound_addr, handle) = run_udp_listener(addr, move |data, _peer| {
+    let (bound_addr, handle) = run_udp_listener(addr, test_bounds(), move |data, _peer| {
         let tx = tx.clone();
         async move {
             let _ = tx.send(data.to_vec()).await;
@@ -116,7 +116,7 @@ async fn udp_bind_failure_non_fatal() {
     // exercises at all.
     let blocker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let blocked_addr = blocker.local_addr().unwrap();
-    let result = run_udp_listener(blocked_addr, |_d, _p| async {}).await;
+    let result = run_udp_listener(blocked_addr, test_bounds(), |_d, _p| async {}).await;
     assert!(result.is_err());
     drop(blocker);
 }
@@ -131,7 +131,7 @@ async fn udp_handler_panic_does_not_crash_recv_loop() {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let call_count = Arc::new(AtomicU32::new(0));
     let count = call_count.clone();
-    let (bound_addr, handle) = run_udp_listener(addr, move |_data, _peer| {
+    let (bound_addr, handle) = run_udp_listener(addr, test_bounds(), move |_data, _peer| {
         let count = count.clone();
         async move {
             count.fetch_add(1, Ordering::Relaxed);

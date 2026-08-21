@@ -277,7 +277,7 @@ async fn main() {
         let local_ip = normalize_dual_stack(*addr).ip();
         let udp_emitter = emitter.clone();
         let udp_wan_resolver = wan_resolver.clone();
-        match run_udp_listener(*addr, move |data, peer| {
+        match run_udp_listener(*addr, config.bounds.clone(), move |data, peer| {
             let emitter = udp_emitter.clone();
             let wan_resolver = udp_wan_resolver.clone();
             async move {

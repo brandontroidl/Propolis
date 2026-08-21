@@ -161,6 +161,7 @@ where
 /// emit side).
 pub async fn run_udp_listener<F, Fut>(
     addr: SocketAddr,
+    bounds: ConnectionBounds,
     handler: F,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)>
 where
@@ -169,6 +170,12 @@ where
 {
     let socket = UdpSocket::bind(addr).await?;
     let bound_addr = socket.local_addr()?;
+    // Bound in-flight datagram handlers and their runtime, mirroring run_tcp_listener: without this
+    // a datagram flood spawns unbounded tasks (each datagram spawns two) and a wedged handler runs
+    // forever. A datagram that cannot get a permit is dropped - UDP is lossy anyway, and the socket
+    // keeps draining so its kernel receive buffer does not back up.
+    let semaphore = Arc::new(Semaphore::new(bounds.max_concurrent as usize));
+    let max_duration = bounds.max_duration;
 
     let recv_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_MAX_DATAGRAM];
@@ -181,12 +188,24 @@ where
                     continue;
                 }
             };
+            let permit = match semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        local = %bound_addr, %peer,
+                        "udp max_concurrent reached; dropping datagram"
+                    );
+                    continue;
+                }
+            };
             let data = buf[..n].to_vec();
             let fut = handler(data, peer);
             tokio::spawn(async move {
-                let inner = tokio::spawn(fut);
+                let _permit = permit; // released when this handler task ends
+                let inner =
+                    tokio::spawn(async move { tokio::time::timeout(max_duration, fut).await });
                 match inner.await {
-                    Ok(()) => {}
+                    Ok(_) => {}
                     Err(join_err) if join_err.is_panic() => {
                         tracing::error!(%peer, error = %join_err, "sensor udp handler panicked");
                     }

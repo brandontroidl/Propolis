@@ -40,10 +40,19 @@ async fn tcp_probe_emits_catchall_probe_event() {
 async fn udp_probe_emits_event_and_zero_response() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("events.jsonl");
-    let (udp_addr, _handle) =
-        sensor_catchall::start_test_udp_listener("127.0.0.1:0".parse().unwrap(), log_path.clone())
-            .await
-            .unwrap();
+    let (udp_addr, _handle) = sensor_catchall::start_test_udp_listener(
+        "127.0.0.1:0".parse().unwrap(),
+        sensor_framework::ConnectionBounds {
+            read_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(5),
+            max_duration: Duration::from_secs(30),
+            max_captured_bytes: 5_000_000,
+            max_concurrent: 100,
+        },
+        log_path.clone(),
+    )
+    .await
+    .unwrap();
 
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     client.send_to(b"\x00\x01probe", udp_addr).await.unwrap();

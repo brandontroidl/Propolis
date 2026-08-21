@@ -75,12 +75,13 @@ pub async fn start_test_listener(
 /// reads the actual per-connection `local_addr()`).
 pub async fn start_test_udp_listener(
     addr: SocketAddr,
+    bounds: ConnectionBounds,
     log_path: PathBuf,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
     let emitter = Arc::new(EventEmitter::new(log_path));
     let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
     let local_ip = normalize_dual_stack(addr).ip();
-    run_udp_listener(addr, move |data, peer| {
+    run_udp_listener(addr, bounds, move |data, peer| {
         let emitter = emitter.clone();
         let wan_resolver = wan_resolver.clone();
         async move {

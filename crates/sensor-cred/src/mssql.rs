@@ -100,8 +100,10 @@ fn build_loginack() -> Vec<u8> {
         let mut b = Vec::new();
         b.push(0x01); // interface: SQL_DFLT
         b.extend_from_slice(&[0x74, 0x00, 0x00, 0x00]); // TDS version 7.4
-        // Server name as UTF-16LE
-        let name = "Propolis";
+        // LOGINACK ProgName (the server program name) as UTF-16LE. Real SQL Server sends the
+        // literal product name here, NOT the instance/host and NEVER the honeypot's own name - a
+        // banner that names the honeypot lets a scanner enumerate every node by searching for it.
+        let name = "Microsoft SQL Server";
         b.push(name.len() as u8);
         for c in name.encode_utf16() {
             b.extend_from_slice(&c.to_le_bytes());

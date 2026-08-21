@@ -68,7 +68,8 @@ pub async fn handle_connection(
 fn build_greeting() -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(0x0a); // protocol version 10
-    payload.extend_from_slice(b"5.7.42-propolis\0"); // server version
+    payload.extend_from_slice(b"5.7.42\0"); // server version (never embed the project name here - a
+    // banner that names the honeypot lets a scanner find every node by searching for it)
     payload.extend_from_slice(&1u32.to_le_bytes()); // connection id
     payload.extend_from_slice(&[0x42; 8]); // auth-plugin-data part 1
     payload.push(0x00); // filler

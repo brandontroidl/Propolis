@@ -18,14 +18,15 @@
 //! worth emulating statefully.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
-use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
+use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver, persona};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
     SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
@@ -72,35 +73,160 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid)
     }
 }
 
-/// Canned `INFO` reply body (see the design spec's "INFO -> canned server info"): a fake Redis
-/// 7.x server on Linux with plausible memory/replication stats, formatted as INFO's real
-/// `# Section` / `key:value` text layout so the reply is indistinguishable in shape from a real
-/// server's.
+/// Redis's exact unknown-command error: the ORIGINAL-case command name, then each following
+/// argument quoted, e.g. `unknown command 'FoO', with args beginning with: 'a', 'b', `. The old
+/// reply uppercased the name and dropped the args clause entirely, which is a one-probe tell. Args
+/// are sanitized and length-bounded so an attacker-controlled arg cannot break RESP error framing.
+fn unknown_command_error(args: &[String]) -> String {
+    let mut msg = format!(
+        "ERR unknown command '{}', with args beginning with: ",
+        sanitize_value(&args[0], 128)
+    );
+    for a in args.iter().skip(1).take(20) {
+        msg.push('\'');
+        msg.push_str(&sanitize_value(a, 128));
+        msg.push_str("', ");
+    }
+    msg
+}
+
+/// A fresh 40-hex id, as Redis mints for `run_id` / `master_replid` on every boot.
+fn random_hex40() -> String {
+    let bytes: [u8; 20] = rand::random();
+    let mut s = String::with_capacity(40);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+// Minted ONCE per process. A real Redis assigns run_id/master_replid a random 40-hex value at
+// startup that is then stable for the life of the process; the old canned INFO had no run_id at
+// all (and every other value frozen), which a one-line INFO probe flags instantly. Process start
+// is captured so uptime advances instead of sitting at a constant 3600.
+static RUN_ID: LazyLock<String> = LazyLock::new(random_hex40);
+static REPL_ID: LazyLock<String> = LazyLock::new(random_hex40);
+static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// `INFO` reply body: a Redis 7.2.4 standalone master formatted as INFO's real `# Section` /
+/// `key:value` layout. The identity/liveness fields that a scanner keys on are dynamic - a
+/// per-process `run_id`/`master_replid`, an advancing `uptime`, the real `process_id`, and the OS
+/// line sourced from the shared persona - so the reply is not the byte-identical frozen stub the
+/// audit flagged. The remaining counters are plausible constants (this trap holds no real data).
 fn canned_info() -> String {
-    concat!(
-        "# Server\r\n",
-        "redis_version:7.2.4\r\n",
-        "redis_mode:standalone\r\n",
-        "os:Linux 5.15.0-91-generic x86_64\r\n",
-        "arch_bits:64\r\n",
-        "process_id:1\r\n",
-        "tcp_port:6379\r\n",
-        "uptime_in_seconds:3600\r\n",
-        "\r\n",
-        "# Memory\r\n",
-        "used_memory:1048576\r\n",
-        "used_memory_human:1.00M\r\n",
-        "maxmemory:0\r\n",
-        "maxmemory_policy:noeviction\r\n",
-        "\r\n",
-        "# Replication\r\n",
-        "role:master\r\n",
-        "connected_slaves:0\r\n",
-        "\r\n",
-        "# Clients\r\n",
-        "connected_clients:1\r\n",
+    let uptime = PROCESS_START.elapsed().as_secs();
+    let uptime_days = uptime / 86_400;
+    let pid = std::process::id();
+    let now_usec = chrono::Utc::now().timestamp_micros();
+    let save_time = chrono::Utc::now().timestamp();
+    let os = format!("Linux {} {}", persona::KERNEL_RELEASE, persona::ARCH);
+    let run_id = &*RUN_ID;
+    let repl_id = &*REPL_ID;
+    format!(
+        "# Server\r\n\
+         redis_version:7.2.4\r\n\
+         redis_git_sha1:00000000\r\n\
+         redis_git_dirty:0\r\n\
+         redis_build_id:a5f6e8c0b3d21947\r\n\
+         redis_mode:standalone\r\n\
+         os:{os}\r\n\
+         arch_bits:64\r\n\
+         monotonic_clock:POSIX clock_gettime\r\n\
+         multiplexing_api:epoll\r\n\
+         atomicvar_api:c11-builtin\r\n\
+         process_id:{pid}\r\n\
+         process_supervised:no\r\n\
+         run_id:{run_id}\r\n\
+         tcp_port:6379\r\n\
+         server_time_usec:{now_usec}\r\n\
+         uptime_in_seconds:{uptime}\r\n\
+         uptime_in_days:{uptime_days}\r\n\
+         hz:10\r\n\
+         configured_hz:10\r\n\
+         lru_clock:0\r\n\
+         executable:/usr/bin/redis-server\r\n\
+         config_file:/etc/redis/redis.conf\r\n\
+         io_threads_active:0\r\n\
+         \r\n\
+         # Clients\r\n\
+         connected_clients:1\r\n\
+         cluster_connections:0\r\n\
+         maxclients:10000\r\n\
+         client_recent_max_input_buffer:20480\r\n\
+         client_recent_max_output_buffer:0\r\n\
+         blocked_clients:0\r\n\
+         tracking_clients:0\r\n\
+         pubsub_clients:0\r\n\
+         watching_clients:0\r\n\
+         clients_in_timeout_table:0\r\n\
+         total_blocking_keys:0\r\n\
+         \r\n\
+         # Memory\r\n\
+         used_memory:1048576\r\n\
+         used_memory_human:1.00M\r\n\
+         used_memory_rss:12582912\r\n\
+         used_memory_rss_human:12.00M\r\n\
+         used_memory_peak:1150976\r\n\
+         used_memory_peak_human:1.10M\r\n\
+         used_memory_lua:0\r\n\
+         used_memory_scripts:0\r\n\
+         number_of_cached_scripts:0\r\n\
+         maxmemory:0\r\n\
+         maxmemory_human:0B\r\n\
+         maxmemory_policy:noeviction\r\n\
+         mem_fragmentation_ratio:12.00\r\n\
+         mem_allocator:jemalloc-5.3.0\r\n\
+         \r\n\
+         # Persistence\r\n\
+         loading:0\r\n\
+         async_loading:0\r\n\
+         rdb_changes_since_last_save:0\r\n\
+         rdb_bgsave_in_progress:0\r\n\
+         rdb_last_save_time:{save_time}\r\n\
+         rdb_last_bgsave_status:ok\r\n\
+         aof_enabled:0\r\n\
+         aof_last_bgrewrite_status:ok\r\n\
+         aof_last_write_status:ok\r\n\
+         \r\n\
+         # Stats\r\n\
+         total_connections_received:1\r\n\
+         total_commands_processed:1\r\n\
+         instantaneous_ops_per_sec:0\r\n\
+         total_net_input_bytes:31\r\n\
+         total_net_output_bytes:0\r\n\
+         rejected_connections:0\r\n\
+         sync_full:0\r\n\
+         expired_keys:0\r\n\
+         evicted_keys:0\r\n\
+         keyspace_hits:0\r\n\
+         keyspace_misses:0\r\n\
+         pubsub_channels:0\r\n\
+         pubsub_patterns:0\r\n\
+         latest_fork_usec:0\r\n\
+         total_forks:0\r\n\
+         \r\n\
+         # Replication\r\n\
+         role:master\r\n\
+         connected_slaves:0\r\n\
+         master_failover_state:no-failover\r\n\
+         master_replid:{repl_id}\r\n\
+         master_replid2:0000000000000000000000000000000000000000\r\n\
+         master_repl_offset:0\r\n\
+         second_repl_offset:-1\r\n\
+         repl_backlog_active:0\r\n\
+         repl_backlog_size:1048576\r\n\
+         \r\n\
+         # CPU\r\n\
+         used_cpu_sys:0.100000\r\n\
+         used_cpu_user:0.080000\r\n\
+         used_cpu_sys_children:0.000000\r\n\
+         used_cpu_user_children:0.000000\r\n\
+         \r\n\
+         # Cluster\r\n\
+         cluster_enabled:0\r\n\
+         \r\n\
+         # Keyspace\r\n"
     )
-    .to_string()
 }
 
 /// Canned `CONFIG GET *` reply: a small, plausible flat key/value array (real Redis returns
@@ -179,7 +305,16 @@ impl Session {
     pub fn dispatch(&mut self, args: &[String]) -> (Vec<u8>, Vec<SensorEvent>) {
         let cmd = args[0].to_ascii_uppercase();
         match cmd.as_str() {
-            "PING" => (resp::simple_string("PONG"), vec![]),
+            // Real Redis PING echoes its optional message (as a bulk string) and errors on excess
+            // arity; a bare PING is +PONG.
+            "PING" => match args.len() {
+                1 => (resp::simple_string("PONG"), vec![]),
+                2 => (resp::bulk_string(&args[1]), vec![]),
+                _ => (
+                    resp::error_reply("ERR wrong number of arguments for 'ping' command"),
+                    vec![],
+                ),
+            },
             "AUTH" => self.handle_auth(args),
             "INFO" => (resp::bulk_string(&canned_info()), vec![]),
             "CONFIG" => self.handle_config(args),
@@ -187,10 +322,7 @@ impl Session {
             "GET" => self.handle_get(args),
             "SLAVEOF" | "REPLICAOF" => self.handle_replicaof(&cmd, args),
             "EVAL" | "SCRIPT" => self.handle_eval(&cmd, args),
-            _ => (
-                resp::error_reply(&format!("ERR unknown command '{cmd}'")),
-                vec![],
-            ),
+            _ => (resp::error_reply(&unknown_command_error(args)), vec![]),
         }
     }
 
@@ -888,5 +1020,47 @@ mod tests {
                 Some("redis")
             );
         }
+    }
+
+    #[test]
+    fn ping_echoes_its_argument() {
+        let mut s = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        assert_eq!(
+            s.dispatch(&args(&["PING"])).0,
+            crate::resp::simple_string("PONG")
+        );
+        assert_eq!(
+            s.dispatch(&args(&["PING", "hello"])).0,
+            crate::resp::bulk_string("hello")
+        );
+    }
+
+    #[test]
+    fn unknown_command_error_keeps_case_and_lists_args() {
+        // The old reply uppercased the command and dropped the args clause - both one-probe tells.
+        let msg = unknown_command_error(&args(&["FooBar", "alpha", "beta"]));
+        assert!(msg.contains("unknown command 'FooBar'"), "{msg}");
+        assert!(
+            msg.contains("with args beginning with: 'alpha', 'beta', "),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn info_is_live_not_a_frozen_stub() {
+        let mut s = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let (reply, _) = s.dispatch(&args(&["INFO"]));
+        let text = String::from_utf8_lossy(&reply);
+        // A per-process run_id/master_replid and the real pid replace the old frozen stub, which
+        // had no run_id and baked in process_id:1 / uptime_in_seconds:3600.
+        assert!(text.contains("run_id:"), "INFO missing run_id");
+        assert!(
+            text.contains("master_replid:"),
+            "INFO missing master_replid"
+        );
+        assert!(
+            text.contains(&format!("process_id:{}", std::process::id())),
+            "INFO process_id is not the real pid"
+        );
     }
 }

@@ -19,14 +19,21 @@ fn canonicalize(ip: IpAddr) -> Result<IpAddr, EgressReject> {
         return Ok(IpAddr::V4(v4)); // ::ffff:a.b.c.d
     }
     let seg = v6.segments();
-    if seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 {
-        // NAT64 64:ff9b::/96
-        return Ok(IpAddr::V4(Ipv4Addr::new(
-            (seg[6] >> 8) as u8,
-            seg[6] as u8,
-            (seg[7] >> 8) as u8,
-            seg[7] as u8,
-        )));
+    if seg[0] == 0x64 && seg[1] == 0xff9b {
+        // NAT64 well-known prefix space (RFC 6052 / RFC 8215). Decode the well-known /96 form to its
+        // embedded IPv4 and re-check; reject any other NAT64 address (e.g. the 64:ff9b:1::/48
+        // local-use prefix) outright. Propolis has a v4 WAN (no NAT64 route), so a NAT64 address can
+        // only be an attacker steering us at a translated target, and only the /96 form decodes
+        // cleanly; over-blocking the rest is safe here.
+        if seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+            return Ok(IpAddr::V4(Ipv4Addr::new(
+                (seg[6] >> 8) as u8,
+                seg[6] as u8,
+                (seg[7] >> 8) as u8,
+                seg[7] as u8,
+            )));
+        }
+        return Err(EgressReject::ExtraRange);
     }
     if seg[0] == 0x2002 {
         // 6to4 2002::/16
@@ -92,8 +99,9 @@ mod tests {
             "::ffff:169.254.169.254",
             "::ffff:10.0.0.1", // v4-mapped
             "64:ff9b::a9fe:a9fe",
-            "64:ff9b::7f00:1", // NAT64
-            "2002:7f00:1::",   // 6to4 -> 127.0.0.1
+            "64:ff9b::7f00:1",   // NAT64
+            "64:ff9b:1::7f00:1", // NAT64 local-use /48, not the well-known /96
+            "2002:7f00:1::",     // 6to4 -> 127.0.0.1
             "0.0.0.0",
             "::",
             "127.0.0.1",

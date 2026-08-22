@@ -84,9 +84,18 @@ fn local_interface_ips() -> HashSet<IpAddr> {
 /// shipped once for the VT scanner's daily cap and had to be fixed - see
 /// `internal/roadmap.md`/the VT daily-cap-reset fix this project already shipped). Not the same
 /// type as `review::virustotal::DailyBudget`: that one is consumed one unit per item inside its
-/// own loop; this one instead grants a whole cycle's `batch` size up front, since `run_cycle`'s
-/// internal selection and concurrency are opaque from this call site - the cap must be enforced by
-/// capping `batch`, not by counting after the fact.
+/// own loop; this one instead grants a whole cycle's `batch` size up front (via `reserve`), since
+/// `run_cycle`'s internal selection and concurrency are opaque from this call site - the cap must
+/// be enforced by bounding `batch` before the cycle runs, not by counting after the fact.
+///
+/// `reserve` alone is NOT the whole protocol: it is a pessimistic upper bound (never grant past
+/// what remains), but a cycle typically uses only a fraction of its grant - an idle honeypot (the
+/// common case; file-download events are rare) selects zero or few candidates most cycles. The
+/// caller MUST call `refund` once the cycle's actual work is known, giving back
+/// `grant - actually_fetched`, or the daily cap silently counts requested batch size instead of
+/// real fetch attempts and drains itself on pure no-op cycles (fixed after this was shipped once
+/// with `reserve`'s effect baked directly into a since-removed `consume_up_to` that never
+/// reconciled).
 struct DailyFetchBudget {
     limit: u32,
     used: u32,
@@ -105,7 +114,8 @@ impl DailyFetchBudget {
     /// Resets `used` first if the UTC day has rolled over, then grants up to `want` against
     /// whatever remains of today's cap - never more, so a single cycle can never exceed the daily
     /// limit even though `run_cycle` only ever sees the granted amount as its own `batch` size.
-    fn consume_up_to(&mut self, now: chrono::DateTime<chrono::Utc>, want: u32) -> u32 {
+    /// The grant is provisional: the caller reconciles it with `refund` once real usage is known.
+    fn reserve(&mut self, now: chrono::DateTime<chrono::Utc>, want: u32) -> u32 {
         let today = now.date_naive();
         if today != self.day {
             self.day = today;
@@ -115,6 +125,13 @@ impl DailyFetchBudget {
         let grant = remaining.min(want);
         self.used += grant;
         grant
+    }
+
+    /// Give back `unused` slots from a previous `reserve` grant once the cycle's actual fetch
+    /// count is known. Saturating: the counter that gates this guard must never wrap silently
+    /// even if called out of balance with `reserve` (e.g. a day rollover landed between the two).
+    fn refund(&mut self, unused: u32) {
+        self.used = self.used.saturating_sub(unused);
     }
 }
 
@@ -719,13 +736,23 @@ async fn main() {
                         return;
                     }
 
-                    let grant = budget.consume_up_to(chrono::Utc::now(), fetch_batch_size as u32);
+                    let grant = budget.reserve(chrono::Utc::now(), fetch_batch_size as u32);
                     if grant > 0 {
                         // Awaited to completion before the next cycle can start or the sleep
                         // below begins: `run_cycle`'s own `select_candidates` does not claim rows
                         // (no FOR UPDATE SKIP LOCKED), so two overlapping calls would double-fetch
                         // and double the effective per-host cap.
                         let stats = fetcher::run_cycle(&deps, grant as usize).await;
+
+                        // Reconcile the daily budget against ACTUAL fetch attempts, not the
+                        // requested grant: `skipped_bucket` candidates never reached the network
+                        // (the per-host-hour bucket gated them before any fetch), and an idle
+                        // honeypot selects few or zero candidates most cycles. Charging the full
+                        // grant regardless would drain `daily_cap` in `daily_cap / batch_size`
+                        // idle cycles and then sit paused for the rest of the day.
+                        let actually_fetched = stats.selected.saturating_sub(stats.skipped_bucket);
+                        budget.refund(grant.saturating_sub(actually_fetched as u32));
+
                         if stats.selected > 0 {
                             tracing::info!(
                                 selected = stats.selected,
@@ -831,42 +858,65 @@ async fn main() {
 mod daily_fetch_budget_tests {
     use super::*;
 
+    fn at(ts: &str) -> chrono::DateTime<chrono::Utc> {
+        ts.parse().unwrap()
+    }
+
+    // Fix round 1, #1 (important): a cycle that selects nothing (or nothing past the per-host
+    // bucket) must cost the daily budget zero, or an idle honeypot - the common case - drains
+    // daily_cap in daily_cap/batch_size cycles on pure no-op cycles and then sits paused for the
+    // rest of the day.
     #[test]
-    fn grants_are_capped_by_the_remaining_daily_limit() {
-        let day = "2026-08-22T00:00:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
-        let mut budget = DailyFetchBudget::new(15, day.date_naive());
+    fn idle_cycles_with_zero_actual_work_do_not_drain_the_daily_budget() {
+        let day = at("2026-08-22T00:00:00Z");
+        let mut budget = DailyFetchBudget::new(10, day.date_naive());
+        for _ in 0..50 {
+            let grant = budget.reserve(day, 20);
+            assert_eq!(
+                grant, 10,
+                "a burst must still be bounded by the full remaining budget"
+            );
+            budget.refund(grant); // idle cycle: nothing was actually fetched
+        }
+        // Fully available still - none of the 50 idle cycles above cost anything real.
+        assert_eq!(budget.reserve(day, 10), 10);
+    }
+
+    #[test]
+    fn a_cycle_that_actually_fetches_k_consumes_exactly_k() {
+        let day = at("2026-08-22T00:00:00Z");
+        let mut budget = DailyFetchBudget::new(10, day.date_naive());
+        let grant = budget.reserve(day, 8);
+        assert_eq!(grant, 8);
+        budget.refund(grant - 3); // only 3 of the 8 granted slots were actually fetched
+
+        // 3 consumed, 7 of the original 10 remain.
+        assert_eq!(budget.reserve(day, 20), 7);
+    }
+
+    #[test]
+    fn reserve_still_hard_bounds_a_single_burst_to_remaining_budget() {
+        let day = at("2026-08-22T00:00:00Z");
+        let mut budget = DailyFetchBudget::new(5, day.date_naive());
         assert_eq!(
-            budget.consume_up_to(day, 20),
-            15,
-            "must not grant more than the daily limit"
-        );
-        assert_eq!(
-            budget.consume_up_to(day, 5),
-            0,
-            "must grant nothing once today's cap is exhausted"
+            budget.reserve(day, 100),
+            5,
+            "a single cycle must never be granted more than the daily cap regardless of batch size"
         );
     }
 
     #[test]
     fn resets_on_a_new_utc_day_and_is_not_re_initialized_mid_run() {
-        let day1 = "2026-08-21T23:00:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
+        let day1 = at("2026-08-21T23:00:00Z");
         let mut budget = DailyFetchBudget::new(10, day1.date_naive());
-        assert_eq!(budget.consume_up_to(day1, 10), 10);
-        assert_eq!(
-            budget.consume_up_to(day1, 1),
-            0,
-            "exhausted for the rest of day1"
-        );
+        let grant = budget.reserve(day1, 10);
+        budget.refund(0); // all 10 were actually fetched
+        assert_eq!(budget.reserve(day1, 1), 0, "exhausted for the rest of day1");
+        assert_eq!(grant, 10);
 
-        let day2 = "2026-08-22T00:05:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
+        let day2 = at("2026-08-22T00:05:00Z");
         assert_eq!(
-            budget.consume_up_to(day2, 10),
+            budget.reserve(day2, 10),
             10,
             "must reset on the new UTC day rather than staying exhausted"
         );

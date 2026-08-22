@@ -400,7 +400,13 @@ async fn handle_session(
                                             let _ = emitter.append(event).await;
                                         }
                                         if !output.is_empty() {
-                                            responses.extend_from_slice(output.as_bytes());
+                                            // The shared shell emits bare LF; a raw-mode client
+                                            // terminal needs CR-LF or each line renders indented
+                                            // (the cursor never returns to column 0). The Enter echo
+                                            // and prompt above already use \r\n; match them.
+                                            responses.extend_from_slice(
+                                                output.replace('\n', "\r\n").as_bytes(),
+                                            );
                                         }
                                     }
                                     responses.extend_from_slice(

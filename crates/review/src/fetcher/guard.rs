@@ -340,4 +340,37 @@ mod tests {
             Err(GuardReject::BadScheme)
         ));
     }
+
+    /// Panics if `resolve` is ever called - proves an IP-literal host skips DNS entirely.
+    struct PanicResolver;
+    impl HostResolver for PanicResolver {
+        fn resolve(&self, _h: &str) -> std::io::Result<Vec<IpAddr>> {
+            panic!("resolver must not be called for an IP literal host");
+        }
+    }
+
+    #[test]
+    fn vet_ipv6_literal_loopback_rejected_without_dns() {
+        let own = HashSet::new();
+        assert!(matches!(
+            vet("http://[::1]/x", &own, &PanicResolver, false),
+            Err(GuardReject::Forbidden(_))
+        ));
+    }
+
+    struct EmptyResolver;
+    impl HostResolver for EmptyResolver {
+        fn resolve(&self, _h: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn vet_empty_resolve_set_fails_closed() {
+        let own = HashSet::new();
+        assert!(matches!(
+            vet("http://nothing.example/x", &own, &EmptyResolver, false),
+            Err(GuardReject::ResolveFailed)
+        ));
+    }
 }

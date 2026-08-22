@@ -1,5 +1,6 @@
 pub mod guard;
 pub mod http;
+pub mod tftp;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FetchStatus {

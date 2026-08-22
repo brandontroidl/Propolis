@@ -208,42 +208,89 @@ pub enum HttpOutcome {
     TooManyHops,
 }
 
-/// Follow `url` through up to `max_hops` redirects, the SSRF-via-redirect defense: `guard::vet`
-/// runs fresh on every hop - the initial `url` and every subsequent `Location` target alike -
-/// producing a fresh [`Pinned`] that hop's `fetch_http_once` call then uses, so a 302 pointing at
-/// an internal/link-local/RFC1918/`::ffff:`-mapped address is caught here rather than blindly
-/// followed. `allow_tftp: false` on every hop, including the first, so a redirect (or even the
-/// caller's own initial URL, via this entry point) can never reach tftp - that scheme is only
-/// ever reachable through a caller that vets with `allow_tftp: true` outside this loop.
+/// The outcome of a single hop attempt (vet, then fetch-once if accepted) - the seam between the
+/// redirect-following loop's control flow and the real guard/network calls. `HttpResult`'s
+/// variants map through unchanged except `Redirect`, which absorbs `vet`'s rejection too (a hop
+/// either gets a pin and a fetch result, or it doesn't - the loop doesn't need to know which
+/// underlying step produced `Rejected`).
+#[derive(Debug, Clone, PartialEq)]
+enum HopOutcome {
+    Body(Fetched),
+    Redirect(String),
+    Rejected(GuardReject),
+    Empty,
+    TooBig,
+}
+
+/// Performs one hop of a fetch: vet `url`, then fetch it once against the resulting pin if
+/// accepted. `fetch_http`'s production path wires this to `guard::vet` + `fetch_http_once`
+/// ([`RealHopFetcher`]); tests substitute a mock that returns scripted [`HopOutcome`]s with no
+/// socket and no real `vet` call, so the redirect loop's control flow (multi-hop follow,
+/// hop-bounding, re-vetting a later hop that goes internal) is hermetically testable - see
+/// `follow_redirects`.
+trait HopFetcher {
+    async fn hop(&self, url: &str) -> Result<HopOutcome, FetchError>;
+}
+
+/// The production [`HopFetcher`]: vets `url` with `allow_tftp: false` (a redirect - or even the
+/// caller's own initial URL, via `fetch_http`'s entry point - can never reach tftp; that scheme
+/// is only ever reachable through a caller that vets with `allow_tftp: true` outside this loop),
+/// then fetches it once if accepted. `own`/`resolver`/`limits` are exactly `fetch_http`'s own
+/// parameters, borrowed for the duration of one `fetch_http` call.
+struct RealHopFetcher<'a> {
+    own: &'a HashSet<IpAddr>,
+    resolver: &'a dyn HostResolver,
+    limits: &'a FetchLimits,
+}
+
+impl HopFetcher for RealHopFetcher<'_> {
+    async fn hop(&self, url: &str) -> Result<HopOutcome, FetchError> {
+        let pinned = match vet(url, self.own, self.resolver, false) {
+            Ok(p) => p,
+            Err(reject) => return Ok(HopOutcome::Rejected(reject)),
+        };
+        Ok(match fetch_http_once(&pinned, url, self.limits).await? {
+            HttpResult::Body(fetched) => HopOutcome::Body(fetched),
+            HttpResult::Redirect(loc) => HopOutcome::Redirect(loc),
+            HttpResult::Empty => HopOutcome::Empty,
+            HttpResult::TooBig => HopOutcome::TooBig,
+        })
+    }
+}
+
+/// The redirect-following loop, the SSRF-via-redirect defense: every hop - the initial `start_url`
+/// and every subsequent `Location` target alike - goes through `hop_fetcher.hop`, which re-vets
+/// fresh before ever fetching, so a 302 pointing at an internal/link-local/RFC1918/`::ffff:`-mapped
+/// address is caught here rather than blindly followed. Generic over [`HopFetcher`] rather than
+/// calling `vet`/`fetch_http_once` directly, so this control flow - multi-hop success, hop
+/// bounding, and re-vetting a later hop that turns out internal - is testable against a mock with
+/// no sockets and no real `vet` call.
 ///
-/// `fetch_http_once`'s `Redirect(loc)` is already an absolute URL (`redirect_target` above joins
-/// a relative `Location` against the request URL before returning it) - `loc` is re-vetted
-/// directly as the next hop's URL, never re-joined against the prior hop, since joining an
+/// `HopOutcome::Redirect(loc)` is already an absolute URL (`redirect_target` joins a relative
+/// `Location` against the request URL before `RealHopFetcher` ever sees it) - `loc` becomes the
+/// next hop's URL directly, never re-joined against the prior hop, since joining an
 /// already-absolute URL again would corrupt it.
 ///
-/// A rejected hop (initial or any redirect) captures zero bytes: `vet`'s `Err` short-circuits
-/// before `fetch_http_once` - and therefore before any socket - is ever reached.
-pub async fn fetch_http(
-    url: &str,
-    own: &HashSet<IpAddr>,
-    r: &dyn HostResolver,
-    limits: &FetchLimits,
+/// `max_hops` bounds redirects *followed*, not hops attempted: the initial hop is never
+/// hop-budget-gated (only a `Redirect` response consumes budget), and hitting the bound on a
+/// `Redirect` returns `TooManyHops` without ever fetching that redirect's target. A rejected hop
+/// (initial or any redirect) captures zero bytes: `Rejected` short-circuits the loop before any
+/// further hop - and therefore any further socket - is ever reached.
+async fn follow_redirects<H: HopFetcher>(
+    start_url: &str,
     max_hops: u8,
+    hop_fetcher: &H,
 ) -> Result<HttpOutcome, FetchError> {
-    let mut current = url.to_string();
+    let mut current = start_url.to_string();
     let mut hops_left = max_hops;
 
     loop {
-        let pinned = match vet(&current, own, r, false) {
-            Ok(p) => p,
-            Err(reject) => return Ok(HttpOutcome::Rejected(reject)),
-        };
-
-        match fetch_http_once(&pinned, &current, limits).await? {
-            HttpResult::Body(fetched) => return Ok(HttpOutcome::Captured(fetched)),
-            HttpResult::Empty => return Ok(HttpOutcome::Empty),
-            HttpResult::TooBig => return Ok(HttpOutcome::TooBig),
-            HttpResult::Redirect(loc) => {
+        match hop_fetcher.hop(&current).await? {
+            HopOutcome::Body(fetched) => return Ok(HttpOutcome::Captured(fetched)),
+            HopOutcome::Rejected(reject) => return Ok(HttpOutcome::Rejected(reject)),
+            HopOutcome::Empty => return Ok(HttpOutcome::Empty),
+            HopOutcome::TooBig => return Ok(HttpOutcome::TooBig),
+            HopOutcome::Redirect(loc) => {
                 if hops_left == 0 {
                     return Ok(HttpOutcome::TooManyHops);
                 }
@@ -252,6 +299,25 @@ pub async fn fetch_http(
             }
         }
     }
+}
+
+/// Follow `url` through up to `max_hops` redirects, re-vetting every hop through `guard::vet`
+/// before it is ever fetched - see `follow_redirects` for the full invariant. Just wires up the
+/// production [`RealHopFetcher`] and runs the loop; production behavior is unchanged from before
+/// this seam existed.
+pub async fn fetch_http(
+    url: &str,
+    own: &HashSet<IpAddr>,
+    r: &dyn HostResolver,
+    limits: &FetchLimits,
+    max_hops: u8,
+) -> Result<HttpOutcome, FetchError> {
+    let hop_fetcher = RealHopFetcher {
+        own,
+        resolver: r,
+        limits,
+    };
+    follow_redirects(url, max_hops, &hop_fetcher).await
 }
 
 #[cfg(test)]
@@ -266,7 +332,7 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::get;
 
-    use super::super::guard::Scheme;
+    use super::super::guard::{EgressReject, Scheme};
     use super::*;
 
     fn ip(s: &str) -> IpAddr {
@@ -616,5 +682,143 @@ mod tests {
             "expected Rejected(Forbidden(_)) even with max_hops=0 (the initial hop isn't a \
              redirect being followed), got {result:?}"
         );
+    }
+
+    // --- hermetic redirect-loop tests, driving `follow_redirects` against a mock `HopFetcher` ---
+    //
+    // These exercise the loop's control flow directly - no sockets, no real `vet` call - which is
+    // what makes multi-hop success, hop-bounding, and later-hop re-vetting testable at all: the
+    // real-socket tests above can only ever reach a single hop, since no address a hermetic test
+    // can bind a listener to also clears `guard::vet`'s forbidden-address check (loopback,
+    // RFC1918, RFC5737, link-local, and CGNAT are all covered - see task-5-report.md for the full
+    // verification). The mock below is scripted per-URL and records every URL it was called with,
+    // in order, so each test can assert not just the final `HttpOutcome` but that the loop
+    // actually attempted every hop it claims to have followed.
+
+    /// A [`HopFetcher`] test double: returns a scripted [`HopOutcome`] per URL and records every
+    /// URL it was called with, in call order. Panics on a URL with no script entry - a loop bug
+    /// that skips, repeats, or corrupts a hop (e.g. double-joining a redirect target) shows up as
+    /// an unscripted-URL panic rather than silently passing.
+    struct MockHopFetcher {
+        script: std::collections::HashMap<&'static str, HopOutcome>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MockHopFetcher {
+        fn new(script: impl IntoIterator<Item = (&'static str, HopOutcome)>) -> Self {
+            Self {
+                script: script.into_iter().collect(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl HopFetcher for MockHopFetcher {
+        async fn hop(&self, url: &str) -> Result<HopOutcome, FetchError> {
+            self.calls.lock().unwrap().push(url.to_string());
+            Ok(self
+                .script
+                .get(url)
+                .unwrap_or_else(|| panic!("unscripted hop url: {url}"))
+                .clone())
+        }
+    }
+
+    fn fetched(tag: &str) -> Fetched {
+        Fetched {
+            bytes: tag.as_bytes().to_vec(),
+            content_type: None,
+            final_url: tag.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_zero_redirect_captures_the_first_body() {
+        let fetcher = MockHopFetcher::new([("a", HopOutcome::Body(fetched("a-body")))]);
+
+        let result = follow_redirects("a", 3, &fetcher).await.unwrap();
+
+        assert_eq!(result, HttpOutcome::Captured(fetched("a-body")));
+        assert_eq!(fetcher.calls(), vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn loop_follows_three_hops_to_capture_in_order() {
+        let fetcher = MockHopFetcher::new([
+            ("a", HopOutcome::Redirect("b".to_string())),
+            ("b", HopOutcome::Redirect("c".to_string())),
+            ("c", HopOutcome::Body(fetched("c-body"))),
+        ]);
+
+        let result = follow_redirects("a", 3, &fetcher).await.unwrap();
+
+        assert_eq!(result, HttpOutcome::Captured(fetched("c-body")));
+        assert_eq!(
+            fetcher.calls(),
+            vec!["a", "b", "c"],
+            "every hop must be followed and re-vetted, in order - not just the first"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_exhausts_hop_budget_on_the_fourth_redirect() {
+        // max_hops counts redirects *followed*, not hops attempted (see follow_redirects' doc
+        // comment): with max_hops=3, hops 0/1/2 are followed normally (budget 3->2->1->0), and
+        // the 4th redirect response - received while budget is already 0 - is what trips
+        // TooManyHops, without the loop ever fetching hop 4's target. That is exactly "4 hops
+        // with max_hops=3 -> TooManyHops" from the brief, so this test pins the off-by-one by
+        // asserting the exact call count (4), not just the outcome.
+        let fetcher = MockHopFetcher::new([
+            ("h0", HopOutcome::Redirect("h1".to_string())),
+            ("h1", HopOutcome::Redirect("h2".to_string())),
+            ("h2", HopOutcome::Redirect("h3".to_string())),
+            ("h3", HopOutcome::Redirect("h4".to_string())),
+        ]);
+
+        let result = follow_redirects("h0", 3, &fetcher).await.unwrap();
+
+        assert_eq!(result, HttpOutcome::TooManyHops);
+        assert_eq!(
+            fetcher.calls(),
+            vec!["h0", "h1", "h2", "h3"],
+            "expected exactly 4 hop attempts for max_hops=3 (h4 must never be dialed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_rejects_when_a_later_hop_goes_internal() {
+        // The case the real-socket tests above could not reach: the FIRST hop looks completely
+        // fine (a real redirect), and it's the SECOND hop's re-vet that catches the SSRF attempt
+        // - proving `guard::vet` runs again on the redirect target, not just on the original URL.
+        let fetcher = MockHopFetcher::new([
+            ("a", HopOutcome::Redirect("b".to_string())),
+            (
+                "b",
+                HopOutcome::Rejected(GuardReject::Forbidden(EgressReject::Reserved)),
+            ),
+        ]);
+
+        let result = follow_redirects("a", 3, &fetcher).await.unwrap();
+
+        assert!(
+            matches!(result, HttpOutcome::Rejected(GuardReject::Forbidden(_))),
+            "expected Rejected(Forbidden(_)), got {result:?}"
+        );
+        assert_eq!(
+            fetcher.calls(),
+            vec!["a", "b"],
+            "hop b must actually have been re-vetted, not short-circuited from hop a's result"
+        );
+        match result {
+            HttpOutcome::Rejected(_) => {}
+            HttpOutcome::Captured(f) => {
+                panic!("captured {} bytes on a rejected hop", f.bytes.len())
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 }

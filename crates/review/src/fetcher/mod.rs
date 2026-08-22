@@ -138,11 +138,7 @@ impl Fetcher for RealFetcher {
                 Ok(http::HttpOutcome::Captured(f)) => RawOutcome::Captured {
                     bytes: f.bytes,
                     content_type: f.content_type,
-                    // fetch_http does not expose the pinned IP of whichever hop finally
-                    // succeeded; re-deriving it here would mean a second, redundant vet/resolve
-                    // against attacker-controlled state after the fact, so pinned_ip is left
-                    // unset for HTTP captures (nullable in the schema).
-                    pinned_ip: None,
+                    pinned_ip: Some(f.pinned_ip.to_string()),
                 },
                 Ok(http::HttpOutcome::Rejected(r)) => RawOutcome::Failed {
                     status: FetchStatus::Rejected,

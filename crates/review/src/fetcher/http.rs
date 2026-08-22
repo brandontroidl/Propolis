@@ -30,6 +30,11 @@ pub struct Fetched {
     pub bytes: Vec<u8>,
     pub content_type: Option<String>,
     pub final_url: String,
+    /// The IP actually dialed for this capture - the abuse-report chain-of-custody IOC (spec
+    /// sections 9/10). Always the pin of the hop that produced this body: `fetch_http_once` sets
+    /// it from its own `pinned` argument, so a multi-hop `fetch_http` capture carries the LAST
+    /// (successful) hop's pin, not the first URL's.
+    pub pinned_ip: IpAddr,
 }
 
 /// The outcome of one `fetch_http_once` call. `Redirect` is never followed here - the caller
@@ -83,7 +88,7 @@ pub async fn fetch_http_once(
         .danger_accept_invalid_certs(true) // bytes never execute; SNI/Host still correct
         .build()?;
 
-    let attempt = fetch_once_inner(&client, url, limits);
+    let attempt = fetch_once_inner(&client, url, limits, pinned.ip);
     match tokio::time::timeout(limits.total_timeout, attempt).await {
         Ok(result) => result,
         Err(_) => Err(FetchError::Timeout),
@@ -140,6 +145,7 @@ async fn fetch_once_inner(
     client: &reqwest::Client,
     url: &str,
     limits: &FetchLimits,
+    pinned_ip: IpAddr,
 ) -> Result<HttpResult, FetchError> {
     let resp = client
         .get(url)
@@ -176,6 +182,7 @@ async fn fetch_once_inner(
             bytes: body,
             content_type,
             final_url,
+            pinned_ip,
         }))
     }
 }
@@ -386,6 +393,26 @@ mod tests {
                 assert_eq!(fetched.bytes.len(), FIVE_MB);
                 assert!(fetched.bytes.iter().all(|&b| b == 7));
             }
+            other => panic!("expected Body, got {other:?}"),
+        }
+    }
+
+    // Fix round 1, #3 (important): a captured body must record the IP actually dialed - the
+    // abuse-report chain-of-custody IOC (spec sections 9/10). TFTP already recorded this;
+    // fetch_http_once had `pinned` in scope the whole time but never carried `pinned.ip` into
+    // `Fetched`.
+    #[tokio::test]
+    async fn captured_body_records_the_dialed_pinned_ip() {
+        let app = Router::new().route("/", get(|| async { "malware bytes" }));
+        let port = spawn(app).await;
+        let p = pinned(port);
+
+        let result = fetch_http_once(&p, &format!("http://127.0.0.1:{port}/"), &limits(1024))
+            .await
+            .unwrap();
+
+        match result {
+            HttpResult::Body(fetched) => assert_eq!(fetched.pinned_ip, p.ip),
             other => panic!("expected Body, got {other:?}"),
         }
     }
@@ -733,6 +760,9 @@ mod tests {
             bytes: tag.as_bytes().to_vec(),
             content_type: None,
             final_url: tag.to_string(),
+            // Arbitrary and irrelevant to what these redirect-loop tests exercise (control flow,
+            // not pinned_ip's value) - fixed so every call produces an equal Fetched.
+            pinned_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
         }
     }
 

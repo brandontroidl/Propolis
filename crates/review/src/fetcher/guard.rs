@@ -159,10 +159,17 @@ pub fn vet(
         // form): use it directly and skip DNS so the resolver can never be consulted for it.
         url::Host::Ipv4(v4) => (v4.to_string(), vec![IpAddr::V4(v4)]),
         url::Host::Ipv6(v6) => (v6.to_string(), vec![IpAddr::V6(v6)]),
-        url::Host::Domain(d) => {
-            let resolved = r.resolve(d).map_err(|_| GuardReject::ResolveFailed)?;
-            (d.to_string(), resolved)
-        }
+        // A non-special scheme (tftp) never gets WHATWG numeric-host normalization, so a
+        // canonical dotted-quad or v6 literal still arrives here as an opaque domain string.
+        // Recognize it ourselves before falling back to DNS, so the literal fast path (and the
+        // DNS skip it guarantees) holds for every allowed scheme, not just http/https.
+        url::Host::Domain(d) => match d.parse::<IpAddr>() {
+            Ok(literal) => (d.to_string(), vec![literal]),
+            Err(_) => {
+                let resolved = r.resolve(d).map_err(|_| GuardReject::ResolveFailed)?;
+                (d.to_string(), resolved)
+            }
+        },
     };
     if ips.is_empty() {
         return Err(GuardReject::ResolveFailed);
@@ -356,6 +363,22 @@ mod tests {
             vet("http://[::1]/x", &own, &PanicResolver, false),
             Err(GuardReject::Forbidden(_))
         ));
+    }
+
+    #[test]
+    fn vet_tftp_literal_pins_default_port_69() {
+        let own = HashSet::new();
+        let p = vet("tftp://8.8.8.8/mal", &own, &PanicResolver, true).unwrap();
+        assert!(matches!(p.scheme, Scheme::Tftp));
+        assert_eq!(p.port, 69);
+        assert_eq!(p.ip, ip("8.8.8.8"));
+    }
+
+    #[test]
+    fn vet_tftp_explicit_port_passes_through_unchanged() {
+        let own = HashSet::new();
+        let p = vet("tftp://8.8.8.8:6900/mal", &own, &PanicResolver, true).unwrap();
+        assert_eq!(p.port, 6900);
     }
 
     struct EmptyResolver;

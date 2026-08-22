@@ -54,7 +54,18 @@ static RESERVED_RANGES: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
 
 /// True if `ip` falls in a reserved or special-purpose range that must never be published to a
 /// blocklist or reported to a threat-intelligence vendor.
+///
+/// Canonicalizes an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its embedded IPv4 form first,
+/// so a mapped private/reserved address cannot slip past this check the way a bare
+/// `RESERVED_RANGES` lookup would miss it (the ranges list only carries the unmapped `::1`/
+/// `fe80::/10`/etc forms, never the `::ffff:0:0/96` wrapper). The fetcher's own SSRF guard
+/// (`review::fetcher::guard::canonicalize`) already does this unwrap before calling in; this
+/// backports the same behavior here so every caller of the shared function gets it.
 pub fn is_reserved_ip(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    };
     RESERVED_RANGES.iter().any(|net| net.contains(&ip))
 }
 
@@ -86,6 +97,23 @@ mod tests {
             "2001:db8::1",
         ] {
             assert!(is_reserved_ip(ip.parse().unwrap()), "{ip} must be reserved");
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_reserved_addresses_are_caught() {
+        // The fetcher's own SSRF guard (review::fetcher::guard::canonicalize) already unwraps
+        // `::ffff:a.b.c.d` before checking; this backports the same canonicalization here so
+        // every caller of the shared function gets it, not just the fetcher.
+        for ip in [
+            "::ffff:10.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(
+                is_reserved_ip(ip.parse().unwrap()),
+                "{ip} (v4-mapped) must be reserved"
+            );
         }
     }
 

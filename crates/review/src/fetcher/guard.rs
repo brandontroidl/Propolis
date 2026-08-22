@@ -301,10 +301,11 @@ mod tests {
             );
         }
     }
-    // Regression: document that the base is_reserved_ip misses the mapped form (F-1 target).
+    // core_scoring::is_reserved_ip now canonicalizes the v4-mapped form itself (F-1), so this
+    // guard's own `canonicalize` is defense-in-depth rather than the only place that catches it.
     #[test]
-    fn base_is_reserved_ip_misses_v4_mapped() {
-        assert!(!core_scoring::is_reserved_ip(ip("::ffff:10.0.0.1")));
+    fn base_is_reserved_ip_now_catches_v4_mapped() {
+        assert!(core_scoring::is_reserved_ip(ip("::ffff:10.0.0.1")));
     }
 
     struct MockResolver(Vec<IpAddr>);

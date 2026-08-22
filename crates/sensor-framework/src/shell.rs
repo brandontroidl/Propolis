@@ -188,12 +188,34 @@ impl FakeShell {
         }
     }
 
+    /// Resolve `arg` to an absolute path: returned as-is if it already starts with `/`, otherwise
+    /// joined onto `cwd`. Minimal - no `.`/`..` normalisation - which is enough for the canned FS
+    /// and the relative reads (`cd /proc && cat self/cmdline`) attackers actually use.
+    fn resolve_path(&self, arg: &str) -> String {
+        if arg.starts_with('/') {
+            arg.to_string()
+        } else {
+            format!("{}/{arg}", self.cwd.trim_end_matches('/'))
+        }
+    }
+
     fn cmd_cat(&self, parts: &[&str]) -> String {
         match first_non_flag_arg(&parts[1..]) {
-            Some(path) => self
-                .fs
-                .read_file(path)
-                .unwrap_or_else(|| format!("cat: {path}: No such file or directory\n")),
+            Some(path) => {
+                let resolved = self.resolve_path(path);
+                // /proc/self is the reading process (`cat`), so /proc/self/cmdline is its own argv,
+                // NUL-separated with a trailing NUL and no newline - exactly as the kernel returns
+                // it. A missing one ("No such file or directory") is a classic honeypot tell some
+                // Mirai/Gafgyt loaders check before delivering a payload.
+                if resolved == "/proc/self/cmdline" {
+                    let mut out = parts.join("\0");
+                    out.push('\0');
+                    return out;
+                }
+                self.fs
+                    .read_file(&resolved)
+                    .unwrap_or_else(|| format!("cat: {path}: No such file or directory\n"))
+            }
             None => String::new(),
         }
     }
@@ -680,6 +702,32 @@ mod shell_detection_tests {
                 session_id: None,
             },
         )
+    }
+
+    #[test]
+    fn cat_proc_self_cmdline_returns_the_reading_process_argv() {
+        // Every real Linux has /proc/self/cmdline; a "No such file or directory" is a honeypot tell
+        // some Mirai/Gafgyt loaders check before delivering a payload. /proc/self is the `cat`
+        // process, so it returns cat's own argv, NUL-separated with a trailing NUL and no newline.
+        let (out, _) = shell().handle_input("cat /proc/self/cmdline");
+        assert_eq!(out, "cat\0/proc/self/cmdline\0");
+    }
+
+    #[test]
+    fn cd_proc_then_cat_relative_cmdline_resolves_against_cwd() {
+        // The observed bot ran `cd /proc && cat self/cmdline`; the relative path must resolve.
+        let mut sh = shell();
+        sh.handle_input("cd /proc");
+        let (out, _) = sh.handle_input("cat self/cmdline");
+        assert_eq!(out, "cat\0self/cmdline\0");
+    }
+
+    #[test]
+    fn cat_relative_file_resolves_against_cwd() {
+        let mut sh = shell();
+        sh.handle_input("cd /etc");
+        let (out, _) = sh.handle_input("cat hostname");
+        assert!(out.contains("server01"), "got: {out:?}");
     }
 
     #[test]

@@ -97,7 +97,7 @@ pub async fn handle_connection(
     if stream.write_all(login_prompt.as_bytes()).await.is_err() {
         return;
     }
-    let Some(username_raw) = reader.read_line(&mut stream).await else {
+    let Some(username_raw) = reader.read_line(&mut stream, true).await else {
         return;
     };
     let username = sanitize_value(&username_raw, MAX_USERNAME_LEN);
@@ -109,7 +109,7 @@ pub async fn handle_connection(
     // sensor-ssh's `auth.rs` password invariant. It is never stored beyond this local binding,
     // never logged, and never placed in any event field; it is dropped the moment this
     // connection's stack frame moves past this point.
-    let Some(_password) = reader.read_line(&mut stream).await else {
+    let Some(_password) = reader.read_line(&mut stream, false).await else {
         return;
     };
 
@@ -135,7 +135,7 @@ pub async fn handle_connection(
     }
 
     loop {
-        let Some(line) = reader.read_line(&mut stream).await else {
+        let Some(line) = reader.read_line(&mut stream, true).await else {
             return;
         };
         let is_exit = matches!(line.trim(), "exit" | "logout");
@@ -221,6 +221,9 @@ struct LineReader {
     bounds: ConnectionBounds,
     first_read: bool,
     total_captured: u64,
+    /// True if the previous byte was a CR, so a following LF (the second half of a CR-LF Enter) is
+    /// swallowed rather than treated as a second, empty line. Spans reads, hence a field.
+    prev_cr: bool,
 }
 
 impl LineReader {
@@ -232,6 +235,7 @@ impl LineReader {
             bounds,
             first_read: true,
             total_captured: 0,
+            prev_cr: false,
         }
     }
 
@@ -244,7 +248,11 @@ impl LineReader {
     /// emitted as a blank line - the same convention sensor-ssh's own channel data loop uses,
     /// which is what makes a `\r\n` (or `\n\r`) pair collapse into a single line ending instead of
     /// producing a spurious empty second line.
-    async fn read_line(&mut self, stream: &mut TcpStream) -> Option<String> {
+    /// Read one line of already-IAC-stripped, lossily-decoded text. When `echo` is true, each typed
+    /// character is echoed back (backspace erases on screen); the Enter's CR-LF is echoed either way,
+    /// so a password (echo=false) is hidden but its Enter still advances the line. Returns `None` on
+    /// EOF, a read timeout/error, or the session's `max_captured_bytes` budget being exhausted.
+    async fn read_line(&mut self, stream: &mut TcpStream, echo: bool) -> Option<String> {
         loop {
             if let Some(line) = self.pending.pop_front() {
                 return Some(line);
@@ -275,31 +283,61 @@ impl LineReader {
                 return None;
             }
 
-            self.feed(&data);
+            let mut echo_out = Vec::new();
+            self.feed(&data, echo, &mut echo_out);
+            if !echo_out.is_empty() && stream.write_all(&echo_out).await.is_err() {
+                return None;
+            }
         }
     }
 
-    /// Extract complete lines from already-IAC-filtered `data` into `pending`. Splits on CR or LF
-    /// (an empty line-ending is ignored, so a CR-LF or CR-NUL pair collapses to one terminator), and
-    /// DROPS NUL bytes: a real telnet client transmits a bare Enter as CR-NUL (RFC 854 s.4.3), so a
-    /// stray NUL left in the stream would otherwise orphan into the FOLLOWING line as a leading
-    /// `\0`, making every subsequent command fail to match (`echo` -> "command not found") and
-    /// defeating the `exit`/`logout` check.
-    fn feed(&mut self, data: &[u8]) {
+    /// Extract complete lines from already-IAC-filtered `data` into `pending`, and, since the sensor
+    /// now offers `WILL ECHO`, produce the server-side echo into `echo_out`.
+    ///
+    /// - A bare Enter arrives as CR, CR-LF, or (RFC 854 s.4.3) **CR-NUL**; `prev_cr` collapses the
+    ///   pair and NUL bytes are dropped, so a stray NUL never orphans onto the next line as a leading
+    ///   `\0` (which used to make every command after the first fail to match and defeat the
+    ///   exit/logout check).
+    /// - Each Enter submits the current line - **including an empty one**, so a lone Enter reprints
+    ///   the prompt like a real shell - and echoes CR-LF regardless of `echo` (so a password's Enter
+    ///   still advances the cursor).
+    /// - Printable bytes are buffered and, when `echo`, echoed; backspace/DEL erases one buffered
+    ///   byte and, when `echo`, rubs it out on screen (`\b \b`). Other control bytes are ignored.
+    fn feed(&mut self, data: &[u8], echo: bool, echo_out: &mut Vec<u8>) {
         for &byte in data {
-            if byte == b'\n' || byte == b'\r' {
-                if !self.current.is_empty() {
+            // Swallow the LF of a CR-LF Enter (the CR already submitted the line).
+            if self.prev_cr {
+                self.prev_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' | b'\n' => {
+                    self.prev_cr = byte == b'\r';
+                    echo_out.extend_from_slice(b"\r\n");
                     self.pending
                         .push_back(String::from_utf8_lossy(&self.current).into_owned());
                     self.current.clear();
                 }
-            } else if byte != 0 {
-                self.current.push(byte);
-                if self.current.len() >= MAX_LINE_LEN {
-                    self.pending
-                        .push_back(String::from_utf8_lossy(&self.current).into_owned());
-                    self.current.clear();
+                0 => {} // CR-NUL padding: drop.
+                0x08 | 0x7f => {
+                    if self.current.pop().is_some() && echo {
+                        echo_out.extend_from_slice(b"\x08 \x08");
+                    }
                 }
+                b if b >= 0x20 => {
+                    self.current.push(b);
+                    if echo {
+                        echo_out.push(b);
+                    }
+                    if self.current.len() >= MAX_LINE_LEN {
+                        self.pending
+                            .push_back(String::from_utf8_lossy(&self.current).into_owned());
+                        self.current.clear();
+                    }
+                }
+                _ => {} // other control bytes: ignore.
             }
         }
     }
@@ -322,9 +360,10 @@ mod tests {
     #[test]
     fn crnul_enter_does_not_orphan_nul_into_the_next_command() {
         let mut reader = LineReader::new(test_bounds());
+        let mut echo = Vec::new();
         // A real telnet client transmits a bare Enter as CR-NUL (RFC 854 s.4.3). Two commands, each
         // terminated that way: the NUL after the first must not corrupt the second command.
-        reader.feed(b"echo one\r\x00echo two\r\x00");
+        reader.feed(b"echo one\r\x00echo two\r\x00", false, &mut echo);
         assert_eq!(reader.pending.pop_front().as_deref(), Some("echo one"));
         assert_eq!(
             reader.pending.pop_front().as_deref(),
@@ -336,6 +375,35 @@ mod tests {
             reader.current.is_empty(),
             "no orphaned NUL left dangling in the line buffer"
         );
+    }
+
+    #[test]
+    fn typed_chars_are_echoed_and_backspace_erases() {
+        let mut reader = LineReader::new(test_bounds());
+        let mut echo = Vec::new();
+        // Type "ab", backspace (DEL), "c", Enter as CR-NUL.
+        reader.feed(b"ab\x7fc\r\x00", true, &mut echo);
+        assert_eq!(reader.pending.pop_front().as_deref(), Some("ac"));
+        assert_eq!(echo, b"ab\x08 \x08c\r\n");
+    }
+
+    #[test]
+    fn password_read_hides_chars_but_still_echoes_the_enter() {
+        let mut reader = LineReader::new(test_bounds());
+        let mut echo = Vec::new();
+        reader.feed(b"secret\r\x00", false, &mut echo);
+        assert_eq!(reader.pending.pop_front().as_deref(), Some("secret"));
+        // Password characters are not echoed; only the Enter's CR-LF advances the cursor.
+        assert_eq!(echo, b"\r\n");
+    }
+
+    #[test]
+    fn empty_enter_submits_an_empty_line_so_the_prompt_reprints() {
+        let mut reader = LineReader::new(test_bounds());
+        let mut echo = Vec::new();
+        reader.feed(b"\r\x00", true, &mut echo);
+        assert_eq!(reader.pending.pop_front().as_deref(), Some(""));
+        assert_eq!(echo, b"\r\n");
     }
 
     #[test]

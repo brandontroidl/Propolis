@@ -29,15 +29,18 @@ const SE: u8 = 240;
 
 /// Telnet Suppress Go Ahead option (RFC 858) - the only option this sensor offers.
 const OPT_SGA: u8 = 3;
+const OPT_ECHO: u8 = 1;
 
-/// The bytes to send immediately after accepting a connection: `IAC WILL SGA` (`255 251 3`).
+/// The bytes to send immediately after accepting a connection: `IAC WILL ECHO`, `IAC WILL SGA`.
 ///
-/// The sensor offers Suppress-Go-Ahead only and runs the login/shell in line mode, where the
-/// CLIENT echoes locally. It deliberately does NOT offer `WILL ECHO`: promising server-side echo
-/// and then never echoing a byte (the previous behaviour) is a contradiction a client's option
-/// state machine catches at once, so the honest posture is to not claim echo at all.
+/// A real telnetd offers server-side echo, so the sensor does too - and, unlike the earlier
+/// behaviour, actually echoes (see the handler's `LineReader`). A line-mode client that agrees
+/// (`DO ECHO`) then stops local-echoing, so a bare Enter's CR is no longer shown by the client as a
+/// literal `^M` and the login/shell renders like a real host. `WILL SGA` is also offered (character
+/// mode). Offering echo without echoing would be the contradiction the previous code avoided by not
+/// claiming it; the fix is to claim it AND honour it.
 pub fn negotiation_preamble() -> Vec<u8> {
-    vec![IAC, WILL, OPT_SGA]
+    vec![IAC, WILL, OPT_ECHO, IAC, WILL, OPT_SGA]
 }
 
 /// Which negotiation verb [`IacFilter`] is midway through parsing the option byte for.
@@ -124,12 +127,11 @@ impl IacFilter {
                         // The client proposed enabling an option, or asked us to: refuse both,
                         // per the module doc's negotiation policy.
                         Verb::Will => response_out.extend_from_slice(&[IAC, DONT, byte]),
-                        // We offered WILL SGA, so a client DO SGA is the agreement - reply nothing
-                        // (RFC 854 loop avoidance). A DO for any option we did not offer (including
-                        // ECHO, which we no longer claim) is refused with WONT. The old code
-                        // blanket-refused even our own SGA, contradicting the preamble.
+                        // We offered WILL ECHO and WILL SGA, so a client DO ECHO / DO SGA is the
+                        // agreement - reply nothing (RFC 854 loop avoidance). A DO for any option we
+                        // did not offer is refused with WONT.
                         Verb::Do => {
-                            if byte != OPT_SGA {
+                            if byte != OPT_SGA && byte != OPT_ECHO {
                                 response_out.extend_from_slice(&[IAC, WONT, byte]);
                             }
                         }
@@ -163,10 +165,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn negotiation_preamble_is_will_sga_only() {
-        // ECHO is deliberately not offered (see negotiation_preamble): the sensor never echoes, so
-        // claiming server echo would be a self-contradiction.
-        assert_eq!(negotiation_preamble(), vec![IAC, WILL, OPT_SGA]);
+    fn negotiation_preamble_offers_echo_and_sga() {
+        // A real telnetd offers server-side echo; the sensor now does too (and actually echoes), so
+        // a line-mode client stops local-echoing and the CR of a bare Enter no longer renders as ^M.
+        const OPT_ECHO: u8 = 1;
+        assert_eq!(
+            negotiation_preamble(),
+            vec![IAC, WILL, OPT_ECHO, IAC, WILL, OPT_SGA]
+        );
     }
 
     #[test]
@@ -182,13 +188,14 @@ mod tests {
     }
 
     #[test]
-    fn client_do_echo_is_refused_since_we_never_offered_it() {
+    fn client_do_echo_gets_no_reply_because_we_offered_it() {
         let mut filter = IacFilter::new();
         let mut data = Vec::new();
         let mut resp = Vec::new();
-        const OPT_ECHO: u8 = 1; // RFC 857; the sensor deliberately does not offer it
+        const OPT_ECHO: u8 = 1; // RFC 857; the sensor now offers WILL ECHO
+        // DO ECHO is the client agreeing to our offer - reply nothing (RFC 854 loop avoidance).
         filter.process(&[IAC, DO, OPT_ECHO], &mut data, &mut resp);
-        assert_eq!(resp, vec![IAC, WONT, OPT_ECHO]);
+        assert!(resp.is_empty());
     }
 
     #[test]

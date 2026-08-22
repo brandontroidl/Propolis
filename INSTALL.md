@@ -398,23 +398,28 @@ every bound below is validated and fails startup rather than silently disabling 
 
 - `PROPOLIS_FETCH_ENABLED` - default `false`. Set `true` to let the daemon fetch samples the
   sensors observed being staged (e.g. a `wget`/`curl` command a shell session ran).
-- `PROPOLIS_FETCH_INTERVAL_SECS` - seconds between scan cycles. Default `10`.
+- `PROPOLIS_FETCH_INTERVAL_SECS` - seconds between scan cycles. Default `10`, maximum `86400` (a
+  day - past that, use `PROPOLIS_FETCH_ENABLED=false` instead).
 - `PROPOLIS_FETCH_MAX_BYTES` - per-fetch byte cap, enforced while the body is still streaming and
-  by the spool's own file-size cap. Default `10000000` (10 MB). Rejected at `0` - a zero cap would
-  disable the byte guard, not make it unlimited.
+  by the spool's own file-size cap. Default `10000000` (10 MB), maximum `500000000` (500 MB).
+  Rejected at `0` - a zero cap would disable the byte guard, not make it unlimited - and rejected
+  above the maximum, so a config typo cannot size an in-memory streaming buffer large enough to
+  OOM the daemon.
 - `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` - fetches allowed against one host per rolling hour (an
-  amplification/DoS guard). Default `12`.
+  amplification/DoS guard). Default `12`, maximum `1000`.
 - `PROPOLIS_FETCH_MAX_HOPS` - HTTP redirects followed per fetch, each re-vetted against the SSRF
   guard before being followed. Default `3`.
 - `PROPOLIS_FETCH_MAX_DEPTH` - recursion depth into URLs extracted from a fetched dropper script.
   Default `2`.
 - `PROPOLIS_FETCH_DAILY_CAP` - total fetch attempts allowed per UTC day, across every cycle.
-  Default `200`.
+  Default `200`, maximum `10000`.
 - `PROPOLIS_FETCH_BATCH_SIZE` - candidates selected per cycle (bounded further by whatever remains
-  of the daily cap). Default `20`.
-- `PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS` - default `10`.
-- `PROPOLIS_FETCH_READ_TIMEOUT_SECS` - default `10`.
-- `PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS` - default `30`.
+  of the daily cap). Default `20`, maximum `1000`.
+- `PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS` - default `10`, maximum `300` (5 minutes - past that, one
+  slow/stalling fetch would hold up the fetcher's strictly-sequential cycle loop for an
+  unreasonable fraction of an hour).
+- `PROPOLIS_FETCH_READ_TIMEOUT_SECS` - default `10`, maximum `300`.
+- `PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS` - default `30`, maximum `300`.
 - `PROPOLIS_FETCH_USER_AGENT` - the `User-Agent` header the fetch presents. Default a generic wget
   version string, deliberately never one naming this project - matches `PROPOLIS_SSH_BANNER`'s
   reasoning: identifying the fetcher would tip off whoever is watching the staging server's access

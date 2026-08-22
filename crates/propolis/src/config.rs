@@ -41,6 +41,23 @@ const DEFAULT_FETCH_BATCH_SIZE: u64 = 20;
 const DEFAULT_FETCH_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_FETCH_READ_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_FETCH_TOTAL_TIMEOUT_SECS: u64 = 30;
+
+// Upper clamps for the fetcher's numeric config, on top of `parse_positive_u64`'s existing
+// zero-rejection - a config typo or an unbounded operator value must not be able to grow an
+// in-memory buffer past what the daemon can hold, or stall the fetcher's strictly-sequential
+// cycle loop for hours on one slow fetch. Fix round 1, #3.
+/// A few hundred MB, per the review: large enough for any real dropper/binary this fetcher is
+/// meant to capture, small enough that one attacker-influenced `Content-Length` cannot OOM the
+/// daemon.
+const MAX_FETCH_MAX_BYTES: u64 = 500_000_000;
+/// A few minutes - past this, a single slow/stalling fetch would hold up the strictly-sequential
+/// cycle loop (no overlapping `run_cycle` calls) for an unreasonable fraction of an hour.
+const MAX_FETCH_TIMEOUT_SECS: u64 = 300;
+const MAX_FETCH_MAX_PER_HOST_HOUR: u64 = 1_000;
+const MAX_FETCH_DAILY_CAP: u64 = 10_000;
+const MAX_FETCH_BATCH_SIZE: u64 = 1_000;
+/// A day - past this the operator should just set `PROPOLIS_FETCH_ENABLED=false` instead.
+const MAX_FETCH_INTERVAL_SECS: u64 = 86_400;
 /// A common real-world wget string rather than anything naming this project, matching
 /// `PROPOLIS_SSH_BANNER`'s reasoning: a fetch that identified itself as "propolis" would tip off
 /// the botnet operator watching its own payload-staging server's access log.
@@ -157,6 +174,26 @@ fn parse_positive_u64(name: &'static str, default: u64) -> Result<u64, ConfigErr
             field: name,
             value: raw,
             reason: "must be a positive integer (zero never means unlimited)",
+        });
+    }
+    Ok(value)
+}
+
+/// Like `parse_positive_u64`, but also rejects a value above `max`. Every malware-fetcher numeric
+/// bound that could otherwise grow an in-memory buffer or a stall window without limit goes
+/// through this rather than the plain `parse_positive_u64` this file's other, pre-existing fields
+/// use - those are unrelated, accepted behavior, not something this fix touches.
+fn parse_bounded_positive_u64(
+    name: &'static str,
+    default: u64,
+    max: u64,
+) -> Result<u64, ConfigError> {
+    let value = parse_positive_u64(name, default)?;
+    if value > max {
+        return Err(ConfigError::Invalid {
+            field: name,
+            value: format!("{value} (maximum allowed is {max})"),
+            reason: "exceeds the maximum allowed value for this field",
         });
     }
     Ok(value)
@@ -448,31 +485,47 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
     // Malware fetcher: opt-in egress, off by default like VT upload - see
     // internal/design/12-malware-fetcher.md section 13.
     let fetch_enabled = parse_bool_flag("PROPOLIS_FETCH_ENABLED", false);
-    let fetch_interval_secs =
-        parse_positive_u64("PROPOLIS_FETCH_INTERVAL_SECS", DEFAULT_FETCH_INTERVAL_SECS)?;
-    let fetch_max_bytes =
-        parse_positive_u64("PROPOLIS_FETCH_MAX_BYTES", DEFAULT_FETCH_MAX_BYTES)? as usize;
-    let fetch_max_per_host_hour = parse_positive_u64(
+    let fetch_interval_secs = parse_bounded_positive_u64(
+        "PROPOLIS_FETCH_INTERVAL_SECS",
+        DEFAULT_FETCH_INTERVAL_SECS,
+        MAX_FETCH_INTERVAL_SECS,
+    )?;
+    let fetch_max_bytes = parse_bounded_positive_u64(
+        "PROPOLIS_FETCH_MAX_BYTES",
+        DEFAULT_FETCH_MAX_BYTES,
+        MAX_FETCH_MAX_BYTES,
+    )? as usize;
+    let fetch_max_per_host_hour = parse_bounded_positive_u64(
         "PROPOLIS_FETCH_MAX_PER_HOST_HOUR",
         DEFAULT_FETCH_MAX_PER_HOST_HOUR,
+        MAX_FETCH_MAX_PER_HOST_HOUR,
     )? as u32;
     let fetch_max_hops = parse_bounded_u8("PROPOLIS_FETCH_MAX_HOPS", DEFAULT_FETCH_MAX_HOPS)?;
     let fetch_max_depth = parse_bounded_u8("PROPOLIS_FETCH_MAX_DEPTH", DEFAULT_FETCH_MAX_DEPTH)?;
-    let fetch_daily_cap =
-        parse_positive_u64("PROPOLIS_FETCH_DAILY_CAP", DEFAULT_FETCH_DAILY_CAP)? as u32;
-    let fetch_batch_size =
-        parse_positive_u64("PROPOLIS_FETCH_BATCH_SIZE", DEFAULT_FETCH_BATCH_SIZE)? as usize;
-    let fetch_connect_timeout_secs = parse_positive_u64(
+    let fetch_daily_cap = parse_bounded_positive_u64(
+        "PROPOLIS_FETCH_DAILY_CAP",
+        DEFAULT_FETCH_DAILY_CAP,
+        MAX_FETCH_DAILY_CAP,
+    )? as u32;
+    let fetch_batch_size = parse_bounded_positive_u64(
+        "PROPOLIS_FETCH_BATCH_SIZE",
+        DEFAULT_FETCH_BATCH_SIZE,
+        MAX_FETCH_BATCH_SIZE,
+    )? as usize;
+    let fetch_connect_timeout_secs = parse_bounded_positive_u64(
         "PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS",
         DEFAULT_FETCH_CONNECT_TIMEOUT_SECS,
+        MAX_FETCH_TIMEOUT_SECS,
     )?;
-    let fetch_read_timeout_secs = parse_positive_u64(
+    let fetch_read_timeout_secs = parse_bounded_positive_u64(
         "PROPOLIS_FETCH_READ_TIMEOUT_SECS",
         DEFAULT_FETCH_READ_TIMEOUT_SECS,
+        MAX_FETCH_TIMEOUT_SECS,
     )?;
-    let fetch_total_timeout_secs = parse_positive_u64(
+    let fetch_total_timeout_secs = parse_bounded_positive_u64(
         "PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS",
         DEFAULT_FETCH_TOTAL_TIMEOUT_SECS,
+        MAX_FETCH_TIMEOUT_SECS,
     )?;
     let fetch_user_agent = env::var("PROPOLIS_FETCH_USER_AGENT")
         .ok()
@@ -608,6 +661,15 @@ mod tests {
             load_config().is_err(),
             "PROPOLIS_FETCH_MAX_BYTES=0 must be rejected at parse time - a zero byte cap would \
              disable the byte guard"
+        );
+
+        // Fix round 1, #3 (minor): the upper end must be bounded too - an unbounded in-memory
+        // streaming buffer could OOM the daemon on a single oversized (attacker-influenced) fetch.
+        unsafe { env::set_var("PROPOLIS_FETCH_MAX_BYTES", "999999999999") };
+        assert!(
+            load_config().is_err(),
+            "an absurdly large PROPOLIS_FETCH_MAX_BYTES must be rejected - it bounds an in-memory \
+             streaming buffer, not just a lower floor"
         );
 
         unsafe {

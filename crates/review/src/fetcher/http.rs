@@ -4,12 +4,13 @@
 //! body is still streaming so an oversized response is never buffered in full. See
 //! `internal/design/12-malware-fetcher.md` section 6.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use futures_util::StreamExt;
 
-use super::guard::Pinned;
+use super::guard::{GuardReject, HostResolver, Pinned, vet};
 
 /// Bounds for one fetch attempt. Every field is caller-supplied so the review daemon can source
 /// them from validated config (`internal/design/12-malware-fetcher.md` section 13) rather than
@@ -197,6 +198,62 @@ fn redirect_target(request_url: &str, resp: &reqwest::Response) -> HttpResult {
     HttpResult::Redirect(resolved)
 }
 
+/// The terminal result of following a fetch through zero or more redirects, every hop re-vetted.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HttpOutcome {
+    Captured(Fetched),
+    Rejected(GuardReject),
+    Empty,
+    TooBig,
+    TooManyHops,
+}
+
+/// Follow `url` through up to `max_hops` redirects, the SSRF-via-redirect defense: `guard::vet`
+/// runs fresh on every hop - the initial `url` and every subsequent `Location` target alike -
+/// producing a fresh [`Pinned`] that hop's `fetch_http_once` call then uses, so a 302 pointing at
+/// an internal/link-local/RFC1918/`::ffff:`-mapped address is caught here rather than blindly
+/// followed. `allow_tftp: false` on every hop, including the first, so a redirect (or even the
+/// caller's own initial URL, via this entry point) can never reach tftp - that scheme is only
+/// ever reachable through a caller that vets with `allow_tftp: true` outside this loop.
+///
+/// `fetch_http_once`'s `Redirect(loc)` is already an absolute URL (`redirect_target` above joins
+/// a relative `Location` against the request URL before returning it) - `loc` is re-vetted
+/// directly as the next hop's URL, never re-joined against the prior hop, since joining an
+/// already-absolute URL again would corrupt it.
+///
+/// A rejected hop (initial or any redirect) captures zero bytes: `vet`'s `Err` short-circuits
+/// before `fetch_http_once` - and therefore before any socket - is ever reached.
+pub async fn fetch_http(
+    url: &str,
+    own: &HashSet<IpAddr>,
+    r: &dyn HostResolver,
+    limits: &FetchLimits,
+    max_hops: u8,
+) -> Result<HttpOutcome, FetchError> {
+    let mut current = url.to_string();
+    let mut hops_left = max_hops;
+
+    loop {
+        let pinned = match vet(&current, own, r, false) {
+            Ok(p) => p,
+            Err(reject) => return Ok(HttpOutcome::Rejected(reject)),
+        };
+
+        match fetch_http_once(&pinned, &current, limits).await? {
+            HttpResult::Body(fetched) => return Ok(HttpOutcome::Captured(fetched)),
+            HttpResult::Empty => return Ok(HttpOutcome::Empty),
+            HttpResult::TooBig => return Ok(HttpOutcome::TooBig),
+            HttpResult::Redirect(loc) => {
+                if hops_left == 0 {
+                    return Ok(HttpOutcome::TooManyHops);
+                }
+                hops_left -= 1;
+                current = loc;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
@@ -211,6 +268,10 @@ mod tests {
 
     use super::super::guard::Scheme;
     use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
 
     async fn spawn(app: Router) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -460,5 +521,100 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, HttpResult::Empty);
+    }
+
+    /// A [`HostResolver`] that maps specific hostnames to specific resolved addresses, so a
+    /// single test can give the redirect chain's different hosts different (real or forbidden)
+    /// classifications without touching real DNS.
+    struct MapResolver(std::collections::HashMap<&'static str, IpAddr>);
+    impl HostResolver for MapResolver {
+        fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            self.0
+                .get(host)
+                .map(|ip| vec![*ip])
+                .ok_or_else(|| std::io::Error::other(format!("unmapped host {host}")))
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_target_resolving_to_forbidden_address_is_rejected_with_no_bytes_captured() {
+        // A real, live server binds to the exact loopback address the mock resolver reports for
+        // "attacker-redirect-target.test" - so it WOULD serve a body and increment `hits` if
+        // `fetch_http` ever dialed it. This is what makes the zero-hits assertion below load
+        // bearing rather than a tautology: mapping the redirect target to an address nothing
+        // listens on (e.g. a link-local metadata IP) would leave `hits` at 0 whether the guard
+        // fired correctly or was silently bypassed, since the dial attempt fails either way -
+        // proving nothing about whether `vet` actually ran. Pointing the mock resolution at the
+        // server's own real, reachable loopback address closes that gap: a bypassed/missing
+        // guard would connect successfully and increment `hits`; the correct guard (loopback is
+        // in `core_scoring`'s reserved-range list) rejects before any socket opens, so it stays
+        // at 0. Verified by fails-without/passes-with (see task report) - temporarily letting the
+        // rejected branch fall through to fetch_http_once made this exact test fail with
+        // `hits == 1` and `Captured(_)`, not just a generic panic.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_in_handler = hits.clone();
+        let app = Router::new().route(
+            "/",
+            get(move || {
+                let hits = hits_in_handler.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "should never be served"
+                }
+            }),
+        );
+        let port = spawn(app).await;
+
+        let own = HashSet::new();
+        let mut hosts = std::collections::HashMap::new();
+        hosts.insert(
+            "attacker-redirect-target.test",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let resolver = MapResolver(hosts);
+
+        let result = fetch_http(
+            &format!("http://attacker-redirect-target.test:{port}/"),
+            &own,
+            &resolver,
+            &limits(1024),
+            3,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, HttpOutcome::Rejected(GuardReject::Forbidden(_))),
+            "expected Rejected(Forbidden(_)), got {result:?}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "handler was reached - fetch_http dialed a hop its own vet() call had rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn hop_budget_does_not_gate_the_first_attempt() {
+        // A subtly-wrong implementation could check `hops_left == 0` before ever calling `vet`,
+        // treating max_hops as "attempts remaining" rather than "redirects remaining to follow" -
+        // that bug would turn every max_hops=0 call into an unconditional TooManyHops, even one
+        // whose target was never actually a redirect. This proves the opposite: vet() runs first
+        // on every call including the very first, and TooManyHops is reserved for hop-exhaustion
+        // on an *actual* redirect, never substituted for a straightforward rejection.
+        let own = HashSet::new();
+        let mut hosts = std::collections::HashMap::new();
+        hosts.insert("attacker.test", ip("10.0.0.1"));
+        let resolver = MapResolver(hosts);
+
+        let result = fetch_http("http://attacker.test/", &own, &resolver, &limits(1024), 0)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, HttpOutcome::Rejected(GuardReject::Forbidden(_))),
+            "expected Rejected(Forbidden(_)) even with max_hops=0 (the initial hop isn't a \
+             redirect being followed), got {result:?}"
+        );
     }
 }

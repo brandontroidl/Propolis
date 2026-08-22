@@ -163,6 +163,10 @@ ensure_dir /var/spool/propolis/catchall   0750 propolis-catchall propolis-catcha
 ensure_dir /var/spool/propolis/ssh        0750 propolis-ssh      propolis-ssh
 ensure_dir /var/spool/propolis/adb       0750 propolis-adb      propolis-adb
 ensure_dir /var/spool/propolis/ftp       0750 propolis-ftp      propolis-ftp
+# propolis-owned, not a dedicated sensor user: unlike catchall/ssh/adb/ftp above (each written by
+# its own standalone sensor process), the malware fetcher runs inside propolis.service itself -
+# see deploy/propolis.service's own ReadWritePaths grant for this exact path.
+ensure_dir /var/spool/propolis/fetched   0750 propolis          propolis
 
 cat <<'EOF'
     NOT DONE BY THIS SCRIPT - back each spool directory with a noexec,nosuid,nodev mount before
@@ -172,6 +176,7 @@ cat <<'EOF'
         tmpfs /var/spool/propolis/ssh      tmpfs noexec,nosuid,nodev,size=256M 0 0
         tmpfs /var/spool/propolis/adb      tmpfs noexec,nosuid,nodev,size=256M 0 0
         tmpfs /var/spool/propolis/ftp      tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/fetched  tmpfs noexec,nosuid,nodev,size=256M 0 0
         tmpfs /var/lib/propolis/spool      tmpfs noexec,nosuid,nodev,size=256M 0 0
 
     Size each mount for the expected upload/sample volume; a dedicated backing partition works

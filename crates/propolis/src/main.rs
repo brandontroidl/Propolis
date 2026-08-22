@@ -7,7 +7,8 @@
 mod config;
 mod supervisor;
 
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,9 +26,97 @@ use console::log_buffer::LogBuffer;
 use feed::{ExclusionEngine, FeedBuilder, FeedConfig, Publisher};
 use intake::runner::IntakeRunner;
 use intake::tailer::LogTailer;
+use review::fetcher::{self, FetchDeps, guard::SystemResolver, http::FetchLimits};
 use review::queue::ReviewQueue;
 use review::submit::SubmissionRunner;
 use review::vendor::{AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter};
+
+/// Absolute path the malware fetcher writes captured samples to. Hardcoded, matching the VT
+/// scanner's own `spool_dirs` below and `console/src/routes/samples.rs`'s identical list - not an
+/// operator env var, same convention as every other sensor's `SPOOL_MAX_FILE_SIZE`/
+/// `SPOOL_GLOBAL_BUDGET` constants.
+const FETCH_SPOOL_DIR: &str = "/var/spool/propolis/fetched";
+
+/// Global byte budget for the fetched-malware spool. Matches `review::fetcher`'s own orchestration
+/// tests' convention (10 MB/file, 1 GB total) rather than the smaller 100 MB the upload-capture
+/// sensors use (`sensor-ftp`/`sensor-adb`) - this spool is a dedicated malware corpus growing over
+/// time from internet-wide staging servers, not an incidental per-connection upload side channel.
+/// The per-file cap is NOT a second constant here: it is `config.fetch_max_bytes`, the same
+/// operator-tunable byte guard the streaming HTTP fetch itself enforces, so the two can never
+/// drift apart into two independently-set byte ceilings for what is really one property.
+const FETCH_SPOOL_GLOBAL_BUDGET: u64 = 1_000_000_000;
+
+/// Enumerates every unicast IPv4/IPv6 address bound to a live local interface, via
+/// `nix::ifaddrs::getifaddrs` (the OS `getifaddrs(3)` call). Loopback and link-local addresses are
+/// included deliberately: this set only needs to contain every address the OS considers "us" - a
+/// separate, independent check (`review::fetcher::guard::is_forbidden_egress_target`, backed by
+/// `core_scoring::is_reserved_ip`) already rejects those ranges as fetch targets regardless of
+/// `own_ips`, so redundancy here costs nothing.
+///
+/// Returns an empty set (never panics) on enumeration failure - the caller is responsible for
+/// treating that as fail-closed, since an empty `own_ips` means the SSRF guard cannot exclude this
+/// node's own addresses as fetch targets.
+fn local_interface_ips() -> HashSet<IpAddr> {
+    let mut ips = HashSet::new();
+    match nix::ifaddrs::getifaddrs() {
+        Ok(addrs) => {
+            for ifaddr in addrs {
+                let Some(sockaddr) = ifaddr.address else {
+                    continue;
+                };
+                if let Some(v4) = sockaddr.as_sockaddr_in() {
+                    ips.insert(IpAddr::V4(v4.ip()));
+                } else if let Some(v6) = sockaddr.as_sockaddr_in6() {
+                    ips.insert(IpAddr::V6(v6.ip()));
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "fetcher: failed to enumerate local interface addresses");
+        }
+    }
+    ips
+}
+
+/// A per-UTC-day cap on how many fetch attempts the malware fetcher may start, mirroring
+/// `review::virustotal::DailyBudget`'s pattern - own ONE instance outside the per-cycle loop body,
+/// reset only on a day rollover, never re-initialized per cycle (that exact mistake was already
+/// shipped once for the VT scanner's daily cap and had to be fixed - see
+/// `internal/roadmap.md`/the VT daily-cap-reset fix this project already shipped). Not the same
+/// type as `review::virustotal::DailyBudget`: that one is consumed one unit per item inside its
+/// own loop; this one instead grants a whole cycle's `batch` size up front, since `run_cycle`'s
+/// internal selection and concurrency are opaque from this call site - the cap must be enforced by
+/// capping `batch`, not by counting after the fact.
+struct DailyFetchBudget {
+    limit: u32,
+    used: u32,
+    day: chrono::NaiveDate,
+}
+
+impl DailyFetchBudget {
+    fn new(limit: u32, today: chrono::NaiveDate) -> Self {
+        Self {
+            limit,
+            used: 0,
+            day: today,
+        }
+    }
+
+    /// Resets `used` first if the UTC day has rolled over, then grants up to `want` against
+    /// whatever remains of today's cap - never more, so a single cycle can never exceed the daily
+    /// limit even though `run_cycle` only ever sees the granted amount as its own `batch` size.
+    fn consume_up_to(&mut self, now: chrono::DateTime<chrono::Utc>, want: u32) -> u32 {
+        let today = now.date_naive();
+        if today != self.day {
+            self.day = today;
+            self.used = 0;
+        }
+        let remaining = self.limit.saturating_sub(self.used);
+        let grant = remaining.min(want);
+        self.used += grant;
+        grant
+    }
+}
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -525,6 +614,7 @@ async fn main() {
                     ("adb", std::path::PathBuf::from("/var/spool/propolis/adb")),
                     ("ftp", std::path::PathBuf::from("/var/spool/propolis/ftp")),
                     ("catchall", std::path::PathBuf::from("/var/spool/propolis/catchall")),
+                    ("fetched", std::path::PathBuf::from(FETCH_SPOOL_DIR)),
                 ];
                 // One budget owned across every scan cycle so the cap is per DAY, not per cycle.
                 let mut budget = review::virustotal::DailyBudget::new(
@@ -549,7 +639,126 @@ async fn main() {
         tracing::info!("propolis: virustotal scanner disabled");
     }
 
-    // 9. Spawn console web server.
+    // 9. Spawn malware fetcher if enabled.
+    if config.fetch_enabled {
+        let pool_fetch = pool.clone();
+        let fetch_own_ips_configured = config.fetch_own_ips.clone();
+        let fetch_user_agent = config.fetch_user_agent.clone();
+        let fetch_interval = config.fetch_interval;
+        let fetch_max_bytes = config.fetch_max_bytes;
+        let fetch_max_per_host_hour = config.fetch_max_per_host_hour;
+        let fetch_max_hops = config.fetch_max_hops;
+        let fetch_max_depth = config.fetch_max_depth;
+        let fetch_daily_cap = config.fetch_daily_cap;
+        let fetch_batch_size = config.fetch_batch_size;
+        let fetch_connect_timeout = config.fetch_connect_timeout;
+        let fetch_read_timeout = config.fetch_read_timeout;
+        let fetch_total_timeout = config.fetch_total_timeout;
+
+        handles.push(spawn_supervised("fetcher", cancel.clone(), move |token| {
+            let pool = pool_fetch.clone();
+            let own_ips_extra = fetch_own_ips_configured.clone();
+            let user_agent = fetch_user_agent.clone();
+            async move {
+                // Fail-closed: an empty own_ips set means the SSRF guard cannot exclude this
+                // node's own addresses as fetch targets, so refuse to run any cycle at all rather
+                // than run unsafe. Computed once at startup, like every other field of `deps`
+                // below - not re-checked per cycle, matching how the VT loop builds its own
+                // `spool_dirs`/`vt_config` once outside the loop and reuses them for every call.
+                let mut own_ips: HashSet<IpAddr> = local_interface_ips();
+                own_ips.extend(own_ips_extra);
+                if own_ips.is_empty() {
+                    tracing::error!(
+                        "fetcher: own_ips is empty (local interface enumeration failed and no \
+                         PROPOLIS_FETCH_OWN_IPS configured); refusing to run - an empty own_ips \
+                         set cannot vet a fetch against this node's own addresses"
+                    );
+                    return;
+                }
+
+                let spool_dir = std::path::PathBuf::from(FETCH_SPOOL_DIR);
+                if let Err(e) = std::fs::create_dir_all(&spool_dir) {
+                    tracing::error!(
+                        error = %e,
+                        path = FETCH_SPOOL_DIR,
+                        "fetcher: failed to create spool directory, refusing to run"
+                    );
+                    return;
+                }
+
+                let deps = FetchDeps {
+                    pool,
+                    spool: sensor_framework::QuarantineSpool::new(
+                        spool_dir,
+                        fetch_max_bytes as u64,
+                        FETCH_SPOOL_GLOBAL_BUDGET,
+                    ),
+                    own_ips,
+                    limits: FetchLimits {
+                        max_bytes: fetch_max_bytes,
+                        connect_timeout: fetch_connect_timeout,
+                        read_timeout: fetch_read_timeout,
+                        total_timeout: fetch_total_timeout,
+                        user_agent,
+                    },
+                    resolver: Box::new(SystemResolver),
+                    max_hops: fetch_max_hops,
+                    max_depth: fetch_max_depth,
+                    per_host_hour: fetch_max_per_host_hour,
+                };
+
+                // One budget owned across every cycle, never re-initialized inside the loop below
+                // - see `DailyFetchBudget`'s own doc comment for why that would reintroduce the
+                // daily-cap-reset bug already fixed once for the VT scanner.
+                let mut budget =
+                    DailyFetchBudget::new(fetch_daily_cap, chrono::Utc::now().date_naive());
+
+                loop {
+                    if token.is_cancelled() {
+                        tracing::info!("fetcher: scanner stopped");
+                        return;
+                    }
+
+                    let grant = budget.consume_up_to(chrono::Utc::now(), fetch_batch_size as u32);
+                    if grant > 0 {
+                        // Awaited to completion before the next cycle can start or the sleep
+                        // below begins: `run_cycle`'s own `select_candidates` does not claim rows
+                        // (no FOR UPDATE SKIP LOCKED), so two overlapping calls would double-fetch
+                        // and double the effective per-host cap.
+                        let stats = fetcher::run_cycle(&deps, grant as usize).await;
+                        if stats.selected > 0 {
+                            tracing::info!(
+                                selected = stats.selected,
+                                succeeded = stats.succeeded,
+                                rejected = stats.rejected,
+                                too_big = stats.too_big,
+                                timeout = stats.timeout,
+                                empty = stats.empty,
+                                dead = stats.dead,
+                                skipped_bucket = stats.skipped_bucket,
+                                enqueued_children = stats.enqueued_children,
+                                errors = stats.errors,
+                                "fetcher: cycle complete"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            "fetcher: daily cap reached, pausing until the UTC day rolls over"
+                        );
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(fetch_interval) => {}
+                        _ = token.cancelled() => {}
+                    }
+                }
+            }
+        }));
+    } else {
+        tracing::info!("propolis: malware fetcher disabled");
+    }
+
+    // 10. Spawn console web server.
     {
         let pool_c = pool.clone();
         let bind = config.console_bind;
@@ -590,14 +799,14 @@ async fn main() {
         }));
     }
 
-    // 9. Wait for shutdown signal.
+    // 11. Wait for shutdown signal.
     shutdown_signal().await;
     tracing::info!("propolis: shutdown signal received");
 
-    // 10. Cancel all subsystems.
+    // 12. Cancel all subsystems.
     cancel.cancel();
 
-    // 11. Await all handles with timeout.
+    // 13. Await all handles with timeout.
     let shutdown = async {
         for handle in handles {
             let _ = handle.await;
@@ -616,4 +825,50 @@ async fn main() {
 
     pool.close().await;
     tracing::info!("propolis: shutdown complete");
+}
+
+#[cfg(test)]
+mod daily_fetch_budget_tests {
+    use super::*;
+
+    #[test]
+    fn grants_are_capped_by_the_remaining_daily_limit() {
+        let day = "2026-08-22T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let mut budget = DailyFetchBudget::new(15, day.date_naive());
+        assert_eq!(
+            budget.consume_up_to(day, 20),
+            15,
+            "must not grant more than the daily limit"
+        );
+        assert_eq!(
+            budget.consume_up_to(day, 5),
+            0,
+            "must grant nothing once today's cap is exhausted"
+        );
+    }
+
+    #[test]
+    fn resets_on_a_new_utc_day_and_is_not_re_initialized_mid_run() {
+        let day1 = "2026-08-21T23:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let mut budget = DailyFetchBudget::new(10, day1.date_naive());
+        assert_eq!(budget.consume_up_to(day1, 10), 10);
+        assert_eq!(
+            budget.consume_up_to(day1, 1),
+            0,
+            "exhausted for the rest of day1"
+        );
+
+        let day2 = "2026-08-22T00:05:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        assert_eq!(
+            budget.consume_up_to(day2, 10),
+            10,
+            "must reset on the new UTC day rather than staying exhausted"
+        );
+    }
 }

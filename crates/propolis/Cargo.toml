@@ -13,11 +13,17 @@ core-scoring = { path = "../core-scoring" }
 feed = { path = "../feed" }
 intake = { path = "../intake" }
 review = { path = "../review" }
+sensor-framework = { path = "../sensor-framework" }
 
 axum = "0.8.9"
 chrono = "0.4.45"
 hex = "0.4.3"
 ipnet = "2.12.0"
+# "net" feature for `nix::ifaddrs::getifaddrs` - enumerating this node's own live interface
+# addresses for the malware fetcher's fail-closed `own_ips` set (crates/review/src/fetcher).
+# Already a transitive dependency of this workspace at this exact version, so promoting it to a
+# direct one with one extra feature is a smaller supply-chain change than adding a new crate.
+nix = { version = "0.31.3", features = ["net"] }
 rand = { version = "0.10.2", features = ["std"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 sqlx = { version = "0.9.0", features = ["postgres", "runtime-tokio", "macros"] }

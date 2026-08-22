@@ -31,6 +31,20 @@ const DEFAULT_CONSOLE_BIND: &str = "127.0.0.1:8080";
 const DEFAULT_COOLDOWN_HOURS: u32 = 24;
 const DEFAULT_RATE_LIMIT: u32 = 100;
 const DEFAULT_RATE_WINDOW_HOURS: u32 = 1;
+const DEFAULT_FETCH_INTERVAL_SECS: u64 = 10;
+const DEFAULT_FETCH_MAX_BYTES: u64 = 10_000_000;
+const DEFAULT_FETCH_MAX_PER_HOST_HOUR: u64 = 12;
+const DEFAULT_FETCH_MAX_HOPS: u8 = 3;
+const DEFAULT_FETCH_MAX_DEPTH: u8 = 2;
+const DEFAULT_FETCH_DAILY_CAP: u64 = 200;
+const DEFAULT_FETCH_BATCH_SIZE: u64 = 20;
+const DEFAULT_FETCH_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_FETCH_READ_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_FETCH_TOTAL_TIMEOUT_SECS: u64 = 30;
+/// A common real-world wget string rather than anything naming this project, matching
+/// `PROPOLIS_SSH_BANNER`'s reasoning: a fetch that identified itself as "propolis" would tip off
+/// the botnet operator watching its own payload-staging server's access log.
+const DEFAULT_FETCH_USER_AGENT: &str = "Wget/1.21.3";
 
 /// One sensor log entry: a sensor's name (for logging/metrics) and the absolute path to its
 /// NDJSON log file.
@@ -75,6 +89,23 @@ pub struct PropolisConfig {
     pub vt_api_key: String,
     pub vt_upload_unknown: bool,
     pub vt_scan_interval_secs: u64,
+    // Malware fetcher
+    pub fetch_enabled: bool,
+    pub fetch_interval: Duration,
+    pub fetch_max_bytes: usize,
+    pub fetch_max_per_host_hour: u32,
+    pub fetch_max_hops: u8,
+    pub fetch_max_depth: u8,
+    pub fetch_daily_cap: u32,
+    pub fetch_batch_size: usize,
+    pub fetch_connect_timeout: Duration,
+    pub fetch_read_timeout: Duration,
+    pub fetch_total_timeout: Duration,
+    pub fetch_user_agent: String,
+    /// Extra addresses to union into the fetcher's `own_ips` set beyond what live interface
+    /// enumeration finds - e.g. a WAN IP reachable only via DNAT that never appears on any local
+    /// interface. See `main.rs`'s fetcher spawn block for the fail-closed check on the combined set.
+    pub fetch_own_ips: Vec<IpAddr>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -228,18 +259,43 @@ fn parse_window_list(raw: &str) -> Result<Vec<(String, Duration)>, ConfigError> 
         .collect()
 }
 
-fn parse_ip_list(raw: &str) -> Result<Vec<IpAddr>, ConfigError> {
+fn parse_ip_list(field: &'static str, raw: &str) -> Result<Vec<IpAddr>, ConfigError> {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| {
             s.parse::<IpAddr>().map_err(|_| ConfigError::Invalid {
-                field: "PROPOLIS_FEED_DELIST",
+                field,
                 value: s.to_string(),
                 reason: "not a valid IP address",
             })
         })
         .collect()
+}
+
+/// A small operator-tunable bound that must fit in a `u8` (the fetcher's redirect-hop and
+/// recursion-depth caps): zero is a legitimate, maximally-strict value here (no redirects / no
+/// recursion at all), so unlike `parse_positive_u64` this does not reject it - only a value that
+/// would silently wrap past 255 is rejected, so a config typo ("300") fails startup instead of
+/// truncating to a smaller-looking but wrong bound.
+fn parse_bounded_u8(name: &'static str, default: u8) -> Result<u8, ConfigError> {
+    let raw = match env::var(name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(default),
+    };
+    let value: u64 = raw.parse().map_err(|_| ConfigError::Invalid {
+        field: name,
+        value: raw.clone(),
+        reason: "must be a non-negative integer",
+    })?;
+    if value > u8::MAX as u64 {
+        return Err(ConfigError::Invalid {
+            field: name,
+            value: raw,
+            reason: "must fit in a u8 (0-255)",
+        });
+    }
+    Ok(value as u8)
 }
 
 fn load_session_secret() -> Result<[u8; 32], ConfigError> {
@@ -364,7 +420,10 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         DEFAULT_STANDARD_TTL_HOURS,
     )?;
     let feed_allowlist = parse_cidr_list(&env::var("PROPOLIS_FEED_ALLOWLIST").unwrap_or_default())?;
-    let feed_delist = parse_ip_list(&env::var("PROPOLIS_FEED_DELIST").unwrap_or_default())?;
+    let feed_delist = parse_ip_list(
+        "PROPOLIS_FEED_DELIST",
+        &env::var("PROPOLIS_FEED_DELIST").unwrap_or_default(),
+    )?;
     let feed_windows = parse_window_list(
         &env::var("PROPOLIS_FEED_WINDOWS").unwrap_or_else(|_| DEFAULT_FEED_WINDOWS.to_string()),
     )?;
@@ -385,6 +444,44 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
     let vt_enabled = parse_bool_flag("PROPOLIS_VT_ENABLED", false) && !vt_api_key.is_empty();
     let vt_upload_unknown = parse_bool_flag("PROPOLIS_VT_UPLOAD", false);
     let vt_scan_interval_secs = parse_u32("PROPOLIS_VT_SCAN_INTERVAL_SECS", 300)? as u64;
+
+    // Malware fetcher: opt-in egress, off by default like VT upload - see
+    // internal/design/12-malware-fetcher.md section 13.
+    let fetch_enabled = parse_bool_flag("PROPOLIS_FETCH_ENABLED", false);
+    let fetch_interval_secs =
+        parse_positive_u64("PROPOLIS_FETCH_INTERVAL_SECS", DEFAULT_FETCH_INTERVAL_SECS)?;
+    let fetch_max_bytes =
+        parse_positive_u64("PROPOLIS_FETCH_MAX_BYTES", DEFAULT_FETCH_MAX_BYTES)? as usize;
+    let fetch_max_per_host_hour = parse_positive_u64(
+        "PROPOLIS_FETCH_MAX_PER_HOST_HOUR",
+        DEFAULT_FETCH_MAX_PER_HOST_HOUR,
+    )? as u32;
+    let fetch_max_hops = parse_bounded_u8("PROPOLIS_FETCH_MAX_HOPS", DEFAULT_FETCH_MAX_HOPS)?;
+    let fetch_max_depth = parse_bounded_u8("PROPOLIS_FETCH_MAX_DEPTH", DEFAULT_FETCH_MAX_DEPTH)?;
+    let fetch_daily_cap =
+        parse_positive_u64("PROPOLIS_FETCH_DAILY_CAP", DEFAULT_FETCH_DAILY_CAP)? as u32;
+    let fetch_batch_size =
+        parse_positive_u64("PROPOLIS_FETCH_BATCH_SIZE", DEFAULT_FETCH_BATCH_SIZE)? as usize;
+    let fetch_connect_timeout_secs = parse_positive_u64(
+        "PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS",
+        DEFAULT_FETCH_CONNECT_TIMEOUT_SECS,
+    )?;
+    let fetch_read_timeout_secs = parse_positive_u64(
+        "PROPOLIS_FETCH_READ_TIMEOUT_SECS",
+        DEFAULT_FETCH_READ_TIMEOUT_SECS,
+    )?;
+    let fetch_total_timeout_secs = parse_positive_u64(
+        "PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS",
+        DEFAULT_FETCH_TOTAL_TIMEOUT_SECS,
+    )?;
+    let fetch_user_agent = env::var("PROPOLIS_FETCH_USER_AGENT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_FETCH_USER_AGENT.to_string());
+    let fetch_own_ips = parse_ip_list(
+        "PROPOLIS_FETCH_OWN_IPS",
+        &env::var("PROPOLIS_FETCH_OWN_IPS").unwrap_or_default(),
+    )?;
 
     Ok(PropolisConfig {
         database_url,
@@ -411,6 +508,19 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         vt_api_key,
         vt_upload_unknown,
         vt_scan_interval_secs,
+        fetch_enabled,
+        fetch_interval: Duration::from_secs(fetch_interval_secs),
+        fetch_max_bytes,
+        fetch_max_per_host_hour,
+        fetch_max_hops,
+        fetch_max_depth,
+        fetch_daily_cap,
+        fetch_batch_size,
+        fetch_connect_timeout: Duration::from_secs(fetch_connect_timeout_secs),
+        fetch_read_timeout: Duration::from_secs(fetch_read_timeout_secs),
+        fetch_total_timeout: Duration::from_secs(fetch_total_timeout_secs),
+        fetch_user_agent,
+        fetch_own_ips,
     })
 }
 
@@ -476,5 +586,77 @@ mod tests {
     #[test]
     fn parse_window_list_empty_disables_retention_feeds() {
         assert!(parse_window_list("").unwrap().is_empty());
+    }
+
+    // Load-bearing per the fetcher spec: a zero byte cap must never be treated as "unlimited" -
+    // it must fail startup outright. Exercised through the real `load_config` path (not just the
+    // underlying parse helper) so this also proves `PropolisConfig` actually wires the new field.
+    #[test]
+    fn load_config_rejects_a_zero_fetch_max_bytes_but_accepts_a_valid_set() {
+        // SAFETY: this test owns every variable it touches start-to-finish and no other test in
+        // this file reads DATABASE_URL / PROPOLIS_SENSOR_LOGS / PROPOLIS_CONSOLE_PASSWORD /
+        // PROPOLIS_FETCH_*, so there is no cross-test race despite `cargo test`'s default
+        // thread-per-test parallelism.
+        unsafe {
+            env::set_var("DATABASE_URL", "postgres://u:p@localhost/db");
+            env::set_var("PROPOLIS_SENSOR_LOGS", "catchall:/tmp/x.jsonl");
+            env::set_var("PROPOLIS_CONSOLE_PASSWORD", "test-password");
+            env::set_var("PROPOLIS_FETCH_ENABLED", "true");
+            env::set_var("PROPOLIS_FETCH_MAX_BYTES", "0");
+        }
+        assert!(
+            load_config().is_err(),
+            "PROPOLIS_FETCH_MAX_BYTES=0 must be rejected at parse time - a zero byte cap would \
+             disable the byte guard"
+        );
+
+        unsafe {
+            env::set_var("PROPOLIS_FETCH_MAX_BYTES", "5000000");
+            env::set_var("PROPOLIS_FETCH_MAX_PER_HOST_HOUR", "12");
+            env::set_var("PROPOLIS_FETCH_MAX_HOPS", "3");
+            env::set_var("PROPOLIS_FETCH_MAX_DEPTH", "2");
+            env::set_var("PROPOLIS_FETCH_DAILY_CAP", "200");
+            env::set_var("PROPOLIS_FETCH_OWN_IPS", "203.0.113.9");
+        }
+        let config = load_config().expect("a fully valid fetch config must parse");
+        assert!(config.fetch_enabled);
+        assert_eq!(config.fetch_max_bytes, 5_000_000);
+        assert_eq!(config.fetch_max_per_host_hour, 12);
+        assert_eq!(config.fetch_max_hops, 3);
+        assert_eq!(config.fetch_max_depth, 2);
+        assert_eq!(config.fetch_daily_cap, 200);
+        assert_eq!(
+            config.fetch_own_ips,
+            vec!["203.0.113.9".parse::<IpAddr>().unwrap()]
+        );
+
+        unsafe {
+            env::remove_var("DATABASE_URL");
+            env::remove_var("PROPOLIS_SENSOR_LOGS");
+            env::remove_var("PROPOLIS_CONSOLE_PASSWORD");
+            env::remove_var("PROPOLIS_FETCH_ENABLED");
+            env::remove_var("PROPOLIS_FETCH_MAX_BYTES");
+            env::remove_var("PROPOLIS_FETCH_MAX_PER_HOST_HOUR");
+            env::remove_var("PROPOLIS_FETCH_MAX_HOPS");
+            env::remove_var("PROPOLIS_FETCH_MAX_DEPTH");
+            env::remove_var("PROPOLIS_FETCH_DAILY_CAP");
+            env::remove_var("PROPOLIS_FETCH_OWN_IPS");
+        }
+    }
+
+    #[test]
+    fn parse_bounded_u8_allows_zero_but_rejects_overflow() {
+        unsafe { env::set_var("TEST_PROPOLIS_BOUNDED_U8", "0") };
+        assert_eq!(
+            parse_bounded_u8("TEST_PROPOLIS_BOUNDED_U8", 9).unwrap(),
+            0,
+            "zero is a legitimate strict value (no hops / no recursion), not a guard bypass"
+        );
+        unsafe { env::set_var("TEST_PROPOLIS_BOUNDED_U8", "300") };
+        assert!(
+            parse_bounded_u8("TEST_PROPOLIS_BOUNDED_U8", 9).is_err(),
+            "a value that would silently wrap past 255 must be rejected, not truncated"
+        );
+        unsafe { env::remove_var("TEST_PROPOLIS_BOUNDED_U8") };
     }
 }

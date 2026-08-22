@@ -45,7 +45,9 @@ What it creates:
   `propolis-adb`, `propolis-http`, `propolis-ftp`, `propolis-smtp`, `propolis-cred` (all system
   users, no login shell, no home directory)
 - **Log dirs:** `/var/log/propolis/{catchall,ssh,telnet,redis,adb,http,ftp,smtp,cred}/`
-- **Spool dirs:** `/var/spool/propolis/{catchall,ssh,adb,ftp}/` (for captured file uploads)
+- **Spool dirs:** `/var/spool/propolis/{catchall,ssh,adb,ftp}/` (for captured file uploads),
+  `/var/spool/propolis/fetched/` (owned `propolis` - the malware fetcher's own quarantine spool,
+  written by the unified daemon itself rather than a standalone sensor process)
 - **State dirs:** `/var/lib/propolis/{cursors,feed,spool}/`
 - **Config dir:** `/etc/propolis/`
 - **Binaries:** installed to `/usr/local/bin/`
@@ -62,6 +64,7 @@ tmpfs /var/spool/propolis/catchall tmpfs noexec,nosuid,nodev,size=256M 0 0
 tmpfs /var/spool/propolis/ssh      tmpfs noexec,nosuid,nodev,size=256M 0 0
 tmpfs /var/spool/propolis/adb      tmpfs noexec,nosuid,nodev,size=256M 0 0
 tmpfs /var/spool/propolis/ftp      tmpfs noexec,nosuid,nodev,size=256M 0 0
+tmpfs /var/spool/propolis/fetched  tmpfs noexec,nosuid,nodev,size=256M 0 0
 tmpfs /var/lib/propolis/spool      tmpfs noexec,nosuid,nodev,size=256M 0 0
 ```
 
@@ -373,6 +376,39 @@ in the sections above; the rest are optional overrides with sensible defaults. T
 - `PROPOLIS_VT_KEY`
 - `PROPOLIS_VT_SCAN_INTERVAL_SECS`
 - `PROPOLIS_VT_UPLOAD`
+
+**malware fetcher** (see `internal/design/12-malware-fetcher.md`; opt-in egress, off by default -
+the fetcher connects OUT to attacker-controlled infrastructure to retrieve staged payloads, so
+every bound below is validated and fails startup rather than silently disabling a guard)
+
+- `PROPOLIS_FETCH_ENABLED` - default `false`. Set `true` to let the daemon fetch samples the
+  sensors observed being staged (e.g. a `wget`/`curl` command a shell session ran).
+- `PROPOLIS_FETCH_INTERVAL_SECS` - seconds between scan cycles. Default `10`.
+- `PROPOLIS_FETCH_MAX_BYTES` - per-fetch byte cap, enforced while the body is still streaming and
+  by the spool's own file-size cap. Default `10000000` (10 MB). Rejected at `0` - a zero cap would
+  disable the byte guard, not make it unlimited.
+- `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` - fetches allowed against one host per rolling hour (an
+  amplification/DoS guard). Default `12`.
+- `PROPOLIS_FETCH_MAX_HOPS` - HTTP redirects followed per fetch, each re-vetted against the SSRF
+  guard before being followed. Default `3`.
+- `PROPOLIS_FETCH_MAX_DEPTH` - recursion depth into URLs extracted from a fetched dropper script.
+  Default `2`.
+- `PROPOLIS_FETCH_DAILY_CAP` - total fetch attempts allowed per UTC day, across every cycle.
+  Default `200`.
+- `PROPOLIS_FETCH_BATCH_SIZE` - candidates selected per cycle (bounded further by whatever remains
+  of the daily cap). Default `20`.
+- `PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS` - default `10`.
+- `PROPOLIS_FETCH_READ_TIMEOUT_SECS` - default `10`.
+- `PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS` - default `30`.
+- `PROPOLIS_FETCH_USER_AGENT` - the `User-Agent` header the fetch presents. Default a generic wget
+  version string, deliberately never one naming this project - matches `PROPOLIS_SSH_BANNER`'s
+  reasoning: identifying the fetcher would tip off whoever is watching the staging server's access
+  log.
+- `PROPOLIS_FETCH_OWN_IPS` - optional comma-separated extra IP addresses unioned into the
+  fetcher's `own_ips` set alongside this node's live interface addresses (e.g. a WAN IP reachable
+  only via DNAT, which never appears on any local interface). The fetcher refuses to run any cycle
+  at all if the combined set ends up empty - fail-closed, since an empty set cannot exclude this
+  node's own addresses as a fetch target.
 
 **feed builder**
 

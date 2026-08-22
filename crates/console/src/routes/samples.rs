@@ -119,6 +119,7 @@ fn spool_dirs() -> Vec<(&'static str, PathBuf)> {
         ("adb", PathBuf::from("/var/spool/propolis/adb")),
         ("ftp", PathBuf::from("/var/spool/propolis/ftp")),
         ("catchall", PathBuf::from("/var/spool/propolis/catchall")),
+        ("fetched", PathBuf::from("/var/spool/propolis/fetched")),
     ]
 }
 

@@ -115,7 +115,14 @@ pub enum GuardReject {
 }
 
 /// Resolves a hostname to its address set. Abstracted so tests never touch a live resolver.
-pub trait HostResolver {
+///
+/// `Send + Sync` supertraits: `FetchDeps.resolver` is `Box<dyn HostResolver + Send + Sync>`, and
+/// `http.rs`'s `RealHopFetcher` holds a `&dyn HostResolver` across an `.await` point - without
+/// these supertraits that reference is not `Send`, which only surfaces once something calls
+/// `run_cycle` from a real multi-threaded `tokio::spawn` (as the `propolis` daemon's
+/// `spawn_supervised` does); every existing `#[tokio::test]` here runs on the single-threaded
+/// current-thread runtime by default, so the gap never showed up in this crate's own test suite.
+pub trait HostResolver: Send + Sync {
     fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>>;
 }
 

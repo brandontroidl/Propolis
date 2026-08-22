@@ -70,10 +70,23 @@
 #     (default 127.0.0.1:8080), PROPOLIS_CONSOLE_PASSWORD (required),
 #     PROPOLIS_CONSOLE_SESSION_SECRET (optional 64-hex-char/32-byte key - unset generates a fresh
 #     random one on every start, which only means sessions do not survive a restart, matching
-#     console.service's own identical, already-accepted behavior).
+#     console.service's own identical, already-accepted behavior). PROPOLIS_FETCH_ENABLED
+#     (default false - opt-in egress, off until the operator turns it on), PROPOLIS_FETCH_INTERVAL_SECS
+#     (default 10), PROPOLIS_FETCH_MAX_BYTES (default 10000000 - rejected at zero, never treated as
+#     unlimited), PROPOLIS_FETCH_MAX_PER_HOST_HOUR (default 12), PROPOLIS_FETCH_MAX_HOPS (default 3),
+#     PROPOLIS_FETCH_MAX_DEPTH (default 2), PROPOLIS_FETCH_DAILY_CAP (default 200),
+#     PROPOLIS_FETCH_BATCH_SIZE (default 20), PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS (default 10),
+#     PROPOLIS_FETCH_READ_TIMEOUT_SECS (default 10), PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS (default 30),
+#     PROPOLIS_FETCH_USER_AGENT (default a generic wget string - never one naming this project),
+#     PROPOLIS_FETCH_OWN_IPS (optional extra addresses unioned into the fetcher's fail-closed
+#     own_ips set, e.g. a DNAT'd WAN IP no local interface carries).
 #   - /var/log/propolis/{catchall,ssh}, owned by their respective sensor users (unchanged from
 #     deploy/sensor-catchall.service / deploy/sensor-ssh.service).
 #   - /var/lib/propolis/{cursors,feed,spool}, owned by propolis.
+#   - /var/spool/propolis/fetched, owned by propolis (the malware fetcher's quarantine spool -
+#     unlike /var/spool/propolis/{catchall,ssh,adb,ftp}, which are each written by their OWN
+#     standalone sensor process and only READ here for VT scanning, this one is written by this
+#     very process, hence the separate ReadWritePaths grant below rather than a ReadOnlyPaths one).
 #   - PostgreSQL reachable at DATABASE_URL. This binary runs its own migrations
 #     (core-scoring + review) at startup - provisioning the database server itself, and its
 #     reachability, stays an independent operator/DBA concern.
@@ -120,6 +133,12 @@ ReadOnlyPaths=/var/log/propolis
 # file's header for why the union grant is correct here even though feed.service's own comment
 # warns against it for ITSELF.
 ReadWritePaths=/var/lib/propolis
+# The malware fetcher's quarantine spool - a SEPARATE top-level tree from /var/lib/propolis above,
+# scoped to only this one child directory rather than the shared /var/spool/propolis parent (whose
+# other children - catchall/ssh/adb/ftp - belong to different sensor processes/users; widening this
+# grant to the parent would let a compromised propolis process reach those siblings, the exact
+# anti-pattern this file's header warns against for /var/lib/propolis's own feed.service comment).
+ReadWritePaths=/var/spool/propolis/fetched
 
 # --- No privileged port binding ---
 # The console listener binds an unprivileged port (8080 by default, > 1024, matching

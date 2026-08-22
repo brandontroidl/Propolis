@@ -371,6 +371,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_source_ip_packet_arriving_first_never_hijacks_the_lock() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        // A genuinely different source IP, not just a different port - this exercises the
+        // pre-lock guard (`from.ip() != pinned_ip`, checked before `locked_tid` is ever set),
+        // distinct from the post-lock TID check the test above exercises. 127.0.0.0/8 is all
+        // loopback, so a second bound address needs no elevated privilege.
+        let attacker = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 600];
+            let (_, client) = server.recv_from(&mut buf).await.unwrap(); // RRQ
+
+            // Off-path attacker fires an injected block 1 immediately, racing to arrive before
+            // the real server's reply. This must never establish the TID lock, no matter how
+            // early it arrives - the lock may only ever be taken from `pinned.ip`.
+            attacker
+                .send_to(&data_packet(1, &[0xEEu8; 512]), client)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // The real server's block 1 arrives after the injected packet.
+            server
+                .send_to(&data_packet(1, &[0x11u8; 5]), client)
+                .await
+                .unwrap();
+            server.recv_from(&mut buf).await.unwrap(); // final ACK
+        });
+
+        let result = fetch_tftp(
+            &pinned(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            "loader.bin",
+            &limits(1024 * 1024),
+        )
+        .await
+        .unwrap();
+
+        match result {
+            TftpOutcome::Captured(bytes) => assert_eq!(
+                bytes,
+                vec![0x11u8; 5],
+                "the injected off-path packet must never establish the lock; only the real \
+                 peer's block may be captured"
+            ),
+            other => panic!("expected Captured, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn first_reply_oack_aborts() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = server.local_addr().unwrap().port();

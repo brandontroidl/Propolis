@@ -4,7 +4,7 @@
 //! body is still streaming so an oversized response is never buffered in full. See
 //! `internal/design/12-malware-fetcher.md` section 6.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -54,6 +54,10 @@ pub enum FetchError {
     /// not the primary deadline.
     #[error("fetch exceeded the total timeout")]
     Timeout,
+    /// `url`'s host (or port) does not match `pinned.host`/`pinned.port`. Fails closed before any
+    /// client is built - see [`check_host_pin`].
+    #[error("pin mismatch: {0}")]
+    PinMismatch(String),
 }
 
 /// Fetch `url` once against the already-vetted `pinned` target. Connects to `pinned.ip` via a
@@ -65,6 +69,8 @@ pub async fn fetch_http_once(
     url: &str,
     limits: &FetchLimits,
 ) -> Result<HttpResult, FetchError> {
+    check_host_pin(pinned, url)?;
+
     let client = reqwest::Client::builder()
         .resolve(&pinned.host, SocketAddr::new(pinned.ip, pinned.port))
         .redirect(reqwest::redirect::Policy::none())
@@ -81,6 +87,52 @@ pub async fn fetch_http_once(
         Ok(result) => result,
         Err(_) => Err(FetchError::Timeout),
     }
+}
+
+/// Fail closed if `url`'s host (and, as secondary defense-in-depth, port) does not match
+/// `pinned.host`/`pinned.port`. `ClientBuilder::resolve` below only overrides DNS for the exact
+/// host string it is given; a caller that ever passes a `url` whose host differs from
+/// `pinned.host` would fall through to real DNS on the url's own host and connect off-pin,
+/// silently voiding the SSRF guard `guard::vet` already ran. This function is the sole HTTP
+/// egress chokepoint, so the guarantee has to hold here rather than being trusted to every caller.
+///
+/// Compares parsed [`url::Host`] values, not raw strings: `guard::vet` stores an IPv6-literal
+/// `Pinned.host` unbracketed (`Ipv6Addr::to_string()`, e.g. `::1`), while `Url::host()` returns
+/// the bracketed form parsed as `Host::Ipv6` - a raw string compare would spuriously reject every
+/// IPv6 target. `url::Host::parse` itself does not help here: it errors on an unbracketed IPv6
+/// literal (`Host::parse("::1")` -> `Err(IdnaError)`, verified directly against this workspace's
+/// vendored `url` crate) since only the bracketed form is recognized as IPv6 by that parser.
+/// Instead, `pinned.host` is reconstructed the same way `guard::vet` derived it in the first
+/// place: try `IpAddr::from_str` (which does accept bare `::1`) to recover the literal form, and
+/// fall back to `Host::Domain` for a real hostname.
+fn check_host_pin(pinned: &Pinned, url: &str) -> Result<(), FetchError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| FetchError::PinMismatch(format!("url {url:?} failed to parse: {e}")))?;
+
+    let pinned_host = match pinned.host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => url::Host::Ipv4(v4),
+        Ok(IpAddr::V6(v6)) => url::Host::Ipv6(v6),
+        Err(_) => url::Host::Domain(pinned.host.clone()),
+    };
+    let url_host = parsed.host().map(|h| h.to_owned());
+    if url_host.as_ref() != Some(&pinned_host) {
+        return Err(FetchError::PinMismatch(format!(
+            "url host {url_host:?} does not match pinned host {:?}",
+            pinned.host
+        )));
+    }
+
+    // Secondary defense-in-depth, not the load-bearing check: `resolve()` is keyed on host, not
+    // port, so a port mismatch is a wiring bug rather than an SSRF bypass - still cheap to assert.
+    let url_port = parsed.port_or_known_default();
+    if url_port != Some(pinned.port) {
+        return Err(FetchError::PinMismatch(format!(
+            "url port {url_port:?} does not match pinned port {}",
+            pinned.port
+        )));
+    }
+
+    Ok(())
 }
 
 async fn fetch_once_inner(
@@ -153,7 +205,7 @@ mod tests {
     use std::time::Instant;
 
     use axum::Router;
-    use axum::http::{StatusCode, header};
+    use axum::http::{HeaderValue, StatusCode, header};
     use axum::response::IntoResponse;
     use axum::routing::get;
 
@@ -300,6 +352,103 @@ mod tests {
     #[tokio::test]
     async fn empty_200_body_is_empty() {
         let app = Router::new().route("/", get(|| async { StatusCode::OK.into_response() }));
+        let port = spawn(app).await;
+
+        let result = fetch_http_once(
+            &pinned(port),
+            &format!("http://127.0.0.1:{port}/"),
+            &limits(1024),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, HttpResult::Empty);
+    }
+
+    #[tokio::test]
+    async fn host_mismatch_fails_closed() {
+        // The server is real and reachable at 127.0.0.1:port, but Pinned.host names a different
+        // host than the url we actually fetch - resolve() would only pin DNS for "other.example",
+        // so without the check_host_pin guard the client falls through to real DNS for
+        // "other.example" (which fails or, worse, could resolve to something reachable) rather
+        // than ever dialing the pinned target. Asserting the specific PinMismatch variant (not
+        // just "any Err") proves the guard fired, rather than the request merely failing for an
+        // unrelated reason such as a DNS lookup error on the bogus name.
+        let app = Router::new().route("/", get(|| async { "ok" }));
+        let port = spawn(app).await;
+
+        let mismatched = Pinned {
+            host: "other.example".to_string(),
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            scheme: Scheme::Http,
+        };
+
+        let result = fetch_http_once(
+            &mismatched,
+            &format!("http://127.0.0.1:{port}/"),
+            &limits(1024),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(FetchError::PinMismatch(_))),
+            "expected Err(PinMismatch(_)), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_redirect_location_is_joined_absolute() {
+        let app = Router::new().route(
+            "/start",
+            get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/next/path")]) }),
+        );
+        let port = spawn(app).await;
+
+        let result = fetch_http_once(
+            &pinned(port),
+            &format!("http://127.0.0.1:{port}/start"),
+            &limits(1024),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            HttpResult::Redirect(format!("http://127.0.0.1:{port}/next/path"))
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_with_no_location_header_is_empty() {
+        let app = Router::new().route("/", get(|| async { StatusCode::FOUND }));
+        let port = spawn(app).await;
+
+        let result = fetch_http_once(
+            &pinned(port),
+            &format!("http://127.0.0.1:{port}/"),
+            &limits(1024),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, HttpResult::Empty);
+    }
+
+    #[tokio::test]
+    async fn redirect_with_non_utf8_location_is_empty() {
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(
+                        header::LOCATION,
+                        HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+                    )],
+                )
+            }),
+        );
         let port = spawn(app).await;
 
         let result = fetch_http_once(

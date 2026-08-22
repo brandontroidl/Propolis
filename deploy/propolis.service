@@ -139,6 +139,14 @@ ReadWritePaths=/var/lib/propolis
 # grant to the parent would let a compromised propolis process reach those siblings, the exact
 # anti-pattern this file's header warns against for /var/lib/propolis's own feed.service comment).
 ReadWritePaths=/var/spool/propolis/fetched
+# Defense-in-depth over the fstab noexec,nosuid,nodev mount INSTALL.md instructs the operator to
+# add: a fetched sample is a live malware binary, and this directive makes systemd itself refuse
+# to execute anything under this path regardless of whether the mount was actually backed
+# noexec - the same "do not rely on one layer alone" reasoning as the spool's own 0640
+# never-set-+x file permissions. Requires systemd >= 244 (ExecPaths=/NoExecPaths= were added in
+# that release) - every currently-supported distro release in this project's deploy target ships
+# well past that.
+NoExecPaths=/var/spool/propolis/fetched
 
 # --- No privileged port binding ---
 # The console listener binds an unprivileged port (8080 by default, > 1024, matching

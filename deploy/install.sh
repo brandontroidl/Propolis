@@ -176,13 +176,20 @@ cat <<'EOF'
         tmpfs /var/spool/propolis/ssh      tmpfs noexec,nosuid,nodev,size=256M 0 0
         tmpfs /var/spool/propolis/adb      tmpfs noexec,nosuid,nodev,size=256M 0 0
         tmpfs /var/spool/propolis/ftp      tmpfs noexec,nosuid,nodev,size=256M 0 0
-        tmpfs /var/spool/propolis/fetched  tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/fetched  tmpfs noexec,nosuid,nodev,size=1200M 0 0
         tmpfs /var/lib/propolis/spool      tmpfs noexec,nosuid,nodev,size=256M 0 0
 
     Size each mount for the expected upload/sample volume; a dedicated backing partition works
     identically (replace the tmpfs line with the partition's device and fstype). Run `mount -a`
     after editing fstab, then confirm with `findmnt <path>` that noexec,nosuid,nodev are actually
     in effect - a directory alone is one chmod away from being wrong.
+
+    /var/spool/propolis/fetched needs its own sizing thought: its global byte budget
+    (FETCH_SPOOL_GLOBAL_BUDGET in crates/propolis/src/main.rs) is 1 GB, so its mount must be sized
+    at least that large or the OS hits ENOSPC before the daemon's own budget check reports a
+    clean error - see INSTALL.md's "malware fetcher" section for the full sizing/retention
+    tradeoff (tmpfs is RAM-backed and does not survive a reboot; use a persistent partition
+    instead if fetched samples must survive one).
 EOF
 
 # ---- 4. binaries ----

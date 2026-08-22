@@ -84,12 +84,20 @@ pub fn url_hash(url: &str) -> Vec<u8> {
 
 /// Parse `url`'s scheme, host, and dial port (defaulting `tftp`'s to 69, since - like
 /// `guard::vet` - the `url` crate only knows WHATWG "special scheme" defaults for
-/// http/https/ws/wss/ftp). Returns `None` for anything `url::Url` cannot parse or that has no
-/// host (e.g. `data:` URIs) - such a URL is simply never enqueued rather than stored with a
-/// nonsensical host/scheme.
+/// http/https/ws/wss/ftp). Returns `None` for anything `url::Url` cannot parse, that has no host
+/// (e.g. `data:` URIs), or whose scheme `RealFetcher` cannot dispatch at all
+/// (http/https/tftp are the only ones it handles) - such a URL is simply never enqueued rather
+/// than stored with a nonsensical host/scheme, or stored as a row that can only ever end up
+/// `Rejected("unsupported_scheme")` after burning a backoff cycle and budget for nothing. A real
+/// captured case: the shell sensor logs an `ftpget ftp://...` command as a
+/// `honeypot_file_download` event with the `ftp://` url verbatim - ftp is deliberately out of the
+/// fetcher's scope, so this is a filter, not a reason to add ftp support.
 pub fn parse_url_parts(url: &str) -> Option<(String, String, Option<i32>)> {
     let parsed = url::Url::parse(url).ok()?;
     let scheme = parsed.scheme().to_string();
+    if !matches!(scheme.as_str(), "http" | "https" | "tftp") {
+        return None;
+    }
     let host = parsed.host_str()?.to_string();
     let port = parsed
         .port_or_known_default()

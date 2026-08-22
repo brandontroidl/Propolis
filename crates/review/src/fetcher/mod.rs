@@ -665,6 +665,68 @@ mod orchestration_tests {
         assert_eq!(std::fs::read(&spooled).unwrap(), bytes);
     }
 
+    // Fix round 2 (minor): a scheme RealFetcher cannot dispatch (ftp - real capture: the shell
+    // sensor logs an `ftpget ftp://...` command as a honeypot_file_download event with the
+    // ftp:// url verbatim) must never get a fetch_attempt row at all - it can only ever end up
+    // Rejected("unsupported_scheme"), burning a backoff cycle and a daily-cap/per-host-bucket
+    // slot for something that will never be fetched. sync_new_events must skip it outright,
+    // while still syncing the schemes the fetcher actually handles.
+    #[tokio::test]
+    async fn sync_skips_unsupported_schemes_but_still_syncs_supported_ones() {
+        let pool = test_pool().await;
+        let ip = "203.0.113.14";
+        reset_all(&pool).await;
+
+        let ftp_url = "ftp://fetch8m.example/mal.bin".to_string();
+        let http_url = "http://fetch8n.example/mal.bin".to_string();
+        let tftp_url = "tftp://fetch8o.example/mal.bin".to_string();
+
+        append_event(
+            &pool,
+            download_event(ip, "sensor-m", &ftp_url, "2026-08-22T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        append_event(
+            &pool,
+            download_event(ip, "sensor-n", &http_url, "2026-08-22T00:00:01Z"),
+        )
+        .await
+        .unwrap();
+        append_event(
+            &pool,
+            download_event(ip, "sensor-o", &tftp_url, "2026-08-22T00:00:02Z"),
+        )
+        .await
+        .unwrap();
+
+        let candidates = store::select_candidates(&pool, 100).await.unwrap();
+        assert!(
+            !candidates.iter().any(|c| c.url == ftp_url),
+            "an unsupported scheme must never be selected"
+        );
+        assert!(
+            candidates.iter().any(|c| c.url == http_url),
+            "http must still sync as before"
+        );
+        assert!(
+            candidates.iter().any(|c| c.url == tftp_url),
+            "tftp must still sync as before"
+        );
+
+        let ftp_row_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM fetch_attempt WHERE url = $1")
+                .bind(&ftp_url)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            ftp_row_count, 0,
+            "no fetch_attempt row must ever exist for an unsupported scheme - it must never \
+             consume backoff/budget cycling toward dead"
+        );
+    }
+
     // (b) a forbidden URL -> status='rejected', reject_reason set, no spool write.
     #[tokio::test]
     async fn rejected_url_is_recorded_with_no_spool_write() {

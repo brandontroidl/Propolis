@@ -375,7 +375,7 @@ async fn record_success(
             let Some((scheme, host, port)) = store::parse_url_parts(&child_url) else {
                 continue;
             };
-            let child = store::AttemptResult {
+            let child = store::NewPendingRow {
                 url_hash: store::url_hash(&child_url),
                 url: child_url,
                 host,
@@ -384,17 +384,16 @@ async fn record_success(
                 source_ip: candidate.source_ip,
                 parent_hash: Some(candidate.url_hash.clone()),
                 depth: candidate.depth + 1,
-                status: FetchStatus::Pending,
-                reject_reason: None,
-                sha256: None,
-                bytes: None,
-                content_type: None,
-                pinned_ip: None,
-                attempts: 0,
-                next_attempt: None,
             };
-            match store::upsert_attempt(&deps.pool, &child).await {
-                Ok(()) => stats.lock().unwrap().enqueued_children += 1,
+            // `insert_pending_if_absent`, never `upsert_attempt`: a child url that already has a
+            // row - at any status - must be left completely untouched. Using an upsert here is
+            // exactly what let a script cycle (A references B, B references A) or a script that
+            // re-lists an already-`dead`/`success` url reset that row back to a fresh `pending`
+            // depth-0-relative-to-nothing state, defeating both the recursion depth cap and the
+            // terminal-after-3-attempts guarantee.
+            match store::insert_pending_if_absent(&deps.pool, &child).await {
+                Ok(true) => stats.lock().unwrap().enqueued_children += 1,
+                Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(error = %e, "fetcher: failed to enqueue a recursion child url")
                 }
@@ -979,6 +978,305 @@ mod orchestration_tests {
             stage3_status, "success",
             "the depth-2 row itself still succeeds; only its children are capped"
         );
+    }
+
+    // Fix round 1, #1 (critical): a recursion child whose url_hash already has a row must never
+    // reset that row - regardless of its current status. A -> B -> A must settle after both
+    // succeed once, not ping-pong forever (the depth cap alone cannot stop a cycle if
+    // re-discovering an already-`success` url resets it back to `pending`/depth 0).
+    #[tokio::test]
+    async fn recursion_cycle_a_to_b_to_a_terminates_without_perpetual_repending() {
+        let pool = test_pool().await;
+        let host = "fetch8i.example";
+        reset_all(&pool).await;
+
+        let url_a = format!("http://{host}/a.sh");
+        let url_b = format!("http://{host}/b.sh");
+
+        store::upsert_attempt(
+            &pool,
+            &store::AttemptResult {
+                url_hash: store::url_hash(&url_a),
+                url: url_a.clone(),
+                host: host.to_string(),
+                scheme: "http".into(),
+                port: Some(80),
+                source_ip: None,
+                parent_hash: None,
+                depth: 0,
+                status: FetchStatus::Pending,
+                reject_reason: None,
+                sha256: None,
+                bytes: None,
+                content_type: None,
+                pinned_ip: None,
+                attempts: 0,
+                next_attempt: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let spool_dir = TempDir::new().unwrap();
+        let deps = test_deps(pool.clone(), &spool_dir, 100);
+        let script_a = format!("#!/bin/sh\nwget {url_b}\n").into_bytes();
+        let script_b = format!("#!/bin/sh\nwget {url_a}\n").into_bytes();
+        let fetcher = MockFetcher::new()
+            .on(
+                &url_a,
+                RawOutcome::Captured {
+                    bytes: script_a,
+                    content_type: None,
+                    pinned_ip: None,
+                },
+            )
+            .on(
+                &url_b,
+                RawOutcome::Captured {
+                    bytes: script_b,
+                    content_type: None,
+                    pinned_ip: None,
+                },
+            );
+
+        // Cycle 1: selects A, captures it, enqueues B fresh at depth 1.
+        let s1 = run_cycle_with(&deps, 10, &fetcher).await;
+        assert_eq!(s1.succeeded, 1);
+        assert_eq!(s1.enqueued_children, 1);
+
+        // Cycle 2: selects B, captures it, and its script re-references A - which already has a
+        // row (now `success`). That must be a no-op, not a reset back to `pending`.
+        let s2 = run_cycle_with(&deps, 10, &fetcher).await;
+        assert_eq!(s2.succeeded, 1);
+        assert_eq!(
+            s2.enqueued_children, 0,
+            "re-discovering A must not create a new row or reset the existing one"
+        );
+
+        use sqlx::Row;
+        let a_row = sqlx::query("SELECT status, depth FROM fetch_attempt WHERE url_hash = $1")
+            .bind(store::url_hash(&url_a))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let a_status: String = a_row.get("status");
+        let a_depth: i32 = a_row.get("depth");
+        assert_eq!(
+            a_status, "success",
+            "A must stay success, not reset to pending"
+        );
+        assert_eq!(
+            a_depth, 0,
+            "A's depth must never be rewritten by being re-discovered"
+        );
+
+        // Cycle 3: both A and B are `success` - nothing eligible. If the bug were still present,
+        // A would have been reset to `pending` in cycle 2 and would be selected again here,
+        // ping-ponging forever.
+        let s3 = run_cycle_with(&deps, 10, &fetcher).await;
+        assert_eq!(
+            s3.selected, 0,
+            "the cycle must have terminated, nothing left to select"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fetch_attempt WHERE host = $1")
+            .bind(host)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "must never grow past the two real urls");
+    }
+
+    // Fix round 1, #1 (critical): a script that lists an already-`dead` url as a child must not
+    // resurrect it - defeats the terminal-after-3-attempts guarantee otherwise.
+    #[tokio::test]
+    async fn recursion_never_resurrects_an_already_dead_child() {
+        let pool = test_pool().await;
+        let host = "fetch8j.example";
+        reset_all(&pool).await;
+
+        let dead_url = format!("http://{host}/dead.bin");
+        let loader_url = format!("http://{host}/loader.sh");
+
+        store::upsert_attempt(
+            &pool,
+            &store::AttemptResult {
+                url_hash: store::url_hash(&dead_url),
+                url: dead_url.clone(),
+                host: host.to_string(),
+                scheme: "http".into(),
+                port: Some(80),
+                source_ip: None,
+                parent_hash: None,
+                depth: 0,
+                status: FetchStatus::Dead,
+                reject_reason: Some("boom".into()),
+                sha256: None,
+                bytes: None,
+                content_type: None,
+                pinned_ip: None,
+                attempts: 3,
+                next_attempt: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        store::upsert_attempt(
+            &pool,
+            &store::AttemptResult {
+                url_hash: store::url_hash(&loader_url),
+                url: loader_url.clone(),
+                host: host.to_string(),
+                scheme: "http".into(),
+                port: Some(80),
+                source_ip: None,
+                parent_hash: None,
+                depth: 0,
+                status: FetchStatus::Pending,
+                reject_reason: None,
+                sha256: None,
+                bytes: None,
+                content_type: None,
+                pinned_ip: None,
+                attempts: 0,
+                next_attempt: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let spool_dir = TempDir::new().unwrap();
+        let deps = test_deps(pool.clone(), &spool_dir, 100);
+        let script = format!("#!/bin/sh\nwget {dead_url}\n").into_bytes();
+        let fetcher = MockFetcher::new().on(
+            &loader_url,
+            RawOutcome::Captured {
+                bytes: script,
+                content_type: None,
+                pinned_ip: None,
+            },
+        );
+
+        let stats = run_cycle_with(&deps, 10, &fetcher).await;
+        assert_eq!(stats.succeeded, 1);
+        assert_eq!(
+            stats.enqueued_children, 0,
+            "the already-dead url must not be re-enqueued"
+        );
+
+        use sqlx::Row;
+        let row = sqlx::query(
+            "SELECT status, attempts, reject_reason FROM fetch_attempt WHERE url_hash = $1",
+        )
+        .bind(store::url_hash(&dead_url))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let status: String = row.get("status");
+        let attempts: i32 = row.get("attempts");
+        let reason: Option<String> = row.get("reject_reason");
+        assert_eq!(status, "dead");
+        assert_eq!(attempts, 3);
+        assert_eq!(reason.as_deref(), Some("boom"));
+
+        let next = store::select_candidates(&pool, 100).await.unwrap();
+        assert!(
+            !next.iter().any(|c| c.url == dead_url),
+            "a dead row must never be reselected"
+        );
+    }
+
+    // Fix round 1, #1 (critical): a script that lists an already-`success` url as a child must
+    // not reset it back to pending - would wipe sha256/bytes/content_type/pinned_ip for a sample
+    // already safely spooled.
+    #[tokio::test]
+    async fn recursion_never_resets_an_already_successful_child() {
+        let pool = test_pool().await;
+        let host = "fetch8k.example";
+        reset_all(&pool).await;
+
+        let done_url = format!("http://{host}/done.bin");
+        let loader_url = format!("http://{host}/loader2.sh");
+        let existing_sha = vec![0xABu8; 32];
+
+        store::upsert_attempt(
+            &pool,
+            &store::AttemptResult {
+                url_hash: store::url_hash(&done_url),
+                url: done_url.clone(),
+                host: host.to_string(),
+                scheme: "http".into(),
+                port: Some(80),
+                source_ip: None,
+                parent_hash: None,
+                depth: 0,
+                status: FetchStatus::Success,
+                reject_reason: None,
+                sha256: Some(existing_sha.clone()),
+                bytes: Some(1234),
+                content_type: Some("application/octet-stream".into()),
+                pinned_ip: Some("93.184.216.34".into()),
+                attempts: 0,
+                next_attempt: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        store::upsert_attempt(
+            &pool,
+            &store::AttemptResult {
+                url_hash: store::url_hash(&loader_url),
+                url: loader_url.clone(),
+                host: host.to_string(),
+                scheme: "http".into(),
+                port: Some(80),
+                source_ip: None,
+                parent_hash: None,
+                depth: 0,
+                status: FetchStatus::Pending,
+                reject_reason: None,
+                sha256: None,
+                bytes: None,
+                content_type: None,
+                pinned_ip: None,
+                attempts: 0,
+                next_attempt: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let spool_dir = TempDir::new().unwrap();
+        let deps = test_deps(pool.clone(), &spool_dir, 100);
+        let script = format!("#!/bin/sh\nwget {done_url}\n").into_bytes();
+        let fetcher = MockFetcher::new().on(
+            &loader_url,
+            RawOutcome::Captured {
+                bytes: script,
+                content_type: None,
+                pinned_ip: None,
+            },
+        );
+
+        let stats = run_cycle_with(&deps, 10, &fetcher).await;
+        assert_eq!(stats.succeeded, 1);
+        assert_eq!(stats.enqueued_children, 0);
+
+        use sqlx::Row;
+        let row =
+            sqlx::query("SELECT status, sha256, bytes FROM fetch_attempt WHERE url_hash = $1")
+                .bind(store::url_hash(&done_url))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let status: String = row.get("status");
+        let sha256: Vec<u8> = row.get("sha256");
+        let bytes: i32 = row.get("bytes");
+        assert_eq!(status, "success");
+        assert_eq!(sha256, existing_sha);
+        assert_eq!(bytes, 1234);
     }
 
     // (f) a zero-byte body -> status='empty', no spool write, not re-fetched.

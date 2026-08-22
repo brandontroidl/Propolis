@@ -33,10 +33,26 @@ pub struct Candidate {
     pub attempts: i32,
 }
 
-/// Everything `upsert_attempt` needs to insert a brand-new row (a recursion child) or update an
-/// already-selected candidate's row after a fetch attempt - one shape serves both, since an
-/// `ON CONFLICT (url_hash) DO UPDATE` naturally covers "insert if absent, else record the new
-/// outcome."
+/// A brand-new depth-0 or recursion-child row to claim if (and only if) `url_hash` has no row
+/// yet. See [`insert_pending_if_absent`] - this is the ONLY shape that may create a new row, so
+/// it deliberately excludes every outcome field (`status`/`attempts`/`sha256`/... are always the
+/// same fixed "just discovered" values, hardcoded in the insert itself rather than left for a
+/// caller to get wrong).
+#[derive(Debug, Clone)]
+pub struct NewPendingRow {
+    pub url_hash: Vec<u8>,
+    pub url: String,
+    pub host: String,
+    pub scheme: String,
+    pub port: Option<i32>,
+    pub source_ip: Option<IpAddr>,
+    pub parent_hash: Option<Vec<u8>>,
+    pub depth: i32,
+}
+
+/// Everything `upsert_attempt` needs to record the outcome of a candidate `select_candidates`
+/// returned THIS cycle. Never used to create a brand-new row - see [`NewPendingRow`]/
+/// [`insert_pending_if_absent`] for that.
 #[derive(Debug, Clone)]
 pub struct AttemptResult {
     pub url_hash: Vec<u8>,
@@ -83,16 +99,27 @@ pub fn parse_url_parts(url: &str) -> Option<(String, String, Option<i32>)> {
 }
 
 /// Claim every not-yet-seen `honeypot_file_download` event URL into a pending depth-0 row via
-/// `upsert_attempt`. Safe to call every cycle: the `NOT EXISTS` filter below means this only
-/// ever runs against a URL with no row yet, so `upsert_attempt`'s `ON CONFLICT` branch is
-/// unreachable here - idempotent by construction, not by relying on the conflict branch to no-op.
+/// `insert_pending_if_absent`. Safe to call every cycle: a URL whose row already exists (from an
+/// earlier sync, or because a recursion child happened to enqueue the same URL first) is left
+/// completely untouched, never reset.
+///
+/// The `NOT EXISTS` pre-filter compares `TRIM()` of both sides rather than the raw strings, to
+/// match the exact equivalence class `url_hash` (`sha256(trim(url))`) partitions the table by -
+/// without this, two whitespace-variant spellings of the same URL would both pass the filter
+/// (each looking "new" against the other's untrimmed text) while colliding on the same
+/// `url_hash`, so only `insert_pending_if_absent`'s own `ON CONFLICT DO NOTHING` prevents a
+/// row-reset once the pre-filter under-dedups. Matching the filter to the real key makes that
+/// pre-filter accurate rather than merely lucky.
 async fn sync_new_events(pool: &PgPool) -> Result<(), sqlx::Error> {
     let rows = sqlx::query(
         "SELECT e.source_ip::text AS source_ip, e.metadata->>'url' AS url \
          FROM event e \
          WHERE e.signal_type = 'honeypot_file_download' \
            AND e.metadata->>'url' IS NOT NULL \
-           AND NOT EXISTS (SELECT 1 FROM fetch_attempt fa WHERE fa.url = e.metadata->>'url')",
+           AND NOT EXISTS ( \
+               SELECT 1 FROM fetch_attempt fa \
+               WHERE TRIM(fa.url) = TRIM(e.metadata->>'url') \
+           )",
     )
     .fetch_all(pool)
     .await?;
@@ -105,9 +132,9 @@ async fn sync_new_events(pool: &PgPool) -> Result<(), sqlx::Error> {
         let Some((scheme, host, port)) = parse_url_parts(&url) else {
             continue;
         };
-        upsert_attempt(
+        insert_pending_if_absent(
             pool,
-            &AttemptResult {
+            &NewPendingRow {
                 url_hash: url_hash(&url),
                 url,
                 host,
@@ -116,14 +143,6 @@ async fn sync_new_events(pool: &PgPool) -> Result<(), sqlx::Error> {
                 source_ip,
                 parent_hash: None,
                 depth: 0,
-                status: FetchStatus::Pending,
-                reject_reason: None,
-                sha256: None,
-                bytes: None,
-                content_type: None,
-                pinned_ip: None,
-                attempts: 0,
-                next_attempt: None,
             },
         )
         .await?;
@@ -170,9 +189,46 @@ pub async fn select_candidates(pool: &PgPool, batch: i64) -> Result<Vec<Candidat
         .collect())
 }
 
-/// Insert-or-update a `fetch_attempt` row by `url_hash`: a recursion child that does not exist
-/// yet is inserted; a candidate already selected this cycle is updated in place with its fetch
-/// outcome. `last_attempt` always advances to `now()` regardless of which branch fires.
+/// Claim `row.url_hash` as a fresh pending row - the ONLY way a new row is ever created, used by
+/// both `sync_new_events` (a not-yet-seen event URL) and a recursion child enqueue
+/// (`record_success` in `mod.rs`). `ON CONFLICT (url_hash) DO NOTHING`: a URL that already has a
+/// row - at ANY status, `pending` through `dead` - is left completely untouched. This is what
+/// keeps a script cycle (A's body references B, B's body references A again) from ping-ponging
+/// forever: re-discovering A as a child never resets its already-advanced status/attempts/depth
+/// back to a fresh pending row, so the second time around there is nothing left to re-fetch.
+///
+/// Returns whether a row was actually inserted, so a caller can tell a genuine new enqueue from
+/// a no-op (`record_success` uses this to keep its `enqueued_children` stat honest).
+pub async fn insert_pending_if_absent(
+    pool: &PgPool,
+    row: &NewPendingRow,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO fetch_attempt \
+         (url_hash, url, host, scheme, port, source_ip, parent_hash, depth, status, attempts, last_attempt) \
+         VALUES ($1, $2, $3, $4, $5, $6::inet, $7, $8, 'pending', 0, now()) \
+         ON CONFLICT (url_hash) DO NOTHING",
+    )
+    .bind(&row.url_hash)
+    .bind(&row.url)
+    .bind(&row.host)
+    .bind(&row.scheme)
+    .bind(row.port)
+    .bind(row.source_ip.map(|ip| ip.to_string()))
+    .bind(&row.parent_hash)
+    .bind(row.depth)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Record the outcome of a candidate `select_candidates` returned this cycle - update-only in
+/// practice, since that candidate's row already exists (this function is never used to create a
+/// new row - see [`insert_pending_if_absent`] for that). The `INSERT ... ON CONFLICT DO UPDATE`
+/// shape is kept anyway as defense in depth for a future caller, guarded by `WHERE status NOT IN
+/// ('success', 'dead')` so even a misuse against an already-terminal `url_hash` cannot regress
+/// it: a conflicting row failing that condition is left untouched (`DO NOTHING` is applied)
+/// rather than updated. `last_attempt` always advances to `now()` when the update does apply.
 pub async fn upsert_attempt(pool: &PgPool, a: &AttemptResult) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO fetch_attempt \
@@ -188,7 +244,8 @@ pub async fn upsert_attempt(pool: &PgPool, a: &AttemptResult) -> Result<(), sqlx
            pinned_ip = EXCLUDED.pinned_ip, \
            attempts = EXCLUDED.attempts, \
            next_attempt = EXCLUDED.next_attempt, \
-           last_attempt = now()",
+           last_attempt = now() \
+         WHERE fetch_attempt.status NOT IN ('success', 'dead')",
     )
     .bind(&a.url_hash)
     .bind(&a.url)

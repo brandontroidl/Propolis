@@ -6,4 +6,6 @@
 *.sh text eol=lf
 *.service text
 Cargo.lock -diff linguist-generated
-vendor/** linguist-vendored
+# Vendored crate sources are byte-exact and checksum-verified by cargo; never
+# apply line-ending normalization to them (eol=lf mangling breaks .cargo-checksum.json).
+vendor/** linguist-vendored -text

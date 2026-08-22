@@ -82,9 +82,16 @@ pub fn url_hash(url: &str) -> Vec<u8> {
     Sha256::digest(url.trim().as_bytes()).to_vec()
 }
 
-/// Parse `url`'s scheme, host, and dial port (defaulting `tftp`'s to 69, since - like
-/// `guard::vet` - the `url` crate only knows WHATWG "special scheme" defaults for
-/// http/https/ws/wss/ftp). Returns `None` for anything `url::Url` cannot parse, that has no host
+/// Parse `url`'s scheme, host, and dial port (defaulting `tftp`'s to 69 only when the url carries
+/// no port at all - like `guard::vet`, the `url` crate only knows WHATWG "special scheme"
+/// defaults for http/https/ws/wss/ftp, so a bare `tftp://host/x` falls through to this explicit
+/// fallback). An EXPLICIT port survives untouched regardless of scheme, tftp included: `Url`'s
+/// authority parser recognizes a `:PORT` suffix for any scheme with a host, not just the
+/// WHATWG-special ones, so `port_or_known_default()` (`self.port.or_else(default_port(scheme))`)
+/// already returns the literal parsed port before the `.or(Some(69))` fallback below is ever
+/// reached - the `69` default cannot silently override a differing explicit port. See
+/// `fetcher::store::tests` for a regression lock on both cases. Returns `None` for anything
+/// `url::Url` cannot parse, that has no host
 /// (e.g. `data:` URIs), or whose scheme `RealFetcher` cannot dispatch at all
 /// (http/https/tftp are the only ones it handles) - such a URL is simply never enqueued rather
 /// than stored with a nonsensical host/scheme, or stored as a row that can only ever end up
@@ -298,4 +305,35 @@ pub async fn host_count_last_hour(pool: &PgPool, host: &str) -> Result<i64, sqlx
     .bind(host)
     .fetch_one(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tftp_default_port_is_69_when_url_has_no_explicit_port() {
+        let (_, _, port) = parse_url_parts("tftp://8.8.8.8/mal").unwrap();
+        assert_eq!(port, Some(69));
+    }
+
+    // F-4 investigation: the audit-accuracy concern was that `port_or_known_default().or(Some(69))`
+    // might coerce ANY tftp url to port 69 regardless of an explicit differing port, since
+    // `vet()` rejects a non-69 explicit tftp port only at actual fetch time (after this row is
+    // already synced). Verified false: `port_or_known_default()` already resolves to the url's
+    // literal explicit port before the `.or(69)` fallback is ever reached, for tftp same as any
+    // other scheme - `Url`'s port parser is not restricted to the WHATWG-special schemes. This
+    // locks that in as a regression test; no behavior changed.
+    #[test]
+    fn tftp_explicit_port_is_recorded_as_stated_not_coerced_to_69() {
+        let (_, _, port) = parse_url_parts("tftp://8.8.8.8:6900/mal").unwrap();
+        assert_eq!(port, Some(6900));
+    }
+
+    #[test]
+    fn http_and_https_ports_are_unaffected() {
+        assert_eq!(parse_url_parts("http://x/").unwrap().2, Some(80));
+        assert_eq!(parse_url_parts("https://x/").unwrap().2, Some(443));
+        assert_eq!(parse_url_parts("http://x:8080/").unwrap().2, Some(8080));
+    }
 }

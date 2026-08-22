@@ -12,6 +12,12 @@
 /feed
 /data
 
+# Internal design, threat-model, and process docs - kept local only, never committed.
+# These describe how the honeypot detects and logs; publishing them hands an attacker
+# the blueprint. Removed from tracking after they were found on the public repo.
+/internal/
+/docs/superpowers/
+
 # OS and editor
 .DS_Store
 Thumbs.db

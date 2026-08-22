@@ -108,6 +108,10 @@ pub enum GuardReject {
     NoHost,
     ResolveFailed,
     Forbidden(EgressReject),
+    /// A `tftp://` URL named an explicit port other than 69. Spec section 7: force destination
+    /// port 69 and reject any other explicit port, so a `tftp://host:PORT/x` cannot be used to
+    /// aim arbitrary UDP traffic at some other service on the target host.
+    TftpPortForbidden,
 }
 
 /// Resolves a hostname to its address set. Abstracted so tests never touch a live resolver.
@@ -186,11 +190,22 @@ pub fn vet(
 
     // `url` only knows default ports for the WHATWG "special" schemes (http/https/ws/wss/ftp);
     // tftp isn't one, so an explicit port still comes through but a bare `tftp://host/x` needs
-    // its default (69) supplied here.
-    let port = match parsed.port_or_known_default() {
-        Some(p) => p,
-        None if scheme == Scheme::Tftp => 69,
-        None => return Err(GuardReject::BadUrl),
+    // its default (69) supplied here. tftp additionally forces the destination port to 69
+    // outright (spec section 7): an explicit non-69 port is rejected rather than honored, so a
+    // tftp:// url can never be used to aim arbitrary UDP traffic at some other service on the
+    // target host. `Url::port()` (not `port_or_known_default()`) is used for tftp specifically
+    // to distinguish "no port in the url" from "port present" - tftp has no WHATWG default, so
+    // `port_or_known_default()` would already return `None` in both cases.
+    let port = if scheme == Scheme::Tftp {
+        match parsed.port() {
+            Some(p) if p != 69 => return Err(GuardReject::TftpPortForbidden),
+            _ => 69,
+        }
+    } else {
+        match parsed.port_or_known_default() {
+            Some(p) => p,
+            None => return Err(GuardReject::BadUrl),
+        }
     };
 
     Ok(Pinned {
@@ -374,11 +389,23 @@ mod tests {
         assert_eq!(p.ip, ip("8.8.8.8"));
     }
 
+    // Fix round 1, #4 (important): spec section 7 - force destination port 69, reject any
+    // explicit non-69 port (blocks arbitrary-UDP-service abuse / amplification via a tftp:// url
+    // aimed at some other UDP service on the target host).
     #[test]
-    fn vet_tftp_explicit_port_passes_through_unchanged() {
+    fn vet_tftp_explicit_non69_port_is_rejected() {
         let own = HashSet::new();
-        let p = vet("tftp://8.8.8.8:6900/mal", &own, &PanicResolver, true).unwrap();
-        assert_eq!(p.port, 6900);
+        assert!(matches!(
+            vet("tftp://8.8.8.8:6900/mal", &own, &PanicResolver, true),
+            Err(GuardReject::TftpPortForbidden)
+        ));
+    }
+
+    #[test]
+    fn vet_tftp_explicit_port_69_is_allowed() {
+        let own = HashSet::new();
+        let p = vet("tftp://8.8.8.8:69/mal", &own, &PanicResolver, true).unwrap();
+        assert_eq!(p.port, 69);
     }
 
     struct EmptyResolver;

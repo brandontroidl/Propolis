@@ -3,6 +3,20 @@
 {% block content %}
 <h2>Captured samples <span class="dim">({{ total }})</span></h2>
 
+{% if fetch_attempts_total > 0 %}
+<div class="panel">
+  <div class="panel-head">Fetch attempts <span class="dim">({{ fetch_attempts_total }})</span></div>
+  <div class="stat-row">
+    {% for sc in status_counts %}
+    <div class="stat-card{% if sc.variant %} stat-card--{{ sc.variant }}{% endif %}">
+      <div class="label">{{ sc.label }}</div>
+      <div class="value">{{ sc.count }}</div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
 {% if samples %}
 <table class="table-compact">
   <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>VirusTotal</th><th></th></tr></thead>

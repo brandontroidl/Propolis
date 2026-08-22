@@ -2938,3 +2938,115 @@ async fn logs_stream_unauthenticated_redirects_to_login(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(response.headers().get("location").unwrap(), "/login");
 }
+
+// --- samples ---
+
+/// Inserts one minimal `fetch_attempt` row with the given `status` (a raw `FetchStatus::as_str()`
+/// value - `review::fetcher::FetchStatus`). Only the columns the table requires
+/// (`crates/review/migrations/0003_fetch_attempt.sql`: `url_hash`/`url`/`host`/`scheme`/`status`/
+/// `last_attempt`) are set; every other column keeps its schema default, matching how a real
+/// fetch cycle's own `store::insert_pending_if_absent`/`upsert_attempt` populate a row - this test
+/// only needs a distinct, unique `url_hash` per row (the table's primary key) and the `status` the
+/// samples-page status strip groups by.
+async fn seed_fetch_attempt(pool: &PgPool, n: u32, status: &str) {
+    let url = format!("http://malware-fetch-test-{n}.example.invalid/payload.bin");
+    sqlx::query(
+        "INSERT INTO fetch_attempt (url_hash, url, host, scheme, status, last_attempt) \
+         VALUES ($1, $2, $3, $4, $5, now())",
+    )
+    .bind(format!("fetch-attempt-test-hash-{n}").into_bytes())
+    .bind(&url)
+    .bind(format!("malware-fetch-test-{n}.example.invalid"))
+    .bind("http")
+    .bind(status)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Reads the count rendered directly after a given status strip label - robust to the exact
+/// indentation/whitespace the template happens to use between the `.label` and `.value` divs
+/// (unlike a hardcoded whitespace-sensitive substring), while still precisely pairing each label
+/// with ITS OWN adjacent count rather than any other stat-card's.
+fn strip_count(body: &str, label: &str) -> i64 {
+    let label_tag = format!("<div class=\"label\">{label}</div>");
+    let after_label = body
+        .find(&label_tag)
+        .map(|pos| &body[pos + label_tag.len()..])
+        .unwrap_or_else(|| panic!("status-strip label {label:?} missing: {body}"));
+    let value_tag = "<div class=\"value\">";
+    let value_start = after_label
+        .find(value_tag)
+        .unwrap_or_else(|| panic!("no value div after label {label:?}: {body}"))
+        + value_tag.len();
+    let value_end = after_label[value_start..]
+        .find("</div>")
+        .unwrap_or_else(|| panic!("unclosed value div after label {label:?}: {body}"));
+    after_label[value_start..value_start + value_end]
+        .parse()
+        .unwrap_or_else(|_| panic!("non-numeric value after label {label:?}: {body}"))
+}
+
+#[sqlx::test(migrations = false)]
+async fn samples_page_shows_fetch_attempt_status_counts(pool: PgPool) {
+    migrate(&pool).await;
+    seed_fetch_attempt(&pool, 1, "success").await;
+    seed_fetch_attempt(&pool, 2, "success").await;
+    seed_fetch_attempt(&pool, 3, "success").await;
+    seed_fetch_attempt(&pool, 4, "rejected").await;
+    seed_fetch_attempt(&pool, 5, "rejected").await;
+    seed_fetch_attempt(&pool, 6, "timeout").await;
+    seed_fetch_attempt(&pool, 7, "too_big").await;
+    seed_fetch_attempt(&pool, 8, "empty").await;
+    seed_fetch_attempt(&pool, 9, "dead").await;
+    seed_fetch_attempt(&pool, 10, "pending").await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/samples",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("Fetch attempts"),
+        "expected the fetch-attempt status strip panel: {body}"
+    );
+    assert_eq!(strip_count(&body, "Success"), 3);
+    assert_eq!(strip_count(&body, "Rejected"), 2);
+    assert_eq!(strip_count(&body, "Timeout"), 1);
+    assert_eq!(strip_count(&body, "Too big"), 1);
+    assert_eq!(strip_count(&body, "Empty"), 1);
+    assert_eq!(strip_count(&body, "Dead"), 1);
+    assert_eq!(strip_count(&body, "Pending"), 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn samples_page_hides_fetch_attempts_panel_when_empty(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/samples",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("Fetch attempts"),
+        "no fetch_attempt rows exist, so the status strip must not render: {body}"
+    );
+}

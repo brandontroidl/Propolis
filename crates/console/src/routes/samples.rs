@@ -29,6 +29,55 @@ struct SampleRow {
     vt_link: String,
 }
 
+#[derive(Debug, Serialize)]
+struct FetchStatusCount {
+    label: &'static str,
+    count: i64,
+    /// Appended as `stat-card--{variant}` (see `base_head.html`'s `.stat-card--*` rules); empty
+    /// means the plain, uncolored `.stat-card`.
+    variant: &'static str,
+}
+
+/// Display order + labels + color variant for each `fetch_attempt.status` value
+/// (`review::fetcher::FetchStatus::as_str()` - pending/success/dead/rejected/too_big/timeout/
+/// empty). Success first (the outcome an operator scans for), then the retryable failure classes,
+/// then the two terminal/in-progress states. Only `dead` (permanently failed after the retry cap)
+/// gets the alert color; `timeout`/`too_big` are still-retrying failures (attention); `rejected`/
+/// `empty` are expected, benign outcomes (the SSRF guard and empty-body responses are routine, not
+/// alarming) so they stay uncolored; `pending` is neutral in-progress work (info).
+const FETCH_STATUS_DISPLAY: [(&str, &str, &str); 7] = [
+    ("success", "Success", "good"),
+    ("rejected", "Rejected", ""),
+    ("timeout", "Timeout", "attention"),
+    ("too_big", "Too big", "attention"),
+    ("empty", "Empty", ""),
+    ("dead", "Dead", "alert"),
+    ("pending", "Pending", "info"),
+];
+
+/// `GROUP BY status` on `fetch_attempt` - parameterless, so there is no injection surface. Missing
+/// statuses (no attempts recorded yet, or none of that particular outcome) default to a count of
+/// 0 rather than being absent from the strip, so the operator always sees the full status set.
+async fn fetch_status_counts(pool: &sqlx::PgPool) -> Vec<FetchStatusCount> {
+    let counts: std::collections::HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
+        "SELECT status, count(*) FROM fetch_attempt GROUP BY status",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+
+    FETCH_STATUS_DISPLAY
+        .iter()
+        .map(|(key, label, variant)| FetchStatusCount {
+            label,
+            count: *counts.get(*key).unwrap_or(&0),
+            variant,
+        })
+        .collect()
+}
+
 async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let base = base_context(&state.db, state.startup_time, state.version).await;
 
@@ -69,6 +118,9 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
     samples.sort_by(|a, b| a.sha256.cmp(&b.sha256));
     let total = samples.len();
 
+    let status_counts = fetch_status_counts(&state.db).await;
+    let fetch_attempts_total: i64 = status_counts.iter().map(|c| c.count).sum();
+
     let tmpl = state.templates.get_template("samples.html")?;
     Ok(Html(tmpl.render(context! {
         active_nav => "samples",
@@ -77,6 +129,8 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         version => base.version,
         samples,
         total,
+        status_counts,
+        fetch_attempts_total,
     })?))
 }
 

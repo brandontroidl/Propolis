@@ -3210,6 +3210,7 @@ dependencies = [
  "rand 0.10.2",
  "reqwest",
  "rust_decimal",
+ "sensor-framework",
  "serde",
  "serde_json",
  "sha2 0.11.0",

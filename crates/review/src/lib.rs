@@ -6,6 +6,7 @@
 //! daemon and CLI dispatch.
 
 pub mod cli;
+pub mod fetcher;
 pub mod gatekeeper;
 pub mod queue;
 pub mod submit;

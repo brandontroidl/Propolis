@@ -381,6 +381,21 @@ in the sections above; the rest are optional overrides with sensible defaults. T
 the fetcher connects OUT to attacker-controlled infrastructure to retrieve staged payloads, so
 every bound below is validated and fails startup rather than silently disabling a guard)
 
+> **Before setting `PROPOLIS_FETCH_ENABLED=true` on any node behind NAT/DNAT (a home router, a
+> cloud instance's security-group NAT, anything where this host does not bind its own public IP
+> directly): set `PROPOLIS_FETCH_OWN_IPS` to that node's PUBLIC WAN IP(s) FIRST.**
+>
+> The fetcher's SSRF guard excludes this node's own addresses as fetch targets using `own_ips` -
+> this node's live interface addresses, unioned with `PROPOLIS_FETCH_OWN_IPS`. On a NAT'd node,
+> the public WAN IP the internet actually sees is *never bound to any local interface*, so it
+> cannot be auto-detected - `own_ips` will be non-empty (loopback, the private LAN address) and
+> the daemon will start normally, but an attacker who stages a payload URL pointing back at this
+> node's own public IP would not be excluded as a fetch target. The daemon logs a WARNING at
+> startup when this looks likely (no public address anywhere in the combined `own_ips` set), but
+> it does **not** refuse to start over it - only a completely empty `own_ips` set is fail-closed
+> (interface enumeration failed AND nothing configured). Set `PROPOLIS_FETCH_OWN_IPS` before
+> relying on this protection; do not wait for the warning.
+
 - `PROPOLIS_FETCH_ENABLED` - default `false`. Set `true` to let the daemon fetch samples the
   sensors observed being staged (e.g. a `wget`/`curl` command a shell session ran).
 - `PROPOLIS_FETCH_INTERVAL_SECS` - seconds between scan cycles. Default `10`.
@@ -405,10 +420,12 @@ every bound below is validated and fails startup rather than silently disabling 
   reasoning: identifying the fetcher would tip off whoever is watching the staging server's access
   log.
 - `PROPOLIS_FETCH_OWN_IPS` - optional comma-separated extra IP addresses unioned into the
-  fetcher's `own_ips` set alongside this node's live interface addresses (e.g. a WAN IP reachable
-  only via DNAT, which never appears on any local interface). The fetcher refuses to run any cycle
-  at all if the combined set ends up empty - fail-closed, since an empty set cannot exclude this
-  node's own addresses as a fetch target.
+  fetcher's `own_ips` set alongside this node's live interface addresses. **Set this to the
+  node's public WAN IP(s) on any NAT'd/DNAT'd deployment** - see the warning callout above; this
+  is the only way to close that gap, since the address cannot be auto-detected from inside the
+  NAT. Only a completely empty combined set (enumeration failed and this is unset) makes the
+  fetcher refuse to run at all; a non-empty set that is missing the real public address is a
+  narrower, silent gap this variable is what closes.
 
 **feed builder**
 

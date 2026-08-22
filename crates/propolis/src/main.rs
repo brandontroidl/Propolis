@@ -78,6 +78,20 @@ fn local_interface_ips() -> HashSet<IpAddr> {
     ips
 }
 
+/// True when NOT ONE address in `own_ips` is a real public address - i.e. every entry is
+/// loopback/private/link-local/reserved. On a NAT'd/DNAT'd node this is the common case: this
+/// node's own public WAN IP is never bound to any local interface, so `local_interface_ips()`
+/// alone cannot see it and `own_ips` ends up non-empty (loopback, the private LAN address) but
+/// still missing the one address that actually matters for self-targeting protection. Reuses
+/// `guard::is_forbidden_egress_target`'s own canonicalization/reserved-range logic (an empty
+/// `own` set here, since this asks "is this address itself public", not "is it in some set") so
+/// this stays in lockstep with what the SSRF guard itself treats as forbidden.
+fn own_ips_lack_a_public_address(own_ips: &HashSet<IpAddr>) -> bool {
+    own_ips
+        .iter()
+        .all(|ip| fetcher::guard::is_forbidden_egress_target(*ip, &HashSet::new()).is_some())
+}
+
 /// A per-UTC-day cap on how many fetch attempts the malware fetcher may start, mirroring
 /// `review::virustotal::DailyBudget`'s pattern - own ONE instance outside the per-cycle loop body,
 /// reset only on a day rollover, never re-initialized per cycle (that exact mistake was already
@@ -677,10 +691,13 @@ async fn main() {
             let own_ips_extra = fetch_own_ips_configured.clone();
             let user_agent = fetch_user_agent.clone();
             async move {
-                // Fail-closed: an empty own_ips set means the SSRF guard cannot exclude this
-                // node's own addresses as fetch targets, so refuse to run any cycle at all rather
-                // than run unsafe. Computed once at startup, like every other field of `deps`
-                // below - not re-checked per cycle, matching how the VT loop builds its own
+                // Fail-closed only against the DEGENERATE case: if own_ips ends up completely
+                // empty (interface enumeration failed outright and no PROPOLIS_FETCH_OWN_IPS is
+                // configured), the SSRF guard has nothing at all to exclude, so refuse to run
+                // rather than run unsafe. This does NOT mean self-targeting protection is
+                // complete otherwise - see the warning below for the gap this does not close.
+                // Computed once at startup, like every other field of `deps` below - not
+                // re-checked per cycle, matching how the VT loop builds its own
                 // `spool_dirs`/`vt_config` once outside the loop and reuses them for every call.
                 let mut own_ips: HashSet<IpAddr> = local_interface_ips();
                 own_ips.extend(own_ips_extra);
@@ -691,6 +708,23 @@ async fn main() {
                          set cannot vet a fetch against this node's own addresses"
                     );
                     return;
+                }
+
+                // Cannot auto-detect a NAT'd/DNAT'd node's public WAN IP - nothing visible on
+                // this host reveals it, so this is a best-effort operator reminder, not a
+                // guarantee. If every address in own_ips is reserved/private/link-local, this is
+                // very likely a NAT'd node whose PROPOLIS_FETCH_OWN_IPS was never set: this
+                // node's own public IP is not bound to any local interface, so a URL an attacker
+                // stages pointing back at it would NOT be excluded as a fetch target.
+                if own_ips_lack_a_public_address(&own_ips) {
+                    tracing::warn!(
+                        "fetcher: own_ips contains no public address (only loopback/private/\
+                         link-local addresses found) - if this node is behind NAT, its public WAN \
+                         IP is not on any local interface and will NOT be excluded as a fetch \
+                         target unless PROPOLIS_FETCH_OWN_IPS names it explicitly; set \
+                         PROPOLIS_FETCH_OWN_IPS to this node's public egress IP(s) before relying \
+                         on self-targeting protection - see INSTALL.md's malware fetcher section"
+                    );
                 }
 
                 let spool_dir = std::path::PathBuf::from(FETCH_SPOOL_DIR);
@@ -919,6 +953,46 @@ mod daily_fetch_budget_tests {
             budget.reserve(day2, 10),
             10,
             "must reset on the new UTC day rather than staying exhausted"
+        );
+    }
+}
+
+// Fix round 1, #2 (important): the empty-own_ips fail-closed check almost never fires in
+// practice (getifaddrs always returns loopback), and on a NAT'd node the public WAN IP is never
+// on any local interface - own_ips_lack_a_public_address is the runtime signal that closes that
+// visibility gap with a warning (never auto-detection, which is impossible from inside the NAT).
+#[cfg(test)]
+mod own_ips_public_address_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_and_private_only_is_flagged() {
+        let own_ips: HashSet<IpAddr> = [ip("127.0.0.1"), ip("10.20.30.109"), ip("::1")]
+            .into_iter()
+            .collect();
+        assert!(
+            own_ips_lack_a_public_address(&own_ips),
+            "a NAT'd node's local-interface-only own_ips must be flagged as missing a public \
+             address"
+        );
+    }
+
+    #[test]
+    fn a_single_public_address_clears_the_warning() {
+        // One real public address (e.g. from PROPOLIS_FETCH_OWN_IPS) alongside the usual
+        // loopback/private noise is enough - the node has a public address covered. 8.8.8.8 is
+        // the same canonical "definitely public" fixture `guard.rs`'s own tests use (not
+        // 203.0.113.x - RFC5737 documentation space is itself in the reserved ranges).
+        let own_ips: HashSet<IpAddr> = [ip("127.0.0.1"), ip("10.20.30.109"), ip("8.8.8.8")]
+            .into_iter()
+            .collect();
+        assert!(
+            !own_ips_lack_a_public_address(&own_ips),
+            "a real public address in own_ips must clear the warning"
         );
     }
 }

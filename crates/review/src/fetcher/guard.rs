@@ -1,6 +1,6 @@
 use core_scoring::is_reserved_ip;
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EgressReject {
@@ -82,6 +82,118 @@ pub fn is_forbidden_egress_target(ip: IpAddr, own: &HashSet<IpAddr>) -> Option<E
     None
 }
 
+/// Egress-allowed URL schemes. `Tftp` is only reachable for the initial fetch URL (never a
+/// redirect target); callers enforce that by passing `allow_tftp: false` on hop revalidation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Scheme {
+    Http,
+    Https,
+    Tftp,
+}
+
+/// A URL that has cleared `vet`: the connect path uses `ip` only, never re-resolving `host`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pinned {
+    pub host: String,
+    pub ip: IpAddr,
+    pub port: u16,
+    pub scheme: Scheme,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GuardReject {
+    BadUrl,
+    Userinfo,
+    BadScheme,
+    NoHost,
+    ResolveFailed,
+    Forbidden(EgressReject),
+}
+
+/// Resolves a hostname to its address set. Abstracted so tests never touch a live resolver.
+pub trait HostResolver {
+    fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>>;
+}
+
+/// Production resolver: the OS stub resolver via `getaddrinfo`.
+pub struct SystemResolver;
+
+impl HostResolver for SystemResolver {
+    fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+        // Port 0 is a placeholder; only the resolved address set is used.
+        (host, 0u16)
+            .to_socket_addrs()
+            .map(|addrs| addrs.map(|sa| sa.ip()).collect())
+    }
+}
+
+/// Vet + pin a fetch URL, load-bearing SSRF guard. Run identically on the initial URL and on
+/// every redirect hop (with `allow_tftp: false` on hops, since a redirect may never cross into
+/// tftp). Fail-closed at every step.
+pub fn vet(
+    url: &str,
+    own: &HashSet<IpAddr>,
+    r: &dyn HostResolver,
+    allow_tftp: bool,
+) -> Result<Pinned, GuardReject> {
+    let parsed = url::Url::parse(url).map_err(|_| GuardReject::BadUrl)?;
+
+    // `user:pass@host` defeats naive host extraction; reject outright.
+    let has_userinfo =
+        !parsed.username().is_empty() || parsed.password().is_some_and(|p| !p.is_empty());
+    if has_userinfo {
+        return Err(GuardReject::Userinfo);
+    }
+
+    let scheme = match parsed.scheme() {
+        "http" => Scheme::Http,
+        "https" => Scheme::Https,
+        "tftp" if allow_tftp => Scheme::Tftp,
+        _ => return Err(GuardReject::BadScheme),
+    };
+
+    // IDN hosts are already punycode-ASCII here; the `url` crate normalized them during parse.
+    let host = parsed.host().ok_or(GuardReject::NoHost)?;
+    let (host_str, ips): (String, Vec<IpAddr>) = match host {
+        // IP literal (including decimal/octal/hex forms the parser folded to canonical dotted
+        // form): use it directly and skip DNS so the resolver can never be consulted for it.
+        url::Host::Ipv4(v4) => (v4.to_string(), vec![IpAddr::V4(v4)]),
+        url::Host::Ipv6(v6) => (v6.to_string(), vec![IpAddr::V6(v6)]),
+        url::Host::Domain(d) => {
+            let resolved = r.resolve(d).map_err(|_| GuardReject::ResolveFailed)?;
+            (d.to_string(), resolved)
+        }
+    };
+    if ips.is_empty() {
+        return Err(GuardReject::ResolveFailed);
+    }
+
+    // A mixed public+internal resolve set is a rebinding attack: any forbidden address rejects
+    // the whole host rather than cherry-picking a surviving public one.
+    for ip in &ips {
+        if let Some(reason) = is_forbidden_egress_target(*ip, own) {
+            return Err(GuardReject::Forbidden(reason));
+        }
+    }
+    let ip = ips[0];
+
+    // `url` only knows default ports for the WHATWG "special" schemes (http/https/ws/wss/ftp);
+    // tftp isn't one, so an explicit port still comes through but a bare `tftp://host/x` needs
+    // its default (69) supplied here.
+    let port = match parsed.port_or_known_default() {
+        Some(p) => p,
+        None if scheme == Scheme::Tftp => 69,
+        None => return Err(GuardReject::BadUrl),
+    };
+
+    Ok(Pinned {
+        host: host_str,
+        ip,
+        port,
+        scheme,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +250,94 @@ mod tests {
     #[test]
     fn base_is_reserved_ip_misses_v4_mapped() {
         assert!(!core_scoring::is_reserved_ip(ip("::ffff:10.0.0.1")));
+    }
+
+    struct MockResolver(Vec<IpAddr>);
+    impl HostResolver for MockResolver {
+        fn resolve(&self, _h: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(self.0.clone())
+        }
+    }
+    fn pub_resolver() -> MockResolver {
+        MockResolver(vec!["93.184.216.34".parse().unwrap()])
+    }
+
+    #[test]
+    fn vet_rejects_bad_schemes_and_userinfo() {
+        let own = HashSet::new();
+        for bad in [
+            "file:///etc/passwd",
+            "gopher://x/",
+            "data:text/plain,x",
+            "ftp://x/",
+            "dict://x/",
+        ] {
+            assert!(matches!(
+                vet(bad, &own, &pub_resolver(), true),
+                Err(GuardReject::BadScheme)
+            ));
+        }
+        assert!(matches!(
+            vet(
+                "http://trusted.com@169.254.169.254/",
+                &own,
+                &pub_resolver(),
+                true
+            ),
+            Err(GuardReject::Userinfo)
+        ));
+    }
+    #[test]
+    fn vet_rejects_internal_and_mixed_sets() {
+        let own = HashSet::new();
+        assert!(matches!(
+            vet(
+                "http://127.0.0.1/",
+                &own,
+                &MockResolver(vec!["127.0.0.1".parse().unwrap()]),
+                true
+            ),
+            Err(GuardReject::Forbidden(_))
+        ));
+        // literal decimal/octal/hex normalize to 127.0.0.1 via the url crate
+        for enc in [
+            "http://2130706433/",
+            "http://0177.0.0.1/",
+            "http://0x7f000001/",
+        ] {
+            assert!(
+                matches!(
+                    vet(enc, &own, &pub_resolver(), true),
+                    Err(GuardReject::Forbidden(_))
+                ),
+                "enc {enc} should reject (host is a reserved literal, resolver unused)"
+            );
+        }
+        // mixed public+internal resolve -> reject the whole host
+        let mixed = MockResolver(vec![
+            "93.184.216.34".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+        ]);
+        assert!(matches!(
+            vet("http://evil.example/", &own, &mixed, true),
+            Err(GuardReject::Forbidden(_))
+        ));
+    }
+    #[test]
+    fn vet_pins_a_public_ip() {
+        let own = HashSet::new();
+        let p = vet("http://example.com/x", &own, &pub_resolver(), true).unwrap();
+        assert_eq!(p.ip, "93.184.216.34".parse::<IpAddr>().unwrap());
+        assert_eq!(p.host, "example.com");
+        assert_eq!(p.port, 80);
+        assert!(matches!(p.scheme, Scheme::Http));
+    }
+    #[test]
+    fn vet_redirect_context_forbids_tftp() {
+        let own = HashSet::new();
+        assert!(matches!(
+            vet("tftp://example.com/x", &own, &pub_resolver(), false),
+            Err(GuardReject::BadScheme)
+        ));
     }
 }

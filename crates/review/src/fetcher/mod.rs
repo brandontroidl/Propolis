@@ -1403,6 +1403,49 @@ mod orchestration_tests {
         assert_eq!(ok_attempts, 1);
     }
 
+    // Fix round 1, #2 (important): spec section 9 - selection is newest-first. Payload URLs die
+    // within minutes, so a stale-first order starves live captures behind a backlog of urls that
+    // are probably already gone.
+    #[tokio::test]
+    async fn select_candidates_orders_newest_first_under_a_backlog() {
+        let pool = test_pool().await;
+        let host = "fetch8l.example";
+        reset_all(&pool).await;
+
+        let base = Utc::now();
+        // Insert 5 rows with explicit, staggered first_seen timestamps directly via SQL (the
+        // store DAL always defaults first_seen to now() at insert time, so backdating needs a
+        // raw insert here rather than going through insert_pending_if_absent).
+        for i in 0..5i64 {
+            let url = format!("http://{host}/u{i}");
+            let first_seen = base - chrono::Duration::minutes(5 - i);
+            sqlx::query(
+                "INSERT INTO fetch_attempt \
+                 (url_hash, url, host, scheme, port, depth, status, attempts, first_seen, last_attempt) \
+                 VALUES ($1, $2, $3, 'http', 80, 0, 'pending', 0, $4, $4)",
+            )
+            .bind(store::url_hash(&url))
+            .bind(&url)
+            .bind(host)
+            .bind(first_seen)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let candidates = store::select_candidates(&pool, 3).await.unwrap();
+        let urls: Vec<String> = candidates.into_iter().map(|c| c.url).collect();
+        assert_eq!(
+            urls,
+            vec![
+                format!("http://{host}/u4"),
+                format!("http://{host}/u3"),
+                format!("http://{host}/u2"),
+            ],
+            "must select the 3 newest rows, newest first - not the oldest"
+        );
+    }
+
     fn to_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }

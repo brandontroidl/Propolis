@@ -154,6 +154,11 @@ async fn sync_new_events(pool: &PgPool) -> Result<(), sqlx::Error> {
 /// (`pending`), or a retryable failure (`rejected`/`too_big`/`timeout`/`empty`) whose
 /// `next_attempt` has elapsed. `success` and `dead` are excluded by construction - neither
 /// value appears in either branch of the `WHERE`.
+///
+/// Newest-first (`ORDER BY first_seen DESC`), per spec section 9: a payload URL a botnet is
+/// actively staging typically dies within minutes, so under a backlog larger than one cycle's
+/// `batch`, oldest-first would spend the whole batch on urls most likely already gone while a
+/// batch's worth of still-live ones waits behind them.
 pub async fn select_candidates(pool: &PgPool, batch: i64) -> Result<Vec<Candidate>, sqlx::Error> {
     sync_new_events(pool).await?;
 
@@ -164,7 +169,7 @@ pub async fn select_candidates(pool: &PgPool, batch: i64) -> Result<Vec<Candidat
          WHERE status = 'pending' \
             OR (status IN ('rejected', 'too_big', 'timeout', 'empty') \
                 AND next_attempt IS NOT NULL AND next_attempt <= now()) \
-         ORDER BY first_seen \
+         ORDER BY first_seen DESC \
          LIMIT $1",
     )
     .bind(batch)

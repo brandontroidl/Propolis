@@ -80,6 +80,17 @@
 #     PROPOLIS_FETCH_USER_AGENT (default a generic wget string - never one naming this project),
 #     PROPOLIS_FETCH_OWN_IPS (optional extra addresses unioned into the fetcher's fail-closed
 #     own_ips set, e.g. a DNAT'd WAN IP no local interface carries).
+#     Operational self-alerting (pages ntfy when the daemon itself degrades; opt-in, off by default
+#     so an upgrade of a node that predates it still starts): PROPOLIS_OPS_ENABLED (default false),
+#     PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC (both REQUIRED when enabled - fail-closed, the
+#     daemon refuses to start without them; use a topic SEPARATE from the Guardian's),
+#     PROPOLIS_OPS_NTFY_TOKEN (optional, for an access-protected topic),
+#     PROPOLIS_OPS_POLL_INTERVAL_SECS (default 30), PROPOLIS_OPS_REPAGE_COOLDOWN_SECS (default 5400),
+#     PROPOLIS_OPS_STALL_FOR_SECS (default 600), PROPOLIS_OPS_CAPACITY_FREE_PCT (default 15),
+#     PROPOLIS_OPS_FEED_STALE_MULTIPLE (default 2), PROPOLIS_OPS_VENDOR_WINDOW_SECS (default 3600),
+#     PROPOLIS_OPS_VENDOR_FAIL_PCT (default 50), PROPOLIS_OPS_VENDOR_MIN_SAMPLES (default 20),
+#     PROPOLIS_OPS_BACKLOG_MAX (default 500), PROPOLIS_OPS_BACKLOG_FOR_SECS (default 900),
+#     PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS (default 21600 - 6h).
 #   - /var/log/propolis/{catchall,ssh}, owned by their respective sensor users (unchanged from
 #     deploy/sensor-catchall.service / deploy/sensor-ssh.service).
 #   - /var/lib/propolis/{cursors,feed,spool}, owned by propolis.

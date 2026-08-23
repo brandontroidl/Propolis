@@ -459,6 +459,39 @@ every bound below is validated and fails startup rather than silently disabling 
 - `PROPOLIS_CONSOLE_PASSWORD`
 - `PROPOLIS_CONSOLE_SESSION_SECRET`
 
+**operational self-alerting** (opt-in; pages the operator via ntfy when the daemon itself degrades -
+distinct from the Guardian, which watches for host compromise. Off by default so a node that predates
+it keeps starting; the daemon logs `operational self-alerting disabled` when off. Once enabled,
+`PROPOLIS_OPS_NTFY_URL` and `PROPOLIS_OPS_NTFY_TOPIC` are REQUIRED and the daemon refuses to start
+without them - a monitor that cannot page must not run silently.)
+
+- `PROPOLIS_OPS_ENABLED` - default `false`. Set `true` to run the ops-monitor.
+- `PROPOLIS_OPS_NTFY_URL` - ntfy base URL (required when enabled). Use a topic SEPARATE from the
+  Guardian's so host-compromise and daemon-degradation pages stay distinguishable.
+- `PROPOLIS_OPS_NTFY_TOPIC` - ntfy topic (required when enabled).
+- `PROPOLIS_OPS_NTFY_TOKEN` - optional bearer token for a protected ntfy topic.
+- `PROPOLIS_OPS_POLL_INTERVAL_SECS` - seconds between evaluation passes. Default `30`.
+- `PROPOLIS_OPS_REPAGE_COOLDOWN_SECS` - re-page interval while a condition stays firing. Default
+  `5400` (90 minutes).
+- `PROPOLIS_OPS_STALL_FOR_SECS` - intake-stalled threshold: a sensor with input pending but no
+  progress for this long pages. Default `600`.
+- `PROPOLIS_OPS_CAPACITY_FREE_PCT` - low-disk threshold on the data and spool volumes, a percentage
+  in `1..=100`. Default `15`.
+- `PROPOLIS_OPS_FEED_STALE_MULTIPLE` - the blocklist feed pages when it has not re-published in this
+  many build cycles. Default `2`.
+- `PROPOLIS_OPS_VENDOR_WINDOW_SECS` - window over which a vendor's submission failure rate is
+  measured. Default `3600`.
+- `PROPOLIS_OPS_VENDOR_FAIL_PCT` - vendor failure-rate threshold (percentage, `1..=100`). Default
+  `50`.
+- `PROPOLIS_OPS_VENDOR_MIN_SAMPLES` - minimum submissions in the window before the vendor rate can
+  fire (avoids alarming on thin data). Default `20`.
+- `PROPOLIS_OPS_BACKLOG_MAX` - fetcher pending-queue size above which the backlog condition arms.
+  Default `500`.
+- `PROPOLIS_OPS_BACKLOG_FOR_SECS` - the backlog pages only if it is also higher than it was this
+  long ago (a draining backlog stays quiet). Default `900`.
+- `PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS` - how often the event-ledger hash chain is re-verified;
+  a verification failure pages Critical immediately. Default `21600` (6 hours).
+
 **ssh sensor**
 
 - `PROPOLIS_SSH_BANNER`

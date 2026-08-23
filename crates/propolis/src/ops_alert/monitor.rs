@@ -30,7 +30,7 @@ struct Tracked {
 async fn deliver<P: Poster>(dispatcher: &Dispatcher<P>, alert: OpsAlert, now: Instant) {
     let key = alert.key.clone();
     if let Err(e) = dispatcher.dispatch(alert, now).await {
-        tracing::error!(key = %key, error = ?e, "ops-alert: delivery failed");
+        tracing::error!(key = %key, error = %e, "ops-alert: delivery failed");
     }
 }
 
@@ -362,6 +362,39 @@ mod tests {
         m.process_tick(base + Duration::from_secs(603)).await;
         assert_eq!(rec.count(), 2, "probe-stale recovered notice sent");
         assert_eq!(rec.last_priority(), "2");
+    }
+
+    #[tokio::test]
+    async fn e2e_a_gaveup_subsystem_pages_critical_then_repages_then_recovers() {
+        use crate::ops_alert::condition::SubsysState;
+        use crate::ops_alert::conditions::subsystem::SubsystemGaveUp;
+
+        let rec = Recorder::new();
+        let ctx = test_ctx();
+        // A clone of the shared handle so the test can flip subsystem state after ctx moves in.
+        let handle = ctx.supervisor.clone();
+        handle.lock().unwrap().insert("feed", SubsysState::GaveUp);
+
+        // The real condition, real debounce, real dispatcher - only the HTTP poster is recorded.
+        let mut m = Monitor::new(vec![Box::new(SubsystemGaveUp)], ctx, dispatcher(&rec));
+        let base = Instant::now();
+
+        m.process_tick(base).await;
+        assert_eq!(rec.count(), 1, "a gave-up subsystem pages immediately");
+        assert_eq!(rec.last_priority(), "5", "subsystem-gaveup is Critical");
+
+        m.process_tick(base + Duration::from_secs(300)).await;
+        assert_eq!(
+            rec.count(),
+            2,
+            "re-pages after the cooldown while still down"
+        );
+
+        // The subsystem recovers (a restart republishes Running).
+        handle.lock().unwrap().insert("feed", SubsysState::Running);
+        m.process_tick(base + Duration::from_secs(310)).await;
+        assert_eq!(rec.count(), 3, "one recovered notice when it comes back");
+        assert_eq!(rec.last_priority(), "2", "recovered maps to priority 2");
     }
 
     #[tokio::test]

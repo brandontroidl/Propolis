@@ -40,6 +40,11 @@ use review::vendor::{AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAda
 /// `SPOOL_GLOBAL_BUDGET` constants.
 const FETCH_SPOOL_DIR: &str = "/var/spool/propolis/fetched";
 
+/// Root of the capture spool the ops-monitor's capacity condition watches for free space. The
+/// per-sensor and fetched subdirectories all live under it, so it is the volume that fills as
+/// captured samples accumulate.
+const OPS_SPOOL_ROOT: &str = "/var/spool/propolis";
+
 /// Global byte budget for the fetched-malware spool. Matches `review::fetcher`'s own orchestration
 /// tests' convention (10 MB/file, 1 GB total) rather than the smaller 100 MB the upload-capture
 /// sensors use (`sensor-ftp`/`sensor-adb`) - this spool is a dedicated malware corpus growing over
@@ -939,6 +944,70 @@ async fn main() {
                 }
             },
         ));
+    }
+
+    // 10.5. Spawn the operational self-alerting monitor if enabled. It reads the shared supervisor
+    // and intake handles the other subsystems publish into, plus disk/DB/feed/vendor signals, and
+    // pages ntfy on degradation. It is itself supervised - a panic restarts it - but if it gives up
+    // entirely, nothing pages about the monitor being down (the who-watches-the-watcher limit,
+    // accepted in the design). Capacity watches the daemon's own always-present data directories:
+    // the cursor/data volume and the capture spool volume; a DB on a volume distinct from the data
+    // volume is Postgres's own concern (documented capacity limitation).
+    if config.ops_alert.enabled {
+        let pool_ops = pool.clone();
+        let ops_cfg = config.ops_alert.clone();
+        let ops_supervisor = supervisor_state.clone();
+        let ops_intake = intake_progress.clone();
+        let pg_data_volume = config.cursor_dir.clone();
+        let spool_dir = PathBuf::from(OPS_SPOOL_ROOT);
+        let feed_marker = ops_alert::conditions::feed::marker_path(&config.feed_output_dir);
+        let feed_build_interval = config.feed_build_interval;
+
+        handles.push(spawn_supervised(
+            "ops-monitor",
+            cancel.clone(),
+            supervisor_state.clone(),
+            move |token| {
+                let pool = pool_ops.clone();
+                let ops_cfg = ops_cfg.clone();
+                let supervisor = ops_supervisor.clone();
+                let intake_progress = ops_intake.clone();
+                let pg_data_volume = pg_data_volume.clone();
+                let spool_dir = spool_dir.clone();
+                let feed_marker_path = feed_marker.clone();
+                async move {
+                    let dispatcher = match ops_alert::dispatch::Dispatcher::new(&ops_cfg) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "ops-monitor: dispatcher build failed; not starting (fix config)"
+                            );
+                            return;
+                        }
+                    };
+                    let ctx = ops_alert::condition::MonitorCtx {
+                        pool,
+                        pg_data_volume,
+                        spool_dir,
+                        supervisor,
+                        intake_progress,
+                        feed_marker_path,
+                        feed_build_interval,
+                        cfg: ops_cfg,
+                    };
+                    ops_alert::monitor::Monitor::new(
+                        ops_alert::monitor::default_conditions(),
+                        ctx,
+                        dispatcher,
+                    )
+                    .run(token)
+                    .await;
+                }
+            },
+        ));
+    } else {
+        tracing::info!("propolis: operational self-alerting disabled");
     }
 
     // 11. Wait for shutdown signal.

@@ -58,6 +58,16 @@ pub enum DispatchError {
     Undelivered(String),
 }
 
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DispatchError::Undelivered(msg) => write!(f, "alert undelivered: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
 /// The HTTP transport. The real impl posts via reqwest; tests inject a recorder.
 pub trait Poster: Send + Sync {
     fn post(&self, req: PostReq) -> impl std::future::Future<Output = Result<u16, PostErr>> + Send;

@@ -123,9 +123,7 @@ pub struct PropolisConfig {
     /// enumeration finds - e.g. a WAN IP reachable only via DNAT that never appears on any local
     /// interface. See `main.rs`'s fetcher spawn block for the fail-closed check on the combined set.
     pub fetch_own_ips: Vec<IpAddr>,
-    // Operational self-alerting. The ops-monitor reads this; it is wired into main.rs in a later
-    // task of this plan, so the binary does not read the field yet (remove the allow when wired).
-    #[allow(dead_code)]
+    // Operational self-alerting, read by the ops-monitor spawned in main.rs.
     pub ops_alert: crate::ops_alert::OpsAlertConfig,
 }
 

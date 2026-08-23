@@ -88,8 +88,9 @@ impl Condition for Capacity {
         Outcome::Firing {
             severity: Severity::Critical,
             detail: format!(
-                "low disk: pg volume {pg_free:.1}% free, spool volume {spool_free:.1}% free \
-                 (threshold {}%){db_ctx}",
+                "low disk: {} {pg_free:.1}% free, {} {spool_free:.1}% free (threshold {}%){db_ctx}",
+                ctx.pg_data_volume.display(),
+                ctx.spool_dir.display(),
                 ctx.cfg.capacity_free_pct
             ),
         }

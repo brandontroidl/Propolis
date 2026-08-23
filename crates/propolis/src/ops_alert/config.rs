@@ -8,9 +8,11 @@ use std::time::Duration;
 
 use crate::config::ConfigError;
 
-/// Every value is range-checked with a safe default; a zero or blank never disables a guard. When
-/// `enabled`, `ntfy_url` and `ntfy_topic` are REQUIRED (fail-closed: a missing target means the
-/// monitor cannot page, so it must not start silently). Thresholds are tunable operational values.
+/// Every value is range-checked with a safe default; a zero or blank never disables a guard.
+/// `enabled` defaults to false: ops-alerting is opt-in, so an existing deployment that predates it
+/// keeps starting (and logs that it is off - visible, not silent). Once the operator sets
+/// `PROPOLIS_OPS_ENABLED=true`, `ntfy_url` and `ntfy_topic` become REQUIRED (fail-closed: a monitor
+/// that cannot page must not start silently). Thresholds are tunable operational values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpsAlertConfig {
     pub enabled: bool,
@@ -112,7 +114,9 @@ fn get_pct(
 pub fn parse_ops_alert(
     get: &impl Fn(&str) -> Option<String>,
 ) -> Result<OpsAlertConfig, ConfigError> {
-    let enabled = get_bool(get, "PROPOLIS_OPS_ENABLED", true);
+    // Opt-in: default off so a deployment predating ops-alerting still starts. Fail-closed applies
+    // once the operator turns it on.
+    let enabled = get_bool(get, "PROPOLIS_OPS_ENABLED", false);
 
     // Fail-closed: when enabled, an alerting target is mandatory. A monitor that cannot page is
     // worse than a loud config error, because it looks healthy while paging nothing.
@@ -175,14 +179,26 @@ mod tests {
 
     #[test]
     fn enabled_with_a_missing_ntfy_url_fails_closed() {
-        let err =
-            parse_ops_alert(&getter(&[("PROPOLIS_OPS_NTFY_TOPIC", "propolis-ops")])).unwrap_err();
+        let err = parse_ops_alert(&getter(&[
+            ("PROPOLIS_OPS_ENABLED", "true"),
+            ("PROPOLIS_OPS_NTFY_TOPIC", "propolis-ops"),
+        ]))
+        .unwrap_err();
         assert_eq!(err, ConfigError::Missing("PROPOLIS_OPS_NTFY_URL"));
+    }
+
+    #[test]
+    fn the_default_is_opt_in_off_and_needs_no_ntfy() {
+        // A deployment that never set any PROPOLIS_OPS_* var still parses (does not fail closed),
+        // so upgrading a daemon that predates ops-alerting does not brick its startup.
+        let cfg = parse_ops_alert(&getter(&[])).unwrap();
+        assert!(!cfg.enabled);
     }
 
     #[test]
     fn enabled_with_a_full_valid_set_parses_with_documented_defaults() {
         let cfg = parse_ops_alert(&getter(&[
+            ("PROPOLIS_OPS_ENABLED", "true"),
             ("PROPOLIS_OPS_NTFY_URL", "https://ntfy.example/"),
             ("PROPOLIS_OPS_NTFY_TOPIC", "propolis-ops"),
         ]))

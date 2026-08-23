@@ -2887,6 +2887,7 @@ dependencies = [
 name = "propolis"
 version = "0.3.0"
 dependencies = [
+ "async-trait",
  "axum",
  "chrono",
  "console",

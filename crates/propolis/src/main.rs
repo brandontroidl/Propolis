@@ -8,10 +8,10 @@ mod config;
 mod ops_alert;
 mod supervisor;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sqlx::PgPool;
@@ -19,6 +19,7 @@ use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 
 use config::SensorLogConfig;
+use ops_alert::condition::SupervisorHandle;
 use supervisor::spawn_supervised;
 
 use console::AppState;
@@ -525,6 +526,10 @@ async fn main() {
     let events_rejected = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 5. Spawn intake tailers - one supervised task per sensor log.
+    // Shared supervised-state map: the supervisor writes each subsystem's state, the ops-monitor
+    // reads it (subsystem-gaveup and sensor-down conditions).
+    let supervisor_state: SupervisorHandle = Arc::new(Mutex::new(HashMap::new()));
+
     for sensor in config.sensor_logs {
         let pool = pool.clone();
         let cursor_dir = config.cursor_dir.clone();
@@ -537,6 +542,7 @@ async fn main() {
         handles.push(spawn_supervised(
             sensor_name,
             cancel.clone(),
+            supervisor_state.clone(),
             move |token| {
                 let sensor = sensor.clone();
                 let pool = pool.clone();
@@ -558,27 +564,32 @@ async fn main() {
         let submit_interval = config.submit_poll_interval;
         let vendors = config.vendors.clone();
 
-        handles.push(spawn_supervised("review", cancel.clone(), move |token| {
-            let pool = pool_r.clone();
-            let vendors = vendors.clone();
-            async move {
-                let client = reqwest::Client::new();
-                let (adapters, gate_configs) = build_adapters(&vendors, client);
-                let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs);
+        handles.push(spawn_supervised(
+            "review",
+            cancel.clone(),
+            supervisor_state.clone(),
+            move |token| {
+                let pool = pool_r.clone();
+                let vendors = vendors.clone();
+                async move {
+                    let client = reqwest::Client::new();
+                    let (adapters, gate_configs) = build_adapters(&vendors, client);
+                    let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs);
 
-                let queue_token = token.child_token();
-                let submit_token = token.child_token();
+                    let queue_token = token.child_token();
+                    let submit_token = token.child_token();
 
-                let queue_handle =
-                    tokio::spawn(run_queue_scan_loop(pool, queue_interval, queue_token));
-                let submit_handle =
-                    tokio::spawn(run_submission_loop(runner, submit_interval, submit_token));
+                    let queue_handle =
+                        tokio::spawn(run_queue_scan_loop(pool, queue_interval, queue_token));
+                    let submit_handle =
+                        tokio::spawn(run_submission_loop(runner, submit_interval, submit_token));
 
-                token.cancelled().await;
-                queue_handle.abort();
-                submit_handle.abort();
-            }
-        }));
+                    token.cancelled().await;
+                    queue_handle.abort();
+                    submit_handle.abort();
+                }
+            },
+        ));
     } else {
         tracing::info!("propolis: review subsystem disabled");
     }
@@ -605,23 +616,28 @@ async fn main() {
         let output_dir = config.feed_output_dir.clone();
         let build_interval = config.feed_build_interval;
 
-        handles.push(spawn_supervised("feed", cancel.clone(), move |token| {
-            let pool = pool_f.clone();
-            let exclusions = exclusions.clone();
-            let feed_config = feed_config.clone();
-            let output_dir = output_dir.clone();
-            async move {
-                run_feed_loop(
-                    pool,
-                    exclusions,
-                    feed_config,
-                    output_dir,
-                    build_interval,
-                    token,
-                )
-                .await;
-            }
-        }));
+        handles.push(spawn_supervised(
+            "feed",
+            cancel.clone(),
+            supervisor_state.clone(),
+            move |token| {
+                let pool = pool_f.clone();
+                let exclusions = exclusions.clone();
+                let feed_config = feed_config.clone();
+                let output_dir = output_dir.clone();
+                async move {
+                    run_feed_loop(
+                        pool,
+                        exclusions,
+                        feed_config,
+                        output_dir,
+                        build_interval,
+                        token,
+                    )
+                    .await;
+                }
+            },
+        ));
     } else {
         tracing::info!("propolis: feed subsystem disabled");
     }
@@ -637,7 +653,11 @@ async fn main() {
             daily_limit: 450,
         };
 
-        handles.push(spawn_supervised("virustotal", cancel.clone(), move |token| {
+        handles.push(spawn_supervised(
+            "virustotal",
+            cancel.clone(),
+            supervisor_state.clone(),
+            move |token| {
             let pool = pool_vt.clone();
             let vt_config = vt_config.clone();
             async move {
@@ -687,135 +707,141 @@ async fn main() {
         let fetch_read_timeout = config.fetch_read_timeout;
         let fetch_total_timeout = config.fetch_total_timeout;
 
-        handles.push(spawn_supervised("fetcher", cancel.clone(), move |token| {
-            let pool = pool_fetch.clone();
-            let own_ips_extra = fetch_own_ips_configured.clone();
-            let user_agent = fetch_user_agent.clone();
-            async move {
-                // Fail-closed only against the DEGENERATE case: if own_ips ends up completely
-                // empty (interface enumeration failed outright and no PROPOLIS_FETCH_OWN_IPS is
-                // configured), the SSRF guard has nothing at all to exclude, so refuse to run
-                // rather than run unsafe. This does NOT mean self-targeting protection is
-                // complete otherwise - see the warning below for the gap this does not close.
-                // Computed once at startup, like every other field of `deps` below - not
-                // re-checked per cycle, matching how the VT loop builds its own
-                // `spool_dirs`/`vt_config` once outside the loop and reuses them for every call.
-                let mut own_ips: HashSet<IpAddr> = local_interface_ips();
-                own_ips.extend(own_ips_extra);
-                if own_ips.is_empty() {
-                    tracing::error!(
-                        "fetcher: own_ips is empty (local interface enumeration failed and no \
+        handles.push(spawn_supervised(
+            "fetcher",
+            cancel.clone(),
+            supervisor_state.clone(),
+            move |token| {
+                let pool = pool_fetch.clone();
+                let own_ips_extra = fetch_own_ips_configured.clone();
+                let user_agent = fetch_user_agent.clone();
+                async move {
+                    // Fail-closed only against the DEGENERATE case: if own_ips ends up completely
+                    // empty (interface enumeration failed outright and no PROPOLIS_FETCH_OWN_IPS is
+                    // configured), the SSRF guard has nothing at all to exclude, so refuse to run
+                    // rather than run unsafe. This does NOT mean self-targeting protection is
+                    // complete otherwise - see the warning below for the gap this does not close.
+                    // Computed once at startup, like every other field of `deps` below - not
+                    // re-checked per cycle, matching how the VT loop builds its own
+                    // `spool_dirs`/`vt_config` once outside the loop and reuses them for every call.
+                    let mut own_ips: HashSet<IpAddr> = local_interface_ips();
+                    own_ips.extend(own_ips_extra);
+                    if own_ips.is_empty() {
+                        tracing::error!(
+                            "fetcher: own_ips is empty (local interface enumeration failed and no \
                          PROPOLIS_FETCH_OWN_IPS configured); refusing to run - an empty own_ips \
                          set cannot vet a fetch against this node's own addresses"
-                    );
-                    return;
-                }
+                        );
+                        return;
+                    }
 
-                // Cannot auto-detect a NAT'd/DNAT'd node's public WAN IP - nothing visible on
-                // this host reveals it, so this is a best-effort operator reminder, not a
-                // guarantee. If every address in own_ips is reserved/private/link-local, this is
-                // very likely a NAT'd node whose PROPOLIS_FETCH_OWN_IPS was never set: this
-                // node's own public IP is not bound to any local interface, so a URL an attacker
-                // stages pointing back at it would NOT be excluded as a fetch target.
-                if own_ips_lack_a_public_address(&own_ips) {
-                    tracing::warn!(
-                        "fetcher: own_ips contains no public address (only loopback/private/\
+                    // Cannot auto-detect a NAT'd/DNAT'd node's public WAN IP - nothing visible on
+                    // this host reveals it, so this is a best-effort operator reminder, not a
+                    // guarantee. If every address in own_ips is reserved/private/link-local, this is
+                    // very likely a NAT'd node whose PROPOLIS_FETCH_OWN_IPS was never set: this
+                    // node's own public IP is not bound to any local interface, so a URL an attacker
+                    // stages pointing back at it would NOT be excluded as a fetch target.
+                    if own_ips_lack_a_public_address(&own_ips) {
+                        tracing::warn!(
+                            "fetcher: own_ips contains no public address (only loopback/private/\
                          link-local addresses found) - if this node is behind NAT, its public WAN \
                          IP is not on any local interface and will NOT be excluded as a fetch \
                          target unless PROPOLIS_FETCH_OWN_IPS names it explicitly; set \
                          PROPOLIS_FETCH_OWN_IPS to this node's public egress IP(s) before relying \
                          on self-targeting protection - see INSTALL.md's malware fetcher section"
-                    );
-                }
-
-                let spool_dir = std::path::PathBuf::from(FETCH_SPOOL_DIR);
-                if let Err(e) = std::fs::create_dir_all(&spool_dir) {
-                    tracing::error!(
-                        error = %e,
-                        path = FETCH_SPOOL_DIR,
-                        "fetcher: failed to create spool directory, refusing to run"
-                    );
-                    return;
-                }
-
-                let deps = FetchDeps {
-                    pool,
-                    spool: sensor_framework::QuarantineSpool::new(
-                        spool_dir,
-                        fetch_max_bytes as u64,
-                        FETCH_SPOOL_GLOBAL_BUDGET,
-                    ),
-                    own_ips,
-                    limits: FetchLimits {
-                        max_bytes: fetch_max_bytes,
-                        connect_timeout: fetch_connect_timeout,
-                        read_timeout: fetch_read_timeout,
-                        total_timeout: fetch_total_timeout,
-                        user_agent,
-                    },
-                    resolver: Box::new(SystemResolver),
-                    max_hops: fetch_max_hops,
-                    max_depth: fetch_max_depth,
-                    per_host_hour: fetch_max_per_host_hour,
-                };
-
-                // One budget owned across every cycle, never re-initialized inside the loop below
-                // - see `DailyFetchBudget`'s own doc comment for why that would reintroduce the
-                // daily-cap-reset bug already fixed once for the VT scanner.
-                let mut budget =
-                    DailyFetchBudget::new(fetch_daily_cap, chrono::Utc::now().date_naive());
-
-                loop {
-                    if token.is_cancelled() {
-                        tracing::info!("fetcher: scanner stopped");
-                        return;
-                    }
-
-                    let grant = budget.reserve(chrono::Utc::now(), fetch_batch_size as u32);
-                    if grant > 0 {
-                        // Awaited to completion before the next cycle can start or the sleep
-                        // below begins: `run_cycle`'s own `select_candidates` does not claim rows
-                        // (no FOR UPDATE SKIP LOCKED), so two overlapping calls would double-fetch
-                        // and double the effective per-host cap.
-                        let stats = fetcher::run_cycle(&deps, grant as usize).await;
-
-                        // Reconcile the daily budget against ACTUAL fetch attempts, not the
-                        // requested grant: `skipped_bucket` candidates never reached the network
-                        // (the per-host-hour bucket gated them before any fetch), and an idle
-                        // honeypot selects few or zero candidates most cycles. Charging the full
-                        // grant regardless would drain `daily_cap` in `daily_cap / batch_size`
-                        // idle cycles and then sit paused for the rest of the day.
-                        let actually_fetched = stats.selected.saturating_sub(stats.skipped_bucket);
-                        budget.refund(grant.saturating_sub(actually_fetched as u32));
-
-                        if stats.selected > 0 {
-                            tracing::info!(
-                                selected = stats.selected,
-                                succeeded = stats.succeeded,
-                                rejected = stats.rejected,
-                                too_big = stats.too_big,
-                                timeout = stats.timeout,
-                                empty = stats.empty,
-                                dead = stats.dead,
-                                skipped_bucket = stats.skipped_bucket,
-                                enqueued_children = stats.enqueued_children,
-                                errors = stats.errors,
-                                "fetcher: cycle complete"
-                            );
-                        }
-                    } else {
-                        tracing::debug!(
-                            "fetcher: daily cap reached, pausing until the UTC day rolls over"
                         );
                     }
 
-                    tokio::select! {
-                        _ = tokio::time::sleep(fetch_interval) => {}
-                        _ = token.cancelled() => {}
+                    let spool_dir = std::path::PathBuf::from(FETCH_SPOOL_DIR);
+                    if let Err(e) = std::fs::create_dir_all(&spool_dir) {
+                        tracing::error!(
+                            error = %e,
+                            path = FETCH_SPOOL_DIR,
+                            "fetcher: failed to create spool directory, refusing to run"
+                        );
+                        return;
+                    }
+
+                    let deps = FetchDeps {
+                        pool,
+                        spool: sensor_framework::QuarantineSpool::new(
+                            spool_dir,
+                            fetch_max_bytes as u64,
+                            FETCH_SPOOL_GLOBAL_BUDGET,
+                        ),
+                        own_ips,
+                        limits: FetchLimits {
+                            max_bytes: fetch_max_bytes,
+                            connect_timeout: fetch_connect_timeout,
+                            read_timeout: fetch_read_timeout,
+                            total_timeout: fetch_total_timeout,
+                            user_agent,
+                        },
+                        resolver: Box::new(SystemResolver),
+                        max_hops: fetch_max_hops,
+                        max_depth: fetch_max_depth,
+                        per_host_hour: fetch_max_per_host_hour,
+                    };
+
+                    // One budget owned across every cycle, never re-initialized inside the loop below
+                    // - see `DailyFetchBudget`'s own doc comment for why that would reintroduce the
+                    // daily-cap-reset bug already fixed once for the VT scanner.
+                    let mut budget =
+                        DailyFetchBudget::new(fetch_daily_cap, chrono::Utc::now().date_naive());
+
+                    loop {
+                        if token.is_cancelled() {
+                            tracing::info!("fetcher: scanner stopped");
+                            return;
+                        }
+
+                        let grant = budget.reserve(chrono::Utc::now(), fetch_batch_size as u32);
+                        if grant > 0 {
+                            // Awaited to completion before the next cycle can start or the sleep
+                            // below begins: `run_cycle`'s own `select_candidates` does not claim rows
+                            // (no FOR UPDATE SKIP LOCKED), so two overlapping calls would double-fetch
+                            // and double the effective per-host cap.
+                            let stats = fetcher::run_cycle(&deps, grant as usize).await;
+
+                            // Reconcile the daily budget against ACTUAL fetch attempts, not the
+                            // requested grant: `skipped_bucket` candidates never reached the network
+                            // (the per-host-hour bucket gated them before any fetch), and an idle
+                            // honeypot selects few or zero candidates most cycles. Charging the full
+                            // grant regardless would drain `daily_cap` in `daily_cap / batch_size`
+                            // idle cycles and then sit paused for the rest of the day.
+                            let actually_fetched =
+                                stats.selected.saturating_sub(stats.skipped_bucket);
+                            budget.refund(grant.saturating_sub(actually_fetched as u32));
+
+                            if stats.selected > 0 {
+                                tracing::info!(
+                                    selected = stats.selected,
+                                    succeeded = stats.succeeded,
+                                    rejected = stats.rejected,
+                                    too_big = stats.too_big,
+                                    timeout = stats.timeout,
+                                    empty = stats.empty,
+                                    dead = stats.dead,
+                                    skipped_bucket = stats.skipped_bucket,
+                                    enqueued_children = stats.enqueued_children,
+                                    errors = stats.errors,
+                                    "fetcher: cycle complete"
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                "fetcher: daily cap reached, pausing until the UTC day rolls over"
+                            );
+                        }
+
+                        tokio::select! {
+                            _ = tokio::time::sleep(fetch_interval) => {}
+                            _ = token.cancelled() => {}
+                        }
                     }
                 }
-            }
-        }));
+            },
+        ));
     } else {
         tracing::info!("propolis: malware fetcher disabled");
     }
@@ -835,30 +861,35 @@ async fn main() {
         let ing = events_ingested.clone();
         let rej = events_rejected.clone();
 
-        handles.push(spawn_supervised("console", cancel.clone(), move |token| {
-            let pool = pool_c.clone();
-            let password = password.clone();
-            let feed_dir = feed_output_dir.clone();
-            let log_buffer = log_buffer.clone();
-            let ing = ing.clone();
-            let rej = rej.clone();
-            async move {
-                run_console(
-                    ConsoleRuntime {
-                        pool,
-                        bind_addr: bind,
-                        password,
-                        session_secret,
-                        feed_output_dir: feed_dir,
-                        log_buffer,
-                        events_ingested: ing,
-                        events_rejected: rej,
-                    },
-                    token,
-                )
-                .await;
-            }
-        }));
+        handles.push(spawn_supervised(
+            "console",
+            cancel.clone(),
+            supervisor_state.clone(),
+            move |token| {
+                let pool = pool_c.clone();
+                let password = password.clone();
+                let feed_dir = feed_output_dir.clone();
+                let log_buffer = log_buffer.clone();
+                let ing = ing.clone();
+                let rej = rej.clone();
+                async move {
+                    run_console(
+                        ConsoleRuntime {
+                            pool,
+                            bind_addr: bind,
+                            password,
+                            session_secret,
+                            feed_output_dir: feed_dir,
+                            log_buffer,
+                            events_ingested: ing,
+                            events_rejected: rej,
+                        },
+                        token,
+                    )
+                    .await;
+                }
+            },
+        ));
     }
 
     // 11. Wait for shutdown signal.

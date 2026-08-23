@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::ops_alert::condition::{SubsysState, SupervisorHandle};
+
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_CONSECUTIVE_PANICS: u32 = 3;
@@ -23,9 +25,18 @@ const HEALTHY_RESET: Duration = Duration::from_secs(300);
 ///
 /// A clean return (the task's future completes without panicking) is treated as intentional
 /// shutdown - no restart.
+/// Publish `name`'s current supervised state into the shared map the ops-monitor reads.
+fn publish(state: &SupervisorHandle, name: &'static str, s: SubsysState) {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name, s);
+}
+
 pub fn spawn_supervised<F, Fut>(
     name: &'static str,
     cancel: CancellationToken,
+    state: SupervisorHandle,
     factory: F,
 ) -> JoinHandle<()>
 where
@@ -46,6 +57,7 @@ where
             let child_token = cancel.child_token();
             let started_at = Instant::now();
             let handle = tokio::spawn(factory(child_token));
+            publish(&state, name, SubsysState::Running);
 
             match handle.await {
                 // Clean return - the task chose to exit (e.g. cancellation token fired).
@@ -89,6 +101,7 @@ where
                             MAX_CONSECUTIVE_PANICS,
                             PANIC_WINDOW.as_secs()
                         );
+                        publish(&state, name, SubsysState::GaveUp);
                         return;
                     }
                     if consecutive_panics >= MAX_CONSECUTIVE_PANICS {
@@ -102,6 +115,13 @@ where
                         return;
                     }
 
+                    publish(
+                        &state,
+                        name,
+                        SubsysState::BackingOff {
+                            consecutive: consecutive_panics,
+                        },
+                    );
                     tracing::info!(
                         subsystem = name,
                         backoff_secs = backoff.as_secs(),
@@ -126,8 +146,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn new_state() -> SupervisorHandle {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     #[tokio::test]
     async fn clean_exit_does_not_restart() {
@@ -135,7 +160,7 @@ mod tests {
         let count = Arc::new(AtomicU32::new(0));
         let count_clone = count.clone();
 
-        let handle = spawn_supervised("test-clean", cancel.clone(), move |_token| {
+        let handle = spawn_supervised("test-clean", cancel.clone(), new_state(), move |_token| {
             let count = count_clone.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -152,7 +177,7 @@ mod tests {
         let count = Arc::new(AtomicU32::new(0));
         let count_clone = count.clone();
 
-        let handle = spawn_supervised("test-cancel", cancel.clone(), move |token| {
+        let handle = spawn_supervised("test-cancel", cancel.clone(), new_state(), move |token| {
             let count = count_clone.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -174,7 +199,7 @@ mod tests {
         let count = Arc::new(AtomicU32::new(0));
         let count_clone = count.clone();
 
-        let handle = spawn_supervised("test-panic", cancel.clone(), move |_token| {
+        let handle = spawn_supervised("test-panic", cancel.clone(), new_state(), move |_token| {
             let count = count_clone.clone();
             async move {
                 let n = count.fetch_add(1, Ordering::SeqCst);
@@ -201,13 +226,19 @@ mod tests {
         let count = Arc::new(AtomicU32::new(0));
         let count_clone = count.clone();
 
-        let handle = spawn_supervised("test-rapid-panic", cancel.clone(), move |_token| {
-            let count = count_clone.clone();
-            async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                panic!("rapid panic");
-            }
-        });
+        let state = new_state();
+        let handle = spawn_supervised(
+            "test-rapid-panic",
+            cancel.clone(),
+            state.clone(),
+            move |_token| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    panic!("rapid panic");
+                }
+            },
+        );
 
         // After 3 rapid panics the supervisor should give up. The backoff (1s + 2s) means
         // this takes about 3s. Allow generous timeout.
@@ -218,5 +249,10 @@ mod tests {
 
         // Exactly 3 attempts: the first, plus two restarts, then give up.
         assert_eq!(count.load(Ordering::SeqCst), 3);
+        // And the shared state records the give-up, which the ops-monitor pages on.
+        assert_eq!(
+            state.lock().unwrap().get("test-rapid-panic"),
+            Some(&SubsysState::GaveUp)
+        );
     }
 }

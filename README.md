@@ -29,8 +29,8 @@ Each attacker IP accumulates a time-decayed score from corroborated evidence:
 
 - **Confirmed-real gate**: an IP is reportable only after a completed TCP handshake proves the source address is genuine. Spoofable UDP and lone SYN traffic never manufactures a report.
 - **Cross-sensor breadth**: an IP that hits multiple WAN addresses and multiple sensor protocols weighs more than one that pokes a single port.
-- **Multi-category corroboration**: eligibility requires signals from at least two distinct categories (honeypot + IDS, honeypot + WAF, etc.), not just volume on one.
-- **6-hour half-life decay**: scores decay continuously, so a quiet attacker drops out of the feed without manual intervention.
+- **Eligibility latch**: an IP becomes feed-eligible once it is confirmed-real and has at least two recorded events. Eligibility is a sticky latch - once earned it persists (it is not re-derived from the live decaying score) until the address is explicitly delisted. (Signal category breadth is recorded and still weighs the score, but is not itself an eligibility gate.)
+- **Score decay and retention**: the score decays with a 6-hour half-life, which lowers an IP's tier and export priority over time. Feed membership, however, is decided by retention windows (24h aggressive, 48h standard), not by the live score - a quiet attacker is retained for its window rather than dropping out the moment its score falls. This is a retention feed, not a decay-out feed.
 
 ## Operator console
 

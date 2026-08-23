@@ -8,6 +8,7 @@
 // ops-monitor is spawned in main.rs - at that point a real dead-code warning means a genuine gap.
 #![allow(dead_code)]
 
+pub mod condition;
 pub mod config;
 pub mod debounce;
 pub mod dispatch;

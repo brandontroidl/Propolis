@@ -60,10 +60,16 @@ impl DebounceMachine {
                 Action::None
             }
 
-            // First firing tick: start the debounce clock, do not page yet.
+            // First firing tick: start the debounce clock. A zero `for_dur` (e.g. hash-chain
+            // verification failing) pages immediately; a positive one waits in Pending.
             (State::Clear, Signal::Firing) => {
-                self.state = State::Pending { since: now };
-                Action::None
+                if self.for_dur.is_zero() {
+                    self.state = State::Firing { last_paged: now };
+                    Action::Page
+                } else {
+                    self.state = State::Pending { since: now };
+                    Action::None
+                }
             }
 
             // Still firing during the debounce window: page once when it has held for `for_dur`.

@@ -201,11 +201,24 @@ mod tests {
 
     #[test]
     fn daemon_subsystems_are_disjoint_from_sensor_names() {
-        // The real deployed sensor names (INSTALL.md) must all classify as sensors, and every
-        // daemon subsystem must classify as not-a-sensor. Guards the name-set discriminator.
-        for daemon in DAEMON_SUBSYSTEMS {
-            assert!(!is_sensor(daemon), "{daemon} must be a daemon subsystem");
-        }
+        // The daemon set is load-bearing: these names must match the spawn_supervised call-site
+        // literals in main.rs exactly, or a gave-up subsystem is misclassified and pages at the
+        // wrong severity (Warning sensor-down vs Critical subsystem-gaveup). Pin it so an edit to
+        // either side is a conscious, reviewed change rather than silent drift. (Asserting
+        // `!is_sensor(daemon)` for names drawn FROM the set would be tautological - is_sensor is
+        // literally `!DAEMON_SUBSYSTEMS.contains` - so it would guard nothing.)
+        assert_eq!(
+            DAEMON_SUBSYSTEMS,
+            &[
+                "review",
+                "feed",
+                "virustotal",
+                "fetcher",
+                "console",
+                "ops-monitor"
+            ],
+        );
+        // The real deployed sensor names (INSTALL.md) must all classify as sensors.
         for sensor in [
             "catchall",
             "ssh",

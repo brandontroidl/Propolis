@@ -259,9 +259,15 @@ impl<P: Poster> Dispatcher<P> {
         let req = self.build_request(&alert);
         self.send_with_retry(req).await?;
 
-        // Only a SUCCESSFUL send of a non-recovered alert arms the cooldown.
-        if !alert.recovered {
-            let mut map = self.last_sent.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = self.last_sent.lock().unwrap_or_else(|p| p.into_inner());
+        if alert.recovered {
+            // A recovered notice ENDS the incident, so clear the dedup entry. Otherwise the prior
+            // (now-resolved) incident's cooldown would silently suppress the page for a genuinely
+            // NEW incident on the same key until the full cooldown elapsed - a missed page. Re-page
+            // spacing for an ONGOING incident is the debounce machine's job, not this map's.
+            map.remove(&alert.key);
+        } else {
+            // A successful send of a non-recovered alert arms the cooldown.
             Self::evict_if_full(&mut map, now);
             map.insert(alert.key, now);
         }
@@ -372,6 +378,35 @@ mod tests {
         d.dispatch(a.clone(), base).await.unwrap();
         d.dispatch(a, base + Duration::from_secs(1)).await.unwrap();
         assert_eq!(rec.count(), 2, "recovered notices are never deduped");
+    }
+
+    #[tokio::test]
+    async fn a_new_incident_after_recovery_is_not_suppressed_by_the_prior_cooldown() {
+        // Regression: a recovered notice must clear the dedup entry, or the prior incident's
+        // cooldown silently swallows the page for a genuinely new incident on the same key.
+        let rec = Recorder::new();
+        let d = dispatcher(&rec, 300);
+        let base = Instant::now();
+
+        d.dispatch(alert("capacity"), base).await.unwrap(); // incident 1 -> page
+        assert_eq!(rec.count(), 1);
+
+        let mut recovered = alert("capacity");
+        recovered.recovered = true;
+        d.dispatch(recovered, base + Duration::from_secs(50))
+            .await
+            .unwrap(); // recovered notice (clears the entry)
+        assert_eq!(rec.count(), 2);
+
+        // A fresh incident WELL within the old cooldown must still page (it is a new incident).
+        d.dispatch(alert("capacity"), base + Duration::from_secs(100))
+            .await
+            .unwrap();
+        assert_eq!(
+            rec.count(),
+            3,
+            "a new incident after recovery pages despite the prior cooldown"
+        );
     }
 
     #[tokio::test]

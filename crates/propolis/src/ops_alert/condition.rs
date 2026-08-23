@@ -25,6 +25,26 @@ pub enum SubsysState {
 /// `subsystem-gaveup` and `sensor-down` conditions read it.
 pub type SupervisorHandle = Arc<Mutex<HashMap<&'static str, SubsysState>>>;
 
+/// The daemon's own supervised subsystems, by the exact name each is spawned under in `main.rs`.
+/// Every other entry in the supervisor handle is a per-sensor intake tailer (sensor names are
+/// operator-chosen via `PROPOLIS_SENSOR_LOGS`, e.g. `ssh`, `catchall`, `cred-vnc`, so they cannot
+/// be recognised by a name prefix). The `subsystem-gaveup` condition watches these; `sensor-down`
+/// watches the complement. Keep this in sync with the `spawn_supervised` call sites; the coverage
+/// test `daemon_subsystems_are_disjoint_from_sensor_names` guards the classification.
+pub const DAEMON_SUBSYSTEMS: &[&str] = &[
+    "review",
+    "feed",
+    "virustotal",
+    "fetcher",
+    "console",
+    "ops-monitor",
+];
+
+/// True when `name` is a per-sensor intake tailer rather than a daemon subsystem.
+pub fn is_sensor(name: &str) -> bool {
+    !DAEMON_SUBSYSTEMS.contains(&name)
+}
+
 /// The monitor-clock instant the intake tailer last advanced its read offset. `None` = it has not
 /// advanced yet (startup grace). The intake runner writes it; the `intake-stalled` condition reads it.
 pub type IntakeProgress = Arc<Mutex<Option<Instant>>>;

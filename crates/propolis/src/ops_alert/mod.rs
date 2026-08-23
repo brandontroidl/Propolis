@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 pub mod condition;
+pub mod conditions;
 pub mod config;
 pub mod debounce;
 pub mod dispatch;

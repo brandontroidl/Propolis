@@ -97,6 +97,12 @@ pub struct MonitorCtx {
     pub spool_dir: PathBuf,
     pub supervisor: SupervisorHandle,
     pub intake_progress: IntakeProgress,
+    /// Sibling marker file the feed loop touches on each successful publish (its mtime is the last
+    /// publish time). See `conditions::feed`.
+    pub feed_marker_path: PathBuf,
+    /// The daemon's feed build interval, used with `cfg.feed_stale_multiple` to derive the staleness
+    /// threshold.
+    pub feed_build_interval: Duration,
     pub cfg: OpsAlertConfig,
 }
 

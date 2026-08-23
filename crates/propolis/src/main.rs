@@ -318,6 +318,11 @@ async fn run_feed_loop(
                 match Publisher::publish(&snapshot, &output_dir, &exclusions, &feed_config) {
                     Ok(()) => {
                         tracing::info!(aggressive, standard, "feed: build published");
+                        // Record the publish time for the ops-monitor's feed-stale condition. A
+                        // marker failure must not disturb a successful publish - log and continue.
+                        if let Err(e) = ops_alert::conditions::feed::touch_marker(&output_dir) {
+                            tracing::warn!(error = %e, "feed: last-published marker update failed");
+                        }
                     }
                     Err(e) => {
                         tracing::error!(

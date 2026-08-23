@@ -450,6 +450,37 @@ mod tests {
         assert_eq!(standard[0].source_ip.to_string(), "198.51.100.2");
     }
 
+    // Executable documentation-truth check for README.md "## Scoring", bullet "Score decay and
+    // retention": "Feed membership ... is decided by retention windows (24h aggressive, 48h
+    // standard), not by the live score - a quiet attacker is retained for its window rather than
+    // dropping out the moment its score falls. This is a retention feed, not a decay-out feed."
+    // `materialize` takes NO score argument at all: an entry is kept iff its last activity is within
+    // the retention window. So a quiet-but-recent attacker (whose live score would have decayed) is
+    // retained, and an entry leaves only when the window lapses - never because a score fell. If
+    // membership ever starts consulting a live/decayed score, this test's score-free premise breaks
+    // and the README claim must be revisited.
+    #[test]
+    fn readme_feed_membership_is_retention_based_not_score_based() {
+        let now = now_fixed();
+        // Quiet-but-recent: last seen 23h ago (no recent activity, a live score would have decayed
+        // over ~4 half-lives), still inside the 24h aggressive window.
+        let quiet_but_recent = candidate(1, FeedTier::Aggressive, 23, now);
+        // Same evidence, last seen 25h ago: outside the window.
+        let aged_out = candidate(2, FeedTier::Aggressive, 25, now);
+
+        let out = materialize(
+            &[quiet_but_recent, aged_out],
+            now,
+            Duration::hours(24),
+            |_| true,
+        );
+        let kept: Vec<String> = out.iter().map(|e| e.source_ip.to_string()).collect();
+
+        // Retained purely because it is within the retention window - no score consulted. The 25h
+        // one leaves only because the window lapsed, not because any score fell below a floor.
+        assert_eq!(kept, ["198.51.100.1"]);
+    }
+
     #[test]
     fn retention_windows_nest_and_ignore_tier() {
         let now = now_fixed();

@@ -5,6 +5,7 @@
 //! `spawn_supervised`, wait for shutdown signal, cancel all subsystems, await with timeout.
 
 mod config;
+mod ops_alert;
 mod supervisor;
 
 use std::collections::HashSet;

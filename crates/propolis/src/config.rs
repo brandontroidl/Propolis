@@ -123,6 +123,10 @@ pub struct PropolisConfig {
     /// enumeration finds - e.g. a WAN IP reachable only via DNAT that never appears on any local
     /// interface. See `main.rs`'s fetcher spawn block for the fail-closed check on the combined set.
     pub fetch_own_ips: Vec<IpAddr>,
+    // Operational self-alerting. The ops-monitor reads this; it is wired into main.rs in a later
+    // task of this plan, so the binary does not read the field yet (remove the allow when wired).
+    #[allow(dead_code)]
+    pub ops_alert: crate::ops_alert::OpsAlertConfig,
 }
 
 #[derive(Debug, PartialEq)]
@@ -574,6 +578,9 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         fetch_total_timeout: Duration::from_secs(fetch_total_timeout_secs),
         fetch_user_agent,
         fetch_own_ips,
+        ops_alert: crate::ops_alert::config::parse_ops_alert(&|k| {
+            std::env::var(k).ok().filter(|s| !s.is_empty())
+        })?,
     })
 }
 

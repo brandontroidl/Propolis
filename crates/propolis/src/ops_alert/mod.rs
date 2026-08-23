@@ -10,5 +10,6 @@
 
 pub mod config;
 pub mod debounce;
+pub mod dispatch;
 
 pub use config::OpsAlertConfig;

@@ -4,4 +4,5 @@
 pub mod backlog;
 pub mod capacity;
 pub mod chain;
+pub mod intake;
 pub mod subsystem;

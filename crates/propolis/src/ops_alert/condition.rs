@@ -45,9 +45,21 @@ pub fn is_sensor(name: &str) -> bool {
     !DAEMON_SUBSYSTEMS.contains(&name)
 }
 
-/// The monitor-clock instant the intake tailer last advanced its read offset. `None` = it has not
-/// advanced yet (startup grace). The intake runner writes it; the `intake-stalled` condition reads it.
-pub type IntakeProgress = Arc<Mutex<Option<Instant>>>;
+/// Per-sensor intake liveness, written by each sensor's intake loop and read by the
+/// `intake-stalled` condition. `last_advanced_at` is the monitor-clock instant that sensor last
+/// consumed input; `backlog` is whether the most recent poll left unconsumed input (a full batch,
+/// or an append error with a line in hand). A sensor is stalled when it has backlog but has not
+/// advanced for `stall_for` - the backlog flag is what distinguishes a wedged ingest pipeline from
+/// a quiet honeypot with simply nothing to read.
+#[derive(Debug, Clone, Copy)]
+pub struct SensorIntake {
+    pub last_advanced_at: Instant,
+    pub backlog: bool,
+}
+
+/// Shared per-sensor intake map, keyed by the same leaked sensor name the supervisor uses. Each
+/// sensor's loop writes only its own entry (no cross-sensor write race).
+pub type IntakeProgress = Arc<Mutex<HashMap<&'static str, SensorIntake>>>;
 
 /// One condition's result for a single evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]

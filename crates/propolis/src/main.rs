@@ -12,14 +12,15 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 
 use config::SensorLogConfig;
-use ops_alert::condition::SupervisorHandle;
+use ops_alert::condition::{IntakeProgress, SensorIntake, SupervisorHandle};
+use ops_alert::conditions::intake::progress_from_batch;
 use supervisor::spawn_supervised;
 
 use console::AppState;
@@ -162,19 +163,32 @@ const LOG_BUFFER_CAPACITY: usize = 1000;
 
 /// One intake sensor's poll loop - reads batches, appends to ledger, persists cursor, sleeps on
 /// idle. Mirrors `intake/src/main.rs`'s `run_sensor_loop`.
+#[allow(clippy::too_many_arguments)]
 async fn run_intake_sensor(
     sensor: SensorLogConfig,
+    intake_key: &'static str,
     pool: PgPool,
     cursor_dir: PathBuf,
     poll_interval: Duration,
     cancel: CancellationToken,
     ingested_counter: Arc<std::sync::atomic::AtomicU64>,
     rejected_counter: Arc<std::sync::atomic::AtomicU64>,
+    intake_progress: IntakeProgress,
 ) {
     let SensorLogConfig { name, log_path } = sensor;
     let tailer = LogTailer::new(log_path, cursor_dir);
     let mut runner = IntakeRunner::new(tailer, pool, name.clone());
     tracing::info!(sensor = %name, "intake: tailer started");
+
+    // Seed the liveness entry so a sensor that never ingests still reads as "recently alive" until
+    // its first real stall, rather than looking stalled from t=0.
+    {
+        let mut map = intake_progress.lock().unwrap_or_else(|p| p.into_inner());
+        map.entry(intake_key).or_insert(SensorIntake {
+            last_advanced_at: Instant::now(),
+            backlog: false,
+        });
+    }
 
     loop {
         if cancel.is_cancelled() {
@@ -186,6 +200,21 @@ async fn run_intake_sensor(
         }
 
         let result = runner.run_batch().await;
+
+        // Publish intake liveness for the ops-monitor's intake-stalled condition.
+        let (advanced, backlog) =
+            progress_from_batch(result.ingested, result.rejected, result.errors);
+        {
+            let mut map = intake_progress.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = map.entry(intake_key).or_insert(SensorIntake {
+                last_advanced_at: Instant::now(),
+                backlog: false,
+            });
+            if advanced {
+                entry.last_advanced_at = Instant::now();
+            }
+            entry.backlog = backlog;
+        }
 
         if result.ingested > 0 || result.rejected > 0 || result.errors > 0 {
             ingested_counter
@@ -529,6 +558,9 @@ async fn main() {
     // Shared supervised-state map: the supervisor writes each subsystem's state, the ops-monitor
     // reads it (subsystem-gaveup and sensor-down conditions).
     let supervisor_state: SupervisorHandle = Arc::new(Mutex::new(HashMap::new()));
+    // Shared per-sensor intake liveness: each sensor loop writes its own entry, the ops-monitor
+    // reads it (intake-stalled condition).
+    let intake_progress: IntakeProgress = Arc::new(Mutex::new(HashMap::new()));
 
     for sensor in config.sensor_logs {
         let pool = pool.clone();
@@ -538,6 +570,7 @@ async fn main() {
         let sensor_name: &'static str = Box::leak(sensor.name.clone().into_boxed_str());
         let ing = events_ingested.clone();
         let rej = events_rejected.clone();
+        let progress = intake_progress.clone();
 
         handles.push(spawn_supervised(
             sensor_name,
@@ -549,9 +582,20 @@ async fn main() {
                 let cursor_dir = cursor_dir.clone();
                 let ing = ing.clone();
                 let rej = rej.clone();
+                let progress = progress.clone();
                 async move {
-                    run_intake_sensor(sensor, pool, cursor_dir, poll_interval, token, ing, rej)
-                        .await;
+                    run_intake_sensor(
+                        sensor,
+                        sensor_name,
+                        pool,
+                        cursor_dir,
+                        poll_interval,
+                        token,
+                        ing,
+                        rej,
+                        progress,
+                    )
+                    .await;
                 }
             },
         ));

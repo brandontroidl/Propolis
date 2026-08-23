@@ -7,3 +7,4 @@ pub mod chain;
 pub mod feed;
 pub mod intake;
 pub mod subsystem;
+pub mod vendor;

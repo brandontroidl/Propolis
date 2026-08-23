@@ -13,5 +13,6 @@ pub mod conditions;
 pub mod config;
 pub mod debounce;
 pub mod dispatch;
+pub mod monitor;
 
 pub use config::OpsAlertConfig;

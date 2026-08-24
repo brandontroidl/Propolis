@@ -39,26 +39,43 @@ pub fn detect_key(line: &str) -> Option<u8> {
     None
 }
 
+/// How many key-less lines a session may cost before detection gives up. `detect_key` brute-forces
+/// 255 keys per line, so retrying it on every non-anchor line is a CPU amplifier: an attacker
+/// streaming ordinary commands that never happen to contain an anchor token (`uname -a`,
+/// `cat /proc/mounts`, ...) would pay the full 255-key scan for the session's whole lifetime, with
+/// no upstream byte cap on the SSH sensor to bound it. The obfuscating loaders this targets lead
+/// with an anchor-bearing probe (`enable`, `/bin/busybox <applet>`) in their first command, so a
+/// small cap catches every real case while bounding the worst case to a fixed `CAP * 255` trials per
+/// session. Design 14 ("shell-grammar-deobfuscation") mandates this cap.
+const MAX_DETECT_ATTEMPTS: u8 = 8;
+
 /// One per session. Tracks a detected single-byte XOR obfuscation key and applies it to input
 /// (decode) and output (encode/mirror).
 #[derive(Default)]
 pub struct CommandCodec {
     key: Option<u8>,
+    /// Lines on which detection ran and found no key. Once it reaches [`MAX_DETECT_ATTEMPTS`] the
+    /// codec stops attempting detection and treats the session as plaintext for good.
+    misses: u8,
 }
 
 impl CommandCodec {
     pub fn new() -> Self {
-        Self { key: None }
+        Self::default()
     }
 
-    /// Decode one input line. In Plain state, try to detect and lock a key; once locked, decode every
-    /// line with it. Returns the (possibly decoded) line and the active key.
+    /// Decode one input line. In Plain state, try to detect and lock a key (until the per-session
+    /// attempt cap is spent); once locked, decode every line with it. Returns the (possibly decoded)
+    /// line and the active key.
     pub fn decode(&mut self, line: &str) -> (String, Option<u8>) {
         if let Some(k) = self.key {
             return (
                 String::from_utf8_lossy(&xor_bytes(line, k)).into_owned(),
                 Some(k),
             );
+        }
+        if self.misses >= MAX_DETECT_ATTEMPTS {
+            return (line.to_string(), None); // detection given up: this session reads as plaintext
         }
         if let Some(k) = detect_key(line) {
             self.key = Some(k);
@@ -67,6 +84,7 @@ impl CommandCodec {
                 Some(k),
             );
         }
+        self.misses += 1;
         (line.to_string(), None)
     }
 
@@ -140,5 +158,33 @@ mod tests {
         let mut c = CommandCodec::new();
         c.decode("lghkel"); // locks 0x09
         assert_eq!(c.encode(b"enable"), b"lghkel".to_vec());
+    }
+
+    #[test]
+    fn detection_gives_up_after_the_attempt_cap_so_a_flood_cannot_spin_it() {
+        // A session that never sends an anchor token must not pay the 255-key brute force forever.
+        // After MAX_DETECT_ATTEMPTS key-less lines the codec stops detecting: a later obfuscated
+        // anchor line is left as-is rather than decoded. This bounds the worst-case CPU cost;
+        // without the cap the same obfuscated line would still lock a key and decode.
+        let mut capped = CommandCodec::new();
+        for _ in 0..MAX_DETECT_ATTEMPTS {
+            assert_eq!(capped.decode("cat /proc/mounts").1, None); // no anchor, no key
+        }
+        // Budget spent: this obfuscated `enable` is NOT decoded any more.
+        assert_eq!(capped.decode("lghkel"), ("lghkel".to_string(), None));
+
+        // Control: the identical line DOES decode when the cap has not been reached.
+        let mut fresh = CommandCodec::new();
+        assert_eq!(fresh.decode("lghkel"), ("enable".to_string(), Some(0x09)));
+    }
+
+    #[test]
+    fn a_key_less_prefix_within_the_cap_still_locks_on_a_later_anchor() {
+        // A few ordinary commands before the first obfuscated probe must not defeat detection.
+        let mut c = CommandCodec::new();
+        for _ in 0..(MAX_DETECT_ATTEMPTS - 1) {
+            assert_eq!(c.decode("uname -a").1, None);
+        }
+        assert_eq!(c.decode("lghkel"), ("enable".to_string(), Some(0x09)));
     }
 }

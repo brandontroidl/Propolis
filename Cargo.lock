@@ -1319,6 +1319,7 @@ version = "0.3.0"
 dependencies = [
  "chrono",
  "core-scoring",
+ "geoip",
  "ipnet",
  "review",
  "serde",

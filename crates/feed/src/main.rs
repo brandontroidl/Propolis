@@ -25,6 +25,8 @@ const ENV_AGGRESSIVE_TTL_HOURS: &str = "PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS";
 const ENV_STANDARD_TTL_HOURS: &str = "PROPOLIS_FEED_STANDARD_TTL_HOURS";
 const ENV_ALLOWLIST: &str = "PROPOLIS_FEED_ALLOWLIST";
 const ENV_DELIST: &str = "PROPOLIS_FEED_DELIST";
+const ENV_ASN_ALLOWLIST: &str = "PROPOLIS_FEED_ASN_ALLOWLIST";
+const ENV_GEOIP_DIR: &str = "PROPOLIS_GEOIP_DIR";
 
 // `/var/lib/propolis/feed` is this service's own dedicated writable root (granted via
 // `ReadWritePaths` in `deploy/feed.service`, never the shared `/var/lib/propolis`); `current` is
@@ -45,6 +47,8 @@ struct Config {
     standard_ttl_hours: u64,
     allowlist: Vec<IpNet>,
     delist: Vec<IpAddr>,
+    asn_allowlist: std::collections::HashSet<u32>,
+    geoip_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -58,6 +62,8 @@ enum ConfigError {
     InvalidCidr { field: &'static str, value: String },
     /// A `PROPOLIS_FEED_DELIST` entry was not a valid IP address.
     InvalidIp { field: &'static str, value: String },
+    /// A `PROPOLIS_FEED_ASN_ALLOWLIST` entry was not a valid AS number.
+    InvalidAsn { field: &'static str, value: String },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -80,6 +86,10 @@ impl std::fmt::Display for ConfigError {
             ConfigError::InvalidIp { field, value } => {
                 write!(f, "{field} entry {value:?} is not a valid IP address")
             }
+            ConfigError::InvalidAsn { field, value } => write!(
+                f,
+                "{field} entry {value:?} is not a valid AS number (a bare integer, e.g. \"8075\")"
+            ),
         }
     }
 }
@@ -143,8 +153,31 @@ fn parse_ip_list(raw: &str, field: &'static str) -> Result<Vec<IpAddr>, ConfigEr
         .collect()
 }
 
+/// Parses a comma-separated AS-number list (`PROPOLIS_FEED_ASN_ALLOWLIST`). An absent or blank-only
+/// env var yields an empty set - ASN suppression off, the safe opt-in default. Each entry is a bare
+/// AS number (`8075`), with or without a leading `AS`/`as` prefix for convenience.
+fn parse_asn_list(
+    raw: &str,
+    field: &'static str,
+) -> Result<std::collections::HashSet<u32>, ConfigError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let digits = s
+                .strip_prefix("AS")
+                .or_else(|| s.strip_prefix("as"))
+                .unwrap_or(s);
+            digits.parse::<u32>().map_err(|_| ConfigError::InvalidAsn {
+                field,
+                value: s.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Loads and validates configuration from environment variables. Fails closed: a missing
-/// `DATABASE_URL`, a zero-valued bound, or a malformed allowlist/delist entry is rejected here
+/// `DATABASE_URL`, a zero-valued bound, or a malformed allowlist/delist/ASN entry is rejected here
 /// rather than silently substituted or dropped.
 fn load_config_from_env() -> Result<Config, ConfigError> {
     let database_url = env::var(ENV_DATABASE_URL)
@@ -171,6 +204,14 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     )?;
     let allowlist = parse_cidr_list(&env::var(ENV_ALLOWLIST).unwrap_or_default(), ENV_ALLOWLIST)?;
     let delist = parse_ip_list(&env::var(ENV_DELIST).unwrap_or_default(), ENV_DELIST)?;
+    let asn_allowlist = parse_asn_list(
+        &env::var(ENV_ASN_ALLOWLIST).unwrap_or_default(),
+        ENV_ASN_ALLOWLIST,
+    )?;
+    let geoip_dir = env::var(ENV_GEOIP_DIR)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
 
     Ok(Config {
         database_url,
@@ -180,6 +221,8 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         standard_ttl_hours,
         allowlist,
         delist,
+        asn_allowlist,
+        geoip_dir,
     })
 }
 
@@ -273,7 +316,31 @@ async fn main() {
         }
     };
 
-    let exclusions = ExclusionEngine::new(config.allowlist.clone(), config.delist.clone());
+    let base_exclusions = ExclusionEngine::new(config.allowlist.clone(), config.delist.clone());
+    let exclusions = if config.asn_allowlist.is_empty() {
+        base_exclusions
+    } else {
+        // ASN suppression is configured: load the ASN database off the async worker (a synchronous
+        // file read) and layer it on. A missing dir/DB warns and leaves suppression inert (fail
+        // open - the CIDR allowlist and reserved checks are untouched), never blocks startup.
+        let geoip = match config.geoip_dir.clone() {
+            Some(dir) => tokio::task::spawn_blocking(move || geoip::GeoIp::load_asn_only(&dir))
+                .await
+                .unwrap_or_else(|_| geoip::GeoIp::disabled()),
+            None => {
+                tracing::warn!(
+                    "{ENV_ASN_ALLOWLIST} is set but {ENV_GEOIP_DIR} is not; ASN suppression is inert"
+                );
+                geoip::GeoIp::disabled()
+            }
+        };
+        if !geoip.is_enabled() {
+            tracing::warn!(
+                "{ENV_ASN_ALLOWLIST} is set but the GeoLite2-ASN database did not load; ASN suppression is inert"
+            );
+        }
+        base_exclusions.with_asn_allowlist(config.asn_allowlist.clone(), std::sync::Arc::new(geoip))
+    };
     let feed_config = FeedConfig {
         aggressive_ttl: chrono::Duration::hours(config.aggressive_ttl_hours as i64),
         standard_ttl: chrono::Duration::hours(config.standard_ttl_hours as i64),
@@ -290,6 +357,7 @@ async fn main() {
         standard_ttl_hours = config.standard_ttl_hours,
         allowlist_entries = config.allowlist.len(),
         delist_entries = config.delist.len(),
+        asn_allowlist_entries = config.asn_allowlist.len(),
         "feed: starting periodic build loop"
     );
 
@@ -367,6 +435,26 @@ mod tests {
     #[test]
     fn parse_ip_list_empty_string_yields_empty_vec() {
         assert_eq!(parse_ip_list("", "x").unwrap(), Vec::<IpAddr>::new());
+    }
+
+    #[test]
+    fn parse_asn_list_empty_yields_empty_set_the_opt_in_default() {
+        assert!(parse_asn_list("", "x").unwrap().is_empty());
+        assert!(parse_asn_list("  ", "x").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_asn_list_accepts_bare_and_as_prefixed_numbers() {
+        let set = parse_asn_list(" 8075, AS15169 ,as13335 ", "x").unwrap();
+        assert_eq!(set, [8075u32, 15169, 13335].into_iter().collect());
+    }
+
+    #[test]
+    fn parse_asn_list_rejects_a_non_numeric_entry() {
+        assert!(matches!(
+            parse_asn_list("8075,notanasn", "x"),
+            Err(ConfigError::InvalidAsn { .. })
+        ));
     }
 
     #[test]

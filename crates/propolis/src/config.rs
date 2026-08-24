@@ -98,6 +98,10 @@ pub struct PropolisConfig {
     pub feed_standard_ttl: Duration,
     pub feed_allowlist: Vec<IpNet>,
     pub feed_delist: Vec<IpAddr>,
+    /// Trusted-org ASNs whose addresses are suppressed from the feed (Phase C), keyed off the
+    /// GeoLite2-ASN database in [`Config::geoip_dir`]. Empty by default (opt-in). See
+    /// `PROPOLIS_FEED_ASN_ALLOWLIST`.
+    pub feed_asn_allowlist: std::collections::HashSet<u32>,
     /// `(label, retention)` pairs driving the `all-{label}.*` feeds. The label is both the
     /// filename suffix and the source the duration is parsed from, so the two cannot drift.
     pub feed_windows: Vec<(String, Duration)>,
@@ -263,6 +267,26 @@ fn parse_cidr_list(raw: &str) -> Result<Vec<IpNet>, ConfigError> {
                 field: "PROPOLIS_FEED_ALLOWLIST",
                 value: s.to_string(),
                 reason: "not a valid CIDR",
+            })
+        })
+        .collect()
+}
+
+/// Parse `PROPOLIS_FEED_ASN_ALLOWLIST` - a comma-separated list of AS numbers (bare, or with a
+/// leading `AS`) whose addresses are suppressed from the feed. Empty by default (opt-in).
+fn parse_asn_list(raw: &str) -> Result<std::collections::HashSet<u32>, ConfigError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let digits = s
+                .strip_prefix("AS")
+                .or_else(|| s.strip_prefix("as"))
+                .unwrap_or(s);
+            digits.parse::<u32>().map_err(|_| ConfigError::Invalid {
+                field: "PROPOLIS_FEED_ASN_ALLOWLIST",
+                value: s.to_string(),
+                reason: "not a valid AS number",
             })
         })
         .collect()
@@ -467,6 +491,8 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         DEFAULT_STANDARD_TTL_HOURS,
     )?;
     let feed_allowlist = parse_cidr_list(&env::var("PROPOLIS_FEED_ALLOWLIST").unwrap_or_default())?;
+    let feed_asn_allowlist =
+        parse_asn_list(&env::var("PROPOLIS_FEED_ASN_ALLOWLIST").unwrap_or_default())?;
     let feed_delist = parse_ip_list(
         "PROPOLIS_FEED_DELIST",
         &env::var("PROPOLIS_FEED_DELIST").unwrap_or_default(),
@@ -564,6 +590,7 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         feed_standard_ttl: Duration::from_secs(feed_standard_ttl_hours * 3600),
         feed_allowlist,
         feed_delist,
+        feed_asn_allowlist,
         feed_windows,
         console_bind,
         console_password,

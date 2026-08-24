@@ -4,6 +4,11 @@
 
 ### Added
 
+- **Trusted-org ASN suppression** - an optional `PROPOLIS_FEED_ASN_ALLOWLIST` keeps a trusted
+  organization's own infrastructure or a known scanner (by AS number) off every published feed,
+  keyed off the offline GeoLite2-ASN database. ASN ownership is not per-IP spoofable, unlike reverse
+  DNS. Empty (opt-in) by default. The GeoLite2 reader is now a shared `geoip` crate used by both the
+  console and the feed.
 - **IP detail: network profile** - a "Services probed" panel (what each address did to us, grouped
   by sensor, with per-service auth state and activity window) and a "Network profile" panel with
   egress-free operator lookup links (Shodan, GreyNoise, AbuseIPDB, VirusTotal) plus optional offline

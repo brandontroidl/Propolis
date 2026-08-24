@@ -159,6 +159,18 @@ PROPOLIS_FEED_BUILD_INTERVAL_SECS=900
 # window the builder does not apply. Set empty to publish only the two tiered feeds.
 PROPOLIS_FEED_WINDOWS=24h,7d,30d,60d,90d
 
+# Trusted-org ASN allowlist (optional): comma-separated AS numbers whose addresses are suppressed
+# from every published feed, so a trusted organization's own infrastructure or a known scanner never
+# lands on your blocklist. Keyed off the offline GeoLite2-ASN database, so this requires
+# PROPOLIS_GEOIP_DIR (below) to point at a directory containing GeoLite2-ASN.mmdb; without it the
+# allowlist is inert (logged at startup). ASN ownership is RIR-registered and not per-IP spoofable,
+# unlike reverse DNS. Empty by default (opt-in). Suppress specific corporate/scanner ASNs, NOT whole
+# clouds (AWS/Azure/GCP host attackers too). Well-known corporate ASNs to start from: Microsoft
+# AS8075, Google AS15169, Cloudflare AS13335. To also exempt research scanners (e.g. Censys, Shodan,
+# GreyNoise), look up each one's CURRENT AS number - scanner ASNs change and are not reproduced here.
+# Confirm any ASN before adding it (e.g. `whois -h whois.radb.net AS8075`, or the console's ASN column).
+# PROPOLIS_FEED_ASN_ALLOWLIST=8075,15169,13335
+
 # Console (loopback only by default)
 PROPOLIS_CONSOLE_BIND=127.0.0.1:8080
 PROPOLIS_CONSOLE_PASSWORD=<your console password>

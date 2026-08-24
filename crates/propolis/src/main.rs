@@ -666,8 +666,35 @@ async fn main() {
     // 7. Spawn feed builder if enabled.
     if config.feed_enabled {
         let pool_f = pool.clone();
-        let exclusions =
+        let base_exclusions =
             ExclusionEngine::new(config.feed_allowlist.clone(), config.feed_delist.clone());
+        let exclusions = if config.feed_asn_allowlist.is_empty() {
+            base_exclusions
+        } else {
+            // ASN suppression configured: load the ASN database off the async worker (a synchronous
+            // file read) and layer it on. A missing dir/DB warns and leaves suppression inert (fail
+            // open - the CIDR allowlist and reserved checks are untouched), never blocks startup.
+            let geoip = match config.geoip_dir.clone() {
+                Some(dir) => tokio::task::spawn_blocking(move || geoip::GeoIp::load_asn_only(&dir))
+                    .await
+                    .unwrap_or_else(|_| geoip::GeoIp::disabled()),
+                None => {
+                    tracing::warn!(
+                        "PROPOLIS_FEED_ASN_ALLOWLIST is set but PROPOLIS_GEOIP_DIR is not; ASN suppression is inert"
+                    );
+                    geoip::GeoIp::disabled()
+                }
+            };
+            if !geoip.is_enabled() {
+                tracing::warn!(
+                    "PROPOLIS_FEED_ASN_ALLOWLIST is set but the GeoLite2-ASN database did not load; ASN suppression is inert"
+                );
+            }
+            base_exclusions.with_asn_allowlist(
+                config.feed_asn_allowlist.clone(),
+                std::sync::Arc::new(geoip),
+            )
+        };
         let feed_config = FeedConfig {
             aggressive_ttl: chrono::Duration::seconds(config.feed_aggressive_ttl.as_secs() as i64),
             standard_ttl: chrono::Duration::seconds(config.feed_standard_ttl.as_secs() as i64),

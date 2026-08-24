@@ -16,7 +16,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use crate::domain::enums::{Category, is_confirmed_real};
+use crate::domain::enums::{Category, Protocol, is_confirmed_real};
 use crate::domain::types::{EventInput, IpScore};
 use crate::scoring::breadth::effective_score;
 use crate::scoring::constants::SCORE_CAP;
@@ -69,6 +69,7 @@ pub fn apply_event(
         mut breakdown,
         first_seen,
         prev_event_count,
+        prev_established_event_count,
         prev_has_confirmed_real,
         delisted,
         prev_active_days,
@@ -78,6 +79,7 @@ pub fn apply_event(
             dec!(0),
             BTreeMap::<Category, CategoryStat>::new(),
             now,
+            0i32,
             0i32,
             false,
             false,
@@ -98,6 +100,7 @@ pub fn apply_event(
                 map,
                 p.first_seen,
                 p.event_count,
+                p.established_event_count,
                 p.has_confirmed_real,
                 p.delisted,
                 p.active_days,
@@ -142,6 +145,12 @@ pub fn apply_event(
     let has_confirmed_real = prev_has_confirmed_real
         || is_confirmed_real(event.protocol, event.authenticated, event.category);
     let event_count = prev_event_count + 1;
+    // Non-spoofable count: only a completed TCP connection proves the source address is genuine (a
+    // spoofed source cannot finish the handshake). UDP/ICMP datagrams carry a forgeable sender, so
+    // they never count toward volume-based blocklisting - otherwise a spoofed flood could list an
+    // innocent third party (see `recommended_by_volume` in `derive_projection`).
+    let established_event_count =
+        prev_established_event_count + i32::from(event.protocol == Protocol::Tcp);
 
     // Steps 5-6: derive facts + assemble. Both decay_anchor and last_seen are `now`
     // (the event's observed_at) because an event WAS seen at this instant.
@@ -151,6 +160,7 @@ pub fn apply_event(
         breakdown,
         has_confirmed_real,
         event_count,
+        established_event_count,
         distinct_wan_count,
         distinct_sensor_count,
         active_days,
@@ -173,6 +183,7 @@ fn derive_projection(
     breakdown: BTreeMap<Category, CategoryStat>,
     has_confirmed_real: bool,
     event_count: i32,
+    established_event_count: i32,
     distinct_wan_count: i32,
     distinct_sensor_count: i32,
     active_days: i32,
@@ -212,11 +223,17 @@ fn derive_projection(
     let rec_vendor = recommended_for_vendor(is_eligible, feed_tier);
     // A high-volume connection flood is recommended for the blocklist on volume alone (no
     // confirmed-real latch): dedup collapses such a flood to one scored event, so the merit path
-    // never fires. Vendor reporting still gates on confirmed-real (rec_vendor above), so a bare
-    // flood is blocked locally but not reported upstream.
+    // never fires. It counts only ESTABLISHED (completed-TCP) events, never spoofable UDP/ICMP, so a
+    // spoofed datagram flood cannot volume-list an innocent third party. Vendor reporting still
+    // gates on confirmed-real (rec_vendor above), so a bare flood is blocked locally but not
+    // reported upstream.
     let seconds_since_last_seen = (decay_anchor - last_seen).num_seconds();
     let rec_blocklist = recommended_for_blocklist(is_eligible, effective)
-        || recommended_by_volume(delisted, event_count as u32, seconds_since_last_seen);
+        || recommended_by_volume(
+            delisted,
+            established_event_count as u32,
+            seconds_since_last_seen,
+        );
 
     // The map is well-formed Decimals, so serialization cannot fail.
     let category_breakdown =
@@ -228,6 +245,7 @@ fn derive_projection(
         decay_anchor,
         max_confidence,
         event_count,
+        established_event_count,
         distinct_categories,
         category_breakdown,
         has_confirmed_real,
@@ -269,6 +287,7 @@ pub(crate) fn project_to_now(
         breakdown,
         stored.has_confirmed_real,
         stored.event_count,
+        stored.established_event_count,
         stored.distinct_wan_count,
         stored.distinct_sensor_count,
         stored.active_days,
@@ -442,11 +461,57 @@ mod tests {
         )
     }
 
+    /// A TCP probe: an ESTABLISHED (completed-handshake) but non-confirmed-real event. Same shape as
+    /// `udp_probe_event_at` but over TCP, so the source address cannot be spoofed.
+    fn tcp_probe_event_at(when: DateTime<Utc>) -> EventInput {
+        EventInput::from_signal(
+            "198.51.100.9".parse().unwrap(),
+            None,
+            "sensor-a".into(),
+            SignalType::PortScan, // weight 20, conf 0.600, network, never confirmed-real
+            Protocol::Tcp,
+            false,
+            when,
+            serde_json::json!({}),
+            None,
+        )
+    }
+
     #[test]
-    fn a_high_volume_flood_is_blocklisted_on_volume_without_confirmed_real() {
-        // A connection/probe flood: many non-confirmed-real events. Dedup keeps the score near zero
-        // and the confirmed-real latch never sets, so the merit path never recommends it - but
-        // crossing the volume threshold while recently active must.
+    fn a_high_volume_tcp_flood_is_blocklisted_on_volume_without_confirmed_real() {
+        // A TCP connection flood: many non-confirmed-real but ESTABLISHED events. Dedup keeps the
+        // score near zero and the confirmed-real latch never sets, so the merit path never
+        // recommends it - but crossing the volume threshold on established (non-spoofable) events
+        // while recently active must.
+        let threshold = crate::scoring::constants::VOLUME_LIST_THRESHOLD as i64;
+        let base = ts("2026-08-21T00:00:00Z");
+        let mut acc: Option<IpScore> = None;
+        for i in 0..threshold {
+            let e = tcp_probe_event_at(base + Duration::seconds(i));
+            acc = Some(apply_event(acc, &e, HALF_LIFE, i > 0, 1, 1));
+        }
+        let s = acc.unwrap();
+        assert!(!s.has_confirmed_real, "flood must not be confirmed-real");
+        assert!(
+            s.established_event_count >= threshold as i32,
+            "TCP events count as established"
+        );
+        assert!(
+            s.recommended_for_blocklist,
+            "a recent high-volume TCP flood must be volume-listed (raw {}, established {})",
+            s.raw_score, s.established_event_count
+        );
+        // Vendor reporting still requires confirmed-real, so a bare flood is NOT reported upstream.
+        assert!(!s.recommended_for_vendor);
+    }
+
+    /// Security regression (audit): a spoofable UDP flood must NEVER be volume-listed. A UDP sender
+    /// address is forgeable, so counting it would let a spoofed flood blocklist an innocent third
+    /// party. UDP events do not count as established, so event_count crosses the threshold but
+    /// established_event_count stays 0 and the volume path never fires. Fails without the fix (the
+    /// old code counted raw event_count and WOULD list this IP).
+    #[test]
+    fn a_udp_only_flood_is_not_volume_listed_even_over_the_threshold() {
         let threshold = crate::scoring::constants::VOLUME_LIST_THRESHOLD as i64;
         let base = ts("2026-08-21T00:00:00Z");
         let mut acc: Option<IpScore> = None;
@@ -455,15 +520,18 @@ mod tests {
             acc = Some(apply_event(acc, &e, HALF_LIFE, i > 0, 1, 1));
         }
         let s = acc.unwrap();
-        assert!(!s.has_confirmed_real, "flood must not be confirmed-real");
-        assert!(s.event_count >= threshold as i32);
         assert!(
-            s.recommended_for_blocklist,
-            "a recent high-volume flood must be blocklisted on volume (raw {}, count {})",
-            s.raw_score, s.event_count
+            s.event_count >= threshold as i32,
+            "raw events are still counted"
         );
-        // Vendor reporting still requires confirmed-real, so a bare flood is NOT reported upstream.
-        assert!(!s.recommended_for_vendor);
+        assert_eq!(
+            s.established_event_count, 0,
+            "no UDP datagram counts as an established (non-spoofable) event"
+        );
+        assert!(
+            !s.recommended_for_blocklist,
+            "a spoofable UDP flood must not be volume-listed - a spoofed source would blocklist an innocent IP"
+        );
     }
 
     /// A high-confidence category whose weight decays below the 0.5 live floor

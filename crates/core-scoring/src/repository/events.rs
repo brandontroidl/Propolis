@@ -258,8 +258,8 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
          (source_ip, raw_score, decay_anchor, max_confidence, event_count, distinct_categories, \
           category_breakdown, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
           first_seen, last_seen, eligible, recommended_for_vendor, recommended_for_blocklist, tier, delisted, \
-          active_days, last_active_day) \
-         VALUES ($1::inet, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
+          active_days, last_active_day, established_event_count) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
          ON CONFLICT (source_ip) DO UPDATE SET \
            raw_score = EXCLUDED.raw_score, \
            decay_anchor = EXCLUDED.decay_anchor, \
@@ -277,7 +277,8 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
            recommended_for_blocklist = EXCLUDED.recommended_for_blocklist, \
            tier = EXCLUDED.tier, \
            active_days = EXCLUDED.active_days, \
-           last_active_day = EXCLUDED.last_active_day",
+           last_active_day = EXCLUDED.last_active_day, \
+           established_event_count = EXCLUDED.established_event_count",
     )
     .bind(new_score.source_ip.to_string())
     .bind(new_score.raw_score)
@@ -298,6 +299,7 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     .bind(new_score.delisted)
     .bind(new_score.active_days)
     .bind(new_score.last_active_day)
+    .bind(new_score.established_event_count)
     .execute(&mut *tx)
     .await?;
 
@@ -341,9 +343,9 @@ where
 {
     let row = sqlx::query(
         "SELECT host(source_ip) AS source_ip, raw_score, decay_anchor, max_confidence, \
-                event_count, distinct_categories, category_breakdown, has_confirmed_real, \
-                distinct_wan_count, distinct_sensor_count, first_seen, last_seen, eligible, \
-                recommended_for_vendor, recommended_for_blocklist, tier, delisted, \
+                event_count, established_event_count, distinct_categories, category_breakdown, \
+                has_confirmed_real, distinct_wan_count, distinct_sensor_count, first_seen, last_seen, \
+                eligible, recommended_for_vendor, recommended_for_blocklist, tier, delisted, \
                 active_days, last_active_day \
          FROM ip_score WHERE source_ip = $1::inet",
     )
@@ -372,6 +374,7 @@ where
         decay_anchor: row.try_get("decay_anchor")?,
         max_confidence: row.try_get("max_confidence")?,
         event_count: row.try_get("event_count")?,
+        established_event_count: row.try_get("established_event_count")?,
         distinct_categories: row.try_get("distinct_categories")?,
         category_breakdown,
         has_confirmed_real: row.try_get("has_confirmed_real")?,

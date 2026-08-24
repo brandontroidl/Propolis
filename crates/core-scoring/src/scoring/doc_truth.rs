@@ -74,12 +74,14 @@ fn readme_score_half_life_is_six_hours() {
 // real; UDP, ICMP, and unauthenticated (lone-SYN-style) traffic never are. Vendor reports and the
 // feed TIERS gate on this via `eligible`, so a spoofed source can earn neither.
 //
-// DOCUMENTED EXCEPTION, guarded so it cannot silently widen: the volume-listed RETENTION path does
-// NOT gate on confirmed-real (see the feed builder's `eligible = false` query and its
-// `a_volume_flood_lands_in_retention_but_not_the_tier_files` test). That path is spoofing-safe today
-// ONLY because every sensor is a TCP application listener, so an event implies a completed handshake
-// and no spoofed source can inflate event_count. If a UDP/packet-level sensor (e.g. an IDS producer)
-// is ever added, this assumption breaks and the volume path must be re-gated on confirmed-real.
+// VOLUME EXCEPTION, and how it stays spoofing-safe: the volume-listed RETENTION path does NOT gate
+// on confirmed-real (see the feed builder's `eligible = false` query and its
+// `a_volume_flood_lands_in_retention_but_not_the_tier_files` test). But it counts only ESTABLISHED
+// (completed-TCP) connections, never spoofable UDP/ICMP - `sensor-catchall` DOES run a live UDP
+// listener, so this gating is load-bearing, not hypothetical. A spoofed UDP flood therefore cannot
+// volume-list an innocent third party; guarded by `engine`'s
+// `a_udp_only_flood_is_not_volume_listed_even_over_the_threshold` (spoofable) vs
+// `a_high_volume_tcp_flood_is_blocklisted_on_volume_without_confirmed_real` (non-spoofable).
 #[test]
 fn readme_confirmed_real_requires_a_tcp_authenticated_honeypot_hit() {
     use crate::domain::enums::{Category, Protocol, is_confirmed_real};

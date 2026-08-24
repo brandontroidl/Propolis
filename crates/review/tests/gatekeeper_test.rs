@@ -80,6 +80,7 @@ fn fake_score(ip: IpAddr, raw_score: Decimal, categories: &[&str]) -> IpScore {
         decay_anchor: now,
         max_confidence: Decimal::from(1),
         event_count: categories.len().max(1) as i32,
+        established_event_count: categories.len().max(1) as i32,
         distinct_categories: categories.len() as i32,
         category_breakdown: serde_json::Value::Object(breakdown),
         has_confirmed_real: true,

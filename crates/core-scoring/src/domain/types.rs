@@ -93,6 +93,11 @@ pub struct IpScore {
     pub decay_anchor: DateTime<Utc>,
     pub max_confidence: Decimal,
     pub event_count: i32,
+    /// Count of NON-SPOOFABLE events only - those from a completed TCP connection, which a spoofed
+    /// source cannot forge (unlike UDP/ICMP, whose sender address in a datagram is forgeable). This,
+    /// not the raw `event_count`, gates volume-based blocklisting, so a spoofed UDP flood cannot list
+    /// an innocent third party on the feed. Folded in `engine::apply_event`.
+    pub established_event_count: i32,
     pub distinct_categories: i32,
     pub category_breakdown: serde_json::Value,
     pub has_confirmed_real: bool,

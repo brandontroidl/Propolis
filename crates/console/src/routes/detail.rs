@@ -164,6 +164,28 @@ struct SubmissionRow {
     success: bool,
 }
 
+/// One row of the "Services probed" panel: this IP's activity against a single sensor, i.e. which
+/// of our services it actually touched and whether it ever authenticated there. The honeypot-native
+/// counterpart to a Shodan "services" view - what the attacker did to us, not what it exposes.
+#[derive(Debug, Serialize)]
+struct ServiceRow {
+    /// Human label for the sensor, e.g. `VNC (5900)`; falls back to the raw sensor name.
+    service: String,
+    sensor: String,
+    event_count: i64,
+    authenticated: bool,
+    first_seen: String,
+    last_seen: String,
+}
+
+/// An operator-initiated external lookup link. The operator's browser makes the request, never the
+/// honeypot, so the box never leaks which addresses it has captured (egress-free enrichment).
+#[derive(Debug, Serialize)]
+struct ExternalLink {
+    name: String,
+    url: String,
+}
+
 /// Mirrors the JSON shape of `core_scoring::scoring::engine::CategoryStat` (crate-private there -
 /// see `queue.rs`'s `live_categories` for the same deserialize-a-local-shape approach applied to
 /// just the category keys).
@@ -239,6 +261,35 @@ async fn detail(
         });
     }
 
+    // "Services probed": this IP's activity grouped by sensor - which of our services it touched,
+    // how often, whether it ever authenticated, and the window. Unlike the per-WAN query this does
+    // not filter on wan_ip, so it is populated even while WAN attribution is unconfigured.
+    let service_rows = sqlx::query(
+        "SELECT sensor, COUNT(*) AS event_count, bool_or(authenticated) AS any_auth, \
+                min(observed_at) AS first_seen, max(observed_at) AS last_seen \
+         FROM event WHERE source_ip = $1::inet \
+         GROUP BY sensor ORDER BY event_count DESC, sensor ASC",
+    )
+    .bind(ip.to_string())
+    .fetch_all(&state.db)
+    .await?;
+    let mut services = Vec::with_capacity(service_rows.len());
+    for row in service_rows {
+        let sensor: String = row.try_get("sensor")?;
+        let first: DateTime<Utc> = row.try_get("first_seen")?;
+        let last: DateTime<Utc> = row.try_get("last_seen")?;
+        services.push(ServiceRow {
+            service: service_label(&sensor),
+            sensor,
+            event_count: row.try_get("event_count")?,
+            authenticated: row.try_get::<Option<bool>, _>("any_auth")?.unwrap_or(false),
+            first_seen: format_timestamp(first),
+            last_seen: format_timestamp(last),
+        });
+    }
+
+    let external_links = external_lookup_links(ip);
+
     // Default range: 7 daily buckets, oldest to newest, zero-filled where a day had no events for
     // this IP - always exactly 7 rows (the `generate_series` bound is unconditional), matching
     // the dashboard's own always-populated hourly timeline. Supplementary: soft-fails to an empty
@@ -302,6 +353,8 @@ async fn detail(
         per_wan,
         categories,
         submissions,
+        services,
+        external_links,
         ip_timeline_labels,
         ip_timeline_data,
         current_range,
@@ -605,6 +658,54 @@ fn category_rows(breakdown: &serde_json::Value) -> Vec<CategoryRow> {
         .collect()
 }
 
+/// Human label for a sensor's `sensor` field, e.g. `cred-vnc` -> `VNC (5900)`. The canonical sensor
+/// names come from the deployment's `PROPOLIS_SENSOR_LOGS` map (see `INSTALL.md`); an unknown sensor
+/// (a renamed or future one) falls back to its raw name rather than being dropped, so the panel
+/// never hides activity it cannot label. `catchall` covers many ports, so it is labelled as a scan
+/// rather than a single port.
+fn service_label(sensor: &str) -> String {
+    let label = match sensor {
+        "ssh" => "SSH (22)",
+        "telnet" => "Telnet (23)",
+        "http" => "HTTP (80)",
+        "ftp" => "FTP (21)",
+        "smtp" => "SMTP (25)",
+        "redis" => "Redis (6379)",
+        "adb" => "ADB (5555)",
+        "cred-vnc" => "VNC (5900)",
+        "cred-mysql" => "MySQL (3306)",
+        "cred-mssql" => "MSSQL (1433)",
+        "cred-pg" => "PostgreSQL (5432)",
+        "cred-mongo" => "MongoDB (27017)",
+        "catchall" => "Catch-all (port scan)",
+        other => return other.to_string(),
+    };
+    label.to_string()
+}
+
+/// The operator-initiated external lookup links shown on the detail page. Each opens in the
+/// operator's own browser (`target=_blank`), so the honeypot never makes the request itself and
+/// never leaks which addresses it has captured. `ip` is an already-validated `IpAddr` (the route's
+/// path param), so its string form is safe to interpolate into the URL with no escaping concern.
+fn external_lookup_links(ip: IpAddr) -> Vec<ExternalLink> {
+    let ip = ip.to_string();
+    [
+        ("Shodan", format!("https://www.shodan.io/host/{ip}")),
+        ("GreyNoise", format!("https://viz.greynoise.io/ip/{ip}")),
+        ("AbuseIPDB", format!("https://www.abuseipdb.com/check/{ip}")),
+        (
+            "VirusTotal",
+            format!("https://www.virustotal.com/gui/ip-address/{ip}"),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, url)| ExternalLink {
+        name: name.to_string(),
+        url,
+    })
+    .collect()
+}
+
 /// `core_scoring::SignalType`'s `Debug` output is `PascalCase` (e.g. `HoneypotCommandExec`); the
 /// DB's `signal_type_enum` and this module's own `extract_detail`/`format_activity` match arms
 /// both key on the wire's `snake_case` spelling (`honeypot_command_exec`), so every caller that
@@ -832,6 +933,35 @@ mod tests {
         assert_eq!(
             extract_detail("honeypot_command_exec", &metadata),
             "cat /etc/passwd"
+        );
+    }
+
+    #[test]
+    fn service_label_maps_known_sensors_and_falls_back_to_raw() {
+        assert_eq!(service_label("cred-vnc"), "VNC (5900)");
+        assert_eq!(service_label("ssh"), "SSH (22)");
+        assert_eq!(service_label("catchall"), "Catch-all (port scan)");
+        // An unknown/renamed sensor is never dropped - it shows its raw name.
+        assert_eq!(service_label("some-future-sensor"), "some-future-sensor");
+    }
+
+    #[test]
+    fn external_lookup_links_build_per_vendor_urls_for_the_ip() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let links = external_lookup_links(ip);
+        let by: std::collections::HashMap<_, _> = links
+            .iter()
+            .map(|l| (l.name.as_str(), l.url.as_str()))
+            .collect();
+        assert_eq!(by["Shodan"], "https://www.shodan.io/host/203.0.113.7");
+        assert_eq!(by["GreyNoise"], "https://viz.greynoise.io/ip/203.0.113.7");
+        assert_eq!(
+            by["AbuseIPDB"],
+            "https://www.abuseipdb.com/check/203.0.113.7"
+        );
+        assert_eq!(
+            by["VirusTotal"],
+            "https://www.virustotal.com/gui/ip-address/203.0.113.7"
         );
     }
 

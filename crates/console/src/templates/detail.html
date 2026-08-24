@@ -60,6 +60,46 @@
 </div>
 
 <div class="panel">
+  <div class="panel-head">Network profile</div>
+  <table class="table-compact">
+    <tbody>
+      <tr><td>Geolocation &amp; ASN</td><td class="dim">GeoLite2 database not configured</td></tr>
+    </tbody>
+  </table>
+  <div class="panel-body">
+    <div style="display:flex;flex-wrap:wrap;gap:0.4rem;">
+      {% for l in external_links %}
+      <a class="range-btn" href="{{ l.url }}" target="_blank" rel="noopener noreferrer">{{ l.name }} &nearr;</a>
+      {% endfor %}
+    </div>
+    <p class="dim" style="margin-top:0.6rem;margin-bottom:0;">External lookups open in your browser - the honeypot makes no outbound request and never reveals which addresses it has seen.</p>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">Services probed <span class="dim">what this address did to us</span></div>
+  {% if services %}
+  <table class="table-compact">
+    <thead><tr><th>Service</th><th>Sensor</th><th>Events</th><th>Authenticated</th><th>First seen</th><th>Last seen</th></tr></thead>
+    <tbody>
+      {% for s in services %}
+      <tr>
+        <td>{{ s.service }}</td>
+        <td class="mono dim">{{ s.sensor }}</td>
+        <td class="mono">{{ s.event_count }}</td>
+        <td>{% if s.authenticated %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td>
+        <td class="seen">{{ s.first_seen }}</td>
+        <td class="seen">{{ s.last_seen }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">No service activity recorded for this IP.</p>
+  {% endif %}
+</div>
+
+<div class="panel">
   <div class="panel-head panel-head--blue">
     Activity
     <div class="range-selector" id="chart-range">

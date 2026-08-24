@@ -745,6 +745,89 @@ async fn queue_lists_pending_entries(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn detail_renders_services_probed_and_egress_free_lookup_links(pool: PgPool) {
+    migrate(&pool).await;
+    // Two sensors for one IP: an authenticated SSH session and an unauthenticated VNC (cred-vnc)
+    // hit. The "Services probed" panel must list both, label each service, and reflect the auth
+    // state; the "Network profile" panel must offer the external lookup links and the
+    // not-yet-configured geo placeholder.
+    let start = chrono::Utc::now() - chrono::Duration::seconds(120);
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.70",
+            "ssh",
+            SignalType::SshBruteForce,
+            Protocol::Tcp,
+            true,
+            &start.to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.70",
+            "cred-vnc",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            false,
+            &(start + chrono::Duration::seconds(10)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.70",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+
+    // Services probed: both services, labelled, with the raw sensor shown too.
+    assert!(body.contains("Services probed"), "services panel missing");
+    assert!(
+        body.contains("SSH (22)"),
+        "ssh service label missing: {body}"
+    );
+    assert!(body.contains("VNC (5900)"), "vnc service label missing");
+    assert!(body.contains("cred-vnc"), "raw sensor name missing");
+
+    // Network profile: egress-free external lookups (operator's browser), geo not yet configured.
+    // The href's slashes are HTML-entity-escaped by minijinja's autoescaper (browsers decode them,
+    // so the link works); assert on the un-escaped vendor domains here and leave the exact URL
+    // construction to the `external_lookup_links_build_per_vendor_urls_for_the_ip` unit test.
+    assert!(
+        body.contains("Network profile"),
+        "network profile panel missing"
+    );
+    assert!(body.contains("www.shodan.io"), "shodan lookup link missing");
+    assert!(
+        body.contains("viz.greynoise.io"),
+        "greynoise lookup link missing"
+    );
+    assert!(body.contains("www.abuseipdb.com"), "abuseipdb link missing");
+    assert!(
+        body.contains("www.virustotal.com"),
+        "virustotal link missing"
+    );
+    assert!(
+        body.contains("GeoLite2 database not configured"),
+        "geo placeholder missing"
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn approve_changes_state_verified_via_db(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.30", 60).await;

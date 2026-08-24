@@ -35,6 +35,7 @@ use sensor_wire::{
     WIRE_VERSION,
 };
 
+use crate::command_codec::CommandCodec;
 use crate::fakefs::FakeFs;
 use crate::persona;
 use crate::sanitize_value;
@@ -75,6 +76,8 @@ pub struct FakeShell {
     fs: FakeFs,
     ctx: EmitContext,
     cwd: String,
+    /// Per-session de-obfuscation for XOR-encoded command probes (see `command_codec`).
+    codec: CommandCodec,
 }
 
 impl FakeShell {
@@ -83,7 +86,15 @@ impl FakeShell {
             fs,
             ctx,
             cwd: "/root".to_string(),
+            codec: CommandCodec::new(),
         }
+    }
+
+    /// Encode outbound bytes with the session's locked obfuscation key (identity when the session is
+    /// plaintext). The sensor calls this on its assembled response so a symmetric-codec bot reads
+    /// plaintext after de-obfuscating.
+    pub fn encode_output(&self, bytes: &[u8]) -> Vec<u8> {
+        self.codec.encode(bytes)
     }
 
     /// Handle one line of shell input: capture it as a `honeypot_command_exec` event (unless the
@@ -101,7 +112,26 @@ impl FakeShell {
             return (String::new(), Vec::new());
         }
 
+        // Decode a single-byte-XOR-obfuscated probe (identity for plaintext). The event records the
+        // RAW line verbatim - the hash chain must see exactly what crossed the wire - while the
+        // decoded form and key are annotated alongside so the grammar can respond and an analyst can
+        // read it. Dispatch and URL capture run on the DECODED line.
+        let (decoded, key) = self.codec.decode(line);
+
         let sanitized_cmd = sanitize_value(line, MAX_COMMAND_LEN);
+        let mut metadata = serde_json::json!({
+            "protocol_label": self.ctx.protocol_label,
+            "command": sanitized_cmd,
+        });
+        if let Some(k) = key
+            && let Some(obj) = metadata.as_object_mut()
+        {
+            obj.insert(
+                "command_decoded".to_string(),
+                serde_json::json!(sanitize_value(&decoded, MAX_COMMAND_LEN)),
+            );
+            obj.insert("xor_key".to_string(), serde_json::json!(k));
+        }
         let event = SensorEvent {
             v: WIRE_VERSION,
             source_ip: self.ctx.source_ip,
@@ -111,15 +141,12 @@ impl FakeShell {
             protocol: PROTO_TCP.into(),
             authenticated: self.ctx.authenticated,
             observed_at: chrono::Utc::now(),
-            metadata: serde_json::json!({
-                "protocol_label": self.ctx.protocol_label,
-                "command": sanitized_cmd,
-            }),
+            metadata,
             sample: None,
             session_id: self.ctx.session_id,
         };
 
-        let parts: Vec<&str> = line.split_whitespace().collect();
+        let parts: Vec<&str> = decoded.split_whitespace().collect();
         let output = self.dispatch(&parts);
 
         let mut events = vec![event];
@@ -127,7 +154,7 @@ impl FakeShell {
         // Direct/busybox fetch commands are recognised from the tokens; a URL buried in a
         // `sh -c "wget ...; ..."` chain (where the tokenizer's split loses the quoting) is recovered
         // by scanning the raw line. `download_target` only returns a real (non-empty) token.
-        if let Some(url) = download_target(&parts).or_else(|| url_if_fetch_line(line)) {
+        if let Some(url) = download_target(&parts).or_else(|| url_if_fetch_line(&decoded)) {
             let sanitized_url = sanitize_value(url, MAX_URL_LEN);
             events.push(SensorEvent {
                 v: WIRE_VERSION,
@@ -154,7 +181,12 @@ impl FakeShell {
     /// Every arm returns a static or lightly-interpolated string; none evaluates, spawns, or
     /// otherwise interprets `parts` as code - see the module doc.
     fn dispatch(&mut self, parts: &[&str]) -> String {
-        match parts.first().copied() {
+        // Match on the command's basename, so a full path (`/bin/busybox`, `/userfs/bin/wget`,
+        // `/bin/sh`) - which IoT loaders routinely use - resolves to the same applet a bare invocation
+        // would, the way a real shell finds it on PATH. Only the command token is normalised;
+        // arguments are untouched.
+        let cmd = parts.first().map(|p| p.rsplit('/').next().unwrap_or(p));
+        match cmd {
             Some("uname") => cmd_uname(parts),
             Some("id") => "uid=0(root) gid=0(root) groups=0(root)\n".to_string(),
             Some("whoami") => "root\n".to_string(),
@@ -702,6 +734,42 @@ mod shell_detection_tests {
                 session_id: None,
             },
         )
+    }
+
+    fn xor(s: &str, key: u8) -> String {
+        String::from_utf8(crate::command_codec::xor_bytes(s, key)).unwrap()
+    }
+
+    #[test]
+    fn xor_obfuscated_command_is_decoded_dispatched_and_annotated() {
+        let mut sh = shell();
+        // The first obfuscated anchor ("enable" ^ 0x09) locks the session key.
+        sh.handle_input(&xor("enable", 0x09));
+        // The obfuscated busybox probe now decodes and reaches the grammar.
+        let probe_obf = xor("/bin/busybox LZRD", 0x09);
+        let (out, events) = sh.handle_input(&probe_obf);
+        assert!(
+            out.contains("LZRD: applet not found"),
+            "decoded probe must get the busybox applet reply, got {out:?}"
+        );
+        assert_eq!(events[0].metadata["command"], probe_obf); // raw bytes preserved verbatim
+        assert_eq!(events[0].metadata["command_decoded"], "/bin/busybox LZRD");
+        assert_eq!(events[0].metadata["xor_key"], 9);
+    }
+
+    #[test]
+    fn plaintext_command_has_no_decoded_annotation() {
+        let (_out, events) = shell().handle_input("uname -a");
+        assert_eq!(events[0].metadata["command"], "uname -a");
+        assert!(events[0].metadata.get("command_decoded").is_none());
+        assert!(events[0].metadata.get("xor_key").is_none());
+    }
+
+    #[test]
+    fn bin_busybox_path_form_gets_the_applet_reply() {
+        // The full-path probe the LZRD variant sends must resolve like a bare `busybox` invocation.
+        let (out, _) = shell().handle_input("/bin/busybox LZRD");
+        assert!(out.contains("LZRD: applet not found"), "got {out:?}");
     }
 
     #[test]

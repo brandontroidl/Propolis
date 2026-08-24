@@ -223,8 +223,12 @@ async fn main() {
         }
     };
 
-    let geoip = Arc::new(match config.geoip_dir {
-        Some(ref dir) => console::geoip::GeoIp::load(dir),
+    // Load the GeoLite2 databases (a synchronous, potentially large file read) on a blocking-pool
+    // thread so it never parks an async worker at startup.
+    let geoip = Arc::new(match config.geoip_dir.clone() {
+        Some(dir) => tokio::task::spawn_blocking(move || console::geoip::GeoIp::load(&dir))
+            .await
+            .unwrap_or_else(|_| console::geoip::GeoIp::disabled()),
         None => console::geoip::GeoIp::disabled(),
     });
     if geoip.is_enabled() {

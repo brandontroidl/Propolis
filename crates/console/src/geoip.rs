@@ -88,7 +88,11 @@ impl GeoIp {
 /// that has not installed the GeoLite2 data). A present-but-unreadable file logs a warning and is
 /// treated as absent rather than propagating an error.
 fn open_db(path: &Path) -> Option<Reader<Vec<u8>>> {
-    if !path.exists() {
+    // `is_file()` (not `exists()`): a FIFO, device node, or socket at this path would make the
+    // `open_readfile` -> `fs::read` below block the thread forever (a FIFO with no writer) or read
+    // unbounded data. The path is operator-controlled, but a botched provisioning script or stale
+    // mount should degrade to disabled, never hang startup.
+    if !path.is_file() {
         return None;
     }
     match Reader::open_readfile(path) {
@@ -121,5 +125,16 @@ mod tests {
         let g = GeoIp::load(Path::new("/nonexistent/propolis/geoip/dir"));
         assert!(!g.is_enabled());
         assert!(g.lookup("203.0.113.7".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn a_non_regular_file_at_the_db_path_degrades_to_disabled() {
+        // A directory (or FIFO/device) where a `.mmdb` is expected must not be opened: the
+        // `is_file()` guard keeps `open_readfile`/`fs::read` from hanging or reading unbounded data.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("GeoLite2-City.mmdb")).unwrap();
+        std::fs::create_dir(dir.path().join("GeoLite2-ASN.mmdb")).unwrap();
+        let g = GeoIp::load(dir.path());
+        assert!(!g.is_enabled());
     }
 }

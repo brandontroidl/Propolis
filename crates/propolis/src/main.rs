@@ -380,8 +380,13 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         events_rejected,
     } = rt;
     let passwords = Arc::new(PasswordStore::new(&password));
+    // Load the GeoLite2 databases (a synchronous, potentially large file read) on a blocking-pool
+    // thread so it never parks a shared runtime worker at startup - run_console is a supervised task
+    // co-located with the sensors and other subsystems on the same tokio runtime.
     let geoip = Arc::new(match geoip_dir {
-        Some(ref dir) => console::geoip::GeoIp::load(dir),
+        Some(dir) => tokio::task::spawn_blocking(move || console::geoip::GeoIp::load(&dir))
+            .await
+            .unwrap_or_else(|_| console::geoip::GeoIp::disabled()),
         None => console::geoip::GeoIp::disabled(),
     });
     if geoip.is_enabled() {

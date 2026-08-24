@@ -68,3 +68,25 @@ fn readme_delist_is_the_only_removal() {
 fn readme_score_half_life_is_six_hours() {
     assert_eq!(HALF_LIFE_SECONDS, 6 * 60 * 60);
 }
+
+// README "Confirmed-real gate": the MECHANISM behind "spoofable UDP or lone-SYN traffic never
+// latches this". Only a TCP connection that authenticated against a honeypot sensor is confirmed-
+// real; UDP, ICMP, and unauthenticated (lone-SYN-style) traffic never are. Vendor reports and the
+// feed TIERS gate on this via `eligible`, so a spoofed source can earn neither.
+//
+// DOCUMENTED EXCEPTION, guarded so it cannot silently widen: the volume-listed RETENTION path does
+// NOT gate on confirmed-real (see the feed builder's `eligible = false` query and its
+// `a_volume_flood_lands_in_retention_but_not_the_tier_files` test). That path is spoofing-safe today
+// ONLY because every sensor is a TCP application listener, so an event implies a completed handshake
+// and no spoofed source can inflate event_count. If a UDP/packet-level sensor (e.g. an IDS producer)
+// is ever added, this assumption breaks and the volume path must be re-gated on confirmed-real.
+#[test]
+fn readme_confirmed_real_requires_a_tcp_authenticated_honeypot_hit() {
+    use crate::domain::enums::{Category, Protocol, is_confirmed_real};
+    assert!(is_confirmed_real(Protocol::Tcp, true, Category::Honeypot));
+    // Any missing leg means not confirmed-real - i.e. spoofable / non-handshake traffic never latches.
+    assert!(!is_confirmed_real(Protocol::Udp, true, Category::Honeypot)); // UDP is spoofable
+    assert!(!is_confirmed_real(Protocol::Icmp, true, Category::Honeypot)); // ICMP is spoofable
+    assert!(!is_confirmed_real(Protocol::Tcp, false, Category::Honeypot)); // no completed app auth
+    assert!(!is_confirmed_real(Protocol::Tcp, true, Category::Network)); // not a honeypot hit
+}

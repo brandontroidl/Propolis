@@ -532,6 +532,41 @@ mod tests {
         assert_eq!(retention[0].tier, None);
     }
 
+    // README "Score decay and retention": "retention windows (24h aggressive, 48h standard)". The
+    // membership test above exercises only the 24h window; this covers BOTH documented windows and
+    // their boundaries so a drift in either is caught. (The 24h/48h VALUES are the config defaults
+    // PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS / _STANDARD_TTL_HOURS, guarded in the propolis config tests;
+    // here we verify the retention mechanism honors each window's boundary.)
+    #[test]
+    fn readme_both_documented_retention_windows_apply_at_their_boundaries() {
+        let now = now_fixed();
+        let cands = [
+            candidate(1, FeedTier::Aggressive, 23, now), // within the 24h aggressive window
+            candidate(2, FeedTier::Standard, 47, now), // outside 24h, within the 48h standard window
+            candidate(3, FeedTier::Standard, 49, now), // outside both windows
+        ];
+
+        let aggressive = materialize(&cands, now, Duration::hours(24), |_| true);
+        let standard = materialize(&cands, now, Duration::hours(48), |_| true);
+
+        let agg: Vec<String> = aggressive.iter().map(|e| e.source_ip.to_string()).collect();
+        let std: Vec<String> = standard.iter().map(|e| e.source_ip.to_string()).collect();
+
+        assert_eq!(
+            agg,
+            ["198.51.100.1"],
+            "24h window keeps only the 23h-old entry"
+        );
+        assert!(
+            std.contains(&"198.51.100.1".to_string()) && std.contains(&"198.51.100.2".to_string()),
+            "48h window keeps the 23h and 47h entries"
+        );
+        assert!(
+            !std.contains(&"198.51.100.3".to_string()),
+            "the 49h entry has aged out of the 48h standard window"
+        );
+    }
+
     #[test]
     fn evidence_counts_survive_materialisation() {
         // The stored evidence is what an operator judges an entry by; a carry-forward that

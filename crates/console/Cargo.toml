@@ -10,9 +10,9 @@ axum-extra = { version = "0.12.6", features = ["cookie"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 core-scoring = { path = "../core-scoring" }
 futures = { version = "0.3.32", default-features = false, features = ["std", "async-await"] }
+geoip = { path = "../geoip" }
 hex = "0.4.3"
 hmac = "0.13.0"
-maxminddb = "0.30.3"
 minijinja = "2.21.0"
 rand = { version = "0.10.2", features = ["std"] }
 review = { path = "../review" }

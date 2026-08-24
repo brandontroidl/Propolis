@@ -62,7 +62,7 @@ fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> App
         passwords: Arc::new(PasswordStore::new(TEST_PASSWORD)),
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
-        geoip: Arc::new(console::geoip::GeoIp::disabled()),
+        geoip: Arc::new(geoip::GeoIp::disabled()),
         feed_output_dir,
         startup_time: chrono::Utc::now(),
         version: "test",

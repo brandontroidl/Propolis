@@ -35,7 +35,7 @@ fn test_state(db: PgPool) -> AppState {
         passwords: Arc::new(PasswordStore::new("correct horse battery staple")),
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
-        geoip: Arc::new(console::geoip::GeoIp::disabled()),
+        geoip: Arc::new(geoip::GeoIp::disabled()),
         feed_output_dir: None,
         startup_time: chrono::Utc::now(),
         version: "test",

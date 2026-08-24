@@ -1,0 +1,12 @@
+[package]
+name = "geoip"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+maxminddb = "0.30.3"
+serde = { version = "1.0.228", features = ["derive"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"

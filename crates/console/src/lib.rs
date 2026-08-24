@@ -9,7 +9,6 @@
 //! `internal/design/06-console-observability.md`.
 
 pub mod auth;
-pub mod geoip;
 pub mod log_buffer;
 pub mod routes;
 pub mod templates;
@@ -40,8 +39,8 @@ pub struct AppState {
     /// Offline GeoLite2 geo/ASN enrichment for the IP detail page (`PROPOLIS_GEOIP_DIR`). Built
     /// once at startup; `GeoIp::disabled()` when unconfigured, so lookups return `None` and the
     /// "Network profile" panel renders its "not configured" placeholder. Egress-free - see the
-    /// `geoip` module.
-    pub geoip: Arc<crate::geoip::GeoIp>,
+    /// `geoip` crate.
+    pub geoip: Arc<geoip::GeoIp>,
     /// The feed publisher's output directory (`PROPOLIS_FEED_OUTPUT_DIR`), read by
     /// `routes::feed` and `routes::metrics` for `manifest.json`. `None` when unconfigured - the
     /// console and the `feed` binary are independently deployed services that share this

@@ -1,9 +1,10 @@
 //! Offline IP geolocation and ASN enrichment from MaxMind GeoLite2 databases. Egress-free by
 //! construction: every lookup is a local file read, never a network call, so the honeypot never
-//! reveals which addresses it has captured. Both databases are optional - when the configured
-//! directory is absent or a file is missing, lookups return `None` and the detail page shows the
-//! "not configured" placeholder. The operator drops `GeoLite2-City.mmdb` and `GeoLite2-ASN.mmdb`
-//! into `PROPOLIS_GEOIP_DIR` (see `INSTALL.md`).
+//! reveals which addresses it has captured. Shared by the console (IP-detail "network profile"
+//! display) and the feed (ASN-allowlist suppression of trusted-org infrastructure), so both use one
+//! reader. Both databases are optional - when the configured directory is absent or a file is
+//! missing, lookups return `None`/`None` and callers degrade gracefully. The operator drops
+//! `GeoLite2-City.mmdb` and `GeoLite2-ASN.mmdb` into `PROPOLIS_GEOIP_DIR` (see `INSTALL.md`).
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -29,10 +30,21 @@ pub struct GeoIp {
     asn: Option<Reader<Vec<u8>>>,
 }
 
+// `maxminddb::Reader` is not `Debug`; a manual impl reports only whether each database loaded so
+// consumers that derive `Debug` (e.g. the feed's `ExclusionEngine`) can hold a `GeoIp` without
+// dumping the whole in-memory database.
+impl std::fmt::Debug for GeoIp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoIp")
+            .field("city", &self.city.is_some())
+            .field("asn", &self.asn.is_some())
+            .finish()
+    }
+}
+
 impl GeoIp {
-    /// A fully-disabled resolver (no databases). `lookup` always returns `None`, so the panel
-    /// renders "not configured". Used by the unified daemon/console when `PROPOLIS_GEOIP_DIR` is
-    /// unset and by tests.
+    /// A fully-disabled resolver (no databases). Every lookup returns `None`. Used when
+    /// `PROPOLIS_GEOIP_DIR` is unset, when ASN suppression is not configured, and by tests.
     pub fn disabled() -> Self {
         Self {
             city: None,
@@ -40,10 +52,10 @@ impl GeoIp {
         }
     }
 
-    /// Load whatever GeoLite2 databases exist under `dir`. A missing directory or missing file is
-    /// not an error - the corresponding reader stays `None` and the panel degrades gracefully. Only
+    /// Load whatever GeoLite2 databases exist under `dir` (City + ASN). A missing directory or file
+    /// is not an error - the corresponding reader stays `None` and callers degrade gracefully. Only
     /// a present-but-unreadable file is logged (a warning), so a corrupt drop-in is visible without
-    /// taking down the console.
+    /// taking down the process.
     pub fn load(dir: &Path) -> Self {
         Self {
             city: open_db(&dir.join("GeoLite2-City.mmdb")),
@@ -51,8 +63,17 @@ impl GeoIp {
         }
     }
 
-    /// True if at least one database loaded, i.e. the panel should render geo/ASN data rather than
-    /// the "not configured" placeholder.
+    /// Load only the ASN database from `dir`. For the feed's ASN-allowlist suppression, which never
+    /// needs city/country data - avoids loading the (much larger) City database in the feed process.
+    pub fn load_asn_only(dir: &Path) -> Self {
+        Self {
+            city: None,
+            asn: open_db(&dir.join("GeoLite2-ASN.mmdb")),
+        }
+    }
+
+    /// True if at least one database loaded, i.e. enrichment/suppression should run rather than the
+    /// "not configured" behaviour.
     pub fn is_enabled(&self) -> bool {
         self.city.is_some() || self.asn.is_some()
     }
@@ -81,6 +102,18 @@ impl GeoIp {
             info.org = asn.autonomous_system_organization.map(|s| s.to_string());
         }
         Some(info)
+    }
+
+    /// The autonomous system number for `ip`, or `None` when the ASN database is not configured or
+    /// holds no record. The lean lookup the feed's suppression gate uses - no allocation, no
+    /// city/country decode.
+    pub fn asn_of(&self, ip: IpAddr) -> Option<u32> {
+        let reader = self.asn.as_ref()?;
+        let result = reader.lookup(ip).ok()?;
+        result
+            .decode::<geoip2::Asn>()
+            .ok()?? // outer ?: decode error; inner ?: no record for this IP
+            .autonomous_system_number
     }
 }
 
@@ -117,6 +150,7 @@ mod tests {
         let g = GeoIp::disabled();
         assert!(!g.is_enabled());
         assert!(g.lookup("8.8.8.8".parse().unwrap()).is_none());
+        assert!(g.asn_of("8.8.8.8".parse().unwrap()).is_none());
     }
 
     #[test]
@@ -125,6 +159,13 @@ mod tests {
         let g = GeoIp::load(Path::new("/nonexistent/propolis/geoip/dir"));
         assert!(!g.is_enabled());
         assert!(g.lookup("203.0.113.7".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn asn_only_load_skips_city_and_a_missing_asn_db_degrades() {
+        let g = GeoIp::load_asn_only(Path::new("/nonexistent/propolis/geoip/dir"));
+        assert!(!g.is_enabled());
+        assert!(g.asn_of("203.0.113.7".parse().unwrap()).is_none());
     }
 
     #[test]

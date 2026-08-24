@@ -11,6 +11,7 @@ path = "src/main.rs"
 console = { path = "../console" }
 core-scoring = { path = "../core-scoring" }
 feed = { path = "../feed" }
+geoip = { path = "../geoip" }
 intake = { path = "../intake" }
 review = { path = "../review" }
 sensor-framework = { path = "../sensor-framework" }

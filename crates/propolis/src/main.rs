@@ -384,10 +384,10 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
     // thread so it never parks a shared runtime worker at startup - run_console is a supervised task
     // co-located with the sensors and other subsystems on the same tokio runtime.
     let geoip = Arc::new(match geoip_dir {
-        Some(dir) => tokio::task::spawn_blocking(move || console::geoip::GeoIp::load(&dir))
+        Some(dir) => tokio::task::spawn_blocking(move || geoip::GeoIp::load(&dir))
             .await
-            .unwrap_or_else(|_| console::geoip::GeoIp::disabled()),
-        None => console::geoip::GeoIp::disabled(),
+            .unwrap_or_else(|_| geoip::GeoIp::disabled()),
+        None => geoip::GeoIp::disabled(),
     });
     if geoip.is_enabled() {
         tracing::info!("console: GeoLite2 enrichment enabled");

@@ -750,10 +750,10 @@ dependencies = [
  "chrono",
  "core-scoring",
  "futures",
+ "geoip",
  "hex",
  "hmac 0.13.0",
  "http-body-util",
- "maxminddb",
  "minijinja",
  "rand 0.10.2",
  "review",
@@ -1543,6 +1543,16 @@ dependencies = [
  "generic-array 0.14.9",
  "rustversion",
  "typenum",
+]
+
+[[package]]
+name = "geoip"
+version = "0.3.0"
+dependencies = [
+ "maxminddb",
+ "serde",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -2912,6 +2922,7 @@ dependencies = [
  "console",
  "core-scoring",
  "feed",
+ "geoip",
  "hex",
  "intake",
  "ipnet",

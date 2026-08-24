@@ -163,6 +163,14 @@ PROPOLIS_FEED_WINDOWS=24h,7d,30d,60d,90d
 PROPOLIS_CONSOLE_BIND=127.0.0.1:8080
 PROPOLIS_CONSOLE_PASSWORD=<your console password>
 PROPOLIS_CONSOLE_SESSION_SECRET=<output of openssl rand -hex 32>
+
+# Offline geo/ASN enrichment for the IP detail page (optional). Point this at a directory holding
+# MaxMind GeoLite2-City.mmdb and GeoLite2-ASN.mmdb. Egress-free: the files are read locally and the
+# honeypot never queries anything over the network, so it never reveals which addresses it has seen.
+# Leave unset to disable (the "Network profile" panel shows "GeoLite2 database not configured"). The
+# GeoLite2 databases are free from MaxMind (account + license key required to download); a missing
+# directory or file degrades gracefully.
+# PROPOLIS_GEOIP_DIR=/var/lib/propolis/geoip
 ```
 
 ### `/etc/propolis/ssh.env` (SSH sensor)

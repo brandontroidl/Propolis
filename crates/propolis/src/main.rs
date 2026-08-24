@@ -360,6 +360,7 @@ struct ConsoleRuntime {
     password: String,
     session_secret: [u8; 32],
     feed_output_dir: Option<PathBuf>,
+    geoip_dir: Option<PathBuf>,
     log_buffer: Arc<LogBuffer>,
     events_ingested: Arc<std::sync::atomic::AtomicU64>,
     events_rejected: Arc<std::sync::atomic::AtomicU64>,
@@ -373,17 +374,26 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         password,
         session_secret,
         feed_output_dir,
+        geoip_dir,
         log_buffer,
         events_ingested,
         events_rejected,
     } = rt;
     let passwords = Arc::new(PasswordStore::new(&password));
+    let geoip = Arc::new(match geoip_dir {
+        Some(ref dir) => console::geoip::GeoIp::load(dir),
+        None => console::geoip::GeoIp::disabled(),
+    });
+    if geoip.is_enabled() {
+        tracing::info!("console: GeoLite2 enrichment enabled");
+    }
     let state = AppState {
         db: pool,
         sessions: Arc::new(SessionStore::new(session_secret)),
         passwords,
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
+        geoip,
         feed_output_dir,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
@@ -911,6 +921,7 @@ async fn main() {
         } else {
             None
         };
+        let geoip_dir = config.geoip_dir.clone();
         let log_buffer = log_buffer.clone();
         let ing = events_ingested.clone();
         let rej = events_rejected.clone();
@@ -923,6 +934,7 @@ async fn main() {
                 let pool = pool_c.clone();
                 let password = password.clone();
                 let feed_dir = feed_output_dir.clone();
+                let geoip_dir = geoip_dir.clone();
                 let log_buffer = log_buffer.clone();
                 let ing = ing.clone();
                 let rej = rej.clone();
@@ -934,6 +946,7 @@ async fn main() {
                             password,
                             session_secret,
                             feed_output_dir: feed_dir,
+                            geoip_dir,
                             log_buffer,
                             events_ingested: ing,
                             events_rejected: rej,

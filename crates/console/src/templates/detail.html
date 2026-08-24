@@ -63,7 +63,14 @@
   <div class="panel-head">Network profile</div>
   <table class="table-compact">
     <tbody>
+      {% if geo %}
+      <tr><td>Country</td><td>{% if geo.country %}{{ geo.country }}{% if geo.country_code %} <span class="dim">({{ geo.country_code }})</span>{% endif %}{% else %}<span class="dim">unknown</span>{% endif %}</td></tr>
+      <tr><td>City</td><td>{% if geo.city %}{{ geo.city }}{% else %}<span class="dim">unknown</span>{% endif %}</td></tr>
+      <tr><td>ASN</td><td class="mono">{% if geo.asn %}AS{{ geo.asn }}{% else %}<span class="dim">unknown</span>{% endif %}</td></tr>
+      <tr><td>Organization</td><td>{% if geo.org %}{{ geo.org }}{% else %}<span class="dim">unknown</span>{% endif %}</td></tr>
+      {% else %}
       <tr><td>Geolocation &amp; ASN</td><td class="dim">GeoLite2 database not configured</td></tr>
+      {% endif %}
     </tbody>
   </table>
   <div class="panel-body">

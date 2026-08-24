@@ -4,6 +4,18 @@
 
 ### Added
 
+- **IP detail: network profile** - a "Services probed" panel (what each address did to us, grouped
+  by sensor, with per-service auth state and activity window) and a "Network profile" panel with
+  egress-free operator lookup links (Shodan, GreyNoise, AbuseIPDB, VirusTotal) plus optional offline
+  MaxMind GeoLite2 geo/ASN enrichment via `PROPOLIS_GEOIP_DIR` (read locally, never queried over the
+  network; degrades to "not configured" when the databases are absent).
+- **Telnet XOR de-obfuscation** - the fake shell recovers single-byte-XOR-obfuscated command probes
+  (e.g. the LZRD Mirai variant) so it responds in-persona, recording both the raw wire bytes and the
+  decoded command; the console shows a "de-obfuscated (xor 0xNN)" badge.
+- **Operational self-alerting** - a supervised `ops-monitor` polling intake, sensor heartbeat, DB/
+  spool capacity, feed freshness, vendor health, and hash-chain integrity, paging over ntfy
+  (opt-in via `PROPOLIS_OPS_ENABLED`).
+
 - **SP8: 7 new honeypot sensors** - telnet, redis, adb, http, ftp, smtp, and credential
   multi-protocol (VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Each runs as a dedicated hardened systemd
   service. 251 tests across the 7 crates.

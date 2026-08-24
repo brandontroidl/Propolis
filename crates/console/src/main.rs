@@ -29,6 +29,7 @@ const ENV_BIND: &str = "PROPOLIS_CONSOLE_BIND";
 const ENV_PASSWORD: &str = "PROPOLIS_CONSOLE_PASSWORD";
 const ENV_SESSION_SECRET: &str = "PROPOLIS_CONSOLE_SESSION_SECRET";
 const ENV_FEED_OUTPUT_DIR: &str = "PROPOLIS_FEED_OUTPUT_DIR";
+const ENV_GEOIP_DIR: &str = "PROPOLIS_GEOIP_DIR";
 
 /// Loopback only, matching the design's closed decision #4 ("Bind model: loopback only by
 /// default") - an operator who wants the console reachable elsewhere binds it explicitly via
@@ -46,6 +47,7 @@ struct Config {
     password: String,
     session_secret: [u8; 32],
     feed_output_dir: Option<PathBuf>,
+    geoip_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -124,6 +126,10 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let session_secret = load_session_secret(env::var(ENV_SESSION_SECRET).ok().as_deref())?;
 
     let feed_output_dir = env::var(ENV_FEED_OUTPUT_DIR).ok().map(PathBuf::from);
+    let geoip_dir = env::var(ENV_GEOIP_DIR)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
 
     Ok(Config {
         database_url,
@@ -131,6 +137,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         password,
         session_secret,
         feed_output_dir,
+        geoip_dir,
     })
 }
 
@@ -216,12 +223,21 @@ async fn main() {
         }
     };
 
+    let geoip = Arc::new(match config.geoip_dir {
+        Some(ref dir) => console::geoip::GeoIp::load(dir),
+        None => console::geoip::GeoIp::disabled(),
+    });
+    if geoip.is_enabled() {
+        tracing::info!("console: GeoLite2 enrichment enabled");
+    }
+
     let state = AppState {
         db: pool,
         sessions: Arc::new(SessionStore::new(config.session_secret)),
         passwords,
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
+        geoip,
         feed_output_dir: config.feed_output_dir,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),

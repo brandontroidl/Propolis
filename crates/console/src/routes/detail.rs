@@ -290,6 +290,11 @@ async fn detail(
 
     let external_links = external_lookup_links(ip);
 
+    // Offline geo/ASN enrichment (egress-free). `None` when no GeoLite2 database is configured, so
+    // the template renders the "not configured" placeholder; `Some` (possibly with empty fields)
+    // once the operator drops the databases into `PROPOLIS_GEOIP_DIR`.
+    let geo = state.geoip.lookup(ip);
+
     // Default range: 7 daily buckets, oldest to newest, zero-filled where a day had no events for
     // this IP - always exactly 7 rows (the `generate_series` bound is unconditional), matching
     // the dashboard's own always-populated hourly timeline. Supplementary: soft-fails to an empty
@@ -355,6 +360,7 @@ async fn detail(
         submissions,
         services,
         external_links,
+        geo,
         ip_timeline_labels,
         ip_timeline_data,
         current_range,

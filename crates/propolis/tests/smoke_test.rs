@@ -68,6 +68,7 @@ async fn smoke_health_and_ready(pool: PgPool) {
             passwords,
             login_rate_limiter: Arc::new(console::auth::RateLimiter::default()),
             templates: Arc::new(console::templates::environment()),
+            geoip: Arc::new(console::geoip::GeoIp::disabled()),
             feed_output_dir: Some(feed_dir.path().to_path_buf()),
             startup_time: chrono::Utc::now(),
             version: "test",

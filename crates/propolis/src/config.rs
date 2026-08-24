@@ -89,6 +89,10 @@ pub struct PropolisConfig {
     // Feed
     pub feed_enabled: bool,
     pub feed_output_dir: PathBuf,
+    /// Directory holding the optional GeoLite2 `.mmdb` databases for the console's offline geo/ASN
+    /// enrichment (`PROPOLIS_GEOIP_DIR`). `None` disables it; a missing directory or file degrades
+    /// gracefully. Grouped with the feed path as the other operator-supplied data directory.
+    pub geoip_dir: Option<PathBuf>,
     pub feed_build_interval: Duration,
     pub feed_aggressive_ttl: Duration,
     pub feed_standard_ttl: Duration,
@@ -446,6 +450,10 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
     let feed_output_dir = env::var("PROPOLIS_FEED_OUTPUT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_FEED_OUTPUT_DIR));
+    let geoip_dir = env::var("PROPOLIS_GEOIP_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
     let feed_build_interval_secs = parse_positive_u64(
         "PROPOLIS_FEED_BUILD_INTERVAL_SECS",
         DEFAULT_FEED_BUILD_INTERVAL_SECS,
@@ -550,6 +558,7 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         vendors: vec![abuseipdb, dshield, otx],
         feed_enabled,
         feed_output_dir,
+        geoip_dir,
         feed_build_interval: Duration::from_secs(feed_build_interval_secs),
         feed_aggressive_ttl: Duration::from_secs(feed_aggressive_ttl_hours * 3600),
         feed_standard_ttl: Duration::from_secs(feed_standard_ttl_hours * 3600),

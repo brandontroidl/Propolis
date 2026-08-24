@@ -2,6 +2,7 @@
 //! `DurableCursor` across polls, process restarts, and log rotation. See "The runner" and "The
 //! durable log cursor" in `internal/design/03-event-intake-aggregation.md`.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -22,13 +23,20 @@ pub struct LogTailer {
     cursor: DurableCursor,
     state: CursorState,
     /// Handle most recently opened for `log_path`, corresponding to `state.inode`. Kept across
-    /// calls so that if the path is rotated out from under us (rotation by rename), the old
-    /// inode's remaining unread bytes can still be drained through this still-open descriptor -
-    /// POSIX keeps an inode's data readable via an already-open fd even after the directory
-    /// entry is renamed or unlinked elsewhere - before switching to the new file at the same
-    /// path. `None` means we have no such handle (fresh instance, or the old inode was already
-    /// drained and abandoned).
+    /// calls so that when the path is rotated out from under us (rotation by rename), this handle
+    /// is moved to `pending_drains` and the old inode's remaining bytes are drained through it -
+    /// POSIX keeps an inode's data readable via an already-open fd even after the directory entry
+    /// is renamed or unlinked. `None` means we have no such handle (fresh instance, or it was just
+    /// handed to `pending_drains`).
     file: Option<File>,
+    /// Inodes that were rotated out from under us (by rename) and are still being drained through
+    /// their held-open descriptors, oldest-first, each with our read offset into it. They are
+    /// drained to exhaustion BEFORE the current file, so a backlog larger than one batch is not
+    /// lost across a rotation. Not persisted: a crash mid-drain loses the in-flight tail (the inode
+    /// is reachable only via the open fd, which the crash closes) - the same bounded loss the
+    /// at-least-once model already tolerates, and far narrower than the old always-lose-past-one-
+    /// batch behavior.
+    pending_drains: VecDeque<(File, u64)>,
     /// The log file's size as of the last time we observed it. Not persisted (restarting a
     /// process legitimately loses this - the old inode is gone regardless); exists purely to
     /// disambiguate a `RotationEvent::Replaced` signal caused by ordinary growth of a
@@ -54,6 +62,7 @@ impl LogTailer {
             cursor,
             state,
             file: None,
+            pending_drains: VecDeque::new(),
             last_known_size,
         }
     }
@@ -67,12 +76,38 @@ impl LogTailer {
             return Vec::new();
         }
 
-        let mut lines = self.handle_rotation(max_lines);
+        self.handle_rotation();
+
+        // 1. Drain any inodes rotated out from under us, oldest-first and to exhaustion, BEFORE the
+        //    current file - otherwise a backlog larger than one batch is lost across a rotation.
+        let mut lines = Vec::new();
+        while lines.len() < max_lines {
+            let want = max_lines - lines.len();
+            let exhausted = match self.pending_drains.front_mut() {
+                None => break,
+                Some((old_file, old_offset)) => {
+                    match read_lines_from(old_file, *old_offset, want) {
+                        Ok((drained, consumed)) => {
+                            *old_offset += consumed;
+                            let got = drained.len();
+                            lines.extend(drained);
+                            got < want // fewer than requested => this old inode has no more lines
+                        }
+                        // Unreadable old handle: abandon it (its data is unrecoverable regardless).
+                        Err(_) => true,
+                    }
+                }
+            };
+            if exhausted {
+                self.pending_drains.pop_front();
+            }
+        }
         if lines.len() >= max_lines {
             self.refresh_last_known_size();
             return lines;
         }
 
+        // 2. Read the current inode for the remainder.
         let Ok(mut file) = File::open(&self.log_path) else {
             // Missing (or otherwise unopenable) log file: nothing more to read this round.
             return lines;
@@ -108,15 +143,13 @@ impl LogTailer {
         }
     }
 
-    /// Checks for rotation and reacts before the batch read proper. Returns lines drained from a
-    /// displaced old inode (`InodeChanged` only); empty in every other case.
-    fn handle_rotation(&mut self, max_lines: usize) -> Vec<String> {
+    /// Checks for rotation and reacts before the batch read proper. On a rename-based rotation the
+    /// displaced inode's still-open handle is moved to `pending_drains`, which `read_batch` then
+    /// drains to exhaustion before the new file.
+    fn handle_rotation(&mut self) {
         match self.cursor.detect_rotation(&self.state) {
-            RotationEvent::None => Vec::new(),
-            RotationEvent::Truncated => {
-                self.reset_to_current_file();
-                Vec::new()
-            }
+            RotationEvent::None => {}
+            RotationEvent::Truncated => self.reset_to_current_file(),
             RotationEvent::Replaced => {
                 if self.maybe_false_positive_replaced() {
                     // Ordinary growth of a still-small file, not a real replacement (see
@@ -126,20 +159,15 @@ impl LogTailer {
                 } else {
                     self.reset_to_current_file();
                 }
-                Vec::new()
             }
             RotationEvent::InodeChanged => {
-                let drained = self
-                    .file
-                    .take()
-                    .and_then(|mut old_file| {
-                        read_lines_from(&mut old_file, self.state.offset, max_lines).ok()
-                    })
-                    .map(|(drained_lines, _consumed)| drained_lines)
-                    .unwrap_or_default();
+                // Preserve the rotated-out inode (with our read position) so read_batch drains its
+                // full backlog before the new file, then point the cursor at the new inode.
+                if let Some(old_file) = self.file.take() {
+                    self.pending_drains.push_back((old_file, self.state.offset));
+                }
                 self.state.inode = get_inode(&self.log_path);
                 self.reset_to_current_file();
-                drained
             }
         }
     }

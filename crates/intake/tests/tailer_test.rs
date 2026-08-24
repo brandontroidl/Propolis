@@ -173,6 +173,39 @@ fn inode_change_drains_old_file_when_handle_still_open() {
 /// (e.g. process just started against a cursor persisted before the rotation happened). The old
 /// content is not accessible through the stored path anymore, so the tailer falls back to
 /// reading the new file from offset 0 - a documented, bounded loss, not a panic or hang.
+/// Regression (audit finding): rotation by rename where the old inode's unread backlog is LARGER
+/// than one batch. The old code drained at most `max_lines` from the old inode and then switched to
+/// the new inode, permanently losing the remainder. The full backlog must be drained across
+/// batches, oldest-first, before the new file, with nothing lost.
+#[test]
+fn inode_change_drains_a_backlog_larger_than_one_batch_without_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "old1\nold2\nold3\nold4\nold5\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(1), vec!["old1"]); // old2..old5 unread, held by the open handle
+
+    // Rotate by rename; the new file has two lines.
+    let rotated = dir.path().join("events.jsonl.1");
+    std::fs::rename(&log_path, &rotated).unwrap();
+    std::fs::write(&log_path, "new1\nnew2\n").unwrap();
+
+    // Drain in 2-line batches (smaller than the 4-line old backlog). Nothing may be lost.
+    let mut collected = Vec::new();
+    for _ in 0..10 {
+        let batch = tailer.read_batch(2);
+        if batch.is_empty() {
+            break;
+        }
+        collected.extend(batch);
+    }
+    assert_eq!(
+        collected,
+        vec!["old2", "old3", "old4", "old5", "new1", "new2"],
+        "the old inode's full backlog (> one batch) must be drained before the new file, nothing lost"
+    );
+}
+
 #[test]
 fn inode_change_without_live_handle_starts_new_file_from_zero() {
     let dir = tempfile::tempdir().unwrap();

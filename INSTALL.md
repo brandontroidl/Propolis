@@ -290,10 +290,23 @@ chown propolis:propolis /etc/propolis/propolis.env
 chmod 0600 /etc/propolis/propolis.env
 ```
 
-The `WAN_MAP` value is a comma-separated list of `local_ip=wan_ip` pairs mapping this host's
-local (private) addresses to the WAN IPs they are NAT'd behind. This is how Propolis knows which
-of your public addresses each hit arrived on. If the host binds WAN IPs directly (no NAT), leave
-`WAN_MAP` empty.
+The `WAN_MAP` value maps this host's local bind addresses to the public WAN IPs they are reachable
+as, so Propolis can record which of your public addresses each hit arrived on. This attribution
+feeds the breadth-of-sighting scoring model, populates the per-IP "Per-WAN breadth" panel, and is
+the only source of the "Distinct WAN vantages" figure.
+
+Set it for every internet-facing sensor, in one of two forms (pairs are comma-separated):
+
+- Behind NAT or DNAT, where the listener binds a private address: map the private address to its
+  public WAN IP, e.g. `10.0.0.1=198.51.100.1`.
+- Direct-bind, where the host holds the public IP itself with no NAT: use an identity entry, e.g.
+  `198.51.100.1=198.51.100.1`. Do NOT leave it empty for this case - an unmapped local address
+  resolves to a null `wan_ip`, so a no-NAT host still needs the identity pair to attribute its hits.
+
+Leave `WAN_MAP` empty only for a corroborating sensor that has no bindable WAN IP and whose hits
+should carry no WAN attribution. An empty map is not an error, but every event from that sensor is
+then stored with a null `wan_ip`: it never appears in the per-WAN breakdown, and it contributes
+nothing to "Distinct WAN vantages", which then reads 0 even for confirmed, authenticated attackers.
 
 ## 6. Start services
 

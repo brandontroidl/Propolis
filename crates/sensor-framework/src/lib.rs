@@ -5,6 +5,7 @@
 //! of the same sub-project) are thin compositions over it.
 
 pub mod bounds;
+pub mod command_codec;
 pub mod config;
 pub mod emit;
 pub mod fakefs;
@@ -17,6 +18,7 @@ pub mod spool;
 pub mod wan;
 
 pub use bounds::ConnectionBounds;
+pub use command_codec::CommandCodec;
 pub use config::SensorConfig;
 pub use emit::EventEmitter;
 pub use handoff::{CaptureDropped, CaptureHandoff, CaptureJob};

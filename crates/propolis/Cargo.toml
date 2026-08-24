@@ -35,3 +35,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# test-util enables tokio's pausable virtual clock (start_paused) so time-based dispatcher tests
+# (per-attempt deadline + backoff) run deterministically and instantly. A tokio feature, not a new
+# crate, so it needs no re-vendoring; dev-only, never shipped in the daemon.
+tokio = { version = "1.53.1", features = ["test-util"] }

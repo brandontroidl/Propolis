@@ -15,6 +15,13 @@ use super::config::OpsAlertConfig;
 
 const MAX_ATTEMPTS: u32 = 4;
 const BASE_BACKOFF: Duration = Duration::from_millis(200);
+/// Per-attempt deadline the DISPATCHER enforces on ANY poster (poster-agnostic), so a hung
+/// transport - a server that accepts the connection but never responds - cannot block the monitor
+/// loop forever. The production reqwest client also sets its own timeout below; this is the
+/// backstop that holds even for a custom poster.
+const POST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Connection-establishment timeout for the production reqwest client.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADER_LEN: usize = 200;
 /// Bounds the dedup map against an unbounded set of condition keys over the daemon's runtime.
 const MAX_DEDUP_ENTRIES: usize = 256;
@@ -81,6 +88,8 @@ pub struct ReqwestPoster {
 impl ReqwestPoster {
     pub fn new() -> Result<Self, DispatchError> {
         let client = reqwest::Client::builder()
+            .timeout(POST_ATTEMPT_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| DispatchError::Undelivered(format!("http client build failed: {e}")))?;
         Ok(Self { client })
@@ -196,17 +205,28 @@ impl<P: Poster> Dispatcher<P> {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match self.poster.post(req.clone()).await {
-                Ok(code) if (200..300).contains(&code) => return Ok(()),
+            // Bound every attempt with a per-attempt deadline, so a hung poster/transport becomes a
+            // retryable timeout rather than an unbounded await that wedges the monitor loop.
+            match tokio::time::timeout(POST_ATTEMPT_TIMEOUT, self.poster.post(req.clone())).await {
+                // Deadline exceeded (a stalled server that never responds): transient, retry.
+                Err(_elapsed) => {
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(DispatchError::Undelivered(format!(
+                            "ntfy attempt exceeded {}s on each of {MAX_ATTEMPTS} attempts",
+                            POST_ATTEMPT_TIMEOUT.as_secs()
+                        )));
+                    }
+                }
+                Ok(Ok(code)) if (200..300).contains(&code) => return Ok(()),
                 // 429 / 5xx / transport error: transient, retry within the attempt budget.
-                Ok(code) if code == 429 || (500..600).contains(&code) => {
+                Ok(Ok(code)) if code == 429 || (500..600).contains(&code) => {
                     if attempt >= MAX_ATTEMPTS {
                         return Err(DispatchError::Undelivered(format!(
                             "ntfy returned {code} after {MAX_ATTEMPTS} attempts"
                         )));
                     }
                 }
-                Err(PostErr::Transport(e)) => {
+                Ok(Err(PostErr::Transport(e))) => {
                     if attempt >= MAX_ATTEMPTS {
                         return Err(DispatchError::Undelivered(format!(
                             "ntfy transport error after {MAX_ATTEMPTS} attempts: {e}"
@@ -214,7 +234,7 @@ impl<P: Poster> Dispatcher<P> {
                     }
                 }
                 // Any other non-2xx (400/401/404 ...) is a permanent config error: do not retry.
-                Ok(code) => {
+                Ok(Ok(code)) => {
                     return Err(DispatchError::Undelivered(format!(
                         "ntfy returned a permanent {code}"
                     )));
@@ -416,6 +436,34 @@ mod tests {
         let err = d.dispatch(alert("capacity"), Instant::now()).await;
         assert!(matches!(err, Err(DispatchError::Undelivered(_))));
         assert_eq!(rec.count(), MAX_ATTEMPTS as usize);
+    }
+
+    /// A poster whose request never resolves (a server that accepts the connection but never
+    /// responds) must not hang the dispatcher: the per-attempt deadline turns each attempt into a
+    /// bounded timeout and dispatch() returns Err after the retry budget. Paused time makes the
+    /// deadlines and backoffs elapse in virtual time, so the test is instant.
+    struct NeverPoster;
+    impl Poster for &NeverPoster {
+        async fn post(&self, _req: PostReq) -> Result<u16, PostErr> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_poster_cannot_wedge_the_dispatcher() {
+        let never = NeverPoster;
+        let d = Dispatcher::with_poster(
+            &never,
+            "https://ntfy.example",
+            "propolis-ops",
+            None,
+            Duration::from_secs(300),
+        );
+        let result = d.dispatch(alert("capacity"), Instant::now()).await;
+        assert!(
+            matches!(result, Err(DispatchError::Undelivered(_))),
+            "a never-resolving poster must surface as a bounded Err, not hang"
+        );
     }
 
     #[tokio::test]

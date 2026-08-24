@@ -153,12 +153,17 @@ pub async fn handle_connection(
         let output = output.replace('\n', "\r\n");
 
         if is_exit {
-            let _ = stream.write_all(output.as_bytes()).await;
+            let _ = stream
+                .write_all(&shell.encode_output(output.as_bytes()))
+                .await;
             return;
         }
 
         let mut response = output.into_bytes();
         response.extend_from_slice(shell_prompt.as_bytes());
+        // Mirror any XOR obfuscation onto the response so a symmetric-codec bot reads plaintext after
+        // de-obfuscating (identity for a plaintext session, so normal bots are unaffected).
+        let response = shell.encode_output(&response);
         if stream.write_all(&response).await.is_err() {
             return;
         }

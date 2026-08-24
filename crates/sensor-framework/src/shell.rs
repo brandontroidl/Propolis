@@ -766,6 +766,17 @@ mod shell_detection_tests {
     }
 
     #[test]
+    fn encode_output_mirrors_after_a_command_locks_the_key() {
+        let mut sh = shell();
+        sh.handle_input(&xor("enable", 0x09)); // an obfuscated command locks 0x09
+        assert_eq!(sh.encode_output(b"# "), xor("# ", 0x09).into_bytes());
+        // A plaintext session leaves output unchanged.
+        let mut plain = shell();
+        plain.handle_input("uname");
+        assert_eq!(plain.encode_output(b"# "), b"# ".to_vec());
+    }
+
+    #[test]
     fn bin_busybox_path_form_gets_the_applet_reply() {
         // The full-path probe the LZRD variant sends must resolve like a bare `busybox` invocation.
         let (out, _) = shell().handle_input("/bin/busybox LZRD");

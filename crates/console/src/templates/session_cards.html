@@ -16,7 +16,7 @@
         <tr>
           <td class="seen dim">{{ event.relative_time }}</td>
           <td>{{ event.activity }}</td>
-          <td class="mono">{{ event.detail }}</td>
+          <td class="mono">{{ event.detail }}{% if event.xor_badge %} <span class="dim" title="command recovered from single-byte-XOR obfuscation; raw bytes in the raw view">(de-obfuscated, xor {{ event.xor_badge }})</span>{% endif %}</td>
           <td>
             <details class="raw-toggle">
               <summary>raw</summary>
@@ -42,7 +42,7 @@
         <td class="seen">{{ event.observed_at }}</td>
         <td class="seen dim">{{ event.relative_time }}</td>
         <td>{{ event.activity }}</td>
-        <td class="mono">{{ event.detail }}</td>
+        <td class="mono">{{ event.detail }}{% if event.xor_badge %} <span class="dim" title="command recovered from single-byte-XOR obfuscation; raw bytes in the raw view">(de-obfuscated, xor {{ event.xor_badge }})</span>{% endif %}</td>
         <td>{{ event.protocol }}</td>
         <td>{% if event.authenticated %}yes{% else %}no{% endif %}</td>
         <td class="ip">{{ event.wan_ip }}</td>

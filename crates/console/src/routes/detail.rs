@@ -96,6 +96,10 @@ struct EventRow {
     relative_time: String,
     activity: String,
     detail: String,
+    /// Pre-formatted `0xNN` badge, set when the command was recovered from a single-byte-XOR
+    /// obfuscation; drives a small "de-obfuscated (xor 0xNN)" badge in the timeline. `None` for a
+    /// plaintext command (minijinja has no hex filter, so this is formatted here).
+    xor_badge: Option<String>,
     protocol: String,
     authenticated: bool,
     wan_ip: String,
@@ -533,6 +537,10 @@ async fn fetch_evidence_rows(
             relative_time: format_relative_time(observed_at),
             activity: format_activity(&sensor, &signal_snake),
             detail: extract_detail(&signal_snake, &metadata),
+            xor_badge: metadata
+                .get("xor_key")
+                .and_then(|v| v.as_u64())
+                .map(|k| format!("0x{k:02x}")),
             protocol: format!("{protocol:?}"),
             authenticated: row.try_get("authenticated")?,
             wan_ip: row
@@ -620,8 +628,11 @@ pub(crate) fn signal_type_snake(signal_type: SignalType) -> String {
 /// task 5) reuses it verbatim for the same column in event search results.
 pub(crate) fn extract_detail(signal_type: &str, metadata: &serde_json::Value) -> String {
     match signal_type {
+        // Prefer the de-obfuscated command when the sensor recovered one (an XOR-encoded probe), so
+        // the timeline reads `enable` rather than `lghkel`; the raw form stays in the raw expander.
         "honeypot_command_exec" => metadata
-            .get("command")
+            .get("command_decoded")
+            .or_else(|| metadata.get("command"))
             .and_then(|v| v.as_str())
             .unwrap_or("-")
             .to_string(),
@@ -802,6 +813,7 @@ mod tests {
             relative_time: format_relative_time(observed_at),
             activity: format_activity("ssh", signal_type),
             detail: extract_detail(signal_type, &metadata),
+            xor_badge: None,
             protocol: "Tcp".into(),
             authenticated: true,
             wan_ip: "203.0.113.9".into(),
@@ -821,6 +833,14 @@ mod tests {
             extract_detail("honeypot_command_exec", &metadata),
             "cat /etc/passwd"
         );
+    }
+
+    #[test]
+    fn extract_detail_command_exec_prefers_decoded_over_raw() {
+        // When the sensor recovered an XOR-obfuscated probe, the timeline shows the decoded form;
+        // the raw (still-obfuscated) bytes remain in `command` for the raw expander and hash chain.
+        let metadata = json!({ "command": "lghkel", "command_decoded": "enable" });
+        assert_eq!(extract_detail("honeypot_command_exec", &metadata), "enable");
     }
 
     #[test]

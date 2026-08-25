@@ -2453,6 +2453,77 @@ async fn feed_page_reads_manifest_correctly(pool: PgPool) {
         body.contains("2026-07-30T14:00:00Z"),
         "missing aggressive valid_until: {body}"
     );
+    // A manifest from before the exclusions field existed still parses (serde default) and renders
+    // ASN suppression as off rather than collapsing the page.
+    assert!(
+        body.contains("Exclusions"),
+        "exclusions panel missing: {body}"
+    );
+    assert!(
+        body.contains(">off<"),
+        "an absent exclusions block should render ASN suppression off: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_page_shows_asn_suppression_active_and_inert_states(pool: PgPool) {
+    migrate(&pool).await;
+
+    // Active: 3 ASNs configured and the GeoLite2-ASN database loaded.
+    let active = tempfile::tempdir().unwrap();
+    std::fs::write(
+        active.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":3,"sha256":"a","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":11,"sha256":"b","valid_until":"2026-07-31T14:00:00Z"}},"exclusions":{"allowlist_count":2,"delist_count":1,"asn_allowlist_count":3,"asn_db_loaded":true}}"#,
+    )
+    .unwrap();
+    let state = test_state_with_feed_dir(pool.clone(), Some(active.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let body = body_text(
+        app.oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        body.contains("3 ASNs active"),
+        "active ASN state missing: {body}"
+    );
+    assert!(
+        body.contains("2 ranges"),
+        "CIDR allowlist count missing: {body}"
+    );
+
+    // Inert: ASNs configured but the database did not load - must be flagged, not shown as active.
+    let inert = tempfile::tempdir().unwrap();
+    std::fs::write(
+        inert.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":0,"sha256":"a","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":0,"sha256":"b","valid_until":"2026-07-31T14:00:00Z"}},"exclusions":{"allowlist_count":0,"delist_count":0,"asn_allowlist_count":3,"asn_db_loaded":false}}"#,
+    )
+    .unwrap();
+    let state = test_state_with_feed_dir(pool, Some(inert.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let body = body_text(
+        app.oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        body.contains("inert"),
+        "inert ASN state not flagged: {body}"
+    );
+    assert!(
+        !body.contains("3 ASNs active"),
+        "an unloaded database must not render as active: {body}"
+    );
 }
 
 #[sqlx::test(migrations = false)]

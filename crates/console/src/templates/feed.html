@@ -122,6 +122,24 @@
     </table>
   </div>
   {% endif %}
+  <div class="panel">
+    <div class="panel-head">Exclusions <span class="dim">kept off every published feed</span></div>
+    <table class="table-compact">
+      <tbody>
+        <tr><td>Reserved / special-purpose ranges</td><td><span class="state-pill state-approved">always on</span></td></tr>
+        <tr><td>Operator CIDR allowlist</td><td class="mono">{{ exclusions.allowlist_count }} range{% if exclusions.allowlist_count != 1 %}s{% endif %}</td></tr>
+        <tr><td>Delisted addresses</td><td class="mono">{{ exclusions.delist_count }}</td></tr>
+        <tr>
+          <td>Trusted-org ASN suppression</td>
+          <td>
+            {% if exclusions.asn_allowlist_count == 0 %}<span class="dim">off</span>
+            {% elif exclusions.asn_db_loaded %}<span class="state-pill state-approved">{{ exclusions.asn_allowlist_count }} ASN{% if exclusions.asn_allowlist_count != 1 %}s{% endif %} active</span>
+            {% else %}<span class="state-pill state-rejected">{{ exclusions.asn_allowlist_count }} configured &ndash; GeoLite2-ASN not loaded, inert</span>{% endif %}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
   {% else %}
   <p class="empty-line">{% if feed_disabled %}feed builder is disabled on this node{% else %}feed enabled - awaiting first build{% endif %}</p>
   {% endif %}

@@ -85,6 +85,28 @@ impl ExclusionEngine {
     fn asn_matches(&self, asn: Option<u32>) -> bool {
         asn.is_some_and(|a| self.asn_allowlist.contains(&a))
     }
+
+    /// Number of operator-allowlisted CIDR ranges.
+    pub fn allowlist_len(&self) -> usize {
+        self.allowlist.len()
+    }
+
+    /// Number of explicitly delisted addresses.
+    pub fn delist_len(&self) -> usize {
+        self.delist.len()
+    }
+
+    /// Number of trusted-org ASNs configured for suppression.
+    pub fn asn_allowlist_len(&self) -> usize {
+        self.asn_allowlist.len()
+    }
+
+    /// Whether the GeoLite2-ASN database actually loaded. `false` with a non-empty ASN allowlist
+    /// means suppression is configured but INERT (the counts alone would mislead), so the feed
+    /// status surface reports both.
+    pub fn asn_db_loaded(&self) -> bool {
+        self.geoip.is_enabled()
+    }
 }
 
 #[cfg(test)]

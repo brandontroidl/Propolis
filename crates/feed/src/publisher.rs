@@ -155,6 +155,12 @@ impl Publisher {
                 standard,
             },
             windows,
+            exclusions: ExclusionsManifest {
+                allowlist_count: exclusions.allowlist_len(),
+                delist_count: exclusions.delist_len(),
+                asn_allowlist_count: exclusions.asn_allowlist_len(),
+                asn_db_loaded: exclusions.asn_db_loaded(),
+            },
         };
         let manifest_json = serde_json::to_string(&manifest)?;
         write_file_synced(&staging.join("manifest.json"), manifest_json.as_bytes())?;
@@ -355,6 +361,23 @@ struct Manifest {
     /// One entry per retention feed. Additive: a consumer reading only `tiers` is unaffected, and
     /// an unconfigured deployment publishes an empty array.
     windows: Vec<WindowManifest>,
+    /// What this build kept OFF the feed - the exclusion engine's configured counts, so the console
+    /// can show suppression state without reading the feed's env itself. Additive: an older consumer
+    /// ignores it.
+    exclusions: ExclusionsManifest,
+}
+
+/// The exclusion engine's configured state, published so the operator can confirm at a glance what
+/// is being kept off the feed (the ASN suppression especially, which is otherwise only visible in a
+/// one-shot startup log).
+#[derive(Debug, Serialize)]
+struct ExclusionsManifest {
+    allowlist_count: usize,
+    delist_count: usize,
+    asn_allowlist_count: usize,
+    /// `false` with a non-zero `asn_allowlist_count` means the ASN allowlist is configured but the
+    /// GeoLite2-ASN database did not load, so suppression is inert - the console flags that.
+    asn_db_loaded: bool,
 }
 
 /// A retention feed's manifest entry. Carries `label` because - unlike the two fixed tiers - the

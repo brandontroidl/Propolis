@@ -189,6 +189,34 @@ fn retention_windows_are_written_as_all_label_files_and_listed_in_the_manifest()
 }
 
 #[test]
+fn manifest_records_the_exclusion_engine_counts_under_the_names_the_console_reads() {
+    let config = FeedConfig::default();
+    let build_time = dt("2026-07-29T14:00:00Z");
+    // A published entry NOT in the delist, so revalidation passes and the manifest is written.
+    let e = entry(ip("45.10.30.11"), FeedTier::Standard, build_time, &config);
+    let snapshot = FeedSnapshot {
+        build_time,
+        aggressive: Vec::new(),
+        standard: vec![e],
+        windows: Vec::new(),
+    };
+    let exclusions = ExclusionEngine::new(Vec::new(), vec![ip("203.0.113.9")]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let output_dir = tmp.path().join("current");
+    Publisher::publish(&snapshot, &output_dir, &exclusions, &config).unwrap();
+
+    // Assert the exact field names the console's `ExclusionsManifest` deserializes - this is the
+    // both-ends check for the manifest contract, so the console fixtures cannot silently drift from
+    // what `publish` actually writes.
+    let ex = &manifest_json(&output_dir)["exclusions"];
+    assert_eq!(ex["allowlist_count"], 0);
+    assert_eq!(ex["delist_count"], 1);
+    assert_eq!(ex["asn_allowlist_count"], 0);
+    assert_eq!(ex["asn_db_loaded"], false);
+}
+
+#[test]
 fn fail_closed_rejects_when_the_violation_is_in_the_aggressive_tier_too() {
     let config = FeedConfig::default();
     let build_time = dt("2026-07-29T14:00:00Z");

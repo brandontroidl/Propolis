@@ -94,6 +94,21 @@ pub(crate) struct Manifest {
     /// the "no builds yet" empty state.
     #[serde(default)]
     pub(crate) windows: Vec<WindowManifest>,
+    /// Exclusion-engine state this build applied. `default` (all-zero) so a manifest from before
+    /// this field existed still parses; the template then renders suppression as "off".
+    #[serde(default)]
+    pub(crate) exclusions: ExclusionsManifest,
+}
+
+/// What the feed build kept off the export, mirrored from the feed's `ExclusionsManifest`. Surfaced
+/// on the Status tab so an operator can confirm ASN suppression (and the CIDR allowlist / delist) at
+/// a glance rather than from a one-shot startup log.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ExclusionsManifest {
+    pub(crate) allowlist_count: usize,
+    pub(crate) delist_count: usize,
+    pub(crate) asn_allowlist_count: usize,
+    pub(crate) asn_db_loaded: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +195,7 @@ async fn feed_page(
             standard_count => m.tiers.standard.count,
             standard_valid_until => m.tiers.standard.valid_until,
             windows => m.windows,
+            exclusions => m.exclusions,
             tab,
             aggressive_entries,
             standard_entries,

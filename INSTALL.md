@@ -183,6 +183,13 @@ PROPOLIS_CONSOLE_SESSION_SECRET=<output of openssl rand -hex 32>
 # GeoLite2 databases are free from MaxMind (account + license key required to download); a missing
 # directory or file degrades gracefully.
 # PROPOLIS_GEOIP_DIR=/var/lib/propolis/geoip
+
+# Forward-confirmed reverse DNS on the IP-detail page (optional, default off). This is the ONE
+# outbound lookup in the console's enrichment: a PTR query goes to the address owner's own DNS (and
+# tells them they are being profiled), so it stays off unless you set this. A shown hostname is
+# forward-confirmed (the PTR name must resolve back to the same IP) and marked verified/unverified;
+# it is DISPLAY ONLY and never influences suppression (a PTR is spoofable - ASN handles suppression).
+# PROPOLIS_CONSOLE_RDNS_ENABLED=true
 ```
 
 ### `/etc/propolis/ssh.env` (SSH sensor)

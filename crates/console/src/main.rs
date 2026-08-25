@@ -30,6 +30,7 @@ const ENV_PASSWORD: &str = "PROPOLIS_CONSOLE_PASSWORD";
 const ENV_SESSION_SECRET: &str = "PROPOLIS_CONSOLE_SESSION_SECRET";
 const ENV_FEED_OUTPUT_DIR: &str = "PROPOLIS_FEED_OUTPUT_DIR";
 const ENV_GEOIP_DIR: &str = "PROPOLIS_GEOIP_DIR";
+const ENV_RDNS_ENABLED: &str = "PROPOLIS_CONSOLE_RDNS_ENABLED";
 
 /// Loopback only, matching the design's closed decision #4 ("Bind model: loopback only by
 /// default") - an operator who wants the console reachable elsewhere binds it explicitly via
@@ -48,6 +49,7 @@ struct Config {
     session_secret: [u8; 32],
     feed_output_dir: Option<PathBuf>,
     geoip_dir: Option<PathBuf>,
+    rdns_enabled: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -130,6 +132,9 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    let rdns_enabled = env::var(ENV_RDNS_ENABLED)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
 
     Ok(Config {
         database_url,
@@ -138,6 +143,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         session_secret,
         feed_output_dir,
         geoip_dir,
+        rdns_enabled,
     })
 }
 
@@ -242,6 +248,7 @@ async fn main() {
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
         geoip,
+        rdns: Arc::new(console::rdns::RdnsResolver::new(config.rdns_enabled)),
         feed_output_dir: config.feed_output_dir,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),

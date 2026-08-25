@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod log_buffer;
+pub mod rdns;
 pub mod routes;
 pub mod templates;
 
@@ -41,6 +42,9 @@ pub struct AppState {
     /// "Network profile" panel renders its "not configured" placeholder. Egress-free - see the
     /// `geoip` crate.
     pub geoip: Arc<geoip::GeoIp>,
+    /// Forward-confirmed reverse-DNS resolver for the IP-detail page (`PROPOLIS_CONSOLE_RDNS_ENABLED`).
+    /// Opt-in (the one egress in the console's enrichment); `RdnsResolver::disabled()` otherwise.
+    pub rdns: Arc<rdns::RdnsResolver>,
     /// The feed publisher's output directory (`PROPOLIS_FEED_OUTPUT_DIR`), read by
     /// `routes::feed` and `routes::metrics` for `manifest.json`. `None` when unconfigured - the
     /// console and the `feed` binary are independently deployed services that share this

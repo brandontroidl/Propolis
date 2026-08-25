@@ -295,6 +295,21 @@ async fn detail(
     // once the operator drops the databases into `PROPOLIS_GEOIP_DIR`.
     let geo = state.geoip.lookup(ip);
 
+    // Opt-in forward-confirmed reverse DNS - the one outbound lookup in this page. Run the blocking
+    // system-resolver call off the async worker with a short timeout; `None` (disabled, timed out, or
+    // join error) hides the row, so a slow resolver degrades the page by one field, never blocks it.
+    let rdns = if state.rdns.is_enabled() {
+        let resolver = state.rdns.clone();
+        let handle = tokio::task::spawn_blocking(move || resolver.lookup(ip));
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+    } else {
+        None
+    };
+
     // Default range: 7 daily buckets, oldest to newest, zero-filled where a day had no events for
     // this IP - always exactly 7 rows (the `generate_series` bound is unconditional), matching
     // the dashboard's own always-populated hourly timeline. Supplementary: soft-fails to an empty
@@ -361,6 +376,7 @@ async fn detail(
         services,
         external_links,
         geo,
+        rdns,
         ip_timeline_labels,
         ip_timeline_data,
         current_range,

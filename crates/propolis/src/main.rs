@@ -361,6 +361,7 @@ struct ConsoleRuntime {
     session_secret: [u8; 32],
     feed_output_dir: Option<PathBuf>,
     geoip_dir: Option<PathBuf>,
+    rdns_enabled: bool,
     log_buffer: Arc<LogBuffer>,
     events_ingested: Arc<std::sync::atomic::AtomicU64>,
     events_rejected: Arc<std::sync::atomic::AtomicU64>,
@@ -375,6 +376,7 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         session_secret,
         feed_output_dir,
         geoip_dir,
+        rdns_enabled,
         log_buffer,
         events_ingested,
         events_rejected,
@@ -399,6 +401,7 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
         geoip,
+        rdns: Arc::new(console::rdns::RdnsResolver::new(rdns_enabled)),
         feed_output_dir,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
@@ -954,6 +957,7 @@ async fn main() {
             None
         };
         let geoip_dir = config.geoip_dir.clone();
+        let rdns_enabled = config.console_rdns_enabled;
         let log_buffer = log_buffer.clone();
         let ing = events_ingested.clone();
         let rej = events_rejected.clone();
@@ -979,6 +983,7 @@ async fn main() {
                             session_secret,
                             feed_output_dir: feed_dir,
                             geoip_dir,
+                            rdns_enabled,
                             log_buffer,
                             events_ingested: ing,
                             events_rejected: rej,

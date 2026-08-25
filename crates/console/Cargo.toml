@@ -13,6 +13,7 @@ futures = { version = "0.3.32", default-features = false, features = ["std", "as
 geoip = { path = "../geoip" }
 hex = "0.4.3"
 hmac = "0.13.0"
+libc = "0.2.186"
 minijinja = "2.21.0"
 rand = { version = "0.10.2", features = ["std"] }
 review = { path = "../review" }

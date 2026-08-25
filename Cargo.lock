@@ -754,6 +754,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "http-body-util",
+ "libc",
  "minijinja",
  "rand 0.10.2",
  "review",

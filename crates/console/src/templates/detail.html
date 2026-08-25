@@ -71,6 +71,9 @@
       {% else %}
       <tr><td>Geolocation &amp; ASN</td><td class="dim">GeoLite2 database not configured</td></tr>
       {% endif %}
+      {% if rdns %}
+      <tr><td>Hostname (rDNS)</td><td>{% if rdns.hostname %}<span class="mono">{{ rdns.hostname }}</span> {% if rdns.verified %}<span class="state-pill state-approved" title="the PTR hostname forward-resolves back to this IP">verified</span>{% else %}<span class="state-pill state-rejected" title="the PTR hostname does NOT forward-resolve to this IP - possibly forged; display only, never trusted for suppression">unverified</span>{% endif %}{% else %}<span class="dim">no PTR record</span>{% endif %}</td></tr>
+      {% endif %}
     </tbody>
   </table>
   <div class="panel-body">

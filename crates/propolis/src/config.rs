@@ -93,6 +93,9 @@ pub struct PropolisConfig {
     /// enrichment (`PROPOLIS_GEOIP_DIR`). `None` disables it; a missing directory or file degrades
     /// gracefully. Grouped with the feed path as the other operator-supplied data directory.
     pub geoip_dir: Option<PathBuf>,
+    /// Opt-in forward-confirmed reverse-DNS on the IP-detail page (`PROPOLIS_CONSOLE_RDNS_ENABLED`).
+    /// Default off - it is the one outbound DNS lookup in the console's enrichment.
+    pub console_rdns_enabled: bool,
     pub feed_build_interval: Duration,
     pub feed_aggressive_ttl: Duration,
     pub feed_standard_ttl: Duration,
@@ -478,6 +481,7 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    let console_rdns_enabled = parse_bool_flag("PROPOLIS_CONSOLE_RDNS_ENABLED", false);
     let feed_build_interval_secs = parse_positive_u64(
         "PROPOLIS_FEED_BUILD_INTERVAL_SECS",
         DEFAULT_FEED_BUILD_INTERVAL_SECS,
@@ -585,6 +589,7 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         feed_enabled,
         feed_output_dir,
         geoip_dir,
+        console_rdns_enabled,
         feed_build_interval: Duration::from_secs(feed_build_interval_secs),
         feed_aggressive_ttl: Duration::from_secs(feed_aggressive_ttl_hours * 3600),
         feed_standard_ttl: Duration::from_secs(feed_standard_ttl_hours * 3600),

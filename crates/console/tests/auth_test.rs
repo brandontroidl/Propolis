@@ -36,6 +36,7 @@ fn test_state(db: PgPool) -> AppState {
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
         geoip: Arc::new(geoip::GeoIp::disabled()),
+        rdns: Arc::new(console::rdns::RdnsResolver::disabled()),
         feed_output_dir: None,
         startup_time: chrono::Utc::now(),
         version: "test",

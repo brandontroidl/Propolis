@@ -63,6 +63,7 @@ fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> App
         login_rate_limiter: Arc::new(RateLimiter::default()),
         templates: Arc::new(console::templates::environment()),
         geoip: Arc::new(geoip::GeoIp::disabled()),
+        rdns: Arc::new(console::rdns::RdnsResolver::disabled()),
         feed_output_dir,
         startup_time: chrono::Utc::now(),
         version: "test",
@@ -825,6 +826,12 @@ async fn detail_renders_services_probed_and_egress_free_lookup_links(pool: PgPoo
     assert!(
         body.contains("GeoLite2 database not configured"),
         "geo placeholder missing"
+    );
+    // Reverse DNS is opt-in (egress): the resolver is disabled in test_state, so the row must not
+    // render at all - no outbound lookup happens unless PROPOLIS_CONSOLE_RDNS_ENABLED is set.
+    assert!(
+        !body.contains("Hostname (rDNS)"),
+        "rDNS row must be hidden when the resolver is disabled (egress-off default)"
     );
 }
 

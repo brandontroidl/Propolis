@@ -4,6 +4,11 @@
 
 ### Added
 
+- **Forward-confirmed reverse DNS** on the IP-detail page (`PROPOLIS_CONSOLE_RDNS_ENABLED`, default
+  off - the one outbound lookup in the console's enrichment). A shown hostname is forward-confirmed
+  (PTR must resolve back to the IP) and marked verified/unverified; display-only, never a suppression
+  signal. On-demand, cached, system resolver via libc (no async DNS dependency).
+
 - **Trusted-org ASN suppression** - an optional `PROPOLIS_FEED_ASN_ALLOWLIST` keeps a trusted
   organization's own infrastructure or a known scanner (by AS number) off every published feed,
   keyed off the offline GeoLite2-ASN database. ASN ownership is not per-IP spoofable, unlike reverse

@@ -41,6 +41,7 @@ const QUEUE_ROW_HTML: &str = include_str!("templates/queue_row.html");
 const QUEUE_HISTORY_ROW_HTML: &str = include_str!("templates/queue_history_row.html");
 const LOGIN_HTML: &str = include_str!("templates/login.html");
 const DETAIL_HTML: &str = include_str!("templates/detail.html");
+const DRAWER_SHELL_HTML: &str = include_str!("templates/drawer_shell.html");
 const FEED_HTML: &str = include_str!("templates/feed.html");
 const SESSION_CARDS_HTML: &str = include_str!("templates/session_cards.html");
 const EVENTS_FRAGMENT_HTML: &str = include_str!("templates/events_fragment.html");
@@ -72,6 +73,11 @@ pub fn environment() -> Environment<'static> {
         .expect("login.html must be a valid template");
     env.add_template("detail.html", DETAIL_HTML)
         .expect("detail.html must be a valid template");
+    // Bare layout the evidence drawer reuses: detail.html extends this (instead of base.html) when
+    // the detail handler answers the drawer's HTMX request, so the slide-over renders the real
+    // /ip/{ip} dossier from one template - see `routes::detail`'s drawer handling.
+    env.add_template("drawer_shell.html", DRAWER_SHELL_HTML)
+        .expect("drawer_shell.html must be a valid template");
     env.add_template("feed.html", FEED_HTML)
         .expect("feed.html must be a valid template");
     // Fragments (console-forensics task 4): partial templates rendered standalone by an HTMX

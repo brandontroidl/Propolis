@@ -7,10 +7,14 @@
 // left the timeline canvas silently blank on some swaps and not others.
 //
 // Chart.js refuses to bind a second chart to a canvas that already has one, so an existing
-// instance is destroyed first. Per-page styling differences ride on data attributes rather than
-// forking this function.
+// instance is destroyed first. Colours are read from the active theme's CSS custom properties so a
+// chart matches whatever theme is live, and the theme switcher re-runs this to recolour on change.
 function propolisInitCharts(root) {
   if (typeof Chart === 'undefined') return;
+  var cs = getComputedStyle(document.documentElement);
+  var line = (cs.getPropertyValue('--chart-line').trim() || '#e0a43f');
+  var fill = (cs.getPropertyValue('--chart-fill').trim() || 'rgba(224,164,63,0.13)');
+  var pointBorder = (cs.getPropertyValue('--chart-point-border').trim() || '#1a1613');
   (root || document).querySelectorAll('canvas[data-chart]').forEach(function (el) {
     var labelsEl = document.getElementById(el.dataset.labels);
     var valuesEl = document.getElementById(el.dataset.values);
@@ -23,15 +27,15 @@ function propolisInitCharts(root) {
         labels: JSON.parse(labelsEl.textContent),
         datasets: [{
           data: JSON.parse(valuesEl.textContent),
-          borderColor: '#4c8ff0',
-          backgroundColor: 'rgba(76, 143, 240, 0.10)',
+          borderColor: line,
+          backgroundColor: fill,
           borderWidth: 2,
           fill: true,
           tension: parseFloat(el.dataset.tension || '0'),
           pointRadius: parseInt(el.dataset.pointRadius || '0', 10),
           pointHoverRadius: 4,
-          pointBackgroundColor: '#4c8ff0',
-          pointBorderColor: '#0e1217',
+          pointBackgroundColor: line,
+          pointBorderColor: pointBorder,
           pointBorderWidth: 2,
         }],
       },
@@ -54,18 +58,34 @@ document.addEventListener('htmx:afterSwap', function (e) { propolisInitCharts(e.
 <div class="topnav">
 <a class="wordmark" href="/">Propolis</a>
 {% block nav %}
-<nav>
-<a href="/" class="{% if active_nav == "dashboard" %}active{% endif %}">Dashboard</a>
-<a href="/queue" class="{% if active_nav == "queue" %}active{% endif %}">Review queue{% if pending_count > 0 %} <span class="badge">{{ pending_count }}</span>{% endif %}</a>
-<a href="/feed" class="{% if active_nav == "feed" %}active{% endif %}">Feed status</a>
-<a href="/ips" class="{% if active_nav == "ips" %}active{% endif %}">IPs</a>
-<a href="/search/events" class="{% if active_nav == "search" %}active{% endif %}">Search</a>
-<a href="/logs" class="{% if active_nav == "logs" %}active{% endif %}">Logs</a>
+<nav class="mainnav" aria-label="Console sections">
+<a href="/"{% if active_nav == "dashboard" %} class="active" aria-current="page"{% endif %}>Dashboard</a>
+<a href="/queue"{% if active_nav == "queue" %} class="active" aria-current="page"{% endif %}>Review{% if pending_count > 0 %} <span class="badge">{{ pending_count }}</span>{% endif %}</a>
+<a href="/ips"{% if active_nav == "ips" %} class="active" aria-current="page"{% endif %}>Attackers</a>
+<a href="/feed"{% if active_nav == "feed" %} class="active" aria-current="page"{% endif %}>Feed</a>
+<a href="/search/events"{% if active_nav == "search" %} class="active" aria-current="page"{% endif %}>Search</a>
+<div class="menu" id="opsmenu">
+<button class="navlike{% if active_nav == "logs" or active_nav == "samples" or active_nav == "integrity" %} active{% endif %}" id="opsbtn" aria-haspopup="true" aria-expanded="false" aria-controls="opslist">Operations <span aria-hidden="true">&#9662;</span></button>
+<div class="menu-list" id="opslist" role="menu" aria-labelledby="opsbtn" hidden>
+<a href="/logs" role="menuitem"{% if active_nav == "logs" %} aria-current="page"{% endif %}>Logs <span class="hint">live tail</span></a>
+<a href="/samples" role="menuitem"{% if active_nav == "samples" %} aria-current="page"{% endif %}>Samples <span class="hint">malware</span></a>
+<a href="/integrity" role="menuitem"{% if active_nav == "integrity" %} aria-current="page"{% endif %}>Integrity <span class="hint">chain</span></a>
+</div>
+</div>
 </nav>
 <div class="right">
-<form action="/search/events" method="get" class="nav-search">
-<input type="text" name="q" placeholder="Search events..." autocomplete="off">
+<form action="/search/events" method="get" class="nav-search" role="search">
+<input type="text" name="q" placeholder="Quick search" aria-label="Quick search events" autocomplete="off">
 </form>
+<label class="theme-switch">
+<span class="visually-hidden">Theme</span>
+<select id="theme-select" aria-label="Colour theme">
+<option value="graphite">Graphite</option>
+<option value="cream">Cream</option>
+<option value="system">System</option>
+<option value="hacker">1337 |-|4&gt;&lt;0R</option>
+</select>
+</label>
 <span class="nav-meta mono dim">up {{ uptime }}</span>
 <span class="nav-meta mono dim">v{{ version }}</span>
 <a href="/logout">Sign out</a>
@@ -77,5 +97,137 @@ document.addEventListener('htmx:afterSwap', function (e) { propolisInitCharts(e.
 {% block content %}{% endblock %}
 </main>
 <div class="status-line">propolis v{{ version }} - up {{ uptime }}</div>
+
+{# Evidence drawer: a slide-over that HTMX-loads the real per-IP dossier fragment. It only ever
+   supplements the real /ip/{ip} page - every attacker row's IP is a real <a href="/ip/{ip}"> that
+   navigates there without JS, and the drawer's own "Open full page" is the same real link. Starts
+   inert + aria-hidden with no aria-modal; those flip only while it is open. #}
+<div class="scrim" id="drawer-scrim" hidden></div>
+<aside class="drawer" id="drawer" role="dialog" aria-labelledby="drawer-title" tabindex="-1" aria-hidden="true" inert>
+<div class="drawer-head">
+<span class="drawer-eyebrow" id="drawer-title">Evidence</span>
+<button type="button" class="iconbtn" id="drawer-close" aria-label="Close evidence drawer">&times;</button>
+</div>
+<div id="drawer-body" aria-live="polite"></div>
+</aside>
+
+<script>
+(function () {
+  // ---- theme switcher ------------------------------------------------------
+  // The head applies the stored theme before first paint; here we keep the <select> in sync and
+  // persist + recolour charts on change. localStorage may throw (private mode) - never let it break
+  // the page. "system" follows the OS via CSS; the other three pin a palette.
+  var THEMES = { graphite: 1, cream: 1, system: 1, hacker: 1 };
+  function storedTheme() { try { return localStorage.getItem('propolis-theme'); } catch (e) { return null; } }
+  function applyTheme(t) {
+    if (!THEMES[t]) t = 'graphite';
+    document.documentElement.setAttribute('data-theme', t);
+    if (typeof propolisSyncChartTheme === 'function') propolisSyncChartTheme();
+    propolisInitCharts(document);
+    document.dispatchEvent(new CustomEvent('propolis:themechange'));
+  }
+  var sel = document.getElementById('theme-select');
+  if (sel) {
+    var cur = storedTheme(); if (!THEMES[cur]) cur = 'graphite';
+    sel.value = cur;
+    sel.addEventListener('change', function () {
+      var t = THEMES[sel.value] ? sel.value : 'graphite';
+      try { localStorage.setItem('propolis-theme', t); } catch (e) {}
+      applyTheme(t);
+    });
+  }
+  // The OS theme changing only matters while "system" is selected; CSS handles the recolour, we just
+  // resync the canvas colours.
+  if (window.matchMedia) {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+      if ((storedTheme() || 'graphite') === 'system') { if (typeof propolisSyncChartTheme === 'function') propolisSyncChartTheme(); propolisInitCharts(document); }
+    });
+  }
+
+  // ---- Operations dropdown -------------------------------------------------
+  var opsBtn = document.getElementById('opsbtn');
+  var opsList = document.getElementById('opslist');
+  var opsMenu = document.getElementById('opsmenu');
+  function opsItems() { return opsList ? Array.prototype.slice.call(opsList.querySelectorAll('[role="menuitem"]')) : []; }
+  function openOps() {
+    if (!opsList) return;
+    opsList.hidden = false; opsMenu.classList.add('open'); opsBtn.setAttribute('aria-expanded', 'true');
+  }
+  function closeOps(focusBtn) {
+    if (!opsList) return;
+    opsList.hidden = true; opsMenu.classList.remove('open'); opsBtn.setAttribute('aria-expanded', 'false');
+    if (focusBtn && opsBtn) opsBtn.focus();
+  }
+  if (opsBtn) {
+    opsBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (opsList.hidden) { openOps(); } else { closeOps(false); }
+    });
+    opsBtn.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); openOps(); var it = opsItems(); if (it.length) it[0].focus(); }
+    });
+    opsList.addEventListener('keydown', function (e) {
+      var it = opsItems(); var i = it.indexOf(document.activeElement);
+      if (e.key === 'Escape') { e.preventDefault(); closeOps(true); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); if (i < it.length - 1) it[i + 1].focus(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); if (i > 0) it[i - 1].focus(); else opsBtn.focus(); }
+    });
+    document.addEventListener('click', function (e) { if (opsMenu && !opsMenu.contains(e.target)) closeOps(false); });
+  }
+
+  // ---- evidence drawer -----------------------------------------------------
+  var drawer = document.getElementById('drawer');
+  var scrim = document.getElementById('drawer-scrim');
+  var closeBtn = document.getElementById('drawer-close');
+  var lastTrigger = null;
+  function focusables() {
+    return drawer.querySelectorAll('a[href], button:not([disabled]), input, select, textarea, [tabindex]:not([tabindex="-1"])');
+  }
+  function openDrawer(trigger) {
+    lastTrigger = trigger || document.activeElement;
+    scrim.hidden = false; scrim.classList.add('open');
+    drawer.classList.add('open');
+    drawer.removeAttribute('inert'); drawer.removeAttribute('aria-hidden');
+    drawer.setAttribute('aria-modal', 'true');
+    setTimeout(function () { try { closeBtn.focus(); } catch (e) {} }, 0);
+  }
+  function closeDrawer() {
+    if (!drawer.classList.contains('open')) return;
+    scrim.classList.remove('open'); scrim.hidden = true;
+    drawer.classList.remove('open');
+    if (lastTrigger && lastTrigger.focus) { try { lastTrigger.focus(); } catch (e) {} }
+    lastTrigger = null;
+    drawer.removeAttribute('aria-modal');
+    drawer.setAttribute('aria-hidden', 'true'); drawer.inert = true;
+  }
+  if (drawer) {
+    if (closeBtn) closeBtn.addEventListener('click', closeDrawer);
+    if (scrim) scrim.addEventListener('click', closeDrawer);
+    drawer.addEventListener('keydown', function (e) {
+      if (e.key !== 'Tab') return;
+      var f = focusables(); if (!f.length) return;
+      var first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && drawer.classList.contains('open')) closeDrawer(); });
+    // HTMX drives the load: an ".insp" trigger carries hx-get to the drawer fragment. Open the
+    // drawer as its request starts, and (re)focus once the real content has swapped in.
+    document.body.addEventListener('htmx:beforeRequest', function (e) {
+      var t = e.detail.elt;
+      if (t && t.classList && t.classList.contains('insp')) openDrawer(t);
+    });
+    document.body.addEventListener('htmx:afterSwap', function (e) {
+      if (e.detail.target && e.detail.target.id === 'drawer-body') { try { closeBtn.focus(); } catch (err) {} }
+    });
+    // If HTMX fails to load the dossier, don't strand the operator in an empty drawer.
+    document.body.addEventListener('htmx:responseError', function (e) {
+      if (e.detail.elt && e.detail.elt.classList && e.detail.elt.classList.contains('insp')) {
+        document.getElementById('drawer-body').innerHTML = '<p class="empty-line">Could not load evidence. <a href="' + e.detail.elt.getAttribute('href') + '">Open the full page</a>.</p>';
+      }
+    });
+  }
+})();
+</script>
 </body>
 </html>

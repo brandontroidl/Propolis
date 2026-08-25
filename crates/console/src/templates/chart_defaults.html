@@ -1,10 +1,20 @@
 </script>
 <script>
-Chart.defaults.color = '#9db0be';
-Chart.defaults.borderColor = '#253039';
-Chart.defaults.font.family = 'ui-monospace, "JetBrains Mono", Consolas, monospace';
+// Chart global defaults, read from the active theme's CSS custom properties (set on <html> by the
+// head theme-init script before this runs), so charts recolour with the theme. propolisSyncChartTheme
+// is re-called by the theme switcher after a change; falls back to the graphite values if a property
+// is unreadable.
+function propolisSyncChartTheme() {
+  if (typeof Chart === 'undefined') return;
+  var cs = getComputedStyle(document.documentElement);
+  var prop = function (name, fallback) { var v = cs.getPropertyValue(name).trim(); return v || fallback; };
+  Chart.defaults.color = prop('--text-muted', '#a79c8a');
+  Chart.defaults.borderColor = prop('--border', '#332c24');
+  Chart.defaults.font.family = prop('--font-mono', 'ui-monospace, monospace');
+}
 Chart.defaults.font.size = 11;
 Chart.defaults.plugins.legend.display = false;
 Chart.defaults.animation.duration = 0;
+propolisSyncChartTheme();
 </script>
 <script>

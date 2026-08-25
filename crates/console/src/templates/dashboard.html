@@ -47,7 +47,7 @@
     <tbody>
       {% for r in most_active %}
       <tr>
-        <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
+        <td class="ip"><a class="insp" href="/ip/{{ r.ip }}" hx-get="/ip/{{ r.ip }}?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog">{{ r.ip }}</a></td>
         <td><span class="strip">{% for c in r.strip %}<i style="height:{{ c.height }}px"{% if c.class %} class="{{ c.class }}"{% endif %}></i>{% endfor %}</span></td>
         <td class="count">{{ r.event_count }}</td>
         <td><span class="sev-tags">{% for t in r.tags %}<span class="sev sev--{{ t.sev }}">{{ t.label }}</span>{% endfor %}</span></td>
@@ -96,28 +96,41 @@
 <script type="application/json" id="proto-labels">{{ proto_labels|safe }}</script>
 <script type="application/json" id="proto-data">{{ proto_data|safe }}</script>
 <script>
-new Chart(document.getElementById('protoChart'), {
-  type: 'bar',
-  data: {
-    labels: JSON.parse(document.getElementById('proto-labels').textContent),
-    datasets: [{
-      data: JSON.parse(document.getElementById('proto-data').textContent),
-      backgroundColor: '#4c8ff0',
-      borderRadius: 4,
-      maxBarThickness: 20,
-    }],
-  },
-  options: {
-    indexAxis: 'y',
-    responsive: true,
-    maintainAspectRatio: false,
-    scales: {
-      x: { beginAtZero: true, ticks: { precision: 0 } },
-      y: { grid: { display: false } },
-    },
-    plugins: { tooltip: { displayColors: false } },
-  },
-});
+// The protocol bar chart is not a line chart, so it lives outside propolisInitCharts. It reads the
+// active theme's --chart-line at build time and re-renders on the theme-change event the switcher
+// dispatches, so it recolours with everything else.
+(function () {
+  function renderProto() {
+    if (typeof Chart === 'undefined') return;
+    var el = document.getElementById('protoChart'); if (!el) return;
+    var color = getComputedStyle(document.documentElement).getPropertyValue('--chart-line').trim() || '#e0a43f';
+    var ex = Chart.getChart(el); if (ex) ex.destroy();
+    new Chart(el, {
+      type: 'bar',
+      data: {
+        labels: JSON.parse(document.getElementById('proto-labels').textContent),
+        datasets: [{
+          data: JSON.parse(document.getElementById('proto-data').textContent),
+          backgroundColor: color,
+          borderRadius: 4,
+          maxBarThickness: 20,
+        }],
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: { beginAtZero: true, ticks: { precision: 0 } },
+          y: { grid: { display: false } },
+        },
+        plugins: { tooltip: { displayColors: false } },
+      },
+    });
+  }
+  document.addEventListener('DOMContentLoaded', renderProto);
+  document.addEventListener('propolis:themechange', renderProto);
+})();
 </script>
 {% endif %}
 
@@ -131,7 +144,7 @@ new Chart(document.getElementById('protoChart'), {
       <tr>
         <td class="seen mono">{{ e.relative_time }}</td>
         <td>{{ e.activity }}</td>
-        <td class="ip"><a href="/ip/{{ e.source_ip }}">{{ e.source_ip }}</a></td>
+        <td class="ip"><a class="insp" href="/ip/{{ e.source_ip }}" hx-get="/ip/{{ e.source_ip }}?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog">{{ e.source_ip }}</a></td>
       </tr>
       {% endfor %}
     </tbody>
@@ -150,7 +163,7 @@ new Chart(document.getElementById('protoChart'), {
       {% for s in recent_submissions %}
       {% if loop.index <= 3 %}
       <tr>
-        <td class="ip"><a href="/ip/{{ s.source_ip }}">{{ s.source_ip }}</a></td>
+        <td class="ip"><a class="insp" href="/ip/{{ s.source_ip }}" hx-get="/ip/{{ s.source_ip }}?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog">{{ s.source_ip }}</a></td>
         <td>{{ s.vendor }}</td>
         <td class="seen">{{ s.submitted_at }}</td>
         <td>{% if s.success %}<span class="state-pill state-approved">Sent</span>{% else %}<span class="state-pill state-rejected">Failed</span>{% endif %}</td>

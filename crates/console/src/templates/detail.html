@@ -1,7 +1,7 @@
-{% extends "base.html" %}
+{% extends layout %}
 {% block title %}{{ ip }} - Propolis{% endblock %}
 {% block content %}
-<p><a href="/queue">&larr; back to queue</a></p>
+{% if is_drawer %}<p><a class="btn" href="/ip/{{ ip }}">Open full page &nearr;</a></p>{% else %}<p><a href="/queue">&larr; back to queue</a></p>{% endif %}
 <div style="display:flex;align-items:center;gap:1rem;">
 <h1 class="mono" style="margin:0;">{{ ip }}</h1>
 <form method="post" action="/ip/{{ ip }}/delist" style="margin:0;">

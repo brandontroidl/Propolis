@@ -1,10 +1,12 @@
-//! Axum router composition. `/health`, `/ready`, `/metrics`, and `/login` are public - no session
-//! required (a monitoring probe or a Prometheus scraper carries no session; see `health`'s and
-//! `metrics`'s own doc comments). Every other route (dashboard, queue, detail, feed) is mounted in
+//! Axum router composition. `/health`, `/ready`, `/metrics`, `/login`, and `/assets/fonts/*` are
+//! public - no session required (a monitoring probe or a Prometheus scraper carries no session; the
+//! login page must load its fonts before a session exists; see `health`'s, `metrics`'s, and
+//! `assets`'s own doc comments). Every other route (dashboard, queue, detail, feed) is mounted in
 //! a `protected` group wrapped in [`crate::auth::require_session`] via `Router::route_layer`, so a
 //! new page added in a later task only needs to `.merge()` into `protected` below to be
 //! session-gated automatically.
 
+pub mod assets;
 pub(crate) mod context;
 pub mod dashboard;
 pub mod detail;
@@ -48,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .merge(health::router())
         .merge(metrics::router())
         .merge(login::router())
+        .merge(assets::router())
         .merge(protected)
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)

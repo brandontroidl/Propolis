@@ -1,0 +1,5 @@
+{# Bare layout for the evidence drawer: emits only a page's content block, with none of base.html's
+   chrome (no <head>, nav, or <main>). detail.html extends this instead of base.html when the detail
+   handler is answering the drawer's HTMX request, so the drawer shows the real /ip/{ip} dossier with
+   zero markup duplication - it is the same template, rendered into a slide-over instead of a page. #}
+{% block content %}{% endblock %}

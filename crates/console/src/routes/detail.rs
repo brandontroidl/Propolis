@@ -49,7 +49,7 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
@@ -198,8 +198,22 @@ struct CategoryStatView {
 async fn detail(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
+    headers: HeaderMap,
+    Query(query): Query<DetailQuery>,
     Path(ip): Path<IpAddr>,
 ) -> Result<Response, AppError> {
+    // Drawer mode: the evidence drawer's `hx-get="/ip/{ip}?drawer=1"` request. Rendered only for a
+    // genuine HTMX request (the `HX-Request` header) so a person navigating straight to
+    // `/ip/{ip}?drawer=1` still gets the full, chrome-wrapped page - the drawer is a JS enhancement
+    // over that real page, never a separate destination. `is_drawer` swaps detail.html's parent to
+    // the bare `drawer_shell.html`, so the same template renders into the slide-over.
+    let is_drawer = query.drawer.is_some() && headers.contains_key("HX-Request");
+    let layout = if is_drawer {
+        "drawer_shell.html"
+    } else {
+        "base.html"
+    };
+
     let Some(score) = read_score(&state.db, ip).await? else {
         return Ok((StatusCode::NOT_FOUND, not_found_body(ip)).into_response());
     };
@@ -338,6 +352,8 @@ async fn detail(
 
     let tmpl = state.templates.get_template("detail.html")?;
     let html = tmpl.render(context! {
+        layout,
+        is_drawer,
         csrf_token,
         active_nav => "detail",
         pending_count,
@@ -457,6 +473,14 @@ async fn chart_fragment(
 struct EventsCursorQuery {
     #[serde(default)]
     cursor: Option<String>,
+}
+
+/// The one query param `detail` reads: `?drawer=1` marks the evidence-drawer HTMX request (see
+/// `detail`). Any presence of the param counts; its value is unused.
+#[derive(Debug, Deserialize)]
+struct DetailQuery {
+    #[serde(default)]
+    drawer: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

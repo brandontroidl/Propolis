@@ -148,6 +148,11 @@
 :root[data-theme="hacker"] body { text-shadow: 0 0 2px rgba(5,214,127,0.35); }
 :root[data-theme="hacker"] .wordmark { text-shadow: 0 0 6px rgba(5,214,127,0.55); }
 * { box-sizing: border-box; }
+/* Contain the off-canvas evidence drawer (position:fixed, translated off-screen-right when closed)
+   so it never adds page-level horizontal scroll. `clip` (not `hidden`) does not create a scroll
+   container, so the sticky top nav still works. Page CONTENT reflows within the viewport on its own;
+   this only holds the intentionally-off-screen drawer. */
+html { overflow-x: clip; }
 html, body {
   margin: 0;
   padding: 0;
@@ -621,7 +626,14 @@ button:hover { border-color: var(--text-muted); }
 
 @media (max-width: 640px) {
   .topnav nav { flex-wrap: wrap; }
+  /* The right-hand chrome (quick-search, theme switch, uptime/version, sign out) wraps to its own
+     full-width row and the search field spans it, so the masthead never forces horizontal scroll. */
+  .topnav .right { flex-wrap: wrap; margin-left: 0; width: 100%; gap: 0.5rem 1rem; }
+  .nav-search, .nav-search input[type="text"] { width: 100%; }
   .drawer { width: 100%; }
+  /* Wide tables scroll within their own panel on narrow screens instead of being clipped, so every
+     column stays reachable and the page body never scrolls sideways. */
+  .panel { overflow-x: auto; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; scroll-behavior: auto !important; }

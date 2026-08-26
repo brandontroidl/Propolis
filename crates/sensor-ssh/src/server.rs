@@ -397,7 +397,9 @@ async fn handle_session(
                                         line_buf.clear();
                                         let (output, events) = shell.handle_input(&line);
                                         for event in &events {
-                                            let _ = emitter.append(event).await;
+                                            if emitter.append(event).await.is_err() {
+                                                tracing::error!(%peer_addr, "ssh: failed to append command event");
+                                            }
                                         }
                                         if !output.is_empty() {
                                             // The shared shell emits bare LF; a raw-mode client
@@ -432,7 +434,9 @@ async fn handle_session(
                                         line_buf.clear();
                                         let (_output, events) = shell.handle_input(&line);
                                         for event in &events {
-                                            let _ = emitter.append(event).await;
+                                            if emitter.append(event).await.is_err() {
+                                                tracing::error!(%peer_addr, "ssh: failed to append command event");
+                                            }
                                         }
                                     }
                                 }

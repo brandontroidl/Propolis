@@ -199,7 +199,8 @@ impl FakeShell {
             Some("ping") => cmd_ping(parts),
             // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
             // for sh/bash instantly outs the honeypot and the dropper leaves. Model a nested shell.
-            Some("sh") | Some("bash") => self.cmd_shell_spawn(parts),
+            // `ash` is BusyBox's shell and appears in the applet list, so it resolves here too.
+            Some("sh") | Some("bash") | Some("ash") => self.cmd_shell_spawn(parts),
             // The canonical Mirai/Gafgyt probe is `/bin/busybox <TOKEN>`, which they confirm by the
             // exact "<TOKEN>: applet not found" reply; they also fetch payloads via `busybox wget`
             // and `busybox tftp`.
@@ -208,6 +209,13 @@ impl FakeShell {
             // non-interactive fetch prints nothing on success) rather than "command not found". The
             // target URL is captured by `download_target` above.
             Some("tftp") | Some("ftpget") => String::new(),
+            // Filesystem/no-output applets in a loader's drop chain (`chmod +x x`, then `cp`/`rm`/
+            // `mkdir`/`sleep`). A real shell prints nothing on success, and "command not found" for
+            // `chmod` is impossible on any real Linux - it outs the honeypot before the loader ever
+            // executes its payload, costing the capture - so model them as silent successes.
+            Some("chmod") | Some("cp") | Some("rm") | Some("mkdir") | Some("sleep") => {
+                String::new()
+            }
             Some("cd") => {
                 self.cwd = first_non_flag_arg(&parts[1..])
                     .unwrap_or("/root")
@@ -309,9 +317,13 @@ fn command_basename(token: &str) -> &str {
 /// found" and must not be recorded as a fetch the persona did not answer in character.
 fn download_target<'a>(parts: &[&'a str]) -> Option<&'a str> {
     const FETCHERS: [&str; 4] = ["wget", "curl", "tftp", "ftpget"];
+    // BusyBox ships wget/tftp/ftpget applets but NOT curl, so `busybox curl` is "applet not found"
+    // (see BUSYBOX_APPLETS) and must not be recorded as a fetch the persona did not answer in
+    // character - the same principle the full-path `busybox /bin/tftp` case relies on.
+    const BUSYBOX_FETCHERS: [&str; 3] = ["wget", "tftp", "ftpget"];
     match parts.first().map(|c| command_basename(c)) {
         Some(cmd) if FETCHERS.contains(&cmd) => first_non_flag_arg(&parts[1..]),
-        Some("busybox") if parts.get(1).is_some_and(|a| FETCHERS.contains(a)) => {
+        Some("busybox") if parts.get(1).is_some_and(|a| BUSYBOX_FETCHERS.contains(a)) => {
             first_non_flag_arg(&parts[2..])
         }
         _ => None,
@@ -344,51 +356,140 @@ fn url_if_fetch_line(line: &str) -> Option<&str> {
     None
 }
 
-/// BusyBox applets this shell models, so `busybox <applet>` delegates to the same handler the bare
-/// command uses. Anything outside this set returns "applet not found" (the Mirai/Gafgyt tell).
+/// The BusyBox applets this shell models - the SINGLE source of truth for both the multi-call banner
+/// and `busybox <applet>` dispatch, so the advertised list can never contradict what the shell
+/// actually answers. Advertising an applet the same shell then rejects with "applet not found" was a
+/// clean two-command honeypot classifier. Notable exclusions: `curl` (real BusyBox ships no curl
+/// applet, so `busybox curl` correctly returns "applet not found") and `cd` (a shell builtin, not an
+/// applet). Every entry here is handled by [`FakeShell::dispatch`] when invoked bare, so
+/// `busybox <applet>` never falls through to "command not found".
+const BUSYBOX_APPLETS: &[&str] = &[
+    "ash", "cat", "chmod", "cp", "echo", "ftpget", "id", "ls", "mkdir", "ping", "pwd", "rm", "sh",
+    "sleep", "tftp", "uname", "wget", "whoami",
+];
+
+/// True if `name` is one of the applets this shell models (see [`BUSYBOX_APPLETS`]); anything else
+/// returns BusyBox's "applet not found" - the reply Mirai/Gafgyt check to confirm a real busybox.
 fn is_busybox_applet(name: &str) -> bool {
-    matches!(
-        name,
-        "echo"
-            | "cat"
-            | "ls"
-            | "wget"
-            | "id"
-            | "whoami"
-            | "uname"
-            | "pwd"
-            | "cd"
-            | "sh"
-            | "tftp"
-            | "ftpget"
-            | "ping"
-            | "curl"
-    )
+    BUSYBOX_APPLETS.contains(&name)
 }
 
-/// The BusyBox multi-call banner printed by a bare `busybox`. Abbreviated applet list; loaders key
-/// off the "applet not found" reply, not this text.
+/// The BusyBox multi-call banner printed by a bare `busybox`. The applet list is rendered from the
+/// one [`BUSYBOX_APPLETS`] source, so it can never advertise an applet the shell then rejects.
+/// Loaders key off the "applet not found" reply, not this exact text.
 fn busybox_banner() -> String {
-    "BusyBox v1.31.1 (2021-06-01 00:00:00 UTC) multi-call binary.\n\
-     BusyBox is copyrighted by many authors between 1998-2015.\n\
-     \n\
-     Usage: busybox [function [arguments]...]\n\
-     \n\
-     Currently defined functions:\n\
-     \tash, base64, cat, chmod, cp, echo, ftpget, id, ls, mkdir, ping, pwd, rm, sh, sleep,\n\
-     \ttftp, uname, wget, whoami\n"
-        .to_string()
+    let mut s = String::from(
+        "BusyBox v1.31.1 (2021-06-01 00:00:00 UTC) multi-call binary.\n\
+         BusyBox is copyrighted by many authors between 1998-2015.\n\
+         \n\
+         Usage: busybox [function [arguments]...]\n\
+         \n\
+         Currently defined functions:\n",
+    );
+    for (idx, chunk) in BUSYBOX_APPLETS.chunks(8).enumerate() {
+        if idx > 0 {
+            s.push('\n');
+        }
+        s.push('\t');
+        s.push_str(&chunk.join(", "));
+    }
+    s.push('\n');
+    s
 }
 
+/// `uname` with real per-flag field selection. Each flag adds its field and the selected fields
+/// print in coreutils' fixed order (kernel-name, nodename, kernel-release, kernel-version, machine,
+/// processor, hardware-platform, operating-system); a bare `uname` prints the kernel name only, and
+/// `-a` the full canonical line. The previous shortcut - ANY flag returned the whole `uname -a`
+/// line - was a one-probe fingerprint (real `uname -m` prints only `x86_64`) that also fed IoT
+/// loaders a garbage machine string and broke their architecture-based payload selection. Fields
+/// come from persona so `uname` cannot disagree with /etc/os-release or the prompt.
 fn cmd_uname(parts: &[&str]) -> String {
-    if parts.len() > 1 {
-        // Any flag at all gets the full banner; this is a canned-response shell, not a faithful
-        // per-flag `uname` reimplementation, so `-a`/`-r`/`-s`/... are treated alike. Host and
-        // kernel come from persona so `uname` cannot disagree with /etc/os-release or the prompt.
-        format!("{}\n", persona::uname_all(&persona::hostname()))
-    } else {
-        "Linux\n".to_string()
+    let host = persona::hostname();
+    let (
+        mut want_s,
+        mut want_n,
+        mut want_r,
+        mut want_v,
+        mut want_m,
+        mut want_p,
+        mut want_i,
+        mut want_o,
+    ) = (false, false, false, false, false, false, false, false);
+    let mut all = false;
+    let mut any_flag = false;
+    for arg in &parts[1..] {
+        if let Some(long) = arg.strip_prefix("--") {
+            any_flag = true;
+            match long {
+                "all" => all = true,
+                "kernel-name" => want_s = true,
+                "nodename" => want_n = true,
+                "kernel-release" => want_r = true,
+                "kernel-version" => want_v = true,
+                "machine" => want_m = true,
+                "processor" => want_p = true,
+                "hardware-platform" => want_i = true,
+                "operating-system" => want_o = true,
+                _ => {}
+            }
+        } else if let Some(shorts) = arg.strip_prefix('-') {
+            any_flag = true;
+            for c in shorts.chars() {
+                match c {
+                    'a' => all = true,
+                    's' => want_s = true,
+                    'n' => want_n = true,
+                    'r' => want_r = true,
+                    'v' => want_v = true,
+                    'm' => want_m = true,
+                    'p' => want_p = true,
+                    'i' => want_i = true,
+                    'o' => want_o = true,
+                    _ => {}
+                }
+            }
+        }
     }
+    // `-a` reuses the canonical line (same persona source), keeping its exact historical bytes; a
+    // bare `uname` is the kernel name, like real coreutils.
+    if all {
+        return format!("{}\n", persona::uname_all(&host));
+    }
+    if !any_flag {
+        return "Linux\n".to_string();
+    }
+    let mut fields = Vec::new();
+    if want_s {
+        fields.push("Linux".to_string());
+    }
+    if want_n {
+        fields.push(host.clone());
+    }
+    if want_r {
+        fields.push(persona::KERNEL_RELEASE.to_string());
+    }
+    if want_v {
+        fields.push(persona::KERNEL_BUILD.to_string());
+    }
+    if want_m {
+        fields.push(persona::ARCH.to_string());
+    }
+    if want_p {
+        fields.push(persona::ARCH.to_string());
+    }
+    if want_i {
+        fields.push(persona::ARCH.to_string());
+    }
+    if want_o {
+        fields.push("GNU/Linux".to_string());
+    }
+    if fields.is_empty() {
+        // Only unrecognized flags: degrade to the kernel name rather than erroring, since a wrong
+        // error format would itself be a tell.
+        return "Linux\n".to_string();
+    }
+    format!("{}\n", fields.join(" "))
 }
 
 /// A plausible fetched body, printed by `curl URL` and `wget -O- URL` (the `... | sh` pattern).
@@ -731,8 +832,8 @@ mod echo_tests {
 #[cfg(test)]
 mod shell_detection_tests {
     use super::{
-        EmitContext, FakeShell, SIGNAL_HONEYPOT_FILE_DOWNLOAD, cmd_curl, cmd_wget, download_target,
-        is_busybox_applet, url_if_fetch_line,
+        BUSYBOX_APPLETS, EmitContext, FakeShell, SIGNAL_HONEYPOT_FILE_DOWNLOAD, busybox_banner,
+        cmd_curl, cmd_uname, cmd_wget, download_target, is_busybox_applet, url_if_fetch_line,
     };
     use crate::fakefs::FakeFs;
 
@@ -969,5 +1070,85 @@ mod shell_detection_tests {
             None,
             "a bare echo of a url is not a download"
         );
+    }
+
+    #[test]
+    fn uname_m_returns_only_the_machine_field() {
+        // The #1 IoT-loader recon command: `uname -m` must print exactly the arch, not the whole
+        // `uname -a` line (the old shortcut returned uname_all for any flag - a one-probe tell that
+        // also broke arch-based payload selection).
+        assert_eq!(cmd_uname(&["uname", "-m"]), "x86_64\n");
+        assert_eq!(cmd_uname(&["uname", "-p"]), "x86_64\n");
+    }
+
+    #[test]
+    fn uname_single_fields_are_selected_individually() {
+        assert_eq!(cmd_uname(&["uname", "-s"]), "Linux\n");
+        assert_eq!(cmd_uname(&["uname", "-r"]), "5.15.0-91-generic\n");
+        assert_eq!(cmd_uname(&["uname", "-n"]), "server01\n");
+    }
+
+    #[test]
+    fn uname_combined_flags_print_fields_in_canonical_order() {
+        // Multiple flags print the selected fields in coreutils' fixed order regardless of the flag
+        // order given.
+        assert_eq!(cmd_uname(&["uname", "-sr"]), "Linux 5.15.0-91-generic\n");
+        assert_eq!(cmd_uname(&["uname", "-rs"]), "Linux 5.15.0-91-generic\n");
+        assert_eq!(
+            cmd_uname(&["uname", "-s", "-r"]),
+            "Linux 5.15.0-91-generic\n"
+        );
+    }
+
+    #[test]
+    fn uname_a_and_bare_keep_their_historical_output() {
+        // Regression guard: the forms that were already correct must not change.
+        assert_eq!(
+            cmd_uname(&["uname", "-a"]),
+            "Linux server01 5.15.0-91-generic #101-Ubuntu SMP x86_64 x86_64 x86_64 GNU/Linux\n"
+        );
+        assert_eq!(cmd_uname(&["uname"]), "Linux\n");
+    }
+
+    #[test]
+    fn chmod_and_drop_chain_verbs_are_silent_successes() {
+        // `chmod +x x` returning "command not found" is impossible on real Linux and aborts the
+        // loader before it runs its payload - the most direct capture-costing tell in the shell.
+        let (out, _) = shell().handle_input("chmod +x /tmp/x");
+        assert_eq!(out, "");
+        for cmd in ["cp a b", "rm x", "mkdir d", "sleep 1"] {
+            let (o, _) = shell().handle_input(cmd);
+            assert_eq!(o, "", "{cmd} should be a silent success, got {o:?}");
+        }
+    }
+
+    #[test]
+    fn busybox_chmod_dispatches_instead_of_applet_not_found() {
+        // The banner advertises chmod; `busybox chmod` must run it, not contradict the banner.
+        let (out, _) = shell().handle_input("busybox chmod +x x");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn busybox_banner_and_applet_set_never_contradict() {
+        // Both are derived from BUSYBOX_APPLETS, so every advertised applet is recognized and every
+        // recognized applet is advertised - the banner-vs-applet contradiction is impossible.
+        let banner = busybox_banner();
+        for applet in BUSYBOX_APPLETS {
+            assert!(
+                is_busybox_applet(applet),
+                "{applet} advertised but not recognized"
+            );
+            assert!(
+                banner.contains(applet),
+                "{applet} recognized but not advertised"
+            );
+        }
+        // curl is not a real BusyBox applet, so `busybox curl` is applet-not-found and it is absent
+        // from the banner.
+        assert!(!is_busybox_applet("curl"));
+        assert!(!banner.contains("curl"));
+        let (out, _) = shell().handle_input("busybox curl http://x/y");
+        assert!(out.contains("curl: applet not found"), "got: {out}");
     }
 }

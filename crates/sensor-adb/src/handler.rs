@@ -427,6 +427,7 @@ pub async fn handle_connection(
                     &mut streams,
                     &emitter,
                     &handoff,
+                    peer_addr,
                 )
                 .await
                 .is_err()
@@ -580,6 +581,7 @@ async fn handle_wrte(
     streams: &mut HashMap<u32, Stream>,
     emitter: &Arc<EventEmitter>,
     handoff: &Arc<CaptureHandoff>,
+    peer_addr: SocketAddr,
 ) -> Result<(), ()> {
     // Routing: arg1 is the recipient's (our) id for the stream - see the module doc's
     // local-id/remote-id convention.
@@ -599,7 +601,9 @@ async fn handle_wrte(
                         line_buf.clear();
                         let (output, events) = shell.handle_input(&line);
                         for event in &events {
-                            let _ = emitter.append(event).await;
+                            if emitter.append(event).await.is_err() {
+                                tracing::error!(%peer_addr, "adb: failed to append command event");
+                            }
                         }
                         responses.extend_from_slice(output.as_bytes());
                         responses.extend_from_slice(SHELL_PROMPT);
@@ -611,7 +615,9 @@ async fn handle_wrte(
                         line_buf.clear();
                         let (_output, events) = shell.handle_input(&line);
                         for event in &events {
-                            let _ = emitter.append(event).await;
+                            if emitter.append(event).await.is_err() {
+                                tracing::error!(%peer_addr, "adb: failed to append command event");
+                            }
                         }
                     }
                 }

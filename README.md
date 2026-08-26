@@ -1,85 +1,112 @@
 # Propolis
 
-Self-hosted honeypot and threat-intelligence platform. Runs native protocol sensors, scores attackers by corroborated evidence across your WAN IPs, and publishes a firewall blocklist - only after you approve each case.
+Self-hosted honeypot and threat-intelligence platform. Native protocol sensors capture
+hostile traffic on your own infrastructure, an append-only hash-chained ledger scores
+each source by corroborated evidence, and - only after you approve each case - Propolis
+publishes a firewall blocklist and files vendor abuse reports.
 
-## Sensors
+Single Rust workspace, PostgreSQL as the one datastore, a loopback operator console, and
+hardened per-sensor systemd services. Every sensor is passive: it captures, it never runs
+what it captures.
 
-12 protocol listeners in one deployment, each a dedicated hardened systemd service:
+> **This is the front door.** Full documentation lives under [`docs/`](docs/README.md);
+> start with **[DOCUMENTATION.md](DOCUMENTATION.md)** for the map, or jump to a
+> [manual for your role](docs/README.md#manuals).
 
-| Sensor | Port | What it captures |
-|---|---|---|
-| SSH | 22 | Key exchange, login attempts, shell commands, file uploads |
-| Telnet | 23 | Login attempts, shell commands |
-| HTTP | 80 | Request paths, headers, POST bodies, path traversal attempts |
-| FTP | 21 | Login attempts, file uploads (STOR), RETR/PORT refused |
-| SMTP | 25 | AUTH credentials, email sender/recipient/subject/body |
-| Redis | 6379 | AUTH, CONFIG SET, SLAVEOF, SET/GET, EVAL attempts |
-| ADB | 5555 | Shell commands, file push capture, pull refused |
-| VNC | 5900 | Authentication attempts (challenge-response) |
-| MySQL | 3306 | Handshake username capture |
-| MSSQL | 1433 | TDS Login7 username capture |
-| PostgreSQL | 5432 | StartupMessage username capture |
-| MongoDB | 27017 | SCRAM authentication username capture |
+## What it is
 
-Every sensor is passive-only (no outbound connections, no execution of captured content), unprivileged (no database handle, no secrets), and drops passwords at capture time.
+- **9 sensor crates covering 12 protocols** in one deployment (SSH, Telnet, HTTP, FTP,
+  SMTP, Redis, ADB, a catch-all port-scan sensor, and a multi-protocol credential sensor
+  for VNC/MySQL/MSSQL/PostgreSQL/MongoDB), each a dedicated hardened service.
+- **Evidence-based scoring** with a *confirmed-real* gate: an IP earns a feed tier or a
+  vendor report only after a completed TCP handshake authenticates against a honeypot
+  sensor - spoofable UDP or lone-SYN traffic never latches it.
+- **Human-approved output**: nothing is published to the blocklist feed or reported to a
+  vendor without explicit operator approval in the console.
+- **An append-only, hash-chained PostgreSQL ledger**: every score is reproducible by
+  replaying the evidence; the chain is enforced by a database trigger.
 
-## Scoring
+See [capabilities](docs/overview/capabilities.md) and the
+[architecture overview](docs/architecture/index.md).
 
-Each attacker IP accumulates a time-decayed score from corroborated evidence:
+## Who it is for
 
-- **Confirmed-real gate**: an IP earns a *vendor report* or a feed *tier* (aggressive/standard) only after a completed TCP handshake, authenticated against a honeypot sensor, proves the source is genuine - spoofable UDP or lone-SYN traffic never latches this, so it never earns a tier or a vendor report. A hyperactive flood is retention-listed on connection count alone (no tier, no vendor report - see "Score decay and retention"), but that count includes only established TCP connections; spoofable UDP/ICMP never counts, so a spoofed datagram flood cannot list an innocent address.
-- **Cross-sensor breadth**: an IP that hits multiple WAN addresses and multiple sensor protocols weighs more than one that pokes a single port.
-- **Eligibility latch**: an IP becomes feed-eligible once it is confirmed-real and has at least two recorded events. Eligibility is a sticky latch - once earned it persists (it is not re-derived from the live decaying score) until the address is explicitly delisted. (Signal category breadth is recorded and still weighs the score, but is not itself an eligibility gate.)
-- **Score decay and retention**: the score decays with a 6-hour half-life. An IP's *tier* is the tier its score earned at its most recent event, then stored - not re-derived continuously - so a quiet Aggressive IP stays Aggressive until a later event recomputes it (lower) or its window lapses; decay lowers the tier at the next event, not while the IP is idle. Feed membership is decided by retention windows (24h aggressive, 48h standard), not by the live score - a quiet attacker is retained for its window rather than dropping out when its score falls. This is a retention feed, not a decay-out feed. A hyperactive flood is volume-listed into the retention windows without a confirmed-real latch, but only its established (completed-TCP) connections count toward the volume threshold - a spoofed UDP/ICMP datagram carries a forgeable sender and never counts, so a spoofed flood cannot list an innocent third party on the feed.
+Defenders running a honeypot on infrastructure they own and are authorized to monitor:
+home labs, researchers, educators, nonprofit / public-safety / government operators, and
+contributors. See [intended audiences](docs/overview/audiences.md) and
+[ethical-use boundaries](docs/overview/ethical-use.md).
 
-## Operator console
+## What it does NOT do
 
-A server-rendered web dashboard (axum + minijinja + HTMX + Chart.js) on loopback:
+Not a network IDS, not a multi-tenant SaaS, not an exploit or offensive tool, not a
+managed service. It ships **no in-process TLS** (put a reverse proxy in front of the
+console) and the systemd `SystemCallFilter` in the shipped units is a **placeholder** you
+are expected to tighten. See [non-goals](docs/overview/non-goals.md) and
+[limitations](docs/overview/limitations.md).
 
-- Six-card stat strip with sparklines (pending review, scored IPs, events/hr, feed entries, top attacker)
-- 24-hour events timeline chart
-- Protocol distribution and top-attackers bar charts
-- Review queue with approve/reject/snooze (HTMX live updates)
-- Per-IP detail page with evidence timeline, category breakdown, WAN breadth, and 7-day activity chart
-- Feed status with tier counts and TTLs
-- Argon2id password auth, HMAC session cookies, CSRF protection, rate-limited login
+## Maturity
 
-## Pipeline
+Source-available and actively developed. The only release **tag is `v0.1.0`**; the
+current tree is `0.3.0` (untagged) and carries roughly two minor bumps of unreleased
+work, including the V12 operator console. It is **not** certified or blessed for
+production - read [maturity and status](docs/overview/maturity-and-status.md) and the
+[production-readiness checklist](docs/getting-started/production-readiness-checklist.md)
+before internet exposure.
+
+## Security cautions
+
+Propolis is designed to sit on the public internet receiving hostile traffic.
+
+- It **captures live malware** into a sterile, `noexec` spool and never executes it -
+  handle the spool accordingly ([malware custody](docs/security/malware-custody.md)).
+- It makes **no outbound requests except five operator-gated paths that all default off**
+  (VirusTotal, the AbuseIPDB/DShield/OTX submitters, console reverse-DNS, and ops-alert
+  ntfy); the sensors themselves are egress-free by construction
+  ([outbound controls](docs/security/outbound-controls.md)).
+- Single node = single blast radius; keep off-host backups.
+
+Full picture: [threat model](docs/security/threat-model.md),
+[hardening checklist](docs/security/hardening-checklist.md),
+[residual risks](docs/security/residual-risks.md). Report a vulnerability privately via
+[SECURITY.md](SECURITY.md).
+
+## Minimal quickstart (evaluation only)
+
+> **Warning:** this brings up listeners that accept hostile traffic. Do it on an isolated
+> host you control, not on a production network, until you have read the
+> [production-readiness checklist](docs/getting-started/production-readiness-checklist.md).
 
 ```
-sensors (passive capture)
-  -> NDJSON event logs (append-only, per-sensor)
-  -> intake tailer (parses, attributes, appends to hash-chained ledger)
-  -> scoring projection (decayed weight, breadth, eligibility gates)
-  -> review queue (operator approves / rejects / snoozes)
-  -> vendor reports (AbuseIPDB, DShield, OTX) + blocklist feed
+cargo build --release            # pinned toolchain in rust-toolchain.toml
+# provide DATABASE_URL + PROPOLIS_CONSOLE_PASSWORD, then run a local evaluation:
 ```
 
-Evidence is an append-only, hash-chained PostgreSQL ledger. Every score is reproducible by replaying it. The chain is enforced at the database layer with a BEFORE INSERT trigger.
+The full, verified evaluation path is in
+[getting-started/evaluation-deployment](docs/getting-started/evaluation-deployment.md);
+production installation is in [operations/installation](docs/operations/installation.md).
 
-## Deployment
+## Documentation
 
-Single node or cluster. Each node runs its sensors and the unified daemon (`propolis`), which composes intake, review, feed, and console as supervised tokio tasks sharing one PgPool. See [INSTALL.md](INSTALL.md) for the full deployment guide.
+- **[DOCUMENTATION.md](DOCUMENTATION.md)** - the corpus map and where to start by role.
+- **[docs/](docs/README.md)** - the full layered corpus (overview, getting-started,
+  architecture, operations, security, development, reference, governance, troubleshooting,
+  history).
+- **[docs/binder/HANDOFF-BINDER.md](docs/binder/HANDOFF-BINDER.md)** - the complete linear
+  handoff binder (offline reading, transfer, audit, AI ingestion).
+- **[Reference](docs/reference/environment-variables.md)** - every environment variable,
+  port, path, table, route, and signal.
 
-```
-cargo build --release
-sudo ./deploy/install.sh
-# configure /etc/propolis/*.env
-sudo systemctl enable --now propolis sensor-ssh sensor-telnet ...
-```
+## Build and architecture
 
-## Architecture
-
-- **Rust** (2024 edition), all dependencies vendored in-tree
-- **PostgreSQL** as the single canonical datastore
-- **Zero unsafe code** in the project (all unsafe is in vendored dependencies)
-- **Hardened systemd units**: `ProtectSystem=strict`, `NoNewPrivileges`, `MemoryDenyWriteExecute`, `CapabilityBoundingSet`, per-sensor OS users, noexec spool mounts
-- **No third-party honeypots**: every sensor is self-authored, so the deployment carries one license and no dependency on upstream honeypot projects
-
-## Security
-
-Tested with a 172-test authorized pentest covering protocol fuzzing, brute force, connection flooding, log injection, XSS/SQLi/CSRF, corroboration gate bypass, hash chain integrity, rogue collector injection, score manipulation, and resource exhaustion. See [SECURITY.md](SECURITY.md) for the vulnerability reporting policy.
+Rust (2024 edition), all dependencies vendored in-tree; PostgreSQL as the single
+datastore; hardened systemd units (`ProtectSystem=strict`, `NoNewPrivileges`,
+`MemoryDenyWriteExecute`, dedicated per-sensor users). No third-party honeypot code -
+every sensor is self-authored. See the [architecture section](docs/architecture/index.md)
+and [supply chain](docs/security/supply-chain.md).
 
 ## License
 
-Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). Free for personal, home-lab, research, educational, nonprofit, and government use. Commercial use requires a separate license.
+Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md) - **not**
+open source. Free for personal, home-lab, research, educational, nonprofit, and government
+use; commercial use requires a separate license. See
+[governance/licensing](docs/governance/licensing.md).

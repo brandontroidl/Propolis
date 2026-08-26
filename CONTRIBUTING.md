@@ -1,37 +1,21 @@
 # Contributing
 
-Propolis is source-available under the PolyForm Noncommercial License. Contributions are welcome
-for noncommercial use.
+Propolis is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
+Contributions are welcome for noncommercial use.
 
-## Development setup
+The full contribution guide now lives in the documentation corpus:
 
-1. Install the Rust toolchain (the pinned version is in `rust-toolchain.toml`).
-2. Start PostgreSQL (e.g., `podman start propolis-pg` if using the dev container).
-3. Set `DATABASE_URL=postgres://propolis:...@localhost:5432/propolis_test`.
-4. Run the gate: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`.
+- **How to contribute** (PR flow, the gate, license terms):
+  [docs/governance/contribution.md](docs/governance/contribution.md)
+- **Contributor manual** (get productive fast):
+  [docs/manuals/contributor.md](docs/manuals/contributor.md)
+- **Development setup, build, and the gate**
+  (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`):
+  [docs/development/build-and-test.md](docs/development/build-and-test.md) ·
+  [docs/development/toolchain-and-environment.md](docs/development/toolchain-and-environment.md)
+- **Coding conventions:**
+  [docs/development/coding-conventions.md](docs/development/coding-conventions.md)
+- **Adding or changing a sensor** (and the invariant tests you must not break):
+  [docs/development/adding-a-sensor.md](docs/development/adding-a-sensor.md)
 
-All dependencies are vendored in-tree (`vendor/`). Use `cargo vendor` after adding or updating a
-dependency, and commit the vendor changes.
-
-## Code style
-
-- Rust 2024 edition. Format with `cargo fmt`.
-- `cargo clippy -- -D warnings` must pass.
-- Conventional commits, lowercase, why-focused body.
-- No comments restating what the code does. Comment only the non-obvious why.
-
-## Testing
-
-Every crate has unit and integration tests. Sensor crates test with real TCP connections against
-an ephemeral listener (`:0`). Database-dependent crates (core-scoring, intake, review, feed,
-console) test against a real PostgreSQL instance.
-
-The CI workflow (`.github/workflows/ci.yml`) runs the full gate on every push and pull request.
-
-## Architecture
-
-Design docs are in `internal/design/`. Architecture decision records are in
-`internal/architecture/adr/`. Read these before proposing structural changes.
-
-The build follows a foundation-first sequencing (ADR-0007): each layer is built complete before
-the next. See `internal/roadmap.md` for the sub-project breakdown.
+Start from [DOCUMENTATION.md](DOCUMENTATION.md) for the full map.

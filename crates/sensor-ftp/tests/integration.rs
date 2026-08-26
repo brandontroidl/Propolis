@@ -144,6 +144,28 @@ async fn login_and_credential_capture() {
 }
 
 #[tokio::test]
+async fn lowercase_and_mixed_case_commands_are_accepted_like_vsftpd() {
+    // RFC 959 commands are case-insensitive and real vsftpd uppercases the verb internally. Before
+    // the fix a lowercase `syst`/`user` fell through to "500 Unknown command" - a one-command
+    // honeypot tell distinguishing this from the vsftpd it advertises.
+    let srv = TestServer::start().await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    assert!(
+        client.send("syst").await.starts_with("215"),
+        "lowercase syst must return 215 like vsftpd"
+    );
+    assert!(
+        client.send("user anonymous").await.starts_with("331"),
+        "lowercase user must be accepted"
+    );
+    assert!(
+        client.send("FeAt").await.starts_with("211"),
+        "mixed-case feat must be accepted"
+    );
+    srv.handle.abort();
+}
+
+#[tokio::test]
 async fn stor_upload_captured_in_spool() {
     let srv = TestServer::start().await;
     let mut client = FtpClient::connect(srv.addr).await;

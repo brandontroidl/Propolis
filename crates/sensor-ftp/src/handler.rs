@@ -92,7 +92,11 @@ pub async fn handle_connection(
         };
         let (cmd, arg) = split_ftp_command(&line);
 
-        match cmd {
+        // RFC 959 commands are case-insensitive and real vsftpd uppercases the verb internally, so a
+        // lowercase `syst`/`user` must dispatch like its uppercase form rather than falling through
+        // to "500 Unknown command" - a one-command tell that a lowercase probe would out. Only the
+        // verb is normalized; `arg` (e.g. a filename) keeps its case, matching the TYPE arm below.
+        match cmd.to_ascii_uppercase().as_str() {
             "USER" => {
                 username = sanitize_value(arg, MAX_USERNAME_LEN);
                 let _ = write_line(&mut reader, b"331 Please specify the password.\r\n").await;

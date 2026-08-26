@@ -152,7 +152,9 @@ pub async fn handle_connection(
             sample: None,
             session_id: Some(session_id),
         };
-        let _ = emitter.append(&event).await;
+        if emitter.append(&event).await.is_err() {
+            tracing::error!(%peer_addr, "http: failed to append request event");
+        }
 
         let response = build_response(&request.method, &request.path);
         let _ = stream.write_all(&response).await;

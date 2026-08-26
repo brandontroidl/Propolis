@@ -92,6 +92,10 @@ pub struct CaptureHandoff {
     tx: mpsc::Sender<CaptureJob>,
     rx: Mutex<Option<mpsc::Receiver<CaptureJob>>>,
     dropped: AtomicU64,
+    /// Captures the worker discarded because the spool refused the body (per-file cap or exhausted
+    /// global budget). Behind an `Arc` because the worker task increments it; `submit` touches only
+    /// `dropped`. Its counterpart accessor is `spool_refused_count`.
+    spool_refused: Arc<AtomicU64>,
     spool: Arc<QuarantineSpool>,
     emitter: Arc<EventEmitter>,
 }
@@ -108,6 +112,7 @@ impl CaptureHandoff {
             tx,
             rx: Mutex::new(Some(rx)),
             dropped: AtomicU64::new(0),
+            spool_refused: Arc::new(AtomicU64::new(0)),
             spool: Arc::new(spool),
             emitter: Arc::new(emitter),
         }
@@ -119,7 +124,18 @@ impl CaptureHandoff {
     /// here would defeat the hand-off's entire reason for existing.
     pub fn submit(&self, job: CaptureJob) -> Result<(), CaptureDropped> {
         self.tx.try_send(job).map_err(|_| {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            // The drop is deliberate (covertness over completeness), but it must not be SILENT: an
+            // attacker can induce it by flooding uploads past the single worker's drain rate, and
+            // every caller discards this Err. Log at power-of-two totals so the first drop is loud
+            // and a sustained flood degrades to logarithmic noise rather than spamming - and
+            // filling - the very log partition the operator relies on.
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    dropped_total = dropped,
+                    "capture hand-off: queue full, sample dropped (no spool, no event)"
+                );
+            }
             CaptureDropped
         })
     }
@@ -129,6 +145,15 @@ impl CaptureHandoff {
     /// its covertness, and the drop is a metric the operator can see."
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Total captures the worker discarded because the spool refused the body - the per-file cap or
+    /// the exhausted global budget (`spool.rs`). Unlike a queue drop, a spool refusal yields neither
+    /// a stored sample nor an event, so this counter is the only in-process record that a capture
+    /// was lost there; surfaced (alongside a per-refusal WARN) so the loss is a metric the operator
+    /// can read rather than a silent gap.
+    pub fn spool_refused_count(&self) -> u64 {
+        self.spool_refused.load(Ordering::Relaxed)
     }
 
     /// Spawn the single task that drains the queue: for each job, hash and store its body,
@@ -153,10 +178,11 @@ impl CaptureHandoff {
             .expect("CaptureHandoff::start_worker called more than once");
         let spool = self.spool.clone();
         let emitter = self.emitter.clone();
+        let spool_refused = self.spool_refused.clone();
 
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
-                process_job(&spool, &emitter, job).await;
+                process_job(&spool, &emitter, &spool_refused, job).await;
             }
         })
     }
@@ -165,7 +191,12 @@ impl CaptureHandoff {
 /// Process exactly one job to completion: store, sanitize `orig_name`, build the event, emit.
 /// Never propagates a panic - see the module doc for why a panicking `event_builder` (a bug in a
 /// sensor's own closure) must not end the worker loop every later job still depends on.
-async fn process_job(spool: &QuarantineSpool, emitter: &EventEmitter, job: CaptureJob) {
+async fn process_job(
+    spool: &QuarantineSpool,
+    emitter: &EventEmitter,
+    spool_refused: &AtomicU64,
+    job: CaptureJob,
+) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         spool.store(&job.body).map(|mut sample_ref| {
             sample_ref.orig_name = sanitize_value(&job.orig_name, MAX_ORIG_NAME_LEN);
@@ -176,8 +207,10 @@ async fn process_job(spool: &QuarantineSpool, emitter: &EventEmitter, job: Captu
     let event = match outcome {
         Ok(Ok(event)) => event,
         Ok(Err(e)) => {
+            let refused = spool_refused.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(
                 error = %e,
+                spool_refused_total = refused,
                 "capture hand-off: spool refused body; sample not retained, no event emitted"
             );
             return;
@@ -473,6 +506,15 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         worker.abort();
+
+        // The spool refusal is now counted (previously it was only a log line with no metric),
+        // giving parity with the queue-drop `dropped_count`.
+        assert_eq!(handoff.spool_refused_count(), 1);
+        assert_eq!(
+            handoff.dropped_count(),
+            0,
+            "neither submit was queue-dropped"
+        );
 
         let content = tokio::fs::read_to_string(&log_path).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();

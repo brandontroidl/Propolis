@@ -70,18 +70,19 @@ Full picture: [threat model](docs/security/threat-model.md),
 [residual risks](docs/security/residual-risks.md). Report a vulnerability privately via
 [SECURITY.md](SECURITY.md).
 
-## Minimal quickstart (evaluation only)
+## Build and evaluate
 
-> **Warning:** this brings up listeners that accept hostile traffic. Do it on an isolated
-> host you control, not on a production network, until you have read the
+> **Warning:** the evaluation path brings up listeners that accept hostile traffic. Do it on
+> an isolated host you control, not on a production network, until you have read the
 > [production-readiness checklist](docs/getting-started/production-readiness-checklist.md).
 
 ```
 cargo build --release            # pinned toolchain in rust-toolchain.toml
-# provide DATABASE_URL + PROPOLIS_CONSOLE_PASSWORD, then run a local evaluation:
 ```
 
-The full, verified evaluation path is in
+Building does not start Propolis. Bringing it up - Postgres and `DATABASE_URL`,
+migrations, `PROPOLIS_CONSOLE_PASSWORD`, and the sensor listeners - is the full,
+verified evaluation path in
 [getting-started/evaluation-deployment](docs/getting-started/evaluation-deployment.md);
 production installation is in [operations/installation](docs/operations/installation.md).
 

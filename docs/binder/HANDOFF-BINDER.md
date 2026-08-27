@@ -11,8 +11,11 @@ last-verified: 2026-08-26
 
 A single linear document that assembles the whole Propolis picture in reading
 order: what it is, how it is built, how it is secured, deployed, operated, and
-maintained, and where it came from. It is meant to be read top to bottom - for
-offline reading, project transfer, audit, or ingestion by a downstream tool.
+maintained, and where it came from. It is meant to be read top to bottom as an
+orientation layer for project transfer, audit, or review - not a self-contained
+replacement for the corpus. Exact reference material is not reproduced here, so
+full depth, offline reading, and downstream-tool ingestion all require the
+linked canonical pages alongside it.
 
 This binder is a **synthesis and index, not a second source of truth.** Every
 section summarizes the canonical pages that own its facts and links to them for
@@ -137,7 +140,7 @@ Read the version signals together, not in isolation
 | Only release tag | `v0.1.0` (annotated, commit `e0bfd513`, 2026-08-02) |
 | `v0.2.0` / `v0.3.0` tags | do not exist - the `0.3.0` tree is **untagged** |
 | `CHANGELOG.md` | a single, undated `## Unreleased` section, not version-partitioned |
-| Current `main` HEAD (this pass) | `2ed77827` |
+| `main` HEAD when last verified (2026-08-26) | `5f2413b7` (volatile - a point-in-time snapshot, not live state) |
 | Rust edition / MSRV | edition 2024; no `rust-version`/MSRV declared |
 
 So the working tree is roughly **two unpublished minor bumps ahead of the tagged
@@ -804,7 +807,7 @@ the **code-observable** decisions in [architecture decisions](../architecture/de
 
 **Audits** ([audits](../history/audits.md)). A read-only sensor adversarial audit
 (2026-08-25/26) merged its fidelity and observability hardening into `main` at
-`2ed77827` (the current HEAD); it reported the dangerous vulnerability classes
+`2ed77827` (the audit's merge commit); it reported the dangerous vulnerability classes
 (memory-safety, RCE, sandbox-escape, injection) clean. Specific detection tells
 are deliberately not published. The separate "172-test pentest" claim remains
 unverified from the public tree.

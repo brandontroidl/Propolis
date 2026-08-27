@@ -27,7 +27,8 @@ from code evidence.
 
 ## Status vocabulary
 
-Every published document carries a metadata header (below) whose `status` is one of:
+Every published document **under `docs/`** carries a metadata header (below) whose
+`status` is one of:
 
 | Status | Meaning | Where it lives |
 |---|---|---|
@@ -43,7 +44,8 @@ behavior carries no tag.
 
 ## Document metadata header
 
-Every published `.md` begins with an HTML comment (invisible when rendered):
+Every published `.md` **under `docs/`** begins with an HTML comment (invisible when
+rendered):
 
 ```
 <!--
@@ -59,6 +61,12 @@ last-verified: <YYYY-MM-DD>
 `applies-to` currently reads `0.3.0 (untagged; latest tag v0.1.0)` across the corpus,
 reflecting the real version state (see
 [overview/maturity-and-status](overview/maturity-and-status.md)).
+
+Root-level files that follow GitHub placement conventions - `README.md`,
+`DOCUMENTATION.md`, `INSTALL.md`, `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`,
+`LICENSE.md` - are **exempt** from the metadata-header rule; it governs the `docs/`
+corpus only. They are still bound by the source-of-truth and public-safety rules
+above.
 
 ## One canonical owner per fact
 

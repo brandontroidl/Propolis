@@ -18,7 +18,7 @@ fingerprint the honeypot.
 
 A read-only adversarial audit of the sensor surface was performed, and its
 remediations merged into `main` as **"sensor fidelity + observability hardening from
-the adversarial audit"** (merge commit `2ed77827`, the current `main` HEAD).
+the adversarial audit"** (merge commit `2ed77827`).
 
 **Outcome, public-safe:**
 

@@ -84,3 +84,11 @@ canonical successor), not silent redirects.
 
 The authoritative, always-current version of this map is
 `docs/history/old-to-new-map.md`; this table is the archive-time snapshot.
+
+> **Erratum (2026-08-26):** the `deploy/blocklist-README.md` row names
+> `docs/reference/feed-formats.md` as a successor. That path was never created.
+> The authoritative successors are in `docs/history/old-to-new-map.md`
+> (`reference/integrations.md` and `operations/routine-procedures.md`); the
+> feed's output format is documented in `docs/reference/scoring-and-feed.md`.
+> The table above is left as-authored as a point-in-time snapshot; this note is
+> the correction.

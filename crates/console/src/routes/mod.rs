@@ -29,6 +29,24 @@ use axum::middleware;
 use crate::AppState;
 use crate::auth::require_session;
 
+/// The live effective threat score, expressed in SQL, for ordering and displaying IPs by their
+/// score AS OF NOW rather than by the stored `raw_score` - which is anchored at each IP's last
+/// event via `decay_anchor`, so ordering by it ranks every IP at its own last-event moment and a
+/// long-idle high score outranks an actively-attacking one.
+///
+/// This reproduces exactly what `routes::detail` displays and what `core_scoring::read_score`
+/// projects: the stored `raw_score` decayed to now over the 6h half-life, then scaled by the
+/// breadth factor and clamped to the score cap. Persistence is deliberately NOT folded in - the
+/// detail page's effective score is `effective_score(read_score().raw_score, wan)`, which excludes
+/// it (persistence lifts only the gate-facing score, never the displayed effective one), and these
+/// ranking/display surfaces must agree with that page.
+///
+/// The literals mirror `core-scoring/src/scoring/constants.rs` (`HALF_LIFE_SECONDS` = 21600,
+/// `BREADTH_PER_WAN` = 0.15, `BREADTH_CAP` = 0.60, `SCORE_CAP` = 100); the
+/// `live_effective_score_sql_matches_core_scoring` test in `tests/routes_test.rs` guards them
+/// against drift by comparing this expression to `core_scoring::effective_score` over real rows.
+pub const LIVE_EFFECTIVE_SCORE_SQL: &str = "LEAST(100, raw_score * power(0.5, EXTRACT(EPOCH FROM (now() - decay_anchor)) / 21600.0) * (1.0 + LEAST(0.60, 0.15 * GREATEST(0, distinct_wan_count - 1))))";
+
 /// Builds the full console router for the given state.
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()

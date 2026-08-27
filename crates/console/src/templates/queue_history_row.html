@@ -1,5 +1,6 @@
+{% import "macros.html" as m %}
 <tr id="row-{{ row.ip }}">
-  <td class="ip"><a href="/ip/{{ row.ip }}">{{ row.ip }}</a></td>
+  <td class="ip">{{ m.ip_evidence_link(row.ip) }}</td>
   <td class="score"><span class="meter"><span class="meter-fill{% if row.score_pct >= 90 %} meter-fill--crit{% elif row.score_pct >= 75 %} meter-fill--high{% elif row.score_pct >= 50 %} meter-fill--warn{% endif %}" style="--pct: {{ row.score_pct }}%"></span></span>{{ row.score }}</td>
   <td>
     {% if row.tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>

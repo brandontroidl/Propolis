@@ -1,0 +1,10 @@
+{#- Shared IP "evidence link": the canonical drawer trigger. `class="insp"` is what the drawer JS
+    (base_tail.html) keys on via a delegated `htmx:beforeRequest` listener, and the real `href` is
+    the no-JavaScript fallback (full-page navigation to the same dossier). Every ordinary IP link in
+    the console MUST route through this macro so the drawer contract cannot silently drift per page -
+    it did: Review, Feed, and Search shipped plain links that navigated instead of opening the
+    drawer. Session-anchor links (`/ip/{ip}#session-...`) are a deliberate exception (the drawer
+    request does not preserve the anchor) and stay plain full-page links. -#}
+{% macro ip_evidence_link(ip) -%}
+<a class="insp" href="/ip/{{ ip }}" hx-get="/ip/{{ ip }}?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog">{{ ip }}</a>
+{%- endmacro %}

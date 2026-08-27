@@ -51,12 +51,17 @@ const SEARCH_HTML: &str = include_str!("templates/search.html");
 const SEARCH_EVENTS_ROWS_HTML: &str = include_str!("templates/search_events_rows.html");
 const SEARCH_EVENTS_FRAGMENT_HTML: &str = include_str!("templates/search_events_fragment.html");
 const LOGS_HTML: &str = include_str!("templates/logs.html");
+const MACROS_HTML: &str = include_str!("templates/macros.html");
 
 /// Builds the environment once at startup (`AppState::templates`); cheap to construct (five small
 /// templates) but shared via `Arc` so the source is parsed exactly once per process rather than
 /// once per request.
 pub fn environment() -> Environment<'static> {
     let mut env = Environment::new();
+    // Shared macros (the canonical IP evidence-link drawer trigger). Imported by every page that
+    // renders an IP link so the drawer contract lives in exactly one place.
+    env.add_template("macros.html", MACROS_HTML)
+        .expect("macros.html must be a valid template");
     env.add_template("base.html", BASE_HTML)
         .expect("base.html must be a valid template");
     env.add_template("dashboard.html", DASHBOARD_HTML)

@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block title %}All IPs - Propolis{% endblock %}
 {% block content %}
-<h2>Attackers <span class="dim">({{ total }})</span></h2>
+{% import "macros.html" as m %}
+<h1>Attackers <span class="dim">({{ total }})</span></h1>
 
 <div class="table-wrap">
 <table class="table-compact">
@@ -22,7 +23,7 @@
     {% for ip in ips %}
     <tr>
       <td class="count"><strong>{{ ip.raw_score }}</strong></td>
-      <td class="ip"><a class="insp" href="/ip/{{ ip.ip }}" hx-get="/ip/{{ ip.ip }}?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog">{{ ip.ip }}</a></td>
+      <td class="ip">{{ m.ip_evidence_link(ip.ip) }}</td>
       <td>{% if ip.tier != "-" %}<span class="tier-{{ ip.tier }}">{{ ip.tier }}</span>{% else %}<span class="dim">-</span>{% endif %}</td>
       <td class="count">{{ ip.event_count }}</td>
       <td class="mono">{{ ip.distinct_categories }}</td>

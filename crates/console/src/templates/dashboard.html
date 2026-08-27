@@ -1,6 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Dashboard - Propolis{% endblock %}
 {% block content %}
+{% import "macros.html" as m %}
+<h1 class="visually-hidden">Dashboard</h1>
 {# Status band - the one thing read first. Leads with the question the console exists to answer:
    does anything need me right now? Every cell is backed by data already in this route's context. #}
 <div class="band">
@@ -17,7 +19,7 @@
   <div class="cell">
     <span class="label">Scored IPs</span>
     <div class="v">{{ total_scored_ips }}</div>
-    <div class="foot">{% if top_attacker_ip != "--" %}top <a href="/ip/{{ top_attacker_ip }}">{{ top_attacker_ip }}</a>{% else %}no attackers yet{% endif %}</div>
+    <div class="foot">{% if top_attacker_ip != "--" %}top {{ m.ip_evidence_link(top_attacker_ip) }}{% else %}no attackers yet{% endif %}</div>
   </div>
   <div class="cell">
     <span class="label">Published</span>
@@ -47,7 +49,7 @@
     <tbody>
       {% for r in most_active %}
       <tr>
-        <td class="ip"><a class="insp" href="/ip/{{ r.ip }}" hx-get="/ip/{{ r.ip }}?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog">{{ r.ip }}</a></td>
+        <td class="ip">{{ m.ip_evidence_link(r.ip) }}</td>
         <td><span class="strip">{% for c in r.strip %}<i style="height:{{ c.height }}px"{% if c.class %} class="{{ c.class }}"{% endif %}></i>{% endfor %}</span></td>
         <td class="count">{{ r.event_count }}</td>
         <td><span class="sev-tags">{% for t in r.tags %}<span class="sev sev--{{ t.sev }}">{{ t.label }}</span>{% endfor %}</span></td>
@@ -144,7 +146,7 @@
       <tr>
         <td class="seen mono">{{ e.relative_time }}</td>
         <td>{{ e.activity }}</td>
-        <td class="ip"><a class="insp" href="/ip/{{ e.source_ip }}" hx-get="/ip/{{ e.source_ip }}?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog">{{ e.source_ip }}</a></td>
+        <td class="ip">{{ m.ip_evidence_link(e.source_ip) }}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -163,7 +165,7 @@
       {% for s in recent_submissions %}
       {% if loop.index <= 3 %}
       <tr>
-        <td class="ip"><a class="insp" href="/ip/{{ s.source_ip }}" hx-get="/ip/{{ s.source_ip }}?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog">{{ s.source_ip }}</a></td>
+        <td class="ip">{{ m.ip_evidence_link(s.source_ip) }}</td>
         <td>{{ s.vendor }}</td>
         <td class="seen">{{ s.submitted_at }}</td>
         <td>{% if s.success %}<span class="state-pill state-approved">Sent</span>{% else %}<span class="state-pill state-rejected">Failed</span>{% endif %}</td>

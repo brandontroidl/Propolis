@@ -1,6 +1,7 @@
 {% extends "base.html" %}
-{% block title %}Search - Propolis{% endblock %}
+{% block title %}{% if mode == "ips" %}IP search{% else %}Event search{% endif %} - Propolis{% endblock %}
 {% block content %}
+{% import "macros.html" as m %}
 <h1>Search</h1>
 
 <form id="search-filter-form" class="filter-form" method="get" action="{% if mode == "ips" %}/search/ips{% else %}/search/events{% endif %}">
@@ -54,7 +55,7 @@
       <tbody>
         {% for r in ip_rows %}
         <tr>
-          <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
+          <td class="ip">{{ m.ip_evidence_link(r.ip) }}</td>
           <td class="count">{{ r.match_count }}</td>
           <td class="mono"><span class="meter"><span class="meter-fill{% if r.score_pct >= 90 %} meter-fill--crit{% elif r.score_pct >= 75 %} meter-fill--high{% elif r.score_pct >= 50 %} meter-fill--warn{% endif %}" style="--pct: {{ r.score_pct }}%"></span></span>{{ r.score }}</td>
           <td>

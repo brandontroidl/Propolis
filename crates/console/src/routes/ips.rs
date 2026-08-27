@@ -89,33 +89,26 @@ async fn ip_list(
 }
 
 async fn fetch_ips_ordered(state: &AppState, order: &str) -> Result<Vec<IpRowRaw>, AppError> {
-    let rows = match order {
-        "event_count ASC" => sqlx::query_as::<_, IpRowRaw>(
-            "SELECT host(source_ip) AS ip, raw_score::float8 AS score, COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, first_seen, last_seen, eligible FROM ip_score ORDER BY event_count ASC LIMIT 500"
-        ).fetch_all(&state.db).await?,
-        "event_count DESC" => sqlx::query_as::<_, IpRowRaw>(
-            "SELECT host(source_ip) AS ip, raw_score::float8 AS score, COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, first_seen, last_seen, eligible FROM ip_score ORDER BY event_count DESC LIMIT 500"
-        ).fetch_all(&state.db).await?,
-        "first_seen ASC" => sqlx::query_as::<_, IpRowRaw>(
-            "SELECT host(source_ip) AS ip, raw_score::float8 AS score, COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, first_seen, last_seen, eligible FROM ip_score ORDER BY first_seen ASC LIMIT 500"
-        ).fetch_all(&state.db).await?,
-        "first_seen DESC" => sqlx::query_as::<_, IpRowRaw>(
-            "SELECT host(source_ip) AS ip, raw_score::float8 AS score, COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, first_seen, last_seen, eligible FROM ip_score ORDER BY first_seen DESC LIMIT 500"
-        ).fetch_all(&state.db).await?,
-        "last_seen ASC" => sqlx::query_as::<_, IpRowRaw>(
-            "SELECT host(source_ip) AS ip, raw_score::float8 AS score, COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, first_seen, last_seen, eligible FROM ip_score ORDER BY last_seen ASC LIMIT 500"
-        ).fetch_all(&state.db).await?,
-        "last_seen DESC" => sqlx::query_as::<_, IpRowRaw>(
-            "SELECT host(source_ip) AS ip, raw_score::float8 AS score, COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, first_seen, last_seen, eligible FROM ip_score ORDER BY last_seen DESC LIMIT 500"
-        ).fetch_all(&state.db).await?,
-        "raw_score ASC" => sqlx::query_as::<_, IpRowRaw>(
-            "SELECT host(source_ip) AS ip, raw_score::float8 AS score, COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, first_seen, last_seen, eligible FROM ip_score ORDER BY raw_score ASC LIMIT 500"
-        ).fetch_all(&state.db).await?,
-        _ => sqlx::query_as::<_, IpRowRaw>(
-            "SELECT host(source_ip) AS ip, raw_score::float8 AS score, COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, first_seen, last_seen, eligible FROM ip_score ORDER BY raw_score DESC LIMIT 500"
-        ).fetch_all(&state.db).await?,
+    // `order` is one of a fixed set of literals chosen by the caller's match below (never user
+    // input), so interpolating it is injection-safe. The score sort and the displayed `score` both
+    // use the live projection (`LIVE_EFFECTIVE_SCORE_SQL`, matching the detail page and
+    // `core_scoring::read_score`), not the stored `raw_score` anchored at each IP's last event.
+    let order_by = match order {
+        "raw_score ASC" => format!("{} ASC", crate::routes::LIVE_EFFECTIVE_SCORE_SQL),
+        "raw_score DESC" => format!("{} DESC", crate::routes::LIVE_EFFECTIVE_SCORE_SQL),
+        other => other.to_string(),
     };
-    Ok(rows)
+    let sql = format!(
+        "SELECT host(source_ip) AS ip, ({frag})::float8 AS score, \
+         COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, \
+         first_seen, last_seen, eligible FROM ip_score ORDER BY {order_by} LIMIT 500",
+        frag = crate::routes::LIVE_EFFECTIVE_SCORE_SQL,
+    );
+    // Audited: `sql` interpolates only `LIVE_EFFECTIVE_SCORE_SQL` and a fixed `order_by` literal,
+    // never user input, so it is injection-safe (see the match above).
+    Ok(sqlx::query_as::<_, IpRowRaw>(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&state.db)
+        .await?)
 }
 
 #[derive(sqlx::FromRow)]

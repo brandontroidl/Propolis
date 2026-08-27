@@ -21,7 +21,7 @@
 //! injected with the `|safe` filter - `templates`'s doc comment establishes that minijinja
 //! auto-escapes every `.html` template, so without `|safe` the JSON's own quotes would be
 //! HTML-entity-escaped and produce a JS syntax error rather than an array literal. The events
-//! timeline always renders (24 buckets, zero-filled by the query's own `generate_series`/`COALESCE`)
+//! timeline always renders (25 buckets, zero-filled by the query's own `generate_series`/`COALESCE`)
 //! even with no events; the protocol-distribution chart instead hides its `<canvas>` and shows the
 //! "waiting for sensor events" copy when `protocol_dist` is empty - an empty Chart.js canvas has
 //! nothing worth looking at.
@@ -141,12 +141,19 @@ async fn dashboard(
         None => ("none".to_string(), false),
     };
 
-    let top_attacker: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
-        "SELECT host(source_ip), raw_score::text FROM ip_score ORDER BY raw_score DESC LIMIT 1",
-    )
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+    // Rank by the live effective score (decayed to now), not the stored `raw_score` anchored at the
+    // IP's last event - otherwise a long-idle high score outranks an active attacker. Matches the
+    // detail page and the Attackers table (`LIVE_EFFECTIVE_SCORE_SQL`).
+    // Audited: interpolates only the constant `LIVE_EFFECTIVE_SCORE_SQL`, never user input.
+    let top_attacker: Option<(String, String)> =
+        sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(format!(
+            "SELECT host(source_ip), round(({frag})::numeric, 1)::text \
+             FROM ip_score ORDER BY ({frag}) DESC LIMIT 1",
+            frag = crate::routes::LIVE_EFFECTIVE_SCORE_SQL,
+        )))
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
     let top_attacker_ip = top_attacker.as_ref().map(|t| t.0.as_str()).unwrap_or("--");
     let top_attacker_score = top_attacker.as_ref().map(|t| t.1.as_str()).unwrap_or("");
 
@@ -188,14 +195,16 @@ async fn dashboard(
     let proto_labels: Vec<String> = protocol_dist.iter().map(|p| p.label.clone()).collect();
     let proto_data: Vec<i64> = protocol_dist.iter().map(|p| p.count).collect();
 
-    // Default range: 24 hourly buckets, oldest to newest, zero-filled where an hour had no events
-    // - always exactly 24 rows (the `generate_series` bound is unconditional), so the timeline
-    // chart and the events sparkline below always have real (possibly all-zero) data, never an
-    // empty array. `dashboard_chart_fragment` (below) reuses the same helper for the
-    // adjustable-range HTMX endpoint the "1h/24h/7d/30d" buttons hit.
+    // Default range: 25 hourly buckets covering the rolling 24h window (oldest and newest are
+    // partial hours), oldest to newest, zero-filled where an hour had no events - always exactly 25
+    // rows (the `generate_series` bound is unconditional), so the timeline chart and the events
+    // sparkline below always have real (possibly all-zero) data, never an empty array.
+    // `dashboard_chart_fragment` (below) reuses the same helper for the adjustable-range HTMX
+    // endpoint the "1h/24h/7d/30d" buttons hit.
     let (timeline_labels, timeline_data) = hourly_series(&state.db).await;
-    // The status band's "Events / 24h" cell: the 24 hourly buckets are already computed and
-    // zero-filled, so their sum is the day's total at no extra query cost.
+    // The status band's "Events / 24h" cell: the buckets and the event filter now share the same
+    // `now() - 24h` lower bound, so their sum is the EXACT rolling-24h total (no in-window event
+    // falls outside a bucket) at no extra query cost.
     let events_24h: i64 = timeline_data.iter().sum();
     let current_range = "24h";
 
@@ -458,14 +467,18 @@ fn normalize_dashboard_range(raw: Option<&str>) -> &'static str {
     }
 }
 
-/// 24 hourly buckets (oldest to newest, zero-filled), site-wide - the dashboard timeline's default
-/// range and the "24h" range-selector button. Soft-fails to two empty vectors on a query error,
-/// per the module doc comment's chart policy.
+/// 25 hourly buckets covering the rolling 24h window (oldest to newest, zero-filled), site-wide -
+/// the dashboard timeline's default range and the "24h" range-selector button. The bucket series
+/// and the event filter share one `now() - 24h` lower bound, so the oldest and newest buckets are
+/// partial hours and every event within the rolling 24h lands in exactly one bucket (the previous
+/// hour-aligned `date_trunc('hour', now()) - 23h` series dropped a whole hour of in-window events at
+/// each hour boundary). Soft-fails to two empty vectors on a query error, per the module doc
+/// comment's chart policy.
 async fn hourly_series(db: &PgPool) -> (Vec<String>, Vec<i64>) {
     let rows = sqlx::query(
         "SELECT bucket, COALESCE(cnt, 0) AS cnt \
          FROM generate_series( \
-             date_trunc('hour', now()) - interval '23 hours', \
+             date_trunc('hour', now() - interval '24 hours'), \
              date_trunc('hour', now()), \
              interval '1 hour' \
          ) AS bucket \

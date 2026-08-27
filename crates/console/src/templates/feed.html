@@ -1,6 +1,7 @@
 {% extends "base.html" %}
-{% block title %}Feed status - Propolis{% endblock %}
+{% block title %}Feed entries - Propolis{% endblock %}
 {% block content %}
+{% import "macros.html" as m %}
 <h1>Feed status</h1>
 <div class="tab-bar">
   {% for tab_name in ["status", "entries"] %}
@@ -36,7 +37,7 @@
   <tbody>
     {% for r in rows %}
     <tr>
-      <td class="ip"><a href="/ip/{{ r.ip }}">{{ r.ip }}</a></td>
+      <td class="ip">{{ m.ip_evidence_link(r.ip) }}</td>
       <td class="mono">{{ r.event_count }}</td>
       <td class="dim">{{ r.signals }}</td>
       <td class="seen">{{ r.first_seen }}</td>

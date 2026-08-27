@@ -310,8 +310,8 @@ async fn dashboard_authenticated_returns_stats(pool: PgPool) {
         "expected the feed-entries placeholder when no feed_output_dir is configured: {body}"
     );
     assert!(
-        body.contains(r#"href="/ip/203.0.113.10">"#)
-            || body.contains(r#"href="/ip/203.0.113.11">"#),
+        body.contains(r#"class="insp" href="/ip/203.0.113.10""#)
+            || body.contains(r#"class="insp" href="/ip/203.0.113.11""#),
         "expected one of the seeded IPs as top attacker in the band: {body}"
     );
     assert!(body.contains("Dashboard"));
@@ -378,8 +378,8 @@ async fn dashboard_shows_recent_activity_and_protocol_distribution(pool: PgPool)
         "recent-activity row missing human-readable activity label: {body}"
     );
     assert!(
-        body.contains(r#"href="/ip/203.0.113.80">203.0.113.80</a>"#),
-        "recent-activity row missing source IP link: {body}"
+        body.contains(r#"class="insp" href="/ip/203.0.113.80" hx-get="/ip/203.0.113.80?drawer=1""#),
+        "recent-activity row missing source IP drawer link: {body}"
     );
     assert!(
         body.contains(r#"<canvas id="protoChart""#),
@@ -454,9 +454,21 @@ async fn dashboard_events_last_hour_excludes_events_older_than_an_hour(pool: PgP
 }
 
 #[sqlx::test(migrations = false)]
-async fn dashboard_top_attacker_shows_highest_scoring_ip(pool: PgPool) {
+async fn dashboard_top_attacker_ranks_by_live_score_not_stale_raw(pool: PgPool) {
     migrate(&pool).await;
-    seed_recommended(&pool, "203.0.113.95", 60).await;
+
+    // A long-idle IP whose events landed two days ago, then forced to a HIGH stored raw_score.
+    // Its `decay_anchor` is ~2 days old, so over 8 half-lives (48h / 6h) its live effective score
+    // has decayed to ~95/256 ≈ 0.4.
+    seed_recommended(&pool, "203.0.113.10", 2 * 24 * 60 * 60).await;
+    sqlx::query("UPDATE ip_score SET raw_score = 95 WHERE source_ip = '203.0.113.10'::inet")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // An actively-attacking IP: events 60s ago, so its live effective score ≈ its raw (tens of
+    // points), far above the idle IP's decayed ~0.4 even though its stored raw is lower.
+    seed_recommended(&pool, "203.0.113.20", 60).await;
 
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -472,9 +484,110 @@ async fn dashboard_top_attacker_shows_highest_scoring_ip(pool: PgPool) {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
+    // The "top" hero must name the active IP. Ranking by the stored `raw_score` (the bug) would
+    // instead promote the idle IP whose anchored 95 has since decayed to ~0.
     assert!(
-        body.contains(r#"href="/ip/203.0.113.95">"#),
-        "expected the sole ip_score row's IP as top attacker in the hero stat: {body}"
+        body.contains(r#"top <a class="insp" href="/ip/203.0.113.20""#),
+        "expected the actively-scoring IP as top attacker, not the stale high-raw one: {body}"
+    );
+    assert!(
+        !body.contains(r#"top <a class="insp" href="/ip/203.0.113.10""#),
+        "the idle high-raw IP must not be the top attacker (its live score has decayed): {body}"
+    );
+}
+
+/// Drift guard: the SQL `LIVE_EFFECTIVE_SCORE_SQL` fragment must produce the same value the detail
+/// page shows via `core_scoring` (`effective_score(read_score().raw_score, wan)`). If the mirrored
+/// constants (half-life, breadth, cap) ever diverge from core-scoring, this fails.
+#[sqlx::test(migrations = false)]
+async fn live_effective_score_sql_matches_core_scoring(pool: PgPool) {
+    use core_scoring::{effective_score, read_score};
+
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.42", 3600).await;
+    // Multiple WAN vantages so the breadth factor is a non-trivial multiplier, not 1.0.
+    sqlx::query(
+        "UPDATE ip_score SET distinct_wan_count = 3 WHERE source_ip = '203.0.113.42'::inet",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let sql = format!(
+        "SELECT ({})::float8 FROM ip_score WHERE source_ip = '203.0.113.42'::inet",
+        routes::LIVE_EFFECTIVE_SCORE_SQL
+    );
+    let sql_score: f64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let ip: std::net::IpAddr = "203.0.113.42".parse().unwrap();
+    let score = read_score(&pool, ip).await.unwrap().unwrap();
+    let rust_score: f64 = effective_score(score.raw_score, score.distinct_wan_count as u32)
+        .to_string()
+        .parse()
+        .unwrap();
+
+    assert!(
+        rust_score > 0.0,
+        "sanity: the seeded IP should have a positive live score, got {rust_score}"
+    );
+    assert!(
+        (sql_score - rust_score).abs() < 0.05,
+        "SQL live score {sql_score} must match core_scoring {rust_score} within tolerance \
+         (constant drift between LIVE_EFFECTIVE_SCORE_SQL and core-scoring?)"
+    );
+}
+
+/// The rolling-window fix: events ~24h ago but still inside the window land in the oldest partial
+/// hour. The previous hour-aligned bucket series had no bucket for that hour and dropped them from
+/// both the chart and the "Events / 24h" total; the rolling series counts them.
+#[sqlx::test(migrations = false)]
+async fn dashboard_events_24h_counts_the_oldest_in_window_hour(pool: PgPool) {
+    migrate(&pool).await;
+
+    // 30s and 45s inside the 24h boundary: safely within the window (margin >> test latency) yet in
+    // the hour the old `trunc(now) - 23h` series excluded. Two distinct signal types so no dedup.
+    for (secs_inside, sig) in [
+        (30i64, SignalType::HoneypotConnection),
+        (45i64, SignalType::HoneypotLoginAttempt),
+    ] {
+        let when = chrono::Utc::now() - chrono::Duration::seconds(24 * 3600 - secs_inside);
+        append_event(
+            &pool,
+            ev(
+                "203.0.113.77",
+                "cowrie",
+                sig,
+                Protocol::Tcp,
+                true,
+                &when.to_rfc3339(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // Both boundary events counted => "Events / 24h" == 2. Under the old hour-aligned series they
+    // fell outside every bucket and the total showed 0.
+    assert!(
+        body.contains(r#"<div class="v">2</div>"#),
+        "expected Events/24h to count both in-window boundary events (2): {body}"
     );
 }
 
@@ -600,7 +713,7 @@ async fn dashboard_timeline_chart_reflects_hourly_event_counts(pool: PgPool) {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
-    // `now()`'s event always lands in the LAST of the 24 ascending-ordered hourly buckets (the
+    // `now()`'s event always lands in the LAST of the 25 ascending-ordered hourly buckets (the
     // current hour), so the rendered `timeline_data` array's final element must be 1 regardless of
     // what wall-clock hour the test happens to run in - a broken query (wrong join condition, wrong
     // window) would instead leave every bucket at 0 and this substring would not appear.
@@ -630,8 +743,8 @@ async fn dashboard_most_active_shows_active_ip_with_strip(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains(r#"href="/ip/203.0.113.86">203.0.113.86</a>"#),
-        "most-active table missing the active IP: {body}"
+        body.contains(r#"class="insp" href="/ip/203.0.113.86" hx-get="/ip/203.0.113.86?drawer=1""#),
+        "most-active table missing the active IP drawer link: {body}"
     );
     assert!(
         body.contains(r#"<span class="strip">"#),
@@ -1708,7 +1821,7 @@ async fn detail_unauthenticated_redirects_to_login(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
-async fn detail_page_has_back_link_to_queue(pool: PgPool) {
+async fn detail_page_has_neutral_back_link(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.51", 60).await;
 
@@ -1727,8 +1840,64 @@ async fn detail_page_has_back_link_to_queue(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains(r#"<p><a href="/queue">&larr; back to queue</a></p>"#),
-        "expected a back-to-queue link above the IP heading: {body}"
+        body.contains(r#"<a href="/ips" onclick="if(history.length>1){history.back();return false}">&larr; Back</a>"#),
+        "expected a neutral back link (browser history with an /ips fallback), not a hardcoded \
+         'back to queue' that misleads when the page was reached from elsewhere: {body}"
+    );
+}
+
+/// Finding 8 — the drawer contract now lives in one place (the `ip_evidence_link` macro). These
+/// lock in that ordinary IP links carry it on the pages that previously shipped plain links, so the
+/// per-page drift that broke Review/Feed/Search cannot silently return. Dashboard and Feed links are
+/// covered by the assertions in their own tests above; these add the two remaining feasible pages.
+#[sqlx::test(migrations = false)]
+async fn attackers_ip_links_use_the_drawer_contract(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.20", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            "/ips",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(
+            r##"class="insp" href="/ip/203.0.113.20" hx-get="/ip/203.0.113.20?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog""##
+        ),
+        "attackers row IP must render the full drawer contract via the macro: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_pending_ip_links_use_the_drawer_contract(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.20", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"class="insp" href="/ip/203.0.113.20" hx-get="/ip/203.0.113.20?drawer=1""#),
+        "review-queue row IP must use the drawer contract, not a plain full-page link: {body}"
     );
 }
 
@@ -2611,8 +2780,10 @@ async fn feed_entries_tab_lists_what_was_published_not_a_fresh_derivation(pool: 
 
     for ip in ["203.0.113.70", "203.0.113.71", "203.0.113.72"] {
         assert!(
-            body.contains(&format!(r#"<a href="/ip/{ip}">{ip}</a>"#)),
-            "published address {ip} missing a detail-page link: {body}"
+            body.contains(&format!(
+                r#"<a class="insp" href="/ip/{ip}" hx-get="/ip/{ip}?drawer=1""#
+            )),
+            "published address {ip} missing a drawer link: {body}"
         );
     }
     assert!(

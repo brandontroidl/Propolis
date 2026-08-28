@@ -4340,6 +4340,7 @@ dependencies = [
  "gateway",
  "log-tailer",
  "provision-certs",
+ "rustls-pemfile",
  "sensor-framework",
  "serde",
  "serde_json",
@@ -4347,6 +4348,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

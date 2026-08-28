@@ -3,17 +3,23 @@ name = "shipper"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "shipper"
+path = "src/main.rs"
+
 [dependencies]
 log-tailer = { path = "../log-tailer" }
 collector-wire = { path = "../collector-wire" }
+sensor-framework = { path = "../sensor-framework" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time"] }
 tokio-rustls = "0.26.4"
 tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+rustls-pemfile = "2.2.0"
 
 [dev-dependencies]
 gateway = { path = "../gateway" }
 provision-certs = { path = "../provision-certs" }
-sensor-framework = { path = "../sensor-framework" }
 tempfile = "3.27.0"

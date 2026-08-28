@@ -1,9 +1,12 @@
 //! Durable confirmed-ack state: the last CONFIRMED sequence number and rolling batch hash the
 //! gateway has acked `Accepted` or `Duplicate`, persisted per shipping key so a restarted ship
 //! cycle resumes from the last confirmed point rather than re-deriving it from the tailer cursor
-//! alone. `key` is caller-chosen (Task 12 keys it `<collector_id>-<sensor>` so one collector's
-//! several sensor logs each get an independent confirmed-seq chain); this module has no opinion
-//! on its shape beyond "safe single path component". Same atomic-write discipline as
+//! alone. `key` is caller-chosen; this module has no opinion on its shape beyond "safe single
+//! path component". Task 12 keys it by `COLLECTOR_ID` alone (never per sensor log): the gateway
+//! keys its own seq/hash chain by the client certificate's CommonName, so every sensor log on
+//! one collector must share exactly ONE `ConfirmedState` - a per-log key would let two logs both
+//! ship "seq 1" under the same CN, and the gateway would accept the first and silently
+//! `Duplicate`-drop the second's records. Same atomic-write discipline as
 //! `gateway::state::CollectorState`: write to a temp file, fsync it, rename over the final path
 //! (atomic on POSIX), then fsync the containing directory so the rename's own directory-entry
 //! update is durable too.

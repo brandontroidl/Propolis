@@ -4,4 +4,5 @@
 //! TLS, advancing durable state only after a confirmed ack (`client`, `state`).
 pub mod batcher;
 pub mod client;
+pub mod config;
 pub mod state;

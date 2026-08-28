@@ -28,7 +28,7 @@ use console::auth::{PasswordStore, RateLimiter, SessionStore};
 use console::log_buffer::LogBuffer;
 use feed::{ExclusionEngine, FeedBuilder, FeedConfig, Publisher};
 use intake::runner::IntakeRunner;
-use intake::tailer::LogTailer;
+use log_tailer::LogTailer;
 use review::fetcher::{self, FetchDeps, guard::SystemResolver, http::FetchLimits};
 use review::queue::ReviewQueue;
 use review::submit::SubmissionRunner;

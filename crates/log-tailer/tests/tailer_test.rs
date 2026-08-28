@@ -1,4 +1,4 @@
-use intake::tailer::LogTailer;
+use log_tailer::LogTailer;
 use std::io::Write;
 
 #[test]

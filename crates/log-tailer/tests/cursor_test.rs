@@ -1,4 +1,4 @@
-use intake::cursor::*;
+use log_tailer::*;
 
 #[test]
 fn save_and_load_round_trip() {

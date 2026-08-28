@@ -3,8 +3,8 @@
 //! "The runner" in `internal/design/03-event-intake-aggregation.md`.
 
 use crate::converter::convert;
-use crate::tailer::LogTailer;
 use core_scoring::append_event;
+use log_tailer::LogTailer;
 use sensor_wire::SensorEvent;
 use sqlx::PgPool;
 

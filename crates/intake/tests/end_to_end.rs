@@ -6,7 +6,7 @@
 
 use core_scoring::{ChainStatus, read_score, verify_chain};
 use intake::runner::IntakeRunner;
-use intake::tailer::LogTailer;
+use log_tailer::LogTailer;
 use sensor_wire::*;
 use sqlx::PgPool;
 

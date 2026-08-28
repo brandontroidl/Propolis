@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/collector-wire",
     "crates/core-scoring",
     "crates/sensor-wire",
     "crates/sensor-framework",

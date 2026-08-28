@@ -3083,6 +3083,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "provision-certs"
+version = "0.1.0"
+dependencies = [
+ "collector-wire",
+ "rcgen",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ptr_meta"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

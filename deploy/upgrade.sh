@@ -26,7 +26,12 @@ echo "==> building release"
 sudo -u "$(stat -c '%U' "$REPO_DIR")" cargo build --release
 
 echo "==> installing binaries"
-for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-cred; do
+# SP-A (collector/control-plane split): gateway and shipper are new binaries alongside the
+# sensors and the unified daemon. A single-box migration installs and restarts every unit on this
+# one host, so this list covers both topologies at once - a box running only the collector role
+# (or only the control-plane role) simply has no unit file for the other side's binaries and the
+# is-enabled guard below skips restarting what was never enabled.
+for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-cred gateway shipper; do
     install -m 0755 "$BUILD_DIR/$bin" "/usr/local/bin/$bin"
 done
 
@@ -37,8 +42,24 @@ for unit in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sen
     fi
 done
 
+# gateway is control-plane-side but must come up BEFORE shipper (collector-side, restarted last of
+# all below): shipper dials the gateway on every batch send, so restarting shipper first would
+# have it retry/backoff against a gateway that is mid-restart. On a single-box migration all of
+# sensors/gateway/propolis/shipper run on the same host; on a split deployment each box only has
+# the units relevant to its own role, so this ordering is a no-op there beyond what is-enabled
+# already skips.
+echo "==> restarting gateway"
+if systemctl is-enabled --quiet gateway.service 2>/dev/null; then
+    systemctl restart gateway.service
+fi
+
 echo "==> restarting propolis (runs migrations)"
 systemctl restart propolis.service
+
+echo "==> restarting shipper (after gateway, so it dials a gateway that is already up)"
+if systemctl is-enabled --quiet shipper.service 2>/dev/null; then
+    systemctl restart shipper.service
+fi
 
 echo "==> done. checking status"
 sleep 2

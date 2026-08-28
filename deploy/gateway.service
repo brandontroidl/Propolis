@@ -1,0 +1,142 @@
+# Propolis gateway - hardened systemd unit.
+#
+# SP-A (collector/control-plane split, internal/design docs under
+# .superpowers/sdd/2026-08-28-sp-a-collector-control-plane-split/). The gateway is the
+# control-plane's one inbound listener: it terminates mutual TLS from disposable collectors
+# (crates/gateway, crates/collector-wire), verifies each collector's client certificate, and
+# appends accepted event batches to a per-collector spool file under
+# PROPOLIS_GATEWAY_SPOOL_DIR/<collector_id>/events.jsonl (crates/gateway/src/spool.rs). It holds
+# no DATABASE_URL and no vendor keys - same least-authority posture as every sensor unit in this
+# directory (crates/gateway/src/config.rs's own module doc).
+#
+# Modeled on deploy/propolis.service's hardening block (three layers: least authority, resource
+# caps, containment), narrowed for this unit's actual shape:
+#   - RestrictAddressFamilies=AF_INET AF_INET6 only - no AF_UNIX. The gateway talks to collectors
+#     over TCP/mTLS and to the local filesystem (its spool/state dirs); unlike propolis.service it
+#     has no PostgreSQL-over-Unix-socket path to support.
+#   - CapabilityBoundingSet= empty - PROPOLIS_GATEWAY_BIND is expected to be an unprivileged port
+#     (the gateway is designed to sit behind whatever the operator fronts it with, or bind a high
+#     port directly); grant AmbientCapabilities=CAP_NET_BIND_SERVICE and add it to
+#     CapabilityBoundingSet only if a deployment binds it below 1024.
+#
+# Prerequisites this unit assumes and does not itself create:
+#   - a dedicated, unprivileged system user/group `propolis-gateway` (no login shell, no home
+#     directory, no database handle, no vendor secrets).
+#   - /etc/propolis/gateway.env (mode 0600, owned by propolis-gateway). Required env vars
+#     (crates/gateway/src/config.rs): PROPOLIS_GATEWAY_BIND, PROPOLIS_GATEWAY_CA_CERT_PATH,
+#     PROPOLIS_GATEWAY_SERVER_CERT_PATH, PROPOLIS_GATEWAY_SERVER_KEY_PATH. Optional:
+#     PROPOLIS_GATEWAY_SPOOL_DIR (default /var/spool/propolis/gateway), PROPOLIS_GATEWAY_STATE_DIR
+#     (default /var/lib/propolis/gateway), PROPOLIS_GATEWAY_MAX_CONCURRENT (default 64),
+#     PROPOLIS_GATEWAY_MAX_DURATION_SECS (default 120), PROPOLIS_GATEWAY_READ_TIMEOUT_MS (default
+#     30000), PROPOLIS_GATEWAY_IDLE_TIMEOUT_MS (default 60000). See
+#     deploy/control-plane.env.example for a filled-in example.
+#   - /etc/propolis/certs holding the gateway's server cert/key and the CA cert used to verify
+#     collector client certificates - read-only from this unit's perspective.
+#   - /var/spool/propolis/gateway and /var/lib/propolis/gateway, owned by propolis-gateway.
+#   - the built binary at /usr/local/bin/gateway (crates/gateway, bin target "gateway").
+
+[Unit]
+Description=Propolis collector gateway (mTLS ingest for disposable collectors)
+After=network.target
+
+[Service]
+Type=simple
+User=propolis-gateway
+Group=propolis-gateway
+EnvironmentFile=/etc/propolis/gateway.env
+ExecStart=/usr/local/bin/gateway
+Restart=on-failure
+RestartSec=5
+
+# --- Least authority ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict mounts the whole filesystem read-only except /dev, /proc, and /sys;
+# systemd.exec(5) is explicit that those three subtrees need their own directives to be
+# protected - PrivateDevices, ProtectKernelTunables, and ProtectControlGroups respectively.
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# TCP/mTLS only - no AF_UNIX (this unit has no PostgreSQL-over-Unix-socket path, unlike
+# propolis.service).
+RestrictAddressFamilies=AF_INET AF_INET6
+# The gateway's own server cert/key plus the CA cert it verifies collector client certs against -
+# read-only, never written by this process.
+ReadOnlyPaths=/etc/propolis/certs
+# This unit's own writable roots: the per-collector spool tree and its state directory.
+ReadWritePaths=/var/spool/propolis/gateway /var/lib/propolis/gateway
+
+# --- No privileged port binding ---
+# PROPOLIS_GATEWAY_BIND is expected to be an unprivileged port (>1024) or fronted by a proxy; no
+# AmbientCapabilities/CapabilityBoundingSet grant needed. If a deployment binds <1024 directly,
+# add AmbientCapabilities=CAP_NET_BIND_SERVICE and CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# (matches deploy/sensor-ssh.service's identical grant for its own privileged bind).
+CapabilityBoundingSet=
+
+# --- Resource caps ---
+# Lower than propolis.service's (one process, four subsystems) and below sensor-ssh.service's
+# (the gateway's own PROPOLIS_GATEWAY_MAX_CONCURRENT defaults to 64 concurrent collector
+# connections, vs. ssh's 256 attacker-facing ones). Revisit if the collector fleet size grows
+# materially.
+MemoryMax=256M
+TasksMax=128
+CPUQuota=50%
+LimitNOFILE=4096
+
+# --- Containment ---
+# PLACEHOLDER. @system-service minus @privileged/@resources is a broad starting allowlist for
+# development, not the shipped filter, matching every other Propolis unit. Before production
+# deployment:
+#   1. Run `strace -c -f /usr/local/bin/gateway` under a representative load: at least one
+#      collector completing the mTLS handshake, shipping several batches, and reconnecting after a
+#      dropped connection.
+#   2. Derive the minimum syscall set from the trace.
+#   3. Replace the two SystemCallFilter lines below with that exact allowlist.
+#   4. Re-test under the restricted filter, and repeat whenever the binary's syscall surface
+#      changes (a dependency bump, a new code path).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Recommended alongside SystemCallFilter by systemd.exec(5): without it, a non-native syscall ABI
+# (e.g. x32 on x86_64) could reach a syscall the native-name allowlist above did not intend to
+# admit.
+SystemCallArchitectures=native
+# The correct systemd directive is MemoryDenyWriteExecute (no trailing "-ion") - see
+# deploy/sensor-ssh.service's fuller note on this exact correction.
+MemoryDenyWriteExecute=yes
+
+# --- Supplementary hardening (not required by any test yet; matches every other unit's set,
+# applicable to the same workload shape: async network I/O plus local file writes, no
+# kernel/namespace/clock/IPC/realtime/SUID use, no privileged capabilities to conflict with a user
+# namespace) ---
+PrivateUsers=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+# 0027: the spool files this unit creates are read by nothing else on this box by default (the
+# control-plane's intake process tails them as a different user); tighten to 0077 if no future
+# consumer needs group access, or leave at 0027 to allow a future same-host reader via
+# supplementary group membership, matching sensor-ssh.service's identical reasoning.
+UMask=0027
+#
+# Deliberately NOT added, each for a concrete reason rather than an oversight (same reasoning as
+# propolis.service and sensor-ssh.service):
+#   - PrivateNetwork=: this unit's entire purpose is to be a network listener for collectors.
+#   - IPAddressDeny=/IPAddressAllow=: collectors may dial in from arbitrary source addresses
+#     depending on deployment topology (a NAT'd collector fleet, a VPN mesh); an allow list is not
+#     known at unit-authoring time.
+#   - RootDirectory=/RootImage=: real chroot/image-root hardening needs a prepared minimal root
+#     tree provisioned outside this unit file - a legitimate future hardening step, not a one-line
+#     addition here (matches every other unit's identical deferral).
+
+[Install]
+WantedBy=multi-user.target

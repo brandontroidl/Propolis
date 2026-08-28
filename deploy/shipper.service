@@ -1,0 +1,141 @@
+# Propolis shipper - hardened systemd unit.
+#
+# SP-A (collector/control-plane split). The shipper is the disposable collector's one outbound
+# process: it tails every sensor's local JSONL event log on this collector box and ships batches
+# over mTLS to the control-plane gateway (crates/shipper, crates/collector-wire). It holds no
+# DATABASE_URL and no vendor keys - it is the disposable-collector surface, and must never gain
+# one (see deploy/collector.env.example's header).
+#
+# Modeled on deploy/sensor-ssh.service's hardening block, since both are single-purpose network
+# processes with local file I/O and no privileged port to bind:
+#   - No AmbientCapabilities/CapabilityBoundingSet grant - the shipper only DIALS the gateway
+#     (outbound), it never binds a listening port at all.
+#   - RestrictAddressFamilies=AF_INET AF_INET6 - outbound TCP/mTLS only.
+#
+# Prerequisites this unit assumes and does not itself create:
+#   - a dedicated, unprivileged system user/group `propolis-shipper` (no login shell, no home
+#     directory, no database handle, no vendor secrets).
+#   - IMPORTANT: propolis-shipper must be able to READ every sensor's
+#     /var/log/propolis/<sensor>/events.jsonl on this collector box. Each sensor unit
+#     (deploy/sensor-*.service) creates its own log file owned by its own dedicated user
+#     (propolis-ssh, propolis-catchall, ...) with UMask=0027, i.e. group-readable. Add
+#     propolis-shipper as a supplementary member of every sensor's group (a shared
+#     `propolis-logs` group works too, if every sensor unit is changed to write group-owned by
+#     it) - matching the same `usermod -aG` pattern deploy/install.sh already uses to give the
+#     aggregated `propolis` daemon read access to sensor logs on a single-box deployment. Without
+#     this, the shipper silently ships nothing from sensors it cannot read.
+#   - /etc/propolis/shipper.env (mode 0600, owned by propolis-shipper). Required env vars
+#     (crates/shipper/src/config.rs): PROPOLIS_SHIPPER_GATEWAY_ADDR, PROPOLIS_SHIPPER_GATEWAY_DNS,
+#     PROPOLIS_SHIPPER_CA_CERT_PATH, PROPOLIS_SHIPPER_CLIENT_CERT_PATH,
+#     PROPOLIS_SHIPPER_CLIENT_KEY_PATH, PROPOLIS_SHIPPER_COLLECTOR_ID,
+#     PROPOLIS_SHIPPER_SENSOR_LOGS. Optional: PROPOLIS_SHIPPER_CURSOR_DIR (default
+#     /var/lib/propolis/shipper/cursors), PROPOLIS_SHIPPER_STATE_DIR (default
+#     /var/lib/propolis/shipper/state), PROPOLIS_SHIPPER_POLL_INTERVAL_MS (default 1000),
+#     PROPOLIS_SHIPPER_MAX_RECORDS_PER_BATCH (default 15), PROPOLIS_SHIPPER_RETRY_BACKOFF_MS
+#     (default 2000). See deploy/collector.env.example for a filled-in example.
+#   - /etc/propolis/certs holding the shipper's client cert/key and the CA cert used to verify the
+#     gateway's server certificate - read-only from this unit's perspective.
+#   - /var/lib/propolis/shipper, owned by propolis-shipper (cursor + state bookkeeping).
+#   - the built binary at /usr/local/bin/shipper (crates/shipper, bin target "shipper").
+
+[Unit]
+Description=Propolis shipper (ships collector-local sensor logs to the gateway over mTLS)
+After=network.target
+
+[Service]
+Type=simple
+User=propolis-shipper
+Group=propolis-shipper
+EnvironmentFile=/etc/propolis/shipper.env
+ExecStart=/usr/local/bin/shipper
+Restart=always
+RestartSec=10
+
+# --- Least authority ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict mounts the whole filesystem read-only except /dev, /proc, and /sys;
+# systemd.exec(5) is explicit that those three subtrees need their own directives to be
+# protected - PrivateDevices, ProtectKernelTunables, and ProtectControlGroups respectively.
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# Outbound mTLS to the gateway only.
+RestrictAddressFamilies=AF_INET AF_INET6
+# Every sensor's log directory on this collector, read-only, plus the shipper's own client
+# cert/key and the CA cert it verifies the gateway's server certificate against. See this file's
+# header for the group-membership requirement to actually read the sensor logs.
+ReadOnlyPaths=/var/log/propolis /etc/propolis/certs
+# This unit's own writable root - cursor and state bookkeeping only, no captured data.
+ReadWritePaths=/var/lib/propolis/shipper
+
+# --- No bind capability ---
+# The shipper is outbound-only (it dials the gateway, it never listens); no
+# AmbientCapabilities/CapabilityBoundingSet grant needed at all.
+CapabilityBoundingSet=
+
+# --- Resource caps ---
+# Lighter than sensor-ssh.service's (no attacker-facing traffic, no per-connection session state -
+# just tailing local files and batching HTTP-shaped mTLS frames to one gateway).
+MemoryMax=256M
+TasksMax=64
+CPUQuota=50%
+LimitNOFILE=4096
+
+# --- Containment ---
+# PLACEHOLDER. @system-service minus @privileged/@resources is a broad starting allowlist for
+# development, not the shipped filter, matching every other Propolis unit. Before production
+# deployment:
+#   1. Run `strace -c -f /usr/local/bin/shipper` under a representative load: tailing multiple
+#      sensor logs, batching records, completing the mTLS handshake, and a retry after a dropped
+#      gateway connection.
+#   2. Derive the minimum syscall set from the trace.
+#   3. Replace the two SystemCallFilter lines below with that exact allowlist.
+#   4. Re-test under the restricted filter, and repeat whenever the binary's syscall surface
+#      changes (a dependency bump, a new code path).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Recommended alongside SystemCallFilter by systemd.exec(5): without it, a non-native syscall ABI
+# (e.g. x32 on x86_64) could reach a syscall the native-name allowlist above did not intend to
+# admit.
+SystemCallArchitectures=native
+# The correct systemd directive is MemoryDenyWriteExecute (no trailing "-ion") - see
+# deploy/sensor-ssh.service's fuller note on this exact correction.
+MemoryDenyWriteExecute=yes
+
+# --- Supplementary hardening (not required by any test yet; matches every other unit's set,
+# applicable to the same workload shape: async network I/O plus local file reads, no
+# kernel/namespace/clock/IPC/realtime/SUID use, no privileged capabilities to conflict with a user
+# namespace) ---
+PrivateUsers=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+# 0027: matches sensor-ssh.service's own choice; this unit's only created files (cursor/state
+# bookkeeping) hold no secret and no captured attacker data.
+UMask=0027
+#
+# Deliberately NOT added, each for a concrete reason rather than an oversight (same reasoning as
+# propolis.service and sensor-ssh.service):
+#   - PrivateNetwork=: this unit's entire purpose is outbound network I/O to the gateway.
+#   - IPAddressDeny=/IPAddressAllow=: the gateway's address is resolved from
+#     PROPOLIS_SHIPPER_GATEWAY_ADDR at runtime, not known at unit-authoring time, and
+#     IPAddressAllow= takes literal IPs/CIDRs, not hostnames - matches propolis.service's identical
+#     reasoning for its own DATABASE_URL/vendor hosts. An operator who wants this can add it once
+#     the gateway's stable address is known for their deployment.
+#   - RootDirectory=/RootImage=: real chroot/image-root hardening needs a prepared minimal root
+#     tree provisioned outside this unit file - a legitimate future hardening step, not a one-line
+#     addition here (matches every other unit's identical deferral).
+
+[Install]
+WantedBy=multi-user.target

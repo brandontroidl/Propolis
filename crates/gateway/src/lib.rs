@@ -3,9 +3,11 @@
 //! `internal/design/` for the collector/control-plane split this crate is one half of.
 
 pub mod server;
+pub mod spool;
 pub mod state;
 pub mod verify;
 
 pub use server::{BatchSink, serve};
+pub use spool::SpoolWriter;
 pub use state::CollectorState;
 pub use verify::{GatewaySink, SpoolWrite};

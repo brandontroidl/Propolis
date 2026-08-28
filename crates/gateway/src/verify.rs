@@ -16,9 +16,10 @@ use collector_wire::frame::Batch;
 use crate::server::BatchSink;
 use crate::state::CollectorState;
 
-/// What Task 8 supplies: append a batch's records to the durable spool for `collector_id`.
-/// Stubbed in this crate's own tests (a no-op, counting, or failing implementation) so
-/// `GatewaySink::accept` is testable without a real spool.
+/// Appends a batch's records to the durable spool for `collector_id`. `spool::SpoolWriter` is
+/// the real, production implementation; this crate's own tests inject a stub (a no-op,
+/// counting, or failing implementation) so `GatewaySink::accept` is testable without touching
+/// the filesystem.
 pub trait SpoolWrite: Send + Sync + 'static {
     fn write_records(&self, collector_id: &str, records: &[Vec<u8>]) -> std::io::Result<()>;
 }

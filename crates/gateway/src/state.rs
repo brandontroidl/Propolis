@@ -84,7 +84,7 @@ fn safe_state_file_path(dir: &Path, collector_id: &str) -> io::Result<PathBuf> {
     Ok(dir.join(format!("{collector_id}.json")))
 }
 
-fn is_safe_path_component(id: &str) -> bool {
+pub(crate) fn is_safe_path_component(id: &str) -> bool {
     !id.is_empty()
         && id != "."
         && id != ".."

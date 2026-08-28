@@ -18,6 +18,14 @@
 //! opposite of at-least-once). `ship_cycle` stops with [`StopReason::ChainDiverged`] instead;
 //! see `crates/shipper/src/state.rs`'s `load_or_fresh` doc and `deploy/collector.env.example`
 //! for the operator-facing side of this contract.
+//!
+//! Residual the guard cannot close: if an operator rebuilds a collector reusing an old CN
+//! WITHOUT resetting the gateway state, and the gateway's remembered `last_seq` happens to
+//! equal the rebuilt collector's very first post-rebuild `batch.seq`, the ack reports
+//! `next_expected_seq == batch.seq + 1` and is indistinguishable from a genuine crash-retry, so
+//! that one batch is silently dropped. Closing it needs a per-incarnation epoch in the identity
+//! or chain (so a rebuild starts a chain the gateway recognizes as new) - deferred to SP-D
+//! collector enrollment. The documented fresh-CN-or-reset procedure avoids it entirely.
 
 use std::io;
 use std::net::SocketAddr;

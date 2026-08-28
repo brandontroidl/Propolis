@@ -141,6 +141,32 @@ impl HostResolver for SystemResolver {
 /// Vet + pin a fetch URL, load-bearing SSRF guard. Run identically on the initial URL and on
 /// every redirect hop (with `allow_tftp: false` on hops, since a redirect may never cross into
 /// tftp). Fail-closed at every step.
+/// Async wrapper around [`vet`]: runs the (blocking, `getaddrinfo`-backed) resolution on the
+/// blocking pool with an independent `dns_timeout`, so a slow or hostile DNS response can neither
+/// stall a shared async worker nor hang unbounded. [`vet`]'s SSRF-vetting logic is unchanged - only
+/// its invocation moves off the worker. A timeout, or a resolver task that panics, fails CLOSED to
+/// [`GuardReject::ResolveFailed`] (an unresolvable target is rejected, never fetched).
+pub async fn vet_async(
+    url: &str,
+    own: &HashSet<IpAddr>,
+    resolver: std::sync::Arc<dyn HostResolver + Send + Sync>,
+    allow_tftp: bool,
+    dns_timeout: std::time::Duration,
+) -> Result<Pinned, GuardReject> {
+    let own = own.clone();
+    let url = url.to_string();
+    match tokio::time::timeout(
+        dns_timeout,
+        tokio::task::spawn_blocking(move || vet(&url, &own, resolver.as_ref(), allow_tftp)),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(_join)) => Err(GuardReject::ResolveFailed),
+        Err(_elapsed) => Err(GuardReject::ResolveFailed),
+    }
+}
+
 pub fn vet(
     url: &str,
     own: &HashSet<IpAddr>,
@@ -289,6 +315,54 @@ mod tests {
     }
     fn pub_resolver() -> MockResolver {
         MockResolver(vec!["93.184.216.34".parse().unwrap()])
+    }
+
+    #[tokio::test]
+    async fn vet_async_preserves_the_ssrf_rejection() {
+        // Resolver maps the host to our own WAN IP; `vet` rejects an own-IP target (an SSRF
+        // self-hit) and the async wrapper must surface that rejection unchanged.
+        let own: HashSet<IpAddr> = [ip("203.0.113.9")].into_iter().collect();
+        let resolver: std::sync::Arc<dyn HostResolver + Send + Sync> =
+            std::sync::Arc::new(MockResolver(vec![ip("203.0.113.9")]));
+        let result = vet_async(
+            "http://evil.test/x",
+            &own,
+            resolver,
+            false,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an own-IP target must still be rejected through vet_async"
+        );
+    }
+
+    #[tokio::test]
+    async fn vet_async_times_out_a_slow_resolver_and_fails_closed() {
+        struct SlowResolver;
+        impl HostResolver for SlowResolver {
+            fn resolve(&self, _h: &str) -> std::io::Result<Vec<IpAddr>> {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                Ok(vec!["93.184.216.34".parse().unwrap()])
+            }
+        }
+        let own: HashSet<IpAddr> = HashSet::new();
+        let resolver: std::sync::Arc<dyn HostResolver + Send + Sync> =
+            std::sync::Arc::new(SlowResolver);
+        // The 50ms DNS timeout fires before the 500ms resolver returns: fail closed to ResolveFailed.
+        let result = vet_async(
+            "http://slow.test/x",
+            &own,
+            resolver,
+            false,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(GuardReject::ResolveFailed)),
+            "a slow resolver must time out and reject, got {result:?}"
+        );
     }
 
     #[test]

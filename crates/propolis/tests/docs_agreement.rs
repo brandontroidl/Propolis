@@ -82,7 +82,8 @@ fn every_env_var_the_code_reads_is_documented_in_the_env_var_reference() {
     // that file. Same code -> docs direction and same rationale as the module doc comment.
     let root = workspace_root();
     let doc_path = root.join("docs/reference/environment-variables.md");
-    let doc = fs::read_to_string(&doc_path).expect("docs/reference/environment-variables.md exists");
+    let doc =
+        fs::read_to_string(&doc_path).expect("docs/reference/environment-variables.md exists");
     let mut src = String::new();
     collect_src(&root.join("crates"), &mut src);
 

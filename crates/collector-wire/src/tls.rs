@@ -184,17 +184,37 @@ mod tests {
     }
     #[test]
     fn a_leaf_from_a_different_ca_is_not_accepted_by_the_verifier() {
-        // Build server_config with CA-1, then confirm a client cert signed by CA-2 fails the
-        // verifier. Full handshake rejection is exercised in the gateway integration test
-        // (Task 6); here assert the verifier is constructed from the given CA only.
+        // Build the same client-cert verifier server_config() uses, rooted at CA-1 only, and
+        // call verify_client_cert directly: a CA-1-signed leaf must verify Ok, a CA-2-signed
+        // leaf (never trusted by this verifier) must verify Err. This is the unit-level proof
+        // that the verifier discriminates by CA; the full negotiated-handshake rejection is
+        // exercised in the gateway integration test (Task 6).
+        use tokio_rustls::rustls::pki_types::UnixTime;
+
         let ca1 = crate::tls::testsupport::mint_ca();
         let ca2 = crate::tls::testsupport::mint_ca();
         assert_ne!(ca1.cert_pem, ca2.cert_pem);
-        // NOTE: the brief's Step 2 sketch called mint_leaf(&ca1, "g") twice here (once for
-        // cert_pem, once for key_pem); each call mints a fresh random keypair, so the two calls
-        // never produce a matched cert/key and with_single_cert correctly rejects the mismatch.
-        // Bound to one leaf so this builds the matched (cert, key) pair the comment describes.
-        let leaf = crate::tls::testsupport::mint_leaf(&ca1, "g");
-        assert!(server_config(&ca1.cert_pem, &leaf.cert_pem, &leaf.key_pem).is_ok());
+
+        let verifier = WebPkiClientVerifier::builder(Arc::new(root_store(&ca1.cert_pem).unwrap()))
+            .build()
+            .unwrap();
+
+        let good_leaf = crate::tls::testsupport::mint_leaf(&ca1, "collector-good");
+        let good_der = good_leaf.cert_ders();
+        assert!(
+            verifier
+                .verify_client_cert(&good_der[0], &[], UnixTime::now())
+                .is_ok(),
+            "a CA-1-signed leaf must be accepted by a CA-1-rooted verifier"
+        );
+
+        let bad_leaf = crate::tls::testsupport::mint_leaf(&ca2, "collector-bad");
+        let bad_der = bad_leaf.cert_ders();
+        assert!(
+            verifier
+                .verify_client_cert(&bad_der[0], &[], UnixTime::now())
+                .is_err(),
+            "a CA-2-signed leaf must be rejected by a CA-1-rooted verifier"
+        );
     }
 }

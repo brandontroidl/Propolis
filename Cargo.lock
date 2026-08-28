@@ -4333,6 +4333,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shipper"
+version = "0.1.0"
+dependencies = [
+ "collector-wire",
+ "log-tailer",
+ "tempfile",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

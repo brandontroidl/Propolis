@@ -3,7 +3,8 @@
 //! and a sensor refused to start with no hint why. This test makes that class of drift fail CI.
 //!
 //! Direction is code -> docs: every `PROPOLIS_*` / `CATCHALL_*` env-var NAME that appears as a
-//! string literal in the workspace's non-test source must also appear literally in INSTALL.md. That
+//! string literal in the workspace's non-test source must also appear literally in the canonical
+//! env-var reference (`docs/reference/environment-variables.md`; INSTALL.md is now a stub). That
 //! direction is chosen deliberately: the reverse (every var in the docs must exist in code) false-
 //! positives on INSTALL.md's own corrective prose, which quotes wrong names on purpose ("previously
 //! documented PROPOLIS_CATCHALL_BIND, which the binary does not read"). Code string literals carry
@@ -75,9 +76,13 @@ fn env_var_literals(src: &str) -> BTreeSet<String> {
 }
 
 #[test]
-fn every_env_var_the_code_reads_is_documented_in_install_md() {
+fn every_env_var_the_code_reads_is_documented_in_the_env_var_reference() {
+    // The env-var docs were reorganized (2026-08-26): INSTALL.md is now a compatibility stub and the
+    // canonical, complete list lives in docs/reference/environment-variables.md. This gate checks
+    // that file. Same code -> docs direction and same rationale as the module doc comment.
     let root = workspace_root();
-    let install = fs::read_to_string(root.join("INSTALL.md")).expect("INSTALL.md must exist");
+    let doc_path = root.join("docs/reference/environment-variables.md");
+    let doc = fs::read_to_string(&doc_path).expect("docs/reference/environment-variables.md exists");
     let mut src = String::new();
     collect_src(&root.join("crates"), &mut src);
 
@@ -87,13 +92,10 @@ fn every_env_var_the_code_reads_is_documented_in_install_md() {
         "extraction found no env-var literals - the scan is broken, not the docs"
     );
 
-    let missing: Vec<&String> = vars
-        .iter()
-        .filter(|v| !install.contains(v.as_str()))
-        .collect();
+    let missing: Vec<&String> = vars.iter().filter(|v| !doc.contains(v.as_str())).collect();
     assert!(
         missing.is_empty(),
-        "env vars read by the code but NOT documented in INSTALL.md (document them or the operator \
-         cannot configure them): {missing:?}"
+        "env vars read by the code but NOT documented in docs/reference/environment-variables.md \
+         (document them or the operator cannot configure them): {missing:?}"
     );
 }

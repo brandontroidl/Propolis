@@ -141,6 +141,11 @@ and [integrations](integrations.md).
 | `PROPOLIS_VENDOR_<V>_RATE_WINDOW_HOURS` | no | `1` (`config.rs:33`) | parse_u32 |
 | `PROPOLIS_VENDOR_DSHIELD_USER` | no | none | DShield only (`:460`); if set with a key, composed as `{user}:{key}` into the single key slot (`:463-466`). User alone (no key) is ignored. |
 
+Concrete literal names the code reads (the `<V>` rows above, instantiated for each vendor):
+`PROPOLIS_VENDOR_ABUSEIPDB_KEY`, `PROPOLIS_VENDOR_ABUSEIPDB_URL`,
+`PROPOLIS_VENDOR_DSHIELD_KEY`, `PROPOLIS_VENDOR_DSHIELD_URL`,
+`PROPOLIS_VENDOR_OTX_KEY`, `PROPOLIS_VENDOR_OTX_URL`.
+
 Default base URLs (`crates/review/src/vendor/*.rs`):
 - abuseipdb: `https://api.abuseipdb.com` (`abuseipdb.rs:21`)
 - dshield: `https://www.dshield.org` (`dshield.rs:21`)
@@ -169,6 +174,8 @@ Default base URLs (`crates/review/src/vendor/*.rs`):
 | `PROPOLIS_CONSOLE_SESSION_SECRET` | no | random 32 bytes generated at startup (`:374-377`) | if set, must be exactly 64 hex chars (32 bytes), else abort (`:379-388`). Sessions are in-memory, so a fresh secret per restart only invalidates sessions already dropped on restart. |
 | `PROPOLIS_GEOIP_DIR` | no | none (`Option`, `:480`) | directory of GeoLite2 `.mmdb` files; empty string treated as unset; missing dir/file degrades gracefully. GeoIP enrichment is **local file reads, not network**. |
 | `PROPOLIS_CONSOLE_RDNS_ENABLED` | no | `false` (`config.rs:484`) | bool_flag; opt-in forward-confirmed reverse DNS — the one outbound DNS lookup. Default off. See [outbound controls](../security/outbound-controls.md). |
+| `PROPOLIS_CONSOLE_TRUSTED_PROXY` | no | `false` | bool_flag; set when the console sits behind a TLS reverse proxy so session cookies are always marked `Secure` (a same-host proxy connects over loopback, which would otherwise drop the flag on a real HTTPS hop). |
+| `PROPOLIS_CONSOLE_METRICS_TOKEN` | no | none | if set, `/metrics` requires `Authorization: Bearer <token>` (constant-time compare); unset leaves `/metrics` open — safe only on a loopback bind. Defense in depth for a non-loopback bind. |
 
 The console serves plain HTTP on a loopback `TcpListener`; there is no in-process
 TLS. Any TLS is operator-provided (e.g. a reverse proxy) [inferred]. See
@@ -311,6 +318,13 @@ Common per-sensor variables (each uses its own prefix; catchall uses `CATCHALL_`
 | `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`) | secs; zero → abort |
 | `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (catchall `4_096`) | bytes; zero → abort |
 | `<P>MAX_CONCURRENT` | no | `256` (http `512`) | u32; zero → abort |
+
+Literal names for the sensors whose `main.rs` defines these as explicit constants (the `<P>` rows
+above, instantiated): ssh — `PROPOLIS_SSH_READ_TIMEOUT_MS`, `PROPOLIS_SSH_IDLE_TIMEOUT_MS`,
+`PROPOLIS_SSH_MAX_DURATION_SECS`, `PROPOLIS_SSH_MAX_CAPTURED_BYTES`, `PROPOLIS_SSH_MAX_CONCURRENT`,
+`PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`; catchall — `CATCHALL_READ_TIMEOUT_MS`,
+`CATCHALL_IDLE_TIMEOUT_MS`, `CATCHALL_MAX_DURATION_SECS`, `CATCHALL_MAX_CAPTURED_BYTES`,
+`CATCHALL_MAX_CONCURRENT`.
 
 Sensor-specific extras:
 - **ssh** (`crates/sensor-ssh/src/main.rs`): `PROPOLIS_SSH_HOST_KEY_PATH`

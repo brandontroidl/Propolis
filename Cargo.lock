@@ -1608,6 +1608,8 @@ dependencies = [
  "provision-certs",
  "rustls-pemfile",
  "sensor-framework",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-rustls",

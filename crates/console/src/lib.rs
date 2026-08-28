@@ -85,4 +85,11 @@ pub struct AppState {
     pub log_buffer: Arc<LogBuffer>,
     pub events_ingested: Arc<std::sync::atomic::AtomicU64>,
     pub events_rejected: Arc<std::sync::atomic::AtomicU64>,
+    /// When true, the console trusts a fronting TLS reverse proxy: session cookies are always marked
+    /// `Secure` (`PROPOLIS_CONSOLE_TRUSTED_PROXY`). Without it, a same-host proxy appears as a
+    /// loopback peer and the `Secure` heuristic would wrongly drop the flag over a real HTTPS hop.
+    pub trusted_proxy: bool,
+    /// Optional bearer token gating `/metrics` (`PROPOLIS_CONSOLE_METRICS_TOKEN`). `None` leaves the
+    /// endpoint open - safe only on a loopback bind (see [`warn_if_console_exposed`]).
+    pub metrics_token: Option<Arc<str>>,
 }

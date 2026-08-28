@@ -362,6 +362,8 @@ struct ConsoleRuntime {
     feed_output_dir: Option<PathBuf>,
     geoip_dir: Option<PathBuf>,
     rdns_enabled: bool,
+    trusted_proxy: bool,
+    metrics_token: Option<String>,
     log_buffer: Arc<LogBuffer>,
     events_ingested: Arc<std::sync::atomic::AtomicU64>,
     events_rejected: Arc<std::sync::atomic::AtomicU64>,
@@ -377,6 +379,8 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         feed_output_dir,
         geoip_dir,
         rdns_enabled,
+        trusted_proxy,
+        metrics_token,
         log_buffer,
         events_ingested,
         events_rejected,
@@ -408,6 +412,8 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         log_buffer,
         events_ingested,
         events_rejected,
+        trusted_proxy,
+        metrics_token: metrics_token.map(Arc::from),
     };
 
     console::warn_if_console_exposed(bind_addr);
@@ -959,6 +965,8 @@ async fn main() {
         };
         let geoip_dir = config.geoip_dir.clone();
         let rdns_enabled = config.console_rdns_enabled;
+        let console_trusted_proxy = config.console_trusted_proxy;
+        let console_metrics_token = config.console_metrics_token.clone();
         let log_buffer = log_buffer.clone();
         let ing = events_ingested.clone();
         let rej = events_rejected.clone();
@@ -975,6 +983,7 @@ async fn main() {
                 let log_buffer = log_buffer.clone();
                 let ing = ing.clone();
                 let rej = rej.clone();
+                let console_metrics_token = console_metrics_token.clone();
                 async move {
                     run_console(
                         ConsoleRuntime {
@@ -985,6 +994,8 @@ async fn main() {
                             feed_output_dir: feed_dir,
                             geoip_dir,
                             rdns_enabled,
+                            trusted_proxy: console_trusted_proxy,
+                            metrics_token: console_metrics_token,
                             log_buffer,
                             events_ingested: ing,
                             events_rejected: rej,

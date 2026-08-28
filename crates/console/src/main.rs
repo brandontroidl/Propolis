@@ -31,6 +31,8 @@ const ENV_SESSION_SECRET: &str = "PROPOLIS_CONSOLE_SESSION_SECRET";
 const ENV_FEED_OUTPUT_DIR: &str = "PROPOLIS_FEED_OUTPUT_DIR";
 const ENV_GEOIP_DIR: &str = "PROPOLIS_GEOIP_DIR";
 const ENV_RDNS_ENABLED: &str = "PROPOLIS_CONSOLE_RDNS_ENABLED";
+const ENV_TRUSTED_PROXY: &str = "PROPOLIS_CONSOLE_TRUSTED_PROXY";
+const ENV_METRICS_TOKEN: &str = "PROPOLIS_CONSOLE_METRICS_TOKEN";
 
 /// Loopback only, matching the design's closed decision #4 ("Bind model: loopback only by
 /// default") - an operator who wants the console reachable elsewhere binds it explicitly via
@@ -50,6 +52,8 @@ struct Config {
     feed_output_dir: Option<PathBuf>,
     geoip_dir: Option<PathBuf>,
     rdns_enabled: bool,
+    trusted_proxy: bool,
+    metrics_token: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -135,6 +139,10 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let rdns_enabled = env::var(ENV_RDNS_ENABLED)
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
         .unwrap_or(false);
+    let trusted_proxy = env::var(ENV_TRUSTED_PROXY)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
+    let metrics_token = env::var(ENV_METRICS_TOKEN).ok().filter(|s| !s.is_empty());
 
     Ok(Config {
         database_url,
@@ -144,6 +152,8 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         feed_output_dir,
         geoip_dir,
         rdns_enabled,
+        trusted_proxy,
+        metrics_token,
     })
 }
 
@@ -256,6 +266,8 @@ async fn main() {
         log_buffer,
         events_ingested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        trusted_proxy: config.trusted_proxy,
+        metrics_token: config.metrics_token.map(Arc::from),
     };
 
     tracing::info!(bind = %bind_addr, "console: starting");

@@ -70,6 +70,8 @@ fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> App
         log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),
         events_ingested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        trusted_proxy: false,
+        metrics_token: None,
     }
 }
 
@@ -3030,6 +3032,64 @@ async fn metrics_returns_prometheus_text_format(pool: PgPool) {
         "expected exactly one pending review entry: {body}"
     );
     assert!(body.contains("propolis_ips_recommended_vendor 1\n"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_cookie_is_secure_when_behind_a_trusted_proxy(pool: PgPool) {
+    migrate(&pool).await;
+    let mut state = test_state(pool);
+    state.trusted_proxy = true;
+    let app = test_app(state);
+
+    // TEST_PEER is loopback, so without trusted_proxy the Secure flag would be dropped. With it,
+    // the cookie must be Secure so it is never sent back over a plaintext hop to the TLS proxy.
+    let req = form_request("/login", format!("password={TEST_PASSWORD}"), None);
+    let response = app.oneshot(req).await.unwrap();
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .expect("a successful login sets the session cookie")
+        .to_str()
+        .unwrap();
+    assert!(
+        set_cookie.contains("Secure"),
+        "trusted_proxy must force a Secure session cookie even for a loopback peer: {set_cookie}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn metrics_bearer_gate_rejects_without_token_and_accepts_with_it(pool: PgPool) {
+    migrate(&pool).await;
+    let mut state = test_state(pool);
+    state.metrics_token = Some(std::sync::Arc::from("s3cr3t-metrics"));
+    let app = test_app(state);
+
+    // Token configured but no Authorization header: 401.
+    let unauth = app
+        .clone()
+        .oneshot(get_request("/metrics", None))
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // Wrong token: 401.
+    let wrong = Request::builder()
+        .uri("/metrics")
+        .header("authorization", "Bearer wrong")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(wrong).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Correct bearer token: 200.
+    let ok = Request::builder()
+        .uri("/metrics")
+        .header("authorization", "Bearer s3cr3t-metrics")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(ok).await.unwrap().status(), StatusCode::OK);
 }
 
 #[sqlx::test(migrations = false)]

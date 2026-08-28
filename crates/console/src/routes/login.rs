@@ -76,7 +76,12 @@ async fn login_submit(
 
     state.login_rate_limiter.reset(peer_ip);
     let (_, cookie_value) = state.sessions.create();
-    let cookie = session_cookie(cookie_value, peer_ip, state.sessions.ttl());
+    let cookie = session_cookie(
+        cookie_value,
+        peer_ip,
+        state.sessions.ttl(),
+        state.trusted_proxy,
+    );
 
     tracing::info!(ip = %peer_ip, "login succeeded");
     Ok((CookieJar::new().add(cookie), Redirect::to("/")).into_response())
@@ -104,14 +109,20 @@ async fn logout(State(state): State<AppState>, jar: CookieJar) -> Response {
     (jar, Redirect::to("/login")).into_response()
 }
 
-/// Builds the session cookie: `HttpOnly` always, `SameSite=Strict` always, `Secure` unless the
-/// peer is loopback (a loopback-only console has no TLS to require - see the design spec's
-/// "Sessions": "Secure (when not on localhost)"), and `Max-Age` tracking the store's own TTL so the
-/// client-side cookie does not outlive (or vanish long before) the server-side session.
-fn session_cookie(value: String, peer_ip: IpAddr, ttl: std::time::Duration) -> Cookie<'static> {
+/// Builds the session cookie: `HttpOnly` always, `SameSite=Strict` always, and `Max-Age` tracking
+/// the store's own TTL. `Secure` is set when `force_secure` (the console is behind a trusted TLS
+/// reverse proxy, `PROPOLIS_CONSOLE_TRUSTED_PROXY`) OR the peer is not loopback. The `force_secure`
+/// path matters because a same-host reverse proxy terminates TLS and connects to the console over
+/// loopback, so `peer_ip.is_loopback()` alone would wrongly drop `Secure` on a real HTTPS session.
+fn session_cookie(
+    value: String,
+    peer_ip: IpAddr,
+    ttl: std::time::Duration,
+    force_secure: bool,
+) -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE, value))
         .http_only(true)
-        .secure(!peer_ip.is_loopback())
+        .secure(force_secure || !peer_ip.is_loopback())
         .same_site(SameSite::Strict)
         .path("/")
         .max_age(time::Duration::seconds(ttl.as_secs() as i64))

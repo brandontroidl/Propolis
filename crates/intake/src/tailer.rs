@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use crate::cursor::{CursorState, DurableCursor, RotationEvent, compute_fingerprint, get_inode};
@@ -200,6 +200,12 @@ impl LogTailer {
 /// accepted line's length including its trailing `\n`). An incomplete trailing line - EOF reached
 /// without a `\n` - is left unconsumed: `consumed` stops short of it so the next read starts at
 /// its beginning again.
+/// Hard cap on a single log line intake will buffer. Sensors already bound their captured fields
+/// (`*_MAX_CAPTURED_BYTES`, ~1 MiB), so a real line never approaches this; the cap defends the
+/// low-trust sensor boundary intake crosses - a compromised or malfunctioning sensor writing an
+/// enormous (or endless, unterminated) line must not drive unbounded allocation here.
+const MAX_LINE_BYTES: u64 = 1_048_576;
+
 fn read_lines_from(
     file: &mut File,
     start_offset: u64,
@@ -212,9 +218,32 @@ fn read_lines_from(
 
     while lines.len() < max_lines {
         let mut buf = Vec::new();
-        let bytes_read = reader.read_until(b'\n', &mut buf)?;
-        if bytes_read == 0 || buf.last() != Some(&b'\n') {
-            break; // EOF, or an incomplete trailing line - neither is consumed.
+        // Read at most MAX_LINE_BYTES + 1 so a runaway line cannot allocate without bound.
+        let bytes_read = (&mut reader)
+            .take(MAX_LINE_BYTES + 1)
+            .read_until(b'\n', &mut buf)?;
+        if bytes_read == 0 {
+            break; // EOF - nothing consumed.
+        }
+        if buf.last() != Some(&b'\n') {
+            if buf.len() as u64 > MAX_LINE_BYTES {
+                // Over-length line with no newline inside the cap: discard it and skip past the
+                // rest of the physical line so the tailer advances instead of re-reading the giant
+                // line forever. If the line has not yet ended (EOF before a newline) leave it
+                // unconsumed - it may still be mid-write and complete on a later poll.
+                match skip_to_newline(&mut reader)? {
+                    Some(skipped) => {
+                        consumed += bytes_read as u64 + skipped;
+                        tracing::warn!(
+                            max_bytes = MAX_LINE_BYTES,
+                            "intake: discarded an over-length log line from a sensor (low-trust boundary)"
+                        );
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            break; // A genuine short incomplete trailing line - leave it unconsumed.
         }
         consumed += bytes_read as u64;
         buf.pop(); // drop the trailing '\n'
@@ -224,4 +253,24 @@ fn read_lines_from(
     }
 
     Ok((lines, consumed))
+}
+
+/// Reads and discards bytes (in bounded chunks) until and including the next `\n`. Returns the
+/// number of bytes skipped, or `None` if EOF was reached before any newline.
+fn skip_to_newline(reader: &mut impl BufRead) -> io::Result<Option<u64>> {
+    let mut discarded: u64 = 0;
+    loop {
+        let mut chunk = Vec::new();
+        let n = reader
+            .by_ref()
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut chunk)?;
+        if n == 0 {
+            return Ok(None); // EOF, no terminating newline.
+        }
+        discarded += n as u64;
+        if chunk.last() == Some(&b'\n') {
+            return Ok(Some(discarded));
+        }
+    }
 }

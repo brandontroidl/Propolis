@@ -30,6 +30,23 @@ use log_buffer::LogBuffer;
 /// `templates` is built once at startup (`templates::environment`) rather than per-request: the
 /// templates are static (embedded via `include_str!`), so re-parsing them on every request would
 /// be pure waste.
+/// Logs a loud warning when the console is bound to a NON-loopback address. The console speaks plain
+/// HTTP (no in-process TLS) and mounts `/health`/`/ready`/`/metrics` OUTSIDE session auth, so a
+/// non-loopback bind exposes operational metrics unauthenticated and login credentials in cleartext
+/// unless the operator has placed it behind a TLS reverse proxy with its own access control - the
+/// intended deployment. Called from both binaries at their console bind. Advisory only: an operator
+/// may deliberately front it with a proxy, so this warns rather than refusing to start.
+pub fn warn_if_console_exposed(bind: std::net::SocketAddr) {
+    if !bind.ip().is_loopback() {
+        tracing::warn!(
+            %bind,
+            "console bound to a NON-LOOPBACK address: it serves plain HTTP and exposes /metrics \
+             OUTSIDE authentication. Front it with a TLS reverse proxy that enforces access \
+             control, or bind 127.0.0.1 (see docs/security/networking-tls)."
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,

@@ -258,3 +258,21 @@ fn advance_moves_offset_independently_of_read_batch() {
     let lines = tailer2.read_batch(10);
     assert_eq!(lines, vec!["cc"]);
 }
+
+#[test]
+fn over_length_line_is_discarded_and_the_tailer_advances_past_it() {
+    // A compromised/malfunctioning sensor writes a line far larger than intake's MAX_LINE_BYTES
+    // (1 MiB) cap. Intake must discard it (never buffer it whole) and still advance to the next
+    // real line, rather than allocating unboundedly or wedging on the giant line forever.
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let giant = "x".repeat(1_048_577); // 1 MiB + 1 byte
+    std::fs::write(&log_path, format!("good1\n{giant}\ngood2\n")).unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    let lines = tailer.read_batch(10);
+    assert_eq!(
+        lines,
+        vec!["good1", "good2"],
+        "the over-length line must be dropped and the tailer must advance to the next real line"
+    );
+}

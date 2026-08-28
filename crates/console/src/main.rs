@@ -221,6 +221,7 @@ async fn main() {
     let passwords = Arc::new(PasswordStore::new(&config.password));
 
     let bind_addr = config.bind_addr;
+    console::warn_if_console_exposed(bind_addr);
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
         Err(e) => {

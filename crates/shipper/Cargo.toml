@@ -22,4 +22,7 @@ rustls-pemfile = "2.2.0"
 [dev-dependencies]
 gateway = { path = "../gateway" }
 provision-certs = { path = "../provision-certs" }
+sensor-wire = { path = "../sensor-wire" }
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1", features = ["v7", "serde"] }
 tempfile = "3.27.0"

@@ -22,4 +22,5 @@ members = [
     "crates/console",
     "crates/propolis",
     "crates/provision-certs",
+    "crates/gateway",
 ]

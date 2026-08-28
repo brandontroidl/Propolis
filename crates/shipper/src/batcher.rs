@@ -4,21 +4,35 @@
 use collector_wire::frame::{Batch, MAX_FRAME_LEN, MAX_RECORD_LEN};
 use log_tailer::LogTailer;
 
-/// Default cap on records per batch, chosen so a batch built at this cap can never exceed
-/// [`MAX_FRAME_LEN`] under the tailer's own per-line bound.
+/// Largest record count for which a batch is GUARANTEED to encode within [`MAX_FRAME_LEN`], no
+/// matter how large the individual records are (up to their own [`MAX_RECORD_LEN`] cap).
 ///
-/// A record can be at most `MAX_RECORD_LEN` (1 MiB) - `log-tailer::tailer::MAX_LINE_BYTES` is
-/// set to the identical value and discards anything longer, so a tailed line can never actually
-/// exceed it. `16 * MAX_RECORD_LEN` is exactly `MAX_FRAME_LEN` (16 MiB); the frame's own header,
-/// per-record length prefixes, and trailer add roughly 145 bytes of overhead on top, so a batch
-/// of 16 records that are EACH simultaneously at the exact 1 MiB cap would slip past
-/// `MAX_FRAME_LEN` by that margin. In practice this is not reachable: sensors bound their
-/// captured fields far below 1 MiB (see the `log-tailer` module doc), so real records never
-/// approach the per-record cap, let alone all 16 at once. This constant is therefore a strong
-/// practical bound, not a byte-exact mathematical guarantee; if that residual margin ever
-/// matters, split-by-bytes accounting belongs at the call site (or `encode_frame`'s own
-/// `MAX_FRAME_LEN` check on the shipping path), not here.
-pub const DEFAULT_MAX_RECORDS: usize = 16;
+/// A record can be at most `MAX_RECORD_LEN` (1 MiB): `log-tailer::tailer::MAX_LINE_BYTES` is set
+/// to the identical value and discards anything longer, so a tailed line can never actually
+/// exceed it - and a compromised or malfunctioning collector writing many near-max-size lines
+/// is a real, not merely theoretical, way to hit this worst case. The wire encoding
+/// (`collector_wire::frame`) costs, per record, its `MAX_RECORD_LEN` bytes plus a 4-byte length
+/// prefix; the frame overall costs a 49-byte header and a 32-byte trailer on top of that (see
+/// `HEADER_LEN`/`TRAILER_LEN` in `collector_wire::frame`, not public, so this bounds them with a
+/// generous 128-byte allowance instead of importing the exact figures). `n` records this large is
+/// safe only while `n * (MAX_RECORD_LEN + 4) + 128 <= MAX_FRAME_LEN`; the compile-time assertion
+/// below checks the exact value chosen here against that inequality, so a future change to either
+/// `collector-wire` constant that breaks the bound fails the build instead of silently shipping
+/// an unshippable batch (a batch the gateway would drop as `FrameTooLarge` and Task 11's ship
+/// loop would then retry forever).
+pub const MAX_RECORDS_FRAME_SAFE: usize = 15;
+
+const _: () = assert!(
+    MAX_RECORDS_FRAME_SAFE * (MAX_RECORD_LEN as usize + 4) + 128 <= MAX_FRAME_LEN,
+    "MAX_RECORDS_FRAME_SAFE no longer guarantees every batch fits MAX_FRAME_LEN - recompute it \
+     against the current MAX_RECORD_LEN/MAX_FRAME_LEN before changing this constant"
+);
+
+/// Default cap on records per batch. Set to [`MAX_RECORDS_FRAME_SAFE`] so the default itself
+/// carries the frame-fit guarantee; `next_batch` also clamps any caller-supplied `max_records`
+/// to the same ceiling, so a larger configured value (e.g. the shipper config's own default of
+/// 16) can never produce an oversized frame either.
+pub const DEFAULT_MAX_RECORDS: usize = MAX_RECORDS_FRAME_SAFE;
 
 /// Builds a [`Batch`] out of up to `max_records` whole lines tailed from a sensor log.
 pub struct Batcher;
@@ -41,7 +55,14 @@ impl Batcher {
         last_hash: [u8; 32],
         max_records: usize,
     ) -> Option<Batch> {
-        let lines = tailer.read_batch(max_records);
+        // Clamp at the read, not after: reading MAX_RECORDS_FRAME_SAFE+1 lines and then
+        // dropping the last one would still advance the tailer's cursor past it (`read_batch`
+        // consumes what it returns), permanently losing that line. Clamping the count passed
+        // into `read_batch` means the tailer only ever consumes what this batch will actually
+        // carry, and this also holds even when `max_records` is a caller-configured value
+        // larger than the frame-safe ceiling (see `DEFAULT_MAX_RECORDS`'s doc comment).
+        let n = max_records.min(MAX_RECORDS_FRAME_SAFE);
+        let lines = tailer.read_batch(n);
         if lines.is_empty() {
             return None;
         }
@@ -67,9 +88,3 @@ impl Batcher {
         Some(Batch::new(last_seq + 1, last_hash, records))
     }
 }
-
-const _: () = assert!(
-    (DEFAULT_MAX_RECORDS as u64) * (MAX_RECORD_LEN as u64) <= MAX_FRAME_LEN as u64,
-    "DEFAULT_MAX_RECORDS * MAX_RECORD_LEN must stay within MAX_FRAME_LEN (see the doc comment \
-     above for the remaining framing-overhead margin this does not account for)"
-);

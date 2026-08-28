@@ -1,6 +1,7 @@
+use collector_wire::frame::{Batch, MAX_FRAME_LEN, MAX_RECORD_LEN, decode_frame, encode_frame};
 use collector_wire::hash::ZERO_HASH;
 use log_tailer::LogTailer;
-use shipper::batcher::Batcher;
+use shipper::batcher::{Batcher, MAX_RECORDS_FRAME_SAFE};
 
 #[test]
 fn builds_the_first_batch_from_whole_tailed_lines_then_drains_to_none() {
@@ -63,8 +64,67 @@ fn an_empty_log_yields_no_batch() {
 }
 
 #[test]
-fn default_max_records_keeps_a_worst_case_batch_within_the_frame_bound() {
+fn default_max_records_is_the_frame_safe_ceiling() {
     // See the module doc on `shipper::batcher::DEFAULT_MAX_RECORDS` for the exact accounting;
     // this just pins the chosen constant so a future change is deliberate, not accidental.
-    assert_eq!(shipper::batcher::DEFAULT_MAX_RECORDS, 16);
+    assert_eq!(shipper::batcher::DEFAULT_MAX_RECORDS, 15);
+    assert_eq!(MAX_RECORDS_FRAME_SAFE, 15);
+}
+
+/// Proves the guarantee `MAX_RECORDS_FRAME_SAFE` claims, at the wire encoding, not just in
+/// arithmetic: a batch of `MAX_RECORDS_FRAME_SAFE` records each at the true `MAX_RECORD_LEN`
+/// ceiling (the worst case a compromised or malfunctioning collector could actually produce,
+/// since `log-tailer` bounds every tailed line to exactly `MAX_RECORD_LEN`) must still encode to
+/// no more than `MAX_FRAME_LEN` bytes, and must round-trip cleanly through `decode_frame`.
+#[test]
+fn a_worst_case_max_size_batch_still_encodes_within_the_frame_bound() {
+    let records: Vec<Vec<u8>> = (0..MAX_RECORDS_FRAME_SAFE)
+        .map(|_| vec![b'a'; MAX_RECORD_LEN as usize])
+        .collect();
+    let batch = Batch::new(1, ZERO_HASH, records);
+
+    let bytes = encode_frame(&batch);
+    assert!(
+        bytes.len() <= MAX_FRAME_LEN,
+        "encoded frame of {} bytes exceeds MAX_FRAME_LEN ({})",
+        bytes.len(),
+        MAX_FRAME_LEN
+    );
+
+    let decoded = decode_frame(&bytes).expect("a within-bound frame must decode cleanly");
+    assert_eq!(decoded, batch);
+}
+
+/// Even when the caller asks for more than the frame-safe ceiling (e.g. the shipper config's
+/// own default of 16, or any other larger value), `next_batch` must never hand back more than
+/// `MAX_RECORDS_FRAME_SAFE` records - and must clamp at the tailer READ, not merely truncate the
+/// result, so the untaken lines stay unread rather than being silently lost from the cursor.
+#[test]
+fn next_batch_never_exceeds_the_frame_safe_ceiling_even_when_asked_for_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let line_count = MAX_RECORDS_FRAME_SAFE + 5;
+    let content: String = (0..line_count).map(|i| format!("{i}\n")).collect();
+    std::fs::write(&log_path, content).unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+
+    let requested = MAX_RECORDS_FRAME_SAFE + 50; // deliberately far over the ceiling
+    let batch =
+        Batcher::next_batch(&mut tailer, 0, ZERO_HASH, requested).expect("lines are available");
+    assert_eq!(batch.records.len(), MAX_RECORDS_FRAME_SAFE);
+    for (i, record) in batch.records.iter().enumerate() {
+        assert_eq!(record, &i.to_string().into_bytes());
+    }
+
+    // The 5 lines beyond the ceiling were never read (clamped at the tailer read, not dropped
+    // after), so they are still there for the next batch.
+    let batch2 = Batcher::next_batch(&mut tailer, batch.seq, batch.batch_hash, requested)
+        .expect("the remaining 5 lines are available");
+    assert_eq!(batch2.records.len(), 5);
+    for (i, record) in batch2.records.iter().enumerate() {
+        assert_eq!(
+            record,
+            &(MAX_RECORDS_FRAME_SAFE + i).to_string().into_bytes()
+        );
+    }
 }

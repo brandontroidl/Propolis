@@ -4337,8 +4337,16 @@ name = "shipper"
 version = "0.1.0"
 dependencies = [
  "collector-wire",
+ "gateway",
  "log-tailer",
+ "provision-certs",
+ "sensor-framework",
+ "serde",
+ "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]

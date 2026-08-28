@@ -262,6 +262,7 @@ mod tests {
             read_timeout: Duration::from_secs(5),
             total_timeout: Duration::from_secs(5),
             user_agent: "propolis-fetch-test".to_string(),
+            dns_timeout: Duration::from_secs(5),
         }
     }
 

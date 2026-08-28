@@ -96,6 +96,8 @@ pub struct PropolisConfig {
     /// Opt-in forward-confirmed reverse-DNS on the IP-detail page (`PROPOLIS_CONSOLE_RDNS_ENABLED`).
     /// Default off - it is the one outbound DNS lookup in the console's enrichment.
     pub console_rdns_enabled: bool,
+    pub console_trusted_proxy: bool,
+    pub console_metrics_token: Option<String>,
     pub feed_build_interval: Duration,
     pub feed_aggressive_ttl: Duration,
     pub feed_standard_ttl: Duration,
@@ -482,6 +484,10 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let console_rdns_enabled = parse_bool_flag("PROPOLIS_CONSOLE_RDNS_ENABLED", false);
+    let console_trusted_proxy = parse_bool_flag("PROPOLIS_CONSOLE_TRUSTED_PROXY", false);
+    let console_metrics_token = env::var("PROPOLIS_CONSOLE_METRICS_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
     let feed_build_interval_secs = parse_positive_u64(
         "PROPOLIS_FEED_BUILD_INTERVAL_SECS",
         DEFAULT_FEED_BUILD_INTERVAL_SECS,
@@ -590,6 +596,8 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         feed_output_dir,
         geoip_dir,
         console_rdns_enabled,
+        console_trusted_proxy,
+        console_metrics_token,
         feed_build_interval: Duration::from_secs(feed_build_interval_secs),
         feed_aggressive_ttl: Duration::from_secs(feed_aggressive_ttl_hours * 3600),
         feed_standard_ttl: Duration::from_secs(feed_standard_ttl_hours * 3600),

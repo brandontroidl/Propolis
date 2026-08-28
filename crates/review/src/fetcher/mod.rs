@@ -54,7 +54,7 @@ pub struct FetchDeps {
     pub spool: sensor_framework::QuarantineSpool,
     pub own_ips: HashSet<IpAddr>,
     pub limits: FetchLimits,
-    pub resolver: Box<dyn HostResolver + Send + Sync>,
+    pub resolver: std::sync::Arc<dyn HostResolver + Send + Sync>,
     pub max_hops: u8,
     pub max_depth: u8,
     pub per_host_hour: u32,
@@ -129,7 +129,7 @@ impl Fetcher for RealFetcher {
             "http" | "https" => match http::fetch_http(
                 &candidate.url,
                 &deps.own_ips,
-                deps.resolver.as_ref(),
+                std::sync::Arc::clone(&deps.resolver),
                 &deps.limits,
                 deps.max_hops,
             )
@@ -165,7 +165,15 @@ impl Fetcher for RealFetcher {
                 let path = url::Url::parse(&candidate.url)
                     .map(|u| u.path().to_string())
                     .unwrap_or_default();
-                match guard::vet(&candidate.url, &deps.own_ips, deps.resolver.as_ref(), true) {
+                match guard::vet_async(
+                    &candidate.url,
+                    &deps.own_ips,
+                    std::sync::Arc::clone(&deps.resolver),
+                    true,
+                    deps.limits.dns_timeout,
+                )
+                .await
+                {
                     Err(reject) => RawOutcome::Failed {
                         status: FetchStatus::Rejected,
                         reason: Some(format!("{reject:?}")),
@@ -541,6 +549,7 @@ mod orchestration_tests {
             read_timeout: std::time::Duration::from_secs(1),
             total_timeout: std::time::Duration::from_secs(1),
             user_agent: "propolis-fetcher-test".into(),
+            dns_timeout: std::time::Duration::from_secs(1),
         }
     }
 
@@ -554,7 +563,7 @@ mod orchestration_tests {
             ),
             own_ips: HashSet::new(),
             limits: test_limits(),
-            resolver: Box::new(DummyResolver),
+            resolver: std::sync::Arc::new(DummyResolver),
             max_hops: 3,
             max_depth: 2,
             per_host_hour,

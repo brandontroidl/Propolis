@@ -40,7 +40,25 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/metrics", get(metrics))
 }
 
-async fn metrics(State(state): State<AppState>) -> Result<Response, AppError> {
+async fn metrics(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    // Optional bearer gate (`PROPOLIS_CONSOLE_METRICS_TOKEN`). When configured, `/metrics` requires
+    // a matching `Authorization: Bearer <token>` even though it is mounted outside session auth -
+    // defense in depth for a non-loopback bind. Unconfigured leaves it open (see
+    // `console::warn_if_console_exposed`).
+    if let Some(token) = &state.metrics_token {
+        let authorized = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()));
+        if !authorized {
+            return Ok((axum::http::StatusCode::UNAUTHORIZED, "unauthorized\n").into_response());
+        }
+    }
+
     let mut out = String::new();
 
     let ips_scored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ip_score")
@@ -208,6 +226,19 @@ fn push_gauge(out: &mut String, name: &str, help: &str, value: i64) {
 /// names are config-driven, trusted identifiers today (`"abuseipdb"`/`"dshield"`/`"otx"` -
 /// `crates/review/src/vendor/*.rs`'s `VendorAdapter::name`), not attacker-controlled, but escaping
 /// is cheap and this keeps the exposition format well-formed regardless.
+/// Constant-time byte comparison for the metrics bearer token, so a wrong token cannot be recovered
+/// by response-timing. The length may leak (a token's length is not the secret).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn escape_label(value: &str) -> String {
     value
         .replace('\\', "\\\\")

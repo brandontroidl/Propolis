@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
-use super::guard::{GuardReject, HostResolver, Pinned, vet};
+use super::guard::{GuardReject, HostResolver, Pinned};
 
 /// Bounds for one fetch attempt. Every field is caller-supplied so the review daemon can source
 /// them from validated config (`internal/design/12-malware-fetcher.md` section 13) rather than
@@ -22,6 +22,9 @@ pub struct FetchLimits {
     pub read_timeout: Duration,
     pub total_timeout: Duration,
     pub user_agent: String,
+    /// Independent timeout for the (blocking) DNS resolution step, applied by `guard::vet_async`
+    /// so a slow/hostile resolver cannot stall an async worker or hang unbounded.
+    pub dns_timeout: Duration,
 }
 
 /// A successfully captured, under-cap response body.
@@ -246,13 +249,21 @@ trait HopFetcher {
 /// parameters, borrowed for the duration of one `fetch_http` call.
 struct RealHopFetcher<'a> {
     own: &'a HashSet<IpAddr>,
-    resolver: &'a dyn HostResolver,
+    resolver: std::sync::Arc<dyn HostResolver + Send + Sync>,
     limits: &'a FetchLimits,
 }
 
 impl HopFetcher for RealHopFetcher<'_> {
     async fn hop(&self, url: &str) -> Result<HopOutcome, FetchError> {
-        let pinned = match vet(url, self.own, self.resolver, false) {
+        let pinned = match super::guard::vet_async(
+            url,
+            self.own,
+            std::sync::Arc::clone(&self.resolver),
+            false,
+            self.limits.dns_timeout,
+        )
+        .await
+        {
             Ok(p) => p,
             Err(reject) => return Ok(HopOutcome::Rejected(reject)),
         };
@@ -315,13 +326,13 @@ async fn follow_redirects<H: HopFetcher>(
 pub async fn fetch_http(
     url: &str,
     own: &HashSet<IpAddr>,
-    r: &dyn HostResolver,
+    resolver: std::sync::Arc<dyn HostResolver + Send + Sync>,
     limits: &FetchLimits,
     max_hops: u8,
 ) -> Result<HttpOutcome, FetchError> {
     let hop_fetcher = RealHopFetcher {
         own,
-        resolver: r,
+        resolver,
         limits,
     };
     follow_redirects(url, max_hops, &hop_fetcher).await
@@ -371,6 +382,7 @@ mod tests {
             read_timeout: Duration::from_secs(5),
             total_timeout: Duration::from_secs(5),
             user_agent: "propolis-fetch-test".to_string(),
+            dns_timeout: Duration::from_secs(5),
         }
     }
 
@@ -669,7 +681,7 @@ mod tests {
         let result = fetch_http(
             &format!("http://attacker-redirect-target.test:{port}/"),
             &own,
-            &resolver,
+            std::sync::Arc::new(resolver),
             &limits(1024),
             3,
         )
@@ -700,9 +712,15 @@ mod tests {
         hosts.insert("attacker.test", ip("10.0.0.1"));
         let resolver = MapResolver(hosts);
 
-        let result = fetch_http("http://attacker.test/", &own, &resolver, &limits(1024), 0)
-            .await
-            .unwrap();
+        let result = fetch_http(
+            "http://attacker.test/",
+            &own,
+            std::sync::Arc::new(resolver),
+            &limits(1024),
+            0,
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(result, HttpOutcome::Rejected(GuardReject::Forbidden(_))),

@@ -54,9 +54,17 @@ impl ConfirmedState {
     }
 
     /// `load` folded to `fresh()` on any missing/unreadable/corrupt state - the caller-facing
-    /// convenience `ship_cycle` uses at the top of every cycle. Falling back to `fresh()` here is
-    /// safe, not merely convenient: re-shipping from seq 1 is exactly the at-least-once path the
-    /// gateway's idempotent `Duplicate` ack already absorbs for any seq it has already accepted.
+    /// convenience `ship_cycle` uses at the top of every cycle. `fresh()` is only correct for a
+    /// genuinely NEW collector identity (this key has never shipped anything the gateway could
+    /// have confirmed). It is NOT generally safe to assume re-shipping from seq 1 is absorbed by
+    /// the gateway's `Duplicate` path: the tailer's cursor does not rewind, so a fresh state
+    /// shipping seq 1 again carries whatever NEW records the tailer is currently positioned at -
+    /// if this collector id's gateway state is already ahead (a rebuilt/re-provisioned collector
+    /// reusing an old identity, or a lost/restored `ConfirmedState`), those new records would be
+    /// silently `Duplicate`-dropped. `ship_cycle`'s `ChainDiverged` guard (`client.rs`) catches
+    /// exactly that case and stops instead of losing them. Rebuilding a collector must therefore
+    /// use a fresh collector id (CN) or have the gateway's per-collector state reset first - see
+    /// `deploy/collector.env.example`.
     pub fn load_or_fresh(dir: &Path, key: &str) -> Self {
         Self::load(dir, key)
             .ok()

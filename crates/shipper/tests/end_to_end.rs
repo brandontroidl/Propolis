@@ -14,7 +14,7 @@ use collector_wire::tls::{client_config, server_config};
 use gateway::{BatchSink, GatewaySink, SpoolWriter, serve};
 use log_tailer::LogTailer;
 use sensor_framework::ConnectionBounds;
-use shipper::client::{RetryPolicy, ShipperClient, ship_cycle};
+use shipper::client::{RetryPolicy, ShipperClient, StopReason, ship_cycle};
 use tokio_rustls::rustls::ClientConfig;
 
 const GATEWAY_DNS: &str = "gateway.local";
@@ -319,5 +319,128 @@ async fn two_sensor_logs_ship_through_one_shared_multiplexed_chain_with_no_dupli
         state_files.len(),
         1,
         "all sensor logs on one collector must share exactly one ConfirmedState file"
+    );
+}
+
+/// F1 regression proof: the gateway keeps a per-collector `CollectorState` (seq/hash chain) on
+/// the CONTROL PLANE, independent of anything on the collector box. If a collector is rebuilt
+/// reusing the same collector id (client cert CN) with its LOCAL shipper state reset to fresh
+/// (e.g. a wiped `STATE_DIR`), the naive behavior - treating every `Duplicate` ack identically to
+/// `Accepted` - would silently drop the rebuilt collector's new events: they'd ship as seq
+/// 1, 2, 3... which the gateway (already ahead) echoes back as `Duplicate`, and the old code
+/// advanced the confirmed state AND persisted the tailer cursor past them anyway. `ship_cycle`
+/// must instead recognize `next_expected_seq > our_seq + 1` as chain divergence, not a benign
+/// crash-retry, and stop loudly without losing anything.
+#[tokio::test]
+async fn a_rebuilt_collector_reusing_an_identity_with_reset_shipper_state_diverges_loudly_instead_of_silently_dropping_evidence()
+ {
+    let cert_dir = tempfile::tempdir().expect("cert tempdir");
+    let certs = mint_certs(cert_dir.path());
+
+    let gateway_state_dir = tempfile::tempdir().expect("gateway state tempdir");
+    let spool_dir = tempfile::tempdir().expect("spool tempdir");
+    let bound_addr = start_gateway(
+        &certs,
+        gateway_state_dir.path().to_path_buf(),
+        spool_dir.path().to_path_buf(),
+    )
+    .await;
+
+    // Phase 1: the "original" collector ships 3 batches (forced one record at a time via
+    // max_records=1) so the gateway's CollectorState for COLLECTOR_ID advances to last_seq=3.
+    // This state lives entirely on the gateway (control-plane) side.
+    let original_sensor_dir = tempfile::tempdir().expect("original sensor tempdir");
+    let original_log_path = original_sensor_dir.path().join("events.jsonl");
+    std::fs::write(&original_log_path, "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n")
+        .expect("write original sensor log");
+    let original_cursor_dir = original_sensor_dir.path().join("cursors");
+
+    let original_shipper_state_dir = tempfile::tempdir().expect("original shipper state tempdir");
+    let mut original_tailer = LogTailer::new(original_log_path, original_cursor_dir);
+    let mut stream = ShipperClient::connect(bound_addr, client_tls(&certs), GATEWAY_DNS)
+        .await
+        .expect("connect for original collector");
+    let original_report = ship_cycle(
+        &mut stream,
+        &mut original_tailer,
+        original_shipper_state_dir.path(),
+        COLLECTOR_ID,
+        1, // one record per batch, forcing 3 separate confirmed batches (seq 1, 2, 3)
+        retry_policy(),
+    )
+    .await
+    .expect("ship original collector's batches");
+    assert_eq!(original_report.batches_shipped, 3);
+    assert!(original_report.stopped.is_none());
+
+    let spool_path = spool_dir.path().join(COLLECTOR_ID).join("events.jsonl");
+    let spool_content_before_rebuild =
+        std::fs::read(&spool_path).expect("read spool before rebuild");
+    assert_eq!(
+        spool_content_before_rebuild,
+        b"{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n".to_vec()
+    );
+
+    // Phase 2: simulate a rebuild. A brand-new sensor log holding a brand-new event, a brand-new
+    // tailer/cursor dir, and a FRESH ConfirmedState (a never-used state_dir) - but the SAME
+    // collector id (same certs, same COLLECTOR_ID), exactly what a rebuilt collector box reusing
+    // its old cert/CN with wiped local state would present. The gateway's CollectorState for
+    // COLLECTOR_ID, untouched by the rebuild, still remembers last_seq=3.
+    let rebuilt_sensor_dir = tempfile::tempdir().expect("rebuilt sensor tempdir");
+    let rebuilt_log_path = rebuilt_sensor_dir.path().join("events.jsonl");
+    std::fs::write(&rebuilt_log_path, "{\"new\":1}\n").expect("write rebuilt sensor log");
+    let rebuilt_cursor_dir = rebuilt_sensor_dir.path().join("cursors");
+
+    let rebuilt_shipper_state_dir = tempfile::tempdir().expect("rebuilt shipper state tempdir");
+    let mut rebuilt_tailer = LogTailer::new(rebuilt_log_path.clone(), rebuilt_cursor_dir.clone());
+    let mut stream2 = ShipperClient::connect(bound_addr, client_tls(&certs), GATEWAY_DNS)
+        .await
+        .expect("connect for rebuilt collector");
+    let rebuilt_report = ship_cycle(
+        &mut stream2,
+        &mut rebuilt_tailer,
+        rebuilt_shipper_state_dir.path(),
+        COLLECTOR_ID,
+        16,
+        retry_policy(),
+    )
+    .await
+    .expect("ship cycle for rebuilt collector");
+
+    // (a) The cycle must STOP loudly with ChainDiverged, not silently succeed as if the batch
+    // had been accepted or was an ordinary duplicate.
+    assert_eq!(
+        rebuilt_report.stopped,
+        Some(StopReason::ChainDiverged {
+            our_seq: 1,
+            gateway_next_expected: 4,
+        }),
+        "a rebuilt collector reusing an identity with a fresh shipper state must diverge loudly, \
+         not silently succeed"
+    );
+    assert_eq!(
+        rebuilt_report.batches_shipped, 0,
+        "the diverged batch must never be counted as shipped"
+    );
+
+    // (b) The new event must NOT be in the gateway spool - the gateway correctly refused it as a
+    // duplicate of an already-confirmed seq rather than appending it.
+    let spool_content_after_rebuild =
+        std::fs::read(&spool_path).expect("read spool after rebuild attempt");
+    assert_eq!(
+        spool_content_after_rebuild, spool_content_before_rebuild,
+        "the rebuilt collector's new event must never reach the spool"
+    );
+
+    // (c) The fresh tailer's cursor must NOT have been advanced past the unshipped line: a
+    // brand-new LogTailer instance over the SAME log path and cursor dir must still see it from
+    // the beginning, proving a later resync (a fresh collector id, or a gateway-state reset)
+    // could still ship it rather than having silently lost it.
+    let mut recheck_tailer = LogTailer::new(rebuilt_log_path, rebuilt_cursor_dir);
+    let unshipped_lines = recheck_tailer.read_batch(10);
+    assert_eq!(
+        unshipped_lines,
+        vec!["{\"new\":1}".to_string()],
+        "the tailer cursor must not have advanced past the diverged, unshipped line"
     );
 }

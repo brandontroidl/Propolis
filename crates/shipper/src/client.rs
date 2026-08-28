@@ -7,6 +7,17 @@
 //! `Duplicate` path absorbs a re-ship of an already-accepted seq. At-least-once end to end,
 //! converging on the ledger dedup window - matching the contract `log_tailer` and
 //! `gateway::verify::GatewaySink` already document on their own sides of this exact boundary.
+//!
+//! F1 guard: a `Duplicate` ack is only ever a safe crash-retry echo when the gateway reports
+//! `next_expected_seq == batch.seq + 1` (it has exactly this batch and nothing past our own
+//! expectation). If `next_expected_seq > batch.seq + 1`, the gateway's chain for this collector
+//! id is AHEAD of ours - e.g. a rebuilt collector reusing an old cert CN with its shipper state
+//! reset to fresh while the gateway still remembers a later confirmed seq for that id. Treating
+//! that as an ordinary confirm would advance both the confirmed state and the tailer cursor past
+//! records the gateway will keep silently `Duplicate`-dropping, losing them for good (the
+//! opposite of at-least-once). `ship_cycle` stops with [`StopReason::ChainDiverged`] instead;
+//! see `crates/shipper/src/state.rs`'s `load_or_fresh` doc and `deploy/collector.env.example`
+//! for the operator-facing side of this contract.
 
 use std::io;
 use std::net::SocketAddr;
@@ -100,6 +111,20 @@ pub enum StopReason {
     /// The gateway returned `Retry` more than `RetryPolicy::max_consecutive_retries` times in a
     /// row for the same batch.
     RetriesExhausted,
+    /// The gateway's `Duplicate` ack reports it is already ahead of what this batch would
+    /// confirm (`gateway_next_expected > our_seq + 1`): this collector's local chain has
+    /// diverged from the gateway's, most likely a rebuilt/re-provisioned collector reusing an
+    /// old collector id (cert CN) whose shipper state was reset to fresh while the gateway still
+    /// remembers a later confirmed seq for that id, or a lost/restored `ConfirmedState`. Not a
+    /// crash-retry (that case is `gateway_next_expected == our_seq + 1` and is absorbed as a
+    /// normal confirm) - treating it as one would silently drop every new record from `our_seq`
+    /// onward, since the gateway will keep echoing `Duplicate` for seqs it already has. An
+    /// operator must resync: reset the gateway's per-collector state for this collector id, or
+    /// re-provision this collector under a FRESH collector id (CN).
+    ChainDiverged {
+        our_seq: u64,
+        gateway_next_expected: u64,
+    },
 }
 
 /// What one `ship_cycle` call accomplished.
@@ -117,10 +142,14 @@ pub struct CycleReport {
 /// builds the next batch from `tailer` and ships it over `stream` until `Batcher::next_batch`
 /// returns `None` (nothing left to ship) or the cycle stops early (see [`StopReason`]).
 ///
-/// Per batch: `Accepted`/`Duplicate` advances the confirmed state, persists it, THEN persists the
-/// tailer cursor (in that order - see the module doc's ordering guarantee); `Retry` sleeps
-/// `retry.backoff` and resends the SAME batch, bounded by `retry.max_consecutive_retries`;
-/// `Reject` logs the reason and stops the cycle immediately without advancing anything.
+/// Per batch: `Accepted`, and a `Duplicate` that is exactly this batch's own crash-retry echo
+/// (`ack.next_expected_seq == batch.seq + 1`), advance the confirmed state, persist it, THEN
+/// persist the tailer cursor (in that order - see the module doc's ordering guarantee); a
+/// `Duplicate` reporting the gateway ahead of that (`ack.next_expected_seq > batch.seq + 1`)
+/// stops the cycle with [`StopReason::ChainDiverged`] instead of advancing anything (see F1 in
+/// the module doc); `Retry` sleeps `retry.backoff` and resends the SAME batch, bounded by
+/// `retry.max_consecutive_retries`; `Reject` logs the reason and stops the cycle immediately
+/// without advancing anything.
 pub async fn ship_cycle(
     stream: &mut ShipperStream,
     tailer: &mut LogTailer,
@@ -144,7 +173,7 @@ pub async fn ship_cycle(
         loop {
             let ack = ShipperClient::send_batch(stream, &frame).await?;
             match ack.status {
-                AckStatus::Accepted | AckStatus::Duplicate => {
+                AckStatus::Accepted => {
                     confirmed = ConfirmedState {
                         last_seq: batch.seq,
                         last_batch_hash: batch.batch_hash,
@@ -156,6 +185,43 @@ pub async fn ship_cycle(
                     tailer.persist_cursor()?;
                     report.batches_shipped += 1;
                     break;
+                }
+                AckStatus::Duplicate if ack.next_expected_seq == batch.seq + 1 => {
+                    // The gateway's chain for this collector id has exactly this batch as its
+                    // last confirmed seq and nothing beyond it: a benign crash-retry echo (this
+                    // exact batch was accepted on a prior attempt whose ack this shipper never
+                    // saw). Safe to confirm and advance, same as Accepted.
+                    confirmed = ConfirmedState {
+                        last_seq: batch.seq,
+                        last_batch_hash: batch.batch_hash,
+                    };
+                    confirmed.store(state_dir, key)?;
+                    tailer.persist_cursor()?;
+                    report.batches_shipped += 1;
+                    break;
+                }
+                AckStatus::Duplicate => {
+                    // ack.next_expected_seq > batch.seq + 1 (a Duplicate can never report less):
+                    // the gateway is ahead of this collector's local chain by more than this
+                    // batch. Not a crash retry - state divergence. Advancing confirmed or the
+                    // tailer cursor here would silently drop every record from batch.seq onward,
+                    // since the gateway will keep echoing Duplicate for seqs it already has.
+                    tracing::error!(
+                        key,
+                        our_seq = batch.seq,
+                        gateway_next_expected = ack.next_expected_seq,
+                        "shipper: this collector's local chain has diverged from the gateway's \
+                         (likely a rebuilt collector reusing an identity, or a lost/restored \
+                         shipper state); stopping ship cycle WITHOUT advancing confirmed state \
+                         or the tailer cursor - an operator must resync by resetting the \
+                         gateway's per-collector state for this collector id, or by \
+                         re-provisioning this collector with a FRESH collector id (CN)"
+                    );
+                    report.stopped = Some(StopReason::ChainDiverged {
+                        our_seq: batch.seq,
+                        gateway_next_expected: ack.next_expected_seq,
+                    });
+                    return Ok(report);
                 }
                 AckStatus::Retry => {
                     consecutive_retries += 1;

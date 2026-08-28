@@ -67,9 +67,18 @@ impl Batcher {
             return None;
         }
 
+        // log-tailer bounds a raw tailed LINE to MAX_LINE_BYTES (== MAX_RECORD_LEN), but it
+        // decodes that line with `String::from_utf8_lossy`, which can expand invalid UTF-8 up to
+        // 3x (each bad byte becomes a 3-byte U+FFFD): a raw line at the cap can therefore surface
+        // here as a record over MAX_RECORD_LEN. `Batch::new` only bounds record COUNT, not
+        // per-record length, so an over-length record would build an unshippable frame the
+        // gateway rejects - and because a rejected/stalled cycle never advances the tailer
+        // cursor, re-reading the same pathological line forever would wedge this collector's
+        // whole serial chain. Enforce the real bound here and skip anything that violates it,
+        // rather than merely asserting it in debug builds.
         let records: Vec<Vec<u8>> = lines
             .into_iter()
-            .map(|line| {
+            .filter_map(|line| {
                 // `read_batch` only ever returns complete, `\n`-stripped lines split on `\n`, so
                 // a returned line cannot itself contain an embedded newline - `Batch::new`'s wire
                 // encoding could not round-trip one (see `collector_wire::frame::FrameError::RecordNewline`).
@@ -77,13 +86,25 @@ impl Batcher {
                     !line.as_bytes().contains(&b'\n'),
                     "log-tailer must never return a line containing an embedded newline"
                 );
-                debug_assert!(
-                    line.len() as u32 <= MAX_RECORD_LEN,
-                    "log-tailer must never return a line longer than MAX_RECORD_LEN"
-                );
-                line.into_bytes()
+                if line.len() as u32 > MAX_RECORD_LEN {
+                    tracing::warn!(
+                        bytes = line.len(),
+                        max_bytes = MAX_RECORD_LEN,
+                        "shipper: dropping an over-length record that cannot fit a frame"
+                    );
+                    return None;
+                }
+                Some(line.into_bytes())
             })
             .collect();
+
+        if records.is_empty() {
+            // Every line this read produced was over-length and skipped: nothing to ship this
+            // round, but the tailer's cursor already advanced past them (read_batch consumes
+            // what it returns), so the next call reads whatever follows rather than re-reading
+            // these forever.
+            return None;
+        }
 
         Some(Batch::new(last_seq + 1, last_hash, records))
     }

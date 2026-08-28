@@ -125,7 +125,7 @@ async fn main() {
         MAX_CONSECUTIVE_RETRIES,
     );
 
-    let handle = tokio::spawn(run_ship_loop(
+    let mut handle = tokio::spawn(run_ship_loop(
         config.gateway_addr,
         config.gateway_dns.clone(),
         tls,
@@ -137,13 +137,40 @@ async fn main() {
         Duration::from_millis(config.poll_interval_ms),
     ));
 
-    shutdown_signal().await;
-    tracing::info!("shipper: shutdown signal received; stopping ship loop");
-    handle.abort();
+    // `run_ship_loop` only ever returns on its own on a PERMANENT stop (see its doc): a shared
+    // seq/hash chain broken by a `Reject` or a `ChainDiverged` divergence. Racing the join
+    // handle against `shutdown_signal` makes that observable here rather than letting the
+    // process sit up shipping nothing while monitoring still sees it "running" (F3): a clean
+    // shutdown signal wins the race normally and aborts the loop with a zero exit, but if the
+    // loop's own task finishes FIRST, that is the permanent-stop branch, not a clean shutdown -
+    // exit non-zero so systemd/monitoring sees a failed unit (dead-man's-switch).
+    tokio::select! {
+        result = &mut handle => {
+            match result {
+                Ok(()) => {
+                    tracing::error!(
+                        "shipper: ship loop terminated on a permanent stop condition (gateway \
+                         rejection or chain divergence); exiting non-zero so this is visible as \
+                         a failed unit rather than a silently idle process"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "shipper: ship loop task panicked; exiting");
+                }
+            }
+            std::process::exit(1);
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("shipper: shutdown signal received; stopping ship loop");
+            handle.abort();
+        }
+    }
 }
 
-/// Runs the single multiplexed ship loop until a gateway `Reject` breaks the shared chain (see
-/// the module doc). Each pass iterates `tailers` in order, dials the gateway once per tailer,
+/// Runs the single multiplexed ship loop until a gateway `Reject` or a `ChainDiverged` breaks the
+/// shared chain (see the module doc) - the only two ways this function returns on its own; `main`
+/// treats either as a permanent stop (F3) and exits non-zero. Each pass iterates `tailers` in
+/// order, dials the gateway once per tailer,
 /// and runs Task 11's `ship_cycle` against the SHARED `collector_id` confirmed-state key; if the
 /// whole pass shipped nothing from any log, sleeps `poll_interval` before the next pass. A
 /// per-tailer connect or IO error is logged and the loop moves on to the next tailer /
@@ -223,6 +250,24 @@ async fn run_ship_loop(
                         ?reason,
                         "shipper: gateway rejected a batch; the shared seq/hash chain is \
                          broken, stopping the ship loop"
+                    );
+                    return;
+                }
+                Some(StopReason::ChainDiverged {
+                    our_seq,
+                    gateway_next_expected,
+                }) => {
+                    // Same permanent-stop shape as Rejected above (see StopReason::ChainDiverged's
+                    // doc and F1 in client.rs's module doc): the shared chain for `collector_id`
+                    // has diverged from the gateway's, every other tailer shares this exact
+                    // chain, and blindly continuing would keep silently losing records. Stop and
+                    // let an operator resync.
+                    tracing::error!(
+                        sensor = %sensor_name,
+                        our_seq,
+                        gateway_next_expected,
+                        "shipper: this collector's chain has diverged from the gateway's; \
+                         stopping the ship loop for an operator to resync"
                     );
                     return;
                 }

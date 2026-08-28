@@ -95,6 +95,82 @@ fn a_worst_case_max_size_batch_still_encodes_within_the_frame_bound() {
     assert_eq!(decoded, batch);
 }
 
+/// F2 regression proof: `log_tailer` decodes a raw tailed line with `String::from_utf8_lossy`,
+/// which can expand invalid UTF-8 up to 3x (each bad byte becomes a 3-byte U+FFFD). A raw line at
+/// or under log-tailer's own MAX_LINE_BYTES cap (== MAX_RECORD_LEN) can therefore come back from
+/// `read_batch` as a record OVER MAX_RECORD_LEN. `next_batch` must not let such a record into the
+/// batch it builds (an oversized record makes an unshippable frame the gateway rejects, and
+/// because a rejected cycle never advances the cursor, the shipper would otherwise re-read - and
+/// re-skip-or-reject - the same pathological line forever, wedging the whole collector's serial
+/// chain). This exercises the `tracing::warn!` drop path in `Batcher::next_batch` (not asserted
+/// on directly, since there is no log-capture harness in this crate's dev-dependencies) and
+/// proves its effect: the oversized record is silently dropped while the following normal record
+/// still ships.
+#[test]
+fn an_over_length_lossy_expanded_record_is_dropped_and_does_not_block_the_next_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+
+    // 400_000 raw bytes of 0xFF: each byte is individually invalid UTF-8, so
+    // `String::from_utf8_lossy` replaces each with a 3-byte U+FFFD, expanding this single line to
+    // 1_200_000 bytes - over MAX_RECORD_LEN (1_048_576) - while the RAW line (400_000 bytes) stays
+    // safely under log-tailer's own MAX_LINE_BYTES cap so it is not itself truncated or discarded
+    // before ever reaching the batcher.
+    let mut content = vec![0xFFu8; 400_000];
+    content.push(b'\n');
+    content.extend_from_slice(b"{\"a\":1}\n");
+    std::fs::write(&log_path, &content).unwrap();
+
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    let batch = Batcher::next_batch(&mut tailer, 0, ZERO_HASH, 100)
+        .expect("the normal second line still yields a batch");
+
+    assert_eq!(
+        batch.records.len(),
+        1,
+        "the over-length lossy-expanded record must be dropped, not shipped"
+    );
+    assert_eq!(batch.records[0], b"{\"a\":1}".to_vec());
+
+    // Both raw lines were consumed from the tailer (the oversized one dropped, not left
+    // unconsumed to be re-read forever) - a third call finds nothing left.
+    assert!(Batcher::next_batch(&mut tailer, batch.seq, batch.batch_hash, 100).is_none());
+}
+
+/// When EVERY line a read produces is over-length, `next_batch` must return `None` (not build a
+/// zero-record batch, which `Batch::new` cannot represent) rather than stalling: the cursor still
+/// advances past the dropped line so a later poll is not stuck re-reading it.
+#[test]
+fn a_read_where_every_line_is_over_length_yields_none_not_a_stall() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+
+    let mut content = vec![0xFFu8; 400_000];
+    content.push(b'\n');
+    std::fs::write(&log_path, &content).unwrap();
+
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert!(
+        Batcher::next_batch(&mut tailer, 0, ZERO_HASH, 100).is_none(),
+        "a read producing only over-length records must yield None, not panic or an empty batch"
+    );
+
+    // The dropped line's bytes were still consumed (read_batch advanced the in-memory cursor),
+    // so appending a normal line and reading again must return only the new line, proving the
+    // tailer did not stall re-reading the same oversized line.
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .unwrap();
+    use std::io::Write;
+    f.write_all(b"{\"b\":2}\n").unwrap();
+    drop(f);
+
+    let batch = Batcher::next_batch(&mut tailer, 0, ZERO_HASH, 100)
+        .expect("the newly appended normal line yields a batch");
+    assert_eq!(batch.records, vec![b"{\"b\":2}".to_vec()]);
+}
+
 /// Even when the caller asks for more than the frame-safe ceiling (e.g. the shipper config's
 /// own default of 16, or any other larger value), `next_batch` must never hand back more than
 /// `MAX_RECORDS_FRAME_SAFE` records - and must clamp at the tailer READ, not merely truncate the

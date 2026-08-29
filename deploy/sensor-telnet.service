@@ -19,7 +19,7 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
-ReadWritePaths=/var/log/propolis/telnet
+ReadWritePaths=/var/log/propolis/telnet /var/spool/propolis/telnet
 
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE

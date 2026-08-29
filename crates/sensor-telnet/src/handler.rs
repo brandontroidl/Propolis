@@ -15,9 +15,12 @@ use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::persona;
 use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell};
-use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
+use sensor_framework::{
+    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
+};
 use sensor_wire::{
-    PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
+    PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
+    SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
 };
 
 use crate::telnet::{IacFilter, negotiation_preamble};
@@ -49,6 +52,12 @@ const PROMPT_PASSWORD: &[u8] = b"Password: ";
 /// malformed input simply ends the session early, matching `sensor_framework::run_tcp_listener`'s
 /// per-connection isolation contract (a dropped connection here never affects the accept loop or
 /// any other in-flight session).
+///
+/// `handoff` captures the raw shell-phase input as evidence when the shared `FakeShell` flags a
+/// binary payload (the "flood": "binary" marker `is_binary_line` sets in `shell.rs`) - a
+/// Mirai/Gafgyt loader's binary dropper, which `FakeShell` otherwise suppresses to a one-line
+/// marker and would be lost. Capture starts only after login (`LineReader::start_capture`, called
+/// just before the shell loop below), so the attacker's password is never in the captured bytes.
 pub async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -56,6 +65,7 @@ pub async fn handle_connection(
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
+    handoff: Arc<CaptureHandoff>,
 ) {
     // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped IPv6 address
     // (::ffff:a.b.c.d from a dual-stack listener) matches the operator's plain-IPv4 WAN map entry
@@ -134,14 +144,23 @@ pub async fn handle_connection(
         return;
     }
 
+    // Capture is shell-phase only: it starts here, after the password has already been read and
+    // dropped above, and never before - so a captured sample can never contain the login
+    // credentials. See the crate-level design note above `handle_connection`.
+    reader.start_capture();
+    let mut binary_seen = false;
+
     loop {
         let Some(line) = reader.read_line(&mut stream, true).await else {
-            return;
+            break;
         };
         let is_exit = matches!(line.trim(), "exit" | "logout");
 
         let (output, events) = shell.handle_input(&line);
         for event in &events {
+            if event.metadata.get("flood").and_then(|v| v.as_str()) == Some("binary") {
+                binary_seen = true;
+            }
             if emitter.append(event).await.is_err() {
                 tracing::error!(%peer_addr, "telnet: failed to append command event");
             }
@@ -156,7 +175,7 @@ pub async fn handle_connection(
             let _ = stream
                 .write_all(&shell.encode_output(output.as_bytes()))
                 .await;
-            return;
+            break;
         }
 
         let mut response = output.into_bytes();
@@ -165,7 +184,38 @@ pub async fn handle_connection(
         // de-obfuscating (identity for a plaintext session, so normal bots are unaffected).
         let response = shell.encode_output(&response);
         if stream.write_all(&response).await.is_err() {
-            return;
+            break;
+        }
+    }
+
+    // A binary payload was seen somewhere in the shell phase (a Mirai/Gafgyt dropper streamed
+    // over the "shell" - never a real interactive command): preserve the raw bytes as evidence.
+    // Plaintext-only sessions never reach this branch, so an ordinary attacker's typed commands
+    // are never spooled.
+    if binary_seen {
+        let raw = reader.take_capture();
+        if !raw.is_empty() {
+            let orig_name = format!("telnet-session-{session_id}");
+            let _ = handoff.submit(CaptureJob {
+                body: raw,
+                orig_name,
+                event_builder: Box::new(move |sample: SampleRef| SensorEvent {
+                    v: WIRE_VERSION,
+                    source_ip,
+                    wan_ip,
+                    sensor: PROTOCOL_LABEL.to_string(),
+                    signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
+                    protocol: PROTO_TCP.to_string(),
+                    authenticated: true,
+                    observed_at: chrono::Utc::now(),
+                    metadata: serde_json::json!({
+                        "protocol_label": PROTOCOL_LABEL,
+                        "capture_reason": "binary_shell_payload",
+                    }),
+                    sample: Some(sample),
+                    session_id: Some(session_id),
+                }),
+            });
         }
     }
 }
@@ -229,6 +279,14 @@ struct LineReader {
     /// True if the previous byte was a CR, so a following LF (the second half of a CR-LF Enter) is
     /// swallowed rather than treated as a second, empty line. Spans reads, hence a field.
     prev_cr: bool,
+    /// Raw, already-IAC-stripped bytes accumulated while `capturing` is true - the evidence
+    /// capture buffer `take_capture` drains. Distinct from `total_captured`/`current`: those track
+    /// line assembly and the whole-session byte budget, this tracks only the shell-phase bytes a
+    /// caller has opted into preserving.
+    capture: Vec<u8>,
+    /// Set by `start_capture`; gates whether `read_line` accumulates into `capture`. Starts false
+    /// so the login/password phase is never captured.
+    capturing: bool,
 }
 
 impl LineReader {
@@ -241,6 +299,37 @@ impl LineReader {
             first_read: true,
             total_captured: 0,
             prev_cr: false,
+            capture: Vec::new(),
+            capturing: false,
+        }
+    }
+
+    /// Begin accumulating raw input into the capture buffer. Callers invoke this only once the
+    /// login phase is over, so the password never reaches `capture`.
+    fn start_capture(&mut self) {
+        self.capturing = true;
+    }
+
+    /// Drain and return everything accumulated in the capture buffer so far.
+    fn take_capture(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.capture)
+    }
+
+    /// Accumulate already-IAC-stripped `data` into the capture buffer, a no-op unless
+    /// `start_capture` has been called, and bounded so a captured session can never grow past
+    /// `bounds.max_captured_bytes` - the same ceiling the whole session's `total_captured` is
+    /// checked against, applied here to the narrower capture buffer.
+    fn capture_bytes(&mut self, data: &[u8]) {
+        if !self.capturing {
+            return;
+        }
+        let room = self
+            .bounds
+            .max_captured_bytes
+            .saturating_sub(self.capture.len() as u64) as usize;
+        if room > 0 {
+            let take = data.len().min(room);
+            self.capture.extend_from_slice(&data[..take]);
         }
     }
 
@@ -284,6 +373,7 @@ impl LineReader {
             let mut data = Vec::new();
             let mut response = Vec::new();
             self.filter.process(&raw[..n], &mut data, &mut response);
+            self.capture_bytes(&data);
             if !response.is_empty() && stream.write_all(&response).await.is_err() {
                 return None;
             }
@@ -360,6 +450,55 @@ mod tests {
             max_captured_bytes: 65_536,
             max_concurrent: 256,
         }
+    }
+
+    #[test]
+    fn capture_is_a_noop_until_start_capture_is_called() {
+        // Mirrors the login phase: bytes flow through the reader before start_capture is ever
+        // called, and must never land in the capture buffer - this is the mechanism that keeps
+        // the password out of any spooled evidence.
+        let mut reader = LineReader::new(test_bounds());
+        reader.capture_bytes(b"root\r\nhunter2\r\n");
+        assert!(
+            reader.take_capture().is_empty(),
+            "bytes seen before start_capture must never be captured"
+        );
+    }
+
+    #[test]
+    fn capture_accumulates_post_iac_bytes_once_capturing() {
+        let mut reader = LineReader::new(test_bounds());
+        reader.start_capture();
+        reader.capture_bytes(b"echo hi\r\n");
+        reader.capture_bytes(&[0x7f, 0xe1, 0x08, 0xff]);
+        assert_eq!(reader.take_capture(), b"echo hi\r\n\x7f\xe1\x08\xff");
+        // take_capture drains: a second call returns nothing more until fed again.
+        assert!(reader.take_capture().is_empty());
+    }
+
+    #[test]
+    fn capture_is_bounded_by_max_captured_bytes() {
+        let mut bounds = test_bounds();
+        bounds.max_captured_bytes = 10;
+        let mut reader = LineReader::new(bounds);
+        reader.start_capture();
+        reader.capture_bytes(b"0123456789ABCDEF"); // 16 bytes offered, cap is 10
+        assert_eq!(
+            reader.capture.len(),
+            10,
+            "a capture must never exceed the bound"
+        );
+
+        // Further bytes past the bound are dropped, not appended once the cap is already full.
+        reader.capture_bytes(b"more");
+        assert_eq!(
+            reader.capture.len(),
+            10,
+            "no more bytes accumulate once the bound is reached"
+        );
+
+        let captured = reader.take_capture();
+        assert_eq!(captured, b"0123456789");
     }
 
     #[test]

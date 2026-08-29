@@ -25,8 +25,10 @@ const ENV_IDLE_TIMEOUT_MS: &str = "PROPOLIS_TELNET_IDLE_TIMEOUT_MS";
 const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_TELNET_MAX_DURATION_SECS";
 const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_TELNET_MAX_CAPTURED_BYTES";
 const ENV_MAX_CONCURRENT: &str = "PROPOLIS_TELNET_MAX_CONCURRENT";
+const ENV_SPOOL_DIR: &str = "PROPOLIS_TELNET_SPOOL_DIR";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/telnet/events.jsonl";
+const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/telnet";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_DURATION_SECS: u64 = 600;
@@ -38,6 +40,7 @@ struct Config {
     bind_addr: SocketAddr,
     wan_map: HashMap<IpAddr, IpAddr>,
     log_path: PathBuf,
+    spool_dir: PathBuf,
     bounds: ConnectionBounds,
 }
 
@@ -156,6 +159,9 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let log_path = env::var(ENV_LOG_PATH)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_PATH));
+    let spool_dir = env::var(ENV_SPOOL_DIR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SPOOL_DIR));
 
     let read_timeout_ms = parse_positive_u64(
         env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
@@ -187,6 +193,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         bind_addr,
         wan_map,
         log_path,
+        spool_dir,
         bounds: ConnectionBounds {
             read_timeout: Duration::from_millis(read_timeout_ms),
             idle_timeout: Duration::from_millis(idle_timeout_ms),
@@ -214,6 +221,7 @@ async fn main() {
     let (bound, handle) = match sensor_telnet::start_test_server(
         config.bind_addr,
         config.log_path,
+        config.spool_dir,
         wan_resolver,
         config.bounds,
     )

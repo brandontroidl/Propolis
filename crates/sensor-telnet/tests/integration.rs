@@ -64,6 +64,7 @@ async fn login_and_command_capture_emits_expected_events() {
     let (addr, handle) = sensor_telnet::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
+        dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
     )
@@ -118,6 +119,7 @@ async fn password_never_appears_in_any_event() {
     let (addr, handle) = sensor_telnet::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
+        dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
     )
@@ -146,6 +148,7 @@ async fn protocol_label_is_telnet_on_all_events() {
     let (addr, handle) = sensor_telnet::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
+        dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
     )
@@ -217,6 +220,7 @@ async fn malformed_random_bytes_drop_connection_without_crashing_listener() {
     let (addr, handle) = sensor_telnet::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
+        dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
     )
@@ -261,6 +265,7 @@ async fn connection_event_unauthenticated_login_event_authenticated_with_usernam
     let (addr, handle) = sensor_telnet::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
+        dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
     )
@@ -311,6 +316,7 @@ async fn accepts_all_credentials() {
     let (addr, handle) = sensor_telnet::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
+        dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
     )
@@ -337,6 +343,7 @@ async fn iac_bytes_in_username_do_not_corrupt_the_line_buffer() {
     let (addr, handle) = sensor_telnet::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
+        dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
     )
@@ -386,6 +393,7 @@ async fn multiple_commands_each_captured_as_separate_events() {
     let (addr, handle) = sensor_telnet::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
+        dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
     )
@@ -439,6 +447,7 @@ async fn no_outbound_connections_from_wget_in_shell() {
     let (addr, handle) = sensor_telnet::start_test_server(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
+        dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
     )
@@ -461,6 +470,142 @@ async fn no_outbound_connections_from_wget_in_shell() {
         connection_count.load(std::sync::atomic::Ordering::Relaxed),
         0,
         "sensor-telnet must open ZERO outbound connections"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// evidence capture: raw shell-phase input is spooled when the shared FakeShell flags a binary
+// payload (a Mirai/Gafgyt dropper today collapses to a "flood": "binary" marker with the raw
+// bytes discarded); a plaintext-only session, and the login/password phase of every session,
+// must never be captured.
+// -------------------------------------------------------------------------------------------
+
+/// Poll `spool_dir` for up to ~1s for at least one entry to appear, rather than a fixed sleep -
+/// the capture hand-off's worker runs off the connection's response path (see
+/// `sensor_framework::handoff`'s module doc), so there is no synchronous point at which "the
+/// worker is done" is directly observable.
+async fn wait_for_spooled_file(spool_dir: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if std::fs::read_dir(spool_dir)
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("timed out waiting for a spooled capture in {spool_dir:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn binary_shell_payload_is_captured_as_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let spool_dir = dir.path().join("spool");
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_telnet::start_test_server(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        spool_dir.clone(),
+        wan_resolver,
+        test_bounds(),
+    )
+    .await
+    .unwrap();
+
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    login(&mut conn, b"root", b"pass").await;
+
+    // A Mirai/Gafgyt-style binary dropper streamed over the "shell": mostly non-ASCII bytes,
+    // which is_binary_line (shell.rs) flags as a binary flood once its lossy-UTF-8-decoded form
+    // is >30% non-printable. Every byte here is >= 0x20 so LineReader::feed buffers it into the
+    // line rather than discarding it as an ignored control byte.
+    let mut binary = vec![0xAAu8; 128];
+    binary.extend_from_slice(b"\r\n");
+    conn.write_all(&binary).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(conn);
+
+    wait_for_spooled_file(&spool_dir).await;
+    handle.abort();
+
+    let spooled: Vec<_> = std::fs::read_dir(&spool_dir).unwrap().collect();
+    assert_eq!(spooled.len(), 1, "exactly one sample should be spooled");
+
+    let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+    let events: Vec<sensor_wire::SensorEvent> = content
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let upload = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .expect("expected a honeypot_malware_upload event for the binary shell payload");
+    assert_eq!(upload.sensor, "telnet");
+    assert!(upload.authenticated);
+    let sample = upload
+        .sample
+        .as_ref()
+        .expect("malware_upload event must carry a sample");
+    assert!(
+        !sample.sha256.is_empty(),
+        "sample must have a non-empty sha256"
+    );
+    assert!(sample.size > 0, "sample must have a non-zero size");
+}
+
+#[tokio::test]
+async fn plaintext_session_is_never_captured_and_password_never_reaches_the_spool() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let spool_dir = dir.path().join("spool");
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_telnet::start_test_server(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        spool_dir.clone(),
+        wan_resolver,
+        test_bounds(),
+    )
+    .await
+    .unwrap();
+
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    login(&mut conn, b"root", b"SuperSecretPassword123").await;
+    conn.write_all(b"whoami\r\n").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    conn.write_all(b"exit\r\n").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    handle.abort();
+
+    let spooled_count = std::fs::read_dir(&spool_dir)
+        .map(|it| it.count())
+        .unwrap_or(0);
+    assert_eq!(
+        spooled_count, 0,
+        "a plaintext-only session must never produce a spooled capture"
+    );
+
+    let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+    assert!(
+        !content.contains("SuperSecretPassword123"),
+        "password must never appear anywhere in the event log, spooled capture or otherwise"
+    );
+    let events: Vec<sensor_wire::SensorEvent> = content
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD),
+        "no malware_upload event for a plaintext-only session; got: {:?}",
+        events.iter().map(|e| &e.signal_type).collect::<Vec<_>>()
     );
 }
 

@@ -377,12 +377,14 @@ async fn a_sequence_gap_is_rejected_and_never_reaches_the_spool() {
 }
 
 /// A single flipped byte inside the frame's own trailing hash breaks `decode_frame`'s wire
-/// checksum before the batch ever reaches `GatewaySink::accept`'s chain check;
-/// `handle_connection` maps every `decode_frame` error uniformly to `Reject{Malformed}`. This
-/// is wire-corruption, distinct from the chain-history `HashMismatch` `end_to_end.rs` (Task 11)
-/// already covers with a self-consistent but wrongly-chained frame.
+/// checksum before the batch ever reaches `GatewaySink::accept`'s chain check; the gateway maps
+/// that decode-time `FrameError::HashMismatch` to `Reject{HashMismatch}`. Same reason code as the
+/// chain-history `HashMismatch` `end_to_end.rs` (Task 11) covers with a self-consistent but
+/// wrongly-chained frame, but a distinct mechanism: this one is wire-corruption caught at decode,
+/// that one is a valid frame failing the rolling-chain check at verification.
 #[tokio::test]
-async fn a_single_flipped_byte_in_the_frame_is_rejected_as_malformed_and_never_reaches_the_spool() {
+async fn a_single_flipped_byte_in_the_frame_is_rejected_as_hash_mismatch_and_never_reaches_the_spool()
+ {
     let cert_dir = tempfile::tempdir().expect("cert tempdir");
     let certs = mint_certs(cert_dir.path(), GATEWAY_DNS, COLLECTOR_ID);
 
@@ -410,7 +412,7 @@ async fn a_single_flipped_byte_in_the_frame_is_rejected_as_malformed_and_never_r
         .await
         .expect("send tampered frame");
     assert_eq!(ack.status, AckStatus::Reject);
-    assert_eq!(ack.reason, AckReason::Malformed);
+    assert_eq!(ack.reason, AckReason::HashMismatch);
 
     let spool_path = spool_dir.path().join(COLLECTOR_ID).join("events.jsonl");
     assert!(

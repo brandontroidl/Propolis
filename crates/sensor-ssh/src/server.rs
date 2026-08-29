@@ -19,7 +19,10 @@ use tokio::task::JoinHandle;
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
 use sensor_framework::persona;
 use sensor_framework::{
-    CaptureHandoff, ConnectionBounds, EventEmitter, QuarantineSpool, WanResolver,
+    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, QuarantineSpool, WanResolver,
+};
+use sensor_wire::{
+    PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
 };
 
 use crate::auth::AuthState;
@@ -112,6 +115,11 @@ pub async fn serve(
 
     let read_timeout = bounds.read_timeout;
     let idle_timeout = bounds.idle_timeout;
+    // Extracted before `bounds` is moved into `run_tcp_listener` below. This bounds only the
+    // shell-channel evidence capture buffer (see `handle_session`'s Shell branch) - a separate,
+    // much narrower ceiling than SCP/SFTP's own 10 MB per-file cap (see `transfer.rs` and
+    // `timeout_stream.rs`'s module doc for why the two are not the same budget).
+    let max_captured_bytes = bounds.max_captured_bytes;
     let (bound_addr, handle) =
         run_tcp_listener(addr, bounds, move |stream, peer_addr, session_id| {
             let host_key = host_key.clone();
@@ -133,6 +141,7 @@ pub async fn serve(
                     handoff,
                     wan_resolver,
                     banner,
+                    max_captured_bytes,
                 )
                 .await
                 {
@@ -157,6 +166,7 @@ async fn handle_session(
     handoff: Arc<CaptureHandoff>,
     wan_resolver: Arc<WanResolver>,
     banner: Arc<String>,
+    max_captured_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ---- Phase 1: version exchange ----
     let (client_version, server_version) =
@@ -224,6 +234,15 @@ async fn handle_session(
     // Per-channel state. Only one channel is typical, but we track by id.
     let mut channel_id: Option<u32> = None;
     let mut handler: ChannelHandler = ChannelHandler::Pending;
+
+    // Raw shell-channel bytes accumulated for evidence capture, and whether the shared FakeShell
+    // ever flagged one as a binary flood (see the Shell arm of SSH_MSG_CHANNEL_DATA below and the
+    // submission after the packet loop). SSH authentication happens in USERAUTH_REQUEST packets,
+    // never in channel data, so the shell channel - which exists only post-auth - can never carry
+    // the login password; no phase-gating is needed here the way telnet's LineReader needs
+    // `start_capture` to exclude its pre-auth login prompt.
+    let mut shell_capture: Vec<u8> = Vec::new();
+    let mut binary_seen = false;
 
     // ---- Main encrypted packet loop ----
     loop {
@@ -374,6 +393,20 @@ async fn handle_session(
 
                 match &mut handler {
                     ChannelHandler::Shell(shell, line_buf) => {
+                        // Accumulate the raw bytes as evidence before any line-buffering or echo
+                        // logic below touches them, bounded so a captured session can never grow
+                        // past `max_captured_bytes` - the operator-configured ceiling this crate's
+                        // own `ConnectionBounds` defines. Whether the buffer is ever submitted
+                        // depends on `binary_seen`, set below when the shared FakeShell flags a
+                        // binary flood; a plaintext-only session accumulates here but the buffer is
+                        // discarded, never spooled, once the loop ends.
+                        let room =
+                            max_captured_bytes.saturating_sub(shell_capture.len() as u64) as usize;
+                        if room > 0 {
+                            let take = data.len().min(room);
+                            shell_capture.extend_from_slice(&data[..take]);
+                        }
+
                         // A real interactive session runs the client terminal in raw mode and relies
                         // on the SERVER to echo keystrokes. Without that echo the attacker types into
                         // a blank screen and the session looks frozen (and no-echo is itself a tell,
@@ -397,6 +430,11 @@ async fn handle_session(
                                         line_buf.clear();
                                         let (output, events) = shell.handle_input(&line);
                                         for event in &events {
+                                            if event.metadata.get("flood").and_then(|v| v.as_str())
+                                                == Some("binary")
+                                            {
+                                                binary_seen = true;
+                                            }
                                             if emitter.append(event).await.is_err() {
                                                 tracing::error!(%peer_addr, "ssh: failed to append command event");
                                             }
@@ -434,6 +472,11 @@ async fn handle_session(
                                         line_buf.clear();
                                         let (_output, events) = shell.handle_input(&line);
                                         for event in &events {
+                                            if event.metadata.get("flood").and_then(|v| v.as_str())
+                                                == Some("binary")
+                                            {
+                                                binary_seen = true;
+                                            }
                                             if emitter.append(event).await.is_err() {
                                                 tracing::error!(%peer_addr, "ssh: failed to append command event");
                                             }
@@ -494,6 +537,35 @@ async fn handle_session(
                 let _ = write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &unimpl).await;
             }
         }
+    }
+
+    // A binary payload was seen somewhere in the shell phase (a Mirai/Gafgyt dropper streamed
+    // over the "shell" - never a real interactive command, since FakeShell's binary-flood
+    // detector only trips on a line that is mostly non-printable). Preserve the raw bytes as
+    // evidence, reusing the same handoff SCP/SFTP already submit through. Plaintext-only sessions
+    // never set `binary_seen`, so ordinary interactive commands are never spooled.
+    if binary_seen && !shell_capture.is_empty() {
+        let orig_name = format!("ssh-session-{session_id}");
+        let _ = handoff.submit(CaptureJob {
+            body: shell_capture,
+            orig_name,
+            event_builder: Box::new(move |sample: SampleRef| SensorEvent {
+                v: WIRE_VERSION,
+                source_ip,
+                wan_ip,
+                sensor: "ssh".into(),
+                signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.into(),
+                protocol: PROTO_TCP.into(),
+                authenticated: true,
+                observed_at: chrono::Utc::now(),
+                metadata: serde_json::json!({
+                    "protocol_label": "ssh",
+                    "capture_reason": "binary_shell_payload",
+                }),
+                sample: Some(sample),
+                session_id: Some(session_id),
+            }),
+        });
     }
 
     Ok(())

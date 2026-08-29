@@ -215,6 +215,187 @@ async fn no_outbound_connections() {
 }
 
 // ---------------------------------------------------------------------
+// Shell-channel evidence capture
+//
+// SCP/SFTP uploads were already captured through `CaptureHandoff`; the interactive shell
+// channel was not, so a Mirai/Gafgyt loader that streams its binary dropper straight into the
+// fake shell (rather than using scp/sftp) had that payload suppressed to FakeShell's one-line
+// "flood: binary" marker and discarded - never recoverable. These two tests are the mirror of
+// sensor-telnet's `capture_is_a_noop_until_start_capture_is_called` family, but end to end
+// against a real SSH client/server pair: one proves a binary shell payload is spooled and
+// produces a honeypot_malware_upload event, the other proves an ordinary plaintext session
+// produces no such capture.
+// ---------------------------------------------------------------------
+
+/// Poll `log_path` up to ~1s for an event whose `signal_type` is `honeypot_malware_upload`,
+/// returning it if one appears. Bounded polling rather than a fixed sleep: the handoff worker
+/// drains its queue off the response path (see `sensor_framework::handoff`'s module doc), so the
+/// event can lag the session's close by a small, variable amount.
+async fn poll_for_malware_upload(log_path: &std::path::Path) -> Option<sensor_wire::SensorEvent> {
+    for _ in 0..20 {
+        if let Ok(content) = tokio::fs::read_to_string(log_path).await {
+            for line in content.lines() {
+                if let Ok(event) = serde_json::from_str::<sensor_wire::SensorEvent>(line)
+                    && event.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD
+                {
+                    return Some(event);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn binary_shell_payload_is_captured_as_malware_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let spool_dir = dir.path().join("spool");
+    let host_key_path = dir.path().join("host_key");
+
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        spool_dir.clone(),
+        host_key_path,
+        wan_resolver,
+        test_bounds(),
+        "OpenSSH_9.6p1".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(config, addr, TestHandler)
+        .await
+        .unwrap();
+    session
+        .authenticate_password("attacker", "password123")
+        .await
+        .unwrap();
+
+    let channel = session.channel_open_session().await.unwrap();
+    channel.request_shell(false).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A line of mostly non-printable bytes (well over the 30% threshold `is_binary_line` uses),
+    // terminated by Enter so it commits as one line and reaches `shell.handle_input`. Stands in
+    // for a loader streaming a binary dropper straight into the "shell" instead of using scp/sftp.
+    let mut payload: Vec<u8> = Vec::new();
+    for i in 0u8..200 {
+        payload.push(0x80u8.wrapping_add(i));
+    }
+    payload.push(b'\n');
+    channel.data(&payload[..]).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    channel.eof().await.unwrap();
+    drop(channel);
+    drop(session);
+
+    let event = poll_for_malware_upload(&log_path)
+        .await
+        .expect("a honeypot_malware_upload event must be emitted for a binary shell payload");
+    handle.abort();
+
+    assert!(event.authenticated);
+    assert_eq!(event.protocol, sensor_wire::PROTO_TCP);
+    let sample = event
+        .sample
+        .expect("the malware_upload event must carry a sample");
+    assert!(!sample.sha256.is_empty(), "sample.sha256 must be non-empty");
+    assert!(sample.size > 0, "sample.size must be non-empty");
+    assert_eq!(
+        event
+            .metadata
+            .get("capture_reason")
+            .and_then(|v| v.as_str()),
+        Some("binary_shell_payload")
+    );
+
+    // The sample must actually have landed in the spool directory, not just be named in the
+    // event - the spool is the recoverable-evidence artifact this fix exists to produce.
+    let spooled: Vec<_> = std::fs::read_dir(&spool_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        !spooled.is_empty(),
+        "the binary payload must be written to the quarantine spool directory"
+    );
+
+    // PII discipline, mirroring the plaintext test above: the password must never appear
+    // anywhere in the emitted events, including this new capture path.
+    let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+    assert!(
+        !content.contains("password123"),
+        "password must never appear in events, including malware_upload capture"
+    );
+}
+
+#[tokio::test]
+async fn plaintext_shell_session_produces_no_malware_upload_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let spool_dir = dir.path().join("spool");
+    let host_key_path = dir.path().join("host_key");
+
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        spool_dir,
+        host_key_path,
+        wan_resolver,
+        test_bounds(),
+        "OpenSSH_9.6p1".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(config, addr, TestHandler)
+        .await
+        .unwrap();
+    session
+        .authenticate_password("attacker", "password123")
+        .await
+        .unwrap();
+
+    let channel = session.channel_open_session().await.unwrap();
+    channel.request_shell(false).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    channel.data(&b"uname -a\n"[..]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    channel.data(&b"whoami\n"[..]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    channel.eof().await.unwrap();
+    drop(channel);
+    drop(session);
+
+    // No malware_upload event must ever appear for an all-plaintext interactive session - a
+    // fixed wait (not the poll helper, which is built to return early on a hit) so the negative
+    // assertion actually gives the handoff worker its full window to prove nothing arrives.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    handle.abort();
+
+    let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+    let events: Vec<sensor_wire::SensorEvent> = content
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD),
+        "a plaintext-only shell session must never produce a malware_upload capture"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Connection bounds
 //
 // This sensor hand-rolled its own accept loop and so had none of the framework bounds every

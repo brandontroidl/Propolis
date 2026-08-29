@@ -95,7 +95,7 @@ async fn smoke_health_and_ready(pool: PgPool) {
     let cursor_path = cursor_dir.path().to_path_buf();
     let sensor_path = sensor_log_path.clone();
     let intake_handle = tokio::spawn(async move {
-        let tailer = intake::tailer::LogTailer::new(sensor_path, cursor_path);
+        let tailer = log_tailer::LogTailer::new(sensor_path, cursor_path);
         let mut runner =
             intake::runner::IntakeRunner::new(tailer, intake_pool, "test-sensor".to_string());
 

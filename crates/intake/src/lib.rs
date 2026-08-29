@@ -3,6 +3,4 @@
 //! converted events to the event ledger. See `internal/design/03-event-intake-aggregation.md`.
 
 pub mod converter;
-pub mod cursor;
 pub mod runner;
-pub mod tailer;

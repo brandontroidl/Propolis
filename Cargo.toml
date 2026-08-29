@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/collector-wire",
     "crates/core-scoring",
     "crates/sensor-wire",
     "crates/sensor-framework",
@@ -14,9 +15,13 @@ members = [
     "crates/sensor-smtp",
     "crates/sensor-cred",
     "crates/geoip",
+    "crates/log-tailer",
     "crates/intake",
     "crates/review",
     "crates/feed",
     "crates/console",
     "crates/propolis",
+    "crates/provision-certs",
+    "crates/gateway",
+    "crates/shipper",
 ]

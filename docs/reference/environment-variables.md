@@ -251,6 +251,67 @@ u32.
 
 ---
 
+## Collector/control-plane split binaries (SP-A)
+
+Two additional binaries, each its own process with its own `load_config_from_env()` and its own
+`/etc/propolis/<name>.env` — the disposable-collector / control-plane topology
+(`deploy/gateway.service`, `deploy/shipper.service`, `deploy/collector.env.example`,
+`deploy/control-plane.env.example`). Neither reads `DATABASE_URL` or any vendor/VT/console
+variable; that boundary is the entire point of the split.
+
+### `gateway`
+
+`crates/gateway/src/config.rs`. Control-plane-side mTLS ingest listener. All fields are strict
+parse (present-but-zero or unparseable → **abort**), matching the sensor pattern.
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_GATEWAY_BIND` | **yes** | — | single `ip:port`; absent → abort (`ConfigError::NoBind`); unparseable → abort (`ConfigError::InvalidBind`) |
+| `PROPOLIS_GATEWAY_CA_CERT_PATH` | **yes** | — | PEM path used to verify collector client certificates; absent → abort |
+| `PROPOLIS_GATEWAY_SERVER_CERT_PATH` | **yes** | — | PEM path the gateway presents in the TLS handshake; absent → abort |
+| `PROPOLIS_GATEWAY_SERVER_KEY_PATH` | **yes** | — | PEM path, private key for the server cert above; absent → abort |
+| `PROPOLIS_GATEWAY_SPOOL_DIR` | no | `/var/spool/propolis/gateway` | root of the per-collector spool tree; one `events.jsonl` per collector under `<root>/<collector_id>/` (`crates/gateway/src/spool.rs`) |
+| `PROPOLIS_GATEWAY_STATE_DIR` | no | `/var/lib/propolis/gateway` | gateway's own state directory |
+| `PROPOLIS_GATEWAY_MAX_CONCURRENT` | no | `64` | positive u32; zero/unparseable → abort |
+| `PROPOLIS_GATEWAY_MAX_DURATION_SECS` | no | `120` | positive u64 secs; zero/unparseable → abort |
+| `PROPOLIS_GATEWAY_READ_TIMEOUT_MS` | no | `30000` | positive u64 ms; zero/unparseable → abort |
+| `PROPOLIS_GATEWAY_IDLE_TIMEOUT_MS` | no | `60000` | positive u64 ms; zero/unparseable → abort |
+
+The gateway's own read loop bounds every frame at `collector_wire::frame::MAX_FRAME_LEN` before
+allocating, so `ConnectionBounds`'s `max_captured_bytes` field is fixed to that ceiling internally
+and is **not** exposed as a separate env var.
+
+### `shipper`
+
+`crates/shipper/src/config.rs`. Collector-side process that tails this collector's sensor logs and
+ships batches to the gateway over mTLS. All fields are strict parse; the collector id below is
+additionally cross-checked against the client certificate's CommonName at startup.
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_SHIPPER_GATEWAY_ADDR` | **yes** | — | `host:port` socket address of the gateway; absent/unparseable → abort |
+| `PROPOLIS_SHIPPER_GATEWAY_DNS` | **yes** | — | DNS name checked against the gateway's TLS server certificate during the mTLS handshake; absent → abort |
+| `PROPOLIS_SHIPPER_CA_CERT_PATH` | **yes** | — | PEM path used to verify the gateway's server certificate; absent → abort |
+| `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` | **yes** | — | PEM path, this collector's client certificate; absent → abort |
+| `PROPOLIS_SHIPPER_CLIENT_KEY_PATH` | **yes** | — | PEM path, private key for the client cert above; absent → abort |
+| `PROPOLIS_SHIPPER_COLLECTOR_ID` | **yes** | — | this collector's identity; **must equal** the CommonName baked into `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` or the shipper refuses to start (`validate_collector_id`, `ConfigError::CollectorIdMismatch`) |
+| `PROPOLIS_SHIPPER_SENSOR_LOGS` | **yes** | — | comma-separated `name:path` pairs, same grammar as `PROPOLIS_SENSOR_LOGS`; empty or a malformed entry → abort; at least one pair required |
+| `PROPOLIS_SHIPPER_CURSOR_DIR` | no | `/var/lib/propolis/shipper/cursors` | per-log tail cursor persistence |
+| `PROPOLIS_SHIPPER_STATE_DIR` | no | `/var/lib/propolis/shipper/state` | shipper's own state directory |
+| `PROPOLIS_SHIPPER_POLL_INTERVAL_MS` | no | `1000` | positive u64 ms; zero/unparseable → abort |
+| `PROPOLIS_SHIPPER_MAX_RECORDS_PER_BATCH` | no | `15` (`batcher::MAX_RECORDS_FRAME_SAFE`) | positive u64 → usize; zero/unparseable → abort |
+| `PROPOLIS_SHIPPER_RETRY_BACKOFF_MS` | no | `2000` | positive u64 ms; zero/unparseable → abort |
+
+`PROPOLIS_SHIPPER_SENSOR_LOGS`'s `name` is used only for cursor keying and logging — every sensor
+log on a collector ships through one seq/hash chain keyed by `PROPOLIS_SHIPPER_COLLECTOR_ID`
+(via the gateway's verified client-certificate CommonName), not by the per-log name.
+
+On the control-plane side, intake's `PROPOLIS_SENSOR_LOGS` is re-pointed at the gateway's
+per-collector spool (one `name:path` entry per collector, not per sensor) — see
+[filesystem paths](filesystem-paths.md) and `deploy/control-plane.env.example`.
+
+---
+
 ## Standalone service binaries
 
 Each reads a strict subset of the unified daemon's variables with the same

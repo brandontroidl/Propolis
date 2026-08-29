@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use intake::runner::IntakeRunner;
-use intake::tailer::LogTailer;
+use log_tailer::LogTailer;
 use sqlx::PgPool;
 
 const ENV_DATABASE_URL: &str = "DATABASE_URL";

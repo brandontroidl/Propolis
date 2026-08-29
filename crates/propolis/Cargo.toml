@@ -13,6 +13,7 @@ core-scoring = { path = "../core-scoring" }
 feed = { path = "../feed" }
 geoip = { path = "../geoip" }
 intake = { path = "../intake" }
+log-tailer = { path = "../log-tailer" }
 review = { path = "../review" }
 sensor-framework = { path = "../sensor-framework" }
 

@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use collector_wire::ack::{ACK_LEN, Ack, AckReason, AckStatus, encode_ack};
-use collector_wire::frame::{Batch, MAX_FRAME_LEN, decode_frame};
+use collector_wire::frame::{Batch, FrameError, MAX_FRAME_LEN, decode_frame};
 use collector_wire::tls::peer_common_name;
 use sensor_framework::{ConnectionBounds, run_tcp_listener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,18 +93,19 @@ async fn handle_connection(
             return;
         }
 
-        let ack = match decode_frame(&frame_bytes) {
-            Ok(batch) => sink.accept(&collector_id, &batch),
+        let (ack, decode_failed) = match decode_frame(&frame_bytes) {
+            Ok(batch) => (sink.accept(&collector_id, &batch), false),
             Err(error) => {
-                tracing::warn!(%peer, %collector_id, %error, "malformed frame; rejecting");
-                Ack {
+                let reason = decode_reject_reason(&error);
+                tracing::warn!(%peer, %collector_id, %error, ?reason, "invalid frame; rejecting");
+                let ack = Ack {
                     status: AckStatus::Reject,
-                    reason: AckReason::Malformed,
+                    reason,
                     next_expected_seq: 0,
-                }
+                };
+                (ack, true)
             }
         };
-        let malformed = ack.status == AckStatus::Reject && ack.reason == AckReason::Malformed;
 
         let ack_bytes: [u8; ACK_LEN] = encode_ack(&ack);
         if let Err(error) = stream.write_all(&ack_bytes).await {
@@ -116,11 +117,67 @@ async fn handle_connection(
             return;
         }
 
-        if malformed {
-            // A malformed frame desyncs the length-prefixed stream (we cannot trust our
-            // position); close rather than attempt to keep reading.
+        if decode_failed {
+            // ANY decode failure desyncs the length-prefixed stream (we cannot trust our
+            // position for the next frame), whatever specific reason we reported; close rather
+            // than attempt to keep reading. A verification Reject from `sink.accept` (seq gap /
+            // hash mismatch on a well-formed frame) leaves the stream in sync, so it does not
+            // close here - the shipper stops on any Reject regardless.
             return;
         }
         // Otherwise loop: a shipper may pipeline several batches on one connection.
+    }
+}
+
+/// Map a frame-decode failure to the closed-enum `AckReason` the gateway reports on the fixed
+/// ack. Purely diagnostic - the shipper stops on any `Reject` regardless of reason, and every
+/// decode failure closes the connection (see `decode_failed` above) - but a specific reason makes
+/// the one-way ack self-describing without opening any richer channel back to the collector.
+fn decode_reject_reason(err: &FrameError) -> AckReason {
+    match err {
+        FrameError::FrameTooLarge | FrameError::RecordTooLarge => AckReason::Oversize,
+        FrameError::HashMismatch => AckReason::HashMismatch,
+        FrameError::RecordNewline => AckReason::BadRecordNewline,
+        // Structural framing faults with no more specific closed-enum reason.
+        FrameError::BadMagic
+        | FrameError::BadVersion
+        | FrameError::Truncated
+        | FrameError::TooManyRecords
+        | FrameError::EmptyBatch => AckReason::Malformed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_errors_map_to_their_specific_ack_reasons() {
+        assert_eq!(
+            decode_reject_reason(&FrameError::FrameTooLarge),
+            AckReason::Oversize
+        );
+        assert_eq!(
+            decode_reject_reason(&FrameError::RecordTooLarge),
+            AckReason::Oversize
+        );
+        assert_eq!(
+            decode_reject_reason(&FrameError::HashMismatch),
+            AckReason::HashMismatch
+        );
+        assert_eq!(
+            decode_reject_reason(&FrameError::RecordNewline),
+            AckReason::BadRecordNewline
+        );
+        // Structural faults collapse to Malformed.
+        for err in [
+            FrameError::BadMagic,
+            FrameError::BadVersion,
+            FrameError::Truncated,
+            FrameError::TooManyRecords,
+            FrameError::EmptyBatch,
+        ] {
+            assert_eq!(decode_reject_reason(&err), AckReason::Malformed);
+        }
     }
 }

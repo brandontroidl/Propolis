@@ -60,6 +60,12 @@ pub struct SampleRef {
     pub sha256: String,
     pub size: u64,
     pub orig_name: String,
+    /// The observation join key (SP-B): a stable, collector-minted id for this capture
+    /// occurrence, minted at `QuarantineSpool::store`. `sha256` identifies content; `capture_id`
+    /// identifies the observation. Optional + skipped so pre-SP-B records still deserialize and a
+    /// None value never appears on the wire (backward/forward compatible, no WIRE_VERSION bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_id: Option<uuid::Uuid>,
 }
 
 #[cfg(test)]
@@ -105,6 +111,7 @@ mod tests {
                 sha256: "a".repeat(64),
                 size: 12345,
                 orig_name: "malware.bin".into(),
+                capture_id: None,
             }),
             ..sample_event()
         };
@@ -156,5 +163,37 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let back: SensorEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back.session_id, Some(sid));
+    }
+
+    #[test]
+    fn sampleref_capture_id_round_trips_when_present() {
+        let id = uuid::Uuid::now_v7();
+        let s = SampleRef {
+            sha256: "a".repeat(64),
+            size: 10,
+            orig_name: "x".into(),
+            capture_id: Some(id),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.contains(&id.to_string()),
+            "capture_id must serialize when present"
+        );
+        let back: SampleRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.capture_id, Some(id));
+    }
+
+    #[test]
+    fn sampleref_without_capture_id_still_deserializes_as_none() {
+        // A pre-SP-B record (no capture_id key) must still parse - backward compat.
+        let legacy = r#"{"sha256":"aa","size":3,"orig_name":""}"#;
+        let s: SampleRef = serde_json::from_str(legacy).unwrap();
+        assert_eq!(s.capture_id, None);
+        // And a None capture_id must be omitted from output (skip_serializing_if).
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("capture_id"),
+            "None capture_id must be omitted"
+        );
     }
 }

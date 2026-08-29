@@ -132,6 +132,11 @@ impl QuarantineSpool {
     /// disk. Without this, a single popular sample delivered by many bots would exhaust the
     /// budget on its own despite never actually filling the disk.
     pub fn store(&self, body: &[u8]) -> Result<SampleRef, SpoolError> {
+        // Minted once per call, regardless of which branch below returns: identical bytes still
+        // dedup to the same sha256 (content), but each `store` call is a distinct capture
+        // occurrence and gets its own id.
+        let capture_id = Some(uuid::Uuid::now_v7());
+
         let size = body.len() as u64;
         if size > self.max_file_size {
             return Err(SpoolError::FileSizeExceeded {
@@ -152,6 +157,7 @@ impl QuarantineSpool {
                 sha256: hash,
                 size,
                 orig_name: String::new(),
+                capture_id,
             });
         }
 
@@ -173,6 +179,7 @@ impl QuarantineSpool {
                     sha256: hash,
                     size,
                     orig_name: String::new(),
+                    capture_id,
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -186,6 +193,7 @@ impl QuarantineSpool {
                     sha256: hash,
                     size,
                     orig_name: String::new(),
+                    capture_id,
                 })
             }
             Err(e) => {
@@ -425,6 +433,27 @@ mod tests {
         let body = vec![1u8; 30]; // 80 + 30 = 110 > 100 budget
         let result = spool.store(&body);
         assert!(matches!(result, Err(SpoolError::BudgetExhausted { .. })));
+    }
+
+    #[test]
+    fn store_mints_a_capture_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = QuarantineSpool::new(dir.path().to_path_buf(), 10_000_000, 100_000_000);
+        let s = spool.store(b"hello").unwrap();
+        assert!(s.capture_id.is_some(), "store must mint a capture_id");
+    }
+
+    #[test]
+    fn store_mints_a_distinct_capture_id_per_call_even_for_identical_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = QuarantineSpool::new(dir.path().to_path_buf(), 10_000_000, 100_000_000);
+        let a = spool.store(b"same").unwrap();
+        let b = spool.store(b"same").unwrap();
+        // Same content dedups to the same sha256 (existing behavior)...
+        assert_eq!(a.sha256, b.sha256);
+        // ...but each capture is a distinct OCCURRENCE, so capture_id differs.
+        assert_ne!(a.capture_id, b.capture_id);
+        assert!(a.capture_id.is_some() && b.capture_id.is_some());
     }
 
     #[test]

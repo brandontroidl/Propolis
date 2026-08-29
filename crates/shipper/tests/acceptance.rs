@@ -131,6 +131,7 @@ fn build_events() -> Vec<SensorEvent> {
                 sha256: "a".repeat(64),
                 size: 4096,
                 orig_name: "dropper.bin".into(),
+                capture_id: None,
             }),
             session_id: Some(uuid::Uuid::now_v7()),
         },

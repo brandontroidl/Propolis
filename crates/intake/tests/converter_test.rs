@@ -61,6 +61,7 @@ fn folds_sample_into_metadata() {
         sha256: "a".repeat(64),
         size: 12345,
         orig_name: "evil.bin".into(),
+        capture_id: None,
     });
     let input = convert(event).unwrap();
     assert_eq!(input.metadata["sample_sha256"], "a".repeat(64));
@@ -75,6 +76,7 @@ fn preserves_existing_metadata_when_folding_sample() {
         sha256: "b".repeat(64),
         size: 100,
         orig_name: "test.bin".into(),
+        capture_id: None,
     });
     let input = convert(event).unwrap();
     // Original metadata fields preserved.

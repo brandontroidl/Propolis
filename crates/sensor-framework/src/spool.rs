@@ -469,4 +469,26 @@ mod tests {
         let result = spool.verify("../../../../etc/passwd");
         assert!(matches!(result, Err(SpoolError::InvalidHash { .. })));
     }
+
+    #[test]
+    fn outbox_manifest_file_does_not_consume_spool_budget() {
+        // SP-B-1c: each sensor's outbox manifest now lives at `<spool_dir>/outbox`, a
+        // subdirectory of the same directory this spool scans on construction. `used` must only
+        // ever be recovered from regular files directly in `dir` (`scan_existing_usage` above is
+        // `is_file`-only and non-recursive), so a manifest file sitting one level down in
+        // `outbox/` must never count against the capture body budget - verified here by budget
+        // exhaustion rather than a `used` accessor (none exists; same technique as
+        // `new_recovers_used_bytes_from_files_already_on_disk`).
+        let dir = tempfile::tempdir().unwrap();
+        let outbox_dir = dir.path().join("outbox");
+        std::fs::create_dir_all(&outbox_dir).unwrap();
+        // Larger than the budget below: if this were ever counted, every store would fail.
+        std::fs::write(outbox_dir.join("some-capture-id.json"), vec![0u8; 500]).unwrap();
+
+        let spool = QuarantineSpool::new(dir.path().to_path_buf(), 1024, 100);
+        let body = vec![1u8; 100]; // exactly the budget; fails if the manifest bytes were counted
+        spool
+            .store(&body)
+            .expect("a same-level outbox/ file must not count against the spool budget");
+    }
 }

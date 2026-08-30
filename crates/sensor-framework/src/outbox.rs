@@ -145,10 +145,14 @@ mod tests {
 
     #[test]
     fn new_rows_are_pending() {
-        let r = row(uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-        assert_eq!(r.gateway_spool_state, CustodyState::Pending);
-        assert_eq!(r.cas_state, CustodyState::Pending);
-        assert_eq!(r.custody_state, CustodyDisposition::Pending);
+        let dir = tempfile::tempdir().unwrap();
+        let m = OutboxManifest::new(dir.path().to_path_buf());
+        let cid = uuid::Uuid::now_v7();
+        m.write(&row(cid, uuid::Uuid::now_v7())).unwrap();
+        let back = m.load(cid).unwrap().expect("present");
+        assert_eq!(back.gateway_spool_state, CustodyState::Pending);
+        assert_eq!(back.cas_state, CustodyState::Pending);
+        assert_eq!(back.custody_state, CustodyDisposition::Pending);
     }
 
     #[test]

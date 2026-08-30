@@ -31,6 +31,14 @@ const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_SSH_MAX_DURATION_SECS";
 const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_SSH_MAX_CAPTURED_BYTES";
 const ENV_MAX_CONCURRENT: &str = "PROPOLIS_SSH_MAX_CONCURRENT";
 const ENV_BANNER: &str = "PROPOLIS_SSH_BANNER";
+/// Unprefixed and shared across every sensor binary on this collector - not `PROPOLIS_SSH_*` -
+/// because the value must be the SAME physical identity every sensor stamps onto its outbox
+/// manifest rows (SP-B-1b), matching the CommonName of the mTLS client certificate `shipper` on
+/// this box presents to the gateway (`shipper::config::ENV_COLLECTOR_ID` /
+/// `validate_collector_id`). A per-sensor-prefixed name here would invite the exact divergence
+/// this identity exists to prevent.
+const ENV_COLLECTOR_ID: &str = "COLLECTOR_ID";
+const ENV_OUTBOX_DIR: &str = "PROPOLIS_SSH_OUTBOX_DIR";
 
 /// The software-version sent in `SSH-2.0-<this>`. Defaults to the OpenSSH build the shared persona
 /// claims (an Ubuntu 22.04 host -> OpenSSH 8.9p1), so the banner blends into the internet's largest
@@ -46,6 +54,12 @@ const DEFAULT_BANNER: &str = sensor_framework::persona::OPENSSH_VERSION;
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/ssh/events.jsonl";
 const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/ssh";
 const DEFAULT_HOST_KEY_PATH: &str = "/var/lib/propolis/ssh/host_key";
+/// Single-node deployments run no shipper, so there is no collector identity to match; `"local"`
+/// keeps the outbox manifest well-formed anyway.
+const DEFAULT_COLLECTOR_ID: &str = "local";
+/// Shared default outbox root across every sensor: manifest rows are keyed by a globally-unique
+/// `capture_id`, so multiple sensor processes writing into the same directory never collide.
+const DEFAULT_OUTBOX_DIR: &str = "/var/lib/propolis/outbox";
 
 // Deliberately identical to sensor-telnet's defaults. Both are unauthenticated, internet-facing
 // TCP honeypots with the same exposure, so two different sets of numbers would be a difference
@@ -65,6 +79,8 @@ struct Config {
     spool_dir: PathBuf,
     bounds: ConnectionBounds,
     banner: String,
+    collector_id: String,
+    outbox_dir: PathBuf,
 }
 
 #[derive(Debug, PartialEq)]
@@ -174,6 +190,11 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     };
 
     let banner = env::var(ENV_BANNER).unwrap_or_else(|_| DEFAULT_BANNER.to_string());
+    let collector_id =
+        env::var(ENV_COLLECTOR_ID).unwrap_or_else(|_| DEFAULT_COLLECTOR_ID.to_string());
+    let outbox_dir = env::var(ENV_OUTBOX_DIR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_OUTBOX_DIR));
 
     Ok(Config {
         bind_addr,
@@ -183,6 +204,8 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         spool_dir,
         bounds,
         banner,
+        collector_id,
+        outbox_dir,
     })
 }
 
@@ -294,6 +317,8 @@ async fn main() {
         wan_resolver,
         config.bounds,
         config.banner,
+        config.collector_id,
+        config.outbox_dir,
     )
     .await
     {

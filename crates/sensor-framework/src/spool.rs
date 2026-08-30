@@ -279,6 +279,10 @@ impl QuarantineSpool {
 fn write_and_seal(file: &mut std::fs::File, body: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     file.write_all(body)?;
+    // Durable before the outbox manifest (SP-B-1b) is ever allowed to claim this body exists:
+    // the manifest's ordering guarantee (handoff.rs's process_job doc) depends on the body being
+    // on disk by the time the manifest row is written, not merely handed to the OS write buffer.
+    file.sync_all()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

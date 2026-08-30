@@ -392,13 +392,33 @@ Sensor-specific extras:
   (default `/var/lib/propolis/ssh/host_key`, `:48`), `PROPOLIS_SSH_SPOOL_DIR`
   (default `/var/spool/propolis/ssh`, `:47`), `PROPOLIS_SSH_BANNER` (default =
   persona `OPENSSH_VERSION` = `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10`, `main.rs:44` +
-  `persona.rs:41`; blank → default).
+  `persona.rs:41`; blank → default), `PROPOLIS_SSH_OUTBOX_DIR` (default
+  `/var/lib/propolis/outbox`; see "Outbox manifest" below).
 - **ftp** (`crates/sensor-ftp/src/main.rs`): `PROPOLIS_FTP_SPOOL_DIR` (default
-  `/var/spool/propolis/ftp`, `:21`).
+  `/var/spool/propolis/ftp`, `:21`), `PROPOLIS_FTP_OUTBOX_DIR` (default
+  `/var/lib/propolis/outbox`; see "Outbox manifest" below).
 - **adb** (`crates/sensor-adb/src/main.rs`): `PROPOLIS_ADB_SPOOL_DIR` (default
-  `/var/spool/propolis/adb`, `:32`).
+  `/var/spool/propolis/adb`, `:32`), `PROPOLIS_ADB_OUTBOX_DIR` (default
+  `/var/lib/propolis/outbox`; see "Outbox manifest" below).
+- **telnet** (`crates/sensor-telnet/src/main.rs`): `PROPOLIS_TELNET_SPOOL_DIR`
+  (default `/var/spool/propolis/telnet`), `PROPOLIS_TELNET_OUTBOX_DIR` (default
+  `/var/lib/propolis/outbox`; see "Outbox manifest" below).
 - **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs:24`).
-- **catchall**: no spool variable (never spools file bodies, `main.rs:47-49`).
+- **catchall**: no spool variable (never spools file bodies, `main.rs:47-49`); no
+  outbox variable either (captures no file bodies, so nothing for SP-B-1b's
+  manifest to record).
+
+#### Outbox manifest (SP-B-1b)
+
+Every sensor that spools captured file bodies (ssh, ftp, adb, telnet) also writes a durable
+per-capture custody manifest row under its outbox directory as soon as the body is sealed - see
+`sensor_framework::outbox` and `sensor_framework::handoff::process_job`. Two variables govern it,
+read identically by each of those four sensors' `main.rs`:
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `COLLECTOR_ID` (unprefixed - shared, not `PROPOLIS_<SENSOR>_*`) | no | `local` | Stamped onto every manifest row this sensor writes. **Must equal** the CommonName of the client certificate `shipper`'s `PROPOLIS_SHIPPER_COLLECTOR_ID` presents to the gateway on this box, because a later stage joins the gateway's cert-derived collector id against this manifest on `(collector_id, occurrence_id)`. A single-node deployment with no shipper leaves this at `local`. |
+| `PROPOLIS_<SENSOR>_OUTBOX_DIR` | no | `/var/lib/propolis/outbox` | Root of the per-capture manifest JSON files (`<dir>/<capture_id>.json`). The default is shared across sensors on purpose: manifest rows are keyed by a globally-unique `capture_id`, so multiple sensor processes writing into the same directory never collide. |
 
 ### Lenient sensors — cred, smtp
 

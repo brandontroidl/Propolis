@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use sensor_framework::{
-    CaptureHandoff, ConnectionBounds, EventEmitter, QuarantineSpool, WanResolver, run_tcp_listener,
+    CaptureHandoff, ConnectionBounds, EventEmitter, OutboxManifest, QuarantineSpool, WanResolver,
+    run_tcp_listener,
 };
 use tokio::task::JoinHandle;
 
@@ -30,6 +31,8 @@ pub async fn start_test_server(
     spool_dir: PathBuf,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
+    collector_id: String,
+    outbox_dir: PathBuf,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
     let emitter = Arc::new(EventEmitter::new(log_path.clone()));
 
@@ -40,7 +43,13 @@ pub async fn start_test_server(
     // The handoff's emitter writes to the same log file. EventEmitter opens with O_APPEND on
     // each write so concurrent emitters to the same path are safe - mirrors sensor-ssh's
     // `server::serve`.
-    let handoff = Arc::new(CaptureHandoff::new(spool, EventEmitter::new(log_path), 64));
+    let handoff = Arc::new(CaptureHandoff::new(
+        spool,
+        EventEmitter::new(log_path),
+        64,
+        collector_id,
+        OutboxManifest::new(outbox_dir),
+    ));
     let _worker = handoff.start_worker();
 
     run_tcp_listener(addr, bounds.clone(), move |stream, peer, session_id| {

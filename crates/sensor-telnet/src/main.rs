@@ -26,9 +26,15 @@ const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_TELNET_MAX_DURATION_SECS";
 const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_TELNET_MAX_CAPTURED_BYTES";
 const ENV_MAX_CONCURRENT: &str = "PROPOLIS_TELNET_MAX_CONCURRENT";
 const ENV_SPOOL_DIR: &str = "PROPOLIS_TELNET_SPOOL_DIR";
+/// Unprefixed and shared across every sensor binary on this collector (see sensor-ssh's own
+/// `main.rs` for why): must match the shipper's `PROPOLIS_SHIPPER_COLLECTOR_ID` cert CommonName.
+const ENV_COLLECTOR_ID: &str = "COLLECTOR_ID";
+const ENV_OUTBOX_DIR: &str = "PROPOLIS_TELNET_OUTBOX_DIR";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/telnet/events.jsonl";
 const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/telnet";
+const DEFAULT_COLLECTOR_ID: &str = "local";
+const DEFAULT_OUTBOX_DIR: &str = "/var/lib/propolis/outbox";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_DURATION_SECS: u64 = 600;
@@ -42,6 +48,8 @@ struct Config {
     log_path: PathBuf,
     spool_dir: PathBuf,
     bounds: ConnectionBounds,
+    collector_id: String,
+    outbox_dir: PathBuf,
 }
 
 #[derive(Debug, PartialEq)]
@@ -162,6 +170,11 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let spool_dir = env::var(ENV_SPOOL_DIR)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_SPOOL_DIR));
+    let collector_id =
+        env::var(ENV_COLLECTOR_ID).unwrap_or_else(|_| DEFAULT_COLLECTOR_ID.to_string());
+    let outbox_dir = env::var(ENV_OUTBOX_DIR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_OUTBOX_DIR));
 
     let read_timeout_ms = parse_positive_u64(
         env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
@@ -194,6 +207,8 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         wan_map,
         log_path,
         spool_dir,
+        collector_id,
+        outbox_dir,
         bounds: ConnectionBounds {
             read_timeout: Duration::from_millis(read_timeout_ms),
             idle_timeout: Duration::from_millis(idle_timeout_ms),
@@ -224,6 +239,8 @@ async fn main() {
         config.spool_dir,
         wan_resolver,
         config.bounds,
+        config.collector_id,
+        config.outbox_dir,
     )
     .await
     {

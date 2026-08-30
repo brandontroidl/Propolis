@@ -48,6 +48,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::emit::EventEmitter;
+use crate::outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
 use crate::sanitize::sanitize_value;
 use crate::spool::QuarantineSpool;
 
@@ -98,6 +99,12 @@ pub struct CaptureHandoff {
     spool_refused: Arc<AtomicU64>,
     spool: Arc<QuarantineSpool>,
     emitter: Arc<EventEmitter>,
+    /// Stamped onto every manifest row this hand-off's worker writes - see `new`'s doc for why
+    /// this must equal the cert CommonName the shipper on this box validates.
+    collector_id: String,
+    /// Durable per-capture custody record store (SP-B-1b). See `process_job`'s doc for the
+    /// ordering guarantee this exists to provide.
+    outbox: Arc<OutboxManifest>,
 }
 
 impl CaptureHandoff {
@@ -106,7 +113,22 @@ impl CaptureHandoff {
     /// `CaptureHandoff` does not spawn a worker - call `start_worker` separately - so a caller
     /// that wants to observe drop behavior in isolation (as `full_queue_drops_and_counts` and
     /// `producer_never_blocks` below do) can simply not start one.
-    pub fn new(spool: QuarantineSpool, emitter: EventEmitter, queue_size: usize) -> Self {
+    ///
+    /// `collector_id` is stamped onto every outbox manifest row the worker writes. It MUST equal
+    /// the CommonName of the mTLS client certificate the shipper on this box presents to the
+    /// gateway (`shipper::config::validate_collector_id` enforces the matching constraint on that
+    /// side), because a later stage joins the gateway's cert-derived collector_id against this
+    /// manifest on `(collector_id, occurrence_id)` - a divergent or hardcoded value here would
+    /// silently break that join. In a single-node deployment with no shipper configured, pass
+    /// `"local"` so the record is still well-formed. `outbox` is the durable manifest store the
+    /// worker writes a `pending` row to for every captured body.
+    pub fn new(
+        spool: QuarantineSpool,
+        emitter: EventEmitter,
+        queue_size: usize,
+        collector_id: String,
+        outbox: OutboxManifest,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(queue_size);
         Self {
             tx,
@@ -115,6 +137,8 @@ impl CaptureHandoff {
             spool_refused: Arc::new(AtomicU64::new(0)),
             spool: Arc::new(spool),
             emitter: Arc::new(emitter),
+            collector_id,
+            outbox: Arc::new(outbox),
         }
     }
 
@@ -179,22 +203,45 @@ impl CaptureHandoff {
         let spool = self.spool.clone();
         let emitter = self.emitter.clone();
         let spool_refused = self.spool_refused.clone();
+        let collector_id = self.collector_id.clone();
+        let outbox = self.outbox.clone();
 
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
-                process_job(&spool, &emitter, &spool_refused, job).await;
+                process_job(
+                    &spool,
+                    &emitter,
+                    &spool_refused,
+                    &collector_id,
+                    &outbox,
+                    job,
+                )
+                .await;
             }
         })
     }
 }
 
-/// Process exactly one job to completion: store, sanitize `orig_name`, build the event, emit.
-/// Never propagates a panic - see the module doc for why a panicking `event_builder` (a bug in a
-/// sensor's own closure) must not end the worker loop every later job still depends on.
+/// Process exactly one job to completion: store, sanitize `orig_name`, build the event, write the
+/// event's durable outbox manifest row, then emit. Never propagates a panic - see the module doc
+/// for why a panicking `event_builder` (a bug in a sensor's own closure) must not end the worker
+/// loop every later job still depends on.
+///
+/// Ordering (SP-B-1b): by the time this reaches the `Ok(Ok(event))` arm, `store` has already
+/// sealed and fsynced the body (`spool.rs`). The manifest row is written fsync-durable BEFORE
+/// `append`, deliberately: a body's custody record must exist as soon as the body itself is
+/// durable, not only once the event has also been logged. A crash between the manifest write and
+/// `append` leaves a `pending` orphan manifest whose `occurrence_id` never reaches the event
+/// stream - that is the intended safe failure (body + custody record both retained; a later
+/// reconciliation flags the orphan), not a case this function tries to make transactional. A
+/// crash between `store` and the manifest write leaves a body with no custody record at all -
+/// identical to today's behavior, handled by the existing spool orphan sweep; no regression.
 async fn process_job(
     spool: &QuarantineSpool,
     emitter: &EventEmitter,
     spool_refused: &AtomicU64,
+    collector_id: &str,
+    outbox: &OutboxManifest,
     job: CaptureJob,
 ) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -204,7 +251,7 @@ async fn process_job(
         })
     }));
 
-    let event = match outcome {
+    let mut event = match outcome {
         Ok(Ok(event)) => event,
         Ok(Err(e)) => {
             let refused = spool_refused.fetch_add(1, Ordering::Relaxed) + 1;
@@ -223,6 +270,41 @@ async fn process_job(
             return;
         }
     };
+
+    // Mint the per-event id here, once, so the manifest and the emitted event share it:
+    // `EventEmitter::append` preserves an already-present `occurrence_id` rather than re-minting
+    // one, so this is the single point of truth both records agree on.
+    let occurrence_id = uuid::Uuid::now_v7();
+    event.occurrence_id = Some(occurrence_id);
+
+    // Body-bearing events always carry a sample; if for some reason one does not, skip the
+    // manifest but still emit - defensively, since the manifest is a body-custody record and
+    // there is no body to record custody of.
+    if let Some(sample) = event.sample.clone()
+        && let Some(capture_id) = sample.capture_id
+    {
+        let row = ManifestRow {
+            collector_id: collector_id.to_string(),
+            capture_id,
+            occurrence_id,
+            sha256: sample.sha256.clone(),
+            size: sample.size,
+            body_key: sample.sha256.clone(),
+            gateway_spool_state: CustodyState::Pending,
+            cas_state: CustodyState::Pending,
+            custody_state: CustodyDisposition::Pending,
+        };
+        if let Err(e) = outbox.write(&row) {
+            tracing::error!(
+                error = %e,
+                %occurrence_id,
+                "capture hand-off: outbox manifest write failed; body retained, event still emitted"
+            );
+            // The event is not lost for this: it still emits below. The body and its bytes stay
+            // on disk regardless (store already succeeded), so no data is destroyed - only the
+            // custody record is missing until reconciliation notices.
+        }
+    }
 
     if let Err(e) = emitter.append(&event).await {
         tracing::error!(
@@ -251,6 +333,25 @@ mod tests {
     use sensor_wire::*;
     use std::time::Duration;
 
+    /// Builds a `CaptureHandoff` wired to an `OutboxManifest` under `base_dir.join("outbox")`,
+    /// with `"test"` as its `collector_id` - used by every test below that does not itself care
+    /// about the manifest, so none has to spell out the SP-B-1b arguments `CaptureHandoff::new`
+    /// grew on top of the pre-existing `(spool, emitter, queue_size)`.
+    fn test_handoff(
+        spool: crate::spool::QuarantineSpool,
+        emitter: crate::emit::EventEmitter,
+        queue_size: usize,
+        base_dir: &std::path::Path,
+    ) -> CaptureHandoff {
+        CaptureHandoff::new(
+            spool,
+            emitter,
+            queue_size,
+            "test".to_string(),
+            crate::outbox::OutboxManifest::new(base_dir.join("outbox")),
+        )
+    }
+
     fn test_event(sample: Option<SampleRef>) -> SensorEvent {
         SensorEvent {
             v: WIRE_VERSION,
@@ -276,7 +377,7 @@ mod tests {
         let log_path = dir.path().join("events.jsonl");
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
-        let handoff = CaptureHandoff::new(spool, emitter, 16);
+        let handoff = test_handoff(spool, emitter, 16, dir.path());
         let worker = handoff.start_worker();
 
         let body = b"malware payload".to_vec();
@@ -310,7 +411,7 @@ mod tests {
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(dir.path().join("events.jsonl"));
         // Queue size 1, no worker draining - so second submit should drop.
-        let handoff = CaptureHandoff::new(spool, emitter, 1);
+        let handoff = test_handoff(spool, emitter, 1, dir.path());
 
         let job = || CaptureJob {
             body: b"data".to_vec(),
@@ -330,7 +431,7 @@ mod tests {
         std::fs::create_dir(&spool_dir).unwrap();
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(dir.path().join("events.jsonl"));
-        let handoff = CaptureHandoff::new(spool, emitter, 1);
+        let handoff = test_handoff(spool, emitter, 1, dir.path());
         // Fill the queue, then verify submit returns immediately (does not block).
         handoff
             .submit(CaptureJob {
@@ -372,7 +473,7 @@ mod tests {
         let log_path = dir.path().join("events.jsonl");
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
-        let handoff = CaptureHandoff::new(spool, emitter, 16);
+        let handoff = test_handoff(spool, emitter, 16, dir.path());
         let worker = handoff.start_worker();
 
         let raw_name = "evil\r\n\x1b[31mname\x1b[0m.bin";
@@ -412,7 +513,7 @@ mod tests {
         std::fs::create_dir(&spool_dir).unwrap();
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(dir.path().join("events.jsonl"));
-        let handoff = CaptureHandoff::new(spool, emitter, 4);
+        let handoff = test_handoff(spool, emitter, 4, dir.path());
         let _first = handoff.start_worker();
 
         let second =
@@ -439,7 +540,7 @@ mod tests {
         let log_path = dir.path().join("events.jsonl");
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
-        let handoff = CaptureHandoff::new(spool, emitter, 16);
+        let handoff = test_handoff(spool, emitter, 16, dir.path());
         let worker = handoff.start_worker();
 
         handoff
@@ -487,7 +588,7 @@ mod tests {
         let log_path = dir.path().join("events.jsonl");
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 8, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
-        let handoff = CaptureHandoff::new(spool, emitter, 16);
+        let handoff = test_handoff(spool, emitter, 16, dir.path());
         let worker = handoff.start_worker();
 
         handoff
@@ -539,7 +640,7 @@ mod tests {
         std::fs::create_dir(&spool_dir).unwrap();
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(dir.path().join("events.jsonl"));
-        let handoff = Arc::new(CaptureHandoff::new(spool, emitter, 4));
+        let handoff = Arc::new(test_handoff(spool, emitter, 4, dir.path()));
 
         const TASKS: usize = 50;
         let handles: Vec<_> = (0..TASKS)
@@ -581,7 +682,7 @@ mod tests {
         let log_path = dir.path().join("events.jsonl");
         let spool = crate::spool::QuarantineSpool::new(spool_dir.clone(), 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
-        let handoff = Arc::new(CaptureHandoff::new(spool, emitter, 64));
+        let handoff = Arc::new(test_handoff(spool, emitter, 64, dir.path()));
         let worker = handoff.start_worker();
 
         const UNIQUE: usize = 10;
@@ -662,5 +763,75 @@ mod tests {
         // Real dedup on disk: 10 unique files + 1 deduplicated file, never 20.
         let on_disk_count = std::fs::read_dir(&spool_dir).unwrap().count();
         assert_eq!(on_disk_count, UNIQUE + 1);
+    }
+
+    #[tokio::test]
+    async fn capture_writes_pending_manifest_matching_the_event() {
+        // The correctness-critical guard for SP-B-1b Task 4: the manifest row and the emitted
+        // event must carry the identical occurrence_id, minted exactly once in process_job. A
+        // wrong-but-plausible implementation that mints a *second* id for the manifest (or lets
+        // `EventEmitter::append` mint its own because `process_job` never stamped one) would
+        // still write a manifest and still emit an event, but the two ids would disagree - this
+        // test is the one place that equality is actually checked end to end.
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let outbox_dir = dir.path().join("outbox");
+        let log_path = dir.path().join("events.jsonl");
+        let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(log_path.clone());
+        let handoff = CaptureHandoff::new(
+            spool,
+            emitter,
+            16,
+            "collector-1".to_string(),
+            crate::outbox::OutboxManifest::new(outbox_dir.clone()),
+        );
+        let worker = handoff.start_worker();
+
+        handoff
+            .submit(CaptureJob {
+                body: b"malware payload".to_vec(),
+                orig_name: "evil.bin".into(),
+                event_builder: Box::new(|sample| test_event(Some(sample))),
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        worker.abort();
+
+        // The event carries an occurrence_id.
+        let line = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let event: SensorEvent = serde_json::from_str(line.trim()).unwrap();
+        let oid = event.occurrence_id.expect("event has occurrence_id");
+        let cid = event
+            .sample
+            .as_ref()
+            .unwrap()
+            .capture_id
+            .expect("capture_id");
+
+        // Exactly one manifest row exists, pending, and matches the event's ids + content.
+        let files: Vec<_> = std::fs::read_dir(&outbox_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(files.len(), 1, "one manifest row per capture");
+        let m = crate::outbox::OutboxManifest::new(outbox_dir);
+        let row = m.load(cid).unwrap().expect("manifest present for capture");
+        assert_eq!(
+            row.occurrence_id, oid,
+            "manifest and event share the occurrence_id"
+        );
+        assert_eq!(row.collector_id, "collector-1");
+        assert_eq!(row.size, b"malware payload".len() as u64);
+        assert_eq!(row.body_key, row.sha256);
+        assert_eq!(
+            row.gateway_spool_state,
+            crate::outbox::CustodyState::Pending
+        );
+        assert_eq!(
+            row.custody_state,
+            crate::outbox::CustodyDisposition::Pending
+        );
     }
 }

@@ -54,6 +54,8 @@ async fn ssh_handshake_and_session_with_real_client() {
         wan_resolver,
         test_bounds(),
         "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -183,6 +185,8 @@ async fn no_outbound_connections() {
         wan_resolver,
         test_bounds(),
         "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -263,6 +267,8 @@ async fn binary_shell_payload_is_captured_as_malware_upload() {
         wan_resolver,
         test_bounds(),
         "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -351,6 +357,8 @@ async fn plaintext_shell_session_produces_no_malware_upload_capture() {
         wan_resolver,
         test_bounds(),
         "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -426,6 +434,8 @@ async fn an_idle_session_is_dropped_once_max_duration_elapses() {
         Arc::new(WanResolver::new(HashMap::new())),
         bounds,
         "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -474,6 +484,8 @@ async fn concurrency_beyond_max_concurrent_is_refused_not_queued() {
         Arc::new(WanResolver::new(HashMap::new())),
         bounds,
         "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -521,6 +533,8 @@ async fn a_peer_that_stalls_mid_handshake_is_dropped_at_the_read_timeout() {
         Arc::new(WanResolver::new(HashMap::new())),
         bounds,
         "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();

@@ -38,6 +38,8 @@ impl TestServer {
             spool_dir.clone(),
             wan_resolver,
             test_bounds(),
+            "test".to_string(),
+            dir.path().join("outbox"),
         )
         .await
         .unwrap();

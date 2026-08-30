@@ -580,12 +580,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool_dir = dir.path().join("spool");
         std::fs::create_dir(&spool_dir).unwrap();
+        let outbox_dir = dir.path().join("outbox");
         let spool =
             sensor_framework::QuarantineSpool::new(spool_dir, MAX_CAPTURE_BODY as u64, 100_000_000);
         let emitter = sensor_framework::EventEmitter::new(dir.path().join("events.jsonl"));
         // Leak the tempdir so it outlives the handoff (the test is short-lived anyway).
         std::mem::forget(dir);
-        Arc::new(CaptureHandoff::new(spool, emitter, 16))
+        Arc::new(CaptureHandoff::new(
+            spool,
+            emitter,
+            16,
+            "test".to_string(),
+            sensor_framework::OutboxManifest::new(outbox_dir),
+        ))
     }
 
     #[test]

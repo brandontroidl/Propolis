@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use sensor_framework::{
-    CaptureHandoff, ConnectionBounds, EventEmitter, QuarantineSpool, WanResolver, run_tcp_listener,
+    CaptureHandoff, ConnectionBounds, EventEmitter, OutboxManifest, QuarantineSpool, WanResolver,
+    run_tcp_listener,
 };
 use tokio::task::JoinHandle;
 
@@ -19,6 +20,8 @@ pub async fn start_test_server(
     spool_dir: PathBuf,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
+    collector_id: String,
+    outbox_dir: PathBuf,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
     std::fs::create_dir_all(&spool_dir)?;
 
@@ -28,6 +31,8 @@ pub async fn start_test_server(
         spool,
         EventEmitter::new(log_path),
         CAPTURE_QUEUE_SIZE,
+        collector_id,
+        OutboxManifest::new(outbox_dir),
     ));
     let _worker = handoff.start_worker();
 

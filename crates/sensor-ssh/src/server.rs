@@ -19,7 +19,8 @@ use tokio::task::JoinHandle;
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
 use sensor_framework::persona;
 use sensor_framework::{
-    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, QuarantineSpool, WanResolver,
+    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, OutboxManifest, QuarantineSpool,
+    WanResolver,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
@@ -79,6 +80,10 @@ enum ChannelHandler {
 /// the exact moment the service is already failing. `run_tcp_listener` caps concurrency with a
 /// semaphore, runs each session inside `tokio::time::timeout(max_duration, ...)`, and backs off
 /// on accept errors.
+///
+/// `collector_id`/`outbox_dir` (SP-B-1b) are the two arguments `handle_session` below does not
+/// need but the capture hand-off does - see `CaptureHandoff::new`'s doc for what they mean.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     addr: SocketAddr,
     log_path: PathBuf,
@@ -87,6 +92,8 @@ pub async fn serve(
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
     banner: String,
+    collector_id: String,
+    outbox_dir: PathBuf,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
     // The software-version this server sends in `SSH-2.0-<banner>`. Shared read-only across all
     // sessions, so one `Arc` rather than a clone per connection.
@@ -110,7 +117,14 @@ pub async fn serve(
     let spool = QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000);
     // The handoff's emitter writes to the same log file. EventEmitter opens with O_APPEND
     // on each write so concurrent emitters to the same path are safe.
-    let handoff = Arc::new(CaptureHandoff::new(spool, EventEmitter::new(log_path), 64));
+    let outbox = OutboxManifest::new(outbox_dir);
+    let handoff = Arc::new(CaptureHandoff::new(
+        spool,
+        EventEmitter::new(log_path),
+        64,
+        collector_id,
+        outbox,
+    ));
     let _worker = handoff.start_worker();
 
     let read_timeout = bounds.read_timeout;

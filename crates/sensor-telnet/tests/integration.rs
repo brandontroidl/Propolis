@@ -67,6 +67,8 @@ async fn login_and_command_capture_emits_expected_events() {
         dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -122,6 +124,8 @@ async fn password_never_appears_in_any_event() {
         dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -151,6 +155,8 @@ async fn protocol_label_is_telnet_on_all_events() {
         dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -223,6 +229,8 @@ async fn malformed_random_bytes_drop_connection_without_crashing_listener() {
         dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -268,6 +276,8 @@ async fn connection_event_unauthenticated_login_event_authenticated_with_usernam
         dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -319,6 +329,8 @@ async fn accepts_all_credentials() {
         dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -346,6 +358,8 @@ async fn iac_bytes_in_username_do_not_corrupt_the_line_buffer() {
         dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -396,6 +410,8 @@ async fn multiple_commands_each_captured_as_separate_events() {
         dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -450,6 +466,8 @@ async fn no_outbound_connections_from_wget_in_shell() {
         dir.path().join("spool"),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -512,6 +530,8 @@ async fn binary_shell_payload_is_captured_as_evidence() {
         spool_dir.clone(),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();
@@ -569,6 +589,8 @@ async fn plaintext_session_is_never_captured_and_password_never_reaches_the_spoo
         spool_dir.clone(),
         wan_resolver,
         test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
     )
     .await
     .unwrap();

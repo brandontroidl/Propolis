@@ -5,8 +5,8 @@
 //! reconstitutes exact sensor NDJSON.
 //!
 //! Append discipline mirrors `sensor_framework::emit::EventEmitter::append`: open with
-//! `OpenOptions::create(true).append(true)`, write each line, then `flush` - no fsync, matching
-//! the at-least-once boundary intake's tailer already tolerates on the sensor side. Unlike
+//! `OpenOptions::create(true).append(true)`, write each line, then `sync_all` for durability.
+//! Records are synced to disk before return so an Accepted ack reflects durable data. Unlike
 //! `EventEmitter`, this is synchronous std I/O (the `SpoolWrite` trait it implements is a
 //! blocking call), not `tokio::fs`.
 
@@ -41,7 +41,7 @@ impl SpoolWrite for SpoolWriter {
             file.write_all(record)?;
             file.write_all(b"\n")?;
         }
-        file.flush()?;
+        file.sync_all()?;
         Ok(())
     }
 }
@@ -57,4 +57,26 @@ fn safe_collector_dir(root: &Path, collector_id: &str) -> io::Result<PathBuf> {
         ));
     }
     Ok(root.join(collector_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_records_persists_exact_ndjson_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = SpoolWriter::new(dir.path().to_path_buf());
+        let recs = vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()];
+        w.write_records("collector-1", &recs).unwrap();
+        let got = std::fs::read_to_string(dir.path().join("collector-1").join("events.jsonl")).unwrap();
+        assert_eq!(got, "{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn unsafe_collector_id_is_rejected_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = SpoolWriter::new(dir.path().to_path_buf());
+        assert!(w.write_records("../escape", &[b"x".to_vec()]).is_err());
+    }
 }

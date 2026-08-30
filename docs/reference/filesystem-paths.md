@@ -55,14 +55,23 @@ event logs.
 | ssh uploads | `PROPOLIS_SSH_SPOOL_DIR` | `/var/spool/propolis/ssh` (`sensor-ssh/src/main.rs:47`) | 0750 propolis-ssh (`install.sh:163`) |
 | ftp uploads | `PROPOLIS_FTP_SPOOL_DIR` | `/var/spool/propolis/ftp` (`sensor-ftp/src/main.rs:21`) | 0750 propolis-ftp (`install.sh:165`) |
 | adb uploads | `PROPOLIS_ADB_SPOOL_DIR` | `/var/spool/propolis/adb` (`sensor-adb/src/main.rs:32`) | 0750 propolis-adb (`install.sh:164`) |
+| telnet uploads | `PROPOLIS_TELNET_SPOOL_DIR` | `/var/spool/propolis/telnet` (`sensor-telnet/src/main.rs:35`) | 0750 propolis-telnet (`install.sh:166`) |
 | catchall | (dir granted for symmetry, **unused** — catchall spools no bodies) | `/var/spool/propolis/catchall` | 0750 propolis-catchall (`install.sh:162`) |
 | fetcher output | const `FETCH_SPOOL_DIR` | `/var/spool/propolis/fetched` (`crates/propolis/src/main.rs:41`) | 0750 propolis (`install.sh:169`) |
 | ops spool root | const `OPS_SPOOL_ROOT` | `/var/spool/propolis` (`crates/propolis/src/main.rs:46`) | 0755 root (`install.sh:161`) |
 
 - The fetcher output dir has a global byte budget of 1_000_000_000 bytes
   (`crates/propolis/src/main.rs:55`).
-- **smtp, redis, telnet, http, cred** have **no** spool dir (no `*_SPOOL_DIR`
-  env); they capture inline only.
+- **smtp, redis, http, cred** have **no** spool dir (no `*_SPOOL_DIR` env);
+  they capture inline only. Telnet spools only when the shell phase sees a
+  binary payload (a Mirai/Gafgyt dropper), never the login/password phase.
+
+Each of ssh/ftp/adb/telnet also writes a durable per-capture custody manifest
+row (`PROPOLIS_<SENSOR>_OUTBOX_DIR`) as soon as a body is sealed - defaults to
+`<its own spool dir>/outbox` (e.g. `/var/spool/propolis/ssh/outbox`), not a
+separate path, so the write always lands inside that unit's own
+`ReadWritePaths` grant. See [environment-variables.md](environment-variables.md#outbox-manifest-sp-b-1b)
+for the full variable reference.
 
 ## Persistent state
 

@@ -52,7 +52,7 @@ anything.
 | Evidence | Location | Notes |
 |---|---|---|
 | Event ledger + score projection | PostgreSQL (`event`, `ip_score`, `review_queue`, ...) | Append-only, hash-chained `event` ledger; owned by [reference/database.md](../reference/database.md) |
-| Captured samples | `/var/spool/propolis/{ssh,adb,ftp,catchall,fetched}` | Live payloads - may be malware |
+| Captured samples | `/var/spool/propolis/{ssh,adb,ftp,telnet,catchall,fetched}` | Live payloads - may be malware |
 | Sensor + daemon logs | `/var/log/propolis/<sensor>/events.jsonl` | Rotated by logrotate; paths owned by [reference/filesystem-paths.md](../reference/filesystem-paths.md) |
 
 ### To preserve

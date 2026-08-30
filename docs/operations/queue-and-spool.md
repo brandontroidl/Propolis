@@ -13,8 +13,8 @@ What happens between a captured malware body and a stored sample, and what an op
 when either stage is overloaded. This is the operational companion to [capacity
 planning](./capacity-planning.md) (the numbers) and [event and sample
 lifecycle](../architecture/event-and-sample-lifecycle.md) (the design). Only the
-`sensor-ssh`, `sensor-ftp`, and `sensor-adb` sensors spool bodies; the rest capture metadata
-only.
+`sensor-ssh`, `sensor-ftp`, `sensor-adb`, and `sensor-telnet` sensors spool bodies; the rest
+capture metadata only.
 
 ## The hand-off path
 

@@ -28,6 +28,8 @@
 //! measures" failure this test suite exists to prevent. `deploy/sensor-catchall.service` and
 //! `deploy/sensor-ssh.service` both carry a comment recording this correction at its point of use.
 
+use std::path::{Path, PathBuf};
+
 #[test]
 fn catchall_unit_has_hardening_directives() {
     let unit = std::fs::read_to_string(concat!(
@@ -532,4 +534,43 @@ fn install_script_var_lib_root_is_root_owned() {
         "the shared /var/lib/propolis root must be created root:root so a compromised propolis \
          cannot rename the sibling propolis-ssh host-key directory; dry-run output:\n{stdout}"
     );
+}
+
+/// The four `CaptureHandoff` body-capturing sensors (ssh/ftp/adb/telnet) each default their
+/// outbox manifest directory to `<default spool_dir>/outbox` (see e.g. `sensor-ssh/src/main.rs`'s
+/// `resolve_outbox_dir`). That default must always land inside a path the unit's own
+/// `ReadWritePaths` already grants, or the manifest write silently fails under
+/// `ProtectSystem=strict` and the outbox never persists in production - exactly the SP-B-1b
+/// regression this test exists to catch, whose default was the shared `/var/lib/propolis/outbox`,
+/// granted by none of these units. This is the production-sandbox machine check: a tempdir-based
+/// unit test of the resolver function alone cannot see this failure mode.
+#[test]
+fn body_capturer_default_outbox_is_inside_read_write_paths() {
+    for (unit_file, default_spool_dir) in [
+        ("sensor-ssh.service", "/var/spool/propolis/ssh"),
+        ("sensor-ftp.service", "/var/spool/propolis/ftp"),
+        ("sensor-adb.service", "/var/spool/propolis/adb"),
+        ("sensor-telnet.service", "/var/spool/propolis/telnet"),
+    ] {
+        let unit = std::fs::read_to_string(format!(
+            "{}/../../deploy/{unit_file}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_else(|e| panic!("failed to read deploy/{unit_file}: {e}"));
+        let default_outbox_dir = PathBuf::from(default_spool_dir).join("outbox");
+        assert!(
+            unit_grants_ancestor_of(&unit, &default_outbox_dir),
+            "{unit_file}: no ReadWritePaths entry is an ancestor of the default outbox dir {}; \
+             the manifest write would silently fail under ProtectSystem=strict",
+            default_outbox_dir.display()
+        );
+    }
+}
+
+/// True if one of `unit`'s `ReadWritePaths=` entries is an ancestor of (or equal to) `path`.
+fn unit_grants_ancestor_of(unit: &str, path: &Path) -> bool {
+    unit.lines()
+        .filter(|l| l.starts_with("ReadWritePaths="))
+        .flat_map(|l| l.trim_start_matches("ReadWritePaths=").split_whitespace())
+        .any(|granted| path.starts_with(granted))
 }

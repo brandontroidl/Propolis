@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,12 +30,14 @@ const ENV_MAX_CONCURRENT: &str = "PROPOLIS_ADB_MAX_CONCURRENT";
 /// Unprefixed and shared across every sensor binary on this collector (see sensor-ssh's own
 /// `main.rs` for why): must match the shipper's `PROPOLIS_SHIPPER_COLLECTOR_ID` cert CommonName.
 const ENV_COLLECTOR_ID: &str = "COLLECTOR_ID";
+/// Defaults to `<spool_dir>/outbox` (see [`resolve_outbox_dir`]), not a fixed path: the outbox
+/// must land inside this sensor's own writable spool root, which is already granted in its
+/// systemd `ReadWritePaths`.
 const ENV_OUTBOX_DIR: &str = "PROPOLIS_ADB_OUTBOX_DIR";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/adb/events.jsonl";
 const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/adb";
 const DEFAULT_COLLECTOR_ID: &str = "local";
-const DEFAULT_OUTBOX_DIR: &str = "/var/lib/propolis/outbox";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_DURATION_SECS: u64 = 600;
@@ -154,6 +156,16 @@ fn parse_positive_u32(
     Ok(value)
 }
 
+/// Resolve the outbox directory: the explicit `PROPOLIS_ADB_OUTBOX_DIR` override if set, else a
+/// subdirectory of the sensor's own resolved spool root. The default must derive from
+/// `spool_dir` (not a fixed constant) so it also follows a `PROPOLIS_ADB_SPOOL_DIR` override,
+/// and so it always lands inside the writable root the sensor's systemd unit already grants.
+fn resolve_outbox_dir(spool_dir: &Path, env_override: Option<String>) -> PathBuf {
+    env_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| spool_dir.join("outbox"))
+}
+
 /// Load and validate configuration from environment variables. Fails closed: any missing bind
 /// address, malformed entry, or zero-valued bound is rejected here rather than silently
 /// substituted with a default that could disable the bound it names.
@@ -173,9 +185,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_SPOOL_DIR));
     let collector_id =
         env::var(ENV_COLLECTOR_ID).unwrap_or_else(|_| DEFAULT_COLLECTOR_ID.to_string());
-    let outbox_dir = env::var(ENV_OUTBOX_DIR)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_OUTBOX_DIR));
+    let outbox_dir = resolve_outbox_dir(&spool_dir, env::var(ENV_OUTBOX_DIR).ok());
 
     let read_timeout_ms = parse_positive_u64(
         env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
@@ -332,5 +342,22 @@ mod tests {
     #[test]
     fn parse_positive_u32_accepts_explicit_value() {
         assert_eq!(parse_positive_u32(Some("7"), 1, "x").unwrap(), 7);
+    }
+
+    #[test]
+    fn outbox_defaults_under_the_spool_root() {
+        // With no PROPOLIS_ADB_OUTBOX_DIR override, the outbox must sit under the resolved
+        // spool dir, which is inside the sensor's systemd ReadWritePaths (unlike the old
+        // shared /var/lib/propolis/outbox default).
+        let spool_dir = PathBuf::from("/custom/spool");
+        let outbox_dir = resolve_outbox_dir(&spool_dir, None);
+        assert_eq!(outbox_dir, PathBuf::from("/custom/spool/outbox"));
+    }
+
+    #[test]
+    fn explicit_outbox_override_still_wins() {
+        let spool_dir = PathBuf::from("/custom/spool");
+        let outbox_dir = resolve_outbox_dir(&spool_dir, Some("/explicit/outbox".to_string()));
+        assert_eq!(outbox_dir, PathBuf::from("/explicit/outbox"));
     }
 }

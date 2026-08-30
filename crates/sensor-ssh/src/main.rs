@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::time::Duration;
@@ -38,6 +38,9 @@ const ENV_BANNER: &str = "PROPOLIS_SSH_BANNER";
 /// `validate_collector_id`). A per-sensor-prefixed name here would invite the exact divergence
 /// this identity exists to prevent.
 const ENV_COLLECTOR_ID: &str = "COLLECTOR_ID";
+/// Defaults to `<spool_dir>/outbox` (see [`resolve_outbox_dir`]), not a fixed path: the outbox
+/// must land inside this sensor's own writable spool root, which is already granted in its
+/// systemd `ReadWritePaths`.
 const ENV_OUTBOX_DIR: &str = "PROPOLIS_SSH_OUTBOX_DIR";
 
 /// The software-version sent in `SSH-2.0-<this>`. Defaults to the OpenSSH build the shared persona
@@ -57,9 +60,6 @@ const DEFAULT_HOST_KEY_PATH: &str = "/var/lib/propolis/ssh/host_key";
 /// Single-node deployments run no shipper, so there is no collector identity to match; `"local"`
 /// keeps the outbox manifest well-formed anyway.
 const DEFAULT_COLLECTOR_ID: &str = "local";
-/// Shared default outbox root across every sensor: manifest rows are keyed by a globally-unique
-/// `capture_id`, so multiple sensor processes writing into the same directory never collide.
-const DEFAULT_OUTBOX_DIR: &str = "/var/lib/propolis/outbox";
 
 // Deliberately identical to sensor-telnet's defaults. Both are unauthenticated, internet-facing
 // TCP honeypots with the same exposure, so two different sets of numbers would be a difference
@@ -142,6 +142,16 @@ fn parse_wan_map(raw: &str) -> Result<HashMap<IpAddr, IpAddr>, ConfigError> {
     Ok(map)
 }
 
+/// Resolve the outbox directory: the explicit `PROPOLIS_SSH_OUTBOX_DIR` override if set, else a
+/// subdirectory of the sensor's own resolved spool root. The default must derive from
+/// `spool_dir` (not a fixed constant) so it also follows a `PROPOLIS_SSH_SPOOL_DIR` override,
+/// and so it always lands inside the writable root the sensor's systemd unit already grants.
+fn resolve_outbox_dir(spool_dir: &Path, env_override: Option<String>) -> PathBuf {
+    env_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| spool_dir.join("outbox"))
+}
+
 fn load_config_from_env() -> Result<Config, ConfigError> {
     let bind_raw = env::var(ENV_BIND).map_err(|_| ConfigError::NoBind)?;
     let bind_addr: SocketAddr = bind_raw
@@ -192,9 +202,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let banner = env::var(ENV_BANNER).unwrap_or_else(|_| DEFAULT_BANNER.to_string());
     let collector_id =
         env::var(ENV_COLLECTOR_ID).unwrap_or_else(|_| DEFAULT_COLLECTOR_ID.to_string());
-    let outbox_dir = env::var(ENV_OUTBOX_DIR)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_OUTBOX_DIR));
+    let outbox_dir = resolve_outbox_dir(&spool_dir, env::var(ENV_OUTBOX_DIR).ok());
 
     Ok(Config {
         bind_addr,
@@ -380,5 +388,22 @@ mod tests {
         if env::var(ENV_BIND).is_err() {
             assert!(matches!(result, Err(ConfigError::NoBind)));
         }
+    }
+
+    #[test]
+    fn outbox_defaults_under_the_spool_root() {
+        // With no PROPOLIS_SSH_OUTBOX_DIR override, the outbox must sit under the resolved
+        // spool dir, which is inside the sensor's systemd ReadWritePaths (unlike the old
+        // shared /var/lib/propolis/outbox default).
+        let spool_dir = PathBuf::from("/custom/spool");
+        let outbox_dir = resolve_outbox_dir(&spool_dir, None);
+        assert_eq!(outbox_dir, PathBuf::from("/custom/spool/outbox"));
+    }
+
+    #[test]
+    fn explicit_outbox_override_still_wins() {
+        let spool_dir = PathBuf::from("/custom/spool");
+        let outbox_dir = resolve_outbox_dir(&spool_dir, Some("/explicit/outbox".to_string()));
+        assert_eq!(outbox_dir, PathBuf::from("/explicit/outbox"));
     }
 }

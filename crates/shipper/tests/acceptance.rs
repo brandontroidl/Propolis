@@ -103,6 +103,7 @@ fn build_events() -> Vec<SensorEvent> {
             metadata: serde_json::json!({ "protocol_label": "ssh", "command": "uname -a" }),
             sample: None,
             session_id: Some(uuid::Uuid::now_v7()),
+            occurrence_id: None,
         },
         SensorEvent {
             v: WIRE_VERSION,
@@ -116,6 +117,7 @@ fn build_events() -> Vec<SensorEvent> {
             metadata: serde_json::json!({ "protocol_label": "telnet", "username": "admin" }),
             sample: None,
             session_id: None,
+            occurrence_id: None,
         },
         SensorEvent {
             v: WIRE_VERSION,
@@ -134,6 +136,7 @@ fn build_events() -> Vec<SensorEvent> {
                 capture_id: None,
             }),
             session_id: Some(uuid::Uuid::now_v7()),
+            occurrence_id: None,
         },
     ]
 }

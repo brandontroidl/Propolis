@@ -53,6 +53,7 @@ async fn ingest_single_event_appears_in_ledger(pool: PgPool) {
         metadata: serde_json::json!({"protocol_label": "ssh", "username": "root"}),
         sample: None,
         session_id: None,
+        occurrence_id: None,
     };
     write_event_line(&log_path, &event);
 
@@ -98,6 +99,7 @@ async fn unknown_signal_type_rejected_cursor_advances() {
         metadata: serde_json::json!({}),
         sample: None,
         session_id: None,
+        occurrence_id: None,
     };
     let good = SensorEvent {
         v: WIRE_VERSION,
@@ -111,6 +113,7 @@ async fn unknown_signal_type_rejected_cursor_advances() {
         metadata: serde_json::json!({}),
         sample: None,
         session_id: None,
+        occurrence_id: None,
     };
     write_event_line(&log_path, &bad);
     write_event_line(&log_path, &good);
@@ -163,6 +166,7 @@ async fn hash_chain_intact_after_ingestion(pool: PgPool) {
             metadata: serde_json::json!({}),
             sample: None,
             session_id: None,
+            occurrence_id: None,
         };
         write_event_line(&log_path, &event);
     }
@@ -196,6 +200,7 @@ async fn rotation_survival_no_events_lost() {
             metadata: serde_json::json!({}),
             sample: None,
             session_id: None,
+            occurrence_id: None,
         };
         write_event_line(&log_path, &event);
     }
@@ -227,6 +232,7 @@ async fn rotation_survival_no_events_lost() {
             metadata: serde_json::json!({}),
             sample: None,
             session_id: None,
+            occurrence_id: None,
         };
         write_event_line(&log_path, &event);
     }

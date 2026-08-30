@@ -14,6 +14,7 @@ fn sample_wire_event() -> SensorEvent {
         metadata: serde_json::json!({"protocol_label": "ssh", "command": "uname -a"}),
         sample: None,
         session_id: None,
+        occurrence_id: None,
     }
 }
 

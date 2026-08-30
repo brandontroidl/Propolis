@@ -264,6 +264,7 @@ mod tests {
             metadata: serde_json::json!({}),
             sample,
             session_id: None,
+            occurrence_id: None,
         }
     }
 

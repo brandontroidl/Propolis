@@ -37,10 +37,25 @@ impl EventEmitter {
     /// buffer to a background blocking-pool task and returns before that task has necessarily
     /// run, so a caller that skipped the flush could observe `append` return before the OS
     /// `write(2)` had actually executed.
-    pub async fn append(&self, event: &SensorEvent) -> std::io::Result<()> {
-        let mut line = serde_json::to_string(event)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        line.push('\n');
+    ///
+    /// `append` also mints a UUIDv7 `occurrence_id` when `event` does not already carry one, and
+    /// returns the id actually written. Minting here - the single chokepoint every sensor uses -
+    /// guarantees every event that lands in the local log has a stable id with no per-sensor code
+    /// required to set one.
+    pub async fn append(&self, event: &SensorEvent) -> std::io::Result<uuid::Uuid> {
+        let occurrence_id = event.occurrence_id.unwrap_or_else(uuid::Uuid::now_v7);
+
+        // Serialize with the id set. Only clone when we actually minted one; a caller that already
+        // stamped the id (the capture worker, Task 4) pays no clone.
+        let line = if event.occurrence_id.is_some() {
+            serde_json::to_string(event)
+        } else {
+            let mut e = event.clone();
+            e.occurrence_id = Some(occurrence_id);
+            serde_json::to_string(&e)
+        }
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let line = format!("{line}\n");
 
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -49,7 +64,7 @@ impl EventEmitter {
             .await?;
         file.write_all(line.as_bytes()).await?;
         file.flush().await?;
-        Ok(())
+        Ok(occurrence_id)
     }
 }
 
@@ -80,12 +95,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let emitter = EventEmitter::new(log_path.clone());
-        emitter.append(&sample_event()).await.unwrap();
+        let id = emitter.append(&sample_event()).await.unwrap();
         let content = tokio::fs::read_to_string(&log_path).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 1);
         let parsed: SensorEvent = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(parsed, sample_event());
+        let mut expected = sample_event();
+        expected.occurrence_id = Some(id);
+        assert_eq!(parsed, expected);
     }
 
     #[tokio::test]
@@ -168,5 +185,45 @@ mod tests {
             );
         }
         assert_eq!(seen.len() as u64, TASKS * PER_TASK);
+    }
+
+    #[tokio::test]
+    async fn append_mints_occurrence_id_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let emitter = EventEmitter::new(log.clone());
+        let e = sample_event(); // occurrence_id: None
+        let id = emitter.append(&e).await.unwrap();
+        let line = std::fs::read_to_string(&log).unwrap();
+        let written: SensorEvent = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            written.occurrence_id,
+            Some(id),
+            "written line carries the returned id"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_preserves_a_present_occurrence_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let emitter = EventEmitter::new(log.clone());
+        let fixed = uuid::Uuid::now_v7();
+        let mut e = sample_event();
+        e.occurrence_id = Some(fixed);
+        let returned = emitter.append(&e).await.unwrap();
+        assert_eq!(returned, fixed, "a present id is used as-is, not re-minted");
+        let line = std::fs::read_to_string(&log).unwrap();
+        let written: SensorEvent = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(written.occurrence_id, Some(fixed));
+    }
+
+    #[tokio::test]
+    async fn two_none_events_get_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let emitter = EventEmitter::new(dir.path().join("events.jsonl"));
+        let a = emitter.append(&sample_event()).await.unwrap();
+        let b = emitter.append(&sample_event()).await.unwrap();
+        assert_ne!(a, b);
     }
 }

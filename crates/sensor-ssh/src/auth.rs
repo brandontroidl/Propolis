@@ -127,6 +127,7 @@ impl AuthState {
             metadata: serde_json::json!({ "protocol_label": "ssh" }),
             sample: None,
             session_id: Some(self.session_id),
+            occurrence_id: None,
         }
     }
 
@@ -184,6 +185,7 @@ impl AuthState {
             }),
             sample: None,
             session_id: Some(self.session_id),
+            occurrence_id: None,
         };
 
         // Always accept: see the module doc for why.

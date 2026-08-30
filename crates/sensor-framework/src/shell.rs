@@ -201,6 +201,7 @@ impl FakeShell {
                     }),
                     sample: None,
                     session_id: self.ctx.session_id,
+                    occurrence_id: None,
                 });
             }
             evs
@@ -225,6 +226,7 @@ impl FakeShell {
             metadata,
             sample: None,
             session_id: self.ctx.session_id,
+            occurrence_id: None,
         }
     }
 

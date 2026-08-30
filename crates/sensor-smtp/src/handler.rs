@@ -190,6 +190,7 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid)
         metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
         sample: None,
         session_id: Some(session_id),
+        occurrence_id: None,
     }
 }
 
@@ -214,6 +215,7 @@ fn login_event(
         }),
         sample: None,
         session_id: Some(session_id),
+        occurrence_id: None,
     }
 }
 
@@ -245,6 +247,7 @@ fn data_event(
         }),
         sample: None,
         session_id: Some(session_id),
+        occurrence_id: None,
     }
 }
 

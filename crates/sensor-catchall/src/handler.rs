@@ -144,6 +144,7 @@ fn build_event(
         }),
         sample: None,
         session_id: Some(session_id),
+        occurrence_id: None,
     }
 }
 

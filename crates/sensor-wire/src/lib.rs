@@ -50,6 +50,11 @@ pub struct SensorEvent {
     pub sample: Option<SampleRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<uuid::Uuid>,
+    /// UUIDv7 minted once per event at emit time (`EventEmitter::append`). Stable across replays so
+    /// intake can dedup exactly. Optional + skipped so pre-SP-B-1b records still deserialize and a
+    /// None never appears on the wire (no WIRE_VERSION bump), matching `session_id` / `capture_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_id: Option<uuid::Uuid>,
 }
 
 /// Reference to a captured file body written to the quarantine spool, named by its SHA-256.
@@ -85,6 +90,7 @@ mod tests {
             metadata: serde_json::json!({ "protocol_label": "ssh", "command": "uname -a" }),
             sample: None,
             session_id: None,
+            occurrence_id: None,
         }
     }
 
@@ -159,6 +165,7 @@ mod tests {
             metadata: serde_json::json!({}),
             sample: None,
             session_id: Some(sid),
+            occurrence_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let back: SensorEvent = serde_json::from_str(&json).unwrap();
@@ -195,5 +202,31 @@ mod tests {
             !json.contains("capture_id"),
             "None capture_id must be omitted"
         );
+    }
+
+    #[test]
+    fn event_without_occurrence_id_still_deserializes_as_none() {
+        // A pre-SP-B-1b record (no occurrence_id key) must still parse.
+        let json = r#"{"v":1,"source_ip":"203.0.113.7","wan_ip":null,"sensor":"ssh","signal_type":"honeypot.command_exec","protocol":"tcp","authenticated":true,"observed_at":"2026-07-20T14:03:11.482913Z","metadata":{},"sample":null,"session_id":null}"#;
+        let e: SensorEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(e.occurrence_id, None);
+    }
+
+    #[test]
+    fn event_occurrence_id_round_trips_when_present() {
+        let id = uuid::Uuid::now_v7();
+        let mut e = sample_event();
+        e.occurrence_id = Some(id);
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("occurrence_id"), "occurrence_id must serialize when present");
+        let back: SensorEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.occurrence_id, Some(id));
+    }
+
+    #[test]
+    fn event_without_occurrence_id_omits_the_key() {
+        let e = sample_event();
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(!s.contains("occurrence_id"), "a None occurrence_id must not appear on the wire");
     }
 }

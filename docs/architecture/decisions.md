@@ -156,6 +156,44 @@ integrity and control paths with a single deliberate fail-open (capture drop und
 saturation, for covertness). See
 [concurrency and failure](./concurrency-and-failure.md).
 
+## 11. Evidence provenance and artifact custody (SP-B) - DRAFT, not yet implemented
+
+Design-stage decisions (no code evidence yet; recorded here per the design's own requirement). See
+[evidence-provenance-and-artifact-custody.md](evidence-provenance-and-artifact-custody.md).
+
+- **Attribution is a many-to-many provenance graph**, not a per-sample row: `observation` (occurrence),
+  `observation_edge` (facts with an evidence basis), `provenance_assertion` (inferences with method +
+  confidence) whose support is a **typed, FK-enforced `provenance_assertion_support`** (never untyped JSON),
+  `observation_artifact` and `capture_observation` (links), so multiple IPs referencing one URL-deduplicated
+  fetch all resolve to the resulting SHA.
+- **Collector identity comes only from the authenticated enveloped gateway-spool record** (verified cert
+  identity + gateway_sequence/record_index/batch_hash/raw_event_bytes, crash-consistent), never a
+  collector-provided value or a loose sidecar.
+- **Intake is one atomic transaction** (event + projection + observations + edges + placeholder + each row's
+  evidence commitment), with a ledger-level `event_occurrence` replay guard; the cursor advances only on
+  commit. No best-effort writes.
+- **Artifact lifecycle is an append-only `artifact_state_event` log + a rebuildable `artifact_current`
+  projection**, not a mutable row; the analysis submission lifecycle follows the same event-log + projection
+  shape.
+- **Per-row evidence commitment is emitted in the same transaction as each evidence row** (single writer
+  interface + deferred completeness trigger); epoch closure/signing/off-host anchoring is the asynchronous
+  SP-B-6 remainder over already-immutable rows - so there is no deletion-before-provability window.
+- **No duplicated SHA that could disagree**: a SHA is reached through its FK; remaining cross-table
+  equalities are enforced by deferred constraint triggers.
+- **Analysis runs are immutable and carry a reproducible signature** (signature bytes + algorithm +
+  signed-manifest digest, not just a key id); `analysis_result` derives its SHA through `run_id`.
+- **The authoritative SHA->source-IP traversal is application-side BFS** (fanout cap, total-node budget,
+  depth bound, explicit truncation flags, keyset pagination); the recursive CTE is illustrative only.
+- **The CAS content path is global** (`cas_root/shard/hex(computed_sha)`); ownership, quota, and receipts
+  are per-certificate.
+- **Retrieval context is first-class**: `retrieval_attempt` + `observation_retrieval` with `trigger_kind`
+  (so scheduled/manual refetches are representable) and per-redirect-hop DNS/endpoint/TLS/response context.
+- **Three-stage custody**: gateway-spool receipt, CAS body receipt, and a `CustodyComplete` receipt
+  (binding collector_id+capture_id+occurrence_id+sha256+size and the required commitment rows); only the
+  third authorizes the disposable collector to delete a body. Gateway spool fsync-before-ack is mandatory.
+- **A captured artifact is not "malware"** until an `analysis_result` verdict classifies it; a retrieved
+  endpoint is never automatically "C2".
+
 ## Related
 
 - [history/decisions-index.md](../history/decisions-index.md) — historical decision index.

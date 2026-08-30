@@ -56,6 +56,7 @@ reads, not network. The full picture is in
 - [pipeline.md](pipeline.md) - scoring, review, enrichment, and the feed pipeline.
 - [console.md](console.md) - operator console architecture.
 - [storage.md](storage.md) - the database model and the event hash chain.
+- [evidence-provenance-and-artifact-custody.md](evidence-provenance-and-artifact-custody.md) - **Draft**: the SP-B evidence provenance graph, artifact custody protocol, and IP-to-captured-artifact attribution (not yet implemented).
 - [concurrency-and-failure.md](concurrency-and-failure.md) - concurrency, backpressure,
   and failure modes.
 - [decisions.md](decisions.md) - code-evidenced architecture decisions.

@@ -302,6 +302,35 @@ async fn run_submission_loop(
     }
 }
 
+/// Checks that the feed publisher will actually be able to write, by exercising the same directory
+/// the publisher's staging step uses: the PARENT of `output_dir`, since staging is created as a
+/// sibling (`feed::publisher::create_staging_dir`) so the atomic rename stays same-filesystem.
+///
+/// Creates and removes a probe directory rather than inspecting permission bits, which is the only
+/// way to account for ownership, ACLs, a read-only mount, and the systemd sandbox's ReadWritePaths
+/// all at once - the last of which is exactly what a bit-check would have missed.
+fn preflight_output_dir(output_dir: &std::path::Path) -> std::io::Result<()> {
+    let parent = output_dir.parent().filter(|p| !p.as_os_str().is_empty());
+    let Some(parent) = parent else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", output_dir.display()),
+        ));
+    };
+    std::fs::create_dir_all(parent)?;
+    let probe = parent.join(format!(
+        ".{}.preflight",
+        output_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "feed".to_string())
+    ));
+    // A leftover from a killed run must not make the probe fail; create_dir_all is idempotent.
+    std::fs::create_dir_all(&probe)?;
+    let _ = std::fs::remove_dir(&probe);
+    Ok(())
+}
+
 /// Feed build loop: build snapshot, publish atomically. Mirrors `feed/src/main.rs`'s loop.
 async fn run_feed_loop(
     pool: PgPool,
@@ -311,6 +340,25 @@ async fn run_feed_loop(
     interval: Duration,
     cancel: CancellationToken,
 ) {
+    // Preflight: prove the publish destination is writable BEFORE the first build, so a
+    // misconfigured path is one loud line at startup instead of an identical error every interval
+    // forever. A real deployment pointed PROPOLIS_FEED_OUTPUT_DIR one level too high, which put the
+    // staging directory (a sibling of the output dir) inside a root-owned directory the daemon
+    // could not write; it failed every 15 minutes for hours, unnoticed.
+    //
+    // Logged, not fatal: the feed is one subsystem, and aborting the whole daemon would also stop
+    // intake and the console, which are unaffected. The ops-monitor's feed-stale condition is what
+    // escalates if it stays broken.
+    if let Err(e) = preflight_output_dir(&output_dir) {
+        tracing::error!(
+            output_dir = %output_dir.display(),
+            error = %e,
+            "feed: output directory is not writable; every publish will fail until this is fixed. \
+             Staging is created as a SIBLING of the output directory, so the publishing user needs \
+             write permission on its PARENT, not just on the output directory itself."
+        );
+    }
+
     loop {
         if cancel.is_cancelled() {
             return;
@@ -1234,5 +1282,37 @@ mod own_ips_public_address_tests {
             !own_ips_lack_a_public_address(&own_ips),
             "a real public address in own_ips must clear the warning"
         );
+    }
+
+    // Reproduces the production misconfiguration: the output dir was set one level too high, so the
+    // publisher's staging sibling landed in a directory the daemon could not write, and every
+    // publish failed silently for hours. The preflight must catch that at startup - and must NOT
+    // fire for a correctly writable path, or it would just be noise operators learn to ignore.
+    #[test]
+    #[cfg(unix)]
+    fn preflight_detects_an_unwritable_parent_and_passes_a_writable_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Writable parent: <tmp>/feed/current - the intended layout. Must pass.
+        let ok_parent = tmp.path().join("feed");
+        std::fs::create_dir(&ok_parent).expect("create writable parent");
+        assert!(
+            preflight_output_dir(&ok_parent.join("current")).is_ok(),
+            "a writable parent must not warn"
+        );
+
+        // Unwritable parent, mirroring a root-owned dir the publishing user cannot write.
+        let bad_parent = tmp.path().join("locked");
+        std::fs::create_dir(&bad_parent).expect("create parent");
+        std::fs::set_permissions(&bad_parent, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        assert!(
+            preflight_output_dir(&bad_parent.join("feed")).is_err(),
+            "an unwritable parent must be caught before the first publish"
+        );
+
+        std::fs::set_permissions(&bad_parent, std::fs::Permissions::from_mode(0o755)).ok();
     }
 }

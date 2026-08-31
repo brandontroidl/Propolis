@@ -767,13 +767,8 @@ async fn main() {
             let pool = pool_vt.clone();
             let vt_config = vt_config.clone();
             async move {
-                let spool_dirs: Vec<(&str, std::path::PathBuf)> = vec![
-                    ("ssh", std::path::PathBuf::from("/var/spool/propolis/ssh")),
-                    ("adb", std::path::PathBuf::from("/var/spool/propolis/adb")),
-                    ("ftp", std::path::PathBuf::from("/var/spool/propolis/ftp")),
-                    ("catchall", std::path::PathBuf::from("/var/spool/propolis/catchall")),
-                    ("fetched", std::path::PathBuf::from(FETCH_SPOOL_DIR)),
-                ];
+                let mut spool_dirs = review::spool::body_spool_dirs();
+                spool_dirs.push(("fetched", std::path::PathBuf::from(FETCH_SPOOL_DIR)));
                 // One budget owned across every scan cycle so the cap is per DAY, not per cycle.
                 let mut budget = review::virustotal::DailyBudget::new(
                     vt_config.daily_limit,

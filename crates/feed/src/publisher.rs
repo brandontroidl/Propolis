@@ -64,6 +64,24 @@ pub enum PublishError {
     #[error("i/o error during publish: {0}")]
     Io(#[from] io::Error),
 
+    /// Staging could not be created under `parent`. Its own variant, rather than a bare `Io`,
+    /// because the bare `io::Error` names no path: a real deployment lost two hours of feed
+    /// publishes to `Permission denied (os error 13)` with nothing to say WHICH directory was
+    /// unwritable. Staging is a SIBLING of `output_dir` (see `create_staging_dir`), so the
+    /// permission that matters is on the output dir's PARENT, which is the non-obvious part worth
+    /// spelling out in the message.
+    #[error(
+        "cannot create the staging directory under {parent:?} (needed to publish to {output_dir:?} \
+         atomically): {source}. Staging is created as a sibling of the output directory, so the \
+         publishing user needs write permission on {parent:?}, not just on {output_dir:?}"
+    )]
+    StagingUnwritable {
+        parent: PathBuf,
+        output_dir: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     /// `manifest.json` serialization failed. Not expected in practice - every field is a plain
     /// `String` or `usize` - but `serde_json::to_string` is fallible in general, so this is
     /// handled rather than `expect`-ed.
@@ -213,13 +231,25 @@ fn revalidate(snapshot: &FeedSnapshot, exclusions: &ExclusionEngine) -> Result<(
 /// write-temp-then-rename helper makes for its cursor file. A leftover from a run that crashed
 /// after staging began must not silently mix its files with this run's, so an existing leftover is
 /// removed before starting.
-fn create_staging_dir(parent: &Path, file_name: &std::ffi::OsStr) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(parent)?;
+fn create_staging_dir(
+    parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> Result<PathBuf, PublishError> {
+    // Every failure here is reported as StagingUnwritable, naming `parent`: a bare io::Error says
+    // only "Permission denied (os error 13)" with no path, which is what made a real misconfigured
+    // deployment (output dir set one level too high, so `parent` was a root-owned directory) take
+    // hours to diagnose while the publisher retried silently every build interval.
+    let staged = |source: io::Error| PublishError::StagingUnwritable {
+        parent: parent.to_path_buf(),
+        output_dir: parent.join(file_name),
+        source,
+    };
+    std::fs::create_dir_all(parent).map_err(staged)?;
     let staging = parent.join(format!(".{}.staging", file_name.to_string_lossy()));
     if staging.exists() {
-        std::fs::remove_dir_all(&staging)?;
+        std::fs::remove_dir_all(&staging).map_err(staged)?;
     }
-    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&staging).map_err(staged)?;
     Ok(staging)
 }
 
@@ -420,5 +450,42 @@ mod tests {
     fn sha256_hex_is_deterministic_and_input_sensitive() {
         assert_eq!(sha256_hex(b"abc"), sha256_hex(b"abc"));
         assert_ne!(sha256_hex(b"abc"), sha256_hex(b"abd"));
+    }
+
+    // Reproduces a real outage: the output dir was configured one level too high, so staging (a
+    // SIBLING of the output dir) landed in a root-owned directory and every publish failed with a
+    // bare "Permission denied (os error 13)" naming no path. The error must name the unwritable
+    // parent and explain that the parent, not the output dir, is what needs write permission.
+    #[test]
+    #[cfg(unix)]
+    fn staging_failure_names_the_unwritable_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("readonly-parent");
+        std::fs::create_dir(&parent).expect("create parent");
+        // Strip write permission, mirroring a root-owned dir the publishing user cannot write.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod parent");
+
+        let err = create_staging_dir(&parent, std::ffi::OsStr::new("current"))
+            .expect_err("staging must fail when the parent is not writable");
+
+        let rendered = err.to_string();
+        assert!(
+            matches!(err, PublishError::StagingUnwritable { .. }),
+            "expected StagingUnwritable, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&parent.display().to_string()),
+            "the error must name the unwritable parent directory, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("write permission"),
+            "the error must say what permission is needed, got: {rendered}"
+        );
+
+        // Restore so tempdir cleanup can remove it.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).ok();
     }
 }

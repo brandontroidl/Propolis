@@ -26,14 +26,46 @@ use sensor_framework::{
 };
 use tokio::task::JoinHandle;
 
-const ENV_BIND_ADDRS: &str = "CATCHALL_BIND_ADDRS";
-const ENV_LOG_PATH: &str = "CATCHALL_LOG_PATH";
-const ENV_WAN_MAP: &str = "CATCHALL_WAN_MAP";
-const ENV_READ_TIMEOUT_MS: &str = "CATCHALL_READ_TIMEOUT_MS";
-const ENV_IDLE_TIMEOUT_MS: &str = "CATCHALL_IDLE_TIMEOUT_MS";
-const ENV_MAX_DURATION_SECS: &str = "CATCHALL_MAX_DURATION_SECS";
-const ENV_MAX_CAPTURED_BYTES: &str = "CATCHALL_MAX_CAPTURED_BYTES";
-const ENV_MAX_CONCURRENT: &str = "CATCHALL_MAX_CONCURRENT";
+// Canonical `PROPOLIS_CATCHALL_*` names, matching every other sensor (`PROPOLIS_SSH_BIND`,
+// `PROPOLIS_FTP_SPOOL_DIR`, ...). This sensor originally shipped with bare `CATCHALL_*` names, the
+// lone exception in the fleet, and that inconsistency cost a real deployment: the operator wrote
+// `/etc/propolis/catchall.env` to the majority convention, nothing read it, the fail-closed config
+// check rejected the empty bind list, and the catch-all sensor sat dead through ~4000 restarts
+// without anyone noticing. `env_var` below still honours the bare names so existing configs keep
+// working; it warns so they can be migrated rather than silently depended on.
+const ENV_BIND_ADDRS: &str = "PROPOLIS_CATCHALL_BIND_ADDRS";
+const ENV_LOG_PATH: &str = "PROPOLIS_CATCHALL_LOG_PATH";
+const ENV_WAN_MAP: &str = "PROPOLIS_CATCHALL_WAN_MAP";
+const ENV_READ_TIMEOUT_MS: &str = "PROPOLIS_CATCHALL_READ_TIMEOUT_MS";
+const ENV_IDLE_TIMEOUT_MS: &str = "PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS";
+const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_CATCHALL_MAX_DURATION_SECS";
+const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES";
+const ENV_MAX_CONCURRENT: &str = "PROPOLIS_CATCHALL_MAX_CONCURRENT";
+
+/// Reads `name`, falling back to the pre-rename bare spelling (`PROPOLIS_CATCHALL_X` -> `CATCHALL_X`)
+/// so a config written against the old names still starts the sensor. A legacy hit is warned about
+/// once per variable, naming the canonical replacement, so the fallback is a migration path rather
+/// than a second permanent spelling.
+fn legacy_name(canonical: &str) -> &str {
+    canonical.strip_prefix("PROPOLIS_").unwrap_or(canonical)
+}
+
+fn env_var(name: &str) -> Result<String, env::VarError> {
+    match env::var(name) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            let legacy = legacy_name(name);
+            let value = env::var(legacy)?;
+            tracing::warn!(
+                canonical = name,
+                legacy,
+                "catchall: read a deprecated bare env var name; rename it to the canonical \
+                 PROPOLIS_-prefixed form (the bare spelling will stop being read in a future release)"
+            );
+            Ok(value)
+        }
+    }
+}
 
 const DEFAULT_LOG_PATH: &str = "catchall-events.jsonl";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
@@ -57,7 +89,8 @@ struct Config {
 
 #[derive(Debug, PartialEq)]
 enum ConfigError {
-    /// `CATCHALL_BIND_ADDRS` was absent, empty, or held only blank entries.
+    /// [`ENV_BIND_ADDRS`] (and its legacy bare spelling) was absent, empty, or held only blank
+    /// entries.
     NoBindAddrs,
     InvalidBindAddr(String),
     InvalidWanMapEntry(String),
@@ -184,34 +217,34 @@ fn parse_positive_u32(
 /// address, malformed entry, or zero-valued bound is rejected here rather than silently
 /// substituted with a default that could disable the bound it names.
 fn load_config_from_env() -> Result<Config, ConfigError> {
-    let bind_addrs = parse_bind_addrs(&env::var(ENV_BIND_ADDRS).unwrap_or_default())?;
-    let wan_map = parse_wan_map(&env::var(ENV_WAN_MAP).unwrap_or_default())?;
-    let log_path = env::var(ENV_LOG_PATH)
+    let bind_addrs = parse_bind_addrs(&env_var(ENV_BIND_ADDRS).unwrap_or_default())?;
+    let wan_map = parse_wan_map(&env_var(ENV_WAN_MAP).unwrap_or_default())?;
+    let log_path = env_var(ENV_LOG_PATH)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_PATH));
 
     let read_timeout_ms = parse_positive_u64(
-        env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
+        env_var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
         DEFAULT_READ_TIMEOUT_MS,
         ENV_READ_TIMEOUT_MS,
     )?;
     let idle_timeout_ms = parse_positive_u64(
-        env::var(ENV_IDLE_TIMEOUT_MS).ok().as_deref(),
+        env_var(ENV_IDLE_TIMEOUT_MS).ok().as_deref(),
         DEFAULT_IDLE_TIMEOUT_MS,
         ENV_IDLE_TIMEOUT_MS,
     )?;
     let max_duration_secs = parse_positive_u64(
-        env::var(ENV_MAX_DURATION_SECS).ok().as_deref(),
+        env_var(ENV_MAX_DURATION_SECS).ok().as_deref(),
         DEFAULT_MAX_DURATION_SECS,
         ENV_MAX_DURATION_SECS,
     )?;
     let max_captured_bytes = parse_positive_u64(
-        env::var(ENV_MAX_CAPTURED_BYTES).ok().as_deref(),
+        env_var(ENV_MAX_CAPTURED_BYTES).ok().as_deref(),
         DEFAULT_MAX_CAPTURED_BYTES,
         ENV_MAX_CAPTURED_BYTES,
     )?;
     let max_concurrent = parse_positive_u32(
-        env::var(ENV_MAX_CONCURRENT).ok().as_deref(),
+        env_var(ENV_MAX_CONCURRENT).ok().as_deref(),
         DEFAULT_MAX_CONCURRENT,
         ENV_MAX_CONCURRENT,
     )?;
@@ -403,5 +436,18 @@ mod tests {
     #[test]
     fn parse_positive_u32_accepts_explicit_value() {
         assert_eq!(parse_positive_u32(Some("7"), 1, "x").unwrap(), 7);
+    }
+
+    // The legacy spelling is derived by stripping the PROPOLIS_ prefix, so a config written against
+    // the old bare names still resolves instead of leaving the sensor unconfigured - the failure
+    // that left the catch-all sensor dead across ~4000 restarts because nothing read its env file.
+    // Tested as a pure derivation rather than by mutating process-global env vars, which would race
+    // every other test in this binary.
+    #[test]
+    fn the_legacy_bare_name_is_the_canonical_one_without_the_propolis_prefix() {
+        assert_eq!(legacy_name(ENV_BIND_ADDRS), "CATCHALL_BIND_ADDRS");
+        assert_eq!(legacy_name(ENV_MAX_CONCURRENT), "CATCHALL_MAX_CONCURRENT");
+        // A name that is already unprefixed is returned unchanged, never truncated further.
+        assert_eq!(legacy_name("CATCHALL_BIND_ADDRS"), "CATCHALL_BIND_ADDRS");
     }
 }

@@ -366,14 +366,14 @@ null `wan_ip`); invalid entry → abort.
 | ftp | `PROPOLIS_FTP_` | `PROPOLIS_FTP_BIND` | `/var/log/propolis/ftp/events.jsonl` |
 | redis | `PROPOLIS_REDIS_` | `PROPOLIS_REDIS_BIND` | `/var/log/propolis/redis/events.jsonl` |
 | adb | `PROPOLIS_ADB_` | `PROPOLIS_ADB_BIND` | `/var/log/propolis/adb/events.jsonl` |
-| catchall | `CATCHALL_` (not `PROPOLIS_`) | `CATCHALL_BIND_ADDRS` (comma-sep list, empty→abort) | `catchall-events.jsonl` (relative) |
+| catchall | `PROPOLIS_CATCHALL_` (bare `CATCHALL_` still read, deprecated) | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list, empty→abort) | `catchall-events.jsonl` (relative) |
 
-Common per-sensor variables (each uses its own prefix; catchall uses `CATCHALL_`):
+Common per-sensor variables (each uses its own prefix; catchall uses `PROPOLIS_CATCHALL_`, with the bare `CATCHALL_` spelling still read but deprecated):
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `<P>WAN_MAP` (catchall `CATCHALL_WAN_MAP`) | no | empty map | invalid entry → abort |
-| `<P>LOG_PATH` (catchall `CATCHALL_LOG_PATH`) | no | see table above | |
+| `<P>WAN_MAP` (catchall `PROPOLIS_CATCHALL_WAN_MAP`) | no | empty map | invalid entry → abort |
+| `<P>LOG_PATH` (catchall `PROPOLIS_CATCHALL_LOG_PATH`) | no | see table above | |
 | `<P>READ_TIMEOUT_MS` | no | `30_000` (catchall `5_000`) | ms; zero → abort |
 | `<P>IDLE_TIMEOUT_MS` | no | `60_000` (catchall `5_000`) | ms; zero → abort |
 | `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`) | secs; zero → abort |
@@ -383,9 +383,23 @@ Common per-sensor variables (each uses its own prefix; catchall uses `CATCHALL_`
 Literal names for the sensors whose `main.rs` defines these as explicit constants (the `<P>` rows
 above, instantiated): ssh — `PROPOLIS_SSH_READ_TIMEOUT_MS`, `PROPOLIS_SSH_IDLE_TIMEOUT_MS`,
 `PROPOLIS_SSH_MAX_DURATION_SECS`, `PROPOLIS_SSH_MAX_CAPTURED_BYTES`, `PROPOLIS_SSH_MAX_CONCURRENT`,
-`PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`; catchall — `CATCHALL_READ_TIMEOUT_MS`,
-`CATCHALL_IDLE_TIMEOUT_MS`, `CATCHALL_MAX_DURATION_SECS`, `CATCHALL_MAX_CAPTURED_BYTES`,
-`CATCHALL_MAX_CONCURRENT`.
+`PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`; catchall — `PROPOLIS_CATCHALL_READ_TIMEOUT_MS`,
+`PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS`, `PROPOLIS_CATCHALL_MAX_DURATION_SECS`, `PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES`,
+`PROPOLIS_CATCHALL_MAX_CONCURRENT`.
+
+### Deprecated catchall aliases (still read, do not use in new configs)
+
+`sensor-catchall` originally shipped with bare, unprefixed names - the only sensor that did. It now
+uses the `PROPOLIS_CATCHALL_` prefix like every other sensor, and still reads the bare spelling as a
+migration path, logging a deprecation warning naming the canonical replacement. An existing config
+keeps working; write new ones with the prefix. The bare names read are `CATCHALL_BIND_ADDRS`,
+`CATCHALL_WAN_MAP`, `CATCHALL_LOG_PATH`, `CATCHALL_READ_TIMEOUT_MS`, `CATCHALL_IDLE_TIMEOUT_MS`,
+`CATCHALL_MAX_DURATION_SECS`, `CATCHALL_MAX_CAPTURED_BYTES`, `CATCHALL_MAX_CONCURRENT`.
+
+Why this is documented rather than quietly dropped: the mismatch between the bare names the binary
+read and the prefixed names an operator would reasonably write left a deployed catch-all sensor dead
+through roughly 4000 restart attempts, its fail-closed config check rejecting an empty bind list
+because nothing read its env file.
 
 Sensor-specific extras:
 - **ssh** (`crates/sensor-ssh/src/main.rs`): `PROPOLIS_SSH_HOST_KEY_PATH`

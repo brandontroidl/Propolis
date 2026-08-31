@@ -109,6 +109,46 @@
   {% endif %}
 </div>
 
+{# fetch_attempt.source_ip only records the FIRST attacker whose event queued a given URL
+   (ON CONFLICT (url_hash) DO NOTHING - see routes/detail.rs's fetch_malware_rows doc comment),
+   so this panel is "malware fetched from URLs this IP was first to report", never "every
+   malicious URL this IP has referenced". The dim caveat below keeps that visible in the UI. #}
+<div class="panel">
+  <div class="panel-head">Malware fetched from this IP's URLs <span class="dim">first reporter of each URL</span></div>
+  {% if malware %}
+  <table class="table-compact">
+    <thead><tr><th>URL</th><th>Payload host</th><th>Size</th><th>SHA-256</th><th>Fetch status</th><th>VirusTotal</th><th>Scanned</th></tr></thead>
+    <tbody>
+      {% for m in malware %}
+      <tr>
+        <td class="mono" style="max-width:24rem;overflow-wrap:anywhere;">{{ m.url }}</td>
+        <td class="mono">{{ m.host }}{% if m.pinned_ip and m.pinned_ip != m.host %} <span class="dim">({{ m.pinned_ip }})</span>{% endif %}</td>
+        <td class="mono">{% if m.bytes %}{{ m.bytes }}{% else %}<span class="dim">-</span>{% endif %}</td>
+        <td class="mono">{% if m.sha256_short %}<span title="{{ m.sha256 }}">{{ m.sha256_short }}...</span>{% else %}<span class="dim">-</span>{% endif %}</td>
+        <td>{{ m.status }}</td>
+        <td>
+          {% if m.detected is defined and m.detected is not none %}
+            {% if m.detected > 0 %}
+            <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-rejected">{{ m.detected }}/{{ m.total }} detected</a>
+            {% else %}
+            <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved">clean (0/{{ m.total }})</a>
+            {% endif %}
+          {% elif m.sha256_short %}
+            <span class="state-pill state-snoozed">not yet scanned</span>
+          {% else %}
+            <span class="dim">-</span>
+          {% endif %}
+        </td>
+        <td class="seen">{% if m.analyzed_at %}{{ m.analyzed_at }}{% else %}<span class="dim">-</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">no fetched samples linked to this address</p>
+  {% endif %}
+</div>
+
 <div class="panel">
   <div class="panel-head panel-head--blue">
     Activity

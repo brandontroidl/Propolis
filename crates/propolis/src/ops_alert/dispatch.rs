@@ -96,6 +96,32 @@ impl ReqwestPoster {
     }
 }
 
+/// A local sink that "delivers" an alert by logging it at ERROR level instead of posting it.
+///
+/// Alerting previously required an external ntfy endpoint, so a node without one got NO alerting at
+/// all - and that is exactly how a feed-publish failure repeated silently for hours, a catch-all
+/// sensor sat dead across thousands of restarts, and a crash-looping sensor went unnoticed. Every
+/// one of those had a condition that would have fired. This sink removes the external dependency:
+/// the alert lands in the journal, where `journalctl -p err`, a log shipper, or a systemd
+/// `OnFailure=` can see it. Push delivery via ntfy remains available and preferable; this is the
+/// floor, not a replacement.
+///
+/// It implements `Poster` rather than being a parallel path so it inherits the dispatcher's
+/// cooldown, dedup, and recovery handling unchanged - one alerting policy, two transports.
+pub struct LogPoster;
+
+impl Poster for LogPoster {
+    async fn post(&self, req: PostReq) -> Result<u16, PostErr> {
+        // The body already carries the rendered alert text the remote sink would have shown.
+        // ERROR level because every condition that reaches dispatch is operator-actionable.
+        tracing::error!(target: "propolis::ops_alert", alert = %req.body, "OPS ALERT");
+        // 200: a local write cannot fail in a way retrying would fix, so never trigger the retry
+        // path. A tracing subscriber that drops the line is a logging-config problem, not a
+        // transport failure to retry.
+        Ok(200)
+    }
+}
+
 impl Poster for ReqwestPoster {
     async fn post(&self, req: PostReq) -> Result<u16, PostErr> {
         let mut rb = self.client.post(&req.url).body(req.body);

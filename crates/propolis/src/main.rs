@@ -1034,16 +1034,10 @@ async fn main() {
                 let spool_dir = spool_dir.clone();
                 let feed_marker_path = feed_marker.clone();
                 async move {
-                    let dispatcher = match ops_alert::dispatch::Dispatcher::new(&ops_cfg) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "ops-monitor: dispatcher build failed; not starting (fix config)"
-                            );
-                            return;
-                        }
-                    };
+                    // No ntfy target configured: deliver alerts to the local log sink rather than
+                    // not alerting at all. Same conditions, same cooldown/dedup policy, different
+                    // transport - see `dispatch::LogPoster`.
+                    let local_only = ops_cfg.ntfy_url.is_empty();
                     let ctx = ops_alert::condition::MonitorCtx {
                         pool,
                         pg_data_volume,
@@ -1052,20 +1046,58 @@ async fn main() {
                         intake_progress,
                         feed_marker_path,
                         feed_build_interval,
-                        cfg: ops_cfg,
+                        cfg: ops_cfg.clone(),
                     };
-                    ops_alert::monitor::Monitor::new(
-                        ops_alert::monitor::default_conditions(),
-                        ctx,
-                        dispatcher,
-                    )
-                    .run(token)
-                    .await;
+                    if local_only {
+                        tracing::warn!(
+                            "ops-monitor: no PROPOLIS_OPS_NTFY_URL configured; alerts go to the \
+                             local log at ERROR level only (journalctl -p err). Set the ntfy url \
+                             and topic for push delivery."
+                        );
+                        let dispatcher = ops_alert::dispatch::Dispatcher::with_poster(
+                            ops_alert::dispatch::LogPoster,
+                            &ops_cfg.ntfy_url,
+                            &ops_cfg.ntfy_topic,
+                            ops_cfg.ntfy_token.clone(),
+                            ops_cfg.repage_cooldown,
+                        );
+                        ops_alert::monitor::Monitor::new(
+                            ops_alert::monitor::default_conditions(),
+                            ctx,
+                            dispatcher,
+                        )
+                        .run(token)
+                        .await;
+                    } else {
+                        let dispatcher = match ops_alert::dispatch::Dispatcher::new(&ops_cfg) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "ops-monitor: dispatcher build failed; not starting (fix config)"
+                                );
+                                return;
+                            }
+                        };
+                        ops_alert::monitor::Monitor::new(
+                            ops_alert::monitor::default_conditions(),
+                            ctx,
+                            dispatcher,
+                        )
+                        .run(token)
+                        .await;
+                    }
                 }
             },
         ));
     } else {
-        tracing::info!("propolis: operational self-alerting disabled");
+        // WARN, not INFO: running with no self-monitoring is a risk posture, and at INFO it scrolled
+        // past unnoticed while a feed-publish failure repeated for hours and a sensor sat dead.
+        tracing::warn!(
+            "propolis: operational self-alerting is DISABLED (PROPOLIS_OPS_ENABLED); no feed-stale, \
+             sensor-down, intake-stalled or backlog condition will page. Set PROPOLIS_OPS_ENABLED=true \
+             (ntfy optional - alerts fall back to the local log)."
+        );
     }
 
     // 11. Wait for shutdown signal.

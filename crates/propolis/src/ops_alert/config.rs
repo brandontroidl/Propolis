@@ -118,20 +118,24 @@ pub fn parse_ops_alert(
     // once the operator turns it on.
     let enabled = get_bool(get, "PROPOLIS_OPS_ENABLED", false);
 
-    // Fail-closed: when enabled, an alerting target is mandatory. A monitor that cannot page is
-    // worse than a loud config error, because it looks healthy while paging nothing.
-    let (ntfy_url, ntfy_topic) = if enabled {
-        (
-            get("PROPOLIS_OPS_NTFY_URL").ok_or(ConfigError::Missing("PROPOLIS_OPS_NTFY_URL"))?,
-            get("PROPOLIS_OPS_NTFY_TOPIC")
-                .ok_or(ConfigError::Missing("PROPOLIS_OPS_NTFY_TOPIC"))?,
-        )
-    } else {
-        (
-            get("PROPOLIS_OPS_NTFY_URL").unwrap_or_default(),
-            get("PROPOLIS_OPS_NTFY_TOPIC").unwrap_or_default(),
-        )
-    };
+    // An alerting target is optional, but its ABSENCE is not silent: with neither ntfy value set,
+    // alerts are delivered to the local log sink (`dispatch::LogPoster`) instead, and the daemon
+    // says so at startup. Requiring ntfy outright was worse in practice - it made "no external
+    // service" mean "no alerting at all", which is how a feed-publish failure repeated silently for
+    // hours on a node whose conditions would all have fired.
+    //
+    // Still fail-closed on a HALF-configured target: a URL without a topic (or vice versa) is an
+    // operator mistake, not a choice of the local sink, and silently downgrading it would page
+    // nothing while looking configured.
+    let ntfy_url = get("PROPOLIS_OPS_NTFY_URL").unwrap_or_default();
+    let ntfy_topic = get("PROPOLIS_OPS_NTFY_TOPIC").unwrap_or_default();
+    if enabled {
+        match (ntfy_url.is_empty(), ntfy_topic.is_empty()) {
+            (true, false) => return Err(ConfigError::Missing("PROPOLIS_OPS_NTFY_URL")),
+            (false, true) => return Err(ConfigError::Missing("PROPOLIS_OPS_NTFY_TOPIC")),
+            _ => {}
+        }
+    }
 
     Ok(OpsAlertConfig {
         enabled,
@@ -185,6 +189,33 @@ mod tests {
         ]))
         .unwrap_err();
         assert_eq!(err, ConfigError::Missing("PROPOLIS_OPS_NTFY_URL"));
+    }
+
+    #[test]
+    fn enabled_with_no_ntfy_target_at_all_is_valid_and_uses_the_local_sink() {
+        // Requiring ntfy outright made "no external service" mean "no alerting at all", which is how
+        // a feed-publish failure repeated silently for hours on a node whose conditions would all
+        // have fired. Enabling with no target is now valid; both ntfy fields stay empty, and the
+        // caller selects the local log sink on that emptiness.
+        let cfg = parse_ops_alert(&getter(&[("PROPOLIS_OPS_ENABLED", "true")])).unwrap();
+        assert!(cfg.enabled);
+        assert!(
+            cfg.ntfy_url.is_empty(),
+            "an empty ntfy url is what selects the local sink"
+        );
+        assert!(cfg.ntfy_topic.is_empty());
+    }
+
+    #[test]
+    fn enabled_with_a_url_but_no_topic_still_fails_closed() {
+        // A HALF-configured target is an operator mistake, not a choice of the local sink. Silently
+        // downgrading it would page nothing while looking configured.
+        let err = parse_ops_alert(&getter(&[
+            ("PROPOLIS_OPS_ENABLED", "true"),
+            ("PROPOLIS_OPS_NTFY_URL", "https://ntfy.example/"),
+        ]))
+        .unwrap_err();
+        assert_eq!(err, ConfigError::Missing("PROPOLIS_OPS_NTFY_TOPIC"));
     }
 
     #[test]

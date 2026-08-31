@@ -2,7 +2,9 @@
 #
 # In-place upgrade: pull, build, replace binaries, restart services.
 # Safe to run on a live node - restarts are sequenced (propolis last so sensors
-# can reconnect). Assumes install.sh has already run once.
+# can reconnect). Runs deploy/provision.sh itself before restarting anything, so a directory or
+# user a change added since the last install/upgrade (e.g. a new sensor's spool dir) always exists
+# before the unit that needs it restarts - no longer assumes install.sh already provisioned it.
 #
 # Usage: sudo ./deploy/upgrade.sh
 
@@ -34,6 +36,9 @@ echo "==> installing binaries"
 for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-cred gateway shipper; do
     install -m 0755 "$BUILD_DIR/$bin" "/usr/local/bin/$bin"
 done
+
+echo "==> ensuring dirs and users (provision.sh, idempotent)"
+"$SCRIPT_DIR/provision.sh"
 
 echo "==> restarting sensors"
 for unit in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-cred; do

@@ -28,6 +28,7 @@
 //! measures" failure this test suite exists to prevent. `deploy/sensor-catchall.service` and
 //! `deploy/sensor-ssh.service` both carry a comment recording this correction at its point of use.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -573,4 +574,82 @@ fn unit_grants_ancestor_of(unit: &str, path: &Path) -> bool {
         .filter(|l| l.starts_with("ReadWritePaths="))
         .flat_map(|l| l.trim_start_matches("ReadWritePaths=").split_whitespace())
         .any(|granted| path.starts_with(granted))
+}
+
+/// SP-B-1e regression: `upgrade.sh` never provisioned directories - it assumed `install.sh` had
+/// already run once - so a spool/state directory a change added only ever existed after a fresh
+/// install. `sensor-telnet.service`'s own `/var/spool/propolis/telnet` `ReadWritePaths` grant
+/// shipped this way and was never created on a live upgrade, crash-looping the unit under
+/// `ProtectSystem=strict` (its `ReadWritePaths` bind-mount target did not exist). Provisioning is
+/// now one shared, idempotent routine (`deploy/provision.sh`) both `install.sh` and `upgrade.sh`
+/// run - this test is the machine check that forecloses the underlying class: it cross-checks
+/// every sensor unit's spool/state `ReadWritePaths` entries against the directories
+/// `provision.sh` actually creates, so a unit granting a path nothing provisions fails the build
+/// rather than only failing in production on the next upgrade.
+#[test]
+fn every_unit_readwrite_dir_is_provisioned() {
+    let provisioned = provisioned_dirs();
+
+    let deploy_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy"));
+    let mut checked_any = false;
+    for entry in std::fs::read_dir(&deploy_dir).expect("failed to read deploy/") {
+        let entry = entry.expect("failed to read a deploy/ directory entry");
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy().into_owned();
+        if !file_name.starts_with("sensor-") || !file_name.ends_with(".service") {
+            continue;
+        }
+        checked_any = true;
+
+        let unit = std::fs::read_to_string(entry.path())
+            .unwrap_or_else(|e| panic!("failed to read deploy/{file_name}: {e}"));
+        for dir in spool_state_read_write_dirs(&unit) {
+            assert!(
+                provisioned.contains(&dir),
+                "deploy/{file_name} grants ReadWritePaths={dir}, but deploy/provision.sh does \
+                 not provision that directory - a live upgrade would leave it missing and the \
+                 unit would crash-loop under ProtectSystem=strict (the SP-B-1e telnet outage)"
+            );
+        }
+    }
+    assert!(
+        checked_any,
+        "no deploy/sensor-*.service units found - the glob in this test is broken"
+    );
+}
+
+/// The `/var/spool/propolis/*` and `/var/lib/propolis/*` entries in `unit`'s `ReadWritePaths=`
+/// lines - the spool/state directories a sensor must be able to write, and the exact class of
+/// directory the telnet outage was missing. `/var/log/propolis/*` log directories are provisioned
+/// by the same routine but excluded here; they are not what this regression test targets.
+fn spool_state_read_write_dirs(unit: &str) -> Vec<String> {
+    unit.lines()
+        .filter(|l| l.starts_with("ReadWritePaths="))
+        .flat_map(|l| l.trim_start_matches("ReadWritePaths=").split_whitespace())
+        .filter(|p| p.starts_with("/var/spool/propolis/") || p.starts_with("/var/lib/propolis/"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The set of directories `deploy/provision.sh` creates, parsed from its `ensure_dir <path> ...`
+/// call sites. Deliberately does not match `provision.sh`'s own `ensure_dir() {` function
+/// definition: split on whitespace, that line's first token is `ensure_dir()` (attached
+/// parenthesis), not the bare `ensure_dir` this parser requires as the first token of a real call.
+fn provisioned_dirs() -> HashSet<String> {
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/provision.sh"
+    ))
+    .expect("failed to read deploy/provision.sh");
+
+    script
+        .lines()
+        .filter_map(|line| {
+            let mut tokens = line.split_whitespace();
+            if tokens.next()? != "ensure_dir" {
+                return None;
+            }
+            tokens.next().map(str::to_string)
+        })
+        .collect()
 }

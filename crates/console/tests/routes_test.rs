@@ -1789,6 +1789,130 @@ async fn detail_shows_events_for_seeded_ip(pool: PgPool) {
     );
 }
 
+/// Inserts one `fetch_attempt` row for `source_ip` plus a matching `sample_analysis` row, joined
+/// via `encode(sha256,'hex')` exactly as `routes::detail`'s `fetch_malware_rows` does -
+/// `crates/console/src/routes/detail.rs`'s doc comment on that function covers why the join goes
+/// through `encode(...)`: `fetch_attempt.sha256` is raw-digest `BYTEA`, `sample_analysis.sha256`
+/// is lowercase-hex `TEXT`. `n` derives both a unique `url_hash` (the table's primary key) and a
+/// unique, valid 64-char lowercase-hex sha256 (`format!("{:064x}", ...)` zero-pads a `u64` into a
+/// full-width hex string, so `hex::decode` on it always succeeds).
+async fn seed_fetch_attempt_with_analysis(
+    pool: &PgPool,
+    n: u32,
+    source_ip: &str,
+    detected: i32,
+    total: i32,
+) -> String {
+    let sha256_hex = format!("{:064x}", 0xdead_beef_u64 + n as u64);
+    let sha256_bytes = hex::decode(&sha256_hex).unwrap();
+    sqlx::query(
+        "INSERT INTO fetch_attempt \
+            (url_hash, url, host, scheme, pinned_ip, source_ip, status, sha256, bytes, last_attempt) \
+         VALUES ($1, $2, $3, 'http', $4, $5::inet, 'success', $6, $7, now())",
+    )
+    .bind(format!("malware-link-test-hash-{n}").into_bytes())
+    .bind(format!(
+        "http://malware-link-test-{n}.example.invalid/payload.bin"
+    ))
+    .bind(format!("malware-link-test-{n}.example.invalid"))
+    .bind("203.0.113.66")
+    .bind(source_ip)
+    .bind(&sha256_bytes)
+    .bind(4300_i32)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO sample_analysis (sha256, detected, total, vt_link, analyzed_at) \
+         VALUES ($1, $2, $3, $4, now())",
+    )
+    .bind(&sha256_hex)
+    .bind(detected)
+    .bind(total)
+    .bind(format!("https://www.virustotal.com/gui/file/{sha256_hex}"))
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sha256_hex
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_shows_linked_malware_fetched_from_this_ips_urls(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.80", 60).await;
+    let sha256_hex = seed_fetch_attempt_with_analysis(&pool, 1, "203.0.113.80", 12, 70).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.80",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("Malware fetched from this IP's URLs"),
+        "malware panel heading missing: {body}"
+    );
+    // minijinja's autoescaper HTML-entity-escapes `/` (`&#x2f;`) inside `{{ m.url }}` - assert on
+    // slash-free fragments of the URL rather than the literal string, same reasoning
+    // `detail_renders_services_probed_and_egress_free_lookup_links`'s own doc comment gives for
+    // asserting on the vendor domain rather than the full escaped href.
+    assert!(
+        body.contains("malware-link-test-1.example.invalid"),
+        "fetched url's host missing: {body}"
+    );
+    assert!(
+        body.contains("payload.bin"),
+        "fetched url's path missing: {body}"
+    );
+    assert!(
+        body.contains(&sha256_hex[..12]),
+        "sha256 short form missing: {body}"
+    );
+    assert!(
+        body.contains("12/70 detected"),
+        "VT verdict missing: {body}"
+    );
+    assert!(
+        body.contains("first reporter of each URL"),
+        "attribution caveat missing: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_shows_empty_state_when_no_fetches_link_to_this_ip(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.81", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.81",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("no fetched samples linked to this address"),
+        "malware panel empty state missing: {body}"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn detail_unknown_ip_returns_404(pool: PgPool) {
     migrate(&pool).await;

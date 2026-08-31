@@ -1,7 +1,7 @@
 //! `GET /ip/:ip` - the IP detail page (`internal/design/06-console-observability.md`, "Pages" >
 //! "IP detail"). Session-gated: mounted under the `protected` group in `routes::mod`.
 //!
-//! Five read-only queries, all scoped to the one path-param IP:
+//! Six read-only queries, all scoped to the one path-param IP:
 //! - the score summary via `core_scoring::read_score` (decayed to now, same as `routes::queue`)
 //!   plus `core_scoring::effective_score` for the breadth-adjusted number the blocklist
 //!   recommendation gate actually uses;
@@ -16,6 +16,11 @@
 //!   extra query - it is the same JSON `routes::queue`'s `live_categories` reads, just kept as
 //!   weight/confidence values here instead of collapsed to a category list);
 //! - the submission history: `vendor_submission` rows for this IP.
+//! - malware fetched from this IP's URLs: `fetch_attempt` rows whose `source_ip` is this IP,
+//!   LEFT JOINed against `sample_analysis` on the captured payload's sha256, so the "attacker src"
+//!   / "download URL" / "VT-scanned sample" that today read as three unrelated things share one
+//!   panel (`fetch_malware_rows`'s doc comment covers the type-mismatched join and the
+//!   first-reporter-only attribution caveat this carries).
 //!
 //! An IP with no `ip_score` row renders 404, matching the design's "Error handling": "Missing IP
 //! ... returns 404." That is a normal, expected outcome (an operator following a stale link, or
@@ -82,6 +87,11 @@ pub fn router() -> Router<AppState> {
 /// many rows per query; a page coming back exactly this size is the "there may be more" signal
 /// (`fetch_evidence_rows`'s doc comment) - there is no separate `COUNT(*)` query.
 const EVIDENCE_PAGE_SIZE: i64 = 200;
+
+/// Row cap for the "Malware fetched from this IP's URLs" panel's `fetch_malware_rows` query -
+/// generous relative to how many distinct download URLs a single attacker realistically reports
+/// (unlike the evidence timeline, there is no "Load more" for this panel).
+const MALWARE_PAGE_SIZE: i64 = 50;
 
 /// One `event` row as rendered in a session card's body (or the "Ungrouped events" table for
 /// pre-`session_id` rows). `activity` and `detail` are both pre-formatted display strings; the
@@ -176,6 +186,33 @@ struct ServiceRow {
     authenticated: bool,
     first_seen: String,
     last_seen: String,
+}
+
+/// One `fetch_attempt` row for this IP, LEFT JOINed against `sample_analysis` on the captured
+/// payload's sha256 - the "Malware fetched from this IP's URLs" panel
+/// (`fetch_malware_rows`'s doc comment covers the join and its first-reporter-only caveat).
+/// `sha256`/`sha256_short`/`detected`/`total`/`vt_link`/`analyzed_at` are all `None` for a fetch
+/// that never captured a body (a rejected/dead/timed-out attempt), or that captured one but has
+/// not been VirusTotal-scanned yet - `status` still renders in both cases, since a failed or
+/// pending fetch is evidence too.
+#[derive(Debug, Serialize)]
+struct MalwareRow {
+    url: String,
+    host: String,
+    pinned_ip: Option<String>,
+    /// Raw `fetch_attempt.status` value (pending/success/dead/rejected/too_big/timeout/empty -
+    /// `review::fetcher::FetchStatus::as_str()`, same vocabulary `routes::samples` displays).
+    status: String,
+    /// Pre-formatted byte count (`format_bytes`), `None` when no body was captured.
+    bytes: Option<String>,
+    /// Full lowercase-hex sha256, for the title attribute; `None` when no body was captured.
+    sha256: Option<String>,
+    /// First 12 hex chars of `sha256`, for the table cell.
+    sha256_short: Option<String>,
+    detected: Option<i32>,
+    total: Option<i32>,
+    vt_link: Option<String>,
+    analyzed_at: Option<String>,
 }
 
 /// An operator-initiated external lookup link. The operator's browser makes the request, never the
@@ -302,6 +339,8 @@ async fn detail(
         });
     }
 
+    let malware = fetch_malware_rows(&state.db, ip).await?;
+
     let external_links = external_lookup_links(ip);
 
     // Offline geo/ASN enrichment (egress-free). `None` when no GeoLite2 database is configured, so
@@ -390,6 +429,7 @@ async fn detail(
         categories,
         submissions,
         services,
+        malware,
         external_links,
         geo,
         rdns,
@@ -654,6 +694,74 @@ async fn fetch_evidence_rows(
         });
     }
     Ok(events)
+}
+
+/// Fetches up to [`MALWARE_PAGE_SIZE`] `fetch_attempt` rows whose `source_ip` is this IP, newest
+/// first by `last_attempt`, LEFT JOINed against `sample_analysis` on the captured payload's
+/// sha256 - the link that ties the attacker IP, the download URL it fed a fetcher, and the
+/// VirusTotal verdict on what actually came back, today shown as three unrelated things.
+///
+/// TYPE MISMATCH: `fetch_attempt.sha256` is `BYTEA` (the raw digest, NULL unless a body was
+/// captured - `crates/review/migrations/0003_fetch_attempt.sql`); `sample_analysis.sha256` is
+/// lowercase-hex `TEXT` (`crates/core-scoring/migrations/0009_sample_analysis.sql`). The join
+/// goes through `encode(fa.sha256, 'hex')`, confirmed against a live database
+/// (`encode(bytea,'hex')` always lowercases) and against both write paths: `fetch_attempt.sha256`
+/// is written from `Sha256::digest(...)` raw bytes and its spool filename from
+/// `review::fetcher::to_hex`'s `{b:02x}` formatting (`crates/review/src/fetcher/mod.rs`), and
+/// `sample_analysis.sha256` (`review::virustotal`) is keyed directly off that same lowercase-hex
+/// spool filename - so both sides are lowercase hex of the same digest by construction, never
+/// merely by convention.
+///
+/// LEFT JOIN, not INNER: a fetch that never captured a body (rejected/dead/timeout/too_big/
+/// empty/pending) or one that captured a body VirusTotal has not scanned yet still has a
+/// `fetch_attempt` row worth showing, with `detected`/`total`/`vt_link`/`analyzed_at` all `None` -
+/// a failed or unscanned fetch is evidence too, not something to hide behind an INNER JOIN's
+/// silent drop.
+///
+/// ATTRIBUTION CAVEAT (do not remove without re-reading the migration and
+/// `crates/review/src/fetcher/store.rs`'s upsert): `fetch_attempt`'s primary key is `url_hash`
+/// alone, inserted `ON CONFLICT (url_hash) DO NOTHING`, so `source_ip` records only the FIRST
+/// attacker whose event queued a given URL for fetching. A later IP that references the exact
+/// same URL is never linked here - this panel is "malware fetched from URLs this IP was the
+/// first to report", not "every malicious URL this IP has ever referenced". The template carries
+/// the same caveat visibly, so the UI never overstates the attribution.
+async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, AppError> {
+    let rows = sqlx::query(
+        "SELECT fa.url, fa.host, fa.pinned_ip, fa.status, fa.bytes, \
+                encode(fa.sha256, 'hex') AS sha256_hex, \
+                sa.detected, sa.total, sa.vt_link, sa.analyzed_at \
+         FROM fetch_attempt fa \
+         LEFT JOIN sample_analysis sa ON encode(fa.sha256, 'hex') = sa.sha256 \
+         WHERE fa.source_ip = $1::inet \
+         ORDER BY fa.last_attempt DESC LIMIT $2",
+    )
+    .bind(ip.to_string())
+    .bind(MALWARE_PAGE_SIZE)
+    .fetch_all(db)
+    .await?;
+
+    let mut malware = Vec::with_capacity(rows.len());
+    for row in rows {
+        let sha256_hex: Option<String> = row.try_get("sha256_hex")?;
+        let bytes: Option<i32> = row.try_get("bytes")?;
+        let analyzed_at: Option<DateTime<Utc>> = row.try_get("analyzed_at")?;
+        malware.push(MalwareRow {
+            url: row.try_get("url")?,
+            host: row.try_get("host")?,
+            pinned_ip: row.try_get("pinned_ip")?,
+            status: row.try_get("status")?,
+            bytes: bytes.map(|b| format_bytes(b.max(0) as u64)),
+            sha256_short: sha256_hex
+                .as_ref()
+                .map(|s| s[..s.len().min(12)].to_string()),
+            sha256: sha256_hex,
+            detected: row.try_get("detected")?,
+            total: row.try_get("total")?,
+            vt_link: row.try_get("vt_link")?,
+            analyzed_at: analyzed_at.map(format_timestamp),
+        });
+    }
+    Ok(malware)
 }
 
 /// Parses a `?cursor=<observed_at>,<id>` value (`format_cursor`'s own output - see that function's

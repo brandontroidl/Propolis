@@ -120,7 +120,10 @@ pub fn parse_url_parts(url: &str) -> Option<(String, String, Option<i32>)> {
 /// pre-filter accurate rather than merely lucky.
 async fn sync_new_events(pool: &PgPool) -> Result<(), sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT e.source_ip::text AS source_ip, e.metadata->>'url' AS url \
+        // host() not ::text: Postgres renders inet as "1.2.3.4/32" even for a plain address, and
+        // IpAddr::from_str rejects the prefix, so ::text + .parse().ok() silently yielded None and
+        // wrote NULL for every row - the attacker attribution was lost on every fetch.
+        "SELECT host(e.source_ip) AS source_ip, e.metadata->>'url' AS url \
          FROM event e \
          WHERE e.signal_type = 'honeypot_file_download' \
            AND e.metadata->>'url' IS NOT NULL \
@@ -171,7 +174,8 @@ pub async fn select_candidates(pool: &PgPool, batch: i64) -> Result<Vec<Candidat
     sync_new_events(pool).await?;
 
     let rows = sqlx::query(
-        "SELECT url_hash, url, host, scheme, port, source_ip::text AS source_ip, \
+        // host(), not ::text - see sync_new_events: the "/32" prefix ::text emits fails IpAddr parsing.
+        "SELECT url_hash, url, host, scheme, port, host(source_ip) AS source_ip, \
                 parent_hash, depth, attempts \
          FROM fetch_attempt \
          WHERE status = 'pending' \

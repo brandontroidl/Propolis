@@ -674,6 +674,49 @@ mod orchestration_tests {
         assert_eq!(std::fs::read(&spooled).unwrap(), bytes);
     }
 
+    // The attacker attribution on every fetch_attempt row was silently NULL in production:
+    // Postgres renders `inet` as "1.2.3.4/32" even for a plain address, so the old
+    // `source_ip::text` + `.parse::<IpAddr>().ok()` always failed the parse and the `.ok()`
+    // swallowed it, writing NULL. That severed every IP -> fetched-malware link. `host()` emits
+    // the bare address. This test fails against the `::text` spelling and passes with `host()`.
+    #[tokio::test]
+    async fn synced_rows_carry_the_reporting_attacker_ip() {
+        let pool = test_pool().await;
+        let ip = "203.0.113.77";
+        reset_all(&pool).await;
+
+        let url = "http://fetch8z.example/payload.bin".to_string();
+        append_event(
+            &pool,
+            download_event(ip, "sensor-a", &url, "2026-08-31T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        let candidates = store::select_candidates(&pool, 100).await.unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|c| c.url == url)
+            .expect("the synced url must be selectable");
+        assert_eq!(
+            candidate.source_ip,
+            Some(ip.parse().unwrap()),
+            "the reporting attacker ip must survive the round trip, not be silently dropped to None"
+        );
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT host(source_ip) FROM fetch_attempt WHERE url = $1")
+                .bind(&url)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some(ip),
+            "fetch_attempt.source_ip must be persisted, not NULL"
+        );
+    }
+
     // Fix round 2 (minor): a scheme RealFetcher cannot dispatch (ftp - real capture: the shell
     // sensor logs an `ftpget ftp://...` command as a honeypot_file_download event with the
     // ftp:// url verbatim) must never get a fetch_attempt row at all - it can only ever end up

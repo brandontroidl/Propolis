@@ -30,6 +30,10 @@ pub(crate) fn format_sensor_label(sensor: &str) -> String {
         "mysql" => "MySQL".into(),
         "postgresql" => "PostgreSQL".into(),
         "mongodb" => "MongoDB".into(),
+        // Acronyms the title-case fallback would mangle (mssql -> "Mssql", smtp -> "Smtp", adb -> "Adb").
+        "mssql" => "MSSQL".into(),
+        "smtp" => "SMTP".into(),
+        "adb" => "ADB".into(),
         "catchall" | "catchall-sensor" => "General".into(),
         other => {
             let mut s = other.to_string();
@@ -183,5 +187,15 @@ mod tests {
     fn format_relative_time_a_day_or_more_shows_days() {
         let dt = Utc::now() - Duration::seconds(90_000);
         assert_eq!(format_relative_time(dt), "1d ago");
+    }
+
+    #[test]
+    fn acronym_sensor_labels_are_fully_uppercased_not_title_cased() {
+        // The title-case fallback renders these as Mssql / Smtp / Adb - wrong for acronyms.
+        assert_eq!(format_sensor_label("mssql"), "MSSQL");
+        assert_eq!(format_sensor_label("smtp"), "SMTP");
+        assert_eq!(format_sensor_label("adb"), "ADB");
+        // format_activity inherits the fix via its `other => format_sensor_label(other)` delegation.
+        assert!(format_activity("mssql", "honeypot_login_attempt").contains("MSSQL"));
     }
 }

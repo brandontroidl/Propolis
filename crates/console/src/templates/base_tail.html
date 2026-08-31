@@ -52,7 +52,9 @@ function propolisInitCharts(root) {
   });
 }
 document.addEventListener('DOMContentLoaded', function () { propolisInitCharts(document); });
-document.addEventListener('htmx:afterSwap', function (e) { propolisInitCharts(e.detail.target); });
+// afterSettle, not afterSwap: HTMX's settle phase strips the canvas width/height/style Chart.js
+// set, clearing the chart. Initialising after settle lets Chart.js win the last write.
+document.addEventListener('htmx:afterSettle', function (e) { propolisInitCharts(e.detail.target); });
 </script>
 {% block topnav %}
 <div class="topnav">

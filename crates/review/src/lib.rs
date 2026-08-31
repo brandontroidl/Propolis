@@ -9,6 +9,7 @@ pub mod cli;
 pub mod fetcher;
 pub mod gatekeeper;
 pub mod queue;
+pub mod spool;
 pub mod submit;
 pub mod vendor;
 pub mod virustotal;

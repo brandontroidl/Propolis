@@ -18,15 +18,28 @@
 {% endif %}
 
 {% if samples %}
+{% import "macros.html" as m %}
 <div class="table-wrap">
 <table class="table-compact">
-  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>VirusTotal</th><th></th></tr></thead>
+  {# "Source" is the attacker this sample is attributable to, via the fetch that retrieved it
+     (fetch_attempt.source_ip). It is the FIRST reporter of each URL, and only covers fetched
+     samples - a directly uploaded body has no fetch row - so the header says so rather than
+     letting a blank cell read as "nobody delivered this". #}
+  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>Source <span class="dim">first reporter, fetched only</span></th><th>VirusTotal</th><th></th></tr></thead>
   <tbody>
     {% for s in samples %}
     <tr>
       <td class="mono" title="{{ s.sha256 }}">{{ s.sha256_short }}...</td>
       <td class="mono">{{ s.size }}</td>
       <td>{{ s.sensor }}</td>
+      <td class="ip">
+        {% if s.source_ips %}
+          {% for ip in s.source_ips %}{{ m.ip_evidence_link(ip) }}{% if not loop.last %} {% endif %}{% endfor %}
+          {% if s.more_source_ips > 0 %}<span class="dim">+{{ s.more_source_ips }} more</span>{% endif %}
+        {% else %}
+          <span class="dim">not linked</span>
+        {% endif %}
+      </td>
       <td>
         {% if s.vt_detected is defined and s.vt_detected is not none %}
           {% if s.vt_detected == -1 %}

@@ -27,6 +27,10 @@ struct SampleRow {
     vt_detected: Option<i32>,
     vt_total: Option<i32>,
     vt_link: String,
+    /// Source IPs this sample is attributable to, newest first, and whether more exist than are
+    /// shown. Empty for a sample nothing links to yet - see `sample_source_ips`.
+    source_ips: Vec<String>,
+    more_source_ips: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,8 +82,84 @@ async fn fetch_status_counts(pool: &sqlx::PgPool) -> Vec<FetchStatusCount> {
         .collect()
 }
 
+/// How many source IPs to show inline per sample before collapsing to a "+N more" count.
+const MAX_SOURCE_IPS_SHOWN: usize = 3;
+
+/// sha256 (lowercase hex) -> the source IPs that sample is attributable to, newest attempt first.
+///
+/// The link is `fetch_attempt`: the fetcher records the attacker IP whose event reported the URL it
+/// retrieved, alongside the sha256 of what came back. `fetch_attempt.sha256` is BYTEA while the
+/// spool filenames (and `sample_analysis.sha256`) are lowercase hex, hence `encode(...)`.
+///
+/// Two honest limits, both surfaced in the UI rather than papered over:
+/// - `fetch_attempt` is keyed by `url_hash` and inserted `ON CONFLICT DO NOTHING`, so `source_ip`
+///   is the FIRST attacker that reported each URL, not every one that referenced it.
+/// - It covers FETCHED samples only. A body uploaded directly to a sensor has no `fetch_attempt`
+///   row, so it shows no source here until the capture/observation link lands.
+/// Rows whose `source_ip` was never recorded (NULL) are simply absent.
+async fn sample_source_ips(
+    pool: &sqlx::PgPool,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT encode(fa.sha256, 'hex') AS sha, host(fa.source_ip) AS ip \
+         FROM fetch_attempt fa \
+         WHERE fa.sha256 IS NOT NULL AND fa.source_ip IS NOT NULL \
+         ORDER BY fa.last_attempt DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    group_source_ips(rows)
+}
+
+/// Groups `(sha, ip)` pairs by sha, preserving input order (the query's newest-attempt-first) and
+/// dropping repeats: one attacker can appear on several URLs that resolved to the same body, and it
+/// should be listed once. Split from the query so the grouping is testable without a database.
+fn group_source_ips(
+    rows: Vec<(String, String)>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (sha, ip) in rows {
+        let ips = map.entry(sha).or_default();
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_ips_group_by_sha_dedup_and_keep_query_order() {
+        let map = group_source_ips(vec![
+            ("aa".to_string(), "203.0.113.1".to_string()),
+            ("aa".to_string(), "203.0.113.2".to_string()),
+            // Same attacker on a second URL that resolved to the same body: listed once.
+            ("aa".to_string(), "203.0.113.1".to_string()),
+            ("bb".to_string(), "203.0.113.9".to_string()),
+        ]);
+
+        assert_eq!(
+            map.get("aa").unwrap(),
+            &vec!["203.0.113.1".to_string(), "203.0.113.2".to_string()],
+            "dedup must keep the first occurrence and the query's newest-first order"
+        );
+        assert_eq!(map.get("bb").unwrap(), &vec!["203.0.113.9".to_string()]);
+        assert!(
+            map.get("cc").is_none(),
+            "a sample nothing links to must have no entry, so the row renders 'not linked'"
+        );
+    }
+}
+
 async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let base = base_context(&state.db, state.startup_time, state.version).await;
+    let source_ips_by_sha = sample_source_ips(&state.db).await;
 
     let vt_results: std::collections::HashMap<String, (i32, i32, String)> =
         sqlx::query_as::<_, (String, i32, i32, String)>(
@@ -100,6 +180,12 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                     let name = entry.file_name().to_string_lossy().to_string();
                     if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
                         let vt = vt_results.get(&name);
+                        let all_ips = source_ips_by_sha.get(&name);
+                        let source_ips: Vec<String> = all_ips
+                            .map(|v| v.iter().take(MAX_SOURCE_IPS_SHOWN).cloned().collect())
+                            .unwrap_or_default();
+                        let more_source_ips =
+                            all_ips.map_or(0, |v| v.len().saturating_sub(MAX_SOURCE_IPS_SHOWN));
                         samples.push(SampleRow {
                             sha256_short: name[..12].to_string(),
                             sha256: name,
@@ -108,6 +194,8 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                             vt_detected: vt.map(|(d, _, _)| *d),
                             vt_total: vt.map(|(_, t, _)| *t),
                             vt_link: vt.map(|(_, _, l)| l.clone()).unwrap_or_default(),
+                            source_ips,
+                            more_source_ips,
                         });
                     }
                 }

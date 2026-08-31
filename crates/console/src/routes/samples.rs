@@ -168,13 +168,9 @@ async fn download_sample(AxumPath(sha256): AxumPath<String>) -> Response {
 }
 
 fn spool_dirs() -> Vec<(&'static str, PathBuf)> {
-    vec![
-        ("ssh", PathBuf::from("/var/spool/propolis/ssh")),
-        ("adb", PathBuf::from("/var/spool/propolis/adb")),
-        ("ftp", PathBuf::from("/var/spool/propolis/ftp")),
-        ("catchall", PathBuf::from("/var/spool/propolis/catchall")),
-        ("fetched", PathBuf::from("/var/spool/propolis/fetched")),
-    ]
+    let mut dirs = review::spool::body_spool_dirs();
+    dirs.push(("fetched", PathBuf::from("/var/spool/propolis/fetched")));
+    dirs
 }
 
 fn format_bytes(b: u64) -> String {

@@ -44,8 +44,8 @@ marketing-grade claims are called out where they are not source-evidenced.
 
 ## Key cautions before you commit
 
-These are the load-bearing constraints an evaluator most often misses. None is a
-defect to discover later - each is stated plainly up front.
+These are the constraints an evaluator most often misses. None is a defect to
+discover later - each is stated up front.
 
 - **No in-process TLS.** The console is plain HTTP on a loopback `TcpListener`.
   Any transport encryption is operator-provided (e.g. a reverse proxy). See

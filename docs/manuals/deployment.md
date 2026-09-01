@@ -17,8 +17,8 @@ sequence and the gates, not a re-listing.
 > Propolis is source-available and actively developed, with one tagged release
 > (`v0.1.0`) and a current tree at `0.3.0` (untagged). It carries **no**
 > production, security, legal, or regulatory certification. The steps below
-> reduce risk; they do not confer assurance. Residual risks remain even when
-> every item is done - see
+> reduce risk, not assurance - residual risks remain even when every item is
+> done: see
 > [`../security/residual-risks.md`](../security/residual-risks.md).
 
 > [!WARNING]

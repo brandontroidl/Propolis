@@ -125,7 +125,7 @@ per-protocol capture behavior is [`reference/sensor-behavior`](../reference/sens
 ## The invariants a change must not break
 
 These are guarded by tests and CI; a change that violates one fails the gate (or
-should be rejected in review). They are the load-bearing contracts of the system:
+should be rejected in review). They are the contracts the system depends on:
 
 | Invariant | What it protects | Enforced by |
 |---|---|---|

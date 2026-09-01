@@ -89,9 +89,9 @@ any insert whose `prev_hash` does not match the chain head, and the production a
 role has `UPDATE/DELETE/TRUNCATE` on `event` revoked. The chain guarantees
 **tamper-evidence**, not confidentiality and not protection against a DB superuser deleting
 rows. Detail owned by [storage](../architecture/storage.md) and
-[database reference](../reference/database.md). Note that any deletion (for example a manual
-prune) breaks chain continuity from that point forward - expected, but record it so a later
-verifier does not read the break as tampering.
+[database reference](../reference/database.md). Any deletion (for example a manual
+prune) breaks chain continuity from that point forward - expected, but record it so a
+later verifier does not mistake it for tampering.
 
 ## 5. Handle captured malware safely
 

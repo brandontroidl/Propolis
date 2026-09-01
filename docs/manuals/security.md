@@ -31,7 +31,7 @@ adversaries: a malicious operator, a compromised kernel, toolchain supply-chain
 compromise. Full statement, with the asset-to-control table:
 [threat model](../security/threat-model.md).
 
-## The load-bearing invariants
+## The critical invariants
 
 ### Never-execute
 

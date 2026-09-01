@@ -44,8 +44,8 @@ protocol capture behavior is
 A sensor emits raw facts only, as a frozen NDJSON `SensorEvent` (one line per
 event, `WIRE_VERSION = 1`). It carries `source_ip`, `wan_ip`, `sensor`,
 `signal_type`, `protocol`, `authenticated`, `observed_at`, free-form `metadata`,
-an optional `sample` reference, and an optional `session_id`. Crucially, a sensor
-never computes `weight`, `confidence`, or `category` - those are derived
+an optional `sample` reference, and an optional `session_id`. A sensor never
+computes `weight`, `confidence`, or `category` - those are derived
 downstream by intake from a single-source-of-truth table. The exact field list,
 the sample side-channel, and the signal taxonomy are owned by
 [`reference/events-and-signals`](../reference/events-and-signals.md).
@@ -98,8 +98,8 @@ review, and feed connect is [`architecture/pipeline`](../architecture/pipeline.m
 
 ### The confirmed-real gate
 
-This is the load-bearing distinction for anyone treating the data as
-intelligence. An IP earns a feed tier or a vendor report only after it latches
+This is the critical distinction for anyone treating the data as intelligence.
+An IP earns a feed tier or a vendor report only after it latches
 `has_confirmed_real`, which requires **an authenticated TCP honeypot event**
 (`protocol == Tcp && authenticated && category == Honeypot`). UDP/ICMP,
 unauthenticated, or non-honeypot traffic never latches it. Weight and confidence

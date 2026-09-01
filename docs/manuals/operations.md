@@ -33,8 +33,8 @@ upgrade path are owned by [service lifecycle](../operations/service-lifecycle.md
 Key points to internalize:
 
 - The daemon fails fast (exit 1) on bad config, an unreachable DB, or a migration
-  error rather than starting degraded; a config/DB/migration fault is visible as an
-  immediate exit in `journalctl`, not a silent partial run.
+  error rather than starting degraded - visible as an immediate exit in
+  `journalctl`, not a silent partial run.
 - The daemon uses `Restart=on-failure` (its in-process supervisor restarts panicked
   subsystems); sensors use `Restart=always`. A daemon process exit is therefore a
   fail-fast or a clean operator stop, not something to auto-restart into the same
@@ -116,8 +116,8 @@ recommended procedure built from `pg_dump`/`tar`, the restore steps, and the ver
 checklist are owned by [backup and restore](../operations/backup-and-restore.md).
 
 > **Recovery is unverified until you restore from it.** A single-node deployment has no
-> built-in redundancy; a backup you have never restored is a hypothesis. Rehearse the
-> restore end to end against a scratch environment and record the date and result.
+> built-in redundancy - rehearse the restore end to end against a scratch environment
+> and record the date and result.
 
 ## Routine procedures and config changes
 

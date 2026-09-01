@@ -112,11 +112,26 @@ fn max_source_ips_shown() -> usize {
 async fn sample_source_ips(
     pool: &sqlx::PgPool,
 ) -> std::collections::HashMap<String, Vec<String>> {
+    // Unions the two ways a sample is attributable: an address that UPLOADED it to a sensor (the
+    // event carries the sha - a first-party observation, and the only link an FTP/SCP upload has,
+    // since it never goes through the fetcher), and an address whose reported url the fetcher
+    // retrieved. Uploads sort first so the stronger attribution is what gets shown when the
+    // per-sample display cap truncates.
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT encode(fa.sha256, 'hex') AS sha, host(fa.source_ip) AS ip \
-         FROM fetch_attempt fa \
-         WHERE fa.sha256 IS NOT NULL AND fa.source_ip IS NOT NULL \
-         ORDER BY fa.last_attempt DESC",
+        "SELECT sha, ip FROM ( \
+           SELECT e.metadata->>'sample_sha256' AS sha, host(e.source_ip) AS ip, \
+                  0 AS rank, max(e.observed_at) AS at \
+           FROM event e \
+           WHERE e.metadata->>'sample_sha256' IS NOT NULL \
+           GROUP BY 1, 2 \
+           UNION ALL \
+           SELECT encode(fa.sha256, 'hex') AS sha, host(fa.source_ip) AS ip, \
+                  1 AS rank, max(fa.last_attempt) AS at \
+           FROM fetch_attempt fa \
+           WHERE fa.sha256 IS NOT NULL AND fa.source_ip IS NOT NULL \
+           GROUP BY 1, 2 \
+         ) linked \
+         ORDER BY rank, at DESC",
     )
     .fetch_all(pool)
     .await

@@ -109,19 +109,23 @@
   {% endif %}
 </div>
 
-{# fetch_attempt.source_ip only records the FIRST attacker whose event queued a given URL
-   (ON CONFLICT (url_hash) DO NOTHING - see routes/detail.rs's fetch_malware_rows doc comment),
-   so this panel is "malware fetched from URLs this IP was first to report", never "every
-   malicious URL this IP has referenced". The dim caveat below keeps that visible in the UI. #}
+{# Two provenance kinds, shown together but never conflated:
+   - uploaded: this address handed the body to a sensor (FTP STOR, SCP, ADB push). The event
+     carries the sha, so the link is a first-party observation.
+   - fetched: the fetcher retrieved a url this address reported. fetch_attempt.source_ip records
+     only the FIRST reporter of each url (ON CONFLICT (url_hash) DO NOTHING), so it is never
+     "every malicious url this IP referenced".
+   The Origin column and the dim caveat keep that difference visible. #}
 <div class="panel">
-  <div class="panel-head">Malware fetched from this IP's URLs <span class="dim">first reporter of each URL</span></div>
+  <div class="panel-head">Malware from this IP <span class="dim">uploaded directly, or fetched from a URL it was first to report</span></div>
   {% if malware %}
   <table class="table-compact">
-    <thead><tr><th>URL</th><th>Payload host</th><th>Size</th><th>SHA-256</th><th>Fetch status</th><th>VirusTotal</th><th>Scanned</th></tr></thead>
+    <thead><tr><th>Origin</th><th>File / URL</th><th>Sensor / payload host</th><th>Size</th><th>SHA-256</th><th>Status</th><th>VirusTotal</th><th>Scanned</th></tr></thead>
     <tbody>
       {% for m in malware %}
       <tr>
-        <td class="mono" style="max-width:24rem;overflow-wrap:anywhere;">{{ m.url }}</td>
+        <td>{% if m.origin == "uploaded" %}<span class="state-pill state-rejected">uploaded</span>{% else %}<span class="state-pill state-snoozed">fetched</span>{% endif %}</td>
+        <td class="mono" style="max-width:24rem;overflow-wrap:anywhere;">{% if m.url %}{{ m.url }}{% else %}<span class="dim">(no name)</span>{% endif %}</td>
         <td class="mono">{{ m.host }}{% if m.pinned_ip and m.pinned_ip != m.host %} <span class="dim">({{ m.pinned_ip }})</span>{% endif %}</td>
         <td class="mono">{% if m.bytes %}{{ m.bytes }}{% else %}<span class="dim">-</span>{% endif %}</td>
         <td class="mono">{% if m.sha256_short %}<span title="{{ m.sha256 }}">{{ m.sha256_short }}...</span>{% else %}<span class="dim">-</span>{% endif %}</td>
@@ -145,7 +149,7 @@
     </tbody>
   </table>
   {% else %}
-  <p class="empty-line">no fetched samples linked to this address</p>
+  <p class="empty-line">no samples linked to this address</p>
   {% endif %}
 </div>
 

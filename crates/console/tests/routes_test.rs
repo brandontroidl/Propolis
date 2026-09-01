@@ -1838,6 +1838,68 @@ async fn seed_fetch_attempt_with_analysis(
     sha256_hex
 }
 
+/// A body UPLOADED straight to a sensor (FTP STOR, SCP, ADB push) never goes through the fetcher,
+/// so it has no `fetch_attempt` row. Attribution comes from the event itself, which carries the
+/// sha - a first-party observation, and the strongest link available. This shipped broken: an FTP
+/// attacker uploaded three samples and the panel still read "no samples linked to this address",
+/// because the query only ever asked `fetch_attempt`.
+#[sqlx::test(migrations = false)]
+async fn detail_links_a_directly_uploaded_sample_to_its_uploader(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.81";
+    seed_recommended(&pool, ip, 60).await;
+
+    append_event(
+        &pool,
+        ev_with_session(
+            ip,
+            "ftp",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": "52ec3ba075a5aabbccddeeff00112233445566778899aabbccddeeff00112233",
+                "sample_orig_name": "info.zip",
+                "sample_size": 1024,
+            }),
+            Uuid::now_v7(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("52ec3ba075a5"),
+        "the uploaded sample's sha must appear on its uploader's page: {body}"
+    );
+    assert!(
+        body.contains("info.zip"),
+        "the uploaded file name must appear: {body}"
+    );
+    assert!(
+        body.contains("uploaded"),
+        "the row must be labelled as a direct upload, not presented as a fetch: {body}"
+    );
+    assert!(
+        !body.contains("no samples linked to this address"),
+        "the empty state must not render when an upload links to this ip: {body}"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn detail_shows_linked_malware_fetched_from_this_ips_urls(pool: PgPool) {
     migrate(&pool).await;
@@ -1859,7 +1921,7 @@ async fn detail_shows_linked_malware_fetched_from_this_ips_urls(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains("Malware fetched from this IP's URLs"),
+        body.contains("Malware from this IP"),
         "malware panel heading missing: {body}"
     );
     // minijinja's autoescaper HTML-entity-escapes `/` (`&#x2f;`) inside `{{ m.url }}` - assert on
@@ -1882,8 +1944,10 @@ async fn detail_shows_linked_malware_fetched_from_this_ips_urls(pool: PgPool) {
         body.contains("12/70 detected"),
         "VT verdict missing: {body}"
     );
+    // The panel must keep saying that a FETCHED link is first-reporter-only, so an inference is
+    // never read as a direct observation. Asserted on the substance, not the exact sentence.
     assert!(
-        body.contains("first reporter of each URL"),
+        body.contains("first to report"),
         "attribution caveat missing: {body}"
     );
 }
@@ -1908,7 +1972,7 @@ async fn detail_shows_empty_state_when_no_fetches_link_to_this_ip(pool: PgPool) 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains("no fetched samples linked to this address"),
+        body.contains("no samples linked to this address"),
         "malware panel empty state missing: {body}"
     );
 }

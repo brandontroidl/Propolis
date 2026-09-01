@@ -197,6 +197,9 @@ struct ServiceRow {
 /// pending fetch is evidence too.
 #[derive(Debug, Serialize)]
 struct MalwareRow {
+    /// "uploaded" (the address handed the body to a sensor - a first-party observation) or
+    /// "fetched" (the fetcher retrieved a url this address reported - first-reporter only).
+    origin: String,
     url: String,
     host: String,
     pinned_ip: Option<String>,
@@ -726,14 +729,39 @@ async fn fetch_evidence_rows(
 /// first to report", not "every malicious URL this IP has ever referenced". The template carries
 /// the same caveat visibly, so the UI never overstates the attribution.
 async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, AppError> {
+    // Two ways a sample is attributable to an address, unioned so the panel shows both:
+    //
+    // 1. UPLOADED - the address handed the body to a sensor (FTP STOR, SSH/SCP, ADB push). The
+    //    event itself carries the sha, so this is a first-party observation, the strongest link
+    //    there is. It was missing until an FTP attacker uploaded three samples and the panel still
+    //    read "not linked" - the sensor had the evidence, the panel just never asked for it.
+    // 2. FETCHED - the fetcher retrieved a URL this address reported. Weaker: it is the FIRST
+    //    reporter of that url, not necessarily every one that referenced it.
+    //
+    // `origin` distinguishes them in the UI so an operator is never shown an inference where a
+    // direct observation exists, or the reverse.
     let rows = sqlx::query(
-        "SELECT fa.url, fa.host, fa.pinned_ip, fa.status, fa.bytes, \
+        "SELECT 'uploaded' AS origin, \
+                coalesce(e.metadata->>'sample_orig_name', '') AS url, \
+                e.sensor AS host, \
+                NULL::text AS pinned_ip, \
+                'captured' AS status, \
+                (e.metadata->>'sample_size')::int AS bytes, \
+                e.metadata->>'sample_sha256' AS sha256_hex, \
+                sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
+                max(e.observed_at) OVER (PARTITION BY e.metadata->>'sample_sha256') AS sort_at \
+         FROM event e \
+         LEFT JOIN sample_analysis sa ON e.metadata->>'sample_sha256' = sa.sha256 \
+         WHERE e.source_ip = $1::inet AND e.metadata->>'sample_sha256' IS NOT NULL \
+         UNION ALL \
+         SELECT 'fetched' AS origin, fa.url, fa.host, fa.pinned_ip, fa.status, fa.bytes, \
                 encode(fa.sha256, 'hex') AS sha256_hex, \
-                sa.detected, sa.total, sa.vt_link, sa.analyzed_at \
+                sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
+                fa.last_attempt AS sort_at \
          FROM fetch_attempt fa \
          LEFT JOIN sample_analysis sa ON encode(fa.sha256, 'hex') = sa.sha256 \
          WHERE fa.source_ip = $1::inet \
-         ORDER BY fa.last_attempt DESC LIMIT $2",
+         ORDER BY sort_at DESC LIMIT $2",
     )
     .bind(ip.to_string())
     .bind(MALWARE_PAGE_SIZE)
@@ -746,6 +774,7 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
         let bytes: Option<i32> = row.try_get("bytes")?;
         let analyzed_at: Option<DateTime<Utc>> = row.try_get("analyzed_at")?;
         malware.push(MalwareRow {
+            origin: row.try_get("origin")?,
             url: row.try_get("url")?,
             host: row.try_get("host")?,
             pinned_ip: row.try_get("pinned_ip")?,

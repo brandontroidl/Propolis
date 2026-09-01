@@ -21,11 +21,12 @@
 {% import "macros.html" as m %}
 <div class="table-wrap">
 <table class="table-compact">
-  {# "Source" is the attacker this sample is attributable to, via the fetch that retrieved it
-     (fetch_attempt.source_ip). It is the FIRST reporter of each URL, and only covers fetched
-     samples - a directly uploaded body has no fetch row - so the header says so rather than
-     letting a blank cell read as "nobody delivered this". #}
-  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>Source <span class="dim">first reporter, fetched only</span></th><th>VirusTotal</th><th></th></tr></thead>
+  {# "Source" is the attacker this sample is attributable to, either way it can arrive:
+     an address that UPLOADED it to a sensor (the event carries the sha - the only link an
+     FTP/SCP upload has, since it never goes through the fetcher), or one whose reported url the
+     fetcher retrieved (fetch_attempt records only the FIRST reporter of each url). Uploaders sort
+     first, so the stronger attribution survives the display cap. #}
+  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>Source <span class="dim">uploader, or first reporter of a fetched URL</span></th><th>VirusTotal</th><th></th></tr></thead>
   <tbody>
     {% for s in samples %}
     <tr>

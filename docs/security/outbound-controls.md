@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-01
 -->
 
 # Outbound controls
@@ -101,11 +101,21 @@ otherwise egress-free enrichment" and forbids using PTR as a suppression signal
 ### 5. Ops-alert ntfy (`propolis`)
 
 A `reqwest` POST to the operator's own ntfy server
-(`crates/propolis/src/ops_alert/dispatch.rs`). Gated `enabled`, default false;
-when enabled, `ntfy_url` and `ntfy_topic` become **required** and startup fails
-closed otherwise - "a monitor that cannot page must not start silently"
-(`crates/propolis/src/ops_alert/config.rs:10-15`). Alert body text is sanitized
-before send (`dispatch.rs:4`); each attempt carries a 30s timeout backstop
+(`crates/propolis/src/ops_alert/dispatch.rs`). Gated `enabled`, default false.
+
+**Enabling alerting does not by itself create an egress path.** With
+`PROPOLIS_OPS_ENABLED=true` and no ntfy target configured, alerts are delivered
+to a local sink that logs them at ERROR level (`dispatch.rs`'s `LogPoster`) and
+**nothing leaves the host**. Requiring an external service was previously the
+condition of alerting at all, which meant a node without one ran with no
+self-monitoring; the local sink removes that trade.
+
+A **half**-configured target still fails closed: a url without a topic (or the
+reverse) aborts startup, because that is an operator mistake rather than a
+choice of sink, and silently downgrading it would page nothing while looking
+configured (`crates/propolis/src/ops_alert/config.rs`). Egress happens only when
+both `ntfy_url` and `ntfy_topic` are set. Alert body text is sanitized before
+send (`dispatch.rs:4`); each attempt carries a 30s timeout backstop
 (`dispatch.rs:22`).
 
 ### Not an egress path: GeoLite2

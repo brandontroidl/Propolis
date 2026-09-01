@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-01
 -->
 
 # Environment variables
@@ -480,6 +480,22 @@ Invalid or zero bound → **silent default**, not abort.
   sessions are in-memory (dropped on restart anyway).
 - **TTL/interval units**: feed TTL variables are HOURS (×3600 → Duration); most
   timeouts are MS or SECS as named in the variable suffix.
+
+## Deploy-script variables (`deploy/blocklist-sync.sh`)
+
+Read by the blocklist publish script, not by any daemon, so they are set in the
+**cron environment** rather than an `/etc/propolis/*.env` file the units load.
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_FEED_OUTPUT_DIR` | no | auto-detected | the publisher output holding `manifest.json`; when unset the script probes `<spool>/feed/current` then the older flat `<spool>/feed`, so both layouts work |
+| `PROPOLIS_BLOCKLIST_REPO` | no | `/var/lib/propolis/blocklist-repo` | the git checkout that is committed and pushed |
+| `PROPOLIS_BLOCKLIST_SSH_KEY` | no | unset | path to a **passphraseless** deploy key for the push. Set for cron: cron has no ssh-agent, so a passphrase-protected key cannot be used non-interactively. When set, the script exports `GIT_SSH_COMMAND` with `IdentitiesOnly=yes`; a configured-but-unreadable key **fails closed (exit 1)** rather than falling back to another identity, since a fallback that succeeds by hand and fails under cron is the exact trap being avoided. When unset in a non-interactive run with no agent, the script warns before pushing. |
+
+Naming the key here rather than in the checkout's `core.sshCommand` is
+deliberate: that git config is box-local state outside version control, and it
+has reverted to a passphrase-protected key in practice, silently restoring the
+cron failure it was meant to fix.
 
 ## Related
 

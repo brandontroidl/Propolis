@@ -4,7 +4,7 @@ audience: evaluator
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-01
 -->
 
 # Limitations
@@ -65,4 +65,7 @@ locally but not pushed anywhere. See
 Sensors are egress-free, but the platform has a small number of enrichment/reporting
 egress paths (VirusTotal, vendor abuse submitters, reverse DNS, ntfy alerts). All
 default off, but an operator enabling them takes on the associated outbound exposure.
+Operational self-alerting is the one exception worth stating plainly: it can be
+enabled with **no egress at all**, delivering alerts to the local log instead of
+ntfy, so monitoring the node does not require accepting an outbound path.
 See [`../security/outbound-controls.md`](../security/outbound-controls.md).

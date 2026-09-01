@@ -91,7 +91,11 @@ mod tests {
 
     #[test]
     fn ordinary_public_addresses_are_not_reserved() {
-        for ip in ["8.8.8.8", "58.151.173.28", "203.0.114.1", "2606:4700::1"] {
+        // Deliberately NOT RFC5737 documentation space: those ranges are themselves reserved (see
+        // the test above), so this case needs globally-routable addresses. Uses only well-known
+        // public resolver anycast addresses, never a real address observed in honeypot traffic -
+        // an attacker's IP must not be committed to the repo.
+        for ip in ["8.8.8.8", "1.1.1.1", "9.9.9.9", "2606:4700::1"] {
             assert!(
                 !is_reserved_ip(ip.parse().unwrap()),
                 "{ip} must not be reserved"

@@ -38,12 +38,19 @@ use review::vendor::{AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAda
 /// scanner's own `spool_dirs` below and `console/src/routes/samples.rs`'s identical list - not an
 /// operator env var, same convention as every other sensor's `SPOOL_MAX_FILE_SIZE`/
 /// `SPOOL_GLOBAL_BUDGET` constants.
-const FETCH_SPOOL_DIR: &str = "/var/spool/propolis/fetched";
+/// Resolved from the shared spool root, never hardcoded, so it follows `PROPOLIS_SPOOL_ROOT` like
+/// every other directory under the tree and a deployment that relocates the spool does not leave the
+/// fetcher writing somewhere the scanner and console do not look.
+fn fetch_spool_dir() -> std::path::PathBuf {
+    review::spool::spool_subdir("fetched")
+}
 
 /// Root of the capture spool the ops-monitor's capacity condition watches for free space. The
 /// per-sensor and fetched subdirectories all live under it, so it is the volume that fills as
 /// captured samples accumulate.
-const OPS_SPOOL_ROOT: &str = "/var/spool/propolis";
+fn ops_spool_root() -> std::path::PathBuf {
+    review::spool::spool_root()
+}
 
 /// Global byte budget for the fetched-malware spool. Matches `review::fetcher`'s own orchestration
 /// tests' convention (10 MB/file, 1 GB total) rather than the smaller 100 MB the upload-capture
@@ -816,7 +823,7 @@ async fn main() {
             let vt_config = vt_config.clone();
             async move {
                 let mut spool_dirs = review::spool::body_spool_dirs();
-                spool_dirs.push(("fetched", std::path::PathBuf::from(FETCH_SPOOL_DIR)));
+                spool_dirs.push(("fetched", fetch_spool_dir()));
                 // One budget owned across every scan cycle so the cap is per DAY, not per cycle.
                 let mut budget = review::virustotal::DailyBudget::new(
                     vt_config.daily_limit,
@@ -901,11 +908,11 @@ async fn main() {
                         );
                     }
 
-                    let spool_dir = std::path::PathBuf::from(FETCH_SPOOL_DIR);
+                    let spool_dir = fetch_spool_dir();
                     if let Err(e) = std::fs::create_dir_all(&spool_dir) {
                         tracing::error!(
                             error = %e,
-                            path = FETCH_SPOOL_DIR,
+                            path = %fetch_spool_dir().display(),
                             "fetcher: failed to create spool directory, refusing to run"
                         );
                         return;
@@ -1065,7 +1072,7 @@ async fn main() {
         let ops_supervisor = supervisor_state.clone();
         let ops_intake = intake_progress.clone();
         let pg_data_volume = config.cursor_dir.clone();
-        let spool_dir = PathBuf::from(OPS_SPOOL_ROOT);
+        let spool_dir = ops_spool_root();
         let feed_marker = ops_alert::conditions::feed::marker_path(&config.feed_output_dir);
         let feed_build_interval = config.feed_build_interval;
 

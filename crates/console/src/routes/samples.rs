@@ -83,7 +83,19 @@ async fn fetch_status_counts(pool: &sqlx::PgPool) -> Vec<FetchStatusCount> {
 }
 
 /// How many source IPs to show inline per sample before collapsing to a "+N more" count.
-const MAX_SOURCE_IPS_SHOWN: usize = 3;
+/// Overridable with `PROPOLIS_CONSOLE_MAX_SOURCE_IPS` for an operator whose feed has many
+/// attackers per sample; a blank, zero, or unparseable value falls back to the default rather than
+/// rendering an empty column (zero never means unlimited).
+const DEFAULT_MAX_SOURCE_IPS_SHOWN: usize = 3;
+const ENV_MAX_SOURCE_IPS: &str = "PROPOLIS_CONSOLE_MAX_SOURCE_IPS";
+
+fn max_source_ips_shown() -> usize {
+    std::env::var(ENV_MAX_SOURCE_IPS)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_SOURCE_IPS_SHOWN)
+}
 
 /// sha256 (lowercase hex) -> the source IPs that sample is attributable to, newest attempt first.
 ///
@@ -172,6 +184,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         .map(|(sha, d, t, l)| (sha, (d, t, l)))
         .collect();
 
+    let max_source_ips = max_source_ips_shown();
     let mut samples = Vec::new();
     for (sensor, dir) in spool_dirs() {
         if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
@@ -182,10 +195,10 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                         let vt = vt_results.get(&name);
                         let all_ips = source_ips_by_sha.get(&name);
                         let source_ips: Vec<String> = all_ips
-                            .map(|v| v.iter().take(MAX_SOURCE_IPS_SHOWN).cloned().collect())
+                            .map(|v| v.iter().take(max_source_ips).cloned().collect())
                             .unwrap_or_default();
                         let more_source_ips =
-                            all_ips.map_or(0, |v| v.len().saturating_sub(MAX_SOURCE_IPS_SHOWN));
+                            all_ips.map_or(0, |v| v.len().saturating_sub(max_source_ips));
                         samples.push(SampleRow {
                             sha256_short: name[..12].to_string(),
                             sha256: name,
@@ -257,7 +270,9 @@ async fn download_sample(AxumPath(sha256): AxumPath<String>) -> Response {
 
 fn spool_dirs() -> Vec<(&'static str, PathBuf)> {
     let mut dirs = review::spool::body_spool_dirs();
-    dirs.push(("fetched", PathBuf::from("/var/spool/propolis/fetched")));
+    // Resolved off the same spool root as the sensor dirs, never a hardcoded path: the fetcher's
+    // output moves with PROPOLIS_SPOOL_ROOT like everything else under the tree.
+    dirs.push(("fetched", review::spool::spool_subdir("fetched")));
     dirs
 }
 

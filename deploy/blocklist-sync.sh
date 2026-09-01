@@ -16,10 +16,37 @@
 # Paths (override via environment; both are auto-detected when unset):
 #   PROPOLIS_FEED_OUTPUT_DIR   the publisher's flat output holding manifest.json
 #   PROPOLIS_BLOCKLIST_REPO    the git checkout that is pushed        (default below)
+#   PROPOLIS_BLOCKLIST_SSH_KEY passphraseless deploy key used for the push (see below)
 set -euo pipefail
 
 # Where this script lives, so it can publish its sibling README alongside the feed.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# --- Push authentication ------------------------------------------------------------------------
+# Cron has no ssh-agent, so a passphrase-protected key cannot be used non-interactively: the push
+# hangs or fails while the same command run by hand succeeds against the operator's loaded agent.
+# The historical fix was `git config core.sshCommand` inside the repo checkout, which is box-local
+# state living outside version control - it has silently reverted more than once, each time turning
+# the hourly publish back into a silent failure that only surfaced as a stale feed.
+#
+# So the key is named HERE, from the environment, and the script fails closed rather than letting
+# ssh fall back to whatever identity happens to be available: a fallback that works interactively
+# and fails under cron is the exact trap this is meant to remove.
+KEY="${PROPOLIS_BLOCKLIST_SSH_KEY:-}"
+if [ -n "$KEY" ]; then
+  if [ ! -r "$KEY" ]; then
+    echo "blocklist-sync: PROPOLIS_BLOCKLIST_SSH_KEY=$KEY is not readable - refusing to push with" \
+         "an unintended identity (interactive runs would silently succeed via an agent that cron" \
+         "does not have)" >&2
+    exit 1
+  fi
+  export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes"
+elif [ -z "${SSH_AUTH_SOCK:-}" ] && [ ! -t 0 ]; then
+  # Non-interactive, no agent, no explicit key: the classic cron configuration in which the push is
+  # about to fail. Say so up front so the cause is in the log next to the failure, not inferred.
+  echo "blocklist-sync: WARNING no PROPOLIS_BLOCKLIST_SSH_KEY set and no ssh-agent in this" \
+       "environment; the push will fail if the remote needs a passphrase-protected key" >&2
+fi
 
 # --- Resolve the feed source ------------------------------------------------------------------
 # Prefer an explicit override; otherwise take whichever standard location actually holds a build.

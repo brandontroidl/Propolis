@@ -184,8 +184,8 @@ impl FakeShell {
             let mut evs = vec![self.command_event(metadata)];
             // A URL buried in a `sh -c "wget ...; ..."` chain (where the tokenizer's split loses the
             // quoting) is recovered by scanning the raw line. `download_target` returns a real token.
-            if let Some(url) = download_target(&parts)
-                .or_else(|| url_if_fetch_line(&decoded).map(str::to_string))
+            if let Some(url) =
+                download_target(&parts).or_else(|| url_if_fetch_line(&decoded).map(str::to_string))
             {
                 let sanitized_url = sanitize_value(&url, MAX_URL_LEN);
                 evs.push(SensorEvent {
@@ -457,7 +457,11 @@ fn ftpget_url(args: &[&str]) -> Option<String> {
         }
     }
     let host = *positional.first()?;
-    let file = if positional.len() >= 2 { positional.last().copied() } else { None };
+    let file = if positional.len() >= 2 {
+        positional.last().copied()
+    } else {
+        None
+    };
     Some(join_fetch_url("ftp", host, port, file))
 }
 

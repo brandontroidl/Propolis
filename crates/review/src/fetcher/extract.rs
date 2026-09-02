@@ -483,7 +483,10 @@ mod tests {
         let encoded = super::super::vbe::tests::encode(plain);
         // Sanity: the encoded form must not contain the url in the clear, or this test proves
         // nothing about decoding.
-        assert!(!encoded.contains("http://"), "fixture leaked the url in the clear");
+        assert!(
+            !encoded.contains("http://"),
+            "fixture leaked the url in the clear"
+        );
         assert_eq!(
             extract_urls(encoded.as_bytes()),
             vec!["http://198.51.100.72/tmp2.exe".to_string()]

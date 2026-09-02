@@ -218,7 +218,10 @@ mod tests {
         let mut e = sample_event();
         e.occurrence_id = Some(id);
         let s = serde_json::to_string(&e).unwrap();
-        assert!(s.contains("occurrence_id"), "occurrence_id must serialize when present");
+        assert!(
+            s.contains("occurrence_id"),
+            "occurrence_id must serialize when present"
+        );
         let back: SensorEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(back.occurrence_id, Some(id));
     }
@@ -227,6 +230,9 @@ mod tests {
     fn event_without_occurrence_id_omits_the_key() {
         let e = sample_event();
         let s = serde_json::to_string(&e).unwrap();
-        assert!(!s.contains("occurrence_id"), "a None occurrence_id must not appear on the wire");
+        assert!(
+            !s.contains("occurrence_id"),
+            "a None occurrence_id must not appear on the wire"
+        );
     }
 }

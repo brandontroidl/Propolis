@@ -231,10 +231,7 @@ fn revalidate(snapshot: &FeedSnapshot, exclusions: &ExclusionEngine) -> Result<(
 /// write-temp-then-rename helper makes for its cursor file. A leftover from a run that crashed
 /// after staging began must not silently mix its files with this run's, so an existing leftover is
 /// removed before starting.
-fn create_staging_dir(
-    parent: &Path,
-    file_name: &std::ffi::OsStr,
-) -> Result<PathBuf, PublishError> {
+fn create_staging_dir(parent: &Path, file_name: &std::ffi::OsStr) -> Result<PathBuf, PublishError> {
     // Every failure here is reported as StagingUnwritable, naming `parent`: a bare io::Error says
     // only "Permission denied (os error 13)" with no path, which is what made a real misconfigured
     // deployment (output dir set one level too high, so `parent` was a root-owned directory) take

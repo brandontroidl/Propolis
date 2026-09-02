@@ -275,7 +275,10 @@ pub(crate) mod tests {
             for b in (9u8..=127).filter(|&b| is_substituted(b)) {
                 let p = DECODE[(b - 9) as usize][variant];
                 // Find an index whose combination is this variant, encode one byte there.
-                let idx = COMBINATION.iter().position(|&v| v as usize == variant).unwrap();
+                let idx = COMBINATION
+                    .iter()
+                    .position(|&v| v as usize == variant)
+                    .unwrap();
                 let mut body = String::new();
                 for _ in 0..idx {
                     body.push('\n'); // consumes a position without substitution

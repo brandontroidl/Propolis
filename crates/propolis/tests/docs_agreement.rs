@@ -101,7 +101,6 @@ fn every_env_var_the_code_reads_is_documented_in_the_env_var_reference() {
     );
 }
 
-
 /// The project bans the em-dash (U+2014) in prose and code: it reads as generated text, and the
 /// maintainer's stated substitute is a spaced hyphen. This walks every tracked Markdown file under
 /// `docs/` (excluding the byte-exact `docs/archive/`, which is checksummed) and every non-vendored
@@ -112,21 +111,38 @@ fn no_em_dashes_in_live_docs_or_source() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut offenders = Vec::new();
     fn walk(dir: &std::path::Path, out: &mut Vec<String>, root: &std::path::Path) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
             if p.is_dir() {
                 // `superpowers` under docs/ is gitignored working notes (plans, specs, reports), not a deliverable.
-                if matches!(name.as_str(), "archive" | "superpowers" | "target" | "vendor" | ".git" | "node_modules" | ".superpowers") {
+                if matches!(
+                    name.as_str(),
+                    "archive"
+                        | "superpowers"
+                        | "target"
+                        | "vendor"
+                        | ".git"
+                        | "node_modules"
+                        | ".superpowers"
+                ) {
                     continue;
                 }
                 walk(&p, out, root);
             } else if name.ends_with(".md") || name.ends_with(".rs") {
-                let Ok(text) = std::fs::read_to_string(&p) else { continue };
+                let Ok(text) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
                 for (i, line) in text.lines().enumerate() {
                     if line.contains('\u{2014}') {
-                        out.push(format!("{}:{}", p.strip_prefix(root).unwrap_or(&p).display(), i + 1));
+                        out.push(format!(
+                            "{}:{}",
+                            p.strip_prefix(root).unwrap_or(&p).display(),
+                            i + 1
+                        ));
                     }
                 }
             }

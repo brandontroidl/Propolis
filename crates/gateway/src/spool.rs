@@ -69,7 +69,8 @@ mod tests {
         let w = SpoolWriter::new(dir.path().to_path_buf());
         let recs = vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()];
         w.write_records("collector-1", &recs).unwrap();
-        let got = std::fs::read_to_string(dir.path().join("collector-1").join("events.jsonl")).unwrap();
+        let got =
+            std::fs::read_to_string(dir.path().join("collector-1").join("events.jsonl")).unwrap();
         assert_eq!(got, "{\"a\":1}\n{\"b\":2}\n");
     }
 

@@ -36,7 +36,7 @@ pub struct ManifestRow {
     pub collector_id: String,
     pub capture_id: Uuid,
     pub occurrence_id: Uuid,
-    pub sha256: String,   // lowercase hex; equals body_key (the on-disk file name)
+    pub sha256: String, // lowercase hex; equals body_key (the on-disk file name)
     pub size: u64,
     pub body_key: String, // the spool file name; today identical to sha256 hex
     pub gateway_spool_state: CustodyState,
@@ -167,6 +167,9 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map(|x| x == "tmp").unwrap_or(false))
             .collect();
-        assert!(leftovers.is_empty(), "no .tmp file may survive a successful write");
+        assert!(
+            leftovers.is_empty(),
+            "no .tmp file may survive a successful write"
+        );
     }
 }

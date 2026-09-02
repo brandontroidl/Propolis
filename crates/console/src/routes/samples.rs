@@ -109,9 +109,7 @@ fn max_source_ips_shown() -> usize {
 /// - It covers FETCHED samples only. A body uploaded directly to a sensor has no `fetch_attempt`
 ///   row, so it shows no source here until the capture/observation link lands.
 ///   Rows whose `source_ip` was never recorded (NULL) are simply absent.
-async fn sample_source_ips(
-    pool: &sqlx::PgPool,
-) -> std::collections::HashMap<String, Vec<String>> {
+async fn sample_source_ips(pool: &sqlx::PgPool) -> std::collections::HashMap<String, Vec<String>> {
     // Unions the two ways a sample is attributable: an address that UPLOADED it to a sensor (the
     // event carries the sha - a first-party observation, and the only link an FTP/SCP upload has,
     // since it never goes through the fetcher), and an address whose reported url the fetcher
@@ -143,11 +141,8 @@ async fn sample_source_ips(
 /// Groups `(sha, ip)` pairs by sha, preserving input order (the query's newest-attempt-first) and
 /// dropping repeats: one attacker can appear on several URLs that resolved to the same body, and it
 /// should be listed once. Split from the query so the grouping is testable without a database.
-fn group_source_ips(
-    rows: Vec<(String, String)>,
-) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+fn group_source_ips(rows: Vec<(String, String)>) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for (sha, ip) in rows {
         let ips = map.entry(sha).or_default();
         if !ips.contains(&ip) {

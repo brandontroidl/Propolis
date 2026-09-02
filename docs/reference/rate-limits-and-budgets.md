@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-01
 -->
 
 # Rate limits and budgets reference
@@ -118,6 +118,13 @@ The byte cap is enforced mid-stream: the transfer aborts to `TooBig` as soon as
 
 Amplification defenses on recursive URL extraction
 (`crates/review/src/fetcher/extract.rs`):
+
+A body in Microsoft Script Encoder form (`.vbe`/`.jse`, the `#@~^ ... ==^#~@`
+envelope) is decoded before scanning (`crates/review/src/fetcher/vbe.rs`).
+The encoding is a fixed positional substitution, not encryption; a captured
+dropper used it to hide an ordinary `strFileURL = "http://..."` assignment,
+which the extractor could not see until decoded. Unencoded bodies pass through
+unchanged. No other encoding (base64, UTF-16) is decoded.
 
 | Item | Value | Source |
 |---|---|---|

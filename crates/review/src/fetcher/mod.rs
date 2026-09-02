@@ -3,6 +3,7 @@ pub mod guard;
 pub mod http;
 pub mod store;
 pub mod tftp;
+pub mod vbe;
 
 use std::collections::HashMap;
 use std::collections::HashSet;

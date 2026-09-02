@@ -51,11 +51,11 @@ is a service that exits immediately at boot with a logged reason. Start with
 
 ## Cross-cutting first checks
 
-1. `systemctl status <unit>` and `journalctl -u <unit> -n 100` — the fail-fast
+1. `systemctl status <unit>` and `journalctl -u <unit> -n 100` - the fail-fast
    reason is logged before exit.
-2. `curl -s localhost:8080/ready` — distinguishes "process up" from "database
+2. `curl -s localhost:8080/ready` - distinguishes "process up" from "database
    reachable" (see [Database](database.md)).
-3. `curl -s localhost:8080/health` — liveness only; always 200 if the process is
+3. `curl -s localhost:8080/health` - liveness only; always 200 if the process is
    serving at all.
 4. Confirm which run mode is deployed: the unified `propolis` daemon or the
    standalone `intake`/`review`/`feed`/`console` set. The env surface differs

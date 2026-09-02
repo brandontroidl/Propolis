@@ -18,12 +18,12 @@ page is the sequence, not a re-listing of values.
 
 Propolis is source-available and actively developed, with one tagged release
 (`v0.1.0`); the current tree is `0.3.0`, untagged. It is not certified or
-production-blessed — see [../overview/maturity-and-status.md](../overview/maturity-and-status.md).
+production-blessed - see [../overview/maturity-and-status.md](../overview/maturity-and-status.md).
 
 ## 1. Derive the real syscall filter
 
 Every shipped unit carries a **placeholder** `SystemCallFilter`
-(`@system-service` minus `@privileged @resources`) — a broad development
+(`@system-service` minus `@privileged @resources`) - a broad development
 allowlist, not a hardened filter. Before production, derive the tight per-binary
 allowlist and replace the placeholder in each `deploy/*.service` unit.
 
@@ -56,7 +56,7 @@ captured binary from being executed. See [malware custody](./malware-custody.md)
   inbound surface the sensors need.
 - **Keep the console loopback-only.** It defaults to `127.0.0.1:8080`. Do not set
   `PROPOLIS_CONSOLE_BIND` to a routable address without a fronting reverse proxy
-  (next item) — the console serves plain HTTP and the `/metrics` endpoint is
+  (next item) - the console serves plain HTTP and the `/metrics` endpoint is
   unauthenticated by design (acceptable only because it is loopback).
 - Restrict outbound egress at the host firewall to exactly the paths you enable
   (see step 5). Sensors make no outbound connections.
@@ -78,12 +78,12 @@ credential/topic. Enable only what you need, and confirm each is intended:
 
 - VirusTotal (`PROPOLIS_VT_ENABLED`, honored only with a non-empty key)
 - Vendor abuse submitters AbuseIPDB / DShield / OTX (`PROPOLIS_VENDOR_*_ENABLED`)
-- Malware fetcher (`PROPOLIS_FETCH_ENABLED`) — fetches attacker-supplied URLs
+- Malware fetcher (`PROPOLIS_FETCH_ENABLED`) - fetches attacker-supplied URLs
   through the SSRF vetter; leave off unless you accept that risk
 - Console reverse DNS (`PROPOLIS_CONSOLE_RDNS_ENABLED`)
 - Ops-alert ntfy (`PROPOLIS_OPS_ENABLED`)
 
-> **Warning — enabling these produces outbound network traffic and, for the
+> **Warning - enabling these produces outbound network traffic and, for the
 > fetcher, dials attacker-controlled destinations.** Understand each path before
 > turning it on. Full behavior and guards: [outbound-controls.md](./outbound-controls.md).
 
@@ -117,7 +117,7 @@ references by construction. The feed *contents* are safe to publish. Still:
 - Confirm the production `event` table has had `UPDATE/DELETE/TRUNCATE` revoked
   from the `propolis` role (migration `0004` does this only when the database is
   named `propolis`). The hash-chain trigger (`0005`) must be present.
-- Establish and **test** an off-host backup and restore path — a single-node
+- Establish and **test** an off-host backup and restore path - a single-node
   deployment has no built-in redundancy (see [residual-risks.md](./residual-risks.md)).
   A backup is unverified until you have restored from it. See
   [../operations/backup-and-restore.md](../operations/backup-and-restore.md).

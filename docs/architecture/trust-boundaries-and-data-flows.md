@@ -10,7 +10,7 @@ last-verified: 2026-08-26
 # Trust boundaries and data flows
 
 This page maps the trust boundaries in a Propolis deployment, the inbound and outbound
-data flows that cross them, and the egress posture — what makes outbound network
+data flows that cross them, and the egress posture - what makes outbound network
 requests, and under what operator control.
 
 The threat model and trust assumptions are owned by
@@ -26,7 +26,7 @@ page is the architectural view that ties them to the data flows.
 | **Sensors** | Low-trust, exposed | The 9 sensor crates (12 protocols). Attacker-facing; run unprivileged, egress-free by construction. |
 | **Local channel** | Trusted host | Per-sensor NDJSON log files and the on-disk quarantine spool. One-directional, local storage. |
 | **Datastore** | Trusted | PostgreSQL: the append-only hash-chained ledger and its projections. |
-| **Platform** | Trusted | Intake, scoring, review, feed, malware fetcher, ops-alerting — the processing tier. |
+| **Platform** | Trusted | Intake, scoring, review, feed, malware fetcher, ops-alerting - the processing tier. |
 | **Operator** | Authenticated | The console user, behind session auth on a loopback bind. |
 | **External services** | Third-party | VirusTotal, abuse vendors, the operator's ntfy server, the public DNS resolver, attacker-hosted payload URLs. |
 
@@ -78,7 +78,7 @@ default-off** egress.
    fields are hex-encoded ("safe by alphabet"). This closes the forged-second-NDJSON-
    line class. See [input handling](../security/input-handling.md).
 3. **Emit.** The sensor writes one NDJSON `sensor-wire` record per event to its local
-   log via a single atomic `O_APPEND` `write_all` — an event exists once and only once
+   log via a single atomic `O_APPEND` `write_all` - an event exists once and only once
    it lands as a complete line. Captured file bodies go to the quarantine spool
    off the response path (see [malware custody](../security/malware-custody.md)); the
    record carries only a SHA-256 reference.
@@ -90,7 +90,7 @@ default-off** egress.
    [storage](./storage.md).
 
 Note the transport: **sensors never talk to intake directly.** The only channel is
-the local NDJSON file on local storage — a one-directional trust boundary. A
+the local NDJSON file on local storage - a one-directional trust boundary. A
 compromised sensor can write lines to its own log, but it cannot reach the database,
 another sensor, or the network.
 
@@ -99,7 +99,7 @@ another sensor, or the network.
 **The platform is not "egress-free"; only the sensor crates are.** Each
 attacker-facing sensor has no HTTP client in its own dependency closure, enforced by
 per-sensor tests that ban `reqwest/hyper/ureq/curl/isahc/surf/attohttpc`. The
-workspace lockfile *does* contain `reqwest` and `hyper` — they belong to the platform
+workspace lockfile *does* contain `reqwest` and `hyper` - they belong to the platform
 tier (review, the fetcher, VirusTotal, ops-alert), never to a sensor.
 
 At the platform level there are exactly **five outbound paths, every one opt-in and
@@ -130,7 +130,7 @@ Two of these carry extra structural controls worth stating here:
   [outbound controls](../security/outbound-controls.md).
 - **Path 4 (rDNS)** is explicitly forbidden from being used as a suppression signal
   (PTR is spoofable, display-only). External-lookup links in the console detail view
-  are rendered for the **operator's own browser** to follow — the box never leaks a
+  are rendered for the **operator's own browser** to follow - the box never leaks a
   captured IP to a third-party lookup service itself.
 
 The **console, sensors, intake, feed, and core-scoring make no outbound requests**
@@ -144,7 +144,7 @@ enrichment and reporting egress paths are operator-gated and default off.* Never
 ## Operator boundary
 
 The operator crosses into the trusted zone only through the console, which serves
-**plain HTTP on a loopback bind by default** (no in-process TLS — any TLS is
+**plain HTTP on a loopback bind by default** (no in-process TLS - any TLS is
 operator-provided in front of it) behind Argon2id password auth, an HMAC-signed
 in-memory session, and CSRF on mutating actions. Internal-only attribution such as
 `wan_ip` (the honeypot's own ingress address) is visible only in the auth-gated
@@ -154,10 +154,10 @@ console; it is **never** in the public blocklist feed. See
 
 ## Related
 
-- [security/threat-model.md](../security/threat-model.md) — threat model and trust
+- [security/threat-model.md](../security/threat-model.md) - threat model and trust
   assumptions.
-- [security/outbound-controls.md](../security/outbound-controls.md) — the five gated
+- [security/outbound-controls.md](../security/outbound-controls.md) - the five gated
   egress paths (canonical).
-- [security/attack-surfaces.md](../security/attack-surfaces.md) — the inbound attack
+- [security/attack-surfaces.md](../security/attack-surfaces.md) - the inbound attack
   surface.
-- [architecture/storage.md](./storage.md) — the ledger the flows converge on.
+- [architecture/storage.md](./storage.md) - the ledger the flows converge on.

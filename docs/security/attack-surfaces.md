@@ -31,11 +31,11 @@ For the trust model behind these boundaries see [threat-model.md](threat-model.m
 
 The attacker-facing surface: **9 sensor crates covering 12 protocols** (the `cred`
 sensor serves VNC / MySQL / MSSQL / PostgreSQL / MongoDB). Sensors have **no compiled-in
-default port** — ports come from the config/env the deploy units set; see
+default port** - ports come from the config/env the deploy units set; see
 [../reference/ports-and-protocols.md](../reference/ports-and-protocols.md) and
 [../reference/sensor-behavior.md](../reference/sensor-behavior.md).
 
-Exposes: raw attacker-chosen bytes on each protocol — banners, commands, credentials,
+Exposes: raw attacker-chosen bytes on each protocol - banners, commands, credentials,
 uploaded sample bytes.
 
 Controls:
@@ -60,11 +60,10 @@ Controls:
 The one path that fetches an **attacker-supplied URL**. It is opt-in
 (`PROPOLIS_FETCH_ENABLED`, default off) and the daemon only spawns it when enabled.
 
-Exposes: an SSRF / internal-scan risk — an attacker who gets the box to fetch a URL of
+Exposes: an SSRF / internal-scan risk - an attacker who gets the box to fetch a URL of
 their choosing.
 
-Control: a fail-closed URL vetter run on the initial URL **and every redirect hop** —
-scheme allowlist (http/https/tftp), `user:pass@host` rejected, DNS-rebinding defense
+Control: a fail-closed URL vetter run on the initial URL **and every redirect hop** - scheme allowlist (http/https/tftp), `user:pass@host` rejected, DNS-rebinding defense
 (a mixed public+internal resolve set rejects the whole host), the connect address pinned
 to the vetted IP (never re-resolved), and a forbidden-target check rejecting own-host and
 reserved IP ranges (with IPv6 canonicalization first). See
@@ -76,14 +75,14 @@ Axum + minijinja server-rendered HTML. **30 routes: 7 public, 23 session-gated**
 (canonical table: [../reference/console-routes.md](../reference/console-routes.md)).
 Default bind is loopback-only (`127.0.0.1:8080`); the operator opts into a wider bind.
 
-Exposes: the public group — `/health`, `/ready`, `/metrics`, `/login` (GET+POST),
-`/logout`, `/assets/fonts/{file}` — reachable without a session. Everything else is behind
+Exposes: the public group - `/health`, `/ready`, `/metrics`, `/login` (GET+POST),
+`/logout`, `/assets/fonts/{file}` - reachable without a session. Everything else is behind
 the session gate. `/metrics` is Prometheus text and is public because Prometheus cannot
 log in; that is acceptable *because* the default bind is loopback.
 
 Controls:
 
-- **Authentication and session/CSRF boundary** — Argon2id password, HMAC-tagged session
+- **Authentication and session/CSRF boundary** - Argon2id password, HMAC-tagged session
   cookie, per-session CSRF on mutating routes, login rate limiting. See
   [authn-authz.md](authn-authz.md).
 - **Security headers on every response:** `X-Frame-Options: DENY` and
@@ -104,7 +103,7 @@ Controls:
 
 ## Database
 
-Internal surface. All writes are parameterized — no SQL string is built with `format!` in
+Internal surface. All writes are parameterized - no SQL string is built with `format!` in
 non-test source; the event insert and all query paths bind values, never interpolate. See
 [input-handling.md](input-handling.md) and, for tables/enums, [../reference/database.md](../reference/database.md).
 
@@ -120,7 +119,7 @@ required to be a `noexec,nosuid,nodev` mount (deployment concern). See
 
 The public blocklist feed is the outward-facing data product. It selects only attacker
 `source_ip` plus tier / first-seen / last-seen / categories; it carries **zero** references
-to the honeypot's own `wan_ip` (internal-only) — verified across every feed export path.
+to the honeypot's own `wan_ip` (internal-only) - verified across every feed export path.
 See [sample-and-credential-privacy.md](sample-and-credential-privacy.md) and
 [../reference/scoring-and-feed.md](../reference/scoring-and-feed.md).
 
@@ -130,7 +129,7 @@ systemd timer or cron unit. See [../operations/deployment-models.md](../operatio
 
 ## Enrichment and reporting egress
 
-Five platform-level outbound paths — VirusTotal, vendor abuse submitters
+Five platform-level outbound paths - VirusTotal, vendor abuse submitters
 (AbuseIPDB / DShield / OTX), console forward-confirmed rDNS, offline GeoLite2 (local file
 reads, **not** network), and ops-alert ntfy. **Every one is opt-in and defaults off**;
 several fail closed if their credential or topic is missing, and vendor submission only

@@ -27,12 +27,12 @@ and every sensor unit:
 | Directive | Value | Effect |
 |---|---|---|
 | `User=` / `Group=` | dedicated `propolis-*` user, never root | asserted `User != root` (`deploy_test.rs:84`) |
-| `NoNewPrivileges=yes` | — | no setuid/capability escalation after exec |
-| `ProtectSystem=strict` | — | entire filesystem read-only except explicit `ReadWritePaths` |
-| `ProtectHome=yes` | — | home trees invisible |
+| `NoNewPrivileges=yes` | - | no setuid/capability escalation after exec |
+| `ProtectSystem=strict` | - | entire filesystem read-only except explicit `ReadWritePaths` |
+| `ProtectHome=yes` | - | home trees invisible |
 | `MemoryDenyWriteExecute=yes` | correct spelling (the `-ion` form silently installs no rule) | no W^X pages: captured code cannot become executable memory |
 | `RestrictAddressFamilies=` | sensors `AF_INET AF_INET6`; daemon adds `AF_UNIX` (local PostgreSQL socket) | no raw/packet/netlink sockets |
-| `PrivateTmp`, `PrivateDevices`, `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `RestrictNamespaces`, `RestrictSUIDSGID`, `LockPersonality`, `RemoveIPC`, `ProtectProc=invisible`, `ProcSubset=pid` | — | broad supplementary containment |
+| `PrivateTmp`, `PrivateDevices`, `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `RestrictNamespaces`, `RestrictSUIDSGID`, `LockPersonality`, `RemoveIPC`, `ProtectProc=invisible`, `ProcSubset=pid` | - | broad supplementary containment |
 | `UMask=` | sensors `0027` (logs group-readable so the daemon's group membership can read them); console `0077` | default file mode |
 | Resource caps | `MemoryMax`, `TasksMax`, `CPUQuota`, `LimitNOFILE` per unit | bound resource-exhaustion blast radius |
 
@@ -46,7 +46,7 @@ The unified daemon additionally sets `ReadOnlyPaths=/var/log/propolis`,
 `NoExecPaths=/var/spool/propolis/fetched` (systemd ≥244, defense-in-depth over
 the fstab `noexec` mount for live malware binaries), and `PrivateUsers=yes`.
 
-> **Caveat — `SystemCallFilter` is a placeholder, not a delivered control.**
+> **Caveat - `SystemCallFilter` is a placeholder, not a delivered control.**
 > Every unit ships `SystemCallFilter=@system-service` minus `@privileged
 > @resources` (`deploy/propolis.service:176-187`, `deploy/sensor-ssh.service:80-99`).
 > The unit header explicitly labels this a **broad development allowlist** and
@@ -71,11 +71,11 @@ security-load-bearing choices:
   (`crates/sensor-framework/src/spool.rs:277`) into spool directories that
   `install.sh` prints (does **not** auto-create) `noexec,nosuid,nodev` fstab lines
   for (`install.sh:172-182`). Whether those mount options are actually applied on
-  a given host is an operator step, not enforceable from the repo — see
+  a given host is an operator step, not enforceable from the repo - see
   [malware custody](./malware-custody.md) and
   [residual risks](./residual-risks.md).
 - **Secrets live only in `/etc/propolis/*.env`, mode `0600`, owned by the service
-  user** — created by hand by the operator, never by `install.sh`. No secret is
+  user** - created by hand by the operator, never by `install.sh`. No secret is
   read from argv or baked into a unit file. See
   [../operations/secret-management.md](../operations/secret-management.md).
 - Dedicated users are created `--system --no-create-home --shell /usr/sbin/nologin`
@@ -98,7 +98,7 @@ non-empty `sensor`, a 32-byte `hash`, `confidence` in `[0,1]`, and non-negative
 **Hash-chain linkage enforced by trigger**
 (`crates/core-scoring/migrations/0005_chain_enforcement_trigger.sql`): a
 `BEFORE INSERT` trigger (`enforce_chain_linkage`) rejects any row whose
-`prev_hash` does not equal the current chain head — the first event must carry a
+`prev_hash` does not equal the current chain head - the first event must carry a
 NULL `prev_hash`; every later event must match. The SHA-256 hash *value* is still
 computed application-side over a frozen canonical byte encoding
 (`crates/core-scoring/src/hashing.rs`; see

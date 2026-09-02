@@ -21,7 +21,7 @@ Every workspace crate pins its own `version` independently; there is no shared
 - **Crate version: `0.3.0`** across all 18 workspace crates.
 - **Only release tag: `v0.1.0`** (points at commit `e0bfd513`,
   2026-08-02). There is no `v0.2.0` or `v0.3.0` tag.
-- The `0.3.0` tree is therefore **unreleased/untagged** — roughly two minor
+- The `0.3.0` tree is therefore **unreleased/untagged** - roughly two minor
   bumps of work sit ahead of the tagged release.
 - No `rust-version` / MSRV is declared in any crate.
 
@@ -31,13 +31,13 @@ version/tag divergence is
 
 ## Compatibility surfaces
 
-### Sensor wire contract — frozen
+### Sensor wire contract - frozen
 
 The `sensor-wire` crate defines the event contract between sensors and the
 platform and is treated as a **frozen contract** (guarded by its own tests).
 Changes to it are compatibility-sensitive and are not made casually.
 
-### Database schema — additive
+### Database schema - additive
 
 Schema evolution is **additive**: new columns/fields are optional so existing
 rows still validate, and stored data is transformed only through explicit
@@ -46,7 +46,7 @@ and migration list are owned by
 [../reference/database.md](../reference/database.md); the migration workflow is
 in [../development/schema-and-migrations.md](../development/schema-and-migrations.md).
 
-### Configuration — additive
+### Configuration - additive
 
 New configuration is introduced with safe defaults so an existing deployment
 keeps working without changes. Exact env-var names, defaults, and bounds are

@@ -61,7 +61,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked -- --test-threads=1
 ```
 
-The tests job needs the test PostgreSQL running — see
+The tests job needs the test PostgreSQL running - see
 [toolchain-and-environment](toolchain-and-environment.md#test-postgresql).
 
 <a id="contributing-vs-ci"></a>
@@ -70,7 +70,7 @@ The tests job needs the test PostgreSQL running — see
 `CONTRIBUTING.md:11` gives the gate as
 `cargo fmt --check && cargo clippy -- -D warnings && cargo test`. That is the
 intent, but it omits `--all`, `--workspace`, `--all-targets`, `--locked`,
-`--test-threads=1`, and its chained `&&` bails on first failure — the exact
+`--test-threads=1`, and its chained `&&` bails on first failure - the exact
 anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 
 ## Test taxonomy
@@ -79,9 +79,9 @@ Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = u
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
 - **Total: 1165 test functions** (681 unit + 484 integration).
-- **DB-backed (`sqlx::test`): 116** — console 87, core-scoring 23, intake 3,
+- **DB-backed (`sqlx::test`): 116** - console 87, core-scoring 23, intake 3,
   propolis 2, feed 1. These provision a fresh database per test.
-- **Ignored: exactly 1** — `crates/console/src/rdns.rs:190`, a live reverse-lookup
+- **Ignored: exactly 1** - `crates/console/src/rdns.rs:190`, a live reverse-lookup
   test `#[ignore]`d so the default suite stays offline-deterministic. Run it
   manually: `cargo test -p console -- --ignored rdns` (`rdns.rs:186-191`).
 
@@ -95,7 +95,7 @@ Per-crate breakdown:
 | console | 68 | 101 | auth_test, routes_test |
 | core-scoring | 63 | 24 | end_to_end, migrations, replay, repository, smoke |
 | feed | 32 | 55 | builder_test, exclusion_test, export_test, publisher_test |
-| geoip | 4 | 0 | — |
+| geoip | 4 | 0 | - |
 | intake | 11 | 42 | converter_test, cursor_test, end_to_end, tailer_test |
 | propolis | 79 | 3 | docs_agreement, smoke_test |
 | review | 76 | 59 | cli_test, fetcher_schema_test, gatekeeper_test, queue_test, submit_test, vendor_test |
@@ -109,7 +109,7 @@ Per-crate breakdown:
 | sensor-smtp | 6 | 10 | integration |
 | sensor-ssh | 40 | 84 | auth_test, crypto_test, integration, shell_test, transport_test |
 | sensor-telnet | 32 | 10 | integration |
-| sensor-wire | 7 | 0 | — |
+| sensor-wire | 7 | 0 | - |
 | **Total** | **681** | **484** | |
 
 ### Test styles by layer
@@ -120,7 +120,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (20 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (88 uses) — needed wherever both the core-scoring and
+  applies migrations manually (88 uses) - needed wherever both the core-scoring and
   review histories are required in one database. See
   [schema-and-migrations](schema-and-migrations.md).
 

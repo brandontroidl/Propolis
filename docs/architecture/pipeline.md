@@ -12,14 +12,14 @@ last-verified: 2026-08-26
 Once an event lands in the hash-chained ledger (see
 [`event-and-sample-lifecycle.md`](event-and-sample-lifecycle.md)), it enters a
 pipeline that turns accumulated evidence into a per-IP score, gates that score behind
-operator review, enriches captured samples, and — only for entries that clear every
-gate — publishes a blocklist feed and, optionally, reports the source IP to abuse
+operator review, enriches captured samples, and - only for entries that clear every
+gate - publishes a blocklist feed and, optionally, reports the source IP to abuse
 vendors.
 
 All exact constants, thresholds, and tier floors are owned by
 [`reference/scoring-and-feed.md`](../reference/scoring-and-feed.md); this page is the
 narrative of how the stages connect. Every outward path in this pipeline is
-operator-gated and defaults off or requires explicit approval — see
+operator-gated and defaults off or requires explicit approval - see
 [`security/outbound-controls.md`](../security/outbound-controls.md).
 
 ```mermaid
@@ -48,12 +48,10 @@ for gate derivation, shared by the write path (`apply_event`) and the read path
 - **Decay + accumulate.** Prior state is decayed to the event's `observed_at`
   (`factor = 0.5 ^ (elapsed / half_life)`, half-life 6h), then this event's weight is
   added and clamped to a ceiling of 100. A repeat `(source_ip, signal_type)` inside a
-  60-second window records the event but adds no weight. Clock-skew is clamped —
-  decay only shrinks.
+  60-second window records the event but adds no weight. Clock-skew is clamped - decay only shrinks.
 - **Confirmed-real latch.** `is_confirmed_real = protocol==Tcp && authenticated &&
   category==Honeypot`; the flag is sticky once set and never unsets
-  (`engine.rs:145-146`). UDP/ICMP and unauthenticated traffic can never latch it —
-  this is what stops a spoofed source from manufacturing merit.
+  (`engine.rs:145-146`). UDP/ICMP and unauthenticated traffic can never latch it - this is what stops a spoofed source from manufacturing merit.
 - **Breadth multiplier.** `effective_score = min(100, raw * breadth_factor)`, where
   breadth rises 0.15 per extra distinct WAN vantage and saturates at 1.60. Only
   vantages that saw an authenticated TCP handshake are counted, and vantages dedup by
@@ -61,7 +59,7 @@ for gate derivation, shared by the write path (`apply_event`) and the read path
   internal score **only** and never leaves the system.
 - **Persistence bonus.** A non-decaying count of distinct UTC active days adds a bonus
   to a **gate-facing** score (`gated_raw = min(100, raw + persistence_points)`),
-  never to the stored raw — so a slow attacker the 6h decay would erase can still earn
+  never to the stored raw - so a slow attacker the 6h decay would erase can still earn
   a tier over time without the bonus being double-counted on the next decay
   (`engine.rs:212-220`).
 - **Tier.** `tier(gated_raw, max_confidence)` yields **Aggressive** (`>= 90` and
@@ -74,7 +72,7 @@ for gate derivation, shared by the write path (`apply_event`) and the read path
   `recommended_for_blocklist = eligible && effective_score >= 50`, **or** an
   independent volume path (`established_event_count >= 1000` within 24h). The volume
   path counts only completed-TCP events, so a spoofed UDP/ICMP flood cannot volume-list
-  an innocent third party — and it does not set `recommended_for_vendor`, so a bare
+  an innocent third party - and it does not set `recommended_for_vendor`, so a bare
   flood is blocklisted locally but never reported upstream.
 
 Exact constant values live in
@@ -126,7 +124,7 @@ Enrichment wiring, keys, and budgets are owned by
 ## 4. Feed generation
 
 The feed builder (`crates/feed/src/builder.rs`) decides membership by **retention
-windows**, not a live-decayed score — every field is read as stored (as of the IP's
+windows**, not a live-decayed score - every field is read as stored (as of the IP's
 last event), so a tier cannot slide between builds.
 
 - **Tier files require approval.** Tier candidates are the join of
@@ -156,8 +154,8 @@ The builder/publisher runs inside the `propolis` daemon on an interval
 (`PROPOLIS_FEED_BUILD_INTERVAL_SECS`, default 900s) and writes to a local output
 directory (default `/var/lib/propolis/feed/current`).
 
-> **Not a shipped timer.** Distributing the built feed off-box — for example syncing
-> the output directory to a public blocklist repository — is an **operator setup
+> **Not a shipped timer.** Distributing the built feed off-box - for example syncing
+> the output directory to a public blocklist repository - is an **operator setup
 > step** (`deploy/blocklist-sync.sh`, referenced only by comment), not a systemd
 > timer or cron unit shipped in `deploy/`. Publishing your blocklist is a deliberate
 > egress decision; review
@@ -179,8 +177,7 @@ clear the gatekeeper.
   cooldown) → RateLimit (vendor-wide successes inside the window) → ScoreFloor →
   CategoryFilter. A DB error during a check holds, never admits.
 - **Idempotency.** The submission runner inserts a `success=false` row keyed
-  `"{ip}:{vendor}:{date}"` **before** the HTTP call, then updates it with the outcome
-  — so a retry within the same UTC day never double-reports, and a new day permits
+  `"{ip}:{vendor}:{date}"` **before** the HTTP call, then updates it with the outcome - so a retry within the same UTC day never double-reports, and a new day permits
   re-reporting.
 - **What is not sent.** A report carries only `{source_ip, categories, comment,
   evidence_window}`. No WAN vantage, raw score, confidence, or sample body ever leaves

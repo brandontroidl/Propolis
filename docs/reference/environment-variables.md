@@ -23,18 +23,17 @@ does not generate them (it only prints a reminder to populate them,
 
 Propolis ships two ways to run the platform, and the env surface differs:
 
-1. **Unified daemon** `propolis` — one `load_config()`
+1. **Unified daemon** `propolis` - one `load_config()`
    (`crates/propolis/src/config.rs:429`) parses intake, review, feed, console,
    VirusTotal, malware-fetcher, and ops-alert config from a single env set
    (`EnvironmentFile=/etc/propolis/propolis.env`). It does **not** read sensor
    `*_BIND`/`*_WAN_MAP` variables; it consumes sensor **log files** via
    `PROPOLIS_SENSOR_LOGS`.
-2. **Standalone service binaries** — `intake`, `review`, `feed`, `console` —
-   each with its own `load_config_from_env()` and its own
+2. **Standalone service binaries** - `intake`, `review`, `feed`, `console` - each with its own `load_config_from_env()` and its own
    `/etc/propolis/<name>.env`. Their variables are a strict subset of the unified
    daemon's (e.g. standalone `feed` does not read `PROPOLIS_FEED_WINDOWS`;
    standalone `review` does not read the VT or fetch variables).
-3. **Sensor binaries** — always separate processes regardless of run mode, each
+3. **Sensor binaries** - always separate processes regardless of run mode, each
    with its own `/etc/propolis/<name>.env`.
 
 Which run mode a given deployment uses is an operator choice; both sets of
@@ -44,10 +43,10 @@ Which run mode a given deployment uses is an operator choice; both sets of
 
 Two fail-closed idioms recur; they are **not** uniform:
 
-- **Strict parse** — `propolis`, `intake`, `review`, `feed`, `console`, and
+- **Strict parse** - `propolis`, `intake`, `review`, `feed`, `console`, and
   sensors `ssh`/`telnet`/`http`/`ftp`/`redis`/`adb`/`catchall`: a
   present-but-invalid or present-but-zero numeric bound **aborts startup**.
-- **Lenient parse** — sensors `cred` and `smtp` **only**: an invalid or zero
+- **Lenient parse** - sensors `cred` and `smtp` **only**: an invalid or zero
   bound silently falls back to the default (`parse_positive_u64` filters `>0`
   then `unwrap_or(default)`, `crates/sensor-cred/src/main.rs:29-33`,
   `crates/sensor-smtp/src/main.rs:28-32`).
@@ -56,12 +55,12 @@ Unified daemon (`config.rs`) parse helpers:
 
 | Helper | Unset/empty | Invalid | Zero | Other |
 |---|---|---|---|---|
-| `require_env` (`:168`) | `Missing` (abort) | — | — | — |
-| `parse_positive_u64` (`:175`) | default | `Invalid` (abort) | `Invalid` (abort) — "zero never means unlimited" | — |
+| `require_env` (`:168`) | `Missing` (abort) | - | - | - |
+| `parse_positive_u64` (`:175`) | default | `Invalid` (abort) | `Invalid` (abort) - "zero never means unlimited" | - |
 | `parse_bounded_positive_u64` (`:199`) | default | abort | abort | `> max` → abort |
-| `parse_u32` (`:215`) | default | abort | allowed | — |
+| `parse_u32` (`:215`) | default | abort | allowed | - |
 | `parse_bounded_u8` (`:351`) | default | abort | allowed (0 = maximally strict) | `> 255` → abort (no wrap) |
-| `parse_bool_flag` (`:227`) | default | — | — | case-insensitive `true`/`false` only; **any** other value (incl. `1`, `yes`) → default |
+| `parse_bool_flag` (`:227`) | default | - | - | case-insensitive `true`/`false` only; **any** other value (incl. `1`, `yes`) → default |
 
 Note `parse_bool_flag` does **not** accept `1`/`yes`; ops-alert `get_bool` and
 console rDNS parse booleans more broadly (called out below).
@@ -113,7 +112,7 @@ variable in this section plus the universal ones above.
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_SENSOR_LOGS` | **yes** | — | comma-separated `name:path` pairs (`config.rs:236-262`). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
+| `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs (`config.rs:236-262`). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
 | `PROPOLIS_CURSOR_DIR` | no | `/var/lib/propolis/cursors` (`config.rs:17`) | any path; no validation |
 | `PROPOLIS_POLL_INTERVAL_MS` | no | `1000` (`config.rs:18`) | positive u64 ms; zero/unparseable → abort |
 
@@ -170,14 +169,14 @@ Default base URLs (`crates/review/src/vendor/*.rs`):
 | Variable | Req | Default | Notes |
 |---|---|---|---|
 | `PROPOLIS_CONSOLE_BIND` | no | `127.0.0.1:8080` (`config.rs:30`) | must parse as `ip:port` SocketAddr; invalid → abort (`:512`) |
-| `PROPOLIS_CONSOLE_PASSWORD` | **yes** | — | `require_env`; absent/empty → **abort** (`:517`) |
+| `PROPOLIS_CONSOLE_PASSWORD` | **yes** | - | `require_env`; absent/empty → **abort** (`:517`) |
 | `PROPOLIS_CONSOLE_SESSION_SECRET` | no | random 32 bytes generated at startup (`:374-377`) | if set, must be exactly 64 hex chars (32 bytes), else abort (`:379-388`). Sessions are in-memory, so a fresh secret per restart only invalidates sessions already dropped on restart. |
 | `PROPOLIS_CONSOLE_MAX_SOURCE_IPS` | no | `3` (`routes/samples.rs`) | how many attacker IPs the Samples page shows inline per sample before collapsing to "+N more"; blank/zero/unparseable falls back to the default (zero never means unlimited) |
 | `PROPOLIS_SPOOL_ROOT` | no | `/var/spool/propolis` (`review/src/spool.rs`) | root of the spool tree. Per-sensor spool dirs default under it, but each sensor's own `PROPOLIS_<SENSOR>_SPOOL_DIR` still wins, so the platform side (VT scan, retention, console) resolves the same directory the sensor actually writes to. Must match what `deploy/install.sh` provisions and what the units grant in `ReadWritePaths`. |
 | `PROPOLIS_GEOIP_DIR` | no | none (`Option`, `:480`) | directory of GeoLite2 `.mmdb` files; empty string treated as unset; missing dir/file degrades gracefully. GeoIP enrichment is **local file reads, not network**. |
-| `PROPOLIS_CONSOLE_RDNS_ENABLED` | no | `false` (`config.rs:484`) | bool_flag; opt-in forward-confirmed reverse DNS — the one outbound DNS lookup. Default off. See [outbound controls](../security/outbound-controls.md). |
+| `PROPOLIS_CONSOLE_RDNS_ENABLED` | no | `false` (`config.rs:484`) | bool_flag; opt-in forward-confirmed reverse DNS - the one outbound DNS lookup. Default off. See [outbound controls](../security/outbound-controls.md). |
 | `PROPOLIS_CONSOLE_TRUSTED_PROXY` | no | `false` | bool_flag; set when the console sits behind a TLS reverse proxy so session cookies are always marked `Secure` (a same-host proxy connects over loopback, which would otherwise drop the flag on a real HTTPS hop). |
-| `PROPOLIS_CONSOLE_METRICS_TOKEN` | no | none | if set, `/metrics` requires `Authorization: Bearer <token>` (constant-time compare); unset leaves `/metrics` open — safe only on a loopback bind. Defense in depth for a non-loopback bind. |
+| `PROPOLIS_CONSOLE_METRICS_TOKEN` | no | none | if set, `/metrics` requires `Authorization: Bearer <token>` (constant-time compare); unset leaves `/metrics` open - safe only on a loopback bind. Defense in depth for a non-loopback bind. |
 
 The console serves plain HTTP on a loopback `TcpListener`; there is no in-process
 TLS. Any TLS is operator-provided (e.g. a reverse proxy) [inferred]. See
@@ -202,7 +201,7 @@ and [rate limits and budgets](rate-limits-and-budgets.md).
 
 | Variable | Req | Default | Max | Bounds / fail |
 |---|---|---|---|---|
-| `PROPOLIS_FETCH_ENABLED` | no | `false` (`config.rs:527`) | — | bool_flag |
+| `PROPOLIS_FETCH_ENABLED` | no | `false` (`config.rs:527`) | - | bool_flag |
 | `PROPOLIS_FETCH_INTERVAL_SECS` | no | `10` (`:34`) | `86400` (`:60`) | bounded positive u64; zero/over-max → abort |
 | `PROPOLIS_FETCH_MAX_BYTES` | no | `10_000_000` (`:35`) | `500_000_000` (`:52`) | bounded positive u64 → usize; **zero → abort** (would disable the byte guard); over-max → abort |
 | `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` | no | `12` (`:36`) | `1000` (`:56`) | bounded positive u64 → u32 |
@@ -213,8 +212,8 @@ and [rate limits and budgets](rate-limits-and-budgets.md).
 | `PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS` | no | `10` (`:41`) | `300` (`:55`) | bounded positive u64 |
 | `PROPOLIS_FETCH_READ_TIMEOUT_SECS` | no | `10` (`:42`) | `300` | bounded positive u64 |
 | `PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS` | no | `30` (`:43`) | `300` | bounded positive u64 |
-| `PROPOLIS_FETCH_USER_AGENT` | no | `Wget/1.21.3` (`:64`) | — | blank → default |
-| `PROPOLIS_FETCH_OWN_IPS` | no | `""` | — | comma-sep IP list (`parse_ip_list`); invalid → abort. Unioned with live-interface IPs for the SSRF self-target guard. |
+| `PROPOLIS_FETCH_USER_AGENT` | no | `Wget/1.21.3` (`:64`) | - | blank → default |
+| `PROPOLIS_FETCH_OWN_IPS` | no | `""` | - | comma-sep IP list (`parse_ip_list`); invalid → abort. Unioned with live-interface IPs for the SSRF self-target guard. |
 
 Fetcher runtime fail-closed (`main.rs:828-835`): if `PROPOLIS_FETCH_OWN_IPS` is
 unset **and** interface enumeration returns empty, the fetcher **refuses to run**
@@ -228,17 +227,17 @@ public egress IP for self-target protection.
 `crates/propolis/src/ops_alert/config.rs`. Opt-in ntfy POST egress, default off.
 Parsed via an injectable getter over `env::var` that treats blank as absent.
 Helpers: `get_bool` (`:35`) accepts `true|1|yes|on` (case-insensitive), else
-default — broader than `parse_bool_flag`. `get_u64`/`get_secs` (`:55`/`:45`):
+default - broader than `parse_bool_flag`. `get_u64`/`get_secs` (`:55`/`:45`):
 unset → default; unparseable → abort; **below min → abort**. `get_pct` (`:96`):
 enforces `1..=100`; 0 and >100 → abort. `get_u32` (`:81`): u64 range-checked to
 u32.
 
 | Variable | Req | Default | Min/bounds | Notes |
 |---|---|---|---|---|
-| `PROPOLIS_OPS_ENABLED` | no | `false` (`config.rs:119`) | — | opt-in; a deployment predating ops-alert still starts |
-| `PROPOLIS_OPS_NTFY_URL` | **yes if enabled** | `""` when disabled | — | enabled + missing → **abort** (`:125`). A monitor that cannot page must not start silently. |
-| `PROPOLIS_OPS_NTFY_TOPIC` | **yes if enabled** | `""` when disabled | — | enabled + missing → abort (`:127`). The `propolis-ops` value seen in tests is not a runtime default. |
-| `PROPOLIS_OPS_NTFY_TOKEN` | no | none (`:140`) | — | optional bearer token |
+| `PROPOLIS_OPS_ENABLED` | no | `false` (`config.rs:119`) | - | opt-in; a deployment predating ops-alert still starts |
+| `PROPOLIS_OPS_NTFY_URL` | **yes if enabled** | `""` when disabled | - | enabled + missing → **abort** (`:125`). A monitor that cannot page must not start silently. |
+| `PROPOLIS_OPS_NTFY_TOPIC` | **yes if enabled** | `""` when disabled | - | enabled + missing → abort (`:127`). The `propolis-ops` value seen in tests is not a runtime default. |
+| `PROPOLIS_OPS_NTFY_TOKEN` | no | none (`:140`) | - | optional bearer token |
 | `PROPOLIS_OPS_POLL_INTERVAL_SECS` | no | `30` (`:141`) | min 1 | |
 | `PROPOLIS_OPS_REPAGE_COOLDOWN_SECS` | no | `5400` (`:142`) | min 1 | |
 | `PROPOLIS_OPS_STALL_FOR_SECS` | no | `600` (`:143`) | min 1 | |
@@ -256,7 +255,7 @@ u32.
 ## Collector/control-plane split binaries (SP-A)
 
 Two additional binaries, each its own process with its own `load_config_from_env()` and its own
-`/etc/propolis/<name>.env` — the disposable-collector / control-plane topology
+`/etc/propolis/<name>.env` - the disposable-collector / control-plane topology
 (`deploy/gateway.service`, `deploy/shipper.service`, `deploy/collector.env.example`,
 `deploy/control-plane.env.example`). Neither reads `DATABASE_URL` or any vendor/VT/console
 variable; that boundary is the entire point of the split.
@@ -268,10 +267,10 @@ parse (present-but-zero or unparseable → **abort**), matching the sensor patte
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_GATEWAY_BIND` | **yes** | — | single `ip:port`; absent → abort (`ConfigError::NoBind`); unparseable → abort (`ConfigError::InvalidBind`) |
-| `PROPOLIS_GATEWAY_CA_CERT_PATH` | **yes** | — | PEM path used to verify collector client certificates; absent → abort |
-| `PROPOLIS_GATEWAY_SERVER_CERT_PATH` | **yes** | — | PEM path the gateway presents in the TLS handshake; absent → abort |
-| `PROPOLIS_GATEWAY_SERVER_KEY_PATH` | **yes** | — | PEM path, private key for the server cert above; absent → abort |
+| `PROPOLIS_GATEWAY_BIND` | **yes** | - | single `ip:port`; absent → abort (`ConfigError::NoBind`); unparseable → abort (`ConfigError::InvalidBind`) |
+| `PROPOLIS_GATEWAY_CA_CERT_PATH` | **yes** | - | PEM path used to verify collector client certificates; absent → abort |
+| `PROPOLIS_GATEWAY_SERVER_CERT_PATH` | **yes** | - | PEM path the gateway presents in the TLS handshake; absent → abort |
+| `PROPOLIS_GATEWAY_SERVER_KEY_PATH` | **yes** | - | PEM path, private key for the server cert above; absent → abort |
 | `PROPOLIS_GATEWAY_SPOOL_DIR` | no | `/var/spool/propolis/gateway` | root of the per-collector spool tree; one `events.jsonl` per collector under `<root>/<collector_id>/` (`crates/gateway/src/spool.rs`) |
 | `PROPOLIS_GATEWAY_STATE_DIR` | no | `/var/lib/propolis/gateway` | gateway's own state directory |
 | `PROPOLIS_GATEWAY_MAX_CONCURRENT` | no | `64` | positive u32; zero/unparseable → abort |
@@ -291,25 +290,25 @@ additionally cross-checked against the client certificate's CommonName at startu
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_SHIPPER_GATEWAY_ADDR` | **yes** | — | `host:port` socket address of the gateway; absent/unparseable → abort |
-| `PROPOLIS_SHIPPER_GATEWAY_DNS` | **yes** | — | DNS name checked against the gateway's TLS server certificate during the mTLS handshake; absent → abort |
-| `PROPOLIS_SHIPPER_CA_CERT_PATH` | **yes** | — | PEM path used to verify the gateway's server certificate; absent → abort |
-| `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` | **yes** | — | PEM path, this collector's client certificate; absent → abort |
-| `PROPOLIS_SHIPPER_CLIENT_KEY_PATH` | **yes** | — | PEM path, private key for the client cert above; absent → abort |
+| `PROPOLIS_SHIPPER_GATEWAY_ADDR` | **yes** | - | `host:port` socket address of the gateway; absent/unparseable → abort |
+| `PROPOLIS_SHIPPER_GATEWAY_DNS` | **yes** | - | DNS name checked against the gateway's TLS server certificate during the mTLS handshake; absent → abort |
+| `PROPOLIS_SHIPPER_CA_CERT_PATH` | **yes** | - | PEM path used to verify the gateway's server certificate; absent → abort |
+| `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` | **yes** | - | PEM path, this collector's client certificate; absent → abort |
+| `PROPOLIS_SHIPPER_CLIENT_KEY_PATH` | **yes** | - | PEM path, private key for the client cert above; absent → abort |
 | `PROPOLIS_COLLECTOR_ID` (deprecated alias `PROPOLIS_SHIPPER_COLLECTOR_ID`, still read) | **yes** | - | this collector's identity; **must equal** the CommonName baked into `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` or the shipper refuses to start (`validate_collector_id`, `ConfigError::CollectorIdMismatch`). Same variable the four body-capturing sensors read (see "Outbox manifest" below) - it must be the SAME value everywhere on this collector, or the provenance join on `(collector_id, occurrence_id)` silently breaks attribution. |
-| `PROPOLIS_SHIPPER_SENSOR_LOGS` | **yes** | — | comma-separated `name:path` pairs, same grammar as `PROPOLIS_SENSOR_LOGS`; empty or a malformed entry → abort; at least one pair required |
+| `PROPOLIS_SHIPPER_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, same grammar as `PROPOLIS_SENSOR_LOGS`; empty or a malformed entry → abort; at least one pair required |
 | `PROPOLIS_SHIPPER_CURSOR_DIR` | no | `/var/lib/propolis/shipper/cursors` | per-log tail cursor persistence |
 | `PROPOLIS_SHIPPER_STATE_DIR` | no | `/var/lib/propolis/shipper/state` | shipper's own state directory |
 | `PROPOLIS_SHIPPER_POLL_INTERVAL_MS` | no | `1000` | positive u64 ms; zero/unparseable → abort |
 | `PROPOLIS_SHIPPER_MAX_RECORDS_PER_BATCH` | no | `15` (`batcher::MAX_RECORDS_FRAME_SAFE`) | positive u64 → usize; zero/unparseable → abort |
 | `PROPOLIS_SHIPPER_RETRY_BACKOFF_MS` | no | `2000` | positive u64 ms; zero/unparseable → abort |
 
-`PROPOLIS_SHIPPER_SENSOR_LOGS`'s `name` is used only for cursor keying and logging — every sensor
+`PROPOLIS_SHIPPER_SENSOR_LOGS`'s `name` is used only for cursor keying and logging - every sensor
 log on a collector ships through one seq/hash chain keyed by `PROPOLIS_COLLECTOR_ID`
 (via the gateway's verified client-certificate CommonName), not by the per-log name.
 
 On the control-plane side, intake's `PROPOLIS_SENSOR_LOGS` is re-pointed at the gateway's
-per-collector spool (one `name:path` entry per collector, not per sensor) — see
+per-collector spool (one `name:path` entry per collector, not per sensor) - see
 [filesystem paths](filesystem-paths.md) and `deploy/control-plane.env.example`.
 
 ---
@@ -351,11 +350,11 @@ Sensors are always separate processes. They have **no compiled-in default port**
 the bind address comes from config/env set by the deploy units. See
 [ports and protocols](ports-and-protocols.md).
 
-### Standard sensors (strict parse) — ssh, telnet, http, ftp, redis, adb, catchall
+### Standard sensors (strict parse) - ssh, telnet, http, ftp, redis, adb, catchall
 
 Shared `ConnectionBounds` pattern via each crate's local
 `parse_positive_u64`/`parse_positive_u32`: unset → default; **present-but-zero or
-unparseable → abort startup** (no upper clamp — a very large timeout/bytes value
+unparseable → abort startup** (no upper clamp - a very large timeout/bytes value
 is accepted). `parse_wan_map` (e.g. `sensor-ssh/src/main.rs:110`): comma-sep
 `local_ip=wan_ip`; empty/absent → empty map (valid: no WAN attribution, stamps a
 null `wan_ip`); invalid entry → abort.
@@ -383,9 +382,9 @@ Common per-sensor variables (each uses its own prefix; catchall uses `PROPOLIS_C
 | `<P>MAX_CONCURRENT` | no | `256` (http `512`) | u32; zero → abort |
 
 Literal names for the sensors whose `main.rs` defines these as explicit constants (the `<P>` rows
-above, instantiated): ssh — `PROPOLIS_SSH_READ_TIMEOUT_MS`, `PROPOLIS_SSH_IDLE_TIMEOUT_MS`,
+above, instantiated): ssh - `PROPOLIS_SSH_READ_TIMEOUT_MS`, `PROPOLIS_SSH_IDLE_TIMEOUT_MS`,
 `PROPOLIS_SSH_MAX_DURATION_SECS`, `PROPOLIS_SSH_MAX_CAPTURED_BYTES`, `PROPOLIS_SSH_MAX_CONCURRENT`,
-`PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`; catchall — `PROPOLIS_CATCHALL_READ_TIMEOUT_MS`,
+`PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`; catchall - `PROPOLIS_CATCHALL_READ_TIMEOUT_MS`,
 `PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS`, `PROPOLIS_CATCHALL_MAX_DURATION_SECS`, `PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES`,
 `PROPOLIS_CATCHALL_MAX_CONCURRENT`.
 
@@ -453,7 +452,7 @@ read identically by each of those four sensors' `main.rs`:
 | `PROPOLIS_COLLECTOR_ID` (deprecated alias `COLLECTOR_ID`, still read; shared across all five binaries, not `PROPOLIS_<SENSOR>_*`) | no | `local` | Stamped onto every manifest row this sensor writes. **Must equal** the CommonName of the client certificate `shipper`'s `PROPOLIS_COLLECTOR_ID` presents to the gateway on this box, because a later stage joins the gateway's cert-derived collector id against this manifest on `(collector_id, occurrence_id)`. A single-node deployment with no shipper leaves this at `local`. |
 | `PROPOLIS_<SENSOR>_OUTBOX_DIR` | no | `<PROPOLIS_<SENSOR>_SPOOL_DIR>/outbox` | Root of the per-capture manifest JSON files (`<dir>/<capture_id>.json`). The default is derived from the sensor's own resolved spool directory (not a fixed shared path) so it always lands inside the writable root the sensor's systemd unit grants - a fixed shared `/var/lib/propolis/outbox` default is unwritable under `ProtectSystem=strict` and was the SP-B-1c regression this fixed. Manifest rows are keyed by a globally-unique `capture_id`, so even where two sensors' outbox dirs happened to coincide, writes would never collide. |
 
-### Lenient sensors — cred, smtp
+### Lenient sensors - cred, smtp
 
 Invalid or zero bound → **silent default**, not abort.
 
@@ -466,7 +465,7 @@ Invalid or zero bound → **silent default**, not abort.
 - **sensor-cred** (`crates/sensor-cred/src/main.rs`): multi-protocol
   (VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Bind variables `PROPOLIS_CRED_VNC_BIND`,
   `_MYSQL_BIND`, `_MSSQL_BIND`, `_PG_BIND`, `_MONGO_BIND` (`main.rs:77-81`). At
-  least one required — none set → `exit(1)` (`:93-98`); a set-but-invalid bind →
+  least one required - none set → `exit(1)` (`:93-98`); a set-but-invalid bind →
   `exit(1)` (`:87-88`); all-configured-fail-to-bind → `exit(1)` (`:122-125`).
   `PROPOLIS_CRED_WAN_MAP` (invalid skipped), `PROPOLIS_CRED_LOG_DIR` (default
   `/var/log/propolis/cred`, per-protocol file `<protocol>.jsonl`). Bounds:
@@ -516,9 +515,9 @@ cron failure it was meant to fix.
 
 ## Related
 
-- [Ports and protocols](ports-and-protocols.md) — bind addresses/ports
-- [Filesystem paths](filesystem-paths.md) — log/spool/cursor/feed directories
-- [Integrations](integrations.md) — VirusTotal, vendor submitters, ntfy, GeoLite2
-- [Rate limits and budgets](rate-limits-and-budgets.md) — fetcher/vendor budgets
-- [Outbound controls](../security/outbound-controls.md) — the gated egress paths
-- [Configuration](../operations/configuration.md) — operator configuration guide
+- [Ports and protocols](ports-and-protocols.md) - bind addresses/ports
+- [Filesystem paths](filesystem-paths.md) - log/spool/cursor/feed directories
+- [Integrations](integrations.md) - VirusTotal, vendor submitters, ntfy, GeoLite2
+- [Rate limits and budgets](rate-limits-and-budgets.md) - fetcher/vendor budgets
+- [Outbound controls](../security/outbound-controls.md) - the gated egress paths
+- [Configuration](../operations/configuration.md) - operator configuration guide

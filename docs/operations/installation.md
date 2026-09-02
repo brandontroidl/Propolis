@@ -49,7 +49,7 @@ modes cannot drift) and reasserts directory mode/owner/group on re-runs via
 
 - **Real install requires root** (`deploy/install.sh:74-77`). It creates OS
   users, writes into `/etc`, `/var/log`, `/var/lib`, `/var/spool`, and
-  `/usr/local/bin`, and installs systemd units — all root-owned operations.
+  `/usr/local/bin`, and installs systemd units - all root-owned operations.
 - **`--dry-run` needs no privilege and no built binaries.** It prints what would
   happen; it is what `crates/sensor-framework/tests/deploy_test.rs` runs in CI
   (`deploy/install.sh:36-38`).
@@ -76,11 +76,11 @@ owned by [../reference/filesystem-paths.md](../reference/filesystem-paths.md).
 ### What `install.sh` deliberately does NOT do
 
 It does not start or enable any service, does not create or migrate the
-database, and **does not create or edit any `/etc/propolis/*.env` file** — those
+database, and **does not create or edit any `/etc/propolis/*.env` file** - those
 carry secrets the script "has no business fabricating"
 (`install.sh:19-32,232-233`). Its final message states that services are
 installed but not started, and the database is untouched. You must author the
-`.env` files yourself before starting anything — see
+`.env` files yourself before starting anything - see
 [configuration.md](configuration.md) and
 [secret-management.md](secret-management.md).
 
@@ -88,14 +88,14 @@ installed but not started, and the database is untouched. You must author the
 
 `install.sh` installs 10 production units to `/etc/systemd/system/`:
 
-- **`propolis.service`** — the unified daemon: `Type=simple`, `User=propolis`,
+- **`propolis.service`** - the unified daemon: `Type=simple`, `User=propolis`,
   `EnvironmentFile=/etc/propolis/propolis.env`, `ExecStart=/usr/local/bin/propolis`,
   `After=network.target postgresql.service` (`propolis.service:106-115`).
-  `Restart=on-failure`, `RestartSec=5` — not `Restart=always`, because the
+  `Restart=on-failure`, `RestartSec=5` - not `Restart=always`, because the
   daemon's internal supervisor restarts a panicked subsystem in-process, so a
   full process exit only ever means a fail-fast (bad config / DB unreachable /
   migration failure) or an operator stop (`propolis.service:116-124`).
-- **Nine `sensor-*.service` units** — `Type=simple`, per-sensor `User`/`Group`,
+- **Nine `sensor-*.service` units** - `Type=simple`, per-sensor `User`/`Group`,
   `EnvironmentFile=/etc/propolis/<name>.env`, `ExecStart=/usr/local/bin/sensor-<name>`,
   `Restart=always`, `RestartSec=10` (`deploy/sensor-ssh.service` is the
   reference unit).
@@ -105,7 +105,7 @@ All units apply a least-authority sandbox (`NoNewPrivileges`,
 and a supplementary hardening block). Two important caveats:
 
 > **The `SystemCallFilter` in every shipped unit is a PLACEHOLDER, not a
-> hardened filter.** It is `@system-service` minus `@privileged @resources` — a
+> hardened filter.** It is `@system-service` minus `@privileged @resources` - a
 > broad development allowlist. The unit header instructs you to derive the real
 > syscall allowlist with `strace -c -f` under representative load before
 > production (`propolis.service:176-187`). Treat it as a residual risk you must
@@ -125,7 +125,7 @@ The **standalone** `intake`/`review`/`feed`/`console` units are not installed by
 `install.sh` does not create or migrate the database. Provisioning PostgreSQL,
 its reachability, and `pg_hba` are an operator/DBA concern (`propolis.service:101-103`).
 
-The daemon runs its own migrations at startup — there is no separate migrate
+The daemon runs its own migrations at startup - there is no separate migrate
 step. On boot it loads config, connects the PgPool, then applies the
 core-scoring migrations followed by `review::migrator()`, embedded via
 `sqlx::migrate!` (`crates/propolis/src/main.rs:542-565`). A migration failure is
@@ -138,7 +138,7 @@ by [../reference/database.md](../reference/database.md); see also
 After the `.env` files exist and the database is reachable, enable and start the
 units (operator action):
 
-> **Warning — the honeypot sensors are internet-facing attacker listeners.** Do
+> **Warning - the honeypot sensors are internet-facing attacker listeners.** Do
 > not enable them until the box is positioned as intended (isolated VLAN,
 > firewalled, out-of-band admin access). See
 > [networking-tls.md](networking-tls.md) and

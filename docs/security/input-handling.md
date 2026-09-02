@@ -27,7 +27,7 @@ evidence.
 
 `sanitize_value(input, max_len)` runs a **load-bearing fixed order** (`sanitize.rs:22-27`):
 
-1. **Collapse** each run of CR / LF / tab / VT / FF to a single space — runs **first**,
+1. **Collapse** each run of CR / LF / tab / VT / FF to a single space - runs **first**,
    against the raw input. Order matters: stripping controls first could remove a character
    adjacent to a bare CR or LF and leave it standing, forging the record anyway
    (module doc, `sanitize.rs:7-10,38-45`).
@@ -36,7 +36,7 @@ evidence.
    zero-width / BOM / word-joiner / invisible-math characters; and the Unicode tag block
    (`0xE0000-0xE007F`, the ASCII-smuggling vector) (`is_dangerous`).
 3. **NFC-normalize** (combining marks preserved).
-4. **Truncate** to `max_len` bytes on a UTF-8 char boundary — never panics on a split code
+4. **Truncate** to `max_len` bytes on a UTF-8 char boundary - never panics on a split code
    point (`truncate_to_len`).
 
 Supporting properties:
@@ -49,7 +49,7 @@ Supporting properties:
 
 ### Applied structurally, not per-sensor-discretion
 
-`sanitize_value` is called across 18 source files — every sensor handler plus framework
+`sanitize_value` is called across 18 source files - every sensor handler plus framework
 `shell.rs`, `handoff.rs`, and `emit.rs`. Two facts make it structural rather than a habit
 each sensor must remember:
 
@@ -65,7 +65,7 @@ each sensor must remember:
 
 Every database write binds its values; **no SQL string is built with `format!`** in
 non-test source (a grep for `format!(...)` containing `SELECT|INSERT|UPDATE|DELETE|WHERE`
-across `crates/*/src` returns zero — the `format!` hits in tests are all inside `.bind(...)`
+across `crates/*/src` returns zero - the `format!` hits in tests are all inside `.bind(...)`
 argument values, not query text).
 
 - The **event insert** is fully parameterized: `INSERT INTO event ... VALUES ($1::inet,
@@ -79,7 +79,7 @@ argument values, not query text).
 Console query surfaces reinforce this at the route layer: search filters combine as prepared
 `($n::type IS NULL OR ...)` clauses with at least one filter required before a query runs,
 LIKE-metacharacters in free-text are escaped, and sort columns are chosen from a fixed match
-(literal order strings — no injection surface). See
+(literal order strings - no injection surface). See
 [../reference/console-routes.md](../reference/console-routes.md).
 
 Tables, enums, and migrations: [../reference/database.md](../reference/database.md).

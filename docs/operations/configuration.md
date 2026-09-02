@@ -15,8 +15,8 @@ CLI flags for runtime settings, and no config in the database. This page
 explains the model and points at the reference table that owns every exact
 default and bound.
 
-> The exhaustive list of variables — names, defaults, bounds, and
-> fail-on-invalid behavior — is owned by
+> The exhaustive list of variables - names, defaults, bounds, and
+> fail-on-invalid behavior - is owned by
 > [../reference/environment-variables.md](../reference/environment-variables.md).
 > This page does not restate those values; it explains how the surface is
 > organized and which file configures what.
@@ -31,7 +31,7 @@ Each systemd unit reads one `EnvironmentFile`:
   and connection bounds)
 
 These `.env` files are **operator-authored**. `deploy/install.sh` does not
-create them — it only prints "Next: populate /etc/propolis/*.env files"
+create them - it only prints "Next: populate /etc/propolis/*.env files"
 (`deploy/install.sh:233`). They are mode `0600` and owned by the service user.
 The defaults documented in the reference table are the **code** defaults applied
 when a variable is unset or blank; they are authoritative for runtime behavior
@@ -65,11 +65,11 @@ rDNS) all default **off**; see [../security/outbound-controls.md](../security/ou
 Configuration is validated at startup. Most binaries (`propolis`, `intake`,
 `review`, `feed`, `console`, and sensors `ssh/telnet/http/ftp/redis/adb/catchall`)
 **abort startup** on a missing required variable or a present-but-invalid /
-present-but-zero numeric bound — "zero never means unlimited"
+present-but-zero numeric bound - "zero never means unlimited"
 (`crates/propolis/src/config.rs:175-213`). A misconfiguration cannot silently
 disable a guard.
 
-Two exceptions: the `cred` and `smtp` sensors are **lenient** — an invalid or
+Two exceptions: the `cred` and `smtp` sensors are **lenient** - an invalid or
 zero bound silently falls back to the default rather than aborting
 (`crates/sensor-cred/src/main.rs:29-33`,
 `crates/sensor-smtp/src/main.rs:28-32`). Their bind variables still fail-close.
@@ -79,7 +79,7 @@ Fail-closed pairings worth noting (all owned by the reference table):
 - A vendor or VirusTotal `*_ENABLED=true` with an empty key is forced disabled
   and logged (`config.rs:399-405,521`).
 - `PROPOLIS_OPS_ENABLED=true` makes `PROPOLIS_OPS_NTFY_URL` and
-  `PROPOLIS_OPS_NTFY_TOPIC` required — a monitor that cannot page must not start
+  `PROPOLIS_OPS_NTFY_TOPIC` required - a monitor that cannot page must not start
   (`ops_alert/config.rs:122-134`).
 - `PROPOLIS_FEED_WINDOWS` fails closed on any malformed entry rather than
   skipping it (`config.rs:298-330`).
@@ -90,21 +90,19 @@ Fail-closed pairings worth noting (all owned by the reference table):
 
 Every sensor requires its bind variable (`<PREFIX>_BIND`, or
 `CATCHALL_BIND_ADDRS` for catchall, or the five `PROPOLIS_CRED_*_BIND` vars for
-cred) and refuses to start without it — there is **no compiled-in default
+cred) and refuses to start without it - there is **no compiled-in default
 port**. The "standard" port mapping (SSH 22, telnet 23, etc.) is whatever the
 operator writes into the `.env` files, not a code default. Ports are owned by
 [../reference/ports-and-protocols.md](../reference/ports-and-protocols.md).
 
 `<PREFIX>_WAN_MAP` maps a local bind address to its public WAN IP for
 multi-vantage breadth scoring, as `private=public` (NAT/DNAT) or `public=public`
-(direct bind). An unmapped local address yields a null `wan_ip` — no WAN
-attribution — which is a valid, non-fatal state.
+(direct bind). An unmapped local address yields a null `wan_ip` - no WAN
+attribution - which is a valid, non-fatal state.
 
 ## Related
 
-- [../reference/environment-variables.md](../reference/environment-variables.md)
-  — every variable, default, and bound (canonical)
-- [secret-management.md](secret-management.md) — the secret-bearing variables
-- [networking-tls.md](networking-tls.md) — bind exposure and TLS
-- [../reference/rate-limits-and-budgets.md](../reference/rate-limits-and-budgets.md)
-  — fetcher/vendor budgets
+- [../reference/environment-variables.md](../reference/environment-variables.md) - every variable, default, and bound (canonical)
+- [secret-management.md](secret-management.md) - the secret-bearing variables
+- [networking-tls.md](networking-tls.md) - bind exposure and TLS
+- [../reference/rate-limits-and-budgets.md](../reference/rate-limits-and-budgets.md) - fetcher/vendor budgets

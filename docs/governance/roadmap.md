@@ -19,7 +19,7 @@ design material and are not part of the public documentation corpus.
   project (see [maintenance-and-support.md](maintenance-and-support.md)), roadmap
   direction is the maintainer's call; there is no committed delivery schedule.
 - **Evidence over intent.** What ships is decided against the actual state of the
-  code, tests, and observed behavior — not against aspirational plans. Planned
+  code, tests, and observed behavior - not against aspirational plans. Planned
   work is not presented as delivered.
 - **Additive and reversible first.** New capability is preferred in forms that
   keep existing deployments working (safe defaults, additive schema, opt-in and

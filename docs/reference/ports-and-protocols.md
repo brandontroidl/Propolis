@@ -118,7 +118,7 @@ bind/listen code found in its source].
 ## Machine-facing endpoints (health / ready / metrics)
 
 These share the **same** bind as the console (`PROPOLIS_CONSOLE_BIND`, default
-`127.0.0.1:8080`) — there is **no** separate metrics/health port. All three are
+`127.0.0.1:8080`) - there is **no** separate metrics/health port. All three are
 merged onto the single console router and mounted **outside** the auth
 middleware (`crates/console/src/routes/mod.rs:49-51`).
 
@@ -136,7 +136,7 @@ Full console route inventory is owned by
 - **intake / review / feed** are PostgreSQL clients only; they connect out via
   `DATABASE_URL` and bind no network listener.
 - The `propolis` aggregated binary's outbound fetcher (malware/artifact
-  retrieval) is **outbound only** — no inbound bind
+  retrieval) is **outbound only** - no inbound bind
   (`crates/propolis/src/config.rs:34-64`).
 
 ## Admin / SSH
@@ -149,7 +149,7 @@ not part of this software.
 ## Standard deploy port map (example)
 
 The mapping a conventional `deploy/`-based single-node setup configures. These
-are **not** compiled-in defaults — each is set by the operator in
+are **not** compiled-in defaults - each is set by the operator in
 `/etc/propolis/<sensor>.env`.
 
 | Port | Facing | Service | Bind env |
@@ -178,9 +178,9 @@ sensor or daemon main.
 
 ## See also
 
-- [filesystem-paths.md](filesystem-paths.md) — every path (logs, spool, state,
+- [filesystem-paths.md](filesystem-paths.md) - every path (logs, spool, state,
   config).
-- [environment-variables.md](environment-variables.md) — exact env-var defaults
+- [environment-variables.md](environment-variables.md) - exact env-var defaults
   and bounds.
-- [../operations/networking-tls.md](../operations/networking-tls.md) — reverse
+- [../operations/networking-tls.md](../operations/networking-tls.md) - reverse
   proxy / TLS placement.

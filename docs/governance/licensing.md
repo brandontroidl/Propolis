@@ -14,21 +14,21 @@ Propolis is **source-available, not open source.**
 ## License
 
 The license is the **PolyForm Noncommercial License 1.0.0**. The full,
-authoritative legal text is in [`LICENSE.md`](../../LICENSE.md) — this page
+authoritative legal text is in [`LICENSE.md`](../../LICENSE.md) - this page
 summarizes it and does not override it.
 
-## Noncommercial use — free
+## Noncommercial use - free
 
 Noncommercial use is granted free under that license. Per `LICENSE.md`, that
 covers personal use, home labs, research, teaching, and nonprofit, public-safety,
 or government organizations.
 
-## Commercial use — separate license required
+## Commercial use - separate license required
 
 Commercial use is **not** granted by the noncommercial license. Per `LICENSE.md`,
-if you (or a company you work for) use the software to make money — in a product
+if you (or a company you work for) use the software to make money - in a product
 or service you sell, in the internal operations of a for-profit organization, or
-otherwise with an anticipated commercial application — you need a **separate
+otherwise with an anticipated commercial application - you need a **separate
 commercial license from the maintainer**, arranged through the project's GitHub
 repository.
 
@@ -42,4 +42,4 @@ which would permit commercial use.
 
 The license carries no warranty; see also
 [maintenance-and-support.md](maintenance-and-support.md). Contributions are made
-under this same license — see [contribution.md](contribution.md).
+under this same license - see [contribution.md](contribution.md).

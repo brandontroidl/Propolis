@@ -119,7 +119,7 @@ contradict each other (`crates/sensor-framework/src/persona.rs:1-16`): **Ubuntu
 filesystem underneath, so path traversal is structurally impossible
 (`crates/sensor-framework/src/fakefs.rs:1-14`). It serves canned `/etc/hostname`,
 `/etc/passwd` (9 accounts incl. root, `ubuntu` uid 1000, `www-data`, `sshd`),
-`/etc/hosts` (loopback and IPv6 multicast only — no routable IPs), `/etc/os-release`,
+`/etc/hosts` (loopback and IPv6 multicast only - no routable IPs), `/etc/os-release`,
 `/proc/version`, and `/proc/cpuinfo` (Intel Xeon E5-2686 v4, 1 core) (`:39-88`).
 Directories include `/`, `/tmp`, `/root`, `/etc`, and `/home/ubuntu` (`:90-105`).
 
@@ -154,7 +154,7 @@ I/O (`:9-29`). This is asserted by `never_exec_static_check` and
   other command gives `<cmd>: command not found`.
 - BusyBox applet set is a single source of truth (`BUSYBOX_APPLETS`, `:366-369`)
   and deliberately excludes `curl` (real busybox ships none), so `busybox curl`
-  gives `applet not found` — matching the real-busybox check Mirai/Gafgyt perform.
+  gives `applet not found` - matching the real-busybox check Mirai/Gafgyt perform.
 - Download capture handles direct, busybox, full-path, and
   `sh -c "wget ...; ..."` chained forms (`:311-357`).
 
@@ -199,7 +199,7 @@ with 0640 permissions and re-hash-on-read fail-closed integrity
 ### Capture hand-off
 
 `CaptureHandoff` moves capture off the connection's response path so a capture
-never delays the reply — response latency must not leak whether a capture happened
+never delays the reply - response latency must not leak whether a capture happened
 (`crates/sensor-framework/src/handoff.rs:1-14`). `submit(job)` is backed by
 `mpsc::try_send` and never blocks: a full queue drops the job, returns
 `CaptureDropped`, increments `dropped_count`, and logs at power-of-two totals
@@ -217,7 +217,7 @@ is isolated with `catch_unwind` and the worker continues (`:35-41, 200-225`).
 `O_APPEND` (atomic concurrent appends on local storage), then `write_all` +
 `flush`; a serialize/append failure never partially writes a line
 (`crates/sensor-framework/src/emit.rs:40-53, 1-7`). The log directory must be local
-storage — NFS `O_APPEND` can race (`:26-39`).
+storage - NFS `O_APPEND` can race (`:26-39`).
 
 ## Per-protocol capture behavior
 
@@ -239,15 +239,15 @@ captures SCP/SFTP transfers.
   `main.rs:246-285`). Banner default is the persona OpenSSH version
   (`main.rs:44`). A residual HASSHServer distinguishability from the minimal
   KEXINIT offer is a tracked follow-up (`main.rs:41-43`).
-- **Auth** (`auth.rs`): **accepts every credential and method** — reaching userauth
-  is itself crypto proof the peer is real — except `none`, which is rejected with
+- **Auth** (`auth.rs`): **accepts every credential and method** - reaching userauth
+  is itself crypto proof the peer is real - except `none`, which is rejected with
   `USERAUTH_FAILURE` listing `publickey,password` to defeat the
   `PreferredAuthentications=none` probe (`:153-206`). Captures sanitized `username`
   and `method` in `honeypot_login_attempt`; the **password is read only to advance
   the parser and is never stored, logged, or emitted** (`:11-21, 142-192`). String
   cap `MAX_METADATA_STRING_LEN = 255` (`:38`).
 - **Channels** (`channel.rs`): only `session` channels are confirmed;
-  `direct-tcpip` and all other types are refused at open — this closes off
+  `direct-tcpip` and all other types are refused at open - this closes off
   attacker-directed proxying by construction (`:8-15, 96-117`). Actions: `pty-req`
   (ack), `shell` (interactive FakeShell), `exec <cmd>` (one-shot; `scp -t ` starts
   the SCP receiver), `subsystem sftp` (SFTP handler). `MAX_LINE_LEN = 8192`.
@@ -313,8 +313,7 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
   dropped), SYST→`215 UNIX Type: L8`, FEAT, PWD/CWD, TYPE (validated), SIZE/MDTM
   (canned `readme.txt`, 4096 bytes), REST, PASV/EPSV (opens a passive data listener
   on the control interface), LIST/NLST (canned listing), STOR (captures upload →
-  `honeypot_malware_upload`), RETR→550, PORT/EPRT→502 (**active mode unimplemented —
-  never dials out**), QUIT, NOOP, unknown→500.
+  `honeypot_malware_upload`), RETR→550, PORT/EPRT→502 (**active mode unimplemented - never dials out**), QUIT, NOOP, unknown→500.
 - **Passive-data hijack defense** (`data_peer_matches`, `:41-49, 220, 247-253`): a
   passive data connection whose source IP differs from the control connection's is
   refused with `425 Security: bad IP connecting.`, preventing off-path attribution
@@ -334,7 +333,7 @@ Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
   (always OK → `honeypot_login_attempt`, password never in metadata), INFO
   (live-ish 7.2.4 dump with per-process random `run_id`/`master_replid`, real pid,
   advancing uptime, persona OS line, `:107-230`), CONFIG GET (canned), CONFIG SET
-  (always OK; only `dir`/`dbfilename` — the RDB-RCE staging primitive — emit a
+  (always OK; only `dir`/`dbfilename` - the RDB-RCE staging primitive - emit a
   `honeypot_command_exec` indicator, `:376-400`), SET (always OK, key and value
   captured, no real store), GET (always nil, no event), SLAVEOF/REPLICAOF (OK +
   captured args), EVAL/SCRIPT (canned compile error + captured args, **never runs
@@ -351,7 +350,7 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
 - **Behavior** (`handler.rs`): banner `220 <host> ESMTP Postfix (Ubuntu)` (persona
   host). EHLO advertises PIPELINING, SIZE 10240000, ETRN, STARTTLS, AUTH PLAIN
   LOGIN, ENHANCEDSTATUSCODES, 8BITMIME, DSN, SMTPUTF8, CHUNKING (`:57-69`). Verbs
-  (`:81-177`): HELO/EHLO, STARTTLS (`454 TLS not available` — no in-process TLS),
+  (`:81-177`): HELO/EHLO, STARTTLS (`454 TLS not available` - no in-process TLS),
   AUTH PLAIN (decodes username, drops password → `honeypot_login_attempt`), AUTH
   LOGIN (username captured, password dropped), MAIL FROM / RCPT TO, DATA (captures
   mail_from/rcpt_to/subject/body_size → `honeypot_command_exec`, replies with a
@@ -359,7 +358,7 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
   line 8192, DATA body 65536, username 255.
 - **Bounds:** common defaults, `max_concurrent` 256. **Bound parsing falls back to
   the default on invalid/zero input rather than refusing to start**
-  (`main.rs:28-38`) — differs from the reject-on-zero sensors. No spool (message
+  (`main.rs:28-38`) - differs from the reject-on-zero sensors. No spool (message
   body captured as size and subject only, never stored as a file).
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
   `honeypot_command_exec` (DATA).
@@ -370,14 +369,14 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
 5555).
 
 - **Protocol** (`adb_proto.rs`): 24-byte header messages
-  (CNXN/OPEN/OKAY/WRTE/CLSE). **No A_AUTH** — the emulated surface is the
+  (CNXN/OPEN/OKAY/WRTE/CLSE). **No A_AUTH** - the emulated surface is the
   auth-disabled adbd on port 5555 (the ADB.Miner target) (`:25-32`).
   `device_banner()` presents a fake Nexus 5 / hammerhead / Android 6.0.1 / sdk 23
   and deliberately omits `shell_v2` so real clients fall back to plain v1 shell
   framing (`:169-173`). `MAX_MESSAGE_DATA_LEN` 1_000_000, `OUR_MAXDATA` 4096.
 - **Behavior** (`handler.rs`): CNXN handshake → device banner, then multiplexed
   streams (`MAX_STREAMS_PER_CONN = 32`). OPEN destinations (`:498-573`): `shell:` →
-  interactive FakeShell (authenticated **always false** — ADB has no auth step),
+  interactive FakeShell (authenticated **always false** - ADB has no auth step),
   `shell:<cmd>` → one-shot exec, `sync:` → file-transfer sub-protocol, anything
   else refused. Sync sub-protocol: SEND/DATA/DONE → captures the pushed file →
   `honeypot_malware_upload`; RECV → refused (`FAIL Permission denied`, **never
@@ -436,7 +435,7 @@ per-protocol bind var is required.
 - **Session id:** `Uuid::now_v7()` minted per accepted TCP connection by the
   listener, per datagram for catchall UDP; carried on every event.
 - **Password discipline:** every login-capturing sensor reads the password only to
-  advance the protocol and drops it — never stored, logged, or placed in any event
+  advance the protocol and drops it - never stored, logged, or placed in any event
   field (SSH `auth.rs:11-21`, telnet `handler.rs:108-114`, FTP `:104-111`, redis
   `handler.rs:329-348`, SMTP `:101-131`, cred handlers). Tests assert absence at
   the serialized-JSON level.
@@ -446,7 +445,7 @@ per-protocol bind var is required.
   ssh/telnet true post-login).
 - **Never-serve-outbound:** FTP RETR→550, FTP PORT/EPRT→502, ADB sync RECV→FAIL,
   SSH `direct-tcpip` refused, catchall/UDP never responds, shell `wget`/`curl`
-  canned — no sensor fetches or serves attacker-directed content.
+  canned - no sensor fetches or serves attacker-directed content.
 
 ## Notes
 

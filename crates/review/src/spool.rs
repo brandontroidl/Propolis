@@ -17,14 +17,14 @@ pub const DEFAULT_SPOOL_ROOT: &str = "/var/spool/propolis";
 const ENV_SPOOL_ROOT: &str = "PROPOLIS_SPOOL_ROOT";
 
 /// The sensors that spool captured bodies, paired with the env var each one reads for its own spool
-/// directory. `catchall` has no per-sensor override (its binary takes no spool config), so it always
-/// resolves under the root.
-const BODY_SPOOLERS: [(&str, Option<&str>); 5] = [
+/// directory. catchall is deliberately absent: it never spools a body (crates/sensor-catchall/src/
+/// handler.rs module doc; its Config carries no spool fields), so listing it - as an earlier version
+/// of this file did - made the VT scan, retention and console walk a directory nothing writes to.
+const BODY_SPOOLERS: [(&str, Option<&str>); 4] = [
     ("ssh", Some("PROPOLIS_SSH_SPOOL_DIR")),
     ("adb", Some("PROPOLIS_ADB_SPOOL_DIR")),
     ("ftp", Some("PROPOLIS_FTP_SPOOL_DIR")),
     ("telnet", Some("PROPOLIS_TELNET_SPOOL_DIR")),
-    ("catchall", None),
 ];
 
 /// The spool tree root: `PROPOLIS_SPOOL_ROOT`, else [`DEFAULT_SPOOL_ROOT`].
@@ -42,9 +42,8 @@ pub fn spool_subdir(name: &str) -> PathBuf {
     spool_root().join(name)
 }
 
-/// (sensor name, spool dir) for every sensor that spools captured bodies. ssh/adb/ftp/telnet capture
-/// via the framework CaptureHandoff; catchall spools raw payloads directly. All produce bodies that
-/// must be scanned, retention-cleaned, and listed. Each directory honours that sensor's own
+/// (sensor name, spool dir) for every sensor that spools captured bodies: ssh/adb/ftp/telnet, all via
+/// the framework CaptureHandoff. Their bodies must be scanned, retention-cleaned, and listed. Each directory honours that sensor's own
 /// `PROPOLIS_<SENSOR>_SPOOL_DIR` override so this never disagrees with where the sensor actually
 /// writes.
 pub fn body_spool_dirs() -> Vec<(&'static str, PathBuf)> {
@@ -78,7 +77,7 @@ mod tests {
         sorted.sort();
         assert_eq!(
             sorted,
-            vec!["adb", "catchall", "ftp", "ssh", "telnet"],
+            vec!["adb", "ftp", "ssh", "telnet"],
             "canonical body-spool set changed - update every consumer deliberately, in one place"
         );
     }

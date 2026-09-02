@@ -17,10 +17,10 @@ migration → change map are owned by [`reference/database`](../reference/databa
 
 Migration SQL lives in **two crates**, applied against **one** physical database:
 
-- `crates/core-scoring/migrations/` — 11 files, `0001_enums.sql` …
+- `crates/core-scoring/migrations/` - 11 files, `0001_enums.sql` …
   `0011_established_event_count.sql`. Owns `event`, `ip_score`, `sample_analysis`,
   and all five enum types.
-- `crates/review/migrations/` — 3 files: `0001_review_queue.sql`,
+- `crates/review/migrations/` - 3 files: `0001_review_queue.sql`,
   `0002_vendor_submission.sql`, `0003_fetch_attempt.sql`.
 
 Both histories number from `0001`. sqlx's default `_sqlx_migrations` bookkeeping
@@ -46,7 +46,7 @@ Migrations are **additive and forward-only**:
 
 - New columns are added with a default or as nullable so existing rows still validate;
   new tables are created, not mutated in place.
-- **Never edit an already-applied migration in place** — it corrupts persisted state.
+- **Never edit an already-applied migration in place** - it corrupts persisted state.
   Add a new numbered migration instead; rebuild a dev database from scratch when a
   history changes.
 - Bump nothing in the wire/hash encoding for a schema change (see below). Columns not
@@ -54,10 +54,10 @@ Migrations are **additive and forward-only**:
   be added freely; `session_id` was added this way (`0007`) without touching the chain.
 
 Two migrations in the current history embed data-only backfills rather than schema
-change: `0006_relax_eligibility.sql` (recomputes eligibility flags — the one migration
+change: `0006_relax_eligibility.sql` (recomputes eligibility flags - the one migration
 that embeds a scoring formula in SQL) and the `0010`/`0011` backfills for `active_days`
 and `established_event_count`. `0010` explicitly refuses to duplicate tier logic in SQL
-(`0010:14-16`) — scoring stays in Rust. Keep new scoring logic out of migrations.
+(`0010:14-16`) - scoring stays in Rust. Keep new scoring logic out of migrations.
 
 ## The frozen wire contract
 
@@ -69,13 +69,13 @@ and the append-only ledger's canonical hash encoding
   and hashes them; a golden vector pins the encoding
   (`hashing.rs:192-214`, `golden_chain_hash_is_stable`).
 - The enum Serialize casing is deliberately the bare Rust identifier (e.g.
-  `"CatchallProbe"`, `"Tcp"`), **not** snake/lowercase — changing it would change every
+  `"CatchallProbe"`, `"Tcp"`), **not** snake/lowercase - changing it would change every
   chain hash. Locked by
   `signal_type_serialize_is_unchanged_bare_rust_identifier` and
   `protocol_serialize_is_unchanged...` (`domain/enums.rs:174,204`). Deserialize accepts
   the wire strings so intake can parse sensor records.
 - `observed_at` serializes as RFC 3339 via chrono's default serde and **must** match
-  `hashing.rs` — do not switch to `ts_microseconds` or the chain breaks
+  `hashing.rs` - do not switch to `ts_microseconds` or the chain breaks
   (`sensor-wire/src/lib.rs:45-48`).
 
 Any change touching these is a chain-compatibility break, not an additive migration.
@@ -100,7 +100,7 @@ frozen in CI via `--locked`.
 
 > **Rebuild in release after re-vendoring.** `.gitattributes` marks `vendor/** -text`
 > so EOL normalization cannot mangle vendored files' `.cargo-checksum.json`. A checksum
-> mismatch surfaces only in a **release** build — a debug/test build can pass. After any
+> mismatch surfaces only in a **release** build - a debug/test build can pass. After any
 > `cargo vendor`, run `cargo build --release --locked`, not just `cargo test`.
 
 The dependency/vendoring model is owned by

@@ -18,9 +18,8 @@ installer, read from argv, or written back to disk by the platform.
 All secrets are set in the per-service files under `/etc/propolis/`:
 
 - Files are mode `0600`, owned by the service user (`install.sh` creates the
-  users; the `.env` files themselves are authored by hand —
-  `crates/propolis/src/config.rs` reads them, `deploy/install.sh:25-28`).
-- `deploy/install.sh` **does not create or edit any `.env` file** — the script
+  users; the `.env` files themselves are authored by hand - `crates/propolis/src/config.rs` reads them, `deploy/install.sh:25-28`).
+- `deploy/install.sh` **does not create or edit any `.env` file** - the script
   "has no business fabricating" secret-bearing files (`install.sh:19-32,232-233`).
 - Configuration is parsed from environment variables only; **no secret is read
   from argv** (all via `env::var`), so secrets do not appear in process listings
@@ -55,7 +54,7 @@ string is retained in memory, and logins are verified against that hash
 value, for example:
 
 ```
-openssl rand -base64 24      # example — any strong secret works
+openssl rand -base64 24      # example - any strong secret works
 ```
 
 Startup aborts if the variable is missing or empty (`config.rs:517`).
@@ -65,12 +64,12 @@ Startup aborts if the variable is missing or empty (`config.rs:517`).
 Signs console sessions. If set it must be **exactly 64 hex characters (32
 bytes)** or startup fails; if unset or empty, a fresh random 32-byte key is
 generated on every start (`config.rs:371-389`). Sessions are in-memory only, so
-a per-restart key merely invalidates existing sessions — which a restart drops
+a per-restart key merely invalidates existing sessions - which a restart drops
 anyway. Set it explicitly only if you want session-signing stability documented
 and controlled. Example generator:
 
 ```
-openssl rand -hex 32         # example — produces the required 64 hex chars
+openssl rand -hex 32         # example - produces the required 64 hex chars
 ```
 
 ### Vendor API keys (optional, opt-in)
@@ -79,13 +78,13 @@ openssl rand -hex 32         # example — produces the required 64 hex chars
 credentials; DShield also uses `PROPOLIS_VENDOR_DSHIELD_USER`, composed as
 `user:key` into the single key slot (`config.rs:454-474`). A vendor with
 `*_ENABLED=true` but an empty key is **forced disabled** (fail-closed, logged
-warning — `config.rs:399-405`). These submitters produce outbound requests and
+warning - `config.rs:399-405`). These submitters produce outbound requests and
 default off; see [../security/outbound-controls.md](../security/outbound-controls.md).
 
 ### `PROPOLIS_VT_KEY` (optional, opt-in)
 
 The VirusTotal API key. `PROPOLIS_VT_ENABLED` is honored only when the key is
-non-empty (`config.rs:520-521`) — enabling VirusTotal requires both. VirusTotal
+non-empty (`config.rs:520-521`) - enabling VirusTotal requires both. VirusTotal
 scanning is outbound egress and defaults off.
 
 ### `PROPOLIS_OPS_NTFY_TOKEN` (optional)
@@ -108,8 +107,8 @@ when `PROPOLIS_OPS_ENABLED=true`.
 
 ## Related
 
-- [configuration.md](configuration.md) — the overall configuration model
-- [../security/authn-authz.md](../security/authn-authz.md) — console
+- [configuration.md](configuration.md) - the overall configuration model
+- [../security/authn-authz.md](../security/authn-authz.md) - console
   authentication and sessions
-- [../security/outbound-controls.md](../security/outbound-controls.md) — the
+- [../security/outbound-controls.md](../security/outbound-controls.md) - the
   gated egress paths the vendor/VirusTotal/ops keys enable

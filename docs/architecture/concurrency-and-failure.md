@@ -11,8 +11,7 @@ last-verified: 2026-08-26
 
 Propolis is built to stay bounded and to fail in a defined direction under exactly the
 saturation an attacker can induce on purpose. This page describes the concurrency
-model — per-connection tasks, bounded queues, and the single serialized append writer —
-and the failure modes at each stage, with the fail-open vs fail-closed posture stated
+model - per-connection tasks, bounded queues, and the single serialized append writer - and the failure modes at each stage, with the fail-open vs fail-closed posture stated
 explicitly.
 
 ## Concurrency model
@@ -23,15 +22,15 @@ Each sensor's listener runs an accept loop and spawns **one task per connection*
 per UDP datagram). Two framework-enforced bounds apply without the handler's
 cooperation (`crates/sensor-framework/src/listener.rs`, `bounds.rs`):
 
-- **`max_concurrent`** — a `tokio::sync::Semaphore` seeded with that many permits. A
+- **`max_concurrent`** - a `tokio::sync::Semaphore` seeded with that many permits. A
   connection accepted while every permit is held is **refused immediately** (the socket
   is closed, not queued). An accepted-but-waiting connection would itself be the
   unbounded resource the cap exists to prevent.
-- **`max_duration`** — the handler future runs inside `tokio::time::timeout`; once it
+- **`max_duration`** - the handler future runs inside `tokio::time::timeout`; once it
   elapses, the future and everything it owns (the connection included) is dropped in
   place.
 
-Three further bounds — `read_timeout`, `idle_timeout`, and `max_captured_bytes` — are
+Three further bounds - `read_timeout`, `idle_timeout`, and `max_captured_bytes` - are
 enforced by the handler's own read loop rather than the listener (the listener hands
 off the raw stream so the handler can resolve WAN attribution), but their **values**
 come from the same single `ConnectionBounds` definition, not numbers each sensor
@@ -47,7 +46,7 @@ retry loop.
 
 ### Off-response-path capture hand-off (a bounded queue + single worker)
 
-Capturing a file body — hashing it, writing it to the spool, appending the event — must
+Capturing a file body - hashing it, writing it to the spool, appending the event - must
 never make the connection's reply path wait, because an attacker measuring response
 latency would be measuring exactly the work that only happens when something is worth
 capturing. So the sensor handler does no more than build a `CaptureJob` and `submit` it
@@ -56,12 +55,12 @@ capturing. So the sensor handler does no more than build a `CaptureJob` and `sub
 - **`submit` is backed by `mpsc::Sender::try_send`** and returns immediately either
   way. There is no path by which enqueuing can stall a connection's response, even under
   deliberate saturation.
-- **A full queue DROPS the job and increments a counter** — it never blocks. The drop
+- **A full queue DROPS the job and increments a counter** - it never blocks. The drop
   count is logged at power-of-two totals.
 - **Exactly one worker drains the queue, strictly sequentially.** `mpsc::channel` hands
   out one `Receiver`; `start_worker` moves it out of a `Mutex<Option<_>>` on its first
   call and **panics on any later call**. That single task processes one job to
-  completion — including its synchronous `spool.store` — before it `recv()`s again, so
+  completion - including its synchronous `spool.store` - before it `recv()`s again, so
   `store` is never invoked concurrently with itself.
 - A panicking sensor `event_builder` is caught, logged, and dropped; **the worker
   survives**.
@@ -80,14 +79,14 @@ never leaves it held. See [storage](./storage.md).
 Concurrent NDJSON log appends (multiple connections through one `EventEmitter` behind an
 `Arc`) are serialized by the OS: one `O_APPEND` `write_all` of the whole line is atomic
 on a local filesystem, so lines are never interleaved or overwritten. This guarantee
-**does not extend to NFS** (the client kernel simulates `O_APPEND` and can race) — the
+**does not extend to NFS** (the client kernel simulates `O_APPEND` and can race) - the
 log directory must be local storage.
 
 ## Failure modes and posture
 
 | Stage | Failure | Behavior | Posture |
 |---|---|---|---|
-| Sensor accept loop | Concurrency cap reached | Connection refused immediately (socket closed, not queued) | Bounded — sheds load |
+| Sensor accept loop | Concurrency cap reached | Connection refused immediately (socket closed, not queued) | Bounded - sheds load |
 | Sensor accept loop | Transient accept/recv error | ~20ms backoff, retry | Degrade slowly |
 | Sensor handler | Panic on one connection | Caught at the task boundary; listener and other connections unaffected | Isolated |
 | Sensor bind | One configured port fails to bind | Non-fatal: the sensor logs it and keeps the other ports (the caller loops and does not propagate) | Degrade partially |
@@ -107,7 +106,7 @@ log directory must be local storage.
 
 The one deliberate fail-open is **capture completeness under queue saturation**: a full
 capture queue drops the job rather than blocking. This is a covertness decision, not an
-oversight — blocking the reply path to guarantee a capture would announce, by latency,
+oversight - blocking the reply path to guarantee a capture would announce, by latency,
 that a capture happened. The drop is counted and logged so the operator can see it.
 
 Everything on the **integrity, storage, and control-plane** paths fails closed: the hash
@@ -117,9 +116,9 @@ missing or malformed input.
 
 ## Backpressure and capacity
 
-- **Sensors** shed load by refusing connections past `max_concurrent` — they do not
+- **Sensors** shed load by refusing connections past `max_concurrent` - they do not
   queue.
-- **Capture** sheds load by dropping jobs past the bounded queue — it does not block.
+- **Capture** sheds load by dropping jobs past the bounded queue - it does not block.
 - **Intake** polls the sensor logs on an interval; it advances a per-sensor cursor and
   is naturally rate-limited by its poll interval and the serialized append lock.
 - The **console** binds loopback-only by default and derives metrics from live DB
@@ -132,9 +131,8 @@ Capacity-planning guidance and the exact bound values are owned by
 
 ## Related
 
-- [architecture/storage.md](./storage.md) — the serialized append path.
-- [architecture/sensors.md](./sensors.md) — the sensor framework these bounds live in.
-- [operations/queue-and-spool.md](../operations/queue-and-spool.md) — operating the
+- [architecture/storage.md](./storage.md) - the serialized append path.
+- [architecture/sensors.md](./sensors.md) - the sensor framework these bounds live in.
+- [operations/queue-and-spool.md](../operations/queue-and-spool.md) - operating the
   capture queue and spool.
-- [operations/health-and-observability.md](../operations/health-and-observability.md) —
-  readiness and the drop/rejection counters.
+- [operations/health-and-observability.md](../operations/health-and-observability.md) - readiness and the drop/rejection counters.

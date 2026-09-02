@@ -108,7 +108,7 @@ fn max_source_ips_shown() -> usize {
 ///   is the FIRST attacker that reported each URL, not every one that referenced it.
 /// - It covers FETCHED samples only. A body uploaded directly to a sensor has no `fetch_attempt`
 ///   row, so it shows no source here until the capture/observation link lands.
-/// Rows whose `source_ip` was never recorded (NULL) are simply absent.
+///   Rows whose `source_ip` was never recorded (NULL) are simply absent.
 async fn sample_source_ips(
     pool: &sqlx::PgPool,
 ) -> std::collections::HashMap<String, Vec<String>> {

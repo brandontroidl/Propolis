@@ -18,7 +18,7 @@ section; for what to do about several of these, see the
 ## `SystemCallFilter` is a placeholder
 
 Every shipped systemd unit sets `SystemCallFilter=@system-service` minus
-`@privileged @resources` — explicitly a broad development allowlist, labelled as
+`@privileged @resources` - explicitly a broad development allowlist, labelled as
 such in the unit header, which instructs the operator to derive the real
 per-binary allowlist before production. **A tightened seccomp filter is not
 shipped in the repo, and whether one was derived on any given host is not
@@ -63,14 +63,14 @@ one, it makes genuine outbound requests:
 - The **malware fetcher** dials attacker-supplied URLs. It is guarded by a
   fail-closed SSRF vetter (scheme allowlist, userinfo rejection, DNS-rebinding
   defense, pinned-address connect, forbidden-target/reserved-IP checks, tftp
-  port-69 pinning) run on the initial URL and every redirect hop — but enabling it
+  port-69 pinning) run on the initial URL and every redirect hop - but enabling it
   is still a deliberate acceptance of dialing hostile hosts.
 - **VirusTotal**, **vendor abuse submitters**, **console rDNS**, and **ops-alert
   ntfy** each reach a third-party or operator-configured endpoint when enabled.
 
 The accurate framing is: *sensors are egress-free by construction; the platform's
 few enrichment/reporting egress paths are operator-gated and default off.* The
-workspace is **not** egress-free — `Cargo.lock` contains `reqwest` and `hyper`,
+workspace is **not** egress-free - `Cargo.lock` contains `reqwest` and `hyper`,
 used by these paths. Full behavior and guards live in
 [outbound-controls.md](./outbound-controls.md).
 
@@ -87,7 +87,7 @@ specifics are enumerated here.
 ## Public feed repository exposure
 
 The published blocklist feed contains only attacker source IPs and
-tier/first-seen/last-seen/category fields — **zero** `wan_ip` (honeypot ingress
+tier/first-seen/last-seen/category fields - **zero** `wan_ip` (honeypot ingress
 attribution) references, verified by construction across the feed crate. Publishing
 the feed contents does not leak your vantage. However, the publish-to-repo step
 (`deploy/blocklist-sync.sh`) is an operator cron job, not a shipped timer; its

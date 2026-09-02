@@ -42,7 +42,7 @@ memory, never written to disk or the database (`crates/console/src/auth.rs:45-52
 Verification fails closed: an unparseable stored hash returns `false` rather than panicking
 (`auth.rs:57-64`).
 
-The console **refuses to start** with no password — an empty or absent
+The console **refuses to start** with no password - an empty or absent
 `PROPOLIS_CONSOLE_PASSWORD` is a fail-closed `MissingPassword` startup error
 (`crates/console/src/main.rs:123-126`).
 
@@ -54,11 +54,11 @@ The console **refuses to start** with no password — an empty or absent
   tag is verified **before** any session-map lookup, so a guessed or forged id is rejected
   without a lookup (`auth.rs:138-155`).
 - **Session id:** 32 random bytes, hex-encoded (`auth.rs:123`).
-- **Store:** in-memory `RwLock<HashMap>` only — there is **no session table**, so every
+- **Store:** in-memory `RwLock<HashMap>` only - there is **no session table**, so every
   session is lost on restart, by design (`auth.rs:87-91`).
 - **TTL:** default 24h; configurable via `with_ttl` (`auth.rs:76,103-109`).
 - **Secret:** `PROPOLIS_CONSOLE_SESSION_SECRET` (64 hex chars / 32 bytes) if set, else a
-  freshly generated secret at startup — which, combined with the in-memory store, means a
+  freshly generated secret at startup - which, combined with the in-memory store, means a
   restart invalidates all existing cookies.
 
 Cookie attributes (`crates/console/src/routes/login.rs:111-119`):
@@ -78,16 +78,16 @@ Cookie attributes (`crates/console/src/routes/login.rs:111-119`):
 1. Extract the peer IP from `ConnectInfo<SocketAddr>`. The binary MUST serve via
    `into_make_service_with_connect_info::<SocketAddr>()` or `ConnectInfo` extraction
    **fails closed** on every login (`login.rs:19-26`).
-2. **Rate-limit check first** — on block, `429 Too Many Requests` with the form
+2. **Rate-limit check first** - on block, `429 Too Many Requests` with the form
    re-rendered (`login.rs:65-69`).
-3. **Password verify** — on failure, `401 Unauthorized` (`login.rs:71-75`).
-4. On success — reset the rate limiter for that IP, create the session, set the cookie,
+3. **Password verify** - on failure, `401 Unauthorized` (`login.rs:71-75`).
+4. On success - reset the rate limiter for that IP, create the session, set the cookie,
    redirect to `/`.
 
 Logout (`GET /logout`) validates the cookie, **destroys the session server-side** via
 `sessions.destroy`, then clears the client cookie. It is idempotent: it works with no
 cookie, an expired session, or a tampered cookie (`login.rs:88-105`, `auth.rs:187-189`).
-Destroying server-side matters — clearing only the client cookie would leave a captured
+Destroying server-side matters - clearing only the client cookie would leave a captured
 cookie value valid until its TTL elapsed.
 
 ## CSRF
@@ -100,7 +100,7 @@ cookie value valid until its TTL elapsed.
   yet (fail-closed).
 - The token is surfaced to templates and embedded as `<meta name="csrf-token">` in
   `base_head.html`.
-- **Enforced on the mutating routes** — approve / reject / snooze / delist / delete. Each
+- **Enforced on the mutating routes** - approve / reject / snooze / delist / delete. Each
   validates CSRF first and returns **403 Forbidden** ("invalid or missing csrf token") on
   failure (`routes/queue.rs`). The exact per-route CSRF column is in
   [../reference/console-routes.md](../reference/console-routes.md).
@@ -122,7 +122,7 @@ successful login. Load-bearing properties (`auth.rs:200-256`):
 - A **blocked attempt is not itself recorded**, so a burst of rejected retries cannot
   extend the window past `max_attempts` within it (`auth.rs:217-219,236-242`).
 - **Memory-bound, fail-closed:** the IP-keyed map is pruned of stale entries once it
-  exceeds 10,000, and hard-rejects all attempts once it exceeds 50,000 — bounding growth
+  exceeds 10,000, and hard-rejects all attempts once it exceeds 50,000 - bounding growth
   under a spoofed-source-IP flood (`auth.rs:224-233`).
 - **Keyed on the real TCP peer** via `ConnectInfo`; if that extraction fails, login fails
   closed (`login.rs:19-26,58-69`).
@@ -131,9 +131,9 @@ successful login. Load-bearing properties (`auth.rs:200-256`):
 
 Authorization is coarse and binary: a request is either an authenticated operator session
 (full access to the protected group) or it is not (redirected to login). There are no
-roles or per-object permissions — the console serves a single trusted operator
+roles or per-object permissions - the console serves a single trusted operator
 ([threat-model.md](threat-model.md)). The bind model backstops this: default
 `127.0.0.1:8080` loopback-only, with the operator opting into a wider bind via
 `PROPOLIS_CONSOLE_BIND` (`main.rs:118-121`). A wider bind without operator-provided TLS
-and a network-layer restriction is a residual risk — see
+and a network-layer restriction is a residual risk - see
 [residual-risks.md](residual-risks.md).

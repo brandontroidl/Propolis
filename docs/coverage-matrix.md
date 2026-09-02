@@ -13,10 +13,10 @@ Maps every major component, pipeline stage, security invariant, and operational
 procedure to the canonical doc page(s) that document it, with a coverage verdict.
 Built by reading the corpus against the extracted source evidence.
 
-**Verdict vocabulary.** `documented` — a canonical page covers the item and owns or
-correctly links its facts. `partial` — covered, but with a stated caveat: an
+**Verdict vocabulary.** `documented` - a canonical page covers the item and owns or
+correctly links its facts. `partial` - covered, but with a stated caveat: an
 `[inferred]`/`[not-evidenced]` claim, a residual risk the corpus flags as
-unmitigated, or a facet not fully traced to source. `gap` — no canonical page
+unmitigated, or a facet not fully traced to source. `gap` - no canonical page
 covers it. A `partial` here is a documentation-honesty marker, not a defect in the
 docs; several rows are `partial` precisely *because* the corpus documents a residual
 risk plainly (per the GLOBAL CORRECTIONS) rather than papering over it.
@@ -55,7 +55,7 @@ the architecture and reference pages below.
 The 4 retired dev units (`intake`/`review`/`feed`/`console.service`) are documented as
 superseded by `propolis.service` in
 [operations/deployment-models.md](operations/deployment-models.md); their full
-hardening blocks are not transcribed (not the production surface) — a deliberate
+hardening blocks are not transcribed (not the production surface) - a deliberate
 scope choice, not a gap.
 
 ## Pipeline stages and data flows
@@ -75,9 +75,9 @@ exact constants by [reference/scoring-and-feed.md](reference/scoring-and-feed.md
 | Enrichment: malware fetcher (attacker URL) | [security/malware-custody.md](security/malware-custody.md), [reference/rate-limits-and-budgets.md](reference/rate-limits-and-budgets.md) | documented | Opt-in; SSRF-vetted every hop; per-host + daily budgets; recursion-capped. |
 | Enrichment: GeoLite2 / ASN | [reference/integrations.md](reference/integrations.md) | documented | Local file reads only; ASN suppression opt-in. |
 | Feed build → export → atomic publish | [architecture/pipeline.md](architecture/pipeline.md), [reference/scoring-and-feed.md](reference/scoring-and-feed.md), [operations/queue-and-spool.md](operations/queue-and-spool.md) | documented | Retention-window membership; 10 formats; staging + two-rename swap; checksum self-check. |
-| Feed → public repo sync (cron) | [operations/deployment-models.md](operations/deployment-models.md), [reference/commands.md](reference/commands.md) | partial | `deploy/blocklist-sync.sh` is an operator setup step (GLOBAL CORRECTION 4); NOT wired into any shipped systemd timer/cron — documented as such. |
-| Vendor submission (AbuseIPDB/DShield/OTX) | [reference/integrations.md](reference/integrations.md), [security/outbound-controls.md](security/outbound-controls.md) | partial | AbuseIPDB/OTX wire contracts verified live; DShield attribution flagged provisional/unverified — documented with caveat. |
-| Cluster / multi-node aggregation | [operations/deployment-models.md](operations/deployment-models.md), [operations/capacity-planning.md](operations/capacity-planning.md) | partial | Shared-DB multi-node is an INSTALL.md claim `[inferred]`; no cluster-coordination code verified — documented as inferred. |
+| Feed → public repo sync (cron) | [operations/deployment-models.md](operations/deployment-models.md), [reference/commands.md](reference/commands.md) | partial | `deploy/blocklist-sync.sh` is an operator setup step (GLOBAL CORRECTION 4); NOT wired into any shipped systemd timer/cron - documented as such. |
+| Vendor submission (AbuseIPDB/DShield/OTX) | [reference/integrations.md](reference/integrations.md), [security/outbound-controls.md](security/outbound-controls.md) | partial | AbuseIPDB/OTX wire contracts verified live; DShield attribution flagged provisional/unverified - documented with caveat. |
+| Cluster / multi-node aggregation | [operations/deployment-models.md](operations/deployment-models.md), [operations/capacity-planning.md](operations/capacity-planning.md) | partial | Shared-DB multi-node is an INSTALL.md claim `[inferred]`; no cluster-coordination code verified - documented as inferred. |
 
 ## Security invariants
 
@@ -88,7 +88,7 @@ narrative owner. Reference values (ports, routes, constants) are owned by the
 | Invariant | Doc page(s) | Coverage | Note |
 |---|---|---|---|
 | 1. Never-execute (no spawn/exec) | [security/never-execute.md](security/never-execute.md) | documented | Whole-workspace grep clean; 8 per-sensor static-check tests; W^X at deploy. The one flagged item (`sensor-catchall` lacks a `never_exec_static_check` regression test) is documented in never-execute.md. |
-| 2. Sensors egress-free by construction | [security/outbound-controls.md](security/outbound-controls.md), [security/supply-chain.md](security/supply-chain.md) | documented | Scoped to sensor crates (GLOBAL CORRECTION 1); the workspace is NOT egress-free — stated plainly. |
+| 2. Sensors egress-free by construction | [security/outbound-controls.md](security/outbound-controls.md), [security/supply-chain.md](security/supply-chain.md) | documented | Scoped to sensor crates (GLOBAL CORRECTION 1); the workspace is NOT egress-free - stated plainly. |
 | 3. Five gated outbound paths (all default OFF) | [security/outbound-controls.md](security/outbound-controls.md), [reference/environment-variables.md](reference/environment-variables.md) | documented | VT, vendor submitters, console rDNS, GeoLite2 (local, not network), ops-alert ntfy; each opt-in, several fail-closed. |
 | 4. Fetcher SSRF guard | [security/malware-custody.md](security/malware-custody.md), [security/input-handling.md](security/input-handling.md) | documented | Scheme allowlist, userinfo reject, DNS-rebinding defense, address pinning, forbidden-target check, tftp port lock. |
 | 5. `sanitize_value` at event boundaries | [security/input-handling.md](security/input-handling.md) | documented | Order-of-operations chokepoint; applied in 18 src files; structurally enforced for captures. |

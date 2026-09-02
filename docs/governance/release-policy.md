@@ -17,12 +17,12 @@ mechanics live in
 
 A release is an **annotated git tag** (`vMAJOR.MINOR.PATCH`) on a commit in
 `main`. Tagging is the release act; there is no separate published package.
-The current tree is `0.3.0` but the only tag is `v0.1.0` — the version and the
+The current tree is `0.3.0` but the only tag is `v0.1.0` - the version and the
 latest tag differ. See
 [compatibility-and-versioning.md](compatibility-and-versioning.md) and
 [../overview/maturity-and-status.md](../overview/maturity-and-status.md).
 
-## Release gate — must be green
+## Release gate - must be green
 
 No release is cut on a red gate. The full gate must pass first:
 
@@ -43,6 +43,6 @@ inferred from a green test run.
 
 Release notes are maintained in [../history/changelog.md](../history/changelog.md).
 As of this writing the changelog is a single undated `## Unreleased` section and
-is **not** version-partitioned — it does not map entries to `v0.1.0` versus later
+is **not** version-partitioned - it does not map entries to `v0.1.0` versus later
 work, and does not yet list the post-tag V12 operator-console interface. Cutting
 a release includes moving `Unreleased` entries under a dated version heading.

@@ -58,7 +58,7 @@ the peer `SocketAddr`, and a fresh `Uuid::now_v7()` session id
 - runs in its own `tokio::spawn`, so a panicking handler is caught by tokio's task
   harness, logged, and never crashes the accept loop
   (`listener.rs:62-71, 124-130`);
-- is bounded by `max_concurrent` via a `tokio::sync::Semaphore` — a connection over
+- is bounded by `max_concurrent` via a `tokio::sync::Semaphore` - a connection over
   the limit is refused immediately (socket closed, never queued)
   (`bounds.rs:29-33`);
 - is time-bounded by running the handler future inside
@@ -72,8 +72,7 @@ matches a dual-stack listener (`listener.rs:272-280`).
 
 ### Connection bounds
 
-`ConnectionBounds` (`bounds.rs:16-34`) defines *shape only* —
-`read_timeout`, `idle_timeout`, `max_duration`, `max_captured_bytes`,
+`ConnectionBounds` (`bounds.rs:16-34`) defines *shape only* - `read_timeout`, `idle_timeout`, `max_duration`, `max_captured_bytes`,
 `max_concurrent`. Concrete values are set per sensor and read from environment
 variables validated at startup; a present-but-zero or unparseable bound makes the
 process refuse to start on most sensors ("zero never means unlimited"). Exact
@@ -91,13 +90,13 @@ entry (local == WAN).
 
 ### Persona, fake filesystem, fake shell
 
-One coherent fictional host — **Ubuntu 22.04.4 LTS "Jammy", hostname `server01` by
-default** — is resolved from `persona.rs` so no two sensors contradict each other
+One coherent fictional host - **Ubuntu 22.04.4 LTS "Jammy", hostname `server01` by
+default** - is resolved from `persona.rs` so no two sensors contradict each other
 (`persona.rs:21-51`). Banners, `uname` output, and `/etc/os-release` all derive from
 it.
 
 `fakefs.rs` is an in-memory static snapshot, fresh per session, with no real
-filesystem underneath — path traversal is structurally impossible
+filesystem underneath - path traversal is structurally impossible
 (`fakefs.rs:1-14`). `shell.rs` is the interactive fake shell presented post-auth,
 shared by SSH, Telnet, and ADB. It emits one `honeypot_command_exec` per non-blank
 line (recording the raw line, sanitized and capped), decodes single-byte-XOR
@@ -112,17 +111,17 @@ behavior is owned by
 `sanitize_value(input, max_len)` is the single chokepoint every attacker string
 clears before entering an event (`sanitize.rs:1-27`): it collapses CR/LF/tab runs to
 one space, strips ANSI/C0/C1 controls and bidi/zero-width characters, NFC-normalizes,
-and UTF-8-boundary-safe truncates to a byte cap — closing CR/LF/ANSI log injection.
+and UTF-8-boundary-safe truncates to a byte cap - closing CR/LF/ANSI log injection.
 See [`security/input-handling.md`](../security/input-handling.md).
 
 ## The capture path
 
-Only three sensors write captured file *bodies* to disk — **SSH, FTP, and ADB**.
+Only three sensors write captured file *bodies* to disk - **SSH, FTP, and ADB**.
 Redis, Telnet, HTTP, SMTP, cred, and catchall capture metadata only and never spool a
 body (confirmed by the absence of `QuarantineSpool`/`CaptureHandoff` in those crates).
 
 For the spooling sensors the path is deliberately **off the connection's reply
-path**, for covertness — response latency must not leak whether a capture happened:
+path**, for covertness - response latency must not leak whether a capture happened:
 
 1. The handler reads enough to answer the protocol, builds a `CaptureJob`, and
    `submit`s it. `submit` is backed by `mpsc::try_send` and **never blocks**; a full
@@ -151,7 +150,7 @@ and a 100 MB global budget. See
 `EventEmitter::append` serializes an event to one NDJSON line, opens the log with
 `O_APPEND` (atomic concurrent appends on local storage), and `write_all` + `flush`; a
 serialize or append failure never partially writes a line
-(`emit.rs:40-53`). The log directory must be local storage — NFS `O_APPEND` can race
+(`emit.rs:40-53`). The log directory must be local storage - NFS `O_APPEND` can race
 (`emit.rs:26-39`). These NDJSON files are what the intake tailer consumes; see
 [`event-and-sample-lifecycle.md`](event-and-sample-lifecycle.md).
 
@@ -159,7 +158,7 @@ serialize or append failure never partially writes a line
 
 Every sensor emits the same frozen record, `SensorEvent`
 (`crates/sensor-wire/src/lib.rs:36-53`, `WIRE_VERSION = 1`). A sensor emits **raw
-facts only** — `source_ip`, `wan_ip`, `sensor`, `signal_type` (a plain string),
+facts only** - `source_ip`, `wan_ip`, `sensor`, `signal_type` (a plain string),
 `protocol`, `authenticated`, `observed_at`, `metadata`, an optional `sample`
 reference, and an optional `session_id`. Weight, confidence, and category are **not**
 on the wire; they are derived downstream so a sensor never computes a score. Field
@@ -174,7 +173,7 @@ types and the signal vocabulary are owned by
   `catchall_probe` carrying a hex payload sample. Its bounds are deliberately tighter
   than the interactive sensors.
 - **`sensor-cred`** is one binary with one listener per configured database/remote
-  protocol — **VNC, MySQL, MSSQL, PostgreSQL, MongoDB**. Each speaks just enough of
+  protocol - **VNC, MySQL, MSSQL, PostgreSQL, MongoDB**. Each speaks just enough of
   its handshake to elicit a credential attempt, drops the credential, and emits a
   login attempt. This is why nine crates cover twelve protocols.
 

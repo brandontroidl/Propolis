@@ -49,10 +49,10 @@ podman run -d --name propolis-pg \
   docker.io/library/postgres:18
 ```
 
-> **Warning — trust auth.** The container accepts any connection with no password.
+> **Warning - trust auth.** The container accepts any connection with no password.
 > It binds `127.0.0.1` only and is a throwaway test fixture. Do not expose it, and
 > do not reuse this posture for any real database. Production DB setup is a separate
-> concern — see [`operations/installation`](../operations/installation.md) and
+> concern - see [`operations/installation`](../operations/installation.md) and
 > [`operations/secret-management`](../operations/secret-management.md).
 
 Then `podman start propolis-pg` on later sessions (`CONTRIBUTING.md:9`).
@@ -77,7 +77,7 @@ are not interchangeable:
 | `INSTALL.md:130` (production) | `postgres://propolis:YOUR_PASSWORD@localhost:5432/propolis` |
 
 The `propolis`-user / `propolis_test`-db form in `CONTRIBUTING.md` is **not** what
-CI or the committed `.env` use — the working test setup is the superuser/`trust`
+CI or the committed `.env` use - the working test setup is the superuser/`trust`
 form. Use the `.env` value for local development.
 
 Local-gate caveats (toolchain PATH ordering, starting the container) are

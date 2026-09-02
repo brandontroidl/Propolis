@@ -28,27 +28,27 @@ tables, ports, routes, and constants are owned by the
 | `.env` | Gitignored local dev config (test `DATABASE_URL`, podman recipe). Not committed. |
 | `CONTRIBUTING.md`, `CHANGELOG.md`, `INSTALL.md`, `README.md`, `SECURITY.md`, `LICENSE.md` | Root docs. |
 
-`internal/`, `docs/superpowers/`, `.superpowers/` are gitignored private material — not part of the source tour.
+`internal/`, `docs/superpowers/`, `.superpowers/` are gitignored private material - not part of the source tour.
 
 ## Crates
 
 18 workspace members (`Cargo.toml:3-21`). Full component inventory with binaries and dependency edges lives in [`architecture/components`](../architecture/components.md); the summary by concern:
 
 **Foundation libraries (no internal deps):**
-- `core-scoring` — event ledger, chain-hashing, scoring, blocklist eligibility; owns the core DB migrations (`crates/core-scoring/migrations/`).
-- `sensor-wire` — the frozen sensor→intake NDJSON wire format (`WIRE_VERSION = 1`); imported by every sensor and by intake.
-- `geoip` — offline MaxMind GeoLite2 City + ASN reader (local file reads only, no network).
+- `core-scoring` - event ledger, chain-hashing, scoring, blocklist eligibility; owns the core DB migrations (`crates/core-scoring/migrations/`).
+- `sensor-wire` - the frozen sensor→intake NDJSON wire format (`WIRE_VERSION = 1`); imported by every sensor and by intake.
+- `geoip` - offline MaxMind GeoLite2 City + ASN reader (local file reads only, no network).
 
 **Sensor layer:**
-- `sensor-framework` — the shared harness (listener lifecycle, WAN attribution, sanitize, emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds). Depends only on `sensor-wire`.
-- `sensor-{catchall,ssh,telnet,redis,adb,http,ftp,smtp,cred}` — the 9 sensor binaries covering 12 protocols (`cred` alone serves VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Each depends only on `sensor-wire` + `sensor-framework` + `tokio`. See [adding-a-sensor](adding-a-sensor.md) and [`architecture/sensors`](../architecture/sensors.md).
+- `sensor-framework` - the shared harness (listener lifecycle, WAN attribution, sanitize, emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds). Depends only on `sensor-wire`.
+- `sensor-{catchall,ssh,telnet,redis,adb,http,ftp,smtp,cred}` - the 9 sensor binaries covering 12 protocols (`cred` alone serves VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Each depends only on `sensor-wire` + `sensor-framework` + `tokio`. See [adding-a-sensor](adding-a-sensor.md) and [`architecture/sensors`](../architecture/sensors.md).
 
 **Data plane:**
-- `intake` — tails sensor NDJSON logs, converts wire events to domain events, appends to the ledger.
-- `review` — review-queue state machine, gatekeeper, vendor adapters (AbuseIPDB/DShield/OTX), VirusTotal scanner, malware fetcher, operator CLI; owns its own migrations (`crates/review/migrations/`).
-- `feed` — blocklist snapshot builder + atomic publish (text/JSON/CSV/CIDR) with checksummed manifest.
-- `console` — the operator web console (axum): auth, dashboard, review queue, IP detail, feed status, `/metrics`, `/logs`. See [`architecture/console`](../architecture/console.md).
-- `propolis` — the unified daemon (binary only). Composes intake + review + feed + console + VirusTotal + fetcher + ops-monitor as concurrent tokio tasks on one `PgPool`. See [`architecture/process-topology`](../architecture/process-topology.md).
+- `intake` - tails sensor NDJSON logs, converts wire events to domain events, appends to the ledger.
+- `review` - review-queue state machine, gatekeeper, vendor adapters (AbuseIPDB/DShield/OTX), VirusTotal scanner, malware fetcher, operator CLI; owns its own migrations (`crates/review/migrations/`).
+- `feed` - blocklist snapshot builder + atomic publish (text/JSON/CSV/CIDR) with checksummed manifest.
+- `console` - the operator web console (axum): auth, dashboard, review queue, IP detail, feed status, `/metrics`, `/logs`. See [`architecture/console`](../architecture/console.md).
+- `propolis` - the unified daemon (binary only). Composes intake + review + feed + console + VirusTotal + fetcher + ops-monitor as concurrent tokio tasks on one `PgPool`. See [`architecture/process-topology`](../architecture/process-topology.md).
 
 ## Finding things
 
@@ -62,4 +62,4 @@ tables, ports, routes, and constants are owned by the
 | How the daemon wires subsystems | `crates/propolis/src/main.rs`, `crates/propolis/src/supervisor.rs`. |
 | Deploy units / install steps | `deploy/`; documented in [`operations/service-lifecycle`](../operations/service-lifecycle.md). |
 
-There is no `Makefile` or `justfile` — build and test are plain `cargo` (verified absent).
+There is no `Makefile` or `justfile` - build and test are plain `cargo` (verified absent).

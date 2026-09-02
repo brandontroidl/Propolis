@@ -2036,7 +2036,7 @@ async fn detail_page_has_neutral_back_link(pool: PgPool) {
     );
 }
 
-/// Finding 8 — the drawer contract now lives in one place (the `ip_evidence_link` macro). These
+/// Finding 8 - the drawer contract now lives in one place (the `ip_evidence_link` macro). These
 /// lock in that ordinary IP links carry it on the pages that previously shipped plain links, so the
 /// per-page drift that broke Review/Feed/Search cannot silently return. Dashboard and Feed links are
 /// covered by the assertions in their own tests above; these add the two remaining feasible pages.

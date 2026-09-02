@@ -31,7 +31,7 @@ NDJSON event logs; it holds no HTTP client and makes no outbound requests (see
 
 ### Persona
 
-A sensor's presented identity — banners, negotiated options, and canned
+A sensor's presented identity - banners, negotiated options, and canned
 responses chosen so the decoy resembles a real service rather than a honeypot.
 Personas live in the shared sensor framework
 (`crates/sensor-framework/src/lib.rs`).
@@ -87,7 +87,7 @@ that saw authenticated TCP, and collapses vantages sharing a /24 (IPv4) or /64
 
 ### WAN vantage
 
-One outward-facing IP address from which the honeypot was reached — a single
+One outward-facing IP address from which the honeypot was reached - a single
 observation point on the attacker's network reach. Multiple distinct vantages
 observing the same source IP is the evidence *breadth* rewards
 (`WanVantage`, `crates/core-scoring/src/scoring/breadth.rs`).
@@ -149,7 +149,7 @@ operator step, not wired into a shipped timer. See
 
 ### Egress-free (scoped)
 
-A precise claim: **the sensor crates** are egress-free by construction — each
+A precise claim: **the sensor crates** are egress-free by construction - each
 has no HTTP client in its dependency tree, enforced by per-sensor tests. The
 **platform** is not egress-free: it has a small number of enrichment/reporting
 outbound paths (VirusTotal, vendor abuse submitters, console rDNS, ops-alert

@@ -35,12 +35,12 @@ Consequences:
   normalization for vendored sources, because `eol=lf` mangling corrupts
   `.cargo-checksum.json` and breaks release builds. After any `cargo vendor`, run
   `cargo build --release --locked` (not just `cargo test`) to catch checksum
-  breakage — a debug/test gate misses it.
+  breakage - a debug/test gate misses it.
 
 ## Frozen lockfile
 
 `Cargo.lock` is committed. The clippy and test CI jobs pass `--locked`, which
-fails the build if `Cargo.lock` is out of date or would change — dependency
+fails the build if `Cargo.lock` is out of date or would change - dependency
 resolution cannot drift silently between CI and a developer machine. See
 [../development/build-and-test.md](../development/build-and-test.md) for the full
 gate.
@@ -66,13 +66,13 @@ Propolis is written in Rust; the workspace is safe Rust with two narrow, audited
 exceptions. No crate sets `#![forbid(unsafe_code)]`.
 
 - **Non-test `unsafe`:** only the console reverse-DNS resolver
-  (`crates/console/src/rdns.rs`) — libc FFI (`getnameinfo`, `sockaddr_in/6`,
+  (`crates/console/src/rdns.rs`) - libc FFI (`getnameinfo`, `sockaddr_in/6`,
   `CStr`) for a PTR lookup. This path is off by default and gated behind
   `PROPOLIS_CONSOLE_RDNS_ENABLED` (see
   [outbound-controls.md](./outbound-controls.md)); the result is display-only and
   never used as a scoring signal.
 - **Test-only `unsafe`:** `env::set_var` / `env::remove_var` blocks in
-  `crates/propolis/src/config.rs` test functions — Rust 2024 made those calls
+  `crates/propolis/src/config.rs` test functions - Rust 2024 made those calls
   `unsafe`; they run only under `#[cfg(test)]`.
 
 The claim "zero unsafe in the project" is **not** accurate and should not be made;

@@ -10,21 +10,21 @@ last-verified: 2026-08-26
 # Coding conventions
 
 The enforced conventions (fmt, clippy-deny-warnings) are checked by CI on every
-push and pull request — see [build-and-test](build-and-test.md). The rest are
+push and pull request - see [build-and-test](build-and-test.md). The rest are
 stated in `CONTRIBUTING.md` and observable in the tree.
 
 ## Language and formatting
 
 - **Rust 2024 edition** on every crate (`crates/*/Cargo.toml:4`, `CONTRIBUTING.md:18`).
-- **Pinned toolchain** `1.96.1` — see [toolchain-and-environment](toolchain-and-environment.md).
+- **Pinned toolchain** `1.96.1` - see [toolchain-and-environment](toolchain-and-environment.md).
 - **`cargo fmt`** with default rustfmt config (no `rustfmt.toml` in the tree).
   `cargo fmt --all --check` is a CI gate (`CONTRIBUTING.md:18`, `ci.yml:49`).
 - **Line endings LF**, final newline, trimmed trailing whitespace, UTF-8, 4-space
-  Rust indent — enforced by `.editorconfig`.
+  Rust indent - enforced by `.editorconfig`.
 
 ## Lint
 
-`cargo clippy --workspace --all-targets --locked -- -D warnings` must pass — clippy
+`cargo clippy --workspace --all-targets --locked -- -D warnings` must pass - clippy
 runs with **warnings denied**, so any lint is a hard failure (`CONTRIBUTING.md:19`,
 `ci.yml:70`). `--all-targets` means test code is linted too.
 
@@ -32,7 +32,7 @@ runs with **warnings denied**, so any lint is a hard failure (`CONTRIBUTING.md:1
 
 Comment the **why**, never the **what**. `CONTRIBUTING.md:21`: "No comments
 restating what the code does. Comment only the non-obvious why." The tree follows
-this — comments explain constraints, invariants, and workarounds (e.g. the frozen
+this - comments explain constraints, invariants, and workarounds (e.g. the frozen
 hash-chain encoding, the serde casing asymmetry, `pipefail` in CI), not line-by-line
 narration.
 
@@ -51,16 +51,16 @@ fix(sensor-ftp): validate the passive data peer against the control source IP
 justification; the workspace does **not** apply `#![forbid(unsafe_code)]`. Verified
 uses in project (non-vendored) source:
 
-- `crates/console/src/rdns.rs` — libc FFI for the forward-confirmed reverse-DNS
+- `crates/console/src/rdns.rs` - libc FFI for the forward-confirmed reverse-DNS
   resolver (`getnameinfo`, `CStr::from_ptr`, zeroed `sockaddr`), `SAFETY`-commented
   (`rdns.rs:107-138`).
-- `crates/propolis/src/config.rs` — `unsafe { env::set_var / remove_var }` inside
+- `crates/propolis/src/config.rs` - `unsafe { env::set_var / remove_var }` inside
   `#[cfg(test)]` only; Rust 2024 marks these functions `unsafe` because process
   environment mutation is global cross-thread state (`config.rs:699-768`).
 
 No other project source contains `unsafe` blocks. Sensor crates additionally keep
 `tokio`'s `process` feature off and are guarded by static tests that reject
-process-spawning code — see
+process-spawning code - see
 [adding-a-sensor](adding-a-sensor.md#the-tests-a-sensor-must-pass).
 
 ## Types and structure

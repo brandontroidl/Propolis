@@ -46,7 +46,7 @@ event logs.
 ## Spool / quarantine (uploaded-artifact capture)
 
 > **Mount requirement:** spool dirs must be backed by `noexec,nosuid,nodev`
-> mounts. `install.sh` does **not** do this — the operator must add fstab
+> mounts. `install.sh` does **not** do this - the operator must add fstab
 > entries (`install.sh:172-187` lists example tmpfs entries). Captured artifacts
 > may be live malware.
 
@@ -56,7 +56,7 @@ event logs.
 | ftp uploads | `PROPOLIS_FTP_SPOOL_DIR` | `/var/spool/propolis/ftp` (`sensor-ftp/src/main.rs:21`) | 0750 propolis-ftp (`install.sh:165`) |
 | adb uploads | `PROPOLIS_ADB_SPOOL_DIR` | `/var/spool/propolis/adb` (`sensor-adb/src/main.rs:32`) | 0750 propolis-adb (`install.sh:164`) |
 | telnet uploads | `PROPOLIS_TELNET_SPOOL_DIR` | `/var/spool/propolis/telnet` (`sensor-telnet/src/main.rs:35`) | 0750 propolis-telnet (`install.sh:166`) |
-| catchall | (dir granted for symmetry, **unused** — catchall spools no bodies) | `/var/spool/propolis/catchall` | 0750 propolis-catchall (`install.sh:162`) |
+| catchall | (dir granted for symmetry, **unused** - catchall spools no bodies) | `/var/spool/propolis/catchall` | 0750 propolis-catchall (`install.sh:162`) |
 | fetcher output | const `FETCH_SPOOL_DIR` | `/var/spool/propolis/fetched` (`crates/propolis/src/main.rs:41`) | 0750 propolis (`install.sh:169`) |
 | ops spool root | const `OPS_SPOOL_ROOT` | `/var/spool/propolis` (`crates/propolis/src/main.rs:46`) | 0755 root (`install.sh:161`) |
 
@@ -80,13 +80,13 @@ for the full variable reference.
 | SSH host key (generated first run, reused) | `PROPOLIS_SSH_HOST_KEY_PATH` | `/var/lib/propolis/ssh/host_key` (`sensor-ssh/src/main.rs:48`) | `/var/lib/propolis/ssh` 0750 propolis-ssh (`install.sh:146`) |
 | intake cursors (log tail position) | `PROPOLIS_CURSOR_DIR` | `/var/lib/propolis/cursors` (`intake/src/main.rs:24`; `propolis/src/config.rs:17`) | 0750 propolis (`install.sh:138`) |
 | feed publish output | `PROPOLIS_FEED_OUTPUT_DIR` | `/var/lib/propolis/feed/current` (`feed/src/main.rs:36`; `propolis/src/config.rs:21`) | `/var/lib/propolis/feed` 0755 propolis (`install.sh:142`) |
-| GeoIP databases | `PROPOLIS_GEOIP_DIR` | **no default — enrichment disabled when unset** (`console/src/main.rs:131-134`; `feed/src/main.rs:211-214`) | not created by install.sh |
+| GeoIP databases | `PROPOLIS_GEOIP_DIR` | **no default - enrichment disabled when unset** (`console/src/main.rs:131-134`; `feed/src/main.rs:211-214`) | not created by install.sh |
 | aggregated-node writable state | (unit grant) | `/var/lib/propolis` (`propolis.service:146` ReadWritePaths) | `/var/lib/propolis` 0755 root (`install.sh:137`) |
 | ops spool bounded-buffer dir | (const) | `/var/lib/propolis/spool` (`install.sh:160`) | 0750 propolis |
 
 - **GeoIP** expects `GeoLite2-City.mmdb` + `GeoLite2-ASN.mmdb` under
   `PROPOLIS_GEOIP_DIR` (`geoip/src/lib.rs:61-62,71`). When the var is unset,
-  GeoIP enrichment is simply disabled — GeoLite2 lookups are **local file
+  GeoIP enrichment is simply disabled - GeoLite2 lookups are **local file
   reads, not network requests**. Not created by `install.sh`; the operator
   provisions the files.
 - The aggregated node's `ReadWritePaths=/var/lib/propolis` is deliberately wider
@@ -100,7 +100,7 @@ for the full variable reference.
   config **including secrets**, named in each unit's `EnvironmentFile=` (e.g.
   `console.env`, `ssh.env`, `catchall.env`, `propolis.env` at
   `propolis.service:114`). `install.sh` does **not** create these env files
-  (`install.sh:25`) — the operator populates them.
+  (`install.sh:25`) - the operator populates them.
 - **Feed status:** the console reads (read-only)
   `PROPOLIS_FEED_OUTPUT_DIR`/`manifest.json` for its feed-status page; the unit
   grants `ReadOnlyPaths=/var/lib/propolis/feed` (`console.service`).
@@ -125,10 +125,10 @@ schema is owned by [database.md](database.md).
 
 ## See also
 
-- [ports-and-protocols.md](ports-and-protocols.md) — every port and bind.
-- [environment-variables.md](environment-variables.md) — exact env-var defaults
+- [ports-and-protocols.md](ports-and-protocols.md) - every port and bind.
+- [environment-variables.md](environment-variables.md) - exact env-var defaults
   and bounds.
-- [../operations/queue-and-spool.md](../operations/queue-and-spool.md) — spool
+- [../operations/queue-and-spool.md](../operations/queue-and-spool.md) - spool
   lifecycle and mount hardening.
-- [../operations/retention.md](../operations/retention.md) — log/spool retention
+- [../operations/retention.md](../operations/retention.md) - log/spool retention
   and rotation.

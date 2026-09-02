@@ -1,5 +1,5 @@
 <!--
-title: Troubleshooting — startup and config
+title: Troubleshooting - startup and config
 audience: operator
 status: current
 owner: maintainer
@@ -65,7 +65,7 @@ Two parse idioms exist and they are **not uniform**:
   **silently falls back to the default** instead of aborting
   (`crates/sensor-cred/src/main.rs:29-33`,
   `crates/sensor-smtp/src/main.rs:28-32`). If you set a `cred`/`smtp` bound and it
-  seems ignored, this is why — the value was rejected and the default used.
+  seems ignored, this is why - the value was rejected and the default used.
 
 Fetcher bounds also enforce an upper clamp; a value above the max aborts (e.g.
 `PROPOLIS_FETCH_MAX_BYTES` max 500 MB, and `=0` aborts because it would disable
@@ -77,7 +77,7 @@ the byte guard). See
 `PROPOLIS_CONSOLE_SESSION_SECRET` is optional, but **if set** it must be exactly
 64 hex characters (32 bytes) or startup fails
 (`crates/propolis/src/config.rs:371-389`). If unset, a fresh random key is
-generated each start — sessions then do not survive a restart (expected; see
+generated each start - sessions then do not survive a restart (expected; see
 [Console](console.md)).
 
 ## Bind conflicts (address already in use)
@@ -94,7 +94,7 @@ A sensor or the console fails to bind when the port is already held. Causes:
   port < 1024 it will fail to bind. The console binds unprivileged `8080` and
   needs no capability.
 
-Ports are **not compiled-in defaults** — every `*_BIND` is a required,
+Ports are **not compiled-in defaults** - every `*_BIND` is a required,
 operator-chosen value in the `.env` file. The "standard" port map (SSH 22,
 telnet 23, and so on) is what the `deploy/` example config sets, not a code
 default. Canonical mapping:
@@ -118,7 +118,7 @@ Only after all four does it spawn subsystems and log `starting unified daemon`.
 ## `.env` files are operator-authored
 
 `deploy/install.sh` deliberately does **not** create or edit any
-`/etc/propolis/*.env` file — it prints `Next: populate /etc/propolis/*.env
+`/etc/propolis/*.env` file - it prints `Next: populate /etc/propolis/*.env
 files` and stops (`deploy/install.sh:233`). A freshly installed but unconfigured
 box will fail every startup on the missing required variables above until you
 author those files (mode 0600, owned by the service user). See

@@ -14,8 +14,8 @@ with the code.
 
 ## The gate is the bar
 
-Every change passes the CI gate — fmt, clippy (`-D warnings`), and the full test suite
-against a real PostgreSQL — on every push and pull request; nothing merges un-gated
+Every change passes the CI gate - fmt, clippy (`-D warnings`), and the full test suite
+against a real PostgreSQL - on every push and pull request; nothing merges un-gated
 (`.github/workflows/ci.yml`, `CONTRIBUTING.md:29`). See
 [build-and-test](build-and-test.md) for the exact commands and why the three jobs are
 independent.
@@ -56,7 +56,7 @@ The narrative and reference documentation under `docs/` follows a **one-canonica
 model: each fact has exactly one home (reference pages own exact values; guides explain
 and link). When adding docs:
 
-- Reference pages own the exact values — env vars, ports, paths, tables, routes,
+- Reference pages own the exact values - env vars, ports, paths, tables, routes,
   scoring constants. Guides cite them, they do not re-list.
 - Every published `.md` starts with the metadata header (title / audience / status /
   owner / applies-to / last-verified).

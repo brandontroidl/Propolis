@@ -12,7 +12,7 @@ last-verified: 2026-08-26
 Two flows run from a single attacker connection: the **event** flow (what happened,
 turned into a scored, tamper-evident ledger row) and the **sample** flow (any file
 body the attacker uploaded or a dropper referenced, held in quarantine). They share
-an origin at the sensor and then diverge — the event goes down the reply-blocking
+an origin at the sensor and then diverge - the event goes down the reply-blocking
 path, the sample body goes off it.
 
 ## Event lifecycle
@@ -50,7 +50,7 @@ flowchart TD
 4. **Hash-chained ledger.** Each row's hash is
    `SHA-256(prev_hash ‖ canonical_bytes(event))`
    (`crates/core-scoring/src/hashing.rs:131-136`). `canonical_bytes` writes a
-   **frozen field order with length-prefixed framing** — it deliberately does not
+   **frozen field order with length-prefixed framing** - it deliberately does not
    serialize the whole struct, and a golden vector pins the encoding. Any change to a
    hashed field, or any reorder/insertion, breaks the chain from that event forward.
    The hash is computed application-side; a DB `BEFORE INSERT` trigger
@@ -71,7 +71,7 @@ flowchart TD
 
 `session_id` correlates one sensor session's events (one SSH connection's logins,
 execs, and transfers) and is **not** part of the hash chain, so adding it never
-disturbs prior hashes (`crates/core-scoring/src/hashing.rs:105` — not hashed).
+disturbs prior hashes (`crates/core-scoring/src/hashing.rs:105` - not hashed).
 
 ## Sample lifecycle
 
@@ -92,7 +92,7 @@ flowchart TD
 ```
 
 1. **Off-path hand-off.** The handler builds a `CaptureJob` and `submit`s it; `submit`
-   is backed by `mpsc::try_send` and never blocks the connection's reply — a full
+   is backed by `mpsc::try_send` and never blocks the connection's reply - a full
    queue drops the job and increments a counter
    (`crates/sensor-framework/src/handoff.rs:109-148`). This keeps response latency
    from leaking whether a capture happened.
@@ -118,7 +118,7 @@ flowchart TD
 > by [`security/outbound-controls.md`](../security/outbound-controls.md) and
 > [`security/malware-custody.md`](../security/malware-custody.md).
 
-The human gate on **reporting** — surfacing an IP for vendor abuse submission — is the
+The human gate on **reporting** - surfacing an IP for vendor abuse submission - is the
 review queue, covered in [`pipeline.md`](pipeline.md). Sample bodies themselves are
 never sent to abuse vendors; a vendor report carries only the source IP, categories,
 and an evidence window (`crates/review/src/vendor/mod.rs:29-35`).

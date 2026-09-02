@@ -11,7 +11,7 @@ last-verified: 2026-08-26
 
 The authoritative Architecture Decision Records (ADRs) are **private** and are not part
 of the published corpus. This page summarizes the load-bearing architecture decisions
-that are **observable in the code** — each one is inferable from source, tests, and
+that are **observable in the code** - each one is inferable from source, tests, and
 migrations without reference to the private records. Where a decision's *rationale* is
 only asserted in a private ADR, that rationale is marked **[inferred]** from the
 code-visible mechanism.
@@ -68,7 +68,7 @@ dropped); the one-directional NDJSON channel (sensors never connect to intake). 
 
 Note: the systemd `SystemCallFilter` shipped in the units is a **placeholder** (a broad
 `@system-service` allowlist minus `@privileged @resources`), explicitly a development
-allowlist the unit header says to tighten before production — not a delivered hardened
+allowlist the unit header says to tighten before production - not a delivered hardened
 syscall filter. See [security/residual-risks.md](../security/residual-risks.md).
 
 ## 4. Never-execute: the honeypot captures, it never runs what it captures
@@ -78,7 +78,7 @@ No Propolis code spawns a subprocess or execs. A whole-workspace grep for
 returns zero matches, and no crate enables tokio's `process` feature. Per-sensor
 static-check tests walk each crate's source tree and fail if a process-spawn construct
 ever appears. Captured samples are written no-execute (`0640`, on a `noexec` mount) and
-are never run at any point — custody is store → hash → verify → human-approve → report.
+are never run at any point - custody is store → hash → verify → human-approve → report.
 
 **Code evidence:** the eight `never_exec_static_check` tests (one gap: `sensor-catchall`
 lacks its own regression test but is clean under the workspace grep);
@@ -90,7 +90,7 @@ See [security/never-execute.md](../security/never-execute.md) and
 
 Each attacker-facing sensor has **no HTTP client in its own dependency closure**
 (enforced for `sensor-ssh` by an explicit banned-dependency test). The workspace as a
-whole is **not** egress-free — `Cargo.lock` contains `reqwest`/`hyper`, used by the
+whole is **not** egress-free - `Cargo.lock` contains `reqwest`/`hyper`, used by the
 platform tier. All outbound network access is confined to **five paths, every one
 opt-in and defaulting off**, and the one path that dials an attacker-supplied URL (the
 malware fetcher) runs through a fail-closed SSRF vetter on every hop.
@@ -128,7 +128,7 @@ zero; the event insert and feed/review queries are all parameterized. See
 
 The console is server-rendered minijinja with HTMX fragment swaps and Chart.js; there is
 **no SPA and no JavaScript build pipeline**. Every template, font, and JS library is
-embedded in the binary at compile time and served locally — the deployed box makes no
+embedded in the binary at compile time and served locally - the deployed box makes no
 CDN request. The console serves plain HTTP on a loopback bind with no in-process TLS.
 
 **Code evidence:** templates via `include_str!`, `base.html` assembled at compile time
@@ -196,7 +196,7 @@ Design-stage decisions (no code evidence yet; recorded here per the design's own
 
 ## Related
 
-- [history/decisions-index.md](../history/decisions-index.md) — historical decision index.
-- [architecture/index.md](./index.md) — how to read the architecture section.
-- [security/threat-model.md](../security/threat-model.md) — the threat model these
+- [history/decisions-index.md](../history/decisions-index.md) - historical decision index.
+- [architecture/index.md](./index.md) - how to read the architecture section.
+- [security/threat-model.md](../security/threat-model.md) - the threat model these
   decisions answer to.

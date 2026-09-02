@@ -43,7 +43,7 @@ production surface.
 
 Multiple nodes can share one PostgreSQL database: scoring aggregates in the
 shared DB, and review/feed are designed to be idempotent so more than one node
-can run them against the same data (`INSTALL.md:364-376`). [inferred] — this is
+can run them against the same data (`INSTALL.md:364-376`). [inferred] - this is
 an `INSTALL.md` claim; no cluster-coordination code was read to confirm the
 idempotency guarantee, and the single-node model is the one exercised in
 practice. Treat cluster deployment as an advanced, less-travelled path and
@@ -63,7 +63,7 @@ validate review/feed idempotency in your own environment before relying on it.
   [../development/toolchain-and-environment.md](../development/toolchain-and-environment.md).
 - **Resource envelope:** the unified daemon unit caps at `MemoryMax=1G`,
   `TasksMax=256`, `CPUQuota=100%`, `LimitNOFILE=4096`
-  (`deploy/propolis.service:170-173`) — the highest in the deploy set, since one
+  (`deploy/propolis.service:170-173`) - the highest in the deploy set, since one
   process holds all four subsystems. Per-sensor caps are lower (256M–512M). See
   [capacity-planning.md](capacity-planning.md).
 
@@ -71,15 +71,13 @@ validate review/feed idempotency in your own environment before relying on it.
 
 Source-available and actively developed, with one tagged release (`v0.1.0`); the
 current tree is `0.3.0` and untagged. This is not a production-certified or
-production-blessed build — see
+production-blessed build - see
 [../overview/maturity-and-status.md](../overview/maturity-and-status.md) and
 [../getting-started/production-readiness-checklist.md](../getting-started/production-readiness-checklist.md).
 
 ## Related
 
-- [installation.md](installation.md) — build, install, and unit layout
-- [configuration.md](configuration.md) — configuration model
-- [../architecture/process-topology.md](../architecture/process-topology.md) —
-  process/task topology
-- [../reference/ports-and-protocols.md](../reference/ports-and-protocols.md) —
-  ports and binds
+- [installation.md](installation.md) - build, install, and unit layout
+- [configuration.md](configuration.md) - configuration model
+- [../architecture/process-topology.md](../architecture/process-topology.md) - process/task topology
+- [../reference/ports-and-protocols.md](../reference/ports-and-protocols.md) - ports and binds

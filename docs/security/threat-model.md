@@ -41,13 +41,13 @@ in [supply-chain.md](supply-chain.md); they are risk-reduction, not a trusted bo
 
 | Asset | What protects it |
 |---|---|
-| **The host** (no attacker code ever runs) | never-execute invariant + deployment W^X / non-root / capability caps — see [never-execute.md](never-execute.md), [filesystem-and-db-protections.md](filesystem-and-db-protections.md) |
-| **Evidence integrity** (captured events are tamper-evident and cannot be forged by input) | SHA-256 event hash chain + boundary sanitization — see [input-handling.md](input-handling.md), [../architecture/storage.md](../architecture/storage.md) |
-| **The database** (no injection, no unbounded growth) | parameterized SQL + bounded reads/spool budget — see [input-handling.md](input-handling.md), [filesystem-and-db-protections.md](filesystem-and-db-protections.md) |
-| **Captured malware custody** (samples stored sterile, never executed, human-gated before egress) | SHA-256-named quarantine spool + approval gate — see [malware-custody.md](malware-custody.md) |
-| **Credential / sample privacy** (submitted passwords never recorded; internal fields never in the public feed) | password-drop invariant + feed field selection — see [sample-and-credential-privacy.md](sample-and-credential-privacy.md) |
-| **The operator** (the one trusted human at the console) | Argon2id auth + session/CSRF boundary + loopback-default bind — see [authn-authz.md](authn-authz.md) |
-| **Third parties** (the box must not become an attack proxy) | SSRF vetter on the one attacker-directed fetch + forbidden-egress guard — see [outbound-controls.md](outbound-controls.md) |
+| **The host** (no attacker code ever runs) | never-execute invariant + deployment W^X / non-root / capability caps - see [never-execute.md](never-execute.md), [filesystem-and-db-protections.md](filesystem-and-db-protections.md) |
+| **Evidence integrity** (captured events are tamper-evident and cannot be forged by input) | SHA-256 event hash chain + boundary sanitization - see [input-handling.md](input-handling.md), [../architecture/storage.md](../architecture/storage.md) |
+| **The database** (no injection, no unbounded growth) | parameterized SQL + bounded reads/spool budget - see [input-handling.md](input-handling.md), [filesystem-and-db-protections.md](filesystem-and-db-protections.md) |
+| **Captured malware custody** (samples stored sterile, never executed, human-gated before egress) | SHA-256-named quarantine spool + approval gate - see [malware-custody.md](malware-custody.md) |
+| **Credential / sample privacy** (submitted passwords never recorded; internal fields never in the public feed) | password-drop invariant + feed field selection - see [sample-and-credential-privacy.md](sample-and-credential-privacy.md) |
+| **The operator** (the one trusted human at the console) | Argon2id auth + session/CSRF boundary + loopback-default bind - see [authn-authz.md](authn-authz.md) |
+| **Third parties** (the box must not become an attack proxy) | SSRF vetter on the one attacker-directed fetch + forbidden-egress guard - see [outbound-controls.md](outbound-controls.md) |
 
 ## Trust assumptions
 
@@ -74,8 +74,8 @@ in [supply-chain.md](supply-chain.md); they are risk-reduction, not a trusted bo
   captured sample is named by its own SHA-256 rather than any attacker-supplied filename
   ([input-handling.md](input-handling.md), [malware-custody.md](malware-custody.md)).
 - **Attacker-supplied URLs.** The one path that fetches an attacker-chosen URL (the
-  optional, default-off malware fetcher) treats the URL as hostile and vets it — scheme
-  allowlist, forbidden-target check, DNS-rebinding defense, pinned address — on the
+  optional, default-off malware fetcher) treats the URL as hostile and vets it - scheme
+  allowlist, forbidden-target check, DNS-rebinding defense, pinned address - on the
   initial request and every redirect hop ([outbound-controls.md](outbound-controls.md)).
 - **The source IP as an identity or authorization signal.** Forward-confirmed reverse DNS
   is display-only and never used as a suppression signal (it is spoofable); the honeypot's
@@ -85,7 +85,7 @@ in [supply-chain.md](supply-chain.md); they are risk-reduction, not a trusted bo
 ## What the design does not promise
 
 - **Not "egress-free."** Sensors are egress-free by construction, but the platform has
-  five outbound paths — every one opt-in and defaulting **off**. See
+  five outbound paths - every one opt-in and defaulting **off**. See
   [outbound-controls.md](outbound-controls.md) for the exact list and gating.
 - **No built-in TLS.** The console is plain HTTP on a loopback `TcpListener`; any TLS is
   operator-provided (for example a reverse proxy). See [authn-authz.md](authn-authz.md)

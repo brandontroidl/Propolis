@@ -13,14 +13,14 @@ Propolis uses **PostgreSQL as its single datastore**. There is no second databas
 no message broker, and no external queue: sensors write local NDJSON logs, intake
 tails those logs and appends to Postgres, and every downstream reader (scoring,
 review, feed, console) reads the same database. Captured file bodies are the one
-thing that lives outside Postgres — they sit in an on-disk quarantine spool and are
+thing that lives outside Postgres - they sit in an on-disk quarantine spool and are
 referenced from the database by SHA-256 (see
 [event and sample lifecycle](./event-and-sample-lifecycle.md)).
 
 Exact table columns, enum variants, and the migration list are owned by
 [reference/database.md](../reference/database.md). This page describes the
-model — the append-only ledger, its enforcement, and the projections derived from
-it — and links there for the values.
+model - the append-only ledger, its enforcement, and the projections derived from
+it - and links there for the values.
 
 ## Two schema-owning crates
 
@@ -30,7 +30,7 @@ Schema is split across two migration sets:
   types (11 migrations).
 - **`review`** owns `review_queue`, `vendor_submission`, `fetch_attempt` (3
   migrations). It depends on the `review_state_enum` created by core-scoring's first
-  migration — a deliberate cross-crate schema dependency so the schema is complete.
+  migration - a deliberate cross-crate schema dependency so the schema is complete.
 
 Migrations are **additive and applied-once**. A migration that has run is never
 edited in place; the current canonical shape is what the runtime reads, and legacy
@@ -57,7 +57,7 @@ little-endian length so adjacent fields cannot blur into one another. It deliber
 does **not** serialize the whole struct as JSON (JSON key order is incidental and
 fragile). The exact field order and framing are owned by
 [reference/database.md](../reference/database.md) and are pinned by a **golden test
-vector** — if that vector changes, the frozen encoding changed and every historical
+vector** - if that vector changes, the frozen encoding changed and every historical
 hash would be invalidated.
 
 Fields that are **not** hashed: the row `id`, `ingested_at`, `session_id`,
@@ -68,19 +68,19 @@ absent from `canonical_bytes`), and pre-existing rows degrade gracefully.
 What the chain guarantees: **tamper-evidence**. Any change to a hashed field of any
 event, or any reordering or insertion, breaks the linkage from that event forward.
 What it does **not** provide: confidentiality, or protection against deletion by a
-database superuser — append-only enforcement is a separate control (below).
+database superuser - append-only enforcement is a separate control (below).
 
 ### Database-layer enforcement
 
 Two migrations back the chain at the database, not just in Rust:
 
-- **Chain-linkage trigger** — a `BEFORE INSERT FOR EACH ROW` trigger
+- **Chain-linkage trigger** - a `BEFORE INSERT FOR EACH ROW` trigger
   (`enforce_chain_linkage()`) reads the current chain head (the `hash` of the
   max-`id` row) and rejects any insert whose `prev_hash` does not match it (or, for
   the first event, is not `NULL`). It raises an exception before the row lands, so a
   fabricated or missing `prev_hash` is **fail-closed**. The DB enforces linkage only;
   the hash value itself is still computed application-side.
-- **Privilege revoke** — in the production database only (recognized by the database
+- **Privilege revoke** - in the production database only (recognized by the database
   name `propolis` and the presence of the `propolis` role), the hardening migration
   runs `REVOKE UPDATE, DELETE, TRUNCATE ON event FROM propolis`. The application role
   keeps `INSERT` for intake but **cannot mutate, delete, or truncate** the ledger.
@@ -112,17 +112,17 @@ non-test source.
 running score inputs (raw score, decay anchor, max confidence, event and category
 counts, distinct WAN/sensor counts, first/last seen) and the derived feed flags
 (`eligible`, `recommended_for_vendor`, `recommended_for_blocklist`, `tier`,
-`delisted`). Because it is a projection, it can be **rebuilt from the ledger** — which
+`delisted`). Because it is a projection, it can be **rebuilt from the ledger** - which
 is exactly why the console's `delete_ip` action purges the `ip_score` and review rows
 but deliberately never touches the `event` ledger.
 
 Two projection columns are worth calling out for their integrity intent (values and
 formulas owned by [reference/scoring-and-feed.md](../reference/scoring-and-feed.md)):
 
-- `active_days` — an unbounded, non-decaying count of distinct UTC calendar days an
+- `active_days` - an unbounded, non-decaying count of distinct UTC calendar days an
   IP was seen, so a slow attacker the time-decay would otherwise erase can still earn
   a tier.
-- `established_event_count` — counts only non-spoofable completed-TCP-connection
+- `established_event_count` - counts only non-spoofable completed-TCP-connection
   events, so a spoofed UDP/ICMP flood cannot get an innocent third party published to
   the feed.
 
@@ -135,12 +135,12 @@ to duplicate tier logic in SQL, keeping Rust the single source of truth.
 
 ## The `review` crate tables
 
-- `review_queue` (PK `source_ip`) — snapshots score and categories at the moment an
+- `review_queue` (PK `source_ip`) - snapshots score and categories at the moment an
   IP is surfaced for operator review; carries the review `state`
   (pending/approved/rejected/snoozed) and decision timestamps.
-- `vendor_submission` (PK `id`) — one row per abuse-report submission, with a
+- `vendor_submission` (PK `id`) - one row per abuse-report submission, with a
   **UNIQUE `idempotency_key`** that dedupes retries and the recorded vendor response.
-- `fetch_attempt` (PK `url_hash`) — the malware fetcher's record of each
+- `fetch_attempt` (PK `url_hash`) - the malware fetcher's record of each
   attacker-supplied URL it considered, including the pinned IP actually dialed, the
   status, and the guard's reject reason. Its `status` value set is documented in a SQL
   comment (not a CHECK or enum); the values are set by review-crate code.
@@ -156,11 +156,10 @@ on mismatch). The database holds only the reference. See
 
 ## Related
 
-- [reference/database.md](../reference/database.md) — every table, column, enum, and
+- [reference/database.md](../reference/database.md) - every table, column, enum, and
   migration (the canonical owner of these values).
-- [reference/scoring-and-feed.md](../reference/scoring-and-feed.md) — scoring
+- [reference/scoring-and-feed.md](../reference/scoring-and-feed.md) - scoring
   constants, tiers, and the feed gate.
-- [architecture/concurrency-and-failure.md](./concurrency-and-failure.md) — the
+- [architecture/concurrency-and-failure.md](./concurrency-and-failure.md) - the
   serialized append path and failure modes.
-- [security/filesystem-and-db-protections.md](../security/filesystem-and-db-protections.md) —
-  the DB privilege model.
+- [security/filesystem-and-db-protections.md](../security/filesystem-and-db-protections.md) - the DB privilege model.

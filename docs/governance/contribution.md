@@ -22,7 +22,7 @@ project (yours or anyone's) requires a separate license from the maintainer. See
 
 ## PR flow
 
-1. Set up the development environment — Rust toolchain (pinned in
+1. Set up the development environment - Rust toolchain (pinned in
    `rust-toolchain.toml`) and a PostgreSQL instance for the database-backed
    crates. Setup and toolchain details:
    [../development/toolchain-and-environment.md](../development/toolchain-and-environment.md).

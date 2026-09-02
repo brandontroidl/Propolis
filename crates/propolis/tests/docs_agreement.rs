@@ -23,9 +23,16 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Concatenate every non-test `.rs` under `dir`, recursively. Skips `tests/` directories (fixtures
-/// deliberately reference example/wrong names) and the vendored tree.
-fn collect_src(dir: &Path, out: &mut String) {
+/// Every non-test `.rs` under `dir`, recursively, one entry per file. Skips `tests/` directories
+/// (fixtures deliberately reference example/wrong names) and the vendored tree.
+///
+/// Files are kept separate on purpose. An earlier version concatenated them and ran one
+/// quote-tracking scan over the whole string, so a file with an odd number of `"` characters
+/// (one `'"'` char literal is enough) inverted the quote state for every file after it in
+/// `read_dir` order. That order differs between filesystems, so the gate passed on one machine
+/// and failed in CI on the same tree, and about forty per-sensor variables went undocumented
+/// while the local run stayed green.
+fn collect_src(dir: &Path, out: &mut Vec<String>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -40,19 +47,22 @@ fn collect_src(dir: &Path, out: &mut String) {
         } else if path.extension().is_some_and(|e| e == "rs")
             && let Ok(text) = fs::read_to_string(&path)
         {
-            out.push_str(&text);
-            out.push('\n');
+            out.push(text);
         }
     }
 }
 
 /// Env-var NAMES (`PROPOLIS_*` / `CATCHALL_*`) that appear inside a double-quoted string literal.
+/// A `'"'` char literal is skipped so it cannot open a phantom string.
 fn env_var_literals(src: &str) -> BTreeSet<String> {
     let mut vars = BTreeSet::new();
     let bytes = src.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'"' {
+        if bytes[i] == b'\'' && bytes.get(i + 1) == Some(&b'"') && bytes.get(i + 2) == Some(&b'\'')
+        {
+            i += 3;
+        } else if bytes[i] == b'"' {
             let start = i + 1;
             let mut j = start;
             while j < bytes.len() && bytes[j] != b'"' {
@@ -84,10 +94,10 @@ fn every_env_var_the_code_reads_is_documented_in_the_env_var_reference() {
     let doc_path = root.join("docs/reference/environment-variables.md");
     let doc =
         fs::read_to_string(&doc_path).expect("docs/reference/environment-variables.md exists");
-    let mut src = String::new();
-    collect_src(&root.join("crates"), &mut src);
+    let mut files = Vec::new();
+    collect_src(&root.join("crates"), &mut files);
 
-    let vars = env_var_literals(&src);
+    let vars: BTreeSet<String> = files.iter().flat_map(|f| env_var_literals(f)).collect();
     assert!(
         !vars.is_empty(),
         "extraction found no env-var literals - the scan is broken, not the docs"

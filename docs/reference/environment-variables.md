@@ -381,12 +381,35 @@ Common per-sensor variables (each uses its own prefix; catchall uses `PROPOLIS_C
 | `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (catchall `4_096`) | bytes; zero → abort |
 | `<P>MAX_CONCURRENT` | no | `256` (http `512`) | u32; zero → abort |
 
-Literal names for the sensors whose `main.rs` defines these as explicit constants (the `<P>` rows
-above, instantiated): ssh - `PROPOLIS_SSH_READ_TIMEOUT_MS`, `PROPOLIS_SSH_IDLE_TIMEOUT_MS`,
-`PROPOLIS_SSH_MAX_DURATION_SECS`, `PROPOLIS_SSH_MAX_CAPTURED_BYTES`, `PROPOLIS_SSH_MAX_CONCURRENT`,
-`PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`; catchall - `PROPOLIS_CATCHALL_READ_TIMEOUT_MS`,
-`PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS`, `PROPOLIS_CATCHALL_MAX_DURATION_SECS`, `PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES`,
-`PROPOLIS_CATCHALL_MAX_CONCURRENT`.
+The `<P>` rows above, instantiated per sensor (each name is read literally by that sensor's
+`main.rs`):
+
+- ssh: `PROPOLIS_SSH_READ_TIMEOUT_MS`, `PROPOLIS_SSH_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_SSH_MAX_DURATION_SECS`, `PROPOLIS_SSH_MAX_CAPTURED_BYTES`, `PROPOLIS_SSH_MAX_CONCURRENT`,
+  `PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`.
+- telnet: `PROPOLIS_TELNET_READ_TIMEOUT_MS`, `PROPOLIS_TELNET_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_TELNET_MAX_DURATION_SECS`, `PROPOLIS_TELNET_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_TELNET_MAX_CONCURRENT`, `PROPOLIS_TELNET_LOG_PATH`, `PROPOLIS_TELNET_WAN_MAP`.
+- adb: `PROPOLIS_ADB_READ_TIMEOUT_MS`, `PROPOLIS_ADB_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_ADB_MAX_DURATION_SECS`, `PROPOLIS_ADB_MAX_CAPTURED_BYTES`, `PROPOLIS_ADB_MAX_CONCURRENT`,
+  `PROPOLIS_ADB_LOG_PATH`, `PROPOLIS_ADB_WAN_MAP`.
+- ftp: `PROPOLIS_FTP_READ_TIMEOUT_MS`, `PROPOLIS_FTP_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_FTP_MAX_DURATION_SECS`, `PROPOLIS_FTP_MAX_CAPTURED_BYTES`, `PROPOLIS_FTP_MAX_CONCURRENT`,
+  `PROPOLIS_FTP_LOG_PATH`, `PROPOLIS_FTP_WAN_MAP`.
+- http: `PROPOLIS_HTTP_READ_TIMEOUT_MS`, `PROPOLIS_HTTP_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_HTTP_MAX_DURATION_SECS`, `PROPOLIS_HTTP_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_HTTP_MAX_CONCURRENT`, `PROPOLIS_HTTP_LOG_PATH`, `PROPOLIS_HTTP_WAN_MAP`.
+- redis: `PROPOLIS_REDIS_READ_TIMEOUT_MS`, `PROPOLIS_REDIS_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_REDIS_MAX_DURATION_SECS`, `PROPOLIS_REDIS_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_REDIS_MAX_CONCURRENT`, `PROPOLIS_REDIS_LOG_PATH`, `PROPOLIS_REDIS_WAN_MAP`.
+- catchall: `PROPOLIS_CATCHALL_READ_TIMEOUT_MS`, `PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_CATCHALL_MAX_DURATION_SECS`, `PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_CATCHALL_MAX_CONCURRENT`.
+- smtp and cred: listed under "Lenient sensors" below, since their invalid-value behavior differs.
+
+The gate `every_env_var_the_code_reads_is_documented_in_the_env_var_reference`
+(`crates/propolis/tests/docs_agreement.rs`) checks each of these names literally against this file,
+so a shorthand such as `_IDLE_TIMEOUT_MS` does not count as documentation.
 
 ### Deprecated catchall aliases (still read, do not use in new configs)
 
@@ -460,18 +483,21 @@ Invalid or zero bound → **silent default**, not abort.
   unset → `exit(1)` `:47`, invalid → `exit(1)` `:54`), `PROPOLIS_SMTP_WAN_MAP`
   (invalid entries silently skipped, `:16-26`), `PROPOLIS_SMTP_LOG_PATH` (default
   `/var/log/propolis/smtp/events.jsonl`), `PROPOLIS_SMTP_READ_TIMEOUT_MS`
-  (`30_000`), `_IDLE_TIMEOUT_MS` (`60_000`), `_MAX_DURATION_SECS` (`600`),
-  `_MAX_CAPTURED_BYTES` (`1_000_000`), `_MAX_CONCURRENT` (`256`).
+  (`30_000`), `PROPOLIS_SMTP_IDLE_TIMEOUT_MS` (`60_000`),
+  `PROPOLIS_SMTP_MAX_DURATION_SECS` (`600`), `PROPOLIS_SMTP_MAX_CAPTURED_BYTES`
+  (`1_000_000`), `PROPOLIS_SMTP_MAX_CONCURRENT` (`256`).
 - **sensor-cred** (`crates/sensor-cred/src/main.rs`): multi-protocol
   (VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Bind variables `PROPOLIS_CRED_VNC_BIND`,
-  `_MYSQL_BIND`, `_MSSQL_BIND`, `_PG_BIND`, `_MONGO_BIND` (`main.rs:77-81`). At
+  `PROPOLIS_CRED_MYSQL_BIND`, `PROPOLIS_CRED_MSSQL_BIND`, `PROPOLIS_CRED_PG_BIND`,
+  `PROPOLIS_CRED_MONGO_BIND` (`main.rs:77-81`). At
   least one required - none set → `exit(1)` (`:93-98`); a set-but-invalid bind →
   `exit(1)` (`:87-88`); all-configured-fail-to-bind → `exit(1)` (`:122-125`).
   `PROPOLIS_CRED_WAN_MAP` (invalid skipped), `PROPOLIS_CRED_LOG_DIR` (default
   `/var/log/propolis/cred`, per-protocol file `<protocol>.jsonl`). Bounds:
-  `PROPOLIS_CRED_READ_TIMEOUT_MS` (`30_000`), `_IDLE_TIMEOUT_MS` (`60_000`),
-  `_MAX_DURATION_SECS` (**`60`**, differs from others' 600), `_MAX_CAPTURED_BYTES`
-  (**`100_000`**, differs from others' 1_000_000), `_MAX_CONCURRENT` (`256`).
+  `PROPOLIS_CRED_READ_TIMEOUT_MS` (`30_000`), `PROPOLIS_CRED_IDLE_TIMEOUT_MS` (`60_000`),
+  `PROPOLIS_CRED_MAX_DURATION_SECS` (**`60`**, differs from others' 600),
+  `PROPOLIS_CRED_MAX_CAPTURED_BYTES` (**`100_000`**, differs from others' 1_000_000),
+  `PROPOLIS_CRED_MAX_CONCURRENT` (`256`).
 
 ---
 

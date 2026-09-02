@@ -152,33 +152,6 @@ fn group_source_ips(rows: Vec<(String, String)>) -> std::collections::HashMap<St
     map
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn source_ips_group_by_sha_dedup_and_keep_query_order() {
-        let map = group_source_ips(vec![
-            ("aa".to_string(), "203.0.113.1".to_string()),
-            ("aa".to_string(), "203.0.113.2".to_string()),
-            // Same attacker on a second URL that resolved to the same body: listed once.
-            ("aa".to_string(), "203.0.113.1".to_string()),
-            ("bb".to_string(), "203.0.113.9".to_string()),
-        ]);
-
-        assert_eq!(
-            map.get("aa").unwrap(),
-            &vec!["203.0.113.1".to_string(), "203.0.113.2".to_string()],
-            "dedup must keep the first occurrence and the query's newest-first order"
-        );
-        assert_eq!(map.get("bb").unwrap(), &vec!["203.0.113.9".to_string()]);
-        assert!(
-            map.get("cc").is_none(),
-            "a sample nothing links to must have no entry, so the row renders 'not linked'"
-        );
-    }
-}
-
 async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let base = base_context(&state.db, state.startup_time, state.version).await;
     let source_ips_by_sha = sample_source_ips(&state.db).await;
@@ -293,5 +266,32 @@ fn format_bytes(b: u64) -> String {
         format!("{:.1} KB", b as f64 / 1024.0)
     } else {
         format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_ips_group_by_sha_dedup_and_keep_query_order() {
+        let map = group_source_ips(vec![
+            ("aa".to_string(), "203.0.113.1".to_string()),
+            ("aa".to_string(), "203.0.113.2".to_string()),
+            // Same attacker on a second URL that resolved to the same body: listed once.
+            ("aa".to_string(), "203.0.113.1".to_string()),
+            ("bb".to_string(), "203.0.113.9".to_string()),
+        ]);
+
+        assert_eq!(
+            map.get("aa").unwrap(),
+            &vec!["203.0.113.1".to_string(), "203.0.113.2".to_string()],
+            "dedup must keep the first occurrence and the query's newest-first order"
+        );
+        assert_eq!(map.get("bb").unwrap(), &vec!["203.0.113.9".to_string()]);
+        assert!(
+            !map.contains_key("cc"),
+            "a sample nothing links to must have no entry, so the row renders 'not linked'"
+        );
     }
 }

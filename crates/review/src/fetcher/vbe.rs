@@ -271,14 +271,17 @@ pub(crate) mod tests {
     fn every_substituted_byte_round_trips_at_every_variant() {
         // Exhaustive over the table: each (variant, plaintext) that is reachable must decode back.
         // Guards a transcription error in any single row, which would otherwise be silent.
-        for variant in 0..3usize {
+        // For each variant, the first position whose combination selects it; one byte is encoded
+        // there so exactly that table column is exercised.
+        let first_index_of_variant: [usize; 3] = std::array::from_fn(|variant| {
+            COMBINATION
+                .iter()
+                .position(|&v| v as usize == variant)
+                .unwrap()
+        });
+        for (variant, &idx) in first_index_of_variant.iter().enumerate() {
             for b in (9u8..=127).filter(|&b| is_substituted(b)) {
                 let p = DECODE[(b - 9) as usize][variant];
-                // Find an index whose combination is this variant, encode one byte there.
-                let idx = COMBINATION
-                    .iter()
-                    .position(|&v| v as usize == variant)
-                    .unwrap();
                 let mut body = String::new();
                 for _ in 0..idx {
                     body.push('\n'); // consumes a position without substitution

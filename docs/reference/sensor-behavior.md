@@ -156,7 +156,12 @@ I/O (`:9-29`). This is asserted by `never_exec_static_check` and
   and deliberately excludes `curl` (real busybox ships none), so `busybox curl`
   gives `applet not found` - matching the real-busybox check Mirai/Gafgyt perform.
 - Download capture handles direct, busybox, full-path, and
-  `sh -c "wget ...; ..."` chained forms (`:311-357`).
+  `sh -c "wget ...; ..."` chained forms. A line is split into its simple commands
+  at `;`, `|`, `||`, `&&`, `&`, parentheses, backticks and newlines, each command
+  cut at its first redirection, and every fetcher in the line is examined; one
+  `honeypot_file_download` is emitted per distinct url, so a Mirai
+  `(tftp ... || busybox tftp ...) > t` fallback chain yields one event
+  (`download_targets`, `simple_commands`).
 
 ### Command de-obfuscation
 

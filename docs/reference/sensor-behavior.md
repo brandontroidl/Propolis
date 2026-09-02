@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-01
 -->
 
 # Sensor behavior reference
@@ -147,7 +147,9 @@ I/O (`:9-29`). This is asserted by `never_exec_static_check` and
   `-O-`/`-qO-` writes body to stdout), `ping` (canned replies), `sh`/`bash`/`ash`
   (nested shell; `sh -c "CMD"` dispatches CMD), `busybox` (multi-call banner
   v1.31.1 plus applet dispatch; unknown applet gives `applet not found`),
-  `tftp`/`ftpget` (silent, download captured),
+  `tftp`/`ftpget` (silent; the download url is synthesized from the separate host and file
+  arguments as `tftp://host[:port]/file` / `ftp://host[:port]/file`, since neither command
+  takes a url token),
   `chmod`/`cp`/`rm`/`mkdir`/`sleep` (silent success), `cd`, `exit`/`logout`; any
   other command gives `<cmd>: command not found`.
 - BusyBox applet set is a single source of truth (`BUSYBOX_APPLETS`, `:366-369`)

@@ -296,7 +296,7 @@ additionally cross-checked against the client certificate's CommonName at startu
 | `PROPOLIS_SHIPPER_CA_CERT_PATH` | **yes** | — | PEM path used to verify the gateway's server certificate; absent → abort |
 | `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` | **yes** | — | PEM path, this collector's client certificate; absent → abort |
 | `PROPOLIS_SHIPPER_CLIENT_KEY_PATH` | **yes** | — | PEM path, private key for the client cert above; absent → abort |
-| `PROPOLIS_SHIPPER_COLLECTOR_ID` | **yes** | — | this collector's identity; **must equal** the CommonName baked into `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` or the shipper refuses to start (`validate_collector_id`, `ConfigError::CollectorIdMismatch`) |
+| `PROPOLIS_COLLECTOR_ID` (deprecated alias `PROPOLIS_SHIPPER_COLLECTOR_ID`, still read) | **yes** | - | this collector's identity; **must equal** the CommonName baked into `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` or the shipper refuses to start (`validate_collector_id`, `ConfigError::CollectorIdMismatch`). Same variable the four body-capturing sensors read (see "Outbox manifest" below) - it must be the SAME value everywhere on this collector, or the provenance join on `(collector_id, occurrence_id)` silently breaks attribution. |
 | `PROPOLIS_SHIPPER_SENSOR_LOGS` | **yes** | — | comma-separated `name:path` pairs, same grammar as `PROPOLIS_SENSOR_LOGS`; empty or a malformed entry → abort; at least one pair required |
 | `PROPOLIS_SHIPPER_CURSOR_DIR` | no | `/var/lib/propolis/shipper/cursors` | per-log tail cursor persistence |
 | `PROPOLIS_SHIPPER_STATE_DIR` | no | `/var/lib/propolis/shipper/state` | shipper's own state directory |
@@ -305,7 +305,7 @@ additionally cross-checked against the client certificate's CommonName at startu
 | `PROPOLIS_SHIPPER_RETRY_BACKOFF_MS` | no | `2000` | positive u64 ms; zero/unparseable → abort |
 
 `PROPOLIS_SHIPPER_SENSOR_LOGS`'s `name` is used only for cursor keying and logging — every sensor
-log on a collector ships through one seq/hash chain keyed by `PROPOLIS_SHIPPER_COLLECTOR_ID`
+log on a collector ships through one seq/hash chain keyed by `PROPOLIS_COLLECTOR_ID`
 (via the gateway's verified client-certificate CommonName), not by the per-log name.
 
 On the control-plane side, intake's `PROPOLIS_SENSOR_LOGS` is re-pointed at the gateway's
@@ -403,6 +403,23 @@ read and the prefixed names an operator would reasonably write left a deployed c
 through roughly 4000 restart attempts, its fail-closed config check rejecting an empty bind list
 because nothing read its env file.
 
+### Deprecated collector-id aliases (still read, do not use in new configs)
+
+`ssh`, `ftp`, `adb`, `telnet`, and `shipper` all read `PROPOLIS_COLLECTOR_ID` for the same
+identity value (see "Outbox manifest" below and the `shipper` section above) - before this rename
+the four sensors read the bare `COLLECTOR_ID` and `shipper` read `PROPOLIS_SHIPPER_COLLECTOR_ID`,
+two different names for one value that a config written against one and not the other would
+silently diverge on. Each binary still reads its own pre-rename name via
+`sensor_framework::env_with_legacy` when `PROPOLIS_COLLECTOR_ID` is unset, logging a deprecation
+warning naming the canonical replacement; if both the canonical name and the old one are set to
+different values, the canonical value wins and the warning names the ignored legacy value. An
+existing config keeps working; write new ones with `PROPOLIS_COLLECTOR_ID`.
+
+Why this is documented rather than quietly dropped: the upcoming provenance join keys on
+`(collector_id, occurrence_id)`, so a sensor and `shipper` configured under different collector-id
+env var names (and so, in practice, different values) would silently break attribution - the same
+divergence risk the bare catchall names above already caused once.
+
 Sensor-specific extras:
 - **ssh** (`crates/sensor-ssh/src/main.rs`): `PROPOLIS_SSH_HOST_KEY_PATH`
   (default `/var/lib/propolis/ssh/host_key`, `:48`), `PROPOLIS_SSH_SPOOL_DIR`
@@ -433,7 +450,7 @@ read identically by each of those four sensors' `main.rs`:
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `COLLECTOR_ID` (unprefixed - shared, not `PROPOLIS_<SENSOR>_*`) | no | `local` | Stamped onto every manifest row this sensor writes. **Must equal** the CommonName of the client certificate `shipper`'s `PROPOLIS_SHIPPER_COLLECTOR_ID` presents to the gateway on this box, because a later stage joins the gateway's cert-derived collector id against this manifest on `(collector_id, occurrence_id)`. A single-node deployment with no shipper leaves this at `local`. |
+| `PROPOLIS_COLLECTOR_ID` (deprecated alias `COLLECTOR_ID`, still read; shared across all five binaries, not `PROPOLIS_<SENSOR>_*`) | no | `local` | Stamped onto every manifest row this sensor writes. **Must equal** the CommonName of the client certificate `shipper`'s `PROPOLIS_COLLECTOR_ID` presents to the gateway on this box, because a later stage joins the gateway's cert-derived collector id against this manifest on `(collector_id, occurrence_id)`. A single-node deployment with no shipper leaves this at `local`. |
 | `PROPOLIS_<SENSOR>_OUTBOX_DIR` | no | `<PROPOLIS_<SENSOR>_SPOOL_DIR>/outbox` | Root of the per-capture manifest JSON files (`<dir>/<capture_id>.json`). The default is derived from the sensor's own resolved spool directory (not a fixed shared path) so it always lands inside the writable root the sensor's systemd unit grants - a fixed shared `/var/lib/propolis/outbox` default is unwritable under `ProtectSystem=strict` and was the SP-B-1c regression this fixed. Manifest rows are keyed by a globally-unique `capture_id`, so even where two sensors' outbox dirs happened to coincide, writes would never collide. |
 
 ### Lenient sensors — cred, smtp

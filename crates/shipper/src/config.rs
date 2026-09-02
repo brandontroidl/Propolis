@@ -23,7 +23,14 @@ const ENV_GATEWAY_DNS: &str = "PROPOLIS_SHIPPER_GATEWAY_DNS";
 const ENV_CA_CERT_PATH: &str = "PROPOLIS_SHIPPER_CA_CERT_PATH";
 const ENV_CLIENT_CERT_PATH: &str = "PROPOLIS_SHIPPER_CLIENT_CERT_PATH";
 const ENV_CLIENT_KEY_PATH: &str = "PROPOLIS_SHIPPER_CLIENT_KEY_PATH";
-const ENV_COLLECTOR_ID: &str = "PROPOLIS_SHIPPER_COLLECTOR_ID";
+/// Canonical name, shared with every sensor binary on this collector (see sensor-ssh's own
+/// `main.rs::ENV_COLLECTOR_ID` for why it is unprefixed rather than `PROPOLIS_SHIPPER_*`): the
+/// value must be the SAME physical identity every sensor stamps onto its outbox manifest rows
+/// AND the CommonName of the mTLS client certificate this shipper presents to the gateway.
+const ENV_COLLECTOR_ID: &str = "PROPOLIS_COLLECTOR_ID";
+/// Pre-rename name this binary originally shipped with, still read via
+/// [`sensor_framework::env_with_legacy`] when `PROPOLIS_COLLECTOR_ID` is unset.
+const ENV_COLLECTOR_ID_LEGACY: &str = "PROPOLIS_SHIPPER_COLLECTOR_ID";
 const ENV_SENSOR_LOGS: &str = "PROPOLIS_SHIPPER_SENSOR_LOGS";
 const ENV_CURSOR_DIR: &str = "PROPOLIS_SHIPPER_CURSOR_DIR";
 const ENV_STATE_DIR: &str = "PROPOLIS_SHIPPER_STATE_DIR";
@@ -182,7 +189,8 @@ pub fn load_config_from_env() -> Result<Config, ConfigError> {
     let ca_cert_path = required_path(ENV_CA_CERT_PATH)?;
     let client_cert_path = required_path(ENV_CLIENT_CERT_PATH)?;
     let client_key_path = required_path(ENV_CLIENT_KEY_PATH)?;
-    let collector_id = required_var(ENV_COLLECTOR_ID)?;
+    let collector_id = sensor_framework::env_with_legacy(ENV_COLLECTOR_ID, ENV_COLLECTOR_ID_LEGACY)
+        .ok_or(ConfigError::Missing(ENV_COLLECTOR_ID))?;
 
     let sensor_logs_raw = required_var(ENV_SENSOR_LOGS)?;
     let sensor_logs = parse_sensor_logs(&sensor_logs_raw)?;

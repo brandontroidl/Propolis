@@ -27,7 +27,9 @@
 #   - /etc/propolis/shipper.env (mode 0600, owned by propolis-shipper). Required env vars
 #     (crates/shipper/src/config.rs): PROPOLIS_SHIPPER_GATEWAY_ADDR, PROPOLIS_SHIPPER_GATEWAY_DNS,
 #     PROPOLIS_SHIPPER_CA_CERT_PATH, PROPOLIS_SHIPPER_CLIENT_CERT_PATH,
-#     PROPOLIS_SHIPPER_CLIENT_KEY_PATH, PROPOLIS_SHIPPER_COLLECTOR_ID,
+#     PROPOLIS_SHIPPER_CLIENT_KEY_PATH, PROPOLIS_COLLECTOR_ID (deprecated alias
+#     PROPOLIS_SHIPPER_COLLECTOR_ID still read - must equal every sensor's own PROPOLIS_COLLECTOR_ID
+#     on this same collector box),
 #     PROPOLIS_SHIPPER_SENSOR_LOGS. Optional: PROPOLIS_SHIPPER_CURSOR_DIR (default
 #     /var/lib/propolis/shipper/cursors), PROPOLIS_SHIPPER_STATE_DIR (default
 #     /var/lib/propolis/shipper/state), PROPOLIS_SHIPPER_POLL_INTERVAL_MS (default 1000),

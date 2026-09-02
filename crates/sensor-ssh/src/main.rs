@@ -31,13 +31,18 @@ const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_SSH_MAX_DURATION_SECS";
 const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_SSH_MAX_CAPTURED_BYTES";
 const ENV_MAX_CONCURRENT: &str = "PROPOLIS_SSH_MAX_CONCURRENT";
 const ENV_BANNER: &str = "PROPOLIS_SSH_BANNER";
-/// Unprefixed and shared across every sensor binary on this collector - not `PROPOLIS_SSH_*` -
+/// Shared across every sensor binary AND `shipper` on this collector - not `PROPOLIS_SSH_*` -
 /// because the value must be the SAME physical identity every sensor stamps onto its outbox
 /// manifest rows (SP-B-1b), matching the CommonName of the mTLS client certificate `shipper` on
 /// this box presents to the gateway (`shipper::config::ENV_COLLECTOR_ID` /
 /// `validate_collector_id`). A per-sensor-prefixed name here would invite the exact divergence
 /// this identity exists to prevent.
-const ENV_COLLECTOR_ID: &str = "COLLECTOR_ID";
+const ENV_COLLECTOR_ID: &str = "PROPOLIS_COLLECTOR_ID";
+/// Pre-rename bare spelling every sensor originally shipped with, still read via
+/// [`sensor_framework::env_with_legacy`] when `PROPOLIS_COLLECTOR_ID` is unset - the same
+/// divergence risk `sensor-catchall`'s bare `CATCHALL_*` names once caused, generalized because
+/// this identity is shared across five binaries, not just this one.
+const ENV_COLLECTOR_ID_LEGACY: &str = "COLLECTOR_ID";
 /// Defaults to `<spool_dir>/outbox` (see [`resolve_outbox_dir`]), not a fixed path: the outbox
 /// must land inside this sensor's own writable spool root, which is already granted in its
 /// systemd `ReadWritePaths`.
@@ -200,8 +205,8 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     };
 
     let banner = env::var(ENV_BANNER).unwrap_or_else(|_| DEFAULT_BANNER.to_string());
-    let collector_id =
-        env::var(ENV_COLLECTOR_ID).unwrap_or_else(|_| DEFAULT_COLLECTOR_ID.to_string());
+    let collector_id = sensor_framework::env_with_legacy(ENV_COLLECTOR_ID, ENV_COLLECTOR_ID_LEGACY)
+        .unwrap_or_else(|| DEFAULT_COLLECTOR_ID.to_string());
     let outbox_dir = resolve_outbox_dir(&spool_dir, env::var(ENV_OUTBOX_DIR).ok());
 
     Ok(Config {

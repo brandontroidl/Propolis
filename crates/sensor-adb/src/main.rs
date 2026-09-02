@@ -27,9 +27,12 @@ const ENV_IDLE_TIMEOUT_MS: &str = "PROPOLIS_ADB_IDLE_TIMEOUT_MS";
 const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_ADB_MAX_DURATION_SECS";
 const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_ADB_MAX_CAPTURED_BYTES";
 const ENV_MAX_CONCURRENT: &str = "PROPOLIS_ADB_MAX_CONCURRENT";
-/// Unprefixed and shared across every sensor binary on this collector (see sensor-ssh's own
-/// `main.rs` for why): must match the shipper's `PROPOLIS_SHIPPER_COLLECTOR_ID` cert CommonName.
-const ENV_COLLECTOR_ID: &str = "COLLECTOR_ID";
+/// Shared across every sensor binary AND `shipper` on this collector (see sensor-ssh's own
+/// `main.rs` for why): must match the shipper's client certificate CommonName.
+const ENV_COLLECTOR_ID: &str = "PROPOLIS_COLLECTOR_ID";
+/// Pre-rename bare spelling, still read via [`sensor_framework::env_with_legacy`] when
+/// `PROPOLIS_COLLECTOR_ID` is unset (see sensor-ssh's own `main.rs` for why).
+const ENV_COLLECTOR_ID_LEGACY: &str = "COLLECTOR_ID";
 /// Defaults to `<spool_dir>/outbox` (see [`resolve_outbox_dir`]), not a fixed path: the outbox
 /// must land inside this sensor's own writable spool root, which is already granted in its
 /// systemd `ReadWritePaths`.
@@ -183,8 +186,8 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let spool_dir = env::var(ENV_SPOOL_DIR)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_SPOOL_DIR));
-    let collector_id =
-        env::var(ENV_COLLECTOR_ID).unwrap_or_else(|_| DEFAULT_COLLECTOR_ID.to_string());
+    let collector_id = sensor_framework::env_with_legacy(ENV_COLLECTOR_ID, ENV_COLLECTOR_ID_LEGACY)
+        .unwrap_or_else(|| DEFAULT_COLLECTOR_ID.to_string());
     let outbox_dir = resolve_outbox_dir(&spool_dir, env::var(ENV_OUTBOX_DIR).ok());
 
     let read_timeout_ms = parse_positive_u64(

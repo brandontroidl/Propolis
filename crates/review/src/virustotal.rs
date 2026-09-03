@@ -17,6 +17,51 @@ pub struct VtConfig {
     pub scan_interval_secs: u64,
     pub request_delay_ms: u64,
     pub daily_limit: u32,
+    /// How long an uploaded-but-unverdicted sample (`detected = -1`) waits before its hash is
+    /// looked up again. VT analyses an upload in minutes, so the first recheck usually resolves
+    /// it; each recheck costs one budget unit, which is why it is a window and not every cycle.
+    pub pending_recheck_secs: u64,
+}
+
+/// What the `sample_analysis` table already says about a spooled body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnalysisState {
+    /// No row: never looked up.
+    Unknown,
+    /// Uploaded to VT, verdict not yet fetched; carries when the row was last touched.
+    Pending(DateTime<Utc>),
+    /// A real verdict is stored.
+    Done,
+}
+
+/// Whether a body should cost a lookup this cycle. `Done` never does; `Unknown` always does; a
+/// pending upload does once its recheck window has elapsed. Before this, any row at all counted
+/// as analyzed, so an uploaded sample was stored as `-1/-1` and never asked about again.
+pub fn needs_lookup(state: &AnalysisState, now: DateTime<Utc>, recheck_secs: u64) -> bool {
+    match state {
+        AnalysisState::Unknown => true,
+        AnalysisState::Done => false,
+        AnalysisState::Pending(since) => {
+            now.signed_duration_since(*since) >= chrono::Duration::seconds(recheck_secs as i64)
+        }
+    }
+}
+
+/// What to do when VT reports the hash unknown. A body already uploaded is never uploaded
+/// again: VT has it, and a second upload is a wasted budget unit that also resets nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextStep {
+    Upload,
+    RefreshPending,
+    Skip,
+}
+
+pub fn next_step(state: &AnalysisState, upload_unknown: bool) -> NextStep {
+    match state {
+        AnalysisState::Pending(_) => NextStep::RefreshPending,
+        _ if upload_unknown => NextStep::Upload,
+        _ => NextStep::Skip,
+    }
 }
 
 /// A request budget that caps VirusTotal calls per UTC day.
@@ -83,6 +128,36 @@ mod tests {
             "budget must reset on the new UTC day"
         );
     }
+
+    #[test]
+    fn pending_uploads_are_rechecked_after_the_window_and_verdicts_never_are() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let fresh = now - chrono::Duration::seconds(100);
+        let stale = now - chrono::Duration::seconds(901);
+        assert!(needs_lookup(&AnalysisState::Unknown, now, 900));
+        assert!(!needs_lookup(&AnalysisState::Done, now, 900));
+        assert!(
+            !needs_lookup(&AnalysisState::Pending(fresh), now, 900),
+            "a pending row inside its window must not spend a budget unit"
+        );
+        assert!(
+            needs_lookup(&AnalysisState::Pending(stale), now, 900),
+            "a pending row past its window must be looked up again"
+        );
+        assert!(
+            needs_lookup(&AnalysisState::Pending(fresh), now, 0),
+            "a zero window means every cycle"
+        );
+    }
+
+    #[test]
+    fn an_uploaded_sample_is_never_uploaded_twice() {
+        let pending = AnalysisState::Pending(Utc::now());
+        assert_eq!(next_step(&pending, true), NextStep::RefreshPending);
+        assert_eq!(next_step(&AnalysisState::Unknown, true), NextStep::Upload);
+        assert_eq!(next_step(&AnalysisState::Unknown, false), NextStep::Skip);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +190,8 @@ pub async fn scan_spool(
                 continue;
             }
 
-            if already_analyzed(pool, &name).await {
+            let state = analysis_state(pool, &name).await;
+            if !needs_lookup(&state, Utc::now(), config.pending_recheck_secs) {
                 continue;
             }
 
@@ -140,18 +216,35 @@ pub async fn scan_spool(
                     );
                     results.push(result);
                 }
-                Ok(None) => {
-                    if config.upload_unknown {
+                Ok(None) => match next_step(&state, config.upload_unknown) {
+                    NextStep::RefreshPending => {
+                        // Uploaded earlier, still no verdict: push the next recheck out by one
+                        // window. Re-storing the pending row is what advances `analyzed_at`.
+                        let _ = store_result(pool, &pending_result(&name), sensor).await;
+                        tracing::info!(sha256 = %name[..12], "vt: upload still awaiting analysis");
+                    }
+                    NextStep::Skip => {
+                        tracing::info!(sha256 = %name[..12], "vt: sample not in VT database");
+                    }
+                    NextStep::Upload => {
+                        // The upload is a second API request: it draws on the same daily budget
+                        // and keeps the same spacing as the lookup that preceded it.
+                        if !budget.try_consume(Utc::now()) {
+                            tracing::info!(
+                                limit = config.daily_limit,
+                                "vt: daily request limit reached before upload, pausing until the UTC day rolls over"
+                            );
+                            return results;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            config.request_delay_ms,
+                        ))
+                        .await;
                         let path = dir.join(&name);
                         match upload_sample(&client, &config.api_key, &path, &name).await {
                             Ok(()) => {
                                 tracing::info!(sha256 = %name[..12], "vt: sample uploaded for analysis");
-                                let pending = VtResult {
-                                    sha256: name.clone(),
-                                    detected: -1,
-                                    total: -1,
-                                    link: format!("https://www.virustotal.com/gui/file/{name}"),
-                                };
+                                let pending = pending_result(&name);
                                 let _ = store_result(pool, &pending, sensor).await;
                                 results.push(pending);
                             }
@@ -159,10 +252,8 @@ pub async fn scan_spool(
                                 tracing::warn!(sha256 = %name[..12], error = %e, "vt: upload failed");
                             }
                         }
-                    } else {
-                        tracing::info!(sha256 = %name[..12], "vt: sample not in VT database");
                     }
-                }
+                },
                 Err(e) => {
                     tracing::warn!(sha256 = %name[..12], error = %e, "vt: lookup failed");
                 }
@@ -173,13 +264,35 @@ pub async fn scan_spool(
     results
 }
 
-async fn already_analyzed(pool: &PgPool, sha256: &str) -> bool {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sample_analysis WHERE sha256 = $1")
-        .bind(sha256)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0)
-        > 0
+/// The stored state for a sha256. A query error reads as `Done` so a flaky database never turns
+/// into a burst of paid lookups; the next cycle asks again.
+async fn analysis_state(pool: &PgPool, sha256: &str) -> AnalysisState {
+    let row = sqlx::query_as::<_, (i32, DateTime<Utc>)>(
+        "SELECT detected, analyzed_at FROM sample_analysis WHERE sha256 = $1",
+    )
+    .bind(sha256)
+    .fetch_optional(pool)
+    .await;
+    match row {
+        Ok(None) => AnalysisState::Unknown,
+        Ok(Some((detected, at))) if detected < 0 => AnalysisState::Pending(at),
+        Ok(Some(_)) => AnalysisState::Done,
+        Err(e) => {
+            tracing::warn!(sha256 = %sha256[..12], error = %e, "vt: analysis state query failed");
+            AnalysisState::Done
+        }
+    }
+}
+
+/// The placeholder row for a sample VT has accepted but not yet verdicted. `-1/-1` is the
+/// contract the console renders as "pending" (samples page and IP detail page alike).
+fn pending_result(sha256: &str) -> VtResult {
+    VtResult {
+        sha256: sha256.to_string(),
+        detected: -1,
+        total: -1,
+        link: format!("https://www.virustotal.com/gui/file/{sha256}"),
+    }
 }
 
 async fn lookup_hash(

@@ -193,6 +193,7 @@ Opt-in egress, default off. See [integrations](integrations.md) and
 | `PROPOLIS_VT_ENABLED` | no | `false` (`:521`) | bool_flag; **and** a non-empty key required to actually enable (`&& !vt_api_key.is_empty()`) |
 | `PROPOLIS_VT_UPLOAD` | no | `false` (`:522`) | bool_flag; upload-unknown-samples opt-in |
 | `PROPOLIS_VT_SCAN_INTERVAL_SECS` | no | `300` (`:523`) | parse_u32 (zero allowed); unparseable → abort. No `PROPOLIS_VT_URL` override exists. |
+| `PROPOLIS_VT_PENDING_RECHECK_SECS` | no | `900` | parse_u32; how long an uploaded sample with no verdict yet (`detected = -1`) waits before its hash is looked up again. Each recheck costs one daily-budget unit. Zero → every scan cycle. unparseable → abort. |
 
 ### Malware fetcher (unified daemon only)
 

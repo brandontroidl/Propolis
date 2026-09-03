@@ -134,6 +134,8 @@
           {% if m.detected is defined and m.detected is not none %}
             {% if m.detected > 0 %}
             <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-rejected">{{ m.detected }}/{{ m.total }} detected</a>
+            {% elif m.detected < 0 %}
+            <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-snoozed">pending VT analysis</a>
             {% else %}
             <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved">clean (0/{{ m.total }})</a>
             {% endif %}

@@ -812,6 +812,7 @@ async fn main() {
             scan_interval_secs: config.vt_scan_interval_secs,
             request_delay_ms: 15_000,
             daily_limit: 450,
+            pending_recheck_secs: config.vt_pending_recheck_secs,
         };
 
         handles.push(spawn_supervised(

@@ -119,6 +119,7 @@ pub struct PropolisConfig {
     pub vt_api_key: String,
     pub vt_upload_unknown: bool,
     pub vt_scan_interval_secs: u64,
+    pub vt_pending_recheck_secs: u64,
     // Malware fetcher
     pub fetch_enabled: bool,
     pub fetch_interval: Duration,
@@ -527,6 +528,9 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
     let vt_enabled = parse_bool_flag("PROPOLIS_VT_ENABLED", false) && !vt_api_key.is_empty();
     let vt_upload_unknown = parse_bool_flag("PROPOLIS_VT_UPLOAD", false);
     let vt_scan_interval_secs = parse_u32("PROPOLIS_VT_SCAN_INTERVAL_SECS", 300)? as u64;
+    // Zero means "ask again every cycle", which is allowed but spends a budget unit per cycle
+    // per pending sample.
+    let vt_pending_recheck_secs = parse_u32("PROPOLIS_VT_PENDING_RECHECK_SECS", 900)? as u64;
 
     // Malware fetcher: opt-in egress, off by default like VT upload - see
     // internal/design/12-malware-fetcher.md section 13.
@@ -612,6 +616,7 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         vt_api_key,
         vt_upload_unknown,
         vt_scan_interval_secs,
+        vt_pending_recheck_secs,
         fetch_enabled,
         fetch_interval: Duration::from_secs(fetch_interval_secs),
         fetch_max_bytes,

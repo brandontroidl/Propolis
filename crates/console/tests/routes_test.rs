@@ -1900,6 +1900,39 @@ async fn detail_links_a_directly_uploaded_sample_to_its_uploader(pool: PgPool) {
     );
 }
 
+/// A sample uploaded to VirusTotal but not yet verdicted is stored as `-1/-1`. The samples page
+/// already rendered that as "pending"; the IP page fell through to the clean branch and showed a
+/// green "clean (0/-1)" for a sample nobody has judged yet.
+#[sqlx::test(migrations = false)]
+async fn detail_renders_a_pending_vt_upload_as_pending_not_clean(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.83", 60).await;
+    seed_fetch_attempt_with_analysis(&pool, 2, "203.0.113.83", -1, -1).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.83",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("pending VT analysis"),
+        "a -1 verdict must render as pending: {body}"
+    );
+    assert!(
+        !body.contains("clean (0"),
+        "a -1 verdict must never render as clean: {body}"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn detail_shows_linked_malware_fetched_from_this_ips_urls(pool: PgPool) {
     migrate(&pool).await;

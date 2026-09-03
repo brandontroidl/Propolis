@@ -41,7 +41,9 @@ A per-cycle counter would reset each cycle and never enforce a per-day cap.
 | Item | Value | Source |
 |---|---|---|
 | Daily cap | 450 requests / UTC day *(hard-coded)* | `main.rs:752` |
-| Request delay | 15000 ms before each lookup *(hard-coded)* | `main.rs:751`, applied `virustotal.rs:130` |
+| Request delay | 15000 ms before each lookup and before each upload *(hard-coded)* | `main.rs`, applied in `virustotal.rs::scan_spool` |
+| Upload cost | one budget unit per upload, in addition to the lookup that preceded it | `virustotal.rs::scan_spool` (`NextStep::Upload`) |
+| Pending recheck | 900 s default before an uploaded, unverdicted sample is looked up again; one budget unit per recheck; never re-uploaded | `PROPOLIS_VT_PENDING_RECHECK_SECS`, `virustotal.rs::needs_lookup` |
 | Scan interval | 300 s default | `PROPOLIS_VT_SCAN_INTERVAL_SECS` (`config.rs:523`) |
 | Documented VT free-tier limit | 4 req/min, 500/day | reference only, verified live 2026-08-19 (`virustotal.rs:5-6`) |
 

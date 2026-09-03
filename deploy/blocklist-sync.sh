@@ -48,6 +48,12 @@ elif [ -z "${SSH_AUTH_SOCK:-}" ] && [ ! -t 0 ]; then
        "environment; the push will fail if the remote needs a passphrase-protected key" >&2
 fi
 
+# One header per run. The log is append-only and shared by cron and by-hand runs, and without
+# this a failure could not be attributed to either: which identity pushed, and whether a terminal
+# was attached (cron never has one), is exactly what a stale-feed investigation needs first.
+if [ -t 0 ]; then tty_state="tty"; else tty_state="no-tty"; fi
+echo "blocklist-sync: run $(date -Is) ${tty_state} identity=${KEY:-agent-or-default}"
+
 # --- Resolve the feed source ------------------------------------------------------------------
 # Prefer an explicit override; otherwise take whichever standard location actually holds a build.
 # This tolerates both the documented `.../feed/current` and the older flat `.../feed` layout without

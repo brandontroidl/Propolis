@@ -1075,6 +1075,8 @@ async fn main() {
         let pg_data_volume = config.cursor_dir.clone();
         let spool_dir = ops_spool_root();
         let feed_marker = ops_alert::conditions::feed::marker_path(&config.feed_output_dir);
+        let feed_push_marker =
+            ops_alert::conditions::feed::push_marker_path(&config.feed_output_dir);
         let feed_build_interval = config.feed_build_interval;
 
         handles.push(spawn_supervised(
@@ -1089,6 +1091,7 @@ async fn main() {
                 let pg_data_volume = pg_data_volume.clone();
                 let spool_dir = spool_dir.clone();
                 let feed_marker_path = feed_marker.clone();
+                let feed_push_marker_path = feed_push_marker.clone();
                 async move {
                     // No ntfy target configured: deliver alerts to the local log sink rather than
                     // not alerting at all. Same conditions, same cooldown/dedup policy, different
@@ -1101,6 +1104,7 @@ async fn main() {
                         supervisor,
                         intake_progress,
                         feed_marker_path,
+                        feed_push_marker_path,
                         feed_build_interval,
                         cfg: ops_cfg.clone(),
                     };

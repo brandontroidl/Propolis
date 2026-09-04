@@ -195,7 +195,7 @@ impl<P: Poster> Monitor<P> {
     }
 }
 
-/// All eight operational conditions, in a stable order. Built fresh on each (re)start so per-
+/// All nine operational conditions, in a stable order. Built fresh on each (re)start so per-
 /// condition state (backlog history, the chain-verify cache) resets cleanly after a supervised
 /// restart.
 pub fn default_conditions() -> Vec<Box<dyn Condition>> {
@@ -208,6 +208,7 @@ pub fn default_conditions() -> Vec<Box<dyn Condition>> {
         Box::new(chain::ChainVerify::new()),
         Box::new(intake::IntakeStalled),
         Box::new(feed::FeedStale),
+        Box::new(feed::FeedPushStale),
         Box::new(vendor::VendorFailures),
     ]
 }
@@ -288,6 +289,7 @@ mod tests {
             supervisor: Arc::new(Mutex::new(HashMap::new())),
             intake_progress: Arc::new(Mutex::new(HashMap::new())),
             feed_marker_path: "/nonexistent".into(),
+            feed_push_marker_path: "/nonexistent".into(),
             feed_build_interval: Duration::from_secs(300),
             cfg,
         }
@@ -398,7 +400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_conditions_are_the_eight_expected_ids() {
+    async fn default_conditions_are_the_nine_expected_ids() {
         let ids: Vec<&str> = default_conditions().iter().map(|c| c.id()).collect();
         assert_eq!(
             ids,
@@ -410,6 +412,7 @@ mod tests {
                 "chain-verify",
                 "intake-stalled",
                 "feed-stale",
+                "feed-push-stale",
                 "vendor-failures",
             ]
         );

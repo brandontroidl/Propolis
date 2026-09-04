@@ -125,6 +125,17 @@ fi
 # when the branch is already up to date, and ships any stranded commit otherwise.
 if git push -q origin HEAD; then
   echo "blocklist-sync: pushed (HEAD $(git rev-parse --short HEAD))"
+  # Record the push time for the daemon's `feed-push-stale` condition, which pages when the local
+  # feed has moved on from the last successful push - the one failure the daemon's own feed
+  # health cannot see, since this script runs outside it. A sibling dotfile of the feed directory
+  # (never inside it, so it is not published), derived exactly as
+  # crates/propolis/src/ops_alert/conditions/feed.rs's `push_marker_path` derives it; world-
+  # readable so the propolis user can stat it. A marker failure must not fail a successful push.
+  push_marker="$(dirname "$SRC")/.$(basename "$SRC").last_pushed"
+  if ! { printf 'blocklist-sync last-pushed marker\n' > "$push_marker" && chmod 0644 "$push_marker"; }; then
+    echo "blocklist-sync: WARNING could not update push marker $push_marker; the daemon's" \
+         "feed-push-stale condition will read this push as not having happened" >&2
+  fi
 else
   echo "blocklist-sync: git push FAILED - the local commit is not on the remote. Under cron this is" \
        "almost always missing SSH auth (no agent / passphrase key). See the deploy README." >&2

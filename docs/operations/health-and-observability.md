@@ -101,7 +101,10 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
 
 - spool free space below `CAPACITY_FREE_PCT` (15%);
 - an intake/feed stall for `STALL_FOR_SECS` (600 s), and feed staleness at
-  `FEED_STALE_MULTIPLE` (2x) the build interval;
+  `FEED_STALE_MULTIPLE` (2x) the build interval - both for the local publish
+  (`feed-stale`) and for the public repo falling that far behind the local feed
+  (`feed-push-stale`, read from the marker `deploy/blocklist-sync.sh` touches after
+  each successful push; a box that never syncs is never paged);
 - vendor submission failure rate over `VENDOR_FAIL_PCT` (50%) within `VENDOR_WINDOW_SECS`
   (3600 s), gated by `VENDOR_MIN_SAMPLES` (20);
 - review backlog over `BACKLOG_MAX` (500) held for `BACKLOG_FOR_SECS` (900 s);

@@ -87,7 +87,11 @@ platform does not schedule it for you - you install the crontab.
 The script is fail-closed: it aborts if the source has no `manifest.json` or the
 target is not a git checkout, and refuses to publish if the tier files are
 missing. It always attempts a push (to ship any commit stranded by a prior failed
-run) and exits non-zero with a diagnostic if the push fails. Schedule it to run
+run) and exits non-zero with a diagnostic if the push fails. After a successful
+push it touches a "last-pushed" marker beside the feed directory; the ops
+monitor's `feed-push-stale` condition pages when the local feed has moved on from
+that marker by more than `FEED_STALE_MULTIPLE` build cycles (see
+[health and observability](health-and-observability.md)). Schedule it to run
 after a build interval so it never races the atomic swap.
 
 ## Rotating secrets

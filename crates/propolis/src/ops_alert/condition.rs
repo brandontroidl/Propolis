@@ -100,6 +100,9 @@ pub struct MonitorCtx {
     /// Sibling marker file the feed loop touches on each successful publish (its mtime is the last
     /// publish time). See `conditions::feed`.
     pub feed_marker_path: PathBuf,
+    /// Sibling marker file `deploy/blocklist-sync.sh` touches after each successful push to the
+    /// public repo. Absent when the operator never syncs. See `conditions::feed::FeedPushStale`.
+    pub feed_push_marker_path: PathBuf,
     /// The daemon's feed build interval, used with `cfg.feed_stale_multiple` to derive the staleness
     /// threshold.
     pub feed_build_interval: Duration,

@@ -25,9 +25,9 @@ cargo build --release  # release binaries (README.md:65, INSTALL.md:15)
 > `cargo build --release --locked` after re-vendoring. See
 > [schema-and-migrations](schema-and-migrations.md#vendoring).
 
-## The gate (three independent CI jobs)
+## The gate (four independent CI jobs)
 
-CI runs **three separate jobs**, deliberately not one sequential job: a single
+CI runs **four separate jobs**, deliberately not one sequential job: a single
 chained job bailed on the first failure, so an unformatted tree once meant clippy
 and the whole suite never ran for 30+ commits (`ci.yml:7-13`). Split this way, a
 cheap failure cannot hide an expensive one.
@@ -37,6 +37,13 @@ cheap failure cannot hide an expensive one.
 | **fmt** | `cargo fmt --all --check` | no |
 | **clippy** | `cargo clippy --workspace --all-targets --locked -- -D warnings` | no |
 | **tests** | `cargo test --workspace --locked -- --test-threads=1` (under `set -o pipefail`) | yes |
+| **release build** | `cargo build --release --workspace --locked` | no |
+
+The release job compiles the profile `deploy/upgrade.sh` ships. The other three
+compile the dev profile, so a release-only break (the vendored-crate checksum
+regression of 2026-08-22, which `cargo test` passed) reached the box with CI
+green. It is CI-only: the local pre-push gate below stays three steps, and a
+release build is run locally when packaging or vendoring changes.
 
 Details that are load-bearing:
 

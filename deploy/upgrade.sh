@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# In-place upgrade: pull, build, replace binaries, restart services.
+# In-place upgrade: pull, build, replace binaries, reinstall unit files + logrotate policy,
+# daemon-reload, restart services.
 # Safe to run on a live node - restarts are sequenced (propolis last so sensors
 # can reconnect). Runs deploy/provision.sh itself before restarting anything, so a directory or
 # user a change added since the last install/upgrade (e.g. a new sensor's spool dir) always exists
@@ -39,6 +40,28 @@ done
 
 echo "==> ensuring dirs and users (provision.sh, idempotent)"
 "$SCRIPT_DIR/provision.sh"
+
+# Unit files and the logrotate policy are deliverables of a release just like the binaries: a
+# hardening directive, a new ReadWritePaths grant, or a changed ExecStart merged to main never
+# reached a box that was only ever upgraded, because this script used to reinstall binaries and
+# restart units while systemd kept running the definitions from the last fresh install. The
+# production list mirrors install.sh's step 5 (deploy_test.rs cross-checks the two). gateway and
+# shipper units are operator-installed per role (split deployment), so they are refreshed only
+# where they are already enabled, matching the is-enabled restart guards below.
+echo "==> installing systemd units and logrotate config"
+for unit in propolis.service sensor-catchall.service sensor-ssh.service sensor-telnet.service sensor-redis.service sensor-adb.service sensor-http.service sensor-ftp.service sensor-smtp.service sensor-cred.service; do
+    install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
+done
+for unit in gateway.service shipper.service; do
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+        install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
+    fi
+done
+install -m 0644 "$SCRIPT_DIR/logrotate-sensors.conf" /etc/logrotate.d/propolis-sensors
+
+# Before any restart, or the restarts would start the OLD unit definitions.
+echo "==> reloading systemd unit files"
+systemctl daemon-reload
 
 echo "==> restarting sensors"
 for unit in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-cred; do

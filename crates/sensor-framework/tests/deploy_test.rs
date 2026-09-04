@@ -653,3 +653,101 @@ fn provisioned_dirs() -> HashSet<String> {
         })
         .collect()
 }
+
+/// Same standard as `install_script_is_valid_bash`: `upgrade.sh` has no `--dry-run`, so a syntax
+/// check is the one real execution it gets without root.
+#[test]
+fn upgrade_script_is_valid_bash() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/upgrade.sh");
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(script)
+        .status()
+        .expect("failed to invoke `bash -n` on deploy/upgrade.sh");
+    assert!(
+        status.success(),
+        "deploy/upgrade.sh has a bash syntax error"
+    );
+}
+
+/// `upgrade.sh` only ever reinstalled binaries and restarted units, so a unit-file change (a
+/// hardening directive, a new `ReadWritePaths` grant, a changed `ExecStart`) merged to main was
+/// never installed on a live box by an upgrade - and without a `daemon-reload` systemd kept
+/// running the unit definition from the last fresh install. The logrotate policy had the same
+/// gap. This cross-checks the two scripts against each other: every unit `install.sh` installs
+/// must also be installed by `upgrade.sh`, the logrotate config must be reinstalled, and the
+/// `daemon-reload` must come before the first restart so the restarts pick up the new files.
+#[test]
+fn upgrade_script_reinstalls_every_installed_unit_and_reloads_before_restarting() {
+    let install = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .expect("failed to read deploy/install.sh");
+    let upgrade = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/upgrade.sh"
+    ))
+    .expect("failed to read deploy/upgrade.sh");
+
+    let installed_units = unit_install_loop_members(&install);
+    assert!(
+        !installed_units.is_empty(),
+        "no `for unit in ... .service` loop found in install.sh - this parser is broken"
+    );
+    let upgraded_units = unit_install_loop_members(&upgrade);
+    for unit in &installed_units {
+        assert!(
+            upgraded_units.contains(unit),
+            "install.sh installs {unit} but upgrade.sh does not reinstall it - a change to that \
+             unit file never reaches a box that is only ever upgraded"
+        );
+    }
+    assert!(
+        upgrade
+            .lines()
+            .any(|l| l.contains("install -m 0644") && l.contains("/etc/systemd/system/")),
+        "upgrade.sh must install unit files into /etc/systemd/system/"
+    );
+    assert!(
+        upgrade
+            .lines()
+            .any(|l| l.contains("logrotate-sensors.conf") && l.contains("/etc/logrotate.d/")),
+        "upgrade.sh must reinstall deploy/logrotate-sensors.conf into /etc/logrotate.d/"
+    );
+
+    let reload_at = upgrade
+        .lines()
+        .position(|l| l.trim_start().starts_with("systemctl daemon-reload"))
+        .expect("upgrade.sh never runs `systemctl daemon-reload`");
+    let first_restart_at = upgrade
+        .lines()
+        .position(|l| l.trim_start().starts_with("systemctl restart"))
+        .expect("upgrade.sh never restarts a unit - the parser is broken");
+    assert!(
+        reload_at < first_restart_at,
+        "upgrade.sh runs daemon-reload (line {}) after its first restart (line {}); the restart \
+         would start the OLD unit definition",
+        reload_at + 1,
+        first_restart_at + 1
+    );
+}
+
+/// The `.service` names listed by every `for unit in ...` loop in a deploy script. Both scripts
+/// keep their unit lists as literal loop members, so this is the authoritative population, not a
+/// hand-copied list that could drift from the scripts it guards.
+fn unit_install_loop_members(script: &str) -> HashSet<String> {
+    script
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| l.starts_with("for unit in "))
+        .flat_map(|l| {
+            l.trim_start_matches("for unit in ")
+                .split_whitespace()
+                .map(|t| t.trim_end_matches(';'))
+                .filter(|t| t.ends_with(".service"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}

@@ -19,11 +19,18 @@ The script (run as root, `sudo ./deploy/upgrade.sh`):
 
 1. Runs `git pull` and `cargo build --release` **as the repo-owner user**, not as
    root, so build output keeps the owner's identity.
-2. Installs the 10 built binaries (`propolis` plus the 9 sensors) to
-   `/usr/local/bin/` with `install -m 0755`.
-3. Restarts each `sensor-*.service` **only if it is enabled**.
-4. Restarts `propolis.service` **last**, so sensors reconnect and the daemon runs
-   any new migrations after the binaries are in place.
+2. Installs the built binaries (`propolis`, the 9 sensors, `gateway`, `shipper`)
+   to `/usr/local/bin/` with `install -m 0755`.
+3. Runs `deploy/provision.sh` (idempotent users + directories), reinstalls the
+   production unit files and `logrotate-sensors.conf` (the same set `install.sh`
+   installs; `gateway.service`/`shipper.service` only where already enabled), then
+   runs `systemctl daemon-reload` so the restarts below pick up the new unit
+   definitions.
+4. Restarts each `sensor-*.service` **only if it is enabled**, then `gateway.service`
+   if enabled.
+5. Restarts `propolis.service`, so sensors reconnect and the daemon runs any new
+   migrations after the binaries are in place, then `shipper.service` if enabled
+   (after the gateway it dials).
 
 The unified daemon is the production surface; the standalone `intake`/`review`/
 `feed`/`console` units are superseded by it and are not part of the upgrade

@@ -118,10 +118,11 @@ modes are covered in [concurrency and failure](../architecture/concurrency-and-f
 ## Live upgrade
 
 `deploy/upgrade.sh` (run as root, `sudo ./deploy/upgrade.sh`) performs an in-place upgrade:
-it rebuilds as the repo-owning user, reinstalls the ten binaries, restarts each **sensor**
-unit that is enabled, then restarts `propolis.service` **last** so sensors reconnect and
-migrations run against the new schema (`deploy/upgrade.sh:23-41`). It assumes `install.sh`
-has already run. See [upgrade, rollback, and DR](./upgrade-rollback-and-dr.md).
+it rebuilds as the repo-owning user, reinstalls the binaries, runs `provision.sh`, reinstalls
+the unit files and logrotate config, runs `daemon-reload`, restarts each **sensor** unit that
+is enabled, then restarts `propolis.service` so sensors reconnect and migrations run against
+the new schema (`deploy/upgrade.sh`). See
+[upgrade, rollback, and DR](./upgrade-rollback-and-dr.md).
 
 > **Warning - production impact.** `upgrade.sh` restarts live services and runs migrations.
 > Run it during a maintenance window and confirm a working backup first (see

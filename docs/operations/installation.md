@@ -158,8 +158,9 @@ forms are collected in [../reference/commands.md](../reference/commands.md).
 ## Upgrades
 
 In-place upgrades use `sudo ./deploy/upgrade.sh` (requires root): it pulls, runs
-`cargo build --release` as the repo-owner user, reinstalls the binaries,
-restarts only the enabled sensor units, and restarts `propolis.service` last so
-migrations run and sensors reconnect (`deploy/upgrade.sh:11-41`). It assumes
-`install.sh` already ran. Rollback and DR are owned by
+`cargo build --release` as the repo-owner user, reinstalls the binaries, runs
+`provision.sh`, reinstalls the unit files and logrotate config, runs
+`daemon-reload`, restarts only the enabled sensor units, and restarts
+`propolis.service` last so migrations run and sensors reconnect
+(`deploy/upgrade.sh`). Rollback and DR are owned by
 [upgrade-rollback-and-dr.md](upgrade-rollback-and-dr.md).

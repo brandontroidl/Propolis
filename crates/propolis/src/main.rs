@@ -34,16 +34,24 @@ use review::queue::ReviewQueue;
 use review::submit::SubmissionRunner;
 use review::vendor::{AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter};
 
-/// Absolute path the malware fetcher writes captured samples to. Hardcoded, matching the VT
-/// scanner's own `spool_dirs` below and `console/src/routes/samples.rs`'s identical list - not an
-/// operator env var, same convention as every other sensor's `SPOOL_MAX_FILE_SIZE`/
-/// `SPOOL_GLOBAL_BUDGET` constants.
+/// Path the malware fetcher writes captured samples to - the same `fetched` bucket
+/// `review::spool::all_body_dirs` hands the VT scan, sample retention and the console samples
+/// view, so the writer and every reader agree by construction. Not an operator env var, same
+/// convention as every other sensor's `SPOOL_MAX_FILE_SIZE`/`SPOOL_GLOBAL_BUDGET` constants.
 /// Resolved from the shared spool root, never hardcoded, so it follows `PROPOLIS_SPOOL_ROOT` like
 /// every other directory under the tree and a deployment that relocates the spool does not leave the
 /// fetcher writing somewhere the scanner and console do not look.
 fn fetch_spool_dir() -> std::path::PathBuf {
     review::spool::spool_subdir("fetched")
 }
+
+/// Age past which a spooled sample body is deleted by the `sample-retention` subsystem, and how
+/// often that pass runs. Compile-time like the spool byte caps, not an env var: retention is a
+/// property of the evidence model (`docs/operations/retention.md`), and the DB row recording a
+/// sample's analysis outlives the bytes. The pass is a directory walk, so hourly is cheap and
+/// keeps a spool from sitting full for a whole day after its oldest bodies expire.
+const SAMPLE_RETENTION_DAYS: u64 = 30;
+const SAMPLE_RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Root of the capture spool the ops-monitor's capacity condition watches for free space. The
 /// per-sensor and fetched subdirectories all live under it, so it is the volume that fills as
@@ -823,8 +831,7 @@ async fn main() {
             let pool = pool_vt.clone();
             let vt_config = vt_config.clone();
             async move {
-                let mut spool_dirs = review::spool::body_spool_dirs();
-                spool_dirs.push(("fetched", fetch_spool_dir()));
+                let spool_dirs = review::spool::all_body_dirs();
                 // One budget owned across every scan cycle so the cap is per DAY, not per cycle.
                 let mut budget = review::virustotal::DailyBudget::new(
                     vt_config.daily_limit,
@@ -836,7 +843,6 @@ async fn main() {
                         return;
                     }
                     review::virustotal::scan_spool(&pool, &vt_config, &spool_dirs, &mut budget).await;
-                    review::virustotal::cleanup_old_samples(&spool_dirs, 30).await;
                     tokio::select! {
                         _ = tokio::time::sleep(tokio::time::Duration::from_secs(vt_config.scan_interval_secs)) => {}
                         _ = token.cancelled() => {}
@@ -847,6 +853,30 @@ async fn main() {
     } else {
         tracing::info!("propolis: virustotal scanner disabled");
     }
+
+    // 8b. Sample retention: age out spooled bodies on every deployment. This used to be a step
+    // of the VirusTotal scan cycle, so a box without a VT key never evicted a sample by age and
+    // its spools were bounded only by the byte budgets, which then refused NEW evidence once old
+    // samples had filled them. Retention is not a scanning concern; it runs whether or not any
+    // analysis is configured.
+    handles.push(spawn_supervised(
+        "sample-retention",
+        cancel.clone(),
+        supervisor_state.clone(),
+        move |token| async move {
+            let spool_dirs = review::spool::all_body_dirs();
+            loop {
+                if token.is_cancelled() {
+                    return;
+                }
+                review::virustotal::cleanup_old_samples(&spool_dirs, SAMPLE_RETENTION_DAYS).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(SAMPLE_RETENTION_INTERVAL) => {}
+                    _ = token.cancelled() => {}
+                }
+            }
+        },
+    ));
 
     // 9. Spawn malware fetcher if enabled.
     if config.fetch_enabled {

@@ -252,11 +252,9 @@ async fn download_sample(AxumPath(sha256): AxumPath<String>) -> Response {
 }
 
 fn spool_dirs() -> Vec<(&'static str, PathBuf)> {
-    let mut dirs = review::spool::body_spool_dirs();
-    // Resolved off the same spool root as the sensor dirs, never a hardcoded path: the fetcher's
-    // output moves with PROPOLIS_SPOOL_ROOT like everything else under the tree.
-    dirs.push(("fetched", review::spool::spool_subdir("fetched")));
-    dirs
+    // The one canonical list (sensor spools + the fetcher's bucket), shared with the VT scan and
+    // sample retention so this view never walks a different set than they do.
+    review::spool::all_body_dirs()
 }
 
 fn format_bytes(b: u64) -> String {

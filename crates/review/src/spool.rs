@@ -61,9 +61,36 @@ pub fn body_spool_dirs() -> Vec<(&'static str, PathBuf)> {
         .collect()
 }
 
+/// Every directory that holds captured bodies: the sensor spools plus the malware fetcher's own
+/// `fetched` bucket. The VT scan, sample retention and the console samples view all walk this one
+/// list, so `fetched` is appended here once rather than hand-appended at each caller (which is how
+/// one of them ends up walking three directories while another walks four).
+pub fn all_body_dirs() -> Vec<(&'static str, PathBuf)> {
+    let mut dirs = body_spool_dirs();
+    dirs.push(("fetched", spool_subdir("fetched")));
+    dirs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_body_dirs_is_every_sensor_spool_plus_fetched() {
+        let names: Vec<&str> = all_body_dirs().iter().map(|(n, _)| *n).collect();
+        for sensor in body_spool_dirs().iter().map(|(n, _)| *n) {
+            assert!(
+                names.contains(&sensor),
+                "{sensor} missing from all_body_dirs"
+            );
+        }
+        assert_eq!(
+            names.iter().filter(|n| **n == "fetched").count(),
+            1,
+            "fetched must be present exactly once"
+        );
+        assert_eq!(names.len(), body_spool_dirs().len() + 1);
+    }
 
     #[test]
     fn canonical_list_is_the_full_body_spooler_set_including_telnet() {

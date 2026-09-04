@@ -479,10 +479,9 @@ and topic are required or the daemon refuses to start.
 
 **Retention** ([retention](../operations/retention.md)). Feed membership is bound
 by tier TTLs (Aggressive 24h, Standard 48h) and retention windows (default
-`24h,7d,30d,60d,90d`). Captured sample files are trimmed at 30 days - **but only
-by the VirusTotal scanner's cleanup pass, which runs only when VirusTotal is
-enabled**; without VT, spooled files are bounded only by the global byte budget,
-so run your own prune if you need age-based expiry. There is **no built-in pruning
+`24h,7d,30d,60d,90d`). Captured sample files are trimmed at 30 days by the
+daemon's always-on `sample-retention` subsystem, independent of VirusTotal; the
+global byte budget bounds a burst in between passes. There is **no built-in pruning
 of the `event` table** - plan storage for sustained ingest. Sensor logs rotate at
 `size 100M`, 5 generations.
 

@@ -98,6 +98,6 @@ one row per source IP. Scoring uses time-decay on read, so old events keep contr
 storage even after their scoring weight has decayed away. Growth is driven by attack volume and
 sensor exposure, not by a fixed schedule. There is **no built-in event-table pruning**; plan
 database storage for sustained ingest and prune with your own retention job if needed. Sample
-files (not DB rows) are trimmed at 30 days by the VT scanner's cleanup pass; feed membership is
+files (not DB rows) are trimmed at 30 days by the always-on `sample-retention` subsystem; feed membership is
 bounded by retention windows. Both are covered in [retention](./retention.md). Table and column
 definitions are owned by [database reference](../reference/database.md).

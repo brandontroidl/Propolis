@@ -75,8 +75,10 @@ After startup, the daemon spawns each subsystem via `spawn_supervised` under a s
 3. **Feed** - if `feed_enabled`: builds a snapshot and atomically publishes it (default
    900 s), touching the ops-monitor freshness marker. (`main.rs:670-742, 305-350`)
 4. **VirusTotal scanner** - if `vt_enabled`: scans the spool directories under
-   `/var/spool/propolis`, sharing one daily budget across cycles and cleaning samples
-   older than 30 days. (`main.rs:744-791`)
+   `/var/spool/propolis`, sharing one daily budget across cycles. (`main.rs:744-791`)
+   **Sample retention** - always spawned (`sample-retention`): hourly, deletes spooled
+   bodies older than 30 days from every body directory, independent of VirusTotal
+   (`main.rs` `SAMPLE_RETENTION_DAYS`).
 5. **Malware fetcher** - if `fetch_enabled`: an SSRF-guarded staging-server fetcher that
    is **fail-closed on an empty `own_ips`**, reserves/refunds a daily budget across
    cycles, and writes to `/var/spool/propolis/fetched`. (`main.rs:41-158, 793-946`)
@@ -87,8 +89,8 @@ After startup, the daemon spawns each subsystem via `spawn_supervised` under a s
    intake liveness handles, watches disk/DB/feed/vendor health, and pages ntfy on
    degradation. (`main.rs:999-1061`)
 
-Subsystems 2-5 and 7 are opt-in and default off; the console is the only data-plane
-subsystem always spawned. The exact enabling env vars and their defaults are owned by
+Subsystems 2-5 and 7 are opt-in and default off; the console and sample retention are
+the only subsystems always spawned. The exact enabling env vars and their defaults are owned by
 [../reference/environment-variables.md](../reference/environment-variables.md); the
 gated egress subsystems (VirusTotal, vendor submitters, ops-alert) are covered in
 [../security/outbound-controls.md](../security/outbound-controls.md).

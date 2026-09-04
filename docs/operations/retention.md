@@ -51,18 +51,17 @@ controls](../security/outbound-controls.md).
 
 ## Captured-sample cleanup (30 days)
 
-Spooled sample files are removed after **30 days** by the VirusTotal scanner's cleanup pass:
-`cleanup_old_samples(spool_dirs, 30)` runs each scan cycle over the sensor and fetcher spools
-(`crates/review/src/virustotal.rs:293-320`, wired `crates/propolis/src/main.rs:781`). The
-30-day age is a compile-time argument, not an env var. The cleanup itself performs no egress
-(it is local file deletion).
+Spooled sample files are removed after **30 days** by the daemon's `sample-retention`
+subsystem: `cleanup_old_samples(spool_dirs, 30)` runs hourly over every body directory
+(`review::spool::all_body_dirs`: the sensor spools plus the fetcher's `fetched` bucket;
+`crates/review/src/virustotal.rs` `cleanup_old_samples`, wired in `crates/propolis/src/main.rs`
+as `SAMPLE_RETENTION_DAYS` / `SAMPLE_RETENTION_INTERVAL`). The 30-day age and the hourly cadence
+are compile-time constants, not env vars. The cleanup itself performs no egress (it is local
+file deletion).
 
-> **Important - the 30-day cleanup only runs when VirusTotal is enabled.** The cleanup pass
-> lives inside the VT scanner loop, which the daemon spawns only when `PROPOLIS_VT_ENABLED` is
-> true and a non-empty key is set (`crates/propolis/src/main.rs:745,781`). With VirusTotal
-> disabled, **no age-based sample cleanup runs at all**; spooled files are then bounded only by
-> the per-spool global byte budget (see below), not by age. If you run without VirusTotal and
-> want age-based sample expiry, prune the spool directories with your own job.
+The subsystem is always spawned, independent of VirusTotal. It used to be a step of the VT scan
+cycle, so a deployment without a VT key never aged out a sample and its spools were bounded only
+by the byte budgets below, which then refused new evidence once old samples had filled them.
 
 Note that the sample-analysis DB rows (`sample_analysis`) recording VT verdicts are not deleted
 by this pass; only the spooled file bytes are. See [integrations](../reference/integrations.md)

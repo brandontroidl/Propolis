@@ -7,7 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
 use sensor_framework::{
-    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
+    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver, upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
@@ -18,6 +18,10 @@ const PROTOCOL_LABEL: &str = "ftp";
 const MAX_LINE_LEN: usize = 8192;
 const MAX_USERNAME_LEN: usize = 255;
 const MAX_STOR_BODY: usize = 10_000_000;
+/// How far past `MAX_STOR_BODY` a STOR is drained without being stored, only to measure the real
+/// upload size for the event's `wire_size`/`truncated`. Bounded so an attacker trickling bytes
+/// cannot hold the data connection open indefinitely once nothing more is being kept.
+const MAX_STOR_DRAIN: usize = 10_000_000;
 
 // Impersonate vsFTPd 3.0.5 end to end: the banner, the FEAT block, and every response string below
 // are that daemon's real output. A banner that matches no daemon - or a banner and FEAT that do not
@@ -252,6 +256,11 @@ pub async fn handle_connection(
                             continue;
                         }
                         let mut body = Vec::new();
+                        // Bytes the client sent, retained or not, so the emitted event can say
+                        // whether `body` is the whole file or a capped prefix. Past the cap the
+                        // read keeps draining (bounded by MAX_STOR_DRAIN, so a slow trickle
+                        // cannot hold the data connection open forever) purely to learn that.
+                        let mut wire_bytes: u64 = 0;
                         let mut chunk = [0u8; 4096];
                         loop {
                             match tokio::time::timeout(
@@ -264,7 +273,8 @@ pub async fn handle_connection(
                                 Ok(Ok(n)) => {
                                     let take = MAX_STOR_BODY.saturating_sub(body.len()).min(n);
                                     body.extend_from_slice(&chunk[..take]);
-                                    if body.len() >= MAX_STOR_BODY {
+                                    wire_bytes += n as u64;
+                                    if wire_bytes >= (MAX_STOR_BODY + MAX_STOR_DRAIN) as u64 {
                                         break;
                                     }
                                 }
@@ -285,12 +295,7 @@ pub async fn handle_connection(
                                 protocol: PROTO_TCP.to_string(),
                                 authenticated: logged_in,
                                 observed_at: chrono::Utc::now(),
-                                metadata: serde_json::json!({
-                                    "protocol_label": PROTOCOL_LABEL,
-                                    "sha256": sample.sha256,
-                                    "size": sample.size,
-                                    "orig_name": sample.orig_name,
-                                }),
+                                metadata: upload_metadata(PROTOCOL_LABEL, &sample, wire_bytes),
                                 sample: Some(sample),
                                 session_id: Some(session_id),
                                 occurrence_id: None,

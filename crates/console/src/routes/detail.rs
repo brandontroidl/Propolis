@@ -745,7 +745,8 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
                 coalesce(e.metadata->>'sample_orig_name', '') AS url, \
                 e.sensor AS host, \
                 NULL::text AS pinned_ip, \
-                'captured' AS status, \
+                CASE WHEN coalesce((e.metadata->>'truncated')::boolean, false) \
+                     THEN 'truncated' ELSE 'captured' END AS status, \
                 (e.metadata->>'sample_size')::int AS bytes, \
                 e.metadata->>'sample_sha256' AS sha256_hex, \
                 sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \

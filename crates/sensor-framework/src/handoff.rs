@@ -70,6 +70,27 @@ pub struct CaptureJob {
     pub event_builder: Box<dyn FnOnce(SampleRef) -> SensorEvent + Send>,
 }
 
+/// The `honeypot_malware_upload` metadata object every body-capturing sensor emits, built in one
+/// place so the keys cannot drift between sensors. `wire_size` is how many body bytes the client
+/// actually sent; `sample.size` is how many were retained. Sensors cap the body they keep (SCP,
+/// SFTP and ADB retain a 10 MB prefix and drain the rest to keep the protocol aligned), and an
+/// analysis of the prefix must never be read as an analysis of the file: `truncated` says the
+/// hash and size describe a prefix, and `wire_size` says how big the real upload was.
+pub fn upload_metadata(
+    protocol_label: &str,
+    sample: &SampleRef,
+    wire_size: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "protocol_label": protocol_label,
+        "sha256": sample.sha256,
+        "size": sample.size,
+        "orig_name": sample.orig_name,
+        "wire_size": wire_size,
+        "truncated": wire_size > sample.size,
+    })
+}
+
 /// `submit` could not enqueue the job because the queue was already at capacity. `submit` never
 /// waits for room (see the module doc), so this is the immediate, synchronous outcome of a full
 /// queue, not a timeout or a retry-later signal.
@@ -332,6 +353,33 @@ mod tests {
     use super::*;
     use sensor_wire::*;
     use std::time::Duration;
+
+    fn sample(size: u64) -> SampleRef {
+        SampleRef {
+            sha256: "ab".repeat(32),
+            size,
+            orig_name: "payload.bin".into(),
+            capture_id: None,
+        }
+    }
+
+    #[test]
+    fn upload_metadata_marks_a_capped_body_as_truncated_with_the_real_wire_size() {
+        let m = upload_metadata("ssh", &sample(10_000_000), 12_000_000);
+        assert_eq!(m["truncated"], true);
+        assert_eq!(m["wire_size"], 12_000_000u64);
+        assert_eq!(m["size"], 10_000_000u64);
+        assert_eq!(m["protocol_label"], "ssh");
+        assert_eq!(m["sha256"], "ab".repeat(32));
+        assert_eq!(m["orig_name"], "payload.bin");
+    }
+
+    #[test]
+    fn upload_metadata_marks_a_complete_body_as_not_truncated() {
+        let m = upload_metadata("adb", &sample(4096), 4096);
+        assert_eq!(m["truncated"], false);
+        assert_eq!(m["wire_size"], 4096u64);
+    }
 
     /// Builds a `CaptureHandoff` wired to an `OutboxManifest` under `base_dir.join("outbox")`,
     /// with `"test"` as its `collector_id` - used by every test below that does not itself care

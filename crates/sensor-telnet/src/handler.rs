@@ -16,7 +16,7 @@ use sensor_framework::persona;
 use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell};
 use sensor_framework::{
-    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
+    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver, upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
@@ -193,6 +193,7 @@ pub async fn handle_connection(
     // Plaintext-only sessions never reach this branch, so an ordinary attacker's typed commands
     // are never spooled.
     if binary_seen {
+        let wire_size = reader.capture_wire_bytes();
         let raw = reader.take_capture();
         if !raw.is_empty() {
             let orig_name = format!("telnet-session-{session_id}");
@@ -208,10 +209,11 @@ pub async fn handle_connection(
                     protocol: PROTO_TCP.to_string(),
                     authenticated: true,
                     observed_at: chrono::Utc::now(),
-                    metadata: serde_json::json!({
-                        "protocol_label": PROTOCOL_LABEL,
-                        "capture_reason": "binary_shell_payload",
-                    }),
+                    metadata: {
+                        let mut m = upload_metadata(PROTOCOL_LABEL, &sample, wire_size);
+                        m["capture_reason"] = serde_json::json!("binary_shell_payload");
+                        m
+                    },
                     sample: Some(sample),
                     session_id: Some(session_id),
                     occurrence_id: None,
@@ -287,6 +289,9 @@ struct LineReader {
     /// line assembly and the whole-session byte budget, this tracks only the shell-phase bytes a
     /// caller has opted into preserving.
     capture: Vec<u8>,
+    /// Shell-phase bytes that arrived after `capture` hit `bounds.max_captured_bytes` and were
+    /// dropped, so the emitted event can say the capture is a prefix and how big the whole was.
+    capture_overflow: u64,
     /// Set by `start_capture`; gates whether `read_line` accumulates into `capture`. Starts false
     /// so the login/password phase is never captured.
     capturing: bool,
@@ -303,6 +308,7 @@ impl LineReader {
             total_captured: 0,
             prev_cr: false,
             capture: Vec::new(),
+            capture_overflow: 0,
             capturing: false,
         }
     }
@@ -318,6 +324,12 @@ impl LineReader {
         std::mem::take(&mut self.capture)
     }
 
+    /// Shell-phase bytes the client sent while capturing, retained or dropped past the ceiling.
+    /// Read BEFORE `take_capture`, which drains the retained half.
+    fn capture_wire_bytes(&self) -> u64 {
+        self.capture.len() as u64 + self.capture_overflow
+    }
+
     /// Accumulate already-IAC-stripped `data` into the capture buffer, a no-op unless
     /// `start_capture` has been called, and bounded so a captured session can never grow past
     /// `bounds.max_captured_bytes` - the same ceiling the whole session's `total_captured` is
@@ -330,10 +342,9 @@ impl LineReader {
             .bounds
             .max_captured_bytes
             .saturating_sub(self.capture.len() as u64) as usize;
-        if room > 0 {
-            let take = data.len().min(room);
-            self.capture.extend_from_slice(&data[..take]);
-        }
+        let take = data.len().min(room);
+        self.capture.extend_from_slice(&data[..take]);
+        self.capture_overflow += (data.len() - take) as u64;
     }
 
     /// Read one line (terminated by `\n` or `\r`) of already IAC-stripped, lossily-decoded text.
@@ -486,6 +497,8 @@ mod tests {
         let mut reader = LineReader::new(bounds);
         reader.start_capture();
         reader.capture_bytes(b"0123456789ABCDEF"); // 16 bytes offered, cap is 10
+        // The whole offered size is still known, so the event can say the capture is a prefix.
+        assert_eq!(reader.capture_wire_bytes(), 16);
         assert_eq!(
             reader.capture.len(),
             10,

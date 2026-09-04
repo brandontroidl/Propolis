@@ -263,7 +263,8 @@ captures SCP/SFTP transfers.
   `SSH_FX_OP_UNSUPPORTED` (`:209-480`). Caps: `MAX_CAPTURE_BODY` 10_000_000,
   `SFTP_MAX_FILE_BODY` 10_000_000, `SFTP_MAX_OPEN_HANDLES` 64,
   `SFTP_MAX_SESSION_BYTES` 20_000_000, `SFTP_MAX_PACKET_SIZE` 262_144
-  (`:38, 230, 236-244`).
+  (`:38, 230, 236-244`). A body past its cap is kept as a prefix and emitted with
+  `truncated: true` plus the real `wire_size`.
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`server.rs:107-111`).
 - **Bounds:** common defaults (deliberately identical to Telnet), `max_concurrent`
   256 (`main.rs:53-57`).
@@ -323,7 +324,10 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
   passive data connection whose source IP differs from the control connection's is
   refused with `425 Security: bad IP connecting.`, preventing off-path attribution
   poisoning (historical fix, commits `94a62ae1`, `016721e1`).
-- **Caps:** `MAX_STOR_BODY = 10_000_000`, login sanitized cap 255.
+- **Caps:** `MAX_STOR_BODY = 10_000_000` (a larger STOR keeps the prefix, drains up
+  to `MAX_STOR_DRAIN` more to measure it, and emits `truncated`/`wire_size` - see
+  [events-and-signals](events-and-signals.md#sampleref-librs59-63)), login
+  sanitized cap 255.
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`lib.rs:12-14, 26-32`).
 - **Bounds:** common defaults, `max_concurrent` 256.
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
@@ -385,7 +389,8 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
   `shell:<cmd>` → one-shot exec, `sync:` → file-transfer sub-protocol, anything
   else refused. Sync sub-protocol: SEND/DATA/DONE → captures the pushed file →
   `honeypot_malware_upload`; RECV → refused (`FAIL Permission denied`, **never
-  serves outbound**); STAT → not-found. Sync body cap `MAX_SYNC_BODY` 10_000_000.
+  serves outbound**); STAT → not-found. Sync body cap `MAX_SYNC_BODY` 10_000_000
+  (a larger push keeps the prefix and is emitted with `truncated`/`wire_size`).
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`lib.rs`).
 - **Bounds:** common defaults, `max_concurrent` 256.
 - **Emits:** `honeypot_connection`, `honeypot_command_exec` (shell),

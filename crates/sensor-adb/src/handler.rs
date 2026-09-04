@@ -32,6 +32,7 @@ use sensor_framework::fakefs::FakeFs;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell};
+use sensor_framework::upload_metadata;
 use sensor_framework::{
     CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
 };
@@ -110,6 +111,9 @@ struct SyncState {
 struct PendingSend {
     orig_name: String,
     body: Vec<u8>,
+    /// DATA payload bytes the client sent, including any drained past `MAX_SYNC_BODY`;
+    /// `body.len()` is what was retained.
+    wire_bytes: u64,
 }
 
 impl SyncState {
@@ -155,6 +159,7 @@ impl SyncState {
                     self.pending_send = Some(PendingSend {
                         orig_name,
                         body: Vec::new(),
+                        wire_bytes: 0,
                     });
                 }
                 adb_proto::SYNC_DATA if self.pending_send.is_some() => {
@@ -169,6 +174,7 @@ impl SyncState {
                         let storable = MAX_SYNC_BODY.saturating_sub(pending.body.len());
                         let take = storable.min(chunk.len());
                         pending.body.extend_from_slice(&chunk[..take]);
+                        pending.wire_bytes += chunk.len() as u64;
                     }
                 }
                 adb_proto::SYNC_DONE if self.pending_send.is_some() => {
@@ -250,6 +256,7 @@ impl SyncState {
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
         let session_id = self.session_id;
+        let wire_size = pending.wire_bytes;
         CaptureJob {
             body: pending.body,
             orig_name: pending.orig_name,
@@ -262,12 +269,7 @@ impl SyncState {
                 protocol: PROTO_TCP.to_string(),
                 authenticated: false,
                 observed_at: chrono::Utc::now(),
-                metadata: serde_json::json!({
-                    "protocol_label": PROTOCOL_LABEL,
-                    "sha256": sample.sha256,
-                    "size": sample.size,
-                    "orig_name": sample.orig_name,
-                }),
+                metadata: upload_metadata(PROTOCOL_LABEL, &sample, wire_size),
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
@@ -780,6 +782,39 @@ mod tests {
             job.body.len()
         );
         assert_eq!(job.body.len(), MAX_SYNC_BODY);
+
+        // The emitted event must not present the retained prefix as the whole file.
+        let sent = (chunk.len() * (MAX_SYNC_BODY / chunk.len() + 5)) as u64;
+        let event = (job.event_builder)(SampleRef {
+            sha256: "ab".repeat(32),
+            size: job.body.len() as u64,
+            orig_name: "huge".into(),
+            capture_id: None,
+        });
+        assert_eq!(event.metadata["truncated"], true);
+        assert_eq!(event.metadata["wire_size"], sent);
+        assert_eq!(event.metadata["size"], MAX_SYNC_BODY as u64);
+    }
+
+    #[test]
+    fn sync_body_within_cap_is_not_marked_truncated() {
+        let mut sync = test_sync_state();
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/small,420",
+        ));
+        let chunk = vec![0x55u8; 4096];
+        sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, &chunk));
+        let (_response, upload) = sync.feed(&adb_proto::build_sync_done(0));
+        let job = upload.unwrap();
+        let event = (job.event_builder)(SampleRef {
+            sha256: "ab".repeat(32),
+            size: job.body.len() as u64,
+            orig_name: "small".into(),
+            capture_id: None,
+        });
+        assert_eq!(event.metadata["truncated"], false);
+        assert_eq!(event.metadata["wire_size"], 4096u64);
     }
 
     #[test]

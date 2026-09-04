@@ -24,7 +24,7 @@ pub use command_codec::CommandCodec;
 pub use config::SensorConfig;
 pub use emit::EventEmitter;
 pub use env::env_with_legacy;
-pub use handoff::{CaptureDropped, CaptureHandoff, CaptureJob};
+pub use handoff::{CaptureDropped, CaptureHandoff, CaptureJob, upload_metadata};
 pub use listener::{run_tcp_listener, run_udp_listener, shutdown_signal};
 pub use outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
 pub use sanitize::{sanitize_value, to_hex_bounded};

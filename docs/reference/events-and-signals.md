@@ -65,6 +65,16 @@ SHA-256. The body travels out-of-band (the spool); only this reference rides the
 
 The `sha256` here is the key into [`sample_analysis`](database.md#table-sample_analysis-0009_sample_analysissql).
 
+Body-capturing sensors cap what they retain (10 MB for SCP, SFTP, ADB and FTP
+STOR; `PROPOLIS_TELNET_MAX_CAPTURED_BYTES` for a telnet binary-payload capture)
+and drain the rest to keep the protocol aligned. Their `honeypot_malware_upload`
+metadata therefore also carries `wire_size` (bytes the client actually sent) and
+`truncated` (`wire_size > size`), built by `sensor_framework::upload_metadata`.
+When `truncated` is true the `sha256` and `size` describe a prefix, not the file;
+the IP detail page shows such rows with status `truncated` instead of `captured`.
+FTP drains at most a further 10 MB past its cap before closing the data
+connection, so a `wire_size` of 20 MB on an FTP row is a floor, not the total.
+
 ## Signal types
 
 16 signal types (`signal_type_enum`, mirrored by Rust `SignalType`). The enum

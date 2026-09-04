@@ -198,6 +198,8 @@ async fn stor_upload_captured_in_spool() {
         .unwrap();
     let sample = upload.sample.as_ref().unwrap();
     assert_eq!(sample.size, body.len() as u64);
+    assert_eq!(upload.metadata["truncated"], false);
+    assert_eq!(upload.metadata["wire_size"], body.len() as u64);
 
     use sha2::{Digest, Sha256};
     let expected_hash = sensor_framework::to_hex_bounded(&Sha256::digest(body), 32);
@@ -207,6 +209,45 @@ async fn stor_upload_captured_in_spool() {
         .await
         .unwrap();
     assert_eq!(on_disk, body);
+    srv.handle.abort();
+}
+
+/// A STOR past the 10 MB cap keeps only the prefix. The event must say so - `truncated` plus the
+/// real `wire_size` - or a scan of the prefix reads as a verdict on the whole upload.
+#[tokio::test]
+async fn stor_upload_past_the_cap_is_marked_truncated() {
+    let srv = TestServer::start().await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    client.login("root", "toor").await;
+    let data_addr = client.pasv().await;
+    client
+        .reader
+        .get_mut()
+        .write_all(b"STOR /tmp/huge.bin\r\n")
+        .await
+        .unwrap();
+    let r = client.read_reply().await;
+    assert!(r.starts_with("150"), "STOR 150: {r}");
+
+    const CAP: usize = 10_000_000;
+    let sent = CAP + 4096;
+    let mut data = TcpStream::connect(data_addr).await.unwrap();
+    data.write_all(&vec![0xABu8; sent]).await.unwrap();
+    drop(data);
+
+    let r = client.read_reply().await;
+    assert!(r.starts_with("226"), "STOR 226: {r}");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let events = srv.events().await;
+    let upload = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .expect("the capped upload must still be captured and emitted");
+    let sample = upload.sample.as_ref().unwrap();
+    assert_eq!(sample.size, CAP as u64, "only the prefix is retained");
+    assert_eq!(upload.metadata["truncated"], true);
+    assert_eq!(upload.metadata["wire_size"], sent as u64);
     srv.handle.abort();
 }
 

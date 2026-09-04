@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use sensor_framework::{CaptureHandoff, CaptureJob, Uuid};
+use sensor_framework::{CaptureHandoff, CaptureJob, Uuid, upload_metadata};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
 };
@@ -58,6 +58,9 @@ pub struct ScpReceiver {
     line_buf: Vec<u8>,
     filename: String,
     body: Vec<u8>,
+    /// Body bytes consumed off the wire for the current file, capped or not - what the client
+    /// actually sent, as opposed to `body.len()`, what was retained.
+    wire_bytes: u64,
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
     session_id: Uuid,
@@ -79,6 +82,7 @@ impl ScpReceiver {
                 line_buf: Vec::new(),
                 filename: String::new(),
                 body: Vec::new(),
+                wire_bytes: 0,
                 source_ip,
                 wan_ip,
                 session_id,
@@ -103,6 +107,7 @@ impl ScpReceiver {
                             if let Some((size, name)) = parse_scp_header(&self.line_buf) {
                                 self.filename = name;
                                 self.body.clear();
+                                self.wire_bytes = 0;
                                 let capped = (size as usize).min(MAX_CAPTURE_BODY);
                                 self.body.reserve(capped);
                                 self.state = ScpState::ReadingBody {
@@ -140,6 +145,7 @@ impl ScpReceiver {
                     }
 
                     *consumed += take;
+                    self.wire_bytes += take as u64;
                     offset += take;
                     if *consumed >= expected as usize {
                         self.state = ScpState::WaitTrailer;
@@ -165,6 +171,7 @@ impl ScpReceiver {
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
         let session_id = self.session_id;
+        let wire_size = self.wire_bytes;
 
         let _ = self.handoff.submit(CaptureJob {
             body,
@@ -178,12 +185,7 @@ impl ScpReceiver {
                 protocol: PROTO_TCP.into(),
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
-                metadata: serde_json::json!({
-                    "protocol_label": "ssh",
-                    "sha256": sample.sha256,
-                    "size": sample.size,
-                    "orig_name": sample.orig_name,
-                }),
+                metadata: upload_metadata("ssh", &sample, wire_size),
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
@@ -248,6 +250,9 @@ const SFTP_MAX_PACKET_SIZE: usize = 262_144;
 struct SftpOpenFile {
     orig_name: String,
     body: Vec<u8>,
+    /// Bytes the client wrote to this handle, including any dropped past the per-file or
+    /// per-session cap; `body.len()` is what was retained.
+    wire_bytes: u64,
 }
 
 /// SFTP subsystem handler. Constructed when the session sees a `subsystem sftp` request.
@@ -383,6 +388,7 @@ impl SftpHandler {
             SftpOpenFile {
                 orig_name: String::from_utf8_lossy(&filename).into_owned(),
                 body: Vec::new(),
+                wire_bytes: 0,
             },
         );
 
@@ -416,6 +422,7 @@ impl SftpHandler {
             if storable > 0 {
                 file.body.extend_from_slice(&data[..storable]);
             }
+            file.wire_bytes += data.len() as u64;
             Some(storable)
         } else {
             None
@@ -454,6 +461,7 @@ impl SftpHandler {
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
         let session_id = self.session_id;
+        let wire_size = file.wire_bytes;
 
         let _ = self.handoff.submit(CaptureJob {
             body: file.body,
@@ -467,12 +475,7 @@ impl SftpHandler {
                 protocol: PROTO_TCP.into(),
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
-                metadata: serde_json::json!({
-                    "protocol_label": "ssh",
-                    "sha256": sample.sha256,
-                    "size": sample.size,
-                    "orig_name": sample.orig_name,
-                }),
+                metadata: upload_metadata("ssh", &sample, wire_size),
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
@@ -622,6 +625,9 @@ mod tests {
             scp.body.len()
         );
         assert_eq!(scp.body.len(), MAX_CAPTURE_BODY);
+        // The emitted event must describe the prefix AS a prefix: the full declared size was
+        // consumed off the wire, and `upload_metadata` turns wire_bytes > size into `truncated`.
+        assert_eq!(scp.wire_bytes, declared as u64);
 
         // Send trailing \0 - the state machine must still be aligned.
         let response = scp.feed(&[0x00]);

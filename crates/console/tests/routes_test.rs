@@ -1900,6 +1900,79 @@ async fn detail_links_a_directly_uploaded_sample_to_its_uploader(pool: PgPool) {
     );
 }
 
+/// The uploaded arm of the malware panel used to emit one row per EVENT, so an attacker that
+/// re-uploaded the same body enough times filled the 50-row page with one sha and pushed every
+/// other sample it had uploaded off the panel. Rows are one per sha now.
+#[sqlx::test(migrations = false)]
+async fn detail_malware_panel_groups_repeated_uploads_of_one_sha(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.82";
+    seed_recommended(&pool, ip, 60).await;
+
+    let repeated = "aaaa3ba075a5aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let distinct = "bbbb3ba075a5aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    // The distinct sample first, so every one of the repeats sorts NEWER than it and the
+    // pre-fix query's LIMIT would have dropped it.
+    let base = chrono::Utc::now() - chrono::Duration::minutes(120);
+    let upload = |sha: &str, name: &str, at: chrono::DateTime<chrono::Utc>| {
+        ev_with_session(
+            ip,
+            "ftp",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &at.to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": sha,
+                "sample_orig_name": name,
+                "sample_size": 1024,
+            }),
+            Uuid::now_v7(),
+        )
+    };
+    append_event(&pool, upload(distinct, "rare.bin", base))
+        .await
+        .unwrap();
+    for i in 1..=60 {
+        append_event(
+            &pool,
+            upload(repeated, "spam.bin", base + chrono::Duration::seconds(i)),
+        )
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // Scope to the malware panel: the event timeline below it also renders every upload.
+    let panel_start = body
+        .find("Malware from this IP")
+        .expect("malware panel heading must render");
+    let panel = &body[panel_start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    assert!(
+        panel.contains("bbbb3ba075a5"),
+        "the distinct sample must not be crowded off the panel by repeats of another: {panel}"
+    );
+    // The table cell renders the 12-char short form followed by "..."; the full sha in the
+    // title attribute does not match this string, so this counts rows.
+    assert_eq!(
+        panel.matches("aaaa3ba075a5...").count(),
+        1,
+        "the repeated sha must render as ONE row, not one per upload: {panel}"
+    );
+}
+
 /// A sample uploaded to VirusTotal but not yet verdicted is stored as `-1/-1`. The samples page
 /// already rendered that as "pending"; the IP page fell through to the clean branch and showed a
 /// green "clean (0/-1)" for a sample nobody has judged yet.

@@ -735,6 +735,8 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
     //    event itself carries the sha, so this is a first-party observation, the strongest link
     //    there is. It was missing until an FTP attacker uploaded three samples and the panel still
     //    read "not linked" - the sensor had the evidence, the panel just never asked for it.
+    //    One row per sha, not per event: an attacker re-uploading one body sixty times used to
+    //    fill the whole page with it and push its other samples off the panel.
     // 2. FETCHED - the fetcher retrieved a URL this address reported. Weaker: it is the FIRST
     //    reporter of that url, not necessarily every one that referenced it.
     //
@@ -742,18 +744,19 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
     // direct observation exists, or the reverse.
     let rows = sqlx::query(
         "SELECT 'uploaded' AS origin, \
-                coalesce(e.metadata->>'sample_orig_name', '') AS url, \
-                e.sensor AS host, \
+                max(coalesce(e.metadata->>'sample_orig_name', '')) AS url, \
+                max(e.sensor) AS host, \
                 NULL::text AS pinned_ip, \
-                CASE WHEN coalesce((e.metadata->>'truncated')::boolean, false) \
+                CASE WHEN bool_or(coalesce((e.metadata->>'truncated')::boolean, false)) \
                      THEN 'truncated' ELSE 'captured' END AS status, \
-                (e.metadata->>'sample_size')::int AS bytes, \
+                max((e.metadata->>'sample_size')::int) AS bytes, \
                 e.metadata->>'sample_sha256' AS sha256_hex, \
                 sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
-                max(e.observed_at) OVER (PARTITION BY e.metadata->>'sample_sha256') AS sort_at \
+                max(e.observed_at) AS sort_at \
          FROM event e \
          LEFT JOIN sample_analysis sa ON e.metadata->>'sample_sha256' = sa.sha256 \
          WHERE e.source_ip = $1::inet AND e.metadata->>'sample_sha256' IS NOT NULL \
+         GROUP BY e.metadata->>'sample_sha256', sa.sha256 \
          UNION ALL \
          SELECT 'fetched' AS origin, fa.url, fa.host, fa.pinned_ip, fa.status, fa.bytes, \
                 encode(fa.sha256, 'hex') AS sha256_hex, \

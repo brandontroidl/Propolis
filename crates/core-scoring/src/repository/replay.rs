@@ -187,7 +187,7 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<Option<IpSc
 
 /// Verify the whole-ledger hash chain, tamper-evidently.
 ///
-/// Fetches ALL events in `id` order and, for each row, recomputes
+/// Walks every event in `id` order, in fixed-size keyset pages, and for each row recomputes
 /// `chain_hash(prev_row_hash, reconstructed_event)` and compares it to the
 /// stored `hash`, and checks `row.prev_hash == prev_row.hash` (the first row
 /// must have `prev_hash IS NULL`). Returns `Broken { first_bad_id }` at the
@@ -198,37 +198,57 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<Option<IpSc
 /// self-consistent prefix that reads `Intact`. Closing that needs a signed, externally-anchored
 /// chain tip (out of scope here; recorded in `internal/audit/2026-07-18-core-scoring-audit.md`).
 pub async fn verify_chain(pool: &PgPool) -> Result<ChainStatus, RepoError> {
-    let rows = sqlx::query(
-        "SELECT id, prev_hash, hash, host(source_ip) AS source_ip, host(wan_ip) AS wan_ip, \
-                sensor, signal_type, protocol, authenticated, category, weight, confidence, \
-                observed_at, metadata \
-         FROM event ORDER BY id",
-    )
-    .fetch_all(pool)
-    .await?;
+    verify_chain_in_batches(pool, VERIFY_BATCH_ROWS).await
+}
 
+/// Rows fetched per round trip by `verify_chain`. The ledger is append-only and unbounded
+/// (`docs/operations/retention.md`), and the walk runs every 6 h inside the unified daemon and on
+/// console demand, so it must not hold the whole table in memory: keyset pages of this size keep
+/// the working set constant however large the ledger grows.
+const VERIFY_BATCH_ROWS: i64 = 5_000;
+
+/// `verify_chain` with the page size exposed, so a test can drive page boundaries with a handful
+/// of rows. Keyset (`id > last`) rather than OFFSET: each page is an index-range scan, and a row
+/// appended mid-walk lands after the cursor and is simply verified as the tail.
+pub async fn verify_chain_in_batches(pool: &PgPool, batch: i64) -> Result<ChainStatus, RepoError> {
+    let batch = batch.max(1);
     let mut prev_hash_of_prior_row: Option<Vec<u8>> = None;
-    for row in &rows {
-        let id: i64 = row.try_get("id")?;
-        let stored_prev: Option<Vec<u8>> = row.try_get("prev_hash")?;
-        let stored_hash: Vec<u8> = row.try_get("hash")?;
-
-        // Linkage: this row's prev_hash must equal the prior row's stored hash
-        // (None for the first row). This is what makes the chain a chain.
-        if stored_prev != prev_hash_of_prior_row {
-            return Ok(ChainStatus::Broken { first_bad_id: id });
+    let mut last_id: i64 = 0;
+    loop {
+        let rows = sqlx::query(
+            "SELECT id, prev_hash, hash, host(source_ip) AS source_ip, host(wan_ip) AS wan_ip, \
+                    sensor, signal_type, protocol, authenticated, category, weight, confidence, \
+                    observed_at, metadata \
+             FROM event WHERE id > $1 ORDER BY id LIMIT $2",
+        )
+        .bind(last_id)
+        .bind(batch)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(ChainStatus::Intact);
         }
+        for row in &rows {
+            let id: i64 = row.try_get("id")?;
+            let stored_prev: Option<Vec<u8>> = row.try_get("prev_hash")?;
+            let stored_hash: Vec<u8> = row.try_get("hash")?;
 
-        // Content: recompute this row's hash from its reconstructed event bound
-        // to the prior row's hash, and compare to the stored hash.
-        let event = reconstruct_event(row)?;
-        let recomputed = chain_hash(prev_hash_of_prior_row.as_deref(), &event);
-        if recomputed.as_slice() != stored_hash.as_slice() {
-            return Ok(ChainStatus::Broken { first_bad_id: id });
+            // Linkage: this row's prev_hash must equal the prior row's stored hash
+            // (None for the first row). This is what makes the chain a chain.
+            if stored_prev != prev_hash_of_prior_row {
+                return Ok(ChainStatus::Broken { first_bad_id: id });
+            }
+
+            // Content: recompute this row's hash from its reconstructed event bound
+            // to the prior row's hash, and compare to the stored hash.
+            let event = reconstruct_event(row)?;
+            let recomputed = chain_hash(prev_hash_of_prior_row.as_deref(), &event);
+            if recomputed.as_slice() != stored_hash.as_slice() {
+                return Ok(ChainStatus::Broken { first_bad_id: id });
+            }
+
+            prev_hash_of_prior_row = Some(stored_hash);
+            last_id = id;
         }
-
-        prev_hash_of_prior_row = Some(stored_hash);
     }
-
-    Ok(ChainStatus::Intact)
 }

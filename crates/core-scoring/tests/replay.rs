@@ -9,7 +9,7 @@ use core_scoring::domain::enums::{Protocol, SignalType};
 use core_scoring::domain::types::EventInput;
 use core_scoring::repository::{
     ChainStatus, RepoError, append_event, read_score, read_stored_score, rebuild_projection,
-    verify_chain,
+    verify_chain, verify_chain_in_batches,
 };
 
 use chrono::Utc;
@@ -156,6 +156,61 @@ async fn read_score_rederives_stale_flags_after_decay(pool: PgPool) -> Result<()
     assert!(
         now.eligible,
         "eligibility records a fact about the past and must not decay away"
+    );
+    Ok(())
+}
+
+/// verify_chain walks the ledger in keyset pages so the working set stays constant as the table
+/// grows. The chain state must carry across a page boundary: a break at the first row of a page
+/// (its prev_hash no longer matching the last row of the previous page) and a break in the last
+/// row of a page must both be caught at the right id, and an intact ledger must read Intact at
+/// every page size, including one that leaves a partial final page.
+#[sqlx::test(migrations = "./migrations")]
+async fn verify_chain_carries_state_across_page_boundaries(pool: PgPool) -> Result<(), RepoError> {
+    for i in 0..5 {
+        append_event(
+            &pool,
+            ev(
+                &format!("2026-07-17T00:0{i}:00Z"),
+                SignalType::HoneypotConnection,
+                Some("198.51.100.1"),
+                "s1",
+                Protocol::Tcp,
+                true,
+            ),
+        )
+        .await?;
+    }
+    for batch in [1, 2, 3, 5, 100] {
+        assert_eq!(
+            verify_chain_in_batches(&pool, batch).await?,
+            ChainStatus::Intact,
+            "intact ledger must verify at page size {batch}"
+        );
+    }
+
+    // Page size 2 puts id 3 at the START of the second page: its linkage check compares against
+    // a hash carried over from the previous page.
+    sqlx::raw_sql("UPDATE event SET weight = weight + 1 WHERE id = 3")
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        verify_chain_in_batches(&pool, 2).await?,
+        ChainStatus::Broken { first_bad_id: 3 },
+        "a content break at the first row of a page must be caught at that row"
+    );
+    // Content of id 3 is restored, but its stored hash no longer matches: break id 4's linkage
+    // instead, which is the LAST row of the second page.
+    sqlx::raw_sql("UPDATE event SET weight = weight - 1 WHERE id = 3")
+        .execute(&pool)
+        .await?;
+    sqlx::raw_sql("UPDATE event SET prev_hash = '\\x00'::bytea WHERE id = 4")
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        verify_chain_in_batches(&pool, 2).await?,
+        ChainStatus::Broken { first_bad_id: 4 },
+        "a linkage break at the last row of a page must be caught at that row"
     );
     Ok(())
 }

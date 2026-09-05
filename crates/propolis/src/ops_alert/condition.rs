@@ -95,6 +95,14 @@ pub struct MonitorCtx {
     pub pg_data_volume: PathBuf,
     /// The sensor spool directory (for `statvfs` free-space + a size walk).
     pub spool_dir: PathBuf,
+    /// Every directory holding captured bodies (`review::spool::all_body_dirs`), walked by
+    /// `conditions::malware::ScanStale` for bodies no scan has ever recorded.
+    pub spool_dirs: Vec<(&'static str, PathBuf)>,
+    /// Whether the VirusTotal scanner and the malware fetcher are spawned at all. The malware
+    /// conditions are silent when their subsystem is off: unscanned-forever and pending-forever
+    /// are then the configured state, not a failure.
+    pub vt_enabled: bool,
+    pub fetch_enabled: bool,
     pub supervisor: SupervisorHandle,
     pub intake_progress: IntakeProgress,
     /// Sibling marker file the feed loop touches on each successful publish (its mtime is the last

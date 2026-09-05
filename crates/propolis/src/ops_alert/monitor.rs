@@ -195,11 +195,11 @@ impl<P: Poster> Monitor<P> {
     }
 }
 
-/// All nine operational conditions, in a stable order. Built fresh on each (re)start so per-
+/// All eleven operational conditions, in a stable order. Built fresh on each (re)start so per-
 /// condition state (backlog history, the chain-verify cache) resets cleanly after a supervised
 /// restart.
 pub fn default_conditions() -> Vec<Box<dyn Condition>> {
-    use super::conditions::{backlog, capacity, chain, feed, intake, subsystem, vendor};
+    use super::conditions::{backlog, capacity, chain, feed, intake, malware, subsystem, vendor};
     vec![
         Box::new(subsystem::SubsystemGaveUp),
         Box::new(subsystem::SensorDown),
@@ -210,6 +210,8 @@ pub fn default_conditions() -> Vec<Box<dyn Condition>> {
         Box::new(feed::FeedStale),
         Box::new(feed::FeedPushStale),
         Box::new(vendor::VendorFailures),
+        Box::new(malware::ScanStale),
+        Box::new(malware::FetchStale),
     ]
 }
 
@@ -286,6 +288,9 @@ mod tests {
             pool,
             pg_data_volume: "/".into(),
             spool_dir: "/".into(),
+            spool_dirs: Vec::new(),
+            vt_enabled: false,
+            fetch_enabled: false,
             supervisor: Arc::new(Mutex::new(HashMap::new())),
             intake_progress: Arc::new(Mutex::new(HashMap::new())),
             feed_marker_path: "/nonexistent".into(),
@@ -400,7 +405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_conditions_are_the_nine_expected_ids() {
+    async fn default_conditions_are_the_eleven_expected_ids() {
         let ids: Vec<&str> = default_conditions().iter().map(|c| c.id()).collect();
         assert_eq!(
             ids,
@@ -414,6 +419,8 @@ mod tests {
                 "feed-stale",
                 "feed-push-stale",
                 "vendor-failures",
+                "scan-stale",
+                "fetch-stale",
             ]
         );
     }

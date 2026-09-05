@@ -250,6 +250,8 @@ u32.
 | `PROPOLIS_OPS_BACKLOG_MAX` | no | `500` (`:149`) | min 1 | u64 |
 | `PROPOLIS_OPS_BACKLOG_FOR_SECS` | no | `900` (`:150`) | min 1 | |
 | `PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS` | no | `21600` (`:151`) | min 1 | |
+| `PROPOLIS_OPS_SCAN_STALE_SECS` | no | `21600` | min 1 | `scan-stale`: a spooled body unscanned, or a VirusTotal upload unverdicted, this long; silent unless VirusTotal is enabled |
+| `PROPOLIS_OPS_FETCH_STALE_SECS` | no | `3600` | min 1 | `fetch-stale`: a fetch url pending this long; silent unless the fetcher is enabled |
 
 ---
 

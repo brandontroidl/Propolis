@@ -1131,6 +1131,8 @@ async fn main() {
         let ops_intake = intake_progress.clone();
         let pg_data_volume = config.cursor_dir.clone();
         let spool_dir = ops_spool_root();
+        let ops_spool_dirs = review::spool::all_body_dirs();
+        let (vt_enabled, fetch_enabled) = (config.vt_enabled, config.fetch_enabled);
         let feed_marker = ops_alert::conditions::feed::marker_path(&config.feed_output_dir);
         let feed_push_marker =
             ops_alert::conditions::feed::push_marker_path(&config.feed_output_dir);
@@ -1147,6 +1149,7 @@ async fn main() {
                 let intake_progress = ops_intake.clone();
                 let pg_data_volume = pg_data_volume.clone();
                 let spool_dir = spool_dir.clone();
+                let spool_dirs = ops_spool_dirs.clone();
                 let feed_marker_path = feed_marker.clone();
                 let feed_push_marker_path = feed_push_marker.clone();
                 async move {
@@ -1158,6 +1161,9 @@ async fn main() {
                         pool,
                         pg_data_volume,
                         spool_dir,
+                        spool_dirs,
+                        vt_enabled,
+                        fetch_enabled,
                         supervisor,
                         intake_progress,
                         feed_marker_path,

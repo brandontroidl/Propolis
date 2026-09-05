@@ -140,6 +140,111 @@ async fn metrics(
         .unwrap();
     }
 
+    // Malware pipeline: the WORK, not the process. A live scanner or fetcher that has stopped
+    // verdicting or retiring urls is invisible to a liveness probe; queue depth by stage plus the
+    // age of the oldest waiting item is what shows it. The ops-monitor's `scan-stale` and
+    // `fetch-stale` conditions page on the same signals.
+    let fetch_rows = sqlx::query(
+        "SELECT status, COUNT(*) AS count FROM fetch_attempt GROUP BY status ORDER BY status",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    writeln!(
+        out,
+        "# HELP propolis_fetch_attempts Malware fetcher urls by current status."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE propolis_fetch_attempts gauge").unwrap();
+    for row in fetch_rows {
+        let status: String = row.try_get("status")?;
+        let count: i64 = row.try_get("count")?;
+        writeln!(
+            out,
+            "propolis_fetch_attempts{{status=\"{}\"}} {count}",
+            escape_label(&status)
+        )
+        .unwrap();
+    }
+    let fetch_pending_oldest: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM now() - min(first_seen))::float8 \
+         FROM fetch_attempt WHERE status = 'pending'",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    push_gauge(
+        &mut out,
+        "propolis_fetch_pending_oldest_age_seconds",
+        "Age of the oldest fetch url still pending; 0 when none is pending.",
+        age_seconds(fetch_pending_oldest),
+    );
+
+    let (analysis_pending, analysis_scanned): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE detected < 0), count(*) FILTER (WHERE detected >= 0) \
+         FROM sample_analysis",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    writeln!(
+        out,
+        "# HELP propolis_sample_analysis Captured samples by analysis state: scanned (a verdict recorded) or pending (uploaded, no verdict yet)."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE propolis_sample_analysis gauge").unwrap();
+    writeln!(
+        out,
+        "propolis_sample_analysis{{state=\"pending\"}} {analysis_pending}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "propolis_sample_analysis{{state=\"scanned\"}} {analysis_scanned}"
+    )
+    .unwrap();
+    let analysis_pending_oldest: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM now() - min(analyzed_at))::float8 \
+         FROM sample_analysis WHERE detected < 0",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    push_gauge(
+        &mut out,
+        "propolis_sample_analysis_pending_oldest_age_seconds",
+        "Age of the oldest VirusTotal upload still awaiting a verdict; 0 when none.",
+        age_seconds(analysis_pending_oldest),
+    );
+
+    // Spool occupancy from the filesystem: sample count and oldest body per spool. A spool this
+    // process cannot read yields no series (absent, not zero) - the standalone console binary has
+    // no spool grant, and an absent series is honest where a zero would claim an empty spool.
+    let spools: Vec<(&str, u64, u64)> = review::spool::all_body_dirs()
+        .iter()
+        .filter_map(|(name, dir)| spool_occupancy(dir).map(|(n, age)| (*name, n, age)))
+        .collect();
+    if !spools.is_empty() {
+        writeln!(
+            out,
+            "# HELP propolis_spool_samples Captured sample bodies on disk, per spool."
+        )
+        .unwrap();
+        writeln!(out, "# TYPE propolis_spool_samples gauge").unwrap();
+        for (name, count, _) in &spools {
+            writeln!(out, "propolis_spool_samples{{spool=\"{name}\"}} {count}").unwrap();
+        }
+        writeln!(
+            out,
+            "# HELP propolis_spool_oldest_sample_age_seconds Age of the oldest sample body on disk, per spool; 0 when empty."
+        )
+        .unwrap();
+        writeln!(out, "# TYPE propolis_spool_oldest_sample_age_seconds gauge").unwrap();
+        for (name, _, age) in &spools {
+            writeln!(
+                out,
+                "propolis_spool_oldest_sample_age_seconds{{spool=\"{name}\"}} {age}"
+            )
+            .unwrap();
+        }
+    }
+
     if let Some(manifest) = state.feed_output_dir.as_deref().and_then(read_manifest) {
         writeln!(
             out,
@@ -246,9 +351,70 @@ fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// `EXTRACT(EPOCH FROM now() - min(...))` as whole seconds for a gauge: NULL (nothing waiting)
+/// and a negative value (clock skew) both read as 0, never as a stale age.
+fn age_seconds(epoch_secs: Option<f64>) -> i64 {
+    epoch_secs.map_or(0, |s| s.max(0.0) as i64)
+}
+
+/// `(sample count, oldest sample age in seconds)` for one spool directory, counting only the
+/// sha256-named bodies the spool writes (never its tmp files). `None` when the directory cannot
+/// be read at all, so the caller emits no series rather than a false zero.
+fn spool_occupancy(dir: &std::path::Path) -> Option<(u64, u64)> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let now = std::time::SystemTime::now();
+    let mut count = 0u64;
+    let mut oldest = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.len() != 64 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        count += 1;
+        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+            let age = now.duration_since(mtime).map_or(0, |d| d.as_secs());
+            oldest = oldest.max(age);
+        }
+    }
+    Some((count, oldest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn age_seconds_treats_null_and_skew_as_zero() {
+        assert_eq!(age_seconds(None), 0);
+        assert_eq!(age_seconds(Some(-12.0)), 0);
+        assert_eq!(age_seconds(Some(90.9)), 90);
+    }
+
+    #[test]
+    fn spool_occupancy_counts_only_sha_named_bodies_and_reports_the_oldest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("a".repeat(64));
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(tmp.path().join("b".repeat(64)), b"y").unwrap();
+        std::fs::write(tmp.path().join("staging.tmp"), b"z").unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        let (count, oldest) = spool_occupancy(tmp.path()).unwrap();
+        assert_eq!(count, 2, "the tmp file is not a sample");
+        assert!((3599..=3601).contains(&oldest), "oldest age {oldest}");
+        assert_eq!(
+            spool_occupancy(&tmp.path().join("missing")),
+            None,
+            "an unreadable spool yields no series, never a zero"
+        );
+    }
 
     #[test]
     fn escape_label_escapes_backslash_quote_and_newline() {

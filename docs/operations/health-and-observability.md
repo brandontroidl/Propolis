@@ -41,6 +41,13 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
 - Gauges: `propolis_ips_scored`, `propolis_ips_eligible`, `propolis_ips_recommended_vendor`,
   `propolis_ips_recommended_blocklist`, `propolis_review_queue_pending`.
 - Counter: `propolis_vendor_submissions_total{vendor,status}`.
+- Malware pipeline (the work, not the process): `propolis_fetch_attempts{status}`,
+  `propolis_fetch_pending_oldest_age_seconds`, `propolis_sample_analysis{state}`
+  (`pending` = uploaded to VirusTotal, no verdict yet; `scanned`),
+  `propolis_sample_analysis_pending_oldest_age_seconds`, and, where the process can read
+  the spools (the unified daemon, not the standalone console), `propolis_spool_samples{spool}`
+  and `propolis_spool_oldest_sample_age_seconds{spool}`. An age gauge is `0` when nothing
+  is waiting; a spool series is absent, not zero, when unreadable.
 - Feed (from `manifest.json` when a feed dir is configured): `propolis_feed_entries{tier}`,
   `propolis_feed_window_entries{window}`, `propolis_feed_last_build_timestamp`.
 - In-memory process counters: `propolis_events_ingested_total`, `propolis_events_rejected_total`.
@@ -108,6 +115,11 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
 - vendor submission failure rate over `VENDOR_FAIL_PCT` (50%) within `VENDOR_WINDOW_SECS`
   (3600 s), gated by `VENDOR_MIN_SAMPLES` (20);
 - review backlog over `BACKLOG_MAX` (500) held for `BACKLOG_FOR_SECS` (900 s);
+- malware work stalled: a spooled body unscanned or a VirusTotal upload unverdicted for
+  `SCAN_STALE_SECS` (6 h; `scan-stale`, only with VirusTotal enabled), or a fetch url
+  pending for `FETCH_STALE_SECS` (1 h; `fetch-stale`, only with the fetcher enabled) -
+  the fetcher retires a url after three attempts, so an old pending row means it is not
+  attempting;
 - periodic hash-chain verification every `CHAIN_VERIFY_INTERVAL_SECS` (6 h);
 - re-page suppression `REPAGE_COOLDOWN_SECS` (5400 s); poll `POLL_INTERVAL_SECS` (30 s).
 

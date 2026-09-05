@@ -30,6 +30,12 @@ pub struct OpsAlertConfig {
     pub backlog_max: u64,
     pub backlog_for: Duration,
     pub chain_verify_interval: Duration,
+    /// A spooled body unscanned, or a VirusTotal upload unverdicted, for longer than this pages
+    /// (`scan-stale`); only when VirusTotal is enabled.
+    pub scan_stale: Duration,
+    /// A fetch url pending for longer than this pages (`fetch-stale`); only when the fetcher is
+    /// enabled. The fetcher retires a url after three attempts, so this is well past that.
+    pub fetch_stale: Duration,
 }
 
 fn get_bool(get: &impl Fn(&str) -> Option<String>, name: &str, default: bool) -> bool {
@@ -153,6 +159,8 @@ pub fn parse_ops_alert(
         backlog_max: get_u64(get, "PROPOLIS_OPS_BACKLOG_MAX", 500, 1)?,
         backlog_for: get_secs(get, "PROPOLIS_OPS_BACKLOG_FOR_SECS", 900, 1)?,
         chain_verify_interval: get_secs(get, "PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS", 21600, 1)?,
+        scan_stale: get_secs(get, "PROPOLIS_OPS_SCAN_STALE_SECS", 21600, 1)?,
+        fetch_stale: get_secs(get, "PROPOLIS_OPS_FETCH_STALE_SECS", 3600, 1)?,
     })
 }
 
@@ -240,6 +248,8 @@ mod tests {
         assert_eq!(cfg.ntfy_token, None);
         assert_eq!(cfg.stall_for, Duration::from_secs(600));
         assert_eq!(cfg.chain_verify_interval, Duration::from_secs(21600));
+        assert_eq!(cfg.scan_stale, Duration::from_secs(21600));
+        assert_eq!(cfg.fetch_stale, Duration::from_secs(3600));
     }
 
     #[test]

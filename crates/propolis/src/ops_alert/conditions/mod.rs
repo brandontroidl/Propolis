@@ -6,5 +6,6 @@ pub mod capacity;
 pub mod chain;
 pub mod feed;
 pub mod intake;
+pub mod malware;
 pub mod subsystem;
 pub mod vendor;

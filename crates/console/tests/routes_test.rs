@@ -3329,6 +3329,78 @@ async fn metrics_returns_prometheus_text_format(pool: PgPool) {
     assert!(body.contains("propolis_ips_recommended_vendor 1\n"));
 }
 
+/// The malware pipeline used to be invisible to /metrics: a scanner or fetcher alive but no
+/// longer verdicting or retiring urls looked identical to a healthy one. Queue depth by stage and
+/// the age of the oldest waiting item are what make that visible.
+#[sqlx::test(migrations = false)]
+async fn metrics_report_malware_pipeline_depth_and_oldest_age(pool: PgPool) {
+    migrate(&pool).await;
+    seed_fetch_attempt(&pool, 1, "pending").await;
+    seed_fetch_attempt(&pool, 2, "pending").await;
+    seed_fetch_attempt(&pool, 3, "dead").await;
+    // Back-date one pending url so the oldest-age gauge has something to measure.
+    sqlx::query(
+        "UPDATE fetch_attempt SET first_seen = now() - interval '2 hours' \
+         WHERE url_hash = $1",
+    )
+    .bind("fetch-attempt-test-hash-1".as_bytes())
+    .execute(&pool)
+    .await
+    .unwrap();
+    // One VT upload still awaiting its verdict (-1/-1), stamped an hour ago, and one verdicted.
+    sqlx::query(
+        "INSERT INTO sample_analysis (sha256, detected, total, vt_link, analyzed_at) VALUES \
+         ($1, -1, -1, '', now() - interval '1 hour'), ($2, 3, 70, '', now())",
+    )
+    .bind("c".repeat(64))
+    .bind("d".repeat(64))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_app(test_state(pool));
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+
+    assert!(
+        body.contains("propolis_fetch_attempts{status=\"pending\"} 2\n"),
+        "pending fetch depth: {body}"
+    );
+    assert!(
+        body.contains("propolis_fetch_attempts{status=\"dead\"} 1\n"),
+        "dead fetch count: {body}"
+    );
+    let fetch_age = gauge_value(&body, "propolis_fetch_pending_oldest_age_seconds");
+    assert!(
+        (7100..=7300).contains(&fetch_age),
+        "oldest pending fetch should be ~2h old, got {fetch_age}s"
+    );
+    assert!(
+        body.contains("propolis_sample_analysis{state=\"pending\"} 1\n"),
+        "pending analysis: {body}"
+    );
+    assert!(
+        body.contains("propolis_sample_analysis{state=\"scanned\"} 1\n"),
+        "scanned analysis: {body}"
+    );
+    let vt_age = gauge_value(&body, "propolis_sample_analysis_pending_oldest_age_seconds");
+    assert!(
+        (3500..=3700).contains(&vt_age),
+        "oldest pending VT upload should be ~1h old, got {vt_age}s"
+    );
+}
+
+/// The integer value on the sample line `name value` of a gauge with no labels.
+fn gauge_value(body: &str, name: &str) -> i64 {
+    body.lines()
+        .find_map(|l| l.strip_prefix(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("gauge {name} missing: {body}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 #[sqlx::test(migrations = false)]
 async fn login_cookie_is_secure_when_behind_a_trusted_proxy(pool: PgPool) {
     migrate(&pool).await;

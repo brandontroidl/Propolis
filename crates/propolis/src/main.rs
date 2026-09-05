@@ -750,9 +750,17 @@ async fn main() {
                     let submit_handle =
                         tokio::spawn(run_submission_loop(runner, submit_interval, submit_token));
 
-                    token.cancelled().await;
-                    queue_handle.abort();
-                    submit_handle.abort();
+                    // A dead child restarts the whole review group under the supervisor's
+                    // policy; merely awaiting cancellation here left the parent Running over a
+                    // panicked loop, invisible to /ready and the ops-monitor.
+                    supervisor::watch_children(
+                        token,
+                        vec![
+                            ("review queue scan", queue_handle),
+                            ("review submission", submit_handle),
+                        ],
+                    )
+                    .await;
                 }
             },
         ));

@@ -155,6 +155,52 @@ where
     })
 }
 
+/// For a supervised task that fans out into child tasks: wait for `token` while watching the
+/// children, and abort them all on cancellation. If a child ends BEFORE cancellation - a panic, or
+/// a loop that returned on its own - the others are aborted and this panics with the child's name,
+/// so the enclosing `spawn_supervised` sees the group fail and restarts it under its backoff and
+/// give-up policy. Without this, a parent that only awaited cancellation stayed `Running` with a
+/// dead child underneath it, invisible to `/ready` and the ops-monitor alike.
+pub async fn watch_children(
+    token: CancellationToken,
+    children: Vec<(&'static str, JoinHandle<()>)>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(&'static str, bool)>(children.len().max(1));
+    let aborts: Vec<_> = children.iter().map(|(_, h)| h.abort_handle()).collect();
+    for (name, handle) in children {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let panicked = handle.await.is_err();
+            let _ = tx.send((name, panicked)).await;
+        });
+    }
+    drop(tx);
+
+    let ended = tokio::select! {
+        _ = token.cancelled() => None,
+        ended = rx.recv() => ended,
+    };
+    for abort in &aborts {
+        abort.abort();
+    }
+    // A child that ended because the cancellation just fired is the shutdown path, not a death;
+    // `select!` may have polled the child's end first.
+    if token.is_cancelled() {
+        return;
+    }
+    match ended {
+        Some((name, true)) => panic!("supervised child task {name} panicked; restarting the group"),
+        Some((name, false)) => {
+            panic!(
+                "supervised child task {name} ended on its own before shutdown; restarting the group"
+            )
+        }
+        None => {
+            panic!("every supervised child task vanished before shutdown; restarting the group")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +210,78 @@ mod tests {
 
     fn new_state() -> SupervisorHandle {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn watch_children_returns_quietly_on_cancellation_and_aborts_them() {
+        let token = CancellationToken::new();
+        let a = tokio::spawn(std::future::pending::<()>());
+        let b = tokio::spawn(std::future::pending::<()>());
+        let a_abort = a.abort_handle();
+        let watcher = tokio::spawn(watch_children(token.clone(), vec![("a", a), ("b", b)]));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("watcher should return on cancellation")
+            .expect("a cancellation exit must not panic");
+        assert!(
+            a_abort.is_finished(),
+            "children are aborted on cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_children_panics_when_a_child_panics_before_shutdown() {
+        let token = CancellationToken::new();
+        let a = tokio::spawn(std::future::pending::<()>());
+        let b = tokio::spawn(async { panic!("child died") });
+        let a_abort = a.abort_handle();
+        let result = tokio::spawn(watch_children(token, vec![("a", a), ("b", b)])).await;
+        assert!(
+            result.is_err_and(|e| e.is_panic()),
+            "a dead child must surface as the group panicking, so the supervisor restarts it"
+        );
+        assert!(
+            a_abort.is_finished(),
+            "the surviving sibling is aborted with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_children_panics_when_a_child_returns_early() {
+        let token = CancellationToken::new();
+        let a = tokio::spawn(std::future::pending::<()>());
+        let b = tokio::spawn(async {});
+        let result = tokio::spawn(watch_children(token, vec![("a", a), ("b", b)])).await;
+        assert!(result.is_err_and(|e| e.is_panic()));
+    }
+
+    /// End to end through the supervisor: a group whose child panics is restarted, and after
+    /// three rapid deaths it gives up - the same policy a directly supervised task gets.
+    #[tokio::test]
+    async fn a_group_with_a_dying_child_is_restarted_then_gives_up() {
+        let cancel = CancellationToken::new();
+        let state = new_state();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_clone = attempts.clone();
+        let handle = spawn_supervised("test-group", cancel.clone(), state.clone(), move |token| {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let child = tokio::spawn(async { panic!("worker died") });
+                watch_children(token, vec![("worker", child)]).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("supervisor should give up after 3 rapid deaths")
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            state.lock().unwrap().get("test-group"),
+            Some(&SubsysState::GaveUp)
+        );
     }
 
     #[tokio::test]

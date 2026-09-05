@@ -400,6 +400,27 @@ mod tests {
         )
     }
 
+    /// Waits until the event log holds `n` lines, failing after a generous deadline. The worker
+    /// hashes, stores and fsyncs each body before it appends the event, and a fixed sleep raced
+    /// that on a loaded CI runner (14 of 20 events had landed when the 300 ms sleep expired).
+    async fn wait_for_lines(path: &std::path::Path, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let count = tokio::fs::read_to_string(path)
+                .await
+                .map(|c| c.lines().count())
+                .unwrap_or(0);
+            if count >= n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {n} event line(s); the worker had written {count}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn test_event(sample: Option<SampleRef>) -> SensorEvent {
         SensorEvent {
             v: WIRE_VERSION,
@@ -438,7 +459,7 @@ mod tests {
             .unwrap();
 
         // Give worker time to process.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_lines(&log_path, 1).await;
         worker.abort();
 
         let content = tokio::fs::read_to_string(&log_path).await.unwrap();
@@ -532,7 +553,7 @@ mod tests {
                 event_builder: Box::new(|sample| test_event(Some(sample))),
             })
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_lines(&log_path, 1).await;
         worker.abort();
 
         let content = tokio::fs::read_to_string(&log_path).await.unwrap();
@@ -606,7 +627,7 @@ mod tests {
             })
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_lines(&log_path, 1).await;
         worker.abort();
 
         let content = tokio::fs::read_to_string(&log_path).await.unwrap();
@@ -654,7 +675,7 @@ mod tests {
             })
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_lines(&log_path, 1).await;
         worker.abort();
 
         // The spool refusal is now counted (previously it was only a log line with no metric),
@@ -767,7 +788,7 @@ mod tests {
             handle.await.unwrap();
         }
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_for_lines(&log_path, UNIQUE + DUP_SUBMITTERS).await;
         worker.abort();
 
         let content = tokio::fs::read_to_string(&log_path).await.unwrap();
@@ -844,7 +865,7 @@ mod tests {
                 event_builder: Box::new(|sample| test_event(Some(sample))),
             })
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_lines(&log_path, 1).await;
         worker.abort();
 
         // The event carries an occurrence_id.

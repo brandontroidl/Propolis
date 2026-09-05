@@ -9,35 +9,29 @@ last-verified: 2026-09-01
 
 # Outbound controls
 
-This page owns the egress narrative for the whole platform.
+This page lists every way Propolis sends anything off the host: the sensors (which
+send nothing), the daemon's five optional integrations, and the two connections a
+deployment can add outside the daemon.
 
-**The accurate framing.** The sensor crates are egress-free by construction; the
-platform's few enrichment and reporting egress paths are operator-gated and
-default off. The workspace is **not** egress-free as a whole - `Cargo.lock`
-contains `reqwest` (line 3203) and `hyper` (line 1796), used by the `review`
-crate and the malware fetcher. Do not describe the system as making no outbound
-requests. The real invariant has two parts: attacker-facing sensors carry no
-HTTP client in their own dependency closure, and every platform-level outbound
-path is opt-in and defaults off.
+Do not describe the system as making no outbound requests. The workspace as a whole
+is not egress-free: `reqwest` and `hyper` are in `Cargo.lock`, used by the `review`
+crate for vendor reporting and by the malware fetcher. The accurate statement has two
+parts: attacker-facing sensors carry no HTTP client in their dependency closure, and
+every daemon-level outbound path is opt-in and defaults off.
 
 ## Sensors carry no HTTP client
 
-An attacker-facing sensor has no HTTP client crate in its resolved dependency
-tree. `sensor-ssh` asserts this directly:
-`sensor_ssh_has_no_http_client_dependency`
-(`crates/sensor-ssh/tests/shell_test.rs:364`) fails if its `Cargo.toml` names
-any of `reqwest, hyper, ureq, curl, isahc, surf, attohttpc` (banned list lines
-372-380). The test is scoped to the sensor because `review` legitimately uses
-`reqwest` for vendor reporting (its own comment states this, lines 365-371).
+No sensor crate names an HTTP client crate in its manifest. Two tests hold that:
+`sensor_ssh_has_no_http_client_dependency` in `crates/sensor-ssh/tests/shell_test.rs`
+checks that crate's own manifest, and `no_sensor_crate_depends_on_an_http_client` in
+`crates/sensor-framework/tests/deploy_test.rs` walks every `crates/sensor-*/Cargo.toml`
+in the workspace against the same banned list (`reqwest, hyper, ureq, curl, isahc,
+surf, attohttpc`), so a sensor added later is covered without anyone remembering to
+copy the test. The `review` crate is not a sensor and is not walked. Each sensor's
+integration tests also assert that a fake shell's `wget` or `curl` opens no
+connection, and the never-execute guard is described in [never-execute.md](never-execute.md).
 
-This explicit per-crate dependency assertion currently exists only for
-`sensor-ssh`. Other sensors carry the never-execute guard (see
-[never-execute.md](never-execute.md)) but not an HTTP-client-dependency test.
-[inferred] Extending the assertion to the other sensor crates would make the
-"sensors are egress-free" claim machine-checked for all of them rather than one.
-See [residual-risks.md](residual-risks.md).
-
-## The five outbound paths
+## The five daemon integrations
 
 Every path below is opt-in and defaults **off**. Several also fail closed if
 their credential or topic is missing - an operator who enables a path without
@@ -130,6 +124,33 @@ service. No request leaves the host for it. See
 The console, sensors, intake, feed, and core-scoring make no outbound requests
 beyond the PostgreSQL connection - and, for the console only, the opt-in rDNS
 query above.
+
+## Two connections outside the daemon
+
+Neither of these is an integration with a third party, and neither runs inside the
+`propolis` daemon, but both send data off the host and both are yours to set up.
+
+### 6. Collector to gateway (split deployment only)
+
+In the collector/control-plane split, the `shipper` service on a collector opens an
+mTLS connection to your own `gateway` service on the control plane and streams the
+sensor event logs to it (`PROPOLIS_SHIPPER_GATEWAY_ADDR`, with the CA and client
+certificate paths beside it). It connects only to the address you configure, with
+the certificate you provisioned, and it does not exist in a single-node install.
+The variables are in the
+[environment reference](../reference/environment-variables.md); the provisioning and
+enrollment procedure is documented in `deploy/collector.env.example` and
+`deploy/control-plane.env.example`, and the wire contract in
+[evidence provenance and artifact custody](../architecture/evidence-provenance-and-artifact-custody.md).
+
+### 7. Feed publication (operator cron)
+
+`deploy/blocklist-sync.sh` copies the built feed into a git checkout and pushes it to
+the remote you configured, using the deploy key you name. Nothing in the daemon or
+the shipped units schedules it; it runs when your cron runs it. Publishing exposes
+the listed IP addresses and, through the repository, that you operate a honeypot.
+The push is monitored by the `feed-push-stale` condition once configured; see
+[routine procedures](../operations/routine-procedures.md).
 
 ## The forbidden-egress-target guard
 

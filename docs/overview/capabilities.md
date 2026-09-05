@@ -31,7 +31,8 @@ its own user.
 | `sensor-catchall` | any TCP or UDP port | Unsolicited probes, without ever replying |
 
 Sensors make no outbound connections: the attacker-facing crates have no HTTP client
-in their dependency tree, and a test in each crate fails the build if one appears.
+in their dependency tree, and a workspace test over every sensor manifest fails the
+build if one appears.
 They hold no database connection and no secrets, and they drop captured passwords at
 capture time. Per-protocol behavior, including what each sensor impersonates and the
 byte caps on what it keeps, is in [sensor behavior](../reference/sensor-behavior.md).

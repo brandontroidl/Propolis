@@ -102,8 +102,10 @@ per-sensor tests that ban `reqwest/hyper/ureq/curl/isahc/surf/attohttpc`. The
 workspace lockfile *does* contain `reqwest` and `hyper` - they belong to the platform
 tier (review, the fetcher, VirusTotal, ops-alert), never to a sensor.
 
-At the platform level there are exactly **five outbound paths, every one opt-in and
-defaulting OFF**, several fail-closed if their credential or topic is missing. The
+The daemon has **five outbound integrations, every one opt-in and defaulting OFF**,
+several fail-closed if their credential or topic is missing. A split deployment adds
+the collector's mTLS connection to your own gateway, and publishing the feed is a cron
+job you install; both are inventoried alongside the five. The
 canonical owner of their exact env flags and semantics is
 [security/outbound-controls.md](../security/outbound-controls.md);
 [reference/environment-variables.md](../reference/environment-variables.md) owns the

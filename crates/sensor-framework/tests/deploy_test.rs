@@ -751,3 +751,47 @@ fn unit_install_loop_members(script: &str) -> HashSet<String> {
         })
         .collect()
 }
+
+/// "The sensors make no outbound connections" rested on one crate's test: `sensor-ssh` asserts
+/// its own manifest names no HTTP client. Every other sensor was covered only by prose. This
+/// walks every `crates/sensor-*/Cargo.toml` in the workspace, so a sensor added later, or an
+/// HTTP client added to an existing one, fails the build rather than quietly breaking the claim
+/// the docs make about all of them. The `review` crate legitimately uses reqwest for vendor
+/// reporting; it is not a sensor and is not walked.
+#[test]
+fn no_sensor_crate_depends_on_an_http_client() {
+    const BANNED: [&str; 7] = [
+        "reqwest",
+        "hyper",
+        "ureq",
+        "curl",
+        "isahc",
+        "surf",
+        "attohttpc",
+    ];
+    let crates_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    let mut checked = Vec::new();
+    for entry in std::fs::read_dir(&crates_dir).expect("failed to read crates/") {
+        let entry = entry.expect("failed to read a crates/ entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("sensor-") {
+            continue;
+        }
+        let manifest = entry.path().join("Cargo.toml");
+        let content = std::fs::read_to_string(&manifest)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest.display()));
+        for line in content.lines() {
+            let key = line.split(['=', ' ', '.']).next().unwrap_or("").trim();
+            assert!(
+                !BANNED.contains(&key),
+                "{name}/Cargo.toml names the HTTP client crate `{key}`; sensors must not be \
+                 able to make outbound requests"
+            );
+        }
+        checked.push(name);
+    }
+    assert!(
+        checked.len() >= 9,
+        "expected every sensor crate to be walked, found only {checked:?}"
+    );
+}

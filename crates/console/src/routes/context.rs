@@ -6,27 +6,34 @@
 use chrono::Utc;
 use sqlx::PgPool;
 
+use crate::routes::degraded::Degraded;
+
 pub(crate) struct BaseContext {
     pub pending_count: i64,
     pub uptime: String,
     pub version: &'static str,
+    /// The pending-count failure, if any, so a page can fold it into its own banner.
+    pub degraded: Degraded,
 }
 
 /// Queries the current sitewide pending-review count and computes process uptime from
 /// `AppState::startup_time`. A failure on the count query falls back to 0 rather than
 /// propagating: this trio is supplementary nav/footer chrome shown on every page, not a page's own
 /// primary content (which already fails closed to a 503 via `AppError` on its own query errors), so
-/// a transient hiccup here should not take down an otherwise-fine page render.
+/// a transient hiccup here should not take down an otherwise-fine page render. The failure is
+/// recorded in `degraded` rather than swallowed, so the page can say the badge is a placeholder.
 pub(crate) async fn base_context(
     db: &PgPool,
     startup_time: chrono::DateTime<Utc>,
     version: &'static str,
 ) -> BaseContext {
-    let pending_count: i64 =
+    let mut degraded = Degraded::new();
+    let pending_count: i64 = degraded.soft(
+        "pending review count",
         sqlx::query_scalar("SELECT COUNT(*) FROM review_queue WHERE state = 'pending'")
             .fetch_one(db)
-            .await
-            .unwrap_or(0);
+            .await,
+    );
 
     let elapsed = Utc::now() - startup_time;
     let hours = elapsed.num_hours();
@@ -41,6 +48,7 @@ pub(crate) async fn base_context(
         pending_count,
         uptime,
         version,
+        degraded,
     }
 }
 

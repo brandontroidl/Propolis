@@ -6,7 +6,7 @@
 <div class="panel">
   <div class="panel-head">Event chain</div>
   <div class="panel-body">
-    <p>{{ event_count }} events in the ledger. Each event carries a SHA-256 hash chained to its predecessor.</p>
+    <p>{% if event_count is none %}<span class="dim">Event count unavailable (the ledger could not be read).</span>{% else %}{{ event_count }} events in the ledger.{% endif %} Each event carries a SHA-256 hash chained to its predecessor.</p>
     <form method="post" action="/integrity/verify" style="margin-top:1rem;">
       <button type="submit" class="btn">Verify chain</button>
     </form>

@@ -146,6 +146,13 @@ does not yet mention it (see
 
 ## Health, readiness, and metrics
 
+Supplementary panels (charts, the most-active table, sample links and verdicts, the
+integrity page's event count, the nav's pending badge) soft-fail: a query error renders a
+placeholder rather than a 503. Every such failure goes through `routes::degraded`, which
+logs the error and names the panel in an amber banner at the top of the page ("Some
+panels could not be loaded and show placeholders: ..."), so a zero or an empty table is
+never mistaken for a quiet node. A page's core content still fails closed to a 503.
+
 `/health`, `/ready`, and `/metrics` are public (Prometheus cannot log in), which is
 acceptable because the console binds loopback-only by default. `/health` is a
 liveness-only constant `200`; `/ready` pings `SELECT 1`, then asks the daemon's

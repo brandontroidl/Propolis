@@ -37,6 +37,7 @@ use sqlx::{PgPool, Row};
 use crate::AppState;
 use crate::auth::Session;
 use crate::routes::context::{BaseContext, base_context};
+use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
 use crate::routes::feed::read_manifest;
 use crate::routes::format::{
@@ -116,23 +117,30 @@ async fn dashboard(
     .await?;
 
     // Supplementary stats below: each soft-fails to its own placeholder rather than propagating,
-    // per the module doc comment.
-    let events_last_hour: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM event WHERE observed_at >= now() - interval '1 hour'",
-    )
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    // per the module doc comment - through `degraded`, so the page names it as a placeholder.
+    let mut degraded = Degraded::new();
+    // -1 is the template's own "unknown" sentinel (it renders "last 24 hours" instead of "+N in
+    // the last hour"); 0 would claim a quiet hour the query never measured.
+    let events_last_hour: i64 = degraded.soft_or(
+        "events in the last hour",
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event WHERE observed_at >= now() - interval '1 hour'",
+        )
+        .fetch_one(&state.db)
+        .await,
+        -1,
+    );
 
     // Honest pipeline-health signal: the age of the most recent event. This is a real, verifiable
     // fact (intake wrote something this recently), never a hardcoded "OK" that could disagree with
     // reality. Fresh (< 1h) reads green; stale reads amber ("check sensors"). No events yet -> not
     // fresh, so a brand-new node does not claim health it cannot show.
-    let last_event: Option<chrono::DateTime<chrono::Utc>> =
+    let last_event: Option<chrono::DateTime<chrono::Utc>> = degraded.soft(
+        "last event age",
         sqlx::query_scalar("SELECT max(observed_at) FROM event")
             .fetch_one(&state.db)
-            .await
-            .unwrap_or(None);
+            .await,
+    );
     let (last_event_ago, pipeline_fresh) = match last_event {
         Some(t) => (
             format_relative_time(t),
@@ -145,25 +153,28 @@ async fn dashboard(
     // IP's last event - otherwise a long-idle high score outranks an active attacker. Matches the
     // detail page and the Attackers table (`LIVE_EFFECTIVE_SCORE_SQL`).
     // Audited: interpolates only the constant `LIVE_EFFECTIVE_SCORE_SQL`, never user input.
-    let top_attacker: Option<(String, String)> =
+    let top_attacker: Option<(String, String)> = degraded.soft(
+        "top attacker",
         sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(format!(
             "SELECT host(source_ip), round(({frag})::numeric, 1)::text \
              FROM ip_score ORDER BY ({frag}) DESC LIMIT 1",
             frag = crate::routes::LIVE_EFFECTIVE_SCORE_SQL,
         )))
         .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+        .await,
+    );
     let top_attacker_ip = top_attacker.as_ref().map(|t| t.0.as_str()).unwrap_or("--");
     let top_attacker_score = top_attacker.as_ref().map(|t| t.1.as_str()).unwrap_or("");
 
-    let recent_event_rows = sqlx::query(
-        "SELECT observed_at, sensor, signal_type::text, host(source_ip) AS source_ip \
-         FROM event ORDER BY observed_at DESC LIMIT 20",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let recent_event_rows = degraded.soft(
+        "recent events",
+        sqlx::query(
+            "SELECT observed_at, sensor, signal_type::text, host(source_ip) AS source_ip \
+             FROM event ORDER BY observed_at DESC LIMIT 20",
+        )
+        .fetch_all(&state.db)
+        .await,
+    );
     let mut recent_events = Vec::with_capacity(recent_event_rows.len());
     for row in recent_event_rows {
         let observed_at: chrono::DateTime<chrono::Utc> = row.try_get("observed_at")?;
@@ -176,14 +187,16 @@ async fn dashboard(
         });
     }
 
-    let protocol_rows = sqlx::query(
-        "SELECT sensor, COUNT(*) AS cnt FROM event \
-         WHERE observed_at >= now() - interval '24 hours' \
-         GROUP BY sensor ORDER BY cnt DESC",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let protocol_rows = degraded.soft(
+        "protocol distribution",
+        sqlx::query(
+            "SELECT sensor, COUNT(*) AS cnt FROM event \
+             WHERE observed_at >= now() - interval '24 hours' \
+             GROUP BY sensor ORDER BY cnt DESC",
+        )
+        .fetch_all(&state.db)
+        .await,
+    );
     let mut protocol_dist = Vec::with_capacity(protocol_rows.len());
     for row in protocol_rows {
         let sensor: String = row.try_get("sensor")?;
@@ -201,7 +214,8 @@ async fn dashboard(
     // sparkline below always have real (possibly all-zero) data, never an empty array.
     // `dashboard_chart_fragment` (below) reuses the same helper for the adjustable-range HTMX
     // endpoint the "1h/24h/7d/30d" buttons hit.
-    let (timeline_labels, timeline_data) = hourly_series(&state.db).await;
+    let (timeline_labels, timeline_data) =
+        degraded.soft("events timeline", hourly_series(&state.db).await);
     // The status band's "Events / 24h" cell: the buckets and the event filter now share the same
     // `now() - 24h` lower bound, so their sum is the EXACT rolling-24h total (no in-window event
     // falls outside a bucket) at no extra query cost.
@@ -210,7 +224,7 @@ async fn dashboard(
 
     // The "most active" table with its 24-hour activity strips - the signature dashboard element.
     // Soft-fails to empty (shows the waiting-for-events copy) rather than 503 on a query error.
-    let most_active = most_active_rows(&state.db).await;
+    let most_active = degraded.soft("most active", most_active_rows(&state.db).await);
 
     // -1 signals "no data" (unconfigured, missing, or unparsable manifest) -> the template
     // displays "--"; `read_manifest` already collapses every one of those cases to `None`.
@@ -250,7 +264,10 @@ async fn dashboard(
         pending_count,
         uptime,
         version,
+        degraded: base_degraded,
     } = base_context(&state.db, state.startup_time, state.version).await;
+    degraded.absorb(base_degraded);
+    let degraded = degraded.names();
 
     // Shadowed into their JSON-string form right before the template needs them - see the module
     // doc comment for why a string (rendered with `|safe`) rather than a native minijinja list.
@@ -285,14 +302,16 @@ async fn dashboard(
         uptime,
         version,
         current_range,
+        degraded,
     })?;
     Ok(Html(html))
 }
 
 /// The top attacker IPs of the last 24 hours, each with a 24-cell hourly activity strip (worst
 /// signal per hour drives the cell colour, event volume its height) and its worst signals as
-/// severity tags. Soft-fails to an empty vec on any query error, per the module's chart policy.
-async fn most_active_rows(db: &PgPool) -> Vec<MostActiveRow> {
+/// severity tags. The caller soft-fails it to an empty vec (`Degraded::soft`), per the module's
+/// chart policy, and the page names the panel as a placeholder.
+async fn most_active_rows(db: &PgPool) -> Result<Vec<MostActiveRow>, sqlx::Error> {
     use std::collections::{BTreeSet, HashMap};
 
     // One pass: the busiest few source IPs in the window, joined back to their own events grouped by
@@ -314,8 +333,7 @@ async fn most_active_rows(db: &PgPool) -> Vec<MostActiveRow> {
          ORDER BY t.cnt DESC, hours_ago",
     )
     .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    .await?;
 
     struct Acc {
         cnt: i64,
@@ -414,7 +432,7 @@ async fn most_active_rows(db: &PgPool) -> Vec<MostActiveRow> {
         })
         .collect();
     result.sort_by_key(|(o, _)| *o);
-    result.into_iter().map(|(_, r)| r).collect()
+    Ok(result.into_iter().map(|(_, r)| r).collect())
 }
 
 /// `GET /dashboard/chart?range=<1h|24h|7d|30d>` - the range-selector HTMX endpoint for the
@@ -425,12 +443,17 @@ async fn dashboard_chart_fragment(
     Query(params): Query<ChartRangeQuery>,
 ) -> Result<Html<String>, AppError> {
     let current_range = normalize_dashboard_range(params.range.as_deref());
-    let (labels, data) = match current_range {
-        "1h" => five_minute_series(&state.db).await,
-        "7d" => daily_series(&state.db, 6).await,
-        "30d" => daily_series(&state.db, 29).await,
-        _ => hourly_series(&state.db).await,
-    };
+    // A fragment has no page banner to carry the name; the failure is still logged, and the
+    // full-page render names the panel.
+    let (labels, data) = Degraded::new().soft(
+        "events timeline",
+        match current_range {
+            "1h" => five_minute_series(&state.db).await,
+            "7d" => daily_series(&state.db, 6).await,
+            "30d" => daily_series(&state.db, 29).await,
+            _ => hourly_series(&state.db).await,
+        },
+    );
     let timeline_labels = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".into());
     let timeline_data = serde_json::to_string(&data).unwrap_or_else(|_| "[]".into());
 
@@ -474,7 +497,7 @@ fn normalize_dashboard_range(raw: Option<&str>) -> &'static str {
 /// hour-aligned `date_trunc('hour', now()) - 23h` series dropped a whole hour of in-window events at
 /// each hour boundary). Soft-fails to two empty vectors on a query error, per the module doc
 /// comment's chart policy.
-async fn hourly_series(db: &PgPool) -> (Vec<String>, Vec<i64>) {
+async fn hourly_series(db: &PgPool) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
     let rows = sqlx::query(
         "SELECT bucket, COALESCE(cnt, 0) AS cnt \
          FROM generate_series( \
@@ -491,8 +514,7 @@ async fn hourly_series(db: &PgPool) -> (Vec<String>, Vec<i64>) {
          ORDER BY bucket",
     )
     .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    .await?;
     let mut labels = Vec::with_capacity(rows.len());
     let mut data = Vec::with_capacity(rows.len());
     for row in rows {
@@ -505,12 +527,12 @@ async fn hourly_series(db: &PgPool) -> (Vec<String>, Vec<i64>) {
         labels.push(bucket.format("%H:00").to_string());
         data.push(cnt);
     }
-    (labels, data)
+    Ok((labels, data))
 }
 
 /// `days + 1` daily buckets (oldest to newest, zero-filled), site-wide - the "7d"/"30d"
 /// range-selector buttons.
-async fn daily_series(db: &PgPool, days: i32) -> (Vec<String>, Vec<i64>) {
+async fn daily_series(db: &PgPool, days: i32) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
     let rows = sqlx::query(
         "SELECT bucket::date AS bucket, COALESCE(cnt, 0) AS cnt \
          FROM generate_series(current_date - ($1::int * interval '1 day'), current_date, interval '1 day') AS bucket \
@@ -524,8 +546,7 @@ async fn daily_series(db: &PgPool, days: i32) -> (Vec<String>, Vec<i64>) {
     )
     .bind(days)
     .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    .await?;
     let mut labels = Vec::with_capacity(rows.len());
     let mut data = Vec::with_capacity(rows.len());
     for row in rows {
@@ -538,7 +559,7 @@ async fn daily_series(db: &PgPool, days: i32) -> (Vec<String>, Vec<i64>) {
         labels.push(bucket.format("%b %-d").to_string());
         data.push(cnt);
     }
-    (labels, data)
+    Ok((labels, data))
 }
 
 /// 12 five-minute buckets (oldest to newest, zero-filled), site-wide - the "1h" range-selector
@@ -549,7 +570,7 @@ async fn daily_series(db: &PgPool, days: i32) -> (Vec<String>, Vec<i64>) {
 /// rounded down to the nearest 5 minutes would drift by up to 4 minutes between the
 /// `generate_series` bound and each row's own bucket, silently misaligning some events into the
 /// wrong bucket.
-async fn five_minute_series(db: &PgPool) -> (Vec<String>, Vec<i64>) {
+async fn five_minute_series(db: &PgPool) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
     let rows = sqlx::query(
         "SELECT bucket, COALESCE(cnt, 0) AS cnt \
          FROM generate_series( \
@@ -566,8 +587,7 @@ async fn five_minute_series(db: &PgPool) -> (Vec<String>, Vec<i64>) {
          ORDER BY bucket",
     )
     .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    .await?;
     let mut labels = Vec::with_capacity(rows.len());
     let mut data = Vec::with_capacity(rows.len());
     for row in rows {
@@ -580,7 +600,7 @@ async fn five_minute_series(db: &PgPool) -> (Vec<String>, Vec<i64>) {
         labels.push(bucket.format("%H:%M").to_string());
         data.push(cnt);
     }
-    (labels, data)
+    Ok((labels, data))
 }
 
 #[cfg(test)]

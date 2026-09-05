@@ -71,6 +71,7 @@ use sqlx::{PgPool, Row};
 use crate::AppState;
 use crate::auth::Session;
 use crate::routes::context::{BaseContext, base_context};
+use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
 use crate::routes::format::{
     format_activity, format_relative_time, format_sensor_label, format_timestamp, tier_label,
@@ -371,7 +372,11 @@ async fn detail(
     // the dashboard's own always-populated hourly timeline. Supplementary: soft-fails to an empty
     // chart rather than the whole page, per the module doc comment. `chart_fragment` (below) reuses
     // the same helper for the adjustable-range HTMX endpoint the "24h/7d/30d" buttons hit.
-    let (ip_timeline_labels, ip_timeline_data) = detail_daily_series(&state.db, ip, 6).await;
+    let mut degraded = Degraded::new();
+    let (ip_timeline_labels, ip_timeline_data) = degraded.soft(
+        "activity timeline",
+        detail_daily_series(&state.db, ip, 6).await,
+    );
     let current_range = "7d";
 
     let csrf_token = state
@@ -382,7 +387,10 @@ async fn detail(
         pending_count,
         uptime,
         version,
+        degraded: base_degraded,
     } = base_context(&state.db, state.startup_time, state.version).await;
+    degraded.absorb(base_degraded);
+    let degraded = degraded.names();
 
     // Shadowed into their JSON-string form right before the template needs them - see
     // `routes::dashboard`'s doc comment for why a string (rendered with `|safe`) rather than a
@@ -401,6 +409,7 @@ async fn detail(
         pending_count,
         uptime,
         version,
+        degraded,
         ip => ip.to_string(),
         raw_score => format!("{:.1}", score.raw_score),
         raw_score_pct => raw_f64.clamp(0.0, 100.0).round() as u32,
@@ -495,7 +504,11 @@ async fn chart_fragment(
     Query(params): Query<ChartRangeQuery>,
 ) -> Result<Html<String>, AppError> {
     let current_range = normalize_detail_range(params.range.as_deref());
-    let (labels, data) = detail_chart_series(&state.db, ip, current_range).await;
+    // A fragment has no page banner; the failure is logged and the full page names the panel.
+    let (labels, data) = Degraded::new().soft(
+        "activity timeline",
+        detail_chart_series(&state.db, ip, current_range).await,
+    );
     let ip_timeline_labels = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".into());
     let ip_timeline_data = serde_json::to_string(&data).unwrap_or_else(|_| "[]".into());
 
@@ -544,7 +557,11 @@ fn normalize_detail_range(raw: Option<&str>) -> &'static str {
     }
 }
 
-async fn detail_chart_series(db: &PgPool, ip: IpAddr, range: &str) -> (Vec<String>, Vec<i64>) {
+async fn detail_chart_series(
+    db: &PgPool,
+    ip: IpAddr,
+    range: &str,
+) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
     match range {
         "24h" => detail_hourly_series(db, ip).await,
         "30d" => detail_daily_series(db, ip, 29).await,
@@ -555,7 +572,11 @@ async fn detail_chart_series(db: &PgPool, ip: IpAddr, range: &str) -> (Vec<Strin
 /// `days + 1` daily buckets (oldest to newest, zero-filled) for this IP's activity chart - shared
 /// by `detail`'s default 7-day render (`days: 6`) and `chart_fragment`'s "7d"/"30d" buttons.
 /// Soft-fails to two empty vectors on a query error, per the module doc comment's chart policy.
-async fn detail_daily_series(db: &PgPool, ip: IpAddr, days: i32) -> (Vec<String>, Vec<i64>) {
+async fn detail_daily_series(
+    db: &PgPool,
+    ip: IpAddr,
+    days: i32,
+) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
     let rows = sqlx::query(
         "SELECT bucket::date AS bucket, COALESCE(cnt, 0) AS cnt \
          FROM generate_series(current_date - ($2::int * interval '1 day'), current_date, interval '1 day') AS bucket \
@@ -570,8 +591,7 @@ async fn detail_daily_series(db: &PgPool, ip: IpAddr, days: i32) -> (Vec<String>
     .bind(ip.to_string())
     .bind(days)
     .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    .await?;
     let mut labels = Vec::with_capacity(rows.len());
     let mut data = Vec::with_capacity(rows.len());
     for row in rows {
@@ -584,13 +604,16 @@ async fn detail_daily_series(db: &PgPool, ip: IpAddr, days: i32) -> (Vec<String>
         labels.push(bucket.format("%b %-d").to_string());
         data.push(cnt);
     }
-    (labels, data)
+    Ok((labels, data))
 }
 
 /// 24 hourly buckets (oldest to newest, zero-filled) for this IP's activity chart -
 /// `chart_fragment`'s "24h" button, mirroring `routes::dashboard`'s own site-wide hourly timeline
 /// query but scoped to one IP.
-async fn detail_hourly_series(db: &PgPool, ip: IpAddr) -> (Vec<String>, Vec<i64>) {
+async fn detail_hourly_series(
+    db: &PgPool,
+    ip: IpAddr,
+) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
     let rows = sqlx::query(
         "SELECT bucket, COALESCE(cnt, 0) AS cnt \
          FROM generate_series( \
@@ -607,8 +630,7 @@ async fn detail_hourly_series(db: &PgPool, ip: IpAddr) -> (Vec<String>, Vec<i64>
     )
     .bind(ip.to_string())
     .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    .await?;
     let mut labels = Vec::with_capacity(rows.len());
     let mut data = Vec::with_capacity(rows.len());
     for row in rows {
@@ -621,7 +643,7 @@ async fn detail_hourly_series(db: &PgPool, ip: IpAddr) -> (Vec<String>, Vec<i64>
         labels.push(bucket.format("%H:00").to_string());
         data.push(cnt);
     }
-    (labels, data)
+    Ok((labels, data))
 }
 
 /// Fetches up to [`EVIDENCE_PAGE_SIZE`] `event` rows for `ip`, newest first, optionally starting

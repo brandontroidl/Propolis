@@ -96,6 +96,12 @@ document.addEventListener('htmx:afterSettle', function (e) { propolisInitCharts(
 </div>
 {% endblock %}
 <main>
+{# Soft-failed panels (routes::degraded): the page rendered, but these panels show placeholders
+   in place of data that could not be read. Named, so a zero or an empty table is never mistaken
+   for a quiet node. #}
+{% if degraded is defined and degraded %}
+<div class="degraded" role="status">Some panels could not be loaded and show placeholders: {{ degraded|join(", ") }}. The cause is in the server log.</div>
+{% endif %}
 {% block content %}{% endblock %}
 </main>
 <div class="status-line">propolis v{{ version }} - up {{ uptime }}</div>

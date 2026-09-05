@@ -153,30 +153,48 @@ async fn feed_page(
         pending_count,
         uptime,
         version,
+        mut degraded,
     } = base_context(&state.db, state.startup_time, state.version).await;
 
     // Only the entries tab reads the export files back; the status tab needs only the manifest.
+    // A feed file that is missing or unparsable while the manifest says a build exists is a
+    // placeholder, not an empty tier, and the page names it.
     let dir = state.feed_output_dir.as_deref();
     let (aggressive_entries, standard_entries, window_entries) = match query.tab {
         Tab::Entries => {
-            let windows: Vec<(String, Vec<FeedEntryRow>)> = manifest
+            let has_build = manifest.is_some();
+            let mut windows: Vec<(String, Vec<FeedEntryRow>)> = Vec::new();
+            for w in manifest
                 .as_ref()
                 .map(|m| m.windows.as_slice())
                 .unwrap_or_default()
-                .iter()
-                .filter_map(|w| {
-                    read_published_feed(dir, &format!("all-{}", w.label))
-                        .map(|rows| (w.label.clone(), rows))
-                })
-                .collect();
+            {
+                match read_published_feed(dir, &format!("all-{}", w.label)) {
+                    Some(rows) => windows.push((w.label.clone(), rows)),
+                    None if has_build => degraded.note("retention feed entries"),
+                    None => {}
+                }
+            }
+            let mut read = |name: &str, what: &'static str| -> Vec<FeedEntryRow> {
+                match read_published_feed(dir, name) {
+                    Some(rows) => rows,
+                    None => {
+                        if has_build {
+                            degraded.note(what);
+                        }
+                        Vec::new()
+                    }
+                }
+            };
             (
-                read_published_feed(dir, "aggressive").unwrap_or_default(),
-                read_published_feed(dir, "standard").unwrap_or_default(),
+                read("aggressive", "aggressive feed entries"),
+                read("standard", "standard feed entries"),
                 windows,
             )
         }
         Tab::Status => (Vec::new(), Vec::new(), Vec::new()),
     };
+    let degraded = degraded.names();
     let tab = query.tab.as_str();
 
     let tmpl = state.templates.get_template("feed.html")?;
@@ -187,6 +205,7 @@ async fn feed_page(
             pending_count,
             uptime,
             version,
+            degraded,
             feed_disabled,
             has_build => true,
             build_time => m.build_time,
@@ -207,6 +226,7 @@ async fn feed_page(
             pending_count,
             uptime,
             version,
+            degraded,
             feed_disabled,
             has_build => false,
             windows => Vec::<WindowManifest>::new(),

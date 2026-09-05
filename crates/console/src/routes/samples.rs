@@ -62,24 +62,23 @@ const FETCH_STATUS_DISPLAY: [(&str, &str, &str); 7] = [
 /// `GROUP BY status` on `fetch_attempt` - parameterless, so there is no injection surface. Missing
 /// statuses (no attempts recorded yet, or none of that particular outcome) default to a count of
 /// 0 rather than being absent from the strip, so the operator always sees the full status set.
-async fn fetch_status_counts(pool: &sqlx::PgPool) -> Vec<FetchStatusCount> {
+async fn fetch_status_counts(pool: &sqlx::PgPool) -> Result<Vec<FetchStatusCount>, sqlx::Error> {
     let counts: std::collections::HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
         "SELECT status, count(*) FROM fetch_attempt GROUP BY status",
     )
     .fetch_all(pool)
-    .await
-    .unwrap_or_default()
+    .await?
     .into_iter()
     .collect();
 
-    FETCH_STATUS_DISPLAY
+    Ok(FETCH_STATUS_DISPLAY
         .iter()
         .map(|(key, label, variant)| FetchStatusCount {
             label,
             count: *counts.get(*key).unwrap_or(&0),
             variant,
         })
-        .collect()
+        .collect())
 }
 
 /// How many source IPs to show inline per sample before collapsing to a "+N more" count.
@@ -109,7 +108,9 @@ fn max_source_ips_shown() -> usize {
 /// - It covers FETCHED samples only. A body uploaded directly to a sensor has no `fetch_attempt`
 ///   row, so it shows no source here until the capture/observation link lands.
 ///   Rows whose `source_ip` was never recorded (NULL) are simply absent.
-async fn sample_source_ips(pool: &sqlx::PgPool) -> std::collections::HashMap<String, Vec<String>> {
+async fn sample_source_ips(
+    pool: &sqlx::PgPool,
+) -> Result<std::collections::HashMap<String, Vec<String>>, sqlx::Error> {
     // Unions the two ways a sample is attributable: an address that UPLOADED it to a sensor (the
     // event carries the sha - a first-party observation, and the only link an FTP/SCP upload has,
     // since it never goes through the fetcher), and an address whose reported url the fetcher
@@ -132,10 +133,9 @@ async fn sample_source_ips(pool: &sqlx::PgPool) -> std::collections::HashMap<Str
          ORDER BY rank, at DESC",
     )
     .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    .await?;
 
-    group_source_ips(rows)
+    Ok(group_source_ips(rows))
 }
 
 /// Groups `(sha, ip)` pairs by sha, preserving input order (the query's newest-attempt-first) and
@@ -154,15 +154,21 @@ fn group_source_ips(rows: Vec<(String, String)>) -> std::collections::HashMap<St
 
 async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let base = base_context(&state.db, state.startup_time, state.version).await;
-    let source_ips_by_sha = sample_source_ips(&state.db).await;
+    // Each DB read soft-fails through `degraded` so the page names the placeholder: an empty
+    // source-IP map renders "not linked" and an empty verdict map "not yet scanned", both of
+    // which are also what a healthy node with nothing to show renders.
+    let mut degraded = base.degraded;
+    let source_ips_by_sha = degraded.soft("sample source IPs", sample_source_ips(&state.db).await);
 
-    let vt_results: std::collections::HashMap<String, (i32, i32, String)> =
-        sqlx::query_as::<_, (String, i32, i32, String)>(
-            "SELECT sha256, detected, total, vt_link FROM sample_analysis",
+    let vt_results: std::collections::HashMap<String, (i32, i32, String)> = degraded
+        .soft(
+            "VirusTotal verdicts",
+            sqlx::query_as::<_, (String, i32, i32, String)>(
+                "SELECT sha256, detected, total, vt_link FROM sample_analysis",
+            )
+            .fetch_all(&state.db)
+            .await,
         )
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default()
         .into_iter()
         .map(|(sha, d, t, l)| (sha, (d, t, l)))
         .collect();
@@ -202,7 +208,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
     samples.sort_by(|a, b| a.sha256.cmp(&b.sha256));
     let total = samples.len();
 
-    let status_counts = fetch_status_counts(&state.db).await;
+    let status_counts = degraded.soft("fetch status counts", fetch_status_counts(&state.db).await);
     let fetch_attempts_total: i64 = status_counts.iter().map(|c| c.count).sum();
 
     let tmpl = state.templates.get_template("samples.html")?;
@@ -211,6 +217,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         pending_count => base.pending_count,
         uptime => base.uptime,
         version => base.version,
+        degraded => degraded.names(),
         samples,
         total,
         status_counts,

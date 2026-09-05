@@ -3747,6 +3747,104 @@ fn strip_count(body: &str, label: &str) -> i64 {
         .unwrap_or_else(|_| panic!("non-numeric value after label {label:?}: {body}"))
 }
 
+/// The soft-fail policy used to render a failed query as data: "0 events in the ledger", an empty
+/// samples table, "not linked". With the database gone, the page must still render (the policy
+/// stands) but must NAME the panels that are placeholders and must not print a zero it never
+/// measured.
+#[sqlx::test(migrations = false)]
+async fn integrity_page_names_unavailable_panels_instead_of_rendering_zero(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool.clone());
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    pool.close().await;
+
+    let response = app
+        .oneshot(get_request(
+            "/integrity",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "soft-fail policy: the page still renders"
+    );
+    let body = body_text(response).await;
+    assert!(
+        body.contains("Some panels could not be loaded"),
+        "the degraded banner must render: {body}"
+    );
+    assert!(
+        body.contains("event count") && body.contains("pending review count"),
+        "the banner must name both failed panels: {body}"
+    );
+    assert!(
+        body.contains("Event count unavailable"),
+        "the count must render as unavailable, not as a number: {body}"
+    );
+    assert!(
+        !body.contains("0 events in the ledger"),
+        "a failed count must never render as an empty ledger: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn samples_page_names_unavailable_panels_when_the_db_is_down(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool.clone());
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    pool.close().await;
+
+    let response = app
+        .oneshot(get_request(
+            "/samples",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    for panel in [
+        "sample source IPs",
+        "VirusTotal verdicts",
+        "fetch status counts",
+        "pending review count",
+    ] {
+        assert!(
+            body.contains(panel),
+            "the banner must name the {panel} panel as a placeholder: {body}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn healthy_pages_render_no_degraded_banner(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/integrity",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("Some panels could not be loaded"),
+        "no banner when every panel loaded: {body}"
+    );
+    assert!(body.contains("0 events in the ledger"), "{body}");
+}
+
 #[sqlx::test(migrations = false)]
 async fn samples_page_shows_fetch_attempt_status_counts(pool: PgPool) {
     migrate(&pool).await;

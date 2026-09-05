@@ -9,6 +9,7 @@
 pub mod assets;
 pub(crate) mod context;
 pub mod dashboard;
+pub(crate) mod degraded;
 pub mod detail;
 pub mod error;
 pub mod feed;

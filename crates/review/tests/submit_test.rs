@@ -2,7 +2,7 @@
 //!
 //! Shares the persistent `propolis_test` database with the other crates'
 //! tests (see the project's `local-gate-toolchain` note). Every test uses a
-//! distinct source IP, `45.10.32.240-247`, disjoint from `queue_test.rs`'s
+//! distinct source IP, `45.10.32.240-248`, disjoint from `queue_test.rs`'s
 //! RFC5737 fixtures and from `gatekeeper_test.rs`'s `45.10.31.230-240`.
 //!
 //! These are ordinary public addresses, not the RFC5737 documentation ranges
@@ -524,6 +524,63 @@ async fn run_once_is_idempotent_across_a_failed_then_successful_retry() {
         "the row must reflect the LATEST attempt's outcome"
     );
     assert_eq!(row.response_status, Some(200));
+}
+
+/// The crash window: an earlier attempt today inserted its pending row, called the vendor, and
+/// died before `record_result` ran. Its row shows `success = false` with NO response recorded.
+/// The cooldown check filters on `success = TRUE`, so it cannot hold this; the runner must
+/// recognise the unrecorded outcome itself and not call the vendor again - the vendor may have
+/// accepted that report, and a second call would report the IP twice.
+#[tokio::test]
+async fn run_once_does_not_resubmit_when_an_earlier_attempt_left_no_recorded_outcome() {
+    let pool = setup_pool().await;
+    let ip = "45.10.32.248";
+    let ip_addr: IpAddr = ip.parse().unwrap();
+    let vendor = "mockvendor-crashwindow";
+    reset(&pool, ip).await;
+    seed_and_approve(&pool, ip).await;
+
+    // Today's row exactly as `insert_pending` leaves it before the vendor call.
+    let key = format!("{ip}:{vendor}:{}", Utc::now().date_naive());
+    sqlx::query(
+        "INSERT INTO vendor_submission \
+         (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, '{}', '', FALSE)",
+    )
+    .bind(ip)
+    .bind(vendor)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mock = MockVendor::new(vendor);
+    mock.script(
+        ip_addr,
+        vec![MockOutcome::Success {
+            status: 200,
+            body: "ok",
+        }],
+    );
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![Box::new(mock.clone())];
+    let runner = SubmissionRunner::new(pool.clone(), vendors, vec![permissive_config(vendor)]);
+    let result = runner.run_once().await.unwrap();
+
+    assert!(
+        mock.submissions_for(ip_addr).is_empty(),
+        "an attempt with an unrecorded outcome must not be re-sent to the vendor"
+    );
+    assert!(
+        result.unresolved >= 1,
+        "the skip must be counted as unresolved, not silently dropped: {result:?}"
+    );
+    assert_eq!(count_submissions(&pool, ip, vendor).await, 1);
+    let row = fetch_submission(&pool, ip, vendor).await;
+    assert!(
+        !row.success,
+        "nothing may rewrite the unknown outcome as a result"
+    );
+    assert_eq!(row.response_status, None);
 }
 
 #[tokio::test]

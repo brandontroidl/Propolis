@@ -178,7 +178,11 @@ clear the gatekeeper.
   CategoryFilter. A DB error during a check holds, never admits.
 - **Idempotency.** The submission runner inserts a `success=false` row keyed
   `"{ip}:{vendor}:{date}"` **before** the HTTP call, then updates it with the outcome - so a retry within the same UTC day never double-reports, and a new day permits
-  re-reporting.
+  re-reporting. The vendor call itself only follows a row this attempt inserted, or
+  a prior attempt whose failure was recorded: a same-day row with no recorded
+  response means an earlier attempt died between the call and the update, and it is
+  skipped (`SubmitResult::unresolved`) rather than re-sent, since the vendor may
+  already hold that report.
 - **What is not sent.** A report carries only `{source_ip, categories, comment,
   evidence_window}`. No WAN vantage, raw score, confidence, or sample body ever leaves
   in a report (`crates/review/src/vendor/mod.rs:29-35`). Captured passwords are

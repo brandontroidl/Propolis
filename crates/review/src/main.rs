@@ -361,11 +361,16 @@ async fn run_submission_loop(runner: SubmissionRunner, interval: Duration) {
     loop {
         match runner.run_once().await {
             Ok(result) => {
-                if result.submitted > 0 || result.held > 0 || result.failed > 0 {
+                if result.submitted > 0
+                    || result.held > 0
+                    || result.failed > 0
+                    || result.unresolved > 0
+                {
                     tracing::info!(
                         submitted = result.submitted,
                         held = result.held,
                         failed = result.failed,
+                        unresolved = result.unresolved,
                         "review: submission pass complete"
                     );
                 }

@@ -81,6 +81,16 @@
 //! legitimately retried, or an operator has deliberately zeroed out
 //! cooldown.
 //!
+//! The row makes the DATABASE idempotent; the vendor call is the side
+//! effect it exists to protect, so the call only follows a claim the INSERT
+//! actually won, or a retry of an attempt whose failure was recorded. A
+//! conflicting row with `response_status IS NULL` means an earlier attempt
+//! today inserted and then died before `record_result` - the vendor may
+//! have accepted that report - and a row already marked successful means it
+//! did. Neither is resubmitted (`SubmitResult::unresolved`): a repeat would
+//! report the IP twice while this table showed one row, and the cooldown
+//! check, which filters on `success = TRUE`, cannot see the first case.
+//!
 //! # Error handling
 //!
 //! `list_approved` failing aborts the whole pass (there is nothing to do
@@ -141,6 +151,12 @@ pub struct SubmitResult {
     /// permanent `VendorError`); a `vendor_submission` row records the
     /// failure.
     pub failed: usize,
+    /// The gate passed but today's `vendor_submission` row shows an earlier
+    /// attempt that already reached the vendor - its outcome never recorded
+    /// (a crash between the call and `record_result`), or successful - so no
+    /// HTTP call was made: a repeat could report the same IP twice while the
+    /// table shows one row. See "Idempotency" in the module doc comment.
+    pub unresolved: usize,
 }
 
 /// Polls `review_queue`'s Approved entries and submits each to every
@@ -255,12 +271,24 @@ impl SubmissionRunner {
                 };
 
                 let key = idempotency_key(ip, name, today);
-                if let Err(e) = insert_pending(&self.pool, ip, name, &key, &report).await {
-                    tracing::error!(
-                        %ip, vendor = %name, error = %e,
-                        "failed to record pending submission; skipping HTTP call"
-                    );
-                    continue;
+                match insert_pending(&self.pool, ip, name, &key, &report).await {
+                    Ok(PendingClaim::Claimed | PendingClaim::RetryOfRecordedFailure) => {}
+                    Ok(claim @ (PendingClaim::OutcomeUnknown | PendingClaim::AlreadySucceeded)) => {
+                        tracing::warn!(
+                            %ip, vendor = %name, ?claim,
+                            "not resubmitting: today's attempt already reached the vendor \
+                             (outcome unrecorded or successful); a repeat could double-report"
+                        );
+                        result.unresolved += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            %ip, vendor = %name, error = %e,
+                            "failed to record pending submission; skipping HTTP call"
+                        );
+                        continue;
+                    }
                 }
 
                 let (status, body, success) = match adapter.submit(&report).await {
@@ -395,30 +423,65 @@ fn build_report(
     })
 }
 
-/// Insert the pending attempt row before the HTTP call (`success = false`).
-/// `ON CONFLICT (idempotency_key) DO NOTHING` - see the module doc
-/// comment's "Idempotency".
+/// What `insert_pending` found under today's idempotency key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingClaim {
+    /// No row existed; this attempt owns the key and the vendor call goes ahead.
+    Claimed,
+    /// An earlier attempt today reached the vendor and recorded a failure; retrying is what the
+    /// design spec asks for.
+    RetryOfRecordedFailure,
+    /// An earlier attempt today inserted its row and then never recorded an outcome - the process
+    /// died between `adapter.submit` and `record_result`. The vendor may well have accepted that
+    /// report, so calling again risks a duplicate the table would never show. Not resubmitted.
+    OutcomeUnknown,
+    /// The row already records success. Normally the cooldown holds this long before here; with
+    /// cooldown zeroed by an operator it is reachable, and still must not double-report.
+    AlreadySucceeded,
+}
+
+/// Insert the pending attempt row before the HTTP call (`success = false`), and say whether this
+/// attempt actually claimed the key. `ON CONFLICT (idempotency_key) DO NOTHING` - see the module
+/// doc comment's "Idempotency". The vendor call is the side effect the row exists to make
+/// idempotent, so it must only follow a claim, or a retry of an attempt whose outcome is known.
 async fn insert_pending(
     pool: &PgPool,
     ip: IpAddr,
     vendor: &str,
     key: &str,
     report: &VendorReport,
-) -> Result<(), SubmitError> {
-    sqlx::query(
+) -> Result<PendingClaim, SubmitError> {
+    let inserted: Option<i64> = sqlx::query_scalar(
         "INSERT INTO vendor_submission \
          (source_ip, vendor, idempotency_key, categories, comment, success) \
          VALUES ($1::inet, $2, $3, $4, $5, FALSE) \
-         ON CONFLICT (idempotency_key) DO NOTHING",
+         ON CONFLICT (idempotency_key) DO NOTHING \
+         RETURNING id",
     )
     .bind(ip.to_string())
     .bind(vendor)
     .bind(key)
     .bind(&report.categories)
     .bind(&report.comment)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok(())
+    if inserted.is_some() {
+        return Ok(PendingClaim::Claimed);
+    }
+    let prior: Option<(bool, Option<i32>)> = sqlx::query_as(
+        "SELECT success, response_status FROM vendor_submission WHERE idempotency_key = $1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match prior {
+        // Conflicted but gone by the time we looked (an operator reset between the two
+        // statements): nothing recorded either way, so treat it as the unknown it is.
+        None => PendingClaim::OutcomeUnknown,
+        Some((true, _)) => PendingClaim::AlreadySucceeded,
+        Some((false, None)) => PendingClaim::OutcomeUnknown,
+        Some((false, Some(_))) => PendingClaim::RetryOfRecordedFailure,
+    })
 }
 
 /// Record the HTTP call's outcome against the row `key` identifies.

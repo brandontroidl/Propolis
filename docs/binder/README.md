@@ -9,6 +9,9 @@ last-verified: 2026-08-26
 
 # Binder
 
+The binder is a generated review artifact from the 2026-08-26 documentation pass; it
+is not updated with every commit, the pages it links are.
+
 The **[handoff binder](HANDOFF-BINDER.md)** is a single linear document that
 assembles the whole Propolis picture in reading order across 17 numbered sections
 - identity, status, architecture, security, deployment, configuration, operations,

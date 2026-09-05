@@ -4,38 +4,76 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-05
 -->
 
 # Propolis documentation
 
-The canonical documentation corpus. See [`../DOCUMENTATION.md`](../DOCUMENTATION.md) for
-the role-based entry map, or the [handoff binder](binder/HANDOFF-BINDER.md) for one linear
-read.
+Start with the [README](../README.md) if you have not read it. This page is the index
+for everything else.
 
-## Sections
+## I want to
 
-- **[overview/](overview/index.md)** - what Propolis is, who it is for, capabilities, non-goals, maturity, limitations, ethics.
-- **[getting-started/](getting-started/evaluation-deployment.md)** - prerequisites, evaluation bring-up, first capture, console tour, production-readiness, safe teardown.
-- **[architecture/](architecture/index.md)** - components, process topology, sensors, event/sample lifecycle, pipeline, console, storage, trust boundaries, concurrency, decisions.
-- **[operations/](operations/installation.md)** - deployment models, installation, configuration, secrets, networking/TLS, service lifecycle, observability, capacity, queue/spool, retention, backup, upgrade/DR, routine procedures.
-- **[security/](security/threat-model.md)** - threat model, attack surfaces, authn/authz, input handling, never-execute, outbound controls, malware custody, privacy, filesystem/DB protections, supply chain, hardening, residual risks, disclosure.
-- **[development/](development/repository-tour.md)** - repository tour, toolchain, build/test, conventions, adding a sensor, schema/migrations, docs & review, release.
-- **[reference/](reference/environment-variables.md)** - environment variables, ports, paths, database, events/signals, sensor behavior, console routes, scoring/feed, integrations, rate limits/budgets, commands, dependencies, glossary.
-- **[governance/](governance/maintenance-and-support.md)** - maintenance & support, compatibility & versioning, release policy, roadmap, contribution, licensing.
-- **[troubleshooting/](troubleshooting/index.md)** - symptom-based diagnosis.
-- **[history/](history/changelog.md)** - changelog, decisions index, completed/superseded work, audits, archive map.
+- **Try it on one machine** - [quickstart](manuals/quickstart.md), then
+  [your first capture](getting-started/first-capture.md) and the
+  [console tour](getting-started/console-tour.md).
+- **Deploy it for real** - [installation](operations/installation.md), then the
+  [production-readiness checklist](getting-started/production-readiness-checklist.md).
+  The [deployment manual](manuals/deployment.md) walks the whole path.
+- **Run a node day to day** - [routine procedures](operations/routine-procedures.md),
+  [health and observability](operations/health-and-observability.md),
+  [retention](operations/retention.md),
+  [backup and restore](operations/backup-and-restore.md),
+  [upgrade, rollback and DR](operations/upgrade-rollback-and-dr.md).
+- **Understand what it is safe to expose** - [threat model](security/threat-model.md),
+  [attack surfaces](security/attack-surfaces.md),
+  [outbound controls](security/outbound-controls.md),
+  [malware custody](security/malware-custody.md),
+  [residual risks](security/residual-risks.md).
+- **Respond to an incident on the box** - [incident response manual](manuals/incident-response.md).
+- **Fix something that is broken** - [troubleshooting](troubleshooting/index.md), by symptom.
+- **Change the code** - [repository tour](development/repository-tour.md),
+  [build and test](development/build-and-test.md),
+  [adding a sensor](development/adding-a-sensor.md),
+  [schema and migrations](development/schema-and-migrations.md).
+- **Look something up** - [environment variables](reference/environment-variables.md),
+  [ports](reference/ports-and-protocols.md),
+  [filesystem paths](reference/filesystem-paths.md),
+  [database](reference/database.md),
+  [events and signals](reference/events-and-signals.md),
+  [sensor behavior](reference/sensor-behavior.md),
+  [console routes](reference/console-routes.md),
+  [scoring and feed](reference/scoring-and-feed.md),
+  [integrations](reference/integrations.md),
+  [commands](reference/commands.md),
+  [glossary](reference/glossary.md).
 
-## Manuals
+## How it works
 
-Curated, role-specific paths through the corpus (they link, they do not duplicate):
+[Architecture](architecture/index.md): [components](architecture/components.md),
+[process topology](architecture/process-topology.md),
+[event and sample lifecycle](architecture/event-and-sample-lifecycle.md),
+[scoring and feed pipeline](architecture/pipeline.md),
+[console](architecture/console.md), [storage](architecture/storage.md),
+[trust boundaries and data flows](architecture/trust-boundaries-and-data-flows.md).
 
-- [Evaluator](manuals/evaluator.md) · [Quickstart](manuals/quickstart.md) · [Deployment](manuals/deployment.md) · [Operations](manuals/operations.md)
-- [Security](manuals/security.md) · [Incident response](manuals/incident-response.md)
-- [Contributor](manuals/contributor.md) · [Maintainer](manuals/maintainer.md) · [Researcher](manuals/researcher.md)
+## Project
 
-## Binder and controls
+[Overview](overview/index.md) with [capabilities](overview/capabilities.md),
+[non-goals](overview/non-goals.md), [maturity](overview/maturity-and-status.md),
+[limitations](overview/limitations.md) and [ethical use](overview/ethical-use.md).
+[Governance](governance/maintenance-and-support.md): versioning, releases, roadmap,
+contribution, [licensing](governance/licensing.md).
+[History](history/changelog.md): changelog, decisions, audits.
 
-- [Handoff binder](binder/HANDOFF-BINDER.md) ([about](binder/README.md)) - complete linear reading experience.
-- [Documentation policy](documentation-policy.md) · [Coverage matrix](coverage-matrix.md) · [Claim-to-source ledger](claim-to-source-ledger.md).
-- [Old-to-new map](history/old-to-new-map.md) · [Immutable archive](archive/2026-08-26/MANIFEST.md).
+## Audit material
+
+These are generated review artifacts, not reader documentation. They record a
+verification snapshot of the tree as of the date in their header and are not kept
+current with every commit.
+
+- [Claim-to-source ledger](claim-to-source-ledger.md): documentation claims mapped to
+  the code that supports them.
+- [Handoff binder](binder/HANDOFF-BINDER.md): the whole project in one linear document.
+- [Coverage matrix](coverage-matrix.md) and [documentation policy](documentation-policy.md).
+- [Pre-rewrite archive](archive/2026-08-26/MANIFEST.md), frozen.

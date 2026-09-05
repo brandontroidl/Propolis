@@ -35,8 +35,11 @@ features; see [Limitations](limitations.md) for residual risks within scope.
   has a small number of enrichment/reporting egress paths. Every one is operator-gated
   and defaults off. See [`../security/outbound-controls.md`](../security/outbound-controls.md).
 
-- **No automatic public action.** No IP is added to the feed and no vendor abuse
-  report is filed without explicit operator approval per case.
+- **No automatic reporting.** No vendor abuse report is filed and no IP enters the
+  score-based tier files without a per-case operator decision. The one automatic
+  listing is the volume rule: a source with a thousand or more completed TCP
+  connections and activity in the last day is added to the retention feeds without
+  review, and is never reported to a vendor on that basis.
 
 - **No bundled threat-intel data.** GeoLite2 databases are not shipped; enrichment
   degrades gracefully to "not configured" when absent. The feed is built from your

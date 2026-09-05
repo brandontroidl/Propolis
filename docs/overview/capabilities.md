@@ -4,100 +4,87 @@ audience: evaluator
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-05
 -->
 
 # Capabilities
 
-This page inventories what Propolis does. Exact values (ports, thresholds, env
-vars, routes) are owned by the [`../reference/`](../reference/ports-and-protocols.md)
-pages and linked, not restated here.
+What Propolis does, in enough detail to decide whether it fits. Exact ports,
+thresholds and variable names are in the [reference](../reference/ports-and-protocols.md)
+pages.
 
-## Sensors: 9 crates, 12 protocols
+## Sensors
 
-Nine sensor crates present twelve protocol listeners. Seven crates are one protocol
-each; the credential sensor (`sensor-cred`) serves five database/remote protocols
-from separate modules.
+Nine sensor programs cover twelve protocols. Each runs as its own systemd service under
+its own user.
 
-| Sensor crate | Protocol(s) | Captures (summary) |
+| Sensor | Protocol | What it records |
 |---|---|---|
-| `sensor-ssh` | SSH | Handshake, login attempts, shell commands, SCP/SFTP uploads |
-| `sensor-telnet` | Telnet | Login attempts, shell commands (incl. XOR-deobfuscated Mirai payloads) |
+| `sensor-ssh` | SSH | Handshake, login attempts, shell commands, SCP and SFTP uploads |
+| `sensor-telnet` | Telnet | Login attempts, shell commands, including XOR-obfuscated Mirai payloads |
 | `sensor-http` | HTTP | Request paths, headers, POST bodies |
 | `sensor-ftp` | FTP | Login attempts, STOR uploads |
-| `sensor-smtp` | SMTP | AUTH credentials, message envelope/body |
-| `sensor-redis` | Redis | AUTH, config/command probes |
-| `sensor-adb` | ADB | Shell commands, `sync:` push capture |
-| `sensor-cred` | VNC, MySQL, MSSQL, PostgreSQL, MongoDB | Authentication / username capture |
-| `sensor-catchall` | protocol-agnostic TCP/UDP | Unprompted traffic (`catchall_probe`) |
+| `sensor-smtp` | SMTP | AUTH credentials, message envelope and body |
+| `sensor-redis` | Redis | AUTH, config and command probes |
+| `sensor-adb` | ADB | Shell commands, pushed files |
+| `sensor-cred` | VNC, MySQL, MSSQL, PostgreSQL, MongoDB | Authentication attempts and usernames |
+| `sensor-catchall` | any TCP or UDP port | Unsolicited probes, without ever replying |
 
-Each sensor runs as a **separate OS process** under its own systemd unit. Sensors
-are **egress-free by construction** - each attacker-facing crate has no HTTP client
-in its dependency tree, enforced by per-sensor tests that ban outbound HTTP
-libraries. Sensors hold no database handle and no secrets, and drop captured
-passwords at capture time. Per-protocol capture behavior:
-[`../reference/sensor-behavior.md`](../reference/sensor-behavior.md). Sensors have no
-compiled-in default port; the standard port mapping (SSH 22, etc.) is what the
-deploy units configure - [`../reference/ports-and-protocols.md`](../reference/ports-and-protocols.md).
+Sensors make no outbound connections: the attacker-facing crates have no HTTP client
+in their dependency tree, and a test in each crate fails the build if one appears.
+They hold no database connection and no secrets, and they drop captured passwords at
+capture time. Per-protocol behavior, including what each sensor impersonates and the
+byte caps on what it keeps, is in [sensor behavior](../reference/sensor-behavior.md).
 
-## Scoring with a confirmed-real gate
+## Scoring
 
-Each attacker IP accumulates a time-decayed score from corroborated evidence,
-recorded in a hash-chained event ledger.
+Each event is appended to a hash-chained ledger in PostgreSQL and folded into a
+per-IP score that decays with a six-hour half-life. Two things shape it:
 
-- **Confirmed-real gate**: an IP earns a feed tier or a vendor report only after a
-  completed TCP handshake authenticated against a sensor proves the source is
-  genuine. Spoofable UDP or lone-SYN traffic never latches this.
-- **Cross-sensor breadth**: hitting multiple WAN addresses and multiple protocols
-  weighs more than a single port.
-- **Eligibility latch**: an IP becomes feed-eligible once confirmed-real with at
-  least two recorded events; the latch is sticky until explicit delisting.
+- An IP only becomes eligible for a tier or a vendor report after a completed TCP
+  handshake has authenticated against a sensor. UDP traffic and bare SYNs cannot do
+  that, so a spoofed source cannot be pushed into the feed by someone else's packets.
+- Activity across more than one of your addresses, and across more than one protocol,
+  weighs more than repeated hits on a single port.
 
-Exact weights, thresholds, half-life, and retention windows are owned by
-[`../reference/scoring-and-feed.md`](../reference/scoring-and-feed.md) and
-[`../reference/events-and-signals.md`](../reference/events-and-signals.md).
+Weights, thresholds and the half-life are in
+[scoring and feed](../reference/scoring-and-feed.md).
 
-## Operator review
+## Review and output
 
-A review queue state machine gatekeeps every outbound action. Nothing is listed or
-reported automatically: an operator approves, rejects, or snoozes each case, via the
-console or the `review` CLI. See [`../architecture/pipeline.md`](../architecture/pipeline.md).
+An IP that reaches a tier lands in the review queue. You approve, reject or snooze it
+in the console or with the `review` command. Approval is what lets it into the
+`aggressive` or `standard` feed files and, if a vendor is configured, what allows a
+report to be filed.
 
-## Two-tier blocklist feed
+The retention feeds (`all-24h`, `all-7d` and so on) are different: they hold every
+approved entry seen within the window, and also any source that completed a thousand
+or more TCP connections in the last day. That volume rule needs no approval; it exists
+so a flood is blocked promptly. Volume alone never triggers a vendor report.
 
-Approved IPs are published as a two-tier feed (`aggressive` and `standard`), each
-tier its own file with its own TTL, exported as text/JSON/CSV/CIDR with an atomic
-publish and a checksummed manifest. Feed membership is decided by retention windows,
-not the live decaying score. Trusted-org ASN suppression is available (opt-in, empty
-by default). Feed publishing to a remote repository is an operator setup step, **not**
-a shipped timer or cron. See [`../reference/scoring-and-feed.md`](../reference/scoring-and-feed.md).
+The feed builder writes text, JSON, CSV, CIDR, ipset, nftables, pf, alias, hosts and
+RPZ formats to a local directory with a checksummed manifest, atomically, every fifteen
+minutes by default. Getting those files to a firewall or a public repository is your
+step; a sync script is provided but not scheduled for you.
 
-## Operator console
+## Console
 
-A server-rendered web dashboard (axum + minijinja + HTMX + Chart.js) on a loopback
-`TcpListener`, plain HTTP (no built-in TLS). It exposes 30 routes (7 public,
-23 session-gated). Features: a six-card stat strip, timelines and distribution
-charts, the review queue, per-IP detail with an evidence drawer, feed status, a
-theme system (graphite/cream/system/hacker), `/metrics`, and a live `/logs` viewer.
-Auth is Argon2id passwords with HMAC session cookies, CSRF protection, and login
-rate-limiting. The console sets no global CSP (only `/samples/download` sets one).
-Routes are owned by [`../reference/console-routes.md`](../reference/console-routes.md);
-console architecture in [`../architecture/console.md`](../architecture/console.md).
+A server-rendered web console on loopback, plain HTTP: dashboard, review queue,
+per-IP evidence with session grouping, samples, feed status, integrity check, live
+logs, and Prometheus metrics. Login is password-based with Argon2id, signed session
+cookies, CSRF protection and rate limiting. There is no built-in TLS.
 
-## Opt-in enrichment and reporting
+## Optional integrations
 
-All of the following are **operator-gated and default OFF**:
+All off until configured:
 
-- **VirusTotal** scanning of captured samples.
-- **Vendor abuse submitters** (AbuseIPDB, DShield, OTX).
-- **Forward-confirmed reverse DNS** on the IP-detail page (`PROPOLIS_CONSOLE_RDNS_ENABLED`);
-  display-only, never a suppression signal.
-- **Operational self-alerting** over ntfy (`PROPOLIS_OPS_ENABLED`).
-- **Offline MaxMind GeoLite2** geo/ASN enrichment (`PROPOLIS_GEOIP_DIR`) - **local
-  file reads, not network**; degrades to "not configured" when the databases are absent.
+- VirusTotal hash lookups for captured samples; uploading unknown bodies is a further
+  opt-in.
+- Abuse reports to AbuseIPDB, DShield and OTX.
+- Forward-confirmed reverse DNS on the IP page, display only.
+- Push alerts over ntfy when the node degrades.
+- Offline GeoLite2 geo and ASN lookup from local files, used for display and for
+  suppressing trusted-organisation ASNs from the feed.
 
-The four network-egress paths above and the reverse-DNS lookup are the platform's
-only outbound paths beyond PostgreSQL, each subject to a forbidden-egress guard that
-rejects own-host/reserved targets. Full treatment:
-[`../security/outbound-controls.md`](../security/outbound-controls.md) and
-[`../reference/integrations.md`](../reference/integrations.md).
+Which of these send anything off the box, and what they send, is set out in
+[outbound controls](../security/outbound-controls.md).

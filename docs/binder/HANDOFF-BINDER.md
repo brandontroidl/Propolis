@@ -9,6 +9,11 @@ last-verified: 2026-08-26
 
 # Propolis handoff binder
 
+> **Generated review artifact.** This binder was assembled during the 2026-08-26
+> documentation review and reflects the tree as of that date. It is not updated with
+> every commit; the pages it links are. Use it for a one-sitting orientation or an
+> audit, not as the current statement of any specific behavior.
+
 A single linear document that assembles the whole Propolis picture in reading
 order: what it is, how it is built, how it is secured, deployed, operated, and
 maintained, and where it came from. It is meant to be read top to bottom as an

@@ -139,8 +139,9 @@ govern research use:
   intelligence comes from attackers choosing to engage your decoys.
 - **Not for offensive use.** Repurposing captured data or credentials to act
   against third parties is outside both the intent and the license.
-- **Outbound actions are operator-gated.** No IP is listed and no vendor abuse
-  report is filed without explicit per-case operator approval; enabling any
+- **Outbound actions are operator-gated.** No vendor abuse report is filed and no
+  IP enters the score-based tier files without a per-case operator decision; the
+  retention feeds also list high-volume TCP sources automatically. Enabling any
   enrichment/reporting egress (VirusTotal, AbuseIPDB/DShield/OTX, ntfy, reverse
   DNS) is an operator decision with associated exposure. See
   [`security/outbound-controls`](../security/outbound-controls.md). When you file a

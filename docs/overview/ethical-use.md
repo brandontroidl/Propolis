@@ -44,8 +44,11 @@ its intent and its license.
 
 ## Outbound actions are operator-gated
 
-No IP is listed on the feed and no vendor abuse report is filed without explicit
-per-case operator approval. Enabling any enrichment or reporting egress path
+No vendor abuse report is filed and no IP enters the score-based tier files without
+a per-case operator decision. The retention feeds additionally list sources that
+completed a thousand or more TCP connections in the last day, without review; such a
+source is never reported to a vendor on volume alone. Enabling any enrichment or
+reporting egress path
 (VirusTotal, AbuseIPDB/DShield/OTX, ntfy alerts, reverse DNS) is an operator
 decision with associated exposure - see
 [`../security/outbound-controls.md`](../security/outbound-controls.md). When you file

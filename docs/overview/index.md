@@ -4,68 +4,48 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-05
 -->
 
-# Propolis
+# Overview
 
-Propolis is a self-hosted, single-node honeypot and threat-intelligence platform.
-It runs native protocol sensors that impersonate common services, records what
-attackers do against your own WAN addresses, scores each source by corroborated
-evidence, and - only after you approve each case - publishes a firewall blocklist
-and files vendor abuse reports.
+Propolis runs decoy services on addresses you own, records what attackers do to
+them, scores each source address from that evidence, and turns the result into a
+firewall blocklist and, if you choose, abuse reports to third-party vendors. It is a
+single node: one PostgreSQL database, one daemon, and one hardened process per sensor.
 
-It is defensive tooling for infrastructure you own or are authorized to monitor.
-See [Ethical use](ethical-use.md) for the boundaries this depends on.
+Use it on infrastructure you own or are authorized to monitor. [Ethical use](ethical-use.md)
+sets out the boundaries this depends on.
 
-## What it is
+## What comes out of it
 
-- A **honeypot layer**: nine sensor crates presenting twelve protocol listeners
-  (SSH, Telnet, HTTP, FTP, SMTP, Redis, ADB, plus VNC/MySQL/MSSQL/PostgreSQL/MongoDB
-  from the credential sensor), each a separate OS process. See
-  [Capabilities](capabilities.md).
-- A **scoring and review pipeline**: a hash-chained event ledger, a time-decayed
-  per-IP score with a confirmed-real gate, an operator review queue, and a two-tier
-  blocklist feed.
-- An **operator console**: a loopback web dashboard for triage, review, and feed status.
-- A **single Rust workspace** deployed as one unified daemon plus the sensor
-  processes. See [`../architecture/index.md`](../architecture/index.md).
+- **Evidence.** Login attempts, shell commands, uploaded files and downloaded droppers,
+  stored in an append-only ledger and viewable per source IP in the console.
+- **A blocklist.** Two score-based tiers, `aggressive` and `standard`, plus retention
+  feeds that list everything seen within a window. You sync the files to your own
+  firewall; nothing is pushed anywhere unless you set that up.
+- **Vendor reports.** Optional submissions to AbuseIPDB, DShield and OTX, off until
+  configured.
 
-## What it does
+## What needs your approval, and what does not
 
-- Captures attacker traffic (credentials, commands, uploaded samples) on services
-  you deliberately expose as decoys.
-- Corroborates activity across multiple WAN addresses and multiple sensor protocols
-  to distinguish genuine attackers from spoofed or incidental traffic.
-- Gates every outbound action (feed listing, vendor report) behind operator approval.
-- Publishes a blocklist you sync to your own firewall.
+Score-based tier entries and every vendor report wait in the review queue for you to
+approve, reject or snooze them. One path is automatic: a source that has completed a
+thousand or more TCP connections and was seen in the last day is added to the
+retention feeds without review, so a flood is blocked even when it never tried a login.
+Such a source is never reported to a vendor on volume alone. The exact rule is in the
+[scoring and feed reference](../reference/scoring-and-feed.md).
 
-## What it does NOT do
+## What it is not
 
-- It is **not a network IDS or IPS** - it observes traffic delivered to its own
-  decoy listeners, not arbitrary traffic on the wire, and it does not block inline.
-- It is **not multi-tenant SaaS or a managed service** - it is a single node you
-  operate yourself.
-- It is **not an offensive or exploitation tool**.
-- It ships **no built-in TLS** - the console is plain HTTP on loopback; any
-  transport encryption is operator-provided. See [Limitations](limitations.md).
-- It is **not "egress-free" as a whole** - sensors are egress-free by construction,
-  but the platform has a few enrichment/reporting egress paths, all operator-gated
-  and defaulting off. See [`../security/outbound-controls.md`](../security/outbound-controls.md).
+- Not an IDS or IPS. It sees only traffic sent to its own listeners and blocks nothing
+  inline.
+- Not multi-tenant and not a hosted service.
+- Not an offensive tool. Captured payloads are stored and may be looked up, never run.
+- Not TLS-terminating. The console is plain HTTP on loopback; put a proxy in front.
 
-## Use cases
+## Where next
 
-- Running attacker-facing decoys on your own WAN IPs to collect first-party threat
-  intelligence.
-- Producing a firewall blocklist grounded in evidence you captured, not a
-  third-party feed.
-- Capturing malware samples dropped by attackers for later analysis under your own
-  custody. See [`../security/malware-custody.md`](../security/malware-custody.md).
-
-## Where to go next
-
-- Pick your path in [Audiences](audiences.md).
-- Detailed feature inventory: [Capabilities](capabilities.md).
-- What it deliberately excludes: [Non-goals](non-goals.md).
-- Current maturity and release state: [Maturity and status](maturity-and-status.md).
-- Known limitations and residual risks: [Limitations](limitations.md).
+[Capabilities](capabilities.md) lists the sensors and features. [Non-goals](non-goals.md),
+[maturity](maturity-and-status.md) and [limitations](limitations.md) say what to expect
+before exposing it. The [documentation index](../README.md) covers everything else.

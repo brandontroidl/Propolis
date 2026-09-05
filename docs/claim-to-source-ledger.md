@@ -9,6 +9,11 @@ last-verified: 2026-08-26
 
 # Claim-to-source ledger
 
+> **Generated audit artifact.** This ledger was produced during the 2026-08-26
+> documentation review against HEAD `2ed77827` and is not maintained with every commit.
+> Line numbers and commit IDs in it are that snapshot's; resolve by symbol or test name
+> against the current tree. It is review evidence, not reader documentation.
+
 The audit trail behind the documentation. Every material claim the corpus makes -
 above all the security and anti-abuse ones, and the six framing corrections that
 distinguish what Propolis actually does from what an earlier README implied - is

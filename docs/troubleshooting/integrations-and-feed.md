@@ -143,7 +143,8 @@ itself is an operator action referenced only by comment - nothing in `deploy/`
 wires it up. With the ops monitor enabled, the `feed-push-stale` condition pages
 when the local feed has moved on from the script's last successful push by more
 than `PROPOLIS_OPS_FEED_STALE_MULTIPLE` build cycles. A box that has never pushed
-is paged only with `PROPOLIS_OPS_FEED_PUSH_EXPECTED=true`; set it once the cron is
+is paged only with `PROPOLIS_OPS_FEED_PUSH_EXPECTED=true`, and then only once the
+stale threshold has elapsed since the daemon started; set it once the cron is
 installed, so a push that has never succeeded is reported rather than read as
 "syncing is optional". If the public repo is stale:
 

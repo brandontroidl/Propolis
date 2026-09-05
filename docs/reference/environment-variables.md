@@ -244,7 +244,7 @@ u32.
 | `PROPOLIS_OPS_STALL_FOR_SECS` | no | `600` (`:143`) | min 1 | |
 | `PROPOLIS_OPS_CAPACITY_FREE_PCT` | no | `15` (`:144`) | 1..=100 | 0/>100 → abort |
 | `PROPOLIS_OPS_FEED_STALE_MULTIPLE` | no | `2` (`:145`) | min 1 | u32 |
-| `PROPOLIS_OPS_FEED_PUSH_EXPECTED` | no | `false` | bool | set once `deploy/blocklist-sync.sh` is in cron: `feed-push-stale` then pages when the feed has never been pushed, instead of treating "no push marker" as grace |
+| `PROPOLIS_OPS_FEED_PUSH_EXPECTED` | no | `false` | bool | set once `deploy/blocklist-sync.sh` is in cron: `feed-push-stale` then pages when the feed has gone unpushed for the stale threshold (`FEED_STALE_MULTIPLE` build cycles) since the daemon started, instead of treating "no push marker" as grace forever |
 | `PROPOLIS_OPS_VENDOR_WINDOW_SECS` | no | `3600` (`:146`) | min 1 | |
 | `PROPOLIS_OPS_VENDOR_FAIL_PCT` | no | `50` (`:147`) | 1..=100 | |
 | `PROPOLIS_OPS_VENDOR_MIN_SAMPLES` | no | `20` (`:148`) | min 1 | u32 |

@@ -208,7 +208,7 @@ pub fn default_conditions() -> Vec<Box<dyn Condition>> {
         Box::new(chain::ChainVerify::new()),
         Box::new(intake::IntakeStalled),
         Box::new(feed::FeedStale),
-        Box::new(feed::FeedPushStale),
+        Box::new(feed::FeedPushStale::new()),
         Box::new(vendor::VendorFailures),
         Box::new(malware::ScanStale),
         Box::new(malware::FetchStale),

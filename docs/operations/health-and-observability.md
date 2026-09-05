@@ -112,8 +112,9 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
   (`feed-stale`) and for the public repo falling that far behind the local feed
   (`feed-push-stale`, read from the marker `deploy/blocklist-sync.sh` touches after
   each successful push; a box that has never pushed is paged only when
-  `FEED_PUSH_EXPECTED` is set, since without it the monitor cannot tell a broken cron
-  from no cron);
+  `FEED_PUSH_EXPECTED` is set, and then only after the same threshold has elapsed
+  since the daemon started, since without the flag the monitor cannot tell a broken
+  cron from no cron and a fresh deployment must not page before its first cron run);
 - vendor submission failure rate over `VENDOR_FAIL_PCT` (50%) within `VENDOR_WINDOW_SECS`
   (3600 s), gated by `VENDOR_MIN_SAMPLES` (20);
 - review backlog over `BACKLOG_MAX` (500) held for `BACKLOG_FOR_SECS` (900 s);

@@ -463,7 +463,7 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
             .lock()
             .map(|map| {
                 map.iter()
-                    .filter(|(_, s)| **s == ops_alert::condition::SubsysState::GaveUp)
+                    .filter(|(_, s)| s.is_down())
                     .map(|(name, _)| *name)
                     .collect()
             })

@@ -17,8 +17,24 @@ use super::dispatch::Severity;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubsysState {
     Running,
-    BackingOff { consecutive: u32 },
+    BackingOff {
+        consecutive: u32,
+    },
+    /// Restarts exhausted after repeated rapid panics; the supervisor stopped trying.
     GaveUp,
+    /// The task returned on its own while the daemon was NOT shutting down. Every subsystem is a
+    /// loop that runs until cancelled, so a voluntary return is a startup refusal (the fetcher
+    /// with no own-IP set, say) or a loop that ended - dead either way, and the supervisor does
+    /// not restart a clean return. Read as "down" by `/ready` and the subsystem conditions,
+    /// where it used to stay `Running` forever.
+    Exited,
+}
+
+impl SubsysState {
+    /// Whether the subsystem is no longer running and will not be restarted.
+    pub fn is_down(self) -> bool {
+        matches!(self, SubsysState::GaveUp | SubsysState::Exited)
+    }
 }
 
 /// Shared map from subsystem name to its current supervised state. The supervisor writes it; the
@@ -38,6 +54,7 @@ pub const DAEMON_SUBSYSTEMS: &[&str] = &[
     "fetcher",
     "console",
     "ops-monitor",
+    "sample-retention",
 ];
 
 /// True when `name` is a per-sensor intake tailer rather than a daemon subsystem.

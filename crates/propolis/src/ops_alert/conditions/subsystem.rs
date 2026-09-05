@@ -13,14 +13,12 @@ use crate::ops_alert::config::OpsAlertConfig;
 use crate::ops_alert::dispatch::Severity;
 use std::time::Duration;
 
-/// Collect the names in `map` that gave up, restricted to those matching `want_sensor`, sorted for
-/// a stable detail string.
+/// Collect the names in `map` that are down (gave up restarting, or exited on their own without
+/// a shutdown), restricted to those matching `want_sensor`, sorted for a stable detail string.
 fn gave_up_names(map: &HashMap<&'static str, SubsysState>, want_sensor: bool) -> Vec<&'static str> {
     let mut names: Vec<&'static str> = map
         .iter()
-        .filter(|(name, state)| {
-            is_sensor(name) == want_sensor && matches!(state, SubsysState::GaveUp)
-        })
+        .filter(|(name, state)| is_sensor(name) == want_sensor && state.is_down())
         .map(|(name, _)| *name)
         .collect();
     names.sort_unstable();
@@ -140,6 +138,21 @@ mod tests {
     }
 
     #[test]
+    fn a_subsystem_that_exited_on_its_own_is_down_too() {
+        // A clean return without a shutdown (a startup refusal) is never restarted; it used to sit
+        // as Running forever and page nothing.
+        let m = map(&[
+            ("fetcher", SubsysState::Exited),
+            ("sample-retention", SubsysState::Running),
+        ]);
+        match eval_subsystem_gaveup(&m) {
+            Outcome::Firing { detail, .. } => assert!(detail.contains("fetcher"), "{detail}"),
+            other => panic!("expected Firing, got {other:?}"),
+        }
+        assert_eq!(eval_sensor_down(&m), Outcome::Ok);
+    }
+
+    #[test]
     fn one_sensor_down_is_a_warning() {
         let m = map(&[
             ("ssh", SubsysState::GaveUp),
@@ -215,7 +228,8 @@ mod tests {
                 "virustotal",
                 "fetcher",
                 "console",
-                "ops-monitor"
+                "ops-monitor",
+                "sample-retention"
             ],
         );
         // The real deployed sensor names (INSTALL.md) must all classify as sensors.

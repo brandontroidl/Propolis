@@ -60,9 +60,21 @@ where
             publish(&state, name, SubsysState::Running);
 
             match handle.await {
-                // Clean return - the task chose to exit (e.g. cancellation token fired).
+                // Clean return. On shutdown that is the cancellation token firing; otherwise the
+                // task ended on its own (a startup refusal, a loop that returned) and, since a
+                // clean return is never restarted, the subsystem is down from here on. Publish
+                // that: left as `Running`, /ready and the ops-monitor kept calling it healthy.
                 Ok(()) => {
-                    tracing::info!(subsystem = name, "supervisor: subsystem exited cleanly");
+                    if cancel.is_cancelled() {
+                        tracing::info!(subsystem = name, "supervisor: subsystem exited cleanly");
+                    } else {
+                        tracing::error!(
+                            subsystem = name,
+                            "supervisor: subsystem exited on its own without a shutdown; it is \
+                             down and will not be restarted"
+                        );
+                        publish(&state, name, SubsysState::Exited);
+                    }
                     return;
                 }
                 // Panic - the JoinError is a panic.
@@ -253,6 +265,50 @@ mod tests {
         assert_eq!(
             state.lock().unwrap().get("test-rapid-panic"),
             Some(&SubsysState::GaveUp)
+        );
+    }
+
+    /// A task that returns on its own, with no shutdown in progress, is dead: the supervisor never
+    /// restarts a clean return. It used to stay `Running` in the shared map forever, so a startup
+    /// refusal (the fetcher with no own-IP set) left /ready green and the ops-monitor quiet.
+    #[tokio::test]
+    async fn a_voluntary_exit_without_shutdown_is_published_as_exited() {
+        let cancel = CancellationToken::new();
+        let state = new_state();
+        let handle = spawn_supervised("test-exit", cancel.clone(), state.clone(), |_token| async {
+        });
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("supervisor should finish")
+            .unwrap();
+        assert_eq!(
+            state.lock().unwrap().get("test-exit"),
+            Some(&SubsysState::Exited)
+        );
+        assert!(SubsysState::Exited.is_down());
+    }
+
+    /// The same clean return during shutdown is the normal path and must not read as a failure.
+    #[tokio::test]
+    async fn a_clean_exit_during_shutdown_is_not_marked_exited() {
+        let cancel = CancellationToken::new();
+        let state = new_state();
+        let handle = spawn_supervised(
+            "test-shutdown",
+            cancel.clone(),
+            state.clone(),
+            |token| async move { token.cancelled().await },
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("supervisor should finish")
+            .unwrap();
+        assert_eq!(
+            state.lock().unwrap().get("test-shutdown"),
+            Some(&SubsysState::Running),
+            "a shutdown exit keeps the last live state; it is not a subsystem failure"
         );
     }
 }

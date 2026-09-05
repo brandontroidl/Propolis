@@ -50,7 +50,7 @@ async fn logs_page(
         pending_count,
         uptime,
         version,
-        degraded: _,
+        degraded,
     } = base_context(&state.db, state.startup_time, state.version).await;
 
     let tmpl = state.templates.get_template("logs.html")?;
@@ -60,6 +60,7 @@ async fn logs_page(
         pending_count,
         uptime,
         version,
+        degraded => degraded.names(),
         entries,
     })?;
     Ok(Html(html))

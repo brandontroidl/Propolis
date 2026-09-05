@@ -401,7 +401,7 @@ async fn render_search_page(
         pending_count,
         uptime,
         version,
-        degraded: _,
+        degraded,
     } = base_context(&state.db, state.startup_time, state.version).await;
     let form = FormValues::from(filters);
     // Two different query strings, not one shared between both mode-switch tabs: the By IP tab's
@@ -418,6 +418,7 @@ async fn render_search_page(
         pending_count,
         uptime,
         version,
+        degraded => degraded.names(),
         mode,
         form,
         sensors,

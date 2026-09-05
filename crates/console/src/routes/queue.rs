@@ -189,7 +189,7 @@ async fn queue_page(
         pending_count,
         uptime,
         version,
-        degraded: _,
+        degraded,
     } = base_context(&state.db, state.startup_time, state.version).await;
 
     let tmpl = state.templates.get_template("queue.html")?;
@@ -199,6 +199,7 @@ async fn queue_page(
         pending_count,
         uptime,
         version,
+        degraded => degraded.names(),
         rows,
         sort => query.sort.as_str(),
         tab => query.tab.as_str(),

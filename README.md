@@ -1,113 +1,73 @@
 # Propolis
 
-Self-hosted honeypot and threat-intelligence platform. Native protocol sensors capture
-hostile traffic on your own infrastructure, an append-only hash-chained ledger scores
-each source by corroborated evidence, and - only after you approve each case - Propolis
-publishes a firewall blocklist and files vendor abuse reports.
+Propolis is a self-hosted honeypot for collecting and reviewing hostile network traffic.
+It includes native sensors for SSH, Telnet, HTTP, FTP, SMTP, Redis, ADB, VNC, MySQL,
+MSSQL, PostgreSQL, and MongoDB, plus a silent catch-all listener that records probes on
+whatever other TCP and UDP ports you point it at.
 
-Single Rust workspace, PostgreSQL as the one datastore, a loopback operator console, and
-hardened per-sensor systemd services. Every sensor is passive: it captures, it never runs
-what it captures.
+Events are stored in PostgreSQL, scored by source IP, and shown in a local operator
+console. Operator approval is required for vendor reports and score-based blocklist
+entries. A separate connection-volume rule can add high-volume TCP sources to retention
+feeds automatically. Captured payloads are stored for analysis but are never executed.
 
-> **This is the front door.** Full documentation lives under [`docs/`](docs/README.md);
-> start with **[DOCUMENTATION.md](DOCUMENTATION.md)** for the map, or jump to a
-> [manual for your role](docs/README.md#manuals).
+## How it works
 
-## What it is
+Each sensor is its own hardened systemd service running as its own user. Sensors accept
+connections, impersonate the real service closely enough to keep an attacker talking, and
+write what they see to an append-only event log. The unified daemon tails those logs into
+a hash-chained PostgreSQL ledger, scores each source IP from the evidence, and serves the
+console on loopback.
 
-- **9 sensor crates covering 12 protocols** in one deployment (SSH, Telnet, HTTP, FTP,
-  SMTP, Redis, ADB, a catch-all port-scan sensor, and a multi-protocol credential sensor
-  for VNC/MySQL/MSSQL/PostgreSQL/MongoDB), each a dedicated hardened service.
-- **Evidence-based scoring** with a *confirmed-real* gate: an IP earns a feed tier or a
-  vendor report only after a completed TCP handshake authenticates against a honeypot
-  sensor - spoofable UDP or lone-SYN traffic never latches it.
-- **Human-approved output**: nothing is published to the blocklist feed or reported to a
-  vendor without explicit operator approval in the console.
-- **An append-only, hash-chained PostgreSQL ledger**: every score is reproducible by
-  replaying the evidence; the chain is enforced by a database trigger.
+An IP only earns a feed tier or a vendor report after a completed TCP handshake has
+authenticated against a sensor. Spoofable UDP traffic and lone SYNs do not count toward
+that gate. The one automatic path is volume: a source with a thousand or more completed
+connections on record and activity in the last day is added to the retention feeds
+without review, so a flood is blocked even when no login was attempted. Score-based tiers
+and vendor reports still wait for a decision in the console.
 
-See [capabilities](docs/overview/capabilities.md) and the
-[architecture overview](docs/architecture/index.md).
+Captured files (SCP, SFTP, ADB pushes, FTP uploads, downloaded droppers) go to a spool
+mounted `noexec`. VirusTotal lookups, abuse reports to AbuseIPDB, DShield and OTX, reverse
+DNS in the console, and push alerts are the only outbound paths, and all of them are off
+until configured.
 
-## Who it is for
+## Building and trying it
 
-Defenders running a honeypot on infrastructure they own and are authorized to monitor:
-home labs, researchers, educators, nonprofit / public-safety / government operators, and
-contributors. See [intended audiences](docs/overview/audiences.md) and
-[ethical-use boundaries](docs/overview/ethical-use.md).
-
-## What it does NOT do
-
-Not a network IDS, not a multi-tenant SaaS, not an exploit or offensive tool, not a
-managed service. It ships **no in-process TLS** (put a reverse proxy in front of the
-console) and the systemd `SystemCallFilter` in the shipped units is a **placeholder** you
-are expected to tighten. See [non-goals](docs/overview/non-goals.md) and
-[limitations](docs/overview/limitations.md).
-
-## Maturity
-
-Source-available and actively developed. The only release **tag is `v0.1.0`**; the
-current tree is `0.3.0` (untagged) and carries roughly two minor bumps of unreleased
-work, including the V12 operator console. It is **not** certified or blessed for
-production - read [maturity and status](docs/overview/maturity-and-status.md) and the
-[production-readiness checklist](docs/getting-started/production-readiness-checklist.md)
-before internet exposure.
-
-## Security cautions
-
-Propolis is designed to sit on the public internet receiving hostile traffic.
-
-- It **captures live malware** into a sterile, `noexec` spool and never executes it -
-  handle the spool accordingly ([malware custody](docs/security/malware-custody.md)).
-- It makes **no outbound requests except five operator-gated paths that all default off**
-  (VirusTotal, the AbuseIPDB/DShield/OTX submitters, console reverse-DNS, and ops-alert
-  ntfy); the sensors themselves are egress-free by construction
-  ([outbound controls](docs/security/outbound-controls.md)).
-- Single node = single blast radius; keep off-host backups.
-
-Full picture: [threat model](docs/security/threat-model.md),
-[hardening checklist](docs/security/hardening-checklist.md),
-[residual risks](docs/security/residual-risks.md). Report a vulnerability privately via
-[SECURITY.md](SECURITY.md).
-
-## Build and evaluate
-
-> **Warning:** the evaluation path brings up listeners that accept hostile traffic. Do it on
-> an isolated host you control, not on a production network, until you have read the
-> [production-readiness checklist](docs/getting-started/production-readiness-checklist.md).
+The toolchain is pinned in `rust-toolchain.toml`.
 
 ```
-cargo build --release            # pinned toolchain in rust-toolchain.toml
+cargo build --release
 ```
 
-Building does not start Propolis. Bringing it up - Postgres and `DATABASE_URL`,
-migrations, `PROPOLIS_CONSOLE_PASSWORD`, and the sensor listeners - is the full,
-verified evaluation path in
-[getting-started/evaluation-deployment](docs/getting-started/evaluation-deployment.md);
-production installation is in [operations/installation](docs/operations/installation.md).
+Building does not start anything. Running Propolis needs a PostgreSQL database, a
+`DATABASE_URL`, a console password, and the sensor listeners, which by design accept
+hostile traffic. Do a first run on an isolated host you control, not on a network you
+care about, following
+[getting-started/evaluation-deployment](docs/getting-started/evaluation-deployment.md).
+Production installs use `deploy/install.sh` and are described in
+[operations/installation](docs/operations/installation.md).
+
+## Risks to know before exposing it
+
+- The spool holds live malware. Treat the host and its backups accordingly.
+- The console has no built-in TLS. Keep it on loopback or behind a reverse proxy.
+- The shipped systemd `SystemCallFilter` is a placeholder to tighten for your kernel.
+- One node is one blast radius. Keep an off-host copy of the database and spool.
+- The last tagged release is `v0.1.0`; the tree is at `0.3.0` with unreleased work. Read
+  the production-readiness checklist before internet exposure.
+
+## Scope
+
+Propolis is not an IDS, not multi-tenant, and not an offensive tool. It runs on
+infrastructure you own and are authorized to monitor: home labs, research, teaching,
+nonprofit and public-sector operations.
 
 ## Documentation
 
-- **[DOCUMENTATION.md](DOCUMENTATION.md)** - the corpus map and where to start by role.
-- **[docs/](docs/README.md)** - the full layered corpus (overview, getting-started,
-  architecture, operations, security, development, reference, governance, troubleshooting,
-  history).
-- **[docs/binder/HANDOFF-BINDER.md](docs/binder/HANDOFF-BINDER.md)** - the complete linear
-  handoff binder (offline reading, transfer, audit, AI ingestion).
-- **[Reference](docs/reference/environment-variables.md)** - every environment variable,
-  port, path, table, route, and signal.
-
-## Build and architecture
-
-Rust (2024 edition), all dependencies vendored in-tree; PostgreSQL as the single
-datastore; hardened systemd units (`ProtectSystem=strict`, `NoNewPrivileges`,
-`MemoryDenyWriteExecute`, dedicated per-sensor users). No third-party honeypot code -
-every sensor is self-authored. See the [architecture section](docs/architecture/index.md)
-and [supply chain](docs/security/supply-chain.md).
+Everything else, including the architecture, threat model, operations runbooks, and the
+reference for every variable, port, table and route, is under
+[docs/](docs/README.md). Report a vulnerability privately via [SECURITY.md](SECURITY.md).
 
 ## License
 
-Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md) - **not**
-open source. Free for personal, home-lab, research, educational, nonprofit, and government
-use; commercial use requires a separate license. See
-[governance/licensing](docs/governance/licensing.md).
+[PolyForm Noncommercial 1.0.0](LICENSE.md). Free for personal, research, educational,
+nonprofit, and government use; commercial use needs a separate license.

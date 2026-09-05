@@ -1,112 +1,95 @@
 <!--
-title: Production-Readiness Checklist
+title: Production-readiness checklist
 audience: deployer
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-05
 -->
 
 # Production-readiness checklist
 
-Work through this before exposing any Propolis listener to untrusted traffic. The
-[evaluation deployment](evaluation-deployment.md) is deliberately not production-safe;
-this page lists what must be true first, linking each item to its owner.
-
-> [!IMPORTANT]
-> Propolis is source-available and actively developed, with one tagged release
-> (`v0.1.0`) and a current tree at `0.3.0` (untagged). It carries **no** production,
-> security, legal, or regulatory certification. This checklist reduces risk; it does not
-> confer any assurance. Residual risks remain even when every item is done - see
-> [residual risks](../security/residual-risks.md).
+Work through this before any listener accepts untrusted traffic. Propolis has one
+tagged release, `v0.1.0`, and the tree is at `0.3.0` with unreleased work; it carries no
+certification of any kind. This list reduces risk, it does not remove it; the
+[residual risks](../security/residual-risks.md) page says what remains when every box
+is ticked.
 
 ## Secrets
 
-- [ ] Every secret lives in a per-service `/etc/propolis/*.env` file, mode `0600`, owned
-      by the service user, created by hand - `install.sh` never writes them
-      (`deploy/install.sh:25-28`, `deploy/propolis.service:55-57`).
-- [ ] `DATABASE_URL` set (carries the DB password inline); the daemon fails fast if it is
-      missing (`crates/propolis/src/config.rs:168-173,430`).
-- [ ] `PROPOLIS_CONSOLE_PASSWORD` set to a strong value (e.g. `openssl rand -base64 24`);
-      empty/absent refuses to start (`config.rs:517`).
-- [ ] `PROPOLIS_CONSOLE_SESSION_SECRET` set to 64 hex chars (`openssl rand -hex 32`) -
-      otherwise a fresh key is generated each start and every session drops on restart
-      (`config.rs:371-389`).
-- [ ] Vendor / VirusTotal / ntfy keys set only for the egress paths you deliberately
-      enable (all default off). Owner: [secret management](../operations/secret-management.md),
-      exact vars in [reference/environment-variables.md](../reference/environment-variables.md).
+- [ ] Every secret is in a per-service `/etc/propolis/*.env` file, mode 0600, owned by
+      that service's user. You write these by hand; `install.sh` never does.
+- [ ] `DATABASE_URL` is set. It carries the database password, and the daemon refuses
+      to start without it.
+- [ ] `PROPOLIS_CONSOLE_PASSWORD` is a strong value, for example from
+      `openssl rand -base64 24`. Empty refuses to start.
+- [ ] `PROPOLIS_CONSOLE_SESSION_SECRET` is 64 hex characters, for example from
+      `openssl rand -hex 32`. Without it a fresh key is generated at each start and
+      every session ends on restart.
+- [ ] Vendor, VirusTotal and ntfy credentials are set only for the paths you mean to
+      enable. See [secret management](../operations/secret-management.md).
 
-## TLS / network exposure
+## Network exposure
 
-- [ ] Understand that the console has **no in-process TLS** - it is plain HTTP on a
-      loopback `TcpListener` (`crates/propolis/src/main.rs:413-424`). Any TLS is
-      operator-provided.
-- [ ] If the console must be reachable off-host, front it with an operator-provided TLS
-      reverse proxy and keep `PROPOLIS_CONSOLE_BIND` on loopback behind it
-      [inferred - not in code]. Owner: [networking and TLS](../operations/networking-tls.md).
-- [ ] `/metrics`, `/health`, `/ready` are unauthenticated; they are only acceptable
-      because the console is loopback-only. Do not expose them directly
-      (`crates/console/src/routes/metrics.rs:8-11`).
-- [ ] Firewall: allow inbound only on the sensor ports you expose; the console needs no
-      inbound from the network (`INSTALL.md:378-385`). Ports owned by
-      [reference/ports-and-protocols.md](../reference/ports-and-protocols.md).
+- [ ] You know the console has no TLS of its own. Keep `PROPOLIS_CONSOLE_BIND` on
+      loopback; if it must be reachable off-host, put a TLS reverse proxy in front and
+      set `PROPOLIS_CONSOLE_TRUSTED_PROXY`. See [networking and TLS](../operations/networking-tls.md).
+- [ ] `/health`, `/ready` and `/metrics` are unauthenticated. They are only safe on
+      loopback; set `PROPOLIS_CONSOLE_METRICS_TOKEN` if `/metrics` must be scraped from
+      elsewhere.
+- [ ] The firewall allows inbound only on the sensor ports you expose. The console
+      needs nothing inbound from the network. Ports are listed in
+      [ports and protocols](../reference/ports-and-protocols.md).
 
 ## Host and process hardening
 
-- [ ] **Derive a real `SystemCallFilter`.** Every shipped unit ships a **placeholder**
-      (`@system-service` minus `@privileged @resources`) - a broad dev allowlist the unit
-      header explicitly says to tighten via `strace -c -f` before production
-      (`deploy/propolis.service:176-187`). This is a residual risk, not a delivered
-      control. Owner: [hardening checklist](../security/hardening-checklist.md).
-- [ ] Create the `noexec,nosuid,nodev` spool mounts - `install.sh` prints fstab guidance
-      but does not create them (`deploy/install.sh:171-193`).
-- [ ] Confirm the systemd sandboxing directives the units set are in effect
-      (`NoNewPrivileges`, `ProtectSystem=strict`, `PrivateUsers`, `MemoryDenyWriteExecute`,
-      per-sensor capability sets). Owner: [service lifecycle](../operations/service-lifecycle.md).
-- [ ] Do not run the containerized Postgres with `host all all all trust`
-      (`INSTALL.md:99-104`).
+- [ ] You have replaced the placeholder `SystemCallFilter` in the units. The shipped
+      value is a broad allowlist the unit header tells you to narrow with `strace` under
+      real load. Until you do, this is an open item, not a control. See the
+      [hardening checklist](../security/hardening-checklist.md).
+- [ ] The spool directories under `/var/spool/propolis` are mounted
+      `noexec,nosuid,nodev`. `install.sh` prints the fstab lines and creates the
+      directories; it does not mount anything.
+- [ ] The sandboxing in the unit files is in effect on your systemd version:
+      `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateUsers`,
+      `MemoryDenyWriteExecute`, and the per-sensor capability sets. See
+      [service lifecycle](../operations/service-lifecycle.md).
+- [ ] PostgreSQL does not trust all hosts. The evaluation's `trust` auth is for a
+      loopback container only.
 
-## Backups and evidence continuity
+## Backups and evidence
 
-- [ ] A backup exists **and has been restored end-to-end at least once** - possessing a
-      backup is not being able to recover. Owner:
+- [ ] A backup exists and you have restored it end to end at least once. Having a
+      backup is not the same as being able to recover. See
       [backup and restore](../operations/backup-and-restore.md) and
       [upgrade, rollback and DR](../operations/upgrade-rollback-and-dr.md).
-- [ ] Retention configured for the ledger, samples, and logs. Owner:
+- [ ] You have decided how long to keep the ledger, the samples and the logs. See
       [retention](../operations/retention.md).
 
-## Public feed / blocklist repo privacy
+## Publishing the feed
 
-- [ ] The blocklist-sync cron is an **operator setup step**: `deploy/blocklist-sync.sh`
-      is referenced by comment but is **not** wired into any shipped systemd timer or cron
-      in `deploy/` - you must install the crontab yourself
-      (`deploy/blocklist-sync.sh:9`, [evidence 09 §12]).
-- [ ] The published feed output (`/var/lib/propolis/feed/current`) is deliberately
-      world-traversable so a distribution user can serve it - confirm that is intended
-      before publishing (`deploy/install.sh:139-142`).
-- [ ] Confirm the blocklist target repo's visibility (public vs private) matches your
-      intent before the first push. The feed content is IP indicators; treat repo
-      exposure as a decision, not a default.
+- [ ] If you publish the feed, the cron entry for `deploy/blocklist-sync.sh` is yours to
+      install; nothing shipped schedules it. Set `PROPOLIS_OPS_FEED_PUSH_EXPECTED` once it
+      is in place so a push that never works is reported.
+- [ ] The feed output directory is world-readable on purpose, so a web server or sync
+      user can serve it. Confirm that is what you want before anything else can read the
+      host.
+- [ ] The target repository's visibility matches your intent. The content is a list of
+      attacker addresses, and the repository reveals that you run a honeypot.
 
-## Enrichment / reporting egress (opt-in, default off)
+## Outbound integrations
 
-Enable only what you intend to, and only after reading its controls:
+- [ ] Each one you enable is a deliberate decision: VirusTotal (`PROPOLIS_VT_ENABLED`),
+      the dropper fetcher (`PROPOLIS_FETCH_ENABLED`), reverse DNS
+      (`PROPOLIS_CONSOLE_RDNS_ENABLED`), push alerts (`PROPOLIS_OPS_ENABLED`), and any
+      vendor whose key you set. All are off until then. What each one sends is in
+      [outbound controls](../security/outbound-controls.md).
 
-- [ ] VirusTotal (`PROPOLIS_VT_ENABLED`), vendor abuse submitters
-      (`PROPOLIS_VENDOR_*_ENABLED`), console rDNS (`PROPOLIS_CONSOLE_RDNS_ENABLED`),
-      ops-alert ntfy (`PROPOLIS_OPS_ENABLED`), and the malware fetcher
-      (`PROPOLIS_FETCH_ENABLED`) all default **off**. Owner:
-      [outbound controls](../security/outbound-controls.md) and
-      [reference/integrations.md](../reference/integrations.md).
+## Operations
 
-## Operations readiness
-
-- [ ] Ops self-alerting configured (or a conscious decision not to): with
-      `PROPOLIS_OPS_ENABLED=true`, the ntfy URL and topic become required and the monitor
-      fails closed if it cannot page (`crates/propolis/src/ops_alert/config.rs:119-134`).
-      Owner: [health and observability](../operations/health-and-observability.md).
-- [ ] Routine procedures and service lifecycle understood:
-      [routine procedures](../operations/routine-procedures.md),
-      [service lifecycle](../operations/service-lifecycle.md).
-
-When you decommission, follow [safe teardown](safe-teardown.md).
+- [ ] Alerting is configured, or you have decided to do without it. With
+      `PROPOLIS_OPS_ENABLED=true` the ntfy URL and topic are required and the daemon
+      refuses to start without them. See
+      [health and observability](../operations/health-and-observability.md).
+- [ ] You have read [routine procedures](../operations/routine-procedures.md) and know
+      how to [tear the node down](safe-teardown.md).

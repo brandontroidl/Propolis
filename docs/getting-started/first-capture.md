@@ -1,94 +1,73 @@
 <!--
-title: First Capture
+title: Your first capture
 audience: evaluator
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-05
 -->
 
 # Your first capture
 
-This follows on from [evaluation deployment](evaluation-deployment.md): with the daemon
-and the SSH sensor running on loopback, generate one event and watch it flow to the
-ledger and the console.
+With the daemon and the SSH sensor from the [quickstart](../manuals/quickstart.md)
+running, this is what one event looks like on its way through the system.
 
 ## Produce an event
 
-Connect to the local sensor's high port. Any TCP client that speaks (or attempts) the
-protocol works - the sensor records the connection and whatever the client sends:
-
 ```bash
-# EXAMPLE - trigger the SSH sensor bound at 127.0.0.1:2222
-ssh -p 2222 root@127.0.0.1        # offer a banner + a login attempt, then disconnect
-# or, a raw connection:
-nc 127.0.0.1 2222
+ssh -p 2222 root@127.0.0.1
 ```
 
-The sensor is a honeypot: it presents a persona and captures the interaction; no real
-shell or login exists. Per-protocol capture behavior (what each sensor records, bounds,
-timeouts) is owned by [reference/sensor-behavior.md](../reference/sensor-behavior.md).
+Any password is accepted. You get a fake shell that answers common commands with
+plausible output; nothing you type runs anywhere. A bare connection with `nc` works too
+and records a connection without a login.
 
-## Where it lands
+## Follow it
 
-1. **Sensor log.** The sensor writes a JSON event line to its log file - in the eval
-   setup, `/tmp/propolis-eval/ssh/events.jsonl` (`PROPOLIS_SSH_LOG_PATH`,
-   `crates/sensor-ssh/src/main.rs:26,46`). You can watch it directly:
-
-   ```bash
-   tail -f /tmp/propolis-eval/ssh/events.jsonl
-   ```
-
-2. **Ledger.** The daemon's intake subsystem tails every file named in
-   `PROPOLIS_SENSOR_LOGS` (`crates/propolis/src/config.rs:236-262`) and appends each
-   event to the append-only, hash-chained `event` ledger, from which the scoring
-   projection is derived. The capture -> ledger -> score path is described in
-   [event and sample lifecycle](../architecture/event-and-sample-lifecycle.md); the
-   `event` table and hash chain are owned by
-   [reference/database.md](../reference/database.md). Event fields and signal types are
-   owned by [reference/events-and-signals.md](../reference/events-and-signals.md).
-
-3. **Score.** The source IP (here `127.0.0.1`) is scored and appears as an attacker row.
-   Scoring constants, tiers, and eligibility thresholds are owned by
-   [reference/scoring-and-feed.md](../reference/scoring-and-feed.md).
-
-## Observe it in the console
-
-Open `http://127.0.0.1:8080/` and log in. The event surfaces across several pages:
-
-- **Live logs** - `/logs` streams the daemon's own tracing events (SSE), so you can see
-  intake pick the event up in near real time (`crates/console/src/routes/logs.rs:35-91`).
-- **Attackers** - `/ips` lists scored source IPs (`crates/console/src/routes/ips.rs:14`).
-- **IP detail** - `/ip/{ip}` shows the evidence timeline, session grouping, and per-WAN
-  breakdown for that address; open it as a drawer with `?drawer=1`
-  (`crates/console/src/routes/detail.rs:76,198-401`).
-- **Review queue** - `/queue` lists IPs awaiting an approve/reject/snooze decision once
-  they cross the review threshold (`crates/console/src/routes/queue.rs:41`).
-
-Route details are owned by
-[reference/console-routes.md](../reference/console-routes.md); see the
-[console tour](console-tour.md) for a walkthrough.
-
-## Observe a captured sample
-
-A bare connection produces an event but no file. Sample capture happens when a client
-uploads a payload (e.g. an `scp`/upload attempt against an upload-capable sensor). The
-SSH sensor spools captured payloads to its spool directory (default
-`/var/spool/propolis/ssh`, `PROPOLIS_SSH_SPOOL_DIR`, `crates/sensor-ssh/src/main.rs:27,47`).
-For the eval, point the spool at a writable temp dir:
+**The sensor log.** The sensor appends one JSON line per event to the file you pointed
+`PROPOLIS_SSH_LOG_PATH` at. The connection, the login and each command are separate
+events:
 
 ```bash
-# EXAMPLE - eval spool override before starting sensor-ssh
-export PROPOLIS_SSH_SPOOL_DIR='/tmp/propolis-eval/ssh-spool'
-mkdir -p /tmp/propolis-eval/ssh-spool
+tail -f /tmp/propolis-eval/ssh/events.jsonl
 ```
 
-Captured samples then appear in the console at `/samples`, listed by their sha256 and
-downloadable as an `application/octet-stream` attachment served with a hardened
-`Content-Security-Policy: default-src 'none'`
-(`crates/console/src/routes/samples.rs:81-168`).
+**The ledger.** The daemon tails that file and appends each event to the `event` table.
+Each row carries a hash chained to the previous row, which is what the console's
+Integrity page later verifies. Table layout is in the
+[database reference](../reference/database.md); the event fields and signal names are in
+[events and signals](../reference/events-and-signals.md).
 
-> [!WARNING]
-> Downloaded samples are live captured payloads and may be malware. Treat them as
-> hostile: never execute them, and handle only in an isolated analysis environment. See
-> [malware custody](../security/malware-custody.md).
+**The score.** The source address, `127.0.0.1` here, gets an `ip_score` row. An
+authenticated SSH login over TCP marks the address confirmed-real, and after a second
+event it is eligible; whether it then reaches a tier depends on how much weight it
+accumulates. The weights and thresholds are in
+[scoring and feed](../reference/scoring-and-feed.md).
+
+## See it in the console
+
+Open <http://127.0.0.1:8080/> and log in.
+
+- **Live logs** streams the daemon's own log, so you can watch intake pick the event up.
+- **Attackers** lists the scored address.
+- The address's page shows the login, the commands, and the session they belong to.
+- **Review** shows the address once it reaches a tier, waiting for a decision.
+
+## Capture a file
+
+A connection produces an event; an upload produces a sample. Push a file to the same
+port:
+
+```bash
+scp -P 2222 /etc/hostname root@127.0.0.1:/tmp/
+```
+
+The sensor keeps the body in the spool directory, named by its SHA-256, and records an
+upload event carrying that hash. The **Samples** page lists it, and the file can be
+downloaded from there.
+
+Anything a real attacker uploads through this path is live malware. The spool in a
+production install is mounted so nothing in it can execute, and the samples page serves
+downloads as opaque attachments, but the file is still whatever the attacker sent.
+Handle it only in an isolated analysis environment; see
+[malware custody](../security/malware-custody.md).

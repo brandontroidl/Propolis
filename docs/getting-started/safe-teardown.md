@@ -1,116 +1,79 @@
 <!--
-title: Safe Teardown
+title: Safe teardown
 audience: operator
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-05
 -->
 
 # Safe teardown
 
-How to stop Propolis, remove its listeners, and either preserve or deliberately wipe the
-captured evidence. Read the whole page before running the destructive steps - captured
-evidence cannot be recovered once wiped unless you took a backup first.
+How to stop Propolis, close its listeners, and either keep or deliberately destroy the
+evidence it captured. Read the whole page before the destructive steps; captured
+evidence cannot be recovered after it is wiped unless you took a backup first.
 
 ## 1. Stop the listeners first
 
-Stop the sensors before the daemon so no new events arrive mid-teardown.
+Stop the sensors before the daemon, so nothing new arrives while you work.
 
 ```bash
-# EXAMPLE - systemd deployment
-sudo systemctl stop sensor-ssh sensor-telnet sensor-cred ...   # every sensor you enabled
+sudo systemctl stop sensor-ssh sensor-telnet sensor-cred   # every sensor you enabled
 sudo systemctl stop propolis.service
 ```
 
-A `SIGTERM`/`SIGINT` triggers a graceful shutdown: the daemon cancels all subsystems,
-waits up to a 30s `SHUTDOWN_TIMEOUT` for in-flight work, then force-exits and closes the
-pool (`crates/propolis/src/main.rs:160,480-507`). For a local evaluation run, Ctrl-C on
-each process does the same. Service lifecycle detail is owned by
-[service lifecycle](../operations/service-lifecycle.md).
+The daemon shuts down gracefully on `SIGTERM`: it cancels its subsystems, waits up to
+30 seconds for in-flight work, then exits and closes the database pool. Ctrl-C does the
+same for an evaluation run.
 
-## 2. Remove the listeners (permanent stop)
+## 2. Keep them stopped
 
-To stop the sensors from restarting on boot:
+The sensor units restart on failure and at boot, so `stop` alone is not enough:
 
 ```bash
-# EXAMPLE
-sudo systemctl disable --now sensor-ssh sensor-telnet sensor-cred ...
+sudo systemctl disable --now sensor-ssh sensor-telnet sensor-cred
 sudo systemctl disable --now propolis.service
 ```
 
-The sensor units use `Restart=always` (`deploy/sensor-ssh.service`), so `stop` alone is
-not enough to keep them down across a reboot - `disable` is required. This closes the
-attacker-facing ports; confirm nothing is still listening before considering the box
+Confirm nothing is still listening on the sensor ports before you treat the host as
 quiet.
 
-## 3. Decide: preserve or wipe evidence
+## 3. Decide what happens to the evidence
 
-Propolis holds captured evidence in three places. Decide what to keep **before** removing
-anything.
+Propolis holds evidence in three places:
 
-| Evidence | Location | Notes |
-|---|---|---|
-| Event ledger + score projection | PostgreSQL (`event`, `ip_score`, `review_queue`, ...) | Append-only, hash-chained `event` ledger; owned by [reference/database.md](../reference/database.md) |
-| Captured samples | `/var/spool/propolis/{ssh,adb,ftp,telnet,catchall,fetched}` | Live payloads - may be malware |
-| Sensor + daemon logs | `/var/log/propolis/<sensor>/events.jsonl` | Rotated by logrotate; paths owned by [reference/filesystem-paths.md](../reference/filesystem-paths.md) |
+| Evidence | Where |
+|---|---|
+| Event ledger and scores | PostgreSQL: `event`, `ip_score`, `review_queue` and the other tables |
+| Captured samples | `/var/spool/propolis/<sensor>/` and `/var/spool/propolis/fetched/`; live malware |
+| Sensor and daemon logs | `/var/log/propolis/<sensor>/events.jsonl` |
 
-### To preserve
+**To keep it**, take a backup and restore it somewhere to prove it worked before you
+touch anything, following [backup and restore](../operations/backup-and-restore.md).
+The ledger's hash chain lets you show later that what you kept was not altered: run the
+Integrity check in the console before the backup and again after the restore.
 
-Take (and verify) a backup before touching anything - follow
-[backup and restore](../operations/backup-and-restore.md). A backup you have never
-restored is not a recovery path. The hash-chained ledger lets you prove the preserved
-evidence was not altered; verify it via the console's `/integrity` page or
-`core_scoring::verify_chain` (`crates/console/src/routes/integrity.rs:36-66`).
-
-### To wipe
-
-> [!WARNING]
-> The following destroys captured evidence permanently. There is no undo. Confirm you
-> have any backup you intend to keep, and that you are on the correct host and database,
-> before running these.
-
-Samples (live malware - handle in an isolated environment; see
-[malware custody](../security/malware-custody.md)):
+**To wipe it**, there is no undo. Check you have the backup you meant to keep and that
+you are on the right host and database, then:
 
 ```bash
-# EXAMPLE - destructive: removes all captured samples
-sudo rm -rf /var/spool/propolis/*/    # per-sensor spool subdirs
+sudo rm -rf /var/spool/propolis/*/     # samples: live malware, handle in isolation
+sudo rm -rf /var/log/propolis/*/       # sensor logs
+dropdb propolis                        # or truncate event, ip_score, review_queue
 ```
 
-Logs:
+For an evaluation, `podman rm -f propolis-pg` and `rm -rf /tmp/propolis-eval` remove
+everything.
 
-```bash
-# EXAMPLE - destructive: removes captured sensor logs
-sudo rm -rf /var/log/propolis/*/
-```
+## 4. Uninstall
 
-Database - drop the whole database, or truncate the capture tables. Owned by
-[reference/database.md](../reference/database.md); do this only against the correct
-`DATABASE_URL` target:
+There is no uninstaller. Reverse `install.sh` by hand: the unit files in
+`/etc/systemd/system/`, the binaries in `/usr/local/bin/`, the `propolis*` system users,
+and the `/etc/propolis`, `/var/lib/propolis`, `/var/log/propolis` and
+`/var/spool/propolis` trees.
 
-```bash
-# EXAMPLE - destructive: drop the entire Propolis database
-dropdb propolis    # or: psql "$DATABASE_URL" -c 'TRUNCATE event, ip_score, review_queue CASCADE;'
-```
+## The published feed
 
-For a disposable evaluation database:
-
-```bash
-podman rm -f propolis-pg
-```
-
-## 4. Full uninstall (optional)
-
-Removing binaries, units, users, and directories laid down by `deploy/install.sh` is a
-separate step beyond stopping services. `install.sh` does not ship an uninstaller; reverse
-its steps manually (units in `/etc/systemd/system/`, binaries in `/usr/local/bin/`, the
-`propolis*` system users, and the `/etc/propolis`, `/var/lib/propolis`, `/var/log/propolis`,
-`/var/spool/propolis` trees). Owner: [installation](../operations/installation.md).
-
-## Public feed
-
-If you published a blocklist, decide whether to leave the last-published feed in place or
-retract it - that is a change to the external repo, independent of tearing down the node.
-See the feed-repo item in the
-[production-readiness checklist](production-readiness-checklist.md).
+If you published a blocklist, the last published copy stays in that repository until
+you remove it. That is a separate decision from tearing down the node; a stale public
+feed keeps blocking addresses you are no longer watching.

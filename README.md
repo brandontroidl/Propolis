@@ -26,9 +26,13 @@ without review, so a flood is blocked even when no login was attempted. Score-ba
 and vendor reports still wait for a decision in the console.
 
 Captured files (SCP, SFTP, ADB pushes, FTP uploads, downloaded droppers) go to a spool
-mounted `noexec`. VirusTotal lookups, abuse reports to AbuseIPDB, DShield and OTX, reverse
-DNS in the console, and push alerts are the only outbound paths, and all of them are off
-until configured.
+mounted `noexec`. The sensors themselves make no outbound connections. The daemon's
+optional outbound integrations, all off until configured, are VirusTotal lookups, abuse
+reports to AbuseIPDB, DShield and OTX, fetching droppers from attacker-supplied URLs,
+reverse DNS in the console, and push alerts. A split deployment adds the collector's
+connection to your own gateway, and publishing the feed to a public repository is a
+cron job you install. [Outbound controls](docs/security/outbound-controls.md) lists
+each path and what it sends.
 
 ## Building and trying it
 

@@ -80,6 +80,8 @@ All off until configured:
 
 - VirusTotal hash lookups for captured samples; uploading unknown bodies is a further
   opt-in.
+- Fetching a dropper from a URL an attacker pasted into a fake shell, behind an SSRF
+  guard, into the same quarantine spool.
 - Abuse reports to AbuseIPDB, DShield and OTX.
 - Forward-confirmed reverse DNS on the IP page, display only.
 - Push alerts over ntfy when the node degrades.

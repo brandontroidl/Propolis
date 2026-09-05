@@ -72,6 +72,7 @@ fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> App
         events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         trusted_proxy: false,
         metrics_token: None,
+        gave_up_subsystems: console::no_subsystem_health(),
     }
 }
 

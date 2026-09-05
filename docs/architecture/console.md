@@ -148,8 +148,9 @@ does not yet mention it (see
 
 `/health`, `/ready`, and `/metrics` are public (Prometheus cannot log in), which is
 acceptable because the console binds loopback-only by default. `/health` is a
-liveness-only constant `200`; `/ready` pings `SELECT 1` and returns `200`/`503`
-fail-closed; `/metrics` derives Prometheus gauges and counters from live DB queries
+liveness-only constant `200`; `/ready` pings `SELECT 1`, then asks the daemon's
+supervisor whether any subsystem has given up, and returns `200`/`503` fail-closed
+(the dead names in the body); `/metrics` derives Prometheus gauges and counters from live DB queries
 per scrape. See [operations/health-and-observability.md](../operations/health-and-observability.md).
 
 ## Related

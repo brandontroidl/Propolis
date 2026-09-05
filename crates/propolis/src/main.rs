@@ -435,6 +435,8 @@ struct ConsoleRuntime {
     log_buffer: Arc<LogBuffer>,
     events_ingested: Arc<std::sync::atomic::AtomicU64>,
     events_rejected: Arc<std::sync::atomic::AtomicU64>,
+    /// The supervisor map, so `/ready` can report a subsystem that has given up.
+    supervisor: SupervisorHandle,
 }
 
 /// Console web server. Mirrors `console/src/main.rs`.
@@ -452,7 +454,23 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         log_buffer,
         events_ingested,
         events_rejected,
+        supervisor,
     } = rt;
+    // Sorted so the readiness body is stable across polls; a poisoned lock reads as "nothing
+    // known", never as a crash inside the probe.
+    let gave_up_subsystems: console::SubsystemHealth = Arc::new(move || {
+        let mut names: Vec<&'static str> = supervisor
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .filter(|(_, s)| **s == ops_alert::condition::SubsysState::GaveUp)
+                    .map(|(name, _)| *name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort_unstable();
+        names
+    });
     let passwords = Arc::new(PasswordStore::new(&password));
     // Load the GeoLite2 databases (a synchronous, potentially large file read) on a blocking-pool
     // thread so it never parks a shared runtime worker at startup - run_console is a supervised task
@@ -482,6 +500,7 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         events_rejected,
         trusted_proxy,
         metrics_token: metrics_token.map(Arc::from),
+        gave_up_subsystems,
     };
 
     console::warn_if_console_exposed(bind_addr);
@@ -1057,6 +1076,7 @@ async fn main() {
         let log_buffer = log_buffer.clone();
         let ing = events_ingested.clone();
         let rej = events_rejected.clone();
+        let console_supervisor = supervisor_state.clone();
 
         handles.push(spawn_supervised(
             "console",
@@ -1071,6 +1091,7 @@ async fn main() {
                 let ing = ing.clone();
                 let rej = rej.clone();
                 let console_metrics_token = console_metrics_token.clone();
+                let supervisor = console_supervisor.clone();
                 async move {
                     run_console(
                         ConsoleRuntime {
@@ -1086,6 +1107,7 @@ async fn main() {
                             log_buffer,
                             events_ingested: ing,
                             events_rejected: rej,
+                            supervisor,
                         },
                         token,
                     )

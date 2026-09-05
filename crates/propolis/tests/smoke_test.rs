@@ -78,6 +78,7 @@ async fn smoke_health_and_ready(pool: PgPool) {
             events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             trusted_proxy: false,
             metrics_token: None,
+            gave_up_subsystems: console::no_subsystem_health(),
         };
 
         let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();

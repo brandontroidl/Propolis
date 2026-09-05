@@ -463,8 +463,9 @@ correction):**
 
 **Health and observability**
 ([health and observability](../operations/health-and-observability.md)). `GET
-/health` (liveness, always 200, no DB), `GET /ready` (200 if `SELECT 1`, else
-**503 fail-closed**), `GET /metrics` (Prometheus, derived live per scrape;
+/health` (liveness, always 200, no DB), `GET /ready` (200 if `SELECT 1` and no
+supervised subsystem has given up, else **503 fail-closed**, dead names in the
+body), `GET /metrics` (Prometheus, derived live per scrape;
 unauthenticated, so keep loopback). Watch `propolis_feed_last_build_timestamp`
 (feed still publishing), the review-queue depth, and two capture-loss counters:
 `dropped_count` (queue full - WARNs at powers of two) and `spool_refused_count`

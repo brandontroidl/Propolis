@@ -268,6 +268,7 @@ async fn main() {
         events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         trusted_proxy: config.trusted_proxy,
         metrics_token: config.metrics_token.map(Arc::from),
+        gave_up_subsystems: console::no_subsystem_health(),
     };
 
     tracing::info!(bind = %bind_addr, "console: starting");

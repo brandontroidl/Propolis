@@ -92,4 +92,19 @@ pub struct AppState {
     /// Optional bearer token gating `/metrics` (`PROPOLIS_CONSOLE_METRICS_TOKEN`). `None` leaves the
     /// endpoint open - safe only on a loopback bind (see [`warn_if_console_exposed`]).
     pub metrics_token: Option<Arc<str>>,
+    /// Names of supervised subsystems that have given up (exhausted their restart budget), read
+    /// by `GET /ready` so a daemon whose collection pipeline is dead does not keep answering
+    /// ready on the strength of a live database. The unified daemon wires this to its supervisor
+    /// map; the standalone console binary and tests use [`no_subsystem_health`], which reports
+    /// nothing dead because there is nothing supervised.
+    pub gave_up_subsystems: SubsystemHealth,
+}
+
+/// Reports the supervised subsystems that have given up; empty when everything is running or
+/// when the constructing process supervises nothing. See `AppState::gave_up_subsystems`.
+pub type SubsystemHealth = Arc<dyn Fn() -> Vec<&'static str> + Send + Sync>;
+
+/// The [`SubsystemHealth`] for a process with no supervised subsystems.
+pub fn no_subsystem_health() -> SubsystemHealth {
+    Arc::new(Vec::new)
 }

@@ -24,7 +24,7 @@ operator-provided reverse proxy. See [networking and TLS](./networking-tls.md).
 | Endpoint | Purpose | Success | Failure | Cite |
 |---|---|---|---|---|
 | `GET /health` | Liveness only; does not touch the DB | `200 {"status":"ok"}` (always) | none | `crates/console/src/routes/health.rs:14-24` |
-| `GET /ready` | Readiness; pings Postgres `SELECT 1` | `200` | **`503 {"status":"unavailable"}`** on any DB error (fail-closed) | `health.rs:26-40` |
+| `GET /ready` | Readiness; pings Postgres `SELECT 1`, then checks no supervised subsystem has given up (unified daemon only; the standalone console supervises nothing) | `200` | **`503 {"status":"unavailable"}`** on any DB error (fail-closed); **`503 {"status":"unavailable","gave_up":[...]}`** naming the dead subsystems | `health.rs` `ready` |
 | `GET /metrics` | Prometheus text (`version=0.0.4`) | `200` | derived live per scrape | `crates/console/src/routes/metrics.rs:1-11` |
 
 Use `/health` for a liveness check that a process is up, and `/ready` for a

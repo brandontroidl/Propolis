@@ -48,7 +48,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 | Method | Path | Handler | Notes | Source |
 |---|---|---|---|---|
 | GET | `/health` | `health` | always `200 {"status":"ok"}` (liveness only) | `routes/health.rs:16,22-24` |
-| GET | `/ready` | `ready` | pings `SELECT 1`; `200`/`503`, fail-closed | `routes/health.rs:17,28-40` |
+| GET | `/ready` | `ready` | pings `SELECT 1`, then any supervised subsystem that gave up; `200`/`503` (`gave_up` names in the body), fail-closed | `routes/health.rs` `ready` |
 | GET | `/metrics` | `metrics` | Prometheus text (`text/plain; version=0.0.4`) | `routes/metrics.rs:40,190-198` |
 | GET | `/login` | `login_form` | | `routes/login.rs:45` |
 | POST | `/login` | `login_submit` | no CSRF (no pre-auth session to bind) | `routes/login.rs:45` |

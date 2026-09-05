@@ -45,6 +45,7 @@ fn test_state(db: PgPool) -> AppState {
         events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         trusted_proxy: false,
         metrics_token: None,
+        gave_up_subsystems: console::no_subsystem_health(),
     }
 }
 
@@ -249,6 +250,33 @@ async fn ready_returns_503_when_db_down(pool: PgPool) {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A live database is not readiness: a daemon whose intake or a sensor tailer has exhausted its
+/// restarts is serving pages while collecting nothing. `/ready` must say so, naming the dead
+/// subsystems, so a probe that only saw "DB up" cannot call it ready.
+#[sqlx::test]
+async fn ready_returns_503_naming_subsystems_that_gave_up(pool: PgPool) {
+    let mut state = test_state(pool);
+    state.gave_up_subsystems = Arc::new(|| vec!["intake:ssh", "fetcher"]);
+    let app = routes::router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        &body[..],
+        br#"{"gave_up":["intake:ssh","fetcher"],"status":"unavailable"}"#
+    );
 }
 
 // --- auth middleware ---

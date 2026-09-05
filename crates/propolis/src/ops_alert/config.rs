@@ -24,6 +24,9 @@ pub struct OpsAlertConfig {
     pub stall_for: Duration,
     pub capacity_free_pct: u8,
     pub feed_stale_multiple: u32,
+    /// The operator has installed the public-repo push (`deploy/blocklist-sync.sh` in cron), so
+    /// a feed that has never been pushed is a failure for `feed-push-stale`, not grace.
+    pub feed_push_expected: bool,
     pub vendor_window: Duration,
     pub vendor_fail_pct: u8,
     pub vendor_min_samples: u32,
@@ -153,6 +156,7 @@ pub fn parse_ops_alert(
         stall_for: get_secs(get, "PROPOLIS_OPS_STALL_FOR_SECS", 600, 1)?,
         capacity_free_pct: get_pct(get, "PROPOLIS_OPS_CAPACITY_FREE_PCT", 15)?,
         feed_stale_multiple: get_u32(get, "PROPOLIS_OPS_FEED_STALE_MULTIPLE", 2, 1)?,
+        feed_push_expected: get_bool(get, "PROPOLIS_OPS_FEED_PUSH_EXPECTED", false),
         vendor_window: get_secs(get, "PROPOLIS_OPS_VENDOR_WINDOW_SECS", 3600, 1)?,
         vendor_fail_pct: get_pct(get, "PROPOLIS_OPS_VENDOR_FAIL_PCT", 50)?,
         vendor_min_samples: get_u32(get, "PROPOLIS_OPS_VENDOR_MIN_SAMPLES", 20, 1)?,
@@ -250,6 +254,7 @@ mod tests {
         assert_eq!(cfg.chain_verify_interval, Duration::from_secs(21600));
         assert_eq!(cfg.scan_stale, Duration::from_secs(21600));
         assert_eq!(cfg.fetch_stale, Duration::from_secs(3600));
+        assert!(!cfg.feed_push_expected, "pushing is opt-in to expect");
     }
 
     #[test]

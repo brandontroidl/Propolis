@@ -64,13 +64,19 @@ fn is_push_stale(
     last_published: Option<SystemTime>,
     last_pushed: Option<SystemTime>,
     threshold: Duration,
+    push_expected: bool,
 ) -> bool {
     match (last_published, last_pushed) {
         (Some(published), Some(pushed)) => published
             .duration_since(pushed)
             .map(|lag| lag > threshold)
             .unwrap_or(false),
-        _ => false,
+        // A feed exists and nothing has ever pushed it. Grace unless the operator has declared
+        // that public syncing is expected (`PROPOLIS_OPS_FEED_PUSH_EXPECTED`), in which case a
+        // sync that has never once succeeded is the exact failure this condition exists for, and
+        // the monitor could not otherwise tell it from "syncing is optional".
+        (Some(_), None) => push_expected,
+        (None, _) => false,
     }
 }
 
@@ -111,15 +117,27 @@ impl Condition for FeedPushStale {
             Ok(t) => t,
             Err(why) => return Outcome::Unknown { why },
         };
-        if is_push_stale(last_published, last_pushed, threshold) {
-            Outcome::Firing {
-                severity: Severity::Warning,
-                detail: format!(
+        if is_push_stale(
+            last_published,
+            last_pushed,
+            threshold,
+            ctx.cfg.feed_push_expected,
+        ) {
+            let detail = if last_pushed.is_none() {
+                "public blocklist repo has never been pushed although PROPOLIS_OPS_FEED_PUSH_EXPECTED \
+                 is set - deploy/blocklist-sync.sh has not succeeded once (cron, deploy key?)"
+                    .to_string()
+            } else {
+                format!(
                     "public blocklist repo is over {}s (>= {} build cycles) behind the local \
                      feed - deploy/blocklist-sync.sh has not pushed since the local feed moved on",
                     threshold.as_secs(),
                     ctx.cfg.feed_stale_multiple
-                ),
+                )
+            };
+            Outcome::Firing {
+                severity: Severity::Warning,
+                detail,
             }
         } else {
             Outcome::Ok
@@ -208,7 +226,7 @@ mod tests {
     fn push_lag_past_the_threshold_is_stale() {
         let now = SystemTime::now();
         let pushed = now - Duration::from_secs(700);
-        assert!(is_push_stale(Some(now), Some(pushed), THRESHOLD));
+        assert!(is_push_stale(Some(now), Some(pushed), THRESHOLD, false));
     }
 
     #[test]
@@ -217,7 +235,7 @@ mod tests {
         // the publish by less than the threshold is the normal steady state, not a failed push.
         let now = SystemTime::now();
         let pushed = now - Duration::from_secs(100);
-        assert!(!is_push_stale(Some(now), Some(pushed), THRESHOLD));
+        assert!(!is_push_stale(Some(now), Some(pushed), THRESHOLD, false));
     }
 
     #[test]
@@ -225,14 +243,41 @@ mod tests {
         // A push after the last publish (clock skew, or a by-hand run) is fresh, never negative.
         let now = SystemTime::now();
         let pushed = now + Duration::from_secs(50);
-        assert!(!is_push_stale(Some(now), Some(pushed), THRESHOLD));
+        assert!(!is_push_stale(Some(now), Some(pushed), THRESHOLD, false));
     }
 
     #[test]
     fn no_push_marker_is_grace_not_stale() {
         // Publishing to a public repo is optional; a box that never syncs has nothing to supervise.
-        assert!(!is_push_stale(Some(SystemTime::now()), None, THRESHOLD));
-        assert!(!is_push_stale(None, None, THRESHOLD));
+        assert!(!is_push_stale(
+            Some(SystemTime::now()),
+            None,
+            THRESHOLD,
+            false
+        ));
+        assert!(!is_push_stale(None, None, THRESHOLD, false));
+    }
+
+    #[test]
+    fn no_push_marker_is_stale_when_the_operator_expects_pushes() {
+        // With PROPOLIS_OPS_FEED_PUSH_EXPECTED set, "never pushed" is the failure itself, not
+        // grace - otherwise a cron that never worked is indistinguishable from no cron at all.
+        assert!(is_push_stale(
+            Some(SystemTime::now()),
+            None,
+            THRESHOLD,
+            true
+        ));
+        // But with no local feed published yet there is nothing to have pushed.
+        assert!(!is_push_stale(None, None, THRESHOLD, true));
+        // And an actual push in the normal lag is still fine under the flag.
+        let now = SystemTime::now();
+        assert!(!is_push_stale(
+            Some(now),
+            Some(now - Duration::from_secs(100)),
+            THRESHOLD,
+            true
+        ));
     }
 
     #[test]

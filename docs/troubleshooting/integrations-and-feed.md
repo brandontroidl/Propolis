@@ -142,8 +142,10 @@ from cron on the honeypot node after each atomic feed swap; the crontab entry
 itself is an operator action referenced only by comment - nothing in `deploy/`
 wires it up. With the ops monitor enabled, the `feed-push-stale` condition pages
 when the local feed has moved on from the script's last successful push by more
-than `PROPOLIS_OPS_FEED_STALE_MULTIPLE` build cycles; a box that has never pushed
-is not paged. If the public repo is stale:
+than `PROPOLIS_OPS_FEED_STALE_MULTIPLE` build cycles. A box that has never pushed
+is paged only with `PROPOLIS_OPS_FEED_PUSH_EXPECTED=true`; set it once the cron is
+installed, so a push that has never succeeded is reported rather than read as
+"syncing is optional". If the public repo is stale:
 
 - Confirm the cron entry exists and runs as a user whose SSH agent/key can push.
   The classic failure is cron lacking the push credential; the script always

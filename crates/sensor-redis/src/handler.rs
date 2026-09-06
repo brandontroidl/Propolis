@@ -80,17 +80,24 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid)
 /// argument quoted, e.g. `unknown command 'FoO', with args beginning with: 'a', 'b', `. The old
 /// reply uppercased the name and dropped the args clause entirely, which is a one-probe tell. Args
 /// are sanitized and length-bounded so an attacker-controlled arg cannot break RESP error framing.
-fn unknown_command_error(args: &[String]) -> String {
+fn unknown_command_error(args: &[Vec<u8>]) -> String {
     let mut msg = format!(
         "ERR unknown command '{}', with args beginning with: ",
-        sanitize_value(&args[0], 128)
+        sanitize_value(&text(&args[0]), 128)
     );
     for a in args.iter().skip(1).take(20) {
         msg.push('\'');
-        msg.push_str(&sanitize_value(a, 128));
+        msg.push_str(&sanitize_value(&text(a), 128));
         msg.push_str("', ");
     }
     msg
+}
+
+/// An argument as display text, for matching a command name and for the ledger. Only the
+/// stored value and the key stay bytes; everything written into an event goes through here and
+/// then `sanitize_value`.
+fn text(arg: &[u8]) -> String {
+    String::from_utf8_lossy(arg).into_owned()
 }
 
 /// A fresh 40-hex id, as Redis mints for `run_id` / `master_replid` on every boot.
@@ -257,7 +264,7 @@ pub struct Session {
     authenticated: bool,
     /// Values SET this session, read back by GET, stored whole. Bounded by `MAX_KEYS` entries
     /// and `MAX_STORE_BYTES` in total, so a connection cannot grow the process without limit.
-    keys: HashMap<String, String>,
+    keys: HashMap<Vec<u8>, Vec<u8>>,
     /// Bytes of keys and values currently held, against `MAX_STORE_BYTES`.
     store_bytes: usize,
 }
@@ -321,14 +328,14 @@ impl Session {
     /// matched case-insensitively (real Redis clients send both `PING` and `ping`). Panics if
     /// `args` is empty - the only caller, `RespReader::read_command`'s loop, already filters
     /// empty parses out before returning `ReadOutcome::Command`.
-    pub fn dispatch(&mut self, args: &[String]) -> (Vec<u8>, Vec<SensorEvent>) {
-        let cmd = args[0].to_ascii_uppercase();
+    pub fn dispatch(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
+        let cmd = text(&args[0]).to_ascii_uppercase();
         match cmd.as_str() {
             // Real Redis PING echoes its optional message (as a bulk string) and errors on excess
             // arity; a bare PING is +PONG.
             "PING" => match args.len() {
                 1 => (resp::simple_string("PONG"), vec![]),
-                2 => (resp::bulk_string(&args[1]), vec![]),
+                2 => (resp::bulk_bytes(&args[1]), vec![]),
                 _ => (
                     resp::error_reply("ERR wrong number of arguments for 'ping' command"),
                     vec![],
@@ -350,7 +357,7 @@ impl Session {
     /// in `metadata` or anywhere else: they live only in this call's local `args` slice, owned by
     /// the read loop's per-command buffer, and are dropped when this function returns. Mirrors
     /// sensor-telnet's `_password` / sensor-ssh's `_password` local-binding convention.
-    fn handle_auth(&mut self, args: &[String]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_auth(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
         if args.len() != 2 && args.len() != 3 {
             return (
                 resp::error_reply("ERR wrong number of arguments for 'auth' command"),
@@ -369,14 +376,14 @@ impl Session {
     /// `CONFIG GET ...` / `CONFIG SET ...`. Only these two subcommands are emulated, matching the
     /// design spec's enumerated command set; anything else is refused like a real unrecognized
     /// subcommand would be.
-    fn handle_config(&mut self, args: &[String]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_config(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
         let Some(sub) = args.get(1) else {
             return (
                 resp::error_reply("ERR wrong number of arguments for 'config' command"),
                 vec![],
             );
         };
-        match sub.to_ascii_uppercase().as_str() {
+        match text(sub).to_ascii_uppercase().as_str() {
             "GET" => (canned_config_get(), vec![]),
             "SET" => self.handle_config_set(args),
             other => (
@@ -392,18 +399,18 @@ impl Session {
     /// `SET` a payload and `SAVE`) - see the design spec's "log as indicator (filesystem write
     /// attempt)". Any other param is accepted silently, matching real Redis's own breadth of
     /// harmless `CONFIG SET` targets.
-    fn handle_config_set(&mut self, args: &[String]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_config_set(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
         if args.len() < 4 {
             return (
                 resp::error_reply("ERR wrong number of arguments for 'config|set' command"),
                 vec![],
             );
         }
-        let param_lower = args[2].to_ascii_lowercase();
+        let param_lower = text(&args[2]).to_ascii_lowercase();
         let mut events = Vec::new();
         if param_lower == "dir" || param_lower == "dbfilename" {
-            let param = sanitize_value(&args[2], MAX_METADATA_STRING_LEN);
-            let value = sanitize_value(&args[3], MAX_VALUE_LEN);
+            let param = sanitize_value(&text(&args[2]), MAX_METADATA_STRING_LEN);
+            let value = sanitize_value(&text(&args[3]), MAX_VALUE_LEN);
             events.push(self.build_event(
                 SIGNAL_HONEYPOT_COMMAND_EXEC,
                 self.authenticated,
@@ -418,18 +425,18 @@ impl Session {
         (resp::simple_string("OK"), events)
     }
 
-    /// `SET <key> <value>`. Always replies `+OK` without actually storing anything (see the
-    /// module doc); the key and value are captured as indicators, sanitized through
-    /// `sanitize_value` before they can reach the event record.
-    fn handle_set(&mut self, args: &[String]) -> (Vec<u8>, Vec<SensorEvent>) {
+    /// `SET <key> <value>`: stored for this session (see the module doc); the key and value are
+    /// captured as indicators, sanitized through `sanitize_value` before they can reach the
+    /// event record.
+    fn handle_set(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
         if args.len() < 3 {
             return (
                 resp::error_reply("ERR wrong number of arguments for 'set' command"),
                 vec![],
             );
         }
-        let key = sanitize_value(&args[1], MAX_METADATA_STRING_LEN);
-        let value = sanitize_value(&args[2], MAX_VALUE_LEN);
+        let key = sanitize_value(&text(&args[1]), MAX_METADATA_STRING_LEN);
+        let value = sanitize_value(&text(&args[2]), MAX_VALUE_LEN);
         let event = self.build_event(
             SIGNAL_HONEYPOT_COMMAND_EXEC,
             self.authenticated,
@@ -460,7 +467,7 @@ impl Session {
 
     /// `GET <key>`: the value SET earlier this session, else nil. No event: the design spec lists
     /// an event only for the write side (`SET`), not this read side.
-    fn handle_get(&mut self, args: &[String]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_get(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
         if args.len() != 2 {
             return (
                 resp::error_reply("ERR wrong number of arguments for 'get' command"),
@@ -468,7 +475,7 @@ impl Session {
             );
         }
         let reply = match self.keys.get(&args[1]) {
-            Some(value) => resp::bulk_string(value),
+            Some(value) => resp::bulk_bytes(value),
             None => resp::nil_bulk_string(),
         };
         (reply, vec![])
@@ -478,10 +485,10 @@ impl Session {
     /// Always replies `+OK`; every trailing argument is captured as a sanitized indicator - an
     /// attacker pointing this instance at a host they control is the signal, regardless of the
     /// specific host/port offered.
-    fn handle_replicaof(&mut self, cmd: &str, args: &[String]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_replicaof(&mut self, cmd: &str, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
         let captured_args: Vec<String> = args[1..]
             .iter()
-            .map(|a| sanitize_value(a, MAX_METADATA_STRING_LEN))
+            .map(|a| sanitize_value(&text(a), MAX_METADATA_STRING_LEN))
             .collect();
         let event = self.build_event(
             SIGNAL_HONEYPOT_COMMAND_EXEC,
@@ -499,10 +506,10 @@ impl Session {
     /// runs any Lua (this sensor executes nothing - see the crate-wide `never_exec_static_check`
     /// in `tests/integration.rs`); replies a plausible compile-style error while capturing every
     /// trailing argument (the script body included) as a sanitized indicator.
-    fn handle_eval(&mut self, cmd: &str, args: &[String]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_eval(&mut self, cmd: &str, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
         let captured_args: Vec<String> = args[1..]
             .iter()
-            .map(|a| sanitize_value(a, MAX_VALUE_LEN))
+            .map(|a| sanitize_value(&text(a), MAX_VALUE_LEN))
             .collect();
         let event = self.build_event(
             SIGNAL_HONEYPOT_COMMAND_EXEC,
@@ -576,7 +583,7 @@ pub async fn handle_connection(
 /// Outcome of one [`RespReader::read_command`] call.
 enum ReadOutcome {
     /// One non-empty command, ready to dispatch.
-    Command(Vec<String>),
+    Command(Vec<Vec<u8>>),
     /// The buffered bytes could never be valid RESP - `handle_connection` writes a protocol-error
     /// reply and ends the session.
     ProtocolError,
@@ -652,8 +659,8 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn args(strs: &[&str]) -> Vec<String> {
-        strs.iter().map(|s| s.to_string()).collect()
+    fn args(strs: &[&str]) -> Vec<Vec<u8>> {
+        strs.iter().map(|s| s.as_bytes().to_vec()).collect()
     }
 
     fn metadata_object(event: &SensorEvent) -> &serde_json::Map<String, serde_json::Value> {
@@ -937,6 +944,28 @@ mod tests {
             session.dispatch(&args(&["GET", "big"])).0,
             resp::bulk_string(&big)
         );
+    }
+
+    /// Redis strings are binary-safe. A value that is not UTF-8 reads back byte for byte, and
+    /// two keys that differ only in a non-UTF-8 byte are two keys; decoding arguments as text
+    /// used to return U+FFFD for the value and make the keys collide.
+    #[test]
+    fn non_utf8_values_and_keys_are_kept_as_bytes() {
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let set = |k: &[u8], v: &[u8]| vec![b"SET".to_vec(), k.to_vec(), v.to_vec()];
+        let get = |k: &[u8]| vec![b"GET".to_vec(), k.to_vec()];
+        let (reply, events) = session.dispatch(&set(b"bin", &[0xFF]));
+        assert_eq!(reply, resp::simple_string("OK"));
+        assert_eq!(
+            events[0].metadata.get("value").and_then(|v| v.as_str()),
+            Some("\u{FFFD}"),
+            "the ledger copy is text"
+        );
+        assert_eq!(session.dispatch(&get(b"bin")).0, resp::bulk_bytes(&[0xFF]));
+        session.dispatch(&set(&[0xFF], b"one"));
+        session.dispatch(&set(&[0xFE], b"two"));
+        assert_eq!(session.dispatch(&get(&[0xFF])).0, resp::bulk_string("one"));
+        assert_eq!(session.dispatch(&get(&[0xFE])).0, resp::bulk_string("two"));
     }
 
     #[test]

@@ -11,8 +11,10 @@
 //! ad-hoc `nc`/telnet-style probing use) and the multi-bulk array form
 //! (`*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n` - what the real `redis-cli` and every client library send).
 //! [`parse_command`] recognizes both from the leading byte (`*` selects multi-bulk, anything else
-//! is inline) and returns identical `Vec<String>` args either way, so `handler.rs`'s dispatch
-//! logic never needs to know which form a given command arrived in.
+//! is inline) and returns identical `Vec<Vec<u8>>` args either way, so `handler.rs`'s dispatch
+//! logic never needs to know which form a given command arrived in. Arguments stay raw bytes: a
+//! bulk string is binary-safe in Redis, and decoding it as text here made a value of `FF` read
+//! back as `EF BF BD` and the keys `FF` and `FE` collide.
 //!
 //! **Every bound below rejects on the attacker's *claim* before buffering to match it.** A
 //! multi-bulk count or a bulk string length is checked against its cap the instant it is parsed
@@ -58,7 +60,7 @@ pub enum ParseOutcome {
     /// One full command was parsed. `args` is empty for a blank inline line or a zero/negative
     /// multi-bulk count (both valid RESP, neither naming a command) - `handler.rs`'s read loop
     /// skips these and reads the next command rather than dispatching an empty one.
-    Complete { args: Vec<String>, consumed: usize },
+    Complete { args: Vec<Vec<u8>>, consumed: usize },
 }
 
 /// A structural RESP violation that reading more bytes could never fix (as opposed to
@@ -101,9 +103,10 @@ fn parse_inline(buf: &[u8]) -> Result<ParseOutcome, RespError> {
         nl
     };
     let consumed = nl + 1;
-    let args: Vec<String> = String::from_utf8_lossy(&buf[..line_end])
-        .split_ascii_whitespace()
-        .map(str::to_string)
+    let args: Vec<Vec<u8>> = buf[..line_end]
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(<[u8]>::to_vec)
         .collect();
     Ok(ParseOutcome::Complete { args, consumed })
 }
@@ -175,7 +178,7 @@ fn parse_multibulk(buf: &[u8]) -> Result<ParseOutcome, RespError> {
             ));
         }
 
-        args.push(String::from_utf8_lossy(&buf[data_start..data_end]).into_owned());
+        args.push(buf[data_start..data_end].to_vec());
         cursor = term_end;
     }
 
@@ -219,8 +222,14 @@ pub fn error_reply(s: &str) -> Vec<u8> {
 /// Encode a RESP bulk string: `$<len>\r\n<s>\r\n`, length-prefixed in bytes (not chars), so this is
 /// correct for any UTF-8 `s` including multi-byte characters.
 pub fn bulk_string(s: &str) -> Vec<u8> {
-    let mut out = format!("${}\r\n", s.len()).into_bytes();
-    out.extend_from_slice(s.as_bytes());
+    bulk_bytes(s.as_bytes())
+}
+
+/// Encode a RESP bulk string from raw bytes: what `GET` returns, so a value SET as arbitrary
+/// bytes reads back byte for byte.
+pub fn bulk_bytes(data: &[u8]) -> Vec<u8> {
+    let mut out = format!("${}\r\n", data.len()).into_bytes();
+    out.extend_from_slice(data);
     out.extend_from_slice(b"\r\n");
     out
 }
@@ -274,6 +283,11 @@ mod tests {
     }
 
     #[test]
+    fn bulk_bytes_encodes_arbitrary_bytes_verbatim() {
+        assert_eq!(bulk_bytes(&[0xFF, 0x00, 0xFE]), b"$3\r\n\xFF\x00\xFE\r\n");
+    }
+
+    #[test]
     fn bulk_string_length_is_byte_length_not_char_count() {
         // "café" is 4 chars but 5 bytes (é is 2 bytes in UTF-8).
         assert_eq!(bulk_string("café"), "$5\r\ncafé\r\n".as_bytes());
@@ -311,7 +325,7 @@ mod tests {
         assert_eq!(
             parse_command(b"PING\r\n").unwrap(),
             ParseOutcome::Complete {
-                args: vec!["PING".to_string()],
+                args: vec![b"PING".to_vec()],
                 consumed: 6,
             }
         );
@@ -323,7 +337,7 @@ mod tests {
         assert_eq!(
             parse_command(b"PING\n").unwrap(),
             ParseOutcome::Complete {
-                args: vec!["PING".to_string()],
+                args: vec![b"PING".to_vec()],
                 consumed: 5,
             }
         );
@@ -336,7 +350,7 @@ mod tests {
         assert_eq!(
             outcome,
             ParseOutcome::Complete {
-                args: vec!["SET".to_string(), "foo".to_string(), "bar".to_string()],
+                args: vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()],
                 consumed: buf.len(),
             }
         );
@@ -370,12 +384,12 @@ mod tests {
         let ParseOutcome::Complete { args, consumed } = parse_command(buf).unwrap() else {
             panic!("expected Complete");
         };
-        assert_eq!(args, vec!["PING".to_string()]);
+        assert_eq!(args, vec![b"PING".to_vec()]);
         assert_eq!(consumed, 6);
         assert_eq!(
             parse_command(&buf[consumed..]).unwrap(),
             ParseOutcome::Complete {
-                args: vec!["PING".to_string()],
+                args: vec![b"PING".to_vec()],
                 consumed: 6,
             }
         );
@@ -390,7 +404,7 @@ mod tests {
         assert_eq!(
             parse_command(b"*1\r\n$4\r\nPING\r\n").unwrap(),
             ParseOutcome::Complete {
-                args: vec!["PING".to_string()],
+                args: vec![b"PING".to_vec()],
                 consumed: 14,
             }
         );
@@ -402,7 +416,7 @@ mod tests {
         assert_eq!(
             parse_command(buf).unwrap(),
             ParseOutcome::Complete {
-                args: vec!["GET".to_string(), "key".to_string()],
+                args: vec![b"GET".to_vec(), b"key".to_vec()],
                 consumed: buf.len(),
             }
         );
@@ -528,22 +542,26 @@ mod tests {
         assert_eq!(
             parse_command(buf).unwrap(),
             ParseOutcome::Complete {
-                args: vec!["SET".to_string(), "foo".to_string(), "bar".to_string()],
+                args: vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()],
                 consumed: buf.len(),
             }
         );
     }
 
     #[test]
-    fn parse_multibulk_binary_unsafe_bytes_lossy_decoded_without_panic() {
-        // Declared length 2, but the two bytes are not valid UTF-8 on their own. Must not panic -
-        // lossy decoding is fine, this crate's sanitize_value chokepoint runs on the result before
-        // it can ever reach an event anyway.
+    fn parse_multibulk_keeps_non_utf8_bytes_verbatim() {
+        // Declared length 2, bytes that are not UTF-8. They come out exactly as sent: decoding
+        // them as text turned every such byte into U+FFFD, so distinct keys collided.
         let mut buf = b"*1\r\n$2\r\n".to_vec();
         buf.extend_from_slice(&[0xFF, 0xFE]);
         buf.extend_from_slice(b"\r\n");
-        let outcome = parse_command(&buf).unwrap();
-        assert!(matches!(outcome, ParseOutcome::Complete { .. }));
+        assert_eq!(
+            parse_command(&buf).unwrap(),
+            ParseOutcome::Complete {
+                args: vec![vec![0xFF, 0xFE]],
+                consumed: buf.len(),
+            }
+        );
     }
 
     #[test]
@@ -556,7 +574,7 @@ mod tests {
         assert_eq!(
             parse_command(&buf[consumed..]).unwrap(),
             ParseOutcome::Complete {
-                args: vec!["PING".to_string()],
+                args: vec![b"PING".to_vec()],
                 consumed: 14,
             }
         );

@@ -55,10 +55,16 @@ async fn read_events(log_path: &std::path::Path) -> Vec<sensor_wire::SensorEvent
 /// Encode and send one command as a RESP multi-bulk array - what a real `redis-cli`/client
 /// library sends.
 async fn send_multibulk(conn: &mut TcpStream, parts: &[&str]) {
+    let bytes: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();
+    send_multibulk_bytes(conn, &bytes).await;
+}
+
+/// Same as [`send_multibulk`] with raw bytes: a bulk string is binary-safe.
+async fn send_multibulk_bytes(conn: &mut TcpStream, parts: &[&[u8]]) {
     let mut buf = format!("*{}\r\n", parts.len()).into_bytes();
     for p in parts {
         buf.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
-        buf.extend_from_slice(p.as_bytes());
+        buf.extend_from_slice(p);
         buf.extend_from_slice(b"\r\n");
     }
     conn.write_all(&buf).await.unwrap();
@@ -178,6 +184,36 @@ async fn set_get_responses_correct() {
         set_event.metadata.get("value").and_then(|v| v.as_str()),
         Some("bar")
     );
+}
+
+/// A value that is not UTF-8 reads back byte for byte and keys differing only in such a byte
+/// stay distinct: the parser used to decode bulk strings as text on the way in.
+#[tokio::test]
+async fn set_get_round_trips_non_utf8_bytes() {
+    let (addr, _log_path, handle, _dir) = start_server().await;
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+
+    send_multibulk_bytes(&mut conn, &[b"SET", b"bin", &[0xFF]]).await;
+    read_until_contains(&mut conn, b"+OK\r\n").await;
+    send_multibulk_bytes(&mut conn, &[b"GET", b"bin"]).await;
+    let reply = read_until_contains(&mut conn, b"$1\r\n\xFF\r\n").await;
+    assert_eq!(reply, b"$1\r\n\xFF\r\n");
+
+    send_multibulk_bytes(&mut conn, &[b"SET", &[0xFF], b"one"]).await;
+    read_until_contains(&mut conn, b"+OK\r\n").await;
+    send_multibulk_bytes(&mut conn, &[b"SET", &[0xFE], b"two"]).await;
+    read_until_contains(&mut conn, b"+OK\r\n").await;
+    send_multibulk_bytes(&mut conn, &[b"GET", &[0xFF]]).await;
+    assert_eq!(
+        read_until_contains(&mut conn, b"$3\r\none\r\n").await,
+        b"$3\r\none\r\n"
+    );
+    send_multibulk_bytes(&mut conn, &[b"GET", &[0xFE]]).await;
+    assert_eq!(
+        read_until_contains(&mut conn, b"$3\r\ntwo\r\n").await,
+        b"$3\r\ntwo\r\n"
+    );
+    handle.abort();
 }
 
 #[tokio::test]

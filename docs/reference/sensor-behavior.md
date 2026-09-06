@@ -337,8 +337,10 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
 
 Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
 
-- **Behavior** (`handler.rs`): parses RESP (inline and multi-bulk). **Never
-  authenticates or persists.** Commands (`:305-327`): PING (echoes arg), AUTH
+- **Behavior** (`handler.rs`): parses RESP (inline and multi-bulk); arguments are kept
+  as raw bytes, so a binary key or value round-trips byte for byte and only the ledger copy
+  is decoded as text. **Never authenticates or persists across connections.** Commands
+  (`:305-327`): PING (echoes arg), AUTH
   (always OK → `honeypot_login_attempt`, password never in metadata), INFO
   (live-ish 7.2.4 dump with per-process random `run_id`/`master_replid`, real pid,
   advancing uptime, persona OS line, `:107-230`), CONFIG GET (canned), CONFIG SET

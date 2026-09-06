@@ -2044,6 +2044,134 @@ async fn detail_malware_panel_marks_an_incomplete_upload(pool: PgPool) {
     );
 }
 
+/// `fetch_attempt` credits a URL to its first reporter, so a later attacker fetching the same URL
+/// had a page reading "no samples linked" while the capture and its verdict sat under another
+/// address. The URL panel joins by URL: the later attacker sees the dated capture, a failed fetch
+/// with its reason, and an ftp URL as unsupported rather than silently absent.
+#[sqlx::test(migrations = false)]
+async fn detail_url_panel_links_each_observed_url_to_its_outcome(pool: PgPool) {
+    migrate(&pool).await;
+    let first = "203.0.113.90";
+    let later = "203.0.113.91";
+    seed_recommended(&pool, first, 60).await;
+    seed_recommended(&pool, later, 60).await;
+
+    // The first reporter's fetch succeeded and was scanned.
+    let captured_url = "http://198.51.100.9/bins/x86";
+    let sha256_hex = format!("{:064x}", 0xfeed_u64);
+    sqlx::query(
+        "INSERT INTO fetch_attempt \
+            (url_hash, url, host, scheme, pinned_ip, source_ip, status, sha256, bytes, attempts, \
+             first_seen, last_attempt) \
+         VALUES (sha256(convert_to($1, 'UTF8')), $1, '198.51.100.9', 'http', '198.51.100.9', \
+                 $2::inet, 'success', $3, 306, 1, now() - interval '3 days', \
+                 now() - interval '3 days')",
+    )
+    .bind(captured_url)
+    .bind(first)
+    .bind(hex::decode(&sha256_hex).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sample_analysis (sha256, detected, total, vt_link, analyzed_at) \
+         VALUES ($1, 7, 61, $2, now())",
+    )
+    .bind(&sha256_hex)
+    .bind(format!("https://www.virustotal.com/gui/file/{sha256_hex}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // A tftp URL the fetcher gave up on.
+    let dead_url = "tftp://198.51.100.10/x86";
+    sqlx::query(
+        "INSERT INTO fetch_attempt \
+            (url_hash, url, host, scheme, source_ip, status, attempts, last_attempt) \
+         VALUES (sha256(convert_to($1, 'UTF8')), $1, '198.51.100.10', 'tftp', $2::inet, 'dead', \
+                 4, now())",
+    )
+    .bind(dead_url)
+    .bind(later)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ftp_url = "ftp://198.51.100.11/x86";
+    for url in [captured_url, dead_url, ftp_url] {
+        append_event(
+            &pool,
+            ev_with_session(
+                later,
+                "telnet",
+                SignalType::HoneypotFileDownload,
+                Protocol::Tcp,
+                true,
+                &chrono::Utc::now().to_rfc3339(),
+                serde_json::json!({ "url": url }),
+                Uuid::now_v7(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{later}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let start = body
+        .find("URLs this IP tried to fetch")
+        .expect("url panel heading must render");
+    let panel = &body[start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    let row_of = |needle: &str| {
+        let at = panel
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} row: {panel}"));
+        let row_start = panel[..at].rfind("<tr").unwrap_or(0);
+        let row_end = at + panel[at..].find("</tr>").unwrap_or(0);
+        &panel[row_start..row_end]
+    };
+    // minijinja escapes `/` in cell text, so rows are located by their host.
+    let captured = row_of("198.51.100.9&#x2f;bins");
+    assert!(
+        captured.contains("captured 20"),
+        "dated capture: {captured}"
+    );
+    assert!(
+        captured.contains(&format!("/ip/{first}")),
+        "credited to the first reporter: {captured}"
+    );
+    assert!(captured.contains("7/61 detected"), "{captured}");
+    assert!(captured.contains(&sha256_hex[..12]), "{captured}");
+    let dead = row_of("198.51.100.10&#x2f;x86");
+    assert!(dead.contains("dead"), "failed with its status: {dead}");
+    assert!(
+        !dead.contains("/ip/"),
+        "queued by this address, no cross-link: {dead}"
+    );
+    let ftp = row_of("198.51.100.11&#x2f;x86");
+    assert!(
+        ftp.contains("unsupported scheme (ftp)"),
+        "ftp is outside the fetcher by design: {ftp}"
+    );
+    // The first-reporter panel above still does not credit the later address with the sample.
+    let malware_start = body.find("Malware from this IP").unwrap();
+    let malware = &body[malware_start..start];
+    assert!(
+        !malware.contains(&sha256_hex[..12]),
+        "the first-reporter panel still credits the capture to the first reporter only: {malware}"
+    );
+}
+
 /// A sample uploaded to VirusTotal but not yet verdicted is stored as `-1/-1`. The samples page
 /// already rendered that as "pending"; the IP page fell through to the clean branch and showed a
 /// green "clean (0/-1)" for a sample nobody has judged yet.

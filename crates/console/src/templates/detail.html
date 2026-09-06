@@ -155,6 +155,50 @@
   {% endif %}
 </div>
 
+{# Every URL this IP asked a shell to fetch, joined to the fetcher's record BY URL. The panel above
+   credits a capture to the first reporter only; this one shows a later attacker's URL with the
+   capture it already produced, dated, because the URL may serve different bytes today. #}
+<div class="panel">
+  <div class="panel-head">URLs this IP tried to fetch <span class="dim">what the fetcher did with each, whoever reported it first</span></div>
+  {% if urls %}
+  <table class="table-compact">
+    <thead><tr><th>URL</th><th>Seen</th><th>Outcome</th><th>Queued by</th><th>Sample</th><th>VirusTotal</th></tr></thead>
+    <tbody>
+      {% for u in urls %}
+      <tr>
+        <td class="mono" style="max-width:24rem;overflow-wrap:anywhere;">{{ u.url }}</td>
+        <td class="seen">{{ u.seen_count }}&times; <span class="dim">{{ u.first_seen }}{% if u.last_seen != u.first_seen %} to {{ u.last_seen }}{% endif %}</span></td>
+        <td>
+          {% if u.kind == "captured" %}<span class="state-pill state-rejected">{{ u.outcome }}</span>
+          {% elif u.kind == "failed" or u.kind == "pending" %}<span class="state-pill state-snoozed">{{ u.outcome }}</span>
+          {% else %}<span class="dim">{{ u.outcome }}</span>{% endif %}
+        </td>
+        <td class="mono">{% if u.first_reporter %}<a href="/ip/{{ u.first_reporter }}">{{ u.first_reporter }}</a> <span class="dim">{{ u.queued_at }}</span>{% elif u.queued_at %}<span class="dim">this address, {{ u.queued_at }}</span>{% else %}<span class="dim">-</span>{% endif %}</td>
+        <td class="mono">{% if u.sha256_short %}<span title="{{ u.sha256 }}">{{ u.sha256_short }}...</span>{% if u.bytes %} <span class="dim">{{ u.bytes }}</span>{% endif %}{% else %}<span class="dim">-</span>{% endif %}</td>
+        <td>
+          {% if u.detected is defined and u.detected is not none %}
+            {% if u.detected > 0 %}
+            <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-rejected">{{ u.detected }}/{{ u.total }} detected</a>
+            {% elif u.detected < 0 %}
+            <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-snoozed">pending VT analysis</a>
+            {% else %}
+            <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved">clean (0/{{ u.total }})</a>
+            {% endif %}
+          {% elif u.sha256_short %}
+            <span class="state-pill state-snoozed">not yet scanned</span>
+          {% else %}
+            <span class="dim">-</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">no download attempts from this address</p>
+  {% endif %}
+</div>
+
 <div class="panel">
   <div class="panel-head panel-head--blue">
     Activity

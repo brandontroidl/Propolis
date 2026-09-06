@@ -21,6 +21,11 @@
 //!   / "download URL" / "VT-scanned sample" that today read as three unrelated things share one
 //!   panel (`fetch_malware_rows`'s doc comment covers the type-mismatched join and the
 //!   first-reporter-only attribution caveat this carries).
+//! - every URL this IP told a shell to fetch, with what became of it: `honeypot_file_download`
+//!   events joined to `fetch_attempt` by URL rather than by reporter, so a URL another address
+//!   reported first (and whose capture the panel above therefore never shows) is still linked to
+//!   its existing result, dated, or shown as failed (with the reason) or unsupported
+//!   (`fetch_url_rows`).
 //!
 //! An IP with no `ip_score` row renders 404, matching the design's "Error handling": "Missing IP
 //! ... returns 404." That is a normal, expected outcome (an operator following a stale link, or
@@ -219,6 +224,30 @@ struct MalwareRow {
     analyzed_at: Option<String>,
 }
 
+/// One URL this IP asked a shell to fetch, with the fetcher's outcome for that URL whoever
+/// reported it first - see `fetch_url_rows`.
+#[derive(Debug, Serialize)]
+struct UrlRow {
+    url: String,
+    /// How many `honeypot_file_download` events from this IP named the URL, and when.
+    seen_count: i64,
+    first_seen: String,
+    last_seen: String,
+    /// `captured`, `failed`, `pending`, `unsupported` or `unqueued`: drives the pill style.
+    kind: String,
+    /// The outcome as text, dated where a fetch happened.
+    outcome: String,
+    /// The address whose report queued the URL, when it was not this one, and when.
+    first_reporter: Option<String>,
+    queued_at: Option<String>,
+    bytes: Option<String>,
+    sha256: Option<String>,
+    sha256_short: Option<String>,
+    detected: Option<i32>,
+    total: Option<i32>,
+    vt_link: Option<String>,
+}
+
 /// An operator-initiated external lookup link. The operator's browser makes the request, never the
 /// honeypot, so the box never leaks which addresses it has captured (egress-free enrichment).
 #[derive(Debug, Serialize)]
@@ -344,6 +373,7 @@ async fn detail(
     }
 
     let malware = fetch_malware_rows(&state.db, ip).await?;
+    let urls = fetch_url_rows(&state.db, ip).await?;
 
     let external_links = external_lookup_links(ip);
 
@@ -442,6 +472,7 @@ async fn detail(
         submissions,
         services,
         malware,
+        urls,
         external_links,
         geo,
         rdns,
@@ -819,6 +850,96 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
         });
     }
     Ok(malware)
+}
+
+/// Every URL this IP told a shell to fetch, one row per distinct URL, joined to the fetcher's
+/// record of that URL by the URL itself (`fetch_attempt.url_hash` is `sha256(trim(url))`, see
+/// `review::fetcher::store::url_hash`), not by reporter. `fetch_attempt` keeps one row per URL
+/// and credits it to the first address that reported it, so the panel above cannot show a later
+/// attacker the capture its own URL already produced; this one can, with the capture's date, since
+/// the URL may not serve the same bytes today. A URL with no row is either one the fetcher never
+/// handles (an `ftp://` target, by design) or one that was never queued.
+async fn fetch_url_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<UrlRow>, AppError> {
+    let rows = sqlx::query(
+        "SELECT u.url, u.seen_count, u.first_seen, u.last_seen, \
+                fa.status, fa.reject_reason, fa.attempts, fa.last_attempt, \
+                fa.first_seen AS queued_at, host(fa.source_ip) AS reporter, fa.bytes, \
+                encode(fa.sha256, 'hex') AS sha256_hex, \
+                sa.detected, sa.total, sa.vt_link \
+         FROM (SELECT btrim(e.metadata->>'url') AS url, count(*) AS seen_count, \
+                      min(e.observed_at) AS first_seen, max(e.observed_at) AS last_seen \
+               FROM event e \
+               WHERE e.source_ip = $1::inet \
+                 AND e.signal_type = 'honeypot_file_download' \
+                 AND e.metadata->>'url' IS NOT NULL \
+               GROUP BY btrim(e.metadata->>'url')) u \
+         LEFT JOIN fetch_attempt fa ON fa.url_hash = sha256(convert_to(u.url, 'UTF8')) \
+         LEFT JOIN sample_analysis sa ON encode(fa.sha256, 'hex') = sa.sha256 \
+         ORDER BY u.last_seen DESC LIMIT $2",
+    )
+    .bind(ip.to_string())
+    .bind(MALWARE_PAGE_SIZE)
+    .fetch_all(db)
+    .await?;
+
+    let this_ip = ip.to_string();
+    let mut urls = Vec::with_capacity(rows.len());
+    for row in rows {
+        let url: String = row.try_get("url")?;
+        let status: Option<String> = row.try_get("status")?;
+        let reject_reason: Option<String> = row.try_get("reject_reason")?;
+        let attempts: Option<i32> = row.try_get("attempts")?;
+        let last_attempt: Option<DateTime<Utc>> = row.try_get("last_attempt")?;
+        let queued_at: Option<DateTime<Utc>> = row.try_get("queued_at")?;
+        let reporter: Option<String> = row.try_get("reporter")?;
+        let bytes: Option<i32> = row.try_get("bytes")?;
+        let sha256_hex: Option<String> = row.try_get("sha256_hex")?;
+        let first_seen: DateTime<Utc> = row.try_get("first_seen")?;
+        let last_seen: DateTime<Utc> = row.try_get("last_seen")?;
+
+        let attempted = last_attempt.map(format_timestamp).unwrap_or_default();
+        let (kind, outcome) = match status.as_deref() {
+            None => {
+                if review::fetcher::store::parse_url_parts(&url).is_some() {
+                    ("unqueued", "not queued".to_string())
+                } else {
+                    let scheme = url.split("://").next().unwrap_or("").to_ascii_lowercase();
+                    ("unsupported", format!("unsupported scheme ({scheme})"))
+                }
+            }
+            Some("success") => ("captured", format!("captured {attempted}")),
+            Some("pending") => (
+                "pending",
+                format!("pending ({} attempts)", attempts.unwrap_or(0)),
+            ),
+            Some(other) => {
+                let reason = reject_reason
+                    .as_deref()
+                    .map(|r| format!(": {r}"))
+                    .unwrap_or_default();
+                ("failed", format!("{other}{reason} {attempted}"))
+            }
+        };
+        urls.push(UrlRow {
+            url,
+            seen_count: row.try_get("seen_count")?,
+            first_seen: format_timestamp(first_seen),
+            last_seen: format_timestamp(last_seen),
+            kind: kind.to_string(),
+            outcome,
+            first_reporter: reporter.filter(|r| *r != this_ip),
+            queued_at: queued_at.map(format_timestamp),
+            bytes: bytes.map(|b| format_bytes(b.max(0) as u64)),
+            sha256_short: sha256_hex
+                .as_ref()
+                .map(|s| s[..s.len().min(12)].to_string()),
+            sha256: sha256_hex,
+            detected: row.try_get("detected")?,
+            total: row.try_get("total")?,
+            vt_link: row.try_get("vt_link")?,
+        });
+    }
+    Ok(urls)
 }
 
 /// Parses a `?cursor=<observed_at>,<id>` value (`format_cursor`'s own output - see that function's

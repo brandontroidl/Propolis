@@ -344,8 +344,9 @@ Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
   advancing uptime, persona OS line, `:107-230`), CONFIG GET (canned), CONFIG SET
   (always OK; only `dir`/`dbfilename` - the RDB-RCE staging primitive - emit a
   `honeypot_command_exec` indicator, `:376-400`), SET (OK; key and value captured,
-  and kept in a per-session store capped at 256 keys), GET (the value SET earlier this
-  session, else nil; no event), SLAVEOF/REPLICAOF (OK +
+  and kept whole in a per-session store of at most 256 keys and 1 MB; a write past either
+  limit is refused with Redis's OOM error rather than acknowledged and dropped), GET (the
+  value SET earlier this session, else nil; no event), SLAVEOF/REPLICAOF (OK +
   captured args), EVAL/SCRIPT (canned compile error + captured args, **never runs
   Lua**), unknown → Redis-exact error. Caps: metadata string 255, value 1024.
 - **Bounds:** common defaults, `max_concurrent` 256. No spool.
@@ -365,8 +366,10 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
   LOGIN (username captured, password dropped), MAIL FROM / RCPT TO, DATA (captures
   mail_from/rcpt_to/subject/body_size → `honeypot_command_exec`, replies with a
   Postfix queue id), BDAT `<size> [LAST]` (CHUNKING: raw chunks accumulate until LAST,
-  then the same message event with `chunking: true`), RSET, NOOP, QUIT, VRFY (252),
-  EXPN (502), unknown→502. Caps: line 8192, message body 65536, username 255.
+  then the same message event with `chunking: true`; a chunk the client does not finish
+  sending is neither acknowledged nor recorded), RSET, NOOP, QUIT, VRFY (252), EXPN (502),
+  unknown→502. Caps: line 8192, username 255; a message body is kept up to 65536 bytes and
+  the event records the full `body_size` received plus `truncated` when it was cut.
 - **Bounds:** common defaults, `max_concurrent` 256. **Bound parsing falls back to
   the default on invalid/zero input rather than refusing to start**
   (`main.rs:28-38`) - differs from the reject-on-zero sensors. No spool (message

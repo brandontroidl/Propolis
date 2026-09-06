@@ -77,8 +77,10 @@ pub async fn handle_connection(
     let mut mail_from = String::new();
     let mut rcpt_to = Vec::new();
     let mut total_read: u64 = 0;
-    // Message body accumulated across BDAT chunks until the LAST one arrives.
+    // Message body accumulated across BDAT chunks until the LAST one arrives, and the bytes the
+    // client sent for it (the body stops growing at MAX_DATA_BODY; the count does not).
     let mut bdat_body = String::new();
+    let mut bdat_received: usize = 0;
 
     loop {
         let Some(line) = read_line_bounded(&mut reader, &bounds, &mut total_read).await else {
@@ -140,13 +142,14 @@ pub async fn handle_connection(
             let _ = write_reply(&mut reader, b"250 2.1.5 Ok\r\n").await;
         } else if upper == "DATA" {
             let _ = write_reply(&mut reader, b"354 End data with <CR><LF>.<CR><LF>\r\n").await;
-            let body = read_data_body(&mut reader, &bounds, &mut total_read).await;
+            let (body, received) = read_data_body(&mut reader, &bounds, &mut total_read).await;
             let subject = extract_header(&body, "Subject");
             let msg = ReceivedMessage {
                 mail_from: &mail_from,
                 rcpt_to: &rcpt_to,
                 subject: &subject,
-                body_size: body.len(),
+                body_size: received,
+                truncated: received > body.len(),
                 chunking: false,
             };
             let _ = emitter
@@ -172,23 +175,30 @@ pub async fn handle_connection(
                     .await;
                 }
                 Some(size) => {
-                    let chunk = read_raw_chunk(&mut reader, size, &bounds, &mut total_read).await;
-                    if bdat_body.len() + chunk.len() < MAX_DATA_BODY {
-                        bdat_body.push_str(&chunk);
-                    }
+                    // A chunk that never fully arrived is neither acknowledged nor recorded:
+                    // the client hung up mid-transfer, and the session ends as a real one would.
+                    let Some(chunk) =
+                        read_raw_chunk(&mut reader, size, &bounds, &mut total_read).await
+                    else {
+                        return;
+                    };
+                    bdat_received += chunk.len();
+                    append_bounded(&mut bdat_body, &chunk);
                     if last {
                         let subject = extract_header(&bdat_body, "Subject");
                         let msg = ReceivedMessage {
                             mail_from: &mail_from,
                             rcpt_to: &rcpt_to,
                             subject: &subject,
-                            body_size: bdat_body.len(),
+                            body_size: bdat_received,
+                            truncated: bdat_received > bdat_body.len(),
                             chunking: true,
                         };
                         let _ = emitter
                             .append(&data_event(source_ip, wan_ip, &msg, session_id))
                             .await;
                         bdat_body.clear();
+                        bdat_received = 0;
                         let reply = format!("250 2.0.0 Ok: queued as {}\r\n", queue_id());
                         let _ = write_reply(&mut reader, reply.as_bytes()).await;
                     } else {
@@ -201,6 +211,7 @@ pub async fn handle_connection(
             mail_from.clear();
             rcpt_to.clear();
             bdat_body.clear();
+            bdat_received = 0;
             let _ = write_reply(&mut reader, b"250 2.0.0 Ok\r\n").await;
         } else if upper.starts_with("NOOP") {
             let _ = write_reply(&mut reader, b"250 2.0.0 Ok\r\n").await;
@@ -268,7 +279,10 @@ struct ReceivedMessage<'a> {
     mail_from: &'a str,
     rcpt_to: &'a [String],
     subject: &'a str,
+    /// Bytes the client sent as the body, whether or not all of it was kept.
     body_size: usize,
+    /// The kept body is shorter than `body_size`: the message ran past `MAX_DATA_BODY`.
+    truncated: bool,
     /// Delivered with BDAT (CHUNKING) rather than DATA.
     chunking: bool,
 }
@@ -284,6 +298,7 @@ fn data_event(
         rcpt_to,
         subject,
         body_size,
+        truncated,
         chunking,
     } = *msg;
     SensorEvent {
@@ -305,6 +320,7 @@ fn data_event(
             "rcpt_to": rcpt_to.iter().map(|r| sanitize_value(r, 255)).collect::<Vec<_>>(),
             "subject": sanitize_value(subject, 512),
             "body_size": body_size,
+            "truncated": truncated,
             "chunking": chunking,
         }),
         sample: None,
@@ -434,39 +450,57 @@ async fn read_line_bounded(
 }
 
 /// Read exactly `size` raw octets of a BDAT chunk, never more than the session's remaining
-/// capture budget. A chunk larger than the budget is cut at the budget; the unread remainder then
-/// reads as garbage commands and the budget check ends the session, the same end an oversized
-/// DATA body meets.
+/// capture budget. `None` when the client sent fewer than it declared (it closed, or went quiet
+/// past the idle timeout) or the budget is spent: an incomplete chunk is not a message, and it
+/// must not be acknowledged as one. A chunk larger than the budget is cut at the budget; the
+/// unread remainder then reads as garbage commands and the budget check ends the session.
 async fn read_raw_chunk(
     reader: &mut BufReader<TcpStream>,
     size: u64,
     bounds: &ConnectionBounds,
     total: &mut u64,
-) -> String {
+) -> Option<String> {
     let remaining = bounds.max_captured_bytes.saturating_sub(*total);
     let want = size.min(remaining) as usize;
     if want == 0 {
-        return String::new();
+        return None;
     }
     let mut buf = vec![0u8; want];
     match tokio::time::timeout(bounds.idle_timeout, reader.read_exact(&mut buf)).await {
         Ok(Ok(_)) => {
             *total += want as u64;
-            String::from_utf8_lossy(&buf).into_owned()
+            Some(String::from_utf8_lossy(&buf).into_owned())
         }
         _ => {
             *total = bounds.max_captured_bytes;
-            String::new()
+            None
         }
     }
 }
 
+/// Append `text` to `body` up to `MAX_DATA_BODY` bytes, on a character boundary. Returns how many
+/// bytes were actually kept, so the caller can record the true received size beside it.
+fn append_bounded(body: &mut String, text: &str) -> usize {
+    let mut kept = 0;
+    for c in text.chars() {
+        if body.len() + c.len_utf8() > MAX_DATA_BODY {
+            break;
+        }
+        body.push(c);
+        kept += c.len_utf8();
+    }
+    kept
+}
+
+/// The message body up to `MAX_DATA_BODY` bytes, and the number of body bytes the client sent,
+/// which keeps counting after the body stops growing so the event can say the body was cut.
 async fn read_data_body(
     reader: &mut BufReader<TcpStream>,
     bounds: &ConnectionBounds,
     total: &mut u64,
-) -> String {
+) -> (String, usize) {
     let mut body = String::new();
+    let mut received = 0usize;
     loop {
         let Some(line) = read_line_bounded(reader, bounds, total).await else {
             break;
@@ -476,12 +510,11 @@ async fn read_data_body(
         }
         // Dot-stuffing: a line starting with "." has the leading dot removed
         let actual = line.strip_prefix('.').unwrap_or(&line);
-        if body.len() + actual.len() < MAX_DATA_BODY {
-            body.push_str(actual);
-            body.push('\n');
-        }
+        received += actual.len() + 1;
+        append_bounded(&mut body, actual);
+        append_bounded(&mut body, "\n");
     }
-    body
+    (body, received)
 }
 
 #[cfg(test)]

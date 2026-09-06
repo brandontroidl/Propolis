@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{ConnectionBounds, WanResolver};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
@@ -303,6 +303,92 @@ async fn bdat_last_delivers_the_message_and_is_captured() {
         Some(true)
     );
     srv.handle.abort();
+}
+
+/// A client that declares a chunk and hangs up part way through has not delivered a message.
+/// The sensor used to answer "queued" and record a body of zero bytes.
+#[tokio::test]
+async fn bdat_short_chunk_is_neither_acknowledged_nor_recorded() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let _ = client.send("MAIL FROM:<a@evil.com>").await;
+    let _ = client.send("RCPT TO:<b@example.com>").await;
+    client
+        .reader
+        .get_mut()
+        .write_all(b"BDAT 100 LAST\r\nabc")
+        .await
+        .unwrap();
+    // Close our sending side; the server sees EOF inside the chunk.
+    client.reader.get_mut().shutdown().await.unwrap();
+    let mut rest = String::new();
+    let got = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.reader.read_to_string(&mut rest),
+    )
+    .await;
+    assert!(
+        got.is_ok() && !rest.contains("250"),
+        "no acknowledgement for a chunk that never fully arrived: {rest:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.metadata.get("command").and_then(|v| v.as_str()) == Some("DATA")),
+        "no message event for an incomplete chunk: {events:?}"
+    );
+    srv.handle.abort();
+}
+
+/// A body exactly at the cap is kept whole; one past the cap is kept up to the cap and the
+/// event records the real size with `truncated`, instead of a body of zero bytes.
+#[tokio::test]
+async fn bdat_body_at_and_past_the_cap_is_recorded_honestly() {
+    for (size, expect_truncated) in [(65_536usize, false), (70_000usize, true)] {
+        let srv = TestServer::start().await;
+        let mut client = SmtpClient::connect(srv.addr).await;
+        client.ehlo().await;
+        let _ = client.send("MAIL FROM:<a@evil.com>").await;
+        let _ = client.send("RCPT TO:<b@example.com>").await;
+        let body = vec![b'x'; size];
+        client
+            .reader
+            .get_mut()
+            .write_all(format!("BDAT {size} LAST\r\n").as_bytes())
+            .await
+            .unwrap();
+        client.reader.get_mut().write_all(&body).await.unwrap();
+        let r = client.read_reply().await;
+        assert!(r.contains("queued as"), "{r}");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let events = srv.events().await;
+        let data_event = events
+            .iter()
+            .find(|e| e.metadata.get("command").and_then(|v| v.as_str()) == Some("DATA"))
+            .unwrap();
+        assert_eq!(
+            data_event
+                .metadata
+                .get("body_size")
+                .and_then(|v| v.as_u64()),
+            Some(size as u64),
+            "body_size is what the client sent"
+        );
+        assert_eq!(
+            data_event
+                .metadata
+                .get("truncated")
+                .and_then(|v| v.as_bool()),
+            Some(expect_truncated),
+            "size {size}"
+        );
+        srv.handle.abort();
+    }
 }
 
 #[tokio::test]

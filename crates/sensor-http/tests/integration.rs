@@ -172,6 +172,124 @@ async fn post_body_captured() {
     srv.handle.abort();
 }
 
+/// A declared body over nginx's default `client_max_body_size` (1 MB) is refused with 413 before
+/// any of it is read; the old handler read 64 KB of it and answered 405 for the method.
+#[tokio::test]
+async fn post_body_over_one_megabyte_is_refused_with_413_before_it_is_sent() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    conn.write_all(b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 2000000\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), conn.read_to_end(&mut response)).await;
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 413 Request Entity Too Large\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("<title>413 Request Entity Too Large</title>"));
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let cmd = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .unwrap();
+    assert_eq!(
+        cmd.metadata.get("body_declared").and_then(|v| v.as_u64()),
+        Some(2_000_000)
+    );
+    assert_eq!(
+        cmd.metadata.get("body_size").and_then(|v| v.as_u64()),
+        Some(0)
+    );
+    srv.handle.abort();
+}
+
+/// A body larger than the capture cap but within what nginx accepts is read to the end before
+/// the reply, so the client sees a clean response after its upload instead of a reset part way;
+/// the event records the real size and that the kept copy is a prefix.
+#[tokio::test]
+async fn post_body_past_the_capture_cap_is_drained_and_recorded_honestly() {
+    let srv = TestServer::start().await;
+    let body = vec![b'A'; 70_000];
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    conn.write_all(b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 70000\r\n\r\n")
+        .await
+        .unwrap();
+    conn.write_all(&body).await.unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), conn.read_to_end(&mut response)).await;
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 405 Not Allowed\r\n"),
+        "{response}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let cmd = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .unwrap();
+    assert_eq!(
+        cmd.metadata.get("body_size").and_then(|v| v.as_u64()),
+        Some(70_000)
+    );
+    assert_eq!(
+        cmd.metadata.get("body_complete").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        cmd.metadata.get("truncated").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    srv.handle.abort();
+}
+
+/// A client that declares a body and hangs up before sending it all has not made a request.
+/// nginx logs the premature close and answers nothing; the old handler answered as if the
+/// fragment were the whole body.
+#[tokio::test]
+async fn post_body_cut_short_gets_no_response_and_is_recorded_as_incomplete() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    conn.write_all(
+        b"POST /login HTTP/1.1\r\nHost: test\r\nContent-Length: 100\r\n\r\nuser=admin&pass=",
+    )
+    .await
+    .unwrap();
+    conn.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    let got = tokio::time::timeout(Duration::from_secs(3), conn.read_to_end(&mut response)).await;
+    assert!(
+        got.is_ok() && response.is_empty(),
+        "no reply to a body that never arrived: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let cmd = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .expect("the attempt is still evidence");
+    assert_eq!(
+        cmd.metadata.get("body_size").and_then(|v| v.as_u64()),
+        Some(16)
+    );
+    assert_eq!(
+        cmd.metadata.get("body_complete").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        cmd.metadata.get("body_preview").and_then(|v| v.as_str()),
+        Some("user=admin&pass=")
+    );
+    srv.handle.abort();
+}
+
 #[tokio::test]
 async fn protocol_label_http_on_all_events() {
     let srv = TestServer::start().await;

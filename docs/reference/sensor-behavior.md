@@ -303,7 +303,12 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
   Last-Modified/ETag/Accept-Ranges and a regenerated `Date` header. Captures
   method, path, query, user-agent, host, and a body preview into one
   `honeypot_command_exec` (authenticated=false, `:107-157`). Caps: request line
-  8192, header block 16384, body capture 65536 (`:16-19`).
+  8192, header block 16384, body capture 65536 (`:16-19`). A declared body is read to
+  its end before the reply (the first 65536 bytes kept, the rest drained); the event
+  records `body_size` (bytes received), `body_declared`, `body_complete` and
+  `truncated`. A body over nginx's 1 MB `client_max_body_size` gets nginx's 413 before
+  any of it is read; a client that hangs up before its declared body has arrived gets
+  no reply, as nginx gives none, and the event says `body_complete: false`.
 - **Bounds:** common defaults except **`max_concurrent` 512** (higher than the
   others, `main.rs:20-24`).
 - **Capture:** no login, no spool. **The POST body is captured only as a truncated
@@ -320,6 +325,12 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
   (canned `readme.txt`, 4096 bytes), REST, PASV/EPSV (opens a passive data listener
   on the control interface), LIST/NLST (canned listing), STOR (captures upload →
   `honeypot_malware_upload`), RETR→550, PORT/EPRT→502 (**active mode unimplemented - never dials out**), QUIT, NOOP, unknown→500.
+  A data transfer is reported the way it ended: no data connection within the idle
+  timeout → `425 Failed to establish connection.` (LIST and STOR alike); the client
+  closing the data connection → `226`; a STOR whose data connection goes quiet or
+  fails part way → `426 Failure reading network stream.` with the fragment still
+  captured and `complete: false` in the event; a STOR the sensor stops reading at the
+  drain cap → `451 Failure writing to local file.`.
 - **Passive-data hijack defense** (`data_peer_matches`, `:41-49, 220, 247-253`): a
   passive data connection whose source IP differs from the control connection's is
   refused with `425 Security: bad IP connecting.`, preventing off-path attribution

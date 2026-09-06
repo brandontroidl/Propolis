@@ -17,6 +17,9 @@ const MAX_REQUEST_LINE_LEN: usize = 8192;
 const MAX_HEADER_BLOCK: usize = 16384;
 const MAX_BODY_CAPTURE: usize = 65536;
 const READ_CHUNK_SIZE: usize = 4096;
+/// nginx's default `client_max_body_size` (1m): a larger declared body is refused with 413 before
+/// any of it is read, as nginx does.
+const NGINX_MAX_BODY: usize = 1_048_576;
 
 /// The impersonated server. Coherent with the shared persona (an Ubuntu host): this is the exact
 /// `Server` token an Ubuntu-packaged nginx emits. A missing or mismatched Server (and, worse, the
@@ -77,6 +80,16 @@ const NGINX_405_HTML: &str = "<html>
 </html>
 ";
 
+/// nginx's generated 413 page (a request body over `client_max_body_size`).
+const NGINX_413_HTML: &str = "<html>
+<head><title>413 Request Entity Too Large</title></head>
+<body>
+<center><h1>413 Request Entity Too Large</h1></center>
+<hr><center>nginx/1.18.0 (Ubuntu)</center>
+</body>
+</html>
+";
+
 pub async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -130,13 +143,20 @@ pub async fn handle_connection(
         if let Some(query) = &request.query {
             metadata["query"] = serde_json::Value::String(sanitize_value(query, 2048));
         }
+        if request.body_declared > 0 {
+            metadata["body_size"] = serde_json::Value::Number(request.body_received.into());
+            metadata["body_declared"] = serde_json::Value::Number(request.body_declared.into());
+            metadata["body_complete"] =
+                serde_json::Value::Bool(request.body_received == request.body_declared);
+            metadata["truncated"] =
+                serde_json::Value::Bool(request.body_received > request.body.len());
+        }
         if !request.body.is_empty() {
             let body_preview = sanitize_value(
                 &String::from_utf8_lossy(&request.body),
                 MAX_BODY_CAPTURE.min(4096),
             );
             metadata["body_preview"] = serde_json::Value::String(body_preview);
-            metadata["body_size"] = serde_json::Value::Number(request.body.len().into());
         }
 
         let event = SensorEvent {
@@ -157,7 +177,21 @@ pub async fn handle_connection(
             tracing::error!(%peer_addr, "http: failed to append request event");
         }
 
-        let response = build_response(&request.method, &request.path);
+        // A body the client never finished sending is not a request nginx answers: it logs the
+        // premature close and drops the connection. Answering it (and the old handler did, with
+        // whatever had arrived counted as the whole body) treated a partial read as a request.
+        let response = if request.body_declared > NGINX_MAX_BODY {
+            error_response(
+                "413 Request Entity Too Large",
+                NGINX_413_HTML,
+                &http_date_now(),
+                false,
+            )
+        } else if request.body_received < request.body_declared {
+            return;
+        } else {
+            build_response(&request.method, &request.path)
+        };
         let _ = stream.write_all(&response).await;
     }
 }
@@ -252,7 +286,14 @@ struct HttpRequest {
     path: String,
     query: Option<String>,
     headers: Vec<(String, String)>,
+    /// The body up to `MAX_BODY_CAPTURE` bytes.
     body: Vec<u8>,
+    /// The Content-Length the client declared (zero when absent).
+    body_declared: usize,
+    /// Body bytes that actually arrived, kept or not. Less than `body_declared` when the
+    /// client stopped early; then the request is incomplete. Zero when the declared size
+    /// exceeds what the server accepts, since nothing is read.
+    body_received: usize,
 }
 
 impl HttpRequest {
@@ -363,22 +404,23 @@ impl BoundedReader {
             .and_then(|(_, v)| v.parse().ok())
             .unwrap_or(0);
 
-        let body_to_read = content_length.min(MAX_BODY_CAPTURE);
+        // Read the whole declared body, keeping the first MAX_BODY_CAPTURE bytes and draining the
+        // rest, so the reply follows the body the way a server's does; the old reader stopped at
+        // the capture cap and answered with the remainder still in flight. A body over what nginx
+        // accepts is not read at all: the 413 goes out first. The session's byte budget still
+        // bounds the drain; a body it cuts off counts as incomplete.
         let mut body = Vec::new();
-        if body_to_read > 0 {
-            // Drain what we already have in the buffer from a pipelined read
-            let from_buf = body_to_read.min(self.buf.len());
-            body.extend_from_slice(&self.buf[..from_buf]);
-            self.buf.drain(..from_buf);
-
-            while body.len() < body_to_read {
-                if self.fill(stream).await.is_none() {
+        let mut received = 0usize;
+        if content_length <= NGINX_MAX_BODY {
+            while received < content_length {
+                if self.buf.is_empty() && self.fill(stream).await.is_none() {
                     break;
                 }
-                let need = body_to_read - body.len();
-                let take = need.min(self.buf.len());
-                body.extend_from_slice(&self.buf[..take]);
+                let take = (content_length - received).min(self.buf.len());
+                let keep = MAX_BODY_CAPTURE.saturating_sub(body.len()).min(take);
+                body.extend_from_slice(&self.buf[..keep]);
                 self.buf.drain(..take);
+                received += take;
             }
         }
 
@@ -388,6 +430,8 @@ impl BoundedReader {
             query,
             headers,
             body,
+            body_declared: content_length,
+            body_received: received,
         })
     }
 }

@@ -403,6 +403,59 @@ async fn postgresql_captures_username() {
         b'Z',
         "Sync ends the error state"
     );
+
+    // Describe: a statement is answered with ParameterDescription then NoData, a portal with
+    // NoData alone. Only NoData for a statement is a malformed exchange.
+    let describe_statement = [b'D', 0, 0, 0, 6, b'S', 0];
+    let describe_portal = [b'D', 0, 0, 0, 6, b'P', 0];
+    let flush = [b'H', 0, 0, 0, 4];
+    conn.write_all(&describe_statement).await.unwrap();
+    conn.write_all(&flush).await.unwrap();
+    let (tag, body) = read_msg(&mut conn).await;
+    assert_eq!(tag, b't', "ParameterDescription for a statement");
+    assert_eq!(body, vec![0, 0], "zero parameters");
+    assert_eq!(read_msg(&mut conn).await.0, b'n', "then NoData");
+    conn.write_all(&describe_portal).await.unwrap();
+    conn.write_all(&flush).await.unwrap();
+    assert_eq!(
+        read_msg(&mut conn).await.0,
+        b'n',
+        "NoData alone for a portal"
+    );
+
+    // Error recovery: after a refused Execute everything up to Sync is discarded, a simple
+    // Query included. It used to be answered (and recorded) inside the error state.
+    conn.write_all(&rest).await.unwrap();
+    assert_eq!(read_msg(&mut conn).await.0, b'2');
+    assert_eq!(read_msg(&mut conn).await.0, b'E');
+    assert_eq!(read_msg(&mut conn).await.0, b'Z');
+    let mut bind_execute = rest.clone();
+    bind_execute.truncate(rest.len() - 5); // drop the Sync
+    conn.write_all(&bind_execute).await.unwrap();
+    assert_eq!(read_msg(&mut conn).await.0, b'2');
+    assert_eq!(read_msg(&mut conn).await.0, b'E', "in the error state");
+    let ignored_sql = b"SELECT 'ignored in error state'\0";
+    let mut ignored = vec![b'Q'];
+    ignored.extend_from_slice(&((4 + ignored_sql.len()) as i32).to_be_bytes());
+    ignored.extend_from_slice(ignored_sql);
+    ignored.extend_from_slice(&[b'S', 0, 0, 0, 4]);
+    conn.write_all(&ignored).await.unwrap();
+    assert_eq!(
+        read_msg(&mut conn).await.0,
+        b'Z',
+        "the Query before Sync draws no reply; Sync alone answers ReadyForQuery"
+    );
+    let after_sql = b"SELECT 'after sync'\0";
+    let mut after = vec![b'Q'];
+    after.extend_from_slice(&((4 + after_sql.len()) as i32).to_be_bytes());
+    after.extend_from_slice(after_sql);
+    conn.write_all(&after).await.unwrap();
+    assert_eq!(
+        read_msg(&mut conn).await.0,
+        b'E',
+        "a Query after Sync is handled"
+    );
+    assert_eq!(read_msg(&mut conn).await.0, b'Z');
     conn.write_all(&[b'X', 0, 0, 0, 4]).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -421,8 +474,8 @@ async fn postgresql_captures_username() {
         .collect();
     assert_eq!(
         queries.len(),
-        3,
-        "one command event per statement: {events:?}"
+        4,
+        "one command event per handled statement: {events:?}"
     );
     assert_eq!(
         queries[0].metadata.get("command").and_then(|v| v.as_str()),
@@ -432,6 +485,11 @@ async fn postgresql_captures_username() {
         queries[2].metadata.get("command").and_then(|v| v.as_str()),
         Some("SELECT 42 AS extended_probe"),
         "extended-protocol SQL is recorded from Parse"
+    );
+    assert_eq!(
+        queries[3].metadata.get("command").and_then(|v| v.as_str()),
+        Some("SELECT 'after sync'"),
+        "the Query discarded in the error state is not recorded"
     );
     assert_eq!(
         login

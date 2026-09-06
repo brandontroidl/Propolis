@@ -205,6 +205,18 @@ pub async fn handle_connection(
             return;
         }
         match type_buf[0] {
+            // Terminate.
+            b'X' => return,
+            // Extended-protocol Sync ends the error state and the client waits for ReadyForQuery.
+            b'S' => {
+                skip_until_sync = false;
+                if stream.write_all(&READY_FOR_QUERY_IDLE).await.is_err() {
+                    return;
+                }
+            }
+            // After a refused Execute a real server discards everything, a simple Query
+            // included, until Sync; this guard therefore sits ahead of every other arm.
+            _ if skip_until_sync => {}
             // Simple query: the statement text, NUL-terminated.
             b'Q' => {
                 let sql = String::from_utf8_lossy(body.strip_suffix(&[0]).unwrap_or(&body));
@@ -217,22 +229,12 @@ pub async fn handle_connection(
                     return;
                 }
             }
-            // Terminate.
-            b'X' => return,
-            // Extended-protocol Sync ends the error state and the client waits for ReadyForQuery.
-            b'S' => {
-                skip_until_sync = false;
-                if stream.write_all(&READY_FOR_QUERY_IDLE).await.is_err() {
-                    return;
-                }
-            }
             // The extended protocol. A client library (psycopg, JDBC, Go's pq) sends Parse /
             // Bind / Describe / Execute / Sync rather than a simple Query, and each step expects
             // its completion message before the next; ignoring them, as this handler first did,
             // stalled such clients on Flush and never recorded their SQL. The statement text is in
             // Parse, so that is where it is recorded; Execute is refused the way the simple path
             // is, and everything after a refusal is discarded until Sync, as a real server does.
-            _ if skip_until_sync => {}
             b'P' => {
                 // statement name NUL, query NUL, i16 parameter-type count, ...
                 let mut parts = body.split(|&b| b == 0);
@@ -250,8 +252,16 @@ pub async fn handle_connection(
                     return;
                 }
             }
+            // Describe: a statement ('S') is answered with its parameter list before the row
+            // description; a portal ('P') with the row description alone. A client that
+            // described a statement and got only NoData had a malformed exchange.
             b'D' => {
-                if stream.write_all(&NO_DATA).await.is_err() {
+                let mut reply = Vec::new();
+                if body.first() == Some(&b'S') {
+                    reply.extend_from_slice(&PARAMETER_DESCRIPTION_EMPTY);
+                }
+                reply.extend_from_slice(&NO_DATA);
+                if stream.write_all(&reply).await.is_err() {
                     return;
                 }
             }
@@ -278,6 +288,8 @@ const PARSE_COMPLETE: [u8; 5] = [b'1', 0, 0, 0, 4];
 const BIND_COMPLETE: [u8; 5] = [b'2', 0, 0, 0, 4];
 const CLOSE_COMPLETE: [u8; 5] = [b'3', 0, 0, 0, 4];
 const NO_DATA: [u8; 5] = [b'n', 0, 0, 0, 4];
+/// ParameterDescription with zero parameters (i16 count = 0).
+const PARAMETER_DESCRIPTION_EMPTY: [u8; 7] = [b't', 0, 0, 0, 6, 0, 0];
 
 /// Largest message accepted in the query phase; a statement is text, not a bulk transfer.
 const MAX_QUERY_MSG: i32 = 65536;

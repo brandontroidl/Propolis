@@ -77,6 +77,8 @@ pub async fn handle_connection(
     let mut mail_from = String::new();
     let mut rcpt_to = Vec::new();
     let mut total_read: u64 = 0;
+    // Message body accumulated across BDAT chunks until the LAST one arrives.
+    let mut bdat_body = String::new();
 
     loop {
         let Some(line) = read_line_bounded(&mut reader, &bounds, &mut total_read).await else {
@@ -140,23 +142,65 @@ pub async fn handle_connection(
             let _ = write_reply(&mut reader, b"354 End data with <CR><LF>.<CR><LF>\r\n").await;
             let body = read_data_body(&mut reader, &bounds, &mut total_read).await;
             let subject = extract_header(&body, "Subject");
+            let msg = ReceivedMessage {
+                mail_from: &mail_from,
+                rcpt_to: &rcpt_to,
+                subject: &subject,
+                body_size: body.len(),
+                chunking: false,
+            };
             let _ = emitter
-                .append(&data_event(
-                    source_ip,
-                    wan_ip,
-                    &mail_from,
-                    &rcpt_to,
-                    &subject,
-                    body.len(),
-                    session_id,
-                ))
+                .append(&data_event(source_ip, wan_ip, &msg, session_id))
                 .await;
             // Postfix acknowledges an accepted message with a queue id, not a bare "250 OK".
             let reply = format!("250 2.0.0 Ok: queued as {}\r\n", queue_id());
             let _ = write_reply(&mut reader, reply.as_bytes()).await;
+        } else if upper.starts_with("BDAT") {
+            // CHUNKING (RFC 3030) is advertised in EHLO, so a client may send the message as
+            // `BDAT <size> [LAST]` followed by exactly <size> raw octets: no dot-stuffing and no
+            // terminator line. Answering 502 here contradicted the advertisement and lost every
+            // message from a client that chose BDAT over DATA.
+            let mut words = line.split_whitespace().skip(1);
+            let size: Option<u64> = words.next().and_then(|s| s.parse().ok());
+            let last = words.next().is_some_and(|w| w.eq_ignore_ascii_case("LAST"));
+            match size {
+                None => {
+                    let _ = write_reply(
+                        &mut reader,
+                        b"501 5.5.4 Error: BDAT requires a chunk size\r\n",
+                    )
+                    .await;
+                }
+                Some(size) => {
+                    let chunk = read_raw_chunk(&mut reader, size, &bounds, &mut total_read).await;
+                    if bdat_body.len() + chunk.len() < MAX_DATA_BODY {
+                        bdat_body.push_str(&chunk);
+                    }
+                    if last {
+                        let subject = extract_header(&bdat_body, "Subject");
+                        let msg = ReceivedMessage {
+                            mail_from: &mail_from,
+                            rcpt_to: &rcpt_to,
+                            subject: &subject,
+                            body_size: bdat_body.len(),
+                            chunking: true,
+                        };
+                        let _ = emitter
+                            .append(&data_event(source_ip, wan_ip, &msg, session_id))
+                            .await;
+                        bdat_body.clear();
+                        let reply = format!("250 2.0.0 Ok: queued as {}\r\n", queue_id());
+                        let _ = write_reply(&mut reader, reply.as_bytes()).await;
+                    } else {
+                        let reply = format!("250 2.0.0 Ok: {size} bytes\r\n");
+                        let _ = write_reply(&mut reader, reply.as_bytes()).await;
+                    }
+                }
+            }
         } else if upper.starts_with("RSET") {
             mail_from.clear();
             rcpt_to.clear();
+            bdat_body.clear();
             let _ = write_reply(&mut reader, b"250 2.0.0 Ok\r\n").await;
         } else if upper.starts_with("NOOP") {
             let _ = write_reply(&mut reader, b"250 2.0.0 Ok\r\n").await;
@@ -219,15 +263,29 @@ fn login_event(
     }
 }
 
+/// One received message, however it was transferred, as the event records it.
+struct ReceivedMessage<'a> {
+    mail_from: &'a str,
+    rcpt_to: &'a [String],
+    subject: &'a str,
+    body_size: usize,
+    /// Delivered with BDAT (CHUNKING) rather than DATA.
+    chunking: bool,
+}
+
 fn data_event(
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
-    mail_from: &str,
-    rcpt_to: &[String],
-    subject: &str,
-    body_size: usize,
+    msg: &ReceivedMessage<'_>,
     session_id: Uuid,
 ) -> SensorEvent {
+    let ReceivedMessage {
+        mail_from,
+        rcpt_to,
+        subject,
+        body_size,
+        chunking,
+    } = *msg;
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -237,6 +295,9 @@ fn data_event(
         protocol: PROTO_TCP.to_string(),
         authenticated: false,
         observed_at: chrono::Utc::now(),
+        // `command` stays "DATA" for a message delivered by BDAT too: it is the same "a message
+        // body was received" observation for everything downstream; `chunking` says which
+        // transfer the client chose.
         metadata: serde_json::json!({
             "protocol_label": PROTOCOL_LABEL,
             "command": "DATA",
@@ -244,6 +305,7 @@ fn data_event(
             "rcpt_to": rcpt_to.iter().map(|r| sanitize_value(r, 255)).collect::<Vec<_>>(),
             "subject": sanitize_value(subject, 512),
             "body_size": body_size,
+            "chunking": chunking,
         }),
         sample: None,
         session_id: Some(session_id),
@@ -367,6 +429,34 @@ async fn read_line_bounded(
                     .trim_end_matches(['\r', '\n'])
                     .to_string(),
             )
+        }
+    }
+}
+
+/// Read exactly `size` raw octets of a BDAT chunk, never more than the session's remaining
+/// capture budget. A chunk larger than the budget is cut at the budget; the unread remainder then
+/// reads as garbage commands and the budget check ends the session, the same end an oversized
+/// DATA body meets.
+async fn read_raw_chunk(
+    reader: &mut BufReader<TcpStream>,
+    size: u64,
+    bounds: &ConnectionBounds,
+    total: &mut u64,
+) -> String {
+    let remaining = bounds.max_captured_bytes.saturating_sub(*total);
+    let want = size.min(remaining) as usize;
+    if want == 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u8; want];
+    match tokio::time::timeout(bounds.idle_timeout, reader.read_exact(&mut buf)).await {
+        Ok(Ok(_)) => {
+            *total += want as u64;
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+        _ => {
+            *total = bounds.max_captured_bytes;
+            String::new()
         }
     }
 }

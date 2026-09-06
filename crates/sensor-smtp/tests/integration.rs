@@ -252,6 +252,111 @@ async fn auth_login_credential_capture() {
     srv.handle.abort();
 }
 
+/// EHLO advertises CHUNKING, so a client may deliver by BDAT instead of DATA. It used to get
+/// "502 command not recognized", contradicting the advertisement and losing the message.
+#[tokio::test]
+async fn bdat_last_delivers_the_message_and_is_captured() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let _ = client.send("MAIL FROM:<attacker@evil.com>").await;
+    let _ = client.send("RCPT TO:<victim@example.com>").await;
+    let body = b"Subject: Chunked\r\n\r\nvia BDAT\r\n";
+    client
+        .reader
+        .get_mut()
+        .write_all(format!("BDAT {} LAST\r\n", body.len()).as_bytes())
+        .await
+        .unwrap();
+    client.reader.get_mut().write_all(body).await.unwrap();
+    let r = client.read_reply().await;
+    assert!(
+        r.starts_with("250 2.0.0 Ok: queued as"),
+        "BDAT LAST must be accepted like DATA: {r}"
+    );
+    // The session is still usable afterwards.
+    let r = client.send("NOOP").await;
+    assert!(r.starts_with("250"), "{r}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let data_event = events
+        .iter()
+        .find(|e| e.metadata.get("command").and_then(|v| v.as_str()) == Some("DATA"))
+        .expect("a BDAT delivery must produce the same message event as DATA");
+    assert_eq!(
+        data_event.metadata.get("subject").and_then(|v| v.as_str()),
+        Some("Chunked")
+    );
+    assert_eq!(
+        data_event
+            .metadata
+            .get("body_size")
+            .and_then(|v| v.as_u64()),
+        Some(body.len() as u64)
+    );
+    assert_eq!(
+        data_event
+            .metadata
+            .get("chunking")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn bdat_chunks_accumulate_until_last() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let _ = client.send("MAIL FROM:<a@evil.com>").await;
+    let _ = client.send("RCPT TO:<b@example.com>").await;
+    let first = b"Subject: Two\r\n\r\n";
+    let second = b"parts\r\n";
+    client
+        .reader
+        .get_mut()
+        .write_all(format!("BDAT {}\r\n", first.len()).as_bytes())
+        .await
+        .unwrap();
+    client.reader.get_mut().write_all(first).await.unwrap();
+    let r = client.read_reply().await;
+    assert!(
+        r.starts_with("250 2.0.0 Ok:") && !r.contains("queued"),
+        "an intermediate chunk is acknowledged but not queued: {r}"
+    );
+    client
+        .reader
+        .get_mut()
+        .write_all(format!("BDAT {} LAST\r\n", second.len()).as_bytes())
+        .await
+        .unwrap();
+    client.reader.get_mut().write_all(second).await.unwrap();
+    let r = client.read_reply().await;
+    assert!(r.contains("queued as"), "{r}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let data_event = events
+        .iter()
+        .find(|e| e.metadata.get("command").and_then(|v| v.as_str()) == Some("DATA"))
+        .unwrap();
+    assert_eq!(
+        data_event
+            .metadata
+            .get("body_size")
+            .and_then(|v| v.as_u64()),
+        Some((first.len() + second.len()) as u64),
+        "both chunks belong to one message"
+    );
+    assert_eq!(
+        data_event.metadata.get("subject").and_then(|v| v.as_str()),
+        Some("Two")
+    );
+    srv.handle.abort();
+}
+
 #[tokio::test]
 async fn data_capture_with_sender_and_recipient() {
     let srv = TestServer::start().await;

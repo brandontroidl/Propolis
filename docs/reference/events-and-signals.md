@@ -78,7 +78,9 @@ Every upload row also carries `complete`: false when the transfer did not end th
 its protocol defines the end of a file (FTP's data connection stalled or failed, or
 hit the drain cap; SCP ended before its trailer; an SFTP handle was never closed; an
 ADB SEND got no DONE), so the captured bytes are a fragment of whatever was being sent.
-The IP detail page shows such rows with status `incomplete`.
+The fragment is submitted whichever way the session ends, including the listener's
+`max_duration` cut-off, which cancels the handler outright. The IP detail page shows such
+rows with status `incomplete`.
 
 ## Signal types
 

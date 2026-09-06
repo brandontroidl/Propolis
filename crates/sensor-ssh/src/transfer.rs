@@ -165,13 +165,18 @@ impl ScpReceiver {
         response
     }
 
-    /// The session is ending with a body still in flight. What arrived is returned as a capture
-    /// marked incomplete, for the caller to submit: a dropper cut off at the trailer used to
-    /// leave no event and no bytes, as if it had never been sent.
+    /// The session is ending with the transfer unfinished: a body still in flight, or the whole
+    /// body received but the trailing `\0` never sent. What arrived is returned as a capture
+    /// marked incomplete, for the caller to submit: a dropper cut off before the trailer used to
+    /// leave no event and no bytes, as if it had never been sent. One-shot: the state moves to
+    /// `Done`, so `Drop` below cannot submit a second copy.
     pub fn abandon(&mut self) -> Option<CaptureJob> {
-        let in_flight = matches!(self.state, ScpState::ReadingBody { .. }) && self.wire_bytes > 0;
+        let unfinished = matches!(
+            self.state,
+            ScpState::ReadingBody { .. } | ScpState::WaitTrailer
+        ) && self.wire_bytes > 0;
         self.state = ScpState::Done;
-        in_flight.then(|| self.capture_job(false))
+        unfinished.then(|| self.capture_job(false))
     }
 
     fn capture_job(&self, complete: bool) -> CaptureJob {
@@ -199,6 +204,18 @@ impl ScpReceiver {
                 session_id: Some(session_id),
                 occurrence_id: None,
             }),
+        }
+    }
+}
+
+/// The receiver is dropped however the session ends, including the listener's `max_duration`
+/// timeout, which cancels the whole handler future and never reaches any cleanup written after
+/// the packet loop. Submitting from `Drop` is what makes an unfinished transfer survive every
+/// exit path with one mechanism; `submit` never blocks, so this is safe in a destructor.
+impl Drop for ScpReceiver {
+    fn drop(&mut self) {
+        if let Some(job) = self.abandon() {
+            let _ = self.handoff.submit(job);
         }
     }
 }
@@ -506,6 +523,16 @@ impl SftpHandler {
     }
 }
 
+/// See `ScpReceiver`'s `Drop`: the same one mechanism for every exit path, the listener's
+/// `max_duration` cancellation included.
+impl Drop for SftpHandler {
+    fn drop(&mut self) {
+        for job in self.abandon() {
+            let _ = self.handoff.submit(job);
+        }
+    }
+}
+
 // ---- SFTP packet builders ----
 
 /// Build an `SSH_FXP_STATUS` response packet.
@@ -684,6 +711,25 @@ mod tests {
         assert_eq!(event.metadata["truncated"], false);
         assert!(scp.abandon().is_none(), "abandon is one-shot");
 
+        // The whole body arrived but the trailing NUL never did: the file is all there, the
+        // protocol never finished, and the receiver used to keep nothing because its state was
+        // WaitTrailer rather than ReadingBody.
+        let (mut trailerless, _) = ScpReceiver::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            test_handoff(),
+        );
+        trailerless.feed(b"C0644 3 x\n");
+        trailerless.feed(b"ABC");
+        let job = trailerless
+            .abandon()
+            .expect("a complete body without its trailer is still a capture");
+        assert_eq!(job.body, b"ABC");
+        let sample = sample_for(&job);
+        let event = (job.event_builder)(sample);
+        assert_eq!(event.metadata["complete"], false);
+
         // Nothing arrived after the header: nothing to keep.
         let (mut empty, _) = ScpReceiver::new(
             "127.0.0.1".parse().unwrap(),
@@ -693,6 +739,106 @@ mod tests {
         );
         empty.feed(b"C0644 100 dropper.bin\n");
         assert!(empty.abandon().is_none());
+    }
+
+    /// A hand-off with room for exactly one job, so a test can prove a submission happened
+    /// without a worker: the next `submit` is refused.
+    fn one_slot_handoff() -> Arc<CaptureHandoff> {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let outbox_dir = dir.path().join("outbox");
+        let spool =
+            sensor_framework::QuarantineSpool::new(spool_dir, MAX_CAPTURE_BODY as u64, 100_000_000);
+        let emitter = sensor_framework::EventEmitter::new(dir.path().join("events.jsonl"));
+        std::mem::forget(dir);
+        Arc::new(CaptureHandoff::new(
+            spool,
+            emitter,
+            1,
+            "test".to_string(),
+            sensor_framework::OutboxManifest::new(outbox_dir),
+        ))
+    }
+
+    fn probe_job() -> CaptureJob {
+        CaptureJob {
+            body: vec![1],
+            orig_name: "probe".into(),
+            event_builder: Box::new(|_sample| unreachable!("never built")),
+        }
+    }
+
+    /// The listener cancels a handler at `max_duration` by dropping its future, which never
+    /// reaches cleanup code after the packet loop. The receiver's `Drop` is the only thing that
+    /// runs on that path, and it must submit the unfinished transfer.
+    #[tokio::test]
+    async fn scp_and_sftp_submit_the_unfinished_transfer_when_cancelled_by_timeout() {
+        let handoff = one_slot_handoff();
+        let (mut scp, _) = ScpReceiver::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+        );
+        scp.feed(b"C0644 100 dropper.bin\n");
+        scp.feed(b"MZ-partial");
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(10), async move {
+            let _keep = &scp;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the future was cancelled, not completed"
+        );
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the one slot holds the abandoned SCP capture"
+        );
+
+        let handoff = one_slot_handoff();
+        let mut sftp = SftpHandler::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+        );
+        let mut init = vec![SSH_FXP_INIT];
+        init.extend_from_slice(&3u32.to_be_bytes());
+        let mut init_pkt = (init.len() as u32).to_be_bytes().to_vec();
+        init_pkt.extend_from_slice(&init);
+        let _ = sftp.feed(&init_pkt);
+        let mut open = vec![SSH_FXP_OPEN];
+        open.extend_from_slice(&1u32.to_be_bytes());
+        open.extend_from_slice(&1u32.to_be_bytes());
+        open.extend_from_slice(b"f");
+        open.extend_from_slice(&SSH_FXF_WRITE.to_be_bytes());
+        let mut open_pkt = (open.len() as u32).to_be_bytes().to_vec();
+        open_pkt.extend_from_slice(&open);
+        let resp = sftp.feed(&open_pkt);
+        let handle_len = u32::from_be_bytes([resp[9], resp[10], resp[11], resp[12]]) as usize;
+        let handle = resp[13..13 + handle_len].to_vec();
+        let mut write = vec![SSH_FXP_WRITE];
+        write.extend_from_slice(&2u32.to_be_bytes());
+        write.extend_from_slice(&(handle.len() as u32).to_be_bytes());
+        write.extend_from_slice(&handle);
+        write.extend_from_slice(&0u64.to_be_bytes());
+        write.extend_from_slice(&3u32.to_be_bytes());
+        write.extend_from_slice(b"ELF");
+        let mut write_pkt = (write.len() as u32).to_be_bytes().to_vec();
+        write_pkt.extend_from_slice(&write);
+        let _ = sftp.feed(&write_pkt);
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(10), async move {
+            let _keep = &sftp;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(cancelled.is_err());
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the one slot holds the abandoned SFTP capture"
+        );
     }
 
     /// SFTP handles still open at session end are captured as incomplete files.

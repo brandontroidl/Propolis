@@ -65,33 +65,90 @@ enum StorOutcome {
     DrainCapReached,
 }
 
-/// Read a STOR upload from its data connection. Returns the retained body (at most
-/// `MAX_STOR_BODY`), the bytes the client sent whether retained or not, and how the transfer
-/// ended. Past the cap the read keeps draining (bounded by `MAX_STOR_DRAIN`, so a slow trickle
-/// cannot hold the data connection open forever) purely to measure the real size.
-async fn receive_stor(
-    mut data: TcpStream,
-    idle_timeout: std::time::Duration,
-) -> (Vec<u8>, u64, StorOutcome) {
-    let mut body = Vec::new();
-    let mut wire_bytes: u64 = 0;
-    let mut chunk = [0u8; 4096];
-    let outcome = loop {
-        match tokio::time::timeout(idle_timeout, data.read(&mut chunk)).await {
-            Ok(Ok(0)) => break StorOutcome::Complete,
-            Ok(Err(_)) | Err(_) => break StorOutcome::NetworkFailure,
-            Ok(Ok(n)) => {
-                let take = MAX_STOR_BODY.saturating_sub(body.len()).min(n);
-                body.extend_from_slice(&chunk[..take]);
-                wire_bytes += n as u64;
-                if wire_bytes >= (MAX_STOR_BODY + MAX_STOR_DRAIN) as u64 {
-                    break StorOutcome::DrainCapReached;
+/// A STOR upload being received: the retained body (at most `MAX_STOR_BODY`), the bytes the
+/// client sent whether retained or not, and what the event needs. Submitted through `finish`
+/// with the outcome, or from `Drop` as incomplete if the handler is cancelled mid-transfer (the
+/// listener's `max_duration` drops the whole future, so no code after the read would run).
+struct StorCapture {
+    body: Vec<u8>,
+    wire_bytes: u64,
+    submitted: bool,
+    orig_name: String,
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    logged_in: bool,
+    session_id: Uuid,
+    handoff: Arc<CaptureHandoff>,
+}
+
+impl StorCapture {
+    /// Read the upload from its data connection and return how it ended. Past the cap the read
+    /// keeps draining (bounded by `MAX_STOR_DRAIN`, so a slow trickle cannot hold the data
+    /// connection open forever) purely to measure the real size.
+    async fn receive(
+        &mut self,
+        mut data: TcpStream,
+        idle_timeout: std::time::Duration,
+    ) -> StorOutcome {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match tokio::time::timeout(idle_timeout, data.read(&mut chunk)).await {
+                Ok(Ok(0)) => return StorOutcome::Complete,
+                Ok(Err(_)) | Err(_) => return StorOutcome::NetworkFailure,
+                Ok(Ok(n)) => {
+                    let take = MAX_STOR_BODY.saturating_sub(self.body.len()).min(n);
+                    self.body.extend_from_slice(&chunk[..take]);
+                    self.wire_bytes += n as u64;
+                    if self.wire_bytes >= (MAX_STOR_BODY + MAX_STOR_DRAIN) as u64 {
+                        return StorOutcome::DrainCapReached;
+                    }
                 }
             }
         }
-    };
-    drop(data);
-    (body, wire_bytes, outcome)
+    }
+
+    fn finish(&mut self, complete: bool) {
+        if self.submitted {
+            return;
+        }
+        self.submitted = true;
+        let body = std::mem::take(&mut self.body);
+        let orig_name = self.orig_name.clone();
+        let (source_ip, wan_ip, logged_in, session_id, wire_bytes) = (
+            self.source_ip,
+            self.wan_ip,
+            self.logged_in,
+            self.session_id,
+            self.wire_bytes,
+        );
+        let job = CaptureJob {
+            body,
+            orig_name,
+            event_builder: Box::new(move |sample: SampleRef| SensorEvent {
+                v: WIRE_VERSION,
+                source_ip,
+                wan_ip,
+                sensor: PROTOCOL_LABEL.to_string(),
+                signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
+                protocol: PROTO_TCP.to_string(),
+                authenticated: logged_in,
+                observed_at: chrono::Utc::now(),
+                metadata: upload_metadata(PROTOCOL_LABEL, &sample, wire_bytes, complete),
+                sample: Some(sample),
+                session_id: Some(session_id),
+                occurrence_id: None,
+            }),
+        };
+        let _ = self.handoff.submit(job);
+    }
+}
+
+impl Drop for StorCapture {
+    fn drop(&mut self) {
+        if self.wire_bytes > 0 {
+            self.finish(false);
+        }
+    }
 }
 
 pub async fn handle_connection(
@@ -317,34 +374,19 @@ pub async fn handle_connection(
                             write_line(&mut reader, b"425 Security: bad IP connecting.\r\n").await;
                         continue;
                     }
-                    let (body, wire_bytes, outcome) = receive_stor(data, bounds.idle_timeout).await;
-                    let complete = outcome == StorOutcome::Complete;
-
-                    let orig_name = filename.clone();
-                    let job = CaptureJob {
-                        body,
-                        orig_name,
-                        event_builder: Box::new(move |sample: SampleRef| SensorEvent {
-                            v: WIRE_VERSION,
-                            source_ip,
-                            wan_ip,
-                            sensor: PROTOCOL_LABEL.to_string(),
-                            signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
-                            protocol: PROTO_TCP.to_string(),
-                            authenticated: logged_in,
-                            observed_at: chrono::Utc::now(),
-                            metadata: upload_metadata(
-                                PROTOCOL_LABEL,
-                                &sample,
-                                wire_bytes,
-                                complete,
-                            ),
-                            sample: Some(sample),
-                            session_id: Some(session_id),
-                            occurrence_id: None,
-                        }),
+                    let mut capture = StorCapture {
+                        body: Vec::new(),
+                        wire_bytes: 0,
+                        submitted: false,
+                        orig_name: filename.clone(),
+                        source_ip,
+                        wan_ip,
+                        logged_in,
+                        session_id,
+                        handoff: handoff.clone(),
                     };
-                    let _ = handoff.submit(job);
+                    let outcome = capture.receive(data, bounds.idle_timeout).await;
+                    capture.finish(outcome == StorOutcome::Complete);
                     let reply: &[u8] = match outcome {
                         StorOutcome::Complete => b"226 Transfer complete.\r\n",
                         StorOutcome::NetworkFailure => b"426 Failure reading network stream.\r\n",
@@ -472,6 +514,99 @@ async fn read_line_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hand-off with one queue slot and no worker: a second `submit` is refused, which is how
+    /// a test proves the first happened.
+    fn one_slot_handoff() -> Arc<CaptureHandoff> {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let outbox_dir = dir.path().join("outbox");
+        let spool =
+            sensor_framework::QuarantineSpool::new(spool_dir, MAX_STOR_BODY as u64, 100_000_000);
+        let emitter = sensor_framework::EventEmitter::new(dir.path().join("events.jsonl"));
+        std::mem::forget(dir);
+        Arc::new(CaptureHandoff::new(
+            spool,
+            emitter,
+            1,
+            "test".to_string(),
+            sensor_framework::OutboxManifest::new(outbox_dir),
+        ))
+    }
+
+    fn probe_job() -> CaptureJob {
+        CaptureJob {
+            body: vec![1],
+            orig_name: "probe".into(),
+            event_builder: Box::new(|_sample| unreachable!("never built")),
+        }
+    }
+
+    /// The listener cancels a handler at `max_duration` by dropping its future mid-read; the
+    /// bytes already received must still reach the hand-off, as an incomplete capture, and a
+    /// finished capture must not be submitted twice by the same mechanism.
+    #[tokio::test]
+    async fn stor_capture_is_submitted_when_the_handler_is_cancelled() {
+        let handoff = one_slot_handoff();
+        let capture = StorCapture {
+            body: b"MZ-part".to_vec(),
+            wire_bytes: 7,
+            submitted: false,
+            orig_name: "x.bin".into(),
+            source_ip: "203.0.113.7".parse().unwrap(),
+            wan_ip: None,
+            logged_in: true,
+            session_id: Uuid::now_v7(),
+            handoff: handoff.clone(),
+        };
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(10), async move {
+            let _keep = &capture;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(cancelled.is_err());
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the one slot holds the abandoned STOR fragment"
+        );
+
+        let handoff = one_slot_handoff();
+        let mut finished = StorCapture {
+            body: b"whole".to_vec(),
+            wire_bytes: 5,
+            submitted: false,
+            orig_name: "y.bin".into(),
+            source_ip: "203.0.113.7".parse().unwrap(),
+            wan_ip: None,
+            logged_in: true,
+            session_id: Uuid::now_v7(),
+            handoff: handoff.clone(),
+        };
+        finished.finish(true);
+        drop(finished);
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "exactly one submission: finish, not finish plus drop"
+        );
+        let empty = StorCapture {
+            body: Vec::new(),
+            wire_bytes: 0,
+            submitted: false,
+            orig_name: "z.bin".into(),
+            source_ip: "203.0.113.7".parse().unwrap(),
+            wan_ip: None,
+            logged_in: true,
+            session_id: Uuid::now_v7(),
+            handoff: one_slot_handoff(),
+        };
+        let handoff = empty.handoff.clone();
+        drop(empty);
+        assert!(
+            handoff.submit(probe_job()).is_ok(),
+            "nothing received, nothing submitted"
+        );
+    }
 
     #[test]
     fn connection_event_is_unauthenticated_with_ftp_label() {

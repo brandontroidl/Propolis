@@ -106,6 +106,19 @@ struct SyncState {
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
     session_id: Uuid,
+    /// Held so `Drop` can submit an unfinished SEND whichever way the stream or session ends,
+    /// the listener's `max_duration` cancellation included.
+    handoff: Arc<CaptureHandoff>,
+}
+
+/// A SEND still open when the stream is closed, the session ends, or the handler future is
+/// cancelled is submitted as an incomplete capture. `submit` never blocks, so it is safe here.
+impl Drop for SyncState {
+    fn drop(&mut self) {
+        if let Some(job) = self.abandon() {
+            let _ = self.handoff.submit(job);
+        }
+    }
 }
 
 struct PendingSend {
@@ -117,13 +130,19 @@ struct PendingSend {
 }
 
 impl SyncState {
-    fn new(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> Self {
+    fn new(
+        source_ip: IpAddr,
+        wan_ip: Option<IpAddr>,
+        session_id: Uuid,
+        handoff: Arc<CaptureHandoff>,
+    ) -> Self {
         Self {
             buf: Vec::new(),
             pending_send: None,
             source_ip,
             wan_ip,
             session_id,
+            handoff,
         }
     }
 
@@ -247,9 +266,13 @@ impl SyncState {
         Some(payload)
     }
 
+    /// The sub-stream cannot make forward progress. DATA already received for an open SEND is
+    /// still evidence, so it goes out as an incomplete capture rather than being discarded.
     fn reset(&mut self) {
+        if let Some(job) = self.abandon() {
+            let _ = self.handoff.submit(job);
+        }
         self.buf.clear();
-        self.pending_send = None;
     }
 
     /// The stream or session is ending with a `SEND` still open (no `DONE` arrived). The bytes
@@ -407,90 +430,75 @@ pub async fn handle_connection(
     let mut streams: HashMap<u32, Stream> = HashMap::new();
     let mut next_stream_id: u32 = 1;
 
-    // The message loop runs as a block so that however it ends, every sync stream still holding
-    // a half-received SEND is flushed below as an incomplete capture instead of dropped.
-    async {
-        loop {
-            let Some((header, data)) = reader.read_message(&mut stream).await else {
-                return;
-            };
+    // A sync stream still holding a half-received SEND when this function returns, or when the
+    // listener cancels it at max_duration, is flushed by `SyncState`'s `Drop`.
+    loop {
+        let Some((header, data)) = reader.read_message(&mut stream).await else {
+            return;
+        };
 
-            match header.command {
-                adb_proto::A_OPEN => {
-                    if handle_open(
-                        &mut stream,
-                        &header,
-                        &data,
-                        &mut streams,
-                        &mut next_stream_id,
-                        source_ip,
-                        wan_ip,
-                        session_id,
-                        &emitter,
-                        peer_addr,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
-                }
-                adb_proto::A_WRTE => {
-                    if handle_wrte(
-                        &mut stream,
-                        &header,
-                        &data,
-                        &mut streams,
-                        &emitter,
-                        &handoff,
-                        peer_addr,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
-                }
-                adb_proto::A_OKAY => {
-                    // Flow-control ack for one of our own WRTEs; this handler never has more than
-                    // one outstanding write per stream in flight, so there is nothing to unblock.
-                }
-                adb_proto::A_CLSE => {
-                    let server_id = header.arg1;
-                    if let Some(mut s) = streams.remove(&server_id) {
-                        // A sync stream closed mid-SEND: keep what arrived, marked incomplete.
-                        if let StreamKind::Sync(sync) = &mut s.kind
-                            && let Some(job) = sync.abandon()
-                        {
-                            let _ = handoff.submit(job);
-                        }
-                        let _ = stream
-                            .write_all(&adb_proto::build_clse(server_id, s.client_local_id))
-                            .await;
-                    }
-                    // Unknown stream id (already closed, or never opened): no reply, so garbage
-                    // input can never trigger a CLSE reply storm.
-                }
-                _ => {
-                    // A second CNXN mid-session, or any other/unknown command: not well-formed ADB
-                    // from this point on. Ending the session is simpler and safer than guessing.
+        match header.command {
+            adb_proto::A_OPEN => {
+                if handle_open(
+                    &mut stream,
+                    &header,
+                    &data,
+                    &mut streams,
+                    &mut next_stream_id,
+                    source_ip,
+                    wan_ip,
+                    session_id,
+                    &emitter,
+                    &handoff,
+                    peer_addr,
+                )
+                .await
+                .is_err()
+                {
                     return;
                 }
             }
-        }
-    }
-    .await;
-
-    for s in streams.values_mut() {
-        if let StreamKind::Sync(sync) = &mut s.kind
-            && let Some(job) = sync.abandon()
-        {
-            let _ = handoff.submit(job);
+            adb_proto::A_WRTE => {
+                if handle_wrte(
+                    &mut stream,
+                    &header,
+                    &data,
+                    &mut streams,
+                    &emitter,
+                    &handoff,
+                    peer_addr,
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
+            adb_proto::A_OKAY => {
+                // Flow-control ack for one of our own WRTEs; this handler never has more than
+                // one outstanding write per stream in flight, so there is nothing to unblock.
+            }
+            adb_proto::A_CLSE => {
+                let server_id = header.arg1;
+                // Removing a sync stream drops its state, which submits a SEND closed
+                // mid-way as an incomplete capture.
+                if let Some(s) = streams.remove(&server_id) {
+                    let _ = stream
+                        .write_all(&adb_proto::build_clse(server_id, s.client_local_id))
+                        .await;
+                }
+                // Unknown stream id (already closed, or never opened): no reply, so garbage
+                // input can never trigger a CLSE reply storm.
+            }
+            _ => {
+                // A second CNXN mid-session, or any other/unknown command: not well-formed ADB
+                // from this point on. Ending the session is simpler and safer than guessing.
+                return;
+            }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Max concurrently-open ADB streams per connection. Each accepted interactive/sync OPEN pins a
 /// `Stream` (a FakeShell plus its fake filesystem) in the streams map; a real device also bounds
 /// concurrent streams, and this stops an OPEN flood from amplifying wire bytes into unbounded heap.
@@ -507,6 +515,7 @@ async fn handle_open(
     wan_ip: Option<IpAddr>,
     session_id: Uuid,
     emitter: &Arc<EventEmitter>,
+    handoff: &Arc<CaptureHandoff>,
     peer_addr: SocketAddr,
 ) -> Result<(), ()> {
     let client_local_id = header.arg0;
@@ -588,7 +597,12 @@ async fn handle_open(
                 server_id,
                 Stream {
                     client_local_id,
-                    kind: StreamKind::Sync(SyncState::new(source_ip, wan_ip, session_id)),
+                    kind: StreamKind::Sync(SyncState::new(
+                        source_ip,
+                        wan_ip,
+                        session_id,
+                        handoff.clone(),
+                    )),
                 },
             );
         }
@@ -711,8 +725,93 @@ mod tests {
         assert_eq!(event.sample, None);
     }
 
+    /// A hand-off with `slots` queue entries and no worker: `submit` succeeds `slots` times, then
+    /// is refused, which is how a test proves a submission happened.
+    fn test_handoff(slots: usize) -> Arc<CaptureHandoff> {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let outbox_dir = dir.path().join("outbox");
+        let spool =
+            sensor_framework::QuarantineSpool::new(spool_dir, MAX_SYNC_BODY as u64, 100_000_000);
+        let emitter = sensor_framework::EventEmitter::new(dir.path().join("events.jsonl"));
+        std::mem::forget(dir);
+        Arc::new(CaptureHandoff::new(
+            spool,
+            emitter,
+            slots,
+            "test".to_string(),
+            sensor_framework::OutboxManifest::new(outbox_dir),
+        ))
+    }
+
     fn test_sync_state() -> SyncState {
-        SyncState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7())
+        SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            test_handoff(16),
+        )
+    }
+
+    fn probe_job() -> CaptureJob {
+        CaptureJob {
+            body: vec![1],
+            orig_name: "probe".into(),
+            event_builder: Box::new(|_sample| unreachable!("never built")),
+        }
+    }
+
+    /// The listener cancels a handler at `max_duration` by dropping its future; no code after
+    /// the message loop runs. `SyncState`'s `Drop` must submit the open SEND on that path, and
+    /// a protocol reset must not discard DATA already received either.
+    #[tokio::test]
+    async fn sync_submits_the_unfinished_send_when_cancelled_or_reset() {
+        let handoff = test_handoff(1);
+        let mut sync = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+        );
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/x,420",
+        ));
+        sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"AB"));
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(10), async move {
+            let _keep = &sync;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(cancelled.is_err());
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the one slot holds the abandoned SEND"
+        );
+
+        let handoff = test_handoff(1);
+        let mut sync = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+        );
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/y,420",
+        ));
+        sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"CD"));
+        // A stray SEND while one is open is a protocol violation: the state resets.
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/z,420",
+        ));
+        assert!(sync.pending_send.is_none());
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the reset submitted the DATA it had"
+        );
     }
 
     #[test]

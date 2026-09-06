@@ -561,21 +561,9 @@ async fn handle_session(
     }
     .await;
 
-    // A transfer still open when the session ended is kept as an incomplete capture rather than
-    // dropped: the bytes that arrived are evidence, and the event says they are a fragment.
-    match &mut handler {
-        ChannelHandler::Scp(scp) => {
-            if let Some(job) = scp.abandon() {
-                let _ = handoff.submit(job);
-            }
-        }
-        ChannelHandler::Sftp(sftp) => {
-            for job in sftp.abandon() {
-                let _ = handoff.submit(job);
-            }
-        }
-        ChannelHandler::Shell(..) | ChannelHandler::Pending => {}
-    }
+    // A transfer still open when the session ends is kept as an incomplete capture: the SCP and
+    // SFTP handlers submit it from `Drop` (see `transfer.rs`), which is the only code that runs
+    // when the listener cancels this future at `max_duration`, so nothing is done here.
 
     // A binary payload was seen somewhere in the shell phase (a Mirai/Gafgyt dropper streamed
     // over the "shell" - never a real interactive command, since FakeShell's binary-flood

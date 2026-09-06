@@ -79,8 +79,12 @@ impl FtpClient {
     }
 
     async fn read_reply(&mut self) -> String {
+        self.read_reply_within(Duration::from_secs(3)).await
+    }
+
+    async fn read_reply_within(&mut self, wait: Duration) -> String {
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(3), self.reader.read_line(&mut line))
+        tokio::time::timeout(wait, self.reader.read_line(&mut line))
             .await
             .expect("timeout reading reply")
             .expect("read error");
@@ -200,6 +204,7 @@ async fn stor_upload_captured_in_spool() {
     assert_eq!(sample.size, body.len() as u64);
     assert_eq!(upload.metadata["truncated"], false);
     assert_eq!(upload.metadata["wire_size"], body.len() as u64);
+    assert_eq!(upload.metadata["complete"], true);
 
     use sha2::{Digest, Sha256};
     let expected_hash = sensor_framework::to_hex_bounded(&Sha256::digest(body), 32);
@@ -248,6 +253,74 @@ async fn stor_upload_past_the_cap_is_marked_truncated() {
     assert_eq!(sample.size, CAP as u64, "only the prefix is retained");
     assert_eq!(upload.metadata["truncated"], true);
     assert_eq!(upload.metadata["wire_size"], sent as u64);
+    srv.handle.abort();
+}
+
+/// A STOR whose data connection never arrives has transferred nothing. vsftpd answers 425; the
+/// sensor used to answer "226 Transfer complete." after its accept timed out.
+#[tokio::test]
+async fn stor_without_a_data_connection_is_425_not_transfer_complete() {
+    let srv = TestServer::start().await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    client.login("root", "toor").await;
+    let _ = client.pasv().await;
+    let r = client.send("STOR /tmp/never.bin").await;
+    assert!(r.starts_with("150"), "{r}");
+    // The accept wait is the idle timeout (5 s in these bounds).
+    let r = client.read_reply_within(Duration::from_secs(8)).await;
+    assert!(r.starts_with("425 Failed to establish connection."), "{r}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD),
+        "nothing was uploaded: {events:?}"
+    );
+    srv.handle.abort();
+}
+
+/// A data connection that goes quiet mid-file is a fragment, not a file: the reply is vsftpd's
+/// 426 and the event says the upload is incomplete, while the fragment is still kept as evidence.
+#[tokio::test]
+async fn stor_that_stalls_mid_transfer_is_426_and_recorded_as_incomplete() {
+    let srv = TestServer::start().await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    client.login("root", "toor").await;
+    let data_addr = client.pasv().await;
+    let r = client.send("STOR /tmp/partial.bin").await;
+    assert!(r.starts_with("150"), "{r}");
+    let fragment = b"MZ-first-half-of-a-payload";
+    let mut data = TcpStream::connect(data_addr).await.unwrap();
+    data.write_all(fragment).await.unwrap();
+    // Keep the data connection open and silent past the idle timeout.
+    let r = client.read_reply_within(Duration::from_secs(8)).await;
+    assert!(r.starts_with("426 Failure reading network stream."), "{r}");
+    drop(data);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let events = srv.events().await;
+    let upload = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .expect("the fragment is still captured");
+    assert_eq!(upload.metadata["complete"], false);
+    assert_eq!(upload.metadata["wire_size"], fragment.len() as u64);
+    assert_eq!(upload.sample.as_ref().unwrap().size, fragment.len() as u64);
+    srv.handle.abort();
+}
+
+/// LIST with no data connection sent nothing; "Directory send OK" claimed otherwise.
+#[tokio::test]
+async fn list_without_a_data_connection_is_425() {
+    let srv = TestServer::start().await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    client.login("root", "toor").await;
+    let _ = client.pasv().await;
+    let r = client.send("LIST").await;
+    assert!(r.starts_with("150"), "{r}");
+    let r = client.read_reply_within(Duration::from_secs(8)).await;
+    assert!(r.starts_with("425 Failed to establish connection."), "{r}");
     srv.handle.abort();
 }
 

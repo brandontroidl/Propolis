@@ -74,6 +74,9 @@ When `truncated` is true the `sha256` and `size` describe a prefix, not the file
 the IP detail page shows such rows with status `truncated` instead of `captured`.
 FTP drains at most a further 10 MB past its cap before closing the data
 connection, so a `wire_size` of 20 MB on an FTP row is a floor, not the total.
+FTP rows also carry `complete`: false when the data connection stalled or failed
+before the client closed it, or the sensor stopped reading at the drain cap, so the
+captured bytes are a fragment of whatever was being sent.
 
 ## Signal types
 

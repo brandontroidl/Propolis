@@ -52,6 +52,48 @@ fn data_peer_matches(control_ip: IpAddr, data_peer: SocketAddr) -> bool {
     normalize_dual_stack(data_peer).ip() == control_ip
 }
 
+/// How a STOR data transfer ended. In stream mode the client closing the data connection is the
+/// end of the file; anything else is not, and the control reply has to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorOutcome {
+    /// The client closed the data connection: the whole file arrived.
+    Complete,
+    /// The data connection went quiet or failed part way: what arrived is a fragment.
+    NetworkFailure,
+    /// The sensor stopped reading at `MAX_STOR_BODY + MAX_STOR_DRAIN`, the way a server stops
+    /// when it cannot write any more of the file.
+    DrainCapReached,
+}
+
+/// Read a STOR upload from its data connection. Returns the retained body (at most
+/// `MAX_STOR_BODY`), the bytes the client sent whether retained or not, and how the transfer
+/// ended. Past the cap the read keeps draining (bounded by `MAX_STOR_DRAIN`, so a slow trickle
+/// cannot hold the data connection open forever) purely to measure the real size.
+async fn receive_stor(
+    mut data: TcpStream,
+    idle_timeout: std::time::Duration,
+) -> (Vec<u8>, u64, StorOutcome) {
+    let mut body = Vec::new();
+    let mut wire_bytes: u64 = 0;
+    let mut chunk = [0u8; 4096];
+    let outcome = loop {
+        match tokio::time::timeout(idle_timeout, data.read(&mut chunk)).await {
+            Ok(Ok(0)) => break StorOutcome::Complete,
+            Ok(Err(_)) | Err(_) => break StorOutcome::NetworkFailure,
+            Ok(Ok(n)) => {
+                let take = MAX_STOR_BODY.saturating_sub(body.len()).min(n);
+                body.extend_from_slice(&chunk[..take]);
+                wire_bytes += n as u64;
+                if wire_bytes >= (MAX_STOR_BODY + MAX_STOR_DRAIN) as u64 {
+                    break StorOutcome::DrainCapReached;
+                }
+            }
+        }
+    };
+    drop(data);
+    (body, wire_bytes, outcome)
+}
+
 pub async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -217,22 +259,29 @@ pub async fn handle_connection(
                 if let Some(ref listener) = pasv_listener {
                     let _ =
                         write_line(&mut reader, b"150 Here comes the directory listing.\r\n").await;
-                    if let Ok(Ok((mut data, data_peer))) =
-                        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
-                            .await
-                    {
-                        if data_peer_matches(source_ip, data_peer) {
-                            // LIST is the long ls -l form; NLST is bare names only.
-                            let payload = if cmd == "NLST" {
-                                CANNED_NLST
-                            } else {
-                                CANNED_LIST
-                            };
-                            let _ = data.write_all(payload.as_bytes()).await;
-                        }
-                        drop(data);
-                    }
-                    let _ = write_line(&mut reader, b"226 Directory send OK.\r\n").await;
+                    let reply: &[u8] =
+                        match tokio::time::timeout(bounds.idle_timeout, listener.accept()).await {
+                            Ok(Ok((mut data, data_peer))) => {
+                                if data_peer_matches(source_ip, data_peer) {
+                                    // LIST is the long ls -l form; NLST is bare names only.
+                                    let payload = if cmd == "NLST" {
+                                        CANNED_NLST
+                                    } else {
+                                        CANNED_LIST
+                                    };
+                                    let _ = data.write_all(payload.as_bytes()).await;
+                                    drop(data);
+                                    b"226 Directory send OK.\r\n"
+                                } else {
+                                    drop(data);
+                                    b"425 Security: bad IP connecting.\r\n"
+                                }
+                            }
+                            // No data connection arrived: nothing was sent, so "send OK" would
+                            // report a transfer that never happened.
+                            _ => b"425 Failed to establish connection.\r\n",
+                        };
+                    let _ = write_line(&mut reader, reply).await;
                 } else {
                     let _ = write_line(&mut reader, b"425 Use PORT or PASV first.\r\n").await;
                 }
@@ -241,52 +290,40 @@ pub async fn handle_connection(
                 let filename = sanitize_value(arg, 255);
                 if let Some(ref listener) = pasv_listener {
                     let _ = write_line(&mut reader, b"150 Ok to send data.\r\n").await;
-                    if let Ok(Ok((mut data, data_peer))) =
-                        tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
-                            .await
-                    {
-                        // Refuse a data connection whose source IP is not the control peer's: it is
-                        // an off-path hijacker racing the passive port, and capturing its upload
-                        // would attribute the sample to the control connection's source_ip.
-                        if !data_peer_matches(source_ip, data_peer) {
-                            drop(data);
-                            let _ =
-                                write_line(&mut reader, b"425 Security: bad IP connecting.\r\n")
-                                    .await;
-                            continue;
-                        }
-                        let mut body = Vec::new();
-                        // Bytes the client sent, retained or not, so the emitted event can say
-                        // whether `body` is the whole file or a capped prefix. Past the cap the
-                        // read keeps draining (bounded by MAX_STOR_DRAIN, so a slow trickle
-                        // cannot hold the data connection open forever) purely to learn that.
-                        let mut wire_bytes: u64 = 0;
-                        let mut chunk = [0u8; 4096];
-                        loop {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(10),
-                                data.read(&mut chunk),
-                            )
-                            .await
-                            {
-                                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                                Ok(Ok(n)) => {
-                                    let take = MAX_STOR_BODY.saturating_sub(body.len()).min(n);
-                                    body.extend_from_slice(&chunk[..take]);
-                                    wire_bytes += n as u64;
-                                    if wire_bytes >= (MAX_STOR_BODY + MAX_STOR_DRAIN) as u64 {
-                                        break;
-                                    }
-                                }
+                    let (data, data_peer) =
+                        match tokio::time::timeout(bounds.idle_timeout, listener.accept()).await {
+                            Ok(Ok(accepted)) => accepted,
+                            // No data connection: no transfer happened, and "Transfer complete"
+                            // used to be the answer anyway.
+                            _ => {
+                                let _ = write_line(
+                                    &mut reader,
+                                    b"425 Failed to establish connection.\r\n",
+                                )
+                                .await;
+                                continue;
                             }
-                        }
+                        };
+                    // Refuse a data connection whose source IP is not the control peer's: it is
+                    // an off-path hijacker racing the passive port, and capturing its upload
+                    // would attribute the sample to the control connection's source_ip.
+                    if !data_peer_matches(source_ip, data_peer) {
                         drop(data);
+                        let _ =
+                            write_line(&mut reader, b"425 Security: bad IP connecting.\r\n").await;
+                        continue;
+                    }
+                    let (body, wire_bytes, outcome) = receive_stor(data, bounds.idle_timeout).await;
+                    let complete = outcome == StorOutcome::Complete;
 
-                        let orig_name = filename.clone();
-                        let job = CaptureJob {
-                            body,
-                            orig_name,
-                            event_builder: Box::new(move |sample: SampleRef| SensorEvent {
+                    let orig_name = filename.clone();
+                    let job = CaptureJob {
+                        body,
+                        orig_name,
+                        event_builder: Box::new(move |sample: SampleRef| {
+                            let mut metadata = upload_metadata(PROTOCOL_LABEL, &sample, wire_bytes);
+                            metadata["complete"] = serde_json::Value::Bool(complete);
+                            SensorEvent {
                                 v: WIRE_VERSION,
                                 source_ip,
                                 wan_ip,
@@ -295,15 +332,20 @@ pub async fn handle_connection(
                                 protocol: PROTO_TCP.to_string(),
                                 authenticated: logged_in,
                                 observed_at: chrono::Utc::now(),
-                                metadata: upload_metadata(PROTOCOL_LABEL, &sample, wire_bytes),
+                                metadata,
                                 sample: Some(sample),
                                 session_id: Some(session_id),
                                 occurrence_id: None,
-                            }),
-                        };
-                        let _ = handoff.submit(job);
-                    }
-                    let _ = write_line(&mut reader, b"226 Transfer complete.\r\n").await;
+                            }
+                        }),
+                    };
+                    let _ = handoff.submit(job);
+                    let reply: &[u8] = match outcome {
+                        StorOutcome::Complete => b"226 Transfer complete.\r\n",
+                        StorOutcome::NetworkFailure => b"426 Failure reading network stream.\r\n",
+                        StorOutcome::DrainCapReached => b"451 Failure writing to local file.\r\n",
+                    };
+                    let _ = write_line(&mut reader, reply).await;
                 } else {
                     let _ = write_line(&mut reader, b"425 Use PORT or PASV first.\r\n").await;
                 }

@@ -423,6 +423,27 @@ async fn postgresql_captures_username() {
         "NoData alone for a portal"
     );
 
+    // A statement with a placeholder describes that placeholder: a client told its `$1` does
+    // not exist (zero parameters, as the first fix answered) had a malformed exchange too.
+    let typed_sql = b"SELECT $1::integer\0";
+    let mut typed = vec![b'P'];
+    typed.extend_from_slice(&((4 + 3 + typed_sql.len() + 2) as i32).to_be_bytes());
+    typed.extend_from_slice(b"s1\0");
+    typed.extend_from_slice(typed_sql);
+    typed.extend_from_slice(&0i16.to_be_bytes());
+    typed.extend_from_slice(&[b'D', 0, 0, 0, 8, b'S', b's', b'1', 0]);
+    typed.extend_from_slice(&flush);
+    conn.write_all(&typed).await.unwrap();
+    assert_eq!(read_msg(&mut conn).await.0, b'1');
+    let (tag, body) = read_msg(&mut conn).await;
+    assert_eq!(tag, b't');
+    assert_eq!(
+        body,
+        vec![0, 1, 0, 0, 0, 23],
+        "one int4 parameter from the cast"
+    );
+    assert_eq!(read_msg(&mut conn).await.0, b'n');
+
     // Error recovery: after a refused Execute everything up to Sync is discarded, a simple
     // Query included. It used to be answered (and recorded) inside the error state.
     conn.write_all(&rest).await.unwrap();
@@ -474,7 +495,7 @@ async fn postgresql_captures_username() {
         .collect();
     assert_eq!(
         queries.len(),
-        4,
+        5,
         "one command event per handled statement: {events:?}"
     );
     assert_eq!(
@@ -488,6 +509,10 @@ async fn postgresql_captures_username() {
     );
     assert_eq!(
         queries[3].metadata.get("command").and_then(|v| v.as_str()),
+        Some("SELECT $1::integer")
+    );
+    assert_eq!(
+        queries[4].metadata.get("command").and_then(|v| v.as_str()),
         Some("SELECT 'after sync'"),
         "the Query discarded in the error state is not recorded"
     );

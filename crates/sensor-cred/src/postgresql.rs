@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -173,6 +174,9 @@ pub async fn handle_connection(
     // Extended-protocol error state: after a refused Execute a real server discards everything
     // until the client's Sync, then answers ReadyForQuery.
     let mut skip_until_sync = false;
+    // Parameter types per prepared statement, so Describe can answer for the statement the
+    // client actually parsed.
+    let mut statements: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
     loop {
         let mut type_buf = [0u8; 1];
         if timed_read_exact(&mut stream, &mut type_buf, bounds.idle_timeout)
@@ -236,10 +240,17 @@ pub async fn handle_connection(
             // Parse, so that is where it is recorded; Execute is refused the way the simple path
             // is, and everything after a refusal is discarded until Sync, as a real server does.
             b'P' => {
-                // statement name NUL, query NUL, i16 parameter-type count, ...
+                // statement name NUL, query NUL, i16 parameter-type count, i32 OIDs...
                 let mut parts = body.split(|&b| b == 0);
-                let _name = parts.next();
-                let sql = String::from_utf8_lossy(parts.next().unwrap_or(&[]));
+                let name = parts.next().unwrap_or(&[]).to_vec();
+                let sql_bytes = parts.next().unwrap_or(&[]);
+                let sql = String::from_utf8_lossy(sql_bytes);
+                let types_at = name.len() + 1 + sql_bytes.len() + 1;
+                let params = parameter_types(&sql, body.get(types_at..).unwrap_or(&[]));
+                if statements.len() >= MAX_STATEMENTS {
+                    statements.clear();
+                }
+                statements.insert(name, params);
                 let _ = emitter
                     .append(&query_event(source_ip, wan_ip, &sql, session_id))
                     .await;
@@ -254,11 +265,16 @@ pub async fn handle_connection(
             }
             // Describe: a statement ('S') is answered with its parameter list before the row
             // description; a portal ('P') with the row description alone. A client that
-            // described a statement and got only NoData had a malformed exchange.
+            // described a statement and got only NoData had a malformed exchange, and one whose
+            // `SELECT $1::integer` came back as zero parameters was told its own placeholders
+            // do not exist.
             b'D' => {
                 let mut reply = Vec::new();
                 if body.first() == Some(&b'S') {
-                    reply.extend_from_slice(&PARAMETER_DESCRIPTION_EMPTY);
+                    let name = body.get(1..).unwrap_or(&[]);
+                    let name = name.strip_suffix(&[0]).unwrap_or(name);
+                    let params = statements.get(name).cloned().unwrap_or_default();
+                    reply.extend_from_slice(&parameter_description(&params));
                 }
                 reply.extend_from_slice(&NO_DATA);
                 if stream.write_all(&reply).await.is_err() {
@@ -288,8 +304,110 @@ const PARSE_COMPLETE: [u8; 5] = [b'1', 0, 0, 0, 4];
 const BIND_COMPLETE: [u8; 5] = [b'2', 0, 0, 0, 4];
 const CLOSE_COMPLETE: [u8; 5] = [b'3', 0, 0, 0, 4];
 const NO_DATA: [u8; 5] = [b'n', 0, 0, 0, 4];
-/// ParameterDescription with zero parameters (i16 count = 0).
-const PARAMETER_DESCRIPTION_EMPTY: [u8; 7] = [b't', 0, 0, 0, 6, 0, 0];
+/// Prepared statements one session may hold; the map is cleared past this, as a bound.
+const MAX_STATEMENTS: usize = 64;
+/// Placeholders one statement may declare; a real server allows 65535.
+const MAX_PARAMETERS: usize = 256;
+
+/// ParameterDescription: i16 count then one i32 type OID per parameter.
+fn parameter_description(oids: &[u32]) -> Vec<u8> {
+    let mut msg = vec![b't'];
+    msg.extend_from_slice(&((4 + 2 + 4 * oids.len()) as i32).to_be_bytes());
+    msg.extend_from_slice(&(oids.len() as i16).to_be_bytes());
+    for oid in oids {
+        msg.extend_from_slice(&oid.to_be_bytes());
+    }
+    msg
+}
+
+/// The parameter types a statement resolves to. Parse may declare them; an undeclared (OID 0)
+/// or undeclared-by-count placeholder is resolved from an explicit `$n::type` cast in the SQL,
+/// else to `text`, the type a real server gives an otherwise unconstrained literal. A real
+/// server infers from column types too; this box has no columns, so `text` is its answer.
+fn parameter_types(sql: &str, declared: &[u8]) -> Vec<u32> {
+    let count = declared
+        .get(..2)
+        .map(|b| i16::from_be_bytes([b[0], b[1]]).max(0) as usize)
+        .unwrap_or(0);
+    let mut oids: Vec<u32> = (0..count)
+        .map(|i| {
+            declared
+                .get(2 + 4 * i..6 + 4 * i)
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+                .unwrap_or(0)
+        })
+        .collect();
+    let placeholders = placeholder_count(sql).min(MAX_PARAMETERS);
+    if oids.len() < placeholders {
+        oids.resize(placeholders, 0);
+    }
+    oids.truncate(MAX_PARAMETERS);
+    for (i, oid) in oids.iter_mut().enumerate() {
+        if *oid == 0 {
+            *oid = cast_type(sql, i + 1).unwrap_or(OID_TEXT);
+        }
+    }
+    oids
+}
+
+const OID_TEXT: u32 = 25;
+
+/// The highest `$n` in the statement.
+fn placeholder_count(sql: &str) -> usize {
+    let mut max = 0usize;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && end - start < 5 && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start
+                && let Ok(n) = sql[start..end].parse::<usize>()
+            {
+                max = max.max(n);
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    max
+}
+
+/// The type OID of an explicit `$n::type` cast in the statement, for the common names.
+fn cast_type(sql: &str, n: usize) -> Option<u32> {
+    let marker = format!("${n}::");
+    let rest = &sql[sql.find(&marker)? + marker.len()..];
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    Some(match name.as_str() {
+        "bool" | "boolean" => 16,
+        "bytea" => 17,
+        "int8" | "bigint" => 20,
+        "int2" | "smallint" => 21,
+        "int4" | "int" | "integer" => 23,
+        "text" => OID_TEXT,
+        "oid" => 26,
+        "json" => 114,
+        "float4" | "real" => 700,
+        "float8" | "double" => 701,
+        "inet" => 869,
+        "varchar" => 1043,
+        "date" => 1082,
+        "timestamp" => 1114,
+        "timestamptz" => 1184,
+        "numeric" | "decimal" => 1700,
+        "uuid" => 2950,
+        "jsonb" => 3802,
+        _ => return None,
+    })
+}
 
 /// Largest message accepted in the query phase; a statement is text, not a bulk transfer.
 const MAX_QUERY_MSG: i32 = 65536;
@@ -480,6 +598,30 @@ mod tests {
         assert_eq!(parse_startup_params(&data, "user"), "postgres");
         assert_eq!(parse_startup_params(&data, "database"), "mydb");
         assert_eq!(parse_startup_params(&data, "missing"), "");
+    }
+
+    #[test]
+    fn parameter_types_come_from_declaration_cast_or_default_to_text() {
+        // Declared int4 for $1, nothing for $2: $2 is resolved from its cast.
+        let mut declared = 1i16.to_be_bytes().to_vec();
+        declared.extend_from_slice(&23u32.to_be_bytes());
+        assert_eq!(
+            parameter_types("SELECT $1, $2::bigint", &declared),
+            vec![23, 20]
+        );
+        // Undeclared and uncast: text.
+        assert_eq!(parameter_types("SELECT $1", &[]), vec![25]);
+        // Declared as unspecified (0) with a cast: the cast wins.
+        let mut unspecified = 1i16.to_be_bytes().to_vec();
+        unspecified.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(
+            parameter_types("SELECT $1::integer", &unspecified),
+            vec![23]
+        );
+        assert_eq!(parameter_types("SELECT 1", &[]), Vec::<u32>::new());
+        let msg = parameter_description(&[23, 20]);
+        assert_eq!(&msg[..7], &[b't', 0, 0, 0, 14, 0, 2]);
+        assert_eq!(&msg[7..11], &23u32.to_be_bytes());
     }
 
     #[test]

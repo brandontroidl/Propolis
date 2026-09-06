@@ -151,7 +151,9 @@ I/O (`:9-29`). This is asserted by `never_exec_static_check` and
   handshake returning `GAYFGT`, `:647-776`), `cat` (fakefs plus a special
   `/proc/self/cmdline` returning argv), `ls`, `wget`/`curl` (canned transcripts,
   `-O-`/`-qO-` writes body to stdout), `ping` (canned replies), `sh`/`bash`/`ash`
-  (nested shell; `sh -c "CMD"` dispatches CMD), `busybox` (multi-call banner
+  (nested shell; `sh -c "CMD"` dispatches CMD), `enable` (bash's builtin list, since
+  Mirai's telnet preamble sends it and only a non-bash says "command not found"), `mount`
+  (the fake filesystem's mount table), `busybox` (multi-call banner
   v1.31.1 plus applet dispatch; unknown applet gives `applet not found`),
   `tftp`/`ftpget` (silent; the download url is synthesized from the separate host and file
   arguments as `tftp://host[:port]/file` / `ftp://host[:port]/file`, since neither command

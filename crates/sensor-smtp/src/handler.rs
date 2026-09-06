@@ -79,7 +79,7 @@ pub async fn handle_connection(
     let mut total_read: u64 = 0;
     // Message body accumulated across BDAT chunks until the LAST one arrives, and the bytes the
     // client sent for it (the body stops growing at MAX_DATA_BODY; the count does not).
-    let mut bdat_body = String::new();
+    let mut bdat_body: Vec<u8> = Vec::new();
     let mut bdat_received: usize = 0;
 
     loop {
@@ -142,8 +142,14 @@ pub async fn handle_connection(
             let _ = write_reply(&mut reader, b"250 2.1.5 Ok\r\n").await;
         } else if upper == "DATA" {
             let _ = write_reply(&mut reader, b"354 End data with <CR><LF>.<CR><LF>\r\n").await;
-            let (body, received) = read_data_body(&mut reader, &bounds, &mut total_read).await;
-            let subject = extract_header(&body, "Subject");
+            // No terminating `.` line means no message: the session ends without a "queued".
+            let Some((body, received)) =
+                read_data_body(&mut reader, &bounds, &mut total_read).await
+            else {
+                return;
+            };
+            let text = String::from_utf8_lossy(&body);
+            let subject = extract_header(&text, "Subject");
             let msg = ReceivedMessage {
                 mail_from: &mail_from,
                 rcpt_to: &rcpt_to,
@@ -185,7 +191,8 @@ pub async fn handle_connection(
                     bdat_received += chunk.len();
                     append_bounded(&mut bdat_body, &chunk);
                     if last {
-                        let subject = extract_header(&bdat_body, "Subject");
+                        let text = String::from_utf8_lossy(&bdat_body);
+                        let subject = extract_header(&text, "Subject");
                         let msg = ReceivedMessage {
                             mail_from: &mail_from,
                             rcpt_to: &rcpt_to,
@@ -449,27 +456,61 @@ async fn read_line_bounded(
     }
 }
 
-/// Read exactly `size` raw octets of a BDAT chunk, never more than the session's remaining
-/// capture budget. `None` when the client sent fewer than it declared (it closed, or went quiet
-/// past the idle timeout) or the budget is spent: an incomplete chunk is not a message, and it
-/// must not be acknowledged as one. A chunk larger than the budget is cut at the budget; the
-/// unread remainder then reads as garbage commands and the budget check ends the session.
+/// `read_line_bounded` for the message body: the raw line bytes with the terminator stripped,
+/// and whether a terminator was actually seen. Decoding per line would count a replacement
+/// character's three bytes where the wire carried one, and the body's own decoding happens once
+/// over the whole message.
+async fn read_body_line(
+    reader: &mut BufReader<TcpStream>,
+    bounds: &ConnectionBounds,
+    total: &mut u64,
+) -> Option<Vec<u8>> {
+    if *total >= bounds.max_captured_bytes {
+        return None;
+    }
+    let remaining = bounds.max_captured_bytes.saturating_sub(*total);
+    let cap = (MAX_LINE_LEN as u64).min(remaining).max(1);
+    let mut buf = Vec::new();
+    let mut limited = (&mut *reader).take(cap);
+    match tokio::time::timeout(bounds.idle_timeout, limited.read_until(b'\n', &mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => None,
+        Ok(Ok(n)) => {
+            *total += n as u64;
+            if buf.last() != Some(&b'\n') {
+                // Cut by the cap or the budget, not a line the client finished.
+                return None;
+            }
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            Some(buf)
+        }
+    }
+}
+
+/// Read exactly the `size` raw octets of a BDAT chunk. `Some` only when the whole declared chunk
+/// arrived: a client that declared more than the session's remaining capture budget, hung up,
+/// or went quiet past the idle timeout has not delivered the chunk, and `None` ends the session
+/// without an acknowledgement. Reading what fit in the budget and calling that the chunk was
+/// how a 512-byte declaration became a "queued" 156-byte message. A declared size of zero is a
+/// valid, complete, empty chunk (RFC 3030 allows `BDAT 0 LAST`), not exhausted capacity.
 async fn read_raw_chunk(
     reader: &mut BufReader<TcpStream>,
     size: u64,
     bounds: &ConnectionBounds,
     total: &mut u64,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     let remaining = bounds.max_captured_bytes.saturating_sub(*total);
-    let want = size.min(remaining) as usize;
-    if want == 0 {
+    if size > remaining {
+        *total = bounds.max_captured_bytes;
         return None;
     }
-    let mut buf = vec![0u8; want];
+    let mut buf = vec![0u8; size as usize];
     match tokio::time::timeout(bounds.idle_timeout, reader.read_exact(&mut buf)).await {
         Ok(Ok(_)) => {
-            *total += want as u64;
-            Some(String::from_utf8_lossy(&buf).into_owned())
+            *total += size;
+            Some(buf)
         }
         _ => {
             *total = bounds.max_captured_bytes;
@@ -478,43 +519,36 @@ async fn read_raw_chunk(
     }
 }
 
-/// Append `text` to `body` up to `MAX_DATA_BODY` bytes, on a character boundary. Returns how many
-/// bytes were actually kept, so the caller can record the true received size beside it.
-fn append_bounded(body: &mut String, text: &str) -> usize {
-    let mut kept = 0;
-    for c in text.chars() {
-        if body.len() + c.len_utf8() > MAX_DATA_BODY {
-            break;
-        }
-        body.push(c);
-        kept += c.len_utf8();
-    }
-    kept
+/// Append `bytes` to `body` up to `MAX_DATA_BODY` bytes. The body is kept as bytes and decoded
+/// once, at the end, so a multibyte character split across two BDAT chunks or cut by the cap
+/// is decoded from the whole, never from each fragment.
+fn append_bounded(body: &mut Vec<u8>, bytes: &[u8]) {
+    let room = MAX_DATA_BODY.saturating_sub(body.len());
+    body.extend_from_slice(&bytes[..bytes.len().min(room)]);
 }
 
 /// The message body up to `MAX_DATA_BODY` bytes, and the number of body bytes the client sent,
 /// which keeps counting after the body stops growing so the event can say the body was cut.
+/// `None` when the client never sent the terminating `.` line (it hung up, went quiet, or ran
+/// out of budget): that is an unfinished transfer, not a message, and it gets no "queued".
 async fn read_data_body(
     reader: &mut BufReader<TcpStream>,
     bounds: &ConnectionBounds,
     total: &mut u64,
-) -> (String, usize) {
-    let mut body = String::new();
+) -> Option<(Vec<u8>, usize)> {
+    let mut body = Vec::new();
     let mut received = 0usize;
     loop {
-        let Some(line) = read_line_bounded(reader, bounds, total).await else {
-            break;
-        };
-        if line == "." {
-            break;
+        let line = read_body_line(reader, bounds, total).await?;
+        if line == b"." {
+            return Some((body, received));
         }
         // Dot-stuffing: a line starting with "." has the leading dot removed
-        let actual = line.strip_prefix('.').unwrap_or(&line);
+        let actual = line.strip_prefix(b".").unwrap_or(&line);
         received += actual.len() + 1;
         append_bounded(&mut body, actual);
-        append_bounded(&mut body, "\n");
+        append_bounded(&mut body, b"\n");
     }
-    (body, received)
 }
 
 #[cfg(test)]

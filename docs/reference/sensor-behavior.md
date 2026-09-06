@@ -365,9 +365,11 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
   AUTH PLAIN (decodes username, drops password → `honeypot_login_attempt`), AUTH
   LOGIN (username captured, password dropped), MAIL FROM / RCPT TO, DATA (captures
   mail_from/rcpt_to/subject/body_size → `honeypot_command_exec`, replies with a
-  Postfix queue id), BDAT `<size> [LAST]` (CHUNKING: raw chunks accumulate until LAST,
-  then the same message event with `chunking: true`; a chunk the client does not finish
-  sending is neither acknowledged nor recorded), RSET, NOOP, QUIT, VRFY (252), EXPN (502),
+  Postfix queue id; without the terminating `.` line nothing is acknowledged or recorded),
+  BDAT `<size> [LAST]` (CHUNKING: raw chunks accumulate as bytes until LAST, then the same
+  message event with `chunking: true`; `BDAT 0 LAST` is a valid empty final chunk; a chunk
+  the client does not finish sending, or that exceeds the session byte budget, is neither
+  acknowledged nor recorded), RSET, NOOP, QUIT, VRFY (252), EXPN (502),
   unknown→502. Caps: line 8192, username 255; a message body is kept up to 65536 bytes and
   the event records the full `body_size` received plus `truncated` when it was cut.
 - **Bounds:** common defaults, `max_concurrent` 256. **Bound parsing falls back to

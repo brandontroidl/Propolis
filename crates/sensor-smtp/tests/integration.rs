@@ -27,6 +27,10 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> TestServer {
+        Self::start_with_bounds(test_bounds()).await
+    }
+
+    async fn start_with_bounds(bounds: ConnectionBounds) -> TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
@@ -34,7 +38,7 @@ impl TestServer {
             "127.0.0.1:0".parse().unwrap(),
             log_path.clone(),
             wan_resolver,
-            test_bounds(),
+            bounds,
         )
         .await
         .unwrap();
@@ -439,6 +443,177 @@ async fn bdat_chunks_accumulate_until_last() {
     assert_eq!(
         data_event.metadata.get("subject").and_then(|v| v.as_str()),
         Some("Two")
+    );
+    srv.handle.abort();
+}
+
+/// A chunk larger than what is left of the session budget cannot arrive whole, so it is never
+/// acknowledged: the sensor used to read the remainder and answer "queued" for part of a chunk.
+#[tokio::test]
+async fn bdat_past_the_session_budget_is_neither_acknowledged_nor_recorded() {
+    let bounds = ConnectionBounds {
+        max_captured_bytes: 256,
+        ..test_bounds()
+    };
+    let srv = TestServer::start_with_bounds(bounds).await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let _ = client.send("MAIL FROM:<a@evil.com>").await;
+    let _ = client.send("RCPT TO:<b@example.com>").await;
+    let chunk = vec![b'x'; 512];
+    client
+        .reader
+        .get_mut()
+        .write_all(b"BDAT 512 LAST\r\n")
+        .await
+        .unwrap();
+    let _ = client.reader.get_mut().write_all(&chunk).await;
+    let mut rest = String::new();
+    let got = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.reader.read_to_string(&mut rest),
+    )
+    .await;
+    assert!(
+        got.is_ok() && !rest.contains("250"),
+        "a chunk past the budget is not acknowledged: {rest:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.metadata.get("command").and_then(|v| v.as_str()) == Some("DATA")),
+        "no message event for a chunk that never fully arrived: {events:?}"
+    );
+    srv.handle.abort();
+}
+
+/// RFC 3030 allows the final chunk to be empty; `BDAT 0 LAST` ends the message rather than the
+/// connection, which a zero-length chunk used to do.
+#[tokio::test]
+async fn bdat_zero_length_last_chunk_completes_the_message() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let _ = client.send("MAIL FROM:<a@evil.com>").await;
+    let _ = client.send("RCPT TO:<b@example.com>").await;
+    let body = b"Subject: Empty tail\r\n\r\nbody\r\n";
+    client
+        .reader
+        .get_mut()
+        .write_all(format!("BDAT {}\r\n", body.len()).as_bytes())
+        .await
+        .unwrap();
+    client.reader.get_mut().write_all(body).await.unwrap();
+    let r = client.read_reply().await;
+    assert!(r.starts_with("250"), "{r}");
+    let r = client.send("BDAT 0 LAST").await;
+    assert!(r.contains("queued as"), "an empty LAST chunk queues: {r}");
+    let r = client.send("NOOP").await;
+    assert!(r.starts_with("250"), "session stays open: {r}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let data_event = events
+        .iter()
+        .find(|e| e.metadata.get("command").and_then(|v| v.as_str()) == Some("DATA"))
+        .expect("the message is recorded");
+    assert_eq!(
+        data_event
+            .metadata
+            .get("body_size")
+            .and_then(|v| v.as_u64()),
+        Some(body.len() as u64)
+    );
+    assert_eq!(
+        data_event.metadata.get("subject").and_then(|v| v.as_str()),
+        Some("Empty tail")
+    );
+    srv.handle.abort();
+}
+
+/// A multi-byte character split between two chunks is one character in the message; decoding
+/// each chunk on its own turned it into two replacement characters and miscounted the bytes.
+#[tokio::test]
+async fn bdat_multibyte_character_split_across_chunks_is_decoded_whole() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let _ = client.send("MAIL FROM:<a@evil.com>").await;
+    let _ = client.send("RCPT TO:<b@example.com>").await;
+    let body = "Subject: café\r\n\r\nx\r\n".as_bytes();
+    let split = body.iter().position(|&b| b == 0xC3).unwrap() + 1;
+    let (first, second) = body.split_at(split);
+    for (chunk, last) in [(first, ""), (second, " LAST")] {
+        client
+            .reader
+            .get_mut()
+            .write_all(format!("BDAT {}{last}\r\n", chunk.len()).as_bytes())
+            .await
+            .unwrap();
+        client.reader.get_mut().write_all(chunk).await.unwrap();
+        let r = client.read_reply().await;
+        assert!(r.starts_with("250"), "{r}");
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let data_event = events
+        .iter()
+        .find(|e| e.metadata.get("command").and_then(|v| v.as_str()) == Some("DATA"))
+        .unwrap();
+    assert_eq!(
+        data_event.metadata.get("subject").and_then(|v| v.as_str()),
+        Some("café")
+    );
+    assert_eq!(
+        data_event
+            .metadata
+            .get("body_size")
+            .and_then(|v| v.as_u64()),
+        Some(body.len() as u64)
+    );
+    srv.handle.abort();
+}
+
+/// DATA is complete only at the `.` line. A client that hangs up before it has not sent a
+/// message, and the sensor used to answer "queued" for whatever had arrived.
+#[tokio::test]
+async fn data_without_terminating_dot_is_neither_acknowledged_nor_recorded() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let _ = client.send("MAIL FROM:<a@evil.com>").await;
+    let _ = client.send("RCPT TO:<b@example.com>").await;
+    let r = client.send("DATA").await;
+    assert!(r.starts_with("354"), "{r}");
+    client
+        .reader
+        .get_mut()
+        .write_all(b"Subject: Cut\r\n\r\nno terminator\r\n")
+        .await
+        .unwrap();
+    client.reader.get_mut().shutdown().await.unwrap();
+    let mut rest = String::new();
+    let got = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.reader.read_to_string(&mut rest),
+    )
+    .await;
+    assert!(
+        got.is_ok() && !rest.contains("250"),
+        "no acknowledgement without the terminating dot: {rest:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.metadata.get("command").and_then(|v| v.as_str()) == Some("DATA")),
+        "no message event for an unterminated DATA: {events:?}"
     );
     srv.handle.abort();
 }

@@ -343,8 +343,9 @@ Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
   (live-ish 7.2.4 dump with per-process random `run_id`/`master_replid`, real pid,
   advancing uptime, persona OS line, `:107-230`), CONFIG GET (canned), CONFIG SET
   (always OK; only `dir`/`dbfilename` - the RDB-RCE staging primitive - emit a
-  `honeypot_command_exec` indicator, `:376-400`), SET (always OK, key and value
-  captured, no real store), GET (always nil, no event), SLAVEOF/REPLICAOF (OK +
+  `honeypot_command_exec` indicator, `:376-400`), SET (OK; key and value captured,
+  and kept in a per-session store capped at 256 keys), GET (the value SET earlier this
+  session, else nil; no event), SLAVEOF/REPLICAOF (OK +
   captured args), EVAL/SCRIPT (canned compile error + captured args, **never runs
   Lua**), unknown → Redis-exact error. Caps: metadata string 255, value 1024.
 - **Bounds:** common defaults, `max_concurrent` 256. No spool.
@@ -363,8 +364,9 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
   AUTH PLAIN (decodes username, drops password → `honeypot_login_attempt`), AUTH
   LOGIN (username captured, password dropped), MAIL FROM / RCPT TO, DATA (captures
   mail_from/rcpt_to/subject/body_size → `honeypot_command_exec`, replies with a
-  Postfix queue id), RSET, NOOP, QUIT, VRFY (252), EXPN (502), unknown→502. Caps:
-  line 8192, DATA body 65536, username 255.
+  Postfix queue id), BDAT `<size> [LAST]` (CHUNKING: raw chunks accumulate until LAST,
+  then the same message event with `chunking: true`), RSET, NOOP, QUIT, VRFY (252),
+  EXPN (502), unknown→502. Caps: line 8192, message body 65536, username 255.
 - **Bounds:** common defaults, `max_concurrent` 256. **Bound parsing falls back to
   the default on invalid/zero input rather than refusing to start**
   (`main.rs:28-38`) - differs from the reject-on-zero sensors. No spool (message
@@ -433,7 +435,7 @@ per-protocol bind var is required.
 | **vnc** (`vnc.rs`) | RFB 3.8, VNC Auth type 2 (5900) | Sends a 16-byte random challenge, reads the DES response; the attempt is the signal (plaintext unrecoverable) → `honeypot_login_attempt` with no username (`:13-102`). |
 | **mysql** (`mysql.rs`) | MySQL 5.7.42 (3306) | Sends a greeting with per-connection random thread id + 20-byte scramble, parses the username from HandshakeResponse41, drops the password → login event (`:39-95`). |
 | **mssql** (`mssql.rs`) | SQL Server 2019 (15.0.16.57) TDS (1433) | PreLogin/Login7; parses the UTF-16LE username from Login7, sends LOGINACK (`:44-150`). |
-| **postgresql** (`postgresql.rs`) | PostgreSQL (5432) | StartupMessage (declines SSL with `N`), parses the `user` param, sends AuthenticationMD5Password with a per-connection random salt, reads and discards the PasswordMessage → login event (`:43-155`). |
+| **postgresql** (`postgresql.rs`) | PostgreSQL (5432) | StartupMessage (declines SSL with `N`), parses the `user` param, sends AuthenticationMD5Password with a per-connection random salt, reads and discards the PasswordMessage → login event; then AuthenticationOk, a PostgreSQL 14 ParameterStatus set, BackendKeyData and ReadyForQuery, and a query loop: each simple query → `honeypot_command_exec` with the statement text, answered `ERROR 42501 permission denied` and ReadyForQuery, until Terminate, 200 statements, or the byte budget. |
 | **mongodb** (`mongodb.rs`) | MongoDB OP_MSG (27017) | Answers isMaster/hello; on saslStart/authenticate extracts the SCRAM `n=<user>` or BSON `user` → login event (`:43-99, 218-270`). |
 
 - Every cred protocol emits `honeypot_connection` + `honeypot_login_attempt`

@@ -309,10 +309,67 @@ async fn postgresql_captures_username() {
     pw_msg.extend_from_slice(pw);
     conn.write_all(&pw_msg).await.unwrap();
 
-    // Read AuthenticationOk
-    let mut ok_type = [0u8; 1];
-    conn.read_exact(&mut ok_type).await.unwrap();
-    assert_eq!(ok_type[0], b'R');
+    // Read AuthenticationOk, the ParameterStatus set, BackendKeyData, then ReadyForQuery. The
+    // handler used to close right after AuthenticationOk, so a client never got to send its
+    // first statement and nothing the attacker meant to run was ever observed.
+    async fn read_msg(conn: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut t = [0u8; 1];
+        conn.read_exact(&mut t).await.unwrap();
+        let mut l = [0u8; 4];
+        conn.read_exact(&mut l).await.unwrap();
+        let mut body = vec![0u8; i32::from_be_bytes(l) as usize - 4];
+        conn.read_exact(&mut body).await.unwrap();
+        (t[0], body)
+    }
+    let (t, body) = read_msg(&mut conn).await;
+    assert_eq!(t, b'R');
+    assert_eq!(
+        i32::from_be_bytes(body[..4].try_into().unwrap()),
+        0,
+        "AuthenticationOk"
+    );
+    let mut saw_version = false;
+    let mut saw_key_data = false;
+    loop {
+        let (t, body) = read_msg(&mut conn).await;
+        match t {
+            b'S' => {
+                if body.starts_with(b"server_version\0") {
+                    saw_version = true;
+                }
+            }
+            b'K' => saw_key_data = true,
+            b'Z' => {
+                assert_eq!(body, b"I", "ReadyForQuery must report idle");
+                break;
+            }
+            other => panic!("unexpected message type {other:?} before ReadyForQuery"),
+        }
+    }
+    assert!(
+        saw_version && saw_key_data,
+        "a client library expects both before it will send"
+    );
+
+    // Send a simple query; it must be recorded and answered, and the session must stay open.
+    let sql = b"SELECT version()\0";
+    let mut q = vec![b'Q'];
+    q.extend_from_slice(&((4 + sql.len()) as i32).to_be_bytes());
+    q.extend_from_slice(sql);
+    conn.write_all(&q).await.unwrap();
+    let (t, body) = read_msg(&mut conn).await;
+    assert_eq!(t, b'E', "a query is refused, not ignored");
+    assert!(
+        body.windows(6).any(|w| w == b"C42501"),
+        "SQLSTATE in the error: {body:?}"
+    );
+    let (t, _) = read_msg(&mut conn).await;
+    assert_eq!(t, b'Z', "ReadyForQuery again: the session is still open");
+    // A second statement proves the loop, then Terminate.
+    conn.write_all(&q).await.unwrap();
+    assert_eq!(read_msg(&mut conn).await.0, b'E');
+    assert_eq!(read_msg(&mut conn).await.0, b'Z');
+    conn.write_all(&[b'X', 0, 0, 0, 4]).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let events = srv.events().await;
@@ -323,6 +380,19 @@ async fn postgresql_captures_username() {
     assert_eq!(
         login.metadata.get("username").and_then(|v| v.as_str()),
         Some("pgadmin")
+    );
+    let queries: Vec<&sensor_wire::SensorEvent> = events
+        .iter()
+        .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .collect();
+    assert_eq!(
+        queries.len(),
+        2,
+        "one command event per statement: {events:?}"
+    );
+    assert_eq!(
+        queries[0].metadata.get("command").and_then(|v| v.as_str()),
+        Some("SELECT version()")
     );
     assert_eq!(
         login

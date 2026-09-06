@@ -170,6 +170,9 @@ pub async fn handle_connection(
     // session open for the next statement instead of hanging up on the first.
     let mut total_read: u64 = 0;
     let mut messages = 0usize;
+    // Extended-protocol error state: after a refused Execute a real server discards everything
+    // until the client's Sync, then answers ReadyForQuery.
+    let mut skip_until_sync = false;
     loop {
         let mut type_buf = [0u8; 1];
         if timed_read_exact(&mut stream, &mut type_buf, bounds.idle_timeout)
@@ -216,20 +219,65 @@ pub async fn handle_connection(
             }
             // Terminate.
             b'X' => return,
-            // Extended-protocol Sync: the client is waiting for ReadyForQuery.
+            // Extended-protocol Sync ends the error state and the client waits for ReadyForQuery.
             b'S' => {
-                let mut reply = error_response("42501", "permission denied");
-                reply.extend_from_slice(&READY_FOR_QUERY_IDLE);
+                skip_until_sync = false;
+                if stream.write_all(&READY_FOR_QUERY_IDLE).await.is_err() {
+                    return;
+                }
+            }
+            // The extended protocol. A client library (psycopg, JDBC, Go's pq) sends Parse /
+            // Bind / Describe / Execute / Sync rather than a simple Query, and each step expects
+            // its completion message before the next; ignoring them, as this handler first did,
+            // stalled such clients on Flush and never recorded their SQL. The statement text is in
+            // Parse, so that is where it is recorded; Execute is refused the way the simple path
+            // is, and everything after a refusal is discarded until Sync, as a real server does.
+            _ if skip_until_sync => {}
+            b'P' => {
+                // statement name NUL, query NUL, i16 parameter-type count, ...
+                let mut parts = body.split(|&b| b == 0);
+                let _name = parts.next();
+                let sql = String::from_utf8_lossy(parts.next().unwrap_or(&[]));
+                let _ = emitter
+                    .append(&query_event(source_ip, wan_ip, &sql, session_id))
+                    .await;
+                if stream.write_all(&PARSE_COMPLETE).await.is_err() {
+                    return;
+                }
+            }
+            b'B' => {
+                if stream.write_all(&BIND_COMPLETE).await.is_err() {
+                    return;
+                }
+            }
+            b'D' => {
+                if stream.write_all(&NO_DATA).await.is_err() {
+                    return;
+                }
+            }
+            b'C' => {
+                if stream.write_all(&CLOSE_COMPLETE).await.is_err() {
+                    return;
+                }
+            }
+            b'E' => {
+                skip_until_sync = true;
+                let reply = error_response("42501", "permission denied");
                 if stream.write_all(&reply).await.is_err() {
                     return;
                 }
             }
-            // Parse / Bind / Describe / Execute / Flush and anything else: buffered by a real
-            // server until Sync, so answer nothing yet.
+            // Flush: every reply above was written as it happened, so nothing is pending.
+            b'H' => {}
             _ => {}
         }
     }
 }
+
+const PARSE_COMPLETE: [u8; 5] = [b'1', 0, 0, 0, 4];
+const BIND_COMPLETE: [u8; 5] = [b'2', 0, 0, 0, 4];
+const CLOSE_COMPLETE: [u8; 5] = [b'3', 0, 0, 0, 4];
+const NO_DATA: [u8; 5] = [b'n', 0, 0, 0, 4];
 
 /// Largest message accepted in the query phase; a statement is text, not a bulk transfer.
 const MAX_QUERY_MSG: i32 = 65536;

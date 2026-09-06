@@ -365,10 +365,44 @@ async fn postgresql_captures_username() {
     );
     let (t, _) = read_msg(&mut conn).await;
     assert_eq!(t, b'Z', "ReadyForQuery again: the session is still open");
-    // A second statement proves the loop, then Terminate.
+    // A second statement proves the loop.
     conn.write_all(&q).await.unwrap();
     assert_eq!(read_msg(&mut conn).await.0, b'E');
     assert_eq!(read_msg(&mut conn).await.0, b'Z');
+
+    // The extended protocol, as a client library sends it: Parse then Flush must yield
+    // ParseComplete at once (a Flush with no reply stalled such clients), then Bind, Execute
+    // and Sync yield BindComplete, the refusal, and ReadyForQuery. The SQL is recorded from
+    // Parse.
+    let ext_sql = b"SELECT 42 AS extended_probe\0";
+    let mut parse = vec![b'P'];
+    let parse_body_len = 4 + 1 + ext_sql.len() + 2; // len, empty name, query, 0 param types
+    parse.extend_from_slice(&(parse_body_len as i32).to_be_bytes());
+    parse.push(0);
+    parse.extend_from_slice(ext_sql);
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    parse.extend_from_slice(&[b'H', 0, 0, 0, 4]); // Flush
+    conn.write_all(&parse).await.unwrap();
+    assert_eq!(read_msg(&mut conn).await.0, b'1', "ParseComplete on Flush");
+    // Bind (empty portal, empty statement, no formats, no params, no result formats), Execute
+    // (empty portal, no row limit), Sync.
+    let mut rest = vec![b'B'];
+    let bind_body = [0u8, 0, 0, 0, 0, 0, 0, 0];
+    rest.extend_from_slice(&((4 + bind_body.len()) as i32).to_be_bytes());
+    rest.extend_from_slice(&bind_body);
+    rest.push(b'E');
+    rest.extend_from_slice(&9i32.to_be_bytes());
+    rest.push(0);
+    rest.extend_from_slice(&0i32.to_be_bytes());
+    rest.extend_from_slice(&[b'S', 0, 0, 0, 4]);
+    conn.write_all(&rest).await.unwrap();
+    assert_eq!(read_msg(&mut conn).await.0, b'2', "BindComplete");
+    assert_eq!(read_msg(&mut conn).await.0, b'E', "Execute is refused");
+    assert_eq!(
+        read_msg(&mut conn).await.0,
+        b'Z',
+        "Sync ends the error state"
+    );
     conn.write_all(&[b'X', 0, 0, 0, 4]).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -387,12 +421,17 @@ async fn postgresql_captures_username() {
         .collect();
     assert_eq!(
         queries.len(),
-        2,
+        3,
         "one command event per statement: {events:?}"
     );
     assert_eq!(
         queries[0].metadata.get("command").and_then(|v| v.as_str()),
         Some("SELECT version()")
+    );
+    assert_eq!(
+        queries[2].metadata.get("command").and_then(|v| v.as_str()),
+        Some("SELECT 42 AS extended_probe"),
+        "extended-protocol SQL is recorded from Parse"
     );
     assert_eq!(
         login

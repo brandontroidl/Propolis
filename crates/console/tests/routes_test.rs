@@ -1974,6 +1974,76 @@ async fn detail_malware_panel_groups_repeated_uploads_of_one_sha(pool: PgPool) {
     );
 }
 
+/// An upload whose transfer never finished (FTP stalled, SCP cut before its trailer) carries
+/// `complete: false` but, below the cap, `truncated: false`; the panel keyed on `truncated`
+/// alone and showed the fragment as an ordinary `captured` sample.
+#[sqlx::test(migrations = false)]
+async fn detail_malware_panel_marks_an_incomplete_upload(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.84";
+    seed_recommended(&pool, ip, 60).await;
+    let fragment = "cccc3ba075a5aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let whole = "dddd3ba075a5aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let upload = |sha: &str, complete: bool| {
+        ev_with_session(
+            ip,
+            "ftp",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": sha,
+                "sample_orig_name": "drop.bin",
+                "sample_size": 512,
+                "wire_size": 512,
+                "truncated": false,
+                "complete": complete,
+            }),
+            Uuid::now_v7(),
+        )
+    };
+    append_event(&pool, upload(fragment, false)).await.unwrap();
+    append_event(&pool, upload(whole, true)).await.unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let panel_start = body
+        .find("Malware from this IP")
+        .expect("malware panel heading must render");
+    let panel = &body[panel_start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    let row_of = |sha_short: &str| {
+        let start = panel
+            .find(sha_short)
+            .unwrap_or_else(|| panic!("{sha_short} row: {panel}"));
+        let row_start = panel[..start].rfind("<tr").unwrap_or(0);
+        let row_end = start + panel[start..].find("</tr>").unwrap_or(0);
+        &panel[row_start..row_end]
+    };
+    assert!(
+        row_of("cccc3ba075a5").contains("incomplete"),
+        "the fragment must not read as captured: {}",
+        row_of("cccc3ba075a5")
+    );
+    assert!(
+        row_of("dddd3ba075a5").contains("captured")
+            && !row_of("dddd3ba075a5").contains("incomplete"),
+        "{}",
+        row_of("dddd3ba075a5")
+    );
+}
+
 /// A sample uploaded to VirusTotal but not yet verdicted is stored as `-1/-1`. The samples page
 /// already rendered that as "pending"; the IP page fell through to the clean branch and showed a
 /// green "clean (0/-1)" for a sample nobody has judged yet.

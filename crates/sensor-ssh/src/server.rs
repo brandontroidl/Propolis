@@ -259,6 +259,11 @@ async fn handle_session(
     let mut binary_seen = false;
 
     // ---- Main encrypted packet loop ----
+    // Run as a block so that however the loop ends (clean close, read error, a failed write
+    // propagating with `?`) the evidence held in `handler` and `shell_capture` is still
+    // submitted below. A write error used to return straight out of this function and take a
+    // half-received SCP or SFTP file with it.
+    let loop_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
     loop {
         let payload =
             match transport::read_packet_encrypted(&mut stream, &mut c2s_cipher, c2s_seq).await {
@@ -552,6 +557,25 @@ async fn handle_session(
             }
         }
     }
+    Ok(())
+    }
+    .await;
+
+    // A transfer still open when the session ended is kept as an incomplete capture rather than
+    // dropped: the bytes that arrived are evidence, and the event says they are a fragment.
+    match &mut handler {
+        ChannelHandler::Scp(scp) => {
+            if let Some(job) = scp.abandon() {
+                let _ = handoff.submit(job);
+            }
+        }
+        ChannelHandler::Sftp(sftp) => {
+            for job in sftp.abandon() {
+                let _ = handoff.submit(job);
+            }
+        }
+        ChannelHandler::Shell(..) | ChannelHandler::Pending => {}
+    }
 
     // A binary payload was seen somewhere in the shell phase (a Mirai/Gafgyt dropper streamed
     // over the "shell" - never a real interactive command, since FakeShell's binary-flood
@@ -583,7 +607,7 @@ async fn handle_session(
         });
     }
 
-    Ok(())
+    loop_result
 }
 
 // ---- Helpers ----

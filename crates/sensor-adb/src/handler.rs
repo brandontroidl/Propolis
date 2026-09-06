@@ -181,7 +181,7 @@ impl SyncState {
                     // DONE's length field IS the mtime - no further payload bytes to consume.
                     self.buf.drain(..adb_proto::SYNC_HEADER_LEN);
                     if let Some(pending) = self.pending_send.take() {
-                        upload = Some(self.build_capture_job(pending));
+                        upload = Some(self.build_capture_job(pending, true));
                     }
                     response.extend_from_slice(&adb_proto::build_sync_message(
                         adb_proto::SYNC_OKAY,
@@ -252,7 +252,16 @@ impl SyncState {
         self.pending_send = None;
     }
 
-    fn build_capture_job(&self, pending: PendingSend) -> CaptureJob {
+    /// The stream or session is ending with a `SEND` still open (no `DONE` arrived). The bytes
+    /// that did are returned as a capture marked incomplete; they used to be dropped with the
+    /// stream.
+    fn abandon(&mut self) -> Option<CaptureJob> {
+        self.buf.clear();
+        let pending = self.pending_send.take()?;
+        (pending.wire_bytes > 0).then(|| self.build_capture_job(pending, false))
+    }
+
+    fn build_capture_job(&self, pending: PendingSend, complete: bool) -> CaptureJob {
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
         let session_id = self.session_id;
@@ -269,7 +278,7 @@ impl SyncState {
                 protocol: PROTO_TCP.to_string(),
                 authenticated: false,
                 observed_at: chrono::Utc::now(),
-                metadata: upload_metadata(PROTOCOL_LABEL, &sample, wire_size),
+                metadata: upload_metadata(PROTOCOL_LABEL, &sample, wire_size, complete),
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
@@ -398,66 +407,85 @@ pub async fn handle_connection(
     let mut streams: HashMap<u32, Stream> = HashMap::new();
     let mut next_stream_id: u32 = 1;
 
-    loop {
-        let Some((header, data)) = reader.read_message(&mut stream).await else {
-            return;
-        };
-
-        match header.command {
-            adb_proto::A_OPEN => {
-                if handle_open(
-                    &mut stream,
-                    &header,
-                    &data,
-                    &mut streams,
-                    &mut next_stream_id,
-                    source_ip,
-                    wan_ip,
-                    session_id,
-                    &emitter,
-                    peer_addr,
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-            }
-            adb_proto::A_WRTE => {
-                if handle_wrte(
-                    &mut stream,
-                    &header,
-                    &data,
-                    &mut streams,
-                    &emitter,
-                    &handoff,
-                    peer_addr,
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-            }
-            adb_proto::A_OKAY => {
-                // Flow-control ack for one of our own WRTEs; this handler never has more than
-                // one outstanding write per stream in flight, so there is nothing to unblock.
-            }
-            adb_proto::A_CLSE => {
-                let server_id = header.arg1;
-                if let Some(s) = streams.remove(&server_id) {
-                    let _ = stream
-                        .write_all(&adb_proto::build_clse(server_id, s.client_local_id))
-                        .await;
-                }
-                // Unknown stream id (already closed, or never opened): no reply, so garbage
-                // input can never trigger a CLSE reply storm.
-            }
-            _ => {
-                // A second CNXN mid-session, or any other/unknown command: not well-formed ADB
-                // from this point on. Ending the session is simpler and safer than guessing.
+    // The message loop runs as a block so that however it ends, every sync stream still holding
+    // a half-received SEND is flushed below as an incomplete capture instead of dropped.
+    async {
+        loop {
+            let Some((header, data)) = reader.read_message(&mut stream).await else {
                 return;
+            };
+
+            match header.command {
+                adb_proto::A_OPEN => {
+                    if handle_open(
+                        &mut stream,
+                        &header,
+                        &data,
+                        &mut streams,
+                        &mut next_stream_id,
+                        source_ip,
+                        wan_ip,
+                        session_id,
+                        &emitter,
+                        peer_addr,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+                adb_proto::A_WRTE => {
+                    if handle_wrte(
+                        &mut stream,
+                        &header,
+                        &data,
+                        &mut streams,
+                        &emitter,
+                        &handoff,
+                        peer_addr,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+                adb_proto::A_OKAY => {
+                    // Flow-control ack for one of our own WRTEs; this handler never has more than
+                    // one outstanding write per stream in flight, so there is nothing to unblock.
+                }
+                adb_proto::A_CLSE => {
+                    let server_id = header.arg1;
+                    if let Some(mut s) = streams.remove(&server_id) {
+                        // A sync stream closed mid-SEND: keep what arrived, marked incomplete.
+                        if let StreamKind::Sync(sync) = &mut s.kind
+                            && let Some(job) = sync.abandon()
+                        {
+                            let _ = handoff.submit(job);
+                        }
+                        let _ = stream
+                            .write_all(&adb_proto::build_clse(server_id, s.client_local_id))
+                            .await;
+                    }
+                    // Unknown stream id (already closed, or never opened): no reply, so garbage
+                    // input can never trigger a CLSE reply storm.
+                }
+                _ => {
+                    // A second CNXN mid-session, or any other/unknown command: not well-formed ADB
+                    // from this point on. Ending the session is simpler and safer than guessing.
+                    return;
+                }
             }
+        }
+    }
+    .await;
+
+    for s in streams.values_mut() {
+        if let StreamKind::Sync(sync) = &mut s.kind
+            && let Some(job) = sync.abandon()
+        {
+            let _ = handoff.submit(job);
         }
     }
 }
@@ -729,6 +757,52 @@ mod tests {
         let (r3, u3) = sync.feed(&adb_proto::build_sync_done(0));
         assert_eq!(SyncHeader::parse(&r3).unwrap().id, adb_proto::SYNC_OKAY);
         assert_eq!(u3.unwrap().body, b"AB");
+    }
+
+    /// A SEND whose DONE never arrives (stream closed, session dropped) keeps the DATA that did,
+    /// marked incomplete; a completed SEND is marked complete.
+    #[test]
+    fn sync_abandoned_mid_send_yields_an_incomplete_capture() {
+        let sample = |job: &CaptureJob| SampleRef {
+            sha256: "ef".repeat(32),
+            size: job.body.len() as u64,
+            orig_name: job.orig_name.clone(),
+            capture_id: None,
+        };
+        let mut sync = test_sync_state();
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/data/local/tmp/x,33188",
+        ));
+        sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"AB"));
+        let job = sync.abandon().expect("DATA arrived, so a capture");
+        assert_eq!(job.body, b"AB");
+        let sample_ref = sample(&job);
+        let event = (job.event_builder)(sample_ref);
+        assert_eq!(event.metadata["complete"], false);
+        assert!(sync.abandon().is_none());
+
+        // A SEND with no DATA yet has nothing to keep.
+        let mut bare = test_sync_state();
+        bare.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/y,420",
+        ));
+        assert!(bare.abandon().is_none());
+
+        let mut done = test_sync_state();
+        let (_, upload) = done.feed(
+            &[
+                adb_proto::build_sync_message(adb_proto::SYNC_SEND, b"/tmp/z,420"),
+                adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"CD"),
+                adb_proto::build_sync_done(0),
+            ]
+            .concat(),
+        );
+        let job = upload.unwrap();
+        let sample_ref = sample(&job);
+        let event = (job.event_builder)(sample_ref);
+        assert_eq!(event.metadata["complete"], true);
     }
 
     #[test]

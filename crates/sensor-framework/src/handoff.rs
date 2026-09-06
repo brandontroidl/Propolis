@@ -76,10 +76,15 @@ pub struct CaptureJob {
 /// SFTP and ADB retain a 10 MB prefix and drain the rest to keep the protocol aligned), and an
 /// analysis of the prefix must never be read as an analysis of the file: `truncated` says the
 /// hash and size describe a prefix, and `wire_size` says how big the real upload was.
+/// `complete` says whether the transfer ended the way its protocol defines the end of a file
+/// (SCP's trailer, SFTP's CLOSE, ADB's DONE, FTP's data-connection close); false means the
+/// session ended, stalled or was cut off with the transfer still open, so the body is a fragment
+/// of whatever was being sent, kept because a fragment of a dropper is still evidence.
 pub fn upload_metadata(
     protocol_label: &str,
     sample: &SampleRef,
     wire_size: u64,
+    complete: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "protocol_label": protocol_label,
@@ -88,6 +93,7 @@ pub fn upload_metadata(
         "orig_name": sample.orig_name,
         "wire_size": wire_size,
         "truncated": wire_size > sample.size,
+        "complete": complete,
     })
 }
 
@@ -365,20 +371,29 @@ mod tests {
 
     #[test]
     fn upload_metadata_marks_a_capped_body_as_truncated_with_the_real_wire_size() {
-        let m = upload_metadata("ssh", &sample(10_000_000), 12_000_000);
+        let m = upload_metadata("ssh", &sample(10_000_000), 12_000_000, true);
         assert_eq!(m["truncated"], true);
         assert_eq!(m["wire_size"], 12_000_000u64);
         assert_eq!(m["size"], 10_000_000u64);
         assert_eq!(m["protocol_label"], "ssh");
         assert_eq!(m["sha256"], "ab".repeat(32));
         assert_eq!(m["orig_name"], "payload.bin");
+        assert_eq!(m["complete"], true);
     }
 
     #[test]
     fn upload_metadata_marks_a_complete_body_as_not_truncated() {
-        let m = upload_metadata("adb", &sample(4096), 4096);
+        let m = upload_metadata("adb", &sample(4096), 4096, true);
         assert_eq!(m["truncated"], false);
         assert_eq!(m["wire_size"], 4096u64);
+    }
+
+    /// A fragment below the cap is not truncated by the sensor, but it is not the file either.
+    #[test]
+    fn upload_metadata_keeps_incomplete_distinct_from_truncated() {
+        let m = upload_metadata("ssh", &sample(4096), 4096, false);
+        assert_eq!(m["truncated"], false);
+        assert_eq!(m["complete"], false);
     }
 
     /// Builds a `CaptureHandoff` wired to an `OutboxManifest` under `base_dir.join("outbox")`,

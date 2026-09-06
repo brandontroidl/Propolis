@@ -65,7 +65,9 @@ pub(crate) fn format_activity(sensor: &str, signal_type: &str) -> String {
         "honeypot_connection" => "connection",
         "honeypot_command_exec" => "command execution",
         "honeypot_malware_upload" => "malware upload",
-        "honeypot_file_download" => "file download",
+        // A URL the attacker told the shell to fetch: an attempt the sensor extracted, never a
+        // file it received. Whether anything was retrieved is the fetcher's separate record.
+        "honeypot_file_download" => "download attempt",
         "ssh_brute_force" => "SSH brute force",
         "port_scan" => "port scan",
         "syn_flood" => "SYN flood",
@@ -87,7 +89,7 @@ pub(crate) fn format_activity(sensor: &str, signal_type: &str) -> String {
 }
 
 /// Maps a signal type to a severity rung for the console's temperature ramp: `crit` (malware),
-/// `high` (hands-on-keyboard: command exec, file download), `watch` (credential attempts / IDS
+/// `high` (hands-on-keyboard: command exec, download attempt), `watch` (credential attempts / IDS
 /// escalations that want a look), or `low` (scans and probes - noise). Drives the `.sev--*` tags and
 /// the activity strip's `.s1..s4` cells. The single source of truth for signal-to-colour, so the
 /// two never disagree. An unknown signal is treated as `low` (fail-quiet: a new signal reads as
@@ -111,7 +113,7 @@ pub(crate) fn signal_tag_label(signal_type: &str) -> &'static str {
     match signal_type {
         "honeypot_malware_upload" => "malware upload",
         "honeypot_command_exec" => "command exec",
-        "honeypot_file_download" => "file download",
+        "honeypot_file_download" => "download attempt",
         "honeypot_login_attempt" => "login attempt",
         "honeypot_connection" => "connection",
         "ssh_brute_force" => "ssh brute",

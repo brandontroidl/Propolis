@@ -154,7 +154,7 @@ impl ScpReceiver {
                 ScpState::WaitTrailer => {
                     // The client sends a single \0 byte after the file body.
                     offset += 1;
-                    self.submit_capture();
+                    let _ = self.handoff.submit(self.capture_job(true));
                     response.push(0); // final ack
                     self.state = ScpState::Done;
                 }
@@ -165,7 +165,16 @@ impl ScpReceiver {
         response
     }
 
-    fn submit_capture(&self) {
+    /// The session is ending with a body still in flight. What arrived is returned as a capture
+    /// marked incomplete, for the caller to submit: a dropper cut off at the trailer used to
+    /// leave no event and no bytes, as if it had never been sent.
+    pub fn abandon(&mut self) -> Option<CaptureJob> {
+        let in_flight = matches!(self.state, ScpState::ReadingBody { .. }) && self.wire_bytes > 0;
+        self.state = ScpState::Done;
+        in_flight.then(|| self.capture_job(false))
+    }
+
+    fn capture_job(&self, complete: bool) -> CaptureJob {
         let body = self.body.clone();
         let orig_name = self.filename.clone();
         let source_ip = self.source_ip;
@@ -173,7 +182,7 @@ impl ScpReceiver {
         let session_id = self.session_id;
         let wire_size = self.wire_bytes;
 
-        let _ = self.handoff.submit(CaptureJob {
+        CaptureJob {
             body,
             orig_name,
             event_builder: Box::new(move |sample: SampleRef| SensorEvent {
@@ -185,12 +194,12 @@ impl ScpReceiver {
                 protocol: PROTO_TCP.into(),
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
-                metadata: upload_metadata("ssh", &sample, wire_size),
+                metadata: upload_metadata("ssh", &sample, wire_size, complete),
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
             }),
-        });
+        }
     }
 }
 
@@ -449,7 +458,7 @@ impl SftpHandler {
         if let Some(file) = self.handles.remove(handle_str.as_ref()) {
             self.resident_body = self.resident_body.saturating_sub(file.body.len());
             if !file.body.is_empty() {
-                self.submit_capture(file);
+                let _ = self.handoff.submit(self.capture_job(file, true));
             }
             build_status(id, SSH_FX_OK)
         } else {
@@ -457,13 +466,26 @@ impl SftpHandler {
         }
     }
 
-    fn submit_capture(&self, file: SftpOpenFile) {
+    /// The session is ending with handles still open. Every one that received bytes is returned
+    /// as a capture marked incomplete, for the caller to submit; a file the client never CLOSEd
+    /// used to vanish with the session.
+    pub fn abandon(&mut self) -> Vec<CaptureJob> {
+        self.resident_body = 0;
+        let mut open: Vec<SftpOpenFile> = self.handles.drain().map(|(_, f)| f).collect();
+        open.retain(|f| f.wire_bytes > 0);
+        open.sort_by(|a, b| a.orig_name.cmp(&b.orig_name));
+        open.into_iter()
+            .map(|file| self.capture_job(file, false))
+            .collect()
+    }
+
+    fn capture_job(&self, file: SftpOpenFile, complete: bool) -> CaptureJob {
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
         let session_id = self.session_id;
         let wire_size = file.wire_bytes;
 
-        let _ = self.handoff.submit(CaptureJob {
+        CaptureJob {
             body: file.body,
             orig_name: file.orig_name,
             event_builder: Box::new(move |sample: SampleRef| SensorEvent {
@@ -475,12 +497,12 @@ impl SftpHandler {
                 protocol: PROTO_TCP.into(),
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
-                metadata: upload_metadata("ssh", &sample, wire_size),
+                metadata: upload_metadata("ssh", &sample, wire_size, complete),
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
             }),
-        });
+        }
     }
 }
 
@@ -632,6 +654,92 @@ mod tests {
         // Send trailing \0 - the state machine must still be aligned.
         let response = scp.feed(&[0x00]);
         assert_eq!(response, vec![0x00], "final ack must still arrive");
+    }
+
+    fn sample_for(job: &CaptureJob) -> SampleRef {
+        SampleRef {
+            sha256: "cd".repeat(32),
+            size: job.body.len() as u64,
+            orig_name: job.orig_name.clone(),
+            capture_id: None,
+        }
+    }
+
+    /// A session that dies with the SCP body half received keeps the half, marked incomplete;
+    /// it used to leave nothing.
+    #[test]
+    fn scp_abandoned_mid_body_yields_an_incomplete_capture() {
+        let handoff = test_handoff();
+        let (mut scp, _initial) =
+            ScpReceiver::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        scp.feed(b"C0644 100 dropper.bin\n");
+        scp.feed(b"MZ-first-forty-bytes-of-a-hundred-byte-f");
+        let job = scp.abandon().expect("bytes arrived, so a capture");
+        assert_eq!(job.body, b"MZ-first-forty-bytes-of-a-hundred-byte-f");
+        assert_eq!(job.orig_name, "dropper.bin");
+        let sample = sample_for(&job);
+        let event = (job.event_builder)(sample);
+        assert_eq!(event.metadata["complete"], false);
+        assert_eq!(event.metadata["wire_size"], 40u64);
+        assert_eq!(event.metadata["truncated"], false);
+        assert!(scp.abandon().is_none(), "abandon is one-shot");
+
+        // Nothing arrived after the header: nothing to keep.
+        let (mut empty, _) = ScpReceiver::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            test_handoff(),
+        );
+        empty.feed(b"C0644 100 dropper.bin\n");
+        assert!(empty.abandon().is_none());
+    }
+
+    /// SFTP handles still open at session end are captured as incomplete files.
+    #[test]
+    fn sftp_abandoned_open_handles_yield_incomplete_captures() {
+        let handoff = test_handoff();
+        let mut sftp =
+            SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let mut init = vec![SSH_FXP_INIT];
+        init.extend_from_slice(&3u32.to_be_bytes());
+        let mut init_pkt = (init.len() as u32).to_be_bytes().to_vec();
+        init_pkt.extend_from_slice(&init);
+        let _ = sftp.feed(&init_pkt);
+
+        let mut open = vec![SSH_FXP_OPEN];
+        open.extend_from_slice(&1u32.to_be_bytes());
+        open.extend_from_slice(&11u32.to_be_bytes());
+        open.extend_from_slice(b"dropper.elf");
+        open.extend_from_slice(&SSH_FXF_WRITE.to_be_bytes());
+        let mut open_pkt = (open.len() as u32).to_be_bytes().to_vec();
+        open_pkt.extend_from_slice(&open);
+        let resp = sftp.feed(&open_pkt);
+        assert_eq!(resp[4], SSH_FXP_HANDLE);
+        let handle_len = u32::from_be_bytes([resp[9], resp[10], resp[11], resp[12]]) as usize;
+        let handle = resp[13..13 + handle_len].to_vec();
+
+        let mut write = vec![SSH_FXP_WRITE];
+        write.extend_from_slice(&2u32.to_be_bytes());
+        write.extend_from_slice(&(handle.len() as u32).to_be_bytes());
+        write.extend_from_slice(&handle);
+        write.extend_from_slice(&0u64.to_be_bytes());
+        write.extend_from_slice(&7u32.to_be_bytes());
+        write.extend_from_slice(b"\x7fELF-fr");
+        let mut write_pkt = (write.len() as u32).to_be_bytes().to_vec();
+        write_pkt.extend_from_slice(&write);
+        let _ = sftp.feed(&write_pkt);
+
+        let mut jobs = sftp.abandon();
+        assert_eq!(jobs.len(), 1);
+        let job = jobs.remove(0);
+        assert_eq!(job.body, b"\x7fELF-fr");
+        assert_eq!(job.orig_name, "dropper.elf");
+        let sample = sample_for(&job);
+        let event = (job.event_builder)(sample);
+        assert_eq!(event.metadata["complete"], false);
+        assert!(sftp.abandon().is_empty(), "handles are drained");
+        assert_eq!(sftp.resident_body, 0);
     }
 
     #[test]

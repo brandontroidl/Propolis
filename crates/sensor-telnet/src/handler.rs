@@ -210,7 +210,7 @@ pub async fn handle_connection(
                     authenticated: true,
                     observed_at: chrono::Utc::now(),
                     metadata: {
-                        let mut m = upload_metadata(PROTOCOL_LABEL, &sample, wire_size);
+                        let mut m = upload_metadata(PROTOCOL_LABEL, &sample, wire_size, true);
                         m["capture_reason"] = serde_json::json!("binary_shell_payload");
                         m
                     },

@@ -255,14 +255,20 @@ pub struct Session {
     wan_ip: Option<IpAddr>,
     session_id: Uuid,
     authenticated: bool,
-    /// Values SET this session, read back by GET. Bounded by `MAX_KEYS` entries and
-    /// `MAX_VALUE_LEN` bytes each, so a connection cannot grow the process without limit.
+    /// Values SET this session, read back by GET, stored whole. Bounded by `MAX_KEYS` entries
+    /// and `MAX_STORE_BYTES` in total, so a connection cannot grow the process without limit.
     keys: HashMap<String, String>,
+    /// Bytes of keys and values currently held, against `MAX_STORE_BYTES`.
+    store_bytes: usize,
 }
 
-/// Distinct keys one session may hold; a SET past this on a new key is acknowledged but not
-/// kept, which is what a full instance under `maxmemory` looks like from the outside.
+/// Distinct keys, and total key+value bytes, one session may hold. A SET that would exceed
+/// either is refused with the error a real instance gives when it is out of memory under its
+/// `noeviction` policy; acknowledging the write and then dropping or cutting it was the same
+/// contradiction as the old always-nil GET, just moved to the limit.
 const MAX_KEYS: usize = 256;
+const MAX_STORE_BYTES: usize = 1024 * 1024;
+const OOM_REPLY: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 
 impl Session {
     /// `source_ip`/`wan_ip` are this connection's real attributes; every event this type ever
@@ -274,6 +280,7 @@ impl Session {
             session_id,
             authenticated: false,
             keys: HashMap::new(),
+            store_bytes: 0,
         }
     }
 
@@ -433,12 +440,21 @@ impl Session {
                 "value": value,
             }),
         );
-        // Keep the raw (length-bounded, not sanitized) value so GET hands back exactly what was
-        // SET; the sanitized copy above is for the ledger only.
-        if self.keys.len() < MAX_KEYS || self.keys.contains_key(&args[1]) {
-            let raw: String = args[2].chars().take(MAX_VALUE_LEN).collect();
-            self.keys.insert(args[1].clone(), raw);
+        // Keep the raw value whole so GET hands back exactly what was SET; the sanitized copy
+        // above is for the ledger only. A write the store cannot hold is refused, never cut or
+        // silently dropped behind an +OK. The attempt is still evidence, so the event stands.
+        let previous = self
+            .keys
+            .get(&args[1])
+            .map_or(0, |v| args[1].len() + v.len());
+        let incoming = args[1].len() + args[2].len();
+        let new_key = !self.keys.contains_key(&args[1]);
+        let after = self.store_bytes - previous + incoming;
+        if (new_key && self.keys.len() >= MAX_KEYS) || after > MAX_STORE_BYTES {
+            return (resp::error_reply(OOM_REPLY), vec![event]);
         }
+        self.keys.insert(args[1].clone(), args[2].clone());
+        self.store_bytes = after;
         (resp::simple_string("OK"), vec![event])
     }
 
@@ -864,24 +880,62 @@ mod tests {
         );
     }
 
+    /// A write the store cannot hold is refused with Redis's own out-of-memory error, never
+    /// acknowledged and then dropped or cut: the reply and a later GET must agree.
     #[test]
-    fn the_session_store_is_capped() {
+    fn a_set_past_the_key_cap_is_refused_not_silently_dropped() {
         let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
-        for i in 0..(MAX_KEYS + 10) {
+        for i in 0..MAX_KEYS {
             let key = format!("k{i}");
-            session.dispatch(&args(&["SET", &key, "v"]));
+            assert_eq!(
+                session.dispatch(&args(&["SET", &key, "v"])).0,
+                resp::simple_string("OK")
+            );
         }
-        assert!(session.keys.len() <= MAX_KEYS);
+        let (reply, events) = session.dispatch(&args(&["SET", "one-too-many", "v"]));
+        assert_eq!(reply, resp::error_reply(OOM_REPLY));
+        assert_eq!(events.len(), 1, "the attempt is still recorded");
+        assert_eq!(
+            session.dispatch(&args(&["GET", "one-too-many"])).0,
+            resp::nil_bulk_string()
+        );
         // A key already held can still be overwritten at the cap.
-        session.dispatch(&args(&["SET", "k0", "new"]));
+        assert_eq!(
+            session.dispatch(&args(&["SET", "k0", "new"])).0,
+            resp::simple_string("OK")
+        );
         assert_eq!(
             session.dispatch(&args(&["GET", "k0"])).0,
             resp::bulk_string("new")
         );
-        // A new key past the cap is acknowledged but not kept.
+    }
+
+    #[test]
+    fn a_value_is_stored_whole_and_a_write_past_the_byte_budget_is_refused() {
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let big = "x".repeat(1025);
         assert_eq!(
-            session.dispatch(&args(&["GET", "k300"])).0,
+            session.dispatch(&args(&["SET", "big", &big])).0,
+            resp::simple_string("OK")
+        );
+        assert_eq!(
+            session.dispatch(&args(&["GET", "big"])).0,
+            resp::bulk_string(&big),
+            "GET returns all 1025 bytes, not a cut copy"
+        );
+        let huge = "y".repeat(MAX_STORE_BYTES);
+        assert_eq!(
+            session.dispatch(&args(&["SET", "huge", &huge])).0,
+            resp::error_reply(OOM_REPLY)
+        );
+        assert_eq!(
+            session.dispatch(&args(&["GET", "huge"])).0,
             resp::nil_bulk_string()
+        );
+        // The refused write did not disturb what was already held.
+        assert_eq!(
+            session.dispatch(&args(&["GET", "big"])).0,
+            resp::bulk_string(&big)
         );
     }
 

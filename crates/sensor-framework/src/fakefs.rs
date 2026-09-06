@@ -30,6 +30,10 @@ pub struct FakeFs {
     /// succeed where a real box would let it, so the `&& cd` that follows runs. Session-scoped,
     /// never persisted: the next session sees a clean box again.
     created: HashSet<String>,
+    /// Created files the attacker has `chmod`ed executable. A loader's writable-directory probe
+    /// is `>/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/`: the empty file must then run
+    /// (silently, exit 0) or the `&& cd` never happens.
+    executable: HashSet<String>,
 }
 
 impl Default for FakeFs {
@@ -84,6 +88,15 @@ impl FakeFs {
             ),
         );
         files.insert("/proc/version", format!("{}\n", persona::proc_version()));
+        // One mount table behind every file that exposes it, so `cat /proc/mounts`,
+        // `/proc/self/mounts`, `/etc/mtab` (a symlink to the second on Ubuntu), `mountinfo`
+        // and the shell's `mount` cannot disagree. `cat /proc/mounts` used to say "No such
+        // file", which no Linux box does.
+        let mounts = render_mounts();
+        files.insert("/proc/mounts", mounts.clone());
+        files.insert("/proc/self/mounts", mounts.clone());
+        files.insert("/etc/mtab", mounts);
+        files.insert("/proc/self/mountinfo", render_mountinfo());
         files.insert(
             "/proc/cpuinfo",
             "processor\t: 0\n\
@@ -107,8 +120,59 @@ impl FakeFs {
         // brand-new box as not even having a /root or /tmp at all.
         dirs.insert("/tmp", vec![]);
         dirs.insert("/root", vec![]);
-        dirs.insert("/etc", vec!["hostname", "passwd", "hosts", "os-release"]);
+        dirs.insert(
+            "/etc",
+            vec!["hostname", "mtab", "passwd", "hosts", "os-release"],
+        );
         dirs.insert("/home", vec!["ubuntu"]);
+        // Every mount point in the table is a directory the box presents, so `cd` into one
+        // that `cat /proc/mounts` lists never fails.
+        dirs.insert("/boot", vec!["efi", "grub"]);
+        dirs.insert("/boot/efi", vec!["EFI"]);
+        dirs.insert(
+            "/sys",
+            vec![
+                "block",
+                "bus",
+                "class",
+                "dev",
+                "devices",
+                "firmware",
+                "fs",
+                "hypervisor",
+                "kernel",
+                "module",
+                "power",
+            ],
+        );
+        dirs.insert("/sys/fs", vec!["bpf", "cgroup", "ext4", "fuse", "pstore"]);
+        dirs.insert("/sys/fs/cgroup", vec![]);
+        dirs.insert("/sys/fs/bpf", vec![]);
+        dirs.insert("/sys/fs/pstore", vec![]);
+        dirs.insert("/sys/fs/fuse", vec!["connections"]);
+        dirs.insert("/sys/fs/fuse/connections", vec![]);
+        dirs.insert(
+            "/sys/kernel",
+            vec![
+                "config",
+                "debug",
+                "mm",
+                "security",
+                "slab",
+                "tracing",
+                "uevent_seqnum",
+            ],
+        );
+        dirs.insert("/sys/kernel/config", vec![]);
+        dirs.insert("/sys/kernel/debug", vec![]);
+        dirs.insert("/sys/kernel/security", vec![]);
+        dirs.insert("/sys/kernel/tracing", vec![]);
+        dirs.insert("/dev/pts", vec!["0", "ptmx"]);
+        dirs.insert("/dev/hugepages", vec![]);
+        dirs.insert("/dev/mqueue", vec![]);
+        dirs.insert("/run/lock", vec![]);
+        dirs.insert("/run/user", vec!["0"]);
+        dirs.insert("/run/user/0", vec![]);
         // The directories a loader probes for somewhere writable (`>/var/run/.x && cd /var/run`,
         // then /mnt, /usr, /dev, /dev/shm, /tmp, /var). Every one exists on a real Ubuntu box,
         // so each probe must succeed here or the chain's `&& cd` never runs and the loader's
@@ -123,7 +187,7 @@ impl FakeFs {
         );
         dirs.insert("/var/run", vec![]);
         dirs.insert("/var/tmp", vec![]);
-        dirs.insert("/run", vec![]);
+        dirs.insert("/run", vec!["lock", "user"]);
         dirs.insert("/mnt", vec![]);
         dirs.insert(
             "/usr",
@@ -134,7 +198,17 @@ impl FakeFs {
         dirs.insert(
             "/dev",
             vec![
-                "null", "zero", "random", "urandom", "tty", "pts", "shm", "stdin", "stdout",
+                "hugepages",
+                "mqueue",
+                "null",
+                "zero",
+                "random",
+                "urandom",
+                "tty",
+                "pts",
+                "shm",
+                "stdin",
+                "stdout",
                 "stderr",
             ],
         );
@@ -144,7 +218,23 @@ impl FakeFs {
             files,
             dirs,
             created: HashSet::new(),
+            executable: HashSet::new(),
         }
+    }
+
+    /// Mark a file the attacker created this session executable (`chmod +x` / `chmod 777`).
+    /// Returns false when `path` is not such a file; the baked-in files keep their modes.
+    pub fn mark_executable(&mut self, path: &str) -> bool {
+        if !self.created.contains(path) {
+            return false;
+        }
+        self.executable.insert(path.to_string());
+        true
+    }
+
+    /// Whether running `path` as a command would start: only a created file after `chmod`.
+    pub fn is_executable(&self, path: &str) -> bool {
+        self.executable.contains(path)
     }
 
     pub fn read_file(&self, path: &str) -> Option<String> {
@@ -212,9 +302,178 @@ impl FakeFs {
     }
 }
 
+/// The mounted filesystems of a stock Ubuntu 22.04 cloud image on one virtual disk: `(source,
+/// mount point, type, options)` in mount order. Every mount point exists in the directory
+/// model above. Rendered into `/proc/mounts`, `/proc/self/mountinfo` and the `mount` command.
+pub const MOUNT_TABLE: [(&str, &str, &str, &str); 20] = [
+    ("sysfs", "/sys", "sysfs", "rw,nosuid,nodev,noexec,relatime"),
+    ("proc", "/proc", "proc", "rw,nosuid,nodev,noexec,relatime"),
+    (
+        "udev",
+        "/dev",
+        "devtmpfs",
+        "rw,nosuid,relatime,size=1968376k,nr_inodes=492094,mode=755,inode64",
+    ),
+    (
+        "devpts",
+        "/dev/pts",
+        "devpts",
+        "rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000",
+    ),
+    (
+        "tmpfs",
+        "/run",
+        "tmpfs",
+        "rw,nosuid,nodev,noexec,relatime,size=402244k,mode=755,inode64",
+    ),
+    (
+        "/dev/sda1",
+        "/",
+        "ext4",
+        "rw,relatime,discard,errors=remount-ro",
+    ),
+    (
+        "securityfs",
+        "/sys/kernel/security",
+        "securityfs",
+        "rw,nosuid,nodev,noexec,relatime",
+    ),
+    ("tmpfs", "/dev/shm", "tmpfs", "rw,nosuid,nodev,inode64"),
+    (
+        "tmpfs",
+        "/run/lock",
+        "tmpfs",
+        "rw,nosuid,nodev,noexec,relatime,size=5120k,inode64",
+    ),
+    (
+        "cgroup2",
+        "/sys/fs/cgroup",
+        "cgroup2",
+        "rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot",
+    ),
+    (
+        "pstore",
+        "/sys/fs/pstore",
+        "pstore",
+        "rw,nosuid,nodev,noexec,relatime",
+    ),
+    (
+        "bpf",
+        "/sys/fs/bpf",
+        "bpf",
+        "rw,nosuid,nodev,noexec,relatime,mode=700",
+    ),
+    (
+        "hugetlbfs",
+        "/dev/hugepages",
+        "hugetlbfs",
+        "rw,relatime,pagesize=2M",
+    ),
+    (
+        "mqueue",
+        "/dev/mqueue",
+        "mqueue",
+        "rw,nosuid,nodev,noexec,relatime",
+    ),
+    (
+        "debugfs",
+        "/sys/kernel/debug",
+        "debugfs",
+        "rw,nosuid,nodev,noexec,relatime",
+    ),
+    (
+        "tracefs",
+        "/sys/kernel/tracing",
+        "tracefs",
+        "rw,nosuid,nodev,noexec,relatime",
+    ),
+    (
+        "fusectl",
+        "/sys/fs/fuse/connections",
+        "fusectl",
+        "rw,nosuid,nodev,noexec,relatime",
+    ),
+    (
+        "configfs",
+        "/sys/kernel/config",
+        "configfs",
+        "rw,nosuid,nodev,noexec,relatime",
+    ),
+    (
+        "/dev/sda15",
+        "/boot/efi",
+        "vfat",
+        "rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro",
+    ),
+    (
+        "tmpfs",
+        "/run/user/0",
+        "tmpfs",
+        "rw,nosuid,nodev,relatime,size=402240k,nr_inodes=100560,mode=700,inode64",
+    ),
+];
+
+/// `/proc/mounts` format: `source mountpoint type options 0 0`.
+fn render_mounts() -> String {
+    let mut out = String::new();
+    for (source, point, fstype, opts) in MOUNT_TABLE {
+        out.push_str(&format!("{source} {point} {fstype} {opts} 0 0\n"));
+    }
+    out
+}
+
+/// `/proc/self/mountinfo` format: `id parent major:minor root mountpoint mount-opts - type
+/// source super-opts`. Ids are sequential from the table; the per-mount options are the flags
+/// (`rw,nosuid,...`) and the super options the rest, as the kernel splits them.
+fn render_mountinfo() -> String {
+    let root_pos = MOUNT_TABLE.iter().position(|m| m.1 == "/").unwrap_or(0);
+    let mut out = String::new();
+    for (i, (source, point, fstype, opts)) in MOUNT_TABLE.iter().enumerate() {
+        let id = 20 + i;
+        let parent = if *point == "/" { 1 } else { 20 + root_pos };
+        let (mount_opts, super_opts): (Vec<&str>, Vec<&str>) = opts.split(',').partition(|o| {
+            matches!(
+                *o,
+                "rw" | "ro" | "nosuid" | "nodev" | "noexec" | "relatime" | "noatime"
+            )
+        });
+        let super_opts = if super_opts.is_empty() {
+            "rw".to_string()
+        } else {
+            format!("rw,{}", super_opts.join(","))
+        };
+        out.push_str(&format!(
+            "{id} {parent} 0:{} / {point} {} - {fstype} {source} {super_opts}\n",
+            i + 21,
+            mount_opts.join(",")
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every file that exposes the mount table agrees, and every mount point it names is a
+    /// directory the shell will `cd` into: a table naming a path `ls` denies is the same
+    /// contradiction as the missing file was.
+    #[test]
+    fn mount_table_is_exposed_consistently_and_every_mount_point_exists() {
+        let fs = FakeFs::new();
+        let mounts = fs.read_file("/proc/mounts").expect("/proc/mounts exists");
+        assert_eq!(fs.read_file("/proc/self/mounts").as_deref(), Some(&*mounts));
+        assert_eq!(fs.read_file("/etc/mtab").as_deref(), Some(&*mounts));
+        assert!(mounts.contains("/dev/sda1 / ext4 rw,relatime,discard,errors=remount-ro 0 0\n"));
+        assert_eq!(mounts.lines().count(), MOUNT_TABLE.len());
+        let info = fs.read_file("/proc/self/mountinfo").unwrap();
+        assert_eq!(info.lines().count(), MOUNT_TABLE.len());
+        assert!(info.contains(" / / rw,relatime - ext4 /dev/sda1 rw,discard,errors=remount-ro\n"));
+        for (_, point, _, _) in MOUNT_TABLE {
+            assert!(fs.is_dir(point), "{point} is mounted but not a directory");
+        }
+        assert!(fs.list_dir("/etc").unwrap().contains(&"mtab".to_string()));
+    }
 
     #[test]
     fn every_directory_the_loader_probes_exists_and_is_listable() {

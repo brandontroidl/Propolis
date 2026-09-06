@@ -120,8 +120,14 @@ filesystem underneath, so path traversal is structurally impossible
 (`crates/sensor-framework/src/fakefs.rs:1-14`). It serves canned `/etc/hostname`,
 `/etc/passwd` (9 accounts incl. root, `ubuntu` uid 1000, `www-data`, `sshd`),
 `/etc/hosts` (loopback and IPv6 multicast only - no routable IPs), `/etc/os-release`,
-`/proc/version`, and `/proc/cpuinfo` (Intel Xeon E5-2686 v4, 1 core) (`:39-88`).
-Directories include `/`, `/tmp`, `/root`, `/etc`, and `/home/ubuntu` (`:90-105`).
+`/proc/version`, `/proc/cpuinfo` (Intel Xeon E5-2686 v4, 1 core), and one mount table
+behind `/proc/mounts`, `/proc/self/mounts`, `/etc/mtab`, `/proc/self/mountinfo` and the
+shell's `mount` (a stock Ubuntu cloud image on `/dev/sda1`; every mount point it names is
+a directory the shell will enter). Directories include `/`, `/tmp`, `/root`, `/etc`,
+`/home/ubuntu`, the loader-probed `/var/run`, `/mnt`, `/usr`, `/dev`, `/dev/shm`, and the
+`/sys`, `/run` and `/boot` subtrees the mount table names. A file the attacker creates
+with a bare redirection and then `chmod`s executable runs silently, so the
+`>/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/` probe completes.
 
 ### Fake shell (SSH, Telnet, ADB)
 
@@ -264,7 +270,9 @@ captures SCP/SFTP transfers.
   `SFTP_MAX_FILE_BODY` 10_000_000, `SFTP_MAX_OPEN_HANDLES` 64,
   `SFTP_MAX_SESSION_BYTES` 20_000_000, `SFTP_MAX_PACKET_SIZE` 262_144
   (`:38, 230, 236-244`). A body past its cap is kept as a prefix and emitted with
-  `truncated: true` plus the real `wire_size`.
+  `truncated: true` plus the real `wire_size`. A transfer still open when the session
+  ends (SCP before its trailer, SFTP handles never CLOSEd) is kept as a capture with
+  `complete: false` rather than dropped.
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`server.rs:107-111`).
 - **Bounds:** common defaults (deliberately identical to Telnet), `max_concurrent`
   256 (`main.rs:53-57`).
@@ -410,7 +418,9 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
   else refused. Sync sub-protocol: SEND/DATA/DONE → captures the pushed file →
   `honeypot_malware_upload`; RECV → refused (`FAIL Permission denied`, **never
   serves outbound**); STAT → not-found. Sync body cap `MAX_SYNC_BODY` 10_000_000
-  (a larger push keeps the prefix and is emitted with `truncated`/`wire_size`).
+  (a larger push keeps the prefix and is emitted with `truncated`/`wire_size`). A SEND
+  whose DONE never arrives (stream closed or session dropped) is kept with
+  `complete: false`.
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`lib.rs`).
 - **Bounds:** common defaults, `max_concurrent` 256.
 - **Emits:** `honeypot_connection`, `honeypot_command_exec` (shell),

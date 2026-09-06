@@ -293,6 +293,9 @@ impl FakeShell {
             Some("echo") => cmd_echo(&parts[1..]),
             Some("cat") => self.cmd_cat(parts),
             Some("ls") => self.cmd_ls(parts),
+            // `mount` with no arguments lists the same table `/proc/mounts` exposes; mounting
+            // something as root is a silent success like the other no-output applets.
+            Some("mount") => cmd_mount(parts),
             Some("wget") => cmd_wget(parts),
             Some("curl") => cmd_curl(parts),
             Some("ping") => cmd_ping(parts),
@@ -312,9 +315,21 @@ impl FakeShell {
             // `mkdir`/`sleep`). A real shell prints nothing on success, and "command not found" for
             // `chmod` is impossible on any real Linux - it outs the honeypot before the loader ever
             // executes its payload, costing the capture - so model them as silent successes.
-            Some("chmod") | Some("cp") | Some("rm") | Some("mkdir") | Some("sleep") => {
+            Some("chmod") => {
+                // Silent like the real thing, but an executable mode on a file the attacker
+                // created is remembered so that running it afterwards succeeds.
+                let mut args = parts[1..].iter().filter(|a| !a.starts_with('-'));
+                if let Some(mode) = args.next()
+                    && mode_grants_execute(mode)
+                {
+                    for target in args {
+                        let path = self.resolve_path(target);
+                        self.fs.mark_executable(&path);
+                    }
+                }
                 String::new()
             }
+            Some("cp") | Some("rm") | Some("mkdir") | Some("sleep") => String::new(),
             Some("cd") => {
                 // Only into a directory the box presents: a silent `cd` into a directory that
                 // `ls /` never showed is a tell, and a loader's `>/x/.x && cd /x` chain relies on
@@ -331,6 +346,24 @@ impl FakeShell {
             // silently, prompt unchanged; "command not found" would be a tell on any Linux.
             Some("su") => String::new(),
             Some("exit") | Some("logout") => String::new(),
+            // A token with a slash names a path, and bash answers for the path, not for PATH:
+            // a file the attacker created and chmod'ed runs (an empty file exits 0 with no
+            // output, which is what the writable-directory probe `>/tmp/d && chmod 777 /tmp/d
+            // && /tmp/d && cd /tmp/` keys its `cd` on), one it did not chmod is refused, and a
+            // path that does not exist is "No such file", never "command not found".
+            Some(other) if parts[0].contains('/') => {
+                let path = self.resolve_path(parts[0]);
+                if self.fs.is_executable(&path) {
+                    String::new()
+                } else if self.fs.read_file(&path).is_some() {
+                    format!("bash: {}: Permission denied\n", parts[0])
+                } else if self.fs.is_dir(&path) {
+                    format!("bash: {}: Is a directory\n", parts[0])
+                } else {
+                    let _ = other;
+                    format!("bash: {}: No such file or directory\n", parts[0])
+                }
+            }
             // An interactive bash on Ubuntu prefixes the message with its own name; the bare form
             // matched no real shell.
             Some(other) => format!("bash: {other}: command not found\n"),
@@ -342,10 +375,17 @@ impl FakeShell {
     /// joined onto `cwd`. Minimal - no `.`/`..` normalisation - which is enough for the canned FS
     /// and the relative reads (`cd /proc && cat self/cmdline`) attackers actually use.
     fn resolve_path(&self, arg: &str) -> String {
-        if arg.starts_with('/') {
+        let joined = if arg.starts_with('/') {
             arg.to_string()
         } else {
             format!("{}/{arg}", self.cwd.trim_end_matches('/'))
+        };
+        // `cd /tmp/` names the same directory as `cd /tmp`; the model keys on the bare form.
+        let trimmed = joined.trim_end_matches('/');
+        if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            trimmed.to_string()
         }
     }
 
@@ -808,6 +848,33 @@ fn busybox_banner() -> String {
     s
 }
 
+/// Whether a `chmod` mode adds execute permission: a symbolic mode naming `x` (`+x`, `a+x`,
+/// `u+rwx`) or an octal mode with an execute bit set in any of its last three digits (`777`,
+/// `755`, `0755`).
+fn mode_grants_execute(mode: &str) -> bool {
+    if mode.chars().all(|c| c.is_ascii_digit()) {
+        let digits: Vec<u32> = mode.chars().filter_map(|c| c.to_digit(8)).collect();
+        let perms = &digits[digits.len().saturating_sub(3)..];
+        return perms.iter().any(|d| d & 1 == 1);
+    }
+    mode.contains('x') && !mode.contains('-')
+}
+
+/// `mount` with no arguments (or `-l`): util-linux's `source on point type fstype (opts)` lines
+/// from the fake filesystem's one mount table. Any other form is a root mounting something,
+/// which prints nothing on success.
+fn cmd_mount(parts: &[&str]) -> String {
+    let listing = parts[1..].iter().all(|a| *a == "-l" || *a == "-v");
+    if !listing {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (source, point, fstype, opts) in crate::fakefs::MOUNT_TABLE {
+        out.push_str(&format!("{source} on {point} type {fstype} ({opts})\n"));
+    }
+    out
+}
+
 /// `uname` with real per-flag field selection. Each flag adds its field and the selected fields
 /// print in coreutils' fixed order (kernel-name, nodename, kernel-release, kernel-version, machine,
 /// processor, hardware-platform, operating-system); a bare `uname` prints the kernel name only, and
@@ -1264,6 +1331,70 @@ mod shell_detection_tests {
 
     fn xor(s: &str, key: u8) -> String {
         String::from_utf8(crate::command_codec::xor_bytes(s, key)).unwrap()
+    }
+
+    /// A loader's writable-directory probe as seen in a live session: create an empty file, make
+    /// it executable, run it, and only then move there. The run used to be "command not found",
+    /// so the `cd` never happened; the trailing slash on the `cd` was refused too.
+    #[test]
+    fn writable_directory_probe_runs_the_created_file_and_changes_directory() {
+        let mut sh = shell();
+        let (out, _) = sh.handle_input(">/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/");
+        assert_eq!(out, "", "every step of the probe succeeds silently");
+        assert_eq!(sh.handle_input("pwd").0, "/tmp\n");
+        // Without the chmod the file is not runnable, and a path that does not exist is a
+        // missing file, not a missing command.
+        let mut fresh = shell();
+        fresh.handle_input(">/tmp/e");
+        assert_eq!(
+            fresh.handle_input("/tmp/e").0,
+            "bash: /tmp/e: Permission denied\n"
+        );
+        assert_eq!(
+            fresh.handle_input("/tmp/nothere").0,
+            "bash: /tmp/nothere: No such file or directory\n"
+        );
+        assert_eq!(fresh.handle_input("/tmp").0, "bash: /tmp: Is a directory\n");
+        fresh.handle_input("chmod +x /tmp/e");
+        assert_eq!(fresh.handle_input("/tmp/e").0, "");
+        assert!(super::mode_grants_execute("755"));
+        assert!(super::mode_grants_execute("0755"));
+        assert!(!super::mode_grants_execute("644"));
+        assert!(super::mode_grants_execute("a+x"));
+        assert!(!super::mode_grants_execute("-x"));
+    }
+
+    /// Observed live (2026-09-06): `cat /proc/mounts; /bin/busybox URUMV`. The box answered
+    /// "No such file or directory" for a file every Linux has.
+    #[test]
+    fn proc_mounts_is_readable_and_agrees_with_the_mount_command() {
+        let mut sh = shell();
+        let (out, _) = sh.handle_input("cat /proc/mounts; /bin/busybox URUMV");
+        assert!(
+            out.contains("/dev/sda1 / ext4 rw,relatime,discard,errors=remount-ro 0 0\n"),
+            "{out}"
+        );
+        assert!(out.ends_with("URUMV: applet not found\n"), "{out}");
+        let (mount, _) = sh.handle_input("mount");
+        assert!(
+            mount.contains("/dev/sda1 on / type ext4 (rw,relatime,discard,errors=remount-ro)\n"),
+            "{mount}"
+        );
+        assert_eq!(
+            mount.lines().count(),
+            out.lines().count() - 1,
+            "mount lists exactly the table /proc/mounts exposes"
+        );
+        assert_eq!(
+            sh.handle_input("cat /etc/mtab").0,
+            sh.handle_input("cat /proc/self/mounts").0
+        );
+        assert_eq!(
+            sh.handle_input("cd /sys/fs/cgroup").0,
+            "",
+            "a listed mount point is a directory"
+        );
+        assert_eq!(sh.handle_input("mount -t tmpfs tmpfs /mnt").0, "");
     }
 
     #[test]

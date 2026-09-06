@@ -269,9 +269,13 @@ pub async fn handle_connection(
                                     } else {
                                         CANNED_LIST
                                     };
-                                    let _ = data.write_all(payload.as_bytes()).await;
+                                    let sent = data.write_all(payload.as_bytes()).await;
                                     drop(data);
-                                    b"226 Directory send OK.\r\n"
+                                    if sent.is_ok() {
+                                        b"226 Directory send OK.\r\n"
+                                    } else {
+                                        b"426 Failure writing network stream.\r\n"
+                                    }
                                 } else {
                                     drop(data);
                                     b"425 Security: bad IP connecting.\r\n"
@@ -320,23 +324,24 @@ pub async fn handle_connection(
                     let job = CaptureJob {
                         body,
                         orig_name,
-                        event_builder: Box::new(move |sample: SampleRef| {
-                            let mut metadata = upload_metadata(PROTOCOL_LABEL, &sample, wire_bytes);
-                            metadata["complete"] = serde_json::Value::Bool(complete);
-                            SensorEvent {
-                                v: WIRE_VERSION,
-                                source_ip,
-                                wan_ip,
-                                sensor: PROTOCOL_LABEL.to_string(),
-                                signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
-                                protocol: PROTO_TCP.to_string(),
-                                authenticated: logged_in,
-                                observed_at: chrono::Utc::now(),
-                                metadata,
-                                sample: Some(sample),
-                                session_id: Some(session_id),
-                                occurrence_id: None,
-                            }
+                        event_builder: Box::new(move |sample: SampleRef| SensorEvent {
+                            v: WIRE_VERSION,
+                            source_ip,
+                            wan_ip,
+                            sensor: PROTOCOL_LABEL.to_string(),
+                            signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
+                            protocol: PROTO_TCP.to_string(),
+                            authenticated: logged_in,
+                            observed_at: chrono::Utc::now(),
+                            metadata: upload_metadata(
+                                PROTOCOL_LABEL,
+                                &sample,
+                                wire_bytes,
+                                complete,
+                            ),
+                            sample: Some(sample),
+                            session_id: Some(session_id),
+                            occurrence_id: None,
                         }),
                     };
                     let _ = handoff.submit(job);

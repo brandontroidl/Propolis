@@ -135,7 +135,6 @@ impl FakeShell {
         // read it. Dispatch and URL capture run on the DECODED line.
         let (decoded, key) = self.codec.decode(line);
         self.command_count += 1;
-        let parts: Vec<&str> = decoded.split_whitespace().collect();
 
         // Two floods must never pollute the append-only ledger with one event per line: a
         // binary/non-text line (an SSH/telnet channel tunneling binary, or a fuzzer - not a
@@ -205,8 +204,57 @@ impl FakeShell {
             evs
         };
 
-        let output = self.dispatch(&parts);
+        let output = self.run_line(&decoded);
         (output, events)
+    }
+
+    /// Run one decoded input line the way a shell reads it: each simple command in order, with
+    /// `&&` and `||` short-circuiting on the previous command's outcome and `;`, `&` and a
+    /// newline just sequencing. A pipeline stays one command answered by its first stage, and
+    /// quotes are not parsed; this is a response grammar, not an interpreter. Dispatching the
+    /// whole line as one command answered a loader's gate line `ls /home; /bin/busybox BOTNET`
+    /// with "ls: cannot access '/home;'" and never ran the busybox probe, so the bot never got
+    /// the "applet not found" reply it waits for and left before its download stage (observed
+    /// live 2026-09-06).
+    fn run_line(&mut self, decoded: &str) -> String {
+        let mut out = String::new();
+        let mut last_ok = true;
+        for (op, segment) in control_segments(decoded) {
+            let run = match op {
+                ControlOp::Seq => true,
+                ControlOp::And => last_ok,
+                ControlOp::Or => !last_ok,
+            };
+            if !run {
+                continue;
+            }
+            let parts: Vec<&str> = segment.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let reply = match redirection_only_target(&parts) {
+                Some(target) => self.redirection_only(target),
+                None => self.dispatch(&parts),
+            };
+            last_ok = !looks_like_failure(&reply);
+            out.push_str(&reply);
+        }
+        out
+    }
+
+    /// `> path` with no command is a real command: it opens the file for writing and prints
+    /// nothing. Loaders probe for a writable directory this way, chaining `>/var/run/.x && cd
+    /// /var/run` across a list of candidates, and the probe must succeed exactly where the box
+    /// would let it (the directory exists) and fail with the shell's own message where it does
+    /// not, or the `&&` after it runs in the wrong places. Dispatching `>/var/run/.x` as a
+    /// command name answered "command not found", failed every probe, and the chain never
+    /// reached the busybox marker the loader keys its next stage on (observed live 2026-09-06).
+    fn redirection_only(&mut self, target: &str) -> String {
+        let resolved = self.resolve_path(target);
+        match self.fs.create_file(&resolved) {
+            Ok(()) => String::new(),
+            Err(_) => format!("bash: {resolved}: No such file or directory\n"),
+        }
     }
 
     /// Build a `honeypot_command_exec` event carrying `metadata`, stamped from the session context.
@@ -268,13 +316,24 @@ impl FakeShell {
                 String::new()
             }
             Some("cd") => {
-                self.cwd = first_non_flag_arg(&parts[1..])
-                    .unwrap_or("/root")
-                    .to_string();
-                String::new()
+                // Only into a directory the box presents: a silent `cd` into a directory that
+                // `ls /` never showed is a tell, and a loader's `>/x/.x && cd /x` chain relies on
+                // the two agreeing about what exists.
+                let target = self.resolve_path(first_non_flag_arg(&parts[1..]).unwrap_or("/root"));
+                if self.fs.is_dir(&target) {
+                    self.cwd = target;
+                    String::new()
+                } else {
+                    format!("bash: cd: {target}: No such file or directory\n")
+                }
             }
+            // Already root on this box, so `su` (and `su -`, `su root`) opens another shell
+            // silently, prompt unchanged; "command not found" would be a tell on any Linux.
+            Some("su") => String::new(),
             Some("exit") | Some("logout") => String::new(),
-            Some(other) => format!("{other}: command not found\n"),
+            // An interactive bash on Ubuntu prefixes the message with its own name; the bare form
+            // matched no real shell.
+            Some(other) => format!("bash: {other}: command not found\n"),
             None => String::new(),
         }
     }
@@ -537,6 +596,84 @@ fn simple_commands(line: &str) -> Vec<Vec<&str>> {
 fn is_redirection(token: &str) -> bool {
     let t = token.trim_start_matches(|c: char| c.is_ascii_digit());
     t.starts_with('>') || t.starts_with('<')
+}
+
+/// The control operator that precedes a segment of an input line, deciding whether it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlOp {
+    /// `;`, a background `&`, a newline, or the start of the line: run unconditionally.
+    Seq,
+    /// `&&`: run only if the previous command succeeded.
+    And,
+    /// `||`: run only if the previous command failed.
+    Or,
+}
+
+/// Split an input line at its control operators for EXECUTION, unlike `simple_commands`, which
+/// splits more aggressively for URL capture. `;`, `&&`, `||`, a background `&` (one not followed
+/// by another `&` or a non-space, so a URL query's `&b=2` survives) and a newline separate
+/// commands; `|`, parentheses and backticks do not, so a pipeline is dispatched as one command
+/// by its first stage. Each segment is paired with the operator that introduced it.
+fn control_segments(line: &str) -> Vec<(ControlOp, &str)> {
+    let bytes = line.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut op = ControlOp::Seq;
+    let mut i = 0;
+    while i < bytes.len() {
+        let (sep_len, next_op) = match bytes[i] {
+            b';' | b'\n' => (1, ControlOp::Seq),
+            b'&' if bytes.get(i + 1) == Some(&b'&') => (2, ControlOp::And),
+            b'&' if bytes.get(i + 1).is_none_or(|n| n.is_ascii_whitespace()) => (1, ControlOp::Seq),
+            b'|' if bytes.get(i + 1) == Some(&b'|') => (2, ControlOp::Or),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        segments.push((op, &line[start..i]));
+        op = next_op;
+        i += sep_len;
+        start = i;
+    }
+    segments.push((op, &line[start..]));
+    segments
+}
+
+/// If `parts` is a command made only of output redirections (`>/tmp/.x`, `> /tmp/.x`,
+/// `>>/tmp/.x`, `1>/tmp/.x`), the file they write. Any ordinary word makes it a normal command
+/// and `None` is returned; an input-only redirection (`</etc/passwd`) reads nothing and is not
+/// modeled here either.
+fn redirection_only_target<'a>(parts: &[&'a str]) -> Option<&'a str> {
+    let mut target = None;
+    let mut i = 0;
+    while i < parts.len() {
+        let tok = parts[i];
+        let stripped = tok.trim_start_matches(|c: char| c.is_ascii_digit());
+        if !stripped.starts_with('>') {
+            return None;
+        }
+        let attached = stripped.trim_start_matches('>');
+        let file = if attached.is_empty() {
+            i += 1;
+            *parts.get(i)?
+        } else {
+            attached
+        };
+        target.get_or_insert(file);
+        i += 1;
+    }
+    target
+}
+
+/// Whether a canned reply reads as a failed command, for `&&`/`||` sequencing. A real shell has
+/// an exit status; this grammar has only its output, so the failure vocabulary the grammar
+/// itself emits stands in for it.
+fn looks_like_failure(reply: &str) -> bool {
+    reply.contains("not found")
+        || reply.contains("No such file")
+        || reply.contains("cannot access")
+        || reply.contains("Permission denied")
 }
 
 /// `tftp [-g|-p] [-l LOCAL] [-r REMOTE] HOST [PORT]` (BusyBox) -> `tftp://HOST[:PORT]/REMOTE`.
@@ -1249,6 +1386,126 @@ mod shell_detection_tests {
         let (out, events) = shell().handle_input("sh");
         assert_eq!(out, "");
         assert_eq!(events.len(), 1); // command_exec only, no spurious download
+    }
+
+    /// Observed live 2026-09-06: a Mirai scanner sent `ls /home; /bin/busybox BOTNET` as ONE line.
+    /// The shell dispatched the whole line as `ls` with `/home;` as its argument, answered
+    /// "cannot access '/home;'", and the busybox probe never ran - so the loader never saw the
+    /// "applet not found" reply it gates its download stage on, and left. A real shell runs each
+    /// command in turn.
+    #[test]
+    fn semicolon_separated_commands_each_run_and_the_busybox_gate_still_answers() {
+        let (out, events) = shell().handle_input("ls /home; /bin/busybox BOTNET");
+        assert!(
+            out.contains("ubuntu"),
+            "ls /home must list the home dir: {out:?}"
+        );
+        assert!(
+            out.ends_with("BOTNET: applet not found\n"),
+            "the busybox probe after the `;` must run and answer: {out:?}"
+        );
+        assert!(!out.contains("cannot access"), "{out:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "still one command_exec event per input line"
+        );
+    }
+
+    #[test]
+    fn cd_then_pwd_on_one_line_sees_the_new_directory() {
+        let (out, _) = shell().handle_input("cd /tmp; pwd");
+        assert_eq!(out, "/tmp\n");
+    }
+
+    #[test]
+    fn and_and_or_short_circuit_on_the_previous_outcome() {
+        let (out, _) = shell().handle_input("nosuchcmd && echo ran");
+        assert!(
+            !out.contains("ran"),
+            "&& after a failure must not run: {out:?}"
+        );
+        let (out, _) = shell().handle_input("nosuchcmd || echo fallback");
+        assert!(
+            out.ends_with("fallback\n"),
+            "|| after a failure must run: {out:?}"
+        );
+        let (out, _) = shell().handle_input("id && echo ok");
+        assert!(out.contains("uid=0") && out.ends_with("ok\n"), "{out:?}");
+    }
+
+    #[test]
+    fn a_pipeline_stays_one_command_answered_by_its_first_stage() {
+        // `|` is not a control operator here: the left stage answers, as before this change.
+        let (out, _) = shell().handle_input("id | grep uid");
+        assert!(out.contains("uid=0(root)"), "{out:?}");
+        assert!(!out.contains("grep"), "{out:?}");
+    }
+
+    /// Observed live 2026-09-06, verbatim: a loader probing for a writable directory before
+    /// choosing a drop location, then printing the marker it keys its next stage on.
+    #[test]
+    fn writable_directory_probe_chain_reaches_the_busybox_marker() {
+        let mut sh = shell();
+        let (out, events) = sh.handle_input(
+            ">/var/run/.x&&cd /var/run;>/mnt/.x&&cd /mnt;>/usr/.x&&cd /usr;>/dev/.x&&cd /dev;\
+             >/dev/shm/.x&&cd /dev/shm;>/tmp/.x&&cd /tmp;>/var/.x&&cd /var;\
+             /bin/busybox echo -e '\\x51\\x4a\\x4c\\x58\\x54\\x4b'",
+        );
+        assert_eq!(
+            out, "QJLXTK\n",
+            "every probe silent, then exactly the marker"
+        );
+        assert_eq!(sh.cwd, "/var", "the last successful `&& cd` wins");
+        assert_eq!(events.len(), 1, "one command_exec for the line");
+        assert_eq!(
+            events[0].signal_type,
+            sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC,
+            "no download event: the line retrieves nothing"
+        );
+    }
+
+    #[test]
+    fn a_redirection_probe_into_a_missing_directory_fails_and_blocks_its_cd() {
+        let mut sh = shell();
+        let (out, _) = sh.handle_input(">/nonexistent/.x&&cd /nonexistent;pwd");
+        assert_eq!(
+            out, "bash: /nonexistent/.x: No such file or directory\n/root\n",
+            "{out:?}"
+        );
+        assert_eq!(sh.cwd, "/root");
+    }
+
+    #[test]
+    fn a_created_file_shows_up_in_a_later_listing() {
+        let mut sh = shell();
+        sh.handle_input("cd /tmp; >.x");
+        let (out, _) = sh.handle_input("ls -a /tmp");
+        assert!(out.contains(".x"), "{out:?}");
+    }
+
+    #[test]
+    fn cd_into_a_directory_the_box_does_not_present_is_refused() {
+        let mut sh = shell();
+        let (out, _) = sh.handle_input("cd /nonexistent");
+        assert_eq!(out, "bash: cd: /nonexistent: No such file or directory\n");
+        assert_eq!(sh.cwd, "/root");
+        // Directories the root listing advertises, and ancestors of modeled files, still work.
+        assert_eq!(sh.handle_input("cd /proc").0, "");
+        assert_eq!(sh.handle_input("cd /bin").0, "");
+    }
+
+    #[test]
+    fn su_on_a_root_shell_is_silent() {
+        assert_eq!(shell().handle_input("su").0, "");
+        assert_eq!(shell().handle_input("su -").0, "");
+        assert_eq!(shell().handle_input("su root").0, "");
+    }
+
+    #[test]
+    fn background_ampersand_and_newline_also_separate_commands() {
+        let (out, _) = shell().handle_input("cd /etc & pwd\nwhoami");
+        assert!(out.ends_with("/etc\nroot\n"), "{out:?}");
     }
 
     #[test]

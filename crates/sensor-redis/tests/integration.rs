@@ -150,8 +150,15 @@ async fn set_get_responses_correct() {
     assert_eq!(set_reply, b"+OK\r\n");
 
     send_multibulk(&mut conn, &["GET", "foo"]).await;
+    let get_reply = read_until_contains(&mut conn, b"$3\r\nbar\r\n").await;
+    assert_eq!(
+        get_reply, b"$3\r\nbar\r\n",
+        "GET must return what this session SET; nil here contradicted the +OK"
+    );
+
+    send_multibulk(&mut conn, &["GET", "never-set"]).await;
     let get_reply = read_until_contains(&mut conn, b"$-1\r\n").await;
-    assert_eq!(get_reply, b"$-1\r\n", "GET must reply a nil bulk string");
+    assert_eq!(get_reply, b"$-1\r\n", "an unset key is nil");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     drop(conn);

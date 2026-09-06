@@ -12,11 +12,13 @@
 //! **This sensor never actually authenticates or persists anything.** `AUTH` always succeeds (a
 //! real unauthenticated Redis instance behaves the same way - the point is to let the attacker
 //! proceed and reveal intent, matching sensor-ssh/telnet's own "accept everything" convention).
-//! `SET` always replies `+OK` without storing the value; `GET` always replies with a nil bulk
-//! string regardless of any prior `SET` in the same session - a deliberate simplification (see
-//! `get_after_set_still_returns_nil` below), not a bug: this honeypot has nothing real behind it
-//! worth emulating statefully.
+//! `SET` stores the value in a small per-session map and `GET` reads it back, so the ordinary
+//! write-then-read check an attacker's tooling makes (`SET foo bar` / `GET foo`) sees a
+//! consistent server; it used to answer nil to every GET, which contradicted the `+OK` two
+//! commands earlier. The map is session-scoped and capped (`MAX_KEYS`); nothing persists between
+//! connections and nothing behind it is real.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -253,7 +255,14 @@ pub struct Session {
     wan_ip: Option<IpAddr>,
     session_id: Uuid,
     authenticated: bool,
+    /// Values SET this session, read back by GET. Bounded by `MAX_KEYS` entries and
+    /// `MAX_VALUE_LEN` bytes each, so a connection cannot grow the process without limit.
+    keys: HashMap<String, String>,
 }
+
+/// Distinct keys one session may hold; a SET past this on a new key is acknowledged but not
+/// kept, which is what a full instance under `maxmemory` looks like from the outside.
+const MAX_KEYS: usize = 256;
 
 impl Session {
     /// `source_ip`/`wan_ip` are this connection's real attributes; every event this type ever
@@ -264,6 +273,7 @@ impl Session {
             wan_ip,
             session_id,
             authenticated: false,
+            keys: HashMap::new(),
         }
     }
 
@@ -423,12 +433,17 @@ impl Session {
                 "value": value,
             }),
         );
+        // Keep the raw (length-bounded, not sanitized) value so GET hands back exactly what was
+        // SET; the sanitized copy above is for the ledger only.
+        if self.keys.len() < MAX_KEYS || self.keys.contains_key(&args[1]) {
+            let raw: String = args[2].chars().take(MAX_VALUE_LEN).collect();
+            self.keys.insert(args[1].clone(), raw);
+        }
         (resp::simple_string("OK"), vec![event])
     }
 
-    /// `GET <key>`. Always replies nil - see the module doc for why this is a deliberate
-    /// simplification, not a bug. No event: the design spec lists an event only for the write
-    /// side (`SET`), not this read side.
+    /// `GET <key>`: the value SET earlier this session, else nil. No event: the design spec lists
+    /// an event only for the write side (`SET`), not this read side.
     fn handle_get(&mut self, args: &[String]) -> (Vec<u8>, Vec<SensorEvent>) {
         if args.len() != 2 {
             return (
@@ -436,7 +451,11 @@ impl Session {
                 vec![],
             );
         }
-        (resp::nil_bulk_string(), vec![])
+        let reply = match self.keys.get(&args[1]) {
+            Some(value) => resp::bulk_string(value),
+            None => resp::nil_bulk_string(),
+        };
+        (reply, vec![])
     }
 
     /// `SLAVEOF <host> <port>` / `REPLICAOF <host> <port>` (or `REPLICAOF NO ONE` to detach).
@@ -813,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn get_always_replies_nil() {
+    fn get_of_a_key_never_set_is_nil_and_emits_nothing() {
         let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         let (response, events) = session.dispatch(&args(&["GET", "foo"]));
         assert_eq!(response, resp::nil_bulk_string());
@@ -823,14 +842,47 @@ mod tests {
         );
     }
 
+    /// `SET foo bar` then `GET foo` is the ordinary write-then-read check; answering `+OK` and
+    /// then nil two commands later contradicted the server within one session.
     #[test]
-    fn get_after_set_still_returns_nil() {
-        // Deliberate simplification (see the module doc): this honeypot never actually stores
-        // anything, so GET is unconditionally nil even immediately after a SET of the same key.
+    fn get_after_set_returns_the_value_within_the_session() {
         let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
         session.dispatch(&args(&["SET", "foo", "bar"]));
         let (response, _events) = session.dispatch(&args(&["GET", "foo"]));
-        assert_eq!(response, resp::nil_bulk_string());
+        assert_eq!(response, resp::bulk_string("bar"));
+        // Overwrite is visible too.
+        session.dispatch(&args(&["SET", "foo", "baz"]));
+        assert_eq!(
+            session.dispatch(&args(&["GET", "foo"])).0,
+            resp::bulk_string("baz")
+        );
+        // Nothing persists across connections: a new session starts empty.
+        let mut fresh = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        assert_eq!(
+            fresh.dispatch(&args(&["GET", "foo"])).0,
+            resp::nil_bulk_string()
+        );
+    }
+
+    #[test]
+    fn the_session_store_is_capped() {
+        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        for i in 0..(MAX_KEYS + 10) {
+            let key = format!("k{i}");
+            session.dispatch(&args(&["SET", &key, "v"]));
+        }
+        assert!(session.keys.len() <= MAX_KEYS);
+        // A key already held can still be overwritten at the cap.
+        session.dispatch(&args(&["SET", "k0", "new"]));
+        assert_eq!(
+            session.dispatch(&args(&["GET", "k0"])).0,
+            resp::bulk_string("new")
+        );
+        // A new key past the cap is acknowledged but not kept.
+        assert_eq!(
+            session.dispatch(&args(&["GET", "k300"])).0,
+            resp::nil_bulk_string()
+        );
     }
 
     #[test]

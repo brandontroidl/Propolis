@@ -68,6 +68,9 @@ pub(crate) fn format_activity(sensor: &str, signal_type: &str) -> String {
         // A URL the attacker told the shell to fetch: an attempt the sensor extracted, never a
         // file it received. Whether anything was retrieved is the fetcher's separate record.
         "honeypot_file_download" => "download attempt",
+        // Telemetry, not an accusation: it carries no weight and never moved this address's
+        // score (see docs/reference/events-and-signals.md).
+        "honeypot_session_end" => "session ended",
         "ssh_brute_force" => "SSH brute force",
         "port_scan" => "port scan",
         "syn_flood" => "SYN flood",
@@ -114,6 +117,7 @@ pub(crate) fn signal_tag_label(signal_type: &str) -> &'static str {
         "honeypot_malware_upload" => "malware upload",
         "honeypot_command_exec" => "command exec",
         "honeypot_file_download" => "download attempt",
+        "honeypot_session_end" => "session end",
         "honeypot_login_attempt" => "login attempt",
         "honeypot_connection" => "connection",
         "ssh_brute_force" => "ssh brute",

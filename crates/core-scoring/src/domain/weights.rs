@@ -28,6 +28,10 @@ pub fn signal_weight(s: SignalType) -> SignalWeight {
         SshBruteForce => (20, dec!(0.600), Auth),
         CatchallProbe => (15, dec!(0.400), Network),
         RemoteAuthFailure => (12, dec!(0.400), Auth),
+        // Telemetry: it never reaches the scoring path at all (see `SignalType::is_telemetry`),
+        // and carries a zero weight so that a row read back from the ledger cannot contribute
+        // even if some future caller folds one by mistake.
+        HoneypotSessionEnd => (0, dec!(0.000), Honeypot),
     };
     SignalWeight {
         weight,
@@ -53,5 +57,22 @@ mod tests {
         assert_eq!(w.confidence, dec!(0.980));
         assert_eq!(w.category, Category::Honeypot);
         assert_eq!(signal_weight(SignalType::BlockedConnection).weight, 3);
+    }
+
+    /// Every telemetry signal weighs nothing, and nothing else does: a scoring signal that
+    /// dropped to zero would be a silent de-weighting, and telemetry that gained a weight would
+    /// start moving scores the moment some path folded one.
+    #[test]
+    fn telemetry_signals_weigh_zero_and_only_telemetry_does() {
+        for s in SignalType::ALL {
+            let w = signal_weight(s);
+            assert_eq!(
+                w.weight == 0,
+                s.is_telemetry(),
+                "{s:?}: weight {} vs is_telemetry {}",
+                w.weight,
+                s.is_telemetry()
+            );
+        }
     }
 }

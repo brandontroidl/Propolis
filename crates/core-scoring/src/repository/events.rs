@@ -43,7 +43,7 @@ use std::net::IpAddr;
 use chrono::{DateTime, NaiveDate, SubsecRound, Utc};
 use sqlx::{PgPool, Postgres, Row};
 
-use crate::domain::enums::Category;
+use crate::domain::enums::{Category, SignalType};
 use crate::domain::types::{EventInput, IpScore, ValidationError};
 use crate::hashing::chain_hash;
 use crate::scoring::breadth::{WanVantage, distinct_wan_count};
@@ -67,7 +67,24 @@ pub enum RepoError {
     /// `.expect()` panic on the corrupt value - the read path fails closed.
     #[error("corrupt stored state: {0}")]
     Corrupt(String),
+    /// A telemetry signal was handed to the scoring append path. Telemetry describes an
+    /// interaction and must never move a score, so the two paths are separate and this one fails
+    /// closed rather than quietly folding the row - see [`append_telemetry_event`].
+    #[error("{0:?} is telemetry; append it with append_telemetry_event")]
+    NotScorable(SignalType),
 }
+
+/// Excludes telemetry rows from a scoring aggregate that reads the whole ledger for one source.
+/// A macro rather than a `const` so the queries stay `&'static str` literals that sqlx accepts
+/// without a dynamic-SQL escape hatch, while the predicate itself has one home;
+/// `telemetry_exclusion_names_every_telemetry_signal` fails if a telemetry signal is added
+/// without extending it.
+macro_rules! exclude_telemetry {
+    () => {
+        "signal_type <> 'honeypot_session_end'"
+    };
+}
+pub(crate) use exclude_telemetry;
 
 // Manual `From` (not thiserror `#[from]`) so we do not require `ValidationError`
 // to implement `std::error::Error`; it stays a plain domain value type.
@@ -95,6 +112,13 @@ const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
 pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, RepoError> {
     // 1. Validate first: a malformed event writes NOTHING (no tx opened).
     event.validate()?;
+
+    // 1a. Telemetry never enters the scoring path. Refusing it here, rather than folding a
+    // zero-weight row, is what makes "telemetry cannot move a score" a property of the code
+    // instead of a property of a tunable number.
+    if event.signal_type.is_telemetry() {
+        return Err(RepoError::NotScorable(event.signal_type));
+    }
 
     // 1b. Normalize the storage-lossy fields to their STORED precision BEFORE
     // both hashing and inserting, so the bytes we hash are byte-identical to the
@@ -153,40 +177,9 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
         .execute(&mut *tx)
         .await?;
 
-    // 2a. Chain head hash (None for the first event ever).
-    let prev_head: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT hash FROM event ORDER BY id DESC LIMIT 1")
-            .fetch_optional(&mut *tx)
-            .await?;
-
-    // 2b. Compute this event's chain hash bound to the head.
-    let hash = chain_hash(prev_head.as_deref(), &event);
-
-    // 2c. Insert the event row; RETURNING id anchors the dedup lookup below.
-    let wan_ip_txt: Option<String> = event.wan_ip.map(|ip| ip.to_string());
-    let new_id: i64 = sqlx::query_scalar(
-        "INSERT INTO event \
-         (source_ip, wan_ip, sensor, signal_type, protocol, authenticated, category, \
-          weight, confidence, observed_at, metadata, prev_hash, hash, session_id) \
-         VALUES ($1::inet, $2::inet, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-         RETURNING id",
-    )
-    .bind(event.source_ip.to_string())
-    .bind(wan_ip_txt)
-    .bind(&event.sensor)
-    .bind(event.signal_type)
-    .bind(event.protocol)
-    .bind(event.authenticated)
-    .bind(event.category)
-    .bind(event.weight as i32)
-    .bind(event.confidence)
-    .bind(event.observed_at)
-    .bind(&event.metadata)
-    .bind(prev_head.as_deref())
-    .bind(hash.as_slice())
-    .bind(event.session_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    // 2a-2c. Append the row to the hash chain (see `insert_chained`); the returned id anchors
+    // the dedup lookup below.
+    let new_id = insert_chained(&mut tx, &event).await?;
 
     // 2d. Read the UN-projected stored projection (double-decay guard: the write
     // path reads the stored raw score AS STORED, never a read-projected value).
@@ -217,13 +210,18 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     // 2f. Breadth inputs from the ledger for this source (INCLUDING the row just
     // inserted). One vantage per distinct non-null wan_ip; `saw_authenticated_tcp`
     // is true if ANY event from this source on that wan was authenticated tcp.
-    let vantage_rows = sqlx::query(
+    // Telemetry rows are excluded here and in the distinct-sensor count below. Skipping only
+    // their own projection would not be enough: these two read EVERY ledger row for the source,
+    // so an outcome record would silently add a vantage or a sensor to the next scored event's
+    // breadth. `rebuild_projection` excludes them the same way, or replay would diverge.
+    let vantage_rows = sqlx::query(concat!(
         "SELECT host(wan_ip) AS wan, \
                 bool_or(protocol = 'tcp' AND authenticated) AS auth_tcp \
          FROM event \
-         WHERE source_ip = $1::inet AND wan_ip IS NOT NULL \
-         GROUP BY wan_ip",
-    )
+         WHERE source_ip = $1::inet AND wan_ip IS NOT NULL AND ",
+        exclude_telemetry!(),
+        " GROUP BY wan_ip"
+    ))
     .bind(event.source_ip.to_string())
     .fetch_all(&mut *tx)
     .await?;
@@ -242,11 +240,14 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     }
     let dwc = distinct_wan_count(&vantages) as i32;
 
-    let dsc: i64 =
-        sqlx::query_scalar("SELECT COUNT(DISTINCT sensor) FROM event WHERE source_ip = $1::inet")
-            .bind(event.source_ip.to_string())
-            .fetch_one(&mut *tx)
-            .await?;
+    let dsc: i64 = sqlx::query_scalar(concat!(
+        "SELECT COUNT(DISTINCT sensor) FROM event \
+         WHERE source_ip = $1::inet AND ",
+        exclude_telemetry!()
+    ))
+    .bind(event.source_ip.to_string())
+    .fetch_one(&mut *tx)
+    .await?;
     let dsc = dsc as i32;
 
     // 2g. Pure projection step (no DB, no clock).
@@ -306,6 +307,81 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     // 2i. Commit; only now is the projection durable.
     tx.commit().await?;
     Ok(new_score)
+}
+
+/// Read the chain head, bind this event's hash to it, and insert the row. Shared by the scoring
+/// append and [`append_telemetry_event`] so the two can never compute the chain differently; both
+/// call it while holding the append advisory lock, which is what makes the head read and the
+/// insert one critical section.
+async fn insert_chained(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &EventInput,
+) -> Result<i64, RepoError> {
+    let prev_head: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT hash FROM event ORDER BY id DESC LIMIT 1")
+            .fetch_optional(&mut **tx)
+            .await?;
+    let hash = chain_hash(prev_head.as_deref(), event);
+    let wan_ip_txt: Option<String> = event.wan_ip.map(|ip| ip.to_string());
+    let new_id: i64 = sqlx::query_scalar(
+        "INSERT INTO event \
+         (source_ip, wan_ip, sensor, signal_type, protocol, authenticated, category, \
+          weight, confidence, observed_at, metadata, prev_hash, hash, session_id) \
+         VALUES ($1::inet, $2::inet, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+         RETURNING id",
+    )
+    .bind(event.source_ip.to_string())
+    .bind(wan_ip_txt)
+    .bind(&event.sensor)
+    .bind(event.signal_type)
+    .bind(event.protocol)
+    .bind(event.authenticated)
+    .bind(event.category)
+    .bind(event.weight as i32)
+    .bind(event.confidence)
+    .bind(event.observed_at)
+    .bind(&event.metadata)
+    .bind(prev_head.as_deref())
+    .bind(hash.as_slice())
+    .bind(event.session_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(new_id)
+}
+
+/// Append a TELEMETRY event: it joins the hash chain like any other record, and touches no
+/// scoring state at all - no projection is read or written, so an address seen only through
+/// telemetry has no `ip_score` row, and an address that already has one keeps it byte for byte.
+///
+/// This is the only way a telemetry signal reaches the ledger; [`append_event`] refuses one. The
+/// separation is deliberate: it makes "telemetry cannot move a score" a structural property
+/// rather than an arithmetic accident of a zero weight, which someone could later tune.
+pub async fn append_telemetry_event(pool: &PgPool, event: EventInput) -> Result<(), RepoError> {
+    event.validate()?;
+    if !event.signal_type.is_telemetry() {
+        return Err(RepoError::NotScorable(event.signal_type));
+    }
+    let mut confidence = event.confidence;
+    confidence.rescale(3);
+    let event = EventInput {
+        observed_at: event.observed_at.trunc_subsecs(6),
+        confidence,
+        ..event
+    };
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await?;
+    // The same append lock the scoring path takes: the chain is one sequence, so a telemetry
+    // append and a scored append must not interleave between head-read and insert.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(APPEND_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+    insert_chained(&mut tx, &event).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Read the stored projection for `ip`, projected to now: `raw_score` and each category weight are

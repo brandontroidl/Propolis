@@ -84,7 +84,9 @@ rows with status `incomplete`.
 
 ## Signal types
 
-16 signal types (`signal_type_enum`, mirrored by Rust `SignalType`). The enum
+17 signal types (`signal_type_enum`, mirrored by Rust `SignalType`). Sixteen of them
+accuse an address and carry weight; the seventeenth, `honeypot_session_end`, is
+**telemetry** and never moves a score - see below. The enum
 definition and its DB type are owned by
 [database.md](database.md#enum-types); this page owns their meaning and weight.
 
@@ -118,6 +120,31 @@ is stored as `NUMERIC(4,3)` in `event`.
 | `ssh_brute_force` | 20 | 0.600 | auth | SSH brute-force |
 | `catchall_probe` | 15 | 0.400 | network | probe hit the catch-all listener |
 | `remote_auth_failure` | 12 | 0.400 | auth | remote auth failure (corroborating sensor) |
+| `honeypot_session_end` | 0 | 0.000 | honeypot | **telemetry**: how one interaction ended |
+
+### Telemetry signals never score
+
+`honeypot_session_end` records what happened to an exchange - why it ended, how long it
+ran, what the attacker was told. It is evidence about the interaction, so it is written
+to the same hash-chained ledger, but it is not an accusation and must not move a score.
+
+A zero weight alone would not achieve that. The append path derives an address's
+distinct-sensor count and per-WAN vantages from **every** ledger row for that source, so
+a zero-weight row would still have widened the breadth inputs of the *next* real event,
+and `rebuild_projection` would have folded it too. Four things enforce the separation,
+keyed on the explicit `SignalType::TELEMETRY` list rather than on the weight number:
+
+- `append_event` refuses a telemetry signal (`RepoError::NotScorable`);
+- `append_telemetry_event` is the only way one reaches the ledger, and it writes no
+  projection at all, so an address seen only through telemetry has no `ip_score` row;
+- the incremental breadth and distinct-sensor aggregates exclude these rows;
+- `rebuild_projection` excludes them identically, so replay still equals the incremental
+  projection.
+
+`verify_chain` still reads them: a telemetry record is part of the chain, just not part
+of a score. Tests in `crates/core-scoring/tests/telemetry.rs` compare
+attack -> telemetry -> attack against attack -> attack field by field, through both the
+incremental path and a rebuild.
 
 Coverage is guarded by `every_signal_type_has_exactly_one_weight_row` (`weights.rs:44`),
 which has no default match arm, so a new variant that lacks a row fails to compile.

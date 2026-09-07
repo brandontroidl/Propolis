@@ -77,6 +77,15 @@ fn reconstruct_event(row: &PgRow) -> Result<EventInput, RepoError> {
 
     let weight: i32 = row.try_get("weight")?;
 
+    // Re-apply the append path's scale-3 normalization to the DECODED confidence. The append
+    // path hashes a value it has rescaled to 3, and `NUMERIC(4,3)` stores that scale, but a
+    // stored ZERO decodes back as scale-0 `0` rather than `0.000` - and `canonical_bytes` hashes
+    // `confidence.to_string()`, so an untampered zero-confidence row would re-hash differently
+    // and read as a broken chain. Every non-zero confidence is already scale 3, so this is a
+    // no-op for them and no existing chain hash changes.
+    let mut confidence: Decimal = row.try_get::<Decimal, _>("confidence")?;
+    confidence.rescale(3);
+
     Ok(EventInput {
         source_ip,
         wan_ip,
@@ -86,7 +95,7 @@ fn reconstruct_event(row: &PgRow) -> Result<EventInput, RepoError> {
         authenticated: row.try_get("authenticated")?,
         category: row.try_get::<Category, _>("category")?,
         weight: weight as u32,
-        confidence: row.try_get::<Decimal, _>("confidence")?,
+        confidence,
         observed_at: row.try_get::<DateTime<Utc>, _>("observed_at")?,
         metadata: row.try_get("metadata")?,
         // Not selected by the query below: session_id is not part of the frozen
@@ -109,11 +118,17 @@ fn reconstruct_event(row: &PgRow) -> Result<EventInput, RepoError> {
 /// `read_score`); fails closed with [`RepoError::Corrupt`] only if a stored value
 /// cannot be parsed.
 pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<Option<IpScore>, RepoError> {
-    let rows = sqlx::query(
+    // Telemetry rows are excluded here exactly as the incremental path excludes them from its
+    // own aggregates: not loading them at all is what keeps the fold, the vantages and the
+    // distinct-sensor count identical between replay and append. `verify_chain` still reads
+    // every row - a telemetry record is part of the hash chain, it is just not part of a score.
+    let rows = sqlx::query(concat!(
         "SELECT host(source_ip) AS source_ip, host(wan_ip) AS wan_ip, sensor, signal_type, \
                 protocol, authenticated, category, weight, confidence, observed_at, metadata \
-         FROM event WHERE source_ip = $1::inet ORDER BY id",
-    )
+         FROM event WHERE source_ip = $1::inet AND ",
+        crate::repository::events::exclude_telemetry!(),
+        " ORDER BY id"
+    ))
     .bind(ip.to_string())
     .fetch_all(pool)
     .await?;

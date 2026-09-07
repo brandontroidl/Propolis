@@ -79,9 +79,12 @@ pub enum SignalType {
     SshBruteForce,
     CatchallProbe,
     RemoteAuthFailure,
+    /// How one interaction ended: the reason, the elapsed time, and what the attacker was told.
+    /// TELEMETRY, not evidence of an attack - see [`SignalType::is_telemetry`].
+    HoneypotSessionEnd,
 }
 impl SignalType {
-    pub const ALL: [SignalType; 16] = [
+    pub const ALL: [SignalType; 17] = [
         SignalType::HoneypotConnection,
         SignalType::HoneypotLoginAttempt,
         SignalType::HoneypotCommandExec,
@@ -98,7 +101,23 @@ impl SignalType {
         SignalType::SshBruteForce,
         SignalType::CatchallProbe,
         SignalType::RemoteAuthFailure,
+        SignalType::HoneypotSessionEnd,
     ];
+
+    /// Signals that describe an interaction rather than accuse an address. They are recorded in
+    /// the ledger, because what the honeypot told an attacker and how the exchange ended is
+    /// evidence about the interaction, but they must never move a score.
+    ///
+    /// This is an EXPLICIT classification, not "weight is zero": a weight is a tunable number,
+    /// and deriving scoring behaviour from it would silently reclassify a signal the day someone
+    /// tuned it to zero. Everything that keeps telemetry out of scoring keys on this list -
+    /// `repository::append_event` refuses it outright, `append_telemetry_event` is the only way
+    /// in, and both the incremental aggregates and `rebuild_projection` exclude these rows.
+    pub const TELEMETRY: [SignalType; 1] = [SignalType::HoneypotSessionEnd];
+
+    pub fn is_telemetry(self) -> bool {
+        Self::TELEMETRY.contains(&self)
+    }
 }
 
 #[derive(
@@ -120,8 +139,8 @@ pub fn is_confirmed_real(p: Protocol, authenticated: bool, c: Category) -> bool 
 mod tests {
     use super::*;
     #[test]
-    fn signal_type_all_has_16_distinct_variants() {
-        assert_eq!(SignalType::ALL.len(), 16);
+    fn signal_type_all_has_17_distinct_variants() {
+        assert_eq!(SignalType::ALL.len(), 17);
         let mut seen = std::collections::HashSet::new();
         for s in SignalType::ALL {
             assert!(seen.insert(s), "duplicate {s:?}");
@@ -144,7 +163,7 @@ mod tests {
 
     #[test]
     fn signal_type_deserializes_from_every_snake_case_wire_string() {
-        let cases: [(&str, SignalType); 16] = [
+        let cases: [(&str, SignalType); 17] = [
             ("honeypot_connection", SignalType::HoneypotConnection),
             ("honeypot_login_attempt", SignalType::HoneypotLoginAttempt),
             ("honeypot_command_exec", SignalType::HoneypotCommandExec),
@@ -161,6 +180,7 @@ mod tests {
             ("ssh_brute_force", SignalType::SshBruteForce),
             ("catchall_probe", SignalType::CatchallProbe),
             ("remote_auth_failure", SignalType::RemoteAuthFailure),
+            ("honeypot_session_end", SignalType::HoneypotSessionEnd),
         ];
         for (wire_str, expected) in cases {
             let quoted = format!("\"{wire_str}\"");

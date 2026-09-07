@@ -25,11 +25,17 @@ use crate::persona;
 pub struct FakeFs {
     files: HashMap<&'static str, String>,
     dirs: HashMap<&'static str, Vec<&'static str>>,
-    /// Files an attacker created this session with a redirection (`>/tmp/.x`). Loaders probe for
-    /// a writable directory this way before choosing where to drop a payload, and the probe must
-    /// succeed where a real box would let it, so the `&& cd` that follows runs. Session-scoped,
-    /// never persisted: the next session sees a clean box again.
-    created: HashSet<String>,
+    /// Files an attacker created this session, with their contents: a redirection (`>/tmp/.x`)
+    /// leaves an empty one, a download the body it "fetched", a `cp` the source's contents.
+    /// Loaders probe for a writable directory this way before choosing where to drop a payload,
+    /// and the probe must succeed where a real box would let it, so the `&& cd` that follows
+    /// runs. Session-scoped, never persisted: the next session sees a clean box again.
+    created: HashMap<String, String>,
+    /// Directories an attacker created this session with `mkdir`.
+    created_dirs: HashSet<String>,
+    /// Paths an attacker removed this session with `rm`, baked-in ones included: a file the
+    /// shell said it deleted must stop being readable, or the next `cat` contradicts the `rm`.
+    removed: HashSet<String>,
     /// Created files the attacker has `chmod`ed executable. A loader's writable-directory probe
     /// is `>/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/`: the empty file must then run
     /// (silently, exit 0) or the `&& cd` never happens.
@@ -214,18 +220,27 @@ impl FakeFs {
         );
         dirs.insert("/dev/shm", vec![]);
 
+        // The binaries a loader chain actually touches: `cp /bin/busybox .` then running the
+        // copy is a standard Mirai staging step, and it needs something to copy. The content is
+        // an ELF header's worth of bytes, which is what `cat` on a real one starts with.
+        for binary in EXECUTABLE_BINARIES {
+            files.insert(binary, "\u{7f}ELF\u{2}\u{1}\u{1}\0".to_string());
+        }
+
         Self {
             files,
             dirs,
-            created: HashSet::new(),
-            executable: HashSet::new(),
+            created: HashMap::new(),
+            created_dirs: HashSet::new(),
+            removed: HashSet::new(),
+            executable: EXECUTABLE_BINARIES.iter().map(|b| b.to_string()).collect(),
         }
     }
 
     /// Mark a file the attacker created this session executable (`chmod +x` / `chmod 777`).
     /// Returns false when `path` is not such a file; the baked-in files keep their modes.
     pub fn mark_executable(&mut self, path: &str) -> bool {
-        if !self.created.contains(path) {
+        if !self.created.contains_key(path) {
             return false;
         }
         self.executable.insert(path.to_string());
@@ -234,36 +249,96 @@ impl FakeFs {
 
     /// Whether running `path` as a command would start: only a created file after `chmod`.
     pub fn is_executable(&self, path: &str) -> bool {
-        self.executable.contains(path)
+        self.executable.contains(path) && !self.removed.contains(path)
     }
 
     pub fn read_file(&self, path: &str) -> Option<String> {
-        if self.created.contains(path) {
-            return Some(String::new());
+        if self.removed.contains(path) {
+            return None;
+        }
+        if let Some(content) = self.created.get(path) {
+            return Some(content.clone());
         }
         self.files.get(path).map(|content| content.to_string())
     }
 
     pub fn list_dir(&self, path: &str) -> Option<Vec<String>> {
-        let mut entries: Vec<String> = self
-            .dirs
-            .get(path)?
-            .iter()
-            .map(|entry| entry.to_string())
-            .collect();
+        if self.removed.contains(path) {
+            return None;
+        }
+        let modeled = self.dirs.get(path).map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry.to_string())
+                .collect::<Vec<String>>()
+        });
+        let mut entries = match modeled {
+            Some(entries) => entries,
+            None if self.created_dirs.contains(path) => Vec::new(),
+            None => return None,
+        };
         let prefix = if path == "/" {
             "/".to_string()
         } else {
             format!("{path}/")
         };
-        for file in &self.created {
-            if let Some(name) = file.strip_prefix(&prefix)
-                && !name.contains('/')
-            {
-                entries.push(name.to_string());
-            }
-        }
+        let child_of_this_dir = |candidate: &String| {
+            candidate
+                .strip_prefix(&prefix)
+                .filter(|name| !name.is_empty() && !name.contains('/'))
+                .map(str::to_string)
+        };
+        entries.extend(self.created.keys().filter_map(child_of_this_dir));
+        entries.extend(self.created_dirs.iter().filter_map(child_of_this_dir));
+        entries.retain(|name| !self.removed.contains(&format!("{prefix}{name}")));
         Some(entries)
+    }
+
+    /// Whether `path` names a file this box presents (a baked-in one or a created one).
+    pub fn file_exists(&self, path: &str) -> bool {
+        self.read_file(path).is_some()
+    }
+
+    /// Write `contents` to `path`, as a download saving its body or a `cp` writing its
+    /// destination does. Fails with the missing directory when the parent does not exist, the
+    /// way a real write does, so a loader dropping into a directory this box denies sees the
+    /// refusal rather than a success it can never verify.
+    pub fn write_file(&mut self, path: &str, contents: &str) -> Result<(), String> {
+        let parent = parent_of(path).ok_or_else(String::new)?;
+        if !self.is_dir(&parent) {
+            return Err(parent);
+        }
+        self.removed.remove(path);
+        self.created.insert(path.to_string(), contents.to_string());
+        Ok(())
+    }
+
+    /// Remove `path`. Returns whether anything was there: `rm` without `-f` reports a missing
+    /// file, and the caller decides. A removed file stops being readable, listed and executable.
+    pub fn remove_path(&mut self, path: &str) -> bool {
+        let existed = self.file_exists(path) || self.is_dir(path);
+        self.created.remove(path);
+        self.created_dirs.remove(path);
+        self.executable.remove(path);
+        if existed {
+            self.removed.insert(path.to_string());
+        }
+        existed
+    }
+
+    /// `mkdir path`. `Err(None)` when it already exists, `Err(Some(parent))` when the parent
+    /// does not - the two failures a real `mkdir` distinguishes.
+    pub fn make_dir(&mut self, path: &str) -> Result<(), Option<String>> {
+        if self.is_dir(path) || self.file_exists(path) {
+            return Err(None);
+        }
+        let parent = parent_of(path).ok_or(None)?;
+        if !self.is_dir(&parent) {
+            return Err(Some(parent));
+        }
+        self.removed.remove(path);
+        self.created_dirs.insert(path.to_string());
+        Ok(())
     }
 
     /// Whether `path` is a directory this box presents: a modeled directory, a directory the
@@ -272,7 +347,10 @@ impl FakeFs {
     /// never lets an attacker enter a directory that `ls /` did not show, and never refuses one
     /// it did.
     pub fn is_dir(&self, path: &str) -> bool {
-        if path == "/" || self.dirs.contains_key(path) {
+        if self.removed.contains(path) {
+            return false;
+        }
+        if path == "/" || self.dirs.contains_key(path) || self.created_dirs.contains(path) {
             return true;
         }
         let in_root_listing = path
@@ -289,16 +367,19 @@ impl FakeFs {
     /// Model `> path` with no command: create an empty file if its directory exists, else fail
     /// the way the shell would. Returns the directory that does not exist on failure.
     pub fn create_file(&mut self, path: &str) -> Result<(), String> {
-        let parent = match path.rfind('/') {
-            Some(0) => "/".to_string(),
-            Some(i) => path[..i].to_string(),
-            None => return Err(String::new()),
-        };
-        if !self.is_dir(&parent) {
-            return Err(parent);
-        }
-        self.created.insert(path.to_string());
-        Ok(())
+        self.write_file(path, "")
+    }
+}
+
+/// Binaries present and executable from the start, so `cp /bin/busybox x && ./x` behaves.
+const EXECUTABLE_BINARIES: [&str; 4] = ["/bin/busybox", "/bin/sh", "/bin/bash", "/usr/bin/wget"];
+
+/// The directory holding `path`, or `None` when `path` has no `/` at all.
+fn parent_of(path: &str) -> Option<String> {
+    match path.rfind('/') {
+        Some(0) => Some("/".to_string()),
+        Some(i) => Some(path[..i].to_string()),
+        None => None,
     }
 }
 

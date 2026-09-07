@@ -51,8 +51,10 @@ const MAX_LINE_LEN: usize = 8192;
 enum ChannelHandler {
     /// Awaiting a channel request to determine the handler type.
     Pending,
-    /// Interactive fake shell with a line buffer for incremental input.
-    Shell(FakeShell, Vec<u8>),
+    /// Interactive fake shell with a line buffer for incremental input. Boxed: the shell owns a
+    /// whole filesystem snapshot and dwarfs the other variants, so an unboxed one would make
+    /// every `ChannelHandler` that size.
+    Shell(Box<FakeShell>, Vec<u8>),
     /// SCP server-mode file receiver.
     Scp(ScpReceiver),
     /// SFTP subsystem handler.
@@ -342,7 +344,7 @@ async fn handle_session(
                             session_id: Some(session_id),
                         };
                         let shell = FakeShell::new(FakeFs::new(), ctx);
-                        handler = ChannelHandler::Shell(shell, Vec::new());
+                        handler = ChannelHandler::Shell(Box::new(shell), Vec::new());
                         // Send an initial prompt, hostname from the shared persona so it matches
                         // uname / the fake filesystem / the other sensors.
                         let prompt = persona::root_prompt(&persona::hostname());

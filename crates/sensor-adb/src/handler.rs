@@ -90,7 +90,8 @@ enum StreamKind {
     /// Interactive `shell:` session: `FakeShell` plus a partial-line buffer for incremental
     /// input. A one-shot `shell:<command>` never reaches this table at all - see
     /// `handle_open`'s doc.
-    Shell(FakeShell, Vec<u8>),
+    /// Boxed: the shell owns a whole filesystem snapshot and dwarfs the sync variant.
+    Shell(Box<FakeShell>, Vec<u8>),
     /// `sync:` file-transfer sub-protocol session.
     Sync(SyncState),
 }
@@ -583,7 +584,7 @@ async fn handle_open(
                         server_id,
                         Stream {
                             client_local_id,
-                            kind: StreamKind::Shell(shell, Vec::new()),
+                            kind: StreamKind::Shell(Box::new(shell), Vec::new()),
                         },
                     );
                 }

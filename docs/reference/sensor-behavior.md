@@ -113,6 +113,13 @@ contradict each other (`crates/sensor-framework/src/persona.rs:1-16`): **Ubuntu
 `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10` (`:41`). Helpers produce a consistent
 `uname -a` string, `/proc/version`, and a `root@<host>:~#` prompt (`:55-67`).
 
+`sensor-adb` resolves a **second** identity from the same file: a rooted Nexus 5 on
+Android 6.0.1 (build M4B30Z, kernel 3.4.0, armv7l). ADB is Android's own debug
+protocol, so the device the CNXN banner announces, the `adb shell` prompt, `uname`,
+`/system/build.prop` and the filesystem all come from that half, and the banner cannot
+drift from the shell the way it had. The device is rooted, which is why it grants a root
+shell over ADB and carries busybox and `su`.
+
 ### Fake filesystem
 
 `fakefs.rs` is an in-memory static snapshot, fresh per session, with no real
@@ -128,6 +135,11 @@ a directory the shell will enter). Directories include `/`, `/tmp`, `/root`, `/e
 `/sys`, `/run` and `/boot` subtrees the mount table names. `/bin/busybox`, `/bin/sh`,
 `/bin/bash` and `/usr/bin/wget` are present and executable, so the `cp /bin/busybox x`
 staging step has something to copy.
+
+`FakeFs::android()` is the same machinery over the phone's filesystem: `/system` (mounted
+read-only, so a write there is refused as on a real device), `/system/bin`,
+`/system/xbin/busybox`, `/data/local/tmp` and `/sdcard` (the two directories an ADB
+dropper writes to), `/default.prop`, `/system/build.prop` and an Android mount table.
 
 The snapshot is **writable for the length of one session**: a bare redirection, a fetch
 that saves to a file, `cp`, `mkdir` and `rm` all change what the rest of that session
@@ -424,7 +436,10 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
   framing (`:169-173`). `MAX_MESSAGE_DATA_LEN` 1_000_000, `OUR_MAXDATA` 4096.
 - **Behavior** (`handler.rs`): CNXN handshake → device banner, then multiplexed
   streams (`MAX_STREAMS_PER_CONN = 32`). OPEN destinations (`:498-573`): `shell:` →
-  interactive FakeShell (authenticated **always false** - ADB has no auth step),
+  interactive FakeShell **in its Android flavor** (the device's filesystem, a
+  `root@hammerhead:<cwd> #` prompt that follows `cd`, Android's `uname`, and mksh's
+  `sh: x: not found` rather than bash's `command not found`; authenticated **always
+  false** - ADB has no auth step),
   `shell:<cmd>` → one-shot exec, `sync:` → file-transfer sub-protocol, anything
   else refused. Sync sub-protocol: SEND/DATA/DONE → captures the pushed file →
   `honeypot_malware_upload`; RECV → refused (`FAIL Permission denied`, **never

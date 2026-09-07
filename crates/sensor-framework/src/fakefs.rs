@@ -36,6 +36,10 @@ pub struct FakeFs {
     /// Paths an attacker removed this session with `rm`, baked-in ones included: a file the
     /// shell said it deleted must stop being readable, or the next `cat` contradicts the `rm`.
     removed: HashSet<String>,
+    /// Directory prefixes mounted read-only, which refuse every write under them. Empty on the
+    /// Linux server; `/system` and `/vendor` on the Android device, where a payload dropped into
+    /// `/system/bin` succeeding would be the tell.
+    readonly: &'static [&'static str],
     /// Created files the attacker has `chmod`ed executable. A loader's writable-directory probe
     /// is `>/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/`: the empty file must then run
     /// (silently, exit 0) or the `&& cd` never happens.
@@ -98,11 +102,11 @@ impl FakeFs {
         // `/proc/self/mounts`, `/etc/mtab` (a symlink to the second on Ubuntu), `mountinfo`
         // and the shell's `mount` cannot disagree. `cat /proc/mounts` used to say "No such
         // file", which no Linux box does.
-        let mounts = render_mounts();
+        let mounts = render_mounts(&MOUNT_TABLE);
         files.insert("/proc/mounts", mounts.clone());
         files.insert("/proc/self/mounts", mounts.clone());
         files.insert("/etc/mtab", mounts);
-        files.insert("/proc/self/mountinfo", render_mountinfo());
+        files.insert("/proc/self/mountinfo", render_mountinfo(&MOUNT_TABLE));
         files.insert(
             "/proc/cpuinfo",
             "processor\t: 0\n\
@@ -233,8 +237,198 @@ impl FakeFs {
             created: HashMap::new(),
             created_dirs: HashSet::new(),
             removed: HashSet::new(),
+            readonly: &[],
             executable: EXECUTABLE_BINARIES.iter().map(|b| b.to_string()).collect(),
         }
+    }
+
+    /// The rooted Nexus 5 `sensor-adb` presents: the same snapshot machinery over an Android
+    /// filesystem, so a bot that reaches ADB and looks around finds the phone the CNXN banner
+    /// claimed. Its identity comes from [`crate::persona`]'s Android half, the same way the
+    /// server's comes from the Ubuntu half.
+    pub fn android() -> Self {
+        let mut files: HashMap<&'static str, String> = HashMap::new();
+        files.insert(
+            "/default.prop",
+            "#\n# ADDITIONAL_DEFAULT_PROPERTIES\n#\n\
+             ro.secure=0\n\
+             ro.allow.mock.location=0\n\
+             ro.debuggable=1\n\
+             ro.adb.secure=0\n\
+             persist.sys.usb.config=adb\n"
+                .to_string(),
+        );
+        files.insert("/system/build.prop", android_build_prop());
+        files.insert(
+            "/proc/version",
+            format!("{}\n", persona::android_proc_version()),
+        );
+        files.insert(
+            "/proc/cpuinfo",
+            "Processor\t: ARMv7 Processor rev 0 (v7l)\n\
+             processor\t: 0\n\
+             BogoMIPS\t: 38.40\n\
+             Features\t: swp half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt \n\
+             CPU implementer\t: 0x51\n\
+             CPU architecture: 7\n\
+             CPU variant\t: 0x2\n\
+             CPU part\t: 0x06f\n\
+             CPU revision\t: 0\n\
+             \n\
+             Hardware\t: Qualcomm MSM 8974 HAMMERHEAD (Flattened Device Tree)\n"
+                .to_string(),
+        );
+        files.insert(
+            "/system/etc/hosts",
+            "127.0.0.1       localhost\n::1             ip6-localhost\n".to_string(),
+        );
+        let mounts = render_mounts(&ANDROID_MOUNT_TABLE);
+        files.insert("/proc/mounts", mounts.clone());
+        files.insert("/proc/self/mounts", mounts);
+        files.insert(
+            "/proc/self/mountinfo",
+            render_mountinfo(&ANDROID_MOUNT_TABLE),
+        );
+
+        let mut dirs = HashMap::new();
+        dirs.insert(
+            "/",
+            vec![
+                "acct",
+                "cache",
+                "config",
+                "d",
+                "data",
+                "default.prop",
+                "dev",
+                "etc",
+                "init",
+                "init.rc",
+                "mnt",
+                "oem",
+                "persist",
+                "proc",
+                "root",
+                "sbin",
+                "sdcard",
+                "storage",
+                "sys",
+                "system",
+                "ueventd.rc",
+                "vendor",
+            ],
+        );
+        dirs.insert(
+            "/system",
+            vec![
+                "app",
+                "bin",
+                "build.prop",
+                "etc",
+                "fonts",
+                "framework",
+                "lib",
+                "media",
+                "priv-app",
+                "tts",
+                "usr",
+                "vendor",
+                "xbin",
+            ],
+        );
+        dirs.insert(
+            "/system/bin",
+            vec![
+                "app_process",
+                "cat",
+                "chmod",
+                "dalvikvm",
+                "df",
+                "getprop",
+                "linker",
+                "logcat",
+                "ls",
+                "mount",
+                "ping",
+                "reboot",
+                "setprop",
+                "sh",
+                "toolbox",
+                "toybox",
+                "umount",
+            ],
+        );
+        dirs.insert("/system/xbin", vec!["busybox", "su"]);
+        dirs.insert("/system/etc", vec!["hosts"]);
+        dirs.insert(
+            "/data",
+            vec![
+                "anr",
+                "app",
+                "backup",
+                "dalvik-cache",
+                "data",
+                "local",
+                "media",
+                "misc",
+                "property",
+                "system",
+                "user",
+            ],
+        );
+        dirs.insert("/data/local", vec!["tmp"]);
+        // The two directories every ADB-borne dropper writes to.
+        dirs.insert("/data/local/tmp", vec![]);
+        dirs.insert(
+            "/sdcard",
+            vec![
+                "Alarms",
+                "Android",
+                "DCIM",
+                "Download",
+                "Movies",
+                "Music",
+                "Notifications",
+                "Pictures",
+                "Podcasts",
+                "Ringtones",
+            ],
+        );
+        dirs.insert("/storage", vec!["emulated", "self"]);
+        dirs.insert("/storage/emulated", vec!["0", "legacy"]);
+        dirs.insert("/storage/emulated/0", vec![]);
+        dirs.insert("/cache", vec!["backup", "lost+found", "recovery"]);
+        dirs.insert("/dev", vec!["block", "cpuctl", "null", "socket", "zero"]);
+        dirs.insert("/mnt", vec!["asec", "obb", "runtime", "secure", "shell"]);
+        dirs.insert("/sys", vec!["block", "class", "devices", "fs", "kernel"]);
+        dirs.insert("/proc", vec![]);
+        dirs.insert("/root", vec![]);
+        dirs.insert("/sbin", vec!["adbd", "healthd", "ueventd", "watchdogd"]);
+        dirs.insert("/vendor", vec!["firmware", "lib"]);
+
+        for binary in ANDROID_EXECUTABLE_BINARIES {
+            files.insert(binary, "\u{7f}ELF\u{1}\u{1}\u{1}\0".to_string());
+        }
+
+        Self {
+            files,
+            dirs,
+            created: HashMap::new(),
+            created_dirs: HashSet::new(),
+            removed: HashSet::new(),
+            readonly: &["/system", "/vendor"],
+            executable: ANDROID_EXECUTABLE_BINARIES
+                .iter()
+                .map(|b| b.to_string())
+                .collect(),
+        }
+    }
+
+    /// Whether `path` sits under a read-only mount, so every write to it is refused.
+    fn is_readonly(&self, path: &str) -> bool {
+        self.readonly
+            .iter()
+            .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
     }
 
     /// Mark a file the attacker created this session executable (`chmod +x` / `chmod 777`).
@@ -300,22 +494,28 @@ impl FakeFs {
     }
 
     /// Write `contents` to `path`, as a download saving its body or a `cp` writing its
-    /// destination does. Fails with the missing directory when the parent does not exist, the
-    /// way a real write does, so a loader dropping into a directory this box denies sees the
-    /// refusal rather than a success it can never verify.
-    pub fn write_file(&mut self, path: &str, contents: &str) -> Result<(), String> {
-        let parent = parent_of(path).ok_or_else(String::new)?;
+    /// destination does. Fails the way a real write does, so a loader dropping into a directory
+    /// this box denies, or onto a read-only mount, sees the refusal rather than a success it can
+    /// never verify.
+    pub fn write_file(&mut self, path: &str, contents: &str) -> Result<(), FsError> {
+        if self.is_readonly(path) {
+            return Err(FsError::ReadOnly);
+        }
+        let parent = parent_of(path).ok_or(FsError::NoSuchDirectory(String::new()))?;
         if !self.is_dir(&parent) {
-            return Err(parent);
+            return Err(FsError::NoSuchDirectory(parent));
         }
         self.removed.remove(path);
         self.created.insert(path.to_string(), contents.to_string());
         Ok(())
     }
 
-    /// Remove `path`. Returns whether anything was there: `rm` without `-f` reports a missing
-    /// file, and the caller decides. A removed file stops being readable, listed and executable.
-    pub fn remove_path(&mut self, path: &str) -> bool {
+    /// Remove `path`. `Ok(false)` when nothing was there: `rm` without `-f` reports that, and the
+    /// caller decides. A removed file stops being readable, listed and executable.
+    pub fn remove_path(&mut self, path: &str) -> Result<bool, FsError> {
+        if self.is_readonly(path) {
+            return Err(FsError::ReadOnly);
+        }
         let existed = self.file_exists(path) || self.is_dir(path);
         self.created.remove(path);
         self.created_dirs.remove(path);
@@ -323,18 +523,20 @@ impl FakeFs {
         if existed {
             self.removed.insert(path.to_string());
         }
-        existed
+        Ok(existed)
     }
 
-    /// `mkdir path`. `Err(None)` when it already exists, `Err(Some(parent))` when the parent
-    /// does not - the two failures a real `mkdir` distinguishes.
-    pub fn make_dir(&mut self, path: &str) -> Result<(), Option<String>> {
-        if self.is_dir(path) || self.file_exists(path) {
-            return Err(None);
+    /// `mkdir path`, with the failures a real `mkdir` distinguishes.
+    pub fn make_dir(&mut self, path: &str) -> Result<(), FsError> {
+        if self.is_readonly(path) {
+            return Err(FsError::ReadOnly);
         }
-        let parent = parent_of(path).ok_or(None)?;
+        if self.is_dir(path) || self.file_exists(path) {
+            return Err(FsError::Exists);
+        }
+        let parent = parent_of(path).ok_or(FsError::NoSuchDirectory(String::new()))?;
         if !self.is_dir(&parent) {
-            return Err(Some(parent));
+            return Err(FsError::NoSuchDirectory(parent));
         }
         self.removed.remove(path);
         self.created_dirs.insert(path.to_string());
@@ -366,13 +568,125 @@ impl FakeFs {
 
     /// Model `> path` with no command: create an empty file if its directory exists, else fail
     /// the way the shell would. Returns the directory that does not exist on failure.
-    pub fn create_file(&mut self, path: &str) -> Result<(), String> {
+    pub fn create_file(&mut self, path: &str) -> Result<(), FsError> {
         self.write_file(path, "")
     }
 }
 
+/// Why a write to the snapshot failed, so the shell can print what the real command prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FsError {
+    /// The parent directory does not exist; carries it for the message.
+    NoSuchDirectory(String),
+    /// The path is under a read-only mount (`/system` on the Android device).
+    ReadOnly,
+    /// `mkdir` on a path that is already there.
+    Exists,
+}
+
 /// Binaries present and executable from the start, so `cp /bin/busybox x && ./x` behaves.
 const EXECUTABLE_BINARIES: [&str; 4] = ["/bin/busybox", "/bin/sh", "/bin/bash", "/usr/bin/wget"];
+
+/// The Android device's equivalents. `/system/xbin/busybox` is there because this device is
+/// rooted (it hands out a root shell over ADB, which a stock one does not) and a rooted phone
+/// almost always carries busybox; `su` for the same reason.
+const ANDROID_EXECUTABLE_BINARIES: [&str; 6] = [
+    "/system/bin/sh",
+    "/system/bin/toybox",
+    "/system/bin/toolbox",
+    "/system/xbin/busybox",
+    "/system/xbin/su",
+    "/system/bin/app_process",
+];
+
+/// `/system/build.prop` on the impersonated device, resolved from [`crate::persona`] so it
+/// cannot disagree with the ADB banner or `uname`.
+fn android_build_prop() -> String {
+    format!(
+        "# begin build properties\n\
+         # autogenerated by buildinfo.sh\n\
+         ro.build.id={build_id}\n\
+         ro.build.display.id={build_id} release-keys\n\
+         ro.build.version.incremental=3565761\n\
+         ro.build.version.sdk={sdk}\n\
+         ro.build.version.release={release}\n\
+         ro.build.type=user\n\
+         ro.build.tags=release-keys\n\
+         ro.product.model={model}\n\
+         ro.product.brand=google\n\
+         ro.product.name={device}\n\
+         ro.product.device={device}\n\
+         ro.product.board={device}\n\
+         ro.product.cpu.abi=armeabi-v7a\n\
+         ro.product.manufacturer=LGE\n\
+         ro.board.platform=msm8974\n\
+         ro.build.fingerprint={fingerprint}\n\
+         # end build properties\n",
+        build_id = persona::ANDROID_BUILD_ID,
+        sdk = persona::ANDROID_SDK,
+        release = persona::ANDROID_RELEASE,
+        model = persona::ANDROID_MODEL,
+        device = persona::ANDROID_DEVICE,
+        fingerprint = persona::android_fingerprint(),
+    )
+}
+
+/// The Android device's mount table: a read-only `/system`, a writable `/data`, and the FUSE
+/// `/sdcard` a dropper reaches for.
+const ANDROID_MOUNT_TABLE: [(&str, &str, &str, &str); 12] = [
+    ("rootfs", "/", "rootfs", "ro,seclabel,relatime"),
+    (
+        "tmpfs",
+        "/dev",
+        "tmpfs",
+        "rw,seclabel,nosuid,relatime,mode=755",
+    ),
+    (
+        "devpts",
+        "/dev/pts",
+        "devpts",
+        "rw,seclabel,relatime,mode=600",
+    ),
+    ("proc", "/proc", "proc", "rw,relatime"),
+    ("sysfs", "/sys", "sysfs", "rw,seclabel,relatime"),
+    ("selinuxfs", "/sys/fs/selinux", "selinuxfs", "rw,relatime"),
+    (
+        "/dev/block/platform/msm_sdcc.1/by-name/system",
+        "/system",
+        "ext4",
+        "ro,seclabel,relatime,data=ordered",
+    ),
+    (
+        "/dev/block/platform/msm_sdcc.1/by-name/userdata",
+        "/data",
+        "ext4",
+        "rw,seclabel,nosuid,nodev,relatime,noauto_da_alloc,data=ordered",
+    ),
+    (
+        "/dev/block/platform/msm_sdcc.1/by-name/cache",
+        "/cache",
+        "ext4",
+        "rw,seclabel,nosuid,nodev,relatime,data=ordered",
+    ),
+    (
+        "/dev/block/platform/msm_sdcc.1/by-name/persist",
+        "/persist",
+        "ext4",
+        "rw,seclabel,nosuid,nodev,relatime,data=ordered",
+    ),
+    (
+        "/data/media",
+        "/storage/emulated",
+        "sdcardfs",
+        "rw,nosuid,nodev,noexec,noatime",
+    ),
+    (
+        "/data/media",
+        "/sdcard",
+        "sdcardfs",
+        "rw,nosuid,nodev,noexec,noatime",
+    ),
+];
 
 /// The directory holding `path`, or `None` when `path` has no `/` at all.
 fn parent_of(path: &str) -> Option<String> {
@@ -495,9 +809,9 @@ pub const MOUNT_TABLE: [(&str, &str, &str, &str); 20] = [
 ];
 
 /// `/proc/mounts` format: `source mountpoint type options 0 0`.
-fn render_mounts() -> String {
+fn render_mounts(table: &[(&str, &str, &str, &str)]) -> String {
     let mut out = String::new();
-    for (source, point, fstype, opts) in MOUNT_TABLE {
+    for (source, point, fstype, opts) in table {
         out.push_str(&format!("{source} {point} {fstype} {opts} 0 0\n"));
     }
     out
@@ -506,10 +820,10 @@ fn render_mounts() -> String {
 /// `/proc/self/mountinfo` format: `id parent major:minor root mountpoint mount-opts - type
 /// source super-opts`. Ids are sequential from the table; the per-mount options are the flags
 /// (`rw,nosuid,...`) and the super options the rest, as the kernel splits them.
-fn render_mountinfo() -> String {
-    let root_pos = MOUNT_TABLE.iter().position(|m| m.1 == "/").unwrap_or(0);
+fn render_mountinfo(table: &[(&str, &str, &str, &str)]) -> String {
+    let root_pos = table.iter().position(|m| m.1 == "/").unwrap_or(0);
     let mut out = String::new();
-    for (i, (source, point, fstype, opts)) in MOUNT_TABLE.iter().enumerate() {
+    for (i, (source, point, fstype, opts)) in table.iter().enumerate() {
         let id = 20 + i;
         let parent = if *point == "/" { 1 } else { 20 + root_pos };
         let (mount_opts, super_opts): (Vec<&str>, Vec<&str>) = opts.split(',').partition(|o| {
@@ -556,6 +870,55 @@ mod tests {
         assert!(fs.list_dir("/etc").unwrap().contains(&"mtab".to_string()));
     }
 
+    /// The Android snapshot describes one device, and the same device the ADB banner announces.
+    #[test]
+    fn the_android_snapshot_is_one_coherent_device() {
+        let mut fs = FakeFs::android();
+        let build_prop = fs
+            .read_file("/system/build.prop")
+            .expect("/system/build.prop exists");
+        for expected in [
+            persona::ANDROID_MODEL,
+            persona::ANDROID_DEVICE,
+            persona::ANDROID_RELEASE,
+            persona::ANDROID_SDK,
+            persona::ANDROID_BUILD_ID,
+        ] {
+            assert!(build_prop.contains(expected), "build.prop lacks {expected}");
+        }
+        assert!(
+            fs.read_file("/proc/version")
+                .unwrap()
+                .contains(persona::ANDROID_KERNEL_RELEASE)
+        );
+        // The directories an ADB dropper writes to, and the ones it lists first.
+        for dir in ["/data/local/tmp", "/sdcard", "/system/bin", "/system/xbin"] {
+            assert!(fs.is_dir(dir), "{dir} must exist");
+        }
+        assert!(fs.is_executable("/system/xbin/busybox"), "rooted device");
+        assert!(fs.is_executable("/system/bin/sh"));
+        // /system is mounted read-only, and the mount table says so, so a payload dropped there
+        // is refused rather than silently accepted.
+        let mounts = fs.read_file("/proc/mounts").unwrap();
+        assert!(mounts.contains(" /system ext4 ro,"), "{mounts}");
+        assert!(mounts.contains(" /data ext4 rw,"), "{mounts}");
+        assert_eq!(
+            fs.write_file("/system/bin/payload", "x"),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(fs.make_dir("/system/evil"), Err(FsError::ReadOnly));
+        assert_eq!(
+            fs.remove_path("/system/bin/sh"),
+            Err(FsError::ReadOnly),
+            "a read-only mount refuses deletions too"
+        );
+        assert!(fs.write_file("/data/local/tmp/payload", "x").is_ok());
+        assert!(fs.write_file("/sdcard/payload", "x").is_ok());
+        // Nothing from the Linux server leaks into the phone.
+        assert!(fs.read_file("/etc/os-release").is_none());
+        assert!(!fs.is_dir("/home"));
+    }
+
     #[test]
     fn every_directory_the_loader_probes_exists_and_is_listable() {
         let fs = FakeFs::new();
@@ -585,7 +948,7 @@ mod tests {
         assert_eq!(fs.read_file("/tmp/.x"), Some(String::new()));
         assert_eq!(
             fs.create_file("/nonexistent/.x"),
-            Err("/nonexistent".to_string())
+            Err(FsError::NoSuchDirectory("/nonexistent".to_string()))
         );
         assert!(
             !fs.list_dir("/").unwrap().contains(&".x".to_string()),

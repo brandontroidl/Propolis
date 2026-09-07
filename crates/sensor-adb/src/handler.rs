@@ -58,7 +58,11 @@ const MAX_SHELL_LINE_LEN: usize = 8192;
 /// state machine aligned with what the client believes it sent) but not retained in memory.
 const MAX_SYNC_BODY: usize = 10_000_000;
 
-const SHELL_PROMPT: &[u8] = b"root@server01:~# ";
+/// The prompt an `adb shell` session shows: the device name and the working directory, both from
+/// the shared persona, so it agrees with the CNXN banner and with what the shell itself answers.
+fn shell_prompt(shell: &FakeShell) -> Vec<u8> {
+    sensor_framework::persona::android_root_prompt(shell.cwd()).into_bytes()
+}
 
 fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
     SensorEvent {
@@ -548,7 +552,9 @@ async fn handle_open(
                 protocol_label: PROTOCOL_LABEL.to_string(),
                 session_id: Some(session_id),
             };
-            let mut shell = FakeShell::new(FakeFs::new(), ctx);
+            // The Android device this sensor announces, not the Linux server the other sensors
+            // present: a Nexus 5 banner followed by an Ubuntu bash was a one-command tell.
+            let mut shell = FakeShell::android(FakeFs::android(), ctx);
 
             write_or_err(stream, &adb_proto::build_okay(server_id, client_local_id)).await?;
 
@@ -577,7 +583,7 @@ async fn handle_open(
                 None => {
                     write_or_err(
                         stream,
-                        &adb_proto::build_wrte(server_id, client_local_id, SHELL_PROMPT),
+                        &adb_proto::build_wrte(server_id, client_local_id, &shell_prompt(&shell)),
                     )
                     .await?;
                     streams.insert(
@@ -653,7 +659,8 @@ async fn handle_wrte(
                             }
                         }
                         responses.extend_from_slice(output.as_bytes());
-                        responses.extend_from_slice(SHELL_PROMPT);
+                        // Re-read the prompt each time: `cd` changes what it shows.
+                        responses.extend_from_slice(&shell_prompt(shell));
                     }
                 } else {
                     line_buf.push(byte);

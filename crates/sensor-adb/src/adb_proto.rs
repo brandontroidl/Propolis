@@ -167,9 +167,16 @@ pub fn build_clse(local_id: u32, remote_id: u32) -> Vec<u8> {
 /// corrupting capture instead of improving it. Omitting it is what makes a real client fall back
 /// to the plain protocol this sensor actually speaks.
 pub fn device_banner() -> String {
-    "device::ro.product.name=hammerhead;ro.product.model=Nexus 5;ro.product.device=hammerhead;\
-     ro.product.board=hammerhead;ro.build.version.release=6.0.1;ro.build.version.sdk=23;\0"
-        .to_string()
+    use sensor_framework::persona;
+    format!(
+        "device::ro.product.name={device};ro.product.model={model};ro.product.device={device};\
+         ro.product.board={device};ro.build.version.release={release};\
+         ro.build.version.sdk={sdk};\0",
+        device = persona::ANDROID_DEVICE,
+        model = persona::ANDROID_MODEL,
+        release = persona::ANDROID_RELEASE,
+        sdk = persona::ANDROID_SDK,
+    )
 }
 
 /// This sensor's own `host::` identity string, used only by the test suite acting as a client.

@@ -36,7 +36,7 @@ use sensor_wire::{
 };
 
 use crate::command_codec::CommandCodec;
-use crate::fakefs::FakeFs;
+use crate::fakefs::{FakeFs, FsError};
 use crate::persona;
 use crate::sanitize_value;
 
@@ -92,18 +92,71 @@ pub struct FakeShell {
     binary_flagged: bool,
     /// Whether the one-per-session command-cap marker has been emitted.
     cap_flagged: bool,
+    /// Which shell this session is pretending to be, which decides how it reports an error and
+    /// what `uname` says. See [`ShellFlavor`].
+    flavor: ShellFlavor,
+}
+
+/// The shell a session presents. The command grammar is shared - every sensor answers the same
+/// verbs - but the two differ in what an attacker actually reads back: bash on the Linux server
+/// says `bash: x: command not found`, Android's mksh says `sh: x: not found`, and `uname` reports
+/// a different machine entirely. A session that mixed them was the ADB tell: a Nexus 5 banner
+/// followed by an Ubuntu bash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellFlavor {
+    /// Ubuntu's bash, on SSH and telnet.
+    #[default]
+    Bash,
+    /// Android's mksh (`/system/bin/sh`), on ADB.
+    AndroidSh,
 }
 
 impl FakeShell {
     pub fn new(fs: FakeFs, ctx: EmitContext) -> Self {
+        Self::with_flavor(fs, ctx, ShellFlavor::Bash)
+    }
+
+    /// The Android shell ADB serves: `FakeFs::android()` plus [`ShellFlavor::AndroidSh`], landing
+    /// in `/` as an `adb shell` session does rather than a Linux server's `/root`.
+    pub fn android(fs: FakeFs, ctx: EmitContext) -> Self {
+        Self::with_flavor(fs, ctx, ShellFlavor::AndroidSh)
+    }
+
+    pub fn with_flavor(fs: FakeFs, ctx: EmitContext, flavor: ShellFlavor) -> Self {
         Self {
             fs,
             ctx,
-            cwd: "/root".to_string(),
+            cwd: match flavor {
+                ShellFlavor::Bash => "/root".to_string(),
+                ShellFlavor::AndroidSh => "/".to_string(),
+            },
             codec: CommandCodec::new(),
             command_count: 0,
             binary_flagged: false,
             cap_flagged: false,
+            flavor,
+        }
+    }
+
+    /// The working directory, for the prompt a sensor prints between commands.
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    /// How this shell names itself when it reports an error (`bash` / `sh`).
+    fn shell_name(&self) -> &'static str {
+        match self.flavor {
+            ShellFlavor::Bash => "bash",
+            ShellFlavor::AndroidSh => "sh",
+        }
+    }
+
+    /// What this shell says for a command it cannot find. bash spells out "command not found";
+    /// mksh says only "not found", and a bot that greps for either string reads the difference.
+    fn not_found(&self, what: &str) -> String {
+        match self.flavor {
+            ShellFlavor::Bash => format!("bash: {what}: command not found\n"),
+            ShellFlavor::AndroidSh => format!("sh: {what}: not found\n"),
         }
     }
 
@@ -253,7 +306,13 @@ impl FakeShell {
         let resolved = self.resolve_path(target);
         match self.fs.create_file(&resolved) {
             Ok(()) => String::new(),
-            Err(_) => format!("bash: {resolved}: No such file or directory\n"),
+            Err(FsError::ReadOnly) => {
+                format!("{}: {resolved}: Read-only file system\n", self.shell_name())
+            }
+            Err(_) => format!(
+                "{}: {resolved}: No such file or directory\n",
+                self.shell_name()
+            ),
         }
     }
 
@@ -286,7 +345,7 @@ impl FakeShell {
         // arguments are untouched.
         let cmd = parts.first().map(|p| command_basename(p));
         match cmd {
-            Some("uname") => cmd_uname(parts),
+            Some("uname") => cmd_uname(parts, self.flavor),
             Some("id") => "uid=0(root) gid=0(root) groups=0(root)\n".to_string(),
             Some("whoami") => "root\n".to_string(),
             Some("pwd") => format!("{}\n", self.cwd),
@@ -361,7 +420,10 @@ impl FakeShell {
                     self.cwd = target;
                     String::new()
                 } else {
-                    format!("bash: cd: {target}: No such file or directory\n")
+                    format!(
+                        "{}: cd: {target}: No such file or directory\n",
+                        self.shell_name()
+                    )
                 }
             }
             // Already root on this box, so `su` (and `su -`, `su root`) opens another shell
@@ -378,17 +440,23 @@ impl FakeShell {
                 if self.fs.is_executable(&path) {
                     String::new()
                 } else if self.fs.read_file(&path).is_some() {
-                    format!("bash: {}: Permission denied\n", parts[0])
+                    format!("{}: {}: Permission denied\n", self.shell_name(), parts[0])
                 } else if self.fs.is_dir(&path) {
-                    format!("bash: {}: Is a directory\n", parts[0])
+                    format!("{}: {}: Is a directory\n", self.shell_name(), parts[0])
                 } else {
                     let _ = other;
-                    format!("bash: {}: No such file or directory\n", parts[0])
+                    // mksh says only "not found" for a path it cannot execute.
+                    match self.flavor {
+                        ShellFlavor::Bash => {
+                            format!("bash: {}: No such file or directory\n", parts[0])
+                        }
+                        ShellFlavor::AndroidSh => self.not_found(parts[0]),
+                    }
                 }
             }
             // An interactive bash on Ubuntu prefixes the message with its own name; the bare form
             // matched no real shell.
-            Some(other) => format!("bash: {other}: command not found\n"),
+            Some(other) => self.not_found(other),
             None => String::new(),
         }
     }
@@ -455,8 +523,16 @@ impl FakeShell {
                 command_basename(src)
             );
         }
-        if self.fs.write_file(&dst_path, &contents).is_err() {
-            return format!("cp: cannot create regular file '{dst}': No such file or directory\n");
+        match self.fs.write_file(&dst_path, &contents) {
+            Ok(()) => {}
+            Err(FsError::ReadOnly) => {
+                return format!("cp: cannot create regular file '{dst}': Read-only file system\n");
+            }
+            Err(_) => {
+                return format!(
+                    "cp: cannot create regular file '{dst}': No such file or directory\n"
+                );
+            }
         }
         if self.fs.is_executable(&src_path) {
             self.fs.mark_executable(&dst_path);
@@ -493,10 +569,15 @@ impl FakeShell {
                 out.push_str(&format!("rm: cannot remove '{target}': Is a directory\n"));
                 continue;
             }
-            if !self.fs.remove_path(&path) && !force {
-                out.push_str(&format!(
+            match self.fs.remove_path(&path) {
+                Ok(true) => {}
+                Ok(false) if force => {}
+                Ok(false) => out.push_str(&format!(
                     "rm: cannot remove '{target}': No such file or directory\n"
-                ));
+                )),
+                Err(_) => out.push_str(&format!(
+                    "rm: cannot remove '{target}': Read-only file system\n"
+                )),
             }
         }
         out
@@ -521,6 +602,9 @@ impl FakeShell {
             match self.fs.make_dir(&path) {
                 Ok(()) => {}
                 // `-p` is silent about an existing directory and creates missing parents.
+                Err(FsError::ReadOnly) => out.push_str(&format!(
+                    "mkdir: cannot create directory '{target}': Read-only file system\n"
+                )),
                 Err(_) if parents => {
                     let mut built = String::new();
                     for segment in path.trim_start_matches('/').split('/') {
@@ -529,10 +613,10 @@ impl FakeShell {
                         let _ = self.fs.make_dir(&built);
                     }
                 }
-                Err(None) => out.push_str(&format!(
+                Err(FsError::Exists) => out.push_str(&format!(
                     "mkdir: cannot create directory '{target}': File exists\n"
                 )),
-                Err(Some(_)) => out.push_str(&format!(
+                Err(FsError::NoSuchDirectory(_)) => out.push_str(&format!(
                     "mkdir: cannot create directory '{target}': No such file or directory\n"
                 )),
             }
@@ -1127,8 +1211,26 @@ fn cmd_mount(parts: &[&str]) -> String {
 /// line - was a one-probe fingerprint (real `uname -m` prints only `x86_64`) that also fed IoT
 /// loaders a garbage machine string and broke their architecture-based payload selection. Fields
 /// come from persona so `uname` cannot disagree with /etc/os-release or the prompt.
-fn cmd_uname(parts: &[&str]) -> String {
-    let host = persona::hostname();
+fn cmd_uname(parts: &[&str], flavor: ShellFlavor) -> String {
+    let android = flavor == ShellFlavor::AndroidSh;
+    let host = if android {
+        persona::ANDROID_HOSTNAME.to_string()
+    } else {
+        persona::hostname()
+    };
+    let (kernel_release, kernel_build, arch) = if android {
+        (
+            persona::ANDROID_KERNEL_RELEASE,
+            persona::ANDROID_KERNEL_BUILD,
+            persona::ANDROID_ARCH,
+        )
+    } else {
+        (
+            persona::KERNEL_RELEASE,
+            persona::KERNEL_BUILD,
+            persona::ARCH,
+        )
+    };
     let (
         mut want_s,
         mut want_n,
@@ -1177,7 +1279,11 @@ fn cmd_uname(parts: &[&str]) -> String {
     // `-a` reuses the canonical line (same persona source), keeping its exact historical bytes; a
     // bare `uname` is the kernel name, like real coreutils.
     if all {
-        return format!("{}\n", persona::uname_all(&host));
+        return if android {
+            format!("{}\n", crate::persona::android_uname_all())
+        } else {
+            format!("{}\n", persona::uname_all(&host))
+        };
     }
     if !any_flag {
         return "Linux\n".to_string();
@@ -1190,22 +1296,23 @@ fn cmd_uname(parts: &[&str]) -> String {
         fields.push(host.clone());
     }
     if want_r {
-        fields.push(persona::KERNEL_RELEASE.to_string());
+        fields.push(kernel_release.to_string());
     }
     if want_v {
-        fields.push(persona::KERNEL_BUILD.to_string());
+        fields.push(kernel_build.to_string());
     }
     if want_m {
-        fields.push(persona::ARCH.to_string());
+        fields.push(arch.to_string());
     }
     if want_p {
-        fields.push(persona::ARCH.to_string());
+        fields.push(arch.to_string());
     }
     if want_i {
-        fields.push(persona::ARCH.to_string());
+        fields.push(arch.to_string());
     }
     if want_o {
-        fields.push("GNU/Linux".to_string());
+        // Android's userspace is not GNU; `uname -o` there says Android.
+        fields.push(if android { "Android" } else { "GNU/Linux" }.to_string());
     }
     if fields.is_empty() {
         // Only unrecognized flags: degrade to the kernel name rather than erroring, since a wrong
@@ -1760,6 +1867,74 @@ mod shell_detection_tests {
         );
         assert_eq!(download_urls, vec!["http://198.51.100.9/bins/x86"]);
         assert_eq!(command_events, 13, "one command event per session line");
+    }
+
+    /// ADB is Android's own protocol, and the sensor announces a Nexus 5. The shell behind it
+    /// answered as an Ubuntu bash on server01, which a bot confirms with one command. This is
+    /// the same session an ADB dropper runs, answered as the device.
+    #[test]
+    fn the_adb_shell_answers_as_the_android_device_it_announces() {
+        let mut sh = FakeShell::android(
+            FakeFs::android(),
+            EmitContext {
+                source_ip: "203.0.113.7".parse().unwrap(),
+                wan_ip: None,
+                authenticated: false,
+                protocol_label: "adb".to_string(),
+                session_id: None,
+            },
+        );
+        // An `adb shell` session starts at /, not in a Linux server's /root.
+        assert_eq!(sh.cwd(), "/");
+        assert_eq!(sh.handle_input("pwd").0, "/\n");
+        assert_eq!(
+            sh.handle_input("uname -a").0,
+            format!("{}\n", crate::persona::android_uname_all())
+        );
+        assert_eq!(sh.handle_input("uname -m").0, "armv7l\n");
+        assert_eq!(sh.handle_input("uname -o").0, "Android\n");
+        assert!(
+            !sh.handle_input("uname -a").0.contains("Ubuntu"),
+            "the phone must not report the server's kernel"
+        );
+        // mksh, not bash: the message an unknown command gets is different, and bots read it.
+        assert_eq!(sh.handle_input("foobarbaz").0, "sh: foobarbaz: not found\n");
+        assert!(!sh.handle_input("foobarbaz").0.contains("bash"));
+        // The device's own files answer, and the server's are absent.
+        assert!(
+            sh.handle_input("cat /system/build.prop")
+                .0
+                .contains(crate::persona::ANDROID_MODEL)
+        );
+        assert!(
+            sh.handle_input("cat /default.prop")
+                .0
+                .contains("ro.secure=0")
+        );
+        assert_eq!(
+            sh.handle_input("cat /etc/os-release").0,
+            "cat: /etc/os-release: No such file or directory\n"
+        );
+        // The drop directories work and /system refuses writes, as on a real device.
+        assert_eq!(sh.handle_input("cd /data/local/tmp").0, "");
+        assert_eq!(sh.cwd(), "/data/local/tmp");
+        assert_eq!(sh.handle_input(">payload && chmod 777 payload").0, "");
+        assert_eq!(sh.handle_input("./payload").0, "");
+        assert_eq!(
+            sh.handle_input(">/system/bin/payload").0,
+            "sh: /system/bin/payload: Read-only file system\n"
+        );
+        // Busybox is there because the device is rooted, so a loader chain still runs.
+        assert_eq!(
+            sh.handle_input("/system/bin/sh").0,
+            "",
+            "the device's own shell is present"
+        );
+        assert!(
+            sh.handle_input("busybox ABCDEF")
+                .0
+                .contains("applet not found")
+        );
     }
 
     /// `cp`, `rm` and `mkdir` answered silent success while changing nothing, so a payload
@@ -2453,25 +2628,46 @@ mod shell_detection_tests {
         // The #1 IoT-loader recon command: `uname -m` must print exactly the arch, not the whole
         // `uname -a` line (the old shortcut returned uname_all for any flag - a one-probe tell that
         // also broke arch-based payload selection).
-        assert_eq!(cmd_uname(&["uname", "-m"]), "x86_64\n");
-        assert_eq!(cmd_uname(&["uname", "-p"]), "x86_64\n");
+        assert_eq!(
+            cmd_uname(&["uname", "-m"], crate::shell::ShellFlavor::Bash),
+            "x86_64\n"
+        );
+        assert_eq!(
+            cmd_uname(&["uname", "-p"], crate::shell::ShellFlavor::Bash),
+            "x86_64\n"
+        );
     }
 
     #[test]
     fn uname_single_fields_are_selected_individually() {
-        assert_eq!(cmd_uname(&["uname", "-s"]), "Linux\n");
-        assert_eq!(cmd_uname(&["uname", "-r"]), "5.15.0-91-generic\n");
-        assert_eq!(cmd_uname(&["uname", "-n"]), "server01\n");
+        assert_eq!(
+            cmd_uname(&["uname", "-s"], crate::shell::ShellFlavor::Bash),
+            "Linux\n"
+        );
+        assert_eq!(
+            cmd_uname(&["uname", "-r"], crate::shell::ShellFlavor::Bash),
+            "5.15.0-91-generic\n"
+        );
+        assert_eq!(
+            cmd_uname(&["uname", "-n"], crate::shell::ShellFlavor::Bash),
+            "server01\n"
+        );
     }
 
     #[test]
     fn uname_combined_flags_print_fields_in_canonical_order() {
         // Multiple flags print the selected fields in coreutils' fixed order regardless of the flag
         // order given.
-        assert_eq!(cmd_uname(&["uname", "-sr"]), "Linux 5.15.0-91-generic\n");
-        assert_eq!(cmd_uname(&["uname", "-rs"]), "Linux 5.15.0-91-generic\n");
         assert_eq!(
-            cmd_uname(&["uname", "-s", "-r"]),
+            cmd_uname(&["uname", "-sr"], crate::shell::ShellFlavor::Bash),
+            "Linux 5.15.0-91-generic\n"
+        );
+        assert_eq!(
+            cmd_uname(&["uname", "-rs"], crate::shell::ShellFlavor::Bash),
+            "Linux 5.15.0-91-generic\n"
+        );
+        assert_eq!(
+            cmd_uname(&["uname", "-s", "-r"], crate::shell::ShellFlavor::Bash),
             "Linux 5.15.0-91-generic\n"
         );
     }
@@ -2480,10 +2676,13 @@ mod shell_detection_tests {
     fn uname_a_and_bare_keep_their_historical_output() {
         // Regression guard: the forms that were already correct must not change.
         assert_eq!(
-            cmd_uname(&["uname", "-a"]),
+            cmd_uname(&["uname", "-a"], crate::shell::ShellFlavor::Bash),
             "Linux server01 5.15.0-91-generic #101-Ubuntu SMP x86_64 x86_64 x86_64 GNU/Linux\n"
         );
-        assert_eq!(cmd_uname(&["uname"]), "Linux\n");
+        assert_eq!(
+            cmd_uname(&["uname"], crate::shell::ShellFlavor::Bash),
+            "Linux\n"
+        );
     }
 
     #[test]

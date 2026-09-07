@@ -66,6 +66,57 @@ pub fn root_prompt(host: &str) -> String {
     format!("root@{host}:~# ")
 }
 
+// --- The Android device sensor-adb impersonates. ADB is Android's own debug protocol, so the
+//     device this module describes is a SECOND coherent identity, not a variation on the Ubuntu
+//     host above: a bot that reaches port 5555 expects a phone, and handing it an Ubuntu bash
+//     after a Nexus 5 banner was a one-command tell. Everything ADB exposes - the CNXN banner's
+//     properties, the shell prompt, `uname`, the filesystem, `/system/build.prop` - resolves from
+//     here, so the banner and the shell cannot drift apart the way they had.
+//
+//     The device is ROOTED: it hands out a root shell over ADB, which a stock retail device does
+//     not, and that is also why its filesystem carries busybox (near-universal on rooted phones)
+//     rather than the toybox-only set a stock image ships.
+
+/// Build properties of a Nexus 5 on its final official build.
+pub const ANDROID_DEVICE: &str = "hammerhead";
+pub const ANDROID_MODEL: &str = "Nexus 5";
+pub const ANDROID_RELEASE: &str = "6.0.1";
+pub const ANDROID_SDK: &str = "23";
+pub const ANDROID_BUILD_ID: &str = "M4B30Z";
+pub const ANDROID_ARCH: &str = "armv7l";
+/// `uname -r` on that build.
+pub const ANDROID_KERNEL_RELEASE: &str = "3.4.0-gcc3f57d";
+pub const ANDROID_KERNEL_BUILD: &str = "#1 SMP PREEMPT Mon Nov 30 21:53:57 UTC 2015";
+/// The hostname an Android kernel reports; phones do not carry the marketing name here.
+pub const ANDROID_HOSTNAME: &str = "localhost";
+
+/// The full build fingerprint, as `ro.build.fingerprint` and `getprop` report it.
+pub fn android_fingerprint() -> String {
+    format!(
+        "google/{ANDROID_DEVICE}/{ANDROID_DEVICE}:{ANDROID_RELEASE}/{ANDROID_BUILD_ID}/3565761:user/release-keys"
+    )
+}
+
+/// `uname -a` on the device. Android's uname prints no `GNU/Linux` suffix.
+pub fn android_uname_all() -> String {
+    format!(
+        "Linux {ANDROID_HOSTNAME} {ANDROID_KERNEL_RELEASE} {ANDROID_KERNEL_BUILD} {ANDROID_ARCH}"
+    )
+}
+
+/// `/proc/version` on the device.
+pub fn android_proc_version() -> String {
+    format!(
+        "Linux version {ANDROID_KERNEL_RELEASE} (android-build@wpiv1.hot.corp.google.com) \
+         (gcc version 4.8 (GCC) ) {ANDROID_KERNEL_BUILD}"
+    )
+}
+
+/// The root shell prompt on Android 6, which shows the device name and the working directory.
+pub fn android_root_prompt(cwd: &str) -> String {
+    format!("root@{ANDROID_DEVICE}:{cwd} # ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +134,22 @@ mod tests {
     #[test]
     fn prompt_reflects_hostname() {
         assert_eq!(root_prompt("web-prod-3"), "root@web-prod-3:~# ");
+    }
+
+    /// The ADB banner, the prompt, `uname` and `/system/build.prop` all read from these, so a
+    /// bot comparing what the device claims with what its shell says finds one device.
+    #[test]
+    fn the_android_identity_agrees_with_itself() {
+        assert!(android_uname_all().contains(ANDROID_KERNEL_RELEASE));
+        assert!(android_uname_all().ends_with(ANDROID_ARCH));
+        assert!(
+            !android_uname_all().contains("GNU/Linux"),
+            "Android's uname prints no GNU/Linux suffix"
+        );
+        assert!(android_proc_version().contains(ANDROID_KERNEL_RELEASE));
+        assert_eq!(android_root_prompt("/"), "root@hammerhead:/ # ");
+        assert!(android_fingerprint().contains(ANDROID_BUILD_ID));
+        assert!(android_fingerprint().contains(ANDROID_RELEASE));
     }
 
     #[test]

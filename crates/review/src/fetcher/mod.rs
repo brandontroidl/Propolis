@@ -147,11 +147,11 @@ impl Fetcher for RealFetcher {
                 },
                 Ok(http::HttpOutcome::Empty) => RawOutcome::Failed {
                     status: FetchStatus::Empty,
-                    reason: None,
+                    reason: Some("server returned an empty body".into()),
                 },
                 Ok(http::HttpOutcome::TooBig) => RawOutcome::Failed {
                     status: FetchStatus::TooBig,
-                    reason: None,
+                    reason: Some("body exceeds the fetch size limit".into()),
                 },
                 Ok(http::HttpOutcome::TooManyHops) => RawOutcome::Failed {
                     status: FetchStatus::Rejected,
@@ -185,21 +185,27 @@ impl Fetcher for RealFetcher {
                             content_type: None,
                             pinned_ip: Some(pinned.ip.to_string()),
                         },
+                        // Every failure carries text, not just the ones that started with it:
+                        // `reject_reason` is the only record of WHY, and the console shows it
+                        // beside the status. A row reading "dead" with nothing after it left an
+                        // operator no way to tell a refused transfer from an absent server.
                         Ok(tftp::TftpOutcome::Empty) => RawOutcome::Failed {
                             status: FetchStatus::Empty,
-                            reason: None,
+                            reason: Some("server sent an empty file".into()),
                         },
                         Ok(tftp::TftpOutcome::TooBig) => RawOutcome::Failed {
                             status: FetchStatus::TooBig,
-                            reason: None,
+                            reason: Some("file exceeds the fetch size limit".into()),
                         },
                         Ok(tftp::TftpOutcome::Oack) => RawOutcome::Failed {
                             status: FetchStatus::Rejected,
-                            reason: Some("oack".into()),
+                            reason: Some(
+                                "server answered OACK, which this client does not use".into(),
+                            ),
                         },
                         Ok(tftp::TftpOutcome::Timeout) => RawOutcome::Failed {
                             status: FetchStatus::Timeout,
-                            reason: None,
+                            reason: Some("no response from the TFTP server".into()),
                         },
                         Err(e) => RawOutcome::Failed {
                             status: FetchStatus::Timeout,

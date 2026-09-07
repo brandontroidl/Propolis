@@ -48,7 +48,7 @@
           {% elif s.vt_detected > 0 %}
             <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" style="color:var(--alert-text);">{{ s.vt_detected }}/{{ s.vt_total }} detected</a>
           {% else %}
-            <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" style="color:var(--good-text);">clean (0/{{ s.vt_total }})</a>
+            <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" style="color:var(--good-text);" title="No engine flagged it. That is not proof the file is harmless.">0/{{ s.vt_total }} detections</a>
           {% endif %}
         {% else %}
           <span class="dim">not scanned</span>

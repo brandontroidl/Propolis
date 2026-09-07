@@ -137,7 +137,7 @@
             {% elif m.detected < 0 %}
             <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-snoozed">pending VT analysis</a>
             {% else %}
-            <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved">clean (0/{{ m.total }})</a>
+            <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved" title="No engine flagged it. That is not proof the file is harmless.">0/{{ m.total }} detections</a>
             {% endif %}
           {% elif m.sha256_short %}
             <span class="state-pill state-snoozed">not yet scanned</span>
@@ -182,7 +182,7 @@
             {% elif u.detected < 0 %}
             <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-snoozed">pending VT analysis</a>
             {% else %}
-            <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved">clean (0/{{ u.total }})</a>
+            <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved" title="No engine flagged it. That is not proof the file is harmless.">0/{{ u.total }} detections</a>
             {% endif %}
           {% elif u.sha256_short %}
             <span class="state-pill state-snoozed">not yet scanned</span>

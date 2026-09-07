@@ -2172,6 +2172,38 @@ async fn detail_url_panel_links_each_observed_url_to_its_outcome(pool: PgPool) {
     );
 }
 
+/// Zero detections is a count, not a verdict: no engine flagged the file, which is not proof it
+/// is harmless. The page used to call such a sample "clean".
+#[sqlx::test(migrations = false)]
+async fn a_zero_detection_sample_is_reported_as_a_count_not_as_clean(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.92", 60).await;
+    seed_fetch_attempt_with_analysis(&pool, 9, "203.0.113.92", 0, 61).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.92",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // Scope to the malware panel: the page also embeds minified vendor JS, which contains the
+    // word in unrelated code.
+    let start = body.find("Malware from this IP").expect("malware panel");
+    let panel = &body[start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    assert!(panel.contains("0/61 detections"), "{panel}");
+    assert!(
+        !panel.to_lowercase().contains("clean"),
+        "the panel never calls a zero-detection sample clean: {panel}"
+    );
+}
+
 /// A sample uploaded to VirusTotal but not yet verdicted is stored as `-1/-1`. The samples page
 /// already rendered that as "pending"; the IP page fell through to the clean branch and showed a
 /// green "clean (0/-1)" for a sample nobody has judged yet.
@@ -2200,7 +2232,7 @@ async fn detail_renders_a_pending_vt_upload_as_pending_not_clean(pool: PgPool) {
         "a -1 verdict must render as pending: {body}"
     );
     assert!(
-        !body.contains("clean (0"),
+        !body.contains("0/-1 detections"),
         "a -1 verdict must never render as clean: {body}"
     );
 }

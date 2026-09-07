@@ -20,6 +20,9 @@ pub const SIGNAL_HONEYPOT_LOGIN_ATTEMPT: &str = "honeypot_login_attempt";
 pub const SIGNAL_HONEYPOT_COMMAND_EXEC: &str = "honeypot_command_exec";
 pub const SIGNAL_HONEYPOT_MALWARE_UPLOAD: &str = "honeypot_malware_upload";
 pub const SIGNAL_HONEYPOT_FILE_DOWNLOAD: &str = "honeypot_file_download";
+/// How one interaction ended. TELEMETRY: it is recorded in the ledger but never scored, and
+/// intake routes it to the unscored append path - see `core_scoring::SignalType::is_telemetry`.
+pub const SIGNAL_HONEYPOT_SESSION_END: &str = "honeypot_session_end";
 
 // Protocol constants - lowercase wire values matching core-scoring's Protocol serde.
 pub const PROTO_TCP: &str = "tcp";

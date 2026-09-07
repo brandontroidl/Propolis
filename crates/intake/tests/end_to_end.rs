@@ -80,6 +80,78 @@ async fn ingest_single_event_appears_in_ledger(pool: PgPool) {
     assert!(!score.eligible);
 }
 
+/// A sensor's outcome record has to survive the whole path - written as NDJSON, parsed,
+/// converted, routed - and land in the ledger without scoring anything. Intake sends every event
+/// to `append_event`, which now REFUSES telemetry, so without the routing this line would be a
+/// hard error that stops the batch. Calling the repository function directly would never have
+/// caught that.
+#[sqlx::test(migrations = false)]
+async fn a_telemetry_line_reaches_the_ledger_through_intake_and_scores_nothing(pool: PgPool) {
+    sqlx::migrate!("../core-scoring/migrations")
+        .run(&pool)
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+
+    let telemetry = SensorEvent {
+        v: WIRE_VERSION,
+        source_ip: "203.0.113.44".parse().unwrap(),
+        wan_ip: Some("198.51.100.4".parse().unwrap()),
+        sensor: "ssh".into(),
+        signal_type: SIGNAL_HONEYPOT_SESSION_END.into(),
+        protocol: PROTO_TCP.into(),
+        authenticated: false,
+        observed_at: chrono::Utc::now(),
+        metadata: serde_json::json!({
+            "protocol_label": "ssh",
+            "reason": "max_duration",
+            "elapsed_ms": 30_000,
+        }),
+        sample: None,
+        session_id: Some(uuid::Uuid::now_v7()),
+        occurrence_id: None,
+    };
+    write_event_line(&log_path, &telemetry);
+
+    let tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    let mut runner = IntakeRunner::new(tailer, pool.clone(), "test-ssh".into());
+    let result = runner.run_batch().await;
+    assert_eq!(result.ingested, 1, "the outcome record was ingested");
+    assert_eq!(result.rejected, 0);
+    assert_eq!(
+        result.errors, 0,
+        "routing telemetry to the scoring path would fail the batch here"
+    );
+
+    // In the ledger, with its session and reason intact.
+    let row = sqlx::query(
+        "SELECT host(source_ip) AS ip, metadata, session_id IS NOT NULL AS has_session \
+         FROM event WHERE signal_type = 'honeypot_session_end'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    use sqlx::Row;
+    assert_eq!(row.get::<String, _>("ip"), "203.0.113.44");
+    assert!(row.get::<bool, _>("has_session"), "tied to its session");
+    let metadata: serde_json::Value = row.get("metadata");
+    assert_eq!(metadata["reason"], "max_duration");
+
+    // And no scoring state at all for that address.
+    assert!(
+        read_score(&pool, "203.0.113.44".parse().unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "an outcome record must not score the address it describes"
+    );
+    assert!(matches!(
+        verify_chain(&pool).await.unwrap(),
+        ChainStatus::Intact
+    ));
+}
+
 #[tokio::test]
 async fn unknown_signal_type_rejected_cursor_advances() {
     let pool = setup_pool().await;

@@ -3,7 +3,7 @@
 //! "The runner" in `internal/design/03-event-intake-aggregation.md`.
 
 use crate::converter::convert;
-use core_scoring::append_event;
+use core_scoring::{append_event, append_telemetry_event};
 use log_tailer::LogTailer;
 use sensor_wire::SensorEvent;
 use sqlx::PgPool;
@@ -86,13 +86,22 @@ impl IntakeRunner {
                 }
             };
 
-            match append_event(&self.pool, input).await {
-                Ok(_score) => result.ingested += 1,
+            // Telemetry takes the unscored append path. The two are separate functions that
+            // refuse each other's signals (see `core_scoring::repository`), so routing on the
+            // signal's own classification here is what lets a sensor emit an outcome record at
+            // all: handing one to `append_event` is a hard error, by design.
+            let appended = if input.signal_type.is_telemetry() {
+                append_telemetry_event(&self.pool, input).await
+            } else {
+                append_event(&self.pool, input).await.map(|_score| ())
+            };
+            match appended {
+                Ok(()) => result.ingested += 1,
                 Err(e) => {
                     tracing::error!(
                         sensor = %self.sensor_name,
                         error = ?e,
-                        "append_event failed, stopping batch"
+                        "append failed, stopping batch"
                     );
                     result.errors += 1;
                     break;

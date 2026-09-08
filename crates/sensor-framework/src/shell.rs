@@ -707,6 +707,25 @@ impl FakeShell {
 /// bytes into U+FFFD, and high bytes that do not form valid UTF-8 land there too, so a genuine
 /// binary stream is mostly non-printable while a real command is ~all printable ASCII. A `> 30%`
 /// non-printable ratio flags the former without catching an ordinary command carrying a stray byte.
+/// Whether a raw capture buffer looks like a binary payload rather than typed input.
+///
+/// Same 30%-non-printable rule [`is_binary_line`] applies to one decoded line, but over raw bytes
+/// and tolerating the line terminators a session buffer carries. A sensor needs this because the
+/// per-line flag is only raised once a COMPLETE line has been assembled and dispatched to the
+/// shell: a dropper streaming a payload with no newline yet, cut off when the listener cancels
+/// the session, would otherwise hold a buffer full of binary that no flag had claimed, and the
+/// capture would be discarded as ordinary typing.
+pub fn looks_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let nonprintable = bytes
+        .iter()
+        .filter(|&&b| !matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7e))
+        .count();
+    nonprintable * 100 / bytes.len() > 30
+}
+
 fn is_binary_line(s: &str) -> bool {
     let total = s.chars().count();
     if total == 0 {

@@ -259,7 +259,9 @@ async fn handle_session(
     // `start_capture` to exclude its pre-auth login prompt.
     let mut shell_capture = ShellCapture {
         body: Vec::new(),
+        wire_bytes: 0,
         binary_seen: false,
+        session_ended: false,
         max_bytes: max_captured_bytes,
         handoff: handoff.clone(),
         source_ip,
@@ -574,6 +576,10 @@ async fn handle_session(
     // detector only trips on a line that is mostly non-printable). Preserve the raw bytes as
     // evidence, reusing the same handoff SCP/SFTP already submit through. Plaintext-only sessions
     // never set `binary_seen`, so ordinary interactive commands are never spooled.
+    // Reaching here means the packet loop ended on its own terms rather than being cancelled,
+    // which is what lets the capture say whether it is whole or a fragment.
+    shell_capture.mark_session_end();
+
     loop_result
 }
 
@@ -586,8 +592,14 @@ async fn handle_session(
 /// submitting from a destructor is safe.
 struct ShellCapture {
     body: Vec<u8>,
+    /// Channel bytes the client sent, retained or dropped past the ceiling, so the event can
+    /// report the real size and whether the stored copy is a prefix.
+    wire_bytes: u64,
     /// Set when the shared FakeShell flags a binary flood. A plaintext session is never spooled.
     binary_seen: bool,
+    /// Set when the packet loop finishes on its own terms. Still false when the listener cancels
+    /// the handler at `max_duration`, which is how `Drop` knows it holds a fragment.
+    session_ended: bool,
     max_bytes: u64,
     handoff: Arc<CaptureHandoff>,
     source_ip: IpAddr,
@@ -596,8 +608,10 @@ struct ShellCapture {
 }
 
 impl ShellCapture {
-    /// Accumulate raw channel bytes, bounded by the operator-configured session ceiling.
+    /// Accumulate raw channel bytes, bounded by the operator-configured session ceiling. Bytes
+    /// past it are counted but not kept, so `truncated` and the real size stay honest.
     fn push(&mut self, data: &[u8]) {
+        self.wire_bytes += data.len() as u64;
         let room = self.max_bytes.saturating_sub(self.body.len() as u64) as usize;
         if room > 0 {
             self.body.extend_from_slice(&data[..data.len().min(room)]);
@@ -607,14 +621,26 @@ impl ShellCapture {
     fn flag_binary(&mut self) {
         self.binary_seen = true;
     }
+
+    /// The packet loop finished on its own terms.
+    fn mark_session_end(&mut self) {
+        self.session_ended = true;
+    }
 }
 
 impl Drop for ShellCapture {
     fn drop(&mut self) {
-        if !self.binary_seen || self.body.is_empty() {
+        if self.body.is_empty() {
+            return;
+        }
+        // The flood flag is only raised once a complete line reached the shell, so a payload
+        // still mid-line when the session was cancelled never got one. The bytes themselves are
+        // the fallback test; without it that capture reads as ordinary typing and is discarded.
+        if !self.binary_seen && !sensor_framework::shell::looks_binary(&self.body) {
             return;
         }
         let body = std::mem::take(&mut self.body);
+        let (wire_size, complete) = (self.wire_bytes, self.session_ended);
         let (source_ip, wan_ip, session_id) = (self.source_ip, self.wan_ip, self.session_id);
         let _ = self.handoff.submit(CaptureJob {
             body,
@@ -628,10 +654,16 @@ impl Drop for ShellCapture {
                 protocol: PROTO_TCP.into(),
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
-                metadata: serde_json::json!({
-                    "protocol_label": "ssh",
-                    "capture_reason": "binary_shell_payload",
-                }),
+                // Through `upload_metadata` like every other capture, so this one also carries
+                // size, wire_size, truncated and complete. Hand-rolling the object here left
+                // `complete` absent, and the console reads a missing `complete` as true - so a
+                // fragment from a cancelled session displayed as a whole sample.
+                metadata: {
+                    let mut m =
+                        sensor_framework::upload_metadata("ssh", &sample, wire_size, complete);
+                    m["capture_reason"] = serde_json::json!("binary_shell_payload");
+                    m
+                },
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
@@ -731,7 +763,9 @@ mod tests {
     fn capture(handoff: Arc<CaptureHandoff>) -> ShellCapture {
         ShellCapture {
             body: Vec::new(),
+            wire_bytes: 0,
             binary_seen: false,
+            session_ended: false,
             max_bytes: 65_536,
             handoff,
             source_ip: "203.0.113.7".parse().unwrap(),

@@ -498,12 +498,88 @@ async fn no_outbound_connections_from_wget_in_shell() {
 // must never be captured.
 // -------------------------------------------------------------------------------------------
 
+/// A dropper streaming its payload with no newline yet, cut off when the listener hits
+/// `max_duration`. Nothing in this test tells the sensor the bytes are binary: no line is ever
+/// completed, so the per-line flood flag is never raised, and the session is ended by the
+/// listener rather than by the client. Both of those are the production boundary the unit tests
+/// bypass by calling the flag directly, and both were broken - the capture was discarded for
+/// want of a flag, and a cancelled capture reported itself complete.
+#[tokio::test]
+async fn a_payload_cut_off_mid_line_is_still_captured_and_marked_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let spool_dir = dir.path().join("spool");
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let bounds = ConnectionBounds {
+        // Short enough that the listener cancels this session while the payload is still
+        // mid-line, which is the path under test.
+        max_duration: Duration::from_secs(2),
+        ..test_bounds()
+    };
+    let (addr, handle) = sensor_telnet::start_test_server(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        spool_dir.clone(),
+        wan_resolver,
+        bounds,
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    login(&mut conn, b"root", b"pass").await;
+
+    // Mostly non-ASCII, and deliberately NO trailing newline: the reader buffers it, the shell
+    // never sees a line, and the flood flag is never raised.
+    let payload = vec![0xAAu8; 256];
+    conn.write_all(&payload).await.unwrap();
+
+    // Hold the connection open and let the listener's max_duration cancel the handler.
+    wait_for_spooled_file(&spool_dir).await;
+    drop(conn);
+    handle.abort();
+
+    let spooled: Vec<_> = std::fs::read_dir(&spool_dir).unwrap().collect();
+    assert_eq!(spooled.len(), 1, "the cut-off payload must be spooled");
+    let stored = std::fs::read(spooled[0].as_ref().unwrap().path()).unwrap();
+    assert_eq!(stored, payload, "the stored bytes are what the client sent");
+
+    let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+    let events: Vec<sensor_wire::SensorEvent> = content
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let upload = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .expect("a cancelled session's binary capture must still be recorded");
+    assert_eq!(
+        upload.metadata["capture_reason"], "binary_shell_payload",
+        "{:?}",
+        upload.metadata
+    );
+    assert_eq!(
+        upload.metadata["complete"], false,
+        "a capture handed over by a cancelled handler is a fragment: {:?}",
+        upload.metadata
+    );
+    assert_eq!(upload.metadata["size"], payload.len() as u64);
+    assert_eq!(upload.metadata["truncated"], false);
+    assert_eq!(
+        upload.sample.as_ref().unwrap().size,
+        payload.len() as u64,
+        "the sample the console reads points at the stored bytes"
+    );
+}
+
 /// Poll `spool_dir` for up to ~1s for at least one entry to appear, rather than a fixed sleep -
 /// the capture hand-off's worker runs off the connection's response path (see
 /// `sensor_framework::handoff`'s module doc), so there is no synchronous point at which "the
 /// worker is done" is directly observable.
 async fn wait_for_spooled_file(spool_dir: &std::path::Path) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
     loop {
         if std::fs::read_dir(spool_dir)
             .map(|mut it| it.next().is_some())

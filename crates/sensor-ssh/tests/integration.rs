@@ -236,7 +236,16 @@ async fn no_outbound_connections() {
 /// drains its queue off the response path (see `sensor_framework::handoff`'s module doc), so the
 /// event can lag the session's close by a small, variable amount.
 async fn poll_for_malware_upload(log_path: &std::path::Path) -> Option<sensor_wire::SensorEvent> {
-    for _ in 0..20 {
+    poll_for_malware_upload_within(log_path, Duration::from_secs(1)).await
+}
+
+/// Same, with an explicit deadline: a test that waits for the listener's `max_duration` to cancel
+/// a session needs longer than the close-driven case.
+async fn poll_for_malware_upload_within(
+    log_path: &std::path::Path,
+    deadline: Duration,
+) -> Option<sensor_wire::SensorEvent> {
+    for _ in 0..(deadline.as_millis() / 50).max(1) {
         if let Ok(content) = tokio::fs::read_to_string(log_path).await {
             for line in content.lines() {
                 if let Ok(event) = serde_json::from_str::<sensor_wire::SensorEvent>(line)
@@ -249,6 +258,83 @@ async fn poll_for_malware_upload(log_path: &std::path::Path) -> Option<sensor_wi
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     None
+}
+
+/// The same dropper, cut off mid-line by the listener's `max_duration` instead of finishing.
+/// Nothing here raises the per-line flood flag - no line is ever completed - and the session is
+/// ended by the listener rather than the client, so this exercises the two production conditions
+/// the unit test cannot: detection from the raw bytes, and a capture that must report itself
+/// incomplete.
+#[tokio::test]
+async fn a_payload_cut_off_mid_line_is_still_captured_and_marked_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let spool_dir = dir.path().join("spool");
+    let host_key_path = dir.path().join("host_key");
+
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let bounds = ConnectionBounds {
+        max_duration: Duration::from_secs(3),
+        ..test_bounds()
+    };
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        spool_dir.clone(),
+        host_key_path,
+        wan_resolver,
+        bounds,
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(config, addr, TestHandler)
+        .await
+        .unwrap();
+    session
+        .authenticate_password("attacker", "password123")
+        .await
+        .unwrap();
+    let channel = session.channel_open_session().await.unwrap();
+    channel.request_shell(false).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Mostly non-printable, and deliberately unterminated: every byte is high-bit set, so none is
+    // CR or LF and the line buffer never reaches MAX_LINE_LEN either. The shell therefore never
+    // sees a line, and nothing raises the per-line flood flag.
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80u8 | (i & 0x3f)).collect();
+    channel.data(&payload[..]).await.unwrap();
+
+    // Hold the session open and let max_duration cancel the handler.
+    let event = poll_for_malware_upload_within(&log_path, Duration::from_secs(8))
+        .await
+        .expect("a cancelled session's binary capture must still be recorded");
+    drop(channel);
+    drop(session);
+    handle.abort();
+
+    assert_eq!(
+        event.metadata["capture_reason"], "binary_shell_payload",
+        "{:?}",
+        event.metadata
+    );
+    assert_eq!(
+        event.metadata["complete"], false,
+        "a capture handed over by a cancelled handler is a fragment: {:?}",
+        event.metadata
+    );
+    assert_eq!(event.metadata["size"], payload.len() as u64);
+    assert_eq!(event.metadata["wire_size"], payload.len() as u64);
+    assert_eq!(event.metadata["truncated"], false);
+
+    let spooled: Vec<_> = std::fs::read_dir(&spool_dir).unwrap().collect();
+    assert_eq!(spooled.len(), 1, "the cut-off payload must be spooled");
+    let stored = std::fs::read(spooled[0].as_ref().unwrap().path()).unwrap();
+    assert_eq!(stored, payload, "the stored bytes are what the client sent");
 }
 
 #[tokio::test]

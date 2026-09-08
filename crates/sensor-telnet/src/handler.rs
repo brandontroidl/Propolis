@@ -194,7 +194,9 @@ pub async fn handle_connection(
 
     // The binary shell-phase capture is submitted by `LineReader`'s `Drop` (see
     // `arm_capture_submit`), which runs however this session ends - a clean return, an early
-    // break, or the listener cancelling the future at `max_duration`.
+    // break, or the listener cancelling the future at `max_duration`. Reaching this line is what
+    // separates the first two from the third, so the capture can say which it was.
+    reader.mark_session_end();
 }
 
 fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
@@ -269,9 +271,13 @@ struct LineReader {
     /// Set by `start_capture`; gates whether `read_line` accumulates into `capture`. Starts false
     /// so the login/password phase is never captured.
     capturing: bool,
-    /// Set when the shared shell flags a binary flood: without it the capture is an ordinary
-    /// typed session and is never spooled.
+    /// Set when the shared shell flags a binary flood: without it, and without the raw bytes
+    /// themselves looking binary, the capture is an ordinary typed session and is never spooled.
     binary_seen: bool,
+    /// Set by `mark_session_end` when the session loop finishes on its own. Still false when the
+    /// listener cancels the handler at `max_duration`, which is how `Drop` knows the capture it
+    /// is handing over is a fragment.
+    session_ended: bool,
     /// What `Drop` needs to hand the capture off. `None` until `arm_capture_submit`, so a reader
     /// built by a unit test submits nothing.
     submit: Option<CaptureSubmit>,
@@ -290,7 +296,14 @@ struct CaptureSubmit {
 /// after the session loop runs. `CaptureHandoff::submit` never blocks, so it is safe here.
 impl Drop for LineReader {
     fn drop(&mut self) {
-        if !self.binary_seen || self.capture.is_empty() {
+        if self.capture.is_empty() {
+            return;
+        }
+        // The per-line flag is only raised once a complete line reached the shell. A payload
+        // still mid-line when the session was cancelled never got one, so the bytes themselves
+        // are the fallback test - otherwise a dropper's buffer reads as ordinary typing and is
+        // thrown away, which is the loss this destructor exists to prevent.
+        if !self.binary_seen && !sensor_framework::shell::looks_binary(&self.capture) {
             return;
         }
         let Some(ctx) = self.submit.take() else {
@@ -300,6 +313,10 @@ impl Drop for LineReader {
         // drains.
         let wire_size = self.capture_wire_bytes();
         let body = self.take_capture();
+        // The session reached the end of its own loop only if `mark_session_end` ran. A capture
+        // handed over by a cancelled handler is a fragment of whatever was still arriving, and
+        // the console shows it as incomplete rather than as a whole sample.
+        let complete = self.session_ended;
         let (source_ip, wan_ip, session_id) = (ctx.source_ip, ctx.wan_ip, ctx.session_id);
         let _ = ctx.handoff.submit(CaptureJob {
             body,
@@ -314,7 +331,7 @@ impl Drop for LineReader {
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
                 metadata: {
-                    let mut m = upload_metadata(PROTOCOL_LABEL, &sample, wire_size, true);
+                    let mut m = upload_metadata(PROTOCOL_LABEL, &sample, wire_size, complete);
                     m["capture_reason"] = serde_json::json!("binary_shell_payload");
                     m
                 },
@@ -340,6 +357,7 @@ impl LineReader {
             capture_overflow: 0,
             capturing: false,
             binary_seen: false,
+            session_ended: false,
             submit: None,
         }
     }
@@ -364,6 +382,12 @@ impl LineReader {
     /// The shared shell saw a binary flood on this session, so the captured bytes are evidence.
     fn flag_binary(&mut self) {
         self.binary_seen = true;
+    }
+
+    /// The session loop finished on its own terms, so a capture submitted after this is whole
+    /// rather than a fragment left by a cancelled handler.
+    fn mark_session_end(&mut self) {
+        self.session_ended = true;
     }
 
     /// Begin accumulating raw input into the capture buffer. Callers invoke this only once the

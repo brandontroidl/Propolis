@@ -148,7 +148,11 @@ pub async fn handle_connection(
     // dropped above, and never before - so a captured sample can never contain the login
     // credentials. See the crate-level design note above `handle_connection`.
     reader.start_capture();
-    let mut binary_seen = false;
+    // Arm the reader to submit its capture from `Drop`. The listener enforces `max_duration` by
+    // dropping this whole future, so a submit written after the loop below never runs for a
+    // session that hits the bound - and a dropper streaming a large payload is exactly the
+    // session that does. `Drop` is the only code that runs on every exit path.
+    reader.arm_capture_submit(handoff.clone(), source_ip, wan_ip, session_id);
 
     loop {
         let Some(line) = reader.read_line(&mut stream, true).await else {
@@ -159,7 +163,7 @@ pub async fn handle_connection(
         let (output, events) = shell.handle_input(&line);
         for event in &events {
             if event.metadata.get("flood").and_then(|v| v.as_str()) == Some("binary") {
-                binary_seen = true;
+                reader.flag_binary();
             }
             if emitter.append(event).await.is_err() {
                 tracing::error!(%peer_addr, "telnet: failed to append command event");
@@ -188,39 +192,9 @@ pub async fn handle_connection(
         }
     }
 
-    // A binary payload was seen somewhere in the shell phase (a Mirai/Gafgyt dropper streamed
-    // over the "shell" - never a real interactive command): preserve the raw bytes as evidence.
-    // Plaintext-only sessions never reach this branch, so an ordinary attacker's typed commands
-    // are never spooled.
-    if binary_seen {
-        let wire_size = reader.capture_wire_bytes();
-        let raw = reader.take_capture();
-        if !raw.is_empty() {
-            let orig_name = format!("telnet-session-{session_id}");
-            let _ = handoff.submit(CaptureJob {
-                body: raw,
-                orig_name,
-                event_builder: Box::new(move |sample: SampleRef| SensorEvent {
-                    v: WIRE_VERSION,
-                    source_ip,
-                    wan_ip,
-                    sensor: PROTOCOL_LABEL.to_string(),
-                    signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
-                    protocol: PROTO_TCP.to_string(),
-                    authenticated: true,
-                    observed_at: chrono::Utc::now(),
-                    metadata: {
-                        let mut m = upload_metadata(PROTOCOL_LABEL, &sample, wire_size, true);
-                        m["capture_reason"] = serde_json::json!("binary_shell_payload");
-                        m
-                    },
-                    sample: Some(sample),
-                    session_id: Some(session_id),
-                    occurrence_id: None,
-                }),
-            });
-        }
-    }
+    // The binary shell-phase capture is submitted by `LineReader`'s `Drop` (see
+    // `arm_capture_submit`), which runs however this session ends - a clean return, an early
+    // break, or the listener cancelling the future at `max_duration`.
 }
 
 fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
@@ -295,6 +269,61 @@ struct LineReader {
     /// Set by `start_capture`; gates whether `read_line` accumulates into `capture`. Starts false
     /// so the login/password phase is never captured.
     capturing: bool,
+    /// Set when the shared shell flags a binary flood: without it the capture is an ordinary
+    /// typed session and is never spooled.
+    binary_seen: bool,
+    /// What `Drop` needs to hand the capture off. `None` until `arm_capture_submit`, so a reader
+    /// built by a unit test submits nothing.
+    submit: Option<CaptureSubmit>,
+}
+
+/// The connection facts `LineReader::drop` stamps onto the capture it submits.
+struct CaptureSubmit {
+    handoff: Arc<CaptureHandoff>,
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+}
+
+/// Submitting from `Drop` is what makes the capture survive every exit path, the listener's
+/// `max_duration` cancellation included - it drops this future in place, so nothing written
+/// after the session loop runs. `CaptureHandoff::submit` never blocks, so it is safe here.
+impl Drop for LineReader {
+    fn drop(&mut self) {
+        if !self.binary_seen || self.capture.is_empty() {
+            return;
+        }
+        let Some(ctx) = self.submit.take() else {
+            return;
+        };
+        // Order matters: `capture_wire_bytes` counts the retained half, which `take_capture`
+        // drains.
+        let wire_size = self.capture_wire_bytes();
+        let body = self.take_capture();
+        let (source_ip, wan_ip, session_id) = (ctx.source_ip, ctx.wan_ip, ctx.session_id);
+        let _ = ctx.handoff.submit(CaptureJob {
+            body,
+            orig_name: format!("telnet-session-{session_id}"),
+            event_builder: Box::new(move |sample: SampleRef| SensorEvent {
+                v: WIRE_VERSION,
+                source_ip,
+                wan_ip,
+                sensor: PROTOCOL_LABEL.to_string(),
+                signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
+                protocol: PROTO_TCP.to_string(),
+                authenticated: true,
+                observed_at: chrono::Utc::now(),
+                metadata: {
+                    let mut m = upload_metadata(PROTOCOL_LABEL, &sample, wire_size, true);
+                    m["capture_reason"] = serde_json::json!("binary_shell_payload");
+                    m
+                },
+                sample: Some(sample),
+                session_id: Some(session_id),
+                occurrence_id: None,
+            }),
+        });
+    }
 }
 
 impl LineReader {
@@ -310,7 +339,31 @@ impl LineReader {
             capture: Vec::new(),
             capture_overflow: 0,
             capturing: false,
+            binary_seen: false,
+            submit: None,
         }
+    }
+
+    /// Let this reader hand its capture off when it is dropped. Called once, alongside
+    /// `start_capture`.
+    fn arm_capture_submit(
+        &mut self,
+        handoff: Arc<CaptureHandoff>,
+        source_ip: IpAddr,
+        wan_ip: Option<IpAddr>,
+        session_id: Uuid,
+    ) {
+        self.submit = Some(CaptureSubmit {
+            handoff,
+            source_ip,
+            wan_ip,
+            session_id,
+        });
+    }
+
+    /// The shared shell saw a binary flood on this session, so the captured bytes are evidence.
+    fn flag_binary(&mut self) {
+        self.binary_seen = true;
     }
 
     /// Begin accumulating raw input into the capture buffer. Callers invoke this only once the
@@ -464,6 +517,86 @@ mod tests {
             max_captured_bytes: 65_536,
             max_concurrent: 256,
         }
+    }
+
+    /// A hand-off with one queue slot and no worker: a second `submit` is refused, which is how
+    /// these tests prove the first one happened.
+    fn one_slot_handoff() -> Arc<CaptureHandoff> {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let outbox_dir = dir.path().join("outbox");
+        let spool = sensor_framework::QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000);
+        let emitter = sensor_framework::EventEmitter::new(dir.path().join("events.jsonl"));
+        std::mem::forget(dir);
+        Arc::new(CaptureHandoff::new(
+            spool,
+            emitter,
+            1,
+            "test".to_string(),
+            sensor_framework::OutboxManifest::new(outbox_dir),
+        ))
+    }
+
+    fn probe_job() -> CaptureJob {
+        CaptureJob {
+            body: vec![1],
+            orig_name: "probe".into(),
+            event_builder: Box::new(|_sample| unreachable!("never built")),
+        }
+    }
+
+    fn armed_reader(handoff: Arc<CaptureHandoff>) -> LineReader {
+        let mut reader = LineReader::new(test_bounds());
+        reader.start_capture();
+        reader.arm_capture_submit(
+            handoff,
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+        );
+        reader
+    }
+
+    /// The listener enforces `max_duration` by dropping the session future, so the submit that
+    /// used to sit after the session loop never ran for a session that hit the bound - and a
+    /// dropper streaming a payload is exactly the long session that does. The capture is
+    /// submitted from `Drop` now, which runs on that path too.
+    #[tokio::test]
+    async fn the_binary_shell_capture_survives_a_cancelled_session() {
+        let handoff = one_slot_handoff();
+        let mut reader = armed_reader(handoff.clone());
+        reader.capture.extend_from_slice(b"\x7fELF-payload-bytes");
+        reader.flag_binary();
+
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(10), async move {
+            let _held = &reader;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the future was cancelled, not completed"
+        );
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the one slot holds the capture the cancelled session had accumulated"
+        );
+    }
+
+    /// An ordinary typed session is never spooled, cancelled or not: only a binary flood makes
+    /// the captured bytes evidence.
+    #[tokio::test]
+    async fn a_plaintext_session_submits_nothing_when_cancelled() {
+        let handoff = one_slot_handoff();
+        let mut reader = armed_reader(handoff.clone());
+        reader.capture.extend_from_slice(b"cat /proc/mounts\n");
+
+        drop(reader);
+        assert!(
+            handoff.submit(probe_job()).is_ok(),
+            "no binary flood, so nothing was submitted"
+        );
     }
 
     #[test]

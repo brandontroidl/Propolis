@@ -79,7 +79,10 @@ its protocol defines the end of a file (FTP's data connection stalled or failed,
 hit the drain cap; SCP ended before its trailer; an SFTP handle was never closed; an
 ADB SEND got no DONE), so the captured bytes are a fragment of whatever was being sent.
 The fragment is submitted whichever way the session ends, including the listener's
-`max_duration` cut-off, which cancels the handler outright. The IP detail page shows such
+`max_duration` cut-off, which cancels the handler outright. The same applies to the
+binary shell-phase captures on SSH and telnet: each is submitted by the destructor of
+the buffer that holds it, not by code after the session loop, which a cancelled handler
+never reaches. The IP detail page shows such
 rows with status `incomplete`.
 
 ## Signal types

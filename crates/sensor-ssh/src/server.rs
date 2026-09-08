@@ -257,8 +257,15 @@ async fn handle_session(
     // never in channel data, so the shell channel - which exists only post-auth - can never carry
     // the login password; no phase-gating is needed here the way telnet's LineReader needs
     // `start_capture` to exclude its pre-auth login prompt.
-    let mut shell_capture: Vec<u8> = Vec::new();
-    let mut binary_seen = false;
+    let mut shell_capture = ShellCapture {
+        body: Vec::new(),
+        binary_seen: false,
+        max_bytes: max_captured_bytes,
+        handoff: handoff.clone(),
+        source_ip,
+        wan_ip,
+        session_id,
+    };
 
     // ---- Main encrypted packet loop ----
     // Run as a block so that however the loop ends (clean close, read error, a failed write
@@ -421,12 +428,7 @@ async fn handle_session(
                         // depends on `binary_seen`, set below when the shared FakeShell flags a
                         // binary flood; a plaintext-only session accumulates here but the buffer is
                         // discarded, never spooled, once the loop ends.
-                        let room =
-                            max_captured_bytes.saturating_sub(shell_capture.len() as u64) as usize;
-                        if room > 0 {
-                            let take = data.len().min(room);
-                            shell_capture.extend_from_slice(&data[..take]);
-                        }
+                        shell_capture.push(data);
 
                         // A real interactive session runs the client terminal in raw mode and relies
                         // on the SERVER to echo keystrokes. Without that echo the attacker types into
@@ -454,7 +456,7 @@ async fn handle_session(
                                             if event.metadata.get("flood").and_then(|v| v.as_str())
                                                 == Some("binary")
                                             {
-                                                binary_seen = true;
+                                                shell_capture.flag_binary();
                                             }
                                             if emitter.append(event).await.is_err() {
                                                 tracing::error!(%peer_addr, "ssh: failed to append command event");
@@ -496,7 +498,7 @@ async fn handle_session(
                                             if event.metadata.get("flood").and_then(|v| v.as_str())
                                                 == Some("binary")
                                             {
-                                                binary_seen = true;
+                                                shell_capture.flag_binary();
                                             }
                                             if emitter.append(event).await.is_err() {
                                                 tracing::error!(%peer_addr, "ssh: failed to append command event");
@@ -572,11 +574,51 @@ async fn handle_session(
     // detector only trips on a line that is mostly non-printable). Preserve the raw bytes as
     // evidence, reusing the same handoff SCP/SFTP already submit through. Plaintext-only sessions
     // never set `binary_seen`, so ordinary interactive commands are never spooled.
-    if binary_seen && !shell_capture.is_empty() {
-        let orig_name = format!("ssh-session-{session_id}");
-        let _ = handoff.submit(CaptureJob {
-            body: shell_capture,
-            orig_name,
+    loop_result
+}
+
+/// The raw shell-channel bytes of one session, submitted from `Drop`.
+///
+/// It has to be a guard rather than a local buffer flushed after the packet loop: the listener
+/// enforces `max_duration` by dropping this handler's future, so nothing written after the loop
+/// runs for a session that hits the bound - and a dropper streaming a payload over the shell
+/// channel is exactly the long session that does. `CaptureHandoff::submit` never blocks, so
+/// submitting from a destructor is safe.
+struct ShellCapture {
+    body: Vec<u8>,
+    /// Set when the shared FakeShell flags a binary flood. A plaintext session is never spooled.
+    binary_seen: bool,
+    max_bytes: u64,
+    handoff: Arc<CaptureHandoff>,
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: sensor_framework::Uuid,
+}
+
+impl ShellCapture {
+    /// Accumulate raw channel bytes, bounded by the operator-configured session ceiling.
+    fn push(&mut self, data: &[u8]) {
+        let room = self.max_bytes.saturating_sub(self.body.len() as u64) as usize;
+        if room > 0 {
+            self.body.extend_from_slice(&data[..data.len().min(room)]);
+        }
+    }
+
+    fn flag_binary(&mut self) {
+        self.binary_seen = true;
+    }
+}
+
+impl Drop for ShellCapture {
+    fn drop(&mut self) {
+        if !self.binary_seen || self.body.is_empty() {
+            return;
+        }
+        let body = std::mem::take(&mut self.body);
+        let (source_ip, wan_ip, session_id) = (self.source_ip, self.wan_ip, self.session_id);
+        let _ = self.handoff.submit(CaptureJob {
+            body,
+            orig_name: format!("ssh-session-{session_id}"),
             event_builder: Box::new(move |sample: SampleRef| SensorEvent {
                 v: WIRE_VERSION,
                 source_ip,
@@ -596,8 +638,6 @@ async fn handle_session(
             }),
         });
     }
-
-    loop_result
 }
 
 // ---- Helpers ----
@@ -655,4 +695,92 @@ fn build_unimplemented(seq: u32) -> Vec<u8> {
     out.push(SSH_MSG_UNIMPLEMENTED);
     out.extend_from_slice(&seq.to_be_bytes());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A hand-off with one queue slot and no worker: a second `submit` is refused, which is how
+    /// these tests prove the first one happened.
+    fn one_slot_handoff() -> Arc<CaptureHandoff> {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let outbox_dir = dir.path().join("outbox");
+        let spool = QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000);
+        let emitter = EventEmitter::new(dir.path().join("events.jsonl"));
+        std::mem::forget(dir);
+        Arc::new(CaptureHandoff::new(
+            spool,
+            emitter,
+            1,
+            "test".to_string(),
+            OutboxManifest::new(outbox_dir),
+        ))
+    }
+
+    fn probe_job() -> CaptureJob {
+        CaptureJob {
+            body: vec![1],
+            orig_name: "probe".into(),
+            event_builder: Box::new(|_sample| unreachable!("never built")),
+        }
+    }
+
+    fn capture(handoff: Arc<CaptureHandoff>) -> ShellCapture {
+        ShellCapture {
+            body: Vec::new(),
+            binary_seen: false,
+            max_bytes: 65_536,
+            handoff,
+            source_ip: "203.0.113.7".parse().unwrap(),
+            wan_ip: None,
+            session_id: sensor_framework::Uuid::now_v7(),
+        }
+    }
+
+    /// The listener enforces `max_duration` by dropping this handler's future, so the submit
+    /// that used to sit after the packet loop never ran for a session that hit the bound - and a
+    /// dropper streaming a payload over the shell channel is exactly the long session that does.
+    #[tokio::test]
+    async fn the_binary_shell_capture_survives_a_cancelled_session() {
+        let handoff = one_slot_handoff();
+        let mut shell_capture = capture(handoff.clone());
+        shell_capture.push(b"\x7fELF-payload-bytes");
+        shell_capture.flag_binary();
+
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(10), async move {
+            let _held = &shell_capture;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the future was cancelled, not completed"
+        );
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the one slot holds the capture the cancelled session had accumulated"
+        );
+    }
+
+    /// An ordinary interactive session is never spooled, and the capture stays inside the
+    /// operator-configured ceiling.
+    #[tokio::test]
+    async fn a_plaintext_session_submits_nothing_and_the_buffer_is_bounded() {
+        let handoff = one_slot_handoff();
+        let mut shell_capture = capture(handoff.clone());
+        shell_capture.push(b"uname -a\n");
+        drop(shell_capture);
+        assert!(
+            handoff.submit(probe_job()).is_ok(),
+            "no binary flood, so nothing was submitted"
+        );
+
+        let mut bounded = capture(one_slot_handoff());
+        bounded.max_bytes = 8;
+        bounded.push(b"0123456789abcdef");
+        assert_eq!(bounded.body.len(), 8, "the ceiling bounds the buffer");
+    }
 }

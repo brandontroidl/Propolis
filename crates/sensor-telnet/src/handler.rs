@@ -16,7 +16,8 @@ use sensor_framework::persona;
 use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell};
 use sensor_framework::{
-    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver, upload_metadata,
+    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
+    upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
@@ -179,6 +180,7 @@ pub async fn handle_connection(
             let _ = stream
                 .write_all(&shell.encode_output(output.as_bytes()))
                 .await;
+            reader.mark_session_end(CaptureEnd::ClientLogout);
             break;
         }
 
@@ -188,15 +190,17 @@ pub async fn handle_connection(
         // de-obfuscating (identity for a plaintext session, so normal bots are unaffected).
         let response = shell.encode_output(&response);
         if stream.write_all(&response).await.is_err() {
+            reader.mark_session_end(CaptureEnd::TransportError);
             break;
         }
     }
 
-    // The binary shell-phase capture is submitted by `LineReader`'s `Drop` (see
-    // `arm_capture_submit`), which runs however this session ends - a clean return, an early
-    // break, or the listener cancelling the future at `max_duration`. Reaching this line is what
-    // separates the first two from the third, so the capture can say which it was.
-    reader.mark_session_end();
+    // Nothing is recorded here. Every exit above - and every one inside `read_line` - names the
+    // ending that produced it, because they do not mean the same thing: a logout leaves a whole
+    // capture, an idle timeout or a failed write leaves a fragment. This line used to set
+    // "complete" for all of them alike. The capture itself is submitted by `LineReader`'s `Drop`
+    // (see `arm_capture_submit`), the only code that also runs when the listener cancels this
+    // future at `max_duration`.
 }
 
 fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
@@ -274,10 +278,10 @@ struct LineReader {
     /// Set when the shared shell flags a binary flood: without it, and without the raw bytes
     /// themselves looking binary, the capture is an ordinary typed session and is never spooled.
     binary_seen: bool,
-    /// Set by `mark_session_end` when the session loop finishes on its own. Still false when the
-    /// listener cancels the handler at `max_duration`, which is how `Drop` knows the capture it
-    /// is handing over is a fragment.
-    session_ended: bool,
+    /// How the session ended, set at the exact exit path that ended it. Starts `Cancelled`
+    /// because that is the one ending no code can record: the listener drops this whole future at
+    /// `max_duration`. Only a peer-chosen end makes the capture complete - see `CaptureEnd`.
+    session_end: CaptureEnd,
     /// What `Drop` needs to hand the capture off. `None` until `arm_capture_submit`, so a reader
     /// built by a unit test submits nothing.
     submit: Option<CaptureSubmit>,
@@ -313,10 +317,11 @@ impl Drop for LineReader {
         // drains.
         let wire_size = self.capture_wire_bytes();
         let body = self.take_capture();
-        // The session reached the end of its own loop only if `mark_session_end` ran. A capture
-        // handed over by a cancelled handler is a fragment of whatever was still arriving, and
-        // the console shows it as incomplete rather than as a whole sample.
-        let complete = self.session_ended;
+        // Only an ending the PEER chose means the bytes are whole. A handler cancelled at
+        // `max_duration`, an idle timeout, a socket error and an exhausted capture budget all
+        // leave a fragment of whatever was still arriving, and the console shows it as
+        // incomplete rather than as a whole sample.
+        let end = self.session_end;
         let (source_ip, wan_ip, session_id) = (ctx.source_ip, ctx.wan_ip, ctx.session_id);
         let _ = ctx.handoff.submit(CaptureJob {
             body,
@@ -331,8 +336,10 @@ impl Drop for LineReader {
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
                 metadata: {
-                    let mut m = upload_metadata(PROTOCOL_LABEL, &sample, wire_size, complete);
+                    let mut m =
+                        upload_metadata(PROTOCOL_LABEL, &sample, wire_size, end.is_complete());
                     m["capture_reason"] = serde_json::json!("binary_shell_payload");
+                    m["end_reason"] = serde_json::json!(end.label());
                     m
                 },
                 sample: Some(sample),
@@ -357,7 +364,7 @@ impl LineReader {
             capture_overflow: 0,
             capturing: false,
             binary_seen: false,
-            session_ended: false,
+            session_end: CaptureEnd::Cancelled,
             submit: None,
         }
     }
@@ -384,10 +391,11 @@ impl LineReader {
         self.binary_seen = true;
     }
 
-    /// The session loop finished on its own terms, so a capture submitted after this is whole
-    /// rather than a fragment left by a cancelled handler.
-    fn mark_session_end(&mut self) {
-        self.session_ended = true;
+    /// Record how the session ended. Called at the exit path that ended it, never after the loop:
+    /// "the loop returned" is true of a clean logout and of an idle timeout alike, and the whole
+    /// point of the distinction is that those two produce different evidence.
+    fn mark_session_end(&mut self, end: CaptureEnd) {
+        self.session_end = end;
     }
 
     /// Begin accumulating raw input into the capture buffer. Callers invoke this only once the
@@ -444,6 +452,7 @@ impl LineReader {
             }
 
             if self.total_captured >= self.bounds.max_captured_bytes {
+                self.session_end = CaptureEnd::CaptureBudget;
                 return None;
             }
 
@@ -455,7 +464,21 @@ impl LineReader {
 
             let mut raw = [0u8; READ_CHUNK_SIZE];
             let n = match tokio::time::timeout(per_read_timeout, stream.read(&mut raw)).await {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return None, // EOF, read error, or timeout
+                // Three different endings, and a capture can only say whether its bytes are whole
+                // if they stay apart: the peer closing is the one that means "it finished
+                // sending".
+                Ok(Ok(0)) => {
+                    self.session_end = CaptureEnd::PeerClosed;
+                    return None;
+                }
+                Ok(Err(_)) => {
+                    self.session_end = CaptureEnd::TransportError;
+                    return None;
+                }
+                Err(_) => {
+                    self.session_end = CaptureEnd::IdleTimeout;
+                    return None;
+                }
                 Ok(Ok(n)) => n,
             };
             self.first_read = false;
@@ -466,12 +489,14 @@ impl LineReader {
             self.filter.process(&raw[..n], &mut data, &mut response);
             self.capture_bytes(&data);
             if !response.is_empty() && stream.write_all(&response).await.is_err() {
+                self.session_end = CaptureEnd::TransportError;
                 return None;
             }
 
             let mut echo_out = Vec::new();
             self.feed(&data, echo, &mut echo_out);
             if !echo_out.is_empty() && stream.write_all(&echo_out).await.is_err() {
+                self.session_end = CaptureEnd::TransportError;
                 return None;
             }
         }

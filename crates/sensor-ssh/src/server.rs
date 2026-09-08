@@ -19,8 +19,8 @@ use tokio::task::JoinHandle;
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
 use sensor_framework::persona;
 use sensor_framework::{
-    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, OutboxManifest, QuarantineSpool,
-    WanResolver,
+    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, OutboxManifest,
+    QuarantineSpool, WanResolver,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
@@ -261,7 +261,7 @@ async fn handle_session(
         body: Vec::new(),
         wire_bytes: 0,
         binary_seen: false,
-        session_ended: false,
+        session_end: CaptureEnd::Cancelled,
         max_bytes: max_captured_bytes,
         handoff: handoff.clone(),
         source_ip,
@@ -279,7 +279,13 @@ async fn handle_session(
         let payload =
             match transport::read_packet_encrypted(&mut stream, &mut c2s_cipher, c2s_seq).await {
                 Ok(p) => p,
-                Err(_) => break, // connection closed or error
+                // These are four different endings, and a capture cannot say whether its bytes
+                // are whole unless they stay apart. A closed connection means the peer finished
+                // sending; a timeout or a socket error means it did not.
+                Err(e) => {
+                    shell_capture.mark_session_end(classify_read_failure(&e));
+                    break;
+                }
             };
         c2s_seq = c2s_seq.wrapping_add(1);
 
@@ -290,7 +296,10 @@ async fn handle_session(
         let msg_type = payload[0];
 
         match msg_type {
-            SSH_MSG_DISCONNECT => break,
+            SSH_MSG_DISCONNECT => {
+                shell_capture.mark_session_end(CaptureEnd::ClientLogout);
+                break;
+            }
             SSH_MSG_IGNORE | SSH_MSG_UNIMPLEMENTED => continue,
 
             SSH_MSG_SERVICE_REQUEST => {
@@ -553,6 +562,7 @@ async fn handle_session(
                             .await;
                     }
                 }
+                shell_capture.mark_session_end(CaptureEnd::PeerClosed);
                 break;
             }
 
@@ -576,9 +586,12 @@ async fn handle_session(
     // detector only trips on a line that is mostly non-printable). Preserve the raw bytes as
     // evidence, reusing the same handoff SCP/SFTP already submit through. Plaintext-only sessions
     // never set `binary_seen`, so ordinary interactive commands are never spooled.
-    // Reaching here means the packet loop ended on its own terms rather than being cancelled,
-    // which is what lets the capture say whether it is whole or a fragment.
-    shell_capture.mark_session_end();
+    // Each `break` above named its own ending, because they do not mean the same thing. What is
+    // left here is the error path: a write that failed, or any other `?` out of the loop, which
+    // cut the session with a payload still arriving.
+    if loop_result.is_err() {
+        shell_capture.mark_session_end(CaptureEnd::TransportError);
+    }
 
     loop_result
 }
@@ -597,9 +610,10 @@ struct ShellCapture {
     wire_bytes: u64,
     /// Set when the shared FakeShell flags a binary flood. A plaintext session is never spooled.
     binary_seen: bool,
-    /// Set when the packet loop finishes on its own terms. Still false when the listener cancels
-    /// the handler at `max_duration`, which is how `Drop` knows it holds a fragment.
-    session_ended: bool,
+    /// How the session ended, set at the exit path that ended it. Starts `Cancelled` because that
+    /// is the one ending no code can record: the listener drops this whole future at
+    /// `max_duration`. Only a peer-chosen end makes the capture complete - see `CaptureEnd`.
+    session_end: CaptureEnd,
     max_bytes: u64,
     handoff: Arc<CaptureHandoff>,
     source_ip: IpAddr,
@@ -622,9 +636,11 @@ impl ShellCapture {
         self.binary_seen = true;
     }
 
-    /// The packet loop finished on its own terms.
-    fn mark_session_end(&mut self) {
-        self.session_ended = true;
+    /// Record how the session ended. Called at the exit path that ended it, never after the loop:
+    /// a peer's DISCONNECT and a mid-transfer socket error both end the loop, and the whole point
+    /// of the distinction is that they leave different evidence.
+    fn mark_session_end(&mut self, end: CaptureEnd) {
+        self.session_end = end;
     }
 }
 
@@ -640,7 +656,7 @@ impl Drop for ShellCapture {
             return;
         }
         let body = std::mem::take(&mut self.body);
-        let (wire_size, complete) = (self.wire_bytes, self.session_ended);
+        let (wire_size, end) = (self.wire_bytes, self.session_end);
         let (source_ip, wan_ip, session_id) = (self.source_ip, self.wan_ip, self.session_id);
         let _ = self.handoff.submit(CaptureJob {
             body,
@@ -659,9 +675,14 @@ impl Drop for ShellCapture {
                 // `complete` absent, and the console reads a missing `complete` as true - so a
                 // fragment from a cancelled session displayed as a whole sample.
                 metadata: {
-                    let mut m =
-                        sensor_framework::upload_metadata("ssh", &sample, wire_size, complete);
+                    let mut m = sensor_framework::upload_metadata(
+                        "ssh",
+                        &sample,
+                        wire_size,
+                        end.is_complete(),
+                    );
                     m["capture_reason"] = serde_json::json!("binary_shell_payload");
+                    m["end_reason"] = serde_json::json!(end.label());
                     m
                 },
                 sample: Some(sample),
@@ -673,6 +694,23 @@ impl Drop for ShellCapture {
 }
 
 // ---- Helpers ----
+
+/// What a failed packet read says about the session's ending. `read_exact` on a socket the peer
+/// closed reports `UnexpectedEof`, which is the peer finishing rather than anything going wrong;
+/// `TimeoutStream` reports an elapsed `idle_timeout` as `TimedOut`; and a packet this transport
+/// cannot parse is the peer sending garbage, not a transport fault.
+fn classify_read_failure(err: &transport::TransportError) -> CaptureEnd {
+    match err {
+        transport::TransportError::Io(e) => match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => CaptureEnd::PeerClosed,
+            std::io::ErrorKind::TimedOut => CaptureEnd::IdleTimeout,
+            _ => CaptureEnd::TransportError,
+        },
+        transport::TransportError::TooLarge { .. }
+        | transport::TransportError::Malformed(_)
+        | transport::TransportError::InvalidEncoding(_) => CaptureEnd::MalformedInput,
+    }
+}
 
 /// Write one encrypted packet and increment the sequence number.
 async fn write_encrypted<W: tokio::io::AsyncWrite + Unpin>(
@@ -765,12 +803,58 @@ mod tests {
             body: Vec::new(),
             wire_bytes: 0,
             binary_seen: false,
-            session_ended: false,
+            session_end: CaptureEnd::Cancelled,
             max_bytes: 65_536,
             handoff,
             source_ip: "203.0.113.7".parse().unwrap(),
             wan_ip: None,
             session_id: sensor_framework::Uuid::now_v7(),
+        }
+    }
+
+    /// The read that ends an SSH session fails whether the peer closed cleanly, stalled, or sent
+    /// garbage, and the capture's completeness turns on telling those apart. The end-to-end tests
+    /// drive the timeout and the explicit DISCONNECT; these are the branches a client cannot
+    /// easily produce on demand. `UnexpectedEof` is the one that reads backwards: it is an error
+    /// type, but it means the peer finished and hung up.
+    #[test]
+    fn a_failed_read_says_whether_the_peer_finished_or_the_session_broke() {
+        use std::io::{Error, ErrorKind};
+        let io = |kind| transport::TransportError::Io(Error::new(kind, "test"));
+
+        assert_eq!(
+            classify_read_failure(&io(ErrorKind::UnexpectedEof)),
+            CaptureEnd::PeerClosed
+        );
+        assert_eq!(
+            classify_read_failure(&io(ErrorKind::TimedOut)),
+            CaptureEnd::IdleTimeout
+        );
+        assert_eq!(
+            classify_read_failure(&io(ErrorKind::ConnectionReset)),
+            CaptureEnd::TransportError
+        );
+        assert_eq!(
+            classify_read_failure(&transport::TransportError::Malformed("bad padding")),
+            CaptureEnd::MalformedInput
+        );
+        assert_eq!(
+            classify_read_failure(&transport::TransportError::TooLarge {
+                claimed: 1 << 30,
+                max: 65536
+            }),
+            CaptureEnd::MalformedInput
+        );
+
+        assert!(CaptureEnd::PeerClosed.is_complete());
+        for cut_short in [
+            CaptureEnd::IdleTimeout,
+            CaptureEnd::TransportError,
+            CaptureEnd::MalformedInput,
+            CaptureEnd::Cancelled,
+            CaptureEnd::CaptureBudget,
+        ] {
+            assert!(!cut_short.is_complete(), "{cut_short:?}");
         }
     }
 

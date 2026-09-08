@@ -337,6 +337,111 @@ async fn a_payload_cut_off_mid_line_is_still_captured_and_marked_incomplete() {
     assert_eq!(stored, payload, "the stored bytes are what the client sent");
 }
 
+/// How the client ends the session. The sensor has no protocol-defined end of file for a shell
+/// capture, so this is the only thing that can say whether the bytes are the whole payload.
+enum Ending {
+    /// Stop sending and let `idle_timeout` elapse with the session still open.
+    GoQuiet,
+    /// Send SSH_MSG_DISCONNECT. The peer finished and said so.
+    Disconnect,
+}
+
+/// Drive one unterminated binary payload to `ending` and return the upload event. Every caller
+/// sends the same kind of payload, so a difference in the recorded outcome can only come from how
+/// the session ended.
+async fn payload_session(
+    idle_timeout: Duration,
+    payload: &[u8],
+    ending: Ending,
+) -> sensor_wire::SensorEvent {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let bounds = ConnectionBounds {
+        idle_timeout,
+        ..test_bounds()
+    };
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        wan_resolver,
+        bounds,
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(config, addr, TestHandler)
+        .await
+        .unwrap();
+    session
+        .authenticate_password("attacker", "password123")
+        .await
+        .unwrap();
+    let channel = session.channel_open_session().await.unwrap();
+    channel.request_shell(false).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    channel.data(payload).await.unwrap();
+
+    if let Ending::Disconnect = ending {
+        session
+            .disconnect(russh::Disconnect::ByApplication, "", "")
+            .await
+            .unwrap();
+    }
+    let event = poll_for_malware_upload_within(&log_path, Duration::from_secs(8))
+        .await
+        .expect("the binary capture must be recorded whatever ended the session");
+    drop(channel);
+    drop(session);
+    handle.abort();
+    event
+}
+
+/// An SSH session that goes quiet mid-payload is not a finished one: the read fails with a
+/// timeout, which used to reach the same "the loop returned" line as a clean disconnect and be
+/// labelled complete.
+#[tokio::test]
+async fn a_payload_abandoned_mid_transfer_is_recorded_as_cut_short_by_the_idle_timeout() {
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80u8 | (i & 0x3f)).collect();
+    let event = payload_session(Duration::from_millis(600), &payload, Ending::GoQuiet).await;
+
+    assert_eq!(
+        event.metadata["end_reason"], "idle_timeout",
+        "{:?}",
+        event.metadata
+    );
+    assert_eq!(
+        event.metadata["complete"], false,
+        "an idle timeout cut the transfer short: {:?}",
+        event.metadata
+    );
+}
+
+/// The other side of the distinction: the client said it was done. This is the ending that must
+/// still read as complete, so the fix above cannot be "label everything incomplete".
+#[tokio::test]
+async fn a_payload_the_client_finished_sending_before_disconnecting_is_recorded_as_complete() {
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80u8 | (i & 0x3f)).collect();
+    let event = payload_session(Duration::from_secs(60), &payload, Ending::Disconnect).await;
+
+    assert_eq!(
+        event.metadata["end_reason"], "client_logout",
+        "{:?}",
+        event.metadata
+    );
+    assert_eq!(
+        event.metadata["complete"], true,
+        "the client disconnected of its own accord: {:?}",
+        event.metadata
+    );
+}
+
 #[tokio::test]
 async fn binary_shell_payload_is_captured_as_malware_upload() {
     let dir = tempfile::tempdir().unwrap();

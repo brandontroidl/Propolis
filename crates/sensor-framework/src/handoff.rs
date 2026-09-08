@@ -70,6 +70,55 @@ pub struct CaptureJob {
     pub event_builder: Box<dyn FnOnce(SampleRef) -> SensorEvent + Send>,
 }
 
+/// Why a session-scoped capture stopped, and therefore whether its bytes are the whole of what
+/// the peer was sending.
+///
+/// A shell capture has no protocol-defined end of file the way SCP's trailer or ADB's DONE does,
+/// so the only thing that can say whether the bytes are whole is how the session itself ended.
+/// "The session loop returned" is not that: an idle timeout, a socket error, malformed input and
+/// an exhausted capture budget all end the loop with a payload still arriving, and labelling
+/// those complete tells an analyst a fragment is a whole sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureEnd {
+    /// Nothing recorded an end: the listener dropped the handler future at `max_duration`. It is
+    /// the initial value because a cancelled future runs no code that could set anything else.
+    Cancelled,
+    /// The peer closed the connection. Whatever it meant to send, it finished sending.
+    PeerClosed,
+    /// The peer asked to end the session (`exit`/`logout`, SSH's DISCONNECT).
+    ClientLogout,
+    /// No byte arrived within `idle_timeout` (or `read_timeout`, for the first read).
+    IdleTimeout,
+    /// The socket failed mid-session - a read error, or a response that could not be written.
+    TransportError,
+    /// The peer sent something the protocol could not parse, so the session could not continue.
+    MalformedInput,
+    /// The session hit `max_captured_bytes`; the rest of the payload was never read off the wire.
+    CaptureBudget,
+}
+
+impl CaptureEnd {
+    /// Whether the captured bytes are the whole of what the peer sent. Only an end the PEER chose
+    /// qualifies: every other variant cut a transfer that was still in progress.
+    pub fn is_complete(self) -> bool {
+        matches!(self, Self::PeerClosed | Self::ClientLogout)
+    }
+
+    /// The value stored in the event's `end_reason`, so an operator reading a fragment can see
+    /// what cut it short rather than only that it is short.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cancelled => "session_cancelled",
+            Self::PeerClosed => "peer_closed",
+            Self::ClientLogout => "client_logout",
+            Self::IdleTimeout => "idle_timeout",
+            Self::TransportError => "transport_error",
+            Self::MalformedInput => "malformed_input",
+            Self::CaptureBudget => "capture_budget",
+        }
+    }
+}
+
 /// The `honeypot_malware_upload` metadata object every body-capturing sensor emits, built in one
 /// place so the keys cannot drift between sensors. `wire_size` is how many body bytes the client
 /// actually sent; `sample.size` is how many were retained. Sensors cap the body they keep (SCP,

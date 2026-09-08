@@ -36,6 +36,11 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+# A real sensor, so one test can carry a record the sensor itself produced through intake into a
+# rendered console page. Asserting each end against its own hand-written fixture leaves the join
+# between them - the metadata key names - untested in both directions. Dev-only: the daemon
+# launches sensors as separate processes and does not link them.
+sensor-telnet = { path = "../sensor-telnet" }
 tempfile = "3.27.0"
 # test-util enables tokio's pausable virtual clock (start_paused) so time-based dispatcher tests
 # (per-attempt deadline + backoff) run deterministically and instantly. A tokio feature, not a new

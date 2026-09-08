@@ -3073,6 +3073,7 @@ dependencies = [
  "reqwest",
  "review",
  "sensor-framework",
+ "sensor-telnet",
  "sqlx",
  "tempfile",
  "tokio",

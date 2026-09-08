@@ -574,6 +574,178 @@ async fn a_payload_cut_off_mid_line_is_still_captured_and_marked_incomplete() {
     );
 }
 
+/// How the client ends the session, which is the only thing that can say whether a shell capture
+/// holds the whole payload: the sensor has no protocol-defined end of file to go by.
+enum Ending {
+    /// Stop sending and let `idle_timeout` elapse with the connection still open.
+    GoQuiet,
+    /// Close the connection cleanly. The peer finished sending.
+    CloseCleanly,
+    /// Abort with an RST (`SO_LINGER` 0), so the server's next read fails rather than reporting
+    /// end-of-file.
+    ResetConnection,
+}
+
+/// Drive one binary-payload session to `ending` and return the upload event's metadata with the
+/// bytes that reached the spool. Every caller sends a payload that is binary and unterminated -
+/// only the ending differs, so a difference in the recorded outcome can come from nothing else.
+async fn payload_session(bounds: ConnectionBounds, payload: &[u8], ending: Ending) -> Metadata {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let spool_dir = dir.path().join("spool");
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_telnet::start_test_server(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        spool_dir.clone(),
+        wan_resolver,
+        bounds,
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    login(&mut conn, b"root", b"pass").await;
+    conn.write_all(payload).await.unwrap();
+
+    match ending {
+        Ending::GoQuiet => {
+            wait_for_spooled_file(&spool_dir).await;
+            drop(conn);
+        }
+        Ending::CloseCleanly => {
+            drop(conn);
+            wait_for_spooled_file(&spool_dir).await;
+        }
+        Ending::ResetConnection => {
+            // A zero linger makes close send RST instead of FIN, so the server sees a read error
+            // rather than end-of-file. Without it this case is indistinguishable from a clean
+            // close, and a clean close is the one ending that means the payload was finished.
+            //
+            // Deprecated because a NON-zero linger blocks the closing thread until the kernel
+            // finishes draining. Zero is the opposite case: close returns at once and sends the
+            // reset, which is the whole point here. The alternative is a raw `setsockopt` behind
+            // `unsafe`, which buys nothing for a test that wants exactly this behavior.
+            #[allow(deprecated)]
+            conn.set_linger(Some(Duration::ZERO)).unwrap();
+            drop(conn);
+            wait_for_spooled_file(&spool_dir).await;
+        }
+    }
+    handle.abort();
+
+    let stored_dir: Vec<_> = std::fs::read_dir(&spool_dir).unwrap().collect();
+    assert_eq!(stored_dir.len(), 1, "exactly one capture per session");
+    let stored = std::fs::read(stored_dir[0].as_ref().unwrap().path()).unwrap();
+
+    let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+    let upload = content
+        .lines()
+        .map(|l| serde_json::from_str::<sensor_wire::SensorEvent>(l).unwrap())
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .expect("the binary capture must be recorded whatever ended the session");
+    Metadata {
+        json: upload.metadata,
+        stored,
+    }
+}
+
+struct Metadata {
+    json: serde_json::Value,
+    stored: Vec<u8>,
+}
+
+/// An idle session is not a finished one. The payload stops arriving and the reader's
+/// `idle_timeout` elapses with the transfer still open, so the bytes are a fragment - but every
+/// one of these endings used to run the same "the loop returned, so it is complete" line.
+#[tokio::test]
+async fn a_payload_abandoned_mid_transfer_is_recorded_as_cut_short_by_the_idle_timeout() {
+    let bounds = ConnectionBounds {
+        idle_timeout: Duration::from_millis(600),
+        max_duration: Duration::from_secs(30),
+        ..test_bounds()
+    };
+    let payload = vec![0xAAu8; 256];
+    let m = payload_session(bounds, &payload, Ending::GoQuiet).await;
+
+    assert_eq!(m.stored, payload, "the stored bytes are what was sent");
+    assert_eq!(m.json["end_reason"], "idle_timeout", "{:?}", m.json);
+    assert_eq!(
+        m.json["complete"], false,
+        "an idle timeout cut the transfer short: {:?}",
+        m.json
+    );
+}
+
+/// A socket that fails mid-session is also not a finished one, and an RST is the case a clean
+/// close is easiest to confuse it with: both end the loop, one after the peer finished sending
+/// and one not.
+#[tokio::test]
+async fn a_payload_ended_by_a_connection_reset_is_recorded_as_a_transport_failure() {
+    let payload = vec![0xAAu8; 256];
+    let m = payload_session(test_bounds(), &payload, Ending::ResetConnection).await;
+
+    assert_eq!(m.json["end_reason"], "transport_error", "{:?}", m.json);
+    assert_eq!(
+        m.json["complete"], false,
+        "a reset connection left the transfer open: {:?}",
+        m.json
+    );
+}
+
+/// The other side of the same distinction: the peer closed the connection itself, so whatever it
+/// sent is whatever it meant to send. This is the ONLY ending in this file that is complete, and
+/// it is what stops the fix above from being "label everything incomplete".
+#[tokio::test]
+async fn a_payload_the_client_finished_sending_before_closing_is_recorded_as_complete() {
+    let payload = vec![0xAAu8; 256];
+    let m = payload_session(test_bounds(), &payload, Ending::CloseCleanly).await;
+
+    assert_eq!(m.stored, payload);
+    assert_eq!(m.json["end_reason"], "peer_closed", "{:?}", m.json);
+    assert_eq!(
+        m.json["complete"], true,
+        "the peer closed the connection itself: {:?}",
+        m.json
+    );
+}
+
+/// Hitting `max_captured_bytes` stops the sensor reading, so the rest of the payload was never
+/// seen: the capture is both a prefix (`truncated`) and unfinished (`complete: false`). The two
+/// are different facts - a whole small file is truncated: false, complete: true - and the panel
+/// shows them differently.
+#[tokio::test]
+async fn a_payload_that_exhausts_the_capture_budget_is_recorded_as_a_prefix_and_unfinished() {
+    let bounds = ConnectionBounds {
+        max_captured_bytes: 512,
+        idle_timeout: Duration::from_millis(600),
+        ..test_bounds()
+    };
+    // Comfortably past the budget even after the login phase has spent part of it.
+    let payload = vec![0xAAu8; 4096];
+    let m = payload_session(bounds, &payload, Ending::GoQuiet).await;
+
+    assert_eq!(m.json["end_reason"], "capture_budget", "{:?}", m.json);
+    assert_eq!(
+        m.json["complete"], false,
+        "the rest of the payload was never read: {:?}",
+        m.json
+    );
+    assert_eq!(
+        m.json["truncated"], true,
+        "the stored bytes are a prefix: {:?}",
+        m.json
+    );
+    assert!(
+        m.stored.len() < payload.len(),
+        "stored {} of {} bytes",
+        m.stored.len(),
+        payload.len()
+    );
+}
+
 /// Poll `spool_dir` for up to ~1s for at least one entry to appear, rather than a fixed sleep -
 /// the capture hand-off's worker runs off the connection's response path (see
 /// `sensor_framework::handoff`'s module doc), so there is no synchronous point at which "the

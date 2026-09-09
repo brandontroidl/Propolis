@@ -1974,6 +1974,202 @@ async fn detail_malware_panel_groups_repeated_uploads_of_one_sha(pool: PgPool) {
     );
 }
 
+/// The panel groups every event carrying one sha into a single row, so a reason can only be shown
+/// when the whole group agrees on it. Three cases in one page, because the risk is that a row is
+/// captioned with a reason that is not true of it:
+///   - one reason, recorded consistently -> shown, in words;
+///   - two sessions that ended differently under the same sha -> no reason, not one of the two;
+///   - a capture from before sensors emitted the field -> no reason, and still "incomplete".
+#[sqlx::test(migrations = false)]
+async fn detail_malware_panel_shows_an_end_reason_only_when_the_whole_group_agrees(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.86";
+    seed_recommended(&pool, ip, 60).await;
+    let agreed = "aaaa11110000aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let mixed = "bbbb22220000aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let legacy = "cccc33330000aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let partial = "dddd55550000aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let upload = |sha: &str, reason: Option<&str>| {
+        let mut metadata = serde_json::json!({
+            "sample_sha256": sha,
+            "sample_orig_name": "drop.bin",
+            "sample_size": 512,
+            "wire_size": 512,
+            "truncated": false,
+            "complete": false,
+        });
+        if let Some(r) = reason {
+            metadata["end_reason"] = serde_json::json!(r);
+        }
+        ev_with_session(
+            ip,
+            "telnet",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            metadata,
+            Uuid::now_v7(),
+        )
+    };
+    // Same sha seen twice, ending the same way both times.
+    append_event(&pool, upload(agreed, Some("idle_timeout")))
+        .await
+        .unwrap();
+    append_event(&pool, upload(agreed, Some("idle_timeout")))
+        .await
+        .unwrap();
+    // Same sha, two different endings: neither may caption the row.
+    append_event(&pool, upload(mixed, Some("idle_timeout")))
+        .await
+        .unwrap();
+    append_event(&pool, upload(mixed, Some("transport_error")))
+        .await
+        .unwrap();
+    // A capture recorded before the field existed at all.
+    append_event(&pool, upload(legacy, None)).await.unwrap();
+    // The same body seen once before the field existed and once after. The surviving reason
+    // describes only one of the two sessions, so it cannot caption a row standing for both -
+    // and `count(DISTINCT ...)` alone would not catch this, since NULLs are not counted.
+    append_event(&pool, upload(partial, None)).await.unwrap();
+    append_event(&pool, upload(partial, Some("idle_timeout")))
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let panel_start = body
+        .find("Malware from this IP")
+        .expect("malware panel heading must render");
+    let panel = &body[panel_start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    let row_of = |sha_short: &str| {
+        let start = panel
+            .find(sha_short)
+            .unwrap_or_else(|| panic!("{sha_short} row: {panel}"));
+        let row_start = panel[..start].rfind("<tr").unwrap_or(0);
+        let row_end = start + panel[start..].find("</tr>").unwrap_or(0);
+        &panel[row_start..row_end]
+    };
+
+    let agreed_row = row_of("aaaa11110000");
+    assert!(
+        agreed_row.contains("incomplete") && agreed_row.contains("idle timeout"),
+        "an agreed reason must be shown in words beside the status: {agreed_row}"
+    );
+
+    let mixed_row = row_of("bbbb22220000");
+    assert!(
+        mixed_row.contains("incomplete"),
+        "the row is still a fragment: {mixed_row}"
+    );
+    assert!(
+        !mixed_row.contains("idle timeout") && !mixed_row.contains("transport error"),
+        "two sessions ended differently, so neither reason describes this row: {mixed_row}"
+    );
+
+    let legacy_row = row_of("cccc33330000");
+    assert!(
+        legacy_row.contains("incomplete"),
+        "a capture predating the field is still incomplete: {legacy_row}"
+    );
+    assert!(
+        !legacy_row.contains('('),
+        "no reason was recorded, so none may be invented: {legacy_row}"
+    );
+
+    let partial_row = row_of("dddd55550000");
+    assert!(
+        partial_row.contains("incomplete"),
+        "the row is still a fragment: {partial_row}"
+    );
+    assert!(
+        !partial_row.contains("idle timeout"),
+        "one of the two sessions behind this row has no recorded reason, so the other one's \
+         cannot stand for both: {partial_row}"
+    );
+}
+
+/// A capture can be BOTH a prefix and unfinished - the telnet capture-budget path is exactly that
+/// - and the status column used to test `truncated` first and return, so the budget case rendered
+/// as merely "truncated" and its incompleteness was invisible on the page.
+#[sqlx::test(migrations = false)]
+async fn detail_malware_panel_reports_a_capture_that_is_both_truncated_and_unfinished(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let ip = "203.0.113.87";
+    seed_recommended(&pool, ip, 60).await;
+    let sha = "eeee44440000aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    append_event(
+        &pool,
+        ev_with_session(
+            ip,
+            "telnet",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": sha,
+                "sample_orig_name": "drop.bin",
+                "sample_size": 512,
+                "wire_size": 4096,
+                "truncated": true,
+                "complete": false,
+                "end_reason": "capture_budget",
+            }),
+            Uuid::now_v7(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let panel_start = body
+        .find("Malware from this IP")
+        .expect("malware panel heading must render");
+    let panel = &body[panel_start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    let start = panel.find("eeee44440000").expect("the capture's row");
+    let row_start = panel[..start].rfind("<tr").unwrap_or(0);
+    let row = &panel[row_start..start + panel[start..].find("</tr>").unwrap_or(0)];
+
+    assert!(
+        row.contains("truncated"),
+        "the stored bytes are a prefix: {row}"
+    );
+    assert!(
+        row.contains("incomplete"),
+        "the rest of the payload was never read, and that must not be hidden by 'truncated': {row}"
+    );
+    assert!(
+        row.contains("capture budget"),
+        "the reason the capture stopped belongs beside it: {row}"
+    );
+}
+
 /// An upload whose transfer never finished (FTP stalled, SCP cut before its trailer) carries
 /// `complete: false` but, below the cap, `truncated: false`; the panel keyed on `truncated`
 /// alone and showed the fragment as an ordinary `captured` sample.

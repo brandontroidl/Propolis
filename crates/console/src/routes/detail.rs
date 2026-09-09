@@ -212,6 +212,12 @@ struct MalwareRow {
     /// Raw `fetch_attempt.status` value (pending/success/dead/rejected/too_big/timeout/empty -
     /// `review::fetcher::FetchStatus::as_str()`, same vocabulary `routes::samples` displays).
     status: String,
+    /// Why a shell capture stopped, in words, when every event behind this row agrees on one
+    /// reason and none is missing it - see `fetch_malware_rows` for why a disagreeing or
+    /// partly-absent group shows nothing rather than picking one. `None` for a fetched row, for
+    /// captures recorded before sensors emitted the field, and for protocols whose completeness
+    /// comes from a protocol-defined end of file rather than from how the session ended.
+    end_reason: Option<String>,
     /// Pre-formatted byte count (`format_bytes`), `None` when no body was captured.
     bytes: Option<String>,
     /// Full lowercase-hex sha256, for the title attribute; `None` when no body was captured.
@@ -801,9 +807,15 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
                 max(e.sensor) AS host, \
                 NULL::text AS pinned_ip, \
                 CASE WHEN bool_or(coalesce((e.metadata->>'truncated')::boolean, false)) \
+                      AND NOT bool_and(coalesce((e.metadata->>'complete')::boolean, true)) \
+                     THEN 'truncated, incomplete' \
+                     WHEN bool_or(coalesce((e.metadata->>'truncated')::boolean, false)) \
                      THEN 'truncated' \
                      WHEN NOT bool_and(coalesce((e.metadata->>'complete')::boolean, true)) \
                      THEN 'incomplete' ELSE 'captured' END AS status, \
+                CASE WHEN count(e.metadata->>'end_reason') = count(*) \
+                      AND count(DISTINCT e.metadata->>'end_reason') = 1 \
+                     THEN max(e.metadata->>'end_reason') END AS end_reason, \
                 max((e.metadata->>'sample_size')::int) AS bytes, \
                 e.metadata->>'sample_sha256' AS sha256_hex, \
                 sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
@@ -813,7 +825,8 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
          WHERE e.source_ip = $1::inet AND e.metadata->>'sample_sha256' IS NOT NULL \
          GROUP BY e.metadata->>'sample_sha256', sa.sha256 \
          UNION ALL \
-         SELECT 'fetched' AS origin, fa.url, fa.host, fa.pinned_ip, fa.status, fa.bytes, \
+         SELECT 'fetched' AS origin, fa.url, fa.host, fa.pinned_ip, fa.status, \
+                NULL::text AS end_reason, fa.bytes, \
                 encode(fa.sha256, 'hex') AS sha256_hex, \
                 sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
                 fa.last_attempt AS sort_at \
@@ -832,12 +845,20 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
         let sha256_hex: Option<String> = row.try_get("sha256_hex")?;
         let bytes: Option<i32> = row.try_get("bytes")?;
         let analyzed_at: Option<DateTime<Utc>> = row.try_get("analyzed_at")?;
+        let status: String = row.try_get("status")?;
+        // The wire label is snake_case so it stays a stable key; the panel is read by a person.
+        // Only shown against a capture that did NOT finish: "captured (peer closed)" tells an
+        // operator nothing they cannot already see.
+        let end_reason: Option<String> = row
+            .try_get::<Option<String>, _>("end_reason")?
+            .filter(|_| status.contains("incomplete"));
         malware.push(MalwareRow {
             origin: row.try_get("origin")?,
             url: row.try_get("url")?,
             host: row.try_get("host")?,
             pinned_ip: row.try_get("pinned_ip")?,
-            status: row.try_get("status")?,
+            status,
+            end_reason: end_reason.map(|r| r.replace('_', " ")),
             bytes: bytes.map(|b| format_bytes(b.max(0) as u64)),
             sha256_short: sha256_hex
                 .as_ref()

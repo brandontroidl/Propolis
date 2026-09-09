@@ -560,6 +560,14 @@ async fn a_payload_cut_off_mid_line_is_still_captured_and_marked_incomplete() {
         "{:?}",
         upload.metadata
     );
+    // `Cancelled` is the one ending no code inside the handler can record, because the listener
+    // drops the whole future: it survives only as the initial value. Without this assertion a
+    // cancelled capture could carry any other reason and still pass on `complete` alone.
+    assert_eq!(
+        upload.metadata["end_reason"], "session_cancelled",
+        "{:?}",
+        upload.metadata
+    );
     assert_eq!(
         upload.metadata["complete"], false,
         "a capture handed over by a cancelled handler is a fragment: {:?}",
@@ -584,6 +592,10 @@ enum Ending {
     /// Abort with an RST (`SO_LINGER` 0), so the server's next read fails rather than reporting
     /// end-of-file.
     ResetConnection,
+    /// Terminate the payload's line and then type `exit`, the way a client that is done says so.
+    /// The second ending that must read as complete, and the only one that reaches the handler's
+    /// own `ClientLogout` arm rather than a read result inside `read_line`.
+    Logout,
 }
 
 /// Drive one binary-payload session to `ending` and return the upload event's metadata with the
@@ -632,6 +644,14 @@ async fn payload_session(bounds: ConnectionBounds, payload: &[u8], ending: Endin
             conn.set_linger(Some(Duration::ZERO)).unwrap();
             drop(conn);
             wait_for_spooled_file(&spool_dir).await;
+        }
+        Ending::Logout => {
+            // Close the binary line first, so the shell actually sees it and raises the flood
+            // flag through the production path, then ask to end the session. The capture
+            // therefore holds the payload plus these bytes - what matters here is the ending.
+            conn.write_all(b"\r\nexit\r\n").await.unwrap();
+            wait_for_spooled_file(&spool_dir).await;
+            drop(conn);
         }
     }
     handle.abort();
@@ -709,6 +729,28 @@ async fn a_payload_the_client_finished_sending_before_closing_is_recorded_as_com
         m.json["complete"], true,
         "the peer closed the connection itself: {:?}",
         m.json
+    );
+}
+
+/// The handler's own `exit` arm, which is a different exit path from the peer closing the socket:
+/// it is reached from the command loop rather than from a read result inside `read_line`, and it
+/// was the one remaining `complete: true` path with no capture test behind it. Without this, the
+/// line that records it could be deleted and only the RST/idle/budget tests would notice - all of
+/// which expect `false`, so "label everything incomplete" would still pass.
+#[tokio::test]
+async fn a_payload_followed_by_an_exit_command_is_recorded_as_a_client_logout() {
+    let payload = vec![0xAAu8; 256];
+    let m = payload_session(test_bounds(), &payload, Ending::Logout).await;
+
+    assert_eq!(m.json["end_reason"], "client_logout", "{:?}", m.json);
+    assert_eq!(
+        m.json["complete"], true,
+        "the client asked to end the session: {:?}",
+        m.json
+    );
+    assert!(
+        m.stored.starts_with(&payload),
+        "the payload the client sent is still the head of the capture"
     );
 }
 

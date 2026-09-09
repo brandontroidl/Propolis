@@ -36,6 +36,10 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> TestServer {
+        TestServer::start_with(test_bounds()).await
+    }
+
+    async fn start_with(bounds: ConnectionBounds) -> TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let spool_dir = dir.path().join("spool");
@@ -45,7 +49,7 @@ impl TestServer {
             log_path.clone(),
             spool_dir.clone(),
             wan_resolver,
-            test_bounds(),
+            bounds,
             "test".to_string(),
             dir.path().join("outbox"),
         )
@@ -276,6 +280,192 @@ async fn push_file_captured_to_spool() {
     srv.handle.abort();
 }
 
+/// Poll `spool_dir` for a capture rather than sleeping a fixed time: the hand-off worker runs off
+/// the connection's response path, so there is no synchronous point at which it is observably
+/// done. Returns false if nothing arrives, which is what the negative test asserts.
+async fn wait_for_spooled_file(spool_dir: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_dir(spool_dir)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// Drive one unterminated binary payload at an interactive `adb shell` stream and return the
+/// upload event plus the bytes that reached the spool. `close_stream` sends the client's own CLSE
+/// instead of leaving the session to end on its own, which is the difference between a transfer
+/// the peer finished and one that was cut off.
+async fn shell_payload_session(
+    bounds: ConnectionBounds,
+    payload: &[u8],
+    close_stream: bool,
+) -> (sensor_wire::SensorEvent, Vec<u8>) {
+    let srv = TestServer::start_with(bounds).await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let server_id = open_stream(&mut conn, 1, "shell:").await;
+    // The server sends its prompt as a WRTE once the interactive stream is open.
+    let (prompt, _) = read_message(&mut conn).await;
+    assert_eq!(prompt.command, adb_proto::A_WRTE);
+
+    conn.write_all(&adb_proto::build_wrte(1, server_id, payload))
+        .await
+        .unwrap();
+    let (ack, _) = read_message(&mut conn).await;
+    assert_eq!(ack.command, adb_proto::A_OKAY);
+
+    if close_stream {
+        conn.write_all(&adb_proto::build_clse(1, server_id))
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        wait_for_spooled_file(&srv.spool_dir).await,
+        "the shell payload must reach the spool however the session ended"
+    );
+    let spooled: Vec<_> = std::fs::read_dir(&srv.spool_dir).unwrap().collect();
+    assert_eq!(spooled.len(), 1, "exactly one capture per session");
+    let stored = std::fs::read(spooled[0].as_ref().unwrap().path()).unwrap();
+
+    let events = srv.events().await;
+    let upload = events
+        .into_iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .expect("the binary shell capture must be recorded");
+    drop(conn);
+    srv.handle.abort();
+    (upload, stored)
+}
+
+/// The gap this capture closes: a dropper that streams its payload over `adb shell` used to leave
+/// a flood event and no sample at all, while the same payload over telnet or SSH was kept. Nothing
+/// here tells the sensor the bytes are binary - the payload never completes a line, so the shell's
+/// per-line flood detector never fires and the raw bytes are the only evidence there is.
+#[tokio::test]
+async fn a_binary_payload_streamed_at_the_adb_shell_is_captured_as_malware_upload() {
+    let bounds = ConnectionBounds {
+        idle_timeout: Duration::from_millis(600),
+        ..test_bounds()
+    };
+    // Every byte high-bit set, so none is CR or LF: no line ever reaches the shell.
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80u8 | (i & 0x3f)).collect();
+    let (upload, stored) = shell_payload_session(bounds, &payload, false).await;
+
+    assert_eq!(stored, payload, "the stored bytes are what the client sent");
+    assert_eq!(
+        upload.metadata["capture_reason"], "binary_shell_payload",
+        "{:?}",
+        upload.metadata
+    );
+    assert_eq!(
+        upload.metadata["end_reason"], "idle_timeout",
+        "{:?}",
+        upload.metadata
+    );
+    assert_eq!(
+        upload.metadata["complete"], false,
+        "an idle timeout cut the transfer short: {:?}",
+        upload.metadata
+    );
+    assert_eq!(upload.metadata["size"], payload.len() as u64);
+    assert_eq!(upload.metadata["wire_size"], payload.len() as u64);
+    assert_eq!(upload.metadata["truncated"], false);
+    assert_eq!(
+        upload.sample.as_ref().unwrap().size,
+        payload.len() as u64,
+        "the sample the console reads points at the stored bytes"
+    );
+}
+
+/// The listener enforces `max_duration` by dropping the whole handler future, so nothing written
+/// after the message loop runs - and a dropper streaming a payload is exactly the long session
+/// that hits it. Only the capture's destructor still runs, which is why it submits from there.
+#[tokio::test]
+async fn a_binary_payload_is_still_captured_when_the_listener_cancels_the_session() {
+    let bounds = ConnectionBounds {
+        // Shorter than idle_timeout, so cancellation is what ends this session.
+        max_duration: Duration::from_secs(2),
+        idle_timeout: Duration::from_secs(20),
+        ..test_bounds()
+    };
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80u8 | (i & 0x3f)).collect();
+    let (upload, stored) = shell_payload_session(bounds, &payload, false).await;
+
+    assert_eq!(stored, payload);
+    assert_eq!(
+        upload.metadata["end_reason"], "session_cancelled",
+        "{:?}",
+        upload.metadata
+    );
+    assert_eq!(
+        upload.metadata["complete"], false,
+        "a capture handed over by a cancelled handler is a fragment: {:?}",
+        upload.metadata
+    );
+}
+
+/// The other side of the distinction, and the case that stops the rule from being "label
+/// everything incomplete": the client closed the stream itself, so what it streamed is what it
+/// meant to send.
+#[tokio::test]
+async fn a_binary_payload_whose_stream_the_client_closes_is_recorded_as_complete() {
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80u8 | (i & 0x3f)).collect();
+    let (upload, stored) = shell_payload_session(test_bounds(), &payload, true).await;
+
+    assert_eq!(stored, payload);
+    assert_eq!(
+        upload.metadata["end_reason"], "peer_closed",
+        "{:?}",
+        upload.metadata
+    );
+    assert_eq!(
+        upload.metadata["complete"], true,
+        "the client closed the stream itself: {:?}",
+        upload.metadata
+    );
+}
+
+/// An ordinary interactive session must never be spooled: the capture triggers on the bytes
+/// looking binary, and normal typed commands do not.
+#[tokio::test]
+async fn a_plaintext_adb_shell_session_is_never_captured() {
+    let srv = TestServer::start_with(ConnectionBounds {
+        idle_timeout: Duration::from_millis(600),
+        ..test_bounds()
+    })
+    .await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let server_id = open_stream(&mut conn, 1, "shell:").await;
+    let (prompt, _) = read_message(&mut conn).await;
+    assert_eq!(prompt.command, adb_proto::A_WRTE);
+
+    send_shell_line(&mut conn, 1, server_id, "uname -a").await;
+    send_shell_line(&mut conn, 1, server_id, "cat /proc/mounts").await;
+
+    assert!(
+        !wait_for_spooled_file(&srv.spool_dir).await,
+        "plain typed commands are not a payload and must not be spooled"
+    );
+    let events = srv.events().await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD),
+        "a plaintext session must produce no malware upload event"
+    );
+
+    drop(conn);
+    srv.handle.abort();
+}
+
 #[tokio::test]
 async fn pull_refused() {
     let srv = TestServer::start().await;
@@ -285,8 +475,8 @@ async fn pull_refused() {
 
     stream_recv_and_expect_fail(&mut conn, 1, server_id, "/data/local/tmp/secret_keys.db").await;
 
-    // No malware_download-shaped event exists in the wire contract for adb; the load-bearing
-    // property is simply that no file content is ever served back and the sensor stays up.
+    // No malware_download-shaped event exists in the wire contract for adb; what must hold is
+    // simply that no file content is ever served back and the sensor stays up.
     let mut probe = TcpStream::connect(srv.addr).await.unwrap();
     cnxn_handshake(&mut probe).await;
     srv.handle.abort();

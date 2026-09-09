@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -34,7 +34,7 @@ use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell};
 use sensor_framework::upload_metadata;
 use sensor_framework::{
-    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
+    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
@@ -92,12 +92,124 @@ struct Stream {
 
 enum StreamKind {
     /// Interactive `shell:` session: `FakeShell` plus a partial-line buffer for incremental
-    /// input. A one-shot `shell:<command>` never reaches this table at all - see
-    /// `handle_open`'s doc.
+    /// input, and the raw-byte capture of everything the client streamed at it. A one-shot
+    /// `shell:<command>` never reaches this table at all - see `handle_open`'s doc.
     /// Boxed: the shell owns a whole filesystem snapshot and dwarfs the sync variant.
-    Shell(Box<FakeShell>, Vec<u8>),
+    Shell(Box<FakeShell>, Vec<u8>, ShellCapture),
     /// `sync:` file-transfer sub-protocol session.
     Sync(SyncState),
+}
+
+/// How the session as a whole ended, shared between the reader that observes the ending and the
+/// per-stream shell captures that are dropped afterwards.
+///
+/// It has to be shared rather than owned by either: one connection can hold several shell
+/// streams, and on the ending that matters most - the listener dropping this handler's future at
+/// `max_duration` - no code runs at all, so `Cancelled` is simply what the captures still read.
+/// `read_message` collapses EOF, a timeout, a socket error, a malformed header and an exhausted
+/// budget into one `None`, and this is what keeps them apart on the way out.
+#[derive(Clone)]
+struct SessionEnd(Arc<Mutex<CaptureEnd>>);
+
+impl SessionEnd {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(CaptureEnd::Cancelled)))
+    }
+
+    /// Record the ending at the exit path that produced it. A poisoned lock is ignored rather
+    /// than panicked on: losing the reason degrades a capture's label, and taking the sensor
+    /// down over it would lose the capture itself.
+    fn set(&self, end: CaptureEnd) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = end;
+        }
+    }
+
+    fn get(&self) -> CaptureEnd {
+        self.0
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or(CaptureEnd::Cancelled)
+    }
+}
+
+/// The raw `shell:` stream bytes of one session, submitted from `Drop`.
+///
+/// The same reasoning as `sensor-ssh`'s guard of the same name: a dropper streaming a payload at
+/// `adb shell` is exactly the long session the listener cancels at `max_duration`, and a
+/// destructor is the only code that still runs then. Until this existed the ADB shell was the one
+/// remaining sensor where that dropper left a flood event and no sample.
+struct ShellCapture {
+    body: Vec<u8>,
+    /// Bytes the client sent, including any past the ceiling, so `wire_size` and `truncated` stay
+    /// honest about the stored copy being a prefix.
+    wire_bytes: u64,
+    /// Raised when the shared `FakeShell` flags a binary flood. A plaintext session is never
+    /// spooled - `Drop` falls back to inspecting the bytes, because a payload still mid-line when
+    /// the session ended never produced a complete line for the shell to flag.
+    binary_seen: bool,
+    max_bytes: u64,
+    /// Set when the peer closed THIS stream with a CLSE. A stream the peer closed itself is
+    /// finished whatever later becomes of the connection, so it beats the session-wide ending.
+    stream_end: Option<CaptureEnd>,
+    session_end: SessionEnd,
+    handoff: Arc<CaptureHandoff>,
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+}
+
+impl ShellCapture {
+    fn push(&mut self, data: &[u8]) {
+        self.wire_bytes += data.len() as u64;
+        let room = self.max_bytes.saturating_sub(self.body.len() as u64) as usize;
+        if room > 0 {
+            self.body.extend_from_slice(&data[..data.len().min(room)]);
+        }
+    }
+
+    fn flag_binary(&mut self) {
+        self.binary_seen = true;
+    }
+}
+
+impl Drop for ShellCapture {
+    fn drop(&mut self) {
+        if self.body.is_empty() {
+            return;
+        }
+        if !self.binary_seen && !sensor_framework::shell::looks_binary(&self.body) {
+            return;
+        }
+        let end = self.stream_end.unwrap_or_else(|| self.session_end.get());
+        let body = std::mem::take(&mut self.body);
+        let wire_size = self.wire_bytes;
+        let (source_ip, wan_ip, session_id) = (self.source_ip, self.wan_ip, self.session_id);
+        let _ = self.handoff.submit(CaptureJob {
+            body,
+            orig_name: format!("adb-shell-{session_id}"),
+            event_builder: Box::new(move |sample: SampleRef| SensorEvent {
+                v: WIRE_VERSION,
+                source_ip,
+                wan_ip,
+                sensor: PROTOCOL_LABEL.to_string(),
+                signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
+                protocol: PROTO_TCP.to_string(),
+                authenticated: false,
+                observed_at: chrono::Utc::now(),
+                metadata: {
+                    let mut m =
+                        upload_metadata(PROTOCOL_LABEL, &sample, wire_size, end.is_complete());
+                    m["capture_reason"] = serde_json::json!("binary_shell_payload");
+                    m["end_reason"] = serde_json::json!(end.label());
+                    m
+                },
+                sample: Some(sample),
+                session_id: Some(session_id),
+                occurrence_id: None,
+            }),
+        });
+    }
 }
 
 /// Which sync sub-message a `sync:` stream is midway through parsing, plus the reassembly
@@ -326,21 +438,28 @@ struct MessageReader {
     bounds: ConnectionBounds,
     first_read: bool,
     total_captured: u64,
+    /// Where each of the endings below is recorded, so a shell capture dropped afterwards can
+    /// tell an exhausted budget from the peer hanging up. Every `None` this reader returns used
+    /// to mean only "end the session".
+    session_end: SessionEnd,
 }
 
 impl MessageReader {
-    fn new(bounds: ConnectionBounds) -> Self {
+    fn new(bounds: ConnectionBounds, session_end: SessionEnd) -> Self {
         Self {
             bounds,
             first_read: true,
             total_captured: 0,
+            session_end,
         }
     }
 
     /// Read exactly `n` bytes, or `None` on EOF, a read error, a timeout, or the session's
-    /// `max_captured_bytes` budget being exhausted.
+    /// `max_captured_bytes` budget being exhausted - each recorded on `session_end` before
+    /// returning, because the caller cannot tell them apart from the `None` alone.
     async fn read_exact_bounded(&mut self, stream: &mut TcpStream, n: usize) -> Option<Vec<u8>> {
         if self.total_captured.saturating_add(n as u64) > self.bounds.max_captured_bytes {
+            self.session_end.set(CaptureEnd::CaptureBudget);
             return None;
         }
         let timeout = if self.first_read {
@@ -356,7 +475,23 @@ impl MessageReader {
                 self.total_captured += n as u64;
                 Some(buf)
             }
-            _ => None,
+            // Three different endings. `read_exact` on a socket the peer closed reports
+            // `UnexpectedEof`, which is the peer finishing rather than anything going wrong; an
+            // elapsed timeout is the client going quiet mid-transfer; anything else is the socket
+            // failing under a transfer that was still open.
+            Ok(Err(e)) => {
+                self.session_end
+                    .set(if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        CaptureEnd::PeerClosed
+                    } else {
+                        CaptureEnd::TransportError
+                    });
+                None
+            }
+            Err(_) => {
+                self.session_end.set(CaptureEnd::IdleTimeout);
+                None
+            }
         }
     }
 
@@ -368,8 +503,14 @@ impl MessageReader {
         let header_bytes = self
             .read_exact_bounded(stream, adb_proto::HEADER_LEN)
             .await?;
-        let header = Header::parse(&header_bytes)?;
+        let Some(header) = Header::parse(&header_bytes) else {
+            // A header this transport cannot parse is the peer sending garbage, not a socket
+            // fault and not the peer finishing.
+            self.session_end.set(CaptureEnd::MalformedInput);
+            return None;
+        };
         if header.data_length > adb_proto::MAX_MESSAGE_DATA_LEN {
+            self.session_end.set(CaptureEnd::MalformedInput);
             return None;
         }
         let data = if header.data_length == 0 {
@@ -415,13 +556,16 @@ pub async fn handle_connection(
         tracing::error!(%peer_addr, "adb: failed to append connection event");
     }
 
-    let mut reader = MessageReader::new(bounds);
+    let session_end = SessionEnd::new();
+    let max_captured_bytes = bounds.max_captured_bytes;
+    let mut reader = MessageReader::new(bounds, session_end.clone());
 
     // ---- CNXN handshake ----
     let Some((header, _data)) = reader.read_message(&mut stream).await else {
         return;
     };
     if header.command != adb_proto::A_CNXN {
+        session_end.set(CaptureEnd::MalformedInput);
         return; // not a well-formed ADB session opener
     }
     if stream
@@ -429,6 +573,7 @@ pub async fn handle_connection(
         .await
         .is_err()
     {
+        session_end.set(CaptureEnd::TransportError);
         return;
     }
 
@@ -456,10 +601,15 @@ pub async fn handle_connection(
                     &emitter,
                     &handoff,
                     peer_addr,
+                    &session_end,
+                    max_captured_bytes,
                 )
                 .await
                 .is_err()
                 {
+                    // The only way these return `Err` is a response that could not be written,
+                    // which cut the session with a transfer possibly still arriving.
+                    session_end.set(CaptureEnd::TransportError);
                     return;
                 }
             }
@@ -476,6 +626,7 @@ pub async fn handle_connection(
                 .await
                 .is_err()
                 {
+                    session_end.set(CaptureEnd::TransportError);
                     return;
                 }
             }
@@ -487,7 +638,13 @@ pub async fn handle_connection(
                 let server_id = header.arg1;
                 // Removing a sync stream drops its state, which submits a SEND closed
                 // mid-way as an incomplete capture.
-                if let Some(s) = streams.remove(&server_id) {
+                if let Some(mut s) = streams.remove(&server_id) {
+                    // The peer closed this stream itself, so whatever it streamed at the shell is
+                    // whatever it meant to send - regardless of how the connection later ends.
+                    // Recorded before the remove's value is dropped, which is what submits it.
+                    if let StreamKind::Shell(_, _, capture) = &mut s.kind {
+                        capture.stream_end = Some(CaptureEnd::PeerClosed);
+                    }
                     let _ = stream
                         .write_all(&adb_proto::build_clse(server_id, s.client_local_id))
                         .await;
@@ -498,6 +655,7 @@ pub async fn handle_connection(
             _ => {
                 // A second CNXN mid-session, or any other/unknown command: not well-formed ADB
                 // from this point on. Ending the session is simpler and safer than guessing.
+                session_end.set(CaptureEnd::MalformedInput);
                 return;
             }
         }
@@ -522,6 +680,8 @@ async fn handle_open(
     emitter: &Arc<EventEmitter>,
     handoff: &Arc<CaptureHandoff>,
     peer_addr: SocketAddr,
+    session_end: &SessionEnd,
+    max_captured_bytes: u64,
 ) -> Result<(), ()> {
     let client_local_id = header.arg0;
     if client_local_id == 0 {
@@ -590,7 +750,22 @@ async fn handle_open(
                         server_id,
                         Stream {
                             client_local_id,
-                            kind: StreamKind::Shell(Box::new(shell), Vec::new()),
+                            kind: StreamKind::Shell(
+                                Box::new(shell),
+                                Vec::new(),
+                                ShellCapture {
+                                    body: Vec::new(),
+                                    wire_bytes: 0,
+                                    binary_seen: false,
+                                    max_bytes: max_captured_bytes,
+                                    stream_end: None,
+                                    session_end: session_end.clone(),
+                                    handoff: handoff.clone(),
+                                    source_ip,
+                                    wan_ip,
+                                    session_id,
+                                },
+                            ),
                         },
                     );
                 }
@@ -645,7 +820,10 @@ async fn handle_wrte(
     let client_local_id = entry.client_local_id;
 
     match &mut entry.kind {
-        StreamKind::Shell(shell, line_buf) => {
+        StreamKind::Shell(shell, line_buf, capture) => {
+            // Raw bytes first, before any line framing: a payload streamed with no newline never
+            // becomes a line, and that is exactly the dropper this capture exists for.
+            capture.push(data);
             let mut responses = Vec::new();
             for &byte in data {
                 if byte == b'\n' || byte == b'\r' {
@@ -654,6 +832,11 @@ async fn handle_wrte(
                         line_buf.clear();
                         let (output, events) = shell.handle_input(&line);
                         for event in &events {
+                            if event.metadata.get("flood").and_then(|v| v.as_str())
+                                == Some("binary")
+                            {
+                                capture.flag_binary();
+                            }
                             if emitter.append(event).await.is_err() {
                                 tracing::error!(%peer_addr, "adb: failed to append command event");
                             }
@@ -669,6 +852,11 @@ async fn handle_wrte(
                         line_buf.clear();
                         let (_output, events) = shell.handle_input(&line);
                         for event in &events {
+                            if event.metadata.get("flood").and_then(|v| v.as_str())
+                                == Some("binary")
+                            {
+                                capture.flag_binary();
+                            }
                             if emitter.append(event).await.is_err() {
                                 tracing::error!(%peer_addr, "adb: failed to append command event");
                             }

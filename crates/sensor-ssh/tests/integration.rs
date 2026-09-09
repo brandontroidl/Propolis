@@ -327,6 +327,14 @@ async fn a_payload_cut_off_mid_line_is_still_captured_and_marked_incomplete() {
         "a capture handed over by a cancelled handler is a fragment: {:?}",
         event.metadata
     );
+    // `Cancelled` is the one ending no code in the handler can record - the listener drops the
+    // whole future - so it survives only as the initial value. Asserting `complete` alone would
+    // pass for any of the other cut-short reasons too.
+    assert_eq!(
+        event.metadata["end_reason"], "session_cancelled",
+        "{:?}",
+        event.metadata
+    );
     assert_eq!(event.metadata["size"], payload.len() as u64);
     assert_eq!(event.metadata["wire_size"], payload.len() as u64);
     assert_eq!(event.metadata["truncated"], false);
@@ -344,6 +352,14 @@ enum Ending {
     GoQuiet,
     /// Send SSH_MSG_DISCONNECT. The peer finished and said so.
     Disconnect,
+    /// Drop the TCP connection cleanly, with no DISCONNECT first. The server's next packet read
+    /// reports end-of-file, which `classify_read_failure` must read as the peer finishing - the
+    /// second ending that has to stay `complete`, and one no production-path test covered.
+    CloseSocket,
+    /// Abort the TCP connection with an RST (`SO_LINGER` 0). The server's next read fails with a
+    /// reset instead of end-of-file, which is a cut-short transfer, not a finished one. These two
+    /// endings differ by one socket option and by nothing the handler can otherwise see.
+    ResetConnection,
 }
 
 /// Drive one unterminated binary payload to `ending` and return the upload event. Every caller
@@ -375,8 +391,19 @@ async fn payload_session(
     .await
     .unwrap();
 
+    // Own the socket rather than letting russh dial, so the two socket-level endings below can
+    // choose between a FIN and an RST. `SO_LINGER` has to be set before the connection is handed
+    // over, since russh takes the stream by value.
+    let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    if let Ending::ResetConnection = ending {
+        // Zero linger makes close send RST rather than FIN, so the server sees a read error
+        // instead of end-of-file. Deprecated because a NON-zero linger blocks the closing thread;
+        // zero is the opposite case and is exactly what this ending needs.
+        #[allow(deprecated)]
+        socket.set_linger(Some(Duration::ZERO)).unwrap();
+    }
     let config = Arc::new(russh::client::Config::default());
-    let mut session = russh::client::connect(config, addr, TestHandler)
+    let mut session = russh::client::connect_stream(config, socket, TestHandler)
         .await
         .unwrap();
     session
@@ -388,17 +415,25 @@ async fn payload_session(
     tokio::time::sleep(Duration::from_millis(200)).await;
     channel.data(payload).await.unwrap();
 
-    if let Ending::Disconnect = ending {
-        session
-            .disconnect(russh::Disconnect::ByApplication, "", "")
-            .await
-            .unwrap();
+    match ending {
+        Ending::Disconnect => {
+            session
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await
+                .unwrap();
+        }
+        Ending::CloseSocket | Ending::ResetConnection => {
+            // Tear the connection down before waiting for the capture: the ending IS the trigger
+            // here, so polling first would just wait out the idle timeout and record that reason
+            // instead of the one under test.
+            drop(channel);
+            drop(session);
+        }
+        Ending::GoQuiet => {}
     }
     let event = poll_for_malware_upload_within(&log_path, Duration::from_secs(8))
         .await
         .expect("the binary capture must be recorded whatever ended the session");
-    drop(channel);
-    drop(session);
     handle.abort();
     event
 }
@@ -438,6 +473,48 @@ async fn a_payload_the_client_finished_sending_before_disconnecting_is_recorded_
     assert_eq!(
         event.metadata["complete"], true,
         "the client disconnected of its own accord: {:?}",
+        event.metadata
+    );
+}
+
+/// A client that just closes the socket never sends DISCONNECT, so the ending is decided inside
+/// `classify_read_failure` rather than by a message the handler can match on. End-of-file means
+/// the peer stopped of its own accord, so this has to stay complete - and it is the case an RST is
+/// easiest to confuse with, since both simply end the packet loop.
+#[tokio::test]
+async fn a_payload_whose_client_closes_the_socket_is_recorded_as_peer_closed() {
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80u8 | (i & 0x3f)).collect();
+    let event = payload_session(Duration::from_secs(60), &payload, Ending::CloseSocket).await;
+
+    assert_eq!(
+        event.metadata["end_reason"], "peer_closed",
+        "{:?}",
+        event.metadata
+    );
+    assert_eq!(
+        event.metadata["complete"], true,
+        "the peer closed the connection itself: {:?}",
+        event.metadata
+    );
+}
+
+/// The same teardown one socket option apart: an RST makes the server's read fail rather than
+/// report end-of-file, so the transfer was still open. Until this test, no SSH test drove a real
+/// read FAILURE through the production path at all - `classify_read_failure` was covered only by
+/// unit tests calling it directly, which cannot show it is reached.
+#[tokio::test]
+async fn a_payload_ended_by_a_connection_reset_is_recorded_as_a_transport_failure() {
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80u8 | (i & 0x3f)).collect();
+    let event = payload_session(Duration::from_secs(60), &payload, Ending::ResetConnection).await;
+
+    assert_eq!(
+        event.metadata["complete"], false,
+        "a reset connection left the transfer open: {:?}",
+        event.metadata
+    );
+    assert_eq!(
+        event.metadata["end_reason"], "transport_error",
+        "an RST is a socket failure, not the peer finishing: {:?}",
         event.metadata
     );
 }

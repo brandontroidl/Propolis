@@ -129,7 +129,7 @@
         <td class="mono">{{ m.host }}{% if m.pinned_ip and m.pinned_ip != m.host %} <span class="dim">({{ m.pinned_ip }})</span>{% endif %}</td>
         <td class="mono">{% if m.bytes %}{{ m.bytes }}{% else %}<span class="dim">-</span>{% endif %}</td>
         <td class="mono">{% if m.sha256_short %}<span title="{{ m.sha256 }}">{{ m.sha256_short }}...</span>{% else %}<span class="dim">-</span>{% endif %}</td>
-        <td>{{ m.status }}</td>
+        <td>{{ m.status }}{% if m.end_reason %} <span class="dim">({{ m.end_reason }})</span>{% endif %}</td>
         <td>
           {% if m.detected is defined and m.detected is not none %}
             {% if m.detected > 0 %}

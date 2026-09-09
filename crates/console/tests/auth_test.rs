@@ -38,6 +38,8 @@ fn test_state(db: PgPool) -> AppState {
         geoip: Arc::new(geoip::GeoIp::disabled()),
         rdns: Arc::new(console::rdns::RdnsResolver::disabled()),
         feed_output_dir: None,
+        fleet_listeners: Arc::new(Vec::new()),
+        deploy_stamp_path: None,
         startup_time: chrono::Utc::now(),
         version: "test",
         log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),

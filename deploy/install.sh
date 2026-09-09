@@ -22,10 +22,14 @@
 #   - create, seed, or migrate the PostgreSQL database. The propolis binary runs its own migrations
 #     (core-scoring + review) at startup once DATABASE_URL is reachable; provisioning the database
 #     server itself is an independent operator/DBA action.
-#   - create or edit any /etc/propolis/*.env file. Each one carries secrets (a database URL, the
-#     console password, vendor API keys) this script has no business fabricating or touching -
-#     internal/design/07-runtime-coordination-deployment.md's "Unified configuration" documents the
-#     full variable set the operator must populate by hand.
+#   - create or edit any OPERATOR-owned /etc/propolis/*.env file. Each one carries secrets (a
+#     database URL, the console password, vendor API keys) this script has no business fabricating
+#     or touching - internal/design/07-runtime-coordination-deployment.md's "Unified configuration"
+#     documents the full variable set the operator must populate by hand. The one exception is
+#     /etc/propolis/fleet-listeners.env, which is written wholly by deploy/fleet-listeners.sh in
+#     step 7: it is generated, carries no secret, and is a derived copy of values the operator
+#     already set elsewhere (see that script's header for why it is derived rather than
+#     hand-maintained).
 #   - programmatically create the quarantine-spool noexec,nosuid,nodev mounts. Sizing and backing a
 #     real mount (tmpfs budget vs. a dedicated partition) is a host-specific decision no generic
 #     script can make safely - see step 3 below, which creates the directories and prints the
@@ -79,8 +83,8 @@ fi
 # ---- 1, 2 & 3. users, directories, and spool mountpoints (provisioning: see deploy/provision.sh) ----
 
 # Shared with upgrade.sh so both entry points provision users/dirs through one idempotent routine
-# - see provision.sh's own header for why. Prints its own "1/7 creating OS users" /
-# "2/7 creating directories" / "3/7 creating spool directories" progress lines (verbatim from this
+# - see provision.sh's own header for why. Prints its own "1/8 creating OS users" /
+# "2/8 creating directories" / "3/8 creating spool directories" progress lines (verbatim from this
 # script's former inline blocks), so nothing further is logged here.
 run_provision() { DRY_RUN="$DRY_RUN" "$SCRIPT_DIR/provision.sh"; }
 run_provision
@@ -112,7 +116,7 @@ EOF
 
 # ---- 4. binaries ----
 
-log "4/7 installing binaries to /usr/local/bin"
+log "4/8 installing binaries to /usr/local/bin"
 for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-cred; do
     src="$BUILD_DIR/$bin"
     dst="/usr/local/bin/$bin"
@@ -129,19 +133,29 @@ done
 
 # ---- 5. systemd units ----
 
-log "5/7 installing systemd units"
+log "5/8 installing systemd units"
 for unit in propolis.service sensor-catchall.service sensor-ssh.service sensor-telnet.service sensor-redis.service sensor-adb.service sensor-http.service sensor-ftp.service sensor-smtp.service sensor-cred.service; do
     run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
 
 # ---- 6. logrotate config ----
 
-log "6/7 installing logrotate config"
+log "6/8 installing logrotate config"
 run install -m 0644 "$SCRIPT_DIR/logrotate-sensors.conf" /etc/logrotate.d/propolis-sensors
 
-# ---- 7. reload systemd ----
+# ---- 7. fleet listener inventory ----
 
-log "7/7 reloading systemd unit files"
+# Derived from the sensors' own bind variables rather than hand-maintained; see
+# fleet-listeners.sh's header for why. On a FRESH install the operator has not populated any
+# sensor env file yet, so this normally writes a header-only file and the fleet pane reports
+# every check as unknown until upgrade.sh (or this script, re-run) regenerates it. That is the
+# truth at that moment, not a defect.
+log "7/8 deriving the fleet listener inventory"
+run "$SCRIPT_DIR/fleet-listeners.sh"
+
+# ---- 8. reload systemd ----
+
+log "8/8 reloading systemd unit files"
 run systemctl daemon-reload
 
 if [ "$DRY_RUN" -eq 1 ]; then

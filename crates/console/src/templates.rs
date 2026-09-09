@@ -51,6 +51,8 @@ const SEARCH_HTML: &str = include_str!("templates/search.html");
 const SEARCH_EVENTS_ROWS_HTML: &str = include_str!("templates/search_events_rows.html");
 const SEARCH_EVENTS_FRAGMENT_HTML: &str = include_str!("templates/search_events_fragment.html");
 const LOGS_HTML: &str = include_str!("templates/logs.html");
+const FLEET_HTML: &str = include_str!("templates/fleet.html");
+const FLEET_STATUS_FRAGMENT_HTML: &str = include_str!("templates/fleet_status_fragment.html");
 const MACROS_HTML: &str = include_str!("templates/macros.html");
 
 /// Builds the environment once at startup (`AppState::templates`); cheap to construct (five small
@@ -112,6 +114,13 @@ pub fn environment() -> Environment<'static> {
     // Console-forensics task 7: live system log viewer (`routes::logs`).
     env.add_template("logs.html", LOGS_HTML)
         .expect("logs.html must be a valid template");
+    // The fleet pane (`routes::fleet`), same full-page/fragment split as the pairs above: the
+    // fragment is what `/fleet/status` renders on the 30-second refresh and what `fleet.html`
+    // includes on first load.
+    env.add_template("fleet.html", FLEET_HTML)
+        .expect("fleet.html must be a valid template");
+    env.add_template("fleet_status_fragment.html", FLEET_STATUS_FRAGMENT_HTML)
+        .expect("fleet_status_fragment.html must be a valid template");
     env.add_template("ips.html", IPS_HTML)
         .expect("ips.html must be a valid template");
     env.add_template("integrity.html", INTEGRITY_HTML)

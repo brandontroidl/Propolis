@@ -59,6 +59,10 @@ After=network.target postgresql.service
 Type=simple
 User=propolis-console
 Group=propolis-console
+# The generated fleet listener inventory, same contract as propolis.service: optional, loaded
+# first so an explicit operator setting in console.env still wins. This binary is a viewer of the
+# inventory; it never probes it.
+EnvironmentFile=-/etc/propolis/fleet-listeners.env
 EnvironmentFile=/etc/propolis/console.env
 ExecStart=/usr/local/bin/console
 Restart=always

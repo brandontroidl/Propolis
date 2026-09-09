@@ -139,6 +139,15 @@ pub struct PropolisConfig {
     pub fetch_own_ips: Vec<IpAddr>,
     // Operational self-alerting, read by the ops-monitor spawned in main.rs.
     pub ops_alert: crate::ops_alert::OpsAlertConfig,
+    // Fleet health (the console's `/fleet` pane).
+    /// The listener inventory this control plane believes exists (`PROPOLIS_FLEET_LISTENERS`,
+    /// written by `deploy/fleet-listeners.sh` from the sensors' own bind variables). Empty when
+    /// unconfigured; a value that is present but malformed is a startup error, never a shortened
+    /// list.
+    pub fleet_listeners: Vec<fleet::Listener>,
+    /// Path to the deploy stamp (`PROPOLIS_FLEET_DEPLOY_STAMP`). `None` leaves the fleet pane's
+    /// version panel reading "not recorded".
+    pub fleet_deploy_stamp: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -149,6 +158,9 @@ pub enum ConfigError {
         value: String,
         reason: &'static str,
     },
+    /// `PROPOLIS_FLEET_LISTENERS` was set and does not parse. Carried as its own variant rather
+    /// than folded into `Invalid` so the operator sees WHICH entry is wrong and why.
+    FleetInventory(fleet::InventoryError),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -162,6 +174,7 @@ impl std::fmt::Display for ConfigError {
             } => {
                 write!(f, "{field}: {reason}, got {value:?}")
             }
+            ConfigError::FleetInventory(e) => write!(f, "PROPOLIS_FLEET_LISTENERS: {e}"),
         }
     }
 }
@@ -586,6 +599,14 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         &env::var("PROPOLIS_FETCH_OWN_IPS").unwrap_or_default(),
     )?;
 
+    let fleet_listeners =
+        fleet::parse_listeners_env(env::var("PROPOLIS_FLEET_LISTENERS").ok().as_deref())
+            .map_err(ConfigError::FleetInventory)?;
+    let fleet_deploy_stamp = env::var("PROPOLIS_FLEET_DEPLOY_STAMP")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
     Ok(PropolisConfig {
         database_url,
         db_max_connections,
@@ -633,6 +654,8 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         ops_alert: crate::ops_alert::config::parse_ops_alert(&|k| {
             std::env::var(k).ok().filter(|s| !s.is_empty())
         })?,
+        fleet_listeners,
+        fleet_deploy_stamp,
     })
 }
 

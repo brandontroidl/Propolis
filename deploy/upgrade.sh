@@ -41,6 +41,12 @@ done
 echo "==> ensuring dirs and users (provision.sh, idempotent)"
 "$SCRIPT_DIR/provision.sh"
 
+# Before the restarts, because the units read this file at start. Derived from the sensors' own
+# bind variables rather than hand-maintained in propolis.env, so the fleet pane describes the
+# listeners this box actually runs; see fleet-listeners.sh's header.
+echo "==> deriving the fleet listener inventory"
+"$SCRIPT_DIR/fleet-listeners.sh"
+
 # Unit files and the logrotate policy are deliverables of a release just like the binaries: a
 # hardening directive, a new ReadWritePaths grant, or a changed ExecStart merged to main never
 # reached a box that was only ever upgraded, because this script used to reinstall binaries and

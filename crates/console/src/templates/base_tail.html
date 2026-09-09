@@ -67,8 +67,10 @@ document.addEventListener('htmx:afterSettle', function (e) { propolisInitCharts(
 <a href="/feed"{% if active_nav == "feed" %} class="active" aria-current="page"{% endif %}>Feed</a>
 <a href="/search/events"{% if active_nav == "search" %} class="active" aria-current="page"{% endif %}>Search</a>
 <div class="menu" id="opsmenu">
-<button class="navlike{% if active_nav == "logs" or active_nav == "samples" or active_nav == "integrity" %} active{% endif %}" id="opsbtn" aria-haspopup="true" aria-expanded="false" aria-controls="opslist">Operations <span aria-hidden="true">&#9662;</span></button>
+<button class="navlike{% if active_nav == "fleet" or active_nav == "logs" or active_nav == "samples" or active_nav == "integrity" %} active{% endif %}" id="opsbtn" aria-haspopup="true" aria-expanded="false" aria-controls="opslist">Operations <span aria-hidden="true">&#9662;</span></button>
 <div class="menu-list" id="opslist" role="menu" aria-labelledby="opsbtn" hidden>
+{# First in the menu because "is anything broken" comes before reading logs to find out why. #}
+<a href="/fleet" role="menuitem"{% if active_nav == "fleet" %} aria-current="page"{% endif %}>Fleet <span class="hint">listeners</span></a>
 <a href="/logs" role="menuitem"{% if active_nav == "logs" %} aria-current="page"{% endif %}>Logs <span class="hint">live tail</span></a>
 <a href="/samples" role="menuitem"{% if active_nav == "samples" %} aria-current="page"{% endif %}>Samples <span class="hint">malware</span></a>
 <a href="/integrity" role="menuitem"{% if active_nav == "integrity" %} aria-current="page"{% endif %}>Integrity <span class="hint">chain</span></a>

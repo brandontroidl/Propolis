@@ -432,6 +432,8 @@ struct ConsoleRuntime {
     rdns_enabled: bool,
     trusted_proxy: bool,
     metrics_token: Option<String>,
+    fleet_listeners: Arc<Vec<fleet::Listener>>,
+    deploy_stamp_path: Option<PathBuf>,
     log_buffer: Arc<LogBuffer>,
     events_ingested: Arc<std::sync::atomic::AtomicU64>,
     events_rejected: Arc<std::sync::atomic::AtomicU64>,
@@ -451,6 +453,8 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         rdns_enabled,
         trusted_proxy,
         metrics_token,
+        fleet_listeners,
+        deploy_stamp_path,
         log_buffer,
         events_ingested,
         events_rejected,
@@ -493,6 +497,8 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         geoip,
         rdns: Arc::new(console::rdns::RdnsResolver::new(rdns_enabled)),
         feed_output_dir,
+        fleet_listeners,
+        deploy_stamp_path,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
         log_buffer,
@@ -645,7 +651,7 @@ async fn main() {
         }
     };
 
-    // 3. Run migrations (core-scoring + review).
+    // 3. Run migrations (core-scoring + review + fleet), each under its own bookkeeping table.
     if let Err(e) = sqlx::migrate!("../core-scoring/migrations")
         .run(&pool)
         .await
@@ -655,6 +661,10 @@ async fn main() {
     }
     if let Err(e) = review::migrator().run(&pool).await {
         tracing::error!(error = %e, "propolis: review migrations failed");
+        std::process::exit(1);
+    }
+    if let Err(e) = fleet::migrator().run(&pool).await {
+        tracing::error!(error = %e, "propolis: fleet migrations failed");
         std::process::exit(1);
     }
 
@@ -1081,6 +1091,8 @@ async fn main() {
         let rdns_enabled = config.console_rdns_enabled;
         let console_trusted_proxy = config.console_trusted_proxy;
         let console_metrics_token = config.console_metrics_token.clone();
+        let console_fleet_listeners = Arc::new(config.fleet_listeners.clone());
+        let console_deploy_stamp = config.fleet_deploy_stamp.clone();
         let log_buffer = log_buffer.clone();
         let ing = events_ingested.clone();
         let rej = events_rejected.clone();
@@ -1099,6 +1111,8 @@ async fn main() {
                 let ing = ing.clone();
                 let rej = rej.clone();
                 let console_metrics_token = console_metrics_token.clone();
+                let fleet_listeners = console_fleet_listeners.clone();
+                let deploy_stamp_path = console_deploy_stamp.clone();
                 let supervisor = console_supervisor.clone();
                 async move {
                     run_console(
@@ -1112,6 +1126,8 @@ async fn main() {
                             rdns_enabled,
                             trusted_proxy: console_trusted_proxy,
                             metrics_token: console_metrics_token,
+                            fleet_listeners,
+                            deploy_stamp_path,
                             log_buffer,
                             events_ingested: ing,
                             events_rejected: rej,

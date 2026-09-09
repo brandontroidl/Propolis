@@ -182,6 +182,37 @@ The console serves plain HTTP on a loopback `TcpListener`; there is no in-proces
 TLS. Any TLS is operator-provided (e.g. a reverse proxy) [inferred]. See
 [networking and TLS](../operations/networking-tls.md).
 
+### Fleet health (the console's `/fleet` pane)
+
+Read by BOTH the unified daemon and the standalone `console` binary: the daemon
+renders the pane through its embedded console, and the standalone binary is a
+viewer of the same data.
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_FLEET_LISTENERS` | no | none (empty inventory) | comma-separated `collector/sensor/protocol/port` entries, e.g. `local/ssh/tcp/22,local/catchall/udp/1024`. Unset or blank means "this node was told no inventory": the pane then reports every check as unknown rather than reporting nothing at all. A value that IS set and malformed aborts startup - never a silently shortened list. `protocol` is `tcp` or `udp`; `port` is 1-65535. |
+| `PROPOLIS_FLEET_DEPLOY_STAMP` | no | none | path to the deploy stamp JSON. A missing, unreadable, or malformed file leaves the version panel reading `not recorded`, never `current`. |
+
+`sensor` is the sensor's OWN reported name, which is what lands in
+`event.sensor` - not the `PROPOLIS_SENSOR_LOGS` label. `sensor-cred` reports its
+five protocols individually, so its names are `vnc`, `mysql`, `mssql`,
+`postgresql` and `mongodb` while its conventional log labels are `cred-vnc` and
+so on. An inventory keyed on the log label would join to nothing.
+
+Do not hand-maintain `PROPOLIS_FLEET_LISTENERS`: it is a second copy of the
+binds that already live in each sensor's own env file, and a hand-kept copy
+drifts invisibly. `deploy/fleet-listeners.sh` derives it from those files and
+writes `/etc/propolis/fleet-listeners.env`, which `propolis.service` and
+`console.service` load BEFORE their operator-owned env file (so an explicit
+operator setting still wins). `deploy/install.sh` and `deploy/upgrade.sh` run
+the generator, so drift is possible only between deploys - and a sensor
+producing events while absent from the inventory shows on the pane as
+`undeclared listener`, which is what catches that window.
+
+`PROPOLIS_FLEET_COLLECTOR_ID` (default `local`) is read by
+`deploy/fleet-listeners.sh` itself, not by any binary: it stamps the collector
+id onto each generated entry.
+
 ### VirusTotal (unified daemon only)
 
 Opt-in egress, default off. See [integrations](integrations.md) and

@@ -111,6 +111,12 @@ After=network.target postgresql.service
 Type=simple
 User=propolis
 Group=propolis
+# The generated fleet listener inventory (deploy/fleet-listeners.sh), loaded FIRST and marked
+# optional with the leading "-": it is derived from the sensors' own env files at deploy time, and
+# loading it before propolis.env means an operator who sets PROPOLIS_FLEET_LISTENERS by hand still
+# wins. systemd reads both files as root before the sandbox applies, so the unit's own
+# User=/ProtectSystem= settings do not gate the read.
+EnvironmentFile=-/etc/propolis/fleet-listeners.env
 EnvironmentFile=/etc/propolis/propolis.env
 ExecStart=/usr/local/bin/propolis
 # Unlike the retired units' Restart=always: this daemon's own supervisor (crates/propolis/src/

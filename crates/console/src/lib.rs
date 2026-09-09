@@ -67,6 +67,16 @@ pub struct AppState {
     /// console and the `feed` binary are independently deployed services that share this
     /// directory by convention, not a required dependency (`routes::feed`'s own doc comment).
     pub feed_output_dir: Option<PathBuf>,
+    /// The listener inventory this control plane believes exists, from `PROPOLIS_FLEET_LISTENERS`
+    /// (derived at deploy time from the sensors' own bind variables by
+    /// `deploy/fleet-listeners.sh`). Empty when unconfigured, which makes `routes::fleet` report
+    /// every check as unknown rather than reporting nothing at all: a page with no rows would be
+    /// indistinguishable from a fleet with nothing wrong.
+    pub fleet_listeners: Arc<Vec<fleet::Listener>>,
+    /// Path to the deploy stamp (`PROPOLIS_FLEET_DEPLOY_STAMP`), written by `deploy/upgrade.sh`.
+    /// `None`, a missing file, or a malformed one all leave the fleet pane's version panel reading
+    /// "not recorded", never "current".
+    pub deploy_stamp_path: Option<PathBuf>,
     /// Process start time, stamped once when the constructing binary builds `AppState`
     /// (`console::main` for the standalone binary, `propolis::run_console` for the unified
     /// daemon) - `routes::context::base_context` derives every page's displayed uptime from this

@@ -28,8 +28,10 @@
   </div>
   <div class="cell">
     <span class="label">Last event</span>
-    <div class="v {% if pipeline_fresh %}v--ok{% else %}v--call{% endif %}" style="font-size:1.25rem">{{ last_event_ago }}</div>
-    <div class="foot">{% if pipeline_fresh %}intake live{% else %}check sensors{% endif %}</div>
+    {# Fleet-wide by construction: one busy sensor masks every silent one. The link goes to the
+       per-listener breakdown, which is where "check sensors" can actually be acted on. #}
+    <div class="v {% if pipeline_fresh %}v--ok{% else %}v--call{% endif %}" style="font-size:1.25rem"><a href="/fleet">{{ last_event_ago }}</a></div>
+    <div class="foot">{% if pipeline_fresh %}intake live &middot; <a href="/fleet">per listener</a>{% else %}<a href="/fleet">check sensors</a>{% endif %}</div>
   </div>
 </div>
 

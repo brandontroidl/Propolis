@@ -62,6 +62,7 @@ mod tests {
             .await
             .unwrap();
         review::migrator().run(pool).await.unwrap();
+        fleet::migrator().run(pool).await.unwrap();
     }
 
     async fn insert_pending(pool: &PgPool, ip: &str) {

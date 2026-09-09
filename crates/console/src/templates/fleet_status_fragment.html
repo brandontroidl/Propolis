@@ -1,0 +1,156 @@
+{# The whole fleet reading. Rendered standalone by GET /fleet/status for the 30-second refresh and
+   {% include %}-ed by fleet.html on first load, so the two can never drift into two different
+   markups for the same data.
+
+   The degraded banner lives HERE rather than in base.html's chrome: a panel that starts failing
+   after the page loaded must show up on the next refresh, not stay hidden until someone reloads. #}
+{% if degraded_panels %}
+<div class="degraded" role="status">Some panels could not be loaded and show placeholders: {{ degraded_panels|join(", ") }}. The cause is in the server log.</div>
+{% endif %}
+
+<div class="band">
+  <div class="cell{% if summary.alarm > 0 %} cell--alarm{% endif %}">
+    <span class="label">Listeners proven</span>
+    <div class="v {% if summary.proven == summary.total and summary.total > 0 %}v--ok{% elif summary.alarm > 0 %}v--alarm{% endif %}">{{ summary.proven }}<small>/ {{ summary.total }}</small></div>
+    <div class="foot">{{ summary.headline }}</div>
+  </div>
+  <div class="cell{% if summary.alarm > 0 %} cell--alarm{% endif %}">
+    <span class="label">Alarms</span>
+    <div class="v {% if summary.alarm > 0 %}v--alarm{% else %}v--ok{% endif %}">{{ summary.alarm }}</div>
+    <div class="foot">{% if summary.alarm > 0 %}not answering, or last probed too long ago{% else %}nothing failing a check{% endif %}</div>
+  </div>
+  {# Warmth goes on the unmeasured count, not on the proven one: an unknown is the thing that
+     wants the operator, and a page where nothing is warm reads as a page where nothing is wrong. #}
+  <div class="cell{% if summary.unknown > 0 %} cell--call{% endif %}">
+    <span class="label">Unknown</span>
+    <div class="v {% if summary.unknown > 0 %}v--call{% else %}v--ok{% endif %}">{{ summary.unknown }}</div>
+    <div class="foot">unmeasured, which is not the same as healthy</div>
+  </div>
+  <div class="cell">
+    <span class="label">Last event</span>
+    <div class="v {% if last_event_level == "ok" %}v--ok{% endif %}" style="font-size:1.25rem">{{ last_event_ago }}</div>
+    <div class="foot">newest ingest, fleet wide</div>
+  </div>
+  <div class="cell">
+    <span class="label">Ledger</span>
+    <div class="v">{{ ledger.events }}</div>
+    <div class="foot">events recorded &middot; <a href="/integrity">verify the chain</a></div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head{% if summary.alarm > 0 %} panel-head--alert{% endif %}">Listeners <span class="dim">reachability, and what each one has produced</span></div>
+  {% if listeners %}
+  <div class="table-wrap">
+    <table class="table-compact">
+      <thead><tr>
+        <th style="width:90px">Collector</th>
+        <th style="width:150px">Listener</th>
+        <th style="width:150px">Reachability</th>
+        <th style="width:180px">Vantage</th>
+        <th style="width:90px">Probed</th>
+        <th style="width:90px">Confirmed</th>
+        <th style="width:90px">Last event</th>
+        <th class="count" style="width:70px">24h</th>
+      </tr></thead>
+      <tbody>
+        {% for r in listeners %}
+        <tr data-state="{{ r.state_level }}">
+          <td class="mono dim">{{ r.collector }}</td>
+          <td>{{ r.sensor_label }} <span class="mono dim">{{ r.protocol }}/{{ r.port }}</span></td>
+          {# Every state is a word AND a colour, never a colour alone. #}
+          <td data-level="{{ r.reach_level }}"><span class="{{ r.reach_dot }}" aria-hidden="true"></span> {{ r.reach }}{% if r.reach_detail %}<div class="faint">{{ r.reach_detail }}</div>{% endif %}</td>
+          <td class="mono dim">{% if r.vantage %}{{ r.vantage }}{% else %}<span class="faint">no probe has run</span>{% endif %}</td>
+          <td class="seen dim">{{ r.probe_ago }}</td>
+          <td class="seen dim">{% if r.confirmed_ago %}{{ r.confirmed_ago }}{% else %}<span class="faint">never</span>{% endif %}</td>
+          <td class="seen" data-level="{{ r.last_event_level }}">{{ r.last_event_ago }}</td>
+          <td class="count">{{ r.events_24h }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty-line">no listener inventory configured - set PROPOLIS_FLEET_LISTENERS, or run deploy/fleet-listeners.sh to derive it from the sensor env files</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">Capture completeness <span class="dim">malware uploads, last 7 days</span></div>
+  {% if captures %}
+  <div class="table-wrap">
+    <table class="table-compact">
+      <thead><tr>
+        <th style="width:120px">Sensor</th>
+        <th style="width:190px">Complete</th>
+        <th class="count" style="width:80px">Captures</th>
+        <th class="count" style="width:90px">Incomplete</th>
+        <th class="count" style="width:90px">Truncated</th>
+        <th>Dominant end reason</th>
+      </tr></thead>
+      <tbody>
+        {% for c in captures %}
+        <tr data-state="{{ c.state_level }}">
+          <td>{{ c.sensor_label }}</td>
+          <td>
+            {% if c.rate_pct is none %}
+            <span class="faint">no labelled capture to rate</span>
+            {% else %}
+            <span class="meter"><span class="{{ c.meter_class }}" style="--pct: {{ c.rate_pct }}%"></span></span>
+            <span class="mono">{{ c.rate_pct }}%</span>
+            <span class="dim">{{ c.complete }} of {{ c.captures - c.unlabelled }}</span>
+            {% endif %}
+            {% if c.unlabelled > 0 %}<div class="dim">{{ c.unlabelled }} unlabelled (excluded from the rate)</div>{% endif %}
+          </td>
+          <td class="count">{{ c.captures }}</td>
+          <td class="count">{{ c.incomplete }}</td>
+          <td class="count">{{ c.truncated }}</td>
+          <td>{% if c.top_end_reason %}<span class="sev sev--watch">{{ c.top_end_reason }}</span> <span class="dim">{{ c.top_end_reason_count }}</span>{% else %}<span class="faint">nothing incomplete</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty-line">no malware captures in the last 7 days</p>
+  {% endif %}
+</div>
+
+<div class="grid-2">
+  <div class="panel">
+    <div class="panel-head">Evidence chain</div>
+    <div class="panel-body">
+      <p><span class="label">Events</span> <span class="mono">{{ ledger.events }}</span></p>
+      <p><span class="label">Newest ingest</span> <span class="mono" data-level="{{ ledger.state_level }}">{% if ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></p>
+      <p class="dim">The chain verdict is not stored yet. <a href="/integrity">Run a verification</a> to see it.</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">Published feed</div>
+    <div class="panel-body" data-level="{{ feed.state_level }}">
+      {% if feed.disabled %}
+      <p>{{ feed.note }}</p>
+      <p class="dim">This node publishes nothing, so there is no feed freshness to report. That is a configuration, not a fault.</p>
+      {% else %}
+      <p><span class="label">Entries</span> <span class="mono">{{ feed.entries }}</span></p>
+      <p><span class="label">Built</span> <span class="mono">{% if feed.build_ago %}{{ feed.build_ago }}{% else %}never{% endif %}</span>{% if feed.build_time %} <span class="dim">{{ feed.build_time }}</span>{% endif %}</p>
+      <p><span class="label">Expires in</span> <span class="mono">{% if feed.expires_in %}{{ feed.expires_in }}{% else %}unknown{% endif %}</span></p>
+      <p class="dim">{{ feed.note }}</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">Running version</div>
+  <div class="panel-body" data-level="{{ version_status.state_level }}">
+    <p><span class="label">Version</span> <span class="mono">v{{ version_status.running_version }}</span> <span class="sev sev--watch">{{ version_status.verdict }}</span></p>
+    <p class="dim">{{ version_status.note }}</p>
+    {% if version_status.stamp_head_sha %}
+    <p><span class="label">Deploy stamp</span> <span class="mono">{{ version_status.stamp_head_sha }}</span>{% if version_status.stamp_origin_main_sha %} <span class="dim">origin/main {{ version_status.stamp_origin_main_sha }}</span>{% endif %}{% if version_status.stamp_age %} <span class="dim">{{ version_status.stamp_age }}</span>{% endif %}</p>
+    {% else %}
+    <p class="dim">No deploy stamp file was found, so there is nothing to compare against either.</p>
+    {% endif %}
+  </div>
+</div>

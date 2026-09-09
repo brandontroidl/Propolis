@@ -11,6 +11,7 @@ path = "src/main.rs"
 console = { path = "../console" }
 core-scoring = { path = "../core-scoring" }
 feed = { path = "../feed" }
+fleet = { path = "../fleet" }
 geoip = { path = "../geoip" }
 intake = { path = "../intake" }
 log-tailer = { path = "../log-tailer" }

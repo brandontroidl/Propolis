@@ -26,6 +26,7 @@ async fn migrate(pool: &PgPool) {
         .await
         .unwrap();
     review::migrator().run(pool).await.unwrap();
+    fleet::migrator().run(pool).await.unwrap();
 }
 
 async fn free_port() -> u16 {
@@ -122,6 +123,8 @@ async fn panel_after_session(pool: PgPool, ending: Ending) -> String {
             geoip: Arc::new(geoip::GeoIp::disabled()),
             rdns: Arc::new(console::rdns::RdnsResolver::disabled()),
             feed_output_dir: Some(feed_dir.path().to_path_buf()),
+            fleet_listeners: Arc::new(Vec::new()),
+            deploy_stamp_path: None,
             startup_time: chrono::Utc::now(),
             version: "test",
             log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),

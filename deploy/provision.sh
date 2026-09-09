@@ -57,7 +57,7 @@ ensure_user() {
     fi
 }
 
-log "1/7 creating OS users"
+log "1/8 creating OS users"
 ensure_user propolis
 ensure_user propolis-catchall
 ensure_user propolis-ssh
@@ -86,7 +86,7 @@ ensure_dir() {
     run install -d -m "$mode" -o "$owner" -g "$group" "$path"
 }
 
-log "2/7 creating directories"
+log "2/8 creating directories"
 ensure_dir /etc/propolis                  0755 root              root
 ensure_dir /var/log/propolis              0755 root              root
 ensure_dir /var/log/propolis/catchall     0750 propolis-catchall propolis-catchall
@@ -126,7 +126,7 @@ ensure_dir /var/lib/propolis/ssh          0750 propolis-ssh      propolis-ssh
 # tmpfs size budget on the operator's behalf, so it stops at the mountpoint; install.sh prints the
 # fstab guidance for a fresh install, and an upgrade leaves an already-mounted tmpfs untouched
 # (install -d on an existing mountpoint only reasserts mode/owner, never remounts).
-log "3/7 creating spool directories (mountpoints only)"
+log "3/8 creating spool directories (mountpoints only)"
 ensure_dir /var/lib/propolis/spool        0750 propolis          propolis
 ensure_dir /var/spool/propolis            0755 root              root
 ensure_dir /var/spool/propolis/catchall   0750 propolis-catchall propolis-catchall

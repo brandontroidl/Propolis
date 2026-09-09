@@ -33,6 +33,8 @@ const ENV_GEOIP_DIR: &str = "PROPOLIS_GEOIP_DIR";
 const ENV_RDNS_ENABLED: &str = "PROPOLIS_CONSOLE_RDNS_ENABLED";
 const ENV_TRUSTED_PROXY: &str = "PROPOLIS_CONSOLE_TRUSTED_PROXY";
 const ENV_METRICS_TOKEN: &str = "PROPOLIS_CONSOLE_METRICS_TOKEN";
+const ENV_FLEET_LISTENERS: &str = "PROPOLIS_FLEET_LISTENERS";
+const ENV_FLEET_DEPLOY_STAMP: &str = "PROPOLIS_FLEET_DEPLOY_STAMP";
 
 /// Loopback only, matching the design's closed decision #4 ("Bind model: loopback only by
 /// default") - an operator who wants the console reachable elsewhere binds it explicitly via
@@ -54,6 +56,8 @@ struct Config {
     rdns_enabled: bool,
     trusted_proxy: bool,
     metrics_token: Option<String>,
+    fleet_listeners: Vec<fleet::Listener>,
+    deploy_stamp_path: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -68,6 +72,11 @@ enum ConfigError {
     /// `PROPOLIS_CONSOLE_SESSION_SECRET` was set but is not exactly 64 hex characters (32
     /// bytes), matching `auth::SessionStore`'s HMAC key size.
     InvalidSessionSecret,
+    /// `PROPOLIS_FLEET_LISTENERS` was set but does not parse. An UNSET variable is not an error
+    /// (it means "no inventory told to this node", and the fleet pane then reports every check as
+    /// unknown); a value that is present and malformed stops the process rather than silently
+    /// shortening the inventory, which would hide a listener instead of reporting it.
+    InvalidFleetListeners(fleet::InventoryError),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -88,6 +97,9 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "{ENV_SESSION_SECRET} must be exactly 64 hex characters (32 bytes) when set"
             ),
+            ConfigError::InvalidFleetListeners(e) => {
+                write!(f, "{ENV_FLEET_LISTENERS}: {e}")
+            }
         }
     }
 }
@@ -144,6 +156,14 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         .unwrap_or(false);
     let metrics_token = env::var(ENV_METRICS_TOKEN).ok().filter(|s| !s.is_empty());
 
+    // The standalone console is a viewer: it renders the inventory and never probes it.
+    let fleet_listeners = fleet::parse_listeners_env(env::var(ENV_FLEET_LISTENERS).ok().as_deref())
+        .map_err(ConfigError::InvalidFleetListeners)?;
+    let deploy_stamp_path = env::var(ENV_FLEET_DEPLOY_STAMP)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
     Ok(Config {
         database_url,
         bind_addr,
@@ -154,6 +174,8 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         rdns_enabled,
         trusted_proxy,
         metrics_token,
+        fleet_listeners,
+        deploy_stamp_path,
     })
 }
 
@@ -261,6 +283,8 @@ async fn main() {
         geoip,
         rdns: Arc::new(console::rdns::RdnsResolver::new(config.rdns_enabled)),
         feed_output_dir: config.feed_output_dir,
+        fleet_listeners: Arc::new(config.fleet_listeners),
+        deploy_stamp_path: config.deploy_stamp_path,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
         log_buffer,

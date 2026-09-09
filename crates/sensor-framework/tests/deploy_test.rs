@@ -733,6 +733,86 @@ fn upgrade_script_reinstalls_every_installed_unit_and_reloads_before_restarting(
     );
 }
 
+/// The fleet listener inventory is DERIVED at deploy time precisely so it cannot drift from the
+/// sensor env files it describes. That guarantee is only as good as both entry points running the
+/// generator: a box that is only ever upgraded would otherwise keep the inventory of whichever
+/// install last ran, and the pane would confidently describe listeners that no longer exist.
+/// `upgrade.sh` must also run it BEFORE the first restart, since the units read the file at start.
+#[test]
+fn both_deploy_scripts_derive_the_fleet_listener_inventory() {
+    let install = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .expect("failed to read deploy/install.sh");
+    let upgrade = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/upgrade.sh"
+    ))
+    .expect("failed to read deploy/upgrade.sh");
+
+    for (name, script) in [("install.sh", &install), ("upgrade.sh", &upgrade)] {
+        assert!(
+            script.contains("fleet-listeners.sh"),
+            "deploy/{name} does not run deploy/fleet-listeners.sh, so PROPOLIS_FLEET_LISTENERS \
+             would go stale on any box deployed through it"
+        );
+    }
+
+    let derive_at = upgrade
+        .lines()
+        .position(|l| {
+            l.trim_start()
+                .starts_with("\"$SCRIPT_DIR/fleet-listeners.sh\"")
+        })
+        .expect("upgrade.sh never invokes fleet-listeners.sh as a command");
+    let first_restart_at = upgrade
+        .lines()
+        .position(|l| l.trim_start().starts_with("systemctl restart"))
+        .expect("upgrade.sh never restarts a unit - the parser is broken");
+    assert!(
+        derive_at < first_restart_at,
+        "upgrade.sh derives the inventory (line {}) after its first restart (line {}); the \
+         restarted unit would load the previous deploy's inventory",
+        derive_at + 1,
+        first_restart_at + 1
+    );
+}
+
+/// Both units must load the generated inventory, and must load it BEFORE their operator-owned env
+/// file: systemd lets a later `EnvironmentFile` override an earlier one, so the reverse order would
+/// silently discard an operator's deliberate `PROPOLIS_FLEET_LISTENERS` override.
+#[test]
+fn units_load_the_generated_fleet_inventory_before_their_operator_env_file() {
+    for (unit, operator_env) in [
+        ("propolis.service", "/etc/propolis/propolis.env"),
+        ("console.service", "/etc/propolis/console.env"),
+    ] {
+        let path = format!(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/{}"),
+            unit
+        );
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let generated_at = text
+            .lines()
+            .position(|l| l.trim() == "EnvironmentFile=-/etc/propolis/fleet-listeners.env")
+            .unwrap_or_else(|| {
+                panic!("{unit} does not load the generated /etc/propolis/fleet-listeners.env")
+            });
+        let operator_at = text
+            .lines()
+            .position(|l| l.trim() == format!("EnvironmentFile={operator_env}"))
+            .unwrap_or_else(|| panic!("{unit} no longer loads {operator_env}"));
+        assert!(
+            generated_at < operator_at,
+            "{unit} loads the generated inventory (line {}) after {operator_env} (line {}), so an \
+             operator override in that file would be discarded",
+            generated_at + 1,
+            operator_at + 1
+        );
+    }
+}
+
 /// The `.service` names listed by every `for unit in ...` loop in a deploy script. Both scripts
 /// keep their unit lists as literal loop members, so this is the authoritative population, not a
 /// hand-copied list that could drift from the scripts it guards.

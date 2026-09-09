@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Fleet - Propolis{% endblock %}
+{% block content %}
+<h1 class="visually-hidden">Fleet</h1>
+{# The whole reading refreshes as one unit: a page that shows a fresh listener table beside a stale
+   headline would be worse than one that refreshes nothing. #}
+<div id="fleet-status" hx-get="/fleet/status" hx-trigger="every 30s" hx-swap="innerHTML">
+{% include "fleet_status_fragment.html" %}
+</div>
+{% endblock %}

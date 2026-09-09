@@ -49,6 +49,7 @@ async fn migrate(pool: &PgPool) {
         .await
         .unwrap();
     review::migrator().run(pool).await.unwrap();
+    fleet::migrator().run(pool).await.unwrap();
 }
 
 fn test_state(db: PgPool) -> AppState {
@@ -56,6 +57,16 @@ fn test_state(db: PgPool) -> AppState {
 }
 
 fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> AppState {
+    test_state_full(db, feed_output_dir, Vec::new(), None)
+}
+
+/// `test_state_with_feed_dir` plus the fleet inventory and deploy-stamp path, for `routes::fleet`.
+fn test_state_full(
+    db: PgPool,
+    feed_output_dir: Option<PathBuf>,
+    fleet_listeners: Vec<fleet::Listener>,
+    deploy_stamp_path: Option<PathBuf>,
+) -> AppState {
     AppState {
         db,
         sessions: Arc::new(SessionStore::new(test_secret())),
@@ -65,6 +76,8 @@ fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> App
         geoip: Arc::new(geoip::GeoIp::disabled()),
         rdns: Arc::new(console::rdns::RdnsResolver::disabled()),
         feed_output_dir,
+        fleet_listeners: Arc::new(fleet_listeners),
+        deploy_stamp_path,
         startup_time: chrono::Utc::now(),
         version: "test",
         log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),
@@ -4332,5 +4345,550 @@ async fn samples_page_hides_fetch_attempts_panel_when_empty(pool: PgPool) {
     assert!(
         !body.contains("Fetch attempts"),
         "no fetch_attempt rows exist, so the status strip must not render: {body}"
+    );
+}
+
+// ---- routes::fleet (the fleet pane) ----------------------------------------------------------
+//
+// These are the acceptance layer for `/fleet`. The invariant under test throughout is that the
+// page never renders an unknown as health: a listener with no probe row, a probe too old to
+// trust, a disabled feed builder, and a build with no recorded revision must each say what they
+// are, in words, and must not read as `ok`.
+
+fn listener(sensor: &str, protocol: fleet::Proto, port: u16) -> fleet::Listener {
+    fleet::Listener {
+        collector_id: "local".into(),
+        sensor: sensor.into(),
+        protocol,
+        port,
+    }
+}
+
+/// The listener table's own markup, so an assertion cannot be satisfied by a word appearing in the
+/// bundled stylesheet or script.
+fn listener_table(body: &str) -> &str {
+    let start = body
+        .find("<tbody>")
+        .expect("the listener table must render");
+    let rest = &body[start..];
+    &rest[..rest.find("</tbody>").unwrap_or(rest.len())]
+}
+
+/// Writes a probe row directly. The prober itself does not exist yet; the pane's reading of a row
+/// does, and that reading is what these tests are about.
+#[allow(clippy::too_many_arguments)]
+async fn insert_probe(
+    pool: &PgPool,
+    sensor: &str,
+    protocol: &str,
+    port: i32,
+    outcome: &str,
+    detail: Option<&str>,
+    attempted_at: chrono::DateTime<chrono::Utc>,
+    confirmed_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    sqlx::query(
+        "INSERT INTO listener_probe \
+           (collector_id, sensor, protocol, port, target, attempted_at, outcome, detail, \
+            confirmed_at) \
+         VALUES ('local', $1, $2, $3, '198.51.100.7:1', $4, $5, $6, $7)",
+    )
+    .bind(sensor)
+    .bind(protocol)
+    .bind(port)
+    .bind(attempted_at)
+    .bind(outcome)
+    .bind(detail)
+    .bind(confirmed_at)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_page_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let app = test_app(test_state(pool));
+
+    let response = app.oneshot(get_request("/fleet", None)).await.unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "the fleet pane must be session-gated like every other page"
+    );
+}
+
+/// The failure this catches is the one the dashboard's single fleet-wide freshness boolean hides:
+/// a sensor unit that was never enabled after a deploy produces nothing, and a page built from the
+/// ledger alone would simply not have a row for it.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_lists_every_configured_listener_even_with_no_events(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.30",
+            "ssh",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("telnet", fleet::Proto::Tcp, 23),
+        ],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(table.contains("tcp/22"), "ssh row missing: {table}");
+    assert!(
+        table.contains("tcp/23"),
+        "the configured telnet listener has no events and must still appear: {table}"
+    );
+    assert!(
+        table.contains("never"),
+        "the eventless listener must read `never`, not blank: {table}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_page_shows_never_probed_as_an_alarm_not_a_blank(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("never probed"),
+        "an unprobed listener must say so: {table}"
+    );
+    assert!(
+        table.contains(r#"data-level="unknown""#),
+        "and must carry unknown styling, not ok: {table}"
+    );
+    assert!(
+        body.contains("reachability unproven"),
+        "the headline must not claim health while nothing has been probed: {body}"
+    );
+    assert!(
+        !body.contains("every listener proven"),
+        "an unprobed fleet must never render the proven headline: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_page_shows_a_refused_probe_with_the_word_refused(pool: PgPool) {
+    migrate(&pool).await;
+    insert_probe(
+        &pool,
+        "telnet",
+        "tcp",
+        23,
+        "refused",
+        Some("connection refused"),
+        chrono::Utc::now(),
+        None,
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("telnet", fleet::Proto::Tcp, 23)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("refused"),
+        "a refused probe must be named in words, not by colour alone: {table}"
+    );
+    assert!(
+        table.contains(r#"data-level="alarm""#),
+        "a refused probe is an alarm: {table}"
+    );
+}
+
+/// The prober dying is the failure here, and its signature is a last-known-good result that stays
+/// on screen forever. The row must say `stale`, not `reachable`.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_shows_a_stale_probe_as_stale_even_when_the_last_outcome_was_reachable(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let long_ago = chrono::Utc::now() - chrono::Duration::hours(3);
+    insert_probe(
+        &pool,
+        "ssh",
+        "tcp",
+        22,
+        "reachable",
+        None,
+        long_ago,
+        Some(long_ago),
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("stale, last reachable"),
+        "a probe older than two intervals must read as stale: {table}"
+    );
+    assert!(
+        table.contains(r#"data-level="alarm""#),
+        "and must render as an alarm despite the good last outcome: {table}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_page_flags_a_ledger_sensor_missing_from_the_inventory_as_undeclared(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.31",
+            "redis",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // The inventory names ssh only; redis is producing events nobody declared.
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("undeclared listener"),
+        "a sensor in the ledger but not the inventory must be flagged, not folded in: {table}"
+    );
+    assert!(
+        table.contains("Redis"),
+        "the undeclared sensor must be named: {table}"
+    );
+}
+
+/// `detail.rs` reads a MISSING `complete` key as complete, which is right for a per-IP panel and
+/// wrong for a rate: it would flatter the number. Three complete, one incomplete, two unlabelled
+/// gives 75% under the honest rule and 83% under the flattering one, so the fixture can tell the
+/// two implementations apart.
+#[sqlx::test(migrations = false)]
+async fn fleet_capture_rate_excludes_unlabelled_captures_from_the_denominator(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.32";
+    let upload = |sha: &str, complete: Option<bool>| {
+        let mut metadata = serde_json::json!({ "sample_sha256": sha, "sample_size": 10 });
+        if let Some(c) = complete {
+            metadata["complete"] = serde_json::json!(c);
+        }
+        ev_with_session(
+            ip,
+            "telnet",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            metadata,
+            Uuid::now_v7(),
+        )
+    };
+    for (i, complete) in [Some(true), Some(true), Some(true), Some(false), None, None]
+        .into_iter()
+        .enumerate()
+    {
+        let sha = format!("{i:064x}");
+        append_event(&pool, upload(&sha, complete)).await.unwrap();
+    }
+
+    let state = test_state_full(pool, None, Vec::new(), None);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    assert!(
+        body.contains(">75%<"),
+        "3 complete of 4 labelled is 75%; 83% would mean the unlabelled ones were counted: {body}"
+    );
+    assert!(
+        body.contains("2 unlabelled (excluded from the rate)"),
+        "the page must state how many captures the rate excluded: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_capture_panel_names_the_dominant_end_reason(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.33";
+    let upload = |sha: &str, reason: &str| {
+        ev_with_session(
+            ip,
+            "ssh",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": sha,
+                "sample_size": 10,
+                "complete": false,
+                "end_reason": reason,
+            }),
+            Uuid::now_v7(),
+        )
+    };
+    // Two budget endings against one idle one, so the panel has to pick the dominant reason rather
+    // than the first or the last it happens to read.
+    for (i, reason) in ["capture_budget", "capture_budget", "idle_timeout"]
+        .into_iter()
+        .enumerate()
+    {
+        let sha = format!("{:064x}", i + 100);
+        append_event(&pool, upload(&sha, reason)).await.unwrap();
+    }
+
+    let state = test_state_full(pool, None, Vec::new(), None);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    assert!(
+        body.contains("capture budget"),
+        "the dominant end reason must be shown next to the rate, in words: {body}"
+    );
+    assert!(
+        !body.contains("idle timeout"),
+        "only the dominant reason belongs on the row: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_page_reports_the_feed_as_unknown_when_no_output_dir_is_configured(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state_full(pool, None, Vec::new(), None);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    assert!(
+        body.contains("builder disabled on this node"),
+        "an unconfigured builder must say so rather than reporting an empty feed: {body}"
+    );
+    assert!(
+        !body.contains("<span class=\"label\">Entries</span> <span class=\"mono\">0</span>"),
+        "a disabled builder must never render as 0 published entries: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_reads_not_recorded_when_no_stamp_file_exists(pool: PgPool) {
+    migrate(&pool).await;
+    let missing = PathBuf::from("/nonexistent/propolis/deploy-stamp.json");
+    let state = test_state_full(pool, None, Vec::new(), Some(missing));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    assert!(
+        body.contains("not recorded"),
+        "with no stamp the version panel must read `not recorded`: {body}"
+    );
+    assert!(
+        !body.contains(">current<"),
+        "and must never claim the running build is current: {body}"
+    );
+}
+
+/// A monitoring page that fails in a way that looks like good news is worse than no page. Dropping
+/// the probe table makes one panel's query fail for real; the page must still render, name the
+/// panel, and not 503.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_renders_a_degraded_banner_instead_of_a_503_when_a_panel_query_fails(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    sqlx::query("DROP TABLE listener_probe")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a failed panel must not take the whole monitoring page down"
+    );
+    let body = body_text(response).await;
+    assert!(
+        body.contains("listener probes"),
+        "the degraded banner must name the panel that failed: {body}"
+    );
+    assert!(
+        body.contains(r#"class="degraded""#),
+        "the failure must be shown as a banner, not as data: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_status_fragment_renders_the_same_rows_without_the_page_chrome(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet/status",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("tcp/22") && body.contains("never probed"),
+        "the fragment must carry the same rows as the page: {body}"
+    );
+    assert!(
+        !body.contains("<html") && !body.contains("class=\"topnav\""),
+        "the fragment must not carry the page chrome: {body}"
     );
 }

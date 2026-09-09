@@ -13,6 +13,7 @@ pub(crate) mod degraded;
 pub mod detail;
 pub mod error;
 pub mod feed;
+pub mod fleet;
 mod format;
 pub mod health;
 pub mod integrity;
@@ -55,6 +56,7 @@ pub fn router(state: AppState) -> Router {
         .merge(queue::router())
         .merge(detail::router())
         .merge(feed::router())
+        .merge(fleet::router())
         .merge(search::router())
         .merge(ips::router())
         .merge(integrity::router())

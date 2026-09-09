@@ -9,6 +9,7 @@ axum = { version = "0.8.9", features = ["macros"] }
 axum-extra = { version = "0.12.6", features = ["cookie"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 core-scoring = { path = "../core-scoring" }
+fleet = { path = "../fleet" }
 futures = { version = "0.3.32", default-features = false, features = ["std", "async-await"] }
 geoip = { path = "../geoip" }
 hex = "0.4.3"

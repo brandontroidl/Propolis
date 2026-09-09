@@ -41,6 +41,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # between them - the metadata key names - untested in both directions. Dev-only: the daemon
 # launches sensors as separate processes and does not link them.
 sensor-telnet = { path = "../sensor-telnet" }
+# The same boundary for the other shell sensor, whose capture metadata the console also reads.
+sensor-ssh = { path = "../sensor-ssh" }
+# An SSH client for that test, so the session is driven over the real transport rather than by
+# calling the handler directly. Already vendored at this version for sensor-ssh's own tests.
+russh = "0.62.4"
 tempfile = "3.27.0"
 # test-util enables tokio's pausable virtual clock (start_paused) so time-based dispatcher tests
 # (per-attempt deadline + backoff) run deterministically and instantly. A tokio feature, not a new

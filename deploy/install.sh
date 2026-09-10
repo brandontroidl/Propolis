@@ -83,8 +83,8 @@ fi
 # ---- 1, 2 & 3. users, directories, and spool mountpoints (provisioning: see deploy/provision.sh) ----
 
 # Shared with upgrade.sh so both entry points provision users/dirs through one idempotent routine
-# - see provision.sh's own header for why. Prints its own "1/8 creating OS users" /
-# "2/8 creating directories" / "3/8 creating spool directories" progress lines (verbatim from this
+# - see provision.sh's own header for why. Prints its own "1/9 creating OS users" /
+# "2/9 creating directories" / "3/9 creating spool directories" progress lines (verbatim from this
 # script's former inline blocks), so nothing further is logged here.
 run_provision() { DRY_RUN="$DRY_RUN" "$SCRIPT_DIR/provision.sh"; }
 run_provision
@@ -116,7 +116,7 @@ EOF
 
 # ---- 4. binaries ----
 
-log "4/8 installing binaries to /usr/local/bin"
+log "4/9 installing binaries to /usr/local/bin"
 for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-cred; do
     src="$BUILD_DIR/$bin"
     dst="/usr/local/bin/$bin"
@@ -133,14 +133,14 @@ done
 
 # ---- 5. systemd units ----
 
-log "5/8 installing systemd units"
+log "5/9 installing systemd units"
 for unit in propolis.service sensor-catchall.service sensor-ssh.service sensor-telnet.service sensor-redis.service sensor-adb.service sensor-http.service sensor-ftp.service sensor-smtp.service sensor-cred.service; do
     run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
 
 # ---- 6. logrotate config ----
 
-log "6/8 installing logrotate config"
+log "6/9 installing logrotate config"
 run install -m 0644 "$SCRIPT_DIR/logrotate-sensors.conf" /etc/logrotate.d/propolis-sensors
 
 # ---- 7. fleet listener inventory ----
@@ -150,12 +150,20 @@ run install -m 0644 "$SCRIPT_DIR/logrotate-sensors.conf" /etc/logrotate.d/propol
 # sensor env file yet, so this normally writes a header-only file and the fleet pane reports
 # every check as unknown until upgrade.sh (or this script, re-run) regenerates it. That is the
 # truth at that moment, not a defect.
-log "7/8 deriving the fleet listener inventory"
+log "7/9 deriving the fleet listener inventory"
 run "$SCRIPT_DIR/fleet-listeners.sh"
 
-# ---- 8. reload systemd ----
+# ---- 8. deploy stamp ----
 
-log "8/8 reloading systemd unit files"
+# What this box last deployed, which the console compares against the commit each binary stamped
+# into itself; see deploy-stamp.sh's header. On a fresh install nothing has been restarted yet, so
+# the pane will read "restart required" until the operator enables the units - which is accurate.
+log "8/9 recording the deploy stamp"
+run "$SCRIPT_DIR/deploy-stamp.sh"
+
+# ---- 9. reload systemd ----
+
+log "9/9 reloading systemd unit files"
 run systemctl daemon-reload
 
 if [ "$DRY_RUN" -eq 1 ]; then

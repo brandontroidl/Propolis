@@ -43,6 +43,10 @@ const ENV_FLEET_PROBE_INTERVAL: &str = "PROPOLIS_FLEET_PROBE_INTERVAL";
 /// same number, so this default and that one must stay equal.
 const DEFAULT_FLEET_PROBE_INTERVAL_SECS: u64 = 300;
 
+/// Where deploy/deploy-stamp.sh writes the stamp. Mirrored in `propolis::config`; the writer and
+/// both readers have to name the same path or the deploy records an answer nobody reads.
+const DEFAULT_DEPLOY_STAMP: &str = "/var/lib/propolis/deploy-stamp.json";
+
 /// Loopback only, matching the design's closed decision #4 ("Bind model: loopback only by
 /// default") - an operator who wants the console reachable elsewhere binds it explicitly via
 /// `PROPOLIS_CONSOLE_BIND`, e.g. behind their own reverse proxy.
@@ -167,10 +171,17 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     // The standalone console is a viewer: it renders the inventory and never probes it.
     let fleet_listeners = fleet::parse_listeners_env(env::var(ENV_FLEET_LISTENERS).ok().as_deref())
         .map_err(ConfigError::InvalidFleetListeners)?;
-    let deploy_stamp_path = env::var(ENV_FLEET_DEPLOY_STAMP)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+    // Defaulted, not left unset: deploy-stamp.sh writes this path on every install and upgrade,
+    // so a console that only looked when told to would leave the version panel reading "not
+    // recorded" on a box that had been recording the answer all along. A missing or unreadable
+    // file still reads "not recorded", which is the honest state for a box that has never
+    // deployed through the scripts.
+    let deploy_stamp_path = Some(
+        env::var(ENV_FLEET_DEPLOY_STAMP)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| PathBuf::from(DEFAULT_DEPLOY_STAMP), PathBuf::from),
+    );
     // A viewer, not a validator: the daemon owns the bounds on this value and refuses to start
     // outside them. Here an unreadable value falls back to the shared default rather than stopping
     // a console that has nothing to do with the sweep, and the effect of getting it wrong is a
@@ -308,6 +319,8 @@ async fn main() {
         deploy_stamp_path: config.deploy_stamp_path,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
+        git_sha: env!("PROPOLIS_GIT_SHA"),
+        built_at: env!("PROPOLIS_BUILD_TIMESTAMP"),
         log_buffer,
         events_ingested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),

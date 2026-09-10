@@ -146,6 +146,9 @@
   <div class="panel-head">Running version</div>
   <div class="panel-body" data-level="{{ version_status.state_level }}">
     <p><span class="label">Version</span> <span class="mono">v{{ version_status.running_version }}</span> <span class="sev sev--watch">{{ version_status.verdict }}</span></p>
+    {# Three different revisions, kept apart on purpose: what this PROCESS runs, what was last
+       BUILT on this box, and what main holds. Collapsing any two of them is the bug. #}
+    <p><span class="label">Running</span> <span class="mono">{{ version_status.running_sha }}</span> <span class="dim">built {{ version_status.built_at }}</span></p>
     <p class="dim">{{ version_status.note }}</p>
     {% if version_status.stamp_head_sha %}
     <p><span class="label">Deploy stamp</span> <span class="mono">{{ version_status.stamp_head_sha }}</span>{% if version_status.stamp_origin_main_sha %} <span class="dim">origin/main {{ version_status.stamp_origin_main_sha }}</span>{% endif %}{% if version_status.stamp_age %} <span class="dim">{{ version_status.stamp_age }}</span>{% endif %}</p>

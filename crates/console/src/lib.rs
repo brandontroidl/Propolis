@@ -95,6 +95,15 @@ pub struct AppState {
     /// binary constructed this `AppState` - so the console always displays the version of the
     /// process actually serving the page, not a fixed constant baked into this library crate.
     pub version: &'static str,
+    /// The git revision this binary was BUILT from (`env!("PROPOLIS_GIT_SHA")`, set by that
+    /// binary's build script), or `unknown` when the build could not identify itself. Stamped by
+    /// the constructing binary for the same reason `version` is: the fleet pane reports the
+    /// revision of the process serving the page, and a build that cannot say which commit it is
+    /// must read as unrecorded rather than be compared with the deploy stamp and called current.
+    pub git_sha: &'static str,
+    /// When this binary was built (`env!("PROPOLIS_BUILD_TIMESTAMP")`, RFC 3339 UTC). Paired with
+    /// `git_sha` so the version panel can distinguish a stale binary from a stale checkout.
+    pub built_at: &'static str,
     /// Shared ring buffer + broadcast channel of recent tracing events, backing `routes::logs`
     /// (`internal/design/11-console-forensics.md`, task 7). Built once at startup alongside
     /// `templates` and installed as a `tracing_subscriber::Layer` by whichever binary constructs

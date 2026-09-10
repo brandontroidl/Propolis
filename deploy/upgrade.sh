@@ -23,10 +23,19 @@ BUILD_DIR="$REPO_DIR/target/release"
 cd "$REPO_DIR"
 
 echo "==> pulling latest"
+PULLED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 sudo -u "$(stat -c '%U' "$REPO_DIR")" git pull
 
 echo "==> building release"
 sudo -u "$(stat -c '%U' "$REPO_DIR")" cargo build --release
+
+# After the build, not before it: the stamp says what was BUILT, and a build that failed must
+# leave the previous stamp in place rather than claim a commit that produced no binaries. Still
+# before the restarts, so the console reads it as soon as it comes back up. The console compares
+# this against the commit each binary stamped into itself, which is how a deploy that built new
+# binaries without restarting the service becomes visible.
+echo "==> recording the deploy stamp"
+PROPOLIS_DEPLOY_PULLED_AT="$PULLED_AT" "$SCRIPT_DIR/deploy-stamp.sh" "$REPO_DIR"
 
 echo "==> installing binaries"
 # SP-A (collector/control-plane split): gateway and shipper are new binaries alongside the

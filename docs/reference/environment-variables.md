@@ -191,7 +191,7 @@ viewer of the same data.
 | Variable | Req | Default | Notes |
 |---|---|---|---|
 | `PROPOLIS_FLEET_LISTENERS` | no | none (empty inventory) | comma-separated `collector/sensor/protocol/port` entries, e.g. `local/ssh/tcp/22,local/catchall/udp/1024`. Unset or blank means "this node was told no inventory": the pane then reports every check as unknown rather than reporting nothing at all. A value that IS set and malformed aborts startup - never a silently shortened list. `protocol` is `tcp` or `udp`; `port` is 1-65535. |
-| `PROPOLIS_FLEET_DEPLOY_STAMP` | no | none | path to the deploy stamp JSON. A missing, unreadable, or malformed file leaves the version panel reading `not recorded`, never `current`. |
+| `PROPOLIS_FLEET_DEPLOY_STAMP` | no | `/var/lib/propolis/deploy-stamp.json` | path to the deploy stamp JSON, written by `deploy/deploy-stamp.sh` on every install and upgrade. A missing, unreadable, or malformed file leaves the version panel reading `not recorded`, never `current`. Set it only to move the file; the default is the path the deploy scripts write. |
 | `PROPOLIS_FLEET_COLLECTOR_ENDPOINTS` | no | none | comma-separated `collector=address`, e.g. `local=198.51.100.7`. The address the control plane dials for that collector's listeners. A listener whose collector is absent here is recorded `not probeable` with the reason named, never guessed at. A malformed entry aborts startup. |
 | `PROPOLIS_FLEET_PROBE_INTERVAL` | no | `300` | sweep cadence in seconds, 60-86400. Rejected rather than clamped outside that range. Also the unit the console measures probe staleness in: a row older than twice this alarms, whatever its last outcome was. The standalone `console` binary reads it too, purely to size that rule. |
 | `PROPOLIS_FLEET_PROBE_TIMEOUT` | no | `5` | per-connect deadline in seconds, 1-60. Rejected rather than clamped outside that range. Bounds each connect so a blackholed address cannot hold a sweep open on the OS default connect timeout. |
@@ -242,7 +242,26 @@ producing events while absent from the inventory shows on the pane as
 
 `PROPOLIS_FLEET_COLLECTOR_ID` (default `local`) is read by
 `deploy/fleet-listeners.sh` itself, not by any binary: it stamps the collector
-id onto each generated entry.
+id onto each generated entry. `PROPOLIS_DEPLOY_PULLED_AT` is read by
+`deploy/deploy-stamp.sh` in the same way: `deploy/upgrade.sh` passes the time it
+pulled, so the stamp's `pulled_at` and `built_at` are two facts rather than one
+number written twice.
+
+#### Compile-time, not configuration
+
+`PROPOLIS_GIT_SHA` and `PROPOLIS_BUILD_TIMESTAMP` are **not** operator
+variables. Each binary's build script (`crates/propolis/build.rs`,
+`crates/console/build.rs`, sharing `crates/build-stamp.rs`) sets them at compile
+time from `git`, and setting them in the environment of a running process has no
+effect. They are listed here only because they read like environment variables
+in the source.
+
+`PROPOLIS_GIT_SHA` is the short commit id, with `+dirty` appended when the
+working tree had uncommitted changes, or the literal `unknown` when the build
+could not run git at all (a tarball, a container with no git, a checkout with no
+`.git`). The version panel treats `unknown` and `+dirty` the same way it treats
+a missing stamp: `not recorded`. A build that cannot say which commit it is must
+never be presented as a build that matches the deploy.
 
 ### VirusTotal (unified daemon only)
 

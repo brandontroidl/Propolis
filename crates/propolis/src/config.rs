@@ -63,6 +63,10 @@ const MAX_FETCH_INTERVAL_SECS: u64 = 86_400;
 /// the botnet operator watching its own payload-staging server's access log.
 const DEFAULT_FETCH_USER_AGENT: &str = "Wget/1.21.3";
 
+/// Where deploy/deploy-stamp.sh writes the stamp. Mirrored in `console::main`; the writer and both
+/// readers have to name the same path or the deploy records an answer nobody reads.
+const DEFAULT_DEPLOY_STAMP: &str = "/var/lib/propolis/deploy-stamp.json";
+
 /// One sensor log entry: a sensor's name (for logging/metrics) and the absolute path to its
 /// NDJSON log file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -669,10 +673,16 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
     let fleet_listeners =
         fleet::parse_listeners_env(env::var("PROPOLIS_FLEET_LISTENERS").ok().as_deref())
             .map_err(ConfigError::FleetInventory)?;
-    let fleet_deploy_stamp = env::var("PROPOLIS_FLEET_DEPLOY_STAMP")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+    // Defaulted rather than left unset: deploy-stamp.sh writes this path on every install and
+    // upgrade, so a daemon that only looked when told to would render "not recorded" on a box that
+    // had been recording the answer all along. A missing or unreadable file still reads "not
+    // recorded".
+    let fleet_deploy_stamp = Some(
+        env::var("PROPOLIS_FLEET_DEPLOY_STAMP")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| PathBuf::from(DEFAULT_DEPLOY_STAMP), PathBuf::from),
+    );
     let fleet_endpoints = fleet::parse_endpoints_env(
         env::var("PROPOLIS_FLEET_COLLECTOR_ENDPOINTS")
             .ok()

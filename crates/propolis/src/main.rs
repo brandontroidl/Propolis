@@ -520,6 +520,8 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         deploy_stamp_path,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
+        git_sha: env!("PROPOLIS_GIT_SHA"),
+        built_at: env!("PROPOLIS_BUILD_TIMESTAMP"),
         log_buffer,
         events_ingested,
         events_rejected,

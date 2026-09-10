@@ -654,6 +654,67 @@ fn provisioned_dirs() -> HashSet<String> {
         .collect()
 }
 
+/// The deploy stamp is what lets the console tell a stale BINARY from a stale CHECKOUT: each
+/// binary records the commit it was built from, this file records what the deploy installed, and
+/// the pane compares them. A deploy that skipped it would leave the panel reading "not recorded"
+/// forever, which looks like a missing feature rather than a missing step.
+#[test]
+fn deploy_stamp_script_is_valid_bash_and_both_deploy_scripts_run_it() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/deploy-stamp.sh");
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(script)
+        .status()
+        .expect("failed to invoke `bash -n` on deploy/deploy-stamp.sh");
+    assert!(
+        status.success(),
+        "deploy/deploy-stamp.sh has a bash syntax error"
+    );
+
+    let install = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .expect("failed to read deploy/install.sh");
+    let upgrade = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/upgrade.sh"
+    ))
+    .expect("failed to read deploy/upgrade.sh");
+    for (name, text) in [("install.sh", &install), ("upgrade.sh", &upgrade)] {
+        assert!(
+            text.contains("deploy-stamp.sh"),
+            "deploy/{name} does not run deploy/deploy-stamp.sh, so a box deployed through it \
+             could never tell a stale binary from a stale checkout"
+        );
+    }
+
+    // After the build, so a failed build leaves the previous stamp rather than claiming a commit
+    // that produced no binaries, and before the first restart, so the console reads the new stamp
+    // as soon as it comes back up.
+    let lines: Vec<&str> = upgrade.lines().collect();
+    let build_at = lines
+        .iter()
+        .position(|l| l.contains("cargo build --release"))
+        .expect("upgrade.sh no longer builds - this parser is broken");
+    let stamp_at = lines
+        .iter()
+        .position(|l| l.contains("deploy-stamp.sh"))
+        .expect("upgrade.sh never invokes deploy-stamp.sh");
+    let first_restart_at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("systemctl restart"))
+        .expect("upgrade.sh never restarts a unit - this parser is broken");
+    assert!(
+        build_at < stamp_at && stamp_at < first_restart_at,
+        "upgrade.sh must stamp after the build (line {}) and before the first restart (line {}), \
+         but stamps at line {}",
+        build_at + 1,
+        first_restart_at + 1,
+        stamp_at + 1
+    );
+}
+
 /// Same standard as `install_script_is_valid_bash`: `upgrade.sh` has no `--dry-run`, so a syntax
 /// check is the one real execution it gets without root.
 #[test]

@@ -128,6 +128,10 @@ struct LedgerStatus {
 #[derive(Debug, Serialize)]
 struct VersionStatus {
     running_version: String,
+    /// The revision this PROCESS was built from, which is not the same question as what is
+    /// checked out on the box. `unknown` when the build could not identify itself.
+    running_sha: String,
+    built_at: String,
     stamp_head_sha: Option<String>,
     stamp_origin_main_sha: Option<String>,
     stamp_age: Option<String>,
@@ -294,6 +298,69 @@ fn read_stamp(path: &Path) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// The version verdict, as a pure function of the three revisions involved.
+///
+/// Three different things get confused here and the panel exists to keep them apart: what this
+/// PROCESS is running, what was last BUILT and installed on this box, and what is on `main`. A
+/// deploy that built new binaries without restarting the service leaves the first two apart, and
+/// that is invisible from anywhere else on the box.
+///
+/// Every uncertain case lands on `not recorded`, never on `current`. The failure this guards is a
+/// panel that says the box is up to date because it could not tell that it was not.
+fn version_verdict(
+    running_sha: &str,
+    stamp_head: Option<&str>,
+    stamp_origin: Option<&str>,
+) -> (&'static str, Level, &'static str) {
+    // A build from a modified working tree matches no commit, so no comparison against the stamp
+    // means anything. Same for a build that could not run git at all.
+    if running_sha == "unknown" || running_sha.contains("+dirty") {
+        return (
+            "not recorded",
+            Level::Unknown,
+            "this binary does not name a clean commit, so it cannot be compared with the deploy \
+             stamp",
+        );
+    }
+    let Some(head) = stamp_head else {
+        return (
+            "not recorded",
+            Level::Unknown,
+            "no deploy stamp was found, so there is nothing to compare the running binary with",
+        );
+    };
+    // The stamp carries the full 40-character id and the binary a short prefix of it, so a prefix
+    // match is the comparison, not equality.
+    if !head.starts_with(running_sha) {
+        return (
+            "restart required",
+            Level::Warn,
+            "a newer build was installed after this process started; the running code is not the \
+             code on disk",
+        );
+    }
+    let Some(origin) = stamp_origin else {
+        return (
+            "not recorded",
+            Level::Unknown,
+            "the deploy stamp names no origin/main revision, so it cannot say whether this box is \
+             behind",
+        );
+    };
+    if origin != head {
+        return (
+            "behind main",
+            Level::Warn,
+            "this box is running the commit it deployed, but main has moved on since",
+        );
+    }
+    (
+        "current",
+        Level::Ok,
+        "the running binary, the deployed checkout and main are the same commit",
+    )
+}
+
 fn version_status(state: &AppState) -> VersionStatus {
     let stamp = state.deploy_stamp_path.as_deref().and_then(read_stamp);
     let field = |key: &str| -> Option<String> {
@@ -301,25 +368,32 @@ fn version_status(state: &AppState) -> VersionStatus {
             .as_ref()
             .and_then(|v| v.get(key))
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let stamp_age = field("pulled_at")
+    let stamp_head_sha = field("head_sha");
+    let stamp_origin_main_sha = field("origin_main_sha");
+    let stamp_age = field("built_at")
+        .or_else(|| field("pulled_at"))
         .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
         .map(|t| format_relative_time(t.with_timezone(&Utc)));
 
-    // This build does not record its own git revision (no build script yet), so there is nothing
-    // to compare the stamp against. "Not recorded" is the honest verdict; the panel must never
-    // read "current" on the strength of a stamp alone, because a stamp says what was BUILT, not
-    // what this process is RUNNING.
+    let (verdict, level, note) = version_verdict(
+        state.git_sha,
+        stamp_head_sha.as_deref(),
+        stamp_origin_main_sha.as_deref(),
+    );
+
     VersionStatus {
         running_version: state.version.to_string(),
-        stamp_head_sha: field("head_sha"),
-        stamp_origin_main_sha: field("origin_main_sha"),
+        running_sha: state.git_sha.to_string(),
+        built_at: state.built_at.to_string(),
+        stamp_head_sha,
+        stamp_origin_main_sha,
         stamp_age,
-        verdict: "not recorded",
-        note: "this build does not record its git revision, so the running code cannot be \
-               compared with the deploy stamp",
-        state_level: Level::Unknown.class(),
+        verdict,
+        note,
+        state_level: level.class(),
     }
 }
 
@@ -682,4 +756,77 @@ async fn fleet_status_fragment(
 ) -> Result<Html<String>, AppError> {
     let view = build_view(&state, Degraded::new()).await;
     render(&state, "fleet_status_fragment.html", &view, context! {})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RUNNING: &str = "abc123abc123";
+    const HEAD: &str = "abc123abc123def456def456def456def456def4";
+    const OTHER: &str = "999999999999aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn a_binary_matching_a_stamp_that_matches_main_is_current() {
+        let (verdict, level, _) = version_verdict(RUNNING, Some(HEAD), Some(HEAD));
+        assert_eq!(verdict, "current");
+        assert_eq!(level, Level::Ok);
+    }
+
+    /// The failure this whole panel exists for: `upgrade.sh` built and installed new binaries, and
+    /// the running process is still the old one.
+    #[test]
+    fn a_binary_older_than_the_deployed_commit_needs_a_restart() {
+        let (verdict, level, note) = version_verdict(RUNNING, Some(OTHER), Some(OTHER));
+        assert_eq!(verdict, "restart required");
+        assert_eq!(level, Level::Warn);
+        assert!(note.contains("not the code on disk"));
+    }
+
+    #[test]
+    fn a_deployed_commit_behind_origin_main_says_so() {
+        let (verdict, level, _) = version_verdict(RUNNING, Some(HEAD), Some(OTHER));
+        assert_eq!(verdict, "behind main");
+        assert_eq!(level, Level::Warn);
+    }
+
+    /// Every uncertain input lands here rather than on `current`. A panel that says the box is up
+    /// to date because it could not tell otherwise is worse than one that says nothing.
+    #[test]
+    fn every_unknown_input_reads_not_recorded_rather_than_current() {
+        for (running, head, origin) in [
+            // No stamp file, or one that parsed to nothing useful.
+            (RUNNING, None, None),
+            (RUNNING, None, Some(HEAD)),
+            // A stamp with no origin revision cannot answer "behind main", so it must not claim
+            // the box is current either.
+            (RUNNING, Some(HEAD), None),
+            // A build that could not run git.
+            ("unknown", Some(HEAD), Some(HEAD)),
+            // A build from a modified working tree matches no commit at all.
+            ("abc123abc123+dirty", Some(HEAD), Some(HEAD)),
+        ] {
+            let (verdict, level, _) = version_verdict(running, head, origin);
+            assert_eq!(
+                verdict, "not recorded",
+                "running={running} head={head:?} origin={origin:?}"
+            );
+            assert_eq!(level, Level::Unknown);
+        }
+    }
+
+    /// The stamp holds the full 40-character id and the binary a 12-character prefix of it, so
+    /// comparing them for equality would report "restart required" on every healthy box.
+    #[test]
+    fn the_short_sha_is_matched_as_a_prefix_of_the_stamps_full_one() {
+        assert_eq!(
+            version_verdict(RUNNING, Some(HEAD), Some(HEAD)).0,
+            "current"
+        );
+        // And a prefix that does not match must not be waved through.
+        assert_eq!(
+            version_verdict("abc123abc124", Some(HEAD), Some(HEAD)).0,
+            "restart required"
+        );
+    }
 }

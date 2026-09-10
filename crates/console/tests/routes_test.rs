@@ -81,6 +81,8 @@ fn test_state_full(
         deploy_stamp_path,
         startup_time: chrono::Utc::now(),
         version: "test",
+        git_sha: "abc123abc123",
+        built_at: "2026-09-09T00:00:00Z",
         log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),
         events_ingested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4813,6 +4815,95 @@ async fn fleet_version_panel_reads_not_recorded_when_no_stamp_file_exists(pool: 
     assert!(
         !body.contains(">current<"),
         "and must never claim the running build is current: {body}"
+    );
+}
+
+/// The whole point of the panel: a deploy built and installed new binaries, and the service was
+/// never restarted, so the running process is older than the code on disk. Nothing else on the box
+/// can see that, and it is the most common way a fix that "shipped" is not actually running.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_says_restart_required_when_the_stamp_moved_past_this_binary(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    // test_state_full stamps the binary as abc123abc123; the deploy recorded a different commit.
+    std::fs::write(
+        &stamp,
+        r#"{"head_sha": "f00dcafef00dcafef00dcafef00dcafef00dcafe",
+            "origin_main_sha": "f00dcafef00dcafef00dcafef00dcafef00dcafe",
+            "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+            "built_at": "2026-09-09T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let state = test_state_full(pool, None, Vec::new(), Some(stamp));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains("restart required"),
+        "a binary older than the deployed commit must say so: {body}"
+    );
+    assert!(
+        body.contains("abc123abc123"),
+        "the running revision must be shown, not just the deployed one: {body}"
+    );
+    assert!(
+        body.contains("f00dcafe"),
+        "the deployed revision must be shown alongside it: {body}"
+    );
+}
+
+/// The healthy case, so the panel is not just a machine for printing warnings: binary, deployed
+/// checkout and main all name the same commit.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_reads_current_when_binary_stamp_and_main_agree(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    // The full id the deploy records, of which the binary's stamp is the leading 12 characters.
+    std::fs::write(
+        &stamp,
+        r#"{"head_sha": "abc123abc123def456def456def456def456def4",
+            "origin_main_sha": "abc123abc123def456def456def456def456def4",
+            "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+            "built_at": "2026-09-09T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let state = test_state_full(pool, None, Vec::new(), Some(stamp));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains("current"),
+        "a matching binary, stamp and main must read current: {body}"
+    );
+    assert!(
+        !body.contains("restart required") && !body.contains("behind main"),
+        "and must not also carry a warning verdict: {body}"
     );
 }
 

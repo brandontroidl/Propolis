@@ -61,6 +61,35 @@ impl TestServer {
             .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad event: {e}: {l}")))
             .collect()
     }
+
+    /// Poll the event log for the capture's own `honeypot_malware_upload` line. The hand-off
+    /// worker writes the spooled body first and appends the event only after the outbox manifest
+    /// row is fsynced (`handoff::process_job`), and it runs off the connection's response path, so
+    /// the 226/426 reply the caller has already read says nothing about whether the event exists
+    /// yet. A fixed sleep only guesses at that gap; this waits for the artifact the caller is
+    /// about to assert on. Callers asserting the event is ABSENT must keep a fixed wait instead,
+    /// since no artifact ever arrives to poll for.
+    async fn wait_for_upload_event(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let content = tokio::fs::read_to_string(&self.log_path)
+                .await
+                .unwrap_or_default();
+            let recorded = content.lines().any(|line| {
+                serde_json::from_str::<sensor_wire::SensorEvent>(line)
+                    .is_ok_and(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+            });
+            if recorded {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for a honeypot_malware_upload event in {:?}",
+                self.log_path
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 struct FtpClient {
@@ -194,7 +223,7 @@ async fn stor_upload_captured_in_spool() {
     let r = client.read_reply().await;
     assert!(r.starts_with("226"), "STOR 226: {r}");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    srv.wait_for_upload_event().await;
     let events = srv.events().await;
     let upload = events
         .iter()
@@ -243,7 +272,7 @@ async fn stor_upload_past_the_cap_is_marked_truncated() {
     let r = client.read_reply().await;
     assert!(r.starts_with("226"), "STOR 226: {r}");
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    srv.wait_for_upload_event().await;
     let events = srv.events().await;
     let upload = events
         .iter()
@@ -298,7 +327,7 @@ async fn stor_that_stalls_mid_transfer_is_426_and_recorded_as_incomplete() {
     assert!(r.starts_with("426 Failure reading network stream."), "{r}");
     drop(data);
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    srv.wait_for_upload_event().await;
     let events = srv.events().await;
     let upload = events
         .iter()

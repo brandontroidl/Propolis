@@ -250,7 +250,7 @@ async fn push_file_captured_to_spool() {
     let body = b"MZ-fake-payload-bytes-not-real-malware";
     sync_push(&mut conn, 1, server_id, "/data/local/tmp/evil.bin", body).await;
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_upload_event(&srv.log_path).await;
     let events = srv.events().await;
     let upload = events
         .iter()
@@ -795,7 +795,9 @@ async fn orig_name_is_sanitized_in_malware_upload_event() {
     let evil_path = "/data/local/tmp/evil\r\nname.bin";
     sync_push(&mut conn, 1, server_id, evil_path, b"x").await;
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for the upload event before reading the log: on an empty log the CR assertion below
+    // passes without ever seeing the sanitized line it exists to check.
+    wait_for_upload_event(&srv.log_path).await;
     let content = tokio::fs::read_to_string(&srv.log_path).await.unwrap();
     assert!(!content.contains('\r'), "raw CR must never reach the log");
     let events = srv.events().await;

@@ -282,7 +282,10 @@ async fn push_file_captured_to_spool() {
 
 /// Poll `spool_dir` for a capture rather than sleeping a fixed time: the hand-off worker runs off
 /// the connection's response path, so there is no synchronous point at which it is observably
-/// done. Returns false if nothing arrives, which is what the negative test asserts.
+/// done. Returns false if nothing arrives, which is what the negative test asserts - and absence
+/// here settles the event log too, since `handoff::process_job` writes the body before it appends
+/// the event. A test asserting an event is PRESENT must wait on `wait_for_upload_event` instead,
+/// for the same ordering read the other way.
 async fn wait_for_spooled_file(spool_dir: &std::path::Path) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(6);
     while std::time::Instant::now() < deadline {
@@ -295,6 +298,32 @@ async fn wait_for_spooled_file(spool_dir: &std::path::Path) -> bool {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
+}
+
+/// Poll the event log for the capture's own `honeypot_malware_upload` line. The spooled body is
+/// written first and the event appended only after the outbox manifest row is fsynced
+/// (`handoff::process_job`), so waiting on the body can return before the event a caller then
+/// asserts on exists - a window that stays shut on an idle machine and opens on a loaded CI
+/// runner. Waiting on the event covers the body too, which lands strictly earlier.
+async fn wait_for_upload_event(log_path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let content = tokio::fs::read_to_string(log_path)
+            .await
+            .unwrap_or_default();
+        let recorded = content.lines().any(|line| {
+            serde_json::from_str::<sensor_wire::SensorEvent>(line)
+                .is_ok_and(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        });
+        if recorded {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for a honeypot_malware_upload event in {log_path:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Drive one unterminated binary payload at an interactive `adb shell` stream and return the
@@ -326,12 +355,13 @@ async fn shell_payload_session(
             .unwrap();
     }
 
-    assert!(
-        wait_for_spooled_file(&srv.spool_dir).await,
-        "the shell payload must reach the spool however the session ended"
-    );
+    wait_for_upload_event(&srv.log_path).await;
     let spooled: Vec<_> = std::fs::read_dir(&srv.spool_dir).unwrap().collect();
-    assert_eq!(spooled.len(), 1, "exactly one capture per session");
+    assert_eq!(
+        spooled.len(),
+        1,
+        "exactly one capture must reach the spool however the session ended"
+    );
     let stored = std::fs::read(spooled[0].as_ref().unwrap().path()).unwrap();
 
     let events = srv.events().await;

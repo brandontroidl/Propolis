@@ -537,7 +537,7 @@ async fn a_payload_cut_off_mid_line_is_still_captured_and_marked_incomplete() {
     conn.write_all(&payload).await.unwrap();
 
     // Hold the connection open and let the listener's max_duration cancel the handler.
-    wait_for_spooled_file(&spool_dir).await;
+    wait_for_upload_event(&log_path).await;
     drop(conn);
     handle.abort();
 
@@ -624,12 +624,12 @@ async fn payload_session(bounds: ConnectionBounds, payload: &[u8], ending: Endin
 
     match ending {
         Ending::GoQuiet => {
-            wait_for_spooled_file(&spool_dir).await;
+            wait_for_upload_event(&log_path).await;
             drop(conn);
         }
         Ending::CloseCleanly => {
             drop(conn);
-            wait_for_spooled_file(&spool_dir).await;
+            wait_for_upload_event(&log_path).await;
         }
         Ending::ResetConnection => {
             // A zero linger makes close send RST instead of FIN, so the server sees a read error
@@ -643,14 +643,14 @@ async fn payload_session(bounds: ConnectionBounds, payload: &[u8], ending: Endin
             #[allow(deprecated)]
             conn.set_linger(Some(Duration::ZERO)).unwrap();
             drop(conn);
-            wait_for_spooled_file(&spool_dir).await;
+            wait_for_upload_event(&log_path).await;
         }
         Ending::Logout => {
             // Close the binary line first, so the shell actually sees it and raises the flood
             // flag through the production path, then ask to end the session. The capture
             // therefore holds the payload plus these bytes - what matters here is the ending.
             conn.write_all(b"\r\nexit\r\n").await.unwrap();
-            wait_for_spooled_file(&spool_dir).await;
+            wait_for_upload_event(&log_path).await;
             drop(conn);
         }
     }
@@ -788,21 +788,31 @@ async fn a_payload_that_exhausts_the_capture_budget_is_recorded_as_a_prefix_and_
     );
 }
 
-/// Poll `spool_dir` for up to ~1s for at least one entry to appear, rather than a fixed sleep -
-/// the capture hand-off's worker runs off the connection's response path (see
+/// Poll the event log for the capture's own `honeypot_malware_upload` line, rather than a fixed
+/// sleep - the capture hand-off's worker runs off the connection's response path (see
 /// `sensor_framework::handoff`'s module doc), so there is no synchronous point at which "the
 /// worker is done" is directly observable.
-async fn wait_for_spooled_file(spool_dir: &std::path::Path) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+///
+/// Wait on the event line specifically, not on the spooled body: `handoff::process_job` writes the
+/// body first and appends the event only after the outbox manifest row is fsynced, so a wait that
+/// stops at the spooled file can return before the line every caller here goes on to assert on
+/// exists. That window never opens on an idle machine and opened three times at once on a loaded
+/// shared CI runner. The body is covered either way, being written strictly earlier.
+async fn wait_for_upload_event(log_path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if std::fs::read_dir(spool_dir)
-            .map(|mut it| it.next().is_some())
-            .unwrap_or(false)
-        {
+        let content = tokio::fs::read_to_string(log_path)
+            .await
+            .unwrap_or_default();
+        let recorded = content.lines().any(|line| {
+            serde_json::from_str::<sensor_wire::SensorEvent>(line)
+                .is_ok_and(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        });
+        if recorded {
             return;
         }
         if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for a spooled capture in {spool_dir:?}");
+            panic!("timed out waiting for a honeypot_malware_upload event in {log_path:?}");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -839,7 +849,7 @@ async fn binary_shell_payload_is_captured_as_evidence() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     drop(conn);
 
-    wait_for_spooled_file(&spool_dir).await;
+    wait_for_upload_event(&log_path).await;
     handle.abort();
 
     let spooled: Vec<_> = std::fs::read_dir(&spool_dir).unwrap().collect();

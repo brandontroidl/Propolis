@@ -8,8 +8,11 @@
 //! value is validated at startup and the process refuses to start on a malformed one rather than
 //! silently substituting a default that could disable the bound it names.
 
+use std::collections::HashSet;
 use std::env;
+use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use intake::runner::IntakeRunner;
@@ -20,9 +23,14 @@ const ENV_DATABASE_URL: &str = "DATABASE_URL";
 const ENV_CURSOR_DIR: &str = "PROPOLIS_CURSOR_DIR";
 const ENV_POLL_INTERVAL_MS: &str = "PROPOLIS_POLL_INTERVAL_MS";
 const ENV_SENSOR_LOGS: &str = "PROPOLIS_SENSOR_LOGS";
+const ENV_PROBE_SOURCE_IPS: &str = "PROPOLIS_FLEET_PROBE_SOURCE_IPS";
+const ENV_PROBE_INTERVAL: &str = "PROPOLIS_FLEET_PROBE_INTERVAL";
 
 const DEFAULT_CURSOR_DIR: &str = "/var/lib/propolis/cursors";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
+/// Mirrored from `propolis::config`'s own default; the two must stay equal or the window intake
+/// confirms in and the window the console trusts a confirmation in drift apart.
+const DEFAULT_PROBE_INTERVAL_SECS: u64 = 300;
 
 /// One entry of `PROPOLIS_SENSOR_LOGS`: a sensor's name (for logging/metrics) and the absolute
 /// path to its NDJSON log file. Mirrors the design doc's `SensorLogConfig`.
@@ -38,6 +46,8 @@ struct Config {
     cursor_dir: PathBuf,
     poll_interval: Duration,
     sensor_logs: Vec<SensorLogConfig>,
+    probe_sources: Arc<HashSet<IpAddr>>,
+    probe_grace: Duration,
 }
 
 #[derive(Debug, PartialEq)]
@@ -156,13 +166,51 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         ENV_POLL_INTERVAL_MS,
     )?;
     let sensor_logs = parse_sensor_logs(&env::var(ENV_SENSOR_LOGS).unwrap_or_default())?;
+    let probe_sources = parse_probe_sources(env::var(ENV_PROBE_SOURCE_IPS).ok().as_deref())?;
+    // Twice the sweep interval, the same window `fleet::health` calls fresh. This binary does not
+    // run the sweep, so it takes the cadence purely to size that window; a value it cannot parse
+    // falls back to the shared default rather than refusing to tail logs.
+    let probe_grace = Duration::from_secs(
+        env::var(ENV_PROBE_INTERVAL)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(DEFAULT_PROBE_INTERVAL_SECS)
+            .saturating_mul(2),
+    );
 
     Ok(Config {
         database_url,
         cursor_dir,
         poll_interval: Duration::from_millis(poll_interval_ms),
         sensor_logs,
+        probe_sources: Arc::new(probe_sources),
+        probe_grace,
     })
+}
+
+/// The control plane's own egress addresses, whose sensor lines are dropped before conversion.
+///
+/// This binary is the OTHER deployment shape of the same pipeline (the unified daemon runs the
+/// same runner in-process), so it reads the same variable. Omitting it here would leave a node
+/// running standalone intake writing the prober's own connections into the ledger while the daemon
+/// filtered them - the same probe scoring the control plane into the blocklist on one shape and
+/// not the other. A malformed address is rejected rather than skipped: a filter that silently
+/// dropped one of its entries is a filter that stops filtering.
+fn parse_probe_sources(raw: Option<&str>) -> Result<HashSet<IpAddr>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(HashSet::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<IpAddr>().map_err(|_| ConfigError::InvalidBound {
+                field: ENV_PROBE_SOURCE_IPS,
+                value: s.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Resolves when the process receives SIGINT (`Ctrl+C`) or, on Unix, SIGTERM - what `systemctl
@@ -214,20 +262,27 @@ async fn run_sensor_loop(
     pool: PgPool,
     cursor_dir: PathBuf,
     poll_interval: Duration,
+    probe_sources: Arc<HashSet<IpAddr>>,
+    probe_grace: Duration,
 ) {
     let SensorLogConfig { name, log_path } = sensor;
     let tailer = LogTailer::new(log_path, cursor_dir);
-    let mut runner = IntakeRunner::new(tailer, pool, name.clone());
+    let mut runner = IntakeRunner::new(tailer, pool, name.clone(), probe_sources, probe_grace);
     tracing::info!(sensor = %name, "intake: tailer started");
 
     loop {
         let result = runner.run_batch().await;
 
-        if result.ingested > 0 || result.rejected > 0 || result.errors > 0 {
+        if result.ingested > 0
+            || result.rejected > 0
+            || result.probe_confirmations > 0
+            || result.errors > 0
+        {
             tracing::info!(
                 sensor = %name,
                 ingested = result.ingested,
                 rejected = result.rejected,
+                probe_confirmations = result.probe_confirmations,
                 errors = result.errors,
                 "intake: batch processed"
             );
@@ -239,7 +294,8 @@ async fn run_sensor_loop(
             tracing::error!(sensor = %name, error = %e, "intake: cursor persist failed");
         }
 
-        if result.ingested == 0 && result.rejected == 0 {
+        // A batch of nothing but probe lines still consumed input, so there may be more waiting.
+        if result.ingested == 0 && result.rejected == 0 && result.probe_confirmations == 0 {
             tokio::time::sleep(poll_interval).await;
         }
     }
@@ -279,8 +335,18 @@ async fn main() {
         let pool = pool.clone();
         let cursor_dir = config.cursor_dir.clone();
         let poll_interval = config.poll_interval;
+        let probe_sources = config.probe_sources.clone();
+        let probe_grace = config.probe_grace;
         handles.push(tokio::spawn(async move {
-            run_sensor_loop(sensor, pool, cursor_dir, poll_interval).await;
+            run_sensor_loop(
+                sensor,
+                pool,
+                cursor_dir,
+                poll_interval,
+                probe_sources,
+                probe_grace,
+            )
+            .await;
         }));
     }
 

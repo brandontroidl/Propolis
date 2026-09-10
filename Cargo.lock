@@ -1467,6 +1467,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -2119,6 +2121,7 @@ version = "0.3.0"
 dependencies = [
  "chrono",
  "core-scoring",
+ "fleet",
  "log-tailer",
  "sensor-wire",
  "serde",

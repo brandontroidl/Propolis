@@ -112,6 +112,7 @@ async fn a_stalled_capture_reaches_the_console_reading_as_incomplete(pool: PgPoo
             rdns: Arc::new(console::rdns::RdnsResolver::disabled()),
             feed_output_dir: Some(feed_dir.path().to_path_buf()),
             fleet_listeners: Arc::new(Vec::new()),
+            fleet_probe_interval: std::time::Duration::from_secs(300),
             deploy_stamp_path: None,
             startup_time: chrono::Utc::now(),
             version: "test",
@@ -138,8 +139,15 @@ async fn a_stalled_capture_reaches_the_console_reading_as_incomplete(pool: PgPoo
     let tailed_log = sensor_log.clone();
     let intake_handle = tokio::spawn(async move {
         let tailer = log_tailer::LogTailer::new(tailed_log, cursor_dir);
-        let mut runner =
-            intake::runner::IntakeRunner::new(tailer, intake_pool, "test-sensor".to_string());
+        let mut runner = intake::runner::IntakeRunner::new(
+            tailer,
+            intake_pool,
+            "test-sensor".to_string(),
+            // No probe configured in this test: nothing is filtered, which is the
+            // shape a node without the reachability sweep runs in.
+            std::sync::Arc::new(std::collections::HashSet::new()),
+            std::time::Duration::from_secs(600),
+        );
         loop {
             if intake_cancel.is_cancelled() {
                 let _ = runner.persist_cursor();

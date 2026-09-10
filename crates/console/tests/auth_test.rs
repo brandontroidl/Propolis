@@ -39,6 +39,7 @@ fn test_state(db: PgPool) -> AppState {
         rdns: Arc::new(console::rdns::RdnsResolver::disabled()),
         feed_output_dir: None,
         fleet_listeners: Arc::new(Vec::new()),
+        fleet_probe_interval: std::time::Duration::from_secs(300),
         deploy_stamp_path: None,
         startup_time: chrono::Utc::now(),
         version: "test",

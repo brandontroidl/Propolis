@@ -192,6 +192,37 @@ viewer of the same data.
 |---|---|---|---|
 | `PROPOLIS_FLEET_LISTENERS` | no | none (empty inventory) | comma-separated `collector/sensor/protocol/port` entries, e.g. `local/ssh/tcp/22,local/catchall/udp/1024`. Unset or blank means "this node was told no inventory": the pane then reports every check as unknown rather than reporting nothing at all. A value that IS set and malformed aborts startup - never a silently shortened list. `protocol` is `tcp` or `udp`; `port` is 1-65535. |
 | `PROPOLIS_FLEET_DEPLOY_STAMP` | no | none | path to the deploy stamp JSON. A missing, unreadable, or malformed file leaves the version panel reading `not recorded`, never `current`. |
+| `PROPOLIS_FLEET_COLLECTOR_ENDPOINTS` | no | none | comma-separated `collector=address`, e.g. `local=198.51.100.7`. The address the control plane dials for that collector's listeners. A listener whose collector is absent here is recorded `not probeable` with the reason named, never guessed at. A malformed entry aborts startup. |
+| `PROPOLIS_FLEET_PROBE_INTERVAL` | no | `300` | sweep cadence in seconds, 60-86400. Rejected rather than clamped outside that range. Also the unit the console measures probe staleness in: a row older than twice this alarms, whatever its last outcome was. The standalone `console` binary reads it too, purely to size that rule. |
+| `PROPOLIS_FLEET_PROBE_TIMEOUT` | no | `5` | per-connect deadline in seconds, 1-60. Rejected rather than clamped outside that range. Bounds each connect so a blackholed address cannot hold a sweep open on the OS default connect timeout. |
+
+The next two turn the active probe on, and they go together.
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_FLEET_PROBE_ENABLED` | no | `false` | whether the daemon runs the reachability sweep. Unified daemon only; the standalone `console` never probes. |
+| `PROPOLIS_FLEET_PROBE_SOURCE_IPS` | when the probe is on | none | comma-separated IP addresses this node's own connects arrive from. Intake drops sensor lines from these before conversion. **Required whenever `PROPOLIS_FLEET_PROBE_ENABLED=true`: startup refuses without it.** Read by the unified daemon and by the standalone `intake` binary. |
+
+Why that refusal exists. Every TCP sensor emits `honeypot_connection` the moment it accepts a
+connection, before reading a byte, and that signal weighs 40 at confidence 0.900. A five-minute
+sweep across a dozen listeners is a few thousand such events a day, all from one address: this
+node's own. Unless intake recognises and drops them, the control plane scores itself into the
+review queue and out into the published blocklist, and nothing downstream can retract that. There
+is no safe default to guess here, because only the operator knows which address this node's
+connects arrive from, so the daemon refuses to start rather than probe unfiltered.
+
+What a `reachable` verdict does and does not prove. The connect proves a socket answered on the
+path the control plane took. On the current single-box deployment the control plane and the
+collector are the same host, so that path is a **hairpin**: the packets never leave the machine,
+and the result is evidence that the listener is up locally, not that anything on the internet can
+reach it. The prober detects this at the socket level and labels the row, so the pane says so
+rather than implying external reachability. A separated control plane, dialling a collector across
+the real network path, is what turns the same check into evidence about external reachability.
+
+The other half of the answer is the intake confirmation. A row reads `ok` only when the socket
+answered AND the resulting sensor line reached intake within two sweep intervals. `reachable` with
+no recent confirmation is a warning, not health: the listener is up and something between the log
+file and intake is broken.
 
 `sensor` is the sensor's OWN reported name, which is what lands in
 `event.sensor` - not the `PROPOLIS_SENSOR_LOGS` label. `sensor-cred` reports its

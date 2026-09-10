@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn daemon_subsystems_are_disjoint_from_sensor_names() {
-        // The daemon set is load-bearing: these names must match the spawn_supervised call-site
+        // The daemon set decides the page severity: these names must match the spawn_supervised call-site
         // literals in main.rs exactly, or a gave-up subsystem is misclassified and pages at the
         // wrong severity (Warning sensor-down vs Critical subsystem-gaveup). Pin it so an edit to
         // either side is a conscious, reviewed change rather than silent drift. (Asserting
@@ -229,7 +229,11 @@ mod tests {
                 "fetcher",
                 "console",
                 "ops-monitor",
-                "sample-retention"
+                "sample-retention",
+                // Spawned only when PROPOLIS_FLEET_PROBE_ENABLED is on, but named here
+                // unconditionally: the classification decides how a give-up pages, and it must not
+                // depend on a config value the ops-monitor cannot see.
+                "listener-probe"
             ],
         );
         // The real deployed sensor names (INSTALL.md) must all classify as sensors.

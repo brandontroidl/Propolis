@@ -24,13 +24,15 @@
 //! rather than by `base.html`'s chrome, so the 30-second refresh keeps it current instead of
 //! freezing whatever was true when the page first loaded.
 //!
-//! Reachability is `never probed` for every listener until the control-plane prober lands. That is
-//! the truthful reading: the question is unanswered, so the pane says so and the headline is not
-//! `ok`.
+//! **Reachability is what the prober found, with its vantage point named.** A listener the prober
+//! has not reached yet reads `never probed` in unknown styling rather than being left blank, and on
+//! a single box - control plane and collector on the same host - the connect is a HAIRPIN that
+//! never leaves the machine. The prober detects that at the socket level and stores it as the row's
+//! detail, which is rendered next to the verdict, so nothing here presents a same-host connect as
+//! evidence that anything outside can reach the listener.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Duration;
 
 use axum::extract::State;
 use axum::response::Html;
@@ -49,11 +51,6 @@ use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
 use crate::routes::feed::read_manifest;
 use crate::routes::format::{format_relative_time, format_sensor_label, format_timestamp};
-
-/// The sweep interval the staleness rules are measured against. Matches the prober's own default;
-/// once the prober is configurable this comes from `AppState` instead. A row older than twice this
-/// is an alarm no matter what it says.
-const PROBE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How far back the capture-completeness panel looks. Long enough that a low-traffic sensor still
 /// has a denominator, short enough that a fix made this week is visible in the rate.
@@ -400,6 +397,11 @@ struct FleetView {
 
 async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
     let now = Utc::now();
+    // The staleness rules are measured in sweep intervals, so they follow the prober's configured
+    // cadence rather than a constant here: with a constant, an operator who slowed the sweep down
+    // would get a page on which every row read stale, and one who sped it up would keep a rule
+    // looser than the evidence allows.
+    let probe_interval = state.fleet_probe_interval;
 
     let probe_rows = degraded.soft("listener probes", fleet::store::read_all(&state.db).await);
     let probes: HashMap<(String, String, String, u16), fleet::ProbeRow> = probe_rows
@@ -433,14 +435,30 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
             listener.port,
         );
         let probe = probes.get(&key);
-        let reach = reach_level(probe, now, PROBE_INTERVAL);
+        let reach = reach_level(probe, now, probe_interval);
         // A row too old to trust must SAY it is stale. Showing its last recorded outcome alone
         // would put the word "reachable" on a listener nothing has checked since the prober died,
         // which is the exact failure the staleness rule exists to catch.
         let stale = probe.is_some_and(|p| {
             now - p.attempted_at
-                > chrono::Duration::from_std(PROBE_INTERVAL.saturating_mul(2)).unwrap_or_default()
+                > chrono::Duration::from_std(probe_interval.saturating_mul(2)).unwrap_or_default()
         });
+        // A warning on this column has a specific meaning the outcome word alone does not carry:
+        // the socket answered and the line it produced never arrived at the far end. That is the
+        // most useful thing this page can say, because it puts the break in the log, logrotate,
+        // shipper, gateway or intake path and takes the sensor itself off the list. Whatever the
+        // prober recorded (the hairpin note, the refusal reason) is kept alongside it.
+        let mut detail_parts: Vec<String> = Vec::new();
+        if reach == Level::Warn
+            && probe.is_some_and(|p| p.outcome == fleet::ProbeOutcome::Reachable)
+        {
+            detail_parts.push("socket answered, no line reached intake".to_string());
+        }
+        if let Some(recorded) = probe.and_then(|p| p.detail.as_ref()) {
+            detail_parts.push(recorded.clone());
+        }
+        let reach_detail = (!detail_parts.is_empty()).then(|| detail_parts.join("; "));
+
         let seen = activity.get(&listener.sensor);
         let last_event_at = seen.and_then(|a| a.last_event_at);
         let event_level = event_age_level(last_event_at, now);
@@ -472,7 +490,7 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
             },
             reach_level: reach.class(),
             reach_dot: dot_class(reach),
-            reach_detail: probe.and_then(|p| p.detail.clone()),
+            reach_detail,
             probe_ago: probe
                 .map(|p| format_relative_time(p.attempted_at))
                 .unwrap_or_else(|| "never".to_string()),

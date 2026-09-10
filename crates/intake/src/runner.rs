@@ -2,7 +2,13 @@
 //! `core_scoring::append_event`, the per-poll unit of work a sensor's intake loop repeats. See
 //! "The runner" in `internal/design/03-event-intake-aggregation.md`.
 
+use std::collections::HashSet;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::converter::convert;
+use chrono::Utc;
 use core_scoring::{append_event, append_telemetry_event};
 use log_tailer::LogTailer;
 use sensor_wire::SensorEvent;
@@ -17,6 +23,14 @@ pub struct RunBatchResult {
     /// wire version, domain validation) - permanently unprocessable, so they are dropped rather
     /// than retried.
     pub rejected: usize,
+    /// Lines dropped because they came from a configured reachability-probe source, each recorded
+    /// against its `listener_probe` row instead of the ledger.
+    ///
+    /// Kept SEPARATE from `ingested` and `rejected` on purpose: `ops_alert::conditions::intake`
+    /// derives its stall verdict from those two, and a steady drip of probe lines counting as
+    /// ingestion would keep a wedged tailer looking healthy. It still counts as cursor progress -
+    /// see `progress_from_batch`.
+    pub probe_confirmations: usize,
     /// Non-zero only when `append_event` itself failed (a database error) partway through the
     /// batch; the batch stops at the first one, so this is 0 or 1 under the current stop-on-first
     /// policy, never a running count of every failure. See `run_batch`'s doc comment for why the
@@ -30,14 +44,34 @@ pub struct IntakeRunner {
     tailer: LogTailer,
     pool: PgPool,
     sensor_name: String,
+    probe_sources: Arc<HashSet<IpAddr>>,
+    probe_grace: Duration,
 }
 
 impl IntakeRunner {
-    pub fn new(tailer: LogTailer, pool: PgPool, sensor_name: String) -> Self {
+    /// `probe_sources` are the control plane's own egress addresses, from
+    /// `PROPOLIS_FLEET_PROBE_SOURCE_IPS`. An EMPTY set means no probe is configured on this node
+    /// and nothing is filtered, which is why the set is a constructor parameter rather than an
+    /// optional builder step: every construction site has to state which it is, and a node that
+    /// turns the probe on without telling intake about it cannot happen by omission.
+    ///
+    /// `probe_grace` is how far back a probe attempt may be and still be the one a sighting
+    /// belongs to. The daemon passes twice the sweep interval, the same window
+    /// `fleet::health::reach_level` calls fresh, so the two cannot come to disagree about what
+    /// "recent" means.
+    pub fn new(
+        tailer: LogTailer,
+        pool: PgPool,
+        sensor_name: String,
+        probe_sources: Arc<HashSet<IpAddr>>,
+        probe_grace: Duration,
+    ) -> Self {
         Self {
             tailer,
             pool,
             sensor_name,
+            probe_sources,
+            probe_grace,
         }
     }
 
@@ -72,6 +106,38 @@ impl IntakeRunner {
                     continue;
                 }
             };
+
+            // A synthetic reachability probe from this control plane's own egress address is not
+            // attacker evidence. It is dropped BEFORE conversion, so it can never reach the ledger
+            // or a score: every TCP sensor emits `honeypot_connection` on accept, which weighs 40
+            // at confidence 0.900, and a five-minute sweep would otherwise score the control
+            // plane's own address into the review queue and the published blocklist.
+            //
+            // The sighting is recorded against the probe row instead. Intake is the far end of the
+            // collection chain, so a probe line arriving HERE is the proof that socket, sensor,
+            // log, shipper, gateway and intake all work - the half of the question a connect
+            // alone cannot answer.
+            if self.probe_sources.contains(&event.source_ip) {
+                if let Err(e) = fleet::store::confirm_sensor(
+                    &self.pool,
+                    &event.sensor,
+                    Utc::now(),
+                    self.probe_grace,
+                )
+                .await
+                {
+                    // Logged, not fatal, and not counted as an error: the line is dropped either
+                    // way, and failing to record the confirmation leaves the row unconfirmed,
+                    // which the pane already renders as a warning rather than as health.
+                    tracing::warn!(
+                        sensor = %event.sensor,
+                        error = %e,
+                        "probe confirmation could not be recorded"
+                    );
+                }
+                result.probe_confirmations += 1;
+                continue;
+            }
 
             let input = match convert(event) {
                 Ok(input) => input,

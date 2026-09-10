@@ -194,10 +194,12 @@ async fn run_intake_sensor(
     ingested_counter: Arc<std::sync::atomic::AtomicU64>,
     rejected_counter: Arc<std::sync::atomic::AtomicU64>,
     intake_progress: IntakeProgress,
+    probe_sources: Arc<HashSet<IpAddr>>,
+    probe_grace: Duration,
 ) {
     let SensorLogConfig { name, log_path } = sensor;
     let tailer = LogTailer::new(log_path, cursor_dir);
-    let mut runner = IntakeRunner::new(tailer, pool, name.clone());
+    let mut runner = IntakeRunner::new(tailer, pool, name.clone(), probe_sources, probe_grace);
     tracing::info!(sensor = %name, "intake: tailer started");
 
     // Seed the liveness entry so a sensor that never ingests still reads as "recently alive" until
@@ -222,8 +224,12 @@ async fn run_intake_sensor(
         let result = runner.run_batch().await;
 
         // Publish intake liveness for the ops-monitor's intake-stalled condition.
-        let (advanced, backlog) =
-            progress_from_batch(result.ingested, result.rejected, result.errors);
+        let (advanced, backlog) = progress_from_batch(
+            result.ingested,
+            result.rejected,
+            result.probe_confirmations,
+            result.errors,
+        );
         {
             let mut map = intake_progress.lock().unwrap_or_else(|p| p.into_inner());
             let entry = map.entry(intake_key).or_insert(SensorIntake {
@@ -236,7 +242,14 @@ async fn run_intake_sensor(
             entry.backlog = backlog;
         }
 
-        if result.ingested > 0 || result.rejected > 0 || result.errors > 0 {
+        // The probe confirmations are logged but deliberately left out of the two counters
+        // `/metrics` publishes as ingest volume: they are this node's own synthetic traffic, and
+        // folding them in would inflate the number an operator reads as attacker activity.
+        if result.ingested > 0
+            || result.rejected > 0
+            || result.probe_confirmations > 0
+            || result.errors > 0
+        {
             ingested_counter
                 .fetch_add(result.ingested as u64, std::sync::atomic::Ordering::Relaxed);
             rejected_counter
@@ -245,6 +258,7 @@ async fn run_intake_sensor(
                 sensor = %name,
                 ingested = result.ingested,
                 rejected = result.rejected,
+                probe_confirmations = result.probe_confirmations,
                 errors = result.errors,
                 "intake: batch processed"
             );
@@ -256,7 +270,9 @@ async fn run_intake_sensor(
             tracing::error!(sensor = %name, error = %e, "intake: cursor persist failed");
         }
 
-        if result.ingested == 0 && result.rejected == 0 {
+        // A batch of nothing but probe lines still consumed input, so there may be more waiting:
+        // sleeping here would halve the drain rate of a log the probe is writing into.
+        if result.ingested == 0 && result.rejected == 0 && result.probe_confirmations == 0 {
             tokio::select! {
                 _ = tokio::time::sleep(poll_interval) => {}
                 _ = cancel.cancelled() => {}
@@ -433,6 +449,7 @@ struct ConsoleRuntime {
     trusted_proxy: bool,
     metrics_token: Option<String>,
     fleet_listeners: Arc<Vec<fleet::Listener>>,
+    fleet_probe_interval: Duration,
     deploy_stamp_path: Option<PathBuf>,
     log_buffer: Arc<LogBuffer>,
     events_ingested: Arc<std::sync::atomic::AtomicU64>,
@@ -454,6 +471,7 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         trusted_proxy,
         metrics_token,
         fleet_listeners,
+        fleet_probe_interval,
         deploy_stamp_path,
         log_buffer,
         events_ingested,
@@ -498,6 +516,7 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         rdns: Arc::new(console::rdns::RdnsResolver::new(rdns_enabled)),
         feed_output_dir,
         fleet_listeners,
+        fleet_probe_interval,
         deploy_stamp_path,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),
@@ -694,6 +713,12 @@ async fn main() {
     // reads it (intake-stalled condition).
     let intake_progress: IntakeProgress = Arc::new(Mutex::new(HashMap::new()));
 
+    // Shared by every intake tailer. The grace window is twice the sweep interval, the same
+    // multiple `fleet::health::reach_level` calls fresh, so the window intake confirms in and the
+    // window the console trusts a confirmation in cannot drift apart.
+    let probe_sources = Arc::new(config.fleet_probe_sources.clone());
+    let probe_grace = config.fleet_probe_interval.saturating_mul(2);
+
     for sensor in config.sensor_logs {
         let pool = pool.clone();
         let cursor_dir = config.cursor_dir.clone();
@@ -703,6 +728,7 @@ async fn main() {
         let ing = events_ingested.clone();
         let rej = events_rejected.clone();
         let progress = intake_progress.clone();
+        let sensor_probe_sources = probe_sources.clone();
 
         handles.push(spawn_supervised(
             sensor_name,
@@ -715,6 +741,7 @@ async fn main() {
                 let ing = ing.clone();
                 let rej = rej.clone();
                 let progress = progress.clone();
+                let probe_sources = sensor_probe_sources.clone();
                 async move {
                     run_intake_sensor(
                         sensor,
@@ -726,11 +753,51 @@ async fn main() {
                         ing,
                         rej,
                         progress,
+                        probe_sources,
+                        probe_grace,
                     )
                     .await;
                 }
             },
         ));
+    }
+
+    // 5b. Spawn the listener reachability probe, if enabled. Supervised like every other daemon
+    // subsystem, so a panicking sweep restarts under backoff and a give-up shows in /ready and
+    // pages through subsystem-gaveup rather than leaving the pane quietly unmeasured.
+    //
+    // Config already refused to start if this is enabled without the source addresses intake needs
+    // to drop the probe's own connections (`ConfigError::ProbeEnabledWithoutSources`), so by the
+    // time the sweep runs the contamination guard is known to be armed.
+    if config.fleet_probe_enabled {
+        if config.fleet_listeners.is_empty() {
+            tracing::warn!(
+                "listener-probe: enabled but PROPOLIS_FLEET_LISTENERS names no listeners; the \
+                 sweep has nothing to dial and the fleet pane will report every check as unknown"
+            );
+        }
+        let probe_pool = pool.clone();
+        let probe_listeners = Arc::new(config.fleet_listeners.clone());
+        let probe_endpoints = Arc::new(config.fleet_endpoints.clone());
+        let probe_cfg = fleet::ProbeConfig {
+            interval: config.fleet_probe_interval,
+            timeout: config.fleet_probe_timeout,
+        };
+        handles.push(spawn_supervised(
+            "listener-probe",
+            cancel.clone(),
+            supervisor_state.clone(),
+            move |token| {
+                let pool = probe_pool.clone();
+                let listeners = probe_listeners.clone();
+                let endpoints = probe_endpoints.clone();
+                async move {
+                    fleet::run_probe_loop(pool, listeners, endpoints, probe_cfg, token).await;
+                }
+            },
+        ));
+    } else {
+        tracing::info!("propolis: listener reachability probe disabled");
     }
 
     // 6. Spawn review subsystem (queue scan + submission) if enabled.
@@ -1092,6 +1159,7 @@ async fn main() {
         let console_trusted_proxy = config.console_trusted_proxy;
         let console_metrics_token = config.console_metrics_token.clone();
         let console_fleet_listeners = Arc::new(config.fleet_listeners.clone());
+        let console_fleet_probe_interval = config.fleet_probe_interval;
         let console_deploy_stamp = config.fleet_deploy_stamp.clone();
         let log_buffer = log_buffer.clone();
         let ing = events_ingested.clone();
@@ -1127,6 +1195,7 @@ async fn main() {
                             trusted_proxy: console_trusted_proxy,
                             metrics_token: console_metrics_token,
                             fleet_listeners,
+                            fleet_probe_interval: console_fleet_probe_interval,
                             deploy_stamp_path,
                             log_buffer,
                             events_ingested: ing,

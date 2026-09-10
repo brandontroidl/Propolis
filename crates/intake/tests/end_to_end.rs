@@ -4,11 +4,25 @@
 // and the suite must run with `--test-threads=1` since `append_event` serializes via a Postgres
 // advisory lock that is scoped to a transaction, not a test.
 
+use std::collections::HashSet;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
 use core_scoring::{ChainStatus, read_score, verify_chain};
 use intake::runner::IntakeRunner;
 use log_tailer::LogTailer;
 use sensor_wire::*;
 use sqlx::PgPool;
+
+/// How far back a probe attempt may be and still be the one a sighting belongs to. The daemon
+/// passes twice the sweep interval; 600s is that for the default 300s cadence.
+const PROBE_GRACE: Duration = Duration::from_secs(600);
+
+/// The shape a node with no reachability probe configured runs in: nothing is filtered.
+fn no_probe_sources() -> Arc<HashSet<IpAddr>> {
+    Arc::new(HashSet::new())
+}
 
 async fn setup_pool() -> PgPool {
     let url = std::env::var("DATABASE_URL")
@@ -58,7 +72,13 @@ async fn ingest_single_event_appears_in_ledger(pool: PgPool) {
     write_event_line(&log_path, &event);
 
     let tailer = LogTailer::new(log_path, dir.path().join("cursors"));
-    let mut runner = IntakeRunner::new(tailer, pool.clone(), "test-ssh".into());
+    let mut runner = IntakeRunner::new(
+        tailer,
+        pool.clone(),
+        "test-ssh".into(),
+        no_probe_sources(),
+        PROBE_GRACE,
+    );
     let result = runner.run_batch().await;
     assert_eq!(result.ingested, 1);
     assert_eq!(result.rejected, 0);
@@ -115,7 +135,13 @@ async fn a_telemetry_line_reaches_the_ledger_through_intake_and_scores_nothing(p
     write_event_line(&log_path, &telemetry);
 
     let tailer = LogTailer::new(log_path, dir.path().join("cursors"));
-    let mut runner = IntakeRunner::new(tailer, pool.clone(), "test-ssh".into());
+    let mut runner = IntakeRunner::new(
+        tailer,
+        pool.clone(),
+        "test-ssh".into(),
+        no_probe_sources(),
+        PROBE_GRACE,
+    );
     let result = runner.run_batch().await;
     assert_eq!(result.ingested, 1, "the outcome record was ingested");
     assert_eq!(result.rejected, 0);
@@ -191,7 +217,13 @@ async fn unknown_signal_type_rejected_cursor_advances() {
     write_event_line(&log_path, &good);
 
     let tailer = LogTailer::new(log_path, dir.path().join("cursors"));
-    let mut runner = IntakeRunner::new(tailer, pool.clone(), "test".into());
+    let mut runner = IntakeRunner::new(
+        tailer,
+        pool.clone(),
+        "test".into(),
+        no_probe_sources(),
+        PROBE_GRACE,
+    );
     let result = runner.run_batch().await;
     assert_eq!(result.rejected, 1);
     assert_eq!(result.ingested, 1);
@@ -244,7 +276,13 @@ async fn hash_chain_intact_after_ingestion(pool: PgPool) {
     }
 
     let tailer = LogTailer::new(log_path, dir.path().join("cursors"));
-    let mut runner = IntakeRunner::new(tailer, pool.clone(), "test".into());
+    let mut runner = IntakeRunner::new(
+        tailer,
+        pool.clone(),
+        "test".into(),
+        no_probe_sources(),
+        PROBE_GRACE,
+    );
     runner.run_batch().await;
 
     let status = verify_chain(&pool).await.unwrap();
@@ -282,6 +320,8 @@ async fn rotation_survival_no_events_lost() {
         LogTailer::new(log_path.clone(), cursor_dir.clone()),
         pool.clone(),
         "test".into(),
+        no_probe_sources(),
+        PROBE_GRACE,
     );
     let r = runner.run_batch().await;
     assert_eq!(r.ingested, 3);
@@ -314,6 +354,8 @@ async fn rotation_survival_no_events_lost() {
         LogTailer::new(log_path, cursor_dir),
         pool.clone(),
         "test".into(),
+        no_probe_sources(),
+        PROBE_GRACE,
     );
     let r2 = runner2.run_batch().await;
     assert_eq!(r2.ingested, 3);

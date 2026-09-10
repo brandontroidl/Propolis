@@ -55,6 +55,7 @@ pub const DAEMON_SUBSYSTEMS: &[&str] = &[
     "console",
     "ops-monitor",
     "sample-retention",
+    "listener-probe",
 ];
 
 /// True when `name` is a per-sensor intake tailer rather than a daemon subsystem.

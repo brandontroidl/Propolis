@@ -16,6 +16,7 @@ pub mod templates;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use minijinja::Environment;
@@ -73,6 +74,12 @@ pub struct AppState {
     /// every check as unknown rather than reporting nothing at all: a page with no rows would be
     /// indistinguishable from a fleet with nothing wrong.
     pub fleet_listeners: Arc<Vec<fleet::Listener>>,
+    /// The prober's sweep interval (`PROPOLIS_FLEET_PROBE_INTERVAL`), which is the unit
+    /// `routes::fleet` measures probe staleness in: a row older than twice this alarms. It is read
+    /// here rather than hard-coded so an operator who slows the sweep down does not get a page
+    /// where every row reads stale, and so speeding it up tightens the rule rather than leaving it
+    /// loose.
+    pub fleet_probe_interval: Duration,
     /// Path to the deploy stamp (`PROPOLIS_FLEET_DEPLOY_STAMP`), written by `deploy/upgrade.sh`.
     /// `None`, a missing file, or a malformed one all leave the fleet pane's version panel reading
     /// "not recorded", never "current".

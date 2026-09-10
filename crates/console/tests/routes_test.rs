@@ -77,6 +77,7 @@ fn test_state_full(
         rdns: Arc::new(console::rdns::RdnsResolver::disabled()),
         feed_output_dir,
         fleet_listeners: Arc::new(fleet_listeners),
+        fleet_probe_interval: std::time::Duration::from_secs(300),
         deploy_stamp_path,
         startup_time: chrono::Utc::now(),
         version: "test",
@@ -4890,5 +4891,312 @@ async fn fleet_status_fragment_renders_the_same_rows_without_the_page_chrome(poo
     assert!(
         !body.contains("<html") && !body.contains("class=\"topnav\""),
         "the fragment must not carry the page chrome: {body}"
+    );
+}
+
+/// Blocking the port at the firewall while the sensor still runs looks like this. The distinction
+/// from `refused` is the whole diagnostic payload: refused means the path works and nothing is
+/// listening, a timeout means the packet was dropped, and they call for different repairs.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_shows_a_timeout_apart_from_a_refusal(pool: PgPool) {
+    migrate(&pool).await;
+    insert_probe(
+        &pool,
+        "telnet",
+        "tcp",
+        23,
+        "timeout",
+        Some("no answer within the probe timeout: the packet was dropped"),
+        chrono::Utc::now(),
+        None,
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("telnet", fleet::Proto::Tcp, 23)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("timeout"),
+        "a dropped packet must read as a timeout in words: {table}"
+    );
+    assert!(
+        !table.contains("refused"),
+        "a timeout must never be presented as a refusal - they point at different repairs: {table}"
+    );
+    assert!(
+        table.contains("the packet was dropped"),
+        "the stored diagnosis must reach the page: {table}"
+    );
+    assert!(
+        table.contains(r#"data-level="alarm""#),
+        "a timeout is an alarm: {table}"
+    );
+}
+
+/// The socket answered and nothing arrived at the far end. This is the single most useful reading
+/// the pane produces, because it takes the sensor off the list and puts the break in the log,
+/// logrotate, shipper, gateway or intake path.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_reads_reachable_without_a_confirmation_as_a_warning_naming_the_break(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    // Real attacker traffic on this sensor, so the row's liveness half is `ok` and the warning
+    // under test is the only thing keeping the headline off `proven`. Without an event the row
+    // would be `unknown` for a second, unrelated reason and the assertion would prove nothing.
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.33",
+            "ssh",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    insert_probe(
+        &pool,
+        "ssh",
+        "tcp",
+        22,
+        "reachable",
+        None,
+        chrono::Utc::now(),
+        None,
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("socket answered, no line reached intake"),
+        "an unconfirmed reachable row must name where the break is: {table}"
+    );
+    assert!(
+        table.contains(r#"data-level="warn""#),
+        "reachable without a confirmation is a warning, not ok: {table}"
+    );
+    assert!(
+        !body.contains("every listener proven"),
+        "an unconfirmed listener is not proven: {body}"
+    );
+    assert!(
+        body.contains("listeners answering, evidence path unconfirmed"),
+        "the headline must say which half of the chain is unproven: {body}"
+    );
+}
+
+/// The hairpin. On a single box the control plane and the collector are the same host, so a probe
+/// connect never leaves the machine. The page must say so: a `reachable` verdict presented without
+/// that qualifier reads as evidence about the external path, which it is not.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_labels_a_same_host_probe_as_a_hairpin(pool: PgPool) {
+    migrate(&pool).await;
+    let now = chrono::Utc::now();
+    insert_probe(
+        &pool,
+        "ssh",
+        "tcp",
+        22,
+        "reachable",
+        Some(
+            "hairpin: this connect never left the host, so it is not evidence of external \
+             reachability",
+        ),
+        now,
+        Some(now),
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("hairpin"),
+        "a same-host connect must be labelled a hairpin even when it succeeded: {table}"
+    );
+    assert!(
+        table.contains("not evidence of external reachability"),
+        "and must say what it does not prove: {table}"
+    );
+    assert!(
+        table.contains("control plane to"),
+        "the vantage point stays named beside the verdict: {table}"
+    );
+}
+
+/// A coverage figure that dropped the listeners it cannot test would flatter itself. UDP is a real
+/// third state: named in words, never green, out of the numerator and in the denominator.
+#[sqlx::test(migrations = false)]
+async fn fleet_udp_row_is_not_probeable_and_counts_in_the_total_but_not_in_proven(pool: PgPool) {
+    migrate(&pool).await;
+    let now = chrono::Utc::now();
+    insert_probe(&pool, "ssh", "tcp", 22, "reachable", None, now, Some(now)).await;
+    insert_probe(
+        &pool,
+        "catchall",
+        "udp",
+        1024,
+        "not_probeable",
+        Some("udp reachability is not provable by connect"),
+        now,
+        Some(now),
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("catchall", fleet::Proto::Udp, 1024),
+        ],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("not probeable"),
+        "the UDP row must name its own state: {table}"
+    );
+    // One of two listeners proven, not one of one: the untestable listener stays in the
+    // denominator so the figure cannot look better than the evidence.
+    assert!(
+        body.contains("1<small>/ 2</small>"),
+        "UDP must be excluded from proven and included in total: {body}"
+    );
+    assert!(
+        !body.contains("every listener proven"),
+        "a fleet with an untestable listener is not fully proven: {body}"
+    );
+}
+
+/// The staleness rule is measured in sweep intervals, so it has to follow the configured cadence.
+/// With a constant, an operator who slowed the sweep down would open the page and find every row
+/// reading stale, which makes the pane useless in exactly the way it exists to prevent.
+#[sqlx::test(migrations = false)]
+async fn fleet_staleness_follows_the_configured_probe_interval(pool: PgPool) {
+    migrate(&pool).await;
+    let probed_at = chrono::Utc::now() - chrono::Duration::seconds(900);
+    insert_probe(
+        &pool,
+        "ssh",
+        "tcp",
+        22,
+        "reachable",
+        None,
+        probed_at,
+        Some(probed_at),
+    )
+    .await;
+
+    // At the 300s default, a 900s-old row is past two intervals and stale.
+    let state = test_state_full(
+        pool.clone(),
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let body = body_text(
+        test_app(state)
+            .oneshot(get_request(
+                "/fleet",
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        listener_table(&body).contains("stale, last reachable"),
+        "at a 300s interval a 900s-old row is stale: {body}"
+    );
+
+    // At an hourly sweep the same row is well inside the window and must not read stale.
+    let mut slow = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    slow.fleet_probe_interval = std::time::Duration::from_secs(3600);
+    let (_, cookie) = slow.sessions.create();
+    let body = body_text(
+        test_app(slow)
+            .oneshot(get_request(
+                "/fleet",
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !listener_table(&body).contains("stale"),
+        "at an hourly sweep the same row is fresh and must not be called stale: {body}"
     );
 }

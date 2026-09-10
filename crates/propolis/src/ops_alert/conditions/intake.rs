@@ -13,12 +13,24 @@ use crate::ops_alert::dispatch::Severity;
 /// Derive `(advanced, backlog)` from one batch's counts. Lives here (not in the intake crate, which
 /// cannot depend on propolis types) and is called by the sensor loop in `main.rs`.
 ///
-/// `advanced` = the read cursor moved (at least one line consumed, ingested or dropped-as-rejected).
+/// `advanced` = the read cursor moved (at least one line consumed: ingested, dropped-as-rejected,
+/// or dropped as a reachability-probe line).
 /// `backlog` = the poll left unconsumed input: an append error stopped the batch with a line in
 /// hand, or the batch filled (100 lines) so more is very likely waiting.
-pub fn progress_from_batch(ingested: usize, rejected: usize, errors: usize) -> (bool, bool) {
-    let advanced = ingested + rejected > 0;
-    let backlog = errors > 0 || (ingested + rejected) >= 100;
+///
+/// `probe_confirmations` counts toward progress but is deliberately NOT folded into `ingested` by
+/// the caller: consuming a probe line IS the cursor moving, so a tailer reading nothing but probe
+/// lines is not stalled - but a probe line is not attacker evidence, and letting it inflate the
+/// ingest counters would hide a pipeline that has stopped ingesting anything real.
+pub fn progress_from_batch(
+    ingested: usize,
+    rejected: usize,
+    probe_confirmations: usize,
+    errors: usize,
+) -> (bool, bool) {
+    let consumed = ingested + rejected + probe_confirmations;
+    let advanced = consumed > 0;
+    let backlog = errors > 0 || consumed >= 100;
     (advanced, backlog)
 }
 
@@ -110,10 +122,21 @@ mod tests {
 
     #[test]
     fn progress_from_batch_classifies_the_cases() {
-        assert_eq!(progress_from_batch(0, 0, 0), (false, false)); // quiet
-        assert_eq!(progress_from_batch(5, 0, 0), (true, false)); // advancing, caught up
-        assert_eq!(progress_from_batch(0, 0, 1), (false, true)); // append wedged, line stuck
-        assert_eq!(progress_from_batch(100, 0, 0), (true, true)); // full batch, more waiting
-        assert_eq!(progress_from_batch(0, 100, 0), (true, true)); // full batch of rejects, advancing
+        assert_eq!(progress_from_batch(0, 0, 0, 0), (false, false)); // quiet
+        assert_eq!(progress_from_batch(5, 0, 0, 0), (true, false)); // advancing, caught up
+        assert_eq!(progress_from_batch(0, 0, 0, 1), (false, true)); // append wedged, line stuck
+        assert_eq!(progress_from_batch(100, 0, 0, 0), (true, true)); // full batch, more waiting
+        assert_eq!(progress_from_batch(0, 100, 0, 0), (true, true)); // full batch of rejects
+    }
+
+    /// A tailer reading nothing but probe lines has a moving cursor and is not stalled. Before the
+    /// probe existed every consumed line was ingested or rejected, so this case could not arise;
+    /// leaving it out would have paged the operator every sweep on a quiet honeypot.
+    #[test]
+    fn progress_from_batch_counts_a_probe_confirmation_as_forward_progress() {
+        assert_eq!(progress_from_batch(0, 0, 1, 0), (true, false));
+        assert_eq!(progress_from_batch(0, 0, 100, 0), (true, true));
+        // And it still cannot mask a wedge: the append error keeps the backlog flag up.
+        assert_eq!(progress_from_batch(0, 0, 1, 1), (true, true));
     }
 }

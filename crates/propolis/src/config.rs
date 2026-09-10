@@ -148,6 +148,26 @@ pub struct PropolisConfig {
     /// Path to the deploy stamp (`PROPOLIS_FLEET_DEPLOY_STAMP`). `None` leaves the fleet pane's
     /// version panel reading "not recorded".
     pub fleet_deploy_stamp: Option<PathBuf>,
+    /// Collector id to dialable address (`PROPOLIS_FLEET_COLLECTOR_ENDPOINTS`). A listener whose
+    /// collector is absent here is recorded `not_probeable` with the reason named, never guessed
+    /// at: a guessed address that happened to answer would put a green row on a socket nobody
+    /// asked about.
+    pub fleet_endpoints: std::collections::BTreeMap<String, String>,
+    /// Whether the control plane runs the reachability sweep (`PROPOLIS_FLEET_PROBE_ENABLED`).
+    /// Off by default: turning it on makes this node connect to the collector's listeners, which
+    /// produces sensor events that MUST be filtered at intake, and that filter needs addresses
+    /// only the operator knows.
+    pub fleet_probe_enabled: bool,
+    /// Sweep cadence (`PROPOLIS_FLEET_PROBE_INTERVAL`, seconds). Also the unit the console's
+    /// staleness rule is measured in: a row older than twice this alarms.
+    pub fleet_probe_interval: Duration,
+    /// Per-connect deadline (`PROPOLIS_FLEET_PROBE_TIMEOUT`, seconds). Bounded so a blackholed
+    /// address cannot hold a sweep open on the OS default connect timeout.
+    pub fleet_probe_timeout: Duration,
+    /// This node's own egress addresses (`PROPOLIS_FLEET_PROBE_SOURCE_IPS`). Intake drops lines
+    /// from these before conversion. Required whenever the probe is enabled - see
+    /// [`ConfigError::ProbeEnabledWithoutSources`].
+    pub fleet_probe_sources: std::collections::HashSet<IpAddr>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -161,6 +181,15 @@ pub enum ConfigError {
     /// `PROPOLIS_FLEET_LISTENERS` was set and does not parse. Carried as its own variant rather
     /// than folded into `Invalid` so the operator sees WHICH entry is wrong and why.
     FleetInventory(fleet::InventoryError),
+    /// The reachability probe was enabled without naming this node's own egress addresses.
+    ///
+    /// This refuses to start rather than probing unfiltered. Every TCP sensor emits
+    /// `honeypot_connection` on accept, weighing 40 at confidence 0.900, so an unfiltered sweep
+    /// would score the control plane's own address into the review queue and out into the
+    /// published blocklist within hours. There is no safe default to fall back to: only the
+    /// operator knows which address this node's connects arrive from. Same shape as the fetcher's
+    /// refusal to run with an empty `own_ips` set.
+    ProbeEnabledWithoutSources,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -175,6 +204,12 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "{field}: {reason}, got {value:?}")
             }
             ConfigError::FleetInventory(e) => write!(f, "PROPOLIS_FLEET_LISTENERS: {e}"),
+            ConfigError::ProbeEnabledWithoutSources => write!(
+                f,
+                "PROPOLIS_FLEET_PROBE_ENABLED is true but PROPOLIS_FLEET_PROBE_SOURCE_IPS is \
+                 empty; set it to this node's own egress address(es) so intake can drop the \
+                 probe's own connections, or the probe would score this node into the blocklist"
+            ),
         }
     }
 }
@@ -226,6 +261,38 @@ fn parse_bounded_positive_u64(
         });
     }
     Ok(value)
+}
+
+/// A duration in seconds with BOTH ends bounded, rejected rather than clamped.
+///
+/// Rejection is what every other bounded value in this file and in `ops_alert::config` does, and
+/// it is the right direction here: a clamp would silently run a sweep on a cadence the operator
+/// did not ask for, and the console measures probe staleness in multiples of that same number, so
+/// a value quietly replaced would make every row read stale for reasons nothing on the page
+/// explains.
+fn parse_bounded_secs(
+    name: &'static str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<Duration, ConfigError> {
+    let raw = match env::var(name) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Ok(Duration::from_secs(default)),
+    };
+    let value: u64 = raw.trim().parse().map_err(|_| ConfigError::Invalid {
+        field: name,
+        value: raw.clone(),
+        reason: "must be a whole number of seconds",
+    })?;
+    if value < min || value > max {
+        return Err(ConfigError::Invalid {
+            field: name,
+            value: format!("{value} (permitted range is {min}-{max} seconds)"),
+            reason: "outside the permitted range for this field",
+        });
+    }
+    Ok(Duration::from_secs(value))
 }
 
 fn parse_u32(name: &str, default: u32) -> Result<u32, ConfigError> {
@@ -606,6 +673,31 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    let fleet_endpoints = fleet::parse_endpoints_env(
+        env::var("PROPOLIS_FLEET_COLLECTOR_ENDPOINTS")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(ConfigError::FleetInventory)?;
+    let fleet_probe_enabled = parse_bool_flag("PROPOLIS_FLEET_PROBE_ENABLED", false);
+    // 60s floor: the sweep opens a connection to every listener, and every one of those becomes a
+    // sensor event that intake has to read and drop. 86400 ceiling so a typo cannot park the sweep
+    // beyond any useful staleness window.
+    let fleet_probe_interval =
+        parse_bounded_secs("PROPOLIS_FLEET_PROBE_INTERVAL", 300, 60, 86_400)?;
+    let fleet_probe_timeout = parse_bounded_secs("PROPOLIS_FLEET_PROBE_TIMEOUT", 5, 1, 60)?;
+    let fleet_probe_sources: std::collections::HashSet<IpAddr> = parse_ip_list(
+        "PROPOLIS_FLEET_PROBE_SOURCE_IPS",
+        &env::var("PROPOLIS_FLEET_PROBE_SOURCE_IPS").unwrap_or_default(),
+    )?
+    .into_iter()
+    .collect();
+    // Fail closed at startup, not at first sweep: an enabled probe whose lines intake cannot
+    // recognise writes the control plane's own address into the ledger, and from there into the
+    // review queue and the published feed. Nothing downstream can undo that, so it must not start.
+    if fleet_probe_enabled && fleet_probe_sources.is_empty() {
+        return Err(ConfigError::ProbeEnabledWithoutSources);
+    }
 
     Ok(PropolisConfig {
         database_url,
@@ -656,6 +748,11 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         })?,
         fleet_listeners,
         fleet_deploy_stamp,
+        fleet_endpoints,
+        fleet_probe_enabled,
+        fleet_probe_interval,
+        fleet_probe_timeout,
+        fleet_probe_sources,
     })
 }
 
@@ -723,15 +820,43 @@ mod tests {
         assert!(parse_window_list("").unwrap().is_empty());
     }
 
-    // Load-bearing per the fetcher spec: a zero byte cap must never be treated as "unlimited" -
-    // it must fail startup outright. Exercised through the real `load_config` path (not just the
-    // underlying parse helper) so this also proves `PropolisConfig` actually wires the new field.
+    /// Serialises every test that drives the real `load_config`.
+    ///
+    /// The process environment is global, and these tests share the three variables `load_config`
+    /// requires (`DATABASE_URL`, `PROPOLIS_SENSOR_LOGS`, `PROPOLIS_CONSOLE_PASSWORD`). Without
+    /// this they would race under `cargo test`'s default thread-per-test parallelism: one test's
+    /// cleanup removes a variable the other is mid-way through relying on, and the failure looks
+    /// like a config bug rather than the test collision it is.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The three variables `load_config` refuses to start without. Set by every test below before
+    /// it exercises the field it actually cares about.
+    fn set_required_env() {
+        // SAFETY: every caller holds ENV_LOCK for the duration of its own set/read/remove cycle.
+        unsafe {
+            env::set_var("DATABASE_URL", "postgres://u:p@localhost/db");
+            env::set_var("PROPOLIS_SENSOR_LOGS", "catchall:/tmp/x.jsonl");
+            env::set_var("PROPOLIS_CONSOLE_PASSWORD", "test-password");
+        }
+    }
+
+    fn clear_required_env() {
+        // SAFETY: as above.
+        unsafe {
+            env::remove_var("DATABASE_URL");
+            env::remove_var("PROPOLIS_SENSOR_LOGS");
+            env::remove_var("PROPOLIS_CONSOLE_PASSWORD");
+        }
+    }
+
+    // A zero byte cap must never be treated as "unlimited" - it must fail startup outright.
+    // Exercised through the real `load_config` path (not just the underlying parse helper) so this
+    // also proves `PropolisConfig` actually wires the new field.
     #[test]
     fn load_config_rejects_a_zero_fetch_max_bytes_but_accepts_a_valid_set() {
-        // SAFETY: this test owns every variable it touches start-to-finish and no other test in
-        // this file reads DATABASE_URL / PROPOLIS_SENSOR_LOGS / PROPOLIS_CONSOLE_PASSWORD /
-        // PROPOLIS_FETCH_*, so there is no cross-test race despite `cargo test`'s default
-        // thread-per-test parallelism.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_LOCK is held for this test's whole set/read/remove cycle, so no other test
+        // in this file can observe or clear these variables mid-run.
         unsafe {
             env::set_var("DATABASE_URL", "postgres://u:p@localhost/db");
             env::set_var("PROPOLIS_SENSOR_LOGS", "catchall:/tmp/x.jsonl");
@@ -802,5 +927,152 @@ mod tests {
             "a value that would silently wrap past 255 must be rejected, not truncated"
         );
         unsafe { env::remove_var("TEST_PROPOLIS_BOUNDED_U8") };
+    }
+
+    /// The contamination guard, driven through the real startup path.
+    ///
+    /// An enabled probe with no source addresses would connect to every listener every sweep,
+    /// each connect becoming a `honeypot_connection` that intake cannot recognise as its own. That
+    /// scores the control plane's address into the review queue and out into the published
+    /// blocklist, which nothing downstream can undo. There is no safe default, so startup refuses.
+    #[test]
+    fn probe_enabled_without_source_ips_refuses_to_start() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_required_env();
+        // SAFETY: ENV_LOCK held for this test's whole cycle.
+        unsafe {
+            env::set_var("PROPOLIS_FLEET_PROBE_ENABLED", "true");
+            env::remove_var("PROPOLIS_FLEET_PROBE_SOURCE_IPS");
+        }
+        assert_eq!(
+            load_config().unwrap_err(),
+            ConfigError::ProbeEnabledWithoutSources,
+            "an enabled probe with no source addresses must refuse to start"
+        );
+
+        // Blank is the same as unset: an operator who left the variable in place with nothing in
+        // it has named no addresses, and the guard must not read the empty string as a set of one.
+        unsafe { env::set_var("PROPOLIS_FLEET_PROBE_SOURCE_IPS", "  ") };
+        assert_eq!(
+            load_config().unwrap_err(),
+            ConfigError::ProbeEnabledWithoutSources
+        );
+
+        // The positive half: a known-good value must still pass. A guard verified only on its deny
+        // branch is half verified, and one that refused every configuration would be its own bug.
+        unsafe {
+            env::set_var(
+                "PROPOLIS_FLEET_PROBE_SOURCE_IPS",
+                "198.51.100.7, 203.0.113.4",
+            )
+        };
+        let config = load_config().expect("a probe with named source addresses must start");
+        assert!(config.fleet_probe_enabled);
+        assert_eq!(config.fleet_probe_sources.len(), 2);
+        assert!(
+            config
+                .fleet_probe_sources
+                .contains(&"198.51.100.7".parse::<IpAddr>().unwrap())
+        );
+
+        // And with the probe OFF, no source addresses are needed at all.
+        unsafe {
+            env::set_var("PROPOLIS_FLEET_PROBE_ENABLED", "false");
+            env::remove_var("PROPOLIS_FLEET_PROBE_SOURCE_IPS");
+        }
+        let config = load_config().expect("a disabled probe needs no source addresses");
+        assert!(!config.fleet_probe_enabled);
+
+        unsafe {
+            env::remove_var("PROPOLIS_FLEET_PROBE_ENABLED");
+        }
+        clear_required_env();
+    }
+
+    #[test]
+    fn fleet_listener_parse_failure_is_a_startup_error_not_a_shortened_list() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_required_env();
+        // SAFETY: ENV_LOCK held for this test's whole cycle.
+        unsafe {
+            env::set_var(
+                "PROPOLIS_FLEET_LISTENERS",
+                "local/ssh/tcp/22,local/telnet/tcp",
+            );
+        }
+        assert!(
+            matches!(load_config(), Err(ConfigError::FleetInventory(_))),
+            "one malformed entry must reject the whole value; silently keeping the good half \
+             would hide a listener rather than report it"
+        );
+
+        unsafe {
+            env::set_var(
+                "PROPOLIS_FLEET_LISTENERS",
+                "local/ssh/tcp/22,local/catchall/udp/1024",
+            );
+            env::set_var("PROPOLIS_FLEET_COLLECTOR_ENDPOINTS", "local=198.51.100.7");
+        }
+        let config = load_config().expect("a well-formed inventory must parse");
+        assert_eq!(config.fleet_listeners.len(), 2);
+        assert_eq!(
+            config.fleet_listeners[0].target(&config.fleet_endpoints),
+            Some("198.51.100.7:22".to_string())
+        );
+
+        unsafe {
+            env::remove_var("PROPOLIS_FLEET_LISTENERS");
+            env::remove_var("PROPOLIS_FLEET_COLLECTOR_ENDPOINTS");
+        }
+        clear_required_env();
+    }
+
+    /// Both ends of both bounds, rejected rather than clamped: the console measures probe staleness
+    /// in multiples of the interval, so a value silently replaced with something else would make
+    /// rows read stale for a reason nothing on the page explains.
+    #[test]
+    fn probe_interval_and_timeout_are_rejected_outside_their_bounds() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_required_env();
+
+        // SAFETY: ENV_LOCK held for this test's whole cycle.
+        unsafe { env::remove_var("PROPOLIS_FLEET_PROBE_INTERVAL") };
+        unsafe { env::remove_var("PROPOLIS_FLEET_PROBE_TIMEOUT") };
+        let config = load_config().expect("the defaults must parse");
+        assert_eq!(config.fleet_probe_interval, Duration::from_secs(300));
+        assert_eq!(config.fleet_probe_timeout, Duration::from_secs(5));
+
+        for bad in ["59", "86401", "0", "not-a-number"] {
+            unsafe { env::set_var("PROPOLIS_FLEET_PROBE_INTERVAL", bad) };
+            assert!(
+                load_config().is_err(),
+                "PROPOLIS_FLEET_PROBE_INTERVAL={bad} must be rejected, not clamped"
+            );
+        }
+        unsafe { env::set_var("PROPOLIS_FLEET_PROBE_INTERVAL", "60") };
+        assert_eq!(
+            load_config().unwrap().fleet_probe_interval,
+            Duration::from_secs(60),
+            "the floor itself must be accepted, or the bound is off by one"
+        );
+
+        for bad in ["0", "61"] {
+            unsafe { env::set_var("PROPOLIS_FLEET_PROBE_TIMEOUT", bad) };
+            assert!(
+                load_config().is_err(),
+                "PROPOLIS_FLEET_PROBE_TIMEOUT={bad} must be rejected, not clamped"
+            );
+        }
+        unsafe { env::set_var("PROPOLIS_FLEET_PROBE_TIMEOUT", "60") };
+        assert_eq!(
+            load_config().unwrap().fleet_probe_timeout,
+            Duration::from_secs(60)
+        );
+
+        unsafe {
+            env::remove_var("PROPOLIS_FLEET_PROBE_INTERVAL");
+            env::remove_var("PROPOLIS_FLEET_PROBE_TIMEOUT");
+        }
+        clear_required_env();
     }
 }

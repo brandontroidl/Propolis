@@ -16,10 +16,15 @@
 
 pub mod health;
 pub mod inventory;
+pub mod probe;
 pub mod store;
 
 pub use health::Level;
-pub use inventory::{InventoryError, Listener, Proto, parse_listeners, parse_listeners_env};
+pub use inventory::{
+    InventoryError, Listener, Proto, parse_endpoints, parse_endpoints_env, parse_listeners,
+    parse_listeners_env,
+};
+pub use probe::{ProbeConfig, probe_once, run_probe_loop};
 pub use store::{ProbeOutcome, ProbeRecord, ProbeRow};
 
 /// This crate's own migrator, tracked under a table name distinct from core-scoring's default

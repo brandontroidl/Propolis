@@ -17,6 +17,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use console::auth::{PasswordStore, RateLimiter, SessionStore};
 use console::log_buffer::{LogBuffer, LogBufferLayer};
@@ -35,6 +36,12 @@ const ENV_TRUSTED_PROXY: &str = "PROPOLIS_CONSOLE_TRUSTED_PROXY";
 const ENV_METRICS_TOKEN: &str = "PROPOLIS_CONSOLE_METRICS_TOKEN";
 const ENV_FLEET_LISTENERS: &str = "PROPOLIS_FLEET_LISTENERS";
 const ENV_FLEET_DEPLOY_STAMP: &str = "PROPOLIS_FLEET_DEPLOY_STAMP";
+const ENV_FLEET_PROBE_INTERVAL: &str = "PROPOLIS_FLEET_PROBE_INTERVAL";
+
+/// The prober's default sweep cadence, mirrored from `propolis::config`. The standalone console
+/// never probes, but it renders rows the prober wrote and has to measure their age against the
+/// same number, so this default and that one must stay equal.
+const DEFAULT_FLEET_PROBE_INTERVAL_SECS: u64 = 300;
 
 /// Loopback only, matching the design's closed decision #4 ("Bind model: loopback only by
 /// default") - an operator who wants the console reachable elsewhere binds it explicitly via
@@ -57,6 +64,7 @@ struct Config {
     trusted_proxy: bool,
     metrics_token: Option<String>,
     fleet_listeners: Vec<fleet::Listener>,
+    fleet_probe_interval: Duration,
     deploy_stamp_path: Option<PathBuf>,
 }
 
@@ -163,6 +171,17 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    // A viewer, not a validator: the daemon owns the bounds on this value and refuses to start
+    // outside them. Here an unreadable value falls back to the shared default rather than stopping
+    // a console that has nothing to do with the sweep, and the effect of getting it wrong is a
+    // staleness threshold that is off, not a probe that misbehaves.
+    let fleet_probe_interval = Duration::from_secs(
+        env::var(ENV_FLEET_PROBE_INTERVAL)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(DEFAULT_FLEET_PROBE_INTERVAL_SECS),
+    );
 
     Ok(Config {
         database_url,
@@ -175,6 +194,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         trusted_proxy,
         metrics_token,
         fleet_listeners,
+        fleet_probe_interval,
         deploy_stamp_path,
     })
 }
@@ -284,6 +304,7 @@ async fn main() {
         rdns: Arc::new(console::rdns::RdnsResolver::new(config.rdns_enabled)),
         feed_output_dir: config.feed_output_dir,
         fleet_listeners: Arc::new(config.fleet_listeners),
+        fleet_probe_interval: config.fleet_probe_interval,
         deploy_stamp_path: config.deploy_stamp_path,
         startup_time: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION"),

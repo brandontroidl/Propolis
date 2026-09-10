@@ -19,6 +19,8 @@
 //! every check as unknown rather than reporting nothing at all); a value that is present but
 //! unparseable stops the process.
 
+use std::collections::BTreeMap;
+
 /// Transport of a single listener. The two values are the ones the `listener_probe` table's
 /// `CHECK` constraint admits, so a `Proto` can never fail to store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -50,6 +52,65 @@ pub struct Listener {
     pub sensor: String,
     pub protocol: Proto,
     pub port: u16,
+}
+
+impl Listener {
+    /// The `host:port` string the prober dials, or `None` when this listener's collector has no
+    /// endpoint configured.
+    ///
+    /// `None` is a real answer, not a failure: the prober records it as `not_probeable` with a
+    /// detail naming the missing endpoint, so an unconfigured collector shows on the pane as an
+    /// unanswered question rather than vanishing from the row set or being guessed at. Guessing
+    /// (localhost, the collector id as a hostname) would produce a green row for a socket nobody
+    /// asked about.
+    ///
+    /// A bare IPv6 address is bracketed here so the result parses as a socket address. An endpoint
+    /// that already carries brackets, or a hostname, is passed through untouched.
+    pub fn target(&self, endpoints: &BTreeMap<String, String>) -> Option<String> {
+        let addr = endpoints.get(&self.collector_id)?;
+        if addr.parse::<std::net::Ipv6Addr>().is_ok() {
+            Some(format!("[{addr}]:{}", self.port))
+        } else {
+            Some(format!("{addr}:{}", self.port))
+        }
+    }
+}
+
+/// Parses `collector=address` entries, comma separated, into the map [`Listener::target`] dials.
+///
+/// Unlike [`parse_listeners`], an empty value is NOT an error. A collector with no endpoint is
+/// already a visible state on the pane (`not_probeable`, with the reason named), so an operator who
+/// has configured no endpoints at all gets a page full of unanswered questions rather than a
+/// refusal to start. A malformed entry is still an error: that is a value the operator meant to be
+/// real, and silently dropping it would leave one collector unprobed for no stated reason.
+pub fn parse_endpoints(raw: &str) -> Result<BTreeMap<String, String>, InventoryError> {
+    let mut out = BTreeMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((collector, addr)) = entry.split_once('=') else {
+            return Err(InventoryError::Malformed {
+                entry: entry.to_string(),
+                why: "expected collector=address",
+            });
+        };
+        let (collector, addr) = (collector.trim(), addr.trim());
+        if collector.is_empty() || addr.is_empty() {
+            return Err(InventoryError::Malformed {
+                entry: entry.to_string(),
+                why: "both the collector id and the address must be non-empty",
+            });
+        }
+        out.insert(collector.to_string(), addr.to_string());
+    }
+    Ok(out)
+}
+
+/// How the daemon reads `PROPOLIS_FLEET_COLLECTOR_ENDPOINTS`. Unset, blank, and "no entries" are
+/// the same thing here, for the reason [`parse_endpoints`] gives.
+pub fn parse_endpoints_env(raw: Option<&str>) -> Result<BTreeMap<String, String>, InventoryError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(BTreeMap::new()),
+        Some(value) => parse_endpoints(value),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -233,5 +294,81 @@ mod tests {
     #[test]
     fn one_bad_entry_rejects_the_whole_value_rather_than_shortening_it() {
         assert!(parse_listeners("local/ssh/tcp/22,local/telnet/tcp").is_err());
+    }
+
+    #[test]
+    fn parse_endpoints_maps_collector_to_address() {
+        let endpoints = parse_endpoints("local=198.51.100.7, edge = 203.0.113.9").unwrap();
+        assert_eq!(endpoints.get("local"), Some(&"198.51.100.7".to_string()));
+        assert_eq!(endpoints.get("edge"), Some(&"203.0.113.9".to_string()));
+        assert_eq!(endpoints.len(), 2);
+    }
+
+    #[test]
+    fn parse_endpoints_rejects_a_malformed_entry_rather_than_skipping_it() {
+        assert!(matches!(
+            parse_endpoints("local"),
+            Err(InventoryError::Malformed { .. })
+        ));
+        assert!(matches!(
+            parse_endpoints("=198.51.100.7"),
+            Err(InventoryError::Malformed { .. })
+        ));
+        assert!(matches!(
+            parse_endpoints("local="),
+            Err(InventoryError::Malformed { .. })
+        ));
+        // A blank value is not the same as a malformed one: no endpoints configured is a state the
+        // pane can render, so it must not stop the process.
+        assert_eq!(parse_endpoints_env(None), Ok(BTreeMap::new()));
+        assert_eq!(parse_endpoints_env(Some("  ")), Ok(BTreeMap::new()));
+    }
+
+    #[test]
+    fn target_is_none_when_the_collector_has_no_endpoint() {
+        let listener = Listener {
+            collector_id: "local".into(),
+            sensor: "ssh".into(),
+            protocol: Proto::Tcp,
+            port: 22,
+        };
+        assert_eq!(listener.target(&BTreeMap::new()), None);
+
+        let other = parse_endpoints("edge=203.0.113.9").unwrap();
+        assert_eq!(listener.target(&other), None);
+
+        let matching = parse_endpoints("local=198.51.100.7").unwrap();
+        assert_eq!(
+            listener.target(&matching),
+            Some("198.51.100.7:22".to_string())
+        );
+    }
+
+    /// A bare IPv6 endpoint must come back bracketed or the result does not parse as a socket
+    /// address and every probe against that collector fails as an `error` that looks like a
+    /// network fault rather than the formatting bug it is.
+    #[test]
+    fn target_brackets_a_bare_ipv6_endpoint_and_leaves_a_hostname_alone() {
+        let listener = Listener {
+            collector_id: "local".into(),
+            sensor: "ssh".into(),
+            protocol: Proto::Tcp,
+            port: 22,
+        };
+        let v6 = parse_endpoints("local=2001:db8::1").unwrap();
+        assert_eq!(listener.target(&v6), Some("[2001:db8::1]:22".to_string()));
+        assert!(
+            listener
+                .target(&v6)
+                .unwrap()
+                .parse::<std::net::SocketAddr>()
+                .is_ok()
+        );
+
+        let host = parse_endpoints("local=collector.invalid").unwrap();
+        assert_eq!(
+            listener.target(&host),
+            Some("collector.invalid:22".to_string())
+        );
     }
 }

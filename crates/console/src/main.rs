@@ -246,6 +246,24 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
+    // Offline identity check, ahead of every other line in this function on purpose: config
+    // loading and the PgPool connect both fail loudly when the environment is not yet fully
+    // populated (a fresh install, an operator diagnosing a stuck deploy), and this must answer
+    // "what commit is this BINARY actually built from" regardless. It is the only way to confirm
+    // what a deploy actually installed - `deploy/deploy-stamp.json` records what the CHECKOUT was
+    // at build time, which a partially-failed install loop or a stale cargo cache can both make
+    // untrue of the binary that landed in `/usr/local/bin`. See `crates/build-stamp.rs`'s own
+    // header for why these two env vars exist at all.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!(
+            "console {} ({}, built {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("PROPOLIS_GIT_SHA"),
+            env!("PROPOLIS_BUILD_TIMESTAMP")
+        );
+        return;
+    }
+
     // The live `/logs` viewer (`routes::logs`) needs a copy of every event this process logs, so
     // `LogBufferLayer` is layered onto the subscriber alongside the default `fmt` output rather
     // than filtered separately - see that layer's own doc comment (`console::log_buffer`).
@@ -318,6 +336,9 @@ async fn main() {
         fleet_probe_interval: config.fleet_probe_interval,
         deploy_stamp_path: config.deploy_stamp_path,
         startup_time: chrono::Utc::now(),
+        // The installed file name this process was started from, which is also the name its own
+        // `--version` line above opens with and the key `deploy/deploy-stamp.sh` records it under.
+        binary_name: "console",
         version: env!("CARGO_PKG_VERSION"),
         git_sha: env!("PROPOLIS_GIT_SHA"),
         built_at: env!("PROPOLIS_BUILD_TIMESTAMP"),

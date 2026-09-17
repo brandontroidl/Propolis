@@ -76,6 +76,7 @@ async fn smoke_health_and_ready(pool: PgPool) {
             fleet_probe_interval: std::time::Duration::from_secs(300),
             deploy_stamp_path: None,
             startup_time: chrono::Utc::now(),
+            binary_name: "propolis",
             version: "test",
             git_sha: "abc123abc123",
             built_at: "2026-09-09T00:00:00Z",

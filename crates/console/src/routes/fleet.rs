@@ -82,7 +82,7 @@ struct ListenerRow {
     probe_ago: String,
     confirmed_ago: Option<String>,
     last_event_ago: String,
-    last_event_level: &'static str,
+    last_event_dot: &'static str,
     events_24h: i64,
     state_level: &'static str,
     /// False for a sensor seen in the ledger that the inventory does not know about.
@@ -103,6 +103,10 @@ struct CaptureRow {
     rate_pct: Option<i64>,
     top_end_reason: Option<String>,
     top_end_reason_count: i64,
+    /// Pill colour for `top_end_reason`, matching this row's own completion-rate severity - the
+    /// dominant reason for an alarm-level row alarms too, rather than every reason reading as the
+    /// same amber regardless of how bad the rate actually is.
+    end_reason_sev: &'static str,
     state_level: &'static str,
     meter_class: &'static str,
 }
@@ -115,14 +119,14 @@ struct FeedFreshness {
     entries: i64,
     disabled: bool,
     note: &'static str,
-    state_level: &'static str,
+    dot: &'static str,
 }
 
 #[derive(Debug, Serialize)]
 struct LedgerStatus {
     events: Option<i64>,
     newest_ingested_ago: Option<String>,
-    state_level: &'static str,
+    dot: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,12 +136,23 @@ struct VersionStatus {
     /// checked out on the box. `unknown` when the build could not identify itself.
     running_sha: String,
     built_at: String,
+    /// Which executable this page is being served by, so the panel names whose installed revision
+    /// it is reporting rather than leaving the reader to assume.
+    binary_name: String,
+    /// The revision of the file the last deploy actually left on disk for THIS binary, read back
+    /// from it by `deploy/deploy-stamp.sh`. `None` for a stamp written before that field existed,
+    /// for a binary that was not installed, or for a recorded value that is not a revision - all
+    /// of which the panel renders as not recorded, never as agreement.
+    installed_sha: Option<String>,
     stamp_head_sha: Option<String>,
     stamp_origin_main_sha: Option<String>,
     stamp_age: Option<String>,
     verdict: &'static str,
+    /// Pill colour for `verdict`, and the panel's only rendering of its `Level`: neutral grey for
+    /// `current`, amber for `not recorded`, attention amber-orange for `restart required` /
+    /// `behind main`, red for `install incomplete`.
+    verdict_sev: &'static str,
     note: &'static str,
-    state_level: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,6 +177,19 @@ fn dot_class(level: Level) -> &'static str {
         Level::Warn => "dot dot--high",
         Level::Alarm => "dot dot--crit",
         Level::Unknown => "dot dot--watch",
+    }
+}
+
+/// The `.sev` pill classes, mapped from `Level` with the same colour semantics as `dot_class`
+/// above (`Ok`->low/grey, `Warn`->high/amber, `Alarm`->crit/red, `Unknown`->watch/amber-adjacent).
+/// A word-carrying panel (the version verdict, a capture's dominant end reason) uses this instead
+/// of a bare dot so the state reads without relying on colour alone.
+fn sev_class(level: Level) -> &'static str {
+    match level {
+        Level::Ok => "sev sev--low",
+        Level::Warn => "sev sev--high",
+        Level::Alarm => "sev sev--crit",
+        Level::Unknown => "sev sev--watch",
     }
 }
 
@@ -252,6 +280,7 @@ async fn capture_rows(db: &PgPool) -> Result<Vec<CaptureRow>, sqlx::Error> {
             rate_pct,
             top_end_reason: None,
             top_end_reason_count: 0,
+            end_reason_sev: sev_class(state_level),
             state_level: state_level.class(),
             meter_class,
         });
@@ -298,17 +327,44 @@ fn read_stamp(path: &Path) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// The version verdict, as a pure function of the three revisions involved.
+/// The git commit id format both producers of these strings use: hex digits only, at least as
+/// long as git's traditional default abbreviation. A shorter or non-hex string is not a revision
+/// this function can compare against anything - it is malformed stamp data, not a mismatch, and
+/// blaming it on "restart required" or "behind main" would point the operator at the wrong fix.
+fn looks_like_git_sha(s: &str) -> bool {
+    s.len() >= 7 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The version verdict, as a pure function of the identities involved.
 ///
-/// Three different things get confused here and the panel exists to keep them apart: what this
-/// PROCESS is running, what was last BUILT and installed on this box, and what is on `main`. A
-/// deploy that built new binaries without restarting the service leaves the first two apart, and
-/// that is invisible from anywhere else on the box.
+/// FOUR different things get confused here and the panel exists to keep them apart: what this
+/// PROCESS is running, what the last deploy actually INSTALLED on disk for this binary, what was
+/// CHECKED OUT when that deploy built, and what `origin/main` held when that deploy last fetched.
+/// A deploy that built and installed new binaries without restarting the service leaves the first
+/// two apart; an install that did not finish leaves the second and third apart. Those two failures
+/// want opposite responses, and neither is visible anywhere else on the box.
 ///
 /// Every uncertain case lands on `not recorded`, never on `current`. The failure this guards is a
 /// panel that says the box is up to date because it could not tell that it was not.
+///
+/// `installed` is what separates a not-yet-restarted process from an install that failed partway
+/// through and left the old binary in place while the stamp still names the new commit. Without it
+/// (a stamp written before that field existed, or a binary this box does not install) a mismatch is
+/// still reported, but as an observed fact with both explanations named, never as a diagnosis -
+/// and an AGREEMENT is not reported as `current` at all. `current` is a claim about the file on
+/// disk as much as about this process, and an absent, empty, dirty or malformed installed identity
+/// means that file was never observed. Three identities agreeing is not the fourth one agreeing,
+/// so the missing observation reads `not recorded`.
+///
+/// Every note below is bound to the DEPLOY STAMP's own observation, not to now: `stamp_origin` is
+/// whatever `origin/main` looked like at the last fetch a deploy happened to make
+/// (`deploy-stamp.sh`'s own header), never a live query, so "behind main" and "current" both
+/// describe a moment in the past, not a live comparison - the page renders `stamp_age` next to
+/// these words for exactly that reason, and the wording here must not read as more current than
+/// that age admits.
 fn version_verdict(
     running_sha: &str,
+    installed: Option<&str>,
     stamp_head: Option<&str>,
     stamp_origin: Option<&str>,
 ) -> (&'static str, Level, &'static str) {
@@ -329,35 +385,106 @@ fn version_verdict(
             "no deploy stamp was found, so there is nothing to compare the running binary with",
         );
     };
+    if !looks_like_git_sha(head) {
+        return (
+            "not recorded",
+            Level::Unknown,
+            "the deploy stamp's recorded commit id is not a valid revision, so it cannot be \
+             compared",
+        );
+    }
+    // A recorded install identity is usable only when it names a clean revision: `+dirty` describes
+    // bytes no commit describes, and anything else is stamp damage. Either way this falls back to
+    // the two-way comparison below rather than being compared as though it were a real revision.
+    // The raw presence is kept because the two cases want different words: a stamp that recorded
+    // nothing for this binary versus one that recorded something unusable.
+    let installed_recorded = installed.is_some();
+    let installed = installed.filter(|s| looks_like_git_sha(s));
+
+    // Checked before the running process, because it decides what a mismatch MEANS. An install
+    // that did not land is not a restart away from being fixed, and reporting it as one sends the
+    // operator to `systemctl restart` instead of to the deploy log.
+    if let Some(installed) = installed
+        && !head.starts_with(installed)
+    {
+        return (
+            "install incomplete",
+            Level::Alarm,
+            "the binary this deploy left on disk is not the commit it recorded building, so the \
+             install did not replace it; restarting would not load that commit",
+        );
+    }
+
     // The stamp carries the full 40-character id and the binary a short prefix of it, so a prefix
     // match is the comparison, not equality.
     if !head.starts_with(running_sha) {
+        if installed.is_some() {
+            return (
+                "restart required",
+                Level::Warn,
+                "the commit this deploy recorded is the one on disk, and this process is not \
+                 running it, so it keeps serving the previous build until the service restarts",
+            );
+        }
         return (
             "restart required",
             Level::Warn,
-            "a newer build was installed after this process started; the running code is not the \
-             code on disk",
+            "the running process's build does not match the commit the deploy stamp recorded as \
+             built; that stamp does not record which binary was installed, so this does not say \
+             whether the process merely has not been restarted yet or the install itself did not \
+             finish - a restart is not guaranteed to resolve it",
         );
     }
     let Some(origin) = stamp_origin else {
         return (
             "not recorded",
             Level::Unknown,
-            "the deploy stamp names no origin/main revision, so it cannot say whether this box is \
-             behind",
+            "the deploy stamp names no origin/main revision, so it cannot say whether this box \
+             was behind as of that deploy",
         );
     };
+    if !looks_like_git_sha(origin) {
+        return (
+            "not recorded",
+            Level::Unknown,
+            "the deploy stamp's recorded origin/main commit id is not a valid revision, so it \
+             cannot be compared",
+        );
+    }
     if origin != head {
         return (
             "behind main",
             Level::Warn,
-            "this box is running the commit it deployed, but main has moved on since",
+            "as of the last deploy's fetch, main had already moved past the commit this box \
+             deployed; main may have moved further since",
         );
     }
+    // Everything comparable agrees, which is three of the four identities. `current` also asserts
+    // the fourth - that the file this deploy left on disk is that commit - and only a usable
+    // installed identity observes it. Without one, the install is unobserved, not confirmed: a box
+    // whose install silently no-opped looks exactly like this until it restarts, which is the
+    // moment the pane would have been most wrong to have said `current`.
+    if installed.is_none() {
+        return (
+            "not recorded",
+            Level::Unknown,
+            if installed_recorded {
+                "the running process matches the deployed checkout, but the revision this deploy \
+                 stamp recorded for the binary on disk is not a clean commit id, so what an \
+                 install actually left there was never observed"
+            } else {
+                "the running process matches the deployed checkout, but this deploy stamp records \
+                 no revision for the binary on disk, so what an install actually left there was \
+                 never observed; redeploying writes that identity"
+            },
+        );
+    }
+
     (
         "current",
         Level::Ok,
-        "the running binary, the deployed checkout and main are the same commit",
+        "as of the last deploy, the running binary, the binary installed on disk, the deployed \
+         checkout and the fetched main were the same commit",
     )
 }
 
@@ -373,6 +500,17 @@ fn version_status(state: &AppState) -> VersionStatus {
     };
     let stamp_head_sha = field("head_sha");
     let stamp_origin_main_sha = field("origin_main_sha");
+    // Keyed by the executable actually serving this page: the stamp records one entry per
+    // installed binary (`deploy/deploy-stamp.sh`), and the other one's revision would say nothing
+    // about this process. A stamp predating that field has no `installed` object at all, which
+    // lands here as `None` and reads as not recorded.
+    let installed_sha = stamp
+        .as_ref()
+        .and_then(|v| v.get("installed"))
+        .and_then(|v| v.get(state.binary_name))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let stamp_age = field("built_at")
         .or_else(|| field("pulled_at"))
         .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
@@ -380,6 +518,7 @@ fn version_status(state: &AppState) -> VersionStatus {
 
     let (verdict, level, note) = version_verdict(
         state.git_sha,
+        installed_sha.as_deref(),
         stamp_head_sha.as_deref(),
         stamp_origin_main_sha.as_deref(),
     );
@@ -388,12 +527,14 @@ fn version_status(state: &AppState) -> VersionStatus {
         running_version: state.version.to_string(),
         running_sha: state.git_sha.to_string(),
         built_at: state.built_at.to_string(),
+        binary_name: state.binary_name.to_string(),
+        installed_sha,
         stamp_head_sha,
         stamp_origin_main_sha,
         stamp_age,
         verdict,
+        verdict_sev: sev_class(level),
         note,
-        state_level: level.class(),
     }
 }
 
@@ -406,7 +547,7 @@ fn feed_freshness(state: &AppState) -> FeedFreshness {
             entries: 0,
             disabled: true,
             note: "builder disabled on this node",
-            state_level: Level::Unknown.class(),
+            dot: dot_class(Level::Unknown),
         };
     }
     let Some(manifest) = state.feed_output_dir.as_deref().and_then(read_manifest) else {
@@ -417,7 +558,7 @@ fn feed_freshness(state: &AppState) -> FeedFreshness {
             entries: 0,
             disabled: false,
             note: "feed enabled, awaiting first build",
-            state_level: Level::Unknown.class(),
+            dot: dot_class(Level::Unknown),
         };
     };
 
@@ -451,7 +592,7 @@ fn feed_freshness(state: &AppState) -> FeedFreshness {
         entries: (manifest.tiers.aggressive.count + manifest.tiers.standard.count) as i64,
         disabled: false,
         note,
-        state_level: level.class(),
+        dot: dot_class(level),
     }
 }
 
@@ -572,7 +713,7 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
             last_event_ago: last_event_at
                 .map(format_relative_time)
                 .unwrap_or_else(|| "never".to_string()),
-            last_event_level: event_level.class(),
+            last_event_dot: dot_class(event_level),
             events_24h: seen.map(|a| a.events_24h).unwrap_or(0),
             state_level: state_level.class(),
             declared: true,
@@ -616,7 +757,7 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
                 .last_event_at
                 .map(format_relative_time)
                 .unwrap_or_else(|| "never".to_string()),
-            last_event_level: event_level.class(),
+            last_event_dot: dot_class(event_level),
             events_24h: seen.events_24h,
             state_level: Level::Unknown.class(),
             declared: false,
@@ -656,7 +797,7 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
     let ledger = LedgerStatus {
         events: Some(ledger_row.0),
         newest_ingested_ago: ledger_row.1.map(format_relative_time),
-        state_level: ledger_level.class(),
+        dot: dot_class(ledger_level),
     };
 
     // The band's "Last event" cell is the same fleet-wide number the dashboard shows, kept here so
@@ -768,51 +909,188 @@ mod tests {
 
     #[test]
     fn a_binary_matching_a_stamp_that_matches_main_is_current() {
-        let (verdict, level, _) = version_verdict(RUNNING, Some(HEAD), Some(HEAD));
+        let (verdict, level, _) = version_verdict(RUNNING, Some(RUNNING), Some(HEAD), Some(HEAD));
         assert_eq!(verdict, "current");
         assert_eq!(level, Level::Ok);
+    }
+
+    /// A stamp written before the installed identity existed cannot say what is on disk, so it
+    /// cannot say the box is current. The running process matching the deployed checkout is still
+    /// real evidence about THIS process and is still rendered, but the verdict word is the honest
+    /// unknown rather than an agreement nothing observed: an install that silently no-opped
+    /// produces exactly this stamp, and `current` would be the wrong answer on that box.
+    #[test]
+    fn an_older_stamp_without_an_installed_identity_is_not_recorded_not_current() {
+        let (verdict, level, note) = version_verdict(RUNNING, None, Some(HEAD), Some(HEAD));
+        assert_eq!(verdict, "not recorded");
+        assert_eq!(level, Level::Unknown);
+        assert!(
+            note.contains("records no revision for the binary on disk"),
+            "the note must name the missing observation, not imply a fault: {note}"
+        );
     }
 
     /// The failure this whole panel exists for: `upgrade.sh` built and installed new binaries, and
     /// the running process is still the old one.
     #[test]
     fn a_binary_older_than_the_deployed_commit_needs_a_restart() {
-        let (verdict, level, note) = version_verdict(RUNNING, Some(OTHER), Some(OTHER));
+        let (verdict, level, note) = version_verdict(RUNNING, None, Some(OTHER), Some(OTHER));
         assert_eq!(verdict, "restart required");
         assert_eq!(level, Level::Warn);
-        assert!(note.contains("not the code on disk"));
+        assert!(note.contains("does not match the commit the deploy stamp recorded"));
+        // The regression this guards: a mismatch used to be reported as "a newer build was
+        // installed" and promise a restart would fix it, neither of which a bare SHA comparison
+        // can actually prove - see `version_verdict`'s own doc comment.
+        assert!(!note.contains("a newer build was installed"));
+        assert!(!note.contains("not the code on disk"));
     }
 
     #[test]
     fn a_deployed_commit_behind_origin_main_says_so() {
-        let (verdict, level, _) = version_verdict(RUNNING, Some(HEAD), Some(OTHER));
+        let (verdict, level, _) = version_verdict(RUNNING, Some(RUNNING), Some(HEAD), Some(OTHER));
         assert_eq!(verdict, "behind main");
         assert_eq!(level, Level::Warn);
+        // Checkout versus fetched main is an observation the installed identity has no part in, so
+        // an absent one must not swallow it: the box is behind whatever the install did.
+        assert_eq!(
+            version_verdict(RUNNING, None, Some(HEAD), Some(OTHER)).0,
+            "behind main"
+        );
+    }
+
+    /// The failure a checkout SHA alone cannot see: the deploy built a commit, the install did not
+    /// replace the file, and the old binary is still on disk. Reporting that as "restart required"
+    /// would send the operator to `systemctl restart`, which reloads the same old bytes.
+    #[test]
+    fn an_install_that_did_not_replace_the_binary_is_not_a_restart_problem() {
+        // The stamp says HEAD was built; the binary on disk still reports the previous commit, and
+        // so does this process, because it is that binary.
+        let (verdict, level, note) = version_verdict(OTHER, Some(OTHER), Some(HEAD), Some(HEAD));
+        assert_eq!(verdict, "install incomplete");
+        assert_eq!(level, Level::Alarm);
+        assert!(
+            note.contains("did not replace it") && note.contains("restarting would not load"),
+            "the note must say a restart is not the fix: {note}"
+        );
+    }
+
+    /// The same mismatch with the process already restarted into the new build: what is on disk is
+    /// still wrong, so the next restart would move the box BACKWARDS. The install is the defect
+    /// either way, and the verdict must not soften just because the current process looks right.
+    #[test]
+    fn an_install_that_did_not_land_is_reported_even_when_the_process_is_current() {
+        let (verdict, level, _) = version_verdict(RUNNING, Some(OTHER), Some(HEAD), Some(HEAD));
+        assert_eq!(verdict, "install incomplete");
+        assert_eq!(level, Level::Alarm);
+    }
+
+    /// With the installed identity present and matching the deploy, a mismatch on the RUNNING
+    /// process has exactly one explanation left, and the note is allowed to name it.
+    #[test]
+    fn a_recorded_install_that_matches_the_deploy_makes_restart_the_named_fix() {
+        let (verdict, level, note) = version_verdict(OTHER, Some(RUNNING), Some(HEAD), Some(HEAD));
+        assert_eq!(verdict, "restart required");
+        assert_eq!(level, Level::Warn);
+        assert!(
+            note.contains("until the service restarts"),
+            "with the install proven, the note must name the restart: {note}"
+        );
+        assert!(
+            !note.contains("not guaranteed"),
+            "and must not keep hedging about an install that is now established: {note}"
+        );
+    }
+
+    /// An installed identity that is not a clean revision proves nothing about what landed, so it
+    /// must neither be compared as if it were real nor stand in for the observation it is not. A
+    /// mismatching running binary falls back to the hedged, undiagnosed `restart required`; a
+    /// matching one reads `not recorded`, because the disk was still never looked at.
+    #[test]
+    fn an_unusable_installed_identity_is_never_treated_as_an_observation() {
+        for installed in [
+            Some("abc123abc123+dirty"),
+            Some("not-a-git-sha-at-all"),
+            Some("abc12"),
+            None,
+        ] {
+            let (verdict, level, _) = version_verdict(RUNNING, installed, Some(HEAD), Some(HEAD));
+            assert_eq!(verdict, "not recorded", "installed={installed:?}");
+            assert_eq!(level, Level::Unknown, "installed={installed:?}");
+            let (verdict, _, note) = version_verdict(OTHER, installed, Some(HEAD), Some(HEAD));
+            assert_eq!(verdict, "restart required", "installed={installed:?}");
+            assert!(
+                note.contains("not guaranteed to resolve it"),
+                "an unusable installed identity must leave the hedge in place: {note}"
+            );
+        }
+    }
+
+    /// A recorded-but-unusable installed identity and an absent one are both unknown, and the two
+    /// notes must not be swapped: one points at stamp damage, the other at a box that simply has
+    /// not been redeployed since the field existed.
+    #[test]
+    fn a_damaged_installed_identity_says_so_rather_than_reading_as_an_old_stamp() {
+        let (verdict, _, note) =
+            version_verdict(RUNNING, Some("abc123abc123+dirty"), Some(HEAD), Some(HEAD));
+        assert_eq!(verdict, "not recorded");
+        assert!(
+            note.contains("is not a clean commit id"),
+            "a damaged installed entry must be named as damage: {note}"
+        );
     }
 
     /// Every uncertain input lands here rather than on `current`. A panel that says the box is up
     /// to date because it could not tell otherwise is worse than one that says nothing.
     #[test]
     fn every_unknown_input_reads_not_recorded_rather_than_current() {
-        for (running, head, origin) in [
+        for (running, installed, head, origin) in [
             // No stamp file, or one that parsed to nothing useful.
-            (RUNNING, None, None),
-            (RUNNING, None, Some(HEAD)),
+            (RUNNING, None, None, None),
+            (RUNNING, None, None, Some(HEAD)),
             // A stamp with no origin revision cannot answer "behind main", so it must not claim
             // the box is current either.
-            (RUNNING, Some(HEAD), None),
-            // A build that could not run git.
-            ("unknown", Some(HEAD), Some(HEAD)),
-            // A build from a modified working tree matches no commit at all.
-            ("abc123abc123+dirty", Some(HEAD), Some(HEAD)),
+            (RUNNING, None, Some(HEAD), None),
+            // A build that could not run git, and a build from a modified working tree: neither
+            // names a commit, and a recorded install identity cannot rescue that - this process
+            // still cannot say what it is.
+            ("unknown", None, Some(HEAD), Some(HEAD)),
+            ("unknown", Some(RUNNING), Some(HEAD), Some(HEAD)),
+            ("abc123abc123+dirty", None, Some(HEAD), Some(HEAD)),
+            ("abc123abc123+dirty", Some(RUNNING), Some(HEAD), Some(HEAD)),
+            // Everything else agreeing does not make an unobserved install an observed one: with
+            // no usable identity for the binary on disk, the fourth identity is simply missing.
+            (RUNNING, None, Some(HEAD), Some(HEAD)),
+            (RUNNING, Some("abc123abc123+dirty"), Some(HEAD), Some(HEAD)),
+            (
+                RUNNING,
+                Some("not-a-git-sha-at-all"),
+                Some(HEAD),
+                Some(HEAD),
+            ),
+            // A stamp whose recorded id is not a valid revision at all - too short, or not hex -
+            // must read as unrecorded, not be compared as if it were a real (mismatching) SHA.
+            (RUNNING, None, Some("abc12"), Some(HEAD)),
+            (RUNNING, None, Some("not-a-git-sha-at-all"), Some(HEAD)),
+            (RUNNING, None, Some(HEAD), Some("abc12")),
+            (RUNNING, None, Some(HEAD), Some("not-a-git-sha-at-all")),
         ] {
-            let (verdict, level, _) = version_verdict(running, head, origin);
+            let (verdict, level, _) = version_verdict(running, installed, head, origin);
             assert_eq!(
                 verdict, "not recorded",
-                "running={running} head={head:?} origin={origin:?}"
+                "running={running} installed={installed:?} head={head:?} origin={origin:?}"
             );
             assert_eq!(level, Level::Unknown);
         }
+    }
+
+    /// A malformed stamp field is reported as unrecorded, distinctly from a real mismatch, so the
+    /// operator is pointed at the deploy stamp file itself rather than at a phantom "restart" or
+    /// "behind main" fix.
+    #[test]
+    fn a_malformed_stamp_sha_is_not_recorded_rather_than_a_mismatch() {
+        let (verdict, _, note) = version_verdict(RUNNING, None, Some("not-hex"), Some(HEAD));
+        assert_eq!(verdict, "not recorded");
+        assert!(note.contains("not a valid revision"));
     }
 
     /// The stamp holds the full 40-character id and the binary a 12-character prefix of it, so
@@ -820,13 +1098,17 @@ mod tests {
     #[test]
     fn the_short_sha_is_matched_as_a_prefix_of_the_stamps_full_one() {
         assert_eq!(
-            version_verdict(RUNNING, Some(HEAD), Some(HEAD)).0,
+            version_verdict(RUNNING, Some(RUNNING), Some(HEAD), Some(HEAD)).0,
             "current"
         );
-        // And a prefix that does not match must not be waved through.
+        // And a prefix that does not match must not be waved through, on either identity.
         assert_eq!(
-            version_verdict("abc123abc124", Some(HEAD), Some(HEAD)).0,
+            version_verdict("abc123abc124", Some(RUNNING), Some(HEAD), Some(HEAD)).0,
             "restart required"
+        );
+        assert_eq!(
+            version_verdict(RUNNING, Some("abc123abc124"), Some(HEAD), Some(HEAD)).0,
+            "install incomplete"
         );
     }
 }

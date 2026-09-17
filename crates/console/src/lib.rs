@@ -91,6 +91,13 @@ pub struct AppState {
     /// observable after the fact. `Copy`, so no `Arc` wrapping needed (unlike `sessions` etc.,
     /// which wrap non-`Clone` interior state).
     pub startup_time: DateTime<Utc>,
+    /// Which executable is serving this page: `"propolis"` for the unified daemon, `"console"` for
+    /// the standalone binary. Stamped by the constructing binary, because this library crate is
+    /// compiled into both and cannot tell them apart from the inside. The fleet pane needs it to
+    /// look up the right entry in the deploy stamp's `installed` map: the two binaries are
+    /// installed separately, so one of them can be replaced while the other is not, and reading
+    /// the other one's revision would report an install this process has no evidence for.
+    pub binary_name: &'static str,
     /// The running binary's own crate version (`env!("CARGO_PKG_VERSION")`), stamped by whichever
     /// binary constructed this `AppState` - so the console always displays the version of the
     /// process actually serving the page, not a fixed constant baked into this library crate.

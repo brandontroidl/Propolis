@@ -19,6 +19,7 @@
 // no `.git` yields "unknown", and the pane renders that as `not recorded` rather than `current`.
 // A build that cannot identify itself must never be presented as a build that matches the deploy.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Emits `PROPOLIS_GIT_SHA` and `PROPOLIS_BUILD_TIMESTAMP` for the crate being built.
@@ -28,18 +29,42 @@ use std::process::Command;
 /// verdict: no recorded commit describes a build made from a modified tree, so the pane treats it
 /// as unrecorded rather than comparing it against the deploy stamp and calling it current.
 fn emit_build_stamp() {
+    // Any file changing inside a source directory that feeds this binary re-runs this script:
+    // editing a tracked source file without committing moves neither HEAD nor any ref, so watching
+    // only git metadata (below) would leave the `+dirty` check computed once at the first build and
+    // stale for every build after it. `source_dirs_to_watch` is this crate's own directory plus
+    // every workspace crate it depends on, transitively - `console` and `propolis` carry almost all
+    // of their behavior in sibling crates, so a build script that watched only the binary crate
+    // would report a clean commit for a binary compiled from an edited `fleet` or `review`. Watching
+    // the repository ROOT instead would be both wrong and expensive: the shared `target/` dir lives
+    // there, so the watch would recurse into the previous build's own output.
+    for dir in source_dirs_to_watch() {
+        println!("cargo:rerun-if-changed={}", dir.display());
+    }
+
     // The commit id changes when HEAD moves (a checkout) and when the branch ref moves (a pull or
-    // a commit), so both are watched. A path that does not exist simply makes cargo re-run this
-    // script every build, which costs two `git` invocations and is the safe direction: a stale
+    // a commit), so both are watched, plus `packed-refs` for a branch whose ref has been packed
+    // and has no loose file of its own. Every path is resolved through `git rev-parse --git-path`,
+    // never guessed as a path relative to this crate's directory: a linked worktree's `.git` is a
+    // FILE (a `gitdir:` pointer into the main repository's `.git/worktrees/<name>/`), not a
+    // directory, so a guessed `../../.git/HEAD` silently does not exist there and a real commit
+    // made inside that worktree would never be watched. `--git-path` asks git itself, which
+    // already resolves both a worktree's per-worktree `HEAD` and its shared, main-repository
+    // `packed-refs` correctly. A path that does not exist simply makes cargo re-run this script
+    // every build, which costs a few extra `git` invocations and is the safe direction: a stale
     // stamp would report the wrong revision with no way to notice.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    if let Some(reference) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
-        println!("cargo:rerun-if-changed=../../.git/{reference}");
+    for path in git_paths_to_watch() {
+        println!("cargo:rerun-if-changed={path}");
     }
 
     let sha = match git(&["rev-parse", "--short=12", "HEAD"]) {
         Some(sha) if !sha.is_empty() => {
-            let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+            // `--untracked-files=no`: an untracked file (a scratch note, a local tool's cache
+            // directory) was never part of what was compiled into this binary and must never mark
+            // a clean checkout as dirty. Only a tracked modification, addition, deletion, or staged
+            // change describes a build that does not match its commit.
+            let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
+                .is_some_and(|s| !s.is_empty());
             if dirty { format!("{sha}+dirty") } else { sha }
         }
         _ => "unknown".to_string(),
@@ -58,6 +83,96 @@ fn emit_build_stamp() {
         "cargo:rustc-env=PROPOLIS_BUILD_TIMESTAMP={}",
         rfc3339_utc(epoch)
     );
+}
+
+/// The git-internal paths whose contents decide what `HEAD` currently resolves to: the `HEAD`
+/// file itself, the ref it points at (when on a branch, resolved to its own loose-file path), and
+/// `packed-refs` (consulted whenever a ref has no loose file of its own, i.e. has been packed).
+/// Every path comes from git's own `--git-path`, never guessed, so a linked worktree's per-worktree
+/// `HEAD` and its shared, main-repository `packed-refs` both resolve the way git itself would.
+/// Returns whatever it can resolve; a git failure here still leaves the directory watch above and
+/// the `git()` calls below to fail soft into "unknown".
+fn git_paths_to_watch() -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(p) = git(&["rev-parse", "--git-path", "HEAD"]) {
+        paths.push(p);
+    }
+    if let Some(reference) = git(&["symbolic-ref", "--quiet", "HEAD"])
+        && let Some(p) = git(&["rev-parse", "--git-path", &reference])
+    {
+        paths.push(p);
+    }
+    if let Some(p) = git(&["rev-parse", "--git-path", "packed-refs"]) {
+        paths.push(p);
+    }
+    paths
+}
+
+/// The source directories whose contents decide what this binary is compiled FROM: the crate being
+/// built, plus every crate it reaches through a `path` dependency, followed transitively. Resolved
+/// from the manifests themselves rather than from an assumed `crates/*` layout, so it holds for a
+/// crate built anywhere - including the disposable fixture crates
+/// `sensor-framework/tests/build_stamp_test.rs` builds, which is how this is tested at all.
+///
+/// A registry or vendored dependency is NOT followed: those are pinned by
+/// `Cargo.lock`, are not part of this repository's tracked source, and `git status` would not call
+/// an edit to one of them a modification of this checkout either. Watching the whole `vendor/` tree
+/// on every build would cost a recursive scan of every vendored crate for a case that does not
+/// arise.
+fn source_dirs_to_watch() -> Vec<PathBuf> {
+    let mut pending = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let dir = dir.canonicalize().unwrap_or(dir);
+        if !dir.is_dir() || dirs.contains(&dir) {
+            continue;
+        }
+        let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap_or_default();
+        for relative in path_dependencies(&manifest) {
+            pending.push(dir.join(relative));
+        }
+        dirs.push(dir);
+    }
+    dirs
+}
+
+/// Every `path = "..."` value in a Cargo manifest, by a deliberate line scan rather than a TOML
+/// parser: a build script that pulled in a parser would pull in a build-time dependency tree, for
+/// the same reason this file shells out to git instead of taking `vergen`.
+///
+/// It over-matches rather than under-matches, which is the safe direction here: a `[[bin]]`
+/// `path = "src/main.rs"` and a dev-dependency's path both come back, and both are either already
+/// covered by the crate's own directory watch or are a directory whose contents do reach the
+/// test binaries. A missed dependency, by contrast, is a binary reporting a commit it was not built
+/// from. `path` preceded by a word character (`manifest-path`, `key_path`) is not this key and is
+/// skipped.
+fn path_dependencies(manifest: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in manifest.lines() {
+        let mut rest = line;
+        while let Some(at) = rest.find("path") {
+            let (before, from_key) = rest.split_at(at);
+            rest = &from_key["path".len()..];
+            if before
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            {
+                continue;
+            }
+            let Some(after) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let Some(after) = after.trim_start().strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = after.find('"') else {
+                continue;
+            };
+            out.push(after[..end].to_string());
+        }
+    }
+    out
 }
 
 /// Runs `git` and returns its trimmed stdout, or `None` for any failure at all: no binary, no

@@ -687,31 +687,330 @@ fn deploy_stamp_script_is_valid_bash_and_both_deploy_scripts_run_it() {
             "deploy/{name} does not run deploy/deploy-stamp.sh, so a box deployed through it \
              could never tell a stale binary from a stale checkout"
         );
+        // Ordering alone does not stop a failed install from being stamped as a success: without
+        // `set -e` the install step's failure would be reported and the script would walk on to
+        // the stamp anyway, recording this checkout as deployed. Neither script can be executed
+        // from a test (they write /usr/local/bin and restart units), so this is the static half of
+        // that evidence; the stamp's own behavior is exercised for real against fixtures below.
+        assert!(
+            text.lines().any(|l| l.trim_start().starts_with("set -e")),
+            "deploy/{name} must abort on a failed step, or a failed install would still reach the \
+             deploy stamp and be recorded as a finished deployment"
+        );
     }
 
-    // After the build, so a failed build leaves the previous stamp rather than claiming a commit
-    // that produced no binaries, and before the first restart, so the console reads the new stamp
-    // as soon as it comes back up.
+    // After the build AND after every binary is actually installed, so a failed build or a
+    // partial install-loop failure leaves the previous stamp in place rather than claiming a
+    // commit that produced no binaries, or claiming success for an install that did not finish -
+    // a checkout SHA alone does not prove which binary is actually on disk, which is exactly what
+    // stamping before the install used to get wrong. Before the first restart, so the console
+    // reads the new stamp as soon as it comes back up. Matches on the real invocation
+    // (`"$SCRIPT_DIR/deploy-stamp.sh"`), not a bare substring match, so a comment that merely
+    // mentions the script's name elsewhere in the file cannot be mistaken for where it actually
+    // runs.
     let lines: Vec<&str> = upgrade.lines().collect();
     let build_at = lines
         .iter()
         .position(|l| l.contains("cargo build --release"))
         .expect("upgrade.sh no longer builds - this parser is broken");
+    let install_binaries_at = lines
+        .iter()
+        .position(|l| l.contains("install -m 0755") && l.contains("$BUILD_DIR"))
+        .expect("upgrade.sh no longer installs binaries from $BUILD_DIR - this parser is broken");
     let stamp_at = lines
         .iter()
-        .position(|l| l.contains("deploy-stamp.sh"))
+        .position(|l| l.contains("\"$SCRIPT_DIR/deploy-stamp.sh\""))
         .expect("upgrade.sh never invokes deploy-stamp.sh");
     let first_restart_at = lines
         .iter()
         .position(|l| l.trim_start().starts_with("systemctl restart"))
         .expect("upgrade.sh never restarts a unit - this parser is broken");
     assert!(
-        build_at < stamp_at && stamp_at < first_restart_at,
-        "upgrade.sh must stamp after the build (line {}) and before the first restart (line {}), \
-         but stamps at line {}",
+        build_at < stamp_at && install_binaries_at < stamp_at && stamp_at < first_restart_at,
+        "upgrade.sh must stamp after the build (line {}) and after installing binaries (line {}) \
+         and before the first restart (line {}), but stamps at line {}",
         build_at + 1,
+        install_binaries_at + 1,
         first_restart_at + 1,
         stamp_at + 1
+    );
+}
+
+// ---- deploy/deploy-stamp.sh, executed for real against fixtures ----
+//
+// `installed` is the field that separates "the deploy recorded a commit" from "that commit is the
+// file actually on disk", so reading the script's text proves nothing about it. Every test below
+// runs the real script against a disposable git repository and a directory of stand-in
+// executables under `tempfile::tempdir()` - never this project's own repository, and never
+// /usr/local/bin.
+
+const DEPLOY_STAMP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/deploy-stamp.sh");
+
+/// A disposable git repository with one commit, returning its full HEAD sha.
+fn fixture_repo(dir: &Path) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "test"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "fixture"]);
+    git(&["rev-parse", "HEAD"])
+}
+
+fn write_executable(path: &Path, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// An executable stand-in for an installed binary, answering `--version` the way
+/// `crates/console/src/main.rs` and `crates/propolis/src/main.rs` do and exiting non-zero for
+/// anything else - so a producer that stopped passing `--version` records nothing rather than
+/// quietly keeping its result. The line is written to a sibling data file and `cat`-ed, so no test
+/// input is ever interpolated into shell text.
+fn write_fake_installed_binary(bin_dir: &Path, name: &str, version_line: &str) {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    std::fs::write(
+        bin_dir.join(format!("{name}.version")),
+        format!("{version_line}\n"),
+    )
+    .unwrap();
+    write_executable(
+        &bin_dir.join(name),
+        "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\ncat \"$0.version\"\n",
+    );
+}
+
+fn run_deploy_stamp(repo: &Path, out_file: &Path, bin_dir: &Path) -> std::process::Output {
+    std::process::Command::new(DEPLOY_STAMP)
+        .arg(repo)
+        .arg(out_file)
+        .arg(bin_dir)
+        .output()
+        .expect("failed to run deploy/deploy-stamp.sh")
+}
+
+fn stamp_json(path: &Path) -> serde_json::Value {
+    let bytes = std::fs::read(path).expect("deploy-stamp.sh wrote no stamp file");
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        panic!(
+            "deploy-stamp.sh wrote something that is not JSON ({e}): {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
+}
+
+fn installed_sha(stamp: &serde_json::Value, binary: &str) -> String {
+    stamp["installed"][binary]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Both deployment shapes exist on this project - the unified `propolis` daemon serves the console
+/// on a single box, and `console.service` runs a separate `/usr/local/bin/console` where the
+/// operator splits them - so the stamp has to answer for each binary on its own. The two fixtures
+/// report DIFFERENT revisions on purpose: a producer that read one binary and wrote its answer
+/// under both names would pass a fixture where they agreed.
+#[test]
+fn deploy_stamp_records_each_installed_binary_under_its_own_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let head = fixture_repo(&repo);
+    let bin_dir = tmp.path().join("bin");
+    write_fake_installed_binary(
+        &bin_dir,
+        "propolis",
+        &format!(
+            "propolis 0.3.0 ({}, built 2026-09-09T00:00:00Z)",
+            &head[..12]
+        ),
+    );
+    write_fake_installed_binary(
+        &bin_dir,
+        "console",
+        "console 0.3.0 (0123456789ab, built 2026-09-09T00:00:00Z)",
+    );
+
+    let out_file = tmp.path().join("deploy-stamp.json");
+    let output = run_deploy_stamp(&repo, &out_file, &bin_dir);
+    assert!(
+        output.status.success(),
+        "deploy-stamp.sh failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stamp = stamp_json(&out_file);
+    assert_eq!(stamp["head_sha"].as_str(), Some(head.as_str()));
+    assert_eq!(
+        installed_sha(&stamp, "propolis"),
+        head[..12],
+        "the propolis entry must carry what the propolis binary itself reported: {stamp}"
+    );
+    assert_eq!(
+        installed_sha(&stamp, "console"),
+        "0123456789ab",
+        "the console entry must carry what the console binary reported, not the other one's \
+         revision: {stamp}"
+    );
+}
+
+/// A collector-only box has no console binary, and `install.sh --dry-run` installs nothing at all.
+/// Neither is an error, and neither may be filled in from the checkout or from the other binary:
+/// the entry stays empty and the console renders it as not recorded.
+#[test]
+fn deploy_stamp_leaves_a_binary_that_is_not_installed_unrecorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let head = fixture_repo(&repo);
+    let bin_dir = tmp.path().join("bin");
+    write_fake_installed_binary(
+        &bin_dir,
+        "propolis",
+        &format!(
+            "propolis 0.3.0 ({}, built 2026-09-09T00:00:00Z)",
+            &head[..12]
+        ),
+    );
+
+    let out_file = tmp.path().join("deploy-stamp.json");
+    let output = run_deploy_stamp(&repo, &out_file, &bin_dir);
+    assert!(
+        output.status.success(),
+        "a missing binary must not abort the deploy over a monitoring detail: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stamp = stamp_json(&out_file);
+    assert_eq!(installed_sha(&stamp, "propolis"), head[..12]);
+    assert_eq!(
+        installed_sha(&stamp, "console"),
+        "",
+        "a binary that is not installed must leave its entry empty, never inherit the checkout's \
+         revision: {stamp}"
+    );
+}
+
+/// Anything that is not a version line in the expected shape, from the expected program, must
+/// record nothing. A wrong or malformed value here would be worse than an absent one: the console
+/// compares it against the deploy and would report a difference that means nothing. The good line
+/// is checked in the same test so a producer that simply recorded nothing at all could not pass.
+#[test]
+fn deploy_stamp_refuses_a_version_line_it_cannot_trust() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let head = fixture_repo(&repo);
+    let bin_dir = tmp.path().join("bin");
+    let out_file = tmp.path().join("deploy-stamp.json");
+    let good = format!(
+        "propolis 0.3.0 ({}, built 2026-09-09T00:00:00Z)",
+        &head[..12]
+    );
+
+    for line in [
+        // Not a revision at all.
+        "propolis 0.3.0 (not-a-git-sha, built 2026-09-09T00:00:00Z)",
+        // The shape is gone: nothing to read a revision out of.
+        "propolis 0.3.0 built 2026-09-09T00:00:00Z",
+        "",
+        // Some other program installed at that path. Its idea of a revision is not this one's.
+        "somethingelse 0.3.0 (0123456789ab, built 2026-09-09T00:00:00Z)",
+    ] {
+        write_fake_installed_binary(&bin_dir, "propolis", line);
+        let output = run_deploy_stamp(&repo, &out_file, &bin_dir);
+        assert!(output.status.success(), "line {line:?} aborted the deploy");
+        assert_eq!(
+            installed_sha(&stamp_json(&out_file), "propolis"),
+            "",
+            "a version line of {line:?} must record nothing"
+        );
+    }
+
+    write_fake_installed_binary(&bin_dir, "propolis", &good);
+    run_deploy_stamp(&repo, &out_file, &bin_dir);
+    assert_eq!(
+        installed_sha(&stamp_json(&out_file), "propolis"),
+        head[..12],
+        "and a well-formed line must still be recorded, or this check would pass by rejecting \
+         everything"
+    );
+}
+
+/// The case this field exists to catch is an install that did NOT replace the binary - and the
+/// binary left behind is by definition an older one, from before `--version` existed, which treats
+/// the flag as no argument at all and starts the service. Asking it for its version must not hang
+/// the deploy waiting for a daemon to exit.
+#[test]
+fn deploy_stamp_does_not_hang_when_the_installed_binary_ignores_the_version_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fixture_repo(&repo);
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    write_executable(&bin_dir.join("propolis"), "#!/bin/sh\nsleep 300\n");
+
+    let out_file = tmp.path().join("deploy-stamp.json");
+    let started = std::time::Instant::now();
+    let output = run_deploy_stamp(&repo, &out_file, &bin_dir);
+    let elapsed = started.elapsed();
+
+    assert!(
+        output.status.success(),
+        "deploy-stamp.sh failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "deploy-stamp.sh took {elapsed:?}, so a binary that does not answer --version can stall a \
+         deploy indefinitely"
+    );
+    assert_eq!(
+        installed_sha(&stamp_json(&out_file), "propolis"),
+        "",
+        "a binary that never answered must leave its entry empty"
+    );
+}
+
+/// The mismatch is loud where an operator is already looking. Waiting for someone to open the
+/// fleet pane is not a notification, and the stamp still records what the binary actually said:
+/// the point is to report the box as it is, not to suppress the disagreement.
+#[test]
+fn deploy_stamp_warns_when_the_installed_binary_is_not_the_commit_that_was_built() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fixture_repo(&repo);
+    let bin_dir = tmp.path().join("bin");
+    write_fake_installed_binary(
+        &bin_dir,
+        "propolis",
+        "propolis 0.3.0 (0123456789ab, built 2026-09-09T00:00:00Z)",
+    );
+
+    let out_file = tmp.path().join("deploy-stamp.json");
+    let output = run_deploy_stamp(&repo, &out_file, &bin_dir);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning") && stderr.contains("propolis"),
+        "an installed binary that is not this checkout's commit must be reported at deploy time, \
+         naming the binary: {stderr}"
+    );
+    assert_eq!(
+        installed_sha(&stamp_json(&out_file), "propolis"),
+        "0123456789ab",
+        "and the stamp records what is actually on disk, not what the deploy wanted to be there"
     );
 }
 

@@ -29,14 +29,6 @@ sudo -u "$(stat -c '%U' "$REPO_DIR")" git pull
 echo "==> building release"
 sudo -u "$(stat -c '%U' "$REPO_DIR")" cargo build --release
 
-# After the build, not before it: the stamp says what was BUILT, and a build that failed must
-# leave the previous stamp in place rather than claim a commit that produced no binaries. Still
-# before the restarts, so the console reads it as soon as it comes back up. The console compares
-# this against the commit each binary stamped into itself, which is how a deploy that built new
-# binaries without restarting the service becomes visible.
-echo "==> recording the deploy stamp"
-PROPOLIS_DEPLOY_PULLED_AT="$PULLED_AT" "$SCRIPT_DIR/deploy-stamp.sh" "$REPO_DIR"
-
 echo "==> installing binaries"
 # SP-A (collector/control-plane split): gateway and shipper are new binaries alongside the
 # sensors and the unified daemon. A single-box migration installs and restarts every unit on this
@@ -73,6 +65,17 @@ for unit in gateway.service shipper.service; do
     fi
 done
 install -m 0644 "$SCRIPT_DIR/logrotate-sensors.conf" /etc/logrotate.d/propolis-sensors
+
+# After every step that can fail (the build, and every install above), and before the restarts, so
+# the console reads it as soon as it comes back up. Recording it any earlier - this used to run
+# right after the build, before the binaries were even copied - meant a failed or partial install
+# loop still left a stamp claiming this checkout as deployed, which is worse than no stamp: it
+# reports success for a deploy that did not finish. `deploy-stamp.sh` also reads each installed
+# binary's own `--version` output here, which is the only source that describes the actual bytes
+# now on disk rather than what this checkout merely intended to build - see that script's own
+# `installed_sha` comment.
+echo "==> recording the deploy stamp"
+PROPOLIS_DEPLOY_PULLED_AT="$PULLED_AT" "$SCRIPT_DIR/deploy-stamp.sh" "$REPO_DIR"
 
 # Before any restart, or the restarts would start the OLD unit definitions.
 echo "==> reloading systemd unit files"

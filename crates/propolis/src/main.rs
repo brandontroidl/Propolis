@@ -519,6 +519,10 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         fleet_probe_interval,
         deploy_stamp_path,
         startup_time: chrono::Utc::now(),
+        // This daemon serves the console itself, so the fleet pane's version panel is reporting on
+        // THIS binary: the installed file name it was started from, which is also the name its own
+        // `--version` line above opens with and the key `deploy/deploy-stamp.sh` records it under.
+        binary_name: "propolis",
         version: env!("CARGO_PKG_VERSION"),
         git_sha: env!("PROPOLIS_GIT_SHA"),
         built_at: env!("PROPOLIS_BUILD_TIMESTAMP"),
@@ -631,6 +635,24 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
+    // Offline identity check, ahead of every other line in this function on purpose: config
+    // loading, the PgPool connect, and migrations all fail loudly when the environment is not yet
+    // fully populated (a fresh install, an operator diagnosing a stuck deploy), and this must
+    // answer "what commit is this BINARY actually built from" regardless. It is the only way to
+    // confirm what a deploy actually installed - `deploy/deploy-stamp.json` records what the
+    // CHECKOUT was at build time, which a partially-failed install loop or a stale cargo cache can
+    // both make untrue of the binary that landed in `/usr/local/bin`. See
+    // `crates/build-stamp.rs`'s own header for why these two env vars exist at all.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!(
+            "propolis {} ({}, built {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("PROPOLIS_GIT_SHA"),
+            env!("PROPOLIS_BUILD_TIMESTAMP")
+        );
+        return;
+    }
+
     // Tracing: honor RUST_LOG if set, otherwise default to info. The console's live `/logs`
     // viewer (`console::routes::logs`) needs a copy of every event this process logs, so
     // `LogBufferLayer` is layered onto the same subscriber stack as the existing `fmt` output

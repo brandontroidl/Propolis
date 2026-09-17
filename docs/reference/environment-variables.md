@@ -191,7 +191,7 @@ viewer of the same data.
 | Variable | Req | Default | Notes |
 |---|---|---|---|
 | `PROPOLIS_FLEET_LISTENERS` | no | none (empty inventory) | comma-separated `collector/sensor/protocol/port` entries, e.g. `local/ssh/tcp/22,local/catchall/udp/1024`. Unset or blank means "this node was told no inventory": the pane then reports every check as unknown rather than reporting nothing at all. A value that IS set and malformed aborts startup - never a silently shortened list. `protocol` is `tcp` or `udp`; `port` is 1-65535. |
-| `PROPOLIS_FLEET_DEPLOY_STAMP` | no | `/var/lib/propolis/deploy-stamp.json` | path to the deploy stamp JSON, written by `deploy/deploy-stamp.sh` on every install and upgrade. A missing, unreadable, or malformed file leaves the version panel reading `not recorded`, never `current`. Set it only to move the file; the default is the path the deploy scripts write. |
+| `PROPOLIS_FLEET_DEPLOY_STAMP` | no | `/var/lib/propolis/deploy-stamp.json` | path to the deploy stamp JSON, written by `deploy/deploy-stamp.sh` on every install and upgrade. A missing, unreadable, or malformed file leaves the version panel reading `not recorded`, never `current`. Set it only to move the file; the default is the path the deploy scripts write. The file records the deployed checkout's commit, the last fetched `origin/main`, the branch, two timestamps, and an `installed` map holding what each installed binary reports for its own `--version` - the daemon and the standalone console separately, because they are installed separately and either one can be left behind. A stamp written before that map existed, or one whose entry for this binary is empty or not a clean commit id, reads as `not recorded` on that line AND in the verdict: `current` asserts what is on disk as well as what this process runs, and nothing observed the disk. Redeploying with the current `deploy-stamp.sh` records it. |
 | `PROPOLIS_FLEET_COLLECTOR_ENDPOINTS` | no | none | comma-separated `collector=address`, e.g. `local=198.51.100.7`. The address the control plane dials for that collector's listeners. A listener whose collector is absent here is recorded `not probeable` with the reason named, never guessed at. A malformed entry aborts startup. |
 | `PROPOLIS_FLEET_PROBE_INTERVAL` | no | `300` | sweep cadence in seconds, 60-86400. Rejected rather than clamped outside that range. Also the unit the console measures probe staleness in: a row older than twice this alarms, whatever its last outcome was. The standalone `console` binary reads it too, purely to size that rule. |
 | `PROPOLIS_FLEET_PROBE_TIMEOUT` | no | `5` | per-connect deadline in seconds, 1-60. Rejected rather than clamped outside that range. Bounds each connect so a blackholed address cannot hold a sweep open on the OS default connect timeout. |
@@ -257,11 +257,17 @@ effect. They are listed here only because they read like environment variables
 in the source.
 
 `PROPOLIS_GIT_SHA` is the short commit id, with `+dirty` appended when the
-working tree had uncommitted changes, or the literal `unknown` when the build
-could not run git at all (a tarball, a container with no git, a checkout with no
+working tree had uncommitted changes (in the crate being built or in any
+workspace crate it depends on), or the literal `unknown` when the build could
+not run git at all (a tarball, a container with no git, a checkout with no
 `.git`). The version panel treats `unknown` and `+dirty` the same way it treats
 a missing stamp: `not recorded`. A build that cannot say which commit it is must
 never be presented as a build that matches the deploy.
+
+Both binaries print these two values, plus their crate version, in response to
+`--version`, before any configuration, database or network work - so an operator
+can ask a binary what it is on a box whose environment is not populated yet, and
+so `deploy/deploy-stamp.sh` can read back what an install actually left on disk.
 
 ### VirusTotal (unified daemon only)
 

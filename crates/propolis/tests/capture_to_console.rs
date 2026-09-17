@@ -115,6 +115,7 @@ async fn a_stalled_capture_reaches_the_console_reading_as_incomplete(pool: PgPoo
             fleet_probe_interval: std::time::Duration::from_secs(300),
             deploy_stamp_path: None,
             startup_time: chrono::Utc::now(),
+            binary_name: "propolis",
             version: "test",
             git_sha: "abc123abc123",
             built_at: "2026-09-09T00:00:00Z",

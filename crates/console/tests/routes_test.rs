@@ -80,6 +80,7 @@ fn test_state_full(
         fleet_probe_interval: std::time::Duration::from_secs(300),
         deploy_stamp_path,
         startup_time: chrono::Utc::now(),
+        binary_name: "console",
         version: "test",
         git_sha: "abc123abc123",
         built_at: "2026-09-09T00:00:00Z",
@@ -4866,8 +4867,10 @@ async fn fleet_version_panel_says_restart_required_when_the_stamp_moved_past_thi
     );
 }
 
-/// The healthy case, so the panel is not just a machine for printing warnings: binary, deployed
-/// checkout and main all name the same commit.
+/// The healthy case, so the panel is not just a machine for printing warnings: binary, installed
+/// file, deployed checkout and main all name the same commit. All four are required - the stamp
+/// carries the installed entry for the binary serving this page, because `current` claims what is
+/// on disk too.
 #[sqlx::test(migrations = false)]
 async fn fleet_version_panel_reads_current_when_binary_stamp_and_main_agree(pool: PgPool) {
     migrate(&pool).await;
@@ -4879,7 +4882,8 @@ async fn fleet_version_panel_reads_current_when_binary_stamp_and_main_agree(pool
         r#"{"head_sha": "abc123abc123def456def456def456def456def4",
             "origin_main_sha": "abc123abc123def456def456def456def456def4",
             "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
-            "built_at": "2026-09-09T00:00:00Z"}"#,
+            "built_at": "2026-09-09T00:00:00Z",
+            "installed": {"propolis": "abc123abc123", "console": "abc123abc123"}}"#,
     )
     .unwrap();
 
@@ -5289,5 +5293,725 @@ async fn fleet_staleness_follows_the_configured_probe_interval(pool: PgPool) {
     assert!(
         !listener_table(&body).contains("stale"),
         "at an hourly sweep the same row is fresh and must not be called stale: {body}"
+    );
+}
+
+// ---- fleet presentation: the computed `Level` states must reach real rendered style classes,
+// not just inert `data-level`/`data-state` attributes no stylesheet selects on. Each test below
+// asserts the actual `.dot`/`.sev` class markup (and the word beside it), never the presence of
+// the dead attribute alone. ----
+
+/// The regression this guards: the version verdict pill used to render `sev sev--watch`
+/// unconditionally, so `current`/`restart required`/`not recorded` were visually identical.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_pill_reads_neutral_when_current(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    std::fs::write(
+        &stamp,
+        r#"{"head_sha": "abc123abc123def456def456def456def456def4",
+            "origin_main_sha": "abc123abc123def456def456def456def456def4",
+            "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+            "built_at": "2026-09-09T00:00:00Z",
+            "installed": {"propolis": "abc123abc123", "console": "abc123abc123"}}"#,
+    )
+    .unwrap();
+
+    let state = test_state_full(pool, None, Vec::new(), Some(stamp));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains(r#"<span class="sev sev--low">current</span>"#),
+        "a matching binary/stamp/main must render the neutral low pill, not the fixed watch one: {body}"
+    );
+    assert!(
+        !body.contains(r#"<span class="sev sev--watch">current</span>"#),
+        "current must not still carry the hard-coded watch colour: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_version_pill_reads_watch_when_not_recorded(pool: PgPool) {
+    migrate(&pool).await;
+    let missing = PathBuf::from("/nonexistent/propolis/deploy-stamp.json");
+    let state = test_state_full(pool, None, Vec::new(), Some(missing));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains(r#"<span class="sev sev--watch">not recorded</span>"#),
+        "an unrecorded verdict must render the explicit watch pill: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_version_pill_reads_attention_when_restart_required(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    std::fs::write(
+        &stamp,
+        r#"{"head_sha": "f00dcafef00dcafef00dcafef00dcafef00dcafe",
+            "origin_main_sha": "f00dcafef00dcafef00dcafef00dcafef00dcafe",
+            "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+            "built_at": "2026-09-09T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let state = test_state_full(pool, None, Vec::new(), Some(stamp));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains(r#"<span class="sev sev--high">restart required</span>"#),
+        "a binary older than the deployed commit must render the attention-orange pill: {body}"
+    );
+    assert!(
+        !body.contains(r#"<span class="sev sev--watch">restart required</span>"#),
+        "restart required must not still carry the fixed watch colour: {body}"
+    );
+}
+
+/// The regression this guards: the capture panel's dominant-end-reason pill was hard-coded
+/// `sev--watch` regardless of how bad the row's own completion rate actually was.
+#[sqlx::test(migrations = false)]
+async fn fleet_capture_end_reason_pill_tracks_the_row_severity(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.90";
+    let upload = |sha: &str| {
+        ev_with_session(
+            ip,
+            "ssh",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": sha,
+                "sample_size": 10,
+                "complete": false,
+                "end_reason": "capture_budget",
+            }),
+            Uuid::now_v7(),
+        )
+    };
+    // Every capture incomplete: 0% complete, which is Alarm-level, not the merely-Watch severity
+    // the fixed pill always showed.
+    for i in 0..3 {
+        let sha = format!("{:064x}", i + 200);
+        append_event(&pool, upload(&sha)).await.unwrap();
+    }
+
+    let state = test_state_full(pool, None, Vec::new(), None);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains(r#"<span class="sev sev--crit">capture budget</span>"#),
+        "a 0%-complete row's dominant reason must render the alarm pill: {body}"
+    );
+    assert!(
+        !body.contains(r#"<span class="sev sev--watch">capture budget</span>"#),
+        "must not still render the hard-coded watch pill regardless of the row's real severity: {body}"
+    );
+}
+
+/// The regression this guards: the feed panel wrote `data-level` on the whole panel body, which no
+/// stylesheet selects on, so an expired feed looked identical to a current one.
+#[sqlx::test(migrations = false)]
+async fn fleet_expired_feed_renders_the_alarm_dot(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2020-01-01T00:00:00Z","tiers":{"aggressive":{"count":1,"sha256":"a","valid_until":"2020-01-02T00:00:00Z"},"standard":{"count":1,"sha256":"b","valid_until":"2020-01-02T00:00:00Z"}}}"#,
+    )
+    .unwrap();
+
+    let state = test_state_full(pool, Some(tmp.path().to_path_buf()), Vec::new(), None);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains("the published feed has expired"),
+        "the expired feed must say so in words: {body}"
+    );
+    assert!(
+        body.contains(
+            r#"<span class="label">Expires in</span> <span class="dot dot--crit" aria-hidden="true"></span>"#
+        ),
+        "an expired feed's Expires-in value must carry the alarm dot, not the dead panel-body attribute: {body}"
+    );
+}
+
+/// The regression this guards: the listener table's last-event cell carried a `data-level`
+/// attribute no stylesheet reads, so every row's last-event column looked the same regardless of
+/// whether the sensor was live or had never produced a single event.
+#[sqlx::test(migrations = false)]
+async fn fleet_listener_last_event_column_carries_a_dot_matching_its_level(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.91",
+            "ssh",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("telnet", fleet::Proto::Tcp, 23),
+        ],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let table = listener_table(&body);
+
+    assert!(
+        table.contains(r#"<td class="seen"><span class="dot dot--low" aria-hidden="true"></span>"#),
+        "a listener with a recent event must carry the healthy dot on its last-event cell: {table}"
+    );
+    assert!(
+        table.contains(
+            r#"<td class="seen"><span class="dot dot--watch" aria-hidden="true"></span> never</td>"#
+        ),
+        "a listener that has never produced an event must carry the unknown dot, not bare `never` text: {table}"
+    );
+}
+
+/// The reach column's dot was already wired correctly; this proves it with the real class rather
+/// than the inert `data-level="alarm"` attribute the pre-existing stale-probe test checks.
+#[sqlx::test(migrations = false)]
+async fn fleet_stale_probe_row_carries_the_alarm_dot_not_only_the_word(pool: PgPool) {
+    migrate(&pool).await;
+    let long_ago = chrono::Utc::now() - chrono::Duration::hours(3);
+    insert_probe(
+        &pool,
+        "ssh",
+        "tcp",
+        22,
+        "reachable",
+        None,
+        long_ago,
+        Some(long_ago),
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let table = listener_table(&body);
+
+    assert!(
+        table.contains(
+            r#"<span class="dot dot--crit" aria-hidden="true"></span> stale, last reachable"#
+        ),
+        "a stale probe must render the real alarm dot next to the word: {table}"
+    );
+}
+
+/// The regression this guards: the Evidence chain panel's "Newest ingest" value carried a
+/// `data-level` attribute the stylesheet never reads. Hits `/fleet/status` directly (the 30-second
+/// refresh fragment), not just the full page, since the two share this exact markup.
+#[sqlx::test(migrations = false)]
+async fn fleet_status_fragment_newest_ingest_carries_a_dot(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.92",
+            "ssh",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet/status",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains(
+            r#"<span class="label">Newest ingest</span> <span class="dot dot--low" aria-hidden="true"></span>"#
+        ),
+        "a recent ingest must carry the healthy dot on the refresh fragment, not a dead attribute: {body}"
+    );
+}
+
+/// A failed ledger query must read as unknown, not silently keep whatever the dead attribute last
+/// said (which, since nothing rendered from it, always looked the same as healthy).
+#[sqlx::test(migrations = false)]
+async fn fleet_page_shows_the_ingest_state_as_unknown_when_the_ledger_query_fails(pool: PgPool) {
+    migrate(&pool).await;
+    sqlx::query("DROP TABLE event CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a failed ledger query must not take the whole monitoring page down"
+    );
+    let body = body_text(response).await;
+    assert!(
+        body.contains("ledger head"),
+        "the degraded banner must name the failed ledger panel: {body}"
+    );
+    assert!(
+        body.contains(
+            r#"<span class="label">Newest ingest</span> <span class="dot dot--watch" aria-hidden="true"></span>"#
+        ),
+        "a failed ledger query must render the unknown dot, not a healthy-looking dead attribute: {body}"
+    );
+}
+
+// ---- the version panel's four identities: what this PROCESS runs, what the deploy left
+// INSTALLED on disk for it, what was CHECKED OUT when that deploy built, and what main held when
+// it last fetched. The tests below drive the page, and the last pair drive it from a stamp the
+// real `deploy/deploy-stamp.sh` wrote, because two halves each tested against their own
+// hand-written fixture leave the field names between them untested in both directions. ----
+
+/// The running binary's own revision in `test_state_full`, and the full id a deploy would record
+/// for the same commit.
+const STAMPED_HEAD: &str = "abc123abc123def456def456def456def456def4";
+/// A valid revision that is not the deployed one, for the binary whose install did not land.
+const OTHER_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+async fn fleet_body(state: AppState) -> String {
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await
+}
+
+/// The deploy stamp records one installed revision per binary, and the page must read the entry
+/// for the executable actually serving it: `propolis` for the unified daemon, `console` for the
+/// standalone binary. The two entries below disagree on purpose - a page that read the wrong one
+/// would swap `current` for `install incomplete` here, which is exactly the wrong answer in both
+/// directions.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_reads_the_installed_entry_for_the_binary_serving_the_page(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    std::fs::write(
+        &stamp,
+        format!(
+            r#"{{"head_sha": "{STAMPED_HEAD}", "origin_main_sha": "{STAMPED_HEAD}",
+                 "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+                 "built_at": "2026-09-09T00:00:00Z",
+                 "installed": {{"propolis": "{OTHER_SHA}", "console": "abc123abc123"}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let as_console = test_state_full(pool.clone(), None, Vec::new(), Some(stamp.clone()));
+    let body = fleet_body(as_console).await;
+    assert!(
+        body.contains(r#"<span class="sev sev--low">current</span>"#),
+        "the console binary's own installed revision matches the deploy, so this page is current: \
+         {body}"
+    );
+    assert!(
+        body.contains(
+            r#"<span class="label">Installed</span> <span class="mono">abc123abc123</span>"#
+        ),
+        "the panel must show the installed revision of the binary serving it: {body}"
+    );
+    assert!(
+        !body.contains(OTHER_SHA),
+        "and must not report the OTHER binary's installed revision as this process's evidence: \
+         {body}"
+    );
+
+    let as_daemon = AppState {
+        binary_name: "propolis",
+        ..test_state_full(pool, None, Vec::new(), Some(stamp))
+    };
+    let body = fleet_body(as_daemon).await;
+    assert!(
+        body.contains(r#"<span class="sev sev--crit">install incomplete</span>"#),
+        "served by the daemon, the same stamp says the propolis binary on disk is not the commit \
+         the deploy recorded, which is not a current box: {body}"
+    );
+}
+
+/// An install that did not land and a process that has not been restarted look identical from a
+/// checkout SHA alone, and they want opposite responses. The panel must name the install, and must
+/// not send the operator to `systemctl restart`, which would reload the same old bytes.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_separates_a_failed_install_from_a_missing_restart(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // The binary on disk is the old one, and so is this process, because it IS that binary.
+    let failed_install = dir.path().join("failed-install.json");
+    std::fs::write(
+        &failed_install,
+        format!(
+            r#"{{"head_sha": "{OTHER_SHA}", "origin_main_sha": "{OTHER_SHA}",
+                 "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+                 "built_at": "2026-09-09T00:00:00Z",
+                 "installed": {{"propolis": "", "console": "abc123abc123"}}}}"#
+        ),
+    )
+    .unwrap();
+    let body = fleet_body(test_state_full(
+        pool.clone(),
+        None,
+        Vec::new(),
+        Some(failed_install),
+    ))
+    .await;
+    assert!(
+        body.contains("install incomplete") && !body.contains("restart required"),
+        "an install that left the previous binary in place must not be reported as a restart \
+         away from being fixed: {body}"
+    );
+    assert!(
+        body.contains("restarting would not load that commit"),
+        "and the note must say so in words: {body}"
+    );
+
+    // The install DID land; this process is simply still the previous one.
+    let needs_restart = dir.path().join("needs-restart.json");
+    std::fs::write(
+        &needs_restart,
+        format!(
+            r#"{{"head_sha": "{OTHER_SHA}", "origin_main_sha": "{OTHER_SHA}",
+                 "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+                 "built_at": "2026-09-09T00:00:00Z",
+                 "installed": {{"propolis": "", "console": "{OTHER_SHA}"}}}}"#
+        ),
+    )
+    .unwrap();
+    let body = fleet_body(test_state_full(pool, None, Vec::new(), Some(needs_restart))).await;
+    assert!(
+        body.contains(r#"<span class="sev sev--high">restart required</span>"#),
+        "with the install proven, the same mismatch is a restart: {body}"
+    );
+    assert!(
+        body.contains("until the service restarts") && !body.contains("not guaranteed"),
+        "and the note may name the fix rather than hedging between two causes: {body}"
+    );
+}
+
+/// A stamp written before the installed identity existed is the state every already-deployed box
+/// is in, and it is exactly the state an install that silently no-opped also produces. The page
+/// must say so in the Installed line AND in the verdict: treating the checkout as proof of what
+/// was installed is the assumption this whole field exists to remove, and a `current` pill on an
+/// unobserved install would make the assumption in the loudest place on the panel.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_reports_an_older_stamp_as_installed_not_recorded(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    std::fs::write(
+        &stamp,
+        format!(
+            r#"{{"head_sha": "{STAMPED_HEAD}", "origin_main_sha": "{STAMPED_HEAD}",
+                 "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+                 "built_at": "2026-09-09T00:00:00Z"}}"#
+        ),
+    )
+    .unwrap();
+
+    let body = fleet_body(test_state_full(pool, None, Vec::new(), Some(stamp))).await;
+    assert!(
+        body.contains(
+            r#"<span class="label">Installed</span> <span class="faint">not recorded</span>"#
+        ),
+        "an older stamp must say plainly that it does not record what was installed: {body}"
+    );
+    assert!(
+        body.contains(r#"<span class="sev sev--watch">not recorded</span>"#),
+        "and the verdict must be the honest unknown, never `current`, when nothing observed the \
+         binary on disk: {body}"
+    );
+    assert!(
+        !body.contains(">current<"),
+        "no part of the panel may present this box as current: {body}"
+    );
+    assert!(
+        body.contains("records no revision for the binary on disk"),
+        "the note must name what is missing, so the operator is pointed at a redeploy rather \
+         than at a phantom fault: {body}"
+    );
+}
+
+/// The same requirement from the other direction: a stamp that DOES record an installed revision
+/// for this binary, but a damaged one, is not an observation either. `+dirty` names bytes no commit
+/// names, and a panel that shrugged it off would report `current` on precisely the box whose deploy
+/// left something unexplained on disk.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_refuses_current_on_a_damaged_installed_revision(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    std::fs::write(
+        &stamp,
+        format!(
+            r#"{{"head_sha": "{STAMPED_HEAD}", "origin_main_sha": "{STAMPED_HEAD}",
+                 "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+                 "built_at": "2026-09-09T00:00:00Z",
+                 "installed": {{"propolis": "", "console": "abc123abc123+dirty"}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let body = fleet_body(test_state_full(pool, None, Vec::new(), Some(stamp))).await;
+    assert!(
+        body.contains(r#"<span class="sev sev--watch">not recorded</span>"#)
+            && !body.contains(">current<"),
+        "a dirty installed revision must leave the verdict unknown, not current: {body}"
+    );
+    assert!(
+        body.contains("is not a clean commit id"),
+        "and the note must point at the stamp's own damaged value: {body}"
+    );
+}
+
+/// The real producer, driving the real page. Everything above asserts the console against a stamp
+/// this test file wrote, which leaves the field names between `deploy/deploy-stamp.sh` and
+/// `routes::fleet` untested in both directions - a rename on either side would keep both halves
+/// green. This runs the actual script against a disposable git repository and stand-in installed
+/// binaries under a tempdir, then renders the page from the file it produced.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_reads_a_stamp_written_by_the_real_deploy_script(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let head = fixture_git_repo(&repo);
+    let short: &'static str = Box::leak(head[..12].to_string().into_boxed_str());
+
+    // The daemon's binary is the commit the deploy built; the standalone console binary on this
+    // box was not replaced. One stamp, two answers.
+    let bin_dir = dir.path().join("bin");
+    write_fake_installed_binary(
+        &bin_dir,
+        "propolis",
+        &format!("propolis 0.3.0 ({short}, built 2026-09-09T00:00:00Z)"),
+    );
+    write_fake_installed_binary(
+        &bin_dir,
+        "console",
+        "console 0.3.0 (0123456789ab, built 2026-09-09T00:00:00Z)",
+    );
+    let stamp = dir.path().join("deploy-stamp.json");
+    run_deploy_stamp(&repo, &stamp, &bin_dir);
+
+    let as_daemon = AppState {
+        binary_name: "propolis",
+        git_sha: short,
+        ..test_state_full(pool.clone(), None, Vec::new(), Some(stamp.clone()))
+    };
+    let body = fleet_body(as_daemon).await;
+    assert!(
+        body.contains(&format!(
+            r#"<span class="label">Installed</span> <span class="mono">{short}</span>"#
+        )),
+        "the page must render the revision the deploy script read back off the daemon binary: \
+         {body}"
+    );
+    assert!(
+        body.contains(r#"<span class="sev sev--low">current</span>"#),
+        "binary, installed file, deployed checkout and fetched main all name one commit: {body}"
+    );
+
+    let as_console = AppState {
+        git_sha: short,
+        ..test_state_full(pool, None, Vec::new(), Some(stamp))
+    };
+    let body = fleet_body(as_console).await;
+    assert!(
+        body.contains("install incomplete"),
+        "the console binary on this box was never replaced, and the same stamp says so: {body}"
+    );
+}
+
+/// A disposable git repository with one commit and an `origin/main` pointing at it, returning its
+/// full HEAD sha. `update-ref` rather than a real remote: the script only reads that ref, and no
+/// test here may reach the network. Never this project's own repository.
+fn fixture_git_repo(dir: &std::path::Path) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "test"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "fixture"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    git(&["update-ref", "refs/remotes/origin/main", &head]);
+    head
+}
+
+/// An executable stand-in for an installed binary, answering `--version` the way `console` and
+/// `propolis` do. The version line goes in a sibling data file the script `cat`s, so no test input
+/// is ever interpolated into shell text.
+fn write_fake_installed_binary(bin_dir: &std::path::Path, name: &str, version_line: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    std::fs::write(
+        bin_dir.join(format!("{name}.version")),
+        format!("{version_line}\n"),
+    )
+    .unwrap();
+    let path = bin_dir.join(name);
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\ncat \"$0.version\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn run_deploy_stamp(repo: &std::path::Path, out_file: &std::path::Path, bin_dir: &std::path::Path) {
+    let out = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/deploy-stamp.sh"
+    ))
+    .arg(repo)
+    .arg(out_file)
+    .arg(bin_dir)
+    .output()
+    .expect("failed to run deploy/deploy-stamp.sh");
+    assert!(
+        out.status.success(),
+        "deploy/deploy-stamp.sh failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

@@ -63,7 +63,7 @@
           <td class="mono dim">{% if r.vantage %}{{ r.vantage }}{% else %}<span class="faint">no probe has run</span>{% endif %}</td>
           <td class="seen dim">{{ r.probe_ago }}</td>
           <td class="seen dim">{% if r.confirmed_ago %}{{ r.confirmed_ago }}{% else %}<span class="faint">never</span>{% endif %}</td>
-          <td class="seen" data-level="{{ r.last_event_level }}">{{ r.last_event_ago }}</td>
+          <td class="seen"><span class="{{ r.last_event_dot }}" aria-hidden="true"></span> {{ r.last_event_ago }}</td>
           <td class="count">{{ r.events_24h }}</td>
         </tr>
         {% endfor %}
@@ -105,7 +105,7 @@
           <td class="count">{{ c.captures }}</td>
           <td class="count">{{ c.incomplete }}</td>
           <td class="count">{{ c.truncated }}</td>
-          <td>{% if c.top_end_reason %}<span class="sev sev--watch">{{ c.top_end_reason }}</span> <span class="dim">{{ c.top_end_reason_count }}</span>{% else %}<span class="faint">nothing incomplete</span>{% endif %}</td>
+          <td>{% if c.top_end_reason %}<span class="{{ c.end_reason_sev }}">{{ c.top_end_reason }}</span> <span class="dim">{{ c.top_end_reason_count }}</span>{% else %}<span class="faint">nothing incomplete</span>{% endif %}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -121,21 +121,21 @@
     <div class="panel-head">Evidence chain</div>
     <div class="panel-body">
       <p><span class="label">Events</span> <span class="mono">{{ ledger.events }}</span></p>
-      <p><span class="label">Newest ingest</span> <span class="mono" data-level="{{ ledger.state_level }}">{% if ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></p>
+      <p><span class="label">Newest ingest</span> <span class="{{ ledger.dot }}" aria-hidden="true"></span> <span class="mono">{% if ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></p>
       <p class="dim">The chain verdict is not stored yet. <a href="/integrity">Run a verification</a> to see it.</p>
     </div>
   </div>
 
   <div class="panel">
     <div class="panel-head">Published feed</div>
-    <div class="panel-body" data-level="{{ feed.state_level }}">
+    <div class="panel-body">
       {% if feed.disabled %}
-      <p>{{ feed.note }}</p>
+      <p><span class="{{ feed.dot }}" aria-hidden="true"></span> {{ feed.note }}</p>
       <p class="dim">This node publishes nothing, so there is no feed freshness to report. That is a configuration, not a fault.</p>
       {% else %}
       <p><span class="label">Entries</span> <span class="mono">{{ feed.entries }}</span></p>
       <p><span class="label">Built</span> <span class="mono">{% if feed.build_ago %}{{ feed.build_ago }}{% else %}never{% endif %}</span>{% if feed.build_time %} <span class="dim">{{ feed.build_time }}</span>{% endif %}</p>
-      <p><span class="label">Expires in</span> <span class="mono">{% if feed.expires_in %}{{ feed.expires_in }}{% else %}unknown{% endif %}</span></p>
+      <p><span class="label">Expires in</span> <span class="{{ feed.dot }}" aria-hidden="true"></span> <span class="mono">{% if feed.expires_in %}{{ feed.expires_in }}{% else %}unknown{% endif %}</span></p>
       <p class="dim">{{ feed.note }}</p>
       {% endif %}
     </div>
@@ -144,14 +144,16 @@
 
 <div class="panel">
   <div class="panel-head">Running version</div>
-  <div class="panel-body" data-level="{{ version_status.state_level }}">
-    <p><span class="label">Version</span> <span class="mono">v{{ version_status.running_version }}</span> <span class="sev sev--watch">{{ version_status.verdict }}</span></p>
-    {# Three different revisions, kept apart on purpose: what this PROCESS runs, what was last
-       BUILT on this box, and what main holds. Collapsing any two of them is the bug. #}
+  <div class="panel-body">
+    <p><span class="label">Version</span> <span class="mono">v{{ version_status.running_version }}</span> <span class="{{ version_status.verdict_sev }}">{{ version_status.verdict }}</span></p>
+    {# Four different identities, kept apart on purpose: what this PROCESS runs, what the deploy
+       left INSTALLED on disk for it, what was CHECKED OUT when that deploy built, and what main
+       held when it last fetched. Collapsing any two of them is the bug. #}
     <p><span class="label">Running</span> <span class="mono">{{ version_status.running_sha }}</span> <span class="dim">built {{ version_status.built_at }}</span></p>
+    <p><span class="label">Installed</span> {% if version_status.installed_sha %}<span class="mono">{{ version_status.installed_sha }}</span> <span class="dim">{{ version_status.binary_name }} on disk</span>{% else %}<span class="faint">not recorded</span> <span class="dim">no deploy stamp records which {{ version_status.binary_name }} binary was installed</span>{% endif %}</p>
     <p class="dim">{{ version_status.note }}</p>
     {% if version_status.stamp_head_sha %}
-    <p><span class="label">Deploy stamp</span> <span class="mono">{{ version_status.stamp_head_sha }}</span>{% if version_status.stamp_origin_main_sha %} <span class="dim">origin/main {{ version_status.stamp_origin_main_sha }}</span>{% endif %}{% if version_status.stamp_age %} <span class="dim">{{ version_status.stamp_age }}</span>{% endif %}</p>
+    <p><span class="label">Deploy stamp</span> <span class="mono">{{ version_status.stamp_head_sha }}</span>{% if version_status.stamp_origin_main_sha %} <span class="dim">origin/main {{ version_status.stamp_origin_main_sha }}</span>{% endif %}{% if version_status.stamp_age %} <span class="dim">recorded {{ version_status.stamp_age }}</span>{% endif %}</p>
     {% else %}
     <p class="dim">No deploy stamp file was found, so there is nothing to compare against either.</p>
     {% endif %}

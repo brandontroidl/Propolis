@@ -85,10 +85,18 @@ impl IntakeRunner {
     /// dropped connection, lock contention), and every subsequent call is likely to fail the same
     /// way, so the batch STOPS at the first one instead of plowing through the rest. `read_batch`
     /// has already advanced the tailer's in-memory offset past every line in this batch
-    /// (including the ones left unprocessed after the failure) - that is only durable once
-    /// `persist_cursor` is called, which callers should do only when `errors == 0`. An unpersisted
-    /// advance is lost on restart, so the failed line (and anything after it) is re-read from the
-    /// last persisted position - the at-least-once guarantee.
+    /// (including the ones left unprocessed after the failure), so the batch is REWOUND here:
+    /// the next poll re-reads the failed line and everything behind it.
+    ///
+    /// Declining to persist the cursor is not sufficient on its own. This runner outlives any
+    /// one batch, so an un-rewound offset means the next poll simply starts past the failed
+    /// line - and the first later batch that succeeds (an empty one is enough, since it reports
+    /// `errors == 0`) persists that advanced position, making the skip durable without any
+    /// restart. Rewinding is what makes the at-least-once guarantee hold in-process; not
+    /// persisting is what makes it hold across a crash.
+    ///
+    /// Lines that succeeded before the failure are replayed on the retry. That is the intended
+    /// trade: the ledger's dedup window absorbs a duplicate, and nothing absorbs a skip.
     pub async fn run_batch(&mut self) -> RunBatchResult {
         let lines = self.tailer.read_batch(100);
         let mut result = RunBatchResult::default();
@@ -175,14 +183,21 @@ impl IntakeRunner {
             }
         }
 
+        if result.errors > 0 {
+            self.tailer.rewind_batch();
+        } else {
+            self.tailer.commit_batch();
+        }
+
         result
     }
 
     /// Durably saves the tailer's current read position.
     ///
-    /// Callers should only call this after a batch with `errors == 0`: persisting past a line
-    /// that never reached the ledger would drop it permanently instead of re-reading it on the
-    /// next poll or restart.
+    /// Safe to call after any batch: `run_batch` rewinds the tailer when it reports errors, so
+    /// the position this saves never sits past a line that failed to reach the ledger. Callers
+    /// that still gate on `errors == 0` lose nothing by it, and a shutdown path that persists
+    /// unconditionally is correct for the same reason.
     pub fn persist_cursor(&self) -> std::io::Result<()> {
         self.tailer.persist_cursor()
     }

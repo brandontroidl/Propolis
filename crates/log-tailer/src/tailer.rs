@@ -14,10 +14,35 @@ use crate::cursor::{CursorState, DurableCursor, RotationEvent, compute_fingerpri
 /// reflect real content replacement. See [`LogTailer::maybe_false_positive_replaced`].
 const FINGERPRINT_STABLE_SIZE: u64 = 256;
 
+/// Read positions as they stood at the start of the current uncommitted batch, so a caller that
+/// could not process what it read can put the tailer back and re-read it on the next poll.
+///
+/// Without this, "do not persist the cursor on failure" only defers the loss: `read_batch` has
+/// already advanced the IN-MEMORY offset past the whole batch, so the next poll starts beyond
+/// the failed line, and the first later batch that succeeds persists that advanced offset. The
+/// at-least-once guarantee then holds only if the process happens to restart in between.
+struct UncommittedRead {
+    /// `state.offset` before this batch's reads.
+    offset: u64,
+    /// Read offset of each entry in `pending_drains`, in queue order, before this batch's reads.
+    /// Aligned so that `pending_drains[i]` corresponds to `drain_offsets[exhausted.len() + i]`.
+    drain_offsets: Vec<u64>,
+    /// Drains this batch read to exhaustion, oldest-first. Held rather than dropped until the
+    /// batch is committed: these inodes are reachable ONLY through their open descriptors, so
+    /// dropping one before the caller has accepted the batch would make a rewind unable to
+    /// recover the lines it already handed out.
+    exhausted: VecDeque<File>,
+}
+
 /// Tails one sensor's NDJSON log file. Holds the in-memory [`CursorState`] for the lifetime of
 /// this instance; [`Self::persist_cursor`] is the only thing that durably saves it; a crash
 /// between reads and persistence re-reads the unpersisted portion on restart (tolerated by the
 /// ledger's dedup window, per the design doc's at-least-once model).
+///
+/// A batch read is uncommitted until the caller says otherwise: [`Self::commit_batch`] accepts
+/// the reads, [`Self::rewind_batch`] undoes them. A caller that does neither gets the historical
+/// behavior (reads advance the in-memory cursor and only `persist_cursor` makes that durable),
+/// which is safe only if it never persists after a failure - see [`UncommittedRead`].
 pub struct LogTailer {
     log_path: PathBuf,
     cursor: DurableCursor,
@@ -42,6 +67,10 @@ pub struct LogTailer {
     /// disambiguate a `RotationEvent::Replaced` signal caused by ordinary growth of a
     /// sub-256-byte file from a genuine in-place content swap.
     last_known_size: u64,
+    /// Positions to restore if the current batch is rewound. `None` between a commit/rewind and
+    /// the next `read_batch`. Spans every read since the last commit or rewind, not just the
+    /// most recent one, so a caller that polls twice before deciding can still undo both.
+    uncommitted: Option<UncommittedRead>,
 }
 
 impl LogTailer {
@@ -64,6 +93,7 @@ impl LogTailer {
             file: None,
             pending_drains: VecDeque::new(),
             last_known_size,
+            uncommitted: None,
         }
     }
 
@@ -77,6 +107,19 @@ impl LogTailer {
         }
 
         self.handle_rotation();
+
+        // Snapshot AFTER rotation handling: rotation is a state transition we neither can nor
+        // want to undo (the displaced inode has already been moved to `pending_drains`, and the
+        // new inode's pre-batch position is wherever rotation left it). What a rewind must
+        // restore is the reads this batch is about to perform, not the rotation that preceded
+        // them.
+        if self.uncommitted.is_none() {
+            self.uncommitted = Some(UncommittedRead {
+                offset: self.state.offset,
+                drain_offsets: self.pending_drains.iter().map(|&(_, off)| off).collect(),
+                exhausted: VecDeque::new(),
+            });
+        }
 
         // 1. Drain any inodes rotated out from under us, oldest-first and to exhaustion, BEFORE the
         //    current file - otherwise a backlog larger than one batch is lost across a rotation.
@@ -98,8 +141,13 @@ impl LogTailer {
                     }
                 }
             };
-            if exhausted {
-                self.pending_drains.pop_front();
+            if exhausted && let Some((file, _)) = self.pending_drains.pop_front() {
+                // Park the descriptor instead of dropping it: until this batch is committed, it
+                // is the only way back to the lines just handed out (see `UncommittedRead`).
+                match &mut self.uncommitted {
+                    Some(uncommitted) => uncommitted.exhausted.push_back(file),
+                    None => drop(file),
+                }
             }
         }
         if lines.len() >= max_lines {
@@ -130,6 +178,61 @@ impl LogTailer {
     /// going through a batch read).
     pub fn advance(&mut self, bytes: usize) {
         self.state.offset += bytes as u64;
+    }
+
+    /// Accepts every read since the last commit or rewind: the advanced positions stand, and the
+    /// exhausted rotated-out descriptors this batch drained are released.
+    ///
+    /// Committing is not persisting. It only says the caller has taken responsibility for these
+    /// lines; [`Self::persist_cursor`] is still what makes the position survive a restart.
+    pub fn commit_batch(&mut self) {
+        self.uncommitted = None;
+    }
+
+    /// Puts every read since the last commit back, so the next [`Self::read_batch`] returns the
+    /// same lines again.
+    ///
+    /// This is the in-memory half of the at-least-once guarantee. Declining to persist the
+    /// cursor protects a failed batch only across a restart; a long-running poller that keeps
+    /// the same tailer needs the offset itself moved back, or the next successful batch persists
+    /// a position past lines that never reached their destination.
+    ///
+    /// Lines the caller already processed successfully before the failure are re-read too: the
+    /// batch is the unit, and duplicate delivery is what the ledger's dedup window exists to
+    /// absorb. Silently skipping is the failure mode worth designing against; replaying is not.
+    pub fn rewind_batch(&mut self) {
+        let Some(UncommittedRead {
+            offset,
+            drain_offsets,
+            exhausted,
+        }) = self.uncommitted.take()
+        else {
+            return;
+        };
+
+        // Drains still queued keep their slot; only their read offsets go back. They sit behind
+        // the exhausted ones, hence the skip.
+        for (slot, saved) in self
+            .pending_drains
+            .iter_mut()
+            .zip(drain_offsets.iter().skip(exhausted.len()))
+        {
+            slot.1 = *saved;
+        }
+
+        // Drains this batch emptied go back on the front, oldest-first, at their pre-batch
+        // offsets - pushed in reverse so the queue order they came off in is restored.
+        for (file, saved) in exhausted
+            .into_iter()
+            .zip(drain_offsets.iter())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            self.pending_drains.push_front((file, *saved));
+        }
+
+        self.state.offset = offset;
     }
 
     /// Persists the current cursor state via `DurableCursor::save`.
@@ -164,6 +267,12 @@ impl LogTailer {
                 // Preserve the rotated-out inode (with our read position) so read_batch drains its
                 // full backlog before the new file, then point the cursor at the new inode.
                 if let Some(old_file) = self.file.take() {
+                    // Keep `drain_offsets` aligned with the queue when a rotation lands while a
+                    // batch is still uncommitted, so a later rewind restores this inode to where
+                    // reading of it actually left off rather than to another entry's offset.
+                    if let Some(uncommitted) = &mut self.uncommitted {
+                        uncommitted.drain_offsets.push(self.state.offset);
+                    }
                     self.pending_drains.push_back((old_file, self.state.offset));
                 }
                 self.state.inode = get_inode(&self.log_path);
@@ -177,6 +286,11 @@ impl LogTailer {
     /// where we're about to read.
     fn reset_to_current_file(&mut self) {
         self.state.offset = 0;
+        // The pre-batch position on THIS inode is the start of it; a rewind must not restore an
+        // offset that belonged to the file we just rotated away from.
+        if let Some(uncommitted) = &mut self.uncommitted {
+            uncommitted.offset = 0;
+        }
         self.state.fingerprint = compute_fingerprint(&self.log_path);
         self.file = None;
     }

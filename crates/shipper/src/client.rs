@@ -158,6 +158,12 @@ pub struct CycleReport {
 /// the module doc); `Retry` sleeps `retry.backoff` and resends the SAME batch, bounded by
 /// `retry.max_consecutive_retries`; `Reject` logs the reason and stops the cycle immediately
 /// without advancing anything.
+///
+/// Every path that stops without a confirmed ack - divergence, retry exhaustion, rejection, or
+/// a dead connection - rewinds the tailer over the unconfirmed batch. Leaving the cursor
+/// unpersisted is not enough on its own: `run_ship_loop` reuses this tailer for the next pass,
+/// so an un-rewound read means the next pass starts past records the gateway never took, and
+/// the first batch it does get accepted persists a cursor beyond them.
 pub async fn ship_cycle(
     stream: &mut ShipperStream,
     tailer: &mut LogTailer,
@@ -179,16 +185,28 @@ pub async fn ship_cycle(
         let mut consecutive_retries: u32 = 0;
 
         loop {
-            let ack = ShipperClient::send_batch(stream, &frame).await?;
+            let ack = match ShipperClient::send_batch(stream, &frame).await {
+                Ok(ack) => ack,
+                Err(e) => {
+                    // The connection died mid-batch. `next_batch` has already advanced the
+                    // tailer over these records, and the caller keeps the same tailer for the
+                    // next pass, so without a rewind this batch is skipped on reconnect and the
+                    // first later accepted batch persists a cursor past it.
+                    tailer.rewind_batch();
+                    return Err(e);
+                }
+            };
             match ack.status {
                 AckStatus::Accepted => {
                     confirmed = ConfirmedState {
                         last_seq: batch.seq,
                         last_batch_hash: batch.batch_hash,
                     };
-                    // Only now is the batch durably on the control plane: persist the
-                    // confirmed-seq state first, then the tailer cursor. Advancing the cursor
-                    // before a confirmed ack would lose unconfirmed lines on a crash.
+                    // Only now is the batch durably on the control plane: the reads can be
+                    // committed, then the confirmed-seq state persisted, then the tailer cursor
+                    // - in that order. Advancing the cursor before a confirmed ack would lose
+                    // unconfirmed lines on a crash.
+                    tailer.commit_batch();
                     confirmed.store(state_dir, key)?;
                     tailer.persist_cursor()?;
                     report.batches_shipped += 1;
@@ -203,6 +221,7 @@ pub async fn ship_cycle(
                         last_seq: batch.seq,
                         last_batch_hash: batch.batch_hash,
                     };
+                    tailer.commit_batch();
                     confirmed.store(state_dir, key)?;
                     tailer.persist_cursor()?;
                     report.batches_shipped += 1;
@@ -225,6 +244,7 @@ pub async fn ship_cycle(
                          gateway's per-collector state for this collector id, or by \
                          re-provisioning this collector with a FRESH collector id (CN)"
                     );
+                    tailer.rewind_batch();
                     report.stopped = Some(StopReason::ChainDiverged {
                         our_seq: batch.seq,
                         gateway_next_expected: ack.next_expected_seq,
@@ -241,6 +261,7 @@ pub async fn ship_cycle(
                             "gateway kept returning Retry past the consecutive-retry bound; \
                              stopping ship cycle"
                         );
+                        tailer.rewind_batch();
                         report.stopped = Some(StopReason::RetriesExhausted);
                         return Ok(report);
                     }
@@ -261,6 +282,7 @@ pub async fn ship_cycle(
                         reason = ?ack.reason,
                         "gateway rejected batch; stopping ship cycle without advancing state"
                     );
+                    tailer.rewind_batch();
                     report.stopped = Some(StopReason::Rejected { reason: ack.reason });
                     return Ok(report);
                 }

@@ -276,3 +276,86 @@ fn over_length_line_is_discarded_and_the_tailer_advances_past_it() {
         "the over-length line must be dropped and the tailer must advance to the next real line"
     );
 }
+
+// --- Batch commit / rewind -------------------------------------------------------------------
+//
+// `read_batch` advances the in-memory offset for everything it hands out. Declining to persist
+// the cursor only defers a loss for a caller that keeps the same tailer across polls: the next
+// read starts past the unprocessed lines, and the next successful persist makes that durable.
+// These cover the rewind that closes it.
+
+#[test]
+fn rewound_batch_is_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "first\nsecond\n").unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+
+    assert_eq!(tailer.read_batch(10), vec!["first", "second"]);
+    tailer.rewind_batch();
+    assert_eq!(
+        tailer.read_batch(10),
+        vec!["first", "second"],
+        "a rewound batch must be offered again, not skipped"
+    );
+}
+
+#[test]
+fn committed_batch_is_not_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "first\nsecond\n").unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+
+    assert_eq!(tailer.read_batch(10), vec!["first", "second"]);
+    tailer.commit_batch();
+    assert!(
+        tailer.read_batch(10).is_empty(),
+        "a committed batch must not be replayed"
+    );
+    // A rewind after a commit has nothing to undo.
+    tailer.rewind_batch();
+    assert!(tailer.read_batch(10).is_empty());
+}
+
+#[test]
+fn rewind_spans_every_read_since_the_last_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "a\nb\nc\nd\n").unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+
+    assert_eq!(tailer.read_batch(2), vec!["a", "b"]);
+    assert_eq!(tailer.read_batch(2), vec!["c", "d"]);
+    tailer.rewind_batch();
+    assert_eq!(
+        tailer.read_batch(10),
+        vec!["a", "b", "c", "d"],
+        "an uncommitted run of reads must rewind as a whole"
+    );
+}
+
+#[test]
+fn rewind_recovers_a_rotated_out_inode_drained_in_the_same_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "old1\nold2\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+
+    // Read nothing yet - just open the inode so rotation has a handle to preserve.
+    assert_eq!(tailer.read_batch(1), vec!["old1"]);
+    tailer.commit_batch();
+
+    // Rotate by rename, leaving the old inode reachable only through the held-open descriptor.
+    std::fs::rename(&log_path, dir.path().join("events.jsonl.1")).unwrap();
+    std::fs::write(&log_path, "new1\n").unwrap();
+
+    // One batch that spans the drained old inode and the new file, then fails.
+    assert_eq!(tailer.read_batch(10), vec!["old2", "new1"]);
+    tailer.rewind_batch();
+    assert_eq!(
+        tailer.read_batch(10),
+        vec!["old2", "new1"],
+        "the rotated-out inode's descriptor must survive a rewind - nothing else can reach it"
+    );
+}

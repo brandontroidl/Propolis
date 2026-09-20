@@ -359,3 +359,63 @@ fn rewind_recovers_a_rotated_out_inode_drained_in_the_same_batch() {
         "the rotated-out inode's descriptor must survive a rewind - nothing else can reach it"
     );
 }
+
+/// The same rotation, but with the pre-rotation read still UNCOMMITTED. The displaced inode is
+/// queued for draining at the offset the cursor happens to sit at, which is already past the
+/// lines this uncommitted batch read from it - so a rewind that is supposed to put every read
+/// since the last commit back has to restore the offset the batch STARTED at on that inode, not
+/// the one it ended at. Without that, `old1` is read once, never delivered, and never re-read.
+#[test]
+fn rewind_recovers_reads_made_before_a_rotation_in_the_same_uncommitted_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "old1\nold2\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+
+    // Read one line and do NOT commit it: the caller has not accepted this batch yet.
+    assert_eq!(tailer.read_batch(1), vec!["old1"]);
+
+    // Rotate by rename underneath the still-open batch.
+    std::fs::rename(&log_path, dir.path().join("events.jsonl.1")).unwrap();
+    std::fs::write(&log_path, "new1\n").unwrap();
+
+    // Keep reading into the same uncommitted batch, then fail it.
+    assert_eq!(tailer.read_batch(10), vec!["old2", "new1"]);
+    tailer.rewind_batch();
+
+    assert_eq!(
+        tailer.read_batch(10),
+        vec!["old1", "old2", "new1"],
+        "a rewind must put back every read since the last commit, including the ones made on the \
+         inode that was rotated away mid-batch"
+    );
+}
+
+/// A rewind spanning two rotations: each displaced inode must go back to where reading of it
+/// began within this batch, which is the start of the file for every inode after the first.
+#[test]
+fn rewind_recovers_reads_across_two_rotations_in_one_uncommitted_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "a1\na2\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+
+    assert_eq!(tailer.read_batch(1), vec!["a1"]);
+
+    std::fs::rename(&log_path, dir.path().join("events.jsonl.1")).unwrap();
+    std::fs::write(&log_path, "b1\nb2\n").unwrap();
+    // Drains a2 off the first inode, then reads b1 off the second.
+    assert_eq!(tailer.read_batch(2), vec!["a2", "b1"]);
+
+    std::fs::rename(&log_path, dir.path().join("events.jsonl.2")).unwrap();
+    std::fs::write(&log_path, "c1\n").unwrap();
+    assert_eq!(tailer.read_batch(10), vec!["b2", "c1"]);
+
+    tailer.rewind_batch();
+    assert_eq!(
+        tailer.read_batch(10),
+        vec!["a1", "a2", "b1", "b2", "c1"],
+        "every inode read during the uncommitted batch must rewind to where this batch began \
+         reading it"
+    );
+}

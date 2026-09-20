@@ -13,6 +13,7 @@ use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use axum::extract::{Request, State};
+use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::CookieJar;
@@ -255,10 +256,23 @@ impl Default for RateLimiter {
     }
 }
 
-/// Rejects any request without a valid session cookie, redirecting to `/login`. Applied only to
-/// the router's protected route group via `Router::route_layer` (see `routes` module) rather than
-/// exempting `/health`, `/ready`, and `/login` by path-matching inside this function - those three
-/// are simply mounted outside the layer this wraps.
+/// Rejects any request without a valid session cookie, sending the operator to `/login`. Applied
+/// only to the router's protected route group via `Router::route_layer` (see `routes` module)
+/// rather than exempting `/health`, `/ready`, and `/login` by path-matching inside this function -
+/// those three are simply mounted outside the layer this wraps.
+///
+/// An HTMX request gets `HX-Redirect` rather than a 303, and the difference is not cosmetic. A
+/// browser XHR follows a 303 transparently, `/login` answers 200 with a WHOLE HTML document, and
+/// HTMX swaps that document into whatever container issued the request - producing a page with
+/// `<html>`, `<head>` and a second copy of every vendored script nested inside a `<div>`, showing
+/// a login form wearing the previous page's chrome. Nothing about that response looks like an
+/// error to HTMX, so a polling panel neither warns nor recovers; it just quietly stops being the
+/// panel. This is the ordinary path after any restart, because sessions live in memory and a
+/// restart clears them (see this module's own doc comment) while a polled page keeps polling.
+///
+/// `HX-Redirect` makes HTMX perform a real navigation instead. The vendored HTMX honours it
+/// regardless of status (its response handler acts on the header before it decides whether to
+/// swap), so the status stays a truthful 401 for anything that is not a browser.
 pub async fn require_session(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -274,6 +288,14 @@ pub async fn require_session(
             request.extensions_mut().insert(session);
             next.run(request).await
         }
+        // Set by HTMX on every request it issues; absent on an ordinary browser navigation.
+        None if request.headers().contains_key("hx-request") => (
+            StatusCode::UNAUTHORIZED,
+            [("HX-Redirect", "/login")],
+            // No body: a swappable one is the bug this arm exists to avoid.
+            "",
+        )
+            .into_response(),
         None => Redirect::to("/login").into_response(),
     }
 }

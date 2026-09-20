@@ -62,6 +62,13 @@
 - **OTX indicators carry their real address family** - the pulse payload declared every indicator
   `IPv4` while reports accept either family, so an IPv6 address was submitted mislabelled against
   an API that validates the value against its declared type.
+- **A polled page survives the session expiring underneath it** - protected routes answered an
+  HTMX request with a 303 to `/login`. The XHR followed it, `/login` returned 200 with a whole HTML
+  document, and HTMX swapped that document into the container that issued the poll - leaving
+  `<html>`, `<head>`, a password field and a second copy of every vendored script nested inside a
+  `<div>`, with nothing about it looking like an error. Sessions are in-memory and a restart clears
+  them, so this happened after every upgrade on any page left open. HTMX requests now get a 401
+  with `HX-Redirect` and no swappable body.
 - **The fleet page no longer reports what it did not measure** - the headline was chosen from the
   combined severity of the reachability and event-age checks, so a fully probed and confirmed fleet
   with one quiet listener read as "evidence path unconfirmed". A failed capture query rendered as

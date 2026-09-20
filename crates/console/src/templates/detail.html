@@ -4,10 +4,20 @@
 {% if is_drawer %}<p><a class="btn" href="/ip/{{ ip }}">Open full page &nearr;</a></p>{% else %}<p><a href="/ips" onclick="if(history.length>1){history.back();return false}">&larr; Back</a></p>{% endif %}
 <div style="display:flex;align-items:center;gap:1rem;">
 <h1 class="mono" style="margin:0;">{{ ip }}</h1>
+{# Delist is reversible, so the control has to be too: the page shows whichever direction applies
+   to this address right now. Relist clears the latch and lets the ordinary gates decide again -
+   it does not force the address back into the feed. #}
+{% if delisted %}
+<form method="post" action="/ip/{{ ip }}/relist" style="margin:0;">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit" class="btn-approve" onclick="return confirm('Relist {{ ip }}? It rejoins the feed only if it still passes the ordinary gates on its current score.')">Relist</button>
+</form>
+{% else %}
 <form method="post" action="/ip/{{ ip }}/delist" style="margin:0;">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <button type="submit" class="btn-snooze" onclick="return confirm('Delist {{ ip }} from the feed and queue? (keeps its history)')">Delist</button>
 </form>
+{% endif %}
 <form method="post" action="/ip/{{ ip }}/delete" style="margin:0;">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <button type="submit" class="btn-danger" onclick="return confirm('Delete {{ ip }} from scoring, review, and vendor history? The event ledger is kept. This cannot be undone from the UI.')">Delete</button>

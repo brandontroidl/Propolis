@@ -1,5 +1,5 @@
 //! `GET /queue` (pending review entries, decayed-to-now score) and
-//! `POST /queue/{ip}/approve|reject|snooze` (HTMX row-partial mutation), per
+//! `POST /queue/{ip}/approve|reject|snooze|unsnooze` (HTMX row-partial mutation), per
 //! `internal/design/06-console-observability.md`'s "Pages" > "Review queue". Session-gated:
 //! mounted under the `protected` group in `routes::mod`.
 //!
@@ -43,6 +43,11 @@ pub fn router() -> Router<AppState> {
         .route("/queue/{ip}/reject", post(reject))
         .route("/queue/{ip}/snooze", post(snooze))
         .route("/ip/{ip}/delist", post(delist))
+        // The way back. `populate` never re-surfaces a decided entry, so without these an entry
+        // an operator chose to defer can only be reached from the Snoozed tab, and a delisted
+        // address could not be relisted at all - see each handler's own doc comment.
+        .route("/queue/{ip}/unsnooze", post(unsnooze))
+        .route("/ip/{ip}/relist", post(relist))
         .route("/ip/{ip}/delete", post(delete_ip))
 }
 
@@ -138,6 +143,13 @@ struct ActionForm {
     csrf_token: String,
     #[serde(default)]
     notes: String,
+    /// Which tab the row was acted on from, sent by the history tabs' own hidden field. Empty for
+    /// the pending tab and for any non-browser caller. It decides only what the response renders:
+    /// a decision made from a history tab moves the row to a DIFFERENT tab, so re-rendering it in
+    /// this table's columns would put the wrong headers over the cells - see
+    /// `queue_moved_row.html`.
+    #[serde(default)]
+    from_tab: String,
 }
 
 /// One row's display data: every numeric/timestamp field is pre-formatted in Rust rather than in
@@ -177,7 +189,9 @@ async fn queue_page(
 
     let rows: Vec<QueueRowView> = match query.tab.review_state() {
         None => pending_rows(&state.db, query.sort, &csrf_token).await?,
-        Some(review_state) => history_rows(&state.db, review_state).await?,
+        // The token goes to the history tabs too: the Snoozed tab carries real decision controls
+        // (it is the only route back out of a snooze), and those POST like any other.
+        Some(review_state) => history_rows(&state.db, review_state, &csrf_token).await?,
     };
 
     // `pending_count` is the shared sitewide count from `base_context` (the same query the
@@ -271,6 +285,7 @@ async fn pending_rows(
 async fn history_rows(
     pool: &PgPool,
     review_state: ReviewState,
+    csrf_token: &str,
 ) -> Result<Vec<QueueRowView>, AppError> {
     let db_rows = sqlx::query(
         "SELECT host(source_ip) AS ip, decided_at, notes \
@@ -320,6 +335,7 @@ async fn history_rows(
             notes.as_deref(),
             &score,
             submissions,
+            csrf_token,
         ));
     }
     Ok(rows)
@@ -371,6 +387,39 @@ async fn snooze(
     act(state, session, path, form, Action::Snooze).await
 }
 
+/// `POST /queue/{ip}/unsnooze` - put a decided entry back in the pending queue.
+///
+/// Snoozing promises a later decision, and `ReviewQueue::populate` deliberately never re-surfaces
+/// a decided row, so this is the route that keeps the promise. It answers with the row re-rendered
+/// as a PENDING row, which is what the Snoozed tab needs: the entry now carries the three ordinary
+/// decision controls in place.
+async fn unsnooze(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(ip): Path<IpAddr>,
+    Form(form): Form<ActionForm>,
+) -> Result<Response, AppError> {
+    if !state.sessions.validate_csrf(&session.id, &form.csrf_token) {
+        tracing::warn!(%ip, "queue unsnooze rejected: missing or invalid csrf token");
+        return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
+    }
+
+    ReviewQueue::new().unsnooze(&state.db, ip).await?;
+
+    let csrf_token = state
+        .sessions
+        .generate_csrf(&session.id)
+        .unwrap_or_default();
+    let Some(score) = read_score(&state.db, ip).await? else {
+        return Err(AppError::missing_projection(ip));
+    };
+    let row = row_view(ip, ReviewState::Pending, None, &score, &csrf_token);
+    let tmpl = state
+        .templates
+        .get_template(response_row_template(&form.from_tab))?;
+    Ok(Html(tmpl.render(context! { row })?).into_response())
+}
+
 async fn act(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
@@ -402,9 +451,25 @@ async fn act(
     };
     let row = row_view(ip, action.review_state(), notes, &score, &csrf_token);
 
-    let tmpl = state.templates.get_template("queue_row.html")?;
+    let tmpl = state
+        .templates
+        .get_template(response_row_template(&form.from_tab))?;
     let html = tmpl.render(context! { row })?;
     Ok(Html(html).into_response())
+}
+
+/// Which row template answers a decision made from `from_tab`.
+///
+/// The pending tab keeps its existing behaviour: the decided row is re-rendered in place with a
+/// state pill, which fits the pending table's columns exactly. A history tab's columns are
+/// different and the row no longer belongs to that tab at all, so it gets the acknowledgement row
+/// instead.
+fn response_row_template(from_tab: &str) -> &'static str {
+    if from_tab.is_empty() || from_tab == Tab::Pending.as_str() {
+        "queue_row.html"
+    } else {
+        "queue_moved_row.html"
+    }
 }
 
 async fn delist(
@@ -431,6 +496,66 @@ async fn delist(
     .await?;
 
     tracing::info!(%ip, "ip delisted from feed and queue");
+    Ok(Redirect::to(&format!("/ip/{ip}")).into_response())
+}
+
+/// `POST /ip/{ip}/relist` - undo a delist.
+///
+/// The console tour says a delist "keeps it out of the feed until you say otherwise"; this is how
+/// the operator says otherwise. Without it, `delist` is a one-way door wearing the word "until".
+///
+/// It clears the `delisted` latch and then re-derives the gate flags rather than assigning them:
+/// `delist` wrote `eligible`/`recommended_for_vendor`/`recommended_for_blocklist` as FALSE
+/// directly, and setting them back to TRUE here would claim gates this address may no longer pass
+/// (its score decays while delisted, and the category weights with it). Clearing the latch first
+/// and reading the projection back gives the same answer `core_scoring` would give for any other
+/// address, so a relisted address rejoins the feed on its current merit or not at all.
+///
+/// It does NOT restore the review-queue entry `delist` deleted: that entry was a recommendation,
+/// and the population scan re-creates one on its next pass iff the address still qualifies. Same
+/// CSRF gate as `delist`.
+async fn relist(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(ip): Path<IpAddr>,
+    Form(form): Form<ActionForm>,
+) -> Result<Response, AppError> {
+    if !state.sessions.validate_csrf(&session.id, &form.csrf_token) {
+        return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
+    }
+
+    let cleared = sqlx::query("UPDATE ip_score SET delisted = FALSE WHERE source_ip = $1::inet")
+        .bind(ip.to_string())
+        .execute(&state.db)
+        .await?;
+    if cleared.rows_affected() == 0 {
+        return Err(AppError::missing_projection(ip));
+    }
+
+    // Read the projection back with the latch cleared: `read_score` re-derives every gate from the
+    // stored row through the same `core_scoring` rules the append path uses, so this cannot drift
+    // from what an ordinary event would have computed.
+    let Some(score) = read_score(&state.db, ip).await? else {
+        return Err(AppError::missing_projection(ip));
+    };
+    sqlx::query(
+        "UPDATE ip_score SET eligible = $1, recommended_for_vendor = $2, \
+         recommended_for_blocklist = $3 WHERE source_ip = $4::inet",
+    )
+    .bind(score.eligible)
+    .bind(score.recommended_for_vendor)
+    .bind(score.recommended_for_blocklist)
+    .bind(ip.to_string())
+    .execute(&state.db)
+    .await?;
+
+    tracing::info!(
+        %ip,
+        eligible = score.eligible,
+        recommended_for_vendor = score.recommended_for_vendor,
+        recommended_for_blocklist = score.recommended_for_blocklist,
+        "ip relisted; gates re-derived from the current projection"
+    );
     Ok(Redirect::to(&format!("/ip/{ip}")).into_response())
 }
 
@@ -510,8 +635,9 @@ fn history_row_view(
     notes: Option<&str>,
     score: &IpScore,
     submissions: String,
+    csrf_token: &str,
 ) -> QueueRowView {
-    let mut row = row_view(ip, review_state, notes, score, "");
+    let mut row = row_view(ip, review_state, notes, score, csrf_token);
     row.decided_at = decided_at.map(format_timestamp).unwrap_or_default();
     row.submissions = submissions;
     row

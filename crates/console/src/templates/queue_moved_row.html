@@ -1,0 +1,9 @@
+{# Replaces a row whose decision moved it OFF the tab it was acted on from.
+
+   The tabs are per-state listings with per-state columns, so a decided row can neither stay where
+   it was nor be re-rendered in that table's columns without the headers lying about the cells
+   underneath. This says where the entry went and links there, which is the one thing the operator
+   needs next. #}
+<tr id="row-{{ row.ip }}">
+  <td colspan="8" class="dim"><span class="mono">{{ row.ip }}</span> is now <span class="state-pill state-{{ row.state }}">{{ row.state }}</span> &middot; <a href="/queue?tab={{ row.state }}">open the {{ row.state }} tab</a></td>
+</tr>

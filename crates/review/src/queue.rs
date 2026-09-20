@@ -71,6 +71,12 @@ impl ReviewQueue {
     /// in the queue in ANY state (a previously Rejected or Snoozed IP is not
     /// re-surfaced; see [`Self::reject`]/[`Self::snooze`]). Returns the
     /// number of newly-inserted Pending entries.
+    ///
+    /// A Snoozed entry therefore only comes back because an operator brings it back
+    /// ([`Self::unsnooze`], or deciding it directly from the Snoozed listing). That is
+    /// deliberate - an entry that re-surfaced on its own would ignore the operator's decision to
+    /// defer it - but it means the Snoozed listing is the ONLY route back, so any interface that
+    /// can snooze must also be able to act on what it snoozed.
     pub async fn populate(&self, pool: &PgPool) -> Result<usize, ReviewError> {
         let result = sqlx::query(
             "INSERT INTO review_queue (source_ip, score_at_surface, categories_at_surface) \
@@ -138,6 +144,12 @@ impl ReviewQueue {
 
     /// Snooze `ip`: held for later review; the row stays so it is not
     /// re-surfaced as a duplicate, but an operator can act on it again later.
+    ///
+    /// "Later" is operator-driven, not scheduled: [`Self::populate`] deliberately never
+    /// re-surfaces a Snoozed row, so the way back is the Snoozed listing plus
+    /// [`Self::approve`]/[`Self::reject`]/[`Self::unsnooze`] - all of which operate on a row in
+    /// any state. A snooze with no way to act on it afterwards would be a reject wearing a softer
+    /// word, so every interface that offers snooze has to offer those too.
     pub async fn snooze(
         &self,
         pool: &PgPool,
@@ -145,6 +157,51 @@ impl ReviewQueue {
         notes: Option<&str>,
     ) -> Result<(), ReviewError> {
         self.decide(pool, ip, ReviewState::Snoozed, notes).await
+    }
+
+    /// Return `ip` to Pending and clear its decision timestamp: the operator wants it back in the
+    /// working queue rather than deciding it now.
+    ///
+    /// The inverse of [`Self::snooze`], and the only transition here that goes BACK. It clears
+    /// `decided_at` because a Pending row has not been decided - leaving a stale timestamp there
+    /// would make the entry sort and read as though a decision had been taken and then ignored.
+    /// `notes` are kept: they are why the operator deferred, which is exactly the context they
+    /// will want when the entry comes back round.
+    ///
+    /// Works on any state, not just Snoozed: an approval or rejection made in error is otherwise
+    /// only reversible by editing the database by hand.
+    pub async fn unsnooze(&self, pool: &PgPool, ip: IpAddr) -> Result<(), ReviewError> {
+        let result = sqlx::query(
+            "UPDATE review_queue SET state = $1, decided_at = NULL WHERE source_ip = $2::inet",
+        )
+        .bind(ReviewState::Pending)
+        .bind(ip.to_string())
+        .execute(pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ReviewError::NotFound(ip));
+        }
+        tracing::info!(%ip, "review queue: entry returned to pending");
+        Ok(())
+    }
+
+    /// List every entry in `state`, most-recently-decided first. The Snoozed listing is what makes
+    /// a snooze recoverable - see [`Self::snooze`].
+    pub async fn list_by_state(
+        &self,
+        pool: &PgPool,
+        state: ReviewState,
+    ) -> Result<Vec<QueueEntry>, ReviewError> {
+        let rows = sqlx::query(
+            "SELECT host(source_ip) AS source_ip, state, score_at_surface, \
+                    categories_at_surface, surfaced_at, decided_at, notes \
+             FROM review_queue WHERE state = $1 ORDER BY decided_at DESC NULLS LAST",
+        )
+        .bind(state)
+        .fetch_all(pool)
+        .await?;
+
+        rows.into_iter().map(row_to_entry).collect()
     }
 
     async fn decide(

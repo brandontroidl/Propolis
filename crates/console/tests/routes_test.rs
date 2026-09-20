@@ -1123,6 +1123,215 @@ async fn snooze_changes_state(pool: PgPool) {
     assert_eq!(state, core_scoring::ReviewState::Snoozed);
 }
 
+/// The whole snooze round trip through the browser interface: snooze from the pending tab, find
+/// the entry again on the Snoozed tab WITH working controls, and decide it from there. Nothing
+/// re-surfaces a snoozed entry, so this tab is the only route back - a Snoozed tab that only
+/// listed would make "decide later" mean "never".
+#[sqlx::test(migrations = false)]
+async fn a_snoozed_entry_can_be_decided_from_the_snoozed_tab(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.206", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.206/snooze",
+            format!("csrf_token={csrf_token}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+
+    // The tab must offer the way out, not just the row.
+    let snoozed_tab = body_text(
+        app.clone()
+            .oneshot(get_request("/queue?tab=snoozed", Some(&cookie_header)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(snoozed_tab.contains("203.0.113.206"), "{snoozed_tab}");
+    for action in ["approve", "reject", "unsnooze"] {
+        assert!(
+            snoozed_tab.contains(&format!("/queue/203.0.113.206/{action}")),
+            "the snoozed tab must offer {action}: {snoozed_tab}"
+        );
+    }
+
+    // And the decision made from it must land.
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.206/approve",
+            format!("csrf_token={csrf_token}&from_tab=snoozed"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = sqlx::query("SELECT state FROM review_queue WHERE source_ip = $1::inet")
+        .bind("203.0.113.206")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let decided: core_scoring::ReviewState = row.get("state");
+    assert_eq!(decided, core_scoring::ReviewState::Approved);
+}
+
+/// `unsnooze` puts the entry back in the working queue, which is the other thing the Snoozed tab
+/// has to be able to do: defer now, deal with it alongside the rest later.
+#[sqlx::test(migrations = false)]
+async fn unsnooze_returns_the_entry_to_the_pending_tab(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.207", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.207/snooze",
+            format!("csrf_token={csrf_token}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.207/unsnooze",
+            format!("csrf_token={csrf_token}&from_tab=snoozed"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let pending = body_text(
+        app.clone()
+            .oneshot(get_request("/queue", Some(&cookie_header)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        pending.contains("203.0.113.207"),
+        "an unsnoozed entry must be back on the pending tab: {pending}"
+    );
+    let snoozed = body_text(
+        app.oneshot(get_request("/queue?tab=snoozed", Some(&cookie_header)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !snoozed.contains("203.0.113.207"),
+        "and must have left the snoozed tab: {snoozed}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn unsnooze_without_csrf_token_returns_403(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.208", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(form_request(
+            "/queue/203.0.113.208/unsnooze",
+            "csrf_token=not-the-real-token".to_string(),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// Delist promises to hold "until you say otherwise", so relist has to be a real inverse: the
+/// latch clears and the gates are RE-DERIVED rather than assigned, so an address rejoins the feed
+/// on its current merit and not merely because it was once listed.
+#[sqlx::test(migrations = false)]
+async fn relist_clears_the_latch_and_rederives_the_gates(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.209", 60).await;
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    let before: bool =
+        sqlx::query_scalar("SELECT eligible FROM ip_score WHERE source_ip = $1::inet")
+            .bind("203.0.113.209")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        before,
+        "precondition: a seeded recommended address is eligible"
+    );
+
+    app.clone()
+        .oneshot(form_request(
+            "/ip/203.0.113.209/delist",
+            format!("csrf_token={csrf_token}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    let row = sqlx::query(
+        "SELECT delisted, eligible, recommended_for_vendor FROM ip_score WHERE source_ip = $1::inet",
+    )
+    .bind("203.0.113.209")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.get::<bool, _>("delisted"));
+    assert!(!row.get::<bool, _>("eligible"));
+
+    let response = app
+        .oneshot(form_request(
+            "/ip/203.0.113.209/relist",
+            format!("csrf_token={csrf_token}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let row = sqlx::query(
+        "SELECT delisted, eligible, recommended_for_vendor FROM ip_score WHERE source_ip = $1::inet",
+    )
+    .bind("203.0.113.209")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!row.get::<bool, _>("delisted"), "the latch must be cleared");
+    assert!(
+        row.get::<bool, _>("eligible"),
+        "an address that still passes the gates must be eligible again after a relist"
+    );
+    assert!(
+        row.get::<bool, _>("recommended_for_vendor"),
+        "the recommendation delist cleared must be re-derived, not left false"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn post_without_csrf_token_returns_403(pool: PgPool) {
     migrate(&pool).await;

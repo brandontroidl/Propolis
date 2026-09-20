@@ -133,9 +133,15 @@ async fn write_response(stream: &mut TcpStream, status: u16, reason: &str, body:
 }
 
 fn sample_report(categories: Vec<String>) -> VendorReport {
+    report_for("203.0.113.50", categories)
+}
+
+/// `sample_report` with the source address chosen by the caller, for the tests that turn on which
+/// address family the report carries.
+fn report_for(ip: &str, categories: Vec<String>) -> VendorReport {
     let now = Utc::now();
     VendorReport {
-        source_ip: "203.0.113.50".parse().unwrap(),
+        source_ip: ip.parse().unwrap(),
         categories,
         comment: "repeated ssh login attempts against the honeypot".to_string(),
         evidence_window: (now - Duration::hours(2), now),
@@ -580,6 +586,31 @@ async fn otx_payload_creates_pulse_with_correct_indicator_and_tags() {
     assert_eq!(indicators.len(), 1);
     assert_eq!(indicators[0]["indicator"], "203.0.113.50");
     assert_eq!(indicators[0]["type"], "IPv4");
+}
+
+/// OTX validates an indicator's value against its declared `type`, so the type has to follow the
+/// address family rather than be fixed at `IPv4`. `VendorReport` accepts either family and the
+/// review queue surfaces both, so an IPv6 report reaching a hard-coded `IPv4` is a real path.
+#[tokio::test]
+async fn otx_labels_an_ipv6_indicator_as_ipv6_not_ipv4() {
+    let (base_url, server) = respond_once(201, "Created", r#"{"id":"abc123"}"#).await;
+    let adapter = OtxAdapter::new(reqwest::Client::new(), "test-key", base_url);
+    let report = report_for(
+        "2001:db8::50",
+        build_otx_categories(Some("ssh"), Category::Auth),
+    );
+
+    adapter.submit(&report).await.unwrap();
+
+    let captured = server.await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+    let indicators = json["indicators"].as_array().unwrap();
+    assert_eq!(indicators[0]["indicator"], "2001:db8::50");
+    assert_eq!(
+        indicators[0]["type"], "IPv6",
+        "an IPv6 source address must be declared as IPv6: {}",
+        captured.body
+    );
 }
 
 #[tokio::test]

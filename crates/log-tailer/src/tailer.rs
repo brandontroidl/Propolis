@@ -270,9 +270,20 @@ impl LogTailer {
                     // Keep `drain_offsets` aligned with the queue when a rotation lands while a
                     // batch is still uncommitted, so a later rewind restores this inode to where
                     // reading of it actually left off rather than to another entry's offset.
+                    //
+                    // The offset recorded is where this BATCH began reading this inode
+                    // (`uncommitted.offset`), not where the cursor sits now. Those differ exactly
+                    // when the batch already read from this inode before the rotation displaced
+                    // it, and recording the live offset there silently drops those lines: they
+                    // were handed out, never committed, and a rewind would resume past them.
+                    // `reset_to_current_file` zeroes `uncommitted.offset` for each new inode, so
+                    // for every inode after the first this is 0 - correct, since that is where
+                    // the batch started reading it.
                     if let Some(uncommitted) = &mut self.uncommitted {
-                        uncommitted.drain_offsets.push(self.state.offset);
+                        uncommitted.drain_offsets.push(uncommitted.offset);
                     }
+                    // The queued offset is the LIVE one: draining resumes where reading actually
+                    // left off. Only the rewind target above goes back to the batch's start.
                     self.pending_drains.push_back((old_file, self.state.offset));
                 }
                 self.state.inode = get_inode(&self.log_path);

@@ -4,6 +4,41 @@
 
 ### Added
 
+- **Split deployment: collectors ship to a gateway over mTLS** - a honeypot collector no longer
+  needs database access. `shipper` tails each sensor's log through the shared `log-tailer` crate and
+  ships length-prefixed batches to a `gateway` over mutually authenticated TLS. The gateway verifies
+  a per-collector sequence number and rolling hash against durable state, spools accepted records as
+  byte-exact sensor NDJSON for intake, and acknowledges; the shipper advances its cursor only on
+  that acknowledgement. Frame, acknowledgement and mTLS config live in a shared `collector-wire`
+  crate so the two ends cannot drift.
+- **Certificate minting for a split deployment** - `provision-certs` mints the CA, gateway and
+  collector certificates the mTLS transport needs. Bootstrap only: addition, rotation and revocation
+  are not implemented.
+- **Malware fetcher** - retrieves the payload behind a URL a captured dropper points at, under
+  deliberately paranoid egress rules: scheme allowlist, URL vetting, IP pinning, an egress deny-set
+  that canonicalizes mapped/NAT64/6to4 forms, per-hop redirect re-vetting performed by hand rather
+  than by the HTTP client, a byte cap on the streamed response, and peer-pinned TFTP for the RRQ
+  case. Embedded URLs are extracted from dropper scripts, including Script-Encoded (`.vbe`) ones.
+  Attempts and their outcomes are recorded in `fetch_attempt` and shown on the IP detail page.
+- **Listener reachability pane** - the console names every declared listener and what has actually
+  been proven about it, from a sweep that dials each one from the control plane. The sweep's own
+  connections are filtered at intake, so answering the reachability question cannot score the node
+  into its own blocklist. Off by default (`PROPOLIS_FLEET_PROBE_ENABLED`), and it refuses to start
+  without the source addresses that filter needs.
+- **Deploy identity** - `deploy-stamp.sh` records what a deploy actually left on disk, and the
+  console compares four identities usually collapsed into one: what this process runs, what the
+  deploy installed, what was checked out, and what `main` held at the last fetch. Idempotent
+  provisioning moved into `provision.sh`.
+- **Per-occurrence and per-capture identity** - sensors mint an `occurrence_id` at the emit
+  chokepoint and a `capture_id` at the spool chokepoint, and write a durable per-capture outbox
+  manifest, so a captured sample can be tied back to the event that produced it. Both fields are
+  additive on the sensor wire.
+- **Volume-based blocklisting** - a high-volume connection flood is recommended for the blocklist on
+  volume alone, since same-signal dedup otherwise collapses a flood into a single scored event. It
+  counts only completed-TCP events, never spoofable datagrams, and volume-listed addresses publish
+  into the retention windows rather than the tiered files.
+- **Per-subsystem liveness** - the supervisor publishes each subsystem's state, `/ready` answers 503
+  once one has given up, and the ops-monitor pages on it.
 - **Forward-confirmed reverse DNS** on the IP-detail page (`PROPOLIS_CONSOLE_RDNS_ENABLED`, default
   off - the one outbound lookup in the console's enrichment). A shown hostname is forward-confirmed
   (PTR must resolve back to the IP) and marked verified/unverified; display-only, never a suppression

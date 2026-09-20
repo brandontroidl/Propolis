@@ -168,4 +168,146 @@ mod tests {
         // five).
         assert!(html.contains("&lt;script&gt;alert(1)&lt;&#x2f;script&gt;"));
     }
+
+    /// The fields `fleet_status_fragment.html` reads unconditionally, so a test can vary only the
+    /// one thing it is about. Mirrors `routes::fleet`'s `render`; the panel-specific flags are
+    /// merged over the top by each test.
+    fn fleet_base_context() -> minijinja::Value {
+        minijinja::context! {
+            summary => minijinja::context! {
+                total => 0, proven => 0, alarm => 0, unknown => 0,
+                headline => "every listener proven", headline_level => "ok",
+            },
+            listeners => Vec::<()>::new(),
+            captures => Vec::<()>::new(),
+            captures_unavailable => false,
+            ledger_unavailable => false,
+            ledger => minijinja::context! {
+                events => 0, newest_ingested_ago => (), dot => "dot dot--watch",
+            },
+            feed => minijinja::context! { disabled => true, dot => "dot dot--watch", note => "" },
+            version_status => minijinja::context! {
+                running_version => "0.0.0", running_sha => "abc1234", built_at => "now",
+                installed_sha => (), binary_name => "propolis", verdict => "not recorded",
+                verdict_sev => "sev sev--watch", note => "", stamp_head_sha => (),
+                stamp_origin_main_sha => (), stamp_age => (),
+            },
+            last_event_ago => "never",
+            last_event_level => "unknown",
+            degraded_panels => Vec::<&str>::new(),
+        }
+    }
+
+    /// Renders `fleet_status_fragment.html` with an empty capture list, which is what BOTH a quiet
+    /// week and a failed capture query produce. The sentence has to differ: "no malware captures
+    /// in the last 7 days" is a statement about the fleet, and printing it because a query errored
+    /// is the console reporting a finding it never read.
+    #[test]
+    fn an_unreadable_capture_panel_does_not_claim_there_were_no_captures() {
+        let env = environment();
+        let tmpl = env.get_template("fleet_status_fragment.html").unwrap();
+
+        let failed = tmpl
+            .render(minijinja::context! {
+                captures_unavailable => true,
+                degraded_panels => vec!["capture completeness"],
+                ..fleet_base_context()
+            })
+            .unwrap();
+        assert!(
+            !failed.contains("no malware captures"),
+            "a failed capture query must not render as an absence of captures: {failed}"
+        );
+        assert!(
+            failed.contains("could not be read"),
+            "the panel must say it could not be read: {failed}"
+        );
+
+        // The genuinely quiet week still reads the way it always did.
+        let quiet = tmpl.render(fleet_base_context()).unwrap();
+        assert!(quiet.contains("no malware captures in the last 7 days"));
+        assert!(!quiet.contains("could not be read"));
+    }
+
+    /// Same distinction on the ledger: a count that failed is not a count of zero.
+    #[test]
+    fn an_unreadable_ledger_does_not_render_as_zero_events() {
+        let env = environment();
+        let tmpl = env.get_template("fleet_status_fragment.html").unwrap();
+        let html = tmpl
+            .render(minijinja::context! {
+                ledger_unavailable => true,
+                ledger => minijinja::context! {
+                    events => (), newest_ingested_ago => (), dot => "dot dot--watch",
+                },
+                last_event_ago => "unavailable",
+                degraded_panels => vec!["ledger head"],
+                ..fleet_base_context()
+            })
+            .unwrap();
+        assert!(
+            html.contains("the event count could not be read"),
+            "the ledger cell must say the count is unreadable: {html}"
+        );
+        assert!(
+            !html.contains("events recorded"),
+            "a failed count must not be presented as a count of recorded events: {html}"
+        );
+        // Both surfaces that show the count - the band cell and the evidence-chain panel - plus
+        // the "Newest ingest" line have to say so; a number in either is a fabricated reading.
+        assert!(
+            html.matches("unavailable").count() >= 3,
+            "every ledger reading on the page must say unavailable: {html}"
+        );
+        assert!(
+            !html.contains(">never<"),
+            "an unread ledger must not claim nothing was ever ingested: {html}"
+        );
+
+        // The readable ledger still renders its real numbers.
+        let readable = env
+            .get_template("fleet_status_fragment.html")
+            .unwrap()
+            .render(minijinja::context! {
+                ledger => minijinja::context! {
+                    events => 4242, newest_ingested_ago => "3 minutes ago", dot => "dot dot--low",
+                },
+                ..fleet_base_context()
+            })
+            .unwrap();
+        assert!(readable.contains("4242") && readable.contains("events recorded"));
+    }
+
+    /// The fleet page polls; a poll that starts failing leaves the last render on screen with
+    /// server-computed ages that never move again. `data-live` is what opts the container into
+    /// `base_tail.html`'s stale handling, so losing the attribute silently restores that bug.
+    #[test]
+    fn the_polled_fleet_container_is_marked_live_and_the_page_handles_a_failed_poll() {
+        let env = environment();
+        let page = env.get_template("fleet.html").unwrap();
+        let html = page
+            .render(minijinja::context! {
+                pending_count => 0,
+                uptime => "1m",
+                version => "0.0.0",
+                degraded => Vec::<&str>::new(),
+                ..fleet_base_context()
+            })
+            .unwrap();
+        assert!(
+            html.contains(r#"id="fleet-status""#) && html.contains(r#"data-live="fleet reading""#),
+            "the polled container must carry data-live so a failed refresh is announced"
+        );
+        // The handler that acts on it ships in the same document (base.html's tail).
+        for event in ["htmx:responseError", "htmx:sendError", "htmx:timeout"] {
+            assert!(
+                html.contains(event),
+                "the page must handle {event} on a polled panel"
+            );
+        }
+        assert!(
+            html.contains("has stopped "),
+            "the stale banner's wording must be present in the page"
+        );
+    }
 }

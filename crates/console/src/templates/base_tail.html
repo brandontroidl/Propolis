@@ -238,6 +238,67 @@ document.addEventListener('htmx:afterSettle', function (e) { propolisInitCharts(
     });
   }
 })();
+
+// A polled panel that stops refreshing is the quietest way this console can mislead: htmx leaves
+// the last successful render in place when a poll fails, and every relative age on it ("4 minutes
+// ago", "never") was computed by the SERVER at that render, so it keeps reading as current while
+// the real gap grows. Any element carrying `data-live="<what it is>"` gets a banner naming how
+// long ago its numbers were actually measured, and is dimmed until a refresh succeeds.
+(function () {
+  var live = document.querySelectorAll('[data-live]');
+  if (!live.length) return;
+
+  function bannerId(el) { return 'stale-banner-' + (el.id || 'live'); }
+
+  function markFresh(el) {
+    el.setAttribute('data-live-at', String(Date.now()));
+    el.removeAttribute('data-stale');
+    var b = document.getElementById(bannerId(el));
+    if (b) b.remove();
+  }
+
+  function markStale(el, why) {
+    var at = Number(el.getAttribute('data-live-at'));
+    var secs = at ? Math.round((Date.now() - at) / 1000) : null;
+    var age = secs === null ? 'when this page was opened'
+      : secs < 90 ? secs + ' seconds ago'
+      : Math.round(secs / 60) + ' minutes ago';
+    el.setAttribute('data-stale', 'true');
+    var b = document.getElementById(bannerId(el));
+    if (!b) {
+      b = document.createElement('div');
+      b.id = bannerId(el);
+      b.className = 'degraded';
+      b.setAttribute('role', 'status');
+      el.parentNode.insertBefore(b, el);
+    }
+    b.textContent = 'This ' + (el.getAttribute('data-live') || 'reading') + ' has stopped '
+      + 'refreshing (' + why + '). What is shown below was measured ' + age + '; the ages it '
+      + 'states have not moved since. Reload the page to retry.';
+  }
+
+  // The element that owns the poll, walking up from whatever htmx reported.
+  function owner(e) {
+    var el = (e.detail && (e.detail.elt || e.detail.target)) || null;
+    while (el && el.nodeType === 1 && !el.hasAttribute('data-live')) el = el.parentElement;
+    return (el && el.nodeType === 1 && el.hasAttribute('data-live')) ? el : null;
+  }
+
+  Array.prototype.forEach.call(live, markFresh);
+
+  document.body.addEventListener('htmx:responseError', function (e) {
+    var el = owner(e); if (el) markStale(el, 'the server answered with an error');
+  });
+  document.body.addEventListener('htmx:sendError', function (e) {
+    var el = owner(e); if (el) markStale(el, 'the server could not be reached');
+  });
+  document.body.addEventListener('htmx:timeout', function (e) {
+    var el = owner(e); if (el) markStale(el, 'the server did not answer in time');
+  });
+  document.body.addEventListener('htmx:afterSwap', function (e) {
+    var el = owner(e); if (el) markFresh(el);
+  });
+})();
 </script>
 </body>
 </html>

@@ -95,6 +95,31 @@ pub fn event_age_level(last_event: Option<DateTime<Utc>>, now: DateTime<Utc>) ->
     }
 }
 
+/// The one sentence the fleet page leads with, chosen from what the two checks ACTUALLY say.
+///
+/// `reach` is the worst reachability verdict across the inventory and `events` the worst event-age
+/// verdict; the dot beside the sentence is [`combine`]d from the same pair. The two are kept apart
+/// here because they fail for unrelated reasons and folding them into one severity loses which one
+/// it was: a fleet whose listeners are all probed and confirmed, one of which has simply been
+/// quiet for a day, combines to `Warn` - and a sentence written for `Warn` alone then tells the
+/// operator the evidence path is unconfirmed, which is the opposite of what the probes proved and
+/// sends them to debug a shipper that is working.
+///
+/// Reachability is stated first when both have something to say: it is the more actionable of the
+/// two, and a listener that is not answering makes its event age uninteresting.
+pub fn headline(reach: Level, events: Level) -> &'static str {
+    match (reach, events) {
+        (Level::Alarm, _) => "a listener is not answering",
+        (Level::Unknown, _) => "reachability unproven",
+        (Level::Warn, _) => "listeners answering, evidence path unconfirmed",
+        // Reachability is proven from here on, so anything left to say is about traffic - and
+        // quiet is not a fault. Both of these read as "nothing is broken, here is what is thin".
+        (Level::Ok, Level::Unknown) => "every listener proven, one has produced no events yet",
+        (Level::Ok, Level::Warn) => "every listener proven, one has been quiet over a day",
+        (Level::Ok, Level::Ok) | (Level::Ok, Level::Alarm) => "every listener proven",
+    }
+}
+
 /// Worst wins, and an empty slice is `Unknown`.
 ///
 /// The empty case is the one that matters: an inventory nobody configured has no checks to fail,
@@ -236,6 +261,65 @@ mod tests {
             event_age_level(Some(now - chrono::Duration::hours(25)), now),
             Level::Warn
         );
+    }
+
+    /// The regression this function exists for: every listener probed AND confirmed, one of them
+    /// merely quiet. The combined level is `Warn`, but saying "evidence path unconfirmed" there
+    /// contradicts the confirmations the probes recorded.
+    #[test]
+    fn a_proven_but_quiet_fleet_is_not_reported_as_an_unconfirmed_evidence_path() {
+        let line = headline(Level::Ok, Level::Warn);
+        assert!(
+            !line.contains("unconfirmed"),
+            "reachability was proven; the headline must not deny it: {line}"
+        );
+        assert!(
+            line.contains("quiet"),
+            "the headline must name what is actually thin: {line}"
+        );
+        // Same for a listener that has never produced an event: unmeasured traffic, proven path.
+        let never = headline(Level::Ok, Level::Unknown);
+        assert!(
+            !never.contains("unconfirmed") && !never.contains("reachability"),
+            "a proven listener that has produced nothing yet is not a reachability finding: \
+             {never}"
+        );
+    }
+
+    #[test]
+    fn a_real_reachability_finding_still_leads_the_headline() {
+        assert_eq!(
+            headline(Level::Warn, Level::Ok),
+            "listeners answering, evidence path unconfirmed"
+        );
+        assert_eq!(
+            headline(Level::Alarm, Level::Ok),
+            "a listener is not answering"
+        );
+        assert_eq!(headline(Level::Unknown, Level::Ok), "reachability unproven");
+        // Reachability outranks event age when both have something to say.
+        assert_eq!(
+            headline(Level::Alarm, Level::Warn),
+            "a listener is not answering"
+        );
+        assert_eq!(
+            headline(Level::Warn, Level::Unknown),
+            "listeners answering, evidence path unconfirmed"
+        );
+    }
+
+    #[test]
+    fn only_an_all_clear_fleet_gets_the_all_clear_sentence() {
+        assert_eq!(headline(Level::Ok, Level::Ok), "every listener proven");
+        for reach in [Level::Warn, Level::Alarm, Level::Unknown] {
+            for events in [Level::Ok, Level::Warn, Level::Alarm, Level::Unknown] {
+                assert_ne!(
+                    headline(reach, events),
+                    "every listener proven",
+                    "reach={reach:?} events={events:?} must not read as an all-clear"
+                );
+            }
+        }
     }
 
     #[test]

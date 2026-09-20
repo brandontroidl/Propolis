@@ -33,8 +33,8 @@
   </div>
   <div class="cell">
     <span class="label">Ledger</span>
-    <div class="v">{{ ledger.events }}</div>
-    <div class="foot">events recorded &middot; <a href="/integrity">verify the chain</a></div>
+    <div class="v">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}{{ ledger.events }}{% endif %}</div>
+    <div class="foot">{% if ledger_unavailable %}the event count could not be read{% else %}events recorded{% endif %} &middot; <a href="/integrity">verify the chain</a></div>
   </div>
 </div>
 
@@ -111,6 +111,10 @@
       </tbody>
     </table>
   </div>
+  {% elif captures_unavailable %}
+  {# A failed query and a quiet week both arrive here as an empty list. Saying "no captures" for
+     the first is the console inventing a finding it never read. #}
+  <p class="empty-line">capture completeness could not be read - this is not the same as "no captures". The cause is in the server log.</p>
   {% else %}
   <p class="empty-line">no malware captures in the last 7 days</p>
   {% endif %}
@@ -120,8 +124,8 @@
   <div class="panel">
     <div class="panel-head">Evidence chain</div>
     <div class="panel-body">
-      <p><span class="label">Events</span> <span class="mono">{{ ledger.events }}</span></p>
-      <p><span class="label">Newest ingest</span> <span class="{{ ledger.dot }}" aria-hidden="true"></span> <span class="mono">{% if ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></p>
+      <p><span class="label">Events</span> {% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}<span class="mono">{{ ledger.events }}</span>{% endif %}</p>
+      <p><span class="label">Newest ingest</span> <span class="{{ ledger.dot }}" aria-hidden="true"></span> <span class="mono">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% elif ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></p>
       <p class="dim">The chain verdict is not stored yet. <a href="/integrity">Run a verification</a> to see it.</p>
     </div>
   </div>

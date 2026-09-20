@@ -319,6 +319,77 @@ async fn unauthenticated_request_redirects_to_login() {
     assert_eq!(response.headers().get("location").unwrap(), "/login");
 }
 
+/// An expired session on a POLLED page is the ordinary case after any restart: sessions live in
+/// memory, a restart clears them, and the page keeps polling. A 303 is wrong there - the XHR
+/// follows it, `/login` answers 200 with a whole HTML document, and HTMX swaps that document into
+/// the container that issued the poll. The result looks like a success to HTMX, so the panel never
+/// warns and never recovers; it silently becomes a login form inside the old page's chrome.
+///
+/// Reproduced live on a deployed box after `deploy/upgrade.sh` restarted the daemon: the fleet
+/// pane's `#fleet-status` ended up holding `<html>`, `<head>`, a password input and a second copy
+/// of the vendored Chart.js.
+#[tokio::test]
+async fn an_htmx_request_without_a_session_is_told_to_navigate_not_handed_a_page_to_swap() {
+    let app = protected_test_router(test_state(lazy_pool()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                // What HTMX sets on every request it issues.
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "an unauthenticated API-shaped request deserves a truthful status"
+    );
+    assert_eq!(
+        response.headers().get("hx-redirect").unwrap(),
+        "/login",
+        "HTMX must be told to navigate; it honours this header whatever the status"
+    );
+    assert!(
+        response.headers().get("location").is_none(),
+        "a 303 is what the XHR would follow into a swappable document"
+    );
+
+    // The body is the actual hazard: anything swappable here lands inside the polling container.
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("<html") && !text.contains("<form"),
+        "the response must carry nothing HTMX could swap into the page, got: {text}"
+    );
+}
+
+/// The ordinary browser navigation keeps its redirect - only HTMX requests change.
+#[tokio::test]
+async fn a_plain_navigation_without_a_session_still_redirects() {
+    let app = protected_test_router(test_state(lazy_pool()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+    assert!(response.headers().get("hx-redirect").is_none());
+}
+
 #[tokio::test]
 async fn valid_session_passes_middleware() {
     let state = test_state(lazy_pool());

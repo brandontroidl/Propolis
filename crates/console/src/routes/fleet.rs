@@ -39,7 +39,7 @@ use axum::response::Html;
 use axum::routing::get;
 use axum::{Extension, Router};
 use chrono::{DateTime, Utc};
-use fleet::health::{Level, combine, event_age_level, reach_level};
+use fleet::health::{Level, combine, event_age_level, headline, reach_level};
 use minijinja::context;
 use serde::Serialize;
 use sqlx::{PgPool, Row};
@@ -607,6 +607,14 @@ struct FleetView {
     version: VersionStatus,
     last_event_ago: String,
     last_event_level: &'static str,
+    /// Whether the capture query FAILED, as opposed to returning nothing. The two produce the same
+    /// empty `captures` list and must not produce the same sentence: "no malware captures in the
+    /// last 7 days" is a finding about the fleet, and printing it because a query errored tells
+    /// the operator something the console does not know. The degraded banner names the panel, but
+    /// a reader who takes the panel's own words at face value is reading a fabricated all-clear.
+    captures_unavailable: bool,
+    /// Same distinction for the event ledger: a failed count is not a count of zero.
+    ledger_unavailable: bool,
     degraded: Vec<&'static str>,
 }
 
@@ -638,6 +646,10 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
 
     let mut listeners = Vec::with_capacity(state.fleet_listeners.len());
     let mut levels = Vec::with_capacity(state.fleet_listeners.len());
+    // Kept apart from `levels` so the headline can say WHICH check is unhappy. Folding them
+    // together first loses that, and the sentence then guesses - see `fleet::health::headline`.
+    let mut reach_levels = Vec::with_capacity(state.fleet_listeners.len());
+    let mut event_levels = Vec::with_capacity(state.fleet_listeners.len());
     let mut proven = 0usize;
     let mut alarm = 0usize;
     let mut unknown = 0usize;
@@ -688,6 +700,8 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
             _ => {}
         }
         levels.push(state_level);
+        reach_levels.push(reach);
+        event_levels.push(event_level);
 
         listeners.push(ListenerRow {
             collector: listener.collector_id.clone(),
@@ -738,6 +752,10 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         let event_level = event_age_level(seen.last_event_at, now);
         unknown += 1;
         levels.push(Level::Unknown);
+        // Nothing probed it, because it is not in the inventory: an unproven reach, not a quiet
+        // one. The headline says "reachability unproven", which is exactly this row's problem.
+        reach_levels.push(Level::Unknown);
+        event_levels.push(event_level);
         listeners.push(ListenerRow {
             collector: "unknown".into(),
             sensor: sensor.clone(),
@@ -764,7 +782,9 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         });
     }
 
-    let mut captures = degraded.soft("capture completeness", capture_rows(&state.db).await);
+    let capture_result = capture_rows(&state.db).await;
+    let captures_unavailable = capture_result.is_err();
+    let mut captures = degraded.soft("capture completeness", capture_result);
     let reasons = degraded.soft("capture end reasons", top_end_reasons(&state.db).await);
     for row in &mut captures {
         // Matched on the RAW sensor name, not the display label: two raw names can share a label
@@ -776,8 +796,7 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         }
     }
 
-    let ledger_row = degraded.soft_or(
-        "ledger head",
+    let ledger_result =
         sqlx::query("SELECT count(*) AS events, max(ingested_at) AS newest_ingested_at FROM event")
             .fetch_one(&state.db)
             .await
@@ -786,35 +805,38 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
                     r.try_get::<i64, _>("events")?,
                     r.try_get::<Option<DateTime<Utc>>, _>("newest_ingested_at")?,
                 ))
-            }),
-        (0, None),
-    );
+            });
+    let ledger_unavailable = ledger_result.is_err();
+    let ledger_row = degraded.soft_or("ledger head", ledger_result, (0, None));
     let ledger_level = match ledger_row.1 {
+        // A failed query and an empty ledger are both `Unknown`, which is right - neither proves
+        // health - but the WORDS beside the dot have to differ, hence `ledger_unavailable`.
         None => Level::Unknown,
         Some(t) if (now - t).num_minutes() < 60 => Level::Ok,
         Some(_) => Level::Warn,
     };
     let ledger = LedgerStatus {
-        events: Some(ledger_row.0),
+        // `None` for a failed count: rendering the `0` placeholder as a number is the console
+        // asserting an empty ledger it never managed to read.
+        events: (!ledger_unavailable).then_some(ledger_row.0),
         newest_ingested_ago: ledger_row.1.map(format_relative_time),
         dot: dot_class(ledger_level),
     };
 
     // The band's "Last event" cell is the same fleet-wide number the dashboard shows, kept here so
     // the two pages cannot disagree; the per-listener column beside it is what this page adds.
-    let overall_last_event = ledger_row
-        .1
-        .map(format_relative_time)
-        .unwrap_or_else(|| "never".to_string());
+    let overall_last_event = match (ledger_unavailable, ledger_row.1) {
+        (true, _) => "unavailable".to_string(),
+        (false, Some(t)) => format_relative_time(t),
+        (false, None) => "never".to_string(),
+    };
 
     let total = listeners.len();
     let headline_level = combine(&levels);
-    let headline = match headline_level {
-        Level::Ok => "every listener proven",
-        Level::Warn => "listeners answering, evidence path unconfirmed",
-        Level::Alarm => "a listener is not answering",
-        Level::Unknown => "reachability unproven",
-    };
+    // From the two checks separately, not from their combined severity: a fleet that is fully
+    // probed and confirmed but has one quiet listener also combines to `Warn`, and describing that
+    // as an unconfirmed evidence path contradicts the confirmations on the rows right below it.
+    let headline = headline(combine(&reach_levels), combine(&event_levels));
 
     FleetView {
         summary: FleetSummary {
@@ -832,6 +854,8 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         version: version_status(state),
         last_event_ago: overall_last_event,
         last_event_level: ledger_level.class(),
+        captures_unavailable,
+        ledger_unavailable,
         degraded: degraded.names(),
     }
 }
@@ -852,6 +876,8 @@ fn render(
         version_status => &view.version,
         last_event_ago => &view.last_event_ago,
         last_event_level => view.last_event_level,
+        captures_unavailable => view.captures_unavailable,
+        ledger_unavailable => view.ledger_unavailable,
         // Deliberately NOT named `degraded`: `base.html` renders a banner from that name, and this
         // page's banner lives inside the refreshing fragment instead so it stays current.
         degraded_panels => &view.degraded,

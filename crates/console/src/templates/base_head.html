@@ -552,6 +552,9 @@ button:hover { border-color: var(--text-muted); }
 .empty-line { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.82rem; padding: 1.25rem 0.9rem; }
 /* Soft-failed panels banner (routes::degraded): amber = "wants the operator", same ramp as review. */
 .degraded { background: var(--high-dim); border: 1px solid var(--high); color: var(--high-text); font-family: var(--font-mono); font-size: 0.82rem; padding: 0.6rem 0.9rem; border-radius: 4px; margin-bottom: 1rem; }
+/* A polled panel whose refresh is failing. It still shows the last reading it managed to get, so
+   it is dimmed to say the numbers below are frozen - the banner above it says since when. */
+[data-stale="true"] { opacity: 0.55; filter: saturate(0.4); }
 
 /* -- Footer & login -- */
 .status-line { text-align: center; color: var(--text-faint); font-family: var(--font-mono); font-size: 0.68rem; padding: 1.5rem 0 1rem; letter-spacing: 0.03em; }

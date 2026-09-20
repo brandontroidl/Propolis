@@ -51,6 +51,25 @@ A decision records `decided_at` and optional notes on the queue row. Approval
 makes an IP *eligible* to be published on the next feed build; it does not itself
 push anything off the node.
 
+### Revisiting a snoozed decision
+
+Nothing re-surfaces a snoozed entry on its own - a population scan never reopens
+a decision an operator already took - so a snooze is revisited from the **Snoozed
+tab**, which carries the same Approve and Reject controls as the pending queue
+plus **Return to pending** for an entry you want back in the working queue.
+
+From the CLI: `review snoozed` lists what is waiting, and
+`review approve|reject|unsnooze <ip>` acts on it. `unsnooze` also undoes an
+approval or rejection made in error; it clears `decided_at` and keeps the notes.
+
+### Delisting and relisting
+
+**Delist** keeps an address out of the feed and the queue regardless of score.
+**Relist** (the address's detail page, on a delisted address) removes that hold.
+Relisting does not force the address back into the feed: it clears the latch and
+re-derives the ordinary gates from the current projection, so an address whose
+score has since decayed stays out on its own merits.
+
 ## Publishing the feed
 
 Feed publication has two distinct stages. Keep them straight - only the first is

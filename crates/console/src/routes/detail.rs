@@ -453,6 +453,10 @@ async fn detail(
         effective_score_pct => effective_f64.clamp(0.0, 100.0).round() as u32,
         tier => score.tier.map(tier_label).unwrap_or("-"),
         eligible => score.eligible,
+        // Which way the delist control points. Delisting is reversible by design ("until you say
+        // otherwise"), so the page has to be able to offer the reverse - see `routes::queue`'s
+        // `relist`.
+        delisted => score.delisted,
         recommended_for_vendor => score.recommended_for_vendor,
         recommended_for_blocklist => score.recommended_for_blocklist,
         has_confirmed_real => score.has_confirmed_real,

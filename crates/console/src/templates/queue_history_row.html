@@ -12,4 +12,22 @@
   <td class="seen">{{ row.decided_at }}</td>
   {% if row.state == "approved" %}<td>{{ row.submissions }}</td>{% endif %}
   <td class="dim">{{ row.notes }}</td>
+  {# A snooze promises a later decision, and nothing re-surfaces a decided entry on its own, so
+     this tab is the only place that decision can be made. A Snoozed row without these controls
+     turns "decide later" into "never" without ever saying so. #}
+  {% if row.state == "snoozed" %}
+  <td>
+    <div class="actions">
+      <input type="hidden" name="csrf_token" value="{{ row.csrf_token }}">
+      {# Tells the handler the row was acted on from a history tab, so it answers with the
+         "moved to another tab" acknowledgement instead of a row shaped for the pending table. #}
+      <input type="hidden" name="from_tab" value="snoozed">
+      <div class="buttons">
+        <button type="button" class="btn-approve" hx-post="/queue/{{ row.ip }}/approve" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Approve</button>
+        <button type="button" class="btn-reject" hx-post="/queue/{{ row.ip }}/reject" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Reject</button>
+        <button type="button" class="btn-snooze" hx-post="/queue/{{ row.ip }}/unsnooze" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Return to pending</button>
+      </div>
+    </div>
+  </td>
+  {% endif %}
 </tr>

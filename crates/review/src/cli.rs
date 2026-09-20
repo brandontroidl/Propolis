@@ -1,6 +1,7 @@
 //! The operator CLI: clap subcommands wrapping [`ReviewQueue`]'s three
-//! decisions (approve/reject/snooze), the pending listing, and the vendor
-//! submission history for an IP. See
+//! decisions (approve/reject/snooze), the way back out of a snooze
+//! (`unsnooze`, and `snoozed` to find what is waiting), the pending listing,
+//! and the vendor submission history for an IP. See
 //! `internal/design/04-review-gatekeeper-reporting.md` ("Operator
 //! decisions"): "The CLI also supports listing the queue (pending entries,
 //! with score and categories) and viewing the submission history for an IP."
@@ -62,8 +63,16 @@ pub enum Command {
         #[arg(long)]
         notes: Option<String>,
     },
+    /// Return an IP to the pending queue. The way back out of a snooze (a
+    /// population scan never re-surfaces a decided entry on its own), and the
+    /// way to undo an approval or rejection made in error.
+    Unsnooze { ip: IpAddr },
     /// List every Pending review queue entry, oldest-surfaced first.
     List,
+    /// List every Snoozed entry, most-recently-snoozed first: what is waiting
+    /// for the "later" a snooze promised. Nothing re-surfaces these
+    /// automatically, so this listing is how they are found again.
+    Snoozed,
     /// Show vendor submission history for an IP, most recent first.
     History { ip: IpAddr },
 }
@@ -109,7 +118,12 @@ pub async fn execute(pool: &PgPool, command: Command) -> Result<(), CliError> {
             queue.snooze(pool, ip, notes.as_deref()).await?;
             println!("snoozed {ip}");
         }
+        Command::Unsnooze { ip } => {
+            queue.unsnooze(pool, ip).await?;
+            println!("{ip} returned to pending");
+        }
         Command::List => print_pending(pool, &queue).await?,
+        Command::Snoozed => print_snoozed(pool, &queue).await?,
         Command::History { ip } => print_history(pool, ip).await?,
     }
     Ok(())
@@ -134,6 +148,33 @@ async fn print_pending(pool: &PgPool, queue: &ReviewQueue) -> Result<(), CliErro
             e.categories_at_surface,
         );
     }
+    Ok(())
+}
+
+async fn print_snoozed(pool: &PgPool, queue: &ReviewQueue) -> Result<(), CliError> {
+    let entries = queue
+        .list_by_state(pool, core_scoring::ReviewState::Snoozed)
+        .await?;
+    if entries.is_empty() {
+        println!("no snoozed review queue entries");
+        return Ok(());
+    }
+    println!(
+        "{:<16}{:>10}  {:<25}NOTES",
+        "SOURCE_IP", "SCORE", "SNOOZED_AT"
+    );
+    for e in entries {
+        println!(
+            "{:<16}{:>10}  {:<25}{}",
+            e.source_ip.to_string(),
+            e.score_at_surface,
+            e.decided_at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "-".to_string()),
+            e.notes.unwrap_or_default(),
+        );
+    }
+    println!("\nact on one with: review approve|reject|unsnooze <ip>");
     Ok(())
 }
 

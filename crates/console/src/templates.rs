@@ -39,6 +39,7 @@ const DASHBOARD_HTML: &str = include_str!("templates/dashboard.html");
 const QUEUE_HTML: &str = include_str!("templates/queue.html");
 const QUEUE_ROW_HTML: &str = include_str!("templates/queue_row.html");
 const QUEUE_HISTORY_ROW_HTML: &str = include_str!("templates/queue_history_row.html");
+const QUEUE_MOVED_ROW_HTML: &str = include_str!("templates/queue_moved_row.html");
 const LOGIN_HTML: &str = include_str!("templates/login.html");
 const DETAIL_HTML: &str = include_str!("templates/detail.html");
 const DRAWER_SHELL_HTML: &str = include_str!("templates/drawer_shell.html");
@@ -76,6 +77,10 @@ pub fn environment() -> Environment<'static> {
     // submissions instead of the pending tab's action buttons - see `routes::queue`'s doc comment.
     env.add_template("queue_history_row.html", QUEUE_HISTORY_ROW_HTML)
         .expect("queue_history_row.html must be a valid template");
+    // The acknowledgement a history tab's row is swapped for once a decision moves it to another
+    // tab - see the template's own comment for why it cannot just be re-rendered in place.
+    env.add_template("queue_moved_row.html", QUEUE_MOVED_ROW_HTML)
+        .expect("queue_moved_row.html must be a valid template");
     env.add_template("login.html", LOGIN_HTML)
         .expect("login.html must be a valid template");
     env.add_template("detail.html", DETAIL_HTML)
@@ -167,6 +172,114 @@ mod tests {
         // `>` -> `&gt;`, and `/` -> `&#x2f;` (minijinja escapes `/` too, not just the HTML-special
         // five).
         assert!(html.contains("&lt;script&gt;alert(1)&lt;&#x2f;script&gt;"));
+    }
+
+    /// A snoozed row's display data. `csrf_token` is what makes its controls usable at all - the
+    /// history tabs used to render with an empty one.
+    fn queue_row(state: &str) -> minijinja::Value {
+        minijinja::context! {
+            ip => "203.0.113.7", state => state, is_pending => false,
+            score => "81.0", score_pct => 81, tier => "standard",
+            categories => "auth", event_count => 12,
+            first_seen => "-", last_seen => "-", decided_at => "2026-09-19T10:00:00Z",
+            submissions => "-", notes => "check the ASN first",
+            csrf_token => "tok-123",
+        }
+    }
+
+    /// A snooze that cannot be acted on later is a rejection wearing a softer word. Nothing
+    /// re-surfaces a snoozed entry, so this tab's controls are the only route back.
+    #[test]
+    fn the_snoozed_tab_can_actually_decide_the_entry_it_is_holding() {
+        let env = environment();
+        let tmpl = env.get_template("queue_history_row.html").unwrap();
+        let html = tmpl
+            .render(minijinja::context! { row => queue_row("snoozed") })
+            .unwrap();
+
+        for action in ["approve", "reject", "unsnooze"] {
+            assert!(
+                html.contains(&format!("/queue/203.0.113.7/{action}")),
+                "the snoozed row must offer {action}: {html}"
+            );
+        }
+        assert!(
+            html.contains(r#"value="tok-123""#),
+            "the controls need a real CSRF token or every one of them is rejected: {html}"
+        );
+        assert!(
+            html.contains(r#"name="from_tab" value="snoozed""#),
+            "the handler needs to know the row came from a history tab: {html}"
+        );
+    }
+
+    /// Approved and rejected are terminal in the console's own model, and their tables have no
+    /// Actions column - rendering controls there would add cells with no header over them.
+    #[test]
+    fn the_other_history_tabs_keep_their_existing_columns() {
+        let env = environment();
+        let tmpl = env.get_template("queue_history_row.html").unwrap();
+        for state in ["approved", "rejected"] {
+            let html = tmpl
+                .render(minijinja::context! { row => queue_row(state) })
+                .unwrap();
+            assert!(
+                !html.contains("/queue/203.0.113.7/unsnooze"),
+                "the {state} tab has no Actions column: {html}"
+            );
+        }
+    }
+
+    /// The console tour says a delist holds "until you say otherwise". The page has to carry the
+    /// control that says otherwise, and it has to be the one that matches the address's state.
+    #[test]
+    fn the_detail_page_offers_the_reverse_of_whichever_listing_state_applies() {
+        let env = environment();
+        let tmpl = env.get_template("detail.html").unwrap();
+        let render = |delisted: bool| {
+            tmpl.render(minijinja::context! {
+                layout => "drawer_shell.html",
+                is_drawer => true,
+                csrf_token => "tok-123",
+                ip => "203.0.113.7",
+                delisted => delisted,
+                ..detail_stub_context()
+            })
+            .unwrap()
+        };
+
+        let delisted = render(true);
+        assert!(
+            delisted.contains("/ip/203.0.113.7/relist") && delisted.contains(">Relist<"),
+            "a delisted address must offer relisting: {delisted}"
+        );
+        assert!(
+            !delisted.contains(">Delist<"),
+            "offering to delist an already-delisted address says nothing true: {delisted}"
+        );
+
+        let listed = render(false);
+        assert!(listed.contains("/ip/203.0.113.7/delist") && listed.contains(">Delist<"));
+        assert!(
+            !listed.contains("/ip/203.0.113.7/relist"),
+            "an address that is not delisted has nothing to relist: {listed}"
+        );
+    }
+
+    /// The remaining `detail.html` fields, so the two tests above can vary only `delisted`.
+    fn detail_stub_context() -> minijinja::Value {
+        minijinja::context! {
+            active_nav => "detail", pending_count => 0, uptime => "1m", version => "0.0.0",
+            degraded => Vec::<&str>::new(),
+            raw_score => "0.0", raw_score_pct => 0,
+            effective_score => "0.0", effective_score_pct => 0,
+            tier => "-", eligible => false,
+            recommended_for_vendor => false, recommended_for_blocklist => false,
+            has_confirmed_real => false, event_count => 0, distinct_categories => 0,
+            distinct_wan_count => 0, distinct_sensor_count => 0, active_days => 0,
+            persistence_bonus => "0", max_confidence => "0.000",
+            first_seen => "-", last_seen => "-",
+        }
     }
 
     /// The fields `fleet_status_fragment.html` reads unconditionally, so a test can vary only the

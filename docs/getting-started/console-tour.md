@@ -43,10 +43,18 @@ approve, reject or snooze. Approve is what lets an address into the `aggressive`
 `standard` feed files and, if a vendor is configured, allows a report. The Approved,
 Rejected and Snoozed tabs show past decisions.
 
+The **Snoozed tab is where a deferred decision gets made**. Nothing puts a snoozed
+entry back in the pending queue on its own, so that tab carries its own Approve and
+Reject controls, plus **Return to pending** to hand the entry back to the working
+queue. Acting on a row there moves it to another tab and tells you which one.
+
 Two per-address actions go further. **Delist** removes the address from the queue and
-keeps it out of the feed until you say otherwise. **Delete** removes its score,
-queue and submission rows so it starts from nothing; the event ledger is never touched,
-so the score can be rebuilt from it.
+keeps it out of the feed until you say otherwise - **Relist**, which replaces the
+Delist button once an address is delisted, is how you say otherwise. Relisting clears
+the hold and re-derives the ordinary gates, so the address rejoins the feed only if it
+still qualifies on its current score. **Delete** removes its score, queue and
+submission rows so it starts from nothing; the event ledger is never touched, so the
+score can be rebuilt from it.
 
 ## Attackers
 

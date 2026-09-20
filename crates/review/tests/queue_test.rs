@@ -360,3 +360,156 @@ async fn withdraw_never_removes_a_decided_entry() {
         .expect("an approved entry must survive withdrawal");
     assert_eq!(state, ReviewState::Approved);
 }
+
+/// The promise `snooze`'s own doc comment makes - "an operator can act on it again later" - has to
+/// be reachable. `populate` never re-surfaces a decided entry, so the only route back is a listing
+/// of what is snoozed plus a decision that works on it. This exercises that whole round trip.
+#[tokio::test]
+async fn a_snoozed_entry_can_be_found_again_and_decided() {
+    let pool = setup_pool().await;
+    let test_ip = "192.0.2.218";
+    reset_ip(&pool, test_ip).await;
+    seed_recommended(&pool, test_ip).await;
+
+    let queue = ReviewQueue::new();
+    queue.populate(&pool).await.unwrap();
+    queue
+        .snooze(&pool, test_ip.parse().unwrap(), Some("check the ASN first"))
+        .await
+        .unwrap();
+
+    // A population scan does not bring it back on its own - that is the behaviour the listing
+    // below has to compensate for, so assert it rather than assuming it.
+    queue.populate(&pool).await.unwrap();
+    let (state, _, _) = fetch_row(&pool, test_ip).await.expect("row must exist");
+    assert_eq!(
+        state,
+        ReviewState::Snoozed,
+        "a population scan must not silently undo an operator's decision to defer"
+    );
+
+    // Found again, with the reasoning the operator left behind.
+    let snoozed = queue
+        .list_by_state(&pool, ReviewState::Snoozed)
+        .await
+        .unwrap();
+    let entry = snoozed
+        .iter()
+        .find(|e| e.source_ip.to_string() == test_ip)
+        .expect("the snoozed listing must contain the entry that was snoozed");
+    assert_eq!(entry.notes.as_deref(), Some("check the ASN first"));
+
+    // And decided from there.
+    queue
+        .approve(&pool, test_ip.parse().unwrap(), Some("reviewed, real"))
+        .await
+        .unwrap();
+    let (state, decided_at, notes) = fetch_row(&pool, test_ip).await.expect("row must exist");
+    assert_eq!(state, ReviewState::Approved);
+    assert!(decided_at.is_some());
+    assert_eq!(notes.as_deref(), Some("reviewed, real"));
+    assert!(
+        !queue
+            .list_by_state(&pool, ReviewState::Snoozed)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.source_ip.to_string() == test_ip),
+        "a decided entry must leave the snoozed listing"
+    );
+}
+
+/// `unsnooze` puts an entry back in the working queue rather than deciding it, and clears the
+/// decision timestamp with it: a Pending row carrying a `decided_at` reads as a decision that was
+/// taken and then ignored.
+#[tokio::test]
+async fn unsnooze_returns_an_entry_to_pending_and_clears_its_decision_timestamp() {
+    let pool = setup_pool().await;
+    let test_ip = "192.0.2.219";
+    reset_ip(&pool, test_ip).await;
+    seed_recommended(&pool, test_ip).await;
+
+    let queue = ReviewQueue::new();
+    queue.populate(&pool).await.unwrap();
+    queue
+        .snooze(&pool, test_ip.parse().unwrap(), Some("deferred once"))
+        .await
+        .unwrap();
+    queue
+        .unsnooze(&pool, test_ip.parse().unwrap())
+        .await
+        .unwrap();
+
+    let (state, decided_at, notes) = fetch_row(&pool, test_ip).await.expect("row must exist");
+    assert_eq!(state, ReviewState::Pending);
+    assert_eq!(
+        decided_at, None,
+        "a pending entry has not been decided, so it must carry no decision time"
+    );
+    assert_eq!(
+        notes.as_deref(),
+        Some("deferred once"),
+        "the reasoning for deferring is the context the operator wants when it comes back round"
+    );
+
+    // Back in the ordinary working queue, not just back in some state column.
+    assert!(
+        queue
+            .list_pending(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.source_ip.to_string() == test_ip),
+        "an unsnoozed entry must appear in the pending listing"
+    );
+    assert_eq!(row_count(&pool, test_ip).await, 1, "no duplicate row");
+}
+
+#[tokio::test]
+async fn unsnoozing_an_entry_that_does_not_exist_fails_closed() {
+    let pool = setup_pool().await;
+    let test_ip: IpAddr = "192.0.2.220".parse().unwrap();
+    reset_ip(&pool, &test_ip.to_string()).await;
+
+    let result = ReviewQueue::new().unsnooze(&pool, test_ip).await;
+    assert!(
+        matches!(result, Err(ReviewError::NotFound(ip)) if ip == test_ip),
+        "unsnoozing an IP with no queue entry must fail closed, not silently no-op"
+    );
+}
+
+/// An entry returned to pending is a live recommendation again, so a `withdraw` scan must be able
+/// to retire it when its trigger lapses - exactly as it would for any other pending entry. The
+/// scan skips decided rows, so this proves `unsnooze` really restored Pending rather than leaving
+/// a row that merely displays as pending.
+#[tokio::test]
+async fn an_unsnoozed_entry_is_withdrawn_again_when_its_recommendation_lapses() {
+    let pool = setup_pool().await;
+    let test_ip = "192.0.2.221";
+    reset_ip(&pool, test_ip).await;
+    seed_recommended(&pool, test_ip).await;
+
+    let queue = ReviewQueue::new();
+    queue.populate(&pool).await.unwrap();
+    queue
+        .snooze(&pool, test_ip.parse().unwrap(), None)
+        .await
+        .unwrap();
+    queue
+        .unsnooze(&pool, test_ip.parse().unwrap())
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE ip_score SET recommended_for_vendor = FALSE WHERE source_ip = $1::inet")
+        .bind(test_ip)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    queue.withdraw(&pool).await.unwrap();
+    assert_eq!(
+        row_count(&pool, test_ip).await,
+        0,
+        "an unsnoozed entry must be an ordinary pending entry, withdrawable like any other"
+    );
+}

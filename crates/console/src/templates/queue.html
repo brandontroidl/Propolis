@@ -7,6 +7,11 @@
   <a href="/queue?tab={{ tab_name }}" class="tab {% if tab == tab_name %}active{% endif %}">{{ tab_name | capitalize }}</a>
   {% endfor %}
 </div>
+{% if tab == "snoozed" %}
+<p class="dim">Snoozed entries stay here until you decide them - nothing puts them back in the
+pending queue on its own. Decide one below, or return it to pending to deal with it alongside the
+rest.</p>
+{% endif %}
 {% if rows %}
 <div class="panel">
 <table class="table-compact">
@@ -30,6 +35,7 @@
       <th>Decided</th>
       {% if tab == "approved" %}<th>Submissions</th>{% endif %}
       <th>Notes</th>
+      {% if tab == "snoozed" %}<th>Actions</th>{% endif %}
       {% endif %}
     </tr>
   </thead>

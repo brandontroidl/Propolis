@@ -361,6 +361,21 @@ async fn main() {
         "feed: starting periodic build loop"
     );
 
+    // See `feed::recover_interrupted_publish`: a publish killed between its two renames leaves the
+    // public path absent with the previous build parked beside it, and nothing else puts it back.
+    match feed::recover_interrupted_publish(&config.output_dir) {
+        Ok(true) => {
+            tracing::info!("feed: restored the last valid feed after an interrupted publish")
+        }
+        Ok(false) => {}
+        Err(e) => tracing::error!(
+            output_dir = %config.output_dir.display(),
+            error = %e,
+            "feed: the published feed directory is missing and the parked previous build could \
+             not be moved back into place"
+        ),
+    }
+
     let build_loop = async {
         loop {
             run_build_cycle(&pool, &exclusions, &feed_config, &config.output_dir).await;

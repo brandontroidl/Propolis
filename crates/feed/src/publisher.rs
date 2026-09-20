@@ -336,6 +336,58 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Where a two-step swap parks the previous build while the new one moves into its place.
+///
+/// A sibling of `output_dir` under the same parent, so both renames are same-filesystem. Its name
+/// is derived from `output_dir`'s, so two feeds published side by side under one parent cannot
+/// collide on it, and a leftover one names the output directory it belongs to.
+fn previous_dir(output_dir: &Path) -> Option<PathBuf> {
+    let parent = match output_dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    // `None` only for a path with no final component (`/`, `..`), which `Publisher::publish`
+    // already rejects as `InvalidOutputDir`; the caller falls back to a plain rename.
+    let file_name = output_dir.file_name()?;
+    Some(parent.join(format!(".{}.previous", file_name.to_string_lossy())))
+}
+
+/// Puts the public path back if a previous swap was interrupted between its two renames.
+///
+/// The window is real: [`swap_into_place`] moves the old directory aside and then moves staging
+/// into its place, and a crash (or a kill, or a machine losing power) between those two renames
+/// leaves `output_dir` absent with the complete previous build sitting in [`previous_dir`]. Every
+/// consumer of the feed then gets "not found" until some later build happens to succeed, which on
+/// a 15-minute build interval is a 15-minute outage of a path other people's blocklists fetch -
+/// and indefinitely long if the same fault also stops the builds.
+///
+/// So the recovery is not deferred to the next successful publish: this restores the last valid
+/// feed on its own. It is deliberately conservative - it moves the parked directory back ONLY when
+/// `output_dir` is absent, so it can never overwrite a live feed, and it is safe to call at
+/// startup and before every publish.
+///
+/// Returns `Ok(true)` when it restored something, `Ok(false)` when there was nothing to do.
+pub fn recover_interrupted_publish(output_dir: &Path) -> io::Result<bool> {
+    if output_dir.exists() {
+        return Ok(false);
+    }
+    let Some(old_aside) = previous_dir(output_dir) else {
+        return Ok(false);
+    };
+    if !old_aside.exists() {
+        return Ok(false);
+    }
+    std::fs::rename(&old_aside, output_dir)?;
+    tracing::warn!(
+        output_dir = %output_dir.display(),
+        restored_from = %old_aside.display(),
+        "publisher: the published feed directory was missing and a previous build was parked \
+         beside it - a publish was interrupted between its two renames; the last valid feed has \
+         been restored"
+    );
+    Ok(true)
+}
+
 /// Atomically replaces `output_dir`'s content with `staging`'s.
 ///
 /// If `output_dir` does not exist yet, a single `rename` is already atomic and sufficient. If it
@@ -348,25 +400,57 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// at exactly that instant sees "not found yet", never a torn mix of old and new files, which is
 /// the guarantee the design's "Atomic publish" asks for ("consumers never see a partially-written
 /// feed").
+///
+/// Two things close that window rather than leaving it open for the next build to notice:
+///
+/// * If the second rename FAILS (a full filesystem, a permission change, an `EXDEV` from a staging
+///   directory that is not actually a sibling), the parked directory is moved straight back, so a
+///   failed publish leaves the previous feed serving rather than nothing at all. The publish still
+///   reports the original error - the rollback restores availability, it does not hide the fault.
+/// * If the process DIES in the window, nothing here can run; [`recover_interrupted_publish`]
+///   restores the parked build at the next startup and at the head of every publish.
 fn swap_into_place(staging: &Path, output_dir: &Path) -> io::Result<()> {
+    // A prior interrupted swap leaves the public path absent and the previous build parked. Put it
+    // back before deciding which branch below applies: otherwise the "does not exist" branch
+    // publishes over the top and the parked copy is orphaned, keeping the disk cost of a build
+    // nobody will ever serve.
+    recover_interrupted_publish(output_dir)?;
+
+    let Some(old_aside) = previous_dir(output_dir) else {
+        return std::fs::rename(staging, output_dir);
+    };
     if !output_dir.exists() {
         return std::fs::rename(staging, output_dir);
     }
 
-    let parent = match output_dir.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let file_name = output_dir
-        .file_name()
-        .expect("output_dir already exists, so it was created with a valid file name");
-    let old_aside = parent.join(format!(".{}.previous", file_name.to_string_lossy()));
     if old_aside.exists() {
         std::fs::remove_dir_all(&old_aside)?;
     }
 
     std::fs::rename(output_dir, &old_aside)?;
-    std::fs::rename(staging, output_dir)?;
+    if let Err(e) = std::fs::rename(staging, output_dir) {
+        // The public path is empty right now and the only complete feed on disk is the one parked
+        // a moment ago. Put it back before returning, so the failure costs a build rather than the
+        // feed's availability.
+        match std::fs::rename(&old_aside, output_dir) {
+            Ok(()) => tracing::error!(
+                output_dir = %output_dir.display(),
+                error = %e,
+                "publisher: could not move the new build into place; the previous feed was \
+                 restored and stays published"
+            ),
+            Err(rollback) => tracing::error!(
+                output_dir = %output_dir.display(),
+                parked = %old_aside.display(),
+                error = %e,
+                rollback_error = %rollback,
+                "publisher: could not move the new build into place AND could not restore the \
+                 previous one; the published feed path is absent and the last valid build is \
+                 parked beside it - startup recovery will restore it, or move it back by hand"
+            ),
+        }
+        return Err(e);
+    }
 
     // Best-effort cleanup: every consumer-visible guarantee already holds by this point (the
     // rename above completed), so a failure here is logged, not propagated as a publish failure.
@@ -484,5 +568,97 @@ mod tests {
 
         // Restore so tempdir cleanup can remove it.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+
+    /// Publishes a directory standing in for a finished build.
+    fn build_dir(at: &Path, marker: &str) {
+        std::fs::create_dir_all(at).expect("create build dir");
+        std::fs::write(at.join("aggressive.txt"), marker).expect("write marker");
+    }
+
+    /// The failure the two-rename swap cannot recover from by itself: the OLD directory has
+    /// already been moved aside and the NEW one cannot take its place. Injected here by handing
+    /// `swap_into_place` a staging path that does not exist, so the second `rename` fails with
+    /// `ENOENT` at exactly the point a full filesystem or a permission change would.
+    ///
+    /// Without the rollback this leaves the published path absent - the feed 404s for every
+    /// consumer until some later build happens to succeed.
+    #[test]
+    fn a_failed_second_rename_restores_the_previous_build_rather_than_leaving_no_feed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output_dir = tmp.path().join("current");
+        build_dir(&output_dir, "v1");
+
+        let missing_staging = tmp.path().join(".current.staging");
+        let err = swap_into_place(&missing_staging, &output_dir)
+            .expect_err("the swap must fail when staging cannot be moved into place");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        assert!(
+            output_dir.exists(),
+            "the published path must not be left absent by a failed swap"
+        );
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap(),
+            "v1",
+            "the previous build must be the one restored, with its content intact"
+        );
+        assert!(
+            !previous_dir(&output_dir).unwrap().exists(),
+            "the rollback must leave no parked copy behind"
+        );
+    }
+
+    /// The other half of the same window: the process dies BETWEEN the two renames, so no
+    /// rollback can run. On disk that is exactly a missing output dir beside a complete parked
+    /// build, which is what this constructs.
+    #[test]
+    fn recovery_restores_the_public_path_after_a_crash_between_the_two_renames() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output_dir = tmp.path().join("current");
+        build_dir(&output_dir, "v1");
+
+        // Crash simulation: the first rename happened, the second never did.
+        let parked = previous_dir(&output_dir).unwrap();
+        std::fs::rename(&output_dir, &parked).expect("park the previous build");
+        assert!(
+            !output_dir.exists(),
+            "precondition: the feed path is absent"
+        );
+
+        assert!(
+            recover_interrupted_publish(&output_dir).expect("recovery must succeed"),
+            "recovery must report that it restored something"
+        );
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap(),
+            "v1",
+            "the last valid feed must be back at the public path"
+        );
+        assert!(
+            !parked.exists(),
+            "the parked copy must be consumed, not copied"
+        );
+    }
+
+    #[test]
+    fn recovery_never_overwrites_a_live_feed_and_is_a_no_op_with_nothing_parked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output_dir = tmp.path().join("current");
+        build_dir(&output_dir, "live");
+
+        // Nothing parked: nothing to do.
+        assert!(!recover_interrupted_publish(&output_dir).unwrap());
+
+        // A stale parked copy beside a LIVE feed must never be promoted over it - that would
+        // republish an older build on every restart.
+        let parked = previous_dir(&output_dir).unwrap();
+        build_dir(&parked, "stale");
+        assert!(!recover_interrupted_publish(&output_dir).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap(),
+            "live",
+            "the live feed must be left exactly as it was"
+        );
     }
 }

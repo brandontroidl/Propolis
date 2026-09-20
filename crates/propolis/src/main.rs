@@ -395,6 +395,23 @@ async fn run_feed_loop(
         );
     }
 
+    // A publish interrupted between its two renames leaves the public path absent with the last
+    // valid build parked beside it. Restore it now rather than waiting for a build to succeed: the
+    // feed is fetched by other people's blocklists, and the next build is an interval away at best
+    // - and never, if whatever killed the last publish also stops the builds.
+    match feed::recover_interrupted_publish(&output_dir) {
+        Ok(true) => {
+            tracing::info!("feed: restored the last valid feed after an interrupted publish")
+        }
+        Ok(false) => {}
+        Err(e) => tracing::error!(
+            output_dir = %output_dir.display(),
+            error = %e,
+            "feed: the published feed directory is missing and the parked previous build could \
+             not be moved back into place"
+        ),
+    }
+
     loop {
         if cancel.is_cancelled() {
             return;

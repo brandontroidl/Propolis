@@ -122,7 +122,16 @@ IP's last event, so an entry cannot slide between tiers between builds.
 - **Atomic publish.** Every format (`.txt`, `.json`, `.csv`, `.cidr`, `.ipset`, `.nft`,
   `.pf`, `.alias`, `.hosts`, `.rpz`) and a manifest are written to a staging directory
   on the same filesystem, fsynced, re-checked against the exclusions, and swapped into
-  place with two renames. An error at any point leaves the previous feed untouched.
+  place with two renames: the live directory is moved aside, then staging takes its
+  place. An error at any point leaves the previous feed untouched - if the second rename
+  fails, the directory moved aside is moved straight back, so the publish reports the
+  error and the previous feed keeps serving.
+- **Interrupted publish.** Between those two renames there is an instant where the
+  published path does not exist. A reader at that instant gets "not found", never a
+  mixture of old and new files. A process that *dies* at that instant leaves the path
+  absent with the previous build parked beside it as `.<name>.previous`; the daemon
+  restores it at startup, and the next publish restores it too rather than orphaning it.
+  A consumer that fetched during the window should retry.
 
 The builder runs inside the daemon every fifteen minutes by default and writes to a
 local directory. Shipping the files anywhere, for example to a public repository, is a

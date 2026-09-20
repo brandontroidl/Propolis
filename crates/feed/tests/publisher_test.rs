@@ -508,3 +508,99 @@ fn root_path_as_output_dir_is_rejected_before_any_write() {
     let result = Publisher::publish(&snapshot, Path::new("/"), &permissive(), &config);
     assert!(matches!(result, Err(PublishError::InvalidOutputDir(_))));
 }
+
+/// A publish interrupted between its two renames leaves the public path absent with the previous
+/// build parked beside it. The next successful publish must both serve the new build AND consume
+/// the parked copy - leaving it behind would keep a whole build's disk cost around forever.
+#[test]
+fn a_publish_after_an_interrupted_one_restores_the_path_and_consumes_the_parked_build() {
+    let config = FeedConfig::default();
+    let build_time_v1 = dt("2026-07-29T14:00:00Z");
+    let snapshot_v1 = FeedSnapshot {
+        build_time: build_time_v1,
+        aggressive: vec![entry(
+            ip("45.10.30.7"),
+            FeedTier::Aggressive,
+            build_time_v1,
+            &config,
+        )],
+        standard: Vec::new(),
+        windows: Vec::new(),
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let output_dir = tmp.path().join("current");
+    Publisher::publish(&snapshot_v1, &output_dir, &permissive(), &config).unwrap();
+
+    // Crash simulation: the swap's first rename landed, its second never did.
+    let parked = tmp.path().join(".current.previous");
+    std::fs::rename(&output_dir, &parked).unwrap();
+    assert!(
+        !output_dir.exists(),
+        "precondition: the feed path is absent"
+    );
+
+    let build_time_v2 = dt("2026-07-29T15:00:00Z");
+    let snapshot_v2 = FeedSnapshot {
+        build_time: build_time_v2,
+        aggressive: vec![entry(
+            ip("45.10.30.99"),
+            FeedTier::Aggressive,
+            build_time_v2,
+            &config,
+        )],
+        standard: Vec::new(),
+        windows: Vec::new(),
+    };
+    Publisher::publish(&snapshot_v2, &output_dir, &permissive(), &config).unwrap();
+
+    let txt = std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap();
+    assert!(txt.contains("45.10.30.99"), "the new build must be serving");
+    assert!(
+        !parked.exists(),
+        "the build parked by the interrupted publish must not be orphaned on disk"
+    );
+}
+
+/// Startup recovery, as the daemons call it: nothing rebuilds, and the last valid feed is back at
+/// the public path with its checksums and manifest still matching what was published.
+#[test]
+fn startup_recovery_restores_the_last_valid_feed_without_rebuilding_it() {
+    let config = FeedConfig::default();
+    let build_time = dt("2026-07-29T14:00:00Z");
+    let snapshot = FeedSnapshot {
+        build_time,
+        aggressive: vec![entry(
+            ip("45.10.30.7"),
+            FeedTier::Aggressive,
+            build_time,
+            &config,
+        )],
+        standard: Vec::new(),
+        windows: Vec::new(),
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let output_dir = tmp.path().join("current");
+    Publisher::publish(&snapshot, &output_dir, &permissive(), &config).unwrap();
+    let published_manifest = manifest_json(&output_dir);
+    let published_txt = std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap();
+
+    std::fs::rename(&output_dir, tmp.path().join(".current.previous")).unwrap();
+
+    assert!(feed::recover_interrupted_publish(&output_dir).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap(),
+        published_txt
+    );
+    let recovered = manifest_json(&output_dir);
+    assert_eq!(
+        recovered, published_manifest,
+        "the restored feed must be the published one byte for byte, checksums included"
+    );
+    assert_eq!(
+        recovered["tiers"]["aggressive"]["sha256"],
+        serde_json::Value::String(sha256_hex(published_txt.as_bytes())),
+        "the manifest's checksum must still describe the file sitting at the public path"
+    );
+}

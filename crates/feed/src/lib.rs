@@ -18,4 +18,4 @@ pub use builder::{
 };
 pub use exclusion::ExclusionEngine;
 pub use export::{export_cidr, export_csv, export_json, export_plaintext};
-pub use publisher::{PublishError, Publisher};
+pub use publisher::{PublishError, Publisher, recover_interrupted_publish};

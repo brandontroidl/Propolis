@@ -45,3 +45,35 @@
 - **SP1: core scoring layer** - domain model, PostgreSQL schema, append-only hash-chained event
   ledger, time-decayed scoring projection, eligibility/weight/recommendation gates, multi-WAN
   breadth model. 60 tests against real PostgreSQL.
+
+### Fixed
+
+- **Evidence is no longer lost when a log rotates mid-batch** - the tailer recorded a displaced
+  inode's rewind offset as the cursor's live position, which was already past whatever the
+  uncommitted batch had read from that inode. A rewind then resumed beyond those lines, so they
+  were handed out, never committed, and never re-read - contradicting `rewind_batch`'s contract of
+  putting back every read since the last commit.
+- **The published feed survives a failed or interrupted swap** - publishing moves the live
+  directory aside and then moves staging into its place. A failed second rename left the public
+  path absent with no rollback, and a crash between the two renames left it absent until some later
+  build happened to succeed. The failure case now rolls the previous build straight back, and
+  `recover_interrupted_publish` restores a parked build at daemon startup and at the head of every
+  publish.
+- **OTX indicators carry their real address family** - the pulse payload declared every indicator
+  `IPv4` while reports accept either family, so an IPv6 address was submitted mislabelled against
+  an API that validates the value against its declared type.
+- **The fleet page no longer reports what it did not measure** - the headline was chosen from the
+  combined severity of the reachability and event-age checks, so a fully probed and confirmed fleet
+  with one quiet listener read as "evidence path unconfirmed". A failed capture query rendered as
+  "no malware captures", and a failed event count as `0 events`. A failed refresh left the previous
+  reading on screen with server-computed ages that never moved again; a stalled panel now says how
+  long ago its numbers were actually measured.
+
+### Changed
+
+- **A snooze can be finished and a delist undone** - the Snoozed tab had no decision controls and
+  nothing re-surfaces a decided entry, so deferring a decision quietly meant never making one; the
+  history tabs also rendered rows with an empty CSRF token. The tab now carries Approve, Reject and
+  Return to pending. `POST /ip/{ip}/relist` undoes a delist by clearing the latch and re-deriving
+  the gates, so an address rejoins the feed on its current merit rather than because it was once
+  listed. Also `review unsnooze` and `review snoozed` on the CLI.

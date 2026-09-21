@@ -103,6 +103,10 @@ struct CaptureRow {
     rate_pct: Option<i64>,
     top_end_reason: Option<String>,
     top_end_reason_count: i64,
+    /// True when the end-reason query itself failed, so `top_end_reason` being `None` says nothing
+    /// about this sensor. Without it a row with incomplete captures renders as "nothing
+    /// incomplete" the moment that one query errors - the cell contradicting the count beside it.
+    end_reason_unavailable: bool,
     /// Pill colour for `top_end_reason`, matching this row's own completion-rate severity - the
     /// dominant reason for an alarm-level row alarms too, rather than every reason reading as the
     /// same amber regardless of how bad the rate actually is.
@@ -280,6 +284,8 @@ async fn capture_rows(db: &PgPool) -> Result<Vec<CaptureRow>, sqlx::Error> {
             rate_pct,
             top_end_reason: None,
             top_end_reason_count: 0,
+            // Set by the caller once the end-reason query has been attempted.
+            end_reason_unavailable: false,
             end_reason_sev: sev_class(state_level),
             state_level: state_level.class(),
             meter_class,
@@ -785,8 +791,15 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
     let capture_result = capture_rows(&state.db).await;
     let captures_unavailable = capture_result.is_err();
     let mut captures = degraded.soft("capture completeness", capture_result);
-    let reasons = degraded.soft("capture end reasons", top_end_reasons(&state.db).await);
+    let reason_result = top_end_reasons(&state.db).await;
+    // Carried onto every row, because `soft` turns the failure into an empty map and an empty map
+    // is indistinguishable from "this sensor has nothing incomplete". The completeness counts can
+    // succeed while this query fails, and then a row showing incomplete captures has to say the
+    // reason is unavailable rather than claim there is nothing to explain.
+    let reasons_unavailable = reason_result.is_err();
+    let reasons = degraded.soft("capture end reasons", reason_result);
     for row in &mut captures {
+        row.end_reason_unavailable = reasons_unavailable;
         // Matched on the RAW sensor name, not the display label: two raw names can share a label
         // (`catchall` and `catchall-sensor` both render as "General"), and joining on the label
         // would attach one sensor's end reason to another's rate.

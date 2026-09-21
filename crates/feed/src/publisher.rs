@@ -1,8 +1,11 @@
 //! The publisher: the last stage of a feed build. See `internal/design/05-blocklist-feed.md`'s
 //! "Publisher" and "Error handling".
 //!
-//! Two responsibilities, run in this order:
+//! Three responsibilities, run in this order:
 //!
+//! 0. Restore a feed parked by an interrupted earlier swap (see `recover_interrupted_publish`),
+//!    before anything that can reject this build. A build that fails re-validation or staging must
+//!    not leave the public path absent when a complete previous feed is sitting beside it.
 //! 1. Re-validate every entry in the snapshot against the exclusion engine. This is
 //!    defense-in-depth - `FeedBuilder::build` already applies `ExclusionEngine::is_excluded` - but
 //!    the design is explicit that a bug in the builder must not leak a reserved/allowlisted/
@@ -116,6 +119,19 @@ impl Publisher {
         exclusions: &ExclusionEngine,
         config: &FeedConfig,
     ) -> Result<(), PublishError> {
+        // FIRST, before any work that can reject this build: put back a feed that a previously
+        // interrupted swap left parked beside the public path. Recovery used to live only inside
+        // `swap_into_place`, the very last step, so every fallible stage ahead of it - the
+        // re-validation below, staging, rendering - returned with the public path still absent and
+        // the last valid feed still parked. A snapshot that fails re-validation is exactly when
+        // consumers most need the previous feed to still be there; restoring it is independent of
+        // whether this build turns out to be publishable, so it happens first.
+        //
+        // Propagated rather than logged: recovery only acts when the public path is absent AND a
+        // parked build is there to restore, and `swap_into_place` would hit the same failure a
+        // moment later, so failing here fails the same publish without first doing the build work.
+        recover_interrupted_publish(output_dir)?;
+
         revalidate(snapshot, exclusions)?;
 
         let file_name = output_dir

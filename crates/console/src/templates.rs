@@ -342,6 +342,66 @@ mod tests {
         assert!(!quiet.contains("could not be read"));
     }
 
+    /// The capture panel's third state. The completeness query can succeed while the end-reason
+    /// query fails, and the failure arrives as an empty map - exactly what a sensor with nothing
+    /// incomplete also produces. A row showing incomplete captures must not then claim there is
+    /// nothing incomplete; the two readings sit in the same row and cannot contradict each other.
+    #[test]
+    fn an_unreadable_end_reason_is_not_rendered_as_nothing_incomplete() {
+        let env = environment();
+        let tmpl = env.get_template("fleet_status_fragment.html").unwrap();
+
+        let row = |unavailable: bool| {
+            minijinja::context! {
+                sensor => "ssh", sensor_label => "SSH",
+                captures => 10, complete => 6, incomplete => 4, unlabelled => 0, truncated => 0,
+                rate_pct => 60,
+                top_end_reason => (), top_end_reason_count => 0,
+                end_reason_unavailable => unavailable,
+                end_reason_sev => "sev sev--watch",
+                state_level => "warn", meter_class => "meter-fill meter-fill--warn",
+            }
+        };
+
+        let failed = tmpl
+            .render(minijinja::context! {
+                captures => vec![row(true)],
+                degraded_panels => vec!["capture end reasons"],
+                ..fleet_base_context()
+            })
+            .unwrap();
+        assert!(
+            !failed.contains("nothing incomplete"),
+            "a row with 4 incomplete captures must not say nothing is incomplete: {failed}"
+        );
+        assert!(
+            failed.contains("reason unavailable"),
+            "the cell must say the reason could not be read: {failed}"
+        );
+
+        // The same row when the query DID run and this sensor simply has nothing to explain.
+        let clean = tmpl
+            .render(minijinja::context! {
+                captures => vec![row(false)],
+                ..fleet_base_context()
+            })
+            .unwrap();
+        assert!(clean.contains("nothing incomplete"));
+        assert!(!clean.contains("reason unavailable"));
+
+        // And a readable reason still renders as itself.
+        let named = tmpl
+            .render(minijinja::context! {
+                captures => vec![minijinja::context! {
+                    top_end_reason => "capture budget", top_end_reason_count => 4,
+                    ..row(false)
+                }],
+                ..fleet_base_context()
+            })
+            .unwrap();
+        assert!(named.contains("capture budget") && !named.contains("nothing incomplete"));
+    }
+
     /// Same distinction on the ledger: a count that failed is not a count of zero.
     #[test]
     fn an_unreadable_ledger_does_not_render_as_zero_events() {
@@ -421,6 +481,53 @@ mod tests {
         assert!(
             html.contains("has stopped "),
             "the stale banner's wording must be present in the page"
+        );
+    }
+
+    /// The half of stale detection that does not depend on an event arriving.
+    ///
+    /// A server that ACCEPTS the status poll and then never answers fires no htmx error and no
+    /// htmx timeout, because htmx's own default request timeout is 0 (no limit). Measured in a
+    /// browser against exactly that server, the fleet panel still read "Probed: just now" after
+    /// 143 seconds, with `xhr.timeout === 0` and no stale marker. Two things shipped in the page
+    /// close it, and both have to stay shipped: a bounded per-request timeout, and a watchdog
+    /// that ages the last successful refresh on the clock rather than on an event.
+    #[test]
+    fn a_polled_panel_bounds_its_request_and_ages_itself_without_waiting_for_an_event() {
+        let env = environment();
+        let html = env
+            .get_template("fleet.html")
+            .unwrap()
+            .render(minijinja::context! {
+                pending_count => 0,
+                uptime => "1m",
+                version => "0.0.0",
+                degraded => Vec::<&str>::new(),
+                ..fleet_base_context()
+            })
+            .unwrap();
+
+        assert!(
+            html.contains(r#"'{"timeout": ' + REQUEST_TIMEOUT_MS + '}'"#),
+            "every polled panel must get a bounded request timeout; htmx's own default is 0              (no limit), which is what let a hung poll go unnoticed"
+        );
+        assert!(
+            html.contains("var REQUEST_TIMEOUT_MS = 15000;"),
+            "the request timeout must be a real bound, not left unset"
+        );
+        assert!(
+            html.contains("setInterval(") && html.contains("staleAfterMs(el)"),
+            "the page must age a live panel on a timer, independently of any request completing"
+        );
+        assert!(
+            html.contains("no refresh has come back"),
+            "the watchdog must be able to raise the stale banner on its own"
+        );
+        // The bound has to be shorter than the poll interval it guards, or a hung request is
+        // still in flight when the next poll is due and nothing is ever abandoned.
+        assert!(
+            html.contains(r#"hx-trigger="every 30s""#),
+            "the fleet panel's poll interval is what the 15s bound is sized against"
         );
     }
 }

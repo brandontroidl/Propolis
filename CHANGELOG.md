@@ -93,7 +93,8 @@
   path absent with no rollback, and a crash between the two renames left it absent until some later
   build happened to succeed. The failure case now rolls the previous build straight back, and
   `recover_interrupted_publish` restores a parked build at daemon startup and at the head of every
-  publish.
+  publish - before the new snapshot is re-validated or staged, so a build that is rejected or
+  cannot stage costs that build and not the availability of the feed already published.
 - **OTX indicators carry their real address family** - the pulse payload declared every indicator
   `IPv4` while reports accept either family, so an IPv6 address was submitted mislabelled against
   an API that validates the value against its declared type.
@@ -109,7 +110,11 @@
   with one quiet listener read as "evidence path unconfirmed". A failed capture query rendered as
   "no malware captures", and a failed event count as `0 events`. A failed refresh left the previous
   reading on screen with server-computed ages that never moved again; a stalled panel now says how
-  long ago its numbers were actually measured.
+  long ago its numbers were actually measured. A poll that is accepted and then never answered
+  raises no error event at all, and HTMX's default request timeout is unlimited, so the panel is
+  bounded by a real request timeout AND aged on its own clock rather than waiting for an event that
+  may never come. A failed end-reason query no longer renders as "nothing incomplete" beside a row
+  that is counting incomplete captures.
 
 ### Changed
 

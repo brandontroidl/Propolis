@@ -105,7 +105,10 @@
           <td class="count">{{ c.captures }}</td>
           <td class="count">{{ c.incomplete }}</td>
           <td class="count">{{ c.truncated }}</td>
-          <td>{% if c.top_end_reason %}<span class="{{ c.end_reason_sev }}">{{ c.top_end_reason }}</span> <span class="dim">{{ c.top_end_reason_count }}</span>{% else %}<span class="faint">nothing incomplete</span>{% endif %}</td>
+          {# Three outcomes, not two: a reason, a reason that could not be read, and a genuinely
+             clean sensor. The middle one used to render as the last, so one failed query made a
+             row with incomplete captures say "nothing incomplete" next to its own count. #}
+          <td>{% if c.top_end_reason %}<span class="{{ c.end_reason_sev }}">{{ c.top_end_reason }}</span> <span class="dim">{{ c.top_end_reason_count }}</span>{% elif c.end_reason_unavailable %}<span class="faint">reason unavailable</span>{% else %}<span class="faint">nothing incomplete</span>{% endif %}</td>
         </tr>
         {% endfor %}
       </tbody>

@@ -604,3 +604,127 @@ fn startup_recovery_restores_the_last_valid_feed_without_rebuilding_it() {
         "the manifest's checksum must still describe the file sitting at the public path"
     );
 }
+
+/// Recovery must not be hostage to the new build being publishable.
+///
+/// A publish interrupted between its two renames parks the last valid feed beside an absent public
+/// path. If the very next build is then REJECTED (here by re-validation, the first fallible stage),
+/// the parked feed used to stay parked, because recovery only ran inside the final swap that a
+/// rejected build never reaches. Consumers kept getting "not found" for a build they never should
+/// have been affected by. Recovery now runs at the head of `publish`, so the rejection costs the
+/// new build and nothing else.
+#[test]
+fn a_rejected_build_still_restores_a_feed_parked_by_an_interrupted_publish() {
+    let config = FeedConfig::default();
+    let build_time_v1 = dt("2026-07-29T14:00:00Z");
+    let snapshot_v1 = FeedSnapshot {
+        build_time: build_time_v1,
+        aggressive: vec![entry(
+            ip("45.10.30.7"),
+            FeedTier::Aggressive,
+            build_time_v1,
+            &config,
+        )],
+        standard: Vec::new(),
+        windows: Vec::new(),
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let output_dir = tmp.path().join("current");
+    Publisher::publish(&snapshot_v1, &output_dir, &permissive(), &config).unwrap();
+    let published_manifest = manifest_json(&output_dir);
+    let published_txt = std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap();
+
+    // Crash simulation: the swap's first rename landed, its second never did.
+    let parked = tmp.path().join(".current.previous");
+    std::fs::rename(&output_dir, &parked).unwrap();
+    assert!(
+        !output_dir.exists(),
+        "precondition: the feed path is absent"
+    );
+
+    // The next build carries a reserved address the publisher must reject outright.
+    let build_time_v2 = dt("2026-07-29T15:00:00Z");
+    let snapshot_v2 = FeedSnapshot {
+        build_time: build_time_v2,
+        aggressive: vec![entry(
+            ip("10.0.0.1"),
+            FeedTier::Aggressive,
+            build_time_v2,
+            &config,
+        )],
+        standard: Vec::new(),
+        windows: Vec::new(),
+    };
+    let err = Publisher::publish(&snapshot_v2, &output_dir, &permissive(), &config)
+        .expect_err("a reserved address must still reject the whole build");
+    assert!(
+        matches!(err, PublishError::ExclusionViolation { ip, .. } if ip == self::ip("10.0.0.1")),
+        "the rejection must still be reported as it was, got: {err}"
+    );
+
+    // ...and the feed that was already valid is back at the public path, untouched by the build
+    // that failed.
+    assert!(
+        output_dir.exists(),
+        "a rejected build must not leave the public path absent while a valid feed sits parked"
+    );
+    assert_eq!(
+        std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap(),
+        published_txt,
+        "the restored feed must be the last valid one, unchanged"
+    );
+    assert_eq!(
+        manifest_json(&output_dir),
+        published_manifest,
+        "the restored manifest must still describe the restored files"
+    );
+    assert!(
+        !parked.exists(),
+        "the parked copy must be consumed by the recovery, not left behind"
+    );
+}
+
+/// The same window, entered through a staging failure rather than a re-validation one: everything
+/// between recovery and the final swap is fallible, so recovery must not depend on reaching it.
+#[test]
+fn a_build_that_cannot_stage_still_restores_a_parked_feed() {
+    let config = FeedConfig::default();
+    let build_time = dt("2026-07-29T14:00:00Z");
+    let snapshot = FeedSnapshot {
+        build_time,
+        aggressive: vec![entry(
+            ip("45.10.30.7"),
+            FeedTier::Aggressive,
+            build_time,
+            &config,
+        )],
+        standard: Vec::new(),
+        windows: Vec::new(),
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let output_dir = tmp.path().join("current");
+    Publisher::publish(&snapshot, &output_dir, &permissive(), &config).unwrap();
+    let published_txt = std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap();
+
+    let parked = tmp.path().join(".current.previous");
+    std::fs::rename(&output_dir, &parked).unwrap();
+
+    // A plain FILE sitting where the staging directory goes: `create_staging_dir` clears a
+    // leftover before starting, and clearing this one fails. The publish therefore aborts after
+    // re-validation has passed and long before anything is swapped into place.
+    std::fs::write(tmp.path().join(".current.staging"), b"not a directory").unwrap();
+
+    let result = Publisher::publish(&snapshot, &output_dir, &permissive(), &config);
+    assert!(
+        matches!(result, Err(PublishError::StagingUnwritable { .. })),
+        "the staging failure must still be reported, got: {result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap(),
+        published_txt,
+        "the last valid feed must have been restored before staging was attempted"
+    );
+    assert!(!parked.exists(), "the parked copy must have been consumed");
+}

@@ -91,6 +91,11 @@ Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = u
 - **Ignored: exactly 1** - `crates/console/src/rdns.rs:190`, a live reverse-lookup
   test `#[ignore]`d so the default suite stays offline-deterministic. Run it
   manually: `cargo test -p console -- --ignored rdns` (`rdns.rs:186-191`).
+- **Outside the suite entirely: one browser fixture.** The console's stale-poll
+  handling has to be checked in a real browser against a real hung socket - the
+  suite can only check that the guarding code ships. Run by hand when the console's
+  polled panels or the vendored HTMX change; see
+  [browser-fixtures](browser-fixtures.md).
 
 > The prior memory index cited "~946 tests"; the current attribute count is 1165.
 > These counts are static attribute counts, not a live `cargo test --list` run.

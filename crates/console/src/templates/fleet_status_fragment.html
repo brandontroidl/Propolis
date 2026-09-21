@@ -129,7 +129,16 @@
     <div class="panel-body">
       <p><span class="label">Events</span> {% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}<span class="mono">{{ ledger.events }}</span>{% endif %}</p>
       <p><span class="label">Newest ingest</span> <span class="{{ ledger.dot }}" aria-hidden="true"></span> <span class="mono">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% elif ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></p>
-      <p class="dim">The chain verdict is not stored yet. <a href="/integrity">Run a verification</a> to see it.</p>
+      {# No verdict is shown here because none is retained anywhere: `/integrity/verify` reports its
+         result in that one response and nothing persists it, so a verification cannot populate this
+         panel. The previous wording ("not stored yet ... run a verification to see it") invited
+         exactly that expectation, and an operator who ran one came back to find the same sentence.
+         Storing a verdict is a schema change, deliberately not made here.
+
+         The daemon's ops-alert condition #7 does verify on an interval, but it is opt-in
+         (`PROPOLIS_OPS_ENABLED` defaults to false) and caches its verdict in its own process, so
+         this panel cannot claim that either without asserting something it never measured. #}
+      <p class="dim">Chain verification runs on the <a href="/integrity">integrity page</a> and its result is shown there. No verdict is retained, so none can be shown here.</p>
     </div>
   </div>
 

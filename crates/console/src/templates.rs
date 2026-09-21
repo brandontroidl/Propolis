@@ -484,6 +484,36 @@ mod tests {
         );
     }
 
+    /// The evidence-chain panel must not offer a verdict it has no way to show.
+    ///
+    /// It used to read "The chain verdict is not stored yet. Run a verification to see it." Both
+    /// halves misled: "yet" implied a verdict was on its way, and "to see it" pointed the reader
+    /// at an action that cannot change this panel. `/integrity/verify` renders its result into
+    /// that one response and nothing persists it, so an operator who followed the instruction came
+    /// back to the identical sentence. Wording only - there is still no verdict to show.
+    #[test]
+    fn the_evidence_chain_panel_does_not_promise_a_verdict_it_cannot_show() {
+        let env = environment();
+        let html = env
+            .get_template("fleet_status_fragment.html")
+            .unwrap()
+            .render(fleet_base_context())
+            .unwrap();
+
+        assert!(
+            !html.contains("not stored yet"),
+            "nothing is going to store a verdict, so the panel must not say \"yet\": {html}"
+        );
+        assert!(
+            html.contains("No verdict is retained"),
+            "the panel must say plainly that no verdict is kept: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/integrity""#),
+            "the way to actually verify the chain must still be one click away: {html}"
+        );
+    }
+
     /// The half of stale detection that does not depend on an event arriving.
     ///
     /// A server that ACCEPTS the status poll and then never answers fires no htmx error and no

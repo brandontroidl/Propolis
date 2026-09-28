@@ -482,9 +482,10 @@ async fn delist(
         return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
     }
 
+    let mut tx = state.db.begin().await?;
     sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
         .bind(ip.to_string())
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
 
     sqlx::query(
@@ -492,8 +493,9 @@ async fn delist(
          recommended_for_blocklist = FALSE WHERE source_ip = $1::inet",
     )
     .bind(ip.to_string())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     tracing::info!(%ip, "ip delisted from feed and queue");
     Ok(Redirect::to(&format!("/ip/{ip}")).into_response())
@@ -524,9 +526,10 @@ async fn relist(
         return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
     }
 
+    let mut tx = state.db.begin().await?;
     let cleared = sqlx::query("UPDATE ip_score SET delisted = FALSE WHERE source_ip = $1::inet")
         .bind(ip.to_string())
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     if cleared.rows_affected() == 0 {
         return Err(AppError::missing_projection(ip));
@@ -535,7 +538,7 @@ async fn relist(
     // Read the projection back with the latch cleared: `read_score` re-derives every gate from the
     // stored row through the same `core_scoring` rules the append path uses, so this cannot drift
     // from what an ordinary event would have computed.
-    let Some(score) = read_score(&state.db, ip).await? else {
+    let Some(score) = read_score(&mut *tx, ip).await? else {
         return Err(AppError::missing_projection(ip));
     };
     sqlx::query(
@@ -546,8 +549,9 @@ async fn relist(
     .bind(score.recommended_for_vendor)
     .bind(score.recommended_for_blocklist)
     .bind(ip.to_string())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     tracing::info!(
         %ip,
@@ -581,18 +585,20 @@ async fn delete_ip(
     // Literal statements (sqlx requires a static SQL string, and it is the right guard here): the
     // ONLY dynamic value is the bound `$1` IP, never the table name.
     let ip_str = ip.to_string();
+    let mut tx = state.db.begin().await?;
     sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
         .bind(&ip_str)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM vendor_submission WHERE source_ip = $1::inet")
         .bind(&ip_str)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM ip_score WHERE source_ip = $1::inet")
         .bind(&ip_str)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     tracing::info!(%ip, "ip purged from scoring/review/vendor state (event ledger retained)");
     // The ip_score row is gone, so /ip/{ip} would 404 - send the operator back to the queue.

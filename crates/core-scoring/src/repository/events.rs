@@ -391,8 +391,11 @@ pub async fn append_telemetry_event(pool: &PgPool, event: EventInput) -> Result<
 ///
 /// PURE read: the projected value is NEVER written back - the stored row stays un-projected so a
 /// later append reads its raw score un-decayed (double-decay guard).
-pub async fn read_score(pool: &PgPool, ip: IpAddr) -> Result<Option<IpScore>, RepoError> {
-    let Some(stored) = read_stored_ip_score(pool, ip).await? else {
+pub async fn read_score<'e, E>(exec: E, ip: IpAddr) -> Result<Option<IpScore>, RepoError>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    let Some(stored) = read_stored_ip_score(exec, ip).await? else {
         return Ok(None);
     };
     Ok(Some(project_to_now(stored, Utc::now(), HALF_LIFE_SECONDS)))

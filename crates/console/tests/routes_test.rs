@@ -1064,6 +1064,71 @@ async fn delete_purges_scoring_state_but_keeps_the_event_ledger(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn delete_rolls_back_all_derived_state_when_the_final_delete_fails(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.41", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO vendor_submission \
+         (source_ip, vendor, idempotency_key, categories, comment) \
+         VALUES ($1::inet, 'test', 'delete-rollback-test', ARRAY['x'], 'test')",
+    )
+    .bind("203.0.113.41")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION reject_ip_score_delete() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected delete failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_ip_score_delete BEFORE DELETE ON ip_score \
+         FOR EACH ROW EXECUTE FUNCTION reject_ip_score_delete()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let response = test_app(state)
+        .oneshot(form_request(
+            "/ip/203.0.113.41/delete",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    for (table, sql) in [
+        (
+            "ip_score",
+            "SELECT COUNT(*) FROM ip_score WHERE source_ip = $1::inet",
+        ),
+        (
+            "review_queue",
+            "SELECT COUNT(*) FROM review_queue WHERE source_ip = $1::inet",
+        ),
+        (
+            "vendor_submission",
+            "SELECT COUNT(*) FROM vendor_submission WHERE source_ip = $1::inet",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind("203.0.113.41")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "{table} must survive the rolled-back purge");
+    }
+}
+
+#[sqlx::test(migrations = false)]
 async fn reject_changes_state(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.31", 60).await;
@@ -1329,6 +1394,108 @@ async fn relist_clears_the_latch_and_rederives_the_gates(pool: PgPool) {
     assert!(
         row.get::<bool, _>("recommended_for_vendor"),
         "the recommendation delist cleared must be re-derived, not left false"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn delist_rolls_back_queue_removal_when_projection_update_fails(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.210", 60).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE FUNCTION reject_delist_update() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected delist failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_delist_update BEFORE UPDATE ON ip_score \
+         FOR EACH ROW WHEN (NEW.delisted) EXECUTE FUNCTION reject_delist_update()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let response = test_app(state)
+        .oneshot(form_request(
+            "/ip/203.0.113.210/delist",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM review_queue WHERE source_ip = $1::inet")
+            .bind("203.0.113.210")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let delisted: bool =
+        sqlx::query_scalar("SELECT delisted FROM ip_score WHERE source_ip = $1::inet")
+            .bind("203.0.113.210")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, 1, "queue removal must roll back with the update");
+    assert!(!delisted, "the projection must retain its original latch");
+}
+
+#[sqlx::test(migrations = false)]
+async fn relist_rolls_back_latch_clear_when_gate_update_fails(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.211", 60).await;
+    sqlx::query(
+        "UPDATE ip_score SET delisted = TRUE, eligible = FALSE, \
+         recommended_for_vendor = FALSE, recommended_for_blocklist = FALSE \
+         WHERE source_ip = $1::inet",
+    )
+    .bind("203.0.113.211")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION reject_relist_gate_update() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected relist failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_relist_gate_update BEFORE UPDATE ON ip_score \
+         FOR EACH ROW WHEN (NEW.eligible) EXECUTE FUNCTION reject_relist_gate_update()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let response = test_app(state)
+        .oneshot(form_request(
+            "/ip/203.0.113.211/relist",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let row = sqlx::query("SELECT delisted, eligible FROM ip_score WHERE source_ip = $1::inet")
+        .bind("203.0.113.211")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(row.get::<bool, _>("delisted"), "latch clear must roll back");
+    assert!(
+        !row.get::<bool, _>("eligible"),
+        "gates must remain unchanged"
     );
 }
 

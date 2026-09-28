@@ -106,7 +106,7 @@ modes - the `0600` env files and per-sensor `0750` spool dirs are load-bearing.
 
 ```
 # Example. Run as root to preserve per-service ownership.
-tar --numeric-owner -czf propolis-state-$(date +%F).tgz \
+tar -czf propolis-state-$(date +%F).tgz \
   /etc/propolis \
   /var/spool/propolis \
   /var/lib/propolis/ssh
@@ -117,6 +117,14 @@ Name each tree once. `tar` recurses into every directory it is given, and
 quarantine, so listing a subdirectory beside its parent stores every file under
 it twice. `crates/propolis/tests/docs_agreement.rs` fails the build if a `tar`
 command in the docs names a path inside another one it also names.
+
+Do not add `--numeric-owner`. Without it the archive records each file's owner by
+user and group name as well as number, and a root extraction maps the names onto
+the target host's accounts. `deploy/provision.sh` creates the service users with
+`useradd --system`, which assigns their UIDs dynamically, so the same user can have
+a different number on a rebuilt host; an archive holding only numbers would hand
+each restored file to whichever local account holds the old number, possibly a
+different service.
 
 Store the config/secrets archive encrypted and separately from the data archive
 if you can, so a data-restore workflow never needs to touch the secret material.
@@ -160,9 +168,12 @@ if you can, so a data-restore workflow never needs to touch the secret material.
    [upgrade, rollback and DR](upgrade-rollback-and-dr.md)), restore into a schema
    the current binary can migrate forward - restoring an older dump and starting
    a newer binary is the supported direction.
-4. **Restore spool and host key.** Unpack the state archive, preserving owners
-   and modes. The SSH host key under `/var/lib/propolis/ssh` restores the prior
-   fingerprint; omit it only if you intend a fresh identity.
+4. **Restore spool and host key.** On a rebuilt host, run `deploy/provision.sh`
+   first so the service users exist, then unpack the state archive as root, which
+   keeps modes and maps each file's recorded owner name onto the local account
+   (`tar -xpzf propolis-state-<date>.tgz -C /`). The SSH host key under
+   `/var/lib/propolis/ssh` restores the prior fingerprint; omit it only if you
+   intend a fresh identity.
 5. **Start the platform** and verify. On startup the daemon connects, runs
    migrations, and spawns subsystems; confirm liveness/readiness per
    [health and observability](health-and-observability.md) and confirm the feed
@@ -248,8 +259,9 @@ events; and the documented archive carries every sample body the database
 references, unaltered.
 
 What it does not prove: physical base backups, WAL archiving or point-in-time
-recovery; file ownership after extraction (it runs unprivileged, so extracting as
-root onto a host whose service users have different UIDs is untested); restoring
+recovery; file ownership after extraction (it runs unprivileged, so the root-only
+mapping of recorded owner names onto a host whose service users have different
+UIDs is GNU tar's behaviour as documented, not exercised here); restoring
 across PostgreSQL major versions; a dump taken while the daemon is writing; volumes
 beyond a few hundred rows; or recovery of `/etc/propolis` and the SSH host key,
 which placeholders stand in for.

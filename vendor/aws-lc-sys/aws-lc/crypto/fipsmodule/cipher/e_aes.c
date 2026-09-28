@@ -424,7 +424,9 @@ static int aes_gcm_ctrl(EVP_CIPHER_CTX *c, int type, int arg, void *ptr) {
       return 1;
 
     case EVP_CTRL_GCM_IV_GEN: {
-      if (gctx->iv_gen == 0 || gctx->key_set == 0) {
+      // The invocation field is the trailing 8 bytes of the IV, so ivlen < 8
+      // would underflow when computing the counter pointer below.
+      if (gctx->iv_gen == 0 || gctx->key_set == 0 || gctx->ivlen < 8) {
         return 0;
       }
       CRYPTO_gcm128_setiv(&gctx->gcm, &gctx->ks.ks, gctx->iv, gctx->ivlen);
@@ -432,8 +434,6 @@ static int aes_gcm_ctrl(EVP_CIPHER_CTX *c, int type, int arg, void *ptr) {
         arg = gctx->ivlen;
       }
       OPENSSL_memcpy(ptr, gctx->iv + gctx->ivlen - arg, arg);
-      // Invocation field will be at least 8 bytes in size, so no need to check
-      // wrap around or increment more than last 8 bytes.
       uint8_t *ctr = gctx->iv + gctx->ivlen - 8;
       CRYPTO_store_u64_be(ctr, CRYPTO_load_u64_be(ctr) + 1);
       gctx->iv_set = 1;
@@ -1209,6 +1209,7 @@ DEFINE_METHOD_FUNCTION(EVP_AEAD, EVP_aead_aes_128_gcm) {
   out->cleanup = aead_aes_gcm_cleanup;
   out->seal_scatter = aead_aes_gcm_seal_scatter;
   out->open_gather = aead_aes_gcm_open_gather;
+  out->copy = aead_ctx_copy_state_trivial;
 }
 
 DEFINE_METHOD_FUNCTION(EVP_AEAD, EVP_aead_aes_192_gcm) {
@@ -1225,6 +1226,7 @@ DEFINE_METHOD_FUNCTION(EVP_AEAD, EVP_aead_aes_192_gcm) {
   out->cleanup = aead_aes_gcm_cleanup;
   out->seal_scatter = aead_aes_gcm_seal_scatter;
   out->open_gather = aead_aes_gcm_open_gather;
+  out->copy = aead_ctx_copy_state_trivial;
 }
 
 DEFINE_METHOD_FUNCTION(EVP_AEAD, EVP_aead_aes_256_gcm) {
@@ -1241,6 +1243,7 @@ DEFINE_METHOD_FUNCTION(EVP_AEAD, EVP_aead_aes_256_gcm) {
   out->cleanup = aead_aes_gcm_cleanup;
   out->seal_scatter = aead_aes_gcm_seal_scatter;
   out->open_gather = aead_aes_gcm_open_gather;
+  out->copy = aead_ctx_copy_state_trivial;
 }
 
 static int aead_aes_gcm_init_randnonce(EVP_AEAD_CTX *ctx, const uint8_t *key,
@@ -1345,6 +1348,7 @@ DEFINE_METHOD_FUNCTION(EVP_AEAD, EVP_aead_aes_128_gcm_randnonce) {
   out->cleanup = aead_aes_gcm_cleanup;
   out->seal_scatter = aead_aes_gcm_seal_scatter_randnonce;
   out->open_gather = aead_aes_gcm_open_gather_randnonce;
+  out->copy = aead_ctx_copy_state_trivial;
 }
 
 DEFINE_METHOD_FUNCTION(EVP_AEAD, EVP_aead_aes_256_gcm_randnonce) {
@@ -1361,6 +1365,7 @@ DEFINE_METHOD_FUNCTION(EVP_AEAD, EVP_aead_aes_256_gcm_randnonce) {
   out->cleanup = aead_aes_gcm_cleanup;
   out->seal_scatter = aead_aes_gcm_seal_scatter_randnonce;
   out->open_gather = aead_aes_gcm_open_gather_randnonce;
+  out->copy = aead_ctx_copy_state_trivial;
 }
 
 struct aead_aes_gcm_tls12_ctx {

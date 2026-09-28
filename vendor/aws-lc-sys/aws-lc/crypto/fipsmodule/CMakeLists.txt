@@ -117,6 +117,26 @@ if(ARCH STREQUAL "ppc64le")
   )
 endif()
 
+# Under OPENSSL_SMALL, the P-256 nistz implementation (p256-nistz.c) is
+# compiled out entirely -- ec.c dispatches P-256 to the fiat-crypto
+# implementation (p256.c) instead -- leaving the nistz assembly fully
+# unreferenced on both x86_64 and aarch64. Drop it from the build. (The
+# large precomputed base-point table is in p256-nistz-table.h, included
+# from C code that is already gated, not in the assembly.)
+if(OPENSSL_SMALL)
+  if(ARCH STREQUAL "x86_64")
+    list(REMOVE_ITEM BCM_ASM_SOURCES
+      p256-x86_64-asm.${ASM_EXT}
+      p256_beeu-x86_64-asm.${ASM_EXT}
+    )
+  elseif(ARCH STREQUAL "aarch64")
+    list(REMOVE_ITEM BCM_ASM_SOURCES
+      p256-armv8-asm.${ASM_EXT}
+      p256_beeu-armv8-asm.${ASM_EXT}
+    )
+  endif()
+endif()
+
 if(PERL_EXECUTABLE)
   perlasm(aesni-gcm-x86_64.${ASM_EXT} modes/asm/aesni-gcm-x86_64.pl)
   perlasm(aesni-gcm-avx512.${ASM_EXT} modes/asm/aesni-gcm-avx512.pl)
@@ -189,7 +209,11 @@ if (CLANG AND (CMAKE_ASM_COMPILER_ID MATCHES "Clang" OR CMAKE_ASM_COMPILER MATCH
 endif()
 
 # s2n-bignum files can be compiled on Unix platforms for x86_64 and arm64 only.
-if((((ARCH STREQUAL "x86_64") AND NOT MY_ASSEMBLER_IS_TOO_OLD_FOR_512AVX) OR
+# x86_64 s2n-bignum needs BMI2/ADX, not AVX-512, so it is gated on
+# MY_ASSEMBLER_IS_TOO_OLD_FOR_ADX_AVX2 rather than
+# MY_ASSEMBLER_IS_TOO_OLD_FOR_512AVX. OPENSSL_SMALL implies only the latter,
+# so s2n-bignum stays available under OPENSSL_SMALL on x86_64 (#3355).
+if((((ARCH STREQUAL "x86_64") AND NOT MY_ASSEMBLER_IS_TOO_OLD_FOR_ADX_AVX2) OR
       ARCH STREQUAL "aarch64") AND UNIX)
 
   # Set the source directory for s2n-bignum assembly files
@@ -326,25 +350,18 @@ if((((ARCH STREQUAL "x86_64") AND NOT MY_ASSEMBLER_IS_TOO_OLD_FOR_512AVX) OR
     endif()
   endif()
 
-  # Under OPENSSL_SMALL on aarch64, drop the s2n-bignum code that becomes
-  # unreachable:
+  # Under OPENSSL_SMALL, drop the s2n-bignum code that becomes unreachable:
   #
-  # - All EC (P-256/P-384/P-521) files, both non-_alt and _alt variants and
-  #   their helpers: the EC implementations that call them (p256-nistz.c,
-  #   p384.c, p521.c) are compiled out entirely under OPENSSL_SMALL. ec.c
-  #   dispatches P-256 to the fiat-crypto implementation (p256.c) and
-  #   P-384/P-521 to the generic Montgomery method instead.
-  # - The curve25519 _alt (wide-multiplier) variants: curve25519 is the only
-  #   remaining s2n-bignum selector user under OPENSSL_SMALL, and it is pinned
-  #   to the non-_alt variant at compile time (see
-  #   third_party/s2n-bignum/s2n-bignum_aws-lc.h).
+  # - P-256/P-384/P-521 (both arches): the callers (p256-nistz.c, p384.c,
+  #   p521.c) are compiled out entirely under OPENSSL_SMALL.
+  # - aarch64 also: the curve25519 _alt variants, since curve25519 is pinned
+  #   to the non-_alt variant there (safe on every ARMv8 CPU).
   #
-  # The fastmul/generic files (used by RSA/BN Montgomery arithmetic) and the
-  # sha3 files (used by keccak1600.c) remain reachable and are kept.
-  #
-  # On x86_64, OPENSSL_SMALL implies MY_ASSEMBLER_IS_TOO_OLD_FOR_512AVX (see
-  # #3319), which makes the enclosing condition false -- s2n-bignum is not
-  # compiled at all, so no removal is needed.
+  # Everything else stays reachable: aarch64's fastmul/generic files (BN
+  # Montgomery), x86_64's curve25519 (both variants -- the non-_alt one needs
+  # BMI2/ADX, so x86_64 keeps the runtime dispatch in s2n-bignum_aws-lc.h
+  # rather than aarch64's compile-time pin), and the sha3 files (used by
+  # keccak1600.c).
   if(OPENSSL_SMALL)
     if(ARCH STREQUAL "aarch64")
       list(REMOVE_ITEM BCM_ASM_SOURCES
@@ -388,6 +405,44 @@ if((((ARCH STREQUAL "x86_64") AND NOT MY_ASSEMBLER_IS_TOO_OLD_FOR_512AVX) OR
         ${S2N_BIGNUM_DIR}/curve25519/curve25519_x25519_byte_alt.S
         ${S2N_BIGNUM_DIR}/curve25519/curve25519_x25519base_byte_alt.S
       )
+    elseif(ARCH STREQUAL "x86_64")
+      list(REMOVE_ITEM BCM_ASM_SOURCES
+        ${S2N_BIGNUM_DIR}/p256/p256_montjscalarmul.S
+        ${S2N_BIGNUM_DIR}/p256/p256_montjscalarmul_alt.S
+        ${S2N_BIGNUM_DIR}/p256/bignum_montinv_p256.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_add_p384.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_sub_p384.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_neg_p384.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_tomont_p384.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_tomont_p384_alt.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_deamont_p384.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_deamont_p384_alt.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_montmul_p384.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_montmul_p384_alt.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_montsqr_p384.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_montsqr_p384_alt.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_nonzero_6.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_littleendian_6.S
+        ${S2N_BIGNUM_DIR}/p384/p384_montjdouble.S
+        ${S2N_BIGNUM_DIR}/p384/p384_montjdouble_alt.S
+        ${S2N_BIGNUM_DIR}/p384/p384_montjscalarmul.S
+        ${S2N_BIGNUM_DIR}/p384/p384_montjscalarmul_alt.S
+        ${S2N_BIGNUM_DIR}/p384/bignum_montinv_p384.S
+        ${S2N_BIGNUM_DIR}/p521/bignum_add_p521.S
+        ${S2N_BIGNUM_DIR}/p521/bignum_sub_p521.S
+        ${S2N_BIGNUM_DIR}/p521/bignum_neg_p521.S
+        ${S2N_BIGNUM_DIR}/p521/bignum_mul_p521.S
+        ${S2N_BIGNUM_DIR}/p521/bignum_mul_p521_alt.S
+        ${S2N_BIGNUM_DIR}/p521/bignum_sqr_p521.S
+        ${S2N_BIGNUM_DIR}/p521/bignum_sqr_p521_alt.S
+        ${S2N_BIGNUM_DIR}/p521/bignum_tolebytes_p521.S
+        ${S2N_BIGNUM_DIR}/p521/bignum_fromlebytes_p521.S
+        ${S2N_BIGNUM_DIR}/p521/p521_jdouble.S
+        ${S2N_BIGNUM_DIR}/p521/p521_jdouble_alt.S
+        ${S2N_BIGNUM_DIR}/p521/p521_jscalarmul.S
+        ${S2N_BIGNUM_DIR}/p521/p521_jscalarmul_alt.S
+        ${S2N_BIGNUM_DIR}/p521/bignum_inv_p521.S
+      )
     endif()
   endif()
 
@@ -406,22 +461,15 @@ endif()
 # mlkem-native assembly files can be compiled on Unix platforms for x86_64 and arm64 only.
 if((ARCH STREQUAL "aarch64") AND UNIX)
 
-  # Set the source directory for s2n-bignum assembly files
+  # Set the source directory for mlkem-native assembly files.
   set(MLKEM_NATIVE_DIR "${AWSLC_SOURCE_DIR}/crypto/fipsmodule/ml_kem")
 
-  set(MLKEM_NATIVE_AARCH64_ASM_SOURCES
-
-    ${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/intt.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/ntt.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/poly_mulcache_compute_asm.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/poly_reduce_asm.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/poly_tobytes_asm.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/poly_tomont_asm.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/polyvec_basemul_acc_montgomery_cached_asm_k2.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/polyvec_basemul_acc_montgomery_cached_asm_k3.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/polyvec_basemul_acc_montgomery_cached_asm_k4.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/rej_uniform_asm.S
-  )
+  # Every .S file in this directory is imported by importer.sh and must be
+  # compiled; glob so that refreshes which add/remove/rename files don't need a
+  # matching edit here. CONFIGURE_DEPENDS makes CMake re-run when the set of
+  # matching files changes.
+  file(GLOB MLKEM_NATIVE_AARCH64_ASM_SOURCES CONFIGURE_DEPENDS
+    "${MLKEM_NATIVE_DIR}/mlkem/native/aarch64/src/*.S")
 
   list(APPEND BCM_ASM_SOURCES ${MLKEM_NATIVE_AARCH64_ASM_SOURCES})
 
@@ -429,32 +477,15 @@ endif()
 
 if((ARCH STREQUAL "x86_64") AND UNIX AND NOT MY_ASSEMBLER_IS_TOO_OLD_FOR_AVX)
 
-  # Set the source directory for s2n-bignum assembly files
+  # Set the source directory for mlkem-native assembly files.
   set(MLKEM_NATIVE_DIR "${AWSLC_SOURCE_DIR}/crypto/fipsmodule/ml_kem")
 
-  set(MLKEM_NATIVE_X86_64_ASM_SOURCES
-
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/intt.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/ntt.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/mulcache_compute.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/nttfrombytes.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/ntttobytes.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/nttunpack.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/reduce.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/tomont.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/polyvec_basemul_acc_montgomery_cached_asm_k2.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/polyvec_basemul_acc_montgomery_cached_asm_k3.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/polyvec_basemul_acc_montgomery_cached_asm_k4.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/rej_uniform_asm.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/poly_compress_d10.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/poly_compress_d11.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/poly_compress_d4.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/poly_compress_d5.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/poly_decompress_d10.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/poly_decompress_d11.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/poly_decompress_d4.S
-    ${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/poly_decompress_d5.S
-  )
+  # Every .S file in this directory is imported by importer.sh and must be
+  # compiled; glob so that refreshes which add/remove/rename files don't need a
+  # matching edit here. CONFIGURE_DEPENDS makes CMake re-run when the set of
+  # matching files changes.
+  file(GLOB MLKEM_NATIVE_X86_64_ASM_SOURCES CONFIGURE_DEPENDS
+    "${MLKEM_NATIVE_DIR}/mlkem/native/x86_64/src/*.S")
 
   list(APPEND BCM_ASM_SOURCES ${MLKEM_NATIVE_X86_64_ASM_SOURCES})
 
@@ -469,7 +500,7 @@ if(UNIX AND ((ARCH STREQUAL "x86_64" AND NOT MY_ASSEMBLER_IS_TOO_OLD_FOR_AVX) OR
   set(MLDSA_NATIVE_DIR "${AWSLC_SOURCE_DIR}/crypto/fipsmodule/ml_dsa")
 
   # Every .S file in this directory is imported by importer.sh and must be
-  # compiled; glob so that refreshes which add/remove files don't need a
+  # compiled; glob so that refreshes which add/remove/rename files don't need a
   # matching edit here. CONFIGURE_DEPENDS makes CMake re-run when the set of
   # matching files changes.
   if(ARCH STREQUAL "x86_64")
@@ -485,7 +516,6 @@ if(UNIX AND ((ARCH STREQUAL "x86_64" AND NOT MY_ASSEMBLER_IS_TOO_OLD_FOR_AVX) OR
   set(S2N_BIGNUM_INCLUDE_DIR "${AWSLC_SOURCE_DIR}/third_party/s2n-bignum/s2n-bignum-imported/include")
 
 endif()
-
 
 if(FIPS_DELOCATE)
   if(FIPS_SHARED)

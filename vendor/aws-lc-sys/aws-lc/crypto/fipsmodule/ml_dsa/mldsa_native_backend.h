@@ -12,7 +12,7 @@
 #if defined(OPENSSL_AARCH64)
 #include "mldsa/native/aarch64/meta.h"
 #elif defined(OPENSSL_X86_64) && !defined(MY_ASSEMBLER_IS_TOO_OLD_FOR_AVX)
-#include "mldsa_x86_64_meta.h"
+#include "mldsa/native/x86_64/meta.h"
 #endif
 
 #endif

@@ -13,7 +13,6 @@
 //! client certificate's CommonName - not by anything the collector sends per log.
 
 use std::env;
-use std::io::BufReader;
 use std::path::PathBuf;
 
 use tokio_rustls::rustls::pki_types::CertificateDer;
@@ -235,8 +234,11 @@ pub fn load_config_from_env() -> Result<Config, ConfigError> {
 }
 
 fn parse_cert_chain(pem: &[u8]) -> std::io::Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(pem);
-    rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+
+    CertificateDer::pem_slice_iter(pem)
+        .map(|cert| cert.map_err(std::io::Error::other))
+        .collect()
 }
 
 /// Validates that `collector_id` matches the CommonName of the leaf certificate in

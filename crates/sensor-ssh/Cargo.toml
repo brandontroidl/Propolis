@@ -11,7 +11,6 @@ path = "src/main.rs"
 sensor-wire = { path = "../sensor-wire" }
 sensor-framework = { path = "../sensor-framework" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time"] }
-serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 chrono = { version = "0.4.45", features = ["serde"] }
 tracing = "0.1.44"
@@ -26,5 +25,4 @@ poly1305 = "0.9.1"
 [dev-dependencies]
 tempfile = "3.27.0"
 russh = "0.62.4"
-russh-keys = "0.50.0-beta.7"
 proptest = "1.11.0"

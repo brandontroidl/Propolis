@@ -76,9 +76,10 @@ async fn start_gateway(certs: &Certs) -> SocketAddr {
 /// A client TLS config that verifies the gateway's certificate but presents no client
 /// certificate at all - the shape a misconfigured or malicious peer would use.
 fn no_client_auth_config(ca_pem: &[u8]) -> Arc<tokio_rustls::rustls::ClientConfig> {
+    use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
+
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    let mut reader = std::io::BufReader::new(ca_pem);
-    for cert in rustls_pemfile::certs(&mut reader) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem) {
         roots.add(cert.expect("parse ca cert")).expect("add root");
     }
     Arc::new(

@@ -13,10 +13,10 @@
 edition = "2021"
 rust-version = "1.71.0"
 name = "aws-lc-sys"
-version = "0.43.0"
+version = "0.45.0"
 authors = ["AWS-LC"]
 build = "builder/main.rs"
-links = "aws_lc_0_43_0"
+links = "aws_lc_0_45_0"
 include = [
     "LICENSE",
     "/aws-lc/**/*.c",
@@ -77,7 +77,7 @@ license = "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause A
 repository = "https://github.com/aws/aws-lc-rs"
 
 [package.metadata.aws-lc-sys]
-commit-hash = "683ebde4bf3bcc016a9a710ad6b49c0c91b59161"
+commit-hash = "02561621ffa4cf17c0c4f70bc11a82df36b42ae9"
 
 [features]
 all-bindings = []

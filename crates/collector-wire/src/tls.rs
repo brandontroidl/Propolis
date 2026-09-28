@@ -10,9 +10,9 @@
 //! `rustls` dependency) so the resolved rustls version cannot skew between this crate
 //! and its `tokio-rustls` transport.
 
-use std::io::BufReader;
 use std::sync::Arc;
 
+use rustls_pki_types::pem::PemObject;
 use tokio_rustls::rustls::{
     self, ClientConfig, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -22,7 +22,7 @@ use tokio_rustls::rustls::{
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
     #[error("failed to read PEM data: {0}")]
-    Pem(#[from] std::io::Error),
+    Pem(#[from] rustls_pki_types::pem::Error),
     #[error("PEM data contained no certificate")]
     NoCertificate,
     #[error("PEM data contained no private key")]
@@ -34,8 +34,7 @@ pub enum TlsError {
 }
 
 fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let mut reader = BufReader::new(pem);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    let certs = CertificateDer::pem_slice_iter(pem).collect::<Result<Vec<_>, _>>()?;
     if certs.is_empty() {
         return Err(TlsError::NoCertificate);
     }
@@ -43,8 +42,10 @@ fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> {
 }
 
 fn parse_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let mut reader = BufReader::new(pem);
-    rustls_pemfile::private_key(&mut reader)?.ok_or(TlsError::NoPrivateKey)
+    PrivateKeyDer::pem_slice_iter(pem)
+        .next()
+        .transpose()?
+        .ok_or(TlsError::NoPrivateKey)
 }
 
 fn root_store(ca_pem: &[u8]) -> Result<RootCertStore, TlsError> {

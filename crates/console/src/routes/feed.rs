@@ -378,6 +378,7 @@ fn is_known_feed_name(name: &str) -> bool {
 
 fn download_not_found() -> Response {
     const BODY: &str = "<!doctype html><meta charset=\"utf-8\"><title>Not found</title>\
-        <p style=\"font-family:sans-serif;padding:2rem\">No feed file available for that tier/format.</p>";
+        <link rel=\"stylesheet\" href=\"/assets/console.css\">\
+        <p class=\"message-page\">No feed file available for that tier/format.</p>";
     (StatusCode::NOT_FOUND, Html(BODY)).into_response()
 }

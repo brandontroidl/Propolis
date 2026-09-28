@@ -213,6 +213,82 @@ mod tests {
         }
     }
 
+    /// A confirmed action used to confirm through an inline onclick, active as soon as the button
+    /// was parsed. Its replacement lives in console.js at the end of the page, so until that script
+    /// runs a click would submit without asking. Every confirmed button therefore renders disabled,
+    /// and console.js enables it once the confirmation handler exists.
+    #[test]
+    fn every_confirmed_action_renders_disabled_until_its_script_arms_it() {
+        let mut confirmed = 0;
+        for (name, src) in template_sources() {
+            for (at, _) in src.match_indices("data-confirm=") {
+                let tag_start = src[..at].rfind('<').unwrap();
+                let tag = &src[tag_start..at];
+                confirmed += 1;
+                assert!(
+                    tag.contains(" disabled"),
+                    "{name}: a data-confirm element must render disabled: `{tag}`"
+                );
+            }
+        }
+        assert!(confirmed >= 3, "found only {confirmed} confirmed actions");
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/assets/console.js"),
+        )
+        .unwrap();
+        assert!(
+            script.contains("querySelectorAll('[data-confirm][disabled]')")
+                && script.contains("disabled = false"),
+            "console.js must enable the confirmed buttons it guards"
+        );
+    }
+
+    /// The policy applies to every response, including the few bodies Rust builds without a
+    /// template (the 503 page and two not-found pages). Those escaped the template scan above and
+    /// kept an inline style the policy then blocked. Scans the non-test, non-comment lines of
+    /// every source file for the same three things.
+    #[test]
+    fn no_rust_built_page_carries_inline_script_style_or_handlers() {
+        let mut dirs = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut scanned = 0;
+        while let Some(dir) = dirs.pop() {
+            for path in std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()) {
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                scanned += 1;
+                let source = std::fs::read_to_string(&path).unwrap();
+                let code = source.split("#[cfg(test)]").next().unwrap();
+                for (n, line) in code.lines().enumerate() {
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let at = format!("{}:{}", path.display(), n + 1);
+                    assert!(!line.contains("style="), "{at}: inline style attribute");
+                    assert!(!line.contains("<style"), "{at}: inline <style> block");
+                    assert!(
+                        !line.contains("<script"),
+                        "{at}: script element built in Rust"
+                    );
+                    let bytes = line.as_bytes();
+                    for (i, _) in line.match_indices(" on") {
+                        let rest = &bytes[i + 3..];
+                        let letters = rest.iter().take_while(|b| b.is_ascii_lowercase()).count();
+                        assert!(
+                            letters == 0 || rest.get(letters) != Some(&b'='),
+                            "{at}: event-handler attribute"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(scanned >= 20, "scanned only {scanned} source files");
+    }
+
     #[test]
     fn every_referenced_asset_is_served() {
         for (name, src) in template_sources() {

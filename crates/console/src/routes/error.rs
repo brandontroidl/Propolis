@@ -10,7 +10,8 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 
 const GENERIC_BODY: &str = "<!doctype html><meta charset=\"utf-8\"><title>Service unavailable</title>\
-<p style=\"font-family:sans-serif;padding:2rem\">Service unavailable. Please try again shortly.</p>";
+<link rel=\"stylesheet\" href=\"/assets/console.css\">\
+<p class=\"message-page\">Service unavailable. Please try again shortly.</p>";
 
 /// A page-load failure, always rendered as a generic 503 - see the module doc comment.
 #[derive(Debug)]

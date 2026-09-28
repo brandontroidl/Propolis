@@ -9,9 +9,9 @@
    keyboard), red (live intrusion) - and green means handled. Colour is
    meaning here, never decoration: a grey row is a fine row.
 
-   Token NAMES are kept stable (inline styles in several templates read
-   --good / --alert-text / etc.); this file re-values them and adds the
-   severity ramp + elevation on top.
+   Token NAMES are kept stable (the utility classes that replaced the
+   templates' inline styles read --good / --alert-text / etc.); this file
+   re-values them and adds the severity ramp + elevation on top.
    ============================================================================ */
 /* Self-hosted fonts (no third-party font request from the deployed box). Served from the public
    /assets/fonts route as Latin-subset woff2; Hanken carries a full weight axis in one file. */
@@ -30,7 +30,7 @@
    - Cream (light), 1337 |-|4><0R (green phosphor) override via [data-theme].
    - System follows the OS: light by default, Graphite under a dark OS.
 
-   Token NAMES are held stable - inline styles in several templates read
+   Token NAMES are held stable - the utility classes read
    --good / --alert-text / --attention etc. - and re-valued onto V12's palette
    (V12 --accent->accent/attention, --crit->alert, --warn->high, --ok->good).
    ============================================================================ */
@@ -785,3 +785,7 @@ button:hover { border-color: var(--text-muted); }
 .h-24 { height: 24px; }
 .h-25 { height: 25px; }
 .h-26 { height: 26px; }
+
+/* The bare pages Rust builds without a template (routes::error's 503, the feed and IP
+   not-found bodies): one line of text on the default theme. */
+.message-page { padding: 2rem; }

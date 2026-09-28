@@ -1242,7 +1242,8 @@ fn group_into_sessions(
 fn not_found_body(ip: IpAddr) -> Html<String> {
     Html(format!(
         "<!doctype html><meta charset=\"utf-8\"><title>IP not found</title>\
-         <p style=\"font-family:sans-serif;padding:2rem\">No score projection found for {ip}. \
+         <link rel=\"stylesheet\" href=\"/assets/console.css\">\
+         <p class=\"message-page\">No score projection found for {ip}. \
          It may not have been scored yet, or the IP was mistyped.</p>"
     ))
 }

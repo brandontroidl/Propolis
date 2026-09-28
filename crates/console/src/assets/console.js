@@ -130,5 +130,16 @@
       window.history.back();
     }
   });
+
+  // A button that asks for confirmation renders disabled and is enabled only here, once the
+  // listener above exists: before that a click would submit without asking, and a delete cannot be
+  // undone from the UI. If this script never loads, the buttons stay disabled. Content swapped in
+  // later (the evidence drawer) is armed as htmx loads it.
+  function armConfirmations(root) {
+    var buttons = root.querySelectorAll ? root.querySelectorAll('[data-confirm][disabled]') : [];
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = false;
+  }
+  armConfirmations(document);
+  document.body.addEventListener('htmx:load', function (e) { armConfirmations(e.target); });
 })();
 

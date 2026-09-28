@@ -89,9 +89,13 @@ Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = u
 - **Total: 1165 test functions** (681 unit + 484 integration).
 - **DB-backed (`sqlx::test`): 116** - console 87, core-scoring 23, intake 3,
   propolis 2, feed 1. These provision a fresh database per test.
-- **Ignored: exactly 1** - `crates/console/src/rdns.rs:190`, a live reverse-lookup
+- **Ignored: exactly 2.** `crates/console/src/rdns.rs:190`, a live reverse-lookup
   test `#[ignore]`d so the default suite stays offline-deterministic. Run it
-  manually: `cargo test -p console -- --ignored rdns` (`rdns.rs:186-191`).
+  manually: `cargo test -p console -- --ignored rdns` (`rdns.rs:186-191`). And
+  `crates/propolis/tests/restore_rehearsal.rs`, the populated backup and restore
+  rehearsal, which needs PostgreSQL server binaries CI does not install; its
+  command and last recorded result are in
+  [backup and restore](../operations/backup-and-restore.md#restore-rehearsal).
 - **Outside the suite entirely: one browser fixture.** The console's stale-poll
   handling has to be checked in a real browser against a real hung socket - the
   suite can only check that the guarding code ships. Run by hand when the console's

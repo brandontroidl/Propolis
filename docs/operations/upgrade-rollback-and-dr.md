@@ -117,7 +117,10 @@ Possessing backups is not the ability to recover. Rehearse the full DR path -
 provision a fresh host, restore config, restore the database, restore spool,
 start, and verify per [backup and restore](backup-and-restore.md) - at least once,
 and record the result. A recovery runbook that has never been executed against
-real state is unverified.
+real state is unverified. The database and spool part of that path has a
+repeatable rehearsal against populated scratch clusters; its scope and last
+result are in [backup and restore](backup-and-restore.md#restore-rehearsal). It
+does not cover provisioning a host, service-user ownership, or configuration.
 
 ### Multi-node note
 

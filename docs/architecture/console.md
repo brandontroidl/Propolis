@@ -79,10 +79,10 @@ architecture in brief:
 - **CSRF** - a per-session token, generated on first use and reused, compared in
   constant time (`subtle::ConstantTimeEq`), surfaced to templates as a
   `<meta name="csrf-token">`. It gates the mutating queue actions
-  (approve/reject/snooze/unsnooze/delist/relist/delete). `POST /login` deliberately carries **no
-  CSRF check** (no pre-auth session to bind a token to; the rate limiter is its
-  defense), and `POST /integrity/verify` carries none because it is a read-only
-  chain verification with no state mutation.
+  (approve/reject/snooze/unsnooze/delist/relist/delete) and `POST /integrity/verify`,
+  which changes no state but scans the whole ledger (and runs one at a time).
+  `POST /login` deliberately carries **no CSRF check** (no pre-auth session to bind a
+  token to; the rate limiter is its defense).
 - **Login rate limiting** - sliding-window per source IP plus a budget across all
   sources, with memory-bound caps. Argon2 verification runs on the blocking pool, at most
   two at a time, so a login spray cannot occupy the async workers.

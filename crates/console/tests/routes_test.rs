@@ -4697,6 +4697,108 @@ async fn healthy_pages_render_no_degraded_banner(pool: PgPool) {
     assert!(body.contains("0 events in the ledger"), "{body}");
 }
 
+/// The integrity page's POST starts a full-ledger scan, so it carries the session's CSRF token
+/// like every other console POST. The page must render the token and the route must refuse a
+/// request without the right one.
+#[sqlx::test(migrations = false)]
+async fn integrity_verify_requires_the_session_csrf_token(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (session_id, cookie) = state.sessions.create();
+    let cookie = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state.clone());
+
+    let page = body_text(
+        app.clone()
+            .oneshot(get_request("/integrity", Some(&cookie)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let token = state.sessions.generate_csrf(&session_id).unwrap();
+    assert!(
+        page.contains(&format!(
+            "<input type=\"hidden\" name=\"csrf_token\" value=\"{token}\">"
+        )),
+        "the verify form must carry the session token: {page}"
+    );
+
+    let wrong = app
+        .clone()
+        .oneshot(form_request(
+            "/integrity/verify",
+            "csrf_token=not-the-token".into(),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+    let missing = app
+        .clone()
+        .oneshot(form_request(
+            "/integrity/verify",
+            String::new(),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        missing.status().is_client_error(),
+        "no token must never run the verification: {}",
+        missing.status()
+    );
+
+    let right = app
+        .oneshot(form_request(
+            "/integrity/verify",
+            format!("csrf_token={token}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(right.status(), StatusCode::OK);
+    assert!(body_text(right).await.contains("Chain intact"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn integrity_verify_runs_one_at_a_time(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (session_id, cookie) = state.sessions.create();
+    let cookie = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    let running = console::routes::integrity::VERIFY_IN_FLIGHT
+        .try_acquire()
+        .expect("no verification should be running when this test starts");
+    let busy = app
+        .clone()
+        .oneshot(form_request(
+            "/integrity/verify",
+            format!("csrf_token={token}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(busy.status(), StatusCode::CONFLICT);
+    let body = body_text(busy).await;
+    assert!(body.contains("already running"), "{body}");
+    assert!(!body.contains("Chain intact"), "{body}");
+
+    drop(running);
+    let after = app
+        .oneshot(form_request(
+            "/integrity/verify",
+            format!("csrf_token={token}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+}
+
 #[sqlx::test(migrations = false)]
 async fn samples_page_shows_fetch_attempt_status_counts(pool: PgPool) {
     migrate(&pool).await;

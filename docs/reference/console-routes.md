@@ -76,7 +76,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 | GET | `/search/ips` | `search_ips` | | `routes/search.rs:59` |
 | GET | `/ips` | `ip_list` | `ip_score` list, capped 500 rows | `routes/ips.rs:14` |
 | GET | `/integrity` | `integrity_page` | | `routes/integrity.rs:13` |
-| POST | `/integrity/verify` | `run_verify` | **no CSRF** (read-only chain verify) | `routes/integrity.rs:14` |
+| POST | `/integrity/verify` | `run_verify` | CSRF (403); one verification at a time (409 while one runs) | `routes/integrity.rs` |
 | GET | `/samples` | `samples_page` | | `routes/samples.rs:17` |
 | GET | `/samples/download/{sha256}` | `download_sample` | hardened download; sets a per-route CSP | `routes/samples.rs:18` |
 | GET | `/logs` | `logs_page` | in-memory ring-buffer snapshot | `routes/logs.rs:35` |
@@ -90,13 +90,13 @@ login rate limiting) are owned by [authentication and authorization](../security
 - `validate_csrf` uses a constant-time compare (`subtle::ConstantTimeEq`) and returns
   `false` if the session is absent or no token has been generated yet (fail-closed)
   (`auth.rs:171-180`).
-- **Only the five queue mutations require CSRF.** Two session-gated POSTs deliberately
-  do **not** check CSRF:
-  - `POST /login` - no pre-auth session exists to bind a token to; a forged login still
-    needs the correct password, and the rate limiter is the real defense
-    (`login.rs:6-17`).
-  - `POST /integrity/verify` - a read-only hash-chain verification with no state
-    mutation (`integrity.rs:14,36`).
+- **Every session-gated POST requires CSRF**, the queue mutations and
+  `POST /integrity/verify` alike. The verification changes no state, but it scans the
+  whole ledger, so it is an operator action with a real cost that another page must not
+  be able to trigger; it also runs one at a time (`409` while one is in progress).
+- **`POST /login` deliberately does not check CSRF.** No pre-auth session exists to bind
+  a token to; a forged login still needs the correct password, and the rate limiter is
+  the real defense (`login.rs`).
 
 ## Queue mutation actions
 

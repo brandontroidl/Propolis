@@ -103,18 +103,18 @@ cookie value valid until its TTL elapsed.
   yet (fail-closed).
 - The token is surfaced to templates and embedded as `<meta name="csrf-token">` in
   `base_head.html`.
-- **Enforced on the mutating routes** - approve / reject / snooze / delist / delete. Each
-  validates CSRF first and returns **403 Forbidden** ("invalid or missing csrf token") on
-  failure (`routes/queue.rs`). The exact per-route CSRF column is in
-  [../reference/console-routes.md](../reference/console-routes.md).
+- **Enforced on every session-gated POST** - approve / reject / snooze / delist / delete
+  and `POST /integrity/verify`. Each validates CSRF first and returns **403 Forbidden**
+  ("invalid or missing csrf token") on failure. The chain verification mutates no state,
+  but it scans the whole ledger, so another page must not be able to set it off; it also
+  runs one at a time (`409` while one is in progress). The exact per-route CSRF column is
+  in [../reference/console-routes.md](../reference/console-routes.md).
 
-Two deliberate CSRF omissions, both documented in source:
+One deliberate CSRF omission, documented in source:
 
 - **`POST /login` has no CSRF check.** No session exists pre-auth to bind a token to, and a
   forged login still needs the Argon2id-verified password, so it gains nothing; the login
-  rate limiter is its defense (`login.rs:6-17`).
-- **`POST /integrity/verify` has no CSRF check.** It is a read-only hash-chain verification
-  that mutates no state (`routes/integrity.rs`).
+  rate limiter is its defense (`login.rs`).
 
 ## Login rate limiting
 

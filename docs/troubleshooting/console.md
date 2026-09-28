@@ -80,18 +80,18 @@ not survive one. Default TTL is 24h.
 
 ## "invalid or missing csrf token" (403)
 
-The queue mutation actions (approve/reject/snooze/delist/delete) require a
-per-session CSRF token; a missing or wrong token returns `403 Forbidden`
-(`crates/console/src/routes/queue.rs:379-382`). Causes:
+Every session-gated POST - the queue mutation actions (approve/reject/snooze/delist/
+delete) and `POST /integrity/verify` - requires a per-session CSRF token; a missing or
+wrong token returns `403 Forbidden`. Causes:
 
 - The page was loaded before a restart and its embedded token no longer matches
   any session. Reload the page to get a fresh token, then retry.
 - A custom client is POSTing without the `csrf_token` form field. The token is
   surfaced to templates and embedded as `<meta name="csrf-token">`.
 
-`POST /integrity/verify` and the `/samples` routes are session-gated but have
-**no** CSRF check - `integrity/verify` is a read-only chain verification with no
-state mutation, so a 403 there is not expected.
+The `/samples` routes are GETs and carry no token. `POST /integrity/verify` answers
+`409` rather than `403` when another verification is already running; that is not a
+token problem - wait for the other run to finish and retry.
 
 ## Fonts or styling look wrong
 

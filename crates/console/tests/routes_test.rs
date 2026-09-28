@@ -1936,6 +1936,39 @@ async fn login_rate_limited_after_five_failed_attempts(pool: PgPool) {
     assert_eq!(sixth.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
+/// A login spray must be visible to monitoring, not only to the person locked out.
+#[sqlx::test(migrations = false)]
+async fn login_refusals_are_counted_on_metrics(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    for _ in 0..7 {
+        app.clone()
+            .oneshot(form_request(
+                "/login",
+                "password=totally-wrong".to_string(),
+                None,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let body = body_text(app.oneshot(get_request("/metrics", None)).await.unwrap()).await;
+    assert!(
+        body.contains("# TYPE propolis_console_login_refused_per_ip_total counter"),
+        "{body}"
+    );
+    assert!(
+        body.contains("propolis_console_login_refused_per_ip_total 2\n"),
+        "two of seven attempts from one address are past the per-address limit: {body}"
+    );
+    assert!(body.contains("propolis_console_login_refused_global_total 0\n"));
+    assert!(body.contains("propolis_console_login_verify_busy_total 0\n"));
+    assert!(body.contains("# TYPE propolis_console_connections_shed_total counter"));
+    assert!(body.contains("# TYPE propolis_console_body_timeouts_total counter"));
+}
+
 #[sqlx::test(migrations = false)]
 async fn login_page_hides_topnav_entirely(pool: PgPool) {
     let state = test_state(pool);

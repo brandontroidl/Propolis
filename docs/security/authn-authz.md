@@ -17,7 +17,7 @@ path, handler, auth, CSRF) lives in
 defaults live in [../reference/environment-variables.md](../reference/environment-variables.md).
 
 > No in-process TLS. The console listens as plain HTTP on a loopback `TcpListener`
-> (`axum::serve`, no rustls). Any TLS is operator-provided (for example a reverse proxy)
+> (`console::server::serve`, HTTP/1.1, no rustls). Any TLS is operator-provided (for example a reverse proxy)
 > and `[inferred]`. See [../operations/networking-tls.md](../operations/networking-tls.md).
 
 ## Public versus gated routes
@@ -73,14 +73,17 @@ Cookie attributes (`crates/console/src/routes/login.rs:111-119`):
 
 ## Login flow
 
-`login_submit` (`login.rs:58-83`), in order:
+`login_submit` (`routes/login.rs`), in order:
 
-1. Extract the peer IP from `ConnectInfo<SocketAddr>`. The binary MUST serve via
-   `into_make_service_with_connect_info::<SocketAddr>()` or `ConnectInfo` extraction
-   **fails closed** on every login (`login.rs:19-26`).
-2. **Rate-limit check first** - on block, `429 Too Many Requests` with the form
-   re-rendered (`login.rs:65-69`).
-3. **Password verify** - on failure, `401 Unauthorized` (`login.rs:71-75`).
+1. Extract the peer IP from `ConnectInfo<SocketAddr>`, which `console::server::serve`
+   inserts on every request. Served any other way, `ConnectInfo` extraction **fails
+   closed** on every login.
+2. **Rate-limit check first** (per source and global, below) - on block,
+   `429 Too Many Requests` with the form re-rendered.
+3. **Password verify**, bounded: Argon2id runs on the blocking pool, at most two
+   verifications at once (`MAX_CONCURRENT_VERIFICATIONS`). An attempt that cannot get a
+   slot within 5 seconds is not checked at all and gets `503` ("Login is busy"); a wrong
+   password gets `401 Unauthorized`.
 4. On success - reset the rate limiter for that IP, create the session, set the cookie,
    redirect to `/`.
 
@@ -115,17 +118,25 @@ Two deliberate CSRF omissions, both documented in source:
 
 ## Login rate limiting
 
-A sliding-window limiter keyed by source IP, default **5 attempts / 60s**
-(`RateLimiter::default = new(5, 60s)`, `auth.rs:251-256`; wired at `main.rs:248`), reset on
-successful login. Load-bearing properties (`auth.rs:200-256`):
+A sliding-window limiter keyed by source IP, default **5 attempts / 60s**, plus a budget
+of **30 attempts / 60s across all sources** (`RateLimiter::default`,
+`DEFAULT_GLOBAL_LOGIN_ATTEMPTS` in `auth.rs`), per-IP history reset on successful login.
+Load-bearing properties:
 
-- A **blocked attempt is not itself recorded**, so a burst of rejected retries cannot
-  extend the window past `max_attempts` within it (`auth.rs:217-219,236-242`).
-- **Memory-bound, fail-closed:** the IP-keyed map is pruned of stale entries once it
-  exceeds 10,000, and hard-rejects all attempts once it exceeds 50,000 - bounding growth
-  under a spoofed-source-IP flood (`auth.rs:224-233`).
+- **The global budget bounds distributed guessing.** Per-IP limits alone allow five guesses
+  a minute from every address an attacker controls. The cost is deliberate: a sustained
+  spray can keep the operator from logging in until it stops, which for a single-password
+  console is preferable to an unbounded guessing rate.
+- A **refused attempt is not recorded** in either window, so rejected retries cannot extend
+  them, and a refused address never gains an entry in the per-IP map.
+- **Memory-bound, fail-closed:** new per-IP entries are admitted only within the global
+  budget; the map is also pruned of stale entries past 10,000 and refuses all attempts past
+  50,000 as a backstop.
+- **Counted:** `propolis_console_login_refused_per_ip_total`,
+  `propolis_console_login_refused_global_total` and
+  `propolis_console_login_verify_busy_total` on `/metrics` make a spray visible.
 - **Keyed on the real TCP peer** via `ConnectInfo`; if that extraction fails, login fails
-  closed (`login.rs:19-26,58-69`).
+  closed.
 
 ## Authorization model
 

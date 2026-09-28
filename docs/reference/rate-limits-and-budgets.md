@@ -17,20 +17,36 @@ defaults/bounds are owned by
 
 ## Console login rate limit
 
-Sliding-window limiter keyed by source IP, enforced in the console auth layer
-(`crates/console/src/auth.rs:200-256`, applied at
-`crates/console/src/routes/login.rs:65`).
+Sliding-window limiter keyed by source IP plus a budget across all sources,
+enforced in the console auth layer (`RateLimiter` in `crates/console/src/auth.rs`,
+applied first in `login_submit`, `crates/console/src/routes/login.rs`).
 
 | Item | Value | Notes |
 |---|---|---|
-| Max attempts | 5 per 60 s per source IP *(hard-coded default)* | `auth.rs:251-256` |
-| Reset | on successful login | `login.rs:77` |
-| Blocked-attempt accounting | a rejected attempt is not itself recorded | cannot extend the window past the original 5 (`auth.rs:217-243`) |
-| Map cleanup trigger | > 10000 tracked IPs | prunes expired entries (`auth.rs:224-229`) |
-| Hard reject ceiling | > 50000 tracked IPs -> all attempts denied | fail-closed DoS bound (`auth.rs:231-233`) |
+| Max attempts per source IP | 5 per 60 s *(hard-coded default)* | `RateLimiter::default` |
+| Max attempts across all sources | 30 per 60 s *(hard-coded default)* | `DEFAULT_GLOBAL_LOGIN_ATTEMPTS`; bounds guessing spread over many addresses |
+| Reset | per-IP window on successful login; the global window is never reset | `login_submit` |
+| Blocked-attempt accounting | a rejected attempt is recorded in neither window | cannot extend either window |
+| Map cleanup trigger | > 10000 tracked IPs | prunes expired entries |
+| Hard reject ceiling | > 50000 tracked IPs -> all attempts denied | backstop; new entries are already limited by the global budget |
+| Concurrent password verifications | 2, on the blocking pool | `MAX_CONCURRENT_VERIFICATIONS`; an attempt waits up to 5 s for a slot, then `503` |
 
-The limiter keys on the TCP peer address, so it must sit behind a proxy that
-sets the peer correctly in production (`login.rs:21-26`).
+The limiter keys on the TCP peer address. Behind a same-host reverse proxy every
+attempt arrives from the proxy's address, so the per-IP limit then acts as a second
+global limit; the proxy should apply its own per-client limit.
+
+## Console connection bounds
+
+Enforced by the console's accept loop (`console::server::ServeLimits::default`,
+`crates/console/src/server.rs`), in both the standalone console and the unified daemon.
+
+| Item | Value | On breach |
+|---|---|---|
+| Open connections | 64 | a new connection is closed on accept (`propolis_console_connections_shed_total`) |
+| Header read | 10 s per request, re-armed while a kept-alive connection waits | connection closed |
+| Body read | 10 s | `408` (`propolis_console_body_timeouts_total`) |
+| Body size | 2 MiB | `413` |
+| Shutdown grace | 10 s for open connections to finish | remaining connections dropped |
 
 ## VirusTotal daily cap
 

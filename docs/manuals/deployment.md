@@ -90,7 +90,7 @@ default), and no-listener subsystems.
 
 > [!WARNING]
 > **No in-process TLS.** The console is plain HTTP on a loopback `TcpListener`
-> (`axum::serve`, no rustls). Any TLS is **operator-provided** - keep the console
+> (`console::server::serve`, HTTP/1.1, no rustls). Any TLS is **operator-provided** - keep the console
 > on loopback and front it with your own reverse proxy. `/health`, `/ready`, and
 > `/metrics` are unauthenticated and share the console bind; they are acceptable
 > only because it is loopback-only. Before any firewall change that could sever

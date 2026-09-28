@@ -95,7 +95,7 @@ the only subsystems always spawned. The exact enabling env vars and their defaul
 gated egress subsystems (VirusTotal, vendor submitters, ops-alert) are covered in
 [../security/outbound-controls.md](../security/outbound-controls.md).
 
-The console listens as plain HTTP on a loopback `TcpListener` (`axum::serve`); there is
+The console listens as plain HTTP on a loopback `TcpListener` (`console::server::serve`, HTTP/1.1); there is
 no in-process TLS. Any TLS termination is operator-provided (for example a reverse
 proxy) and out of the daemon. See
 [../operations/networking-tls.md](../operations/networking-tls.md).

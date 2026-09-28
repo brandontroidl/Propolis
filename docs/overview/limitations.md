@@ -24,7 +24,7 @@ are operator responsibilities - see
 
 ## No in-process TLS
 
-The console serves **plain HTTP on a loopback `TcpListener`** (`axum::serve`, no
+The console serves **plain HTTP on a loopback `TcpListener`** (`console::server::serve`, HTTP/1.1, no
 rustls). There is no built-in transport encryption. Exposing the console beyond
 loopback requires an operator-provided reverse proxy or tunnel to add TLS
 `[inferred]`. See [`../operations/networking-tls.md`](../operations/networking-tls.md).

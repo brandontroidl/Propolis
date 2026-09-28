@@ -312,6 +312,43 @@ async fn metrics(
     writeln!(out, "# TYPE propolis_events_rejected_total counter").unwrap();
     writeln!(out, "propolis_events_rejected_total {rejected}").unwrap();
 
+    // Console saturation: each of these moves only when a bound refused work, so a non-zero rate
+    // is a login spray or a connection flood, not ordinary use.
+    push_counter(
+        &mut out,
+        "propolis_console_login_refused_per_ip_total",
+        "Login attempts refused by the per-address rate limit since process start.",
+        state.login_rate_limiter.refused_per_ip(),
+    );
+    push_counter(
+        &mut out,
+        "propolis_console_login_refused_global_total",
+        "Login attempts refused by the all-addresses login budget since process start.",
+        state.login_rate_limiter.refused_global(),
+    );
+    push_counter(
+        &mut out,
+        "propolis_console_login_verify_busy_total",
+        "Login attempts answered busy because every password-verification slot was taken.",
+        state.passwords.busy_count(),
+    );
+    push_counter(
+        &mut out,
+        "propolis_console_connections_shed_total",
+        "Connections closed on accept because the console's connection limit was reached.",
+        crate::server::STATS
+            .connections_shed
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
+        "propolis_console_body_timeouts_total",
+        "Requests answered 408 because the body did not arrive within the read timeout.",
+        crate::server::STATS
+            .body_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+
     Ok((
         StatusCode::OK,
         [(
@@ -326,6 +363,12 @@ async fn metrics(
 fn push_gauge(out: &mut String, name: &str, help: &str, value: i64) {
     writeln!(out, "# HELP {name} {help}").unwrap();
     writeln!(out, "# TYPE {name} gauge").unwrap();
+    writeln!(out, "{name} {value}").unwrap();
+}
+
+fn push_counter(out: &mut String, name: &str, help: &str, value: u64) {
+    writeln!(out, "# HELP {name} {help}").unwrap();
+    writeln!(out, "# TYPE {name} counter").unwrap();
     writeln!(out, "{name} {value}").unwrap();
 }
 

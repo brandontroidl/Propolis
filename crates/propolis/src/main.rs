@@ -117,6 +117,11 @@ fn own_ips_lack_a_public_address(own_ips: &HashSet<IpAddr>) -> bool {
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the console waits for open connections to finish on shutdown. Must stay below
+/// `SHUTDOWN_TIMEOUT`: the live log stream never ends on its own, so an unbounded wait for it
+/// would always run the daemon's whole shutdown budget out.
+const CONSOLE_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
 /// How many recent tracing events `console::routes::logs`'s viewer keeps in memory for a
 /// freshly loaded page (`console::log_buffer::LogBuffer::new`'s own doc comment - live-streamed
 /// entries after that are unbounded by this, only by the browser tab's own cap).
@@ -505,13 +510,16 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
 
     tracing::info!(bind = %bind_addr, "console: starting");
 
-    let app = console::routes::router(state).into_make_service_with_connect_info::<SocketAddr>();
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(cancel.cancelled_owned())
-        .await
-    {
-        tracing::error!(error = %e, "console: server error");
-    }
+    // Bounded connections, header reads and body reads; see `console::server`. The grace period
+    // sits inside the daemon's own SHUTDOWN_TIMEOUT so the console never holds shutdown past it.
+    console::server::serve(
+        listener,
+        console::routes::router(state),
+        console::server::ServeLimits::default(),
+        cancel.cancelled_owned(),
+        CONSOLE_SHUTDOWN_GRACE,
+    )
+    .await;
     tracing::info!("console: shutdown complete");
 }
 

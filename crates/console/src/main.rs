@@ -7,11 +7,10 @@
 //! value is validated at startup and the process refuses to start on a malformed one rather than
 //! silently substituting a default that could disable a bound.
 //!
-//! MUST serve via `Router::into_make_service_with_connect_info::<SocketAddr>()` - Task 2's
-//! carry-forward, documented on `console::routes::login`'s module doc comment: the login route's
-//! rate limiter and the session cookie's `Secure` decision both key on the TCP peer address via
-//! `axum::extract::ConnectInfo<SocketAddr>`, which that extractor only populates when the router
-//! is served this way (falling back to a test-only `MockConnectInfo` layer otherwise).
+//! Serves through `console::server::serve`, which bounds connections, header reads and body reads
+//! (see that module) and supplies `axum::extract::ConnectInfo<SocketAddr>` on every request: the
+//! login route's rate limiter and the session cookie's `Secure` decision both key on the TCP peer
+//! address, and that extractor fails closed without it.
 
 use std::env;
 use std::net::SocketAddr;
@@ -56,6 +55,10 @@ const DEFAULT_BIND: &str = "127.0.0.1:8080";
 /// page - see `log_buffer::LogBuffer::new`'s own doc comment. Matches `propolis::main`'s own
 /// constant for the unified daemon binary.
 const LOG_BUFFER_CAPACITY: usize = 1000;
+
+/// How long shutdown waits for open connections to finish their in-flight requests. The live log
+/// stream never finishes on its own, so without a bound one open logs tab would hold shutdown.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 struct Config {
     database_url: String,
@@ -352,13 +355,14 @@ async fn main() {
 
     tracing::info!(bind = %bind_addr, "console: starting");
 
-    let app = routes::router(state).into_make_service_with_connect_info::<SocketAddr>();
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-    {
-        tracing::error!(error = %e, "console: server error");
-    }
+    console::server::serve(
+        listener,
+        routes::router(state),
+        console::server::ServeLimits::default(),
+        shutdown_signal(),
+        SHUTDOWN_GRACE,
+    )
+    .await;
     tracing::info!("console: shutdown complete");
 }
 

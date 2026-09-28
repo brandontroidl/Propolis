@@ -13,17 +13,17 @@
 //! auth entirely by loading this page - unacceptable. The threat CSRF protects against does not
 //! apply here anyway: a forged cross-site POST to this endpoint still has to supply the correct
 //! operator password to do anything (verified by Argon2id below), so an attacker who could forge a
-//! successful login already knows the password and gains nothing from the forgery. The per-source
-//! rate limiter below is this route's actual defense (brute force), independent of CSRF.
+//! successful login already knows the password and gains nothing from the forgery. The rate
+//! limiter below (per source and global) is this route's actual defense against brute force,
+//! independent of CSRF, and the bounded verification behind it keeps a spray from taking the
+//! runtime's workers.
 //!
 //! # `ConnectInfo` requirement on the real binary
 //!
 //! The rate limiter and the cookie's `Secure` decision both key on the TCP peer address via
-//! `axum::extract::ConnectInfo<SocketAddr>`. That extractor is populated by a real accept loop only
-//! when the router is served via `Router::into_make_service_with_connect_info::<SocketAddr>()`
-//! (falling back to a test-only `MockConnectInfo` layer otherwise - see `connect_info.rs` in
-//! vendored axum). Task 4's `main.rs` MUST serve this way, or `ConnectInfo` extraction fails
-//! closed on every login attempt in production.
+//! `axum::extract::ConnectInfo<SocketAddr>`. `console::server::serve` inserts it on every request
+//! (tests use axum's `MockConnectInfo` layer instead). Serving the router any other way makes
+//! `ConnectInfo` extraction fail closed on every login attempt.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -37,7 +37,7 @@ use minijinja::context;
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::auth::SESSION_COOKIE;
+use crate::auth::{PasswordCheck, SESSION_COOKIE};
 use crate::routes::error::AppError;
 
 pub fn router() -> Router<AppState> {
@@ -68,10 +68,18 @@ async fn login_submit(
         return Ok((StatusCode::TOO_MANY_REQUESTS, Html(html)).into_response());
     }
 
-    if !state.passwords.verify(&form.password) {
-        tracing::warn!(ip = %peer_ip, "login failed: wrong password");
-        let html = render(&state, Some("Invalid password."))?;
-        return Ok((StatusCode::UNAUTHORIZED, Html(html)).into_response());
+    match state.passwords.verify_bounded(form.password).await {
+        PasswordCheck::Match => {}
+        PasswordCheck::Mismatch => {
+            tracing::warn!(ip = %peer_ip, "login failed: wrong password");
+            let html = render(&state, Some("Invalid password."))?;
+            return Ok((StatusCode::UNAUTHORIZED, Html(html)).into_response());
+        }
+        PasswordCheck::Busy => {
+            tracing::warn!(ip = %peer_ip, "login refused: password verification at capacity");
+            let html = render(&state, Some("Login is busy. Try again shortly."))?;
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, Html(html)).into_response());
+        }
     }
 
     state.login_rate_limiter.reset(peer_ip);

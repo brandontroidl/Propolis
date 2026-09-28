@@ -30,7 +30,7 @@ bounding, address-family restriction) still apply. See
 
 ## No in-process TLS
 
-The console serves plain HTTP on a `TcpListener` (`axum::serve`, no rustls). There
+The console serves plain HTTP on a `TcpListener` (`console::server::serve`, HTTP/1.1, no rustls). There
 is no built-in TLS anywhere in the platform. Confidentiality and integrity for
 console traffic beyond loopback depend entirely on an operator-provided reverse
 proxy. Do not assume transport encryption exists unless you configured it.

@@ -44,17 +44,23 @@ There are **30 routes: 7 public, 23 session-gated**. See
 
 ## No in-process TLS
 
-The console serves **plain HTTP** on a loopback `TcpListener` via `axum::serve`.
-There is **no built-in TLS** (no `rustls` in the console's serving path). Any TLS
+The console serves **plain HTTP/1.1** on a loopback `TcpListener` via
+`console::server::serve` (hyper's HTTP/1 connection builder driven by the console's own
+accept loop). There is **no built-in TLS** (no `rustls` in the console's serving path). Any TLS
 termination is operator-provided in front of the console (for example, a reverse
 proxy) and is **[inferred]** - the console itself never negotiates TLS. The default
 bind is loopback-only; see
 [reference/ports-and-protocols.md](../reference/ports-and-protocols.md) and
 [operations/networking-tls.md](../operations/networking-tls.md).
 
-The binary MUST serve with `into_make_service_with_connect_info::<SocketAddr>()`
-(`main.rs:262`), because the login rate limiter keys on the real TCP peer via
-`ConnectInfo`; without it, `ConnectInfo` extraction fails closed on every login.
+`console::server::serve` bounds the connection itself, so the console does not depend
+on a proxy for it: at most 64 connections at once (one accepted past that is closed
+immediately), 10 seconds to deliver a request's headers (re-armed while a kept-alive
+connection waits, so idle connections close too), and 10 seconds and 2 MiB for the body,
+read before the handler runs (`408` or `413` otherwise). It serves HTTP/1.1 only: hyper's
+auto-detecting builder waits for the HTTP/2 preface with no timeout of its own. It also
+inserts `ConnectInfo<SocketAddr>` on every request, which the login rate limiter keys on;
+without it, `ConnectInfo` extraction fails closed on every login.
 
 ## Session, CSRF, and login
 
@@ -77,7 +83,9 @@ architecture in brief:
   CSRF check** (no pre-auth session to bind a token to; the rate limiter is its
   defense), and `POST /integrity/verify` carries none because it is a read-only
   chain verification with no state mutation.
-- **Login rate limiting** - sliding-window per source IP with memory-bound caps.
+- **Login rate limiting** - sliding-window per source IP plus a budget across all
+  sources, with memory-bound caps. Argon2 verification runs on the blocking pool, at most
+  two at a time, so a login spray cannot occupy the async workers.
 
 ## Security headers
 

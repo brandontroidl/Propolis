@@ -66,7 +66,7 @@ captured binary from being executed. See [malware custody](./malware-custody.md)
 ## 4. Terminate TLS in a reverse proxy
 
 Propolis has **no in-process TLS**. The console is plain HTTP on a `TcpListener`
-(`axum::serve`, no rustls). If the console must be reachable beyond loopback,
+(`console::server::serve`, HTTP/1.1, no rustls). If the console must be reachable beyond loopback,
 front it with an operator-provided TLS-terminating reverse proxy bound to
 loopback upstream. This is an operator responsibility, not a built-in feature.
 See [../operations/networking-tls.md](../operations/networking-tls.md).

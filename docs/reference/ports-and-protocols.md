@@ -110,7 +110,7 @@ bind/listen code found in its source].
   (`DEFAULT_CONSOLE_BIND = "127.0.0.1:8080"`,
   `crates/propolis/src/config.rs:30,509-513`).
 
-> The console is plain HTTP on a loopback `TcpListener` (`axum::serve`, no
+> The console is plain HTTP on a loopback `TcpListener` (`console::server::serve`, HTTP/1.1, no
 > rustls). There is **no in-process TLS**. Any TLS is operator-provided (e.g. a
 > reverse proxy) [inferred]. See
 > [operations/networking-tls.md](../operations/networking-tls.md).

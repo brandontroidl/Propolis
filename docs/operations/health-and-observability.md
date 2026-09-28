@@ -51,6 +51,12 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
 - Feed (from `manifest.json` when a feed dir is configured): `propolis_feed_entries{tier}`,
   `propolis_feed_window_entries{window}`, `propolis_feed_last_build_timestamp`.
 - In-memory process counters: `propolis_events_ingested_total`, `propolis_events_rejected_total`.
+- Console saturation counters, each moving only when a bound refused work (a steady rate
+  means a login spray or a connection flood, not ordinary use):
+  `propolis_console_login_refused_per_ip_total`, `propolis_console_login_refused_global_total`,
+  `propolis_console_login_verify_busy_total`, `propolis_console_connections_shed_total`,
+  `propolis_console_body_timeouts_total`. Limits: [rate limits and
+  budgets](../reference/rate-limits-and-budgets.md#console-connection-bounds).
 
 `propolis_feed_last_build_timestamp` is the primary signal that the feed loop is still
 publishing; see [retention](./retention.md) and [scoring and feed

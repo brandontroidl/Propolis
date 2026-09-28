@@ -57,10 +57,17 @@ too - front them with authentication at the proxy. Route ownership is in
 
 ## TLS posture - no in-process TLS
 
-> **There is no built-in TLS.** The console is plain HTTP served by
-> `axum::serve` on a plain `tokio::net::TcpListener`
-> (`crates/propolis/src/main.rs:413-424`) - there is no rustls or other TLS
+> **There is no built-in TLS.** The console is plain HTTP/1.1 served by
+> `console::server::serve` on a plain `tokio::net::TcpListener`
+> (`crates/console/src/server.rs`) - there is no rustls or other TLS
 > setup in the code. Do not assume any component terminates TLS itself.
+>
+> The console does bound its own connections whether or not a proxy is in
+> front: at most 64 open, 10 seconds for request headers (idle keep-alive
+> connections included) and for the body, 2 MiB bodies. See
+> [rate limits and budgets](../reference/rate-limits-and-budgets.md#console-connection-bounds).
+> A proxy in front should still apply its own per-client limits, since behind
+> it every connection arrives from the proxy's address.
 
 Any TLS for the console is the **operator's responsibility, via a reverse
 proxy** in front of the loopback listener (`[inferred]` - this is the design

@@ -33,28 +33,32 @@ in-process TLS. Routes and APIs are owned by
 
 ## Login fails
 
-Login runs three checks in order (`crates/console/src/routes/login.rs:58-83`):
+Login runs these checks in order (`crates/console/src/routes/login.rs`):
 
-1. **Rate limit** → `429 Too Many Requests`. The limiter is per source IP,
-   default **5 attempts / 60 seconds** (`crates/console/src/auth.rs:251-255`). A
-   rejected attempt is not itself counted, so failed retries do not extend the
-   window; a **successful** login resets it. If you are locked out, wait out the
-   60-second window. Values:
+1. **Rate limit** → `429 Too Many Requests`. The limiter allows **5 attempts / 60
+   seconds** per source IP and **30 / 60 seconds across all sources**
+   (`crates/console/src/auth.rs`). A rejected attempt is not itself counted, so
+   failed retries do not extend the window; a **successful** login resets the
+   per-IP window. If you are locked out, wait out the 60-second window. If you are
+   locked out on your first attempt, someone else is spending the global budget:
+   check `propolis_console_login_refused_global_total` on `/metrics`. Values:
    [Rate limits and budgets](../reference/rate-limits-and-budgets.md).
-2. **Password** → `401 Unauthorized`. The password comes from
+2. **Busy**: `503` "Login is busy". Both password-verification slots stayed taken
+   for 5 seconds, so the attempt was not checked. Retry; persistent 503s mean a
+   login flood (`propolis_console_login_verify_busy_total`).
+3. **Password** → `401 Unauthorized`. The password comes from
    `PROPOLIS_CONSOLE_PASSWORD`, hashed with Argon2id at startup; the plaintext is
    dropped and only the hash kept in memory. There is no password reset flow - change the env var and restart. An empty/absent password means the console
    refuses to start in the first place (see
    [Startup and config](startup-and-config.md)).
-3. **Success** → session cookie set, redirect to `/`.
+4. **Success** → session cookie set, redirect to `/`.
 
 ### Login redirect loop / cookie not sticking
 
-- **`ConnectInfo` requirement** - the server must run with
-  `into_make_service_with_connect_info::<SocketAddr>()` or peer-IP extraction
-  fails closed on every login (`crates/console/src/main.rs:262`,
-  `login.rs:19-26`). This is wired in the shipped binaries; if you run a custom
-  harness that omits it, every login fails.
+- **`ConnectInfo` requirement** - the router must be served through
+  `console::server::serve` (which supplies the peer address) or peer-IP extraction
+  fails closed on every login. Both shipped binaries serve it that way; if you run
+  a custom harness that serves the router otherwise, every login fails.
 - **`Secure` cookie over plain HTTP** - the session cookie is set `Secure` unless
   the client is loopback (`login.rs:115`). If you reach the console through a
   proxy that presents as a non-loopback client but serves plain HTTP to the

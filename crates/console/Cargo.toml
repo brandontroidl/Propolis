@@ -15,6 +15,9 @@ futures = { version = "0.3.32", default-features = false, features = ["std", "as
 geoip = { path = "../geoip" }
 hex = "0.4.3"
 hmac = "0.13.0"
+http-body-util = "0.1.4"
+hyper = { version = "1.11.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "service"] }
 libc = "0.2.186"
 minijinja = "2.21.0"
 rand = { version = "0.10.2", features = ["std"] }
@@ -26,12 +29,12 @@ sha2 = "0.11.0"
 sqlx = { version = "0.9.0", features = ["postgres", "runtime-tokio", "macros", "rust_decimal", "chrono", "json"] }
 subtle = "2.6.1"
 time = "0.3.54"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
-http-body-util = "0.1.4"
 tempfile = "3.27.0"
-tower = { version = "0.5.3", features = ["util"] }
+tokio = { version = "1.53.1", features = ["test-util"] }
 uuid = { version = "1", features = ["v7"] }

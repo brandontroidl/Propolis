@@ -79,7 +79,8 @@ load-bearing ones and their roles are listed here.
 
 | Crate | Version | Role |
 |---|---|---|
-| `axum` | - | Console web server (`crates/console`). Plain HTTP on a loopback `TcpListener` via `axum::serve`; there is **no in-process TLS** (no rustls). Any TLS is operator-provided (e.g. a reverse proxy). |
+| `axum` | - | Console routing and extractors (`crates/console`). Plain HTTP on a loopback `TcpListener`; there is **no in-process TLS** (no rustls). Any TLS is operator-provided (e.g. a reverse proxy). |
+| `hyper`, `hyper-util` | - | The console's HTTP/1.1 connections, driven by its own accept loop (`console::server`) so it can bound connection count, header and body read time; `axum::serve` exposes none of those. |
 | `minijinja` | - | Server-side HTML templating for the console. |
 | htmx | - | Client-side interactivity in the console (vendored front-end asset, not a Rust crate). |
 | Chart.js | - | Console dashboard charts (vendored front-end asset). |

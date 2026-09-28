@@ -12,6 +12,7 @@ pub mod auth;
 pub mod log_buffer;
 pub mod rdns;
 pub mod routes;
+pub mod server;
 pub mod templates;
 
 use std::path::PathBuf;
@@ -43,7 +44,7 @@ pub fn warn_if_console_exposed(bind: std::net::SocketAddr) {
             %bind,
             "console bound to a NON-LOOPBACK address: it serves plain HTTP and exposes /metrics \
              OUTSIDE authentication. Front it with a TLS reverse proxy that enforces access \
-             control, or bind 127.0.0.1 (see docs/security/networking-tls)."
+             control, or bind 127.0.0.1 (see docs/operations/networking-tls.md)."
         );
     }
 }

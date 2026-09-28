@@ -92,6 +92,12 @@ resolver. The module doc calls it "the ONE outbound lookup in the console's
 otherwise egress-free enrichment" and forbids using PTR as a suppression signal
 (spoofable, display-only).
 
+Its per-process result cache is capacity-bounded at 4096 distinct IPs
+(`CACHE_CAPACITY`): every insert sweeps expired entries and, if still full,
+evicts the single oldest surviving one, so an operator (or a compromised
+session) viewing many distinct IP pages cannot grow it without bound. See
+[input-handling.md](input-handling.md)'s "Bounded reads".
+
 ### 5. Ops-alert ntfy (`propolis`)
 
 A `reqwest` POST to the operator's own ntfy server

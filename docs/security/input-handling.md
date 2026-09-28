@@ -105,6 +105,11 @@ Attacker input cannot drive unbounded resource use:
   [../architecture/concurrency-and-failure.md](../architecture/concurrency-and-failure.md).
 - **Console read pages are bounded:** event/IP listings paginate (search page size 50; the
   attacker IP list caps at 500 rows). See [../reference/console-routes.md](../reference/console-routes.md).
+- **The opt-in reverse-DNS cache is capacity-bounded:** at most 4096 distinct IPs
+  (`crates/console/src/rdns.rs`'s `CACHE_CAPACITY`), with expired entries swept and the oldest
+  surviving entry evicted on every insert once full - an operator (or a compromised session)
+  paging through many distinct IP detail pages cannot grow this process-wide `HashMap` without
+  bound. See [outbound-controls.md](outbound-controls.md).
 
 ## Why sanitized input still cannot forge history
 

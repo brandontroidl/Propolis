@@ -922,8 +922,11 @@ mod tests {
     }
 
     /// A hand-off with `slots` queue entries and no worker: `submit` succeeds `slots` times, then
-    /// is refused, which is how a test proves a submission happened.
-    fn test_handoff(slots: usize) -> Arc<CaptureHandoff> {
+    /// is refused, which is how a test proves a submission happened. The directory it writes to
+    /// is returned for the caller to hold: dropping it at the end of the test removes it, where
+    /// forgetting it left one directory behind per call and showed up under LeakSanitizer
+    /// (docs/security/sanitizer-results.md).
+    fn test_handoff(slots: usize) -> (Arc<CaptureHandoff>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let spool_dir = dir.path().join("spool");
         std::fs::create_dir(&spool_dir).unwrap();
@@ -931,23 +934,25 @@ mod tests {
         let spool =
             sensor_framework::QuarantineSpool::new(spool_dir, MAX_SYNC_BODY as u64, 100_000_000);
         let emitter = sensor_framework::EventEmitter::new(dir.path().join("events.jsonl"));
-        std::mem::forget(dir);
-        Arc::new(CaptureHandoff::new(
+        let handoff = Arc::new(CaptureHandoff::new(
             spool,
             emitter,
             slots,
             "test".to_string(),
             sensor_framework::OutboxManifest::new(outbox_dir),
-        ))
+        ));
+        (handoff, dir)
     }
 
-    fn test_sync_state() -> SyncState {
-        SyncState::new(
+    fn test_sync_state() -> (SyncState, tempfile::TempDir) {
+        let (handoff, dir) = test_handoff(16);
+        let state = SyncState::new(
             "203.0.113.7".parse().unwrap(),
             None,
             Uuid::now_v7(),
-            test_handoff(16),
-        )
+            handoff,
+        );
+        (state, dir)
     }
 
     fn probe_job() -> CaptureJob {
@@ -963,7 +968,7 @@ mod tests {
     /// a protocol reset must not discard DATA already received either.
     #[tokio::test]
     async fn sync_submits_the_unfinished_send_when_cancelled_or_reset() {
-        let handoff = test_handoff(1);
+        let (handoff, _handoff_dir) = test_handoff(1);
         let mut sync = SyncState::new(
             "203.0.113.7".parse().unwrap(),
             None,
@@ -986,7 +991,7 @@ mod tests {
             "the one slot holds the abandoned SEND"
         );
 
-        let handoff = test_handoff(1);
+        let (handoff, _handoff_dir) = test_handoff(1);
         let mut sync = SyncState::new(
             "203.0.113.7".parse().unwrap(),
             None,
@@ -1012,7 +1017,7 @@ mod tests {
 
     #[test]
     fn sync_send_data_done_produces_capture_job() {
-        let mut sync = test_sync_state();
+        let (mut sync, _sync_dir) = test_sync_state();
         let mut wire = Vec::new();
         wire.extend_from_slice(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
@@ -1037,7 +1042,7 @@ mod tests {
         // The reassembly buffer must persist state across separate WRTE-driven `feed` calls,
         // exactly as a real client trickling SEND/DATA/DONE across separate writes would drive
         // it (see tests/integration.rs's own `sync_push` helper, which does exactly this).
-        let mut sync = test_sync_state();
+        let (mut sync, _sync_dir) = test_sync_state();
         let (r1, u1) = sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
             b"/tmp/x,420",
@@ -1064,7 +1069,7 @@ mod tests {
             orig_name: job.orig_name.clone(),
             capture_id: None,
         };
-        let mut sync = test_sync_state();
+        let (mut sync, _sync_dir) = test_sync_state();
         sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
             b"/data/local/tmp/x,33188",
@@ -1078,14 +1083,14 @@ mod tests {
         assert!(sync.abandon().is_none());
 
         // A SEND with no DATA yet has nothing to keep.
-        let mut bare = test_sync_state();
+        let (mut bare, _bare_dir) = test_sync_state();
         bare.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
             b"/tmp/y,420",
         ));
         assert!(bare.abandon().is_none());
 
-        let mut done = test_sync_state();
+        let (mut done, _done_dir) = test_sync_state();
         let (_, upload) = done.feed(
             &[
                 adb_proto::build_sync_message(adb_proto::SYNC_SEND, b"/tmp/z,420"),
@@ -1102,7 +1107,7 @@ mod tests {
 
     #[test]
     fn sync_recv_is_refused_with_fail_and_no_upload() {
-        let mut sync = test_sync_state();
+        let (mut sync, _sync_dir) = test_sync_state();
         let (response, upload) = sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_RECV,
             b"/data/secrets.txt",
@@ -1115,7 +1120,7 @@ mod tests {
 
     #[test]
     fn sync_stat_reports_not_found_and_does_not_upload() {
-        let mut sync = test_sync_state();
+        let (mut sync, _sync_dir) = test_sync_state();
         let (response, upload) = sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_STAT,
             b"/tmp/probe",
@@ -1134,7 +1139,7 @@ mod tests {
         // An attacker declares (and sends) a body larger than MAX_SYNC_BODY across multiple
         // DATA chunks. The accumulated body must stop growing at the cap - mirrors
         // sensor-ssh's `transfer::scp_body_capped_at_max_capture_body`.
-        let mut sync = test_sync_state();
+        let (mut sync, _sync_dir) = test_sync_state();
         sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
             b"/tmp/huge,420",
@@ -1167,7 +1172,7 @@ mod tests {
 
     #[test]
     fn sync_body_within_cap_is_not_marked_truncated() {
-        let mut sync = test_sync_state();
+        let (mut sync, _sync_dir) = test_sync_state();
         sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
             b"/tmp/small,420",
@@ -1188,7 +1193,7 @@ mod tests {
 
     #[test]
     fn sync_oversized_data_chunk_length_resets_state_without_panicking() {
-        let mut sync = test_sync_state();
+        let (mut sync, _sync_dir) = test_sync_state();
         sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
             b"/tmp/x,420",
@@ -1215,7 +1220,7 @@ mod tests {
 
     #[test]
     fn sync_data_or_done_without_preceding_send_is_ignored_without_panicking() {
-        let mut sync = test_sync_state();
+        let (mut sync, _sync_dir) = test_sync_state();
         let (response, upload) = sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_DATA,
             b"stray",
@@ -1230,7 +1235,7 @@ mod tests {
         // attacker-controlled, pre-any-check bytes on a stream ADB has no authentication for at
         // all, so arbitrary (including malformed or truncated) input must never panic.
         for seed in 0..20u8 {
-            let mut sync = test_sync_state();
+            let (mut sync, _sync_dir) = test_sync_state();
             let garbage: Vec<u8> = (0..512u32)
                 .map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed))
                 .collect();

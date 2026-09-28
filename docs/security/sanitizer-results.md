@@ -152,14 +152,15 @@ reported no leaks. Its fixture keeps its `TempDir` alive in
   this run.
 - One nightly toolchain, one host, debug profile.
 
-### Follow-up, not done here
+### Follow-up (done)
 
-`test_handoff` also leaves one directory per call on disk
-(`$TMPDIR/.tmpXXXXXX/spool`), 33 for each run of the lib tests. If the helper kept
-the `TempDir` alive for the length of the test, as the integration fixture does,
-both the LeakSanitizer report and the leftover directories would go away. This
-triage changed no code, because its mandate was to change code only for a product
-leak.
+`test_handoff` also left one directory per call on disk
+(`$TMPDIR/.tmpXXXXXX/spool`), 33 for each run of the lib tests. The helper now
+returns the `TempDir` alongside the hand-off, and every test holds it until the
+test ends, as the integration fixture does. Re-run the same way after that change
+(2026-09-28): the lib unit tests pass (42), `verbosity=1` shows
+`LeakSanitizer: checking for leaks`, no leak is reported, and a fresh `TMPDIR` is
+empty after the run.
 
 The raw symbolized report and the per-test table are kept with the audit
 evidence, outside the repository.

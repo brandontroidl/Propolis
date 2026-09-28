@@ -127,9 +127,10 @@ its reachability, and `pg_hba` are an operator/DBA concern (`propolis.service:10
 
 The daemon runs its own migrations at startup - there is no separate migrate
 step. On boot it loads config, connects the PgPool, then applies the
-core-scoring migrations followed by `review::migrator()`, embedded via
-`sqlx::migrate!` (`crates/propolis/src/main.rs:542-565`). A migration failure is
-a fail-fast: the process exits 1 (`main.rs:554-565`). The migration set is owned
+core-scoring migrations followed by `review::migrator()` and `fleet::migrator()`,
+embedded via `sqlx::migrate!` (`crates/propolis/src/main.rs:665-680`). A migration
+failure is a fail-fast: the process exits 1 at each of the three steps
+(`main.rs:671,675,679`). The migration set is owned
 by [../reference/database.md](../reference/database.md); see also
 [../development/schema-and-migrations.md](../development/schema-and-migrations.md).
 

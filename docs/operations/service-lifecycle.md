@@ -72,7 +72,7 @@ viewer, and metrics, see [health and observability](./health-and-observability.m
 ## Startup sequence (daemon)
 
 `propolis` fails fast (`std::process::exit(1)`) at any of these steps rather than starting
-degraded (`crates/propolis/src/main.rs:511-577`):
+degraded (`main`, `crates/propolis/src/main.rs:604-692`):
 
 1. init tracing;
 2. `load_config()` - exit 1 on any missing-required or malformed-bound value;
@@ -82,18 +82,18 @@ degraded (`crates/propolis/src/main.rs:511-577`):
 6. spawn subsystems.
 
 Migrations run at startup from within the binary (`sqlx::migrate!`); there is no separate
-migrate step (`main.rs:554-565`, confirmed `install.sh:22-24`). A config, DB, or migration
+migrate step (`main.rs:665-680`, confirmed `install.sh:22-24`). A config, DB, or migration
 error is therefore visible as an immediate exit in `journalctl`, not a silent partial run.
 See [troubleshooting: startup and config](../troubleshooting/startup-and-config.md).
 
 ## Stop and graceful shutdown
 
 Stopping a unit sends SIGTERM (SIGINT on Ctrl-C); the daemon treats both as a clean
-shutdown request (`crates/propolis/src/main.rs:160`, `:480-507`, `:1063-1089`):
+shutdown request (`crates/propolis/src/main.rs:118`, `shutdown_signal` `:573-600`, `:1288-1313`):
 
 1. cancel all subsystems;
 2. await their task handles, bounded by a **30 s `SHUTDOWN_TIMEOUT`**
-   (`main.rs:160`), then force-exit if any handle has not finished;
+   (`main.rs:118`), then log a warning and stop waiting if any handle has not finished;
 3. `pool.close()`.
 
 A clean stop exits 0.

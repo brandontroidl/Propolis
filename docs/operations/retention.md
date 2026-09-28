@@ -23,20 +23,20 @@ live-decayed score**. Every field is read as stored (as of the IP's last event) 
 re-derived against the wall clock, so an entry cannot slide between builds
 (`crates/feed/src/builder.rs:110-153`). The feed loop rebuilds every
 `PROPOLIS_FEED_BUILD_INTERVAL_SECS` (default **900 s** / 15 min) and publishes atomically; a
-failed build leaves the previous feed in place (`crates/propolis/src/main.rs:305-350`).
+failed build leaves the previous feed in place (`run_feed_loop`, `crates/propolis/src/main.rs:319-399`).
 
 Two kinds of retention apply:
 
 - **Tier TTLs** bound how long a merit-tiered entry stays in the per-tier files after its last
   sighting:
-  - `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` - default **24 h** (`config.rs:23,489`);
-  - `PROPOLIS_FEED_STANDARD_TTL_HOURS` - default **48 h** (`config.rs:24,493`).
+  - `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` - default **24 h** (`config.rs:23,581-584`);
+  - `PROPOLIS_FEED_STANDARD_TTL_HOURS` - default **48 h** (`config.rs:24,585-588`).
   An entry is kept iff `now - last_seen < ttl`; `valid_until = coarsen_to_hour(last_seen) + ttl`
   (`builder.rs:302-328`).
 - **Retention windows** publish `all-{label}` feeds that ignore tier and hold every approved
   entry (and auto-published volume floods) whose `last_seen` falls inside the window:
   `PROPOLIS_FEED_WINDOWS`, default **`24h,7d,30d,60d,90d`**, nested by construction
-  (`config.rs:29,505`, `builder.rs:269-277`). A malformed window entry is fail-closed.
+  (`config.rs:29,596-598`, `builder.rs:269-277`). A malformed window entry is fail-closed.
 
 Tiers themselves (aggressive: score >= 90, confidence >= 0.95; standard: >= 75, >= 0.70) and
 the eligibility/volume rules are owned by [scoring and feed

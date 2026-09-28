@@ -175,11 +175,11 @@ of the IP's last event), so a tier cannot slide between builds
 
 | Setting | Default | Env var | Source |
 |---|---|---|---|
-| Aggressive tier TTL | 24 h | `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` | `config.rs:23,489-496` |
+| Aggressive tier TTL | 24 h | `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` | `config.rs:23,581-584` |
 | Standard tier TTL | 48 h | `PROPOLIS_FEED_STANDARD_TTL_HOURS` | `config.rs:24` |
-| Retention windows | `24h,7d,30d,60d,90d` | `PROPOLIS_FEED_WINDOWS` | `config.rs:29,505` |
+| Retention windows | `24h,7d,30d,60d,90d` | `PROPOLIS_FEED_WINDOWS` | `config.rs:29,596-598` |
 | Build interval | 15 min (900 s) | `PROPOLIS_FEED_BUILD_INTERVAL_SECS` | `config.rs:22` |
-| Feed enabled | true | `PROPOLIS_FEED_ENABLED` | `config.rs:476` |
+| Feed enabled | true | `PROPOLIS_FEED_ENABLED` | `config.rs:564` |
 | Output dir | `/var/lib/propolis/feed/current` | (config) | `config.rs:21` |
 
 Retention windows ignore tier and hold every approved entry (and volume floods)
@@ -205,7 +205,7 @@ is_reserved(ip) || allowlist_cidr_contains(ip) || delist_contains(ip) || asn_all
 - Allowlist / delist / ASN allowlist are operator-supplied via
   `PROPOLIS_FEED_ALLOWLIST` (CIDR), `PROPOLIS_FEED_DELIST` (IPs), and
   `PROPOLIS_FEED_ASN_ALLOWLIST` (AS numbers) - all empty by default
-  (`crates/propolis/src/config.rs:497-505`).
+  (`crates/propolis/src/config.rs:589-595`).
 - **ASN suppression** is opt-in with an empty default; it suppresses
   trusted-org infrastructure (e.g. Microsoft AS8075, Google AS15169) keyed off
   offline GeoLite2-ASN reads (see [integrations.md](integrations.md#geolite2-offline-enrichment)).

@@ -38,7 +38,7 @@ When traffic looks under-recorded, check which bound is biting.
 The console `/metrics` endpoint exposes process counters derived per scrape:
 
 - `propolis_events_ingested_total` and `propolis_events_rejected_total` come from
-  in-process atomics (`crates/console/src/routes/metrics.rs:177-188`). A rising
+  in-process atomics (`metrics`, `crates/console/src/routes/metrics.rs:302-313`). A rising
   `rejected` total during load is where dropped/invalid events surface.
 - `propolis_review_queue_pending` gauges the review backlog.
 
@@ -90,13 +90,14 @@ paths: [Filesystem paths](../reference/filesystem-paths.md).
   1 GB on `/var/spool/propolis/fetched` (`FETCH_SPOOL_GLOBAL_BUDGET`,
   `crates/propolis/src/main.rs:41,55`). At the budget it stops writing new
   fetched samples; this is a cap, not an error. It is not operator-configurable.
-- **VirusTotal cleanup** - when VT scanning is enabled, `cleanup_old_samples`
-  removes spool files older than 30 days each cycle
-  (`crates/review/src/virustotal.rs:293-320`, wired at
-  `crates/propolis/src/main.rs:781`). If VT is **disabled**, that cleanup does
-  not run and captured samples accumulate until you prune them or logrotate/disk
-  policy intervenes. Plan retention accordingly:
-  [Retention](../operations/retention.md).
+- **Sample retention** - `cleanup_old_samples` removes spool files older than 30
+  days each cycle, run by the `sample-retention` supervised task
+  (`crates/propolis/src/main.rs:958-980`; `cleanup_old_samples`,
+  `crates/review/src/virustotal.rs:405-437`). This runs unconditionally,
+  independent of whether VT scanning is enabled, so a box with VT disabled still
+  ages out old spool files; only the standalone `review` binary (which does not
+  run this task) needs you to prune manually or rely on logrotate/disk policy.
+  Plan retention accordingly: [Retention](../operations/retention.md).
 - **Disk full** - the spool mounts are recommended `noexec,nosuid,nodev` but
   `install.sh` does not create them; it prints fstab guidance. A full spool
   filesystem will surface as write errors in sensor/fetcher logs. Monitor free

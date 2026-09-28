@@ -42,11 +42,11 @@ verified to a fixed/configurable range in this pass].
 ### Console (operator-facing)
 
 The console binds **loopback-only by default** (`127.0.0.1:8080`,
-`crates/propolis/src/config.rs:30,509-513`), on an unprivileged port with no
+`crates/propolis/src/config.rs:30,600-608`), on an unprivileged port with no
 capability grant. It binds a non-localhost address only if the operator
 overrides `PROPOLIS_CONSOLE_BIND` - the design intent is to keep it loopback and
 put any remote access behind the operator's own reverse proxy
-(`crates/console/src/main.rs:36-37`).
+(`DEFAULT_BIND`, `crates/console/src/main.rs:49-52`).
 
 `/health`, `/ready`, and `/metrics` share the console's bind (no separate port)
 and are mounted outside the session-auth middleware
@@ -81,9 +81,9 @@ reverse proxy" comment, not a shipped feature). A typical arrangement:
 - Enforce authentication at the proxy for the unauthenticated
   `/health`/`/ready`/`/metrics` endpoints if the proxy is remotely reachable.
 
-The application sets `X-Frame-Options: DENY` and `X-Content-Type-Options:
-nosniff` on console routes (`crates/console/src/routes/mod.rs:59-70`) but sets no
-global HSTS or CSP - HSTS, if wanted, is another reason to terminate at a proxy.
+The application sets `X-Frame-Options: DENY`, `X-Content-Type-Options:
+nosniff` and a Content-Security-Policy (unless a route set a stricter one) on console routes (`security_headers`, `crates/console/src/routes/mod.rs:85-107`) but sets no
+HSTS - HSTS, if wanted, is another reason to terminate at a proxy.
 
 Outbound connections (vendor APIs, VirusTotal, the fetcher) use HTTPS provided
 by their own HTTP clients; that is unrelated to the console's inbound posture and

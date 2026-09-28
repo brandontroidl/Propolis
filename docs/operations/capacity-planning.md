@@ -19,7 +19,7 @@ size them.
 ## Database connections
 
 The daemon opens one PgPool sized by `PROPOLIS_DB_MAX_CONNECTIONS` (default **10**, must be
-`> 0`; `crates/propolis/src/config.rs:16,432`). Every subsystem (intake, review, feed,
+`> 0`; `parse_positive_u64`, `crates/propolis/src/config.rs:16,520-523`). Every subsystem (intake, review, feed,
 console, metrics) shares this one pool. In a multi-node cluster each node opens its own pool
 against the shared database, so size the PostgreSQL `max_connections` for the **sum** across
 all nodes plus headroom, not a single node. Under-sizing the pool serializes subsystem DB work;
@@ -42,8 +42,8 @@ refuses (fail-closed) once the budget is reached (`crates/sensor-framework/src/s
 
 | Spool | Per-file cap | Global budget | Cite |
 |---|---|---|---|
-| `sensor-ssh`, `sensor-ftp`, `sensor-adb`, `sensor-telnet` capture | 10 MB | 100 MB | `spool.rs:156`, SSH `server.rs:107-111`, telnet `lib.rs:42` |
-| Fetcher (`/var/spool/propolis/fetched`) | `PROPOLIS_FETCH_MAX_BYTES` (default 10 MB) | **1 GB** (`FETCH_SPOOL_GLOBAL_BUDGET`) | `crates/propolis/src/main.rs:41,55` |
+| `sensor-ssh`, `sensor-ftp`, `sensor-adb`, `sensor-telnet` capture | 10 MB | 100 MB | SSH `server.rs:119`, FTP `lib.rs:13-14`, ADB `lib.rs:25-26`, telnet `lib.rs:42` |
+| Fetcher (`/var/spool/propolis/fetched`) | `PROPOLIS_FETCH_MAX_BYTES` (default 10 MB) | **1 GB** (`FETCH_SPOOL_GLOBAL_BUDGET`) | `crates/propolis/src/main.rs:70`, `crates/propolis/src/config.rs:35` |
 
 Redis, HTTP, SMTP, cred, and catchall sensors never write a body to a spool (they capture
 metadata only), so they consume no spool budget. Telnet only spools when the shell phase sees a

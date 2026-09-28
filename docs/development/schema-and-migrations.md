@@ -36,7 +36,7 @@ cross-crate schema dependency: it uses `review_state_enum`, which is created by
 core-scoring migration `0001` (`0001_enums.sql:26`).
 
 At runtime the daemon applies core-scoring migrations first, then `review::migrator()`,
-each `exit(1)` on failure (`crates/propolis/src/main.rs:555-566`).
+then `fleet::migrator()`, each `exit(1)` on failure (`crates/propolis/src/main.rs:665-680`).
 
 In tests, migrations are applied one of two ways
 ([build-and-test](build-and-test.md#test-styles-by-layer)):
@@ -89,8 +89,8 @@ order and guarantees in [`reference/events-and-signals`](../reference/events-and
 ## sqlx
 
 `sqlx` `0.9.0` with the `postgres, runtime-tokio, macros, rust_decimal, chrono, uuid,
-json` feature set (`crates/core-scoring/Cargo.toml:14`; console omits `uuid`,
-`crates/console/Cargo.toml:24`). Migrations are plain SQL files applied via the
+json` feature set (`crates/core-scoring/Cargo.toml:15`; console omits `uuid`,
+`crates/console/Cargo.toml:29`). Migrations are plain SQL files applied via the
 `sqlx::migrate!` macro and the review `migrator()`. The test database provisioning is
 in [toolchain-and-environment](toolchain-and-environment.md#test-postgresql).
 

@@ -27,14 +27,14 @@ compile this tree cleanly. Bump the pin deliberately and re-run the full gate.
 All 24 crates are **edition 2024** (each `crates/*/Cargo.toml:4`).
 
 CI installs this toolchain via `dtolnay/rust-toolchain` pinned to commit SHA
-`2fe4ca74464c5902a4f6e302d0a619b4ea911ccc` (`.github/workflows/ci.yml:42,59,98`).
+`2fe4ca74464c5902a4f6e302d0a619b4ea911ccc` (`.github/workflows/ci.yml:44,61,100,155`).
 
 ## Test PostgreSQL
 
 The suite is not fully offline: database-backed crates (`core-scoring`, `intake`,
 `review`, `feed`, `console`) test against a real PostgreSQL using
 [`sqlx`](https://crates.io) `sqlx::test`, which provisions a **fresh database per
-test**. `sqlx` version is `0.9.0` (`crates/core-scoring/Cargo.toml:14`).
+test**. `sqlx` version is `0.9.0` (`crates/core-scoring/Cargo.toml:15`).
 
 ### Local dev container (podman)
 
@@ -72,7 +72,7 @@ are not interchangeable:
 | Source | `DATABASE_URL` |
 |---|---|
 | `.env` (dev, committed) | `postgres://postgres@127.0.0.1:5432/postgres` |
-| CI (`.github/workflows/ci.yml:91`) | `postgres://postgres@localhost:5432/postgres` |
+| CI (`.github/workflows/ci.yml:93`) | `postgres://postgres@localhost:5432/postgres` |
 | `CONTRIBUTING.md:10` | `postgres://propolis:...@localhost:5432/propolis_test` |
 | `INSTALL.md:130` (production) | `postgres://propolis:YOUR_PASSWORD@localhost:5432/propolis` |
 

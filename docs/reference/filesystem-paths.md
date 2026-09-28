@@ -57,11 +57,11 @@ event logs.
 | adb uploads | `PROPOLIS_ADB_SPOOL_DIR` | `/var/spool/propolis/adb` (`sensor-adb/src/main.rs:32`) | 0750 propolis-adb (`install.sh:164`) |
 | telnet uploads | `PROPOLIS_TELNET_SPOOL_DIR` | `/var/spool/propolis/telnet` (`sensor-telnet/src/main.rs:35`) | 0750 propolis-telnet (`install.sh:166`) |
 | catchall | (dir granted for symmetry, **unused** - catchall spools no bodies) | `/var/spool/propolis/catchall` | 0750 propolis-catchall (`install.sh:162`) |
-| fetcher output | const `FETCH_SPOOL_DIR` | `/var/spool/propolis/fetched` (`crates/propolis/src/main.rs:41`) | 0750 propolis (`install.sh:169`) |
-| ops spool root | const `OPS_SPOOL_ROOT` | `/var/spool/propolis` (`crates/propolis/src/main.rs:46`) | 0755 root (`install.sh:161`) |
+| fetcher output | `PROPOLIS_SPOOL_ROOT` + `/fetched` (fn `fetch_spool_dir()`) | `/var/spool/propolis/fetched` (`crates/propolis/src/main.rs:44-46`; root `crates/review/src/spool.rs:71`) | 0750 propolis (`install.sh:169`) |
+| ops spool root | `PROPOLIS_SPOOL_ROOT` (fn `ops_spool_root()`) | `/var/spool/propolis` (`crates/propolis/src/main.rs:59-61`; default `crates/review/src/spool.rs:71`) | 0755 root (`install.sh:161`) |
 
 - The fetcher output dir has a global byte budget of 1_000_000_000 bytes
-  (`crates/propolis/src/main.rs:55`).
+  (`FETCH_SPOOL_GLOBAL_BUDGET`, `crates/propolis/src/main.rs:70`).
 - **smtp, redis, http, cred** have **no** spool dir (no `*_SPOOL_DIR` env);
   they capture inline only. Telnet spools only when the shell phase sees a
   binary payload (a Mirai/Gafgyt dropper), never the login/password phase.
@@ -80,7 +80,7 @@ for the full variable reference.
 | SSH host key (generated first run, reused) | `PROPOLIS_SSH_HOST_KEY_PATH` | `/var/lib/propolis/ssh/host_key` (`sensor-ssh/src/main.rs:48`) | `/var/lib/propolis/ssh` 0750 propolis-ssh (`install.sh:146`) |
 | intake cursors (log tail position) | `PROPOLIS_CURSOR_DIR` | `/var/lib/propolis/cursors` (`intake/src/main.rs:24`; `propolis/src/config.rs:17`) | 0750 propolis (`install.sh:138`) |
 | feed publish output | `PROPOLIS_FEED_OUTPUT_DIR` | `/var/lib/propolis/feed/current` (`feed/src/main.rs:36`; `propolis/src/config.rs:21`) | `/var/lib/propolis/feed` 0755 propolis (`install.sh:142`) |
-| GeoIP databases | `PROPOLIS_GEOIP_DIR` | **no default - enrichment disabled when unset** (`console/src/main.rs:131-134`; `feed/src/main.rs:211-214`) | not created by install.sh |
+| GeoIP databases | `PROPOLIS_GEOIP_DIR` | **no default - enrichment disabled when unset** (`geoip_dir` parse, `console/src/main.rs:162-165`; `feed/src/main.rs:211-214`) | not created by install.sh |
 | aggregated-node writable state | (unit grant) | `/var/lib/propolis` (`propolis.service:146` ReadWritePaths) | `/var/lib/propolis` 0755 root (`install.sh:137`) |
 | ops spool bounded-buffer dir | (const) | `/var/lib/propolis/spool` (`install.sh:160`) | 0750 propolis |
 

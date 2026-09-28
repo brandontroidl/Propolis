@@ -16,7 +16,7 @@ owned by [console routes](../reference/console-routes.md); this page is the oper
 ## Endpoints
 
 The console router exposes three public (no session) probe endpoints plus `/login` and the
-font assets; every other route is session-gated (`crates/console/src/routes/mod.rs:33-57`).
+font assets; every other route is session-gated (`router`, `crates/console/src/routes/mod.rs:53-78`).
 The console binds loopback-only by default (`127.0.0.1:8080`); there is **no in-process TLS**
 (plain HTTP on a `TcpListener`), so any TLS termination and any exposure beyond loopback is an
 operator-provided reverse proxy. See [networking and TLS](./networking-tls.md).
@@ -71,8 +71,8 @@ by logrotate (`size 100M`, `rotate 5`, `copytruncate`; `deploy/logrotate-sensors
 Paths are owned by [filesystem paths](../reference/filesystem-paths.md).
 
 The console has a session-gated live log viewer at `/logs`, backed by an in-memory ring of the
-**1000** most recent tracing events (`LOG_BUFFER_CAPACITY`, `crates/propolis/src/main.rs:165`,
-`routes/mod.rs:43`). It is a convenience tail, not a durable log store; the journal and the
+**1000** most recent tracing events (`LOG_BUFFER_CAPACITY`, `crates/propolis/src/main.rs:128`,
+`LogBuffer`, `crates/console/src/log_buffer.rs:39-58`). It is a convenience tail, not a durable log store; the journal and the
 NDJSON files are authoritative.
 
 ### Overload counters
@@ -84,10 +84,10 @@ spool](./queue-and-spool.md); in summary:
 - **Dropped (queue full).** When the bounded capture queue is full, `submit` drops the job
   rather than blocking, increments `dropped_count`, and logs a WARN at **power-of-two totals**
   (first drop, then 2, 4, 8, ...) so a sustained flood degrades to logarithmic noise instead of
-  filling the log partition (`crates/sensor-framework/src/handoff.rs:125-148`).
+  filling the log partition (`crates/sensor-framework/src/handoff.rs:225-241`).
 - **Spool-refused.** A body the spool rejects (per-file cap or exhausted global budget)
   increments `spool_refused_count` and logs a per-refusal WARN; no sample and no event result
-  (`handoff.rs:150-216`).
+  (`process_job`, `handoff.rs:330-340`).
 
 A rising drop or spool-refused count means the capture layer is shedding load; it is expected
 behavior under a flood (covertness over completeness), not a crash. Separately, the ops-alert

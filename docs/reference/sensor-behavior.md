@@ -217,7 +217,7 @@ alphabet (`:33-36`).
 `QuarantineSpool::new(dir, max_file_size, global_budget)` stores captured bodies
 named by their SHA-256 (never the attacker filename, so traversal is impossible),
 with 0640 permissions and re-hash-on-read fail-closed integrity
-(`crates/sensor-framework/src/spool.rs:113-122, 1-9`).
+(`crates/sensor-framework/src/spool.rs:118-127, 1-9`).
 
 - `store(body)` rejects `FileSizeExceeded` when `size > max_file_size`, dedups on
   an existing hash (no extra budget), reserves budget atomically via

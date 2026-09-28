@@ -22,7 +22,7 @@ submitters, the malware fetcher, ops alerts) and blocklist feed generation.
 ## VirusTotal not scanning
 
 VT is doubly gated: it runs only when `PROPOLIS_VT_ENABLED=true` **and**
-`PROPOLIS_VT_KEY` is non-empty (`crates/propolis/src/config.rs:520-521`). Either
+`PROPOLIS_VT_KEY` is non-empty (`crates/propolis/src/config.rs:612-613`). Either
 missing → VT stays off with no error. Checklist:
 
 1. Both the enable flag and a non-empty key are set.
@@ -33,9 +33,9 @@ missing → VT stays off with no error. Checklist:
 
 The scanner enforces a per-UTC-day budget. In the unified daemon this is
 hardcoded `daily_limit = 450` with a `request_delay_ms = 15000` pacing delay
-(`crates/propolis/src/main.rs:751-752`). When the day's budget is exhausted the
+(`crates/propolis/src/main.rs:922-923`). When the day's budget is exhausted the
 scanner logs and returns early, resuming after the UTC date rolls over
-(`crates/review/src/virustotal.rs:28-58`). This is the intended cap, not a fault - the free-tier VT limit is 4 req/min, 500/day. The one `DailyBudget` is owned
+(`scan_spool`, `crates/review/src/virustotal.rs:192-198`). This is the intended cap, not a fault - the free-tier VT limit is 4 req/min, 500/day. The one `DailyBudget` is owned
 across all scan cycles so the cap actually holds; a per-cycle counter would reset
 and never enforce it.
 
@@ -54,9 +54,9 @@ only when `PROPOLIS_VT_UPLOAD=true`, and upload sends the sample file off the bo
 Three adapters exist (AbuseIPDB, DShield, OTX) and are always constructed; a
 disabled vendor is held by the gatekeeper, not skipped at construction. A vendor
 `_ENABLED=true` with an empty `_KEY` is force-disabled fail-closed with a warning
-(`crates/propolis/src/config.rs:399-405`). If nothing is being reported, walk the
+(`load_vendor_config`, `crates/propolis/src/config.rs:486-493`). If nothing is being reported, walk the
 gatekeeper's ordered checks - it short-circuits on the first hold
-(`crates/review/src/vendor/gatekeeper.rs:85-138`):
+(`check`, `crates/review/src/gatekeeper.rs:85-138`):
 
 | Order | Hold reason | Meaning |
 |---|---|---|
@@ -92,11 +92,11 @@ enabled, is **fail-closed on self-target protection**:
 
 - If `PROPOLIS_FETCH_OWN_IPS` is unset **and** interface enumeration returns
   empty, the fetcher refuses to run and logs an error
-  (`crates/propolis/src/main.rs:828-835`). Set `PROPOLIS_FETCH_OWN_IPS` to the
+  (`crates/propolis/src/main.rs:1017-1024`). Set `PROPOLIS_FETCH_OWN_IPS` to the
   box's public egress IP.
 - If the resolved own-IPs contain only private/loopback/link-local addresses (a
   NAT'd node whose public IP is on no interface), it **warns but runs**
-  (`main.rs:843-852`) - set the public IP explicitly so the SSRF guard can
+  (`own_ips_lack_a_public_address`, `main.rs:1032-1041`) - set the public IP explicitly so the SSRF guard can
   protect it.
 - Fetches are bounded (per-host/hour, daily cap, byte cap, hop/depth caps, spool
   budget) and target-vetted by the SSRF guard, which rejects reserved/own-host
@@ -158,15 +158,18 @@ installed, so a push that has never succeeded is reported rather than read as
 
 ## Ops alerts never fire, or the daemon won't start with ops enabled
 
-Ops self-alerting is opt-in (`PROPOLIS_OPS_ENABLED=false` by default). When you
-enable it, `PROPOLIS_OPS_NTFY_URL` and `PROPOLIS_OPS_NTFY_TOPIC` become
-**required** - enabled-but-missing aborts startup, fail-closed, because a monitor
-that cannot page must not run silently
-(`crates/propolis/src/ops_alert/config.rs:122-134`). So:
+Ops self-alerting is opt-in (`PROPOLIS_OPS_ENABLED=false` by default). Setting
+`PROPOLIS_OPS_NTFY_URL` and `PROPOLIS_OPS_NTFY_TOPIC` is optional even once
+enabled - with neither set, alerts go to a local log sink instead of ntfy, and
+the daemon says so at startup. It is still fail-closed on a **half-configured**
+target: enabled with a URL but no topic (or vice versa) aborts startup, because
+a mistake there must not silently downgrade to the log sink
+(`parse_ops_alert`, `crates/propolis/src/ops_alert/config.rs:123-147`). So:
 
-- Daemon won't start after enabling ops → you set `PROPOLIS_OPS_ENABLED=true` but
-  left the ntfy URL or topic empty. Set both (and optionally
-  `PROPOLIS_OPS_NTFY_TOKEN` for a protected topic).
+- Daemon won't start after enabling ops - you set `PROPOLIS_OPS_ENABLED=true` and
+  set only one of the ntfy URL or topic. Set both (and optionally
+  `PROPOLIS_OPS_NTFY_TOKEN` for a protected topic), or leave both unset to use
+  the local log sink.
 - Alerts never fire → confirm ops is actually enabled, the ntfy endpoint is
   reachable, and the degradation thresholds (capacity, feed staleness, vendor
   failure rate, backlog, chain verify) are configured as intended. This ntfy POST

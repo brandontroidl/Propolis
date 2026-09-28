@@ -66,7 +66,7 @@ Configuration is validated at startup. Most binaries (`propolis`, `intake`,
 `review`, `feed`, `console`, and sensors `ssh/telnet/http/ftp/redis/adb/catchall`)
 **abort startup** on a missing required variable or a present-but-invalid /
 present-but-zero numeric bound - "zero never means unlimited"
-(`crates/propolis/src/config.rs:175-213`). A misconfiguration cannot silently
+(`require_env`, `parse_positive_u64`, `crates/propolis/src/config.rs:224-249`). A misconfiguration cannot silently
 disable a guard.
 
 Two exceptions: the `cred` and `smtp` sensors are **lenient** - an invalid or
@@ -77,14 +77,14 @@ zero bound silently falls back to the default rather than aborting
 Fail-closed pairings worth noting (all owned by the reference table):
 
 - A vendor or VirusTotal `*_ENABLED=true` with an empty key is forced disabled
-  and logged (`config.rs:399-405,521`).
+  and logged (`load_vendor_config`, `config.rs:486-493,613`).
 - `PROPOLIS_OPS_ENABLED=true` makes `PROPOLIS_OPS_NTFY_URL` and
   `PROPOLIS_OPS_NTFY_TOPIC` required - a monitor that cannot page must not start
   (`ops_alert/config.rs:122-134`).
 - `PROPOLIS_FEED_WINDOWS` fails closed on any malformed entry rather than
-  skipping it (`config.rs:298-330`).
+  skipping it (`parse_window_list`, `config.rs:386-418`).
 - `PROPOLIS_FEED_ASN_ALLOWLIST` is inert unless `PROPOLIS_GEOIP_DIR` is set and
-  the GeoLite2-ASN database loads (`config.rs:278-296`, `main.rs:686,693`).
+  the GeoLite2-ASN database loads (`parse_asn_list`, `config.rs:366-384`, `main.rs:845,852`).
 
 ## Sensor binds and WAN attribution
 

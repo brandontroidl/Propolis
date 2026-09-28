@@ -73,12 +73,12 @@ The invariant is defence-in-depth, not source discipline alone:
 - **Deployment-layer W^X.** Every systemd unit sets `MemoryDenyWriteExecute=yes`
   (`deploy/sensor-ssh.service:104-112`), so a page cannot be both writable and
   executable even if an exec primitive were somehow reached. A test asserts the
-  directive is present and correctly spelled -
-  `crates/sensor-framework/tests/deploy_test.rs:100-102` - because the `-ion`
+  directive is present and correctly spelled - `assert_unit_hardened`,
+  `crates/sensor-framework/tests/deploy_test.rs:103-107` - because the `-ion`
   misspelling silently installs no rule. Owned by
   [filesystem-and-db-protections.md](filesystem-and-db-protections.md).
 - **No-execute spool.** Captured sample bodies are written mode `0640`
-  (`crates/sensor-framework/src/spool.rs:271-279`) and the spool directory is
+  (`write_and_seal`, `crates/sensor-framework/src/spool.rs:348-364`) and the spool directory is
   required to be a `noexec,nosuid,nodev` mount. A captured file is therefore not
   marked executable and lives on a mount that would refuse execution. The mount
   option is an operator deployment step, not enforced by the units - see

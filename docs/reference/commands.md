@@ -63,7 +63,8 @@ cargo test -p console -- --ignored rdns     # the one #[ignore]d live rDNS test 
 ```
 
 > **Egress warning.** `cargo test -p console -- --ignored rdns` performs a live
-> reverse-DNS lookup (`crates/console/src/rdns.rs:186-191`). It is `#[ignore]`d
+> reverse-DNS lookup (`live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`,
+> `crates/console/src/rdns.rs:352-366`). It is `#[ignore]`d
 > precisely so the default suite stays offline-deterministic. Run it only when a
 > real DNS query is acceptable.
 
@@ -115,8 +116,8 @@ cargo run -p propolis          # intake + review + feed + console + VT + fetcher
 
 `propolis` connects the `PgPool`, applies migrations (see below), then spawns
 each subsystem as a supervised tokio task. The console listens on
-`config.console_bind` (default `127.0.0.1:8080`,
-`crates/propolis/src/main.rs`/`config.rs:29`). Review, feed, VirusTotal,
+`config.console_bind` (default `127.0.0.1:8080`, `DEFAULT_CONSOLE_BIND`,
+`crates/propolis/src/main.rs`/`config.rs:30`). Review, feed, VirusTotal,
 fetcher, and the ops-monitor are each **opt-in** and default OFF; when enabled,
 several are outbound paths (see warning under Operations). See
 [`../architecture/process-topology.md`](../architecture/process-topology.md).
@@ -124,12 +125,15 @@ several are outbound paths (see warning under Operations). See
 ## Migrations
 
 There is no standalone migrate command in the shipped surface. The `propolis`
-daemon applies both migration histories against the one database at startup,
-in order: core-scoring (`crates/core-scoring/migrations/`, 11 files) then review
-(`crates/review/migrations/`, 3 files), each exiting `1` on failure
-(`crates/propolis/src/main.rs:555-566`). Review carries its own migrator that
-renames its bookkeeping table to `_sqlx_migrations_review`
-(`crates/review/src/lib.rs:25-49`) because both histories number from `0001`.
+daemon applies all three migration histories against the one database at
+startup, in order: core-scoring (`crates/core-scoring/migrations/`, 12 files),
+review (`crates/review/migrations/`, 7 files), then fleet
+(`crates/fleet/migrations/`, 1 file), each exiting `1` on failure
+(`crates/propolis/src/main.rs:665-680`). Review and fleet each carry their own
+migrator that renames its bookkeeping table (`review::migrator`, table
+`_sqlx_migrations_review`, `crates/review/src/lib.rs:26-50`; `fleet::migrator`,
+table `_sqlx_migrations_fleet`, `crates/fleet/src/lib.rs:30-37`) because all
+three histories number from `0001`.
 See [`../development/schema-and-migrations.md`](../development/schema-and-migrations.md)
 and [`database.md`](database.md).
 

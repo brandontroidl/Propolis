@@ -51,16 +51,17 @@ Enforced by the console's accept loop (`console::server::ServeLimits::default`,
 ## VirusTotal daily cap
 
 Enforced by a single `DailyBudget` owned across every scan cycle
-(`crates/review/src/virustotal.rs:22-58`, `crates/propolis/src/main.rs:771-774`).
+(`DailyBudget`, `crates/review/src/virustotal.rs:74-103`;
+`crates/propolis/src/main.rs:936-940`).
 A per-cycle counter would reset each cycle and never enforce a per-day cap.
 
 | Item | Value | Source |
 |---|---|---|
-| Daily cap | 450 requests / UTC day *(hard-coded)* | `main.rs:752` |
+| Daily cap | 450 requests / UTC day *(hard-coded)* | `main.rs:923` |
 | Request delay | 15000 ms before each lookup and before each upload *(hard-coded)* | `main.rs`, applied in `virustotal.rs::scan_spool` |
 | Upload cost | one budget unit per upload, in addition to the lookup that preceded it | `virustotal.rs::scan_spool` (`NextStep::Upload`) |
 | Pending recheck | 900 s default before an uploaded, unverdicted sample is looked up again; one budget unit per recheck; never re-uploaded | `PROPOLIS_VT_PENDING_RECHECK_SECS`, `virustotal.rs::needs_lookup` |
-| Scan interval | 300 s default | `PROPOLIS_VT_SCAN_INTERVAL_SECS` (`config.rs:523`) |
+| Scan interval | 300 s default | `PROPOLIS_VT_SCAN_INTERVAL_SECS` (`config.rs:615`) |
 | Documented VT free-tier limit | 4 req/min, 500/day | reference only, verified live 2026-08-19 (`virustotal.rs:5-6`) |
 
 `try_consume` resets `used = 0` when the UTC date rolls over, else refuses
@@ -97,7 +98,7 @@ overrides:
 ## Malware fetcher budgets and bounds
 
 The fetcher is opt-in (`PROPOLIS_FETCH_ENABLED`, default false) and off by
-default (`crates/propolis/src/config.rs:527`). Its egress is bounded at several
+default (`fetch_enabled` parse, `crates/propolis/src/config.rs:622`). Its egress is bounded at several
 layers.
 
 ### Per-cycle and per-host
@@ -107,9 +108,9 @@ layers.
 | In-flight concurrency | 8 per cycle *(hard-coded semaphore)* | `CONCURRENCY` (`crates/review/src/fetcher/mod.rs:136,340`) |
 | Max attempts per URL | 3, then terminal `Dead` *(hard-coded)* | `MAX_ATTEMPTS` (`mod.rs:131,489-493`) |
 | Retry backoff | `5 * 4^(attempts-1)` min after the first and second failures (5, then 20); the third failure is terminal, so no longer delay is ever scheduled *(hard-coded)* | `backoff_delay` (`mod.rs:138-144`) |
-| Per-host hourly budget | default 12, max 1000 | `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` (`config.rs:36,58`) |
-| Daily cap | default 200, max 10000 | `PROPOLIS_FETCH_DAILY_CAP` (`config.rs:39,60`) |
-| Batch size per cycle | default 20, max 1000 | `PROPOLIS_FETCH_BATCH_SIZE` (`config.rs:40,61`) |
+| Per-host hourly budget | default 12, max 1000 | `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` (`config.rs:36,57`) |
+| Daily cap | default 200, max 10000 | `PROPOLIS_FETCH_DAILY_CAP` (`config.rs:39,58`) |
+| Batch size per cycle | default 20, max 1000 | `PROPOLIS_FETCH_BATCH_SIZE` (`config.rs:40,59`) |
 | Cycle interval | default 10 s, max 86400 s | `PROPOLIS_FETCH_INTERVAL_SECS` (`config.rs:34`) |
 
 The per-host and daily budgets live in PostgreSQL, not in process memory, so
@@ -131,12 +132,12 @@ panic never aborts the batch.
 
 | Item | Value | Env var / source |
 |---|---|---|
-| Max body bytes | default 10 MB (10000000), max 500 MB | `PROPOLIS_FETCH_MAX_BYTES` (`config.rs:35,52`) |
+| Max body bytes | default 10 MB (10000000), max 500 MB | `PROPOLIS_FETCH_MAX_BYTES` (`config.rs:35,53`) |
 | Redirect hops followed | default 3 | `PROPOLIS_FETCH_MAX_HOPS` (`config.rs:37`) |
 | Recursion depth | default 2 | `PROPOLIS_FETCH_MAX_DEPTH` (`config.rs:38`) |
 | Connect timeout | default 10 s | `PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS` (`config.rs:41`) |
 | Read timeout | default 10 s | `PROPOLIS_FETCH_READ_TIMEOUT_SECS` (`config.rs:42`) |
-| Total timeout | default 30 s, max 300 s | `PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS` (`config.rs:43,54`) |
+| Total timeout | default 30 s, max 300 s | `PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS` (`config.rs:43,56`) |
 
 The byte cap is enforced mid-stream: the transfer aborts to `TooBig` as soon as
 `body.len() + chunk.len() > max_bytes`, never buffering the whole oversized body
@@ -191,7 +192,7 @@ A zero interval is rejected for the review loops (would busy-loop)
 
 | Item | Value | Source |
 |---|---|---|
-| Sample spool max age | 30 days, removed each VT cycle *(hard-coded)* | `crates/propolis/src/main.rs:781` |
+| Sample spool max age | 30 days, checked hourly by the `sample-retention` task regardless of whether VirusTotal is enabled *(hard-coded)* | `SAMPLE_RETENTION_DAYS` (`crates/propolis/src/main.rs:53`); cleanup call at `crates/propolis/src/main.rs:973` |
 
 Operational spool and queue sizing (disk headroom, backpressure) is covered in
 [../operations/queue-and-spool.md](../operations/queue-and-spool.md).

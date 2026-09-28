@@ -18,7 +18,7 @@ stated in `CONTRIBUTING.md` and observable in the tree.
 - **Rust 2024 edition** on every crate (`crates/*/Cargo.toml:4`, `CONTRIBUTING.md:18`).
 - **Pinned toolchain** `1.96.1` - see [toolchain-and-environment](toolchain-and-environment.md).
 - **`cargo fmt`** with default rustfmt config (no `rustfmt.toml` in the tree).
-  `cargo fmt --all --check` is a CI gate (`CONTRIBUTING.md:18`, `ci.yml:49`).
+  `cargo fmt --all --check` is a CI gate (`CONTRIBUTING.md:18`, `ci.yml:51`).
 - **Line endings LF**, final newline, trimmed trailing whitespace, UTF-8, 4-space
   Rust indent - enforced by `.editorconfig`.
 
@@ -26,7 +26,7 @@ stated in `CONTRIBUTING.md` and observable in the tree.
 
 `cargo clippy --workspace --all-targets --locked -- -D warnings` must pass - clippy
 runs with **warnings denied**, so any lint is a hard failure (`CONTRIBUTING.md:19`,
-`ci.yml:70`). `--all-targets` means test code is linted too.
+`ci.yml:72`). `--all-targets` means test code is linted too.
 
 ## Comments
 
@@ -52,11 +52,13 @@ justification; the workspace does **not** apply `#![forbid(unsafe_code)]`. Verif
 uses in project (non-vendored) source:
 
 - `crates/console/src/rdns.rs` - libc FFI for the forward-confirmed reverse-DNS
-  resolver (`getnameinfo`, `CStr::from_ptr`, zeroed `sockaddr`), `SAFETY`-commented
-  (`rdns.rs:107-138`).
+  resolver (`getnameinfo`, `CStr::from_ptr`, zeroed `sockaddr`), in `reverse_lookup`
+  and the `sockaddr_in_for`/`sockaddr_in6_for` helpers (`rdns.rs:137-196`); the
+  `CStr` and zeroed-`sockaddr` blocks are `SAFETY`-commented.
 - `crates/propolis/src/config.rs` - `unsafe { env::set_var / remove_var }` inside
   `#[cfg(test)]` only; Rust 2024 marks these functions `unsafe` because process
-  environment mutation is global cross-thread state (`config.rs:699-768`).
+  environment mutation is global cross-thread state - scattered across many call
+  sites in `mod tests`, e.g. `config.rs:847-1086`.
 
 No other project source contains `unsafe` blocks. Sensor crates additionally keep
 `tokio`'s `process` feature off and are guarded by static tests that reject

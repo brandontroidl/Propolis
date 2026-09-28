@@ -38,8 +38,8 @@ default the binaries carry.
 - **Aggregated single-node binary** `propolis` (`crates/propolis`, ExecStart
   `/usr/local/bin/propolis`, `deploy/propolis.service:115`): embeds intake +
   review + feed + the console web server + an outbound fetcher in one process.
-  It binds **only** the console (`crates/propolis/src/config.rs:509-513`;
-  listener at `crates/propolis/src/main.rs:413`). It does **not** bind any
+  It binds **only** the console (`crates/propolis/src/config.rs:600-608`;
+  listener in `run_console`, `crates/propolis/src/main.rs:503`). It does **not** bind any
   sensor ports; sensors always run as their own binaries.
 
 ## Attacker-facing listeners (honeypot)
@@ -101,14 +101,14 @@ bind/listen code found in its source].
 ## Operator-facing listener (console web UI)
 
 - **`PROPOLIS_CONSOLE_BIND`**, default **`127.0.0.1:8080`** (loopback only)
-  (`crates/console/src/main.rs:28,38`). Unprivileged port (>1024); the unit
+  (`ENV_BIND`, `DEFAULT_BIND`, `crates/console/src/main.rs:28,52`). Unprivileged port (>1024); the unit
   grants no bind capability (`deploy/console.service` `CapabilityBoundingSet=`).
 - The console binds non-localhost **only** if the operator overrides the
   default; the design intent is to place it behind the operator's own reverse
-  proxy (`crates/console/src/main.rs:35-37`).
+  proxy (`crates/console/src/main.rs:49-51`).
 - The aggregated `propolis` binary uses the same default and env var
   (`DEFAULT_CONSOLE_BIND = "127.0.0.1:8080"`,
-  `crates/propolis/src/config.rs:30,509-513`).
+  `crates/propolis/src/config.rs:30,600-608`).
 
 > The console is plain HTTP on a loopback `TcpListener` (`console::server::serve`, HTTP/1.1, no
 > rustls). There is **no in-process TLS**. Any TLS is operator-provided (e.g. a
@@ -120,7 +120,7 @@ bind/listen code found in its source].
 These share the **same** bind as the console (`PROPOLIS_CONSOLE_BIND`, default
 `127.0.0.1:8080`) - there is **no** separate metrics/health port. All three are
 merged onto the single console router and mounted **outside** the auth
-middleware (`crates/console/src/routes/mod.rs:49-51`).
+middleware (`router`'s outer merge chain, `crates/console/src/routes/mod.rs:70-78`).
 
 | Route | Purpose | Behavior | Source |
 |---|---|---|---|
@@ -137,7 +137,7 @@ Full console route inventory is owned by
   `DATABASE_URL` and bind no network listener.
 - The `propolis` aggregated binary's outbound fetcher (malware/artifact
   retrieval) is **outbound only** - no inbound bind
-  (`crates/propolis/src/config.rs:34-64`).
+  (`crates/propolis/src/config.rs:34-65`).
 
 ## Admin / SSH
 

@@ -50,15 +50,15 @@ Details that are load-bearing:
 
 - **`--all-targets` on clippy** compiles the test targets, so a test file that no
   longer compiles fails at clippy rather than silently vanishing from the suite
-  (`ci.yml:66-68`).
+  (`ci.yml:68-72`).
 - **`--test-threads=1`** runs the suite serially.
 - **`set -o pipefail`** is mandatory in the tests job: without it, piping `cargo
   test` through `tee` would report `tee`'s success and pass a red suite
-  (`ci.yml:103-108`).
+  (`ci.yml:105-110`).
 - **`--locked`** enforces the committed `Cargo.lock` frozen (clippy + tests jobs).
 - An advisory `Report test totals` step (`if: always()`) sums passed/failed/ignored
   and counts test binaries into the run summary; it never fails the job
-  (`ci.yml:115-143`). It exists so a sudden drop in how much ran is visible to a
+  (`ci.yml:112-145`). It exists so a sudden drop in how much ran is visible to a
   human.
 
 Running the gate locally mirrors CI:

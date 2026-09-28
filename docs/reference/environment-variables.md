@@ -24,7 +24,7 @@ does not generate them (it only prints a reminder to populate them,
 Propolis ships two ways to run the platform, and the env surface differs:
 
 1. **Unified daemon** `propolis` - one `load_config()`
-   (`crates/propolis/src/config.rs:429`) parses intake, review, feed, console,
+   (`crates/propolis/src/config.rs:517`) parses intake, review, feed, console,
    VirusTotal, malware-fetcher, and ops-alert config from a single env set
    (`EnvironmentFile=/etc/propolis/propolis.env`). It does **not** read sensor
    `*_BIND`/`*_WAN_MAP` variables; it consumes sensor **log files** via
@@ -55,12 +55,12 @@ Unified daemon (`config.rs`) parse helpers:
 
 | Helper | Unset/empty | Invalid | Zero | Other |
 |---|---|---|---|---|
-| `require_env` (`:168`) | `Missing` (abort) | - | - | - |
-| `parse_positive_u64` (`:175`) | default | `Invalid` (abort) | `Invalid` (abort) - "zero never means unlimited" | - |
-| `parse_bounded_positive_u64` (`:199`) | default | abort | abort | `> max` → abort |
-| `parse_u32` (`:215`) | default | abort | allowed | - |
-| `parse_bounded_u8` (`:351`) | default | abort | allowed (0 = maximally strict) | `> 255` → abort (no wrap) |
-| `parse_bool_flag` (`:227`) | default | - | - | case-insensitive `true`/`false` only; **any** other value (incl. `1`, `yes`) → default |
+| `require_env` (`:224`) | `Missing` (abort) | - | - | - |
+| `parse_positive_u64` (`:231`) | default | `Invalid` (abort) | `Invalid` (abort) - "zero never means unlimited" | - |
+| `parse_bounded_positive_u64` (`:255`) | default | abort | abort | `> max` → abort |
+| `parse_u32` (`:303`) | default | abort | allowed | - |
+| `parse_bounded_u8` (`:439`) | default | abort | allowed (0 = maximally strict) | `> 255` → abort (no wrap) |
+| `parse_bool_flag` (`:315`) | default | - | - | case-insensitive `true`/`false` only; **any** other value (incl. `1`, `yes`) → default |
 
 Note `parse_bool_flag` does **not** accept `1`/`yes`; ops-alert `get_bool` and
 console rDNS parse booleans more broadly (called out below).
@@ -70,8 +70,8 @@ console rDNS parse booleans more broadly (called out below).
 ## Universal / cross-cutting
 
 ### `DATABASE_URL`
-- Read by: `propolis` (`config.rs:430`), `console` (`main.rs:113`), `feed`
-  (`main.rs:183`), `intake` (`main.rs:146`), `review` (`main.rs:199`).
+- Read by: `propolis` (`config.rs:518`), `console` (`main.rs:144`), `feed`
+  (`main.rs:183`), `intake` (`main.rs:156`), `review` (`main.rs:199`).
 - Required: **yes**, for every binary that touches PostgreSQL. No default.
 - Form: PostgreSQL connection string (not validated at parse time; `sqlx`
   validates on connect).
@@ -79,7 +79,7 @@ console rDNS parse booleans more broadly (called out below).
   `.filter(|s| !s.is_empty())`).
 
 ### `RUST_LOG`
-- Read by: `propolis` (`main.rs:524`), `console` (`main.rs:194`), and the
+- Read by: `propolis` (`main.rs:635-636`), `console` (`main.rs:278-279`), and the
   sensors via `tracing_subscriber`.
 - Required: no. Default filter `info` on unset or parse failure.
 - Standard `tracing_subscriber::EnvFilter` default-env name. Sensors `cred`/`smtp`
@@ -121,7 +121,7 @@ variable in this section plus the universal ones above.
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs (`config.rs:236-262`). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
+| `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs (`parse_sensor_logs`, `config.rs:324-350`). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
 | `PROPOLIS_CURSOR_DIR` | no | `/var/lib/propolis/cursors` (`config.rs:17`) | any path; no validation |
 | `PROPOLIS_POLL_INTERVAL_MS` | no | `1000` (`config.rs:18`) | positive u64 ms; zero/unparseable → abort |
 
@@ -129,11 +129,11 @@ variable in this section plus the universal ones above.
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_REVIEW_ENABLED` | no | `true` (`config.rs:444`) | bool_flag |
+| `PROPOLIS_REVIEW_ENABLED` | no | `true` (`config.rs:532`) | bool_flag |
 | `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS` | no | `60` (`config.rs:19`) | positive u64; zero → abort |
 | `PROPOLIS_SUBMIT_POLL_INTERVAL_SECS` | no | `30` (`config.rs:20`) | positive u64; zero → abort |
 
-### Vendor abuse submitters (`config.rs:454-474`, `load_vendor_config:391`)
+### Vendor abuse submitters (`config.rs:542-562`, `load_vendor_config:479-513`)
 
 Each vendor `<V>` ∈ {`ABUSEIPDB`, `DSHIELD`, `OTX`}. These are opt-in egress
 paths, default off. See [outbound controls](../security/outbound-controls.md)
@@ -141,13 +141,13 @@ and [integrations](integrations.md).
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_VENDOR_<V>_KEY` | no | `""` | empty key + enabled → vendor forced **disabled** (fail-closed, warns) (`:399-405`) |
+| `PROPOLIS_VENDOR_<V>_KEY` | no | `""` | empty key + enabled → vendor forced **disabled** (fail-closed, warns) (`:486-493`) |
 | `PROPOLIS_VENDOR_<V>_URL` | no | vendor base URL (below) | no validation |
-| `PROPOLIS_VENDOR_<V>_ENABLED` | no | `false` (`:398`) | bool_flag; stays disabled unless key present |
+| `PROPOLIS_VENDOR_<V>_ENABLED` | no | `false` (`:486`) | bool_flag; stays disabled unless key present |
 | `PROPOLIS_VENDOR_<V>_COOLDOWN_HOURS` | no | `24` (`config.rs:31`) | parse_u32; zero allowed; unparseable → abort |
 | `PROPOLIS_VENDOR_<V>_RATE_LIMIT` | no | `100` (`config.rs:32`) | parse_u32 |
 | `PROPOLIS_VENDOR_<V>_RATE_WINDOW_HOURS` | no | `1` (`config.rs:33`) | parse_u32 |
-| `PROPOLIS_VENDOR_DSHIELD_USER` | no | none | DShield only (`:460`); if set with a key, composed as `{user}:{key}` into the single key slot (`:463-466`). User alone (no key) is ignored. |
+| `PROPOLIS_VENDOR_DSHIELD_USER` | no | none | DShield only (`:548`); if set with a key, composed as `{user}:{key}` into the single key slot (`:551-554`). User alone (no key) is ignored. |
 
 Concrete literal names the code reads (the `<V>` rows above, instantiated for each vendor):
 `PROPOLIS_VENDOR_ABUSEIPDB_KEY`, `PROPOLIS_VENDOR_ABUSEIPDB_URL`,
@@ -163,7 +163,7 @@ Default base URLs (`crates/review/src/vendor/*.rs`):
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_FEED_ENABLED` | no | `true` (`config.rs:476`) | bool_flag |
+| `PROPOLIS_FEED_ENABLED` | no | `true` (`config.rs:564`) | bool_flag |
 | `PROPOLIS_FEED_OUTPUT_DIR` | no | `/var/lib/propolis/feed/current` (`config.rs:21`) | path |
 | `PROPOLIS_FEED_BUILD_INTERVAL_SECS` | no | `900` (`config.rs:22`) | positive u64; zero → abort |
 | `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` | no | `24` (`config.rs:23`) | positive u64; ×3600 → Duration; zero → abort |
@@ -177,13 +177,13 @@ Default base URLs (`crates/review/src/vendor/*.rs`):
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_CONSOLE_BIND` | no | `127.0.0.1:8080` (`config.rs:30`) | must parse as `ip:port` SocketAddr; invalid → abort (`:512`) |
-| `PROPOLIS_CONSOLE_PASSWORD` | **yes** | - | `require_env`; absent/empty → **abort** (`:517`) |
-| `PROPOLIS_CONSOLE_SESSION_SECRET` | no | random 32 bytes generated at startup (`:374-377`) | if set, must be exactly 64 hex chars (32 bytes), else abort (`:379-388`). Sessions are in-memory, so a fresh secret per restart only invalidates sessions already dropped on restart. |
+| `PROPOLIS_CONSOLE_BIND` | no | `127.0.0.1:8080` (`config.rs:30`) | must parse as `ip:port` SocketAddr; invalid → abort (`:602-608`) |
+| `PROPOLIS_CONSOLE_PASSWORD` | **yes** | - | `require_env`; absent/empty → **abort** (`:609`) |
+| `PROPOLIS_CONSOLE_SESSION_SECRET` | no | random 32 bytes generated at startup (`load_session_secret`, `config.rs:459-477`) | if set, must be exactly 64 hex chars (32 bytes), else abort (`:467-476`). Sessions are in-memory, so a fresh secret per restart only invalidates sessions already dropped on restart. |
 | `PROPOLIS_CONSOLE_MAX_SOURCE_IPS` | no | `3` (`routes/samples.rs`) | how many attacker IPs the Samples page shows inline per sample before collapsing to "+N more"; blank/zero/unparseable falls back to the default (zero never means unlimited) |
 | `PROPOLIS_SPOOL_ROOT` | no | `/var/spool/propolis` (`review/src/spool.rs`) | root of the spool tree. Per-sensor spool dirs default under it, but each sensor's own `PROPOLIS_<SENSOR>_SPOOL_DIR` still wins, so the platform side (VT scan, retention, console) resolves the same directory the sensor actually writes to. Must match what `deploy/install.sh` provisions and what the units grant in `ReadWritePaths`. |
-| `PROPOLIS_GEOIP_DIR` | no | none (`Option`, `:480`) | directory of GeoLite2 `.mmdb` files; empty string treated as unset; missing dir/file degrades gracefully. GeoIP enrichment is **local file reads, not network**. |
-| `PROPOLIS_CONSOLE_RDNS_ENABLED` | no | `false` (`config.rs:484`) | bool_flag; opt-in forward-confirmed reverse DNS - the one outbound DNS lookup. Default off. See [outbound controls](../security/outbound-controls.md). |
+| `PROPOLIS_GEOIP_DIR` | no | none (`Option`, `:568`) | directory of GeoLite2 `.mmdb` files; empty string treated as unset; missing dir/file degrades gracefully. GeoIP enrichment is **local file reads, not network**. |
+| `PROPOLIS_CONSOLE_RDNS_ENABLED` | no | `false` (`config.rs:572`) | bool_flag; opt-in forward-confirmed reverse DNS - the one outbound DNS lookup. Default off. See [outbound controls](../security/outbound-controls.md). |
 | `PROPOLIS_CONSOLE_TRUSTED_PROXY` | no | `false` | bool_flag; set when the console sits behind a TLS reverse proxy so session cookies are always marked `Secure` (a same-host proxy connects over loopback, which would otherwise drop the flag on a real HTTPS hop). |
 | `PROPOLIS_CONSOLE_METRICS_TOKEN` | no | none | if set, `/metrics` requires `Authorization: Bearer <token>` (constant-time compare); unset leaves `/metrics` open - safe only on a loopback bind. Defense in depth for a non-loopback bind. |
 
@@ -285,10 +285,10 @@ Opt-in egress, default off. See [integrations](integrations.md) and
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_VT_KEY` | no | `""` (`config.rs:520`) | empty → VT disabled regardless of `_ENABLED` |
-| `PROPOLIS_VT_ENABLED` | no | `false` (`:521`) | bool_flag; **and** a non-empty key required to actually enable (`&& !vt_api_key.is_empty()`) |
-| `PROPOLIS_VT_UPLOAD` | no | `false` (`:522`) | bool_flag; upload-unknown-samples opt-in |
-| `PROPOLIS_VT_SCAN_INTERVAL_SECS` | no | `300` (`:523`) | parse_u32 (zero allowed); unparseable → abort. No `PROPOLIS_VT_URL` override exists. |
+| `PROPOLIS_VT_KEY` | no | `""` (`config.rs:612`) | empty → VT disabled regardless of `_ENABLED` |
+| `PROPOLIS_VT_ENABLED` | no | `false` (`:613`) | bool_flag; **and** a non-empty key required to actually enable (`&& !vt_api_key.is_empty()`) |
+| `PROPOLIS_VT_UPLOAD` | no | `false` (`:614`) | bool_flag; upload-unknown-samples opt-in |
+| `PROPOLIS_VT_SCAN_INTERVAL_SECS` | no | `300` (`:615`) | parse_u32 (zero allowed); unparseable → abort. No `PROPOLIS_VT_URL` override exists. |
 | `PROPOLIS_VT_PENDING_RECHECK_SECS` | no | `900` | parse_u32; how long an uploaded sample with no verdict yet (`detected = -1`) waits before its hash is looked up again. Each recheck costs one daily-budget unit. Zero → every scan cycle. unparseable → abort. |
 
 ### Malware fetcher (unified daemon only)
@@ -298,25 +298,25 @@ and [rate limits and budgets](rate-limits-and-budgets.md).
 
 | Variable | Req | Default | Max | Bounds / fail |
 |---|---|---|---|---|
-| `PROPOLIS_FETCH_ENABLED` | no | `false` (`config.rs:527`) | - | bool_flag |
-| `PROPOLIS_FETCH_INTERVAL_SECS` | no | `10` (`:34`) | `86400` (`:60`) | bounded positive u64; zero/over-max → abort |
-| `PROPOLIS_FETCH_MAX_BYTES` | no | `10_000_000` (`:35`) | `500_000_000` (`:52`) | bounded positive u64 → usize; **zero → abort** (would disable the byte guard); over-max → abort |
-| `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` | no | `12` (`:36`) | `1000` (`:56`) | bounded positive u64 → u32 |
+| `PROPOLIS_FETCH_ENABLED` | no | `false` (`config.rs:622`) | - | bool_flag |
+| `PROPOLIS_FETCH_INTERVAL_SECS` | no | `10` (`:34`) | `86400` (`:61`) | bounded positive u64; zero/over-max → abort |
+| `PROPOLIS_FETCH_MAX_BYTES` | no | `10_000_000` (`:35`) | `500_000_000` (`:53`) | bounded positive u64 → usize; **zero → abort** (would disable the byte guard); over-max → abort |
+| `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` | no | `12` (`:36`) | `1000` (`:57`) | bounded positive u64 → u32 |
 | `PROPOLIS_FETCH_MAX_HOPS` | no | `3` (`:37`) | `255` (u8) | bounded_u8; **zero allowed** (no redirects); >255 → abort |
 | `PROPOLIS_FETCH_MAX_DEPTH` | no | `2` (`:38`) | `255` (u8) | bounded_u8; zero allowed (no recursion) |
-| `PROPOLIS_FETCH_DAILY_CAP` | no | `200` (`:39`) | `10_000` (`:57`) | bounded positive u64 → u32 |
-| `PROPOLIS_FETCH_BATCH_SIZE` | no | `20` (`:40`) | `1000` (`:58`) | bounded positive u64 → usize |
-| `PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS` | no | `10` (`:41`) | `300` (`:55`) | bounded positive u64 |
+| `PROPOLIS_FETCH_DAILY_CAP` | no | `200` (`:39`) | `10_000` (`:58`) | bounded positive u64 → u32 |
+| `PROPOLIS_FETCH_BATCH_SIZE` | no | `20` (`:40`) | `1000` (`:59`) | bounded positive u64 → usize |
+| `PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS` | no | `10` (`:41`) | `300` (`:56`) | bounded positive u64 |
 | `PROPOLIS_FETCH_READ_TIMEOUT_SECS` | no | `10` (`:42`) | `300` | bounded positive u64 |
 | `PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS` | no | `30` (`:43`) | `300` | bounded positive u64 |
-| `PROPOLIS_FETCH_USER_AGENT` | no | `Wget/1.21.3` (`:64`) | - | blank → default |
+| `PROPOLIS_FETCH_USER_AGENT` | no | `Wget/1.21.3` (`:65`) | - | blank → default |
 | `PROPOLIS_FETCH_OWN_IPS` | no | `""` | - | comma-sep IP list (`parse_ip_list`); invalid → abort. Unioned with live-interface IPs for the SSRF self-target guard. |
 
-Fetcher runtime fail-closed (`main.rs:828-835`): if `PROPOLIS_FETCH_OWN_IPS` is
-unset **and** interface enumeration returns empty, the fetcher **refuses to run**
+Fetcher runtime fail-closed (`own_ips.is_empty()` check, `main.rs:1017-1024`): if
+`PROPOLIS_FETCH_OWN_IPS` is unset **and** interface enumeration returns empty, the fetcher **refuses to run**
 (logs an error and returns). If the own-IPs set has only private/loopback/
 link-local addresses (a NAT'd node whose public WAN IP is on no interface), it
-**warns but runs** (`main.rs:843-852`); set `PROPOLIS_FETCH_OWN_IPS` to the
+**warns but runs** (`own_ips_lack_a_public_address` check, `main.rs:1032-1041`); set `PROPOLIS_FETCH_OWN_IPS` to the
 public egress IP for self-target protection.
 
 ### Operational self-alerting (ops-alert)
@@ -418,21 +418,21 @@ per-collector spool (one `name:path` entry per collector, not per sensor) - see
 Each reads a strict subset of the unified daemon's variables with the same
 defaults and the same strict-parse/fail-closed rules unless noted.
 
-- **`console`** (`crates/console/src/main.rs:112`): `DATABASE_URL` (req),
+- **`console`** (`load_config_from_env`, `crates/console/src/main.rs:143`): `DATABASE_URL` (req),
   `PROPOLIS_CONSOLE_BIND`, `PROPOLIS_CONSOLE_PASSWORD` (req, empty→abort),
   `PROPOLIS_CONSOLE_SESSION_SECRET`, `PROPOLIS_FEED_OUTPUT_DIR`,
   `PROPOLIS_GEOIP_DIR`, `PROPOLIS_CONSOLE_RDNS_ENABLED`, `RUST_LOG`. Two
   divergences from the unified daemon: `PROPOLIS_FEED_OUTPUT_DIR` is **not**
-  empty-filtered (`main.rs:130`), so an explicitly-empty value becomes
+  empty-filtered (`main.rs:161`), so an explicitly-empty value becomes
   `Some(PathBuf::from(""))`; and `PROPOLIS_CONSOLE_RDNS_ENABLED` accepts
-  `true|1|yes` case-insensitive (`main.rs:136`), broader than `bool_flag`.
+  `true|1|yes` case-insensitive (`main.rs:166-168`), broader than `bool_flag`.
 - **`feed`** (`crates/feed/src/main.rs:182`): `DATABASE_URL` (req),
   `PROPOLIS_FEED_OUTPUT_DIR`, `PROPOLIS_FEED_BUILD_INTERVAL_SECS`,
   `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS`, `PROPOLIS_FEED_STANDARD_TTL_HOURS`,
   `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_DELIST`,
   `PROPOLIS_FEED_ASN_ALLOWLIST`, `PROPOLIS_GEOIP_DIR`. **Does not read
   `PROPOLIS_FEED_WINDOWS`** (no `all-{label}` retention feeds in standalone).
-- **`intake`** (`crates/intake/src/main.rs:145`): `DATABASE_URL` (req),
+- **`intake`** (`crates/intake/src/main.rs:155`): `DATABASE_URL` (req),
   `PROPOLIS_CURSOR_DIR`, `PROPOLIS_POLL_INTERVAL_MS`, `PROPOLIS_SENSOR_LOGS`
   (req, empty→abort).
 - **`review`** (`crates/review/src/main.rs:198`): `DATABASE_URL` (req),
@@ -604,17 +604,17 @@ Invalid or zero bound → **silent default**, not abort.
 ## Interactions
 
 - **VT enable requires both**: `PROPOLIS_VT_ENABLED=true` **and** a non-empty
-  `PROPOLIS_VT_KEY` (`config.rs:521`). Either missing → VT off.
+  `PROPOLIS_VT_KEY` (`config.rs:613`). Either missing → VT off.
 - **Vendor enable requires key**: `PROPOLIS_VENDOR_<V>_ENABLED=true` with an
-  empty `_KEY` → forced disabled and warns (`config.rs:399-405`, review
+  empty `_KEY` → forced disabled and warns (`config.rs:486-493`, review
   `main.rs:150-156`).
 - **DShield user+key composition**: `PROPOLIS_VENDOR_DSHIELD_USER` +
   `PROPOLIS_VENDOR_DSHIELD_KEY` compose to `{user}:{key}` in the single key slot
-  (`config.rs:463-466`). User alone is ignored.
+  (`config.rs:551-554`). User alone is ignored.
 - **ASN suppression needs GeoIP**: `PROPOLIS_FEED_ASN_ALLOWLIST` is inert unless
   `PROPOLIS_GEOIP_DIR` is set and the GeoLite2-ASN DB loads. The unified daemon
-  warns when the ASN allowlist is set but `GEOIP_DIR` is unset (`main.rs:686`) or
-  the ASN DB failed to load (`main.rs:693`).
+  warns when the ASN allowlist is set but `GEOIP_DIR` is unset (`main.rs:856-858`) or
+  the ASN DB failed to load (`main.rs:862-865`).
 - **Fetcher SSRF guard vs OWN_IPS**: `PROPOLIS_FETCH_OWN_IPS` unions with live
   interface IPs; an empty union → the fetcher refuses to run; a union without any
   public address → warn-only.

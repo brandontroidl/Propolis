@@ -70,7 +70,7 @@ argument values, not query text).
 
 - The **event insert** is fully parameterized: `INSERT INTO event ... VALUES ($1::inet,
   $2::inet, $3, ... $14) RETURNING id` via `sqlx::query_scalar` with bound params
-  (`crates/core-scoring/src/repository/events.rs:167-171`). The advisory lock guarding the
+  (`insert_chained`, `crates/core-scoring/src/repository/events.rs:316-350`). The advisory lock guarding the
   hash chain is parameterized too (`pg_advisory_xact_lock($1)`).
 - Feed builder, review CLI, and VirusTotal writes all use `$`-placeholders or static SQL.
 - The repository module deliberately uses the runtime `sqlx::query*` API with bound values,

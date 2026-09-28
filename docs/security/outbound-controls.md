@@ -52,18 +52,18 @@ fetcher is the exception: it ignores every one of these variables (see
 ### 1. VirusTotal (`review`)
 
 Sample-hash lookups (and optionally uploads) against
-`https://www.virustotal.com/api/v3/...` via a `reqwest` client
-(`crates/review/src/virustotal.rs:102,190,253`). Enabled only when the flag is
+`https://www.virustotal.com/api/v3/...` via a `reqwest` client (client builder,
+`lookup_hash`, `upload_sample`; `crates/review/src/virustotal.rs:177,306,365`). Enabled only when the flag is
 on **and** a key is present:
 
 ```
 vt_enabled = parse_bool_flag("PROPOLIS_VT_ENABLED", false) && !vt_api_key.is_empty()
 ```
 
-(`crates/propolis/src/config.rs:521`) - default off, fail-closed to off with no
+(`crates/propolis/src/config.rs:613`) - default off, fail-closed to off with no
 key. Uploading unknown samples is a separate flag, `PROPOLIS_VT_UPLOAD`, also
-default false (`config.rs:522`). A per-UTC-day request cap bounds volume
-(`virustotal.rs:22`, `RequestBudget`).
+default false (`config.rs:614`). A per-UTC-day request cap bounds volume
+(`DailyBudget`, `virustotal.rs:67-78`).
 
 ### 2. Vendor abuse submitters (`review`)
 
@@ -81,8 +81,8 @@ never touches Pending, Rejected, or Snoozed entries
 
 The one path that fetches an **attacker-supplied URL**. Gated
 `fetch_enabled = parse_bool_flag("PROPOLIS_FETCH_ENABLED", false)`
-(`crates/propolis/src/config.rs:527`, default false); the daemon spawns it only
-`if config.fetch_enabled` (`crates/propolis/src/main.rs:794`). Because it
+(`crates/propolis/src/config.rs:622`, default false); the daemon spawns it only
+`if config.fetch_enabled` (`crates/propolis/src/main.rs:983`). Because it
 dereferences attacker input, it is guarded by a dedicated SSRF vetter - see the
 [forbidden-egress-target guard](#the-forbidden-egress-target-guard) below.
 
@@ -219,9 +219,9 @@ own-host and reserved destinations before any connection:
 - **Empty resolve set fails closed** `ResolveFailed` (`vet`).
 
 At the daemon boundary the fetcher refuses to run if `own_ips` is empty
-(`crates/propolis/src/main.rs:828-835`) and warns if `own_ips` has no public
+(`crates/propolis/src/main.rs:1017-1024`) and warns if `own_ips` has no public
 address (a NAT'd node, where self-targeting cannot be fully excluded;
-`main.rs:843-852`).
+`own_ips_lack_a_public_address`, `main.rs:1032-1041`).
 
 The same forbidden-target concept also bounds where the platform will connect at
 all: the guard rejects own-host and reserved targets rather than admitting them.

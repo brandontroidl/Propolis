@@ -35,15 +35,16 @@ reports. Implemented in `crates/review/src/virustotal.rs`.
 ### Gating
 
 Enabled iff `PROPOLIS_VT_ENABLED` is set AND `PROPOLIS_VT_KEY` is non-empty; an
-empty key forces it off, fail-closed (`crates/propolis/src/config.rs:520-521`).
+empty key forces it off, fail-closed (`vt_enabled`/`vt_api_key` in
+`load_config`, `crates/propolis/src/config.rs:612-613`).
 
 | Setting | Value | Source |
 |---|---|---|
-| `PROPOLIS_VT_ENABLED` | default false | `config.rs:521` |
-| `PROPOLIS_VT_UPLOAD` (upload unknown samples) | default false | `config.rs:522` |
-| `PROPOLIS_VT_SCAN_INTERVAL_SECS` | default 300 | `config.rs:523` |
-| Request delay | 15000 ms (hard-coded) | `crates/propolis/src/main.rs:751` |
-| Daily cap | 450 (hard-coded) | `main.rs:752` |
+| `PROPOLIS_VT_ENABLED` | default false | `config.rs:613` |
+| `PROPOLIS_VT_UPLOAD` (upload unknown samples) | default false | `config.rs:614` |
+| `PROPOLIS_VT_SCAN_INTERVAL_SECS` | default 300 | `config.rs:615` |
+| Request delay | 15000 ms (hard-coded) | `crates/propolis/src/main.rs:922` |
+| Daily cap | 450 (hard-coded) | `main.rs:923` |
 
 ### Endpoints
 
@@ -51,24 +52,26 @@ empty key forces it off, fail-closed (`crates/propolis/src/config.rs:520-521`).
   means "not in VT's database" (returns `None`); a non-200 is an error.
   `detected = malicious + suspicious`;
   `total = malicious + suspicious + undetected + harmless`
-  (`virustotal.rs:185-229`).
+  (`lookup_hash`, `virustotal.rs:301-345`).
 - **Upload** (only if `PROPOLIS_VT_UPLOAD`) - `POST /api/v3/files` multipart;
   stores a pending row with `detected = -1, total = -1`
-  (`virustotal.rs:143-161,231-274`).
+  (`NextStep::Upload` arm, `upload_sample`, `pending_result`, `virustotal.rs:223-258,290-299,347-386`).
 
 The documented free-tier limit is 4 req/min, 500/day, verified live against the
 VT v3 API 2026-08-19 (`virustotal.rs:5-6`). The daily cap is enforced by a
 single `DailyBudget` owned across every scan cycle - a counter local to one
 `scan_spool` call would reset each cycle and never enforce a per-day cap
-(`virustotal.rs:22-58`, `main.rs:771-774`). See
+(`DailyBudget`, `virustotal.rs:74-103`, `main.rs:936-940`). See
 [rate-limits-and-budgets.md](rate-limits-and-budgets.md#virustotal-daily-cap).
 
 `scan_spool` walks each spool dir, filters to 64-hex-char (SHA-256) filenames,
 skips samples already analyzed, and consumes one budget unit per new sample; on
-exhaustion it logs and returns early (`virustotal.rs:96-174`). Spool dirs
-scanned: `/var/spool/propolis/{ssh,adb,ftp,catchall}` plus the fetcher spool
-tagged `fetched`. Samples older than 30 days are cleaned each cycle
-(`main.rs:763-781`).
+exhaustion it logs and returns early (`virustotal.rs:171-268`; filename filter
+in `list_samples`, `crates/review/src/spool.rs:34-39`). Spool dirs scanned:
+`/var/spool/propolis/{ssh,adb,ftp,telnet}` (`crates/review/src/spool.rs:78-83`)
+plus the fetcher spool tagged `fetched`. Samples older than 30 days are checked hourly by the
+`sample-retention` task, independent of whether VirusTotal is enabled
+(`main.rs:958-980`).
 
 ## Vendor abuse submitters
 
@@ -162,7 +165,7 @@ GeoLite2 enrichment (including the GeoLite2-ASN reads that back
 [ASN suppression](scoring-and-feed.md#exclusions-and-asn-suppression)) is
 **local file reads, not network egress.** The ASN allowlist loads the ASN DB via
 `GeoIp::load_asn_only`; an empty allowlist short-circuits before any lookup
-(`crates/propolis/src/main.rs:673,681,696`,
+(`crates/propolis/src/main.rs:845,852,867`,
 `crates/feed/src/exclusion.rs:53-61`). No MaxMind or other host is contacted at
 runtime; keeping the database current is an operator file-management task.
 

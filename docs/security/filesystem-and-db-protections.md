@@ -68,7 +68,7 @@ security-load-bearing choices:
   symlink that `ProtectSystem=strict`'s bind-mount would then follow. The host-key
   dir `/var/lib/propolis/ssh` is `0750` owned `propolis-ssh`.
 - **Captured sample files are written `0640`**
-  (`crates/sensor-framework/src/spool.rs:277`) into spool directories that
+  (`write_and_seal`, `crates/sensor-framework/src/spool.rs:361`) into spool directories that
   `install.sh` prints (does **not** auto-create) `noexec,nosuid,nodev` fstab lines
   for (`install.sh:172-182`). Whether those mount options are actually applied on
   a given host is an operator step, not enforceable from the repo - see

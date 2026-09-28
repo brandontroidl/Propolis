@@ -38,36 +38,38 @@ to `/login`** (never a 401). Full table: [../reference/console-routes.md](../ref
 
 The operator password (`PROPOLIS_CONSOLE_PASSWORD`) is hashed at startup with **Argon2id
 (default params)** and the plaintext is discarded; only the PHC hash string is kept in
-memory, never written to disk or the database (`crates/console/src/auth.rs:45-52`).
+memory, never written to disk or the database (`PasswordStore::new`,
+`crates/console/src/auth.rs:74-85`).
 Verification fails closed: an unparseable stored hash returns `false` rather than panicking
-(`auth.rs:57-64`).
+(`PasswordStore::verify`, `auth.rs:119-126`).
 
 The console **refuses to start** with no password - an empty or absent
 `PROPOLIS_CONSOLE_PASSWORD` is a fail-closed `MissingPassword` startup error
-(`crates/console/src/main.rs:123-126`).
+(`crates/console/src/main.rs:84-86,154-157`).
 
 ## Session cookie
 
 - **Cookie name:** `propolis_session`.
 - **Value format:** `{session_id}.{hmac_tag}`, where the tag is HMAC-SHA256 of the session
-  id under a 32-byte server secret (`auth.rs:78-83`, `sign` at `auth.rs:191-197`). The HMAC
-  tag is verified **before** any session-map lookup, so a guessed or forged id is rejected
-  without a lookup (`auth.rs:138-155`).
-- **Session id:** 32 random bytes, hex-encoded (`auth.rs:123`).
+  id under a 32-byte server secret (`SessionStore` doc comment and `secret` field,
+  `auth.rs:140-145,151`; `sign` at `auth.rs:253-259`). The HMAC tag is verified
+  **before** any session-map lookup, so a guessed or forged id is rejected without a
+  lookup (`validate`, `auth.rs:200-217`).
+- **Session id:** 32 random bytes, hex-encoded (`create`, `auth.rs:185`).
 - **Store:** in-memory `RwLock<HashMap>` only - there is **no session table**, so every
-  session is lost on restart, by design (`auth.rs:87-91`).
-- **TTL:** default 24h; configurable via `with_ttl` (`auth.rs:76,103-109`).
+  session is lost on restart, by design (`SessionStore`, `auth.rs:147-153`).
+- **TTL:** default 24h; configurable via `with_ttl` (`auth.rs:138,165-171`).
 - **Secret:** `PROPOLIS_CONSOLE_SESSION_SECRET` (64 hex chars / 32 bytes) if set, else a
   freshly generated secret at startup - which, combined with the in-memory store, means a
   restart invalidates all existing cookies.
 
-Cookie attributes (`crates/console/src/routes/login.rs:111-119`):
+Cookie attributes (`session_cookie`, `crates/console/src/routes/login.rs:120-138`):
 
 | Attribute | Value |
 |---|---|
 | `HttpOnly` | always |
 | `SameSite` | `Strict`, always |
-| `Secure` | set **unless** the peer is loopback (`!peer_ip.is_loopback()`) |
+| `Secure` | set **unless** the peer is loopback and `PROPOLIS_CONSOLE_TRUSTED_PROXY` is not enabled |
 | `Path` | `/` |
 | `Max-Age` | tracks the store TTL |
 
@@ -89,17 +91,18 @@ Cookie attributes (`crates/console/src/routes/login.rs:111-119`):
 
 Logout (`GET /logout`) validates the cookie, **destroys the session server-side** via
 `sessions.destroy`, then clears the client cookie. It is idempotent: it works with no
-cookie, an expired session, or a tampered cookie (`login.rs:88-105`, `auth.rs:187-189`).
+cookie, an expired session, or a tampered cookie (`logout`, `login.rs:98-118`;
+`SessionStore::destroy`, `auth.rs:249-251`).
 Destroying server-side matters - clearing only the client cookie would leave a captured
 cookie value valid until its TTL elapsed.
 
 ## CSRF
 
 - **Per-session token**, generated on first use and reused thereafter so multiple
-  concurrently-open forms stay valid (`generate_csrf`, `auth.rs:160-167`): 32 random bytes,
+  concurrently-open forms stay valid (`generate_csrf`, `auth.rs:222-229`): 32 random bytes,
   hex, stored on the `Session`.
 - **Validated in constant time** via `subtle::ConstantTimeEq::ct_eq` (`validate_csrf`,
-  `auth.rs:171-180`). Returns `false` if the session is absent or has no token generated
+  `auth.rs:233-242`). Returns `false` if the session is absent or has no token generated
   yet (fail-closed).
 - The token is surfaced to templates and embedded as `<meta name="csrf-token">` in
   `base_head.html`.
@@ -145,6 +148,6 @@ Authorization is coarse and binary: a request is either an authenticated operato
 roles or per-object permissions - the console serves a single trusted operator
 ([threat-model.md](threat-model.md)). The bind model backstops this: default
 `127.0.0.1:8080` loopback-only, with the operator opting into a wider bind via
-`PROPOLIS_CONSOLE_BIND` (`main.rs:118-121`). A wider bind without operator-provided TLS
+`PROPOLIS_CONSOLE_BIND` (`DEFAULT_BIND`, `main.rs:49-52`). A wider bind without operator-provided TLS
 and a network-layer restriction is a residual risk - see
 [residual-risks.md](residual-risks.md).

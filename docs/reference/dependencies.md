@@ -85,11 +85,11 @@ load-bearing ones and their roles are listed here.
 | htmx | - | Client-side interactivity in the console (vendored front-end asset, not a Rust crate). |
 | Chart.js | - | Console dashboard charts (vendored front-end asset). |
 | `reqwest` / `hyper` | - | HTTP clients present in `Cargo.lock`, used **only** by the review/enrichment paths (VirusTotal, vendor abuse submitters, the SSRF-guarded malware fetcher). |
-| `sqlx` | 0.9.0 | Async PostgreSQL access, compile-time-checked queries, migrations, and the `sqlx::test` harness. Features differ per crate (core-scoring includes `uuid`; console omits it - `crates/core-scoring/Cargo.toml:14`, `crates/console/Cargo.toml:24`). |
+| `sqlx` | 0.9.0 | Async PostgreSQL access, compile-time-checked queries, migrations, and the `sqlx::test` harness. Features differ per crate (core-scoring includes `uuid`; console omits it - `crates/core-scoring/Cargo.toml:15`, `crates/console/Cargo.toml:29`). |
 
 `sensor-ssh` additionally carries its own cryptographic primitives
 (x25519 / ed25519-dalek, chacha20, poly1305) so it can complete a real SSH
-handshake without a general SSH library (`crates/sensor-ssh/Cargo.toml:24-30`).
+handshake without a general SSH library (`crates/sensor-ssh/Cargo.toml:21-24`).
 
 ### HTTP clients and the egress model
 

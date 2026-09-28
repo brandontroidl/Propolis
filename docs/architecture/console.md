@@ -26,15 +26,16 @@ This page describes the architecture, not the exact values.
 
 Two binaries construct the same `AppState`: the standalone `console` binary
 (`crates/console/src/main.rs`) and the unified `propolis` daemon
-(`propolis::run_console`, `crates/console/src/lib.rs:56-58`). The standalone
+(`propolis::run_console`, `crates/propolis/src/main.rs:427-524`). The standalone
 `main.rs` is the fully verified construction path; the unified daemon wires the
 same router.
 
-`router(state)` (`routes/mod.rs:33-57`) builds two route groups:
+`router(state)` (`routes/mod.rs:53-78`) builds two route groups:
 
-- **Public group** - `health`, `ready`, `metrics`, `login`, `logout`, and the
-  fonts asset route, mounted **outside** the session layer.
-- **Protected group** - everything else (dashboard, queue, IP detail, feed,
+- **Public group** - `health`, `ready`, `metrics`, `login`, `logout`, and the two
+  asset routes (`/assets/fonts/{file}`, `/assets/{file}`), mounted **outside** the
+  session layer.
+- **Protected group** - everything else (dashboard, queue, IP detail, feed, fleet,
   search, IPs, integrity, samples, logs), wrapped with a
   `require_session` middleware via `.route_layer(...)` so every route in it is
   session-gated.
@@ -89,7 +90,7 @@ architecture in brief:
 
 ## Security headers
 
-`security_headers` middleware is applied globally (`routes/mod.rs:55`) and sets two
+`security_headers` middleware is applied globally (`routes/mod.rs:76`) and sets three
 headers on **every** response, public and protected alike:
 
 - `X-Frame-Options: DENY`

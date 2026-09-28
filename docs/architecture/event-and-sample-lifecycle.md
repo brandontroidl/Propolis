@@ -94,19 +94,21 @@ flowchart TD
 1. **Off-path hand-off.** The handler builds a `CaptureJob` and `submit`s it; `submit`
    is backed by `mpsc::try_send` and never blocks the connection's reply - a full
    queue drops the job and increments a counter
-   (`crates/sensor-framework/src/handoff.rs:109-148`). This keeps response latency
+   (`crates/sensor-framework/src/handoff.rs:225-241`). This keeps response latency
    from leaking whether a capture happened.
 2. **Sequential worker + spool.** A single worker drains the queue and stores each
    body under its **SHA-256 filename** (never the attacker name), `0640`, with a
    per-file size cap (10 MB) and a global byte budget (100 MB) reserved atomically;
    the store is never called concurrently
-   (`handoff.rs:159-233`, `spool.rs:114-196`). The emitted event carries a
+   (`handoff.rs:272-391`, `spool.rs:119-209`, `QuarantineSpool::new`/`QuarantineSpool::store`). The emitted event carries a
    `SampleRef { sha256, size, orig_name }` where `orig_name` is a sanitized indicator
    only, never a path component. See
    [`security/malware-custody.md`](../security/malware-custody.md).
-3. **Enrichment.** VirusTotal scanning walks the spool directories, filters to
-   64-hex SHA-256 filenames, and looks up each new sample's hash, writing a verdict
-   to `sample_analysis` (`crates/review/src/virustotal.rs:96-229`). A hash lookup
+3. **Enrichment.** VirusTotal scanning (`scan_spool`, `crates/review/src/virustotal.rs:171-268`)
+   walks the spool directories, filters to 64-hex SHA-256 filenames
+   (`review::spool::list_samples`, `crates/review/src/spool.rs:34-55`), and looks up each new
+   sample's hash, writing a verdict to `sample_analysis` (`store_result`,
+   `crates/review/src/virustotal.rs:388-403`). A hash lookup
    sends only the hash. **Uploading an unknown sample body off-box is opt-in
    (`PROPOLIS_VT_UPLOAD`, default off).** The daily-budget cap and wiring are owned by
    [`reference/integrations.md`](../reference/integrations.md) and

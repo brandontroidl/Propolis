@@ -22,19 +22,21 @@ Source: `crates/console/src/routes/`, `crates/console/src/auth.rs`.
 
 ## Auth boundary
 
-`router()` (`routes/mod.rs:33-57`) builds two groups:
+`router()` (`routes/mod.rs:53-78`) builds two groups:
 
-- **Protected group** (`routes/mod.rs:34-47`): merged, then wrapped with
+- **Protected group** (`routes/mod.rs:54-68`): merged, then wrapped with
   `require_session` via `route_layer`. Every route is session-gated.
-- **Public group** (`routes/mod.rs:49-54`): `health`, `metrics`, `login`, `assets`
+- **Public group** (`routes/mod.rs:70-74`): `health`, `metrics`, `login`, `assets`
   merged **outside** `require_session` - no session required.
 
-Both groups then receive `security_headers` globally (`routes/mod.rs:55`).
+Both groups then receive `security_headers` globally (`routes/mod.rs:76`).
 
-`require_session` (`auth.rs:262-279`) reads the `propolis_session` cookie and calls
+`require_session` (`auth.rs:396-421`) reads the `propolis_session` cookie and calls
 `sessions.validate`. On a valid session it continues; on an invalid/absent session it
-returns `Redirect::to("/login")` (**302**, not 401). An unauthenticated hit on a
-protected route is therefore a redirect to the login page.
+returns `Redirect::to("/login")` (**303**) for an ordinary request, or **401** with an
+`HX-Redirect: /login` header for an HTMX request (`hx-request` header present, no
+swappable body). An unauthenticated hit on a protected route is therefore always
+redirected to the login page, by whichever mechanism the requester understands.
 
 Session and password internals (cookie signing, Argon2id, TTL, CSRF token generation,
 login rate limiting) are owned by [authentication and authorization](../security/authn-authz.md).
@@ -49,7 +51,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 |---|---|---|---|---|
 | GET | `/health` | `health` | always `200 {"status":"ok"}` (liveness only) | `routes/health.rs:16,22-24` |
 | GET | `/ready` | `ready` | pings `SELECT 1`, then any supervised subsystem that gave up; `200`/`503` (`gave_up` names in the body), fail-closed | `routes/health.rs` `ready` |
-| GET | `/metrics` | `metrics` | Prometheus text (`text/plain; version=0.0.4`) | `routes/metrics.rs:40,190-198` |
+| GET | `/metrics` | `metrics` | Prometheus text (`text/plain; version=0.0.4`) | `routes/metrics.rs:40,352-360` |
 | GET | `/login` | `login_form` | | `routes/login.rs:45` |
 | POST | `/login` | `login_submit` | no CSRF (no pre-auth session to bind) | `routes/login.rs:45` |
 | GET | `/logout` | `logout` | idempotent; destroys session + clears cookie | `routes/login.rs:46` |
@@ -77,10 +79,10 @@ login rate limiting) are owned by [authentication and authorization](../security
 | GET | `/feed/download/{tier}/{format}` | `download_feed` | see feed downloads below | `routes/feed.rs:60` |
 | GET | `/fleet` | `fleet_page` | listener reachability, capture completeness, running version | `routes/fleet.rs` |
 | GET | `/fleet/status` | `fleet_status_fragment` | HTMX, polled every 30 s; stale handling in `assets/live-panels.js` | `routes/fleet.rs` |
-| GET | `/search/events` | `search_events` | doubles as HTMX load-more when `HX-Request` present; `400` on a control character or an over-512-byte query param | `routes/search.rs:58` |
-| GET | `/search/ips` | `search_ips` | `400` on a control character or an over-512-byte query param | `routes/search.rs:59` |
+| GET | `/search/events` | `search_events` | doubles as HTMX load-more when `HX-Request` present; `400` on a control character or an over-512-byte query param | `routes/search.rs:66` |
+| GET | `/search/ips` | `search_ips` | `400` on a control character or an over-512-byte query param | `routes/search.rs:67` |
 | GET | `/ips` | `ip_list` | `ip_score` list, capped 500 rows | `routes/ips.rs:14` |
-| GET | `/integrity` | `integrity_page` | | `routes/integrity.rs:13` |
+| GET | `/integrity` | `integrity_page` | | `routes/integrity.rs:18` |
 | POST | `/integrity/verify` | `run_verify` | CSRF (403); one verification at a time (409 while one runs) | `routes/integrity.rs` |
 | GET | `/samples` | `samples_page` | | `routes/samples.rs:17` |
 | GET | `/samples/download/{sha256}` | `download_sample` | hardened download; sets a per-route CSP | `routes/samples.rs:18` |
@@ -90,11 +92,11 @@ login rate limiting) are owned by [authentication and authorization](../security
 ## CSRF model
 
 - **Per-session token**, generated on first use and reused thereafter so multiple open
-  forms stay valid (`auth.rs:157-180`). Surfaced to templates as `csrf_token` and
-  embedded in `base_head.html:19` as `<meta name="csrf-token" content="...">`.
+  forms stay valid (`generate_csrf`, `auth.rs:219-229`). Surfaced to templates as `csrf_token` and
+  embedded in `base_head.html:8` as `<meta name="csrf-token" content="...">`.
 - `validate_csrf` uses a constant-time compare (`subtle::ConstantTimeEq`) and returns
   `false` if the session is absent or no token has been generated yet (fail-closed)
-  (`auth.rs:171-180`).
+  (`auth.rs:231-242`).
 - **Every session-gated POST requires CSRF**, the queue mutations and
   `POST /integrity/verify` alike. The verification changes no state, but it scans the
   whole ledger, so it is an operator action with a real cost that another page must not
@@ -105,10 +107,11 @@ login rate limiting) are owned by [authentication and authorization](../security
 
 ## Queue mutation actions
 
-All under the protected group (`routes/queue.rs:39-47`). Each POST takes an `ActionForm`
-with a required `csrf_token` field and optional `notes` (`queue.rs:136-141`). CSRF is
+All under the protected group (`routes/queue.rs:39-52`). Each POST takes an `ActionForm`
+with a required `csrf_token` field and optional `notes` (`queue.rs:141-153`). CSRF is
 validated first; on failure the handler returns **`403 FORBIDDEN`** "invalid or missing
-csrf token" (`queue.rs:379-382,414-416,450-452`).
+csrf token" (`queue.rs:402-405` unsnooze, `430-433` act, `481-483` delist, `525-527` relist,
+`581-583` delete_ip).
 
 | Action | Method + path | Effect | Response |
 |---|---|---|---|
@@ -118,9 +121,9 @@ csrf token" (`queue.rs:379-382,414-416,450-452`).
 | Delist | `POST /ip/{ip}/delist` | delete `review_queue` row; set `ip_score.delisted=TRUE, eligible=FALSE, recommended_for_vendor=FALSE, recommended_for_blocklist=FALSE` | `303` → `/ip/{ip}` |
 | Delete | `POST /ip/{ip}/delete` | purge `review_queue` + `vendor_submission` + `ip_score` rows | `303` → `/queue` |
 
-Approve/reject/snooze converge in `act` (`queue.rs:372-406`), then re-read the score and
+Approve/reject/snooze converge in `act` (`queue.rs:423-459`), then re-read the score and
 render the `queue_row.html` partial. `delete_ip` deliberately does **not** touch the
-append-only hash-chained `event` ledger (`queue.rs:435-473`) - the projection can be
+append-only hash-chained `event` ledger (`queue.rs:575-606`) - the projection can be
 rebuilt from the ledger. Table and column facts are owned by
 [database reference](database.md); scoring flags by [scoring and feed](scoring-and-feed.md).
 
@@ -162,7 +165,7 @@ export files rather than re-querying the DB (`feed.rs:59-179`).
 
 ## Security-headers middleware
 
-`security_headers` (`routes/mod.rs:59-71`) is applied globally at `routes/mod.rs:55`, so it
+`security_headers` (`routes/mod.rs:89-107`) is applied globally at `routes/mod.rs:76`, so it
 runs on **every** response, public and protected alike. It sets:
 
 - `X-Frame-Options: DENY`

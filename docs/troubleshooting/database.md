@@ -18,7 +18,7 @@ enums, and migration list are owned by
 
 Phase 2 of daemon startup connects the pool; on failure it logs
 `propolis: failed to connect to PostgreSQL` and exits 1
-(`crates/propolis/src/main.rs:542-552`). Check, in order:
+(`crates/propolis/src/main.rs:652-663`). Check, in order:
 
 1. `DATABASE_URL` is correct and reachable - host, port, database name, and the
    inline password. Test independently: `psql "$DATABASE_URL" -c 'SELECT 1'` as
@@ -37,12 +37,13 @@ Phase 2 of daemon startup connects the pool; on failure it logs
 
 ## Migration failures at startup
 
-Phase 3 runs two independent migration histories against the same database:
-core-scoring migrations, then the review migrations
-(`crates/propolis/src/main.rs:554-565`). The review history is tracked in its own
-`_sqlx_migrations_review` table so the two do not collide
-(`crates/review/src/lib.rs:45-49`). Failure logs `core-scoring migrations
-failed` or `review migrations failed` and exits 1.
+Phase 3 runs three independent migration histories against the same database:
+core-scoring migrations, then review, then fleet
+(`crates/propolis/src/main.rs:665-680`). The review and fleet histories are each
+tracked in their own table (`_sqlx_migrations_review`,
+`crates/review/src/lib.rs:45-49`; `_sqlx_migrations_fleet`, `crates/fleet/src/lib.rs:33-36`)
+so the three do not collide. Failure logs `core-scoring migrations
+failed`, `review migrations failed`, or `fleet migrations failed` and exits 1.
 
 Common causes:
 
@@ -81,16 +82,19 @@ error. See [Health and observability](../operations/health-and-observability.md)
 The `event` ledger is append-only and hash-chained. The console integrity page
 (`GET /integrity`, `POST /integrity/verify`) runs `core_scoring::verify_chain`
 over the ledger and reports intact or broken
-(`crates/console/src/routes/integrity.rs:36-66`). The POST is read-only (no state
-mutation, hence no CSRF token required).
+(`run_verify`, `crates/console/src/routes/integrity.rs:57-74`). The POST changes no
+state, but it still requires the session's CSRF token like every other console POST
+(`integrity.rs:54-65`).
 
 A **broken** result means a stored event's hash does not chain to its
 predecessor. This indicates the `event` table was modified out of band - direct `UPDATE`/`DELETE` on `event`, a restore that mixed rows from different
 points in time, or storage corruption. Investigate before trusting downstream
-scores. Note that the console's own delete actions (`delete_ip`, `delist`)
-**never touch the `event` ledger** - they only remove projection rows
-(`review_queue`, `vendor_submission`, `ip_score`), which can be rebuilt from the
-ledger (`crates/console/src/routes/queue.rs:435-473`). So operator deletes are
+scores. Note that the console's own delete actions (`delist`,
+`crates/console/src/routes/queue.rs:475-502`; `delete_ip`, `queue.rs:566-606`)
+**never touch the `event` ledger** - they only touch projection rows
+(`delist` deletes the `review_queue` row and latches `ip_score` as delisted;
+`delete_ip` deletes the `review_queue`, `vendor_submission` and `ip_score` rows),
+which can be rebuilt from the ledger. So operator deletes are
 not a cause of chain breakage.
 
 If ops-alerting is enabled, the monitor periodically re-verifies the chain on the

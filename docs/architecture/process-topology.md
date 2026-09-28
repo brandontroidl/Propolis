@@ -68,26 +68,29 @@ After startup, the daemon spawns each subsystem via `spawn_supervised` under a s
 
 1. **Intake tailers** - one supervised task per configured sensor log; each runs a poll
    loop (read batch -> append to ledger -> persist cursor -> sleep on idle,
-   `poll_interval` default 1000 ms). (`main.rs:593-630, 172-251`)
+   `poll_interval` default 1000 ms). (`main.rs:714-755, 135-230`)
 2. **Review** - if `review_enabled`: builds the vendor adapters (AbuseIPDB/DShield/OTX)
    and runs a queue-scan loop (default 60 s) plus a submission loop (default 30 s).
-   (`main.rs:633-667, 255-303`)
+   (`main.rs:796-837, 234-287`)
 3. **Feed** - if `feed_enabled`: builds a snapshot and atomically publishes it (default
-   900 s), touching the ops-monitor freshness marker. (`main.rs:670-742, 305-350`)
+   900 s), touching the ops-monitor freshness marker. (`main.rs:841-913, 319-399`)
 4. **VirusTotal scanner** - if `vt_enabled`: scans the spool directories under
-   `/var/spool/propolis`, sharing one daily budget across cycles. (`main.rs:744-791`)
+   `/var/spool/propolis`, sharing one daily budget across cycles. (`main.rs:916-956`)
    **Sample retention** - always spawned (`sample-retention`): hourly, deletes spooled
    bodies older than 30 days from every body directory, independent of VirusTotal
    (`main.rs` `SAMPLE_RETENTION_DAYS`).
 5. **Malware fetcher** - if `fetch_enabled`: an SSRF-guarded staging-server fetcher that
-   is **fail-closed on an empty `own_ips`**, reserves/refunds a daily budget across
-   cycles, and writes to `/var/spool/propolis/fetched`. (`main.rs:41-158, 793-946`)
+   is **fail-closed on an empty `own_ips`**, enforces its per-host and daily caps in the
+   database when a cycle claims rows, so they hold across restarts and across nodes
+   sharing the database, and writes to `/var/spool/propolis/fetched`. (`main.rs:37-46,
+   63-116, 983-1113`; the claim is `store::claim_candidates` in
+   `crates/review/src/fetcher/store.rs`, called from `run_cycle_with`)
 6. **Console web server** - always spawned: axum on `config.console_bind` (default
-   `127.0.0.1:8080`), graceful shutdown wired to the cancel token. (`main.rs:370-431,
-   948-997`)
+   `127.0.0.1:8080`), graceful shutdown wired to the cancel token. (`main.rs:406-524,
+   1115-1180`)
 7. **Ops self-alert monitor** - if `ops_alert.enabled`: reads the shared supervisor and
    intake liveness handles, watches disk/DB/feed/vendor health, and pages ntfy on
-   degradation. (`main.rs:999-1061`)
+   degradation. (`main.rs:1189-1277`)
 
 Subsystems 2-5 and 7 are opt-in and default off; the console and sample retention are
 the only subsystems always spawned. The exact enabling env vars and their defaults are owned by
@@ -102,14 +105,14 @@ proxy) and out of the daemon. See
 
 ### Startup sequence
 
-`main` runs fail-fast, in order (`main.rs:511-577`):
+`main` runs fail-fast, in order (`main.rs:624-690`):
 
 1. Initialize tracing (`RUST_LOG`, else `info`) plus an in-memory `LogBuffer`
    (capacity 1000) feeding the console's live `/logs` viewer.
 2. Parse and validate config; `exit(1)` on error.
 3. Connect the `PgPool` with `db_max_connections` (default 10); `exit(1)` on failure.
-4. Run the core-scoring migrations, then the review migrations, against the one DB;
-   `exit(1)` on failure.
+4. Run the core-scoring migrations, then the review migrations, then the fleet
+   migrations, against the one DB; `exit(1)` on failure.
 5. Create the cursor directory; `exit(1)` on failure.
 
 Only then are the subsystems spawned.
@@ -132,13 +135,13 @@ One `PgPool` is cloned into every subsystem. A single `CancellationToken` tree i
 `.child_token()` per subsystem. `events_ingested` and `events_rejected` `AtomicU64`
 counters are shared intake -> console; the `SupervisorHandle` map and `IntakeProgress`
 handle are shared into the ops-monitor; the `LogBuffer` is shared tracing -> console.
-(`main.rs:582-591`)
+(`main.rs:630, 694-706`)
 
 ### Shutdown
 
-`shutdown_signal()` fires on SIGINT/SIGTERM, calls `cancel.cancel()`, awaits all handles
-with a `SHUTDOWN_TIMEOUT` of 30 s, then closes the pool. (`main.rs:160, 480-507,
-1064-1087`)
+When `shutdown_signal()` (`main.rs:573-600`) resolves on SIGINT/SIGTERM, `main` calls
+`cancel.cancel()`, awaits all handles with a `SHUTDOWN_TIMEOUT` of 30 s, then closes the
+pool. (`main.rs:118, 1288-1313`)
 
 ## Feed publishing
 

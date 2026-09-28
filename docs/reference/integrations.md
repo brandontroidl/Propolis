@@ -146,7 +146,7 @@ data feeds only the internal breadth multiplier (see
 the system. `[inferred from absence]`: none of the three adapter payload structs
 (`ReportPayload`, `LogEntry`, `PulsePayload`/`Indicator`) has any field that
 could carry a WAN vantage address - confirmed by reading all three
-(`vendor/mod.rs:297`).
+(`vendor/abuseipdb.rs:44-49`, `vendor/dshield.rs:104-113`, `vendor/otx.rs:62-76`).
 
 The report comment is
 `"propolis: {ip} - {N} event(s) across {M} categor{y/ies} since {first_seen}, current score {raw.round_dp(1)}"`,

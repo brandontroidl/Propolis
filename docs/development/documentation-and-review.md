@@ -58,8 +58,7 @@ build when:
   test attributes;
 - the [migration change map](../reference/database.md#migration-change-map) does not
   list exactly the migration files on disk;
-- a `path:line` citation written from the workspace root names a missing file or
-  lines past its end;
+- a `path:line` citation names a missing file or lines past its end;
 - a documented `tar` command names one tree twice, or a live page or source file
   contains an em dash.
 

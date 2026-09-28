@@ -843,15 +843,37 @@ fn the_migration_change_map_lists_every_migration() {
     assert!(sets >= 3, "found only {sets} migration sets");
 }
 
-/// Citations of the form `path:line` that name a file by its path from the workspace root (or from
-/// `crates/`) must name a file that exists and lines it has. Hundreds of line citations drifted as
-/// cited files changed; this cannot see a citation that moved within its file, but it does catch
-/// one whose file was renamed, split or shortened past the lines it names. Bare filenames are
-/// skipped because the file they mean depends on the page's context. The sanitizer results page
-/// is a dated record whose citations describe the commit it names.
+/// Every file under `dir`, recursively, skipping build output.
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.is_dir() {
+            if path.file_name().is_some_and(|n| n != "target") {
+                files_under(&path, out);
+            }
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// Citations of the form `path:line` must name a file that exists and lines it has. Hundreds of
+/// line citations drifted as cited files changed; this cannot see a citation that moved within its
+/// file, but it does catch one whose file was renamed, split or shortened past the lines it names.
+///
+/// A path is resolved from the workspace root, then from `crates/`, then as the tail of a path
+/// under `crates/` (pages write `routes/mod.rs` or `vendor/mod.rs` relative to the crate they are
+/// about). A tail that several files share passes if any of them has the lines, since which one the
+/// page means depends on its context. Bare filenames (no `/`) are skipped for the same reason, as
+/// are paths outside the workspace. The sanitizer results page is a dated record whose citations
+/// describe the commit it names.
 #[test]
 fn documented_line_citations_name_real_files_and_lines() {
     let root = workspace_root();
+    let mut crate_files = Vec::new();
+    files_under(&root.join("crates"), &mut crate_files);
     let (mut checked, mut wrong) = (0, Vec::new());
     for doc in current_docs() {
         if doc.ends_with("docs/security/sanitizer-results.md") {
@@ -866,7 +888,8 @@ fn documented_line_citations_name_real_files_and_lines() {
             };
             let is_path = path.contains('/')
                 && Path::new(path).extension().is_some()
-                && !path.contains("://");
+                && !path.contains("://")
+                && !path.starts_with(['/', '~']);
             let is_spans = !spans.is_empty()
                 && spans.starts_with(|c: char| c.is_ascii_digit())
                 && spans
@@ -875,47 +898,60 @@ fn documented_line_citations_name_real_files_and_lines() {
             if !is_path || !is_spans {
                 continue;
             }
-            // `crates/*/Cargo.toml:4` cites the same line in every crate.
-            let targets: Vec<PathBuf> = match path.strip_prefix("crates/*/") {
-                Some(rest) => fs::read_dir(root.join("crates"))
-                    .unwrap()
-                    .flatten()
-                    .map(|e| e.path().join(rest))
-                    .filter(|p| p.is_file())
-                    .collect(),
-                None => [root.join(path), root.join("crates").join(path)]
-                    .into_iter()
-                    .find(|p| p.is_file())
-                    .into_iter()
-                    .collect(),
-            };
-            if targets.is_empty() {
-                if ["crates/", "deploy/", ".github/"]
-                    .iter()
-                    .any(|p| path.starts_with(p))
-                {
-                    wrong.push(format!(
-                        "{}: {token} names a file that does not exist",
-                        doc.display()
-                    ));
-                }
-                continue;
-            }
             let last = spans
                 .split([',', '-'])
                 .filter_map(|n| n.parse::<usize>().ok())
                 .max()
                 .unwrap_or(0);
+            let has_lines = |file: &PathBuf| {
+                last > 0 && last <= fs::read_to_string(file).unwrap().lines().count()
+            };
             checked += 1;
-            for target in targets {
-                let lines = fs::read_to_string(&target).unwrap().lines().count();
-                if last == 0 || last > lines {
+            // `crates/*/Cargo.toml:4` cites the same line in every crate, so every crate must have it.
+            if let Some(rest) = path.strip_prefix("crates/*/") {
+                let each: Vec<PathBuf> = fs::read_dir(root.join("crates"))
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.path().join(rest))
+                    .filter(|p| p.is_file())
+                    .collect();
+                if each.is_empty() || !each.iter().all(has_lines) {
                     wrong.push(format!(
-                        "{}: {token} cites line {last}; {} has {lines}",
-                        doc.display(),
-                        target.display()
+                        "{}: {token}: not every crate has that line",
+                        doc.display()
                     ));
                 }
+                continue;
+            }
+            let direct = [root.join(path), root.join("crates").join(path)]
+                .into_iter()
+                .find(|p| p.is_file());
+            let candidates: Vec<PathBuf> = match direct {
+                Some(file) => vec![file],
+                None => {
+                    let tail = format!("/{path}");
+                    crate_files
+                        .iter()
+                        .filter(|f| f.to_string_lossy().ends_with(&tail))
+                        .cloned()
+                        .collect()
+                }
+            };
+            if candidates.is_empty() {
+                wrong.push(format!(
+                    "{}: {token} names no file in the workspace",
+                    doc.display()
+                ));
+            } else if !candidates.iter().any(has_lines) {
+                let names: Vec<String> = candidates
+                    .iter()
+                    .map(|c| c.strip_prefix(&root).unwrap_or(c).display().to_string())
+                    .collect();
+                wrong.push(format!(
+                    "{}: {token} cites line {last}, past the end of {}",
+                    doc.display(),
+                    names.join(" and ")
+                ));
             }
         }
     }

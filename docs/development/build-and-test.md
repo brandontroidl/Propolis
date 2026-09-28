@@ -179,10 +179,11 @@ disagree on a fact that has drifted before:
 - a [migration change map](../reference/database.md#migration-change-map) that does
   not list exactly the migration files on disk;
 - any figure in the test taxonomy above;
-- a `path:line` citation, written from the workspace root or from `crates/`, whose
-  file does not exist or has fewer lines than it cites (bare filenames, whose file
-  depends on the page, are skipped; a citation that moved within its file is not
-  detected).
+- a `path:line` citation whose file does not exist or has fewer lines than it cites.
+  A path is resolved from the workspace root, from `crates/`, or as the tail of a
+  path under `crates/` (`routes/mod.rs`); a tail several files share passes if any
+  of them has the lines. Bare filenames, whose file depends on the page, are
+  skipped, and a citation that moved within its file is not detected.
 
 Historical pages, `CHANGELOG.md`, the dated claim ledger and the sanitizer record
 are exempt from the version, count and citation checks: they record what was true

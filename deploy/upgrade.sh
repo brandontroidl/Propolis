@@ -27,7 +27,7 @@ PULLED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 sudo -u "$(stat -c '%U' "$REPO_DIR")" git pull
 
 echo "==> building release"
-sudo -u "$(stat -c '%U' "$REPO_DIR")" cargo build --release
+sudo -u "$(stat -c '%U' "$REPO_DIR")" cargo build --release --workspace --locked
 
 echo "==> installing binaries"
 # SP-A (collector/control-plane split): gateway and shipper are new binaries alongside the

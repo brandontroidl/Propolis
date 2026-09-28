@@ -713,6 +713,11 @@ fn deploy_stamp_script_is_valid_bash_and_both_deploy_scripts_run_it() {
         .iter()
         .position(|l| l.contains("cargo build --release"))
         .expect("upgrade.sh no longer builds - this parser is broken");
+    assert!(
+        lines[build_at].contains("--workspace") && lines[build_at].contains("--locked"),
+        "upgrade.sh must build the complete locked workspace so production cannot resolve a \
+         dependency graph different from the one reviewed and tested by CI"
+    );
     let install_binaries_at = lines
         .iter()
         .position(|l| l.contains("install -m 0755") && l.contains("$BUILD_DIR"))

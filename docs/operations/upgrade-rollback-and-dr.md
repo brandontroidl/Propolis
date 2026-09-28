@@ -17,8 +17,9 @@ performs an in-place live upgrade on a node where `install.sh` has already run.
 
 The script (run as root, `sudo ./deploy/upgrade.sh`):
 
-1. Runs `git pull` and `cargo build --release` **as the repo-owner user**, not as
-   root, so build output keeps the owner's identity.
+1. Runs `git pull` and `cargo build --release --workspace --locked` **as the
+   repo-owner user**, not as root, so build output keeps the owner's identity and
+   dependency resolution cannot drift from the reviewed lockfile.
 2. Installs the built binaries (`propolis`, the 9 sensors, `gateway`, `shipper`)
    to `/usr/local/bin/` with `install -m 0755`.
 3. Runs `deploy/provision.sh` (idempotent users + directories), reinstalls the

@@ -40,6 +40,8 @@ async fn fetch_attempt_table_exists_with_expected_columns() {
         "first_seen",
         "last_attempt",
         "claim_expires",
+        "transport_auth",
+        "tls_verify_error",
     ] {
         assert!(cols.iter().any(|x| x == c), "missing column {c}");
     }
@@ -97,4 +99,90 @@ async fn fetch_daily_usage_is_one_non_negative_row_per_day() {
         .execute(&pool)
         .await
         .unwrap();
+}
+
+// Audit P-08: 0007 lands on a database that already holds rows written by the client that
+// verified no certificate. Applied here to a fresh database carrying such rows (a capture and a
+// pending one, written with the pre-0007 column list), so the upgrade itself is what is tested,
+// not a row inserted afterwards.
+#[sqlx::test(migrations = false)]
+async fn migration_0007_marks_existing_rows_unknown_and_constrains_new_ones(pool: PgPool) {
+    sqlx::migrate!("../core-scoring/migrations")
+        .run(&pool)
+        .await
+        .unwrap();
+    for before in [
+        include_str!("../migrations/0001_review_queue.sql"),
+        include_str!("../migrations/0002_vendor_submission.sql"),
+        include_str!("../migrations/0003_fetch_attempt.sql"),
+        include_str!("../migrations/0004_backfill_fetch_attempt_source_ip.sql"),
+        include_str!("../migrations/0005_fetch_attempt_first_seen_idx.sql"),
+        include_str!("../migrations/0006_fetch_coordination.sql"),
+    ] {
+        sqlx::raw_sql(before).execute(&pool).await.unwrap();
+    }
+    for (url, status, sha) in [
+        (
+            "https://legacy.example/captured",
+            "success",
+            Some(vec![0xAB_u8; 32]),
+        ),
+        ("https://legacy.example/pending", "pending", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO fetch_attempt \
+             (url_hash, url, host, scheme, status, sha256, attempts, last_attempt) \
+             VALUES (sha256(convert_to($1, 'UTF8')), $1, 'legacy.example', 'https', $2, $3, 0, now())",
+        )
+        .bind(url)
+        .bind(status)
+        .bind(sha)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/0007_fetch_attempt_transport_auth.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT status, transport_auth, tls_verify_error FROM fetch_attempt ORDER BY status",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("pending".to_string(), "unknown".to_string(), None),
+            ("success".to_string(), "unknown".to_string(), None),
+        ],
+        "no row fetched before 0007 may read as verified"
+    );
+
+    let write = |transport_auth: &'static str, error: Option<&'static str>| {
+        sqlx::query(
+            "UPDATE fetch_attempt SET transport_auth = $1, tls_verify_error = $2 \
+             WHERE status = 'success'",
+        )
+        .bind(transport_auth)
+        .bind(error)
+        .execute(&pool)
+    };
+    assert!(write("bogus", None).await.is_err(), "unlisted state");
+    assert!(
+        write("unverified", None).await.is_err(),
+        "unverified without the validation error"
+    );
+    assert!(
+        write("verified", Some("x")).await.is_err(),
+        "an error on a state that is not unverified"
+    );
+    assert!(write("unverified", Some("x")).await.is_ok());
+    assert!(write("verified", None).await.is_ok());
+    assert!(write("plaintext", None).await.is_ok());
 }

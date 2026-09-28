@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-28
 -->
 
 # Storage and database model
@@ -28,7 +28,7 @@ Schema is split across two migration sets:
 
 - **`core-scoring`** owns `event`, `ip_score`, `sample_analysis`, and all five enum
   types (11 migrations).
-- **`review`** owns `review_queue`, `vendor_submission`, `fetch_attempt` (3
+- **`review`** owns `review_queue`, `vendor_submission`, `fetch_attempt` (7
   migrations). It depends on the `review_state_enum` created by core-scoring's first
   migration - a deliberate cross-crate schema dependency so the schema is complete.
 
@@ -142,8 +142,11 @@ to duplicate tier logic in SQL, keeping Rust the single source of truth.
   **UNIQUE `idempotency_key`** that dedupes retries and the recorded vendor response.
 - `fetch_attempt` (PK `url_hash`) - the malware fetcher's record of each
   attacker-supplied URL it considered, including the pinned IP actually dialed, the
-  status, and the guard's reject reason. Its `status` value set is documented in a SQL
-  comment (not a CHECK or enum); the values are set by review-crate code.
+  status, the guard's reject reason, and for a captured body whether the transport
+  that delivered it was authenticated (`transport_auth`, see
+  [malware custody](../security/malware-custody.md#transport-authentication-of-fetched-samples)).
+  Its `status` value set is documented in a SQL comment (not a CHECK or enum); the
+  values are set by review-crate code.
 
 ## Captured file bodies (outside Postgres)
 

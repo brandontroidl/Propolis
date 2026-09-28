@@ -44,6 +44,53 @@ impl FetchStatus {
     }
 }
 
+/// How the transport that delivered a captured body authenticated its sender, over the whole path
+/// that delivered it: every redirect hop as well as the hop that returned the body. An on-path
+/// party can rewrite an unauthenticated redirect as easily as an unauthenticated body, so a body
+/// is `Verified` only when every hop was. Stored per captured body in
+/// `fetch_attempt.transport_auth` (see `migrations/0007_fetch_attempt_transport_auth.sql`) so a
+/// transport-unauthenticated body is never presented as equivalent to an authenticated one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportAuth {
+    /// Every hop was https and its certificate verified for the host name.
+    Verified,
+    /// At least one https hop failed certificate validation and was fetched again from the same
+    /// pinned address without it. `error` is the first such failure.
+    Unverified { error: String },
+    /// No certificate failed validation, but at least one hop was http or tftp.
+    Plaintext,
+}
+
+impl TransportAuth {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Unverified { .. } => "unverified",
+            Self::Plaintext => "plaintext",
+        }
+    }
+
+    pub fn verify_error(&self) -> Option<&str> {
+        match self {
+            Self::Unverified { error } => Some(error),
+            Self::Verified | Self::Plaintext => None,
+        }
+    }
+
+    /// The state of a path that is `self` followed by one more hop authenticated as `next`. A
+    /// certificate failure outranks plaintext so its error is never dropped; both leave the path
+    /// unauthenticated.
+    pub fn followed_by(self, next: TransportAuth) -> TransportAuth {
+        match (self, next) {
+            (Self::Unverified { error }, _) | (_, Self::Unverified { error }) => {
+                Self::Unverified { error }
+            }
+            (Self::Plaintext, _) | (_, Self::Plaintext) => Self::Plaintext,
+            (Self::Verified, Self::Verified) => Self::Verified,
+        }
+    }
+}
+
 /// Everything one `run_cycle` needs: the DB pool the `store` module reads/writes, the quarantine
 /// spool captured bytes are written to, the SSRF-guard `own_ips` set and resolver every fetch is
 /// vetted against, the shared byte/time limits, and the tunables that bound the fetcher's
@@ -109,6 +156,7 @@ enum RawOutcome {
         bytes: Vec<u8>,
         content_type: Option<String>,
         pinned_ip: Option<String>,
+        transport_auth: TransportAuth,
     },
     Failed {
         status: FetchStatus,
@@ -142,6 +190,7 @@ impl Fetcher for RealFetcher {
                     bytes: f.bytes,
                     content_type: f.content_type,
                     pinned_ip: Some(f.pinned_ip.to_string()),
+                    transport_auth: f.transport_auth,
                 },
                 Ok(http::HttpOutcome::Rejected(r)) => RawOutcome::Failed {
                     status: FetchStatus::Rejected,
@@ -186,6 +235,7 @@ impl Fetcher for RealFetcher {
                             bytes,
                             content_type: None,
                             pinned_ip: Some(pinned.ip.to_string()),
+                            transport_auth: TransportAuth::Plaintext,
                         },
                         // Every failure carries text, not just the ones that started with it:
                         // `reject_reason` is the only record of WHY, and the console shows it
@@ -240,7 +290,8 @@ const LEASE_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a claim must hold so no other node can take a row while this cycle may still be
 /// processing it. Worst case per candidate is every redirect hop (`max_hops + 1` of them) spending
-/// its full DNS timeout and full total timeout, plus the local overhead; candidates run
+/// its full DNS timeout and full total timeout (an https hop's certificate-failure retry shares
+/// that hop's total timeout, see `http::fetch_http_once`), plus the local overhead; candidates run
 /// `CONCURRENCY` at a time, so the last of `batch` starts after `ceil(batch / CONCURRENCY) - 1`
 /// full waves.
 fn claim_lease(limits: &FetchLimits, max_hops: u8, batch: usize) -> std::time::Duration {
@@ -320,8 +371,18 @@ async fn process_one<F: Fetcher>(
             bytes,
             content_type,
             pinned_ip,
+            transport_auth,
         } if !bytes.is_empty() => {
-            record_success(deps, candidate, bytes, content_type, pinned_ip, stats).await;
+            record_success(
+                deps,
+                candidate,
+                bytes,
+                content_type,
+                pinned_ip,
+                transport_auth,
+                stats,
+            )
+            .await;
         }
         // Defense in depth: production never produces this (both HttpOutcome and TftpOutcome
         // have their own explicit Empty variant, mapped above before this ever runs), but a
@@ -341,6 +402,7 @@ async fn record_success(
     bytes: Vec<u8>,
     content_type: Option<String>,
     pinned_ip: Option<String>,
+    transport_auth: TransportAuth,
     stats: &Mutex<CycleStats>,
 ) {
     let sha = Sha256::digest(&bytes).to_vec();
@@ -373,6 +435,7 @@ async fn record_success(
         bytes: Some(bytes.len() as i32),
         content_type,
         pinned_ip,
+        transport_auth: Some(transport_auth),
         attempts: candidate.attempts,
         next_attempt: None,
     };
@@ -444,6 +507,7 @@ async fn record_failure(
         bytes: None,
         content_type: None,
         pinned_ip: None,
+        transport_auth: None,
         attempts,
         next_attempt,
     };
@@ -461,6 +525,39 @@ async fn record_failure(
         FetchStatus::Timeout => s.timeout += 1,
         FetchStatus::Empty => s.empty += 1,
         FetchStatus::Pending | FetchStatus::Success => {}
+    }
+}
+
+#[cfg(test)]
+mod transport_auth_tests {
+    use super::TransportAuth::{self, Plaintext, Verified};
+
+    fn unverified(error: &str) -> TransportAuth {
+        TransportAuth::Unverified {
+            error: error.into(),
+        }
+    }
+
+    #[test]
+    fn a_path_is_verified_only_when_every_hop_is_and_keeps_the_first_certificate_failure() {
+        let cases = [
+            (Verified, Verified, Verified),
+            (Verified, Plaintext, Plaintext),
+            (Plaintext, Verified, Plaintext),
+            (Plaintext, Plaintext, Plaintext),
+            (Verified, unverified("b"), unverified("b")),
+            (unverified("a"), Verified, unverified("a")),
+            (Plaintext, unverified("b"), unverified("b")),
+            (unverified("a"), Plaintext, unverified("a")),
+            (unverified("a"), unverified("b"), unverified("a")),
+        ];
+        for (path, next, expected) in cases {
+            assert_eq!(
+                path.clone().followed_by(next.clone()),
+                expected,
+                "{path:?} followed by {next:?}"
+            );
+        }
     }
 }
 
@@ -675,6 +772,7 @@ mod orchestration_tests {
                 bytes: bytes.clone(),
                 content_type: Some("application/octet-stream".into()),
                 pinned_ip: Some("93.184.216.34".into()),
+                transport_auth: TransportAuth::Plaintext,
             },
         );
 
@@ -705,6 +803,68 @@ mod orchestration_tests {
         let spooled = spool_dir.path().join(&hex);
         assert!(spooled.exists(), "spool file {hex} was not written");
         assert_eq!(std::fs::read(&spooled).unwrap(), bytes);
+    }
+
+    // Audit P-08: each captured body records how its transport was authenticated, a certificate
+    // failure keeps its error, and a row with no body never reads as anything but 'unknown'.
+    #[tokio::test]
+    async fn captured_bodies_record_how_their_transport_was_authenticated() {
+        let pool = test_pool().await;
+        reset_all(&pool).await;
+        let urls = seed_pending(&pool, "fetch8auth.example", 4).await;
+
+        let captured = |tag: &str, transport_auth| RawOutcome::Captured {
+            bytes: tag.as_bytes().to_vec(),
+            content_type: None,
+            pinned_ip: None,
+            transport_auth,
+        };
+        let cert_error = "invalid peer certificate: UnknownIssuer";
+        let fetcher = MockFetcher::new()
+            .on(&urls[0], captured("verified", TransportAuth::Verified))
+            .on(
+                &urls[1],
+                captured(
+                    "unverified",
+                    TransportAuth::Unverified {
+                        error: cert_error.into(),
+                    },
+                ),
+            )
+            .on(&urls[2], captured("plaintext", TransportAuth::Plaintext))
+            .on(
+                &urls[3],
+                RawOutcome::Failed {
+                    status: FetchStatus::Timeout,
+                    reason: None,
+                },
+            );
+
+        let spool_dir = TempDir::new().unwrap();
+        let deps = test_deps(pool.clone(), &spool_dir, 100);
+        let stats = run_cycle_with(&deps, 10, &fetcher).await;
+        assert_eq!((stats.succeeded, stats.timeout), (3, 1));
+
+        let mut recorded = Vec::new();
+        for url in &urls {
+            let row: (String, Option<String>) = sqlx::query_as(
+                "SELECT transport_auth, tls_verify_error FROM fetch_attempt WHERE url = $1",
+            )
+            .bind(url)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            recorded.push(row);
+        }
+        assert_eq!(
+            recorded,
+            vec![
+                ("verified".to_string(), None),
+                ("unverified".to_string(), Some(cert_error.to_string())),
+                ("plaintext".to_string(), None),
+                ("unknown".to_string(), None),
+            ]
+        );
     }
 
     // The attacker attribution on every fetch_attempt row was silently NULL in production:
@@ -892,6 +1052,7 @@ mod orchestration_tests {
                 bytes: None,
                 content_type: None,
                 pinned_ip: None,
+                transport_auth: None,
                 attempts: 0,
                 next_attempt: None,
             },
@@ -983,6 +1144,7 @@ mod orchestration_tests {
                     bytes: None,
                     content_type: None,
                     pinned_ip: None,
+                    transport_auth: None,
                     attempts: 0,
                     next_attempt: None,
                 },
@@ -1060,6 +1222,7 @@ mod orchestration_tests {
                 bytes: None,
                 content_type: None,
                 pinned_ip: None,
+                transport_auth: None,
                 attempts: 0,
                 next_attempt: None,
             },
@@ -1078,6 +1241,7 @@ mod orchestration_tests {
                     bytes: script.into_bytes(),
                     content_type: None,
                     pinned_ip: None,
+                    transport_auth: TransportAuth::Plaintext,
                 },
             )
             .on(
@@ -1086,6 +1250,7 @@ mod orchestration_tests {
                     bytes: stage3_script.into_bytes(),
                     content_type: None,
                     pinned_ip: None,
+                    transport_auth: TransportAuth::Plaintext,
                 },
             );
 
@@ -1153,6 +1318,7 @@ mod orchestration_tests {
                 bytes: None,
                 content_type: None,
                 pinned_ip: None,
+                transport_auth: None,
                 attempts: 0,
                 next_attempt: None,
             },
@@ -1171,6 +1337,7 @@ mod orchestration_tests {
                     bytes: script_a,
                     content_type: None,
                     pinned_ip: None,
+                    transport_auth: TransportAuth::Plaintext,
                 },
             )
             .on(
@@ -1179,6 +1346,7 @@ mod orchestration_tests {
                     bytes: script_b,
                     content_type: None,
                     pinned_ip: None,
+                    transport_auth: TransportAuth::Plaintext,
                 },
             );
 
@@ -1258,6 +1426,7 @@ mod orchestration_tests {
                 bytes: None,
                 content_type: None,
                 pinned_ip: None,
+                transport_auth: None,
                 attempts: 3,
                 next_attempt: None,
             },
@@ -1282,6 +1451,7 @@ mod orchestration_tests {
                 bytes: None,
                 content_type: None,
                 pinned_ip: None,
+                transport_auth: None,
                 attempts: 0,
                 next_attempt: None,
             },
@@ -1298,6 +1468,7 @@ mod orchestration_tests {
                 bytes: script,
                 content_type: None,
                 pinned_ip: None,
+                transport_auth: TransportAuth::Plaintext,
             },
         );
 
@@ -1360,6 +1531,7 @@ mod orchestration_tests {
                 bytes: Some(1234),
                 content_type: Some("application/octet-stream".into()),
                 pinned_ip: Some("93.184.216.34".into()),
+                transport_auth: None,
                 attempts: 0,
                 next_attempt: None,
             },
@@ -1384,6 +1556,7 @@ mod orchestration_tests {
                 bytes: None,
                 content_type: None,
                 pinned_ip: None,
+                transport_auth: None,
                 attempts: 0,
                 next_attempt: None,
             },
@@ -1400,6 +1573,7 @@ mod orchestration_tests {
                 bytes: script,
                 content_type: None,
                 pinned_ip: None,
+                transport_auth: TransportAuth::Plaintext,
             },
         );
 
@@ -1512,6 +1686,7 @@ mod orchestration_tests {
                     bytes: None,
                     content_type: None,
                     pinned_ip: None,
+                    transport_auth: None,
                     attempts: 0,
                     next_attempt: None,
                 },

@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-01
+last-verified: 2026-09-28
 -->
 
 # Outbound controls
@@ -77,6 +77,13 @@ The one path that fetches an **attacker-supplied URL**. Gated
 `if config.fetch_enabled` (`crates/propolis/src/main.rs:794`). Because it
 dereferences attacker input, it is guarded by a dedicated SSRF vetter - see the
 [forbidden-egress-target guard](#the-forbidden-egress-target-guard) below.
+
+An https fetch validates the server certificate first. Only when that validation
+fails does the fetcher try the same pinned address once more without it, inside
+the same timeout, and it records the body as transport-unauthenticated together
+with the validation error. The policy and what each recorded state supports are
+owned by
+[malware-custody.md](malware-custody.md#transport-authentication-of-fetched-samples).
 
 > **Warning - egress.** Enabling the fetcher makes the honeypot retrieve a URL
 > chosen by an attacker. The SSRF guard below constrains where it may connect,

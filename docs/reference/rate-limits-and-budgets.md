@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-01
+last-verified: 2026-09-28
 -->
 
 # Rate limits and budgets reference
@@ -104,9 +104,9 @@ layers.
 
 | Item | Value | Env var / source |
 |---|---|---|
-| In-flight concurrency | 8 per cycle *(hard-coded semaphore)* | `CONCURRENCY` (`crates/review/src/fetcher/mod.rs:86,260`) |
-| Max attempts per URL | 3, then terminal `Dead` *(hard-coded)* | `MAX_ATTEMPTS` (`mod.rs:81,409-413`) |
-| Retry backoff | `5 * 4^(attempts-1)` min (5, 20, 80) *(hard-coded)* | `mod.rs:88-94` |
+| In-flight concurrency | 8 per cycle *(hard-coded semaphore)* | `CONCURRENCY` (`crates/review/src/fetcher/mod.rs:136,340`) |
+| Max attempts per URL | 3, then terminal `Dead` *(hard-coded)* | `MAX_ATTEMPTS` (`mod.rs:131,489-493`) |
+| Retry backoff | `5 * 4^(attempts-1)` min (5, 20, 80) *(hard-coded)* | `mod.rs:138-144` |
 | Per-host hourly budget | default 12, max 1000 | `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` (`config.rs:36,58`) |
 | Daily cap | default 200, max 10000 | `PROPOLIS_FETCH_DAILY_CAP` (`config.rs:39,60`) |
 | Batch size per cycle | default 20, max 1000 | `PROPOLIS_FETCH_BATCH_SIZE` (`config.rs:40,61`) |
@@ -140,7 +140,13 @@ panic never aborts the batch.
 
 The byte cap is enforced mid-stream: the transfer aborts to `TooBig` as soon as
 `body.len() + chunk.len() > max_bytes`, never buffering the whole oversized body
-(`crates/review/src/fetcher/http.rs:170-176`).
+(`crates/review/src/fetcher/http.rs:294-300`).
+
+The total timeout bounds a whole hop, not one connection. When an https
+certificate fails validation, the second attempt without validation (see
+[malware custody](../security/malware-custody.md#transport-authentication-of-fetched-samples))
+spends what is left of the same timeout, so the retry never lengthens a hop
+(`Hop` in `crates/review/src/fetcher/http.rs`).
 
 ### Dropper-script URL extraction
 

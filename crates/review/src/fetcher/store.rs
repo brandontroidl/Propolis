@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 
-use super::FetchStatus;
+use super::{FetchStatus, TransportAuth};
 
 /// One row eligible for a fetch attempt this cycle: a freshly-synced depth-0 URL from a
 /// `honeypot_file_download` event, a backoff-eligible retry, or a depth>=1 synthetic row a
@@ -71,6 +71,9 @@ pub struct AttemptResult {
     pub bytes: Option<i32>,
     pub content_type: Option<String>,
     pub pinned_ip: Option<String>,
+    /// How the captured body's transport was authenticated; `None` when no body was captured,
+    /// stored as `'unknown'` like every row recorded before this was tracked.
+    pub transport_auth: Option<TransportAuth>,
     pub attempts: i32,
     pub next_attempt: Option<DateTime<Utc>>,
 }
@@ -375,11 +378,16 @@ pub async fn insert_pending_if_absent(
 /// rather than updated. `last_attempt` always advances to `now()` when the update does apply, and
 /// the claim is released: from here the attempt counts against its host through `last_attempt`.
 pub async fn upsert_attempt(pool: &PgPool, a: &AttemptResult) -> Result<(), sqlx::Error> {
+    let (transport_auth, tls_verify_error) = match &a.transport_auth {
+        Some(t) => (t.as_str(), t.verify_error()),
+        None => ("unknown", None),
+    };
     sqlx::query(
         "INSERT INTO fetch_attempt \
          (url_hash, url, host, scheme, port, source_ip, parent_hash, depth, status, \
-          reject_reason, sha256, bytes, content_type, pinned_ip, attempts, next_attempt, last_attempt) \
-         VALUES ($1,$2,$3,$4,$5,$6::inet,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16, now()) \
+          reject_reason, sha256, bytes, content_type, pinned_ip, transport_auth, tls_verify_error, \
+          attempts, next_attempt, last_attempt) \
+         VALUES ($1,$2,$3,$4,$5,$6::inet,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18, now()) \
          ON CONFLICT (url_hash) DO UPDATE SET \
            status = EXCLUDED.status, \
            reject_reason = EXCLUDED.reject_reason, \
@@ -387,6 +395,8 @@ pub async fn upsert_attempt(pool: &PgPool, a: &AttemptResult) -> Result<(), sqlx
            bytes = EXCLUDED.bytes, \
            content_type = EXCLUDED.content_type, \
            pinned_ip = EXCLUDED.pinned_ip, \
+           transport_auth = EXCLUDED.transport_auth, \
+           tls_verify_error = EXCLUDED.tls_verify_error, \
            attempts = EXCLUDED.attempts, \
            next_attempt = EXCLUDED.next_attempt, \
            last_attempt = now(), \
@@ -407,6 +417,8 @@ pub async fn upsert_attempt(pool: &PgPool, a: &AttemptResult) -> Result<(), sqlx
     .bind(a.bytes)
     .bind(&a.content_type)
     .bind(&a.pinned_ip)
+    .bind(transport_auth)
+    .bind(tls_verify_error)
     .bind(a.attempts)
     .bind(a.next_attempt)
     .execute(pool)

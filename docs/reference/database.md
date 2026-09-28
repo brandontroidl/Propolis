@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-28
 -->
 
 # Database reference
@@ -307,6 +307,8 @@ payload URLs.
 | `first_seen` | TIMESTAMPTZ | NOT NULL DEFAULT `now()` |
 | `last_attempt` | TIMESTAMPTZ | NOT NULL |
 | `claim_expires` | TIMESTAMPTZ | NULL = unclaimed; set when a fetch cycle claims the row, cleared when its outcome is recorded (`0006`) |
+| `transport_auth` | TEXT | NOT NULL DEFAULT `'unknown'`; CHECK in `verified`, `unverified`, `plaintext`, `unknown`: how the captured body's transport was authenticated over every hop, `unknown` when no body was captured or the row predates `0007` ([meanings](../security/malware-custody.md#transport-authentication-of-fetched-samples)) |
+| `tls_verify_error` | TEXT | the first certificate-validation error; CHECK: non-NULL exactly when `transport_auth = 'unverified'` (`0007`) |
 
 Indexes: `(host, last_attempt)`, `(status, next_attempt)`, `(first_seen DESC)` (`0005`),
 and a partial `(host, claim_expires) WHERE claim_expires IS NOT NULL` (`0006`).
@@ -321,6 +323,8 @@ every node on the database. See
 `status` is a free TEXT column, **not** an enum or CHECK. The documented value set -
 `pending`, `success`, `dead`, `rejected`, `too_big`, `timeout`, `empty` - lives only
 in a SQL comment (`0003:11`); the actual values written are set by review-crate code.
+`transport_auth` is the exception on this table: its value set, and its pairing with
+`tls_verify_error`, are enforced by CHECK constraints (`0007`).
 
 ## Migration change map
 
@@ -351,6 +355,7 @@ in a SQL comment (`0003:11`); the actual values written are set by review-crate 
 | `0004` | data backfill of `fetch_attempt.source_ip` (NULL before the `host()` read fix) |
 | `0005` | `fetch_attempt (first_seen DESC)` index for newest-first selection |
 | `0006` | `fetch_attempt.claim_expires` + partial index; `fetch_daily_usage` table |
+| `0007` | `fetch_attempt.transport_auth` (existing rows `'unknown'`) + `tls_verify_error`, with their CHECK constraints |
 
 **fleet** (`crates/fleet/migrations/`, tracked in `_sqlx_migrations_fleet`):
 

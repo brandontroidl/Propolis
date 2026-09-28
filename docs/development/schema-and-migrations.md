@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-28
 -->
 
 # Schema and migrations
@@ -20,7 +20,7 @@ Migration SQL lives in **three crates**, applied against **one** physical databa
 - `crates/core-scoring/migrations/` - `0001_enums.sql` … `0012_session_end_signal.sql`.
   Owns `event`, `ip_score`, `sample_analysis`, and all five enum types.
 - `crates/review/migrations/` - `0001_review_queue.sql` …
-  `0006_fetch_coordination.sql`. Owns `review_queue`, `vendor_submission`,
+  `0007_fetch_attempt_transport_auth.sql`. Owns `review_queue`, `vendor_submission`,
   `fetch_attempt` and `fetch_daily_usage`.
 - `crates/fleet/migrations/` - `0001_listener_probe.sql`, tracked in its own
   `_sqlx_migrations_fleet` table.

@@ -136,7 +136,7 @@ Owners: [security/outbound-controls.md](security/outbound-controls.md),
 | Forbidden-target check rejects own-host, reserved IPs, `0.0.0.0/8`, CGNAT `100.64/10`, `::`; canonicalizes v4-mapped/6to4/NAT64/Teredo first. | `guard.rs:14-83`; test `base_is_reserved_ip_misses_v4_mapped:279` | IMPLEMENTED |
 | tftp forces port 69; explicit non-69 port rejected. | `guard.rs:206-210`; test `:402` | IMPLEMENTED |
 | Empty resolve set fails closed. | `guard.rs:185-187`; test `:425` | IMPLEMENTED |
-| Byte cap enforced mid-stream (aborts to `TooBig`, never buffers oversized body); certs deliberately not validated because bytes never execute. | `http.rs:73-96,170-176` | IMPLEMENTED |
+| Byte cap enforced mid-stream (aborts to `TooBig`, never buffers oversized body); certs deliberately not validated because bytes never execute. *Certificate half superseded after this snapshot (audit P-08): certificates are verified first and a body fetched past a failed validation is recorded unverified; see [malware custody](security/malware-custody.md#transport-authentication-of-fetched-samples).* | `http.rs:73-96,170-176` | IMPLEMENTED |
 | Dropper-URL extraction bounded: 64 KiB body scan, max 256 URLs, `$`-unresolved tokens dropped. | `crates/review/src/fetcher/extract.rs:36,42,60-77` | IMPLEMENTED |
 
 ---

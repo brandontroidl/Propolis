@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-01
+last-verified: 2026-09-28
 -->
 
 # Environment variables
@@ -94,6 +94,15 @@ console rDNS parse booleans more broadly (called out below).
 - Required: no. Default `server01` (`persona.rs:22`).
 - Validation: trimmed; blank after trim → default (`persona.rs:48-50`). Always
   resolves.
+
+### `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`
+- Read by: `reqwest` itself when each HTTP client is built, not by Propolis
+  config code. Upper case wins over lower case (`http_proxy` and the rest).
+- Honored by: the VirusTotal, vendor-submitter and ops-alert ntfy clients, whose
+  destinations are fixed vendor endpoints or URLs you configured.
+- Ignored by: the malware fetcher, always. A proxy resolves the URL's host
+  itself, so a proxied fetch would bypass the address the SSRF guard pinned; see
+  [outbound controls](../security/outbound-controls.md).
 
 ---
 

@@ -41,6 +41,14 @@ half-configured egress. Exact env-var names, defaults, and bounds are owned by
 integration wire details by
 [../reference/integrations.md](../reference/integrations.md).
 
+The VirusTotal, vendor-submitter and ntfy clients are ordinary `reqwest` clients,
+so they honor the standard proxy variables in the daemon's environment
+(`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, upper or lower case) and
+an operator's egress proxy can carry them. Their destinations are fixed vendor
+endpoints or URLs the operator configured, never attacker input. The malware
+fetcher is the exception: it ignores every one of these variables (see
+[section 3](#3-malware-fetcher-reviewfetcher)).
+
 ### 1. VirusTotal (`review`)
 
 Sample-hash lookups (and optionally uploads) against
@@ -77,6 +85,13 @@ The one path that fetches an **attacker-supplied URL**. Gated
 `if config.fetch_enabled` (`crates/propolis/src/main.rs:794`). Because it
 dereferences attacker input, it is guarded by a dedicated SSRF vetter - see the
 [forbidden-egress-target guard](#the-forbidden-egress-target-guard) below.
+
+The fetcher never uses a proxy. A proxy resolves and connects to the URL's host
+itself, so a proxied fetch would never reach the address the guard vetted, and
+nothing the guard decided would apply to where the proxy connected. Every client
+the fetcher builds therefore ignores the proxy variables, and its traffic always
+leaves the node directly: a host firewall that allows egress only through a
+proxy will block it.
 
 An https fetch validates the server certificate first. Only when that validation
 fails does the fetcher try the same pinned address once more without it, inside
@@ -186,6 +201,13 @@ hop, failing closed at each step. Its `is_forbidden_egress_target` check (line
   the whole host is rejected, not just the surviving public IP (lines 189-195).
 - **Pinned connect** - the connection uses the vetted IP and never re-resolves
   the host (`Pinned`, doc line 94).
+- **No proxy** - every HTTP client the fetcher builds, the certificate-failure
+  retry's included, comes from one constructor (`Hop::client` in
+  `crates/review/src/fetcher/http.rs`) that refuses the proxy variables.
+  `crates/review/tests/fetcher_proxy_test.rs` sets `HTTP_PROXY`, `HTTPS_PROXY`
+  and `ALL_PROXY` to a local listener and proves an http fetch and an https
+  fetch through its retry both reach only the pinned target, and that no other
+  file under `src/fetcher` constructs a client.
 - **IP-literal hosts skip DNS** (decimal/octal/hex folded by the `url` crate) so
   a reserved literal is caught without a resolver call (lines 168-183).
 - **tftp forced to port 69** - any explicit non-69 port is `TftpPortForbidden`

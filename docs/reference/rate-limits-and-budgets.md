@@ -140,7 +140,7 @@ panic never aborts the batch.
 
 The byte cap is enforced mid-stream: the transfer aborts to `TooBig` as soon as
 `body.len() + chunk.len() > max_bytes`, never buffering the whole oversized body
-(`crates/review/src/fetcher/http.rs:294-300`).
+(`fetch_once_inner` in `crates/review/src/fetcher/http.rs`).
 
 The total timeout bounds a whole hop, not one connection. When an https
 certificate fails validation, the second attempt without validation (see

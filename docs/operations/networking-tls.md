@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-28
 -->
 
 # Networking and TLS
@@ -99,7 +99,10 @@ Based on `INSTALL.md:378-385` (operator guidance, not code):
   loopback, or reachable only through your proxy.
 - **Outbound:** the unified daemon needs outbound HTTPS to the vendor APIs *only
   if* review/VirusTotal are enabled, and outbound `5432` only if PostgreSQL is
-  remote. **Sensors make no outbound connections by design**
+  remote. The vendor and VirusTotal clients honor `HTTPS_PROXY` and the other
+  standard proxy variables, so they can leave through an egress proxy. The
+  malware fetcher, if enabled, ignores those variables and always connects
+  directly, so a policy that allows egress only through a proxy blocks it. **Sensors make no outbound connections by design**
   (`INSTALL.md:385`); their unit files restrict address families to
   `AF_INET AF_INET6` with no outbound path.
 - **Recovery path:** before applying any firewall rule that could sever access,

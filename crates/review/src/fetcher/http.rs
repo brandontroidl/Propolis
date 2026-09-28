@@ -1,7 +1,8 @@
-//! Pinned HTTP fetch: connects to `Pinned.ip` only (never re-resolves `Pinned.host`), disables
-//! reqwest's own redirect handling (a hop is returned as `HttpResult::Redirect` for the caller to
-//! re-vet through `guard::vet` before ever following it), and enforces a hard byte cap while the
-//! body is still streaming so an oversized response is never buffered in full. See
+//! Pinned HTTP fetch: connects to `Pinned.ip` only (never re-resolves `Pinned.host`, and never
+//! hands the request to a proxy named in the environment), disables reqwest's own redirect
+//! handling (a hop is returned as `HttpResult::Redirect` for the caller to re-vet through
+//! `guard::vet` before ever following it), and enforces a hard byte cap while the body is still
+//! streaming so an oversized response is never buffered in full. See
 //! `internal/design/12-malware-fetcher.md` section 6.
 
 use std::collections::HashSet;
@@ -82,8 +83,9 @@ pub enum FetchError {
 
 /// Fetch `url` once against the already-vetted `pinned` target. Connects to `pinned.ip` via a
 /// static resolver override (`ClientBuilder::resolve`) so the client can never re-resolve
-/// `pinned.host` through DNS - the load-bearing pinning guarantee. A fresh, unpooled client is
-/// built per attempt: attacker-controlled URLs never share a connection pool.
+/// `pinned.host` through DNS - the load-bearing pinning guarantee - and refuses every proxy, which
+/// would resolve the host itself (see `Hop::client`). A fresh, unpooled client is built per
+/// attempt: attacker-controlled URLs never share a connection pool.
 ///
 /// An https URL is fetched with its certificate verified against the system trust store, the
 /// same verifier every other reqwest client in the workspace uses. Only if that attempt fails
@@ -164,26 +166,46 @@ impl Hop<'_> {
         if remaining.is_zero() {
             return Err(FetchError::Timeout);
         }
+        let client = self.client(certificates, remaining)?;
+
+        let request = fetch_once_inner(
+            &client,
+            self.url,
+            self.limits,
+            self.pinned.ip,
+            transport_auth,
+        );
+        match tokio::time::timeout_at(self.deadline, request).await {
+            Ok(result) => result,
+            Err(_) => Err(FetchError::Timeout),
+        }
+    }
+
+    /// The only place the fetcher builds an HTTP client, the certificate-failure retry's included,
+    /// so no attempt can reach anything but the pin.
+    fn client(
+        &self,
+        certificates: Certificates<'_>,
+        remaining: Duration,
+    ) -> Result<reqwest::Client, reqwest::Error> {
         let pin = SocketAddr::new(self.pinned.ip, self.pinned.port);
         let builder = reqwest::Client::builder()
             .resolve(&self.pinned.host, pin)
+            // reqwest otherwise takes a proxy from HTTP_PROXY, HTTPS_PROXY or ALL_PROXY (either
+            // case) when the client is built. A proxy resolves and dials the URL's host itself, so
+            // the request would never touch the pin the guard vetted.
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(0)
             .http1_only()
             .connect_timeout(self.limits.connect_timeout)
             .read_timeout(self.limits.read_timeout)
             .timeout(remaining);
-        let client = match certificates {
+        match certificates {
             Certificates::Verify(roots) => builder.tls_certs_merge(roots.iter().cloned()),
             Certificates::AcceptAny => builder.tls_danger_accept_invalid_certs(true),
         }
-        .build()?;
-
-        let request = fetch_once_inner(&client, self.url, self.limits, pin.ip(), transport_auth);
-        match tokio::time::timeout_at(self.deadline, request).await {
-            Ok(result) => result,
-            Err(_) => Err(FetchError::Timeout),
-        }
+        .build()
     }
 }
 
@@ -217,7 +239,7 @@ fn certificate_validation_error(err: &FetchError) -> Option<String> {
 }
 
 /// Fail closed if `url`'s host (and, as secondary defense-in-depth, port) does not match
-/// `pinned.host`/`pinned.port`. `ClientBuilder::resolve` in `Hop::attempt` only overrides DNS
+/// `pinned.host`/`pinned.port`. `ClientBuilder::resolve` in `Hop::client` only overrides DNS
 /// for the exact host string it is given; a caller that ever passes a `url` whose host differs
 /// from `pinned.host` would fall through to real DNS on the url's own host and connect off-pin,
 /// silently voiding the SSRF guard `guard::vet` already ran. This function is the sole HTTP

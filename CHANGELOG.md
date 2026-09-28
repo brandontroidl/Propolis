@@ -134,6 +134,11 @@
   inventory lacked six crates. The docs agreement test now recomputes the version, crate, member and
   binary totals, the component inventory and dependency graph, the test taxonomy and the migration
   list from `cargo metadata` and the source, and fails when a current page disagrees.
+- **Code citations point at the code again** - the docs cite code by `path:line`, and about 450
+  citations had drifted as the cited files changed, including every directory citation into
+  `install.sh` after provisioning moved to `provision.sh`. All were re-read against the current
+  source and corrected, sentences the code had outgrown were rewritten, and the docs agreement test
+  now fails when a citation names a missing file or lines past its end.
 - **Smaller console hardening** - the reverse-DNS cache holds at most 4096 entries, sweeping expired
   ones and evicting the oldest; search refuses a control character or a value over 512 bytes with
   400 instead of passing it to PostgreSQL.

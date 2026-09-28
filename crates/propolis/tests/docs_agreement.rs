@@ -842,3 +842,86 @@ fn the_migration_change_map_lists_every_migration() {
     }
     assert!(sets >= 3, "found only {sets} migration sets");
 }
+
+/// Citations of the form `path:line` that name a file by its path from the workspace root (or from
+/// `crates/`) must name a file that exists and lines it has. Hundreds of line citations drifted as
+/// cited files changed; this cannot see a citation that moved within its file, but it does catch
+/// one whose file was renamed, split or shortened past the lines it names. Bare filenames are
+/// skipped because the file they mean depends on the page's context. The sanitizer results page
+/// is a dated record whose citations describe the commit it names.
+#[test]
+fn documented_line_citations_name_real_files_and_lines() {
+    let root = workspace_root();
+    let (mut checked, mut wrong) = (0, Vec::new());
+    for doc in current_docs() {
+        if doc.ends_with("docs/security/sanitizer-results.md") {
+            continue;
+        }
+        let text = fs::read_to_string(&doc).unwrap();
+        let tokens = text.split(|c: char| c.is_whitespace() || "`()[];|\"".contains(c));
+        for token in tokens {
+            let token = token.trim_end_matches(['.', ',', ':']);
+            let Some((path, spans)) = token.rsplit_once(':') else {
+                continue;
+            };
+            let is_path = path.contains('/')
+                && Path::new(path).extension().is_some()
+                && !path.contains("://");
+            let is_spans = !spans.is_empty()
+                && spans.starts_with(|c: char| c.is_ascii_digit())
+                && spans
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '-' || c == ',');
+            if !is_path || !is_spans {
+                continue;
+            }
+            // `crates/*/Cargo.toml:4` cites the same line in every crate.
+            let targets: Vec<PathBuf> = match path.strip_prefix("crates/*/") {
+                Some(rest) => fs::read_dir(root.join("crates"))
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.path().join(rest))
+                    .filter(|p| p.is_file())
+                    .collect(),
+                None => [root.join(path), root.join("crates").join(path)]
+                    .into_iter()
+                    .find(|p| p.is_file())
+                    .into_iter()
+                    .collect(),
+            };
+            if targets.is_empty() {
+                if ["crates/", "deploy/", ".github/"]
+                    .iter()
+                    .any(|p| path.starts_with(p))
+                {
+                    wrong.push(format!(
+                        "{}: {token} names a file that does not exist",
+                        doc.display()
+                    ));
+                }
+                continue;
+            }
+            let last = spans
+                .split([',', '-'])
+                .filter_map(|n| n.parse::<usize>().ok())
+                .max()
+                .unwrap_or(0);
+            checked += 1;
+            for target in targets {
+                let lines = fs::read_to_string(&target).unwrap().lines().count();
+                if last == 0 || last > lines {
+                    wrong.push(format!(
+                        "{}: {token} cites line {last}; {} has {lines}",
+                        doc.display(),
+                        target.display()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert!(
+        checked >= 200,
+        "checked only {checked} citations; the scan has stopped seeing them"
+    );
+}

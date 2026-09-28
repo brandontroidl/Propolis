@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 1656 test functions** (941 unit + 715 integration).
+- **Total: 1657 test functions** (941 unit + 716 integration).
 - **DB-backed (`sqlx::test`): 200** - console 157, core-scoring 25, intake 7,
   fleet 6, propolis 4, review 1. These provision a fresh database per test.
 - **Ignored: exactly 2.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -121,7 +121,7 @@ Per-crate breakdown:
 | geoip | 4 | 0 | - |
 | intake | 11 | 20 | audit_regressions, converter_test, end_to_end, probe_filter |
 | log-tailer | 0 | 34 | cursor_test, tailer_test |
-| propolis | 100 | 15 | capture_to_console, docs_agreement, restore_rehearsal, smoke_test, ssh_capture_to_console |
+| propolis | 100 | 16 | capture_to_console, docs_agreement, restore_rehearsal, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 4 | provision |
 | review | 116 | 70 | cli_test, fetcher_proxy_test, fetcher_schema_test, gatekeeper_test, queue_test, submit_test, vendor_test |
 | sensor-adb | 53 | 20 | integration |
@@ -136,7 +136,7 @@ Per-crate breakdown:
 | sensor-telnet | 39 | 18 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **941** | **715** | |
+| **Total** | **941** | **716** | |
 
 ### Test styles by layer
 
@@ -178,9 +178,14 @@ disagree on a fact that has drifted before:
   differs from `cargo metadata`;
 - a [migration change map](../reference/database.md#migration-change-map) that does
   not list exactly the migration files on disk;
-- any figure in the test taxonomy above.
+- any figure in the test taxonomy above;
+- a `path:line` citation, written from the workspace root or from `crates/`, whose
+  file does not exist or has fewer lines than it cites (bare filenames, whose file
+  depends on the page, are skipped; a citation that moved within its file is not
+  detected).
 
-Historical pages, `CHANGELOG.md` and the dated claim ledger are exempt from the
-version and count checks: they record what was true when they were written.
+Historical pages, `CHANGELOG.md`, the dated claim ledger and the sanitizer record
+are exempt from the version, count and citation checks: they record what was true
+when they were written.
 
 Runnable command reference lives in [`reference/commands`](../reference/commands.md).

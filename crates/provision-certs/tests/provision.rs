@@ -27,3 +27,40 @@ fn key_files_are_written_with_owner_only_permissions() {
         assert_eq!(mode, 0o600, "{key_file} must be mode 0600, got {mode:o}");
     }
 }
+
+#[test]
+fn unsafe_collector_id_is_rejected_before_writing_anything() {
+    let parent = tempfile::tempdir().unwrap();
+    let out = parent.path().join("certs");
+    std::fs::create_dir(&out).unwrap();
+
+    let err = provision_certs::provision(&out, "gateway.local", "../escaped").unwrap_err();
+    assert!(matches!(
+        err,
+        provision_certs::ProvisionError::InvalidCollectorId(_)
+    ));
+    assert!(std::fs::read_dir(&out).unwrap().next().is_none());
+    assert!(!parent.path().join("escaped.crt").exists());
+    assert!(!parent.path().join("escaped.key").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_symlink_is_replaced_without_touching_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, b"do not overwrite").unwrap();
+    symlink(&victim, dir.path().join("gateway.key")).unwrap();
+
+    provision_certs::provision(dir.path(), "gateway.local", "collector-03").unwrap();
+
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not overwrite");
+    assert!(
+        !std::fs::symlink_metadata(dir.path().join("gateway.key"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}

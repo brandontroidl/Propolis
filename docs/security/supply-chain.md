@@ -55,6 +55,7 @@ is pinned to an immutable identifier, not a moving tag:
 | `dtolnay/rust-toolchain` | commit SHA `2fe4ca74464c5902a4f6e302d0a619b4ea911ccc` (1.96.1 branch) |
 | `Swatinem/rust-cache` | commit SHA `c19371144df3bb44fab255c43d04cbc2ab54d1c4` (v2.9.1) |
 | `actions/checkout` | commit SHA `9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0` (v7.0.0) |
+| `EmbarkStudios/cargo-deny-action` | commit SHA `3c6349835b2b7b196a839186cb8b78e02f7b5f25` (v2.1.1, cargo-deny 0.20.2) |
 | PostgreSQL test container | `postgres:18` by digest `sha256:32ca0af8...ad5500` |
 
 The Rust toolchain itself is pinned to exact version `1.96.1` (not `stable`) in
@@ -73,19 +74,42 @@ exceptions. No crate sets `#![forbid(unsafe_code)]`.
   never used as a scoring signal.
 - **Test-only `unsafe`:** `env::set_var` / `env::remove_var` blocks in
   `crates/propolis/src/config.rs` test functions - Rust 2024 made those calls
-  `unsafe`; they run only under `#[cfg(test)]`.
+  `unsafe`; they run only under `#[cfg(test)]`. One `libc::mkfifo` call in
+  `crates/sensor-framework/src/spool.rs` tests creates the FIFO the spool reader
+  must refuse without blocking.
 
 The claim "zero unsafe in the project" is **not** accurate and should not be made;
 the accurate statement is that project code is safe Rust apart from the audited
 rDNS FFI above.
 
+## Dependency policy (`deny.toml`)
+
+The `dependency policy` CI job runs `cargo deny check` against `deny.toml` at the
+repository root, with a freshly fetched advisory database on every run:
+
+- **Advisories.** Vulnerable, unsound, unmaintained and yanked crates fail the job.
+  An exception names the advisory, why it is accepted and a review date. The one
+  current exception is RUSTSEC-2023-0071 (`rsa`, no fixed release), reachable only
+  through `russh`, the SSH client used in tests. RUSTSEC-2026-0235 (`rkyv` 0.7)
+  needs no exception: it is an optional `rust_decimal` dependency that is never
+  compiled, so it is in `Cargo.lock` but not in the checked graph (`cargo audit`,
+  which reads only the lockfile, still lists it).
+- **Licences.** An allowlist of the permissive licences present in the graph. A
+  dependency under any other licence fails the job until someone reads the licence
+  and adds it. Workspace crates are `publish = false` and are not checked: the
+  project's own terms (PolyForm Noncommercial 1.0.0, commercial by arrangement,
+  see `LICENSE.md`) are not a single SPDX expression.
+- **Sources.** crates.io only; no git dependencies, no other registries.
+- **Duplicates** are reported as warnings, not failures: several upstream crate
+  families are mid-migration and carry two versions each.
+
 ## Reviewing dependency changes
 
 Because `vendor/` is committed, a dependency add or bump appears as a reviewable
-diff. Recommended maintainer practice (not an automated gate in this repo):
-review the `Cargo.lock` diff and the `vendor/` changes together, and re-run the
-full gate including a release build after re-vendoring. This is guidance, not a
-shipped control.
+diff. The policy job checks what can be decided mechanically; the rest is review
+practice: read the `Cargo.lock` diff and the `vendor/` changes together, check a
+new version's publish date and yanked status, look for a new or changed build
+script, and re-run the full gate including a release build after re-vendoring.
 
 ## Related
 

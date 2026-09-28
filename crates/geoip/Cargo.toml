@@ -2,6 +2,7 @@
 name = "geoip"
 version = "0.4.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 maxminddb = "0.30.3"

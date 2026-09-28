@@ -2,6 +2,7 @@
 name = "sensor-wire"
 version = "0.4.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }

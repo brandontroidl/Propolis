@@ -25,12 +25,12 @@ cargo build --release  # release binaries (README.md:65, INSTALL.md:15)
 > `cargo build --release --locked` after re-vendoring. See
 > [schema-and-migrations](schema-and-migrations.md#vendoring).
 
-## The gate (four independent CI jobs)
+## The gate (independent CI jobs)
 
-CI runs **four separate jobs**, deliberately not one sequential job: a single
-chained job bailed on the first failure, so an unformatted tree once meant clippy
-and the whole suite never ran for 30+ commits (`ci.yml:7-13`). Split this way, a
-cheap failure cannot hide an expensive one.
+CI runs **separate jobs**, deliberately not one sequential job: a single chained
+job bailed on the first failure, so an unformatted tree once meant clippy and the
+whole suite never ran for 30+ commits (see the header of `ci.yml`). Split this
+way, a cheap failure cannot hide an expensive one.
 
 | Job | Exact command | Needs DB |
 |---|---|---|
@@ -38,6 +38,7 @@ cheap failure cannot hide an expensive one.
 | **clippy** | `cargo clippy --workspace --all-targets --locked -- -D warnings` | no |
 | **tests** | `cargo test --workspace --locked -- --test-threads=1` (under `set -o pipefail`) | yes |
 | **release build** | `cargo build --release --workspace --locked` | no |
+| **dependency policy** | `cargo deny check --all-features` against `deny.toml` (see [supply chain](../security/supply-chain.md#dependency-policy-denytoml)) | no |
 
 The release job compiles the profile `deploy/upgrade.sh` ships. The other three
 compile the dev profile, so a release-only break (the vendored-crate checksum

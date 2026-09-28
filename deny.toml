@@ -1,0 +1,63 @@
+# Dependency policy, enforced by the `deny` CI job (`cargo deny check`). Every dependency is
+# vendored under vendor/, so this is the review gate for what may enter that tree.
+#
+# Any exception below names the advisory or crate, why it is accepted, and the date it must be
+# looked at again. An exception past its review date is a finding, not background.
+
+[graph]
+all-features = true
+
+[advisories]
+# Unmaintained and unsound advisories fail too, not only vulnerabilities: an unsound crate is
+# memory-unsafe from safe code, which is exactly what this project relies on Rust to rule out.
+unmaintained = "all"
+yanked = "deny"
+# RUSTSEC-2026-0235 (rkyv 0.7) needs no entry: rkyv is an optional rust_decimal dependency whose
+# feature is never enabled, so it is absent from the graph this checks. Only a lockfile-level
+# scanner (`cargo audit`) lists it. If a feature change ever pulls it in, this job fails, which is
+# the point.
+ignore = [
+    # rsa Marvin timing side channel; no fixed release exists. Reached only through russh, which is
+    # a dev-dependency used as the SSH client in sensor-ssh and propolis tests. No production
+    # binary links rsa, and the test client never holds a key worth recovering.
+    # Review: 2026-12-31, or when russh depends on a fixed rsa.
+    { id = "RUSTSEC-2023-0071", reason = "dev-only via russh test client; no fixed rsa release" },
+]
+
+[licenses]
+# Every licence here is permissive. A new one fails the job until someone reads it and adds it.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+# Workspace crates are not published (`publish = false`) and carry no SPDX licence field: the
+# project licence is PolyForm Noncommercial 1.0.0 with commercial terms by arrangement (LICENSE.md),
+# which a single SPDX expression would misstate.
+[licenses.private]
+ignore = true
+
+[bans]
+# The graph has many duplicate versions pulled in by upstream crates mid-migration (RustCrypto,
+# windows-sys); they are reported, not failed, so the list stays visible without blocking.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

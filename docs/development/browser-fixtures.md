@@ -136,7 +136,7 @@ request resolves. Recovery is what the default mode demonstrates.
 It would run on `ubuntu-latest`, which has Chrome preinstalled, so wiring it up is possible. It is
 deliberately not wired up: it costs ~4 minutes of wall clock for two modes, and a wall-clock timing
 assertion on a shared runner is a flake source in a gate whose whole design
-([build-and-test](build-and-test.md)) is four jobs that each fail for exactly one reason. The
+([build-and-test](build-and-test.md)) is independent jobs that each fail for exactly one reason. The
 committed template guard catches the likely regression - someone deleting the code - in the normal
 suite. Run this fixture by hand when you touch the live-panel script in `base_tail.html`, the poll
 markup in `fleet.html`, or the vendored `htmx.min.js`, and paste the timeline into the change.

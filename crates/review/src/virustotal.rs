@@ -5,7 +5,7 @@
 //! Rate limit: VT free tier allows 4 requests/minute, 500/day. The scanner
 //! respects this with a configurable delay between requests.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
@@ -181,14 +181,8 @@ pub async fn scan_spool(
     let mut results = Vec::new();
 
     for (sensor, dir) in spool_dirs {
-        let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-            continue;
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.len() != 64 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
+        for file in crate::spool::list_samples(dir).await.unwrap_or_default() {
+            let name = file.sha256;
 
             let state = analysis_state(pool, &name).await;
             if !needs_lookup(&state, Utc::now(), config.pending_recheck_secs) {
@@ -240,8 +234,17 @@ pub async fn scan_spool(
                             config.request_delay_ms,
                         ))
                         .await;
-                        let path = dir.join(&name);
-                        match upload_sample(&client, &config.api_key, &path, &name).await {
+                        // Uploaded bytes are exactly the ones that hash to the name: a link or
+                        // swapped content in the spool must never send some other local file to
+                        // a third party.
+                        let bytes = match crate::spool::read_sample(dir, &name).await {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(sha256 = %name[..12], sensor, error = %e, "vt: sample failed verification, not uploaded");
+                                continue;
+                            }
+                        };
+                        match upload_sample(&client, &config.api_key, bytes, &name).await {
                             Ok(()) => {
                                 tracing::info!(sha256 = %name[..12], "vt: sample uploaded for analysis");
                                 let pending = pending_result(&name);
@@ -344,13 +347,9 @@ async fn lookup_hash(
 async fn upload_sample(
     client: &reqwest::Client,
     api_key: &str,
-    path: &Path,
+    bytes: Vec<u8>,
     sha256: &str,
 ) -> Result<(), String> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| format!("read error: {e}"))?;
-
     let boundary = format!("----propolis{}", chrono::Utc::now().timestamp_millis());
     let mut body = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -413,8 +412,13 @@ pub async fn cleanup_old_samples(spool_dirs: &[(&str, PathBuf)], max_age_days: u
             continue;
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.len() != 64 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+            // Deliberately not `list_samples`: a planted digest-named link or FIFO ages out here
+            // too. `remove_file` removes the entry itself and never touches a link's target.
+            let name = entry.file_name();
+            if !name
+                .to_str()
+                .is_some_and(sensor_framework::spool::is_canonical_sha256_hex)
+            {
                 continue;
             }
             if let Ok(meta) = entry.metadata().await

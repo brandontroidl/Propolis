@@ -48,8 +48,9 @@ const DEFAULT_FETCH_TOTAL_TIMEOUT_SECS: u64 = 30;
 // cycle loop for hours on one slow fetch. Fix round 1, #3.
 /// A few hundred MB, per the review: large enough for any real dropper/binary this fetcher is
 /// meant to capture, small enough that one attacker-influenced `Content-Length` cannot OOM the
-/// daemon.
-const MAX_FETCH_MAX_BYTES: u64 = 500_000_000;
+/// daemon. Shared with the spool readers, which refuse any body larger than a producer could
+/// have written.
+const MAX_FETCH_MAX_BYTES: u64 = review::spool::MAX_SAMPLE_BYTES;
 /// A few minutes - past this, a single slow/stalling fetch would hold up the strictly-sequential
 /// cycle loop (no overlapping `run_cycle` calls) for an unreasonable fraction of an hour.
 const MAX_FETCH_TIMEOUT_SECS: u64 = 300;

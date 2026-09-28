@@ -9,7 +9,62 @@
 //! would look in a directory nothing writes to and simply find nothing - the same silent-divergence
 //! failure class as a config the binary never reads.
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+pub use sensor_framework::SpoolError;
+use sensor_framework::spool::{is_canonical_sha256_hex, read_verified};
+
+/// The largest body any producer can file into a spool: the fetcher's per-file cap is
+/// operator-configurable up to this (`PROPOLIS_FETCH_MAX_BYTES`), and every sensor spool caps
+/// lower. Readers enforce it so a planted oversized file cannot become an unbounded read.
+pub const MAX_SAMPLE_BYTES: u64 = 500_000_000;
+
+/// One sample body found in a spool directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleFile {
+    pub sha256: String,
+    pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+/// The samples in `dir`: regular files named with a canonical lowercase SHA-256, never following
+/// a link. Anything else in a spool directory is not a sample - including a symlink or FIFO a
+/// compromised sensor could plant under a digest-shaped name. An unreadable directory yields
+/// `None`, which a caller that reports occupancy must keep distinct from "empty".
+pub async fn list_samples(dir: &Path) -> Option<Vec<SampleFile>> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    let mut samples = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|n| is_canonical_sha256_hex(n)) else {
+            continue;
+        };
+        // `DirEntry::metadata` does not traverse a symlink, so a link reads as a link here.
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if meta.is_file() {
+            samples.push(SampleFile {
+                sha256: name.to_string(),
+                size: meta.len(),
+                modified: meta.modified().ok(),
+            });
+        }
+    }
+    Some(samples)
+}
+
+/// Read the body filed as `sha256` in `dir`, verified: see
+/// `sensor_framework::spool::read_verified`. Every consumer outside the writing sensor (console
+/// download, VirusTotal upload) reads through this, so none of them trusts a file name as proof
+/// of its content.
+pub async fn read_sample(dir: &Path, sha256: &str) -> Result<Vec<u8>, SpoolError> {
+    let dir = dir.to_path_buf();
+    let sha256 = sha256.to_string();
+    tokio::task::spawn_blocking(move || read_verified(&dir, &sha256, MAX_SAMPLE_BYTES))
+        .await
+        .unwrap_or_else(|e| Err(SpoolError::Io(std::io::Error::other(e))))
+}
 
 /// Root that per-sensor spool directories default under, overridable with `PROPOLIS_SPOOL_ROOT`
 /// (`deploy/install.sh` provisions this tree, and the systemd units grant it in `ReadWritePaths`).
@@ -127,6 +182,44 @@ mod tests {
                 assert_eq!(dir, root.join(name));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn list_samples_lists_only_canonical_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = "a".repeat(64);
+        std::fs::write(dir.path().join(&real), b"body").unwrap();
+        std::fs::write(dir.path().join("B".repeat(64)), b"uppercase").unwrap();
+        std::fs::write(dir.path().join("staging.tmp"), b"tmp").unwrap();
+        std::fs::create_dir(dir.path().join("d".repeat(64))).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc/hostname", dir.path().join("c".repeat(64))).unwrap();
+
+        let listed = list_samples(dir.path()).await.unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "only the regular digest-named file: {listed:?}"
+        );
+        assert_eq!(listed[0].sha256, real);
+        assert_eq!(listed[0].size, 4);
+        assert!(list_samples(&dir.path().join("missing")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_sample_enforces_the_shared_cap_and_hash() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"payload";
+        let name = sensor_framework::to_hex_bounded(&Sha256::digest(body), 32);
+        std::fs::write(dir.path().join(&name), body).unwrap();
+        assert_eq!(read_sample(dir.path(), &name).await.unwrap(), body);
+
+        std::fs::write(dir.path().join(&name), b"swapped").unwrap();
+        assert!(matches!(
+            read_sample(dir.path(), &name).await,
+            Err(SpoolError::HashMismatch { .. })
+        ));
     }
 
     #[test]

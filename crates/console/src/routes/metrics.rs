@@ -216,10 +216,12 @@ async fn metrics(
     // Spool occupancy from the filesystem: sample count and oldest body per spool. A spool this
     // process cannot read yields no series (absent, not zero) - the standalone console binary has
     // no spool grant, and an absent series is honest where a zero would claim an empty spool.
-    let spools: Vec<(&str, u64, u64)> = review::spool::all_body_dirs()
-        .iter()
-        .filter_map(|(name, dir)| spool_occupancy(dir).map(|(n, age)| (*name, n, age)))
-        .collect();
+    let mut spools: Vec<(&str, u64, u64)> = Vec::new();
+    for (name, dir) in review::spool::all_body_dirs() {
+        if let Some((count, age)) = spool_occupancy(&dir).await {
+            spools.push((name, count, age));
+        }
+    }
     if !spools.is_empty() {
         writeln!(
             out,
@@ -357,27 +359,20 @@ fn age_seconds(epoch_secs: Option<f64>) -> i64 {
     epoch_secs.map_or(0, |s| s.max(0.0) as i64)
 }
 
-/// `(sample count, oldest sample age in seconds)` for one spool directory, counting only the
-/// sha256-named bodies the spool writes (never its tmp files). `None` when the directory cannot
-/// be read at all, so the caller emits no series rather than a false zero.
-fn spool_occupancy(dir: &std::path::Path) -> Option<(u64, u64)> {
-    let entries = std::fs::read_dir(dir).ok()?;
+/// `(sample count, oldest sample age in seconds)` for one spool directory, counting exactly what
+/// the samples page lists (`review::spool::list_samples`: sha256-named regular files, never tmp
+/// files or links). `None` when the directory cannot be read at all, so the caller emits no
+/// series rather than a false zero.
+async fn spool_occupancy(dir: &std::path::Path) -> Option<(u64, u64)> {
+    let samples = review::spool::list_samples(dir).await?;
     let now = std::time::SystemTime::now();
-    let mut count = 0u64;
-    let mut oldest = 0u64;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.len() != 64 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
-            continue;
-        }
-        count += 1;
-        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-            let age = now.duration_since(mtime).map_or(0, |d| d.as_secs());
-            oldest = oldest.max(age);
-        }
-    }
-    Some((count, oldest))
+    let oldest = samples
+        .iter()
+        .filter_map(|s| s.modified)
+        .map(|mtime| now.duration_since(mtime).map_or(0, |d| d.as_secs()))
+        .max()
+        .unwrap_or(0);
+    Some((samples.len() as u64, oldest))
 }
 
 #[cfg(test)]
@@ -391,13 +386,15 @@ mod tests {
         assert_eq!(age_seconds(Some(90.9)), 90);
     }
 
-    #[test]
-    fn spool_occupancy_counts_only_sha_named_bodies_and_reports_the_oldest() {
+    #[tokio::test]
+    async fn spool_occupancy_counts_only_sha_named_bodies_and_reports_the_oldest() {
         let tmp = tempfile::tempdir().unwrap();
         let old = tmp.path().join("a".repeat(64));
         std::fs::write(&old, b"x").unwrap();
         std::fs::write(tmp.path().join("b".repeat(64)), b"y").unwrap();
         std::fs::write(tmp.path().join("staging.tmp"), b"z").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&old, tmp.path().join("c".repeat(64))).unwrap();
         let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         std::fs::File::options()
             .write(true)
@@ -406,11 +403,11 @@ mod tests {
             .set_modified(long_ago)
             .unwrap();
 
-        let (count, oldest) = spool_occupancy(tmp.path()).unwrap();
-        assert_eq!(count, 2, "the tmp file is not a sample");
+        let (count, oldest) = spool_occupancy(tmp.path()).await.unwrap();
+        assert_eq!(count, 2, "neither the tmp file nor a link is a sample");
         assert!((3599..=3601).contains(&oldest), "oldest age {oldest}");
         assert_eq!(
-            spool_occupancy(&tmp.path().join("missing")),
+            spool_occupancy(&tmp.path().join("missing")).await,
             None,
             "an unreadable spool yields no series, never a zero"
         );

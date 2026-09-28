@@ -51,6 +51,10 @@ pub enum SpoolError {
     InvalidHash {
         given: String,
     },
+    /// The spool entry is a symlink, FIFO, directory or anything else that is not a regular
+    /// file. Only the spool writer creates entries, and it only ever creates regular files, so
+    /// anything else was planted and is refused rather than followed.
+    NotRegularFile,
     Io(std::io::Error),
 }
 
@@ -76,6 +80,7 @@ impl std::fmt::Display for SpoolError {
             SpoolError::InvalidHash { given } => {
                 write!(f, "not a valid sha-256 hex digest: {given:?}")
             }
+            SpoolError::NotRegularFile => write!(f, "spool entry is not a regular file"),
             SpoolError::Io(e) => write!(f, "spool i/o error: {e}"),
         }
     }
@@ -211,26 +216,16 @@ impl QuarantineSpool {
     /// `sanitize::to_hex_bounded`: a hex-only string cannot express `/`, `\`, or a `..` segment,
     /// so a malformed argument can never escape `self.dir` no matter what the caller passes.
     pub fn verify(&self, sha256: &str) -> Result<(), SpoolError> {
-        if !is_valid_sha256_hex(sha256) {
-            let given: String = sha256.chars().take(128).collect();
-            return Err(SpoolError::InvalidHash { given });
-        }
         self.verify_on_disk(sha256)
     }
 
-    /// Shared re-hash-on-read logic for both `verify` and `store`'s dedup path. Only ever called
-    /// with a hash already known to be well-formed (either computed internally, or checked by
-    /// `verify` above), so it does no format validation of its own.
+    /// Shared re-hash-on-read logic for both `verify` and `store`'s dedup path; `read_verified`
+    /// does the name validation.
     fn verify_on_disk(&self, hash: &str) -> Result<(), SpoolError> {
-        let body = std::fs::read(self.dir.join(hash))?;
-        let actual = hex_digest(&Sha256::digest(&body));
-        if actual != hash {
-            return Err(SpoolError::HashMismatch {
-                expected: hash.to_string(),
-                actual,
-            });
-        }
-        Ok(())
+        // No size cap here: a file stored under a larger cap by an earlier run is still a valid
+        // dedup target, and the cap this call would apply is about memory, which `store` already
+        // bounded when it accepted `body`.
+        read_verified(&self.dir, hash, u64::MAX).map(drop)
     }
 
     /// Atomically check-and-reserve `size` bytes against the global budget. `SeqCst` throughout:
@@ -273,6 +268,83 @@ impl QuarantineSpool {
     }
 }
 
+/// Read the body filed as `sha256` in `dir`, returning it only if it is a regular file of at most
+/// `max_len` bytes whose content hashes to exactly that name.
+///
+/// This is the one way anything outside the writing sensor may read a spooled body. The spool
+/// directory is written by internet-facing sensor processes, so its contents are untrusted from
+/// the reader's side: a file NAME is a claim about the content, not proof of it. So the entry is
+/// opened without following a symlink (`O_NOFOLLOW`) and without blocking on a FIFO
+/// (`O_NONBLOCK`), must be a regular file by `fstat` of the opened descriptor, and is read from
+/// that descriptor - never re-opened by path - so what is hashed is exactly what is returned.
+/// `sha256` must be the canonical lowercase form the writer produces; an uppercase spelling
+/// names no file the writer could have created.
+pub fn read_verified(dir: &Path, sha256: &str, max_len: u64) -> Result<Vec<u8>, SpoolError> {
+    use std::io::Read;
+
+    if !is_canonical_sha256_hex(sha256) {
+        let given: String = sha256.chars().take(128).collect();
+        return Err(SpoolError::InvalidHash { given });
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(dir.join(sha256)) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(SpoolError::NotRegularFile);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(SpoolError::NotRegularFile);
+    }
+    if metadata.len() > max_len {
+        return Err(SpoolError::FileSizeExceeded {
+            size: metadata.len(),
+            limit: max_len,
+        });
+    }
+
+    // Bounded by `max_len + 1` rather than trusting the fstat length: a file still growing under
+    // a writer must not turn this into an unbounded read.
+    let mut body = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(max_len.saturating_add(1))
+        .read_to_end(&mut body)?;
+    if body.len() as u64 > max_len {
+        return Err(SpoolError::FileSizeExceeded {
+            size: body.len() as u64,
+            limit: max_len,
+        });
+    }
+
+    let actual = hex_digest(&Sha256::digest(&body));
+    if actual != sha256 {
+        return Err(SpoolError::HashMismatch {
+            expected: sha256.to_string(),
+            actual,
+        });
+    }
+    Ok(body)
+}
+
+/// Whether `name` is the exact form the spool writer names a body: 64 lowercase hex characters.
+/// Readers use this to decide what counts as a sample; anything else in a spool directory (a
+/// staging file, the `outbox/` directory, a planted name) is not one. The alphabet also
+/// structurally excludes `/`, `\` and `.`, which is what makes joining a checked name onto the
+/// spool directory traversal-safe without a traversal-specific check.
+pub fn is_canonical_sha256_hex(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Write the body to a freshly created, empty spool file and lock down its permissions.
 /// `create_new` on the caller's side already guarantees this file did not exist a moment ago, so
 /// there is nothing to dedup here - only the write and the permission bits.
@@ -307,14 +379,6 @@ fn scan_existing_usage(dir: &Path) -> u64 {
         .filter(std::fs::Metadata::is_file)
         .map(|metadata| metadata.len())
         .sum()
-}
-
-/// A SHA-256 hex digest is exactly 64 lowercase-or-uppercase hex characters. This alphabet
-/// structurally excludes `/`, `\`, and `.`, so confirming it is enough to make a path-traversal
-/// payload impossible to smuggle through `verify`'s `sha256` argument - safe by alphabet, not by
-/// a traversal-specific check that could be bypassed by some encoding this one overlooks.
-fn is_valid_sha256_hex(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -490,5 +554,118 @@ mod tests {
         spool
             .store(&body)
             .expect("a same-level outbox/ file must not count against the spool budget");
+    }
+
+    #[test]
+    fn read_verified_returns_a_stored_body() {
+        let (dir, spool) = test_spool(1024, 1_000_000);
+        let sample = spool.store(b"captured payload").unwrap();
+        let body = read_verified(dir.path(), &sample.sha256, 1024).unwrap();
+        assert_eq!(body, b"captured payload");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_verified_refuses_a_symlink_named_as_a_sample() {
+        // The audit reproduction: a link named like a digest, pointing at a file outside the
+        // spool. The reader must refuse the link itself, not read through it.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, b"not a sample").unwrap();
+        let name = hex_digest(&Sha256::digest(b"not a sample"));
+        std::os::unix::fs::symlink(&secret, dir.path().join(&name)).unwrap();
+
+        let result = read_verified(dir.path(), &name, 1024);
+        assert!(
+            matches!(result, Err(SpoolError::NotRegularFile)),
+            "a symlink must be refused even when its target hashes to its name, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_verified_does_not_block_on_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "c".repeat(64);
+        let path = dir.path().join(&name);
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path owned for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        // A blocking open of a FIFO with no writer never returns; this must fail fast instead.
+        let result = read_verified(dir.path(), &name, 1024);
+        assert!(matches!(result, Err(SpoolError::NotRegularFile)));
+    }
+
+    #[test]
+    fn read_verified_refuses_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "d".repeat(64);
+        std::fs::create_dir(dir.path().join(&name)).unwrap();
+        assert!(matches!(
+            read_verified(dir.path(), &name, 1024),
+            Err(SpoolError::NotRegularFile)
+        ));
+    }
+
+    #[test]
+    fn read_verified_refuses_content_that_does_not_match_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = hex_digest(&Sha256::digest(b"claimed"));
+        std::fs::write(dir.path().join(&name), b"actual").unwrap();
+        assert!(matches!(
+            read_verified(dir.path(), &name, 1024),
+            Err(SpoolError::HashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn read_verified_refuses_a_file_over_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![5u8; 11];
+        let name = hex_digest(&Sha256::digest(&body));
+        std::fs::write(dir.path().join(&name), &body).unwrap();
+        assert!(matches!(
+            read_verified(dir.path(), &name, 10),
+            Err(SpoolError::FileSizeExceeded {
+                size: 11,
+                limit: 10
+            })
+        ));
+        assert_eq!(read_verified(dir.path(), &name, 11).unwrap(), body);
+    }
+
+    #[test]
+    fn read_verified_accepts_only_the_canonical_lowercase_name() {
+        let (dir, spool) = test_spool(1024, 1_000_000);
+        let sample = spool.store(b"case").unwrap();
+        let upper = sample.sha256.to_ascii_uppercase();
+        assert!(matches!(
+            read_verified(dir.path(), &upper, 1024),
+            Err(SpoolError::InvalidHash { .. })
+        ));
+        assert!(matches!(
+            read_verified(dir.path(), "../../etc/passwd", 1024),
+            Err(SpoolError::InvalidHash { .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn store_refuses_to_dedup_against_a_planted_symlink() {
+        // A link already sitting at the name `store` would write must not be accepted as the
+        // stored copy of this body, even when the link's target has the right content.
+        let (dir, spool) = test_spool(1024, 1_000_000);
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("body");
+        std::fs::write(&target, b"payload").unwrap();
+        let name = hex_digest(&Sha256::digest(b"payload"));
+        std::os::unix::fs::symlink(&target, dir.path().join(&name)).unwrap();
+
+        assert!(matches!(
+            spool.store(b"payload"),
+            Err(SpoolError::NotRegularFile)
+        ));
     }
 }

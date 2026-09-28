@@ -169,9 +169,11 @@ There is **no global CSP header**. The only route that emits a CSP is
 `GET /samples/download/{sha256}`, which serves the raw malware sample with
 `Content-Security-Policy: default-src 'none'` alongside its own
 `X-Content-Type-Options: nosniff`, `Content-Type: application/octet-stream`, and
-`Content-Disposition: attachment` (`samples.rs:145-160`). That download also validates the
-`{sha256}` segment as exactly 64 hex characters and returns `400` for a malformed value
-(`samples.rs:138-139`).
+`Content-Disposition: attachment` (`serve_sample` in `samples.rs`). That download also
+validates the `{sha256}` segment as exactly 64 hex characters and returns `400` for a malformed
+value. It serves only a body that passes `review::spool::read_sample` (a regular file, not a
+link, whose content hashes to the requested digest); an entry that exists but fails that check
+returns `409` and is logged, and an absent one returns `404`.
 
 XSS defense across the HTML pages is therefore **minijinja auto-escaping** (every template
 whose name ends in `.html` is auto-escaped) plus `nosniff` / `DENY` and the hardened

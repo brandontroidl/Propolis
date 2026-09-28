@@ -176,32 +176,24 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
     let max_source_ips = max_source_ips_shown();
     let mut samples = Vec::new();
     for (sensor, dir) in spool_dirs() {
-        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Ok(meta) = entry.metadata().await {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
-                        let vt = vt_results.get(&name);
-                        let all_ips = source_ips_by_sha.get(&name);
-                        let source_ips: Vec<String> = all_ips
-                            .map(|v| v.iter().take(max_source_ips).cloned().collect())
-                            .unwrap_or_default();
-                        let more_source_ips =
-                            all_ips.map_or(0, |v| v.len().saturating_sub(max_source_ips));
-                        samples.push(SampleRow {
-                            sha256_short: name[..12].to_string(),
-                            sha256: name,
-                            size: format_bytes(meta.len()),
-                            sensor: sensor.to_string(),
-                            vt_detected: vt.map(|(d, _, _)| *d),
-                            vt_total: vt.map(|(_, t, _)| *t),
-                            vt_link: vt.map(|(_, _, l)| l.clone()).unwrap_or_default(),
-                            source_ips,
-                            more_source_ips,
-                        });
-                    }
-                }
-            }
+        for file in review::spool::list_samples(&dir).await.unwrap_or_default() {
+            let vt = vt_results.get(&file.sha256);
+            let all_ips = source_ips_by_sha.get(&file.sha256);
+            let source_ips: Vec<String> = all_ips
+                .map(|v| v.iter().take(max_source_ips).cloned().collect())
+                .unwrap_or_default();
+            let more_source_ips = all_ips.map_or(0, |v| v.len().saturating_sub(max_source_ips));
+            samples.push(SampleRow {
+                sha256_short: file.sha256[..12].to_string(),
+                size: format_bytes(file.size),
+                sha256: file.sha256,
+                sensor: sensor.to_string(),
+                vt_detected: vt.map(|(d, _, _)| *d),
+                vt_total: vt.map(|(_, t, _)| *t),
+                vt_link: vt.map(|(_, _, l)| l.clone()).unwrap_or_default(),
+                source_ips,
+                more_source_ips,
+            });
         }
     }
 
@@ -226,35 +218,60 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
 }
 
 async fn download_sample(AxumPath(sha256): AxumPath<String>) -> Response {
+    serve_sample(&spool_dirs(), &sha256).await
+}
+
+async fn serve_sample(dirs: &[(&'static str, PathBuf)], sha256: &str) -> Response {
     if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         return (axum::http::StatusCode::BAD_REQUEST, "invalid sha256").into_response();
     }
+    // Spool names are lowercase; accept a pasted uppercase digest for the same body.
+    let sha256 = sha256.to_ascii_lowercase();
 
-    for (_sensor, dir) in spool_dirs() {
-        let path = dir.join(&sha256);
-        if let Ok(bytes) = tokio::fs::read(&path).await {
-            return (
-                [
-                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        format!("attachment; filename=\"{sha256}\""),
-                    ),
-                    (
-                        header::HeaderName::from_static("x-content-type-options"),
-                        "nosniff".to_string(),
-                    ),
-                    (
-                        header::HeaderName::from_static("content-security-policy"),
-                        "default-src 'none'".to_string(),
-                    ),
-                ],
-                bytes,
-            )
-                .into_response();
-        }
+    // A body that exists but fails verification is reported as such rather than as "not found":
+    // a link, a non-regular file or content that does not hash to its name in a spool means
+    // something other than the sensor wrote there, which the operator needs to see.
+    let mut refused = false;
+    for (sensor, dir) in dirs {
+        let bytes = match review::spool::read_sample(dir, &sha256).await {
+            Ok(bytes) => bytes,
+            Err(review::spool::SpoolError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(sensor, sha256 = %sha256, error = %e, "samples: refused to serve a spool entry that failed verification");
+                refused = true;
+                continue;
+            }
+        };
+        return (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{sha256}\""),
+                ),
+                (
+                    header::HeaderName::from_static("x-content-type-options"),
+                    "nosniff".to_string(),
+                ),
+                (
+                    header::HeaderName::from_static("content-security-policy"),
+                    "default-src 'none'".to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response();
     }
 
+    if refused {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            "sample failed integrity verification and was not served",
+        )
+            .into_response();
+    }
     (axum::http::StatusCode::NOT_FOUND, "sample not found").into_response()
 }
 
@@ -297,6 +314,87 @@ mod tests {
         assert!(
             !map.contains_key("cc"),
             "a sample nothing links to must have no entry, so the row renders 'not linked'"
+        );
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    async fn body_of(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn serve_sample_returns_a_verified_body_from_whichever_spool_holds_it() {
+        let empty = tempfile::tempdir().unwrap();
+        let holding = tempfile::tempdir().unwrap();
+        let body = b"dropper bytes";
+        let sha = sha256_hex(body);
+        std::fs::write(holding.path().join(&sha), body).unwrap();
+        let dirs = [
+            ("ssh", empty.path().to_path_buf()),
+            ("fetched", holding.path().to_path_buf()),
+        ];
+
+        let response = serve_sample(&dirs, &sha.to_ascii_uppercase()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(body_of(response).await, body);
+    }
+
+    /// The audit's reproduction: a digest-named symlink in a sensor spool pointing at a local file
+    /// served that file's bytes to the operator. It must be refused, and the target's bytes must
+    /// not appear in the response - including when the link's name is the target's real digest,
+    /// which a name-only check would accept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_sample_refuses_a_symlink_and_never_returns_its_target() {
+        let spool = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("hostname");
+        std::fs::write(&target, b"host-secret-contents").unwrap();
+
+        for name in ["a".repeat(64), sha256_hex(b"host-secret-contents")] {
+            let link = spool.path().join(&name);
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let response = serve_sample(&[("ssh", spool.path().to_path_buf())], &name).await;
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let served = body_of(response).await;
+            assert!(
+                !served
+                    .windows(b"host-secret-contents".len())
+                    .any(|w| w == b"host-secret-contents"),
+                "target bytes leaked through the download route"
+            );
+            std::fs::remove_file(&link).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_sample_refuses_content_that_does_not_match_its_name() {
+        let spool = tempfile::tempdir().unwrap();
+        let name = sha256_hex(b"what the name claims");
+        std::fs::write(spool.path().join(&name), b"what is actually there").unwrap();
+
+        let response = serve_sample(&[("ftp", spool.path().to_path_buf())], &name).await;
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn serve_sample_distinguishes_missing_from_malformed() {
+        let spool = tempfile::tempdir().unwrap();
+        let dirs = [("adb", spool.path().to_path_buf())];
+        assert_eq!(
+            serve_sample(&dirs, &"e".repeat(64)).await.status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            serve_sample(&dirs, "../../etc/passwd").await.status(),
+            axum::http::StatusCode::BAD_REQUEST
         );
     }
 }

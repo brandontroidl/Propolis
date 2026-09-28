@@ -83,7 +83,12 @@ The quarantine spool is content-addressed and fail-closed by construction
 - files are named by the SHA-256 of their content, never by an attacker-supplied filename, so
   path traversal is structurally impossible;
 - files are written `create_new` with `0640` permissions;
-- reads re-hash and refuse on mismatch (`HashMismatch` -> corrupt, refused);
+- reads re-hash and refuse on mismatch (`HashMismatch` -> corrupt, refused). Every reader
+  outside the writing sensor - the console download, the VirusTotal upload - goes through
+  `sensor_framework::spool::read_verified`: the entry is opened without following a symlink,
+  must be a regular file no larger than any producer can write (500 MB), and is hashed from the
+  opened descriptor. A link, FIFO or swapped body under a digest name is refused and logged,
+  never read through; the samples list and spool metrics skip such entries;
 - duplicate content dedups on the existing hash and consumes no extra budget;
 - on restart, `new()` re-scans the directory to recover used bytes, so a restart does not reset
   the budget ceiling.

@@ -108,10 +108,15 @@ modes - the `0600` env files and per-sensor `0750` spool dirs are load-bearing.
 # Example. Run as root to preserve per-service ownership.
 tar --numeric-owner -czf propolis-state-$(date +%F).tgz \
   /etc/propolis \
-  /var/spool/propolis/fetched \
   /var/spool/propolis \
   /var/lib/propolis/ssh
 ```
+
+Name each tree once. `tar` recurses into every directory it is given, and
+`/var/spool/propolis` already contains each per-sensor spool and the `fetched`
+quarantine, so listing a subdirectory beside its parent stores every file under
+it twice. `crates/propolis/tests/docs_agreement.rs` fails the build if a `tar`
+command in the docs names a path inside another one it also names.
 
 Store the config/secrets archive encrypted and separately from the data archive
 if you can, so a data-restore workflow never needs to touch the secret material.

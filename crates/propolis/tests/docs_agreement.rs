@@ -10,9 +10,11 @@
 //! documented PROPOLIS_CATCHALL_BIND, which the binary does not read"). Code string literals carry
 //! no such prose, so this direction is unambiguous.
 
+mod doc_commands;
+
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 fn workspace_root() -> PathBuf {
     // crates/propolis -> crates -> workspace root
@@ -164,5 +166,145 @@ fn no_em_dashes_in_live_docs_or_source() {
         offenders.is_empty(),
         "em-dash (U+2014) found; replace with a spaced hyphen or restructure the sentence:\n{}",
         offenders.join("\n")
+    );
+}
+
+/// Every pair of `tar` inputs where one names the same tree as, or a tree inside, the other.
+/// `tar` recurses into a directory, so the audited backup command (P-11), which listed
+/// `/var/spool/propolis/fetched` beside `/var/spool/propolis`, stored every fetched sample twice.
+/// Comparison is by path component, so `/var/spool/propolis-old` is not inside
+/// `/var/spool/propolis`; a `..` component cannot be judged without the filesystem and is
+/// reported instead of guessed at.
+fn overlapping_inputs(inputs: &[String]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (i, a) in inputs.iter().enumerate() {
+        if Path::new(a).components().any(|c| c == Component::ParentDir) {
+            found.push(format!("{a} contains `..`; write the path without it"));
+        }
+        for b in &inputs[i + 1..] {
+            let (pa, pb) = (Path::new(a), Path::new(b));
+            if pa == pb {
+                found.push(format!("{a} is listed twice"));
+            } else if pb.starts_with(pa) {
+                found.push(format!("{b} is inside {a}"));
+            } else if pa.starts_with(pb) {
+                found.push(format!("{a} is inside {b}"));
+            }
+        }
+    }
+    found
+}
+
+/// Live Markdown the gate reads: `docs/` without the checksummed `archive/` and the gitignored
+/// `superpowers/` notes, plus the top-level `*.md` files.
+fn live_markdown(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if !matches!(entry.file_name().to_str(), Some("archive" | "superpowers")) {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|e| e == "md") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&root.join("docs"), &mut files);
+    if let Ok(entries) = fs::read_dir(root) {
+        files.extend(
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "md")),
+        );
+    }
+    files
+}
+
+#[test]
+fn documented_archive_commands_name_each_tree_once() {
+    let root = workspace_root();
+    let backup_doc = root.join("docs/operations/backup-and-restore.md");
+    let backup = fs::read_to_string(&backup_doc).expect("docs/operations/backup-and-restore.md");
+    // The backup page owns the procedure; if its command stops being found, the reader is broken
+    // and every other file's clean result below means nothing.
+    assert!(
+        doc_commands::tar_create_inputs(&backup)
+            .iter()
+            .any(|inputs| inputs.len() >= 2),
+        "no tar archive command with two or more inputs found in {} - the extraction is broken, \
+         not the docs",
+        backup_doc.display()
+    );
+
+    let mut problems = Vec::new();
+    for file in live_markdown(&root) {
+        let Ok(text) = fs::read_to_string(&file) else {
+            continue;
+        };
+        for inputs in doc_commands::tar_create_inputs(&text) {
+            for problem in overlapping_inputs(&inputs) {
+                problems.push(format!(
+                    "{}: {problem}",
+                    file.strip_prefix(&root).unwrap_or(&file).display()
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "a documented tar command archives the same files twice; name each tree once:\n{}",
+        problems.join("\n")
+    );
+}
+
+/// The reader and the overlap check, held to the exact command the audit found and to the near
+/// misses a lexical prefix check would get wrong.
+#[test]
+fn archive_overlap_check_flags_the_audited_command_and_nothing_else() {
+    let audited = "```\n\
+        # Example. Run as root to preserve per-service ownership.\n\
+        tar --numeric-owner -czf propolis-state-$(date +%F).tgz \\\n\
+        \x20 /etc/propolis \\\n\
+        \x20 /var/spool/propolis/fetched \\\n\
+        \x20 /var/spool/propolis \\\n\
+        \x20 /var/lib/propolis/ssh\n\
+        ```\n";
+    let commands = doc_commands::tar_create_inputs(audited);
+    assert_eq!(
+        commands,
+        vec![vec![
+            "/etc/propolis".to_string(),
+            "/var/spool/propolis/fetched".to_string(),
+            "/var/spool/propolis".to_string(),
+            "/var/lib/propolis/ssh".to_string(),
+        ]],
+        "the archive name and the comment must not read as inputs"
+    );
+    assert_eq!(
+        overlapping_inputs(&commands[0]),
+        vec!["/var/spool/propolis/fetched is inside /var/spool/propolis".to_string()]
+    );
+
+    let owned = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    assert!(
+        overlapping_inputs(&owned(&["/var/spool/propolis", "/var/spool/propolis-old"])).is_empty(),
+        "a sibling sharing a name prefix is not inside the other"
+    );
+    assert_eq!(
+        overlapping_inputs(&owned(&["/etc/propolis/", "/etc/propolis"])).len(),
+        1
+    );
+    assert_eq!(
+        doc_commands::tar_create_inputs(
+            "```\nsudo tar -C / -cf x.tar a b\ntar -xzf x.tgz -C /\n```"
+        ),
+        vec![owned(&["a", "b"])],
+        "-C's directory is not an input, and extraction is not archiving"
     );
 }

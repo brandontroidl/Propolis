@@ -3,7 +3,7 @@ title: Documentation and review expectations
 audience: maintainer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -38,17 +38,33 @@ Review expectations that follow from the tree's conventions:
 
 ## Documentation stays in sync mechanically, where it can
 
-The repo enforces one class of doc/code agreement in CI rather than by convention:
+The repo enforces doc/code agreement in CI, rather than by convention, for every class
+of fact that has drifted before. **`crates/propolis/tests/docs_agreement.rs`** fails the
+build when:
 
-**`crates/propolis/tests/docs_agreement.rs`** fails the build if any `PROPOLIS_*` /
-`CATCHALL_*` env-var name that appears as a string literal in non-test source is missing
-from `INSTALL.md`. Direction is code → docs (the reverse would false-positive on
-`INSTALL.md`'s own corrective prose that quotes deliberately-wrong names). It exists
-because the project twice shipped `INSTALL.md` documenting an env-var name the code did
-not read, and a sensor refused to start with no hint why (`docs_agreement.rs:1-10`).
+- an env-var name the non-test source reads (`PROPOLIS_*` / `CATCHALL_*` string
+  literals) is missing from the
+  [environment variable reference](../reference/environment-variables.md). Direction is
+  code to docs; the reverse would false-positive on corrective prose that quotes
+  deliberately wrong names. It exists because the project twice shipped install docs
+  naming a variable the code did not read, and a sensor refused to start with no hint
+  why;
+- a current page's `applies-to` version, a stated tree or toolchain version, or a stated
+  crate, member or binary total disagrees with `cargo metadata` and
+  `rust-toolchain.toml`;
+- the [component inventory](../architecture/components.md) is missing a crate or its
+  dependency graph differs from the manifests;
+- the [test taxonomy](build-and-test.md#test-taxonomy) differs from a recount of the
+  test attributes;
+- the [migration change map](../reference/database.md#migration-change-map) does not
+  list exactly the migration files on disk;
+- a documented `tar` command names one tree twice, or a live page or source file
+  contains an em dash.
 
-Practical consequence: **when you add or rename an env var, update `INSTALL.md` in the
-same change** or CI fails.
+Practical consequence: **when you add or rename an env var, a crate, a dependency
+between crates, a test or a migration, update the page that owns that fact in the same
+change** or CI fails. The full list, with what each check exempts, is in
+[build-and-test](build-and-test.md#notable-enforcement-test-doccode-agreement).
 
 ## Published documentation corpus
 

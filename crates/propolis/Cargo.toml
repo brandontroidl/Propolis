@@ -48,6 +48,9 @@ sensor-ssh = { path = "../sensor-ssh" }
 # An SSH client for that test, so the session is driven over the real transport rather than by
 # calling the handler directly. Already vendored at this version for sensor-ssh's own tests.
 russh = "0.62.4"
+# Parses `cargo metadata` in the docs agreement test, which checks the crate, binary and version
+# figures the docs restate. Already vendored at this version for the other crates.
+serde_json = "1.0.151"
 tempfile = "3.27.0"
 # test-util enables tokio's pausable virtual clock (start_paused) so time-based dispatcher tests
 # (per-attempt deadline + backoff) run deterministically and instantly. A tokio feature, not a new

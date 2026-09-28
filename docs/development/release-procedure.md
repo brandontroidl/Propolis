@@ -3,7 +3,7 @@ title: Release procedure
 audience: maintainer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -18,15 +18,15 @@ observable state and marked `[inferred]` where the mechanism is not documented i
 
 | Fact | Value | Source |
 |---|---|---|
-| Crate version (all 18) | `0.3.0` | each `crates/*/Cargo.toml:3` |
+| Crate version | `0.4.0` for eighteen of the 24 crates; `0.1.0` for `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper` | each `crates/*/Cargo.toml:3` |
 | Only release tag | `v0.1.0` ("v0.1.0: initial release") | `git tag` |
-| Tags `v0.2.0` / `v0.3.0` | do not exist | `git tag` |
+| Tags `v0.2.0` / `v0.3.0` / `v0.4.0` | do not exist | `git tag` |
 | `CHANGELOG.md` | a single, undated `## Unreleased` section | `CHANGELOG.md:3` |
 
-So the working tree is **`0.3.0` but untagged**: the crate manifests moved ahead of the
-tags across two unreleased version bumps, and `CHANGELOG.md` accumulates all changes
+So the working tree is **`0.4.0` but untagged**: the crate manifests moved ahead of the
+tags across three unreleased version bumps, and `CHANGELOG.md` accumulates all changes
 since `v0.1.0` under one `Unreleased` heading. Describe maturity as source-available,
-actively developed, **one tagged release (`v0.1.0`)**, current tree `0.3.0` untagged - not certified or production-blessed. The V12 operator console (theme system, evidence
+actively developed, **one tagged release (`v0.1.0`)**, current tree `0.4.0` untagged - not certified or production-blessed. The V12 operator console (theme system, evidence
 drawer, self-hosted fonts) merged **after** the `v0.1.0` tag (at `dbf8c053`) and is not
 mentioned in `CHANGELOG.md`.
 
@@ -40,8 +40,10 @@ and [`governance/release-policy`](../governance/release-policy.md).
 ### 1. Bump the version
 
 The workspace has **no `[workspace.package]`** table, so version is declared
-per-crate - all 18 crates currently read `version = "0.3.0"`. A version bump updates
-each crate manifest (kept in lockstep in the current tree). Run `cargo build --locked`
+per-crate. Eighteen crates read `version = "0.4.0"` and have been bumped in lockstep;
+the six added since `0.3.0` (`collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper`) read
+`version = "0.1.0"` and have not been bumped yet. A version bump updates each crate
+manifest it applies to. Run `cargo build --locked`
 afterward so `Cargo.lock` reflects the new versions, and commit both.
 
 ### 2. Finalize the changelog
@@ -78,12 +80,12 @@ Tags follow the `vMAJOR.MINOR.PATCH` form (`v0.1.0` is annotated: "v0.1.0: initi
 release"). Create an annotated tag on the release commit:
 
 ```
-git tag -a v0.3.0 -m "v0.3.0: <summary>"
+git tag -a v0.4.0 -m "v0.4.0: <summary>"
 ```
 
 > **Pushing a tag is an outward, effectively-irreversible publish.** A pushed tag is
 > what downstream users and any deploy step resolve against. Confirm the tag points at
-> the intended, fully-gated commit before `git push origin v0.3.0`. Deleting or moving a
+> the intended, fully-gated commit before `git push origin v0.4.0`. Deleting or moving a
 > published tag is disruptive to anyone who already fetched it.
 
 ### 5. Deploy

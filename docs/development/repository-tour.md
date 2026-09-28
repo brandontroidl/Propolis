@@ -3,7 +3,7 @@ title: Repository tour
 audience: developer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -17,12 +17,12 @@ tables, ports, routes, and constants are owned by the
 
 | Path | What it holds |
 |---|---|
-| `Cargo.toml` | Workspace root: `resolver = "2"`, 18 members, no `[workspace.dependencies]` and no `[workspace.package]` (every crate declares its own version and deps). |
+| `Cargo.toml` | Workspace root: `resolver = "2"`, 24 members, no `[workspace.dependencies]` and no `[workspace.package]` (every crate declares its own version and deps). |
 | `Cargo.lock` | Committed, frozen in CI via `--locked`. |
 | `rust-toolchain.toml` | Pins the exact toolchain (`1.96.1`) + `clippy`, `rustfmt`. See [toolchain-and-environment](toolchain-and-environment.md). |
 | `.cargo/config.toml` | Redirects crates-io to the vendored source tree. |
 | `vendor/` | All dependencies vendored in-tree. Do not edit. See [schema-and-migrations](schema-and-migrations.md#vendoring) and [`reference/dependencies`](../reference/dependencies.md). |
-| `crates/` | The 18 workspace members (below). |
+| `crates/` | The 24 workspace members (below). |
 | `deploy/` | systemd units + `install.sh`. Owns real bind ports/paths at deploy time. See [`reference/ports-and-protocols`](../reference/ports-and-protocols.md). |
 | `.github/workflows/ci.yml` | The authoritative build/test gate. See [build-and-test](build-and-test.md). |
 | `.env` | Gitignored local dev config (test `DATABASE_URL`, podman recipe). Not committed. |
@@ -32,12 +32,14 @@ tables, ports, routes, and constants are owned by the
 
 ## Crates
 
-18 workspace members (`Cargo.toml:3-21`). Full component inventory with binaries and dependency edges lives in [`architecture/components`](../architecture/components.md); the summary by concern:
+24 workspace members (`Cargo.toml:3-28`). Full component inventory with binaries and dependency edges lives in [`architecture/components`](../architecture/components.md); the summary by concern:
 
 **Foundation libraries (no internal deps):**
 - `core-scoring` - event ledger, chain-hashing, scoring, blocklist eligibility; owns the core DB migrations (`crates/core-scoring/migrations/`).
 - `sensor-wire` - the frozen sensor→intake NDJSON wire format (`WIRE_VERSION = 1`); imported by every sensor and by intake.
 - `geoip` - offline MaxMind GeoLite2 City + ASN reader (local file reads only, no network).
+- `log-tailer` - file tailing with a durable, rotation-aware cursor, shared by `intake` and `shipper`.
+- `collector-wire` - the collector-to-gateway batch frame, ack and mutual-TLS configuration.
 
 **Sensor layer:**
 - `sensor-framework` - the shared harness (listener lifecycle, WAN attribution, sanitize, emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds). Depends only on `sensor-wire`.
@@ -47,14 +49,20 @@ tables, ports, routes, and constants are owned by the
 - `intake` - tails sensor NDJSON logs, converts wire events to domain events, appends to the ledger.
 - `review` - review-queue state machine, gatekeeper, vendor adapters (AbuseIPDB/DShield/OTX), VirusTotal scanner, malware fetcher, operator CLI; owns its own migrations (`crates/review/migrations/`).
 - `feed` - blocklist snapshot builder + atomic publish (text/JSON/CSV/CIDR) with checksummed manifest.
+- `fleet` - listener inventory, probe results and the health verdict the console's `/fleet` page shows; owns its own migrations (`crates/fleet/migrations/`).
 - `console` - the operator web console (axum): auth, dashboard, review queue, IP detail, feed status, `/metrics`, `/logs`. See [`architecture/console`](../architecture/console.md).
 - `propolis` - the unified daemon (binary only). Composes intake + review + feed + console + VirusTotal + fetcher + ops-monitor as concurrent tokio tasks on one `PgPool`. See [`architecture/process-topology`](../architecture/process-topology.md).
+
+**Split deployment** (sensors on a collector host, the database on a control plane):
+- `shipper` - collector side: ships sensor log lines to the gateway in sequenced, hash-chained batches over mutual TLS.
+- `gateway` - control-plane side: verifies each collector's batches and spools them in the shape `intake` already tails.
+- `provision-certs` - mints the private CA and the gateway and collector certificates the other two load.
 
 ## Finding things
 
 | Looking for… | Go to |
 |---|---|
-| A DB table, column, enum, or migration | `crates/core-scoring/migrations/`, `crates/review/migrations/`; documented in [`reference/database`](../reference/database.md). |
+| A DB table, column, enum, or migration | `crates/core-scoring/migrations/`, `crates/review/migrations/`, `crates/fleet/migrations/`; documented in [`reference/database`](../reference/database.md). |
 | The wire event format | `crates/sensor-wire/src/lib.rs`; documented in [`reference/events-and-signals`](../reference/events-and-signals.md). |
 | Scoring weights / thresholds | `crates/core-scoring/src/domain/`; documented in [`reference/scoring-and-feed`](../reference/scoring-and-feed.md). |
 | An env var's default / bound | source per crate (e.g. `crates/propolis/src/config.rs`, each sensor's `main.rs`); documented in [`reference/environment-variables`](../reference/environment-variables.md). |

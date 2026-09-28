@@ -3,7 +3,7 @@ title: Storage and database model
 audience: developer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-09-28
 -->
 
@@ -22,15 +22,20 @@ Exact table columns, enum variants, and the migration list are owned by
 model - the append-only ledger, its enforcement, and the projections derived from
 it - and links there for the values.
 
-## Two schema-owning crates
+## Three schema-owning crates
 
-Schema is split across two migration sets:
+Schema is split across three migration sets, each listed migration by migration in
+[reference/database.md](../reference/database.md#migration-change-map):
 
 - **`core-scoring`** owns `event`, `ip_score`, `sample_analysis`, and all five enum
-  types (11 migrations).
-- **`review`** owns `review_queue`, `vendor_submission`, `fetch_attempt` (7
-  migrations). It depends on the `review_state_enum` created by core-scoring's first
-  migration - a deliberate cross-crate schema dependency so the schema is complete.
+  types.
+- **`review`** owns `review_queue`, `vendor_submission`, `fetch_attempt`, and
+  `fetch_daily_usage`. It depends on the `review_state_enum` created by
+  core-scoring's first migration - a deliberate cross-crate schema dependency so the
+  schema is complete.
+- **`fleet`** owns `listener_probe`, and records its migrations in its own
+  bookkeeping table (`_sqlx_migrations_fleet`) so its version numbers cannot collide
+  with the other sets'.
 
 Migrations are **additive and applied-once**. A migration that has run is never
 edited in place; the current canonical shape is what the runtime reads, and legacy
@@ -146,7 +151,10 @@ to duplicate tier logic in SQL, keeping Rust the single source of truth.
   that delivered it was authenticated (`transport_auth`, see
   [malware custody](../security/malware-custody.md#transport-authentication-of-fetched-samples)).
   Its `status` value set is documented in a SQL comment (not a CHECK or enum); the
-  values are set by review-crate code.
+  values are set by review-crate code. Nodes sharing the database claim rows with a
+  lease (`claim_expires`), so no two fetch the same URL at once.
+- `fetch_daily_usage` (PK the UTC day) - the fetcher's daily fetch budget, spent
+  under a row lock so every node draws on one shared cap.
 
 ## Captured file bodies (outside Postgres)
 

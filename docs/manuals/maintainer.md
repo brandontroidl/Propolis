@@ -3,7 +3,7 @@ title: Maintainer manual
 audience: maintainer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -20,15 +20,15 @@ The version signals diverge across surfaces - read them together:
 
 | Fact | Value |
 |---|---|
-| Crate version (all 18 crates) | `0.3.0`, each crate pins it independently (no `[workspace.package]`) |
+| Crate version | `0.4.0` for eighteen of the 24 crates, `0.1.0` for the six added since `0.3.0`; each crate pins its own (no `[workspace.package]`) |
 | Only release tag | `v0.1.0` (annotated, commit `e0bfd513`, 2026-08-02) |
-| Tags `v0.2.0` / `v0.3.0` | do not exist |
+| Tags `v0.2.0` / `v0.3.0` / `v0.4.0` | do not exist |
 | `CHANGELOG.md` | a single undated `## Unreleased` section |
 | Post-tag work not in the changelog | the V12 operator console (theme system, evidence drawer, self-hosted fonts) merged at `dbf8c053`, after `v0.1.0` |
 
-So the working tree is **`0.3.0` but untagged**: roughly two unreleased minor
+So the working tree is **`0.4.0` but untagged**: roughly three unreleased minor
 bumps sit ahead of the tagged release. Describe maturity as source-available,
-actively developed, **one tagged release (`v0.1.0`)**, current tree `0.3.0`
+actively developed, **one tagged release (`v0.1.0`)**, current tree `0.4.0`
 untagged - never certified or production-blessed. Canonical status page:
 [`overview/maturity-and-status`](../overview/maturity-and-status.md).
 

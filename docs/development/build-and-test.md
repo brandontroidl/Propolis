@@ -3,7 +3,7 @@ title: Build and test
 audience: developer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -86,12 +86,13 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 1165 test functions** (681 unit + 484 integration).
-- **DB-backed (`sqlx::test`): 116** - console 87, core-scoring 23, intake 3,
-  propolis 2, feed 1. These provision a fresh database per test.
-- **Ignored: exactly 2.** `crates/console/src/rdns.rs:190`, a live reverse-lookup
-  test `#[ignore]`d so the default suite stays offline-deterministic. Run it
-  manually: `cargo test -p console -- --ignored rdns` (`rdns.rs:186-191`). And
+- **Total: 1656 test functions** (941 unit + 715 integration).
+- **DB-backed (`sqlx::test`): 200** - console 157, core-scoring 25, intake 7,
+  fleet 6, propolis 4, review 1. These provision a fresh database per test.
+- **Ignored: exactly 2.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
+  in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
+  default suite stays offline-deterministic; run it manually with
+  `cargo test -p console -- --ignored rdns`. And
   `crates/propolis/tests/restore_rehearsal.rs`, the populated backup and restore
   rehearsal, which needs PostgreSQL server binaries CI does not install; its
   command and last recorded result are in
@@ -102,32 +103,40 @@ Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = u
   polled panels or the vendored HTMX change; see
   [browser-fixtures](browser-fixtures.md).
 
-> The prior memory index cited "~946 tests"; the current attribute count is 1165.
-> These counts are static attribute counts, not a live `cargo test --list` run.
+These are static attribute counts, not a live `cargo test --list` run. Every figure
+in this section, and the table below row for row, is recomputed from the source and
+`cargo metadata` by `crates/propolis/tests/docs_agreement.rs`, so a change that adds,
+removes or ignores a test fails the suite until this page says so.
 
 Per-crate breakdown:
 
 | Crate | Unit | Integration | Integration files |
 |---|---|---|---|
-| console | 68 | 101 | auth_test, routes_test |
-| core-scoring | 63 | 24 | end_to_end, migrations, replay, repository, smoke |
-| feed | 32 | 55 | builder_test, exclusion_test, export_test, publisher_test |
+| collector-wire | 9 | 0 | - |
+| console | 121 | 181 | auth_test, routes_test, server_test |
+| core-scoring | 67 | 26 | end_to_end, migrations, replay, repository, smoke, telemetry |
+| feed | 36 | 58 | builder_test, exclusion_test, export_test, publisher_test |
+| fleet | 23 | 15 | deploy_inventory_test, probe_test, store_test |
+| gateway | 11 | 13 | handshake, spool, verify |
 | geoip | 4 | 0 | - |
-| intake | 11 | 42 | converter_test, cursor_test, end_to_end, tailer_test |
-| propolis | 79 | 3 | docs_agreement, smoke_test |
-| review | 76 | 59 | cli_test, fetcher_schema_test, gatekeeper_test, queue_test, submit_test, vendor_test |
-| sensor-adb | 48 | 16 | integration |
-| sensor-catchall | 17 | 6 | integration |
-| sensor-cred | 13 | 8 | integration |
-| sensor-framework | 98 | 26 | deploy_test, listener_integration, spool_integration |
-| sensor-ftp | 4 | 10 | integration |
-| sensor-http | 8 | 13 | integration |
-| sensor-redis | 75 | 17 | integration |
-| sensor-smtp | 6 | 10 | integration |
-| sensor-ssh | 40 | 84 | auth_test, crypto_test, integration, shell_test, transport_test |
-| sensor-telnet | 32 | 10 | integration |
-| sensor-wire | 7 | 0 | - |
-| **Total** | **681** | **484** | |
+| intake | 11 | 20 | audit_regressions, converter_test, end_to_end, probe_filter |
+| log-tailer | 0 | 34 | cursor_test, tailer_test |
+| propolis | 100 | 15 | capture_to_console, docs_agreement, restore_rehearsal, smoke_test, ssh_capture_to_console |
+| provision-certs | 0 | 4 | provision |
+| review | 116 | 70 | cli_test, fetcher_proxy_test, fetcher_schema_test, gatekeeper_test, queue_test, submit_test, vendor_test |
+| sensor-adb | 53 | 20 | integration |
+| sensor-catchall | 18 | 6 | integration |
+| sensor-cred | 14 | 8 | integration |
+| sensor-framework | 155 | 46 | build_stamp_test, deploy_test, listener_integration, spool_integration |
+| sensor-ftp | 7 | 14 | integration |
+| sensor-http | 8 | 16 | integration |
+| sensor-redis | 79 | 18 | integration |
+| sensor-smtp | 6 | 18 | integration |
+| sensor-ssh | 48 | 91 | auth_test, crypto_test, integration, shell_test, transport_test |
+| sensor-telnet | 39 | 18 | integration |
+| sensor-wire | 12 | 0 | - |
+| shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
+| **Total** | **941** | **715** | |
 
 ### Test styles by layer
 
@@ -136,17 +145,42 @@ Per-crate breakdown:
   sensor contract (see [adding-a-sensor](adding-a-sensor.md#the-tests-a-sensor-must-pass)).
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
-  (20 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (88 uses) - needed wherever both the core-scoring and
-  review histories are required in one database. See
+  (25 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
+  applies migrations manually (172 uses) - needed wherever a test needs more than
+  one migration history in one database, or a history that keeps its own
+  bookkeeping table (review, fleet). A bare
+  `#[sqlx::test]` (3 uses, the console's `/ready` tests) also gets an empty
+  database, because the console crate has no `migrations/` directory; those tests
+  need only a live connection. See
   [schema-and-migrations](schema-and-migrations.md).
 
 ### Notable enforcement test: doc/code agreement
 
-`crates/propolis/tests/docs_agreement.rs` fails CI if any `PROPOLIS_*` / `CATCHALL_*`
-env-var name that appears as a string literal in non-test source is missing from
-`INSTALL.md` (direction: code → docs). It guards a real twice-shipped drift
-(`PROPOLIS_CATCHALL_BIND` vs `CATCHALL_BIND_ADDRS`) where a sensor refused to start
-with no hint why (`docs_agreement.rs:1-10`).
+`crates/propolis/tests/docs_agreement.rs` fails CI when the docs and the tree
+disagree on a fact that has drifted before:
+
+- any `PROPOLIS_*` / `CATCHALL_*` env-var name that appears as a string literal in
+  non-test source but is missing from the
+  [environment variable reference](../reference/environment-variables.md)
+  (direction: code to docs). It guards a real twice-shipped drift
+  (`PROPOLIS_CATCHALL_BIND` vs `CATCHALL_BIND_ADDRS`) where a sensor refused to
+  start with no hint why;
+- an em dash in live docs or source;
+- a documented `tar` command that names the same tree twice;
+- a current page whose `applies-to` front matter is not the workspace version;
+- a count of crates, members or binaries in a current page that is not the workspace
+  total from `cargo metadata` (counts qualified as sensor, protocol, installed, test
+  or archive figures are exempt);
+- a backticked version beside "tree", "currently" or "Crate version" that is not the
+  workspace version, or one beside "Rust" or "toolchain" that is not the
+  `rust-toolchain.toml` pin (other versions, such as dependencies', are exempt);
+- a [component inventory](../architecture/components.md) row or dependency edge that
+  differs from `cargo metadata`;
+- a [migration change map](../reference/database.md#migration-change-map) that does
+  not list exactly the migration files on disk;
+- any figure in the test taxonomy above.
+
+Historical pages, `CHANGELOG.md` and the dated claim ledger are exempt from the
+version and count checks: they record what was true when they were written.
 
 Runnable command reference lives in [`reference/commands`](../reference/commands.md).

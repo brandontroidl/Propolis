@@ -3,7 +3,7 @@ title: Rate limits and budgets reference
 audience: all
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-09-28
 -->
 
@@ -106,7 +106,7 @@ layers.
 |---|---|---|
 | In-flight concurrency | 8 per cycle *(hard-coded semaphore)* | `CONCURRENCY` (`crates/review/src/fetcher/mod.rs:136,340`) |
 | Max attempts per URL | 3, then terminal `Dead` *(hard-coded)* | `MAX_ATTEMPTS` (`mod.rs:131,489-493`) |
-| Retry backoff | `5 * 4^(attempts-1)` min (5, 20, 80) *(hard-coded)* | `mod.rs:138-144` |
+| Retry backoff | `5 * 4^(attempts-1)` min after the first and second failures (5, then 20); the third failure is terminal, so no longer delay is ever scheduled *(hard-coded)* | `backoff_delay` (`mod.rs:138-144`) |
 | Per-host hourly budget | default 12, max 1000 | `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` (`config.rs:36,58`) |
 | Daily cap | default 200, max 10000 | `PROPOLIS_FETCH_DAILY_CAP` (`config.rs:39,60`) |
 | Batch size per cycle | default 20, max 1000 | `PROPOLIS_FETCH_BATCH_SIZE` (`config.rs:40,61`) |

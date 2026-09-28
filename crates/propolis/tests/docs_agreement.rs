@@ -12,7 +12,7 @@
 
 mod doc_commands;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -307,4 +307,538 @@ fn archive_overlap_check_flags_the_audited_command_and_nothing_else() {
         vec![owned(&["a", "b"])],
         "-C's directory is not an input, and extraction is not archiving"
     );
+}
+
+// ---- workspace facts the docs restate --------------------------------------------------------
+//
+// The docs once said 18 crates at 0.3.0, 15 binaries and 1165 tests while the tree had 24 crates
+// (most at 0.4.0), 17 binaries and roughly 1650 tests: every figure was right when written and
+// nothing noticed when it stopped being. These tests derive each figure from the workspace itself
+// and fail when a current document disagrees.
+
+/// One workspace member: identity and targets from `cargo metadata`, test counts from its sources.
+struct Member {
+    name: String,
+    version: String,
+    binaries: usize,
+    /// Other workspace members this one depends on (normal dependencies only).
+    internal_deps: BTreeSet<String>,
+    /// Integration test targets, by name.
+    integration_targets: BTreeSet<String>,
+    unit: TestCount,
+    integration: TestCount,
+}
+
+/// Test attributes as `build-and-test.md` counts them.
+#[derive(Default)]
+struct TestCount {
+    tests: usize,
+    db: usize,
+    db_own_migrations: usize,
+    db_no_migrations: usize,
+    ignored: usize,
+}
+
+/// Every test attribute in every `.rs` file under `dir`.
+fn count_tests(dir: &Path) -> TestCount {
+    let mut count = TestCount::default();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                for line in fs::read_to_string(&path).unwrap().lines() {
+                    let line = line.trim_start();
+                    let db = line.starts_with("#[sqlx::test");
+                    count.tests += usize::from(
+                        db || line.starts_with("#[test]") || line.starts_with("#[tokio::test"),
+                    );
+                    count.db += usize::from(db);
+                    count.db_own_migrations +=
+                        usize::from(db && line.contains(r#"migrations = "./migrations""#));
+                    count.db_no_migrations +=
+                        usize::from(db && line.contains("migrations = false"));
+                    count.ignored += usize::from(line.starts_with("#[ignore"));
+                }
+            }
+        }
+    }
+    count
+}
+
+fn workspace_members() -> Vec<Member> {
+    let output = std::process::Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version=1",
+            "--no-deps",
+            "--offline",
+            "--locked",
+        ])
+        .current_dir(workspace_root())
+        .output()
+        .expect("run cargo metadata");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let text = |v: &serde_json::Value| v.as_str().expect("a string").to_string();
+    let packages = metadata["packages"].as_array().expect("packages");
+    let names: BTreeSet<String> = packages.iter().map(|p| text(&p["name"])).collect();
+    let mut members: Vec<Member> = packages
+        .iter()
+        .map(|package| {
+            let dir = Path::new(package["manifest_path"].as_str().unwrap())
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let targets = package["targets"].as_array().unwrap();
+            let named = |kind: &str| -> BTreeSet<String> {
+                targets
+                    .iter()
+                    .filter(|t| t["kind"].as_array().unwrap().iter().any(|k| k == kind))
+                    .map(|t| text(&t["name"]))
+                    .collect()
+            };
+            Member {
+                name: text(&package["name"]),
+                version: text(&package["version"]),
+                binaries: named("bin").len(),
+                internal_deps: package["dependencies"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|d| d["kind"].is_null())
+                    .map(|d| text(&d["name"]))
+                    .filter(|d| names.contains(d))
+                    .collect(),
+                integration_targets: named("test"),
+                unit: count_tests(&dir.join("src")),
+                integration: count_tests(&dir.join("tests")),
+            }
+        })
+        .collect();
+    members.sort_by(|a, b| a.name.cmp(&b.name));
+    members
+}
+
+/// Current documents that restate workspace facts: live markdown minus the changelog, the dated
+/// claim ledger and `docs/history/`, which record what was true at a point in time on purpose.
+fn current_docs() -> Vec<PathBuf> {
+    live_markdown(&workspace_root())
+        .into_iter()
+        .filter(|p| {
+            let s = p.to_string_lossy();
+            !s.ends_with("CHANGELOG.md")
+                && !s.ends_with("claim-to-source-ledger.md")
+                && !s.contains("/docs/history/")
+        })
+        .collect()
+}
+
+/// Every `<number> [qualifier] <noun>` phrase in `text`, wrapped lines and markdown emphasis
+/// included, with the count and the phrase plus three words either side of it.
+fn counted_phrases(text: &str, noun: &str) -> Vec<(usize, String)> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let bare = |w: &str| {
+        w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_string()
+    };
+    let mut out = Vec::new();
+    for (i, word) in words.iter().enumerate() {
+        if bare(word) != noun {
+            continue;
+        }
+        let count = (1..=2)
+            .filter_map(|back| i.checked_sub(back))
+            .find_map(|j| {
+                let is_number = bare(words[j]).chars().all(|c| c.is_ascii_digit());
+                let qualifiers_are_words = words[j + 1..i]
+                    .iter()
+                    .all(|w| bare(w).chars().all(|c| c.is_ascii_alphabetic()));
+                (is_number && qualifiers_are_words)
+                    .then(|| bare(words[j]).parse::<usize>().ok().map(|n| (n, j)))
+                    .flatten()
+            });
+        if let Some((n, j)) = count {
+            let phrase = words[j.saturating_sub(3)..(i + 4).min(words.len())].join(" ");
+            out.push((n, phrase));
+        }
+    }
+    out
+}
+
+/// Historical and superseded pages, and the claim ledger (a snapshot of one commit), are frozen
+/// records and keep the version they were frozen at.
+#[test]
+fn documents_state_the_version_the_tree_is_at() {
+    let version = workspace_members()
+        .into_iter()
+        .find(|m| m.name == "propolis")
+        .expect("the propolis crate")
+        .version;
+    let (mut checked, mut wrong) = (0, Vec::new());
+    for path in live_markdown(&workspace_root()) {
+        if path.ends_with("docs/claim-to-source-ledger.md") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        let header: Vec<&str> = text.lines().take(12).collect();
+        if header
+            .iter()
+            .any(|l| *l == "status: historical" || *l == "status: superseded")
+        {
+            continue;
+        }
+        let Some(line) = header.iter().find(|l| l.starts_with("applies-to:")) else {
+            continue;
+        };
+        checked += 1;
+        if !line.starts_with(&format!("applies-to: {version} ")) {
+            wrong.push(format!("{}: {line}", path.display()));
+        }
+    }
+    assert!(
+        checked >= 50,
+        "found only {checked} pages with front matter"
+    );
+    assert!(
+        wrong.is_empty(),
+        "front matter must name the tree's version {version}:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// Every backticked bare version (`1.2.3`) outside fenced code, with the words before it (in
+/// reading order) and the word after it. Emphasis markers are dropped so `**`0.4.0` but**` reads
+/// like the sentence it is.
+fn backticked_versions(text: &str) -> Vec<(String, Vec<String>, String)> {
+    let prose: Vec<&str> = text.split("```").step_by(2).collect();
+    let flat = prose.join(" ").replace("**", "");
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    let is_version = |s: &str| {
+        let parts: Vec<&str> = s.split('.').collect();
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    };
+    let word = |w: &str| {
+        w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_ascii_lowercase()
+    };
+    let segments: Vec<&str> = flat.split('`').collect();
+    let mut out = Vec::new();
+    for i in (1..segments.len().saturating_sub(1)).step_by(2) {
+        if !is_version(segments[i]) {
+            continue;
+        }
+        let before: Vec<String> = segments[..i]
+            .join("`")
+            .split_whitespace()
+            .map(word)
+            .collect();
+        let before = before[before.len().saturating_sub(8)..].to_vec();
+        let after = segments[i + 1]
+            .split_whitespace()
+            .next()
+            .map(word)
+            .unwrap_or_default();
+        out.push((segments[i].to_string(), before, after));
+    }
+    out
+}
+
+/// Prose restates two versions: the tree's ("the current tree is `0.3.0`", "Crate version:
+/// `0.3.0`") and the pinned toolchain's ("Rust `1.96.1`"). Both went stale in the first case, so a
+/// version next to those words must be the real one. Other versions (dependencies, the crates
+/// still at `0.1.0`, the version a crate was added after) are left alone.
+#[test]
+fn documents_state_the_real_tree_and_toolchain_versions() {
+    let version = workspace_members()
+        .into_iter()
+        .find(|m| m.name == "propolis")
+        .expect("the propolis crate")
+        .version;
+    let pin = fs::read_to_string(workspace_root().join("rust-toolchain.toml")).unwrap();
+    let toolchain = pin
+        .lines()
+        .find_map(|l| l.strip_prefix("channel = "))
+        .expect("a pinned channel")
+        .trim_matches('"')
+        .to_string();
+    let (mut claims, mut wrong) = ([0, 0], Vec::new());
+    for path in current_docs() {
+        let text = fs::read_to_string(&path).unwrap();
+        for (found, before, after) in backticked_versions(&text) {
+            let near = &before[before.len().saturating_sub(3)..];
+            let about_tree = after == "tree"
+                || near.iter().any(|w| w == "tree" || w == "currently")
+                || before[before.len().saturating_sub(6)..]
+                    .join(" ")
+                    .contains("crate version");
+            let about_toolchain = before.iter().any(|w| w == "toolchain" || w == "rust");
+            let (k, truth) = match (about_tree, about_toolchain) {
+                (true, _) => (0, &version),
+                (false, true) => (1, &toolchain),
+                (false, false) => continue,
+            };
+            claims[k] += 1;
+            if found != *truth {
+                wrong.push(format!(
+                    "{}: `{found}` should be `{truth}`: ...{} `{found}` {after}...",
+                    path.display(),
+                    before.join(" ")
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert!(
+        claims.iter().all(|&n| n >= 5),
+        "found only {claims:?} tree/toolchain version statements; the scan has stopped seeing them"
+    );
+}
+
+/// A count of crates, members or binaries is a workspace total unless the words right around it
+/// say otherwise (sensor crates, protocols, the binaries an installer copies, a test run's
+/// binaries, the members of a tar archive).
+#[test]
+fn documents_state_the_real_crate_and_binary_totals() {
+    let members = workspace_members();
+    let totals = [
+        ("crates", members.len()),
+        ("members", members.len()),
+        ("binaries", members.iter().map(|m| m.binaries).sum()),
+    ];
+    let qualified = ["sensor", "protocol", "install", "test", "archive"];
+    let mut wrong = Vec::new();
+    let mut stated = [0; 3];
+    for path in current_docs() {
+        let text = fs::read_to_string(&path).unwrap();
+        for (k, (noun, truth)) in totals.iter().enumerate() {
+            for (n, phrase) in counted_phrases(&text, noun) {
+                let lower = phrase.to_ascii_lowercase();
+                if qualified.iter().any(|q| lower.contains(q)) {
+                    continue;
+                }
+                if n == *truth {
+                    stated[k] += 1;
+                } else {
+                    wrong.push(format!(
+                        "{}: says {n}, is {truth}: {phrase}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert!(
+        stated.iter().all(|&s| s > 0),
+        "the scan found no statement of the totals at all ({stated:?}); it has stopped seeing them"
+    );
+}
+
+/// `docs/development/build-and-test.md` publishes the test taxonomy; every figure in it is
+/// recounted here by the method it states (test attributes, unit = under `src/`, integration =
+/// under `tests/`), and its per-crate table must have exactly one row per workspace member.
+#[test]
+fn the_published_test_taxonomy_matches_the_source() {
+    let members = workspace_members();
+    let doc =
+        fs::read_to_string(workspace_root().join("docs/development/build-and-test.md")).unwrap();
+    let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sum = |f: fn(&Member) -> usize| members.iter().map(f).sum::<usize>();
+    let unit = sum(|m| m.unit.tests);
+    let integration = sum(|m| m.integration.tests);
+    let db = sum(|m| m.unit.db + m.integration.db);
+    let own = sum(|m| m.unit.db_own_migrations + m.integration.db_own_migrations);
+    let manual = sum(|m| m.unit.db_no_migrations + m.integration.db_no_migrations);
+    let ignored = sum(|m| m.unit.ignored + m.integration.ignored);
+    let mut db_by_crate: Vec<(usize, &str)> = members
+        .iter()
+        .map(|m| (m.unit.db + m.integration.db, m.name.as_str()))
+        .filter(|(n, _)| *n > 0)
+        .collect();
+    db_by_crate.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    let db_by_crate: Vec<String> = db_by_crate
+        .iter()
+        .map(|(n, c)| format!("{c} {n}"))
+        .collect();
+
+    let prose = flat(&doc);
+    for expected in [
+        format!(
+            "**Total: {} test functions** ({unit} unit + {integration} integration).",
+            unit + integration
+        ),
+        format!(
+            "**DB-backed (`sqlx::test`): {db}** - {}.",
+            db_by_crate.join(", ")
+        ),
+        format!("**Ignored: exactly {ignored}.**"),
+        format!(
+            r#"`#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set ({own} uses)"#
+        ),
+        format!("applies migrations manually ({manual} uses)"),
+        format!("A bare `#[sqlx::test]` ({} uses,", db - own - manual),
+    ] {
+        assert!(
+            prose.contains(&expected),
+            "build-and-test.md must say `{expected}`"
+        );
+    }
+
+    let table: Vec<&str> = doc
+        .lines()
+        .skip_while(|l| !l.starts_with("| Crate | Unit | Integration | Integration files |"))
+        .skip(2)
+        .take_while(|l| l.starts_with("| "))
+        .collect();
+    let mut expected: Vec<String> = members
+        .iter()
+        .map(|m| {
+            let targets = m.integration_targets.iter().cloned().collect::<Vec<_>>();
+            let targets = if targets.is_empty() {
+                "-".to_string()
+            } else {
+                targets.join(", ")
+            };
+            format!(
+                "| {} | {} | {} | {targets} |",
+                m.name, m.unit.tests, m.integration.tests
+            )
+        })
+        .collect();
+    expected.push(format!("| **Total** | **{unit}** | **{integration}** | |"));
+    assert_eq!(
+        table, expected,
+        "the per-crate table in build-and-test.md must match the workspace row for row"
+    );
+}
+
+/// `docs/architecture/components.md` owns the crate inventory and the internal dependency graph.
+/// Six crates were added without either being updated, so both are checked against the manifests:
+/// one table row per member, and exactly the members' normal `path` dependencies as graph edges.
+#[test]
+fn the_component_inventory_matches_cargo_metadata() {
+    let members = workspace_members();
+    let names: BTreeSet<&str> = members.iter().map(|m| m.name.as_str()).collect();
+    let doc = fs::read_to_string(workspace_root().join("docs/architecture/components.md")).unwrap();
+
+    let rows: BTreeSet<&str> = doc
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("| `")?
+                .split_once("` |")
+                .map(|(name, _)| name)
+        })
+        .collect();
+    assert_eq!(
+        rows, names,
+        "the inventory table must have one row per workspace member"
+    );
+
+    let graph = doc
+        .split("```mermaid")
+        .nth(1)
+        .and_then(|g| g.split("```").next())
+        .expect("a mermaid dependency graph");
+    let mut nodes: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut id_edges = Vec::new();
+    for line in graph.lines().map(str::trim) {
+        if let Some(edge) = line.split_once(" --> ") {
+            id_edges.push(edge);
+        } else if let Some((id, label)) = line.split_once('[') {
+            // One node may stand for a family: `sensor-{catchall,ssh}` is two crates.
+            let label = label
+                .trim_end_matches(']')
+                .trim_matches('"')
+                .replace("<br/>", "");
+            let crates = match label.split_once('{') {
+                Some((prefix, rest)) => rest
+                    .trim_end_matches('}')
+                    .split(',')
+                    .map(|suffix| format!("{prefix}{}", suffix.trim()))
+                    .collect(),
+                None => vec![label],
+            };
+            nodes.insert(id, crates);
+        }
+    }
+    let drawn: BTreeSet<&str> = nodes.values().flatten().map(String::as_str).collect();
+    assert_eq!(drawn, names, "the graph must draw every workspace member");
+
+    let mut edges = BTreeSet::new();
+    for (from, to) in id_edges {
+        let (Some(from), Some(to)) = (nodes.get(from), nodes.get(to)) else {
+            panic!("graph edge {from} --> {to} names an undeclared node");
+        };
+        for f in from {
+            for t in to {
+                edges.insert((f.clone(), t.clone()));
+            }
+        }
+    }
+    let actual: BTreeSet<(String, String)> = members
+        .iter()
+        .flat_map(|m| m.internal_deps.iter().map(|d| (m.name.clone(), d.clone())))
+        .collect();
+    assert_eq!(
+        edges, actual,
+        "the graph's edges must be exactly the members' internal dependencies"
+    );
+}
+
+/// `docs/reference/database.md` owns the migration list: its change map must have one row per
+/// migration file in each crate's `migrations/` directory, and a section for every such crate.
+#[test]
+fn the_migration_change_map_lists_every_migration() {
+    let root = workspace_root();
+    let doc = fs::read_to_string(root.join("docs/reference/database.md")).unwrap();
+    let mut sets = 0;
+    for entry in fs::read_dir(root.join("crates")).unwrap().flatten() {
+        let dir = entry.path().join("migrations");
+        if !dir.is_dir() {
+            continue;
+        }
+        sets += 1;
+        let krate = entry.file_name().to_string_lossy().into_owned();
+        let on_disk: Vec<String> = {
+            let mut v: Vec<String> = fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|f| f.file_name().to_string_lossy().into_owned())
+                .filter(|f| f.ends_with(".sql"))
+                .map(|f| f[..4].to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        let heading = format!("**{krate}** (`crates/{krate}/migrations/`");
+        let listed: Vec<String> = doc
+            .lines()
+            .skip_while(|l| !l.starts_with(&heading))
+            .skip(1)
+            .skip_while(|l| l.trim().is_empty())
+            .take_while(|l| l.starts_with('|'))
+            .filter_map(|l| {
+                l.strip_prefix("| `")?
+                    .split_once('`')
+                    .map(|(n, _)| n.to_string())
+            })
+            .collect();
+        assert_eq!(
+            listed, on_disk,
+            "database.md's change map for {krate} must list exactly its migration files"
+        );
+    }
+    assert!(sets >= 3, "found only {sets} migration sets");
 }

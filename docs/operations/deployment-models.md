@@ -3,7 +3,7 @@ title: Deployment models
 audience: deployer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -81,7 +81,7 @@ validate feed behaviour in your own environment before relying on it.
 ## Maturity
 
 Source-available and actively developed, with one tagged release (`v0.1.0`); the
-current tree is `0.3.0` and untagged. This is not a production-certified or
+current tree is `0.4.0` and untagged. This is not a production-certified or
 production-blessed build - see
 [../overview/maturity-and-status.md](../overview/maturity-and-status.md) and
 [../getting-started/production-readiness-checklist.md](../getting-started/production-readiness-checklist.md).

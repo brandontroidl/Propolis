@@ -3,7 +3,7 @@ title: Documentation policy
 audience: maintainer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -58,9 +58,11 @@ last-verified: <YYYY-MM-DD>
 -->
 ```
 
-`applies-to` currently reads `0.3.0 (untagged; latest tag v0.1.0)` across the corpus,
-reflecting the real version state (see
-[overview/maturity-and-status](overview/maturity-and-status.md)).
+`applies-to` names the version of the `propolis` crate and the latest tag; every current
+page reads `0.4.0 (untagged; latest tag v0.1.0)`, reflecting the real version state (see
+[overview/maturity-and-status](overview/maturity-and-status.md)). Historical pages and the
+claim-to-source ledger, a snapshot of one commit, keep the version they were frozen at. `crates/propolis/tests/docs_agreement.rs` fails when a
+current page names any other version.
 
 Root-level files that follow GitHub placement conventions - `README.md`,
 `DOCUMENTATION.md`, `INSTALL.md`, `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`,

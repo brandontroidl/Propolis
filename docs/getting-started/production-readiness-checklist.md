@@ -3,14 +3,14 @@ title: Production-readiness checklist
 audience: deployer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-09-05
 -->
 
 # Production-readiness checklist
 
 Work through this before any listener accepts untrusted traffic. Propolis has one
-tagged release, `v0.1.0`, and the tree is at `0.3.0` with unreleased work; it carries no
+tagged release, `v0.1.0`, and the tree is at `0.4.0` with unreleased work; it carries no
 certification of any kind. This list reduces risk, it does not remove it; the
 [residual risks](../security/residual-risks.md) page says what remains when every box
 is ticked.

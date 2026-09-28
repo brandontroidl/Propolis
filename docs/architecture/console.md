@@ -3,7 +3,7 @@ title: Console architecture
 audience: developer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -130,7 +130,7 @@ becoming script execution.
 
 The V12 operator-console interface - the theme system, evidence drawer, and
 self-hosted fonts - merged **after** the `v0.1.0` tag (at commit `dbf8c053`); it is
-present in the current `0.3.0` tree but not in any tagged release, and `CHANGELOG.md`
+present in the current `0.4.0` tree but not in any tagged release, and `CHANGELOG.md`
 does not yet mention it (see
 [overview/maturity-and-status.md](../overview/maturity-and-status.md)).
 

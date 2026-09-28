@@ -3,7 +3,7 @@ title: Schema and migrations
 audience: developer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-09-28
 -->
 

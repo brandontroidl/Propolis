@@ -115,6 +115,28 @@
   bounded by a real request timeout AND aged on its own clock rather than waiting for an event that
   may never come. A failed end-reason query no longer renders as "nothing incomplete" beside a row
   that is counting incomplete captures.
+- **Queue decisions are all-or-nothing** - delist, relist and delete-ip each issued two or three
+  autocommit statements, so a failure part-way left an address half changed (a queue row dropped
+  with the feed latch kept, `delisted` cleared without the gates recomputed, vendor rows deleted
+  while the score row survived). Each now runs in one transaction.
+- **Upgrades build what CI tested** - `upgrade.sh` built with a bare `cargo build --release`, which
+  could resolve a dependency graph CI never ran and relied on default members covering every
+  installed binary. It now builds with `--workspace --locked`, as the CI release job does.
+- **The backup stores each sample once and restores owners by name** - the documented archive named
+  the fetched-sample directory and its parent, so every fetched sample was stored and restored
+  twice, and `--numeric-owner` recorded only numbers, which a rebuilt host whose service users got
+  different UIDs would hand to the wrong accounts. Restore now runs `provision.sh` before
+  extracting. `crates/propolis/tests/restore_rehearsal.rs` (ignored by default; it needs PostgreSQL
+  server binaries) restores a populated backup into a fresh cluster and checks the ledger, its
+  grants and sequences, and the spooled samples.
+- **The docs state the tree they describe** - current pages said 18 crates at `0.3.0`, 15 binaries
+  and 1165 tests against a tree of 24 crates, 17 binaries and over 1600 tests, and the component
+  inventory lacked six crates. The docs agreement test now recomputes the version, crate, member and
+  binary totals, the component inventory and dependency graph, the test taxonomy and the migration
+  list from `cargo metadata` and the source, and fails when a current page disagrees.
+- **Smaller console hardening** - the reverse-DNS cache holds at most 4096 entries, sweeping expired
+  ones and evicting the oldest; search refuses a control character or a value over 512 bytes with
+  400 instead of passing it to PostgreSQL.
 
 ### Changed
 
@@ -124,3 +146,56 @@
   Return to pending. `POST /ip/{ip}/relist` undoes a delist by clearing the latch and re-deriving
   the gates, so an address rejoins the feed on its current merit rather than because it was once
   listed. Also `review unsnooze` and `review snoozed` on the CLI.
+
+### Security
+
+Remediation of an external audit (findings P-01 to P-15). Upgrading applies review migrations
+`0006` and `0007`.
+
+- **Spool reads no longer follow links** - the console's sample download and the VirusTotal
+  uploader opened a digest-named spool entry by name, so a symlink planted in a spool (which the
+  internet-facing sensors write) made them read whatever local file it named, and the uploader
+  could send it to a third party when unknown-sample upload was on. Entries are now opened without
+  following links, must be regular files within the 500 MB sample cap, and are re-hashed against
+  their names; a mismatch answers 409.
+- **Nodes sharing a database share the fetcher's limits** - each node picked its own fetch rows and
+  kept the per-host and daily budgets in memory, so two nodes could fetch the same malware URL at
+  once, N nodes spent N times each cap, and a restart reset the daily count. Rows are now claimed
+  with a lease (`claim_expires`) and the budgets are spent in the database under a row lock
+  (migration `0006`, new table `fetch_daily_usage`).
+- **Captured bodies record how their transport was authenticated** - the fetcher never validated
+  certificates, so an https capture carried no evidence that its bytes came from the named host.
+  It now validates first and fetches again without validation only after a certificate failure,
+  to the same pinned address, and labels every captured body `verified`, `unverified` (with the
+  validation error), `plaintext` or `unknown` (migration `0007`); the samples page shows the label.
+  Cost: a TLS 1.2 server that can sign its handshake only with SHA-1 is no longer captured.
+- **The fetcher ignores proxy settings in its environment** - reqwest reads `HTTP_PROXY`,
+  `HTTPS_PROXY` and `ALL_PROXY` by default, and a proxy resolves and dials the host itself, so a
+  fetch would have bypassed the address the SSRF guard vetted.
+- **Every special-purpose address block is kept out of the feed** - the reserved list gains the
+  IANA special-purpose blocks it lacked (carrier-grade NAT `100.64.0.0/10` among them), and an IPv6
+  address that embeds an IPv4 host (mapped, NAT64 `64:ff9b::/96`, 6to4) is judged by that host.
+  Such addresses are never published, reported or dialed. Existing rows are not rewritten: the next
+  feed build drops them, an approved queue row for one is held as reserved and warns on every
+  poll, and a fetch row resolving into one is rejected on its next attempt.
+- **The console bounds what one client can hold** - `axum::serve` armed no header timeout and
+  capped nothing, so slow or idle connections could be held indefinitely. The console now runs its
+  own HTTP/1.1 accept loop (64 connections, 10 s for headers, 10 s and 2 MiB for a body), checks
+  passwords in two bounded slots so a login flood cannot take the CPU, and limits login attempts
+  to 30 a minute across all addresses as well as 5 per address. `propolis_console_*` metrics count
+  what was refused.
+- **A Content-Security-Policy on every page** - scripts and styles are served as files, templates
+  carry no inline script, style or event handler, and every response carries a policy that allows
+  script and style only from the console itself.
+- **Chain verification needs a CSRF token** - `POST /integrity/verify` reads the whole ledger but
+  took no token; it now requires one like every other console POST, and a second run while one is
+  in progress answers 409.
+- **Certificates are written without following links** - `provision-certs` wrote each PEM and
+  tightened key modes afterwards, following any link already at the target and joining the
+  collector id into the path unchecked. Files are now created new with their final mode, and a
+  collector id that is not a plain name is refused.
+- **Dependency policy** - `event-listener` 5.4.2 (RUSTSEC-2026-0221), two yanked crates replaced,
+  unused and unmaintained crates removed. `deny.toml` fails CI on a vulnerable, unsound,
+  unmaintained or yanked crate, a licence outside the allowlist, or an unknown registry or git
+  source, with one reviewed exception (RUSTSEC-2023-0071 in `rsa`, reachable only from a test
+  client).

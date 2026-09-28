@@ -56,7 +56,7 @@ Production installs use `deploy/install.sh` and are described in
 - The console has no built-in TLS. Keep it on loopback or behind a reverse proxy.
 - The shipped systemd `SystemCallFilter` is a placeholder to tighten for your kernel.
 - One node is one blast radius. Keep an off-host copy of the database and spool.
-- The last tagged release is `v0.1.0`; the tree is at `0.3.0` with unreleased work. Read
+- The last tagged release is `v0.1.0`; the tree is at `0.4.0` with unreleased work. Read
   the production-readiness checklist before internet exposure.
 
 ## Scope

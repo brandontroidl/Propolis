@@ -3,7 +3,7 @@ title: Commands reference
 audience: developer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -22,7 +22,7 @@ Every workspace crate is edition 2024.
 ## Build
 
 ```
-cargo build            # debug build, all 18 workspace members
+cargo build            # debug build, all 24 workspace members
 cargo build --release  # release binaries into target/release/
 ```
 

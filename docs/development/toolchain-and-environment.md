@@ -3,7 +3,7 @@ title: Toolchain and environment
 audience: developer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -24,7 +24,7 @@ platform; a local floating `stable` resolved to a newer toolchain that did not
 compile this tree cleanly. Bump the pin deliberately and re-run the full gate.
 `rustup` provides matched `rustc` + `clippy` + `rustfmt` for the pinned version.
 
-All 18 crates are **edition 2024** (each `crates/*/Cargo.toml:4`).
+All 24 crates are **edition 2024** (each `crates/*/Cargo.toml:4`).
 
 CI installs this toolchain via `dtolnay/rust-toolchain` pinned to commit SHA
 `2fe4ca74464c5902a4f6e302d0a619b4ea911ccc` (`.github/workflows/ci.yml:42,59,98`).

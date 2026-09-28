@@ -3,7 +3,7 @@ title: Release policy
 audience: maintainer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -17,7 +17,7 @@ mechanics live in
 
 A release is an **annotated git tag** (`vMAJOR.MINOR.PATCH`) on a commit in
 `main`. Tagging is the release act; there is no separate published package.
-The current tree is `0.3.0` but the only tag is `v0.1.0` - the version and the
+The current tree is `0.4.0` but the only tag is `v0.1.0` - the version and the
 latest tag differ. See
 [compatibility-and-versioning.md](compatibility-and-versioning.md) and
 [../overview/maturity-and-status.md](../overview/maturity-and-status.md).

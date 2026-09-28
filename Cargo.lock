@@ -2568,6 +2568,7 @@ dependencies = [
  "sensor-framework",
  "sensor-ssh",
  "sensor-telnet",
+ "serde_json",
  "sqlx",
  "tempfile",
  "tokio",

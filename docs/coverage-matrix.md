@@ -3,7 +3,7 @@ title: Documentation coverage matrix
 audience: maintainer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -21,11 +21,17 @@ covers it. A `partial` here is a documentation-honesty marker, not a defect in t
 docs; several rows are `partial` precisely *because* the corpus documents a residual
 risk plainly (per the GLOBAL CORRECTIONS) rather than papering over it.
 
-Result: **no coverage gaps.** Every component, stage, invariant, and procedure has a
+Result: **one gap**, marked on the `shipper`, `gateway` and `provision-certs` rows.
+The split deployment (collectors shipping to a control-plane gateway) has no
+operator page: its configuration is in the environment variable
+reference and the comments of `deploy/collector.env.example` and
+`deploy/control-plane.env.example`, and its design in the custody architecture page,
+but no page walks through provisioning certificates, installing the units and bringing
+a collector up. Every other component, stage, invariant, and procedure has a
 canonical owner. The `partial` rows carry a documented caveat, noted in the last
 column.
 
-## Component crates (18 crates / 15 binaries)
+## Component crates (24 crates / 17 binaries)
 
 Inventory and dependency graph owned by
 [architecture/components.md](architecture/components.md). Per-crate behavior lives in
@@ -51,6 +57,12 @@ the architecture and reference pages below.
 | `feed` | [architecture/pipeline.md](architecture/pipeline.md), [reference/scoring-and-feed.md](reference/scoring-and-feed.md) | documented | Snapshot→export→atomic publish; 10 formats per tier/window; checksummed manifest. |
 | `console` | [architecture/console.md](architecture/console.md), [reference/console-routes.md](reference/console-routes.md), [security/authn-authz.md](security/authn-authz.md) | documented | axum operator console; 34 routes (8 public, 26 session-gated); a global Content-Security-Policy with no inline script or style (the sample download keeps a stricter one). |
 | `propolis` | [process-topology.md](architecture/process-topology.md), [concurrency-and-failure.md](architecture/concurrency-and-failure.md) | documented | Unified daemon: intake+review+feed+console+VT+fetcher+ops-monitor as supervised tokio tasks on one PgPool. |
+| `fleet` | [reference/database.md](reference/database.md), [reference/console-routes.md](reference/console-routes.md), [reference/environment-variables.md](reference/environment-variables.md) | partial | `listener_probe`, the `/fleet` pages and their variables are documented; the probe loop and the verdict rules have no architecture page. |
+| `log-tailer` | [architecture/process-topology.md](architecture/process-topology.md), [architecture/event-and-sample-lifecycle.md](architecture/event-and-sample-lifecycle.md) | partial | Described as the intake tailer; its use by `shipper` is covered only by the component inventory. |
+| `collector-wire` | [architecture/components.md](architecture/components.md), [architecture/evidence-provenance-and-artifact-custody.md](architecture/evidence-provenance-and-artifact-custody.md) | partial | Frame, ack and TLS rules live in the crate's own docs; no reference page. |
+| `shipper` | [reference/environment-variables.md](reference/environment-variables.md) | gap | Configuration only; see the split-deployment gap above. |
+| `gateway` | [reference/environment-variables.md](reference/environment-variables.md), [architecture/evidence-provenance-and-artifact-custody.md](architecture/evidence-provenance-and-artifact-custody.md) | gap | Configuration and spool design only; see the split-deployment gap above. |
+| `provision-certs` | [architecture/components.md](architecture/components.md) | gap | Inventory row only; see the split-deployment gap above. |
 
 The 4 retired dev units (`intake`/`review`/`feed`/`console.service`) are documented as
 superseded by `propolis.service` in

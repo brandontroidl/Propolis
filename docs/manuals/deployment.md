@@ -3,7 +3,7 @@ title: Deployment manual
 audience: deployer
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -15,7 +15,7 @@ sequence and the gates, not a re-listing.
 
 > [!IMPORTANT]
 > Propolis is source-available and actively developed, with one tagged release
-> (`v0.1.0`) and a current tree at `0.3.0` (untagged). It carries **no**
+> (`v0.1.0`) and a current tree at `0.4.0` (untagged). It carries **no**
 > production, security, legal, or regulatory certification. The steps below
 > reduce risk, not assurance - residual risks remain even when every item is
 > done: see

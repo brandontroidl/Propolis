@@ -3,7 +3,7 @@ title: Hardening checklist
 audience: operator
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -17,7 +17,7 @@ and [../reference/filesystem-paths.md](../reference/filesystem-paths.md). This
 page is the sequence, not a re-listing of values.
 
 Propolis is source-available and actively developed, with one tagged release
-(`v0.1.0`); the current tree is `0.3.0`, untagged. It is not certified or
+(`v0.1.0`); the current tree is `0.4.0`, untagged. It is not certified or
 production-blessed - see [../overview/maturity-and-status.md](../overview/maturity-and-status.md).
 
 ## 1. Derive the real syscall filter

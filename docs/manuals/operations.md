@@ -3,7 +3,7 @@ title: Operator manual
 audience: operator
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -15,7 +15,7 @@ not restate their values. Each linked page is the single owner of the facts it
 carries.
 
 Propolis is source-available and actively developed, with one tagged release
-(`v0.1.0`); the current tree is `0.3.0`, untagged, and not production-certified. See
+(`v0.1.0`); the current tree is `0.4.0`, untagged, and not production-certified. See
 [maturity and status](../overview/maturity-and-status.md) before you depend on it.
 
 ## Mental model

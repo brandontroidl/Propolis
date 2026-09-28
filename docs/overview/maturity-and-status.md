@@ -3,7 +3,7 @@ title: Maturity and status
 audience: evaluator
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -17,11 +17,13 @@ operate at your own risk.
 
 The version signals diverge across surfaces; read them together, not in isolation:
 
-- **Crate version: `0.3.0`** across all 18 workspace crates. There is no shared
-  `[workspace.package]` version key - each crate pins `0.3.0` independently.
+- **Crate version: `0.4.0`** for eighteen of the 24 workspace crates; the six
+  added since `0.3.0` (`collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper`) are at
+  `0.1.0`. There is no shared `[workspace.package]` version key - each crate pins
+  its own.
 - **Only one release tag exists: `v0.1.0`** (annotated, at commit `e0bfd513`,
-  dated 2026-08-02). There is no `v0.2.0` or `v0.3.0` tag, so the current `0.3.0`
-  tree is **untagged / unreleased**, roughly two unpublished minor bumps of work
+  dated 2026-08-02). There is no `v0.2.0`, `v0.3.0` or `v0.4.0` tag, so the current
+  `0.4.0` tree is **untagged / unreleased**, roughly three unpublished minor bumps of work
   past the tagged release.
 - **`CHANGELOG.md` is a single undated `## Unreleased` section.** It carries no
   per-version partitions or dates, so entries cannot be mapped to `v0.1.0` versus

@@ -3,7 +3,7 @@ title: Security reviewer manual
 audience: security
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -15,7 +15,7 @@ facts. Read the [threat model](../security/threat-model.md) first - it frames
 everything below.
 
 Propolis is source-available and actively developed, one tagged release (`v0.1.0`),
-current tree `0.3.0` untagged, not production-certified. Do not read any control below
+current tree `0.4.0` untagged, not production-certified. Do not read any control below
 as a certification. See [maturity and status](../overview/maturity-and-status.md).
 
 ## Threat model in one paragraph

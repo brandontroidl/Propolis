@@ -3,7 +3,7 @@ title: Threat model and trust assumptions
 audience: security
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -91,7 +91,7 @@ in [supply-chain.md](supply-chain.md); they are risk-reduction, not a trusted bo
   operator-provided (for example a reverse proxy). See [authn-authz.md](authn-authz.md)
   and [../operations/networking-tls.md](../operations/networking-tls.md).
 - **Not production-certified.** Source-available, actively developed, one tagged release
-  (`v0.1.0`); the current tree is `0.3.0`, untagged. See
+  (`v0.1.0`); the current tree is `0.4.0`, untagged. See
   [../overview/maturity-and-status.md](../overview/maturity-and-status.md).
 
 Full list of accepted residual risks: [residual-risks.md](residual-risks.md).

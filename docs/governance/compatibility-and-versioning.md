@@ -3,7 +3,7 @@ title: Compatibility and versioning
 audience: all
 status: current
 owner: maintainer
-applies-to: 0.3.0 (untagged; latest tag v0.1.0)
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
 last-verified: 2026-08-26
 -->
 
@@ -13,15 +13,17 @@ last-verified: 2026-08-26
 
 Propolis uses semantic-versioning-shaped version numbers (`MAJOR.MINOR.PATCH`).
 Every workspace crate pins its own `version` independently; there is no shared
-`[workspace.package]` version key, and at present all crates move together
-(currently `0.3.0`). Pre-1.0, treat minor bumps as potentially breaking.
+`[workspace.package]` version key. Eighteen crates have moved together (currently
+`0.4.0`); the six added since `0.3.0` are at `0.1.0` and have not been bumped yet.
+Pre-1.0, treat minor bumps as potentially breaking.
 
 ## Current version/tag state
 
-- **Crate version: `0.3.0`** across all 18 workspace crates.
+- **Crate version: `0.4.0`** for eighteen of the 24 workspace crates; `0.1.0` for
+  `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper`.
 - **Only release tag: `v0.1.0`** (points at commit `e0bfd513`,
-  2026-08-02). There is no `v0.2.0` or `v0.3.0` tag.
-- The `0.3.0` tree is therefore **unreleased/untagged** - roughly two minor
+  2026-08-02). There is no `v0.2.0`, `v0.3.0` or `v0.4.0` tag.
+- The `0.4.0` tree is therefore **unreleased/untagged** - roughly three minor
   bumps of work sit ahead of the tagged release.
 - No `rust-version` / MSRV is declared in any crate.
 

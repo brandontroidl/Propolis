@@ -405,8 +405,7 @@ async fn dashboard_shows_recent_activity_and_protocol_distribution(pool: PgPool)
         body.contains(r#"<canvas id="protoChart""#),
         "protocol-distribution chart canvas missing once events exist: {body}"
     );
-    // Chart data is now in <script type="application/json"> elements which minijinja HTML-escapes.
-    // The browser's .textContent unescapes them; in the raw HTML, quotes are &quot; entities.
+    // Chart data sits in <script type="application/json"> elements, read by the charts script.
     assert!(
         body.contains("application/json") && body.contains("proto-labels"),
         "protocol-distribution chart data element missing: {body}"
@@ -418,6 +417,58 @@ async fn dashboard_shows_recent_activity_and_protocol_distribution(pool: PgPool)
     assert!(
         !body.contains("waiting for sensor events"),
         "empty-state message should not render once events exist: {body}"
+    );
+}
+
+/// The protocol chart's labels are sensor names, and a sensor name is whatever string an event
+/// carried - in a split deployment, whatever a collector shipped. Placed raw in the chart's JSON
+/// data element, one holding `</script>` would end the element and put the rest into the page as
+/// markup.
+#[sqlx::test(migrations = false)]
+async fn chart_data_cannot_close_its_script_element(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.82",
+            r#"</script><b id="injected">x</b>"#,
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("</script><b id="),
+        "a sensor name closed its script element and reached the page as markup: {body}"
+    );
+    // What the charts script reads: the element's text up to the first `</script`, parsed as
+    // JSON. It must hold the label exactly as the event carried it.
+    let open = r#"<script type="application/json" id="proto-labels">"#;
+    let start = body.find(open).expect("the protocol labels element") + open.len();
+    let text = &body[start..start + body[start..].find("</script").unwrap()];
+    let labels: Vec<String> = serde_json::from_str(text).unwrap_or_else(|e| {
+        panic!("the labels element is not the JSON it should be ({e}): {text}")
+    });
+    assert_eq!(
+        labels,
+        vec![r#"</script><b id="injected">x</b>"#.to_string()]
     );
 }
 

@@ -16,11 +16,11 @@
 //! strips (`most_active_rows`) replaced the old top-attackers bar chart - the chart duplicated
 //! information the strip table shows better. All are fed by supplementary, soft-failing queries: a
 //! slow or errored query degrades to an empty chart / the "waiting for sensor events" copy, never a
-//! 503. Chart.js needs its datasets as JS array literals inside an inline `<script>`, so each array
-//! is serialized with `serde_json::to_string` into a `String` *before* it reaches the template, then
-//! injected with the `|safe` filter - `templates`'s doc comment establishes that minijinja
-//! auto-escapes every `.html` template, so without `|safe` the JSON's own quotes would be
-//! HTML-entity-escaped and produce a JS syntax error rather than an array literal. The events
+//! 503. The charts script reads its datasets from `<script type="application/json">` elements, so
+//! each array is serialized with `templates::script_json` into a `String` *before* it reaches the
+//! template, then placed with the `|safe` filter - minijinja auto-escapes every `.html` template,
+//! and the browser does not decode entities inside a script element, so an escaped `&quot;` would
+//! reach `JSON.parse` as-is. `script_json` escapes what could end the element instead. The events
 //! timeline always renders (25 buckets, zero-filled by the query's own `generate_series`/`COALESCE`)
 //! even with no events; the protocol-distribution chart instead hides its `<canvas>` and shows the
 //! "waiting for sensor events" copy when `protocol_dist` is empty - an empty Chart.js canvas has
@@ -44,6 +44,7 @@ use crate::routes::format::{
     format_activity, format_relative_time, format_sensor_label, severity_rank, signal_severity,
     signal_tag_label,
 };
+use crate::templates::script_json;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -271,10 +272,10 @@ async fn dashboard(
 
     // Shadowed into their JSON-string form right before the template needs them - see the module
     // doc comment for why a string (rendered with `|safe`) rather than a native minijinja list.
-    let timeline_labels = serde_json::to_string(&timeline_labels).unwrap_or_else(|_| "[]".into());
-    let timeline_data = serde_json::to_string(&timeline_data).unwrap_or_else(|_| "[]".into());
-    let proto_labels = serde_json::to_string(&proto_labels).unwrap_or_else(|_| "[]".into());
-    let proto_data = serde_json::to_string(&proto_data).unwrap_or_else(|_| "[]".into());
+    let timeline_labels = script_json(&timeline_labels);
+    let timeline_data = script_json(&timeline_data);
+    let proto_labels = script_json(&proto_labels);
+    let proto_data = script_json(&proto_data);
 
     let tmpl = state.templates.get_template("dashboard.html")?;
     let html = tmpl.render(context! {
@@ -454,8 +455,8 @@ async fn dashboard_chart_fragment(
             _ => hourly_series(&state.db).await,
         },
     );
-    let timeline_labels = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".into());
-    let timeline_data = serde_json::to_string(&data).unwrap_or_else(|_| "[]".into());
+    let timeline_labels = script_json(&labels);
+    let timeline_data = script_json(&data);
 
     let tmpl = state
         .templates

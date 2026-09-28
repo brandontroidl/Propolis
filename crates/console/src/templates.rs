@@ -4,7 +4,8 @@
 //! name ends in `.html` (verified against `vendor/minijinja/src/defaults.rs`'s
 //! `default_auto_escape_callback`), which is this crate's XSS-prevention guarantee: every value
 //! interpolated with `{{ }}` is HTML-escaped unless a template explicitly opts out with the `|safe`
-//! filter (which nothing here does).
+//! filter. Only the chart data elements do, and only for JSON built by [`script_json`], which
+//! cannot end the element it sits in.
 //!
 //! `base.html` is `base_head.html` followed by `base_tail.html`. No page carries inline script,
 //! inline style or an event-handler attribute: the Content-Security-Policy (`routes::mod`) allows
@@ -41,6 +42,26 @@ const LOGS_HTML: &str = include_str!("templates/logs.html");
 const FLEET_HTML: &str = include_str!("templates/fleet.html");
 const FLEET_STATUS_FRAGMENT_HTML: &str = include_str!("templates/fleet_status_fragment.html");
 const MACROS_HTML: &str = include_str!("templates/macros.html");
+
+/// `value` as JSON for a `<script type="application/json">` element, placed with `|safe`. The
+/// browser reads such an element's content as raw text up to the first `</script`, and JSON leaves
+/// `<` and `/` as they are, so a string holding `</script>` would end the element and put the rest
+/// of it into the page as markup. A chart label can be a sensor name, which is whatever an event
+/// carried, and in a split deployment whatever a collector shipped. `<`, `>` and `&` are written
+/// as JSON unicode escapes instead, which `JSON.parse` reads back as the same characters. The chart
+/// data is always a list, so a value that cannot be serialized becomes an empty one.
+pub(crate) fn script_json<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    let json = serde_json::to_string(value).unwrap_or_else(|_| "[]".into());
+    let backslash = char::from(92);
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '<' | '>' | '&' => out.push_str(&format!("{backslash}u{:04x}", u32::from(c))),
+            other => out.push(other),
+        }
+    }
+    out
+}
 
 /// Builds the environment once at startup (`AppState::templates`); cheap to construct (five small
 /// templates) but shared via `Arc` so the source is parsed exactly once per process rather than
@@ -223,6 +244,15 @@ mod tests {
         // documents and re-verifies the invariant explicitly, and would fail loudly (not panic
         // during an unrelated test's setup) if a future template edit breaks parsing.
         let _ = environment();
+    }
+
+    #[test]
+    fn script_json_cannot_end_its_element_and_reads_back_unchanged() {
+        let label = r#"</script><!-- a & b -->"#;
+        let json = script_json(&[label]);
+        assert!(!json.contains(['<', '>', '&']), "{json}");
+        let back: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, [label]);
     }
 
     #[test]

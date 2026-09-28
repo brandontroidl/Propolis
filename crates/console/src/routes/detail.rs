@@ -81,6 +81,7 @@ use crate::routes::error::AppError;
 use crate::routes::format::{
     format_activity, format_relative_time, format_sensor_label, format_timestamp, tier_label,
 };
+use crate::templates::script_json;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -430,11 +431,9 @@ async fn detail(
 
     // Shadowed into their JSON-string form right before the template needs them - see
     // `routes::dashboard`'s doc comment for why a string (rendered with `|safe`) rather than a
-    // native minijinja list: minijinja auto-escapes every `.html` template, so an un-`|safe`'d
-    // JSON string's own quotes would be HTML-entity-escaped into a JS syntax error.
-    let ip_timeline_labels =
-        serde_json::to_string(&ip_timeline_labels).unwrap_or_else(|_| "[]".into());
-    let ip_timeline_data = serde_json::to_string(&ip_timeline_data).unwrap_or_else(|_| "[]".into());
+    // native minijinja list.
+    let ip_timeline_labels = script_json(&ip_timeline_labels);
+    let ip_timeline_data = script_json(&ip_timeline_data);
 
     let tmpl = state.templates.get_template("detail.html")?;
     let html = tmpl.render(context! {
@@ -550,8 +549,8 @@ async fn chart_fragment(
         "activity timeline",
         detail_chart_series(&state.db, ip, current_range).await,
     );
-    let ip_timeline_labels = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".into());
-    let ip_timeline_data = serde_json::to_string(&data).unwrap_or_else(|_| "[]".into());
+    let ip_timeline_labels = script_json(&labels);
+    let ip_timeline_data = script_json(&data);
 
     let tmpl = state.templates.get_template("detail_chart_fragment.html")?;
     let html = tmpl.render(context! {

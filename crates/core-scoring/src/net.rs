@@ -13,11 +13,12 @@ use std::sync::LazyLock;
 
 use ipnet::IpNet;
 
-/// Special-purpose ranges no outbound record may ever carry, regardless of operator
-/// configuration: RFC1918 private space, RFC5737 documentation ranges, loopback, link-local,
-/// multicast, the limited broadcast address, and their IPv6 equivalents (loopback, link-local,
-/// unique-local, multicast, and the documentation range). Fixed and not operator-configurable, so
-/// this is computed once and shared by every caller.
+/// Ranges no outbound record may ever carry, regardless of operator configuration: none of them
+/// is an attacking host's own internet address. Every block the IANA IPv4 and IPv6
+/// Special-Purpose Address Registries mark not globally reachable is here (both registries last
+/// updated 2025-10-09, compared 2026-09-28), plus multicast, except the IPv4-mapped prefix
+/// `::ffff:0:0/96`, which [`is_reserved_ip`] unwraps to the embedded IPv4 address instead. Fixed
+/// and not operator-configurable, so this is computed once and shared by every caller.
 static RESERVED_RANGES: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
     [
         // RFC1918 private address space.
@@ -43,6 +44,38 @@ static RESERVED_RANGES: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
         "fc00::/7",
         // IPv6 documentation range.
         "2001:db8::/32",
+        // "This network" (RFC 791), including the unspecified address 0.0.0.0.
+        "0.0.0.0/8",
+        // Shared address space for carrier-grade NAT (RFC 6598), also used by overlay networks.
+        "100.64.0.0/10",
+        // IETF protocol assignments (RFC 6890). Its globally reachable members, the PCP and TURN
+        // anycast addresses, answer from the nearest service instance, not from one host.
+        "192.0.0.0/24",
+        // 6a44 relay anycast (RFC 6751). The deprecated 6to4 relay block around it has no
+        // reachability status in the registry and stays publishable.
+        "192.88.99.2/32",
+        // Benchmarking (RFC 2544).
+        "198.18.0.0/15",
+        // Reserved for future use (RFC 1112); holds the limited broadcast address above.
+        "240.0.0.0/4",
+        // IPv6 unspecified address.
+        "::/128",
+        // Local-use IPv4/IPv6 translation (RFC 8215). The well-known 64:ff9b::/96 is globally
+        // reachable and not listed.
+        "64:ff9b:1::/48",
+        // Discard-only (RFC 6666) and dummy (RFC 9780) prefixes.
+        "100::/64",
+        "100:0:0:1::/64",
+        // IETF protocol assignments (RFC 2928), including the benchmarking prefix and Teredo, whose
+        // addresses name a Teredo server and a NAT mapping rather than a host. Its globally
+        // reachable members are anycast service prefixes and identifier prefixes (ORCHIDv2, drone
+        // entity tags). 6to4 (2002::/16) is deliberately absent: a 6to4 address belongs to whoever
+        // holds its embedded public IPv4 address.
+        "2001::/23",
+        // IPv6 documentation range (RFC 9637).
+        "3fff::/20",
+        // SRv6 segment identifiers (RFC 9602).
+        "5f00::/16",
     ]
     .iter()
     .map(|s| {
@@ -97,6 +130,94 @@ mod tests {
             "2001:db8::1",
         ] {
             assert!(is_reserved_ip(ip.parse().unwrap()), "{ip} must be reserved");
+        }
+    }
+
+    /// Each block added from the IANA special-purpose registries, with the addresses at its edges
+    /// that must be reserved and the neighbors just past them that must not, so a missing entry
+    /// and a prefix one bit too short both fail.
+    #[test]
+    fn special_purpose_blocks_are_reserved_exactly_to_their_edges() {
+        let blocks: [(&str, &[&str], &[&str]); 13] = [
+            ("0.0.0.0/8", &["0.0.0.0", "0.255.255.255"], &["1.0.0.0"]),
+            (
+                "100.64.0.0/10",
+                &["100.64.0.0", "100.127.255.255"],
+                &["100.63.255.255", "100.128.0.0"],
+            ),
+            (
+                "192.0.0.0/24",
+                &["192.0.0.0", "192.0.0.9", "192.0.0.255"],
+                &["191.255.255.255", "192.0.1.0"],
+            ),
+            (
+                "192.88.99.2/32",
+                &["192.88.99.2"],
+                &["192.88.99.1", "192.88.99.3"],
+            ),
+            (
+                "198.18.0.0/15",
+                &["198.18.0.0", "198.19.255.255"],
+                &["198.17.255.255", "198.20.0.0"],
+            ),
+            // Multicast sits directly below this block and nothing lies above it, so the nearest
+            // unreserved neighbor is below multicast.
+            (
+                "240.0.0.0/4",
+                &["240.0.0.0", "255.255.255.254"],
+                &["223.255.255.255"],
+            ),
+            // ::1, between this and ::2, is loopback.
+            ("::/128", &["::"], &["::2"]),
+            (
+                "64:ff9b:1::/48",
+                &["64:ff9b:1::", "64:ff9b:1:ffff:ffff:ffff:ffff:ffff"],
+                &["64:ff9b:0:ffff:ffff:ffff:ffff:ffff", "64:ff9b:2::"],
+            ),
+            (
+                "100::/64",
+                &["100::", "100::ffff:ffff:ffff:ffff"],
+                &["ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
+            ),
+            (
+                "100:0:0:1::/64",
+                &["100:0:0:1::", "100:0:0:1:ffff:ffff:ffff:ffff"],
+                &["100:0:0:2::"],
+            ),
+            (
+                "2001::/23",
+                &[
+                    "2001::",
+                    "2001:0:c000:201::1",
+                    "2001:2::1",
+                    "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff",
+                ],
+                &["2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "2001:200::"],
+            ),
+            (
+                "3fff::/20",
+                &["3fff::", "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff"],
+                &["3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "3fff:1000::"],
+            ),
+            (
+                "5f00::/16",
+                &["5f00::", "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
+                &["5eff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "5f01::"],
+            ),
+        ];
+        for (block, inside, outside) in blocks {
+            for ip in inside {
+                assert!(
+                    is_reserved_ip(ip.parse().unwrap()),
+                    "{ip} ({block}) must be reserved"
+                );
+            }
+            for ip in outside {
+                assert!(
+                    !is_reserved_ip(ip.parse().unwrap()),
+                    "{ip}, just outside {block}, must not be reserved"
+                );
+            }
         }
     }
 

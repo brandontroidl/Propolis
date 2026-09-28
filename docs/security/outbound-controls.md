@@ -182,25 +182,29 @@ The push is monitored by the `feed-push-stale` condition once configured; see
 
 ## The forbidden-egress-target guard
 
-The fetcher's URL vetter (`crates/review/src/fetcher/guard.rs`, `vet()` at line
-144) is a load-bearing SSRF guard run on the initial URL and on every redirect
-hop, failing closed at each step. Its `is_forbidden_egress_target` check (line
-68) rejects own-host and reserved destinations before any connection:
+The fetcher's URL vetter (`vet` in `crates/review/src/fetcher/guard.rs`) is a
+load-bearing SSRF guard run on the initial URL and on every redirect hop,
+failing closed at each step. Its `is_forbidden_egress_target` check rejects
+own-host and reserved destinations before any connection:
 
-- **Reserved / private / loopback IPs** via `core_scoring::is_reserved_ip`, plus
-  `0.0.0.0/8`, CGNAT `100.64/10`, and `::` (lines 57-83).
-- **IPv6 canonicalization first** - v4-mapped `::ffff:`, NAT64 `64:ff9b::/96`,
-  6to4 `2002::/16`, Teredo/`2001::/32`, and deprecated v4-compat forms are folded
-  or rejected (lines 14-55) so a mapped-loopback cannot slip past the base
+- **Special-purpose, private and loopback IPs** via `core_scoring::is_reserved_ip`:
+  every block the IANA special-purpose registries mark not globally reachable,
+  plus multicast (the list and the calls behind it are in
+  [scoring and feed](../reference/scoring-and-feed.md)). `in_extra_egress_deny`
+  repeats `0.0.0.0/8`, CGNAT `100.64/10` and `::` so the never-dial set cannot
+  shrink if the shared never-publish list is ever narrowed.
+- **IPv6 canonicalization first** (`canonicalize`) - v4-mapped `::ffff:`, NAT64
+  `64:ff9b::/96`, 6to4 `2002::/16`, Teredo/`2001::/32`, and deprecated v4-compat
+  forms are folded or rejected so a mapped-loopback cannot slip past the base
   checker.
 - **Scheme allowlist** http/https/tftp only, everything else `BadScheme`; tftp
-  only on the initial fetch, never a redirect (lines 159-164).
-- **`user:pass@host` rejected** outright (`Userinfo`, lines 152-157) - defeats
-  naive host extraction.
+  only on the initial fetch, never a redirect (`vet`).
+- **`user:pass@host` rejected** outright (`Userinfo`, in `vet`) - defeats naive
+  host extraction.
 - **DNS-rebinding defence** - if a host resolves to a mixed public+internal set,
-  the whole host is rejected, not just the surviving public IP (lines 189-195).
+  the whole host is rejected, not just the surviving public IP (`vet`).
 - **Pinned connect** - the connection uses the vetted IP and never re-resolves
-  the host (`Pinned`, doc line 94).
+  the host (`Pinned`).
 - **No proxy** - every HTTP client the fetcher builds, the certificate-failure
   retry's included, comes from one constructor (`Hop::client` in
   `crates/review/src/fetcher/http.rs`) that refuses the proxy variables.
@@ -209,10 +213,10 @@ hop, failing closed at each step. Its `is_forbidden_egress_target` check (line
   fetch through its retry both reach only the pinned target, and that no other
   file under `src/fetcher` constructs a client.
 - **IP-literal hosts skip DNS** (decimal/octal/hex folded by the `url` crate) so
-  a reserved literal is caught without a resolver call (lines 168-183).
+  a reserved literal is caught without a resolver call (`vet`).
 - **tftp forced to port 69** - any explicit non-69 port is `TftpPortForbidden`
-  (lines 206-210) so tftp cannot aim UDP at another service.
-- **Empty resolve set fails closed** `ResolveFailed` (lines 185-187).
+  (`vet`) so tftp cannot aim UDP at another service.
+- **Empty resolve set fails closed** `ResolveFailed` (`vet`).
 
 At the daemon boundary the fetcher refuses to run if `own_ips` is empty
 (`crates/propolis/src/main.rs:828-835`) and warns if `own_ips` has no public

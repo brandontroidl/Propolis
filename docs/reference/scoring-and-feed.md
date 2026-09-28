@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.3.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-28
 -->
 
 # Scoring and feed reference
@@ -222,23 +222,45 @@ offending rows (`crates/feed/src/publisher.rs:95-101,173-205`).
 
 `is_reserved_ip(ip)` is one definition shared by BOTH outbound paths (feed
 publish and vendor submit); it was previously feed-only, which left the vendor
-path unguarded (`net.rs:1-9,57-59`). The ranges are fixed and not
-operator-configurable (`net.rs:21-53`):
+path unguarded (the `net.rs` module doc). The ranges are fixed and not
+operator-configurable (`RESERVED_RANGES`):
 
 | Class | Ranges |
 |---|---|
 | RFC1918 private | `10/8`, `172.16/12`, `192.168/16` |
-| RFC5737 doc | `192.0.2/24`, `198.51.100/24`, `203.0.113/24` |
+| Shared address space (CGNAT, RFC 6598) | `100.64/10` |
+| This network, unspecified | `0/8`, `::/128` |
+| Documentation | `192.0.2/24`, `198.51.100/24`, `203.0.113/24`, `2001:db8::/32`, `3fff::/20` |
 | Loopback | `127/8`, `::1/128` |
 | Link-local | `169.254/16`, `fe80::/10` |
 | Multicast | `224/4`, `ff00::/8` |
-| Broadcast | `255.255.255.255/32` |
+| Broadcast and future use | `255.255.255.255/32`, `240/4` |
 | IPv6 ULA | `fc00::/7` |
-| IPv6 doc | `2001:db8::/32` |
+| IETF protocol assignments | `192.0.0/24`, `2001::/23` (includes Teredo `2001::/32` and benchmarking `2001:2::/48`) |
+| Benchmarking | `198.18/15` |
+| 6a44 relay anycast | `192.88.99.2/32` |
+| NAT64 local-use | `64:ff9b:1::/48` |
+| IPv6 discard-only and dummy | `100::/64`, `100:0:0:1::/64` |
+| SRv6 segment identifiers | `5f00::/16` |
 
-The malware fetcher's SSRF guard extends this with additional deny ranges
-(`0.0.0.0/8`, CGNAT `100.64.0.0/10`, `::`, Teredo, deprecated v4-compat,
-own-host) - see [integrations.md](integrations.md) and
+The list matches the IANA IPv4 and IPv6 Special-Purpose Address Registries
+(both last updated 2025-10-09; compared 2026-09-28): every block they mark not
+globally reachable is in it except the IPv4-mapped prefix `::ffff:0:0/96`,
+which `is_reserved_ip` unwraps to the embedded IPv4 address before checking.
+Two calls go beyond the registries' reachability column:
+
+- `192.0.0.0/24` and `2001::/23` are listed whole, although a few members are
+  marked globally reachable: anycast service addresses (PCP, TURN, DNS-SD, AMT, AS112)
+  and identifier prefixes (ORCHIDv2, drone entity tags). None of them is an
+  attacking host's own address.
+- 6to4 (`2002::/16`, reachability "N/A") is not listed: a 6to4 address belongs
+  to whoever holds its embedded public IPv4 address.
+
+The malware fetcher's SSRF guard applies this same list and adds own-host
+addresses, rejection of Teredo, deprecated v4-compat and non-`/96` NAT64 forms,
+decoding of 6to4 and well-known NAT64 addresses to their embedded IPv4, and a
+fetch-only list repeating `0.0.0.0/8`, `100.64.0.0/10` and `::` - see
+[integrations.md](integrations.md) and
 [../security/outbound-controls.md](../security/outbound-controls.md).
 
 ## See also

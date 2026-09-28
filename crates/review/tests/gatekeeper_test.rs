@@ -321,6 +321,8 @@ async fn reserved_ranges_are_refused_ahead_of_every_configurable_check() {
         "fe80::1",
         "fc00::1",
         "2001:db8::1",
+        // Carrier-grade NAT space, which overlay VPNs also hand to an operator's own devices.
+        "100.64.0.1",
     ] {
         let ip: IpAddr = addr.parse().unwrap();
         // A maximal score and a matching category: every other gate would pass this.

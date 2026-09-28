@@ -54,6 +54,9 @@ fn canonicalize(ip: IpAddr) -> Result<IpAddr, EgressReject> {
     Ok(ip)
 }
 
+/// Never-dial entries checked after the shared never-publish list. All three are in that list too;
+/// they are repeated here so the fetcher's deny set cannot shrink if that list is ever narrowed
+/// for publishing reasons.
 fn in_extra_egress_deny(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -301,6 +304,80 @@ mod tests {
             );
         }
     }
+    /// The special-purpose blocks the shared reserved list gained from the IANA registries are
+    /// never dialed, up to their edges, and the addresses just past each edge still are. Blocks
+    /// the guard already refused before that (`0.0.0.0/8`, `100.64.0.0/10`, `::`, the NAT64
+    /// prefixes) stay covered by `forbidden_targets_are_all_rejected`.
+    #[test]
+    fn special_purpose_blocks_are_rejected_exactly_to_their_edges() {
+        let own = HashSet::new();
+        let blocks: [(&str, &[&str], &[&str]); 9] = [
+            (
+                "192.0.0.0/24",
+                &["192.0.0.0", "192.0.0.9", "192.0.0.255"],
+                &["191.255.255.255", "192.0.1.0"],
+            ),
+            (
+                "192.88.99.2/32",
+                &["192.88.99.2"],
+                &["192.88.99.1", "192.88.99.3"],
+            ),
+            (
+                "198.18.0.0/15",
+                &["198.18.0.0", "198.19.255.255"],
+                &["198.17.255.255", "198.20.0.0"],
+            ),
+            (
+                "240.0.0.0/4",
+                &["240.0.0.0", "255.255.255.254"],
+                &["223.255.255.255"],
+            ),
+            (
+                "100::/64",
+                &["100::", "100::ffff:ffff:ffff:ffff"],
+                &["ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
+            ),
+            (
+                "100:0:0:1::/64",
+                &["100:0:0:1::", "100:0:0:1:ffff:ffff:ffff:ffff"],
+                &["100:0:0:2::"],
+            ),
+            (
+                "2001::/23",
+                &[
+                    "2001:1::1",
+                    "2001:2::1",
+                    "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff",
+                ],
+                &["2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "2001:200::"],
+            ),
+            (
+                "3fff::/20",
+                &["3fff::", "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff"],
+                &["3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "3fff:1000::"],
+            ),
+            (
+                "5f00::/16",
+                &["5f00::", "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
+                &["5eff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "5f01::"],
+            ),
+        ];
+        for (block, inside, outside) in blocks {
+            for bad in inside {
+                assert!(
+                    is_forbidden_egress_target(ip(bad), &own).is_some(),
+                    "should reject {bad} ({block})"
+                );
+            }
+            for ok in outside {
+                assert!(
+                    is_forbidden_egress_target(ip(ok), &own).is_none(),
+                    "should allow {ok}, just outside {block}"
+                );
+            }
+        }
+    }
+
     // core_scoring::is_reserved_ip now canonicalizes the v4-mapped form itself (F-1), so this
     // guard's own `canonicalize` is defense-in-depth rather than the only place that catches it.
     #[test]

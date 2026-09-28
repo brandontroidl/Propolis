@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 1657 test functions** (941 unit + 716 integration).
+- **Total: 1658 test functions** (941 unit + 717 integration).
 - **DB-backed (`sqlx::test`): 200** - console 157, core-scoring 25, intake 7,
   fleet 6, propolis 4, review 1. These provision a fresh database per test.
 - **Ignored: exactly 2.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -123,7 +123,7 @@ Per-crate breakdown:
 | log-tailer | 0 | 34 | cursor_test, tailer_test |
 | propolis | 100 | 16 | capture_to_console, docs_agreement, restore_rehearsal, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 4 | provision |
-| review | 116 | 70 | cli_test, fetcher_proxy_test, fetcher_schema_test, gatekeeper_test, queue_test, submit_test, vendor_test |
+| review | 116 | 71 | cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
 | sensor-adb | 53 | 20 | integration |
 | sensor-catchall | 18 | 6 | integration |
 | sensor-cred | 14 | 8 | integration |
@@ -136,7 +136,7 @@ Per-crate breakdown:
 | sensor-telnet | 39 | 18 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **941** | **716** | |
+| **Total** | **941** | **717** | |
 
 ### Test styles by layer
 

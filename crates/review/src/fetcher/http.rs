@@ -119,11 +119,12 @@ async fn fetch_http_once_trusting(
         limits,
         deadline: Instant::now() + limits.total_timeout,
     };
-    let verify = Certificates::Verify(extra_roots);
-
     if parsed.scheme() != "https" {
-        return hop.attempt(verify, TransportAuth::Plaintext).await;
+        return hop
+            .attempt(Certificates::NoHandshake, TransportAuth::Plaintext)
+            .await;
     }
+    let verify = Certificates::Verify(extra_roots);
     match hop.attempt(verify, TransportAuth::Verified).await {
         Err(err) => match certificate_validation_error(&err) {
             Some(error) => {
@@ -143,6 +144,10 @@ enum Certificates<'a> {
     /// Accept any certificate. Only ever the retry after a validation failure, whose result is
     /// labeled unverified.
     AcceptAny,
+    /// A plain-http hop, which makes no TLS handshake (redirects are followed by hand, one hop at
+    /// a time). Building a verifying client would still load and parse the whole system trust
+    /// store, blocking the async worker on every hop and failing the fetch on a host without one.
+    NoHandshake,
 }
 
 /// What every attempt at one hop shares, so a retry cannot reach a different address, send a
@@ -203,7 +208,9 @@ impl Hop<'_> {
             .timeout(remaining);
         match certificates {
             Certificates::Verify(roots) => builder.tls_certs_merge(roots.iter().cloned()),
-            Certificates::AcceptAny => builder.tls_danger_accept_invalid_certs(true),
+            Certificates::AcceptAny | Certificates::NoHandshake => {
+                builder.tls_danger_accept_invalid_certs(true)
+            }
         }
         .build()
     }

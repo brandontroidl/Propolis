@@ -76,5 +76,7 @@ current with every commit.
 - [Claim-to-source ledger](claim-to-source-ledger.md): documentation claims mapped to
   the code that supports them.
 - [Handoff binder](binder/HANDOFF-BINDER.md): the whole project in one linear document.
+- [Sanitizer results](security/sanitizer-results.md): dated AddressSanitizer and
+  LeakSanitizer runs and how each report was attributed.
 - [Coverage matrix](coverage-matrix.md) and [documentation policy](documentation-policy.md).
 - [Pre-rewrite archive](archive/2026-08-26/MANIFEST.md), frozen.

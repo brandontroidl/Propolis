@@ -117,3 +117,4 @@ script, and re-run the full gate including a release build after re-vendoring.
 - [Build and test](../development/build-and-test.md)
 - [Outbound controls](./outbound-controls.md)
 - [Residual risks](./residual-risks.md)
+- [Sanitizer results](./sanitizer-results.md)

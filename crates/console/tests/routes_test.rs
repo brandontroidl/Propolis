@@ -6526,3 +6526,135 @@ fn run_deploy_stamp(repo: &std::path::Path, out_file: &std::path::Path, bin_dir:
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// --- search: control characters and over-length values are refused before SQL ---
+
+/// Percent-encodes a query-string value the same way `routes::search`'s own (private)
+/// `percent_encode` does for its generated links (unreserved set kept literal, everything else
+/// escaped) - duplicated here rather than imported since the production function is private to
+/// that module and these tests build request URIs, not `Filters` values.
+fn qs_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[sqlx::test(migrations = false)]
+async fn search_events_rejects_a_percent_decoded_nul_in_q_with_400(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    // The finding this guards: a percent-decoded NUL used to reach PostgreSQL, which rejected it
+    // and surfaced as the console's generic 503 - it must now be a 400 that never touches SQL.
+    let response = app
+        .oneshot(get_request(
+            "/search/events?q=abc%00def",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = false)]
+async fn search_events_rejects_another_control_character_in_sensor_with_400(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    // %07 is BEL (0x07): a C0 control distinct from NUL, guarding that the check is a general
+    // control-character rule and not a NUL special case.
+    let response = app
+        .oneshot(get_request(
+            "/search/events?sensor=ssh%07server",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = false)]
+async fn search_events_rejects_an_over_length_q_value_with_400(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let too_long = "a".repeat(600); // over the 512-byte MAX_QUERY_PARAM_LEN
+    let response = app
+        .oneshot(get_request(
+            &format!("/search/events?q={too_long}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = false)]
+async fn search_ips_rejects_a_control_character_in_ip_with_400(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    // `ip` alone never counts as a filter in IP-search mode (`Filters::any_provided`'s doc
+    // comment), so `sensor` carries the control character here to actually exercise validation.
+    let response = app
+        .oneshot(get_request(
+            "/search/ips?sensor=ssh%00",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Regression: quotes, ILIKE wildcard characters, and HTML-special characters in a search query
+/// must still reach SQL as an ordinary (parameterized, wildcard-escaped) filter value and render
+/// a normal 200 results page - the control-character and length check must not over-block
+/// legitimate operator input.
+#[sqlx::test(migrations = false)]
+async fn search_events_still_searches_normally_with_quotes_wildcards_and_html_like_input(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+
+    for q in [
+        "O'Brien \"the great\"",
+        "100%_off",
+        "<script>alert(1)</script>",
+    ] {
+        let app = test_app(state.clone());
+        let uri = format!("/search/events?q={}", qs_encode(q));
+        let response = app
+            .oneshot(get_request(
+                &uri,
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "expected 200 for legitimate query {q:?}"
+        );
+    }
+}

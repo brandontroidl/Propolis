@@ -72,8 +72,8 @@ login rate limiting) are owned by [authentication and authorization](../security
 | GET | `/ip/{ip}/chart` | `chart_fragment` | HTMX | `routes/detail.rs:78` |
 | GET | `/feed` | `feed_page` | `?tab=status\|entries` | `routes/feed.rs:59` |
 | GET | `/feed/download/{tier}/{format}` | `download_feed` | see feed downloads below | `routes/feed.rs:60` |
-| GET | `/search/events` | `search_events` | doubles as HTMX load-more when `HX-Request` present | `routes/search.rs:58` |
-| GET | `/search/ips` | `search_ips` | | `routes/search.rs:59` |
+| GET | `/search/events` | `search_events` | doubles as HTMX load-more when `HX-Request` present; `400` on a control character or an over-512-byte query param | `routes/search.rs:58` |
+| GET | `/search/ips` | `search_ips` | `400` on a control character or an over-512-byte query param | `routes/search.rs:59` |
 | GET | `/ips` | `ip_list` | `ip_score` list, capped 500 rows | `routes/ips.rs:14` |
 | GET | `/integrity` | `integrity_page` | | `routes/integrity.rs:13` |
 | POST | `/integrity/verify` | `run_verify` | CSRF (403); one verification at a time (409 while one runs) | `routes/integrity.rs` |

@@ -11,6 +11,14 @@
 //! `fetch_evidence_rows`'s page-size cap and `routes::queue`'s scoped queries apply elsewhere in
 //! this crate.
 //!
+//! Every raw [`SearchParams`] value is checked ([`validate_params`]) before either handler does
+//! anything else: a control character or an over-length value answers a plain `400` and never
+//! reaches SQL. A percent-decoded NUL used to reach PostgreSQL, which rejected it, and the
+//! operator saw the generic 503 while the log filled with database errors. This is stricter than
+//! [`Filters`]' fail-open handling of a value that merely fails to parse (a malformed IP, a bad
+//! date), which is a plausible typo; a control character or a multi-kilobyte value has no
+//! legitimate reading.
+//!
 //! Event search reuses `routes::detail`'s cursor encoding (`format_cursor`/`parse_cursor`) for
 //! its own `(observed_at, id)`-shaped `?cursor=` value, even though - per the design's literal
 //! "Query pattern" for event search - only the `id` half is actually bound into the `id < $7`
@@ -35,8 +43,8 @@
 use std::net::IpAddr;
 
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
-use axum::response::Html;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -74,6 +82,57 @@ pub struct SearchParams {
     pub to: Option<String>,
     pub cursor: Option<String>,
     pub mode: Option<String>,
+}
+
+/// Longest value (bytes) accepted for any search parameter. One bound for all eight: it exists
+/// to refuse pathological input before any database work, not to model each field, and 512 bytes
+/// is far past the longest phrase an operator types into `q`.
+const MAX_QUERY_PARAM_LEN: usize = 512;
+
+/// Refuses a value with any control character (`char::is_control`: C0 and C1, NUL included) or
+/// longer than [`MAX_QUERY_PARAM_LEN`]. Refused rather than stripped, unlike ingested event
+/// fields: a query-string value has no legitimate reason to carry one. The error is
+/// `(StatusCode, String)` rather than a `Response` because clippy's `result_large_err` flags the
+/// latter.
+fn reject_invalid(field: &str, value: &str) -> Result<(), (StatusCode, String)> {
+    if value.chars().any(|c| c.is_control()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid search parameter '{field}': control characters are not allowed"),
+        ));
+    }
+    if value.len() > MAX_QUERY_PARAM_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid search parameter '{field}': exceeds the {MAX_QUERY_PARAM_LEN}-byte \
+                 maximum"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates every raw [`SearchParams`] field - `q`, `sensor`, `signal_type`, `ip`, `from`, `to`,
+/// `cursor`, `mode` - against [`reject_invalid`]. Called first thing in both handlers, before
+/// [`Filters::from_params`] normalizes anything or either fetch function runs a query, so a
+/// rejected request never reaches the database.
+fn validate_params(p: &SearchParams) -> Result<(), (StatusCode, String)> {
+    for (field, value) in [
+        ("q", &p.q),
+        ("sensor", &p.sensor),
+        ("signal_type", &p.signal_type),
+        ("ip", &p.ip),
+        ("from", &p.from),
+        ("to", &p.to),
+        ("cursor", &p.cursor),
+        ("mode", &p.mode),
+    ] {
+        if let Some(v) = value {
+            reject_invalid(field, v)?;
+        }
+    }
+    Ok(())
 }
 
 /// The six filter values, normalized once from [`SearchParams`] (trimmed, empty-string treated as
@@ -296,7 +355,10 @@ async fn search_events(
     Extension(session): Extension<Session>,
     headers: HeaderMap,
     Query(params): Query<SearchParams>,
-) -> Result<Html<String>, AppError> {
+) -> Result<Response, AppError> {
+    if let Err(rejection) = validate_params(&params) {
+        return Ok(rejection.into_response());
+    }
     let filters = Filters::from_params(&params);
     let is_htmx = headers.get("HX-Request").is_some();
     let searched = filters.any_provided("events");
@@ -309,7 +371,7 @@ async fn search_events(
             tracing::warn!(
                 "htmx search-events request arrived with no filters; returning empty fragment"
             );
-            return Ok(Html(String::new()));
+            return Ok(Html(String::new()).into_response());
         }
         return render_search_page(
             &state,
@@ -336,7 +398,7 @@ async fn search_events(
             .templates
             .get_template("search_events_fragment.html")?;
         let html = tmpl.render(context! { rows, has_more, next_cursor })?;
-        return Ok(Html(html));
+        return Ok(Html(html).into_response());
     }
 
     render_search_page(
@@ -357,7 +419,10 @@ async fn search_ips(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
     Query(params): Query<SearchParams>,
-) -> Result<Html<String>, AppError> {
+) -> Result<Response, AppError> {
+    if let Err(rejection) = validate_params(&params) {
+        return Ok(rejection.into_response());
+    }
     let filters = Filters::from_params(&params);
     let searched = filters.any_provided("ips");
     let ip_rows = if searched {
@@ -391,7 +456,7 @@ async fn render_search_page(
     next_cursor: Option<String>,
     ip_rows: Vec<SearchIpRow>,
     searched: bool,
-) -> Result<Html<String>, AppError> {
+) -> Result<Response, AppError> {
     let (sensors, signal_types) = filter_options(&state.db).await;
     let csrf_token = state
         .sessions
@@ -431,7 +496,7 @@ async fn render_search_page(
         events_query_string,
         ips_query_string,
     })?;
-    Ok(Html(html))
+    Ok(Html(html).into_response())
 }
 
 /// Populates the filter form's sensor/signal-type dropdowns (design's "Filter dropdowns"). Soft-

@@ -79,7 +79,11 @@ argument values, not query text).
 Console query surfaces reinforce this at the route layer: search filters combine as prepared
 `($n::type IS NULL OR ...)` clauses with at least one filter required before a query runs,
 LIKE-metacharacters in free-text are escaped, and sort columns are chosen from a fixed match
-(literal order strings - no injection surface). See
+(literal order strings - no injection surface). Every search query-string value is also rejected
+outright - a plain `400`, before `Filters::from_params` or SQL binding - if it contains a control
+character or exceeds 512 bytes (`routes/search.rs`'s `validate_params`): a percent-decoded NUL
+previously reached PostgreSQL, which rejected it and surfaced as the console's generic `503`, so a
+repeated malformed request cost a wasted database round trip and a log line each time. See
 [../reference/console-routes.md](../reference/console-routes.md).
 
 Tables, enums, and migrations: [../reference/database.md](../reference/database.md).

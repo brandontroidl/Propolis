@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "wnaf"
-version = "0.14.0"
+version = "0.14.1"
 authors = ["RustCrypto Developers"]
 build = false
 autolib = false
@@ -69,6 +69,10 @@ version = "0.14"
 default-features = false
 
 [dependencies.group]
+version = "0.14"
+default-features = false
+
+[dependencies.primefield]
 version = "0.14"
 default-features = false
 

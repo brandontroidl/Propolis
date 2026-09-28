@@ -1994,9 +1994,7 @@ async fn login_page_shows_version(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains(
-            r#"<p class="dim" style="text-align:center;font-size:0.72rem;margin-top:1rem;">vtest</p>"#
-        ),
+        body.contains(r#"<p class="dim login-foot">vtest</p>"#),
         "expected the login page's own version line: {body}"
     );
     assert!(
@@ -2989,7 +2987,7 @@ async fn detail_page_has_neutral_back_link(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains(r#"<a href="/ips" onclick="if(history.length>1){history.back();return false}">&larr; Back</a>"#),
+        body.contains(r#"<a href="/ips" data-history-back>&larr; Back</a>"#),
         "expected a neutral back link (browser history with an /ips fallback), not a hardcoded \
          'back to queue' that misleads when the page was reached from elsewhere: {body}"
     );
@@ -4840,6 +4838,29 @@ async fn samples_page_shows_fetch_attempt_status_counts(pool: PgPool) {
     assert_eq!(strip_count(&body, "Pending"), 1);
 }
 
+/// The transport query reads the columns migration review/0007 added; a healthy database must
+/// render the samples page with every panel loaded, the transport one included.
+#[sqlx::test(migrations = false)]
+async fn samples_page_loads_the_fetch_transport_panel_on_a_healthy_database(pool: PgPool) {
+    migrate(&pool).await;
+    seed_fetch_attempt_with_analysis(&pool, 1, "203.0.113.9", 0, 70).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let response = test_app(state)
+        .oneshot(get_request(
+            "/samples",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("Some panels could not be loaded"),
+        "a healthy database must load every samples panel: {body}"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn samples_page_hides_fetch_attempts_panel_when_empty(pool: PgPool) {
     migrate(&pool).await;
@@ -6657,4 +6678,83 @@ async fn search_events_still_searches_normally_with_quotes_wildcards_and_html_li
             "expected 200 for legitimate query {q:?}"
         );
     }
+}
+
+// --- content security policy and static assets ---
+
+#[sqlx::test(migrations = false)]
+async fn every_page_carries_the_content_security_policy(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let cookie = format!("{}={cookie}", auth::SESSION_COOKIE);
+
+    for (uri, cookie) in [
+        ("/login", None),
+        ("/", Some(cookie.as_str())),
+        ("/ips", Some(cookie.as_str())),
+        ("/integrity", Some(cookie.as_str())),
+    ] {
+        let response = test_app(state.clone())
+            .oneshot(get_request(uri, cookie))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap_or_else(|| panic!("{uri} has no content-security-policy"))
+            .to_str()
+            .unwrap();
+        assert_eq!(csp, routes::CONTENT_SECURITY_POLICY, "{uri}");
+        for directive in [
+            "script-src 'self'",
+            "style-src 'self'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(csp.contains(directive), "{uri}: missing {directive}");
+        }
+        assert!(
+            !csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"),
+            "{uri}: the policy must not allow inline script or style"
+        );
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn assets_are_served_with_their_type_and_revalidated_by_etag(pool: PgPool) {
+    let app = test_app(test_state(pool));
+
+    for (file, content_type) in [
+        ("console.css", "text/css; charset=utf-8"),
+        ("console.js", "text/javascript; charset=utf-8"),
+        ("live-panels.js", "text/javascript; charset=utf-8"),
+        ("htmx.min.js", "text/javascript; charset=utf-8"),
+    ] {
+        let uri = format!("/assets/{file}");
+        let first = app.clone().oneshot(get_request(&uri, None)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "{uri}");
+        assert_eq!(first.headers()["content-type"], content_type, "{uri}");
+        assert_eq!(first.headers()["cache-control"], "no-cache", "{uri}");
+        let etag = first.headers()["etag"].to_str().unwrap().to_string();
+
+        let again = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED, "{uri}");
+    }
+
+    let unknown = app
+        .oneshot(get_request("/assets/../Cargo.toml", None))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 }

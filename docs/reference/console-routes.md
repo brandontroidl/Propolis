@@ -41,7 +41,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 
 ## Route table
 
-**7 public + 23 session-gated = 30 routes.**
+**8 public + 26 session-gated = 34 routes** (one row per method and path; `/login` serves GET and POST).
 
 ### Public (no session)
 
@@ -53,7 +53,8 @@ login rate limiting) are owned by [authentication and authorization](../security
 | GET | `/login` | `login_form` | | `routes/login.rs:45` |
 | POST | `/login` | `login_submit` | no CSRF (no pre-auth session to bind) | `routes/login.rs:45` |
 | GET | `/logout` | `logout` | idempotent; destroys session + clears cookie | `routes/login.rs:46` |
-| GET | `/assets/fonts/{file}` | `font` | fixed 4-name allowlist; public so login page loads fonts | `routes/assets.rs:28` |
+| GET | `/assets/fonts/{file}` | `font` | fixed 4-name allowlist; public so login page loads fonts | `routes/assets.rs` |
+| GET | `/assets/{file}` | `static_asset` | the pages' scripts and stylesheets, fixed allowlist; ETag + `no-cache`, `304` on a match | `routes/assets.rs` |
 
 ### Session-gated (protected)
 
@@ -65,13 +66,17 @@ login rate limiting) are owned by [authentication and authorization](../security
 | POST | `/queue/{ip}/approve` | `approve` | CSRF required | `routes/queue.rs:42` |
 | POST | `/queue/{ip}/reject` | `reject` | CSRF required | `routes/queue.rs:43` |
 | POST | `/queue/{ip}/snooze` | `snooze` | CSRF required | `routes/queue.rs:44` |
-| POST | `/ip/{ip}/delist` | `delist` | CSRF required | `routes/queue.rs:45` |
-| POST | `/ip/{ip}/delete` | `delete_ip` | CSRF required | `routes/queue.rs:46` |
+| POST | `/queue/{ip}/unsnooze` | `unsnooze` | CSRF required | `routes/queue.rs` |
+| POST | `/ip/{ip}/delist` | `delist` | CSRF required | `routes/queue.rs` |
+| POST | `/ip/{ip}/relist` | `relist` | CSRF required | `routes/queue.rs` |
+| POST | `/ip/{ip}/delete` | `delete_ip` | CSRF required | `routes/queue.rs` |
 | GET | `/ip/{ip}` | `detail` | drawer mode via `?drawer=1` + `HX-Request`; missing IP → `404` | `routes/detail.rs:76` |
 | GET | `/ip/{ip}/events` | `events_fragment` | HTMX keyset pagination | `routes/detail.rs:77` |
 | GET | `/ip/{ip}/chart` | `chart_fragment` | HTMX | `routes/detail.rs:78` |
 | GET | `/feed` | `feed_page` | `?tab=status\|entries` | `routes/feed.rs:59` |
 | GET | `/feed/download/{tier}/{format}` | `download_feed` | see feed downloads below | `routes/feed.rs:60` |
+| GET | `/fleet` | `fleet_page` | listener reachability, capture completeness, running version | `routes/fleet.rs` |
+| GET | `/fleet/status` | `fleet_status_fragment` | HTMX, polled every 30 s; stale handling in `assets/live-panels.js` | `routes/fleet.rs` |
 | GET | `/search/events` | `search_events` | doubles as HTMX load-more when `HX-Request` present; `400` on a control character or an over-512-byte query param | `routes/search.rs:58` |
 | GET | `/search/ips` | `search_ips` | `400` on a control character or an over-512-byte query param | `routes/search.rs:59` |
 | GET | `/ips` | `ip_list` | `ip_score` list, capped 500 rows | `routes/ips.rs:14` |
@@ -158,16 +163,26 @@ export files rather than re-querying the DB (`feed.rs:59-179`).
 ## Security-headers middleware
 
 `security_headers` (`routes/mod.rs:59-71`) is applied globally at `routes/mod.rs:55`, so it
-runs on **every** response, public and protected alike. It sets exactly two headers:
+runs on **every** response, public and protected alike. It sets:
 
 - `X-Frame-Options: DENY`
 - `X-Content-Type-Options: nosniff`
+- `Content-Security-Policy`, unless the route already set a stricter one (below)
 
-### No global Content-Security-Policy
+### Content-Security-Policy
 
-There is **no global CSP header**. The only route that emits a CSP is
-`GET /samples/download/{sha256}`, which serves the raw malware sample with
-`Content-Security-Policy: default-src 'none'` alongside its own
+Every response carries
+`default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`
+(`routes::CONTENT_SECURITY_POLICY`). No page carries an inline `<script>`, an inline
+style or an event-handler attribute: every script and stylesheet is a static file under
+`crates/console/src/assets/`, served at `/assets/{name}` from a fixed allowlist with an ETag
+and `Cache-Control: no-cache`, so a browser revalidates and never runs a stale script against
+new markup. Data-driven widths use generated classes (`pct-0` to `pct-100`, `h-2` to `h-26`)
+rather than style attributes. `templates.rs` tests scan every template for inline script,
+style and handlers, and for references to assets that are not served.
+
+`GET /samples/download/{sha256}` keeps a stricter policy of its own. It serves the raw malware
+sample with `Content-Security-Policy: default-src 'none'` alongside its own
 `X-Content-Type-Options: nosniff`, `Content-Type: application/octet-stream`, and
 `Content-Disposition: attachment` (`serve_sample` in `samples.rs`). That download also
 validates the `{sha256}` segment as exactly 64 hex characters and returns `400` for a malformed
@@ -175,6 +190,6 @@ value. It serves only a body that passes `review::spool::read_sample` (a regular
 link, whose content hashes to the requested digest); an entry that exists but fails that check
 returns `409` and is logged, and an absent one returns `404`.
 
-XSS defense across the HTML pages is therefore **minijinja auto-escaping** (every template
-whose name ends in `.html` is auto-escaped) plus `nosniff` / `DENY` and the hardened
-download path - not a CSP.
+XSS defense across the HTML pages is **minijinja auto-escaping** (every template whose name
+ends in `.html` is auto-escaped). The policy is the second line: an escaping mistake that let
+markup through still could not run script or apply inline style.

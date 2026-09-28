@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; no tags in this repository)
-last-verified: 2026-09-21
+last-verified: 2026-09-28
 -->
 
 # Browser fixtures
@@ -21,8 +21,8 @@ what a passing run looks like, and how to read a failing one.
 The fleet page refreshes itself (`fleet.html`, `hx-trigger="every 30s"`). HTMX leaves the last
 successful render on screen when a refresh fails, and every relative age on that render ("4 minutes
 ago", "never") was computed by the **server** at render time - so a panel that has stopped
-refreshing keeps reading as current while the real gap grows. `base_tail.html`'s live-panel script
-exists to stop that, and it decides staleness two independent ways:
+refreshing keeps reading as current while the real gap grows. The live-panel script
+(`crates/console/src/assets/live-panels.js`, loaded on every page) exists to stop that, and it decides staleness two independent ways:
 
 | Mechanism | Covers | Fails silently if |
 |---|---|---|
@@ -42,8 +42,8 @@ asserts that both mechanisms still **ship** in the rendered page. It cannot asse
 
 One page, assembled from the repository's own files:
 
-- the unmodified vendored `htmx.min.js`, and
-- the live-panel IIFE lifted verbatim out of `base_tail.html`, located by its opening comment.
+- the unmodified vendored `crates/console/src/assets/htmx.min.js`, and
+- `crates/console/src/assets/live-panels.js`, the file the console serves, read whole.
 
 Nothing about the behaviour under test is restated in the fixture, so it cannot drift into passing
 against code the console does not ship. Change the live-panel script and the fixture picks the
@@ -81,6 +81,12 @@ google-chrome --headless=new --disable-background-timer-throttling \
 `--port`, `--run-seconds` and `--recover-after-seconds` are there for when you need a second run
 alongside the first or a longer window; the defaults are sized for the 30s poll interval the fleet
 page actually uses.
+
+Any browser that runs timers in a headless window works. On 2026-09-28, after the live-panel
+script moved from an inline block in `base_tail.html` to `assets/live-panels.js`, the default mode
+was run in headless Firefox 150 (opened over WebDriver BiDi, `--remote-debugging-port`) and gave
+the passing timeline below: bounded at 15000 ms, stale at 47.4s on `htmx:timeout`, recovered at
+92.5s after the first normal answer.
 
 ## A passing run
 
@@ -138,5 +144,5 @@ deliberately not wired up: it costs ~4 minutes of wall clock for two modes, and 
 assertion on a shared runner is a flake source in a gate whose whole design
 ([build-and-test](build-and-test.md)) is independent jobs that each fail for exactly one reason. The
 committed template guard catches the likely regression - someone deleting the code - in the normal
-suite. Run this fixture by hand when you touch the live-panel script in `base_tail.html`, the poll
+suite. Run this fixture by hand when you touch `assets/live-panels.js`, the poll
 markup in `fleet.html`, or the vendored `htmx.min.js`, and paste the timeline into the change.

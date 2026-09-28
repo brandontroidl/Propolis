@@ -77,6 +77,15 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The console's Content-Security-Policy. Scripts, styles, fonts and requests come from this origin
+/// only, and nothing inline runs or applies: every page's script and style is a static file under
+/// `src/assets/` and no template carries an inline `<script>`, `<style>`, `style=""` or event
+/// handler attribute. Auto-escaping remains the XSS defence; this is the second line that stops an
+/// escaping mistake from becoming script execution. `data:` images are the inline favicon.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; \
+     style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+     form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
 async fn security_headers(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
@@ -88,5 +97,58 @@ async fn security_headers(
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
         "nosniff".parse().unwrap(),
     );
+    // A route that set its own, stricter policy (the sample download) keeps it.
+    headers
+        .entry(axum::http::header::CONTENT_SECURITY_POLICY)
+        .or_insert(axum::http::HeaderValue::from_static(
+            CONTENT_SECURITY_POLICY,
+        ));
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    async fn policy_for(app: Router) -> String {
+        let response = app
+            .layer(middleware::from_fn(security_headers))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_response_gets_the_console_policy_unless_it_set_its_own() {
+        let plain = Router::new().route("/", axum::routing::get(|| async { "page" }));
+        assert_eq!(policy_for(plain).await, CONTENT_SECURITY_POLICY);
+
+        let own = Router::new().route(
+            "/",
+            axum::routing::get(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_SECURITY_POLICY,
+                        "default-src 'none'",
+                    )],
+                    "body",
+                )
+            }),
+        );
+        assert_eq!(
+            policy_for(own).await,
+            "default-src 'none'",
+            "the sample download's stricter policy must not be replaced"
+        );
+    }
 }

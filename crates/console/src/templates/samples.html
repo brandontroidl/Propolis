@@ -26,7 +26,10 @@
      FTP/SCP upload has, since it never goes through the fetcher), or one whose reported url the
      fetcher retrieved (fetch_attempt records only the FIRST reporter of each url). Uploaders sort
      first, so the stronger attribution survives the display cap. #}
-  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>Source <span class="dim">uploader, or first reporter of a fetched URL</span></th><th>VirusTotal</th><th></th></tr></thead>
+  {# "Transport" is how the fetcher's connection for this body was authenticated, per source URL:
+     an unverified-TLS or plaintext fetch is evidence an on-path party could have altered in
+     transit. A sensor upload was not fetched, so it has none. #}
+  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>Source <span class="dim">uploader, or first reporter of a fetched URL</span></th><th>Transport <span class="dim">fetched bodies</span></th><th>VirusTotal</th><th></th></tr></thead>
   <tbody>
     {% for s in samples %}
     <tr>
@@ -42,13 +45,20 @@
         {% endif %}
       </td>
       <td>
+        {% if s.transport %}
+          <span class="sev-tags">{% for t in s.transport %}{% if t.sev %}<span class="sev sev--{{ t.sev }}"{% if t.detail %} title="{{ t.detail }}"{% endif %}>{{ t.label }}</span>{% else %}<span class="dim">{{ t.label }}</span>{% endif %}{% endfor %}</span>
+        {% else %}
+          <span class="dim">not fetched</span>
+        {% endif %}
+      </td>
+      <td>
         {% if s.vt_detected is defined and s.vt_detected is not none %}
           {% if s.vt_detected == -1 %}
             <span class="dim">pending</span>
           {% elif s.vt_detected > 0 %}
-            <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" style="color:var(--alert-text);">{{ s.vt_detected }}/{{ s.vt_total }} detected</a>
+            <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" class="text-alert">{{ s.vt_detected }}/{{ s.vt_total }} detected</a>
           {% else %}
-            <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" style="color:var(--good-text);" title="No engine flagged it. That is not proof the file is harmless.">0/{{ s.vt_total }} detections</a>
+            <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" class="text-good" title="No engine flagged it. That is not proof the file is harmless.">0/{{ s.vt_total }} detections</a>
           {% endif %}
         {% else %}
           <span class="dim">not scanned</span>

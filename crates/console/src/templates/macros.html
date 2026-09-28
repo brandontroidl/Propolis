@@ -1,5 +1,5 @@
 {#- Shared IP "evidence link": the canonical drawer trigger. `class="insp"` is what the drawer JS
-    (base_tail.html) keys on via a delegated `htmx:beforeRequest` listener, and the real `href` is
+    (assets/console.js) keys on via a delegated `htmx:beforeRequest` listener, and the real `href` is
     the no-JavaScript fallback (full-page navigation to the same dossier). Every ordinary IP link in
     the console MUST route through this macro so the drawer contract cannot silently drift per page -
     it did: Review, Feed, and Search shipped plain links that navigated instead of opening the

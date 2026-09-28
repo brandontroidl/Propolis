@@ -31,6 +31,77 @@ struct SampleRow {
     /// shown. Empty for a sample nothing links to yet - see `sample_source_ips`.
     source_ips: Vec<String>,
     more_source_ips: usize,
+    /// How the fetcher's transport was authenticated for each URL that returned this body; empty
+    /// for a body no fetch produced (a sensor upload). See `sample_transport`.
+    transport: Vec<TransportTag>,
+}
+
+/// One distinct transport-authentication state among the fetches that returned a sample.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct TransportTag {
+    label: &'static str,
+    /// Appended as `sev--{sev}`; empty renders as plain dim text.
+    sev: &'static str,
+    /// The certificate-validation error for an unverified fetch, shown on hover. It can carry
+    /// names from the attacker's certificate, so it is length-capped here and auto-escaped by the
+    /// template like every other value.
+    detail: Option<String>,
+}
+
+/// The longest certificate error shown on hover; the full text stays in `fetch_attempt`.
+const TRANSPORT_DETAIL_MAX_CHARS: usize = 160;
+
+fn transport_tag(state: &str, error: Option<String>) -> TransportTag {
+    let detail = error.map(|e| e.chars().take(TRANSPORT_DETAIL_MAX_CHARS).collect());
+    match state {
+        "verified" => TransportTag {
+            label: "TLS verified",
+            sev: "low",
+            detail: None,
+        },
+        "unverified" => TransportTag {
+            label: "TLS unverified",
+            sev: "watch",
+            detail,
+        },
+        "plaintext" => TransportTag {
+            label: "plaintext",
+            sev: "low",
+            detail: None,
+        },
+        // 'unknown': fetched before transport authentication was recorded. Never shown as verified.
+        _ => TransportTag {
+            label: "not recorded",
+            sev: "",
+            detail: None,
+        },
+    }
+}
+
+/// sha256 (lowercase hex) -> each distinct transport state among the successful fetches that
+/// returned that body. Several URLs can serve the same bytes over different transports, so the
+/// states are listed side by side rather than collapsed to the best one: a verified copy does not
+/// make an unverified one authenticated.
+async fn sample_transport(
+    pool: &sqlx::PgPool,
+) -> Result<std::collections::HashMap<String, Vec<TransportTag>>, sqlx::Error> {
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT DISTINCT ON (encode(sha256, 'hex'), transport_auth) \
+                encode(sha256, 'hex'), transport_auth, tls_verify_error \
+         FROM fetch_attempt \
+         WHERE status = 'success' AND sha256 IS NOT NULL \
+         ORDER BY encode(sha256, 'hex'), transport_auth, last_attempt DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut map: std::collections::HashMap<String, Vec<TransportTag>> =
+        std::collections::HashMap::new();
+    for (sha, state, error) in rows {
+        map.entry(sha)
+            .or_default()
+            .push(transport_tag(&state, error));
+    }
+    Ok(map)
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +230,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
     // which are also what a healthy node with nothing to show renders.
     let mut degraded = base.degraded;
     let source_ips_by_sha = degraded.soft("sample source IPs", sample_source_ips(&state.db).await);
+    let transport_by_sha = degraded.soft("fetch transport", sample_transport(&state.db).await);
 
     let vt_results: std::collections::HashMap<String, (i32, i32, String)> = degraded
         .soft(
@@ -183,6 +255,10 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                 .map(|v| v.iter().take(max_source_ips).cloned().collect())
                 .unwrap_or_default();
             let more_source_ips = all_ips.map_or(0, |v| v.len().saturating_sub(max_source_ips));
+            let transport = transport_by_sha
+                .get(&file.sha256)
+                .cloned()
+                .unwrap_or_default();
             samples.push(SampleRow {
                 sha256_short: file.sha256[..12].to_string(),
                 size: format_bytes(file.size),
@@ -193,6 +269,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                 vt_link: vt.map(|(_, _, l)| l.clone()).unwrap_or_default(),
                 source_ips,
                 more_source_ips,
+                transport,
             });
         }
     }
@@ -294,6 +371,28 @@ fn format_bytes(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_verified_fetch_reads_as_verified_and_errors_are_capped() {
+        assert_eq!(transport_tag("verified", None).label, "TLS verified");
+        assert_eq!(transport_tag("plaintext", None).label, "plaintext");
+        let unknown = transport_tag("unknown", None);
+        assert_eq!(unknown.label, "not recorded");
+        assert_eq!(
+            unknown.sev, "",
+            "a state nobody recorded must not look like a verdict"
+        );
+        assert_eq!(transport_tag("anything-else", None).label, "not recorded");
+
+        let long = "x".repeat(TRANSPORT_DETAIL_MAX_CHARS + 50);
+        let unverified = transport_tag("unverified", Some(long));
+        assert_eq!(unverified.label, "TLS unverified");
+        assert_eq!(unverified.sev, "watch");
+        assert_eq!(
+            unverified.detail.unwrap().chars().count(),
+            TRANSPORT_DETAIL_MAX_CHARS
+        );
+    }
 
     #[test]
     fn source_ips_group_by_sha_dedup_and_keep_query_order() {

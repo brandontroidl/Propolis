@@ -28,7 +28,7 @@
   </div>
   <div class="cell">
     <span class="label">Last event</span>
-    <div class="v {% if last_event_level == "ok" %}v--ok{% endif %}" style="font-size:1.25rem">{{ last_event_ago }}</div>
+    <div class="v {% if last_event_level == "ok" %}v--ok{% endif %} value-lg">{{ last_event_ago }}</div>
     <div class="foot">newest ingest, fleet wide</div>
   </div>
   <div class="cell">
@@ -44,14 +44,14 @@
   <div class="table-wrap">
     <table class="table-compact">
       <thead><tr>
-        <th style="width:90px">Collector</th>
-        <th style="width:150px">Listener</th>
-        <th style="width:150px">Reachability</th>
-        <th style="width:180px">Vantage</th>
-        <th style="width:90px">Probed</th>
-        <th style="width:90px">Confirmed</th>
-        <th style="width:90px">Last event</th>
-        <th class="count" style="width:70px">24h</th>
+        <th class="w-90">Collector</th>
+        <th class="w-150">Listener</th>
+        <th class="w-150">Reachability</th>
+        <th class="w-180">Vantage</th>
+        <th class="w-90">Probed</th>
+        <th class="w-90">Confirmed</th>
+        <th class="w-90">Last event</th>
+        <th class="count w-70">24h</th>
       </tr></thead>
       <tbody>
         {% for r in listeners %}
@@ -81,11 +81,11 @@
   <div class="table-wrap">
     <table class="table-compact">
       <thead><tr>
-        <th style="width:120px">Sensor</th>
-        <th style="width:190px">Complete</th>
-        <th class="count" style="width:80px">Captures</th>
-        <th class="count" style="width:90px">Incomplete</th>
-        <th class="count" style="width:90px">Truncated</th>
+        <th class="w-120">Sensor</th>
+        <th class="w-190">Complete</th>
+        <th class="count w-80">Captures</th>
+        <th class="count w-90">Incomplete</th>
+        <th class="count w-90">Truncated</th>
         <th>Dominant end reason</th>
       </tr></thead>
       <tbody>
@@ -96,7 +96,7 @@
             {% if c.rate_pct is none %}
             <span class="faint">no labelled capture to rate</span>
             {% else %}
-            <span class="meter"><span class="{{ c.meter_class }}" style="--pct: {{ c.rate_pct }}%"></span></span>
+            <span class="meter"><span class="{{ c.meter_class }} pct-{{ [c.rate_pct, 100]|min }}"></span></span>
             <span class="mono">{{ c.rate_pct }}%</span>
             <span class="dim">{{ c.complete }} of {{ c.captures - c.unlabelled }}</span>
             {% endif %}

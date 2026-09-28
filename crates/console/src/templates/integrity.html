@@ -7,19 +7,19 @@
   <div class="panel-head">Event chain</div>
   <div class="panel-body">
     <p>{% if event_count is none %}<span class="dim">Event count unavailable (the ledger could not be read).</span>{% else %}{{ event_count }} events in the ledger.{% endif %} Each event carries a SHA-256 hash chained to its predecessor.</p>
-    <form method="post" action="/integrity/verify" style="margin-top:1rem;">
+    <form method="post" action="/integrity/verify" class="mt-1">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button type="submit" class="btn">Verify chain</button>
     </form>
     {% if busy %}
-    <p class="dim" style="margin-top:1rem;">A verification is already running. Its result appears on the page that started it; try again when it finishes.</p>
+    <p class="dim mt-1">A verification is already running. Its result appears on the page that started it; try again when it finishes.</p>
     {% endif %}
     {% if verified %}
-    <div style="margin-top:1rem;padding:0.8rem;border:1px solid {% if intact %}var(--good){% else %}var(--alert){% endif %};border-radius:4px;">
+    <div class="verdict{% if intact %} verdict--good{% endif %}">
       {% if intact %}
-      <span style="color:var(--good-text);">{{ status }}</span>
+      <span class="text-good">{{ status }}</span>
       {% else %}
-      <span style="color:var(--alert-text);">{{ status }}</span>
+      <span class="text-alert">{{ status }}</span>
       {% endif %}
     </div>
     {% endif %}

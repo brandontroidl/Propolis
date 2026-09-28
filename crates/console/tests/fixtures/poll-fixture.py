@@ -7,11 +7,11 @@ panel goes on presenting a reading it took minutes ago as the current one. Repro
 real XHR in a real browser against a real hung socket. `templates.rs`'s
 `a_polled_panel_bounds_its_request_and_ages_itself_without_waiting_for_an_event` checks that the
 guarding code still SHIPS in the page; this checks that it still WORKS. Run it by hand whenever the
-live-panel script in `base_tail.html`, the poll markup in `fleet.html`, or the vendored
+live-panel script (`src/assets/live-panels.js`), the poll markup in `fleet.html`, or the vendored
 `htmx.min.js` changes.
 
 WHAT IT SERVES. One page, built from this repo's own unmodified `htmx.min.js` and the live-panel
-IIFE lifted verbatim out of `base_tail.html` - nothing about the behaviour under test is restated
+script `src/assets/live-panels.js`, both read as files - nothing about the behaviour under test is restated
 here, so the fixture cannot drift into passing against code the console does not ship. The page
 polls `/fleet/status`, which is held open (headers sent, body never finished) until
 `recover-after-seconds`, and answers normally after that. The page reports its own observable state
@@ -78,15 +78,13 @@ parser.add_argument(
 parser.add_argument("--launch-chrome", action="store_true", help="start headless Chrome against the fixture")
 args = parser.parse_args()
 
-TEMPLATES = args.repo_root / "crates/console/src/templates"
-if not (TEMPLATES / "base_tail.html").is_file():
-    sys.exit(f"no console templates under {TEMPLATES} - pass --repo-root")
+ASSETS = args.repo_root / "crates/console/src/assets"
+if not (ASSETS / "live-panels.js").is_file():
+    sys.exit(f"no console assets under {ASSETS} - pass --repo-root")
 
-# The behaviour under test, taken from the shipped page rather than restated here.
-tail = (TEMPLATES / "base_tail.html").read_text()
-start = tail.index("// A polled panel")
-LIVE_SCRIPT = tail[start : tail.index("</script>", start)]
-HTMX = (TEMPLATES / "htmx.min.js").read_text()
+# The behaviour under test, taken from the files the console serves rather than restated here.
+LIVE_SCRIPT = (ASSETS / "live-panels.js").read_text()
+HTMX = (ASSETS / "htmx.min.js").read_text()
 
 STARTED = time.monotonic()
 

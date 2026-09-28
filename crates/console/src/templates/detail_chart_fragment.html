@@ -6,7 +6,7 @@
 </div>
 <script type="application/json" id="ip-timeline-labels">{{ ip_timeline_labels|safe }}</script>
 <script type="application/json" id="ip-timeline-data">{{ ip_timeline_data|safe }}</script>
-{# See dashboard_chart_fragment.html: rendering is driven by propolisInitCharts in base_tail.html. #}
+{# See dashboard_chart_fragment.html: rendering is driven by propolisInitCharts in assets/charts.js. #}
 {% if is_fragment %}
 <div class="range-selector" id="chart-range" hx-swap-oob="true">
   {% for r in ["24h", "7d", "30d"] %}

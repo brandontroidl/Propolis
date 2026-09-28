@@ -39,7 +39,7 @@ same router.
   `require_session` middleware via `.route_layer(...)` so every route in it is
   session-gated.
 
-There are **30 routes: 7 public, 23 session-gated**. See
+There are **34 routes: 8 public, 26 session-gated**. See
 [reference/console-routes.md](../reference/console-routes.md) for the table.
 
 ## No in-process TLS
@@ -94,13 +94,15 @@ headers on **every** response, public and protected alike:
 
 - `X-Frame-Options: DENY`
 - `X-Content-Type-Options: nosniff`
+- a Content-Security-Policy allowing script, style, fonts and requests from this origin
+  only and nothing inline (exact text in
+  [console routes](../reference/console-routes.md#content-security-policy)), unless the route
+  set a stricter one: `GET /samples/download/{sha256}` keeps `default-src 'none'`.
 
-**There is no global Content-Security-Policy.** The only route that emits a CSP is
-`GET /samples/download/{sha256}`, which serves the raw malware sample as an
-`application/octet-stream` attachment under `Content-Security-Policy: default-src
-'none'` plus its own `nosniff`. XSS defense for the HTML pages is therefore
-minijinja auto-escaping (below) plus `nosniff`/`DENY` and the hardened download
-path - **not a CSP**.
+No template carries inline script, inline style or an event handler; every script and
+stylesheet is a static file under `src/assets/`, served by `routes::assets`. XSS defense for
+the HTML pages is minijinja auto-escaping (below); the policy stops an escaping mistake from
+becoming script execution.
 
 ## Templates and fragments
 

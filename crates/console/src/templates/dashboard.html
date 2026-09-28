@@ -30,7 +30,7 @@
     <span class="label">Last event</span>
     {# Fleet-wide by construction: one busy sensor masks every silent one. The link goes to the
        per-listener breakdown, which is where "check sensors" can actually be acted on. #}
-    <div class="v {% if pipeline_fresh %}v--ok{% else %}v--call{% endif %}" style="font-size:1.25rem"><a href="/fleet">{{ last_event_ago }}</a></div>
+    <div class="v {% if pipeline_fresh %}v--ok{% else %}v--call{% endif %} value-lg"><a href="/fleet">{{ last_event_ago }}</a></div>
     <div class="foot">{% if pipeline_fresh %}intake live &middot; <a href="/fleet">per listener</a>{% else %}<a href="/fleet">check sensors</a>{% endif %}</div>
   </div>
 </div>
@@ -42,17 +42,17 @@
   {% if most_active %}
   <table class="table-compact">
     <thead><tr>
-      <th style="width:150px">Address</th>
-      <th style="width:190px">Activity &middot; 24h</th>
-      <th class="count" style="width:70px">Events</th>
+      <th class="w-150">Address</th>
+      <th class="w-190">Activity &middot; 24h</th>
+      <th class="count w-70">Events</th>
       <th>What it did</th>
-      <th style="width:90px">Last seen</th>
+      <th class="w-90">Last seen</th>
     </tr></thead>
     <tbody>
       {% for r in most_active %}
       <tr>
         <td class="ip">{{ m.ip_evidence_link(r.ip) }}</td>
-        <td><span class="strip">{% for c in r.strip %}<i style="height:{{ c.height }}px"{% if c.class %} class="{{ c.class }}"{% endif %}></i>{% endfor %}</span></td>
+        <td><span class="strip">{% for c in r.strip %}<i class="h-{{ c.height }}{% if c.class %} {{ c.class }}{% endif %}"></i>{% endfor %}</span></td>
         <td class="count">{{ r.event_count }}</td>
         <td><span class="sev-tags">{% for t in r.tags %}<span class="sev sev--{{ t.sev }}">{{ t.label }}</span>{% endfor %}</span></td>
         <td class="seen dim">{{ r.last_seen }}</td>
@@ -99,43 +99,7 @@
 {% if protocol_dist %}
 <script type="application/json" id="proto-labels">{{ proto_labels|safe }}</script>
 <script type="application/json" id="proto-data">{{ proto_data|safe }}</script>
-<script>
-// The protocol bar chart is not a line chart, so it lives outside propolisInitCharts. It reads the
-// active theme's --chart-line at build time and re-renders on the theme-change event the switcher
-// dispatches, so it recolours with everything else.
-(function () {
-  function renderProto() {
-    if (typeof Chart === 'undefined') return;
-    var el = document.getElementById('protoChart'); if (!el) return;
-    var color = getComputedStyle(document.documentElement).getPropertyValue('--chart-line').trim() || '#e0a43f';
-    var ex = Chart.getChart(el); if (ex) ex.destroy();
-    new Chart(el, {
-      type: 'bar',
-      data: {
-        labels: JSON.parse(document.getElementById('proto-labels').textContent),
-        datasets: [{
-          data: JSON.parse(document.getElementById('proto-data').textContent),
-          backgroundColor: color,
-          borderRadius: 4,
-          maxBarThickness: 20,
-        }],
-      },
-      options: {
-        indexAxis: 'y',
-        responsive: true,
-        maintainAspectRatio: false,
-        scales: {
-          x: { beginAtZero: true, ticks: { precision: 0 } },
-          y: { grid: { display: false }, ticks: { autoSkip: false } },
-        },
-        plugins: { tooltip: { displayColors: false } },
-      },
-    });
-  }
-  document.addEventListener('DOMContentLoaded', renderProto);
-  document.addEventListener('propolis:themechange', renderProto);
-})();
-</script>
+<script src="/assets/dashboard.js"></script>
 {% endif %}
 
 <div class="panel">

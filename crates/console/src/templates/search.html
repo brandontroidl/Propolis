@@ -57,7 +57,7 @@
         <tr>
           <td class="ip">{{ m.ip_evidence_link(r.ip) }}</td>
           <td class="count">{{ r.match_count }}</td>
-          <td class="mono"><span class="meter"><span class="meter-fill{% if r.score_pct >= 90 %} meter-fill--crit{% elif r.score_pct >= 75 %} meter-fill--high{% elif r.score_pct >= 50 %} meter-fill--warn{% endif %}" style="--pct: {{ r.score_pct }}%"></span></span>{{ r.score }}</td>
+          <td class="mono"><span class="meter"><span class="meter-fill{% if r.score_pct >= 90 %} meter-fill--crit{% elif r.score_pct >= 75 %} meter-fill--high{% elif r.score_pct >= 50 %} meter-fill--warn{% endif %} pct-{{ r.score_pct }}"></span></span>{{ r.score }}</td>
           <td>
             {% if r.tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>
             {% elif r.tier == "standard" %}<span class="tier tier-standard">Standard</span>

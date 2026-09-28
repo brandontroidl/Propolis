@@ -103,9 +103,11 @@ Chart.js and htmx are likewise vendored and self-hosted. If styling breaks:
 - **A reverse proxy stripping or misrouting `/assets/fonts/*`** - that route is
   public (so the pre-auth login page can load fonts). Ensure the proxy passes it
   through un-rewritten. An unknown font name returns 404 by design (allowlist).
-- **No global Content-Security-Policy** - the console sets only `X-Frame-Options:
-  DENY` and `X-Content-Type-Options: nosniff` globally; the only route emitting a
-  CSP is `/samples/download`. So a broken page is not a CSP blocking assets - look at the proxy or the network path instead.
+- **Content-Security-Policy blocks** - every page carries a policy that allows scripts and
+  stylesheets from the console's own origin only. If a page renders unstyled or without
+  charts, check that the proxy passes `/assets/*` through un-rewritten (the browser console
+  names any blocked resource), and that it does not inject its own inline scripts or styles,
+  which the policy refuses.
 
 ## Pages show empty states
 

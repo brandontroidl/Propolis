@@ -71,7 +71,7 @@ reserved IP ranges (with IPv6 canonicalization first). See
 
 ## Console (HTTP)
 
-Axum + minijinja server-rendered HTML. **30 routes: 7 public, 23 session-gated**
+Axum + minijinja server-rendered HTML. **34 routes: 8 public, 26 session-gated**
 (canonical table: [../reference/console-routes.md](../reference/console-routes.md)).
 Default bind is loopback-only (`127.0.0.1:8080`); the operator opts into a wider bind.
 
@@ -86,11 +86,11 @@ Controls:
   cookie, per-session CSRF on mutating routes, login rate limiting. See
   [authn-authz.md](authn-authz.md).
 - **Security headers on every response:** `X-Frame-Options: DENY` and
-  `X-Content-Type-Options: nosniff`. There is **no global Content-Security-Policy**; the
-  only route that sets a CSP is `/samples/download/{sha256}`
-  (`default-src 'none'`, served `application/octet-stream` as an attachment). XSS defense
-  is minijinja auto-escaping (`.html` templates) plus `nosniff`/`DENY` plus that hardened
-  download path, not a CSP.
+  `X-Content-Type-Options: nosniff`, and a Content-Security-Policy allowing script, style,
+  fonts and requests from this origin only, with nothing inline (no template carries inline
+  script, style or handlers). `/samples/download/{sha256}` keeps a stricter
+  `default-src 'none'` (served `application/octet-stream` as an attachment). XSS defense
+  is minijinja auto-escaping (`.html` templates); the policy is the second line.
 - **Path/traversal-safe route params.** Font names match a fixed four-name allowlist;
   sample downloads validate a 64-hex SHA-256; feed downloads validate the tier as a shape
   check that admits no `.`/`/`/`\`. See [../reference/console-routes.md](../reference/console-routes.md).

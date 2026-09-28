@@ -6,7 +6,7 @@
 </div>
 <script type="application/json" id="timeline-labels">{{ timeline_labels|safe }}</script>
 <script type="application/json" id="timeline-data">{{ timeline_data|safe }}</script>
-{# Rendering is driven by propolisInitCharts in base_tail.html, on DOMContentLoaded for the
+{# Rendering is driven by propolisInitCharts in assets/charts.js, on DOMContentLoaded for the
    full-page render and on htmx:afterSwap for this fragment. Nothing here executes on its own. #}
 {% if is_fragment %}
 {# The range selector lives in the panel HEAD, outside this fragment's swap target, so a plain

@@ -5,7 +5,7 @@
 {# The whole reading refreshes as one unit: a page that shows a fresh listener table beside a stale
    headline would be worse than one that refreshes nothing.
 
-   `data-live` opts this container into the stale-poll handling in base_tail.html. Without it, a
+   `data-live` opts this container into the stale-poll handling in assets/live-panels.js. Without it, a
    refresh that starts failing leaves this reading on screen indefinitely with server-computed ages
    that never move - the page would go on saying "probed 20 seconds ago" an hour after the last
    answer it got. #}

@@ -69,10 +69,11 @@ The inbound and outbound surfaces:
 - **Malware fetcher** (opt-in, default off): the SSRF vetter - scheme allowlist, userinfo
   rejection, DNS-rebinding defense, pinned-address connect, forbidden-target/reserved-IP
   checks with IPv6 canonicalization first - run on the initial URL and every redirect hop.
-- **Console (HTTP)** (30 routes: 7 public, 23 session-gated; loopback bind by default):
+- **Console (HTTP)** (34 routes: 8 public, 26 session-gated; loopback bind by default):
   Argon2id auth, HMAC session cookie, per-session CSRF on the mutating routes, login rate
-  limiting, `X-Frame-Options: DENY` + `nosniff` on every response. There is **no global
-  CSP**; the only route that sets one is `/samples/download/{sha256}`. See
+  limiting, `X-Frame-Options: DENY` + `nosniff` on every response. Every response
+  carries a Content-Security-Policy with no inline script or style allowed (the sample
+  download keeps a stricter `default-src 'none'`). See
   [authn/authz](../security/authn-authz.md) and [console routes](../reference/console-routes.md).
 - **Database**: parameterized SQL only - no query text built with string formatting in
   non-test source. See [input handling](../security/input-handling.md).

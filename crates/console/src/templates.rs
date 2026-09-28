@@ -6,33 +6,19 @@
 //! interpolated with `{{ }}` is HTML-escaped unless a template explicitly opts out with the `|safe`
 //! filter (which nothing here does).
 //!
-//! `base.html`'s source is assembled at COMPILE TIME from five pieces: `base_head.html`, the
-//! vendored `chart.min.js`, `chart_defaults.html`, the vendored `htmx.min.js`, and `base_tail.html`,
-//! joined via `concat!(include_str!(..), ..)`, so neither the ~200KB minified Chart.js distribution
-//! nor the ~50KB minified HTMX distribution ever has to be hand-transcribed into an HTML file or
-//! spliced in at runtime; `concat!` accepts `include_str!` results because they expand to string
-//! literals before `concat!` sees them. `htmx.min.js` is the unmodified, upstream `htmx.org@2.0.10`
-//! distribution (cross-checked byte-for-byte against two independent CDNs mirroring the same
-//! published npm package: unpkg and jsdelivr), no CDN dependency at runtime, per the task's global
-//! constraint. `chart.min.js` is the unmodified, upstream `chart.js@4.5.1` UMD distribution (same
-//! byte-for-byte cross-check against unpkg and jsdelivr) and sets `window.Chart` on load.
-//!
-//! `base_head.html` ends mid-tag, with `<body>` followed by an unclosed `<script>` - this opens the
-//! Chart.js script tag; `chart_defaults.html` closes it, adds a second self-contained `<script>`
-//! block applying the console's dark theme to `Chart.defaults`, then opens a third, unclosed
-//! `<script>` tag for HTMX; `base_tail.html` closes that one and continues the page. Chart.js loads
-//! before HTMX only because that ordering lets `base_head.html`'s existing trailing `<script>` be
-//! reused as-is; the two libraries are independent (each only attaches its own global) and every
-//! inline `<script>` in `base_tail.html` and the child page templates runs later still, inside
-//! `<main>`, so load order between them is not otherwise significant.
+//! `base.html` is `base_head.html` followed by `base_tail.html`. No page carries inline script,
+//! inline style or an event-handler attribute: the Content-Security-Policy (`routes::mod`) allows
+//! scripts and styles only from this origin, so every one is a static file under `src/assets/`,
+//! served by `routes::assets` and referenced with `<script src>` / `<link rel="stylesheet">` in
+//! the order the page needs them (see `base_head.html`). `htmx.min.js` is the unmodified,
+//! upstream `htmx.org@2.0.10` distribution and `chart.min.js` the unmodified `chart.js@4.5.1` UMD
+//! distribution (each cross-checked byte-for-byte against unpkg and jsdelivr); neither is fetched
+//! from a CDN at runtime.
 
 use minijinja::Environment;
 
 const BASE_HTML: &str = concat!(
     include_str!("templates/base_head.html"),
-    include_str!("templates/chart.min.js"),
-    include_str!("templates/chart_defaults.html"),
-    include_str!("templates/htmx.min.js"),
     include_str!("templates/base_tail.html"),
 );
 const DASHBOARD_HTML: &str = include_str!("templates/dashboard.html");
@@ -142,6 +128,94 @@ const SAMPLES_HTML: &str = include_str!("templates/samples.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The live-panel script every page loads (see `base_tail.html`).
+    const LIVE_PANELS_JS: &str = include_str!("assets/live-panels.js");
+
+    /// Every `.html` file in the templates directory, read from disk rather than from the constants
+    /// above, so a template added without being listed here is still checked.
+    fn template_sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/templates");
+        let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "html"))
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read_to_string(&path).unwrap())
+            })
+            .collect();
+        out.sort();
+        assert!(
+            out.len() >= 20,
+            "found only {} templates in {dir:?}",
+            out.len()
+        );
+        out
+    }
+
+    /// The Content-Security-Policy forbids inline script, inline style and event-handler
+    /// attributes; a template that reintroduces any of them breaks silently in the browser (the
+    /// policy blocks it, nothing errors server-side). This keeps them out at the source.
+    #[test]
+    fn no_template_carries_inline_script_style_or_handlers() {
+        for (name, src) in template_sources() {
+            // A backslash before an attribute quote is kept literally in HTML, so the attribute
+            // value silently includes it: class=\"w-90\" names no class at all.
+            assert!(
+                !src.contains("=\\\""),
+                "{name}: backslash-escaped attribute quote"
+            );
+            assert!(!src.contains("<style"), "{name}: inline <style> block");
+            assert!(!src.contains(" style="), "{name}: inline style attribute");
+            assert!(
+                !src.to_ascii_lowercase().contains("javascript:"),
+                "{name}: javascript: URL"
+            );
+            for (at, _) in src.match_indices("<script") {
+                let tag = &src[at..src[at..].find('>').map_or(src.len(), |end| at + end)];
+                assert!(
+                    tag.contains(" src=\"/assets/") || tag.contains("type=\"application/json\""),
+                    "{name}: inline executable script `{tag}>`"
+                );
+            }
+            let bytes = src.as_bytes();
+            for (at, _) in src.match_indices(" on") {
+                let rest = &bytes[at + 3..];
+                let letters = rest.iter().take_while(|b| b.is_ascii_lowercase()).count();
+                assert!(
+                    letters == 0 || rest.get(letters) != Some(&b'='),
+                    "{name}: event-handler attribute near `{}`",
+                    &src[at..(at + 20).min(src.len())]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_referenced_asset_is_served() {
+        for (name, src) in template_sources() {
+            for (at, _) in src.match_indices("\"/assets/") {
+                let path = &src[at + 1..];
+                let path = &path[..path.find('"').unwrap()];
+                if path.starts_with("/assets/fonts/") {
+                    continue;
+                }
+                let file = path.trim_start_matches("/assets/");
+                assert!(
+                    crate::routes::assets::is_static_asset(file),
+                    "{name} references {path}, which routes::assets does not serve"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_rate_over_100_still_names_an_existing_meter_class() {
+        let env = environment();
+        assert_eq!(env.render_str("{{ [130, 100]|min }}", ()).unwrap(), "100");
+        assert_eq!(env.render_str("{{ [42, 100]|min }}", ()).unwrap(), "42");
+    }
 
     #[test]
     fn every_template_registers_and_extends_cleanly() {
@@ -264,6 +338,44 @@ mod tests {
             !listed.contains("/ip/203.0.113.7/relist"),
             "an address that is not delisted has nothing to relist: {listed}"
         );
+    }
+
+    /// A certificate error is attacker-influenced text (names from the attacker's certificate); it
+    /// reaches the page only as an escaped attribute, never as markup.
+    #[test]
+    fn a_fetched_sample_names_its_transport_and_escapes_the_certificate_error() {
+        let html = environment()
+            .get_template("samples.html")
+            .unwrap()
+            .render(minijinja::context! {
+                active_nav => "samples", pending_count => 0, uptime => "1m", version => "0.0.0",
+                degraded => Vec::<&str>::new(), total => 2, status_counts => Vec::<()>::new(),
+                fetch_attempts_total => 0,
+                samples => vec![
+                    minijinja::context! {
+                        sha256 => "a".repeat(64), sha256_short => "aaaaaaaaaaaa", size => "1 B",
+                        sensor => "fetched", source_ips => Vec::<&str>::new(), more_source_ips => 0,
+                        transport => vec![
+                            minijinja::context! { label => "TLS unverified", sev => "watch",
+                                detail => "invalid peer certificate: \"><script>x()</script>" },
+                            minijinja::context! { label => "plaintext", sev => "low", detail => () },
+                        ],
+                    },
+                    minijinja::context! {
+                        sha256 => "b".repeat(64), sha256_short => "bbbbbbbbbbbb", size => "1 B",
+                        sensor => "ssh", source_ips => Vec::<&str>::new(), more_source_ips => 0,
+                        transport => Vec::<()>::new(),
+                    },
+                ],
+            })
+            .unwrap();
+        assert!(html.contains(r#"<span class="sev sev--watch" title="invalid peer certificate: &quot;&gt;&lt;script&gt;x()&lt;&#x2f;script&gt;">TLS unverified</span>"#), "{html}");
+        assert!(html.contains(r#"<span class="sev sev--low">plaintext</span>"#));
+        assert!(
+            html.contains("not fetched"),
+            "a sensor upload has no fetch transport"
+        );
+        assert!(!html.contains("<script>x()"));
     }
 
     /// The remaining `detail.html` fields, so the two tests above can vary only `delisted`.
@@ -453,7 +565,7 @@ mod tests {
 
     /// The fleet page polls; a poll that starts failing leaves the last render on screen with
     /// server-computed ages that never move again. `data-live` is what opts the container into
-    /// `base_tail.html`'s stale handling, so losing the attribute silently restores that bug.
+    /// the stale handling in `assets/live-panels.js`, so losing the attribute silently restores that bug.
     #[test]
     fn the_polled_fleet_container_is_marked_live_and_the_page_handles_a_failed_poll() {
         let env = environment();
@@ -471,16 +583,20 @@ mod tests {
             html.contains(r#"id="fleet-status""#) && html.contains(r#"data-live="fleet reading""#),
             "the polled container must carry data-live so a failed refresh is announced"
         );
-        // The handler that acts on it ships in the same document (base.html's tail).
+        // The handler that acts on it ships with every page: base.html loads live-panels.js.
+        assert!(
+            html.contains(r#"<script src="/assets/live-panels.js"></script>"#),
+            "the page must load the live-panel script"
+        );
         for event in ["htmx:responseError", "htmx:sendError", "htmx:timeout"] {
             assert!(
-                html.contains(event),
-                "the page must handle {event} on a polled panel"
+                LIVE_PANELS_JS.contains(event),
+                "the live-panel script must handle {event} on a polled panel"
             );
         }
         assert!(
-            html.contains("has stopped "),
-            "the stale banner's wording must be present in the page"
+            LIVE_PANELS_JS.contains("has stopped "),
+            "the stale banner's wording must be present in the script"
         );
     }
 
@@ -538,19 +654,19 @@ mod tests {
             .unwrap();
 
         assert!(
-            html.contains(r#"'{"timeout": ' + REQUEST_TIMEOUT_MS + '}'"#),
+            LIVE_PANELS_JS.contains(r#"'{"timeout": ' + REQUEST_TIMEOUT_MS + '}'"#),
             "every polled panel must get a bounded request timeout; htmx's own default is 0              (no limit), which is what let a hung poll go unnoticed"
         );
         assert!(
-            html.contains("var REQUEST_TIMEOUT_MS = 15000;"),
+            LIVE_PANELS_JS.contains("var REQUEST_TIMEOUT_MS = 15000;"),
             "the request timeout must be a real bound, not left unset"
         );
         assert!(
-            html.contains("setInterval(") && html.contains("staleAfterMs(el)"),
+            LIVE_PANELS_JS.contains("setInterval(") && LIVE_PANELS_JS.contains("staleAfterMs(el)"),
             "the page must age a live panel on a timer, independently of any request completing"
         );
         assert!(
-            html.contains("no refresh has come back"),
+            LIVE_PANELS_JS.contains("no refresh has come back"),
             "the watchdog must be able to raise the stale banner on its own"
         );
         // The bound has to be shorter than the poll interval it guards, or a hung request is

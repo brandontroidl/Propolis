@@ -222,9 +222,10 @@ path.
 
 **Console** ([console](../architecture/console.md)). Server-rendered axum +
 minijinja + HTMX + self-hosted Chart.js. It serves **plain HTTP on a loopback
-`TcpListener` - there is no in-process TLS**. It exposes **30 routes (7 public,
-23 session-gated)**, sets `X-Frame-Options: DENY` and `nosniff` globally, and sets
-**no global CSP** (only `/samples/download` sets `default-src 'none'`).
+`TcpListener` - there is no in-process TLS**. It exposes **34 routes (8 public,
+26 session-gated)**, sets `X-Frame-Options: DENY`, `nosniff` and a Content-Security-Policy
+with no inline script or style globally (`/samples/download` keeps a stricter
+`default-src 'none'`).
 
 **Concurrency and failure** ([concurrency and failure](../architecture/concurrency-and-failure.md)).
 Bounded by construction: per-connection tasks with a hard concurrency cap that
@@ -770,7 +771,7 @@ consult each for the authoritative table:
 | [database](../reference/database.md) | tables, columns, enums, migrations, the hash-chain canonical encoding |
 | [events-and-signals](../reference/events-and-signals.md) | signal types, event fields, weights |
 | [sensor-behavior](../reference/sensor-behavior.md) | per-protocol capture behavior (banners, verbs, caps) |
-| [console-routes](../reference/console-routes.md) | the 30 routes (7 public, 23 session-gated) and per-route auth/CSRF |
+| [console-routes](../reference/console-routes.md) | the 34 routes (8 public, 26 session-gated) and per-route auth/CSRF |
 | [scoring-and-feed](../reference/scoring-and-feed.md) | scoring constants, thresholds, tiers, TTLs, retention windows |
 | [integrations](../reference/integrations.md) | VirusTotal, vendor submitters, ntfy, GeoLite2 wire contracts |
 | [rate-limits-and-budgets](../reference/rate-limits-and-budgets.md) | fetcher/vendor/VT budgets and spool byte limits |
@@ -779,7 +780,7 @@ consult each for the authoritative table:
 | [glossary](../reference/glossary.md) | terminology |
 
 **Quick facts to anchor the numbers** (each owned by a page above): 18 crates /
-15 binaries; 9 sensor crates / 12 protocols; 30 console routes (7 public, 23
+15 binaries; 9 sensor crates / 12 protocols; 34 console routes (8 public, 26
 session-gated); scoring half-life 6h; tiers Aggressive (score ≥ 90, confidence ≥
 0.95) and Standard (≥ 75, ≥ 0.70); tier TTLs 24h/48h; retention windows
 `24h,7d,30d,60d,90d`; feed build interval 900s; spool budgets 100 MB per spooling

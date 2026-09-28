@@ -159,16 +159,19 @@ I/O (`:9-29`). This is asserted by `never_exec_static_check` and
 `workspace_lockfile_has_no_http_client_crate` in
 `crates/sensor-ssh/tests/shell_test.rs`.
 
-- One `honeypot_command_exec` is emitted per non-blank input line; a blank line
-  produces no event or output (`:110-178`). The raw line is recorded verbatim in
-  `metadata.command`, sanitized and capped at `MAX_COMMAND_LEN = 1024` (`:46, 121`).
+- One `honeypot_command_exec` is emitted per non-blank input line, except that a
+  binary line or a line past the per-session cap of 256 commands
+  (`MAX_COMMANDS_PER_SESSION`, `:78`) yields at most one marker event per session
+  per flood kind; a blank line produces no event or output (`:180-262`). The raw
+  line is recorded verbatim in
+  `metadata.command`, sanitized and capped at `MAX_COMMAND_LEN = 1024` (`:46, 225`).
 - If the line is single-byte-XOR obfuscated, `command_decoded` and `xor_key` are
-  added to metadata (`:126-134`).
+  added to metadata (`:227-235`).
 - A recognized fetch verb additionally emits `honeypot_file_download` with
-  `metadata.url`, capped at `MAX_URL_LEN = 512` (`:50, 157-174`).
-- Implemented commands (`dispatch`, `:183-229`): `uname` (real per-flag field
+  `metadata.url`, capped at `MAX_URL_LEN = 512` (`:50, 237-256`).
+- Implemented commands (`dispatch`, `:341-462`): `uname` (real per-flag field
   selection), `id`/`whoami`/`pwd`, `echo` (Gafgyt/BASHLITE `\xHH`-decoding
-  handshake returning `GAYFGT`, `:647-776`), `cat` (fakefs plus a special
+  handshake returning `GAYFGT`, `:1561-1690`), `cat` (fakefs plus a special
   `/proc/self/cmdline` returning argv), `ls` (sorted, dotfiles hidden without `-a`),
   `cp`/`rm`/`mkdir` (they change the session's filesystem and report the real errors),
   `wget`/`curl` (canned transcripts, `-O-`/`-qO-` writes body to stdout, a saved
@@ -182,7 +185,7 @@ I/O (`:9-29`). This is asserted by `never_exec_static_check` and
   takes a url token),
   `chmod`/`cp`/`rm`/`mkdir`/`sleep` (silent success), `cd`, `exit`/`logout`; any
   other command gives `<cmd>: command not found`.
-- BusyBox applet set is a single source of truth (`BUSYBOX_APPLETS`, `:366-369`)
+- BusyBox applet set is a single source of truth (`BUSYBOX_APPLETS`, `:1085-1088`)
   and deliberately excludes `curl` (real busybox ships none), so `busybox curl`
   gives `applet not found` - matching the real-busybox check Mirai/Gafgyt perform.
 - Download capture handles direct, busybox, full-path, and
@@ -223,9 +226,9 @@ with 0640 permissions and re-hash-on-read fail-closed integrity
 - `store(body)` rejects `FileSizeExceeded` when `size > max_file_size`, dedups on
   an existing hash (no extra budget), reserves budget atomically via
   `compare_exchange`, and rejects `BudgetExhausted` past `global_budget`
-  (`:134-196, 232-253`). Files are written with `create_new` + 0640 (`:271-280`).
+  (`:134-196, 232-253`). Files are written with `create_new` + 0640 (`:171-175, 351-364`).
 - `new()` recovers used bytes by scanning the directory at startup so a restart
-  does not reset the ceiling (`:108-122, 288-298`).
+  does not reset the ceiling (`:108-122, 366-382`).
 - **Only SSH, FTP, and ADB spool bodies.** All three use `max_file_size` =
   10_000_000 (10&nbsp;MB) and `global_budget` = 100_000_000 (100&nbsp;MB). Redis,
   Telnet, HTTP, SMTP, cred, and catchall never write a body to a spool (confirmed
@@ -238,13 +241,14 @@ never delays the reply - response latency must not leak whether a capture happen
 (`crates/sensor-framework/src/handoff.rs:1-9`). `submit(job)` is backed by
 `mpsc::try_send` and never blocks: a full queue drops the job, returns
 `CaptureDropped`, increments `dropped_count`, and logs at power-of-two totals
-(`:109-148`). Every spooling sensor sets `capture_queue_size` = **64**
-(`:104-119`). Exactly one worker drains the queue strictly sequentially
+(`:225-241`). Every spooling sensor sets `capture_queue_size` = **64**
+(`crates/sensor-ssh/src/server.rs:126`, `crates/sensor-ftp/src/lib.rs:15`,
+`crates/sensor-adb/src/lib.rs:29`). Exactly one worker drains the queue strictly sequentially
 (`start_worker` panics on a second call), so `spool.store` is never called
-concurrently (`:159-188`). `orig_name` is sanitized and capped at
-`MAX_ORIG_NAME_LEN = 255` (`:59, 202`); a spool refusal is counted in
-`spool_refused_count` with no event emitted (`:207-216`); a panicking event builder
-is isolated with `catch_unwind` and the worker continues (`:35-41, 200-225`).
+concurrently (`:272-298`). `orig_name` is sanitized and capped at
+`MAX_ORIG_NAME_LEN = 255` (`:60, 325`); a spool refusal is counted in
+`spool_refused_count` with no event emitted (`:255-257, 332-340`); a panicking event builder
+is isolated with `catch_unwind` and the worker continues (`:35-41, 323-347`).
 
 ### Event emission
 
@@ -290,10 +294,10 @@ captures SCP/SFTP transfers.
   (`:1-19`). SCP receive mode parses the `C<mode> <size> <name>` header and streams
   the body to `honeypot_malware_upload`. SFTP v3 subset supports INIT/VERSION,
   OPEN (write-mode only), WRITE, CLOSE→capture; every other verb returns
-  `SSH_FX_OP_UNSUPPORTED` (`:209-480`). Caps: `MAX_CAPTURE_BODY` 10_000_000,
+  `SSH_FX_OP_UNSUPPORTED` (`:238-484`). Caps: `MAX_CAPTURE_BODY` 10_000_000,
   `SFTP_MAX_FILE_BODY` 10_000_000, `SFTP_MAX_OPEN_HANDLES` 64,
   `SFTP_MAX_SESSION_BYTES` 20_000_000, `SFTP_MAX_PACKET_SIZE` 262_144
-  (`:38, 230, 236-244`). A body past its cap is kept as a prefix and emitted with
+  (`:38, 259, 265-266, 273`). A body past its cap is kept as a prefix and emitted with
   `truncated: true` plus the real `wire_size`. A transfer still open when the session
   ends (SCP before its trailer, SFTP handles never CLOSEd) is kept as a capture with
   `complete: false` rather than dropped.
@@ -331,10 +335,10 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
 
 - **Behavior** (`handler.rs`): `SERVER_BANNER = "nginx/1.18.0 (Ubuntu)"`. Serves
   `/` (nginx default welcome page) and `/robots.txt`; GET/HEAD only, other methods
-  give an nginx 405 and unknown paths an nginx 404 (`:177-211`). Static 200s carry
+  give an nginx 405 and unknown paths an nginx 404 (`:212-246`). Static 200s carry
   Last-Modified/ETag/Accept-Ranges and a regenerated `Date` header. Captures
   method, path, query, user-agent, host, and a body preview into one
-  `honeypot_command_exec` (authenticated=false, `:107-157`). Caps: request line
+  `honeypot_command_exec` (authenticated=false, `:120-178`). Caps: request line
   8192, header block 16384, body capture 65536 (`:16-19`). A declared body is read to
   its end before the reply (the first 65536 bytes kept, the rest drained); the event
   records `body_size` (bytes received), `body_declared`, `body_complete` and
@@ -352,7 +356,7 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
 Impersonates **vsFTPd 3.0.5** (conventional port 21).
 
 - **Behavior** (`handler.rs`): banner `220 (vsFTPd 3.0.5)`. Verbs
-  (case-insensitive, `:99-323`): USER→331, PASS→login event + 230 (password
+  (case-insensitive, `:202-418`): USER→331, PASS→login event + 230 (password
   dropped), SYST→`215 UNIX Type: L8`, FEAT, PWD/CWD, TYPE (validated), SIZE/MDTM
   (canned `readme.txt`, 4096 bytes), REST, PASV/EPSV (opens a passive data listener
   on the control interface), LIST/NLST (canned listing), STOR (captures upload →
@@ -363,7 +367,7 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
   fails part way → `426 Failure reading network stream.` with the fragment still
   captured and `complete: false` in the event; a STOR the sensor stops reading at the
   drain cap → `451 Failure writing to local file.`.
-- **Passive-data hijack defense** (`data_peer_matches`, `:41-49, 220, 247-253`): a
+- **Passive-data hijack defense** (`data_peer_matches`, `:51-53, 322-339, 371-376`): a
   passive data connection whose source IP differs from the control connection's is
   refused with `425 Security: bad IP connecting.`, preventing off-path attribution
   poisoning (historical fix, commits `94a62ae1`, `016721e1`).
@@ -383,12 +387,12 @@ Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
 - **Behavior** (`handler.rs`): parses RESP (inline and multi-bulk); arguments are kept
   as raw bytes, so a binary key or value round-trips byte for byte and only the ledger copy
   is decoded as text. **Never authenticates or persists across connections.** Commands
-  (`:305-327`): PING (echoes arg), AUTH
+  (`:331-353`): PING (echoes arg), AUTH
   (always OK → `honeypot_login_attempt`, password never in metadata), INFO
   (live-ish 7.2.4 dump with per-process random `run_id`/`master_replid`, real pid,
-  advancing uptime, persona OS line, `:107-230`), CONFIG GET (canned), CONFIG SET
+  advancing uptime, persona OS line, `:113-240`), CONFIG GET (canned), CONFIG SET
   (always OK; only `dir`/`dbfilename` - the RDB-RCE staging primitive - emit a
-  `honeypot_command_exec` indicator, `:376-400`), SET (OK; key and value captured,
+  `honeypot_command_exec` indicator, `:402-426`), SET (OK; key and value captured,
   and kept whole in a per-session store of at most 256 keys and 1 MB; a write past either
   limit is refused with Redis's OOM error rather than acknowledged and dropped), GET (the
   value SET earlier this session, else nil; no event), SLAVEOF/REPLICAOF (OK +
@@ -406,7 +410,7 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
 - **Behavior** (`handler.rs`): banner `220 <host> ESMTP Postfix (Ubuntu)` (persona
   host). EHLO advertises PIPELINING, SIZE 10240000, ETRN, STARTTLS, AUTH PLAIN
   LOGIN, ENHANCEDSTATUSCODES, 8BITMIME, DSN, SMTPUTF8, CHUNKING (`:57-69`). Verbs
-  (`:81-177`): HELO/EHLO, STARTTLS (`454 TLS not available` - no in-process TLS),
+  (`:91-238`): HELO/EHLO, STARTTLS (`454 TLS not available` - no in-process TLS),
   AUTH PLAIN (decodes username, drops password → `honeypot_login_attempt`), AUTH
   LOGIN (username captured, password dropped), MAIL FROM / RCPT TO, DATA (captures
   mail_from/rcpt_to/subject/body_size → `honeypot_command_exec`, replies with a
@@ -434,9 +438,9 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
   auth-disabled adbd on port 5555 (the ADB.Miner target) (`:25-32`).
   `device_banner()` presents a fake Nexus 5 / hammerhead / Android 6.0.1 / sdk 23
   and deliberately omits `shell_v2` so real clients fall back to plain v1 shell
-  framing (`:169-173`). `MAX_MESSAGE_DATA_LEN` 1_000_000, `OUR_MAXDATA` 4096.
+  framing (`:169-180`). `MAX_MESSAGE_DATA_LEN` 1_000_000, `OUR_MAXDATA` 4096.
 - **Behavior** (`handler.rs`): CNXN handshake → device banner, then multiplexed
-  streams (`MAX_STREAMS_PER_CONN = 32`). OPEN destinations (`:498-573`): `shell:` →
+  streams (`MAX_STREAMS_PER_CONN = 32`). OPEN destinations (`:671-803`): `shell:` →
   interactive FakeShell **in its Android flavor** (the device's filesystem, a
   `root@hammerhead:<cwd> #` prompt that follows `cd`, Android's `uname`, and mksh's
   `sh: x: not found` rather than bash's `command not found`; authenticated **always
@@ -503,8 +507,8 @@ per-protocol bind var is required.
   listener, per datagram for catchall UDP; carried on every event.
 - **Password discipline:** every login-capturing sensor reads the password only to
   advance the protocol and drops it - never stored, logged, or placed in any event
-  field (SSH `auth.rs:11-16`, telnet `handler.rs:119-125`, FTP `:104-111`, redis
-  `handler.rs:360-374`, SMTP `:101-131`, cred handlers). Tests assert absence at
+  field (SSH `auth.rs:11-16`, telnet `handler.rs:119-125`, FTP `:207-213`, redis
+  `handler.rs:360-374`, SMTP `:105-135`, cred handlers). Tests assert absence at
   the serialized-JSON level.
 - **`authenticated` flag:** `honeypot_connection` and `catchall_probe` are always
   false; ADB events are always false (no auth step); `honeypot_login_attempt` is

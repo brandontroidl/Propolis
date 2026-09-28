@@ -169,10 +169,10 @@ Default base URLs (`crates/review/src/vendor/*.rs`):
 | `PROPOLIS_FEED_BUILD_INTERVAL_SECS` | no | `900` (`config.rs:22`) | positive u64; zero → abort |
 | `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` | no | `24` (`config.rs:23`) | positive u64; ×3600 → Duration; zero → abort |
 | `PROPOLIS_FEED_STANDARD_TTL_HOURS` | no | `48` (`config.rs:24`) | positive u64; zero → abort |
-| `PROPOLIS_FEED_ALLOWLIST` | no | `""` | comma-sep CIDR list (`parse_cidr_list:264`); **bare IP without prefix is rejected**; invalid entry → abort |
-| `PROPOLIS_FEED_DELIST` | no | `""` | comma-sep IP list (`parse_ip_list:332`); invalid → abort |
-| `PROPOLIS_FEED_ASN_ALLOWLIST` | no | `""` | comma-sep AS numbers, optional `AS`/`as` prefix (`parse_asn_list:280`); invalid → abort. Inert unless the GeoIP ASN DB loads (see [interactions](#interactions)). |
-| `PROPOLIS_FEED_WINDOWS` | no | `24h,7d,30d,60d,90d` (`config.rs:29`) | comma-sep `<count>h`/`<count>d` (`parse_window_list:308`). Only `h`/`d` units; count must be a positive int; **any malformed entry → abort** (fails closed, not skipped). Empty string → no retention feeds. **Unified daemon only.** |
+| `PROPOLIS_FEED_ALLOWLIST` | no | `""` | comma-sep CIDR list (`parse_cidr_list:352`); **bare IP without prefix is rejected**; invalid entry → abort |
+| `PROPOLIS_FEED_DELIST` | no | `""` | comma-sep IP list (`parse_ip_list:420`); invalid → abort |
+| `PROPOLIS_FEED_ASN_ALLOWLIST` | no | `""` | comma-sep AS numbers, optional `AS`/`as` prefix (`parse_asn_list:368`); invalid → abort. Inert unless the GeoIP ASN DB loads (see [interactions](#interactions)). |
+| `PROPOLIS_FEED_WINDOWS` | no | `24h,7d,30d,60d,90d` (`config.rs:29`) | comma-sep `<count>h`/`<count>d` (`parse_window_list:396`). Only `h`/`d` units; count must be a positive int; **any malformed entry → abort** (fails closed, not skipped). Empty string → no retention feeds. **Unified daemon only.** |
 
 ### Console
 
@@ -551,10 +551,10 @@ Sensor-specific extras:
   `persona.rs:41`; blank → default), `PROPOLIS_SSH_OUTBOX_DIR` (default
   `/var/spool/propolis/ssh/outbox`; see "Outbox manifest" below).
 - **ftp** (`crates/sensor-ftp/src/main.rs`): `PROPOLIS_FTP_SPOOL_DIR` (default
-  `/var/spool/propolis/ftp`, `:21`), `PROPOLIS_FTP_OUTBOX_DIR` (default
+  `/var/spool/propolis/ftp`, `:31`), `PROPOLIS_FTP_OUTBOX_DIR` (default
   `/var/spool/propolis/ftp/outbox`; see "Outbox manifest" below).
 - **adb** (`crates/sensor-adb/src/main.rs`): `PROPOLIS_ADB_SPOOL_DIR` (default
-  `/var/spool/propolis/adb`, `:32`), `PROPOLIS_ADB_OUTBOX_DIR` (default
+  `/var/spool/propolis/adb`, `:42`), `PROPOLIS_ADB_OUTBOX_DIR` (default
   `/var/spool/propolis/adb/outbox`; see "Outbox manifest" below).
 - **telnet** (`crates/sensor-telnet/src/main.rs`): `PROPOLIS_TELNET_SPOOL_DIR`
   (default `/var/spool/propolis/telnet`), `PROPOLIS_TELNET_OUTBOX_DIR` (default

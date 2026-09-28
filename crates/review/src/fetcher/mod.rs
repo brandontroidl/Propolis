@@ -5,7 +5,6 @@ pub mod store;
 pub mod tftp;
 pub mod vbe;
 
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::panic::AssertUnwindSafe;
@@ -47,9 +46,10 @@ impl FetchStatus {
 
 /// Everything one `run_cycle` needs: the DB pool the `store` module reads/writes, the quarantine
 /// spool captured bytes are written to, the SSRF-guard `own_ips` set and resolver every fetch is
-/// vetted against, the shared byte/time limits, and the three tunables that bound the fetcher's
+/// vetted against, the shared byte/time limits, and the tunables that bound the fetcher's
 /// blast radius - redirect hops per fetch, recursion depth into extracted dropper-script URLs,
-/// and fetches per host per hour.
+/// fetches per host per hour, and fetches per UTC day. The last two are enforced in the
+/// database (`store::claim_candidates`), so they hold across every node sharing it.
 pub struct FetchDeps {
     pub pool: PgPool,
     pub spool: sensor_framework::QuarantineSpool,
@@ -59,6 +59,7 @@ pub struct FetchDeps {
     pub max_hops: u8,
     pub max_depth: u8,
     pub per_host_hour: u32,
+    pub daily_cap: u32,
 }
 
 /// Outcome counters for one `run_cycle` call - purely observational (logging/metrics), never
@@ -73,12 +74,13 @@ pub struct CycleStats {
     pub empty: usize,
     pub dead: usize,
     pub skipped_bucket: usize,
+    pub skipped_daily: usize,
     pub enqueued_children: usize,
     pub errors: usize,
 }
 
 /// Failed attempts (`rejected`/`too_big`/`timeout`/`empty`) at which a row is marked terminal
-/// (`dead`) and excluded from `select_candidates` forever after, regardless of `next_attempt`.
+/// (`dead`) and excluded from `claim_candidates` forever after, regardless of `next_attempt`.
 const MAX_ATTEMPTS: i32 = 3;
 
 /// Fetches in flight at once within a single `run_cycle` call. Not part of `FetchDeps`: it
@@ -228,61 +230,72 @@ pub async fn run_cycle(deps: &FetchDeps, batch: usize) -> CycleStats {
     run_cycle_with(deps, batch, &RealFetcher).await
 }
 
-/// Select up to `batch` candidates and process them with bounded concurrency: gate each on its
-/// host's per-cycle budget, dispatch through `fetcher`, then record the outcome (spool + upsert
-/// on success, backoff-or-terminal upsert on failure) and, on a successful capture still under
-/// `max_depth`, enqueue any URLs `extract::extract_urls` finds in the body as depth+1 pending
-/// rows. Every candidate's processing is isolated behind `catch_unwind`, so one panicking or
-/// erroring URL never aborts the rest of the batch.
+/// Allowance for the non-network work one candidate does after its fetch returns: the spool
+/// write and the outcome/children writes to the database.
+const PER_CANDIDATE_OVERHEAD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Extra lease beyond the computed worst case, for scheduling jitter and clock skew between the
+/// database and this process.
+const LEASE_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a claim must hold so no other node can take a row while this cycle may still be
+/// processing it. Worst case per candidate is every redirect hop (`max_hops + 1` of them) spending
+/// its full DNS timeout and full total timeout, plus the local overhead; candidates run
+/// `CONCURRENCY` at a time, so the last of `batch` starts after `ceil(batch / CONCURRENCY) - 1`
+/// full waves.
+fn claim_lease(limits: &FetchLimits, max_hops: u8, batch: usize) -> std::time::Duration {
+    let per_hop = limits.dns_timeout + limits.total_timeout;
+    let per_candidate = per_hop * (u32::from(max_hops) + 1) + PER_CANDIDATE_OVERHEAD;
+    let waves = batch.div_ceil(CONCURRENCY).max(1) as u32;
+    per_candidate * waves + LEASE_MARGIN
+}
+
+/// Claim up to `batch` candidates within the shared per-host and daily budgets (see
+/// `store::claim_candidates`) and process them with bounded concurrency: dispatch through
+/// `fetcher`, then record the outcome (spool + upsert on success, backoff-or-terminal upsert on
+/// failure) and, on a successful capture still under `max_depth`, enqueue any URLs
+/// `extract::extract_urls` finds in the body as depth+1 pending rows. Every candidate's processing
+/// is isolated behind `catch_unwind`, so one panicking or erroring URL never aborts the rest of
+/// the batch; a candidate that panics before its outcome is recorded keeps its claim until the
+/// lease lapses and is then retried.
 async fn run_cycle_with<F: Fetcher>(deps: &FetchDeps, batch: usize, fetcher: &F) -> CycleStats {
     let stats = Mutex::new(CycleStats::default());
 
-    let candidates = match store::select_candidates(&deps.pool, batch as i64).await {
+    let limits = store::ClaimLimits {
+        batch: batch as i64,
+        per_host_hour: i64::from(deps.per_host_hour),
+        daily_cap: i64::from(deps.daily_cap),
+        lease: claim_lease(&deps.limits, deps.max_hops, batch),
+    };
+    let claim = match store::claim_candidates(&deps.pool, limits).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, "fetcher: select_candidates failed");
+            tracing::error!(error = %e, "fetcher: claim_candidates failed, fetching nothing this cycle");
             stats.lock().unwrap().errors += 1;
             return stats.into_inner().unwrap();
         }
     };
-    stats.lock().unwrap().selected = candidates.len();
+    {
+        let mut s = stats.lock().unwrap();
+        s.selected = claim.candidates.len() + claim.skipped_bucket + claim.skipped_daily;
+        s.skipped_bucket = claim.skipped_bucket;
+        s.skipped_daily = claim.skipped_daily;
+    }
+    let candidates = claim.candidates;
     if candidates.is_empty() {
         return stats.into_inner().unwrap();
     }
-
-    // Seed each distinct host's remaining budget for this cycle from one real last-hour count,
-    // rather than re-checking per URL: this is what makes the per-host cap exact under bounded
-    // concurrency (N tasks racing a fresh `host_count_last_hour` read of a not-yet-committed
-    // count could all observe "under budget" and all proceed). A DB error on the check fails
-    // closed - treat the host as already at capacity, never as unlimited.
-    let mut hosts: Vec<&str> = candidates.iter().map(|c| c.host.as_str()).collect();
-    hosts.sort_unstable();
-    hosts.dedup();
-    let mut budgets = HashMap::new();
-    for host in hosts {
-        let used = match store::host_count_last_hour(&deps.pool, host).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(host, error = %e, "fetcher: host_count_last_hour failed, treating host as at capacity");
-                deps.per_host_hour as i64
-            }
-        };
-        let remaining = (deps.per_host_hour as i64 - used).max(0);
-        budgets.insert(host.to_string(), remaining);
-    }
-    let budgets = Mutex::new(budgets);
 
     let semaphore = Semaphore::new(CONCURRENCY);
 
     let tasks = candidates.iter().map(|candidate| {
         let sem = &semaphore;
-        let budgets = &budgets;
         let stats = &stats;
         async move {
             let Ok(_permit) = sem.acquire().await else {
                 return;
             };
-            let outcome = AssertUnwindSafe(process_one(deps, fetcher, candidate, budgets, stats))
+            let outcome = AssertUnwindSafe(process_one(deps, fetcher, candidate, stats))
                 .catch_unwind()
                 .await;
             if outcome.is_err() {
@@ -300,19 +313,8 @@ async fn process_one<F: Fetcher>(
     deps: &FetchDeps,
     fetcher: &F,
     candidate: &store::Candidate,
-    budgets: &Mutex<HashMap<String, i64>>,
     stats: &Mutex<CycleStats>,
 ) {
-    {
-        let mut b = budgets.lock().unwrap();
-        let remaining = b.entry(candidate.host.clone()).or_insert(0);
-        if *remaining <= 0 {
-            stats.lock().unwrap().skipped_bucket += 1;
-            return;
-        }
-        *remaining -= 1;
-    }
-
     match fetcher.fetch(deps, candidate).await {
         RawOutcome::Captured {
             bytes,
@@ -467,7 +469,7 @@ async fn record_failure(
 ///
 /// Shares the persistent `propolis_test` database with other crates' tests (see
 /// `queue_test.rs`/`gatekeeper_test.rs`'s module docs for the same convention). Because
-/// `select_candidates` is deliberately GLOBAL - it selects across the whole `fetch_attempt`
+/// `claim_candidates` is deliberately GLOBAL - it selects across the whole `fetch_attempt`
 /// table, not scoped to any one test - these tests MUST run serially:
 /// `cargo test -p review --lib fetcher::orchestration_tests -- --test-threads=1`. Run in
 /// parallel, one test's `reset_all` wipe (or its `run_cycle_with` call, which can select rows
@@ -505,18 +507,20 @@ mod orchestration_tests {
 
     /// Wipes every row this whole test suite could have left behind, from THIS run or a prior
     /// one - not just the calling test's own host. `propolis_test` is a persistent shared
-    /// database (matches `queue_test.rs`'s `reset_ip` convention), and `select_candidates` is
+    /// database (matches `queue_test.rs`'s `reset_ip` convention), and `claim_candidates` is
     /// deliberately GLOBAL (it has to be, to serve the whole table each cycle) - so a row any
     /// other test in this file leaves non-terminal (still `pending`, or backed off with an
-    /// elapsed `next_attempt`) is visible to every later `select_candidates` call in the same
+    /// elapsed `next_attempt`) is visible to every later `claim_candidates` call in the same
     /// process, not just its own test. Two concrete leaks this closes: the per-host-bucket test
     /// intentionally leaves 40 of its 50 rows `pending` (only `per_host_hour` get attempted),
     /// and the panic-isolation test's "boom" row never reaches an upsert at all (the panic fires
     /// before `record_failure`/`record_success` runs), so it too stays `pending` forever. Both
-    /// are exactly the kind of row a later test's own `select_candidates` batch would otherwise
+    /// are exactly the kind of row a later test's own `claim_candidates` batch would otherwise
     /// scoop up ahead of its own freshly-seeded one (`ORDER BY first_seen` sorts the older,
-    /// leaked-in row first). Called at the start of every test so each is self-contained
-    /// regardless of run order or which tests ran before it.
+    /// leaked-in row first). The shared daily-usage counter is cleared too, so one test's
+    /// charges never leave the next with less daily budget than it set up. Called at the start
+    /// of every test so each is self-contained regardless of run order or which tests ran
+    /// before it.
     async fn reset_all(pool: &PgPool) {
         sqlx::query("DELETE FROM fetch_attempt WHERE host LIKE 'fetch8%.example'")
             .execute(pool)
@@ -526,6 +530,27 @@ mod orchestration_tests {
             .execute(pool)
             .await
             .unwrap();
+        sqlx::query("DELETE FROM fetch_daily_usage")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// The rows a claim would hand out, with a zero lease so they stay claimable afterwards -
+    /// for tests that check selection (sync, ordering, eligibility) rather than coordination.
+    async fn claim_unleased(pool: &PgPool, batch: i64) -> Vec<store::Candidate> {
+        store::claim_candidates(
+            pool,
+            store::ClaimLimits {
+                batch,
+                per_host_hour: i64::MAX,
+                daily_cap: i64::MAX,
+                lease: std::time::Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap()
+        .candidates
     }
 
     fn download_event(ip: &str, sensor: &str, url: &str, ts: &str) -> EventInput {
@@ -574,6 +599,7 @@ mod orchestration_tests {
             max_hops: 3,
             max_depth: 2,
             per_host_hour,
+            daily_cap: 1_000_000,
         }
     }
 
@@ -700,7 +726,7 @@ mod orchestration_tests {
         .await
         .unwrap();
 
-        let candidates = store::select_candidates(&pool, 100).await.unwrap();
+        let candidates = claim_unleased(&pool, 100).await;
         let candidate = candidates
             .iter()
             .find(|c| c.url == url)
@@ -759,7 +785,7 @@ mod orchestration_tests {
         .await
         .unwrap();
 
-        let candidates = store::select_candidates(&pool, 100).await.unwrap();
+        let candidates = claim_unleased(&pool, 100).await;
         assert!(
             !candidates.iter().any(|c| c.url == ftp_url),
             "an unsupported scheme must never be selected"
@@ -1297,7 +1323,7 @@ mod orchestration_tests {
         assert_eq!(attempts, 3);
         assert_eq!(reason.as_deref(), Some("boom"));
 
-        let next = store::select_candidates(&pool, 100).await.unwrap();
+        let next = claim_unleased(&pool, 100).await;
         assert!(
             !next.iter().any(|c| c.url == dead_url),
             "a dead row must never be reselected"
@@ -1550,7 +1576,7 @@ mod orchestration_tests {
             .unwrap();
         }
 
-        let candidates = store::select_candidates(&pool, 3).await.unwrap();
+        let candidates = claim_unleased(&pool, 3).await;
         let urls: Vec<String> = candidates.into_iter().map(|c| c.url).collect();
         assert_eq!(
             urls,
@@ -1565,5 +1591,281 @@ mod orchestration_tests {
 
     fn to_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    // --- cross-node coordination (audit P-02) ---
+    //
+    // Each "node" below is its own `PgPool`, so the two sides share nothing but the database -
+    // the same position two review processes on two hosts are in.
+
+    async fn seed_pending(pool: &PgPool, host: &str, n: usize) -> Vec<String> {
+        let mut urls = Vec::new();
+        for i in 0..n {
+            let url = format!("http://{host}/n{i}");
+            let (scheme, parsed_host, port) = store::parse_url_parts(&url).unwrap();
+            store::insert_pending_if_absent(
+                pool,
+                &store::NewPendingRow {
+                    url_hash: store::url_hash(&url),
+                    url: url.clone(),
+                    host: parsed_host,
+                    scheme,
+                    port,
+                    source_ip: None,
+                    parent_hash: None,
+                    depth: 0,
+                },
+            )
+            .await
+            .unwrap();
+            urls.push(url);
+        }
+        urls
+    }
+
+    fn leased(batch: i64, per_host_hour: i64, daily_cap: i64) -> store::ClaimLimits {
+        store::ClaimLimits {
+            batch,
+            per_host_hour,
+            daily_cap,
+            lease: std::time::Duration::from_secs(600),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_nodes_racing_one_backlog_claim_disjoint_rows() {
+        let node_a = test_pool().await;
+        let node_b = test_pool().await;
+        reset_all(&node_a).await;
+        let mut seeded = seed_pending(&node_a, "fetch8p.example", 10).await;
+        seeded.extend(seed_pending(&node_a, "fetch8q.example", 10).await);
+
+        let (a, b) = tokio::join!(
+            store::claim_candidates(&node_a, leased(12, 100, 1_000)),
+            store::claim_candidates(&node_b, leased(12, 100, 1_000)),
+        );
+        let a: HashSet<String> = a.unwrap().candidates.into_iter().map(|c| c.url).collect();
+        let b: HashSet<String> = b.unwrap().candidates.into_iter().map(|c| c.url).collect();
+
+        assert!(
+            a.is_disjoint(&b),
+            "a row claimed by one node must never be handed to the other: {:?}",
+            a.intersection(&b).collect::<Vec<_>>()
+        );
+        let union: HashSet<String> = a.union(&b).cloned().collect();
+        assert_eq!(union, seeded.into_iter().collect::<HashSet<_>>());
+    }
+
+    #[tokio::test]
+    async fn the_per_host_hourly_cap_holds_across_nodes() {
+        let node_a = test_pool().await;
+        let node_b = test_pool().await;
+        reset_all(&node_a).await;
+        seed_pending(&node_a, "fetch8r.example", 10).await;
+
+        let (a, b) = tokio::join!(
+            store::claim_candidates(&node_a, leased(10, 4, 1_000)),
+            store::claim_candidates(&node_b, leased(10, 4, 1_000)),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(
+            a.candidates.len() + b.candidates.len(),
+            4,
+            "two nodes must share one per-host budget, not get one each"
+        );
+
+        // The four in flight still count: a third claim while they are claimed gets nothing.
+        let c = store::claim_candidates(&node_a, leased(10, 4, 1_000))
+            .await
+            .unwrap();
+        assert!(c.candidates.is_empty());
+        assert_eq!(c.skipped_bucket, 6);
+    }
+
+    #[tokio::test]
+    async fn the_daily_cap_holds_across_nodes_and_charges_only_claimed_rows() {
+        let node_a = test_pool().await;
+        let node_b = test_pool().await;
+        reset_all(&node_a).await;
+        seed_pending(&node_a, "fetch8s.example", 3).await;
+        seed_pending(&node_a, "fetch8t.example", 3).await;
+        seed_pending(&node_a, "fetch8u.example", 3).await;
+
+        let (a, b) = tokio::join!(
+            store::claim_candidates(&node_a, leased(9, 100, 5)),
+            store::claim_candidates(&node_b, leased(9, 100, 5)),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a.candidates.len() + b.candidates.len(), 5);
+        // Whichever claims first takes 5 of 9 and skips 4; the other then sees only those same 4
+        // unclaimed rows and skips all of them.
+        assert_eq!(a.skipped_daily + b.skipped_daily, 8);
+
+        let used: i32 = sqlx::query_scalar(
+            "SELECT used FROM fetch_daily_usage WHERE day = (now() AT TIME ZONE 'UTC')::date",
+        )
+        .fetch_one(&node_a)
+        .await
+        .unwrap();
+        assert_eq!(used, 5, "the daily cap is charged exactly what was claimed");
+    }
+
+    #[tokio::test]
+    async fn an_idle_claim_costs_the_daily_budget_nothing() {
+        let pool = test_pool().await;
+        reset_all(&pool).await;
+        for _ in 0..50 {
+            let claim = store::claim_candidates(&pool, leased(20, 100, 10))
+                .await
+                .unwrap();
+            assert!(claim.candidates.is_empty());
+        }
+        seed_pending(&pool, "fetch8v.example", 10).await;
+        let claim = store::claim_candidates(&pool, leased(20, 100, 10))
+            .await
+            .unwrap();
+        assert_eq!(
+            claim.candidates.len(),
+            10,
+            "fifty idle claims must leave the whole daily budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_daily_cap_resets_on_a_new_utc_day() {
+        let pool = test_pool().await;
+        reset_all(&pool).await;
+        sqlx::query(
+            "INSERT INTO fetch_daily_usage (day, used) \
+             VALUES ((now() AT TIME ZONE 'UTC')::date - 1, 1000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_pending(&pool, "fetch8w.example", 3).await;
+
+        let claim = store::claim_candidates(&pool, leased(3, 100, 5))
+            .await
+            .unwrap();
+        assert_eq!(
+            claim.candidates.len(),
+            3,
+            "yesterday's usage must not count today"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_hides_its_rows_until_recorded_or_the_lease_lapses() {
+        let pool = test_pool().await;
+        reset_all(&pool).await;
+        let urls = seed_pending(&pool, "fetch8x.example", 1).await;
+
+        let first = store::claim_candidates(&pool, leased(5, 100, 100))
+            .await
+            .unwrap();
+        assert_eq!(first.candidates.len(), 1);
+        let second = store::claim_candidates(&pool, leased(5, 100, 100))
+            .await
+            .unwrap();
+        assert!(
+            second.candidates.is_empty(),
+            "a live claim must hide the row"
+        );
+
+        // A node that died mid-fetch never records an outcome; its lease lapsing returns the row.
+        sqlx::query(
+            "UPDATE fetch_attempt SET claim_expires = now() - interval '1 second' WHERE url = $1",
+        )
+        .bind(&urls[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+        let third = store::claim_candidates(&pool, leased(5, 100, 100))
+            .await
+            .unwrap();
+        assert_eq!(third.candidates.len(), 1);
+    }
+
+    /// Counts every URL it is asked to fetch, and always times out, so rows stay retryable.
+    struct CountingFetcher {
+        calls: Mutex<HashMap<String, usize>>,
+    }
+
+    impl Fetcher for CountingFetcher {
+        async fn fetch(&self, _deps: &FetchDeps, candidate: &store::Candidate) -> RawOutcome {
+            *self
+                .calls
+                .lock()
+                .unwrap()
+                .entry(candidate.url.clone())
+                .or_default() += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            RawOutcome::Failed {
+                status: FetchStatus::Timeout,
+                reason: None,
+            }
+        }
+    }
+
+    /// The side effect itself: two concurrent cycles on two nodes fetch each URL once, and the
+    /// recorded outcome releases the claim.
+    #[tokio::test]
+    async fn concurrent_cycles_on_two_nodes_fetch_each_url_exactly_once() {
+        let node_a = test_pool().await;
+        let node_b = test_pool().await;
+        reset_all(&node_a).await;
+        seed_pending(&node_a, "fetch8y.example", 8).await;
+        seed_pending(&node_a, "fetch8k.example", 8).await;
+
+        let spool_a = TempDir::new().unwrap();
+        let spool_b = TempDir::new().unwrap();
+        let deps_a = test_deps(node_a.clone(), &spool_a, 100);
+        let deps_b = test_deps(node_b.clone(), &spool_b, 100);
+        let fetcher = CountingFetcher {
+            calls: Mutex::new(HashMap::new()),
+        };
+
+        let (sa, sb) = tokio::join!(
+            run_cycle_with(&deps_a, 16, &fetcher),
+            run_cycle_with(&deps_b, 16, &fetcher),
+        );
+        assert_eq!(sa.timeout + sb.timeout, 16);
+
+        let calls = fetcher.calls.into_inner().unwrap();
+        assert_eq!(calls.len(), 16, "every seeded url fetched");
+        assert!(
+            calls.values().all(|&n| n == 1),
+            "no url may be fetched by both nodes: {calls:?}"
+        );
+
+        let still_claimed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fetch_attempt \
+             WHERE host IN ('fetch8y.example', 'fetch8k.example') AND claim_expires IS NOT NULL",
+        )
+        .fetch_one(&node_a)
+        .await
+        .unwrap();
+        assert_eq!(still_claimed, 0, "a recorded outcome releases its claim");
+    }
+
+    #[test]
+    fn the_claim_lease_covers_every_hop_of_every_wave_of_the_batch() {
+        let limits = FetchLimits {
+            max_bytes: 1,
+            connect_timeout: std::time::Duration::from_secs(10),
+            read_timeout: std::time::Duration::from_secs(30),
+            total_timeout: std::time::Duration::from_secs(60),
+            user_agent: String::new(),
+            dns_timeout: std::time::Duration::from_secs(5),
+        };
+        // batch 20 at CONCURRENCY 8 is 3 waves; each candidate is up to 4 hops of (5 + 60) s
+        // plus 30 s of local work.
+        let lease = claim_lease(&limits, 3, 20);
+        assert_eq!(
+            lease,
+            std::time::Duration::from_secs(3 * (4 * 65 + 30) + 60)
+        );
+        assert!(claim_lease(&limits, 3, 1) >= std::time::Duration::from_secs(4 * 65 + 30));
+        assert!(claim_lease(&limits, 3, 0) > std::time::Duration::ZERO);
     }
 }

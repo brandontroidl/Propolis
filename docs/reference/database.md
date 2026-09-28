@@ -14,12 +14,15 @@ and the append-only ledger's hash chain. Signal semantics and the signal weight
 table live in [events-and-signals.md](events-and-signals.md); scoring thresholds,
 tiers, and eligibility live in [scoring-and-feed.md](scoring-and-feed.md).
 
-Two crates own schema through two independent migration sets:
+Three crates own schema through three independent migration sets:
 
-- **core-scoring** (`crates/core-scoring/migrations/*.sql`, 11 migrations) owns
-  `event`, `ip_score`, `sample_analysis`, and all five enum types.
-- **review** (`crates/review/migrations/*.sql`, 3 migrations) owns `review_queue`,
-  `vendor_submission`, `fetch_attempt`.
+- **core-scoring** (`crates/core-scoring/migrations/*.sql`) owns `event`, `ip_score`,
+  `sample_analysis`, and all five enum types.
+- **review** (`crates/review/migrations/*.sql`) owns `review_queue`,
+  `vendor_submission`, `fetch_attempt`, `fetch_daily_usage`.
+- **fleet** (`crates/fleet/migrations/*.sql`) owns `listener_probe`.
+
+The change maps at the end of this page list every migration in each set.
 
 review depends on `review_state_enum`, which is created by core-scoring migration
 `0001` (a deliberate cross-crate schema dependency; the enum is defined in `0001` so
@@ -303,8 +306,17 @@ payload URLs.
 | `next_attempt` | TIMESTAMPTZ | backoff schedule |
 | `first_seen` | TIMESTAMPTZ | NOT NULL DEFAULT `now()` |
 | `last_attempt` | TIMESTAMPTZ | NOT NULL |
+| `claim_expires` | TIMESTAMPTZ | NULL = unclaimed; set when a fetch cycle claims the row, cleared when its outcome is recorded (`0006`) |
 
-Indexes: `(host, last_attempt)`, `(status, next_attempt)`.
+Indexes: `(host, last_attempt)`, `(status, next_attempt)`, `(first_seen DESC)` (`0005`),
+and a partial `(host, claim_expires) WHERE claim_expires IS NOT NULL` (`0006`).
+
+### `fetch_daily_usage` (`0006_fetch_coordination.sql`)
+
+One row per UTC day: `day DATE` PRIMARY KEY, `used INTEGER NOT NULL DEFAULT 0 CHECK
+(used >= 0)`. The fetcher's daily cap is charged here when rows are claimed, shared by
+every node on the database. See
+[rate limits and budgets](rate-limits-and-budgets.md#per-cycle-and-per-host).
 
 `status` is a free TEXT column, **not** an enum or CHECK. The documented value set -
 `pending`, `success`, `dead`, `rejected`, `too_big`, `timeout`, `empty` - lives only
@@ -327,6 +339,7 @@ in a SQL comment (`0003:11`); the actual values written are set by review-crate 
 | `0009` | `sample_analysis` table |
 | `0010` | `ip_score.active_days INTEGER DEFAULT 1` + `last_active_day DATE`; backfills day counts |
 | `0011` | `ip_score.established_event_count INTEGER DEFAULT 0`; backfills TCP-only counts |
+| `0012` | `signal_type_enum` value `honeypot_session_end` (unscored interaction telemetry) |
 
 **review** (`crates/review/migrations/`):
 
@@ -335,5 +348,14 @@ in a SQL comment (`0003:11`); the actual values written are set by review-crate 
 | `0001` | `review_queue` (uses core-scoring's `review_state_enum`) |
 | `0002` | `vendor_submission` + index |
 | `0003` | `fetch_attempt` + 2 indexes |
+| `0004` | data backfill of `fetch_attempt.source_ip` (NULL before the `host()` read fix) |
+| `0005` | `fetch_attempt (first_seen DESC)` index for newest-first selection |
+| `0006` | `fetch_attempt.claim_expires` + partial index; `fetch_daily_usage` table |
+
+**fleet** (`crates/fleet/migrations/`, tracked in `_sqlx_migrations_fleet`):
+
+| migration | adds |
+|---|---|
+| `0001` | `listener_probe` + `(sensor, attempted_at DESC)` index |
 
 Migration workflow and conventions: [../development/schema-and-migrations.md](../development/schema-and-migrations.md).

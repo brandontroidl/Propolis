@@ -43,11 +43,22 @@ production surface.
 
 Multiple nodes can share one PostgreSQL database: scoring aggregates in the
 shared DB, and review/feed are designed to be idempotent so more than one node
-can run them against the same data (`INSTALL.md:364-376`). [inferred] - this is
-an `INSTALL.md` claim; no cluster-coordination code was read to confirm the
-idempotency guarantee, and the single-node model is the one exercised in
-practice. Treat cluster deployment as an advanced, less-travelled path and
-validate review/feed idempotency in your own environment before relying on it.
+can run them against the same data (`INSTALL.md:364-376`).
+
+What is enforced in code and tested with two independent connection pools:
+
+- **Malware fetcher.** Each cycle claims its rows in one transaction, so no two
+  nodes fetch the same URL, and the per-host hourly and daily caps are shared
+  budgets in the database rather than one budget per node. See
+  [rate limits and budgets](../reference/rate-limits-and-budgets.md#per-cycle-and-per-host).
+- **Vendor submissions.** A unique `{ip}:{vendor}:{date}` idempotency key is
+  claimed in the database before the external call, so concurrent nodes do not
+  submit the same IP to the same vendor twice in a day.
+
+Feed publication across nodes remains [inferred] from the `INSTALL.md` claim; no
+cross-node test covers it. The single-node model is the one exercised in
+practice, so treat cluster deployment as an advanced, less-travelled path and
+validate feed behaviour in your own environment before relying on it.
 
 ## Hardware and OS assumptions
 

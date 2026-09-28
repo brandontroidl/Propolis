@@ -335,9 +335,11 @@ Full section: [deployment models](../operations/deployment-models.md),
 
 **Models.** Linux + systemd. The primary, documented model is **single-node**: one
 host runs the unified `propolis` daemon plus the nine sensor services. A
-multi-node cluster sharing one PostgreSQL database is possible but `[inferred]`
-from `INSTALL.md` (review/feed designed idempotent); treat it as an advanced,
-less-travelled path and validate idempotency yourself. Requirements: systemd
+multi-node cluster sharing one PostgreSQL database is possible: the malware
+fetcher's claims and budgets and vendor-submission idempotency are enforced in the
+database, while feed publication across nodes is still `[inferred]` from
+`INSTALL.md`; treat it as an advanced, less-travelled path and validate the feed
+yourself. Requirements: systemd
 ≥ 244, PostgreSQL 15+ (an operator requirement, not code-enforced), and the pinned
 Rust `1.96.1` on the build host only.
 

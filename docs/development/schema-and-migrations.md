@@ -15,13 +15,17 @@ migration → change map are owned by [`reference/database`](../reference/databa
 
 ## Two migration histories, one database
 
-Migration SQL lives in **two crates**, applied against **one** physical database:
+Migration SQL lives in **three crates**, applied against **one** physical database:
 
-- `crates/core-scoring/migrations/` - 11 files, `0001_enums.sql` …
-  `0011_established_event_count.sql`. Owns `event`, `ip_score`, `sample_analysis`,
-  and all five enum types.
-- `crates/review/migrations/` - 3 files: `0001_review_queue.sql`,
-  `0002_vendor_submission.sql`, `0003_fetch_attempt.sql`.
+- `crates/core-scoring/migrations/` - `0001_enums.sql` … `0012_session_end_signal.sql`.
+  Owns `event`, `ip_score`, `sample_analysis`, and all five enum types.
+- `crates/review/migrations/` - `0001_review_queue.sql` …
+  `0006_fetch_coordination.sql`. Owns `review_queue`, `vendor_submission`,
+  `fetch_attempt` and `fetch_daily_usage`.
+- `crates/fleet/migrations/` - `0001_listener_probe.sql`, tracked in its own
+  `_sqlx_migrations_fleet` table.
+
+List the directories for the current set rather than trusting a count here.
 
 Both histories number from `0001`. sqlx's default `_sqlx_migrations` bookkeeping
 table is keyed by version only (no namespacing), so sharing it would raise

@@ -77,7 +77,7 @@ exact constants by [reference/scoring-and-feed.md](reference/scoring-and-feed.md
 | Feed build → export → atomic publish | [architecture/pipeline.md](architecture/pipeline.md), [reference/scoring-and-feed.md](reference/scoring-and-feed.md), [operations/queue-and-spool.md](operations/queue-and-spool.md) | documented | Retention-window membership; 10 formats; staging + two-rename swap; checksum self-check. |
 | Feed → public repo sync (cron) | [operations/deployment-models.md](operations/deployment-models.md), [reference/commands.md](reference/commands.md) | partial | `deploy/blocklist-sync.sh` is an operator setup step (GLOBAL CORRECTION 4); NOT wired into any shipped systemd timer/cron - documented as such. |
 | Vendor submission (AbuseIPDB/DShield/OTX) | [reference/integrations.md](reference/integrations.md), [security/outbound-controls.md](security/outbound-controls.md) | partial | AbuseIPDB/OTX wire contracts verified live; DShield attribution flagged provisional/unverified - documented with caveat. |
-| Cluster / multi-node aggregation | [operations/deployment-models.md](operations/deployment-models.md), [operations/capacity-planning.md](operations/capacity-planning.md) | partial | Shared-DB multi-node is an INSTALL.md claim `[inferred]`; no cluster-coordination code verified - documented as inferred. |
+| Cluster / multi-node aggregation | [operations/deployment-models.md](operations/deployment-models.md), [operations/capacity-planning.md](operations/capacity-planning.md) | partial | Fetcher claims and per-host/daily budgets are coordinated in the database and tested across two connection pools; vendor submission is keyed per ip/vendor/day. Feed publication across nodes remains `[inferred]`. |
 
 ## Security invariants
 

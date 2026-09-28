@@ -1,13 +1,15 @@
 //! `fetch_attempt` data-access layer: the dedup/backoff/recursion ledger `run_cycle` drives.
 //!
-//! `select_candidates` is the single entry point that turns both a `honeypot_file_download`
+//! `claim_candidates` is the single entry point that turns both a `honeypot_file_download`
 //! event and a prior cycle's backoff/recursion state into "what to try this cycle" - it first
-//! syncs any not-yet-seen event URL into a fresh `pending` row (an idempotent claim: `ON
+//! syncs any not-yet-seen event URL into a fresh `pending` row (an idempotent insert: `ON
 //! CONFLICT (url_hash) DO NOTHING`, so a URL reported by many events, or re-synced across
-//! cycles, only ever gets one row), then selects rows that are either never-attempted or
-//! backed off past their `next_attempt`. A `dead` (terminal, 3-attempt-capped) or `success` row
-//! is never selected again - `status` alone gates eligibility, so there is exactly one source of
-//! truth for "should this be tried now."
+//! cycles, only ever gets one row), then claims rows that are either never-attempted or
+//! backed off past their `next_attempt`, within the per-host and daily budgets. A `dead`
+//! (terminal, 3-attempt-capped) or `success` row is never selected again - `status` alone gates
+//! eligibility, so there is exactly one source of truth for "should this be tried now." The
+//! claim, the budgets and the daily charge live in the database, so every node sharing it draws
+//! on the same ones.
 
 use std::net::IpAddr;
 
@@ -168,34 +170,89 @@ async fn sync_new_events(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-/// Sync new event URLs, then select up to `batch` rows eligible to try now: never-attempted
+/// The limits one claim is made under.
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimLimits {
+    /// Most rows this cycle looks at.
+    pub batch: i64,
+    /// Fetches per host per trailing hour, across every node sharing the database.
+    pub per_host_hour: i64,
+    /// Fetches per UTC day, across every node sharing the database.
+    pub daily_cap: i64,
+    /// How long a claim holds before another cycle may take the row. Must outlast the slowest
+    /// cycle that could be processing it, or a second node fetches it too.
+    pub lease: std::time::Duration,
+}
+
+/// What `claim_candidates` handed this cycle.
+#[derive(Debug, Default)]
+pub struct Claim {
+    /// Rows this cycle now owns and must fetch, newest first.
+    pub candidates: Vec<Candidate>,
+    /// Eligible rows left unclaimed because their host had no hourly budget left.
+    pub skipped_bucket: usize,
+    /// Eligible rows left unclaimed because the daily cap was reached.
+    pub skipped_daily: usize,
+}
+
+/// Sync new event URLs, then claim up to `limits.batch` rows eligible to try now: never-attempted
 /// (`pending`), or a retryable failure (`rejected`/`too_big`/`timeout`/`empty`) whose
-/// `next_attempt` has elapsed. `success` and `dead` are excluded by construction - neither
-/// value appears in either branch of the `WHERE`.
+/// `next_attempt` has elapsed, and not currently claimed by another cycle. `success` and `dead`
+/// are excluded by construction - neither value appears in either branch of the `WHERE`.
 ///
 /// Newest-first (`ORDER BY first_seen DESC`), per spec section 9: a payload URL a botnet is
 /// actively staging typically dies within minutes, so under a backlog larger than one cycle's
 /// `batch`, oldest-first would spend the whole batch on urls most likely already gone while a
 /// batch's worth of still-live ones waits behind them.
-pub async fn select_candidates(pool: &PgPool, batch: i64) -> Result<Vec<Candidate>, sqlx::Error> {
+///
+/// Everything that decides what to fetch happens in one transaction, so several nodes sharing
+/// the database behave like one fetcher:
+/// - today's `fetch_daily_usage` row is locked first, which serializes every claim across every
+///   node - each claim then sees the previous one's committed claims and charges;
+/// - a host's hourly usage counts its completed attempts in the trailing hour plus its rows
+///   currently claimed (in flight on some node), so a node cannot spend budget another node has
+///   already reserved;
+/// - the chosen rows get `claim_expires`, which hides them from every other claim until the
+///   outcome is recorded or the lease lapses;
+/// - the daily cap is charged with exactly the number of rows claimed.
+///
+/// A database error fails the whole claim: nothing is claimed, nothing is fetched.
+pub async fn claim_candidates(pool: &PgPool, limits: ClaimLimits) -> Result<Claim, sqlx::Error> {
     sync_new_events(pool).await?;
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        "INSERT INTO fetch_daily_usage (day, used) VALUES ((now() AT TIME ZONE 'UTC')::date, 0) \
+         ON CONFLICT (day) DO NOTHING",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let used_today: i32 = sqlx::query_scalar(
+        "SELECT used FROM fetch_daily_usage WHERE day = (now() AT TIME ZONE 'UTC')::date \
+         FOR UPDATE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let mut daily_remaining = (limits.daily_cap - i64::from(used_today)).max(0);
 
     let rows = sqlx::query(
         // host(), not ::text - see sync_new_events: the "/32" prefix ::text emits fails IpAddr parsing.
         "SELECT url_hash, url, host, scheme, port, host(source_ip) AS source_ip, \
                 parent_hash, depth, attempts \
          FROM fetch_attempt \
-         WHERE status = 'pending' \
-            OR (status IN ('rejected', 'too_big', 'timeout', 'empty') \
-                AND next_attempt IS NOT NULL AND next_attempt <= now()) \
+         WHERE (status = 'pending' \
+                OR (status IN ('rejected', 'too_big', 'timeout', 'empty') \
+                    AND next_attempt IS NOT NULL AND next_attempt <= now())) \
+           AND (claim_expires IS NULL OR claim_expires <= now()) \
          ORDER BY first_seen DESC \
-         LIMIT $1",
+         LIMIT $1 \
+         FOR UPDATE SKIP LOCKED",
     )
-    .bind(batch)
-    .fetch_all(pool)
+    .bind(limits.batch)
+    .fetch_all(&mut *tx)
     .await?;
-
-    Ok(rows
+    let eligible: Vec<Candidate> = rows
         .into_iter()
         .map(|r| Candidate {
             url_hash: r.get("url_hash"),
@@ -210,7 +267,70 @@ pub async fn select_candidates(pool: &PgPool, batch: i64) -> Result<Vec<Candidat
             depth: r.get("depth"),
             attempts: r.get("attempts"),
         })
-        .collect())
+        .collect();
+
+    let mut hosts: Vec<String> = eligible.iter().map(|c| c.host.clone()).collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    let used_by_host: std::collections::HashMap<String, i64> = sqlx::query_as(
+        "SELECT host, COUNT(*) FROM fetch_attempt \
+         WHERE host = ANY($1) \
+           AND ((status <> 'pending' AND last_attempt >= now() - interval '1 hour') \
+                OR claim_expires > now()) \
+         GROUP BY host",
+    )
+    .bind(&hosts)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .collect();
+    let mut host_remaining: std::collections::HashMap<String, i64> = hosts
+        .into_iter()
+        .map(|h| {
+            let used = used_by_host.get(&h).copied().unwrap_or(0);
+            (h, (limits.per_host_hour - used).max(0))
+        })
+        .collect();
+
+    let mut claim = Claim::default();
+    for candidate in eligible {
+        let host_left = host_remaining.entry(candidate.host.clone()).or_insert(0);
+        if *host_left <= 0 {
+            claim.skipped_bucket += 1;
+        } else if daily_remaining <= 0 {
+            claim.skipped_daily += 1;
+        } else {
+            *host_left -= 1;
+            daily_remaining -= 1;
+            claim.candidates.push(candidate);
+        }
+    }
+
+    if !claim.candidates.is_empty() {
+        let hashes: Vec<Vec<u8>> = claim
+            .candidates
+            .iter()
+            .map(|c| c.url_hash.clone())
+            .collect();
+        sqlx::query(
+            "UPDATE fetch_attempt SET claim_expires = now() + make_interval(secs => $2) \
+             WHERE url_hash = ANY($1)",
+        )
+        .bind(&hashes)
+        .bind(limits.lease.as_secs_f64())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE fetch_daily_usage SET used = used + $1 \
+             WHERE day = (now() AT TIME ZONE 'UTC')::date",
+        )
+        .bind(claim.candidates.len() as i32)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(claim)
 }
 
 /// Claim `row.url_hash` as a fresh pending row - the ONLY way a new row is ever created, used by
@@ -246,13 +366,14 @@ pub async fn insert_pending_if_absent(
     Ok(result.rows_affected() > 0)
 }
 
-/// Record the outcome of a candidate `select_candidates` returned this cycle - update-only in
+/// Record the outcome of a candidate `claim_candidates` handed this cycle - update-only in
 /// practice, since that candidate's row already exists (this function is never used to create a
 /// new row - see [`insert_pending_if_absent`] for that). The `INSERT ... ON CONFLICT DO UPDATE`
 /// shape is kept anyway as defense in depth for a future caller, guarded by `WHERE status NOT IN
 /// ('success', 'dead')` so even a misuse against an already-terminal `url_hash` cannot regress
 /// it: a conflicting row failing that condition is left untouched (`DO NOTHING` is applied)
-/// rather than updated. `last_attempt` always advances to `now()` when the update does apply.
+/// rather than updated. `last_attempt` always advances to `now()` when the update does apply, and
+/// the claim is released: from here the attempt counts against its host through `last_attempt`.
 pub async fn upsert_attempt(pool: &PgPool, a: &AttemptResult) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO fetch_attempt \
@@ -268,7 +389,8 @@ pub async fn upsert_attempt(pool: &PgPool, a: &AttemptResult) -> Result<(), sqlx
            pinned_ip = EXCLUDED.pinned_ip, \
            attempts = EXCLUDED.attempts, \
            next_attempt = EXCLUDED.next_attempt, \
-           last_attempt = now() \
+           last_attempt = now(), \
+           claim_expires = NULL \
          WHERE fetch_attempt.status NOT IN ('success', 'dead')",
     )
     .bind(&a.url_hash)
@@ -290,21 +412,6 @@ pub async fn upsert_attempt(pool: &PgPool, a: &AttemptResult) -> Result<(), sqlx
     .execute(pool)
     .await?;
     Ok(())
-}
-
-/// Count how many attempts (any completed outcome - never `pending`, which means "not fetched
-/// yet") this host has had in the trailing hour. `run_cycle` seeds its per-cycle host budget
-/// from this once per distinct host, rather than re-querying per URL (see the module doc in
-/// `mod.rs` for why: an exact cap under bounded concurrency needs a single read per host, not
-/// N racing reads of a not-yet-committed count).
-pub async fn host_count_last_hour(pool: &PgPool, host: &str) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM fetch_attempt \
-         WHERE host = $1 AND status != 'pending' AND last_attempt >= now() - interval '1 hour'",
-    )
-    .bind(host)
-    .fetch_one(pool)
-    .await
 }
 
 #[cfg(test)]

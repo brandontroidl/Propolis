@@ -96,10 +96,20 @@ layers.
 | Batch size per cycle | default 20, max 1000 | `PROPOLIS_FETCH_BATCH_SIZE` (`config.rs:40,61`) |
 | Cycle interval | default 10 s, max 86400 s | `PROPOLIS_FETCH_INTERVAL_SECS` (`config.rs:34`) |
 
-The per-host budget is seeded once per cycle from one real
-`host_count_last_hour` read; a DB error treats the host as at capacity
-(fail-closed). Each candidate is isolated behind `catch_unwind`, so one panic
-never aborts the batch (`mod.rs:238-278`).
+The per-host and daily budgets live in PostgreSQL, not in process memory, so
+they survive a restart and hold across every node sharing the database. Each
+cycle claims its rows in one transaction (`store::claim_candidates`): it locks
+today's `fetch_daily_usage` row (serializing claims across nodes), selects
+eligible rows that no other cycle has claimed (`FOR UPDATE SKIP LOCKED`),
+counts each host's completed attempts in the trailing hour plus its rows
+currently claimed by any node, sets `claim_expires` on the rows it takes, and
+charges the daily cap exactly that many. A cycle that claims nothing costs the
+daily cap nothing. A claim is released when the outcome is recorded; a node
+that dies mid-fetch leaves its claims to lapse after a lease sized to the
+slowest possible cycle (every redirect hop at its full DNS and total timeout,
+per wave of 8). A DB error fails the whole claim - nothing is fetched that
+cycle (fail-closed). Each candidate is isolated behind `catch_unwind`, so one
+panic never aborts the batch.
 
 ### Size and timeout caps
 

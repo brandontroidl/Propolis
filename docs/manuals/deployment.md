@@ -32,8 +32,9 @@ sequence and the gates, not a re-listing.
 
 Single node is the primary, documented model: one host runs the unified daemon
 plus the nine sensor processes, each its own systemd unit and OS user. A
-multi-node cluster sharing one PostgreSQL is an advanced, less-travelled path
-whose idempotency you must validate yourself.
+multi-node cluster sharing one PostgreSQL is an advanced, less-travelled path:
+the fetcher and vendor submission coordinate through the database, but feed
+publication across nodes is unverified and you must validate it yourself.
 
 - [`../operations/deployment-models.md`](../operations/deployment-models.md)
 

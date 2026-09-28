@@ -39,12 +39,13 @@ async fn fetch_attempt_table_exists_with_expected_columns() {
         "next_attempt",
         "first_seen",
         "last_attempt",
+        "claim_expires",
     ] {
         assert!(cols.iter().any(|x| x == c), "missing column {c}");
     }
 }
 
-// F-5: select_candidates orders the whole eligible set by `first_seen DESC` with no covering
+// F-5: claim_candidates orders the whole eligible set by `first_seen DESC` with no covering
 // index (only host/last_attempt and status/next_attempt existed) - under a backlog larger than
 // one cycle's batch this forces a sort over every qualifying row each cycle.
 #[tokio::test]
@@ -59,4 +60,41 @@ async fn fetch_attempt_has_a_first_seen_index_for_the_selection_sort() {
         indexdefs.iter().any(|d| d.contains("first_seen")),
         "expected an index covering fetch_attempt.first_seen, found: {indexdefs:?}"
     );
+}
+
+#[tokio::test]
+async fn fetch_daily_usage_is_one_non_negative_row_per_day() {
+    let pool = pool().await;
+    let day = "1999-01-01";
+    sqlx::query("DELETE FROM fetch_daily_usage WHERE day = $1::date")
+        .bind(day)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO fetch_daily_usage (day, used) VALUES ($1::date, 0)")
+        .bind(day)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query("INSERT INTO fetch_daily_usage (day, used) VALUES ($1::date, 0)")
+            .bind(day)
+            .execute(&pool)
+            .await
+            .is_err(),
+        "a second row for the same day must be refused"
+    );
+    assert!(
+        sqlx::query("UPDATE fetch_daily_usage SET used = -1 WHERE day = $1::date")
+            .bind(day)
+            .execute(&pool)
+            .await
+            .is_err(),
+        "usage can never go negative"
+    );
+    sqlx::query("DELETE FROM fetch_daily_usage WHERE day = $1::date")
+        .bind(day)
+        .execute(&pool)
+        .await
+        .unwrap();
 }

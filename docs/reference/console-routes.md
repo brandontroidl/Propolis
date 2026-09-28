@@ -62,8 +62,8 @@ login rate limiting) are owned by [authentication and authorization](../security
 
 | Method | Path | Handler | Notes | Source |
 |---|---|---|---|---|
-| GET | `/` | `dashboard` | 6 stat cards, 2 Chart.js charts | `routes/dashboard.rs:49` |
-| GET | `/dashboard/chart` | `dashboard_chart_fragment` | HTMX; `?range=1h\|24h\|7d\|30d`, malformed → `24h` | `routes/dashboard.rs:50` |
+| GET | `/` | `dashboard` | 6 stat cards, 2 Chart.js charts | `routes/dashboard.rs:50` |
+| GET | `/dashboard/chart` | `dashboard_chart_fragment` | HTMX; `?range=1h\|24h\|7d\|30d`, malformed -> `24h` | `routes/dashboard.rs:51` |
 | GET | `/queue` | `queue_page` | review queue | `routes/queue.rs:41` |
 | POST | `/queue/{ip}/approve` | `approve` | CSRF required | `routes/queue.rs:42` |
 | POST | `/queue/{ip}/reject` | `reject` | CSRF required | `routes/queue.rs:43` |
@@ -72,9 +72,9 @@ login rate limiting) are owned by [authentication and authorization](../security
 | POST | `/ip/{ip}/delist` | `delist` | CSRF required | `routes/queue.rs` |
 | POST | `/ip/{ip}/relist` | `relist` | CSRF required | `routes/queue.rs` |
 | POST | `/ip/{ip}/delete` | `delete_ip` | CSRF required | `routes/queue.rs` |
-| GET | `/ip/{ip}` | `detail` | drawer mode via `?drawer=1` + `HX-Request`; missing IP → `404` | `routes/detail.rs:76` |
-| GET | `/ip/{ip}/events` | `events_fragment` | HTMX keyset pagination | `routes/detail.rs:77` |
-| GET | `/ip/{ip}/chart` | `chart_fragment` | HTMX | `routes/detail.rs:78` |
+| GET | `/ip/{ip}` | `detail` | drawer mode via `?drawer=1` + `HX-Request`; missing IP -> `404` | `routes/detail.rs:87` |
+| GET | `/ip/{ip}/events` | `events_fragment` | HTMX keyset pagination | `routes/detail.rs:88` |
+| GET | `/ip/{ip}/chart` | `chart_fragment` | HTMX | `routes/detail.rs:89` |
 | GET | `/feed` | `feed_page` | `?tab=status\|entries` | `routes/feed.rs:59` |
 | GET | `/feed/download/{tier}/{format}` | `download_feed` | see feed downloads below | `routes/feed.rs:60` |
 | GET | `/fleet` | `fleet_page` | listener reachability, capture completeness, running version | `routes/fleet.rs` |
@@ -86,7 +86,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 | POST | `/integrity/verify` | `run_verify` | CSRF (403); one verification at a time (409 while one runs) | `routes/integrity.rs` |
 | GET | `/samples` | `samples_page` | | `routes/samples.rs:17` |
 | GET | `/samples/download/{sha256}` | `download_sample` | hardened download; sets a per-route CSP | `routes/samples.rs:18` |
-| GET | `/logs` | `logs_page` | in-memory ring-buffer snapshot | `routes/logs.rs:35` |
+| GET | `/logs` | `logs_page` | in-memory ring-buffer snapshot | `routes/logs.rs:36` |
 | GET | `/logs/stream` | `logs_stream` | SSE (`text/event-stream`) | `routes/logs.rs:37` |
 
 ## CSRF model
@@ -129,15 +129,15 @@ rebuilt from the ledger. Table and column facts are owned by
 
 ## Feed downloads
 
-`GET /feed/download/{tier}/{format}` (`feed.rs:60,294-336`) streams one export file off
+`GET /feed/download/{tier}/{format}` (`feed.rs:60,314-356`) streams one export file off
 disk. Both path segments are validated **before** touching the filesystem.
 
-- `tier` (feed name) is validated by `is_known_feed_name` (`feed.rs:346-357`): accepts
+- `tier` (feed name) is validated by `is_known_feed_name` (`feed.rs:366-377`): accepts
   literal `aggressive` / `standard`, or `all-{digits}{h|d}` retention-window names. This
   is a **shape check** that admits no `.`, `/`, or `\`, so no accepted value can traverse
   out of the feed directory.
 - `format` is matched against a fixed set → (extension, content-type)
-  (`feed.rs:304-316`). **10 formats:**
+  (`feed.rs:324-336`). **10 formats:**
 
   | Format | Extension | Content-Type |
   |---|---|---|
@@ -155,13 +155,13 @@ disk. Both path segments are validated **before** touching the filesystem.
 - The path is built as `{tier}.{extension}` under the feed directory
   (`PROPOLIS_FEED_OUTPUT_DIR`, see [environment variables](environment-variables.md)) and
   served with `Content-Disposition: attachment; filename="{tier}.{extension}"`
-  (`feed.rs:318-330`).
-- Every "nothing to serve" case (feed dir unset, unknown tier/format, file absent) →
-  **`404`** with a small HTML body, not a generic 503 (`feed.rs:298-303,315,331-334,359-363`).
+  (`feed.rs:338-350`).
+- Every "nothing to serve" case (feed dir unset, unknown tier/format, file absent) ->
+  **`404`** with a small HTML body, not a generic 503 (`feed.rs:318-323,335,351-354,379-383`).
 
 The `/feed` page itself has two tabs (`?tab=status|entries`): the status tab reads
 `manifest.json` from the feed dir and the entries tab reads back the published `{feed}.json`
-export files rather than re-querying the DB (`feed.rs:59-179`).
+export files rather than re-querying the DB (`feed_page`, `feed.rs:141-240`).
 
 ## Security-headers middleware
 

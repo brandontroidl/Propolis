@@ -38,29 +38,32 @@ Rust `sqlx::Type` enum in `crates/core-scoring/src/domain/enums.rs`.
 | `protocol_enum` | `tcp`, `udp`, `icmp` | `Protocol` (`enums.rs:16`) |
 | `category_enum` | `honeypot`, `ids`, `network`, `waf`, `auth` | `Category` (`enums.rs:36`; derives `PartialOrd, Ord`) |
 | `feed_tier_enum` | `aggressive`, `standard` | `FeedTier` (`enums.rs:48`) |
-| `signal_type_enum` | 16 variants (see below) | `SignalType` (`enums.rs:65`) |
-| `review_state_enum` | `pending`, `approved`, `rejected`, `snoozed` | `ReviewState` (`enums.rs:108`) |
+| `signal_type_enum` | 17 variants (see below) | `SignalType` (`enums.rs:65`) |
+| `review_state_enum` | `pending`, `approved`, `rejected`, `snoozed` | `ReviewState` (`enums.rs:127`) |
 
-`signal_type_enum` variants (`0001_enums.sql:7-24`): `honeypot_connection`,
-`honeypot_login_attempt`, `honeypot_command_exec`, `honeypot_malware_upload`,
-`honeypot_file_download`, `suricata_sev1`, `suricata_sev2`, `suricata_sev3`,
-`port_scan`, `syn_flood`, `blocked_connection`, `waf_sqli_xss`, `waf_generic_block`,
-`ssh_brute_force`, `catchall_probe`, `remote_auth_failure`. The Rust side pins the
-count with `SignalType::ALL: [SignalType; 16]` (`enums.rs:84`), guarded by test
-`signal_type_all_has_16_distinct_variants` (`enums.rs:123`). Per-signal meaning and
+`signal_type_enum` variants (`0001_enums.sql:7-24`, `0012_session_end_signal.sql`):
+`honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec`,
+`honeypot_malware_upload`, `honeypot_file_download`, `suricata_sev1`,
+`suricata_sev2`, `suricata_sev3`, `port_scan`, `syn_flood`, `blocked_connection`,
+`waf_sqli_xss`, `waf_generic_block`, `ssh_brute_force`, `catchall_probe`,
+`remote_auth_failure`, `honeypot_session_end` (telemetry only, never scored - see
+`SignalType::TELEMETRY`). The Rust side pins the count with
+`SignalType::ALL: [SignalType; 17]` (`enums.rs:87`), guarded by test
+`signal_type_all_has_17_distinct_variants` (`enums.rs:142`). Per-signal meaning and
 weight: [events-and-signals.md](events-and-signals.md).
 
 ### Serde casing asymmetry (hash-chain critical)
 
-`SignalType`, `Protocol`, and `Category` carry `#[serde(rename_all(deserialize =
-...))]` - a **Deserialize-only** rename (`enums.rs:5-15, 57-64`). Serialize
+`SignalType` and `Protocol` carry `#[serde(rename_all(deserialize =
+...))]` - a **Deserialize-only** rename (`enums.rs:5-15, 57-64`); `Category` carries
+no such override. Serialize
 deliberately stays at the bare Rust identifier (`"CatchallProbe"`, `"Tcp"`), NOT the
 snake_case/lowercase wire form. The reason is the frozen hash chain: `canonical_bytes`
 hashes `serde_json::to_vec(&enum)` verbatim, so flipping Serialize casing would change
 every chain hash. Deserialize accepts the snake_case/lowercase wire strings so intake
 can parse sensor-wire records. Locked by tests
-`signal_type_serialize_is_unchanged_bare_rust_identifier` (`enums.rs:174`) and
-`protocol_serialize_is_unchanged_bare_rust_identifier` (`enums.rs:204`).
+`signal_type_serialize_is_unchanged_bare_rust_identifier` (`enums.rs:194`) and
+`protocol_serialize_is_unchanged_bare_rust_identifier` (`enums.rs:224`).
 
 ## Table: `event` (append-only ledger)
 
@@ -207,7 +210,7 @@ No indexes are defined beyond the `source_ip` PRIMARY KEY.
 
 `has_confirmed_real` latches true only for an authenticated TCP honeypot event:
 `is_confirmed_real(p, authenticated, c) = p==Tcp && authenticated && c==Honeypot`
-(`enums.rs:115-117`).
+(`enums.rs:134-136`).
 
 `active_days` (`0010`): an unbounded, non-decaying count of distinct UTC calendar days
 the IP was seen. It feeds a persistence bonus at the tier gate so a slow attacker that

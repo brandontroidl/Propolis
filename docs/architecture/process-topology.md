@@ -34,7 +34,7 @@ to start (`exit`) on a malformed value. Each sensor binds its TCP/UDP addresses 
 writes NDJSON event logs that intake later tails.
 
 Source: `deploy/sensor-ssh.service` (ExecStart/Restart/MemoryMax);
-`sensor-catchall/src/main.rs:6-13`, `sensor-ssh/src/main.rs:8-10`.
+`sensor-catchall/src/main.rs:6-12`, `sensor-ssh/src/main.rs:7-10`.
 
 ## Data plane - the unified `propolis` daemon
 
@@ -127,7 +127,7 @@ of 60 s it stops restarting that subsystem and alerts; the panic counter resets 
 without panicking) is treated as intentional shutdown - no restart. Each subsystem's
 state is published into a shared map the ops-monitor reads.
 
-Source: `crates/propolis/src/supervisor.rs:16-33`.
+Source: `crates/propolis/src/supervisor.rs:16-156`.
 
 ### Shared state
 

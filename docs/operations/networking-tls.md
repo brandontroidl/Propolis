@@ -26,7 +26,8 @@ page explains exposure and operator responsibilities.
 
 Sensors are the internet-exposed honeypot listeners. Each requires its bind
 address explicitly and fails closed if it is absent or unparseable - there is no
-compiled-in default port anywhere (`crates/sensor-ssh/src/main.rs:130-134` and
+compiled-in default port anywhere (`load_config_from_env`,
+`crates/sensor-ssh/src/main.rs:160-165` and
 the equivalent in each sensor). The IP portion is whatever the operator writes
 (`0.0.0.0`, a specific address, etc.). `sensor-ftp` additionally opens
 passive-mode data connections on dynamic ephemeral ports negotiated per session
@@ -92,7 +93,8 @@ those paths default off. See
 
 ## Firewall and exposure guidance
 
-Based on `INSTALL.md:378-385` (operator guidance, not code):
+Based on `docs/archive/2026-08-26/root/INSTALL.md:378-385` (operator guidance, not code; the
+live `INSTALL.md` is now a redirect stub):
 
 - **Inbound:** allow the configured sensor ports from the internet (that is the
   point). Allow nothing inbound to the console port from off-host - keep it
@@ -103,7 +105,7 @@ Based on `INSTALL.md:378-385` (operator guidance, not code):
   standard proxy variables, so they can leave through an egress proxy. The
   malware fetcher, if enabled, ignores those variables and always connects
   directly, so a policy that allows egress only through a proxy blocks it. **Sensors make no outbound connections by design**
-  (`INSTALL.md:385`); their unit files restrict address families to
+  (`docs/archive/2026-08-26/root/INSTALL.md:385`); their unit files restrict address families to
   `AF_INET AF_INET6` with no outbound path.
 - **Recovery path:** before applying any firewall rule that could sever access,
   confirm you have out-of-band administration (hypervisor console / serial), not

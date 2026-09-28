@@ -20,11 +20,12 @@ installed by `deploy/install.sh`:
 
 - `propolis.service` runs `/usr/local/bin/propolis`, a single process holding the
   intake, review, feed, and console subsystems as concurrent tasks over one shared
-  PostgreSQL pool (`deploy/propolis.service:110-115`,
+  PostgreSQL pool (`deploy/propolis.service:107,121`,
   `crates/propolis/src/main.rs:1-5`).
 - `sensor-<name>.service` for `catchall, ssh, telnet, redis, adb, http, ftp, smtp, cred`,
-  each running its own binary as its own system user (`deploy/install.sh:198`,
-  `deploy/sensor-ssh.service`).
+  each running its own binary as its own system user, created by `deploy/install.sh`'s
+  delegation to `deploy/provision.sh` (`ensure_user`, `deploy/provision.sh:50-70`,
+  `deploy/sensor-ssh.service:34`).
 
 The standalone `intake.service`, `review.service`, `feed.service`, and `console.service`
 units also exist in the repo but are **superseded by `propolis.service` in production and
@@ -37,7 +38,8 @@ daemon and [deployment models](./deployment-models.md) for single-node vs cluste
 ## Start and enable
 
 Configuration and secrets must exist first (`install.sh` never writes any
-`/etc/propolis/*.env` file, and never starts, enables, or migrates anything). See
+operator-owned `/etc/propolis/*.env` file - it only generates the secret-free
+`fleet-listeners.env` - and never starts, enables, or migrates anything). See
 [configuration](./configuration.md) and [secret management](./secret-management.md).
 
 Once every service has its `/etc/propolis/*.env`:
@@ -50,7 +52,8 @@ sudo systemctl enable --now sensor-catchall sensor-ssh sensor-telnet sensor-redi
 ```
 
 `enable --now` both starts the unit and sets it to start at boot. Source:
-`INSTALL.md:332-346`. Runnable commands are collected in
+`docs/archive/2026-08-26/root/INSTALL.md:332-346` (the live `INSTALL.md` is now a redirect
+stub). Runnable commands are collected in
 [commands reference](../reference/commands.md).
 
 Ordering: `propolis.service` declares `After=network.target postgresql.service`
@@ -66,7 +69,7 @@ systemctl status propolis sensor-ssh
 journalctl -u propolis -u sensor-ssh -f
 ```
 
-Source: `INSTALL.md:350-362`. For health and readiness endpoints, the in-console log
+Source: `docs/archive/2026-08-26/root/INSTALL.md:350-362`. For health and readiness endpoints, the in-console log
 viewer, and metrics, see [health and observability](./health-and-observability.md).
 
 ## Startup sequence (daemon)
@@ -104,14 +107,14 @@ The two unit families restart differently on purpose:
 
 | Unit | `Restart=` | `RestartSec=` | Cite |
 |---|---|---|---|
-| `propolis.service` | `on-failure` | 5 s | `deploy/propolis.service:123-124` |
+| `propolis.service` | `on-failure` | 5 s | `deploy/propolis.service:129-130` |
 | `sensor-*.service` | `always` | 10 s | `deploy/sensor-ssh.service`, `deploy/sensor-*.service` |
 
 The daemon uses `on-failure`, **not** `Restart=always`, because its in-process supervisor
 (`crates/propolis/src/supervisor.rs`) restarts a panicked subsystem with backoff without
 the process exiting. A process exit is therefore only a fail-fast (bad config, DB
 unreachable, migration failure) or an operator-requested clean stop, and neither should be
-auto-restarted into the same failure (`deploy/propolis.service:116-122`). Sensors are
+auto-restarted into the same failure (`deploy/propolis.service:122-128`). Sensors are
 independent listeners with no such internal supervisor, so they use `always`. Failure
 modes are covered in [concurrency and failure](../architecture/concurrency-and-failure.md).
 

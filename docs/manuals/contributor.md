@@ -40,8 +40,10 @@ owns setup. In short:
   supplies the matched components. All crates are edition 2024.
 - The suite is **not fully offline**: the database-backed crates test against a
   real PostgreSQL via `sqlx::test`, which provisions a fresh database per test.
-  Use the committed `.env` value for `DATABASE_URL`, not the different form in
-  `CONTRIBUTING.md` (the page documents the discrepancy).
+  Use the dev value for `DATABASE_URL` given in
+  [toolchain and environment](../development/toolchain-and-environment.md#database_url),
+  not the different form in the archived `CONTRIBUTING.md` (that page documents the
+  discrepancy).
 
 > **Trust-auth dev container.** The documented local PostgreSQL recipe is a
 > throwaway `trust`-auth container bound to `127.0.0.1` only. Do not expose it or

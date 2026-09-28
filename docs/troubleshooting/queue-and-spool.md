@@ -71,12 +71,12 @@ interval of lag.
 
 - **Nothing surfaces** - `populate` only inserts `ip_score` rows where
   `recommended_for_vendor = TRUE AND eligible = TRUE`
-  (`crates/review/src/queue.rs:74-91`). If a source never becomes eligible
+  (`crates/review/src/queue.rs:80-97`). If a source never becomes eligible
   (eligibility needs a confirmed-real honeypot event and `event_count >= 2`),
   it never enters the queue. Eligibility and tier rules are owned by
   [Scoring and feed](../reference/scoring-and-feed.md).
 - **A rejected/snoozed entry keeps its state** - Rejected and Snoozed rows
-  persist so `populate` does not re-surface them (`queue.rs:129-148`). This is
+  persist so `populate` does not re-surface them (`reject`/`snooze`, `queue.rs:134-160`). This is
   intentional; use approve/reject/snooze from the console, not a manual delete.
 - **Review disabled** - `PROPOLIS_REVIEW_ENABLED=false` stops the loop entirely.
 

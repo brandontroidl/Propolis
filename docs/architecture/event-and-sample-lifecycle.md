@@ -34,17 +34,17 @@ flowchart TD
 1. **Capture.** A sensor handler sanitizes every attacker string, builds a
    `SensorEvent` carrying raw facts only (no score), and calls
    `EventEmitter::append`, which writes exactly one NDJSON line to the sensor's log
-   with `O_APPEND` (`crates/sensor-framework/src/emit.rs:40-53`). See
+   with `O_APPEND` (`crates/sensor-framework/src/emit.rs:45-68`). See
    [`sensors.md`](sensors.md).
 2. **Wire record.** The line conforms to the frozen `SensorEvent` schema
-   (`crates/sensor-wire/src/lib.rs:36-53`, `WIRE_VERSION = 1`). `signal_type` and
+   (`crates/sensor-wire/src/lib.rs:39-61`, `WIRE_VERSION = 1`). `signal_type` and
    `protocol` are plain strings on the wire so `sensor-wire` carries no scoring
    dependency; the record contains no `\n`/`\r` (NDJSON invariant). Field detail is
    owned by [`reference/events-and-signals.md`](../reference/events-and-signals.md).
 3. **Intake.** The intake tailer consumes each NDJSON record and validates its
    `signal_type`/`protocol` against the known set. `EventInput::from_signal` derives
    `weight`, `confidence`, and `category` from the single-source-of-truth weight
-   table (`crates/core-scoring/src/domain/weights.rs:11-37`) so a sensor never
+   table (`crates/core-scoring/src/domain/weights.rs:11-41`) so a sensor never
    computes them. Weights and the derivation are owned by
    [`reference/events-and-signals.md`](../reference/events-and-signals.md).
 4. **Hash-chained ledger.** Each row's hash is

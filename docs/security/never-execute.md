@@ -24,9 +24,9 @@ zero matches. The only `std::process` uses in non-test source are three
 (lines 414, 422, 432) - process termination, not process creation.
 
 No crate enables Tokio's `process` feature: a grep for `"process"` across every
-`crates/*/Cargo.toml` returns nothing. `sensor-cred` asserts this directly - its
-integration test checks that the `tokio = ` line in its own `Cargo.toml` does
-not contain `"process"` (`crates/sensor-cred/tests/integration.rs:485-486`).
+`crates/*/Cargo.toml` returns nothing. `sensor-ssh` asserts this directly - its
+`tokio_dependency_lacks_process_feature` test checks that the `tokio = ` line in its own `Cargo.toml` does
+not contain `"process"` (`crates/sensor-ssh/tests/shell_test.rs:344-361`).
 
 Because the capability is simply absent from the dependency tree and the source,
 there is no exec path to reach - not a runtime guard that could be misconfigured
@@ -43,13 +43,13 @@ than shipping.
 | Test | Location |
 |------|----------|
 | `never_exec_static_check` (SSH) | `crates/sensor-ssh/tests/shell_test.rs:121` |
-| (cred) | `crates/sensor-cred/tests/integration.rs:488` |
-| (adb) | `crates/sensor-adb/tests/integration.rs:356` |
-| (ftp) | `crates/sensor-ftp/tests/integration.rs:255` |
-| (http) | `crates/sensor-http/tests/integration.rs:198` |
-| (redis) | `crates/sensor-redis/tests/integration.rs:270` |
-| (smtp) | `crates/sensor-smtp/tests/integration.rs:358` |
-| (telnet) | `crates/sensor-telnet/tests/integration.rs:181` |
+| (cred) | `crates/sensor-cred/tests/integration.rs:680` |
+| (adb) | `crates/sensor-adb/tests/integration.rs:578` |
+| (ftp) | `crates/sensor-ftp/tests/integration.rs:400` |
+| (http) | `crates/sensor-http/tests/integration.rs:316` |
+| (redis) | `crates/sensor-redis/tests/integration.rs:313` |
+| (smtp) | `crates/sensor-smtp/tests/integration.rs:724` |
+| (telnet) | `crates/sensor-telnet/tests/integration.rs:190` |
 
 The SSH test is broader than its own crate: it walks **both** `sensor-ssh/src`
 and `sensor-framework/src` (lines 145-160). The `FakeFs`/`FakeShell`

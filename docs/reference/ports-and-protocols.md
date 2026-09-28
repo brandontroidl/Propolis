@@ -20,9 +20,9 @@ Every sensor requires its bind address to be set explicitly via an env var and
 **fails closed** (refuses to start) if the value is missing or unparseable.
 There is no hardcoded `0.0.0.0:22`-style default anywhere in the source. The
 operator supplies `ip:port` per sensor in `/etc/propolis/<sensor>.env`
-(`crates/sensor-ssh/src/main.rs:23,130-134`; `crates/sensor-cred/src/main.rs:93-97`).
+(`crates/sensor-ssh/src/main.rs:23,161-165`; `crates/sensor-cred/src/main.rs:93-97`).
 `install.sh` creates users and directories but sets **no** bind port
-(`deploy/install.sh:25,233`).
+(`deploy/install.sh:25,85-90,172-173`).
 
 The IP portion is whatever the operator writes (`0.0.0.0`, a specific address,
 `127.0.0.1`). The software does not force a bind address. The "standard" port
@@ -36,7 +36,7 @@ default the binaries carry.
   PostgreSQL-client daemons that bind **no** network listener
   (`crates/intake`, `crates/review`, `crates/feed` mains).
 - **Aggregated single-node binary** `propolis` (`crates/propolis`, ExecStart
-  `/usr/local/bin/propolis`, `deploy/propolis.service:115`): embeds intake +
+  `/usr/local/bin/propolis`, `deploy/propolis.service:121`): embeds intake +
   review + feed + the console web server + an outbound fetcher in one process.
   It binds **only** the console (`crates/propolis/src/config.rs:600-608`;
   listener in `run_console`, `crates/propolis/src/main.rs:503`). It does **not** bind any
@@ -50,14 +50,14 @@ default.
 
 | Sensor | Bind env | Protocol(s) | Conventional port | Notes |
 |---|---|---|---|---|
-| sensor-ssh | `PROPOLIS_SSH_BIND` (single `ip:port`) | SSH | 22 | Unit grants `CAP_NET_BIND_SERVICE` for privileged bind (`deploy/sensor-ssh.service`). Missing bind => `ConfigError::NoBind`, exit (`crates/sensor-ssh/src/main.rs:23,73,130-134`). |
-| sensor-telnet | `PROPOLIS_TELNET_BIND` (single) | Telnet | 23 | `crates/sensor-telnet/src/main.rs:20,149-153` |
+| sensor-ssh | `PROPOLIS_SSH_BIND` (single `ip:port`) | SSH | 22 | Unit grants `CAP_NET_BIND_SERVICE` for privileged bind (`deploy/sensor-ssh.service`). Missing bind => `ConfigError::NoBind`, exit (`crates/sensor-ssh/src/main.rs:23,94,161-165`). |
+| sensor-telnet | `PROPOLIS_TELNET_BIND` (single) | Telnet | 23 | `crates/sensor-telnet/src/main.rs:20,175-179` |
 | sensor-http | `PROPOLIS_HTTP_BIND` (single) | HTTP | 80 | `crates/sensor-http/src/main.rs:10,121-125` |
-| sensor-ftp | `PROPOLIS_FTP_BIND` (single) | FTP | 21 | Also opens passive-mode data ports at runtime (see below). `crates/sensor-ftp/src/main.rs:10,61-65` |
+| sensor-ftp | `PROPOLIS_FTP_BIND` (single) | FTP | 21 | Also opens passive-mode data ports at runtime (see below). `crates/sensor-ftp/src/main.rs:10,84-88` |
 | sensor-smtp | `PROPOLIS_SMTP_BIND` (single) | SMTP | 25 | Missing => error + exit (`crates/sensor-smtp/src/main.rs:10,44-58`) |
 | sensor-redis | `PROPOLIS_REDIS_BIND` (single) | Redis | 6379 | `crates/sensor-redis/src/main.rs:21,150-154` |
-| sensor-adb | `PROPOLIS_ADB_BIND` (single) | ADB | 5555 | `crates/sensor-adb/src/main.rs:21,153-157` |
-| sensor-catchall | `CATCHALL_BIND_ADDRS` (comma-sep list) | TCP + UDP, any port | (multi) | Both TCP and UDP attempted per address. Empty => `ConfigError::NoBindAddrs`, exit. Per-port bind failure is **non-fatal** (logged + skipped, sensor stays up). Unit grants `CAP_NET_BIND_SERVICE`. `crates/sensor-catchall/src/main.rs:29,60-61,187,248-294` |
+| sensor-adb | `PROPOLIS_ADB_BIND` (single) | ADB | 5555 | `crates/sensor-adb/src/main.rs:21,176-180` |
+| sensor-catchall | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list) | TCP + UDP, any port | (multi) | Both TCP and UDP attempted per address. Empty => `ConfigError::NoBindAddrs`, exit. Per-port bind failure is **non-fatal** (logged + skipped, sensor stays up). Unit grants `CAP_NET_BIND_SERVICE`. `crates/sensor-catchall/src/main.rs:36,141-143,272-275,286-330` |
 | sensor-cred | five per-protocol envs (below) | VNC / MySQL / MSSQL / PostgreSQL / MongoDB | (multi) | No single bind env; at least one required. `crates/sensor-cred/src/main.rs:75-99` |
 
 ### sensor-cred per-protocol binds
@@ -92,7 +92,7 @@ Each attacker-facing sensor also reads a `*_WAN_MAP` env var (comma-separated
 Not a listener. See [environment-variables.md](environment-variables.md) for the
 exact per-sensor names (`PROPOLIS_SSH_WAN_MAP`, `PROPOLIS_TELNET_WAN_MAP`,
 `PROPOLIS_HTTP_WAN_MAP`, `PROPOLIS_FTP_WAN_MAP`, `PROPOLIS_SMTP_WAN_MAP`,
-`PROPOLIS_REDIS_WAN_MAP`, `PROPOLIS_ADB_WAN_MAP`, `CATCHALL_WAN_MAP`,
+`PROPOLIS_REDIS_WAN_MAP`, `PROPOLIS_ADB_WAN_MAP`, `PROPOLIS_CATCHALL_WAN_MAP`,
 `PROPOLIS_CRED_WAN_MAP`).
 
 `sensor-wire` is a decoder/library crate with no network listener [inferred: no
@@ -124,8 +124,8 @@ middleware (`router`'s outer merge chain, `crates/console/src/routes/mod.rs:70-7
 
 | Route | Purpose | Behavior | Source |
 |---|---|---|---|
-| `GET /health` | Liveness | Always 200 | `crates/console/src/routes/health.rs:14-30` |
-| `GET /ready` | Readiness | Pings Postgres; 200 ok / 503 fail-closed | `crates/console/src/routes/health.rs:14-30` |
+| `GET /health` | Liveness | Always 200 | `crates/console/src/routes/health.rs:22-24` |
+| `GET /ready` | Readiness | Pings Postgres; 200 ok / 503 fail-closed | `crates/console/src/routes/health.rs:32-54` |
 | `GET /metrics` | Prometheus text | Derived from DB queries per scrape | `crates/console/src/routes/metrics.rs:7,40` |
 
 Full console route inventory is owned by
@@ -166,7 +166,7 @@ are **not** compiled-in defaults - each is set by the operator in
 | 5900 | attacker | VNC (cred) | `PROPOLIS_CRED_VNC_BIND` |
 | 6379 | attacker | Redis | `PROPOLIS_REDIS_BIND` |
 | 27017 | attacker | MongoDB (cred) | `PROPOLIS_CRED_MONGO_BIND` |
-| (any) | attacker | Catchall (TCP+UDP, multi-port) | `CATCHALL_BIND_ADDRS` |
+| (any) | attacker | Catchall (TCP+UDP, multi-port) | `PROPOLIS_CATCHALL_BIND_ADDRS` |
 | 8080 | operator + machine | Console UI + `/health` `/ready` `/metrics` (loopback default) | `PROPOLIS_CONSOLE_BIND` |
 
 ## Sockets

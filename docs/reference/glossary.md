@@ -55,7 +55,7 @@ weight each contributes are owned by
 The three event attributes that decide whether a sighting *confirms* an
 attacker rather than merely records traffic. Only a TCP event that is
 authenticated and categorized `Honeypot` sets the confirmed-real latch
-(`is_confirmed_real`, `crates/core-scoring/src/domain/enums.rs:115`).
+(`is_confirmed_real`, `crates/core-scoring/src/domain/enums.rs:134-136`).
 
 ### Confirmed-real latch
 

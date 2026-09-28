@@ -165,7 +165,7 @@ unchanged. No other encoding (base64, UTF-16) is decoded.
 |---|---|---|
 | Max body scanned | 64 KiB *(hard-coded)* | `MAX_BODY_LEN` (`extract.rs:36`) |
 | Max URLs emitted | 256 *(hard-coded)* | `MAX_URLS` (`extract.rs:42`) |
-| Variable-resolution passes | 8 *(hard-coded)* | `MAX_RESOLVE_PASSES` (`extract.rs:100`) |
+| Variable-resolution passes | 8 *(hard-coded)* | `MAX_RESOLVE_PASSES` (`extract.rs:112`) |
 
 ### TFTP fetch
 

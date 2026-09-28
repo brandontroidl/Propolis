@@ -26,9 +26,9 @@ cargo build            # debug build, all 24 workspace members
 cargo build --release  # release binaries into target/release/
 ```
 
-`cargo build --release` is the documented build step (`README.md:65`,
-`INSTALL.md:15`); the install script expects those release binaries in
-`target/release/` (`deploy/install.sh:56,205-209`).
+`cargo build --release` is the documented build step (`README.md:42`,
+`docs/operations/installation.md:25`); the install script expects those release
+binaries in `target/release/` (`deploy/install.sh:59-60,127-130`).
 
 ## The gate
 
@@ -49,7 +49,7 @@ cargo test --workspace --locked -- --test-threads=1 2>&1 | tee /tmp/test-output.
   the `tee` pipe cannot report green over a red suite.
 - `--locked` enforces the committed `Cargo.lock` frozen.
 
-`CONTRIBUTING.md:11` gives a shorter chained form
+`docs/governance/contribution.md:41` gives a shorter chained form
 (`cargo fmt --check && cargo clippy -- -D warnings && cargo test`); it omits the
 scope flags above and bails on first failure, so treat CI as authoritative. See
 [`../development/build-and-test.md`](../development/build-and-test.md) for the
@@ -85,7 +85,7 @@ podman start propolis-pg
 ```
 
 `DATABASE_URL` differs across sources (CI `postgres@localhost/postgres`, `.env`
-`postgres@127.0.0.1/postgres`, `CONTRIBUTING.md:10`
+`postgres@127.0.0.1/postgres`, `docs/archive/2026-08-26/root/CONTRIBUTING.md:10`
 `propolis:...@localhost/propolis_test`). Match your local `.env`; see
 [`environment-variables.md`](environment-variables.md).
 
@@ -168,7 +168,9 @@ sudo ./deploy/install.sh              # installs binaries + units; starts/enable
 `install.sh` provisions OS users, directories, spool mountpoints, the release
 binaries, `propolis.service` + the 9 sensor units, and a logrotate config. It
 does **not** start or enable any service, create/migrate the database, or write
-any `/etc/propolis/*.env` file (`deploy/install.sh:19-32,229-234`). Starting a
+any operator-owned `/etc/propolis/*.env` file; the one env file it does write is
+the generated, secret-free `fleet-listeners.env`
+(`deploy/install.sh:19-32,153-154,171-174`). Starting a
 service is a separate operator action taken only after populating the env files:
 
 > **Production warning.** Enabling a unit starts a live honeypot and, if the
@@ -180,7 +182,7 @@ sudo systemctl enable --now propolis.service      # example, per unit
 
 The spool directories still need `noexec,nosuid,nodev` mounts added to
 `/etc/fstab` by hand; the installer prints the exact lines and stops there
-(`deploy/install.sh:171-193`). Verify with `findmnt <path>` that the mount
+(`deploy/install.sh:92-115`). Verify with `findmnt <path>` that the mount
 options are actually in effect.
 
 ## Operations

@@ -62,19 +62,24 @@ to invoke.
 
 ## `/ready` returns 503
 
-`GET /ready` is fail-closed: it runs `SELECT 1` against the pool and returns
-`200 {"status":"ok"}` only on success; any error - closed pool, network error,
-timeout - returns `503 {"status":"unavailable"}`
-(`crates/console/src/routes/health.rs:26-40`). A 503 therefore means the console
-process is alive but cannot reach the database. Distinguish from liveness:
+`GET /ready` is fail-closed: it runs `SELECT 1` against the pool, then checks
+whether any supervised subsystem has given up, and returns
+`200 {"status":"ok"}` only when both pass
+(`ready`, `crates/console/src/routes/health.rs:26-54`). Any DB error - closed
+pool, network error, timeout - returns `503 {"status":"unavailable"}`
+(`health.rs:33-40`). A subsystem that has exhausted its restarts returns
+`503 {"status":"unavailable","gave_up":[...]}` (`health.rs:41-52`). A 503
+therefore means the console process is alive but either cannot reach the
+database or has a dead subsystem; a `gave_up` field in the body tells the two
+apart. Distinguish from liveness:
 
 ```
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/health   # 200 = process serving
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/ready    # 503 = DB unreachable
 ```
 
-A persistent 503 with a healthy `/health` points at the database or the pool, not
-the web layer. The daemon logs `readiness check: database ping failed` with the
+A persistent 503 with a healthy `/health` and no `gave_up` field points at the
+database or the pool, not the web layer. The daemon logs `readiness check: database ping failed` with the
 error. See [Health and observability](../operations/health-and-observability.md).
 
 ## Hash-chain / integrity page reports "broken"

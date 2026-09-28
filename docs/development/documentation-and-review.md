@@ -16,7 +16,7 @@ with the code.
 
 Every change passes the CI gate - fmt, clippy (`-D warnings`), and the full test suite
 against a real PostgreSQL - on every push and pull request; nothing merges un-gated
-(`.github/workflows/ci.yml`, `CONTRIBUTING.md:29`). See
+(`.github/workflows/ci.yml`, `docs/governance/contribution.md:33-34`). See
 [build-and-test](build-and-test.md) for the exact commands and why the three jobs are
 independent.
 
@@ -26,8 +26,8 @@ Review expectations that follow from the tree's conventions:
   TCP; DB changes test with `sqlx::test`. New invariants get a test that would fail
   without the change.
 - **Conventional, lowercase commits** with a why-focused body; small, bisectable
-  increments (`CONTRIBUTING.md:20`). See [coding-conventions](coding-conventions.md).
-- **Comment the why, not the what** (`CONTRIBUTING.md:21`).
+  increments (`docs/governance/contribution.md:29-30`). See [coding-conventions](coding-conventions.md).
+- **Comment the why, not the what.** See [coding-conventions](coding-conventions.md#comments).
 - **Additive migrations only**; never edit an applied migration in place. See
   [schema-and-migrations](schema-and-migrations.md).
 - **Sensor changes keep the never-exec / no-fetch guarantees** and their static tests.
@@ -85,7 +85,8 @@ current/historical/superseded/draft/planned status and the metadata standard is
 [`documentation-policy`](../documentation-policy.md). The claim-to-source mapping lives
 in [`claim-to-source-ledger`](../claim-to-source-ledger.md).
 
-Design docs and architecture decision records referenced from `CONTRIBUTING.md`
+Design docs and architecture decision records referenced from the archived
+`docs/archive/2026-08-26/root/CONTRIBUTING.md:33-34`
 (`internal/design/`, `internal/architecture/adr/`) are gitignored private material and
 are not part of the published corpus; the code-evidenced decisions surface in
 [`architecture/decisions`](../architecture/decisions.md).

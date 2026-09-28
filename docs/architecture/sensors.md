@@ -32,7 +32,7 @@ not by careful coding:
   client anywhere in its own dependency tree. Per-sensor tests ban
   `reqwest/hyper/ureq/curl/isahc/surf/attohttpc`; the shell's `wget`/`curl` return
   canned transcripts with zero network I/O
-  (`crates/sensor-framework/src/shell.rs:17-25`). A sensor cannot fetch or serve
+  (`crates/sensor-framework/src/shell.rs:18-24`). A sensor cannot fetch or serve
   attacker-directed content because nothing capable of it is present. (The *platform*
   as a whole has a few operator-gated, default-off egress paths for enrichment and
   reporting; see [`security/outbound-controls.md`](../security/outbound-controls.md).
@@ -126,18 +126,18 @@ path**, for covertness - response latency must not leak whether a capture happen
 1. The handler reads enough to answer the protocol, builds a `CaptureJob`, and
    `submit`s it. `submit` is backed by `mpsc::try_send` and **never blocks**; a full
    queue drops the job, returns `CaptureDropped`, and increments a counter
-   (`handoff.rs:109-148`). Queue size is 64 on every spooling sensor.
+   (`handoff.rs:221-241`). Queue size is 64 on every spooling sensor.
 2. A **single worker** drains the queue strictly sequentially (`start_worker` panics
    on a second call), so the spool is never written concurrently
-   (`handoff.rs:159-188`). It hashes the body, stores it, and appends the event; a
-   panicking event builder is isolated by `catch_unwind` and the worker continues
-   (`handoff.rs:194-233`).
+   (`handoff.rs:259-298`). It hashes the body, stores it, and appends the event via
+   `process_job`; a panicking event builder is isolated by `catch_unwind` and the
+   worker continues (`handoff.rs:315-391`).
 
 ### Quarantine spool
 
 `QuarantineSpool` stores every captured body under its **SHA-256 as the filename**
 (never the attacker-supplied name → traversal impossible), with `0640` permissions
-and re-hash-on-read fail-closed (`spool.rs:1-9, 114-122`). It enforces a per-file
+and re-hash-on-read fail-closed (`spool.rs:1-9, 153-167`). It enforces a per-file
 size cap and a global byte budget via an atomic `compare_exchange` reservation, dedups
 on existing hash, and recovers its used-byte count by scanning the directory on
 startup so a restart does not reset the ceiling. SSH/FTP/ADB use a 10 MB per-file cap
@@ -150,17 +150,18 @@ and a 100 MB global budget. See
 `EventEmitter::append` serializes an event to one NDJSON line, opens the log with
 `O_APPEND` (atomic concurrent appends on local storage), and `write_all` + `flush`; a
 serialize or append failure never partially writes a line
-(`emit.rs:40-53`). The log directory must be local storage - NFS `O_APPEND` can race
-(`emit.rs:26-39`). These NDJSON files are what the intake tailer consumes; see
+(`emit.rs:45-68`). The log directory must be local storage - NFS `O_APPEND` can race
+(`emit.rs:30-34`). These NDJSON files are what the intake tailer consumes; see
 [`event-and-sample-lifecycle.md`](event-and-sample-lifecycle.md).
 
 ## The wire record
 
 Every sensor emits the same frozen record, `SensorEvent`
-(`crates/sensor-wire/src/lib.rs:36-53`, `WIRE_VERSION = 1`). A sensor emits **raw
+(`crates/sensor-wire/src/lib.rs:39-61`, `WIRE_VERSION = 1`). A sensor emits **raw
 facts only** - `source_ip`, `wan_ip`, `sensor`, `signal_type` (a plain string),
 `protocol`, `authenticated`, `observed_at`, `metadata`, an optional `sample`
-reference, and an optional `session_id`. Weight, confidence, and category are **not**
+reference, an optional `session_id`, and an optional `occurrence_id` (minted by
+`EventEmitter::append`). Weight, confidence, and category are **not**
 on the wire; they are derived downstream so a sensor never computes a score. Field
 types and the signal vocabulary are owned by
 [`reference/events-and-signals.md`](../reference/events-and-signals.md).

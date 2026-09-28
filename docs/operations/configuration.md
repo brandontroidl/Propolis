@@ -32,7 +32,7 @@ Each systemd unit reads one `EnvironmentFile`:
 
 These `.env` files are **operator-authored**. `deploy/install.sh` does not
 create them - it only prints "Next: populate /etc/propolis/*.env files"
-(`deploy/install.sh:233`). They are mode `0600` and owned by the service user.
+(`deploy/install.sh:173`). They are mode `0600` and owned by the service user.
 The defaults documented in the reference table are the **code** defaults applied
 when a variable is unset or blank; they are authoritative for runtime behavior
 even though the `.env` files themselves are not in the repo.
@@ -78,9 +78,11 @@ Fail-closed pairings worth noting (all owned by the reference table):
 
 - A vendor or VirusTotal `*_ENABLED=true` with an empty key is forced disabled
   and logged (`load_vendor_config`, `config.rs:486-493,613`).
-- `PROPOLIS_OPS_ENABLED=true` makes `PROPOLIS_OPS_NTFY_URL` and
-  `PROPOLIS_OPS_NTFY_TOPIC` required - a monitor that cannot page must not start
-  (`ops_alert/config.rs:122-134`).
+- `PROPOLIS_OPS_ENABLED=true` with only one of `PROPOLIS_OPS_NTFY_URL` /
+  `PROPOLIS_OPS_NTFY_TOPIC` set fails closed (a half-configured target looks
+  configured but would page nothing); with neither set, alerts fall back to the
+  local log sink instead of aborting startup (`parse_ops_alert`,
+  `crates/propolis/src/ops_alert/config.rs:123-147`).
 - `PROPOLIS_FEED_WINDOWS` fails closed on any malformed entry rather than
   skipping it (`parse_window_list`, `config.rs:386-418`).
 - `PROPOLIS_FEED_ASN_ALLOWLIST` is inert unless `PROPOLIS_GEOIP_DIR` is set and
@@ -89,7 +91,7 @@ Fail-closed pairings worth noting (all owned by the reference table):
 ## Sensor binds and WAN attribution
 
 Every sensor requires its bind variable (`<PREFIX>_BIND`, or
-`CATCHALL_BIND_ADDRS` for catchall, or the five `PROPOLIS_CRED_*_BIND` vars for
+`PROPOLIS_CATCHALL_BIND_ADDRS` for catchall, or the five `PROPOLIS_CRED_*_BIND` vars for
 cred) and refuses to start without it - there is **no compiled-in default
 port**. The "standard" port mapping (SSH 22, telnet 23, etc.) is whatever the
 operator writes into the `.env` files, not a code default. Ports are owned by

@@ -19,18 +19,18 @@
 //! one task ever calls `recv()`. That task's loop processes one job to completion - including its
 //! synchronous call into `QuarantineSpool::store` - before it calls `recv().await` again, so
 //! `store` is never invoked concurrently with itself by this component, no matter how many
-//! producer tasks race `submit` concurrently. This confirms, rather than merely repeats, the
-//! assumption `spool.rs`'s own doc comment carries forward from Task 4: the narrow `create_new`
-//! race in `store`'s dedup path (two callers racing to store identical content) is not this
-//! system's real access pattern.
+//! producer tasks race `submit` concurrently. So the narrow `create_new` race in `store`'s dedup
+//! path (two callers racing to store identical content) is not a sensor's access pattern. The
+//! review crate's malware fetcher is the one other caller: it stores into its own spool from
+//! several concurrent fetches, and can meet that race when two URLs return the same bytes at once.
 //!
 //! `orig_name` is sanitized here, not by each sensor, before it is written onto the `SampleRef` -
 //! see `spool.rs`'s `store` doc, which places that obligation on whoever calls `store` and then
-//! fills in the returned ref's `orig_name`. In this system that caller is always this worker (no
-//! other code ever calls `QuarantineSpool::store`), so the framework enforces the requirement
-//! structurally here rather than trusting every current and future sensor to remember it
-//! independently - matching this crate's standing pattern (`sanitize.rs`, `bounds.rs`,
-//! `config.rs`): a sensor has no route to a record that bypasses it.
+//! fills in the returned ref's `orig_name`. Every sensor's store goes through this worker (the
+//! fetcher never fills in `orig_name`), so the framework enforces the requirement structurally
+//! here rather than trusting every current and future sensor to remember it independently -
+//! matching this crate's standing pattern (`sanitize.rs`, `bounds.rs`, `config.rs`): a sensor has
+//! no route to a record that bypasses it.
 //!
 //! A job whose `event_builder` panics - a bug in a sensor's own closure, working on
 //! attacker-influenced data - is isolated the same way `listener.rs` isolates a panicking

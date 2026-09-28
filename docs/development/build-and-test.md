@@ -10,14 +10,14 @@ last-verified: 2026-08-26
 # Build and test
 
 The authoritative gate is CI (`.github/workflows/ci.yml`). Treat CI as the source
-of truth; the chained one-liner in `CONTRIBUTING.md:11` states the same intent but
-omits scope flags (see [drift](#contributing-vs-ci) below).
+of truth; the chained one-liner in `docs/governance/contribution.md:41` states the
+same intent but omits scope flags (see [drift](#contributing-vs-ci) below).
 
 ## Build
 
 ```
 cargo build            # debug
-cargo build --release  # release binaries (README.md:65, INSTALL.md:15)
+cargo build --release  # release binaries (README.md:42, docs/operations/installation.md:25)
 ```
 
 > **After any `cargo vendor`, build in release too.** A debug/test build can pass
@@ -75,7 +75,7 @@ The tests job needs the test PostgreSQL running - see
 <a id="contributing-vs-ci"></a>
 ### CONTRIBUTING vs CI
 
-`CONTRIBUTING.md:11` gives the gate as
+`docs/governance/contribution.md:41` gives the gate as
 `cargo fmt --check && cargo clippy -- -D warnings && cargo test`. That is the
 intent, but it omits `--all`, `--workspace`, `--all-targets`, `--locked`,
 `--test-threads=1`, and its chained `&&` bails on first failure - the exact
@@ -141,7 +141,7 @@ Per-crate breakdown:
 ### Test styles by layer
 
 - **Sensor crates** test with **real TCP** against an ephemeral `:0` listener per
-  connection (`CONTRIBUTING.md:25-27`), plus static-check tests that enforce the
+  connection (e.g. `crates/sensor-catchall/tests/integration.rs:18`), plus static-check tests that enforce the
   sensor contract (see [adding-a-sensor](adding-a-sensor.md#the-tests-a-sensor-must-pass)).
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set

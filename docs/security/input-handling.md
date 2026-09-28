@@ -54,7 +54,10 @@ Supporting properties:
 each sensor must remember:
 
 - The framework enforces it for captured filenames: `orig_name` is sanitized in the capture
-  worker (`handoff.rs:202`), which is the **only** caller of `spool.store`; `spool.store`
+  worker's `process_job` (`handoff.rs:324-325`), which is the only sensor-side
+  caller of `spool.store` (the review fetcher's call,
+  `crates/review/src/fetcher/mod.rs:410`, discards the returned ref and never
+  sets `orig_name`); `spool.store`
   itself always returns an empty `orig_name` (`spool.rs`), so a sensor cannot route an
   unsanitized filename around the chokepoint (test
   `orig_name_is_sanitized_before_reaching_the_event`).
@@ -93,7 +96,7 @@ Tables, enums, and migrations: [../reference/database.md](../reference/database.
 Attacker input cannot drive unbounded resource use:
 
 - **Every sanitized field is length-capped** at its call site via `sanitize_value`'s
-  `max_len` (for example the SSH auth username, `auth.rs:34`), and byte-derived fields are
+  `max_len` (for example the SSH auth username in `handle_userauth`, `auth.rs:164-167`), and byte-derived fields are
   hex-bounded.
 - **Captured samples are size-bounded twice:** a per-file cap (`FileSizeExceeded`) and a
   **global byte budget** with an atomic check-and-reserve, recovered from disk on restart. A

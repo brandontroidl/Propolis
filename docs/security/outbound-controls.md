@@ -136,9 +136,10 @@ A **half**-configured target still fails closed: a url without a topic (or the
 reverse) aborts startup, because that is an operator mistake rather than a
 choice of sink, and silently downgrading it would page nothing while looking
 configured (`crates/propolis/src/ops_alert/config.rs`). Egress happens only when
-both `ntfy_url` and `ntfy_topic` are set. Alert body text is sanitized before
-send (`dispatch.rs:4`); each attempt carries a 30s timeout backstop
-(`dispatch.rs:22`).
+both `ntfy_url` and `ntfy_topic` are set. Alert header values are sanitized
+before send (`sanitize_header`, `dispatch.rs:141`); the body itself is
+deliberately left unsanitized, since it is never header-parsed. Each attempt
+carries a 30s timeout backstop (`dispatch.rs:22`).
 
 ### Not an egress path: GeoLite2
 

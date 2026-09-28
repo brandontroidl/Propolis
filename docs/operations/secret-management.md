@@ -19,8 +19,10 @@ All secrets are set in the per-service files under `/etc/propolis/`:
 
 - Files are mode `0600`, owned by the service user (`install.sh` creates the
   users; the `.env` files themselves are authored by hand - `crates/propolis/src/config.rs` reads them, `deploy/install.sh:25-28`).
-- `deploy/install.sh` **does not create or edit any `.env` file** - the script
-  "has no business fabricating" secret-bearing files (`install.sh:19-32,232-233`).
+- `deploy/install.sh` **does not create or edit any operator-owned `.env` file** -
+  the script "has no business fabricating" secret-bearing files; its only
+  generated env file, `/etc/propolis/fleet-listeners.env`, carries no secret
+  (`install.sh:19-32,153-154`).
 - Configuration is parsed from environment variables only; **no secret is read
   from argv** (all via `env::var`), so secrets do not appear in process listings
   or shell history.
@@ -90,7 +92,7 @@ scanning is outbound egress and defaults off.
 ### `PROPOLIS_OPS_NTFY_TOKEN` (optional)
 
 An optional bearer token for a protected ntfy topic used by operational
-self-alerting (`crates/propolis/src/ops_alert/config.rs:140`). Only relevant
+self-alerting (`crates/propolis/src/ops_alert/config.rs:153`). Only relevant
 when `PROPOLIS_OPS_ENABLED=true`.
 
 ## Handling rules

@@ -41,7 +41,7 @@ These abort startup when unset or empty:
 | `PROPOLIS_CONSOLE_PASSWORD` | unified daemon, standalone `console` | refuses to start; no console without it |
 | `PROPOLIS_SENSOR_LOGS` | unified daemon, `intake` | required; empty list or an entry missing name or path aborts |
 | `<P>_BIND` (per sensor) | each standard sensor | e.g. `PROPOLIS_SSH_BIND` unset → `NoBind` abort |
-| `CATCHALL_BIND_ADDRS` | `sensor-catchall` | note the **unprefixed** name; empty list refuses to start |
+| `PROPOLIS_CATCHALL_BIND_ADDRS` | `sensor-catchall` | the older unprefixed `CATCHALL_BIND_ADDRS` is still read, with a warning; empty list refuses to start |
 
 `sensor-cred` needs at least one of its five bind vars
 (`PROPOLIS_CRED_{VNC,MYSQL,MSSQL,PG,MONGO}_BIND`); none set → exit 1.

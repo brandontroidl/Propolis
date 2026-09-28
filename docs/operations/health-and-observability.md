@@ -23,7 +23,7 @@ operator-provided reverse proxy. See [networking and TLS](./networking-tls.md).
 
 | Endpoint | Purpose | Success | Failure | Cite |
 |---|---|---|---|---|
-| `GET /health` | Liveness only; does not touch the DB | `200 {"status":"ok"}` (always) | none | `crates/console/src/routes/health.rs:14-24` |
+| `GET /health` | Liveness only; does not touch the DB | `200 {"status":"ok"}` (always) | none | `health` (`crates/console/src/routes/health.rs:20-24`) |
 | `GET /ready` | Readiness; pings Postgres `SELECT 1`, then checks no supervised subsystem has given up (unified daemon only; the standalone console supervises nothing) | `200` | **`503 {"status":"unavailable"}`** on any DB error (fail-closed); **`503 {"status":"unavailable","gave_up":[...]}`** naming the dead subsystems | `health.rs` `ready` |
 | `GET /metrics` | Prometheus text (`version=0.0.4`) | `200` | derived live per scrape | `crates/console/src/routes/metrics.rs:1-11` |
 
@@ -99,16 +99,20 @@ related but distinct signal from these counters.
 The daemon can run an internal monitor that pages via [ntfy](https://ntfy.sh) when the system
 degrades. It is **off by default** and is one of the platform's operator-gated egress paths
 (see [outbound controls](../security/outbound-controls.md)). It is distinct from the Guardian
-host-compromise monitor and should use a separate topic (`INSTALL.md:502-533`).
+host-compromise monitor and should use a separate topic
+(`docs/archive/2026-08-26/root/INSTALL.md:502-533`; the live `INSTALL.md` is now a redirect
+stub).
 
 > **Warning - outbound egress.** Enabling the ops-alert monitor makes the daemon POST to your
 > configured ntfy server. That is the only network egress this feature performs, and it is off
 > until you set `PROPOLIS_OPS_ENABLED=true`.
 
-Configuration is **fail-closed**: when `PROPOLIS_OPS_ENABLED=true`, both
-`PROPOLIS_OPS_NTFY_URL` and `PROPOLIS_OPS_NTFY_TOPIC` become required and the daemon refuses to
-start without them, because a monitor that cannot page is worse than a loud config error
-(`crates/propolis/src/ops_alert/config.rs:119-134`). Exact defaults and bounds for every
+Configuration is **fail-closed only on a half-configured target**: when
+`PROPOLIS_OPS_ENABLED=true`, setting exactly one of `PROPOLIS_OPS_NTFY_URL` /
+`PROPOLIS_OPS_NTFY_TOPIC` makes the daemon refuse to start, because a target that looks
+configured but cannot page is worse than a loud config error; leaving both unset is
+accepted and falls back to alerting through the local log sink instead of ntfy
+(`parse_ops_alert`, `crates/propolis/src/ops_alert/config.rs:123-147`). Exact defaults and bounds for every
 `PROPOLIS_OPS_*` var are owned by [environment
 variables](../reference/environment-variables.md); the monitor watches (defaults):
 

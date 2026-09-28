@@ -42,7 +42,7 @@ Work outward from the process:
 ## Port not listening
 
 - **Bind var unset or wrong** - every sensor's `*_BIND` (catchall:
-  `CATCHALL_BIND_ADDRS`) is required with no default. Unset → the sensor refuses
+  `PROPOLIS_CATCHALL_BIND_ADDRS`) is required with no default. Unset → the sensor refuses
   to start. A typo'd `ip:port` → abort (strict sensors) or, for `cred`/`smtp`
   only, exit 1 on an invalid bind.
 - **Bound to the wrong interface** - `127.0.0.1:22` only accepts loopback.
@@ -64,7 +64,7 @@ to its socket.
 
 ## WAN attribution empty ("Distinct WAN vantages" reads 0, `wan_ip` null)
 
-Each sensor takes an optional `*_WAN_MAP` (catchall: `CATCHALL_WAN_MAP`) mapping a
+Each sensor takes an optional `*_WAN_MAP` (catchall: `PROPOLIS_CATCHALL_WAN_MAP`) mapping a
 local bind address to its public WAN IP, used for multi-vantage breadth scoring.
 Two accepted forms:
 

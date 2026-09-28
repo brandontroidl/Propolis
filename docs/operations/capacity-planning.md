@@ -28,8 +28,9 @@ over-sizing it can exhaust the server's connection slots.
 ## Capture queue
 
 Each spooling sensor hands captured bodies to a single background worker through a bounded
-in-process channel of **64** jobs (`SensorConfig::capture_queue_size`; SSH `server.rs:110`,
-FTP `lib.rs:14`, ADB `lib.rs`). The queue is deliberately small and drops rather than blocks
+in-process channel of **64** jobs, hard-coded per sensor rather than sourced from the unused
+`SensorConfig::capture_queue_size` field: SSH `server.rs:126`,
+FTP `CAPTURE_QUEUE_SIZE` (`lib.rs:15`), ADB `lib.rs`. The queue is deliberately small and drops rather than blocks
 when full, so it bounds memory, not throughput. Operational behavior under overload is
 described in [queue and spool](./queue-and-spool.md); it is not operator-tunable via env in the
 shipped config.
@@ -66,7 +67,8 @@ Defaults (all operator-overridable via each sensor's `_MAX_CONCURRENT` env var, 
 - most internet-facing sensors: **256**;
 - `sensor-http`: **512** (`crates/sensor-http/src/main.rs:20-24`);
 - `sensor-catchall`: 256, but with much tighter timeouts and a 4 KB capture cap
-  (`crates/sensor-catchall/src/main.rs:39-43`).
+  (`DEFAULT_READ_TIMEOUT_MS`/`DEFAULT_IDLE_TIMEOUT_MS`/`DEFAULT_MAX_CAPTURED_BYTES`,
+  `crates/sensor-catchall/src/main.rs:70-75`).
 
 A zero or unparseable bound is rejected at startup ("zero never means unlimited") for every
 sensor except SMTP and cred, which fall back to the default on invalid input
@@ -81,7 +83,7 @@ process cannot exceed; size sensor `max_concurrent` and capture load to stay wit
 
 | Unit | MemoryMax | TasksMax | CPUQuota | LimitNOFILE | Cite |
 |---|---|---|---|---|---|
-| `propolis` | 1 G | 256 | 100% | 4096 | `deploy/propolis.service:170-173` |
+| `propolis` | 1 G | 256 | 100% | 4096 | `deploy/propolis.service:176-179` |
 | `sensor-ssh` | 512 M | 128 | 75% | (default) | `deploy/sensor-ssh.service:34-78` |
 | `sensor-catchall` | 256 M | 64 | 50% | (default) | `deploy/sensor-catchall.service:33-73` |
 | other sensors | 256 M | 128 | 50% | (default) | `deploy/sensor-*.service` |

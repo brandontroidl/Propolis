@@ -105,17 +105,19 @@ and a vendor enabled with an empty API key is forced disabled, fail-closed
   The DShield wire contract is flagged in-code as provisional - the live
   endpoint 403'd during implementation, and the `"user:key"` single-slot
   composition is a noted open decision `[inferred]` (`main.rs:220-236`).
-- **OTX** (`vendor/otx.rs:4-82`) - pulses are forced `public: true` (OTX rejects
-  private). `name = "propolis: {ip} ({timestamp})"`, one indicator
-  `{indicator: ip, type: "IPv4", description}`.
+- **OTX** (`OtxAdapter::submit`, `vendor/otx.rs:84-106`) - pulses are forced
+  `public: true` (OTX rejects private). `name = "propolis: {ip} ({timestamp})"`,
+  one indicator `{indicator: ip, type, description}` where `type` is `"IPv4"`
+  or `"IPv6"` by the address family (`indicator_type`, `vendor/otx.rs:34-39`).
 
 ### Idempotency
 
 The idempotency key is `"{source_ip}:{vendor}:{date}"` where `date` is the UTC
-calendar day of the poll (`submit.rs:300-305`). The runner INSERTs a
-`success = false` row `ON CONFLICT (idempotency_key) DO NOTHING` BEFORE the HTTP
-call, then UPDATEs that row with the outcome after (`submit.rs:257-283`). The
-date scoping means a new UTC day permits re-reporting. Only an ATTEMPTED
+calendar day of the poll (`idempotency_key`, `submit.rs:328-333`). The runner
+INSERTs a `success = false` row `ON CONFLICT (idempotency_key) DO NOTHING`
+BEFORE the HTTP call, then UPDATEs that row with the outcome after
+(`submit.rs:273-306`). The date scoping means a new UTC day permits
+re-reporting. Only an ATTEMPTED
 submission writes a `vendor_submission` row; a held (ip, vendor) pair writes
 nothing (`submit.rs:14-19`).
 
@@ -148,7 +150,7 @@ could carry a WAN vantage address - confirmed by reading all three
 
 The report comment is
 `"propolis: {ip} - {N} event(s) across {M} categor{y/ies} since {first_seen}, current score {raw.round_dp(1)}"`,
-and `evidence_window = (first_seen, last_seen)` (`submit.rs:379-394`).
+and `evidence_window = (first_seen, last_seen)` (`build_report`, `submit.rs:407-422`).
 
 ## Ops-alert ntfy
 

@@ -131,7 +131,7 @@ sticky until an explicit delist.
 ### Confirmed-real gate
 
 `is_confirmed_real(protocol, authenticated, category) = (protocol == Tcp) && authenticated && (category == Honeypot)`
-(`crates/core-scoring/src/domain/enums.rs:115-117`). The latch is sticky:
+(`crates/core-scoring/src/domain/enums.rs:134-136`). The latch is sticky:
 `has_confirmed_real = prev || is_confirmed_real(...)` - once set, never unset
 (`engine.rs:145-146`). UDP/ICMP and unauthenticated or non-honeypot traffic
 never latch it.
@@ -216,7 +216,7 @@ is_reserved(ip) || allowlist_cidr_contains(ip) || delist_contains(ip) || asn_all
 
 The publisher re-validates every entry against exclusions at publish time; the
 FIRST violation rejects the WHOLE build, unlike the builder which drops
-offending rows (`crates/feed/src/publisher.rs:95-101,173-205`).
+offending rows (`revalidate`, `crates/feed/src/publisher.rs:213-239`).
 
 ## Reserved-range guard (`crates/core-scoring/src/net.rs`)
 

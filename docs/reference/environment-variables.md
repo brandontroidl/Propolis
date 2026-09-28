@@ -15,9 +15,10 @@ form, bounds/validation, and fail behavior. This page owns these facts; other
 docs link here rather than restating defaults.
 
 Defaults listed are the **code** defaults applied when a variable is unset or
-blank. All `/etc/propolis/*.env` files are operator-authored; `deploy/install.sh`
+blank. All `/etc/propolis/*.env` files except the generated `fleet-listeners.env`
+(`deploy/install.sh:28-32,153-154`) are operator-authored; `deploy/install.sh`
 does not generate them (it only prints a reminder to populate them,
-`deploy/install.sh:233`).
+`deploy/install.sh:173`).
 
 ## Run modes and where variables are read
 
@@ -88,7 +89,7 @@ console rDNS parse booleans more broadly (called out below).
 
 ### `PROPOLIS_HOSTNAME`
 - Read by: `sensor-framework::persona::hostname()`
-  (`crates/sensor-framework/src/persona.rs:46`); used by every sensor presenting
+  (`crates/sensor-framework/src/persona.rs:45`); used by every sensor presenting
   a host identity (SSH/telnet shell, fake-fs `/etc/hostname`, redis `INFO`,
   SMTP/FTP greeting).
 - Required: no. Default `server01` (`persona.rs:22`).
@@ -157,7 +158,7 @@ Concrete literal names the code reads (the `<V>` rows above, instantiated for ea
 Default base URLs (`crates/review/src/vendor/*.rs`):
 - abuseipdb: `https://api.abuseipdb.com` (`abuseipdb.rs:21`)
 - dshield: `https://www.dshield.org` (`dshield.rs:21`)
-- otx: `https://otx.alienvault.com` (`otx.rs:16`)
+- otx: `https://otx.alienvault.com` (`otx.rs:25`)
 
 ### Feed
 
@@ -323,30 +324,30 @@ public egress IP for self-target protection.
 
 `crates/propolis/src/ops_alert/config.rs`. Opt-in ntfy POST egress, default off.
 Parsed via an injectable getter over `env::var` that treats blank as absent.
-Helpers: `get_bool` (`:35`) accepts `true|1|yes|on` (case-insensitive), else
-default - broader than `parse_bool_flag`. `get_u64`/`get_secs` (`:55`/`:45`):
-unset → default; unparseable → abort; **below min → abort**. `get_pct` (`:96`):
-enforces `1..=100`; 0 and >100 → abort. `get_u32` (`:81`): u64 range-checked to
+Helpers: `get_bool` (`:44`) accepts `true|1|yes|on` (case-insensitive), else
+default - broader than `parse_bool_flag`. `get_u64`/`get_secs` (`:64`/`:54`):
+unset -> default; unparseable -> abort; **below min -> abort**. `get_pct` (`:105`):
+enforces `1..=100`; 0 and >100 -> abort. `get_u32` (`:90`): u64 range-checked to
 u32.
 
 | Variable | Req | Default | Min/bounds | Notes |
 |---|---|---|---|---|
-| `PROPOLIS_OPS_ENABLED` | no | `false` (`config.rs:119`) | - | opt-in; a deployment predating ops-alert still starts |
-| `PROPOLIS_OPS_NTFY_URL` | **yes if enabled** | `""` when disabled | - | enabled + missing → **abort** (`:125`). A monitor that cannot page must not start silently. |
-| `PROPOLIS_OPS_NTFY_TOPIC` | **yes if enabled** | `""` when disabled | - | enabled + missing → abort (`:127`). The `propolis-ops` value seen in tests is not a runtime default. |
-| `PROPOLIS_OPS_NTFY_TOKEN` | no | none (`:140`) | - | optional bearer token |
-| `PROPOLIS_OPS_POLL_INTERVAL_SECS` | no | `30` (`:141`) | min 1 | |
-| `PROPOLIS_OPS_REPAGE_COOLDOWN_SECS` | no | `5400` (`:142`) | min 1 | |
-| `PROPOLIS_OPS_STALL_FOR_SECS` | no | `600` (`:143`) | min 1 | |
-| `PROPOLIS_OPS_CAPACITY_FREE_PCT` | no | `15` (`:144`) | 1..=100 | 0/>100 → abort |
-| `PROPOLIS_OPS_FEED_STALE_MULTIPLE` | no | `2` (`:145`) | min 1 | u32 |
+| `PROPOLIS_OPS_ENABLED` | no | `false` (`config.rs:128`) | - | opt-in; a deployment predating ops-alert still starts |
+| `PROPOLIS_OPS_NTFY_URL` | no | `""` (unset reads as empty, `:139-140`) | - | enabled and set with the other unset -> abort (`:141-147`); enabled and both unset -> alerts go to the local log sink (`:130-134`) |
+| `PROPOLIS_OPS_NTFY_TOPIC` | no | `""` (unset reads as empty, `:139-140`) | - | enabled and set with the other unset -> abort (`:141-147`); enabled and both unset -> alerts go to the local log sink (`:130-134`). The `propolis-ops` value seen in tests is not a runtime default. |
+| `PROPOLIS_OPS_NTFY_TOKEN` | no | none (`:153`) | - | optional bearer token |
+| `PROPOLIS_OPS_POLL_INTERVAL_SECS` | no | `30` (`:154`) | min 1 | |
+| `PROPOLIS_OPS_REPAGE_COOLDOWN_SECS` | no | `5400` (`:155`) | min 1 | |
+| `PROPOLIS_OPS_STALL_FOR_SECS` | no | `600` (`:156`) | min 1 | |
+| `PROPOLIS_OPS_CAPACITY_FREE_PCT` | no | `15` (`:157`) | 1..=100 | 0/>100 -> abort |
+| `PROPOLIS_OPS_FEED_STALE_MULTIPLE` | no | `2` (`:158`) | min 1 | u32 |
 | `PROPOLIS_OPS_FEED_PUSH_EXPECTED` | no | `false` | bool | set once `deploy/blocklist-sync.sh` is in cron: `feed-push-stale` then pages when the feed has gone unpushed for the stale threshold (`FEED_STALE_MULTIPLE` build cycles) since the daemon started, instead of treating "no push marker" as grace forever |
-| `PROPOLIS_OPS_VENDOR_WINDOW_SECS` | no | `3600` (`:146`) | min 1 | |
-| `PROPOLIS_OPS_VENDOR_FAIL_PCT` | no | `50` (`:147`) | 1..=100 | |
-| `PROPOLIS_OPS_VENDOR_MIN_SAMPLES` | no | `20` (`:148`) | min 1 | u32 |
-| `PROPOLIS_OPS_BACKLOG_MAX` | no | `500` (`:149`) | min 1 | u64 |
-| `PROPOLIS_OPS_BACKLOG_FOR_SECS` | no | `900` (`:150`) | min 1 | |
-| `PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS` | no | `21600` (`:151`) | min 1 | |
+| `PROPOLIS_OPS_VENDOR_WINDOW_SECS` | no | `3600` (`:160`) | min 1 | |
+| `PROPOLIS_OPS_VENDOR_FAIL_PCT` | no | `50` (`:161`) | 1..=100 | |
+| `PROPOLIS_OPS_VENDOR_MIN_SAMPLES` | no | `20` (`:162`) | min 1 | u32 |
+| `PROPOLIS_OPS_BACKLOG_MAX` | no | `500` (`:163`) | min 1 | u64 |
+| `PROPOLIS_OPS_BACKLOG_FOR_SECS` | no | `900` (`:164`) | min 1 | |
+| `PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS` | no | `21600` (`:165`) | min 1 | |
 | `PROPOLIS_OPS_SCAN_STALE_SECS` | no | `21600` | min 1 | `scan-stale`: a spooled body unscanned, or a VirusTotal upload unverdicted, this long; silent unless VirusTotal is enabled |
 | `PROPOLIS_OPS_FETCH_STALE_SECS` | no | `3600` | min 1 | `fetch-stale`: a fetch url pending this long; silent unless the fetcher is enabled |
 
@@ -455,7 +456,7 @@ the bind address comes from config/env set by the deploy units. See
 Shared `ConnectionBounds` pattern via each crate's local
 `parse_positive_u64`/`parse_positive_u32`: unset → default; **present-but-zero or
 unparseable → abort startup** (no upper clamp - a very large timeout/bytes value
-is accepted). `parse_wan_map` (e.g. `sensor-ssh/src/main.rs:110`): comma-sep
+is accepted). `parse_wan_map` (e.g. `sensor-ssh/src/main.rs:131`): comma-sep
 `local_ip=wan_ip`; empty/absent → empty map (valid: no WAN attribution, stamps a
 null `wan_ip`); invalid entry → abort.
 
@@ -544,9 +545,9 @@ divergence risk the bare catchall names above already caused once.
 
 Sensor-specific extras:
 - **ssh** (`crates/sensor-ssh/src/main.rs`): `PROPOLIS_SSH_HOST_KEY_PATH`
-  (default `/var/lib/propolis/ssh/host_key`, `:48`), `PROPOLIS_SSH_SPOOL_DIR`
-  (default `/var/spool/propolis/ssh`, `:47`), `PROPOLIS_SSH_BANNER` (default =
-  persona `OPENSSH_VERSION` = `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10`, `main.rs:44` +
+  (default `/var/lib/propolis/ssh/host_key`, `:64`), `PROPOLIS_SSH_SPOOL_DIR`
+  (default `/var/spool/propolis/ssh`, `:63`), `PROPOLIS_SSH_BANNER` (default =
+  persona `OPENSSH_VERSION` = `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10`, `main.rs:60` +
   `persona.rs:41`; blank → default), `PROPOLIS_SSH_OUTBOX_DIR` (default
   `/var/spool/propolis/ssh/outbox`; see "Outbox manifest" below).
 - **ftp** (`crates/sensor-ftp/src/main.rs`): `PROPOLIS_FTP_SPOOL_DIR` (default
@@ -559,7 +560,8 @@ Sensor-specific extras:
   (default `/var/spool/propolis/telnet`), `PROPOLIS_TELNET_OUTBOX_DIR` (default
   `/var/spool/propolis/telnet/outbox`; see "Outbox manifest" below).
 - **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs:24`).
-- **catchall**: no spool variable (never spools file bodies, `main.rs:47-49`); no
+- **catchall**: no spool variable (never spools file bodies,
+  `crates/sensor-catchall/src/main.rs:78-81`); no
   outbox variable either (captures no file bodies, so nothing for SP-B-1b's
   manifest to record).
 
@@ -607,7 +609,7 @@ Invalid or zero bound → **silent default**, not abort.
   `PROPOLIS_VT_KEY` (`config.rs:613`). Either missing → VT off.
 - **Vendor enable requires key**: `PROPOLIS_VENDOR_<V>_ENABLED=true` with an
   empty `_KEY` → forced disabled and warns (`config.rs:486-493`, review
-  `main.rs:150-156`).
+  `main.rs:148-156`).
 - **DShield user+key composition**: `PROPOLIS_VENDOR_DSHIELD_USER` +
   `PROPOLIS_VENDOR_DSHIELD_KEY` compose to `{user}:{key}` in the single key slot
   (`config.rs:551-554`). User alone is ignored.

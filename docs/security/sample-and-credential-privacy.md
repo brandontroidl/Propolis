@@ -46,7 +46,8 @@ Enforcement:
   [../reference/events-and-signals.md](../reference/events-and-signals.md).
 - **Captured identifiers are sanitized.** The `username` and `method` that *are*
   captured are length-capped and run through `sanitize_value` before entering the
-  event (`auth.rs:34` and four `sanitize_value` calls in `auth.rs`). The shared
+  event (`auth.rs:164-167` for `username`, `auth.rs:149-152` for `method` - two
+  `sanitize_value` calls in `auth.rs`). The shared
   sanitizer chokepoint is covered by
   [input-handling.md](input-handling.md).
 

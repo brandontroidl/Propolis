@@ -67,7 +67,8 @@ enforces the latter).
 
 Sensors emit `sensor_wire::SensorEvent` only - raw facts (`source_ip`, `wan_ip`,
 `sensor`, `signal_type` and `protocol` as plain strings, `authenticated`,
-`observed_at`, `metadata`, optional `sample`, optional `session_id`). Weight,
+`observed_at`, `metadata`, optional `sample`, optional `session_id`, optional
+`occurrence_id`). Weight,
 confidence, and category are **not** on the wire; they are derived downstream by
 intake. The encoding is frozen and hash-chain-critical - see
 [schema-and-migrations](schema-and-migrations.md#the-frozen-wire-contract) and
@@ -79,13 +80,13 @@ emit only the SP2 signal subset (`catchall_probe`, `honeypot_connection`,
 ## The tests a sensor must pass
 
 Sensors test with **real TCP** against an ephemeral `:0` listener per connection
-(`CONTRIBUTING.md:25-27`). Two static-check tests enforce the "never execute, never
+(e.g. `crates/sensor-catchall/tests/integration.rs:18`). Two static-check tests enforce the "never execute, never
 fetch" guarantee and should be present in a new sensor's `tests/`:
 
 - **`never_exec_static_check`** - greps the crate's own `src/` for process-spawning
   patterns (`std::process::Command`, `process::Command`, `Command::new`,
   `libc::exec`, `nix::unistd::exec`) and fails if any appear (e.g.
-  `crates/sensor-http/tests/integration.rs:198`). Present across the protocol
+  `crates/sensor-http/tests/integration.rs:315-336`). Present across the protocol
   sensors (ftp, telnet, redis, adb, http, smtp, cred, ssh).
 - **No HTTP-client dependency** - `crates/sensor-ssh/tests/shell_test.rs:364`
   (`sensor_ssh_has_no_http_client_dependency`) asserts the crate manifest declares
@@ -126,7 +127,7 @@ sensor's unit is not automatically covered; extend `deploy_test.rs` to assert yo
 new unit too.
 
 Then register the binary and unit in `deploy/install.sh` (the binary list at
-`install.sh:198` and the unit-enable list at `install.sh:215`). `install.sh` installs
+`install.sh:120` and the unit list at `install.sh:137`). `install.sh` installs
 units but does **not** start them; `systemctl enable --now <unit>` is an operator
 action after populating `/etc/propolis/<name>.env`. Deploy details:
 [`operations/service-lifecycle`](../operations/service-lifecycle.md); real bind ports:

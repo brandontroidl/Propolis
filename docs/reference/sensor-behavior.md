@@ -36,11 +36,12 @@ not restate values owned elsewhere:
 ## Shared wire contract
 
 Every sensor emits the frozen NDJSON `SensorEvent` record defined in `sensor-wire`
-(`crates/sensor-wire/src/lib.rs:37-53`): `v`, `source_ip`, `wan_ip` (nullable),
+(`crates/sensor-wire/src/lib.rs:39-61`): `v`, `source_ip`, `wan_ip` (nullable),
 `sensor`, `signal_type`, `protocol`, `authenticated`, `observed_at` (RFC 3339),
-`metadata` (JSON), `sample` (optional `SampleRef`), `session_id` (optional). Wire
+`metadata` (JSON), `sample` (optional `SampleRef`), `session_id` (optional),
+`occurrence_id` (optional). Wire
 version is `1` (`:12`). A captured sample is referenced by
-`SampleRef { sha256, size, orig_name }` (`:59-63`); `orig_name` is a sanitized
+`SampleRef { sha256, size, orig_name, capture_id }` (`:67-77`); `orig_name` is a sanitized
 indicator string, never a path component. Signal-type and protocol constants are
 owned by [`events-and-signals.md`](events-and-signals.md).
 
@@ -64,14 +65,14 @@ not queued) (`bounds.rs:29-33`). Every bound is validated at startup: for most
 sensors a present-but-zero or unparseable value is rejected and the process refuses
 to start ("zero never means unlimited"). **Exceptions:** `sensor-smtp`
 (`crates/sensor-smtp/src/main.rs:28-38`) and `sensor-cred`
-(`crates/sensor-cred/src/main.rs:29-38`) fall back to the default on an
+(`crates/sensor-cred/src/main.rs:29-39`) fall back to the default on an
 invalid or zero value instead of refusing to start. This is an evidenced
 behavioral inconsistency across the sensor set, not a bug claim.
 
 Common defaults across the internet-facing TCP sensors are `read_timeout`
 30000&nbsp;ms, `idle_timeout` 60000&nbsp;ms, `max_duration` 600&nbsp;s,
 `max_captured_bytes` 1_000_000, `max_concurrent` 256 (verified
-`crates/sensor-ssh/src/main.rs:53-57`). Per-sensor deviations are noted in the
+`crates/sensor-ssh/src/main.rs:72-76`). Per-sensor deviations are noted in the
 protocol table below; the canonical values live in
 [`environment-variables.md`](environment-variables.md).
 
@@ -124,7 +125,7 @@ shell over ADB and carries busybox and `su`.
 
 `fakefs.rs` is an in-memory static snapshot, fresh per session, with no real
 filesystem underneath, so path traversal is structurally impossible
-(`crates/sensor-framework/src/fakefs.rs:1-14`). It serves canned `/etc/hostname`,
+(`crates/sensor-framework/src/fakefs.rs:1-5`). It serves canned `/etc/hostname`,
 `/etc/passwd` (9 accounts incl. root, `ubuntu` uid 1000, `www-data`, `sshd`),
 `/etc/hosts` (loopback and IPv6 multicast only - no routable IPs), `/etc/os-release`,
 `/proc/version`, `/proc/cpuinfo` (Intel Xeon E5-2686 v4, 1 core), and one mount table
@@ -234,7 +235,7 @@ with 0640 permissions and re-hash-on-read fail-closed integrity
 
 `CaptureHandoff` moves capture off the connection's response path so a capture
 never delays the reply - response latency must not leak whether a capture happened
-(`crates/sensor-framework/src/handoff.rs:1-14`). `submit(job)` is backed by
+(`crates/sensor-framework/src/handoff.rs:1-9`). `submit(job)` is backed by
 `mpsc::try_send` and never blocks: a full queue drops the job, returns
 `CaptureDropped`, increments `dropped_count`, and logs at power-of-two totals
 (`:109-148`). Every spooling sensor sets `capture_queue_size` = **64**
@@ -250,8 +251,8 @@ is isolated with `catch_unwind` and the worker continues (`:35-41, 200-225`).
 `EventEmitter::append(event)` serializes to one NDJSON line, opens the log with
 `O_APPEND` (atomic concurrent appends on local storage), then `write_all` +
 `flush`; a serialize/append failure never partially writes a line
-(`crates/sensor-framework/src/emit.rs:40-53, 1-7`). The log directory must be local
-storage - NFS `O_APPEND` can race (`:26-39`).
+(`crates/sensor-framework/src/emit.rs:45-68, 1-7`). The log directory must be local
+storage - NFS `O_APPEND` can race (`:25-34`).
 
 ## Per-protocol capture behavior
 
@@ -270,9 +271,9 @@ captures SCP/SFTP transfers.
   `ssh-ed25519` (ed25519, loaded-or-generated and persisted so it is stable across
   restarts), cipher `chacha20-poly1305@openssh.com` both directions (AEAD),
   compression `none` (`crates/sensor-ssh/src/transport/mod.rs:467-502`,
-  `main.rs:246-285`). Banner default is the persona OpenSSH version
-  (`main.rs:44`). A residual HASSHServer distinguishability from the minimal
-  KEXINIT offer is a tracked follow-up (`main.rs:41-43`).
+  `main.rs:284-321`). Banner default is the persona OpenSSH version
+  (`main.rs:60`). A residual HASSHServer distinguishability from the minimal
+  KEXINIT offer is a tracked follow-up (`main.rs:57-59`).
 - **Auth** (`auth.rs`): **accepts every credential and method** - reaching userauth
   is itself crypto proof the peer is real - except `none`, which is rejected with
   `USERAUTH_FAILURE` listing `publickey,password` to defeat the
@@ -296,9 +297,9 @@ captures SCP/SFTP transfers.
   `truncated: true` plus the real `wire_size`. A transfer still open when the session
   ends (SCP before its trailer, SFTP handles never CLOSEd) is kept as a capture with
   `complete: false` rather than dropped.
-- **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`server.rs:107-111`).
+- **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`server.rs:119-129`).
 - **Bounds:** common defaults (deliberately identical to Telnet), `max_concurrent`
-  256 (`main.rs:53-57`).
+  256 (`main.rs:72-76`).
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
   `honeypot_command_exec`, `honeypot_file_download` (via shell),
   `honeypot_malware_upload` (SCP/SFTP).
@@ -313,10 +314,10 @@ credential, then presents the fake shell.
   ECHO/SGA), never replies to `WONT`/`DONT` (RFC 854 loop avoidance) (`:16-19,
   42-44, 125-141`). The IAC/subnegotiation stripper survives being split across
   reads (`:54-160`).
-- **Flow** (`handler.rs:52-171`): writes the persona issue banner and
+- **Flow** (`handler.rs:62-204`): writes the persona issue banner and
   `<host> login:` prompt; reads the username (cap `MAX_USERNAME_LEN = 255`);
   prompts `Password:` and reads the password **read-only, then drops it, never
-  stored or logged** (`:105-114`); accepts unconditionally and emits
+  stored or logged** (`:119-125`); accepts unconditionally and emits
   `honeypot_login_attempt` (authenticated=true); enters the FakeShell. Echoes typed
   characters, hides password characters, translates shell LF to CR-LF for NVT.
   `MAX_LINE_LEN` 8192.
@@ -368,9 +369,9 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
   poisoning (historical fix, commits `94a62ae1`, `016721e1`).
 - **Caps:** `MAX_STOR_BODY = 10_000_000` (a larger STOR keeps the prefix, drains up
   to `MAX_STOR_DRAIN` more to measure it, and emits `truncated`/`wire_size` - see
-  [events-and-signals](events-and-signals.md#sampleref-librs59-63)), login
+  [events-and-signals](events-and-signals.md#sampleref-librs67-77)), login
   sanitized cap 255.
-- **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`lib.rs:12-14, 26-32`).
+- **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`lib.rs:13-15, 29-36`).
 - **Bounds:** common defaults, `max_concurrent` 256.
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
   `honeypot_malware_upload`.
@@ -457,10 +458,10 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
 A passive, protocol-agnostic listener that emulates no protocol and **never writes
 a byte back** (`crates/sensor-catchall/src/handler.rs:1-9, 30-32`).
 
-- **Binds** every listed address on **both TCP and UDP** (`CATCHALL_BIND_ADDRS`, a
+- **Binds** every listed address on **both TCP and UDP** (`PROPOLIS_CATCHALL_BIND_ADDRS`, a
   comma-separated `ip:port` list, ≥1 required); per-port bind failure is non-fatal
-  (`main.rs:253-297`).
-- **Distinct bound defaults** (`main.rs:39-43`): `read_timeout` **5000&nbsp;ms**,
+  (`main.rs:286-330`).
+- **Distinct bound defaults** (`main.rs:71-75`): `read_timeout` **5000&nbsp;ms**,
   `idle_timeout` **5000&nbsp;ms**, `max_duration` **30&nbsp;s**,
   `max_captured_bytes` **4096**, `max_concurrent` 256.
 - **Behavior** (`handler.rs`): reads up to `max_captured_bytes` and emits one
@@ -482,7 +483,7 @@ per-protocol bind var is required.
 - **Distinct bound defaults** (`main.rs:51-72`): `read_timeout` 30000&nbsp;ms,
   `idle_timeout` 60000&nbsp;ms, `max_duration` **60&nbsp;s**, `max_captured_bytes`
   **100_000**, `max_concurrent` 256. Bound parsing falls back to the default on
-  invalid input (`:29-38`).
+  invalid input (`:29-39`).
 
 | Protocol | Impersonates (conventional port) | Capture behavior |
 |---|---|---|
@@ -502,8 +503,8 @@ per-protocol bind var is required.
   listener, per datagram for catchall UDP; carried on every event.
 - **Password discipline:** every login-capturing sensor reads the password only to
   advance the protocol and drops it - never stored, logged, or placed in any event
-  field (SSH `auth.rs:11-21`, telnet `handler.rs:108-114`, FTP `:104-111`, redis
-  `handler.rs:329-348`, SMTP `:101-131`, cred handlers). Tests assert absence at
+  field (SSH `auth.rs:11-16`, telnet `handler.rs:119-125`, FTP `:104-111`, redis
+  `handler.rs:360-374`, SMTP `:101-131`, cred handlers). Tests assert absence at
   the serialized-JSON level.
 - **`authenticated` flag:** `honeypot_connection` and `catchall_probe` are always
   false; ADB events are always false (no auth step); `honeypot_login_attempt` is

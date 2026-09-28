@@ -11,34 +11,34 @@ last-verified: 2026-08-26
 
 The enforced conventions (fmt, clippy-deny-warnings) are checked by CI on every
 push and pull request - see [build-and-test](build-and-test.md). The rest are
-stated in `CONTRIBUTING.md` and observable in the tree.
+listed in `docs/manuals/contributor.md:93-100` and observable in the tree.
 
 ## Language and formatting
 
-- **Rust 2024 edition** on every crate (`crates/*/Cargo.toml:4`, `CONTRIBUTING.md:18`).
+- **Rust 2024 edition** on every crate (`crates/*/Cargo.toml:4`).
 - **Pinned toolchain** `1.96.1` - see [toolchain-and-environment](toolchain-and-environment.md).
 - **`cargo fmt`** with default rustfmt config (no `rustfmt.toml` in the tree).
-  `cargo fmt --all --check` is a CI gate (`CONTRIBUTING.md:18`, `ci.yml:51`).
+  `cargo fmt --all --check` is a CI gate (`ci.yml:51`); the contribution guide's local
+  check runs `cargo fmt --check` (`docs/governance/contribution.md:41`).
 - **Line endings LF**, final newline, trimmed trailing whitespace, UTF-8, 4-space
   Rust indent - enforced by `.editorconfig`.
 
 ## Lint
 
 `cargo clippy --workspace --all-targets --locked -- -D warnings` must pass - clippy
-runs with **warnings denied**, so any lint is a hard failure (`CONTRIBUTING.md:19`,
+runs with **warnings denied**, so any lint is a hard failure (`docs/governance/contribution.md:41`,
 `ci.yml:72`). `--all-targets` means test code is linted too.
 
 ## Comments
 
-Comment the **why**, never the **what**. `CONTRIBUTING.md:21`: "No comments
-restating what the code does. Comment only the non-obvious why." The tree follows
-this - comments explain constraints, invariants, and workarounds (e.g. the frozen
+Comment the **why**, never the **what** (`docs/manuals/contributor.md:95`). The tree follows this -
+comments explain constraints, invariants, and workarounds (e.g. the frozen
 hash-chain encoding, the serde casing asymmetry, `pipefail` in CI), not line-by-line
 narration.
 
 ## Commits
 
-Conventional commits, **lowercase**, with a why-focused body (`CONTRIBUTING.md:20`).
+Conventional commits, **lowercase**, with a why-focused body (`docs/governance/contribution.md:29-30`).
 Example subject line (example only):
 
 ```

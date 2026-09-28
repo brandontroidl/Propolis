@@ -38,9 +38,10 @@ test**. `sqlx` version is `0.9.0` (`crates/core-scoring/Cargo.toml:15`).
 
 ### Local dev container (podman)
 
-The committed `.env` (gitignored, `.gitignore:7`) uses a disposable, localhost-only,
-trust-auth container named `propolis-pg`. Recreate it with the recipe recorded in
-`.env`:
+The dev database is a disposable, localhost-only, trust-auth container named
+`propolis-pg`, the same recipe as the [quickstart](../manuals/quickstart.md). A local
+`.env` can hold the settings below, but it is gitignored (`.gitignore:7`) and never
+committed. Create the container with:
 
 ```
 podman run -d --name propolis-pg \
@@ -55,30 +56,30 @@ podman run -d --name propolis-pg \
 > concern - see [`operations/installation`](../operations/installation.md) and
 > [`operations/secret-management`](../operations/secret-management.md).
 
-Then `podman start propolis-pg` on later sessions (`CONTRIBUTING.md:9`).
+Then `podman start propolis-pg` on later sessions.
 
 ### `DATABASE_URL`
 
 `sqlx::test` reads `DATABASE_URL` to reach the server, then creates its own
-per-test database. The committed dev value (`.env`):
+per-test database. The dev value (`docs/manuals/quickstart.md:45`):
 
 ```
 DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres
 ```
 
-**Documented discrepancy.** Three different URLs appear across the repo and they
+**Documented discrepancy.** Four different URLs appear across the repo and they
 are not interchangeable:
 
 | Source | `DATABASE_URL` |
 |---|---|
-| `.env` (dev, committed) | `postgres://postgres@127.0.0.1:5432/postgres` |
+| `docs/manuals/quickstart.md:45` (dev) | `postgres://postgres@127.0.0.1:5432/postgres` |
 | CI (`.github/workflows/ci.yml:93`) | `postgres://postgres@localhost:5432/postgres` |
-| `CONTRIBUTING.md:10` | `postgres://propolis:...@localhost:5432/propolis_test` |
-| `INSTALL.md:130` (production) | `postgres://propolis:YOUR_PASSWORD@localhost:5432/propolis` |
+| `docs/archive/2026-08-26/root/CONTRIBUTING.md:10` | `postgres://propolis:...@localhost:5432/propolis_test` |
+| `deploy/propolis.env.example:35` (production) | `postgres://propolis:CHANGE_ME@localhost:5432/propolis` |
 
-The `propolis`-user / `propolis_test`-db form in `CONTRIBUTING.md` is **not** what
-CI or the committed `.env` use - the working test setup is the superuser/`trust`
-form. Use the `.env` value for local development.
+The `propolis`-user / `propolis_test`-db form in the archived `CONTRIBUTING.md` is **not** what
+CI or the dev setup use - the working test setup is the superuser/`trust`
+form. Use the dev value for local development.
 
 Local-gate caveats (toolchain PATH ordering, starting the container) are
 environment-specific and out of scope here; the canonical build/test commands are

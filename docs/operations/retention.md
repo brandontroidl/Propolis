@@ -45,7 +45,7 @@ reference](../reference/scoring-and-feed.md).
 Retention windows and TTLs govern only what the local feed under
 `/var/lib/propolis/feed/current` contains. Publishing that feed to a public repository is a
 separate operator step: `deploy/blocklist-sync.sh` run from cron on the node, **not** wired
-into any shipped systemd timer or cron file (`deploy/blocklist-sync.sh:9`). See
+into any shipped systemd timer or cron file (`deploy/blocklist-sync.sh:8`). See
 [deployment models](./deployment-models.md) and [outbound
 controls](../security/outbound-controls.md).
 

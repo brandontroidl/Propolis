@@ -41,7 +41,7 @@ Consequences:
 ## The `cargo vendor` workflow
 
 After adding or updating a dependency
-(`CONTRIBUTING.md:13-14`):
+(`docs/manuals/contributor.md:111-113`):
 
 > **Egress warning.** `cargo vendor` fetches from crates.io. Run it on a
 > workstation, never on the honeypot node.

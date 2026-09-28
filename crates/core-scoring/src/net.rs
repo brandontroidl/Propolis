@@ -8,7 +8,7 @@
 //! `recommended_for_vendor` from ordinary sensor testing and be one approval click away from being
 //! reported to AbuseIPDB, DShield and OTX as an attacker. One definition, both callers.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 
 use ipnet::IpNet;
@@ -85,26 +85,83 @@ static RESERVED_RANGES: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
     .collect()
 });
 
+/// The IPv4 address an IPv6 address carries, for the forms that name an IPv4 host: IPv4-mapped
+/// (`::ffff:a.b.c.d`), the NAT64 well-known prefix (`64:ff9b::a.b.c.d`, RFC 6052) and 6to4
+/// (`2002:aabb:ccdd::/48`, RFC 3056). `None` for every other address. Shared by
+/// [`is_reserved_ip`] and the fetcher's SSRF guard so both decode the same forms the same way.
+pub fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let seg = v6.segments();
+    let from =
+        |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    if seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6].iter().all(|&s| s == 0) {
+        return Some(from(seg[6], seg[7]));
+    }
+    if seg[0] == 0x2002 {
+        return Some(from(seg[1], seg[2]));
+    }
+    None
+}
+
 /// True if `ip` falls in a reserved or special-purpose range that must never be published to a
 /// blocklist or reported to a threat-intelligence vendor.
 ///
-/// Canonicalizes an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its embedded IPv4 form first,
-/// so a mapped private/reserved address cannot slip past this check the way a bare
-/// `RESERVED_RANGES` lookup would miss it (the ranges list only carries the unmapped `::1`/
-/// `fe80::/10`/etc forms, never the `::ffff:0:0/96` wrapper). The fetcher's own SSRF guard
-/// (`review::fetcher::guard::canonicalize`) already does this unwrap before calling in; this
-/// backports the same behavior here so every caller of the shared function gets it.
+/// An IPv6 address that carries an IPv4 one ([`embedded_ipv4`]) is reserved if either is: the
+/// ranges list holds the unwrapped forms, so without this `::ffff:10.0.0.1`, `64:ff9b::7f00:1` or
+/// `2002:a00:1::` would pass as ordinary public addresses.
 pub fn is_reserved_ip(ip: IpAddr) -> bool {
-    let ip = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        IpAddr::V4(_) => ip,
-    };
-    RESERVED_RANGES.iter().any(|net| net.contains(&ip))
+    let in_ranges = |ip: IpAddr| RESERVED_RANGES.iter().any(|net| net.contains(&ip));
+    match ip {
+        IpAddr::V4(_) => in_ranges(ip),
+        IpAddr::V6(v6) => {
+            in_ranges(ip) || embedded_ipv4(v6).is_some_and(|v4| in_ranges(IpAddr::V4(v4)))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every IPv6 form that carries an IPv4 host is judged by that host too, and only those forms
+    /// are decoded: the same wrappers around a public IPv4 address stay publishable.
+    #[test]
+    fn an_ipv6_wrapper_around_a_reserved_ipv4_address_is_reserved() {
+        for wrapped in [
+            "::ffff:10.0.0.1",    // IPv4-mapped
+            "64:ff9b::7f00:1",    // NAT64 well-known prefix, 127.0.0.1
+            "64:ff9b::a9fe:a9fe", // NAT64 well-known prefix, 169.254.169.254
+            "2002:a00:1::",       // 6to4, 10.0.0.1
+            "2002:c0a8:101::5",   // 6to4, 192.168.1.1
+        ] {
+            assert!(
+                is_reserved_ip(wrapped.parse().unwrap()),
+                "{wrapped} must be reserved"
+            );
+        }
+        for public in ["::ffff:8.8.8.8", "64:ff9b::808:808", "2002:808:808::1"] {
+            assert!(
+                !is_reserved_ip(public.parse().unwrap()),
+                "{public} wraps a public address and must stay publishable"
+            );
+        }
+        assert_eq!(
+            embedded_ipv4("64:ff9b::7f00:1".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            embedded_ipv4("2002:a00:1::".parse().unwrap()),
+            Some("10.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            embedded_ipv4("64:ff9b:1::a00:1".parse().unwrap()),
+            None,
+            "only the well-known /96 NAT64 prefix carries a decodable address"
+        );
+        assert_eq!(embedded_ipv4("2600::1".parse().unwrap()), None);
+    }
 
     #[test]
     fn rfc1918_space_is_reserved() {

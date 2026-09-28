@@ -245,8 +245,11 @@ operator-configurable (`RESERVED_RANGES`):
 
 The list matches the IANA IPv4 and IPv6 Special-Purpose Address Registries
 (both last updated 2025-10-09; compared 2026-09-28): every block they mark not
-globally reachable is in it except the IPv4-mapped prefix `::ffff:0:0/96`,
-which `is_reserved_ip` unwraps to the embedded IPv4 address before checking.
+globally reachable is in it except the IPv4-mapped prefix `::ffff:0:0/96`.
+`is_reserved_ip` also judges an IPv6 address by the IPv4 host it carries, for
+the three forms that carry one (`embedded_ipv4`: IPv4-mapped, the well-known NAT64
+`64:ff9b::/96` and 6to4 `2002::/16`), so `::ffff:10.0.0.1`, `64:ff9b::7f00:1` and
+`2002:a00:1::` are reserved while the same forms around a public address are not.
 Two calls go beyond the registries' reachability column:
 
 - `192.0.0.0/24` and `2001::/23` are listed whole, although a few members are
@@ -254,11 +257,11 @@ Two calls go beyond the registries' reachability column:
   and identifier prefixes (ORCHIDv2, drone entity tags). None of them is an
   attacking host's own address.
 - 6to4 (`2002::/16`, reachability "N/A") is not listed: a 6to4 address belongs
-  to whoever holds its embedded public IPv4 address.
+  to whoever holds its embedded IPv4 address, so it is judged by that address.
 
 The malware fetcher's SSRF guard applies this same list and adds own-host
 addresses, rejection of Teredo, deprecated v4-compat and non-`/96` NAT64 forms,
-decoding of 6to4 and well-known NAT64 addresses to their embedded IPv4, and a
+decoding of the same embedded-IPv4 forms (the shared `embedded_ipv4`), and a
 fetch-only list repeating `0.0.0.0/8`, `100.64.0.0/10` and `::` - see
 [integrations.md](integrations.md) and
 [../security/outbound-controls.md](../security/outbound-controls.md).

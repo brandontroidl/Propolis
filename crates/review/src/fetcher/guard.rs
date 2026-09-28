@@ -1,6 +1,6 @@
-use core_scoring::is_reserved_ip;
+use core_scoring::{embedded_ipv4, is_reserved_ip};
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv6Addr, ToSocketAddrs};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EgressReject {
@@ -15,34 +15,16 @@ fn canonicalize(ip: IpAddr) -> Result<IpAddr, EgressReject> {
     let IpAddr::V6(v6) = ip else {
         return Ok(ip);
     };
-    if let Some(v4) = v6.to_ipv4_mapped() {
-        return Ok(IpAddr::V4(v4)); // ::ffff:a.b.c.d
+    // IPv4-mapped, the NAT64 well-known /96 and 6to4: dial-checked as the IPv4 host they name.
+    if let Some(v4) = embedded_ipv4(v6) {
+        return Ok(IpAddr::V4(v4));
     }
     let seg = v6.segments();
     if seg[0] == 0x64 && seg[1] == 0xff9b {
-        // NAT64 well-known prefix space (RFC 6052 / RFC 8215). Decode the well-known /96 form to its
-        // embedded IPv4 and re-check; reject any other NAT64 address (e.g. the 64:ff9b:1::/48
-        // local-use prefix) outright. Propolis has a v4 WAN (no NAT64 route), so a NAT64 address can
-        // only be an attacker steering us at a translated target, and only the /96 form decodes
-        // cleanly; over-blocking the rest is safe here.
-        if seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
-            return Ok(IpAddr::V4(Ipv4Addr::new(
-                (seg[6] >> 8) as u8,
-                seg[6] as u8,
-                (seg[7] >> 8) as u8,
-                seg[7] as u8,
-            )));
-        }
+        // Any other NAT64 address (e.g. the 64:ff9b:1::/48 local-use prefix). Propolis has a v4 WAN
+        // (no NAT64 route), so a NAT64 address can only be an attacker steering us at a translated
+        // target, and only the well-known /96 decodes cleanly; over-blocking the rest is safe here.
         return Err(EgressReject::ExtraRange);
-    }
-    if seg[0] == 0x2002 {
-        // 6to4 2002::/16
-        return Ok(IpAddr::V4(Ipv4Addr::new(
-            (seg[1] >> 8) as u8,
-            seg[1] as u8,
-            (seg[2] >> 8) as u8,
-            seg[2] as u8,
-        )));
     }
     if seg[0] == 0x2001 && seg[1] == 0 {
         return Err(EgressReject::Teredo); // 2001::/32

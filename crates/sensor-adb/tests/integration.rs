@@ -289,10 +289,7 @@ async fn push_file_captured_to_spool() {
 async fn wait_for_spooled_file(spool_dir: &std::path::Path) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(6);
     while std::time::Instant::now() < deadline {
-        if std::fs::read_dir(spool_dir)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false)
-        {
+        if !spooled_files(spool_dir).is_empty() {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -356,13 +353,13 @@ async fn shell_payload_session(
     }
 
     wait_for_upload_event(&srv.log_path).await;
-    let spooled: Vec<_> = std::fs::read_dir(&srv.spool_dir).unwrap().collect();
+    let spooled = spooled_files(&srv.spool_dir);
     assert_eq!(
         spooled.len(),
         1,
         "exactly one capture must reach the spool however the session ended"
     );
-    let stored = std::fs::read(spooled[0].as_ref().unwrap().path()).unwrap();
+    let stored = std::fs::read(&spooled[0]).unwrap();
 
     let events = srv.events().await;
     let upload = events
@@ -895,6 +892,24 @@ async fn unsupported_open_destination_is_refused_with_close_not_okay() {
     );
     assert_eq!(header.arg1, 5);
     srv.handle.abort();
+}
+
+/// The captures stored in `dir`: files named by the SHA-256 of their content. The spool also holds a
+/// `.staging/` directory, where a body is written before it is published under that name.
+fn spooled_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    sensor_framework::spool::is_canonical_sha256_hex(
+                        &e.file_name().to_string_lossy(),
+                    )
+                })
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn walkdir_or_manual(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

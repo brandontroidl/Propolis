@@ -339,10 +339,28 @@ async fn a_payload_cut_off_mid_line_is_still_captured_and_marked_incomplete() {
     assert_eq!(event.metadata["wire_size"], payload.len() as u64);
     assert_eq!(event.metadata["truncated"], false);
 
-    let spooled: Vec<_> = std::fs::read_dir(&spool_dir).unwrap().collect();
+    let spooled = spooled_files(&spool_dir);
     assert_eq!(spooled.len(), 1, "the cut-off payload must be spooled");
-    let stored = std::fs::read(spooled[0].as_ref().unwrap().path()).unwrap();
+    let stored = std::fs::read(&spooled[0]).unwrap();
     assert_eq!(stored, payload, "the stored bytes are what the client sent");
+}
+
+/// The captures stored in `dir`: files named by the SHA-256 of their content. The spool also holds a
+/// `.staging/` directory, where a body is written before it is published under that name.
+fn spooled_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    sensor_framework::spool::is_canonical_sha256_hex(
+                        &e.file_name().to_string_lossy(),
+                    )
+                })
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// How the client ends the session. The sensor has no protocol-defined end of file for a shell
@@ -591,10 +609,7 @@ async fn binary_shell_payload_is_captured_as_malware_upload() {
 
     // The sample must actually have landed in the spool directory, not just be named in the
     // event - the spool is the recoverable-evidence artifact this fix exists to produce.
-    let spooled: Vec<_> = std::fs::read_dir(&spool_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .collect();
+    let spooled = spooled_files(&spool_dir);
     assert!(
         !spooled.is_empty(),
         "the binary payload must be written to the quarantine spool directory"

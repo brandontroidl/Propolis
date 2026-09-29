@@ -541,9 +541,9 @@ async fn a_payload_cut_off_mid_line_is_still_captured_and_marked_incomplete() {
     drop(conn);
     handle.abort();
 
-    let spooled: Vec<_> = std::fs::read_dir(&spool_dir).unwrap().collect();
+    let spooled = spooled_files(&spool_dir);
     assert_eq!(spooled.len(), 1, "the cut-off payload must be spooled");
-    let stored = std::fs::read(spooled[0].as_ref().unwrap().path()).unwrap();
+    let stored = std::fs::read(&spooled[0]).unwrap();
     assert_eq!(stored, payload, "the stored bytes are what the client sent");
 
     let content = tokio::fs::read_to_string(&log_path).await.unwrap();
@@ -656,9 +656,9 @@ async fn payload_session(bounds: ConnectionBounds, payload: &[u8], ending: Endin
     }
     handle.abort();
 
-    let stored_dir: Vec<_> = std::fs::read_dir(&spool_dir).unwrap().collect();
+    let stored_dir = spooled_files(&spool_dir);
     assert_eq!(stored_dir.len(), 1, "exactly one capture per session");
-    let stored = std::fs::read(stored_dir[0].as_ref().unwrap().path()).unwrap();
+    let stored = std::fs::read(&stored_dir[0]).unwrap();
 
     let content = tokio::fs::read_to_string(&log_path).await.unwrap();
     let upload = content
@@ -852,7 +852,7 @@ async fn binary_shell_payload_is_captured_as_evidence() {
     wait_for_upload_event(&log_path).await;
     handle.abort();
 
-    let spooled: Vec<_> = std::fs::read_dir(&spool_dir).unwrap().collect();
+    let spooled = spooled_files(&spool_dir);
     assert_eq!(spooled.len(), 1, "exactly one sample should be spooled");
 
     let content = tokio::fs::read_to_string(&log_path).await.unwrap();
@@ -905,9 +905,7 @@ async fn plaintext_session_is_never_captured_and_password_never_reaches_the_spoo
     tokio::time::sleep(Duration::from_millis(200)).await;
     handle.abort();
 
-    let spooled_count = std::fs::read_dir(&spool_dir)
-        .map(|it| it.count())
-        .unwrap_or(0);
+    let spooled_count = spooled_files(&spool_dir).len();
     assert_eq!(
         spooled_count, 0,
         "a plaintext-only session must never produce a spooled capture"
@@ -929,6 +927,24 @@ async fn plaintext_session_is_never_captured_and_password_never_reaches_the_spoo
         "no malware_upload event for a plaintext-only session; got: {:?}",
         events.iter().map(|e| &e.signal_type).collect::<Vec<_>>()
     );
+}
+
+/// The captures stored in `dir`: files named by the SHA-256 of their content. The spool also holds a
+/// `.staging/` directory, where a body is written before it is published under that name.
+fn spooled_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    sensor_framework::spool::is_canonical_sha256_hex(
+                        &e.file_name().to_string_lossy(),
+                    )
+                })
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn walkdir_or_manual(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

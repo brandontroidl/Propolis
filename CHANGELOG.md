@@ -174,6 +174,8 @@ Remediation of an external audit (findings P-01 to P-15). Upgrading applies revi
   to the same pinned address, and labels every captured body `verified`, `unverified` (with the
   validation error), `plaintext` or `unknown` (migration `0007`); the samples page shows the label.
   Cost: a TLS 1.2 server that can sign its handshake only with SHA-1 is no longer captured.
+  Plain-http hops build no certificate verifier, so they neither load the system trust store
+  nor fail on a host without one.
 - **The fetcher ignores proxy settings in its environment** - reqwest reads `HTTP_PROXY`,
   `HTTPS_PROXY` and `ALL_PROXY` by default, and a proxy resolves and dials the host itself, so a
   fetch would have bypassed the address the SSRF guard vetted.
@@ -191,7 +193,14 @@ Remediation of an external audit (findings P-01 to P-15). Upgrading applies revi
   what was refused.
 - **A Content-Security-Policy on every page** - scripts and styles are served as files, templates
   carry no inline script, style or event handler, and every response carries a policy that allows
-  script and style only from the console itself.
+  script and style only from the console itself. The error pages the console builds without a
+  template follow it too, and Relist, Delist and Delete, which used to confirm through an inline
+  handler, render disabled until the script that asks for confirmation has loaded.
+- **Chart data cannot end its script element** - the dashboard's protocol chart labels are
+  sensor names, which intake takes as any non-empty string and a split deployment receives from
+  its collectors. Placed raw in the chart's JSON data element, a name holding `</script>` ended
+  the element and put the rest into the operator's page as markup (before the policy, as script).
+  Chart data now escapes `<`, `>` and `&` as JSON unicode escapes.
 - **Chain verification needs a CSRF token** - `POST /integrity/verify` reads the whole ledger but
   took no token; it now requires one like every other console POST, and a second run while one is
   in progress answers 409.

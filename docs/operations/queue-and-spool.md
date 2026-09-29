@@ -65,34 +65,38 @@ Log line (example): `capture hand-off: queue full, sample dropped (no spool, no 
 
 A body that reaches the worker but the spool rejects increments `spool_refused_count` and logs
 a WARN **per refusal** (`process_job`, `handoff.rs:330-340`). The spool refuses in two cases
-(`crates/sensor-framework/src/spool.rs:139-209,235-256`):
+(`crates/sensor-framework/src/spool.rs#store`, `crates/sensor-framework/src/spool.rs#reserve_budget`):
 
 - **`FileSizeExceeded`** - the body is larger than the per-file cap (10 MB for the spooling
-  sensors) (`spool.rs:146-151`).
+  sensors) (`sensor-framework/src/spool.rs#store`).
 - **`BudgetExhausted`** - the global byte budget (100 MB per spooling sensor) is already
   reserved. Reservation is atomic (`compare_exchange`), so the budget is a hard ceiling
-  (`reserve_budget`, `spool.rs:235-256`).
+  (`sensor-framework/src/spool.rs#reserve_budget`).
 
 Unlike a queue drop, a spool refusal is the only in-process record that a capture was lost at
 that stage, which is why every refusal logs (not just powers of two).
 
 ## Spool storage properties
 
-The quarantine spool is content-addressed and fail-closed by construction
-(`spool.rs:1-9`):
+The quarantine spool is content-addressed and fail-closed by construction (the module
+doc of `crates/sensor-framework/src/spool.rs`):
 
 - files are named by the SHA-256 of their content, never by an attacker-supplied filename, so
-  path traversal is structurally impossible (`store`, `spool.rs:139-209`);
-- files are written `create_new` with `0640` permissions (`spool.rs:171-175`, `write_and_seal` `spool.rs:348-364`);
+  path traversal is structurally impossible (`sensor-framework/src/spool.rs#store`);
+- each body is written to a file in the spool's `.staging/` directory with `0640`
+  permissions and synced, then given its digest name with a hard link, which never replaces
+  an existing name, so a digest name never holds a partial body and two stores of the same
+  bytes at once both succeed (`sensor-framework/src/spool.rs#publish`, `sensor-framework/src/spool.rs#write_and_seal`);
 - reads re-hash and refuse on mismatch (`HashMismatch` -> corrupt, refused). Every reader
   outside the writing sensor - the console download, the VirusTotal upload - goes through
-  `sensor_framework::spool::read_verified` (`spool.rs:282-337`): the entry is opened without following a symlink,
+  `sensor_framework::spool::read_verified` (`sensor-framework/src/spool.rs#read_verified`): the entry is opened without following a symlink,
   must be a regular file no larger than any producer can write (500 MB), and is hashed from the
   opened descriptor. A link, FIFO or swapped body under a digest name is refused and logged,
   never read through; the samples list and spool metrics skip such entries;
-- duplicate content dedups on the existing hash and consumes no extra budget (`spool.rs:156-167`);
+- duplicate content dedups on the existing hash and consumes no extra budget (`sensor-framework/src/spool.rs#store`);
 - on restart, `new()` re-scans the directory to recover used bytes, so a restart does not reset
-  the budget ceiling (`scan_existing_usage`, `spool.rs:119-127,366-382`).
+  the budget ceiling (`sensor-framework/src/spool.rs#scan_existing_usage`), and removes staged files older than an
+  hour that a stopped process left behind (`sensor-framework/src/spool.rs#remove_stale_staging`).
 
 Sample files are trimmed at 30 days; see [retention](./retention.md). Spool paths and budgets
 are owned by [filesystem paths](../reference/filesystem-paths.md) and

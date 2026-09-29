@@ -19,6 +19,24 @@ use crate::sanitize::to_hex_bounded;
 /// A SHA-256 digest is always exactly this many bytes.
 const SHA256_DIGEST_LEN: usize = 32;
 
+/// Subdirectory of the spool where a body is written before it is given its digest name. Not a
+/// digest name, and not a regular file, so readers and the budget scan both pass over it.
+const STAGING_DIR: &str = ".staging";
+
+/// A staged file older than this was left by a process that stopped mid-store; one that is still
+/// being written is far younger, since a store writes at most one capped body.
+const STALE_STAGING: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How `QuarantineSpool::publish` ended when it did not publish a fresh name.
+enum Publish {
+    /// Another store published the same digest first.
+    Lost,
+    /// Nothing was published.
+    NotPublished(std::io::Error),
+    /// The body is published under its name, but syncing the directory failed.
+    NameNotSynced(std::io::Error),
+}
+
 /// Hex-encode a digest via the crate's shared hex helper rather than `{:x}` - the `sha2`/
 /// `digest` version this workspace resolves returns a `hybrid-array` `Array<u8, U32>`, which
 /// does not implement `LowerHex` (verified against the crate's own source; there is no format
@@ -117,6 +135,7 @@ pub struct QuarantineSpool {
 
 impl QuarantineSpool {
     pub fn new(dir: PathBuf, max_file_size: u64, global_budget: u64) -> Self {
+        remove_stale_staging(&dir.join(STAGING_DIR));
         let used = scan_existing_usage(&dir);
         Self {
             dir,
@@ -167,44 +186,55 @@ impl QuarantineSpool {
         }
 
         self.reserve_budget(size)?;
-
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&file_path)
-        {
-            Ok(mut file) => {
-                if let Err(e) = write_and_seal(&mut file, body) {
-                    self.release_budget(size);
-                    drop(file);
-                    let _ = std::fs::remove_file(&file_path);
-                    return Err(e.into());
-                }
-                Ok(SampleRef {
-                    sha256: hash,
-                    size,
-                    orig_name: String::new(),
-                    capture_id,
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Lost a narrow race: another call published this exact content between our
-                // existence check above and this attempt. We do not own that write, so give
-                // back the speculative reservation and confirm what is actually on disk rather
-                // than assume the winner's write has already finished.
+        let sample = SampleRef {
+            sha256: hash.clone(),
+            size,
+            orig_name: String::new(),
+            capture_id,
+        };
+        match self.publish(&file_path, body) {
+            Ok(()) => Ok(sample),
+            Err(Publish::Lost) => {
+                // Another call published this exact content between the existence check above
+                // and our publish. Its file is complete (a name is only ever linked to a written,
+                // synced body), and it holds the budget for those bytes, so give ours back and
+                // confirm what is on disk.
                 self.release_budget(size);
                 self.verify_on_disk(&hash)?;
-                Ok(SampleRef {
-                    sha256: hash,
-                    size,
-                    orig_name: String::new(),
-                    capture_id,
-                })
+                Ok(sample)
             }
-            Err(e) => {
+            Err(Publish::NotPublished(e)) => {
                 self.release_budget(size);
                 Err(e.into())
             }
+            // The body is on disk under its name and keeps its budget; only the name's
+            // durability across a crash is unconfirmed, so the caller must not treat it as stored.
+            Err(Publish::NameNotSynced(e)) => Err(e.into()),
+        }
+    }
+
+    /// Write `body` to a staging file and give it its final name only once it is complete and
+    /// synced, so a digest name never holds a partial body. Writing at the final name directly
+    /// let a concurrent `store` of the same bytes (the malware fetcher runs several fetches at
+    /// once) find the name while the first write was still in progress, re-hash the partial file
+    /// and fail it as corrupt. The final name is created with a hard link, which, unlike a rename,
+    /// never replaces an existing name; the directory is then synced so the new name is as durable
+    /// as the body it names.
+    fn publish(&self, file_path: &Path, body: &[u8]) -> Result<(), Publish> {
+        let staging = self.dir.join(STAGING_DIR);
+        std::fs::create_dir_all(&staging).map_err(Publish::NotPublished)?;
+        let staged = staging.join(uuid::Uuid::now_v7().to_string());
+        let linked = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .and_then(|mut file| write_and_seal(&mut file, body))
+            .and_then(|()| std::fs::hard_link(&staged, file_path));
+        let _ = std::fs::remove_file(&staged);
+        match linked {
+            Ok(()) => sync_dir(&self.dir).map_err(Publish::NameNotSynced),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Publish::Lost),
+            Err(e) => Err(Publish::NotPublished(e)),
         }
     }
 
@@ -345,7 +375,32 @@ pub fn is_canonical_sha256_hex(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Write the body to a freshly created, empty spool file and lock down its permissions.
+/// Sync `dir` itself, so a name just linked into it survives a crash along with the body.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Delete staged files a stopped process left behind. They carry no digest name, so nothing
+/// reads them, and they sit outside the budget scan, so without this they would take disk space
+/// the budget never sees. Best-effort, like `scan_existing_usage`.
+fn remove_stale_staging(staging: &Path) {
+    let Ok(entries) = std::fs::read_dir(staging) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > STALE_STAGING));
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Write the body to a freshly created, empty staging file and lock down its permissions.
 /// `create_new` on the caller's side already guarantees this file did not exist a moment ago, so
 /// there is nothing to dedup here - only the write and the permission bits.
 fn write_and_seal(file: &mut std::fs::File, body: &[u8]) -> std::io::Result<()> {
@@ -649,6 +704,89 @@ mod tests {
             read_verified(dir.path(), "../../etc/passwd", 1024),
             Err(SpoolError::InvalidHash { .. })
         ));
+    }
+
+    /// Several callers storing the same body at once, as the malware fetcher does when two URLs
+    /// serve the same bytes. Every one must succeed with the same digest: none may read another's
+    /// file while it is still being written and take it for corrupt.
+    #[test]
+    fn concurrent_stores_of_one_body_all_succeed() {
+        const WRITERS: usize = 8;
+        let body = std::sync::Arc::new(vec![0x5au8; 2 * 1024 * 1024]);
+        for round in 0..24 {
+            let (_dir, spool) = test_spool(8 * 1024 * 1024, 64 * 1024 * 1024);
+            let spool = std::sync::Arc::new(spool);
+            let start = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+            // Every writer is spawned before any is joined: they meet at the barrier together.
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|_| {
+                    let (spool, start, body) = (spool.clone(), start.clone(), body.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        spool.store(&body)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+            for result in &results {
+                assert!(
+                    result.is_ok(),
+                    "round {round}: a concurrent store of the same body failed: {result:?}"
+                );
+            }
+            // One body is on disk, so the budget is charged for one: every caller that found
+            // the name already published gave its reservation back.
+            assert_eq!(
+                spool.used.load(Ordering::SeqCst),
+                body.len() as u64,
+                "round {round}: the budget was charged more than once for one stored body"
+            );
+        }
+    }
+
+    #[test]
+    fn a_store_leaves_nothing_staged() {
+        let (dir, spool) = test_spool(1024, 1_000_000);
+        spool.store(b"first").unwrap();
+        spool.store(b"first").unwrap();
+        spool.store(b"second").unwrap();
+        let staged: Vec<_> = std::fs::read_dir(dir.path().join(STAGING_DIR))
+            .unwrap()
+            .collect();
+        assert!(staged.is_empty(), "left behind: {staged:?}");
+    }
+
+    /// A process that stops mid-store leaves its staged file. Nothing reads it and the budget scan
+    /// does not see it, so the next start removes it once it is clearly abandoned; a younger one
+    /// may belong to another process still writing, and stays.
+    #[test]
+    fn new_removes_only_abandoned_staged_files_and_never_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join(STAGING_DIR);
+        std::fs::create_dir(&staging).unwrap();
+        let abandoned = staging.join("abandoned");
+        let in_flight = staging.join("in-flight");
+        std::fs::write(&abandoned, vec![0u8; 500]).unwrap();
+        std::fs::write(&in_flight, vec![0u8; 500]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&abandoned)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - STALE_STAGING * 2)
+            .unwrap();
+
+        let spool = QuarantineSpool::new(dir.path().to_path_buf(), 1024, 100);
+        assert!(
+            !abandoned.exists(),
+            "an abandoned staged file must be removed"
+        );
+        assert!(
+            in_flight.exists(),
+            "a recent staged file must be left alone"
+        );
+        spool
+            .store(&[1u8; 100])
+            .expect("staged files must not count against the budget");
     }
 
     #[test]

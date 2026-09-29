@@ -76,10 +76,13 @@ fn concurrent_stores_respect_budget_and_never_corrupt_content() {
     }
 
     // Every admitted sample is fully and correctly on disk - no interleaved or truncated write
-    // from concurrent threads sharing the directory.
+    // from concurrent threads sharing the directory. Stored bodies are the digest-named files;
+    // the staging directory beside them holds nothing once every store has returned.
     let mut total_bytes_on_disk = 0u64;
-    for entry in std::fs::read_dir(dir.path()).unwrap() {
-        total_bytes_on_disk += entry.unwrap().metadata().unwrap().len();
+    for entry in std::fs::read_dir(dir.path()).unwrap().map(Result::unwrap) {
+        if sensor_framework::spool::is_canonical_sha256_hex(&entry.file_name().to_string_lossy()) {
+            total_bytes_on_disk += entry.metadata().unwrap().len();
+        }
     }
     assert_eq!(total_bytes_on_disk, BODY_SIZE * admitted as u64);
 

@@ -221,14 +221,15 @@ alphabet (`:33-36`).
 `QuarantineSpool::new(dir, max_file_size, global_budget)` stores captured bodies
 named by their SHA-256 (never the attacker filename, so traversal is impossible),
 with 0640 permissions and re-hash-on-read fail-closed integrity
-(`crates/sensor-framework/src/spool.rs:118-127, 1-9`).
+(`crates/sensor-framework/src/spool.rs#QuarantineSpool`).
 
 - `store(body)` rejects `FileSizeExceeded` when `size > max_file_size`, dedups on
   an existing hash (no extra budget), reserves budget atomically via
   `compare_exchange`, and rejects `BudgetExhausted` past `global_budget`
-  (`:134-196, 232-253`). Files are written with `create_new` + 0640 (`:171-175, 351-364`).
+  (`sensor-framework/src/spool.rs#store`, `sensor-framework/src/spool.rs#reserve_budget`). A body is written to a staging file at 0640,
+  synced, then hard-linked to its digest name (`sensor-framework/src/spool.rs#publish`, `sensor-framework/src/spool.rs#write_and_seal`).
 - `new()` recovers used bytes by scanning the directory at startup so a restart
-  does not reset the ceiling (`:108-122, 366-382`).
+  does not reset the ceiling (`sensor-framework/src/spool.rs#QuarantineSpool`, `sensor-framework/src/spool.rs#scan_existing_usage`).
 - **Only SSH, FTP, and ADB spool bodies.** All three use `max_file_size` =
   10_000_000 (10&nbsp;MB) and `global_budget` = 100_000_000 (100&nbsp;MB). Redis,
   Telnet, HTTP, SMTP, cred, and catchall never write a body to a spool (confirmed

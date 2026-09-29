@@ -139,6 +139,13 @@
   `install.sh` after provisioning moved to `provision.sh`. All were re-read against the current
   source and corrected, sentences the code had outgrown were rewritten, and the docs agreement test
   now fails when a citation names a missing file or lines past its end.
+- **Two stores of the same sample at once both succeed** - the spool wrote a body straight to its
+  digest name, so a second store of the same bytes during that write (the malware fetcher runs
+  several fetches at once, and two URLs can serve one payload) re-hashed the half-written file
+  and failed it as corrupt, recording a failed fetch. A body is now written to a staging file,
+  synced, and given its name with a hard link, which never replaces an existing name, so a
+  digest name only ever holds a complete body. Staged files a stopped process left behind are
+  removed at the next start.
 - **Smaller console hardening** - the reverse-DNS cache holds at most 4096 entries, sweeping expired
   ones and evicting the oldest; search refuses a control character or a value over 512 bytes with
   400 instead of passing it to PostgreSQL.

@@ -78,7 +78,7 @@ The invariant is defence-in-depth, not source discipline alone:
   misspelling silently installs no rule. Owned by
   [filesystem-and-db-protections.md](filesystem-and-db-protections.md).
 - **No-execute spool.** Captured sample bodies are written mode `0640`
-  (`write_and_seal`, `crates/sensor-framework/src/spool.rs:348-364`) and the spool directory is
+  (`crates/sensor-framework/src/spool.rs#write_and_seal`) and the spool directory is
   required to be a `noexec,nosuid,nodev` mount. A captured file is therefore not
   marked executable and lives on a mount that would refuse execution. The mount
   option is an operator deployment step, not enforced by the units - see

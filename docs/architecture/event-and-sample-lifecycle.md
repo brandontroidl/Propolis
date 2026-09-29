@@ -99,8 +99,8 @@ flowchart TD
 2. **Sequential worker + spool.** A single worker drains the queue and stores each
    body under its **SHA-256 filename** (never the attacker name), `0640`, with a
    per-file size cap (10 MB) and a global byte budget (100 MB) reserved atomically;
-   the store is never called concurrently
-   (`handoff.rs:272-391`, `spool.rs:119-209`, `QuarantineSpool::new`/`QuarantineSpool::store`). The emitted event carries a
+   the capture hand-off never calls the store concurrently, and a body gets its digest
+   name only once it is complete (`handoff.rs:272-391`, `sensor-framework/src/spool.rs#store`, `sensor-framework/src/spool.rs#publish`). The emitted event carries a
    `SampleRef { sha256, size, orig_name }` where `orig_name` is a sanitized indicator
    only, never a path component. See
    [`security/malware-custody.md`](../security/malware-custody.md).

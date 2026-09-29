@@ -19,10 +19,9 @@
 //! one task ever calls `recv()`. That task's loop processes one job to completion - including its
 //! synchronous call into `QuarantineSpool::store` - before it calls `recv().await` again, so
 //! `store` is never invoked concurrently with itself by this component, no matter how many
-//! producer tasks race `submit` concurrently. So the narrow `create_new` race in `store`'s dedup
-//! path (two callers racing to store identical content) is not a sensor's access pattern. The
-//! review crate's malware fetcher is the one other caller: it stores into its own spool from
-//! several concurrent fetches, and can meet that race when two URLs return the same bytes at once.
+//! producer tasks race `submit` concurrently. The review crate's malware fetcher is the one other
+//! caller: it stores into its own spool from several concurrent fetches, which is safe because
+//! `store` gives a body its digest name only once it is complete (`spool.rs`'s `publish`).
 //!
 //! `orig_name` is sanitized here, not by each sensor, before it is written onto the `SampleRef` -
 //! see `spool.rs`'s `store` doc, which places that obligation on whoever calls `store` and then
@@ -893,8 +892,13 @@ mod tests {
             "the ten distinct bodies must resolve to ten distinct sha256 values"
         );
 
-        // Real dedup on disk: 10 unique files + 1 deduplicated file, never 20.
-        let on_disk_count = std::fs::read_dir(&spool_dir).unwrap().count();
+        // Real dedup on disk: 10 unique files + 1 deduplicated file, never 20. Only digest-named
+        // entries are stored bodies; the spool's staging directory sits beside them.
+        let on_disk_count = std::fs::read_dir(&spool_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| crate::spool::is_canonical_sha256_hex(&e.file_name().to_string_lossy()))
+            .count();
         assert_eq!(on_disk_count, UNIQUE + 1);
     }
 

@@ -70,6 +70,11 @@ pub struct EmitContext {
     pub session_id: Option<uuid::Uuid>,
 }
 
+/// Where a shell reads the time: the timestamps in its replies and the `observed_at` of its
+/// events. Sessions use the system clock; a replay fixes it, so a transcript that prints the time
+/// can be compared byte for byte.
+pub type Clock = fn() -> chrono::DateTime<chrono::Utc>;
+
 /// Per-session ceiling on `honeypot_command_exec` events. A real interactive attacker runs a
 /// bounded kill chain (tens of commands); an unbounded stream is a flood - one IP produced >20k
 /// command events by streaming binary over the channel. Past this, the shell keeps responding but
@@ -95,6 +100,7 @@ pub struct FakeShell {
     /// Which shell this session is pretending to be, which decides how it reports an error and
     /// what `uname` says. See [`ShellFlavor`].
     flavor: ShellFlavor,
+    clock: Clock,
 }
 
 /// The shell a session presents. The command grammar is shared - every sensor answers the same
@@ -135,7 +141,14 @@ impl FakeShell {
             binary_flagged: false,
             cap_flagged: false,
             flavor,
+            clock: chrono::Utc::now,
         }
+    }
+
+    /// The same shell reading its time from `clock` instead of the system clock.
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// The working directory, for the prompt a sensor prints between commands.
@@ -244,7 +257,7 @@ impl FakeShell {
                     signal_type: SIGNAL_HONEYPOT_FILE_DOWNLOAD.into(),
                     protocol: PROTO_TCP.into(),
                     authenticated: self.ctx.authenticated,
-                    observed_at: chrono::Utc::now(),
+                    observed_at: (self.clock)(),
                     metadata: serde_json::json!({
                         "protocol_label": self.ctx.protocol_label,
                         "url": sanitized_url,
@@ -327,7 +340,7 @@ impl FakeShell {
             signal_type: SIGNAL_HONEYPOT_COMMAND_EXEC.into(),
             protocol: PROTO_TCP.into(),
             authenticated: self.ctx.authenticated,
-            observed_at: chrono::Utc::now(),
+            observed_at: (self.clock)(),
             metadata,
             sample: None,
             session_id: self.ctx.session_id,
@@ -361,7 +374,7 @@ impl FakeShell {
             // one reply a bash never gives. `system` and `shell` really are unknown to bash.
             Some("enable") => cmd_enable(parts),
             Some("wget") => {
-                let out = cmd_wget(parts);
+                let out = cmd_wget(parts, (self.clock)());
                 self.save_fetched_file("wget", parts);
                 out
             }
@@ -1349,12 +1362,12 @@ const FETCHED_BODY: &str =
     "<html><head><title>Welcome</title></head><body><h1>It works!</h1></body></html>\n";
 
 /// `wget URL`: the classic wget banner (connection line, HTTP status, progress bar, final "saved"
-/// summary) - zero network I/O, see the module doc. The timestamp is real wall-clock time (a frozen
-/// date is a tell an attacker catches by running twice). The saved filename is derived from `-O` or
+/// summary) - zero network I/O, see the module doc. The timestamp is `now`, the session clock's
+/// time (a frozen date is a tell an attacker catches by running twice). The saved filename is derived from `-O` or
 /// the URL's own basename rather than a constant "index.html" (every download claiming the same
 /// name was a tell); `-q`/`-nv` suppress the banner as real wget does; `-O-`/`-qO-` write the body
 /// to stdout (the `wget -qO- | sh` loader pattern) instead of the transcript.
-fn cmd_wget(parts: &[&str]) -> String {
+fn cmd_wget(parts: &[&str], now: chrono::DateTime<chrono::Utc>) -> String {
     let url = fetch_url_arg("wget", &parts[1..]).unwrap_or("");
     let sanitized_url = sanitize_value(url, MAX_URL_LEN);
 
@@ -1373,7 +1386,7 @@ fn cmd_wget(parts: &[&str]) -> String {
         _ => wget_basename(url),
     };
     let name = sanitize_value(&name, MAX_URL_LEN);
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
+    let now = now.format("%Y-%m-%d %H:%M:%S");
     format!(
         "--{now}--  {sanitized_url}\n\
          Connecting to {sanitized_url}... connected.\n\
@@ -2578,9 +2591,29 @@ mod shell_detection_tests {
         assert!(!is_busybox_applet("MIRAI"));
     }
 
+    fn noon() -> chrono::DateTime<chrono::Utc> {
+        "2026-09-29T12:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn the_session_clock_stamps_replies_and_events() {
+        let mut sh = shell().with_clock(noon);
+        let (out, events) = sh.handle_input("wget http://198.51.100.9/x");
+        assert!(
+            out.starts_with("--2026-09-29 12:00:00--  http://198.51.100.9/x\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n2026-09-29 12:00:00 (1.2 MB/s) - 'x' saved"),
+            "{out}"
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|e| e.observed_at == noon()));
+    }
+
     #[test]
     fn wget_derives_the_saved_filename_from_the_url() {
-        let out = cmd_wget(&["wget", "http://198.51.100.9/bins/mips"]);
+        let out = cmd_wget(&["wget", "http://198.51.100.9/bins/mips"], noon());
         assert!(out.contains("Saving to: 'mips'"), "got: {out}");
         assert!(
             !out.contains("index.html"),
@@ -2590,13 +2623,13 @@ mod shell_detection_tests {
 
     #[test]
     fn wget_quiet_suppresses_the_banner() {
-        assert_eq!(cmd_wget(&["wget", "-q", "http://x/y"]), "");
+        assert_eq!(cmd_wget(&["wget", "-q", "http://x/y"], noon()), "");
     }
 
     #[test]
     fn wget_dash_big_o_dash_writes_body_to_stdout() {
         // The `wget -qO- URL | sh` loader pattern: content goes to stdout, not a transcript.
-        let out = cmd_wget(&["wget", "-qO-", "http://x/y"]);
+        let out = cmd_wget(&["wget", "-qO-", "http://x/y"], noon());
         assert!(out.contains("It works!"), "got: {out}");
     }
 

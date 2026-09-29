@@ -175,6 +175,11 @@ fn parse_fixture(path: &Path) -> Fixture {
     }
 }
 
+/// The time every replayed session reads, so replies that print the time replay exactly.
+fn replay_clock() -> chrono::DateTime<chrono::Utc> {
+    "2026-09-29T12:00:00Z".parse().unwrap()
+}
+
 fn shell_for(fixture: &Fixture) -> FakeShell {
     let ctx = EmitContext {
         source_ip: "192.0.2.10".parse::<IpAddr>().unwrap(),
@@ -183,11 +188,12 @@ fn shell_for(fixture: &Fixture) -> FakeShell {
         protocol_label: fixture.protocol.clone(),
         session_id: None,
     };
-    match fixture.persona.as_str() {
+    let shell = match fixture.persona.as_str() {
         "ubuntu" => FakeShell::new(FakeFs::new(), ctx),
         "android" => FakeShell::android(FakeFs::android(), ctx),
         other => panic!("{}: unknown persona {other:?}", fixture.path.display()),
-    }
+    };
+    shell.with_clock(replay_clock)
 }
 
 /// The shell's reply to one line, as the bytes a transport would send before its own line

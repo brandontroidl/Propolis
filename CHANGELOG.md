@@ -134,11 +134,13 @@
   inventory lacked six crates. The docs agreement test now recomputes the version, crate, member and
   binary totals, the component inventory and dependency graph, the test taxonomy and the migration
   list from `cargo metadata` and the source, and fails when a current page disagrees.
-- **Code citations point at the code again** - the docs cite code by `path:line`, and about 450
+- **Code citations point at the code again** - the docs cited code by `path:line`, and about 450
   citations had drifted as the cited files changed, including every directory citation into
   `install.sh` after provisioning moved to `provision.sh`. All were re-read against the current
-  source and corrected, sentences the code had outgrown were rewritten, and the docs agreement test
-  now fails when a citation names a missing file or lines past its end.
+  source and sentences the code had outgrown were rewritten. Every citation now names a symbol
+  instead of a line (`crates/sensor-framework/src/spool.rs#store`), which an edit elsewhere in the
+  file cannot move. The docs agreement test fails on a line citation in any form, and on a
+  `path#symbol` whose file is gone or no longer contains the symbol.
 - **Two stores of the same sample at once both succeed** - the spool wrote a body straight to its
   digest name, so a second store of the same bytes during that write (the malware fetcher runs
   several fetches at once, and two URLs can serve one payload) re-hashed the half-written file

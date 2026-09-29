@@ -32,7 +32,7 @@ Each systemd unit reads one `EnvironmentFile`:
 
 These `.env` files are **operator-authored**. `deploy/install.sh` does not
 create them - it only prints "Next: populate /etc/propolis/*.env files"
-(`deploy/install.sh:173`). They are mode `0600` and owned by the service user.
+(`deploy/install.sh#populate /etc/propolis`). They are mode `0600` and owned by the service user.
 The defaults documented in the reference table are the **code** defaults applied
 when a variable is unset or blank; they are authoritative for runtime behavior
 even though the `.env` files themselves are not in the repo.
@@ -66,27 +66,28 @@ Configuration is validated at startup. Most binaries (`propolis`, `intake`,
 `review`, `feed`, `console`, and sensors `ssh/telnet/http/ftp/redis/adb/catchall`)
 **abort startup** on a missing required variable or a present-but-invalid /
 present-but-zero numeric bound - "zero never means unlimited"
-(`require_env`, `parse_positive_u64`, `crates/propolis/src/config.rs:224-249`). A misconfiguration cannot silently
+(`crates/propolis/src/config.rs#require_env`, `crates/propolis/src/config.rs#parse_positive_u64`). A misconfiguration cannot silently
 disable a guard.
 
 Two exceptions: the `cred` and `smtp` sensors are **lenient** - an invalid or
 zero bound silently falls back to the default rather than aborting
-(`crates/sensor-cred/src/main.rs:29-33`,
-`crates/sensor-smtp/src/main.rs:28-32`). Their bind variables still fail-close.
+(`crates/sensor-cred/src/main.rs#parse_positive_u64`,
+`crates/sensor-smtp/src/main.rs#parse_positive_u64`). Their bind variables still fail-close.
 
 Fail-closed pairings worth noting (all owned by the reference table):
 
 - A vendor or VirusTotal `*_ENABLED=true` with an empty key is forced disabled
-  and logged (`load_vendor_config`, `config.rs:486-493,613`).
+  and logged (`crates/propolis/src/config.rs#load_vendor_config`, `crates/propolis/src/config.rs#load_config`,
+  `crates/propolis/src/main.rs#main`).
 - `PROPOLIS_OPS_ENABLED=true` with only one of `PROPOLIS_OPS_NTFY_URL` /
   `PROPOLIS_OPS_NTFY_TOPIC` set fails closed (a half-configured target looks
   configured but would page nothing); with neither set, alerts fall back to the
-  local log sink instead of aborting startup (`parse_ops_alert`,
-  `crates/propolis/src/ops_alert/config.rs:123-147`).
+  local log sink instead of aborting startup
+  (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`).
 - `PROPOLIS_FEED_WINDOWS` fails closed on any malformed entry rather than
-  skipping it (`parse_window_list`, `config.rs:386-418`).
+  skipping it (`crates/propolis/src/config.rs#parse_window_list`).
 - `PROPOLIS_FEED_ASN_ALLOWLIST` is inert unless `PROPOLIS_GEOIP_DIR` is set and
-  the GeoLite2-ASN database loads (`parse_asn_list`, `config.rs:366-384`, `main.rs:845,852`).
+  the GeoLite2-ASN database loads (`crates/propolis/src/config.rs#parse_asn_list`, `crates/propolis/src/main.rs#main`).
 
 ## Sensor binds and WAN attribution
 

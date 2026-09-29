@@ -36,15 +36,15 @@ reports. Implemented in `crates/review/src/virustotal.rs`.
 
 Enabled iff `PROPOLIS_VT_ENABLED` is set AND `PROPOLIS_VT_KEY` is non-empty; an
 empty key forces it off, fail-closed (`vt_enabled`/`vt_api_key` in
-`load_config`, `crates/propolis/src/config.rs:612-613`).
+`crates/propolis/src/config.rs#load_config`).
 
 | Setting | Value | Source |
 |---|---|---|
-| `PROPOLIS_VT_ENABLED` | default false | `config.rs:613` |
-| `PROPOLIS_VT_UPLOAD` (upload unknown samples) | default false | `config.rs:614` |
-| `PROPOLIS_VT_SCAN_INTERVAL_SECS` | default 300 | `config.rs:615` |
-| Request delay | 15000 ms (hard-coded) | `crates/propolis/src/main.rs:922` |
-| Daily cap | 450 (hard-coded) | `main.rs:923` |
+| `PROPOLIS_VT_ENABLED` | default false | `crates/propolis/src/config.rs#load_config` |
+| `PROPOLIS_VT_UPLOAD` (upload unknown samples) | default false | `crates/propolis/src/config.rs#load_config` |
+| `PROPOLIS_VT_SCAN_INTERVAL_SECS` | default 300 | `crates/propolis/src/config.rs#load_config` |
+| Request delay | 15000 ms (hard-coded) | `crates/propolis/src/main.rs#main` |
+| Daily cap | 450 (hard-coded) | `crates/propolis/src/main.rs#main` |
 
 ### Endpoints
 
@@ -52,35 +52,35 @@ empty key forces it off, fail-closed (`vt_enabled`/`vt_api_key` in
   means "not in VT's database" (returns `None`); a non-200 is an error.
   `detected = malicious + suspicious`;
   `total = malicious + suspicious + undetected + harmless`
-  (`lookup_hash`, `virustotal.rs:301-345`).
+  (`crates/review/src/virustotal.rs#lookup_hash`).
 - **Upload** (only if `PROPOLIS_VT_UPLOAD`) - `POST /api/v3/files` multipart;
   stores a pending row with `detected = -1, total = -1`
-  (`NextStep::Upload` arm, `upload_sample`, `pending_result`, `virustotal.rs:223-258,290-299,347-386`).
+  (`crates/review/src/virustotal.rs#scan_spool`, `crates/review/src/virustotal.rs#upload_sample`, `crates/review/src/virustotal.rs#pending_result`).
 
 The documented free-tier limit is 4 req/min, 500/day, verified live against the
-VT v3 API 2026-08-19 (`virustotal.rs:5-6`). The daily cap is enforced by a
+VT v3 API 2026-08-19 (`crates/review/src/virustotal.rs`). The daily cap is enforced by a
 single `DailyBudget` owned across every scan cycle - a counter local to one
 `scan_spool` call would reset each cycle and never enforce a per-day cap
-(`DailyBudget`, `virustotal.rs:74-103`, `main.rs:936-940`). See
+(`crates/review/src/virustotal.rs#DailyBudget`, `crates/propolis/src/main.rs#main`). See
 [rate-limits-and-budgets.md](rate-limits-and-budgets.md#virustotal-daily-cap).
 
 `scan_spool` walks each spool dir, filters to 64-hex-char (SHA-256) filenames,
 skips samples already analyzed, and consumes one budget unit per new sample; on
-exhaustion it logs and returns early (`virustotal.rs:171-268`; filename filter
-in `list_samples`, `crates/review/src/spool.rs:34-39`). Spool dirs scanned:
-`/var/spool/propolis/{ssh,adb,ftp,telnet}` (`crates/review/src/spool.rs:78-83`)
+exhaustion it logs and returns early (`crates/review/src/virustotal.rs#scan_spool`; filename filter
+in `crates/review/src/spool.rs#list_samples`). Spool dirs scanned:
+`/var/spool/propolis/{ssh,adb,ftp,telnet}` (`crates/review/src/spool.rs#BODY_SPOOLERS`)
 plus the fetcher spool tagged `fetched`. Samples older than 30 days are checked hourly by the
 `sample-retention` task, independent of whether VirusTotal is enabled
-(`main.rs:958-980`).
+(`crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`, `crates/propolis/src/main.rs#SAMPLE_RETENTION_INTERVAL`).
 
 ## Vendor abuse submitters
 
 Three adapters, all implementing `VendorAdapter`. The API key lives only on the
 adapter struct and is never placed on a report, response, error, or log line
-(`crates/review/src/vendor/mod.rs:60-70`). All three vendors are always
+(`crates/review/src/vendor/mod.rs#VendorAdapter`). All three vendors are always
 constructed; the gatekeeper's `Disabled` check is what holds a disabled vendor,
 and a vendor enabled with an empty API key is forced disabled, fail-closed
-(`crates/review/src/main.rs:150-156,261-299`).
+(`crates/review/src/main.rs#load_vendor_config`, `crates/review/src/main.rs#build_adapters`).
 
 ### Wire contracts
 
@@ -90,45 +90,47 @@ and a vendor enabled with an empty API key is forced disabled, fail-closed
 | DShield / SANS ISC | `POST /submitapi/` | `X-ISC-Authorization: ISC-HMAC-SHA256 ...` | `https://www.dshield.org` |
 | OTX (AlienVault / LevelBlue) | `POST /api/v1/pulses/create` (JSON) | `X-OTX-API-Key` | `https://otx.alienvault.com` |
 
-- **AbuseIPDB** (`vendor/abuseipdb.rs:21,57-84`) - a `429` is treated as
+- **AbuseIPDB** (`crates/review/src/vendor/abuseipdb.rs#submit`) - a `429` is treated as
   SUCCESS ("duplicate report within per-IP cooldown", verified live).
   Categories are numeric strings (e.g. ssh -> `["22"]`).
-- **DShield** (`vendor/dshield.rs`) - HMAC-SHA256 auth
+- **DShield** (`crates/review/src/vendor/dshield.rs`) - HMAC-SHA256 auth
   (`Credentials = base64(HMAC-SHA256(key = nonce+userid, msg = api_key))`).
   Log type `cowrie`; the `LogEntry` carries
   `{timestamp, source_ip, user, password, lastcommand, hassh, banner}` - every
   key present, because DShield silently drops a cowrie record missing any key.
   **`password` is ALWAYS empty**: the honeypot drops captured passwords by
-  design (`dshield.rs:66-113,132-144`). The API key is supplied as
-  `"userid:apikey"`, split on the first `:`; a missing user or key, or a
-  response body starting `ERROR`, is a permanent error (`dshield.rs:10-12,121-159`).
+  design (`crates/review/src/vendor/dshield.rs#LogEntry`). The API key is supplied as
+  `"userid:apikey"`, split on the first `:`
+  (`crates/review/src/vendor/dshield.rs#new`); a missing user or key, or a
+  response body starting `ERROR`, is a permanent error
+  (`crates/review/src/vendor/dshield.rs#submit`).
   The DShield wire contract is flagged in-code as provisional - the live
   endpoint 403'd during implementation, and the `"user:key"` single-slot
-  composition is a noted open decision `[inferred]` (`main.rs:220-236`).
-- **OTX** (`OtxAdapter::submit`, `vendor/otx.rs:84-106`) - pulses are forced
+  composition is a noted open decision `[inferred]` (`crates/review/src/main.rs#load_config_from_env`).
+- **OTX** (`crates/review/src/vendor/otx.rs#submit`) - pulses are forced
   `public: true` (OTX rejects private). `name = "propolis: {ip} ({timestamp})"`,
   one indicator `{indicator: ip, type, description}` where `type` is `"IPv4"`
-  or `"IPv6"` by the address family (`indicator_type`, `vendor/otx.rs:34-39`).
+  or `"IPv6"` by the address family (`crates/review/src/vendor/otx.rs#indicator_type`).
 
 ### Idempotency
 
 The idempotency key is `"{source_ip}:{vendor}:{date}"` where `date` is the UTC
-calendar day of the poll (`idempotency_key`, `submit.rs:328-333`). The runner
+calendar day of the poll (`crates/review/src/submit.rs#idempotency_key`). The runner
 INSERTs a `success = false` row `ON CONFLICT (idempotency_key) DO NOTHING`
-BEFORE the HTTP call, then UPDATEs that row with the outcome after
-(`submit.rs:273-306`). The date scoping means a new UTC day permits
+BEFORE the HTTP call (`crates/review/src/submit.rs#insert_pending`), then UPDATEs that row with the outcome after
+(`crates/review/src/submit.rs#record_result`). The date scoping means a new UTC day permits
 re-reporting. Only an ATTEMPTED
 submission writes a `vendor_submission` row; a held (ip, vendor) pair writes
-nothing (`submit.rs:14-19`).
+nothing (`crates/review/src/submit.rs#run_once`).
 
-Error classification (`vendor/mod.rs:243-269`): 2xx is success; a connection
+Error classification (`crates/review/src/vendor/mod.rs#send_and_classify`): 2xx is success; a connection
 failure (no response, `status:0`) or 5xx is `Transient` (retried next poll); any
 other 4xx is `Permanent` (marked failed, not auto-retried).
 
 ### Gating (the gatekeeper)
 
 Before any submission, `gatekeeper::check` runs an ordered, fail-closed sequence
-that short-circuits on the first hold (`gatekeeper.rs:85-138`): **Reserved**
+that short-circuits on the first hold (`crates/review/src/gatekeeper.rs#check`): **Reserved**
 (reserved-range IP, first and not overridable) -> **Disabled** -> **Stale**
 (last activity older than the 48 h freshness window) -> **Cooldown** ->
 **RateLimit** -> **ScoreFloor** -> **CategoryFilter**. Exact values and the full
@@ -139,18 +141,18 @@ sequence are owned by
 
 The `VendorReport` carries only
 `{source_ip, categories, comment, evidence_window}`
-(`vendor/mod.rs:29-35`). **No WAN / vantage IP, no raw score, no confidence, and
+(`crates/review/src/vendor/mod.rs#VendorReport`). **No WAN / vantage IP, no raw score, no confidence, and
 no per-vantage breakdown is ever placed in a report.** The multi-WAN vantage
 data feeds only the internal breadth multiplier (see
 [scoring-and-feed.md](scoring-and-feed.md#breadth-multiplier)) and never leaves
 the system. `[inferred from absence]`: none of the three adapter payload structs
 (`ReportPayload`, `LogEntry`, `PulsePayload`/`Indicator`) has any field that
 could carry a WAN vantage address - confirmed by reading all three
-(`vendor/abuseipdb.rs:44-49`, `vendor/dshield.rs:104-113`, `vendor/otx.rs:62-76`).
+(`crates/review/src/vendor/abuseipdb.rs#ReportPayload`, `crates/review/src/vendor/dshield.rs#LogEntry`, `crates/review/src/vendor/otx.rs#PulsePayload`, `crates/review/src/vendor/otx.rs#Indicator`).
 
 The report comment is
 `"propolis: {ip} - {N} event(s) across {M} categor{y/ies} since {first_seen}, current score {raw.round_dp(1)}"`,
-and `evidence_window = (first_seen, last_seen)` (`build_report`, `submit.rs:407-422`).
+and `evidence_window = (first_seen, last_seen)` (`crates/review/src/submit.rs#build_report`).
 
 ## Ops-alert ntfy
 
@@ -167,8 +169,8 @@ GeoLite2 enrichment (including the GeoLite2-ASN reads that back
 [ASN suppression](scoring-and-feed.md#exclusions-and-asn-suppression)) is
 **local file reads, not network egress.** The ASN allowlist loads the ASN DB via
 `GeoIp::load_asn_only`; an empty allowlist short-circuits before any lookup
-(`crates/propolis/src/main.rs:845,852,867`,
-`crates/feed/src/exclusion.rs:53-61`). No MaxMind or other host is contacted at
+(`crates/propolis/src/main.rs#main`,
+`crates/feed/src/exclusion.rs#with_asn_allowlist`, `crates/feed/src/exclusion.rs#lookup_asn`). No MaxMind or other host is contacted at
 runtime; keeping the database current is an operator file-management task.
 
 ## See also

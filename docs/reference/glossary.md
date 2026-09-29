@@ -45,8 +45,8 @@ sensor framework; commands are logged, never executed. See
 
 ### Signal type
 
-The classification of an observed event (16 distinct variants,
-`crates/core-scoring/src/domain/enums.rs`). Signal types, event fields, and the
+The classification of an observed event (17 distinct variants,
+`crates/core-scoring/src/domain/enums.rs#SignalType`). Signal types, event fields, and the
 weight each contributes are owned by
 [`events-and-signals.md`](events-and-signals.md).
 
@@ -55,14 +55,14 @@ weight each contributes are owned by
 The three event attributes that decide whether a sighting *confirms* an
 attacker rather than merely records traffic. Only a TCP event that is
 authenticated and categorized `Honeypot` sets the confirmed-real latch
-(`is_confirmed_real`, `crates/core-scoring/src/domain/enums.rs:134-136`).
+(`is_confirmed_real`, `crates/core-scoring/src/domain/enums.rs#is_confirmed_real`).
 
 ### Confirmed-real latch
 
 A sticky per-IP flag meaning "this IP completed a full authenticated honeypot
 interaction at least once." It is set the first time an event satisfies the
 confirmed-real predicate (TCP + authenticated + `Honeypot` category) and never
-clears thereafter (`crates/core-scoring/src/scoring/engine.rs:144-146`). A
+clears thereafter (`crates/core-scoring/src/scoring/engine.rs#apply_event`). A
 spoofed source cannot forge it, because it requires a completed authenticated
 TCP handshake from an address the sender actually controls. It gates
 *eligibility*.
@@ -71,7 +71,7 @@ TCP handshake from an address the sender actually controls. It gates
 
 Whether an IP may be published to the blocklist feed. An IP is eligible only
 when it is not delisted, has the confirmed-real latch, and has at least two
-recorded events (`crates/core-scoring/src/scoring/eligibility.rs:1-8`). Raw
+recorded events (`crates/core-scoring/src/scoring/eligibility.rs#eligible`). Raw
 score alone never makes an IP eligible. Thresholds are owned by
 [`scoring-and-feed.md`](scoring-and-feed.md).
 

@@ -20,16 +20,17 @@ installed by `deploy/install.sh`:
 
 - `propolis.service` runs `/usr/local/bin/propolis`, a single process holding the
   intake, review, feed, and console subsystems as concurrent tasks over one shared
-  PostgreSQL pool (`deploy/propolis.service:107,121`,
-  `crates/propolis/src/main.rs:1-5`).
+  PostgreSQL pool (`deploy/propolis.service#Description=Propolis unified daemon`,
+  `deploy/propolis.service#ExecStart=/usr/local/bin/propolis`,
+  `crates/propolis/src/main.rs`).
 - `sensor-<name>.service` for `catchall, ssh, telnet, redis, adb, http, ftp, smtp, cred`,
   each running its own binary as its own system user, created by `deploy/install.sh`'s
-  delegation to `deploy/provision.sh` (`ensure_user`, `deploy/provision.sh:50-70`,
-  `deploy/sensor-ssh.service:34`).
+  delegation to `deploy/provision.sh` (`deploy/provision.sh#ensure_user`,
+  `deploy/sensor-ssh.service#User=propolis-ssh`).
 
 The standalone `intake.service`, `review.service`, `feed.service`, and `console.service`
 units also exist in the repo but are **superseded by `propolis.service` in production and
-are not installed by `install.sh`** (`deploy/install.sh:14-17`). They remain for dev and
+are not installed by `install.sh`** (`deploy/install.sh#deliberately NOT installed here`). They remain for dev and
 testing only; do not enable them alongside the unified daemon.
 
 See [process topology](../architecture/process-topology.md) for what runs inside the
@@ -52,12 +53,12 @@ sudo systemctl enable --now sensor-catchall sensor-ssh sensor-telnet sensor-redi
 ```
 
 `enable --now` both starts the unit and sets it to start at boot. Source:
-`docs/archive/2026-08-26/root/INSTALL.md:332-346` (the live `INSTALL.md` is now a redirect
+`docs/archive/2026-08-26/root/INSTALL.md#6. Start services` (the live `INSTALL.md` is now a redirect
 stub). Runnable commands are collected in
 [commands reference](../reference/commands.md).
 
 Ordering: `propolis.service` declares `After=network.target postgresql.service`
-(`deploy/propolis.service:108`), so systemd starts it after the database. Sensors carry no
+(`deploy/propolis.service#After=network.target postgresql.service`), so systemd starts it after the database. Sensors carry no
 dependency on the daemon; they append to local log files and the daemon tails those logs,
 so start order between sensors and daemon does not matter for correctness.
 
@@ -69,13 +70,13 @@ systemctl status propolis sensor-ssh
 journalctl -u propolis -u sensor-ssh -f
 ```
 
-Source: `docs/archive/2026-08-26/root/INSTALL.md:350-362`. For health and readiness endpoints, the in-console log
+Source: `docs/archive/2026-08-26/root/INSTALL.md#7. Verify`. For health and readiness endpoints, the in-console log
 viewer, and metrics, see [health and observability](./health-and-observability.md).
 
 ## Startup sequence (daemon)
 
 `propolis` fails fast (`std::process::exit(1)`) at any of these steps rather than starting
-degraded (`main`, `crates/propolis/src/main.rs:604-692`):
+degraded (`crates/propolis/src/main.rs#main`):
 
 1. init tracing;
 2. `load_config()` - exit 1 on any missing-required or malformed-bound value;
@@ -85,18 +86,18 @@ degraded (`main`, `crates/propolis/src/main.rs:604-692`):
 6. spawn subsystems.
 
 Migrations run at startup from within the binary (`sqlx::migrate!`); there is no separate
-migrate step (`main.rs:665-680`, confirmed `install.sh:22-24`). A config, DB, or migration
+migrate step (`crates/propolis/src/main.rs#main`, confirmed `deploy/install.sh#runs its own migrations`). A config, DB, or migration
 error is therefore visible as an immediate exit in `journalctl`, not a silent partial run.
 See [troubleshooting: startup and config](../troubleshooting/startup-and-config.md).
 
 ## Stop and graceful shutdown
 
 Stopping a unit sends SIGTERM (SIGINT on Ctrl-C); the daemon treats both as a clean
-shutdown request (`crates/propolis/src/main.rs:118`, `shutdown_signal` `:573-600`, `:1288-1313`):
+shutdown request (`crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`, `crates/propolis/src/main.rs#shutdown_signal`, `crates/propolis/src/main.rs#main`):
 
 1. cancel all subsystems;
 2. await their task handles, bounded by a **30 s `SHUTDOWN_TIMEOUT`**
-   (`main.rs:118`), then log a warning and stop waiting if any handle has not finished;
+   (`crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`), then log a warning and stop waiting if any handle has not finished;
 3. `pool.close()`.
 
 A clean stop exits 0.
@@ -107,14 +108,14 @@ The two unit families restart differently on purpose:
 
 | Unit | `Restart=` | `RestartSec=` | Cite |
 |---|---|---|---|
-| `propolis.service` | `on-failure` | 5 s | `deploy/propolis.service:129-130` |
+| `propolis.service` | `on-failure` | 5 s | `deploy/propolis.service#Restart=on-failure` |
 | `sensor-*.service` | `always` | 10 s | `deploy/sensor-ssh.service`, `deploy/sensor-*.service` |
 
 The daemon uses `on-failure`, **not** `Restart=always`, because its in-process supervisor
 (`crates/propolis/src/supervisor.rs`) restarts a panicked subsystem with backoff without
 the process exiting. A process exit is therefore only a fail-fast (bad config, DB
 unreachable, migration failure) or an operator-requested clean stop, and neither should be
-auto-restarted into the same failure (`deploy/propolis.service:122-128`). Sensors are
+auto-restarted into the same failure (`deploy/propolis.service#Unlike the retired units' Restart=always`). Sensors are
 independent listeners with no such internal supervisor, so they use `always`. Failure
 modes are covered in [concurrency and failure](../architecture/concurrency-and-failure.md).
 

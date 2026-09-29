@@ -26,7 +26,7 @@ and every sensor unit:
 
 | Directive | Value | Effect |
 |---|---|---|
-| `User=` / `Group=` | dedicated `propolis-*` user, never root | asserted `User != root` (`deploy_test.rs:84`) |
+| `User=` / `Group=` | dedicated `propolis-*` user, never root | asserted `User != root` (`crates/sensor-framework/tests/deploy_test.rs#assert_unit_hardened`) |
 | `NoNewPrivileges=yes` | - | no setuid/capability escalation after exec |
 | `ProtectSystem=strict` | - | entire filesystem read-only except explicit `ReadWritePaths` |
 | `ProtectHome=yes` | - | home trees invisible |
@@ -48,7 +48,7 @@ the fstab `noexec` mount for live malware binaries), and `PrivateUsers=yes`.
 
 > **Caveat - `SystemCallFilter` is a placeholder, not a delivered control.**
 > Every unit ships `SystemCallFilter=@system-service` minus `@privileged
-> @resources` (`deploy/propolis.service:181-194`, `deploy/sensor-ssh.service:80-99`).
+> @resources` (`deploy/propolis.service#SystemCallFilter=@system-service`, `deploy/sensor-ssh.service#SystemCallFilter=@system-service`).
 > The unit header explicitly labels this a **broad development allowlist** and
 > instructs the operator to derive the real per-binary allowlist (e.g. via
 > `strace -c -f`) before production. A tightened syscall filter is **not** shipped
@@ -57,22 +57,22 @@ the fstab `noexec` mount for live malware binaries), and `PrivateUsers=yes`.
 
 ## Filesystem permission model (install.sh)
 
-`deploy/install.sh` delegates to `deploy/provision.sh` (`install.sh:89-90`;
+`deploy/install.sh` delegates to `deploy/provision.sh` (`deploy/install.sh#run_provision`;
 idempotent - `ensure_dir`'s `install -d` reasserts mode/owner/group,
-`provision.sh:79-87`), which lays out the directory tree. The exhaustive
+`deploy/provision.sh#ensure_dir`), which lays out the directory tree. The exhaustive
 path/mode table is owned by
 [../reference/filesystem-paths.md](../reference/filesystem-paths.md); the
 security-load-bearing choices:
 
 - **`/var/lib/propolis` is root-owned `0755`** on purpose
-  (`ensure_dir` call, `deploy/provision.sh:101-106`): a parent writable by the `propolis` daemon would let a
+  (`ensure_dir` call, `deploy/provision.sh#ensure_dir /var/lib/propolis`): a parent writable by the `propolis` daemon would let a
   compromised daemon unlink or swap the sibling `ssh/` host-key directory for a
   symlink that `ProtectSystem=strict`'s bind-mount would then follow. The host-key
   dir `/var/lib/propolis/ssh` is `0750` owned `propolis-ssh`.
 - **Captured sample files are written `0640`**
   (`crates/sensor-framework/src/spool.rs#write_and_seal`) into spool directories that
   `install.sh` prints (does **not** auto-create) `noexec,nosuid,nodev` fstab lines
-  for (`install.sh:96-102`). Whether those mount options are actually applied on
+  for (`deploy/install.sh#NOT DONE BY THIS SCRIPT`). Whether those mount options are actually applied on
   a given host is an operator step, not enforceable from the repo - see
   [malware custody](./malware-custody.md) and
   [residual risks](./residual-risks.md).
@@ -81,7 +81,7 @@ security-load-bearing choices:
   read from argv or baked into a unit file. See
   [../operations/secret-management.md](../operations/secret-management.md).
 - Dedicated users are created `--system --no-create-home --shell /usr/sbin/nologin`
-  (`ensure_user`, `deploy/provision.sh:50-70`); no sensor user can log in.
+  (`ensure_user`, `deploy/provision.sh#ensure_user`); no sensor user can log in.
 
 ## Database-layer protections
 
@@ -109,7 +109,7 @@ but the database now enforces the *linkage* a rogue INSERT would try to skip.
 
 **Serialized inserts.** The chain-head read, INSERT, and projection run inside one
 transaction under a `pg_advisory_xact_lock` at READ COMMITTED
-(`crates/core-scoring/src/repository/events.rs:142-171`) so two concurrent inserts
+(`crates/core-scoring/src/repository/events.rs#append_event`) so two concurrent inserts
 cannot fork the chain on the same `prev_hash`.
 
 **Parameterized queries only.** No SQL string is built with `format!` in non-test

@@ -21,7 +21,7 @@ capture metadata only.
 A sensor never writes a captured body on the connection's response path. Doing so would make
 the reply latency reveal whether a capture happened, so capture is pushed onto a bounded queue
 drained by a single background worker, off the response path
-(`crates/sensor-framework/src/handoff.rs:1-14`).
+(`crates/sensor-framework/src/handoff.rs`).
 
 ```mermaid
 flowchart LR
@@ -36,12 +36,14 @@ flowchart LR
 Key properties:
 
 - **Bounded queue, capacity 64.** `submit` is backed by `mpsc::try_send` and **never blocks**:
-  if the queue is full the job is dropped immediately (`handoff.rs:221-241`).
+  if the queue is full the job is dropped immediately (`crates/sensor-framework/src/handoff.rs#submit`,
+  `crates/sensor-ftp/src/lib.rs#CAPTURE_QUEUE_SIZE`, `crates/sensor-adb/src/lib.rs#CAPTURE_QUEUE_SIZE`,
+  `crates/sensor-ssh/src/server.rs#serve`).
 - **Exactly one worker.** The worker drains the queue strictly sequentially, so
   `spool.store` is never called concurrently; a second `start_worker` call panics
-  (`handoff.rs:259-298`).
+  (`crates/sensor-framework/src/handoff.rs#start_worker`).
 - **Panic isolation.** A panicking event builder is caught (`catch_unwind`) and the worker
-  continues (`process_job`, `handoff.rs:323-347`).
+  continues (`crates/sensor-framework/src/handoff.rs#process_job`).
 
 ## What an operator sees under overload
 
@@ -55,7 +57,7 @@ When an attacker floods uploads faster than the single worker drains, the queue 
 `submit` drops jobs. Each drop increments `dropped_count` and logs a WARN **only at power-of-two
 totals** (drop 1, 2, 4, 8, 16, ...), so the first drop is loud and a sustained flood degrades to
 logarithmic noise instead of filling the log partition it shares
-(`handoff.rs:225-241`). A dropped job produces no stored sample and no event. This is a
+(`crates/sensor-framework/src/handoff.rs#submit`). A dropped job produces no stored sample and no event. This is a
 deliberate trade of completeness for covertness under load, not an error.
 
 Log line (example): `capture hand-off: queue full, sample dropped (no spool, no event)` with
@@ -64,7 +66,7 @@ Log line (example): `capture hand-off: queue full, sample dropped (no spool, no 
 ### Spool refusals (`spool_refused_count`)
 
 A body that reaches the worker but the spool rejects increments `spool_refused_count` and logs
-a WARN **per refusal** (`process_job`, `handoff.rs:330-340`). The spool refuses in two cases
+a WARN **per refusal** (`crates/sensor-framework/src/handoff.rs#process_job`). The spool refuses in two cases
 (`crates/sensor-framework/src/spool.rs#store`, `crates/sensor-framework/src/spool.rs#reserve_budget`):
 
 - **`FileSizeExceeded`** - the body is larger than the per-file cap (10 MB for the spooling

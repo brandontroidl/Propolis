@@ -87,7 +87,7 @@ and the console detail page shows "Distinct WAN vantages" as 0. Fixes:
 
 Breadth scoring only counts a WAN vantage that completed an authenticated TCP
 handshake, and dedups vantages by /24 (IPv4) or /64 (IPv6) prefix
-(`crates/core-scoring/src/scoring/breadth.rs:29-57`). So a single operator block
+(`crates/core-scoring/src/scoring/breadth.rs#distinct_wan_count`). So a single operator block
 or spoofed UDP source will not inflate the vantage count even when mapped
 correctly - that is intended. Scoring constants:
 [Scoring and feed](../reference/scoring-and-feed.md).

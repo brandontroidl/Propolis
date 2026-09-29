@@ -32,7 +32,7 @@ not by careful coding:
   client anywhere in its own dependency tree. Per-sensor tests ban
   `reqwest/hyper/ureq/curl/isahc/surf/attohttpc`; the shell's `wget`/`curl` return
   canned transcripts with zero network I/O
-  (`crates/sensor-framework/src/shell.rs:18-24`). A sensor cannot fetch or serve
+  (`crates/sensor-framework/src/shell.rs`). A sensor cannot fetch or serve
   attacker-directed content because nothing capable of it is present. (The *platform*
   as a whole has a few operator-gated, default-off egress paths for enrichment and
   reporting; see [`security/outbound-controls.md`](../security/outbound-controls.md).
@@ -53,26 +53,26 @@ A sensor crate supplies protocol logic; the framework supplies everything else.
 `run_tcp_listener(addr, bounds, handler)` binds one TCP address, runs an accept loop,
 and hands each accepted connection to the protocol handler with a raw `TcpStream`,
 the peer `SocketAddr`, and a fresh `Uuid::now_v7()` session id
-(`crates/sensor-framework/src/listener.rs:72-140`). Each connection:
+(`crates/sensor-framework/src/listener.rs#run_tcp_listener`). Each connection:
 
 - runs in its own `tokio::spawn`, so a panicking handler is caught by tokio's task
   harness, logged, and never crashes the accept loop
-  (`listener.rs:62-71, 124-130`);
+  (`crates/sensor-framework/src/listener.rs#run_tcp_listener`);
 - is bounded by `max_concurrent` via a `tokio::sync::Semaphore` - a connection over
   the limit is refused immediately (socket closed, never queued)
-  (`bounds.rs:29-33`);
+  (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`);
 - is time-bounded by running the handler future inside
-  `tokio::time::timeout(max_duration, fut)` (`listener.rs:118`).
+  `tokio::time::timeout(max_duration, fut)` (`crates/sensor-framework/src/listener.rs#run_tcp_listener`).
 
 `run_udp_listener` mirrors this for datagrams, but **never hands the socket to the
 handler**, so a UDP sensor cannot answer a probe by construction
-(`listener.rs:147-161, 162-221`). `normalize_dual_stack` maps IPv4-mapped IPv6 peers
+(`crates/sensor-framework/src/listener.rs#run_udp_listener`). `normalize_dual_stack` maps IPv4-mapped IPv6 peers
 (`::ffff:a.b.c.d`) down to plain IPv4 before WAN resolution, so a plain-IPv4 WAN map
-matches a dual-stack listener (`listener.rs:272-280`).
+matches a dual-stack listener (`crates/sensor-framework/src/listener.rs#normalize_dual_stack`).
 
 ### Connection bounds
 
-`ConnectionBounds` (`bounds.rs:16-34`) defines *shape only* - `read_timeout`, `idle_timeout`, `max_duration`, `max_captured_bytes`,
+`ConnectionBounds` (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`) defines *shape only* - `read_timeout`, `idle_timeout`, `max_duration`, `max_captured_bytes`,
 `max_concurrent`. Concrete values are set per sensor and read from environment
 variables validated at startup; a present-but-zero or unparseable bound makes the
 process refuse to start on most sensors ("zero never means unlimited"). Exact
@@ -84,7 +84,7 @@ defaults, and the two sensors that fall back to defaults instead of refusing
 
 `WanResolver` maps the local bound address a connection landed on to the operator's
 WAN IP, so an event records which vantage saw the attacker
-(`wan.rs:25-33`). An unmapped local address yields `None` → the event's `wan_ip` is
+(`crates/sensor-framework/src/wan.rs#WanResolver::resolve`). An unmapped local address yields `None` → the event's `wan_ip` is
 null, a documented case rather than an error. No-NAT deployments carry an identity
 entry (local == WAN).
 
@@ -92,12 +92,12 @@ entry (local == WAN).
 
 One coherent fictional host - **Ubuntu 22.04.4 LTS "Jammy", hostname `server01` by
 default** - is resolved from `persona.rs` so no two sensors contradict each other
-(`persona.rs:21-51`). Banners, `uname` output, and `/etc/os-release` all derive from
+(`crates/sensor-framework/src/persona.rs`). Banners, `uname` output, and `/etc/os-release` all derive from
 it.
 
 `fakefs.rs` is an in-memory static snapshot, fresh per session, with no real
 filesystem underneath - path traversal is structurally impossible
-(`fakefs.rs:1-14`). `shell.rs` is the interactive fake shell presented post-auth,
+(`crates/sensor-framework/src/fakefs.rs`). `shell.rs` is the interactive fake shell presented post-auth,
 shared by SSH, Telnet, and ADB. It emits one `honeypot_command_exec` per non-blank
 line (recording the raw line, sanitized and capped), decodes single-byte-XOR
 obfuscated probes, recognizes fetch verbs (emitting `honeypot_file_download` with the
@@ -109,7 +109,7 @@ behavior is owned by
 ### Capture sanitization
 
 `sanitize_value(input, max_len)` is the single chokepoint every attacker string
-clears before entering an event (`sanitize.rs:1-27`): it collapses CR/LF/tab runs to
+clears before entering an event (`crates/sensor-framework/src/sanitize.rs#sanitize_value`): it collapses CR/LF/tab runs to
 one space, strips ANSI/C0/C1 controls and bidi/zero-width characters, NFC-normalizes,
 and UTF-8-boundary-safe truncates to a byte cap - closing CR/LF/ANSI log injection.
 See [`security/input-handling.md`](../security/input-handling.md).
@@ -126,12 +126,12 @@ path**, for covertness - response latency must not leak whether a capture happen
 1. The handler reads enough to answer the protocol, builds a `CaptureJob`, and
    `submit`s it. `submit` is backed by `mpsc::try_send` and **never blocks**; a full
    queue drops the job, returns `CaptureDropped`, and increments a counter
-   (`handoff.rs:221-241`). Queue size is 64 on every spooling sensor.
+   (`crates/sensor-framework/src/handoff.rs#submit`). Queue size is 64 on every spooling sensor.
 2. A **single worker** drains the queue strictly sequentially (`start_worker` panics
    on a second call), so the spool is never written concurrently
-   (`handoff.rs:259-298`). It hashes the body, stores it, and appends the event via
+   (`crates/sensor-framework/src/handoff.rs#start_worker`). It hashes the body, stores it, and appends the event via
    `process_job`; a panicking event builder is isolated by `catch_unwind` and the
-   worker continues (`handoff.rs:315-391`).
+   worker continues (`crates/sensor-framework/src/handoff.rs#process_job`).
 
 ### Quarantine spool
 
@@ -150,14 +150,14 @@ and a 100 MB global budget. See
 `EventEmitter::append` serializes an event to one NDJSON line, opens the log with
 `O_APPEND` (atomic concurrent appends on local storage), and `write_all` + `flush`; a
 serialize or append failure never partially writes a line
-(`emit.rs:45-68`). The log directory must be local storage - NFS `O_APPEND` can race
-(`emit.rs:30-34`). These NDJSON files are what the intake tailer consumes; see
+(`crates/sensor-framework/src/emit.rs#append`). The log directory must be local storage - NFS `O_APPEND` can race
+(`crates/sensor-framework/src/emit.rs#append`). These NDJSON files are what the intake tailer consumes; see
 [`event-and-sample-lifecycle.md`](event-and-sample-lifecycle.md).
 
 ## The wire record
 
 Every sensor emits the same frozen record, `SensorEvent`
-(`crates/sensor-wire/src/lib.rs:39-61`, `WIRE_VERSION = 1`). A sensor emits **raw
+(`crates/sensor-wire/src/lib.rs#SensorEvent`, `WIRE_VERSION = 1`). A sensor emits **raw
 facts only** - `source_ip`, `wan_ip`, `sensor`, `signal_type` (a plain string),
 `protocol`, `authenticated`, `observed_at`, `metadata`, an optional `sample`
 reference, an optional `session_id`, and an optional `occurrence_id` (minted by
@@ -169,7 +169,7 @@ types and the signal vocabulary are owned by
 ## The catch-all and multi-protocol sensors
 
 - **`sensor-catchall`** emulates no protocol and never writes a byte back
-  (`crates/sensor-catchall/src/handler.rs:1-9`). It binds every configured address
+  (`crates/sensor-catchall/src/handler.rs`). It binds every configured address
   on **both TCP and UDP**, reads up to a small byte cap, and emits one
   `catchall_probe` carrying a hex payload sample. Its bounds are deliberately tighter
   than the interactive sensors.

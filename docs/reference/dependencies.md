@@ -41,7 +41,7 @@ Consequences:
 ## The `cargo vendor` workflow
 
 After adding or updating a dependency
-(`docs/manuals/contributor.md:111-113`):
+(`docs/manuals/contributor.md#Schema and dependency changes`):
 
 > **Egress warning.** `cargo vendor` fetches from crates.io. Run it on a
 > workstation, never on the honeypot node.
@@ -85,11 +85,13 @@ load-bearing ones and their roles are listed here.
 | htmx | - | Client-side interactivity in the console (vendored front-end asset, not a Rust crate). |
 | Chart.js | - | Console dashboard charts (vendored front-end asset). |
 | `reqwest` / `hyper` | - | HTTP clients present in `Cargo.lock`, used **only** by the review/enrichment paths (VirusTotal, vendor abuse submitters, the SSRF-guarded malware fetcher). |
-| `sqlx` | 0.9.0 | Async PostgreSQL access, compile-time-checked queries, migrations, and the `sqlx::test` harness. Features differ per crate (core-scoring includes `uuid`; console omits it - `crates/core-scoring/Cargo.toml:15`, `crates/console/Cargo.toml:29`). |
+| `sqlx` | 0.9.0 | Async PostgreSQL access, compile-time-checked queries, migrations, and the `sqlx::test` harness. Features differ per crate (core-scoring includes `uuid`; console omits it - `crates/core-scoring/Cargo.toml#sqlx`, `crates/console/Cargo.toml#sqlx`). |
 
 `sensor-ssh` additionally carries its own cryptographic primitives
 (x25519 / ed25519-dalek, chacha20, poly1305) so it can complete a real SSH
-handshake without a general SSH library (`crates/sensor-ssh/Cargo.toml:21-24`).
+handshake without a general SSH library (`crates/sensor-ssh/Cargo.toml#x25519-dalek`,
+`crates/sensor-ssh/Cargo.toml#ed25519-dalek`, `crates/sensor-ssh/Cargo.toml#chacha20`,
+`crates/sensor-ssh/Cargo.toml#poly1305`).
 
 ### HTTP clients and the egress model
 

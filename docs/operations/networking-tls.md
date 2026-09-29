@@ -26,8 +26,8 @@ page explains exposure and operator responsibilities.
 
 Sensors are the internet-exposed honeypot listeners. Each requires its bind
 address explicitly and fails closed if it is absent or unparseable - there is no
-compiled-in default port anywhere (`load_config_from_env`,
-`crates/sensor-ssh/src/main.rs:160-165` and
+compiled-in default port anywhere
+(`crates/sensor-ssh/src/main.rs#load_config_from_env` and
 the equivalent in each sensor). The IP portion is whatever the operator writes
 (`0.0.0.0`, a specific address, etc.). `sensor-ftp` additionally opens
 passive-mode data connections on dynamic ephemeral ports negotiated per session
@@ -43,15 +43,15 @@ verified to a fixed/configurable range in this pass].
 ### Console (operator-facing)
 
 The console binds **loopback-only by default** (`127.0.0.1:8080`,
-`crates/propolis/src/config.rs:30,600-608`), on an unprivileged port with no
+`crates/propolis/src/config.rs#DEFAULT_CONSOLE_BIND`), on an unprivileged port with no
 capability grant. It binds a non-localhost address only if the operator
 overrides `PROPOLIS_CONSOLE_BIND` - the design intent is to keep it loopback and
 put any remote access behind the operator's own reverse proxy
-(`DEFAULT_BIND`, `crates/console/src/main.rs:49-52`).
+(`crates/console/src/main.rs#DEFAULT_BIND`).
 
 `/health`, `/ready`, and `/metrics` share the console's bind (no separate port)
 and are mounted outside the session-auth middleware
-(`crates/console/src/routes/mod.rs`). This is acceptable *because* the console is
+(`crates/console/src/routes/mod.rs#router`). This is acceptable *because* the console is
 loopback-only; if you rebind it off-loopback, those endpoints become reachable
 too - front them with authentication at the proxy. Route ownership is in
 [../reference/console-routes.md](../reference/console-routes.md).
@@ -83,7 +83,7 @@ reverse proxy" comment, not a shipped feature). A typical arrangement:
   `/health`/`/ready`/`/metrics` endpoints if the proxy is remotely reachable.
 
 The application sets `X-Frame-Options: DENY`, `X-Content-Type-Options:
-nosniff` and a Content-Security-Policy (unless a route set a stricter one) on console routes (`security_headers`, `crates/console/src/routes/mod.rs:85-107`) but sets no
+nosniff` and a Content-Security-Policy (unless a route set a stricter one) on console routes (`crates/console/src/routes/mod.rs#security_headers`) but sets no
 HSTS - HSTS, if wanted, is another reason to terminate at a proxy.
 
 Outbound connections (vendor APIs, VirusTotal, the fetcher) use HTTPS provided
@@ -93,7 +93,7 @@ those paths default off. See
 
 ## Firewall and exposure guidance
 
-Based on `docs/archive/2026-08-26/root/INSTALL.md:378-385` (operator guidance, not code; the
+Based on `docs/archive/2026-08-26/root/INSTALL.md#Firewall considerations` (operator guidance, not code; the
 live `INSTALL.md` is now a redirect stub):
 
 - **Inbound:** allow the configured sensor ports from the internet (that is the
@@ -105,7 +105,7 @@ live `INSTALL.md` is now a redirect stub):
   standard proxy variables, so they can leave through an egress proxy. The
   malware fetcher, if enabled, ignores those variables and always connects
   directly, so a policy that allows egress only through a proxy blocks it. **Sensors make no outbound connections by design**
-  (`docs/archive/2026-08-26/root/INSTALL.md:385`); their unit files restrict address families to
+  (`docs/archive/2026-08-26/root/INSTALL.md#Firewall considerations`); their unit files restrict address families to
   `AF_INET AF_INET6` with no outbound path.
 - **Recovery path:** before applying any firewall rule that could sever access,
   confirm you have out-of-band administration (hypervisor console / serial), not

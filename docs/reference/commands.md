@@ -16,7 +16,7 @@ bounds live in [`environment-variables.md`](environment-variables.md); ports in
 invocations.
 
 The toolchain is pinned to Rust `1.96.1` with `clippy` + `rustfmt`
-(`rust-toolchain.toml:6-7`); cargo selects it automatically inside the repo.
+(`rust-toolchain.toml#channel`, `rust-toolchain.toml#components`); cargo selects it automatically inside the repo.
 Every workspace crate is edition 2024.
 
 ## Build
@@ -26,9 +26,9 @@ cargo build            # debug build, all 24 workspace members
 cargo build --release  # release binaries into target/release/
 ```
 
-`cargo build --release` is the documented build step (`README.md:42`,
-`docs/operations/installation.md:25`); the install script expects those release
-binaries in `target/release/` (`deploy/install.sh:59-60,127-130`).
+`cargo build --release` is the documented build step (`README.md#Building and trying it`,
+`docs/operations/installation.md#1. Build`); the install script expects those release
+binaries in `target/release/` (`deploy/install.sh#BUILD_DIR`).
 
 ## The gate
 
@@ -49,7 +49,7 @@ cargo test --workspace --locked -- --test-threads=1 2>&1 | tee /tmp/test-output.
   the `tee` pipe cannot report green over a red suite.
 - `--locked` enforces the committed `Cargo.lock` frozen.
 
-`docs/governance/contribution.md:41` gives a shorter chained form
+`docs/governance/contribution.md#The merge gate` gives a shorter chained form
 (`cargo fmt --check && cargo clippy -- -D warnings && cargo test`); it omits the
 scope flags above and bails on first failure, so treat CI as authoritative. See
 [`../development/build-and-test.md`](../development/build-and-test.md) for the
@@ -64,7 +64,7 @@ cargo test -p console -- --ignored rdns     # the one #[ignore]d live rDNS test 
 
 > **Egress warning.** `cargo test -p console -- --ignored rdns` performs a live
 > reverse-DNS lookup (`live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`,
-> `crates/console/src/rdns.rs:352-366`). It is `#[ignore]`d
+> `crates/console/src/rdns.rs#live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`). It is `#[ignore]`d
 > precisely so the default suite stays offline-deterministic. Run it only when a
 > real DNS query is acceptable.
 
@@ -85,7 +85,7 @@ podman start propolis-pg
 ```
 
 `DATABASE_URL` differs across sources (CI `postgres@localhost/postgres`, `.env`
-`postgres@127.0.0.1/postgres`, `docs/archive/2026-08-26/root/CONTRIBUTING.md:10`
+`postgres@127.0.0.1/postgres`, `docs/archive/2026-08-26/root/CONTRIBUTING.md#Development setup`
 `propolis:...@localhost/propolis_test`). Match your local `.env`; see
 [`environment-variables.md`](environment-variables.md).
 
@@ -94,7 +94,7 @@ podman start propolis-pg
 Each crate that produces a binary is runnable with `cargo run -p <crate>`.
 Every binary reads its configuration from environment variables **only** and
 refuses to start on a malformed value rather than substituting a default
-(`crates/sensor-catchall/src/main.rs:6-13`,
+(`crates/sensor-catchall/src/main.rs`,
 `crates/review/src/main.rs` module doc). Set the required vars first; see
 [`environment-variables.md`](environment-variables.md).
 
@@ -117,7 +117,7 @@ cargo run -p propolis          # intake + review + feed + console + VT + fetcher
 `propolis` connects the `PgPool`, applies migrations (see below), then spawns
 each subsystem as a supervised tokio task. The console listens on
 `config.console_bind` (default `127.0.0.1:8080`, `DEFAULT_CONSOLE_BIND`,
-`crates/propolis/src/main.rs`/`config.rs:30`). Review, feed, VirusTotal,
+`crates/propolis/src/main.rs#main`, `crates/propolis/src/config.rs#DEFAULT_CONSOLE_BIND`). Review, feed, VirusTotal,
 fetcher, and the ops-monitor are each **opt-in** and default OFF; when enabled,
 several are outbound paths (see warning under Operations). See
 [`../architecture/process-topology.md`](../architecture/process-topology.md).
@@ -129,10 +129,10 @@ daemon applies all three migration histories against the one database at
 startup, in order: core-scoring (`crates/core-scoring/migrations/`, 12 files),
 review (`crates/review/migrations/`, 7 files), then fleet
 (`crates/fleet/migrations/`, 1 file), each exiting `1` on failure
-(`crates/propolis/src/main.rs:665-680`). Review and fleet each carry their own
+(`crates/propolis/src/main.rs#main`). Review and fleet each carry their own
 migrator that renames its bookkeeping table (`review::migrator`, table
-`_sqlx_migrations_review`, `crates/review/src/lib.rs:26-50`; `fleet::migrator`,
-table `_sqlx_migrations_fleet`, `crates/fleet/src/lib.rs:30-37`) because all
+`_sqlx_migrations_review`, `crates/review/src/lib.rs#migrator`; `fleet::migrator`,
+table `_sqlx_migrations_fleet`, `crates/fleet/src/lib.rs#migrator`) because all
 three histories number from `0001`.
 See [`../development/schema-and-migrations.md`](../development/schema-and-migrations.md)
 and [`database.md`](database.md).
@@ -170,7 +170,7 @@ binaries, `propolis.service` + the 9 sensor units, and a logrotate config. It
 does **not** start or enable any service, create/migrate the database, or write
 any operator-owned `/etc/propolis/*.env` file; the one env file it does write is
 the generated, secret-free `fleet-listeners.env`
-(`deploy/install.sh:19-32,153-154,171-174`). Starting a
+(`deploy/install.sh#This script does NOT`, `deploy/install.sh#fleet-listeners.env`). Starting a
 service is a separate operator action taken only after populating the env files:
 
 > **Production warning.** Enabling a unit starts a live honeypot and, if the
@@ -182,7 +182,7 @@ sudo systemctl enable --now propolis.service      # example, per unit
 
 The spool directories still need `noexec,nosuid,nodev` mounts added to
 `/etc/fstab` by hand; the installer prints the exact lines and stops there
-(`deploy/install.sh:92-115`). Verify with `findmnt <path>` that the mount
+(`deploy/install.sh#NOT DONE BY THIS SCRIPT`). Verify with `findmnt <path>` that the mount
 options are actually in effect.
 
 ## Operations

@@ -11,34 +11,36 @@ last-verified: 2026-08-26
 
 The enforced conventions (fmt, clippy-deny-warnings) are checked by CI on every
 push and pull request - see [build-and-test](build-and-test.md). The rest are
-listed in `docs/manuals/contributor.md:93-100` and observable in the tree.
+listed in `docs/manuals/contributor.md#5. Follow the conventions` and observable in the tree.
 
 ## Language and formatting
 
-- **Rust 2024 edition** on every crate (`crates/*/Cargo.toml:4`).
+- **Rust 2024 edition** on every crate (the `edition` key in each `crates/*/Cargo.toml`, e.g. `crates/propolis/Cargo.toml#edition`).
 - **Pinned toolchain** `1.96.1` - see [toolchain-and-environment](toolchain-and-environment.md).
 - **`cargo fmt`** with default rustfmt config (no `rustfmt.toml` in the tree).
-  `cargo fmt --all --check` is a CI gate (`ci.yml:51`); the contribution guide's local
-  check runs `cargo fmt --check` (`docs/governance/contribution.md:41`).
+  `cargo fmt --all --check` is a CI gate (`.github/workflows/ci.yml#Format check`); the
+  contribution guide's local check runs `cargo fmt --check`
+  (`docs/governance/contribution.md#The merge gate`).
 - **Line endings LF**, final newline, trimmed trailing whitespace, UTF-8, 4-space
   Rust indent - enforced by `.editorconfig`.
 
 ## Lint
 
 `cargo clippy --workspace --all-targets --locked -- -D warnings` must pass - clippy
-runs with **warnings denied**, so any lint is a hard failure (`docs/governance/contribution.md:41`,
-`ci.yml:72`). `--all-targets` means test code is linted too.
+runs with **warnings denied**, so any lint is a hard failure
+(`docs/governance/contribution.md#The merge gate`,
+`.github/workflows/ci.yml#Clippy (deny warnings)`). `--all-targets` means test code is linted too.
 
 ## Comments
 
-Comment the **why**, never the **what** (`docs/manuals/contributor.md:95`). The tree follows this -
+Comment the **why**, never the **what** (`docs/manuals/contributor.md#5. Follow the conventions`). The tree follows this -
 comments explain constraints, invariants, and workarounds (e.g. the frozen
 hash-chain encoding, the serde casing asymmetry, `pipefail` in CI), not line-by-line
 narration.
 
 ## Commits
 
-Conventional commits, **lowercase**, with a why-focused body (`docs/governance/contribution.md:29-30`).
+Conventional commits, **lowercase**, with a why-focused body (`docs/governance/contribution.md#PR flow`).
 Example subject line (example only):
 
 ```
@@ -52,13 +54,14 @@ justification; the workspace does **not** apply `#![forbid(unsafe_code)]`. Verif
 uses in project (non-vendored) source:
 
 - `crates/console/src/rdns.rs` - libc FFI for the forward-confirmed reverse-DNS
-  resolver (`getnameinfo`, `CStr::from_ptr`, zeroed `sockaddr`), in `reverse_lookup`
-  and the `sockaddr_in_for`/`sockaddr_in6_for` helpers (`rdns.rs:137-196`); the
-  `CStr` and zeroed-`sockaddr` blocks are `SAFETY`-commented.
+  resolver (`getnameinfo`, `CStr::from_ptr`, zeroed `sockaddr`), in
+  `crates/console/src/rdns.rs#reverse_lookup` and the
+  `crates/console/src/rdns.rs#sockaddr_in_for`/`crates/console/src/rdns.rs#sockaddr_in6_for`
+  helpers; the `CStr` and zeroed-`sockaddr` blocks are `SAFETY`-commented.
 - `crates/propolis/src/config.rs` - `unsafe { env::set_var / remove_var }` inside
   `#[cfg(test)]` only; Rust 2024 marks these functions `unsafe` because process
   environment mutation is global cross-thread state - scattered across many call
-  sites in `mod tests`, e.g. `config.rs:847-1086`.
+  sites in `crates/propolis/src/config.rs#tests`.
 
 No other project source contains `unsafe` blocks. Sensor crates additionally keep
 `tokio`'s `process` feature off and are guarded by static tests that reject

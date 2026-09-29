@@ -16,27 +16,28 @@ owned by [console routes](../reference/console-routes.md); this page is the oper
 ## Endpoints
 
 The console router exposes three public (no session) probe endpoints plus `/login` and the
-font assets; every other route is session-gated (`router`, `crates/console/src/routes/mod.rs:53-78`).
+font assets; every other route is session-gated (`crates/console/src/routes/mod.rs#router`).
 The console binds loopback-only by default (`127.0.0.1:8080`); there is **no in-process TLS**
 (plain HTTP on a `TcpListener`), so any TLS termination and any exposure beyond loopback is an
 operator-provided reverse proxy. See [networking and TLS](./networking-tls.md).
 
 | Endpoint | Purpose | Success | Failure | Cite |
 |---|---|---|---|---|
-| `GET /health` | Liveness only; does not touch the DB | `200 {"status":"ok"}` (always) | none | `health` (`crates/console/src/routes/health.rs:20-24`) |
-| `GET /ready` | Readiness; pings Postgres `SELECT 1`, then checks no supervised subsystem has given up (unified daemon only; the standalone console supervises nothing) | `200` | **`503 {"status":"unavailable"}`** on any DB error (fail-closed); **`503 {"status":"unavailable","gave_up":[...]}`** naming the dead subsystems | `health.rs` `ready` |
-| `GET /metrics` | Prometheus text (`version=0.0.4`) | `200` | derived live per scrape | `crates/console/src/routes/metrics.rs:1-11` |
+| `GET /health` | Liveness only; does not touch the DB | `200 {"status":"ok"}` (always) | none | `crates/console/src/routes/health.rs#health` |
+| `GET /ready` | Readiness; pings Postgres `SELECT 1`, then checks no supervised subsystem has given up (unified daemon only; the standalone console supervises nothing) | `200` | **`503 {"status":"unavailable"}`** on any DB error (fail-closed); **`503 {"status":"unavailable","gave_up":[...]}`** naming the dead subsystems | `crates/console/src/routes/health.rs#ready` |
+| `GET /metrics` | Prometheus text (`version=0.0.4`) | `200` | derived live per scrape | `crates/console/src/routes/metrics.rs` |
 
 Use `/health` for a liveness check that a process is up, and `/ready` for a
-load-balancer/monitor readiness check that also proves the DB is reachable. `/metrics` is
-unauthenticated; that is acceptable only because the console is loopback-only
-(`metrics.rs:8-11`). If you proxy the console, do not expose `/metrics` publicly.
+load-balancer/monitor readiness check that also proves the DB is reachable. `/metrics` carries
+no session gate and, unless `PROPOLIS_CONSOLE_METRICS_TOKEN` is set, no bearer check; leaving it
+open is acceptable only because the console is loopback-only
+(`crates/console/src/routes/metrics.rs`, `crates/console/src/routes/metrics.rs#metrics`). If you proxy the console, do not expose `/metrics` publicly.
 
 ## Metrics
 
 `/metrics` derives everything from live DB queries plus the feed `manifest.json` on every
 scrape; there are no pre-aggregated counters, so a scrape reflects current state
-(`metrics.rs:43,190-198`). Emitted series (`metrics.rs:46-188`):
+(`crates/console/src/routes/metrics.rs#metrics`). Emitted series (`crates/console/src/routes/metrics.rs#metrics`):
 
 - Gauges: `propolis_ips_scored`, `propolis_ips_eligible`, `propolis_ips_recommended_vendor`,
   `propolis_ips_recommended_blocklist`, `propolis_review_queue_pending`.
@@ -71,8 +72,8 @@ by logrotate (`size 100M`, `rotate 5`, `copytruncate`; `deploy/logrotate-sensors
 Paths are owned by [filesystem paths](../reference/filesystem-paths.md).
 
 The console has a session-gated live log viewer at `/logs`, backed by an in-memory ring of the
-**1000** most recent tracing events (`LOG_BUFFER_CAPACITY`, `crates/propolis/src/main.rs:128`,
-`LogBuffer`, `crates/console/src/log_buffer.rs:39-58`). It is a convenience tail, not a durable log store; the journal and the
+**1000** most recent tracing events (`crates/propolis/src/main.rs#LOG_BUFFER_CAPACITY`,
+`crates/console/src/log_buffer.rs#LogBuffer`). It is a convenience tail, not a durable log store; the journal and the
 NDJSON files are authoritative.
 
 ### Overload counters
@@ -84,10 +85,10 @@ spool](./queue-and-spool.md); in summary:
 - **Dropped (queue full).** When the bounded capture queue is full, `submit` drops the job
   rather than blocking, increments `dropped_count`, and logs a WARN at **power-of-two totals**
   (first drop, then 2, 4, 8, ...) so a sustained flood degrades to logarithmic noise instead of
-  filling the log partition (`crates/sensor-framework/src/handoff.rs:225-241`).
+  filling the log partition (`crates/sensor-framework/src/handoff.rs#submit`).
 - **Spool-refused.** A body the spool rejects (per-file cap or exhausted global budget)
   increments `spool_refused_count` and logs a per-refusal WARN; no sample and no event result
-  (`process_job`, `handoff.rs:330-340`).
+  (`crates/sensor-framework/src/handoff.rs#process_job`).
 
 A rising drop or spool-refused count means the capture layer is shedding load; it is expected
 behavior under a flood (covertness over completeness), not a crash. Separately, the ops-alert
@@ -100,7 +101,7 @@ The daemon can run an internal monitor that pages via [ntfy](https://ntfy.sh) wh
 degrades. It is **off by default** and is one of the platform's operator-gated egress paths
 (see [outbound controls](../security/outbound-controls.md)). It is distinct from the Guardian
 host-compromise monitor and should use a separate topic
-(`docs/archive/2026-08-26/root/INSTALL.md:502-533`; the live `INSTALL.md` is now a redirect
+(`docs/archive/2026-08-26/root/INSTALL.md#Environment variable reference`; the live `INSTALL.md` is now a redirect
 stub).
 
 > **Warning - outbound egress.** Enabling the ops-alert monitor makes the daemon POST to your
@@ -112,7 +113,7 @@ Configuration is **fail-closed only on a half-configured target**: when
 `PROPOLIS_OPS_NTFY_TOPIC` makes the daemon refuse to start, because a target that looks
 configured but cannot page is worse than a loud config error; leaving both unset is
 accepted and falls back to alerting through the local log sink instead of ntfy
-(`parse_ops_alert`, `crates/propolis/src/ops_alert/config.rs:123-147`). Exact defaults and bounds for every
+(`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`). Exact defaults and bounds for every
 `PROPOLIS_OPS_*` var are owned by [environment
 variables](../reference/environment-variables.md); the monitor watches (defaults):
 

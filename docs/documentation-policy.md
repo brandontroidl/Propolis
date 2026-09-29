@@ -4,7 +4,7 @@ audience: maintainer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-28
 -->
 
 # Documentation policy
@@ -76,6 +76,34 @@ Each fact has exactly one home to prevent drift. Reference pages own exact value
 narrative and guide pages explain and link to them. The ownership map is in the
 [coverage matrix](coverage-matrix.md); the reference owners are listed in
 `docs/reference/`. Do not restate an owned value in a second page - link to it.
+
+## Citing code
+
+A current page cites code by symbol, never by line number. A line number moves with
+every edit above it and goes stale with no signal; a symbol stays put until the code it
+names is renamed or removed, and then a check fails. The form is a code span
+`path#anchor`:
+
+- `path` contains a `/` and names one file: from the repository root
+  (`crates/sensor-framework/src/spool.rs`), or a tail the page's context makes
+  unambiguous (`console/src/auth.rs`). Never a bare file name. `crates/*/Cargo.toml`
+  means that file in every crate.
+- `anchor`, in Rust source: the narrowest item the sentence is about - a function or
+  method, const, static, struct, enum, enum variant (`SpoolError::HashMismatch`), trait,
+  type alias, macro, or test name.
+- `anchor`, in any other file: a distinctive token found in it verbatim - a shell
+  function, a systemd directive with its value (`ReadWritePaths=/var/lib/propolis`), a
+  workflow step name, a SQL object, a TOML key, or a heading.
+- Several items take several spans. A whole file, or its module documentation, is cited
+  by the path alone.
+
+`crates/propolis/tests/docs_agreement.rs#current_docs_cite_code_by_symbol_not_by_line`
+fails on a line citation in any form (`path:N`, `file.rs:N`, a `:N` span whose file the
+paragraph implies, or `name:N` naming a Rust item), and
+`crates/propolis/tests/docs_agreement.rs#code_citations_name_symbols_their_files_contain`
+fails on a `path#anchor` whose file or anchor is missing. Dated records keep the
+citations they were written with: the claim-to-source ledger, the sanitizer results,
+`CHANGELOG.md`, and the `docs/history/` and `docs/archive/` pages.
 
 ## Corpus controls
 

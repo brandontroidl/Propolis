@@ -30,7 +30,7 @@ When traffic looks under-recorded, check which bound is biting.
   under a flood this is the deliberate backpressure point.
 - **Dedup window** - a repeat `(source_ip, signal_type)` within
   `DEDUP_WINDOW_SECONDS = 60` records the event but adds no score weight
-  (`crates/core-scoring/src/scoring/constants.rs:10`). So "event count rose but
+  (`crates/core-scoring/src/scoring/constants.rs#DEDUP_WINDOW_SECONDS`). So "event count rose but
   score did not" during rapid repeats is correct behavior, not a lost event.
 
 ### Counters to read
@@ -38,7 +38,7 @@ When traffic looks under-recorded, check which bound is biting.
 The console `/metrics` endpoint exposes process counters derived per scrape:
 
 - `propolis_events_ingested_total` and `propolis_events_rejected_total` come from
-  in-process atomics (`metrics`, `crates/console/src/routes/metrics.rs:302-313`). A rising
+  in-process atomics (`metrics`, `crates/console/src/routes/metrics.rs#metrics`). A rising
   `rejected` total during load is where dropped/invalid events surface.
 - `propolis_review_queue_pending` gauges the review backlog.
 
@@ -71,12 +71,12 @@ interval of lag.
 
 - **Nothing surfaces** - `populate` only inserts `ip_score` rows where
   `recommended_for_vendor = TRUE AND eligible = TRUE`
-  (`crates/review/src/queue.rs:80-97`). If a source never becomes eligible
+  (`crates/review/src/queue.rs#populate`). If a source never becomes eligible
   (eligibility needs a confirmed-real honeypot event and `event_count >= 2`),
   it never enters the queue. Eligibility and tier rules are owned by
   [Scoring and feed](../reference/scoring-and-feed.md).
 - **A rejected/snoozed entry keeps its state** - Rejected and Snoozed rows
-  persist so `populate` does not re-surface them (`reject`/`snooze`, `queue.rs:134-160`). This is
+  persist so `populate` does not re-surface them (`reject`/`snooze`, `crates/review/src/queue.rs#reject`, `crates/review/src/queue.rs#snooze`). This is
   intentional; use approve/reject/snooze from the console, not a manual delete.
 - **Review disabled** - `PROPOLIS_REVIEW_ENABLED=false` stops the loop entirely.
 
@@ -88,12 +88,12 @@ paths: [Filesystem paths](../reference/filesystem-paths.md).
 
 - **Fetcher spool budget** - the fetcher enforces a hardcoded global budget of
   1 GB on `/var/spool/propolis/fetched` (`FETCH_SPOOL_GLOBAL_BUDGET`,
-  `crates/propolis/src/main.rs:41,55`). At the budget it stops writing new
+  `crates/propolis/src/main.rs#FETCH_SPOOL_GLOBAL_BUDGET`). At the budget it stops writing new
   fetched samples; this is a cap, not an error. It is not operator-configurable.
 - **Sample retention** - `cleanup_old_samples` removes spool files older than 30
   days each cycle, run by the `sample-retention` supervised task
-  (`crates/propolis/src/main.rs:958-980`; `cleanup_old_samples`,
-  `crates/review/src/virustotal.rs:405-437`). This runs unconditionally,
+  (`crates/propolis/src/main.rs#main`, `crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`;
+  `cleanup_old_samples`, `crates/review/src/virustotal.rs#cleanup_old_samples`). This runs unconditionally,
   independent of whether VT scanning is enabled, so a box with VT disabled still
   ages out old spool files; only the standalone `review` binary (which does not
   run this task) needs you to prune manually or rely on logrotate/disk policy.

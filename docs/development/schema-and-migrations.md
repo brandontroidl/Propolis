@@ -31,12 +31,12 @@ Both histories number from `0001`. sqlx's default `_sqlx_migrations` bookkeeping
 table is keyed by version only (no namespacing), so sharing it would raise
 `VersionMissing` / `VersionMismatch`. The review crate works around this with its own
 `migrator()` that renames the bookkeeping table to `_sqlx_migrations_review` via
-`dangerous_set_table_name` (`crates/review/src/lib.rs:26-50`). `review` also has a
+`dangerous_set_table_name` (`crates/review/src/lib.rs#migrator`). `review` also has a
 cross-crate schema dependency: it uses `review_state_enum`, which is created by
-core-scoring migration `0001` (`0001_enums.sql:26`).
+core-scoring migration `0001` (`crates/core-scoring/migrations/0001_enums.sql#review_state_enum`).
 
 At runtime the daemon applies core-scoring migrations first, then `review::migrator()`,
-then `fleet::migrator()`, each `exit(1)` on failure (`crates/propolis/src/main.rs:665-680`).
+then `fleet::migrator()`, each `exit(1)` on failure (`crates/propolis/src/main.rs#main`).
 
 In tests, migrations are applied one of two ways
 ([build-and-test](build-and-test.md#test-styles-by-layer)):
@@ -70,17 +70,17 @@ and the append-only ledger's canonical hash encoding
 (`crates/core-scoring/src/hashing.rs`) are **frozen**. They are coupled:
 
 - `canonical_bytes` writes event fields in a fixed order with length-prefixed framing
-  and hashes them; a golden vector pins the encoding
-  (`hashing.rs:192-214`, `golden_chain_hash_is_stable`).
+  and `chain_hash` hashes them; a golden vector pins the encoding
+  (`crates/core-scoring/src/hashing.rs#canonical_bytes`, `crates/core-scoring/src/hashing.rs#chain_hash`, `crates/core-scoring/src/hashing.rs#golden_chain_hash_is_stable`).
 - The enum Serialize casing is deliberately the bare Rust identifier (e.g.
   `"CatchallProbe"`, `"Tcp"`), **not** snake/lowercase - changing it would change every
   chain hash. Locked by
-  `signal_type_serialize_is_unchanged_bare_rust_identifier` and
-  `protocol_serialize_is_unchanged...` (`domain/enums.rs:194,224`). Deserialize accepts
+  `crates/core-scoring/src/domain/enums.rs#signal_type_serialize_is_unchanged_bare_rust_identifier` and
+  `crates/core-scoring/src/domain/enums.rs#protocol_serialize_is_unchanged_bare_rust_identifier`. Deserialize accepts
   the wire strings so intake can parse sensor records.
 - `observed_at` serializes as RFC 3339 via chrono's default serde and **must** match
   `hashing.rs` - do not switch to `ts_microseconds` or the chain breaks
-  (`sensor-wire/src/lib.rs:48-51`).
+  (`crates/sensor-wire/src/lib.rs#SensorEvent`).
 
 Any change touching these is a chain-compatibility break, not an additive migration.
 Full mechanism in [`architecture/storage`](../architecture/storage.md); frozen field
@@ -89,8 +89,8 @@ order and guarantees in [`reference/events-and-signals`](../reference/events-and
 ## sqlx
 
 `sqlx` `0.9.0` with the `postgres, runtime-tokio, macros, rust_decimal, chrono, uuid,
-json` feature set (`crates/core-scoring/Cargo.toml:15`; console omits `uuid`,
-`crates/console/Cargo.toml:29`). Migrations are plain SQL files applied via the
+json` feature set (`crates/core-scoring/Cargo.toml#sqlx`; console omits `uuid`,
+`crates/console/Cargo.toml#sqlx`). Migrations are plain SQL files applied via the
 `sqlx::migrate!` macro and the review `migrator()`. The test database provisioning is
 in [toolchain-and-environment](toolchain-and-environment.md#test-postgresql).
 
@@ -98,7 +98,7 @@ in [toolchain-and-environment](toolchain-and-environment.md#test-postgresql).
 ## Vendoring and rebuild-after-vendor
 
 All dependencies are vendored in-tree under `vendor/`; `.cargo/config.toml` redirects
-crates-io to it. Workflow (`docs/manuals/contributor.md:111-113`): run `cargo vendor` after adding
+crates-io to it. Workflow ([Schema and dependency changes](../manuals/contributor.md#6-schema-and-dependency-changes)): run `cargo vendor` after adding
 or updating a dependency, then commit the vendor changes. `Cargo.lock` is committed and
 frozen in CI via `--locked`.
 

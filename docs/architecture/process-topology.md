@@ -34,7 +34,7 @@ to start (`exit`) on a malformed value. Each sensor binds its TCP/UDP addresses 
 writes NDJSON event logs that intake later tails.
 
 Source: `deploy/sensor-ssh.service` (ExecStart/Restart/MemoryMax);
-`sensor-catchall/src/main.rs:6-12`, `sensor-ssh/src/main.rs:7-10`.
+`crates/sensor-catchall/src/main.rs`, `crates/sensor-ssh/src/main.rs`.
 
 ## Data plane - the unified `propolis` daemon
 
@@ -64,33 +64,34 @@ Source: `deploy/propolis.service` header and directives; `deploy/install.sh` uni
 ### Subsystems inside the daemon
 
 After startup, the daemon spawns each subsystem via `spawn_supervised` under a single
-`CancellationToken` tree (`crates/propolis/src/main.rs` `main`):
+`CancellationToken` tree (`crates/propolis/src/main.rs#main`):
 
 1. **Intake tailers** - one supervised task per configured sensor log; each runs a poll
    loop (read batch -> append to ledger -> persist cursor -> sleep on idle,
-   `poll_interval` default 1000 ms). (`main.rs:714-755, 135-230`)
+   `poll_interval` default 1000 ms). (`crates/propolis/src/main.rs#run_intake_sensor`)
 2. **Review** - if `review_enabled`: builds the vendor adapters (AbuseIPDB/DShield/OTX)
    and runs a queue-scan loop (default 60 s) plus a submission loop (default 30 s).
-   (`main.rs:796-837, 234-287`)
+   (`crates/propolis/src/main.rs#build_adapters`, `crates/propolis/src/main.rs#run_queue_scan_loop`,
+   `crates/propolis/src/main.rs#run_submission_loop`)
 3. **Feed** - if `feed_enabled`: builds a snapshot and atomically publishes it (default
-   900 s), touching the ops-monitor freshness marker. (`main.rs:841-913, 319-399`)
+   900 s), touching the ops-monitor freshness marker. (`crates/propolis/src/main.rs#run_feed_loop`)
 4. **VirusTotal scanner** - if `vt_enabled`: scans the spool directories under
-   `/var/spool/propolis`, sharing one daily budget across cycles. (`main.rs:916-956`)
+   `/var/spool/propolis`, sharing one daily budget across cycles. (`crates/propolis/src/main.rs#main`,
+   `crates/review/src/virustotal.rs#DailyBudget`, `crates/review/src/virustotal.rs#scan_spool`)
    **Sample retention** - always spawned (`sample-retention`): hourly, deletes spooled
    bodies older than 30 days from every body directory, independent of VirusTotal
-   (`main.rs` `SAMPLE_RETENTION_DAYS`).
+   (`crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`).
 5. **Malware fetcher** - if `fetch_enabled`: an SSRF-guarded staging-server fetcher that
    is **fail-closed on an empty `own_ips`**, enforces its per-host and daily caps in the
    database when a cycle claims rows, so they hold across restarts and across nodes
-   sharing the database, and writes to `/var/spool/propolis/fetched`. (`main.rs:37-46,
-   63-116, 983-1113`; the claim is `store::claim_candidates` in
+   sharing the database, and writes to `/var/spool/propolis/fetched`. (`crates/propolis/src/main.rs#local_interface_ips`,
+   `crates/propolis/src/main.rs#main`, `crates/propolis/src/main.rs#fetch_spool_dir`; the claim is `store::claim_candidates` in
    `crates/review/src/fetcher/store.rs`, called from `run_cycle_with`)
 6. **Console web server** - always spawned: axum on `config.console_bind` (default
-   `127.0.0.1:8080`), graceful shutdown wired to the cancel token. (`main.rs:406-524,
-   1115-1180`)
+   `127.0.0.1:8080`), graceful shutdown wired to the cancel token. (`crates/propolis/src/main.rs#run_console`)
 7. **Ops self-alert monitor** - if `ops_alert.enabled`: reads the shared supervisor and
    intake liveness handles, watches disk/DB/feed/vendor health, and pages ntfy on
-   degradation. (`main.rs:1189-1277`)
+   degradation. (`crates/propolis/src/main.rs#main`, `crates/propolis/src/ops_alert/monitor.rs#Monitor::run`)
 
 Subsystems 2-5 and 7 are opt-in and default off; the console and sample retention are
 the only subsystems always spawned. The exact enabling env vars and their defaults are owned by
@@ -105,7 +106,7 @@ proxy) and out of the daemon. See
 
 ### Startup sequence
 
-`main` runs fail-fast, in order (`main.rs:624-690`):
+`main` runs fail-fast, in order (`crates/propolis/src/main.rs#main`):
 
 1. Initialize tracing (`RUST_LOG`, else `info`) plus an in-memory `LogBuffer`
    (capacity 1000) feeding the console's live `/logs` viewer.
@@ -127,7 +128,10 @@ of 60 s it stops restarting that subsystem and alerts; the panic counter resets 
 without panicking) is treated as intentional shutdown - no restart. Each subsystem's
 state is published into a shared map the ops-monitor reads.
 
-Source: `crates/propolis/src/supervisor.rs:16-156`.
+Source: `crates/propolis/src/supervisor.rs#spawn_supervised`, with its limits in
+`crates/propolis/src/supervisor.rs#INITIAL_BACKOFF`, `crates/propolis/src/supervisor.rs#MAX_BACKOFF`,
+`crates/propolis/src/supervisor.rs#MAX_CONSECUTIVE_PANICS`, `crates/propolis/src/supervisor.rs#PANIC_WINDOW` and
+`crates/propolis/src/supervisor.rs#HEALTHY_RESET`.
 
 ### Shared state
 
@@ -135,13 +139,13 @@ One `PgPool` is cloned into every subsystem. A single `CancellationToken` tree i
 `.child_token()` per subsystem. `events_ingested` and `events_rejected` `AtomicU64`
 counters are shared intake -> console; the `SupervisorHandle` map and `IntakeProgress`
 handle are shared into the ops-monitor; the `LogBuffer` is shared tracing -> console.
-(`main.rs:630, 694-706`)
+(`crates/propolis/src/main.rs#main`)
 
 ### Shutdown
 
-When `shutdown_signal()` (`main.rs:573-600`) resolves on SIGINT/SIGTERM, `main` calls
+When `shutdown_signal()` (`crates/propolis/src/main.rs#shutdown_signal`) resolves on SIGINT/SIGTERM, `main` calls
 `cancel.cancel()`, awaits all handles with a `SHUTDOWN_TIMEOUT` of 30 s, then closes the
-pool. (`main.rs:118, 1288-1313`)
+pool. (`crates/propolis/src/main.rs#main`, `crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`)
 
 ## Feed publishing
 

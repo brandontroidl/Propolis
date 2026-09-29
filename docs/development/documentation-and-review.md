@@ -16,7 +16,7 @@ with the code.
 
 Every change passes the CI gate - fmt, clippy (`-D warnings`), and the full test suite
 against a real PostgreSQL - on every push and pull request; nothing merges un-gated
-(`.github/workflows/ci.yml`, `docs/governance/contribution.md:33-34`). See
+(`.github/workflows/ci.yml`, `docs/governance/contribution.md#PR flow`). See
 [build-and-test](build-and-test.md) for the exact commands and why the three jobs are
 independent.
 
@@ -26,7 +26,7 @@ Review expectations that follow from the tree's conventions:
   TCP; DB changes test with `sqlx::test`. New invariants get a test that would fail
   without the change.
 - **Conventional, lowercase commits** with a why-focused body; small, bisectable
-  increments (`docs/governance/contribution.md:29-30`). See [coding-conventions](coding-conventions.md).
+  increments (`docs/governance/contribution.md#PR flow`). See [coding-conventions](coding-conventions.md).
 - **Comment the why, not the what.** See [coding-conventions](coding-conventions.md#comments).
 - **Additive migrations only**; never edit an applied migration in place. See
   [schema-and-migrations](schema-and-migrations.md).
@@ -58,7 +58,8 @@ build when:
   test attributes;
 - the [migration change map](../reference/database.md#migration-change-map) does not
   list exactly the migration files on disk;
-- a `path:line` citation names a missing file or lines past its end;
+- a page cites code by line number, or a `path#symbol` citation names a missing file
+  or a symbol the file no longer contains;
 - a documented `tar` command names one tree twice, or a live page or source file
   contains an em dash.
 
@@ -87,7 +88,7 @@ current/historical/superseded/draft/planned status and the metadata standard is
 in [`claim-to-source-ledger`](../claim-to-source-ledger.md).
 
 Design docs and architecture decision records referenced from the archived
-`docs/archive/2026-08-26/root/CONTRIBUTING.md:33-34`
+`docs/archive/2026-08-26/root/CONTRIBUTING.md#Architecture`
 (`internal/design/`, `internal/architecture/adr/`) are gitignored private material and
 are not part of the published corpus; the code-evidenced decisions surface in
 [`architecture/decisions`](../architecture/decisions.md).

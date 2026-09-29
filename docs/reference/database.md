@@ -26,7 +26,7 @@ The change maps at the end of this page list every migration in each set.
 
 review depends on `review_state_enum`, which is created by core-scoring migration
 `0001` (a deliberate cross-crate schema dependency; the enum is defined in `0001` so
-the shared schema is complete, `0001_enums.sql:26`).
+the shared schema is complete, `crates/core-scoring/migrations/0001_enums.sql#review_state_enum`).
 
 ## Enum types
 
@@ -35,35 +35,35 @@ Rust `sqlx::Type` enum in `crates/core-scoring/src/domain/enums.rs`.
 
 | Postgres type | Variants (wire/DB values) | Rust enum |
 |---|---|---|
-| `protocol_enum` | `tcp`, `udp`, `icmp` | `Protocol` (`enums.rs:16`) |
-| `category_enum` | `honeypot`, `ids`, `network`, `waf`, `auth` | `Category` (`enums.rs:36`; derives `PartialOrd, Ord`) |
-| `feed_tier_enum` | `aggressive`, `standard` | `FeedTier` (`enums.rs:48`) |
-| `signal_type_enum` | 17 variants (see below) | `SignalType` (`enums.rs:65`) |
-| `review_state_enum` | `pending`, `approved`, `rejected`, `snoozed` | `ReviewState` (`enums.rs:127`) |
+| `protocol_enum` | `tcp`, `udp`, `icmp` | `Protocol` (`crates/core-scoring/src/domain/enums.rs#Protocol`) |
+| `category_enum` | `honeypot`, `ids`, `network`, `waf`, `auth` | `Category` (`crates/core-scoring/src/domain/enums.rs#Category`; derives `PartialOrd, Ord`) |
+| `feed_tier_enum` | `aggressive`, `standard` | `FeedTier` (`crates/core-scoring/src/domain/enums.rs#FeedTier`) |
+| `signal_type_enum` | 17 variants (see below) | `SignalType` (`crates/core-scoring/src/domain/enums.rs#SignalType`) |
+| `review_state_enum` | `pending`, `approved`, `rejected`, `snoozed` | `ReviewState` (`crates/core-scoring/src/domain/enums.rs#ReviewState`) |
 
-`signal_type_enum` variants (`0001_enums.sql:7-24`, `0012_session_end_signal.sql`):
+`signal_type_enum` variants (`crates/core-scoring/migrations/0001_enums.sql#signal_type_enum`, `crates/core-scoring/migrations/0012_session_end_signal.sql#honeypot_session_end`):
 `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec`,
 `honeypot_malware_upload`, `honeypot_file_download`, `suricata_sev1`,
 `suricata_sev2`, `suricata_sev3`, `port_scan`, `syn_flood`, `blocked_connection`,
 `waf_sqli_xss`, `waf_generic_block`, `ssh_brute_force`, `catchall_probe`,
 `remote_auth_failure`, `honeypot_session_end` (telemetry only, never scored - see
 `SignalType::TELEMETRY`). The Rust side pins the count with
-`SignalType::ALL: [SignalType; 17]` (`enums.rs:87`), guarded by test
-`signal_type_all_has_17_distinct_variants` (`enums.rs:142`). Per-signal meaning and
+`SignalType::ALL: [SignalType; 17]` (`crates/core-scoring/src/domain/enums.rs#ALL`), guarded by test
+`crates/core-scoring/src/domain/enums.rs#signal_type_all_has_17_distinct_variants`. Per-signal meaning and
 weight: [events-and-signals.md](events-and-signals.md).
 
 ### Serde casing asymmetry (hash-chain critical)
 
 `SignalType` and `Protocol` carry `#[serde(rename_all(deserialize =
-...))]` - a **Deserialize-only** rename (`enums.rs:5-15, 57-64`); `Category` carries
+...))]` - a **Deserialize-only** rename (`crates/core-scoring/src/domain/enums.rs#Protocol`, `crates/core-scoring/src/domain/enums.rs#SignalType`); `Category` carries
 no such override. Serialize
 deliberately stays at the bare Rust identifier (`"CatchallProbe"`, `"Tcp"`), NOT the
 snake_case/lowercase wire form. The reason is the frozen hash chain: `canonical_bytes`
 hashes `serde_json::to_vec(&enum)` verbatim, so flipping Serialize casing would change
 every chain hash. Deserialize accepts the snake_case/lowercase wire strings so intake
 can parse sensor-wire records. Locked by tests
-`signal_type_serialize_is_unchanged_bare_rust_identifier` (`enums.rs:194`) and
-`protocol_serialize_is_unchanged_bare_rust_identifier` (`enums.rs:224`).
+`crates/core-scoring/src/domain/enums.rs#signal_type_serialize_is_unchanged_bare_rust_identifier` and
+`crates/core-scoring/src/domain/enums.rs#protocol_serialize_is_unchanged_bare_rust_identifier`.
 
 ## Table: `event` (append-only ledger)
 
@@ -71,39 +71,41 @@ Base `0002_event.sql`; hardened by `0004`; `session_id` added by `0007`.
 
 | column | type | constraint / default | source |
 |---|---|---|---|
-| `id` | BIGSERIAL | PRIMARY KEY | `0002:2` |
-| `source_ip` | INET | NOT NULL | `0002:3` |
-| `wan_ip` | INET | nullable (NULL = corroborating sensor with no bindable WAN IP) | `0002:4` |
-| `sensor` | TEXT | NOT NULL; CHECK `sensor <> ''` | `0002:5`, `0004:14` |
-| `signal_type` | signal_type_enum | NOT NULL | `0002:6` |
-| `protocol` | protocol_enum | NOT NULL | `0002:7` |
-| `authenticated` | BOOLEAN | NOT NULL | `0002:8` |
-| `category` | category_enum | NOT NULL | `0002:9` |
-| `weight` | INTEGER | NOT NULL; CHECK `>= 0` | `0002:10`, `0004:17` |
-| `confidence` | NUMERIC(4,3) | NOT NULL; CHECK `BETWEEN 0 AND 1` | `0002:11`, `0004:16` |
-| `observed_at` | TIMESTAMPTZ | NOT NULL | `0002:12` |
-| `ingested_at` | TIMESTAMPTZ | NOT NULL DEFAULT `now()` | `0002:13` |
-| `metadata` | JSONB | NOT NULL DEFAULT `'{}'` (sanitized at capture) | `0002:14` |
-| `prev_hash` | BYTEA | nullable (NULL only for the first event) | `0002:15` |
-| `hash` | BYTEA | NOT NULL; CHECK `octet_length(hash) = 32` (SHA-256) | `0002:16`, `0004:15` |
-| `session_id` | UUID | nullable; correlates one sensor session | `0007:6` |
+| `id` | BIGSERIAL | PRIMARY KEY | `crates/core-scoring/migrations/0002_event.sql#id` |
+| `source_ip` | INET | NOT NULL | `crates/core-scoring/migrations/0002_event.sql#source_ip` |
+| `wan_ip` | INET | nullable (NULL = corroborating sensor with no bindable WAN IP) | `crates/core-scoring/migrations/0002_event.sql#wan_ip` |
+| `sensor` | TEXT | NOT NULL; CHECK `sensor <> ''` | `crates/core-scoring/migrations/0002_event.sql#sensor`, `crates/core-scoring/migrations/0004_harden_event_table.sql#event_sensor_nonempty` |
+| `signal_type` | signal_type_enum | NOT NULL | `crates/core-scoring/migrations/0002_event.sql#signal_type` |
+| `protocol` | protocol_enum | NOT NULL | `crates/core-scoring/migrations/0002_event.sql#protocol` |
+| `authenticated` | BOOLEAN | NOT NULL | `crates/core-scoring/migrations/0002_event.sql#authenticated` |
+| `category` | category_enum | NOT NULL | `crates/core-scoring/migrations/0002_event.sql#category` |
+| `weight` | INTEGER | NOT NULL; CHECK `>= 0` | `crates/core-scoring/migrations/0002_event.sql#weight`, `crates/core-scoring/migrations/0004_harden_event_table.sql#event_weight_nonnegative` |
+| `confidence` | NUMERIC(4,3) | NOT NULL; CHECK `BETWEEN 0 AND 1` | `crates/core-scoring/migrations/0002_event.sql#confidence`, `crates/core-scoring/migrations/0004_harden_event_table.sql#event_confidence_range` |
+| `observed_at` | TIMESTAMPTZ | NOT NULL | `crates/core-scoring/migrations/0002_event.sql#observed_at` |
+| `ingested_at` | TIMESTAMPTZ | NOT NULL DEFAULT `now()` | `crates/core-scoring/migrations/0002_event.sql#ingested_at` |
+| `metadata` | JSONB | NOT NULL DEFAULT `'{}'` (sanitized at capture) | `crates/core-scoring/migrations/0002_event.sql#metadata` |
+| `prev_hash` | BYTEA | nullable (NULL only for the first event) | `crates/core-scoring/migrations/0002_event.sql#prev_hash` |
+| `hash` | BYTEA | NOT NULL; CHECK `octet_length(hash) = 32` (SHA-256) | `crates/core-scoring/migrations/0002_event.sql#hash`, `crates/core-scoring/migrations/0004_harden_event_table.sql#event_hash_length` |
+| `session_id` | UUID | nullable; correlates one sensor session | `crates/core-scoring/migrations/0007_session_id.sql#session_id` |
 
-Indexes: `event_source_ip_idx (source_ip)` (`0002:19`), `event_observed_at_idx
-(observed_at)` (`0002:20`), `event_session_idx (source_ip, session_id)` (`0007:7`).
+Indexes: `event_source_ip_idx (source_ip)` (`crates/core-scoring/migrations/0002_event.sql#event_source_ip_idx`), `event_observed_at_idx
+(observed_at)` (`crates/core-scoring/migrations/0002_event.sql#event_observed_at_idx`), `event_session_idx (source_ip, session_id)` (`crates/core-scoring/migrations/0007_session_id.sql#event_session_idx`).
 
-The `metadata` column is documented "sanitized at capture" (`0002_event.sql:14`); the
+The `metadata` column is documented "sanitized at capture" (`crates/core-scoring/migrations/0002_event.sql#metadata`); the
 sanitizer path itself lives outside the schema. The DB does **not** enforce the
 `signal_type` -> `category` coupling; a mismatched `category` on a direct SQL INSERT
 passes all CHECK constraints. That coupling is enforced application-side only, in
-`EventInput::validate` (`types.rs:70-74`).
+`EventInput::validate` (`crates/core-scoring/src/domain/types.rs#validate`).
 
 ### Immutability hardening (`0004_harden_event_table.sql`)
 
 Cleanup first DELETEs rogue rows (hash not 32 bytes, empty sensor, confidence outside
-[0,1], negative weight), then adds the four CHECK constraints above (`0004:11-17`).
+[0,1], negative weight), then adds the four CHECK constraints above
+(`crates/core-scoring/migrations/0004_harden_event_table.sql#DELETE FROM event WHERE`,
+`crates/core-scoring/migrations/0004_harden_event_table.sql#ALTER TABLE event`).
 In the production database only - `current_database() = 'propolis'` AND the `propolis`
 role exists - it runs `REVOKE UPDATE, DELETE, TRUNCATE ON event FROM propolis`
-(`0004:22-27`). The `propolis` role keeps INSERT (intake needs it) but cannot mutate,
+(`crates/core-scoring/migrations/0004_harden_event_table.sql#REVOKE UPDATE, DELETE, TRUNCATE ON event FROM propolis`). The `propolis` role keeps INSERT (intake needs it) but cannot mutate,
 delete, or truncate the ledger. Test databases (name `test`, or missing role) skip the
 REVOKE so the cleanup DELETEs above can still run.
 
@@ -116,42 +118,42 @@ Pre-existing rows keep NULL and degrade gracefully (no grouping).
 
 ## Hash chain (`crates/core-scoring/src/hashing.rs`)
 
-The canonical byte encoding is **FROZEN** (`hashing.rs:1-47`). Every previously
+The canonical byte encoding is **FROZEN** (`crates/core-scoring/src/hashing.rs`). Every previously
 computed hash was computed against this exact layout; any change to field order,
 framing, or a field's encoding would silently change all future hashes and break
 verification of every persisted event. A shape change that must affect hashing is to
 be introduced as a new, explicitly versioned encoding function, not an edit to this
 one.
 
-`canonical_bytes(&EventInput)` (`hashing.rs:72-123`) writes fields in fixed order.
+`canonical_bytes(&EventInput)` (`crates/core-scoring/src/hashing.rs#canonical_bytes`) writes fields in fixed order.
 Every variable-length field is length-prefixed with a **`u64` little-endian** length
-(`push_len_prefixed`, `hashing.rs:62-65`) so no field can blur into the next and a
+(`crates/core-scoring/src/hashing.rs#push_len_prefixed`) so no field can blur into the next and a
 field at or beyond 4 GiB cannot wrap and collide.
 
 | # | field | encoding |
 |---|---|---|
-| 1 | `source_ip` | `to_string()` bytes, len-prefixed (`:76`) |
-| 2 | `wan_ip` | presence byte (`0`=None, `1`=Some), then if Some `to_string()` len-prefixed (`:79-85`) |
-| 3 | `sensor` | UTF-8 bytes, len-prefixed (`:88`) |
-| 4 | `signal_type` | `serde_json::to_vec` (quoted bare identifier, e.g. `"HoneypotCommandExec"`), len-prefixed (`:91-93`) |
-| 5 | `protocol` | `serde_json::to_vec`, len-prefixed (`:96-98`) |
-| 6 | `authenticated` | single byte `0`/`1`, no prefix (`:101`) |
-| 7 | `category` | `serde_json::to_vec`, len-prefixed (`:104-106`) |
-| 8 | `weight` | `u32` little-endian, 4 bytes, no prefix (`:109`) |
-| 9 | `confidence` | `Decimal::to_string()` bytes, len-prefixed (`:112`) |
-| 10 | `observed_at` | RFC 3339 string bytes, len-prefixed (`:115`) |
-| 11 | `metadata` | `serde_json::to_vec(&metadata)` bytes, len-prefixed (`:118-120`) |
+| 1 | `source_ip` | `to_string()` bytes, len-prefixed (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
+| 2 | `wan_ip` | presence byte (`0`=None, `1`=Some), then if Some `to_string()` len-prefixed (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
+| 3 | `sensor` | UTF-8 bytes, len-prefixed (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
+| 4 | `signal_type` | `serde_json::to_vec` (quoted bare identifier, e.g. `"HoneypotCommandExec"`), len-prefixed (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
+| 5 | `protocol` | `serde_json::to_vec`, len-prefixed (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
+| 6 | `authenticated` | single byte `0`/`1`, no prefix (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
+| 7 | `category` | `serde_json::to_vec`, len-prefixed (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
+| 8 | `weight` | `u32` little-endian, 4 bytes, no prefix (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
+| 9 | `confidence` | `Decimal::to_string()` bytes, len-prefixed (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
+| 10 | `observed_at` | RFC 3339 string bytes, len-prefixed (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
+| 11 | `metadata` | `serde_json::to_vec(&metadata)` bytes, len-prefixed (`crates/core-scoring/src/hashing.rs#canonical_bytes`) |
 
 `serde_json` is built without the `preserve_order` feature, so JSON object keys
-serialize sorted (deterministic) rather than insertion-ordered (`hashing.rs:40-43`).
+serialize sorted (deterministic) rather than insertion-ordered (`crates/core-scoring/src/hashing.rs`).
 
 **Not hashed** (absent from `canonical_bytes`): `id`, `ingested_at`, `session_id`,
 `prev_hash`, and `hash` itself.
 
 `chain_hash(prev, event)` = `SHA256( prev.unwrap_or(&[]) || canonical_bytes(event) )`
-(`hashing.rs:131-136`). The first event uses `prev = None` (empty prefix). Each hash
+(`crates/core-scoring/src/hashing.rs#chain_hash`). The first event uses `prev = None` (empty prefix). Each hash
 binds the event's own content and the prior event's hash. A golden vector,
-`golden_chain_hash_is_stable` (`hashing.rs`), pins the encoding to a fixed 32-byte
+`golden_chain_hash_is_stable` (`crates/core-scoring/src/hashing.rs#golden_chain_hash_is_stable`), pins the encoding to a fixed 32-byte
 result for a known event.
 
 **What it guarantees:** tamper-evidence of the append-only ledger. Any change to a
@@ -163,9 +165,11 @@ deletion by a database superuser - append-only enforcement comes separately from
 
 ### Chain-linkage trigger (`0005_chain_enforcement_trigger.sql`)
 
-`enforce_chain_linkage()` runs BEFORE INSERT FOR EACH ROW on `event` (`0005:33-36`).
-It reads the current chain head (the `hash` of the row with max `id`, `0005:17`) and
-enforces (`0005:19-27`):
+`enforce_chain_linkage()` runs BEFORE INSERT FOR EACH ROW on `event`
+(`crates/core-scoring/migrations/0005_chain_enforcement_trigger.sql#trg_enforce_chain_linkage`).
+It reads the current chain head (the `hash` of the row with max `id`,
+`crates/core-scoring/migrations/0005_chain_enforcement_trigger.sql#SELECT hash INTO head_hash`) and
+enforces (`crates/core-scoring/migrations/0005_chain_enforcement_trigger.sql#enforce_chain_linkage`):
 
 - empty table: `NEW.prev_hash` must be NULL, else `RAISE EXCEPTION 'first event must
   have NULL prev_hash'`;
@@ -173,64 +177,65 @@ enforces (`0005:19-27`):
   'prev_hash does not match chain head'`.
 
 The hash itself is still computed application-side in Rust; the trigger enforces only
-**linkage**, not hash correctness (`0005:6-10`). It is fail-closed: a fabricated or
+**linkage**, not hash correctness (`crates/core-scoring/migrations/0005_chain_enforcement_trigger.sql`). It is fail-closed: a fabricated or
 missing `prev_hash` is rejected before the row lands.
 
 ## Table: `ip_score` (per-IP aggregate)
 
 Base `0003_ip_score.sql`; extended by `0008`, `0010`, `0011`. PK `source_ip`. Rust
-read model `IpScore` (`types.rs:89-119`). The formulas that produce these values are
+read model `IpScore` (`crates/core-scoring/src/domain/types.rs#IpScore`). The formulas that produce these values are
 owned by [scoring-and-feed.md](scoring-and-feed.md); this table is the persisted
 result.
 
 | column | type | default | source |
 |---|---|---|---|
-| `source_ip` | INET | PRIMARY KEY | `0003:2` |
-| `raw_score` | NUMERIC | NOT NULL | `0003:3` |
-| `decay_anchor` | TIMESTAMPTZ | NOT NULL | `0003:4` |
-| `max_confidence` | NUMERIC | NOT NULL | `0003:5` |
-| `event_count` | INTEGER | NOT NULL | `0003:6` |
-| `distinct_categories` | INTEGER | NOT NULL | `0003:7` |
-| `category_breakdown` | JSONB | NOT NULL DEFAULT `'{}'` | `0003:8` |
-| `has_confirmed_real` | BOOLEAN | NOT NULL DEFAULT false | `0003:9` |
-| `distinct_wan_count` | INTEGER | NOT NULL DEFAULT 0 | `0003:10` |
-| `distinct_sensor_count` | INTEGER | NOT NULL DEFAULT 0 | `0003:11` |
-| `first_seen` | TIMESTAMPTZ | NOT NULL | `0003:12` |
-| `last_seen` | TIMESTAMPTZ | NOT NULL | `0003:13` |
-| `eligible` | BOOLEAN | NOT NULL DEFAULT false | `0003:14` |
-| `recommended_for_vendor` | BOOLEAN | NOT NULL DEFAULT false | `0003:15` |
-| `recommended_for_blocklist` | BOOLEAN | NOT NULL DEFAULT false | `0003:16` |
-| `tier` | feed_tier_enum | nullable | `0003:17` |
-| `delisted` | BOOLEAN | NOT NULL DEFAULT false | `0008:1` |
-| `active_days` | INTEGER | NOT NULL DEFAULT 1 | `0010:7` |
-| `last_active_day` | DATE | nullable | `0010:8` |
-| `established_event_count` | INTEGER | NOT NULL DEFAULT 0 | `0011:12` |
+| `source_ip` | INET | PRIMARY KEY | `crates/core-scoring/migrations/0003_ip_score.sql#source_ip` |
+| `raw_score` | NUMERIC | NOT NULL | `crates/core-scoring/migrations/0003_ip_score.sql#raw_score` |
+| `decay_anchor` | TIMESTAMPTZ | NOT NULL | `crates/core-scoring/migrations/0003_ip_score.sql#decay_anchor` |
+| `max_confidence` | NUMERIC | NOT NULL | `crates/core-scoring/migrations/0003_ip_score.sql#max_confidence` |
+| `event_count` | INTEGER | NOT NULL | `crates/core-scoring/migrations/0003_ip_score.sql#event_count` |
+| `distinct_categories` | INTEGER | NOT NULL | `crates/core-scoring/migrations/0003_ip_score.sql#distinct_categories` |
+| `category_breakdown` | JSONB | NOT NULL DEFAULT `'{}'` | `crates/core-scoring/migrations/0003_ip_score.sql#category_breakdown` |
+| `has_confirmed_real` | BOOLEAN | NOT NULL DEFAULT false | `crates/core-scoring/migrations/0003_ip_score.sql#has_confirmed_real` |
+| `distinct_wan_count` | INTEGER | NOT NULL DEFAULT 0 | `crates/core-scoring/migrations/0003_ip_score.sql#distinct_wan_count` |
+| `distinct_sensor_count` | INTEGER | NOT NULL DEFAULT 0 | `crates/core-scoring/migrations/0003_ip_score.sql#distinct_sensor_count` |
+| `first_seen` | TIMESTAMPTZ | NOT NULL | `crates/core-scoring/migrations/0003_ip_score.sql#first_seen` |
+| `last_seen` | TIMESTAMPTZ | NOT NULL | `crates/core-scoring/migrations/0003_ip_score.sql#last_seen` |
+| `eligible` | BOOLEAN | NOT NULL DEFAULT false | `crates/core-scoring/migrations/0003_ip_score.sql#eligible` |
+| `recommended_for_vendor` | BOOLEAN | NOT NULL DEFAULT false | `crates/core-scoring/migrations/0003_ip_score.sql#recommended_for_vendor` |
+| `recommended_for_blocklist` | BOOLEAN | NOT NULL DEFAULT false | `crates/core-scoring/migrations/0003_ip_score.sql#recommended_for_blocklist` |
+| `tier` | feed_tier_enum | nullable | `crates/core-scoring/migrations/0003_ip_score.sql#tier` |
+| `delisted` | BOOLEAN | NOT NULL DEFAULT false | `crates/core-scoring/migrations/0008_delisted.sql#delisted` |
+| `active_days` | INTEGER | NOT NULL DEFAULT 1 | `crates/core-scoring/migrations/0010_active_days.sql#active_days` |
+| `last_active_day` | DATE | nullable | `crates/core-scoring/migrations/0010_active_days.sql#last_active_day` |
+| `established_event_count` | INTEGER | NOT NULL DEFAULT 0 | `crates/core-scoring/migrations/0011_established_event_count.sql#established_event_count` |
 
 No indexes are defined beyond the `source_ip` PRIMARY KEY.
 
 `has_confirmed_real` latches true only for an authenticated TCP honeypot event:
 `is_confirmed_real(p, authenticated, c) = p==Tcp && authenticated && c==Honeypot`
-(`enums.rs:134-136`).
+(`crates/core-scoring/src/domain/enums.rs#is_confirmed_real`).
 
 `active_days` (`0010`): an unbounded, non-decaying count of distinct UTC calendar days
 the IP was seen. It feeds a persistence bonus at the tier gate so a slow attacker that
 the 6-hour decay would otherwise erase still earns a tier. `last_active_day` records
 the last UTC day counted, telling the next event whether it opens a new day. The
 migration backfills `active_days` from the distinct-UTC-date count in the `event`
-ledger (`0010:17-25`); rows whose events were already pruned keep DEFAULT 1.
+ledger (`crates/core-scoring/migrations/0010_active_days.sql#UPDATE ip_score s SET`); rows whose events were already pruned keep DEFAULT 1.
 
 `established_event_count` (`0011`): counts only non-spoofable completed-TCP-connection
 events. The by-volume recommendation gates on this instead of raw `event_count`, so a
 spoofed UDP/ICMP flood cannot publish an innocent third party. Backfill = `count(*)
-WHERE protocol='tcp'` per `source_ip` (`0011:14-22`); no-TCP rows keep 0.
+WHERE protocol='tcp'` per `source_ip` (`crates/core-scoring/migrations/0011_established_event_count.sql#WHERE protocol = 'tcp'`); no-TCP rows keep 0.
 
 `0006_relax_eligibility.sql` is a **data-only** backfill (no schema change). It relaxed
 the eligibility gate from `(has_confirmed_real AND event_count>=2 AND
 distinct_categories>=2)` to `(has_confirmed_real AND event_count>=2)`, then recomputed
 `eligible`, `recommended_for_vendor = (tier IS NOT NULL)`, and
-`recommended_for_blocklist` for newly qualifying rows (`0006:7-14`). It is the one
+`recommended_for_blocklist` for newly qualifying rows
+(`crates/core-scoring/migrations/0006_relax_eligibility.sql#UPDATE ip_score SET`). It is the one
 migration that embeds a scoring formula in SQL; `0010` explicitly refuses to duplicate
-tier logic in SQL (`0010:14-16`). The authoritative formulas are in
+tier logic in SQL (`crates/core-scoring/migrations/0010_active_days.sql#it does not re-derive the tier/recommendation flags in SQL`). The authoritative formulas are in
 [scoring-and-feed.md](scoring-and-feed.md).
 
 ## Table: `sample_analysis` (`0009_sample_analysis.sql`)
@@ -325,7 +330,7 @@ every node on the database. See
 
 `status` is a free TEXT column, **not** an enum or CHECK. The documented value set -
 `pending`, `success`, `dead`, `rejected`, `too_big`, `timeout`, `empty` - lives only
-in a SQL comment (`0003:11`); the actual values written are set by review-crate code.
+in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|success|dead|rejected|too_big|timeout|empty`); the actual values written are set by review-crate code.
 `transport_auth` is the exception on this table: its value set, and its pairing with
 `tls_verify_error`, are enforced by CHECK constraints (`0007`).
 

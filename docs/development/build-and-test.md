@@ -10,7 +10,7 @@ last-verified: 2026-08-26
 # Build and test
 
 The authoritative gate is CI (`.github/workflows/ci.yml`). Treat CI as the source
-of truth; the chained one-liner in `docs/governance/contribution.md:41` states the
+of truth; the chained one-liner in [the merge gate](../governance/contribution.md#the-merge-gate) states the
 same intent but omits scope flags (see [drift](#contributing-vs-ci) below).
 
 ## Build
@@ -50,15 +50,15 @@ Details that are load-bearing:
 
 - **`--all-targets` on clippy** compiles the test targets, so a test file that no
   longer compiles fails at clippy rather than silently vanishing from the suite
-  (`ci.yml:68-72`).
+  (`.github/workflows/ci.yml#Clippy (deny warnings)`).
 - **`--test-threads=1`** runs the suite serially.
 - **`set -o pipefail`** is mandatory in the tests job: without it, piping `cargo
   test` through `tee` would report `tee`'s success and pass a red suite
-  (`ci.yml:105-110`).
+  (`.github/workflows/ci.yml#Tests (serial, frozen lockfile)`).
 - **`--locked`** enforces the committed `Cargo.lock` frozen (clippy + tests jobs).
 - An advisory `Report test totals` step (`if: always()`) sums passed/failed/ignored
   and counts test binaries into the run summary; it never fails the job
-  (`ci.yml:112-145`). It exists so a sudden drop in how much ran is visible to a
+  (`.github/workflows/ci.yml#Report test totals`). It exists so a sudden drop in how much ran is visible to a
   human.
 
 Running the gate locally mirrors CI:
@@ -75,7 +75,7 @@ The tests job needs the test PostgreSQL running - see
 <a id="contributing-vs-ci"></a>
 ### CONTRIBUTING vs CI
 
-`docs/governance/contribution.md:41` gives the gate as
+[the merge gate](../governance/contribution.md#the-merge-gate) gives the gate as
 `cargo fmt --check && cargo clippy -- -D warnings && cargo test`. That is the
 intent, but it omits `--all`, `--workspace`, `--all-targets`, `--locked`,
 `--test-threads=1`, and its chained `&&` bails on first failure - the exact
@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 1667 test functions** (947 unit + 720 integration).
+- **Total: 1670 test functions** (947 unit + 723 integration).
 - **DB-backed (`sqlx::test`): 202** - console 159, core-scoring 25, intake 7,
   fleet 6, propolis 4, review 1. These provision a fresh database per test.
 - **Ignored: exactly 2.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -121,7 +121,7 @@ Per-crate breakdown:
 | geoip | 4 | 0 | - |
 | intake | 11 | 20 | audit_regressions, converter_test, end_to_end, probe_filter |
 | log-tailer | 0 | 34 | cursor_test, tailer_test |
-| propolis | 100 | 17 | capture_to_console, docs_agreement, restore_rehearsal, smoke_test, ssh_capture_to_console |
+| propolis | 100 | 20 | capture_to_console, docs_agreement, restore_rehearsal, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 4 | provision |
 | review | 116 | 71 | cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
 | sensor-adb | 53 | 20 | integration |
@@ -136,12 +136,12 @@ Per-crate breakdown:
 | sensor-telnet | 39 | 18 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **947** | **720** | |
+| **Total** | **947** | **723** | |
 
 ### Test styles by layer
 
 - **Sensor crates** test with **real TCP** against an ephemeral `:0` listener per
-  connection (e.g. `crates/sensor-catchall/tests/integration.rs:18`), plus static-check tests that enforce the
+  connection (e.g. `crates/sensor-catchall/tests/integration.rs#tcp_probe_emits_catchall_probe_event`), plus static-check tests that enforce the
   sensor contract (see [adding-a-sensor](adding-a-sensor.md#the-tests-a-sensor-must-pass)).
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
@@ -179,11 +179,15 @@ disagree on a fact that has drifted before:
 - a [migration change map](../reference/database.md#migration-change-map) that does
   not list exactly the migration files on disk;
 - any figure in the test taxonomy above;
-- a `path:line` citation whose file does not exist or has fewer lines than it cites.
-  A path is resolved from the workspace root, from `crates/`, or as the tail of a
-  path under `crates/` (`routes/mod.rs`); a tail several files share passes if any
-  of them has the lines. Bare filenames, whose file depends on the page, are
-  skipped, and a citation that moved within its file is not detected.
+- a citation of code by line number, in any form: `path:N`, `file.rs:N`, a `:N`
+  span, or a `name:N` span naming a Rust item. Code is cited as `path#symbol`
+  ([documentation policy](../documentation-policy.md#citing-code));
+- a `path#symbol` citation whose file does not exist or does not contain the
+  symbol. A path is resolved from the workspace root, from `crates/`, or as the
+  tail of a path in the workspace (`routes/mod.rs`); a tail several files share
+  passes if any of them has the symbol, and `crates/*/` requires it in every crate.
+  A Rust symbol must appear as a whole word; any other anchor, such as a systemd
+  directive or a heading, verbatim.
 
 Historical pages, `CHANGELOG.md`, the dated claim ledger and the sanitizer record
 are exempt from the version, count and citation checks: they record what was true

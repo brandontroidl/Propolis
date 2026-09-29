@@ -18,10 +18,10 @@ observable state and marked `[inferred]` where the mechanism is not documented i
 
 | Fact | Value | Source |
 |---|---|---|
-| Crate version | `0.4.0` for eighteen of the 24 crates; `0.1.0` for `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper` | each `crates/*/Cargo.toml:3` |
+| Crate version | `0.4.0` for eighteen of the 24 crates; `0.1.0` for `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper` | each `crates/*/Cargo.toml#version` |
 | Only release tag | `v0.1.0` ("v0.1.0: initial release") | `git tag` |
 | Tags `v0.2.0` / `v0.3.0` / `v0.4.0` | do not exist | `git tag` |
-| `CHANGELOG.md` | a single, undated `## Unreleased` section | `CHANGELOG.md:3` |
+| `CHANGELOG.md` | a single, undated `## Unreleased` section | `CHANGELOG.md#Unreleased` |
 
 So the working tree is **`0.4.0` but untagged**: the crate manifests moved ahead of the
 tags across three unreleased version bumps, and `CHANGELOG.md` accumulates all changes

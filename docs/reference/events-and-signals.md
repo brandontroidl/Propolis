@@ -17,26 +17,26 @@ math is owned by [scoring-and-feed.md](scoring-and-feed.md).
 ## SensorEvent wire format (`crates/sensor-wire/src/lib.rs`)
 
 A frozen NDJSON record - one line per event, no embedded `\n` or `\r` (test
-`ndjson_single_line`, `lib.rs:109`). A single definition is shared by every sensor
+`ndjson_single_line`, `crates/sensor-wire/src/lib.rs#ndjson_single_line`). A single definition is shared by every sensor
 (producer) and by intake (consumer), so the wire shape has one source of truth.
-`WIRE_VERSION = 1` (`lib.rs:12`), `VERSION_MARKER = "sensor-wire"` (`lib.rs:11`).
+`WIRE_VERSION = 1` (`crates/sensor-wire/src/lib.rs#WIRE_VERSION`), `VERSION_MARKER = "sensor-wire"` (`crates/sensor-wire/src/lib.rs#VERSION_MARKER`).
 
-`SensorEvent` struct (`lib.rs:39-61`), 12 fields:
+`SensorEvent` struct (`crates/sensor-wire/src/lib.rs#SensorEvent`), 12 fields:
 
 | field | type | notes |
 |---|---|---|
 | `v` | u32 | wire version (`WIRE_VERSION`, currently 1) |
 | `source_ip` | IpAddr | attacker source |
-| `wan_ip` | Option\<IpAddr\> | serializes as `"wan_ip":null` when None (test `null_wan_ip_serializes`, `lib.rs:133`) |
+| `wan_ip` | Option\<IpAddr\> | serializes as `"wan_ip":null` when None (test `null_wan_ip_serializes`, `crates/sensor-wire/src/lib.rs#null_wan_ip_serializes`) |
 | `sensor` | String | sensor name |
-| `signal_type` | String | plain string, **not** the enum - keeps sensor-wire free of a core-scoring dependency; intake validates it against the known set (`lib.rs:35-38`) |
+| `signal_type` | String | plain string, **not** the enum - keeps sensor-wire free of a core-scoring dependency; intake validates it against the known set (`crates/sensor-wire/src/lib.rs#SensorEvent`) |
 | `protocol` | String | plain string, same rationale |
 | `authenticated` | bool | |
-| `observed_at` | DateTime\<Utc\> | RFC 3339 via chrono's default serde - **must** match `hashing.rs`; switching to `ts_microseconds` (integer timestamp) would break the hash chain (`lib.rs:48-51`) |
+| `observed_at` | DateTime\<Utc\> | RFC 3339 via chrono's default serde - **must** match `hashing.rs`; switching to `ts_microseconds` (integer timestamp) would break the hash chain (`crates/sensor-wire/src/lib.rs#SensorEvent`) |
 | `metadata` | serde_json::Value | free-form per-signal detail |
 | `sample` | Option\<SampleRef\> | side-channel file reference (see below) |
-| `session_id` | Option\<Uuid\> | `#[serde(default, skip_serializing_if = "Option::is_none")]` - omitted from JSON when None; older records without the key still deserialize (test `deserialize_without_session_id`, `lib.rs:150`) |
-| `occurrence_id` | Option\<Uuid\> | `#[serde(default, skip_serializing_if = "Option::is_none")]` - UUIDv7 minted once per event at emit time (`EventEmitter::append`), stable across replays so intake can dedup exactly (`lib.rs:56-60`) |
+| `session_id` | Option\<Uuid\> | `#[serde(default, skip_serializing_if = "Option::is_none")]` - omitted from JSON when None; older records without the key still deserialize (test `deserialize_without_session_id`, `crates/sensor-wire/src/lib.rs#deserialize_without_session_id`) |
+| `occurrence_id` | Option\<Uuid\> | `#[serde(default, skip_serializing_if = "Option::is_none")]` - UUIDv7 minted once per event at emit time (`EventEmitter::append`), stable across replays so intake can dedup exactly (`crates/sensor-wire/src/lib.rs#SensorEvent`) |
 
 A sensor emits raw facts only. `weight`, `confidence`, and `category` are **not** on
 the wire - they are derived downstream by `EventInput::from_signal` from the [signal
@@ -47,15 +47,15 @@ core-scoring or its database layer. The wire values match core-scoring's serde
 Deserialize casing exactly; see the [serde casing note](database.md#serde-casing-asymmetry-hash-chain-critical).
 Sensor-emittable constants are provided so literals are not hand-typed:
 
-- Signal (`lib.rs:17-25`), the subset a sensor can emit: `catchall_probe`,
+- Signal (`crates/sensor-wire/src/lib.rs#SIGNAL_CATCHALL_PROBE`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_CONNECTION`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_LOGIN_ATTEMPT`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_COMMAND_EXEC`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_MALWARE_UPLOAD`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_FILE_DOWNLOAD`), the subset a sensor can emit: `catchall_probe`,
   `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec`,
   `honeypot_malware_upload`, `honeypot_file_download`, plus the telemetry constant
-  `honeypot_session_end` (`lib.rs:23-25`) - recorded in the ledger but never scored;
+  `honeypot_session_end` (`crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_SESSION_END`) - recorded in the ledger but never scored;
   no sensor crate emits it yet. The remaining signal types (Suricata, WAF, port scan,
   and so on) originate from other layers, not sensor-wire.
-- Protocol (`lib.rs:28-30`): `tcp`, `udp`, `icmp`.
+- Protocol (`crates/sensor-wire/src/lib.rs#PROTO_TCP`, `crates/sensor-wire/src/lib.rs#PROTO_UDP`, `crates/sensor-wire/src/lib.rs#PROTO_ICMP`): `tcp`, `udp`, `icmp`.
 
-### SampleRef (`lib.rs:67-77`)
+### SampleRef
 
 A reference to a captured file body written to the quarantine spool, named by its
 SHA-256. The body travels out-of-band (the spool); only this reference rides the wire.
@@ -64,8 +64,8 @@ SHA-256. The body travels out-of-band (the spool); only this reference rides the
 |---|---|---|
 | `sha256` | String | content hash; the spool filename |
 | `size` | u64 | body size in bytes |
-| `orig_name` | String | attacker-controlled; carried as a **sanitized indicator only**, never used as a path component (`lib.rs:64-65`) |
-| `capture_id` | Option\<Uuid\> | `#[serde(default, skip_serializing_if = "Option::is_none")]` - observation join key minted at `QuarantineSpool::store`; `sha256` identifies content, `capture_id` identifies the observation (`lib.rs:71-76`) |
+| `orig_name` | String | attacker-controlled; carried as a **sanitized indicator only**, never used as a path component (`crates/sensor-wire/src/lib.rs#SampleRef`) |
+| `capture_id` | Option\<Uuid\> | `#[serde(default, skip_serializing_if = "Option::is_none")]` - observation join key minted at `QuarantineSpool::store`; `sha256` identifies content, `capture_id` identifies the observation (`crates/sensor-wire/src/lib.rs#SampleRef`) |
 
 The `sha256` here is the key into [`sample_analysis`](database.md#table-sample_analysis-0009_sample_analysissql).
 
@@ -104,9 +104,9 @@ sensor actually emits a given signal is not asserted here.
 ## Signal weight table
 
 `signal_weight(SignalType) -> { weight: u32, confidence: Decimal, category: Category }`
-is the single source of truth (`crates/core-scoring/src/domain/weights.rs:11-41`).
+is the single source of truth (`crates/core-scoring/src/domain/weights.rs#signal_weight`).
 `EventInput::from_signal` derives `weight`/`confidence`/`category` from it
-(`types.rs:26-55`), so these three values are never computed by a sensor. `confidence`
+(`crates/core-scoring/src/domain/types.rs#from_signal`), so these three values are never computed by a sensor. `confidence`
 is stored as `NUMERIC(4,3)` in `event`.
 
 | signal_type | weight | confidence | category | meaning [inferred] |
@@ -153,13 +153,13 @@ of a score. Tests in `crates/core-scoring/tests/telemetry.rs` compare
 attack -> telemetry -> attack against attack -> attack field by field, through both the
 incremental path and a rebuild.
 
-Coverage is guarded by `every_signal_type_has_exactly_one_weight_row` (`weights.rs:48`),
+Coverage is guarded by `every_signal_type_has_exactly_one_weight_row` (`crates/core-scoring/src/domain/weights.rs#every_signal_type_has_exactly_one_weight_row`),
 which has no default match arm, so a new variant that lacks a row fails to compile.
 
 ### Confirmed-real predicate
 
 `is_confirmed_real(p, authenticated, c) = p==Tcp && authenticated && c==Honeypot`
-(`enums.rs:134-136`). Only an authenticated TCP honeypot event latches
+(`crates/core-scoring/src/domain/enums.rs#is_confirmed_real`). Only an authenticated TCP honeypot event latches
 `ip_score.has_confirmed_real`; the weight and confidence above do not by themselves
 set it.
 

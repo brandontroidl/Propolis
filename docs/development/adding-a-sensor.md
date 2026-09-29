@@ -75,26 +75,26 @@ intake. The encoding is frozen and hash-chain-critical - see
 [`reference/events-and-signals`](../reference/events-and-signals.md). A sensor may
 emit only the SP2 signal subset (`catchall_probe`, `honeypot_connection`,
 `honeypot_login_attempt`, `honeypot_command_exec`, `honeypot_malware_upload`,
-`honeypot_file_download`; `crates/sensor-wire/src/lib.rs:17-22`).
+`honeypot_file_download`; `crates/sensor-wire/src/lib.rs#SIGNAL_CATCHALL_PROBE`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_CONNECTION`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_LOGIN_ATTEMPT`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_COMMAND_EXEC`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_MALWARE_UPLOAD`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_FILE_DOWNLOAD`).
 
 ## The tests a sensor must pass
 
 Sensors test with **real TCP** against an ephemeral `:0` listener per connection
-(e.g. `crates/sensor-catchall/tests/integration.rs:18`). Two static-check tests enforce the "never execute, never
+(e.g. `crates/sensor-catchall/tests/integration.rs#tcp_probe_emits_catchall_probe_event`). Two static-check tests enforce the "never execute, never
 fetch" guarantee and should be present in a new sensor's `tests/`:
 
 - **`never_exec_static_check`** - greps the crate's own `src/` for process-spawning
   patterns (`std::process::Command`, `process::Command`, `Command::new`,
   `libc::exec`, `nix::unistd::exec`) and fails if any appear (e.g.
-  `crates/sensor-http/tests/integration.rs:315-336`). Present across the protocol
+  `crates/sensor-http/tests/integration.rs#never_exec_static_check`). Present across the protocol
   sensors (ftp, telnet, redis, adb, http, smtp, cred, ssh).
-- **No HTTP-client dependency** - `crates/sensor-ssh/tests/shell_test.rs:364`
+- **No HTTP-client dependency** - `crates/sensor-ssh/tests/shell_test.rs#sensor_ssh_has_no_http_client_dependency`
   (`sensor_ssh_has_no_http_client_dependency`) asserts the crate manifest declares
   none of `reqwest`, `hyper`, `ureq`, `curl`, `isahc`, `surf`, `attohttpc`. This
   explicit test currently lives in `sensor-ssh` only; the dependency structure
   above gives the same guarantee by construction for every sensor. **Add an
   equivalent test to a new sensor.**
-- **`tokio_dependency_lacks_process_feature`** (`shell_test.rs:344`) - asserts
+- **`tokio_dependency_lacks_process_feature`** (`crates/sensor-ssh/tests/shell_test.rs#tokio_dependency_lacks_process_feature`) - asserts
   `tokio`'s `process` feature stays off, so adding process-spawning capability
   requires a visible `Cargo.toml` diff.
 
@@ -118,7 +118,7 @@ existing units. Observable required directives (`deploy/sensor-ssh.service`):
 > **`SystemCallFilter` is a placeholder, not a shipped hardened filter.** The units
 > ship `SystemCallFilter=@system-service` + `SystemCallFilter=~@privileged @resources`
 > - a broad dev allowlist the unit header explicitly says to replace with a tightened
-> per-sensor allowlist (`deploy/sensor-ssh.service:90-99`). This is residual risk, not
+> per-sensor allowlist (`deploy/sensor-ssh.service#SystemCallFilter=@system-service`). This is residual risk, not
 > a delivered control.
 
 `crates/sensor-framework/tests/deploy_test.rs` asserts these directives are present - but the assertions target the **catchall and ssh units specifically**
@@ -127,7 +127,7 @@ sensor's unit is not automatically covered; extend `deploy_test.rs` to assert yo
 new unit too.
 
 Then register the binary and unit in `deploy/install.sh` (the binary list at
-`install.sh:120` and the unit list at `install.sh:137`). `install.sh` installs
+`deploy/install.sh#installing binaries to /usr/local/bin` and the unit list at `deploy/install.sh#installing systemd units`). `install.sh` installs
 units but does **not** start them; `systemctl enable --now <unit>` is an operator
 action after populating `/etc/propolis/<name>.env`. Deploy details:
 [`operations/service-lifecycle`](../operations/service-lifecycle.md); real bind ports:

@@ -859,55 +859,332 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Citations of the form `path:line` must name a file that exists and lines it has. Hundreds of
-/// line citations drifted as cited files changed; this cannot see a citation that moved within its
-/// file, but it does catch one whose file was renamed, split or shortened past the lines it names.
-///
-/// A path is resolved from the workspace root, then from `crates/`, then as the tail of a path
-/// under `crates/` (pages write `routes/mod.rs` or `vendor/mod.rs` relative to the crate they are
-/// about). A tail that several files share passes if any of them has the lines, since which one the
-/// page means depends on its context. Bare filenames (no `/`) are skipped for the same reason, as
-/// are paths outside the workspace. The sanitizer results page is a dated record whose citations
-/// describe the commit it names.
-#[test]
-fn documented_line_citations_name_real_files_and_lines() {
-    let root = workspace_root();
-    let mut crate_files = Vec::new();
-    files_under(&root.join("crates"), &mut crate_files);
-    let (mut checked, mut wrong) = (0, Vec::new());
-    for doc in current_docs() {
-        if doc.ends_with("docs/security/sanitizer-results.md") {
+/// Extensions of the files the docs cite. A `name.ext:12` token with any other extension (a host
+/// with a port, an address, a version) is not a citation.
+const CITED_EXTENSIONS: &[&str] = &[
+    "rs", "toml", "yml", "yaml", "sh", "sql", "html", "js", "css", "md", "service", "example",
+    "lock", "py", "json", "conf", "txt", "mjs",
+];
+
+/// A floor under the `path#symbol` citations the scan finds (1,108 when set): far fewer means it
+/// has stopped seeing them, not that the docs stopped citing code.
+const MIN_SYMBOL_CITATIONS: usize = 900;
+
+/// Lines of `text` outside fenced code blocks, numbered from 1.
+fn prose_lines(text: &str) -> Vec<(usize, &str)> {
+    let mut in_fence = false;
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            out.push((n + 1, line));
+        }
+    }
+    out
+}
+
+/// Whether `line` opens a Markdown block (a list item, table row, heading or quote) rather than
+/// continuing the paragraph above it.
+fn opens_block(line: &str) -> bool {
+    let line = line.trim_start();
+    let numbered = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    line.is_empty()
+        || line.starts_with(['|', '#', '>'])
+        || ["- ", "* ", "+ "].iter().any(|m| line.starts_with(m))
+        || (numbered.len() < line.len()
+            && (numbered.starts_with(". ") || numbered.starts_with(") ")))
+}
+
+/// Every inline code span outside fenced blocks, with the line it opens on. A span may wrap onto
+/// following lines of its paragraph, as Markdown allows, and each line break in it reads as a
+/// space; an opening backtick with no close before the paragraph ends is literal, not a span.
+fn code_spans(text: &str) -> Vec<(usize, String)> {
+    let (mut spans, mut open, mut in_fence) = (Vec::new(), None::<(usize, String)>, false);
+    for (n, line) in text.lines().enumerate() {
+        if line.trim_start().starts_with("```") {
+            (in_fence, open) = (!in_fence, None);
             continue;
         }
+        if in_fence {
+            continue;
+        }
+        if opens_block(line) {
+            open = None;
+        }
+        let line = if open.is_some() {
+            line.trim_start()
+        } else {
+            line
+        };
+        for (i, piece) in line.split('`').enumerate() {
+            if i > 0 {
+                open = match open.take() {
+                    Some(span) => {
+                        spans.push(span);
+                        None
+                    }
+                    None => Some((n + 1, String::new())),
+                };
+            }
+            if let Some((_, body)) = open.as_mut() {
+                body.push_str(piece);
+            }
+        }
+        if let Some((_, body)) = open.as_mut() {
+            body.push(' ');
+        }
+    }
+    spans
+}
+
+fn is_line_list(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_digit())
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == ',' || c == ' ')
+}
+
+fn is_identifier(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn has_cited_extension(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| CITED_EXTENSIONS.contains(&e))
+}
+
+/// Every item name defined in the workspace's Rust source: what a `name:12` span would cite.
+fn defined_rust_items(root: &Path) -> BTreeSet<String> {
+    let mut files = Vec::new();
+    files_under(&root.join("crates"), &mut files);
+    let mut names = BTreeSet::new();
+    for file in files
+        .iter()
+        .filter(|f| f.extension().is_some_and(|e| e == "rs"))
+    {
+        let text = fs::read_to_string(file).unwrap_or_default();
+        let words: Vec<&str> = text
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '!'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        for pair in words.windows(2) {
+            let keyword = matches!(
+                pair[0],
+                "fn" | "struct"
+                    | "enum"
+                    | "trait"
+                    | "type"
+                    | "const"
+                    | "static"
+                    | "mod"
+                    | "macro_rules!"
+            );
+            if keyword && is_identifier(pair[1]) {
+                names.insert(pair[1].to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Every `path:12`, `name.rs:12` or `name.rs:12:5` citation on `line`.
+fn file_line_citations(line: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for token in line.split(|c: char| c.is_whitespace() || "`()[]{}<>;|\"'".contains(c)) {
+        let token = token.trim_start_matches('*');
+        for (at, _) in token.match_indices(':') {
+            let (file, rest) = (&token[..at], &token[at + 1..]);
+            let lines = rest
+                .find(|c: char| !(c.is_ascii_digit() || c == '-' || c == ','))
+                .map_or(rest, |end| &rest[..end])
+                .trim_end_matches([',', '-']);
+            if is_line_list(lines) && has_cited_extension(file) && !file.contains("://") {
+                found.push(format!("{file}:{lines}"));
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Whether a code span cites by line: a `:12` span whose file the page implies, or a `name:12`
+/// span naming a Rust item. `:0` is a port, and `postgres:18` names no item.
+fn span_cites_a_line(span: &str, rust_items: &BTreeSet<String>) -> bool {
+    let span = span.trim();
+    match span.split_once(':') {
+        Some(("", lines)) => is_line_list(lines) && lines != "0",
+        Some((name, lines)) => rust_items.contains(name) && is_line_list(lines),
+        None => false,
+    }
+}
+
+/// Every citation by line number in `text`, with the line it is on.
+fn line_citations(text: &str, rust_items: &BTreeSet<String>) -> Vec<(usize, String)> {
+    let mut found: Vec<(usize, String)> = prose_lines(text)
+        .into_iter()
+        .flat_map(|(n, line)| file_line_citations(line).into_iter().map(move |c| (n, c)))
+        .collect();
+    found.extend(
+        code_spans(text)
+            .into_iter()
+            .filter(|(_, span)| span_cites_a_line(span, rust_items))
+            .map(|(n, span)| (n, format!("`{span}`"))),
+    );
+    found
+}
+
+/// The scan must see every form of line citation, including a span that wraps onto the next line,
+/// and must pass over the lookalikes the docs really contain: an image tag, a bare port, an address
+/// or host with a port, a URL, a `path#symbol` citation, and a fenced block. A backtick left open at
+/// the end of a paragraph must not pair with one in the next, which here would make `store:15` a
+/// span.
+#[test]
+fn line_citation_scan_flags_each_form_and_nothing_else() {
+    let page = "\
+cites crates/sensor-framework/src/spool.rs:139 and main.rs:130-140, then spool.rs:12:5.
+the span (`:517`), one that wraps (`:16-19,
+  28-40`), `store:139`, and **crates/*/Cargo.toml:4**.
+
+not: `postgres:18`, `:0`, 127.0.0.1:55432, example.com:443, https://host.example/a.rs:12,
+`crates/sensor-framework/src/spool.rs#store`, and a `lone backtick
+
+then :14` and `store:15` here.
+```text
+spool.rs:99 `:98`
+```
+";
+    let rust_items: BTreeSet<String> = ["store".to_string()].into();
+    let expected = [
+        (1, "crates/sensor-framework/src/spool.rs:139"),
+        (1, "main.rs:130-140"),
+        (1, "spool.rs:12"),
+        (3, "crates/*/Cargo.toml:4"),
+        (2, "`:517`"),
+        (2, "`:16-19, 28-40`"),
+        (3, "`store:139`"),
+    ];
+    let expected: Vec<(usize, String)> = expected.map(|(n, c)| (n, c.to_string())).into();
+    assert_eq!(line_citations(page, &rust_items), expected);
+    assert!(
+        code_spans(page).contains(&(6, "crates/sensor-framework/src/spool.rs#store".to_string())),
+        "the path#symbol span must still be seen, for the anchor check"
+    );
+}
+
+/// Current pages that cite code; the sanitizer results page is a dated record of one commit.
+fn citing_docs() -> Vec<PathBuf> {
+    current_docs()
+        .into_iter()
+        .filter(|d| !d.ends_with("docs/security/sanitizer-results.md"))
+        .collect()
+}
+
+/// Hundreds of `path:line` citations drifted as the files they cite changed: an edit anywhere above
+/// a cited line moves it, and nothing noticed until each was re-read by hand. The docs therefore
+/// cite code as `path#symbol`, which a moved line does not break and a renamed or deleted symbol
+/// does (the next test). This fails on any citation by line number that comes back.
+#[test]
+fn current_docs_cite_code_by_symbol_not_by_line() {
+    let rust_items = defined_rust_items(&workspace_root());
+    assert!(
+        rust_items.len() > 1000,
+        "found only {} Rust items",
+        rust_items.len()
+    );
+    let mut wrong = Vec::new();
+    for doc in citing_docs() {
         let text = fs::read_to_string(&doc).unwrap();
-        let tokens = text.split(|c: char| c.is_whitespace() || "`()[];|\"".contains(c));
-        for token in tokens {
-            let token = token.trim_end_matches(['.', ',', ':']);
-            let Some((path, spans)) = token.rsplit_once(':') else {
+        for (n, citation) in line_citations(&text, &rust_items) {
+            wrong.push(format!("{}:{n}: {citation}", doc.display()));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "cite code as `path#symbol`, not by line (docs/documentation-policy.md):\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// Whether `anchor` is in `text`: each `::` segment as a whole word when all are identifiers
+/// (`store`, `SpoolError::HashMismatch`), otherwise the anchor verbatim (`Format check`,
+/// `ReadWritePaths=/var/lib/propolis`).
+fn anchor_found(anchor: &str, text: &str) -> bool {
+    let segments: Vec<&str> = anchor.split("::").collect();
+    if !segments.iter().all(|s| is_identifier(s)) {
+        return text.contains(anchor);
+    }
+    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    segments.iter().all(|segment| {
+        text.match_indices(segment).any(|(at, _)| {
+            !is_word(text[..at].chars().next_back())
+                && !is_word(text[at + segment.len()..].chars().next())
+        })
+    })
+}
+
+/// A symbol is found only as a whole word, so `#store` does not resolve against `restore` or
+/// `store_all` after `store` is renamed; every segment of a path must be present; anything that is
+/// not an identifier path is matched exactly.
+#[test]
+fn anchors_match_whole_symbols_or_exact_text() {
+    let spool = "pub enum SpoolError { HashMismatch }\nfn restore() {}\nfn store_all() {}\n";
+    assert!(!anchor_found("store", spool));
+    assert!(anchor_found("store", &format!("{spool}fn store() {{}}\n")));
+    assert!(anchor_found("SpoolError::HashMismatch", spool));
+    assert!(!anchor_found("SpoolError::TooLarge", spool));
+    let unit = "[Service]\nReadWritePaths=/var/lib/propolis\n";
+    assert!(anchor_found("ReadWritePaths=/var/lib/propolis", unit));
+    assert!(!anchor_found(
+        "ReadWritePaths=/var/lib/propolis/spool",
+        unit
+    ));
+    let workflow = "      - name: Format check\n";
+    assert!(anchor_found("Format check", workflow));
+    assert!(!anchor_found("Format check", "      - name: Format\n"));
+}
+
+/// Every file in the workspace outside build output, vendored sources and git's own store.
+fn workspace_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for path in fs::read_dir(root).unwrap().flatten().map(|e| e.path()) {
+        let skipped = path.file_name().is_some_and(|n| {
+            [".git", "target", "vendor", "node_modules"].contains(&n.to_str().unwrap_or(""))
+        });
+        if path.is_dir() && !skipped {
+            files_under(&path, &mut files);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// Every `path#symbol` citation must name a file that exists and a symbol that is in it, so renaming
+/// or deleting cited code fails here instead of leaving a reader nothing to find. A path is
+/// resolved from the workspace root, then from `crates/`, then as the tail of a path in the
+/// workspace (pages write `console/src/auth.rs` or `routes/mod.rs` about the crate they describe);
+/// a tail several files share passes if any of them holds the symbol. `crates/*/Cargo.toml#edition`
+/// cites every crate, so every crate must hold it.
+#[test]
+fn code_citations_name_symbols_their_files_contain() {
+    let root = workspace_root();
+    let files = workspace_files(&root);
+    let read = |f: &PathBuf| fs::read_to_string(f).unwrap_or_default();
+    let (mut checked, mut wrong) = (0, Vec::new());
+    for doc in citing_docs() {
+        let text = fs::read_to_string(&doc).unwrap();
+        for (n, span) in code_spans(&text) {
+            let Some((path, anchor)) = span.trim().split_once('#') else {
                 continue;
             };
-            let is_path = path.contains('/')
-                && Path::new(path).extension().is_some()
-                && !path.contains("://")
-                && !path.starts_with(['/', '~']);
-            let is_spans = !spans.is_empty()
-                && spans.starts_with(|c: char| c.is_ascii_digit())
-                && spans
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c == '-' || c == ',');
-            if !is_path || !is_spans {
+            if !path.contains('/') || path.contains("://") || !has_cited_extension(path) {
                 continue;
             }
-            let last = spans
-                .split([',', '-'])
-                .filter_map(|n| n.parse::<usize>().ok())
-                .max()
-                .unwrap_or(0);
-            let has_lines = |file: &PathBuf| {
-                last > 0 && last <= fs::read_to_string(file).unwrap().lines().count()
-            };
             checked += 1;
-            // `crates/*/Cargo.toml:4` cites the same line in every crate, so every crate must have it.
+            let at = format!("{}:{n}: `{span}`", doc.display());
             if let Some(rest) = path.strip_prefix("crates/*/") {
                 let each: Vec<PathBuf> = fs::read_dir(root.join("crates"))
                     .unwrap()
@@ -915,11 +1192,8 @@ fn documented_line_citations_name_real_files_and_lines() {
                     .map(|e| e.path().join(rest))
                     .filter(|p| p.is_file())
                     .collect();
-                if each.is_empty() || !each.iter().all(has_lines) {
-                    wrong.push(format!(
-                        "{}: {token}: not every crate has that line",
-                        doc.display()
-                    ));
+                if each.is_empty() || !each.iter().all(|f| anchor_found(anchor, &read(f))) {
+                    wrong.push(format!("{at}: not every crate's {rest} has `{anchor}`"));
                 }
                 continue;
             }
@@ -930,7 +1204,7 @@ fn documented_line_citations_name_real_files_and_lines() {
                 Some(file) => vec![file],
                 None => {
                     let tail = format!("/{path}");
-                    crate_files
+                    files
                         .iter()
                         .filter(|f| f.to_string_lossy().ends_with(&tail))
                         .cloned()
@@ -938,26 +1212,15 @@ fn documented_line_citations_name_real_files_and_lines() {
                 }
             };
             if candidates.is_empty() {
-                wrong.push(format!(
-                    "{}: {token} names no file in the workspace",
-                    doc.display()
-                ));
-            } else if !candidates.iter().any(has_lines) {
-                let names: Vec<String> = candidates
-                    .iter()
-                    .map(|c| c.strip_prefix(&root).unwrap_or(c).display().to_string())
-                    .collect();
-                wrong.push(format!(
-                    "{}: {token} cites line {last}, past the end of {}",
-                    doc.display(),
-                    names.join(" and ")
-                ));
+                wrong.push(format!("{at}: names no file in the workspace"));
+            } else if !candidates.iter().any(|f| anchor_found(anchor, &read(f))) {
+                wrong.push(format!("{at}: `{anchor}` is not in {path}"));
             }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert!(
-        checked >= 200,
+        checked >= MIN_SYMBOL_CITATIONS,
         "checked only {checked} citations; the scan has stopped seeing them"
     );
 }

@@ -23,15 +23,15 @@ sensor appends newline-delimited JSON events.
 
 | Sensor | Log-path env | Default | install.sh dir (mode 0750) |
 |---|---|---|---|
-| ssh | `PROPOLIS_SSH_LOG_PATH` | `/var/log/propolis/ssh/events.jsonl` (`crates/sensor-ssh/src/main.rs:62`) | `/var/log/propolis/ssh` propolis-ssh (`provision.sh:93`) |
-| telnet | `PROPOLIS_TELNET_LOG_PATH` | `/var/log/propolis/telnet/events.jsonl` (`sensor-telnet/src/main.rs:40`) | `/var/log/propolis/telnet` (`provision.sh:94`) |
-| http | `PROPOLIS_HTTP_LOG_PATH` | `/var/log/propolis/http/events.jsonl` (`sensor-http/src/main.rs:19`) | `/var/log/propolis/http` (`provision.sh:97`) |
-| ftp | `PROPOLIS_FTP_LOG_PATH` | `/var/log/propolis/ftp/events.jsonl` (`sensor-ftp/src/main.rs:30`) | `/var/log/propolis/ftp` (`provision.sh:98`) |
-| smtp | `PROPOLIS_SMTP_LOG_PATH` | `/var/log/propolis/smtp/events.jsonl` (`sensor-smtp/src/main.rs:14`) | `/var/log/propolis/smtp` (`provision.sh:99`) |
-| redis | `PROPOLIS_REDIS_LOG_PATH` | `/var/log/propolis/redis/events.jsonl` (`sensor-redis/src/main.rs:30`) | `/var/log/propolis/redis` (`provision.sh:95`) |
-| adb | `PROPOLIS_ADB_LOG_PATH` | `/var/log/propolis/adb/events.jsonl` (`sensor-adb/src/main.rs:41`) | `/var/log/propolis/adb` (`provision.sh:96`) |
-| catchall | `PROPOLIS_CATCHALL_LOG_PATH` | **`catchall-events.jsonl`** (relative, not absolute) (`sensor-catchall/src/main.rs:70`) | `/var/log/propolis/catchall` (`provision.sh:92`) |
-| cred | `PROPOLIS_CRED_LOG_DIR` (a **directory**) | `/var/log/propolis/cred`; writes one file per protocol `<protocol>.jsonl` (e.g. `mysql.jsonl`) (`sensor-cred/src/main.rs:10,102`) | `/var/log/propolis/cred` (`provision.sh:100`) |
+| ssh | `PROPOLIS_SSH_LOG_PATH` | `/var/log/propolis/ssh/events.jsonl` (`crates/sensor-ssh/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/ssh` propolis-ssh (`deploy/provision.sh#ensure_dir /var/log/propolis/ssh`) |
+| telnet | `PROPOLIS_TELNET_LOG_PATH` | `/var/log/propolis/telnet/events.jsonl` (`sensor-telnet/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/telnet` (`deploy/provision.sh#ensure_dir /var/log/propolis/telnet`) |
+| http | `PROPOLIS_HTTP_LOG_PATH` | `/var/log/propolis/http/events.jsonl` (`sensor-http/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/http` (`deploy/provision.sh#ensure_dir /var/log/propolis/http`) |
+| ftp | `PROPOLIS_FTP_LOG_PATH` | `/var/log/propolis/ftp/events.jsonl` (`sensor-ftp/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/ftp` (`deploy/provision.sh#ensure_dir /var/log/propolis/ftp`) |
+| smtp | `PROPOLIS_SMTP_LOG_PATH` | `/var/log/propolis/smtp/events.jsonl` (`sensor-smtp/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/smtp` (`deploy/provision.sh#ensure_dir /var/log/propolis/smtp`) |
+| redis | `PROPOLIS_REDIS_LOG_PATH` | `/var/log/propolis/redis/events.jsonl` (`sensor-redis/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/redis` (`deploy/provision.sh#ensure_dir /var/log/propolis/redis`) |
+| adb | `PROPOLIS_ADB_LOG_PATH` | `/var/log/propolis/adb/events.jsonl` (`sensor-adb/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/adb` (`deploy/provision.sh#ensure_dir /var/log/propolis/adb`) |
+| catchall | `PROPOLIS_CATCHALL_LOG_PATH` | **`catchall-events.jsonl`** (relative, not absolute) (`sensor-catchall/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/catchall` (`deploy/provision.sh#ensure_dir /var/log/propolis/catchall`) |
+| cred | `PROPOLIS_CRED_LOG_DIR` (a **directory**) | `/var/log/propolis/cred`; writes one file per protocol `<protocol>.jsonl` (e.g. `mysql.jsonl`) (`sensor-cred/src/main.rs#DEFAULT_LOG_DIR`, `sensor-cred/src/main.rs#main`) | `/var/log/propolis/cred` (`deploy/provision.sh#ensure_dir /var/log/propolis/cred`) |
 
 Two paths differ from the pattern:
 
@@ -48,21 +48,21 @@ event logs.
 
 > **Mount requirement:** spool dirs must be backed by `noexec,nosuid,nodev`
 > mounts. `install.sh` does **not** do this - the operator must add fstab
-> entries (`install.sh:96-102` lists example tmpfs entries). Captured artifacts
+> entries (`deploy/install.sh#NOT DONE BY THIS SCRIPT` lists example tmpfs entries). Captured artifacts
 > may be live malware.
 
 | Purpose | Env | Default | install.sh dir |
 |---|---|---|---|
-| ssh uploads | `PROPOLIS_SSH_SPOOL_DIR` | `/var/spool/propolis/ssh` (`sensor-ssh/src/main.rs:63`) | 0750 propolis-ssh (`provision.sh:133`) |
-| ftp uploads | `PROPOLIS_FTP_SPOOL_DIR` | `/var/spool/propolis/ftp` (`sensor-ftp/src/main.rs:31`) | 0750 propolis-ftp (`provision.sh:135`) |
-| adb uploads | `PROPOLIS_ADB_SPOOL_DIR` | `/var/spool/propolis/adb` (`sensor-adb/src/main.rs:42`) | 0750 propolis-adb (`provision.sh:134`) |
-| telnet uploads | `PROPOLIS_TELNET_SPOOL_DIR` | `/var/spool/propolis/telnet` (`sensor-telnet/src/main.rs:41`) | 0750 propolis-telnet (`provision.sh:136`) |
-| catchall | (dir granted for symmetry, **unused** - catchall spools no bodies) | `/var/spool/propolis/catchall` | 0750 propolis-catchall (`provision.sh:132`) |
-| fetcher output | `PROPOLIS_SPOOL_ROOT` + `/fetched` (fn `fetch_spool_dir()`) | `/var/spool/propolis/fetched` (`crates/propolis/src/main.rs:44-46`; root `crates/review/src/spool.rs:71`) | 0750 propolis (`provision.sh:140`) |
-| ops spool root | `PROPOLIS_SPOOL_ROOT` (fn `ops_spool_root()`) | `/var/spool/propolis` (`crates/propolis/src/main.rs:59-61`; default `crates/review/src/spool.rs:71`) | 0755 root (`provision.sh:131`) |
+| ssh uploads | `PROPOLIS_SSH_SPOOL_DIR` | `/var/spool/propolis/ssh` (`sensor-ssh/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-ssh (`deploy/provision.sh#ensure_dir /var/spool/propolis/ssh`) |
+| ftp uploads | `PROPOLIS_FTP_SPOOL_DIR` | `/var/spool/propolis/ftp` (`sensor-ftp/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-ftp (`deploy/provision.sh#ensure_dir /var/spool/propolis/ftp`) |
+| adb uploads | `PROPOLIS_ADB_SPOOL_DIR` | `/var/spool/propolis/adb` (`sensor-adb/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-adb (`deploy/provision.sh#ensure_dir /var/spool/propolis/adb`) |
+| telnet uploads | `PROPOLIS_TELNET_SPOOL_DIR` | `/var/spool/propolis/telnet` (`sensor-telnet/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-telnet (`deploy/provision.sh#ensure_dir /var/spool/propolis/telnet`) |
+| catchall | (dir granted for symmetry, **unused** - catchall spools no bodies) | `/var/spool/propolis/catchall` | 0750 propolis-catchall (`deploy/provision.sh#ensure_dir /var/spool/propolis/catchall`) |
+| fetcher output | `PROPOLIS_SPOOL_ROOT` + `/fetched` (fn `fetch_spool_dir()`) | `/var/spool/propolis/fetched` (`crates/propolis/src/main.rs#fetch_spool_dir`; root `crates/review/src/spool.rs#DEFAULT_SPOOL_ROOT`) | 0750 propolis (`deploy/provision.sh#ensure_dir /var/spool/propolis/fetched`) |
+| ops spool root | `PROPOLIS_SPOOL_ROOT` (fn `ops_spool_root()`) | `/var/spool/propolis` (`crates/propolis/src/main.rs#ops_spool_root`; default `crates/review/src/spool.rs#DEFAULT_SPOOL_ROOT`) | 0755 root (`deploy/provision.sh#3/9 creating spool directories (mountpoints only)`) |
 
 - The fetcher output dir has a global byte budget of 1_000_000_000 bytes
-  (`FETCH_SPOOL_GLOBAL_BUDGET`, `crates/propolis/src/main.rs:70`).
+  (`FETCH_SPOOL_GLOBAL_BUDGET`, `crates/propolis/src/main.rs#FETCH_SPOOL_GLOBAL_BUDGET`).
 - **smtp, redis, http, cred** have **no** spool dir (no `*_SPOOL_DIR` env);
   they capture inline only. Telnet spools only when the shell phase sees a
   binary payload (a Mirai/Gafgyt dropper), never the login/password phase.
@@ -78,15 +78,15 @@ for the full variable reference.
 
 | Purpose | Env | Default | install.sh dir |
 |---|---|---|---|
-| SSH host key (generated first run, reused) | `PROPOLIS_SSH_HOST_KEY_PATH` | `/var/lib/propolis/ssh/host_key` (`sensor-ssh/src/main.rs:64`) | `/var/lib/propolis/ssh` 0750 propolis-ssh (`provision.sh:115`) |
-| intake cursors (log tail position) | `PROPOLIS_CURSOR_DIR` | `/var/lib/propolis/cursors` (`intake/src/main.rs:29`; `propolis/src/config.rs:17`) | 0750 propolis (`provision.sh:107`) |
-| feed publish output | `PROPOLIS_FEED_OUTPUT_DIR` | `/var/lib/propolis/feed/current` (`feed/src/main.rs:36`; `propolis/src/config.rs:21`) | `/var/lib/propolis/feed` 0755 propolis (`provision.sh:111`) |
-| GeoIP databases | `PROPOLIS_GEOIP_DIR` | **no default - enrichment disabled when unset** (`geoip_dir` parse, `console/src/main.rs:162-165`; `feed/src/main.rs:211-214`) | not created by install.sh |
-| aggregated-node writable state | (unit grant) | `/var/lib/propolis` (`propolis.service:152` ReadWritePaths) | `/var/lib/propolis` 0755 root (`provision.sh:106`) |
-| ops spool bounded-buffer dir | (const) | `/var/lib/propolis/spool` (`provision.sh:130`) | 0750 propolis |
+| SSH host key (generated first run, reused) | `PROPOLIS_SSH_HOST_KEY_PATH` | `/var/lib/propolis/ssh/host_key` (`sensor-ssh/src/main.rs#DEFAULT_HOST_KEY_PATH`) | `/var/lib/propolis/ssh` 0750 propolis-ssh (`deploy/provision.sh#ensure_dir /var/lib/propolis/ssh`) |
+| intake cursors (log tail position) | `PROPOLIS_CURSOR_DIR` | `/var/lib/propolis/cursors` (`intake/src/main.rs#DEFAULT_CURSOR_DIR`; `propolis/src/config.rs#DEFAULT_CURSOR_DIR`) | 0750 propolis (`deploy/provision.sh#ensure_dir /var/lib/propolis/cursors`) |
+| feed publish output | `PROPOLIS_FEED_OUTPUT_DIR` | `/var/lib/propolis/feed/current` (`feed/src/main.rs#DEFAULT_OUTPUT_DIR`; `propolis/src/config.rs#DEFAULT_FEED_OUTPUT_DIR`) | `/var/lib/propolis/feed` 0755 propolis (`deploy/provision.sh#ensure_dir /var/lib/propolis/feed`) |
+| GeoIP databases | `PROPOLIS_GEOIP_DIR` | **no default - enrichment disabled when unset** (`geoip_dir` parse, `console/src/main.rs#load_config_from_env`; `feed/src/main.rs#load_config_from_env`) | not created by install.sh |
+| aggregated-node writable state | (unit grant) | `/var/lib/propolis` (`deploy/propolis.service#ReadWritePaths=/var/lib/propolis`) | `/var/lib/propolis` 0755 root (`deploy/provision.sh#root-owned, NOT propolis`) |
+| ops spool bounded-buffer dir | (const) | `/var/lib/propolis/spool` (`deploy/provision.sh#ensure_dir /var/lib/propolis/spool`) | 0750 propolis |
 
 - **GeoIP** expects `GeoLite2-City.mmdb` + `GeoLite2-ASN.mmdb` under
-  `PROPOLIS_GEOIP_DIR` (`geoip/src/lib.rs:61-62,71`). When the var is unset,
+  `PROPOLIS_GEOIP_DIR` (`crates/geoip/src/lib.rs#load`, `crates/geoip/src/lib.rs#load_asn_only`). When the var is unset,
   GeoIP enrichment is simply disabled - GeoLite2 lookups are **local file
   reads, not network requests**. Not created by `install.sh`; the operator
   provisions the files.
@@ -96,12 +96,12 @@ for the full variable reference.
 
 ## Config
 
-- **Config root `/etc/propolis`** (0755 root, `provision.sh:90`). Per-service env
+- **Config root `/etc/propolis`** (0755 root, `deploy/provision.sh#ensure_dir /etc/propolis`). Per-service env
   files `/etc/propolis/<service>.env` (mode 0600, service-owned) carry all
   config **including secrets**, named in each unit's `EnvironmentFile=` (e.g.
   `console.env`, `ssh.env`, `catchall.env`, `propolis.env` at
-  `propolis.service:120`). `install.sh` does **not** create these env files
-  (`install.sh:25`) - the operator populates them.
+  `deploy/propolis.service#EnvironmentFile=/etc/propolis/propolis.env`). `install.sh` does **not** create these env files
+  (`deploy/install.sh#OPERATOR-owned /etc/propolis/*.env file`) - the operator populates them.
 - **Feed status:** the console reads (read-only)
   `PROPOLIS_FEED_OUTPUT_DIR`/`manifest.json` for its feed-status page; the unit
   grants `ReadOnlyPaths=/var/lib/propolis/feed` (`console.service`).

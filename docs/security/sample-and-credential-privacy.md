@@ -32,7 +32,7 @@ is never stored on the auth state, never logged, and never reaches `metadata`.
 Enforcement:
 
 - **Serialized-JSON test.** `password_never_in_event`
-  (`crates/sensor-ssh/tests/auth_test.rs:49`) asserts the password is absent from
+  (`crates/sensor-ssh/tests/auth_test.rs#password_never_in_event`) asserts the password is absent from
   the serialized event JSON, not merely from the typed struct - so a future field
   addition cannot reintroduce it silently.
 - **No password is logged.** A grep for `tracing::*` lines containing `password`
@@ -46,7 +46,7 @@ Enforcement:
   [../reference/events-and-signals.md](../reference/events-and-signals.md).
 - **Captured identifiers are sanitized.** The `username` and `method` that *are*
   captured are length-capped and run through `sanitize_value` before entering the
-  event (`auth.rs:164-167` for `username`, `auth.rs:149-152` for `method` - two
+  event (`crates/sensor-ssh/src/auth.rs#handle_userauth` for both `username` and `method` - two
   `sanitize_value` calls in `auth.rs`). The shared
   sanitizer chokepoint is covered by
   [input-handling.md](input-handling.md).
@@ -76,8 +76,9 @@ published** in the public blocklist feed and never sent to a vendor.
 - **The public feed contains zero `wan_ip` references.** A grep across all of
   `crates/feed/src/**` (builder, publisher, exclusion, and every `export/*`
   target - cidr/json/plaintext/csv/firewall) returns 0. The feed selects only
-  `host(source_ip)` (attacker IPs) plus tier, first_seen, last_seen, and
-  categories (`crates/feed/src/builder.rs:169-172,226`). Feed contents are owned
+  `host(source_ip)` (attacker IPs) plus tier, first_seen, last_seen,
+  event_count, distinct_categories, and categories
+  (`crates/feed/src/builder.rs#build`). Feed contents are owned
   by [../reference/scoring-and-feed.md](../reference/scoring-and-feed.md).
 - **In the console, `wan_ip` appears only** in `routes/detail.rs`,
   `routes/search.rs`, and their templates - all behind the `require_session`

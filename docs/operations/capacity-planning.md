@@ -19,7 +19,8 @@ size them.
 ## Database connections
 
 The daemon opens one PgPool sized by `PROPOLIS_DB_MAX_CONNECTIONS` (default **10**, must be
-`> 0`; `parse_positive_u64`, `crates/propolis/src/config.rs:16,520-523`). Every subsystem (intake, review, feed,
+`> 0`; `parse_positive_u64`, `crates/propolis/src/config.rs#DEFAULT_DB_MAX_CONNECTIONS`,
+`crates/propolis/src/config.rs#load_config`). Every subsystem (intake, review, feed,
 console, metrics) shares this one pool. In a multi-node cluster each node opens its own pool
 against the shared database, so size the PostgreSQL `max_connections` for the **sum** across
 all nodes plus headroom, not a single node. Under-sizing the pool serializes subsystem DB work;
@@ -29,8 +30,9 @@ over-sizing it can exhaust the server's connection slots.
 
 Each spooling sensor hands captured bodies to a single background worker through a bounded
 in-process channel of **64** jobs, hard-coded per sensor rather than sourced from the unused
-`SensorConfig::capture_queue_size` field: SSH `server.rs:126`,
-FTP `CAPTURE_QUEUE_SIZE` (`lib.rs:15`), ADB `lib.rs`. The queue is deliberately small and drops rather than blocks
+`SensorConfig::capture_queue_size` field: SSH `crates/sensor-ssh/src/server.rs#serve`,
+FTP `CAPTURE_QUEUE_SIZE` (`crates/sensor-ftp/src/lib.rs#CAPTURE_QUEUE_SIZE`), ADB
+`crates/sensor-adb/src/lib.rs#CAPTURE_QUEUE_SIZE`. The queue is deliberately small and drops rather than blocks
 when full, so it bounds memory, not throughput. Operational behavior under overload is
 described in [queue and spool](./queue-and-spool.md); it is not operator-tunable via env in the
 shipped config.
@@ -43,8 +45,8 @@ refuses (fail-closed) once the budget is reached (`crates/sensor-framework/src/s
 
 | Spool | Per-file cap | Global budget | Cite |
 |---|---|---|---|
-| `sensor-ssh`, `sensor-ftp`, `sensor-adb`, `sensor-telnet` capture | 10 MB | 100 MB | SSH `server.rs:119`, FTP `lib.rs:13-14`, ADB `lib.rs:25-26`, telnet `lib.rs:42` |
-| Fetcher (`/var/spool/propolis/fetched`) | `PROPOLIS_FETCH_MAX_BYTES` (default 10 MB) | **1 GB** (`FETCH_SPOOL_GLOBAL_BUDGET`) | `crates/propolis/src/main.rs:70`, `crates/propolis/src/config.rs:35` |
+| `sensor-ssh`, `sensor-ftp`, `sensor-adb`, `sensor-telnet` capture | 10 MB | 100 MB | SSH `crates/sensor-ssh/src/server.rs#serve`, FTP `crates/sensor-ftp/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-ftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, ADB `crates/sensor-adb/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-adb/src/lib.rs#SPOOL_GLOBAL_BUDGET`, telnet `crates/sensor-telnet/src/lib.rs#start_test_server` |
+| Fetcher (`/var/spool/propolis/fetched`) | `PROPOLIS_FETCH_MAX_BYTES` (default 10 MB) | **1 GB** (`FETCH_SPOOL_GLOBAL_BUDGET`) | `crates/propolis/src/main.rs#FETCH_SPOOL_GLOBAL_BUDGET`, `crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_BYTES` |
 
 Redis, HTTP, SMTP, cred, and catchall sensors never write a body to a spool (they capture
 metadata only), so they consume no spool budget. Telnet only spools when the shell phase sees a
@@ -60,19 +62,21 @@ plus rotated logs under `/var/log/propolis`. Sample retention trims the spool; s
 ## Connection concurrency (per sensor)
 
 Each sensor caps concurrent connections with `max_concurrent`; a connection accepted over the
-cap is closed immediately, never queued (`crates/sensor-framework/src/bounds.rs:29-33`).
+cap is closed immediately, never queued (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`).
 Defaults (all operator-overridable via each sensor's `_MAX_CONCURRENT` env var, owned by
 [environment variables](../reference/environment-variables.md)):
 
 - most internet-facing sensors: **256**;
-- `sensor-http`: **512** (`crates/sensor-http/src/main.rs:20-24`);
+- `sensor-http`: **512** (`crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`);
 - `sensor-catchall`: 256, but with much tighter timeouts and a 4 KB capture cap
-  (`DEFAULT_READ_TIMEOUT_MS`/`DEFAULT_IDLE_TIMEOUT_MS`/`DEFAULT_MAX_CAPTURED_BYTES`,
-  `crates/sensor-catchall/src/main.rs:70-75`).
+  (`crates/sensor-catchall/src/main.rs#DEFAULT_READ_TIMEOUT_MS`/
+  `crates/sensor-catchall/src/main.rs#DEFAULT_IDLE_TIMEOUT_MS`/
+  `crates/sensor-catchall/src/main.rs#DEFAULT_MAX_CAPTURED_BYTES`).
 
 A zero or unparseable bound is rejected at startup ("zero never means unlimited") for every
 sensor except SMTP and cred, which fall back to the default on invalid input
-(`crates/sensor-smtp/src/main.rs:28-38`, `crates/sensor-cred/src/main.rs:29-38`). Raising
+(`crates/sensor-smtp/src/main.rs#parse_positive_u64`/`crates/sensor-smtp/src/main.rs#parse_positive_u32`,
+`crates/sensor-cred/src/main.rs#parse_positive_u64`/`crates/sensor-cred/src/main.rs#parse_positive_u32`). Raising
 `max_concurrent` raises peak memory and file-descriptor use; keep it under each unit's
 `LimitNOFILE`.
 
@@ -83,10 +87,10 @@ process cannot exceed; size sensor `max_concurrent` and capture load to stay wit
 
 | Unit | MemoryMax | TasksMax | CPUQuota | LimitNOFILE | Cite |
 |---|---|---|---|---|---|
-| `propolis` | 1 G | 256 | 100% | 4096 | `deploy/propolis.service:176-179` |
-| `sensor-ssh` | 512 M | 128 | 75% | (default) | `deploy/sensor-ssh.service:34-78` |
-| `sensor-catchall` | 256 M | 64 | 50% | (default) | `deploy/sensor-catchall.service:33-73` |
-| other sensors | 256 M | 128 | 50% | (default) | `deploy/sensor-*.service` |
+| `propolis` | 1 G | 256 | 100% | 4096 | `deploy/propolis.service#MemoryMax`/`deploy/propolis.service#TasksMax`/`deploy/propolis.service#CPUQuota`/`deploy/propolis.service#LimitNOFILE` |
+| `sensor-ssh` | 512 M | 128 | 75% | 4096 | `deploy/sensor-ssh.service#MemoryMax`/`deploy/sensor-ssh.service#TasksMax`/`deploy/sensor-ssh.service#CPUQuota`/`deploy/sensor-ssh.service#LimitNOFILE` |
+| `sensor-catchall` | 256 M | 64 | 50% | 4096 | `deploy/sensor-catchall.service#MemoryMax`/`deploy/sensor-catchall.service#TasksMax`/`deploy/sensor-catchall.service#CPUQuota`/`deploy/sensor-catchall.service#LimitNOFILE` |
+| other sensors | 256 M | 128 | 50% | 4096 | `deploy/sensor-*.service` |
 
 The daemon holds all four subsystems in one process, hence the highest caps in the set. If a
 unit is being OOM-killed, `journalctl -u <unit>` shows the `MemoryMax` hit; reduce load or

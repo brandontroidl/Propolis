@@ -16,16 +16,17 @@ docs link here rather than restating defaults.
 
 Defaults listed are the **code** defaults applied when a variable is unset or
 blank. All `/etc/propolis/*.env` files except the generated `fleet-listeners.env`
-(`deploy/install.sh:28-32,153-154`) are operator-authored; `deploy/install.sh`
+(`deploy/install.sh#7/9 deriving the fleet listener inventory`,
+`deploy/fleet-listeners.sh#OUT_FILE`) are operator-authored; `deploy/install.sh`
 does not generate them (it only prints a reminder to populate them,
-`deploy/install.sh:173`).
+`deploy/install.sh#Next: populate`).
 
 ## Run modes and where variables are read
 
 Propolis ships two ways to run the platform, and the env surface differs:
 
 1. **Unified daemon** `propolis` - one `load_config()`
-   (`crates/propolis/src/config.rs:517`) parses intake, review, feed, console,
+   (`crates/propolis/src/config.rs#load_config`) parses intake, review, feed, console,
    VirusTotal, malware-fetcher, and ops-alert config from a single env set
    (`EnvironmentFile=/etc/propolis/propolis.env`). It does **not** read sensor
    `*_BIND`/`*_WAN_MAP` variables; it consumes sensor **log files** via
@@ -49,19 +50,19 @@ Two fail-closed idioms recur; they are **not** uniform:
   present-but-invalid or present-but-zero numeric bound **aborts startup**.
 - **Lenient parse** - sensors `cred` and `smtp` **only**: an invalid or zero
   bound silently falls back to the default (`parse_positive_u64` filters `>0`
-  then `unwrap_or(default)`, `crates/sensor-cred/src/main.rs:29-33`,
-  `crates/sensor-smtp/src/main.rs:28-32`).
+  then `unwrap_or(default)`, `crates/sensor-cred/src/main.rs#parse_positive_u64`,
+  `crates/sensor-smtp/src/main.rs#parse_positive_u64`).
 
 Unified daemon (`config.rs`) parse helpers:
 
 | Helper | Unset/empty | Invalid | Zero | Other |
 |---|---|---|---|---|
-| `require_env` (`:224`) | `Missing` (abort) | - | - | - |
-| `parse_positive_u64` (`:231`) | default | `Invalid` (abort) | `Invalid` (abort) - "zero never means unlimited" | - |
-| `parse_bounded_positive_u64` (`:255`) | default | abort | abort | `> max` → abort |
-| `parse_u32` (`:303`) | default | abort | allowed | - |
-| `parse_bounded_u8` (`:439`) | default | abort | allowed (0 = maximally strict) | `> 255` → abort (no wrap) |
-| `parse_bool_flag` (`:315`) | default | - | - | case-insensitive `true`/`false` only; **any** other value (incl. `1`, `yes`) → default |
+| `require_env` (`crates/propolis/src/config.rs#require_env`) | `Missing` (abort) | - | - | - |
+| `parse_positive_u64` (`crates/propolis/src/config.rs#parse_positive_u64`) | default | `Invalid` (abort) | `Invalid` (abort) - "zero never means unlimited" | - |
+| `parse_bounded_positive_u64` (`crates/propolis/src/config.rs#parse_bounded_positive_u64`) | default | abort | abort | `> max` → abort |
+| `parse_u32` (`crates/propolis/src/config.rs#parse_u32`) | default | abort | allowed | - |
+| `parse_bounded_u8` (`crates/propolis/src/config.rs#parse_bounded_u8`) | default | abort | allowed (0 = maximally strict) | `> 255` → abort (no wrap) |
+| `parse_bool_flag` (`crates/propolis/src/config.rs#parse_bool_flag`) | default | - | - | case-insensitive `true`/`false` only; **any** other value (incl. `1`, `yes`) → default |
 
 Note `parse_bool_flag` does **not** accept `1`/`yes`; ops-alert `get_bool` and
 console rDNS parse booleans more broadly (called out below).
@@ -71,8 +72,11 @@ console rDNS parse booleans more broadly (called out below).
 ## Universal / cross-cutting
 
 ### `DATABASE_URL`
-- Read by: `propolis` (`config.rs:518`), `console` (`main.rs:144`), `feed`
-  (`main.rs:183`), `intake` (`main.rs:156`), `review` (`main.rs:199`).
+- Read by: `propolis` (`crates/propolis/src/config.rs#load_config`), `console`
+  (`console/src/main.rs#load_config_from_env`), `feed`
+  (`feed/src/main.rs#load_config_from_env`), `intake`
+  (`intake/src/main.rs#load_config_from_env`), `review`
+  (`review/src/main.rs#load_config_from_env`).
 - Required: **yes**, for every binary that touches PostgreSQL. No default.
 - Form: PostgreSQL connection string (not validated at parse time; `sqlx`
   validates on connect).
@@ -80,7 +84,7 @@ console rDNS parse booleans more broadly (called out below).
   `.filter(|s| !s.is_empty())`).
 
 ### `RUST_LOG`
-- Read by: `propolis` (`main.rs:635-636`), `console` (`main.rs:278-279`), and the
+- Read by: `propolis` (`propolis/src/main.rs#main`), `console` (`console/src/main.rs#main`), and the
   sensors via `tracing_subscriber`.
 - Required: no. Default filter `info` on unset or parse failure.
 - Standard `tracing_subscriber::EnvFilter` default-env name. Sensors `cred`/`smtp`
@@ -89,11 +93,11 @@ console rDNS parse booleans more broadly (called out below).
 
 ### `PROPOLIS_HOSTNAME`
 - Read by: `sensor-framework::persona::hostname()`
-  (`crates/sensor-framework/src/persona.rs:45`); used by every sensor presenting
+  (`crates/sensor-framework/src/persona.rs#hostname`); used by every sensor presenting
   a host identity (SSH/telnet shell, fake-fs `/etc/hostname`, redis `INFO`,
   SMTP/FTP greeting).
-- Required: no. Default `server01` (`persona.rs:22`).
-- Validation: trimmed; blank after trim → default (`persona.rs:48-50`). Always
+- Required: no. Default `server01` (`sensor-framework/src/persona.rs#DEFAULT_HOSTNAME`).
+- Validation: trimmed; blank after trim → default (`sensor-framework/src/persona.rs#hostname`). Always
   resolves.
 
 ### `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`
@@ -116,25 +120,25 @@ variable in this section plus the universal ones above.
 
 | Variable | Req | Default | Bounds / validation | Fail |
 |---|---|---|---|---|
-| `PROPOLIS_DB_MAX_CONNECTIONS` | no | `10` (`config.rs:16`) | positive u64 → cast u32 | zero/unparseable → abort |
+| `PROPOLIS_DB_MAX_CONNECTIONS` | no | `10` (`crates/propolis/src/config.rs#DEFAULT_DB_MAX_CONNECTIONS`) | positive u64 → cast u32 | zero/unparseable → abort |
 
 ### Intake
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs (`parse_sensor_logs`, `config.rs:324-350`). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
-| `PROPOLIS_CURSOR_DIR` | no | `/var/lib/propolis/cursors` (`config.rs:17`) | any path; no validation |
-| `PROPOLIS_POLL_INTERVAL_MS` | no | `1000` (`config.rs:18`) | positive u64 ms; zero/unparseable → abort |
+| `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs (`crates/propolis/src/config.rs#parse_sensor_logs`). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
+| `PROPOLIS_CURSOR_DIR` | no | `/var/lib/propolis/cursors` (`crates/propolis/src/config.rs#DEFAULT_CURSOR_DIR`) | any path; no validation |
+| `PROPOLIS_POLL_INTERVAL_MS` | no | `1000` (`crates/propolis/src/config.rs#DEFAULT_POLL_INTERVAL_MS`) | positive u64 ms; zero/unparseable → abort |
 
 ### Review
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_REVIEW_ENABLED` | no | `true` (`config.rs:532`) | bool_flag |
-| `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS` | no | `60` (`config.rs:19`) | positive u64; zero → abort |
-| `PROPOLIS_SUBMIT_POLL_INTERVAL_SECS` | no | `30` (`config.rs:20`) | positive u64; zero → abort |
+| `PROPOLIS_REVIEW_ENABLED` | no | `true` (`crates/propolis/src/config.rs#load_config`) | bool_flag |
+| `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS` | no | `60` (`crates/propolis/src/config.rs#DEFAULT_QUEUE_SCAN_INTERVAL_SECS`) | positive u64; zero → abort |
+| `PROPOLIS_SUBMIT_POLL_INTERVAL_SECS` | no | `30` (`crates/propolis/src/config.rs#DEFAULT_SUBMIT_POLL_INTERVAL_SECS`) | positive u64; zero → abort |
 
-### Vendor abuse submitters (`config.rs:542-562`, `load_vendor_config:479-513`)
+### Vendor abuse submitters (`crates/propolis/src/config.rs#load_config`, `crates/propolis/src/config.rs#load_vendor_config`)
 
 Each vendor `<V>` ∈ {`ABUSEIPDB`, `DSHIELD`, `OTX`}. These are opt-in egress
 paths, default off. See [outbound controls](../security/outbound-controls.md)
@@ -142,13 +146,13 @@ and [integrations](integrations.md).
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_VENDOR_<V>_KEY` | no | `""` | empty key + enabled → vendor forced **disabled** (fail-closed, warns) (`:486-493`) |
+| `PROPOLIS_VENDOR_<V>_KEY` | no | `""` | empty key + enabled → vendor forced **disabled** (fail-closed, warns) (`crates/propolis/src/config.rs#load_vendor_config`) |
 | `PROPOLIS_VENDOR_<V>_URL` | no | vendor base URL (below) | no validation |
-| `PROPOLIS_VENDOR_<V>_ENABLED` | no | `false` (`:486`) | bool_flag; stays disabled unless key present |
-| `PROPOLIS_VENDOR_<V>_COOLDOWN_HOURS` | no | `24` (`config.rs:31`) | parse_u32; zero allowed; unparseable → abort |
-| `PROPOLIS_VENDOR_<V>_RATE_LIMIT` | no | `100` (`config.rs:32`) | parse_u32 |
-| `PROPOLIS_VENDOR_<V>_RATE_WINDOW_HOURS` | no | `1` (`config.rs:33`) | parse_u32 |
-| `PROPOLIS_VENDOR_DSHIELD_USER` | no | none | DShield only (`:548`); if set with a key, composed as `{user}:{key}` into the single key slot (`:551-554`). User alone (no key) is ignored. |
+| `PROPOLIS_VENDOR_<V>_ENABLED` | no | `false` (`crates/propolis/src/config.rs#load_vendor_config`) | bool_flag; stays disabled unless key present |
+| `PROPOLIS_VENDOR_<V>_COOLDOWN_HOURS` | no | `24` (`crates/propolis/src/config.rs#DEFAULT_COOLDOWN_HOURS`) | parse_u32; zero allowed; unparseable → abort |
+| `PROPOLIS_VENDOR_<V>_RATE_LIMIT` | no | `100` (`crates/propolis/src/config.rs#DEFAULT_RATE_LIMIT`) | parse_u32 |
+| `PROPOLIS_VENDOR_<V>_RATE_WINDOW_HOURS` | no | `1` (`crates/propolis/src/config.rs#DEFAULT_RATE_WINDOW_HOURS`) | parse_u32 |
+| `PROPOLIS_VENDOR_DSHIELD_USER` | no | none | DShield only (`crates/propolis/src/config.rs#load_config`); if set with a key, composed as `{user}:{key}` into the single key slot (`crates/propolis/src/config.rs#load_config`). User alone (no key) is ignored. |
 
 Concrete literal names the code reads (the `<V>` rows above, instantiated for each vendor):
 `PROPOLIS_VENDOR_ABUSEIPDB_KEY`, `PROPOLIS_VENDOR_ABUSEIPDB_URL`,
@@ -156,35 +160,35 @@ Concrete literal names the code reads (the `<V>` rows above, instantiated for ea
 `PROPOLIS_VENDOR_OTX_KEY`, `PROPOLIS_VENDOR_OTX_URL`.
 
 Default base URLs (`crates/review/src/vendor/*.rs`):
-- abuseipdb: `https://api.abuseipdb.com` (`abuseipdb.rs:21`)
-- dshield: `https://www.dshield.org` (`dshield.rs:21`)
-- otx: `https://otx.alienvault.com` (`otx.rs:25`)
+- abuseipdb: `https://api.abuseipdb.com` (`review/src/vendor/abuseipdb.rs#DEFAULT_BASE_URL`)
+- dshield: `https://www.dshield.org` (`review/src/vendor/dshield.rs#DEFAULT_BASE_URL`)
+- otx: `https://otx.alienvault.com` (`review/src/vendor/otx.rs#DEFAULT_BASE_URL`)
 
 ### Feed
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_FEED_ENABLED` | no | `true` (`config.rs:564`) | bool_flag |
-| `PROPOLIS_FEED_OUTPUT_DIR` | no | `/var/lib/propolis/feed/current` (`config.rs:21`) | path |
-| `PROPOLIS_FEED_BUILD_INTERVAL_SECS` | no | `900` (`config.rs:22`) | positive u64; zero → abort |
-| `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` | no | `24` (`config.rs:23`) | positive u64; ×3600 → Duration; zero → abort |
-| `PROPOLIS_FEED_STANDARD_TTL_HOURS` | no | `48` (`config.rs:24`) | positive u64; zero → abort |
-| `PROPOLIS_FEED_ALLOWLIST` | no | `""` | comma-sep CIDR list (`parse_cidr_list:352`); **bare IP without prefix is rejected**; invalid entry → abort |
-| `PROPOLIS_FEED_DELIST` | no | `""` | comma-sep IP list (`parse_ip_list:420`); invalid → abort |
-| `PROPOLIS_FEED_ASN_ALLOWLIST` | no | `""` | comma-sep AS numbers, optional `AS`/`as` prefix (`parse_asn_list:368`); invalid → abort. Inert unless the GeoIP ASN DB loads (see [interactions](#interactions)). |
-| `PROPOLIS_FEED_WINDOWS` | no | `24h,7d,30d,60d,90d` (`config.rs:29`) | comma-sep `<count>h`/`<count>d` (`parse_window_list:396`). Only `h`/`d` units; count must be a positive int; **any malformed entry → abort** (fails closed, not skipped). Empty string → no retention feeds. **Unified daemon only.** |
+| `PROPOLIS_FEED_ENABLED` | no | `true` (`crates/propolis/src/config.rs#load_config`) | bool_flag |
+| `PROPOLIS_FEED_OUTPUT_DIR` | no | `/var/lib/propolis/feed/current` (`crates/propolis/src/config.rs#DEFAULT_FEED_OUTPUT_DIR`) | path |
+| `PROPOLIS_FEED_BUILD_INTERVAL_SECS` | no | `900` (`crates/propolis/src/config.rs#DEFAULT_FEED_BUILD_INTERVAL_SECS`) | positive u64; zero → abort |
+| `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` | no | `24` (`crates/propolis/src/config.rs#DEFAULT_AGGRESSIVE_TTL_HOURS`) | positive u64; ×3600 → Duration; zero → abort |
+| `PROPOLIS_FEED_STANDARD_TTL_HOURS` | no | `48` (`crates/propolis/src/config.rs#DEFAULT_STANDARD_TTL_HOURS`) | positive u64; zero → abort |
+| `PROPOLIS_FEED_ALLOWLIST` | no | `""` | comma-sep CIDR list (`crates/propolis/src/config.rs#parse_cidr_list`); **bare IP without prefix is rejected**; invalid entry → abort |
+| `PROPOLIS_FEED_DELIST` | no | `""` | comma-sep IP list (`crates/propolis/src/config.rs#parse_ip_list`); invalid → abort |
+| `PROPOLIS_FEED_ASN_ALLOWLIST` | no | `""` | comma-sep AS numbers, optional `AS`/`as` prefix (`crates/propolis/src/config.rs#parse_asn_list`); invalid → abort. Inert unless the GeoIP ASN DB loads (see [interactions](#interactions)). |
+| `PROPOLIS_FEED_WINDOWS` | no | `24h,7d,30d,60d,90d` (`crates/propolis/src/config.rs#DEFAULT_FEED_WINDOWS`) | comma-sep `<count>h`/`<count>d` (`crates/propolis/src/config.rs#parse_window_list`). Only `h`/`d` units; count must be a positive int; **any malformed entry → abort** (fails closed, not skipped). Empty string → no retention feeds. **Unified daemon only.** |
 
 ### Console
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_CONSOLE_BIND` | no | `127.0.0.1:8080` (`config.rs:30`) | must parse as `ip:port` SocketAddr; invalid → abort (`:602-608`) |
-| `PROPOLIS_CONSOLE_PASSWORD` | **yes** | - | `require_env`; absent/empty → **abort** (`:609`) |
-| `PROPOLIS_CONSOLE_SESSION_SECRET` | no | random 32 bytes generated at startup (`load_session_secret`, `config.rs:459-477`) | if set, must be exactly 64 hex chars (32 bytes), else abort (`:467-476`). Sessions are in-memory, so a fresh secret per restart only invalidates sessions already dropped on restart. |
+| `PROPOLIS_CONSOLE_BIND` | no | `127.0.0.1:8080` (`crates/propolis/src/config.rs#DEFAULT_CONSOLE_BIND`) | must parse as `ip:port` SocketAddr; invalid → abort (`crates/propolis/src/config.rs#load_config`) |
+| `PROPOLIS_CONSOLE_PASSWORD` | **yes** | - | `require_env`; absent/empty → **abort** (`crates/propolis/src/config.rs#load_config`) |
+| `PROPOLIS_CONSOLE_SESSION_SECRET` | no | random 32 bytes generated at startup (`crates/propolis/src/config.rs#load_session_secret`) | if set, must be exactly 64 hex chars (32 bytes), else abort (`crates/propolis/src/config.rs#load_session_secret`). Sessions are in-memory, so a fresh secret per restart only invalidates sessions already dropped on restart. |
 | `PROPOLIS_CONSOLE_MAX_SOURCE_IPS` | no | `3` (`routes/samples.rs`) | how many attacker IPs the Samples page shows inline per sample before collapsing to "+N more"; blank/zero/unparseable falls back to the default (zero never means unlimited) |
 | `PROPOLIS_SPOOL_ROOT` | no | `/var/spool/propolis` (`review/src/spool.rs`) | root of the spool tree. Per-sensor spool dirs default under it, but each sensor's own `PROPOLIS_<SENSOR>_SPOOL_DIR` still wins, so the platform side (VT scan, retention, console) resolves the same directory the sensor actually writes to. Must match what `deploy/install.sh` provisions and what the units grant in `ReadWritePaths`. |
-| `PROPOLIS_GEOIP_DIR` | no | none (`Option`, `:568`) | directory of GeoLite2 `.mmdb` files; empty string treated as unset; missing dir/file degrades gracefully. GeoIP enrichment is **local file reads, not network**. |
-| `PROPOLIS_CONSOLE_RDNS_ENABLED` | no | `false` (`config.rs:572`) | bool_flag; opt-in forward-confirmed reverse DNS - the one outbound DNS lookup. Default off. See [outbound controls](../security/outbound-controls.md). |
+| `PROPOLIS_GEOIP_DIR` | no | none (`Option`, `crates/propolis/src/config.rs#load_config`) | directory of GeoLite2 `.mmdb` files; empty string treated as unset; missing dir/file degrades gracefully. GeoIP enrichment is **local file reads, not network**. |
+| `PROPOLIS_CONSOLE_RDNS_ENABLED` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag; opt-in forward-confirmed reverse DNS - the one outbound DNS lookup. Default off. See [outbound controls](../security/outbound-controls.md). |
 | `PROPOLIS_CONSOLE_TRUSTED_PROXY` | no | `false` | bool_flag; set when the console sits behind a TLS reverse proxy so session cookies are always marked `Secure` (a same-host proxy connects over loopback, which would otherwise drop the flag on a real HTTPS hop). |
 | `PROPOLIS_CONSOLE_METRICS_TOKEN` | no | none | if set, `/metrics` requires `Authorization: Bearer <token>` (constant-time compare); unset leaves `/metrics` open - safe only on a loopback bind. Defense in depth for a non-loopback bind. |
 
@@ -286,10 +290,10 @@ Opt-in egress, default off. See [integrations](integrations.md) and
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_VT_KEY` | no | `""` (`config.rs:612`) | empty → VT disabled regardless of `_ENABLED` |
-| `PROPOLIS_VT_ENABLED` | no | `false` (`:613`) | bool_flag; **and** a non-empty key required to actually enable (`&& !vt_api_key.is_empty()`) |
-| `PROPOLIS_VT_UPLOAD` | no | `false` (`:614`) | bool_flag; upload-unknown-samples opt-in |
-| `PROPOLIS_VT_SCAN_INTERVAL_SECS` | no | `300` (`:615`) | parse_u32 (zero allowed); unparseable → abort. No `PROPOLIS_VT_URL` override exists. |
+| `PROPOLIS_VT_KEY` | no | `""` (`crates/propolis/src/config.rs#load_config`) | empty → VT disabled regardless of `_ENABLED` |
+| `PROPOLIS_VT_ENABLED` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag; **and** a non-empty key required to actually enable (`&& !vt_api_key.is_empty()`) |
+| `PROPOLIS_VT_UPLOAD` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag; upload-unknown-samples opt-in |
+| `PROPOLIS_VT_SCAN_INTERVAL_SECS` | no | `300` (`crates/propolis/src/config.rs#load_config`) | parse_u32 (zero allowed); unparseable → abort. No `PROPOLIS_VT_URL` override exists. |
 | `PROPOLIS_VT_PENDING_RECHECK_SECS` | no | `900` | parse_u32; how long an uploaded sample with no verdict yet (`detected = -1`) waits before its hash is looked up again. Each recheck costs one daily-budget unit. Zero → every scan cycle. unparseable → abort. |
 
 ### Malware fetcher (unified daemon only)
@@ -299,55 +303,55 @@ and [rate limits and budgets](rate-limits-and-budgets.md).
 
 | Variable | Req | Default | Max | Bounds / fail |
 |---|---|---|---|---|
-| `PROPOLIS_FETCH_ENABLED` | no | `false` (`config.rs:622`) | - | bool_flag |
-| `PROPOLIS_FETCH_INTERVAL_SECS` | no | `10` (`:34`) | `86400` (`:61`) | bounded positive u64; zero/over-max → abort |
-| `PROPOLIS_FETCH_MAX_BYTES` | no | `10_000_000` (`:35`) | `500_000_000` (`:53`) | bounded positive u64 → usize; **zero → abort** (would disable the byte guard); over-max → abort |
-| `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` | no | `12` (`:36`) | `1000` (`:57`) | bounded positive u64 → u32 |
-| `PROPOLIS_FETCH_MAX_HOPS` | no | `3` (`:37`) | `255` (u8) | bounded_u8; **zero allowed** (no redirects); >255 → abort |
-| `PROPOLIS_FETCH_MAX_DEPTH` | no | `2` (`:38`) | `255` (u8) | bounded_u8; zero allowed (no recursion) |
-| `PROPOLIS_FETCH_DAILY_CAP` | no | `200` (`:39`) | `10_000` (`:58`) | bounded positive u64 → u32 |
-| `PROPOLIS_FETCH_BATCH_SIZE` | no | `20` (`:40`) | `1000` (`:59`) | bounded positive u64 → usize |
-| `PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS` | no | `10` (`:41`) | `300` (`:56`) | bounded positive u64 |
-| `PROPOLIS_FETCH_READ_TIMEOUT_SECS` | no | `10` (`:42`) | `300` | bounded positive u64 |
-| `PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS` | no | `30` (`:43`) | `300` | bounded positive u64 |
-| `PROPOLIS_FETCH_USER_AGENT` | no | `Wget/1.21.3` (`:65`) | - | blank → default |
+| `PROPOLIS_FETCH_ENABLED` | no | `false` (`crates/propolis/src/config.rs#load_config`) | - | bool_flag |
+| `PROPOLIS_FETCH_INTERVAL_SECS` | no | `10` (`crates/propolis/src/config.rs#DEFAULT_FETCH_INTERVAL_SECS`) | `86400` (`crates/propolis/src/config.rs#MAX_FETCH_INTERVAL_SECS`) | bounded positive u64; zero/over-max → abort |
+| `PROPOLIS_FETCH_MAX_BYTES` | no | `10_000_000` (`crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_BYTES`) | `500_000_000` (`crates/propolis/src/config.rs#MAX_FETCH_MAX_BYTES`) | bounded positive u64 → usize; **zero → abort** (would disable the byte guard); over-max → abort |
+| `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` | no | `12` (`crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_PER_HOST_HOUR`) | `1000` (`crates/propolis/src/config.rs#MAX_FETCH_MAX_PER_HOST_HOUR`) | bounded positive u64 → u32 |
+| `PROPOLIS_FETCH_MAX_HOPS` | no | `3` (`crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_HOPS`) | `255` (u8) | bounded_u8; **zero allowed** (no redirects); >255 → abort |
+| `PROPOLIS_FETCH_MAX_DEPTH` | no | `2` (`crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_DEPTH`) | `255` (u8) | bounded_u8; zero allowed (no recursion) |
+| `PROPOLIS_FETCH_DAILY_CAP` | no | `200` (`crates/propolis/src/config.rs#DEFAULT_FETCH_DAILY_CAP`) | `10_000` (`crates/propolis/src/config.rs#MAX_FETCH_DAILY_CAP`) | bounded positive u64 → u32 |
+| `PROPOLIS_FETCH_BATCH_SIZE` | no | `20` (`crates/propolis/src/config.rs#DEFAULT_FETCH_BATCH_SIZE`) | `1000` (`crates/propolis/src/config.rs#MAX_FETCH_BATCH_SIZE`) | bounded positive u64 → usize |
+| `PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS` | no | `10` (`crates/propolis/src/config.rs#DEFAULT_FETCH_CONNECT_TIMEOUT_SECS`) | `300` (`crates/propolis/src/config.rs#MAX_FETCH_TIMEOUT_SECS`) | bounded positive u64 |
+| `PROPOLIS_FETCH_READ_TIMEOUT_SECS` | no | `10` (`crates/propolis/src/config.rs#DEFAULT_FETCH_READ_TIMEOUT_SECS`) | `300` | bounded positive u64 |
+| `PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS` | no | `30` (`crates/propolis/src/config.rs#DEFAULT_FETCH_TOTAL_TIMEOUT_SECS`) | `300` | bounded positive u64 |
+| `PROPOLIS_FETCH_USER_AGENT` | no | `Wget/1.21.3` (`crates/propolis/src/config.rs#DEFAULT_FETCH_USER_AGENT`) | - | blank → default |
 | `PROPOLIS_FETCH_OWN_IPS` | no | `""` | - | comma-sep IP list (`parse_ip_list`); invalid → abort. Unioned with live-interface IPs for the SSRF self-target guard. |
 
-Fetcher runtime fail-closed (`own_ips.is_empty()` check, `main.rs:1017-1024`): if
+Fetcher runtime fail-closed (`own_ips.is_empty()` check, `propolis/src/main.rs#main`): if
 `PROPOLIS_FETCH_OWN_IPS` is unset **and** interface enumeration returns empty, the fetcher **refuses to run**
 (logs an error and returns). If the own-IPs set has only private/loopback/
 link-local addresses (a NAT'd node whose public WAN IP is on no interface), it
-**warns but runs** (`own_ips_lack_a_public_address` check, `main.rs:1032-1041`); set `PROPOLIS_FETCH_OWN_IPS` to the
+**warns but runs** (`own_ips_lack_a_public_address` check, `propolis/src/main.rs#main`); set `PROPOLIS_FETCH_OWN_IPS` to the
 public egress IP for self-target protection.
 
 ### Operational self-alerting (ops-alert)
 
 `crates/propolis/src/ops_alert/config.rs`. Opt-in ntfy POST egress, default off.
 Parsed via an injectable getter over `env::var` that treats blank as absent.
-Helpers: `get_bool` (`:44`) accepts `true|1|yes|on` (case-insensitive), else
-default - broader than `parse_bool_flag`. `get_u64`/`get_secs` (`:64`/`:54`):
-unset -> default; unparseable -> abort; **below min -> abort**. `get_pct` (`:105`):
-enforces `1..=100`; 0 and >100 -> abort. `get_u32` (`:90`): u64 range-checked to
+Helpers: `get_bool` (`crates/propolis/src/ops_alert/config.rs#get_bool`) accepts `true|1|yes|on` (case-insensitive), else
+default - broader than `parse_bool_flag`. `get_u64`/`get_secs` (`crates/propolis/src/ops_alert/config.rs#get_u64`/`crates/propolis/src/ops_alert/config.rs#get_secs`):
+unset -> default; unparseable -> abort; **below min -> abort**. `get_pct` (`crates/propolis/src/ops_alert/config.rs#get_pct`):
+enforces `1..=100`; 0 and >100 -> abort. `get_u32` (`crates/propolis/src/ops_alert/config.rs#get_u32`): u64 range-checked to
 u32.
 
 | Variable | Req | Default | Min/bounds | Notes |
 |---|---|---|---|---|
-| `PROPOLIS_OPS_ENABLED` | no | `false` (`config.rs:128`) | - | opt-in; a deployment predating ops-alert still starts |
-| `PROPOLIS_OPS_NTFY_URL` | no | `""` (unset reads as empty, `:139-140`) | - | enabled and set with the other unset -> abort (`:141-147`); enabled and both unset -> alerts go to the local log sink (`:130-134`) |
-| `PROPOLIS_OPS_NTFY_TOPIC` | no | `""` (unset reads as empty, `:139-140`) | - | enabled and set with the other unset -> abort (`:141-147`); enabled and both unset -> alerts go to the local log sink (`:130-134`). The `propolis-ops` value seen in tests is not a runtime default. |
-| `PROPOLIS_OPS_NTFY_TOKEN` | no | none (`:153`) | - | optional bearer token |
-| `PROPOLIS_OPS_POLL_INTERVAL_SECS` | no | `30` (`:154`) | min 1 | |
-| `PROPOLIS_OPS_REPAGE_COOLDOWN_SECS` | no | `5400` (`:155`) | min 1 | |
-| `PROPOLIS_OPS_STALL_FOR_SECS` | no | `600` (`:156`) | min 1 | |
-| `PROPOLIS_OPS_CAPACITY_FREE_PCT` | no | `15` (`:157`) | 1..=100 | 0/>100 -> abort |
-| `PROPOLIS_OPS_FEED_STALE_MULTIPLE` | no | `2` (`:158`) | min 1 | u32 |
+| `PROPOLIS_OPS_ENABLED` | no | `false` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | opt-in; a deployment predating ops-alert still starts |
+| `PROPOLIS_OPS_NTFY_URL` | no | `""` (unset reads as empty, `crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | enabled and set with the other unset -> abort (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`); enabled and both unset -> alerts go to the local log sink (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) |
+| `PROPOLIS_OPS_NTFY_TOPIC` | no | `""` (unset reads as empty, `crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | enabled and set with the other unset -> abort (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`); enabled and both unset -> alerts go to the local log sink (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`). The `propolis-ops` value seen in tests is not a runtime default. |
+| `PROPOLIS_OPS_NTFY_TOKEN` | no | none (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | optional bearer token |
+| `PROPOLIS_OPS_POLL_INTERVAL_SECS` | no | `30` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_REPAGE_COOLDOWN_SECS` | no | `5400` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_STALL_FOR_SECS` | no | `600` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_CAPACITY_FREE_PCT` | no | `15` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | 1..=100 | 0/>100 -> abort |
+| `PROPOLIS_OPS_FEED_STALE_MULTIPLE` | no | `2` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | u32 |
 | `PROPOLIS_OPS_FEED_PUSH_EXPECTED` | no | `false` | bool | set once `deploy/blocklist-sync.sh` is in cron: `feed-push-stale` then pages when the feed has gone unpushed for the stale threshold (`FEED_STALE_MULTIPLE` build cycles) since the daemon started, instead of treating "no push marker" as grace forever |
-| `PROPOLIS_OPS_VENDOR_WINDOW_SECS` | no | `3600` (`:160`) | min 1 | |
-| `PROPOLIS_OPS_VENDOR_FAIL_PCT` | no | `50` (`:161`) | 1..=100 | |
-| `PROPOLIS_OPS_VENDOR_MIN_SAMPLES` | no | `20` (`:162`) | min 1 | u32 |
-| `PROPOLIS_OPS_BACKLOG_MAX` | no | `500` (`:163`) | min 1 | u64 |
-| `PROPOLIS_OPS_BACKLOG_FOR_SECS` | no | `900` (`:164`) | min 1 | |
-| `PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS` | no | `21600` (`:165`) | min 1 | |
+| `PROPOLIS_OPS_VENDOR_WINDOW_SECS` | no | `3600` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_VENDOR_FAIL_PCT` | no | `50` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | 1..=100 | |
+| `PROPOLIS_OPS_VENDOR_MIN_SAMPLES` | no | `20` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | u32 |
+| `PROPOLIS_OPS_BACKLOG_MAX` | no | `500` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | u64 |
+| `PROPOLIS_OPS_BACKLOG_FOR_SECS` | no | `900` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS` | no | `21600` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
 | `PROPOLIS_OPS_SCAN_STALE_SECS` | no | `21600` | min 1 | `scan-stale`: a spooled body unscanned, or a VirusTotal upload unverdicted, this long; silent unless VirusTotal is enabled |
 | `PROPOLIS_OPS_FETCH_STALE_SECS` | no | `3600` | min 1 | `fetch-stale`: a fetch url pending this long; silent unless the fetcher is enabled |
 
@@ -419,24 +423,24 @@ per-collector spool (one `name:path` entry per collector, not per sensor) - see
 Each reads a strict subset of the unified daemon's variables with the same
 defaults and the same strict-parse/fail-closed rules unless noted.
 
-- **`console`** (`load_config_from_env`, `crates/console/src/main.rs:143`): `DATABASE_URL` (req),
+- **`console`** (`load_config_from_env`, `crates/console/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
   `PROPOLIS_CONSOLE_BIND`, `PROPOLIS_CONSOLE_PASSWORD` (req, empty→abort),
   `PROPOLIS_CONSOLE_SESSION_SECRET`, `PROPOLIS_FEED_OUTPUT_DIR`,
   `PROPOLIS_GEOIP_DIR`, `PROPOLIS_CONSOLE_RDNS_ENABLED`, `RUST_LOG`. Two
   divergences from the unified daemon: `PROPOLIS_FEED_OUTPUT_DIR` is **not**
-  empty-filtered (`main.rs:161`), so an explicitly-empty value becomes
+  empty-filtered (`console/src/main.rs#load_config_from_env`), so an explicitly-empty value becomes
   `Some(PathBuf::from(""))`; and `PROPOLIS_CONSOLE_RDNS_ENABLED` accepts
-  `true|1|yes` case-insensitive (`main.rs:166-168`), broader than `bool_flag`.
-- **`feed`** (`crates/feed/src/main.rs:182`): `DATABASE_URL` (req),
+  `true|1|yes` case-insensitive (`console/src/main.rs#load_config_from_env`), broader than `bool_flag`.
+- **`feed`** (`crates/feed/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
   `PROPOLIS_FEED_OUTPUT_DIR`, `PROPOLIS_FEED_BUILD_INTERVAL_SECS`,
   `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS`, `PROPOLIS_FEED_STANDARD_TTL_HOURS`,
   `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_DELIST`,
   `PROPOLIS_FEED_ASN_ALLOWLIST`, `PROPOLIS_GEOIP_DIR`. **Does not read
   `PROPOLIS_FEED_WINDOWS`** (no `all-{label}` retention feeds in standalone).
-- **`intake`** (`crates/intake/src/main.rs:155`): `DATABASE_URL` (req),
+- **`intake`** (`crates/intake/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
   `PROPOLIS_CURSOR_DIR`, `PROPOLIS_POLL_INTERVAL_MS`, `PROPOLIS_SENSOR_LOGS`
   (req, empty→abort).
-- **`review`** (`crates/review/src/main.rs:198`): `DATABASE_URL` (req),
+- **`review`** (`crates/review/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
   `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, `PROPOLIS_SUBMIT_POLL_INTERVAL_SECS`, and
   the full `PROPOLIS_VENDOR_*` set (`_KEY`/`_URL`/`_ENABLED`/`_COOLDOWN_HOURS`/
   `_RATE_LIMIT`/`_RATE_WINDOW_HOURS` for abuseipdb/dshield/otx plus
@@ -456,13 +460,13 @@ the bind address comes from config/env set by the deploy units. See
 Shared `ConnectionBounds` pattern via each crate's local
 `parse_positive_u64`/`parse_positive_u32`: unset → default; **present-but-zero or
 unparseable → abort startup** (no upper clamp - a very large timeout/bytes value
-is accepted). `parse_wan_map` (e.g. `sensor-ssh/src/main.rs:131`): comma-sep
+is accepted). `parse_wan_map` (e.g. `sensor-ssh/src/main.rs#parse_wan_map`): comma-sep
 `local_ip=wan_ip`; empty/absent → empty map (valid: no WAN attribution, stamps a
 null `wan_ip`); invalid entry → abort.
 
 | Sensor | Prefix `<P>` | Bind variable (required) | Log path default |
 |---|---|---|---|
-| ssh | `PROPOLIS_SSH_` | `PROPOLIS_SSH_BIND` (unset → abort, `main.rs:130`) | `/var/log/propolis/ssh/events.jsonl` |
+| ssh | `PROPOLIS_SSH_` | `PROPOLIS_SSH_BIND` (unset → abort, `sensor-ssh/src/main.rs#load_config_from_env`) | `/var/log/propolis/ssh/events.jsonl` |
 | telnet | `PROPOLIS_TELNET_` | `PROPOLIS_TELNET_BIND` | `/var/log/propolis/telnet/events.jsonl` |
 | http | `PROPOLIS_HTTP_` | `PROPOLIS_HTTP_BIND` | `/var/log/propolis/http/events.jsonl` |
 | ftp | `PROPOLIS_FTP_` | `PROPOLIS_FTP_BIND` | `/var/log/propolis/ftp/events.jsonl` |
@@ -545,23 +549,23 @@ divergence risk the bare catchall names above already caused once.
 
 Sensor-specific extras:
 - **ssh** (`crates/sensor-ssh/src/main.rs`): `PROPOLIS_SSH_HOST_KEY_PATH`
-  (default `/var/lib/propolis/ssh/host_key`, `:64`), `PROPOLIS_SSH_SPOOL_DIR`
-  (default `/var/spool/propolis/ssh`, `:63`), `PROPOLIS_SSH_BANNER` (default =
-  persona `OPENSSH_VERSION` = `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10`, `main.rs:60` +
-  `persona.rs:41`; blank → default), `PROPOLIS_SSH_OUTBOX_DIR` (default
+  (default `/var/lib/propolis/ssh/host_key`, `sensor-ssh/src/main.rs#DEFAULT_HOST_KEY_PATH`), `PROPOLIS_SSH_SPOOL_DIR`
+  (default `/var/spool/propolis/ssh`, `sensor-ssh/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_SSH_BANNER` (default =
+  persona `OPENSSH_VERSION` = `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10`, `sensor-ssh/src/main.rs#DEFAULT_BANNER` +
+  `sensor-framework/src/persona.rs#OPENSSH_VERSION`; unset → default, a set-but-blank value is sent as-is (`sensor-ssh/src/main.rs#load_config_from_env`)), `PROPOLIS_SSH_OUTBOX_DIR` (default
   `/var/spool/propolis/ssh/outbox`; see "Outbox manifest" below).
 - **ftp** (`crates/sensor-ftp/src/main.rs`): `PROPOLIS_FTP_SPOOL_DIR` (default
-  `/var/spool/propolis/ftp`, `:31`), `PROPOLIS_FTP_OUTBOX_DIR` (default
+  `/var/spool/propolis/ftp`, `sensor-ftp/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_FTP_OUTBOX_DIR` (default
   `/var/spool/propolis/ftp/outbox`; see "Outbox manifest" below).
 - **adb** (`crates/sensor-adb/src/main.rs`): `PROPOLIS_ADB_SPOOL_DIR` (default
-  `/var/spool/propolis/adb`, `:42`), `PROPOLIS_ADB_OUTBOX_DIR` (default
+  `/var/spool/propolis/adb`, `sensor-adb/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_ADB_OUTBOX_DIR` (default
   `/var/spool/propolis/adb/outbox`; see "Outbox manifest" below).
 - **telnet** (`crates/sensor-telnet/src/main.rs`): `PROPOLIS_TELNET_SPOOL_DIR`
   (default `/var/spool/propolis/telnet`), `PROPOLIS_TELNET_OUTBOX_DIR` (default
   `/var/spool/propolis/telnet/outbox`; see "Outbox manifest" below).
-- **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs:24`).
+- **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`).
 - **catchall**: no spool variable (never spools file bodies,
-  `crates/sensor-catchall/src/main.rs:78-81`); no
+  `crates/sensor-catchall/src/main.rs#Config`); no
   outbox variable either (captures no file bodies, so nothing for SP-B-1b's
   manifest to record).
 
@@ -582,8 +586,8 @@ read identically by each of those four sensors' `main.rs`:
 Invalid or zero bound → **silent default**, not abort.
 
 - **sensor-smtp** (`crates/sensor-smtp/src/main.rs`): `PROPOLIS_SMTP_BIND` (req;
-  unset → `exit(1)` `:47`, invalid → `exit(1)` `:54`), `PROPOLIS_SMTP_WAN_MAP`
-  (invalid entries silently skipped, `:16-26`), `PROPOLIS_SMTP_LOG_PATH` (default
+  unset → `exit(1)`, invalid → `exit(1)`, `sensor-smtp/src/main.rs#main`), `PROPOLIS_SMTP_WAN_MAP`
+  (invalid entries silently skipped, `sensor-smtp/src/main.rs#parse_wan_map`), `PROPOLIS_SMTP_LOG_PATH` (default
   `/var/log/propolis/smtp/events.jsonl`), `PROPOLIS_SMTP_READ_TIMEOUT_MS`
   (`30_000`), `PROPOLIS_SMTP_IDLE_TIMEOUT_MS` (`60_000`),
   `PROPOLIS_SMTP_MAX_DURATION_SECS` (`600`), `PROPOLIS_SMTP_MAX_CAPTURED_BYTES`
@@ -591,9 +595,9 @@ Invalid or zero bound → **silent default**, not abort.
 - **sensor-cred** (`crates/sensor-cred/src/main.rs`): multi-protocol
   (VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Bind variables `PROPOLIS_CRED_VNC_BIND`,
   `PROPOLIS_CRED_MYSQL_BIND`, `PROPOLIS_CRED_MSSQL_BIND`, `PROPOLIS_CRED_PG_BIND`,
-  `PROPOLIS_CRED_MONGO_BIND` (`main.rs:77-81`). At
-  least one required - none set → `exit(1)` (`:93-98`); a set-but-invalid bind →
-  `exit(1)` (`:87-88`); all-configured-fail-to-bind → `exit(1)` (`:122-125`).
+  `PROPOLIS_CRED_MONGO_BIND` (`sensor-cred/src/main.rs#main`). At
+  least one required - none set → `exit(1)` (`sensor-cred/src/main.rs#main`); a set-but-invalid bind →
+  `exit(1)` (`sensor-cred/src/main.rs#main`); all-configured-fail-to-bind → `exit(1)` (`sensor-cred/src/main.rs#main`).
   `PROPOLIS_CRED_WAN_MAP` (invalid skipped), `PROPOLIS_CRED_LOG_DIR` (default
   `/var/log/propolis/cred`, per-protocol file `<protocol>.jsonl`). Bounds:
   `PROPOLIS_CRED_READ_TIMEOUT_MS` (`30_000`), `PROPOLIS_CRED_IDLE_TIMEOUT_MS` (`60_000`),
@@ -606,17 +610,17 @@ Invalid or zero bound → **silent default**, not abort.
 ## Interactions
 
 - **VT enable requires both**: `PROPOLIS_VT_ENABLED=true` **and** a non-empty
-  `PROPOLIS_VT_KEY` (`config.rs:613`). Either missing → VT off.
+  `PROPOLIS_VT_KEY` (`crates/propolis/src/config.rs#load_config`). Either missing → VT off.
 - **Vendor enable requires key**: `PROPOLIS_VENDOR_<V>_ENABLED=true` with an
-  empty `_KEY` → forced disabled and warns (`config.rs:486-493`, review
-  `main.rs:148-156`).
+  empty `_KEY` → forced disabled and warns (`crates/propolis/src/config.rs#load_vendor_config`, review
+  `review/src/main.rs#load_vendor_config`).
 - **DShield user+key composition**: `PROPOLIS_VENDOR_DSHIELD_USER` +
   `PROPOLIS_VENDOR_DSHIELD_KEY` compose to `{user}:{key}` in the single key slot
-  (`config.rs:551-554`). User alone is ignored.
+  (`crates/propolis/src/config.rs#load_config`). User alone is ignored.
 - **ASN suppression needs GeoIP**: `PROPOLIS_FEED_ASN_ALLOWLIST` is inert unless
   `PROPOLIS_GEOIP_DIR` is set and the GeoLite2-ASN DB loads. The unified daemon
-  warns when the ASN allowlist is set but `GEOIP_DIR` is unset (`main.rs:856-858`) or
-  the ASN DB failed to load (`main.rs:862-865`).
+  warns when the ASN allowlist is set but `GEOIP_DIR` is unset (`propolis/src/main.rs#main`) or
+  the ASN DB failed to load (`propolis/src/main.rs#main`).
 - **Fetcher SSRF guard vs OWN_IPS**: `PROPOLIS_FETCH_OWN_IPS` unions with live
   interface IPs; an empty union → the fetcher refuses to run; a union without any
   public address → warn-only.

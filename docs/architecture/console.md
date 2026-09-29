@@ -26,11 +26,11 @@ This page describes the architecture, not the exact values.
 
 Two binaries construct the same `AppState`: the standalone `console` binary
 (`crates/console/src/main.rs`) and the unified `propolis` daemon
-(`propolis::run_console`, `crates/propolis/src/main.rs:427-524`). The standalone
+(`propolis::run_console`, `crates/propolis/src/main.rs#run_console`). The standalone
 `main.rs` is the fully verified construction path; the unified daemon wires the
 same router.
 
-`router(state)` (`routes/mod.rs:53-78`) builds two route groups:
+`router(state)` (`crates/console/src/routes/mod.rs#router`) builds two route groups:
 
 - **Public group** - `health`, `ready`, `metrics`, `login`, `logout`, and the two
   asset routes (`/assets/fonts/{file}`, `/assets/{file}`), mounted **outside** the
@@ -90,7 +90,7 @@ architecture in brief:
 
 ## Security headers
 
-`security_headers` middleware is applied globally (`routes/mod.rs:76`) and sets three
+`security_headers` middleware is applied globally (`crates/console/src/routes/mod.rs#router`) and sets three
 headers on **every** response, public and protected alike:
 
 - `X-Frame-Options: DENY`

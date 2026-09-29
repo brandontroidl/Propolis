@@ -35,7 +35,8 @@ There is a second, dev/testing-only way to run the platform: the four standalone
 service binaries `intake`, `review`, `feed`, and `console` as separate units
 (`deploy/intake.service`, `deploy/review.service`, `deploy/feed.service`,
 `deploy/console.service`). These are **superseded by `propolis.service` in
-production and are not installed by `install.sh`** (`deploy/install.sh:14-17`).
+production and are not installed by `install.sh`**
+(`deploy/install.sh#deliberately NOT installed here`).
 They remain in the repo for development only; do not deploy them as the
 production surface.
 
@@ -43,7 +44,8 @@ production surface.
 
 Multiple nodes can share one PostgreSQL database: scoring aggregates in the
 shared DB, and review/feed are designed to be idempotent so more than one node
-can run them against the same data (`docs/archive/2026-08-26/root/INSTALL.md:364-376`).
+can run them against the same data
+(`docs/archive/2026-08-26/root/INSTALL.md#Multi-node deployment`).
 
 What is enforced in code and tested with two independent connection pools:
 
@@ -63,9 +65,10 @@ validate feed behaviour in your own environment before relying on it.
 ## Hardware and OS assumptions
 
 - **OS:** Linux with systemd. The unit files use systemd `>= 244` directives
-  (`NoExecPaths=`, `deploy/propolis.service:163-166`); every currently-supported
+  (`NoExecPaths=`, `deploy/propolis.service#NoExecPaths=`); every currently-supported
   distro ships well past that.
-- **PostgreSQL:** version 15+ is the `INSTALL.md` claim (`docs/archive/2026-08-26/root/INSTALL.md:9`; the live `INSTALL.md` is now a redirect stub). The
+- **PostgreSQL:** version 15+ is the `INSTALL.md` claim
+  (`docs/archive/2026-08-26/root/INSTALL.md#Prerequisites`; the live `INSTALL.md` is now a redirect stub). The
   binary connects via `DATABASE_URL` and runs its own migrations at startup; no
   DB-version check exists in the code [inferred from the absence of a version
   gate], so "15+" is an operator requirement, not an enforced one.
@@ -74,7 +77,9 @@ validate feed behaviour in your own environment before relying on it.
   [../development/toolchain-and-environment.md](../development/toolchain-and-environment.md).
 - **Resource envelope:** the unified daemon unit caps at `MemoryMax=1G`,
   `TasksMax=256`, `CPUQuota=100%`, `LimitNOFILE=4096`
-  (`deploy/propolis.service:176-179`) - the highest in the deploy set, since one
+  (`deploy/propolis.service#MemoryMax=1G`, `deploy/propolis.service#TasksMax=256`,
+  `deploy/propolis.service#CPUQuota=100%`, `deploy/propolis.service#LimitNOFILE=4096`) - the highest
+  in the deploy set, since one
   process holds all four subsystems. Per-sensor caps are lower (256M–512M). See
   [capacity-planning.md](capacity-planning.md).
 

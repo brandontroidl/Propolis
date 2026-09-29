@@ -32,7 +32,7 @@ tables, ports, routes, and constants are owned by the
 
 ## Crates
 
-24 workspace members (`Cargo.toml:3-28`). Full component inventory with binaries and dependency edges lives in [`architecture/components`](../architecture/components.md); the summary by concern:
+24 workspace members (`Cargo.toml#members`). Full component inventory with binaries and dependency edges lives in [`architecture/components`](../architecture/components.md); the summary by concern:
 
 **Foundation libraries (no internal deps):**
 - `core-scoring` - event ledger, chain-hashing, scoring, blocklist eligibility; owns the core DB migrations (`crates/core-scoring/migrations/`).

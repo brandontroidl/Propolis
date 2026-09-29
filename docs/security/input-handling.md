@@ -25,12 +25,12 @@ log-injection class: an uncompromised sensor talked into emitting a **forged sec
 line** via an unescaped CR/LF, terminal escape, or bidirectional override in captured
 evidence.
 
-`sanitize_value(input, max_len)` runs a **load-bearing fixed order** (`sanitize.rs:22-27`):
+`sanitize_value(input, max_len)` runs a **load-bearing fixed order** (`crates/sensor-framework/src/sanitize.rs#sanitize_value`):
 
 1. **Collapse** each run of CR / LF / tab / VT / FF to a single space - runs **first**,
    against the raw input. Order matters: stripping controls first could remove a character
    adjacent to a bare CR or LF and leave it standing, forging the record anyway
-   (module doc, `sanitize.rs:7-10,38-45`).
+   (`crates/sensor-framework/src/sanitize.rs`, `crates/sensor-framework/src/sanitize.rs#collapse_line_breaking_whitespace`).
 2. **Strip** ANSI CSI escapes; C0 (`0x00-0x1F`, `0x7F`) and C1 (`0x80-0x9F`) controls;
    line/paragraph separators (`0x2028`/`0x2029`); bidirectional overrides and isolates;
    zero-width / BOM / word-joiner / invisible-math characters; and the Unicode tag block
@@ -54,9 +54,9 @@ Supporting properties:
 each sensor must remember:
 
 - The framework enforces it for captured filenames: `orig_name` is sanitized in the capture
-  worker's `process_job` (`handoff.rs:324-325`), which is the only sensor-side
+  worker's `process_job` (`crates/sensor-framework/src/handoff.rs#process_job`), which is the only sensor-side
   caller of `spool.store` (the review fetcher's call,
-  `crates/review/src/fetcher/mod.rs:410`, discards the returned ref and never
+  `crates/review/src/fetcher/mod.rs#record_success`, discards the returned ref and never
   sets `orig_name`); `spool.store`
   itself always returns an empty `orig_name` (`spool.rs`), so a sensor cannot route an
   unsanitized filename around the chokepoint (test
@@ -73,7 +73,7 @@ argument values, not query text).
 
 - The **event insert** is fully parameterized: `INSERT INTO event ... VALUES ($1::inet,
   $2::inet, $3, ... $14) RETURNING id` via `sqlx::query_scalar` with bound params
-  (`insert_chained`, `crates/core-scoring/src/repository/events.rs:316-350`). The advisory lock guarding the
+  (`crates/core-scoring/src/repository/events.rs#insert_chained`). The advisory lock guarding the
   hash chain is parameterized too (`pg_advisory_xact_lock($1)`).
 - Feed builder, review CLI, and VirusTotal writes all use `$`-placeholders or static SQL.
 - The repository module deliberately uses the runtime `sqlx::query*` API with bound values,
@@ -96,7 +96,7 @@ Tables, enums, and migrations: [../reference/database.md](../reference/database.
 Attacker input cannot drive unbounded resource use:
 
 - **Every sanitized field is length-capped** at its call site via `sanitize_value`'s
-  `max_len` (for example the SSH auth username in `handle_userauth`, `auth.rs:164-167`), and byte-derived fields are
+  `max_len` (for example the SSH auth username in `crates/sensor-ssh/src/auth.rs#handle_userauth`), and byte-derived fields are
   hex-bounded.
 - **Captured samples are size-bounded twice:** a per-file cap (`FileSizeExceeded`) and a
   **global byte budget** with an atomic check-and-reserve, recovered from disk on restart. A

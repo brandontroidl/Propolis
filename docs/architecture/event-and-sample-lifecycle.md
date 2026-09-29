@@ -34,22 +34,22 @@ flowchart TD
 1. **Capture.** A sensor handler sanitizes every attacker string, builds a
    `SensorEvent` carrying raw facts only (no score), and calls
    `EventEmitter::append`, which writes exactly one NDJSON line to the sensor's log
-   with `O_APPEND` (`crates/sensor-framework/src/emit.rs:45-68`). See
+   with `O_APPEND` (`crates/sensor-framework/src/emit.rs#append`). See
    [`sensors.md`](sensors.md).
 2. **Wire record.** The line conforms to the frozen `SensorEvent` schema
-   (`crates/sensor-wire/src/lib.rs:39-61`, `WIRE_VERSION = 1`). `signal_type` and
+   (`crates/sensor-wire/src/lib.rs#SensorEvent`, `WIRE_VERSION = 1`). `signal_type` and
    `protocol` are plain strings on the wire so `sensor-wire` carries no scoring
    dependency; the record contains no `\n`/`\r` (NDJSON invariant). Field detail is
    owned by [`reference/events-and-signals.md`](../reference/events-and-signals.md).
 3. **Intake.** The intake tailer consumes each NDJSON record and validates its
    `signal_type`/`protocol` against the known set. `EventInput::from_signal` derives
    `weight`, `confidence`, and `category` from the single-source-of-truth weight
-   table (`crates/core-scoring/src/domain/weights.rs:11-41`) so a sensor never
+   table (`crates/core-scoring/src/domain/weights.rs#signal_weight`) so a sensor never
    computes them. Weights and the derivation are owned by
    [`reference/events-and-signals.md`](../reference/events-and-signals.md).
 4. **Hash-chained ledger.** Each row's hash is
    `SHA-256(prev_hash ‖ canonical_bytes(event))`
-   (`crates/core-scoring/src/hashing.rs:131-136`). `canonical_bytes` writes a
+   (`crates/core-scoring/src/hashing.rs#chain_hash`). `canonical_bytes` writes a
    **frozen field order with length-prefixed framing** - it deliberately does not
    serialize the whole struct, and a golden vector pins the encoding. Any change to a
    hashed field, or any reorder/insertion, breaks the chain from that event forward.
@@ -63,7 +63,7 @@ flowchart TD
 5. **Scoring projection.** `apply_event` is a pure fold: it decays prior per-IP state
    to the event's `observed_at`, adds this event's weight, and recomputes all derived
    gate flags into the `ip_score` aggregate
-   (`crates/core-scoring/src/scoring/engine.rs:56-173`). Reads use `project_to_now`,
+   (`crates/core-scoring/src/scoring/engine.rs#apply_event`). Reads use `project_to_now`,
    which decays to the wall clock without persisting (guarding against double-decay).
    How raw score becomes a tier, a recommendation, and a feed entry is the subject of
    [`pipeline.md`](pipeline.md); the constants are owned by
@@ -71,7 +71,7 @@ flowchart TD
 
 `session_id` correlates one sensor session's events (one SSH connection's logins,
 execs, and transfers) and is **not** part of the hash chain, so adding it never
-disturbs prior hashes (`crates/core-scoring/src/hashing.rs:105` - not hashed).
+disturbs prior hashes (`crates/core-scoring/src/hashing.rs#canonical_bytes` - not hashed).
 
 ## Sample lifecycle
 
@@ -94,21 +94,21 @@ flowchart TD
 1. **Off-path hand-off.** The handler builds a `CaptureJob` and `submit`s it; `submit`
    is backed by `mpsc::try_send` and never blocks the connection's reply - a full
    queue drops the job and increments a counter
-   (`crates/sensor-framework/src/handoff.rs:225-241`). This keeps response latency
+   (`crates/sensor-framework/src/handoff.rs#submit`). This keeps response latency
    from leaking whether a capture happened.
 2. **Sequential worker + spool.** A single worker drains the queue and stores each
    body under its **SHA-256 filename** (never the attacker name), `0640`, with a
    per-file size cap (10 MB) and a global byte budget (100 MB) reserved atomically;
    the capture hand-off never calls the store concurrently, and a body gets its digest
-   name only once it is complete (`handoff.rs:272-391`, `sensor-framework/src/spool.rs#store`, `sensor-framework/src/spool.rs#publish`). The emitted event carries a
+   name only once it is complete (`crates/sensor-framework/src/handoff.rs#start_worker`, `crates/sensor-framework/src/handoff.rs#process_job`, `crates/sensor-framework/src/spool.rs#store`, `crates/sensor-framework/src/spool.rs#publish`). The emitted event carries a
    `SampleRef { sha256, size, orig_name }` where `orig_name` is a sanitized indicator
    only, never a path component. See
    [`security/malware-custody.md`](../security/malware-custody.md).
-3. **Enrichment.** VirusTotal scanning (`scan_spool`, `crates/review/src/virustotal.rs:171-268`)
+3. **Enrichment.** VirusTotal scanning (`crates/review/src/virustotal.rs#scan_spool`)
    walks the spool directories, filters to 64-hex SHA-256 filenames
-   (`review::spool::list_samples`, `crates/review/src/spool.rs:34-55`), and looks up each new
-   sample's hash, writing a verdict to `sample_analysis` (`store_result`,
-   `crates/review/src/virustotal.rs:388-403`). A hash lookup
+   (`crates/review/src/spool.rs#list_samples`), and looks up each new
+   sample's hash, writing a verdict to `sample_analysis`
+   (`crates/review/src/virustotal.rs#store_result`). A hash lookup
    sends only the hash. **Uploading an unknown sample body off-box is opt-in
    (`PROPOLIS_VT_UPLOAD`, default off).** The daily-budget cap and wiring are owned by
    [`reference/integrations.md`](../reference/integrations.md) and
@@ -123,7 +123,7 @@ flowchart TD
 The human gate on **reporting** - surfacing an IP for vendor abuse submission - is the
 review queue, covered in [`pipeline.md`](pipeline.md). Sample bodies themselves are
 never sent to abuse vendors; a vendor report carries only the source IP, categories,
-and an evidence window (`crates/review/src/vendor/mod.rs:29-35`).
+and an evidence window (`crates/review/src/vendor/mod.rs#VendorReport`).
 
 ## Where each fact is owned
 

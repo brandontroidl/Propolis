@@ -18,7 +18,7 @@ enums, and migration list are owned by
 
 Phase 2 of daemon startup connects the pool; on failure it logs
 `propolis: failed to connect to PostgreSQL` and exits 1
-(`crates/propolis/src/main.rs:652-663`). Check, in order:
+(`crates/propolis/src/main.rs#main`). Check, in order:
 
 1. `DATABASE_URL` is correct and reachable - host, port, database name, and the
    inline password. Test independently: `psql "$DATABASE_URL" -c 'SELECT 1'` as
@@ -39,9 +39,9 @@ Phase 2 of daemon startup connects the pool; on failure it logs
 
 Phase 3 runs three independent migration histories against the same database:
 core-scoring migrations, then review, then fleet
-(`crates/propolis/src/main.rs:665-680`). The review and fleet histories are each
+(`crates/propolis/src/main.rs#main`). The review and fleet histories are each
 tracked in their own table (`_sqlx_migrations_review`,
-`crates/review/src/lib.rs:45-49`; `_sqlx_migrations_fleet`, `crates/fleet/src/lib.rs:33-36`)
+`crates/review/src/lib.rs#migrator`; `_sqlx_migrations_fleet`, `crates/fleet/src/lib.rs#migrator`)
 so the three do not collide. Failure logs `core-scoring migrations
 failed`, `review migrations failed`, or `fleet migrations failed` and exits 1.
 
@@ -65,10 +65,10 @@ to invoke.
 `GET /ready` is fail-closed: it runs `SELECT 1` against the pool, then checks
 whether any supervised subsystem has given up, and returns
 `200 {"status":"ok"}` only when both pass
-(`ready`, `crates/console/src/routes/health.rs:26-54`). Any DB error - closed
+(`crates/console/src/routes/health.rs#ready`). Any DB error - closed
 pool, network error, timeout - returns `503 {"status":"unavailable"}`
-(`health.rs:33-40`). A subsystem that has exhausted its restarts returns
-`503 {"status":"unavailable","gave_up":[...]}` (`health.rs:41-52`). A 503
+(`crates/console/src/routes/health.rs#ready`). A subsystem that has exhausted its restarts returns
+`503 {"status":"unavailable","gave_up":[...]}` (`crates/console/src/routes/health.rs#ready`). A 503
 therefore means the console process is alive but either cannot reach the
 database or has a dead subsystem; a `gave_up` field in the body tells the two
 apart. Distinguish from liveness:
@@ -87,15 +87,15 @@ error. See [Health and observability](../operations/health-and-observability.md)
 The `event` ledger is append-only and hash-chained. The console integrity page
 (`GET /integrity`, `POST /integrity/verify`) runs `core_scoring::verify_chain`
 over the ledger and reports intact or broken
-(`run_verify`, `crates/console/src/routes/integrity.rs:57-74`). The POST changes no
+(`crates/console/src/routes/integrity.rs#run_verify`). The POST changes no
 state, but it still requires the session's CSRF token like every other console POST
-(`integrity.rs:54-65`).
+(`crates/console/src/routes/integrity.rs#run_verify`).
 
 A **broken** result means a stored event's hash does not chain to its
 predecessor. This indicates the `event` table was modified out of band - direct `UPDATE`/`DELETE` on `event`, a restore that mixed rows from different
 points in time, or storage corruption. Investigate before trusting downstream
 scores. Note that the console's own delete actions (`delist`,
-`crates/console/src/routes/queue.rs:475-502`; `delete_ip`, `queue.rs:566-606`)
+`crates/console/src/routes/queue.rs#delist`; `delete_ip`, `crates/console/src/routes/queue.rs#delete_ip`)
 **never touch the `event` ledger** - they only touch projection rows
 (`delist` deletes the `review_queue` row and latches `ip_score` as delisted;
 `delete_ip` deletes the `review_queue`, `vendor_submission` and `ip_score` rows),

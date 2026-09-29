@@ -24,33 +24,35 @@ by [events-and-signals.md](events-and-signals.md).
 A source IP's score is a decaying, capped accumulation of signal weights.
 `apply_event` is a pure fold: it decays prior state to the new event's
 `observed_at`, adds the event's weight (unless deduped), and recomputes all
-derived flags (`crates/core-scoring/src/scoring/engine.rs:56-173`).
+derived flags (`crates/core-scoring/src/scoring/engine.rs#apply_event`).
 
-### Constants (`crates/core-scoring/src/scoring/constants.rs`)
+### Constants
+
+Defined in `crates/core-scoring/src/scoring/constants.rs`.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `HALF_LIFE_SECONDS` | 21600 (6 h) | Decay half-life for raw score and per-category weight (`constants.rs:5`) |
-| `DEDUP_WINDOW_SECONDS` | 60 | A repeat `(source_ip, signal_type)` within 60 s records the event but adds no weight (`constants.rs:10`) |
-| `SCORE_CAP` | 100 | Clamp ceiling for raw and effective score (`constants.rs:13`) |
-| `BREADTH_PER_WAN` | 0.15 | Breadth-factor increment per extra distinct WAN vantage (`constants.rs:16`) |
-| `BREADTH_CAP` | 0.60 | Max breadth bonus; factor saturates at 1.60 (`constants.rs:19`) |
-| `BLOCKLIST_FLOOR` | 50 | Minimum effective score for blocklist recommendation (`constants.rs:22`) |
-| `PERSIST_PER_DAY` | 0.55 | Persistence bonus points per active day beyond grace (`constants.rs:34`) |
-| `PERSIST_GRACE_DAYS` | 2 | Active days that earn no persistence bonus (`constants.rs:38`) |
-| `PERSIST_CAP` | 60 | Max persistence bonus in points (`constants.rs:41`) |
-| `VOLUME_LIST_THRESHOLD` | 1000 | Cumulative established `event_count` for volume-blocklisting (`constants.rs:51`) |
-| `VOLUME_LIST_WINDOW_SECONDS` | 86400 (24 h) | Recency gate for volume-blocklisting (`constants.rs:52`) |
-| `LIVE_FLOOR` | 0.5 | A category contributes to `distinct_categories` / `max_confidence` only while its decayed weight is strictly `> 0.5` (`engine.rs:45`) |
+| `HALF_LIFE_SECONDS` | 21600 (6 h) | Decay half-life for raw score and per-category weight (`crates/core-scoring/src/scoring/constants.rs#HALF_LIFE_SECONDS`) |
+| `DEDUP_WINDOW_SECONDS` | 60 | A repeat `(source_ip, signal_type)` within 60 s records the event but adds no weight (`crates/core-scoring/src/scoring/constants.rs#DEDUP_WINDOW_SECONDS`) |
+| `SCORE_CAP` | 100 | Clamp ceiling for raw and effective score (`crates/core-scoring/src/scoring/constants.rs#SCORE_CAP`) |
+| `BREADTH_PER_WAN` | 0.15 | Breadth-factor increment per extra distinct WAN vantage (`crates/core-scoring/src/scoring/constants.rs#BREADTH_PER_WAN`) |
+| `BREADTH_CAP` | 0.60 | Max breadth bonus; factor saturates at 1.60 (`crates/core-scoring/src/scoring/constants.rs#BREADTH_CAP`) |
+| `BLOCKLIST_FLOOR` | 50 | Minimum effective score for blocklist recommendation (`crates/core-scoring/src/scoring/constants.rs#BLOCKLIST_FLOOR`) |
+| `PERSIST_PER_DAY` | 0.55 | Persistence bonus points per active day beyond grace (`crates/core-scoring/src/scoring/constants.rs#PERSIST_PER_DAY`) |
+| `PERSIST_GRACE_DAYS` | 2 | Active days that earn no persistence bonus (`crates/core-scoring/src/scoring/constants.rs#PERSIST_GRACE_DAYS`) |
+| `PERSIST_CAP` | 60 | Max persistence bonus in points (`crates/core-scoring/src/scoring/constants.rs#PERSIST_CAP`) |
+| `VOLUME_LIST_THRESHOLD` | 1000 | Cumulative established `event_count` for volume-blocklisting (`crates/core-scoring/src/scoring/constants.rs#VOLUME_LIST_THRESHOLD`) |
+| `VOLUME_LIST_WINDOW_SECONDS` | 86400 (24 h) | Recency gate for volume-blocklisting (`crates/core-scoring/src/scoring/constants.rs#VOLUME_LIST_WINDOW_SECONDS`) |
+| `LIVE_FLOOR` | 0.5 | A category contributes to `distinct_categories` / `max_confidence` only while its decayed weight is strictly `> 0.5` (`crates/core-scoring/src/scoring/engine.rs#LIVE_FLOOR`) |
 
 ### Decay
 
 `factor = 0.5 ^ (elapsed_seconds / HALF_LIFE_SECONDS)`. Non-positive elapsed
 returns the prior state unchanged (clock-skew clamp; decay only shrinks)
-(`crates/core-scoring/src/scoring/decay.rs:13-20`). On add,
-`new_raw = min(SCORE_CAP, decayed_raw + weight)` (`engine.rs:141`).
+(`crates/core-scoring/src/scoring/decay.rs#decay`). On add,
+`new_raw = min(SCORE_CAP, decayed_raw + weight)` (`crates/core-scoring/src/scoring/engine.rs#apply_event`).
 `max_confidence` per category is a running MAX and does not decay
-(`engine.rs:133-140`).
+(`crates/core-scoring/src/scoring/engine.rs#apply_event`).
 
 ### Breadth multiplier
 
@@ -60,16 +62,18 @@ effective_score(raw, n) = min(SCORE_CAP, raw * breadth_factor(n))
 ```
 
 `breadth_factor(0) = breadth_factor(1) = 1.00`; it saturates at 1.60 for
-`n >= 5` (`crates/core-scoring/src/scoring/breadth.rs:66-95`).
+`n >= 5` (`crates/core-scoring/src/scoring/breadth.rs#breadth_factor`).
 
 The distinct WAN count is hardened: only vantages with
 `saw_authenticated_tcp == true` are counted, and vantages dedup by /24 (IPv4) or
 /64 (IPv6) prefix before counting - a spoofed source cannot complete an
 authenticated TCP handshake, and same-prefix vantages are treated as one
-operator block (`breadth.rs:9-57`). ASN-based dedup is a documented deferred
-extension, not shipped `[planned]` (`breadth.rs:24-28`). The engine does not
+operator block (`crates/core-scoring/src/scoring/breadth.rs#distinct_wan_count`,
+`crates/core-scoring/src/scoring/breadth.rs#WanVantage`,
+`crates/core-scoring/src/scoring/breadth.rs#dedupe_prefix`). ASN-based dedup is a documented deferred
+extension, not shipped `[planned]` (`crates/core-scoring/src/scoring/breadth.rs#dedupe_prefix`). The engine does not
 recompute breadth; `distinct_wan_count` is supplied by the repository and
-threaded through verbatim (`engine.rs:52-55,164-165`).
+threaded through verbatim (`crates/core-scoring/src/scoring/engine.rs#apply_event`).
 
 The WAN vantage data feeds only this internal multiplier. It is never placed in
 any vendor report - see [integrations.md](integrations.md#what-is-never-sent).
@@ -81,24 +85,24 @@ persistence_points(active_days) = min(PERSIST_CAP, PERSIST_PER_DAY * max(0, acti
 ```
 
 `active_days` is an unbounded, non-decaying count of distinct UTC calendar days
-seen (`engine.rs:116-127`). The bonus is 0 up to and including 2 days, then
+seen (`crates/core-scoring/src/scoring/engine.rs#apply_event`). The bonus is 0 up to and including 2 days, then
 linear at 0.55/day, saturating at 60 points
-(`crates/core-scoring/src/scoring/persistence.rs:21-24`).
+(`crates/core-scoring/src/scoring/persistence.rs#persistence_points`).
 
 The bonus is applied only to a gate-facing score, never the stored raw:
 `gated_raw = min(SCORE_CAP, raw_score + persistence_points(active_days))`
-(`engine.rs:217-220`). The stored `raw_score` stays the decayed accumulation so
+(`crates/core-scoring/src/scoring/engine.rs#derive_projection`). The stored `raw_score` stays the decayed accumulation so
 the next decay cannot double-count the bonus. Confidence and eligibility gates
 still apply, so a persistent low-confidence scanner is lifted but never promoted
-(`engine.rs:214-216`).
+(`crates/core-scoring/src/scoring/engine.rs#derive_projection`).
 
 Calibration documented in code: a once-a-day command-exec source (base ~60)
 reaches STANDARD (75) at ~30 active days and AGGRESSIVE (90) at ~60
-(`constants.rs:31-33`).
+(`crates/core-scoring/src/scoring/constants.rs#PERSIST_PER_DAY`).
 
 ## Tier
 
-`tier(raw_score, max_confidence)` (`crates/core-scoring/src/scoring/tier.rs:9-19`),
+`tier(raw_score, max_confidence)` (`crates/core-scoring/src/scoring/tier.rs#tier`),
 evaluated aggressive-first with inclusive (`>=`) floors:
 
 | Tier | Requires |
@@ -107,13 +111,13 @@ evaluated aggressive-first with inclusive (`>=`) floors:
 | Standard | `raw_score >= 75` AND `max_confidence >= 0.70` |
 | (none) | otherwise |
 
-The `FeedTier` enum has only `Aggressive` and `Standard` (`enums.rs:48-51`).
+The `FeedTier` enum has only `Aggressive` and `Standard` (`crates/core-scoring/src/domain/enums.rs#FeedTier`).
 
 Tier runs on the **gated raw** (base + persistence), NOT the breadth-multiplied
-effective score: `tier(gated_raw, max_confidence)` (`engine.rs:222`).
+effective score: `tier(gated_raw, max_confidence)` (`crates/core-scoring/src/scoring/engine.rs#derive_projection`).
 `max_confidence` is live-decayed - only categories whose decayed weight is
 `> LIVE_FLOOR (0.5)` contribute; an empty breakdown yields 0, fail-closed
-(`engine.rs:196-204`).
+(`crates/core-scoring/src/scoring/engine.rs#derive_projection`).
 
 ## Eligibility latch
 
@@ -122,7 +126,7 @@ eligible(has_confirmed_real, event_count, _distinct_categories, delisted)
     = !delisted && has_confirmed_real && event_count >= 2
 ```
 
-(`crates/core-scoring/src/scoring/eligibility.rs:1-8`). The
+(`crates/core-scoring/src/scoring/eligibility.rs#eligible`). The
 `distinct_categories` argument is ignored (leading underscore): the older
 two-category gate was dropped 2026-08-19 (migration `0006_relax_eligibility.sql`).
 Eligibility takes no score input, so a decayed score can never revoke it; it is
@@ -131,71 +135,71 @@ sticky until an explicit delist.
 ### Confirmed-real gate
 
 `is_confirmed_real(protocol, authenticated, category) = (protocol == Tcp) && authenticated && (category == Honeypot)`
-(`crates/core-scoring/src/domain/enums.rs:134-136`). The latch is sticky:
+(`crates/core-scoring/src/domain/enums.rs#is_confirmed_real`). The latch is sticky:
 `has_confirmed_real = prev || is_confirmed_real(...)` - once set, never unset
-(`engine.rs:145-146`). UDP/ICMP and unauthenticated or non-honeypot traffic
+(`crates/core-scoring/src/scoring/engine.rs#apply_event`). UDP/ICMP and unauthenticated or non-honeypot traffic
 never latch it.
 
 ## Recommendation gates
 
 Derived in `derive_projection`, the single source of truth shared by
-`apply_event` (write) and `project_to_now` (read) (`engine.rs:175-300`).
+`apply_event` (write) and `project_to_now` (read) (`crates/core-scoring/src/scoring/engine.rs#derive_projection`).
 
 | Gate | Rule | Source |
 |---|---|---|
-| `recommended_for_vendor` | `eligible && tier.is_some()` | `tier.rs:21-23` |
-| `recommended_for_blocklist` | `eligible && effective_score >= 50` **OR** the volume path below | `tier.rs:25-27`, `engine.rs:231-236` |
-| `recommended_by_volume` | `!delisted && established_event_count >= 1000 && seconds_since_last_seen <= 86400` | `tier.rs:34-42` |
+| `recommended_for_vendor` | `eligible && tier.is_some()` | `crates/core-scoring/src/scoring/tier.rs#recommended_for_vendor` |
+| `recommended_for_blocklist` | `eligible && effective_score >= 50` **OR** the volume path below | `crates/core-scoring/src/scoring/tier.rs#recommended_for_blocklist`, `crates/core-scoring/src/scoring/engine.rs#derive_projection` |
+| `recommended_by_volume` | `!delisted && established_event_count >= 1000 && seconds_since_last_seen <= 86400` | `crates/core-scoring/src/scoring/tier.rs#recommended_by_volume` |
 
 The volume path is independent of confirmed-real and score. It counts ONLY
 `established_event_count` (completed-TCP events: `prev + (protocol == Tcp)`,
-`engine.rs:152-153`), so a spoofed UDP/ICMP flood cannot volume-list an innocent
+`crates/core-scoring/src/scoring/engine.rs#apply_event`), so a spoofed UDP/ICMP flood cannot volume-list an innocent
 third party. Vendor reporting always gates on `recommended_for_vendor`
 (confirmed-real), so a bare flood is blocked locally but never reported upstream
-(`engine.rs:223-229`).
+(`crates/core-scoring/src/scoring/engine.rs#derive_projection`).
 
 ## Feed membership and retention
 
 Owned by the feed builder (`crates/feed/src/builder.rs`). Membership is decided
 by RETENTION windows, not a live-decayed score. All fields are read as stored (as
 of the IP's last event), so a tier cannot slide between builds
-(`builder.rs:110-153`).
+(`crates/feed/src/builder.rs#Candidate`, `crates/feed/src/builder.rs#build`).
 
 ### Candidate sources
 
 - **Tier candidates** (aggressive / standard files) require operator approval:
   `s.recommended_for_blocklist = true AND s.eligible = true AND q.state = 'approved' AND s.tier IS NOT NULL`
-  (`builder.rs:168-179`). See the [review queue](../architecture/pipeline.md).
+  (`crates/feed/src/builder.rs#build`). See the [review queue](../architecture/pipeline.md).
 - **Volume candidates** are auto-published (no approval):
   `s.recommended_for_blocklist = true AND s.eligible = false` (tier = none). They
   land ONLY in retention windows, never the tier files
-  (`builder.rs:219-234,263-268`).
+  (`crates/feed/src/builder.rs#build`).
 
 ### TTLs and windows
 
 | Setting | Default | Env var | Source |
 |---|---|---|---|
-| Aggressive tier TTL | 24 h | `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` | `config.rs:23,581-584` |
-| Standard tier TTL | 48 h | `PROPOLIS_FEED_STANDARD_TTL_HOURS` | `config.rs:24` |
-| Retention windows | `24h,7d,30d,60d,90d` | `PROPOLIS_FEED_WINDOWS` | `config.rs:29,596-598` |
-| Build interval | 15 min (900 s) | `PROPOLIS_FEED_BUILD_INTERVAL_SECS` | `config.rs:22` |
-| Feed enabled | true | `PROPOLIS_FEED_ENABLED` | `config.rs:564` |
-| Output dir | `/var/lib/propolis/feed/current` | (config) | `config.rs:21` |
+| Aggressive tier TTL | 24 h | `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` | `crates/propolis/src/config.rs#DEFAULT_AGGRESSIVE_TTL_HOURS`, `crates/propolis/src/config.rs#load_config` |
+| Standard tier TTL | 48 h | `PROPOLIS_FEED_STANDARD_TTL_HOURS` | `crates/propolis/src/config.rs#DEFAULT_STANDARD_TTL_HOURS` |
+| Retention windows | `24h,7d,30d,60d,90d` | `PROPOLIS_FEED_WINDOWS` | `crates/propolis/src/config.rs#DEFAULT_FEED_WINDOWS`, `crates/propolis/src/config.rs#load_config` |
+| Build interval | 15 min (900 s) | `PROPOLIS_FEED_BUILD_INTERVAL_SECS` | `crates/propolis/src/config.rs#DEFAULT_FEED_BUILD_INTERVAL_SECS` |
+| Feed enabled | true | `PROPOLIS_FEED_ENABLED` | `crates/propolis/src/config.rs#load_config` |
+| Output dir | `/var/lib/propolis/feed/current` | (config) | `crates/propolis/src/config.rs#DEFAULT_FEED_OUTPUT_DIR` |
 
 Retention windows ignore tier and hold every approved entry (and volume floods)
 whose `last_seen` is inside the window, published as `all-{label}.*` and nested
-by construction (`builder.rs:92-96,269-277`). A candidate is kept iff
+by construction (`crates/feed/src/builder.rs#FeedConfig`, `crates/feed/src/builder.rs#build`). A candidate is kept iff
 `now - last_seen < ttl`; each entry's `valid_from = coarsen_to_hour(last_seen)`
-and `valid_until = valid_from + ttl` (`builder.rs:302-328`). Every exported
+and `valid_until = valid_from + ttl` (`crates/feed/src/builder.rs#materialize`). Every exported
 timestamp is coarsened to the hour boundary (anti-deanonymization)
-(`builder.rs:330-340`).
+(`crates/feed/src/builder.rs#coarsen_to_hour`).
 
 Full default/bound detail for these env vars is owned by
 [environment-variables.md](environment-variables.md).
 
 ## Exclusions and ASN suppression
 
-`ExclusionEngine.is_excluded(ip)` (`crates/feed/src/exclusion.rs:66-71`):
+`ExclusionEngine.is_excluded(ip)` (`crates/feed/src/exclusion.rs#is_excluded`):
 
 ```
 is_reserved(ip) || allowlist_cidr_contains(ip) || delist_contains(ip) || asn_allowlisted(ip)
@@ -205,18 +209,19 @@ is_reserved(ip) || allowlist_cidr_contains(ip) || delist_contains(ip) || asn_all
 - Allowlist / delist / ASN allowlist are operator-supplied via
   `PROPOLIS_FEED_ALLOWLIST` (CIDR), `PROPOLIS_FEED_DELIST` (IPs), and
   `PROPOLIS_FEED_ASN_ALLOWLIST` (AS numbers) - all empty by default
-  (`crates/propolis/src/config.rs:589-595`).
+  (`crates/propolis/src/config.rs#load_config`).
 - **ASN suppression** is opt-in with an empty default; it suppresses
   trusted-org infrastructure (e.g. Microsoft AS8075, Google AS15169) keyed off
   offline GeoLite2-ASN reads (see [integrations.md](integrations.md#geolite2-offline-enrichment)).
   ASN ownership is RIR-registered, not per-IP spoofable. An empty allowlist
   short-circuits before any DB lookup; a non-empty allowlist with no ASN DB
   loaded means suppression is configured but INERT
-  (`exclusion.rs:8-11,53-61,76-81,104-109`).
+  (`crates/feed/src/exclusion.rs`, `crates/feed/src/exclusion.rs#with_asn_allowlist`,
+  `crates/feed/src/exclusion.rs#lookup_asn`, `crates/feed/src/exclusion.rs#asn_db_loaded`).
 
 The publisher re-validates every entry against exclusions at publish time; the
 FIRST violation rejects the WHOLE build, unlike the builder which drops
-offending rows (`revalidate`, `crates/feed/src/publisher.rs:213-239`).
+offending rows (`revalidate`, `crates/feed/src/publisher.rs#revalidate`).
 
 ## Reserved-range guard (`crates/core-scoring/src/net.rs`)
 

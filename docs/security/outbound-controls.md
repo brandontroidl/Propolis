@@ -53,36 +53,37 @@ fetcher is the exception: it ignores every one of these variables (see
 
 Sample-hash lookups (and optionally uploads) against
 `https://www.virustotal.com/api/v3/...` via a `reqwest` client (client builder,
-`lookup_hash`, `upload_sample`; `crates/review/src/virustotal.rs:177,306,365`). Enabled only when the flag is
+`lookup_hash`, `upload_sample`; `crates/review/src/virustotal.rs#scan_spool`,
+`crates/review/src/virustotal.rs#lookup_hash`, `crates/review/src/virustotal.rs#upload_sample`). Enabled only when the flag is
 on **and** a key is present:
 
 ```
 vt_enabled = parse_bool_flag("PROPOLIS_VT_ENABLED", false) && !vt_api_key.is_empty()
 ```
 
-(`crates/propolis/src/config.rs:613`) - default off, fail-closed to off with no
+(`crates/propolis/src/config.rs#load_config`) - default off, fail-closed to off with no
 key. Uploading unknown samples is a separate flag, `PROPOLIS_VT_UPLOAD`, also
-default false (`config.rs:614`). A per-UTC-day request cap bounds volume
-(`DailyBudget`, `virustotal.rs:67-78`).
+default false (`crates/propolis/src/config.rs#load_config`). A per-UTC-day request cap bounds volume
+(`DailyBudget`, `crates/review/src/virustotal.rs#DailyBudget`).
 
 ### 2. Vendor abuse submitters (`review`)
 
 AbuseIPDB, DShield, and OTX submitters, each gated by its own
 `PROPOLIS_VENDOR_<NAME>_ENABLED` flag, default false
-(`crates/review/src/main.rs:149`). Fail-closed: an enabled vendor with no API
+(`crates/review/src/main.rs#load_vendor_config`). Fail-closed: an enabled vendor with no API
 key is logged "enabled but no API key configured; treating as disabled" and
-skipped (`review/src/main.rs:150-155`). Only rows the operator has **Approved**
+skipped (`crates/review/src/main.rs#load_vendor_config`). Only rows the operator has **Approved**
 in the review queue are ever submitted - the runner reads `list_approved` and
 never touches Pending, Rejected, or Snoozed entries
-(`crates/review/src/submit.rs:6-20`). See
+(`crates/review/src/submit.rs#run_once`). See
 [malware-custody.md](malware-custody.md) for the human-approval gate.
 
 ### 3. Malware fetcher (`review::fetcher`)
 
 The one path that fetches an **attacker-supplied URL**. Gated
 `fetch_enabled = parse_bool_flag("PROPOLIS_FETCH_ENABLED", false)`
-(`crates/propolis/src/config.rs:622`, default false); the daemon spawns it only
-`if config.fetch_enabled` (`crates/propolis/src/main.rs:983`). Because it
+(`crates/propolis/src/config.rs#load_config`, default false); the daemon spawns it only
+`if config.fetch_enabled` (`crates/propolis/src/main.rs#main`). Because it
 dereferences attacker input, it is guarded by a dedicated SSRF vetter - see the
 [forbidden-egress-target guard](#the-forbidden-egress-target-guard) below.
 
@@ -137,9 +138,9 @@ reverse) aborts startup, because that is an operator mistake rather than a
 choice of sink, and silently downgrading it would page nothing while looking
 configured (`crates/propolis/src/ops_alert/config.rs`). Egress happens only when
 both `ntfy_url` and `ntfy_topic` are set. Alert header values are sanitized
-before send (`sanitize_header`, `dispatch.rs:141`); the body itself is
+before send (`sanitize_header`, `crates/propolis/src/ops_alert/dispatch.rs#sanitize_header`); the body itself is
 deliberately left unsanitized, since it is never header-parsed. Each attempt
-carries a 30s timeout backstop (`dispatch.rs:22`).
+carries a 30s timeout backstop (`crates/propolis/src/ops_alert/dispatch.rs#POST_ATTEMPT_TIMEOUT`).
 
 ### Not an egress path: GeoLite2
 
@@ -220,9 +221,9 @@ own-host and reserved destinations before any connection:
 - **Empty resolve set fails closed** `ResolveFailed` (`vet`).
 
 At the daemon boundary the fetcher refuses to run if `own_ips` is empty
-(`crates/propolis/src/main.rs:1017-1024`) and warns if `own_ips` has no public
+(`crates/propolis/src/main.rs#main`) and warns if `own_ips` has no public
 address (a NAT'd node, where self-targeting cannot be fully excluded;
-`own_ips_lack_a_public_address`, `main.rs:1032-1041`).
+`own_ips_lack_a_public_address`, `crates/propolis/src/main.rs#own_ips_lack_a_public_address`).
 
 The same forbidden-target concept also bounds where the platform will connect at
 all: the guard rejects own-host and reserved targets rather than admitting them.

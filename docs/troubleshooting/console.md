@@ -61,7 +61,7 @@ Login runs these checks in order (`crates/console/src/routes/login.rs`):
   a custom harness that serves the router otherwise, every login fails.
 - **`Secure` cookie over plain HTTP** - the session cookie is set `Secure` unless
   the client is loopback and `PROPOLIS_CONSOLE_TRUSTED_PROXY` is not enabled
-  (`session_cookie`, `login.rs:120-138`). If you reach the console through a
+  (`crates/console/src/routes/login.rs#session_cookie`). If you reach the console through a
   proxy that presents as a non-loopback client but serves plain HTTP to the
   browser, the browser drops the `Secure` cookie and you bounce back to
   `/login`. Terminate TLS at the proxy (so the browser sees HTTPS), or reach the
@@ -73,7 +73,7 @@ Login runs these checks in order (`crates/console/src/routes/login.rs`):
 
 Expected. Sessions live in an in-memory `HashMap` with **no session table**;
 every session is lost on restart by design
-(`SessionStore`, `crates/console/src/auth.rs:147-150`). Likewise, if
+(`crates/console/src/auth.rs#SessionStore`). Likewise, if
 `PROPOLIS_CONSOLE_SESSION_SECRET` is unset a fresh signing key is generated each
 start, invalidating any surviving cookies. Set a fixed 64-hex-char secret only if
 you want the signing key stable across restarts - sessions themselves still do

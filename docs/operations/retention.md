@@ -21,22 +21,22 @@ planning](./capacity-planning.md)).
 Blocklist-feed membership is decided by **retention windows and tier TTLs, not by a
 live-decayed score**. Every field is read as stored (as of the IP's last event) and never
 re-derived against the wall clock, so an entry cannot slide between builds
-(`crates/feed/src/builder.rs:110-153`). The feed loop rebuilds every
+(`crates/feed/src/builder.rs#FeedBuilder::build`). The feed loop rebuilds every
 `PROPOLIS_FEED_BUILD_INTERVAL_SECS` (default **900 s** / 15 min) and publishes atomically; a
-failed build leaves the previous feed in place (`run_feed_loop`, `crates/propolis/src/main.rs:319-399`).
+failed build leaves the previous feed in place (`run_feed_loop`, `crates/propolis/src/main.rs#run_feed_loop`).
 
 Two kinds of retention apply:
 
 - **Tier TTLs** bound how long a merit-tiered entry stays in the per-tier files after its last
   sighting:
-  - `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` - default **24 h** (`config.rs:23,581-584`);
-  - `PROPOLIS_FEED_STANDARD_TTL_HOURS` - default **48 h** (`config.rs:24,585-588`).
+  - `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` - default **24 h** (`crates/propolis/src/config.rs#DEFAULT_AGGRESSIVE_TTL_HOURS`);
+  - `PROPOLIS_FEED_STANDARD_TTL_HOURS` - default **48 h** (`crates/propolis/src/config.rs#DEFAULT_STANDARD_TTL_HOURS`).
   An entry is kept iff `now - last_seen < ttl`; `valid_until = coarsen_to_hour(last_seen) + ttl`
-  (`builder.rs:302-328`).
+  (`crates/feed/src/builder.rs#materialize`).
 - **Retention windows** publish `all-{label}` feeds that ignore tier and hold every approved
   entry (and auto-published volume floods) whose `last_seen` falls inside the window:
   `PROPOLIS_FEED_WINDOWS`, default **`24h,7d,30d,60d,90d`**, nested by construction
-  (`config.rs:29,596-598`, `builder.rs:269-277`). A malformed window entry is fail-closed.
+  (`crates/propolis/src/config.rs#DEFAULT_FEED_WINDOWS`, `crates/feed/src/builder.rs#FeedBuilder::build`). A malformed window entry is fail-closed.
 
 Tiers themselves (aggressive: score >= 90, confidence >= 0.95; standard: >= 75, >= 0.70) and
 the eligibility/volume rules are owned by [scoring and feed
@@ -45,7 +45,7 @@ reference](../reference/scoring-and-feed.md).
 Retention windows and TTLs govern only what the local feed under
 `/var/lib/propolis/feed/current` contains. Publishing that feed to a public repository is a
 separate operator step: `deploy/blocklist-sync.sh` run from cron on the node, **not** wired
-into any shipped systemd timer or cron file (`deploy/blocklist-sync.sh:8`). See
+into any shipped systemd timer or cron file (`deploy/blocklist-sync.sh`). See
 [deployment models](./deployment-models.md) and [outbound
 controls](../security/outbound-controls.md).
 
@@ -78,7 +78,8 @@ There is **no built-in pruning of the `event` table**: captured events accumulat
 auto-deleted. Scoring decays on read (6-hour half-life), so an old event stops contributing to a
 score long before it stops consuming storage. `ip_score` holds one durable row per source IP;
 eligibility is sticky until an explicit delist, so a score row is not removed when its weight
-decays away (`crates/core-scoring/src/scoring/doc_truth.rs:49-64`).
+decays away (`crates/core-scoring/src/scoring/doc_truth.rs#readme_eligibility_is_not_derived_from_a_decaying_score`,
+`crates/core-scoring/src/scoring/doc_truth.rs#readme_delist_is_the_only_removal`).
 
 Consequences for an operator:
 

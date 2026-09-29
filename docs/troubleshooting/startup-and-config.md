@@ -11,7 +11,7 @@ last-verified: 2026-08-26
 
 Propolis config parsing is **fail-fast**: on any missing required variable or any
 invalid numeric bound the process logs a reason and calls `std::process::exit(1)`
-rather than starting in a degraded state (`crates/propolis/src/main.rs:643-650`).
+rather than starting in a degraded state (`crates/propolis/src/main.rs#main`).
 Under systemd with `Restart=on-failure`/`Restart=always` the unit then restarts,
 fails again, and back-off/`journalctl` is where you see why. Always read the log
 before changing anything.
@@ -28,7 +28,7 @@ journalctl -u propolis -n 100 --no-pager
 ```
 
 The daemon logs `propolis: invalid configuration; refusing to start` with the
-underlying error before exiting (`crates/propolis/src/main.rs:647`). Sensors log
+underlying error before exiting (`crates/propolis/src/main.rs#main`). Sensors log
 an analogous reason and exit 1.
 
 ## Missing required variables
@@ -57,14 +57,14 @@ Two parse idioms exist and they are **not uniform**:
   `ssh`/`telnet`/`http`/`ftp`/`redis`/`adb`/`catchall`): a present-but-invalid or
   present-but-zero numeric bound **aborts startup**. Zero is rejected on most
   bounds because "zero never means unlimited"
-  (`parse_positive_u64`, `crates/propolis/src/config.rs:231-249`). A few bounds allow 0 with a defined
+  (`parse_positive_u64`, `crates/propolis/src/config.rs#parse_positive_u64`). A few bounds allow 0 with a defined
   meaning (e.g. `PROPOLIS_FETCH_MAX_HOPS=0` = no redirects,
   `PROPOLIS_FETCH_MAX_DEPTH=0` = no recursion,
   `PROPOLIS_OPS_CAPACITY_FREE_PCT` rejects 0).
 - **Lenient** (sensors `cred` and `smtp` only): an invalid or zero bound
   **silently falls back to the default** instead of aborting
-  (`crates/sensor-cred/src/main.rs:29-33`,
-  `crates/sensor-smtp/src/main.rs:28-32`). If you set a `cred`/`smtp` bound and it
+  (`crates/sensor-cred/src/main.rs#parse_positive_u64`,
+  `crates/sensor-smtp/src/main.rs#parse_positive_u64`). If you set a `cred`/`smtp` bound and it
   seems ignored, this is why - the value was rejected and the default used.
 
 Fetcher bounds also enforce an upper clamp; a value above the max aborts (e.g.
@@ -76,7 +76,7 @@ the byte guard). See
 
 `PROPOLIS_CONSOLE_SESSION_SECRET` is optional, but **if set** it must be exactly
 64 hex characters (32 bytes) or startup fails
-(`load_session_secret`, `crates/propolis/src/config.rs:459-477`). If unset, a fresh random key is
+(`load_session_secret`, `crates/propolis/src/config.rs#load_session_secret`). If unset, a fresh random key is
 generated each start - sessions then do not survive a restart (expected; see
 [Console](console.md)).
 
@@ -103,7 +103,7 @@ default. Canonical mapping:
 ## Startup order and what each phase means
 
 The unified daemon boots in a fixed sequence; an exit 1 tells you which phase
-failed (`crates/propolis/src/main.rs:643-690`):
+failed (`crates/propolis/src/main.rs#main`):
 
 1. Parse/validate config → `invalid configuration; refusing to start`.
 2. Connect the PgPool → `failed to connect to PostgreSQL` (see
@@ -119,8 +119,8 @@ Only after all four does it spawn subsystems and log `starting unified daemon`.
 
 `deploy/install.sh` deliberately does **not** create or edit any operator-owned
 `/etc/propolis/*.env` file (the one exception is the generated, secret-free
-`fleet-listeners.env`, `deploy/install.sh:25-32`) - it prints `Next: populate
-/etc/propolis/*.env files` and stops (`deploy/install.sh:173`). A freshly installed but unconfigured
+`fleet-listeners.env`, `deploy/install.sh#fleet-listeners.env`) - it prints `Next: populate
+/etc/propolis/*.env files` and stops (`deploy/install.sh#Next: populate`). A freshly installed but unconfigured
 box will fail every startup on the missing required variables above until you
 author those files (mode 0600, owned by the service user). See
 [Secret management](../operations/secret-management.md).

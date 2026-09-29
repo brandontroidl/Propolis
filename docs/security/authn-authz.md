@@ -38,32 +38,32 @@ to `/login`** (never a 401). Full table: [../reference/console-routes.md](../ref
 
 The operator password (`PROPOLIS_CONSOLE_PASSWORD`) is hashed at startup with **Argon2id
 (default params)** and the plaintext is discarded; only the PHC hash string is kept in
-memory, never written to disk or the database (`PasswordStore::new`,
-`crates/console/src/auth.rs:74-85`).
+memory, never written to disk or the database
+(`crates/console/src/auth.rs#PasswordStore::new`).
 Verification fails closed: an unparseable stored hash returns `false` rather than panicking
-(`PasswordStore::verify`, `auth.rs:119-126`).
+(`crates/console/src/auth.rs#PasswordStore::verify`).
 
 The console **refuses to start** with no password - an empty or absent
 `PROPOLIS_CONSOLE_PASSWORD` is a fail-closed `MissingPassword` startup error
-(`crates/console/src/main.rs:84-86,154-157`).
+(`crates/console/src/main.rs#ConfigError::MissingPassword`, `crates/console/src/main.rs#load_config_from_env`).
 
 ## Session cookie
 
 - **Cookie name:** `propolis_session`.
 - **Value format:** `{session_id}.{hmac_tag}`, where the tag is HMAC-SHA256 of the session
-  id under a 32-byte server secret (`SessionStore` doc comment and `secret` field,
-  `auth.rs:140-145,151`; `sign` at `auth.rs:253-259`). The HMAC tag is verified
+  id under a 32-byte server secret (`crates/console/src/auth.rs#SessionStore`;
+  `crates/console/src/auth.rs#SessionStore::sign`). The HMAC tag is verified
   **before** any session-map lookup, so a guessed or forged id is rejected without a
-  lookup (`validate`, `auth.rs:200-217`).
-- **Session id:** 32 random bytes, hex-encoded (`create`, `auth.rs:185`).
+  lookup (`crates/console/src/auth.rs#SessionStore::validate`).
+- **Session id:** 32 random bytes, hex-encoded (`crates/console/src/auth.rs#SessionStore::create`).
 - **Store:** in-memory `RwLock<HashMap>` only - there is **no session table**, so every
-  session is lost on restart, by design (`SessionStore`, `auth.rs:147-153`).
-- **TTL:** default 24h; configurable via `with_ttl` (`auth.rs:138,165-171`).
+  session is lost on restart, by design (`crates/console/src/auth.rs#SessionStore`).
+- **TTL:** default 24h; configurable via `with_ttl` (`crates/console/src/auth.rs#DEFAULT_SESSION_TTL`, `crates/console/src/auth.rs#SessionStore::with_ttl`).
 - **Secret:** `PROPOLIS_CONSOLE_SESSION_SECRET` (64 hex chars / 32 bytes) if set, else a
   freshly generated secret at startup - which, combined with the in-memory store, means a
   restart invalidates all existing cookies.
 
-Cookie attributes (`session_cookie`, `crates/console/src/routes/login.rs:120-138`):
+Cookie attributes (`crates/console/src/routes/login.rs#session_cookie`):
 
 | Attribute | Value |
 |---|---|
@@ -91,18 +91,19 @@ Cookie attributes (`session_cookie`, `crates/console/src/routes/login.rs:120-138
 
 Logout (`GET /logout`) validates the cookie, **destroys the session server-side** via
 `sessions.destroy`, then clears the client cookie. It is idempotent: it works with no
-cookie, an expired session, or a tampered cookie (`logout`, `login.rs:98-118`;
-`SessionStore::destroy`, `auth.rs:249-251`).
+cookie, an expired session, or a tampered cookie
+(`crates/console/src/routes/login.rs#logout`;
+`crates/console/src/auth.rs#SessionStore::destroy`).
 Destroying server-side matters - clearing only the client cookie would leave a captured
 cookie value valid until its TTL elapsed.
 
 ## CSRF
 
 - **Per-session token**, generated on first use and reused thereafter so multiple
-  concurrently-open forms stay valid (`generate_csrf`, `auth.rs:222-229`): 32 random bytes,
+  concurrently-open forms stay valid (`crates/console/src/auth.rs#generate_csrf`): 32 random bytes,
   hex, stored on the `Session`.
-- **Validated in constant time** via `subtle::ConstantTimeEq::ct_eq` (`validate_csrf`,
-  `auth.rs:233-242`). Returns `false` if the session is absent or has no token generated
+- **Validated in constant time** via `subtle::ConstantTimeEq::ct_eq`
+  (`crates/console/src/auth.rs#validate_csrf`). Returns `false` if the session is absent or has no token generated
   yet (fail-closed).
 - The token is surfaced to templates and embedded as `<meta name="csrf-token">` in
   `base_head.html`.
@@ -122,8 +123,7 @@ One deliberate CSRF omission, documented in source:
 ## Login rate limiting
 
 A sliding-window limiter keyed by source IP, default **5 attempts / 60s**, plus a budget
-of **30 attempts / 60s across all sources** (`RateLimiter::default`,
-`DEFAULT_GLOBAL_LOGIN_ATTEMPTS` in `auth.rs`), per-IP history reset on successful login.
+of **30 attempts / 60s across all sources** (`crates/console/src/auth.rs#RateLimiter::default`, `crates/console/src/auth.rs#DEFAULT_GLOBAL_LOGIN_ATTEMPTS`), per-IP history reset on successful login.
 Load-bearing properties:
 
 - **The global budget bounds distributed guessing.** Per-IP limits alone allow five guesses
@@ -148,6 +148,6 @@ Authorization is coarse and binary: a request is either an authenticated operato
 roles or per-object permissions - the console serves a single trusted operator
 ([threat-model.md](threat-model.md)). The bind model backstops this: default
 `127.0.0.1:8080` loopback-only, with the operator opting into a wider bind via
-`PROPOLIS_CONSOLE_BIND` (`DEFAULT_BIND`, `main.rs:49-52`). A wider bind without operator-provided TLS
+`PROPOLIS_CONSOLE_BIND` (`crates/console/src/main.rs#DEFAULT_BIND`). A wider bind without operator-provided TLS
 and a network-layer restriction is a residual risk - see
 [residual-risks.md](residual-risks.md).

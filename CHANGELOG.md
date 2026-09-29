@@ -14,6 +14,13 @@
 - **Certificate minting for a split deployment** - `provision-certs` mints the CA, gateway and
   collector certificates the mTLS transport needs. Bootstrap only: addition, rotation and revocation
   are not implemented.
+- **Operator runbook for the split deployment** - `docs/operations/split-deployment.md` covers
+  creating the certificates, setting up both hosts by hand (no script creates the gateway's or the
+  shipper's users, directories or units), checking the path end to end, and upgrading, rotating,
+  rebuilding, backing up and troubleshooting it, with the limits the split still has. Its commands
+  and claims were checked against the code by independent reviewers, and the chain behaviour it
+  describes (the reset procedure, a one-sided reset, a foreign CA, a blank log line) was run on
+  loopback with the release binaries.
 - **Malware fetcher** - retrieves the payload behind a URL a captured dropper points at, under
   deliberately paranoid egress rules: scheme allowlist, URL vetting, IP pinning, an egress deny-set
   that canonicalizes mapped/NAT64/6to4 forms, per-hop redirect re-vetting performed by hand rather
@@ -83,6 +90,15 @@
 
 ### Fixed
 
+- **Split-deployment examples and references match the code** - the example env files named
+  certificate files `provision-certs` never writes and called every one 0600, described the
+  gateway address as `host:port` (only a literal IP and port is accepted), called the client
+  certificate revocable (nothing revokes one), and gave a re-provisioning recipe for more
+  collectors that the tool cannot carry out. The environment variable reference said the sensors
+  log at `info` without `RUST_LOG`; every binary except `propolis` and `console` logs only errors.
+  The gateway unit suggested a capability grant for a port below 1024 that `PrivateUsers=yes`
+  makes useless. These, the reference's gateway and shipper tables, and the backup, upgrade and
+  compatibility pages are corrected.
 - **Evidence is no longer lost when a log rotates mid-batch** - the tailer recorded a displaced
   inode's rewind offset as the cursor's live position, which was already past whatever the
   uncommitted batch had read from that inode. A rewind then resumed beyond those lines, so they

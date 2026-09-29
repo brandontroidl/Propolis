@@ -94,6 +94,23 @@ for the full variable reference.
   than intake's cursors-only grant, because the single process owns cursors,
   feed output, and spool together.
 
+## Split deployment (gateway and shipper)
+
+Only in a [split deployment](../operations/split-deployment.md). No script creates these
+directories; the runbook gives the owners and modes. Both units name their directories in
+`ReadWritePaths=` or `ReadOnlyPaths=` without the `-` prefix, so each named directory must exist
+before its unit starts: the gateway's spool and state directories and `/etc/propolis/certs`, and
+on the collector `/var/lib/propolis/shipper` (the shipper creates `cursors/` and `state/` under it
+itself) and `/var/log/propolis`.
+
+| Purpose | Env | Default | Host |
+|---|---|---|---|
+| gateway spool, one `<collector_id>/events.jsonl` per collector, tailed by intake | `PROPOLIS_GATEWAY_SPOOL_DIR` | `/var/spool/propolis/gateway` (`crates/gateway/src/config.rs#DEFAULT_SPOOL_DIR`) | control plane |
+| gateway chain state, `<collector_id>.json` | `PROPOLIS_GATEWAY_STATE_DIR` | `/var/lib/propolis/gateway` (`crates/gateway/src/config.rs#DEFAULT_STATE_DIR`) | control plane |
+| shipper read positions, one file per log | `PROPOLIS_SHIPPER_CURSOR_DIR` | `/var/lib/propolis/shipper/cursors` (`crates/shipper/src/config.rs#DEFAULT_CURSOR_DIR`) | collector |
+| shipper chain state, `<collector_id>.json` | `PROPOLIS_SHIPPER_STATE_DIR` | `/var/lib/propolis/shipper/state` (`crates/shipper/src/config.rs#DEFAULT_STATE_DIR`) | collector |
+| mTLS certificates and keys | the `*_CERT_PATH` and `*_KEY_PATH` variables | no default; `/etc/propolis/certs` by convention, read-only to both units (`deploy/gateway.service#ReadOnlyPaths=/etc/propolis/certs`) | both |
+
 ## Config
 
 - **Config root `/etc/propolis`** (0755 root, `deploy/provision.sh#ensure_dir /etc/propolis`). Per-service env

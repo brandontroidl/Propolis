@@ -49,9 +49,17 @@ worth backing up:
 |---|---|---|
 | `/var/spool/propolis/<sensor>` | Per-sensor capture spool | No (raw capture) |
 | `/var/spool/propolis/fetched` | Fetched malware samples (quarantine, 1 GB global budget) | No (custody evidence) |
-| `/var/lib/propolis/cursors` | Per-sensor log-read cursors | Rebuilds by re-reading logs |
+| `/var/lib/propolis/cursors` | Per-sensor log-read cursors | Rebuilds by re-reading logs, which records their events a second time |
 | `/var/lib/propolis/ssh` | Persistent SSH host key | Regenerates, but changes the honeypot fingerprint |
 | `/var/lib/propolis/feed/current` | Published feed output | Rebuilds from the database on the next feed cycle |
+
+In a [split deployment](split-deployment.md#backups-and-restores) the archive below also holds
+each collector's gateway spool, under `/var/spool/propolis/gateway`. The gateway's and the
+shipper's chain state is not worth backing up: restoring either host leaves the two sides out of
+step, and both have to be reset. A restored spool file is read again from its start, so its
+events are recorded a second time. On a rebuilt control plane, run `deploy/provision.sh`, create
+the `propolis-gateway` user and add `propolis` to its group before unpacking anything;
+`provision.sh` does neither of the last two.
 
 The captured sample bodies and quarantined fetched malware are custody evidence
 and are **not** reconstructable from the database (the database stores only the

@@ -84,12 +84,19 @@ console rDNS parse booleans more broadly (called out below).
   `.filter(|s| !s.is_empty())`).
 
 ### `RUST_LOG`
-- Read by: `propolis` (`propolis/src/main.rs#main`), `console` (`console/src/main.rs#main`), and the
-  sensors via `tracing_subscriber`.
-- Required: no. Default filter `info` on unset or parse failure.
-- Standard `tracing_subscriber::EnvFilter` default-env name. Sensors `cred`/`smtp`
-  honor it via `tracing_subscriber::fmt::init()`; other sensors honor it the
-  same way [inferred] (not individually verified).
+- Read by: every binary except `provision-certs`, as `tracing_subscriber`'s standard `EnvFilter`
+  variable.
+- Required: no. When it is unset or does not parse, `propolis` and `console` log at `info`
+  (`propolis/src/main.rs#main`, `console/src/main.rs#main`). Every other binary - the sensors,
+  `gateway`, `shipper`, and the standalone `intake`, `review` and `feed` - logs **errors only**.
+  Each calls `tracing_subscriber::fmt::init()` (for example `crates/gateway/src/main.rs#main`),
+  whose default filter is `error` once the `env-filter` feature is on, and a workspace build
+  (`cargo build --release` at the workspace root, as the deployment manual has you run it before
+  `deploy/install.sh`, or `cargo build --release --workspace --locked` as `deploy/upgrade.sh` runs
+  it) turns the feature on for every member because `propolis`, `console` and `sensor-catchall`
+  enable it. Set
+  `RUST_LOG=info` in a unit's env file to see its startup and warning lines: with it unset, a
+  healthy release-built `gateway` prints nothing at all (observed 2026-09-28).
 
 ### `PROPOLIS_HOSTNAME`
 - Read by: `sensor-framework::persona::hostname()`
@@ -252,7 +259,10 @@ writes `/etc/propolis/fleet-listeners.env`, which `propolis.service` and
 operator setting still wins). `deploy/install.sh` and `deploy/upgrade.sh` run
 the generator, so drift is possible only between deploys - and a sensor
 producing events while absent from the inventory shows on the pane as
-`undeclared listener`, which is what catches that window.
+`undeclared listener`, which is what catches that window. The exception is a
+[split deployment](../operations/split-deployment.md): the sensor env files live on the collector, the
+generator on the control plane writes an empty inventory, and the list has to be
+set in the control plane's `propolis.env`.
 
 `PROPOLIS_FLEET_COLLECTOR_ID` (default `local`) is read by
 `deploy/fleet-listeners.sh` itself, not by any binary: it stamps the collector
@@ -363,7 +373,8 @@ Two additional binaries, each its own process with its own `load_config_from_env
 `/etc/propolis/<name>.env` - the disposable-collector / control-plane topology
 (`deploy/gateway.service`, `deploy/shipper.service`, `deploy/collector.env.example`,
 `deploy/control-plane.env.example`). Neither reads `DATABASE_URL` or any vendor/VT/console
-variable; that boundary is the entire point of the split.
+variable; that boundary is the entire point of the split. Setting them up and running them:
+[split deployment](../operations/split-deployment.md).
 
 ### `gateway`
 
@@ -377,11 +388,11 @@ parse (present-but-zero or unparseable → **abort**), matching the sensor patte
 | `PROPOLIS_GATEWAY_SERVER_CERT_PATH` | **yes** | - | PEM path the gateway presents in the TLS handshake; absent → abort |
 | `PROPOLIS_GATEWAY_SERVER_KEY_PATH` | **yes** | - | PEM path, private key for the server cert above; absent → abort |
 | `PROPOLIS_GATEWAY_SPOOL_DIR` | no | `/var/spool/propolis/gateway` | root of the per-collector spool tree; one `events.jsonl` per collector under `<root>/<collector_id>/` (`crates/gateway/src/spool.rs`) |
-| `PROPOLIS_GATEWAY_STATE_DIR` | no | `/var/lib/propolis/gateway` | gateway's own state directory |
+| `PROPOLIS_GATEWAY_STATE_DIR` | no | `/var/lib/propolis/gateway` | each collector's position in its batch chain, `<dir>/<collector_id>.json` holding `last_seq` and `last_batch_hash` (`crates/gateway/src/state.rs#CollectorState`). The gateway holds this in memory while it runs, so removing a file takes effect at its next restart, and then only together with the shipper's state, see [split deployment](../operations/split-deployment.md#rebuilding-a-collector) |
 | `PROPOLIS_GATEWAY_MAX_CONCURRENT` | no | `64` | positive u32; zero/unparseable → abort |
 | `PROPOLIS_GATEWAY_MAX_DURATION_SECS` | no | `120` | positive u64 secs; zero/unparseable → abort |
-| `PROPOLIS_GATEWAY_READ_TIMEOUT_MS` | no | `30000` | positive u64 ms; zero/unparseable → abort |
-| `PROPOLIS_GATEWAY_IDLE_TIMEOUT_MS` | no | `60000` | positive u64 ms; zero/unparseable → abort |
+| `PROPOLIS_GATEWAY_READ_TIMEOUT_MS` | no | `30000` | positive u64 ms; zero/unparseable → abort. Validated but **not applied**: the connection handler sets no read timeout (`crates/gateway/src/server.rs#handle_connection`) |
+| `PROPOLIS_GATEWAY_IDLE_TIMEOUT_MS` | no | `60000` | positive u64 ms; zero/unparseable → abort. Validated but **not applied**, like the read timeout; only `PROPOLIS_GATEWAY_MAX_CONCURRENT` and `PROPOLIS_GATEWAY_MAX_DURATION_SECS` bound a connection |
 
 The gateway's own read loop bounds every frame at `collector_wire::frame::MAX_FRAME_LEN` before
 allocating, so `ConnectionBounds`'s `max_captured_bytes` field is fixed to that ceiling internally
@@ -395,26 +406,28 @@ additionally cross-checked against the client certificate's CommonName at startu
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_SHIPPER_GATEWAY_ADDR` | **yes** | - | `host:port` socket address of the gateway; absent/unparseable → abort |
-| `PROPOLIS_SHIPPER_GATEWAY_DNS` | **yes** | - | DNS name checked against the gateway's TLS server certificate during the mTLS handshake; absent → abort |
+| `PROPOLIS_SHIPPER_GATEWAY_ADDR` | **yes** | - | literal `ip:port` socket address of the gateway; nothing is resolved, so a host name is refused; absent/unparseable → abort (`crates/shipper/src/config.rs#load_config_from_env`) |
+| `PROPOLIS_SHIPPER_GATEWAY_DNS` | **yes** | - | name checked against the gateway's TLS server certificate during the mTLS handshake; only compared, never resolved, so it need not exist in DNS (`crates/shipper/src/client.rs#ShipperClient::connect`); absent → abort |
 | `PROPOLIS_SHIPPER_CA_CERT_PATH` | **yes** | - | PEM path used to verify the gateway's server certificate; absent → abort |
 | `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` | **yes** | - | PEM path, this collector's client certificate; absent → abort |
 | `PROPOLIS_SHIPPER_CLIENT_KEY_PATH` | **yes** | - | PEM path, private key for the client cert above; absent → abort |
-| `PROPOLIS_COLLECTOR_ID` (deprecated alias `PROPOLIS_SHIPPER_COLLECTOR_ID`, still read) | **yes** | - | this collector's identity; **must equal** the CommonName baked into `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` or the shipper refuses to start (`validate_collector_id`, `ConfigError::CollectorIdMismatch`). Same variable the four body-capturing sensors read (see "Outbox manifest" below) - it must be the SAME value everywhere on this collector, or the provenance join on `(collector_id, occurrence_id)` silently breaks attribution. |
+| `PROPOLIS_COLLECTOR_ID` (deprecated alias `PROPOLIS_SHIPPER_COLLECTOR_ID`, still read) | **yes** | - | this collector's identity; **must equal** the CommonName baked into `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` or the shipper refuses to start (`validate_collector_id`, `ConfigError::CollectorIdMismatch`). Same variable the four body-capturing sensors read (see "Outbox manifest" below) - set the same value on every unit of this collector. Today the sensors only stamp it on their outbox manifest rows, which nothing reads yet; the planned provenance join on `(collector_id, occurrence_id)` depends on it matching. |
 | `PROPOLIS_SHIPPER_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, same grammar as `PROPOLIS_SENSOR_LOGS`; empty or a malformed entry → abort; at least one pair required |
-| `PROPOLIS_SHIPPER_CURSOR_DIR` | no | `/var/lib/propolis/shipper/cursors` | per-log tail cursor persistence |
-| `PROPOLIS_SHIPPER_STATE_DIR` | no | `/var/lib/propolis/shipper/state` | shipper's own state directory |
+| `PROPOLIS_SHIPPER_CURSOR_DIR` | no | `/var/lib/propolis/shipper/cursors` | one cursor file per log, named by the SHA-256 of the log's path (`crates/log-tailer/src/cursor.rs#DurableCursor::cursor_file_path`) |
+| `PROPOLIS_SHIPPER_STATE_DIR` | no | `/var/lib/propolis/shipper/state` | this collector's position in its batch chain, `<dir>/<collector_id>.json` (`crates/shipper/src/state.rs#ConfirmedState`) |
 | `PROPOLIS_SHIPPER_POLL_INTERVAL_MS` | no | `1000` | positive u64 ms; zero/unparseable → abort |
-| `PROPOLIS_SHIPPER_MAX_RECORDS_PER_BATCH` | no | `15` (`batcher::MAX_RECORDS_FRAME_SAFE`) | positive u64 → usize; zero/unparseable → abort |
-| `PROPOLIS_SHIPPER_RETRY_BACKOFF_MS` | no | `2000` | positive u64 ms; zero/unparseable → abort |
+| `PROPOLIS_SHIPPER_MAX_RECORDS_PER_BATCH` | no | `15` (`batcher::MAX_RECORDS_FRAME_SAFE`) | positive u64 → usize; zero/unparseable → abort; a value above 15 is lowered to 15 (`crates/shipper/src/batcher.rs#Batcher::next_batch`) |
+| `PROPOLIS_SHIPPER_RETRY_BACKOFF_MS` | no | `2000` | positive u64 ms; zero/unparseable → abort. The wait before resending a batch the gateway answered with Retry, at most 5 times in a row (`crates/shipper/src/main.rs#MAX_CONSECUTIVE_RETRIES`); a failed connection is retried on the next poll instead |
 
-`PROPOLIS_SHIPPER_SENSOR_LOGS`'s `name` is used only for cursor keying and logging - every sensor
-log on a collector ships through one seq/hash chain keyed by `PROPOLIS_COLLECTOR_ID`
+`PROPOLIS_SHIPPER_SENSOR_LOGS`'s `name` only labels log lines: it is not sent to the gateway, and each
+log's cursor is keyed by its path. Every sensor log on a collector ships through one seq/hash chain
+keyed by `PROPOLIS_COLLECTOR_ID`
 (via the gateway's verified client-certificate CommonName), not by the per-log name.
 
 On the control-plane side, intake's `PROPOLIS_SENSOR_LOGS` is re-pointed at the gateway's
 per-collector spool (one `name:path` entry per collector, not per sensor) - see
-[filesystem paths](filesystem-paths.md) and `deploy/control-plane.env.example`.
+[split deployment](../operations/split-deployment.md), [filesystem paths](filesystem-paths.md#split-deployment-gateway-and-shipper)
+and `deploy/control-plane.env.example`.
 
 ---
 

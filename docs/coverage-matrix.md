@@ -21,14 +21,13 @@ covers it. A `partial` here is a documentation-honesty marker, not a defect in t
 docs; several rows are `partial` precisely *because* the corpus documents a residual
 risk plainly (per the GLOBAL CORRECTIONS) rather than papering over it.
 
-Result: **one gap**, marked on the `shipper`, `gateway` and `provision-certs` rows.
-The split deployment (collectors shipping to a control-plane gateway) has no
-operator page: its configuration is in the environment variable
-reference and the comments of `deploy/collector.env.example` and
-`deploy/control-plane.env.example`, and its design in the custody architecture page,
-but no page walks through provisioning certificates, installing the units and bringing
-a collector up. Every other component, stage, invariant, and procedure has a
-canonical owner. The `partial` rows carry a documented caveat, noted in the last
+Result: **no gaps**. The split deployment (collectors shipping to a control-plane
+gateway) was the last one; [operations/split-deployment.md](operations/split-deployment.md)
+now walks through certificates, both hosts, checking the path end to end and operating
+it. Its `shipper`, `gateway` and `provision-certs` rows are `partial` because that page
+documents limits the split still has (one collector per CA, no provisioning script, no
+liveness alert). Every component, stage, invariant, and procedure has a canonical
+owner. The `partial` rows carry a documented caveat, noted in the last
 column.
 
 ## Component crates (24 crates / 17 binaries)
@@ -60,9 +59,9 @@ the architecture and reference pages below.
 | `fleet` | [reference/database.md](reference/database.md), [reference/console-routes.md](reference/console-routes.md), [reference/environment-variables.md](reference/environment-variables.md) | partial | `listener_probe`, the `/fleet` pages and their variables are documented; the probe loop and the verdict rules have no architecture page. |
 | `log-tailer` | [architecture/process-topology.md](architecture/process-topology.md), [architecture/event-and-sample-lifecycle.md](architecture/event-and-sample-lifecycle.md) | partial | Described as the intake tailer; its use by `shipper` is covered only by the component inventory. |
 | `collector-wire` | [architecture/components.md](architecture/components.md), [architecture/evidence-provenance-and-artifact-custody.md](architecture/evidence-provenance-and-artifact-custody.md) | partial | Frame, ack and TLS rules live in the crate's own docs; no reference page. |
-| `shipper` | [reference/environment-variables.md](reference/environment-variables.md) | gap | Configuration only; see the split-deployment gap above. |
-| `gateway` | [reference/environment-variables.md](reference/environment-variables.md), [architecture/evidence-provenance-and-artifact-custody.md](architecture/evidence-provenance-and-artifact-custody.md) | gap | Configuration and spool design only; see the split-deployment gap above. |
-| `provision-certs` | [architecture/components.md](architecture/components.md) | gap | Inventory row only; see the split-deployment gap above. |
+| `shipper` | [operations/split-deployment.md](operations/split-deployment.md), [reference/environment-variables.md](reference/environment-variables.md) | partial | Setup, verification, chain reset and troubleshooting documented; the page's known limitations (no timeouts, a blank log line stops it, state-write failure loses batches) are unfixed. |
+| `gateway` | [operations/split-deployment.md](operations/split-deployment.md), [reference/environment-variables.md](reference/environment-variables.md), [architecture/evidence-provenance-and-artifact-custody.md](architecture/evidence-provenance-and-artifact-custody.md) | partial | Setup and operation documented; read and idle timeouts are parsed but not applied, and nothing rotates its spool. |
+| `provision-certs` | [operations/split-deployment.md](operations/split-deployment.md), [architecture/components.md](architecture/components.md) | partial | Usage, outputs and rotation documented; one collector per CA, no revocation, no expiry. |
 
 The 4 retired dev units (`intake`/`review`/`feed`/`console.service`) are documented as
 superseded by `propolis.service` in
@@ -125,6 +124,7 @@ Owned by the `operations/` section, with symptom-based recovery in `troubleshoot
 | Procedure | Doc page(s) | Coverage | Note |
 |---|---|---|---|
 | Install (users, dirs, spool, units) | [operations/installation.md](operations/installation.md), [reference/commands.md](reference/commands.md) | documented | `install.sh` is idempotent, dry-run capable; does NOT start services, touch the DB, or write `.env`. |
+| Split deployment (collector + control plane) | [operations/split-deployment.md](operations/split-deployment.md), [reference/environment-variables.md](reference/environment-variables.md) | partial | Certificates, both hosts, verification, chain reset, upgrades and restores documented; one collector per CA, no provisioning script, no liveness alert. |
 | Deployment models (single-node / cluster / dev units) | [operations/deployment-models.md](operations/deployment-models.md) | partial | Single-node fully documented; multi-node aggregation `[inferred]` (see pipeline table). |
 | Configuration (env vars, defaults, bounds) | [operations/configuration.md](operations/configuration.md), [reference/environment-variables.md](reference/environment-variables.md) | documented | Every `PROPOLIS_*` var, default, bound, and fail behavior owned by the env-vars reference. |
 | Secret management | [operations/secret-management.md](operations/secret-management.md) | documented | Per-service `/etc/propolis/*.env`, mode `0600`, operator-created; no secret from argv. |
@@ -142,10 +142,8 @@ Owned by the `operations/` section, with symptom-based recovery in `troubleshoot
 
 ## Corpus-control pages (self-coverage)
 
-| Item | Doc page | Coverage |
-|---|---|---|
+| Item | Doc page | Coverage | Note |
+|---|---|---|---|
 | Current/historical/superseded policy | [documentation-policy.md](documentation-policy.md) | documented |
 | Claim → source traceability | [claim-to-source-ledger.md](claim-to-source-ledger.md) | partial | Canonical path reserved; page assembled alongside this one (verify present before relying on the link). |
 | Complete linear reading experience | [binder/HANDOFF-BINDER.md](binder/HANDOFF-BINDER.md) | partial | Canonical path reserved; binder assembled alongside this one (verify present before relying on the link). |
-</content>
-</invoke>

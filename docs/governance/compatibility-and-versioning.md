@@ -48,6 +48,14 @@ and migration list are owned by
 [../reference/database.md](../reference/database.md); the migration workflow is
 in [../development/schema-and-migrations.md](../development/schema-and-migrations.md).
 
+### Collector-to-gateway wire - lock-step
+
+Every frame a `shipper` sends carries a version byte, and there is no negotiation: a `gateway`
+rejects any other version, and a shipper stops on a rejection
+(`crates/collector-wire/src/frame.rs#VERSION`, `crates/collector-wire/src/frame.rs#decode_frame`).
+A change to the wire therefore has to reach the control plane and every collector together; see
+[split deployment](../operations/split-deployment.md#upgrading).
+
 ### Configuration - additive
 
 New configuration is introduced with safe defaults so an existing deployment

@@ -2,10 +2,12 @@
 #
 # In-place upgrade: pull, build, replace binaries, reinstall unit files + logrotate policy,
 # daemon-reload, restart services.
-# Safe to run on a live node - restarts are sequenced (propolis last so sensors
-# can reconnect). Runs deploy/provision.sh itself before restarting anything, so a directory or
-# user a change added since the last install/upgrade (e.g. a new sensor's spool dir) always exists
-# before the unit that needs it restarts - no longer assumes install.sh already provisioned it.
+# Safe to run on a live node - restarts are sequenced: sensors, then gateway, propolis, and the
+# shipper last. Not for a split deployment's collector, which must not run propolis: see
+# docs/operations/split-deployment.md. Runs deploy/provision.sh itself before restarting
+# anything, so a directory or user a change added since the last install/upgrade (e.g. a new
+# sensor's spool dir) always exists before the unit that needs it restarts - no longer assumes
+# install.sh already provisioned it.
 #
 # Usage: sudo ./deploy/upgrade.sh
 

@@ -21,7 +21,7 @@
 #     (propolis-ssh, propolis-catchall, ...) with UMask=0027, i.e. group-readable. Add
 #     propolis-shipper as a supplementary member of every sensor's group (a shared
 #     `propolis-logs` group works too, if every sensor unit is changed to write group-owned by
-#     it) - matching the same `usermod -aG` pattern deploy/install.sh already uses to give the
+#     it) - matching the same `usermod -aG` pattern deploy/provision.sh already uses to give the
 #     aggregated `propolis` daemon read access to sensor logs on a single-box deployment. Without
 #     this, the shipper silently ships nothing from sensors it cannot read.
 #   - /etc/propolis/shipper.env (mode 0600, owned by propolis-shipper). Required env vars
@@ -39,6 +39,9 @@
 #     gateway's server certificate - read-only from this unit's perspective.
 #   - /var/lib/propolis/shipper, owned by propolis-shipper (cursor + state bookkeeping).
 #   - the built binary at /usr/local/bin/shipper (crates/shipper, bin target "shipper").
+# No script creates the user, group memberships, directory, env file or certificates, and
+# deploy/install.sh does not install the binary; docs/operations/split-deployment.md gives the
+# steps, including upgrading a collector without deploy/upgrade.sh.
 
 [Unit]
 Description=Propolis shipper (ships collector-local sensor logs to the gateway over mTLS)
@@ -80,7 +83,7 @@ CapabilityBoundingSet=
 
 # --- Resource caps ---
 # Lighter than sensor-ssh.service's (no attacker-facing traffic, no per-connection session state -
-# just tailing local files and batching HTTP-shaped mTLS frames to one gateway).
+# just tailing local files and sending length-prefixed batch frames over mTLS to one gateway).
 MemoryMax=256M
 TasksMax=64
 CPUQuota=50%
@@ -130,11 +133,10 @@ UMask=0027
 # Deliberately NOT added, each for a concrete reason rather than an oversight (same reasoning as
 # propolis.service and sensor-ssh.service):
 #   - PrivateNetwork=: this unit's entire purpose is outbound network I/O to the gateway.
-#   - IPAddressDeny=/IPAddressAllow=: the gateway's address is resolved from
-#     PROPOLIS_SHIPPER_GATEWAY_ADDR at runtime, not known at unit-authoring time, and
-#     IPAddressAllow= takes literal IPs/CIDRs, not hostnames - matches propolis.service's identical
-#     reasoning for its own DATABASE_URL/vendor hosts. An operator who wants this can add it once
-#     the gateway's stable address is known for their deployment.
+#   - IPAddressDeny=/IPAddressAllow=: the gateway's address is the literal ip:port in
+#     PROPOLIS_SHIPPER_GATEWAY_ADDR, which is per deployment and not known at unit-authoring time.
+#     An operator who wants this can add IPAddressDeny=any together with IPAddressAllow= for
+#     that address (an allow list alone restricts nothing).
 #   - RootDirectory=/RootImage=: real chroot/image-root hardening needs a prepared minimal root
 #     tree provisioned outside this unit file - a legitimate future hardening step, not a one-line
 #     addition here (matches every other unit's identical deferral).

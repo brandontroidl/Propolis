@@ -29,9 +29,10 @@ The script (run as root, `sudo ./deploy/upgrade.sh`):
    definitions.
 4. Restarts each `sensor-*.service` **only if it is enabled**, then `gateway.service`
    if enabled.
-5. Restarts `propolis.service`, so sensors reconnect and the daemon runs any new
-   migrations after the binaries are in place, then `shipper.service` if enabled
-   (after the gateway it dials).
+5. Restarts `propolis.service`, so the daemon runs any new migrations after the
+   binaries are in place, then `shipper.service` if enabled (after the gateway it
+   dials). `propolis.service` is restarted on every host, so the script must not be
+   run on a collector of a [split deployment](split-deployment.md#upgrading).
 
 The unified daemon is the production surface; the standalone `intake`/`review`/
 `feed`/`console` units are superseded by it and are not part of the upgrade

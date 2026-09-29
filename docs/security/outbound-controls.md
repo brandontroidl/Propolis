@@ -168,9 +168,8 @@ sensor event logs to it (`PROPOLIS_SHIPPER_GATEWAY_ADDR`, with the CA and client
 certificate paths beside it). It connects only to the address you configure, with
 the certificate you provisioned, and it does not exist in a single-node install.
 The variables are in the
-[environment reference](../reference/environment-variables.md); the provisioning and
-enrollment procedure is documented in `deploy/collector.env.example` and
-`deploy/control-plane.env.example`, and the wire contract in
+[environment reference](../reference/environment-variables.md), the certificate and setup
+procedure in [split deployment](../operations/split-deployment.md), and the wire contract in
 [evidence provenance and artifact custody](../architecture/evidence-provenance-and-artifact-custody.md).
 
 ### 7. Feed publication (operator cron)

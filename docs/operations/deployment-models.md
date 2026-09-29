@@ -10,8 +10,8 @@ last-verified: 2026-08-26
 # Deployment models
 
 Propolis runs on Linux with systemd. It supports a single-node deployment (the
-primary, documented model) and a multi-node cluster sharing one PostgreSQL
-database.
+primary, documented model), a multi-node cluster sharing one PostgreSQL
+database, and a split deployment that moves the sensors to a separate collector host.
 
 ## Single node (primary)
 
@@ -61,6 +61,13 @@ Feed publication across nodes remains [inferred] from the `INSTALL.md` claim; no
 cross-node test covers it. The single-node model is the one exercised in
 practice, so treat cluster deployment as an advanced, less-travelled path and
 validate feed behaviour in your own environment before relying on it.
+
+## Collector and control plane (split)
+
+The sensors run on a disposable collector host with a `shipper` that forwards their logs over
+mutual TLS to a `gateway` on the control plane, which runs everything else. The collector holds
+no database credential, vendor key or console password. The procedure, and the parts of it the
+installer does not do yet, are in [split deployment](split-deployment.md).
 
 ## Hardware and OS assumptions
 

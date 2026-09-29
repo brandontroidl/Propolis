@@ -115,6 +115,15 @@ bind/listen code found in its source].
 > reverse proxy) [inferred]. See
 > [operations/networking-tls.md](../operations/networking-tls.md).
 
+## Collector-facing listener (split deployment only)
+
+In a [split deployment](../operations/split-deployment.md) the control plane runs `gateway`,
+which listens on **`PROPOLIS_GATEWAY_BIND`**, a literal `ip:port` with no compiled-in default
+(`crates/gateway/src/config.rs#load_config_from_env`); the examples use 9443. It speaks mutual
+TLS and accepts only collectors whose client certificate its CA signed. Its unit grants no bind
+capability and restricts no source address, so keep the port at 1024 or above and allow it in the host
+firewall from collector addresses only. The collector's `shipper` only dials out.
+
 ## Machine-facing endpoints (health / ready / metrics)
 
 These share the **same** bind as the console (`PROPOLIS_CONSOLE_BIND`, default

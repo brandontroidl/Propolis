@@ -37,6 +37,8 @@ the fetcher and vendor submission coordinate through the database, but feed
 publication across nodes is unverified and you must validate it yourself.
 
 - [`../operations/deployment-models.md`](../operations/deployment-models.md)
+- [`../operations/split-deployment.md`](../operations/split-deployment.md) - sensors on a
+  separate collector host, shipping to the control plane over mutual TLS
 
 ## 1. Prerequisites
 

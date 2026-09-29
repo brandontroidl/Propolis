@@ -34,8 +34,8 @@ separate relations and separate UI roles throughout.
 
 ## Authenticated transport: the enveloped gateway-spool record
 
-SP-A's gateway wrote raw NDJSON to a per-collector spool (`crates/gateway/src/spool.rs`, byte-transparent,
-`flush` not `fsync`). SP-B replaces that spool record with **one crash-consistent enveloped record** per
+SP-A's gateway writes raw NDJSON to a per-collector spool, byte-transparent and synced to disk before it
+acknowledges the batch (`crates/gateway/src/spool.rs#SpoolWriter::write_records`). SP-B replaces that spool record with **one crash-consistent enveloped record** per
 event, so the authenticated collector identity and the raw event bytes cannot drift apart across a crash:
 
 ```

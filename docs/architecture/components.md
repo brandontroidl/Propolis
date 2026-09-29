@@ -42,7 +42,7 @@ owner of the component inventory and the inter-crate dependency graph.
 | `collector-wire` | library (leaf) | none | Collector-to-gateway wire protocol: sequenced, hash-chained batch frames, acks, and the mutual-TLS configs both ends build from one pinned CA. |
 | `shipper` | lib + bin | `shipper` | Collector side of the split deployment: tails a sensor log through `log-tailer`, assembles the next sequenced batch, ships it to the gateway over mutual TLS, and advances its durable state only after a confirmed ack. |
 | `gateway` | lib + bin | `gateway` | Control-plane side of the split deployment: a client-certificate-required TLS accept loop that verifies each collector's sequence and hash chain and appends accepted records to a per-collector spool in sensor NDJSON shape, which intake tails unchanged. |
-| `provision-certs` | lib + bin | `provision-certs` | Mints the private CA, the gateway server certificate and per-collector client certificates, isolated so its certificate library never enters the daemon dependency trees. |
+| `provision-certs` | lib + bin | `provision-certs` | Mints a private CA, the gateway server certificate and one collector client certificate per run, isolated so its certificate library never enters the daemon dependency trees. |
 
 Source: the `[workspace] members` list in `Cargo.toml`; each crate's `Cargo.toml` and
 `src/lib.rs` / `src/main.rs`.

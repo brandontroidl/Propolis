@@ -59,40 +59,42 @@ const MAX_SAMPLE_BYTES: u64 = 500_000_000;
 
 // The options the rehearsal passes to each command the backup page documents. It cannot run the
 // page's commands verbatim (it supplies its own paths, cluster and database), so
-// `the_rehearsal_applies_every_option_the_backup_page_documents` holds the page to these instead.
+// `the_rehearsal_runs_the_options_the_backup_page_documents` holds the page to these instead.
 const PG_DUMP_FORMAT: &str = "--format=custom";
 const PG_RESTORE_STOP_ON_ERROR: &str = "--exit-on-error";
 const TAR_CREATE: &str = "-czf";
 const TAR_EXTRACT: &str = "-xzpf";
 
-/// The rehearsal proves the documented procedure only while it applies every option the page
-/// passes. An option added to the page but not here, such as `--no-privileges` on the restore or an
-/// `--exclude` on the archive, would leave the rehearsal passing while the real procedure lost the
-/// ledger's revoke or custody evidence. Needs no PostgreSQL, so it is not ignored.
+/// The rehearsal proves the documented procedure only while the two pass the same options, in both
+/// directions. An option the page adds, such as `--no-privileges` on the restore or an `--exclude`
+/// on the archive, would change what the real procedure saves or restores. One the page drops, such
+/// as `--format=custom` (a plain dump `pg_restore` refuses) or `--exit-on-error` (a restore that
+/// continues past a missing role), would break it. Either way the rehearsal, running its own
+/// options, would still pass. `-C` on the archive is the rehearsal's own: it re-roots the documented
+/// absolute paths under a scratch directory. Needs no PostgreSQL, so it is not ignored.
 #[test]
-fn the_rehearsal_applies_every_option_the_backup_page_documents() {
+fn the_rehearsal_runs_the_options_the_backup_page_documents() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let doc = fs::read_to_string(root.join(BACKUP_DOC)).expect("backup page");
-    let check = |program: &str, commands: Vec<Vec<String>>, applied: &[&str]| {
-        assert!(
-            !commands.is_empty(),
-            "{BACKUP_DOC} has no {program} command"
+    let check = |program: &str, commands: Vec<Vec<String>>, rehearsed: &[&str]| {
+        assert_eq!(
+            commands.len(),
+            1,
+            "{BACKUP_DOC} should document one {program} command, found {commands:?}"
         );
-        let applied: BTreeSet<String> = applied.iter().map(|o| option_name(o)).collect();
-        for command in commands {
-            let documented: BTreeSet<String> = command
-                .iter()
-                .filter(|w| w.starts_with('-'))
-                .map(|o| option_name(o))
-                .collect();
-            let missing: Vec<&String> = documented.difference(&applied).collect();
-            assert!(
-                missing.is_empty(),
-                "{BACKUP_DOC}'s `{program} {}` passes {missing:?}, which the rehearsal does not \
-                 apply; apply it in populated_backup_restores_into_a_fresh_cluster",
-                command.join(" ")
-            );
-        }
+        let rehearsed: BTreeSet<String> = rehearsed.iter().map(|o| option_key(o)).collect();
+        let documented: BTreeSet<String> = commands[0]
+            .iter()
+            .filter(|w| w.starts_with('-'))
+            .map(|o| option_key(o))
+            .collect();
+        assert_eq!(
+            documented,
+            rehearsed,
+            "{BACKUP_DOC}'s `{program} {}` and populated_backup_restores_into_a_fresh_cluster \
+             must pass the same options",
+            commands[0].join(" ")
+        );
     };
     check(
         "pg_dump",
@@ -110,22 +112,30 @@ fn the_rehearsal_applies_every_option_the_backup_page_documents() {
             c.first()
                 .is_some_and(|o| o.starts_with('-') && o.contains('c'))
         });
-    check("tar (create)", create, &[TAR_CREATE, "-C"]);
+    check("tar (create)", create, &[TAR_CREATE]);
     check("tar (extract)", extract, &[TAR_EXTRACT, "-C"]);
 }
 
-/// An option as the comparison sees it: a short cluster by its letters in order (`-czf` and `-zcf`
-/// are one set of options), a long option by its name, except `--format`, whose value is the point.
-fn option_name(option: &str) -> String {
+/// An option as the comparison sees it. A long option is its name, except `--format`, whose value
+/// is the point. A short group is its letters as a set (`-czf` and `-zcf` agree), but only when any
+/// value-taking letter ends the group: `-xfpz` makes `pz` the archive name, so it is kept as written
+/// and matches nothing.
+fn option_key(option: &str) -> String {
     match option.strip_prefix("--") {
         Some(long) => match long.split_once('=') {
             Some(("format", _)) | None => option.to_string(),
             Some((name, _)) => format!("--{name}"),
         },
         None => {
-            let mut letters: Vec<char> = option[1..].chars().collect();
-            letters.sort_unstable();
-            format!("-{}", letters.into_iter().collect::<String>())
+            let group = &option[1..];
+            match group.find(doc_commands::SHORT_WITH_VALUE) {
+                Some(at) if at + 1 != group.len() => option.to_string(),
+                _ => {
+                    let mut letters: Vec<char> = group.chars().collect();
+                    letters.sort_unstable();
+                    format!("-{}", letters.into_iter().collect::<String>())
+                }
+            }
         }
     }
 }

@@ -127,7 +127,7 @@ fn words(line: &str) -> Vec<String> {
 
 /// GNU tar short options that take a value: `-f FILE`, `-C DIR`, `-T FILE`, `-X FILE` and the
 /// rarer block-size, format, label, date, script and compressor options.
-const SHORT_WITH_VALUE: &[char] = &[
+pub const SHORT_WITH_VALUE: &[char] = &[
     'f', 'C', 'T', 'X', 'b', 'H', 'K', 'L', 'N', 'V', 'g', 'F', 'I',
 ];
 

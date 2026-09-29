@@ -241,6 +241,24 @@ mod tests {
                 && script.contains("disabled = false"),
             "console.js must enable the confirmed buttons it guards"
         );
+        // Enabling before the confirmation listener exists would reopen the window this closes;
+        // never enabling would leave the buttons dead. Content htmx swaps in later (the evidence
+        // drawer) needs arming too.
+        let listener = script
+            .find("closest('[data-confirm]')")
+            .expect("console.js registers its confirmation listener");
+        let armed = script
+            .find("armConfirmations(document)")
+            .expect("console.js arms the page's confirmed buttons");
+        assert!(
+            listener < armed,
+            "console.js must arm the buttons only after the confirmation listener exists"
+        );
+        assert!(
+            script.contains("addEventListener('htmx:load'")
+                && script.contains("armConfirmations(e.target)"),
+            "console.js must arm confirmed buttons in content htmx swaps in"
+        );
     }
 
     /// The policy applies to every response, including the few bodies Rust builds without a
@@ -262,12 +280,24 @@ mod tests {
                 }
                 scanned += 1;
                 let source = std::fs::read_to_string(&path).unwrap();
-                let code = source.split("#[cfg(test)]").next().unwrap();
-                for (n, line) in code.lines().enumerate() {
+                let lines: Vec<&str> = source.lines().collect();
+                // Stop at the test module, not at the first `#[cfg(test)]`: a test-only helper
+                // can carry that attribute in the middle of the production code.
+                let end = (0..lines.len())
+                    .find(|&i| {
+                        lines[i].trim() == "#[cfg(test)]"
+                            && lines[i + 1..]
+                                .iter()
+                                .find(|l| !l.trim().is_empty())
+                                .is_some_and(|l| l.trim_start().starts_with("mod "))
+                    })
+                    .unwrap_or(lines.len());
+                for (n, line) in lines[..end].iter().enumerate() {
                     if line.trim_start().starts_with("//") {
                         continue;
                     }
                     let at = format!("{}:{}", path.display(), n + 1);
+                    let line = line.to_ascii_lowercase();
                     assert!(!line.contains("style="), "{at}: inline style attribute");
                     assert!(!line.contains("<style"), "{at}: inline <style> block");
                     assert!(

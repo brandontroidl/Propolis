@@ -6,6 +6,11 @@
 //! A test binary of its own because it points the trust store at an empty file through
 //! SSL_CERT_FILE, which rustls-native-certs reads in place of the system store, and nothing else in
 //! this binary reads the environment.
+//!
+//! Built only where rustls-platform-verifier loads roots through rustls-native-certs (the same cfg
+//! it selects that loader with). On Apple and Windows targets the verifier asks the operating
+//! system instead and never reads SSL_CERT_FILE, so there the test could show nothing.
+#![cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener};

@@ -207,10 +207,10 @@ residual risk, not a control.
 end to end against populated data. It supplies its own paths, cluster and
 database, so it runs its own `pg_dump`, `pg_restore` and `tar` commands rather
 than these verbatim, with the same options: a test that needs no PostgreSQL, and
-so runs in CI, fails if a command on this page passes an option the rehearsal does
-not apply. It is `#[ignore]`d in the normal suite because
-it needs the PostgreSQL server binaries plus a `pg_dump` and `pg_restore` of the
-same major version, which CI does not install. Point it at that `bin` directory:
+so runs in CI, fails if a command on this page and the rehearsal's version of it
+pass different options, in either direction. The rehearsal itself is `#[ignore]`d
+in the normal suite because it needs the PostgreSQL server binaries plus a
+`pg_dump` and `pg_restore` of the same major version, which CI does not install. Point it at that `bin` directory:
 
 ```
 RESTORE_REHEARSAL_PG_BIN=/usr/lib/postgresql/18/bin \

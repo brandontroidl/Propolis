@@ -170,8 +170,14 @@ if you can, so a data-restore workflow never needs to touch the secret material.
    a newer binary is the supported direction.
 4. **Restore spool and host key.** On a rebuilt host, run `deploy/provision.sh`
    first so the service users exist, then unpack the state archive as root, which
-   keeps modes and maps each file's recorded owner name onto the local account
-   (`tar -xpzf propolis-state-<date>.tgz -C /`). The SSH host key under
+   keeps modes and maps each file's recorded owner name onto the local account:
+
+   ```
+   # Example - run as root on the rebuilt host.
+   tar -xpzf propolis-state-2026-09-28.tgz -C /
+   ```
+
+   The SSH host key under
    `/var/lib/propolis/ssh` restores the prior fingerprint; omit it only if you
    intend a fresh identity.
 5. **Start the platform** and verify. On startup the daemon connects, runs
@@ -198,7 +204,11 @@ residual risk, not a control.
 ## Restore rehearsal
 
 `crates/propolis/tests/restore_rehearsal.rs` runs this page's backup and restore
-end to end against populated data. It is `#[ignore]`d in the normal suite because
+end to end against populated data. It supplies its own paths, cluster and
+database, so it runs its own `pg_dump`, `pg_restore` and `tar` commands rather
+than these verbatim, with the same options: a test that needs no PostgreSQL, and
+so runs in CI, fails if a command on this page passes an option the rehearsal does
+not apply. It is `#[ignore]`d in the normal suite because
 it needs the PostgreSQL server binaries plus a `pg_dump` and `pg_restore` of the
 same major version, which CI does not install. Point it at that `bin` directory:
 
@@ -270,6 +280,9 @@ which placeholders stand in for.
 
 **2026-09-28 - pass.** PostgreSQL 18.0 server, `pg_dump` and `pg_restore` 18.0,
 GNU tar 1.35; restored into a fresh cluster (`initdb`), not only a fresh database.
+Re-run at 2026-09-29 00:03 UTC on the tree that adds the documented-option check,
+with the same result; the review migration count below is from that run, as the
+first record predated review migration `0007`.
 
 | Table | Rows, source = restored |
 |---|---|
@@ -281,7 +294,7 @@ GNU tar 1.35; restored into a fresh cluster (`initdb`), not only a fresh databas
 | `fetch_daily_usage` | 1 |
 | `sample_analysis` | 4 (1 pending verdict) |
 | `listener_probe` | 3 |
-| `_sqlx_migrations`, `_sqlx_migrations_review`, `_sqlx_migrations_fleet` | 12, 6, 1 |
+| `_sqlx_migrations`, `_sqlx_migrations_review`, `_sqlx_migrations_fleet` | 12, 7, 1 |
 
 - Every table's row digest, every named aggregate and every schema-object digest
   matched. Chain head `f6699ed522fc7f4633dc0a358a8f1b52006e1215fae1c4adf3a4bb899e90d994`

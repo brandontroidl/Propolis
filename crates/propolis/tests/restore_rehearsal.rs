@@ -57,6 +57,79 @@ const SPOOL_ROOT: &str = "var/spool/propolis";
 /// Largest body any spool may hold (`review::spool::MAX_SAMPLE_BYTES`); readers enforce it.
 const MAX_SAMPLE_BYTES: u64 = 500_000_000;
 
+// The options the rehearsal passes to each command the backup page documents. It cannot run the
+// page's commands verbatim (it supplies its own paths, cluster and database), so
+// `the_rehearsal_applies_every_option_the_backup_page_documents` holds the page to these instead.
+const PG_DUMP_FORMAT: &str = "--format=custom";
+const PG_RESTORE_STOP_ON_ERROR: &str = "--exit-on-error";
+const TAR_CREATE: &str = "-czf";
+const TAR_EXTRACT: &str = "-xzpf";
+
+/// The rehearsal proves the documented procedure only while it applies every option the page
+/// passes. An option added to the page but not here, such as `--no-privileges` on the restore or an
+/// `--exclude` on the archive, would leave the rehearsal passing while the real procedure lost the
+/// ledger's revoke or custody evidence. Needs no PostgreSQL, so it is not ignored.
+#[test]
+fn the_rehearsal_applies_every_option_the_backup_page_documents() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let doc = fs::read_to_string(root.join(BACKUP_DOC)).expect("backup page");
+    let check = |program: &str, commands: Vec<Vec<String>>, applied: &[&str]| {
+        assert!(
+            !commands.is_empty(),
+            "{BACKUP_DOC} has no {program} command"
+        );
+        let applied: BTreeSet<String> = applied.iter().map(|o| option_name(o)).collect();
+        for command in commands {
+            let documented: BTreeSet<String> = command
+                .iter()
+                .filter(|w| w.starts_with('-'))
+                .map(|o| option_name(o))
+                .collect();
+            let missing: Vec<&String> = documented.difference(&applied).collect();
+            assert!(
+                missing.is_empty(),
+                "{BACKUP_DOC}'s `{program} {}` passes {missing:?}, which the rehearsal does not \
+                 apply; apply it in populated_backup_restores_into_a_fresh_cluster",
+                command.join(" ")
+            );
+        }
+    };
+    check(
+        "pg_dump",
+        doc_commands::commands_running(&doc, "pg_dump"),
+        &[PG_DUMP_FORMAT, "--file"],
+    );
+    check(
+        "pg_restore",
+        doc_commands::commands_running(&doc, "pg_restore"),
+        &[PG_RESTORE_STOP_ON_ERROR, "--dbname"],
+    );
+    let (create, extract): (Vec<_>, Vec<_>) = doc_commands::commands_running(&doc, "tar")
+        .into_iter()
+        .partition(|c| {
+            c.first()
+                .is_some_and(|o| o.starts_with('-') && o.contains('c'))
+        });
+    check("tar (create)", create, &[TAR_CREATE, "-C"]);
+    check("tar (extract)", extract, &[TAR_EXTRACT, "-C"]);
+}
+
+/// An option as the comparison sees it: a short cluster by its letters in order (`-czf` and `-zcf`
+/// are one set of options), a long option by its name, except `--format`, whose value is the point.
+fn option_name(option: &str) -> String {
+    match option.strip_prefix("--") {
+        Some(long) => match long.split_once('=') {
+            Some(("format", _)) | None => option.to_string(),
+            Some((name, _)) => format!("--{name}"),
+        },
+        None => {
+            let mut letters: Vec<char> = option[1..].chars().collect();
+            letters.sort_unstable();
+            format!("-{}", letters.into_iter().collect::<String>())
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL server binaries: set RESTORE_REHEARSAL_PG_BIN (docs/operations/backup-and-restore.md)"]
 async fn populated_backup_restores_into_a_fresh_cluster() {
@@ -102,7 +175,7 @@ async fn populated_backup_restores_into_a_fresh_cluster() {
 
     // --- Backup, as documented ---------------------------------------------------------------
     run(Command::new(bin.join("pg_dump"))
-        .arg("--format=custom")
+        .arg(PG_DUMP_FORMAT)
         .arg(format!("--file={}", dump.display()))
         .arg(&source_url));
     let inputs = documented_archive_inputs();
@@ -121,7 +194,7 @@ async fn populated_backup_restores_into_a_fresh_cluster() {
     }
     let source_files = tree(&source_root.join(SPOOL_ROOT));
     run(Command::new("tar")
-        .arg("-czf")
+        .arg(TAR_CREATE)
         .arg(&archive)
         .arg("-C")
         .arg(&source_root)
@@ -147,12 +220,12 @@ async fn populated_backup_restores_into_a_fresh_cluster() {
     );
     provision(&target).await;
     run(Command::new(bin.join("pg_restore"))
-        .arg("--exit-on-error")
+        .arg(PG_RESTORE_STOP_ON_ERROR)
         .arg(format!("--dbname={}", target.url("postgres", "propolis")))
         .arg(&dump));
     fs::create_dir_all(&restored_root).unwrap();
     run(Command::new("tar")
-        .arg("-xzpf")
+        .arg(TAR_EXTRACT)
         .arg(&archive)
         .arg("-C")
         .arg(&restored_root));

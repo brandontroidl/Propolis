@@ -22,6 +22,31 @@ pub fn tar_create_inputs(markdown: &str) -> Vec<Vec<String>> {
     commands
 }
 
+/// The arguments of every command inside `markdown`'s fenced code blocks that runs `program`, one
+/// list per command, in document order. A leading `sudo` and `NAME=value` assignments are skipped
+/// to find the program.
+// Only the restore rehearsal reads whole commands; the docs gate compiles this module too.
+#[allow(dead_code)]
+pub fn commands_running(markdown: &str, program: &str) -> Vec<Vec<String>> {
+    let suffix = format!("/{program}");
+    let mut commands = Vec::new();
+    for line in fenced_logical_lines(markdown) {
+        let words = words(&line);
+        for command in words.split(|w| matches!(w.as_str(), "|" | "||" | "&&" | ";" | "&")) {
+            let mut rest = command
+                .iter()
+                .skip_while(|w| *w == "sudo" || is_assignment(w));
+            if rest
+                .next()
+                .is_some_and(|p| p == program || p.ends_with(&suffix))
+            {
+                commands.push(rest.cloned().collect());
+            }
+        }
+    }
+    commands
+}
+
 /// Lines inside ``` fences, with backslash-continued lines joined into one.
 fn fenced_logical_lines(markdown: &str) -> Vec<String> {
     let mut lines = Vec::new();

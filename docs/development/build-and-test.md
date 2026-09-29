@@ -86,17 +86,21 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 1670 test functions** (947 unit + 723 integration).
+- **Total: 1673 test functions** (947 unit + 726 integration).
 - **DB-backed (`sqlx::test`): 202** - console 159, core-scoring 25, intake 7,
   fleet 6, propolis 4, review 1. These provision a fresh database per test.
-- **Ignored: exactly 2.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
+- **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
   default suite stays offline-deterministic; run it manually with
-  `cargo test -p console -- --ignored rdns`. And
+  `cargo test -p console -- --ignored rdns`.
   `crates/propolis/tests/restore_rehearsal.rs`, the populated backup and restore
   rehearsal, which needs PostgreSQL server binaries CI does not install; its
   command and last recorded result are in
-  [backup and restore](../operations/backup-and-restore.md#restore-rehearsal).
+  [backup and restore](../operations/backup-and-restore.md#restore-rehearsal). And
+  `private_sessions_replay_byte_for_byte` in
+  `crates/sensor-framework/tests/shell_replay.rs`, which replays session fixtures
+  kept outside the repository; run it with `PROPOLIS_PRIVATE_SESSIONS=<dir> cargo test
+  -p sensor-framework --test shell_replay -- --ignored`.
 - **Outside the suite entirely: one browser fixture.** The console's stale-poll
   handling has to be checked in a real browser against a real hung socket - the
   suite can only check that the guarding code ships. Run by hand when the console's
@@ -127,7 +131,7 @@ Per-crate breakdown:
 | sensor-adb | 53 | 20 | integration |
 | sensor-catchall | 18 | 6 | integration |
 | sensor-cred | 14 | 8 | integration |
-| sensor-framework | 158 | 46 | build_stamp_test, deploy_test, listener_integration, spool_integration |
+| sensor-framework | 158 | 49 | build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
 | sensor-ftp | 7 | 14 | integration |
 | sensor-http | 8 | 16 | integration |
 | sensor-redis | 79 | 18 | integration |
@@ -136,7 +140,7 @@ Per-crate breakdown:
 | sensor-telnet | 39 | 18 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **947** | **723** | |
+| **Total** | **947** | **726** | |
 
 ### Test styles by layer
 

@@ -6801,11 +6801,39 @@ async fn assets_are_served_with_their_type_and_revalidated_by_etag(pool: PgPool)
             .await
             .unwrap();
         assert_eq!(again.status(), StatusCode::NOT_MODIFIED, "{uri}");
+
+        // A tag from before an upgrade must not be taken for the current one, or the browser
+        // keeps running the old script against the new pages.
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("if-none-match", "\"an-older-build\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::OK, "{uri}: stale tag");
+        assert_eq!(stale.headers()["etag"], etag.as_str(), "{uri}: stale tag");
+        assert!(!body_text(stale).await.is_empty(), "{uri}: stale tag");
     }
 
-    let unknown = app
+    // Names that reach the handler (one path segment, `..%2F` decoded by the extractor) but are
+    // not in its list. A handler that read the name from disk would serve these.
+    for uri in [
+        "/assets/Cargo.toml",
+        "/assets/..%2FCargo.toml",
+        "/assets/..%2F..%2FCargo.toml",
+    ] {
+        let response = app.clone().oneshot(get_request(uri, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+    // More than one segment never matches the asset route at all.
+    let nested = app
         .oneshot(get_request("/assets/../Cargo.toml", None))
         .await
         .unwrap();
-    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(nested.status(), StatusCode::NOT_FOUND);
 }

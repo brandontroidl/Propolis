@@ -30,7 +30,7 @@ use crate::auth::AuthState;
 use crate::channel::{ChannelAction, handle_channel_open, handle_channel_request};
 use crate::fakefs::FakeFs;
 use crate::hostkey::HostKey;
-use crate::shell::{EmitContext, FakeShell};
+use crate::shell::{EmitContext, FakeShell, onlcr};
 use crate::timeout_stream::TimeoutStream;
 use crate::transfer::{ScpReceiver, SftpHandler};
 use crate::transport::cipher::TransportCipher;
@@ -396,7 +396,7 @@ async fn handle_session(
                         } else {
                             // One-shot exec: send output and close.
                             if !output.is_empty() {
-                                let data_pkt = build_channel_data(ch_id, output.as_bytes());
+                                let data_pkt = build_channel_data(ch_id, output.bytes());
                                 write_encrypted(
                                     &mut stream,
                                     &mut s2c_cipher,
@@ -478,9 +478,7 @@ async fn handle_session(
                                             // terminal needs CR-LF or each line renders indented
                                             // (the cursor never returns to column 0). The Enter echo
                                             // and prompt above already use \r\n; match them.
-                                            responses.extend_from_slice(
-                                                output.replace('\n', "\r\n").as_bytes(),
-                                            );
+                                            responses.extend_from_slice(&onlcr(output.bytes()));
                                         }
                                     }
                                     responses.extend_from_slice(

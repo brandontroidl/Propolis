@@ -732,7 +732,7 @@ async fn handle_open(
                     if !output.is_empty() {
                         write_or_err(
                             stream,
-                            &adb_proto::build_wrte(server_id, client_local_id, output.as_bytes()),
+                            &adb_proto::build_wrte(server_id, client_local_id, output.bytes()),
                         )
                         .await?;
                     }
@@ -841,7 +841,7 @@ async fn handle_wrte(
                                 tracing::error!(%peer_addr, "adb: failed to append command event");
                             }
                         }
-                        responses.extend_from_slice(output.as_bytes());
+                        responses.extend_from_slice(output.bytes());
                         // Re-read the prompt each time: `cd` changes what it shows.
                         responses.extend_from_slice(&shell_prompt(shell));
                     }

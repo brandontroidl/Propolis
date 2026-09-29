@@ -14,7 +14,7 @@ use sensor_framework::fakefs::FakeFs;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::persona;
 use sensor_framework::sanitize_value;
-use sensor_framework::shell::{EmitContext, FakeShell};
+use sensor_framework::shell::{EmitContext, FakeShell, onlcr};
 use sensor_framework::{
     CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
     upload_metadata,
@@ -174,17 +174,15 @@ pub async fn handle_connection(
         // The shared shell emits bare LF line endings; a telnet NVT terminal needs CR-LF or the
         // cursor never returns to column 0 (each new line renders indented - a visible tell). The
         // banner/prompts above already use \r\n; translate the command output to match.
-        let output = output.replace('\n', "\r\n");
+        let output = onlcr(output.bytes());
 
         if is_exit {
-            let _ = stream
-                .write_all(&shell.encode_output(output.as_bytes()))
-                .await;
+            let _ = stream.write_all(&shell.encode_output(&output)).await;
             reader.mark_session_end(CaptureEnd::ClientLogout);
             break;
         }
 
-        let mut response = output.into_bytes();
+        let mut response = output;
         response.extend_from_slice(shell_prompt.as_bytes());
         // Mirror any XOR obfuscation onto the response so a symmetric-codec bot reads plaintext after
         // de-obfuscating (identity for a plaintext session, so normal bots are unaffected).

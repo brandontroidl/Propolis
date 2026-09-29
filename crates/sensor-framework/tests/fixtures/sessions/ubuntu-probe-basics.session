@@ -72,6 +72,13 @@ $ uname -m
 > x86_64
 $ id
 > uid=0(root) gid=0(root) groups=0(root)
+$ true && echo ok
+> ok
+$ false || echo fallback
+> fallback
+$ echo not found && echo still-runs
+> not found
+> still-runs
 $ whoami
 > root
 $ cd /dev/shm

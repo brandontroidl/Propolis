@@ -75,6 +75,131 @@ pub struct EmitContext {
 /// can be compared byte for byte.
 pub type Clock = fn() -> chrono::DateTime<chrono::Utc>;
 
+/// The two output streams a modeled command may write. Keeping the stream identity alongside
+/// bytes lets a non-PTY SSH exec send stderr as extended data while a terminal can merge both in
+/// their original order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFd {
+    Stdout,
+    Stderr,
+}
+
+/// One ordered write made by a modeled command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSegment {
+    pub fd: OutputFd,
+    pub bytes: Vec<u8>,
+}
+
+/// The observable result of one command or command list. Status is authoritative for shell
+/// control flow; output wording is never inspected to decide whether `&&` or `||` continues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandResult {
+    pub status: u8,
+    pub output: Vec<OutputSegment>,
+    combined: Vec<u8>,
+}
+
+impl CommandResult {
+    fn silent(status: u8) -> Self {
+        Self {
+            status,
+            output: Vec::new(),
+            combined: Vec::new(),
+        }
+    }
+
+    fn stdout(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::one(OutputFd::Stdout, 0, bytes.into())
+    }
+
+    fn stderr(status: u8, bytes: impl Into<Vec<u8>>) -> Self {
+        Self::one(OutputFd::Stderr, status, bytes.into())
+    }
+
+    fn one(fd: OutputFd, status: u8, bytes: Vec<u8>) -> Self {
+        if bytes.is_empty() {
+            return Self::silent(status);
+        }
+        Self {
+            status,
+            combined: bytes.clone(),
+            output: vec![OutputSegment { fd, bytes }],
+        }
+    }
+
+    fn append(&mut self, mut other: Self) {
+        self.status = other.status;
+        self.combined.append(&mut other.combined);
+        self.output.append(&mut other.output);
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.combined
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.combined
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.combined.is_empty()
+    }
+
+    pub fn contains(&self, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        self.combined
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        self.combined.starts_with(prefix.as_bytes())
+    }
+
+    pub fn ends_with(&self, suffix: &str) -> bool {
+        self.combined.ends_with(suffix.as_bytes())
+    }
+
+    pub fn lines(&self) -> std::str::Lines<'_> {
+        std::str::from_utf8(&self.combined).unwrap_or("").lines()
+    }
+}
+
+impl std::fmt::Display for CommandResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", String::from_utf8_lossy(&self.combined))
+    }
+}
+
+impl PartialEq<&str> for CommandResult {
+    fn eq(&self, other: &&str) -> bool {
+        self.combined == other.as_bytes()
+    }
+}
+
+impl PartialEq<String> for CommandResult {
+    fn eq(&self, other: &String) -> bool {
+        self.combined == other.as_bytes()
+    }
+}
+
+/// Apply the terminal ONLCR output transformation without assuming UTF-8. Every LF becomes CR-LF;
+/// all other bytes, including NUL and arbitrary executable bytes, pass through unchanged.
+pub fn onlcr(bytes: &[u8]) -> Vec<u8> {
+    let extra = bytes.iter().filter(|&&byte| byte == b'\n').count();
+    let mut out = Vec::with_capacity(bytes.len().saturating_add(extra));
+    for &byte in bytes {
+        if byte == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(byte);
+    }
+    out
+}
+
 /// Per-session ceiling on `honeypot_command_exec` events. A real interactive attacker runs a
 /// bounded kill chain (tens of commands); an unbounded stream is a flood - one IP produced >20k
 /// command events by streaming binary over the channel. Past this, the shell keeps responding but
@@ -190,16 +315,18 @@ impl FakeShell {
     /// every idle newline a client sends. This is the one place this function departs from
     /// "every call captures exactly one event" - called out here since it is the one behavior in
     /// this module not dictated directly by the interface.
-    pub fn handle_input(&mut self, line: &str) -> (String, Vec<SensorEvent>) {
-        if line.trim().is_empty() {
-            return (String::new(), Vec::new());
+    pub fn handle_input(&mut self, line: impl AsRef<[u8]>) -> (CommandResult, Vec<SensorEvent>) {
+        let raw = String::from_utf8_lossy(line.as_ref());
+        if raw.trim().is_empty() {
+            return (CommandResult::silent(0), Vec::new());
         }
 
-        // Decode a single-byte-XOR-obfuscated probe (identity for plaintext). The event records the
-        // RAW line verbatim - the hash chain must see exactly what crossed the wire - while the
-        // decoded form and key are annotated alongside so the grammar can respond and an analyst can
-        // read it. Dispatch and URL capture run on the DECODED line.
-        let (decoded, key) = self.codec.decode(line);
+        // Decode a single-byte-XOR-obfuscated probe (identity for plaintext). The event records a
+        // sanitized, lossily decoded representation of the pre-codec bytes; the transport capture,
+        // when one is retained, is where exact wire bytes live. The decoded form and key are
+        // annotated alongside so the grammar can respond and an analyst can read it. Dispatch and
+        // URL capture run on the decoded line.
+        let (decoded, key) = self.codec.decode(&raw);
         self.command_count += 1;
 
         // Two floods must never pollute the append-only ledger with one event per line: a
@@ -231,11 +358,11 @@ impl FakeShell {
                 }))]
             }
         } else {
-            // Normal command: the event records the RAW line verbatim (the hash chain must see
-            // exactly what crossed the wire); the decoded form and XOR key are annotated alongside.
+            // Normal command: the event records the sanitized pre-codec text; the decoded form and
+            // XOR key are annotated alongside.
             let mut metadata = serde_json::json!({
                 "protocol_label": self.ctx.protocol_label,
-                "command": sanitize_value(line, MAX_COMMAND_LEN),
+                "command": sanitize_value(&raw, MAX_COMMAND_LEN),
             });
             if let Some(k) = key
                 && let Some(obj) = metadata.as_object_mut()
@@ -282,14 +409,13 @@ impl FakeShell {
     /// with "ls: cannot access '/home;'" and never ran the busybox probe, so the bot never got
     /// the "applet not found" reply it waits for and left before its download stage (observed
     /// live 2026-09-06).
-    fn run_line(&mut self, decoded: &str) -> String {
-        let mut out = String::new();
-        let mut last_ok = true;
+    fn run_line(&mut self, decoded: &str) -> CommandResult {
+        let mut result = CommandResult::silent(0);
         for (op, segment) in control_segments(decoded) {
             let run = match op {
                 ControlOp::Seq => true,
-                ControlOp::And => last_ok,
-                ControlOp::Or => !last_ok,
+                ControlOp::And => result.status == 0,
+                ControlOp::Or => result.status != 0,
             };
             if !run {
                 continue;
@@ -298,14 +424,13 @@ impl FakeShell {
             if parts.is_empty() {
                 continue;
             }
-            let reply = match redirection_only_target(&parts) {
+            let command = match redirection_only_target(&parts) {
                 Some(target) => self.redirection_only(target),
                 None => self.dispatch(&parts),
             };
-            last_ok = !looks_like_failure(&reply);
-            out.push_str(&reply);
+            result.append(command);
         }
-        out
+        result
     }
 
     /// `> path` with no command is a real command: it opens the file for writing and prints
@@ -315,16 +440,20 @@ impl FakeShell {
     /// not, or the `&&` after it runs in the wrong places. Dispatching `>/var/run/.x` as a
     /// command name answered "command not found", failed every probe, and the chain never
     /// reached the busybox marker the loader keys its next stage on (observed live 2026-09-06).
-    fn redirection_only(&mut self, target: &str) -> String {
+    fn redirection_only(&mut self, target: &str) -> CommandResult {
         let resolved = self.resolve_path(target);
         match self.fs.create_file(&resolved) {
-            Ok(()) => String::new(),
-            Err(FsError::ReadOnly) => {
-                format!("{}: {resolved}: Read-only file system\n", self.shell_name())
-            }
-            Err(_) => format!(
-                "{}: {resolved}: No such file or directory\n",
-                self.shell_name()
+            Ok(()) => CommandResult::silent(0),
+            Err(FsError::ReadOnly) => CommandResult::stderr(
+                1,
+                format!("{}: {resolved}: Read-only file system\n", self.shell_name()),
+            ),
+            Err(_) => CommandResult::stderr(
+                1,
+                format!(
+                    "{}: {resolved}: No such file or directory\n",
+                    self.shell_name()
+                ),
             ),
         }
     }
@@ -351,39 +480,50 @@ impl FakeShell {
     /// Produce the canned terminal output for one already-tokenized, non-empty command line.
     /// Every arm returns a static or lightly-interpolated string; none evaluates, spawns, or
     /// otherwise interprets `parts` as code - see the module doc.
-    fn dispatch(&mut self, parts: &[&str]) -> String {
+    fn dispatch(&mut self, parts: &[&str]) -> CommandResult {
         // Match on the command's basename, so a full path (`/bin/busybox`, `/userfs/bin/wget`,
         // `/bin/sh`) - which IoT loaders routinely use - resolves to the same applet a bare invocation
         // would, the way a real shell finds it on PATH. Only the command token is normalised;
         // arguments are untouched.
         let cmd = parts.first().map(|p| command_basename(p));
         match cmd {
-            Some("uname") => cmd_uname(parts, self.flavor),
-            Some("id") => "uid=0(root) gid=0(root) groups=0(root)\n".to_string(),
-            Some("whoami") => "root\n".to_string(),
-            Some("pwd") => format!("{}\n", self.cwd),
-            Some("echo") => cmd_echo(&parts[1..]),
+            Some("uname") => CommandResult::stdout(cmd_uname(parts, self.flavor)),
+            Some("id") => CommandResult::stdout(
+                "uid=0(root) gid=0(root) groups=0(root)\n"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            Some("whoami") => CommandResult::stdout(b"root\n".to_vec()),
+            Some("pwd") => CommandResult::stdout(format!("{}\n", self.cwd)),
+            Some("echo") => CommandResult::stdout(cmd_echo(&parts[1..])),
             Some("cat") => self.cmd_cat(parts),
             Some("ls") => self.cmd_ls(parts),
             // `mount` with no arguments lists the same table `/proc/mounts` exposes; mounting
             // something as root is a silent success like the other no-output applets.
-            Some("mount") => cmd_mount(parts),
+            Some("mount") => CommandResult::stdout(cmd_mount(parts)),
             // Mirai's telnet preamble is `enable`, `system`, `shell`, `sh`: CLI-escape words for
             // routers. On the bash this box claims, `enable` is a builtin that lists the enabled
             // builtins; answering "command not found" for it (observed live 2026-09-06) was the
             // one reply a bash never gives. `system` and `shell` really are unknown to bash.
-            Some("enable") => cmd_enable(parts),
+            Some("enable") => CommandResult::stdout(cmd_enable(parts)),
+            Some("true") | Some(":") => CommandResult::silent(0),
+            Some("false") => CommandResult::silent(1),
             Some("wget") => {
+                let writes_stdout = matches!(wget_output(parts), WgetOutput::Stdout);
                 let out = cmd_wget(parts, (self.clock)());
                 self.save_fetched_file("wget", parts);
-                out
+                if writes_stdout {
+                    CommandResult::stdout(out)
+                } else {
+                    CommandResult::one(OutputFd::Stderr, 0, out.into_bytes())
+                }
             }
             Some("curl") => {
                 let out = cmd_curl(parts);
                 self.save_fetched_file("curl", parts);
-                out
+                CommandResult::stdout(out)
             }
-            Some("ping") => cmd_ping(parts),
+            Some("ping") => CommandResult::stdout(cmd_ping(parts)),
             // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
             // for sh/bash instantly outs the honeypot and the dropper leaves. Model a nested shell.
             // `ash` is BusyBox's shell and appears in the applet list, so it resolves here too.
@@ -397,7 +537,7 @@ impl FakeShell {
             // target URL is captured by `download_target` above.
             Some(fetcher @ ("tftp" | "ftpget")) => {
                 self.save_fetched_file(fetcher, parts);
-                String::new()
+                CommandResult::silent(0)
             }
             // Filesystem/no-output applets in a loader's drop chain (`chmod +x x`, then `cp`/`rm`/
             // `mkdir`/`sleep`). A real shell prints nothing on success, and "command not found" for
@@ -415,7 +555,7 @@ impl FakeShell {
                         self.fs.mark_executable(&path);
                     }
                 }
-                String::new()
+                CommandResult::silent(0)
             }
             // These change the filesystem the rest of the session sees. Answering silent
             // success while changing nothing let a loader `cp` a payload and then fail to find
@@ -423,7 +563,7 @@ impl FakeShell {
             Some("cp") => self.cmd_cp(parts),
             Some("rm") => self.cmd_rm(parts),
             Some("mkdir") => self.cmd_mkdir(parts),
-            Some("sleep") => String::new(),
+            Some("sleep") => CommandResult::silent(0),
             Some("cd") => {
                 // Only into a directory the box presents: a silent `cd` into a directory that
                 // `ls /` never showed is a tell, and a loader's `>/x/.x && cd /x` chain relies on
@@ -431,18 +571,21 @@ impl FakeShell {
                 let target = self.resolve_path(first_non_flag_arg(&parts[1..]).unwrap_or("/root"));
                 if self.fs.is_dir(&target) {
                     self.cwd = target;
-                    String::new()
+                    CommandResult::silent(0)
                 } else {
-                    format!(
-                        "{}: cd: {target}: No such file or directory\n",
-                        self.shell_name()
+                    CommandResult::stderr(
+                        1,
+                        format!(
+                            "{}: cd: {target}: No such file or directory\n",
+                            self.shell_name()
+                        ),
                     )
                 }
             }
             // Already root on this box, so `su` (and `su -`, `su root`) opens another shell
             // silently, prompt unchanged; "command not found" would be a tell on any Linux.
-            Some("su") => String::new(),
-            Some("exit") | Some("logout") => String::new(),
+            Some("su") => CommandResult::silent(0),
+            Some("exit") | Some("logout") => CommandResult::silent(0),
             // A token with a slash names a path, and bash answers for the path, not for PATH:
             // a file the attacker created and chmod'ed runs (an empty file exits 0 with no
             // output, which is what the writable-directory probe `>/tmp/d && chmod 777 /tmp/d
@@ -451,26 +594,35 @@ impl FakeShell {
             Some(other) if parts[0].contains('/') => {
                 let path = self.resolve_path(parts[0]);
                 if self.fs.is_executable(&path) {
-                    String::new()
+                    CommandResult::silent(0)
                 } else if self.fs.read_file(&path).is_some() {
-                    format!("{}: {}: Permission denied\n", self.shell_name(), parts[0])
+                    CommandResult::stderr(
+                        126,
+                        format!("{}: {}: Permission denied\n", self.shell_name(), parts[0]),
+                    )
                 } else if self.fs.is_dir(&path) {
-                    format!("{}: {}: Is a directory\n", self.shell_name(), parts[0])
+                    CommandResult::stderr(
+                        126,
+                        format!("{}: {}: Is a directory\n", self.shell_name(), parts[0]),
+                    )
                 } else {
                     let _ = other;
                     // mksh says only "not found" for a path it cannot execute.
-                    match self.flavor {
-                        ShellFlavor::Bash => {
-                            format!("bash: {}: No such file or directory\n", parts[0])
-                        }
-                        ShellFlavor::AndroidSh => self.not_found(parts[0]),
-                    }
+                    CommandResult::stderr(
+                        127,
+                        match self.flavor {
+                            ShellFlavor::Bash => {
+                                format!("bash: {}: No such file or directory\n", parts[0])
+                            }
+                            ShellFlavor::AndroidSh => self.not_found(parts[0]),
+                        },
+                    )
                 }
             }
             // An interactive bash on Ubuntu prefixes the message with its own name; the bare form
             // matched no real shell.
-            Some(other) => self.not_found(other),
-            None => String::new(),
+            Some(other) => CommandResult::stderr(127, self.not_found(other)),
+            None => CommandResult::silent(0),
         }
     }
 
@@ -515,18 +667,21 @@ impl FakeShell {
 
     /// `cp [-flags] SRC DST`. The destination is a real copy for the rest of the session, and
     /// keeps the source's executable bit as a real `cp` does.
-    fn cmd_cp(&mut self, parts: &[&str]) -> String {
+    fn cmd_cp(&mut self, parts: &[&str]) -> CommandResult {
         let operands: Vec<&str> = parts[1..]
             .iter()
             .copied()
             .filter(|a| !a.starts_with('-'))
             .collect();
         let (Some(&src), Some(&dst)) = (operands.first(), operands.get(1)) else {
-            return "cp: missing destination file operand\n".to_string();
+            return CommandResult::stderr(1, "cp: missing destination file operand\n");
         };
         let src_path = self.resolve_path(src);
         let Some(contents) = self.fs.read_file(&src_path) else {
-            return format!("cp: cannot stat '{src}': No such file or directory\n");
+            return CommandResult::stderr(
+                1,
+                format!("cp: cannot stat '{src}': No such file or directory\n"),
+            );
         };
         let mut dst_path = self.resolve_path(dst);
         if self.fs.is_dir(&dst_path) {
@@ -539,23 +694,27 @@ impl FakeShell {
         match self.fs.write_file(&dst_path, &contents) {
             Ok(()) => {}
             Err(FsError::ReadOnly) => {
-                return format!("cp: cannot create regular file '{dst}': Read-only file system\n");
+                return CommandResult::stderr(
+                    1,
+                    format!("cp: cannot create regular file '{dst}': Read-only file system\n"),
+                );
             }
             Err(_) => {
-                return format!(
-                    "cp: cannot create regular file '{dst}': No such file or directory\n"
+                return CommandResult::stderr(
+                    1,
+                    format!("cp: cannot create regular file '{dst}': No such file or directory\n"),
                 );
             }
         }
         if self.fs.is_executable(&src_path) {
             self.fs.mark_executable(&dst_path);
         }
-        String::new()
+        CommandResult::silent(0)
     }
 
     /// `rm [-rf] PATH...`. A removed file stops being readable and listed; `-f` stays silent on
     /// a path that was not there, as the real one does.
-    fn cmd_rm(&mut self, parts: &[&str]) -> String {
+    fn cmd_rm(&mut self, parts: &[&str]) -> CommandResult {
         let flags: Vec<&str> = parts[1..]
             .iter()
             .copied()
@@ -570,9 +729,9 @@ impl FakeShell {
             .collect();
         if targets.is_empty() {
             return if force {
-                String::new()
+                CommandResult::silent(0)
             } else {
-                "rm: missing operand\n".to_string()
+                CommandResult::stderr(1, "rm: missing operand\n")
             };
         }
         let mut out = String::new();
@@ -593,11 +752,15 @@ impl FakeShell {
                 )),
             }
         }
-        out
+        if out.is_empty() {
+            CommandResult::silent(0)
+        } else {
+            CommandResult::stderr(1, out)
+        }
     }
 
     /// `mkdir [-p] DIR...`. The new directory is one `cd` and `ls` accept afterwards.
-    fn cmd_mkdir(&mut self, parts: &[&str]) -> String {
+    fn cmd_mkdir(&mut self, parts: &[&str]) -> CommandResult {
         let parents = parts[1..]
             .iter()
             .any(|a| a.starts_with('-') && a.contains('p'));
@@ -607,7 +770,7 @@ impl FakeShell {
             .filter(|a| !a.starts_with('-'))
             .collect();
         if targets.is_empty() {
-            return "mkdir: missing operand\n".to_string();
+            return CommandResult::stderr(1, "mkdir: missing operand\n");
         }
         let mut out = String::new();
         for target in targets {
@@ -634,10 +797,14 @@ impl FakeShell {
                 )),
             }
         }
-        out
+        if out.is_empty() {
+            CommandResult::silent(0)
+        } else {
+            CommandResult::stderr(1, out)
+        }
     }
 
-    fn cmd_cat(&self, parts: &[&str]) -> String {
+    fn cmd_cat(&self, parts: &[&str]) -> CommandResult {
         match first_non_flag_arg(&parts[1..]) {
             Some(path) => {
                 let resolved = self.resolve_path(path);
@@ -648,17 +815,21 @@ impl FakeShell {
                 if resolved == "/proc/self/cmdline" {
                     let mut out = parts.join("\0");
                     out.push('\0');
-                    return out;
+                    return CommandResult::stdout(out.into_bytes());
                 }
-                self.fs
-                    .read_file(&resolved)
-                    .unwrap_or_else(|| format!("cat: {path}: No such file or directory\n"))
+                match self.fs.read_file(&resolved) {
+                    Some(contents) => CommandResult::stdout(contents.into_bytes()),
+                    None => CommandResult::stderr(
+                        1,
+                        format!("cat: {path}: No such file or directory\n"),
+                    ),
+                }
             }
-            None => String::new(),
+            None => CommandResult::silent(0),
         }
     }
 
-    fn cmd_ls(&self, parts: &[&str]) -> String {
+    fn cmd_ls(&self, parts: &[&str]) -> CommandResult {
         let target = first_non_flag_arg(&parts[1..]).unwrap_or(self.cwd.as_str());
         let show_hidden = parts[1..]
             .iter()
@@ -672,19 +843,22 @@ impl FakeShell {
                 }
                 entries.sort();
                 if entries.is_empty() {
-                    String::new()
+                    CommandResult::silent(0)
                 } else {
-                    entries.join("  ") + "\n"
+                    CommandResult::stdout(entries.join("  ") + "\n")
                 }
             }
-            None => format!("ls: cannot access '{target}': No such file or directory\n"),
+            None => CommandResult::stderr(
+                2,
+                format!("ls: cannot access '{target}': No such file or directory\n"),
+            ),
         }
     }
 
     /// `sh` / `bash`. A nested interactive shell just drops the caller at a new prompt, so a bare
     /// invocation is a no-op that keeps the session in this fake shell (never "command not found").
     /// `sh -c "CMD"` runs CMD in the fake shell, since loaders stage their payload that way.
-    fn cmd_shell_spawn(&mut self, parts: &[&str]) -> String {
+    fn cmd_shell_spawn(&mut self, parts: &[&str]) -> CommandResult {
         let script = parts
             .iter()
             .position(|&p| p == "-c")
@@ -696,17 +870,17 @@ impl FakeShell {
                 return self.dispatch(&inner_parts);
             }
         }
-        String::new()
+        CommandResult::silent(0)
     }
 
     /// `busybox`. Bare invocation prints the multi-call banner. `busybox <applet> ...` runs the
     /// applet if it is one this shell models, else returns BusyBox's exact "<applet>: applet not
     /// found" - the reply Mirai/Gafgyt check for to confirm a real busybox before delivering.
-    fn cmd_busybox(&mut self, parts: &[&str]) -> String {
+    fn cmd_busybox(&mut self, parts: &[&str]) -> CommandResult {
         match parts.get(1).copied() {
-            None => busybox_banner(),
+            None => CommandResult::stdout(busybox_banner()),
             Some(applet) if is_busybox_applet(applet) => self.dispatch(&parts[1..]),
-            Some(applet) => format!("{applet}: applet not found\n"),
+            Some(applet) => CommandResult::stderr(127, format!("{applet}: applet not found\n")),
         }
     }
 }
@@ -985,16 +1159,6 @@ fn redirection_only_target<'a>(parts: &[&'a str]) -> Option<&'a str> {
         i += 1;
     }
     target
-}
-
-/// Whether a canned reply reads as a failed command, for `&&`/`||` sequencing. A real shell has
-/// an exit status; this grammar has only its output, so the failure vocabulary the grammar
-/// itself emits stands in for it.
-fn looks_like_failure(reply: &str) -> bool {
-    reply.contains("not found")
-        || reply.contains("No such file")
-        || reply.contains("cannot access")
-        || reply.contains("Permission denied")
 }
 
 /// `tftp [-g|-p] [-l LOCAL] [-r REMOTE] HOST [PORT]` (BusyBox) -> `tftp://HOST[:PORT]/REMOTE`.
@@ -1759,9 +1923,9 @@ mod echo_tests {
 #[cfg(test)]
 mod shell_detection_tests {
     use super::{
-        BUSYBOX_APPLETS, EmitContext, FakeShell, SIGNAL_HONEYPOT_FILE_DOWNLOAD, busybox_banner,
-        cmd_curl, cmd_uname, cmd_wget, download_target, is_busybox_applet, simple_commands,
-        url_if_fetch_line,
+        BUSYBOX_APPLETS, EmitContext, FakeShell, OutputFd, SIGNAL_HONEYPOT_FILE_DOWNLOAD,
+        busybox_banner, cmd_curl, cmd_uname, cmd_wget, download_target, is_busybox_applet, onlcr,
+        simple_commands, url_if_fetch_line,
     };
     use crate::fakefs::FakeFs;
 
@@ -1834,7 +1998,7 @@ mod shell_detection_tests {
                     _ => {}
                 }
             }
-            out
+            out.to_string()
         };
 
         // Preamble: bash lists its builtins for `enable`; `system`, `shell` and `linuxshell` do
@@ -2102,7 +2266,7 @@ mod shell_detection_tests {
     fn xor_obfuscated_command_is_decoded_dispatched_and_annotated() {
         let mut sh = shell();
         // The first obfuscated anchor ("enable" ^ 0x09) locks the session key.
-        sh.handle_input(&xor("enable", 0x09));
+        sh.handle_input(xor("enable", 0x09));
         // The obfuscated busybox probe now decodes and reaches the grammar.
         let probe_obf = xor("/bin/busybox LZRD", 0x09);
         let (out, events) = sh.handle_input(&probe_obf);
@@ -2151,7 +2315,7 @@ mod shell_detection_tests {
         let mut sh = shell();
         let mut total = 0;
         for i in 0..(cap + 50) {
-            total += sh.handle_input(&format!("cmd{i}")).1.len();
+            total += sh.handle_input(format!("cmd{i}")).1.len();
         }
         // `cap` real command events + exactly one cap marker; never one per line.
         assert_eq!(total, cap as usize + 1);
@@ -2171,7 +2335,7 @@ mod shell_detection_tests {
     #[test]
     fn encode_output_mirrors_after_a_command_locks_the_key() {
         let mut sh = shell();
-        sh.handle_input(&xor("enable", 0x09)); // an obfuscated command locks 0x09
+        sh.handle_input(xor("enable", 0x09)); // an obfuscated command locks 0x09
         assert_eq!(sh.encode_output(b"# "), xor("# ", 0x09).into_bytes());
         // A plaintext session leaves output unchanged.
         let mut plain = shell();
@@ -2264,6 +2428,75 @@ mod shell_detection_tests {
         );
         let (out, _) = shell().handle_input("id && echo ok");
         assert!(out.contains("uid=0") && out.ends_with("ok\n"), "{out:?}");
+    }
+
+    #[test]
+    fn explicit_status_controls_lists_without_reading_output_words() {
+        let (out, _) = shell().handle_input("echo not found && echo continued");
+        assert_eq!(out, "not found\ncontinued\n");
+        assert_eq!(out.status, 0);
+
+        let (out, _) = shell().handle_input("false && echo skipped || echo fallback");
+        assert_eq!(out, "fallback\n");
+        assert_eq!(out.status, 0);
+
+        let (out, _) = shell().handle_input("true || echo skipped");
+        assert_eq!(out, "");
+        assert_eq!(out.status, 0);
+    }
+
+    #[test]
+    fn command_result_keeps_ordered_stdout_and_stderr_segments() {
+        let (out, _) = shell().handle_input("nosuchcmd; echo recovered");
+        assert_eq!(out.status, 0, "the final command decides the list status");
+        assert_eq!(
+            out.bytes(),
+            b"bash: nosuchcmd: command not found\nrecovered\n"
+        );
+        assert_eq!(out.output.len(), 2);
+        assert_eq!(out.output[0].fd, OutputFd::Stderr);
+        assert_eq!(out.output[1].fd, OutputFd::Stdout);
+
+        let (failed, _) = shell().handle_input("nosuchcmd");
+        assert_eq!(failed.status, 127);
+        assert_eq!(failed.output[0].fd, OutputFd::Stderr);
+    }
+
+    #[test]
+    fn modeled_failures_carry_their_real_exit_statuses() {
+        let mut sh = shell();
+        let cases = [
+            ("/bin/busybox ECCHI", 127),
+            ("false", 1),
+            ("nosuchcmd_q", 127),
+            ("/tmp", 126),
+            ("/tmp/missing_q", 127),
+            ("cat /missing_q", 1),
+            ("ls /missing_q", 2),
+            ("cd /missing_q", 1),
+            ("cp", 1),
+            ("rm", 1),
+            ("mkdir", 1),
+            ("> /missing_q/x", 1),
+        ];
+        for (line, expected) in cases {
+            let (out, _) = sh.handle_input(line);
+            assert_eq!(out.status, expected, "{line}: {out:?}");
+            if !out.is_empty() {
+                assert_eq!(out.output[0].fd, OutputFd::Stderr, "{line}: {out:?}");
+            }
+        }
+
+        assert_eq!(sh.handle_input(">/tmp/np").0.status, 0);
+        assert_eq!(sh.handle_input("/tmp/np").0.status, 126);
+        assert_eq!(sh.handle_input("mkdir /tmp/existing").0.status, 0);
+        assert_eq!(sh.handle_input("mkdir /tmp/existing").0.status, 1);
+    }
+
+    #[test]
+    fn onlcr_maps_newlines_without_decoding_bytes() {
+        assert_eq!(onlcr(b"a\n\0\xffb\n"), b"a\r\n\0\xffb\r\n");
+        assert_eq!(onlcr(b"\r\n"), b"\r\r\n");
     }
 
     #[test]

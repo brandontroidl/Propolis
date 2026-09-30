@@ -60,6 +60,7 @@ mod dd;
 mod eval;
 mod expand;
 mod lex;
+mod lookup;
 mod parse;
 mod read;
 mod readlink;
@@ -2723,6 +2724,8 @@ mod budget_tests;
 mod dd_tests;
 #[cfg(test)]
 mod grammar_tests;
+#[cfg(test)]
+mod lookup_tests;
 #[cfg(test)]
 mod proc_self_tests;
 #[cfg(test)]

@@ -779,6 +779,7 @@ impl FakeFs {
         for alias in binaries::ALIASES {
             b.symlink(alias.path, alias.target);
         }
+        b.binary(binaries::WHICH_PATH, binaries::WHICH_SCRIPT);
         // The usrmerge layout: the top-level names are symlinks into /usr, with relative targets
         // as the real ones have, and their targets must be directories.
         for name in ["bin", "sbin", "lib", "lib64"] {

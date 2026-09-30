@@ -29,7 +29,7 @@ const EXEC_BITS: u32 = 0o111;
 
 pub(super) fn register(r: &mut Registry) {
     for name in ["test", "["] {
-        r.register(name, HandlerId::Test, FakeShell::builtin_test);
+        r.register_builtin(name, HandlerId::Test, FakeShell::builtin_test);
     }
 }
 

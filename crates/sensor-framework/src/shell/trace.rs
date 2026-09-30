@@ -125,6 +125,10 @@ pub enum HandlerId {
     Continue,
     /// `.`, `source` and `eval`: recorded, never run.
     SourceEval,
+    /// The `command` builtin: `-v`/`-V` describe a name, anything else runs it.
+    CommandBuiltin,
+    Type,
+    Which,
     /// A compound command or a pipeline: no handler, the engine evaluates the node itself.
     Compound,
     PathInvoke,
@@ -490,6 +494,9 @@ mod tests {
             ("hexdump -C /etc/hostname", HandlerId::Hexdump),
             ("dd if=/etc/hostname", HandlerId::Dd),
             ("readlink /bin", HandlerId::Readlink),
+            ("command -v ls", HandlerId::CommandBuiltin),
+            ("type ls", HandlerId::Type),
+            ("which ls", HandlerId::Which),
             ("ls /", HandlerId::Ls),
             ("mount", HandlerId::Mount),
             ("enable", HandlerId::EnableBuiltin),

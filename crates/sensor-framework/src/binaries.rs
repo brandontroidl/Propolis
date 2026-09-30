@@ -13,11 +13,85 @@
 //! first 64 bytes. `tests/fixtures/ubuntu-2204-elf-headers.tsv` holds the same rows and the golden
 //! test compares the two, so editing either alone fails.
 //!
-//! Left out on purpose: the three scripts (`which`, `gunzip`, `service`), whose first bytes are text
+//! Left out on purpose: two of the three scripts (`gunzip`, `service`), whose first bytes are text
 //! and would need their real bodies, and `awk`, whose path is a symlink chain the recording did not
-//! capture link by link.
+//! capture link by link. The third, `which`, is the one script the box models ([`WHICH_SCRIPT`]),
+//! because the lookup commands must be able to find it.
 
 use crate::fakefs::{Blob, ELF_HEADER_LEN, ElfImage};
+
+/// Where the debianutils `which` script is found on the box.
+pub const WHICH_PATH: &str = "/usr/bin/which";
+
+/// The `which` script, debianutils 5.5-1ubuntu2. The first 64 bytes are the ones recorded from
+/// Ubuntu 22.04 on 2026-09-29, which also gave its size, 946 bytes. The rest is written from the
+/// script's logic (the search the shell's `which` performs), so its length is not the recorded one
+/// [unverified body].
+pub const WHICH_SCRIPT: &str = r#"#! /bin/sh
+set -ef
+
+if test -n "$KSH_VERSION"; then
+	puts() {
+		print -r -- "$*"
+	}
+else
+	puts() {
+		printf '%s\n' "$*"
+	}
+fi
+
+ALLMATCHES=0
+
+while getopts a whichopts
+do
+	case "$whichopts" in
+		a) ALLMATCHES=1 ;;
+		?) puts "Usage: $0 [-a] args"; exit 2 ;;
+	esac
+done
+shift $(($OPTIND - 1))
+
+if [ "$#" -eq 0 ]; then
+	ALLRET=1
+else
+	ALLRET=0
+fi
+case $PATH in
+	(*[!:]:) PATH="$PATH:" ;;
+esac
+
+for PROGRAM in "$@"; do
+	RET=1
+	IFS_SAVE="$IFS"
+	IFS=:
+	case $PROGRAM in
+	*/*)
+		if [ -f "$PROGRAM" ] && [ -x "$PROGRAM" ]; then
+			puts "$PROGRAM"
+			RET=0
+		fi
+		;;
+	*)
+		for ELEMENT in $PATH; do
+			if [ -z "$ELEMENT" ]; then
+				ELEMENT=.
+			fi
+			if [ -f "$ELEMENT/$PROGRAM" ] && [ -x "$ELEMENT/$PROGRAM" ]; then
+				puts "$ELEMENT/$PROGRAM"
+				RET=0
+				[ "$ALLMATCHES" -eq 1 ] || break
+			fi
+		done
+		;;
+	esac
+	IFS="$IFS_SAVE"
+	if [ "$RET" -ne 0 ]; then
+		ALLRET=1
+	fi
+done
+
+exit "$ALLRET"
+"#;
 
 /// Offset of the first newline in `/usr/bin/ls`. The pty capture of `head -n 1 /bin/ls` returned 411
 /// wire bytes, which is bytes 0 through this offset with the newline expanded to CR LF, so the

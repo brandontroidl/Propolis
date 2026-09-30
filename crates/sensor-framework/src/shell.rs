@@ -36,7 +36,7 @@ use sensor_wire::{
 };
 
 use crate::command_codec::CommandCodec;
-use crate::fakefs::{FakeFs, FsError};
+use crate::fakefs::{FakeFs, FsError, READ_CAP};
 use crate::persona;
 use crate::sanitize_value;
 
@@ -556,12 +556,20 @@ impl FakeShell {
     /// command name answered "command not found", failed every probe, and the chain never
     /// reached the busybox marker the loader keys its next stage on (observed live 2026-09-06).
     fn redirection_only(&mut self, target: &str) -> CommandResult {
-        let resolved = self.resolve_path(target);
+        let resolved = self.resolve_logical(target);
         match self.fs.create_file(&resolved) {
             Ok(()) => CommandResult::silent(0),
             Err(FsError::ReadOnly) => CommandResult::stderr(
                 1,
                 self.shell_error(format_args!("{resolved}: Read-only file system")),
+            ),
+            Err(FsError::IsADirectory) => CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("{resolved}: Is a directory")),
+            ),
+            Err(FsError::NoSpace) => CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("{resolved}: No space left on device")),
             ),
             Err(_) => CommandResult::stderr(
                 1,
@@ -667,7 +675,7 @@ impl FakeShell {
                     && mode_grants_execute(mode)
                 {
                     for target in args {
-                        let path = self.resolve_path(target);
+                        let path = self.resolve_logical(target);
                         self.fs.mark_executable(&path);
                     }
                 }
@@ -684,7 +692,8 @@ impl FakeShell {
                 // Only into a directory the box presents: a silent `cd` into a directory that
                 // `ls /` never showed is a tell, and a loader's `>/x/.x && cd /x` chain relies on
                 // the two agreeing about what exists.
-                let target = self.resolve_path(first_non_flag_arg(&parts[1..]).unwrap_or("/root"));
+                let target =
+                    self.resolve_logical(first_non_flag_arg(&parts[1..]).unwrap_or("/root"));
                 if self.fs.is_dir(&target) {
                     self.cwd = target;
                     CommandResult::silent(0)
@@ -713,10 +722,10 @@ impl FakeShell {
             // && /tmp/d && cd /tmp/` keys its `cd` on), one it did not chmod is refused, and a
             // path that does not exist is "No such file", never "command not found".
             Some(other) if parts[0].contains('/') => {
-                let path = self.resolve_path(parts[0]);
+                let path = self.resolve_logical(parts[0]);
                 if self.fs.is_executable(&path) {
                     CommandResult::silent(0)
-                } else if self.fs.read_file(&path).is_some() {
+                } else if self.fs.file_exists(&path) {
                     CommandResult::stderr(
                         126,
                         self.shell_error(format_args!("{}: Permission denied", parts[0])),
@@ -748,10 +757,10 @@ impl FakeShell {
         }
     }
 
-    /// Resolve `arg` to an absolute path: returned as-is if it already starts with `/`, otherwise
-    /// joined onto `cwd`. Minimal - no `.`/`..` normalisation - which is enough for the canned FS
-    /// and the relative reads (`cd /proc && cat self/cmdline`) attackers actually use.
-    fn resolve_path(&self, arg: &str) -> String {
+    /// Resolve `arg` to an absolute logical path: joined onto `cwd` unless it starts with `/`, then
+    /// normalised lexically. Symlinks stay unresolved here, so `cd /var/run` leaves `pwd` at
+    /// `/var/run` as bash's logical mode does; [`FakeFs`] resolves them physically per operation.
+    fn resolve_logical(&self, arg: &str) -> String {
         let joined = if arg.starts_with('/') {
             arg.to_string()
         } else {
@@ -782,8 +791,8 @@ impl FakeShell {
     /// printed to stdout saves nothing, as the real command does not.
     fn save_fetched_file(&mut self, cmd: &str, parts: &[&str]) {
         if let Some(name) = download_save_name(cmd, parts) {
-            let path = self.resolve_path(&name);
-            let _ = self.fs.write_file(&path, FETCHED_BODY);
+            let path = self.resolve_logical(&name);
+            let _ = self.fs.write_file(&path, FETCHED_BODY.as_bytes());
         }
     }
 
@@ -835,14 +844,14 @@ impl FakeShell {
         let (Some(&src), Some(&dst)) = (operands.first(), operands.get(1)) else {
             return CommandResult::stderr(1, "cp: missing destination file operand\n");
         };
-        let src_path = self.resolve_path(src);
-        let Some(contents) = self.fs.read_file(&src_path) else {
+        let src_path = self.resolve_logical(src);
+        let Ok((blob, mode)) = self.fs.content_and_mode(&src_path) else {
             return CommandResult::stderr(
                 1,
                 format!("cp: cannot stat '{src}': No such file or directory\n"),
             );
         };
-        let mut dst_path = self.resolve_path(dst);
+        let mut dst_path = self.resolve_logical(dst);
         if self.fs.is_dir(&dst_path) {
             dst_path = format!(
                 "{}/{}",
@@ -850,7 +859,7 @@ impl FakeShell {
                 command_basename(src)
             );
         }
-        match self.fs.write_file(&dst_path, &contents) {
+        match self.fs.write_blob(&dst_path, blob, mode) {
             Ok(()) => {}
             Err(FsError::ReadOnly) => {
                 return CommandResult::stderr(
@@ -864,9 +873,6 @@ impl FakeShell {
                     format!("cp: cannot create regular file '{dst}': No such file or directory\n"),
                 );
             }
-        }
-        if self.fs.is_executable(&src_path) {
-            self.fs.mark_executable(&dst_path);
         }
         CommandResult::silent(0)
     }
@@ -895,7 +901,7 @@ impl FakeShell {
         }
         let mut out = String::new();
         for target in targets {
-            let path = self.resolve_path(target);
+            let path = self.resolve_logical(target);
             if self.fs.is_dir(&path) && !recursive {
                 out.push_str(&format!("rm: cannot remove '{target}': Is a directory\n"));
                 continue;
@@ -933,7 +939,7 @@ impl FakeShell {
         }
         let mut out = String::new();
         for target in targets {
-            let path = self.resolve_path(target);
+            let path = self.resolve_logical(target);
             match self.fs.make_dir(&path) {
                 Ok(()) => {}
                 // `-p` is silent about an existing directory and creates missing parents.
@@ -951,7 +957,7 @@ impl FakeShell {
                 Err(FsError::Exists) => out.push_str(&format!(
                     "mkdir: cannot create directory '{target}': File exists\n"
                 )),
-                Err(FsError::NoSuchDirectory(_)) => out.push_str(&format!(
+                Err(_) => out.push_str(&format!(
                     "mkdir: cannot create directory '{target}': No such file or directory\n"
                 )),
             }
@@ -966,7 +972,7 @@ impl FakeShell {
     fn cmd_cat(&self, parts: &[&str]) -> CommandResult {
         match first_non_flag_arg(&parts[1..]) {
             Some(path) => {
-                let resolved = self.resolve_path(path);
+                let resolved = self.resolve_logical(path);
                 // /proc/self is the reading process (`cat`), so /proc/self/cmdline is its own argv,
                 // NUL-separated with a trailing NUL and no newline - exactly as the kernel returns
                 // it. A missing one ("No such file or directory") is a classic honeypot tell some
@@ -976,9 +982,12 @@ impl FakeShell {
                     out.push('\0');
                     return CommandResult::stdout(out.into_bytes());
                 }
-                match self.fs.read_file(&resolved) {
-                    Some(contents) => CommandResult::stdout(contents.into_bytes()),
-                    None => CommandResult::stderr(
+                match self.fs.read_all(&resolved, READ_CAP) {
+                    Ok(contents) => CommandResult::stdout(contents),
+                    Err(FsError::IsADirectory) => {
+                        CommandResult::stderr(1, format!("cat: {path}: Is a directory\n"))
+                    }
+                    Err(_) => CommandResult::stderr(
                         1,
                         format!("cat: {path}: No such file or directory\n"),
                     ),
@@ -993,7 +1002,7 @@ impl FakeShell {
         let show_hidden = parts[1..]
             .iter()
             .any(|a| a.starts_with('-') && (a.contains('a') || a.contains('A')));
-        match self.fs.list_dir(&self.resolve_path(target)) {
+        match self.fs.list_dir(&self.resolve_logical(target)) {
             Some(mut entries) => {
                 // A real `ls` hides dotfiles without `-a` and sorts what it prints. Listing the
                 // `.x` probe files a loader had just dropped was a tell on both counts.
@@ -1599,8 +1608,11 @@ fn cmd_mount(parts: &[&str]) -> String {
         return String::new();
     }
     let mut out = String::new();
-    for (source, point, fstype, opts) in crate::fakefs::MOUNT_TABLE {
-        out.push_str(&format!("{source} on {point} type {fstype} ({opts})\n"));
+    for m in crate::fakefs::MOUNT_TABLE {
+        out.push_str(&format!(
+            "{} on {} type {} ({})\n",
+            m.source, m.point, m.fstype, m.opts
+        ));
     }
     out
 }
@@ -2881,6 +2893,76 @@ mod shell_detection_tests {
         // Directories the root listing advertises, and ancestors of modeled files, still work.
         assert_eq!(sh.handle_input("cd /proc").0, "");
         assert_eq!(sh.handle_input("cd /bin").0, "");
+    }
+
+    /// A file made executable under a `noexec` mount is refused as the kernel refuses it, while
+    /// the same steps in an exec-permitted directory run. `/var/run` is `/run` behind a symlink,
+    /// so it is refused too.
+    #[test]
+    fn running_a_chmodded_file_from_a_noexec_mount_is_permission_denied() {
+        let mut sh = shell();
+        sh.handle_input(">/run/x; chmod +x /run/x");
+        let (out, _) = sh.handle_input("/run/x");
+        assert_eq!(out, "-bash: /run/x: Permission denied\n");
+        assert_eq!(out.status, 126);
+        assert_eq!(
+            sh.handle_input("/var/run/x").0,
+            "-bash: /var/run/x: Permission denied\n"
+        );
+        sh.handle_input(">/tmp/x; chmod +x /tmp/x");
+        assert_eq!(sh.handle_input("/tmp/x").0, "", "/tmp permits exec");
+
+        let mut android = FakeShell::android(
+            FakeFs::android(),
+            EmitContext {
+                source_ip: "203.0.113.7".parse().unwrap(),
+                wan_ip: None,
+                authenticated: true,
+                protocol_label: "adb".to_string(),
+                session_id: None,
+            },
+        );
+        android.handle_input(">/sdcard/x; chmod +x /sdcard/x");
+        let (out, _) = android.handle_input("/sdcard/x");
+        assert_eq!(out, "sh: /sdcard/x: Permission denied\n");
+        assert_eq!(out.status, 126);
+        android.handle_input(">/data/local/tmp/x; chmod +x /data/local/tmp/x");
+        assert_eq!(android.handle_input("/data/local/tmp/x").0, "");
+    }
+
+    /// `cat` of a directory says so; it used to claim the directory did not exist.
+    #[test]
+    fn cat_of_a_directory_says_it_is_a_directory() {
+        let mut sh = shell();
+        let (out, _) = sh.handle_input("cat /etc");
+        assert_eq!(out, "cat: /etc: Is a directory\n");
+        assert_eq!(out.status, 1);
+        assert_eq!(
+            sh.handle_input("cat /nonexistent").0,
+            "cat: /nonexistent: No such file or directory\n"
+        );
+        assert_eq!(
+            sh.handle_input("cat /bin").0,
+            "cat: /bin: Is a directory\n",
+            "a symlink to a directory is a directory"
+        );
+    }
+
+    /// `cd` through a symlink keeps the logical path in `pwd` and the prompt, as bash does, while
+    /// files resolve physically.
+    #[test]
+    fn cd_through_a_symlink_keeps_the_logical_cwd() {
+        let mut sh = shell();
+        assert_eq!(sh.handle_input("cd /var/run").0, "");
+        assert_eq!(sh.handle_input("pwd").0, "/var/run\n");
+        assert_eq!(sh.handle_input(">.x").0, "");
+        assert_eq!(sh.handle_input("ls -a /run").0, ".x  lock  user\n");
+        assert_eq!(sh.handle_input("cd /bin").0, "");
+        assert_eq!(sh.handle_input("pwd").0, "/bin\n");
+        assert_eq!(
+            sh.handle_input("cat busybox").0.bytes(),
+            b"\x7fELF\x02\x01\x01\0"
+        );
     }
 
     #[test]

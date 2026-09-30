@@ -101,7 +101,7 @@ fn command_with_injection_is_sanitized() {
 #[test]
 fn fakefs_common_paths_exist() {
     let fs = sensor_ssh::fakefs::FakeFs::new();
-    assert!(fs.read_file("/etc/hostname").is_some());
+    assert!(fs.file_exists("/etc/hostname"));
     assert!(fs.list_dir("/").is_some());
     assert!(fs.list_dir("/tmp").is_some());
 }
@@ -110,8 +110,9 @@ fn fakefs_common_paths_exist() {
 fn fakefs_uses_rfc5737_addresses() {
     let fs = sensor_ssh::fakefs::FakeFs::new();
     // Any IP addresses in canned content must be RFC5737/RFC1918.
-    if let Some(content) = fs.read_file("/etc/hosts") {
+    if let Ok(content) = fs.read_all("/etc/hosts", 4096) {
         // Should not contain real public IPs.
+        let content = String::from_utf8_lossy(&content);
         assert!(!content.contains("8.8.8.8"));
         assert!(!content.contains("1.1.1.1"));
     }

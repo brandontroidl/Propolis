@@ -12,38 +12,382 @@
 //! IPv6 multicast/link-local group, never a routable address of any kind - stricter than the
 //! RFC 5737/RFC 1918 documentation-only ranges this project's *emitted events* use, since a
 //! plain default `/etc/hosts` has no routable address in it at all.
+//!
+//! The model is one node type over two layers: an immutable persona [`Snapshot`] built at
+//! construction, and a per-session overlay of created nodes and tombstones. Paths given to the
+//! public methods are logical (symlinks unresolved); every content, directory and exec operation
+//! resolves them to a physical path first, so `/bin/busybox` and `/usr/bin/busybox` are one file.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use crate::persona;
 
-/// A snapshot of a plausible Linux filesystem, built fresh by `new()` for every session. The
-/// baked-in content is static; the one mutation the shell makes is `create_file`, recording an
-/// empty file an attacker wrote with a bare redirection, and that lives only for the session.
-/// The hostname- and OS-bearing files are sourced from [`crate::persona`] so they cannot
-/// contradict the shell's `uname`, the sensor prompts, or the other sensors' banners.
+/// Unix seconds stamped on every baked node (2024-01-01T00:00:00Z). Persona data: invisible until
+/// a `stat` is modeled, and kept a constant so this module never reads the clock.
+pub const PERSONA_MTIME: i64 = 1_704_067_200;
+
+/// Upper bound on the bytes one `read_all` returns. S7 replaces this with the connection's egress
+/// budget.
+pub const READ_CAP: u64 = 1 << 20;
+
+/// Symlinks followed while resolving one path before giving up with `ELOOP` (Linux's
+/// `MAXSYMLINKS`).
+const MAX_SYMLINK_HOPS: u32 = 40;
+
+const MODE_FILE: u32 = 0o100_644;
+const MODE_EXECUTABLE: u32 = 0o100_755;
+const MODE_DIRECTORY: u32 = 0o040_755;
+const MODE_SYMLINK: u32 = 0o120_777;
+const MODE_DEVICE: u32 = 0o020_666;
+const EXEC_BITS: u32 = 0o111;
+
+/// Seeds for the two random devices, so `cat /dev/urandom` is deterministic per session.
+const RANDOM_SEED: u64 = 0x5eed_0001;
+const URANDOM_SEED: u64 = 0x5eed_0002;
+
+/// One filesystem object. Size is always derived (a `Regular`'s blob length, a symlink's target
+/// length, zero for the rest), never stored.
+#[derive(Debug, Clone)]
+pub struct Node {
+    pub kind: NodeKind,
+    pub meta: Metadata,
+}
+
+#[derive(Debug, Clone)]
+pub enum NodeKind {
+    Regular(Blob),
+    Directory(DirListing),
+    Symlink { target: String },
+    Device(Device),
+}
+
+/// Static child names of a modeled directory. Overlay-created children are merged at list time,
+/// never stored here, so a snapshot's listing is immutable.
+#[derive(Debug, Clone)]
+pub struct DirListing {
+    entries: Vec<String>,
+}
+
+impl DirListing {
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Device {
+    /// Reads EOF, discards writes.
+    Null,
+    /// Reads zeros, discards writes.
+    Zero,
+    /// Reads zeros, refuses writes with `ENOSPC`.
+    Full,
+    /// Reads a deterministic counter-mode stream, discards writes.
+    Random,
+    Urandom,
+    /// Reads EOF, discards writes.
+    Tty,
+    /// `/dev/fd/N` behaviour, reserved for the fd table; nothing constructs it yet.
+    FdLink(u8),
+}
+
+impl Device {
+    fn read(self, off: u64, max_len: u64) -> Vec<u8> {
+        let len = usize::try_from(max_len.min(READ_CAP)).unwrap_or(0);
+        match self {
+            Device::Null | Device::Tty | Device::FdLink(_) => Vec::new(),
+            Device::Zero | Device::Full => vec![0; len],
+            Device::Random | Device::Urandom => {
+                let seed = if self == Device::Random {
+                    RANDOM_SEED
+                } else {
+                    URANDOM_SEED
+                };
+                (0..len)
+                    .map(|i| counter_byte(seed, off.saturating_add(i as u64)))
+                    .collect()
+            }
+        }
+    }
+
+    fn write(self) -> Result<(), FsError> {
+        match self {
+            Device::Full => Err(FsError::NoSpace),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Metadata {
+    /// Full `st_mode`, type bits included (`0o100_644` file, `0o040_755` directory).
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Unix seconds.
+    pub mtime: i64,
+}
+
+impl Metadata {
+    fn root_owned(mode: u32) -> Self {
+        Self {
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: PERSONA_MTIME,
+        }
+    }
+}
+
+impl Node {
+    pub fn regular(blob: Blob, mode: u32) -> Self {
+        Self {
+            kind: NodeKind::Regular(blob),
+            meta: Metadata::root_owned(mode),
+        }
+    }
+
+    pub fn directory(entries: Vec<String>) -> Self {
+        Self {
+            kind: NodeKind::Directory(DirListing { entries }),
+            meta: Metadata::root_owned(MODE_DIRECTORY),
+        }
+    }
+
+    pub fn symlink(target: &str) -> Self {
+        Self {
+            kind: NodeKind::Symlink {
+                target: target.to_string(),
+            },
+            meta: Metadata::root_owned(MODE_SYMLINK),
+        }
+    }
+
+    pub fn device(device: Device) -> Self {
+        Self {
+            kind: NodeKind::Device(device),
+            meta: Metadata::root_owned(MODE_DEVICE),
+        }
+    }
+}
+
+/// Bounded byte content of a regular file. Baked files are one small `Bytes` piece; `Fill` and
+/// `Counter` let a later step add large synthetic bodies with O(1) storage.
+#[derive(Debug, Clone)]
+pub struct Blob {
+    /// Invariant: `len` is the sum of the pieces' lengths; at most 64 pieces.
+    pieces: Vec<Piece>,
+    len: u64,
+}
+
+#[derive(Debug, Clone)]
+enum Piece {
+    Bytes(Arc<Vec<u8>>),
+    Fill { byte: u8, len: u64 },
+    Counter { seed: u64, len: u64 },
+}
+
+impl Piece {
+    fn len(&self) -> u64 {
+        match self {
+            Piece::Bytes(bytes) => bytes.len() as u64,
+            Piece::Fill { len, .. } | Piece::Counter { len, .. } => *len,
+        }
+    }
+
+    /// Append the bytes at piece-local offsets `[from, to)`; `to` is at most `self.len()`.
+    #[deny(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+    fn append_range(&self, from: u64, to: u64, out: &mut Vec<u8>) {
+        match self {
+            Piece::Bytes(bytes) => {
+                let from = usize::try_from(from).unwrap_or(usize::MAX);
+                let to = usize::try_from(to).unwrap_or(usize::MAX);
+                if let Some(slice) = bytes.get(from..to) {
+                    out.extend_from_slice(slice);
+                }
+            }
+            Piece::Fill { byte, .. } => {
+                let n = usize::try_from(to.saturating_sub(from)).unwrap_or(0);
+                out.resize(out.len().saturating_add(n), *byte);
+            }
+            Piece::Counter { seed, .. } => {
+                out.extend((from..to).map(|i| counter_byte(*seed, i)));
+            }
+        }
+    }
+}
+
+/// Byte `index` of the deterministic counter-mode stream for `seed` (splitmix64 over 8-byte
+/// blocks).
+#[deny(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+fn counter_byte(seed: u64, index: u64) -> u8 {
+    let block = (index >> 3).wrapping_add(1);
+    let mut z = seed.wrapping_add(block.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let lane = usize::try_from(index & 7).unwrap_or(0);
+    z.to_le_bytes().get(lane).copied().unwrap_or(0)
+}
+
+impl Blob {
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        let bytes = bytes.into();
+        let len = bytes.len() as u64;
+        Self {
+            pieces: vec![Piece::Bytes(Arc::new(bytes))],
+            len,
+        }
+    }
+
+    /// `len` copies of `byte`, stored in O(1).
+    pub fn fill(byte: u8, len: u64) -> Self {
+        Self {
+            pieces: vec![Piece::Fill { byte, len }],
+            len,
+        }
+    }
+
+    /// `len` bytes of the deterministic counter-mode stream for `seed`, stored in O(1).
+    pub fn counter(seed: u64, len: u64) -> Self {
+        Self {
+            pieces: vec![Piece::Counter { seed, len }],
+            len,
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Materialized bytes only; `Fill` and `Counter` pieces contribute nothing. The connection
+    /// budget sums this over the overlay.
+    pub fn owned_bytes(&self) -> u64 {
+        self.pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Bytes(bytes) => bytes.len() as u64,
+                Piece::Fill { .. } | Piece::Counter { .. } => 0,
+            })
+            .sum()
+    }
+
+    /// The bytes in `[off, off + min(max_len, len - off))`, empty when `off >= len`. Allocates at
+    /// most `max_len` bytes; an overflowing `off + max_len` saturates to the blob's end instead of
+    /// wrapping.
+    #[deny(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+    pub fn read_range(&self, off: u64, max_len: u64) -> Vec<u8> {
+        let end = off.saturating_add(max_len).min(self.len);
+        if off >= end {
+            return Vec::new();
+        }
+        let want = usize::try_from(end.saturating_sub(off)).unwrap_or(0);
+        let mut out = Vec::with_capacity(want);
+        let mut piece_start = 0u64;
+        for piece in &self.pieces {
+            let piece_end = piece_start.saturating_add(piece.len());
+            if piece_end > off && piece_start < end {
+                let from = off.max(piece_start).saturating_sub(piece_start);
+                let to = end.min(piece_end).saturating_sub(piece_start);
+                piece.append_range(from, to, &mut out);
+            }
+            piece_start = piece_end;
+            if piece_start >= end {
+                break;
+            }
+        }
+        out
+    }
+}
+
+/// One row of a mount table. `opts` is the comma-separated option string `/proc/mounts` shows.
+#[derive(Debug, Clone, Copy)]
+pub struct MountEntry {
+    pub source: &'static str,
+    pub point: &'static str,
+    pub fstype: &'static str,
+    pub opts: &'static str,
+}
+
+impl MountEntry {
+    const fn new(
+        source: &'static str,
+        point: &'static str,
+        fstype: &'static str,
+        opts: &'static str,
+    ) -> Self {
+        Self {
+            source,
+            point,
+            fstype,
+            opts,
+        }
+    }
+
+    fn opt(&self, name: &str) -> bool {
+        self.opts.split(',').any(|opt| opt == name)
+    }
+
+    /// Whether `path` is the mount point or below it, on a component boundary (`/systemx` is not
+    /// under `/system`).
+    fn covers(&self, path: &str) -> bool {
+        self.point == "/"
+            || path == self.point
+            || path
+                .strip_prefix(self.point)
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
+/// The immutable persona filesystem.
+struct Snapshot {
+    nodes: HashMap<String, Node>,
+    mounts: &'static [MountEntry],
+}
+
+impl Snapshot {
+    /// The mount governing `physical_path`: the covering entry with the longest mount point.
+    fn mount_for(&self, physical_path: &str) -> Option<&MountEntry> {
+        self.mounts
+            .iter()
+            .filter(|mount| mount.covers(physical_path))
+            .max_by_key(|mount| mount.point.len())
+    }
+
+    fn is_ro(&self, physical_path: &str) -> bool {
+        self.mount_for(physical_path)
+            .is_some_and(|mount| mount.opt("ro"))
+    }
+
+    fn is_noexec(&self, physical_path: &str) -> bool {
+        self.mount_for(physical_path)
+            .is_some_and(|mount| mount.opt("noexec"))
+    }
+}
+
+/// What the session changed on top of the snapshot. Overlay nodes are keyed by physical path.
+#[derive(Default)]
+struct Overlay {
+    nodes: HashMap<String, Node>,
+    /// Physical paths removed this session, baked-in ones included: a file the shell said it
+    /// deleted must stop being readable, or the next `cat` contradicts the `rm`.
+    tombstones: HashSet<String>,
+}
+
+/// A snapshot of a plausible Linux filesystem, built fresh by `new()` for every session, plus what
+/// the attacker changed. Files an attacker creates (a bare redirection, a download, a `cp`) live
+/// only for the session: loaders probe for a writable directory that way before choosing where
+/// to drop a payload, and the probe must succeed where a real box would let it. The hostname- and
+/// OS-bearing files are sourced from [`crate::persona`] so they cannot contradict the shell's
+/// `uname`, the sensor prompts, or the other sensors' banners.
 pub struct FakeFs {
-    files: HashMap<&'static str, String>,
-    dirs: HashMap<&'static str, Vec<&'static str>>,
-    /// Files an attacker created this session, with their contents: a redirection (`>/tmp/.x`)
-    /// leaves an empty one, a download the body it "fetched", a `cp` the source's contents.
-    /// Loaders probe for a writable directory this way before choosing where to drop a payload,
-    /// and the probe must succeed where a real box would let it, so the `&& cd` that follows
-    /// runs. Session-scoped, never persisted: the next session sees a clean box again.
-    created: HashMap<String, String>,
-    /// Directories an attacker created this session with `mkdir`.
-    created_dirs: HashSet<String>,
-    /// Paths an attacker removed this session with `rm`, baked-in ones included: a file the
-    /// shell said it deleted must stop being readable, or the next `cat` contradicts the `rm`.
-    removed: HashSet<String>,
-    /// Directory prefixes mounted read-only, which refuse every write under them. Empty on the
-    /// Linux server; `/system` and `/vendor` on the Android device, where a payload dropped into
-    /// `/system/bin` succeeding would be the tell.
-    readonly: &'static [&'static str],
-    /// Created files the attacker has `chmod`ed executable. A loader's writable-directory probe
-    /// is `>/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/`: the empty file must then run
-    /// (silently, exit 0) or the `&& cd` never happens.
-    executable: HashSet<String>,
+    snapshot: Arc<Snapshot>,
+    overlay: Overlay,
 }
 
 impl Default for FakeFs {
@@ -52,13 +396,106 @@ impl Default for FakeFs {
     }
 }
 
+/// Assembles a snapshot's nodes. Everything starts root-owned; only the modeled binaries are
+/// executable.
+struct Builder {
+    nodes: HashMap<String, Node>,
+}
+
+impl Builder {
+    fn new() -> Self {
+        Self {
+            nodes: HashMap::new(),
+        }
+    }
+
+    fn file(&mut self, path: &str, content: impl Into<Vec<u8>>) {
+        self.nodes.insert(
+            path.to_string(),
+            Node::regular(Blob::from_bytes(content), MODE_FILE),
+        );
+    }
+
+    fn binary(&mut self, path: &str, content: impl Into<Vec<u8>>) {
+        self.nodes.insert(
+            path.to_string(),
+            Node::regular(Blob::from_bytes(content), MODE_EXECUTABLE),
+        );
+    }
+
+    fn dir(&mut self, path: &str, entries: &[&str]) {
+        self.nodes.insert(
+            path.to_string(),
+            Node::directory(entries.iter().map(|e| e.to_string()).collect()),
+        );
+    }
+
+    fn symlink(&mut self, path: &str, target: &str) {
+        self.nodes.insert(path.to_string(), Node::symlink(target));
+    }
+
+    fn device(&mut self, path: &str, device: Device) {
+        self.nodes.insert(path.to_string(), Node::device(device));
+    }
+
+    /// An empty directory node for every child the `/` listing advertises that has no node yet,
+    /// except the names in `files`, which the listing shows but the box does not model as
+    /// directories.
+    fn advertise_root_children(&mut self, files: &[&str]) {
+        let children: Vec<String> = match self.nodes.get("/").map(|n| &n.kind) {
+            Some(NodeKind::Directory(listing)) => listing.entries.clone(),
+            _ => Vec::new(),
+        };
+        for child in children {
+            let path = format!("/{child}");
+            if !files.contains(&child.as_str()) && !self.nodes.contains_key(&path) {
+                self.nodes.insert(path, Node::directory(Vec::new()));
+            }
+        }
+    }
+
+    /// Give every node a directory for each missing ancestor (`/proc/self` exists because
+    /// `/proc/self/mounts` does). Idempotent.
+    fn ensure_ancestor_dirs(&mut self) {
+        let paths: Vec<String> = self.nodes.keys().cloned().collect();
+        for path in paths {
+            let mut current = path;
+            while let Some(parent) = parent_of(&current) {
+                if parent == current {
+                    break;
+                }
+                if !self.nodes.contains_key(&parent) {
+                    self.nodes
+                        .insert(parent.clone(), Node::directory(Vec::new()));
+                }
+                current = parent;
+            }
+        }
+    }
+
+    fn finish(mut self, mounts: &'static [MountEntry]) -> Snapshot {
+        self.ensure_ancestor_dirs();
+        Snapshot {
+            nodes: self.nodes,
+            mounts,
+        }
+    }
+}
+
 impl FakeFs {
+    fn from_snapshot(snapshot: Snapshot) -> Self {
+        Self {
+            snapshot: Arc::new(snapshot),
+            overlay: Overlay::default(),
+        }
+    }
+
     pub fn new() -> Self {
         let host = persona::hostname();
+        let mut b = Builder::new();
 
-        let mut files: HashMap<&'static str, String> = HashMap::new();
-        files.insert("/etc/hostname", format!("{host}\n"));
-        files.insert(
+        b.file("/etc/hostname", format!("{host}\n"));
+        b.file(
             "/etc/passwd",
             "root:x:0:0:root:/root:/bin/bash\n\
              daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
@@ -68,10 +505,9 @@ impl FakeFs {
              www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n\
              nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n\
              sshd:x:105:65534::/run/sshd:/usr/sbin/nologin\n\
-             ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n"
-                .to_string(),
+             ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n",
         );
-        files.insert(
+        b.file(
             "/etc/hosts",
             format!(
                 "127.0.0.1 localhost\n\
@@ -82,7 +518,7 @@ impl FakeFs {
                  ff02::2 ip6-allrouters\n"
             ),
         );
-        files.insert(
+        b.file(
             "/etc/os-release",
             format!(
                 "NAME=\"{name}\"\n\
@@ -97,29 +533,25 @@ impl FakeFs {
                 vid = persona::OS_VERSION_ID,
             ),
         );
-        files.insert("/proc/version", format!("{}\n", persona::proc_version()));
+        b.file("/proc/version", format!("{}\n", persona::proc_version()));
         // One mount table behind every file that exposes it, so `cat /proc/mounts`,
-        // `/proc/self/mounts`, `/etc/mtab` (a symlink to the second on Ubuntu), `mountinfo`
+        // `/proc/self/mounts`, `/etc/mtab` (a symlink to the second, as on Ubuntu), `mountinfo`
         // and the shell's `mount` cannot disagree. `cat /proc/mounts` used to say "No such
         // file", which no Linux box does.
-        let mounts = render_mounts(&MOUNT_TABLE);
-        files.insert("/proc/mounts", mounts.clone());
-        files.insert("/proc/self/mounts", mounts.clone());
-        files.insert("/etc/mtab", mounts);
-        files.insert("/proc/self/mountinfo", render_mountinfo(&MOUNT_TABLE));
-        files.insert(
+        b.file("/proc/mounts", render_mounts(&MOUNT_TABLE));
+        b.file("/proc/self/mounts", render_mounts(&MOUNT_TABLE));
+        b.file("/proc/self/mountinfo", render_mountinfo(&MOUNT_TABLE));
+        b.file(
             "/proc/cpuinfo",
             "processor\t: 0\n\
              vendor_id\t: GenuineIntel\n\
              model name\t: Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz\n\
-             cpu cores\t: 1\n"
-                .to_string(),
+             cpu cores\t: 1\n",
         );
 
-        let mut dirs = HashMap::new();
-        dirs.insert(
+        b.dir(
             "/",
-            vec![
+            &[
                 "bin", "boot", "dev", "etc", "home", "lib", "lib64", "media", "mnt", "opt", "proc",
                 "root", "run", "sbin", "srv", "sys", "tmp", "usr", "var",
             ],
@@ -128,20 +560,20 @@ impl FakeFs {
         // to a plain `ls`) /root - both are present as *known, empty* directories rather than
         // absent, so `ls` on either returns a correct empty listing instead of misreporting a
         // brand-new box as not even having a /root or /tmp at all.
-        dirs.insert("/tmp", vec![]);
-        dirs.insert("/root", vec![]);
-        dirs.insert(
+        b.dir("/tmp", &[]);
+        b.dir("/root", &[]);
+        b.dir(
             "/etc",
-            vec!["hostname", "mtab", "passwd", "hosts", "os-release"],
+            &["hostname", "mtab", "passwd", "hosts", "os-release"],
         );
-        dirs.insert("/home", vec!["ubuntu"]);
+        b.dir("/home", &["ubuntu"]);
         // Every mount point in the table is a directory the box presents, so `cd` into one
         // that `cat /proc/mounts` lists never fails.
-        dirs.insert("/boot", vec!["efi", "grub"]);
-        dirs.insert("/boot/efi", vec!["EFI"]);
-        dirs.insert(
+        b.dir("/boot", &["efi", "grub"]);
+        b.dir("/boot/efi", &["EFI"]);
+        b.dir(
             "/sys",
-            vec![
+            &[
                 "block",
                 "bus",
                 "class",
@@ -155,15 +587,15 @@ impl FakeFs {
                 "power",
             ],
         );
-        dirs.insert("/sys/fs", vec!["bpf", "cgroup", "ext4", "fuse", "pstore"]);
-        dirs.insert("/sys/fs/cgroup", vec![]);
-        dirs.insert("/sys/fs/bpf", vec![]);
-        dirs.insert("/sys/fs/pstore", vec![]);
-        dirs.insert("/sys/fs/fuse", vec!["connections"]);
-        dirs.insert("/sys/fs/fuse/connections", vec![]);
-        dirs.insert(
+        b.dir("/sys/fs", &["bpf", "cgroup", "ext4", "fuse", "pstore"]);
+        b.dir("/sys/fs/cgroup", &[]);
+        b.dir("/sys/fs/bpf", &[]);
+        b.dir("/sys/fs/pstore", &[]);
+        b.dir("/sys/fs/fuse", &["connections"]);
+        b.dir("/sys/fs/fuse/connections", &[]);
+        b.dir(
             "/sys/kernel",
-            vec![
+            &[
                 "config",
                 "debug",
                 "mm",
@@ -173,41 +605,40 @@ impl FakeFs {
                 "uevent_seqnum",
             ],
         );
-        dirs.insert("/sys/kernel/config", vec![]);
-        dirs.insert("/sys/kernel/debug", vec![]);
-        dirs.insert("/sys/kernel/security", vec![]);
-        dirs.insert("/sys/kernel/tracing", vec![]);
-        dirs.insert("/dev/pts", vec!["0", "ptmx"]);
-        dirs.insert("/dev/hugepages", vec![]);
-        dirs.insert("/dev/mqueue", vec![]);
-        dirs.insert("/run/lock", vec![]);
-        dirs.insert("/run/user", vec!["0"]);
-        dirs.insert("/run/user/0", vec![]);
+        b.dir("/sys/kernel/config", &[]);
+        b.dir("/sys/kernel/debug", &[]);
+        b.dir("/sys/kernel/security", &[]);
+        b.dir("/sys/kernel/tracing", &[]);
+        b.dir("/dev/pts", &["0", "ptmx"]);
+        b.dir("/dev/hugepages", &[]);
+        b.dir("/dev/mqueue", &[]);
+        b.dir("/run/lock", &[]);
+        b.dir("/run/user", &["0"]);
+        b.dir("/run/user/0", &[]);
         // The directories a loader probes for somewhere writable (`>/var/run/.x && cd /var/run`,
         // then /mnt, /usr, /dev, /dev/shm, /tmp, /var). Every one exists on a real Ubuntu box,
         // so each probe must succeed here or the chain's `&& cd` never runs and the loader's
         // final marker, which it keys its next stage on, is never printed. Listings are the
         // stock contents, minus anything that would need a deeper model to be consistent.
-        dirs.insert(
+        b.dir(
             "/var",
-            vec![
+            &[
                 "backups", "cache", "lib", "local", "lock", "log", "mail", "opt", "run", "spool",
                 "tmp",
             ],
         );
-        dirs.insert("/var/run", vec![]);
-        dirs.insert("/var/tmp", vec![]);
-        dirs.insert("/run", vec!["lock", "user"]);
-        dirs.insert("/mnt", vec![]);
-        dirs.insert(
+        b.dir("/var/tmp", &[]);
+        b.dir("/run", &["lock", "user"]);
+        b.dir("/mnt", &[]);
+        b.dir(
             "/usr",
-            vec![
+            &[
                 "bin", "games", "include", "lib", "lib64", "local", "sbin", "share", "src",
             ],
         );
-        dirs.insert(
+        b.dir(
             "/dev",
-            vec![
+            &[
                 "hugepages",
                 "mqueue",
                 "null",
@@ -222,24 +653,41 @@ impl FakeFs {
                 "stderr",
             ],
         );
-        dirs.insert("/dev/shm", vec![]);
+        b.dir("/dev/shm", &[]);
+        b.advertise_root_children(&[]);
 
         // The binaries a loader chain actually touches: `cp /bin/busybox .` then running the
         // copy is a standard Mirai staging step, and it needs something to copy. The content is
-        // an ELF header's worth of bytes, which is what `cat` on a real one starts with.
+        // an ELF header's worth of bytes, which is what `cat` on a real one starts with. They
+        // live at their physical `/usr/bin` paths; `/bin` is the usrmerge symlink.
         for binary in EXECUTABLE_BINARIES {
-            files.insert(binary, "\u{7f}ELF\u{2}\u{1}\u{1}\0".to_string());
+            b.binary(binary, "\u{7f}ELF\u{2}\u{1}\u{1}\0");
         }
+        // The usrmerge layout: the top-level names are symlinks into /usr, with relative targets
+        // as the real ones have, and their targets must be directories.
+        for name in ["bin", "sbin", "lib", "lib64"] {
+            b.symlink(&format!("/{name}"), &format!("usr/{name}"));
+        }
+        b.dir("/usr/sbin", &[]);
+        b.dir("/usr/lib", &[]);
+        b.dir("/usr/lib64", &[]);
+        b.symlink("/var/run", "/run");
+        b.symlink("/var/lock", "/run/lock");
+        b.symlink("/etc/mtab", "/proc/self/mounts");
 
-        Self {
-            files,
-            dirs,
-            created: HashMap::new(),
-            created_dirs: HashSet::new(),
-            removed: HashSet::new(),
-            readonly: &[],
-            executable: EXECUTABLE_BINARIES.iter().map(|b| b.to_string()).collect(),
-        }
+        b.device("/dev/null", Device::Null);
+        b.device("/dev/zero", Device::Zero);
+        b.device("/dev/random", Device::Random);
+        b.device("/dev/urandom", Device::Urandom);
+        b.device("/dev/tty", Device::Tty);
+        // The fd links point into a /proc/self/fd this box does not model yet, so opening one
+        // fails as a dangling link does.
+        b.symlink("/dev/stdin", "/proc/self/fd/0");
+        b.symlink("/dev/stdout", "/proc/self/fd/1");
+        b.symlink("/dev/stderr", "/proc/self/fd/2");
+        b.symlink("/dev/fd", "/proc/self/fd");
+
+        Self::from_snapshot(b.finish(&MOUNT_TABLE))
     }
 
     /// The rooted Nexus 5 `sensor-adb` presents: the same snapshot machinery over an Android
@@ -247,23 +695,22 @@ impl FakeFs {
     /// claimed. Its identity comes from [`crate::persona`]'s Android half, the same way the
     /// server's comes from the Ubuntu half.
     pub fn android() -> Self {
-        let mut files: HashMap<&'static str, String> = HashMap::new();
-        files.insert(
+        let mut b = Builder::new();
+        b.file(
             "/default.prop",
             "#\n# ADDITIONAL_DEFAULT_PROPERTIES\n#\n\
              ro.secure=0\n\
              ro.allow.mock.location=0\n\
              ro.debuggable=1\n\
              ro.adb.secure=0\n\
-             persist.sys.usb.config=adb\n"
-                .to_string(),
+             persist.sys.usb.config=adb\n",
         );
-        files.insert("/system/build.prop", android_build_prop());
-        files.insert(
+        b.file("/system/build.prop", android_build_prop());
+        b.file(
             "/proc/version",
             format!("{}\n", persona::android_proc_version()),
         );
-        files.insert(
+        b.file(
             "/proc/cpuinfo",
             "Processor\t: ARMv7 Processor rev 0 (v7l)\n\
              processor\t: 0\n\
@@ -275,25 +722,22 @@ impl FakeFs {
              CPU part\t: 0x06f\n\
              CPU revision\t: 0\n\
              \n\
-             Hardware\t: Qualcomm MSM 8974 HAMMERHEAD (Flattened Device Tree)\n"
-                .to_string(),
+             Hardware\t: Qualcomm MSM 8974 HAMMERHEAD (Flattened Device Tree)\n",
         );
-        files.insert(
+        b.file(
             "/system/etc/hosts",
-            "127.0.0.1       localhost\n::1             ip6-localhost\n".to_string(),
+            "127.0.0.1       localhost\n::1             ip6-localhost\n",
         );
-        let mounts = render_mounts(&ANDROID_MOUNT_TABLE);
-        files.insert("/proc/mounts", mounts.clone());
-        files.insert("/proc/self/mounts", mounts);
-        files.insert(
+        b.file("/proc/mounts", render_mounts(&ANDROID_MOUNT_TABLE));
+        b.file("/proc/self/mounts", render_mounts(&ANDROID_MOUNT_TABLE));
+        b.file(
             "/proc/self/mountinfo",
             render_mountinfo(&ANDROID_MOUNT_TABLE),
         );
 
-        let mut dirs = HashMap::new();
-        dirs.insert(
+        b.dir(
             "/",
-            vec![
+            &[
                 "acct",
                 "cache",
                 "config",
@@ -318,9 +762,9 @@ impl FakeFs {
                 "vendor",
             ],
         );
-        dirs.insert(
+        b.dir(
             "/system",
-            vec![
+            &[
                 "app",
                 "bin",
                 "build.prop",
@@ -336,9 +780,9 @@ impl FakeFs {
                 "xbin",
             ],
         );
-        dirs.insert(
+        b.dir(
             "/system/bin",
-            vec![
+            &[
                 "app_process",
                 "cat",
                 "chmod",
@@ -358,11 +802,11 @@ impl FakeFs {
                 "umount",
             ],
         );
-        dirs.insert("/system/xbin", vec!["busybox", "su"]);
-        dirs.insert("/system/etc", vec!["hosts"]);
-        dirs.insert(
+        b.dir("/system/xbin", &["busybox", "su"]);
+        b.dir("/system/etc", &["hosts"]);
+        b.dir(
             "/data",
-            vec![
+            &[
                 "anr",
                 "app",
                 "backup",
@@ -376,12 +820,12 @@ impl FakeFs {
                 "user",
             ],
         );
-        dirs.insert("/data/local", vec!["tmp"]);
+        b.dir("/data/local", &["tmp"]);
         // The two directories every ADB-borne dropper writes to.
-        dirs.insert("/data/local/tmp", vec![]);
-        dirs.insert(
+        b.dir("/data/local/tmp", &[]);
+        b.dir(
             "/sdcard",
-            vec![
+            &[
                 "Alarms",
                 "Android",
                 "DCIM",
@@ -394,186 +838,291 @@ impl FakeFs {
                 "Ringtones",
             ],
         );
-        dirs.insert("/storage", vec!["emulated", "self"]);
-        dirs.insert("/storage/emulated", vec!["0", "legacy"]);
-        dirs.insert("/storage/emulated/0", vec![]);
-        dirs.insert("/cache", vec!["backup", "lost+found", "recovery"]);
-        dirs.insert("/dev", vec!["block", "cpuctl", "null", "socket", "zero"]);
-        dirs.insert("/mnt", vec!["asec", "obb", "runtime", "secure", "shell"]);
-        dirs.insert("/sys", vec!["block", "class", "devices", "fs", "kernel"]);
-        dirs.insert("/proc", vec![]);
-        dirs.insert("/root", vec![]);
-        dirs.insert("/sbin", vec!["adbd", "healthd", "ueventd", "watchdogd"]);
-        dirs.insert("/vendor", vec!["firmware", "lib"]);
+        b.dir("/storage", &["emulated", "self"]);
+        b.dir("/storage/emulated", &["0", "legacy"]);
+        b.dir("/storage/emulated/0", &[]);
+        b.dir("/cache", &["backup", "lost+found", "recovery"]);
+        b.dir("/dev", &["block", "cpuctl", "null", "socket", "zero"]);
+        b.dir("/mnt", &["asec", "obb", "runtime", "secure", "shell"]);
+        b.dir("/sys", &["block", "class", "devices", "fs", "kernel"]);
+        b.dir("/proc", &[]);
+        b.dir("/root", &[]);
+        b.dir("/sbin", &["adbd", "healthd", "ueventd", "watchdogd"]);
+        b.dir("/vendor", &["firmware", "lib"]);
+        // The root listing shows these three but the box models no content for them, so they are
+        // not directories.
+        b.advertise_root_children(&["default.prop", "init", "init.rc", "ueventd.rc"]);
 
         for binary in ANDROID_EXECUTABLE_BINARIES {
-            files.insert(binary, "\u{7f}ELF\u{1}\u{1}\u{1}\0".to_string());
+            b.binary(binary, "\u{7f}ELF\u{1}\u{1}\u{1}\0");
         }
+        b.device("/dev/null", Device::Null);
+        b.device("/dev/zero", Device::Zero);
 
-        Self {
-            files,
-            dirs,
-            created: HashMap::new(),
-            created_dirs: HashSet::new(),
-            removed: HashSet::new(),
-            readonly: &["/system", "/vendor"],
-            executable: ANDROID_EXECUTABLE_BINARIES
-                .iter()
-                .map(|b| b.to_string())
-                .collect(),
-        }
+        Self::from_snapshot(b.finish(&ANDROID_MOUNT_TABLE))
     }
 
-    /// Whether `path` sits under a read-only mount, so every write to it is refused.
-    fn is_readonly(&self, path: &str) -> bool {
-        self.readonly
-            .iter()
-            .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    /// The live node at a physical path: an overlay node shadows the snapshot's, and a tombstone
+    /// hides both.
+    fn node_at(&self, physical: &str) -> Option<&Node> {
+        if self.overlay.tombstones.contains(physical) {
+            return None;
+        }
+        self.overlay
+            .nodes
+            .get(physical)
+            .or_else(|| self.snapshot.nodes.get(physical))
+    }
+
+    /// Resolve a logical absolute path to a physical one, following symlinks component by
+    /// component. A relative link target joins against the link's parent, an absolute one
+    /// restarts at `/`. `follow_final` false leaves a symlink in the last position alone (what
+    /// `rm` acts on). The last component may be absent, so a creator can resolve the path it is
+    /// about to make.
+    fn resolve(&self, logical_abs: &str, follow_final: bool) -> Result<String, FsError> {
+        let mut pending: VecDeque<String> = logical_abs
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .map(str::to_string)
+            .collect();
+        let mut resolved: Vec<String> = Vec::new();
+        let mut hops = 0u32;
+        while let Some(component) = pending.pop_front() {
+            if component == ".." {
+                resolved.pop();
+                continue;
+            }
+            let candidate = format!("/{}", join_with(&resolved, &component));
+            let is_last = pending.is_empty();
+            match self.node_at(&candidate).map(|node| &node.kind) {
+                Some(NodeKind::Symlink { target }) if !is_last || follow_final => {
+                    hops = hops.saturating_add(1);
+                    if hops > MAX_SYMLINK_HOPS {
+                        return Err(FsError::TooManyLinks);
+                    }
+                    if target.starts_with('/') {
+                        resolved.clear();
+                    }
+                    for part in target.split('/').rev().filter(|c| !c.is_empty()) {
+                        pending.push_front(part.to_string());
+                    }
+                }
+                Some(NodeKind::Directory(_)) => resolved.push(component),
+                Some(_) if !is_last => return Err(FsError::NotADirectory),
+                None if !is_last => return Err(FsError::NoSuchDirectory(candidate)),
+                Some(_) | None => resolved.push(component),
+            }
+        }
+        Ok(format!("/{}", resolved.join("/")))
+    }
+
+    /// The physical path and live node `path` names, following every symlink.
+    fn lookup(&self, path: &str) -> Option<(String, &Node)> {
+        let physical = self.resolve(path, true).ok()?;
+        let node = self.node_at(&physical)?;
+        Some((physical, node))
     }
 
     /// Mark a file the attacker created this session executable (`chmod +x` / `chmod 777`).
     /// Returns false when `path` is not such a file; the baked-in files keep their modes.
     pub fn mark_executable(&mut self, path: &str) -> bool {
-        if !self.created.contains_key(path) {
+        let Ok(physical) = self.resolve(path, true) else {
+            return false;
+        };
+        if self.overlay.tombstones.contains(&physical) {
             return false;
         }
-        self.executable.insert(path.to_string());
-        true
+        match self.overlay.nodes.get_mut(&physical) {
+            Some(node) if matches!(node.kind, NodeKind::Regular(_)) => {
+                node.meta.mode |= EXEC_BITS;
+                true
+            }
+            _ => false,
+        }
     }
 
-    /// Whether running `path` as a command would start: only a created file after `chmod`.
+    /// Whether running `path` as a command would start: a regular file with an execute bit, not
+    /// on a `noexec` mount.
     pub fn is_executable(&self, path: &str) -> bool {
-        self.executable.contains(path) && !self.removed.contains(path)
+        self.lookup(path).is_some_and(|(physical, node)| {
+            matches!(node.kind, NodeKind::Regular(_))
+                && node.meta.mode & EXEC_BITS != 0
+                && !self.snapshot.is_noexec(&physical)
+        })
     }
 
-    pub fn read_file(&self, path: &str) -> Option<String> {
-        if self.removed.contains(path) {
-            return None;
+    /// Up to `max_len` bytes of `path` from `off`. A directory is `IsADirectory`, an absent or
+    /// removed path `NoSuchFile`; a device answers with its own stream.
+    pub fn read_range(&self, path: &str, off: u64, max_len: u64) -> Result<Vec<u8>, FsError> {
+        let physical = self.resolve(path, true).map_err(|error| match error {
+            FsError::NoSuchDirectory(_) => FsError::NoSuchFile,
+            other => other,
+        })?;
+        match self.node_at(&physical).map(|node| &node.kind) {
+            Some(NodeKind::Regular(blob)) => Ok(blob.read_range(off, max_len)),
+            Some(NodeKind::Device(device)) => Ok(device.read(off, max_len)),
+            Some(NodeKind::Directory(_)) => Err(FsError::IsADirectory),
+            Some(NodeKind::Symlink { .. }) | None => Err(FsError::NoSuchFile),
         }
-        if let Some(content) = self.created.get(path) {
-            return Some(content.clone());
-        }
-        self.files.get(path).map(|content| content.to_string())
     }
 
+    /// The first `cap` bytes of `path`.
+    pub fn read_all(&self, path: &str, cap: u64) -> Result<Vec<u8>, FsError> {
+        self.read_range(path, 0, cap)
+    }
+
+    /// The content and mode of a regular file, for `cp`: cloning the blob shares its pieces.
+    pub fn content_and_mode(&self, path: &str) -> Result<(Blob, u32), FsError> {
+        match self.lookup(path).map(|(_, node)| node) {
+            Some(Node {
+                kind: NodeKind::Regular(blob),
+                meta,
+            }) => Ok((blob.clone(), meta.mode)),
+            Some(Node {
+                kind: NodeKind::Directory(_),
+                ..
+            }) => Err(FsError::IsADirectory),
+            _ => Err(FsError::NoSuchFile),
+        }
+    }
+
+    /// The names in directory `path`: the modeled ones plus what the session created, less what
+    /// it removed. `None` for anything that is not a directory this box presents.
     pub fn list_dir(&self, path: &str) -> Option<Vec<String>> {
-        if self.removed.contains(path) {
+        let (physical, node) = self.lookup(path)?;
+        let NodeKind::Directory(listing) = &node.kind else {
             return None;
-        }
-        let modeled = self.dirs.get(path).map(|entries| {
-            entries
-                .iter()
-                .map(|entry| entry.to_string())
-                .collect::<Vec<String>>()
-        });
-        let mut entries = match modeled {
-            Some(entries) => entries,
-            None if self.created_dirs.contains(path) => Vec::new(),
-            None => return None,
         };
-        let prefix = if path == "/" {
+        let prefix = if physical == "/" {
             "/".to_string()
         } else {
-            format!("{path}/")
+            format!("{physical}/")
         };
-        let child_of_this_dir = |candidate: &String| {
-            candidate
+        let mut entries = listing.entries.clone();
+        for key in self.overlay.nodes.keys() {
+            if let Some(name) = key
                 .strip_prefix(&prefix)
                 .filter(|name| !name.is_empty() && !name.contains('/'))
-                .map(str::to_string)
-        };
-        entries.extend(self.created.keys().filter_map(child_of_this_dir));
-        entries.extend(self.created_dirs.iter().filter_map(child_of_this_dir));
-        entries.retain(|name| !self.removed.contains(&format!("{prefix}{name}")));
+                && !entries.iter().any(|entry| entry == name)
+            {
+                entries.push(name.to_string());
+            }
+        }
+        entries.retain(|name| !self.overlay.tombstones.contains(&format!("{prefix}{name}")));
         Some(entries)
     }
 
-    /// Whether `path` names a file this box presents (a baked-in one or a created one).
+    /// Whether `path` names a file or device this box presents (a baked-in or created one).
     pub fn file_exists(&self, path: &str) -> bool {
-        self.read_file(path).is_some()
+        self.lookup(path).is_some_and(|(_, node)| {
+            matches!(node.kind, NodeKind::Regular(_) | NodeKind::Device(_))
+        })
     }
 
-    /// Write `contents` to `path`, as a download saving its body or a `cp` writing its
-    /// destination does. Fails the way a real write does, so a loader dropping into a directory
-    /// this box denies, or onto a read-only mount, sees the refusal rather than a success it can
-    /// never verify.
-    pub fn write_file(&mut self, path: &str, contents: &str) -> Result<(), FsError> {
-        if self.is_readonly(path) {
+    /// Whether `path` is a directory this box presents, following symlinks. `cd` and the write
+    /// probes consult this, so the shell never lets an attacker enter a directory that `ls /`
+    /// did not show, and never refuses one it did.
+    pub fn is_dir(&self, path: &str) -> bool {
+        self.lookup(path)
+            .is_some_and(|(_, node)| matches!(node.kind, NodeKind::Directory(_)))
+    }
+
+    /// Resolve a write target to its physical path, mapping a missing parent under a read-only
+    /// mount to the refusal a real write there gets.
+    fn resolve_for_write(&self, path: &str) -> Result<String, FsError> {
+        self.resolve(path, true).map_err(|error| match error {
+            FsError::NoSuchDirectory(missing) if self.snapshot.is_ro(&missing) => FsError::ReadOnly,
+            other => other,
+        })
+    }
+
+    /// Write `bytes` to `path`, as a download saving its body or a redirection does.
+    pub fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.write_blob(path, Blob::from_bytes(bytes), MODE_FILE)
+    }
+
+    /// Write `blob` to `path` with `mode`. Fails the way a real write does, so a loader dropping
+    /// into a directory this box denies, or onto a read-only mount, sees the refusal rather than
+    /// a success it can never verify. A device target takes the write into its own semantics and
+    /// stores nothing. Overwriting a file keeps its execute bits: a payload saved over a
+    /// `chmod`ed name stays runnable, as it does when truncated in place.
+    pub fn write_blob(&mut self, path: &str, blob: Blob, mode: u32) -> Result<(), FsError> {
+        let physical = self.resolve_for_write(path)?;
+        if self.snapshot.is_ro(&physical) {
             return Err(FsError::ReadOnly);
         }
-        let parent = parent_of(path).ok_or(FsError::NoSuchDirectory(String::new()))?;
-        if !self.is_dir(&parent) {
-            return Err(FsError::NoSuchDirectory(parent));
+        let mut mode = mode;
+        match self.node_at(&physical).map(|node| (&node.kind, node.meta)) {
+            Some((NodeKind::Directory(_), _)) => return Err(FsError::IsADirectory),
+            Some((NodeKind::Device(device), _)) => return device.write(),
+            Some((NodeKind::Regular(_), existing)) => mode |= existing.mode & EXEC_BITS,
+            _ => {}
         }
-        self.removed.remove(path);
-        self.created.insert(path.to_string(), contents.to_string());
+        self.overlay.tombstones.remove(&physical);
+        self.overlay
+            .nodes
+            .insert(physical, Node::regular(blob, mode));
         Ok(())
     }
 
-    /// Remove `path`. `Ok(false)` when nothing was there: `rm` without `-f` reports that, and the
-    /// caller decides. A removed file stops being readable, listed and executable.
+    /// Remove `path` (a symlink itself, never its target). `Ok(false)` when nothing was there:
+    /// `rm` without `-f` reports that, and the caller decides. A removed file stops being
+    /// readable, listed and executable.
     pub fn remove_path(&mut self, path: &str) -> Result<bool, FsError> {
-        if self.is_readonly(path) {
+        let physical = match self.resolve(path, false) {
+            Ok(physical) => physical,
+            Err(FsError::NoSuchDirectory(missing)) if self.snapshot.is_ro(&missing) => {
+                return Err(FsError::ReadOnly);
+            }
+            Err(_) => return Ok(false),
+        };
+        if self.snapshot.is_ro(&physical) {
             return Err(FsError::ReadOnly);
         }
-        let existed = self.file_exists(path) || self.is_dir(path);
-        self.created.remove(path);
-        self.created_dirs.remove(path);
-        self.executable.remove(path);
+        let existing = self.node_at(&physical).map(|node| &node.kind);
+        let existed = existing.is_some();
+        if matches!(existing, Some(NodeKind::Directory(_))) {
+            let below = format!("{physical}/");
+            self.overlay.nodes.retain(|key, _| !key.starts_with(&below));
+        }
+        self.overlay.nodes.remove(&physical);
         if existed {
-            self.removed.insert(path.to_string());
+            self.overlay.tombstones.insert(physical);
         }
         Ok(existed)
     }
 
     /// `mkdir path`, with the failures a real `mkdir` distinguishes.
     pub fn make_dir(&mut self, path: &str) -> Result<(), FsError> {
-        if self.is_readonly(path) {
+        let physical = self.resolve_for_write(path)?;
+        if self.snapshot.is_ro(&physical) {
             return Err(FsError::ReadOnly);
         }
-        if self.is_dir(path) || self.file_exists(path) {
+        if self.node_at(&physical).is_some() {
             return Err(FsError::Exists);
         }
-        let parent = parent_of(path).ok_or(FsError::NoSuchDirectory(String::new()))?;
-        if !self.is_dir(&parent) {
-            return Err(FsError::NoSuchDirectory(parent));
-        }
-        self.removed.remove(path);
-        self.created_dirs.insert(path.to_string());
+        self.overlay.tombstones.remove(&physical);
+        self.overlay
+            .nodes
+            .insert(physical, Node::directory(Vec::new()));
         Ok(())
     }
 
-    /// Whether `path` is a directory this box presents: a modeled directory, a directory the
-    /// root listing advertises, or an ancestor of a modeled file (`/proc/self` exists because
-    /// `/proc/self/cmdline` does). `cd` and the write probes below consult this, so the shell
-    /// never lets an attacker enter a directory that `ls /` did not show, and never refuses one
-    /// it did.
-    pub fn is_dir(&self, path: &str) -> bool {
-        if self.removed.contains(path) {
-            return false;
-        }
-        if path == "/" || self.dirs.contains_key(path) || self.created_dirs.contains(path) {
-            return true;
-        }
-        let in_root_listing = path
-            .strip_prefix('/')
-            .filter(|rest| !rest.contains('/'))
-            .is_some_and(|name| self.dirs.get("/").is_some_and(|root| root.contains(&name)));
-        if in_root_listing {
-            return true;
-        }
-        let prefix = format!("{path}/");
-        self.files.keys().any(|f| f.starts_with(&prefix))
-    }
-
     /// Model `> path` with no command: create an empty file if its directory exists, else fail
-    /// the way the shell would. Returns the directory that does not exist on failure.
+    /// the way the shell would.
     pub fn create_file(&mut self, path: &str) -> Result<(), FsError> {
-        self.write_file(path, "")
+        self.write_file(path, b"")
     }
 }
 
-/// Why a write to the snapshot failed, so the shell can print what the real command prints.
+/// `resolved` components followed by `component`, `/`-joined.
+fn join_with(resolved: &[String], component: &str) -> String {
+    let mut parts: Vec<&str> = resolved.iter().map(String::as_str).collect();
+    parts.push(component);
+    parts.join("/")
+}
+
+/// Why an operation on the filesystem failed, so the shell can print what the real command prints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsError {
     /// The parent directory does not exist; carries it for the message.
@@ -582,10 +1131,26 @@ pub enum FsError {
     ReadOnly,
     /// `mkdir` on a path that is already there.
     Exists,
+    /// A read or exec target that is absent or was removed.
+    NoSuchFile,
+    /// A read or copy target that is a directory.
+    IsADirectory,
+    /// A non-final path component that is not a directory.
+    NotADirectory,
+    /// Symlink resolution exceeded [`MAX_SYMLINK_HOPS`] (`ELOOP`).
+    TooManyLinks,
+    /// A write to `/dev/full`.
+    NoSpace,
 }
 
-/// Binaries present and executable from the start, so `cp /bin/busybox x && ./x` behaves.
-const EXECUTABLE_BINARIES: [&str; 4] = ["/bin/busybox", "/bin/sh", "/bin/bash", "/usr/bin/wget"];
+/// Binaries present and executable from the start, so `cp /bin/busybox x && ./x` behaves. They sit
+/// at the physical paths behind the usrmerge symlinks.
+const EXECUTABLE_BINARIES: [&str; 4] = [
+    "/usr/bin/busybox",
+    "/usr/bin/sh",
+    "/usr/bin/bash",
+    "/usr/bin/wget",
+];
 
 /// The Android device's equivalents. `/system/xbin/busybox` is there because this device is
 /// rooted (it hands out a root shell over ADB, which a stock one does not) and a rooted phone
@@ -632,55 +1197,56 @@ fn android_build_prop() -> String {
 }
 
 /// The Android device's mount table: a read-only `/system`, a writable `/data`, and the FUSE
-/// `/sdcard` a dropper reaches for.
-const ANDROID_MOUNT_TABLE: [(&str, &str, &str, &str); 12] = [
-    ("rootfs", "/", "rootfs", "ro,seclabel,relatime"),
-    (
+/// `/sdcard` a dropper reaches for. The read-only rootfs governs every path no submount claims
+/// (`/vendor`, `/root`), which is why those refuse writes.
+const ANDROID_MOUNT_TABLE: [MountEntry; 12] = [
+    MountEntry::new("rootfs", "/", "rootfs", "ro,seclabel,relatime"),
+    MountEntry::new(
         "tmpfs",
         "/dev",
         "tmpfs",
         "rw,seclabel,nosuid,relatime,mode=755",
     ),
-    (
+    MountEntry::new(
         "devpts",
         "/dev/pts",
         "devpts",
         "rw,seclabel,relatime,mode=600",
     ),
-    ("proc", "/proc", "proc", "rw,relatime"),
-    ("sysfs", "/sys", "sysfs", "rw,seclabel,relatime"),
-    ("selinuxfs", "/sys/fs/selinux", "selinuxfs", "rw,relatime"),
-    (
+    MountEntry::new("proc", "/proc", "proc", "rw,relatime"),
+    MountEntry::new("sysfs", "/sys", "sysfs", "rw,seclabel,relatime"),
+    MountEntry::new("selinuxfs", "/sys/fs/selinux", "selinuxfs", "rw,relatime"),
+    MountEntry::new(
         "/dev/block/platform/msm_sdcc.1/by-name/system",
         "/system",
         "ext4",
         "ro,seclabel,relatime,data=ordered",
     ),
-    (
+    MountEntry::new(
         "/dev/block/platform/msm_sdcc.1/by-name/userdata",
         "/data",
         "ext4",
         "rw,seclabel,nosuid,nodev,relatime,noauto_da_alloc,data=ordered",
     ),
-    (
+    MountEntry::new(
         "/dev/block/platform/msm_sdcc.1/by-name/cache",
         "/cache",
         "ext4",
         "rw,seclabel,nosuid,nodev,relatime,data=ordered",
     ),
-    (
+    MountEntry::new(
         "/dev/block/platform/msm_sdcc.1/by-name/persist",
         "/persist",
         "ext4",
         "rw,seclabel,nosuid,nodev,relatime,data=ordered",
     ),
-    (
+    MountEntry::new(
         "/data/media",
         "/storage/emulated",
         "sdcardfs",
         "rw,nosuid,nodev,noexec,noatime",
     ),
-    (
+    MountEntry::new(
         "/data/media",
         "/sdcard",
         "sdcardfs",
@@ -697,110 +1263,111 @@ fn parent_of(path: &str) -> Option<String> {
     }
 }
 
-/// The mounted filesystems of a stock Ubuntu 22.04 cloud image on one virtual disk: `(source,
-/// mount point, type, options)` in mount order. Every mount point exists in the directory
-/// model above. Rendered into `/proc/mounts`, `/proc/self/mountinfo` and the `mount` command.
-pub const MOUNT_TABLE: [(&str, &str, &str, &str); 20] = [
-    ("sysfs", "/sys", "sysfs", "rw,nosuid,nodev,noexec,relatime"),
-    ("proc", "/proc", "proc", "rw,nosuid,nodev,noexec,relatime"),
-    (
+/// The mounted filesystems of a stock Ubuntu 22.04 cloud image on one virtual disk, in mount
+/// order. Every mount point exists in the directory model above. Rendered into `/proc/mounts`,
+/// `/proc/self/mountinfo` and the `mount` command, and consulted for each path's read-only and
+/// `noexec` policy.
+pub const MOUNT_TABLE: [MountEntry; 20] = [
+    MountEntry::new("sysfs", "/sys", "sysfs", "rw,nosuid,nodev,noexec,relatime"),
+    MountEntry::new("proc", "/proc", "proc", "rw,nosuid,nodev,noexec,relatime"),
+    MountEntry::new(
         "udev",
         "/dev",
         "devtmpfs",
         "rw,nosuid,relatime,size=1968376k,nr_inodes=492094,mode=755,inode64",
     ),
-    (
+    MountEntry::new(
         "devpts",
         "/dev/pts",
         "devpts",
         "rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000",
     ),
-    (
+    MountEntry::new(
         "tmpfs",
         "/run",
         "tmpfs",
         "rw,nosuid,nodev,noexec,relatime,size=402244k,mode=755,inode64",
     ),
-    (
+    MountEntry::new(
         "/dev/sda1",
         "/",
         "ext4",
         "rw,relatime,discard,errors=remount-ro",
     ),
-    (
+    MountEntry::new(
         "securityfs",
         "/sys/kernel/security",
         "securityfs",
         "rw,nosuid,nodev,noexec,relatime",
     ),
-    ("tmpfs", "/dev/shm", "tmpfs", "rw,nosuid,nodev,inode64"),
-    (
+    MountEntry::new("tmpfs", "/dev/shm", "tmpfs", "rw,nosuid,nodev,inode64"),
+    MountEntry::new(
         "tmpfs",
         "/run/lock",
         "tmpfs",
         "rw,nosuid,nodev,noexec,relatime,size=5120k,inode64",
     ),
-    (
+    MountEntry::new(
         "cgroup2",
         "/sys/fs/cgroup",
         "cgroup2",
         "rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot",
     ),
-    (
+    MountEntry::new(
         "pstore",
         "/sys/fs/pstore",
         "pstore",
         "rw,nosuid,nodev,noexec,relatime",
     ),
-    (
+    MountEntry::new(
         "bpf",
         "/sys/fs/bpf",
         "bpf",
         "rw,nosuid,nodev,noexec,relatime,mode=700",
     ),
-    (
+    MountEntry::new(
         "hugetlbfs",
         "/dev/hugepages",
         "hugetlbfs",
         "rw,relatime,pagesize=2M",
     ),
-    (
+    MountEntry::new(
         "mqueue",
         "/dev/mqueue",
         "mqueue",
         "rw,nosuid,nodev,noexec,relatime",
     ),
-    (
+    MountEntry::new(
         "debugfs",
         "/sys/kernel/debug",
         "debugfs",
         "rw,nosuid,nodev,noexec,relatime",
     ),
-    (
+    MountEntry::new(
         "tracefs",
         "/sys/kernel/tracing",
         "tracefs",
         "rw,nosuid,nodev,noexec,relatime",
     ),
-    (
+    MountEntry::new(
         "fusectl",
         "/sys/fs/fuse/connections",
         "fusectl",
         "rw,nosuid,nodev,noexec,relatime",
     ),
-    (
+    MountEntry::new(
         "configfs",
         "/sys/kernel/config",
         "configfs",
         "rw,nosuid,nodev,noexec,relatime",
     ),
-    (
+    MountEntry::new(
         "/dev/sda15",
         "/boot/efi",
         "vfat",
         "rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro",
     ),
-    (
+    MountEntry::new(
         "tmpfs",
         "/run/user/0",
         "tmpfs",
@@ -809,10 +1376,13 @@ pub const MOUNT_TABLE: [(&str, &str, &str, &str); 20] = [
 ];
 
 /// `/proc/mounts` format: `source mountpoint type options 0 0`.
-fn render_mounts(table: &[(&str, &str, &str, &str)]) -> String {
+fn render_mounts(table: &[MountEntry]) -> String {
     let mut out = String::new();
-    for (source, point, fstype, opts) in table {
-        out.push_str(&format!("{source} {point} {fstype} {opts} 0 0\n"));
+    for m in table {
+        out.push_str(&format!(
+            "{} {} {} {} 0 0\n",
+            m.source, m.point, m.fstype, m.opts
+        ));
     }
     out
 }
@@ -820,13 +1390,13 @@ fn render_mounts(table: &[(&str, &str, &str, &str)]) -> String {
 /// `/proc/self/mountinfo` format: `id parent major:minor root mountpoint mount-opts - type
 /// source super-opts`. Ids are sequential from the table; the per-mount options are the flags
 /// (`rw,nosuid,...`) and the super options the rest, as the kernel splits them.
-fn render_mountinfo(table: &[(&str, &str, &str, &str)]) -> String {
-    let root_pos = table.iter().position(|m| m.1 == "/").unwrap_or(0);
+fn render_mountinfo(table: &[MountEntry]) -> String {
+    let root_pos = table.iter().position(|m| m.point == "/").unwrap_or(0);
     let mut out = String::new();
-    for (i, (source, point, fstype, opts)) in table.iter().enumerate() {
+    for (i, m) in table.iter().enumerate() {
         let id = 20 + i;
-        let parent = if *point == "/" { 1 } else { 20 + root_pos };
-        let (mount_opts, super_opts): (Vec<&str>, Vec<&str>) = opts.split(',').partition(|o| {
+        let parent = if m.point == "/" { 1 } else { 20 + root_pos };
+        let (mount_opts, super_opts): (Vec<&str>, Vec<&str>) = m.opts.split(',').partition(|o| {
             matches!(
                 *o,
                 "rw" | "ro" | "nosuid" | "nodev" | "noexec" | "relatime" | "noatime"
@@ -838,9 +1408,12 @@ fn render_mountinfo(table: &[(&str, &str, &str, &str)]) -> String {
             format!("rw,{}", super_opts.join(","))
         };
         out.push_str(&format!(
-            "{id} {parent} 0:{} / {point} {} - {fstype} {source} {super_opts}\n",
+            "{id} {parent} 0:{} / {} {} - {} {} {super_opts}\n",
             i + 21,
-            mount_opts.join(",")
+            m.point,
+            mount_opts.join(","),
+            m.fstype,
+            m.source
         ));
     }
     out
@@ -850,22 +1423,30 @@ fn render_mountinfo(table: &[(&str, &str, &str, &str)]) -> String {
 mod tests {
     use super::*;
 
+    fn read_string(fs: &FakeFs, path: &str) -> String {
+        String::from_utf8(fs.read_all(path, 8192).unwrap()).unwrap()
+    }
+
     /// Every file that exposes the mount table agrees, and every mount point it names is a
     /// directory the shell will `cd` into: a table naming a path `ls` denies is the same
     /// contradiction as the missing file was.
     #[test]
     fn mount_table_is_exposed_consistently_and_every_mount_point_exists() {
         let fs = FakeFs::new();
-        let mounts = fs.read_file("/proc/mounts").expect("/proc/mounts exists");
-        assert_eq!(fs.read_file("/proc/self/mounts").as_deref(), Some(&*mounts));
-        assert_eq!(fs.read_file("/etc/mtab").as_deref(), Some(&*mounts));
+        let mounts = read_string(&fs, "/proc/mounts");
+        assert_eq!(read_string(&fs, "/proc/self/mounts"), mounts);
+        assert_eq!(read_string(&fs, "/etc/mtab"), mounts);
         assert!(mounts.contains("/dev/sda1 / ext4 rw,relatime,discard,errors=remount-ro 0 0\n"));
         assert_eq!(mounts.lines().count(), MOUNT_TABLE.len());
-        let info = fs.read_file("/proc/self/mountinfo").unwrap();
+        let info = read_string(&fs, "/proc/self/mountinfo");
         assert_eq!(info.lines().count(), MOUNT_TABLE.len());
         assert!(info.contains(" / / rw,relatime - ext4 /dev/sda1 rw,discard,errors=remount-ro\n"));
-        for (_, point, _, _) in MOUNT_TABLE {
-            assert!(fs.is_dir(point), "{point} is mounted but not a directory");
+        for m in MOUNT_TABLE {
+            assert!(
+                fs.is_dir(m.point),
+                "{} is mounted but not a directory",
+                m.point
+            );
         }
         assert!(fs.list_dir("/etc").unwrap().contains(&"mtab".to_string()));
     }
@@ -874,9 +1455,7 @@ mod tests {
     #[test]
     fn the_android_snapshot_is_one_coherent_device() {
         let mut fs = FakeFs::android();
-        let build_prop = fs
-            .read_file("/system/build.prop")
-            .expect("/system/build.prop exists");
+        let build_prop = read_string(&fs, "/system/build.prop");
         for expected in [
             persona::ANDROID_MODEL,
             persona::ANDROID_DEVICE,
@@ -886,11 +1465,7 @@ mod tests {
         ] {
             assert!(build_prop.contains(expected), "build.prop lacks {expected}");
         }
-        assert!(
-            fs.read_file("/proc/version")
-                .unwrap()
-                .contains(persona::ANDROID_KERNEL_RELEASE)
-        );
+        assert!(read_string(&fs, "/proc/version").contains(persona::ANDROID_KERNEL_RELEASE));
         // The directories an ADB dropper writes to, and the ones it lists first.
         for dir in ["/data/local/tmp", "/sdcard", "/system/bin", "/system/xbin"] {
             assert!(fs.is_dir(dir), "{dir} must exist");
@@ -899,11 +1474,11 @@ mod tests {
         assert!(fs.is_executable("/system/bin/sh"));
         // /system is mounted read-only, and the mount table says so, so a payload dropped there
         // is refused rather than silently accepted.
-        let mounts = fs.read_file("/proc/mounts").unwrap();
+        let mounts = read_string(&fs, "/proc/mounts");
         assert!(mounts.contains(" /system ext4 ro,"), "{mounts}");
         assert!(mounts.contains(" /data ext4 rw,"), "{mounts}");
         assert_eq!(
-            fs.write_file("/system/bin/payload", "x"),
+            fs.write_file("/system/bin/payload", b"x"),
             Err(FsError::ReadOnly)
         );
         assert_eq!(fs.make_dir("/system/evil"), Err(FsError::ReadOnly));
@@ -912,10 +1487,10 @@ mod tests {
             Err(FsError::ReadOnly),
             "a read-only mount refuses deletions too"
         );
-        assert!(fs.write_file("/data/local/tmp/payload", "x").is_ok());
-        assert!(fs.write_file("/sdcard/payload", "x").is_ok());
+        assert!(fs.write_file("/data/local/tmp/payload", b"x").is_ok());
+        assert!(fs.write_file("/sdcard/payload", b"x").is_ok());
         // Nothing from the Linux server leaks into the phone.
-        assert!(fs.read_file("/etc/os-release").is_none());
+        assert!(fs.read_all("/etc/os-release", 8192).is_err());
         assert!(!fs.is_dir("/home"));
     }
 
@@ -945,7 +1520,7 @@ mod tests {
         let mut fs = FakeFs::new();
         assert_eq!(fs.create_file("/tmp/.x"), Ok(()));
         assert!(fs.list_dir("/tmp").unwrap().contains(&".x".to_string()));
-        assert_eq!(fs.read_file("/tmp/.x"), Some(String::new()));
+        assert_eq!(fs.read_all("/tmp/.x", 8192), Ok(Vec::new()));
         assert_eq!(
             fs.create_file("/nonexistent/.x"),
             Err(FsError::NoSuchDirectory("/nonexistent".to_string()))
@@ -954,5 +1529,577 @@ mod tests {
             !fs.list_dir("/").unwrap().contains(&".x".to_string()),
             "a file created in /tmp must not appear at /"
         );
+    }
+
+    // The `is_dir` and `list_dir` goldens below were captured from the string-map FakeFs this
+    // node model replaced, so they pin what the shell answered before the refactor. Paths the
+    // old heuristics answered wrongly are left out and asserted separately where they change.
+
+    const UBUNTU_DIRS: &[&str] = &[
+        "/",
+        "/bin",
+        "/boot",
+        "/boot/efi",
+        "/dev",
+        "/dev/hugepages",
+        "/dev/mqueue",
+        "/dev/pts",
+        "/dev/shm",
+        "/etc",
+        "/home",
+        "/lib",
+        "/lib64",
+        "/media",
+        "/mnt",
+        "/opt",
+        "/proc",
+        "/proc/self",
+        "/root",
+        "/run",
+        "/run/lock",
+        "/run/user",
+        "/run/user/0",
+        "/sbin",
+        "/srv",
+        "/sys",
+        "/sys/fs",
+        "/sys/fs/bpf",
+        "/sys/fs/cgroup",
+        "/sys/fs/fuse",
+        "/sys/fs/fuse/connections",
+        "/sys/fs/pstore",
+        "/sys/kernel",
+        "/sys/kernel/config",
+        "/sys/kernel/debug",
+        "/sys/kernel/security",
+        "/sys/kernel/tracing",
+        "/tmp",
+        "/usr",
+        "/usr/bin",
+        "/var",
+        "/var/run",
+        "/var/tmp",
+    ];
+
+    const UBUNTU_NOT_DIRS: &[&str] = &[
+        "/bin/bash",
+        "/bin/busybox",
+        "/bin/sh",
+        "/etc/hostname",
+        "/etc/hosts",
+        "/etc/mtab",
+        "/etc/os-release",
+        "/etc/passwd",
+        "/nonexistent",
+        "/proc/cpuinfo",
+        "/proc/mounts",
+        "/proc/self/mountinfo",
+        "/proc/self/mounts",
+        "/proc/self/nothing",
+        "/proc/version",
+        "/tmp/x",
+        "/usr/bin/wget",
+        "/usr/share",
+    ];
+
+    const ANDROID_DIRS: &[&str] = &[
+        "/",
+        "/acct",
+        "/cache",
+        "/config",
+        "/d",
+        "/data",
+        "/data/local",
+        "/data/local/tmp",
+        "/dev",
+        "/etc",
+        "/mnt",
+        "/oem",
+        "/persist",
+        "/proc",
+        "/proc/self",
+        "/root",
+        "/sbin",
+        "/sdcard",
+        "/storage",
+        "/storage/emulated",
+        "/storage/emulated/0",
+        "/sys",
+        "/system",
+        "/system/bin",
+        "/system/etc",
+        "/system/xbin",
+        "/vendor",
+    ];
+
+    const ANDROID_NOT_DIRS: &[&str] = &[
+        "/dev/pts",
+        "/etc/hostname",
+        "/nonexistent",
+        "/proc/cpuinfo",
+        "/proc/mounts",
+        "/proc/self/mountinfo",
+        "/proc/self/mounts",
+        "/proc/self/nothing",
+        "/proc/version",
+        "/sys/fs/selinux",
+        "/system/bin/app_process",
+        "/system/bin/sh",
+        "/system/bin/toolbox",
+        "/system/bin/toybox",
+        "/system/build.prop",
+        "/system/etc/hosts",
+        "/system/xbin/busybox",
+        "/system/xbin/su",
+        "/tmp/x",
+        "/usr/lib",
+        "/usr/sbin",
+        "/usr/share",
+    ];
+
+    const UBUNTU_LISTINGS: &str = "\
+/: bin boot dev etc home lib lib64 media mnt opt proc root run sbin srv sys tmp usr var
+/boot: efi grub
+/boot/efi: EFI
+/dev: hugepages mqueue null pts random shm stderr stdin stdout tty urandom zero
+/dev/hugepages:
+/dev/mqueue:
+/dev/pts: 0 ptmx
+/dev/shm:
+/etc: hostname hosts mtab os-release passwd
+/home: ubuntu
+/mnt:
+/root:
+/run: lock user
+/run/lock:
+/run/user: 0
+/run/user/0:
+/sys: block bus class dev devices firmware fs hypervisor kernel module power
+/sys/fs: bpf cgroup ext4 fuse pstore
+/sys/fs/bpf:
+/sys/fs/cgroup:
+/sys/fs/fuse: connections
+/sys/fs/fuse/connections:
+/sys/fs/pstore:
+/sys/kernel: config debug mm security slab tracing uevent_seqnum
+/sys/kernel/config:
+/sys/kernel/debug:
+/sys/kernel/security:
+/sys/kernel/tracing:
+/tmp:
+/usr: bin games include lib lib64 local sbin share src
+/var: backups cache lib local lock log mail opt run spool tmp
+/var/tmp:
+";
+
+    const ANDROID_LISTINGS: &str = "\
+/: acct cache config d data default.prop dev etc init init.rc mnt oem persist proc root sbin sdcard storage sys system ueventd.rc vendor
+/cache: backup lost+found recovery
+/data: anr app backup dalvik-cache data local media misc property system user
+/data/local: tmp
+/data/local/tmp:
+/dev: block cpuctl null socket zero
+/mnt: asec obb runtime secure shell
+/proc:
+/root:
+/sbin: adbd healthd ueventd watchdogd
+/sdcard: Alarms Android DCIM Download Movies Music Notifications Pictures Podcasts Ringtones
+/storage: emulated self
+/storage/emulated: 0 legacy
+/storage/emulated/0:
+/sys: block class devices fs kernel
+/system: app bin build.prop etc fonts framework lib media priv-app tts usr vendor xbin
+/system/bin: app_process cat chmod dalvikvm df getprop linker logcat ls mount ping reboot setprop sh toolbox toybox umount
+/system/etc: hosts
+/system/xbin: busybox su
+/vendor: firmware lib
+";
+
+    const ANDROID_PROC_MOUNTS: &str = "\
+rootfs / rootfs ro,seclabel,relatime 0 0
+tmpfs /dev tmpfs rw,seclabel,nosuid,relatime,mode=755 0 0
+devpts /dev/pts devpts rw,seclabel,relatime,mode=600 0 0
+proc /proc proc rw,relatime 0 0
+sysfs /sys sysfs rw,seclabel,relatime 0 0
+selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
+/dev/block/platform/msm_sdcc.1/by-name/system /system ext4 ro,seclabel,relatime,data=ordered 0 0
+/dev/block/platform/msm_sdcc.1/by-name/userdata /data ext4 rw,seclabel,nosuid,nodev,relatime,noauto_da_alloc,data=ordered 0 0
+/dev/block/platform/msm_sdcc.1/by-name/cache /cache ext4 rw,seclabel,nosuid,nodev,relatime,data=ordered 0 0
+/dev/block/platform/msm_sdcc.1/by-name/persist /persist ext4 rw,seclabel,nosuid,nodev,relatime,data=ordered 0 0
+/data/media /storage/emulated sdcardfs rw,nosuid,nodev,noexec,noatime 0 0
+/data/media /sdcard sdcardfs rw,nosuid,nodev,noexec,noatime 0 0
+";
+
+    #[test]
+    fn is_dir_answers_as_the_string_map_model_did() {
+        for (name, fs, dirs, not_dirs) in [
+            ("ubuntu", FakeFs::new(), UBUNTU_DIRS, UBUNTU_NOT_DIRS),
+            ("android", FakeFs::android(), ANDROID_DIRS, ANDROID_NOT_DIRS),
+        ] {
+            for path in dirs {
+                assert!(fs.is_dir(path), "{name}: {path} was a directory");
+            }
+            for path in not_dirs {
+                assert!(!fs.is_dir(path), "{name}: {path} was not a directory");
+            }
+        }
+        // The two names the usrmerge symlinks need as targets were not directories before; the
+        // three root-listing entries below are files the listing shows but no content backs.
+        let ubuntu = FakeFs::new();
+        assert!(ubuntu.is_dir("/usr/sbin") && ubuntu.is_dir("/usr/lib"));
+        let android = FakeFs::android();
+        for file in ["/default.prop", "/init", "/init.rc", "/ueventd.rc"] {
+            assert!(!android.is_dir(file), "{file} is listed, not a directory");
+        }
+    }
+
+    #[test]
+    fn list_dir_answers_as_the_string_map_model_did() {
+        for (name, fs, listings) in [
+            ("ubuntu", FakeFs::new(), UBUNTU_LISTINGS),
+            ("android", FakeFs::android(), ANDROID_LISTINGS),
+        ] {
+            for line in listings.lines() {
+                let (path, names) = line.split_once(':').unwrap();
+                let mut listed = fs
+                    .list_dir(path)
+                    .unwrap_or_else(|| panic!("{name}: {path} was listable"));
+                listed.sort();
+                assert_eq!(listed.join(" "), names.trim(), "{name}: ls {path}");
+            }
+        }
+        // /var/run was an empty directory and is /run now, as on a real box; /proc, /bin and the
+        // other directories that were only implied used to refuse a listing and now list empty.
+        let fs = FakeFs::new();
+        assert_eq!(fs.list_dir("/var/run"), fs.list_dir("/run"));
+        assert_eq!(fs.list_dir("/proc"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn android_proc_mounts_bytes_are_unchanged() {
+        let fs = FakeFs::android();
+        assert_eq!(read_string(&fs, "/proc/mounts"), ANDROID_PROC_MOUNTS);
+        assert_eq!(read_string(&fs, "/proc/self/mounts"), ANDROID_PROC_MOUNTS);
+    }
+
+    /// A small deterministic generator, so the property test needs no new dependency and replays
+    /// identically.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// A blob of random pieces and its full materialization, computed piece by piece rather than
+    /// through `read_range`.
+    fn random_blob(rng: &mut Rng) -> (Blob, Vec<u8>) {
+        let mut pieces = Vec::new();
+        let mut naive = Vec::new();
+        for _ in 0..rng.below(7) {
+            let len = rng.below(40);
+            match rng.below(3) {
+                0 => {
+                    let bytes: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                    naive.extend_from_slice(&bytes);
+                    pieces.push(Piece::Bytes(Arc::new(bytes)));
+                }
+                1 => {
+                    let byte = rng.next() as u8;
+                    naive.extend(std::iter::repeat_n(byte, len as usize));
+                    pieces.push(Piece::Fill { byte, len });
+                }
+                _ => {
+                    let seed = rng.next();
+                    naive.extend((0..len).map(|i| counter_byte(seed, i)));
+                    pieces.push(Piece::Counter { seed, len });
+                }
+            }
+        }
+        let len = naive.len() as u64;
+        (Blob { pieces, len }, naive)
+    }
+
+    #[test]
+    fn read_range_equals_the_bounded_naive_slice_for_random_layouts() {
+        let mut rng = Rng(7);
+        for _ in 0..3000 {
+            let (blob, naive) = random_blob(&mut rng);
+            let total = naive.len() as u64;
+            let (off, max_len) = match rng.below(6) {
+                0 => (u64::MAX - rng.below(3), rng.below(20)),
+                1 => (rng.below(total + 5), u64::MAX),
+                _ => (rng.below(total + 5), rng.below(total + 5)),
+            };
+            let start = off.min(total);
+            let end = start.saturating_add(max_len).min(total);
+            let expected = &naive[start as usize..end as usize];
+            let got = blob.read_range(off, max_len);
+            assert_eq!(got, expected, "off={off} max_len={max_len} total={total}");
+            assert!(got.len() as u64 <= max_len);
+        }
+    }
+
+    #[test]
+    fn read_range_saturates_instead_of_overflowing() {
+        let blob = Blob::from_bytes(b"0123456789".to_vec());
+        assert_eq!(blob.read_range(u64::MAX - 1, 10), Vec::<u8>::new());
+        assert_eq!(blob.read_range(3, u64::MAX), b"3456789");
+        assert_eq!(blob.read_range(10, 4), Vec::<u8>::new());
+        assert_eq!(blob.read_range(2, 3), b"234");
+        assert_eq!(blob.owned_bytes(), 10);
+        let synthetic = Blob::fill(0xAA, 1 << 40);
+        assert_eq!(synthetic.owned_bytes(), 0, "fill owns no bytes");
+        assert_eq!(synthetic.read_range((1 << 40) - 2, 100), vec![0xAA, 0xAA]);
+        assert_eq!(Blob::counter(9, 100).read_range(0, 100).len(), 100);
+    }
+
+    #[test]
+    fn read_range_reads_files_and_refuses_directories_and_absences() {
+        let fs = FakeFs::new();
+        assert_eq!(
+            fs.read_range("/etc/hostname", 0, 3).unwrap(),
+            persona::hostname().as_bytes()[..3]
+        );
+        assert_eq!(
+            fs.read_range("/etc/hostname", 1_000, 3),
+            Ok(Vec::new()),
+            "past the end is empty, not an error"
+        );
+        assert_eq!(fs.read_all("/etc", 16), Err(FsError::IsADirectory));
+        assert_eq!(fs.read_all("/nonexistent", 16), Err(FsError::NoSuchFile));
+        assert_eq!(
+            fs.read_all("/nonexistent/deeper", 16),
+            Err(FsError::NoSuchFile)
+        );
+        assert_eq!(
+            fs.read_all("/etc/hostname/x", 16),
+            Err(FsError::NotADirectory)
+        );
+    }
+
+    #[test]
+    fn the_usrmerge_symlinks_resolve_to_the_physical_paths() {
+        let fs = FakeFs::new();
+        assert_eq!(
+            fs.resolve("/bin/busybox", true).unwrap(),
+            "/usr/bin/busybox"
+        );
+        assert_eq!(fs.resolve("/var/run/.x", true).unwrap(), "/run/.x");
+        assert_eq!(fs.resolve("/var/run/..", true).unwrap(), "/");
+        assert_eq!(fs.resolve("/lib64", false).unwrap(), "/lib64");
+        assert_eq!(fs.resolve("/lib64", true).unwrap(), "/usr/lib64");
+        assert_eq!(
+            fs.read_all("/bin/busybox", 64).unwrap(),
+            fs.read_all("/usr/bin/busybox", 64).unwrap()
+        );
+        assert_eq!(
+            fs.read_all("/etc/mtab", 8192).unwrap(),
+            fs.read_all("/proc/self/mounts", 8192).unwrap()
+        );
+        assert!(fs.is_executable("/bin/busybox"));
+        assert!(fs.is_dir("/var/run") && fs.is_dir("/bin") && fs.is_dir("/lib"));
+        // The fd links point at a directory the box does not model.
+        assert_eq!(fs.read_all("/dev/stdin", 1), Err(FsError::NoSuchFile));
+        assert!(!fs.file_exists("/dev/stdin"));
+    }
+
+    #[test]
+    fn a_symlink_cycle_gives_eloop_after_forty_hops() {
+        let mut fs = FakeFs::new();
+        fs.overlay.nodes.insert("/tmp/a".into(), Node::symlink("b"));
+        fs.overlay.nodes.insert("/tmp/b".into(), Node::symlink("a"));
+        assert_eq!(fs.resolve("/tmp/a", true), Err(FsError::TooManyLinks));
+        assert_eq!(fs.read_all("/tmp/a", 1), Err(FsError::TooManyLinks));
+        assert!(!fs.is_dir("/tmp/a") && !fs.file_exists("/tmp/a"));
+        // A chain one link short of the cap still resolves; one over does not.
+        for i in 0..40 {
+            fs.overlay
+                .nodes
+                .insert(format!("/tmp/l{i}"), Node::symlink(&format!("l{}", i + 1)));
+        }
+        fs.overlay
+            .nodes
+            .insert("/tmp/l40".into(), Node::symlink("/etc/hostname"));
+        assert_eq!(fs.resolve("/tmp/l1", true).unwrap(), "/etc/hostname");
+        assert_eq!(fs.resolve("/tmp/l0", true), Err(FsError::TooManyLinks));
+        // `rm` acts on the link itself, so it works on a cycle.
+        assert_eq!(fs.remove_path("/tmp/a"), Ok(true));
+        assert!(fs.overlay.tombstones.contains("/tmp/a"));
+    }
+
+    #[test]
+    fn mount_policy_follows_the_longest_matching_mount_point() {
+        let ubuntu = FakeFs::new();
+        for path in ["/", "/tmp/x", "/run/x", "/dev/null", "/etc/passwd"] {
+            assert!(!ubuntu.snapshot.is_ro(path), "{path} is on a rw mount");
+        }
+        assert!(ubuntu.snapshot.is_noexec("/run"));
+        assert!(ubuntu.snapshot.is_noexec("/run/lock/x"));
+        assert!(ubuntu.snapshot.is_noexec("/dev/pts/0"));
+        assert!(ubuntu.snapshot.is_noexec("/proc/version"));
+        assert!(
+            !ubuntu.snapshot.is_noexec("/run/user/0/x"),
+            "the nested mount is exec-permitted although /run is not"
+        );
+        assert!(!ubuntu.snapshot.is_noexec("/tmp/x"));
+        assert!(!ubuntu.snapshot.is_noexec("/dev/shm/x"));
+        assert!(
+            !ubuntu.snapshot.is_noexec("/runx"),
+            "/runx is not under /run"
+        );
+
+        let android = FakeFs::android();
+        for path in ["/system/bin/x", "/system", "/vendor/x", "/root/x", "/x"] {
+            assert!(android.snapshot.is_ro(path), "{path} is read-only");
+        }
+        for path in [
+            "/data/local/tmp/x",
+            "/cache/x",
+            "/sdcard/x",
+            "/dev/null",
+            "/systemx",
+        ] {
+            assert!(
+                android.snapshot.is_ro(path) == (path == "/systemx"),
+                "{path}"
+            );
+        }
+        assert!(android.snapshot.is_noexec("/sdcard/x"));
+        assert!(android.snapshot.is_noexec("/storage/emulated/0/x"));
+        assert!(!android.snapshot.is_noexec("/data/local/tmp/x"));
+    }
+
+    #[test]
+    fn a_write_into_a_readonly_mount_is_refused_even_through_a_missing_parent() {
+        let mut fs = FakeFs::android();
+        assert_eq!(
+            fs.write_file("/system/nodir/x", b"x"),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(fs.write_file("/vendor/x", b"x"), Err(FsError::ReadOnly));
+        assert_eq!(fs.write_file("/root/x", b"x"), Err(FsError::ReadOnly));
+        assert_eq!(
+            fs.write_file("/data/nodir/x", b"x"),
+            Err(FsError::NoSuchDirectory("/data/nodir".into()))
+        );
+    }
+
+    #[test]
+    fn devices_read_and_write_by_their_own_rules() {
+        let mut fs = FakeFs::new();
+        assert_eq!(fs.write_file("/dev/null", b"x"), Ok(()));
+        assert_eq!(fs.read_all("/dev/null", 16), Ok(Vec::new()));
+        assert!(
+            !fs.overlay.nodes.contains_key("/dev/null"),
+            "a discarded write stores nothing"
+        );
+        assert_eq!(fs.read_all("/dev/zero", 4), Ok(vec![0, 0, 0, 0]));
+        assert_eq!(fs.write_file("/dev/zero", b"x"), Ok(()));
+        // No persona lists /dev/full, so the device is injected to exercise its rules.
+        fs.overlay
+            .nodes
+            .insert("/dev/full".into(), Node::device(Device::Full));
+        assert_eq!(fs.write_file("/dev/full", b"x"), Err(FsError::NoSpace));
+        assert_eq!(fs.read_all("/dev/full", 2), Ok(vec![0, 0]));
+        assert_eq!(fs.write_file("/dev/tty", b"x"), Ok(()));
+        assert_eq!(fs.read_all("/dev/tty", 8), Ok(Vec::new()));
+        let random = fs.read_all("/dev/urandom", 32).unwrap();
+        assert_eq!(random.len(), 32);
+        assert_ne!(random, vec![0; 32]);
+        assert_eq!(fs.read_range("/dev/urandom", 8, 8).unwrap(), random[8..16]);
+        assert_ne!(fs.read_all("/dev/random", 32).unwrap(), random);
+        assert!(fs.file_exists("/dev/null") && !fs.is_dir("/dev/null"));
+        assert_eq!(
+            fs.read_all("/dev/zero", u64::MAX).unwrap().len() as u64,
+            READ_CAP,
+            "an unbounded read of an endless device is capped"
+        );
+        let mut android = FakeFs::android();
+        assert_eq!(android.write_file("/dev/null", b"x"), Ok(()));
+        assert_eq!(android.read_all("/dev/zero", 2), Ok(vec![0, 0]));
+    }
+
+    #[test]
+    fn a_removed_baked_file_is_shadowed_by_its_tombstone_until_rewritten() {
+        let mut fs = FakeFs::new();
+        assert!(fs.file_exists("/etc/hostname"));
+        assert_eq!(fs.remove_path("/etc/hostname"), Ok(true));
+        assert!(!fs.file_exists("/etc/hostname"));
+        assert_eq!(fs.read_all("/etc/hostname", 16), Err(FsError::NoSuchFile));
+        assert!(
+            !fs.list_dir("/etc")
+                .unwrap()
+                .contains(&"hostname".to_string())
+        );
+        assert_eq!(fs.remove_path("/etc/hostname"), Ok(false));
+        assert_eq!(fs.write_file("/etc/hostname", b"new\n"), Ok(()));
+        assert_eq!(fs.read_all("/etc/hostname", 16), Ok(b"new\n".to_vec()));
+        assert_eq!(
+            fs.list_dir("/etc")
+                .unwrap()
+                .iter()
+                .filter(|name| *name == "hostname")
+                .count(),
+            1,
+            "a rewritten baked name is listed once"
+        );
+        // A removed directory takes what was created under it along.
+        assert_eq!(fs.make_dir("/tmp/a"), Ok(()));
+        assert_eq!(fs.create_file("/tmp/a/f"), Ok(()));
+        assert_eq!(fs.remove_path("/tmp/a"), Ok(true));
+        assert_eq!(fs.make_dir("/tmp/a"), Ok(()));
+        assert_eq!(fs.list_dir("/tmp/a"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn the_execute_bit_rides_the_node_mode() {
+        let mut fs = FakeFs::new();
+        assert!(
+            !fs.mark_executable("/etc/hostname"),
+            "baked files keep their modes"
+        );
+        assert!(fs.is_executable("/usr/bin/wget"));
+        assert!(!fs.is_executable("/etc/hostname"));
+        fs.create_file("/tmp/p").unwrap();
+        assert!(!fs.is_executable("/tmp/p"));
+        assert!(fs.mark_executable("/tmp/p"));
+        assert!(fs.is_executable("/tmp/p"));
+        // Truncating in place keeps the bit; a copy carries its source's mode.
+        fs.write_file("/tmp/p", b"payload").unwrap();
+        assert!(fs.is_executable("/tmp/p"));
+        let (blob, mode) = fs.content_and_mode("/bin/busybox").unwrap();
+        assert_eq!(mode, MODE_EXECUTABLE);
+        fs.write_blob("/tmp/b", blob, mode).unwrap();
+        assert!(fs.is_executable("/tmp/b"));
+        let (blob, mode) = fs.content_and_mode("/etc/hostname").unwrap();
+        fs.write_blob("/tmp/h", blob, mode).unwrap();
+        assert!(!fs.is_executable("/tmp/h"));
+        assert_eq!(
+            fs.content_and_mode("/etc").err(),
+            Some(FsError::IsADirectory)
+        );
+        assert_eq!(
+            fs.content_and_mode("/nope").err(),
+            Some(FsError::NoSuchFile)
+        );
+        // Nothing runs from a noexec mount, whatever its mode.
+        fs.create_file("/run/x").unwrap();
+        assert!(fs.mark_executable("/run/x"));
+        assert!(!fs.is_executable("/run/x"));
+        assert!(
+            !fs.is_executable("/var/run/x"),
+            "the same file through the link"
+        );
+        assert_eq!(fs.write_file("/tmp", b"x"), Err(FsError::IsADirectory));
     }
 }

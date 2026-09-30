@@ -95,8 +95,6 @@ pub async fn handle_connection(
     // come from the shared persona so the hostname matches uname / the shell prompt / the other
     // sensors, instead of a bare "login:" with no host and a cross-instance-constant shell prompt.
     let host = persona::hostname();
-    let shell_prompt = persona::root_prompt(&host);
-
     let issue = format!("{}\r\n", persona::OS_PRETTY);
     if stream.write_all(issue.as_bytes()).await.is_err() {
         return;
@@ -141,7 +139,7 @@ pub async fn handle_connection(
     };
     let mut shell = FakeShell::new(FakeFs::new(), ctx);
 
-    if stream.write_all(shell_prompt.as_bytes()).await.is_err() {
+    if stream.write_all(shell.prompt().as_bytes()).await.is_err() {
         return;
     }
 
@@ -159,9 +157,8 @@ pub async fn handle_connection(
         let Some(line) = reader.read_line(&mut stream, true).await else {
             break;
         };
-        let is_exit = matches!(line.trim(), "exit" | "logout");
-
         let (output, events) = shell.handle_input(&line);
+        let close_session = output.close_session;
         for event in &events {
             if event.metadata.get("flood").and_then(|v| v.as_str()) == Some("binary") {
                 reader.flag_binary();
@@ -176,14 +173,14 @@ pub async fn handle_connection(
         // banner/prompts above already use \r\n; translate the command output to match.
         let output = onlcr(output.bytes());
 
-        if is_exit {
+        if close_session {
             let _ = stream.write_all(&shell.encode_output(&output)).await;
             reader.mark_session_end(CaptureEnd::ClientLogout);
             break;
         }
 
         let mut response = output;
-        response.extend_from_slice(shell_prompt.as_bytes());
+        response.extend_from_slice(shell.prompt().as_bytes());
         // Mirror any XOR obfuscation onto the response so a symmetric-codec bot reads plaintext after
         // de-obfuscating (identity for a plaintext session, so normal bots are unaffected).
         let response = shell.encode_output(&response);

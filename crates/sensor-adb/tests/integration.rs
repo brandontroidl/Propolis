@@ -241,6 +241,46 @@ async fn shell_command_capture_via_fakeshell() {
 }
 
 #[tokio::test]
+async fn interactive_shell_closes_only_after_the_outer_android_shell_exits() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let local_id = 8;
+    let server_id = open_stream(&mut conn, local_id, "shell:").await;
+
+    let (prompt, prompt_data) = read_message(&mut conn).await;
+    assert_eq!(prompt.command, adb_proto::A_WRTE);
+    assert_eq!(
+        String::from_utf8_lossy(&prompt_data),
+        sensor_framework::persona::android_root_prompt("/")
+    );
+
+    let nested = send_shell_line(&mut conn, local_id, server_id, "sh").await;
+    assert_eq!(
+        nested,
+        sensor_framework::persona::android_root_prompt("/"),
+        "opening a nested Android shell keeps the stream open"
+    );
+    let returned = send_shell_line(&mut conn, local_id, server_id, "exit").await;
+    assert_eq!(
+        returned,
+        sensor_framework::persona::android_root_prompt("/"),
+        "the first exit returns to the outer shell"
+    );
+
+    conn.write_all(&adb_proto::build_wrte(local_id, server_id, b"exit\n"))
+        .await
+        .unwrap();
+    let (ack, _) = read_message(&mut conn).await;
+    assert_eq!(ack.command, adb_proto::A_OKAY);
+    let (close, _) = read_message(&mut conn).await;
+    assert_eq!(close.command, adb_proto::A_CLSE);
+    assert_eq!(close.arg0, server_id);
+    assert_eq!(close.arg1, local_id);
+    srv.handle.abort();
+}
+
+#[tokio::test]
 async fn push_file_captured_to_spool() {
     let srv = TestServer::start().await;
     let mut conn = TcpStream::connect(srv.addr).await.unwrap();

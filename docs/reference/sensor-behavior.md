@@ -112,7 +112,9 @@ contradict each other (`crates/sensor-framework/src/persona.rs`): **Ubuntu
 `x86_64` (`crates/sensor-framework/src/persona.rs#OS_PRETTY`, `crates/sensor-framework/src/persona.rs#OS_VERSION`, `crates/sensor-framework/src/persona.rs#KERNEL_RELEASE`, `crates/sensor-framework/src/persona.rs#KERNEL_BUILD`, `crates/sensor-framework/src/persona.rs#ARCH`). Default hostname is `server01`, overridable with
 `PROPOLIS_HOSTNAME` (`crates/sensor-framework/src/persona.rs#DEFAULT_HOSTNAME`, `crates/sensor-framework/src/persona.rs#ENV_HOSTNAME`, `crates/sensor-framework/src/persona.rs#hostname`). The SSH banner default is
 `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10` (`crates/sensor-framework/src/persona.rs#OPENSSH_VERSION`). Helpers produce a consistent
-`uname -a` string, `/proc/version`, and a `root@<host>:~#` prompt (`crates/sensor-framework/src/persona.rs#uname_all`, `crates/sensor-framework/src/persona.rs#proc_version`, `crates/sensor-framework/src/persona.rs#root_prompt`).
+`uname -a` string and `/proc/version`; the shell builds its
+`root@<host>:<cwd>#` prompt from that identity and its current state
+(`crates/sensor-framework/src/persona.rs#uname_all`, `crates/sensor-framework/src/persona.rs#proc_version`, `crates/sensor-framework/src/shell.rs#FakeShell::prompt`).
 
 `sensor-adb` resolves a **second** identity from the same file: a rooted Nexus 5 on
 Android 6.0.1 (build M4B30Z, kernel 3.4.0, armv7l). ADB is Android's own debug
@@ -151,7 +153,7 @@ nothing behind. Nothing persists between sessions.
 
 ### Fake shell (SSH, Telnet, ADB)
 
-`shell.rs` presents an interactive post-auth shell shared by SSH, Telnet, and ADB
+`shell.rs` presents interactive and one-shot shells shared by SSH, Telnet, and ADB
 (`crates/sensor-framework/src/shell.rs`). It is **never-exec and no-fetch by
 construction**: there is no process-spawn API and no HTTP/network-fetch client
 anywhere in the crate; `wget`/`curl` return canned transcripts with zero network
@@ -169,6 +171,12 @@ I/O (`crates/sensor-framework/src/shell.rs`). This is asserted by `never_exec_st
   added to metadata (`crates/sensor-framework/src/shell.rs#FakeShell::handle_input`).
 - A recognized fetch verb additionally emits `honeypot_file_download` with
   `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell.rs#FakeShell::handle_input`).
+- Shell identity is state, not fixed response text (`crates/sensor-framework/src/shell.rs#ShellContext`, `crates/sensor-framework/src/shell.rs#FakeShell::prompt`). An Ubuntu login starts as
+  `-bash`, uses the interactive command-not-found handler and a prompt that follows
+  the working directory. SSH exec uses `bash: line 1:` diagnostics and no prompt.
+  Bare `su`, `sh`, `bash` and `ash` push nested levels; dash levels have their own
+  `sh: N:` line counters. `exit` pops one level, and only exiting the outer level
+  sets `close_session`. Android starts and nests as mksh with `sh:` diagnostics.
 - Implemented commands (`dispatch`, `crates/sensor-framework/src/shell.rs#FakeShell::dispatch`): `uname` (real per-flag field
   selection), `id`/`whoami`/`pwd`, `echo` (Gafgyt/BASHLITE `\xHH`-decoding
   handshake returning `GAYFGT`, `crates/sensor-framework/src/shell.rs#cmd_echo`, `crates/sensor-framework/src/shell.rs#decode_echo_escapes_into`), `cat` (fakefs plus a special
@@ -183,8 +191,8 @@ I/O (`crates/sensor-framework/src/shell.rs`). This is asserted by `never_exec_st
   `tftp`/`ftpget` (silent; the download url is synthesized from the separate host and file
   arguments as `tftp://host[:port]/file` / `ftp://host[:port]/file`, since neither command
   takes a url token),
-  `chmod`/`cp`/`rm`/`mkdir`/`sleep` (silent success), `cd`, `exit`/`logout`; any
-  other command gives `<cmd>: command not found`.
+  `chmod`/`cp`/`rm`/`mkdir`/`sleep` (silent success), `cd`, `exit`/`logout`; an
+  unknown command uses the active shell level's diagnostic form.
 - BusyBox applet set is a single source of truth (`BUSYBOX_APPLETS`, `crates/sensor-framework/src/shell.rs#BUSYBOX_APPLETS`)
   and deliberately excludes `curl` (real busybox ships none), so `busybox curl`
   gives `applet not found` - matching the real-busybox check Mirai/Gafgyt perform.
@@ -289,7 +297,8 @@ captures SCP/SFTP transfers.
 - **Channels** (`channel.rs`): only `session` channels are confirmed;
   `direct-tcpip` and all other types are refused at open - this closes off
   attacker-directed proxying by construction (`crates/sensor-ssh/src/channel.rs#handle_channel_open`). Actions: `pty-req`
-  (ack), `shell` (interactive FakeShell), `exec <cmd>` (one-shot; `scp -t ` starts
+  (ack), `shell` (interactive FakeShell with state-derived prompts), `exec <cmd>`
+  (one-shot with noninteractive bash diagnostics; `scp -t ` starts
   the SCP receiver), `subsystem sftp` (SFTP handler). `MAX_LINE_LEN = 8192`.
 - **Capture** (`transfer.rs`): captures **inbound writes only, never serves reads**
   (`crates/sensor-ssh/src/transfer.rs`). SCP receive mode parses the `C<mode> <size> <name>` header and streams
@@ -324,7 +333,8 @@ credential, then presents the fake shell.
   prompts `Password:` and reads the password **read-only, then drops it, never
   stored or logged** (`crates/sensor-telnet/src/handler.rs#handle_connection`); accepts unconditionally and emits
   `honeypot_login_attempt` (authenticated=true); enters the FakeShell. Echoes typed
-  characters, hides password characters, translates shell LF to CR-LF for NVT.
+  characters, hides password characters, translates shell LF to CR-LF for NVT,
+  prints the active level's prompt, and closes only when the outer shell exits.
   `MAX_LINE_LEN` 8192.
 - **Bounds:** common defaults, `max_concurrent` 256. **Does not spool bodies.**
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
@@ -443,7 +453,8 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
 - **Behavior** (`handler.rs`): CNXN handshake → device banner, then multiplexed
   streams (`MAX_STREAMS_PER_CONN = 32`). OPEN destinations (`crates/sensor-adb/src/handler.rs#handle_open`): `shell:` →
   interactive FakeShell **in its Android flavor** (the device's filesystem, a
-  `root@hammerhead:<cwd> #` prompt that follows `cd`, Android's `uname`, and mksh's
+  `root@hammerhead:<cwd> #` prompt that follows `cd`, Android's `uname`, nested mksh
+  levels that close the stream only when the outer shell exits, and mksh's
   `sh: x: not found` rather than bash's `command not found`; authenticated **always
   false** - ADB has no auth step),
   `shell:<cmd>` → one-shot exec, `sync:` → file-transfer sub-protocol, anything

@@ -159,6 +159,59 @@ async fn ssh_handshake_and_session_with_real_client() {
 }
 
 #[tokio::test]
+async fn exec_request_uses_noninteractive_bash_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        wan_resolver,
+        test_bounds(),
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(config, addr, TestHandler)
+        .await
+        .unwrap();
+    assert!(
+        session
+            .authenticate_password("root", "password")
+            .await
+            .unwrap()
+            .success()
+    );
+
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel.exec(false, b"nosuchcmd_q").await.unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut output = Vec::new();
+        while let Some(message) = channel.wait().await {
+            if let russh::ChannelMsg::Data { data } = message {
+                output.extend_from_slice(&data);
+                if output.ends_with(b"\n") {
+                    break;
+                }
+            }
+        }
+        output
+    })
+    .await
+    .expect("timed out waiting for SSH exec output");
+    assert_eq!(output, b"bash: line 1: nosuchcmd_q: command not found\n");
+
+    drop(channel);
+    drop(session);
+    handle.abort();
+}
+
+#[tokio::test]
 async fn no_outbound_connections() {
     // Start a "target" server that the fake wget/curl would connect to if it actually made
     // network requests. Verify it receives zero connections.

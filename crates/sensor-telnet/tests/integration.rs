@@ -114,6 +114,50 @@ async fn login_and_command_capture_emits_expected_events() {
 }
 
 #[tokio::test]
+async fn nested_shell_exit_restores_the_login_prompt_before_final_logout() {
+    let dir = tempfile::tempdir().unwrap();
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_telnet::start_test_server(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        wan_resolver,
+        test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    login(&mut conn, b"root", b"password").await;
+
+    conn.write_all(b"sh\r\n").await.unwrap();
+    read_until_contains(&mut conn, b"# ").await;
+    conn.write_all(b"exit\r\n").await.unwrap();
+    read_until_contains(&mut conn, b"root@server01:~# ").await;
+
+    conn.write_all(b"cd /tmp\r\n").await.unwrap();
+    read_until_contains(&mut conn, b"root@server01:/tmp# ").await;
+    conn.write_all(b"exit\r\n").await.unwrap();
+    let logout = read_until_contains(&mut conn, b"logout\r\n").await;
+    assert!(
+        !logout
+            .windows(b"root@server01:/tmp# ".len())
+            .any(|w| w == b"root@server01:/tmp# "),
+        "a closed login shell must not print another prompt: {logout:?}"
+    );
+
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(3), conn.read(&mut byte))
+        .await
+        .expect("server did not close after login-shell exit")
+        .unwrap();
+    assert_eq!(read, 0, "login-shell exit must close the Telnet session");
+    handle.abort();
+}
+
+#[tokio::test]
 async fn password_never_appears_in_any_event() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("events.jsonl");

@@ -61,7 +61,7 @@ const MAX_SYNC_BODY: usize = 10_000_000;
 /// The prompt an `adb shell` session shows: the device name and the working directory, both from
 /// the shared persona, so it agrees with the CNXN banner and with what the shell itself answers.
 fn shell_prompt(shell: &FakeShell) -> Vec<u8> {
-    sensor_framework::persona::android_root_prompt(shell.cwd()).into_bytes()
+    shell.prompt().into_bytes()
 }
 
 fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
@@ -818,6 +818,7 @@ async fn handle_wrte(
         return Ok(()); // unknown stream (already closed, or never opened): ignore, do not reply
     };
     let client_local_id = entry.client_local_id;
+    let mut close_shell = false;
 
     match &mut entry.kind {
         StreamKind::Shell(shell, line_buf, capture) => {
@@ -842,7 +843,11 @@ async fn handle_wrte(
                             }
                         }
                         responses.extend_from_slice(output.bytes());
-                        // Re-read the prompt each time: `cd` changes what it shows.
+                        close_shell = output.close_session;
+                        if close_shell {
+                            break;
+                        }
+                        // Re-read the prompt each time: `cd` or a nested shell changes it.
                         responses.extend_from_slice(&shell_prompt(shell));
                     }
                 } else {
@@ -850,7 +855,7 @@ async fn handle_wrte(
                     if line_buf.len() >= MAX_SHELL_LINE_LEN {
                         let line = String::from_utf8_lossy(line_buf).into_owned();
                         line_buf.clear();
-                        let (_output, events) = shell.handle_input(&line);
+                        let (output, events) = shell.handle_input(&line);
                         for event in &events {
                             if event.metadata.get("flood").and_then(|v| v.as_str())
                                 == Some("binary")
@@ -860,6 +865,10 @@ async fn handle_wrte(
                             if emitter.append(event).await.is_err() {
                                 tracing::error!(%peer_addr, "adb: failed to append command event");
                             }
+                        }
+                        close_shell = output.close_session;
+                        if close_shell {
+                            break;
                         }
                     }
                 }
@@ -871,6 +880,14 @@ async fn handle_wrte(
                     &adb_proto::build_wrte(server_id, client_local_id, &responses),
                 )
                 .await?;
+            }
+            if close_shell {
+                if let Some(mut closed) = streams.remove(&server_id)
+                    && let StreamKind::Shell(_, _, capture) = &mut closed.kind
+                {
+                    capture.stream_end = Some(CaptureEnd::ClientLogout);
+                }
+                write_or_err(stream, &adb_proto::build_clse(server_id, client_local_id)).await?;
             }
         }
         StreamKind::Sync(sync) => {

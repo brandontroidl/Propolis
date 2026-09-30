@@ -17,7 +17,6 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
-use sensor_framework::persona;
 use sensor_framework::{
     CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, OutboxManifest,
     QuarantineSpool, WanResolver,
@@ -275,7 +274,7 @@ async fn handle_session(
     // submitted below. A write error used to return straight out of this function and take a
     // half-received SCP or SFTP file with it.
     let loop_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
-    loop {
+    'packet_loop: loop {
         let payload =
             match transport::read_packet_encrypted(&mut stream, &mut c2s_cipher, c2s_seq).await {
                 Ok(p) => p,
@@ -362,10 +361,8 @@ async fn handle_session(
                             session_id: Some(session_id),
                         };
                         let shell = FakeShell::new(FakeFs::new(), ctx);
+                        let prompt = shell.prompt();
                         handler = ChannelHandler::Shell(Box::new(shell), Vec::new());
-                        // Send an initial prompt, hostname from the shared persona so it matches
-                        // uname / the fake filesystem / the other sensors.
-                        let prompt = persona::root_prompt(&persona::hostname());
                         let data_pkt = build_channel_data(ch_id, prompt.as_bytes());
                         write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &data_pkt)
                             .await?;
@@ -379,7 +376,7 @@ async fn handle_session(
                             protocol_label: "ssh".to_string(),
                             session_id: Some(session_id),
                         };
-                        let mut shell = FakeShell::new(FakeFs::new(), shell_ctx);
+                        let mut shell = FakeShell::exec(FakeFs::new(), shell_ctx);
                         let (output, events) = shell.handle_input(&cmd);
                         for event in &events {
                             emitter.append(event).await?;
@@ -449,6 +446,7 @@ async fn handle_session(
                         // fresh prompt - even for an empty line, as a real shell does.
                         let mut responses = Vec::new();
                         let mut prev_cr = false;
+                        let mut close_shell = false;
                         for &byte in data {
                             match byte {
                                 b'\r' | b'\n' => {
@@ -480,10 +478,12 @@ async fn handle_session(
                                             // and prompt above already use \r\n; match them.
                                             responses.extend_from_slice(&onlcr(output.bytes()));
                                         }
+                                        close_shell = output.close_session;
                                     }
-                                    responses.extend_from_slice(
-                                        persona::root_prompt(&persona::hostname()).as_bytes(),
-                                    );
+                                    if close_shell {
+                                        break;
+                                    }
+                                    responses.extend_from_slice(shell.prompt().as_bytes());
                                 }
                                 // Backspace / DEL: erase the last char on screen too.
                                 0x7f | 0x08 => {
@@ -502,7 +502,7 @@ async fn handle_session(
                                     if line_buf.len() >= MAX_LINE_LEN {
                                         let line = String::from_utf8_lossy(line_buf).to_string();
                                         line_buf.clear();
-                                        let (_output, events) = shell.handle_input(&line);
+                                        let (output, events) = shell.handle_input(&line);
                                         for event in &events {
                                             if event.metadata.get("flood").and_then(|v| v.as_str())
                                                 == Some("binary")
@@ -512,6 +512,10 @@ async fn handle_session(
                                             if emitter.append(event).await.is_err() {
                                                 tracing::error!(%peer_addr, "ssh: failed to append command event");
                                             }
+                                        }
+                                        close_shell = output.close_session;
+                                        if close_shell {
+                                            break;
                                         }
                                     }
                                 }
@@ -524,6 +528,10 @@ async fn handle_session(
                             let data_pkt = build_channel_data(ch_id, &responses);
                             write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &data_pkt)
                                 .await?;
+                        }
+                        if close_shell {
+                            shell_capture.mark_session_end(CaptureEnd::ClientLogout);
+                            break 'packet_loop;
                         }
                     }
                     ChannelHandler::Scp(scp) => {

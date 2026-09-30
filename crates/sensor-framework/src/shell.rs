@@ -97,7 +97,9 @@ pub struct OutputSegment {
 pub struct CommandResult {
     pub status: u8,
     pub output: Vec<OutputSegment>,
+    pub close_session: bool,
     combined: Vec<u8>,
+    stop_line: bool,
 }
 
 impl CommandResult {
@@ -105,7 +107,9 @@ impl CommandResult {
         Self {
             status,
             output: Vec::new(),
+            close_session: false,
             combined: Vec::new(),
+            stop_line: false,
         }
     }
 
@@ -125,11 +129,22 @@ impl CommandResult {
             status,
             combined: bytes.clone(),
             output: vec![OutputSegment { fd, bytes }],
+            close_session: false,
+            stop_line: false,
         }
+    }
+
+    fn shell_exit(status: u8, bytes: impl Into<Vec<u8>>, close_session: bool) -> Self {
+        let mut result = Self::one(OutputFd::Stdout, status, bytes.into());
+        result.close_session = close_session;
+        result.stop_line = true;
+        result
     }
 
     fn append(&mut self, mut other: Self) {
         self.status = other.status;
+        self.close_session |= other.close_session;
+        self.stop_line |= other.stop_line;
         self.combined.append(&mut other.combined);
         self.output.append(&mut other.output);
     }
@@ -207,8 +222,8 @@ pub fn onlcr(bytes: &[u8]) -> Vec<u8> {
 /// cannot pollute the append-only ledger without bound.
 const MAX_COMMANDS_PER_SESSION: u64 = 256;
 
-/// The fake interactive shell. One instance per SSH session; `cwd` is the only mutable state,
-/// tracking a `cd` across calls the way a real shell would.
+/// The fake shell. One instance per interactive session or exec request; filesystem, working
+/// directory, codec and nested shell levels persist across input lines.
 pub struct FakeShell {
     fs: FakeFs,
     ctx: EmitContext,
@@ -222,17 +237,34 @@ pub struct FakeShell {
     binary_flagged: bool,
     /// Whether the one-per-session command-cap marker has been emitted.
     cap_flagged: bool,
-    /// Which shell this session is pretending to be, which decides how it reports an error and
-    /// what `uname` says. See [`ShellFlavor`].
+    /// Which host persona this session presents. Active shell levels decide diagnostics and
+    /// prompts; the flavor keeps `uname` aligned with the filesystem snapshot.
     flavor: ShellFlavor,
+    context: ShellContext,
+    levels: Vec<ShellLevel>,
+    hostname: String,
     clock: Clock,
 }
 
-/// The shell a session presents. The command grammar is shared - every sensor answers the same
-/// verbs - but the two differ in what an attacker actually reads back: bash on the Linux server
-/// says `bash: x: command not found`, Android's mksh says `sh: x: not found`, and `uname` reports
-/// a different machine entirely. A session that mixed them was the ADB tell: a Nexus 5 banner
-/// followed by an Ubuntu bash.
+/// How the outermost shell was entered. Login shells read Ubuntu's interactive startup files;
+/// one-shot exec commands do not; Android uses mksh rather than either GNU shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellContext {
+    LoginInteractive,
+    ExecC,
+    AndroidMksh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellLevel {
+    Bash { login: bool },
+    Dash { line: u64 },
+    AndroidMksh,
+}
+
+/// The host persona a session presents. The command grammar is shared, but Linux and Android
+/// report different kernels and use different outer shell identities. A session that mixed them
+/// was the ADB tell: a Nexus 5 banner followed by an Ubuntu bash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShellFlavor {
     /// Ubuntu's bash, on SSH and telnet.
@@ -244,16 +276,39 @@ pub enum ShellFlavor {
 
 impl FakeShell {
     pub fn new(fs: FakeFs, ctx: EmitContext) -> Self {
-        Self::with_flavor(fs, ctx, ShellFlavor::Bash)
+        Self::with_context(fs, ctx, ShellFlavor::Bash, ShellContext::LoginInteractive)
+    }
+
+    /// A non-interactive `bash -c`-style shell used by SSH exec requests.
+    pub fn exec(fs: FakeFs, ctx: EmitContext) -> Self {
+        Self::with_context(fs, ctx, ShellFlavor::Bash, ShellContext::ExecC)
     }
 
     /// The Android shell ADB serves: `FakeFs::android()` plus [`ShellFlavor::AndroidSh`], landing
     /// in `/` as an `adb shell` session does rather than a Linux server's `/root`.
     pub fn android(fs: FakeFs, ctx: EmitContext) -> Self {
-        Self::with_flavor(fs, ctx, ShellFlavor::AndroidSh)
+        Self::with_context(fs, ctx, ShellFlavor::AndroidSh, ShellContext::AndroidMksh)
     }
 
     pub fn with_flavor(fs: FakeFs, ctx: EmitContext, flavor: ShellFlavor) -> Self {
+        let context = match flavor {
+            ShellFlavor::Bash => ShellContext::LoginInteractive,
+            ShellFlavor::AndroidSh => ShellContext::AndroidMksh,
+        };
+        Self::with_context(fs, ctx, flavor, context)
+    }
+
+    fn with_context(
+        fs: FakeFs,
+        ctx: EmitContext,
+        flavor: ShellFlavor,
+        context: ShellContext,
+    ) -> Self {
+        let level = match context {
+            ShellContext::LoginInteractive => ShellLevel::Bash { login: true },
+            ShellContext::ExecC => ShellLevel::Bash { login: false },
+            ShellContext::AndroidMksh => ShellLevel::AndroidMksh,
+        };
         Self {
             fs,
             ctx,
@@ -266,6 +321,9 @@ impl FakeShell {
             binary_flagged: false,
             cap_flagged: false,
             flavor,
+            context,
+            levels: vec![level],
+            hostname: persona::hostname(),
             clock: chrono::Utc::now,
         }
     }
@@ -281,20 +339,73 @@ impl FakeShell {
         &self.cwd
     }
 
-    /// How this shell names itself when it reports an error (`bash` / `sh`).
-    fn shell_name(&self) -> &'static str {
-        match self.flavor {
-            ShellFlavor::Bash => "bash",
-            ShellFlavor::AndroidSh => "sh",
+    /// The prompt for the active shell level. Exec requests have no prompt.
+    pub fn prompt(&self) -> String {
+        match (self.context, self.active_level()) {
+            (ShellContext::ExecC, _) => String::new(),
+            (_, ShellLevel::Bash { .. }) => {
+                let display = match self.cwd.strip_prefix("/root") {
+                    Some("") => "~".to_string(),
+                    Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+                    _ => self.cwd.clone(),
+                };
+                format!("root@{}:{display}# ", self.hostname)
+            }
+            (_, ShellLevel::Dash { .. }) => "# ".to_string(),
+            (_, ShellLevel::AndroidMksh) => persona::android_root_prompt(&self.cwd),
         }
     }
 
-    /// What this shell says for a command it cannot find. bash spells out "command not found";
-    /// mksh says only "not found", and a bot that greps for either string reads the difference.
+    fn active_level(&self) -> ShellLevel {
+        self.levels
+            .last()
+            .copied()
+            .expect("a FakeShell always has an outermost level")
+    }
+
+    fn advance_shell_line(&mut self) {
+        if let Some(ShellLevel::Dash { line }) = self.levels.last_mut() {
+            *line = line.saturating_add(1);
+        }
+    }
+
+    fn error_prefix(&self) -> String {
+        match (self.context, self.active_level()) {
+            (ShellContext::ExecC, ShellLevel::Bash { .. }) => "bash: line 1".to_string(),
+            (_, ShellLevel::Bash { login: true }) => "-bash".to_string(),
+            (_, ShellLevel::Bash { login: false }) => "bash".to_string(),
+            (_, ShellLevel::Dash { line }) => format!("sh: {line}"),
+            (_, ShellLevel::AndroidMksh) => "sh".to_string(),
+        }
+    }
+
+    fn shell_error(&self, detail: impl std::fmt::Display) -> String {
+        format!("{}: {detail}\n", self.error_prefix())
+    }
+
+    fn argv_zero(&self) -> &'static str {
+        match self.active_level() {
+            ShellLevel::Bash { login: true } => "-bash",
+            ShellLevel::Bash { login: false } => "bash",
+            ShellLevel::Dash { .. } | ShellLevel::AndroidMksh => "sh",
+        }
+    }
+
+    fn is_bash(&self) -> bool {
+        matches!(self.active_level(), ShellLevel::Bash { .. })
+    }
+
+    /// What the active shell says for a command it cannot find.
     fn not_found(&self, what: &str) -> String {
-        match self.flavor {
-            ShellFlavor::Bash => format!("bash: {what}: command not found\n"),
-            ShellFlavor::AndroidSh => format!("sh: {what}: not found\n"),
+        match (self.context, self.active_level()) {
+            (ShellContext::ExecC, ShellLevel::Bash { .. }) => {
+                format!("bash: line 1: {what}: command not found\n")
+            }
+            (_, ShellLevel::Bash { .. }) => login_command_not_found(what)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{what}: command not found\n")),
+            (_, ShellLevel::Dash { line }) => format!("sh: {line}: {what}: not found\n"),
+            (_, ShellLevel::AndroidMksh) => format!("sh: {what}: not found\n"),
         }
     }
 
@@ -320,6 +431,7 @@ impl FakeShell {
         if raw.trim().is_empty() {
             return (CommandResult::silent(0), Vec::new());
         }
+        self.advance_shell_line();
 
         // Decode a single-byte-XOR-obfuscated probe (identity for plaintext). The event records a
         // sanitized, lossily decoded representation of the pre-codec bytes; the transport capture,
@@ -429,6 +541,9 @@ impl FakeShell {
                 None => self.dispatch(&parts),
             };
             result.append(command);
+            if result.stop_line {
+                break;
+            }
         }
         result
     }
@@ -446,14 +561,11 @@ impl FakeShell {
             Ok(()) => CommandResult::silent(0),
             Err(FsError::ReadOnly) => CommandResult::stderr(
                 1,
-                format!("{}: {resolved}: Read-only file system\n", self.shell_name()),
+                self.shell_error(format_args!("{resolved}: Read-only file system")),
             ),
             Err(_) => CommandResult::stderr(
                 1,
-                format!(
-                    "{}: {resolved}: No such file or directory\n",
-                    self.shell_name()
-                ),
+                self.shell_error(format_args!("{resolved}: No such file or directory")),
             ),
         }
     }
@@ -495,6 +607,9 @@ impl FakeShell {
             ),
             Some("whoami") => CommandResult::stdout(b"root\n".to_vec()),
             Some("pwd") => CommandResult::stdout(format!("{}\n", self.cwd)),
+            Some("echo") if parts.get(1..) == Some(&["$0"][..]) => {
+                CommandResult::stdout(format!("{}\n", self.argv_zero()))
+            }
             Some("echo") => CommandResult::stdout(cmd_echo(&parts[1..])),
             Some("cat") => self.cmd_cat(parts),
             Some("ls") => self.cmd_ls(parts),
@@ -505,7 +620,8 @@ impl FakeShell {
             // routers. On the bash this box claims, `enable` is a builtin that lists the enabled
             // builtins; answering "command not found" for it (observed live 2026-09-06) was the
             // one reply a bash never gives. `system` and `shell` really are unknown to bash.
-            Some("enable") => CommandResult::stdout(cmd_enable(parts)),
+            Some("enable") if self.is_bash() => CommandResult::stdout(cmd_enable(parts)),
+            Some("enable") => CommandResult::stderr(127, self.not_found("enable")),
             Some("true") | Some(":") => CommandResult::silent(0),
             Some("false") => CommandResult::silent(1),
             Some("wget") => {
@@ -575,17 +691,22 @@ impl FakeShell {
                 } else {
                     CommandResult::stderr(
                         1,
-                        format!(
-                            "{}: cd: {target}: No such file or directory\n",
-                            self.shell_name()
-                        ),
+                        self.shell_error(format_args!("cd: {target}: No such file or directory")),
                     )
                 }
             }
-            // Already root on this box, so `su` (and `su -`, `su root`) opens another shell
-            // silently, prompt unchanged; "command not found" would be a tell on any Linux.
-            Some("su") => CommandResult::silent(0),
-            Some("exit") | Some("logout") => CommandResult::silent(0),
+            // Already root on this box, so `su` (and `su -`, `su root`) opens another bash
+            // silently. It is still a real nested level: one `exit` returns to the caller.
+            Some("su") => {
+                let level = match self.active_level() {
+                    ShellLevel::AndroidMksh => ShellLevel::AndroidMksh,
+                    _ => ShellLevel::Bash { login: false },
+                };
+                self.push_level(level);
+                CommandResult::silent(0)
+            }
+            Some("exit") => self.exit_shell(),
+            Some("logout") => self.logout_shell(),
             // A token with a slash names a path, and bash answers for the path, not for PATH:
             // a file the attacker created and chmod'ed runs (an empty file exits 0 with no
             // output, which is what the writable-directory probe `>/tmp/d && chmod 777 /tmp/d
@@ -598,23 +719,24 @@ impl FakeShell {
                 } else if self.fs.read_file(&path).is_some() {
                     CommandResult::stderr(
                         126,
-                        format!("{}: {}: Permission denied\n", self.shell_name(), parts[0]),
+                        self.shell_error(format_args!("{}: Permission denied", parts[0])),
                     )
                 } else if self.fs.is_dir(&path) {
                     CommandResult::stderr(
                         126,
-                        format!("{}: {}: Is a directory\n", self.shell_name(), parts[0]),
+                        self.shell_error(format_args!("{}: Is a directory", parts[0])),
                     )
                 } else {
                     let _ = other;
                     // mksh says only "not found" for a path it cannot execute.
                     CommandResult::stderr(
                         127,
-                        match self.flavor {
-                            ShellFlavor::Bash => {
-                                format!("bash: {}: No such file or directory\n", parts[0])
-                            }
-                            ShellFlavor::AndroidSh => self.not_found(parts[0]),
+                        match self.active_level() {
+                            ShellLevel::AndroidMksh => self.not_found(parts[0]),
+                            _ => self.shell_error(format_args!(
+                                "{}: No such file or directory",
+                                parts[0]
+                            )),
                         },
                     )
                 }
@@ -662,6 +784,43 @@ impl FakeShell {
         if let Some(name) = download_save_name(cmd, parts) {
             let path = self.resolve_path(&name);
             let _ = self.fs.write_file(&path, FETCHED_BODY);
+        }
+    }
+
+    fn push_level(&mut self, level: ShellLevel) {
+        self.levels.push(level);
+    }
+
+    fn exit_shell(&mut self) -> CommandResult {
+        if self.levels.len() > 1 {
+            let popped = self.levels.pop().expect("length checked above");
+            let output = if matches!(popped, ShellLevel::Bash { .. }) {
+                b"exit\n".to_vec()
+            } else {
+                Vec::new()
+            };
+            return CommandResult::shell_exit(0, output, false);
+        }
+
+        let output = if matches!(self.active_level(), ShellLevel::Bash { login: true }) {
+            b"logout\n".to_vec()
+        } else {
+            Vec::new()
+        };
+        CommandResult::shell_exit(0, output, true)
+    }
+
+    fn logout_shell(&mut self) -> CommandResult {
+        match self.active_level() {
+            ShellLevel::Bash { login: true } if self.levels.len() == 1 => {
+                CommandResult::shell_exit(0, b"logout\n".to_vec(), true)
+            }
+            ShellLevel::Bash { .. } => {
+                CommandResult::stderr(1, self.shell_error("logout: not login shell: use `exit'"))
+            }
+            ShellLevel::Dash { .. } | ShellLevel::AndroidMksh => {
+                CommandResult::stderr(127, self.not_found("logout"))
+            }
         }
     }
 
@@ -855,9 +1014,8 @@ impl FakeShell {
         }
     }
 
-    /// `sh` / `bash`. A nested interactive shell just drops the caller at a new prompt, so a bare
-    /// invocation is a no-op that keeps the session in this fake shell (never "command not found").
-    /// `sh -c "CMD"` runs CMD in the fake shell, since loaders stage their payload that way.
+    /// `sh` / `bash`. A bare invocation pushes a nested interactive shell level; `sh -c "CMD"`
+    /// runs CMD under a temporary level, since loaders stage their payload that way.
     fn cmd_shell_spawn(&mut self, parts: &[&str]) -> CommandResult {
         let script = parts
             .iter()
@@ -867,10 +1025,27 @@ impl FakeShell {
             let inner = strip_one_quote_pair(script);
             let inner_parts: Vec<&str> = inner.split_whitespace().collect();
             if !inner_parts.is_empty() {
-                return self.dispatch(&inner_parts);
+                let level = self.spawned_level(command_basename(parts[0]), 1);
+                let caller_depth = self.levels.len();
+                self.push_level(level);
+                let result = self.dispatch(&inner_parts);
+                self.levels.truncate(caller_depth);
+                return result;
             }
         }
+        if parts.len() == 1 {
+            let level = self.spawned_level(command_basename(parts[0]), 0);
+            self.push_level(level);
+        }
         CommandResult::silent(0)
+    }
+
+    fn spawned_level(&self, command: &str, dash_line: u64) -> ShellLevel {
+        match (self.active_level(), command) {
+            (ShellLevel::AndroidMksh, _) => ShellLevel::AndroidMksh,
+            (_, "bash") => ShellLevel::Bash { login: false },
+            _ => ShellLevel::Dash { line: dash_line },
+        }
     }
 
     /// `busybox`. Bare invocation prints the multi-call banner. `busybox <applet> ...` runs the
@@ -882,6 +1057,36 @@ impl FakeShell {
             Some(applet) if is_busybox_applet(applet) => self.dispatch(&parts[1..]),
             Some(applet) => CommandResult::stderr(127, format!("{applet}: applet not found\n")),
         }
+    }
+}
+
+/// Ubuntu 22.04's interactive command-not-found handler for the names most often used to escape
+/// router CLIs. Package ordering is a captured persona detail, not a claim that every Ubuntu host
+/// prints suggestions in the same order.
+fn login_command_not_found(name: &str) -> Option<&'static str> {
+    match name {
+        "start" => Some(
+            "Command 'start' not found, did you mean:\n  command 'tart' from deb tart (3.10-1build1)\n  command 'stat' from deb coreutils (8.32-4.1ubuntu1.3)\n  command 'rstart' from deb x11-session-utils (7.7+4build2)\n  command 'kstart' from deb kde-cli-tools (4:5.24.4-0ubuntu1)\n  command 'startx' from deb xinit (1.4.1-0ubuntu4)\nTry: apt install <deb name>\n",
+        ),
+        "config" => Some(
+            "Command 'config' not found, did you mean:\n  command 'cconfig' from deb xrootd-server (5.4.1-1)\n  command 'mconfig' from deb mono-devel (6.8.0.105+dfsg-3.2)\n  command 'vconfig' from deb vlan (2.0.5ubuntu5)\n  command 'iconfig' from deb ipmiutil (3.1.8-1)\n  command 'kconfig' from deb kconfig-frontends (4.11.0.1+dfsg-6)\n  command 'kconfig' from deb kconfig-frontends-nox (4.11.0.1+dfsg-6)\n  command 'fconfig' from deb redboot-tools (0.7build4)\nTry: apt install <deb name>\n",
+        ),
+        "system" => Some(
+            "Command 'system' not found, did you mean:\n  command 'system3' from deb simh (3.8.1-6.1)\n  command 'systemd' from deb systemd (249.11-0ubuntu3.21)\nTry: apt install <deb name>\n",
+        ),
+        "shell" => Some(
+            "Command 'shell' not found, did you mean:\n  command 'bshell' from deb avahi-ui-utils (0.8-5ubuntu5.5)\n  command 'rshell' from deb pyboard-rshell (0.0.31-0ubuntu1)\n  command 'spell' from deb spell (1.0-24.2)\n  command 'shelr' from deb shelr (0.16.3-2.1)\n  command 'jshell' from deb openjdk-11-jdk-headless (11.0.31+11-1ubuntu1~22.04.2)\n  command 'jshell' from deb openjdk-17-jdk-headless (17.0.19+10-1~22.04.2)\n  command 'jshell' from deb openjdk-18-jdk-headless (18.0.2+9-2~22.04)\n  command 'jshell' from deb openjdk-21-jdk-headless (21.0.11+10-1~22.04.2)\n  command 'jshell' from deb openjdk-25-jdk-headless (25.0.3+9-2~22.04.2)\nTry: apt install <deb name>\n",
+        ),
+        "ifconfig" => Some(
+            "Command 'ifconfig' not found, but can be installed with:\napt install net-tools\n",
+        ),
+        "tftp" => Some(
+            "Command 'tftp' not found, but can be installed with:\napt install tftp-hpa  # version 5.2+20150808-1.2build2, or\napt install tftp      # version 0.17-23ubuntu1\n",
+        ),
+        "ftpget" => Some(
+            "Command 'ftpget' not found, did you mean:\n  command 'lftpget' from deb lftp (4.9.2-1build1)\nTry: apt install <deb name>\n",
+        ),
+        _ => None,
     }
 }
 
@@ -1942,6 +2147,118 @@ mod shell_detection_tests {
         )
     }
 
+    fn exec_shell() -> FakeShell {
+        FakeShell::exec(
+            FakeFs::new(),
+            EmitContext {
+                source_ip: "203.0.113.7".parse().unwrap(),
+                wan_ip: None,
+                authenticated: true,
+                protocol_label: "ssh".to_string(),
+                session_id: None,
+            },
+        )
+    }
+
+    #[test]
+    fn login_identity_controls_prompt_argv_zero_and_errors() {
+        let mut sh = shell();
+        assert_eq!(
+            sh.prompt(),
+            format!("root@{}:~# ", crate::persona::hostname())
+        );
+        assert_eq!(sh.handle_input("echo $0").0, "-bash\n");
+        assert_eq!(
+            sh.handle_input("nosuchcmd_q").0,
+            "nosuchcmd_q: command not found\n"
+        );
+        assert_eq!(
+            sh.handle_input("system").0,
+            "Command 'system' not found, did you mean:\n  command 'system3' from deb simh (3.8.1-6.1)\n  command 'systemd' from deb systemd (249.11-0ubuntu3.21)\nTry: apt install <deb name>\n"
+        );
+        assert_eq!(
+            sh.handle_input("ifconfig").0,
+            "Command 'ifconfig' not found, but can be installed with:\napt install net-tools\n"
+        );
+        assert_eq!(
+            sh.handle_input("cd /missing_q").0,
+            "-bash: cd: /missing_q: No such file or directory\n"
+        );
+        assert_eq!(sh.handle_input("cd /tmp").0, "");
+        assert_eq!(
+            sh.prompt(),
+            format!("root@{}:/tmp# ", crate::persona::hostname())
+        );
+    }
+
+    #[test]
+    fn exec_context_has_no_prompt_and_uses_bash_line_one_errors() {
+        let mut sh = exec_shell();
+        assert_eq!(sh.prompt(), "");
+        assert_eq!(sh.handle_input("echo $0").0, "bash\n");
+        assert_eq!(
+            sh.handle_input("nosuchcmd_q").0,
+            "bash: line 1: nosuchcmd_q: command not found\n"
+        );
+        assert_eq!(
+            sh.handle_input("cd /missing_q").0,
+            "bash: line 1: cd: /missing_q: No such file or directory\n"
+        );
+    }
+
+    #[test]
+    fn nested_dash_levels_keep_independent_line_numbers() {
+        let mut sh = shell();
+        assert_eq!(sh.handle_input("sh").0, "");
+        assert_eq!(sh.prompt(), "# ");
+        assert_eq!(sh.handle_input("echo $0").0, "sh\n");
+        assert_eq!(
+            sh.handle_input("outer_missing").0,
+            "sh: 2: outer_missing: not found\n"
+        );
+
+        assert_eq!(sh.handle_input("sh").0, "");
+        assert_eq!(
+            sh.handle_input("inner_missing").0,
+            "sh: 1: inner_missing: not found\n"
+        );
+        let (inner_exit, _) = sh.handle_input("exit");
+        assert_eq!(inner_exit, "");
+        assert!(!inner_exit.close_session);
+        assert_eq!(sh.prompt(), "# ");
+        assert_eq!(
+            sh.handle_input("outer_again").0,
+            "sh: 4: outer_again: not found\n"
+        );
+
+        let (outer_exit, _) = sh.handle_input("exit");
+        assert_eq!(outer_exit, "");
+        assert!(!outer_exit.close_session);
+        assert_eq!(
+            sh.prompt(),
+            format!("root@{}:~# ", crate::persona::hostname())
+        );
+    }
+
+    #[test]
+    fn nested_bash_logout_fails_and_exit_returns_to_login_shell() {
+        let mut sh = shell();
+        assert_eq!(sh.handle_input("su").0, "");
+        assert_eq!(sh.handle_input("echo $0").0, "bash\n");
+        let (logout, _) = sh.handle_input("logout");
+        assert_eq!(logout.status, 1);
+        assert_eq!(logout, "bash: logout: not login shell: use `exit'\n");
+
+        let (nested_exit, _) = sh.handle_input("exit");
+        assert_eq!(nested_exit, "exit\n");
+        assert!(!nested_exit.close_session);
+        assert_eq!(sh.handle_input("echo $0").0, "-bash\n");
+
+        let (login_exit, _) = sh.handle_input("exit; echo must_not_run");
+        assert_eq!(login_exit, "logout\n");
+        assert!(login_exit.close_session);
+    }
+
     fn xor(s: &str, key: u8) -> String {
         String::from_utf8(crate::command_codec::xor_bytes(s, key)).unwrap()
     }
@@ -1961,13 +2278,16 @@ mod shell_detection_tests {
         fresh.handle_input(">/tmp/e");
         assert_eq!(
             fresh.handle_input("/tmp/e").0,
-            "bash: /tmp/e: Permission denied\n"
+            "-bash: /tmp/e: Permission denied\n"
         );
         assert_eq!(
             fresh.handle_input("/tmp/nothere").0,
-            "bash: /tmp/nothere: No such file or directory\n"
+            "-bash: /tmp/nothere: No such file or directory\n"
         );
-        assert_eq!(fresh.handle_input("/tmp").0, "bash: /tmp: Is a directory\n");
+        assert_eq!(
+            fresh.handle_input("/tmp").0,
+            "-bash: /tmp: Is a directory\n"
+        );
         fresh.handle_input("chmod +x /tmp/e");
         assert_eq!(fresh.handle_input("/tmp/e").0, "");
         assert!(super::mode_grants_execute("755"));
@@ -2008,11 +2328,11 @@ mod shell_detection_tests {
             out.contains("enable cd\n") && !out.contains("not found"),
             "{out}"
         );
-        assert_eq!(run(&mut sh, "system"), "bash: system: command not found\n");
-        assert_eq!(run(&mut sh, "shell"), "bash: shell: command not found\n");
+        assert!(run(&mut sh, "system").starts_with("Command 'system' not found, did you mean:"));
+        assert!(run(&mut sh, "shell").starts_with("Command 'shell' not found, did you mean:"));
         assert_eq!(
             run(&mut sh, "linuxshell"),
-            "bash: linuxshell: command not found\n"
+            "linuxshell: command not found\n"
         );
         assert_eq!(run(&mut sh, "sh"), "");
 
@@ -2082,6 +2402,8 @@ mod shell_detection_tests {
         );
         // An `adb shell` session starts at /, not in a Linux server's /root.
         assert_eq!(sh.cwd(), "/");
+        assert_eq!(sh.prompt(), crate::persona::android_root_prompt("/"));
+        assert_eq!(sh.handle_input("echo $0").0, "sh\n");
         assert_eq!(sh.handle_input("pwd").0, "/\n");
         assert_eq!(
             sh.handle_input("uname -a").0,
@@ -2131,6 +2453,10 @@ mod shell_detection_tests {
                 .0
                 .contains("applet not found")
         );
+        let (nested_exit, _) = sh.handle_input("exit");
+        assert!(!nested_exit.close_session);
+        let (outer_exit, _) = sh.handle_input("exit");
+        assert!(outer_exit.close_session);
     }
 
     /// `cp`, `rm` and `mkdir` answered silent success while changing nothing, so a payload
@@ -2177,7 +2503,7 @@ mod shell_detection_tests {
         );
         assert_eq!(
             sh.handle_input("/tmp/payload").0,
-            "bash: /tmp/payload: No such file or directory\n",
+            "-bash: /tmp/payload: No such file or directory\n",
             "a removed file stops being executable"
         );
         assert_eq!(
@@ -2192,7 +2518,7 @@ mod shell_detection_tests {
         assert_eq!(sh.handle_input("rm -rf /tmp/stage").0, "");
         assert_eq!(
             sh.handle_input("cd /tmp/stage").0,
-            "bash: cd: /tmp/stage: No such file or directory\n"
+            "-bash: cd: /tmp/stage: No such file or directory\n"
         );
         // A baked-in file can be removed too: saying nothing and keeping it contradicts the rm.
         assert_eq!(sh.handle_input("rm /etc/hostname").0, "");
@@ -2449,10 +2775,7 @@ mod shell_detection_tests {
     fn command_result_keeps_ordered_stdout_and_stderr_segments() {
         let (out, _) = shell().handle_input("nosuchcmd; echo recovered");
         assert_eq!(out.status, 0, "the final command decides the list status");
-        assert_eq!(
-            out.bytes(),
-            b"bash: nosuchcmd: command not found\nrecovered\n"
-        );
+        assert_eq!(out.bytes(), b"nosuchcmd: command not found\nrecovered\n");
         assert_eq!(out.output.len(), 2);
         assert_eq!(out.output[0].fd, OutputFd::Stderr);
         assert_eq!(out.output[1].fd, OutputFd::Stdout);
@@ -2535,7 +2858,7 @@ mod shell_detection_tests {
         let mut sh = shell();
         let (out, _) = sh.handle_input(">/nonexistent/.x&&cd /nonexistent;pwd");
         assert_eq!(
-            out, "bash: /nonexistent/.x: No such file or directory\n/root\n",
+            out, "-bash: /nonexistent/.x: No such file or directory\n/root\n",
             "{out:?}"
         );
         assert_eq!(sh.cwd, "/root");
@@ -2553,7 +2876,7 @@ mod shell_detection_tests {
     fn cd_into_a_directory_the_box_does_not_present_is_refused() {
         let mut sh = shell();
         let (out, _) = sh.handle_input("cd /nonexistent");
-        assert_eq!(out, "bash: cd: /nonexistent: No such file or directory\n");
+        assert_eq!(out, "-bash: cd: /nonexistent: No such file or directory\n");
         assert_eq!(sh.cwd, "/root");
         // Directories the root listing advertises, and ancestors of modeled files, still work.
         assert_eq!(sh.handle_input("cd /proc").0, "");

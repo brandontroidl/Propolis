@@ -66,6 +66,21 @@ $ enable
 > enable unalias
 > enable unset
 > enable wait
+$ echo $0
+> -bash
+$ nosuchcmd_q
+> nosuchcmd_q: command not found
+$ system
+> Command 'system' not found, did you mean:
+>   command 'system3' from deb simh (3.8.1-6.1)
+>   command 'systemd' from deb systemd (249.11-0ubuntu3.21)
+> Try: apt install <deb name>
+$ sh
+$ linuxshell
+> sh: 1: linuxshell: not found
+$ exit
+$ echo $0
+> -bash
 $ /bin/busybox ECCHI
 > ECCHI: applet not found
 $ uname -m

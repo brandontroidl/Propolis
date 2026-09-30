@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 1678 test functions** (952 unit + 726 integration).
+- **Total: 1685 test functions** (956 unit + 729 integration).
 - **DB-backed (`sqlx::test`): 202** - console 159, core-scoring 25, intake 7,
   fleet 6, propolis 4, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -128,19 +128,19 @@ Per-crate breakdown:
 | propolis | 100 | 20 | capture_to_console, docs_agreement, restore_rehearsal, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 4 | provision |
 | review | 116 | 71 | cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
-| sensor-adb | 53 | 20 | integration |
+| sensor-adb | 53 | 21 | integration |
 | sensor-catchall | 18 | 6 | integration |
 | sensor-cred | 14 | 8 | integration |
-| sensor-framework | 163 | 49 | build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
+| sensor-framework | 167 | 49 | build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
 | sensor-ftp | 7 | 14 | integration |
 | sensor-http | 8 | 16 | integration |
 | sensor-redis | 79 | 18 | integration |
 | sensor-smtp | 6 | 18 | integration |
-| sensor-ssh | 48 | 91 | auth_test, crypto_test, integration, shell_test, transport_test |
-| sensor-telnet | 39 | 18 | integration |
+| sensor-ssh | 48 | 92 | auth_test, crypto_test, integration, shell_test, transport_test |
+| sensor-telnet | 39 | 19 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **952** | **726** | |
+| **Total** | **956** | **729** | |
 
 ### Test styles by layer
 

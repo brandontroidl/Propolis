@@ -42,7 +42,10 @@ use crate::fakefs::{Blob, FakeFs, FsError, READ_CAP};
 use crate::persona;
 use crate::sanitize_value;
 
+mod registry;
 mod trace;
+
+use registry::{HandlerFn, Registry};
 
 pub use trace::{
     BudgetHit, BudgetTrace, CommandTrace, FsDenied, FsEffect, HandlerId, LineTrace, ParseNode,
@@ -844,53 +847,37 @@ impl FakeShell {
         }
     }
 
-    /// The arm `dispatch` takes for a tokenized command. `dispatch` matches on this and nothing
-    /// else, so the decision the trace reports is the decision that ran.
+    /// The registry entry, or fallback decision, for a tokenized command: the decision the trace
+    /// reports and, for a registered command, the handler that runs. `dispatch` runs exactly what
+    /// this returns, so the two cannot disagree.
     ///
-    /// Matches on the command's basename, so a full path (`/bin/busybox`, `/userfs/bin/wget`,
+    /// Looks up the command's basename, so a full path (`/bin/busybox`, `/userfs/bin/wget`,
     /// `/bin/sh`) - which IoT loaders routinely use - resolves to the same applet a bare invocation
     /// would, the way a real shell finds it on PATH. Only the command token is normalised;
-    /// arguments are untouched.
-    fn resolve_handler(&self, parts: &[&str]) -> HandlerId {
+    /// arguments are untouched. A name the registry lacks is a path invocation when the token has
+    /// a slash and not-found otherwise; those two have no handler in the registry.
+    fn resolve(&self, parts: &[&str]) -> (HandlerId, Option<HandlerFn>) {
         let Some(first) = parts.first() else {
-            return HandlerId::Empty;
+            return (HandlerId::Empty, None);
         };
-        match command_basename(first) {
-            "uname" => HandlerId::Uname,
-            "id" => HandlerId::Id,
-            "whoami" => HandlerId::Whoami,
-            "pwd" => HandlerId::Pwd,
-            "echo" if parts.get(1..) == Some(&["$0"][..]) => HandlerId::EchoArgv0,
-            "echo" => HandlerId::Echo,
-            "cat" => HandlerId::Cat,
-            "ls" => HandlerId::Ls,
-            "mount" => HandlerId::Mount,
-            "enable" if self.is_bash() => HandlerId::EnableBuiltin,
-            "enable" => HandlerId::EnableNotFound,
-            "true" | ":" => HandlerId::TrueColon,
-            "false" => HandlerId::False,
-            "wget" => HandlerId::Wget,
-            "curl" => HandlerId::Curl,
-            "ping" => HandlerId::Ping,
-            "sh" | "bash" | "ash" => HandlerId::ShellSpawn,
-            "busybox" => HandlerId::Busybox,
-            "tftp" | "ftpget" => HandlerId::Fetcher,
-            "chmod" => HandlerId::Chmod,
-            "cp" => HandlerId::Cp,
-            "rm" => HandlerId::Rm,
-            "mkdir" => HandlerId::Mkdir,
-            "sleep" => HandlerId::Sleep,
-            "cd" => HandlerId::Cd,
-            "su" => HandlerId::Su,
-            "exit" => HandlerId::Exit,
-            "logout" => HandlerId::Logout,
-            _ if first.contains('/') => HandlerId::PathInvoke,
-            _ => HandlerId::NotFound,
+        if let Some((id, handler)) =
+            Registry::builtin().lookup(command_basename(first), self, parts)
+        {
+            return (id, Some(handler));
+        }
+        if first.contains('/') {
+            (HandlerId::PathInvoke, None)
+        } else {
+            (HandlerId::NotFound, None)
         }
     }
 
+    fn resolve_handler(&self, parts: &[&str]) -> HandlerId {
+        self.resolve(parts).0
+    }
+
     /// Produce the canned terminal output for one already-tokenized command line.
-    /// Every arm returns a static or lightly-interpolated string; none evaluates, spawns, or
+    /// Every handler returns a static or lightly-interpolated string; none evaluates, spawns, or
     /// otherwise interprets `parts` as code - see the module doc.
     fn dispatch(&mut self, parts: &[&str]) -> CommandResult {
         // One step per entry, so a chain of nested dispatches spends the line's allowance.
@@ -899,178 +886,214 @@ impl FakeShell {
             stopped.stop_line = true;
             return stopped;
         }
-        match self.resolve_handler(parts) {
-            HandlerId::Uname => CommandResult::stdout(cmd_uname(parts, self.flavor)),
-            HandlerId::Id => CommandResult::stdout(
-                "uid=0(root) gid=0(root) groups=0(root)\n"
-                    .as_bytes()
-                    .to_vec(),
-            ),
-            HandlerId::Whoami => CommandResult::stdout(b"root\n".to_vec()),
-            HandlerId::Pwd => CommandResult::stdout(format!("{}\n", self.cwd)),
-            HandlerId::EchoArgv0 => CommandResult::stdout(format!("{}\n", self.argv_zero())),
-            HandlerId::Echo => CommandResult::stdout(cmd_echo(&parts[1..])),
-            HandlerId::Cat => self.cmd_cat(parts),
-            HandlerId::Ls => self.cmd_ls(parts),
-            // `mount` with no arguments lists the same table `/proc/mounts` exposes; mounting
-            // something as root is a silent success like the other no-output applets.
-            HandlerId::Mount => CommandResult::stdout(cmd_mount(parts)),
-            // Mirai's telnet preamble is `enable`, `system`, `shell`, `sh`: CLI-escape words for
-            // routers. On the bash this box claims, `enable` is a builtin that lists the enabled
-            // builtins; answering "command not found" for it (observed live 2026-09-06) was the
-            // one reply a bash never gives. `system` and `shell` really are unknown to bash.
-            HandlerId::EnableBuiltin => CommandResult::stdout(cmd_enable(parts)),
-            HandlerId::EnableNotFound => CommandResult::stderr(127, self.not_found("enable")),
-            HandlerId::TrueColon => CommandResult::silent(0),
-            HandlerId::False => CommandResult::silent(1),
-            HandlerId::Wget => {
-                let writes_stdout = matches!(wget_output(parts), WgetOutput::Stdout);
-                let out = cmd_wget(parts, (self.clock)());
-                let refused = self.save_fetched_file("wget", parts);
-                let mut result = if writes_stdout {
-                    CommandResult::stdout(out)
-                } else {
-                    CommandResult::one(OutputFd::Stderr, 0, out.into_bytes())
-                };
-                if let Some((name, reason)) = refused {
-                    // [unverified] wording, from GNU wget's write-failure line.
-                    result.append(CommandResult::stderr(
-                        1,
-                        format!("Cannot write to '{name}' ({reason}).\n"),
-                    ));
-                }
-                result
-            }
-            HandlerId::Curl => {
-                let out = cmd_curl(parts);
-                let refused = self.save_fetched_file("curl", parts);
-                let mut result = CommandResult::stdout(out);
-                if refused.is_some() {
-                    // curl's exit code 23 and message for a failed write to the output file.
-                    result.append(CommandResult::stderr(
-                        23,
-                        "curl: (23) Failure writing output to destination\n",
-                    ));
-                }
-                result
-            }
-            HandlerId::Ping => CommandResult::stdout(cmd_ping(parts)),
-            // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
-            // for sh/bash instantly outs the honeypot and the dropper leaves. Model a nested shell.
-            // `ash` is BusyBox's shell and appears in the applet list, so it resolves here too.
-            HandlerId::ShellSpawn => self.cmd_shell_spawn(parts),
-            // The canonical Mirai/Gafgyt probe is `/bin/busybox <TOKEN>`, which they confirm by the
-            // exact "<TOKEN>: applet not found" reply; they also fetch payloads via `busybox wget`
-            // and `busybox tftp`.
-            HandlerId::Busybox => self.cmd_busybox(parts),
-            // tftp/ftpget are BusyBox download applets these loaders use; stay quiet (a real
-            // non-interactive fetch prints nothing on success) rather than "command not found". The
-            // target URL is captured by `download_target` above.
-            HandlerId::Fetcher => {
-                let command = command_basename(parts[0]);
-                match self.save_fetched_file(command, parts) {
-                    // [unverified] wording, in BusyBox's `can't open` style.
-                    Some((name, reason)) => CommandResult::stderr(
-                        1,
-                        format!("{command}: can't open '{name}': {reason}\n"),
-                    ),
-                    None => CommandResult::silent(0),
-                }
-            }
-            // Filesystem/no-output applets in a loader's drop chain (`chmod +x x`, then `cp`/`rm`/
-            // `mkdir`/`sleep`). A real shell prints nothing on success, and "command not found" for
-            // `chmod` is impossible on any real Linux - it outs the honeypot before the loader ever
-            // executes its payload, costing the capture - so model them as silent successes.
-            HandlerId::Chmod => {
-                // Silent like the real thing, but an executable mode on a file the attacker
-                // created is remembered so that running it afterwards succeeds.
-                let mut args = parts[1..].iter().filter(|a| !a.starts_with('-'));
-                if let Some(mode) = args.next()
-                    && mode_grants_execute(mode)
-                {
-                    for target in args {
-                        let path = self.resolve_logical(target);
-                        self.traced_mark_executable(&path);
-                    }
-                }
-                CommandResult::silent(0)
-            }
-            // These change the filesystem the rest of the session sees. Answering silent
-            // success while changing nothing let a loader `cp` a payload and then fail to find
-            // it, and left a file it had just `rm`ed still readable.
-            HandlerId::Cp => self.cmd_cp(parts),
-            HandlerId::Rm => self.cmd_rm(parts),
-            HandlerId::Mkdir => self.cmd_mkdir(parts),
-            HandlerId::Sleep => CommandResult::silent(0),
-            HandlerId::Cd => {
-                // Only into a directory the box presents: a silent `cd` into a directory that
-                // `ls /` never showed is a tell, and a loader's `>/x/.x && cd /x` chain relies on
-                // the two agreeing about what exists.
-                let target =
-                    self.resolve_logical(first_non_flag_arg(&parts[1..]).unwrap_or("/root"));
-                if self.fs.is_dir(&target) {
-                    self.cwd = target;
-                    CommandResult::silent(0)
-                } else {
-                    CommandResult::stderr(
-                        1,
-                        self.shell_error(format_args!("cd: {target}: No such file or directory")),
-                    )
-                }
-            }
-            // Already root on this box, so `su` (and `su -`, `su root`) opens another bash
-            // silently. It is still a real nested level: one `exit` returns to the caller.
-            HandlerId::Su => {
-                let level = match self.active_level() {
-                    ShellLevel::AndroidMksh => ShellLevel::AndroidMksh,
-                    _ => ShellLevel::Bash { login: false },
-                };
-                self.push_level(level);
-                CommandResult::silent(0)
-            }
-            HandlerId::Exit => self.exit_shell(),
-            HandlerId::Logout => self.logout_shell(),
-            // A token with a slash names a path, and bash answers for the path, not for PATH:
-            // a file the attacker created and chmod'ed runs (an empty file exits 0 with no
-            // output, which is what the writable-directory probe `>/tmp/d && chmod 777 /tmp/d
-            // && /tmp/d && cd /tmp/` keys its `cd` on), one it did not chmod is refused, and a
-            // path that does not exist is "No such file", never "command not found".
-            HandlerId::PathInvoke => {
-                let path = self.resolve_logical(parts[0]);
-                if self.fs.is_executable(&path) {
-                    CommandResult::silent(0)
-                } else if self.fs.file_exists(&path) {
-                    CommandResult::stderr(
-                        126,
-                        self.shell_error(format_args!("{}: Permission denied", parts[0])),
-                    )
-                } else if self.fs.is_dir(&path) {
-                    CommandResult::stderr(
-                        126,
-                        self.shell_error(format_args!("{}: Is a directory", parts[0])),
-                    )
-                } else {
-                    // mksh says only "not found" for a path it cannot execute.
-                    CommandResult::stderr(
-                        127,
-                        match self.active_level() {
-                            ShellLevel::AndroidMksh => self.not_found(parts[0]),
-                            _ => self.shell_error(format_args!(
-                                "{}: No such file or directory",
-                                parts[0]
-                            )),
-                        },
-                    )
-                }
-            }
+        let (id, handler) = self.resolve(parts);
+        if let Some(handler) = handler {
+            return handler(self, parts);
+        }
+        match id {
+            HandlerId::PathInvoke => self.invoke_path(parts),
             // An interactive bash on Ubuntu prefixes the message with its own name; the bare form
             // matched no real shell.
             HandlerId::NotFound => {
                 CommandResult::stderr(127, self.not_found(command_basename(parts[0])))
             }
             // A command made only of redirections has nothing to run; `RedirectionOnly` is the
-            // trace's name for it and never comes back from `resolve_handler`.
-            HandlerId::Empty | HandlerId::RedirectionOnly => CommandResult::silent(0),
+            // trace's name for it and never comes back from `resolve`.
+            _ => CommandResult::silent(0),
+        }
+    }
+
+    fn builtin_uname(&mut self, parts: &[&str]) -> CommandResult {
+        CommandResult::stdout(cmd_uname(parts, self.flavor))
+    }
+
+    fn builtin_id(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::stdout(
+            "uid=0(root) gid=0(root) groups=0(root)\n"
+                .as_bytes()
+                .to_vec(),
+        )
+    }
+
+    fn builtin_whoami(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::stdout(b"root\n".to_vec())
+    }
+
+    fn builtin_pwd(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::stdout(format!("{}\n", self.cwd))
+    }
+
+    fn builtin_echo_argv0(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::stdout(format!("{}\n", self.argv_zero()))
+    }
+
+    fn builtin_echo(&mut self, parts: &[&str]) -> CommandResult {
+        CommandResult::stdout(cmd_echo(&parts[1..]))
+    }
+
+    /// `mount` with no arguments lists the same table `/proc/mounts` exposes; mounting
+    /// something as root is a silent success like the other no-output applets.
+    fn builtin_mount(&mut self, parts: &[&str]) -> CommandResult {
+        CommandResult::stdout(cmd_mount(parts))
+    }
+
+    /// Mirai's telnet preamble is `enable`, `system`, `shell`, `sh`: CLI-escape words for
+    /// routers. On the bash this box claims, `enable` is a builtin that lists the enabled
+    /// builtins; answering "command not found" for it (observed live 2026-09-06) was the
+    /// one reply a bash never gives. `system` and `shell` really are unknown to bash.
+    fn builtin_enable(&mut self, parts: &[&str]) -> CommandResult {
+        CommandResult::stdout(cmd_enable(parts))
+    }
+
+    fn builtin_enable_not_found(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::stderr(127, self.not_found("enable"))
+    }
+
+    fn builtin_true(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::silent(0)
+    }
+
+    fn builtin_false(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::silent(1)
+    }
+
+    fn builtin_wget(&mut self, parts: &[&str]) -> CommandResult {
+        let writes_stdout = matches!(wget_output(parts), WgetOutput::Stdout);
+        let out = cmd_wget(parts, (self.clock)());
+        let refused = self.save_fetched_file("wget", parts);
+        let mut result = if writes_stdout {
+            CommandResult::stdout(out)
+        } else {
+            CommandResult::one(OutputFd::Stderr, 0, out.into_bytes())
+        };
+        if let Some((name, reason)) = refused {
+            // [unverified] wording, from GNU wget's write-failure line.
+            result.append(CommandResult::stderr(
+                1,
+                format!("Cannot write to '{name}' ({reason}).\n"),
+            ));
+        }
+        result
+    }
+
+    fn builtin_curl(&mut self, parts: &[&str]) -> CommandResult {
+        let out = cmd_curl(parts);
+        let refused = self.save_fetched_file("curl", parts);
+        let mut result = CommandResult::stdout(out);
+        if refused.is_some() {
+            // curl's exit code 23 and message for a failed write to the output file.
+            result.append(CommandResult::stderr(
+                23,
+                "curl: (23) Failure writing output to destination\n",
+            ));
+        }
+        result
+    }
+
+    fn builtin_ping(&mut self, parts: &[&str]) -> CommandResult {
+        CommandResult::stdout(cmd_ping(parts))
+    }
+
+    /// tftp/ftpget are BusyBox download applets these loaders use; stay quiet (a real
+    /// non-interactive fetch prints nothing on success) rather than "command not found". The
+    /// target URL is captured by `download_target` above.
+    fn builtin_fetcher(&mut self, parts: &[&str]) -> CommandResult {
+        let command = command_basename(parts[0]);
+        match self.save_fetched_file(command, parts) {
+            // [unverified] wording, in BusyBox's `can't open` style.
+            Some((name, reason)) => {
+                CommandResult::stderr(1, format!("{command}: can't open '{name}': {reason}\n"))
+            }
+            None => CommandResult::silent(0),
+        }
+    }
+
+    /// Filesystem/no-output applets in a loader's drop chain (`chmod +x x`, then `cp`/`rm`/
+    /// `mkdir`/`sleep`). A real shell prints nothing on success, and "command not found" for
+    /// `chmod` is impossible on any real Linux - it outs the honeypot before the loader ever
+    /// executes its payload, costing the capture - so model them as silent successes.
+    fn builtin_chmod(&mut self, parts: &[&str]) -> CommandResult {
+        // Silent like the real thing, but an executable mode on a file the attacker
+        // created is remembered so that running it afterwards succeeds.
+        let mut args = parts[1..].iter().filter(|a| !a.starts_with('-'));
+        if let Some(mode) = args.next()
+            && mode_grants_execute(mode)
+        {
+            for target in args {
+                let path = self.resolve_logical(target);
+                self.traced_mark_executable(&path);
+            }
+        }
+        CommandResult::silent(0)
+    }
+
+    fn builtin_sleep(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::silent(0)
+    }
+
+    fn builtin_cd(&mut self, parts: &[&str]) -> CommandResult {
+        // Only into a directory the box presents: a silent `cd` into a directory that
+        // `ls /` never showed is a tell, and a loader's `>/x/.x && cd /x` chain relies on
+        // the two agreeing about what exists.
+        let target = self.resolve_logical(first_non_flag_arg(&parts[1..]).unwrap_or("/root"));
+        if self.fs.is_dir(&target) {
+            self.cwd = target;
+            CommandResult::silent(0)
+        } else {
+            CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("cd: {target}: No such file or directory")),
+            )
+        }
+    }
+
+    /// Already root on this box, so `su` (and `su -`, `su root`) opens another bash
+    /// silently. It is still a real nested level: one `exit` returns to the caller.
+    fn builtin_su(&mut self, _parts: &[&str]) -> CommandResult {
+        let level = match self.active_level() {
+            ShellLevel::AndroidMksh => ShellLevel::AndroidMksh,
+            _ => ShellLevel::Bash { login: false },
+        };
+        self.push_level(level);
+        CommandResult::silent(0)
+    }
+
+    fn builtin_exit(&mut self, _parts: &[&str]) -> CommandResult {
+        self.exit_shell()
+    }
+
+    fn builtin_logout(&mut self, _parts: &[&str]) -> CommandResult {
+        self.logout_shell()
+    }
+
+    /// A token with a slash names a path, and bash answers for the path, not for PATH:
+    /// a file the attacker created and chmod'ed runs (an empty file exits 0 with no
+    /// output, which is what the writable-directory probe `>/tmp/d && chmod 777 /tmp/d
+    /// && /tmp/d && cd /tmp/` keys its `cd` on), one it did not chmod is refused, and a
+    /// path that does not exist is "No such file", never "command not found".
+    fn invoke_path(&mut self, parts: &[&str]) -> CommandResult {
+        let path = self.resolve_logical(parts[0]);
+        if self.fs.is_executable(&path) {
+            CommandResult::silent(0)
+        } else if self.fs.file_exists(&path) {
+            CommandResult::stderr(
+                126,
+                self.shell_error(format_args!("{}: Permission denied", parts[0])),
+            )
+        } else if self.fs.is_dir(&path) {
+            CommandResult::stderr(
+                126,
+                self.shell_error(format_args!("{}: Is a directory", parts[0])),
+            )
+        } else {
+            // mksh says only "not found" for a path it cannot execute.
+            CommandResult::stderr(
+                127,
+                match self.active_level() {
+                    ShellLevel::AndroidMksh => self.not_found(parts[0]),
+                    _ => self.shell_error(format_args!("{}: No such file or directory", parts[0])),
+                },
+            )
         }
     }
 

@@ -241,16 +241,21 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   download becomes a file), `ping` (canned replies), `sh`/`bash`/`ash`
   (nested shell; `sh -c "CMD"`, `sh FILE` and a script piped to `sh` run their text in a shell level of their own), `enable` (bash's builtin list, since
   Mirai's telnet preamble sends it and only a non-bash says "command not found"), `mount`
-  (the fake filesystem's mount table), `busybox` (multi-call banner
-  v1.31.1 plus applet dispatch; unknown applet gives `applet not found`),
+  (the fake filesystem's mount table), `busybox` (the real v1.30.1 multi-call banner
+  plus applet dispatch; an unlisted name gives `applet not found`),
   `tftp`/`ftpget` (silent; the download url is synthesized from the separate host and file
   arguments as `tftp://host[:port]/file` / `ftp://host[:port]/file`, since neither command
   takes a url token),
   `chmod`/`cp`/`rm`/`mkdir`/`sleep` (silent success), `cd`, `exit`/`logout`; an
   unknown command uses the active shell level's diagnostic form.
-- BusyBox applet set is a single source of truth (`BUSYBOX_APPLETS`, `crates/sensor-framework/src/shell/mod.rs#BUSYBOX_APPLETS`)
-  and deliberately excludes `curl` (real busybox ships none), so `busybox curl`
-  gives `applet not found` - matching the real-busybox check Mirai/Gafgyt perform.
+- BusyBox applet set is a single source of truth (`APPLET_ROWS`, `crates/sensor-framework/src/shell/busybox.rs#APPLET_ROWS`):
+  the banner prints those rows and `busybox <applet>` recognizes exactly the names they list, so the
+  two cannot contradict. Both are the reference build's own (BusyBox v1.30.1, 263 applets, captured
+  from a bare `/bin/busybox`). A listed applet runs its modeled handler when there is one
+  (`crates/sensor-framework/src/shell/mod.rs#FakeShell::cmd_busybox`) and otherwise succeeds silently:
+  its usage text is not captured, so none is invented. A name the banner does not list, `curl`
+  included (real busybox ships none), gives `applet not found` - matching the real-busybox check
+  Mirai/Gafgyt perform.
 - Download capture handles direct, busybox, full-path, and
   `sh -c "wget ...; ..."` chained forms. A line is split into its simple commands
   at `;`, `|`, `||`, `&&`, `&`, parentheses, backticks and newlines, each command

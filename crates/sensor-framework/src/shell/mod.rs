@@ -56,6 +56,7 @@ use crate::sanitize_value;
 mod arith;
 mod ast;
 mod builtins;
+mod busybox;
 mod dd;
 mod eval;
 mod expand;
@@ -1755,13 +1756,18 @@ impl FakeShell {
         }
     }
 
-    /// `busybox`. Bare invocation prints the multi-call banner. `busybox <applet> ...` runs the
-    /// applet if it is one this shell models, else returns BusyBox's exact "<applet>: applet not
+    /// `busybox`. Bare invocation prints the multi-call banner. `busybox <applet> ...` runs an
+    /// applet the banner lists: through its modeled handler when there is one, else as a silent
+    /// success (the applet exists, and its usage text and behavior are not captured, so nothing
+    /// is invented). A name the banner does not list returns BusyBox's exact "<applet>: applet not
     /// found" - the reply Mirai/Gafgyt check for to confirm a real busybox before delivering.
     fn cmd_busybox(&mut self, parts: &[&str]) -> CommandResult {
         match parts.get(1).copied() {
-            None => CommandResult::stdout(busybox_banner()),
-            Some(applet) if is_busybox_applet(applet) => {
+            None => CommandResult::stdout(busybox::banner()),
+            Some(applet) if busybox::is_applet(applet) => {
+                if self.resolve(&parts[1..]).1.is_none() {
+                    return CommandResult::silent(0);
+                }
                 self.busybox_depth = self.busybox_depth.saturating_add(1);
                 let result = self.dispatch_nested(&parts[1..]);
                 self.busybox_depth = self.busybox_depth.saturating_sub(1);
@@ -1872,13 +1878,13 @@ fn command_basename(token: &str) -> &str {
 /// parse, so a Mirai loader's `tftp -g HOST -r FILE` was logged and then silently never fetched.
 ///
 /// The top-level command token is basename-resolved like `dispatch`, so `/bin/busybox tftp ...` is
-/// captured. The busybox *applet* token is matched raw, exactly like `cmd_busybox`/`is_busybox_applet`
+/// captured. The busybox *applet* token is matched raw, exactly like `cmd_busybox`/`busybox::is_applet`
 /// do: real busybox resolves an applet by bare name only, so `busybox /bin/tftp` is "applet not
 /// found" and must not be recorded as a fetch the persona did not answer in character.
 fn download_target(parts: &[&str]) -> Option<String> {
     const FETCHERS: [&str; 4] = ["wget", "curl", "tftp", "ftpget"];
     // BusyBox ships wget/tftp/ftpget applets but NOT curl, so `busybox curl` is "applet not found"
-    // (see BUSYBOX_APPLETS) and must not be recorded as a fetch the persona did not answer in
+    // (see `busybox::applets`) and must not be recorded as a fetch the persona did not answer in
     // character - the same principle the full-path `busybox /bin/tftp` case relies on.
     const BUSYBOX_FETCHERS: [&str; 3] = ["wget", "tftp", "ftpget"];
     let (cmd, args) = match parts.first().map(|c| command_basename(c)) {
@@ -2125,48 +2131,6 @@ fn url_if_fetch_line(line: &str) -> Option<&str> {
         }
     }
     None
-}
-
-/// The BusyBox applets this shell models - the SINGLE source of truth for both the multi-call banner
-/// and `busybox <applet>` dispatch, so the advertised list can never contradict what the shell
-/// actually answers. Advertising an applet the same shell then rejects with "applet not found" was a
-/// clean two-command honeypot classifier. Notable exclusions: `curl` (real BusyBox ships no curl
-/// applet, so `busybox curl` correctly returns "applet not found") and `cd` (a shell builtin, not an
-/// applet). Every entry here is handled by [`FakeShell::dispatch`] when invoked bare, so
-/// `busybox <applet>` never falls through to "command not found".
-const BUSYBOX_APPLETS: &[&str] = &[
-    "ash", "cat", "chmod", "cp", "dd", "echo", "ftpget", "grep", "head", "hexdump", "id", "ls",
-    "mkdir", "more", "od", "ping", "pwd", "readlink", "rm", "sh", "sleep", "tftp", "uname", "wc",
-    "wget", "whoami",
-];
-
-/// True if `name` is one of the applets this shell models (see [`BUSYBOX_APPLETS`]); anything else
-/// returns BusyBox's "applet not found" - the reply Mirai/Gafgyt check to confirm a real busybox.
-fn is_busybox_applet(name: &str) -> bool {
-    BUSYBOX_APPLETS.contains(&name)
-}
-
-/// The BusyBox multi-call banner printed by a bare `busybox`. The applet list is rendered from the
-/// one [`BUSYBOX_APPLETS`] source, so it can never advertise an applet the shell then rejects.
-/// Loaders key off the "applet not found" reply, not this exact text.
-fn busybox_banner() -> String {
-    let mut s = String::from(
-        "BusyBox v1.31.1 (2021-06-01 00:00:00 UTC) multi-call binary.\n\
-         BusyBox is copyrighted by many authors between 1998-2015.\n\
-         \n\
-         Usage: busybox [function [arguments]...]\n\
-         \n\
-         Currently defined functions:\n",
-    );
-    for (idx, chunk) in BUSYBOX_APPLETS.chunks(8).enumerate() {
-        if idx > 0 {
-            s.push('\n');
-        }
-        s.push('\t');
-        s.push_str(&chunk.join(", "));
-    }
-    s.push('\n');
-    s
 }
 
 /// Whether a `chmod` mode adds execute permission: a symbolic mode naming `x` (`+x`, `a+x`,
@@ -2795,6 +2759,8 @@ fn decode_echo_escapes_into(s: &str, out: &mut String, dash: bool) -> bool {
 #[cfg(test)]
 mod budget_tests;
 
+#[cfg(test)]
+mod busybox_tests;
 #[cfg(test)]
 mod dd_tests;
 #[cfg(test)]

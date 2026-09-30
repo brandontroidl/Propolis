@@ -589,7 +589,8 @@ fn the_text_tools_are_applets_of_the_modeled_busybox_and_absent_on_the_phone() {
         .lines()
         .skip_while(|line| !line.starts_with("Currently defined"))
         .skip(1)
-        .flat_map(|line| line.trim().split(", "))
+        .flat_map(|line| line.split(','))
+        .map(str::trim)
         .collect();
     for applet in ["grep", "od", "wc"] {
         assert!(listed.contains(&applet), "{applet} advertised: {banner}");

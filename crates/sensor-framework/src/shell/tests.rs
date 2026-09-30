@@ -150,9 +150,8 @@ mod echo_tests {
 mod shell_detection_tests {
     use crate::fakefs::FakeFs;
     use crate::shell::{
-        BUSYBOX_APPLETS, EmitContext, FakeShell, OutputFd, SIGNAL_HONEYPOT_FILE_DOWNLOAD,
-        busybox_banner, cmd_curl, cmd_uname, cmd_wget, download_target, is_busybox_applet, onlcr,
-        simple_commands, url_if_fetch_line,
+        EmitContext, FakeShell, OutputFd, SIGNAL_HONEYPOT_FILE_DOWNLOAD, busybox::is_applet,
+        cmd_curl, cmd_uname, cmd_wget, download_target, onlcr, simple_commands, url_if_fetch_line,
     };
 
     fn shell() -> FakeShell {
@@ -1220,9 +1219,9 @@ mod shell_detection_tests {
 
     #[test]
     fn busybox_applet_set() {
-        assert!(is_busybox_applet("wget"));
-        assert!(is_busybox_applet("sh"));
-        assert!(!is_busybox_applet("MIRAI"));
+        assert!(is_applet("wget"));
+        assert!(is_applet("sh"));
+        assert!(!is_applet("MIRAI"));
     }
 
     fn noon() -> chrono::DateTime<chrono::Utc> {
@@ -1413,29 +1412,6 @@ mod shell_detection_tests {
         // The banner advertises chmod; `busybox chmod` must run it, not contradict the banner.
         let (out, _) = shell().handle_input("busybox chmod +x x");
         assert_eq!(out, "");
-    }
-
-    #[test]
-    fn busybox_banner_and_applet_set_never_contradict() {
-        // Both are derived from BUSYBOX_APPLETS, so every advertised applet is recognized and every
-        // recognized applet is advertised - the banner-vs-applet contradiction is impossible.
-        let banner = busybox_banner();
-        for applet in BUSYBOX_APPLETS {
-            assert!(
-                is_busybox_applet(applet),
-                "{applet} advertised but not recognized"
-            );
-            assert!(
-                banner.contains(applet),
-                "{applet} recognized but not advertised"
-            );
-        }
-        // curl is not a real BusyBox applet, so `busybox curl` is applet-not-found and it is absent
-        // from the banner.
-        assert!(!is_busybox_applet("curl"));
-        assert!(!banner.contains("curl"));
-        let (out, _) = shell().handle_input("busybox curl http://x/y");
-        assert!(out.contains("curl: applet not found"), "got: {out}");
     }
 
     #[test]

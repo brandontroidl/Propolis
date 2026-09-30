@@ -259,7 +259,7 @@ fn registry_facts_agree_with_the_filesystem_nodes() {
 }
 
 /// The backlog's acceptance transcript, in order, in one session. The lines that need a command
-/// family not built yet (`dd` is F3, `readlink` is F4) keep their not-found replies and are pinned
+/// family not built yet (`readlink` is F4) keep their not-found replies and are pinned
 /// as such, so the day they are modeled this test says which line to flip.
 #[test]
 fn the_backlog_acceptance_transcript_replays_its_f1_lines() {
@@ -273,15 +273,18 @@ fn the_backlog_acceptance_transcript_replays_its_f1_lines() {
         assert_eq!(out.status, 0, "{line}");
         assert_is_image(&out, "busybox");
     }
-    // F3: dd is not an applet yet.
-    assert_eq!(
-        run(&mut sh, "/bin/busybox dd if=/proc/self/exe bs=22 count=1"),
-        "dd: applet not found\n"
-    );
-    assert_eq!(
-        run(&mut sh, "/bin/busybox dd if=\"$SHELL\" bs=22 count=1"),
-        "dd: applet not found\n"
-    );
+    // F3: 22 header bytes of the image the reading process is, then BusyBox dd's record lines.
+    // The status is 0, so a `|| dd ...` after it would not run.
+    let records = b"1+0 records in\n1+0 records out\n";
+    for (line, image_name) in [
+        ("/bin/busybox dd if=/proc/self/exe bs=22 count=1", "busybox"),
+        ("/bin/busybox dd if=\"$SHELL\" bs=22 count=1", "bash"),
+    ] {
+        let out = run(&mut sh, line);
+        let mut want = image(image_name).0[..22].to_vec();
+        want.extend_from_slice(records);
+        assert_eq!((out.status, out.bytes()), (0, want.as_slice()), "{line}");
+    }
     // The copy takes the bytes and then the exec bit; running it is simulated.
     assert_eq!(
         run(&mut sh, "/bin/busybox cat /proc/self/exe > /tmp/.bb"),
@@ -308,6 +311,7 @@ fn image_generation_touches_no_host_file_and_starts_no_process() {
         ("fakefs.rs", include_str!("../fakefs.rs")),
         ("registry.rs", include_str!("registry.rs")),
         ("read.rs", include_str!("read.rs")),
+        ("dd.rs", include_str!("dd.rs")),
     ] {
         let production = source.split("#[cfg(test)]").next().unwrap();
         for banned in [

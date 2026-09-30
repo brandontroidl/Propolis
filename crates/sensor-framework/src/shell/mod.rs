@@ -56,6 +56,7 @@ use crate::sanitize_value;
 mod arith;
 mod ast;
 mod builtins;
+mod dd;
 mod eval;
 mod expand;
 mod lex;
@@ -2117,8 +2118,8 @@ fn url_if_fetch_line(line: &str) -> Option<&str> {
 /// applet). Every entry here is handled by [`FakeShell::dispatch`] when invoked bare, so
 /// `busybox <applet>` never falls through to "command not found".
 const BUSYBOX_APPLETS: &[&str] = &[
-    "ash", "cat", "chmod", "cp", "echo", "ftpget", "head", "hexdump", "id", "ls", "mkdir", "more",
-    "ping", "pwd", "rm", "sh", "sleep", "tftp", "uname", "wget", "whoami",
+    "ash", "cat", "chmod", "cp", "dd", "echo", "ftpget", "head", "hexdump", "id", "ls", "mkdir",
+    "more", "ping", "pwd", "rm", "sh", "sleep", "tftp", "uname", "wget", "whoami",
 ];
 
 /// True if `name` is one of the applets this shell models (see [`BUSYBOX_APPLETS`]); anything else
@@ -2716,6 +2717,8 @@ fn decode_echo_escapes_into(s: &str, out: &mut String) -> bool {
 #[cfg(test)]
 mod budget_tests;
 
+#[cfg(test)]
+mod dd_tests;
 #[cfg(test)]
 mod grammar_tests;
 #[cfg(test)]

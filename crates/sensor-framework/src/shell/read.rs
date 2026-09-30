@@ -92,7 +92,7 @@ impl FakeShell {
     /// newline, as the kernel returns it). A missing `cmdline` is a classic honeypot tell that
     /// loaders check before delivering a payload. The shell's own `/proc/<pid>/cmdline` is the
     /// shell's argv.
-    fn read_operand(
+    pub(super) fn read_operand(
         &mut self,
         argv: &[&str],
         path: &str,
@@ -119,7 +119,7 @@ impl FakeShell {
     /// image (busybox is 2 MiB, past `READ_CAP`). The bytes are charged to the line by the
     /// evaluator once the command returns, and a command reading several operands stops taking
     /// more once what it has already produced spent what the line had left.
-    fn read_cap(&self) -> u64 {
+    pub(super) fn read_cap(&self) -> u64 {
         self.budget().limits().work_per_line
     }
 

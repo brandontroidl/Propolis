@@ -58,6 +58,7 @@ impl Registry {
         };
         register_core(&mut registry);
         super::read::register(&mut registry);
+        super::dd::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }

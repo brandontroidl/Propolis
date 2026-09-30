@@ -46,6 +46,7 @@ use sensor_wire::{
     WIRE_VERSION,
 };
 
+use crate::binaries;
 use crate::budget::{ConnectionBudget, Resource};
 use crate::command_codec::CommandCodec;
 use crate::fakefs::{Blob, FakeFs, FsError, READ_CAP};
@@ -63,7 +64,7 @@ mod registry;
 mod trace;
 
 use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
-use registry::{HandlerFn, Registry};
+use registry::{HandlerFn, Registry, resolve_proc_self};
 
 pub use ast::UnsupportedKind;
 pub use trace::{
@@ -344,6 +345,9 @@ pub struct FakeShell {
     script_depth: u32,
     /// Loops open right now, for `break` and `continue`.
     loop_depth: u32,
+    /// BusyBox applets running right now. An applet runs inside the busybox process, so what it
+    /// opens as `/proc/self/exe` is busybox, whatever applet name it was started under.
+    busybox_depth: u32,
 }
 
 /// One entry of the shell stack.
@@ -376,6 +380,16 @@ enum ShellLevel {
     Bash { login: bool },
     Dash { line: u64 },
     AndroidMksh,
+}
+
+/// The command name of the executable a shell level runs as: Ubuntu's bash, or the dash `sh` is.
+/// The phone's mksh has no modeled file.
+fn level_command(level: ShellLevel) -> Option<&'static str> {
+    match level {
+        ShellLevel::Bash { .. } => Some("bash"),
+        ShellLevel::Dash { .. } => Some("dash"),
+        ShellLevel::AndroidMksh => None,
+    }
 }
 
 /// The host persona a session presents. The command grammar is shared, but Linux and Android
@@ -457,6 +471,7 @@ impl FakeShell {
             last_subst_status: None,
             script_depth: 0,
             loop_depth: 0,
+            busybox_depth: 0,
         }
     }
 
@@ -767,6 +782,7 @@ impl FakeShell {
         self.last_subst_status = None;
         self.script_depth = 0;
         self.loop_depth = 0;
+        self.busybox_depth = 0;
     }
 
     /// Run one decoded input as a shell reads it, one physical line at a time: each line joins
@@ -1011,7 +1027,7 @@ impl FakeShell {
     fn invoke_path(&mut self, parts: &[&str]) -> CommandResult {
         let path = self.resolve_logical(parts[0]);
         if self.fs.is_executable(&path) {
-            CommandResult::silent(0)
+            self.run_saved_executable(parts, &path)
         } else if self.fs.file_exists(&path) {
             CommandResult::stderr(
                 126,
@@ -1032,6 +1048,31 @@ impl FakeShell {
                 },
             )
         }
+    }
+
+    /// Running the executable file at `path`, which nothing here ever does for real. A file the
+    /// session made runs as an empty program does. A saved copy of the modeled busybox answers as
+    /// busybox does when started under another name: a name beginning `busybox` is the multi-call
+    /// binary and takes its applet from the first argument, anything else has no such applet
+    /// (`cp /usr/bin/busybox /tmp/.bb && /tmp/.bb PROBE` prints `.bb: applet not found`, status
+    /// 127, on the reference system).
+    fn run_saved_executable(&mut self, parts: &[&str], path: &str) -> CommandResult {
+        let is_busybox = self
+            .fs
+            .content_and_mode(path)
+            .ok()
+            .and_then(|(blob, _)| blob.as_elf())
+            .is_some_and(|image| binaries::is_busybox(&image));
+        if !is_busybox {
+            return CommandResult::silent(0);
+        }
+        let name = command_basename(parts[0]);
+        if name.starts_with("busybox") {
+            let mut multicall = vec!["busybox"];
+            multicall.extend_from_slice(&parts[1..]);
+            return self.cmd_busybox(&multicall);
+        }
+        CommandResult::stderr(127, format!("{name}: applet not found\n"))
     }
 
     /// Dispatch a command re-entrantly (a busybox applet, `sh -c`) and record it under the
@@ -1241,12 +1282,68 @@ impl FakeShell {
     /// `/var/run` as bash's logical mode does; [`FakeFs`] resolves them physically per operation.
     fn resolve_logical(&mut self, arg: &str) -> String {
         let normalized = self.normalize_logical(arg);
-        // The shell's own `/proc/<pid>` is `/proc/self` to the shell.
+        self.alias_own_pid(normalized)
+    }
+
+    /// The shell's own `/proc/<pid>` is `/proc/self` to the shell.
+    fn alias_own_pid(&self, normalized: String) -> String {
         let own = format!("/proc/{}", self.state().pid);
         match normalized.strip_prefix(&own) {
             Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("/proc/self{rest}"),
             _ => normalized,
         }
+    }
+
+    /// [`Self::resolve_logical`] for a path a process is about to open. `/proc/self/exe` is the
+    /// executable of the process that opens it, so it resolves against `reader`, the command name
+    /// of that process (`None` when it has no file behind it), and `/proc/<pid>/exe` of an open
+    /// shell resolves against that shell. Everything else resolves as any other path. Nothing
+    /// here reads a file of the host: the result is a path into the fake filesystem.
+    fn resolve_reading(&mut self, arg: &str, reader: Option<&str>) -> String {
+        let normalized = self.normalize_logical(arg);
+        // Only the Ubuntu persona has binaries behind these names; the phone's would be ARM.
+        if self.flavor == ShellFlavor::Bash {
+            if normalized == "/proc/self/exe" {
+                if let Some(path) = reader.and_then(resolve_proc_self) {
+                    return path.to_string();
+                }
+            } else if let Some(pid) = normalized
+                .strip_prefix("/proc/")
+                .and_then(|rest| rest.strip_suffix("/exe"))
+                .and_then(|pid| pid.parse::<u32>().ok())
+                && let Some(path) = self.shell_exe_of_pid(pid).and_then(resolve_proc_self)
+            {
+                return path.to_string();
+            }
+        }
+        self.alias_own_pid(normalized)
+    }
+
+    /// The command name of the process reading a file named by `argv0`: busybox while an applet
+    /// runs, else the command's own name.
+    fn reader_of<'a>(&self, argv0: &'a str) -> &'a str {
+        if self.busybox_depth > 0 {
+            "busybox"
+        } else {
+            command_basename(argv0)
+        }
+    }
+
+    /// The command name of the shell the innermost level is running: what a redirection opened by
+    /// the shell itself sees as `/proc/self/exe`.
+    fn shell_reader(&self) -> Option<&'static str> {
+        level_command(self.active_level())
+    }
+
+    /// The command name of the open shell whose process id is `pid`.
+    fn shell_exe_of_pid(&self, pid: u32) -> Option<&'static str> {
+        self.frames
+            .iter()
+            .find(|frame| frame.state.pid == pid)
+            .and_then(|frame| match frame.kind {
+                FrameKind::Level(level) | FrameKind::Script(level) => level_command(level),
+                FrameKind::Subshell => None,
+            })
     }
 
     /// [`Self::resolve_logical`] without the `/proc/<pid>` alias.
@@ -1363,7 +1460,8 @@ impl FakeShell {
         let (Some(&src), Some(&dst)) = (operands.first(), operands.get(1)) else {
             return CommandResult::stderr(1, "cp: missing destination file operand\n");
         };
-        let src_path = self.resolve_logical(src);
+        let reader = self.reader_of(parts[0]);
+        let src_path = self.resolve_reading(src, Some(reader));
         let Ok((blob, mode)) = self.fs.content_and_mode(&src_path) else {
             return CommandResult::stderr(
                 1,
@@ -1521,8 +1619,12 @@ impl FakeShell {
                 if typed == own_cmdline {
                     return CommandResult::stdout(format!("{}\0", self.argv_zero()).into_bytes());
                 }
-                let resolved = self.resolve_logical(path);
-                match self.fs.read_all(&resolved, READ_CAP) {
+                let reader = self.reader_of(parts[0]);
+                let resolved = self.resolve_reading(path, Some(reader));
+                // A modeled executable is bigger than `READ_CAP` (busybox is 2 MiB); the line's
+                // work allowance is the bound, as it is for anything else a line produces.
+                let cap = self.budget().limits().work_per_line;
+                match self.fs.read_all(&resolved, cap) {
                     Ok(contents) => CommandResult::stdout(contents),
                     Err(FsError::IsADirectory) => {
                         CommandResult::stderr(1, format!("cat: {path}: Is a directory\n"))
@@ -1630,7 +1732,11 @@ impl FakeShell {
         let state = self.state_mut();
         state.argv0 = argv0.map(str::to_string);
         state.positional = args.iter().map(|a| (*a).to_string()).collect();
+        // A script is a shell process of its own: the commands in it start as separate processes,
+        // not as applets of the busybox that started the script.
+        let applets = std::mem::take(&mut self.busybox_depth);
         let result = self.run_script(text);
+        self.busybox_depth = applets;
         self.frames.truncate(caller_frames);
         self.depth.leave();
         result
@@ -1676,7 +1782,12 @@ impl FakeShell {
     fn cmd_busybox(&mut self, parts: &[&str]) -> CommandResult {
         match parts.get(1).copied() {
             None => CommandResult::stdout(busybox_banner()),
-            Some(applet) if is_busybox_applet(applet) => self.dispatch_nested(&parts[1..]),
+            Some(applet) if is_busybox_applet(applet) => {
+                self.busybox_depth = self.busybox_depth.saturating_add(1);
+                let result = self.dispatch_nested(&parts[1..]);
+                self.busybox_depth = self.busybox_depth.saturating_sub(1);
+                result
+            }
             Some(applet) => CommandResult::stderr(127, format!("{applet}: applet not found\n")),
         }
     }
@@ -2646,5 +2757,7 @@ mod budget_tests;
 
 #[cfg(test)]
 mod grammar_tests;
+#[cfg(test)]
+mod proc_self_tests;
 #[cfg(test)]
 mod tests;

@@ -25,10 +25,22 @@ struct CommandEntry {
     handler: HandlerFn,
 }
 
+/// What the registry knows about the file behind a command name: the physical path of the
+/// executable a process running that command has open as `/proc/self/exe`, and the size and mode
+/// its node carries. Derived from the binaries table, the same table the filesystem builds its
+/// nodes from, so a lookup here and a read of the node cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NodeFacts {
+    pub path: &'static str,
+    pub size: u64,
+    pub mode: u32,
+}
+
 /// Command entries by basename. A name may hold several entries: they are tried in registration
 /// order and the first whose guard passes (or that has none) answers.
 pub(super) struct Registry {
     by_name: HashMap<&'static str, Vec<CommandEntry>>,
+    nodes: HashMap<&'static str, NodeFacts>,
 }
 
 static BUILTIN: LazyLock<Registry> = LazyLock::new(Registry::build);
@@ -42,9 +54,16 @@ impl Registry {
     fn build() -> Self {
         let mut registry = Self {
             by_name: HashMap::new(),
+            nodes: HashMap::new(),
         };
         register_core(&mut registry);
+        register_nodes(&mut registry);
         registry
+    }
+
+    /// The node facts for the command `name`, an alias (`sh`) answering with its target's.
+    pub(super) fn node_facts(&self, name: &str) -> Option<NodeFacts> {
+        self.nodes.get(name).copied()
     }
 
     /// Register `handler` as the answer for `name`.
@@ -99,6 +118,35 @@ impl Registry {
 
 fn is_bash(shell: &FakeShell, _parts: &[&str]) -> bool {
     shell.is_bash()
+}
+
+/// The executable `/proc/self/exe` names for a process running the command `exe_of`: the file the
+/// kernel reports as the process's binary, not the name it was started by, so a busybox applet is
+/// busybox and `sh` is dash. `None` for a command with no file behind it. The one place that
+/// answers this, for the readers of the link's target now and `readlink` later.
+pub(super) fn resolve_proc_self(exe_of: &str) -> Option<&'static str> {
+    Registry::builtin()
+        .node_facts(exe_of)
+        .map(|facts| facts.path)
+}
+
+/// Record the file behind every command name the binaries table models.
+fn register_nodes(r: &mut Registry) {
+    for binary in crate::binaries::BINARIES {
+        r.nodes.insert(
+            binary.name,
+            NodeFacts {
+                path: binary.path,
+                size: binary.size,
+                mode: binary.mode,
+            },
+        );
+    }
+    for alias in crate::binaries::ALIASES {
+        if let Some(facts) = r.nodes.get(alias.target).copied() {
+            r.nodes.insert(alias.name, facts);
+        }
+    }
 }
 
 fn register_core(r: &mut Registry) {

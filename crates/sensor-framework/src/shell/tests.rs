@@ -867,10 +867,11 @@ mod shell_detection_tests {
         assert_eq!(sh.handle_input("ls -a /run").0, ".x  lock  user\n");
         assert_eq!(sh.handle_input("cd /bin").0, "");
         assert_eq!(sh.handle_input("pwd").0, "/bin\n");
-        assert_eq!(
-            sh.handle_input("cat busybox").0.bytes(),
-            b"\x7fELF\x02\x01\x01\0"
-        );
+        // The file behind the relative name is the busybox image: its recorded first bytes, and
+        // its full recorded length.
+        let (out, _) = sh.handle_input("cat busybox");
+        assert_eq!(out.bytes().len(), 2_193_272);
+        assert_eq!(&out.bytes()[..8], b"\x7fELF\x02\x01\x01\x03");
     }
 
     #[test]
@@ -1306,7 +1307,11 @@ mod shell_detection_tests {
         let mut sh = shell();
         assert_eq!(sh.handle_input("cd /tmp").0, "");
         assert_eq!(sh.handle_input("cp /bin/busybox ./b").0, "");
-        assert_eq!(sh.handle_input("./b").0, "", "the copy runs");
+        // The copy is busybox started under the name `b`, which is not an applet: the reference
+        // system answers `.bb: applet not found` to the same chain (status 127).
+        let (out, _) = sh.handle_input("./b");
+        assert_eq!(out, "b: applet not found\n", "the copy runs");
+        assert_eq!(out.status, 127);
         assert_eq!(sh.handle_input("ls /tmp").0, "b\n");
     }
 

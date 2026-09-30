@@ -1051,7 +1051,10 @@ impl FakeShell {
 
     /// `< file` and `<> file`: the whole file, read now.
     fn open_input(&mut self, text: &str, create: bool) -> Result<Stdin, CommandResult> {
-        let resolved = self.resolve_logical(text);
+        // Opened by the shell, before any command it starts has replaced it: `cat < /proc/self/exe`
+        // reads the shell's own binary, where `cat /proc/self/exe` reads cat's.
+        let reader = self.shell_reader();
+        let resolved = self.resolve_reading(text, reader);
         if create
             && !self.fs.file_exists(&resolved)
             && let Err(error) = self.traced_create(&resolved)

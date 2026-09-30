@@ -4,6 +4,7 @@
 //! framework piece the design lists now exists; `sensor-catchall` and `sensor-ssh` (later tasks
 //! of the same sub-project) are thin compositions over it.
 
+pub mod binaries;
 pub mod bounds;
 pub mod budget;
 pub mod command_codec;

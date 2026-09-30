@@ -135,9 +135,20 @@ behind `/proc/mounts`, `/proc/self/mounts`, `/etc/mtab`, `/proc/self/mountinfo` 
 shell's `mount` (a stock Ubuntu cloud image on `/dev/sda1`; every mount point it names is
 a directory the shell will enter). Directories include `/`, `/tmp`, `/root`, `/etc`,
 `/home/ubuntu`, the loader-probed `/var/run`, `/mnt`, `/usr`, `/dev`, `/dev/shm`, and the
-`/sys`, `/run` and `/boot` subtrees the mount table names. `/bin/busybox`, `/bin/sh`,
-`/bin/bash` and `/usr/bin/wget` are present and executable, so the `cp /bin/busybox x`
-staging step has something to copy.
+`/sys`, `/run` and `/boot` subtrees the mount table names. The Ubuntu persona has the 73
+executables recorded from a real Ubuntu 22.04 (`/bin/busybox`, `/bin/ls`, `/bin/echo`,
+`/bin/cat`, `/bin/bash`, `/usr/bin/wget` and the rest of `BINARIES`,
+`crates/sensor-framework/src/binaries.rs#BINARIES`; `/bin/sh` is a link to dash), each a
+synthetic ELF image: the first 64 bytes a real one starts with, then generated filler out to
+its real size, so a probe that reads the header or the length sees what Ubuntu shows and
+`cp /bin/busybox x` has something to copy. The images are generated data, never a file of the
+host, and nothing runs them. Only `/bin/ls` holds a newline before offset 410 (at 409, as
+the recorded `head -n 1` shows). `/proc/self/exe` is the executable of the process that
+opens it: an applet of `busybox` reads busybox, a direct `cat` reads cat, a redirection the
+shell opens (`cat < /proc/self/exe`) and `/proc/$$/exe` read bash (dash in a shell opened
+with `sh`). The phone's binaries stay stubs and it has no `/proc/self/exe`. A copy of the
+busybox image runs as a renamed busybox does: `.bb: applet not found` (127), or the
+multi-call binary when the copy's name begins `busybox`.
 
 `FakeFs::android()` is the same machinery over the phone's filesystem: `/system` (mounted
 read-only, so a write there is refused as on a real device), `/system/bin`,

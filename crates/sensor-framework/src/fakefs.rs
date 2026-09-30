@@ -21,6 +21,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::binaries::{self, BinaryImage};
 use crate::budget::{BudgetError, BudgetLimits, ConnectionBudget};
 use crate::persona;
 
@@ -173,8 +174,43 @@ impl Node {
     }
 }
 
-/// Bounded byte content of a regular file. Baked files are one small `Bytes` piece; `Fill` and
-/// `Counter` let a later step add large synthetic bodies with O(1) storage.
+/// Bytes of the recorded header every synthetic executable starts with.
+pub const ELF_HEADER_LEN: usize = 64;
+
+/// A synthetic executable: a recorded header, then filler out to `len`. The whole file is this
+/// description, so it costs the same to hold whatever its size, and any range of it costs only the
+/// bytes asked for.
+///
+/// The filler byte at offset `i >= 64` is `0x80 | (i & 0x3f)`. The high bit is always set, so filler
+/// is never a newline: the first newline a line-reading command meets is one the header carries or
+/// the one planted at `newline_at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElfImage {
+    pub header: [u8; ELF_HEADER_LEN],
+    pub len: u64,
+    /// An offset at or past the header that holds `0x0a` instead of filler.
+    pub newline_at: Option<u64>,
+}
+
+impl ElfImage {
+    /// Byte `index` of the file; meaningful for `index < len`.
+    #[deny(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+    pub fn byte_at(&self, index: u64) -> u8 {
+        if let Some(byte) = usize::try_from(index)
+            .ok()
+            .and_then(|at| self.header.get(at))
+        {
+            return *byte;
+        }
+        if self.newline_at == Some(index) {
+            return 0x0a;
+        }
+        0x80 | u8::try_from(index & 0x3f).unwrap_or(0)
+    }
+}
+
+/// Bounded byte content of a regular file. Baked files are one small `Bytes` piece; `Fill`,
+/// `Counter` and `Elf` are large synthetic bodies with O(1) storage.
 #[derive(Debug, Clone)]
 pub struct Blob {
     /// Invariant: `len` is the sum of the pieces' lengths; at most 64 pieces.
@@ -187,6 +223,7 @@ enum Piece {
     Bytes(Arc<Vec<u8>>),
     Fill { byte: u8, len: u64 },
     Counter { seed: u64, len: u64 },
+    Elf(ElfImage),
 }
 
 impl Piece {
@@ -194,6 +231,7 @@ impl Piece {
         match self {
             Piece::Bytes(bytes) => bytes.len() as u64,
             Piece::Fill { len, .. } | Piece::Counter { len, .. } => *len,
+            Piece::Elf(image) => image.len,
         }
     }
 
@@ -214,6 +252,9 @@ impl Piece {
             }
             Piece::Counter { seed, .. } => {
                 out.extend((from..to).map(|i| counter_byte(*seed, i)));
+            }
+            Piece::Elf(image) => {
+                out.extend((from..to).map(|i| image.byte_at(i)));
             }
         }
     }
@@ -258,6 +299,22 @@ impl Blob {
         }
     }
 
+    /// A whole file that is `image`, stored in O(1).
+    pub fn elf(image: ElfImage) -> Self {
+        Self {
+            len: image.len,
+            pieces: vec![Piece::Elf(image)],
+        }
+    }
+
+    /// The image this blob is, when it is exactly one and nothing has been added to it.
+    pub fn as_elf(&self) -> Option<ElfImage> {
+        match self.pieces.as_slice() {
+            [Piece::Elf(image)] => Some(*image),
+            _ => None,
+        }
+    }
+
     pub fn len(&self) -> u64 {
         self.len
     }
@@ -266,14 +323,14 @@ impl Blob {
         self.len == 0
     }
 
-    /// Materialized bytes only; `Fill` and `Counter` pieces contribute nothing. The connection
-    /// budget sums this over the overlay.
+    /// Materialized bytes only; `Fill`, `Counter` and `Elf` pieces contribute nothing. The
+    /// connection budget sums this over the overlay.
     pub fn owned_bytes(&self) -> u64 {
         self.pieces
             .iter()
             .map(|piece| match piece {
                 Piece::Bytes(bytes) => bytes.len() as u64,
-                Piece::Fill { .. } | Piece::Counter { .. } => 0,
+                Piece::Fill { .. } | Piece::Counter { .. } | Piece::Elf(_) => 0,
             })
             .sum()
     }
@@ -424,6 +481,14 @@ impl Builder {
         self.nodes.insert(
             path.to_string(),
             Node::regular(Blob::from_bytes(content), MODE_EXECUTABLE),
+        );
+    }
+
+    /// A modeled Ubuntu binary at its physical path, with its recorded mode.
+    fn image(&mut self, binary: &BinaryImage) {
+        self.nodes.insert(
+            binary.path.to_string(),
+            Node::regular(binary.blob(), binary.mode),
         );
     }
 
@@ -673,12 +738,15 @@ impl FakeFs {
         b.dir("/dev/shm", &[]);
         b.advertise_root_children(&[]);
 
-        // The binaries a loader chain actually touches: `cp /bin/busybox .` then running the
-        // copy is a standard Mirai staging step, and it needs something to copy. The content is
-        // an ELF header's worth of bytes, which is what `cat` on a real one starts with. They
-        // live at their physical `/usr/bin` paths; `/bin` is the usrmerge symlink.
-        for binary in EXECUTABLE_BINARIES {
-            b.binary(binary, "\u{7f}ELF\u{2}\u{1}\u{1}\0");
+        // The binaries a loader chain touches: `cp /bin/busybox .` then running the copy is a
+        // standard Mirai staging step, and probes read `/bin/echo` and `/bin/ls` for the ELF
+        // header. Each is a synthetic image with the recorded header and size. They live at their
+        // physical `/usr/bin` paths; `/bin` is the usrmerge symlink.
+        for binary in binaries::BINARIES {
+            b.image(binary);
+        }
+        for alias in binaries::ALIASES {
+            b.symlink(alias.path, alias.target);
         }
         // The usrmerge layout: the top-level names are symlinks into /usr, with relative targets
         // as the real ones have, and their targets must be directories.
@@ -1054,8 +1122,12 @@ impl FakeFs {
     }
 
     /// Write `bytes` to `path`, as a download saving its body or a redirection does.
+    ///
+    /// Bytes that are exactly a modeled binary (`cat /proc/self/exe > FILE`) are stored as that
+    /// image, which is the same content held in O(1) instead of a couple of megabytes.
     pub fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
-        self.write_blob(path, Blob::from_bytes(bytes), MODE_FILE)
+        let blob = binaries::image_blob_for(bytes).unwrap_or_else(|| Blob::from_bytes(bytes));
+        self.write_blob(path, blob, MODE_FILE)
     }
 
     /// Write `blob` to `path` with `mode`. Fails the way a real write does, so a loader dropping
@@ -1242,15 +1314,6 @@ impl From<BudgetError> for FsError {
         }
     }
 }
-
-/// Binaries present and executable from the start, so `cp /bin/busybox x && ./x` behaves. They sit
-/// at the physical paths behind the usrmerge symlinks.
-const EXECUTABLE_BINARIES: [&str; 4] = [
-    "/usr/bin/busybox",
-    "/usr/bin/sh",
-    "/usr/bin/bash",
-    "/usr/bin/wget",
-];
 
 /// The Android device's equivalents. `/system/xbin/busybox` is there because this device is
 /// rooted (it hands out a root shell over ADB, which a stock one does not) and a rooted phone
@@ -1907,7 +1970,29 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
         let mut naive = Vec::new();
         for _ in 0..rng.below(7) {
             let len = rng.below(40);
-            match rng.below(3) {
+            match rng.below(4) {
+                3 => {
+                    // Lengths straddle the 64-byte header, and the planted newline may land in it
+                    // (where the header wins), at its edge, or in the filler.
+                    let len = rng.below(200);
+                    let mut header = [0u8; ELF_HEADER_LEN];
+                    header.iter_mut().for_each(|byte| *byte = rng.next() as u8);
+                    let newline_at = (rng.below(2) == 0).then(|| rng.below(220));
+                    naive.extend((0..len).map(|i| {
+                        if let Some(byte) = header.get(i as usize) {
+                            *byte
+                        } else if newline_at == Some(i) {
+                            0x0a
+                        } else {
+                            0x80 | (i & 0x3f) as u8
+                        }
+                    }));
+                    pieces.push(Piece::Elf(ElfImage {
+                        header,
+                        len,
+                        newline_at,
+                    }));
+                }
                 0 => {
                     let bytes: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
                     naive.extend_from_slice(&bytes);
@@ -2011,6 +2096,62 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
         // The fd links point at a directory the box does not model.
         assert_eq!(fs.read_all("/dev/stdin", 1), Err(FsError::NoSuchFile));
         assert!(!fs.file_exists("/dev/stdin"));
+    }
+
+    /// Every modeled binary is a regular executable node at its recorded path, with its recorded
+    /// size, mode and header, reachable through the usrmerge link; `sh` is a link to dash. The
+    /// phone has none of them.
+    #[test]
+    fn every_modeled_binary_is_a_node_with_its_recorded_size_mode_and_header() {
+        let fs = FakeFs::new();
+        for binary in binaries::BINARIES {
+            let (blob, mode) = fs.content_and_mode(binary.path).unwrap();
+            assert_eq!(blob.len(), binary.size, "{}", binary.path);
+            assert_eq!(blob.owned_bytes(), 0, "{} is O(1)", binary.path);
+            assert_eq!(mode, binary.mode, "{}", binary.path);
+            assert!(fs.is_executable(binary.path), "{}", binary.path);
+            assert_eq!(
+                fs.read_range(binary.path, 0, 64).unwrap(),
+                binary.header(),
+                "{}",
+                binary.path
+            );
+            let merged = binary.path.strip_prefix("/usr").unwrap();
+            assert_eq!(fs.resolve(merged, true).unwrap(), binary.path);
+            let last = binary.size - 1;
+            assert_eq!(fs.read_range(merged, last, 10).unwrap().len(), 1);
+            assert_eq!(fs.read_range(merged, binary.size, 10), Ok(Vec::new()));
+        }
+        assert_eq!(fs.resolve("/bin/sh", true).unwrap(), "/usr/bin/dash");
+        assert_eq!(fs.resolve("/usr/bin/sh", false).unwrap(), "/usr/bin/sh");
+        assert_eq!(
+            fs.read_all("/bin/sh", 64).unwrap(),
+            fs.read_all("/bin/dash", 64).unwrap()
+        );
+        let android = FakeFs::android();
+        assert!(android.read_all("/usr/bin/busybox", 8).is_err());
+    }
+
+    /// Saving bytes that are exactly a modeled image (what `cat /proc/self/exe > FILE` does) keeps
+    /// them as the image, so a 2 MiB copy costs the connection its path and node, not its bytes.
+    #[test]
+    fn writing_the_bytes_of_an_image_stores_the_image() {
+        let (mut fs, budget) = budgeted(1_000, 10);
+        let busybox = binaries::find("busybox").unwrap();
+        let bytes = busybox.blob().read_range(0, u64::MAX);
+        assert_eq!(fs.write_file("/tmp/.bb", &bytes), Ok(()));
+        assert_eq!(budget.owned_bytes_used(), 8, "the path only");
+        let (blob, mode) = fs.content_and_mode("/tmp/.bb").unwrap();
+        assert_eq!(blob.as_elf(), Some(busybox.image()));
+        assert_eq!(mode, MODE_FILE);
+        assert_eq!(fs.read_all("/tmp/.bb", u64::MAX).unwrap(), bytes);
+        // Anything else that large is content, and the budget refuses it.
+        let mut other = bytes.clone();
+        other[100] ^= 1;
+        assert_eq!(
+            fs.write_file("/tmp/.cc", &other),
+            Err(FsError::FileTooLarge)
+        );
     }
 
     #[test]

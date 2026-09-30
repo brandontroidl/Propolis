@@ -2,7 +2,100 @@
 //! `FakeShell::handle_input` the way a session does.
 
 mod echo_tests {
-    use crate::shell::cmd_echo;
+    use crate::fakefs::FakeFs;
+    use crate::shell::{EchoDialect, EmitContext, FakeShell};
+
+    /// The bash builtin, the dialect every test below that names no other means.
+    fn cmd_echo(args: &[&str]) -> String {
+        crate::shell::cmd_echo(EchoDialect::Bash, args)
+    }
+
+    fn run(sh: &mut FakeShell, line: &str) -> String {
+        sh.handle_input(line).0.to_string()
+    }
+
+    fn shell() -> FakeShell {
+        FakeShell::new(
+            FakeFs::new(),
+            EmitContext {
+                source_ip: "203.0.113.7".parse().unwrap(),
+                wan_ip: None,
+                authenticated: true,
+                protocol_label: "telnet".to_string(),
+                session_id: None,
+            },
+        )
+    }
+
+    #[test]
+    fn bash_echo_leaves_escapes_alone_without_dash_e() {
+        let mut sh = shell();
+        assert_eq!(run(&mut sh, "echo 'a\\nb'"), "a\\nb\n");
+        assert_eq!(run(&mut sh, "echo -e 'a\\nb'"), "a\nb\n");
+        assert_eq!(run(&mut sh, "echo -E -e 'a\\nb' -E"), "a\nb -E\n");
+    }
+
+    #[test]
+    fn dash_echo_interprets_escapes_without_dash_e() {
+        // Captured on Ubuntu 22.04: `dash -c "echo '\101\xff'"` printed `A\xff` (octal decoded,
+        // hex not) and `dash -c "echo -e '\101'"` printed `-e A`.
+        assert_eq!(
+            crate::shell::cmd_echo(EchoDialect::Dash, &["\\101\\xff"]),
+            "A\\xff\n"
+        );
+        assert_eq!(
+            crate::shell::cmd_echo(EchoDialect::Dash, &["-e", "\\101"]),
+            "-e A\n"
+        );
+        assert_eq!(
+            crate::shell::cmd_echo(EchoDialect::Dash, &["a\\tb\\0101"]),
+            "a\tbA\n"
+        );
+    }
+
+    #[test]
+    fn only_an_exact_dash_n_is_a_flag_in_dash() {
+        let dash = |args: &[&str]| crate::shell::cmd_echo(EchoDialect::Dash, args);
+        assert_eq!(dash(&["-n", "hi"]), "hi");
+        assert_eq!(dash(&["-en", "hi"]), "-en hi\n");
+        assert_eq!(dash(&["-E", "hi"]), "-E hi\n");
+        assert_eq!(dash(&["-n", "-n", "x"]), "-n x");
+        assert_eq!(dash(&["a\\cb", "z"]), "a");
+    }
+
+    #[test]
+    fn the_active_shell_level_picks_the_echo() {
+        let mut sh = shell();
+        assert_eq!(run(&mut sh, "echo '\\101'"), "\\101\n");
+        assert_eq!(run(&mut sh, "sh"), "");
+        assert_eq!(run(&mut sh, "echo '\\101'"), "A\n");
+        assert_eq!(run(&mut sh, "echo -e x"), "-e x\n");
+        assert_eq!(run(&mut sh, "exit"), "");
+        assert_eq!(run(&mut sh, "echo '\\101'"), "\\101\n");
+    }
+
+    #[test]
+    fn dash_script_level_uses_dash_echo() {
+        let mut sh = shell();
+        assert_eq!(run(&mut sh, "sh -c \"echo '\\\\101'\""), "A\n");
+    }
+
+    #[test]
+    fn busybox_echo_takes_dash_e_and_dash_n() {
+        let mut sh = shell();
+        assert_eq!(run(&mut sh, "sh"), "");
+        assert_eq!(run(&mut sh, "busybox echo -e '\\x51\\x4a\\x4c'"), "QJL\n");
+        assert_eq!(run(&mut sh, "busybox echo -ne '\\x51'"), "Q");
+        assert_eq!(run(&mut sh, "busybox echo '\\x51'"), "\\x51\n");
+    }
+
+    #[test]
+    fn gafgyt_handshake_answers_from_the_login_shell_and_from_busybox() {
+        let mut sh = shell();
+        let probe = "echo -e \"\\x47\\x41\\x59\\x46\\x47\\x54\"";
+        assert_eq!(run(&mut sh, probe), "GAYFGT\n");
+        assert_eq!(run(&mut sh, &format!("busybox {probe}")), "GAYFGT\n");
+    }
 
     #[test]
     fn gafgyt_handshake_returns_gayfgt() {

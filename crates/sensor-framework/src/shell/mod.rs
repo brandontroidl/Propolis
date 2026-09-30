@@ -918,7 +918,20 @@ impl FakeShell {
     }
 
     fn builtin_echo(&mut self, parts: &[&str]) -> CommandResult {
-        CommandResult::stdout(cmd_echo(&parts[1..]))
+        CommandResult::stdout(cmd_echo(self.echo_dialect(), &parts[1..]))
+    }
+
+    /// Which `echo` is running: the busybox applet while one runs, otherwise the active shell
+    /// level's builtin.
+    fn echo_dialect(&self) -> EchoDialect {
+        if self.busybox_depth > 0 {
+            return EchoDialect::Busybox;
+        }
+        match self.active_level() {
+            ShellLevel::Bash { .. } => EchoDialect::Bash,
+            ShellLevel::Dash { .. } => EchoDialect::Dash,
+            ShellLevel::AndroidMksh => EchoDialect::Mksh,
+        }
     }
 
     /// `mount` with no arguments lists the same table `/proc/mounts` exposes; mounting
@@ -2599,7 +2612,16 @@ fn first_non_flag_arg<'a>(args: &[&'a str]) -> Option<&'a str> {
 /// backslash escapes a real `echo -e` would. Quoting was already removed by the shell before the
 /// arguments got here. It only transforms text - nothing here is evaluated or executed, per the
 /// module's never-exec guarantee.
-fn cmd_echo(args: &[&str]) -> String {
+///
+/// The dialect is the `echo` actually running. Ubuntu's dash is captured in the 2026-09-29 ground
+/// truth ("dash echo", "dash echo -e"): it decodes escapes always, `-e` is an ordinary operand and
+/// `\xHH` is not an escape. The Android mksh has no capture, so it keeps the bash rules
+/// ([unverified]). Escapes above 0x7f leave as the char with that code point rather than the raw
+/// byte until words and output carry bytes.
+fn cmd_echo(dialect: EchoDialect, args: &[&str]) -> String {
+    if dialect == EchoDialect::Dash {
+        return dash_echo(args);
+    }
     let mut interpret = false; // -e
     let mut trailing_newline = true; // -n suppresses
     let mut first_operand = 0;
@@ -2630,7 +2652,7 @@ fn cmd_echo(args: &[&str]) -> String {
             out.push(' ');
         }
         if interpret {
-            if decode_echo_escapes_into(tok, &mut out) {
+            if decode_echo_escapes_into(tok, &mut out, false) {
                 // A `\c` escape stops all further output, including the trailing newline.
                 return out;
             }
@@ -2644,11 +2666,43 @@ fn cmd_echo(args: &[&str]) -> String {
     out
 }
 
+/// Which implementation of `echo` answers: the escape and flag rules differ between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EchoDialect {
+    Bash,
+    Dash,
+    Busybox,
+    Mksh,
+}
+
+/// dash's `echo`: only a first operand that is exactly `-n` is an option, and every operand is
+/// decoded as escapes with no `-e`.
+fn dash_echo(args: &[&str]) -> String {
+    let (trailing_newline, operands) = match args.split_first() {
+        Some((&"-n", rest)) => (false, rest),
+        _ => (true, args),
+    };
+    let mut out = String::new();
+    for (idx, tok) in operands.iter().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        if decode_echo_escapes_into(tok, &mut out, true) {
+            return out;
+        }
+    }
+    if trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
 /// Decode the backslash escapes `echo -e` understands, appending to `out`. Returns `true` if a
 /// `\c` escape was hit, which tells the caller to stop producing output entirely. Supports the
 /// escapes real-world loaders actually use: `\xHH` hex, `\0NNN`/`\NNN` octal, and the single-letter
-/// set (`\n \t \r \\ \a \b \f \v \0`).
-fn decode_echo_escapes_into(s: &str, out: &mut String) -> bool {
+/// set (`\n \t \r \\ \a \b \f \v \0`). `dash` selects dash's set: bare `\NNN` octal is decoded and
+/// `\xHH` is not.
+fn decode_echo_escapes_into(s: &str, out: &mut String, dash: bool) -> bool {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
@@ -2665,7 +2719,26 @@ fn decode_echo_escapes_into(s: &str, out: &mut String) -> bool {
             Some('v') => out.push('\x0b'),
             Some('\\') => out.push('\\'),
             Some('c') => return true, // stop all further output
-            Some('x') => {
+            Some(first @ '1'..='7') if dash => {
+                // dash reads `\NNN` as octal (bash needs the leading 0): up to three digits,
+                // truncated to a byte.
+                let mut val = first.to_digit(8).unwrap_or(0);
+                let mut n = 1;
+                while n < 3 {
+                    match chars.peek().and_then(|d| d.to_digit(8)) {
+                        Some(d) => {
+                            val = val * 8 + d;
+                            chars.next();
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if let Some(ch) = char::from_u32(val & 0xff) {
+                    out.push(ch);
+                }
+            }
+            Some('x') if !dash => {
                 // Up to two hex digits.
                 let mut val: u32 = 0;
                 let mut n = 0;

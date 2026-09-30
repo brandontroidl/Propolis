@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Fake shell: a real grammar and faithful command modeling** - the shell the SSH, Telnet and ADB
+  sensors present now lexes, parses and evaluates a shell-command subset (quotes, expansions,
+  arithmetic, real pipelines, `&&`/`||`, subshells and `if`/`for`/`while`) instead of matching whole
+  lines, dispatches every command through a shared registry, and bounds each connection with a shared
+  resource budget (overlay bytes and nodes, command and download events, wire egress, per-line work
+  and a recursion depth cap). The filesystem is a node model over a persona snapshot with symlinks,
+  devices, modes and mount flags. The commands the highest-volume observed attacker chains use now
+  answer faithfully: reading the ELF header of `/bin/ls` (`cat | head`, `hexdump -n 52`, `dd bs=52`)
+  and of `/proc/self/exe` (resolved to the executable of the reading process, so the `|| cat`
+  fallback is suppressed), the Telnet `.fxcat` writable-directory sweep, and the real
+  BusyBox v1.30.1 multi-call banner and its 263-applet set. Shell identity (bash login versus a
+  `bash -c` exec versus nested `su`/`sh`/dash levels versus Android mksh) drives every prompt, error
+  prefix and `$0`. A per-line internal trace records why the shell answered as it did and can never
+  reach the wire, and the never-exec and no-fetch guarantees hold by construction: the emulator has
+  no process, evaluation or network facility and the synthetic binary bytes are generated, never a
+  host file read or run. Attacker-facing behavior is checked by a byte-for-byte session-replay corpus.
 - **Split deployment: collectors ship to a gateway over mTLS** - a honeypot collector no longer
   needs database access. `shipper` tails each sensor's log through the shared `log-tailer` crate and
   ships length-prefixed batches to a `gateway` over mutually authenticated TLS. The gateway verifies

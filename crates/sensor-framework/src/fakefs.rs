@@ -965,6 +965,17 @@ impl FakeFs {
     /// `rm` acts on). The last component may be absent, so a creator can resolve the path it is
     /// about to make.
     fn resolve(&self, logical_abs: &str, follow_final: bool) -> Result<String, FsError> {
+        self.resolve_with(logical_abs, follow_final, false)
+    }
+
+    /// [`Self::resolve`], with `allow_missing` letting a missing non-final component stand: the
+    /// rest of the path is then kept as typed (`..` still climbing), as `realpath -m` does.
+    fn resolve_with(
+        &self,
+        logical_abs: &str,
+        follow_final: bool,
+        allow_missing: bool,
+    ) -> Result<String, FsError> {
         let mut pending: VecDeque<String> = logical_abs
             .split('/')
             .filter(|c| !c.is_empty() && *c != ".")
@@ -994,11 +1005,37 @@ impl FakeFs {
                 }
                 Some(NodeKind::Directory(_)) => resolved.push(component),
                 Some(_) if !is_last => return Err(FsError::NotADirectory),
-                None if !is_last => return Err(FsError::NoSuchDirectory(candidate)),
+                None if !is_last && !allow_missing => {
+                    return Err(FsError::NoSuchDirectory(candidate));
+                }
                 Some(_) | None => resolved.push(component),
             }
         }
         Ok(format!("/{}", resolved.join("/")))
+    }
+
+    /// What the symlink at `logical_abs` points to, exactly as stored (`usr/bin` for `/bin`), or
+    /// `None` when the path is not a symlink or does not exist. Only the final component is left
+    /// unfollowed; the directories leading to it resolve as they do for any path.
+    pub fn link_target(&self, logical_abs: &str) -> Option<String> {
+        let physical = self.resolve(logical_abs, false).ok()?;
+        match self.node_at(&physical).map(|node| &node.kind) {
+            Some(NodeKind::Symlink { target }) => Some(target.clone()),
+            _ => None,
+        }
+    }
+
+    /// The physical path `logical_abs` names once every symlink is followed, for the way `mode`
+    /// asks for it. `None` when the mode's requirement fails or resolution does (a loop, a
+    /// non-directory in the middle).
+    pub fn canonicalize(&self, logical_abs: &str, mode: Canonical) -> Option<String> {
+        let physical = self
+            .resolve_with(logical_abs, true, mode == Canonical::AllowMissing)
+            .ok()?;
+        if mode == Canonical::Existing && self.node_at(&physical).is_none() {
+            return None;
+        }
+        Some(physical)
     }
 
     /// The physical path and live node `path` names, following every symlink.
@@ -1278,6 +1315,18 @@ fn join_with(resolved: &[String], component: &str) -> String {
     let mut parts: Vec<&str> = resolved.iter().map(String::as_str).collect();
     parts.push(component);
     parts.join("/")
+}
+
+/// Which components of a path [`FakeFs::canonicalize`] requires to exist: `readlink -f`,
+/// `-e` and `-m`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Canonical {
+    /// All but the last (`-f`).
+    ParentsExist,
+    /// All of them (`-e`).
+    Existing,
+    /// None (`-m`).
+    AllowMissing,
 }
 
 /// Why an operation on the filesystem failed, so the shell can print what the real command prints.

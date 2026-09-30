@@ -62,6 +62,7 @@ mod expand;
 mod lex;
 mod parse;
 mod read;
+mod readlink;
 mod registry;
 mod trace;
 
@@ -2119,7 +2120,7 @@ fn url_if_fetch_line(line: &str) -> Option<&str> {
 /// `busybox <applet>` never falls through to "command not found".
 const BUSYBOX_APPLETS: &[&str] = &[
     "ash", "cat", "chmod", "cp", "dd", "echo", "ftpget", "head", "hexdump", "id", "ls", "mkdir",
-    "more", "ping", "pwd", "rm", "sh", "sleep", "tftp", "uname", "wget", "whoami",
+    "more", "ping", "pwd", "readlink", "rm", "sh", "sleep", "tftp", "uname", "wget", "whoami",
 ];
 
 /// True if `name` is one of the applets this shell models (see [`BUSYBOX_APPLETS`]); anything else
@@ -2725,5 +2726,7 @@ mod grammar_tests;
 mod proc_self_tests;
 #[cfg(test)]
 mod read_tests;
+#[cfg(test)]
+mod readlink_tests;
 #[cfg(test)]
 mod tests;

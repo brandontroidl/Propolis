@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 1938 test functions** (1201 unit + 737 integration).
+- **Total: 1950 test functions** (1213 unit + 737 integration).
 - **DB-backed (`sqlx::test`): 202** - console 159, core-scoring 25, intake 7,
   fleet 6, propolis 4, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -131,7 +131,7 @@ Per-crate breakdown:
 | sensor-adb | 53 | 23 | integration |
 | sensor-catchall | 18 | 6 | integration |
 | sensor-cred | 14 | 8 | integration |
-| sensor-framework | 412 | 52 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
+| sensor-framework | 424 | 52 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
 | sensor-ftp | 7 | 14 | integration |
 | sensor-http | 8 | 16 | integration |
 | sensor-redis | 79 | 18 | integration |
@@ -140,7 +140,7 @@ Per-crate breakdown:
 | sensor-telnet | 39 | 20 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **1201** | **737** | |
+| **Total** | **1213** | **737** | |
 
 ### Test styles by layer
 

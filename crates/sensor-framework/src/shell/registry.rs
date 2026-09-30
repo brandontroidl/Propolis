@@ -59,6 +59,7 @@ impl Registry {
         register_core(&mut registry);
         super::read::register(&mut registry);
         super::dd::register(&mut registry);
+        super::readlink::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }
@@ -125,7 +126,7 @@ fn is_bash(shell: &FakeShell, _parts: &[&str]) -> bool {
 /// The executable `/proc/self/exe` names for a process running the command `exe_of`: the file the
 /// kernel reports as the process's binary, not the name it was started by, so a busybox applet is
 /// busybox and `sh` is dash. `None` for a command with no file behind it. The one place that
-/// answers this, for the readers of the link's target now and `readlink` later.
+/// answers this, for the byte readers and `readlink`.
 pub(super) fn resolve_proc_self(exe_of: &str) -> Option<&'static str> {
     Registry::builtin()
         .node_facts(exe_of)

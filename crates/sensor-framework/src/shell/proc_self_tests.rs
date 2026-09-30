@@ -258,9 +258,7 @@ fn registry_facts_agree_with_the_filesystem_nodes() {
     assert_eq!(resolve_proc_self("nosuchcommand"), None);
 }
 
-/// The backlog's acceptance transcript, in order, in one session. The lines that need a command
-/// family not built yet (`readlink` is F4) keep their not-found replies and are pinned
-/// as such, so the day they are modeled this test says which line to flip.
+/// The backlog's acceptance transcript, in order, in one session.
 #[test]
 fn the_backlog_acceptance_transcript_replays_its_f1_lines() {
     let mut sh = shell();
@@ -295,10 +293,10 @@ fn the_backlog_acceptance_transcript_replays_its_f1_lines() {
         run(&mut sh, "chmod 755 /tmp/.bb && /tmp/.bb PROBE"),
         ".bb: applet not found\n"
     );
-    // F4: readlink is not modeled yet.
+    // F4: readlink is the reading process, so the link names /usr/bin/readlink.
     assert_eq!(
         run(&mut sh, "readlink /proc/self/exe"),
-        "readlink: command not found\n"
+        "/usr/bin/readlink\n"
     );
 }
 
@@ -312,6 +310,7 @@ fn image_generation_touches_no_host_file_and_starts_no_process() {
         ("registry.rs", include_str!("registry.rs")),
         ("read.rs", include_str!("read.rs")),
         ("dd.rs", include_str!("dd.rs")),
+        ("readlink.rs", include_str!("readlink.rs")),
     ] {
         let production = source.split("#[cfg(test)]").next().unwrap();
         for banned in [
@@ -335,6 +334,7 @@ fn every_registered_command_with_a_recorded_binary_has_facts() {
     for name in [
         "uname", "id", "whoami", "echo", "cat", "head", "ls", "mount", "true", "false", "wget",
         "curl", "ping", "sh", "bash", "busybox", "chmod", "cp", "rm", "mkdir", "sleep", "su",
+        "readlink",
     ] {
         assert!(registry.node_facts(name).is_some(), "{name}");
     }

@@ -891,6 +891,74 @@ async fn concurrent_shell_and_sync_streams_on_one_connection() {
 }
 
 #[tokio::test]
+async fn shell_streams_of_one_connection_share_one_command_ceiling() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+
+    let mut streams = Vec::new();
+    for local_id in 1..=4u32 {
+        let server_id = open_stream(&mut conn, local_id, "shell:").await;
+        let _ = read_message(&mut conn).await; // initial prompt
+        streams.push((local_id, server_id));
+    }
+    // Four streams of 64 lines are the connection's 256 command events.
+    for &(local_id, server_id) in &streams {
+        for _ in 0..64 {
+            send_shell_line(&mut conn, local_id, server_id, "true").await;
+        }
+    }
+    // Past it, no stream gets an event of its own, and the connection gets one marker in total.
+    for &(local_id, server_id) in &streams {
+        for _ in 0..3 {
+            send_shell_line(&mut conn, local_id, server_id, "true").await;
+        }
+    }
+
+    let events = srv.events().await;
+    fn flood(e: &sensor_wire::SensorEvent) -> Option<&str> {
+        e.metadata.get("flood").and_then(|v| v.as_str())
+    }
+    let commands = events
+        .iter()
+        .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .filter(|e| flood(e).is_none())
+        .count();
+    let markers = events
+        .iter()
+        .filter(|e| flood(e) == Some("command_cap"))
+        .count();
+    assert_eq!(commands, 256, "the streams share one ceiling");
+    assert_eq!(markers, 1, "and one marker");
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn a_connection_that_has_spent_its_egress_allowance_is_dropped_after_that_reply() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let server_id = open_stream(&mut conn, 10, "shell:").await;
+    let _ = read_message(&mut conn).await; // initial prompt
+
+    // Each `cat /dev/zero` answers with one MiB and a prompt; the connection may write 16 MiB.
+    // The 16th reply is the one that reaches the cap, and it arrives whole.
+    for reply in 1..=16 {
+        let out = send_shell_line(&mut conn, 10, server_id, "cat /dev/zero").await;
+        assert!(out.len() >= 1 << 20, "reply {reply} was cut short");
+    }
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(3), conn.read(&mut byte))
+        .await
+        .expect("the connection was not dropped after the allowance was spent");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "nothing follows the reply that spent the allowance: {read:?}"
+    );
+    srv.handle.abort();
+}
+
+#[tokio::test]
 async fn open_flood_is_capped_with_close_not_unbounded_streams() {
     let srv = TestServer::start().await;
     let mut conn = TcpStream::connect(srv.addr).await.unwrap();

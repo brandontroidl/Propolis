@@ -18,7 +18,7 @@ pub struct LineTrace {
     pub binary_line: bool,
     /// One entry per control segment, in execution order.
     pub segments: Vec<SegmentTrace>,
-    /// Whole-line budget outcome. Empty until the budget step fills it.
+    /// Whole-line budget outcome.
     pub budget: BudgetTrace,
     /// The events this line emitted, in order: a log of the events, not the events.
     pub events: Vec<TraceEventKind>,
@@ -127,6 +127,8 @@ pub enum FsDenied {
     NotADirectory,
     TooManyLinks,
     NoSpace,
+    FileTooLarge,
+    NameTooLong,
 }
 
 impl From<&crate::fakefs::FsError> for FsDenied {
@@ -141,6 +143,8 @@ impl From<&crate::fakefs::FsError> for FsDenied {
             FsError::NotADirectory => Self::NotADirectory,
             FsError::TooManyLinks => Self::TooManyLinks,
             FsError::NoSpace => Self::NoSpace,
+            FsError::FileTooLarge => Self::FileTooLarge,
+            FsError::NameTooLong => Self::NameTooLong,
         }
     }
 }
@@ -154,11 +158,14 @@ pub enum TraceEventKind {
     FloodDownloadCap,
 }
 
-/// Empty until the budget step fills every field; present so the trace shape is stable.
+/// What the line cost against the per-line and per-connection budgets.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct BudgetTrace {
+    /// Steps plus bytes scanned or produced, charged to the line's work budget.
     pub work_charged: u64,
+    /// The deepest re-entrant dispatch the line reached.
     pub max_depth_reached: u32,
+    /// The first cap the line ran into, if any. Later ones are not recorded.
     pub hit: Option<BudgetHit>,
 }
 

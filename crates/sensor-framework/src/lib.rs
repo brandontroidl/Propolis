@@ -5,6 +5,7 @@
 //! of the same sub-project) are thin compositions over it.
 
 pub mod bounds;
+pub mod budget;
 pub mod command_codec;
 pub mod config;
 pub mod emit;
@@ -20,6 +21,7 @@ pub mod spool;
 pub mod wan;
 
 pub use bounds::ConnectionBounds;
+pub use budget::{BudgetLimits, ConnectionBudget, EgressState, limits_from};
 pub use command_codec::CommandCodec;
 pub use config::SensorConfig;
 pub use emit::EventEmitter;

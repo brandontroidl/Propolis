@@ -157,6 +157,71 @@ async fn nested_shell_exit_restores_the_login_prompt_before_final_logout() {
     handle.abort();
 }
 
+/// Read a shell reply: bytes until one ends in a prompt, or the server closes. Only the tail is
+/// checked, so a megabyte of output is not rescanned on every read.
+async fn read_reply(conn: &mut TcpStream) -> (usize, bool) {
+    let mut total = 0;
+    let mut tail = Vec::new();
+    let mut chunk = vec![0u8; 65_536];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut chunk))
+            .await
+            .expect("timed out waiting for the reply")
+            .unwrap_or(0);
+        if n == 0 {
+            return (total, true);
+        }
+        total += n;
+        tail.extend_from_slice(&chunk[..n]);
+        tail.drain(..tail.len().saturating_sub(2));
+        if tail == b"# " {
+            return (total, false);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_connection_that_has_spent_its_egress_allowance_is_dropped_after_that_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_telnet::start_test_server(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        wan_resolver,
+        test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    login(&mut conn, b"attacker", b"pw").await;
+
+    // Each `cat /dev/zero` answers with one MiB and a prompt; the connection may write 16 MiB.
+    let mut answered = 0;
+    let mut wire = 0;
+    loop {
+        assert!(answered < 20, "the connection was never dropped");
+        conn.write_all(b"cat /dev/zero\r\n").await.unwrap();
+        let (bytes, closed) = read_reply(&mut conn).await;
+        wire += bytes;
+        if closed {
+            break;
+        }
+        answered += 1;
+    }
+    // The 16th reply is the one that reaches the cap: it arrives whole, prompt included (the reply
+    // loop only counts it as answered by seeing that prompt), and nothing follows it.
+    assert_eq!(answered, 16);
+    assert!(
+        wire >= 16 << 20,
+        "the drop came before the allowance was spent: {wire}"
+    );
+    handle.abort();
+}
+
 #[tokio::test]
 async fn password_never_appears_in_any_event() {
     let dir = tempfile::tempdir().unwrap();

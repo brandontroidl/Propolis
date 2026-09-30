@@ -162,13 +162,23 @@ I/O (`crates/sensor-framework/src/shell.rs`). This is asserted by `never_exec_st
 `crates/sensor-ssh/tests/shell_test.rs`.
 
 - One `honeypot_command_exec` is emitted per non-blank input line, except that a
-  binary line or a line past the per-session cap of 256 commands
-  (`MAX_COMMANDS_PER_SESSION`, `crates/sensor-framework/src/shell.rs#MAX_COMMANDS_PER_SESSION`) yields at most one marker event per session
+  binary line or a line past the per-connection cap of 256 commands
+  (`MAX_COMMANDS_PER_SESSION`, `crates/sensor-framework/src/shell.rs#MAX_COMMANDS_PER_SESSION`, shared by every shell on the connection through
+  `crates/sensor-framework/src/budget.rs#ConnectionBudget`) yields at most one marker event per session
   per flood kind; a blank line produces no event or output (`crates/sensor-framework/src/shell.rs#FakeShell::handle_input`). The raw
   line is recorded verbatim in
   `metadata.command`, sanitized and capped at `MAX_COMMAND_LEN = 1024` (`crates/sensor-framework/src/shell.rs#MAX_COMMAND_LEN`, `crates/sensor-framework/src/shell.rs#FakeShell::handle_input`).
 - If the line is single-byte-XOR obfuscated, `command_decoded` and `xor_key` are
   added to metadata (`crates/sensor-framework/src/shell.rs#FakeShell::handle_input`).
+- One `ConnectionBudget` per connection (`crates/sensor-framework/src/budget.rs#ConnectionBudget`, limits in `crates/sensor-framework/src/budget.rs#BudgetLimits::standard`)
+  bounds what a session can make the sensor hold or send: 256 KiB of created file content and 4096
+  created nodes (a removed file's slot is not freed), 64 recorded downloads per connection and 8 per
+  line, 16 MiB written to the peer, and per input line a work allowance and a re-entry depth of 16.
+  A refused write prints the kernel's own `No space left on device`, `File too large` or
+  `File name too long` (names over 255 per component or 4096 per path). Past the download cap the
+  connection's one `download_cap` marker is emitted and no further `honeypot_file_download` events;
+  a refused re-entry is a silent success. A connection that has written its 16 MiB is dropped after
+  the reply that spent it.
 - A recognized fetch verb additionally emits `honeypot_file_download` with
   `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell.rs#FakeShell::handle_input`).
 - Shell identity is state, not fixed response text (`crates/sensor-framework/src/shell.rs#ShellContext`, `crates/sensor-framework/src/shell.rs#FakeShell::prompt`). An Ubuntu login starts as

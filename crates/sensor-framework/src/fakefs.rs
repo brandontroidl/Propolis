@@ -21,14 +21,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::budget::{BudgetError, BudgetLimits, ConnectionBudget};
 use crate::persona;
 
 /// Unix seconds stamped on every baked node (2024-01-01T00:00:00Z). Persona data: invisible until
 /// a `stat` is modeled, and kept a constant so this module never reads the clock.
 pub const PERSONA_MTIME: i64 = 1_704_067_200;
 
-/// Upper bound on the bytes one `read_all` returns. S7 replaces this with the connection's egress
-/// budget.
+/// Upper bound on the bytes one `read_all` returns. The connection's cumulative output is bounded
+/// separately, by the egress budget each transport charges.
 pub const READ_CAP: u64 = 1 << 20;
 
 /// Symlinks followed while resolving one path before giving up with `ELOOP` (Linux's
@@ -388,6 +389,9 @@ struct Overlay {
 pub struct FakeFs {
     snapshot: Arc<Snapshot>,
     overlay: Overlay,
+    /// Charged by every write, so no writer can bypass it. Shared with the other filesystems and
+    /// shells on the same connection.
+    budget: Arc<ConnectionBudget>,
 }
 
 impl Default for FakeFs {
@@ -487,7 +491,20 @@ impl FakeFs {
         Self {
             snapshot: Arc::new(snapshot),
             overlay: Overlay::default(),
+            budget: ConnectionBudget::new(BudgetLimits::default()),
         }
+    }
+
+    /// This filesystem charging `budget` instead of its own standard-limits one, so it shares a
+    /// ceiling with the rest of its connection.
+    pub fn with_budget(mut self, budget: Arc<ConnectionBudget>) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// The budget this filesystem charges; a shell built on it charges the same one.
+    pub fn budget(&self) -> &Arc<ConnectionBudget> {
+        &self.budget
     }
 
     pub fn new() -> Self {
@@ -1046,7 +1063,12 @@ impl FakeFs {
     /// a success it can never verify. A device target takes the write into its own semantics and
     /// stores nothing. Overwriting a file keeps its execute bits: a payload saved over a
     /// `chmod`ed name stays runnable, as it does when truncated in place.
+    ///
+    /// The name is checked first, then the connection budget is charged for the blob's
+    /// materialized bytes (net of what the path already held) and, for a path with no overlay
+    /// slot yet, one node. A refusal inserts nothing.
     pub fn write_blob(&mut self, path: &str, blob: Blob, mode: u32) -> Result<(), FsError> {
+        self.budget.check_name(path)?;
         let physical = self.resolve_for_write(path)?;
         if self.snapshot.is_ro(&physical) {
             return Err(FsError::ReadOnly);
@@ -1058,11 +1080,37 @@ impl FakeFs {
             Some((NodeKind::Regular(_), existing)) => mode |= existing.mode & EXEC_BITS,
             _ => {}
         }
+        let new_bytes = blob.owned_bytes();
+        let old_bytes = self.overlay_owned_bytes(&physical);
+        // A path already holding an overlay node or a tombstone owns its slot; only a baked or
+        // brand-new path needs one.
+        let needs_slot = !self.overlay.nodes.contains_key(&physical)
+            && !self.overlay.tombstones.contains(&physical);
+        // A new slot also holds its path, charged with the content and kept charged for the life
+        // of the slot: a tombstone keeps the path resident.
+        let path_bytes = if needs_slot {
+            u64::try_from(physical.len()).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        let charged = new_bytes.saturating_add(path_bytes);
+        self.budget.replace_bytes(old_bytes, charged)?;
+        if needs_slot && let Err(error) = self.budget.charge_node() {
+            // Undoing a swap that just fit cannot itself be refused.
+            let _ = self.budget.replace_bytes(charged, old_bytes);
+            return Err(error.into());
+        }
         self.overlay.tombstones.remove(&physical);
         self.overlay
             .nodes
             .insert(physical, Node::regular(blob, mode));
         Ok(())
+    }
+
+    /// Bytes charged for the overlay node at `physical`: its blob's materialized bytes, zero for
+    /// anything else.
+    fn overlay_owned_bytes(&self, physical: &str) -> u64 {
+        self.overlay.nodes.get(physical).map_or(0, node_owned_bytes)
     }
 
     /// Remove `path` (a symlink itself, never its target). `Ok(false)` when nothing was there:
@@ -1081,25 +1129,55 @@ impl FakeFs {
         }
         let existing = self.node_at(&physical).map(|node| &node.kind);
         let existed = existing.is_some();
-        if matches!(existing, Some(NodeKind::Directory(_))) {
+        let is_directory = matches!(existing, Some(NodeKind::Directory(_)));
+        if is_directory {
             let below = format!("{physical}/");
-            self.overlay.nodes.retain(|key, _| !key.starts_with(&below));
+            let doomed: Vec<String> = self
+                .overlay
+                .nodes
+                .keys()
+                .filter(|key| key.starts_with(&below))
+                .cloned()
+                .collect();
+            for key in doomed {
+                if let Some(node) = self.overlay.nodes.remove(&key) {
+                    self.budget.refund_bytes(node_owned_bytes(&node));
+                }
+            }
         }
-        self.overlay.nodes.remove(&physical);
+        // The bytes come back; the node slot does not. A created node's slot becomes the
+        // tombstone's, and a baked path's tombstone takes a new one.
+        let removed = self.overlay.nodes.remove(&physical);
+        if let Some(node) = &removed {
+            self.budget.refund_bytes(node_owned_bytes(node));
+        }
         if existed {
             self.overlay.tombstones.insert(physical);
+            if removed.is_none() {
+                self.budget.charge_node_unchecked();
+            }
         }
         Ok(existed)
     }
 
     /// `mkdir path`, with the failures a real `mkdir` distinguishes.
     pub fn make_dir(&mut self, path: &str) -> Result<(), FsError> {
+        self.budget.check_name(path)?;
         let physical = self.resolve_for_write(path)?;
         if self.snapshot.is_ro(&physical) {
             return Err(FsError::ReadOnly);
         }
         if self.node_at(&physical).is_some() {
             return Err(FsError::Exists);
+        }
+        // No live node here, so a tombstone is the only thing that can already own the slot.
+        if !self.overlay.tombstones.contains(&physical) {
+            let path_bytes = u64::try_from(physical.len()).unwrap_or(u64::MAX);
+            self.budget.charge_bytes(path_bytes)?;
+            if let Err(error) = self.budget.charge_node() {
+                self.budget.refund_bytes(path_bytes);
+                return Err(error.into());
+            }
         }
         self.overlay.tombstones.remove(&physical);
         self.overlay
@@ -1112,6 +1190,14 @@ impl FakeFs {
     /// the way the shell would.
     pub fn create_file(&mut self, path: &str) -> Result<(), FsError> {
         self.write_file(path, b"")
+    }
+}
+
+/// The bytes a node was charged: a regular file's materialized blob bytes, nothing for the rest.
+fn node_owned_bytes(node: &Node) -> u64 {
+    match &node.kind {
+        NodeKind::Regular(blob) => blob.owned_bytes(),
+        _ => 0,
     }
 }
 
@@ -1139,8 +1225,22 @@ pub enum FsError {
     NotADirectory,
     /// Symlink resolution exceeded [`MAX_SYMLINK_HOPS`] (`ELOOP`).
     TooManyLinks,
-    /// A write to `/dev/full`.
+    /// A write to `/dev/full`, or one the connection budget has no room for (`ENOSPC`).
     NoSpace,
+    /// One write bigger than the connection's whole content budget (`EFBIG`).
+    FileTooLarge,
+    /// A path or path component over the name limits (`ENAMETOOLONG`).
+    NameTooLong,
+}
+
+impl From<BudgetError> for FsError {
+    fn from(error: BudgetError) -> Self {
+        match error {
+            BudgetError::NoSpace => Self::NoSpace,
+            BudgetError::TooLarge => Self::FileTooLarge,
+            BudgetError::NameTooLong => Self::NameTooLong,
+        }
+    }
 }
 
 /// Binaries present and executable from the start, so `cp /bin/busybox x && ./x` behaves. They sit
@@ -2101,5 +2201,152 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
             "the same file through the link"
         );
         assert_eq!(fs.write_file("/tmp", b"x"), Err(FsError::IsADirectory));
+    }
+
+    fn budgeted(owned_bytes: u64, overlay_nodes: u64) -> (FakeFs, Arc<ConnectionBudget>) {
+        let budget = ConnectionBudget::new(BudgetLimits {
+            owned_bytes,
+            overlay_nodes,
+            ..BudgetLimits::standard()
+        });
+        (FakeFs::new().with_budget(budget.clone()), budget)
+    }
+
+    #[test]
+    fn writes_charge_their_bytes_and_a_new_path_net_of_what_the_path_held() {
+        let (mut fs, budget) = budgeted(100, 10);
+        // The 6-byte path of a new node is charged with its content, once.
+        assert_eq!(fs.write_file("/tmp/a", &[1; 60]), Ok(()));
+        assert_eq!(budget.owned_bytes_used(), 66);
+        // Overwriting swaps 60 for 90, so it needs 30 more, not 90, and no second path.
+        assert_eq!(fs.write_file("/tmp/a", &[2; 90]), Ok(()));
+        assert_eq!(budget.owned_bytes_used(), 96);
+        assert_eq!(fs.write_file("/tmp/a", &[3; 10]), Ok(()));
+        assert_eq!(budget.owned_bytes_used(), 16);
+        // 79 bytes and a 6-byte path would bring the total to 101.
+        assert_eq!(fs.write_file("/tmp/b", &[4; 79]), Err(FsError::NoSpace));
+        assert_eq!(fs.write_file("/tmp/b", &[4; 78]), Ok(()));
+        assert_eq!(budget.owned_bytes_used(), 100, "the cap itself fits");
+        assert_eq!(fs.remove_path("/tmp/b"), Ok(true));
+        assert_eq!(
+            budget.owned_bytes_used(),
+            22,
+            "the tombstone keeps the path"
+        );
+        assert_eq!(fs.write_file("/tmp/c", &[4; 91]), Err(FsError::NoSpace));
+        assert_eq!(
+            fs.write_file("/tmp/c", &[4; 101]),
+            Err(FsError::FileTooLarge)
+        );
+        assert!(!fs.file_exists("/tmp/c"), "a refused write inserts nothing");
+        assert_eq!(budget.owned_bytes_used(), 22);
+        assert_eq!(budget.overlay_nodes_used(), 2);
+    }
+
+    #[test]
+    fn a_refused_node_gives_back_the_bytes_it_had_charged() {
+        let (mut fs, budget) = budgeted(100, 1);
+        assert_eq!(fs.write_file("/tmp/a", &[1; 10]), Ok(()));
+        assert_eq!(fs.write_file("/tmp/b", &[1; 10]), Err(FsError::NoSpace));
+        assert_eq!(
+            budget.owned_bytes_used(),
+            16,
+            "the failed write left no charge behind (10 bytes and a 6-byte path)"
+        );
+        // Overwriting a file that already owns its slot never needs a second one.
+        assert_eq!(fs.write_file("/tmp/a", &[1; 20]), Ok(()));
+    }
+
+    #[test]
+    fn removing_returns_bytes_but_not_slots() {
+        let (mut fs, budget) = budgeted(1_000, 10);
+        fs.make_dir("/tmp/d").unwrap();
+        fs.write_file("/tmp/d/a", &[1; 40]).unwrap();
+        fs.write_file("/tmp/d/b", &[1; 40]).unwrap();
+        fs.write_file("/tmp/c", &[1; 40]).unwrap();
+        assert_eq!(
+            (budget.owned_bytes_used(), budget.overlay_nodes_used()),
+            (148, 4)
+        );
+
+        assert_eq!(fs.remove_path("/tmp/c"), Ok(true));
+        assert_eq!(
+            (budget.owned_bytes_used(), budget.overlay_nodes_used()),
+            (108, 4)
+        );
+        // Removing a directory returns the content created under it; every node's path stays
+        // charged with its slot.
+        assert_eq!(fs.remove_path("/tmp/d"), Ok(true));
+        assert_eq!(
+            (budget.owned_bytes_used(), budget.overlay_nodes_used()),
+            (28, 4)
+        );
+        // A removed path owns its slot, and its path charge, until something is created there
+        // again.
+        fs.make_dir("/tmp/d").unwrap();
+        assert_eq!(
+            (budget.owned_bytes_used(), budget.overlay_nodes_used()),
+            (28, 4)
+        );
+        assert_eq!(fs.remove_path("/nonexistent"), Ok(false));
+        assert_eq!(budget.overlay_nodes_used(), 4);
+    }
+
+    #[test]
+    fn a_baked_path_needs_a_slot_to_be_overwritten_or_removed() {
+        let (mut fs, budget) = budgeted(1_000, 10);
+        fs.write_file("/etc/hostname", b"x\n").unwrap();
+        assert_eq!(budget.overlay_nodes_used(), 1);
+        fs.remove_path("/etc/passwd").unwrap();
+        assert_eq!(budget.overlay_nodes_used(), 2);
+    }
+
+    #[test]
+    fn names_over_the_limits_are_refused_by_every_writer() {
+        let (mut fs, budget) = budgeted(1_000, 10);
+        let long = format!("/tmp/{}", "a".repeat(256));
+        assert_eq!(fs.write_file(&long, b"x"), Err(FsError::NameTooLong));
+        assert_eq!(fs.create_file(&long), Err(FsError::NameTooLong));
+        assert_eq!(fs.make_dir(&long), Err(FsError::NameTooLong));
+        assert_eq!(
+            fs.write_blob(&long, Blob::from_bytes(b"x".to_vec()), MODE_FILE),
+            Err(FsError::NameTooLong)
+        );
+        assert_eq!(
+            (budget.owned_bytes_used(), budget.overlay_nodes_used()),
+            (0, 0)
+        );
+        assert_eq!(
+            fs.write_file(&format!("/tmp/{}", "a".repeat(255)), b"x"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn synthetic_blobs_cost_no_content_but_do_cost_a_path_and_a_node() {
+        let (mut fs, budget) = budgeted(10, 10);
+        let huge = Blob::fill(0, 1 << 40);
+        assert_eq!(fs.write_blob("/tmp/z", huge, MODE_FILE), Ok(()));
+        assert_eq!(budget.owned_bytes_used(), 6, "the 6-byte path only");
+        assert_eq!(budget.overlay_nodes_used(), 1);
+        assert_eq!(fs.remove_path("/tmp/z"), Ok(true));
+        assert_eq!(budget.owned_bytes_used(), 6);
+    }
+
+    #[test]
+    fn two_filesystems_on_one_budget_draw_on_the_same_allowance() {
+        let budget = ConnectionBudget::new(BudgetLimits {
+            owned_bytes: 100,
+            ..BudgetLimits::standard()
+        });
+        let mut a = FakeFs::new().with_budget(budget.clone());
+        let mut b = FakeFs::android().with_budget(budget);
+        assert_eq!(a.write_file("/tmp/a", &[1; 70]), Ok(()));
+        // 76 used; the 17-byte path leaves room for 7 bytes of content.
+        assert_eq!(
+            b.write_file("/data/local/tmp/b", &[1; 8]),
+            Err(FsError::NoSpace)
+        );
+        assert_eq!(b.write_file("/data/local/tmp/b", &[1; 7]), Ok(()));
     }
 }

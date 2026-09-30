@@ -158,6 +158,109 @@ async fn ssh_handshake_and_session_with_real_client() {
     );
 }
 
+/// Read one shell reply: bytes until one ends in a prompt, or the connection ends.
+async fn read_reply(channel: &mut russh::Channel<russh::client::Msg>) -> (usize, bool) {
+    let mut total = 0;
+    let mut tail: Vec<u8> = Vec::new();
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), channel.wait())
+            .await
+            .expect("timed out waiting for the reply");
+        match message {
+            Some(russh::ChannelMsg::Data { data }) => {
+                total += data.len();
+                tail.extend_from_slice(&data);
+                tail.drain(..tail.len().saturating_sub(2));
+                if tail == b"# " {
+                    return (total, false);
+                }
+            }
+            Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) | None => {
+                return (total, true);
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_connection_that_has_spent_its_egress_allowance_is_dropped_after_that_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        wan_resolver,
+        test_bounds(),
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(config, addr, TestHandler)
+        .await
+        .unwrap();
+    assert!(
+        session
+            .authenticate_password("root", "password")
+            .await
+            .unwrap()
+            .success()
+    );
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel
+        .request_pty(false, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .unwrap();
+    channel.request_shell(false).await.unwrap();
+    let (_, closed) = read_reply(&mut channel).await;
+    assert!(!closed, "the shell opens with a prompt");
+
+    // A 24 KB file, so a short `cat` answers with a packet that fits the client's limit and the
+    // client sends little enough to stay inside the window this server never adjusts. Each reply
+    // is about 24 KB on the wire (echoed keystrokes, output with CR-LF, prompt), so the 16 MiB
+    // allowance runs out near the 699th. The reply that spends it arrives whole, prompt included,
+    // and nothing follows it.
+    let mut wire = 0;
+    for _ in 0..3 {
+        let append = format!("echo {} >> /tmp/f\n", "a".repeat(8000));
+        channel.data(append.as_bytes()).await.unwrap();
+        let (bytes, closed) = read_reply(&mut channel).await;
+        assert!(!closed);
+        wire += bytes;
+    }
+    let mut answered = 0;
+    loop {
+        assert!(answered < 900, "the connection was never dropped");
+        if channel.data(&b"cat /tmp/f\n"[..]).await.is_err() {
+            break;
+        }
+        let (bytes, closed) = read_reply(&mut channel).await;
+        wire += bytes;
+        if closed {
+            break;
+        }
+        answered += 1;
+    }
+    assert!(
+        (650..=750).contains(&answered),
+        "answered {answered} lines before the drop"
+    );
+    assert!(
+        wire >= 16 << 20,
+        "dropped before the allowance was spent: {wire}"
+    );
+
+    drop(channel);
+    drop(session);
+    handle.abort();
+}
+
 #[tokio::test]
 async fn exec_request_uses_noninteractive_bash_identity() {
     let dir = tempfile::tempdir().unwrap();

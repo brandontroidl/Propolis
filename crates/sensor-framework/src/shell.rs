@@ -29,12 +29,14 @@
 //! or ANSI escape.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_FILE_DOWNLOAD, SensorEvent,
     WIRE_VERSION,
 };
 
+use crate::budget::{ConnectionBudget, Resource};
 use crate::command_codec::CommandCodec;
 use crate::fakefs::{Blob, FakeFs, FsError, READ_CAP};
 use crate::persona;
@@ -248,12 +250,13 @@ pub fn onlcr(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Per-session ceiling on `honeypot_command_exec` events. A real interactive attacker runs a
-/// bounded kill chain (tens of commands); an unbounded stream is a flood - one IP produced >20k
-/// command events by streaming binary over the channel. Past this, the shell keeps responding but
-/// stops appending per-line events (one marker is emitted at the boundary), so a single session
-/// cannot pollute the append-only ledger without bound.
-const MAX_COMMANDS_PER_SESSION: u64 = 256;
+/// Default ceiling on `honeypot_command_exec` events, the value of `BudgetLimits::command_events`.
+/// A real interactive attacker runs a bounded kill chain (tens of commands); an unbounded stream is
+/// a flood - one IP produced >20k command events by streaming binary over the channel. Past this,
+/// the shell keeps responding but stops appending per-line events (one marker is emitted at the
+/// boundary), so a single session cannot pollute the append-only ledger without bound. The count is
+/// per connection, shared by every shell on it, through the connection budget.
+pub(crate) const MAX_COMMANDS_PER_SESSION: u64 = 256;
 
 /// The fake shell. One instance per interactive session or exec request; filesystem, working
 /// directory, codec and nested shell levels persist across input lines.
@@ -263,13 +266,8 @@ pub struct FakeShell {
     cwd: String,
     /// Per-session de-obfuscation for XOR-encoded command probes (see `command_codec`).
     codec: CommandCodec,
-    /// Count of input lines this session (whether or not each produced an event); drives the flood
-    /// cap.
-    command_count: u64,
     /// Whether the one-per-session binary-flood marker has been emitted.
     binary_flagged: bool,
-    /// Whether the one-per-session command-cap marker has been emitted.
-    cap_flagged: bool,
     /// Which host persona this session presents. Active shell levels decide diagnostics and
     /// prompts; the flavor keeps `uname` aligned with the filesystem snapshot.
     flavor: ShellFlavor,
@@ -282,6 +280,13 @@ pub struct FakeShell {
     /// Commands open at this moment, outermost first. A re-entrant dispatch pushes; closing pops
     /// and attaches to the parent's `reentry` or, for the outermost, to the current segment.
     trace_stack: Vec<CommandTrace>,
+    /// Steps and bytes the current line may still spend. Reset once per line, never on re-entry,
+    /// so a chain of nested dispatches shares one allowance.
+    work_left: u64,
+    /// Whether the line has spent it; the line stops at the next checkpoint.
+    work_exhausted: bool,
+    /// Depth of re-entrant dispatch right now.
+    depth: u32,
 }
 
 /// How the outermost shell was entered. Login shells read Ubuntu's interactive startup files;
@@ -347,6 +352,7 @@ impl FakeShell {
             ShellContext::ExecC => ShellLevel::Bash { login: false },
             ShellContext::AndroidMksh => ShellLevel::AndroidMksh,
         };
+        let work_left = fs.budget().limits().work_per_line;
         Self {
             fs,
             ctx,
@@ -355,9 +361,7 @@ impl FakeShell {
                 ShellFlavor::AndroidSh => "/".to_string(),
             },
             codec: CommandCodec::new(),
-            command_count: 0,
             binary_flagged: false,
-            cap_flagged: false,
             flavor,
             context,
             levels: vec![level],
@@ -365,6 +369,9 @@ impl FakeShell {
             clock: chrono::Utc::now,
             trace: LineTrace::default(),
             trace_stack: Vec::new(),
+            work_left,
+            work_exhausted: false,
+            depth: 0,
         }
     }
 
@@ -378,6 +385,20 @@ impl FakeShell {
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// The same shell and its filesystem charging `budget`, the one budget of their connection,
+    /// instead of the standard-limits budget a shell starts with. Every shell of a connection takes
+    /// a clone of the same `Arc`.
+    pub fn with_budget(mut self, budget: Arc<ConnectionBudget>) -> Self {
+        self.work_left = budget.limits().work_per_line;
+        self.fs = self.fs.with_budget(budget);
+        self
+    }
+
+    /// The budget this shell charges: its filesystem's, so the two can never disagree.
+    fn budget(&self) -> &ConnectionBudget {
+        self.fs.budget()
     }
 
     /// The working directory, for the prompt a sensor prints between commands.
@@ -479,6 +500,8 @@ impl FakeShell {
         }
         self.trace = LineTrace::default();
         self.trace_stack.clear();
+        self.work_left = self.budget().limits().work_per_line;
+        self.work_exhausted = false;
         self.advance_shell_line();
 
         // Decode a single-byte-XOR-obfuscated probe (identity for plaintext). The event records a
@@ -487,7 +510,9 @@ impl FakeShell {
         // annotated alongside so the grammar can respond and an analyst can read it. Dispatch and
         // URL capture run on the decoded line.
         let (decoded, key) = self.codec.decode(&raw);
-        self.command_count += 1;
+        // Every non-blank line counts, whether or not it produces an event, so a binary flood
+        // spends the same allowance a command flood does.
+        let command_allowed = self.budget().command_event_allowed();
         self.trace.decoded = decoded.to_string();
         self.trace.xor_key = key;
 
@@ -509,15 +534,16 @@ impl FakeShell {
                     "flood": "binary",
                 }))]
             }
-        } else if self.command_count > MAX_COMMANDS_PER_SESSION {
-            if std::mem::replace(&mut self.cap_flagged, true) {
+        } else if !command_allowed {
+            if !self.budget().claim_command_cap_marker() {
                 Vec::new()
             } else {
                 self.trace.events.push(TraceEventKind::FloodCommandCap);
+                let cap = self.budget().limits().command_events;
                 vec![self.command_event(serde_json::json!({
                     "protocol_label": self.ctx.protocol_label,
                     "command": format!(
-                        "<per-session command cap of {MAX_COMMANDS_PER_SESSION} reached; further commands suppressed>"
+                        "<per-session command cap of {cap} reached; further commands suppressed>"
                     ),
                     "flood": "command_cap",
                 }))]
@@ -540,7 +566,24 @@ impl FakeShell {
             }
             let mut evs = vec![self.command_event(metadata)];
             self.trace.events.push(TraceEventKind::CommandExec);
+            // Scanning the line for fetch targets is linear in its length.
+            self.charge_work(len_u64(decoded.len()));
+            let per_line_cap = self.budget().limits().download_per_line;
+            let mut recorded_this_line: u64 = 0;
+            let mut download_capped = false;
             for url in download_targets(&decoded) {
+                // The per-line cap is tested first so a URL refused by it spends none of the
+                // connection's allowance.
+                if recorded_this_line >= per_line_cap {
+                    self.record_hit(BudgetHit::DownloadPerLine);
+                    download_capped = true;
+                    break;
+                }
+                if !self.budget().download_allowed() {
+                    download_capped = true;
+                    break;
+                }
+                recorded_this_line = recorded_this_line.saturating_add(1);
                 self.trace.events.push(TraceEventKind::FileDownload);
                 let sanitized_url = sanitize_value(&url, MAX_URL_LEN);
                 evs.push(SensorEvent {
@@ -561,6 +604,14 @@ impl FakeShell {
                     occurrence_id: None,
                 });
             }
+            if download_capped && self.budget().claim_download_cap_marker() {
+                self.trace.events.push(TraceEventKind::FloodDownloadCap);
+                evs.push(self.command_event(serde_json::json!({
+                    "protocol_label": self.ctx.protocol_label,
+                    "command": "<download cap reached; further download events suppressed>",
+                    "flood": "download_cap",
+                })));
+            }
             evs
         };
 
@@ -580,6 +631,10 @@ impl FakeShell {
     fn run_line(&mut self, decoded: &str) -> CommandResult {
         let mut result = CommandResult::silent(0);
         for (op, segment) in control_segments(decoded) {
+            if !self.charge_work(1) {
+                result.stop_line = true;
+                break;
+            }
             let run = match op {
                 ControlOp::Seq => true,
                 ControlOp::And => result.status == 0,
@@ -696,7 +751,13 @@ impl FakeShell {
         }
 
         // An empty argv (a redirection-only command) dispatches to a silent success.
-        let result = self.dispatch(argv);
+        let mut result = self.dispatch(argv);
+        // Charged here, once per command and before output is routed, so bytes a redirection sends
+        // to a file cost the line as much as bytes sent to the terminal, and a re-entrant command's
+        // output is not counted twice.
+        if !self.charge_work(len_u64(result.bytes().len())) {
+            result.stop_line = true;
+        }
         if redirs.is_empty() {
             return result;
         }
@@ -721,7 +782,9 @@ impl FakeShell {
         }
 
         // The target was truncated or preserved at open, so `>` and `>>` both continue from the
-        // file's current content.
+        // file's current content. Only a budget refusal is reported: the target opened, so any
+        // other refusal cannot happen here.
+        let mut write_refusal = None;
         for (path, append, bytes) in writes {
             let mut content = if append {
                 self.fs.read_all(&path, READ_CAP).unwrap_or_default()
@@ -729,12 +792,23 @@ impl FakeShell {
                 Vec::new()
             };
             content.extend_from_slice(&bytes);
-            let _ = self.traced_write_file(&path, &content);
+            if let Err(error) = self.traced_write_file(&path, &content) {
+                write_refusal = write_refusal.or_else(|| budget_refusal_text(&error));
+            }
         }
 
         let mut terminal = CommandResult::silent(result.status);
         for seg in kept {
             terminal.append(CommandResult::one(seg.fd, result.status, seg.bytes));
+        }
+        if let Some(reason) = write_refusal {
+            // [unverified] wording: the `write error` form is what a command prints when a write
+            // to its redirected stdout fails; no capture of the sensor's exact commands exists.
+            let command = argv.first().map_or("sh", |arg| command_basename(arg));
+            terminal.append(CommandResult::stderr(
+                1,
+                format!("{command}: write error: {reason}\n"),
+            ));
         }
         terminal.close_session = result.close_session;
         terminal.stop_line = result.stop_line;
@@ -746,8 +820,7 @@ impl FakeShell {
         let reason = match error {
             FsError::ReadOnly => "Read-only file system",
             FsError::IsADirectory => "Is a directory",
-            FsError::NoSpace => "No space left on device",
-            _ => "No such file or directory",
+            other => budget_refusal_text(other).unwrap_or("No such file or directory"),
         };
         CommandResult::stderr(1, self.shell_error(format_args!("{resolved}: {reason}")))
     }
@@ -820,6 +893,12 @@ impl FakeShell {
     /// Every arm returns a static or lightly-interpolated string; none evaluates, spawns, or
     /// otherwise interprets `parts` as code - see the module doc.
     fn dispatch(&mut self, parts: &[&str]) -> CommandResult {
+        // One step per entry, so a chain of nested dispatches spends the line's allowance.
+        if !self.charge_work(1) {
+            let mut stopped = CommandResult::silent(0);
+            stopped.stop_line = true;
+            return stopped;
+        }
         match self.resolve_handler(parts) {
             HandlerId::Uname => CommandResult::stdout(cmd_uname(parts, self.flavor)),
             HandlerId::Id => CommandResult::stdout(
@@ -847,17 +926,33 @@ impl FakeShell {
             HandlerId::Wget => {
                 let writes_stdout = matches!(wget_output(parts), WgetOutput::Stdout);
                 let out = cmd_wget(parts, (self.clock)());
-                self.save_fetched_file("wget", parts);
-                if writes_stdout {
+                let refused = self.save_fetched_file("wget", parts);
+                let mut result = if writes_stdout {
                     CommandResult::stdout(out)
                 } else {
                     CommandResult::one(OutputFd::Stderr, 0, out.into_bytes())
+                };
+                if let Some((name, reason)) = refused {
+                    // [unverified] wording, from GNU wget's write-failure line.
+                    result.append(CommandResult::stderr(
+                        1,
+                        format!("Cannot write to '{name}' ({reason}).\n"),
+                    ));
                 }
+                result
             }
             HandlerId::Curl => {
                 let out = cmd_curl(parts);
-                self.save_fetched_file("curl", parts);
-                CommandResult::stdout(out)
+                let refused = self.save_fetched_file("curl", parts);
+                let mut result = CommandResult::stdout(out);
+                if refused.is_some() {
+                    // curl's exit code 23 and message for a failed write to the output file.
+                    result.append(CommandResult::stderr(
+                        23,
+                        "curl: (23) Failure writing output to destination\n",
+                    ));
+                }
+                result
             }
             HandlerId::Ping => CommandResult::stdout(cmd_ping(parts)),
             // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
@@ -872,8 +967,15 @@ impl FakeShell {
             // non-interactive fetch prints nothing on success) rather than "command not found". The
             // target URL is captured by `download_target` above.
             HandlerId::Fetcher => {
-                self.save_fetched_file(command_basename(parts[0]), parts);
-                CommandResult::silent(0)
+                let command = command_basename(parts[0]);
+                match self.save_fetched_file(command, parts) {
+                    // [unverified] wording, in BusyBox's `can't open` style.
+                    Some((name, reason)) => CommandResult::stderr(
+                        1,
+                        format!("{command}: can't open '{name}': {reason}\n"),
+                    ),
+                    None => CommandResult::silent(0),
+                }
             }
             // Filesystem/no-output applets in a loader's drop chain (`chmod +x x`, then `cp`/`rm`/
             // `mkdir`/`sleep`). A real shell prints nothing on success, and "command not found" for
@@ -974,12 +1076,52 @@ impl FakeShell {
 
     /// Dispatch a command re-entrantly (a busybox applet, `sh -c`) and record it under the
     /// command that caused it.
+    ///
+    /// Every re-entrant path goes through here, so this is where the depth cap holds. A refusal
+    /// is a silent success: no real loader nests this deep, the cap is a stack and DoS guard, and
+    /// a novel error string would itself be a fingerprint. The trace shows it fired.
     fn dispatch_nested(&mut self, parts: &[&str]) -> CommandResult {
+        let max_depth = self.budget().limits().max_depth;
+        if self.depth >= max_depth {
+            self.record_hit(BudgetHit::Depth);
+            self.note_depth();
+            return CommandResult::silent(0);
+        }
+        self.depth = self.depth.saturating_add(1);
+        self.note_depth();
         let resolved = self.resolve_handler(parts);
         self.trace_open(parts, ParseNode::Simple, resolved);
         let result = self.dispatch(parts);
         self.trace_close(result.status);
+        self.depth = self.depth.saturating_sub(1);
         result
+    }
+
+    fn note_depth(&mut self) {
+        let reached = self.trace.budget.max_depth_reached.max(self.depth);
+        self.trace.budget.max_depth_reached = reached;
+    }
+
+    /// Spend `n` steps or bytes of the line's allowance. False once it is spent, and from then on:
+    /// the caller stops the line. The allowance is shared by every nested dispatch of the line.
+    fn charge_work(&mut self, n: u64) -> bool {
+        self.trace.budget.work_charged = self.trace.budget.work_charged.saturating_add(n);
+        if self.work_exhausted {
+            return false;
+        }
+        if n > self.work_left {
+            self.work_left = 0;
+            self.work_exhausted = true;
+            self.record_hit(BudgetHit::Work);
+            return false;
+        }
+        self.work_left = self.work_left.saturating_sub(n);
+        true
+    }
+
+    /// Note the first cap this line ran into.
+    fn record_hit(&mut self, hit: BudgetHit) {
+        self.trace.budget.hit.get_or_insert(hit);
     }
 
     fn trace_open(&mut self, tokens: &[&str], node: ParseNode, resolved: HandlerId) {
@@ -1011,6 +1153,11 @@ impl FakeShell {
     }
 
     fn trace_denied(&mut self, path: &str, error: &FsError) {
+        match self.budget().take_refusal() {
+            Some(Resource::OwnedBytes) => self.record_hit(BudgetHit::OwnedBytes),
+            Some(Resource::Nodes) => self.record_hit(BudgetHit::Nodes),
+            None => {}
+        }
         self.trace_fs(FsEffect::Denied {
             path: path.to_string(),
             why: FsDenied::from(error),
@@ -1090,7 +1237,7 @@ impl FakeShell {
     /// Resolve `arg` to an absolute logical path: joined onto `cwd` unless it starts with `/`, then
     /// normalised lexically. Symlinks stay unresolved here, so `cd /var/run` leaves `pwd` at
     /// `/var/run` as bash's logical mode does; [`FakeFs`] resolves them physically per operation.
-    fn resolve_logical(&self, arg: &str) -> String {
+    fn resolve_logical(&mut self, arg: &str) -> String {
         let joined = if arg.starts_with('/') {
             arg.to_string()
         } else {
@@ -1109,20 +1256,30 @@ impl FakeShell {
                 name => segments.push(name),
             }
         }
-        if segments.is_empty() {
+        let resolved = if segments.is_empty() {
             "/".to_string()
         } else {
             format!("/{}", segments.join("/"))
-        }
+        };
+        // The result is already built and its size is bounded by the line; an exhausted allowance
+        // is noted here and stops the line at the next checkpoint.
+        self.charge_work(len_u64(segments.len()));
+        resolved
     }
 
     /// Record the file a fetch command saved, with the body this shell claims to have fetched,
     /// so the `chmod +x` and `./payload` a loader runs next find something there. A fetch that
     /// printed to stdout saves nothing, as the real command does not.
-    fn save_fetched_file(&mut self, cmd: &str, parts: &[&str]) {
-        if let Some(name) = download_save_name(cmd, parts) {
-            let path = self.resolve_logical(&name);
-            let _ = self.traced_write_file(&path, FETCHED_BODY.as_bytes());
+    ///
+    /// A save the budget refuses returns the sanitized name and the kernel's reason so the command
+    /// can say so. Any other refusal stays silent, as it always has.
+    fn save_fetched_file(&mut self, cmd: &str, parts: &[&str]) -> Option<(String, &'static str)> {
+        let name = download_save_name(cmd, parts)?;
+        let path = self.resolve_logical(&name);
+        match self.traced_write_file(&path, FETCHED_BODY.as_bytes()) {
+            Ok(()) => None,
+            Err(error) => budget_refusal_text(&error)
+                .map(|reason| (sanitize_value(&name, MAX_URL_LEN), reason)),
         }
     }
 
@@ -1197,10 +1354,11 @@ impl FakeShell {
                     format!("cp: cannot create regular file '{dst}': Read-only file system\n"),
                 );
             }
-            Err(_) => {
+            Err(error) => {
+                let reason = budget_refusal_text(&error).unwrap_or("No such file or directory");
                 return CommandResult::stderr(
                     1,
-                    format!("cp: cannot create regular file '{dst}': No such file or directory\n"),
+                    format!("cp: cannot create regular file '{dst}': {reason}\n"),
                 );
             }
         }
@@ -1276,12 +1434,26 @@ impl FakeShell {
                 Err(FsError::ReadOnly) => out.push_str(&format!(
                     "mkdir: cannot create directory '{target}': Read-only file system\n"
                 )),
+                Err(error) if budget_refusal_text(&error).is_some() => {
+                    let reason = budget_refusal_text(&error).unwrap_or_default();
+                    out.push_str(&format!(
+                        "mkdir: cannot create directory '{target}': {reason}\n"
+                    ));
+                }
                 Err(_) if parents => {
                     let mut built = String::new();
                     for segment in path.trim_start_matches('/').split('/') {
                         built.push('/');
                         built.push_str(segment);
-                        let _ = self.traced_make_dir(&built);
+                        // An existing parent is expected; a refusal of room or name is not.
+                        if let Err(error) = self.traced_make_dir(&built)
+                            && let Some(reason) = budget_refusal_text(&error)
+                        {
+                            out.push_str(&format!(
+                                "mkdir: cannot create directory '{target}': {reason}\n"
+                            ));
+                            break;
+                        }
                     }
                 }
                 Err(FsError::Exists) => out.push_str(&format!(
@@ -1299,7 +1471,7 @@ impl FakeShell {
         }
     }
 
-    fn cmd_cat(&self, parts: &[&str]) -> CommandResult {
+    fn cmd_cat(&mut self, parts: &[&str]) -> CommandResult {
         match first_non_flag_arg(&parts[1..]) {
             Some(path) => {
                 let resolved = self.resolve_logical(path);
@@ -1327,12 +1499,14 @@ impl FakeShell {
         }
     }
 
-    fn cmd_ls(&self, parts: &[&str]) -> CommandResult {
-        let target = first_non_flag_arg(&parts[1..]).unwrap_or(self.cwd.as_str());
+    fn cmd_ls(&mut self, parts: &[&str]) -> CommandResult {
+        let cwd = self.cwd.clone();
+        let target = first_non_flag_arg(&parts[1..]).unwrap_or(cwd.as_str());
         let show_hidden = parts[1..]
             .iter()
             .any(|a| a.starts_with('-') && (a.contains('a') || a.contains('A')));
-        match self.fs.list_dir(&self.resolve_logical(target)) {
+        let listed = self.resolve_logical(target);
+        match self.fs.list_dir(&listed) {
             Some(mut entries) => {
                 // A real `ls` hides dotfiles without `-a` and sorts what it prints. Listing the
                 // `.x` probe files a loader had just dropped was a tell on both counts.
@@ -1390,7 +1564,7 @@ impl FakeShell {
     /// open error with 127, the dash family dash's with 2. The spawned shell reports at its own
     /// line 0 whatever the caller's line counter says, and pushes no persistent level, like
     /// `sh -c`.
-    fn run_sh_file(&self, shell_name: &str, file: &str) -> CommandResult {
+    fn run_sh_file(&mut self, shell_name: &str, file: &str) -> CommandResult {
         let path = self.resolve_logical(file);
         match self.fs.read_all(&path, READ_CAP) {
             Ok(bytes) => {
@@ -1429,6 +1603,21 @@ impl FakeShell {
             Some(applet) => CommandResult::stderr(127, format!("{applet}: applet not found\n")),
         }
     }
+}
+
+/// The kernel's wording for the refusals a budget or name limit produces, or `None` for any other
+/// error.
+fn budget_refusal_text(error: &FsError) -> Option<&'static str> {
+    match error {
+        FsError::NoSpace => Some("No space left on device"),
+        FsError::FileTooLarge => Some("File too large"),
+        FsError::NameTooLong => Some("File name too long"),
+        _ => None,
+    }
+}
+
+fn len_u64(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 /// Ubuntu 22.04's interactive command-not-found handler for the names most often used to escape
@@ -2513,6 +2702,11 @@ fn decode_echo_escapes_into(s: &str, out: &mut String) -> bool {
     }
     false
 }
+
+// Declared with the test modules, after all production code: `trace_type_never_feeds_wire_output`
+// reads shell.rs up to its first `#[cfg(test)]` as the production source.
+#[cfg(test)]
+mod budget_tests;
 
 #[cfg(test)]
 mod echo_tests {

@@ -34,7 +34,8 @@ use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell};
 use sensor_framework::upload_metadata;
 use sensor_framework::{
-    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
+    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget, EgressState,
+    EventEmitter, Uuid, WanResolver, limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
@@ -558,6 +559,9 @@ pub async fn handle_connection(
 
     let session_end = SessionEnd::new();
     let max_captured_bytes = bounds.max_captured_bytes;
+    // The connection's one budget, cloned into every stream's shell so the streams share a ceiling
+    // instead of each holding a full one.
+    let budget = ConnectionBudget::new(limits_from(&bounds));
     let mut reader = MessageReader::new(bounds, session_end.clone());
 
     // ---- CNXN handshake ----
@@ -603,6 +607,7 @@ pub async fn handle_connection(
                     peer_addr,
                     &session_end,
                     max_captured_bytes,
+                    &budget,
                 )
                 .await
                 .is_err()
@@ -622,6 +627,7 @@ pub async fn handle_connection(
                     &emitter,
                     &handoff,
                     peer_addr,
+                    &budget,
                 )
                 .await
                 .is_err()
@@ -682,6 +688,7 @@ async fn handle_open(
     peer_addr: SocketAddr,
     session_end: &SessionEnd,
     max_captured_bytes: u64,
+    budget: &Arc<ConnectionBudget>,
 ) -> Result<(), ()> {
     let client_local_id = header.arg0;
     if client_local_id == 0 {
@@ -714,7 +721,7 @@ async fn handle_open(
             };
             // The Android device this sensor announces, not the Linux server the other sensors
             // present: a Nexus 5 banner followed by an Ubuntu bash was a one-command tell.
-            let mut shell = FakeShell::android(FakeFs::android(), ctx);
+            let mut shell = FakeShell::android(FakeFs::android(), ctx).with_budget(budget.clone());
 
             write_or_err(stream, &adb_proto::build_okay(server_id, client_local_id)).await?;
 
@@ -730,9 +737,12 @@ async fn handle_open(
                         }
                     }
                     if !output.is_empty() {
-                        write_or_err(
+                        write_shell_wrte(
                             stream,
-                            &adb_proto::build_wrte(server_id, client_local_id, output.bytes()),
+                            budget,
+                            server_id,
+                            client_local_id,
+                            output.bytes(),
                         )
                         .await?;
                     }
@@ -802,6 +812,7 @@ async fn handle_open(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_wrte(
     stream: &mut TcpStream,
     header: &Header,
@@ -810,6 +821,7 @@ async fn handle_wrte(
     emitter: &Arc<EventEmitter>,
     handoff: &Arc<CaptureHandoff>,
     peer_addr: SocketAddr,
+    budget: &Arc<ConnectionBudget>,
 ) -> Result<(), ()> {
     // Routing: arg1 is the recipient's (our) id for the stream - see the module doc's
     // local-id/remote-id convention.
@@ -875,11 +887,7 @@ async fn handle_wrte(
             }
             write_or_err(stream, &adb_proto::build_okay(server_id, client_local_id)).await?;
             if !responses.is_empty() {
-                write_or_err(
-                    stream,
-                    &adb_proto::build_wrte(server_id, client_local_id, &responses),
-                )
-                .await?;
+                write_shell_wrte(stream, budget, server_id, client_local_id, &responses).await?;
             }
             if close_shell {
                 if let Some(mut closed) = streams.remove(&server_id)
@@ -913,6 +921,27 @@ async fn handle_wrte(
 
 async fn write_or_err(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), ()> {
     stream.write_all(bytes).await.map_err(|_| ())
+}
+
+/// Write shell output as a WRTE and charge its payload to the connection's egress budget. `Err`
+/// once that budget is spent, after the write: the caller's `Err` ends the whole connection, so
+/// what follows a spent budget is a dropped connection, never a reply cut short.
+async fn write_shell_wrte(
+    stream: &mut TcpStream,
+    budget: &ConnectionBudget,
+    server_id: u32,
+    client_local_id: u32,
+    payload: &[u8],
+) -> Result<(), ()> {
+    write_or_err(
+        stream,
+        &adb_proto::build_wrte(server_id, client_local_id, payload),
+    )
+    .await?;
+    match budget.charge_egress(payload.len() as u64) {
+        EgressState::Ok => Ok(()),
+        EgressState::Spent => Err(()),
+    }
 }
 
 #[cfg(test)]

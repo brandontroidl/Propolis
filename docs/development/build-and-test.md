@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 1726 test functions** (996 unit + 730 integration).
+- **Total: 1767 test functions** (1030 unit + 737 integration).
 - **DB-backed (`sqlx::test`): 202** - console 159, core-scoring 25, intake 7,
   fleet 6, propolis 4, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -128,19 +128,19 @@ Per-crate breakdown:
 | propolis | 100 | 20 | capture_to_console, docs_agreement, restore_rehearsal, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 4 | provision |
 | review | 116 | 71 | cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
-| sensor-adb | 53 | 21 | integration |
+| sensor-adb | 53 | 23 | integration |
 | sensor-catchall | 18 | 6 | integration |
 | sensor-cred | 14 | 8 | integration |
-| sensor-framework | 207 | 49 | build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
+| sensor-framework | 241 | 52 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
 | sensor-ftp | 7 | 14 | integration |
 | sensor-http | 8 | 16 | integration |
 | sensor-redis | 79 | 18 | integration |
 | sensor-smtp | 6 | 18 | integration |
-| sensor-ssh | 48 | 93 | auth_test, crypto_test, integration, shell_test, transport_test |
-| sensor-telnet | 39 | 19 | integration |
+| sensor-ssh | 48 | 94 | auth_test, crypto_test, integration, shell_test, transport_test |
+| sensor-telnet | 39 | 20 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **996** | **730** | |
+| **Total** | **1030** | **737** | |
 
 ### Test styles by layer
 

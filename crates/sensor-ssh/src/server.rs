@@ -18,8 +18,8 @@ use tokio::task::JoinHandle;
 
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
 use sensor_framework::{
-    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, OutboxManifest,
-    QuarantineSpool, WanResolver,
+    BudgetLimits, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget,
+    EgressState, EventEmitter, OutboxManifest, QuarantineSpool, WanResolver, limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
@@ -135,6 +135,9 @@ pub async fn serve(
     // much narrower ceiling than SCP/SFTP's own 10 MB per-file cap (see `transfer.rs` and
     // `timeout_stream.rs`'s module doc for why the two are not the same budget).
     let max_captured_bytes = bounds.max_captured_bytes;
+    // Each connection builds its own budget from these limits: one ceiling for every shell and exec
+    // channel it opens.
+    let budget_limits = limits_from(&bounds);
     let (bound_addr, handle) =
         run_tcp_listener(addr, bounds, move |stream, peer_addr, session_id| {
             let host_key = host_key.clone();
@@ -157,6 +160,7 @@ pub async fn serve(
                     wan_resolver,
                     banner,
                     max_captured_bytes,
+                    budget_limits,
                 )
                 .await
                 {
@@ -182,6 +186,7 @@ async fn handle_session(
     wan_resolver: Arc<WanResolver>,
     banner: Arc<String>,
     max_captured_bytes: u64,
+    budget_limits: BudgetLimits,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ---- Phase 1: version exchange ----
     let (client_version, server_version) =
@@ -241,6 +246,8 @@ async fn handle_session(
     let local_addr = stream.get_ref().local_addr().map(normalize_dual_stack).ok();
     let wan_ip = local_addr.and_then(|la| wan_resolver.resolve(la.ip()));
     let mut auth_state = AuthState::new(source_ip, wan_ip, session_id);
+    // The one budget of this connection, cloned into every shell it opens.
+    let budget = ConnectionBudget::new(budget_limits);
 
     // Emit honeypot_connection (authenticated=false, pre-auth).
     let conn_event = auth_state.emit_connection_event();
@@ -360,7 +367,7 @@ async fn handle_session(
                             protocol_label: "ssh".to_string(),
                             session_id: Some(session_id),
                         };
-                        let shell = FakeShell::new(FakeFs::new(), ctx);
+                        let shell = FakeShell::new(FakeFs::new(), ctx).with_budget(budget.clone());
                         let prompt = shell.prompt();
                         handler = ChannelHandler::Shell(Box::new(shell), Vec::new());
                         let data_pkt = build_channel_data(ch_id, prompt.as_bytes());
@@ -376,7 +383,8 @@ async fn handle_session(
                             protocol_label: "ssh".to_string(),
                             session_id: Some(session_id),
                         };
-                        let mut shell = FakeShell::exec(FakeFs::new(), shell_ctx);
+                        let mut shell =
+                            FakeShell::exec(FakeFs::new(), shell_ctx).with_budget(budget.clone());
                         let (output, events) = shell.handle_input(&cmd);
                         for event in &events {
                             emitter.append(event).await?;
@@ -401,6 +409,13 @@ async fn handle_session(
                                     &data_pkt,
                                 )
                                 .await?;
+                                // The reply is out; a connection with no egress left ends here.
+                                if budget.charge_egress(output.bytes().len() as u64)
+                                    == EgressState::Spent
+                                {
+                                    shell_capture.mark_session_end(CaptureEnd::TransportError);
+                                    break 'packet_loop;
+                                }
                             }
                         }
                     }
@@ -524,13 +539,22 @@ async fn handle_session(
                                 _ => prev_cr = false,
                             }
                         }
+                        let mut egress_spent = false;
                         if !responses.is_empty() {
                             let data_pkt = build_channel_data(ch_id, &responses);
                             write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &data_pkt)
                                 .await?;
+                            // Charged as written: echo, ONLCR'd output and prompt together.
+                            egress_spent = budget.charge_egress(responses.len() as u64)
+                                == EgressState::Spent;
                         }
                         if close_shell {
                             shell_capture.mark_session_end(CaptureEnd::ClientLogout);
+                            break 'packet_loop;
+                        }
+                        if egress_spent {
+                            // The reply was sent whole, prompt included; nothing follows it.
+                            shell_capture.mark_session_end(CaptureEnd::TransportError);
                             break 'packet_loop;
                         }
                     }

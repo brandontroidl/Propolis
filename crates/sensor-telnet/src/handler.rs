@@ -16,8 +16,8 @@ use sensor_framework::persona;
 use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell, onlcr};
 use sensor_framework::{
-    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
-    upload_metadata,
+    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget, EgressState,
+    EventEmitter, Uuid, WanResolver, limits_from, upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
@@ -100,6 +100,8 @@ pub async fn handle_connection(
         return;
     }
 
+    // Built before `bounds` moves into the reader: the connection's one budget.
+    let budget = ConnectionBudget::new(limits_from(&bounds));
     let mut reader = LineReader::new(bounds);
 
     let login_prompt = format!("{host} login: ");
@@ -137,7 +139,7 @@ pub async fn handle_connection(
         protocol_label: PROTOCOL_LABEL.to_string(),
         session_id: Some(session_id),
     };
-    let mut shell = FakeShell::new(FakeFs::new(), ctx);
+    let mut shell = FakeShell::new(FakeFs::new(), ctx).with_budget(budget.clone());
 
     if stream.write_all(shell.prompt().as_bytes()).await.is_err() {
         return;
@@ -174,6 +176,8 @@ pub async fn handle_connection(
         let output = onlcr(output.bytes());
 
         if close_session {
+            // Not charged: the session ends with this write, so there is no later write for the
+            // count to refuse.
             let _ = stream.write_all(&shell.encode_output(&output)).await;
             reader.mark_session_end(CaptureEnd::ClientLogout);
             break;
@@ -185,6 +189,12 @@ pub async fn handle_connection(
         // de-obfuscating (identity for a plaintext session, so normal bots are unaffected).
         let response = shell.encode_output(&response);
         if stream.write_all(&response).await.is_err() {
+            reader.mark_session_end(CaptureEnd::TransportError);
+            break;
+        }
+        // Charged as written, after ONLCR and the codec. A connection with no egress left is
+        // dropped once this reply, prompt included, is out.
+        if budget.charge_egress(response.len() as u64) == EgressState::Spent {
             reader.mark_session_end(CaptureEnd::TransportError);
             break;
         }

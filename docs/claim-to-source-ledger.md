@@ -72,7 +72,7 @@ Owner: [security/never-execute.md](security/never-execute.md).
 | No crate enables tokio's `"process"` feature. | asserted `crates/sensor-cred/tests/integration.rs:485-486` | IMPLEMENTED |
 | Per-sensor static-check tests fail the build if any `.rs` gains an exec call (8 tests; ssh test also covers `sensor-framework/src`). | `crates/sensor-ssh/tests/shell_test.rs:121,145-160`; cred `:488`, adb `:356`, ftp `:255`, http `:198`, redis `:270`, smtp `:358`, telnet `:181` | IMPLEMENTED |
 | Deployment-layer W^X: every unit sets `MemoryDenyWriteExecute=yes` (correct spelling). | `deploy/sensor-ssh.service:104-112`; asserted `crates/sensor-framework/tests/deploy_test.rs:100-102` | IMPLEMENTED |
-| Fake shell's `wget`/`curl` return canned transcripts with zero network I/O; no process-spawn or HTTP client in the crate. | `crates/sensor-framework/src/shell.rs:9-29` | IMPLEMENTED |
+| Fake shell's `wget`/`curl` return canned transcripts with zero network I/O; no process-spawn or HTTP client in the crate. | `crates/sensor-framework/src/shell/mod.rs:9-29` | IMPLEMENTED |
 | Gap: `sensor-catchall` has no `never_exec_static_check` regression guard (covered only by the whole-workspace grep). | absence in `crates/sensor-catchall/tests/` | [inferred] (coverage gap) |
 
 ---

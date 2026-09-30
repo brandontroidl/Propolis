@@ -66,6 +66,21 @@ pub fn root_prompt(host: &str) -> String {
     format!("root@{host}:~# ")
 }
 
+/// The process id a session's login shell has, which `$$` reports, and the first of a run of ids
+/// its background jobs and spawned shells count up from. Derived from the session's id so two
+/// sessions differ and one session always gets the same value; a shell with no session id (a
+/// replay, a test) gets a fixed one. The range stays where a login shell's id sits on a host that
+/// has been up a while, not near 1 and not in the millions.
+pub fn session_pid(seed: Option<u128>) -> u32 {
+    const BASE: u32 = 1_000;
+    const SPAN: u128 = 28_000;
+    const FALLBACK: u32 = 2_211;
+    match seed {
+        Some(seed) => BASE.saturating_add(u32::try_from(seed % SPAN).unwrap_or(0)),
+        None => FALLBACK,
+    }
+}
+
 // --- The Android device sensor-adb impersonates. ADB is Android's own debug protocol, so the
 //     device this module describes is a SECOND coherent identity, not a variation on the Ubuntu
 //     host above: a bot that reaches port 5555 expects a phone, and handing it an Ubuntu bash

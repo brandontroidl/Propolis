@@ -114,7 +114,7 @@ contradict each other (`crates/sensor-framework/src/persona.rs`): **Ubuntu
 `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10` (`crates/sensor-framework/src/persona.rs#OPENSSH_VERSION`). Helpers produce a consistent
 `uname -a` string and `/proc/version`; the shell builds its
 `root@<host>:<cwd>#` prompt from that identity and its current state
-(`crates/sensor-framework/src/persona.rs#uname_all`, `crates/sensor-framework/src/persona.rs#proc_version`, `crates/sensor-framework/src/shell.rs#FakeShell::prompt`).
+(`crates/sensor-framework/src/persona.rs#uname_all`, `crates/sensor-framework/src/persona.rs#proc_version`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::prompt`).
 
 `sensor-adb` resolves a **second** identity from the same file: a rooted Nexus 5 on
 Android 6.0.1 (build M4B30Z, kernel 3.4.0, armv7l). ADB is Android's own debug
@@ -153,23 +153,23 @@ nothing behind. Nothing persists between sessions.
 
 ### Fake shell (SSH, Telnet, ADB)
 
-`shell.rs` presents interactive and one-shot shells shared by SSH, Telnet, and ADB
-(`crates/sensor-framework/src/shell.rs`). It is **never-exec and no-fetch by
+`shell/mod.rs` presents interactive and one-shot shells shared by SSH, Telnet, and ADB
+(`crates/sensor-framework/src/shell/mod.rs`). It is **never-exec and no-fetch by
 construction**: there is no process-spawn API and no HTTP/network-fetch client
 anywhere in the crate; `wget`/`curl` return canned transcripts with zero network
-I/O (`crates/sensor-framework/src/shell.rs`). This is asserted by `never_exec_static_check` and
+I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exec_static_check` and
 `workspace_lockfile_has_no_http_client_crate` in
 `crates/sensor-ssh/tests/shell_test.rs`.
 
 - One `honeypot_command_exec` is emitted per non-blank input line, except that a
   binary line or a line past the per-connection cap of 256 commands
-  (`MAX_COMMANDS_PER_SESSION`, `crates/sensor-framework/src/shell.rs#MAX_COMMANDS_PER_SESSION`, shared by every shell on the connection through
+  (`MAX_COMMANDS_PER_SESSION`, `crates/sensor-framework/src/shell/mod.rs#MAX_COMMANDS_PER_SESSION`, shared by every shell on the connection through
   `crates/sensor-framework/src/budget.rs#ConnectionBudget`) yields at most one marker event per session
-  per flood kind; a blank line produces no event or output (`crates/sensor-framework/src/shell.rs#FakeShell::handle_input`). The raw
+  per flood kind; a blank line produces no event or output (`crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`). The raw
   line is recorded verbatim in
-  `metadata.command`, sanitized and capped at `MAX_COMMAND_LEN = 1024` (`crates/sensor-framework/src/shell.rs#MAX_COMMAND_LEN`, `crates/sensor-framework/src/shell.rs#FakeShell::handle_input`).
+  `metadata.command`, sanitized and capped at `MAX_COMMAND_LEN = 1024` (`crates/sensor-framework/src/shell/mod.rs#MAX_COMMAND_LEN`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
 - If the line is single-byte-XOR obfuscated, `command_decoded` and `xor_key` are
-  added to metadata (`crates/sensor-framework/src/shell.rs#FakeShell::handle_input`).
+  added to metadata (`crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
 - One `ConnectionBudget` per connection (`crates/sensor-framework/src/budget.rs#ConnectionBudget`, limits in `crates/sensor-framework/src/budget.rs#BudgetLimits::standard`)
   bounds what a session can make the sensor hold or send: 256 KiB of created file content and 4096
   created nodes (a removed file's slot is not freed), 64 recorded downloads per connection and 8 per
@@ -177,24 +177,48 @@ I/O (`crates/sensor-framework/src/shell.rs`). This is asserted by `never_exec_st
   A refused write prints the kernel's own `No space left on device`, `File too large` or
   `File name too long` (names over 255 per component or 4096 per path). Past the download cap the
   connection's one `download_cap` marker is emitted and no further `honeypot_file_download` events;
-  a refused re-entry is a silent success. A connection that has written its 16 MiB is dropped after
+  a refused re-entry, loop or nesting is a silent failure with status 1, never an error string. A connection that has written its 16 MiB is dropped after
   the reply that spent it.
 - A recognized fetch verb additionally emits `honeypot_file_download` with
-  `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell.rs#FakeShell::handle_input`).
-- Shell identity is state, not fixed response text (`crates/sensor-framework/src/shell.rs#ShellContext`, `crates/sensor-framework/src/shell.rs#FakeShell::prompt`). An Ubuntu login starts as
+  `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell/mod.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
+- Shell identity is state, not fixed response text (`crates/sensor-framework/src/shell/mod.rs#ShellContext`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::prompt`). An Ubuntu login starts as
   `-bash`, uses the interactive command-not-found handler and a prompt that follows
   the working directory. SSH exec uses `bash: line 1:` diagnostics and no prompt.
   Bare `su`, `sh`, `bash` and `ash` push nested levels; dash levels have their own
   `sh: N:` line counters. `exit` pops one level, and only exiting the outer level
   sets `close_session`. Android starts and nests as mksh with `sh:` diagnostics.
-- Implemented commands (`dispatch`, `crates/sensor-framework/src/shell.rs#FakeShell::dispatch`): `uname` (real per-flag field
+- Input is read as a shell reads it, by a lexer, parser and evaluator
+  (`crates/sensor-framework/src/shell/lex.rs`, `crates/sensor-framework/src/shell/parse.rs`,
+  `crates/sensor-framework/src/shell/eval.rs`), not split on whitespace. Quotes and backslashes,
+  `$VAR`, `${VAR:-w}`, `$?`, `$$`, `$0`, `$!`, `$#`, `$1..`, `$(( ))` (64-bit wrapping;
+  division by zero prints bash's `division by 0 (error token is "0")`), `$( )` and backticks, `~`,
+  field splitting at `$IFS` and globbing over the fake filesystem (1,024-name cap) expand in
+  POSIX order (`crates/sensor-framework/src/shell/expand.rs`, `crates/sensor-framework/src/shell/arith.rs`).
+  Redirections (`>`, `>>`, `<`, here-documents, `N>&M`, `>&-`, `/dev/null`) are opened before the
+  command runs and apply to a whole loop or group as well as a simple command; a bash target
+  that expands to other than one word is `-bash: WORD: ambiguous redirect`. Pipelines run every
+  stage, feeding each the one before, and take the last stage's status; `&&` and `||` decide on
+  status alone; `!`, `( )`, `{ }`, `if`, `for`, `while` and `until` run with the state-copy rules
+  (`( )`, a pipeline stage, `$( )` and `&` get a copy of the working directory and variables;
+  `{ }` does not). A trailing `&` runs the command at once and, in an interactive login shell,
+  prints `[N] PID`. An unfinished construct waits for more input under the PS2 prompt `> ` (64
+  lines or 64 KiB at most). Constructs outside this subset (`case`, `[[ ]]`, functions, `$'..'`,
+  `${x##*/}`, brace expansion, `<<<`, arrays) parse and are skipped with status 0 and no output;
+  what bash and dash also reject prints their syntax error and status 2. `read`, `export`,
+  `unset`, `set`, `shift`, `umask`, `break`, `continue`, `cd`, `exit` act on the shell itself
+  (`crates/sensor-framework/src/shell/builtins.rs`); `source`, `.` and `eval` only record intent.
+  `$$` and `$!` come from a per-session process id seeded from the session id
+  (`crates/sensor-framework/src/persona.rs#session_pid`), and the shell's own `/proc/PID` reads as
+  `/proc/self`. Words are strings: byte-string arguments are deferred to the command families that
+  need binary operands.
+- Implemented commands (`dispatch`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::dispatch`): `uname` (real per-flag field
   selection), `id`/`whoami`/`pwd`, `echo` (Gafgyt/BASHLITE `\xHH`-decoding
-  handshake returning `GAYFGT`, `crates/sensor-framework/src/shell.rs#cmd_echo`, `crates/sensor-framework/src/shell.rs#decode_echo_escapes_into`), `cat` (fakefs plus a special
+  handshake returning `GAYFGT`, `crates/sensor-framework/src/shell/mod.rs#cmd_echo`, `crates/sensor-framework/src/shell/mod.rs#decode_echo_escapes_into`), `cat` (fakefs plus a special
   `/proc/self/cmdline` returning argv), `ls` (sorted, dotfiles hidden without `-a`),
   `cp`/`rm`/`mkdir` (they change the session's filesystem and report the real errors),
   `wget`/`curl` (canned transcripts, `-O-`/`-qO-` writes body to stdout, a saved
   download becomes a file), `ping` (canned replies), `sh`/`bash`/`ash`
-  (nested shell; `sh -c "CMD"` dispatches CMD), `enable` (bash's builtin list, since
+  (nested shell; `sh -c "CMD"`, `sh FILE` and a script piped to `sh` run their text in a shell level of their own), `enable` (bash's builtin list, since
   Mirai's telnet preamble sends it and only a non-bash says "command not found"), `mount`
   (the fake filesystem's mount table), `busybox` (multi-call banner
   v1.31.1 plus applet dispatch; unknown applet gives `applet not found`),
@@ -203,7 +227,7 @@ I/O (`crates/sensor-framework/src/shell.rs`). This is asserted by `never_exec_st
   takes a url token),
   `chmod`/`cp`/`rm`/`mkdir`/`sleep` (silent success), `cd`, `exit`/`logout`; an
   unknown command uses the active shell level's diagnostic form.
-- BusyBox applet set is a single source of truth (`BUSYBOX_APPLETS`, `crates/sensor-framework/src/shell.rs#BUSYBOX_APPLETS`)
+- BusyBox applet set is a single source of truth (`BUSYBOX_APPLETS`, `crates/sensor-framework/src/shell/mod.rs#BUSYBOX_APPLETS`)
   and deliberately excludes `curl` (real busybox ships none), so `busybox curl`
   gives `applet not found` - matching the real-busybox check Mirai/Gafgyt perform.
 - Download capture handles direct, busybox, full-path, and

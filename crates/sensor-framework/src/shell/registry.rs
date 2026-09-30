@@ -3,7 +3,7 @@
 //! function called from [`Registry::builtin`]), not by editing the dispatcher.
 //!
 //! The registry holds no handler bodies and builds no `CommandResult`, so the
-//! `trace_type_never_feeds_wire_output` source scan of `shell.rs` still covers every place
+//! `trace_type_never_feeds_wire_output` source scan of the shell module still covers every place
 //! attacker-facing bytes are made.
 
 use std::collections::HashMap;
@@ -97,10 +97,6 @@ impl Registry {
     }
 }
 
-fn is_echo_argv0(_shell: &FakeShell, parts: &[&str]) -> bool {
-    parts.get(1..) == Some(&["$0"][..])
-}
-
 fn is_bash(shell: &FakeShell, _parts: &[&str]) -> bool {
     shell.is_bash()
 }
@@ -110,12 +106,6 @@ fn register_core(r: &mut Registry) {
     r.register("id", HandlerId::Id, FakeShell::builtin_id);
     r.register("whoami", HandlerId::Whoami, FakeShell::builtin_whoami);
     r.register("pwd", HandlerId::Pwd, FakeShell::builtin_pwd);
-    r.register_if(
-        "echo",
-        is_echo_argv0,
-        HandlerId::EchoArgv0,
-        FakeShell::builtin_echo_argv0,
-    );
     r.register("echo", HandlerId::Echo, FakeShell::builtin_echo);
     r.register("cat", HandlerId::Cat, FakeShell::cmd_cat);
     r.register("ls", HandlerId::Ls, FakeShell::cmd_ls);
@@ -163,4 +153,21 @@ fn register_core(r: &mut Registry) {
     r.register("su", HandlerId::Su, FakeShell::builtin_su);
     r.register("exit", HandlerId::Exit, FakeShell::builtin_exit);
     r.register("logout", HandlerId::Logout, FakeShell::builtin_logout);
+    // The builtins that act on the shell itself. `source` is bash's; dash and mksh have only `.`.
+    r.register("read", HandlerId::Read, FakeShell::builtin_read);
+    r.register("export", HandlerId::Export, FakeShell::builtin_export);
+    r.register("unset", HandlerId::Unset, FakeShell::builtin_unset);
+    r.register("set", HandlerId::Set, FakeShell::builtin_set);
+    r.register("shift", HandlerId::Shift, FakeShell::builtin_shift);
+    r.register("umask", HandlerId::Umask, FakeShell::builtin_umask);
+    r.register("break", HandlerId::Break, FakeShell::builtin_break);
+    r.register("continue", HandlerId::Continue, FakeShell::builtin_continue);
+    r.register(".", HandlerId::SourceEval, FakeShell::builtin_source);
+    r.register_if(
+        "source",
+        is_bash,
+        HandlerId::SourceEval,
+        FakeShell::builtin_source,
+    );
+    r.register("eval", HandlerId::SourceEval, FakeShell::builtin_eval);
 }

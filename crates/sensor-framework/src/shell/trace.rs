@@ -5,6 +5,7 @@
 //! `tests/shell_test.rs`) hold that line.
 
 use super::ControlOp;
+use super::ast::UnsupportedKind;
 
 /// Everything the engine decided while running ONE input line. Held on the shell (current line
 /// only), surfaced to the operator through `tracing` and to tests through
@@ -41,25 +42,36 @@ pub enum RunDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CommandTrace {
-    /// The simple command's whitespace tokens, redirections included.
+    /// A simple command's expanded arguments, redirections not included; empty for a compound
+    /// command or a command made only of redirections.
     pub tokens: Vec<String>,
     pub node: ParseNode,
     pub resolved: HandlerId,
     pub status: u8,
     pub fs_effects: Vec<FsEffect>,
-    /// Re-entrant dispatch (a busybox applet, `sh -c`): the inner command's own trace. The
-    /// nesting of this Vec mirrors the call stack.
+    /// Everything that ran inside this command: a busybox applet or the commands of an `sh -c`
+    /// script, the stages of a pipeline, the body of a compound command, a `$( )` substitution.
+    /// The nesting of this Vec mirrors the call stack.
     pub reentry: Vec<CommandTrace>,
+    /// Why a skipped command was outside the grammar subset.
+    pub unsupported: Option<UnsupportedKind>,
 }
 
-/// Coarse parse-node kinds the engine distinguishes today; the grammar step adds variants.
+/// The syntax-tree node kinds the engine distinguishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ParseNode {
     Simple,
-    /// A command made only of redirections (`>/tmp/x`).
+    /// A command made only of redirections or assignments (`>/tmp/x`).
     RedirectionOnly,
-    /// A pipeline, answered by its first stage only.
+    /// A pipeline of more than one stage, or one negated with `!`; its stages are `reentry`.
     Pipeline,
+    Subshell,
+    Brace,
+    If,
+    For,
+    While,
+    /// A construct outside the grammar subset, skipped with status 0.
+    Unsupported,
 }
 
 /// The dispatch decision, one variant per behavioural arm of `FakeShell::dispatch`. Argument
@@ -71,7 +83,6 @@ pub enum HandlerId {
     Id,
     Whoami,
     Pwd,
-    EchoArgv0,
     Echo,
     Cat,
     Ls,
@@ -96,6 +107,18 @@ pub enum HandlerId {
     Su,
     Exit,
     Logout,
+    Read,
+    Export,
+    Unset,
+    Set,
+    Shift,
+    Umask,
+    Break,
+    Continue,
+    /// `.`, `source` and `eval`: recorded, never run.
+    SourceEval,
+    /// A compound command or a pipeline: no handler, the engine evaluates the node itself.
+    Compound,
     PathInvoke,
     NotFound,
     /// What `dispatch` does with an empty argv. The trace labels a redirection-only command
@@ -187,6 +210,7 @@ impl CommandTrace {
             status: 0,
             fs_effects: Vec::new(),
             reentry: Vec::new(),
+            unsupported: None,
         }
     }
 }
@@ -312,13 +336,71 @@ mod tests {
     }
 
     #[test]
-    fn a_pipeline_is_traced_as_its_first_stage() {
+    fn a_pipeline_is_traced_as_one_node_holding_every_stage() {
         let mut sh = shell();
         sh.handle_input("echo a | cat");
         let command = only_command(&sh);
         assert_eq!(command.node, ParseNode::Pipeline);
-        assert_eq!(command.resolved, HandlerId::Echo);
-        assert_eq!(command.tokens, vec!["echo", "a"]);
+        assert_eq!(command.resolved, HandlerId::Compound);
+        assert_eq!(command.reentry.len(), 2);
+        assert_eq!(command.reentry[0].resolved, HandlerId::Echo);
+        assert_eq!(command.reentry[0].tokens, vec!["echo", "a"]);
+        assert_eq!(command.reentry[1].resolved, HandlerId::Cat);
+        assert_eq!(command.status, 0);
+    }
+
+    #[test]
+    fn compound_commands_record_their_nodes_and_the_commands_inside() {
+        let mut sh = shell();
+        sh.handle_input("if true; then echo a; fi");
+        let outer = only_command(&sh);
+        assert_eq!(outer.node, ParseNode::If);
+        let inner: Vec<_> = outer.reentry.iter().map(|c| c.resolved).collect();
+        assert_eq!(inner, vec![HandlerId::TrueColon, HandlerId::Echo]);
+
+        sh.handle_input("for i in 1 2; do echo $i; done");
+        let outer = only_command(&sh);
+        assert_eq!(outer.node, ParseNode::For);
+        assert_eq!(outer.reentry.len(), 2);
+        assert_eq!(outer.reentry[1].tokens, vec!["echo", "2"]);
+
+        sh.handle_input("( cd /tmp )");
+        assert_eq!(only_command(&sh).node, ParseNode::Subshell);
+    }
+
+    #[test]
+    fn an_unsupported_construct_is_recorded_as_skipped() {
+        let mut sh = shell();
+        let (out, _) = sh.handle_input("case x in x) echo hi;; esac");
+        assert!(out.is_empty());
+        let command = only_command(&sh);
+        assert_eq!(command.node, ParseNode::Unsupported);
+        assert_eq!(
+            command.unsupported,
+            Some(crate::shell::UnsupportedKind::Case)
+        );
+        assert_eq!(command.status, 0);
+    }
+
+    #[test]
+    fn a_loop_cannot_grow_the_trace_without_bound() {
+        let mut sh = shell();
+        sh.handle_input("i=0; while :; do i=$((i+1)); if :; then :; fi; done");
+        let count = |c: &CommandTrace| {
+            fn walk(c: &CommandTrace) -> usize {
+                1 + c.reentry.iter().map(walk).sum::<usize>()
+            }
+            walk(c)
+        };
+        let total: usize = sh
+            .last_trace()
+            .segments
+            .iter()
+            .filter_map(|s| s.command.as_ref())
+            .map(count)
+            .sum();
+        assert!(total <= 600, "{total} trace nodes for one line");
+        assert_eq!(sh.last_trace().budget.hit, Some(BudgetHit::Work));
     }
 
     #[test]
@@ -393,7 +475,6 @@ mod tests {
             ("id", HandlerId::Id),
             ("whoami", HandlerId::Whoami),
             ("pwd", HandlerId::Pwd),
-            ("echo $0", HandlerId::EchoArgv0),
             ("echo hi", HandlerId::Echo),
             ("cat /etc/hostname", HandlerId::Cat),
             ("ls /", HandlerId::Ls),

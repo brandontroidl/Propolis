@@ -194,10 +194,32 @@ fn trace_type_never_feeds_wire_output() {
         .join("sensor-framework")
         .join("src")
         .join("shell");
-    let shell_rs = std::fs::read_to_string(shell_dir.with_extension("rs")).expect("read shell.rs");
-    let trace_rs = std::fs::read_to_string(shell_dir.join("trace.rs")).expect("read trace.rs");
     let production = |src: &str| src.split("#[cfg(test)]").next().unwrap_or("").to_string();
-    let (shell_rs, trace_rs) = (production(&shell_rs), production(&trace_rs));
+    // Every production file of the shell module except the trace itself, which is checked below.
+    // Files that hold only tests (`tests.rs`, `*_tests.rs`) build no wire output.
+    let mut shell_rs = String::new();
+    let mut scanned = 0;
+    for entry in std::fs::read_dir(&shell_dir).expect("read the shell directory") {
+        let path = entry.expect("directory entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let test_only = name == "tests.rs" || name.ends_with("_tests.rs");
+        if path.extension().is_some_and(|x| x == "rs") && name != "trace.rs" && !test_only {
+            let text = std::fs::read_to_string(&path).expect("read a shell source file");
+            shell_rs.push_str(&production(&text));
+            shell_rs.push('\n');
+            scanned += 1;
+        }
+    }
+    assert!(
+        scanned >= 9,
+        "expected the shell module's production files, found {scanned}"
+    );
+    let trace_rs =
+        production(&std::fs::read_to_string(shell_dir.join("trace.rs")).expect("read trace.rs"));
 
     let sinks = [
         "CommandResult::",

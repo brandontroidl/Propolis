@@ -32,7 +32,7 @@ not by careful coding:
   client anywhere in its own dependency tree. Per-sensor tests ban
   `reqwest/hyper/ureq/curl/isahc/surf/attohttpc`; the shell's `wget`/`curl` return
   canned transcripts with zero network I/O
-  (`crates/sensor-framework/src/shell.rs`). A sensor cannot fetch or serve
+  (`crates/sensor-framework/src/shell/mod.rs`). A sensor cannot fetch or serve
   attacker-directed content because nothing capable of it is present. (The *platform*
   as a whole has a few operator-gated, default-off egress paths for enrichment and
   reporting; see [`security/outbound-controls.md`](../security/outbound-controls.md).
@@ -97,7 +97,7 @@ it.
 
 `fakefs.rs` is an in-memory static snapshot, fresh per session, with no real
 filesystem underneath - path traversal is structurally impossible
-(`crates/sensor-framework/src/fakefs.rs`). `shell.rs` is the interactive fake shell presented post-auth,
+(`crates/sensor-framework/src/fakefs.rs`). `shell/` is the interactive fake shell presented post-auth,
 shared by SSH, Telnet, and ADB. It emits one `honeypot_command_exec` per non-blank
 line (recording the raw line, sanitized and capped), decodes single-byte-XOR
 obfuscated probes, recognizes fetch verbs (emitting `honeypot_file_download` with the

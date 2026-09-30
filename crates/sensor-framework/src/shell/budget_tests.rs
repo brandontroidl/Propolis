@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use super::eval::DepthGuard;
 use super::{BudgetHit, EmitContext, FakeShell, FsDenied, FsEffect, TraceEventKind};
 use crate::budget::{BudgetLimits, ConnectionBudget};
 use crate::fakefs::FakeFs;
@@ -321,19 +322,19 @@ fn re_entry_is_refused_at_the_depth_cap_and_silently() {
     let mut sh = FakeShell::new(FakeFs::new(), ctx());
     assert_eq!(BudgetLimits::standard().max_depth, 16);
 
-    sh.depth = 15;
+    sh.depth = DepthGuard::at(15);
     let (out, _) = sh.handle_input("busybox echo hi");
     assert_eq!(out, "hi\n", "depth 15 may still enter one level");
     assert_eq!(sh.last_trace().budget.max_depth_reached, 16);
     assert_eq!(sh.last_trace().budget.hit, None);
-    assert_eq!(sh.depth, 15, "depth is restored after the entry");
+    assert_eq!(sh.depth.current(), 15, "depth is restored after the entry");
 
-    sh.depth = 16;
+    sh.depth = DepthGuard::at(16);
     let (out, _) = sh.handle_input("busybox echo hi");
-    assert_eq!((out.status, out.is_empty()), (0, true));
+    assert_eq!((out.status, out.is_empty()), (1, true));
     assert_eq!(sh.last_trace().budget.max_depth_reached, 16);
     assert_eq!(sh.last_trace().budget.hit, Some(BudgetHit::Depth));
-    assert_eq!(sh.depth, 16);
+    assert_eq!(sh.depth.current(), 16);
 }
 
 #[test]

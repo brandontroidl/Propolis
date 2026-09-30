@@ -50,7 +50,7 @@ Supporting properties:
 ### Applied structurally, not per-sensor-discretion
 
 `sanitize_value` is called across 18 source files - every sensor handler plus framework
-`shell.rs`, `handoff.rs`, and `emit.rs`. Two facts make it structural rather than a habit
+`shell/mod.rs`, `handoff.rs`, and `emit.rs`. Two facts make it structural rather than a habit
 each sensor must remember:
 
 - The framework enforces it for captured filenames: `orig_name` is sanitized in the capture

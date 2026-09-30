@@ -66,6 +66,7 @@ mod read;
 mod readlink;
 mod registry;
 mod test_builtin;
+mod texttools;
 mod trace;
 
 use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
@@ -2134,8 +2135,9 @@ fn url_if_fetch_line(line: &str) -> Option<&str> {
 /// applet). Every entry here is handled by [`FakeShell::dispatch`] when invoked bare, so
 /// `busybox <applet>` never falls through to "command not found".
 const BUSYBOX_APPLETS: &[&str] = &[
-    "ash", "cat", "chmod", "cp", "dd", "echo", "ftpget", "head", "hexdump", "id", "ls", "mkdir",
-    "more", "ping", "pwd", "readlink", "rm", "sh", "sleep", "tftp", "uname", "wget", "whoami",
+    "ash", "cat", "chmod", "cp", "dd", "echo", "ftpget", "grep", "head", "hexdump", "id", "ls",
+    "mkdir", "more", "od", "ping", "pwd", "readlink", "rm", "sh", "sleep", "tftp", "uname", "wc",
+    "wget", "whoami",
 ];
 
 /// True if `name` is one of the applets this shell models (see [`BUSYBOX_APPLETS`]); anything else
@@ -2809,3 +2811,5 @@ mod readlink_tests;
 mod test_builtin_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod texttools_tests;

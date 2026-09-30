@@ -52,7 +52,7 @@ fn window(bytes: Vec<u8>, off: u64, limit: u64) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn errno_text(error: &FsError) -> &'static str {
+pub(super) fn errno_text(error: &FsError) -> &'static str {
     match error {
         FsError::IsADirectory => "Is a directory",
         _ => "No such file or directory",

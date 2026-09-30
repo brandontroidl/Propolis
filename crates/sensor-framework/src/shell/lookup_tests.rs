@@ -540,7 +540,7 @@ fn a_file_dispatch_does_not_run_is_not_advertised() {
         "the premise: on `$PATH` and executable"
     );
     assert!(!dispatch_runs(&mut sh, "dropped"));
-    for name in ["printf", "grep", "touch", "dropped"] {
+    for name in ["printf", "sed", "touch", "dropped"] {
         assert_eq!(
             answer(&mut sh, &format!("which {name}")),
             ("".into(), "".into(), 1),

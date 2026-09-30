@@ -36,9 +36,16 @@ use sensor_wire::{
 };
 
 use crate::command_codec::CommandCodec;
-use crate::fakefs::{FakeFs, FsError, READ_CAP};
+use crate::fakefs::{Blob, FakeFs, FsError, READ_CAP};
 use crate::persona;
 use crate::sanitize_value;
+
+mod trace;
+
+pub use trace::{
+    BudgetHit, BudgetTrace, CommandTrace, FsDenied, FsEffect, HandlerId, LineTrace, ParseNode,
+    RunDecision, SegmentTrace, TraceEventKind,
+};
 
 /// Cap applied to the sanitized command line captured in `metadata.command`. Matches
 /// `auth::MAX_METADATA_STRING_LEN`'s convention of a generous, fixed bound on an
@@ -270,6 +277,11 @@ pub struct FakeShell {
     levels: Vec<ShellLevel>,
     hostname: String,
     clock: Clock,
+    /// What the engine decided for the current input line; reset at the top of `handle_input`.
+    trace: LineTrace,
+    /// Commands open at this moment, outermost first. A re-entrant dispatch pushes; closing pops
+    /// and attaches to the parent's `reentry` or, for the outermost, to the current segment.
+    trace_stack: Vec<CommandTrace>,
 }
 
 /// How the outermost shell was entered. Login shells read Ubuntu's interactive startup files;
@@ -351,7 +363,15 @@ impl FakeShell {
             levels: vec![level],
             hostname: persona::hostname(),
             clock: chrono::Utc::now,
+            trace: LineTrace::default(),
+            trace_stack: Vec::new(),
         }
+    }
+
+    /// What the engine decided while running the most recent non-blank input line. For tests and
+    /// in-process readers; it is never part of a reply.
+    pub fn last_trace(&self) -> &LineTrace {
+        &self.trace
     }
 
     /// The same shell reading its time from `clock` instead of the system clock.
@@ -457,6 +477,8 @@ impl FakeShell {
         if raw.trim().is_empty() {
             return (CommandResult::silent(0), Vec::new());
         }
+        self.trace = LineTrace::default();
+        self.trace_stack.clear();
         self.advance_shell_line();
 
         // Decode a single-byte-XOR-obfuscated probe (identity for plaintext). The event records a
@@ -466,6 +488,8 @@ impl FakeShell {
         // URL capture run on the decoded line.
         let (decoded, key) = self.codec.decode(&raw);
         self.command_count += 1;
+        self.trace.decoded = decoded.to_string();
+        self.trace.xor_key = key;
 
         // Two floods must never pollute the append-only ledger with one event per line: a
         // binary/non-text line (an SSH/telnet channel tunneling binary, or a fuzzer - not a
@@ -474,9 +498,11 @@ impl FakeShell {
         // shell keeps responding - a silently dead session is itself a tell - but emit at most ONE
         // marker event per session per flood kind rather than one event per garbage line.
         let events = if is_binary_line(&decoded) {
+            self.trace.binary_line = true;
             if std::mem::replace(&mut self.binary_flagged, true) {
                 Vec::new()
             } else {
+                self.trace.events.push(TraceEventKind::FloodBinary);
                 vec![self.command_event(serde_json::json!({
                     "protocol_label": self.ctx.protocol_label,
                     "command": "<binary channel data; per-line command events suppressed>",
@@ -487,6 +513,7 @@ impl FakeShell {
             if std::mem::replace(&mut self.cap_flagged, true) {
                 Vec::new()
             } else {
+                self.trace.events.push(TraceEventKind::FloodCommandCap);
                 vec![self.command_event(serde_json::json!({
                     "protocol_label": self.ctx.protocol_label,
                     "command": format!(
@@ -512,7 +539,9 @@ impl FakeShell {
                 obj.insert("xor_key".to_string(), serde_json::json!(k));
             }
             let mut evs = vec![self.command_event(metadata)];
+            self.trace.events.push(TraceEventKind::CommandExec);
             for url in download_targets(&decoded) {
+                self.trace.events.push(TraceEventKind::FileDownload);
                 let sanitized_url = sanitize_value(&url, MAX_URL_LEN);
                 evs.push(SensorEvent {
                     v: WIRE_VERSION,
@@ -536,6 +565,7 @@ impl FakeShell {
         };
 
         let output = self.run_line(&decoded);
+        tracing::debug!(target: "propolis::shell::trace", trace = ?self.trace, "shell line");
         (output, events)
     }
 
@@ -555,6 +585,16 @@ impl FakeShell {
                 ControlOp::And => result.status == 0,
                 ControlOp::Or => result.status != 0,
             };
+            let decision = match (run, op) {
+                (true, _) => RunDecision::Ran,
+                (false, ControlOp::And) => RunDecision::SkippedByAnd,
+                (false, _) => RunDecision::SkippedByOr,
+            };
+            self.trace.segments.push(SegmentTrace {
+                op,
+                decision,
+                command: None,
+            });
             if !run {
                 continue;
             }
@@ -563,7 +603,7 @@ impl FakeShell {
             if stage.is_empty() {
                 continue;
             }
-            let command = self.run_simple(stage);
+            let command = self.run_simple(stage, stage.len() < all.len());
             result.append(command);
             if result.stop_line {
                 break;
@@ -584,7 +624,24 @@ impl FakeShell {
     /// `>/var/run/.x` as a command name answered "command not found", failed every probe, and the
     /// chain never reached the busybox marker the loader keys its next stage on (observed live
     /// 2026-09-06).
-    fn run_simple(&mut self, stage: &[&str]) -> CommandResult {
+    ///
+    /// `piped` marks a stage that was the first of a pipeline, for the trace only.
+    fn run_simple(&mut self, stage: &[&str], piped: bool) -> CommandResult {
+        let Redirected { argv, redirs } = split_redirections(stage);
+        let (node, resolved) = if argv.is_empty() {
+            (ParseNode::RedirectionOnly, HandlerId::RedirectionOnly)
+        } else if piped {
+            (ParseNode::Pipeline, self.resolve_handler(&argv))
+        } else {
+            (ParseNode::Simple, self.resolve_handler(&argv))
+        };
+        self.trace_open(stage, node, resolved);
+        let result = self.run_redirected(&argv, &redirs);
+        self.trace_close(result.status);
+        result
+    }
+
+    fn run_redirected(&mut self, argv: &[&str], redirs: &[Redirection<'_>]) -> CommandResult {
         #[derive(Clone)]
         enum Sink {
             Terminal,
@@ -592,14 +649,12 @@ impl FakeShell {
             File { path: String, append: bool },
         }
 
-        let Redirected { argv, redirs } = split_redirections(stage);
-
         // Destination per fd; index 0 is unused, 1 is stdout, 2 is stderr.
         let mut sink = [Sink::Terminal, Sink::Terminal, Sink::Terminal];
 
         // The first failing file redirection prints the shell's own error and the command never
         // dispatches, as in bash.
-        for r in &redirs {
+        for r in redirs {
             let idx = usize::from(r.fd);
             match r.kind {
                 RedirKind::Close => {
@@ -625,7 +680,7 @@ impl FakeShell {
                     let open = if append && self.fs.file_exists(&resolved) {
                         Ok(())
                     } else {
-                        self.fs.create_file(&resolved)
+                        self.traced_create(&resolved)
                     };
                     if let Err(error) = open {
                         return self.redirect_open_error(&resolved, &error);
@@ -641,7 +696,7 @@ impl FakeShell {
         }
 
         // An empty argv (a redirection-only command) dispatches to a silent success.
-        let result = self.dispatch(&argv);
+        let result = self.dispatch(argv);
         if redirs.is_empty() {
             return result;
         }
@@ -674,7 +729,7 @@ impl FakeShell {
                 Vec::new()
             };
             content.extend_from_slice(&bytes);
-            let _ = self.fs.write_file(&path, &content);
+            let _ = self.traced_write_file(&path, &content);
         }
 
         let mut terminal = CommandResult::silent(result.status);
@@ -716,42 +771,80 @@ impl FakeShell {
         }
     }
 
-    /// Produce the canned terminal output for one already-tokenized, non-empty command line.
+    /// The arm `dispatch` takes for a tokenized command. `dispatch` matches on this and nothing
+    /// else, so the decision the trace reports is the decision that ran.
+    ///
+    /// Matches on the command's basename, so a full path (`/bin/busybox`, `/userfs/bin/wget`,
+    /// `/bin/sh`) - which IoT loaders routinely use - resolves to the same applet a bare invocation
+    /// would, the way a real shell finds it on PATH. Only the command token is normalised;
+    /// arguments are untouched.
+    fn resolve_handler(&self, parts: &[&str]) -> HandlerId {
+        let Some(first) = parts.first() else {
+            return HandlerId::Empty;
+        };
+        match command_basename(first) {
+            "uname" => HandlerId::Uname,
+            "id" => HandlerId::Id,
+            "whoami" => HandlerId::Whoami,
+            "pwd" => HandlerId::Pwd,
+            "echo" if parts.get(1..) == Some(&["$0"][..]) => HandlerId::EchoArgv0,
+            "echo" => HandlerId::Echo,
+            "cat" => HandlerId::Cat,
+            "ls" => HandlerId::Ls,
+            "mount" => HandlerId::Mount,
+            "enable" if self.is_bash() => HandlerId::EnableBuiltin,
+            "enable" => HandlerId::EnableNotFound,
+            "true" | ":" => HandlerId::TrueColon,
+            "false" => HandlerId::False,
+            "wget" => HandlerId::Wget,
+            "curl" => HandlerId::Curl,
+            "ping" => HandlerId::Ping,
+            "sh" | "bash" | "ash" => HandlerId::ShellSpawn,
+            "busybox" => HandlerId::Busybox,
+            "tftp" | "ftpget" => HandlerId::Fetcher,
+            "chmod" => HandlerId::Chmod,
+            "cp" => HandlerId::Cp,
+            "rm" => HandlerId::Rm,
+            "mkdir" => HandlerId::Mkdir,
+            "sleep" => HandlerId::Sleep,
+            "cd" => HandlerId::Cd,
+            "su" => HandlerId::Su,
+            "exit" => HandlerId::Exit,
+            "logout" => HandlerId::Logout,
+            _ if first.contains('/') => HandlerId::PathInvoke,
+            _ => HandlerId::NotFound,
+        }
+    }
+
+    /// Produce the canned terminal output for one already-tokenized command line.
     /// Every arm returns a static or lightly-interpolated string; none evaluates, spawns, or
     /// otherwise interprets `parts` as code - see the module doc.
     fn dispatch(&mut self, parts: &[&str]) -> CommandResult {
-        // Match on the command's basename, so a full path (`/bin/busybox`, `/userfs/bin/wget`,
-        // `/bin/sh`) - which IoT loaders routinely use - resolves to the same applet a bare invocation
-        // would, the way a real shell finds it on PATH. Only the command token is normalised;
-        // arguments are untouched.
-        let cmd = parts.first().map(|p| command_basename(p));
-        match cmd {
-            Some("uname") => CommandResult::stdout(cmd_uname(parts, self.flavor)),
-            Some("id") => CommandResult::stdout(
+        match self.resolve_handler(parts) {
+            HandlerId::Uname => CommandResult::stdout(cmd_uname(parts, self.flavor)),
+            HandlerId::Id => CommandResult::stdout(
                 "uid=0(root) gid=0(root) groups=0(root)\n"
                     .as_bytes()
                     .to_vec(),
             ),
-            Some("whoami") => CommandResult::stdout(b"root\n".to_vec()),
-            Some("pwd") => CommandResult::stdout(format!("{}\n", self.cwd)),
-            Some("echo") if parts.get(1..) == Some(&["$0"][..]) => {
-                CommandResult::stdout(format!("{}\n", self.argv_zero()))
-            }
-            Some("echo") => CommandResult::stdout(cmd_echo(&parts[1..])),
-            Some("cat") => self.cmd_cat(parts),
-            Some("ls") => self.cmd_ls(parts),
+            HandlerId::Whoami => CommandResult::stdout(b"root\n".to_vec()),
+            HandlerId::Pwd => CommandResult::stdout(format!("{}\n", self.cwd)),
+            HandlerId::EchoArgv0 => CommandResult::stdout(format!("{}\n", self.argv_zero())),
+            HandlerId::Echo => CommandResult::stdout(cmd_echo(&parts[1..])),
+            HandlerId::Cat => self.cmd_cat(parts),
+            HandlerId::Ls => self.cmd_ls(parts),
             // `mount` with no arguments lists the same table `/proc/mounts` exposes; mounting
             // something as root is a silent success like the other no-output applets.
-            Some("mount") => CommandResult::stdout(cmd_mount(parts)),
+            HandlerId::Mount => CommandResult::stdout(cmd_mount(parts)),
             // Mirai's telnet preamble is `enable`, `system`, `shell`, `sh`: CLI-escape words for
             // routers. On the bash this box claims, `enable` is a builtin that lists the enabled
             // builtins; answering "command not found" for it (observed live 2026-09-06) was the
             // one reply a bash never gives. `system` and `shell` really are unknown to bash.
-            Some("enable") if self.is_bash() => CommandResult::stdout(cmd_enable(parts)),
-            Some("enable") => CommandResult::stderr(127, self.not_found("enable")),
-            Some("true") | Some(":") => CommandResult::silent(0),
-            Some("false") => CommandResult::silent(1),
-            Some("wget") => {
+            HandlerId::EnableBuiltin => CommandResult::stdout(cmd_enable(parts)),
+            HandlerId::EnableNotFound => CommandResult::stderr(127, self.not_found("enable")),
+            HandlerId::TrueColon => CommandResult::silent(0),
+            HandlerId::False => CommandResult::silent(1),
+            HandlerId::Wget => {
                 let writes_stdout = matches!(wget_output(parts), WgetOutput::Stdout);
                 let out = cmd_wget(parts, (self.clock)());
                 self.save_fetched_file("wget", parts);
@@ -761,32 +854,32 @@ impl FakeShell {
                     CommandResult::one(OutputFd::Stderr, 0, out.into_bytes())
                 }
             }
-            Some("curl") => {
+            HandlerId::Curl => {
                 let out = cmd_curl(parts);
                 self.save_fetched_file("curl", parts);
                 CommandResult::stdout(out)
             }
-            Some("ping") => CommandResult::stdout(cmd_ping(parts)),
+            HandlerId::Ping => CommandResult::stdout(cmd_ping(parts)),
             // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
             // for sh/bash instantly outs the honeypot and the dropper leaves. Model a nested shell.
             // `ash` is BusyBox's shell and appears in the applet list, so it resolves here too.
-            Some("sh") | Some("bash") | Some("ash") => self.cmd_shell_spawn(parts),
+            HandlerId::ShellSpawn => self.cmd_shell_spawn(parts),
             // The canonical Mirai/Gafgyt probe is `/bin/busybox <TOKEN>`, which they confirm by the
             // exact "<TOKEN>: applet not found" reply; they also fetch payloads via `busybox wget`
             // and `busybox tftp`.
-            Some("busybox") => self.cmd_busybox(parts),
+            HandlerId::Busybox => self.cmd_busybox(parts),
             // tftp/ftpget are BusyBox download applets these loaders use; stay quiet (a real
             // non-interactive fetch prints nothing on success) rather than "command not found". The
             // target URL is captured by `download_target` above.
-            Some(fetcher @ ("tftp" | "ftpget")) => {
-                self.save_fetched_file(fetcher, parts);
+            HandlerId::Fetcher => {
+                self.save_fetched_file(command_basename(parts[0]), parts);
                 CommandResult::silent(0)
             }
             // Filesystem/no-output applets in a loader's drop chain (`chmod +x x`, then `cp`/`rm`/
             // `mkdir`/`sleep`). A real shell prints nothing on success, and "command not found" for
             // `chmod` is impossible on any real Linux - it outs the honeypot before the loader ever
             // executes its payload, costing the capture - so model them as silent successes.
-            Some("chmod") => {
+            HandlerId::Chmod => {
                 // Silent like the real thing, but an executable mode on a file the attacker
                 // created is remembered so that running it afterwards succeeds.
                 let mut args = parts[1..].iter().filter(|a| !a.starts_with('-'));
@@ -795,7 +888,7 @@ impl FakeShell {
                 {
                     for target in args {
                         let path = self.resolve_logical(target);
-                        self.fs.mark_executable(&path);
+                        self.traced_mark_executable(&path);
                     }
                 }
                 CommandResult::silent(0)
@@ -803,11 +896,11 @@ impl FakeShell {
             // These change the filesystem the rest of the session sees. Answering silent
             // success while changing nothing let a loader `cp` a payload and then fail to find
             // it, and left a file it had just `rm`ed still readable.
-            Some("cp") => self.cmd_cp(parts),
-            Some("rm") => self.cmd_rm(parts),
-            Some("mkdir") => self.cmd_mkdir(parts),
-            Some("sleep") => CommandResult::silent(0),
-            Some("cd") => {
+            HandlerId::Cp => self.cmd_cp(parts),
+            HandlerId::Rm => self.cmd_rm(parts),
+            HandlerId::Mkdir => self.cmd_mkdir(parts),
+            HandlerId::Sleep => CommandResult::silent(0),
+            HandlerId::Cd => {
                 // Only into a directory the box presents: a silent `cd` into a directory that
                 // `ls /` never showed is a tell, and a loader's `>/x/.x && cd /x` chain relies on
                 // the two agreeing about what exists.
@@ -825,7 +918,7 @@ impl FakeShell {
             }
             // Already root on this box, so `su` (and `su -`, `su root`) opens another bash
             // silently. It is still a real nested level: one `exit` returns to the caller.
-            Some("su") => {
+            HandlerId::Su => {
                 let level = match self.active_level() {
                     ShellLevel::AndroidMksh => ShellLevel::AndroidMksh,
                     _ => ShellLevel::Bash { login: false },
@@ -833,14 +926,14 @@ impl FakeShell {
                 self.push_level(level);
                 CommandResult::silent(0)
             }
-            Some("exit") => self.exit_shell(),
-            Some("logout") => self.logout_shell(),
+            HandlerId::Exit => self.exit_shell(),
+            HandlerId::Logout => self.logout_shell(),
             // A token with a slash names a path, and bash answers for the path, not for PATH:
             // a file the attacker created and chmod'ed runs (an empty file exits 0 with no
             // output, which is what the writable-directory probe `>/tmp/d && chmod 777 /tmp/d
             // && /tmp/d && cd /tmp/` keys its `cd` on), one it did not chmod is refused, and a
             // path that does not exist is "No such file", never "command not found".
-            Some(other) if parts[0].contains('/') => {
+            HandlerId::PathInvoke => {
                 let path = self.resolve_logical(parts[0]);
                 if self.fs.is_executable(&path) {
                     CommandResult::silent(0)
@@ -855,7 +948,6 @@ impl FakeShell {
                         self.shell_error(format_args!("{}: Is a directory", parts[0])),
                     )
                 } else {
-                    let _ = other;
                     // mksh says only "not found" for a path it cannot execute.
                     CommandResult::stderr(
                         127,
@@ -871,8 +963,127 @@ impl FakeShell {
             }
             // An interactive bash on Ubuntu prefixes the message with its own name; the bare form
             // matched no real shell.
-            Some(other) => CommandResult::stderr(127, self.not_found(other)),
-            None => CommandResult::silent(0),
+            HandlerId::NotFound => {
+                CommandResult::stderr(127, self.not_found(command_basename(parts[0])))
+            }
+            // A command made only of redirections has nothing to run; `RedirectionOnly` is the
+            // trace's name for it and never comes back from `resolve_handler`.
+            HandlerId::Empty | HandlerId::RedirectionOnly => CommandResult::silent(0),
+        }
+    }
+
+    /// Dispatch a command re-entrantly (a busybox applet, `sh -c`) and record it under the
+    /// command that caused it.
+    fn dispatch_nested(&mut self, parts: &[&str]) -> CommandResult {
+        let resolved = self.resolve_handler(parts);
+        self.trace_open(parts, ParseNode::Simple, resolved);
+        let result = self.dispatch(parts);
+        self.trace_close(result.status);
+        result
+    }
+
+    fn trace_open(&mut self, tokens: &[&str], node: ParseNode, resolved: HandlerId) {
+        self.trace_stack
+            .push(CommandTrace::open(tokens, node, resolved));
+    }
+
+    /// Close the innermost open command with its `status`, attaching it to its caller or, for the
+    /// outermost, to the segment being run.
+    fn trace_close(&mut self, status: u8) {
+        let Some(mut command) = self.trace_stack.pop() else {
+            return;
+        };
+        command.status = status;
+        match self.trace_stack.last_mut() {
+            Some(parent) => parent.reentry.push(command),
+            None => {
+                if let Some(segment) = self.trace.segments.last_mut() {
+                    segment.command = Some(command);
+                }
+            }
+        }
+    }
+
+    fn trace_fs(&mut self, effect: FsEffect) {
+        if let Some(open) = self.trace_stack.last_mut() {
+            open.fs_effects.push(effect);
+        }
+    }
+
+    fn trace_denied(&mut self, path: &str, error: &FsError) {
+        self.trace_fs(FsEffect::Denied {
+            path: path.to_string(),
+            why: FsDenied::from(error),
+        });
+    }
+
+    fn traced_create(&mut self, path: &str) -> Result<(), FsError> {
+        let result = self.fs.create_file(path);
+        match &result {
+            Ok(()) => self.trace_fs(FsEffect::Created {
+                path: path.to_string(),
+                bytes: 0,
+            }),
+            Err(error) => self.trace_denied(path, error),
+        }
+        result
+    }
+
+    fn traced_write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        let result = self.fs.write_file(path, bytes);
+        match &result {
+            Ok(()) => self.trace_fs(FsEffect::Wrote {
+                path: path.to_string(),
+                bytes: bytes.len(),
+            }),
+            Err(error) => self.trace_denied(path, error),
+        }
+        result
+    }
+
+    fn traced_write_blob(&mut self, path: &str, blob: Blob, mode: u32) -> Result<(), FsError> {
+        let len = usize::try_from(blob.len()).unwrap_or(usize::MAX);
+        let result = self.fs.write_blob(path, blob, mode);
+        match &result {
+            Ok(()) => self.trace_fs(FsEffect::Wrote {
+                path: path.to_string(),
+                bytes: len,
+            }),
+            Err(error) => self.trace_denied(path, error),
+        }
+        result
+    }
+
+    fn traced_remove(&mut self, path: &str) -> Result<bool, FsError> {
+        let result = self.fs.remove_path(path);
+        match &result {
+            Ok(existed) => self.trace_fs(FsEffect::Removed {
+                path: path.to_string(),
+                existed: *existed,
+            }),
+            Err(error) => self.trace_denied(path, error),
+        }
+        result
+    }
+
+    fn traced_make_dir(&mut self, path: &str) -> Result<(), FsError> {
+        let result = self.fs.make_dir(path);
+        match &result {
+            Ok(()) => self.trace_fs(FsEffect::MadeDir {
+                path: path.to_string(),
+            }),
+            Err(error) => self.trace_denied(path, error),
+        }
+        result
+    }
+
+    /// `FakeFs::mark_executable` refuses silently (a baked-in file keeps its mode), so only an
+    /// applied change is recorded.
+    fn traced_mark_executable(&mut self, path: &str) {
+        if self.fs.mark_executable(path) {
+            self.trace_fs(FsEffect::MarkedExecutable {
+                path: path.to_string(),
+            });
         }
     }
 
@@ -911,7 +1122,7 @@ impl FakeShell {
     fn save_fetched_file(&mut self, cmd: &str, parts: &[&str]) {
         if let Some(name) = download_save_name(cmd, parts) {
             let path = self.resolve_logical(&name);
-            let _ = self.fs.write_file(&path, FETCHED_BODY.as_bytes());
+            let _ = self.traced_write_file(&path, FETCHED_BODY.as_bytes());
         }
     }
 
@@ -978,7 +1189,7 @@ impl FakeShell {
                 command_basename(src)
             );
         }
-        match self.fs.write_blob(&dst_path, blob, mode) {
+        match self.traced_write_blob(&dst_path, blob, mode) {
             Ok(()) => {}
             Err(FsError::ReadOnly) => {
                 return CommandResult::stderr(
@@ -1025,7 +1236,7 @@ impl FakeShell {
                 out.push_str(&format!("rm: cannot remove '{target}': Is a directory\n"));
                 continue;
             }
-            match self.fs.remove_path(&path) {
+            match self.traced_remove(&path) {
                 Ok(true) => {}
                 Ok(false) if force => {}
                 Ok(false) => out.push_str(&format!(
@@ -1059,7 +1270,7 @@ impl FakeShell {
         let mut out = String::new();
         for target in targets {
             let path = self.resolve_logical(target);
-            match self.fs.make_dir(&path) {
+            match self.traced_make_dir(&path) {
                 Ok(()) => {}
                 // `-p` is silent about an existing directory and creates missing parents.
                 Err(FsError::ReadOnly) => out.push_str(&format!(
@@ -1070,7 +1281,7 @@ impl FakeShell {
                     for segment in path.trim_start_matches('/').split('/') {
                         built.push('/');
                         built.push_str(segment);
-                        let _ = self.fs.make_dir(&built);
+                        let _ = self.traced_make_dir(&built);
                     }
                 }
                 Err(FsError::Exists) => out.push_str(&format!(
@@ -1156,7 +1367,7 @@ impl FakeShell {
                 let level = self.spawned_level(command_basename(parts[0]), 1);
                 let caller_depth = self.levels.len();
                 self.push_level(level);
-                let result = self.dispatch(&inner_parts);
+                let result = self.dispatch_nested(&inner_parts);
                 self.levels.truncate(caller_depth);
                 return result;
             }
@@ -1214,7 +1425,7 @@ impl FakeShell {
     fn cmd_busybox(&mut self, parts: &[&str]) -> CommandResult {
         match parts.get(1).copied() {
             None => CommandResult::stdout(busybox_banner()),
-            Some(applet) if is_busybox_applet(applet) => self.dispatch(&parts[1..]),
+            Some(applet) if is_busybox_applet(applet) => self.dispatch_nested(&parts[1..]),
             Some(applet) => CommandResult::stderr(127, format!("{applet}: applet not found\n")),
         }
     }
@@ -1459,8 +1670,8 @@ fn is_redirection(token: &str) -> bool {
 }
 
 /// The control operator that precedes a segment of an input line, deciding whether it runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ControlOp {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ControlOp {
     /// `;`, a background `&`, a newline, or the start of the line: run unconditionally.
     Seq,
     /// `&&`: run only if the previous command succeeded.

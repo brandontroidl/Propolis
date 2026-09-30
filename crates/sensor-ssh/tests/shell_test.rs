@@ -161,6 +161,83 @@ fn never_exec_static_check() {
     );
 }
 
+/// The text inside the bracket that opens at `open` (a `(` or `{`), through its match.
+fn balanced_span(text: &str, open: usize) -> &str {
+    let bytes = text.as_bytes();
+    let (opener, closer) = if bytes[open] == b'(' {
+        (b'(', b')')
+    } else {
+        (b'{', b'}')
+    };
+    let mut depth = 0usize;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        if b == opener {
+            depth += 1;
+        } else if b == closer {
+            depth -= 1;
+            if depth == 0 {
+                return &text[open..=i];
+            }
+        }
+    }
+    &text[open..]
+}
+
+#[test]
+fn trace_type_never_feeds_wire_output() {
+    // The internal trace is an operator channel. Attacker-facing bytes are built only by the
+    // `CommandResult` constructors, `OutputSegment` literals, `onlcr` and `encode_output`, so
+    // none of those call sites may take a trace value. Test modules are excluded: they read the
+    // trace back to assert on it.
+    let shell_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("sensor-framework")
+        .join("src")
+        .join("shell");
+    let shell_rs = std::fs::read_to_string(shell_dir.with_extension("rs")).expect("read shell.rs");
+    let trace_rs = std::fs::read_to_string(shell_dir.join("trace.rs")).expect("read trace.rs");
+    let production = |src: &str| src.split("#[cfg(test)]").next().unwrap_or("").to_string();
+    let (shell_rs, trace_rs) = (production(&shell_rs), production(&trace_rs));
+
+    let sinks = [
+        "CommandResult::",
+        "OutputSegment {",
+        "onlcr(",
+        "encode_output(",
+    ];
+    let trace_words = ["trace", "LineTrace", "CommandTrace"];
+    let mut call_sites = 0;
+    let mut leaks = Vec::new();
+    for sink in sinks {
+        for (at, _) in shell_rs.match_indices(sink) {
+            let Some(open) = shell_rs[at..].find(['(', '{']).map(|offset| at + offset) else {
+                continue;
+            };
+            call_sites += 1;
+            let args = balanced_span(&shell_rs, open);
+            if trace_words.iter().any(|word| args.contains(word)) {
+                leaks.push(format!("{sink} ... {args}"));
+            }
+        }
+    }
+    assert!(
+        call_sites > 50,
+        "expected the wire-output call sites in shell.rs, found {call_sites}"
+    );
+    assert!(
+        leaks.is_empty(),
+        "a trace value feeds wire output: {leaks:?}"
+    );
+
+    // The trace module itself builds no output.
+    for sink in sinks {
+        assert!(
+            !trace_rs.contains(sink),
+            "trace.rs must not build wire output ({sink})"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // additional coverage, not in the brief's given suite.
 //

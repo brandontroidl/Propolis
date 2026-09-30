@@ -60,6 +60,7 @@ impl Registry {
         super::read::register(&mut registry);
         super::dd::register(&mut registry);
         super::readlink::register(&mut registry);
+        super::test_builtin::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }

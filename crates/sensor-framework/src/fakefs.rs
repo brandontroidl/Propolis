@@ -131,6 +131,37 @@ pub struct Metadata {
     pub mtime: i64,
 }
 
+/// The kind of a node as `stat` reports it. Every modeled device is a character device; the box
+/// models no block device, FIFO or socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    Regular,
+    Directory,
+    Symlink,
+    CharDevice,
+}
+
+/// What [`FakeFs::stat`] reports: the node's metadata, its size, and the policy of the mount its
+/// physical path sits on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stat {
+    pub kind: FileKind,
+    /// Full `st_mode`, type bits included.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime: i64,
+    /// A regular file's length, a symlink's target length, zero for the rest.
+    pub size: u64,
+    /// The node's mount is `ro`: nothing under it can be written.
+    pub read_only: bool,
+    /// The node's mount is `noexec`: a file under it cannot be executed.
+    pub no_exec: bool,
+    /// Where the node lives once every link is followed. Two paths name one file exactly when
+    /// this is equal.
+    pub physical: String,
+}
+
 impl Metadata {
     fn root_owned(mode: u32) -> Self {
         Self {
@@ -1043,6 +1074,31 @@ impl FakeFs {
         let physical = self.resolve(path, true).ok()?;
         let node = self.node_at(&physical)?;
         Some((physical, node))
+    }
+
+    /// The attributes of the node `logical_abs` names, for `test` and the like. `follow` false
+    /// leaves a symlink in the last position alone (`test -L`). `None` when nothing is there, a
+    /// dangling link's target included.
+    pub fn stat(&self, logical_abs: &str, follow: bool) -> Option<Stat> {
+        let physical = self.resolve(logical_abs, follow).ok()?;
+        let node = self.node_at(&physical)?;
+        let (kind, size) = match &node.kind {
+            NodeKind::Regular(blob) => (FileKind::Regular, blob.len()),
+            NodeKind::Directory(_) => (FileKind::Directory, 0),
+            NodeKind::Symlink { target } => (FileKind::Symlink, target.len() as u64),
+            NodeKind::Device(_) => (FileKind::CharDevice, 0),
+        };
+        Some(Stat {
+            kind,
+            mode: node.meta.mode,
+            uid: node.meta.uid,
+            gid: node.meta.gid,
+            mtime: node.meta.mtime,
+            size,
+            read_only: self.snapshot.is_ro(&physical),
+            no_exec: self.snapshot.is_noexec(&physical),
+            physical,
+        })
     }
 
     /// Mark a file the attacker created this session executable (`chmod +x` / `chmod 777`).
@@ -2267,6 +2323,59 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
         assert!(android.snapshot.is_noexec("/sdcard/x"));
         assert!(android.snapshot.is_noexec("/storage/emulated/0/x"));
         assert!(!android.snapshot.is_noexec("/data/local/tmp/x"));
+    }
+
+    #[test]
+    fn stat_reports_kind_size_and_mount_policy_and_follows_links_on_request() {
+        let fs = FakeFs::new();
+        let hostname = fs.stat("/etc/hostname", true).unwrap();
+        assert_eq!(hostname.kind, FileKind::Regular);
+        assert_eq!(
+            hostname.size,
+            fs.read_all("/etc/hostname", READ_CAP).unwrap().len() as u64
+        );
+        assert!(!hostname.read_only && !hostname.no_exec);
+        assert_eq!(fs.stat("/etc", true).unwrap().kind, FileKind::Directory);
+        assert_eq!(
+            fs.stat("/dev/null", true).unwrap().kind,
+            FileKind::CharDevice
+        );
+
+        // `/var/run` is a link to `/run`: unfollowed it is the link, followed the directory on
+        // its own mount.
+        let link = fs.stat("/var/run", false).unwrap();
+        assert_eq!(link.kind, FileKind::Symlink);
+        assert_eq!(link.size, "/run".len() as u64);
+        let run = fs.stat("/var/run", true).unwrap();
+        assert_eq!(
+            (run.kind, run.physical.as_str()),
+            (FileKind::Directory, "/run")
+        );
+        assert!(run.no_exec && !run.read_only);
+        assert_eq!(fs.stat("/bin/ls", true).unwrap().physical, "/usr/bin/ls");
+
+        assert!(fs.stat("/no/such/path", true).is_none());
+        assert!(fs.stat("/etc/hostname/child", true).is_none());
+
+        let android = FakeFs::android();
+        assert!(android.stat("/system/bin", true).unwrap().read_only);
+        assert!(!android.stat("/data/local/tmp", true).unwrap().read_only);
+        assert!(android.stat("/sdcard", true).unwrap().no_exec);
+    }
+
+    #[test]
+    fn stat_sees_what_the_session_created_and_removed() {
+        let mut fs = FakeFs::new();
+        fs.write_file("/tmp/made", b"abc").unwrap();
+        let made = fs.stat("/tmp/made", true).unwrap();
+        assert_eq!(
+            (made.kind, made.size, made.mode),
+            (FileKind::Regular, 3, MODE_FILE)
+        );
+        fs.remove_path("/tmp/made").unwrap();
+        assert!(fs.stat("/tmp/made", true).is_none());
+        fs.remove_path("/etc/hostname").unwrap();
+        assert!(fs.stat("/etc/hostname", true).is_none());
     }
 
     #[test]

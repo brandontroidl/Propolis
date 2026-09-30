@@ -64,6 +64,7 @@ mod parse;
 mod read;
 mod readlink;
 mod registry;
+mod test_builtin;
 mod trace;
 
 use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
@@ -2728,5 +2729,7 @@ mod proc_self_tests;
 mod read_tests;
 #[cfg(test)]
 mod readlink_tests;
+#[cfg(test)]
+mod test_builtin_tests;
 #[cfg(test)]
 mod tests;

@@ -311,6 +311,7 @@ fn image_generation_touches_no_host_file_and_starts_no_process() {
         ("read.rs", include_str!("read.rs")),
         ("dd.rs", include_str!("dd.rs")),
         ("readlink.rs", include_str!("readlink.rs")),
+        ("test_builtin.rs", include_str!("test_builtin.rs")),
     ] {
         let production = source.split("#[cfg(test)]").next().unwrap();
         for banned in [
@@ -334,7 +335,7 @@ fn every_registered_command_with_a_recorded_binary_has_facts() {
     for name in [
         "uname", "id", "whoami", "echo", "cat", "head", "ls", "mount", "true", "false", "wget",
         "curl", "ping", "sh", "bash", "busybox", "chmod", "cp", "rm", "mkdir", "sleep", "su",
-        "readlink",
+        "readlink", "test", "[",
     ] {
         assert!(registry.node_facts(name).is_some(), "{name}");
     }

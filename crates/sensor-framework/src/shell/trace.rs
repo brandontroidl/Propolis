@@ -97,6 +97,8 @@ pub enum HandlerId {
     EnableNotFound,
     TrueColon,
     False,
+    /// `test` and `[`.
+    Test,
     Wget,
     Curl,
     Ping,
@@ -494,6 +496,8 @@ mod tests {
             ("true", HandlerId::TrueColon),
             (":", HandlerId::TrueColon),
             ("false", HandlerId::False),
+            ("test -e /", HandlerId::Test),
+            ("[ -e / ]", HandlerId::Test),
             ("wget -q http://203.0.113.9/x", HandlerId::Wget),
             ("curl http://203.0.113.9/x", HandlerId::Curl),
             ("ping -c1 203.0.113.9", HandlerId::Ping),

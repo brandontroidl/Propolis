@@ -91,6 +91,32 @@ pub struct OutputSegment {
     pub bytes: Vec<u8>,
 }
 
+/// One output redirection parsed from a simple command's whitespace tokens. S5 models fd 1
+/// (stdout) and fd 2 (stderr) only; the full 0-9 open-file-description table is S8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Redirection<'a> {
+    /// Source fd being redirected: 1 for `>`/`>>`, 2 for `2>`, etc.
+    fd: u8,
+    kind: RedirKind<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirKind<'a> {
+    /// `> t`, `>> t`, `>t`, `2>t`: write (append=false truncates, true appends) to a path token.
+    /// `/dev/null` is recognised at apply time and discards; it is NOT created as a file.
+    File { target: &'a str, append: bool },
+    /// `N>&M` / `>&M`: duplicate fd M's current destination onto fd N (`2>&1`, `1>&2`).
+    Dup(u8),
+    /// `N>&-`: close fd N (route to discard).
+    Close,
+}
+
+/// A simple command's argv with its output redirections removed, produced by `split_redirections`.
+struct Redirected<'a> {
+    argv: Vec<&'a str>,
+    redirs: Vec<Redirection<'a>>,
+}
+
 /// The observable result of one command or command list. Status is authoritative for shell
 /// control flow; output wording is never inspected to decide whether `&&` or `||` continues.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,14 +558,12 @@ impl FakeShell {
             if !run {
                 continue;
             }
-            let parts: Vec<&str> = segment.split_whitespace().collect();
-            if parts.is_empty() {
+            let all: Vec<&str> = segment.split_whitespace().collect();
+            let stage = first_pipeline_stage(&all);
+            if stage.is_empty() {
                 continue;
             }
-            let command = match redirection_only_target(&parts) {
-                Some(target) => self.redirection_only(target),
-                None => self.dispatch(&parts),
-            };
+            let command = self.run_simple(stage);
             result.append(command);
             if result.stop_line {
                 break;
@@ -548,34 +572,129 @@ impl FakeShell {
         result
     }
 
-    /// `> path` with no command is a real command: it opens the file for writing and prints
-    /// nothing. Loaders probe for a writable directory this way, chaining `>/var/run/.x && cd
-    /// /var/run` across a list of candidates, and the probe must succeed exactly where the box
-    /// would let it (the directory exists) and fail with the shell's own message where it does
-    /// not, or the `&&` after it runs in the wrong places. Dispatching `>/var/run/.x` as a
-    /// command name answered "command not found", failed every probe, and the chain never
-    /// reached the busybox marker the loader keys its next stage on (observed live 2026-09-06).
-    fn redirection_only(&mut self, target: &str) -> CommandResult {
-        let resolved = self.resolve_logical(target);
-        match self.fs.create_file(&resolved) {
-            Ok(()) => CommandResult::silent(0),
-            Err(FsError::ReadOnly) => CommandResult::stderr(
-                1,
-                self.shell_error(format_args!("{resolved}: Read-only file system")),
-            ),
-            Err(FsError::IsADirectory) => CommandResult::stderr(
-                1,
-                self.shell_error(format_args!("{resolved}: Is a directory")),
-            ),
-            Err(FsError::NoSpace) => CommandResult::stderr(
-                1,
-                self.shell_error(format_args!("{resolved}: No space left on device")),
-            ),
-            Err(_) => CommandResult::stderr(
-                1,
-                self.shell_error(format_args!("{resolved}: No such file or directory")),
-            ),
+    /// Run one simple command (the first pipeline stage of a control segment): parse its
+    /// redirections, open the targets before dispatch (a real shell opens fds before exec),
+    /// dispatch the command, then route each output segment to its fd's destination.
+    ///
+    /// A command made only of redirections (`> path`) is a real command: it opens the file for
+    /// writing and prints nothing. Loaders probe for a writable directory this way, chaining
+    /// `>/var/run/.x && cd /var/run` across a list of candidates, and the probe must succeed
+    /// exactly where the box would let it (the directory exists) and fail with the shell's own
+    /// message where it does not, or the `&&` after it runs in the wrong places. Dispatching
+    /// `>/var/run/.x` as a command name answered "command not found", failed every probe, and the
+    /// chain never reached the busybox marker the loader keys its next stage on (observed live
+    /// 2026-09-06).
+    fn run_simple(&mut self, stage: &[&str]) -> CommandResult {
+        #[derive(Clone)]
+        enum Sink {
+            Terminal,
+            Discard,
+            File { path: String, append: bool },
         }
+
+        let Redirected { argv, redirs } = split_redirections(stage);
+
+        // Destination per fd; index 0 is unused, 1 is stdout, 2 is stderr.
+        let mut sink = [Sink::Terminal, Sink::Terminal, Sink::Terminal];
+
+        // The first failing file redirection prints the shell's own error and the command never
+        // dispatches, as in bash.
+        for r in &redirs {
+            let idx = usize::from(r.fd);
+            match r.kind {
+                RedirKind::Close => {
+                    if let Some(slot) = sink.get_mut(idx) {
+                        *slot = Sink::Discard;
+                    }
+                }
+                RedirKind::Dup(m) => {
+                    let dest = sink.get(usize::from(m)).cloned().unwrap_or(Sink::Terminal);
+                    if let Some(slot) = sink.get_mut(idx) {
+                        *slot = dest;
+                    }
+                }
+                RedirKind::File { target, append } => {
+                    let resolved = self.resolve_logical(target);
+                    if is_discard_path(&resolved) {
+                        if let Some(slot) = sink.get_mut(idx) {
+                            *slot = Sink::Discard;
+                        }
+                        continue;
+                    }
+                    // `>>` keeps an existing file's content; everything else creates or truncates.
+                    let open = if append && self.fs.file_exists(&resolved) {
+                        Ok(())
+                    } else {
+                        self.fs.create_file(&resolved)
+                    };
+                    if let Err(error) = open {
+                        return self.redirect_open_error(&resolved, &error);
+                    }
+                    if let Some(slot) = sink.get_mut(idx) {
+                        *slot = Sink::File {
+                            path: resolved,
+                            append,
+                        };
+                    }
+                }
+            }
+        }
+
+        // An empty argv (a redirection-only command) dispatches to a silent success.
+        let result = self.dispatch(&argv);
+        if redirs.is_empty() {
+            return result;
+        }
+
+        let mut kept: Vec<OutputSegment> = Vec::new();
+        let mut writes: Vec<(String, bool, Vec<u8>)> = Vec::new();
+        for seg in &result.output {
+            let idx = match seg.fd {
+                OutputFd::Stdout => 1,
+                OutputFd::Stderr => 2,
+            };
+            match sink.get(idx) {
+                Some(Sink::Discard) => {}
+                Some(Sink::File { path, append }) => {
+                    match writes.iter_mut().find(|(p, _, _)| p == path) {
+                        Some((_, _, buf)) => buf.extend_from_slice(&seg.bytes),
+                        None => writes.push((path.clone(), *append, seg.bytes.clone())),
+                    }
+                }
+                Some(Sink::Terminal) | None => kept.push(seg.clone()),
+            }
+        }
+
+        // The target was truncated or preserved at open, so `>` and `>>` both continue from the
+        // file's current content.
+        for (path, append, bytes) in writes {
+            let mut content = if append {
+                self.fs.read_all(&path, READ_CAP).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            content.extend_from_slice(&bytes);
+            let _ = self.fs.write_file(&path, &content);
+        }
+
+        let mut terminal = CommandResult::silent(result.status);
+        for seg in kept {
+            terminal.append(CommandResult::one(seg.fd, result.status, seg.bytes));
+        }
+        terminal.close_session = result.close_session;
+        terminal.stop_line = result.stop_line;
+        terminal
+    }
+
+    /// What the shell itself says when it cannot open a redirection target.
+    fn redirect_open_error(&self, resolved: &str, error: &FsError) -> CommandResult {
+        let reason = match error {
+            FsError::ReadOnly => "Read-only file system",
+            FsError::IsADirectory => "Is a directory",
+            FsError::NoSpace => "No space left on device",
+            _ => "No such file or directory",
+        };
+        CommandResult::stderr(1, self.shell_error(format_args!("{resolved}: {reason}")))
     }
 
     /// Build a `honeypot_command_exec` event carrying `metadata`, stamped from the session context.
@@ -1042,11 +1161,43 @@ impl FakeShell {
                 return result;
             }
         }
+        // `sh FILE` runs a script file. The parser is not built yet, so the file is resolved and
+        // a missing one gets the dialect's open error; anything else exits 0 without running.
+        if script.is_none()
+            && let Some(file) = first_non_flag_arg(&parts[1..])
+        {
+            return self.run_sh_file(command_basename(parts[0]), file);
+        }
         if parts.len() == 1 {
             let level = self.spawned_level(command_basename(parts[0]), 0);
             self.push_level(level);
         }
         CommandResult::silent(0)
+    }
+
+    /// `sh|bash|dash|ash FILE`. `shell_name` is the invoked command's basename: bash reports its own
+    /// open error with 127, the dash family dash's with 2. The spawned shell reports at its own
+    /// line 0 whatever the caller's line counter says, and pushes no persistent level, like
+    /// `sh -c`.
+    fn run_sh_file(&self, shell_name: &str, file: &str) -> CommandResult {
+        let path = self.resolve_logical(file);
+        match self.fs.read_all(&path, READ_CAP) {
+            Ok(bytes) => {
+                let content = String::from_utf8_lossy(&bytes);
+                if is_blank_or_comment_only(&content) {
+                    return CommandResult::silent(0);
+                }
+                // Content is recorded as intent by the command event; it is not interpreted yet.
+                CommandResult::silent(0)
+            }
+            Err(_) if shell_name == "bash" => {
+                // [unverified] wording and status: no `bash FILE` capture exists yet.
+                CommandResult::stderr(127, format!("bash: {file}: No such file or directory\n"))
+            }
+            Err(_) => {
+                CommandResult::stderr(2, format!("sh: 0: cannot open {file}: No such file\n"))
+            }
+        }
     }
 
     fn spawned_level(&self, command: &str, dash_line: u64) -> ShellLevel {
@@ -1349,30 +1500,90 @@ fn control_segments(line: &str) -> Vec<(ControlOp, &str)> {
     segments
 }
 
-/// If `parts` is a command made only of output redirections (`>/tmp/.x`, `> /tmp/.x`,
-/// `>>/tmp/.x`, `1>/tmp/.x`), the file they write. Any ordinary word makes it a normal command
-/// and `None` is returned; an input-only redirection (`</etc/passwd`) reads nothing and is not
-/// modeled here either.
-fn redirection_only_target<'a>(parts: &[&'a str]) -> Option<&'a str> {
-    let mut target = None;
+/// The tokens of a segment up to (excluding) the first standalone `|` token. A pipeline is still
+/// answered by its first stage (see `run_line`); redirections that belong to a LATER stage are not
+/// this command's, so they must not be parsed or applied. `cat /bin/ls|head` keeps `/bin/ls|head`
+/// as one token (the `|` is glued, not standalone) and is unaffected.
+fn first_pipeline_stage<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    match tokens.iter().position(|&t| t == "|") {
+        Some(i) => &tokens[..i],
+        None => tokens,
+    }
+}
+
+/// Split a simple command's whitespace tokens into argv and output redirections. Recognises the
+/// whitespace-delimited forms IoT loaders use:
+///   `>` `>>` `1>` `2>` `2>>`   operator token, target is the NEXT token
+///   `>f` `>>f` `2>f`           target attached to the operator
+///   `2>&1` `1>&2` `>&2`        duplicate another fd's destination
+///   `2>&-`                     close
+/// A token is a redirection operator ONLY when everything before its `>`/`<` is empty or all ASCII
+/// digits: `2>x` parses (fd 2), `i>ii` does NOT and stays a literal argv token (word-attached
+/// operators need the S9 lexer). Input redirections (`<`, `<<`, `<f`) are consumed and dropped, as
+/// the fake shell reads nothing. A bare operator with no target is dropped.
+fn split_redirections<'a>(stage: &[&'a str]) -> Redirected<'a> {
+    let mut argv = Vec::new();
+    let mut redirs = Vec::new();
     let mut i = 0;
-    while i < parts.len() {
-        let tok = parts[i];
-        let stripped = tok.trim_start_matches(|c: char| c.is_ascii_digit());
-        if !stripped.starts_with('>') {
-            return None;
-        }
-        let attached = stripped.trim_start_matches('>');
-        let file = if attached.is_empty() {
-            i += 1;
-            *parts.get(i)?
+    while let Some(&t) = stage.get(i) {
+        let digit_count = t.bytes().take_while(u8::is_ascii_digit).count();
+        let (digits, rest) = t.split_at(digit_count);
+        if rest.starts_with('>') {
+            let fd = if digits.is_empty() {
+                1
+            } else {
+                digits.parse::<u8>().unwrap_or(1)
+            };
+            let append = rest.starts_with(">>");
+            let after = &rest[if append { 2 } else { 1 }..];
+            if after.is_empty() {
+                i += 1;
+                if let Some(&next) = stage.get(i) {
+                    redirs.push(Redirection {
+                        fd,
+                        kind: RedirKind::File {
+                            target: next,
+                            append,
+                        },
+                    });
+                }
+            } else if after == "&-" {
+                redirs.push(Redirection {
+                    fd,
+                    kind: RedirKind::Close,
+                });
+            } else if let Some(m) = after.strip_prefix('&') {
+                if let Ok(k) = m.parse::<u8>() {
+                    redirs.push(Redirection {
+                        fd,
+                        kind: RedirKind::Dup(k),
+                    });
+                }
+            } else {
+                redirs.push(Redirection {
+                    fd,
+                    kind: RedirKind::File {
+                        target: after,
+                        append,
+                    },
+                });
+            }
+        } else if let Some(input) = rest.strip_prefix('<') {
+            if input.trim_start_matches('<').is_empty() {
+                i += 1;
+            }
         } else {
-            attached
-        };
-        target.get_or_insert(file);
+            argv.push(t);
+        }
         i += 1;
     }
-    target
+    Redirected { argv, redirs }
+}
+
+/// Redirection targets that discard writes without creating a file. `/dev/null` is a device node
+/// in the filesystem, but matching it here keeps a `>/dev/null` from touching the overlay.
+fn is_discard_path(resolved: &str) -> bool {
+    resolved == "/dev/null"
 }
 
 /// `tftp [-g|-p] [-l LOCAL] [-r REMOTE] HOST [PORT]` (BusyBox) -> `tftp://HOST[:PORT]/REMOTE`.
@@ -1941,6 +2152,15 @@ fn cmd_ping(parts: &[&str]) -> String {
 /// (`ls -la`) as a lookup for a nonexistent path named `-la`.
 fn first_non_flag_arg<'a>(args: &[&'a str]) -> Option<&'a str> {
     args.iter().find(|arg| !arg.starts_with('-')).copied()
+}
+
+/// A script whose every line is empty or a comment (first non-blank char `#`). Such a file makes
+/// `sh FILE` exit 0 silently; the `.fxcat` sweep's one-byte "\n" files are the case that matters.
+fn is_blank_or_comment_only(content: &str) -> bool {
+    content.lines().all(|l| {
+        let t = l.trim_start();
+        t.is_empty() || t.starts_with('#')
+    })
 }
 
 /// A honeypot `echo` faithful enough to survive the shell-detection handshakes IoT botnets run
@@ -3436,5 +3656,190 @@ mod shell_detection_tests {
         assert!(!banner.contains("curl"));
         let (out, _) = shell().handle_input("busybox curl http://x/y");
         assert!(out.contains("curl: applet not found"), "got: {out}");
+    }
+
+    #[test]
+    fn redirect_truncates_stdout_into_a_file() {
+        let mut sh = shell();
+        assert_eq!(sh.handle_input("cd /tmp").0, "");
+        assert_eq!(sh.handle_input("echo hi > /tmp/f").0, "");
+        assert_eq!(sh.handle_input("cat /tmp/f").0, "hi\n");
+        // A second `>` replaces the content rather than extending it.
+        assert_eq!(sh.handle_input("echo yo > /tmp/f").0, "");
+        assert_eq!(sh.handle_input("cat /tmp/f").0, "yo\n");
+        // A command that prints nothing still truncates, as the shell opens the file first.
+        assert_eq!(sh.handle_input("true > /tmp/f").0, "");
+        assert_eq!(sh.handle_input("cat /tmp/f").0, "");
+    }
+
+    #[test]
+    fn redirect_append_adds_to_existing() {
+        let mut sh = shell();
+        sh.handle_input("echo a > /tmp/f");
+        assert_eq!(sh.handle_input("echo b >> /tmp/f").0, "");
+        assert_eq!(sh.handle_input("cat /tmp/f").0, "a\nb\n");
+    }
+
+    #[test]
+    fn busybox_echo_redirect_writes_one_newline_and_prints_nothing() {
+        let mut sh = shell();
+        assert_eq!(sh.handle_input("/bin/busybox echo > /tmp/.fxcat").0, "");
+        assert_eq!(sh.handle_input("cat /tmp/.fxcat").0, "\n");
+        let r = sh.handle_input("sh /tmp/.fxcat").0;
+        assert_eq!(r, "");
+        assert_eq!(r.status, 0);
+    }
+
+    #[test]
+    fn sh_of_blank_or_comment_only_file_exits_zero_silently() {
+        let mut sh = shell();
+        sh.handle_input("echo > /tmp/blank");
+        assert_eq!(sh.handle_input("sh /tmp/blank").0, "");
+        sh.handle_input("echo '# just a comment' > /tmp/c");
+        let r = sh.handle_input("sh /tmp/c").0;
+        assert_eq!(r, "");
+        assert_eq!(r.status, 0);
+        assert!(super::is_blank_or_comment_only("\n"));
+        assert!(super::is_blank_or_comment_only(""));
+        assert!(super::is_blank_or_comment_only("   \n#x\n"));
+        assert!(!super::is_blank_or_comment_only("id\n"));
+    }
+
+    #[test]
+    fn sh_of_a_file_with_real_content_exits_zero_unparsed() {
+        let mut sh = shell();
+        sh.handle_input("echo id > /tmp/s");
+        let r = sh.handle_input("sh /tmp/s").0;
+        assert_eq!(r, "");
+        assert_eq!(r.status, 0);
+        assert!(!r.contains("uid=0"));
+    }
+
+    #[test]
+    fn sh_of_a_missing_file_gives_the_dash_open_error() {
+        let mut sh = shell();
+        let r = sh.handle_input("sh /tmp/nope").0;
+        assert_eq!(r, "sh: 0: cannot open /tmp/nope: No such file\n");
+        assert_eq!(r.status, 2);
+    }
+
+    #[test]
+    fn sh_dash_c_with_an_empty_script_is_not_a_file_open() {
+        let mut sh = shell();
+        let r = sh.handle_input("sh -c \"\"").0;
+        assert_eq!(r, "");
+        assert_eq!(r.status, 0);
+    }
+
+    #[test]
+    fn stderr_redirect_discards_via_dev_null_and_merges_via_2to1() {
+        let mut sh = shell();
+        sh.handle_input("cd /tmp");
+        assert_eq!(sh.handle_input("ls /missing_q 2>/dev/null").0, "");
+        assert_eq!(sh.handle_input("ls /missing_q 2>/dev/null").0.status, 2);
+        assert_eq!(sh.handle_input("ls /missing_q > /tmp/o 2>&1").0, "");
+        assert_eq!(
+            sh.handle_input("cat /tmp/o").0,
+            "ls: cannot access '/missing_q': No such file or directory\n"
+        );
+    }
+
+    #[test]
+    fn redirect_target_is_created_even_when_the_command_fails() {
+        let mut sh = shell();
+        sh.handle_input("cd /tmp");
+        assert_eq!(
+            sh.handle_input("cat /missing_q > /tmp/.bb").0,
+            "cat: /missing_q: No such file or directory\n"
+        );
+        assert_eq!(sh.handle_input("chmod 755 /tmp/.bb").0, "");
+        assert_eq!(sh.handle_input("/tmp/.bb").0, "");
+    }
+
+    #[test]
+    fn redirect_into_a_missing_directory_errors_and_blocks_the_command() {
+        let mut sh = shell();
+        let r = sh.handle_input("echo hi > /nope/f").0;
+        assert_eq!(r, "-bash: /nope/f: No such file or directory\n");
+        assert_eq!(r.status, 1);
+        assert!(sh.handle_input("ls /nope").0.contains("No such file"));
+    }
+
+    #[test]
+    fn word_attached_redirect_stays_a_literal_argument() {
+        use super::{Redirected, split_redirections};
+        let Redirected { argv, redirs } = split_redirections(&["cat", "i>ii"]);
+        assert_eq!(argv, vec!["cat", "i>ii"]);
+        assert!(redirs.is_empty());
+        let mut sh = shell();
+        sh.handle_input("cd /var");
+        assert_eq!(
+            sh.handle_input("cat i>ii").0,
+            "cat: i>ii: No such file or directory\n"
+        );
+    }
+
+    #[test]
+    fn pipeline_redirect_belongs_to_the_last_stage_and_is_ignored() {
+        let mut sh = shell();
+        assert!(
+            sh.handle_input("printf x | base64 -d > /tmp/.s")
+                .0
+                .contains("not found")
+        );
+        assert!(sh.handle_input("cat /tmp/.s").0.contains("No such file"));
+        assert_eq!(
+            super::first_pipeline_stage(&["id", "|", "grep", "uid"]),
+            &["id"]
+        );
+        assert_eq!(
+            super::first_pipeline_stage(&["cat", "/bin/ls|head", "-n", "1"]),
+            &["cat", "/bin/ls|head", "-n", "1"]
+        );
+    }
+
+    #[test]
+    fn split_redirections_classifies_every_form() {
+        use super::{RedirKind, split_redirections};
+        let r = split_redirections(&["echo", "a", ">", "f"]);
+        assert_eq!(r.argv, vec!["echo", "a"]);
+        assert_eq!(r.redirs.len(), 1);
+        assert!(matches!(
+            r.redirs[0].kind,
+            RedirKind::File {
+                target: "f",
+                append: false
+            }
+        ));
+        assert_eq!(
+            split_redirections(&["echo", ">>f"]).redirs[0].kind,
+            RedirKind::File {
+                target: "f",
+                append: true
+            }
+        );
+        let two = split_redirections(&["x", "2>e"]);
+        assert_eq!(two.redirs[0].fd, 2);
+        assert_eq!(
+            split_redirections(&["x", "2>&1"]).redirs[0].kind,
+            RedirKind::Dup(1)
+        );
+        assert_eq!(
+            split_redirections(&["x", "2>&-"]).redirs[0].kind,
+            RedirKind::Close
+        );
+        assert!(matches!(
+            split_redirections(&["x", ">/dev/null"]).redirs[0].kind,
+            RedirKind::File {
+                target: "/dev/null",
+                ..
+            }
+        ));
+        assert!(split_redirections(&["cat", "<in"]).redirs.is_empty());
+        assert_eq!(split_redirections(&["cat", "<in"]).argv, vec!["cat"]);
+        assert_eq!(
+            split_redirections(&["cat", "<", "in", "x"]).argv,
+            vec!["cat", "x"]
+        );
     }
 }

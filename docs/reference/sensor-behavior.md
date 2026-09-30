@@ -225,7 +225,10 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
 - Implemented commands (`dispatch`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::dispatch`): `uname` (real per-flag field
   selection), `id`/`whoami`/`pwd`, `echo` (Gafgyt/BASHLITE `\xHH`-decoding
   handshake returning `GAYFGT`, `crates/sensor-framework/src/shell/mod.rs#cmd_echo`, `crates/sensor-framework/src/shell/mod.rs#decode_echo_escapes_into`), `cat` (fakefs plus a special
-  `/proc/self/cmdline` returning argv), `ls` (sorted, dotfiles hidden without `-a`),
+  `/proc/self/cmdline` returning argv, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_cat`), `head` (`-n`/`-c` over a file or a pipe,
+  `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_head`), `more` (copies its input through: the pty pager needs a
+  terminal-rows model the shell does not have, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_more`) and `hexdump` (only `-e '16/1 "%c"'` with `-n`;
+  any other format prints nothing, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_hexdump`), `ls` (sorted, dotfiles hidden without `-a`),
   `cp`/`rm`/`mkdir` (they change the session's filesystem and report the real errors),
   `wget`/`curl` (canned transcripts, `-O-`/`-qO-` writes body to stdout, a saved
   download becomes a file), `ping` (canned replies), `sh`/`bash`/`ash`

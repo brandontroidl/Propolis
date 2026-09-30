@@ -34,8 +34,8 @@
 //! dispatches through the `registry` to the handlers in this file and in `builtins`. Constructs
 //! outside that subset (`case`, `[[ ]]`, functions, `$'..'`, brace expansion, here-strings,
 //! arrays) parse and are skipped with status 0, so they never raise an error a real shell would
-//! not. Words are `String`s; migrating every handler to byte-string arguments is deferred to
-//! when a command family (F1/F2) needs it.
+//! not. Words are `String`s; migrating every handler to byte-string arguments is deferred until a
+//! command family needs it (F1 and F2 did not: file contents and pipe data are already bytes).
 #![forbid(unsafe_code)]
 
 use std::net::IpAddr;
@@ -60,6 +60,7 @@ mod eval;
 mod expand;
 mod lex;
 mod parse;
+mod read;
 mod registry;
 mod trace;
 
@@ -1601,46 +1602,6 @@ impl FakeShell {
         }
     }
 
-    fn cmd_cat(&mut self, parts: &[&str]) -> CommandResult {
-        match first_non_flag_arg(&parts[1..]).filter(|path| *path != "-") {
-            Some(path) => {
-                let own_cmdline = format!("/proc/{}/cmdline", self.state().pid);
-                let typed = self.normalize_logical(path);
-                // /proc/self is the reading process (`cat`), so /proc/self/cmdline is its own argv,
-                // NUL-separated with a trailing NUL and no newline - exactly as the kernel returns
-                // it. A missing one ("No such file or directory") is a classic honeypot tell some
-                // Mirai/Gafgyt loaders check before delivering a payload. The shell's own
-                // `/proc/<pid>/cmdline` is the shell's argv.
-                if typed == "/proc/self/cmdline" {
-                    let mut out = parts.join("\0");
-                    out.push('\0');
-                    return CommandResult::stdout(out.into_bytes());
-                }
-                if typed == own_cmdline {
-                    return CommandResult::stdout(format!("{}\0", self.argv_zero()).into_bytes());
-                }
-                let reader = self.reader_of(parts[0]);
-                let resolved = self.resolve_reading(path, Some(reader));
-                // A modeled executable is bigger than `READ_CAP` (busybox is 2 MiB); the line's
-                // work allowance is the bound, as it is for anything else a line produces.
-                let cap = self.budget().limits().work_per_line;
-                match self.fs.read_all(&resolved, cap) {
-                    Ok(contents) => CommandResult::stdout(contents),
-                    Err(FsError::IsADirectory) => {
-                        CommandResult::stderr(1, format!("cat: {path}: Is a directory\n"))
-                    }
-                    Err(_) => CommandResult::stderr(
-                        1,
-                        format!("cat: {path}: No such file or directory\n"),
-                    ),
-                }
-            }
-            // No operand: copy standard input through, which is what a pipeline into `cat` and a
-            // `cat < file` need. From the terminal there is nothing to read.
-            None => CommandResult::stdout(self.stdin.take_rest()),
-        }
-    }
-
     fn cmd_ls(&mut self, parts: &[&str]) -> CommandResult {
         let cwd = self.cwd().to_string();
         let target = first_non_flag_arg(&parts[1..]).unwrap_or(cwd.as_str());
@@ -2156,8 +2117,8 @@ fn url_if_fetch_line(line: &str) -> Option<&str> {
 /// applet). Every entry here is handled by [`FakeShell::dispatch`] when invoked bare, so
 /// `busybox <applet>` never falls through to "command not found".
 const BUSYBOX_APPLETS: &[&str] = &[
-    "ash", "cat", "chmod", "cp", "echo", "ftpget", "id", "ls", "mkdir", "ping", "pwd", "rm", "sh",
-    "sleep", "tftp", "uname", "wget", "whoami",
+    "ash", "cat", "chmod", "cp", "echo", "ftpget", "head", "hexdump", "id", "ls", "mkdir", "more",
+    "ping", "pwd", "rm", "sh", "sleep", "tftp", "uname", "wget", "whoami",
 ];
 
 /// True if `name` is one of the applets this shell models (see [`BUSYBOX_APPLETS`]); anything else
@@ -2759,5 +2720,7 @@ mod budget_tests;
 mod grammar_tests;
 #[cfg(test)]
 mod proc_self_tests;
+#[cfg(test)]
+mod read_tests;
 #[cfg(test)]
 mod tests;

@@ -307,6 +307,7 @@ fn image_generation_touches_no_host_file_and_starts_no_process() {
         ("binaries.rs", include_str!("../binaries.rs")),
         ("fakefs.rs", include_str!("../fakefs.rs")),
         ("registry.rs", include_str!("registry.rs")),
+        ("read.rs", include_str!("read.rs")),
     ] {
         let production = source.split("#[cfg(test)]").next().unwrap();
         for banned in [
@@ -328,8 +329,8 @@ fn image_generation_touches_no_host_file_and_starts_no_process() {
 fn every_registered_command_with_a_recorded_binary_has_facts() {
     let registry = Registry::builtin();
     for name in [
-        "uname", "id", "whoami", "echo", "cat", "ls", "mount", "true", "false", "wget", "curl",
-        "ping", "sh", "bash", "busybox", "chmod", "cp", "rm", "mkdir", "sleep", "su",
+        "uname", "id", "whoami", "echo", "cat", "head", "ls", "mount", "true", "false", "wget",
+        "curl", "ping", "sh", "bash", "busybox", "chmod", "cp", "rm", "mkdir", "sleep", "su",
     ] {
         assert!(registry.node_facts(name).is_some(), "{name}");
     }

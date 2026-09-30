@@ -57,6 +57,7 @@ impl Registry {
             nodes: HashMap::new(),
         };
         register_core(&mut registry);
+        super::read::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }
@@ -70,13 +71,13 @@ impl Registry {
     ///
     /// Panics if `name` already has an unguarded entry: it would answer every invocation and the
     /// new one could never run.
-    fn register(&mut self, name: &'static str, id: HandlerId, handler: HandlerFn) {
+    pub(super) fn register(&mut self, name: &'static str, id: HandlerId, handler: HandlerFn) {
         self.push(name, None, id, handler);
     }
 
     /// Register `handler` for `name` when `guard` holds. Guarded entries go before the unguarded
     /// entry for the same name.
-    fn register_if(
+    pub(super) fn register_if(
         &mut self,
         name: &'static str,
         guard: GuardFn,
@@ -155,7 +156,6 @@ fn register_core(r: &mut Registry) {
     r.register("whoami", HandlerId::Whoami, FakeShell::builtin_whoami);
     r.register("pwd", HandlerId::Pwd, FakeShell::builtin_pwd);
     r.register("echo", HandlerId::Echo, FakeShell::builtin_echo);
-    r.register("cat", HandlerId::Cat, FakeShell::cmd_cat);
     r.register("ls", HandlerId::Ls, FakeShell::cmd_ls);
     r.register("mount", HandlerId::Mount, FakeShell::builtin_mount);
     r.register_if(

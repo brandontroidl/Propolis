@@ -82,6 +82,12 @@ impl LineBudget {
         self.charged
     }
 
+    /// What the line may still spend: the most bytes a reader may hand back without the line's
+    /// own charge for them running it out.
+    pub(super) fn remaining(&self) -> u64 {
+        self.left
+    }
+
     pub(super) fn exhausted(&self) -> bool {
         self.exhausted
     }
@@ -283,6 +289,18 @@ impl Stdin {
             .saturating_add(line.len())
             .saturating_add(usize::from(ended));
         Some((line, ended))
+    }
+
+    /// Up to `n` bytes not yet read, so a reader that stops early leaves the rest for the next.
+    pub(super) fn take(&mut self, n: u64) -> Vec<u8> {
+        let Self::Data { bytes, pos } = self else {
+            return Vec::new();
+        };
+        let rest = bytes.get(*pos..).unwrap_or(&[]);
+        let want = usize::try_from(n).unwrap_or(usize::MAX).min(rest.len());
+        let taken = rest.get(..want).unwrap_or(&[]).to_vec();
+        *pos = pos.saturating_add(want);
+        taken
     }
 
     /// Everything not yet read.

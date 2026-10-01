@@ -354,12 +354,50 @@ captures SCP/SFTP transfers.
   and `method` in `honeypot_login_attempt`; the **password is read only to advance
   the parser and is never stored, logged, or emitted** (`crates/sensor-ssh/src/auth.rs`, `crates/sensor-ssh/src/auth.rs#AuthState::handle_userauth`). String
   cap `MAX_METADATA_STRING_LEN = 255` (`crates/sensor-ssh/src/auth.rs#MAX_METADATA_STRING_LEN`).
-- **Channels** (`channel.rs`): only `session` channels are confirmed;
-  `direct-tcpip` and all other types are refused at open - this closes off
-  attacker-directed proxying by construction (`crates/sensor-ssh/src/channel.rs#handle_channel_open`). Actions: `pty-req`
-  (ack), `shell` (interactive FakeShell with state-derived prompts), `exec <cmd>`
-  (one-shot with noninteractive bash diagnostics; `scp -t ` starts
-  the SCP receiver), `subsystem sftp` (SFTP handler). `MAX_LINE_LEN = 8192`.
+- **Channel table:** one connection may hold several channels, each with its own
+  handler and its own flow-control state, keyed by the client's sender-channel number
+  (mirrored as the server id). The table is capped at `MAX_CHANNELS_PER_CONNECTION`
+  = 10; a valid `session` open past the cap, or reusing an id already in the table, is
+  refused with `SSH_OPEN_RESOURCE_SHORTAGE` ("channel limit reached") so an OPEN flood
+  cannot pin unbounded shells. Only `session` channels are confirmed; `direct-tcpip`,
+  every other type, and a zero peer max-packet are refused at open with
+  `SSH_OPEN_UNKNOWN_CHANNEL_TYPE` - this closes off attacker-directed proxying by
+  construction (`crates/sensor-ssh/src/server.rs#MAX_CHANNELS_PER_CONNECTION`, `crates/sensor-ssh/src/channel.rs#handle_channel_open`, `crates/sensor-ssh/src/channel.rs#build_channel_open_resource_shortage`).
+  A channel the server has already closed stays in the table until the peer's CLOSE
+  arrives, and meanwhile refuses new requests and drops further data.
+- **Flow control** (RFC 4254 section 5.2, per channel): the server advertises
+  `INITIAL_WINDOW_SIZE` 2 MiB and `CHANNEL_MAX_PACKET_SIZE` 32 KiB on every
+  confirmation. Server-to-client output honors the **peer's** window and max packet:
+  output is queued per channel and emitted in chunks of at most `min(peer max packet,
+  32 KiB, remaining peer window)`, stopping at a zero peer window and resuming only on
+  that channel's `WINDOW_ADJUST`, so a 2 MiB reply is never one oversized packet.
+  Client-to-server data is counted as it is consumed, and the server sends
+  `WINDOW_ADJUST` once the consumed bytes reach half the initial window (1 MiB)
+  (`crates/sensor-ssh/src/server.rs#next_frame`, `crates/sensor-ssh/src/server.rs#flush_channel_output`, `crates/sensor-ssh/src/server.rs#build_channel_window_adjust`, `crates/sensor-ssh/src/channel.rs#INITIAL_WINDOW_SIZE`, `crates/sensor-ssh/src/channel.rs#CHANNEL_MAX_PACKET_SIZE`).
+- **Channel requests** (`channel.rs`, dispatched in `handle_session`): `pty-req` (sets
+  a flag on the channel), `shell`, `exec <cmd>` and `subsystem sftp` are accepted only
+  on a channel still awaiting its handler; any other subsystem or request type (`env`,
+  `window-change`, `signal`) is not acted on. A reply is sent **only when `want_reply`
+  is set**: `CHANNEL_SUCCESS` if accepted, `CHANNEL_FAILURE` for an unknown or refused
+  request (`crates/sensor-ssh/src/channel.rs#handle_channel_request`, `crates/sensor-ssh/src/channel.rs#ChannelAction`, `crates/sensor-ssh/src/server.rs#build_channel_failure`).
+- **Interactive shell vs exec:** the `pty-req` flag selects terminal behavior. With a
+  pty the shell prints its state-derived prompt, echoes typed bytes, converts bare LF
+  to CR-LF with `onlcr`, and sends both streams merged on `CHANNEL_DATA`. Without a pty
+  (an `exec`, or `shell` with no `pty-req`) there is no echo or prompt, LF is left
+  untouched, and stderr is sent as `CHANNEL_EXTENDED_DATA` type 1
+  (`SSH_EXTENDED_DATA_STDERR`) while stdout stays on `CHANNEL_DATA`. `exec <cmd>` runs
+  once in the exec-mode shell (noninteractive bash diagnostics); `scp -t ` starts the
+  SCP receiver, `subsystem sftp` the SFTP handler. `MAX_LINE_LEN = 8192`
+  (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/server.rs#build_channel_extended_data`, `crates/sensor-ssh/src/server.rs#MAX_LINE_LEN`, `crates/sensor-framework/src/shell/mod.rs#onlcr`).
+- **Exec lifecycle:** a one-shot exec sends its queued output, then `exit-status`
+  (`want_reply` false), then `CHANNEL_EOF`, then `CHANNEL_CLOSE`, each only once all
+  queued output has drained, so a window-stalled reply still ends cleanly. An
+  interactive shell that exits takes the same path. A peer `CHANNEL_EOF` is a
+  half-close and does not cut queued output (`crates/sensor-ssh/src/server.rs#build_exit_status`, `crates/sensor-ssh/src/server.rs#build_channel_eof`, `crates/sensor-ssh/src/server.rs#build_channel_close`).
+- **Write deadline:** the session stream is wrapped once in `TimeoutStream`, so a write
+  or flush pending past `idle_timeout` fails rather than letting a peer that stops
+  reading (a zero window with a full socket buffer) stall the handler; the egress budget
+  is charged per data chunk and ends the session once spent (`crates/sensor-ssh/src/timeout_stream.rs#TimeoutStream`, `crates/sensor-ssh/src/server.rs#classify_read_failure`).
 - **Capture** (`transfer.rs`): captures **inbound writes only, never serves reads**
   (`crates/sensor-ssh/src/transfer.rs`). SCP receive mode parses the `C<mode> <size> <name>` header and streams
   the body to `honeypot_malware_upload`. SFTP v3 subset supports INIT/VERSION,
@@ -393,9 +431,32 @@ credential, then presents the fake shell.
   prompts `Password:` and reads the password **read-only, then drops it, never
   stored or logged** (`crates/sensor-telnet/src/handler.rs#handle_connection`); accepts unconditionally and emits
   `honeypot_login_attempt` (authenticated=true); enters the FakeShell. Echoes typed
-  characters, hides password characters, translates shell LF to CR-LF for NVT,
-  prints the active level's prompt, and closes only when the outer shell exits.
-  `MAX_LINE_LEN` 8192.
+  characters, hides password characters, prints the active level's prompt, and closes
+  only when the shell reports `close_session` (see below). `MAX_LINE_LEN` 8192
+  (`crates/sensor-telnet/src/handler.rs#LineReader`).
+- **Data encoder** (`crates/sensor-telnet/src/handler.rs#encode_telnet_data`): every
+  application byte the client reads (issue banner, login and password prompts,
+  typed-character echo, shell output, shell prompt) goes through one encoder and the
+  one writer built on it (`crates/sensor-telnet/src/handler.rs#write_telnet_data`). Order is fixed: ONLCR (every LF
+  becomes CR-LF, all other bytes untouched, no UTF-8 assumption, `crates/sensor-framework/src/shell/mod.rs#onlcr`), then
+  the optional per-session XOR codec (applied only where a shell exists: the shell
+  reply, its prompt, and the first prompt after login pass the `FakeShell`; the
+  pre-login banner, prompts and typed-character echo pass `None` and get ONLCR and IAC
+  doubling only), then RFC 854 doubling of every literal `0xFF` data byte. Negotiation
+  bytes (the connect preamble and the filter's `DONT`/`WONT` replies) bypass the
+  encoder through the raw writer because their `0xFF` bytes are protocol markers, not
+  data (`crates/sensor-telnet/src/handler.rs#write_raw`, `crates/sensor-framework/src/shell/mod.rs#FakeShell`). Egress is charged on the encoded length.
+- **Session end** (`crates/sensor-telnet/src/handler.rs#handle_connection`): when the shell's result has
+  `close_session` set (the outer shell exited, not a nested `exit`,
+  `crates/sensor-framework/src/shell/mod.rs#CommandResult`), the sensor writes that output once through the encoder
+  with no prompt appended, records `CaptureEnd::ClientLogout`, and drops the
+  connection. Every other exit (peer close, idle timeout, failed write, spent egress)
+  records its own ending (`crates/sensor-framework/src/handoff.rs#CaptureEnd`).
+- **Write deadline** (`crates/sensor-telnet/src/handler.rs#write_raw`): every write, negotiation replies and
+  in-reader echo included, is wrapped in a timeout of the connection's `idle_timeout`
+  (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`). A timed-out or failed write ends the session (recorded as
+  `TransportError` where a capture is armed), so a client that stops reading cannot
+  hold the handler on a blocked `write_all`.
 - **Bounds:** common defaults, `max_concurrent` 256. **Does not spool bodies.**
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
   `honeypot_command_exec`, `honeypot_file_download` (via shell).
@@ -509,7 +570,10 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
   auth-disabled adbd on port 5555 (the ADB.Miner target) (`crates/sensor-adb/src/adb_proto.rs`).
   `device_banner()` presents a fake Nexus 5 / hammerhead / Android 6.0.1 / sdk 23
   and deliberately omits `shell_v2` so real clients fall back to plain v1 shell
-  framing (`crates/sensor-adb/src/adb_proto.rs#device_banner`). `MAX_MESSAGE_DATA_LEN` 1_000_000, `OUR_MAXDATA` 4096.
+  framing (`crates/sensor-adb/src/adb_proto.rs#device_banner`). `MAX_MESSAGE_DATA_LEN` 1_000_000 bounds any
+  inbound message before a buffer is allocated for it (a larger declared length ends
+  the session as malformed input), and `OUR_MAXDATA` 4096 is the maxdata the sensor
+  advertises in its own CNXN (`crates/sensor-adb/src/adb_proto.rs#MAX_MESSAGE_DATA_LEN`, `crates/sensor-adb/src/adb_proto.rs#OUR_MAXDATA`, `crates/sensor-adb/src/adb_proto.rs#build_cnxn`).
 - **Behavior** (`handler.rs`): CNXN handshake → device banner, then multiplexed
   streams (`MAX_STREAMS_PER_CONN = 32`). OPEN destinations (`crates/sensor-adb/src/handler.rs#handle_open`): `shell:` →
   interactive FakeShell **in its Android flavor** (the device's filesystem, a
@@ -524,6 +588,42 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
   (a larger push keeps the prefix and is emitted with `truncated`/`wire_size`). A SEND
   whose DONE never arrives (stream closed or session dropped) is kept with
   `complete: false`.
+- **Write chunking** (`crates/sensor-adb/src/handler.rs#handle_connection`): the maxdata the client advertises
+  in its CNXN (`arg1`, clamped to 1 through `MAX_MESSAGE_DATA_LEN`) is the ceiling for
+  every WRTE the sensor sends. A reply larger than that is split into WRTEs of at most
+  that many payload bytes, so a client with a small maxdata never receives a message it
+  must reject (`crates/sensor-adb/src/handler.rs#drive_stream`).
+- **Per-stream send state** (`crates/sensor-adb/src/handler.rs#Stream`, `crates/sensor-adb/src/handler.rs#PendingWrite`): each stream
+  owns an outbound queue, an offset into the response being sent, and an `awaiting_okay`
+  flag. ADB flow control is stop-and-wait per stream: the sensor sends one WRTE, sets
+  the flag, and sends the next chunk only when the client's OKAY for that stream clears
+  it. Sending is never awaited inline and never blocks on the OKAY: the OPEN, WRTE and
+  OKAY arms of the read loop each call `drive_stream` once, which writes at most one
+  chunk and returns, so one slow stream cannot stall reading or the other streams
+  (`crates/sensor-adb/src/handler.rs#handle_wrte`). An OKAY with the wrong ids, or for a stream not awaiting one,
+  is ignored.
+- **Drain then close** (`crates/sensor-adb/src/handler.rs#drive_stream`): a one-shot `shell:<cmd>` queues its
+  whole output and sends CLSE only after the queue is empty and the last chunk has been
+  acknowledged; a command with no output closes at once. An interactive shell's `exit`
+  from the outer level drains its final output and prompt before the CLSE. A stream
+  whose response is fully sent is removed from the table.
+- **Android line endings** (`crates/sensor-framework/src/shell/mod.rs#onlcr`): the shell's output is passed
+  through ONLCR before it is queued, as a pty-backed adbd does; every LF becomes CR-LF
+  and all other bytes, NUL and binary included, pass through unchanged. Interactive
+  input is handled as a terminal would: CR, LF or CR-LF each end one line, the line is
+  echoed as CR-LF, backspace and DEL erase one buffered character, and the prompt is
+  re-read after every line because `cd` or a nested shell changes it (`crates/sensor-adb/src/handler.rs#handle_wrte`).
+- **Memory and egress bound** (`crates/sensor-framework/src/budget.rs#ConnectionBudget`): the connection creates
+  one `ConnectionBudget` and every shell on it, one-shot or interactive, holds a clone
+  of that same `Arc`. The 32 streams therefore share one ceiling on created file
+  content, nodes, recorded commands, downloads and egress bytes rather than each holding
+  a full set (the memory bound, `crates/sensor-adb/src/handler.rs#handle_open`). Every WRTE payload sent is
+  charged with `charge_egress`; once the cap is spent the sensor finishes the response
+  in progress and drops the connection (`crates/sensor-framework/src/budget.rs#ConnectionBudget::charge_egress`).
+- **Write deadline** (`crates/sensor-adb/src/handler.rs#write_or_err`): every write (the CNXN reply, OKAY, WRTE
+  and CLSE) is wrapped in a timeout of the connection's `idle_timeout`; a peer that
+  stops reading cannot hold the handler on a blocked write, and reads carry the same
+  idle bound so a client that never sends OKAY ends the session too.
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`lib.rs`).
 - **Bounds:** common defaults, `max_concurrent` 256.
 - **Emits:** `honeypot_connection`, `honeypot_command_exec` (shell),

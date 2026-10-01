@@ -20,6 +20,13 @@
   reach the wire, and the never-exec and no-fetch guarantees hold by construction: the emulator has
   no process, evaluation or network facility and the synthetic binary bytes are generated, never a
   host file read or run. Attacker-facing behavior is checked by a byte-for-byte session-replay corpus.
+- **Protocol-correct shell transports** - SSH now tracks up to ten independent channels, obeys each
+  peer's receive window and maximum packet size, replenishes its own receive window, separates
+  non-PTY stderr, and completes exec channels with exit status, EOF and close. ADB obeys negotiated
+  maxdata and waits for an OKAY before each subsequent WRTE, including large one-shot replies.
+  Telnet routes banner, prompts, echo and command output through one NVT encoder that applies ONLCR,
+  the session XOR codec and IAC escaping in wire order. Writes on all three transports are bounded
+  by the connection idle timeout.
 - **Split deployment: collectors ship to a gateway over mTLS** - a honeypot collector no longer
   needs database access. `shipper` tails each sensor's log through the shared `log-tailer` crate and
   ships length-prefixed batches to a `gateway` over mutually authenticated TLS. The gateway verifies

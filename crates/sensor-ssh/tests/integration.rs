@@ -293,23 +293,179 @@ async fn exec_request_uses_noninteractive_bash_identity() {
 
     let mut channel = session.channel_open_session().await.unwrap();
     channel.exec(false, b"nosuchcmd_q").await.unwrap();
-    let output = tokio::time::timeout(Duration::from_secs(3), async {
-        let mut output = Vec::new();
-        while let Some(message) = channel.wait().await {
-            if let russh::ChannelMsg::Data { data } = message {
-                output.extend_from_slice(&data);
-                if output.ends_with(b"\n") {
-                    break;
+    let (stdout, stderr, status, eof, close) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut status = None;
+            let mut eof = false;
+            let mut close = false;
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                    russh::ChannelMsg::ExtendedData { data, ext } => {
+                        assert_eq!(ext, 1, "stderr must use SSH extended-data type 1");
+                        stderr.extend_from_slice(&data);
+                    }
+                    russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                    russh::ChannelMsg::Eof => eof = true,
+                    russh::ChannelMsg::Close => {
+                        close = true;
+                        break;
+                    }
+                    _ => {}
                 }
             }
-        }
-        output
-    })
-    .await
-    .expect("timed out waiting for SSH exec output");
-    assert_eq!(output, b"bash: line 1: nosuchcmd_q: command not found\n");
+            (stdout, stderr, status, eof, close)
+        })
+        .await
+        .expect("timed out waiting for SSH exec output");
+    assert!(stdout.is_empty(), "non-PTY stderr leaked into stdout");
+    assert_eq!(stderr, b"bash: line 1: nosuchcmd_q: command not found\n");
+    assert_eq!(status, Some(127));
+    assert!(eof, "exec did not send channel EOF");
+    assert!(close, "exec did not close its channel");
 
     drop(channel);
+    drop(session);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn exec_larger_than_the_initial_window_drains_through_window_adjustments() {
+    let dir = tempfile::tempdir().unwrap();
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        wan_resolver,
+        test_bounds(),
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(config, addr, TestHandler)
+        .await
+        .unwrap();
+    assert!(
+        session
+            .authenticate_password("root", "password")
+            .await
+            .unwrap()
+            .success()
+    );
+
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel
+        .exec(
+            false,
+            b"/bin/busybox cat /proc/self/exe || cat /proc/self/exe",
+        )
+        .await
+        .unwrap();
+    let (stdout, stderr, status, eof, close) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut status = None;
+            let mut eof = false;
+            let mut close = false;
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                    russh::ChannelMsg::ExtendedData { data, ext } => {
+                        assert_eq!(ext, 1);
+                        stderr.extend_from_slice(&data);
+                    }
+                    russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                    russh::ChannelMsg::Eof => eof = true,
+                    russh::ChannelMsg::Close => {
+                        close = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            (stdout, stderr, status, eof, close)
+        })
+        .await
+        .expect("large exec stalled at the SSH channel window");
+
+    assert_eq!(stdout.len(), 2_193_272);
+    assert_eq!(&stdout[..4], b"\x7fELF");
+    assert!(stderr.is_empty());
+    assert_eq!(status, Some(0));
+    assert!(eof);
+    assert!(close);
+
+    drop(channel);
+    drop(session);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn one_connection_routes_independent_channels_and_caps_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        wan_resolver,
+        test_bounds(),
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(config, addr, TestHandler)
+        .await
+        .unwrap();
+    assert!(
+        session
+            .authenticate_password("root", "password")
+            .await
+            .unwrap()
+            .success()
+    );
+
+    let mut channels = Vec::new();
+    for _ in 0..10 {
+        channels.push(session.channel_open_session().await.unwrap());
+    }
+    assert!(
+        session.channel_open_session().await.is_err(),
+        "an eleventh live channel must be refused"
+    );
+
+    channels[0].exec(false, b"whoami").await.unwrap();
+    channels[1].exec(false, b"pwd").await.unwrap();
+    let mut outputs = Vec::new();
+    for channel in channels.iter_mut().take(2) {
+        let mut output = Vec::new();
+        while let Some(message) = channel.wait().await {
+            match message {
+                russh::ChannelMsg::Data { data } => output.extend_from_slice(&data),
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        outputs.push(output);
+    }
+    assert_eq!(outputs[0], b"root\n");
+    assert_eq!(outputs[1], b"/root\n");
+
+    drop(channels);
     drop(session);
     handle.abort();
 }
@@ -521,6 +677,7 @@ fn spooled_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 /// How the client ends the session. The sensor has no protocol-defined end of file for a shell
 /// capture, so this is the only thing that can say whether the bytes are the whole payload.
+#[derive(Clone, Copy)]
 enum Ending {
     /// Stop sending and let `idle_timeout` elapse with the session still open.
     GoQuiet,
@@ -565,17 +722,31 @@ async fn payload_session(
     .await
     .unwrap();
 
-    // Own the socket rather than letting russh dial, so the two socket-level endings below can
-    // choose between a FIN and an RST. `SO_LINGER` has to be set before the connection is handed
-    // over, since russh takes the stream by value.
-    let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
-    if let Ending::ResetConnection = ending {
-        // Zero linger makes close send RST rather than FIN, so the server sees a read error
-        // instead of end-of-file. Deprecated because a NON-zero linger blocks the closing thread;
-        // zero is the opposite case and is exactly what this ending needs.
-        #[allow(deprecated)]
-        socket.set_linger(Some(Duration::ZERO)).unwrap();
-    }
+    // Dropping a russh Handle asks its background task to shut the socket down cleanly before the
+    // final close, which defeats SO_LINGER=0 and turns an intended reset into EOF. For the reset
+    // case, put a byte-transparent proxy in front of the server and reset the proxy's upstream
+    // socket on an explicit signal. The clean-close case still connects directly.
+    let mut reset_trigger = None;
+    let client_addr = if matches!(ending, Ending::ResetConnection) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut downstream, _) = listener.accept().await.unwrap();
+            let mut upstream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            #[allow(deprecated)]
+            upstream.set_linger(Some(Duration::ZERO)).unwrap();
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {}
+                _ = rx => {}
+            }
+        });
+        reset_trigger = Some(tx);
+        proxy_addr
+    } else {
+        addr
+    };
+    let socket = tokio::net::TcpStream::connect(client_addr).await.unwrap();
     let config = Arc::new(russh::client::Config::default());
     let mut session = russh::client::connect_stream(config, socket, TestHandler)
         .await
@@ -588,6 +759,13 @@ async fn payload_session(
     channel.request_shell(false).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     channel.data(payload).await.unwrap();
+
+    if matches!(ending, Ending::ResetConnection) {
+        // `Channel::data` queues into russh's writer task. Give the proxy time to forward the
+        // encrypted packet before resetting its upstream side.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = reset_trigger.take().unwrap().send(());
+    }
 
     match ending {
         Ending::Disconnect => {

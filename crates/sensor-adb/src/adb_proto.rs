@@ -45,9 +45,8 @@ pub const HEADER_LEN: usize = 24;
 /// This sensor's advertised protocol version and per-message payload ceiling, sent as `arg0`/
 /// `arg1` of our own `CNXN` reply. `0x01000000` and `4096` are the values consistently
 /// documented as the original ("legacy") ADB protocol constants across independent sources; a
-/// smaller `maxdata` is also the more defensive choice for a honeypot. Whatever the client
-/// advertises in its own `CNXN` is accepted but never enforced - see the module doc's leniency
-/// policy.
+/// smaller `maxdata` is also the more defensive choice for a honeypot. The connection handler
+/// parses and enforces the client's advertised maxdata for every server WRTE.
 pub const OUR_VERSION: u32 = 0x0100_0000;
 pub const OUR_MAXDATA: u32 = 4096;
 

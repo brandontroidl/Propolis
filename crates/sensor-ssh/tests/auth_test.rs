@@ -258,8 +258,10 @@ fn method_with_injection_is_sanitized() {
 #[test]
 fn channel_open_session_is_confirmed() {
     let packet = build_channel_open(b"session", 7);
-    let (channel_id, response) = handle_channel_open(&packet).unwrap();
-    assert_eq!(channel_id, 7);
+    let opened = handle_channel_open(&packet).unwrap();
+    assert_eq!(opened.recipient_channel, 7);
+    assert!(opened.accepted);
+    let response = opened.response;
     assert_eq!(response[0], transport::SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
     let recipient_channel = u32::from_be_bytes(response[1..5].try_into().unwrap());
     let sender_channel = u32::from_be_bytes(response[5..9].try_into().unwrap());
@@ -275,7 +277,9 @@ fn channel_open_rejects_direct_tcpip() {
     // protocol ("No attacker-directed fetch", internal/design/02-sensor-framework.md). It must
     // never be confirmed.
     let packet = build_channel_open(b"direct-tcpip", 3);
-    let (_channel_id, response) = handle_channel_open(&packet).unwrap();
+    let opened = handle_channel_open(&packet).unwrap();
+    assert!(!opened.accepted);
+    let response = opened.response;
     assert_eq!(response[0], transport::SSH_MSG_CHANNEL_OPEN_FAILURE);
     assert_ne!(response[0], transport::SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
 }
@@ -289,15 +293,16 @@ fn channel_open_rejects_malformed_packet() {
 #[test]
 fn channel_request_pty_req_is_recognized() {
     let packet = build_channel_request(5, b"pty-req", true, b"");
-    let action = handle_channel_request(&packet, 5).unwrap();
-    assert_eq!(action, ChannelAction::PtyReq);
+    let request = handle_channel_request(&packet, 5).unwrap();
+    assert_eq!(request.action, ChannelAction::PtyReq);
+    assert!(request.want_reply);
 }
 
 #[test]
 fn channel_request_shell_is_recognized() {
     let packet = build_channel_request(5, b"shell", true, b"");
-    let action = handle_channel_request(&packet, 5).unwrap();
-    assert_eq!(action, ChannelAction::Shell);
+    let request = handle_channel_request(&packet, 5).unwrap();
+    assert_eq!(request.action, ChannelAction::Shell);
 }
 
 #[test]
@@ -305,8 +310,11 @@ fn channel_request_exec_captures_raw_command() {
     let mut extra = Vec::new();
     push_ssh_string(&mut extra, b"cat /etc/passwd");
     let packet = build_channel_request(5, b"exec", true, &extra);
-    let action = handle_channel_request(&packet, 5).unwrap();
-    assert_eq!(action, ChannelAction::Exec("cat /etc/passwd".to_string()));
+    let request = handle_channel_request(&packet, 5).unwrap();
+    assert_eq!(
+        request.action,
+        ChannelAction::Exec("cat /etc/passwd".to_string())
+    );
 }
 
 #[test]
@@ -314,15 +322,16 @@ fn channel_request_subsystem_captures_name() {
     let mut extra = Vec::new();
     push_ssh_string(&mut extra, b"sftp");
     let packet = build_channel_request(5, b"subsystem", true, &extra);
-    let action = handle_channel_request(&packet, 5).unwrap();
-    assert_eq!(action, ChannelAction::Subsystem("sftp".to_string()));
+    let request = handle_channel_request(&packet, 5).unwrap();
+    assert_eq!(request.action, ChannelAction::Subsystem("sftp".to_string()));
 }
 
 #[test]
 fn channel_request_unknown_type_is_other() {
     let packet = build_channel_request(5, b"env", false, b"");
-    let action = handle_channel_request(&packet, 5).unwrap();
-    assert_eq!(action, ChannelAction::Other);
+    let request = handle_channel_request(&packet, 5).unwrap();
+    assert_eq!(request.action, ChannelAction::Other);
+    assert!(!request.want_reply);
 }
 
 #[test]

@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -87,7 +88,12 @@ pub async fn handle_connection(
         tracing::error!(%peer_addr, "telnet: failed to append connection event");
     }
 
-    if stream.write_all(&negotiation_preamble()).await.is_err() {
+    let write_timeout = bounds.idle_timeout;
+
+    if write_raw(&mut stream, write_timeout, &negotiation_preamble())
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -95,8 +101,11 @@ pub async fn handle_connection(
     // come from the shared persona so the hostname matches uname / the shell prompt / the other
     // sensors, instead of a bare "login:" with no host and a cross-instance-constant shell prompt.
     let host = persona::hostname();
-    let issue = format!("{}\r\n", persona::OS_PRETTY);
-    if stream.write_all(issue.as_bytes()).await.is_err() {
+    let issue = format!("{}\n", persona::OS_PRETTY);
+    if write_telnet_data(&mut stream, write_timeout, issue.as_bytes(), None)
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -105,7 +114,10 @@ pub async fn handle_connection(
     let mut reader = LineReader::new(bounds);
 
     let login_prompt = format!("{host} login: ");
-    if stream.write_all(login_prompt.as_bytes()).await.is_err() {
+    if write_telnet_data(&mut stream, write_timeout, login_prompt.as_bytes(), None)
+        .await
+        .is_err()
+    {
         return;
     }
     let Some(username_raw) = reader.read_line(&mut stream, true).await else {
@@ -113,7 +125,10 @@ pub async fn handle_connection(
     };
     let username = sanitize_value(&username_raw, MAX_USERNAME_LEN);
 
-    if stream.write_all(PROMPT_PASSWORD).await.is_err() {
+    if write_telnet_data(&mut stream, write_timeout, PROMPT_PASSWORD, None)
+        .await
+        .is_err()
+    {
         return;
     }
     // The password is read only far enough to advance past the login prompt - mirrors
@@ -141,7 +156,15 @@ pub async fn handle_connection(
     };
     let mut shell = FakeShell::new(FakeFs::new(), ctx).with_budget(budget.clone());
 
-    if stream.write_all(shell.prompt().as_bytes()).await.is_err() {
+    if write_telnet_data(
+        &mut stream,
+        write_timeout,
+        shell.prompt().as_bytes(),
+        Some(&shell),
+    )
+    .await
+    .is_err()
+    {
         return;
     }
 
@@ -170,31 +193,28 @@ pub async fn handle_connection(
             }
         }
 
-        // The shared shell emits bare LF line endings; a telnet NVT terminal needs CR-LF or the
-        // cursor never returns to column 0 (each new line renders indented - a visible tell). The
-        // banner/prompts above already use \r\n; translate the command output to match.
-        let output = onlcr(output.bytes());
-
         if close_session {
             // Not charged: the session ends with this write, so there is no later write for the
             // count to refuse.
-            let _ = stream.write_all(&shell.encode_output(&output)).await;
+            let _ =
+                write_telnet_data(&mut stream, write_timeout, output.bytes(), Some(&shell)).await;
             reader.mark_session_end(CaptureEnd::ClientLogout);
             break;
         }
 
-        let mut response = output;
+        let mut response = output.bytes().to_vec();
         response.extend_from_slice(shell.prompt().as_bytes());
-        // Mirror any XOR obfuscation onto the response so a symmetric-codec bot reads plaintext after
-        // de-obfuscating (identity for a plaintext session, so normal bots are unaffected).
-        let response = shell.encode_output(&response);
-        if stream.write_all(&response).await.is_err() {
+        let encoded = encode_telnet_data(&response, Some(&shell));
+        if write_raw(&mut stream, write_timeout, &encoded)
+            .await
+            .is_err()
+        {
             reader.mark_session_end(CaptureEnd::TransportError);
             break;
         }
         // Charged as written, after ONLCR and the codec. A connection with no egress left is
         // dropped once this reply, prompt included, is out.
-        if budget.charge_egress(response.len() as u64) == EgressState::Spent {
+        if budget.charge_egress(encoded.len() as u64) == EgressState::Spent {
             reader.mark_session_end(CaptureEnd::TransportError);
             break;
         }
@@ -206,6 +226,46 @@ pub async fn handle_connection(
     // "complete" for all of them alike. The capture itself is submitted by `LineReader`'s `Drop`
     // (see `arm_capture_submit`), the only code that also runs when the listener cancels this
     // future at `max_duration`.
+}
+
+/// Encode application data in the one order a Telnet client observes it: terminal newlines,
+/// optional per-session XOR, then RFC 854 escaping of literal IAC bytes. Negotiation commands do
+/// not pass through this function because their 0xff bytes are protocol markers, not data.
+fn encode_telnet_data(bytes: &[u8], shell: Option<&FakeShell>) -> Vec<u8> {
+    let terminal = onlcr(bytes);
+    let coded = match shell {
+        Some(shell) => shell.encode_output(&terminal),
+        None => terminal,
+    };
+    let iac_count = coded.iter().filter(|&&byte| byte == 0xff).count();
+    let mut escaped = Vec::with_capacity(coded.len().saturating_add(iac_count));
+    for byte in coded {
+        escaped.push(byte);
+        if byte == 0xff {
+            escaped.push(0xff);
+        }
+    }
+    escaped
+}
+
+async fn write_raw(
+    stream: &mut TcpStream,
+    write_timeout: Duration,
+    bytes: &[u8],
+) -> Result<(), ()> {
+    tokio::time::timeout(write_timeout, stream.write_all(bytes))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+async fn write_telnet_data(
+    stream: &mut TcpStream,
+    write_timeout: Duration,
+    bytes: &[u8],
+    shell: Option<&FakeShell>,
+) -> Result<(), ()> {
+    write_raw(stream, write_timeout, &encode_telnet_data(bytes, shell)).await
 }
 
 fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
@@ -493,14 +553,22 @@ impl LineReader {
             let mut response = Vec::new();
             self.filter.process(&raw[..n], &mut data, &mut response);
             self.capture_bytes(&data);
-            if !response.is_empty() && stream.write_all(&response).await.is_err() {
+            if !response.is_empty()
+                && write_raw(stream, self.bounds.idle_timeout, &response)
+                    .await
+                    .is_err()
+            {
                 self.session_end = CaptureEnd::TransportError;
                 return None;
             }
 
             let mut echo_out = Vec::new();
             self.feed(&data, echo, &mut echo_out);
-            if !echo_out.is_empty() && stream.write_all(&echo_out).await.is_err() {
+            if !echo_out.is_empty()
+                && write_telnet_data(stream, self.bounds.idle_timeout, &echo_out, None)
+                    .await
+                    .is_err()
+            {
                 self.session_end = CaptureEnd::TransportError;
                 return None;
             }
@@ -531,7 +599,7 @@ impl LineReader {
             match byte {
                 b'\r' | b'\n' => {
                     self.prev_cr = byte == b'\r';
-                    echo_out.extend_from_slice(b"\r\n");
+                    echo_out.push(b'\n');
                     self.pending
                         .push_back(String::from_utf8_lossy(&self.current).into_owned());
                     self.current.clear();
@@ -731,7 +799,7 @@ mod tests {
         // Type "ab", backspace (DEL), "c", Enter as CR-NUL.
         reader.feed(b"ab\x7fc\r\x00", true, &mut echo);
         assert_eq!(reader.pending.pop_front().as_deref(), Some("ac"));
-        assert_eq!(echo, b"ab\x08 \x08c\r\n");
+        assert_eq!(echo, b"ab\x08 \x08c\n");
     }
 
     #[test]
@@ -741,7 +809,7 @@ mod tests {
         reader.feed(b"secret\r\x00", false, &mut echo);
         assert_eq!(reader.pending.pop_front().as_deref(), Some("secret"));
         // Password characters are not echoed; only the Enter's CR-LF advances the cursor.
-        assert_eq!(echo, b"\r\n");
+        assert_eq!(echo, b"\n");
     }
 
     #[test]
@@ -750,7 +818,31 @@ mod tests {
         let mut echo = Vec::new();
         reader.feed(b"\r\x00", true, &mut echo);
         assert_eq!(reader.pending.pop_front().as_deref(), Some(""));
-        assert_eq!(echo, b"\r\n");
+        assert_eq!(echo, b"\n");
+    }
+
+    #[test]
+    fn data_encoding_applies_onlcr_then_xor_then_iac_escaping() {
+        let ctx = EmitContext {
+            source_ip: "203.0.113.7".parse().unwrap(),
+            wan_ip: None,
+            authenticated: true,
+            protocol_label: "telnet".to_string(),
+            session_id: Some(Uuid::now_v7()),
+        };
+        let mut shell = FakeShell::new(FakeFs::new(), ctx);
+        let obfuscated_enable: String = b"enable"
+            .iter()
+            .map(|byte| char::from(byte ^ 0x09))
+            .collect();
+        shell.handle_input(&obfuscated_enable);
+
+        // ONLCR inserts CR before LF. XOR turns 0xf6 into 0xff, and only then does Telnet double
+        // the IAC data byte. Reordering either transform changes these exact bytes.
+        assert_eq!(
+            encode_telnet_data(&[b'\n', 0xf6], Some(&shell)),
+            vec![b'\r' ^ 0x09, b'\n' ^ 0x09, 0xff, 0xff]
+        );
     }
 
     #[test]

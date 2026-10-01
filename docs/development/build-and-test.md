@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-09-30
 -->
 
 # Build and test
@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 2035 test functions** (1298 unit + 737 integration).
+- **Total: 2042 test functions** (1302 unit + 740 integration).
 - **DB-backed (`sqlx::test`): 202** - console 159, core-scoring 25, intake 7,
   fleet 6, propolis 4, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -128,7 +128,7 @@ Per-crate breakdown:
 | propolis | 100 | 20 | capture_to_console, docs_agreement, restore_rehearsal, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 4 | provision |
 | review | 116 | 71 | cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
-| sensor-adb | 53 | 23 | integration |
+| sensor-adb | 53 | 24 | integration |
 | sensor-catchall | 18 | 6 | integration |
 | sensor-cred | 14 | 8 | integration |
 | sensor-framework | 509 | 52 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
@@ -136,11 +136,11 @@ Per-crate breakdown:
 | sensor-http | 8 | 16 | integration |
 | sensor-redis | 79 | 18 | integration |
 | sensor-smtp | 6 | 18 | integration |
-| sensor-ssh | 48 | 94 | auth_test, crypto_test, integration, shell_test, transport_test |
-| sensor-telnet | 39 | 20 | integration |
+| sensor-ssh | 51 | 96 | auth_test, crypto_test, integration, shell_test, transport_test |
+| sensor-telnet | 40 | 20 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **1298** | **737** | |
+| **Total** | **1302** | **740** | |
 
 ### Test styles by layer
 

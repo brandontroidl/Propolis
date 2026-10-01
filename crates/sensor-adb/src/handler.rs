@@ -21,9 +21,10 @@
 //! (both a real `adb` client and some bots do this) is handled correctly rather than assuming one
 //! stream per connection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -31,7 +32,7 @@ use tokio::net::TcpStream;
 use sensor_framework::fakefs::FakeFs;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
-use sensor_framework::shell::{EmitContext, FakeShell};
+use sensor_framework::shell::{EmitContext, FakeShell, onlcr};
 use sensor_framework::upload_metadata;
 use sensor_framework::{
     CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget, EgressState,
@@ -89,6 +90,34 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid)
 struct Stream {
     client_local_id: u32,
     kind: StreamKind,
+    outbound: VecDeque<PendingWrite>,
+    awaiting_okay: bool,
+    close_after_drain: bool,
+    drop_after_drain: bool,
+}
+
+struct PendingWrite {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+impl Stream {
+    fn new(client_local_id: u32, kind: StreamKind) -> Self {
+        Self {
+            client_local_id,
+            kind,
+            outbound: VecDeque::new(),
+            awaiting_okay: false,
+            close_after_drain: false,
+            drop_after_drain: false,
+        }
+    }
+
+    fn queue(&mut self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.outbound.push_back(PendingWrite { bytes, offset: 0 });
+        }
+    }
 }
 
 enum StreamKind {
@@ -96,7 +125,9 @@ enum StreamKind {
     /// input, and the raw-byte capture of everything the client streamed at it. A one-shot
     /// `shell:<command>` never reaches this table at all - see `handle_open`'s doc.
     /// Boxed: the shell owns a whole filesystem snapshot and dwarfs the sync variant.
-    Shell(Box<FakeShell>, Vec<u8>, ShellCapture),
+    Shell(Box<FakeShell>, Vec<u8>, ShellCapture, bool),
+    /// A `shell:<command>` whose response is still being paced by peer OKAY messages.
+    OneShot,
     /// `sync:` file-transfer sub-protocol session.
     Sync(SyncState),
 }
@@ -559,6 +590,7 @@ pub async fn handle_connection(
 
     let session_end = SessionEnd::new();
     let max_captured_bytes = bounds.max_captured_bytes;
+    let write_timeout = bounds.idle_timeout;
     // The connection's one budget, cloned into every stream's shell so the streams share a ceiling
     // instead of each holding a full one.
     let budget = ConnectionBudget::new(limits_from(&bounds));
@@ -572,10 +604,14 @@ pub async fn handle_connection(
         session_end.set(CaptureEnd::MalformedInput);
         return; // not a well-formed ADB session opener
     }
-    if stream
-        .write_all(&adb_proto::build_cnxn(&adb_proto::device_banner()))
-        .await
-        .is_err()
+    let peer_maxdata = header.arg1.clamp(1, adb_proto::MAX_MESSAGE_DATA_LEN) as usize;
+    if write_or_err(
+        &mut stream,
+        write_timeout,
+        &adb_proto::build_cnxn(&adb_proto::device_banner()),
+    )
+    .await
+    .is_err()
     {
         session_end.set(CaptureEnd::TransportError);
         return;
@@ -608,6 +644,8 @@ pub async fn handle_connection(
                     &session_end,
                     max_captured_bytes,
                     &budget,
+                    peer_maxdata,
+                    write_timeout,
                 )
                 .await
                 .is_err()
@@ -628,6 +666,8 @@ pub async fn handle_connection(
                     &handoff,
                     peer_addr,
                     &budget,
+                    peer_maxdata,
+                    write_timeout,
                 )
                 .await
                 .is_err()
@@ -637,8 +677,35 @@ pub async fn handle_connection(
                 }
             }
             adb_proto::A_OKAY => {
-                // Flow-control ack for one of our own WRTEs; this handler never has more than
-                // one outstanding write per stream in flight, so there is nothing to unblock.
+                let server_id = header.arg1;
+                let should_remove = if let Some(entry) = streams.get_mut(&server_id) {
+                    if header.arg0 != entry.client_local_id || !entry.awaiting_okay {
+                        false
+                    } else {
+                        entry.awaiting_okay = false;
+                        match drive_stream(
+                            &mut stream,
+                            &budget,
+                            server_id,
+                            entry,
+                            peer_maxdata,
+                            write_timeout,
+                        )
+                        .await
+                        {
+                            Ok(remove) => remove,
+                            Err(()) => {
+                                session_end.set(CaptureEnd::TransportError);
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    false
+                };
+                if should_remove {
+                    streams.remove(&server_id);
+                }
             }
             adb_proto::A_CLSE => {
                 let server_id = header.arg1;
@@ -648,12 +715,15 @@ pub async fn handle_connection(
                     // The peer closed this stream itself, so whatever it streamed at the shell is
                     // whatever it meant to send - regardless of how the connection later ends.
                     // Recorded before the remove's value is dropped, which is what submits it.
-                    if let StreamKind::Shell(_, _, capture) = &mut s.kind {
+                    if let StreamKind::Shell(_, _, capture, _) = &mut s.kind {
                         capture.stream_end = Some(CaptureEnd::PeerClosed);
                     }
-                    let _ = stream
-                        .write_all(&adb_proto::build_clse(server_id, s.client_local_id))
-                        .await;
+                    let _ = write_or_err(
+                        &mut stream,
+                        write_timeout,
+                        &adb_proto::build_clse(server_id, s.client_local_id),
+                    )
+                    .await;
                 }
                 // Unknown stream id (already closed, or never opened): no reply, so garbage
                 // input can never trigger a CLSE reply storm.
@@ -689,6 +759,8 @@ async fn handle_open(
     session_end: &SessionEnd,
     max_captured_bytes: u64,
     budget: &Arc<ConnectionBudget>,
+    peer_maxdata: usize,
+    write_timeout: Duration,
 ) -> Result<(), ()> {
     let client_local_id = header.arg0;
     if client_local_id == 0 {
@@ -702,7 +774,12 @@ async fn handle_open(
     // heap each), OOM-killing the sensor. Once the cap is hit, refuse further opens with a CLSE
     // (arg0=0 marks a failed open) instead of allocating another stream.
     if streams.len() >= MAX_STREAMS_PER_CONN {
-        write_or_err(stream, &adb_proto::build_clse(0, client_local_id)).await?;
+        write_or_err(
+            stream,
+            write_timeout,
+            &adb_proto::build_clse(0, client_local_id),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -723,7 +800,12 @@ async fn handle_open(
             // present: a Nexus 5 banner followed by an Ubuntu bash was a one-command tell.
             let mut shell = FakeShell::android(FakeFs::android(), ctx).with_budget(budget.clone());
 
-            write_or_err(stream, &adb_proto::build_okay(server_id, client_local_id)).await?;
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_okay(server_id, client_local_id),
+            )
+            .await?;
 
             match cmd {
                 Some(cmd) => {
@@ -736,66 +818,78 @@ async fn handle_open(
                             tracing::error!(%peer_addr, "adb: failed to append command event");
                         }
                     }
-                    if !output.is_empty() {
-                        write_shell_wrte(
-                            stream,
-                            budget,
-                            server_id,
-                            client_local_id,
-                            output.bytes(),
-                        )
-                        .await?;
-                    }
-                    write_or_err(stream, &adb_proto::build_clse(server_id, client_local_id))
-                        .await?;
-                    // Never inserted into `streams`: already fully closed.
-                }
-                None => {
-                    write_or_err(
+                    let mut entry = Stream::new(client_local_id, StreamKind::OneShot);
+                    entry.queue(onlcr(output.bytes()));
+                    entry.close_after_drain = true;
+                    let should_remove = drive_stream(
                         stream,
-                        &adb_proto::build_wrte(server_id, client_local_id, &shell_prompt(&shell)),
+                        budget,
+                        server_id,
+                        &mut entry,
+                        peer_maxdata,
+                        write_timeout,
                     )
                     .await?;
-                    streams.insert(
-                        server_id,
-                        Stream {
-                            client_local_id,
-                            kind: StreamKind::Shell(
-                                Box::new(shell),
-                                Vec::new(),
-                                ShellCapture {
-                                    body: Vec::new(),
-                                    wire_bytes: 0,
-                                    binary_seen: false,
-                                    max_bytes: max_captured_bytes,
-                                    stream_end: None,
-                                    session_end: session_end.clone(),
-                                    handoff: handoff.clone(),
-                                    source_ip,
-                                    wan_ip,
-                                    session_id,
-                                },
-                            ),
-                        },
+                    if !should_remove {
+                        streams.insert(server_id, entry);
+                    }
+                }
+                None => {
+                    let prompt = shell_prompt(&shell);
+                    let mut entry = Stream::new(
+                        client_local_id,
+                        StreamKind::Shell(
+                            Box::new(shell),
+                            Vec::new(),
+                            ShellCapture {
+                                body: Vec::new(),
+                                wire_bytes: 0,
+                                binary_seen: false,
+                                max_bytes: max_captured_bytes,
+                                stream_end: None,
+                                session_end: session_end.clone(),
+                                handoff: handoff.clone(),
+                                source_ip,
+                                wan_ip,
+                                session_id,
+                            },
+                            false,
+                        ),
                     );
+                    entry.queue(prompt);
+                    drive_stream(
+                        stream,
+                        budget,
+                        server_id,
+                        &mut entry,
+                        peer_maxdata,
+                        write_timeout,
+                    )
+                    .await?;
+                    streams.insert(server_id, entry);
                 }
             }
         }
         Destination::Sync => {
             let server_id = *next_stream_id;
             *next_stream_id += 1;
-            write_or_err(stream, &adb_proto::build_okay(server_id, client_local_id)).await?;
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_okay(server_id, client_local_id),
+            )
+            .await?;
             streams.insert(
                 server_id,
-                Stream {
+                Stream::new(
                     client_local_id,
-                    kind: StreamKind::Sync(SyncState::new(
+                    StreamKind::Sync(SyncState::new(
                         source_ip,
                         wan_ip,
                         session_id,
                         handoff.clone(),
                     )),
-                },
+                ),
             );
         }
         Destination::Unsupported => {
@@ -806,7 +900,12 @@ async fn handle_open(
             );
             // arg0=0: this CLOSE indicates a failed OPEN, so no stream id was ever minted for
             // it - exactly the documented "local-id MAY be zero" case.
-            write_or_err(stream, &adb_proto::build_clse(0, client_local_id)).await?;
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_clse(0, client_local_id),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -822,6 +921,8 @@ async fn handle_wrte(
     handoff: &Arc<CaptureHandoff>,
     peer_addr: SocketAddr,
     budget: &Arc<ConnectionBudget>,
+    peer_maxdata: usize,
+    write_timeout: Duration,
 ) -> Result<(), ()> {
     // Routing: arg1 is the recipient's (our) id for the stream - see the module doc's
     // local-id/remote-id convention.
@@ -831,15 +932,24 @@ async fn handle_wrte(
     };
     let client_local_id = entry.client_local_id;
     let mut close_shell = false;
+    let mut queued_response = Vec::new();
 
     match &mut entry.kind {
-        StreamKind::Shell(shell, line_buf, capture) => {
+        StreamKind::Shell(shell, line_buf, capture, prev_cr) => {
             // Raw bytes first, before any line framing: a payload streamed with no newline never
             // becomes a line, and that is exactly the dropper this capture exists for.
             capture.push(data);
             let mut responses = Vec::new();
             for &byte in data {
+                if *prev_cr {
+                    *prev_cr = false;
+                    if byte == b'\n' {
+                        continue;
+                    }
+                }
                 if byte == b'\n' || byte == b'\r' {
+                    *prev_cr = byte == b'\r';
+                    responses.extend_from_slice(b"\r\n");
                     if !line_buf.is_empty() {
                         let line = String::from_utf8_lossy(line_buf).into_owned();
                         line_buf.clear();
@@ -854,16 +964,24 @@ async fn handle_wrte(
                                 tracing::error!(%peer_addr, "adb: failed to append command event");
                             }
                         }
-                        responses.extend_from_slice(output.bytes());
+                        responses.extend_from_slice(&onlcr(output.bytes()));
                         close_shell = output.close_session;
                         if close_shell {
                             break;
                         }
-                        // Re-read the prompt each time: `cd` or a nested shell changes it.
+                    }
+                    if !close_shell {
+                        // Re-read the prompt each time: `cd` or a nested shell changes it. Empty
+                        // Enter gets the same fresh prompt as a real interactive shell.
                         responses.extend_from_slice(&shell_prompt(shell));
                     }
-                } else {
+                } else if byte == 0x7f || byte == 0x08 {
+                    if line_buf.pop().is_some() {
+                        responses.extend_from_slice(b"\x08 \x08");
+                    }
+                } else if byte >= 0x20 {
                     line_buf.push(byte);
+                    responses.push(byte);
                     if line_buf.len() >= MAX_SHELL_LINE_LEN {
                         let line = String::from_utf8_lossy(line_buf).into_owned();
                         line_buf.clear();
@@ -885,62 +1003,119 @@ async fn handle_wrte(
                     }
                 }
             }
-            write_or_err(stream, &adb_proto::build_okay(server_id, client_local_id)).await?;
-            if !responses.is_empty() {
-                write_shell_wrte(stream, budget, server_id, client_local_id, &responses).await?;
-            }
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_okay(server_id, client_local_id),
+            )
+            .await?;
+            queued_response = responses;
             if close_shell {
-                if let Some(mut closed) = streams.remove(&server_id)
-                    && let StreamKind::Shell(_, _, capture) = &mut closed.kind
-                {
-                    capture.stream_end = Some(CaptureEnd::ClientLogout);
-                }
-                write_or_err(stream, &adb_proto::build_clse(server_id, client_local_id)).await?;
+                capture.stream_end = Some(CaptureEnd::ClientLogout);
             }
         }
         StreamKind::Sync(sync) => {
             let (response, upload) = sync.feed(data);
-            write_or_err(stream, &adb_proto::build_okay(server_id, client_local_id)).await?;
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_okay(server_id, client_local_id),
+            )
+            .await?;
             if let Some(job) = upload {
                 // Off-response-path: never awaited, never blocks this reply - see
                 // sensor_framework::handoff's module doc. A full queue drops the job and is
                 // counted, not retried on this hot path.
                 let _ = handoff.submit(job);
             }
-            if !response.is_empty() {
-                write_or_err(
-                    stream,
-                    &adb_proto::build_wrte(server_id, client_local_id, &response),
-                )
-                .await?;
-            }
+            queued_response = response;
         }
+        StreamKind::OneShot => {}
+    }
+    let entry = streams.get_mut(&server_id).ok_or(())?;
+    entry.queue(queued_response);
+    if close_shell {
+        entry.close_after_drain = true;
+    }
+    let should_remove = drive_stream(
+        stream,
+        budget,
+        server_id,
+        entry,
+        peer_maxdata,
+        write_timeout,
+    )
+    .await?;
+    if should_remove {
+        streams.remove(&server_id);
     }
     Ok(())
 }
 
-async fn write_or_err(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), ()> {
-    stream.write_all(bytes).await.map_err(|_| ())
+async fn write_or_err(
+    stream: &mut TcpStream,
+    write_timeout: Duration,
+    bytes: &[u8],
+) -> Result<(), ()> {
+    tokio::time::timeout(write_timeout, stream.write_all(bytes))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
 }
 
-/// Write shell output as a WRTE and charge its payload to the connection's egress budget. `Err`
-/// once that budget is spent, after the write: the caller's `Err` ends the whole connection, so
-/// what follows a spent budget is a dropped connection, never a reply cut short.
-async fn write_shell_wrte(
+/// Send at most one queued WRTE for a stream. A second WRTE is never sent until the peer's OKAY
+/// clears `awaiting_okay`; this keeps large shell output bounded by both negotiated `maxdata` and
+/// ADB's per-stream stop-and-wait flow control. Returns true after sending the final CLSE.
+async fn drive_stream(
     stream: &mut TcpStream,
     budget: &ConnectionBudget,
     server_id: u32,
-    client_local_id: u32,
-    payload: &[u8],
-) -> Result<(), ()> {
-    write_or_err(
-        stream,
-        &adb_proto::build_wrte(server_id, client_local_id, payload),
-    )
-    .await?;
-    match budget.charge_egress(payload.len() as u64) {
-        EgressState::Ok => Ok(()),
-        EgressState::Spent => Err(()),
+    entry: &mut Stream,
+    peer_maxdata: usize,
+    write_timeout: Duration,
+) -> Result<bool, ()> {
+    if entry.awaiting_okay {
+        return Ok(false);
+    }
+    while let Some(front) = entry.outbound.front_mut() {
+        if front.offset == front.bytes.len() {
+            entry.outbound.pop_front();
+            continue;
+        }
+        let end = front
+            .offset
+            .saturating_add(peer_maxdata)
+            .min(front.bytes.len());
+        let payload = &front.bytes[front.offset..end];
+        write_or_err(
+            stream,
+            write_timeout,
+            &adb_proto::build_wrte(server_id, entry.client_local_id, payload),
+        )
+        .await?;
+        front.offset = end;
+        entry.awaiting_okay = true;
+        if budget.charge_egress(payload.len() as u64) == EgressState::Spent {
+            // Finish this already-started logical response before dropping the connection. The
+            // old whole-WRTE implementation did that naturally; chunking must not turn the cap
+            // into a partial-response oracle merely because maxdata is smaller than the reply.
+            entry.drop_after_drain = true;
+        }
+        return Ok(false);
+    }
+    if entry.drop_after_drain {
+        return Err(());
+    }
+    if entry.close_after_drain {
+        write_or_err(
+            stream,
+            write_timeout,
+            &adb_proto::build_clse(server_id, entry.client_local_id),
+        )
+        .await?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 

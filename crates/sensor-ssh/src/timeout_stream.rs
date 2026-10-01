@@ -1,5 +1,5 @@
-//! A stream wrapper that applies `ConnectionBounds`' read and idle timeouts to every read of an
-//! SSH session.
+//! A stream wrapper that applies `ConnectionBounds`' read and idle timeouts to every read and
+//! write of an SSH session.
 //!
 //! `run_tcp_listener` bounds a session as a whole with `max_duration`, which stops a connection
 //! being held forever. It cannot bound the individual reads inside it: the listener hands the
@@ -10,9 +10,9 @@
 //!
 //! Applied here rather than at each call site because every transport function
 //! (`read_packet_unencrypted`, `read_packet_encrypted`, `do_version_exchange_server`, ...) is
-//! already generic over `AsyncRead`/`AsyncWrite`. Wrapping the stream once means every read in the
-//! session inherits the bound, including any added later - a per-call-site timeout only covers the
-//! call sites someone remembered.
+//! already generic over `AsyncRead`/`AsyncWrite`. Wrapping the stream once means every read and
+//! write in the session inherits the bound, including any added later - a per-call-site timeout
+//! only covers the call sites someone remembered.
 //!
 //! `read_timeout` bounds the wait for the first byte of the session and `idle_timeout` bounds every
 //! read after that, matching `sensor-telnet`'s semantics exactly.
@@ -32,13 +32,14 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep};
 
-/// Wraps a stream so every read is bounded by a timeout that resets on progress.
+/// Wraps a stream so every read and write is bounded by a timeout that resets on progress.
 pub struct TimeoutStream<S> {
     inner: S,
     /// Applied after the first successful read; the initial deadline uses `read_timeout`.
     idle_timeout: Duration,
     /// Boxed so this type stays `Unpin` and needs no unsafe pin projection.
-    deadline: Pin<Box<Sleep>>,
+    read_deadline: Pin<Box<Sleep>>,
+    write_deadline: Pin<Box<Sleep>>,
 }
 
 impl<S> TimeoutStream<S> {
@@ -52,7 +53,8 @@ impl<S> TimeoutStream<S> {
         Self {
             inner,
             idle_timeout,
-            deadline: Box::pin(tokio::time::sleep(read_timeout)),
+            read_deadline: Box::pin(tokio::time::sleep(read_timeout)),
+            write_deadline: Box::pin(tokio::time::sleep(idle_timeout)),
         }
     }
 }
@@ -71,7 +73,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for TimeoutStream<S> {
                 // Reset on progress, including a zero-byte read (EOF) - the caller sees the EOF
                 // and ends the session, so the timer's state past this point does not matter.
                 if buf.filled().len() > before {
-                    me.deadline.as_mut().reset(Instant::now() + me.idle_timeout);
+                    me.read_deadline
+                        .as_mut()
+                        .reset(Instant::now() + me.idle_timeout);
+                    me.write_deadline
+                        .as_mut()
+                        .reset(Instant::now() + me.idle_timeout);
                 }
                 Poll::Ready(Ok(()))
             }
@@ -79,7 +86,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for TimeoutStream<S> {
             // Only once the socket has no data to give does the deadline get polled - which is
             // also what registers its waker, so a session that goes quiet is woken to be failed
             // rather than waiting for traffic that never comes.
-            Poll::Pending => match Future::poll(me.deadline.as_mut(), cx) {
+            Poll::Pending => match Future::poll(me.read_deadline.as_mut(), cx) {
                 Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "ssh session exceeded its read/idle timeout",
@@ -96,11 +103,45 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TimeoutStream<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        let me = self.get_mut();
+        match Pin::new(&mut me.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                if written > 0 {
+                    me.write_deadline
+                        .as_mut()
+                        .reset(Instant::now() + me.idle_timeout);
+                }
+                Poll::Ready(Ok(written))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => match Future::poll(me.write_deadline.as_mut(), cx) {
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ssh session exceeded its write/idle timeout",
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let me = self.get_mut();
+        match Pin::new(&mut me.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                me.write_deadline
+                    .as_mut()
+                    .reset(Instant::now() + me.idle_timeout);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => match Future::poll(me.write_deadline.as_mut(), cx) {
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ssh session exceeded its write/idle timeout",
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -111,7 +152,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TimeoutStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn a_stream_that_never_speaks_fails_at_the_read_timeout() {
@@ -175,5 +216,18 @@ mod tests {
             TimeoutStream::new(server, Duration::from_secs(30), Duration::from_secs(30));
         let mut buf = [0u8; 16];
         assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_cannot_stall_a_write_forever() {
+        let (client, server) = tokio::io::duplex(8);
+        let _client = client;
+        let mut stream = TimeoutStream::new(
+            server,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+        let err = stream.write_all(&[0u8; 1024]).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
     }
 }

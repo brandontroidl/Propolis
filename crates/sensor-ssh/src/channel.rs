@@ -28,13 +28,33 @@ use crate::transport::{
 
 /// RFC 4254 section 5.1's reason code for a channel type this server does not service.
 const SSH_OPEN_UNKNOWN_CHANNEL_TYPE: u32 = 3;
+const SSH_OPEN_RESOURCE_SHORTAGE: u32 = 4;
 
 /// Initial window size and maximum packet size this server advertises for every confirmed
 /// channel. This server never rate-limits attacker traffic through SSH flow control - that is
 /// `sensor_framework::ConnectionBounds`' job - so these are simply generous, protocol-plausible
 /// defaults (in OpenSSH's own neighborhood), not a tuned capacity plan.
-const INITIAL_WINDOW_SIZE: u32 = 2_097_152; // 2 MiB
-const CHANNEL_MAX_PACKET_SIZE: u32 = 32_768; // 32 KiB
+pub const INITIAL_WINDOW_SIZE: u32 = 2_097_152; // 2 MiB
+pub const CHANNEL_MAX_PACKET_SIZE: u32 = 32_768; // 32 KiB
+
+/// The usable fields from a channel-open request. The peer's window and packet limit govern
+/// server-to-client traffic; treating them as advisory lets one large fake-shell reply violate
+/// RFC 4254 and makes strict clients disconnect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelOpen {
+    pub recipient_channel: u32,
+    pub peer_window: u32,
+    pub peer_max_packet: u32,
+    pub accepted: bool,
+    pub response: Vec<u8>,
+}
+
+/// A parsed channel request together with the RFC 4254 `want reply` bit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRequest {
+    pub action: ChannelAction,
+    pub want_reply: bool,
+}
 
 /// What the caller should do next after a `SSH_MSG_CHANNEL_REQUEST`. See the module doc for why
 /// `Exec`/`Subsystem` carry their string raw, unsanitized.
@@ -93,7 +113,7 @@ impl std::error::Error for ChannelError {}
 /// our side's id inherits that same uniqueness for free). For anything else the response is
 /// `SSH_MSG_CHANNEL_OPEN_FAILURE` (see the module doc for why) - no channel exists, and the
 /// returned id is only the client's number for bookkeeping/logging, never one to register as open.
-pub fn handle_channel_open(packet: &[u8]) -> Result<(u32, Vec<u8>), ChannelError> {
+pub fn handle_channel_open(packet: &[u8]) -> Result<ChannelOpen, ChannelError> {
     let mut cursor = 0usize;
 
     let msg_type = read_u8(packet, &mut cursor)?;
@@ -103,17 +123,26 @@ pub fn handle_channel_open(packet: &[u8]) -> Result<(u32, Vec<u8>), ChannelError
 
     let channel_type = read_string(packet, &mut cursor)?;
     let sender_channel = read_u32(packet, &mut cursor)?;
-    let _initial_window_size = read_u32(packet, &mut cursor)?;
-    let _max_packet_size = read_u32(packet, &mut cursor)?;
+    let peer_window = read_u32(packet, &mut cursor)?;
+    let peer_max_packet = read_u32(packet, &mut cursor)?;
 
-    if channel_type != b"session" {
-        return Ok((sender_channel, build_channel_open_failure(sender_channel)));
+    if channel_type != b"session" || peer_max_packet == 0 {
+        return Ok(ChannelOpen {
+            recipient_channel: sender_channel,
+            peer_window,
+            peer_max_packet,
+            accepted: false,
+            response: build_channel_open_failure(sender_channel),
+        });
     }
 
-    Ok((
-        sender_channel,
-        build_channel_open_confirmation(sender_channel),
-    ))
+    Ok(ChannelOpen {
+        recipient_channel: sender_channel,
+        peer_window,
+        peer_max_packet,
+        accepted: true,
+        response: build_channel_open_confirmation(sender_channel),
+    })
 }
 
 /// Handle one `SSH_MSG_CHANNEL_REQUEST` (RFC 4254 section 5.4). `channel_id` is the id the caller
@@ -123,7 +152,7 @@ pub fn handle_channel_open(packet: &[u8]) -> Result<(u32, Vec<u8>), ChannelError
 pub fn handle_channel_request(
     packet: &[u8],
     channel_id: u32,
-) -> Result<ChannelAction, ChannelError> {
+) -> Result<ChannelRequest, ChannelError> {
     let mut cursor = 0usize;
 
     let msg_type = read_u8(packet, &mut cursor)?;
@@ -137,7 +166,7 @@ pub fn handle_channel_request(
     }
 
     let request_type = read_string(packet, &mut cursor)?;
-    let _want_reply = read_u8(packet, &mut cursor)?;
+    let want_reply = read_u8(packet, &mut cursor)? != 0;
 
     let action = match request_type.as_slice() {
         b"pty-req" => ChannelAction::PtyReq,
@@ -153,7 +182,7 @@ pub fn handle_channel_request(
         _ => ChannelAction::Other,
     };
 
-    Ok(action)
+    Ok(ChannelRequest { action, want_reply })
 }
 
 /// Build `SSH_MSG_CHANNEL_OPEN_CONFIRMATION` (RFC 4254 section 5.1): recipient channel (the
@@ -180,6 +209,21 @@ fn build_channel_open_failure(recipient_channel: u32) -> Vec<u8> {
     out.extend_from_slice(&(description.len() as u32).to_be_bytes());
     out.extend_from_slice(description);
     out.extend_from_slice(&0u32.to_be_bytes()); // language tag, empty
+    out
+}
+
+/// Refuse an otherwise valid session channel when the per-connection channel table is full.
+/// Kept next to the other open-response encoding so the session orchestrator does not duplicate
+/// RFC 4254 framing just to enforce its resource cap.
+pub fn build_channel_open_resource_shortage(recipient_channel: u32) -> Vec<u8> {
+    let description = b"channel limit reached";
+    let mut out = Vec::with_capacity(1 + 4 + 4 + 4 + description.len() + 4);
+    out.push(SSH_MSG_CHANNEL_OPEN_FAILURE);
+    out.extend_from_slice(&recipient_channel.to_be_bytes());
+    out.extend_from_slice(&SSH_OPEN_RESOURCE_SHORTAGE.to_be_bytes());
+    out.extend_from_slice(&(description.len() as u32).to_be_bytes());
+    out.extend_from_slice(description);
+    out.extend_from_slice(&0u32.to_be_bytes());
     out
 }
 

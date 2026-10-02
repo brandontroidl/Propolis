@@ -84,6 +84,8 @@ pub enum HandlerId {
     Whoami,
     Pwd,
     Echo,
+    /// `printf`: the format interpreter loaders use to emit payloads and bytes.
+    Printf,
     Cat,
     /// `head`, `hexdump` and `more`: the byte readers next to `cat`.
     Head,

@@ -63,6 +63,7 @@ mod expand;
 mod lex;
 mod lookup;
 mod parse;
+mod printf;
 mod read;
 mod readlink;
 mod registry;
@@ -2767,6 +2768,8 @@ mod dd_tests;
 mod grammar_tests;
 #[cfg(test)]
 mod lookup_tests;
+#[cfg(test)]
+mod printf_tests;
 #[cfg(test)]
 mod proc_self_tests;
 #[cfg(test)]

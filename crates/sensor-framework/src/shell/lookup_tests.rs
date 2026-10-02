@@ -528,10 +528,10 @@ fn every_registered_name_is_looked_up_the_way_dispatch_runs_it() {
 fn a_file_dispatch_does_not_run_is_not_advertised() {
     let mut sh = shell();
     assert!(
-        sh_holds_file(&mut sh, "printf"),
+        sh_holds_file(&mut sh, "sed"),
         "the premise: the file is there"
     );
-    assert!(!dispatch_runs(&mut shell(), "printf"));
+    assert!(!dispatch_runs(&mut shell(), "sed"));
     run(&mut sh, "PATH=/tmp:$PATH");
     run(&mut sh, ">/tmp/dropped");
     run(&mut sh, "chmod +x /tmp/dropped");
@@ -540,7 +540,7 @@ fn a_file_dispatch_does_not_run_is_not_advertised() {
         "the premise: on `$PATH` and executable"
     );
     assert!(!dispatch_runs(&mut sh, "dropped"));
-    for name in ["printf", "sed", "touch", "dropped"] {
+    for name in ["sed", "touch", "dropped"] {
         assert_eq!(
             answer(&mut sh, &format!("which {name}")),
             ("".into(), "".into(), 1),

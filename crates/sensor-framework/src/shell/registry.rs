@@ -77,6 +77,7 @@ impl Registry {
         super::test_builtin::register(&mut registry);
         super::lookup::register(&mut registry);
         super::texttools::register(&mut registry);
+        super::printf::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }

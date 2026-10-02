@@ -466,6 +466,8 @@ struct Overlay {
     /// Physical paths removed this session, baked-in ones included: a file the shell said it
     /// deleted must stop being readable, or the next `cat` contradicts the `rm`.
     tombstones: HashSet<String>,
+    /// `chattr` bits by physical path; an entry keeps its slot (and charge) once made.
+    attrs: HashMap<String, u32>,
 }
 
 /// A snapshot of a plausible Linux filesystem, built fresh by `new()` for every session, plus what
@@ -1209,10 +1211,19 @@ impl FakeFs {
     /// Resolve a write target to its physical path, mapping a missing parent under a read-only
     /// mount to the refusal a real write there gets.
     fn resolve_for_write(&self, path: &str) -> Result<String, FsError> {
-        self.resolve(path, true).map_err(|error| match error {
-            FsError::NoSuchDirectory(missing) if self.snapshot.is_ro(&missing) => FsError::ReadOnly,
-            other => other,
-        })
+        self.resolve_for_write_with(path, true)
+    }
+
+    /// [`Self::resolve_for_write`] with `follow_final` false for a call that creates the name
+    /// itself rather than writing through it (a symlink replaces nothing it points at).
+    fn resolve_for_write_with(&self, path: &str, follow_final: bool) -> Result<String, FsError> {
+        self.resolve(path, follow_final)
+            .map_err(|error| match error {
+                FsError::NoSuchDirectory(missing) if self.snapshot.is_ro(&missing) => {
+                    FsError::ReadOnly
+                }
+                other => other,
+            })
     }
 
     /// Write `bytes` to `path`, as a download saving its body or a redirection does.
@@ -1313,6 +1324,12 @@ impl FakeFs {
         }
         // The bytes come back; the node slot does not. A created node's slot becomes the
         // tombstone's, and a baked path's tombstone takes a new one.
+        let below = format!("{physical}/");
+        for (key, bits) in &mut self.overlay.attrs {
+            if *key == physical || key.starts_with(&below) {
+                *bits = 0;
+            }
+        }
         let removed = self.overlay.nodes.remove(&physical);
         if let Some(node) = &removed {
             self.budget.refund_bytes(node_owned_bytes(node));
@@ -1357,6 +1374,95 @@ impl FakeFs {
     pub fn create_file(&mut self, path: &str) -> Result<(), FsError> {
         self.write_file(path, b"")
     }
+
+    /// `symlink(target, path)`: a link node holding `target` exactly as typed. The target is
+    /// never resolved here, so a dangling link is fine; the final component of `path` is the new
+    /// name, never followed. The path and the target text are charged with the node, and stay
+    /// charged for the life of the slot as a directory's do.
+    pub fn create_symlink(&mut self, path: &str, target: &str) -> Result<(), FsError> {
+        self.budget.check_name(path)?;
+        let physical = self.resolve_for_write_with(path, false)?;
+        if self.snapshot.is_ro(&physical) {
+            return Err(FsError::ReadOnly);
+        }
+        if self.node_at(&physical).is_some() {
+            return Err(FsError::Exists);
+        }
+        if !self.overlay.tombstones.contains(&physical) {
+            let held = physical.len().saturating_add(target.len());
+            let bytes = u64::try_from(held).unwrap_or(u64::MAX);
+            self.budget.charge_bytes(bytes)?;
+            if let Err(error) = self.budget.charge_node() {
+                self.budget.refund_bytes(bytes);
+                return Err(error.into());
+            }
+        }
+        self.overlay.tombstones.remove(&physical);
+        self.overlay.nodes.insert(physical, Node::symlink(target));
+        Ok(())
+    }
+
+    /// The ext2 attribute bits (`chattr`) of the node `path` names, or `None` when nothing is
+    /// there. Stored only: no write or removal consults them.
+    pub fn attrs(&self, path: &str) -> Option<u32> {
+        let physical = self.resolve(path, true).ok()?;
+        self.node_at(&physical)?;
+        Some(self.overlay.attrs.get(&physical).copied().unwrap_or(0))
+    }
+
+    /// Apply a `chattr` change to the node `path` names and return the bits it now holds. The
+    /// bits live beside the overlay's nodes, keyed by physical path, so a modeled file needs no
+    /// copy of itself to carry them; a path's first nonzero set is charged like a node slot and
+    /// that slot stays charged. Removing a path zeroes its bits (a new file is a new inode).
+    pub fn change_attrs(
+        &mut self,
+        path: &str,
+        change: AttrChange,
+        bits: u32,
+    ) -> Result<u32, FsError> {
+        let physical = self.resolve(path, true).map_err(|error| match error {
+            FsError::NoSuchDirectory(_) => FsError::NoSuchFile,
+            other => other,
+        })?;
+        if self.node_at(&physical).is_none() {
+            return Err(FsError::NoSuchFile);
+        }
+        if self.snapshot.is_ro(&physical) {
+            return Err(FsError::ReadOnly);
+        }
+        let held = self.overlay.attrs.get(&physical).copied();
+        let current = held.unwrap_or(0);
+        let next = match change {
+            AttrChange::Add => current | bits,
+            AttrChange::Remove => current & !bits,
+            AttrChange::Replace => bits,
+        };
+        if held.is_none() {
+            if next == 0 {
+                return Ok(0);
+            }
+            let bytes = u64::try_from(physical.len()).unwrap_or(u64::MAX);
+            self.budget.charge_bytes(bytes)?;
+            if let Err(error) = self.budget.charge_node() {
+                self.budget.refund_bytes(bytes);
+                return Err(error.into());
+            }
+        }
+        self.overlay.attrs.insert(physical, next);
+        Ok(next)
+    }
+}
+
+/// The ext2 attribute bits `chattr` stores, with the kernel's `FS_*_FL` values.
+pub const ATTR_IMMUTABLE: u32 = 0x0000_0010;
+pub const ATTR_APPEND_ONLY: u32 = 0x0000_0020;
+
+/// How one `chattr` mode argument edits the stored bits: `+` adds, `-` clears, `=` replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrChange {
+    Add,
+    Remove,
+    Replace,
 }
 
 /// The bytes a node was charged: a regular file's materialized blob bytes, nothing for the rest.

@@ -81,6 +81,7 @@ impl Registry {
         super::base64::register(&mut registry);
         super::hashing::register(&mut registry);
         super::pathtools::register(&mut registry);
+        super::fsops::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }

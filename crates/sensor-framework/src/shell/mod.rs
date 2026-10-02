@@ -61,6 +61,7 @@ mod busybox;
 mod dd;
 mod eval;
 mod expand;
+mod fsops;
 mod hashing;
 mod lex;
 mod lookup;
@@ -2769,6 +2770,8 @@ mod budget_tests;
 mod busybox_tests;
 #[cfg(test)]
 mod dd_tests;
+#[cfg(test)]
+mod fsops_tests;
 #[cfg(test)]
 mod grammar_tests;
 #[cfg(test)]

@@ -137,6 +137,9 @@ pub enum HandlerId {
     Rmdir,
     /// `chattr`: ext2 attribute bits stored on the overlay's nodes.
     Chattr,
+    /// `getprop` and `setprop`: the Android shell's property table and its session overlay.
+    Getprop,
+    Setprop,
     Sleep,
     Cd,
     Su,

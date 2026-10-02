@@ -53,6 +53,7 @@ use crate::fakefs::{Blob, FakeFs, FsError, READ_CAP};
 use crate::persona;
 use crate::sanitize_value;
 
+mod android;
 mod arith;
 mod ast;
 mod base64;
@@ -360,6 +361,10 @@ pub struct FakeShell {
     /// BusyBox applets running right now. An applet runs inside the busybox process, so what it
     /// opens as `/proc/self/exe` is busybox, whatever applet name it was started under.
     busybox_depth: u32,
+    /// What `setprop` set this session, read before the modeled table. Android's property
+    /// service is system-wide, so it sits here rather than in a frame's state, which a subshell
+    /// discards.
+    props: std::collections::BTreeMap<String, String>,
 }
 
 /// One entry of the shell stack.
@@ -484,6 +489,7 @@ impl FakeShell {
             script_depth: 0,
             loop_depth: 0,
             busybox_depth: 0,
+            props: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2761,6 +2767,8 @@ fn decode_echo_escapes_into(s: &str, out: &mut String, dash: bool) -> bool {
 // Declared with the test modules, after all production code: `trace_type_never_feeds_wire_output`
 // reads each file of this module up to its first `#[cfg(test)]` as the production source, and skips
 // the files that hold only tests.
+#[cfg(test)]
+mod android_tests;
 #[cfg(test)]
 mod base64_tests;
 #[cfg(test)]

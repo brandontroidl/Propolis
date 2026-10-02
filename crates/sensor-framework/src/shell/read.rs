@@ -1,4 +1,4 @@
-//! The byte readers: `cat`, `head`, `more` and `hexdump`. Each reads the modeled bytes of a file
+//! The byte readers: `cat`, `head`, `tail`, `more` and `hexdump`. Each reads the modeled bytes of a file
 //! (or its standard input) and writes them back untouched: no text framing is added over binary,
 //! so `cat /bin/ls | head -n 1` is the image up to and including its first `0x0a`, exactly as the
 //! pty capture shows.
@@ -29,6 +29,7 @@ pub(super) fn register(r: &mut Registry) {
     r.register("cat", HandlerId::Cat, FakeShell::cmd_cat);
     // The phone's toolbox has no recorded answer for these, and it answers "not found" today.
     r.register_if("head", ubuntu, HandlerId::Head, FakeShell::cmd_head);
+    r.register_if("tail", ubuntu, HandlerId::Tail, FakeShell::cmd_tail);
     r.register_if("more", ubuntu, HandlerId::More, FakeShell::cmd_more);
     r.register_if(
         "hexdump",
@@ -202,13 +203,46 @@ impl FakeShell {
             Ok(args) => args,
             Err(text) => return CommandResult::stderr(1, text),
         };
+        let files = args.files.clone();
+        let (quiet, verbose) = (args.quiet, args.verbose);
+        self.read_each(parts, "head", &files, quiet, verbose, &Pick::Head(args))
+    }
+
+    /// `tail`: the last N lines (`-n`, default 10) or bytes (`-c`) of standard input or of each
+    /// file operand, read through the same bounded reader as `head`, so a file larger than the
+    /// line's allowance is tailed over its first allowance of bytes. `-n +N` starts at line N.
+    ///
+    /// `-f` and its relatives are accepted and print the initial block only: nothing in the model
+    /// ever appends to a file, so there is no growth to follow. [unverified] The real tool would
+    /// keep running there; a recorded session that depends on that is not modeled.
+    pub(super) fn cmd_tail(&mut self, parts: &[&str]) -> CommandResult {
+        let args = match parse_tail(parts.get(1..).unwrap_or(&[])) {
+            Ok(args) => args,
+            Err(text) => return CommandResult::stderr(1, text),
+        };
+        let files = args.files.clone();
+        let (quiet, verbose) = (args.quiet, args.verbose);
+        self.read_each(parts, "tail", &files, quiet, verbose, &Pick::Tail(args))
+    }
+
+    /// The operand loop `head` and `tail` share: `==> NAME <==` headers for several operands (or
+    /// `-v`, never with `-q`), and each failure reported in place without stopping the rest.
+    fn read_each(
+        &mut self,
+        parts: &[&str],
+        tool: &str,
+        files: &[&str],
+        quiet: bool,
+        verbose: bool,
+        pick: &Pick<'_>,
+    ) -> CommandResult {
         let busybox = self.busybox_depth > 0;
-        let sources: Vec<&str> = if args.files.is_empty() {
+        let sources: Vec<&str> = if files.is_empty() {
             vec!["-"]
         } else {
-            args.files.clone()
+            files.to_vec()
         };
-        let headers = args.verbose || (sources.len() > 1 && !args.quiet);
+        let headers = verbose || (sources.len() > 1 && !quiet);
         let mut acc = CommandResult::silent(0);
         let mut failed = false;
         let mut printed_header = false;
@@ -218,10 +252,11 @@ impl FakeShell {
             if left == 0 {
                 break;
             }
-            let read = if path == "-" {
-                Ok(self.head_stdin(&args, cap))
-            } else {
-                self.head_file(parts, path, &args, cap)
+            let read = match (path == "-", pick) {
+                (true, Pick::Head(args)) => Ok(self.head_stdin(args, cap)),
+                (false, Pick::Head(args)) => self.head_file(parts, path, args, cap),
+                (true, Pick::Tail(args)) => Ok(self.tail_stdin(args, cap)),
+                (false, Pick::Tail(args)) => self.tail_file(parts, path, args, cap),
             };
             match read {
                 Ok(bytes) => {
@@ -242,13 +277,13 @@ impl FakeShell {
                     // under a UTF-8 locale; the missing-file forms are the tools' own.
                     let text = match (&error, busybox) {
                         (FsError::IsADirectory, false) => {
-                            format!("head: error reading '{path}': Is a directory\n")
+                            format!("{tool}: error reading '{path}': Is a directory\n")
                         }
                         (_, false) => format!(
-                            "head: cannot open '{path}' for reading: {}\n",
+                            "{tool}: cannot open '{path}' for reading: {}\n",
                             errno_text(&error)
                         ),
-                        (_, true) => format!("head: {path}: {}\n", errno_text(&error)),
+                        (_, true) => format!("{tool}: {path}: {}\n", errno_text(&error)),
                     };
                     acc.append(CommandResult::stderr(1, text));
                 }
@@ -331,6 +366,23 @@ impl FakeShell {
                 Ok(without_last(all, unit, args.count.n))
             }
         }
+    }
+
+    fn tail_stdin(&mut self, args: &TailArgs<'_>, cap: u64) -> Vec<u8> {
+        let mut all = self.stdin.take_rest();
+        all.truncate(clamp(cap));
+        tail_of(all, args)
+    }
+
+    fn tail_file(
+        &mut self,
+        argv: &[&str],
+        path: &str,
+        args: &TailArgs<'_>,
+        cap: u64,
+    ) -> Result<Vec<u8>, FsError> {
+        let all = self.read_operand(argv, path, 0, cap)?;
+        Ok(tail_of(all, args))
     }
 
     /// `hexdump`, for the one form the recorded loaders run: `-e '16/1 "%c"'` with an optional
@@ -494,11 +546,19 @@ fn head_count(text: &str, unit: Unit) -> Result<Count, String> {
         Some(rest) => (true, rest),
         None => (false, text.strip_prefix('+').unwrap_or(text)),
     };
+    Ok(Count {
+        n: scaled_number(digits).ok_or_else(bad)?,
+        all_but_last,
+    })
+}
+
+/// `12`, `3k`, `1MB`: a count with GNU's multiplier suffix, saturating at `u64::MAX`.
+fn scaled_number(digits: &str) -> Option<u64> {
     let split = digits
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(digits.len());
     let (number, suffix) = digits.split_at(split);
-    let base: u64 = number.parse().map_err(|_| bad())?;
+    let base: u64 = number.parse().ok()?;
     let multiplier: u64 = match suffix {
         "" => 1,
         "b" => 512,
@@ -506,12 +566,9 @@ fn head_count(text: &str, unit: Unit) -> Result<Count, String> {
         "k" | "K" => 1_024,
         "MB" => 1_000_000,
         "M" => 1_048_576,
-        _ => return Err(bad()),
+        _ => return None,
     };
-    Ok(Count {
-        n: base.saturating_mul(multiplier),
-        all_but_last,
-    })
+    Some(base.saturating_mul(multiplier))
 }
 
 /// `head`'s command line. The messages are GNU head's; the BusyBox applet's own wording for a
@@ -610,6 +667,199 @@ fn parse_head<'a>(args: &[&'a str]) -> Result<HeadArgs<'a>, String> {
         }
     }
     Ok(parsed)
+}
+
+/// Which reader's arguments `read_each` applies to each operand.
+enum Pick<'a> {
+    Head(HeadArgs<'a>),
+    Tail(TailArgs<'a>),
+}
+
+struct TailArgs<'a> {
+    unit: Unit,
+    n: u64,
+    /// `-n +5`: start at the Nth line (or byte) instead of counting back from the end.
+    from_start: bool,
+    /// `-z`: records end at NUL, not newline.
+    delimiter: u8,
+    files: Vec<&'a str>,
+    quiet: bool,
+    verbose: bool,
+}
+
+const TAIL_TRY: &str = "Try 'tail --help' for more information.\n";
+
+fn tail_count(text: &str, unit: Unit) -> Result<(u64, bool), String> {
+    let (from_start, digits) = match (text.strip_prefix('+'), text.strip_prefix('-')) {
+        (Some(rest), _) => (true, rest),
+        (None, Some(rest)) => (false, rest),
+        (None, None) => (false, text),
+    };
+    scaled_number(digits)
+        .map(|n| (n, from_start))
+        .ok_or_else(|| {
+            let what = match unit {
+                Unit::Lines => "lines",
+                Unit::Bytes => "bytes",
+            };
+            format!("tail: invalid number of {what}: '{text}'\n")
+        })
+}
+
+/// `tail`'s command line, with `head`'s conventions: GNU's messages, `-N` for `-n N`, clustered
+/// short flags, `--name=value` or `--name value`. A count is `N` or `-N` (the last N) or `+N`.
+fn parse_tail<'a>(args: &[&'a str]) -> Result<TailArgs<'a>, String> {
+    let mut parsed = TailArgs {
+        unit: Unit::Lines,
+        n: 10,
+        from_start: false,
+        delimiter: b'\n',
+        files: Vec::new(),
+        quiet: false,
+        verbose: false,
+    };
+    let mut options = true;
+    let mut i = 0usize;
+    while let Some(&arg) = args.get(i) {
+        i = i.saturating_add(1);
+        if !options || arg == "-" || !arg.starts_with('-') {
+            parsed.files.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            options = false;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            match name {
+                "lines" | "bytes" | "sleep-interval" | "pid" | "max-unchanged-stats" => {
+                    let value = match value {
+                        Some(value) => value,
+                        None => {
+                            let next = args.get(i).copied().ok_or_else(|| {
+                                format!("tail: option '--{name}' requires an argument\n{TAIL_TRY}")
+                            })?;
+                            i = i.saturating_add(1);
+                            next
+                        }
+                    };
+                    if name == "lines" || name == "bytes" {
+                        let unit = if name == "lines" {
+                            Unit::Lines
+                        } else {
+                            Unit::Bytes
+                        };
+                        (parsed.n, parsed.from_start) = tail_count(value, unit)?;
+                        parsed.unit = unit;
+                    }
+                }
+                "quiet" | "silent" => parsed.quiet = true,
+                "verbose" => parsed.verbose = true,
+                "zero-terminated" => parsed.delimiter = 0,
+                "follow" | "retry" | "presume-input-pipe" => {}
+                _ => {
+                    return Err(format!("tail: unrecognized option '{arg}'\n{TAIL_TRY}"));
+                }
+            }
+            continue;
+        }
+        let cluster = arg.get(1..).unwrap_or("");
+        if !cluster.is_empty() && cluster.bytes().all(|b| b.is_ascii_digit()) {
+            parsed.unit = Unit::Lines;
+            (parsed.n, parsed.from_start) = tail_count(cluster, Unit::Lines)?;
+            continue;
+        }
+        for (at, flag) in cluster.char_indices() {
+            match flag {
+                'q' => parsed.quiet = true,
+                'v' => parsed.verbose = true,
+                'z' => parsed.delimiter = 0,
+                'f' | 'F' => {}
+                'n' | 'c' | 's' => {
+                    let attached = cluster.get(at.saturating_add(1)..).unwrap_or("");
+                    let value = if attached.is_empty() {
+                        let next = args.get(i).copied().ok_or_else(|| {
+                            format!("tail: option requires an argument -- '{flag}'\n{TAIL_TRY}")
+                        })?;
+                        i = i.saturating_add(1);
+                        next
+                    } else {
+                        attached
+                    };
+                    if flag != 's' {
+                        let unit = if flag == 'n' {
+                            Unit::Lines
+                        } else {
+                            Unit::Bytes
+                        };
+                        (parsed.n, parsed.from_start) = tail_count(value, unit)?;
+                        parsed.unit = unit;
+                    }
+                    break;
+                }
+                other => {
+                    return Err(format!("tail: invalid option -- '{other}'\n{TAIL_TRY}"));
+                }
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+/// The part of `bytes` that `tail` prints. Lines end at `delimiter`, which is part of the line,
+/// and a final unterminated line counts as one. Input with fewer lines than asked for comes back
+/// whole, and no framing is added to it.
+fn tail_of(mut bytes: Vec<u8>, args: &TailArgs<'_>) -> Vec<u8> {
+    let start = match (args.unit, args.from_start) {
+        (Unit::Bytes, false) => bytes.len().saturating_sub(clamp(args.n)),
+        (Unit::Bytes, true) => clamp(args.n.saturating_sub(1)).min(bytes.len()),
+        (Unit::Lines, false) => {
+            let mut start = bytes.len();
+            let mut limit = if bytes.last() == Some(&args.delimiter) {
+                bytes.len().saturating_sub(1)
+            } else {
+                bytes.len()
+            };
+            for _ in 0..args.n {
+                match bytes
+                    .get(..limit)
+                    .and_then(|before| before.iter().rposition(|b| *b == args.delimiter))
+                {
+                    Some(at) => {
+                        start = at.saturating_add(1);
+                        limit = at;
+                    }
+                    None => {
+                        start = 0;
+                        break;
+                    }
+                }
+            }
+            start
+        }
+        (Unit::Lines, true) => {
+            let mut start = 0usize;
+            for _ in 1..args.n {
+                match bytes
+                    .get(start..)
+                    .and_then(|rest| rest.iter().position(|b| *b == args.delimiter))
+                {
+                    Some(at) => start = start.saturating_add(at).saturating_add(1),
+                    None => {
+                        start = bytes.len();
+                        break;
+                    }
+                }
+            }
+            start
+        }
+    };
+    bytes.drain(..start.min(bytes.len()));
+    bytes
 }
 
 /// `bytes` without its last `n` lines or bytes. A final line with no newline counts as a line.

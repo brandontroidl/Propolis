@@ -225,6 +225,166 @@ fn head_reports_what_the_real_tool_does() {
 }
 
 #[test]
+fn tail_counts_lines_and_bytes_of_files_and_of_standard_input() {
+    let mut sh = shell();
+    run(
+        &mut sh,
+        "printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n11\\n12\\n' > /tmp/n; echo -e 'a\\nb\\nc' > /tmp/t; \
+         echo -n xy > /tmp/u; printf 'p\\nq' > /tmp/v",
+    );
+    for (line, want) in [
+        ("tail /tmp/n", "3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n"),
+        ("tail -n 2 /tmp/t", "b\nc\n"),
+        ("tail -n2 /tmp/t", "b\nc\n"),
+        ("tail --lines=1 /tmp/t", "c\n"),
+        ("tail -2 /tmp/t", "b\nc\n"),
+        ("tail -n -2 /tmp/t", "b\nc\n"),
+        ("tail -n 0 /tmp/t", ""),
+        ("tail -n 99 /tmp/t", "a\nb\nc\n"),
+        ("tail -n +2 /tmp/t", "b\nc\n"),
+        ("tail -n +1 /tmp/t", "a\nb\nc\n"),
+        ("tail -n +0 /tmp/t", "a\nb\nc\n"),
+        ("tail -n +9 /tmp/t", ""),
+        ("tail -c 5 /tmp/t", "\nb\nc\n"),
+        ("tail -c5 /tmp/t", "\nb\nc\n"),
+        ("tail --bytes=2 /tmp/t", "c\n"),
+        ("tail -c +3 /tmp/t", "b\nc\n"),
+        ("tail -c 1K /tmp/t", "a\nb\nc\n"),
+        ("tail -c 0 /tmp/t", ""),
+        ("tail -n 1 /tmp/u", "xy"),
+        ("tail -n 2 /tmp/v", "p\nq"),
+        ("tail -c 1 /tmp/u", "y"),
+        ("printf 'a\\nb\\nc\\n' | tail -n 1", "c\n"),
+        ("printf 'a\\nb\\nc' | tail -n 2", "b\nc"),
+        ("tail -n 1 < /tmp/t", "c\n"),
+        ("cat /tmp/t | tail -n +2", "b\nc\n"),
+        ("printf 'a\\0b\\0' | tail -z -n 1", "b\0"),
+        (
+            "tail -n 1 /tmp/t /tmp/u",
+            "==> /tmp/t <==\nc\n\n==> /tmp/u <==\nxy",
+        ),
+        ("tail -q -n 1 /tmp/t /tmp/u", "c\nxy"),
+        ("tail -v -n 1 /tmp/t", "==> /tmp/t <==\nc\n"),
+        ("cat /tmp/t | tail -v -n 1", "==> standard input <==\nc\n"),
+        // Nothing grows a modeled file, so following prints the initial block and ends.
+        ("tail -f -n 1 /tmp/t", "c\n"),
+        ("tail -F -s 1 -n 1 /tmp/t", "c\n"),
+        ("tail --follow=name --retry --pid=1 -n 1 /tmp/t", "c\n"),
+    ] {
+        let out = run(&mut sh, line);
+        assert_eq!(out.bytes(), want.as_bytes(), "{line}");
+        assert_eq!(out.status, 0, "{line}");
+    }
+    // Terminal standard input reads empty.
+    assert_eq!(run(&mut sh, "tail -n 3"), "");
+}
+
+#[test]
+fn tail_of_a_binary_is_its_bounded_bytes_and_never_invents_framing() {
+    let image = ls_image();
+    // The one newline in the image is at 409, so the last line is everything after it.
+    let after = &image[410..];
+    for line in ["tail -n 1 /bin/ls", "cat /bin/ls | tail -n 1"] {
+        assert_eq!(run(&mut shell(), line).bytes(), after, "{line}");
+    }
+    let from = image.len() - 5;
+    assert_eq!(
+        run(&mut shell(), "tail -c 5 /bin/ls").bytes(),
+        &image[from..]
+    );
+    assert_eq!(
+        run(&mut shell(), "tail -c +410 /bin/ls").bytes(),
+        &image[409..]
+    );
+    // No newline in the bounded prefix: the whole bounded content, unframed.
+    let zeros = run(&mut shell(), "tail -n 1 /dev/zero");
+    assert!(zeros.bytes().iter().all(|b| *b == 0));
+    assert!(!zeros.bytes().is_empty());
+    let mut limits = BudgetLimits::standard();
+    limits.work_per_line = 1_000;
+    let budget = ConnectionBudget::new(limits);
+    let mut sh = FakeShell::new(FakeFs::new(), ctx()).with_budget(budget);
+    assert_eq!(
+        run(&mut sh, "tail -c 5000 /bin/ls").bytes(),
+        &image[..1_000],
+        "a large file is tailed over its first allowance only"
+    );
+}
+
+#[test]
+fn tail_reports_what_the_real_tool_does() {
+    let mut sh = shell();
+    for (line, want) in [
+        (
+            "tail /nosuch",
+            "tail: cannot open '/nosuch' for reading: No such file or directory\n",
+        ),
+        ("tail /tmp", "tail: error reading '/tmp': Is a directory\n"),
+        (
+            "/bin/busybox tail /nosuch",
+            "tail: /nosuch: No such file or directory\n",
+        ),
+        ("tail -n x /tmp", "tail: invalid number of lines: 'x'\n"),
+        ("tail -c +1q /tmp", "tail: invalid number of bytes: '+1q'\n"),
+        (
+            "tail -n",
+            "tail: option requires an argument -- 'n'\nTry 'tail --help' for more information.\n",
+        ),
+        (
+            "tail -k /tmp",
+            "tail: invalid option -- 'k'\nTry 'tail --help' for more information.\n",
+        ),
+        (
+            "tail --nope /tmp",
+            "tail: unrecognized option '--nope'\nTry 'tail --help' for more information.\n",
+        ),
+    ] {
+        let out = run(&mut sh, line);
+        assert_eq!(out, want, "{line}");
+        assert_eq!(out.status, 1, "{line}");
+    }
+    let mixed = run(&mut sh, "echo z > /tmp/z; tail -n 1 /nosuch /tmp/z");
+    assert_eq!(
+        mixed,
+        "tail: cannot open '/nosuch' for reading: No such file or directory\n==> /tmp/z <==\nz\n"
+    );
+    assert_eq!(mixed.status, 1);
+}
+
+#[test]
+fn busybox_tail_runs_the_same_handler() {
+    let mut sh = shell();
+    run(&mut sh, "echo -e 'a\\nb\\nc' > /tmp/t");
+    for line in [
+        "/bin/busybox tail -n 2 /tmp/t",
+        "busybox tail -n 2 < /tmp/t",
+    ] {
+        let out = run(&mut sh, line);
+        assert_eq!(
+            (out.status, out.to_string().as_str()),
+            (0, "b\nc\n"),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn tail_only_reads_modeled_bytes_and_runs_nothing() {
+    let mut sh = shell();
+    run(
+        &mut sh,
+        "echo 'echo pwned > /tmp/pwn' > /tmp/s; chmod +x /tmp/s",
+    );
+    assert_eq!(run(&mut sh, "tail -n 1 /tmp/s"), "echo pwned > /tmp/pwn\n");
+    let out = run(&mut sh, "cat /tmp/pwn");
+    assert_eq!(out.status, 1, "{out}");
+    // The recorded tail binary is data to read, and reading it starts nothing.
+    let out = run(&mut sh, "tail -c 4 /usr/bin/tail");
+    assert_eq!(out.status, 0);
+    assert_eq!(out.bytes().len(), 4);
+}
+
+#[test]
 fn hexdump_and_more_report_a_missing_file_and_fail() {
     let mut sh = shell();
     let out = run(&mut sh, "hexdump -e '16/1 \"%c\"' /nosuch");
@@ -275,6 +435,7 @@ fn the_phone_has_none_of_these_readers() {
     let mut sh = FakeShell::android(FakeFs::android(), ctx());
     for name in [
         "head -n 1 /system/build.prop",
+        "tail -n 1 /system/build.prop",
         "more /default.prop",
         "hexdump /default.prop",
     ] {

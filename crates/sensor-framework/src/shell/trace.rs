@@ -89,6 +89,8 @@ pub enum HandlerId {
     Cat,
     /// `head`, `hexdump` and `more`: the byte readers next to `cat`.
     Head,
+    /// `tail`: the mirror of `head`, over the same bounded read.
+    Tail,
     Hexdump,
     More,
     Dd,
@@ -503,6 +505,7 @@ mod tests {
             ("echo hi", HandlerId::Echo),
             ("cat /etc/hostname", HandlerId::Cat),
             ("head -n 1 /etc/hostname", HandlerId::Head),
+            ("tail -n 1 /etc/hostname", HandlerId::Tail),
             ("more /etc/hostname", HandlerId::More),
             ("hexdump -C /etc/hostname", HandlerId::Hexdump),
             ("dd if=/etc/hostname", HandlerId::Dd),

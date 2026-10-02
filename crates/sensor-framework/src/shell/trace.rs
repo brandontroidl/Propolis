@@ -140,6 +140,9 @@ pub enum HandlerId {
     /// `getprop` and `setprop`: the Android shell's property table and its session overlay.
     Getprop,
     Setprop,
+    /// `toybox` and `toolbox`: the Android shell's multi-call binaries, routing to modeled applets.
+    Toybox,
+    Toolbox,
     Sleep,
     Cd,
     Su,

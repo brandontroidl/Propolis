@@ -83,6 +83,7 @@ impl Registry {
         super::pathtools::register(&mut registry);
         super::fsops::register(&mut registry);
         super::android::register(&mut registry);
+        super::multicall::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }

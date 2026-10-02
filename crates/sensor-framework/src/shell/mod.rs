@@ -66,6 +66,7 @@ mod fsops;
 mod hashing;
 mod lex;
 mod lookup;
+mod multicall;
 mod parse;
 mod pathtools;
 mod printf;
@@ -2786,6 +2787,8 @@ mod grammar_tests;
 mod hashing_tests;
 #[cfg(test)]
 mod lookup_tests;
+#[cfg(test)]
+mod multicall_tests;
 #[cfg(test)]
 mod pathtools_tests;
 #[cfg(test)]

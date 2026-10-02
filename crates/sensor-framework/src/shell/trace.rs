@@ -99,6 +99,11 @@ pub enum HandlerId {
     Od,
     /// `base64`: bounded encode and decode over modeled bytes, for staged payloads.
     Base64,
+    /// `md5sum`, `sha1sum`, `sha256sum` and `cksum`: digests of modeled bytes, for verify steps.
+    Md5sum,
+    Sha1sum,
+    Sha256sum,
+    Cksum,
     Ls,
     Mount,
     EnableBuiltin,

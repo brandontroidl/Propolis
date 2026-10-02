@@ -79,6 +79,7 @@ impl Registry {
         super::texttools::register(&mut registry);
         super::printf::register(&mut registry);
         super::base64::register(&mut registry);
+        super::hashing::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }

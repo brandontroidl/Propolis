@@ -3409,9 +3409,11 @@ version = "0.4.0"
 dependencies = [
  "chrono",
  "libc",
+ "md-5",
  "sensor-wire",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.11.0",
  "tempfile",
  "tokio",

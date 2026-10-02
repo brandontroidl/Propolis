@@ -143,6 +143,14 @@ pub enum HandlerId {
     /// `toybox` and `toolbox`: the Android shell's multi-call binaries, routing to modeled applets.
     Toybox,
     Toolbox,
+    /// The Android system commands attackers probe with: canned or intent-echoing replies only.
+    Getenforce,
+    Pm,
+    Am,
+    Wm,
+    Dumpsys,
+    Screencap,
+    Logcat,
     Sleep,
     Cd,
     Su,

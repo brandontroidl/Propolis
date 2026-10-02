@@ -902,23 +902,29 @@ impl FakeFs {
         b.dir(
             "/system/bin",
             &[
+                "am",
                 "app_process",
                 "cat",
                 "chmod",
                 "dalvikvm",
                 "df",
+                "dumpsys",
+                "getenforce",
                 "getprop",
                 "linker",
                 "logcat",
                 "ls",
                 "mount",
                 "ping",
+                "pm",
                 "reboot",
+                "screencap",
                 "setprop",
                 "sh",
                 "toolbox",
                 "toybox",
                 "umount",
+                "wm",
             ],
         );
         b.dir("/system/xbin", &["busybox", "su"]);
@@ -1530,13 +1536,20 @@ impl From<BudgetError> for FsError {
 /// The Android device's equivalents. `/system/xbin/busybox` is there because this device is
 /// rooted (it hands out a root shell over ADB, which a stock one does not) and a rooted phone
 /// almost always carries busybox; `su` for the same reason.
-const ANDROID_EXECUTABLE_BINARIES: [&str; 6] = [
+const ANDROID_EXECUTABLE_BINARIES: [&str; 13] = [
     "/system/bin/sh",
     "/system/bin/toybox",
     "/system/bin/toolbox",
     "/system/xbin/busybox",
     "/system/xbin/su",
     "/system/bin/app_process",
+    "/system/bin/am",
+    "/system/bin/dumpsys",
+    "/system/bin/getenforce",
+    "/system/bin/pm",
+    "/system/bin/screencap",
+    "/system/bin/wm",
+    "/system/bin/logcat",
 ];
 
 /// `/system/build.prop` on the impersonated device, resolved from [`crate::persona`] so it
@@ -2084,7 +2097,7 @@ mod tests {
 /storage/emulated/0:
 /sys: block class devices fs kernel
 /system: app bin build.prop etc fonts framework lib media priv-app tts usr vendor xbin
-/system/bin: app_process cat chmod dalvikvm df getprop linker logcat ls mount ping reboot setprop sh toolbox toybox umount
+/system/bin: am app_process cat chmod dalvikvm df dumpsys getenforce getprop linker logcat ls mount ping pm reboot screencap setprop sh toolbox toybox umount wm
 /system/etc: hosts
 /system/xbin: busybox su
 /vendor: firmware lib

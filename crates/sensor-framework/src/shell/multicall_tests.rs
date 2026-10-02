@@ -160,13 +160,19 @@ fn the_applet_lists_are_the_advertised_system_bin() {
     );
     // The advertised files that are not applets of either binary.
     let standalone = [
+        "am",
         "app_process",
         "dalvikvm",
+        "dumpsys",
+        "getenforce",
         "linker",
         "logcat",
+        "pm",
+        "screencap",
         "sh",
         "toolbox",
         "toybox",
+        "wm",
     ];
     for name in &advertised {
         let known = TOYBOX_APPLETS.contains(&name.as_str())

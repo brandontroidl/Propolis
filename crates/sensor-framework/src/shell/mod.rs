@@ -54,6 +54,7 @@ use crate::persona;
 use crate::sanitize_value;
 
 mod android;
+mod androidsys;
 mod arith;
 mod ast;
 mod base64;
@@ -2770,6 +2771,8 @@ fn decode_echo_escapes_into(s: &str, out: &mut String, dash: bool) -> bool {
 // the files that hold only tests.
 #[cfg(test)]
 mod android_tests;
+#[cfg(test)]
+mod androidsys_tests;
 #[cfg(test)]
 mod base64_tests;
 #[cfg(test)]

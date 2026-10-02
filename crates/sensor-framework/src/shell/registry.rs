@@ -80,6 +80,7 @@ impl Registry {
         super::printf::register(&mut registry);
         super::base64::register(&mut registry);
         super::hashing::register(&mut registry);
+        super::pathtools::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }

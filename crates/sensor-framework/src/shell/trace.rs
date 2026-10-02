@@ -95,6 +95,11 @@ pub enum HandlerId {
     More,
     Dd,
     Readlink,
+    /// `realpath`: the canonical path, through the same resolver as `readlink -f`.
+    Realpath,
+    /// `basename` and `dirname`: lexical path splitting, no filesystem access.
+    Basename,
+    Dirname,
     /// `wc`, `grep` and `od`: the text tools that report on a file's bytes.
     Wc,
     Grep,
@@ -510,6 +515,9 @@ mod tests {
             ("hexdump -C /etc/hostname", HandlerId::Hexdump),
             ("dd if=/etc/hostname", HandlerId::Dd),
             ("readlink /bin", HandlerId::Readlink),
+            ("realpath /bin", HandlerId::Realpath),
+            ("basename /bin/ls", HandlerId::Basename),
+            ("dirname /bin/ls", HandlerId::Dirname),
             ("wc -c /etc/hostname", HandlerId::Wc),
             ("grep -F a /etc/hostname", HandlerId::Grep),
             ("od -An -tx1 /etc/hostname", HandlerId::Od),

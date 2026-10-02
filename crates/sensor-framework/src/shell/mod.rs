@@ -65,6 +65,7 @@ mod hashing;
 mod lex;
 mod lookup;
 mod parse;
+mod pathtools;
 mod printf;
 mod read;
 mod readlink;
@@ -2774,6 +2775,8 @@ mod grammar_tests;
 mod hashing_tests;
 #[cfg(test)]
 mod lookup_tests;
+#[cfg(test)]
+mod pathtools_tests;
 #[cfg(test)]
 mod printf_tests;
 #[cfg(test)]

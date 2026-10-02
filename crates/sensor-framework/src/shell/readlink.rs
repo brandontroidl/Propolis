@@ -1,4 +1,6 @@
 //! `readlink`: the target of a symlink, and with `-f`, `-e` or `-m` the canonical physical path.
+//! `realpath` lives here too: it is `readlink -f/-e/-m` with another command line, so it calls the
+//! same per-operand resolver rather than carrying a second one.
 //!
 //! Both answers come from the filesystem model: [`FakeFs::link_target`] returns a link's stored
 //! target one level deep, and [`FakeFs::canonicalize`] follows every link with the same resolver
@@ -26,7 +28,15 @@ pub(super) fn register(r: &mut Registry) {
         HandlerId::Readlink,
         FakeShell::cmd_readlink,
     );
+    r.register_if(
+        "realpath",
+        ubuntu,
+        HandlerId::Realpath,
+        FakeShell::cmd_realpath,
+    );
 }
+
+const MISSING: &str = "No such file or directory";
 
 fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {
     shell.flavor == ShellFlavor::Bash
@@ -143,7 +153,6 @@ impl FakeShell {
         options: &Options,
         reader: &str,
     ) -> Result<String, &'static str> {
-        const MISSING: &str = "No such file or directory";
         if arg.is_empty() {
             return Err(MISSING);
         }
@@ -188,5 +197,136 @@ impl FakeShell {
                 })
             }
         }
+    }
+}
+
+const REALPATH_TRY: &str = "Try 'realpath --help' for more information.\n";
+
+struct RealpathOptions {
+    /// `-e`, `-m`: the last one given wins; the default needs every component but the last.
+    mode: Canonical,
+    /// `-s`: collapse `.`, `..` and slashes in the text and follow no link.
+    no_symlinks: bool,
+    quiet: bool,
+    zero: bool,
+}
+
+/// What `realpath`'s command line asks for, the tool's own error text, or `None` for an option it
+/// has that this shell does not model (`-L`, `--relative-to`, `--relative-base`, `--help`,
+/// `--version`).
+fn parse_realpath<'a>(args: &[&'a str]) -> Result<Option<(RealpathOptions, Vec<&'a str>)>, String> {
+    let mut options = RealpathOptions {
+        mode: Canonical::ParentsExist,
+        no_symlinks: false,
+        quiet: false,
+        zero: false,
+    };
+    let mut operands = Vec::new();
+    let mut ended = false;
+    for &arg in args {
+        if ended || arg == "-" || !arg.starts_with('-') {
+            operands.push(arg);
+        } else if arg == "--" {
+            ended = true;
+        } else if let Some(long) = arg.strip_prefix("--") {
+            match long {
+                "canonicalize-existing" => options.mode = Canonical::Existing,
+                "canonicalize-missing" => options.mode = Canonical::AllowMissing,
+                "no-symlinks" | "strip" => options.no_symlinks = true,
+                "physical" => options.no_symlinks = false,
+                "quiet" => options.quiet = true,
+                "zero" => options.zero = true,
+                "logical" | "help" | "version" => return Ok(None),
+                _ if long.starts_with("relative-to=") || long.starts_with("relative-base=") => {
+                    return Ok(None);
+                }
+                _ => {
+                    return Err(format!(
+                        "realpath: unrecognized option '{arg}'\n{REALPATH_TRY}"
+                    ));
+                }
+            }
+        } else {
+            for flag in arg.chars().skip(1) {
+                match flag {
+                    'e' => options.mode = Canonical::Existing,
+                    'm' => options.mode = Canonical::AllowMissing,
+                    's' => options.no_symlinks = true,
+                    'P' => options.no_symlinks = false,
+                    'q' => options.quiet = true,
+                    'z' => options.zero = true,
+                    'L' => return Ok(None),
+                    other => {
+                        return Err(format!(
+                            "realpath: invalid option -- '{other}'\n{REALPATH_TRY}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some((options, operands)))
+}
+
+impl FakeShell {
+    /// `realpath [-emsqz] [FILE]...`: the canonical absolute path of each operand, through the
+    /// resolver `readlink -f` uses. Status 1 when any operand could not be resolved. `-L`,
+    /// `--relative-to` and `--relative-base` are not modeled: they print nothing and succeed.
+    pub(super) fn cmd_realpath(&mut self, parts: &[&str]) -> CommandResult {
+        let (options, operands) = match parse_realpath(parts.get(1..).unwrap_or(&[])) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return CommandResult::silent(0),
+            Err(text) => return CommandResult::stderr(1, text),
+        };
+        if operands.is_empty() {
+            return CommandResult::stderr(1, format!("realpath: missing operand\n{REALPATH_TRY}"));
+        }
+        let reader = self.reader_of(parts.first().copied().unwrap_or("realpath"));
+        let end = if options.zero { "\0" } else { "\n" };
+        let resolve = Options {
+            canonical: Some(options.mode),
+            ..Options::default()
+        };
+
+        let mut out = String::new();
+        let mut errors = String::new();
+        let mut failed = false;
+        for arg in operands {
+            let answer = if options.no_symlinks {
+                self.realpath_lexical(arg, options.mode)
+            } else {
+                self.readlink_operand(arg, &resolve, reader)
+            };
+            match answer {
+                Ok(text) => {
+                    out.push_str(&text);
+                    out.push_str(end);
+                }
+                Err(reason) => {
+                    failed = true;
+                    if !options.quiet {
+                        errors.push_str(&format!("realpath: {}: {reason}\n", quoted(arg)));
+                    }
+                }
+            }
+        }
+        let mut result = CommandResult::stdout(out);
+        result.append(CommandResult::stderr(u8::from(failed), errors));
+        result.status = u8::from(failed);
+        result
+    }
+
+    /// `realpath -s`: the operand's text made absolute and normalized, links left alone. The
+    /// filesystem is consulted only for the existence the mode requires.
+    fn realpath_lexical(&mut self, arg: &str, mode: Canonical) -> Result<String, &'static str> {
+        if arg.is_empty() {
+            return Err(MISSING);
+        }
+        self.charge_work(len_u64(arg.len()));
+        let path = self.normalize_logical(arg);
+        if mode != Canonical::AllowMissing && self.fs.canonicalize(&path, mode).is_none() {
+            return Err(MISSING);
+        }
+        Ok(path)
     }
 }

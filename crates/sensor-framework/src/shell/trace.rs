@@ -97,6 +97,8 @@ pub enum HandlerId {
     Wc,
     Grep,
     Od,
+    /// `base64`: bounded encode and decode over modeled bytes, for staged payloads.
+    Base64,
     Ls,
     Mount,
     EnableBuiltin,

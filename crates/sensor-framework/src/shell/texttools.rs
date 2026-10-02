@@ -30,7 +30,7 @@ fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {
 }
 
 /// The result of a line whose allowance ran out while a tool was reading.
-fn stopped() -> CommandResult {
+pub(super) fn stopped() -> CommandResult {
     let mut result = CommandResult::silent(1);
     result.stop_line = true;
     result
@@ -41,7 +41,7 @@ const WIDE: usize = 7;
 
 impl FakeShell {
     /// Up to `limit` bytes of one operand: standard input for no operand or `-`.
-    fn read_source(
+    pub(super) fn read_source(
         &mut self,
         argv: &[&str],
         path: Option<&str>,

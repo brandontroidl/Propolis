@@ -55,6 +55,7 @@ use crate::sanitize_value;
 
 mod arith;
 mod ast;
+mod base64;
 mod builtins;
 mod busybox;
 mod dd;
@@ -2757,6 +2758,8 @@ fn decode_echo_escapes_into(s: &str, out: &mut String, dash: bool) -> bool {
 // Declared with the test modules, after all production code: `trace_type_never_feeds_wire_output`
 // reads each file of this module up to its first `#[cfg(test)]` as the production source, and skips
 // the files that hold only tests.
+#[cfg(test)]
+mod base64_tests;
 #[cfg(test)]
 mod budget_tests;
 

@@ -456,6 +456,7 @@ fn find_type_selects_the_kind_of_node() {
         out(&mut sh, "find /dev -type c"),
         lines(&[
             "/dev/null",
+            "/dev/pts/0",
             "/dev/random",
             "/dev/tty",
             "/dev/urandom",

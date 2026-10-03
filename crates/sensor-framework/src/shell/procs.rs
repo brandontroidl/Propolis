@@ -29,6 +29,14 @@
 //! has no node and reads as absent, as on a real `/proc`. The same set carries `/proc/net`, which
 //! `netinfo.rs` renders, because the filesystem takes one whole generated set at a time.
 //!
+//! The login shell's row also has `maps` and `fd`, and `/proc/self/{status,maps,fd}` are those
+//! same nodes under the other name: `/proc/self` is the shell's own row (the one `$$` names), not
+//! the reading command's, as `/proc/self/exe` is for the byte readers. `status` is the one
+//! `status_text` renderer, so the two names cannot differ. Everything is synthesized from the
+//! table and fixed constants: no byte comes from the host's `/proc`, and every address is a fixed
+//! function of the pid. The descriptor links name the session's tty, or `pipe:[inode]` for an exec
+//! request, and make `/dev/stdin`, `/dev/stdout` and `/dev/stderr` resolve.
+//!
 //! Only `ps` and `top` are transient processes: each lists itself, with the next pid the session
 //! allocator hands out, as the real tools list themselves.
 //!
@@ -50,7 +58,7 @@ use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use super::hostinfo::{expand, load_average, uptime_secs, uptime_short};
 use super::registry::{Registry, resolve_proc_self};
 use super::{CommandResult, FakeShell, HandlerId, ShellContext, ShellFlavor};
-use crate::fakefs::{Blob, ELF_HEADER_LEN, ElfImage, Node};
+use crate::fakefs::{Blob, Device, ELF_HEADER_LEN, ElfImage, Node};
 
 pub(super) fn register(r: &mut Registry) {
     r.register("ps", HandlerId::Ps, FakeShell::cmd_ps);
@@ -495,10 +503,37 @@ fn process_nodes(table: &Table, mounts: &[u8], mountinfo: &[u8]) -> HashMap<Stri
             "stat",
             "status",
         ];
-        let mut dir = Node::directory(entries.iter().map(|e| (*e).to_string()).collect());
+        // `fd` and `maps` are modeled for the shell's own row only: nothing of any other row's
+        // memory or descriptors is described, so those stay absent as on a `/proc` that denies them.
+        let mut names: Vec<String> = entries.iter().map(|e| (*e).to_string()).collect();
+        if p.attached {
+            names.push("fd".to_string());
+            names.push("maps".to_string());
+            names.sort_unstable();
+        }
+        let mut dir = Node::directory(names);
         dir.meta.mode = 0o040_555;
         dir.meta.mtime = mtime;
         nodes.insert(base.clone(), dir);
+        if p.attached {
+            // `/proc/self` is the shell's own row: one set of nodes, built once and placed under
+            // both names, so `/proc/self/status` cannot differ from `/proc/<pid>/status`.
+            for (rel, node) in own_nodes(table, p, mountinfo, mtime) {
+                nodes.insert(format!("/proc/self/{rel}"), node.clone());
+                nodes.insert(format!("{base}/{rel}"), node);
+            }
+            nodes.insert(
+                "/proc/self/status".to_string(),
+                file_node(status_text(table, p), mtime),
+            );
+            if let Some(tty) = p.tty.strip_prefix("pts/").filter(|_| !table.android) {
+                // The target of the Ubuntu fd links and so of `/dev/stdin`: the same tty
+                // `/dev/tty` is, which reads empty.
+                let mut node = Node::device(Device::Tty);
+                node.meta.mtime = mtime;
+                nodes.insert(format!("/dev/pts/{tty}"), node);
+            }
+        }
         nodes.insert(
             format!("{base}/cmdline"),
             file_node(cmdline_bytes(p), mtime),
@@ -556,6 +591,296 @@ fn process_nodes(table: &Table, mounts: &[u8], mountinfo: &[u8]) -> HashMap<Stri
     nodes
 }
 
+/// The nodes only the shell's own row has, as paths relative to its `/proc/<pid>`: `maps`, and
+/// `fd` with the three standard descriptors.
+///
+/// The descriptors point at the session's tty (`/dev/pts/0`) when it has one. An exec request has
+/// none, and sshd hands the command pipes, whose links read `pipe:[inode]` and name no file, as the
+/// kernel prints them. The inode numbers are fixed functions of the pid [unverified]. The links
+/// are stored in the generated layer, so `readlink`, `ls -l` and every path through them resolve
+/// as any other link does, and `/dev/stdin`, `/dev/stdout` and `/dev/stderr` reach the tty by way
+/// of `/proc/self/fd`.
+fn own_nodes(table: &Table, p: &Proc, mountinfo: &[u8], mtime: i64) -> Vec<(String, Node)> {
+    let mut fd = Node::directory(vec!["0".to_string(), "1".to_string(), "2".to_string()]);
+    fd.meta.mode = 0o040_500;
+    fd.meta.mtime = mtime;
+    let mut nodes = vec![
+        (
+            "maps".to_string(),
+            file_node(render_maps(table, p, mountinfo), mtime),
+        ),
+        ("fd".to_string(), fd),
+    ];
+    for n in 0u64..3 {
+        let target = if p.tty == "?" {
+            let inode = u64::from(p.pid)
+                .saturating_mul(8)
+                .saturating_add(20_000)
+                .saturating_add(n.saturating_mul(2));
+            format!("pipe:[{inode}]")
+        } else {
+            format!("/dev/{}", p.tty)
+        };
+        nodes.push((format!("fd/{n}"), link_node(&target, mtime)));
+    }
+    nodes
+}
+
+/// A run of one mapped file (or of anonymous memory) as `maps` lists it.
+struct Seg {
+    len: u64,
+    perms: &'static str,
+    /// The offset into the file.
+    off: u64,
+}
+
+const fn seg(len: u64, perms: &'static str, off: u64) -> Seg {
+    Seg { len, perms, off }
+}
+
+struct Mapping {
+    start: u64,
+    end: u64,
+    perms: &'static str,
+    off: u64,
+    /// A file path, a bracketed kernel name (`[heap]`), or empty for anonymous memory.
+    name: String,
+    inode: u64,
+}
+
+/// Lay `segs` end to end from `start` and return the address after the last.
+fn place(out: &mut Vec<Mapping>, start: u64, name: &str, inode: u64, segs: &[Seg]) -> u64 {
+    let mut at = start;
+    for s in segs {
+        let end = at.saturating_add(s.len);
+        out.push(Mapping {
+            start: at,
+            end,
+            perms: s.perms,
+            off: s.off,
+            name: name.to_string(),
+            inode,
+        });
+        at = end;
+    }
+    at
+}
+
+// Segment sizes below follow the shape of Ubuntu 22.04's bash 5.1, glibc 2.35 and ncurses 6.3
+// and of Android 6's mksh and bionic. None is read from a host or a capture [unverified], and
+// every inode number is invented.
+const UBUNTU_BASH: &[Seg] = &[
+    seg(0x2c000, "r--p", 0),
+    seg(0xcd000, "r-xp", 0x2c000),
+    seg(0x31000, "r--p", 0xf9000),
+    seg(0x4000, "r--p", 0x12a000),
+    seg(0x9000, "rw-p", 0x12e000),
+    seg(0x6000, "rw-p", 0),
+];
+const UBUNTU_LOCALE: &[Seg] = &[seg(0x2e0000, "r--p", 0)];
+const UBUNTU_TINFO: &[Seg] = &[
+    seg(0x2000, "r--p", 0),
+    seg(0x1b000, "r-xp", 0x2000),
+    seg(0x8000, "r--p", 0x1d000),
+    seg(0x4000, "r--p", 0x25000),
+    seg(0x2000, "rw-p", 0x29000),
+];
+const UBUNTU_LIBC: &[Seg] = &[
+    seg(0x28000, "r--p", 0),
+    seg(0x195000, "r-xp", 0x28000),
+    seg(0x58000, "r--p", 0x1bd000),
+    seg(0x4000, "r--p", 0x214000),
+    seg(0x2000, "rw-p", 0x218000),
+    seg(0xd000, "rw-p", 0),
+];
+const UBUNTU_LD: &[Seg] = &[
+    seg(0x2000, "r--p", 0),
+    seg(0x29000, "r-xp", 0x2000),
+    seg(0xb000, "r--p", 0x2b000),
+    seg(0x2000, "r--p", 0x36000),
+    seg(0x2000, "rw-p", 0x38000),
+];
+const ANDROID_SH: &[Seg] = &[
+    seg(0x56000, "r-xp", 0),
+    seg(0x1000, "r--p", 0x56000),
+    seg(0x2000, "rw-p", 0x57000),
+    seg(0x1000, "rw-p", 0),
+];
+const ANDROID_LIBC: &[Seg] = &[
+    seg(0x6c000, "r-xp", 0),
+    seg(0x1000, "r--p", 0x6c000),
+    seg(0x3000, "rw-p", 0x6d000),
+    seg(0x2000, "rw-p", 0),
+];
+const ANDROID_LINKER: &[Seg] = &[
+    seg(0x2a000, "r-xp", 0),
+    seg(0x1000, "r--p", 0x2a000),
+    seg(0x2000, "rw-p", 0x2b000),
+];
+const ANDROID_PROPERTIES: &[Seg] = &[seg(0x20000, "r--s", 0)];
+
+/// The address-space layout of the shell. Every address is a fixed function of the pid, so two
+/// reads agree and a replay reproduces it; the binary and the stack sit where `stat` says they do.
+fn shell_mappings(table: &Table, p: &Proc) -> Vec<Mapping> {
+    let mut out = Vec::new();
+    let top = stack_top(table.android, p.pid);
+    if table.android {
+        // 32-bit ARM, PIE, from the 3.4 kernel the persona reports: no vdso, the vectors page
+        // instead. The `stat` image address is not a PIE address, which `stat` already was.
+        let sh = place(&mut out, 0xb6d8_8000, &p.exe, 1_161, ANDROID_SH);
+        place(
+            &mut out,
+            sh.max(0xb6e0_0000),
+            "[heap]",
+            0,
+            &[seg(0x21000, "rw-p", 0)],
+        );
+        let at = place(
+            &mut out,
+            0xb6e4_0000,
+            "/system/lib/libc.so",
+            1_184,
+            ANDROID_LIBC,
+        );
+        let at = place(&mut out, at, "/system/bin/linker", 1_149, ANDROID_LINKER);
+        place(
+            &mut out,
+            at,
+            "/dev/__properties__",
+            1_087,
+            ANDROID_PROPERTIES,
+        );
+        place(
+            &mut out,
+            top.saturating_sub(0x2_0000),
+            "[stack]",
+            0,
+            &[seg(0x2_1000, "rw-p", 0)],
+        );
+        place(
+            &mut out,
+            0xffff_0000,
+            "[vectors]",
+            0,
+            &[seg(0x1000, "r-xp", 0)],
+        );
+        return out;
+    }
+    let image = image_base(false, p.pid);
+    place(&mut out, image, &p.exe, 1_310_791, UBUNTU_BASH);
+    place(
+        &mut out,
+        image.saturating_add(0x20_0000),
+        "[heap]",
+        0,
+        &[seg(0x22000, "rw-p", 0)],
+    );
+    let lib = "/usr/lib/x86_64-linux-gnu";
+    let at = place(
+        &mut out,
+        0x7f3c_9a40_0000,
+        "/usr/lib/locale/locale-archive",
+        1_054_872,
+        UBUNTU_LOCALE,
+    );
+    let at = place(&mut out, at, "", 0, &[seg(0x3000, "rw-p", 0)]);
+    let at = place(
+        &mut out,
+        at,
+        &format!("{lib}/libtinfo.so.6.3"),
+        1_311_127,
+        UBUNTU_TINFO,
+    );
+    let at = place(
+        &mut out,
+        at,
+        &format!("{lib}/libc.so.6"),
+        1_311_102,
+        UBUNTU_LIBC,
+    );
+    let at = place(&mut out, at, "", 0, &[seg(0x2000, "rw-p", 0)]);
+    place(
+        &mut out,
+        at,
+        &format!("{lib}/ld-linux-x86-64.so.2"),
+        1_311_098,
+        UBUNTU_LD,
+    );
+    let stack_end = place(
+        &mut out,
+        top.saturating_sub(0x2_0000),
+        "[stack]",
+        0,
+        &[seg(0x2_1000, "rw-p", 0)],
+    );
+    let vvar = stack_end.saturating_add(0x8000);
+    let vdso = place(&mut out, vvar, "[vvar]", 0, &[seg(0x4000, "r--p", 0)]);
+    place(&mut out, vdso, "[vdso]", 0, &[seg(0x2000, "r-xp", 0)]);
+    place(
+        &mut out,
+        0xffff_ffff_ff60_0000,
+        "[vsyscall]",
+        0,
+        &[seg(0x1000, "--xp", 0)],
+    );
+    out
+}
+
+/// The `major:minor` of the mount the path `file` sits on, from the same mount table
+/// `/proc/self/mountinfo` prints; `(0, 0)` for a name that is no path or no mount holds.
+fn device_of(file: &str, mountinfo: &[u8]) -> (u32, u32) {
+    let text = String::from_utf8_lossy(mountinfo);
+    let mut best: Option<(usize, (u32, u32))> = None;
+    for line in text.lines().take(64) {
+        let mut fields = line.split_whitespace();
+        let (Some(dev), Some(point)) = (fields.nth(2), fields.nth(1)) else {
+            continue;
+        };
+        let under = point == "/"
+            || file
+                .strip_prefix(point)
+                .is_some_and(|rest| rest.starts_with('/'));
+        let parsed = dev
+            .split_once(':')
+            .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)));
+        if let (true, Some(parsed)) = (under, parsed)
+            && best.is_none_or(|(len, _)| point.len() > len)
+        {
+            best = Some((point.len(), parsed));
+        }
+    }
+    best.map_or((0, 0), |(_, dev)| dev)
+}
+
+/// `/proc/<pid>/maps` in the kernel's layout: `start-end perms offset dev inode`, then the name
+/// from the column after the 72nd (the 48th on 32-bit), lowercase hex, and a trailing space after
+/// an anonymous mapping's inode.
+fn render_maps(table: &Table, p: &Proc, mountinfo: &[u8]) -> String {
+    let width = if table.android { 48 } else { 72 };
+    let mut out = String::new();
+    for m in shell_mappings(table, p) {
+        let (major, minor) = if m.name.starts_with('/') {
+            device_of(&m.name, mountinfo)
+        } else {
+            (0, 0)
+        };
+        let mut line = format!(
+            "{:08x}-{:08x} {} {:08x} {:02x}:{:02x} {} ",
+            m.start, m.end, m.perms, m.off, major, minor, m.inode
+        );
+        if !m.name.is_empty() {
+            while line.len() < width {
+                line.push(' ');
+            }
+            line.push(' ');
+            line.push_str(&m.name);
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
 /// `/proc/<pid>/cmdline`: the arguments each followed by a NUL, nothing for a kernel thread.
 fn cmdline_bytes(p: &Proc) -> Vec<u8> {
     let mut out = Vec::new();
@@ -566,19 +891,35 @@ fn cmdline_bytes(p: &Proc) -> Vec<u8> {
     out
 }
 
+/// The load address `stat` reports for a process's image, a fixed function of its pid.
+fn image_base(android: bool, pid: u32) -> u64 {
+    let code: u64 = if android {
+        0x0001_0000
+    } else {
+        0x5580_0000_0000
+    };
+    code.saturating_add(u64::from(pid).saturating_mul(0x10_0000))
+}
+
+/// The address `stat` reports for the start of a process's stack, which `maps` keeps inside its
+/// `[stack]` range.
+fn stack_top(android: bool, pid: u32) -> u64 {
+    let stack: u64 = if android {
+        0xbe80_0000
+    } else {
+        0x7ffd_0000_0000
+    };
+    stack.saturating_add(u64::from(pid).saturating_mul(0x1000))
+}
+
 /// The 52 fields of `/proc/<pid>/stat`. Counters that nothing else shows are fixed figures that
 /// scale with the row, not measurements.
 fn stat_line(table: &Table, p: &Proc) -> String {
     let pages = p.rss_kib.div_euclid(4);
     let tty_nr: i64 = if p.tty == "?" { 0 } else { 34_816 };
     let tpgid: i64 = if p.attached { i64::from(p.pid) } else { -1 };
-    let (code, stack): (u64, u64) = if table.android {
-        (0x0001_0000, 0xbe80_0000)
-    } else {
-        (0x5580_0000_0000, 0x7ffd_0000_0000)
-    };
-    let image = code.saturating_add(u64::from(p.pid).saturating_mul(0x10_0000));
-    let top = stack.saturating_add(u64::from(p.pid).saturating_mul(0x1000));
+    let image = image_base(table.android, p.pid);
+    let top = stack_top(table.android, p.pid);
     let fields: Vec<String> = vec![
         p.pid.to_string(),
         format!("({})", p.comm),

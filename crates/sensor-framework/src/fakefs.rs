@@ -712,6 +712,7 @@ impl FakeFs {
         // and the shell's `mount` cannot disagree. `cat /proc/mounts` used to say "No such
         // file", which no Linux box does.
         b.file("/proc/mounts", render_mounts(&MOUNT_TABLE));
+        b.dir("/proc/self", &["mountinfo", "mounts"]);
         b.file("/proc/self/mounts", render_mounts(&MOUNT_TABLE));
         b.file("/proc/self/mountinfo", render_mountinfo(&MOUNT_TABLE));
         b.file(
@@ -866,7 +867,8 @@ impl FakeFs {
         b.device("/dev/random", Device::Random);
         b.device("/dev/urandom", Device::Urandom);
         b.device("/dev/tty", Device::Tty);
-        // The fd links point into a /proc/self/fd this box does not model yet, so opening one
+        // The fd links point into /proc/self/fd, which the shell generates (`procs.rs`) from its
+        // process table. A filesystem with no shell on top has no such directory, so opening one
         // fails as a dangling link does.
         b.symlink("/dev/stdin", "/proc/self/fd/0");
         b.symlink("/dev/stdout", "/proc/self/fd/1");
@@ -916,6 +918,7 @@ impl FakeFs {
         );
         b.file("/proc/meminfo", render_meminfo(&ANDROID_MEMINFO));
         b.file("/proc/mounts", render_mounts(&ANDROID_MOUNT_TABLE));
+        b.dir("/proc/self", &["mountinfo", "mounts"]);
         b.file("/proc/self/mounts", render_mounts(&ANDROID_MOUNT_TABLE));
         b.file(
             "/proc/self/mountinfo",
@@ -2583,7 +2586,7 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
         );
         assert!(fs.is_executable("/bin/busybox"));
         assert!(fs.is_dir("/var/run") && fs.is_dir("/bin") && fs.is_dir("/lib"));
-        // The fd links point at a directory the box does not model.
+        // Without the shell's generated layer there is no /proc/self/fd for the links to reach.
         assert_eq!(fs.read_all("/dev/stdin", 1), Err(FsError::NoSuchFile));
         assert!(!fs.file_exists("/dev/stdin"));
     }

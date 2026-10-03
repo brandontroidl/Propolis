@@ -1237,7 +1237,8 @@ fn the_process_model_touches_no_host_file_starts_no_process_and_opens_no_socket(
         "::Command",
         "std::net",
         "tokio",
-        "libc",
+        // The crate, not the library names the modeled `maps` lists (`libc.so.6`).
+        "libc::",
         "getpid",
         "read_dir",
         "/proc/self/",
@@ -1249,9 +1250,14 @@ fn the_process_model_touches_no_host_file_starts_no_process_and_opens_no_socket(
             .filter(|line| line.contains(banned))
             .collect();
         // `/proc/self/mounts` and `mountinfo` are read from the modeled filesystem, which is not
-        // the host's; nothing else of that path may be named.
-        let allowed =
-            banned == "/proc/self/" && hits.iter().all(|line| line.contains("/proc/self/mount"));
+        // the host's, and `/proc/self/{rel}` and `/proc/self/status` are the keys of nodes this
+        // module hands that filesystem; no other use of that path may appear.
+        let allowed = banned == "/proc/self/"
+            && hits.iter().all(|line| {
+                ["/proc/self/mount", "/proc/self/{rel}", "/proc/self/status"]
+                    .iter()
+                    .any(|ok| line.contains(ok))
+            });
         assert!(hits.is_empty() || allowed, "{banned}: {hits:?}");
     }
 }
@@ -1273,5 +1279,433 @@ fn the_new_commands_are_recorded_under_their_own_handler_ids() {
         let trace = sh.last_trace();
         let command = trace.segments[0].command.as_ref().expect("segment ran");
         assert_eq!(command.resolved, id, "{line}");
+    }
+}
+
+// ------------------------------------------------------------------------------------ /proc/self
+
+/// The `Key:\tvalue` lines of a status file.
+fn status_field(status: &str, key: &str) -> String {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}:\t")))
+        .unwrap_or_else(|| panic!("no {key} in:\n{status}"))
+        .to_string()
+}
+
+/// One parsed `maps` line: (start, end, perms, offset, dev, inode, name).
+type MapsLine = (u64, u64, String, u64, String, u64, String);
+
+fn parse_maps(text: &str) -> Vec<MapsLine> {
+    text.lines()
+        .map(|line| {
+            let mut f = line.splitn(6, ' ');
+            let (range, perms, off, dev, rest) = (
+                f.next().unwrap(),
+                f.next().unwrap(),
+                f.next().unwrap(),
+                f.next().unwrap(),
+                f.next().unwrap(),
+            );
+            let tail = f.next().unwrap_or("");
+            let (start, end) = range.split_once('-').unwrap();
+            let inode: u64 = rest.parse().unwrap_or_else(|_| panic!("inode in {line:?}"));
+            (
+                u64::from_str_radix(start, 16).unwrap(),
+                u64::from_str_radix(end, 16).unwrap(),
+                perms.to_string(),
+                u64::from_str_radix(off, 16).unwrap(),
+                dev.to_string(),
+                inode,
+                tail.trim_start().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn proc_self_status_is_the_shells_own_status_with_the_fields_a_dropper_checks() {
+    let mut sh = shell();
+    let me = pid_of_shell(&mut sh);
+    let status = out(&mut sh, "cat /proc/self/status");
+    assert_eq!(status_field(&status, "Name"), "bash");
+    assert_eq!(status_field(&status, "State"), "S (sleeping)");
+    assert_eq!(status_field(&status, "Pid"), me);
+    assert_eq!(status_field(&status, "Tgid"), me);
+    // No debugger: the one field analysis-aware malware reads this file for.
+    assert_eq!(status_field(&status, "TracerPid"), "0");
+    assert_eq!(status_field(&status, "Uid"), "0\t0\t0\t0");
+    assert_eq!(status_field(&status, "Gid"), "0\t0\t0\t0");
+    assert_eq!(status_field(&status, "Seccomp"), "0");
+    for cap in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
+        assert_eq!(status_field(&status, cap).len(), 16, "{cap}");
+    }
+    // The parent is the session's sshd child, the same row `ps` shows.
+    let ppid = status_field(&status, "PPid");
+    assert!(
+        out(&mut sh, &format!("cat /proc/{ppid}/comm")).starts_with("sshd"),
+        "{ppid}"
+    );
+    // Self is the own pid: one renderer, byte for byte.
+    assert_eq!(status, out(&mut sh, &format!("cat /proc/{me}/status")));
+    assert_eq!(status, out(&mut sh, "cat /proc/$$/status"));
+}
+
+#[test]
+fn proc_self_maps_names_the_binary_loader_libc_and_the_kernel_regions() {
+    let mut sh = shell();
+    let me = pid_of_shell(&mut sh);
+    let text = out(&mut sh, "cat /proc/self/maps");
+    let maps = parse_maps(&text);
+    // Bounded: a handful of lines, not a page of them.
+    assert!((15..=40).contains(&maps.len()), "{} lines", maps.len());
+    assert!(text.len() < 4_096, "{} bytes", text.len());
+    assert_eq!(text, text.to_lowercase(), "lowercase hex");
+    // The shell's own binary, as `/proc/$$/exe` names it.
+    let exe = out(&mut sh, "readlink /proc/$$/exe");
+    let named = |name: &str| maps.iter().filter(|m| m.6 == name).collect::<Vec<_>>();
+    // The binary is `/proc/self/exe`'s target, as r--p, r-xp, r--p and rw-p runs.
+    let bash = named(exe.trim());
+    assert_eq!(exe.trim(), "/usr/bin/bash");
+    assert!(bash.len() >= 4, "{bash:?}");
+    assert_eq!(bash[0].2, "r--p");
+    assert_eq!(bash[0].3, 0, "the first run starts at offset 0");
+    for perms in ["r-xp", "r--p", "rw-p"] {
+        assert!(bash.iter().any(|m| m.2 == perms), "bash {perms}");
+    }
+    assert!(
+        bash.iter().all(|m| m.5 == bash[0].5 && m.5 != 0),
+        "one inode"
+    );
+    for lib in [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    ] {
+        let runs = named(lib);
+        assert!(runs.iter().any(|m| m.2 == "r-xp"), "{lib}");
+        assert!(runs.iter().any(|m| m.2 == "rw-p"), "{lib}");
+    }
+    let heap = named("[heap]");
+    assert_eq!(heap.len(), 1);
+    assert_eq!(heap[0].2, "rw-p");
+    for region in ["[stack]", "[vvar]", "[vdso]"] {
+        assert_eq!(named(region).len(), 1, "{region}");
+    }
+    assert_eq!(named("[vdso]")[0].2, "r-xp");
+    assert_eq!(named("[stack]")[0].2, "rw-p");
+    // Ranges are well-formed, page-aligned and ascending without overlap.
+    let mut last_end = 0;
+    for m in &maps {
+        assert!(m.0 < m.1 && m.0 % 0x1000 == 0 && m.1 % 0x1000 == 0, "{m:?}");
+        assert!(m.0 >= last_end, "ascending: {m:?}");
+        last_end = m.1;
+    }
+    // The name column starts at the kernel's 73rd character, and an anonymous run ends in a space.
+    for line in text.lines() {
+        let m = &parse_maps(line)[0];
+        if m.6.is_empty() {
+            assert!(line.ends_with(' '), "{line:?}");
+        } else {
+            assert_eq!(line.find(m.6.as_str()), Some(73), "{line:?}");
+        }
+    }
+    assert_eq!(text, out(&mut sh, &format!("cat /proc/{me}/maps")));
+    // What is not modeled stays absent: nothing else of the process, and no other process's maps.
+    for line in [
+        "cat /proc/self/environ",
+        "cat /proc/self/smaps",
+        "cat /proc/1/maps",
+        "ls /proc/self/fd/3",
+    ] {
+        let (stdout, stderr, status) = answer(&mut sh, line);
+        let expected = if line.starts_with("ls") { 2 } else { 1 };
+        assert_eq!((stdout.as_str(), status), ("", expected), "{line}");
+        assert!(
+            stderr.contains("No such file or directory"),
+            "{line}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn proc_self_maps_agrees_with_stat_and_with_the_mount_table() {
+    let mut sh = shell();
+    let me = pid_of_shell(&mut sh);
+    let maps = parse_maps(&out(&mut sh, "cat /proc/self/maps"));
+    let stat = out(&mut sh, &format!("cat /proc/{me}/stat"));
+    let fields: Vec<&str> = stat.split_whitespace().collect();
+    let (startcode, startstack): (u64, u64) =
+        (fields[25].parse().unwrap(), fields[27].parse().unwrap());
+    assert_eq!(maps[0].0, startcode, "the image starts where stat says");
+    let stack = maps.iter().find(|m| m.6 == "[stack]").unwrap();
+    assert!(
+        (stack.0..stack.1).contains(&startstack),
+        "stat's stack is in [stack]"
+    );
+    // The VmStk of status is the size of that range.
+    let status = out(&mut sh, "cat /proc/self/status");
+    let vmstk: u64 = status_field(&status, "VmStk")
+        .trim()
+        .trim_end_matches(" kB")
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!((stack.1 - stack.0) / 1024, vmstk);
+    // The file's device is the root mount's, as mountinfo prints it.
+    let info = out(&mut sh, "cat /proc/self/mountinfo");
+    let root_dev = info
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|f| f[4] == "/")
+        .map(|f| f[2].to_string())
+        .unwrap();
+    let (major, minor) = root_dev.split_once(':').unwrap();
+    let want = format!(
+        "{:02x}:{:02x}",
+        major.parse::<u32>().unwrap(),
+        minor.parse::<u32>().unwrap()
+    );
+    assert_ne!(
+        want, "00:00",
+        "the discriminating case: a root device that is not 0:0"
+    );
+    let bash = maps.iter().find(|m| m.6 == "/usr/bin/bash").unwrap();
+    assert_eq!(bash.4, want);
+    assert!(
+        maps.iter()
+            .filter(|m| m.6.starts_with('['))
+            .all(|m| m.4 == "00:00")
+    );
+}
+
+#[test]
+fn the_maps_are_a_fixed_function_of_the_session_not_of_the_host_or_the_deployment() {
+    // The pid is a function of the session id, and every address a function of the pid, so a
+    // replay of one session reads the same bytes whatever else differs.
+    let session = |source: &str, wan: Option<&str>| EmitContext {
+        source_ip: source.parse().unwrap(),
+        wan_ip: wan.map(|ip| ip.parse().unwrap()),
+        session_id: Some(uuid::Uuid::from_u128(7)),
+        ..ctx_for("ssh")
+    };
+    let build = |ctx| FakeShell::new(FakeFs::new(), ctx).with_clock(friday);
+    let first = {
+        let mut sh = build(session("203.0.113.7", None));
+        (
+            out(&mut sh, "cat /proc/self/maps"),
+            out(&mut sh, "cat /proc/self/status"),
+        )
+    };
+    let mut sh = build(session("203.0.113.7", None));
+    assert_eq!(first.0, out(&mut sh, "cat /proc/self/maps"));
+    assert_eq!(
+        first.0,
+        out(&mut sh, "cat /proc/self/maps"),
+        "two reads agree"
+    );
+    assert_eq!(first.1, out(&mut sh, "cat /proc/self/status"));
+    // Another source address and a WAN address change nothing.
+    let mut elsewhere = build(session("198.51.100.77", Some("192.0.2.200")));
+    assert_eq!(first.0, out(&mut elsewhere, "cat /proc/self/maps"));
+    assert_eq!(first.1, out(&mut elsewhere, "cat /proc/self/status"));
+    // A different session is a different process: the addresses move with the pid.
+    let mut another = build(EmitContext {
+        session_id: Some(uuid::Uuid::from_u128(8)),
+        ..session("203.0.113.7", None)
+    });
+    assert_ne!(first.0, out(&mut another, "cat /proc/self/maps"));
+}
+
+#[test]
+fn proc_self_fd_lists_the_three_standard_descriptors_as_links_to_the_tty() {
+    let mut sh = shell();
+    let me = pid_of_shell(&mut sh);
+    assert_eq!(out(&mut sh, "ls /proc/self/fd"), "0  1  2\n");
+    assert_eq!(
+        out(&mut sh, "ls /proc/self"),
+        "fd  maps  mountinfo  mounts  status\n"
+    );
+    assert_eq!(
+        out(&mut sh, &format!("ls /proc/{me}")),
+        "cmdline  comm  cwd  exe  fd  maps  mountinfo  mounts  stat  status\n"
+    );
+    for fd in 0..3 {
+        assert_eq!(
+            out(&mut sh, &format!("readlink /proc/self/fd/{fd}")),
+            "/dev/pts/0\n"
+        );
+        assert_eq!(
+            out(&mut sh, &format!("readlink /proc/{me}/fd/{fd}")),
+            "/dev/pts/0\n"
+        );
+    }
+    // The tty is the session's own: ps shows the shell on it.
+    assert!(out(&mut sh, "ps").contains("pts/0"));
+}
+
+#[test]
+fn dev_stdin_stdout_and_stderr_now_resolve_through_proc_self_fd() {
+    let mut sh = shell();
+    for (link, fd) in [("stdin", 0), ("stdout", 1), ("stderr", 2)] {
+        assert_eq!(
+            out(&mut sh, &format!("readlink /dev/{link}")),
+            format!("/proc/self/fd/{fd}\n")
+        );
+        assert_eq!(
+            out(&mut sh, &format!("readlink -e /dev/{link}")),
+            "/dev/pts/0\n",
+            "{link}"
+        );
+        assert!(out(&mut sh, &format!("test -e /dev/{link} && echo yes")).starts_with("yes"));
+    }
+    // Reading it works: the tty has nothing to read, where it used to fail as a dangling link.
+    assert_eq!(
+        answer(&mut sh, "cat /dev/stdin"),
+        (String::new(), String::new(), 0)
+    );
+    assert_eq!(out(&mut sh, "ls /dev/fd"), "0  1  2\n");
+    // Writing to the stream still goes where the shell sends it.
+    assert_eq!(out(&mut sh, "echo hi > /dev/stdout"), "hi\n");
+}
+
+#[test]
+fn an_exec_request_has_no_tty_so_its_descriptors_are_pipes_and_nothing_names_a_pty() {
+    let mut sh = exec();
+    for fd in 0..3 {
+        let target = out(&mut sh, &format!("readlink /proc/self/fd/{fd}"));
+        let inode = target
+            .strip_prefix("pipe:[")
+            .and_then(|t| t.strip_suffix("]\n"));
+        assert!(
+            inode.is_some_and(|i| i.parse::<u64>().is_ok()),
+            "{target:?}"
+        );
+    }
+    assert_eq!(out(&mut sh, "ls /proc/self/fd"), "0  1  2\n");
+    assert!(!out(&mut sh, "cat /proc/self/maps").is_empty());
+    assert_eq!(
+        answer(&mut sh, "ls /dev/pts/0").2,
+        2,
+        "no tty node when there is no tty"
+    );
+    let status = out(&mut sh, "cat /proc/self/status");
+    assert_eq!(status_field(&status, "TracerPid"), "0");
+    // The three links are three distinct pipes.
+    let all = out(
+        &mut sh,
+        "readlink /proc/self/fd/0 /proc/self/fd/1 /proc/self/fd/2",
+    );
+    let mut lines: Vec<&str> = all.lines().collect();
+    lines.dedup();
+    assert_eq!(lines.len(), 3, "{all}");
+    // A telnet login has a pty, as an ssh one does.
+    let mut t = telnet();
+    assert_eq!(out(&mut t, "readlink /proc/self/fd/0"), "/dev/pts/0\n");
+}
+
+#[test]
+fn the_phone_has_its_own_status_maps_and_descriptors() {
+    let mut sh = phone();
+    let me = pid_of_shell(&mut sh);
+    let status = out(&mut sh, "cat /proc/self/status");
+    assert_eq!(status_field(&status, "Name"), "sh");
+    assert_eq!(status_field(&status, "Pid"), me);
+    assert_eq!(status_field(&status, "TracerPid"), "0");
+    assert_eq!(status_field(&status, "Uid"), "0\t0\t0\t0");
+    assert_eq!(status_field(&status, "State"), "S (sleeping)");
+    assert_eq!(status, out(&mut sh, &format!("cat /proc/{me}/status")));
+    let text = out(&mut sh, "cat /proc/self/maps");
+    let maps = parse_maps(&text);
+    assert!((10..=40).contains(&maps.len()), "{} lines", maps.len());
+    let names: Vec<&str> = maps.iter().map(|m| m.6.as_str()).collect();
+    for want in [
+        "/system/bin/sh",
+        "/system/lib/libc.so",
+        "/system/bin/linker",
+        "[heap]",
+        "[stack]",
+        "[vectors]",
+    ] {
+        assert!(names.contains(&want), "{want} in {names:?}");
+    }
+    // 3.4 ARM: 32-bit addresses, no vdso, and none of the glibc names.
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("vdso") || n.contains("x86") || n.contains("glibc"))
+    );
+    assert!(
+        text.lines().all(|l| l.find('-') == Some(8)),
+        "8-digit addresses"
+    );
+    assert!(maps.iter().all(|m| m.1 <= 0x1_0000_0000));
+    for line in text.lines().filter(|l| l.contains('/') || l.contains('[')) {
+        let m = &parse_maps(line)[0];
+        assert_eq!(line.find(m.6.as_str()), Some(49), "{line:?}");
+    }
+    let stat = out(&mut sh, &format!("cat /proc/{me}/stat"));
+    let startstack: u64 = stat.split_whitespace().nth(27).unwrap().parse().unwrap();
+    let stack = maps.iter().find(|m| m.6 == "[stack]").unwrap();
+    assert!((stack.0..stack.1).contains(&startstack));
+    // The phone's console is a pts too. The toolbox has no `readlink`, so read the links from the
+    // filesystem the shell reads.
+    for fd in 0..3 {
+        assert_eq!(
+            sh.fs.link_target(&format!("/proc/self/fd/{fd}")).as_deref(),
+            Some("/dev/pts/0")
+        );
+    }
+    assert_eq!(out(&mut sh, "ls /proc/self/fd"), "0  1  2\n");
+    assert_ne!(
+        answer(&mut sh, "cat /dev/stdin").2,
+        0,
+        "the phone models no /dev/stdin"
+    );
+}
+
+#[test]
+fn nothing_in_the_self_nodes_carries_a_deployment_address_or_reads_the_hosts_proc() {
+    let ctx = || EmitContext {
+        source_ip: "203.0.113.7".parse().unwrap(),
+        wan_ip: Some("198.51.100.9".parse().unwrap()),
+        ..ctx_for("ssh")
+    };
+    for mut sh in [
+        FakeShell::new(FakeFs::new(), ctx()).with_clock(friday),
+        FakeShell::exec(FakeFs::new(), ctx()).with_clock(friday),
+        FakeShell::android(FakeFs::android(), ctx()).with_clock(friday),
+    ] {
+        let mut all = String::new();
+        for line in [
+            "cat /proc/self/status",
+            "cat /proc/self/maps",
+            "ls /proc/self/fd",
+            "readlink /proc/self/fd/0 /proc/self/fd/1 /proc/self/fd/2",
+        ] {
+            all.push_str(&out(&mut sh, line));
+        }
+        assert!(all.len() > 1_000, "the files were produced: {}", all.len());
+        for leak in ["203.0.113.7", "198.51.100.9", "203.0.113", "198.51.100"] {
+            assert!(!all.contains(leak), "{leak} in:\n{all}");
+        }
+    }
+    // The module that builds them names no host file under /proc: the only reads are of the
+    // modeled filesystem's `mounts` and `mountinfo`.
+    let source = include_str!("procs.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    for line in production
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .filter(|l| l.contains("/proc"))
+    {
+        for read in [
+            "std::fs",
+            "File::",
+            "read_to_string",
+            "fs::read",
+            "OpenOptions",
+        ] {
+            assert!(!line.contains(read), "{line}");
+        }
     }
 }

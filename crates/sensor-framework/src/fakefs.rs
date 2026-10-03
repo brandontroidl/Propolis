@@ -659,6 +659,27 @@ impl FakeFs {
              sshd:x:105:65534::/run/sshd:/usr/sbin/nologin\n\
              ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n",
         );
+        // Every group the passwd file and `ls -l` name, so `getent group` and `cat /etc/group`
+        // agree with them. Memberships are the stock Ubuntu cloud image's login user.
+        b.file(
+            "/etc/group",
+            "root:x:0:\n\
+             daemon:x:1:\n\
+             bin:x:2:\n\
+             sys:x:3:\n\
+             adm:x:4:ubuntu\n\
+             tty:x:5:\n\
+             disk:x:6:\n\
+             mail:x:8:\n\
+             sudo:x:27:ubuntu\n\
+             www-data:x:33:\n\
+             users:x:100:\n\
+             nogroup:x:65534:\n\
+             ubuntu:x:1000:\n",
+        );
+        // The synthetic resolver is the model gateway (the same 172.31.16.1 `ip route` shows),
+        // never a real nameserver: `nslookup` and `dig` name it and query nothing.
+        b.file("/etc/resolv.conf", "nameserver 172.31.16.1\n");
         b.file(
             "/etc/hosts",
             format!(
@@ -717,7 +738,15 @@ impl FakeFs {
         b.dir("/root", &[]);
         b.dir(
             "/etc",
-            &["hostname", "mtab", "passwd", "hosts", "os-release"],
+            &[
+                "group",
+                "hostname",
+                "mtab",
+                "passwd",
+                "hosts",
+                "os-release",
+                "resolv.conf",
+            ],
         );
         b.dir("/home", &["ubuntu"]);
         // Every mount point in the table is a directory the box presents, so `cd` into one
@@ -963,6 +992,7 @@ impl FakeFs {
                 "ls",
                 "mount",
                 "netstat",
+                "nslookup",
                 "ping",
                 "pm",
                 "ps",
@@ -1603,7 +1633,7 @@ impl From<BudgetError> for FsError {
 /// The Android device's equivalents. `/system/xbin/busybox` is there because this device is
 /// rooted (it hands out a root shell over ADB, which a stock one does not) and a rooted phone
 /// almost always carries busybox; `su` for the same reason.
-const ANDROID_EXECUTABLE_BINARIES: [&str; 25] = [
+const ANDROID_EXECUTABLE_BINARIES: [&str; 26] = [
     "/system/bin/sh",
     "/system/bin/toybox",
     "/system/bin/toolbox",
@@ -1629,6 +1659,7 @@ const ANDROID_EXECUTABLE_BINARIES: [&str; 25] = [
     "/system/bin/free",
     "/system/bin/stat",
     "/system/bin/find",
+    "/system/bin/nslookup",
 ];
 
 /// `/system/build.prop` on the impersonated device, resolved from [`crate::persona`] so it
@@ -2286,7 +2317,7 @@ mod tests {
 /dev/mqueue:
 /dev/pts: 0 ptmx
 /dev/shm:
-/etc: hostname hosts mtab os-release passwd
+/etc: group hostname hosts mtab os-release passwd resolv.conf
 /home: ubuntu
 /mnt:
 /root:
@@ -2329,7 +2360,7 @@ mod tests {
 /storage/emulated/0:
 /sys: block class devices fs kernel
 /system: app bin build.prop etc fonts framework lib media priv-app tts usr vendor xbin
-/system/bin: am app_process cat chmod dalvikvm date df du dumpsys env find free getenforce getprop hostname ifconfig ip linker logcat ls mount netstat ping pm ps reboot route screencap setprop sh stat toolbox top toybox umount uptime wm
+/system/bin: am app_process cat chmod dalvikvm date df du dumpsys env find free getenforce getprop hostname ifconfig ip linker logcat ls mount netstat nslookup ping pm ps reboot route screencap setprop sh stat toolbox top toybox umount uptime wm
 /system/etc: hosts
 /system/xbin: busybox su
 /vendor: firmware lib

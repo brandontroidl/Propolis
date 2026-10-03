@@ -1011,12 +1011,14 @@ fn file_line_citations(line: &str) -> Vec<String> {
 }
 
 /// Whether a code span cites by line: a `:12` span whose file the page implies, or a `name:12`
-/// span naming a Rust item. `:0` is a port, and `postgres:18` names no item.
+/// span naming a Rust item. `:0` is a port in either form (source lines are 1-indexed, so line 0
+/// never exists), which is why prose like `status:0` or `host:0` is not a citation even when the
+/// name happens to be a Rust item; `postgres:18` names no item.
 fn span_cites_a_line(span: &str, rust_items: &BTreeSet<String>) -> bool {
     let span = span.trim();
     match span.split_once(':') {
         Some(("", lines)) => is_line_list(lines) && lines != "0",
-        Some((name, lines)) => rust_items.contains(name) && is_line_list(lines),
+        Some((name, lines)) => rust_items.contains(name) && is_line_list(lines) && lines != "0",
         None => false,
     }
 }

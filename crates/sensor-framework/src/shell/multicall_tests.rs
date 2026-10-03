@@ -172,6 +172,7 @@ fn the_applet_lists_are_the_advertised_system_bin() {
         "ip",
         "linker",
         "logcat",
+        "nslookup",
         "pm",
         "screencap",
         "sh",

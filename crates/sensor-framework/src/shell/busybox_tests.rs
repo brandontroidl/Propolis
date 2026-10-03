@@ -128,7 +128,7 @@ fn a_name_the_banner_does_not_list_is_applet_not_found() {
 fn a_listed_applet_without_a_model_succeeds_silently() {
     // The usage text and behavior of these are not captured, so none is invented.
     for line in [
-        "busybox nslookup example.com",
+        "busybox traceroute example.com",
         "busybox hwclock",
         "busybox ifconfig",
         "busybox reboot",

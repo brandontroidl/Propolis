@@ -183,6 +183,10 @@ pub enum HandlerId {
     Ifconfig,
     Netstat,
     Route,
+    /// `getent`, `nslookup` and `dig`: static answers over the modeled `/etc` files, no resolver.
+    Getent,
+    Nslookup,
+    Dig,
     Sleep,
     Cd,
     Su,

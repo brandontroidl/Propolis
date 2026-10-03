@@ -394,6 +394,17 @@ impl FakeShell {
         }
     }
 
+    /// The default route's gateway: the synthetic resolver `nslookup` and `dig` name, so the
+    /// name tools and `ip route` cannot disagree about the one nameserver the box has.
+    pub(super) fn model_gateway(&self) -> [u8; 4] {
+        self.net_model()
+            .routes
+            .iter()
+            .find(|route| route.prefix == 0)
+            .and_then(|route| route.gateway)
+            .unwrap_or([127, 0, 0, 1])
+    }
+
     /// The pid and name a listener shows: the modeled process of that name, or none if the table
     /// holds no such process.
     fn listener_owner(&self, listener: &Listener) -> Option<(u32, &'static str)> {

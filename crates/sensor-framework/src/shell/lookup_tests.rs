@@ -569,7 +569,9 @@ fn sh_holds_file(sh: &mut FakeShell, name: &str) -> bool {
 /// has the image of either (`ps` and `kill` are recorded, so they have files), and `ip` and `ss`
 /// (iproute2), which the network model answers for and no capture has the image of, and `du`
 /// (coreutils), whose image is not in the recording either (`df` and `free` are), and `file`
-/// (the `file` package), likewise unrecorded (`stat` and `find` are recorded).
+/// (the `file` package), likewise unrecorded (`stat` and `find` are recorded), and `getent`, `dig`
+/// and `nslookup` (the C library and bind9 packages), which the static name model answers for and
+/// no capture has the image of.
 #[test]
 fn the_names_reported_without_a_file_are_the_pinned_ones() {
     let mut sh = shell();
@@ -587,8 +589,8 @@ fn the_names_reported_without_a_file_are_the_pinned_ones() {
     assert_eq!(
         without_file,
         [
-            "arch", "ash", "du", "file", "ftpget", "hexdump", "ip", "killall", "more", "pgrep",
-            "pidof", "pkill", "printenv", "ss", "tftp", "top"
+            "arch", "ash", "dig", "du", "file", "ftpget", "getent", "hexdump", "ip", "killall",
+            "more", "nslookup", "pgrep", "pidof", "pkill", "printenv", "ss", "tftp", "top"
         ]
     );
 }

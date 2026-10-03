@@ -161,6 +161,10 @@ pub enum HandlerId {
     Free,
     Df,
     Du,
+    /// `stat`, `file` and `find`: metadata, identification and a bounded walk of the modeled tree.
+    Stat,
+    File,
+    Find,
     /// `env` and `printenv`: the session's exported variables, sorted, and `env`'s scoped command.
     Env,
     Printenv,

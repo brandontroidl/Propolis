@@ -110,7 +110,9 @@ fn an_unknown_applet_gets_each_binarys_not_found_form() {
 fn a_listed_applet_without_a_model_succeeds_silently() {
     let mut sh = android();
     for name in TOYBOX_APPLETS {
-        let (stdout, stderr, status) = answer(&mut sh, &format!("toybox {name}"));
+        // `stat` is modeled and, like the real one, refuses to run with no operand.
+        let operand = if name == "stat" { " /" } else { "" };
+        let (stdout, stderr, status) = answer(&mut sh, &format!("toybox {name}{operand}"));
         assert!(
             !stderr.contains("Unknown command"),
             "`toybox {name}` contradicts the listing: {stderr:?}"
@@ -137,7 +139,7 @@ fn a_bare_binary_lists_the_advertised_applets() {
     assert_eq!((err.as_str(), status), ("", 0));
     assert_eq!(
         toybox,
-        "cat\nchmod\ndate\ndf\ndu\nenv\nfree\nhostname\nls\nmount\nnetstat\nping\nreboot\nroute\numount\nuptime\n"
+        "cat\nchmod\ndate\ndf\ndu\nenv\nfind\nfree\nhostname\nls\nmount\nnetstat\nping\nreboot\nroute\nstat\numount\nuptime\n"
     );
     assert_eq!(
         answer(&mut sh, "toolbox"),

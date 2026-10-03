@@ -64,6 +64,7 @@ mod dd;
 mod envtools;
 mod eval;
 mod expand;
+mod fileinfo;
 mod fsops;
 mod hashing;
 mod hostinfo;
@@ -2806,6 +2807,8 @@ mod busybox_tests;
 mod dd_tests;
 #[cfg(test)]
 mod envtools_tests;
+#[cfg(test)]
+mod fileinfo_tests;
 #[cfg(test)]
 mod fsops_tests;
 #[cfg(test)]

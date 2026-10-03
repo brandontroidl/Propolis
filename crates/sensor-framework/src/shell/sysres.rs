@@ -46,25 +46,25 @@ const BLOCK: u64 = 4_096;
 
 // ------------------------------------------------------------------------------- option scanning
 
-enum Tok<'a> {
+pub(super) enum Tok<'a> {
     Short(char, Option<&'a str>),
     Long(&'static str, Option<&'a str>),
     Operand(&'a str),
 }
 
 /// What a command accepts on its line, for the scanner and for its error wording.
-struct Syntax {
-    cmd: &'static str,
+pub(super) struct Syntax {
+    pub(super) cmd: &'static str,
     /// The phone's toybox words its option errors its own way and has no long options.
-    android: bool,
+    pub(super) android: bool,
     /// Short letters that take a value.
-    valued: &'static str,
+    pub(super) valued: &'static str,
     /// Long names, with whether each takes a value.
-    longs: &'static [(&'static str, bool)],
+    pub(super) longs: &'static [(&'static str, bool)],
 }
 
 impl Syntax {
-    fn unrecognized(&self, arg: &str) -> CommandResult {
+    pub(super) fn unrecognized(&self, arg: &str) -> CommandResult {
         if self.android {
             let name = arg.trim_start_matches('-');
             CommandResult::stderr(1, format!("{}: Unknown option {name}\n", self.cmd))
@@ -80,7 +80,7 @@ impl Syntax {
         }
     }
 
-    fn bad_short(&self, flag: char) -> CommandResult {
+    pub(super) fn bad_short(&self, flag: char) -> CommandResult {
         if self.android {
             CommandResult::stderr(1, format!("{}: Unknown option {flag}\n", self.cmd))
         } else {
@@ -129,7 +129,7 @@ fn resolve_long(
 }
 
 /// Split `args` GNU style: options may follow operands, `--` ends them, a lone `-` is an operand.
-fn scan<'a>(args: &[&'a str], syn: &Syntax) -> Result<Vec<Tok<'a>>, CommandResult> {
+pub(super) fn scan<'a>(args: &[&'a str], syn: &Syntax) -> Result<Vec<Tok<'a>>, CommandResult> {
     let mut toks = Vec::new();
     let mut ended = false;
     let mut i = 0usize;
@@ -190,7 +190,7 @@ fn scan<'a>(args: &[&'a str], syn: &Syntax) -> Result<Vec<Tok<'a>>, CommandResul
 
 // ------------------------------------------------------------------------------------ arithmetic
 
-fn ceil_div(n: u64, d: u64) -> u64 {
+pub(super) fn ceil_div(n: u64, d: u64) -> u64 {
     n.saturating_add(d.saturating_sub(1))
         .checked_div(d)
         .unwrap_or(0)
@@ -568,11 +568,11 @@ fn toybox_free(mem: &Mem, unit: FreeUnit) -> String {
 // -------------------------------------------------------------------------------------------- df
 
 /// The canned capacity of one real filesystem, in KiB blocks [unverified].
-struct Figures {
-    point: &'static str,
-    size: u64,
-    used: u64,
-    avail: u64,
+pub(super) struct Figures {
+    pub(super) point: &'static str,
+    pub(super) size: u64,
+    pub(super) used: u64,
+    pub(super) avail: u64,
 }
 
 const fn figures(point: &'static str, size: u64, used: u64, avail: u64) -> Figures {
@@ -610,7 +610,7 @@ const ANDROID_DISKS: [Figures; 8] = [
     figures("/sdcard", 12_251_376, 3_481_544, 8_769_832),
 ];
 
-fn disks(flavor: ShellFlavor) -> &'static [Figures] {
+pub(super) fn disks(flavor: ShellFlavor) -> &'static [Figures] {
     match flavor {
         ShellFlavor::Bash => &UBUNTU_DISKS,
         ShellFlavor::AndroidSh => &ANDROID_DISKS,

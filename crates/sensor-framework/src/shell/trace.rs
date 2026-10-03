@@ -104,6 +104,9 @@ pub enum HandlerId {
     Wc,
     Grep,
     Od,
+    /// `xxd` and `strings`: the hex dumper and the printable-run extractor over modeled bytes.
+    Xxd,
+    Strings,
     /// `base64`: bounded encode and decode over modeled bytes, for staged payloads.
     Base64,
     /// `md5sum`, `sha1sum`, `sha256sum` and `cksum`: digests of modeled bytes, for verify steps.
@@ -580,6 +583,8 @@ mod tests {
             ("wc -c /etc/hostname", HandlerId::Wc),
             ("grep -F a /etc/hostname", HandlerId::Grep),
             ("od -An -tx1 /etc/hostname", HandlerId::Od),
+            ("xxd /etc/hostname", HandlerId::Xxd),
+            ("strings /etc/hostname", HandlerId::Strings),
             ("command -v ls", HandlerId::CommandBuiltin),
             ("type ls", HandlerId::Type),
             ("which ls", HandlerId::Which),

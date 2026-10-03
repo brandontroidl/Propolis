@@ -58,6 +58,7 @@ mod androidsys;
 mod arith;
 mod ast;
 mod base64;
+mod binview;
 mod builtins;
 mod busybox;
 mod dd;
@@ -2803,6 +2804,8 @@ mod android_tests;
 mod androidsys_tests;
 #[cfg(test)]
 mod base64_tests;
+#[cfg(test)]
+mod binview_tests;
 #[cfg(test)]
 mod budget_tests;
 

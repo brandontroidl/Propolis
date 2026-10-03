@@ -157,6 +157,10 @@ pub enum HandlerId {
     Nproc,
     Date,
     Uptime,
+    /// `free`, `df` and `du`: figures read from the modeled `/proc/meminfo`, mount table and tree.
+    Free,
+    Df,
+    Du,
     /// `env` and `printenv`: the session's exported variables, sorted, and `env`'s scoped command.
     Env,
     Printenv,

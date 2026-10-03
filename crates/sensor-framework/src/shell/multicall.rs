@@ -35,9 +35,9 @@ fn android(shell: &FakeShell, _parts: &[&str]) -> bool {
 }
 
 /// The toybox-backed names of the advertised `/system/bin`.
-pub(super) const TOYBOX_APPLETS: [&str; 14] = [
-    "cat", "chmod", "date", "df", "env", "hostname", "ls", "mount", "netstat", "ping", "reboot",
-    "route", "umount", "uptime",
+pub(super) const TOYBOX_APPLETS: [&str; 16] = [
+    "cat", "chmod", "date", "df", "du", "env", "free", "hostname", "ls", "mount", "netstat",
+    "ping", "reboot", "route", "umount", "uptime",
 ];
 
 /// The toolbox-backed names of the advertised `/system/bin`. `ps`, `top` and `ifconfig` are

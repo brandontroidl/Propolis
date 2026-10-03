@@ -625,6 +625,18 @@ impl FakeFs {
         self
     }
 
+    /// The mount table this persona presents, in mount order.
+    pub fn mounts(&self) -> &'static [MountEntry] {
+        self.snapshot.mounts
+    }
+
+    /// The mount `logical_abs` sits on once every link is followed, `None` when nothing is there.
+    pub fn mount_of(&self, logical_abs: &str) -> Option<MountEntry> {
+        let physical = self.resolve(logical_abs, true).ok()?;
+        self.node_at(&physical)?;
+        self.snapshot.mount_for(&physical).copied()
+    }
+
     /// The budget this filesystem charges; a shell built on it charges the same one.
     pub fn budget(&self) -> &Arc<ConnectionBudget> {
         &self.budget
@@ -688,6 +700,7 @@ impl FakeFs {
              model name\t: Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz\n\
              cpu cores\t: 1\n",
         );
+        b.file("/proc/meminfo", render_meminfo(&UBUNTU_MEMINFO));
 
         b.dir(
             "/",
@@ -872,6 +885,7 @@ impl FakeFs {
             "/system/etc/hosts",
             "127.0.0.1       localhost\n::1             ip6-localhost\n",
         );
+        b.file("/proc/meminfo", render_meminfo(&ANDROID_MEMINFO));
         b.file("/proc/mounts", render_mounts(&ANDROID_MOUNT_TABLE));
         b.file("/proc/self/mounts", render_mounts(&ANDROID_MOUNT_TABLE));
         b.file(
@@ -934,8 +948,10 @@ impl FakeFs {
                 "dalvikvm",
                 "date",
                 "df",
+                "du",
                 "dumpsys",
                 "env",
+                "free",
                 "getenforce",
                 "getprop",
                 "hostname",
@@ -1585,7 +1601,7 @@ impl From<BudgetError> for FsError {
 /// The Android device's equivalents. `/system/xbin/busybox` is there because this device is
 /// rooted (it hands out a root shell over ADB, which a stock one does not) and a rooted phone
 /// almost always carries busybox; `su` for the same reason.
-const ANDROID_EXECUTABLE_BINARIES: [&str; 20] = [
+const ANDROID_EXECUTABLE_BINARIES: [&str; 23] = [
     "/system/bin/sh",
     "/system/bin/toybox",
     "/system/bin/toolbox",
@@ -1606,6 +1622,9 @@ const ANDROID_EXECUTABLE_BINARIES: [&str; 20] = [
     "/system/bin/ip",
     "/system/bin/netstat",
     "/system/bin/route",
+    "/system/bin/df",
+    "/system/bin/du",
+    "/system/bin/free",
 ];
 
 /// `/system/build.prop` on the impersonated device, resolved from [`crate::persona`] so it
@@ -1819,6 +1838,131 @@ pub const MOUNT_TABLE: [MountEntry; 20] = [
     ),
 ];
 
+/// One `/proc/meminfo` line: the field, its value, and whether the kernel writes ` kB` after it
+/// (the huge-page counts are bare numbers).
+type MemLine = (&'static str, u64, bool);
+
+/// The Ubuntu host's memory [unverified: composed, not captured]. The totals are the ones `top`
+/// already reports for this host (3923.7 MiB, which the `udev` and `/run` sizes in the mount table
+/// also imply), and the rest is arranged so the kernel's own identities hold: the anon and file
+/// LRU lists add up to `Active` and `Inactive`, `Slab` is its two halves, and the file lists equal
+/// `Buffers` + `Cached` less `Shmem`.
+const UBUNTU_MEMINFO: [MemLine; 50] = [
+    ("MemTotal", 4_017_836, true),
+    ("MemFree", 2_405_196, true),
+    ("MemAvailable", 3_452_180, true),
+    ("Buffers", 163_204, true),
+    ("Cached", 1_039_408, true),
+    ("SwapCached", 0, true),
+    ("Active", 563_524, true),
+    ("Inactive", 936_236, true),
+    ("Active(anon)", 95_320, true),
+    ("Inactive(anon)", 203_424, true),
+    ("Active(file)", 468_204, true),
+    ("Inactive(file)", 732_812, true),
+    ("Unevictable", 18_432, true),
+    ("Mlocked", 18_432, true),
+    ("SwapTotal", 0, true),
+    ("SwapFree", 0, true),
+    ("Dirty", 156, true),
+    ("Writeback", 0, true),
+    ("AnonPages", 298_744, true),
+    ("Mapped", 212_880, true),
+    ("Shmem", 1_596, true),
+    ("KReclaimable", 80_548, true),
+    ("Slab", 142_148, true),
+    ("SReclaimable", 79_816, true),
+    ("SUnreclaim", 62_332, true),
+    ("KernelStack", 3_232, true),
+    ("PageTables", 5_716, true),
+    ("Bounce", 0, true),
+    ("WritebackTmp", 0, true),
+    ("CommitLimit", 2_008_918, true),
+    ("Committed_AS", 2_512_364, true),
+    ("VmallocTotal", 34_359_738_367, true),
+    ("VmallocUsed", 24_692, true),
+    ("VmallocChunk", 0, true),
+    ("Percpu", 1_216, true),
+    ("HardwareCorrupted", 0, true),
+    ("AnonHugePages", 0, true),
+    ("ShmemHugePages", 0, true),
+    ("ShmemPmdMapped", 0, true),
+    ("FileHugePages", 0, true),
+    ("FilePmdMapped", 0, true),
+    ("HugePages_Total", 0, false),
+    ("HugePages_Free", 0, false),
+    ("HugePages_Rsvd", 0, false),
+    ("HugePages_Surp", 0, false),
+    ("Hugepagesize", 2_048, true),
+    ("Hugetlb", 0, true),
+    ("DirectMap4k", 235_520, true),
+    ("DirectMap2M", 3_958_784, true),
+    ("DirectMap1G", 0, true),
+];
+
+/// The Nexus 5's memory [unverified: composed, not captured]: 2 GiB less what the radio and the
+/// graphics carve out, no swap, and the 3.4 kernel's fields (no `MemAvailable`, which arrived in
+/// 3.14). The same identities hold as for the Ubuntu host, plus `HighTotal` + `LowTotal` =
+/// `MemTotal` and likewise for the free halves.
+const ANDROID_MEMINFO: [MemLine; 37] = [
+    ("MemTotal", 1_875_408, true),
+    ("MemFree", 112_432, true),
+    ("Buffers", 4_724, true),
+    ("Cached", 612_844, true),
+    ("SwapCached", 0, true),
+    ("Active", 502_316, true),
+    ("Inactive", 804_460, true),
+    ("Active(anon)", 312_000, true),
+    ("Inactive(anon)", 377_208, true),
+    ("Active(file)", 190_316, true),
+    ("Inactive(file)", 427_252, true),
+    ("Unevictable", 0, true),
+    ("Mlocked", 0, true),
+    ("HighTotal", 1_085_440, true),
+    ("HighFree", 41_208, true),
+    ("LowTotal", 789_968, true),
+    ("LowFree", 71_224, true),
+    ("SwapTotal", 0, true),
+    ("SwapFree", 0, true),
+    ("Dirty", 24, true),
+    ("Writeback", 0, true),
+    ("AnonPages", 689_208, true),
+    ("Mapped", 301_120, true),
+    ("Shmem", 12_340, true),
+    ("Slab", 78_440, true),
+    ("SReclaimable", 28_116, true),
+    ("SUnreclaim", 50_324, true),
+    ("KernelStack", 6_320, true),
+    ("PageTables", 12_408, true),
+    ("NFS_Unstable", 0, true),
+    ("Bounce", 0, true),
+    ("WritebackTmp", 0, true),
+    ("CommitLimit", 937_704, true),
+    ("Committed_AS", 1_432_604, true),
+    ("VmallocTotal", 245_760, true),
+    ("VmallocUsed", 169_356, true),
+    ("VmallocChunk", 6_300, true),
+];
+
+/// `/proc/meminfo` as the kernel writes it: the name and colon padded to 16 columns, the value
+/// right-aligned in 8, then ` kB` where the field has a unit (a name too long for that gets one
+/// space and a five-column value).
+fn render_meminfo(lines: &[MemLine]) -> String {
+    let mut out = String::new();
+    for &(name, value, kb) in lines {
+        let label = format!("{name}:");
+        let unit = if kb { " kB" } else { "" };
+        if label.len() > 16 {
+            // The kernel prints `HardwareCorrupted` with a format of its own, one space and a
+            // five-column value.
+            out.push_str(&format!("{label} {value:>5}{unit}\n"));
+        } else {
+            out.push_str(&format!("{label:<16}{value:>8}{unit}\n"));
+        }
+    }
+    out
+}
+
 /// `/proc/mounts` format: `source mountpoint type options 0 0`.
 fn render_mounts(table: &[MountEntry]) -> String {
     let mut out = String::new();
@@ -1893,6 +2037,31 @@ mod tests {
             );
         }
         assert!(fs.list_dir("/etc").unwrap().contains(&"mtab".to_string()));
+    }
+
+    /// A path's mount is the longest one covering where the path really is, so a link into `/usr`
+    /// is on the root disk and a link into `/run` is on the `/run` tmpfs; a path that is not there
+    /// has none.
+    #[test]
+    fn mount_of_follows_links_to_the_longest_covering_mount() {
+        let fs = FakeFs::new();
+        let point = |path: &str| fs.mount_of(path).map(|m| m.point);
+        assert_eq!(point("/"), Some("/"));
+        assert_eq!(point("/etc/passwd"), Some("/"));
+        assert_eq!(point("/bin/busybox"), Some("/"));
+        assert_eq!(point("/run/user"), Some("/run"));
+        assert_eq!(point("/run/user/0"), Some("/run/user/0"));
+        assert_eq!(point("/var/run/lock"), Some("/run/lock"));
+        assert_eq!(point("/boot/efi"), Some("/boot/efi"));
+        assert_eq!(point("/nonexistent"), None);
+        assert_eq!(fs.mounts().len(), MOUNT_TABLE.len());
+        let phone = FakeFs::android();
+        assert_eq!(
+            phone.mount_of("/sdcard").map(|m| m.fstype),
+            Some("sdcardfs")
+        );
+        assert_eq!(phone.mount_of("/system").map(|m| m.point), Some("/system"));
+        assert_eq!(phone.mounts().len(), 12);
     }
 
     /// The Android snapshot describes one device, and the same device the ADB banner announces.
@@ -2156,7 +2325,7 @@ mod tests {
 /storage/emulated/0:
 /sys: block class devices fs kernel
 /system: app bin build.prop etc fonts framework lib media priv-app tts usr vendor xbin
-/system/bin: am app_process cat chmod dalvikvm date df dumpsys env getenforce getprop hostname ifconfig ip linker logcat ls mount netstat ping pm ps reboot route screencap setprop sh toolbox top toybox umount uptime wm
+/system/bin: am app_process cat chmod dalvikvm date df du dumpsys env free getenforce getprop hostname ifconfig ip linker logcat ls mount netstat ping pm ps reboot route screencap setprop sh toolbox top toybox umount uptime wm
 /system/etc: hosts
 /system/xbin: busybox su
 /vendor: firmware lib

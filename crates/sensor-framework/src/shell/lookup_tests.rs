@@ -567,7 +567,8 @@ fn sh_holds_file(sh: &mut FakeShell, name: &str) -> bool {
 /// (coreutils files no capture has the image of), and `top`, `pgrep` and `pkill` (procps), `pidof`
 /// (sysvinit-utils) and `killall` (psmisc), which the process table answers for and no capture
 /// has the image of either (`ps` and `kill` are recorded, so they have files), and `ip` and `ss`
-/// (iproute2), which the network model answers for and no capture has the image of.
+/// (iproute2), which the network model answers for and no capture has the image of, and `du`
+/// (coreutils), whose image is not in the recording either (`df` and `free` are).
 #[test]
 fn the_names_reported_without_a_file_are_the_pinned_ones() {
     let mut sh = shell();
@@ -585,8 +586,8 @@ fn the_names_reported_without_a_file_are_the_pinned_ones() {
     assert_eq!(
         without_file,
         [
-            "arch", "ash", "ftpget", "hexdump", "ip", "killall", "more", "pgrep", "pidof", "pkill",
-            "printenv", "ss", "tftp", "top"
+            "arch", "ash", "du", "ftpget", "hexdump", "ip", "killall", "more", "pgrep", "pidof",
+            "pkill", "printenv", "ss", "tftp", "top"
         ]
     );
 }

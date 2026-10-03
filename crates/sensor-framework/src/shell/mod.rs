@@ -78,6 +78,7 @@ mod procs;
 mod read;
 mod readlink;
 mod registry;
+mod sysres;
 mod test_builtin;
 mod texttools;
 mod trace;
@@ -2831,6 +2832,8 @@ mod procs_tests;
 mod read_tests;
 #[cfg(test)]
 mod readlink_tests;
+#[cfg(test)]
+mod sysres_tests;
 #[cfg(test)]
 mod test_builtin_tests;
 #[cfg(test)]

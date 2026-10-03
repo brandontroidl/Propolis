@@ -125,10 +125,9 @@ fn a_listed_applet_without_a_model_succeeds_silently() {
             "toolbox {name}: {stderr:?}"
         );
     }
-    // No handler answers `df` or `reboot` on the phone, so they run as the silent success
-    // BusyBox gives a listed applet nothing models.
-    assert_eq!(answer(&mut sh, "toybox df"), ("".into(), "".into(), 0));
-    assert_eq!(answer(&mut sh, "toybox reboot").2, 0);
+    // No handler answers `reboot` on the phone, so it runs as the silent success BusyBox gives a
+    // listed applet nothing models.
+    assert_eq!(answer(&mut sh, "toybox reboot"), ("".into(), "".into(), 0));
 }
 
 #[test]
@@ -138,7 +137,7 @@ fn a_bare_binary_lists_the_advertised_applets() {
     assert_eq!((err.as_str(), status), ("", 0));
     assert_eq!(
         toybox,
-        "cat\nchmod\ndate\ndf\nenv\nhostname\nls\nmount\nnetstat\nping\nreboot\nroute\numount\nuptime\n"
+        "cat\nchmod\ndate\ndf\ndu\nenv\nfree\nhostname\nls\nmount\nnetstat\nping\nreboot\nroute\numount\nuptime\n"
     );
     assert_eq!(
         answer(&mut sh, "toolbox"),

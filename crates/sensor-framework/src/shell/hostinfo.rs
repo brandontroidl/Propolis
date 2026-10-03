@@ -49,7 +49,7 @@ const WIDTH_MAX: usize = 64;
 const CPUINFO_MAX: u64 = 65_536;
 
 /// The standard two-line tail of a coreutils option error.
-fn try_help(cmd: &str) -> String {
+pub(super) fn try_help(cmd: &str) -> String {
     format!("Try '{cmd} --help' for more information.\n")
 }
 
@@ -64,7 +64,7 @@ fn bad_option(cmd: &str, arg: &str) -> CommandResult {
     }
 }
 
-fn bad_flag(cmd: &str, flag: char) -> CommandResult {
+pub(super) fn bad_flag(cmd: &str, flag: char) -> CommandResult {
     CommandResult::stderr(
         1,
         format!("{cmd}: invalid option -- '{flag}'\n{}", try_help(cmd)),

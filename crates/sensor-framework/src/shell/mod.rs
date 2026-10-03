@@ -70,6 +70,7 @@ mod hostinfo;
 mod lex;
 mod lookup;
 mod multicall;
+mod netinfo;
 mod parse;
 mod pathtools;
 mod printf;
@@ -2816,6 +2817,8 @@ mod hostinfo_tests;
 mod lookup_tests;
 #[cfg(test)]
 mod multicall_tests;
+#[cfg(test)]
+mod netinfo_tests;
 #[cfg(test)]
 mod pathtools_tests;
 #[cfg(test)]

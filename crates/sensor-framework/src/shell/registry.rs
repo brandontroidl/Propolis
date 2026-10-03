@@ -88,6 +88,7 @@ impl Registry {
         super::hostinfo::register(&mut registry);
         super::envtools::register(&mut registry);
         super::procs::register(&mut registry);
+        super::netinfo::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }

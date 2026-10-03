@@ -508,7 +508,8 @@ fn the_directory_lists_the_nodes_and_proc_lists_the_pids() {
         "cmdline  comm  cwd  exe  mountinfo  mounts  stat  status\n"
     );
     let listing = out(&mut sh, "ls /proc");
-    let mut found: Vec<&str> = listing.split_whitespace().collect();
+    // `/proc/net` is a directory of the same set, not a process.
+    let mut found: Vec<&str> = listing.split_whitespace().filter(|n| *n != "net").collect();
     found.sort_unstable();
     let ps = out(&mut sh, "ps -eo pid=");
     let mut want: Vec<&str> = ps.split_whitespace().collect();
@@ -1149,10 +1150,13 @@ fn the_table_is_small_and_every_row_is_well_formed() {
         ("telnet", telnet(), 4, 6),
         ("phone", phone(), 4, 6),
     ] {
-        let count = out(&mut sh, "ls /proc").split_whitespace().count();
+        // `/proc/net` is a directory of the same set, not a process.
+        let listing = out(&mut sh, "ls /proc");
+        let pids: Vec<&str> = listing.split_whitespace().filter(|n| *n != "net").collect();
+        let count = pids.len();
         assert!((floor..=ceiling).contains(&count), "{label}: {count} rows");
         let mut seen = std::collections::HashSet::new();
-        for pid in out(&mut sh, "ls /proc").split_whitespace() {
+        for pid in pids {
             assert!(seen.insert(pid.to_string()), "{label}: pid {pid} twice");
             let comm = out(&mut sh, &format!("cat /proc/{pid}/comm"));
             assert!(

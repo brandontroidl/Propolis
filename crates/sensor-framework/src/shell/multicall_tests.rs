@@ -138,11 +138,11 @@ fn a_bare_binary_lists_the_advertised_applets() {
     assert_eq!((err.as_str(), status), ("", 0));
     assert_eq!(
         toybox,
-        "cat\nchmod\ndate\ndf\nenv\nhostname\nls\nmount\nping\nreboot\numount\nuptime\n"
+        "cat\nchmod\ndate\ndf\nenv\nhostname\nls\nmount\nnetstat\nping\nreboot\nroute\numount\nuptime\n"
     );
     assert_eq!(
         answer(&mut sh, "toolbox"),
-        ("getprop\nsetprop\nps\ntop\n".into(), "".into(), 0)
+        ("getprop\nsetprop\nps\ntop\nifconfig\n".into(), "".into(), 0)
     );
 }
 
@@ -168,6 +168,7 @@ fn the_applet_lists_are_the_advertised_system_bin() {
         "dalvikvm",
         "dumpsys",
         "getenforce",
+        "ip",
         "linker",
         "logcat",
         "pm",

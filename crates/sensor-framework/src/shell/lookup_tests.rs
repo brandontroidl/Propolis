@@ -566,7 +566,8 @@ fn sh_holds_file(sh: &mut FakeShell, name: &str) -> bool {
 /// a util-linux file the modeled filesystem does not hold yet, as are `arch` and `printenv`
 /// (coreutils files no capture has the image of), and `top`, `pgrep` and `pkill` (procps), `pidof`
 /// (sysvinit-utils) and `killall` (psmisc), which the process table answers for and no capture
-/// has the image of either (`ps` and `kill` are recorded, so they have files).
+/// has the image of either (`ps` and `kill` are recorded, so they have files), and `ip` and `ss`
+/// (iproute2), which the network model answers for and no capture has the image of.
 #[test]
 fn the_names_reported_without_a_file_are_the_pinned_ones() {
     let mut sh = shell();
@@ -584,8 +585,8 @@ fn the_names_reported_without_a_file_are_the_pinned_ones() {
     assert_eq!(
         without_file,
         [
-            "arch", "ash", "ftpget", "hexdump", "killall", "more", "pgrep", "pidof", "pkill",
-            "printenv", "tftp", "top"
+            "arch", "ash", "ftpget", "hexdump", "ip", "killall", "more", "pgrep", "pidof", "pkill",
+            "printenv", "ss", "tftp", "top"
         ]
     );
 }

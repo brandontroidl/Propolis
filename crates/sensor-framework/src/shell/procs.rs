@@ -26,7 +26,8 @@
 //! The filesystem side is the `generated` layer of [`crate::fakefs::FakeFs`]: this module hands it
 //! `/proc/<pid>/{cmdline,comm,stat,status,exe,cwd,mounts,mountinfo}` for every row, rebuilt from the
 //! table whenever the session clock or the login shell's directory changes. A pid outside the table
-//! has no node and reads as absent, as on a real `/proc`.
+//! has no node and reads as absent, as on a real `/proc`. The same set carries `/proc/net`, which
+//! `netinfo.rs` renders, because the filesystem takes one whole generated set at a time.
 //!
 //! Only `ps` and `top` are transient processes: each lists itself, with the next pid the session
 //! allocator hands out, as the real tools list themselves.
@@ -265,8 +266,21 @@ impl FakeShell {
             .fs
             .read_all("/proc/self/mountinfo", 16_384)
             .unwrap_or_default();
-        let nodes = process_nodes(&table, &mounts, &mountinfo);
+        let mut nodes = process_nodes(&table, &mounts, &mountinfo);
+        // `/proc/net` joins the process nodes in the same set: `set_generated` replaces the
+        // whole set, so it has to be handed everything at once.
+        nodes.extend(self.net_nodes(table.boot.timestamp()));
         self.fs.set_generated(nodes);
+    }
+
+    /// The pid of the daemon the modeled init started under the kernel name `comm` (`sshd`,
+    /// `telnetd`, `adbd`), the process a listening socket belongs to.
+    pub(super) fn listener_pid(&self, comm: &str) -> Option<u32> {
+        self.process_table()
+            .procs
+            .iter()
+            .find(|p| p.ppid == 1 && p.comm == comm)
+            .map(|p| p.pid)
     }
 }
 

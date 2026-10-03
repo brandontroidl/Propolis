@@ -169,6 +169,12 @@ pub enum HandlerId {
     Kill,
     Killall,
     Pkill,
+    /// `ip`, `ss`, `ifconfig`, `netstat` and `route`: the one synthetic network model, rendered.
+    Ip,
+    Ss,
+    Ifconfig,
+    Netstat,
+    Route,
     Sleep,
     Cd,
     Su,

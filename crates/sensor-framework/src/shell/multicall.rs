@@ -40,8 +40,9 @@ pub(super) const TOYBOX_APPLETS: [&str; 12] = [
     "uptime",
 ];
 
-/// The toolbox-backed names of the advertised `/system/bin`.
-pub(super) const TOOLBOX_APPLETS: [&str; 2] = ["getprop", "setprop"];
+/// The toolbox-backed names of the advertised `/system/bin`. `ps` and `top` are toolbox's on
+/// Android 6 [unverified]; toybox took them over in a later release.
+pub(super) const TOOLBOX_APPLETS: [&str; 4] = ["getprop", "setprop", "ps", "top"];
 
 /// Shell builtins that toybox also provides as applets and that only print or answer a status,
 /// so running them nested leaves the session's shell untouched. The other builtins (`cd`, `exit`,

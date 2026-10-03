@@ -1137,8 +1137,8 @@ mod shell_levels {
             run(&mut sh, &format!("cat /proc/{pid}/mounts")),
             run(&mut sh, "cat /proc/self/mounts")
         );
-        // A different pid is not this shell's.
-        assert!(run(&mut sh, "cat /proc/1/cmdline").contains("No such file"));
+        // A pid outside the process table is no process (pid 1 is init, a row of it).
+        assert!(run(&mut sh, "cat /proc/4/cmdline").contains("No such file"));
     }
 
     #[test]

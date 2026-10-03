@@ -72,6 +72,8 @@ impl FakeShell {
                 String::new()
             };
             self.state_mut().set_cwd(target);
+            // `/proc/<login pid>/cwd` is the login shell's directory.
+            self.install_processes();
             CommandResult::stdout(out)
         } else {
             CommandResult::stderr(

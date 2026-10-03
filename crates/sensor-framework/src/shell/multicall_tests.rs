@@ -142,7 +142,7 @@ fn a_bare_binary_lists_the_advertised_applets() {
     );
     assert_eq!(
         answer(&mut sh, "toolbox"),
-        ("getprop\nsetprop\n".into(), "".into(), 0)
+        ("getprop\nsetprop\nps\ntop\n".into(), "".into(), 0)
     );
 }
 

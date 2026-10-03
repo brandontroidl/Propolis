@@ -482,7 +482,16 @@ pub struct FakeFs {
     /// Charged by every write, so no writer can bypass it. Shared with the other filesystems and
     /// shells on the same connection.
     budget: Arc<ConnectionBudget>,
+    /// Nodes the shell derives from state the snapshot cannot hold (the process table behind
+    /// `/proc/<pid>`), keyed by physical path. Read after the snapshot and never charged: the
+    /// owner replaces the whole set, bounded by [`GENERATED_MAX`], and a session's own writes
+    /// and removals land in the overlay above it.
+    generated: HashMap<String, Node>,
 }
+
+/// The most generated nodes one filesystem holds. The shell's process table is a handful of
+/// processes with a few nodes each; the bound only keeps a caller's bug from growing the map.
+pub const GENERATED_MAX: usize = 256;
 
 impl Default for FakeFs {
     fn default() -> Self {
@@ -590,7 +599,23 @@ impl FakeFs {
             snapshot: Arc::new(snapshot),
             overlay: Overlay::default(),
             budget: ConnectionBudget::new(BudgetLimits::default()),
+            generated: HashMap::new(),
         }
+    }
+
+    /// Replace the generated nodes with `nodes` (physical path to node), keeping at most
+    /// [`GENERATED_MAX`] of them in path order so the kept set does not depend on map order.
+    /// The snapshot and the session's overlay are untouched, and a path the snapshot holds is
+    /// still answered by the snapshot.
+    pub fn set_generated(&mut self, nodes: HashMap<String, Node>) {
+        let mut paths: Vec<String> = nodes.keys().cloned().collect();
+        paths.sort_unstable();
+        paths.truncate(GENERATED_MAX);
+        let mut nodes = nodes;
+        self.generated = paths
+            .into_iter()
+            .filter_map(|path| nodes.remove(&path).map(|node| (path, node)))
+            .collect();
     }
 
     /// This filesystem charging `budget` instead of its own standard-limits one, so it shares a
@@ -920,11 +945,13 @@ impl FakeFs {
                 "mount",
                 "ping",
                 "pm",
+                "ps",
                 "reboot",
                 "screencap",
                 "setprop",
                 "sh",
                 "toolbox",
+                "top",
                 "toybox",
                 "umount",
                 "uptime",
@@ -1001,6 +1028,7 @@ impl FakeFs {
             .nodes
             .get(physical)
             .or_else(|| self.snapshot.nodes.get(physical))
+            .or_else(|| self.generated.get(physical))
     }
 
     /// Resolve a logical absolute path to a physical one, following symlinks component by
@@ -1190,6 +1218,19 @@ impl FakeFs {
             format!("{physical}/")
         };
         let mut entries = listing.entries.clone();
+        // The generated children come in path order, so a listing never depends on map order.
+        let mut generated: Vec<&str> = self
+            .generated
+            .keys()
+            .filter_map(|key| key.strip_prefix(&prefix))
+            .filter(|name| !name.is_empty() && !name.contains('/'))
+            .collect();
+        generated.sort_unstable();
+        for name in generated {
+            if !entries.iter().any(|entry| entry == name) {
+                entries.push(name.to_string());
+            }
+        }
         for key in self.overlay.nodes.keys() {
             if let Some(name) = key
                 .strip_prefix(&prefix)
@@ -1540,7 +1581,7 @@ impl From<BudgetError> for FsError {
 /// The Android device's equivalents. `/system/xbin/busybox` is there because this device is
 /// rooted (it hands out a root shell over ADB, which a stock one does not) and a rooted phone
 /// almost always carries busybox; `su` for the same reason.
-const ANDROID_EXECUTABLE_BINARIES: [&str; 14] = [
+const ANDROID_EXECUTABLE_BINARIES: [&str; 16] = [
     "/system/bin/sh",
     "/system/bin/toybox",
     "/system/bin/toolbox",
@@ -1555,6 +1596,8 @@ const ANDROID_EXECUTABLE_BINARIES: [&str; 14] = [
     "/system/bin/wm",
     "/system/bin/logcat",
     "/system/bin/env",
+    "/system/bin/ps",
+    "/system/bin/top",
 ];
 
 /// `/system/build.prop` on the impersonated device, resolved from [`crate::persona`] so it
@@ -2038,8 +2081,10 @@ mod tests {
         "/sys/fs/selinux",
         "/system/bin/app_process",
         "/system/bin/env",
+        "/system/bin/ps",
         "/system/bin/sh",
         "/system/bin/toolbox",
+        "/system/bin/top",
         "/system/bin/toybox",
         "/system/build.prop",
         "/system/etc/hosts",
@@ -2103,7 +2148,7 @@ mod tests {
 /storage/emulated/0:
 /sys: block class devices fs kernel
 /system: app bin build.prop etc fonts framework lib media priv-app tts usr vendor xbin
-/system/bin: am app_process cat chmod dalvikvm date df dumpsys env getenforce getprop hostname linker logcat ls mount ping pm reboot screencap setprop sh toolbox toybox umount uptime wm
+/system/bin: am app_process cat chmod dalvikvm date df dumpsys env getenforce getprop hostname linker logcat ls mount ping pm ps reboot screencap setprop sh toolbox top toybox umount uptime wm
 /system/etc: hosts
 /system/xbin: busybox su
 /vendor: firmware lib

@@ -73,6 +73,7 @@ mod multicall;
 mod parse;
 mod pathtools;
 mod printf;
+mod procs;
 mod read;
 mod readlink;
 mod registry;
@@ -369,6 +370,9 @@ pub struct FakeShell {
     /// service is system-wide, so it sits here rather than in a frame's state, which a subshell
     /// discards.
     props: std::collections::BTreeMap<String, String>,
+    /// When the session began on the shell's clock: the start time of the processes the session
+    /// owns in the process table.
+    session_started: chrono::DateTime<chrono::Utc>,
 }
 
 /// One entry of the shell stack.
@@ -464,7 +468,7 @@ impl FakeShell {
         let hostname = persona::hostname();
         let pid = persona::session_pid(ctx.session_id.map(|id| id.as_u128()));
         let state = ShellState::login(flavor, pid, &hostname);
-        Self {
+        let mut shell = Self {
             fs,
             ctx,
             codec: CommandCodec::new(),
@@ -494,7 +498,10 @@ impl FakeShell {
             loop_depth: 0,
             busybox_depth: 0,
             props: std::collections::BTreeMap::new(),
-        }
+            session_started: chrono::Utc::now(),
+        };
+        shell.install_processes();
+        shell
     }
 
     /// What the engine decided while running the most recent non-blank input line. For tests and
@@ -506,6 +513,9 @@ impl FakeShell {
     /// The same shell reading its time from `clock` instead of the system clock.
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        // The session began now on this clock, and every start time in the process table follows.
+        self.session_started = clock();
+        self.install_processes();
         self
     }
 
@@ -1320,11 +1330,19 @@ impl FakeShell {
         self.alias_own_pid(normalized)
     }
 
-    /// The shell's own `/proc/<pid>` is `/proc/self` to the shell.
+    /// The shell's own `/proc/<pid>` is `/proc/self` to the shell, unless the process table
+    /// already serves that pid (the login shell is a row of it), in which case its own node is
+    /// the answer.
     fn alias_own_pid(&self, normalized: String) -> String {
         let own = format!("/proc/{}", self.state().pid);
         match normalized.strip_prefix(&own) {
-            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("/proc/self{rest}"),
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                if self.fs.is_dir(&own) {
+                    normalized
+                } else {
+                    format!("/proc/self{rest}")
+                }
+            }
             _ => normalized,
         }
     }
@@ -2804,6 +2822,8 @@ mod pathtools_tests;
 mod printf_tests;
 #[cfg(test)]
 mod proc_self_tests;
+#[cfg(test)]
+mod procs_tests;
 #[cfg(test)]
 mod read_tests;
 #[cfg(test)]

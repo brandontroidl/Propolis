@@ -123,9 +123,9 @@ fn the_shells_own_proc_self_is_the_shell() {
     assert_is_image(&run(&mut sh, "cat /proc/$$/exe"), "dash");
     assert_is_image(&run(&mut sh, &format!("cat /proc/{login_pid}/exe")), "bash");
     assert_is_image(&run(&mut sh, "cat /proc/self/exe"), "cat");
-    // Some other process id is no process.
+    // A process id outside the process table is no process.
     assert!(
-        run(&mut sh, "cat /proc/1/exe").contains("No such file or directory"),
+        run(&mut sh, "cat /proc/4/exe").contains("No such file or directory"),
         "no other pid is modeled"
     );
 }

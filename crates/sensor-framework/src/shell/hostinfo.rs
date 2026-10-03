@@ -95,7 +95,7 @@ impl FakeShell {
         }
     }
 
-    fn now(&self) -> DateTime<Utc> {
+    pub(super) fn now(&self) -> DateTime<Utc> {
         (self.clock)()
     }
 }
@@ -565,7 +565,7 @@ fn pad_to(text: String, width: usize, fill: char) -> String {
 /// Expand a `date` format against `t`: the strftime fields GNU supports for a fixed UTC moment,
 /// with the `-`, `_`, `0` and `^` flags and a width. A field this does not know is copied through
 /// as written, as GNU does for an unknown one. Weekly numbering (`%U %V %W %G`) is not modeled.
-fn expand(format: &str, t: &DateTime<Utc>) -> String {
+pub(super) fn expand(format: &str, t: &DateTime<Utc>) -> String {
     let mut out = String::new();
     let mut chars = format.chars();
     while let Some(c) = chars.next() {
@@ -644,7 +644,7 @@ const BOOT_WINDOW_SECS: i64 = 1_209_600;
 const BOOT_OFFSET_SECS: u64 = 8_021;
 
 /// Seconds the box has been up at `now`.
-fn uptime_secs(now: &DateTime<Utc>) -> u64 {
+pub(super) fn uptime_secs(now: &DateTime<Utc>) -> u64 {
     u64::try_from(now.timestamp().rem_euclid(BOOT_WINDOW_SECS))
         .unwrap_or(0)
         .saturating_add(BOOT_OFFSET_SECS)
@@ -652,7 +652,7 @@ fn uptime_secs(now: &DateTime<Utc>) -> u64 {
 
 /// [unverified] a load average that is small and moves with the clock, so repeated calls do not
 /// print one frozen figure: `(1, 5, 15 minutes)` in hundredths.
-fn load_average(now: &DateTime<Utc>) -> String {
+pub(super) fn load_average(now: &DateTime<Utc>) -> String {
     let t = now.timestamp().rem_euclid(86_400 * 7);
     let hundredths =
         |base: i64, step: i64, span: i64| base.saturating_add(t.div_euclid(step).rem_euclid(span));
@@ -671,7 +671,7 @@ fn plural(count: u64, unit: &str) -> String {
 }
 
 /// procps' short form: `3 days,  3:17`, `1 day,  2:05`, ` 3:17`, `17 min`.
-fn uptime_short(secs: u64) -> String {
+pub(super) fn uptime_short(secs: u64) -> String {
     let days = secs.checked_div(86_400).unwrap_or(0);
     let hours = (secs % 86_400).checked_div(3_600).unwrap_or(0);
     let minutes = (secs % 3_600).checked_div(60).unwrap_or(0);

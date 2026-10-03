@@ -334,6 +334,12 @@ impl PidAlloc {
         self.next = self.next.saturating_add(1);
         pid
     }
+
+    /// The id the next process would take: every id below it, past the shell's own, was handed
+    /// out to something this session started.
+    pub(super) fn peek(&self) -> u32 {
+        self.next
+    }
 }
 
 /// Where one of a command's descriptors goes.

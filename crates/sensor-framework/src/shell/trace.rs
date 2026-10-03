@@ -160,6 +160,15 @@ pub enum HandlerId {
     /// `env` and `printenv`: the session's exported variables, sorted, and `env`'s scoped command.
     Env,
     Printenv,
+    /// `ps` and `top`, `pgrep` and `pidof`, and `kill`, `killall` and `pkill`: the modeled process
+    /// table, read and "signaled" without anything being touched.
+    Ps,
+    Top,
+    Pgrep,
+    Pidof,
+    Kill,
+    Killall,
+    Pkill,
     Sleep,
     Cd,
     Su,

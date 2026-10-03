@@ -562,16 +562,16 @@ fn sh_holds_file(sh: &mut FakeShell, name: &str) -> bool {
 
 /// The names dispatch runs that no `$PATH` directory holds a file for are reported at the standard
 /// directory. They are pinned so a filesystem change that adds or drops one is a decision: on the
-/// 2026-09-29 Ubuntu 22.04 recording `tftp`, `ftpget`, `hexdump` and `ash` are absent, and `more` is
+/// 2026-09-29 Ubuntu 22.04 recording `tftp`, `ftpget` and `ash` are absent, and `more` is
 /// a util-linux file the modeled filesystem does not hold yet, as are `arch` and `printenv`
 /// (coreutils files no capture has the image of), and `top`, `pgrep` and `pkill` (procps), `pidof`
 /// (sysvinit-utils) and `killall` (psmisc), which the process table answers for and no capture
 /// has the image of either (`ps` and `kill` are recorded, so they have files), and `ip` and `ss`
 /// (iproute2), which the network model answers for and no capture has the image of, and `du`
-/// (coreutils), whose image is not in the recording either (`df` and `free` are), and `file`
-/// (the `file` package), likewise unrecorded (`stat` and `find` are recorded), and `getent`, `dig`
-/// and `nslookup` (the C library and bind9 packages), which the static name model answers for and
-/// no capture has the image of, and `xxd` (vim) and `strings` (binutils), likewise unrecorded.
+/// (coreutils), whose image is not in the recording either (`df` and `free` are), and `getent`,
+/// `dig` and `nslookup` (the C library and bind9 packages), which the static name model answers
+/// for and no capture has the image of. `file`, `xxd`, `hexdump` and `strings` are not here: the
+/// first is no command at all, the others resolve only as BusyBox applets.
 #[test]
 fn the_names_reported_without_a_file_are_the_pinned_ones() {
     let mut sh = shell();
@@ -589,9 +589,8 @@ fn the_names_reported_without_a_file_are_the_pinned_ones() {
     assert_eq!(
         without_file,
         [
-            "arch", "ash", "dig", "du", "file", "ftpget", "getent", "hexdump", "ip", "killall",
-            "more", "nslookup", "pgrep", "pidof", "pkill", "printenv", "ss", "strings", "tftp",
-            "top", "xxd"
+            "arch", "ash", "dig", "du", "ftpget", "getent", "ip", "killall", "more", "nslookup",
+            "pgrep", "pidof", "pkill", "printenv", "ss", "tftp", "top"
         ]
     );
 }

@@ -164,9 +164,8 @@ pub enum HandlerId {
     Free,
     Df,
     Du,
-    /// `stat`, `file` and `find`: metadata, identification and a bounded walk of the modeled tree.
+    /// `stat` and `find`: metadata and a bounded walk of the modeled tree.
     Stat,
-    File,
     Find,
     /// `env` and `printenv`: the session's exported variables, sorted, and `env`'s scoped command.
     Env,
@@ -574,7 +573,6 @@ mod tests {
             ("head -n 1 /etc/hostname", HandlerId::Head),
             ("tail -n 1 /etc/hostname", HandlerId::Tail),
             ("more /etc/hostname", HandlerId::More),
-            ("hexdump -C /etc/hostname", HandlerId::Hexdump),
             ("dd if=/etc/hostname", HandlerId::Dd),
             ("readlink /bin", HandlerId::Readlink),
             ("realpath /bin", HandlerId::Realpath),
@@ -583,8 +581,6 @@ mod tests {
             ("wc -c /etc/hostname", HandlerId::Wc),
             ("grep -F a /etc/hostname", HandlerId::Grep),
             ("od -An -tx1 /etc/hostname", HandlerId::Od),
-            ("xxd /etc/hostname", HandlerId::Xxd),
-            ("strings /etc/hostname", HandlerId::Strings),
             ("command -v ls", HandlerId::CommandBuiltin),
             ("type ls", HandlerId::Type),
             ("which ls", HandlerId::Which),
@@ -627,6 +623,19 @@ mod tests {
             let mut sh = shell();
             sh.handle_input(line);
             assert_eq!(only_command(&sh).resolved, *want, "{line}");
+        }
+
+        // Absent as files on Ubuntu, so they dispatch only as BusyBox applets.
+        for (line, want) in [
+            ("busybox hexdump -C /etc/hostname", HandlerId::Hexdump),
+            ("busybox xxd /etc/hostname", HandlerId::Xxd),
+            ("busybox strings /etc/hostname", HandlerId::Strings),
+        ] {
+            let mut sh = shell();
+            sh.handle_input(line);
+            let outer = only_command(&sh);
+            assert_eq!(outer.resolved, HandlerId::Busybox, "{line}");
+            assert_eq!(outer.reentry[0].resolved, want, "{line}");
         }
 
         // `enable` outside bash is not a builtin.

@@ -1,14 +1,11 @@
-//! `stat`, `file` and `find` through `handle_input`. No capture backs the layouts, so the cases check
+//! `stat` and `find` through `handle_input`. No capture backs the layouts, so the cases check
 //! what must hold regardless: a `stat` figure is the one the filesystem holds (and agrees with
-//! `wc`, `df` and `ls`), `file`'s ELF line agrees with the modeled binary and the persona, and
-//! `find` lists exactly the modeled nodes, sorted, inside its bounds. The exact-layout cases pin the
+//! `wc`, `df` and `ls`), and `find` lists exactly the modeled nodes, sorted, inside its bounds. The exact-layout cases pin the
 //! wording the module claims.
 
-use super::fileinfo::{FILE_PROBE, FIND_DEPTH_MAX, FIND_VISIT_MAX};
+use super::fileinfo::{FIND_DEPTH_MAX, FIND_VISIT_MAX};
 use super::{CommandResult, EmitContext, FakeShell, HandlerId, OutputFd};
-use crate::binaries::BINARIES;
 use crate::fakefs::{Blob, FakeFs};
-use crate::persona;
 
 fn ctx() -> EmitContext {
     EmitContext {
@@ -87,10 +84,6 @@ fn tree(sh: &mut FakeShell) {
     for (path, bytes) in files {
         sh.fs.write_file(path, &bytes).unwrap();
     }
-}
-
-fn hex(text: &str) -> bool {
-    text.len() == 40 && text.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 // ------------------------------------------------------------------------------------------ stat
@@ -380,233 +373,6 @@ fn stat_options_it_lacks_are_refused_and_unmodeled_ones_print_nothing() {
             .parse::<u64>()
             .is_ok()
     );
-}
-
-// ------------------------------------------------------------------------------------------ file
-
-#[test]
-fn file_of_a_modeled_binary_is_an_elf_line_that_matches_the_persona() {
-    let mut sh = shell();
-    let ls = out(&mut sh, "file /bin/ls");
-    let tail = ls
-        .strip_prefix("/bin/ls: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=")
-        .unwrap_or_else(|| panic!("{ls}"));
-    let id = tail
-        .strip_suffix(", for GNU/Linux 3.2.0, stripped\n")
-        .unwrap_or_else(|| panic!("{ls}"));
-    assert!(hex(id), "{ls}");
-    let bb = out(&mut sh, "file /bin/busybox");
-    let tail = bb
-        .strip_prefix("/bin/busybox: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), statically linked, BuildID[sha1]=")
-        .unwrap_or_else(|| panic!("{bb}"));
-    assert!(tail.ends_with(", for GNU/Linux 3.2.0, stripped\n"), "{bb}");
-    // The build id is a function of the image: stable, and not shared between binaries.
-    assert_eq!(ls, out(&mut sh, "file /bin/ls"));
-    assert_eq!(
-        ls,
-        out(&mut sh, "file /usr/bin/ls").replace("/usr/bin/ls", "/bin/ls")
-    );
-    assert_ne!(
-        out(&mut sh, "file -b /bin/ls"),
-        out(&mut sh, "file -b /bin/cat")
-    );
-    // The architecture is the persona's: `uname -m`, and every modeled binary's machine.
-    assert_eq!(persona::ARCH, "x86_64");
-    assert_eq!(out(&mut sh, "uname -m"), "x86_64\n");
-    for binary in BINARIES {
-        let line = out(&mut sh, &format!("file {}", binary.path));
-        assert!(
-            line.contains(": ELF 64-bit LSB ") && line.contains(", x86-64, version 1 ("),
-            "{}: {line}",
-            binary.name
-        );
-    }
-    // A saved copy of the busybox image is still that image.
-    out(&mut sh, "cp /bin/busybox /tmp/bb");
-    assert_eq!(
-        out(&mut sh, "file -b /tmp/bb"),
-        out(&mut sh, "file -b /bin/busybox")
-    );
-}
-
-#[test]
-fn file_reads_the_machine_from_the_header_it_is_given() {
-    let mut sh = shell();
-    // 52 bytes of an ARM EABI5 executable header, as bytes the session wrote.
-    let mut header = vec![0x7f, b'E', b'L', b'F', 1, 1, 1, 0];
-    header.resize(16, 0);
-    header.extend([2, 0, 0x28, 0]);
-    header.resize(36, 0);
-    header.extend([0, 0, 0, 5]);
-    header.resize(52, 0);
-    sh.fs.write_file("/tmp/arm", &header).unwrap();
-    assert_eq!(
-        out(&mut sh, "file /tmp/arm"),
-        "/tmp/arm: ELF 32-bit LSB executable, ARM, EABI5 version 1 (SYSV)\n"
-    );
-    assert_eq!(
-        out(&mut sh, "file -i /tmp/arm"),
-        "/tmp/arm: application/x-executable; charset=binary\n"
-    );
-    // Four bytes of magic are not a header.
-    sh.fs.write_file("/tmp/stub", b"\x7fELF").unwrap();
-    assert_eq!(out(&mut sh, "file -b /tmp/stub"), "data\n");
-}
-
-#[test]
-fn file_of_text_is_ascii_text_and_the_other_kinds_are_named() {
-    let mut sh = shell();
-    let cases: Vec<(&[u8], &str)> = vec![
-        (b"hello\n", "ASCII text"),
-        (b"hello", "ASCII text, with no line terminators"),
-        (b"a\r\nb\r\n", "ASCII text, with CRLF line terminators"),
-        (b"a\r\nb\n", "ASCII text, with CRLF, LF line terminators"),
-        (b"", "empty"),
-        (&[0, 1, 2, 255], "data"),
-        ("h\u{e9}llo\n".as_bytes(), "UTF-8 Unicode text"),
-        (
-            b"#!/bin/sh\necho hi\n",
-            "POSIX shell script, ASCII text executable",
-        ),
-        (
-            b"#!/usr/bin/env bash\nls\n",
-            "Bourne-Again shell script, ASCII text executable",
-        ),
-    ];
-    for (bytes, expected) in cases {
-        sh.fs.write_file("/tmp/f", bytes).unwrap();
-        assert_eq!(
-            answer(&mut sh, "file /tmp/f"),
-            (format!("/tmp/f: {expected}\n"), "".into(), 0),
-            "{bytes:?}"
-        );
-    }
-    sh.fs.write_file("/tmp/f", &[b'a'; 400]).unwrap();
-    assert_eq!(
-        out(&mut sh, "file -b /tmp/f"),
-        "ASCII text, with very long lines (400), with no line terminators\n"
-    );
-    // What `echo` wrote is read back as the text it is.
-    out(&mut sh, "echo hello > /tmp/e");
-    assert_eq!(out(&mut sh, "file /tmp/e"), "/tmp/e: ASCII text\n");
-    assert_eq!(
-        out(&mut sh, "file /etc/passwd"),
-        "/etc/passwd: ASCII text\n"
-    );
-}
-
-#[test]
-fn file_names_a_directory_a_link_a_device_and_a_missing_path() {
-    let mut sh = shell();
-    assert_eq!(out(&mut sh, "file /tmp"), "/tmp: directory\n");
-    assert_eq!(
-        out(&mut sh, "file /bin"),
-        "/bin: symbolic link to usr/bin\n"
-    );
-    assert_eq!(out(&mut sh, "file -L /bin"), "/bin: directory\n");
-    assert_eq!(
-        out(&mut sh, "file /dev/null"),
-        "/dev/null: character special (1/3)\n"
-    );
-    out(&mut sh, "ln -s /nope /tmp/dang");
-    assert_eq!(
-        out(&mut sh, "file /tmp/dang"),
-        "/tmp/dang: symbolic link to /nope\n"
-    );
-    assert_eq!(
-        out(&mut sh, "file -L /tmp/dang"),
-        "/tmp/dang: broken symbolic link to /nope\n"
-    );
-    assert_eq!(
-        answer(&mut sh, "file /nope"),
-        (
-            "/nope: cannot open `/nope' (No such file or directory)\n".into(),
-            "".into(),
-            0
-        )
-    );
-}
-
-#[test]
-fn file_brief_mime_padding_and_stdin() {
-    let mut sh = shell();
-    sh.fs.write_file("/tmp/a", b"hi\n").unwrap();
-    sh.fs.write_file("/tmp/bbb", b"").unwrap();
-    assert_eq!(out(&mut sh, "file -b /tmp/a"), "ASCII text\n");
-    assert_eq!(
-        out(&mut sh, "file /tmp/a /tmp/bbb"),
-        "/tmp/a:   ASCII text\n/tmp/bbb: empty\n"
-    );
-    assert_eq!(
-        out(&mut sh, "file -b /tmp/a /tmp/bbb"),
-        "ASCII text\nempty\n"
-    );
-    for (line, expected) in [
-        ("file -i /tmp/a", "/tmp/a: text/plain; charset=us-ascii\n"),
-        (
-            "file --mime /tmp/a",
-            "/tmp/a: text/plain; charset=us-ascii\n",
-        ),
-        ("file --mime-type /tmp/a", "/tmp/a: text/plain\n"),
-        ("file -bi /tmp/bbb", "inode/x-empty; charset=binary\n"),
-        ("file -i /tmp", "/tmp: inode/directory; charset=binary\n"),
-        ("file -i /bin", "/bin: inode/symlink; charset=binary\n"),
-        (
-            "file -bi /bin/ls",
-            "application/x-pie-executable; charset=binary\n",
-        ),
-        (
-            "file -bi /bin/busybox",
-            "application/x-executable; charset=binary\n",
-        ),
-        (
-            "file -i /dev/null",
-            "/dev/null: inode/chardevice; charset=binary\n",
-        ),
-    ] {
-        assert_eq!(out(&mut sh, line), expected, "{line}");
-    }
-    assert_eq!(out(&mut sh, "echo hi | file -"), "/dev/stdin: ASCII text\n");
-    // `-s` and `-z` change nothing here.
-    assert_eq!(out(&mut sh, "file -sz /tmp/a"), out(&mut sh, "file /tmp/a"));
-}
-
-#[test]
-fn file_errors_and_unmodeled_options() {
-    let mut sh = shell();
-    let (stdout, stderr, status) = answer(&mut sh, "file");
-    assert_eq!((stdout.as_str(), status), ("", 1));
-    assert!(
-        stderr.starts_with("Usage: file [-bcdEhiklLNnprsSvzZ0]"),
-        "{stderr}"
-    );
-    let (_, stderr, status) = answer(&mut sh, "file -y /etc");
-    assert_eq!(status, 1);
-    assert!(
-        stderr.starts_with("file: invalid option -- 'y'\n"),
-        "{stderr}"
-    );
-    assert_eq!(answer(&mut sh, "file --bogus /etc").2, 1);
-    for line in [
-        "file -k /etc/passwd",
-        "file --apple /etc/passwd",
-        "file -f /etc/passwd",
-        "file --extension /etc/passwd",
-        "file --help",
-    ] {
-        assert_eq!(answer(&mut sh, line), ("".into(), "".into(), 0), "{line}");
-    }
-}
-
-#[test]
-fn file_reads_a_bounded_prefix_of_a_huge_file() {
-    let mut sh = shell();
-    sh.fs
-        .write_blob("/tmp/big", Blob::fill(0, 50_000_000), 0o100_644)
-        .unwrap();
-    assert_eq!(out(&mut sh, "file /tmp/big"), "/tmp/big: data\n");
-    let charged = sh.last_trace().budget.work_charged;
-    assert!(charged <= FILE_PROBE + 512, "charged {charged}");
 }
 
 // ------------------------------------------------------------------------------------------ find
@@ -1257,17 +1023,12 @@ fn busybox_routes_to_stat_and_find_with_its_own_error_wording() {
             1
         )
     );
-    // `file` is not a BusyBox applet.
-    assert_eq!(
-        answer(&mut sh, "busybox file /etc"),
-        ("".into(), "file: applet not found\n".into(), 127)
-    );
 }
 
 // -------------------------------------------------------------------------- registration and scope
 
 #[test]
-fn stat_and_find_exist_on_both_personas_and_file_on_ubuntu_only() {
+fn stat_and_find_exist_on_both_personas() {
     for (name, id) in [("stat", HandlerId::Stat), ("find", HandlerId::Find)] {
         let mut sh = shell();
         assert_eq!(
@@ -1312,39 +1073,72 @@ fn stat_and_find_exist_on_both_personas_and_file_on_ubuntu_only() {
             "{name}"
         );
     }
+}
+
+/// The 2026-09-29 Ubuntu 22.04 recording marks `file`, `xxd` and `hexdump` absent (and never
+/// probed `strings`). `file` is no BusyBox applet, so it is not found however it is reached; the
+/// other three are applets, so only `busybox NAME` runs them.
+/// `name` is "command not found" bare, on the Ubuntu persona and the phone, to `command -v` and to
+/// dispatch alike.
+fn assert_not_a_bare_command(name: &str) {
+    for mut sh in [shell(), phone()] {
+        let (stdout, stderr, status) = answer(&mut sh, &format!("{name} /etc/hostname"));
+        assert_eq!((stdout.as_str(), status), ("", 127), "{name}");
+        assert!(stderr.contains("not found"), "{name}: {stderr}");
+        assert_eq!(
+            sh.last_trace().segments[0]
+                .command
+                .as_ref()
+                .unwrap()
+                .resolved,
+            HandlerId::NotFound,
+            "{name}"
+        );
+        assert_eq!(
+            answer(&mut sh, &format!("command -v {name}")),
+            ("".into(), "".into(), 1),
+            "{name}"
+        );
+    }
+}
+
+/// The applet runs on the Ubuntu persona and reaches its own handler.
+fn assert_busybox_applet(args: &str, handler: HandlerId) {
     let mut sh = shell();
-    assert_eq!(out(&mut sh, "command -v file"), "/usr/bin/file\n");
-    sh.handle_input("file /etc/hostname");
+    let (stdout, stderr, status) = answer(&mut sh, &format!("busybox {args} /etc/hostname"));
+    assert_eq!(status, 0, "busybox {args}: {stderr}");
+    assert!(!stdout.is_empty(), "busybox {args}");
+    let outer = sh.last_trace().segments[0].command.as_ref().unwrap();
+    assert_eq!(outer.reentry[0].resolved, handler, "busybox {args}");
+}
+
+#[test]
+fn file_is_not_a_command_on_any_persona_or_path() {
+    assert_not_a_bare_command("file");
+    let mut sh = shell();
     assert_eq!(
-        sh.last_trace().segments[0]
-            .command
-            .as_ref()
-            .unwrap()
-            .resolved,
-        HandlerId::File
+        answer(&mut sh, "busybox file /etc"),
+        ("".into(), "file: applet not found\n".into(), 127)
     );
-    // toybox has no `file`: the phone answers not found and advertises no such file.
-    let mut ph = phone();
-    assert_eq!(
-        answer(&mut ph, "command -v file"),
-        ("".into(), "".into(), 1)
-    );
-    assert!(
-        !ph.fs
-            .list_dir("/system/bin")
-            .unwrap()
-            .contains(&"file".to_string())
-    );
-    let (stdout, _, status) = answer(&mut ph, "file /system/bin/sh");
-    assert_eq!((stdout.as_str(), status), ("", 127));
-    assert_eq!(
-        ph.last_trace().segments[0]
-            .command
-            .as_ref()
-            .unwrap()
-            .resolved,
-        HandlerId::NotFound
-    );
+}
+
+#[test]
+fn xxd_is_absent_bare_and_runs_only_as_a_busybox_applet() {
+    assert_not_a_bare_command("xxd");
+    assert_busybox_applet("xxd", HandlerId::Xxd);
+}
+
+#[test]
+fn hexdump_is_absent_bare_and_runs_only_as_a_busybox_applet() {
+    assert_not_a_bare_command("hexdump");
+    // `hexdump` prints a dump only for the one raw-character format the model carries.
+    assert_busybox_applet("hexdump -e '16/1 \"%c\"'", HandlerId::Hexdump);
+}
+
+#[test]
+fn strings_is_absent_bare_and_runs_only_as_a_busybox_applet() {
+    assert_not_a_bare_command("strings");
+    assert_busybox_applet("strings", HandlerId::Strings);
 }
 
 #[test]
@@ -1360,7 +1154,6 @@ fn the_commands_read_the_model_and_change_nothing() {
     for line in [
         "stat /etc/passwd /bin/ls /tmp/t",
         "stat -f /",
-        "file /bin/ls /etc/passwd /tmp/t",
         "find / -name passwd",
         "find /tmp/t | cat",
         "stat /tmp/t | cat",

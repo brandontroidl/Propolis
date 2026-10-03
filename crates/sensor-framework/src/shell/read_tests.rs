@@ -71,37 +71,43 @@ fn hexdump_of_the_raw_character_format_is_the_first_52_bytes_and_no_newline() {
     let expected = &ls_image()[..52];
     for line in [
         "/bin/busybox hexdump -e '16/1 \"%c\"' -n 52 /bin/ls",
-        "hexdump -e '16/1 \"%c\"' -n 52 /bin/ls",
-        "hexdump -n 52 -e '16/1 \"%c\"' /bin/ls",
-        "hexdump -n52 -e'16/1 \"%c\"' /bin/ls",
-        "cat /bin/ls | hexdump -e '16/1 \"%c\"' -n 52",
+        "busybox hexdump -e '16/1 \"%c\"' -n 52 /bin/ls",
+        "busybox hexdump -n 52 -e '16/1 \"%c\"' /bin/ls",
+        "busybox hexdump -n52 -e'16/1 \"%c\"' /bin/ls",
+        "cat /bin/ls | busybox hexdump -e '16/1 \"%c\"' -n 52",
     ] {
         let out = run(&mut shell(), line);
         assert_eq!(out.status, 0, "{line}");
         assert_eq!(out.bytes(), expected, "{line}");
     }
     // Without -n the format prints the whole file, still raw.
-    let out = run(&mut shell(), "hexdump -e '16/1 \"%c\"' /bin/ls");
+    let out = run(&mut shell(), "busybox hexdump -e '16/1 \"%c\"' /bin/ls");
     assert_eq!(out.bytes(), ls_image().as_slice());
 }
 
 #[test]
 fn a_hexdump_format_that_is_not_modeled_prints_no_dump() {
     for line in [
-        "hexdump -C /bin/ls",
-        "hexdump /bin/ls",
-        "hexdump -e '16/1 \"%02x \"' -n 52 /bin/ls",
-        "hexdump -e '16/1 \"%c\"' -e '16/1 \"%c\"' /bin/ls",
-        "hexdump -e '16/1 \"%c\"' -s 4 /bin/ls",
-        "hexdump -e '16/1 \"%c\"' -n x /bin/ls",
+        "busybox hexdump -C /bin/ls",
+        "busybox hexdump /bin/ls",
+        "busybox hexdump -e '16/1 \"%02x \"' -n 52 /bin/ls",
+        "busybox hexdump -e '16/1 \"%c\"' -e '16/1 \"%c\"' /bin/ls",
+        "busybox hexdump -e '16/1 \"%c\"' -s 4 /bin/ls",
+        "busybox hexdump -e '16/1 \"%c\"' -n x /bin/ls",
     ] {
         let out = run(&mut shell(), line);
         assert_eq!((out.status, out.bytes()), (0, &b""[..]), "{line}");
     }
     // Identical 16-byte groups would be squeezed to `*` by the real tool; not modeled either.
-    let out = run(&mut shell(), "hexdump -e '16/1 \"%c\"' -n 64 /dev/zero");
+    let out = run(
+        &mut shell(),
+        "busybox hexdump -e '16/1 \"%c\"' -n 64 /dev/zero",
+    );
     assert_eq!((out.status, out.bytes()), (0, &b""[..]));
-    let out = run(&mut shell(), "hexdump -v -e '16/1 \"%c\"' -n 64 /dev/zero");
+    let out = run(
+        &mut shell(),
+        "busybox hexdump -v -e '16/1 \"%c\"' -n 64 /dev/zero",
+    );
     assert_eq!(out.bytes(), vec![0u8; 64].as_slice());
 }
 
@@ -387,7 +393,7 @@ fn tail_only_reads_modeled_bytes_and_runs_nothing() {
 #[test]
 fn hexdump_and_more_report_a_missing_file_and_fail() {
     let mut sh = shell();
-    let out = run(&mut sh, "hexdump -e '16/1 \"%c\"' /nosuch");
+    let out = run(&mut sh, "busybox hexdump -e '16/1 \"%c\"' /nosuch");
     assert_eq!(
         (out.status, out.to_string().as_str()),
         (1, "hexdump: /nosuch: No such file or directory\n")

@@ -33,10 +33,17 @@ pub(super) fn register(r: &mut Registry) {
     r.register_if("more", ubuntu, HandlerId::More, FakeShell::cmd_more);
     r.register_if(
         "hexdump",
-        ubuntu,
+        has_hexdump,
         HandlerId::Hexdump,
         FakeShell::cmd_hexdump,
     );
+}
+
+/// The Ubuntu recording marks `hexdump` absent (binaries table, 2026-09-29), but BusyBox has it
+/// as an applet, so it resolves only under `busybox hexdump` (`cmd_busybox` raises `busybox_depth`
+/// before it resolves the applet). The phone has none.
+fn has_hexdump(shell: &FakeShell, _parts: &[&str]) -> bool {
+    shell.busybox_depth > 0
 }
 
 fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {

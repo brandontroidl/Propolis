@@ -1,4 +1,4 @@
-//! `stat`, `file` and `find`: the reads an enumeration script makes of the filesystem once `ls`
+//! `stat` and `find`: the reads an enumeration script makes of the filesystem once `ls`
 //! and `cat` have shown it what is there, answered from the modeled tree so none of them can
 //! disagree with it.
 //!
@@ -7,10 +7,7 @@
 //! from the node's physical path, so it is stable and equal for two names of one file: the inode,
 //! the device number (from the mount table) and the link count of a directory (its subdirectories
 //! plus two). The three timestamps are the node's modeled mtime, a constant of the persona, so a
-//! replay prints the same bytes and nothing here calls the system clock. `file` identifies a
-//! regular file from its modeled bytes: an ELF header (rendered from the node's recorded header,
-//! so it agrees with the modeled binary and the persona architecture), `empty`, text, or `data`.
-//! `find` walks the modeled tree in a walk bounded in depth, in nodes visited and in output, each
+//! replay prints the same bytes and nothing here calls the system clock. `find` walks the modeled tree in a walk bounded in depth, in nodes visited and in output, each
 //! node charged to the line's work allowance, children sorted so a replay is byte-identical.
 //!
 //! `find` never runs anything: `-exec`, `-ok`, `-delete` and the other predicates that act or
@@ -19,7 +16,8 @@
 //! the host or starts a process.
 //!
 //! `stat` and `find` exist on both personas (coreutils and findutils on Ubuntu, toybox on the
-//! phone, BusyBox as an applet of either). `file` is Ubuntu only: toybox has no `file`.
+//! phone, BusyBox as an applet of either). There is no `file` command on any persona: the Ubuntu
+//! 22.04 recording marks it absent (binaries table, 2026-09-29) and it is not a BusyBox applet.
 //!
 //! No capture backs any layout or wording here beyond the persona's own binaries: the formats are
 //! composed from knowledge of the tools. Values marked `[unverified]` are the least certain.
@@ -32,24 +30,16 @@
 use std::cmp::Ordering;
 
 use chrono::DateTime;
-use sha1::{Digest, Sha1};
 
 use super::registry::Registry;
 use super::sysres::{DU_DEPTH_MAX, DU_VISIT_MAX, Syntax, Tok, ceil_div, disks, scan};
 use super::texttools::stopped;
 use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
-use crate::binaries;
-use crate::fakefs::{ELF_HEADER_LEN, ElfImage, FileKind, MountEntry, Stat};
+use crate::fakefs::{FileKind, MountEntry, Stat};
 
 pub(super) fn register(r: &mut Registry) {
     r.register("stat", HandlerId::Stat, FakeShell::cmd_stat);
     r.register("find", HandlerId::Find, FakeShell::cmd_find);
-    // toybox has no `file`, and the phone answers "not found".
-    r.register_if("file", ubuntu, HandlerId::File, FakeShell::cmd_file);
-}
-
-fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {
-    shell.flavor == ShellFlavor::Bash
 }
 
 /// Directories `find` descends below an operand, as `du` does.
@@ -60,8 +50,6 @@ pub(super) const FIND_VISIT_MAX: u32 = DU_VISIT_MAX;
 const FIND_OUT_MAX: usize = 65_536;
 /// Children of one directory examined to count its subdirectories for `stat`'s link count.
 const LINK_SCAN_MAX: usize = 4_096;
-/// The most bytes of a file `file` examines.
-pub(super) const FILE_PROBE: u64 = 65_536;
 /// The block `stat` sizes a file in and rounds a directory to, as ext4 allocates.
 const BLOCK: u64 = 4_096;
 
@@ -811,448 +799,6 @@ fn with_newline(mut out: String, printf: bool) -> String {
         out.push('\n');
     }
     out
-}
-
-// ------------------------------------------------------------------------------------------ file
-
-const FILE_SHORTS: &str = "bcdEhiklLnNprsSvzZ0efFmP";
-
-const FILE_LONGS: &[(&str, bool)] = &[
-    ("brief", false),
-    ("mime", false),
-    ("mime-type", false),
-    ("mime-encoding", false),
-    ("dereference", false),
-    ("no-dereference", false),
-    ("special-files", false),
-    ("uncompress", false),
-    ("uncompress-noreport", false),
-    ("keep-going", false),
-    ("raw", false),
-    ("no-pad", false),
-    ("preserve-date", false),
-    ("no-buffer", false),
-    ("no-sandbox", false),
-    ("apple", false),
-    ("extension", false),
-    ("print0", false),
-    ("debug", false),
-    ("exclude", true),
-    ("exclude-quiet", true),
-    ("files-from", true),
-    ("separator", true),
-    ("magic-file", true),
-    ("parameter", true),
-    ("checking-printout", false),
-    ("compile", false),
-    ("list", false),
-    ("help", false),
-    ("version", false),
-];
-
-const FILE_USAGE: &str = "Usage: file [-bcdEhiklLNnprsSvzZ0] [--apple] [--extension] [--mime-encoding]\n            [--mime-type] [-e testname] [-F separator] [-f namefile] [-m magicfiles] file ...\n        file -C [-m magicfile]\n        file [--help]\n";
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MimeMode {
-    Off,
-    Full,
-    TypeOnly,
-}
-
-/// What `file` concluded about one operand.
-struct Described {
-    text: String,
-    /// The MIME type and charset, `None` for an operand that could not be opened.
-    mime: Option<(String, &'static str)>,
-}
-
-impl Described {
-    fn of(text: impl Into<String>, mime: &str, charset: &'static str) -> Self {
-        Self {
-            text: text.into(),
-            mime: Some((mime.to_string(), charset)),
-        }
-    }
-}
-
-fn elf_machine(machine: u16) -> String {
-    match machine {
-        0x3e => "x86-64".to_string(),
-        0x03 => "Intel 80386".to_string(),
-        0x28 => "ARM".to_string(),
-        0xb7 => "ARM aarch64".to_string(),
-        other => format!("*unknown arch 0x{other:x}*"),
-    }
-}
-
-/// The dynamic loader a modeled image of this machine names.
-fn elf_interpreter(machine: u16) -> &'static str {
-    match machine {
-        0x03 => "/lib/ld-linux.so.2",
-        0x28 => "/lib/ld-linux-armhf.so.3",
-        0xb7 => "/lib/ld-linux-aarch64.so.1",
-        _ => "/lib64/ld-linux-x86-64.so.2",
-    }
-}
-
-/// `file`'s ELF line from the first bytes of a file, or `None` when they are not an ELF header.
-/// Class, byte order, type, machine, ABI and (for ARM) the EABI come from the header itself. A
-/// modeled `image` (its length and whether it is the static busybox) adds what the 64 bytes
-/// cannot say: linkage, interpreter and a build id derived from the image, not from a real build
-/// [unverified: the layout, GNU/Linux 3.2.0 and `stripped` follow Ubuntu 22.04's `file` 5.41].
-fn elf_description(header: &[u8], image: Option<(u64, bool)>) -> Option<Described> {
-    if header.get(..4) != Some(&b"\x7fELF"[..]) || header.len() < 20 {
-        return None;
-    }
-    let class = match header.get(4)? {
-        1 => "32-bit",
-        2 => "64-bit",
-        _ => return None,
-    };
-    let big = match header.get(5)? {
-        1 => false,
-        2 => true,
-        _ => return None,
-    };
-    let u16_at = |at: usize| -> Option<u16> {
-        let bytes: [u8; 2] = header.get(at..at.saturating_add(2))?.try_into().ok()?;
-        Some(if big {
-            u16::from_be_bytes(bytes)
-        } else {
-            u16::from_le_bytes(bytes)
-        })
-    };
-    let machine = u16_at(18)?;
-    let (kind, mime) = match u16_at(16)? {
-        1 => ("relocatable", "application/x-object"),
-        2 => ("executable", "application/x-executable"),
-        3 => ("pie executable", "application/x-pie-executable"),
-        4 => ("core file", "application/x-coredump"),
-        _ => return None,
-    };
-    let abi = match header.get(7)? {
-        0 => "SYSV".to_string(),
-        3 => "GNU/Linux".to_string(),
-        other => format!("OS/ABI {other}"),
-    };
-    let eabi = match (machine, header.get(36..40)) {
-        (0x28, Some(flags)) => {
-            let raw: [u8; 4] = flags.try_into().ok()?;
-            let word = if big {
-                u32::from_be_bytes(raw)
-            } else {
-                u32::from_le_bytes(raw)
-            };
-            match word >> 24 {
-                0 => String::new(),
-                n => format!("EABI{n} "),
-            }
-        }
-        _ => String::new(),
-    };
-    let mut line = format!(
-        "ELF {class} {} {kind}, {}, {eabi}version {} ({abi})",
-        if big { "MSB" } else { "LSB" },
-        elf_machine(machine),
-        header.get(6)?,
-    );
-    if let Some((len, is_static)) = image {
-        let mut hasher = Sha1::new();
-        hasher.update(header.get(..ELF_HEADER_LEN).unwrap_or(header));
-        hasher.update(len.to_le_bytes());
-        let build_id: String = hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        if is_static {
-            line.push_str(", statically linked");
-        } else {
-            line.push_str(&format!(
-                ", dynamically linked, interpreter {}",
-                elf_interpreter(machine)
-            ));
-        }
-        line.push_str(&format!(
-            ", BuildID[sha1]={build_id}, for GNU/Linux 3.2.0, stripped"
-        ));
-    }
-    Some(Described::of(line, mime, "binary"))
-}
-
-/// What a script's `#!` line names, as `file` describes it.
-fn script_kind(first_line: &str) -> Option<&'static str> {
-    let mut words = first_line.strip_prefix("#!")?.split_whitespace();
-    let mut program = words.next()?.rsplit('/').next()?;
-    if program == "env" {
-        program = words.next()?.rsplit('/').next()?;
-    }
-    match program {
-        "sh" | "dash" | "ash" => Some("POSIX shell script"),
-        "bash" => Some("Bourne-Again shell script"),
-        _ => None,
-    }
-}
-
-/// Whether `bytes` are text as `file` counts it: ASCII printable and the common controls, or
-/// UTF-8. `truncated` says the probe stopped before the file's end, so a character cut by it
-/// is not an error.
-fn text_charset(bytes: &[u8], truncated: bool) -> Option<&'static str> {
-    let control_ok =
-        |byte: u8| matches!(byte, 0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x1b);
-    let printable = |byte: u8| (byte >= 0x20 && byte != 0x7f) || control_ok(byte);
-    if bytes.iter().all(|&byte| byte < 0x80 && printable(byte)) {
-        return Some("us-ascii");
-    }
-    let valid = match std::str::from_utf8(bytes) {
-        Ok(_) => true,
-        Err(error) => error.error_len().is_none() && truncated,
-    };
-    let clean = bytes.iter().all(|&byte| byte >= 0x80 || printable(byte));
-    (valid && clean).then_some("utf-8")
-}
-
-/// `file`'s description of text: the line terminators and a very long line, after the charset.
-/// [unverified: the very-long-line threshold and wording.]
-fn text_description(bytes: &[u8], charset: &'static str) -> Described {
-    let mut crlf = 0u64;
-    let mut lf = 0u64;
-    let mut cr = 0u64;
-    let mut longest = 0usize;
-    let mut run = 0usize;
-    let mut i = 0usize;
-    while let Some(&byte) = bytes.get(i) {
-        let next = i.saturating_add(1);
-        match byte {
-            b'\r' if bytes.get(next) == Some(&b'\n') => {
-                crlf = crlf.saturating_add(1);
-                longest = longest.max(run);
-                run = 0;
-                i = i.saturating_add(2);
-                continue;
-            }
-            b'\r' => {
-                cr = cr.saturating_add(1);
-                longest = longest.max(run);
-                run = 0;
-            }
-            b'\n' => {
-                lf = lf.saturating_add(1);
-                longest = longest.max(run);
-                run = 0;
-            }
-            _ => run = run.saturating_add(1),
-        }
-        i = next;
-    }
-    longest = longest.max(run);
-    let first_line = bytes
-        .split(|byte| *byte == b'\n')
-        .next()
-        .map(|line| {
-            String::from_utf8_lossy(line)
-                .trim_end_matches('\r')
-                .to_string()
-        })
-        .unwrap_or_default();
-    let base = if charset == "utf-8" {
-        "UTF-8 Unicode text"
-    } else {
-        "ASCII text"
-    };
-    let script = script_kind(&first_line);
-    let mut text = match script {
-        Some(kind) => format!("{kind}, {base} executable"),
-        None => base.to_string(),
-    };
-    if longest > 300 {
-        text.push_str(&format!(", with very long lines ({longest})"));
-    }
-    let kinds: Vec<&str> = [(crlf, "CRLF"), (cr, "CR"), (lf, "LF")]
-        .iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(_, name)| *name)
-        .collect();
-    match kinds.as_slice() {
-        [] => text.push_str(", with no line terminators"),
-        ["LF"] => {}
-        many => text.push_str(&format!(", with {} line terminators", many.join(", "))),
-    }
-    let mime = if script.is_some() {
-        "text/x-shellscript"
-    } else {
-        "text/plain"
-    };
-    Described::of(text, mime, charset)
-}
-
-/// What `file` says of a regular file's bytes. `len` is its whole length, `image` its recorded
-/// image when it is one.
-fn describe_bytes(bytes: &[u8], len: u64, image: Option<ElfImage>) -> Described {
-    if len == 0 {
-        return Described::of("empty", "inode/x-empty", "binary");
-    }
-    let header = image
-        .as_ref()
-        .map_or(bytes, |image| image.header.as_slice());
-    let modeled = image.map(|image| (image.len, binaries::is_busybox(&image)));
-    if let Some(elf) = elf_description(header, modeled) {
-        return elf;
-    }
-    let truncated = len_u64(bytes.len()) < len;
-    match text_charset(bytes, truncated) {
-        Some(charset) => text_description(bytes, charset),
-        None => Described::of("data", "application/octet-stream", "binary"),
-    }
-}
-
-impl FakeShell {
-    fn describe_operand(
-        &mut self,
-        parts: &[&str],
-        name: &str,
-        deref: bool,
-    ) -> Result<Described, ()> {
-        if name == "-" {
-            let bytes = self.stdin.take(FILE_PROBE);
-            if !self.charge_work(len_u64(bytes.len())) {
-                return Err(());
-            }
-            return Ok(describe_bytes(&bytes, len_u64(bytes.len()), None));
-        }
-        let missing = || Described {
-            text: format!("cannot open `{name}' (No such file or directory)"),
-            mime: None,
-        };
-        if name.is_empty() {
-            return Ok(missing());
-        }
-        let logical = self.resolve_logical(name);
-        if !self.charge_work(1) {
-            return Err(());
-        }
-        let Some(stat) = self.fs.stat(&logical, deref) else {
-            // A dangling link is still a link to `file -L`.
-            return Ok(match self.fs.stat(&logical, false) {
-                Some(link) if link.kind == FileKind::Symlink => {
-                    let target = self.fs.link_target(&logical).unwrap_or_default();
-                    Described::of(
-                        format!("broken symbolic link to {target}"),
-                        "inode/symlink",
-                        "binary",
-                    )
-                }
-                _ => missing(),
-            });
-        };
-        Ok(match stat.kind {
-            FileKind::Directory => Described::of("directory", "inode/directory", "binary"),
-            FileKind::Symlink => {
-                let target = self.fs.link_target(&logical).unwrap_or_default();
-                Described::of(
-                    format!("symbolic link to {target}"),
-                    "inode/symlink",
-                    "binary",
-                )
-            }
-            FileKind::CharDevice => {
-                let (major, minor) = rdev_of(&stat.physical);
-                Described::of(
-                    format!("character special ({major}/{minor})"),
-                    "inode/chardevice",
-                    "binary",
-                )
-            }
-            FileKind::Regular => {
-                let probe = FILE_PROBE.min(self.read_cap());
-                let Ok(bytes) = self.read_operand(parts, name, 0, probe) else {
-                    return Ok(missing());
-                };
-                if !self.charge_work(len_u64(bytes.len())) {
-                    return Err(());
-                }
-                let image = self
-                    .fs
-                    .content_and_mode(&logical)
-                    .ok()
-                    .and_then(|(blob, _)| blob.as_elf());
-                describe_bytes(&bytes, stat.size, image)
-            }
-        })
-    }
-
-    /// `file [-b] [-i | --mime-type] [-L] [-s] [-z] FILE...`: each operand named, then described
-    /// from its modeled bytes or kind. A symlink is reported, not followed, unless `-L`. Options
-    /// outside these (`-f`, `-k`, `--apple`, ...) are not modeled: nothing is printed and the
-    /// status is 0. Ubuntu only.
-    pub(super) fn cmd_file(&mut self, parts: &[&str]) -> CommandResult {
-        let syn = Syntax {
-            cmd: "file",
-            android: false,
-            valued: "efFmP",
-            longs: FILE_LONGS,
-        };
-        let toks = match scan(parts.get(1..).unwrap_or(&[]), &syn) {
-            Ok(toks) => toks,
-            Err(error) => return error,
-        };
-        let (mut brief, mut deref) = (false, false);
-        let mut mime = MimeMode::Off;
-        let mut files: Vec<&str> = Vec::new();
-        for tok in &toks {
-            match tok {
-                Tok::Operand(path) => files.push(*path),
-                Tok::Short('b', _) | Tok::Long("brief", _) => brief = true,
-                Tok::Short('i', _) | Tok::Long("mime", _) => mime = MimeMode::Full,
-                Tok::Long("mime-type", _) => mime = MimeMode::TypeOnly,
-                Tok::Short('L', _) | Tok::Long("dereference", _) => deref = true,
-                Tok::Short('h', _) | Tok::Long("no-dereference", _) => deref = false,
-                // Block devices are not modeled, and nothing here is compressed.
-                Tok::Short('s' | 'z', _) | Tok::Long("special-files" | "uncompress", _) => {}
-                Tok::Short(flag, _) if !FILE_SHORTS.contains(*flag) => return syn.bad_short(*flag),
-                Tok::Short(..) | Tok::Long(..) => return CommandResult::silent(0),
-            }
-        }
-        if files.is_empty() {
-            return CommandResult::stderr(1, FILE_USAGE);
-        }
-        let mut lines = Vec::new();
-        for file in &files {
-            match self.describe_operand(parts, file, deref) {
-                Ok(described) => lines.push((*file, described)),
-                Err(()) => return stopped(),
-            }
-        }
-        let shown = |name: &str| {
-            if name == "-" {
-                "/dev/stdin".to_string()
-            } else {
-                name.to_string()
-            }
-        };
-        let width = files
-            .iter()
-            .map(|name| shown(name).chars().count())
-            .max()
-            .unwrap_or(0);
-        let mut out = String::new();
-        for (name, described) in lines {
-            let body = match (&described.mime, mime) {
-                (Some((kind, charset)), MimeMode::Full) => format!("{kind}; charset={charset}"),
-                (Some((kind, _)), MimeMode::TypeOnly) => kind.clone(),
-                _ => described.text,
-            };
-            if brief {
-                out.push_str(&body);
-            } else {
-                let name = shown(name);
-                let fill = width.saturating_sub(name.chars().count());
-                out.push_str(&format!("{name}:{} {body}", " ".repeat(fill)));
-            }
-            out.push('\n');
-        }
-        CommandResult::stdout(out)
-    }
 }
 
 // ------------------------------------------------------------------------------------------ find

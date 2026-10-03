@@ -7,9 +7,9 @@
 //! format outside the ones below (`xxd -i`, `-b`, `-a`, `strings -e`, `-f`) prints nothing and
 //! succeeds, never a dump this shell made up.
 //!
-//! Both are applets of the captured BusyBox, so `busybox xxd` and `busybox strings` land here. They
-//! exist on the Ubuntu persona only: the phone's toolbox has no `xxd` (toybox gained one long
-//! after this device's release) and no recorded `strings`, and answers "not found" for both.
+//! Both are applets of the captured BusyBox, so `busybox xxd` and `busybox strings` land here, on
+//! the Ubuntu persona. Bare, both are "command not found" on every persona: the Ubuntu recording
+//! marks `xxd` absent (binaries table, 2026-09-29), and the phone's toolbox has neither.
 //!
 //! The layouts are `xxd` from vim's tree and GNU binutils `strings` as run on a current host; no
 //! capture of either exists on the reference box, so every wording and layout beyond the canonical
@@ -23,21 +23,24 @@
 use super::read::errno_text;
 use super::registry::Registry;
 use super::texttools::stopped;
-use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
+use super::{CommandResult, FakeShell, HandlerId, len_u64};
 use crate::fakefs::FsError;
 
 pub(super) fn register(r: &mut Registry) {
-    r.register_if("xxd", ubuntu, HandlerId::Xxd, FakeShell::cmd_xxd);
+    r.register_if("xxd", has_applet, HandlerId::Xxd, FakeShell::cmd_xxd);
     r.register_if(
         "strings",
-        ubuntu,
+        has_applet,
         HandlerId::Strings,
         FakeShell::cmd_strings,
     );
 }
 
-fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {
-    shell.flavor == ShellFlavor::Bash
+/// Neither is a file on either persona (Ubuntu's recording marks `xxd` absent and never probed
+/// `strings`; toybox has neither), so they resolve only as BusyBox applets, which `cmd_busybox`
+/// signals by raising `busybox_depth` before it resolves the applet.
+fn has_applet(shell: &FakeShell, _parts: &[&str]) -> bool {
+    shell.busybox_depth > 0
 }
 
 /// xxd's own default and ceiling for the bytes on a line.
@@ -556,8 +559,8 @@ impl FakeShell {
     /// whatever `-a` says, as binutils does by default today.
     ///
     /// The scan is work the line pays for, and a file longer than what the line has left is
-    /// scanned up to that point. A missing file is `strings: 'FILE': No such file` with status 1
-    /// (BusyBox words it `strings: FILE: No such file or directory`) [unverified].
+    /// scanned up to that point. A missing file or a directory is `strings: FILE: <errno text>`
+    /// with status 1, BusyBox's wording, the only form reachable [unverified].
     pub(super) fn cmd_strings(&mut self, parts: &[&str]) -> CommandResult {
         let Some(plan) = parse_strings(parts.get(1..).unwrap_or(&[])) else {
             return CommandResult::silent(0);
@@ -566,7 +569,6 @@ impl FakeShell {
             // [unverified] wording.
             return CommandResult::stderr(1, "strings: invalid minimum string length 0\n");
         }
-        let busybox = self.busybox_depth > 0;
         let names: Vec<Option<&str>> = if plan.files.is_empty() {
             vec![None]
         } else {
@@ -580,16 +582,11 @@ impl FakeShell {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     let label = name.unwrap_or("-");
-                    let (text, is_failure) = match (&error, busybox) {
-                        (FsError::IsADirectory, false) => (
-                            format!("strings: Warning: '{label}' is a directory\n"),
-                            false,
-                        ),
-                        (_, false) => (format!("strings: '{label}': No such file\n"), true),
-                        (_, true) => (format!("strings: {label}: {}\n", errno_text(&error)), true),
-                    };
-                    failed |= is_failure;
-                    acc.append(CommandResult::stderr(u8::from(is_failure), text));
+                    failed = true;
+                    acc.append(CommandResult::stderr(
+                        1,
+                        format!("strings: {label}: {}\n", errno_text(&error)),
+                    ));
                     continue;
                 }
             };

@@ -563,7 +563,8 @@ fn sh_holds_file(sh: &mut FakeShell, name: &str) -> bool {
 /// The names dispatch runs that no `$PATH` directory holds a file for are reported at the standard
 /// directory. They are pinned so a filesystem change that adds or drops one is a decision: on the
 /// 2026-09-29 Ubuntu 22.04 recording `tftp`, `ftpget`, `hexdump` and `ash` are absent, and `more` is
-/// a util-linux file the modeled filesystem does not hold yet.
+/// a util-linux file the modeled filesystem does not hold yet, as is `arch` (a coreutils file no
+/// capture has the image of).
 #[test]
 fn the_names_reported_without_a_file_are_the_pinned_ones() {
     let mut sh = shell();
@@ -578,5 +579,8 @@ fn the_names_reported_without_a_file_are_the_pinned_ones() {
             without_file.push(name);
         }
     }
-    assert_eq!(without_file, ["ash", "ftpget", "hexdump", "more", "tftp"]);
+    assert_eq!(
+        without_file,
+        ["arch", "ash", "ftpget", "hexdump", "more", "tftp"]
+    );
 }

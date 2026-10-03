@@ -65,6 +65,7 @@ mod eval;
 mod expand;
 mod fsops;
 mod hashing;
+mod hostinfo;
 mod lex;
 mod lookup;
 mod multicall;
@@ -2788,6 +2789,8 @@ mod fsops_tests;
 mod grammar_tests;
 #[cfg(test)]
 mod hashing_tests;
+#[cfg(test)]
+mod hostinfo_tests;
 #[cfg(test)]
 mod lookup_tests;
 #[cfg(test)]

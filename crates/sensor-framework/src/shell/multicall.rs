@@ -35,8 +35,8 @@ fn android(shell: &FakeShell, _parts: &[&str]) -> bool {
 }
 
 /// The toybox-backed names of the advertised `/system/bin`.
-pub(super) const TOYBOX_APPLETS: [&str; 8] = [
-    "cat", "chmod", "df", "ls", "mount", "ping", "reboot", "umount",
+pub(super) const TOYBOX_APPLETS: [&str; 11] = [
+    "cat", "chmod", "date", "df", "hostname", "ls", "mount", "ping", "reboot", "umount", "uptime",
 ];
 
 /// The toolbox-backed names of the advertised `/system/bin`.

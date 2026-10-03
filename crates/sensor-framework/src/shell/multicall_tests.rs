@@ -136,7 +136,10 @@ fn a_bare_binary_lists_the_advertised_applets() {
     let mut sh = android();
     let (toybox, err, status) = answer(&mut sh, "toybox");
     assert_eq!((err.as_str(), status), ("", 0));
-    assert_eq!(toybox, "cat\nchmod\ndf\nls\nmount\nping\nreboot\numount\n");
+    assert_eq!(
+        toybox,
+        "cat\nchmod\ndate\ndf\nhostname\nls\nmount\nping\nreboot\numount\nuptime\n"
+    );
     assert_eq!(
         answer(&mut sh, "toolbox"),
         ("getprop\nsetprop\n".into(), "".into(), 0)

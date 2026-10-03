@@ -907,10 +907,12 @@ impl FakeFs {
                 "cat",
                 "chmod",
                 "dalvikvm",
+                "date",
                 "df",
                 "dumpsys",
                 "getenforce",
                 "getprop",
+                "hostname",
                 "linker",
                 "logcat",
                 "ls",
@@ -924,6 +926,7 @@ impl FakeFs {
                 "toolbox",
                 "toybox",
                 "umount",
+                "uptime",
                 "wm",
             ],
         );
@@ -2097,7 +2100,7 @@ mod tests {
 /storage/emulated/0:
 /sys: block class devices fs kernel
 /system: app bin build.prop etc fonts framework lib media priv-app tts usr vendor xbin
-/system/bin: am app_process cat chmod dalvikvm df dumpsys getenforce getprop linker logcat ls mount ping pm reboot screencap setprop sh toolbox toybox umount wm
+/system/bin: am app_process cat chmod dalvikvm date df dumpsys getenforce getprop hostname linker logcat ls mount ping pm reboot screencap setprop sh toolbox toybox umount uptime wm
 /system/etc: hosts
 /system/xbin: busybox su
 /vendor: firmware lib

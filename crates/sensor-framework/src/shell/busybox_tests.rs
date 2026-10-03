@@ -129,7 +129,7 @@ fn a_listed_applet_without_a_model_succeeds_silently() {
     // The usage text and behavior of these are not captured, so none is invented.
     for line in [
         "busybox nslookup example.com",
-        "busybox nproc",
+        "busybox hwclock",
         "busybox ifconfig",
         "busybox reboot",
         "/bin/busybox vi /tmp/x",

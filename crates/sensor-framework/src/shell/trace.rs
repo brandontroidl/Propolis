@@ -151,6 +151,12 @@ pub enum HandlerId {
     Dumpsys,
     Screencap,
     Logcat,
+    /// `hostname`, `arch`, `nproc`, `date` and `uptime`: persona constants and the session clock.
+    Hostname,
+    Arch,
+    Nproc,
+    Date,
+    Uptime,
     Sleep,
     Cd,
     Su,

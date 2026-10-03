@@ -187,6 +187,8 @@ pub enum HandlerId {
     Getent,
     Nslookup,
     Dig,
+    /// `nc`: intent capture. Never connects, listens or runs the `-e` command.
+    Nc,
     Sleep,
     Cd,
     Su,

@@ -72,6 +72,7 @@ mod lex;
 mod lookup;
 mod multicall;
 mod nameinfo;
+mod netcat;
 mod netinfo;
 mod parse;
 mod pathtools;
@@ -1802,11 +1803,14 @@ impl FakeShell {
         match parts.get(1).copied() {
             None => CommandResult::stdout(busybox::banner()),
             Some(applet) if busybox::is_applet(applet) => {
-                if self.resolve(&parts[1..]).1.is_none() {
-                    return CommandResult::silent(0);
-                }
+                // Raised before resolving: an applet with no file of its own (`nc` on Ubuntu)
+                // exists only through this binary, and its registry guard reads the depth.
                 self.busybox_depth = self.busybox_depth.saturating_add(1);
-                let result = self.dispatch_nested(&parts[1..]);
+                let result = if self.resolve(&parts[1..]).1.is_none() {
+                    CommandResult::silent(0)
+                } else {
+                    self.dispatch_nested(&parts[1..])
+                };
                 self.busybox_depth = self.busybox_depth.saturating_sub(1);
                 result
             }
@@ -2824,6 +2828,8 @@ mod lookup_tests;
 mod multicall_tests;
 #[cfg(test)]
 mod nameinfo_tests;
+#[cfg(test)]
+mod netcat_tests;
 #[cfg(test)]
 mod netinfo_tests;
 #[cfg(test)]

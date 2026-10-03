@@ -4,9 +4,9 @@
 //! dispatch has an entry for it, a builtin when the entry was registered as one, and otherwise a
 //! file found by walking `$PATH` over [`crate::fakefs::FakeFs`].
 //!
-//! A name dispatch answers but no `$PATH` directory holds a file for (`tftp`, which the loaders'
-//! BusyBox lure keeps runnable; a session's own `PATH=` emptied) is reported at the persona's
-//! standard directory, because dispatch does not consult `$PATH`: agreeing with dispatch outranks
+//! A name dispatch answers but no `$PATH` directory holds a file for (`more`; a session's own
+//! `PATH=` emptied) is reported at the persona's standard
+//! directory, because dispatch does not consult `$PATH`: agreeing with dispatch outranks
 //! agreeing with the recorded Ubuntu 22.04 layout, where those names are absent.
 //!
 //! Wording, from the 2026-09-29 recordings on Ubuntu 22.04: bash prints `command -v` of a builtin as

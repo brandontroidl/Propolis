@@ -127,7 +127,7 @@ pub enum HandlerId {
     Ping,
     ShellSpawn,
     Busybox,
-    /// `tftp` and `ftpget`.
+    /// `tftp` and `ftpget`, which exist only as BusyBox applets.
     Fetcher,
     Chmod,
     Cp,
@@ -597,10 +597,7 @@ mod tests {
             ("ping -c1 203.0.113.9", HandlerId::Ping),
             ("sh", HandlerId::ShellSpawn),
             ("/bin/bash", HandlerId::ShellSpawn),
-            ("ash", HandlerId::ShellSpawn),
             ("/bin/busybox X", HandlerId::Busybox),
-            ("tftp -g -r f 203.0.113.9", HandlerId::Fetcher),
-            ("ftpget 203.0.113.9 f", HandlerId::Fetcher),
             ("chmod 777 /tmp", HandlerId::Chmod),
             ("cp /etc/hostname /tmp/h", HandlerId::Cp),
             ("rm -f /tmp/zz", HandlerId::Rm),
@@ -630,6 +627,9 @@ mod tests {
             ("busybox hexdump -C /etc/hostname", HandlerId::Hexdump),
             ("busybox xxd /etc/hostname", HandlerId::Xxd),
             ("busybox strings /etc/hostname", HandlerId::Strings),
+            ("busybox ash", HandlerId::ShellSpawn),
+            ("busybox tftp -g -r f 203.0.113.9", HandlerId::Fetcher),
+            ("busybox ftpget 203.0.113.9 f", HandlerId::Fetcher),
         ] {
             let mut sh = shell();
             sh.handle_input(line);

@@ -561,8 +561,7 @@ fn sh_holds_file(sh: &mut FakeShell, name: &str) -> bool {
 }
 
 /// The names dispatch runs that no `$PATH` directory holds a file for are reported at the standard
-/// directory. They are pinned so a filesystem change that adds or drops one is a decision: on the
-/// 2026-09-29 Ubuntu 22.04 recording `tftp`, `ftpget` and `ash` are absent, and `more` is
+/// directory. They are pinned so a filesystem change that adds or drops one is a decision: `more` is
 /// a util-linux file the modeled filesystem does not hold yet, as are `arch` and `printenv`
 /// (coreutils files no capture has the image of), and `top`, `pgrep` and `pkill` (procps), `pidof`
 /// (sysvinit-utils) and `killall` (psmisc), which the process table answers for and no capture
@@ -571,7 +570,8 @@ fn sh_holds_file(sh: &mut FakeShell, name: &str) -> bool {
 /// (coreutils), whose image is not in the recording either (`df` and `free` are), and `getent`,
 /// `dig` and `nslookup` (the C library and bind9 packages), which the static name model answers
 /// for and no capture has the image of. `file`, `xxd`, `hexdump` and `strings` are not here: the
-/// first is no command at all, the others resolve only as BusyBox applets.
+/// first is no command at all, the others, like `tftp`, `ftpget` and `ash` (absent on the
+/// 2026-09-29 Ubuntu 22.04 recording), resolve only as BusyBox applets.
 #[test]
 fn the_names_reported_without_a_file_are_the_pinned_ones() {
     let mut sh = shell();
@@ -589,8 +589,56 @@ fn the_names_reported_without_a_file_are_the_pinned_ones() {
     assert_eq!(
         without_file,
         [
-            "arch", "ash", "dig", "du", "ftpget", "getent", "ip", "killall", "more", "nslookup",
-            "pgrep", "pidof", "pkill", "printenv", "ss", "tftp", "top"
+            "arch", "dig", "du", "getent", "ip", "killall", "more", "nslookup", "pgrep", "pidof",
+            "pkill", "printenv", "ss", "top"
         ]
     );
+}
+
+/// The 2026-09-29 Ubuntu 22.04 recording has `tftp`, `ftpget` and `ash` absent, so the bare names
+/// are not found there (nor on the phone, which has no BusyBox files); they run only as BusyBox
+/// applets. `sh` and `bash` are present on both, and gating them would out the honeypot.
+#[test]
+fn tftp_ftpget_and_ash_are_not_found_bare_but_run_as_busybox_applets() {
+    for make in [shell, android] {
+        for name in ["tftp", "ftpget", "ash"] {
+            let mut sh = make();
+            let (out, err, status) = answer(&mut sh, name);
+            assert_eq!(status, 127, "bare {name}");
+            assert!(
+                out.is_empty() && err.contains("not found"),
+                "bare {name}: {err:?}"
+            );
+            assert_ne!(
+                answer(&mut sh, &format!("command -v {name}")).2,
+                0,
+                "{name}"
+            );
+            assert_ne!(answer(&mut sh, &format!("type {name}")).2, 0, "{name}");
+            assert_ne!(answer(&mut sh, &format!("which {name}")).2, 0, "{name}");
+        }
+    }
+    for line in [
+        "busybox tftp -g -r f 198.51.100.9",
+        "busybox ftpget 198.51.100.9 f",
+        "busybox ash",
+    ] {
+        let mut sh = shell();
+        let (_, err, status) = answer(&mut sh, line);
+        assert_ne!(status, 127, "{line}");
+        assert!(!err.contains("not found"), "{line}: {err:?}");
+    }
+    for make in [shell, android] {
+        for name in ["sh", "bash"] {
+            let mut sh = make();
+            let (_, err, status) = answer(&mut sh, name);
+            assert_eq!(status, 0, "bare {name}");
+            assert!(err.is_empty(), "bare {name}: {err:?}");
+            assert_eq!(
+                answer(&mut sh, &format!("command -v {name}")).2,
+                0,
+                "{name}"
+            );
+        }
+    }
 }

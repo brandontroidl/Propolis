@@ -132,7 +132,7 @@ fn a_saved_download_past_the_budget_is_reported_by_each_fetcher() {
     let (out, _) = sh.handle_input("curl -o /tmp/c http://198.51.100.1/x");
     assert_eq!(out.status, 23);
     assert_eq!(out, "curl: (23) Failure writing output to destination\n");
-    let (out, _) = sh.handle_input("tftp -g -r d -l /tmp/d 198.51.100.1");
+    let (out, _) = sh.handle_input("busybox tftp -g -r d -l /tmp/d 198.51.100.1");
     assert_eq!(out.status, 1);
     assert_eq!(out, "tftp: can't open '/tmp/d': No space left on device\n");
 }

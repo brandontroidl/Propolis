@@ -214,6 +214,12 @@ fn is_bash(shell: &FakeShell, _parts: &[&str]) -> bool {
     shell.is_bash()
 }
 
+/// A command that exists only as a BusyBox applet: `cmd_busybox` raises `busybox_depth` before it
+/// resolves the applet, so the bare name is not found.
+fn via_busybox(shell: &FakeShell, _parts: &[&str]) -> bool {
+    shell.busybox_depth > 0
+}
+
 /// The executable `/proc/self/exe` names for a process running the command `exe_of`: the file the
 /// kernel reports as the process's binary, not the name it was started by, so a busybox applet is
 /// busybox and `sh` is dash. `None` for a command with no file behind it. The one place that
@@ -271,16 +277,29 @@ fn register_core(r: &mut Registry) {
     r.register("ping", HandlerId::Ping, FakeShell::builtin_ping);
     // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
     // for sh/bash instantly outs the honeypot and the dropper leaves. Model a nested shell.
-    // `ash` is BusyBox's shell and appears in the applet list, so it resolves here too.
-    for name in ["sh", "bash", "ash"] {
+    // sh and bash are always present. `ash` is BusyBox's shell, a file on neither persona
+    // (the 2026-09-29 Ubuntu recording has it absent), so it resolves only as `busybox ash`.
+    for name in ["sh", "bash"] {
         r.register(name, HandlerId::ShellSpawn, FakeShell::cmd_shell_spawn);
     }
+    r.register_if(
+        "ash",
+        via_busybox,
+        HandlerId::ShellSpawn,
+        FakeShell::cmd_shell_spawn,
+    );
     // The canonical Mirai/Gafgyt probe is `/bin/busybox <TOKEN>`, which they confirm by the
     // exact "<TOKEN>: applet not found" reply; they also fetch payloads via `busybox wget`
     // and `busybox tftp`.
     r.register("busybox", HandlerId::Busybox, FakeShell::cmd_busybox);
+    // Neither is a file on either persona (absent in the Ubuntu recording); BusyBox applets only.
     for name in ["tftp", "ftpget"] {
-        r.register(name, HandlerId::Fetcher, FakeShell::builtin_fetcher);
+        r.register_if(
+            name,
+            via_busybox,
+            HandlerId::Fetcher,
+            FakeShell::builtin_fetcher,
+        );
     }
     r.register("chmod", HandlerId::Chmod, FakeShell::builtin_chmod);
     // These change the filesystem the rest of the session sees. Answering silent

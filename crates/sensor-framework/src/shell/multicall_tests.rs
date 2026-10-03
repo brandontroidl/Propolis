@@ -138,7 +138,7 @@ fn a_bare_binary_lists_the_advertised_applets() {
     assert_eq!((err.as_str(), status), ("", 0));
     assert_eq!(
         toybox,
-        "cat\nchmod\ndate\ndf\nhostname\nls\nmount\nping\nreboot\numount\nuptime\n"
+        "cat\nchmod\ndate\ndf\nenv\nhostname\nls\nmount\nping\nreboot\numount\nuptime\n"
     );
     assert_eq!(
         answer(&mut sh, "toolbox"),

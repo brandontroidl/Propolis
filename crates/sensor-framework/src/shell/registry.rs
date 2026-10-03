@@ -86,6 +86,7 @@ impl Registry {
         super::multicall::register(&mut registry);
         super::androidsys::register(&mut registry);
         super::hostinfo::register(&mut registry);
+        super::envtools::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }

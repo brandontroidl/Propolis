@@ -35,8 +35,9 @@ fn android(shell: &FakeShell, _parts: &[&str]) -> bool {
 }
 
 /// The toybox-backed names of the advertised `/system/bin`.
-pub(super) const TOYBOX_APPLETS: [&str; 11] = [
-    "cat", "chmod", "date", "df", "hostname", "ls", "mount", "ping", "reboot", "umount", "uptime",
+pub(super) const TOYBOX_APPLETS: [&str; 12] = [
+    "cat", "chmod", "date", "df", "env", "hostname", "ls", "mount", "ping", "reboot", "umount",
+    "uptime",
 ];
 
 /// The toolbox-backed names of the advertised `/system/bin`.
@@ -45,7 +46,7 @@ pub(super) const TOOLBOX_APPLETS: [&str; 2] = ["getprop", "setprop"];
 /// Shell builtins that toybox also provides as applets and that only print or answer a status,
 /// so running them nested leaves the session's shell untouched. The other builtins (`cd`, `exit`,
 /// `export`, `set`, ...) change the shell itself and are not applets of anything.
-const PURE_BUILTINS: [&str; 6] = ["echo", "pwd", "true", "false", "test", "["];
+pub(super) const PURE_BUILTINS: [&str; 6] = ["echo", "pwd", "true", "false", "test", "["];
 
 /// Names the shell answers that are not applets of either multi-call binary: BusyBox and its
 /// `ash`, `su` (a binary of its own), and the fetchers, which a stock toybox does not build. The

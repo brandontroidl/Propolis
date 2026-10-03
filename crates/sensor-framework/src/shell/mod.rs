@@ -61,6 +61,7 @@ mod base64;
 mod builtins;
 mod busybox;
 mod dd;
+mod envtools;
 mod eval;
 mod expand;
 mod fsops;
@@ -2783,6 +2784,8 @@ mod budget_tests;
 mod busybox_tests;
 #[cfg(test)]
 mod dd_tests;
+#[cfg(test)]
+mod envtools_tests;
 #[cfg(test)]
 mod fsops_tests;
 #[cfg(test)]

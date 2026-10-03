@@ -910,6 +910,7 @@ impl FakeFs {
                 "date",
                 "df",
                 "dumpsys",
+                "env",
                 "getenforce",
                 "getprop",
                 "hostname",
@@ -1539,7 +1540,7 @@ impl From<BudgetError> for FsError {
 /// The Android device's equivalents. `/system/xbin/busybox` is there because this device is
 /// rooted (it hands out a root shell over ADB, which a stock one does not) and a rooted phone
 /// almost always carries busybox; `su` for the same reason.
-const ANDROID_EXECUTABLE_BINARIES: [&str; 13] = [
+const ANDROID_EXECUTABLE_BINARIES: [&str; 14] = [
     "/system/bin/sh",
     "/system/bin/toybox",
     "/system/bin/toolbox",
@@ -1553,6 +1554,7 @@ const ANDROID_EXECUTABLE_BINARIES: [&str; 13] = [
     "/system/bin/screencap",
     "/system/bin/wm",
     "/system/bin/logcat",
+    "/system/bin/env",
 ];
 
 /// `/system/build.prop` on the impersonated device, resolved from [`crate::persona`] so it
@@ -2035,6 +2037,7 @@ mod tests {
         "/proc/version",
         "/sys/fs/selinux",
         "/system/bin/app_process",
+        "/system/bin/env",
         "/system/bin/sh",
         "/system/bin/toolbox",
         "/system/bin/toybox",
@@ -2100,7 +2103,7 @@ mod tests {
 /storage/emulated/0:
 /sys: block class devices fs kernel
 /system: app bin build.prop etc fonts framework lib media priv-app tts usr vendor xbin
-/system/bin: am app_process cat chmod dalvikvm date df dumpsys getenforce getprop hostname linker logcat ls mount ping pm reboot screencap setprop sh toolbox toybox umount uptime wm
+/system/bin: am app_process cat chmod dalvikvm date df dumpsys env getenforce getprop hostname linker logcat ls mount ping pm reboot screencap setprop sh toolbox toybox umount uptime wm
 /system/etc: hosts
 /system/xbin: busybox su
 /vendor: firmware lib

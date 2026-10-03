@@ -157,6 +157,9 @@ pub enum HandlerId {
     Nproc,
     Date,
     Uptime,
+    /// `env` and `printenv`: the session's exported variables, sorted, and `env`'s scoped command.
+    Env,
+    Printenv,
     Sleep,
     Cd,
     Su,

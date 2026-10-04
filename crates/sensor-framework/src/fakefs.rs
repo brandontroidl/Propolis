@@ -19,7 +19,7 @@
 //! resolves them to a physical path first, so `/bin/busybox` and `/usr/bin/busybox` are one file.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::binaries::{self, BinaryImage};
 use crate::budget::{BudgetError, BudgetLimits, ConnectionBudget};
@@ -466,6 +466,18 @@ struct Overlay {
     /// Physical paths removed this session, baked-in ones included: a file the shell said it
     /// deleted must stop being readable, or the next `cat` contradicts the `rm`.
     tombstones: HashSet<String>,
+}
+
+/// The mutable state that outlives one shell and is shared by every channel of a connection
+/// (see [`FakeFs::share`]): the written-file overlay and the `chattr` side table.
+///
+/// It sits behind a `std::sync::Mutex`, which is not re-entrant. Every public [`FakeFs`] method
+/// that needs it locks once at the top and passes the guard's contents to private helpers
+/// (`node_at`, `resolve`, `lookup`, ...) that take `&Persistent`; no helper locks, so no path
+/// can lock twice. No guard is held across an `.await` (this module has none).
+#[derive(Default)]
+struct Persistent {
+    overlay: Overlay,
     /// `chattr` bits by physical path; an entry keeps its slot (and charge) once made.
     attrs: HashMap<String, u32>,
 }
@@ -478,14 +490,17 @@ struct Overlay {
 /// `uname`, the sensor prompts, or the other sensors' banners.
 pub struct FakeFs {
     snapshot: Arc<Snapshot>,
-    overlay: Overlay,
+    /// Written files, removals and `chattr` bits. Shared by every filesystem made with
+    /// [`FakeFs::share`], so the channels of one connection see one set of files.
+    persistent: Arc<Mutex<Persistent>>,
     /// Charged by every write, so no writer can bypass it. Shared with the other filesystems and
     /// shells on the same connection.
     budget: Arc<ConnectionBudget>,
     /// Nodes the shell derives from state the snapshot cannot hold (the process table behind
     /// `/proc/<pid>`), keyed by physical path. Read after the snapshot and never charged: the
     /// owner replaces the whole set, bounded by [`GENERATED_MAX`], and a session's own writes
-    /// and removals land in the overlay above it.
+    /// and removals land in the overlay above it. Per instance, never shared: each shell's
+    /// process table is its own.
     generated: HashMap<String, Node>,
 }
 
@@ -597,10 +612,32 @@ impl FakeFs {
     fn from_snapshot(snapshot: Snapshot) -> Self {
         Self {
             snapshot: Arc::new(snapshot),
-            overlay: Overlay::default(),
+            persistent: Arc::new(Mutex::new(Persistent::default())),
             budget: ConnectionBudget::new(BudgetLimits::default()),
             generated: HashMap::new(),
         }
+    }
+
+    /// A filesystem over the same persona, written files and budget as this one, with an empty
+    /// generated set. One connection builds one filesystem and shares it per channel, so a file
+    /// written through one channel is readable through another, while each shell keeps its own
+    /// `/proc/<pid>`.
+    pub fn share(&self) -> FakeFs {
+        FakeFs {
+            snapshot: Arc::clone(&self.snapshot),
+            persistent: Arc::clone(&self.persistent),
+            budget: Arc::clone(&self.budget),
+            generated: HashMap::new(),
+        }
+    }
+
+    /// The shared state, locked. A poisoned lock is recovered: every mutation below leaves the
+    /// maps consistent between statements that can panic, and a honeypot channel must not wedge
+    /// the others over one panic.
+    fn lock(&self) -> MutexGuard<'_, Persistent> {
+        self.persistent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Replace the generated nodes with `nodes` (physical path to node), keeping at most
@@ -632,8 +669,9 @@ impl FakeFs {
 
     /// The mount `logical_abs` sits on once every link is followed, `None` when nothing is there.
     pub fn mount_of(&self, logical_abs: &str) -> Option<MountEntry> {
-        let physical = self.resolve(logical_abs, true).ok()?;
-        self.node_at(&physical)?;
+        let p = self.lock();
+        let physical = self.resolve(&p, logical_abs, true).ok()?;
+        self.node_at(&p, &physical)?;
         self.snapshot.mount_for(&physical).copied()
     }
 
@@ -1076,11 +1114,11 @@ impl FakeFs {
 
     /// The live node at a physical path: an overlay node shadows the snapshot's, and a tombstone
     /// hides both.
-    fn node_at(&self, physical: &str) -> Option<&Node> {
-        if self.overlay.tombstones.contains(physical) {
+    fn node_at<'a>(&'a self, p: &'a Persistent, physical: &str) -> Option<&'a Node> {
+        if p.overlay.tombstones.contains(physical) {
             return None;
         }
-        self.overlay
+        p.overlay
             .nodes
             .get(physical)
             .or_else(|| self.snapshot.nodes.get(physical))
@@ -1092,14 +1130,20 @@ impl FakeFs {
     /// restarts at `/`. `follow_final` false leaves a symlink in the last position alone (what
     /// `rm` acts on). The last component may be absent, so a creator can resolve the path it is
     /// about to make.
-    fn resolve(&self, logical_abs: &str, follow_final: bool) -> Result<String, FsError> {
-        self.resolve_with(logical_abs, follow_final, false)
+    fn resolve(
+        &self,
+        p: &Persistent,
+        logical_abs: &str,
+        follow_final: bool,
+    ) -> Result<String, FsError> {
+        self.resolve_with(p, logical_abs, follow_final, false)
     }
 
     /// [`Self::resolve`], with `allow_missing` letting a missing non-final component stand: the
     /// rest of the path is then kept as typed (`..` still climbing), as `realpath -m` does.
     fn resolve_with(
         &self,
+        p: &Persistent,
         logical_abs: &str,
         follow_final: bool,
         allow_missing: bool,
@@ -1118,7 +1162,7 @@ impl FakeFs {
             }
             let candidate = format!("/{}", join_with(&resolved, &component));
             let is_last = pending.is_empty();
-            match self.node_at(&candidate).map(|node| &node.kind) {
+            match self.node_at(p, &candidate).map(|node| &node.kind) {
                 Some(NodeKind::Symlink { target }) if !is_last || follow_final => {
                     hops = hops.saturating_add(1);
                     if hops > MAX_SYMLINK_HOPS {
@@ -1146,8 +1190,9 @@ impl FakeFs {
     /// `None` when the path is not a symlink or does not exist. Only the final component is left
     /// unfollowed; the directories leading to it resolve as they do for any path.
     pub fn link_target(&self, logical_abs: &str) -> Option<String> {
-        let physical = self.resolve(logical_abs, false).ok()?;
-        match self.node_at(&physical).map(|node| &node.kind) {
+        let p = self.lock();
+        let physical = self.resolve(&p, logical_abs, false).ok()?;
+        match self.node_at(&p, &physical).map(|node| &node.kind) {
             Some(NodeKind::Symlink { target }) => Some(target.clone()),
             _ => None,
         }
@@ -1157,19 +1202,20 @@ impl FakeFs {
     /// asks for it. `None` when the mode's requirement fails or resolution does (a loop, a
     /// non-directory in the middle).
     pub fn canonicalize(&self, logical_abs: &str, mode: Canonical) -> Option<String> {
+        let p = self.lock();
         let physical = self
-            .resolve_with(logical_abs, true, mode == Canonical::AllowMissing)
+            .resolve_with(&p, logical_abs, true, mode == Canonical::AllowMissing)
             .ok()?;
-        if mode == Canonical::Existing && self.node_at(&physical).is_none() {
+        if mode == Canonical::Existing && self.node_at(&p, &physical).is_none() {
             return None;
         }
         Some(physical)
     }
 
     /// The physical path and live node `path` names, following every symlink.
-    fn lookup(&self, path: &str) -> Option<(String, &Node)> {
-        let physical = self.resolve(path, true).ok()?;
-        let node = self.node_at(&physical)?;
+    fn lookup<'a>(&'a self, p: &'a Persistent, path: &str) -> Option<(String, &'a Node)> {
+        let physical = self.resolve(p, path, true).ok()?;
+        let node = self.node_at(p, &physical)?;
         Some((physical, node))
     }
 
@@ -1177,8 +1223,9 @@ impl FakeFs {
     /// leaves a symlink in the last position alone (`test -L`). `None` when nothing is there, a
     /// dangling link's target included.
     pub fn stat(&self, logical_abs: &str, follow: bool) -> Option<Stat> {
-        let physical = self.resolve(logical_abs, follow).ok()?;
-        let node = self.node_at(&physical)?;
+        let p = self.lock();
+        let physical = self.resolve(&p, logical_abs, follow).ok()?;
+        let node = self.node_at(&p, &physical)?;
         let (kind, size) = match &node.kind {
             NodeKind::Regular(blob) => (FileKind::Regular, blob.len()),
             NodeKind::Directory(_) => (FileKind::Directory, 0),
@@ -1201,13 +1248,15 @@ impl FakeFs {
     /// Mark a file the attacker created this session executable (`chmod +x` / `chmod 777`).
     /// Returns false when `path` is not such a file; the baked-in files keep their modes.
     pub fn mark_executable(&mut self, path: &str) -> bool {
-        let Ok(physical) = self.resolve(path, true) else {
+        let mut guard = self.lock();
+        let p = &mut *guard;
+        let Ok(physical) = self.resolve(p, path, true) else {
             return false;
         };
-        if self.overlay.tombstones.contains(&physical) {
+        if p.overlay.tombstones.contains(&physical) {
             return false;
         }
-        match self.overlay.nodes.get_mut(&physical) {
+        match p.overlay.nodes.get_mut(&physical) {
             Some(node) if matches!(node.kind, NodeKind::Regular(_)) => {
                 node.meta.mode |= EXEC_BITS;
                 true
@@ -1219,7 +1268,8 @@ impl FakeFs {
     /// Whether running `path` as a command would start: a regular file with an execute bit, not
     /// on a `noexec` mount.
     pub fn is_executable(&self, path: &str) -> bool {
-        self.lookup(path).is_some_and(|(physical, node)| {
+        let p = self.lock();
+        self.lookup(&p, path).is_some_and(|(physical, node)| {
             matches!(node.kind, NodeKind::Regular(_))
                 && node.meta.mode & EXEC_BITS != 0
                 && !self.snapshot.is_noexec(&physical)
@@ -1229,11 +1279,12 @@ impl FakeFs {
     /// Up to `max_len` bytes of `path` from `off`. A directory is `IsADirectory`, an absent or
     /// removed path `NoSuchFile`; a device answers with its own stream.
     pub fn read_range(&self, path: &str, off: u64, max_len: u64) -> Result<Vec<u8>, FsError> {
-        let physical = self.resolve(path, true).map_err(|error| match error {
+        let p = self.lock();
+        let physical = self.resolve(&p, path, true).map_err(|error| match error {
             FsError::NoSuchDirectory(_) => FsError::NoSuchFile,
             other => other,
         })?;
-        match self.node_at(&physical).map(|node| &node.kind) {
+        match self.node_at(&p, &physical).map(|node| &node.kind) {
             Some(NodeKind::Regular(blob)) => Ok(blob.read_range(off, max_len)),
             Some(NodeKind::Device(device)) => Ok(device.read(off, max_len)),
             Some(NodeKind::Directory(_)) => Err(FsError::IsADirectory),
@@ -1248,7 +1299,8 @@ impl FakeFs {
 
     /// The content and mode of a regular file, for `cp`: cloning the blob shares its pieces.
     pub fn content_and_mode(&self, path: &str) -> Result<(Blob, u32), FsError> {
-        match self.lookup(path).map(|(_, node)| node) {
+        let p = self.lock();
+        match self.lookup(&p, path).map(|(_, node)| node) {
             Some(Node {
                 kind: NodeKind::Regular(blob),
                 meta,
@@ -1264,7 +1316,8 @@ impl FakeFs {
     /// The names in directory `path`: the modeled ones plus what the session created, less what
     /// it removed. `None` for anything that is not a directory this box presents.
     pub fn list_dir(&self, path: &str) -> Option<Vec<String>> {
-        let (physical, node) = self.lookup(path)?;
+        let p = self.lock();
+        let (physical, node) = self.lookup(&p, path)?;
         let NodeKind::Directory(listing) = &node.kind else {
             return None;
         };
@@ -1287,7 +1340,7 @@ impl FakeFs {
                 entries.push(name.to_string());
             }
         }
-        for key in self.overlay.nodes.keys() {
+        for key in p.overlay.nodes.keys() {
             if let Some(name) = key
                 .strip_prefix(&prefix)
                 .filter(|name| !name.is_empty() && !name.contains('/'))
@@ -1296,13 +1349,14 @@ impl FakeFs {
                 entries.push(name.to_string());
             }
         }
-        entries.retain(|name| !self.overlay.tombstones.contains(&format!("{prefix}{name}")));
+        entries.retain(|name| !p.overlay.tombstones.contains(&format!("{prefix}{name}")));
         Some(entries)
     }
 
     /// Whether `path` names a file or device this box presents (a baked-in or created one).
     pub fn file_exists(&self, path: &str) -> bool {
-        self.lookup(path).is_some_and(|(_, node)| {
+        let p = self.lock();
+        self.lookup(&p, path).is_some_and(|(_, node)| {
             matches!(node.kind, NodeKind::Regular(_) | NodeKind::Device(_))
         })
     }
@@ -1311,20 +1365,26 @@ impl FakeFs {
     /// probes consult this, so the shell never lets an attacker enter a directory that `ls /`
     /// did not show, and never refuses one it did.
     pub fn is_dir(&self, path: &str) -> bool {
-        self.lookup(path)
+        let p = self.lock();
+        self.lookup(&p, path)
             .is_some_and(|(_, node)| matches!(node.kind, NodeKind::Directory(_)))
     }
 
     /// Resolve a write target to its physical path, mapping a missing parent under a read-only
     /// mount to the refusal a real write there gets.
-    fn resolve_for_write(&self, path: &str) -> Result<String, FsError> {
-        self.resolve_for_write_with(path, true)
+    fn resolve_for_write(&self, p: &Persistent, path: &str) -> Result<String, FsError> {
+        self.resolve_for_write_with(p, path, true)
     }
 
     /// [`Self::resolve_for_write`] with `follow_final` false for a call that creates the name
     /// itself rather than writing through it (a symlink replaces nothing it points at).
-    fn resolve_for_write_with(&self, path: &str, follow_final: bool) -> Result<String, FsError> {
-        self.resolve(path, follow_final)
+    fn resolve_for_write_with(
+        &self,
+        p: &Persistent,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<String, FsError> {
+        self.resolve(p, path, follow_final)
             .map_err(|error| match error {
                 FsError::NoSuchDirectory(missing) if self.snapshot.is_ro(&missing) => {
                     FsError::ReadOnly
@@ -1353,23 +1413,28 @@ impl FakeFs {
     /// slot yet, one node. A refusal inserts nothing.
     pub fn write_blob(&mut self, path: &str, blob: Blob, mode: u32) -> Result<(), FsError> {
         self.budget.check_name(path)?;
-        let physical = self.resolve_for_write(path)?;
+        let mut guard = self.lock();
+        let p = &mut *guard;
+        let physical = self.resolve_for_write(p, path)?;
         if self.snapshot.is_ro(&physical) {
             return Err(FsError::ReadOnly);
         }
         let mut mode = mode;
-        match self.node_at(&physical).map(|node| (&node.kind, node.meta)) {
+        match self
+            .node_at(p, &physical)
+            .map(|node| (&node.kind, node.meta))
+        {
             Some((NodeKind::Directory(_), _)) => return Err(FsError::IsADirectory),
             Some((NodeKind::Device(device), _)) => return device.write(),
             Some((NodeKind::Regular(_), existing)) => mode |= existing.mode & EXEC_BITS,
             _ => {}
         }
         let new_bytes = blob.owned_bytes();
-        let old_bytes = self.overlay_owned_bytes(&physical);
+        let old_bytes = overlay_owned_bytes(p, &physical);
         // A path already holding an overlay node or a tombstone owns its slot; only a baked or
         // brand-new path needs one.
-        let needs_slot = !self.overlay.nodes.contains_key(&physical)
-            && !self.overlay.tombstones.contains(&physical);
+        let needs_slot =
+            !p.overlay.nodes.contains_key(&physical) && !p.overlay.tombstones.contains(&physical);
         // A new slot also holds its path, charged with the content and kept charged for the life
         // of the slot: a tombstone keeps the path resident.
         let path_bytes = if needs_slot {
@@ -1384,24 +1449,18 @@ impl FakeFs {
             let _ = self.budget.replace_bytes(charged, old_bytes);
             return Err(error.into());
         }
-        self.overlay.tombstones.remove(&physical);
-        self.overlay
-            .nodes
-            .insert(physical, Node::regular(blob, mode));
+        p.overlay.tombstones.remove(&physical);
+        p.overlay.nodes.insert(physical, Node::regular(blob, mode));
         Ok(())
-    }
-
-    /// Bytes charged for the overlay node at `physical`: its blob's materialized bytes, zero for
-    /// anything else.
-    fn overlay_owned_bytes(&self, physical: &str) -> u64 {
-        self.overlay.nodes.get(physical).map_or(0, node_owned_bytes)
     }
 
     /// Remove `path` (a symlink itself, never its target). `Ok(false)` when nothing was there:
     /// `rm` without `-f` reports that, and the caller decides. A removed file stops being
     /// readable, listed and executable.
     pub fn remove_path(&mut self, path: &str) -> Result<bool, FsError> {
-        let physical = match self.resolve(path, false) {
+        let mut guard = self.lock();
+        let p = &mut *guard;
+        let physical = match self.resolve(p, path, false) {
             Ok(physical) => physical,
             Err(FsError::NoSuchDirectory(missing)) if self.snapshot.is_ro(&missing) => {
                 return Err(FsError::ReadOnly);
@@ -1411,12 +1470,12 @@ impl FakeFs {
         if self.snapshot.is_ro(&physical) {
             return Err(FsError::ReadOnly);
         }
-        let existing = self.node_at(&physical).map(|node| &node.kind);
+        let existing = self.node_at(p, &physical).map(|node| &node.kind);
         let existed = existing.is_some();
         let is_directory = matches!(existing, Some(NodeKind::Directory(_)));
         if is_directory {
             let below = format!("{physical}/");
-            let doomed: Vec<String> = self
+            let doomed: Vec<String> = p
                 .overlay
                 .nodes
                 .keys()
@@ -1424,7 +1483,7 @@ impl FakeFs {
                 .cloned()
                 .collect();
             for key in doomed {
-                if let Some(node) = self.overlay.nodes.remove(&key) {
+                if let Some(node) = p.overlay.nodes.remove(&key) {
                     self.budget.refund_bytes(node_owned_bytes(&node));
                 }
             }
@@ -1432,17 +1491,17 @@ impl FakeFs {
         // The bytes come back; the node slot does not. A created node's slot becomes the
         // tombstone's, and a baked path's tombstone takes a new one.
         let below = format!("{physical}/");
-        for (key, bits) in &mut self.overlay.attrs {
+        for (key, bits) in &mut p.attrs {
             if *key == physical || key.starts_with(&below) {
                 *bits = 0;
             }
         }
-        let removed = self.overlay.nodes.remove(&physical);
+        let removed = p.overlay.nodes.remove(&physical);
         if let Some(node) = &removed {
             self.budget.refund_bytes(node_owned_bytes(node));
         }
         if existed {
-            self.overlay.tombstones.insert(physical);
+            p.overlay.tombstones.insert(physical);
             if removed.is_none() {
                 self.budget.charge_node_unchecked();
             }
@@ -1453,15 +1512,17 @@ impl FakeFs {
     /// `mkdir path`, with the failures a real `mkdir` distinguishes.
     pub fn make_dir(&mut self, path: &str) -> Result<(), FsError> {
         self.budget.check_name(path)?;
-        let physical = self.resolve_for_write(path)?;
+        let mut guard = self.lock();
+        let p = &mut *guard;
+        let physical = self.resolve_for_write(p, path)?;
         if self.snapshot.is_ro(&physical) {
             return Err(FsError::ReadOnly);
         }
-        if self.node_at(&physical).is_some() {
+        if self.node_at(p, &physical).is_some() {
             return Err(FsError::Exists);
         }
         // No live node here, so a tombstone is the only thing that can already own the slot.
-        if !self.overlay.tombstones.contains(&physical) {
+        if !p.overlay.tombstones.contains(&physical) {
             let path_bytes = u64::try_from(physical.len()).unwrap_or(u64::MAX);
             self.budget.charge_bytes(path_bytes)?;
             if let Err(error) = self.budget.charge_node() {
@@ -1469,8 +1530,8 @@ impl FakeFs {
                 return Err(error.into());
             }
         }
-        self.overlay.tombstones.remove(&physical);
-        self.overlay
+        p.overlay.tombstones.remove(&physical);
+        p.overlay
             .nodes
             .insert(physical, Node::directory(Vec::new()));
         Ok(())
@@ -1488,14 +1549,16 @@ impl FakeFs {
     /// charged for the life of the slot as a directory's do.
     pub fn create_symlink(&mut self, path: &str, target: &str) -> Result<(), FsError> {
         self.budget.check_name(path)?;
-        let physical = self.resolve_for_write_with(path, false)?;
+        let mut guard = self.lock();
+        let p = &mut *guard;
+        let physical = self.resolve_for_write_with(p, path, false)?;
         if self.snapshot.is_ro(&physical) {
             return Err(FsError::ReadOnly);
         }
-        if self.node_at(&physical).is_some() {
+        if self.node_at(p, &physical).is_some() {
             return Err(FsError::Exists);
         }
-        if !self.overlay.tombstones.contains(&physical) {
+        if !p.overlay.tombstones.contains(&physical) {
             let held = physical.len().saturating_add(target.len());
             let bytes = u64::try_from(held).unwrap_or(u64::MAX);
             self.budget.charge_bytes(bytes)?;
@@ -1504,17 +1567,18 @@ impl FakeFs {
                 return Err(error.into());
             }
         }
-        self.overlay.tombstones.remove(&physical);
-        self.overlay.nodes.insert(physical, Node::symlink(target));
+        p.overlay.tombstones.remove(&physical);
+        p.overlay.nodes.insert(physical, Node::symlink(target));
         Ok(())
     }
 
     /// The ext2 attribute bits (`chattr`) of the node `path` names, or `None` when nothing is
     /// there. Stored only: no write or removal consults them.
     pub fn attrs(&self, path: &str) -> Option<u32> {
-        let physical = self.resolve(path, true).ok()?;
-        self.node_at(&physical)?;
-        Some(self.overlay.attrs.get(&physical).copied().unwrap_or(0))
+        let p = self.lock();
+        let physical = self.resolve(&p, path, true).ok()?;
+        self.node_at(&p, &physical)?;
+        Some(p.attrs.get(&physical).copied().unwrap_or(0))
     }
 
     /// Apply a `chattr` change to the node `path` names and return the bits it now holds. The
@@ -1527,17 +1591,19 @@ impl FakeFs {
         change: AttrChange,
         bits: u32,
     ) -> Result<u32, FsError> {
-        let physical = self.resolve(path, true).map_err(|error| match error {
+        let mut guard = self.lock();
+        let p = &mut *guard;
+        let physical = self.resolve(p, path, true).map_err(|error| match error {
             FsError::NoSuchDirectory(_) => FsError::NoSuchFile,
             other => other,
         })?;
-        if self.node_at(&physical).is_none() {
+        if self.node_at(p, &physical).is_none() {
             return Err(FsError::NoSuchFile);
         }
         if self.snapshot.is_ro(&physical) {
             return Err(FsError::ReadOnly);
         }
-        let held = self.overlay.attrs.get(&physical).copied();
+        let held = p.attrs.get(&physical).copied();
         let current = held.unwrap_or(0);
         let next = match change {
             AttrChange::Add => current | bits,
@@ -1555,7 +1621,7 @@ impl FakeFs {
                 return Err(error.into());
             }
         }
-        self.overlay.attrs.insert(physical, next);
+        p.attrs.insert(physical, next);
         Ok(next)
     }
 }
@@ -1570,6 +1636,12 @@ pub enum AttrChange {
     Add,
     Remove,
     Replace,
+}
+
+/// Bytes charged for the overlay node at `physical`: its blob's materialized bytes, zero for
+/// anything else.
+fn overlay_owned_bytes(p: &Persistent, physical: &str) -> u64 {
+    p.overlay.nodes.get(physical).map_or(0, node_owned_bytes)
 }
 
 /// The bytes a node was charged: a regular file's materialized blob bytes, nothing for the rest.
@@ -2050,6 +2122,11 @@ fn render_mountinfo(table: &[MountEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolve_in(fs: &FakeFs, path: &str, follow_final: bool) -> Result<String, FsError> {
+        let p = fs.lock();
+        fs.resolve(&p, path, follow_final)
+    }
 
     fn read_string(fs: &FakeFs, path: &str) -> String {
         String::from_utf8(fs.read_all(path, 8192).unwrap()).unwrap()
@@ -2569,13 +2646,13 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
     fn the_usrmerge_symlinks_resolve_to_the_physical_paths() {
         let fs = FakeFs::new();
         assert_eq!(
-            fs.resolve("/bin/busybox", true).unwrap(),
+            resolve_in(&fs, "/bin/busybox", true).unwrap(),
             "/usr/bin/busybox"
         );
-        assert_eq!(fs.resolve("/var/run/.x", true).unwrap(), "/run/.x");
-        assert_eq!(fs.resolve("/var/run/..", true).unwrap(), "/");
-        assert_eq!(fs.resolve("/lib64", false).unwrap(), "/lib64");
-        assert_eq!(fs.resolve("/lib64", true).unwrap(), "/usr/lib64");
+        assert_eq!(resolve_in(&fs, "/var/run/.x", true).unwrap(), "/run/.x");
+        assert_eq!(resolve_in(&fs, "/var/run/..", true).unwrap(), "/");
+        assert_eq!(resolve_in(&fs, "/lib64", false).unwrap(), "/lib64");
+        assert_eq!(resolve_in(&fs, "/lib64", true).unwrap(), "/usr/lib64");
         assert_eq!(
             fs.read_all("/bin/busybox", 64).unwrap(),
             fs.read_all("/usr/bin/busybox", 64).unwrap()
@@ -2610,13 +2687,16 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
                 binary.path
             );
             let merged = binary.path.strip_prefix("/usr").unwrap();
-            assert_eq!(fs.resolve(merged, true).unwrap(), binary.path);
+            assert_eq!(resolve_in(&fs, merged, true).unwrap(), binary.path);
             let last = binary.size - 1;
             assert_eq!(fs.read_range(merged, last, 10).unwrap().len(), 1);
             assert_eq!(fs.read_range(merged, binary.size, 10), Ok(Vec::new()));
         }
-        assert_eq!(fs.resolve("/bin/sh", true).unwrap(), "/usr/bin/dash");
-        assert_eq!(fs.resolve("/usr/bin/sh", false).unwrap(), "/usr/bin/sh");
+        assert_eq!(resolve_in(&fs, "/bin/sh", true).unwrap(), "/usr/bin/dash");
+        assert_eq!(
+            resolve_in(&fs, "/usr/bin/sh", false).unwrap(),
+            "/usr/bin/sh"
+        );
         assert_eq!(
             fs.read_all("/bin/sh", 64).unwrap(),
             fs.read_all("/bin/dash", 64).unwrap()
@@ -2650,25 +2730,33 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
     #[test]
     fn a_symlink_cycle_gives_eloop_after_forty_hops() {
         let mut fs = FakeFs::new();
-        fs.overlay.nodes.insert("/tmp/a".into(), Node::symlink("b"));
-        fs.overlay.nodes.insert("/tmp/b".into(), Node::symlink("a"));
-        assert_eq!(fs.resolve("/tmp/a", true), Err(FsError::TooManyLinks));
+        fs.lock()
+            .overlay
+            .nodes
+            .insert("/tmp/a".into(), Node::symlink("b"));
+        fs.lock()
+            .overlay
+            .nodes
+            .insert("/tmp/b".into(), Node::symlink("a"));
+        assert_eq!(resolve_in(&fs, "/tmp/a", true), Err(FsError::TooManyLinks));
         assert_eq!(fs.read_all("/tmp/a", 1), Err(FsError::TooManyLinks));
         assert!(!fs.is_dir("/tmp/a") && !fs.file_exists("/tmp/a"));
         // A chain one link short of the cap still resolves; one over does not.
         for i in 0..40 {
-            fs.overlay
+            fs.lock()
+                .overlay
                 .nodes
                 .insert(format!("/tmp/l{i}"), Node::symlink(&format!("l{}", i + 1)));
         }
-        fs.overlay
+        fs.lock()
+            .overlay
             .nodes
             .insert("/tmp/l40".into(), Node::symlink("/etc/hostname"));
-        assert_eq!(fs.resolve("/tmp/l1", true).unwrap(), "/etc/hostname");
-        assert_eq!(fs.resolve("/tmp/l0", true), Err(FsError::TooManyLinks));
+        assert_eq!(resolve_in(&fs, "/tmp/l1", true).unwrap(), "/etc/hostname");
+        assert_eq!(resolve_in(&fs, "/tmp/l0", true), Err(FsError::TooManyLinks));
         // `rm` acts on the link itself, so it works on a cycle.
         assert_eq!(fs.remove_path("/tmp/a"), Ok(true));
-        assert!(fs.overlay.tombstones.contains("/tmp/a"));
+        assert!(fs.lock().overlay.tombstones.contains("/tmp/a"));
     }
 
     #[test]
@@ -2787,13 +2875,14 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
         assert_eq!(fs.write_file("/dev/null", b"x"), Ok(()));
         assert_eq!(fs.read_all("/dev/null", 16), Ok(Vec::new()));
         assert!(
-            !fs.overlay.nodes.contains_key("/dev/null"),
+            !fs.lock().overlay.nodes.contains_key("/dev/null"),
             "a discarded write stores nothing"
         );
         assert_eq!(fs.read_all("/dev/zero", 4), Ok(vec![0, 0, 0, 0]));
         assert_eq!(fs.write_file("/dev/zero", b"x"), Ok(()));
         // No persona lists /dev/full, so the device is injected to exercise its rules.
-        fs.overlay
+        fs.lock()
+            .overlay
             .nodes
             .insert("/dev/full".into(), Node::device(Device::Full));
         assert_eq!(fs.write_file("/dev/full", b"x"), Err(FsError::NoSpace));
@@ -3035,5 +3124,126 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
             Err(FsError::NoSpace)
         );
         assert_eq!(b.write_file("/data/local/tmp/b", &[1; 7]), Ok(()));
+    }
+
+    #[test]
+    fn shared_filesystems_see_each_others_files_dirs_modes_and_removals() {
+        let base = FakeFs::new();
+        let mut fs1 = base.share();
+        let mut fs2 = base.share();
+
+        assert_eq!(fs1.write_file("/tmp/from-one", b"alpha-bytes"), Ok(()));
+        assert_eq!(
+            fs2.read_all("/tmp/from-one", 64),
+            Ok(b"alpha-bytes".to_vec())
+        );
+        assert_eq!(fs2.write_file("/tmp/from-two", b"beta"), Ok(()));
+        assert_eq!(fs1.read_all("/tmp/from-two", 64), Ok(b"beta".to_vec()));
+        assert_eq!(
+            fs1.read_all("/tmp/from-one", 64),
+            Ok(b"alpha-bytes".to_vec())
+        );
+        // The base handle is one more view of the same files.
+        assert_eq!(base.read_all("/tmp/from-two", 64), Ok(b"beta".to_vec()));
+
+        assert_eq!(fs1.make_dir("/tmp/dir-one"), Ok(()));
+        assert!(fs2.is_dir("/tmp/dir-one"));
+        assert_eq!(fs2.make_dir("/tmp/dir-one"), Err(FsError::Exists));
+        assert!(
+            fs2.list_dir("/tmp")
+                .unwrap()
+                .contains(&"dir-one".to_string())
+        );
+
+        assert!(!fs2.is_executable("/tmp/from-one"));
+        assert!(fs1.mark_executable("/tmp/from-one"));
+        assert!(fs2.is_executable("/tmp/from-one"));
+
+        assert_eq!(fs1.create_symlink("/tmp/link-one", "/etc/hostname"), Ok(()));
+        assert_eq!(
+            fs2.link_target("/tmp/link-one").as_deref(),
+            Some("/etc/hostname")
+        );
+
+        assert_eq!(
+            fs1.change_attrs("/tmp/from-two", AttrChange::Add, ATTR_IMMUTABLE),
+            Ok(ATTR_IMMUTABLE)
+        );
+        assert_eq!(fs2.attrs("/tmp/from-two"), Some(ATTR_IMMUTABLE));
+
+        // A baked file removed through one channel is gone through the other.
+        assert_eq!(fs1.remove_path("/etc/hostname"), Ok(true));
+        assert_eq!(fs2.read_all("/etc/hostname", 64), Err(FsError::NoSuchFile));
+        assert!(!fs2.file_exists("/etc/hostname"));
+        assert!(
+            !fs2.list_dir("/etc")
+                .unwrap()
+                .contains(&"hostname".to_string())
+        );
+        // So is a file the other channel created.
+        assert_eq!(fs2.remove_path("/tmp/from-one"), Ok(true));
+        assert_eq!(fs1.read_all("/tmp/from-one", 64), Err(FsError::NoSuchFile));
+        assert_eq!(fs1.attrs("/tmp/from-one"), None);
+    }
+
+    #[test]
+    fn shared_filesystems_keep_generated_nodes_per_instance() {
+        let base = FakeFs::new();
+        let mut fs1 = base.share();
+        let fs2 = base.share();
+        let proc_node = Node::regular(Blob::from_bytes(&b"pid-4242-only"[..]), MODE_FILE);
+        fs1.set_generated(HashMap::from([
+            (
+                "/proc/4242".to_string(),
+                Node::directory(vec!["cmdline".into()]),
+            ),
+            ("/proc/4242/cmdline".to_string(), proc_node),
+        ]));
+        assert!(fs1.is_dir("/proc/4242"));
+
+        assert_eq!(
+            fs1.read_all("/proc/4242/cmdline", 64),
+            Ok(b"pid-4242-only".to_vec())
+        );
+        assert_eq!(
+            fs2.read_all("/proc/4242/cmdline", 64),
+            Err(FsError::NoSuchFile)
+        );
+        assert!(base.list_dir("/proc/4242").is_none());
+        assert!(fs2.list_dir("/proc/4242").is_none());
+        // A fresh share starts empty even when its source holds generated nodes.
+        assert!(fs1.share().list_dir("/proc/4242").is_none());
+    }
+
+    #[test]
+    fn shared_filesystems_charge_one_budget() {
+        let base = FakeFs::new();
+        let mut fs1 = base.share();
+        let fs2 = base.share();
+        assert!(Arc::ptr_eq(fs1.budget(), fs2.budget()));
+        assert!(Arc::ptr_eq(base.budget(), fs2.budget()));
+        let before = fs2.budget().owned_bytes_used();
+        assert_eq!(fs1.write_file("/tmp/charged", &[7; 33]), Ok(()));
+        // 33 content bytes plus the 12-byte path.
+        assert_eq!(fs2.budget().owned_bytes_used(), before + 33 + 12);
+        assert_eq!(fs2.budget().overlay_nodes_used(), 1);
+    }
+
+    #[test]
+    fn a_standalone_filesystem_is_isolated_from_other_standalone_ones() {
+        let mut a = FakeFs::new();
+        let b = FakeFs::new();
+        assert_eq!(a.write_file("/tmp/only-a", b"x"), Ok(()));
+        assert_eq!(a.read_all("/tmp/only-a", 8), Ok(b"x".to_vec()));
+        assert_eq!(b.read_all("/tmp/only-a", 8), Err(FsError::NoSuchFile));
+        assert_eq!(a.remove_path("/etc/hostname"), Ok(true));
+        assert!(b.file_exists("/etc/hostname"));
+        assert!(!a.file_exists("/etc/hostname"));
+    }
+
+    #[test]
+    fn a_filesystem_stays_send_for_the_connection_task() {
+        fn assert_send<T: Send>() {}
+        assert_send::<FakeFs>();
     }
 }

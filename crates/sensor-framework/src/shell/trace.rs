@@ -294,6 +294,141 @@ pub enum BudgetHit {
     Nodes,
 }
 
+/// How well the fake shell handled one input line, for the operator's coverage measure. Derived
+/// from the trace by [`LineTrace::classify`] and shipped as a short word on the command_exec
+/// event; the trace itself never leaves the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum CommandClass {
+    Supported,
+    Partial,
+    Unknown,
+    ParseLimit,
+}
+
+impl CommandClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Partial => "partial",
+            Self::Unknown => "unknown",
+            Self::ParseLimit => "parse_limit",
+        }
+    }
+}
+
+impl HandlerId {
+    /// Handlers that capture intent or answer with a canned reply instead of modeling the
+    /// command: attacker input is recorded but the behavior is not reproduced.
+    fn is_canned(self) -> bool {
+        matches!(
+            self,
+            Self::Nc
+                | Self::Wget
+                | Self::Curl
+                | Self::SourceEval
+                | Self::Getenforce
+                | Self::Pm
+                | Self::Am
+                | Self::Wm
+                | Self::Dumpsys
+                | Self::Screencap
+                | Self::Logcat
+        )
+    }
+}
+
+impl CommandTrace {
+    /// This command and everything nested in it, parents first.
+    fn walk<'a>(&'a self, out: &mut Vec<&'a CommandTrace>) {
+        out.push(self);
+        for inner in &self.reentry {
+            inner.walk(out);
+        }
+    }
+
+    /// True when no handler modeled the command: an unknown name, a path that is not a file the
+    /// session can run (status 127), or a multi-call binary that answered "applet not found"
+    /// (status 127 with nothing run beneath it). A path that exists but cannot run (126) is a
+    /// modeled outcome, not a gap, and a saved executable that ran is modeled too.
+    fn is_unhandled(&self) -> bool {
+        match self.resolved {
+            HandlerId::NotFound | HandlerId::EnableNotFound => true,
+            HandlerId::PathInvoke => self.status == 127,
+            HandlerId::Busybox | HandlerId::Toybox | HandlerId::Toolbox => {
+                self.status == 127 && self.reentry.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    /// The first token that names a program: this command's, or the first nested command's when
+    /// this one is a pipeline or compound command with no tokens of its own.
+    fn first_program(&self) -> Option<&str> {
+        self.tokens
+            .first()
+            .map(String::as_str)
+            .or_else(|| self.reentry.iter().find_map(CommandTrace::first_program))
+    }
+}
+
+impl LineTrace {
+    /// The first top-level command that ran.
+    pub fn primary_command(&self) -> Option<&CommandTrace> {
+        self.segments.iter().find_map(|s| s.command.as_ref())
+    }
+
+    /// Resolved basename of the program the line starts with, `None` for a line with no program
+    /// token (redirection-only, or nothing ran).
+    pub fn primary_basename(&self) -> Option<&str> {
+        self.primary_command()
+            .and_then(CommandTrace::first_program)
+            .map(super::command_basename)
+    }
+
+    /// Exit status of the last top-level command that ran, which is what the line reports to a
+    /// following `$?`. `None` when nothing ran.
+    pub fn final_status(&self) -> Option<u8> {
+        self.segments
+            .iter()
+            .rev()
+            .find_map(|s| s.command.as_ref())
+            .map(|c| c.status)
+    }
+
+    /// Coverage class of the line, first match wins:
+    ///
+    /// 1. `ParseLimit`: a work, depth, download, owned-bytes or node cap cut the line short
+    ///    (`budget.hit`), so the rest of the line was not modeled.
+    /// 2. `Unknown`: any command anywhere in the line (nested commands included) had no handler:
+    ///    `NotFound`, `EnableNotFound`, a `PathInvoke` that exited 127, or a multi-call binary
+    ///    that answered "applet not found". A `PathInvoke` that exited otherwise (126, or a saved
+    ///    executable that ran) counts as modeled.
+    /// 3. `Partial`: any command was outside the grammar subset (`unsupported` set or
+    ///    `ParseNode::Unsupported`), or resolved to a canned or intent-only handler: `Nc`,
+    ///    `Wget`, `Curl`, `SourceEval`, `Getenforce`, `Pm`, `Am`, `Wm`, `Dumpsys`, `Screencap`,
+    ///    `Logcat`.
+    /// 4. `Supported`: everything else. A line with no command at all (nothing ran) also lands
+    ///    here; blank lines never reach a class because they emit no event.
+    pub fn classify(&self) -> CommandClass {
+        if self.budget.hit.is_some() {
+            return CommandClass::ParseLimit;
+        }
+        let mut all = Vec::new();
+        for command in self.segments.iter().filter_map(|s| s.command.as_ref()) {
+            command.walk(&mut all);
+        }
+        if all.iter().any(|c| c.is_unhandled()) {
+            return CommandClass::Unknown;
+        }
+        if all.iter().any(|c| {
+            c.unsupported.is_some() || c.node == ParseNode::Unsupported || c.resolved.is_canned()
+        }) {
+            return CommandClass::Partial;
+        }
+        CommandClass::Supported
+    }
+}
+
 impl CommandTrace {
     pub(super) fn open(tokens: &[&str], node: ParseNode, resolved: HandlerId) -> Self {
         Self {

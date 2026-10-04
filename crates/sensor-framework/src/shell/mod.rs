@@ -92,8 +92,8 @@ use registry::{HandlerFn, Registry, resolve_proc_self};
 
 pub use ast::UnsupportedKind;
 pub use trace::{
-    BudgetHit, BudgetTrace, CommandTrace, FsDenied, FsEffect, HandlerId, LineTrace, ParseNode,
-    RunDecision, SegmentTrace, TraceEventKind,
+    BudgetHit, BudgetTrace, CommandClass, CommandTrace, FsDenied, FsEffect, HandlerId, LineTrace,
+    ParseNode, RunDecision, SegmentTrace, TraceEventKind,
 };
 
 /// Cap applied to the sanitized command line captured in `metadata.command`. Matches
@@ -707,7 +707,7 @@ impl FakeShell {
         // >20k `command_exec` events this way). In both cases we STILL dispatch below so the fake
         // shell keeps responding - a silently dead session is itself a tell - but emit at most ONE
         // marker event per session per flood kind rather than one event per garbage line.
-        let events = if is_binary_line(&decoded) {
+        let mut events = if is_binary_line(&decoded) {
             self.trace.binary_line = true;
             if std::mem::replace(&mut self.binary_flagged, true) {
                 Vec::new()
@@ -802,7 +802,45 @@ impl FakeShell {
 
         let output = self.run_input(&decoded);
         tracing::debug!(target: "propolis::shell::trace", trace = ?self.trace, "shell line");
+        // Only the normal path pushed CommandExec; the flood markers carry no trace worth
+        // classifying. The trace is final here, so the coverage fields are added in place and
+        // the event order is untouched.
+        if self.trace.events.first() == Some(&TraceEventKind::CommandExec)
+            && let Some(obj) = events.first_mut().and_then(|e| e.metadata.as_object_mut())
+        {
+            self.annotate_coverage(obj);
+        }
         (output, events)
+    }
+
+    /// Operator-facing coverage fields for the command_exec event: derived category words and
+    /// small scalars only, never the trace itself.
+    fn annotate_coverage(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
+        let trace = &self.trace;
+        obj.insert(
+            "classification".to_string(),
+            serde_json::json!(trace.classify().as_str()),
+        );
+        if let Some(name) = trace.primary_basename() {
+            obj.insert(
+                // Not `resolved_*`: `no_trace_byte_reaches_output` bans trace field names from
+                // event text.
+                "command_basename".to_string(),
+                serde_json::json!(sanitize_value(name, MAX_URL_LEN)),
+            );
+        }
+        if let Some(status) = trace.final_status() {
+            obj.insert("status".to_string(), serde_json::json!(status));
+        }
+        let persona = match self.flavor {
+            ShellFlavor::Bash => "ubuntu",
+            ShellFlavor::AndroidSh => "android",
+        };
+        obj.insert("persona".to_string(), serde_json::json!(persona));
+        obj.insert(
+            "emulator_version".to_string(),
+            serde_json::json!(env!("CARGO_PKG_VERSION")),
+        );
     }
 
     /// Reset what is scoped to one input line: the work allowance, the trace, the stack of
@@ -2811,6 +2849,8 @@ mod budget_tests;
 
 #[cfg(test)]
 mod busybox_tests;
+#[cfg(test)]
+mod classify_tests;
 #[cfg(test)]
 mod dd_tests;
 #[cfg(test)]

@@ -551,6 +551,47 @@ async fn multiple_commands_each_captured_as_separate_events() {
 }
 
 #[tokio::test]
+async fn a_telnet_connection_keeps_its_own_files_and_a_new_one_starts_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+    let (addr, handle) = sensor_telnet::start_test_server(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        wan_resolver,
+        test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    login(&mut first, b"root", b"pass").await;
+    first
+        .write_all(b"echo telnet-marker-8864 > /tmp/telnet_x\r\n")
+        .await
+        .unwrap();
+    read_until_contains(&mut first, b"# ").await;
+    first.write_all(b"cat /tmp/telnet_x\r\n").await.unwrap();
+    let seen = read_until_contains(&mut first, b"telnet-marker-8864\r\n").await;
+    assert!(!seen.is_empty());
+
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    login(&mut second, b"root", b"pass").await;
+    second.write_all(b"cat /tmp/telnet_x\r\n").await.unwrap();
+    let reply = read_until_contains(&mut second, b"# ").await;
+    assert!(
+        !String::from_utf8_lossy(&reply).contains("telnet-marker-8864"),
+        "a new connection saw the previous connection's file"
+    );
+
+    drop(first);
+    drop(second);
+    handle.abort();
+}
+
+#[tokio::test]
 async fn no_outbound_connections_from_wget_in_shell() {
     // Mirrors sensor-ssh's own `no_outbound_connections` test: the shared FakeShell's wget/curl
     // handlers must perform zero real network I/O regardless of which sensor drives them.

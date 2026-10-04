@@ -1033,6 +1033,62 @@ async fn shell_streams_of_one_connection_share_one_command_ceiling() {
     srv.handle.abort();
 }
 
+/// Connect, handshake and open one interactive shell, consuming its prompt.
+async fn connect_shell(srv: &TestServer, local_id: u32) -> (TcpStream, u32) {
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let server_id = open_stream(&mut conn, local_id, "shell:").await;
+    let (prompt, _) = read_message(&mut conn).await;
+    acknowledge_wrte(&mut conn, &prompt).await;
+    (conn, server_id)
+}
+
+#[tokio::test]
+async fn shell_streams_of_one_connection_share_a_written_file() {
+    let srv = TestServer::start().await;
+    let (mut conn, first_id) = connect_shell(&srv, 1).await;
+    let second_id = open_stream(&mut conn, 2, "shell:").await;
+    let (prompt, _) = read_message(&mut conn).await;
+    acknowledge_wrte(&mut conn, &prompt).await;
+
+    send_shell_line(
+        &mut conn,
+        1,
+        first_id,
+        "echo adb-marker-6149 > /data/local/tmp/shared_x",
+    )
+    .await;
+    let seen = send_shell_line(&mut conn, 2, second_id, "cat /data/local/tmp/shared_x").await;
+    assert!(
+        seen.contains("adb-marker-6149"),
+        "second stream saw: {seen:?}"
+    );
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn a_new_adb_connection_does_not_see_files_written_by_an_earlier_one() {
+    let srv = TestServer::start().await;
+    let (mut first, first_id) = connect_shell(&srv, 1).await;
+    send_shell_line(
+        &mut first,
+        1,
+        first_id,
+        "echo adb-leak-2706 > /data/local/tmp/leak_x",
+    )
+    .await;
+    let own = send_shell_line(&mut first, 1, first_id, "cat /data/local/tmp/leak_x").await;
+    assert!(own.contains("adb-leak-2706"), "own connection saw: {own:?}");
+
+    let (mut second, second_id) = connect_shell(&srv, 1).await;
+    let seen = send_shell_line(&mut second, 1, second_id, "cat /data/local/tmp/leak_x").await;
+    assert!(
+        !seen.contains("adb-leak-2706"),
+        "a new connection saw the previous connection's file: {seen:?}"
+    );
+    srv.handle.abort();
+}
+
 #[tokio::test]
 async fn a_connection_that_has_spent_its_egress_allowance_is_dropped_after_that_reply() {
     let srv = TestServer::start().await;

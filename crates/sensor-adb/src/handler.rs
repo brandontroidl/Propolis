@@ -594,6 +594,9 @@ pub async fn handle_connection(
     // The connection's one budget, cloned into every stream's shell so the streams share a ceiling
     // instead of each holding a full one.
     let budget = ConnectionBudget::new(limits_from(&bounds));
+    // The connection's one filesystem: each shell stream opens a share of it, so a file written on
+    // one stream is readable on the next and a new connection starts clean.
+    let base_fs = FakeFs::android().with_budget(budget.clone());
     let mut reader = MessageReader::new(bounds, session_end.clone());
 
     // ---- CNXN handshake ----
@@ -644,6 +647,7 @@ pub async fn handle_connection(
                     &session_end,
                     max_captured_bytes,
                     &budget,
+                    &base_fs,
                     peer_maxdata,
                     write_timeout,
                 )
@@ -759,6 +763,7 @@ async fn handle_open(
     session_end: &SessionEnd,
     max_captured_bytes: u64,
     budget: &Arc<ConnectionBudget>,
+    base_fs: &FakeFs,
     peer_maxdata: usize,
     write_timeout: Duration,
 ) -> Result<(), ()> {
@@ -798,7 +803,7 @@ async fn handle_open(
             };
             // The Android device this sensor announces, not the Linux server the other sensors
             // present: a Nexus 5 banner followed by an Ubuntu bash was a one-command tell.
-            let mut shell = FakeShell::android(FakeFs::android(), ctx).with_budget(budget.clone());
+            let mut shell = FakeShell::android(base_fs.share(), ctx).with_budget(budget.clone());
 
             write_or_err(
                 stream,

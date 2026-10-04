@@ -385,6 +385,9 @@ async fn handle_session(
     let mut auth_state = AuthState::new(source_ip, wan_ip, session_id);
     // The one budget of this connection, cloned into every shell it opens.
     let budget = ConnectionBudget::new(budget_limits);
+    // The one filesystem of this connection: every shell and exec opens a share of it, so a file
+    // written on one channel is readable on the next, and a new connection starts clean.
+    let base_fs = FakeFs::new().with_budget(budget.clone());
 
     // Emit honeypot_connection (authenticated=false, pre-auth).
     let conn_event = auth_state.emit_connection_event();
@@ -557,7 +560,7 @@ async fn handle_session(
                             protocol_label: "ssh".to_string(),
                             session_id: Some(session_id),
                         };
-                        let shell = FakeShell::new(FakeFs::new(), ctx).with_budget(budget.clone());
+                        let shell = FakeShell::new(base_fs.share(), ctx).with_budget(budget.clone());
                         let prompt = shell.prompt();
                         state.handler = ChannelHandler::Shell(Box::new(shell), Vec::new());
                         if state.flow.pty {
@@ -583,7 +586,7 @@ async fn handle_session(
                             session_id: Some(session_id),
                         };
                         let mut shell =
-                            FakeShell::exec(FakeFs::new(), shell_ctx).with_budget(budget.clone());
+                            FakeShell::exec(base_fs.share(), shell_ctx).with_budget(budget.clone());
                         let (output, events) = shell.handle_input(&cmd);
                         for event in &events {
                             emitter.append(event).await?;

@@ -1184,3 +1184,166 @@ async fn a_peer_that_stalls_mid_handshake_is_dropped_at_the_read_timeout() {
         "a stalled handshake must be dropped at the read timeout, well before max_duration"
     );
 }
+
+async fn start_server(
+    dir: &std::path::Path,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.join("events.jsonl"),
+        dir.join("spool"),
+        dir.join("host_key"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        test_bounds(),
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.join("outbox"),
+    )
+    .await
+    .unwrap()
+}
+
+async fn login(addr: std::net::SocketAddr) -> russh::client::Handle<TestHandler> {
+    let config = Arc::new(russh::client::Config::default());
+    let mut session = russh::client::connect(config, addr, TestHandler)
+        .await
+        .unwrap();
+    assert!(
+        session
+            .authenticate_password("root", "password")
+            .await
+            .unwrap()
+            .success()
+    );
+    session
+}
+
+/// Run one exec request on a fresh channel and return its stdout.
+async fn exec_stdout(session: &russh::client::Handle<TestHandler>, cmd: &str) -> Vec<u8> {
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel.exec(false, cmd.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    while let Some(message) = tokio::time::timeout(Duration::from_secs(10), channel.wait())
+        .await
+        .expect("timed out waiting for exec output")
+    {
+        match message {
+            russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+            russh::ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Open an interactive shell channel and swallow its first prompt.
+async fn open_shell(
+    session: &russh::client::Handle<TestHandler>,
+) -> russh::Channel<russh::client::Msg> {
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel
+        .request_pty(false, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .unwrap();
+    channel.request_shell(false).await.unwrap();
+    let (_, closed) = read_reply(&mut channel).await;
+    assert!(!closed, "the shell opens with a prompt");
+    channel
+}
+
+/// Send one line to a shell channel and return everything up to the next prompt.
+async fn shell_line(channel: &mut russh::Channel<russh::client::Msg>, line: &str) -> String {
+    channel.data(format!("{line}\n").as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), channel.wait())
+            .await
+            .expect("timed out waiting for the reply");
+        match message {
+            Some(russh::ChannelMsg::Data { data }) => {
+                out.extend_from_slice(&data);
+                if out.ends_with(b"# ") {
+                    break;
+                }
+            }
+            Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) | None => break,
+            Some(_) => {}
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test]
+async fn a_file_written_by_one_exec_is_read_by_the_next_exec_of_the_same_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    exec_stdout(&session, "echo exec-marker-7431 > /tmp/exec_x").await;
+    let read_back = exec_stdout(&session, "cat /tmp/exec_x").await;
+    assert_eq!(read_back, b"exec-marker-7431\n");
+
+    drop(session);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_new_connection_does_not_see_files_written_by_an_earlier_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+
+    let first = login(addr).await;
+    exec_stdout(&first, "echo first-conn-5528 > /tmp/leak_x").await;
+    assert_eq!(
+        exec_stdout(&first, "cat /tmp/leak_x").await,
+        b"first-conn-5528\n"
+    );
+
+    let second = login(addr).await;
+    let out = exec_stdout(&second, "cat /tmp/leak_x").await;
+    assert!(
+        !String::from_utf8_lossy(&out).contains("first-conn-5528"),
+        "a new connection saw the previous connection's file"
+    );
+
+    drop(first);
+    drop(second);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn two_shell_channels_of_one_connection_share_a_written_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    let mut first = open_shell(&session).await;
+    let mut second = open_shell(&session).await;
+    shell_line(&mut first, "echo shell-marker-9082 > /tmp/shell_x").await;
+    let seen = shell_line(&mut second, "cat /tmp/shell_x").await;
+    assert!(
+        seen.contains("shell-marker-9082"),
+        "second shell saw: {seen:?}"
+    );
+
+    drop(first);
+    drop(second);
+    drop(session);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_shell_sees_a_file_written_by_an_earlier_exec_of_the_same_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    exec_stdout(&session, "echo mixed-marker-3317 > /tmp/mixed_x").await;
+    let mut shell = open_shell(&session).await;
+    let seen = shell_line(&mut shell, "cat /tmp/mixed_x").await;
+    assert!(seen.contains("mixed-marker-3317"), "shell saw: {seen:?}");
+
+    drop(shell);
+    drop(session);
+    handle.abort();
+}

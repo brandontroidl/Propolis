@@ -258,6 +258,20 @@ struct SyncState {
     /// Held so `Drop` can submit an unfinished SEND whichever way the stream or session ends,
     /// the listener's `max_duration` cancellation included.
     handoff: Arc<CaptureHandoff>,
+    /// A share of the connection's filesystem: a completed push is also written into it, so a
+    /// later shell command on the connection can read the file back.
+    fs: FakeFs,
+}
+
+/// The fake-tree path a push to `raw` is written to, or `None` when it must not be: empty,
+/// relative, carrying a control character, or holding any `..` component. The path is
+/// attacker-supplied, so a climbing path is refused rather than normalized into somewhere it did
+/// not name. The overlay has no host filesystem underneath; the result only keys the in-memory tree.
+fn push_destination(raw: &str) -> Option<&str> {
+    let usable = raw.starts_with('/')
+        && !raw.chars().any(char::is_control)
+        && !raw.split('/').any(|component| component == "..");
+    usable.then_some(raw)
 }
 
 /// A SEND still open when the stream is closed, the session ends, or the handler future is
@@ -284,6 +298,7 @@ impl SyncState {
         wan_ip: Option<IpAddr>,
         session_id: Uuid,
         handoff: Arc<CaptureHandoff>,
+        fs: FakeFs,
     ) -> Self {
         Self {
             buf: Vec::new(),
@@ -292,6 +307,20 @@ impl SyncState {
             wan_ip,
             session_id,
             handoff,
+            fs,
+        }
+    }
+
+    /// Best effort and additive: the quarantine capture is the record of the push, this only gives
+    /// the attacker's next command something to find. A refused write (budget, read-only mount,
+    /// bad name) is dropped. A body cut by `MAX_SYNC_BODY` is not written, since a truncated payload
+    /// that "ran" would be a worse tell than a missing one.
+    fn land_in_fake_fs(&mut self, pending: &PendingSend) {
+        if pending.wire_bytes != pending.body.len() as u64 {
+            return;
+        }
+        if let Some(dest) = push_destination(&pending.orig_name) {
+            let _ = self.fs.write_file(dest, &pending.body);
         }
     }
 
@@ -349,6 +378,7 @@ impl SyncState {
                     // DONE's length field IS the mtime - no further payload bytes to consume.
                     self.buf.drain(..adb_proto::SYNC_HEADER_LEN);
                     if let Some(pending) = self.pending_send.take() {
+                        self.land_in_fake_fs(&pending);
                         upload = Some(self.build_capture_job(pending, true));
                     }
                     response.extend_from_slice(&adb_proto::build_sync_message(
@@ -893,6 +923,7 @@ async fn handle_open(
                         wan_ip,
                         session_id,
                         handoff.clone(),
+                        base_fs.share(),
                     )),
                 ),
             );
@@ -1177,6 +1208,7 @@ mod tests {
             None,
             Uuid::now_v7(),
             handoff,
+            FakeFs::android(),
         );
         (state, dir)
     }
@@ -1200,6 +1232,7 @@ mod tests {
             None,
             Uuid::now_v7(),
             handoff.clone(),
+            FakeFs::android(),
         );
         sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
@@ -1223,6 +1256,7 @@ mod tests {
             None,
             Uuid::now_v7(),
             handoff.clone(),
+            FakeFs::android(),
         );
         sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
@@ -1238,6 +1272,73 @@ mod tests {
         assert!(
             handoff.submit(probe_job()).is_err(),
             "the reset submitted the DATA it had"
+        );
+    }
+
+    fn push(fs: FakeFs, path: &str, body: &[u8]) -> (Vec<u8>, Option<CaptureJob>) {
+        let (handoff, _dir) = test_handoff(16);
+        let mut sync = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            fs,
+        );
+        let mut wire =
+            adb_proto::build_sync_message(adb_proto::SYNC_SEND, format!("{path},33188").as_bytes());
+        wire.extend_from_slice(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, body));
+        wire.extend_from_slice(&adb_proto::build_sync_done(1_700_000_000));
+        sync.feed(&wire)
+    }
+
+    #[test]
+    fn push_destination_denies_traversal_relative_and_control_characters() {
+        assert_eq!(
+            push_destination("/data/local/tmp/x"),
+            Some("/data/local/tmp/x")
+        );
+        assert_eq!(push_destination("x"), None);
+        assert_eq!(push_destination(""), None);
+        assert_eq!(push_destination("/data/local/tmp/../../etc/x"), None);
+        assert_eq!(push_destination("/data/a\0b"), None);
+        assert_eq!(push_destination("/data/a\nb"), None);
+    }
+
+    #[test]
+    fn a_completed_push_lands_in_the_shared_fs_and_still_yields_the_capture() {
+        let base = FakeFs::android();
+        let (_, upload) = push(base.share(), "/data/local/tmp/adb_payload", b"ELF-adb-5521");
+        assert_eq!(
+            base.read_all("/data/local/tmp/adb_payload", 64).unwrap(),
+            b"ELF-adb-5521"
+        );
+        let job = upload.expect("the capture job is produced exactly as before");
+        assert_eq!(job.body, b"ELF-adb-5521");
+        assert_eq!(job.orig_name, "/data/local/tmp/adb_payload");
+        assert!(!FakeFs::android().file_exists("/data/local/tmp/adb_payload"));
+    }
+
+    #[test]
+    fn a_climbing_or_over_budget_push_is_not_stored_but_still_yields_the_capture() {
+        use sensor_framework::{BudgetLimits, ConnectionBudget};
+        let base = FakeFs::android();
+        let (_, upload) = push(
+            base.share(),
+            "/data/local/tmp/../../../tmp/esc",
+            b"esc-0042",
+        );
+        assert!(upload.is_some());
+        assert!(!base.file_exists("/tmp/esc"));
+
+        let small = FakeFs::android().with_budget(ConnectionBudget::new(BudgetLimits {
+            owned_bytes: 1024,
+            ..BudgetLimits::standard()
+        }));
+        let (_, upload) = push(small.share(), "/data/local/tmp/big", &vec![0xCD; 4096]);
+        assert!(!small.file_exists("/data/local/tmp/big"));
+        assert_eq!(
+            upload.expect("evidence regardless of the fs").body.len(),
+            4096
         );
     }
 

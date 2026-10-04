@@ -594,8 +594,14 @@ async fn handle_session(
 
                         if cmd.starts_with("scp -t ") {
                             // SCP server mode.
-                            let (scp, initial) =
-                                ScpReceiver::new(source_ip, wan_ip, session_id, handoff.clone());
+                            let (scp, initial) = ScpReceiver::new(
+                                source_ip,
+                                wan_ip,
+                                session_id,
+                                handoff.clone(),
+                                base_fs.share(),
+                                &cmd,
+                            );
                             state.handler = ChannelHandler::Scp(scp);
                             state.flow.queue(OutputFd::Stdout, initial);
                             flush_channel_output(
@@ -633,8 +639,13 @@ async fn handle_session(
                     }
                     ChannelAction::Subsystem(name) => {
                         if name == "sftp" {
-                            let sftp =
-                                SftpHandler::new(source_ip, wan_ip, session_id, handoff.clone());
+                            let sftp = SftpHandler::new(
+                                source_ip,
+                                wan_ip,
+                                session_id,
+                                handoff.clone(),
+                                base_fs.share(),
+                            );
                             state.handler = ChannelHandler::Sftp(sftp);
                         }
                     }

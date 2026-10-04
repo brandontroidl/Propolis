@@ -1194,3 +1194,123 @@ fn walkdir_or_manual(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     walk(dir, &mut files);
     files
 }
+
+// ---- pushed files land in the connection's fake filesystem ----
+
+/// `sync_push` with the body split across several DATA chunks, for a body over one chunk's limit.
+async fn sync_push_chunked(
+    stream: &mut TcpStream,
+    local_id: u32,
+    server_id: u32,
+    path: &str,
+    body: &[u8],
+) {
+    let send_payload = format!("{path},33188");
+    let mut messages = vec![adb_proto::build_sync_message(
+        adb_proto::SYNC_SEND,
+        send_payload.as_bytes(),
+    )];
+    for chunk in body.chunks(100_000) {
+        messages.push(adb_proto::build_sync_message(adb_proto::SYNC_DATA, chunk));
+    }
+    messages.push(adb_proto::build_sync_done(1_700_000_000));
+    for message in &messages {
+        stream
+            .write_all(&adb_proto::build_wrte(local_id, server_id, message))
+            .await
+            .unwrap();
+        let (h, _) = read_message(stream).await;
+        assert_eq!(h.command, adb_proto::A_OKAY);
+    }
+    let (reply, data) = read_message(stream).await;
+    assert_eq!(reply.command, adb_proto::A_WRTE);
+    assert_eq!(SyncHeader::parse(&data).unwrap().id, adb_proto::SYNC_OKAY);
+    stream
+        .write_all(&adb_proto::build_okay(local_id, server_id))
+        .await
+        .unwrap();
+}
+
+/// Open an interactive shell stream on an existing connection and swallow its prompt.
+async fn open_shell_stream(conn: &mut TcpStream, local_id: u32) -> u32 {
+    let server_id = open_stream(conn, local_id, "shell:").await;
+    let (prompt, _) = read_message(conn).await;
+    acknowledge_wrte(conn, &prompt).await;
+    server_id
+}
+
+#[tokio::test]
+async fn a_pushed_file_is_read_by_a_shell_of_the_same_connection_and_still_captured() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let sync_id = open_stream(&mut conn, 1, "sync:").await;
+
+    let body = b"#!/system/bin/sh\necho adb-dropper-marker-9047\n";
+    sync_push(&mut conn, 1, sync_id, "/data/local/tmp/pushed_x", body).await;
+
+    let shell_id = open_shell_stream(&mut conn, 2).await;
+    let seen = send_shell_line(&mut conn, 2, shell_id, "cat /data/local/tmp/pushed_x").await;
+    assert!(
+        seen.contains("adb-dropper-marker-9047"),
+        "shell saw: {seen:?}"
+    );
+    let listing = send_shell_line(&mut conn, 2, shell_id, "ls /data/local/tmp").await;
+    assert!(listing.contains("pushed_x"), "ls saw: {listing:?}");
+
+    wait_for_upload_event(&srv.log_path).await;
+    let spooled = spooled_files(&srv.spool_dir);
+    assert_eq!(spooled.len(), 1, "the capture path is unchanged");
+    assert_eq!(std::fs::read(&spooled[0]).unwrap(), body);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn a_new_adb_connection_does_not_see_a_file_pushed_on_an_earlier_one() {
+    let srv = TestServer::start().await;
+    let mut first = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut first).await;
+    let sync_id = open_stream(&mut first, 1, "sync:").await;
+    sync_push(
+        &mut first,
+        1,
+        sync_id,
+        "/data/local/tmp/pushed_leak",
+        b"adb-push-leak-3318",
+    )
+    .await;
+
+    let (mut second, second_id) = connect_shell(&srv, 1).await;
+    let seen = send_shell_line(&mut second, 1, second_id, "cat /data/local/tmp/pushed_leak").await;
+    assert!(
+        !seen.contains("adb-push-leak-3318"),
+        "a new connection saw the earlier connection's push: {seen:?}"
+    );
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn a_push_larger_than_the_connection_budget_is_bounded_but_still_captured() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let sync_id = open_stream(&mut conn, 1, "sync:").await;
+
+    // Over the connection's 196608-byte owned-bytes ceiling, under the 10 MB capture cap.
+    let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    sync_push_chunked(&mut conn, 1, sync_id, "/data/local/tmp/huge_push", &body).await;
+
+    let shell_id = open_shell_stream(&mut conn, 2).await;
+    let seen = send_shell_line(&mut conn, 2, shell_id, "cat /data/local/tmp/huge_push").await;
+    assert!(
+        seen.len() < body.len(),
+        "the over-budget push must not be stored whole ({} bytes read back)",
+        seen.len()
+    );
+
+    wait_for_upload_event(&srv.log_path).await;
+    let spooled = spooled_files(&srv.spool_dir);
+    assert_eq!(spooled.len(), 1);
+    assert_eq!(std::fs::read(&spooled[0]).unwrap(), body);
+    srv.handle.abort();
+}

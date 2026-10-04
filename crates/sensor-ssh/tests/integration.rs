@@ -1347,3 +1347,242 @@ async fn a_shell_sees_a_file_written_by_an_earlier_exec_of_the_same_connection()
     drop(session);
     handle.abort();
 }
+
+// ---- uploads land in the connection's fake filesystem ----
+
+/// Read channel data until at least `n` bytes have arrived.
+async fn read_at_least(channel: &mut russh::Channel<russh::client::Msg>, n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        let message = tokio::time::timeout(Duration::from_secs(10), channel.wait())
+            .await
+            .expect("timed out waiting for channel data");
+        match message {
+            Some(russh::ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+            Some(russh::ChannelMsg::Close) | None => panic!("channel closed early: {out:?}"),
+            Some(_) => {}
+        }
+    }
+    out
+}
+
+/// Upload `body` over the SCP sink protocol (`scp -t <target>`), as `scp file host:target` does.
+async fn scp_put(
+    session: &russh::client::Handle<TestHandler>,
+    target: &str,
+    name: &str,
+    body: &[u8],
+) {
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel
+        .exec(false, format!("scp -t {target}").as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(read_at_least(&mut channel, 1).await, [0], "ready ack");
+    channel
+        .data(format!("C0644 {} {name}\n", body.len()).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(read_at_least(&mut channel, 1).await, [0], "header ack");
+    channel.data(body).await.unwrap();
+    channel.data(&[0u8][..]).await.unwrap();
+    assert_eq!(read_at_least(&mut channel, 1).await, [0], "final ack");
+}
+
+fn sftp_packet(msg: u8, parts: &[&[u8]]) -> Vec<u8> {
+    let mut body = vec![msg];
+    for part in parts {
+        body.extend_from_slice(part);
+    }
+    let mut packet = (body.len() as u32).to_be_bytes().to_vec();
+    packet.extend_from_slice(&body);
+    packet
+}
+
+fn sftp_string(bytes: &[u8]) -> Vec<u8> {
+    let mut out = (bytes.len() as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Read one whole SFTP packet (length prefix included) off the channel.
+async fn read_sftp_packet(channel: &mut russh::Channel<russh::client::Msg>) -> Vec<u8> {
+    let head = read_at_least(channel, 4).await;
+    let want = 4 + u32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
+    if head.len() >= want {
+        return head;
+    }
+    let mut packet = head;
+    packet.extend(read_at_least(channel, want - packet.len()).await);
+    packet
+}
+
+/// Upload `body` to `path` over the SFTP subsystem: INIT, OPEN, WRITE, CLOSE.
+async fn sftp_put(session: &russh::client::Handle<TestHandler>, path: &str, body: &[u8]) {
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel.request_subsystem(false, "sftp").await.unwrap();
+    channel
+        .data(&sftp_packet(1, &[&3u32.to_be_bytes()])[..])
+        .await
+        .unwrap();
+    assert_eq!(read_sftp_packet(&mut channel).await[4], 2, "VERSION");
+
+    let open = sftp_packet(
+        3,
+        &[
+            &1u32.to_be_bytes(),
+            &sftp_string(path.as_bytes()),
+            &0x0au32.to_be_bytes(), // WRITE | CREAT
+            &0u32.to_be_bytes(),    // empty attrs
+        ],
+    );
+    channel.data(&open[..]).await.unwrap();
+    let reply = read_sftp_packet(&mut channel).await;
+    assert_eq!(reply[4], 102, "HANDLE");
+    let handle_len = u32::from_be_bytes(reply[9..13].try_into().unwrap()) as usize;
+    let handle = reply[13..13 + handle_len].to_vec();
+
+    let write = sftp_packet(
+        6,
+        &[
+            &2u32.to_be_bytes(),
+            &sftp_string(&handle),
+            &0u64.to_be_bytes(),
+            &sftp_string(body),
+        ],
+    );
+    channel.data(&write[..]).await.unwrap();
+    assert_eq!(read_sftp_packet(&mut channel).await[4], 101, "WRITE status");
+
+    let close = sftp_packet(4, &[&3u32.to_be_bytes(), &sftp_string(&handle)]);
+    channel.data(&close[..]).await.unwrap();
+    assert_eq!(read_sftp_packet(&mut channel).await[4], 101, "CLOSE status");
+}
+
+/// The upload event for the spooled body, proving the evidence path ran.
+async fn expect_capture_of(dir: &std::path::Path, body: &[u8]) {
+    let event = poll_for_malware_upload_within(&dir.join("events.jsonl"), Duration::from_secs(8))
+        .await
+        .expect("the upload must still be captured");
+    let stored = spooled_files(&dir.join("spool"));
+    assert_eq!(stored.len(), 1, "one spooled body");
+    assert_eq!(std::fs::read(&stored[0]).unwrap(), body);
+    assert_eq!(event.metadata["size"], body.len() as u64);
+}
+
+#[tokio::test]
+async fn a_file_uploaded_by_scp_is_read_by_a_later_exec_and_still_captured() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    let body = b"#!/bin/sh\necho scp-dropper-marker-6620\n";
+    scp_put(&session, "/tmp/payload", "payload", body).await;
+
+    assert_eq!(exec_stdout(&session, "cat /tmp/payload").await, body);
+    let listing = String::from_utf8_lossy(&exec_stdout(&session, "ls /tmp").await).into_owned();
+    assert!(listing.contains("payload"), "ls saw: {listing:?}");
+    expect_capture_of(dir.path(), body).await;
+
+    drop(session);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn scp_into_a_directory_names_the_file_after_the_wire_name_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    scp_put(
+        &session,
+        "/var/tmp",
+        "../../etc/dir_drop",
+        b"dir-marker-3094",
+    )
+    .await;
+
+    assert_eq!(
+        exec_stdout(&session, "cat /var/tmp/dir_drop").await,
+        b"dir-marker-3094"
+    );
+    let escaped = exec_stdout(&session, "cat /etc/dir_drop").await;
+    assert!(
+        !String::from_utf8_lossy(&escaped).contains("dir-marker-3094"),
+        "the wire name climbed out of the target"
+    );
+
+    drop(session);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_file_uploaded_by_sftp_is_read_by_a_later_exec_and_still_captured() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    let body = b"ELF-sftp-dropper-marker-7185";
+    sftp_put(&session, "/var/tmp/sftp_payload", body).await;
+
+    assert_eq!(
+        exec_stdout(&session, "cat /var/tmp/sftp_payload").await,
+        body
+    );
+    expect_capture_of(dir.path(), body).await;
+
+    drop(session);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_new_connection_does_not_see_a_file_uploaded_on_an_earlier_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+
+    let first = login(addr).await;
+    scp_put(&first, "/tmp/leak_scp", "leak_scp", b"scp-leak-8841").await;
+    sftp_put(&first, "/tmp/leak_sftp", b"sftp-leak-2157").await;
+    assert_eq!(
+        exec_stdout(&first, "cat /tmp/leak_scp").await,
+        b"scp-leak-8841"
+    );
+
+    let second = login(addr).await;
+    for (path, marker) in [
+        ("/tmp/leak_scp", "scp-leak-8841"),
+        ("/tmp/leak_sftp", "sftp-leak-2157"),
+    ] {
+        let out = exec_stdout(&second, &format!("cat {path}")).await;
+        assert!(
+            !String::from_utf8_lossy(&out).contains(marker),
+            "a new connection saw {path}"
+        );
+    }
+
+    drop(first);
+    drop(second);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn an_upload_larger_than_the_connection_budget_is_bounded_but_still_captured() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    // Over the connection's 196608-byte owned-bytes ceiling, under the 10 MB capture cap.
+    let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    scp_put(&session, "/tmp/huge_drop", "huge_drop", &body).await;
+
+    let seen = exec_stdout(&session, "cat /tmp/huge_drop").await;
+    assert!(
+        seen.len() < body.len(),
+        "the over-budget upload must not be stored whole ({} bytes read back)",
+        seen.len()
+    );
+    expect_capture_of(dir.path(), &body).await;
+
+    drop(session);
+    handle.abort();
+}

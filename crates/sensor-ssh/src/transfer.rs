@@ -22,10 +22,47 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use sensor_framework::fakefs::FakeFs;
 use sensor_framework::{CaptureHandoff, CaptureJob, Uuid, upload_metadata};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
 };
+
+/// Where a relative upload path lands: the login home the fake shell starts in.
+const UPLOAD_HOME: &str = "/root";
+
+/// The fake-tree path an upload named `raw` is written to, or `None` when it must not be.
+///
+/// The path is attacker-supplied, so it is refused outright when it carries a NUL or other control
+/// character or any `..` component, rather than normalized: an upload that climbs is hostile, and
+/// landing it somewhere it did not name would only mislead. A relative path is taken from
+/// [`UPLOAD_HOME`]. The overlay has no host filesystem underneath, so the result is only ever a key
+/// into the in-memory tree.
+fn upload_destination(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.chars().any(char::is_control) {
+        return None;
+    }
+    if raw.split('/').any(|component| component == "..") {
+        return None;
+    }
+    Some(if raw.starts_with('/') {
+        raw.to_string()
+    } else {
+        format!("{UPLOAD_HOME}/{raw}")
+    })
+}
+
+/// The target path of an `scp -t` exec command: what follows the options, quotes stripped.
+fn scp_target(cmd: &str) -> Option<String> {
+    let rest = cmd.strip_prefix("scp -t")?;
+    let target: Vec<&str> = rest
+        .split_whitespace()
+        .skip_while(|token| token.starts_with('-'))
+        .collect();
+    let target = target.join(" ");
+    let target = target.trim_matches(|c| c == '\'' || c == '"');
+    (!target.is_empty()).then(|| target.to_string())
+}
 
 // ---- SCP receiver ----
 
@@ -65,16 +102,24 @@ pub struct ScpReceiver {
     wan_ip: Option<IpAddr>,
     session_id: Uuid,
     handoff: Arc<CaptureHandoff>,
+    /// A share of the connection's filesystem: a completed upload is also written into it, so a
+    /// later command on the connection can read the file back.
+    fs: FakeFs,
+    /// The `scp -t` target as typed, `None` when the command named none.
+    target: Option<String>,
 }
 
 impl ScpReceiver {
-    /// Construct a new SCP receiver and return the initial `\0` acknowledge the SCP protocol
-    /// requires the server to send before the client begins.
+    /// Construct a new SCP receiver for the exec command `cmd` (`scp -t <target>`) and return the
+    /// initial `\0` acknowledge the SCP protocol requires the server to send before the client
+    /// begins. `fs` is a share of the connection's filesystem.
     pub fn new(
         source_ip: IpAddr,
         wan_ip: Option<IpAddr>,
         session_id: Uuid,
         handoff: Arc<CaptureHandoff>,
+        fs: FakeFs,
+        cmd: &str,
     ) -> (Self, Vec<u8>) {
         (
             Self {
@@ -87,9 +132,40 @@ impl ScpReceiver {
                 wan_ip,
                 session_id,
                 handoff,
+                fs,
+                target: scp_target(cmd),
             },
             vec![0u8], // initial ready-acknowledge
         )
+    }
+
+    /// Where a completed upload lands in the fake tree: the target itself, or the sent file's
+    /// name inside it when the target is a directory (or ends in `/`), as `scp` does. Only the last
+    /// component of the wire filename is used, so it cannot steer the write out of the target.
+    fn fs_destination(&self) -> Option<String> {
+        let raw = self.target.as_deref()?;
+        let target = upload_destination(raw)?;
+        if !raw.ends_with('/') && !self.fs.is_dir(&target) {
+            return Some(target);
+        }
+        let name = self.filename.rsplit('/').next().unwrap_or_default();
+        if matches!(name, "" | "." | "..") {
+            return None;
+        }
+        upload_destination(&format!("{}/{name}", target.trim_end_matches('/')))
+    }
+
+    /// Best effort and additive: the quarantine spool is the record of the upload, this only gives
+    /// the attacker's next command something to find. A refused write (budget, read-only mount,
+    /// bad name) is dropped. A body that hit the capture cap is not written, because a truncated
+    /// payload that "ran" would be a worse tell than a missing one.
+    fn land_in_fake_fs(&mut self) {
+        if self.wire_bytes != self.body.len() as u64 {
+            return;
+        }
+        if let Some(dest) = self.fs_destination() {
+            let _ = self.fs.write_file(&dest, &self.body);
+        }
     }
 
     /// Feed incoming channel data bytes. Returns response bytes to send back to the client.
@@ -155,6 +231,7 @@ impl ScpReceiver {
                     // The client sends a single \0 byte after the file body.
                     offset += 1;
                     let _ = self.handoff.submit(self.capture_job(true));
+                    self.land_in_fake_fs();
                     response.push(0); // final ack
                     self.state = ScpState::Done;
                 }
@@ -294,6 +371,8 @@ pub struct SftpHandler {
     wan_ip: Option<IpAddr>,
     session_id: Uuid,
     handoff: Arc<CaptureHandoff>,
+    /// A share of the connection's filesystem; a closed upload is also written into it.
+    fs: FakeFs,
 }
 
 impl SftpHandler {
@@ -302,6 +381,7 @@ impl SftpHandler {
         wan_ip: Option<IpAddr>,
         session_id: Uuid,
         handoff: Arc<CaptureHandoff>,
+        fs: FakeFs,
     ) -> Self {
         Self {
             buf: Vec::new(),
@@ -312,6 +392,7 @@ impl SftpHandler {
             wan_ip,
             session_id,
             handoff,
+            fs,
         }
     }
 
@@ -475,11 +556,25 @@ impl SftpHandler {
         if let Some(file) = self.handles.remove(handle_str.as_ref()) {
             self.resident_body = self.resident_body.saturating_sub(file.body.len());
             if !file.body.is_empty() {
+                self.land_in_fake_fs(&file);
                 let _ = self.handoff.submit(self.capture_job(file, true));
             }
             build_status(id, SSH_FX_OK)
         } else {
             build_status(id, SSH_FX_OK)
+        }
+    }
+
+    /// Best effort and additive, as for SCP: write a closed upload that arrived whole into the
+    /// fake tree at the path it was opened under. Only a handle that received bytes reaches here,
+    /// so an open-and-close never truncates an existing file; a body cut by a cap is not written.
+    /// WRITE offsets are not tracked, so the body is the bytes in arrival order.
+    fn land_in_fake_fs(&mut self, file: &SftpOpenFile) {
+        if file.wire_bytes != file.body.len() as u64 {
+            return;
+        }
+        if let Some(dest) = upload_destination(&file.orig_name) {
+            let _ = self.fs.write_file(&dest, &file.body);
         }
     }
 
@@ -654,8 +749,14 @@ mod tests {
         // count to keep the protocol state machine aligned with the wire (so the trailing
         // \0 and final ack still land correctly).
         let handoff = test_handoff();
-        let (mut scp, _initial) =
-            ScpReceiver::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let (mut scp, _initial) = ScpReceiver::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            FakeFs::new(),
+            "scp -t /tmp",
+        );
 
         // Header declaring 12 MB (above the 10 MB cap).
         let declared: usize = 12_000_000;
@@ -697,8 +798,14 @@ mod tests {
     #[test]
     fn scp_abandoned_mid_body_yields_an_incomplete_capture() {
         let handoff = test_handoff();
-        let (mut scp, _initial) =
-            ScpReceiver::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let (mut scp, _initial) = ScpReceiver::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            FakeFs::new(),
+            "scp -t /tmp",
+        );
         scp.feed(b"C0644 100 dropper.bin\n");
         scp.feed(b"MZ-first-forty-bytes-of-a-hundred-byte-f");
         let job = scp.abandon().expect("bytes arrived, so a capture");
@@ -719,6 +826,8 @@ mod tests {
             None,
             Uuid::now_v7(),
             test_handoff(),
+            FakeFs::new(),
+            "scp -t /tmp",
         );
         trailerless.feed(b"C0644 3 x\n");
         trailerless.feed(b"ABC");
@@ -736,6 +845,8 @@ mod tests {
             None,
             Uuid::now_v7(),
             test_handoff(),
+            FakeFs::new(),
+            "scp -t /tmp",
         );
         empty.feed(b"C0644 100 dropper.bin\n");
         assert!(empty.abandon().is_none());
@@ -780,6 +891,8 @@ mod tests {
             None,
             Uuid::now_v7(),
             handoff.clone(),
+            FakeFs::new(),
+            "scp -t /tmp",
         );
         scp.feed(b"C0644 100 dropper.bin\n");
         scp.feed(b"MZ-partial");
@@ -803,6 +916,7 @@ mod tests {
             None,
             Uuid::now_v7(),
             handoff.clone(),
+            FakeFs::new(),
         );
         let mut init = vec![SSH_FXP_INIT];
         init.extend_from_slice(&3u32.to_be_bytes());
@@ -845,8 +959,13 @@ mod tests {
     #[test]
     fn sftp_abandoned_open_handles_yield_incomplete_captures() {
         let handoff = test_handoff();
-        let mut sftp =
-            SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let mut sftp = SftpHandler::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            FakeFs::new(),
+        );
         let mut init = vec![SSH_FXP_INIT];
         init.extend_from_slice(&3u32.to_be_bytes());
         let mut init_pkt = (init.len() as u32).to_be_bytes().to_vec();
@@ -894,8 +1013,13 @@ mod tests {
         // SFTP_MAX_PACKET_SIZE. The handler must clear its buffer rather than accumulating
         // data toward that length.
         let handoff = test_handoff();
-        let mut sftp =
-            SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let mut sftp = SftpHandler::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            FakeFs::new(),
+        );
 
         // Forge a length header claiming 1 GB.
         let huge_len: u32 = 1_000_000_000;
@@ -930,8 +1054,13 @@ mod tests {
         }
 
         let handoff = test_handoff();
-        let mut sftp =
-            SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let mut sftp = SftpHandler::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            FakeFs::new(),
+        );
 
         // INIT (version 3), then open the cap's worth of write handles without ever closing:
         // each must return a HANDLE.
@@ -959,8 +1088,13 @@ mod tests {
         // immediately once the 4 bytes are present - it must not wait for body bytes
         // to arrive before checking.
         let handoff = test_handoff();
-        let mut sftp =
-            SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let mut sftp = SftpHandler::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            FakeFs::new(),
+        );
 
         let huge_len: u32 = 500_000;
         let response = sftp.feed(&huge_len.to_be_bytes());
@@ -979,13 +1113,202 @@ mod tests {
     }
 
     #[test]
+    fn upload_destination_denies_traversal_and_control_characters() {
+        assert_eq!(upload_destination("/tmp/p"), Some("/tmp/p".into()));
+        assert_eq!(upload_destination("p"), Some("/root/p".into()));
+        assert_eq!(upload_destination(""), None);
+        assert_eq!(upload_destination("/tmp/../etc/passwd"), None);
+        assert_eq!(upload_destination("../x"), None);
+        assert_eq!(upload_destination("/tmp/a\0b"), None);
+        assert_eq!(upload_destination("/tmp/a\nb"), None);
+        // A dotted name is not a `..` component.
+        assert_eq!(upload_destination("/tmp/..x"), Some("/tmp/..x".into()));
+    }
+
+    #[test]
+    fn scp_target_skips_options_and_quotes() {
+        assert_eq!(scp_target("scp -t /tmp/x"), Some("/tmp/x".into()));
+        assert_eq!(scp_target("scp -t -d /tmp/"), Some("/tmp/".into()));
+        assert_eq!(scp_target("scp -t -- '/tmp/a b'"), Some("/tmp/a b".into()));
+        assert_eq!(scp_target("scp -t"), None);
+        assert_eq!(scp_target("scp -f /etc/passwd"), None);
+    }
+
+    fn scp_upload(fs: FakeFs, cmd: &str, name: &str, body: &[u8]) -> Arc<CaptureHandoff> {
+        let handoff = one_slot_handoff();
+        let (mut scp, _) = ScpReceiver::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+            fs,
+            cmd,
+        );
+        scp.feed(format!("C0644 {} {name}\n", body.len()).as_bytes());
+        scp.feed(body);
+        let ack = scp.feed(&[0]);
+        assert_eq!(ack, vec![0], "final ack");
+        handoff
+    }
+
+    #[test]
+    fn scp_upload_lands_in_the_shared_fs_and_still_submits_the_capture() {
+        let base = FakeFs::new();
+        let handoff = scp_upload(
+            base.share(),
+            "scp -t /tmp/payload",
+            "ignored",
+            b"MZ-scp-4471",
+        );
+        assert_eq!(
+            base.read_all("/tmp/payload", 64).unwrap(),
+            b"MZ-scp-4471",
+            "a share of the same connection sees the body at the target"
+        );
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the evidence submit happened"
+        );
+        assert!(
+            !FakeFs::new().file_exists("/tmp/payload"),
+            "another connection's filesystem is untouched"
+        );
+    }
+
+    #[test]
+    fn scp_into_a_directory_uses_only_the_last_component_of_the_wire_name() {
+        let base = FakeFs::new();
+        scp_upload(
+            base.share(),
+            "scp -t /tmp",
+            "../../etc/dropped.sh",
+            b"#!/bin/sh-9913",
+        );
+        assert_eq!(
+            base.read_all("/tmp/dropped.sh", 64).unwrap(),
+            b"#!/bin/sh-9913"
+        );
+        assert!(!base.file_exists("/etc/dropped.sh"));
+
+        scp_upload(base.share(), "scp -t /tmp/", "..", b"x");
+        assert!(
+            !base.file_exists("/tmp/.."),
+            "a `..` name is refused, not written"
+        );
+    }
+
+    #[test]
+    fn scp_target_that_climbs_is_not_written_but_is_still_captured() {
+        let base = FakeFs::new();
+        let before = base.read_all("/etc/hostname", 64).unwrap();
+        let handoff = scp_upload(
+            base.share(),
+            "scp -t /tmp/../etc/hostname",
+            "h",
+            b"pwned-0001",
+        );
+        assert_eq!(base.read_all("/etc/hostname", 64).unwrap(), before);
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "evidence still submitted"
+        );
+    }
+
+    #[test]
+    fn an_upload_over_the_connection_budget_is_not_stored_but_is_still_captured() {
+        use sensor_framework::{BudgetLimits, ConnectionBudget};
+        let budget = ConnectionBudget::new(BudgetLimits {
+            owned_bytes: 1024,
+            ..BudgetLimits::standard()
+        });
+        let base = FakeFs::new().with_budget(budget);
+        let body = vec![0xAB; 4096];
+        let handoff = scp_upload(base.share(), "scp -t /tmp/big", "big", &body);
+        assert!(!base.file_exists("/tmp/big"), "the fs refused the write");
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the capture does not depend on the fs write"
+        );
+    }
+
+    #[test]
+    fn sftp_close_lands_the_body_and_an_open_without_writes_changes_nothing() {
+        fn pkt(msg: u8, parts: &[&[u8]]) -> Vec<u8> {
+            let mut body = vec![msg];
+            for p in parts {
+                body.extend_from_slice(p);
+            }
+            let mut out = (body.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(&body);
+            out
+        }
+        fn s(b: &[u8]) -> Vec<u8> {
+            let mut v = (b.len() as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(b);
+            v
+        }
+        let base = FakeFs::new();
+        let before = base.read_all("/etc/hostname", 64).unwrap();
+        let handoff = one_slot_handoff();
+        let mut sftp = SftpHandler::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+            base.share(),
+        );
+        let open = |sftp: &mut SftpHandler, id: u32, path: &[u8]| {
+            let resp = sftp.feed(&pkt(
+                SSH_FXP_OPEN,
+                &[
+                    &id.to_be_bytes(),
+                    &s(path),
+                    &SSH_FXF_WRITE.to_be_bytes(),
+                    &0u32.to_be_bytes(),
+                ],
+            ));
+            let len = u32::from_be_bytes([resp[9], resp[10], resp[11], resp[12]]) as usize;
+            resp[13..13 + len].to_vec()
+        };
+        // Open an existing file and close it with no WRITE: untouched.
+        let h = open(&mut sftp, 1, b"/etc/hostname");
+        sftp.feed(&pkt(SSH_FXP_CLOSE, &[&2u32.to_be_bytes(), &s(&h)]));
+        assert_eq!(base.read_all("/etc/hostname", 64).unwrap(), before);
+
+        let h = open(&mut sftp, 3, b"/var/tmp/sftp_payload");
+        sftp.feed(&pkt(
+            SSH_FXP_WRITE,
+            &[
+                &4u32.to_be_bytes(),
+                &s(&h),
+                &0u64.to_be_bytes(),
+                &s(b"ELF-sftp-2288"),
+            ],
+        ));
+        sftp.feed(&pkt(SSH_FXP_CLOSE, &[&5u32.to_be_bytes(), &s(&h)]));
+        assert_eq!(
+            base.read_all("/var/tmp/sftp_payload", 64).unwrap(),
+            b"ELF-sftp-2288"
+        );
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "evidence submitted on CLOSE"
+        );
+    }
+
+    #[test]
     fn sftp_oversized_length_split_across_feeds() {
         // The attacker trickles the 4-byte length header across two feeds: the first
         // delivers only 2 bytes (not enough to read the length), the second delivers the
         // remaining 2 bytes. The check must fire on the second feed.
         let handoff = test_handoff();
-        let mut sftp =
-            SftpHandler::new("127.0.0.1".parse().unwrap(), None, Uuid::now_v7(), handoff);
+        let mut sftp = SftpHandler::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            FakeFs::new(),
+        );
 
         let huge_len: u32 = 1_000_000;
         let header = huge_len.to_be_bytes();

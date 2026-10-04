@@ -2,26 +2,9 @@
 //! byte, together with the state and evidence a later line depends on. A unit test of one verb
 //! cannot show that status, files and the working directory survive a chain; these can.
 //!
-//! Each `tests/fixtures/sessions/*.session` file is one session, answered by one shell:
-//!
-//! ```text
-//! # source: where the lines were observed        (required)
-//! # date: YYYY-MM-DD                              (required)
-//! # protocol: ssh | telnet | adb                  (required)
-//! # persona: ubuntu | android                     (required)
-//! $ an input line, exactly as sent
-//! > an output line, compared with a trailing LF
-//! >~ output text with no trailing LF
-//! >e a\tb                                         an output line with escapes (\t \r \n \\
-//!                                                 \0 \xHH), compared with a trailing LF
-//! >x 7f 45 4c 46                                  raw output bytes, in hex
-//! >prefix-x 7f 45 4c 46                           the output starts with these bytes
-//! >prefix-e PING localhost (                      the same, as escaped text
-//! >len 2193272                                    the output is exactly this long
-//! @cwd /tmp                                       the working directory after the line
-//! @downloads http://example.invalid/a             the line's download events, in order
-//! @events 1                                       every event the line emitted
-//! ```
+//! Each `tests/fixtures/sessions/*.session` file is one session, answered by one shell. The file
+//! format, with every directive, is documented on `sensor_framework::replay`, which also holds
+//! the parser this test and `propolis shell explain` share.
 //!
 //! A line's output directives are concatenated and must equal its whole reply, unless the line
 //! uses `>prefix-x` or `>len`, which check only what they state. A line with no output
@@ -31,169 +14,25 @@
 //! Sessions drawn from sensor telemetry stay in a private corpus outside the repository; point
 //! `PROPOLIS_PRIVATE_SESSIONS` at it and run the ignored test to replay them.
 
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use sensor_framework::fakefs::FakeFs;
-use sensor_framework::shell::{EmitContext, FakeShell};
+use sensor_framework::replay::{self, Fixture};
+use sensor_framework::shell::FakeShell;
 use sensor_wire::{SIGNAL_HONEYPOT_FILE_DOWNLOAD, SensorEvent};
 
-/// What one input line must produce.
-#[derive(Default)]
-struct Expect {
-    output: Vec<u8>,
-    prefix: Option<Vec<u8>>,
-    len: Option<usize>,
-    cwd: Option<String>,
-    downloads: Option<Vec<String>>,
-    events: Option<usize>,
-}
-
-struct Step {
-    line_no: usize,
-    input: String,
-    expect: Expect,
-}
-
-struct Fixture {
+/// A fixture and the file it came from, for failure messages.
+struct Loaded {
     path: PathBuf,
-    persona: String,
-    protocol: String,
-    steps: Vec<Step>,
+    fixture: Fixture,
 }
 
-fn parse_hex(field: &str, at: &str) -> Vec<u8> {
-    field
-        .split_whitespace()
-        .map(|h| u8::from_str_radix(h, 16).unwrap_or_else(|_| panic!("{at}: bad hex byte {h:?}")))
-        .collect()
-}
-
-fn unescape(text: &str, at: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut bytes = text.bytes();
-    while let Some(b) = bytes.next() {
-        if b != b'\\' {
-            out.push(b);
-            continue;
-        }
-        match bytes.next() {
-            Some(b't') => out.push(b'\t'),
-            Some(b'r') => out.push(b'\r'),
-            Some(b'n') => out.push(b'\n'),
-            Some(b'0') => out.push(0),
-            Some(b'\\') => out.push(b'\\'),
-            Some(b'x') => {
-                let hex: Vec<u8> = bytes.by_ref().take(2).collect();
-                let hex = std::str::from_utf8(&hex).unwrap_or("");
-                out.push(
-                    u8::from_str_radix(hex, 16)
-                        .unwrap_or_else(|_| panic!("{at}: bad \\x escape {hex:?}")),
-                );
-            }
-            other => panic!("{at}: unknown escape \\{:?}", other.map(char::from)),
-        }
-    }
-    out
-}
-
-fn parse_fixture(path: &Path) -> Fixture {
+fn parse_fixture(path: &Path) -> Loaded {
     let text = std::fs::read_to_string(path).unwrap();
-    let mut meta = std::collections::BTreeMap::new();
-    let mut steps: Vec<Step> = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        let at = format!("{}:{}", path.display(), i + 1);
-        if let Some(rest) = line.strip_prefix("# ") {
-            if let Some((key, value)) = rest.split_once(':') {
-                meta.insert(key.trim().to_string(), value.trim().to_string());
-            }
-            continue;
-        }
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(input) = line.strip_prefix("$ ") {
-            steps.push(Step {
-                line_no: i + 1,
-                input: input.to_string(),
-                expect: Expect::default(),
-            });
-            continue;
-        }
-        let step = steps
-            .last_mut()
-            .unwrap_or_else(|| panic!("{at}: a directive before any `$` line"));
-        let e = &mut step.expect;
-        if let Some(hex) = line.strip_prefix(">prefix-x ") {
-            e.prefix = Some(parse_hex(hex, &at));
-        } else if let Some(text) = line.strip_prefix(">prefix-e ") {
-            e.prefix = Some(unescape(text, &at));
-        } else if let Some(text) = line.strip_prefix(">e ") {
-            e.output.extend(unescape(text, &at));
-            e.output.push(b'\n');
-        } else if let Some(hex) = line.strip_prefix(">x ") {
-            e.output.extend(parse_hex(hex, &at));
-        } else if let Some(n) = line.strip_prefix(">len ") {
-            e.len = Some(
-                n.trim()
-                    .parse()
-                    .unwrap_or_else(|_| panic!("{at}: bad length")),
-            );
-        } else if let Some(text) = line.strip_prefix(">~ ") {
-            e.output.extend_from_slice(text.as_bytes());
-        } else if line == ">" {
-            e.output.push(b'\n');
-        } else if let Some(text) = line.strip_prefix("> ") {
-            e.output.extend_from_slice(text.as_bytes());
-            e.output.push(b'\n');
-        } else if let Some(cwd) = line.strip_prefix("@cwd ") {
-            e.cwd = Some(cwd.to_string());
-        } else if let Some(urls) = line.strip_prefix("@downloads") {
-            e.downloads = Some(urls.split_whitespace().map(str::to_string).collect());
-        } else if let Some(n) = line.strip_prefix("@events ") {
-            e.events = Some(
-                n.trim()
-                    .parse()
-                    .unwrap_or_else(|_| panic!("{at}: bad count")),
-            );
-        } else {
-            panic!("{at}: unrecognised line {line:?}");
-        }
-    }
-    for key in ["source", "date", "protocol", "persona"] {
-        assert!(
-            meta.contains_key(key),
-            "{}: missing `# {key}:` header",
-            path.display()
-        );
-    }
-    Fixture {
+    let fixture = replay::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    Loaded {
         path: path.to_path_buf(),
-        persona: meta["persona"].clone(),
-        protocol: meta["protocol"].clone(),
-        steps,
+        fixture,
     }
-}
-
-/// The time every replayed session reads, so replies that print the time replay exactly.
-fn replay_clock() -> chrono::DateTime<chrono::Utc> {
-    "2026-09-29T12:00:00Z".parse().unwrap()
-}
-
-fn shell_for(fixture: &Fixture) -> FakeShell {
-    let ctx = EmitContext {
-        source_ip: "192.0.2.10".parse::<IpAddr>().unwrap(),
-        wan_ip: None,
-        authenticated: true,
-        protocol_label: fixture.protocol.clone(),
-        session_id: None,
-    };
-    let shell = match fixture.persona.as_str() {
-        "ubuntu" => FakeShell::new(FakeFs::new(), ctx),
-        "android" => FakeShell::android(FakeFs::android(), ctx),
-        other => panic!("{}: unknown persona {other:?}", fixture.path.display()),
-    };
-    shell.with_clock(replay_clock)
 }
 
 /// The shell's reply to one line, as the bytes a transport would send before its own line
@@ -213,11 +52,11 @@ fn show(bytes: &[u8]) -> String {
     s
 }
 
-fn check(fixture: &Fixture) -> Vec<String> {
-    let mut shell = shell_for(fixture);
+fn check(loaded: &Loaded) -> Vec<String> {
+    let mut shell = loaded.fixture.shell();
     let mut failures = Vec::new();
-    for step in &fixture.steps {
-        let at = format!("{}:{}", fixture.path.display(), step.line_no);
+    for step in &loaded.fixture.steps {
+        let at = format!("{}:{}", loaded.path.display(), step.line_no);
         let (out, events) = run(&mut shell, &step.input);
         let e = &step.expect;
         if e.prefix.is_none() && e.len.is_none() {
@@ -292,7 +131,7 @@ fn replay_dir(dir: &Path) {
     assert!(!paths.is_empty(), "{}: no session fixtures", dir.display());
     let mut failures = Vec::new();
     for path in &paths {
-        let fixture = parse_fixture(path);
+        let loaded = parse_fixture(path);
         let inputs = std::fs::read_to_string(path)
             .unwrap()
             .lines()
@@ -300,12 +139,12 @@ fn replay_dir(dir: &Path) {
             .count();
         assert!(inputs > 0, "{}: no `$` lines", path.display());
         assert_eq!(
-            fixture.steps.len(),
+            loaded.fixture.steps.len(),
             inputs,
             "{}: parsed steps differ from `$` lines",
             path.display()
         );
-        failures.extend(check(&fixture));
+        failures.extend(check(&loaded));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

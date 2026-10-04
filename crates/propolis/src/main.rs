@@ -599,6 +599,42 @@ async fn shutdown_signal() {
     }
 }
 
+/// `propolis shell explain <fixture.session>`: replays a sanitized session fixture through the
+/// fake shell and prints the engine's decision trace per line (see
+/// `sensor_framework::replay::explain`). The file's bytes are the only input and stdout/stderr
+/// the only output; no listener, database, tracing subscriber or network is touched. Returns the
+/// process exit code.
+fn run_shell_explain(path: Option<&str>) -> i32 {
+    let Some(path) = path else {
+        eprintln!("usage: propolis shell explain <fixture.session>");
+        return 2;
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("propolis shell explain: cannot read {path}: {e}");
+            return 1;
+        }
+    };
+    let fixture = match sensor_framework::replay::parse(&text) {
+        Ok(fixture) => fixture,
+        Err(e) => {
+            eprintln!("propolis shell explain: {path}: {e}");
+            return 1;
+        }
+    };
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let result = sensor_framework::replay::explain(&fixture, &mut out);
+    let flushed = std::io::Write::flush(&mut out);
+    match result.and(flushed) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("propolis shell explain: {e}");
+            1
+        }
+    }
+}
+
 // ---- entry point ----
 
 #[tokio::main]
@@ -619,6 +655,18 @@ async fn main() {
             env!("PROPOLIS_BUILD_TIMESTAMP")
         );
         return;
+    }
+
+    // Offline operator command, ahead of config, the PgPool, tracing and every listener for the
+    // same reason as `--version`: it reads one fixture file and prints, so it must work on a
+    // machine with no database or environment, and must never reach a sensor connection.
+    {
+        let args: Vec<String> = std::env::args().skip(1).take(3).collect();
+        if args.first().map(String::as_str) == Some("shell")
+            && args.get(1).map(String::as_str) == Some("explain")
+        {
+            std::process::exit(run_shell_explain(args.get(2).map(String::as_str)));
+        }
     }
 
     // Tracing: honor RUST_LOG if set, otherwise default to info. The console's live `/logs`

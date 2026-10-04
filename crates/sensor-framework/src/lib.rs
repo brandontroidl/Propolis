@@ -16,6 +16,7 @@ pub mod handoff;
 pub mod listener;
 pub mod outbox;
 pub mod persona;
+pub mod replay;
 pub mod sanitize;
 pub mod shell;
 pub mod spool;

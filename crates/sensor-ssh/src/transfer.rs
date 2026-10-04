@@ -1243,8 +1243,12 @@ mod tests {
             "the evidence submit happened"
         );
         assert!(
-            !FakeFs::new().file_exists("/tmp/payload"),
-            "another connection's filesystem is untouched"
+            base.share().file_exists("/tmp/payload"),
+            "a share of the same base sees the upload"
+        );
+        assert!(
+            !FakeFs::new().share().file_exists("/tmp/payload"),
+            "a share of a different base does not"
         );
     }
 
@@ -1263,11 +1267,103 @@ mod tests {
         );
         assert!(!base.file_exists("/etc/dropped.sh"));
 
-        scp_upload(base.share(), "scp -t /tmp/", "..", b"x");
-        assert!(
-            !base.file_exists("/tmp/.."),
-            "a `..` name is refused, not written"
+        // `/tmp/..` resolves to the directory `/`, so no file-level check on the tree can tell a
+        // refused `..` name from a write that failed on the directory; assert the decision itself.
+        let destination = |header: &[u8]| {
+            let (mut scp, _) = ScpReceiver::new(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                Uuid::now_v7(),
+                one_slot_handoff(),
+                base.share(),
+                "scp -t /tmp/",
+            );
+            scp.feed(header);
+            scp.fs_destination()
+        };
+        assert_eq!(destination(b"C0644 1 ..\n"), None, "a `..` name");
+        assert_eq!(
+            destination(b"C0644 1 sub/..\n"),
+            None,
+            "a name ending in `..`"
         );
+        assert_eq!(
+            destination(b"C0644 1 ok.sh\n"),
+            Some("/tmp/ok.sh".to_string()),
+            "an ordinary name still lands"
+        );
+    }
+
+    #[test]
+    fn an_sftp_open_that_climbs_is_not_written_but_is_still_captured() {
+        fn pkt(msg: u8, parts: &[&[u8]]) -> Vec<u8> {
+            let mut body = vec![msg];
+            for p in parts {
+                body.extend_from_slice(p);
+            }
+            let mut out = (body.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(&body);
+            out
+        }
+        fn s(b: &[u8]) -> Vec<u8> {
+            let mut v = (b.len() as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(b);
+            v
+        }
+        let base = FakeFs::new();
+        let hostname = base.read_all("/etc/hostname", 64).unwrap();
+        // Control: the climbed-to locations are writable, so only the path guard keeps them clean.
+        let mut probe = base.share();
+        probe.write_file("/etc/sftp_probe", b"x").unwrap();
+        assert!(base.file_exists("/etc/sftp_probe"));
+        assert!(probe.remove_path("/etc/sftp_probe").unwrap());
+        let mut id = 0u32;
+        for climbing in [
+            "/tmp/../etc/hostname",
+            "../../etc/sftp_pwn",
+            "/var/tmp/../../etc/sftp_pwn",
+        ] {
+            let handoff = one_slot_handoff();
+            let mut sftp = SftpHandler::new(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                Uuid::now_v7(),
+                handoff.clone(),
+                base.share(),
+            );
+            id += 1;
+            let resp = sftp.feed(&pkt(
+                SSH_FXP_OPEN,
+                &[
+                    &id.to_be_bytes(),
+                    &s(climbing.as_bytes()),
+                    &SSH_FXF_WRITE.to_be_bytes(),
+                    &0u32.to_be_bytes(),
+                ],
+            ));
+            let len = u32::from_be_bytes([resp[9], resp[10], resp[11], resp[12]]) as usize;
+            let handle = resp[13..13 + len].to_vec();
+            sftp.feed(&pkt(
+                SSH_FXP_WRITE,
+                &[
+                    &id.to_be_bytes(),
+                    &s(&handle),
+                    &0u64.to_be_bytes(),
+                    &s(b"sftp-climb-6620"),
+                ],
+            ));
+            sftp.feed(&pkt(SSH_FXP_CLOSE, &[&id.to_be_bytes(), &s(&handle)]));
+            assert!(
+                handoff.submit(probe_job()).is_err(),
+                "{climbing}: the evidence is still submitted"
+            );
+        }
+        assert_eq!(
+            base.read_all("/etc/hostname", 64).unwrap(),
+            hostname,
+            "a climbing open must not overwrite a file outside the named directory"
+        );
+        assert!(!base.file_exists("/etc/sftp_pwn"));
     }
 
     #[test]

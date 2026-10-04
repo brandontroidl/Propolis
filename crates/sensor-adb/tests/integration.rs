@@ -1314,3 +1314,133 @@ async fn a_push_larger_than_the_connection_budget_is_bounded_but_still_captured(
     assert_eq!(std::fs::read(&spooled[0]).unwrap(), body);
     srv.handle.abort();
 }
+
+/// One sync `STAT` round trip. The reply layout is parsed by hand (id, then mode, size, time with
+/// no length field) so a framing error in the server's builder is not mirrored here.
+async fn sync_stat(
+    stream: &mut TcpStream,
+    local_id: u32,
+    server_id: u32,
+    path: &str,
+) -> (u32, u32, u32) {
+    let request = adb_proto::build_sync_message(adb_proto::SYNC_STAT, path.as_bytes());
+    stream
+        .write_all(&adb_proto::build_wrte(local_id, server_id, &request))
+        .await
+        .unwrap();
+    let (ack, _) = read_message(stream).await;
+    assert_eq!(ack.command, adb_proto::A_OKAY);
+    let (wrte, data) = read_message(stream).await;
+    assert_eq!(wrte.command, adb_proto::A_WRTE);
+    assert_eq!(data.len(), 16, "STAT is id + mode + size + time");
+    assert_eq!(&data[..4], b"STAT");
+    let word = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+    let reply = (word(4), word(8), word(12));
+    stream
+        .write_all(&adb_proto::build_okay(local_id, server_id))
+        .await
+        .unwrap();
+    reply
+}
+
+const S_IFMT: u32 = 0o170_000;
+const S_IFDIR: u32 = 0o040_000;
+
+/// What `adb push <local> <dest>` does: STAT the destination and, when it is a directory, append
+/// the local file's basename before the SEND.
+async fn adb_push(
+    stream: &mut TcpStream,
+    local_id: u32,
+    server_id: u32,
+    dest: &str,
+    local_name: &str,
+    body: &[u8],
+) -> String {
+    let (mode, _, _) = sync_stat(stream, local_id, server_id, dest).await;
+    let target = if mode & S_IFMT == S_IFDIR {
+        format!("{}/{local_name}", dest.trim_end_matches('/'))
+    } else {
+        dest.to_string()
+    };
+    sync_push(stream, local_id, server_id, &target, body).await;
+    target
+}
+
+#[tokio::test]
+async fn an_adb_push_to_a_directory_without_a_trailing_slash_lands_inside_it() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let sync_id = open_stream(&mut conn, 1, "sync:").await;
+
+    let (dir_mode, _, _) = sync_stat(&mut conn, 1, sync_id, "/data/local/tmp").await;
+    assert_eq!(
+        dir_mode & S_IFMT,
+        S_IFDIR,
+        "STAT of a directory is not not-found"
+    );
+
+    let body = b"#!/system/bin/sh\necho adb-dir-push-7711\n";
+    let target = adb_push(&mut conn, 1, sync_id, "/data/local/tmp", "dropper", body).await;
+    assert_eq!(target, "/data/local/tmp/dropper");
+
+    let shell_id = open_shell_stream(&mut conn, 2).await;
+    let seen = send_shell_line(&mut conn, 2, shell_id, "cat /data/local/tmp/dropper").await;
+    assert!(seen.contains("adb-dir-push-7711"), "shell saw: {seen:?}");
+
+    // The same connection: a push to a brand-new file path still STATs as absent and lands there.
+    let (absent, size, mtime) = sync_stat(&mut conn, 1, sync_id, "/data/local/tmp/fresh.bin").await;
+    assert_eq!((absent, size, mtime), (0, 0, 0));
+    let target = adb_push(
+        &mut conn,
+        1,
+        sync_id,
+        "/data/local/tmp/fresh.bin",
+        "ignored",
+        b"adb-fresh-push-2290",
+    )
+    .await;
+    assert_eq!(target, "/data/local/tmp/fresh.bin");
+    let seen = send_shell_line(&mut conn, 2, shell_id, "cat /data/local/tmp/fresh.bin").await;
+    assert!(seen.contains("adb-fresh-push-2290"), "shell saw: {seen:?}");
+
+    // STAT of an existing file now reports it.
+    let (file_mode, file_size, _) =
+        sync_stat(&mut conn, 1, sync_id, "/data/local/tmp/dropper").await;
+    assert_eq!(file_mode & S_IFMT, 0o100_000, "a regular file");
+    assert_eq!(file_size as usize, body.len());
+    srv.handle.abort();
+}
+
+/// An upload and a shell write on one connection spend ONE owned-bytes allowance. The push leaves
+/// less than the shell's next write needs; that write is refused only if the push was charged to
+/// the budget the shell charges. Without the connection's budget on the base filesystem the push
+/// goes to a private budget and the write succeeds.
+#[tokio::test]
+async fn an_adb_push_and_a_later_shell_write_share_one_owned_bytes_budget() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let sync_id = open_stream(&mut conn, 1, "sync:").await;
+
+    // 190000 of the 196608-byte ceiling, as an in-budget push.
+    let body: Vec<u8> = (0..190_000u32).map(|i| (i % 251) as u8).collect();
+    sync_push_chunked(&mut conn, 1, sync_id, "/data/local/tmp/big_push", &body).await;
+
+    let shell_id = open_shell_stream(&mut conn, 2).await;
+    let stored = send_shell_line(&mut conn, 2, shell_id, "ls /data/local/tmp").await;
+    assert!(
+        stored.contains("big_push"),
+        "the push itself fits: {stored:?}"
+    );
+
+    let fill = "A".repeat(7_500);
+    let line = format!("echo {fill} > /data/local/tmp/shell_fill");
+    let out = send_shell_line(&mut conn, 2, shell_id, &line).await;
+    assert!(
+        out.contains("No space left on device"),
+        "the shell write must hit the budget the push already spent, got {} bytes of output",
+        out.len()
+    );
+    srv.handle.abort();
+}

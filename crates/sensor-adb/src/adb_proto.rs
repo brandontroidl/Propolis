@@ -309,6 +309,27 @@ pub fn stat_not_found_body() -> [u8; 12] {
     [0u8; 12]
 }
 
+/// The 12-byte `STAT` response body for an existing path: little-endian `st_mode` (type bits
+/// included, so a directory carries `S_IFDIR`), size, and mtime.
+pub fn stat_body(mode: u32, size: u32, mtime: u32) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[0..4].copy_from_slice(&mode.to_le_bytes());
+    out[4..8].copy_from_slice(&size.to_le_bytes());
+    out[8..12].copy_from_slice(&mtime.to_le_bytes());
+    out
+}
+
+/// A whole `STAT` reply: the 4-byte id followed directly by the 12-byte body. Unlike every other
+/// sync reply there is no length field - `SYNC.TXT` defines `STAT`'s response as id, mode, size,
+/// time - so it must not go through `build_sync_message`, which would insert the payload length
+/// where the client reads the mode.
+pub fn stat_reply(body: &[u8; 12]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&SYNC_STAT.to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
 /// Parse a `SEND` request's payload: `<path>,<mode>` split on the *last* comma (mirrors
 /// `sensor-ssh`'s `transfer::parse_scp_header` convention - a path may itself legitimately
 /// contain a comma, the trailing `,<mode>` never does). Returns `(path, mode)`; `mode` is parsed
@@ -543,6 +564,17 @@ mod tests {
     #[test]
     fn stat_not_found_body_is_all_zero_12_bytes() {
         assert_eq!(stat_not_found_body(), [0u8; 12]);
+    }
+
+    #[test]
+    fn stat_reply_is_id_then_little_endian_mode_size_mtime() {
+        let body = stat_body(0o040_771, 4096, 1_700_000_000);
+        let reply = stat_reply(&body);
+        assert_eq!(reply.len(), 16);
+        assert_eq!(&reply[..4], b"STAT");
+        assert_eq!(&reply[4..8], &0o040_771u32.to_le_bytes());
+        assert_eq!(&reply[8..12], &4096u32.to_le_bytes());
+        assert_eq!(&reply[12..], &1_700_000_000u32.to_le_bytes());
     }
 
     // ---- fuzz-lite: parsing must never panic on arbitrary attacker-controlled bytes ----

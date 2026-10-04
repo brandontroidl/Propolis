@@ -329,6 +329,22 @@ impl SyncState {
         }
     }
 
+    /// The `STAT` answer for `path`, from this connection's fake tree only. A real `adb push` STATs
+    /// its destination first: a directory makes the client append the local basename to the SEND
+    /// path, anything else is taken as the literal target file. So a directory must answer with
+    /// its `S_IFDIR` mode, and an absent path with the all-zero "not found" a new-file push needs.
+    fn stat_reply(&self, path: &str) -> Vec<u8> {
+        let body = match self.fs.stat(path, true) {
+            Some(stat) => adb_proto::stat_body(
+                stat.mode,
+                u32::try_from(stat.size).unwrap_or(u32::MAX),
+                u32::try_from(stat.mtime.max(0)).unwrap_or(u32::MAX),
+            ),
+            None => adb_proto::stat_not_found_body(),
+        };
+        adb_proto::stat_reply(&body)
+    }
+
     /// Feed newly arrived `WRTE` payload bytes, draining as many complete sync sub-messages as
     /// are available. Returns the response bytes to send back (a `STAT`/`FAIL`/`OKAY` reply, or
     /// empty if the sub-message consumed produced no immediate reply - e.g. a bare `SEND`
@@ -397,13 +413,11 @@ impl SyncState {
                         self.reset();
                         break;
                     }
-                    if self.take_payload(sync_header.length).is_none() {
+                    let Some(payload) = self.take_payload(sync_header.length) else {
                         break;
-                    }
-                    response.extend_from_slice(&adb_proto::build_sync_message(
-                        adb_proto::SYNC_STAT,
-                        &adb_proto::stat_not_found_body(),
-                    ));
+                    };
+                    let path = String::from_utf8_lossy(&payload);
+                    response.extend_from_slice(&self.stat_reply(&path));
                 }
                 adb_proto::SYNC_RECV => {
                     if sync_header.length > adb_proto::MAX_SYNC_PATH_LEN {
@@ -1377,7 +1391,59 @@ mod tests {
         let job = upload.expect("the capture job is produced exactly as before");
         assert_eq!(job.body, b"ELF-adb-5521");
         assert_eq!(job.orig_name, "/data/local/tmp/adb_payload");
-        assert!(!FakeFs::android().file_exists("/data/local/tmp/adb_payload"));
+        assert!(
+            base.share().file_exists("/data/local/tmp/adb_payload"),
+            "a share of the same base sees the push"
+        );
+        assert!(
+            !FakeFs::android()
+                .share()
+                .file_exists("/data/local/tmp/adb_payload"),
+            "a share of a different base does not"
+        );
+    }
+
+    /// The reply is `STAT` + mode + size + mtime with no length field, and reflects only the
+    /// connection's fake tree: a directory answers `S_IFDIR`, a file its own mode and size, and
+    /// an absent path the all-zero not-found a new-file push depends on.
+    #[test]
+    fn sync_stat_answers_from_the_fake_tree() {
+        let base = FakeFs::android();
+        push_mode(
+            base.share(),
+            "/data/local/tmp/dropper",
+            0o100_755,
+            b"ELF-12345",
+        );
+        let (handoff, _dir) = test_handoff(16);
+        let mut sync = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            base.share(),
+        );
+        let mut stat = |path: &str| {
+            let (reply, upload) = sync.feed(&adb_proto::build_sync_message(
+                adb_proto::SYNC_STAT,
+                path.as_bytes(),
+            ));
+            assert!(upload.is_none());
+            assert_eq!(reply.len(), 16, "id + mode + size + mtime, no length field");
+            assert_eq!(&reply[..4], b"STAT");
+            let word = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
+            (word(4), word(8), word(12))
+        };
+        let (dir_mode, _, _) = stat("/data/local/tmp");
+        assert_eq!(
+            dir_mode & 0o170_000,
+            0o040_000,
+            "a directory carries S_IFDIR"
+        );
+        let (file_mode, file_size, _) = stat("/data/local/tmp/dropper");
+        assert_eq!(file_mode, 0o100_755);
+        assert_eq!(file_size, 9);
+        assert_eq!(stat("/data/local/tmp/not_there"), (0, 0, 0));
     }
 
     #[test]
@@ -1515,12 +1581,13 @@ mod tests {
             b"/tmp/probe",
         ));
         assert!(upload.is_none());
-        let reply = SyncHeader::parse(&response).unwrap();
-        assert_eq!(reply.id, adb_proto::SYNC_STAT);
         assert_eq!(
-            &response[adb_proto::SYNC_HEADER_LEN..],
-            &adb_proto::stat_not_found_body()
+            response,
+            adb_proto::stat_reply(&adb_proto::stat_not_found_body())
         );
+        assert_eq!(response.len(), 16);
+        assert_eq!(&response[..4], b"STAT");
+        assert_eq!(&response[4..], &[0u8; 12]);
     }
 
     #[test]

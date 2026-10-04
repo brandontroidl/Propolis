@@ -1625,6 +1625,60 @@ async fn scp_into_a_directory_names_the_file_after_the_wire_name_only() {
     handle.abort();
 }
 
+/// An upload and a later shell write on one connection spend ONE owned-bytes allowance. The scp
+/// leaves less than the next write needs; that write is refused only if the upload was charged to
+/// the budget the shell charges. Without the connection's budget on the base filesystem the
+/// upload goes to a private budget and the write succeeds.
+#[tokio::test]
+async fn an_scp_upload_and_a_later_shell_write_share_one_owned_bytes_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    // 190000 of the 196608-byte ceiling.
+    let body: Vec<u8> = (0..190_000u32).map(|i| (i % 251) as u8).collect();
+    scp_put(&session, "/tmp/big_upload", "big_upload", &body).await;
+    let stored = exec_stdout(&session, "cat /tmp/big_upload").await;
+    assert_eq!(stored.len(), body.len(), "the upload itself fits");
+
+    let fill = "A".repeat(7_500);
+    exec_stdout(&session, &format!("echo {fill} > /tmp/shell_fill")).await;
+    let written = exec_stdout(&session, "cat /tmp/shell_fill").await;
+    assert!(
+        written.len() < fill.len(),
+        "the shell write must hit the budget the upload already spent, but {} bytes landed",
+        written.len()
+    );
+
+    drop(session);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn an_sftp_open_whose_path_climbs_writes_nothing_outside_the_fake_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    let marker = b"sftp-climb-marker-5521";
+    sftp_put(&session, "/var/tmp/../../etc/sftp_climb", marker).await;
+    sftp_put(&session, "../../etc/sftp_climb_rel", marker).await;
+    sftp_put(&session, "/var/tmp/sftp_ok", marker).await;
+
+    assert_eq!(exec_stdout(&session, "cat /var/tmp/sftp_ok").await, marker);
+    for path in ["/etc/sftp_climb", "/etc/sftp_climb_rel", "/sftp_climb_rel"] {
+        let out = exec_stdout(&session, &format!("cat {path}")).await;
+        assert!(
+            !String::from_utf8_lossy(&out).contains("sftp-climb-marker-5521"),
+            "a climbing path landed at {path}"
+        );
+    }
+    expect_capture_of(dir.path(), marker).await;
+
+    drop(session);
+    handle.abort();
+}
+
 #[tokio::test]
 async fn a_file_uploaded_by_sftp_is_read_by_a_later_exec_and_still_captured() {
     let dir = tempfile::tempdir().unwrap();

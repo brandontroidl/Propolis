@@ -1373,6 +1373,17 @@ async fn scp_put(
     name: &str,
     body: &[u8],
 ) {
+    scp_put_mode(session, target, name, "0644", body).await;
+}
+
+/// [`scp_put`] with the C-line's octal mode given as typed (`"0755"`).
+async fn scp_put_mode(
+    session: &russh::client::Handle<TestHandler>,
+    target: &str,
+    name: &str,
+    mode: &str,
+    body: &[u8],
+) {
     let mut channel = session.channel_open_session().await.unwrap();
     channel
         .exec(false, format!("scp -t {target}").as_bytes())
@@ -1380,7 +1391,7 @@ async fn scp_put(
         .unwrap();
     assert_eq!(read_at_least(&mut channel, 1).await, [0], "ready ack");
     channel
-        .data(format!("C0644 {} {name}\n", body.len()).as_bytes())
+        .data(format!("C{mode} {} {name}\n", body.len()).as_bytes())
         .await
         .unwrap();
     assert_eq!(read_at_least(&mut channel, 1).await, [0], "header ack");
@@ -1419,6 +1430,16 @@ async fn read_sftp_packet(channel: &mut russh::Channel<russh::client::Msg>) -> V
 
 /// Upload `body` to `path` over the SFTP subsystem: INIT, OPEN, WRITE, CLOSE.
 async fn sftp_put(session: &russh::client::Handle<TestHandler>, path: &str, body: &[u8]) {
+    sftp_put_attrs(session, path, &0u32.to_be_bytes(), body).await;
+}
+
+/// [`sftp_put`] with the OPEN's raw ATTRS bytes (flags word first) given by the caller.
+async fn sftp_put_attrs(
+    session: &russh::client::Handle<TestHandler>,
+    path: &str,
+    attrs: &[u8],
+    body: &[u8],
+) {
     let mut channel = session.channel_open_session().await.unwrap();
     channel.request_subsystem(false, "sftp").await.unwrap();
     channel
@@ -1433,7 +1454,7 @@ async fn sftp_put(session: &russh::client::Handle<TestHandler>, path: &str, body
             &1u32.to_be_bytes(),
             &sftp_string(path.as_bytes()),
             &0x0au32.to_be_bytes(), // WRITE | CREAT
-            &0u32.to_be_bytes(),    // empty attrs
+            attrs,
         ],
     );
     channel.data(&open[..]).await.unwrap();
@@ -1483,6 +1504,94 @@ async fn a_file_uploaded_by_scp_is_read_by_a_later_exec_and_still_captured() {
     let listing = String::from_utf8_lossy(&exec_stdout(&session, "ls /tmp").await).into_owned();
     assert!(listing.contains("payload"), "ls saw: {listing:?}");
     expect_capture_of(dir.path(), body).await;
+
+    drop(session);
+    handle.abort();
+}
+
+/// Run one exec and return its stdout and stderr together with the exit status it reported.
+async fn exec_status(session: &russh::client::Handle<TestHandler>, cmd: &str) -> (String, u32) {
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel.exec(false, cmd.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let mut status = None;
+    while let Some(message) = tokio::time::timeout(Duration::from_secs(10), channel.wait())
+        .await
+        .expect("timed out waiting for exec output")
+    {
+        match message {
+            russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. } => {
+                out.extend_from_slice(&data);
+            }
+            russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+            russh::ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    (
+        String::from_utf8_lossy(&out).into_owned(),
+        status.expect("the exec reported an exit status"),
+    )
+}
+
+/// The mode an uploader sends decides whether the file runs: a 0755 binary pushed by SCP is
+/// executable by a later exec of the same connection, a 0644 one is refused with 126.
+#[tokio::test]
+async fn an_scp_upload_runs_only_when_the_c_line_mode_has_an_execute_bit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    scp_put_mode(&session, "/tmp/bot", "bot", "0755", b"\x7fELF-bot-4410").await;
+    scp_put_mode(&session, "/tmp/data", "data", "0644", b"\x7fELF-data-4411").await;
+    // A malformed mode falls back to 0644 rather than failing the upload.
+    scp_put_mode(&session, "/tmp/odd", "odd", "09zz", b"\x7fELF-odd-4412").await;
+
+    let (out, status) = exec_status(&session, "/tmp/bot").await;
+    assert!(!out.contains("Permission denied"), "0755 upload: {out:?}");
+    assert_eq!(status, 0, "0755 upload runs as a saved executable");
+
+    for path in ["/tmp/data", "/tmp/odd"] {
+        let (out, status) = exec_status(&session, path).await;
+        assert!(out.contains("Permission denied"), "{path}: {out:?}");
+        assert_eq!(status, 126, "{path} was not given an execute bit");
+    }
+
+    drop(session);
+    handle.abort();
+}
+
+/// SFTP OPEN carries the mode in its ATTRS: permissions are honored when present, and an
+/// OPEN with empty ATTRS leaves the file 0644.
+#[tokio::test]
+async fn an_sftp_upload_runs_only_when_the_open_attrs_carry_an_execute_bit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    let attrs_with = |perm: u32| {
+        let mut attrs = 0x4u32.to_be_bytes().to_vec(); // SSH_FILEXFER_ATTR_PERMISSIONS
+        attrs.extend_from_slice(&perm.to_be_bytes());
+        attrs
+    };
+    sftp_put_attrs(&session, "/tmp/sbot", &attrs_with(0o755), b"ELF-sbot-5520").await;
+    sftp_put_attrs(
+        &session,
+        "/tmp/sdata",
+        &attrs_with(0o644),
+        b"ELF-sdata-5521",
+    )
+    .await;
+    sftp_put(&session, "/tmp/sbare", b"ELF-sbare-5522").await;
+
+    let (out, status) = exec_status(&session, "/tmp/sbot").await;
+    assert!(!out.contains("Permission denied"), "0755 attrs: {out:?}");
+    assert_eq!(status, 0);
+    for path in ["/tmp/sdata", "/tmp/sbare"] {
+        let (out, status) = exec_status(&session, path).await;
+        assert!(out.contains("Permission denied"), "{path}: {out:?}");
+        assert_eq!(status, 126);
+    }
 
     drop(session);
     handle.abort();

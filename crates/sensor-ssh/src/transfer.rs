@@ -31,6 +31,9 @@ use sensor_wire::{
 /// Where a relative upload path lands: the login home the fake shell starts in.
 const UPLOAD_HOME: &str = "/root";
 
+/// The permission bits an upload gets when the client sent none (or a malformed value).
+const DEFAULT_UPLOAD_PERM: u32 = 0o644;
+
 /// The fake-tree path an upload named `raw` is written to, or `None` when it must not be.
 ///
 /// The path is attacker-supplied, so it is refused outright when it carries a NUL or other control
@@ -94,6 +97,8 @@ pub struct ScpReceiver {
     state: ScpState,
     line_buf: Vec<u8>,
     filename: String,
+    /// Permission bits from the C-line, applied when the file lands in the fake tree.
+    perm: u32,
     body: Vec<u8>,
     /// Body bytes consumed off the wire for the current file, capped or not - what the client
     /// actually sent, as opposed to `body.len()`, what was retained.
@@ -126,6 +131,7 @@ impl ScpReceiver {
                 state: ScpState::WaitHeader,
                 line_buf: Vec::new(),
                 filename: String::new(),
+                perm: DEFAULT_UPLOAD_PERM,
                 body: Vec::new(),
                 wire_bytes: 0,
                 source_ip,
@@ -164,7 +170,7 @@ impl ScpReceiver {
             return;
         }
         if let Some(dest) = self.fs_destination() {
-            let _ = self.fs.write_file(&dest, &self.body);
+            let _ = self.fs.write_file_mode(&dest, &self.body, self.perm);
         }
     }
 
@@ -180,8 +186,9 @@ impl ScpReceiver {
                         let byte = data[offset];
                         offset += 1;
                         if byte == b'\n' {
-                            if let Some((size, name)) = parse_scp_header(&self.line_buf) {
+                            if let Some((perm, size, name)) = parse_scp_header(&self.line_buf) {
                                 self.filename = name;
+                                self.perm = perm;
                                 self.body.clear();
                                 self.wire_bytes = 0;
                                 let capped = (size as usize).min(MAX_CAPTURE_BODY);
@@ -297,8 +304,9 @@ impl Drop for ScpReceiver {
     }
 }
 
-/// Parse an SCP C-line: `C<mode> <size> <filename>`. Returns `(size, filename)` on success.
-fn parse_scp_header(line: &[u8]) -> Option<(u64, String)> {
+/// Parse an SCP C-line: `C<mode> <size> <filename>`. Returns `(permission bits, size, filename)`
+/// on success; a mode that is not octal falls back to [`DEFAULT_UPLOAD_PERM`].
+fn parse_scp_header(line: &[u8]) -> Option<(u32, u64, String)> {
     let line = std::str::from_utf8(line).ok()?;
     if !line.starts_with('C') {
         return None;
@@ -307,9 +315,12 @@ fn parse_scp_header(line: &[u8]) -> Option<(u64, String)> {
     if parts.len() < 3 {
         return None;
     }
+    let perm = u32::from_str_radix(parts[0], 8)
+        .map(|mode| mode & 0o777)
+        .unwrap_or(DEFAULT_UPLOAD_PERM);
     let size: u64 = parts[1].parse().ok()?;
     let filename = parts[2].to_string();
-    Some((size, filename))
+    Some((perm, size, filename))
 }
 
 // ---- SFTP handler ----
@@ -352,6 +363,8 @@ const SFTP_MAX_PACKET_SIZE: usize = 262_144;
 /// Per-handle state for an open SFTP file.
 struct SftpOpenFile {
     orig_name: String,
+    /// Permission bits from the OPEN attrs, applied when the file lands in the fake tree.
+    perm: u32,
     body: Vec<u8>,
     /// Bytes the client wrote to this handle, including any dropped past the per-file or
     /// per-session cap; `body.len()` is what was retained.
@@ -476,6 +489,8 @@ impl SftpHandler {
             return build_status(id, SSH_FX_OP_UNSUPPORTED);
         };
 
+        let perm = read_open_perm(body, &mut cursor);
+
         // Only honor opens with write intent.
         if pflags & (SSH_FXF_WRITE | SSH_FXF_CREAT) == 0 {
             return build_status(id, SSH_FX_OP_UNSUPPORTED);
@@ -494,6 +509,7 @@ impl SftpHandler {
             handle_str.clone(),
             SftpOpenFile {
                 orig_name: String::from_utf8_lossy(&filename).into_owned(),
+                perm,
                 body: Vec::new(),
                 wire_bytes: 0,
             },
@@ -574,7 +590,7 @@ impl SftpHandler {
             return;
         }
         if let Some(dest) = upload_destination(&file.orig_name) {
-            let _ = self.fs.write_file(&dest, &file.body);
+            let _ = self.fs.write_file_mode(&dest, &file.body, file.perm);
         }
     }
 
@@ -667,6 +683,28 @@ fn read_u32(data: &[u8], cursor: &mut usize) -> Option<u32> {
     Some(value)
 }
 
+/// The permission bits in the ATTRS that follow an OPEN's pflags (SFTP v3: a flags word, then
+/// size, uid/gid and permissions in that order when their bits are set). A missing, truncated
+/// or permission-less ATTRS yields [`DEFAULT_UPLOAD_PERM`].
+fn read_open_perm(body: &[u8], cursor: &mut usize) -> u32 {
+    const ATTR_SIZE: u32 = 0x1;
+    const ATTR_UIDGID: u32 = 0x2;
+    const ATTR_PERMISSIONS: u32 = 0x4;
+    let Some(flags) = read_u32(body, cursor) else {
+        return DEFAULT_UPLOAD_PERM;
+    };
+    if flags & ATTR_SIZE != 0 {
+        *cursor = cursor.saturating_add(8);
+    }
+    if flags & ATTR_UIDGID != 0 {
+        *cursor = cursor.saturating_add(8);
+    }
+    if flags & ATTR_PERMISSIONS == 0 {
+        return DEFAULT_UPLOAD_PERM;
+    }
+    read_u32(body, cursor).map_or(DEFAULT_UPLOAD_PERM, |mode| mode & 0o777)
+}
+
 fn read_string(data: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
     let len = read_u32(data, cursor)? as usize;
     let end = cursor.checked_add(len)?;
@@ -682,9 +720,44 @@ mod tests {
     #[test]
     fn parse_scp_header_valid() {
         let header = b"C0644 1234 evil.bin";
-        let (size, name) = parse_scp_header(header).unwrap();
+        let (perm, size, name) = parse_scp_header(header).unwrap();
+        assert_eq!(perm, 0o644);
         assert_eq!(size, 1234);
         assert_eq!(name, "evil.bin");
+    }
+
+    #[test]
+    fn parse_scp_header_reads_the_octal_mode_and_defaults_a_bad_one() {
+        assert_eq!(parse_scp_header(b"C0755 1 x").unwrap().0, 0o755);
+        assert_eq!(
+            parse_scp_header(b"C4755 1 x").unwrap().0,
+            0o755,
+            "setuid masked"
+        );
+        assert_eq!(parse_scp_header(b"C0600 1 x").unwrap().0, 0o600);
+        assert_eq!(
+            parse_scp_header(b"Cxyz 1 x").unwrap().0,
+            DEFAULT_UPLOAD_PERM
+        );
+        assert_eq!(parse_scp_header(b"C 1 x").unwrap().0, DEFAULT_UPLOAD_PERM);
+    }
+
+    #[test]
+    fn read_open_perm_walks_the_attrs_in_wire_order() {
+        let perm_of = |bytes: &[u8]| read_open_perm(bytes, &mut 0);
+        assert_eq!(perm_of(&[]), DEFAULT_UPLOAD_PERM, "no attrs at all");
+        assert_eq!(perm_of(&0u32.to_be_bytes()), DEFAULT_UPLOAD_PERM);
+        assert_eq!(
+            perm_of(&0x4u32.to_be_bytes()),
+            DEFAULT_UPLOAD_PERM,
+            "truncated"
+        );
+        // SIZE and UIDGID come before PERMISSIONS and must be skipped.
+        let mut attrs = 0x7u32.to_be_bytes().to_vec();
+        attrs.extend_from_slice(&99u64.to_be_bytes());
+        attrs.extend_from_slice(&[0; 8]);
+        attrs.extend_from_slice(&0o100_755u32.to_be_bytes());
+        assert_eq!(perm_of(&attrs), 0o755);
     }
 
     #[test]

@@ -284,8 +284,13 @@ impl Drop for SyncState {
     }
 }
 
+/// The permission bits a push gets when its SEND carried no parseable mode.
+const DEFAULT_PUSH_PERM: u32 = 0o644;
+
 struct PendingSend {
     orig_name: String,
+    /// Permission bits of the SEND's `st_mode`, applied when the file lands in the fake tree.
+    perm: u32,
     body: Vec<u8>,
     /// DATA payload bytes the client sent, including any drained past `MAX_SYNC_BODY`;
     /// `body.len()` is what was retained.
@@ -320,7 +325,7 @@ impl SyncState {
             return;
         }
         if let Some(dest) = push_destination(&pending.orig_name) {
-            let _ = self.fs.write_file(dest, &pending.body);
+            let _ = self.fs.write_file_mode(dest, &pending.body, pending.perm);
         }
     }
 
@@ -350,11 +355,12 @@ impl SyncState {
                         break; // wait for more bytes
                     };
                     let path_mode = String::from_utf8_lossy(&payload).into_owned();
-                    let orig_name = adb_proto::parse_send_path(&path_mode)
-                        .map(|(path, _mode)| path)
-                        .unwrap_or_default();
+                    let (orig_name, perm) = adb_proto::parse_send_path(&path_mode)
+                        .map(|(path, mode)| (path, mode & 0o777))
+                        .unwrap_or_else(|| (String::new(), DEFAULT_PUSH_PERM));
                     self.pending_send = Some(PendingSend {
                         orig_name,
+                        perm,
                         body: Vec::new(),
                         wire_bytes: 0,
                     });
@@ -1276,6 +1282,12 @@ mod tests {
     }
 
     fn push(fs: FakeFs, path: &str, body: &[u8]) -> (Vec<u8>, Option<CaptureJob>) {
+        push_mode(fs, path, 33188, body)
+    }
+
+    /// A push whose SEND carries `mode` as the decimal `st_mode` a real `adb push` sends
+    /// (33188 is 0o100644, 33261 is 0o100755).
+    fn push_mode(fs: FakeFs, path: &str, mode: u32, body: &[u8]) -> (Vec<u8>, Option<CaptureJob>) {
         let (handoff, _dir) = test_handoff(16);
         let mut sync = SyncState::new(
             "203.0.113.7".parse().unwrap(),
@@ -1284,11 +1296,61 @@ mod tests {
             handoff,
             fs,
         );
-        let mut wire =
-            adb_proto::build_sync_message(adb_proto::SYNC_SEND, format!("{path},33188").as_bytes());
+        let mut wire = adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            format!("{path},{mode}").as_bytes(),
+        );
         wire.extend_from_slice(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, body));
         wire.extend_from_slice(&adb_proto::build_sync_done(1_700_000_000));
         sync.feed(&wire)
+    }
+
+    /// The SEND mode decides whether a pushed file runs: 0755 is executable, 0644 is not, and
+    /// only the permission bits are taken. A SEND with no parseable mode names no path either.
+    #[test]
+    fn a_push_lands_with_the_send_modes_permission_bits() {
+        let base = FakeFs::android();
+        push_mode(base.share(), "/data/local/tmp/bot", 0o100_755, b"ELF-bot");
+        push_mode(base.share(), "/data/local/tmp/data", 0o100_644, b"ELF-data");
+        push_mode(
+            base.share(),
+            "/data/local/tmp/high",
+            0o104_700 | 0o010,
+            b"ELF-high",
+        );
+        assert!(base.is_executable("/data/local/tmp/bot"));
+        assert!(!base.is_executable("/data/local/tmp/data"));
+        assert_eq!(
+            base.stat("/data/local/tmp/bot", true).unwrap().mode,
+            0o100_755
+        );
+        assert_eq!(
+            base.stat("/data/local/tmp/data", true).unwrap().mode,
+            0o100_644
+        );
+        // setuid is dropped, the owner and group execute bits stay.
+        assert_eq!(
+            base.stat("/data/local/tmp/high", true).unwrap().mode,
+            0o100_710
+        );
+
+        let (handoff, _dir) = test_handoff(16);
+        let mut sync = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            base.share(),
+        );
+        let mut wire =
+            adb_proto::build_sync_message(adb_proto::SYNC_SEND, b"/data/local/tmp/nomode");
+        wire.extend_from_slice(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"x"));
+        wire.extend_from_slice(&adb_proto::build_sync_done(1));
+        sync.feed(&wire);
+        assert!(
+            !base.file_exists("/data/local/tmp/nomode"),
+            "an unparseable SEND has no destination, as before"
+        );
     }
 
     #[test]

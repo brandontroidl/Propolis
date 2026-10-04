@@ -38,6 +38,7 @@ pub const READ_CAP: u64 = 1 << 20;
 const MAX_SYMLINK_HOPS: u32 = 40;
 
 const MODE_FILE: u32 = 0o100_644;
+const MODE_REGULAR: u32 = 0o100_000;
 const MODE_EXECUTABLE: u32 = 0o100_755;
 const MODE_DIRECTORY: u32 = 0o040_755;
 const MODE_SYMLINK: u32 = 0o120_777;
@@ -1400,6 +1401,14 @@ impl FakeFs {
     pub fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
         let blob = binaries::image_blob_for(bytes).unwrap_or_else(|| Blob::from_bytes(bytes));
         self.write_blob(path, blob, MODE_FILE)
+    }
+
+    /// [`Self::write_file`] with the permission bits the uploader asked for (an SCP `C0755` line,
+    /// an ADB SEND mode, SFTP attrs), so a pushed 0755 binary is runnable and a 0644 one is not.
+    /// Only the low nine bits are taken; the file-type bits are always a regular file's.
+    pub fn write_file_mode(&mut self, path: &str, bytes: &[u8], perm: u32) -> Result<(), FsError> {
+        let blob = binaries::image_blob_for(bytes).unwrap_or_else(|| Blob::from_bytes(bytes));
+        self.write_blob(path, blob, MODE_REGULAR | (perm & 0o777))
     }
 
     /// Write `blob` to `path` with `mode`. Fails the way a real write does, so a loader dropping
@@ -2852,6 +2861,27 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
         assert!(fs.stat("/tmp/made", true).is_none());
         fs.remove_path("/etc/hostname").unwrap();
         assert!(fs.stat("/etc/hostname", true).is_none());
+    }
+
+    #[test]
+    fn write_file_mode_stores_the_given_permission_bits_on_a_regular_file() {
+        let mut fs = FakeFs::new();
+        fs.write_file_mode("/tmp/run", b"x", 0o755).unwrap();
+        fs.write_file_mode("/tmp/data", b"x", 0o644).unwrap();
+        // A full st_mode (ADB) or stray high bits must not change the file type or leak in.
+        fs.write_file_mode("/tmp/full", b"x", 0o100_750).unwrap();
+        fs.write_file_mode("/tmp/high", b"x", 0o7_4000 | 0o600)
+            .unwrap();
+        assert!(fs.is_executable("/tmp/run"));
+        assert!(!fs.is_executable("/tmp/data"));
+        assert!(fs.is_executable("/tmp/full"));
+        assert!(!fs.is_executable("/tmp/high"));
+        assert_eq!(fs.stat("/tmp/run", true).unwrap().mode, 0o100_755);
+        assert_eq!(fs.stat("/tmp/data", true).unwrap().mode, MODE_FILE);
+        assert_eq!(fs.stat("/tmp/high", true).unwrap().mode, 0o100_600);
+        // write_file keeps its 0644 default.
+        fs.write_file("/tmp/plain", b"x").unwrap();
+        assert!(!fs.is_executable("/tmp/plain"));
     }
 
     #[test]

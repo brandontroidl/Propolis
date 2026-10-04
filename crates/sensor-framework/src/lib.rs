@@ -9,6 +9,7 @@ pub mod bounds;
 pub mod budget;
 pub mod command_codec;
 pub mod config;
+pub mod coverage;
 pub mod emit;
 pub mod env;
 pub mod fakefs;

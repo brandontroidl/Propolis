@@ -49,14 +49,23 @@ pub async fn start_test_listener(
     let emitter = Arc::new(EventEmitter::new(log_path));
     let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
     let bounds = test_bounds();
-    run_tcp_listener(addr, bounds.clone(), move |stream, peer, session_id| {
-        let emitter = emitter.clone();
-        let wan_resolver = wan_resolver.clone();
-        let bounds = bounds.clone();
-        async move {
-            handler::handle_tcp(stream, peer, session_id, &wan_resolver, &emitter, &bounds).await;
-        }
-    })
+    let per_source_cap = Some(sensor_framework::default_per_source_cap(
+        bounds.max_concurrent,
+    ));
+    run_tcp_listener(
+        addr,
+        bounds.clone(),
+        per_source_cap,
+        move |stream, peer, session_id| {
+            let emitter = emitter.clone();
+            let wan_resolver = wan_resolver.clone();
+            let bounds = bounds.clone();
+            async move {
+                handler::handle_tcp(stream, peer, session_id, &wan_resolver, &emitter, &bounds)
+                    .await;
+            }
+        },
+    )
     .await
 }
 
@@ -81,7 +90,10 @@ pub async fn start_test_udp_listener(
     let emitter = Arc::new(EventEmitter::new(log_path));
     let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
     let local_ip = normalize_dual_stack(addr).ip();
-    run_udp_listener(addr, bounds, move |data, peer| {
+    let per_source_cap = Some(sensor_framework::default_per_source_cap(
+        bounds.max_concurrent,
+    ));
+    run_udp_listener(addr, bounds, per_source_cap, move |data, peer| {
         let emitter = emitter.clone();
         let wan_resolver = wan_resolver.clone();
         async move {

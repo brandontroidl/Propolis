@@ -39,7 +39,8 @@ pub async fn serve(
     sink: Arc<dyn BatchSink>,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
     let acceptor = TlsAcceptor::from(tls);
-    run_tcp_listener(addr, bounds, move |tcp, peer, _session_id| {
+    // No per-source cap: the gateway's one trusted shipper opens many connections from one IP.
+    run_tcp_listener(addr, bounds, None, move |tcp, peer, _session_id| {
         let acceptor = acceptor.clone();
         let sink = Arc::clone(&sink);
         async move { handle_connection(tcp, peer, acceptor, sink).await }

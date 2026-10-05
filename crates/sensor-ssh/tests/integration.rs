@@ -1112,8 +1112,11 @@ async fn concurrency_beyond_max_concurrent_is_refused_not_queued() {
     let mut scratch = [0u8; 1024];
     let _ = tokio::time::timeout(Duration::from_secs(5), first.read(&mut scratch)).await;
 
-    // Second connection: accepted at the TCP layer, then closed without a byte of SSH.
-    let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Second connection, from a different source IP so the per-source cap cannot be what refuses
+    // it: accepted at the TCP layer, then closed without a byte of SSH.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+    let mut second = socket.connect(addr).await.unwrap();
     let got = tokio::time::timeout(Duration::from_secs(10), second.read(&mut scratch)).await;
 
     handle.abort();

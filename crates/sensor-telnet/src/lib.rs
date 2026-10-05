@@ -52,23 +52,31 @@ pub async fn start_test_server(
     ));
     let _worker = handoff.start_worker();
 
-    run_tcp_listener(addr, bounds.clone(), move |stream, peer, session_id| {
-        let emitter = emitter.clone();
-        let handoff = handoff.clone();
-        let wan_resolver = wan_resolver.clone();
-        let bounds = bounds.clone();
-        async move {
-            handler::handle_connection(
-                stream,
-                peer,
-                session_id,
-                emitter,
-                wan_resolver,
-                bounds,
-                handoff,
-            )
-            .await;
-        }
-    })
+    let per_source_cap = Some(sensor_framework::default_per_source_cap(
+        bounds.max_concurrent,
+    ));
+    run_tcp_listener(
+        addr,
+        bounds.clone(),
+        per_source_cap,
+        move |stream, peer, session_id| {
+            let emitter = emitter.clone();
+            let handoff = handoff.clone();
+            let wan_resolver = wan_resolver.clone();
+            let bounds = bounds.clone();
+            async move {
+                handler::handle_connection(
+                    stream,
+                    peer,
+                    session_id,
+                    emitter,
+                    wan_resolver,
+                    bounds,
+                    handoff,
+                )
+                .await;
+            }
+        },
+    )
     .await
 }

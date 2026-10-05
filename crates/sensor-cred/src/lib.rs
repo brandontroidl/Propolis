@@ -87,11 +87,19 @@ where
         + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    run_tcp_listener(addr, bounds.clone(), move |stream, peer, session_id| {
-        let emitter = emitter.clone();
-        let wan_resolver = wan_resolver.clone();
-        let bounds = bounds.clone();
-        handler(stream, peer, session_id, emitter, wan_resolver, bounds)
-    })
+    let per_source_cap = Some(sensor_framework::default_per_source_cap(
+        bounds.max_concurrent,
+    ));
+    run_tcp_listener(
+        addr,
+        bounds.clone(),
+        per_source_cap,
+        move |stream, peer, session_id| {
+            let emitter = emitter.clone();
+            let wan_resolver = wan_resolver.clone();
+            let bounds = bounds.clone();
+            handler(stream, peer, session_id, emitter, wan_resolver, bounds)
+        },
+    )
     .await
 }

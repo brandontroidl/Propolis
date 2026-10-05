@@ -50,7 +50,7 @@ A sensor crate supplies protocol logic; the framework supplies everything else.
 
 ### Listener and per-connection isolation
 
-`run_tcp_listener(addr, bounds, handler)` binds one TCP address, runs an accept loop,
+`run_tcp_listener(addr, bounds, per_source_cap, handler)` binds one TCP address, runs an accept loop,
 and hands each accepted connection to the protocol handler with a raw `TcpStream`,
 the peer `SocketAddr`, and a fresh `Uuid::now_v7()` session id
 (`crates/sensor-framework/src/listener.rs#run_tcp_listener`). Each connection:
@@ -58,13 +58,18 @@ the peer `SocketAddr`, and a fresh `Uuid::now_v7()` session id
 - runs in its own `tokio::spawn`, so a panicking handler is caught by tokio's task
   harness, logged, and never crashes the accept loop
   (`crates/sensor-framework/src/listener.rs#run_tcp_listener`);
+- is bounded per source IP by `per_source_cap` (`Some(n)` enables it; sensors pass a
+  quarter of `max_concurrent`, floor 2; the gateway passes `None` because its trusted
+  shipper multiplexes many connections from one IP), checked before the global permit
+  so one source cannot exhaust `max_concurrent`
+  (`crates/sensor-framework/src/admission.rs#PerSourceLimiter`);
 - is bounded by `max_concurrent` via a `tokio::sync::Semaphore` - a connection over
   the limit is refused immediately (socket closed, never queued)
   (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`);
 - is time-bounded by running the handler future inside
   `tokio::time::timeout(max_duration, fut)` (`crates/sensor-framework/src/listener.rs#run_tcp_listener`).
 
-`run_udp_listener` mirrors this for datagrams, but **never hands the socket to the
+`run_udp_listener` mirrors this for datagrams (a datagram over its source's cap is dropped), but **never hands the socket to the
 handler**, so a UDP sensor cannot answer a probe by construction
 (`crates/sensor-framework/src/listener.rs#run_udp_listener`). `normalize_dual_stack` maps IPv4-mapped IPv6 peers
 (`::ffff:a.b.c.d`) down to plain IPv4 before WAN resolution, so a plain-IPv4 WAN map

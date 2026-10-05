@@ -19,9 +19,20 @@ explicitly.
 ### Per-connection tasks with a hard concurrency cap
 
 Each sensor's listener runs an accept loop and spawns **one task per connection** (or
-per UDP datagram). Two framework-enforced bounds apply without the handler's
-cooperation (`crates/sensor-framework/src/listener.rs`, `bounds.rs`):
+per UDP datagram). Three framework-enforced bounds apply without the handler's
+cooperation (`crates/sensor-framework/src/listener.rs`, `bounds.rs`, `admission.rs`):
 
+- **Per-source cap** - `PerSourceLimiter` (`crates/sensor-framework/src/admission.rs#PerSourceLimiter`)
+  counts live connections per source IP (IPv4-mapped IPv6 normalized) and refuses a
+  source already at its cap, so one host cannot take every `max_concurrent` permit and
+  blind the sensor to everyone else. It is checked **before** the global permit, so a
+  refused source burns no global permit; the guard moves into the connection task and
+  frees its slot on any exit (finish, panic, timeout, abort). Sensors pass
+  `default_per_source_cap(max_concurrent)`, a quarter of `max_concurrent`, floor 2,
+  never above `max_concurrent`. The gateway passes `None` (no cap): its one trusted
+  shipper opens many connections from a single IP. The TFTP sensor, which runs its own
+  receive loop, applies the same limiter and derivation. Refusals are logged at
+  power-of-two totals.
 - **`max_concurrent`** - a `tokio::sync::Semaphore` seeded with that many permits. A
   connection accepted while every permit is held is **refused immediately** (the socket
   is closed, not queued). An accepted-but-waiting connection would itself be the
@@ -116,8 +127,9 @@ missing or malformed input.
 
 ## Backpressure and capacity
 
-- **Sensors** shed load by refusing connections past `max_concurrent` - they do not
-  queue.
+- **Sensors** shed load by refusing connections past `max_concurrent`, and past a
+  per-source cap (a quarter of `max_concurrent` by default) for any single source IP -
+  they do not queue.
 - **Capture** sheds load by dropping jobs past the bounded queue - it does not block.
 - **Intake** polls the sensor logs on an interval; it advances a per-sensor cursor and
   is naturally rate-limited by its poll interval and the serialized append lock.

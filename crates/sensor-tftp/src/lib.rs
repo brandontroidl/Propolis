@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
-    CaptureHandoff, ConnectionBounds, EventEmitter, OutboxManifest, QuarantineSpool, WanResolver,
+    CaptureHandoff, ConnectionBounds, EventEmitter, OutboxManifest, PerSourceLimiter,
+    QuarantineSpool, WanResolver, default_per_source_cap,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
@@ -57,6 +58,7 @@ pub async fn start_test_server(
     let socket = UdpSocket::bind(addr).await?;
     let bound = socket.local_addr()?;
     let semaphore = Arc::new(Semaphore::new(bounds.max_concurrent as usize));
+    let limiter = PerSourceLimiter::new(default_per_source_cap(bounds.max_concurrent));
     let sensor = Arc::new(Sensor {
         emitter,
         wan_resolver,
@@ -65,17 +67,23 @@ pub async fn start_test_server(
         local_ip: bound.ip(),
     });
 
-    let handle = tokio::spawn(serve(socket, sensor, semaphore));
+    let handle = tokio::spawn(serve(socket, sensor, semaphore, limiter));
     Ok((bound, handle))
 }
 
 /// The request loop. This socket only ever receives: replies leave from a per-transfer socket
 /// (`guarded::Transfer`), as RFC 1350 specifies. A request that cannot get a concurrency permit
 /// is dropped unanswered, like any other lost datagram, and the loop keeps draining the socket.
-async fn serve(socket: UdpSocket, sensor: Arc<Sensor>, semaphore: Arc<Semaphore>) {
+async fn serve(
+    socket: UdpSocket,
+    sensor: Arc<Sensor>,
+    semaphore: Arc<Semaphore>,
+    limiter: PerSourceLimiter,
+) {
     let max_duration = sensor.bounds.max_duration;
     let mut buf = vec![0u8; RECV_BUFFER];
     let mut refused: u64 = 0;
+    let mut source_refused: u64 = 0;
     loop {
         let (n, peer) = match socket.recv_from(&mut buf).await {
             Ok(received) => received,
@@ -86,6 +94,14 @@ async fn serve(socket: UdpSocket, sensor: Arc<Sensor>, semaphore: Arc<Semaphore>
             }
         };
         let Some(request) = handler::classify(&buf[..n]) else {
+            continue;
+        };
+        // Per-source first so a refused source never burns a global permit.
+        let Some(source_guard) = limiter.try_admit(peer) else {
+            source_refused += 1;
+            if source_refused.is_power_of_two() {
+                tracing::warn!(refused_total = source_refused, %peer, "tftp: per-source cap reached; request dropped");
+            }
             continue;
         };
         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
@@ -99,6 +115,7 @@ async fn serve(socket: UdpSocket, sensor: Arc<Sensor>, semaphore: Arc<Semaphore>
         let sensor = sensor.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _source_guard = source_guard;
             let handled = tokio::time::timeout(max_duration, sensor.handle_request(peer, request));
             if handled.await.is_err() {
                 tracing::warn!(%peer, "tftp: transfer exceeded max_duration; dropped");

@@ -1,3 +1,4 @@
+use sensor_framework::admission::default_per_source_cap;
 use sensor_framework::bounds::ConnectionBounds;
 use sensor_framework::listener::{run_tcp_listener, run_udp_listener, shutdown_signal};
 use std::net::SocketAddr;
@@ -5,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 fn test_bounds() -> ConnectionBounds {
     ConnectionBounds {
@@ -17,19 +18,28 @@ fn test_bounds() -> ConnectionBounds {
     }
 }
 
+/// Connects to `target` from a specific loopback source address (Linux routes all of 127/8 to
+/// loopback), so a test can present distinct source IPs to one listener.
+async fn connect_from(source: &str, target: SocketAddr) -> std::io::Result<TcpStream> {
+    let socket = TcpSocket::new_v4()?;
+    socket.bind(format!("{source}:0").parse().unwrap())?;
+    socket.connect(target).await
+}
+
 #[tokio::test]
 async fn tcp_accept_and_handler_called() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(1);
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let (bound_addr, handle) = run_tcp_listener(addr, test_bounds(), move |stream, peer, _id| {
-        let tx = tx.clone();
-        async move {
-            let _ = tx.send(peer).await;
-            drop(stream);
-        }
-    })
-    .await
-    .unwrap();
+    let (bound_addr, handle) =
+        run_tcp_listener(addr, test_bounds(), None, move |stream, peer, _id| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(peer).await;
+                drop(stream);
+            }
+        })
+        .await
+        .unwrap();
     let _conn = TcpStream::connect(bound_addr).await.unwrap();
     let peer = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -43,7 +53,7 @@ async fn tcp_accept_and_handler_called() {
 async fn udp_receives_and_never_responds() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let (bound_addr, handle) = run_udp_listener(addr, test_bounds(), move |data, _peer| {
+    let (bound_addr, handle) = run_udp_listener(addr, test_bounds(), None, move |data, _peer| {
         let tx = tx.clone();
         async move {
             let _ = tx.send(data.to_vec()).await;
@@ -72,7 +82,7 @@ async fn bind_failure_non_fatal() {
     let blocked_addr = blocker.local_addr().unwrap();
     // run_tcp_listener on the blocked port should return an error for that port
     // but not crash. (If the API binds multiple ports, a single failure is non-fatal.)
-    let result = run_tcp_listener(blocked_addr, test_bounds(), |_s, _p, _id| async {}).await;
+    let result = run_tcp_listener(blocked_addr, test_bounds(), None, |_s, _p, _id| async {}).await;
     assert!(result.is_err());
     drop(blocker);
 }
@@ -82,15 +92,16 @@ async fn handler_panic_does_not_crash_accept_loop() {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let count = call_count.clone();
-    let (bound_addr, handle) = run_tcp_listener(addr, test_bounds(), move |_stream, _peer, _id| {
-        let count = count.clone();
-        async move {
-            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            panic!("handler panic");
-        }
-    })
-    .await
-    .unwrap();
+    let (bound_addr, handle) =
+        run_tcp_listener(addr, test_bounds(), None, move |_stream, _peer, _id| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                panic!("handler panic");
+            }
+        })
+        .await
+        .unwrap();
     // Connect twice - both should be handled despite the panic.
     let _c1 = TcpStream::connect(bound_addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -116,7 +127,7 @@ async fn udp_bind_failure_non_fatal() {
     // exercises at all.
     let blocker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let blocked_addr = blocker.local_addr().unwrap();
-    let result = run_udp_listener(blocked_addr, test_bounds(), |_d, _p| async {}).await;
+    let result = run_udp_listener(blocked_addr, test_bounds(), None, |_d, _p| async {}).await;
     assert!(result.is_err());
     drop(blocker);
 }
@@ -131,7 +142,7 @@ async fn udp_handler_panic_does_not_crash_recv_loop() {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let call_count = Arc::new(AtomicU32::new(0));
     let count = call_count.clone();
-    let (bound_addr, handle) = run_udp_listener(addr, test_bounds(), move |_data, _peer| {
+    let (bound_addr, handle) = run_udp_listener(addr, test_bounds(), None, move |_data, _peer| {
         let count = count.clone();
         async move {
             count.fetch_add(1, Ordering::Relaxed);
@@ -169,15 +180,20 @@ async fn max_concurrent_refuses_excess_connections_immediately() {
     let hold = Arc::new(tokio::sync::Notify::new());
     let started2 = started.clone();
     let hold2 = hold.clone();
-    let (bound_addr, handle) = run_tcp_listener(addr, bounds, move |stream, _peer, _id| {
-        let started = started2.clone();
-        let hold = hold2.clone();
-        async move {
-            started.notify_one();
-            hold.notified().await;
-            drop(stream);
-        }
-    })
+    let (bound_addr, handle) = run_tcp_listener(
+        addr,
+        bounds,
+        Some(default_per_source_cap(1)),
+        move |stream, _peer, _id| {
+            let started = started2.clone();
+            let hold = hold2.clone();
+            async move {
+                started.notify_one();
+                hold.notified().await;
+                drop(stream);
+            }
+        },
+    )
     .await
     .unwrap();
 
@@ -187,7 +203,7 @@ async fn max_concurrent_refuses_excess_connections_immediately() {
     // race against a fully-occupied semaphore rather than an in-progress accept.
     started.notified().await;
 
-    let mut second = TcpStream::connect(bound_addr).await.unwrap();
+    let mut second = connect_from("127.0.0.2", bound_addr).await.unwrap();
     // A real prober would not necessarily wait passively; write before reading to confirm a
     // refused connection tolerates an incoming write rather than hanging on it.
     let _ = second.write_all(b"probe").await;
@@ -221,25 +237,31 @@ async fn max_concurrent_caps_peak_concurrent_handlers() {
     let peak = Arc::new(AtomicU32::new(0));
     let active2 = active.clone();
     let peak2 = peak.clone();
-    let (bound_addr, handle) = run_tcp_listener(addr, bounds, move |stream, _peer, _id| {
-        let active = active2.clone();
-        let peak = peak2.clone();
-        async move {
-            let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
-            peak.fetch_max(cur, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            active.fetch_sub(1, Ordering::SeqCst);
-            drop(stream);
-        }
-    })
+    let (bound_addr, handle) = run_tcp_listener(
+        addr,
+        bounds,
+        Some(default_per_source_cap(2)),
+        move |stream, _peer, _id| {
+            let active = active2.clone();
+            let peak = peak2.clone();
+            async move {
+                let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        },
+    )
     .await
     .unwrap();
 
     let mut connect_handles = Vec::new();
-    for _ in 0..6 {
-        connect_handles.push(tokio::spawn(
-            async move { TcpStream::connect(bound_addr).await },
-        ));
+    // Six distinct sources, so the per-source cap cannot mask the global-cap assertion.
+    for i in 1..=6 {
+        connect_handles.push(tokio::spawn(async move {
+            connect_from(&format!("127.0.0.{i}"), bound_addr).await
+        }));
     }
     let mut conns = Vec::new();
     for h in connect_handles {
@@ -270,7 +292,7 @@ async fn max_duration_aborts_long_running_handler() {
     };
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (bound_addr, handle) =
-        run_tcp_listener(addr, bounds, move |stream, _peer, _id| async move {
+        run_tcp_listener(addr, bounds, None, move |stream, _peer, _id| async move {
             tokio::time::sleep(Duration::from_secs(3600)).await;
             drop(stream); // never reached within this test's lifetime if max_duration works.
         })
@@ -299,4 +321,91 @@ async fn shutdown_signal_does_not_resolve_without_a_signal() {
         result.is_err(),
         "shutdown_signal must not resolve without an actual signal"
     );
+}
+
+#[tokio::test]
+async fn per_source_cap_refuses_one_source_but_admits_another() {
+    // One source holding its cap must not block a different source. Global cap (10) is far above
+    // the per-source cap (1), so any refusal observed here is the per-source limit.
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let hold2 = hold.clone();
+    let admitted = Arc::new(AtomicU32::new(0));
+    let admitted2 = admitted.clone();
+    let (bound_addr, handle) =
+        run_tcp_listener(addr, test_bounds(), Some(1), move |stream, _peer, _id| {
+            let hold = hold2.clone();
+            let admitted = admitted2.clone();
+            async move {
+                admitted.fetch_add(1, Ordering::SeqCst);
+                hold.notified().await;
+                drop(stream);
+            }
+        })
+        .await
+        .unwrap();
+
+    let _first = connect_from("127.0.0.2", bound_addr).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while admitted.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first connection was never admitted");
+
+    // Same source, beyond its cap: closed without reaching the handler.
+    let mut same = connect_from("127.0.0.2", bound_addr).await.unwrap();
+    let _ = same.write_all(b"probe").await;
+    let mut buf = [0u8; 1];
+    match tokio::time::timeout(Duration::from_millis(500), same.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("refused connection unexpectedly yielded {n} bytes"),
+        Err(_) => panic!("same-source connection beyond the cap was not closed"),
+    }
+    assert_eq!(admitted.load(Ordering::SeqCst), 1);
+
+    // A different source is still admitted.
+    let _other = connect_from("127.0.0.3", bound_addr).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while admitted.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a different source was starved by the first source's per-source cap");
+
+    hold.notify_waiters();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn per_source_slot_is_released_when_the_connection_ends() {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let admitted = Arc::new(AtomicU32::new(0));
+    let admitted2 = admitted.clone();
+    let (bound_addr, handle) =
+        run_tcp_listener(addr, test_bounds(), Some(1), move |stream, _peer, _id| {
+            let admitted = admitted2.clone();
+            async move {
+                admitted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        })
+        .await
+        .unwrap();
+
+    // Sequential connections from one source with cap 1 must all be admitted: each handler ends
+    // immediately, so the guard's Drop must free the slot every time.
+    for expected in 1..=3u32 {
+        let _conn = connect_from("127.0.0.2", bound_addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while admitted.load(Ordering::SeqCst) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slot was not released after the previous connection ended");
+    }
+    handle.abort();
 }

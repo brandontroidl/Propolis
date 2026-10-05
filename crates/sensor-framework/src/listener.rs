@@ -25,6 +25,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use crate::admission::PerSourceLimiter;
 use crate::bounds::ConnectionBounds;
 
 /// Maximum size of a single UDP datagram (the IPv4/IPv6 payload ceiling), so `recv_from` never
@@ -47,6 +48,11 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 /// session id minted fresh for this connection, so every event a handler emits over the
 /// connection's lifetime can be stamped with a stable, time-ordered identifier. It is called once
 /// per accepted connection.
+///
+/// `per_source_cap`: `Some(n)` admits at most `n` concurrent connections per source IP (IPv4-mapped
+/// IPv6 normalized), checked before the global permit so a refused source burns nothing global;
+/// `None` disables it (the gateway, whose one trusted shipper opens many connections from one IP).
+/// Sensors pass `Some(default_per_source_cap(bounds.max_concurrent))`.
 ///
 /// Two bounds this function enforces directly, without the handler's cooperation:
 /// - `max_concurrent`: a `tokio::sync::Semaphore` seeded with `bounds.max_concurrent` permits.
@@ -72,6 +78,7 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 pub async fn run_tcp_listener<F, Fut>(
     addr: SocketAddr,
     bounds: ConnectionBounds,
+    per_source_cap: Option<u32>,
     handler: F,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)>
 where
@@ -82,6 +89,8 @@ where
     let bound_addr = listener.local_addr()?;
     let semaphore = Arc::new(Semaphore::new(bounds.max_concurrent as usize));
     let max_duration = bounds.max_duration;
+    let limiter = per_source_cap.map(PerSourceLimiter::new);
+    let mut source_refused: u64 = 0;
 
     let accept_handle = tokio::spawn(async move {
         loop {
@@ -92,6 +101,28 @@ where
                     tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                     continue;
                 }
+            };
+
+            // Per-source check first so a refused source never burns a global permit.
+            let source_guard = match &limiter {
+                Some(limiter) => match limiter.try_admit(peer) {
+                    Some(guard) => Some(guard),
+                    None => {
+                        source_refused += 1;
+                        // Power-of-two totals: a flood must not fill the log it is probing.
+                        if source_refused.is_power_of_two() {
+                            tracing::warn!(
+                                refused_total = source_refused,
+                                %peer,
+                                local = %bound_addr,
+                                "per-source cap reached; refusing connection"
+                            );
+                        }
+                        drop(stream);
+                        continue;
+                    }
+                },
+                None => None,
             };
 
             let permit = match semaphore.clone().try_acquire_owned() {
@@ -110,10 +141,11 @@ where
             let session_id = uuid::Uuid::now_v7();
             let fut = handler(stream, peer, session_id);
             tokio::spawn(async move {
-                // Held for the connection's whole lifetime; dropped (releasing the permit) when
-                // this outer task ends, which happens only once the inner task below has already
-                // finished one way or another.
+                // Held for the connection's whole lifetime; dropped (releasing the permit and the
+                // per-source slot) when this outer task ends, which happens only once the inner
+                // task below has already finished one way or another.
                 let _permit = permit;
+                let _source_guard = source_guard;
                 let inner =
                     tokio::spawn(async move { tokio::time::timeout(max_duration, fut).await });
                 match inner.await {
@@ -162,6 +194,7 @@ where
 pub async fn run_udp_listener<F, Fut>(
     addr: SocketAddr,
     bounds: ConnectionBounds,
+    per_source_cap: Option<u32>,
     handler: F,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)>
 where
@@ -176,6 +209,8 @@ where
     // keeps draining so its kernel receive buffer does not back up.
     let semaphore = Arc::new(Semaphore::new(bounds.max_concurrent as usize));
     let max_duration = bounds.max_duration;
+    let limiter = per_source_cap.map(PerSourceLimiter::new);
+    let mut source_refused: u64 = 0;
 
     let recv_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_MAX_DATAGRAM];
@@ -187,6 +222,23 @@ where
                     tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                     continue;
                 }
+            };
+            let source_guard = match &limiter {
+                Some(limiter) => match limiter.try_admit(peer) {
+                    Some(guard) => Some(guard),
+                    None => {
+                        source_refused += 1;
+                        if source_refused.is_power_of_two() {
+                            tracing::warn!(
+                                refused_total = source_refused,
+                                local = %bound_addr, %peer,
+                                "udp per-source cap reached; dropping datagram"
+                            );
+                        }
+                        continue;
+                    }
+                },
+                None => None,
             };
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -202,6 +254,7 @@ where
             let fut = handler(data, peer);
             tokio::spawn(async move {
                 let _permit = permit; // released when this handler task ends
+                let _source_guard = source_guard;
                 let inner =
                     tokio::spawn(async move { tokio::time::timeout(max_duration, fut).await });
                 match inner.await {

@@ -658,8 +658,9 @@ async fn max_concurrent_drops_requests_beyond_the_limit() {
     let mut first = Client::new().await;
     let transfer = first.begin_write(srv.addr, "holder.bin", "octet").await;
 
-    // The only permit is held by the open transfer: a second request is dropped unanswered.
-    let mut second = Client::new().await;
+    // The only permit is held by the open transfer: a second request is dropped unanswered. It
+    // comes from a different source IP so the per-source cap cannot be what drops it.
+    let mut second = Client::bound("127.0.0.2:0").await;
     second.send(srv.addr, &wrq(b"refused.bin", b"octet")).await;
     second.send(srv.addr, &rrq(b"refused.bin", b"octet")).await;
     second.assert_silent(Duration::from_millis(500)).await;
@@ -678,7 +679,7 @@ async fn max_concurrent_drops_requests_beyond_the_limit() {
     // Finishing the first transfer frees the permit.
     first.send_block(transfer, 1, b"done").await;
     first.expect_ack(transfer, 1).await;
-    let mut third = Client::new().await;
+    let mut third = Client::bound("127.0.0.3:0").await;
     let mut answered = false;
     for _ in 0..20 {
         third.send(srv.addr, &rrq(b"after.bin", b"octet")).await;
@@ -695,6 +696,34 @@ async fn max_concurrent_drops_requests_beyond_the_limit() {
         answered,
         "the permit must be released when the transfer ends"
     );
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn per_source_cap_drops_one_source_but_still_serves_another() {
+    // max_concurrent 8 derives a per-source cap of 2.
+    let mut bounds = test_bounds();
+    bounds.max_concurrent = 8;
+    let srv = TestServer::start_with(bounds, HashMap::new()).await;
+
+    let mut hog = Client::bound("127.0.0.2:0").await;
+    let _t1 = hog.begin_write(srv.addr, "hog1.bin", "octet").await;
+    let _t2 = hog.begin_write(srv.addr, "hog2.bin", "octet").await;
+
+    // The same source is now at its cap: the next request is dropped unanswered, with no event.
+    hog.send(srv.addr, &wrq(b"hog3.bin", b"octet")).await;
+    hog.assert_silent(Duration::from_millis(500)).await;
+    assert!(
+        srv.events()
+            .await
+            .iter()
+            .all(|e| e.metadata["filename"] != "hog3.bin"),
+        "a request dropped by the per-source cap leaves no event"
+    );
+
+    // A different source is unaffected even though the global limit has plenty of room.
+    let mut other = Client::bound("127.0.0.3:0").await;
+    other.begin_write(srv.addr, "other.bin", "octet").await;
     srv.handle.abort();
 }
 

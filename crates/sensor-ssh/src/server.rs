@@ -275,8 +275,14 @@ pub async fn serve(
     // Each connection builds its own budget from these limits: one ceiling for every shell and exec
     // channel it opens.
     let budget_limits = limits_from(&bounds);
-    let (bound_addr, handle) =
-        run_tcp_listener(addr, bounds, move |stream, peer_addr, session_id| {
+    let per_source_cap = Some(sensor_framework::default_per_source_cap(
+        bounds.max_concurrent,
+    ));
+    let (bound_addr, handle) = run_tcp_listener(
+        addr,
+        bounds,
+        per_source_cap,
+        move |stream, peer_addr, session_id| {
             let host_key = host_key.clone();
             let emitter = emitter.clone();
             let handoff = handoff.clone();
@@ -304,8 +310,9 @@ pub async fn serve(
                     tracing::debug!(error = %e, peer = %peer_addr, "SSH session ended");
                 }
             }
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     Ok((bound_addr, handle))
 }

@@ -287,15 +287,23 @@ async fn main() {
         let bounds = config.bounds.clone();
         let tcp_emitter = emitter.clone();
         let tcp_wan_resolver = wan_resolver.clone();
-        match run_tcp_listener(*addr, bounds.clone(), move |stream, peer, session_id| {
-            let emitter = tcp_emitter.clone();
-            let wan_resolver = tcp_wan_resolver.clone();
-            let bounds = bounds.clone();
-            async move {
-                handler::handle_tcp(stream, peer, session_id, &wan_resolver, &emitter, &bounds)
-                    .await;
-            }
-        })
+        let per_source_cap = Some(sensor_framework::default_per_source_cap(
+            bounds.max_concurrent,
+        ));
+        match run_tcp_listener(
+            *addr,
+            bounds.clone(),
+            per_source_cap,
+            move |stream, peer, session_id| {
+                let emitter = tcp_emitter.clone();
+                let wan_resolver = tcp_wan_resolver.clone();
+                let bounds = bounds.clone();
+                async move {
+                    handler::handle_tcp(stream, peer, session_id, &wan_resolver, &emitter, &bounds)
+                        .await;
+                }
+            },
+        )
         .await
         {
             Ok((bound, handle)) => {
@@ -310,13 +318,18 @@ async fn main() {
         let local_ip = normalize_dual_stack(*addr).ip();
         let udp_emitter = emitter.clone();
         let udp_wan_resolver = wan_resolver.clone();
-        match run_udp_listener(*addr, config.bounds.clone(), move |data, peer| {
-            let emitter = udp_emitter.clone();
-            let wan_resolver = udp_wan_resolver.clone();
-            async move {
-                handler::handle_udp(data, peer, local_ip, &wan_resolver, &emitter).await;
-            }
-        })
+        match run_udp_listener(
+            *addr,
+            config.bounds.clone(),
+            per_source_cap,
+            move |data, peer| {
+                let emitter = udp_emitter.clone();
+                let wan_resolver = udp_wan_resolver.clone();
+                async move {
+                    handler::handle_udp(data, peer, local_ip, &wan_resolver, &emitter).await;
+                }
+            },
+        )
         .await
         {
             Ok((bound, handle)) => {

@@ -4,6 +4,7 @@
 //! framework piece the design lists now exists; `sensor-catchall` and `sensor-ssh` (later tasks
 //! of the same sub-project) are thin compositions over it.
 
+pub mod admission;
 pub mod binaries;
 pub mod bounds;
 pub mod budget;
@@ -23,6 +24,7 @@ pub mod shell;
 pub mod spool;
 pub mod wan;
 
+pub use admission::{PerSourceLimiter, SourceGuard, default_per_source_cap};
 pub use bounds::ConnectionBounds;
 pub use budget::{BudgetLimits, ConnectionBudget, EgressState, limits_from};
 pub use command_codec::CommandCodec;

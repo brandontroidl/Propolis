@@ -18,6 +18,9 @@
 //! @cwd /tmp                                       the working directory after the line
 //! @downloads http://example.invalid/a             the line's download events, in order
 //! @events 1                                       every event the line emitted
+//! @class supported                                the line's coverage class: supported, partial,
+//!                                                 unknown or parse_limit (optional; unchecked
+//!                                                 when absent)
 //! ```
 //!
 //! Parsing reads text only. Nothing here opens a file, a socket or a database.
@@ -27,7 +30,7 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 
 use crate::fakefs::FakeFs;
-use crate::shell::{EmitContext, FakeShell};
+use crate::shell::{CommandClass, EmitContext, FakeShell};
 
 /// The persona a fixture's shell answers as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +57,7 @@ pub struct Expect {
     pub cwd: Option<String>,
     pub downloads: Option<Vec<String>>,
     pub events: Option<usize>,
+    pub class: Option<CommandClass>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +194,14 @@ pub fn parse(text: &str) -> Result<Fixture, ParseError> {
             e.downloads = Some(urls.split_whitespace().map(str::to_string).collect());
         } else if let Some(n) = raw.strip_prefix("@events ") {
             e.events = Some(parse_count(n, "count", at)?);
+        } else if let Some(word) = raw.strip_prefix("@class ") {
+            e.class = Some(match word.trim() {
+                "supported" => CommandClass::Supported,
+                "partial" => CommandClass::Partial,
+                "unknown" => CommandClass::Unknown,
+                "parse_limit" => CommandClass::ParseLimit,
+                other => return fail(at, format!("unknown class {other:?}")),
+            });
         } else {
             return fail(at, format!("unrecognised line {raw:?}"));
         }
@@ -320,6 +332,86 @@ pub fn explain(fixture: &Fixture, out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
+impl Expect {
+    /// Whether `out` satisfies the step's reply directives: the whole reply when no `>prefix-*` or
+    /// `>len` is given, else only what those state. The replay checker applies the same rule.
+    pub fn reply_matches(&self, out: &[u8]) -> bool {
+        if self.prefix.is_none() && self.len.is_none() {
+            return out == self.output;
+        }
+        self.prefix.as_ref().is_none_or(|p| out.starts_with(p))
+            && self.len.is_none_or(|n| out.len() == n)
+    }
+
+    /// The reply expectation as bounded escaped text, for review output.
+    fn describe_reply(&self) -> String {
+        if self.prefix.is_none() && self.len.is_none() {
+            return show_bytes(&self.output, SHOW_REPLY_MAX);
+        }
+        let mut parts = Vec::new();
+        if let Some(p) = &self.prefix {
+            parts.push(format!("starts with {}", show_bytes(p, SHOW_REPLY_MAX)));
+        }
+        if let Some(n) = self.len {
+            parts.push(format!("{n} bytes"));
+        }
+        parts.join(", ")
+    }
+}
+
+/// One step's committed expectation against what the current emulator produces.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StepDiff {
+    pub line_no: usize,
+    pub input: String,
+    /// Expected reply, escaped and bounded; a `>prefix-*` or `>len` step shows what it states.
+    pub reply_expected: String,
+    /// Actual reply, escaped and bounded.
+    pub reply_actual: String,
+    /// The fixture's `@class`, when it has one.
+    pub class_expected: Option<String>,
+    pub class_actual: String,
+    /// False when the reply differs or, for a step with `@class`, the class does.
+    pub matched: bool,
+}
+
+/// Replays `fixture` through a fresh shell and compares each step's reply and classification with
+/// the fixture's expectations, without asserting: the result is for review before a behavior
+/// change is accepted. A step without `@class` is compared on its reply alone. Working directory,
+/// downloads and event counts are the replay checker's concern and are not compared here.
+pub fn diff(fixture: &Fixture) -> Vec<StepDiff> {
+    let mut shell = fixture.shell();
+    fixture
+        .steps
+        .iter()
+        .map(|step| {
+            let (reply, _events) = shell.handle_input(&step.input);
+            let reply = reply.into_bytes();
+            let class_actual = shell.last_trace().classify();
+            let e = &step.expect;
+            StepDiff {
+                line_no: step.line_no,
+                input: step.input.clone(),
+                reply_expected: e.describe_reply(),
+                reply_actual: show_bytes(&reply, SHOW_REPLY_MAX),
+                class_expected: e.class.map(|c| c.as_str().to_string()),
+                class_actual: class_actual.as_str().to_string(),
+                matched: e.reply_matches(&reply) && e.class.is_none_or(|c| c == class_actual),
+            }
+        })
+        .collect()
+}
+
+/// Per-file diffs as one JSON array of `{"file", "steps"}` objects, for
+/// `propolis shell shadow-diff --json`. Every step is included, matched or not.
+pub fn files_to_json(files: &[(String, Vec<StepDiff>)]) -> String {
+    let value: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(file, steps)| serde_json::json!({ "file": file, "steps": steps }))
+        .collect();
+    serde_json::to_string_pretty(&value).expect("a StepDiff list always serializes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +474,76 @@ mod tests {
             let err = parse(text).unwrap_err();
             assert!(err.to_string().contains(needle), "{err} for {text:?}");
         }
+    }
+
+    const HEAD: &str = "# source: s\n# date: d\n# protocol: ssh\n# persona: ubuntu\n";
+
+    #[test]
+    fn parses_class_and_rejects_an_unknown_class_word() {
+        let f = parse(&format!(
+            "{HEAD}$ id\n@class supported\n$ a\n@class partial\n$ b\n@class unknown\n$ c\n@class parse_limit\n$ d\n"
+        ))
+        .unwrap();
+        let classes: Vec<_> = f.steps.iter().map(|s| s.expect.class).collect();
+        assert_eq!(
+            classes,
+            [
+                Some(CommandClass::Supported),
+                Some(CommandClass::Partial),
+                Some(CommandClass::Unknown),
+                Some(CommandClass::ParseLimit),
+                None
+            ]
+        );
+        let err = parse(&format!("{HEAD}$ id\n@class mostly\n")).unwrap_err();
+        assert!(err.to_string().contains("unknown class"), "{err}");
+    }
+
+    #[test]
+    fn diff_matches_a_correct_class_and_flags_a_wrong_one() {
+        // `id` is supported and `nosuchcmd-xyz` unknown (see the explain test below).
+        let good = parse(&format!(
+            "{HEAD}$ id\n> uid=0(root) gid=0(root) groups=0(root)\n@class supported\n\
+             $ nosuchcmd-xyz\n> nosuchcmd-xyz: command not found\n@class unknown\n"
+        ))
+        .unwrap();
+        let d = diff(&good);
+        assert_eq!(d.len(), 2);
+        assert!(d.iter().all(|s| s.matched), "{d:#?}");
+        assert_eq!(d[1].class_expected.as_deref(), Some("unknown"));
+        assert_eq!(d[1].class_actual, "unknown");
+
+        // Same replies, deliberately wrong classes: only the class differs.
+        let wrong = parse(&format!(
+            "{HEAD}$ id\n> uid=0(root) gid=0(root) groups=0(root)\n@class unknown\n\
+             $ nosuchcmd-xyz\n> nosuchcmd-xyz: command not found\n@class supported\n"
+        ))
+        .unwrap();
+        let d = diff(&wrong);
+        assert!(d.iter().all(|s| !s.matched), "{d:#?}");
+        assert_eq!(d[0].reply_expected, d[0].reply_actual);
+        assert_eq!(d[0].class_actual, "supported");
+    }
+
+    #[test]
+    fn diff_without_class_compares_the_reply_only() {
+        let f = parse(&format!(
+            "{HEAD}$ id\n> uid=0(root) gid=0(root) groups=0(root)\n$ whoami\n> nobody\n\
+             $ id\n>prefix-e uid=\n$ id\n>len 3\n"
+        ))
+        .unwrap();
+        let d = diff(&f);
+        let matched: Vec<bool> = d.iter().map(|s| s.matched).collect();
+        assert_eq!(matched, [true, false, true, false], "{d:#?}");
+        assert_eq!(d[1].reply_expected, "nobody\\n");
+        assert_eq!(d[1].reply_actual, "root\\n");
+        assert_eq!(d[1].class_expected, None);
+        assert_eq!(d[2].reply_expected, "starts with uid=");
+        let json: serde_json::Value =
+            serde_json::from_str(&files_to_json(&[("f.session".to_string(), d)])).unwrap();
+        assert_eq!(json[0]["file"], "f.session");
+        assert_eq!(json[0]["steps"][1]["matched"], false);
+        assert_eq!(json[0]["steps"][0]["matched"], true);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 # Probe shapes bots send after login, with the replies a root shell on Ubuntu 22.04 gives. Every
-# reply was checked against a container of that release with busybox-static installed.
+# reply was checked against a container of that release with busybox-static installed. Each
+# `@class` is the emulator's coverage classification for that line, recorded from a run.
 # source: Ubuntu 22.04 container probe; command shapes from the Mirai loader source, Nozomi Networks OT/IoT trends July 2025 and SANS ISC diary 31064
 # date: 2026-09-29
 # protocol: telnet
@@ -66,50 +67,73 @@ $ enable
 > enable unalias
 > enable unset
 > enable wait
+@class supported
 $ echo $0
 > -bash
+@class supported
 $ nosuchcmd_q
 > nosuchcmd_q: command not found
+@class unknown
 $ system
 > Command 'system' not found, did you mean:
 >   command 'system3' from deb simh (3.8.1-6.1)
 >   command 'systemd' from deb systemd (249.11-0ubuntu3.21)
 > Try: apt install <deb name>
+@class unknown
 $ sh
+@class supported
 $ linuxshell
 > sh: 1: linuxshell: not found
+@class unknown
 $ exit
+@class supported
 $ echo $0
 > -bash
+@class supported
 $ /bin/busybox ECCHI
 > ECCHI: applet not found
+@class unknown
 $ uname -m
 > x86_64
+@class supported
 $ id
 > uid=0(root) gid=0(root) groups=0(root)
+@class supported
 $ true && echo ok
 > ok
+@class supported
 $ false || echo fallback
 > fallback
+@class supported
 $ echo not found && echo still-runs
 > not found
 > still-runs
+@class supported
 $ whoami
 > root
+@class supported
 $ cd /dev/shm
 @cwd /dev/shm
+@class supported
 $ pwd
 > /dev/shm
+@class supported
 $ >/tmp/.x && cd /tmp
 @cwd /tmp
+@class supported
 $ (/bin/busybox echo -e "\x44\x49\x52"||echo -e "\x44\x49\x52")
 > DIR
+@class supported
 $ /bin/busybox echo -e '\x51\x4a\x4c'
 > QJL
+@class supported
 $ /bin/busybox echo -ne '\x51\x4a\x4c'
 >~ QJL
+@class supported
 $ mkdir .d && cd .d && pwd
 > /tmp/.d
 @cwd /tmp/.d
+@class supported
 $ >.e; cat .e; rm .e; ls .e
 > ls: cannot access '.e': No such file or directory
+@class supported

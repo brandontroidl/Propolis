@@ -635,6 +635,103 @@ fn run_shell_explain(path: Option<&str>) -> i32 {
     }
 }
 
+const SHADOW_DIFF_USAGE: &str = "usage: propolis shell shadow-diff <fixture.session|dir> [--json]";
+
+/// The `*.session` files `path` names: itself when a file, else every one directly inside it.
+fn shadow_diff_files(path: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if !meta.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let entries =
+        std::fs::read_dir(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "session"))
+        .collect();
+    if files.is_empty() {
+        return Err(format!("{}: no .session fixtures", path.display()));
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// `propolis shell shadow-diff <path> [--json]`: replays each fixture (one file, or every
+/// `*.session` in a directory) through the current emulator and reports where its reply or
+/// `@class` differs from the committed expectation, for review before a behavior change is
+/// accepted. Offline like `shell explain`: fixture bytes in, stdout/stderr out. Exit code: 0 when
+/// no step diverges, 1 when any does, 2 on a usage, read or parse error.
+fn run_shadow_diff(path: Option<&str>, json: bool) -> i32 {
+    let Some(path) = path else {
+        eprintln!("{SHADOW_DIFF_USAGE}");
+        return 2;
+    };
+    let files = match shadow_diff_files(std::path::Path::new(path)) {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("propolis shell shadow-diff: {e}");
+            return 2;
+        }
+    };
+    let mut results = Vec::new();
+    let mut errored = false;
+    for file in &files {
+        let name = file.display().to_string();
+        let parsed = std::fs::read_to_string(file)
+            .map_err(|e| format!("cannot read {name}: {e}"))
+            .and_then(|text| {
+                sensor_framework::replay::parse(&text).map_err(|e| format!("{name}: {e}"))
+            });
+        match parsed {
+            Ok(fixture) => results.push((name, sensor_framework::replay::diff(&fixture))),
+            Err(e) => {
+                eprintln!("propolis shell shadow-diff: {e}");
+                errored = true;
+            }
+        }
+    }
+    let steps: usize = results.iter().map(|(_, d)| d.len()).sum();
+    let diverged: usize = results
+        .iter()
+        .map(|(_, d)| d.iter().filter(|s| !s.matched).count())
+        .sum();
+    let text = if json {
+        format!("{}\n", sensor_framework::replay::files_to_json(&results))
+    } else {
+        let mut text = String::new();
+        for (name, diffs) in &results {
+            for s in diffs.iter().filter(|s| !s.matched) {
+                text.push_str(&format!("{name}:{}: $ {}\n", s.line_no, s.input));
+                text.push_str(&format!("  reply expected: {}\n", s.reply_expected));
+                text.push_str(&format!("  reply actual:   {}\n", s.reply_actual));
+                if let Some(c) = &s.class_expected {
+                    text.push_str(&format!(
+                        "  class expected: {c}\n  class actual:   {}\n",
+                        s.class_actual
+                    ));
+                } else {
+                    text.push_str(&format!(
+                        "  class actual:   {} (not pinned)\n",
+                        s.class_actual
+                    ));
+                }
+            }
+        }
+        text.push_str(&format!("{steps} steps, {diverged} diffs\n"));
+        text
+    };
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = std::io::Write::write_all(&mut out, text.as_bytes())
+        .and_then(|()| std::io::Write::flush(&mut out))
+    {
+        eprintln!("propolis shell shadow-diff: {e}");
+        return 2;
+    }
+    if errored { 2 } else { i32::from(diverged > 0) }
+}
+
 const COVERAGE_USAGE: &str =
     "usage: propolis coverage [--since <rfc3339>] [--until <rfc3339>] [--json] [--examples]";
 
@@ -837,6 +934,18 @@ async fn main() {
             && args.get(1).map(String::as_str) == Some("explain")
         {
             std::process::exit(run_shell_explain(args.get(2).map(String::as_str)));
+        }
+    }
+
+    // Offline fixture review, same reasoning as `shell explain`: no config, database or listener.
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().map(String::as_str) == Some("shell")
+            && args.get(1).map(String::as_str) == Some("shadow-diff")
+        {
+            let json = args[2..].iter().any(|a| a == "--json");
+            let path = args[2..].iter().find(|a| a.as_str() != "--json");
+            std::process::exit(run_shadow_diff(path.map(String::as_str), json));
         }
     }
 

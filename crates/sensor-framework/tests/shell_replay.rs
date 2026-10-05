@@ -109,6 +109,17 @@ fn check(loaded: &Loaded) -> Vec<String> {
         {
             failures.push(format!("{at}: {} events, expected {n}", events.len()));
         }
+        if let Some(class) = e.class {
+            let actual = shell.last_trace().classify();
+            if actual != class {
+                failures.push(format!(
+                    "{at}: `{}` class {}, expected {}",
+                    step.input,
+                    actual.as_str(),
+                    class.as_str()
+                ));
+            }
+        }
     }
     failures
 }
@@ -160,6 +171,41 @@ fn private_sessions_replay_byte_for_byte() {
     let dir = std::env::var_os("PROPOLIS_PRIVATE_SESSIONS")
         .expect("set PROPOLIS_PRIVATE_SESSIONS to the private session directory");
     replay_dir(Path::new(&dir));
+}
+
+/// `@class` pins the classification: a correct word passes, a wrong one fails, and a step with
+/// no `@class` is not checked (the private corpus predates the directive).
+#[test]
+fn the_replay_checker_pins_the_command_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let head =
+        "# source: harness self-test\n# date: 2026-10-04\n# protocol: ssh\n# persona: ubuntu\n";
+    let write = |name: &str, body: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("{head}{body}")).unwrap();
+        path
+    };
+
+    let right = write(
+        "right.session",
+        "$ id\n> uid=0(root) gid=0(root) groups=0(root)\n@class supported\n\
+         $ nosuchcmd-xyz\n> nosuchcmd-xyz: command not found\n@class unknown\n\
+         $ whoami\n> root\n",
+    );
+    assert_eq!(check(&parse_fixture(&right)), Vec::<String>::new());
+
+    let wrong = write(
+        "wrong.session",
+        "$ id\n> uid=0(root) gid=0(root) groups=0(root)\n@class unknown\n\
+         $ whoami\n> root\n",
+    );
+    let failures = check(&parse_fixture(&wrong));
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("class supported, expected unknown"),
+        "{}",
+        failures[0]
+    );
 }
 
 /// The harness must catch a wrong reply, a wrong length, a wrong directory and a wrong event

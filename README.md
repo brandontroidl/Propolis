@@ -1,8 +1,8 @@
 # Propolis
 
 Propolis is a self-hosted honeypot for collecting and reviewing hostile network traffic.
-It includes native sensors for SSH, Telnet, HTTP, FTP, SMTP, Redis, ADB, VNC, MySQL,
-MSSQL, PostgreSQL, and MongoDB, plus a silent catch-all listener that records probes on
+It includes native sensors for SSH, Telnet, HTTP, FTP, SMTP, TFTP, Redis, ADB, VNC,
+MySQL, MSSQL, PostgreSQL, and MongoDB, plus a silent catch-all listener that records probes on
 whatever other TCP and UDP ports you point it at.
 
 Events are stored in PostgreSQL, scored by source IP, and shown in a local operator
@@ -25,7 +25,7 @@ connections on record and activity in the last day is added to the retention fee
 without review, so a flood is blocked even when no login was attempted. Score-based tiers
 and vendor reports still wait for a decision in the console.
 
-Captured files (SCP, SFTP, ADB pushes, FTP uploads, downloaded droppers) go to a spool
+Captured files (SCP, SFTP, ADB pushes, FTP and TFTP uploads, downloaded droppers) go to a spool
 mounted `noexec`. The sensors themselves make no outbound connections. The daemon's
 optional outbound integrations, all off until configured, are VirusTotal lookups, abuse
 reports to AbuseIPDB, DShield and OTX, fetching droppers from attacker-supplied URLs,

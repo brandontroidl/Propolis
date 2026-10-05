@@ -9,7 +9,7 @@ last-verified: 2026-08-26
 
 # Sensor architecture
 
-Propolis captures attacker activity through **nine sensor crates covering twelve
+Propolis captures attacker activity through **ten sensor crates covering thirteen
 emulated protocols**, plus one protocol-agnostic passive listener. Every sensor is
 a thin protocol front-end built on one shared crate, `sensor-framework`, which owns
 the parts that must behave identically everywhere: the listener, connection bounds,
@@ -116,9 +116,13 @@ See [`security/input-handling.md`](../security/input-handling.md).
 
 ## The capture path
 
-Only three sensors write captured file *bodies* to disk - **SSH, FTP, and ADB**.
-Redis, Telnet, HTTP, SMTP, cred, and catchall capture metadata only and never spool a
+Only these sensors write captured file *bodies* to disk - **SSH, FTP, ADB, TFTP**, and
+Telnet when its shell phase sees a binary payload.
+Redis, HTTP, SMTP, cred, and catchall capture metadata only and never spool a
 body (confirmed by the absence of `QuarantineSpool`/`CaptureHandoff` in those crates).
+TFTP is the one sensor that answers over UDP; its replies are bounded so that bytes sent
+never exceed bytes received, which is why it does not use the framework's receive-only
+UDP listener (see [sensor behavior](../reference/sensor-behavior.md#sensor-tftp)).
 
 For the spooling sensors the path is deliberately **off the connection's reply
 path**, for covertness - response latency must not leak whether a capture happened:
@@ -176,7 +180,7 @@ types and the signal vocabulary are owned by
 - **`sensor-cred`** is one binary with one listener per configured database/remote
   protocol - **VNC, MySQL, MSSQL, PostgreSQL, MongoDB**. Each speaks just enough of
   its handshake to elicit a credential attempt, drops the credential, and emits a
-  login attempt. This is why nine crates cover twelve protocols.
+  login attempt. This is why ten crates cover thirteen protocols.
 
 ## Never-serve-outbound
 

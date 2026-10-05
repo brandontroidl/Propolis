@@ -101,6 +101,12 @@ for pair in \
     add_entry "$sensor" tcp "$(port_of "$addr")"
 done
 
+# sensor-tftp is the one UDP-only listener: a single request socket, so one udp entry.
+addr="$(read_env_var PROPOLIS_TFTP_BIND)"
+if [ -n "$addr" ]; then
+    add_entry tftp udp "$(port_of "$addr")"
+fi
+
 # sensor-catchall takes a comma-separated list and binds BOTH TCP and UDP for every entry, so each
 # port yields two listeners. It also still reads the deprecated bare spelling of its own variable
 # (crates/sensor-catchall/src/main.rs's env_var fallback), and a box using that spelling must not

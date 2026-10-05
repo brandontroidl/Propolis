@@ -27,7 +27,7 @@ not from any outbound probing on your part.
 
 ## Malware custody responsibility
 
-Sensors capture uploaded samples (SSH/SCP/SFTP, FTP STOR, ADB push, and the fetcher
+Sensors capture uploaded samples (SSH/SCP/SFTP, FTP STOR, TFTP WRQ, ADB push, and the fetcher
 spool). **Captured malware is live, hostile code.** You are responsible for storing,
 handling, and disposing of it safely, and for any onward transmission (for example,
 enabling VirusTotal scanning uploads samples to a third party). Read

@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 2500 test functions** (1722 unit + 778 integration).
+- **Total: 2557 test functions** (1751 unit + 806 integration).
 - **DB-backed (`sqlx::test`): 208** - console 159, core-scoring 28, intake 7,
   propolis 7, fleet 6, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -120,7 +120,7 @@ Per-crate breakdown:
 | console | 124 | 183 | auth_test, routes_test, samples_transport_test, server_test |
 | core-scoring | 67 | 29 | coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 36 | 58 | builder_test, exclusion_test, export_test, publisher_test |
-| fleet | 23 | 15 | deploy_inventory_test, probe_test, store_test |
+| fleet | 23 | 16 | deploy_inventory_test, probe_test, store_test |
 | gateway | 11 | 13 | handshake, spool, verify |
 | geoip | 4 | 0 | - |
 | intake | 11 | 20 | audit_regressions, converter_test, end_to_end, probe_filter |
@@ -131,16 +131,17 @@ Per-crate breakdown:
 | sensor-adb | 59 | 31 | integration |
 | sensor-catchall | 18 | 6 | integration |
 | sensor-cred | 14 | 8 | integration |
-| sensor-framework | 911 | 53 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
+| sensor-framework | 911 | 54 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
 | sensor-ftp | 7 | 14 | integration |
 | sensor-http | 8 | 16 | integration |
 | sensor-redis | 79 | 18 | integration |
 | sensor-smtp | 6 | 18 | integration |
 | sensor-ssh | 61 | 109 | auth_test, crypto_test, integration, shell_test, transport_test |
 | sensor-telnet | 40 | 21 | integration |
+| sensor-tftp | 29 | 26 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **1722** | **778** | |
+| **Total** | **1751** | **806** | |
 
 ### Test styles by layer
 

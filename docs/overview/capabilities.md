@@ -15,7 +15,7 @@ pages.
 
 ## Sensors
 
-Nine sensor programs cover twelve protocols. Each runs as its own systemd service under
+Ten sensor programs cover thirteen protocols. Each runs as its own systemd service under
 its own user.
 
 | Sensor | Protocol | What it records |
@@ -25,6 +25,7 @@ its own user.
 | `sensor-http` | HTTP | Request paths, headers, POST bodies |
 | `sensor-ftp` | FTP | Login attempts, STOR uploads |
 | `sensor-smtp` | SMTP | AUTH credentials, message envelope and body |
+| `sensor-tftp` | TFTP (UDP) | Read and write probes with filename and mode, and uploaded payloads; never serves a file |
 | `sensor-redis` | Redis | AUTH, config and command probes |
 | `sensor-adb` | ADB | Shell commands, pushed files |
 | `sensor-cred` | VNC, MySQL, MSSQL, PostgreSQL, MongoDB | Authentication attempts and usernames |

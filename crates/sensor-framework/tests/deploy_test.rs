@@ -51,6 +51,31 @@ fn ssh_unit_has_hardening_directives() {
     assert_unit_hardened(&unit, "sensor-ssh");
 }
 
+/// The TFTP sensor is the one unit that answers over UDP. It must clear the same bar as every
+/// other sensor, bind port 69 without root, and stay off by default: the unit carries no
+/// compiled-in bind, so an installed-but-unconfigured unit has nothing to listen on.
+#[test]
+fn tftp_unit_has_hardening_directives_and_cap_net_bind() {
+    let unit = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/sensor-tftp.service"
+    ))
+    .unwrap();
+    assert_unit_hardened(&unit, "sensor-tftp");
+    assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
+    assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
+    assert!(
+        unit.contains("EnvironmentFile=/etc/propolis/tftp.env"),
+        "the unit must read its bind from the operator's tftp.env, with no inline default"
+    );
+    assert!(
+        !unit
+            .lines()
+            .any(|l| l.contains("PROPOLIS_TFTP_BIND") && !l.trim_start().starts_with('#')),
+        "the unit must not hardcode a bind address"
+    );
+}
+
 /// The three layers `internal/design/02-sensor-framework.md`'s "Isolation and deployment"
 /// requires of every sensor unit: least authority, resource caps, and containment. Shared by
 /// both units below so the two can never drift into checking different bars.
@@ -418,6 +443,10 @@ fn logrotate_config_covers_both_sensor_logs() {
         config.contains("/var/log/propolis/ssh/events.jsonl"),
         "must rotate the SSH honeypot's log"
     );
+    assert!(
+        config.contains("/var/log/propolis/tftp/events.jsonl"),
+        "must rotate the TFTP honeypot's log"
+    );
 }
 
 /// `deploy/install.sh` is a real (if small) bash program - control flow, idempotent helpers, a
@@ -537,7 +566,7 @@ fn install_script_var_lib_root_is_root_owned() {
     );
 }
 
-/// The four `CaptureHandoff` body-capturing sensors (ssh/ftp/adb/telnet) each default their
+/// The five `CaptureHandoff` body-capturing sensors (ssh/ftp/adb/telnet/tftp) each default their
 /// outbox manifest directory to `<default spool_dir>/outbox` (see e.g. `sensor-ssh/src/main.rs`'s
 /// `resolve_outbox_dir`). That default must always land inside a path the unit's own
 /// `ReadWritePaths` already grants, or the manifest write silently fails under
@@ -552,6 +581,7 @@ fn body_capturer_default_outbox_is_inside_read_write_paths() {
         ("sensor-ftp.service", "/var/spool/propolis/ftp"),
         ("sensor-adb.service", "/var/spool/propolis/adb"),
         ("sensor-telnet.service", "/var/spool/propolis/telnet"),
+        ("sensor-tftp.service", "/var/spool/propolis/tftp"),
     ] {
         let unit = std::fs::read_to_string(format!(
             "{}/../../deploy/{unit_file}",

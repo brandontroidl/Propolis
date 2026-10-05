@@ -246,6 +246,7 @@ mod tests {
             "http",
             "ftp",
             "smtp",
+            "tftp",
             "cred-vnc",
             "cred-mysql",
             "cred-mssql",

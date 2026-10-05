@@ -28,6 +28,7 @@ sensor appends newline-delimited JSON events.
 | http | `PROPOLIS_HTTP_LOG_PATH` | `/var/log/propolis/http/events.jsonl` (`sensor-http/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/http` (`deploy/provision.sh#ensure_dir /var/log/propolis/http`) |
 | ftp | `PROPOLIS_FTP_LOG_PATH` | `/var/log/propolis/ftp/events.jsonl` (`sensor-ftp/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/ftp` (`deploy/provision.sh#ensure_dir /var/log/propolis/ftp`) |
 | smtp | `PROPOLIS_SMTP_LOG_PATH` | `/var/log/propolis/smtp/events.jsonl` (`sensor-smtp/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/smtp` (`deploy/provision.sh#ensure_dir /var/log/propolis/smtp`) |
+| tftp | `PROPOLIS_TFTP_LOG_PATH` | `/var/log/propolis/tftp/events.jsonl` (`sensor-tftp/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/tftp` (`deploy/provision.sh#ensure_dir /var/log/propolis/tftp`) |
 | redis | `PROPOLIS_REDIS_LOG_PATH` | `/var/log/propolis/redis/events.jsonl` (`sensor-redis/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/redis` (`deploy/provision.sh#ensure_dir /var/log/propolis/redis`) |
 | adb | `PROPOLIS_ADB_LOG_PATH` | `/var/log/propolis/adb/events.jsonl` (`sensor-adb/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/adb` (`deploy/provision.sh#ensure_dir /var/log/propolis/adb`) |
 | catchall | `PROPOLIS_CATCHALL_LOG_PATH` | **`catchall-events.jsonl`** (relative, not absolute) (`sensor-catchall/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/catchall` (`deploy/provision.sh#ensure_dir /var/log/propolis/catchall`) |
@@ -57,6 +58,7 @@ event logs.
 | ftp uploads | `PROPOLIS_FTP_SPOOL_DIR` | `/var/spool/propolis/ftp` (`sensor-ftp/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-ftp (`deploy/provision.sh#ensure_dir /var/spool/propolis/ftp`) |
 | adb uploads | `PROPOLIS_ADB_SPOOL_DIR` | `/var/spool/propolis/adb` (`sensor-adb/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-adb (`deploy/provision.sh#ensure_dir /var/spool/propolis/adb`) |
 | telnet uploads | `PROPOLIS_TELNET_SPOOL_DIR` | `/var/spool/propolis/telnet` (`sensor-telnet/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-telnet (`deploy/provision.sh#ensure_dir /var/spool/propolis/telnet`) |
+| tftp uploads | `PROPOLIS_TFTP_SPOOL_DIR` | `/var/spool/propolis/tftp` (`sensor-tftp/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-tftp (`deploy/provision.sh#ensure_dir /var/spool/propolis/tftp`) |
 | catchall | (dir granted for symmetry, **unused** - catchall spools no bodies) | `/var/spool/propolis/catchall` | 0750 propolis-catchall (`deploy/provision.sh#ensure_dir /var/spool/propolis/catchall`) |
 | fetcher output | `PROPOLIS_SPOOL_ROOT` + `/fetched` (fn `fetch_spool_dir()`) | `/var/spool/propolis/fetched` (`crates/propolis/src/main.rs#fetch_spool_dir`; root `crates/review/src/spool.rs#DEFAULT_SPOOL_ROOT`) | 0750 propolis (`deploy/provision.sh#ensure_dir /var/spool/propolis/fetched`) |
 | ops spool root | `PROPOLIS_SPOOL_ROOT` (fn `ops_spool_root()`) | `/var/spool/propolis` (`crates/propolis/src/main.rs#ops_spool_root`; default `crates/review/src/spool.rs#DEFAULT_SPOOL_ROOT`) | 0755 root (`deploy/provision.sh#3/9 creating spool directories (mountpoints only)`) |
@@ -67,7 +69,7 @@ event logs.
   they capture inline only. Telnet spools only when the shell phase sees a
   binary payload (a Mirai/Gafgyt dropper), never the login/password phase.
 
-Each of ssh/ftp/adb/telnet also writes a durable per-capture custody manifest
+Each of ssh/ftp/adb/telnet/tftp also writes a durable per-capture custody manifest
 row (`PROPOLIS_<SENSOR>_OUTBOX_DIR`) as soon as a body is sealed - defaults to
 `<its own spool dir>/outbox` (e.g. `/var/spool/propolis/ssh/outbox`), not a
 separate path, so the write always lands inside that unit's own

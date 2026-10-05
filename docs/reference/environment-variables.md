@@ -46,7 +46,7 @@ Which run mode a given deployment uses is an operator choice; both sets of
 Two fail-closed idioms recur; they are **not** uniform:
 
 - **Strict parse** - `propolis`, `intake`, `review`, `feed`, `console`, and
-  sensors `ssh`/`telnet`/`http`/`ftp`/`redis`/`adb`/`catchall`: a
+  sensors `ssh`/`telnet`/`http`/`ftp`/`redis`/`adb`/`catchall`/`tftp`: a
   present-but-invalid or present-but-zero numeric bound **aborts startup**.
 - **Lenient parse** - sensors `cred` and `smtp` **only**: an invalid or zero
   bound silently falls back to the default (`parse_positive_u64` filters `>0`
@@ -468,7 +468,7 @@ Sensors are always separate processes. They have **no compiled-in default port**
 the bind address comes from config/env set by the deploy units. See
 [ports and protocols](ports-and-protocols.md).
 
-### Standard sensors (strict parse) - ssh, telnet, http, ftp, redis, adb, catchall
+### Standard sensors (strict parse) - ssh, telnet, http, ftp, redis, adb, catchall, tftp
 
 Shared `ConnectionBounds` pattern via each crate's local
 `parse_positive_u64`/`parse_positive_u32`: unset → default; **present-but-zero or
@@ -483,6 +483,7 @@ null `wan_ip`); invalid entry → abort.
 | telnet | `PROPOLIS_TELNET_` | `PROPOLIS_TELNET_BIND` | `/var/log/propolis/telnet/events.jsonl` |
 | http | `PROPOLIS_HTTP_` | `PROPOLIS_HTTP_BIND` | `/var/log/propolis/http/events.jsonl` |
 | ftp | `PROPOLIS_FTP_` | `PROPOLIS_FTP_BIND` | `/var/log/propolis/ftp/events.jsonl` |
+| tftp | `PROPOLIS_TFTP_` | `PROPOLIS_TFTP_BIND` (UDP; unset aborts startup, `sensor-tftp/src/main.rs#load_config_from`) | `/var/log/propolis/tftp/events.jsonl` |
 | redis | `PROPOLIS_REDIS_` | `PROPOLIS_REDIS_BIND` | `/var/log/propolis/redis/events.jsonl` |
 | adb | `PROPOLIS_ADB_` | `PROPOLIS_ADB_BIND` | `/var/log/propolis/adb/events.jsonl` |
 | catchall | `PROPOLIS_CATCHALL_` (bare `CATCHALL_` still read, deprecated) | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list, empty→abort) | `catchall-events.jsonl` (relative) |
@@ -497,7 +498,7 @@ Common per-sensor variables (each uses its own prefix; catchall uses `PROPOLIS_C
 | `<P>IDLE_TIMEOUT_MS` | no | `60_000` (catchall `5_000`) | ms; zero → abort |
 | `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`) | secs; zero → abort |
 | `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (catchall `4_096`) | bytes; zero → abort |
-| `<P>MAX_CONCURRENT` | no | `256` (http `512`) | u32; zero → abort |
+| `<P>MAX_CONCURRENT` | no | `256` (http `512`, tftp `128`) | u32; zero → abort |
 
 The `<P>` rows above, instantiated per sensor (each name is read literally by that sensor's
 `main.rs`):
@@ -514,6 +515,16 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
 - ftp: `PROPOLIS_FTP_READ_TIMEOUT_MS`, `PROPOLIS_FTP_IDLE_TIMEOUT_MS`,
   `PROPOLIS_FTP_MAX_DURATION_SECS`, `PROPOLIS_FTP_MAX_CAPTURED_BYTES`, `PROPOLIS_FTP_MAX_CONCURRENT`,
   `PROPOLIS_FTP_LOG_PATH`, `PROPOLIS_FTP_WAN_MAP`.
+- tftp: `PROPOLIS_TFTP_READ_TIMEOUT_MS`, `PROPOLIS_TFTP_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_TFTP_MAX_DURATION_SECS`, `PROPOLIS_TFTP_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_TFTP_MAX_CONCURRENT`, `PROPOLIS_TFTP_LOG_PATH`, `PROPOLIS_TFTP_WAN_MAP`.
+  Unlike the other sensors, `PROPOLIS_TFTP_MAX_CAPTURED_BYTES` has an upper bound: a value above
+  `10_000_000` (the spool's per-file limit) **aborts startup** instead of being accepted.
+  The `128` default for `PROPOLIS_TFTP_MAX_CONCURRENT` is sized so `max_concurrent` full-cap bodies,
+  the 64-job capture queue and about 15 MB of baseline stay within the unit's `MemoryMax=256M`
+  (`sensor-tftp/src/main.rs#DEFAULT_MAX_CONCURRENT`). Raising `PROPOLIS_TFTP_MAX_CAPTURED_BYTES`
+  toward the 10 MB hard cap requires lowering `PROPOLIS_TFTP_MAX_CONCURRENT` to stay under
+  `MemoryMax`; the worst case is roughly `(max_concurrent + 64) * max_captured_bytes + 15 MB`.
 - http: `PROPOLIS_HTTP_READ_TIMEOUT_MS`, `PROPOLIS_HTTP_IDLE_TIMEOUT_MS`,
   `PROPOLIS_HTTP_MAX_DURATION_SECS`, `PROPOLIS_HTTP_MAX_CAPTURED_BYTES`,
   `PROPOLIS_HTTP_MAX_CONCURRENT`, `PROPOLIS_HTTP_LOG_PATH`, `PROPOLIS_HTTP_WAN_MAP`.
@@ -576,6 +587,12 @@ Sensor-specific extras:
 - **telnet** (`crates/sensor-telnet/src/main.rs`): `PROPOLIS_TELNET_SPOOL_DIR`
   (default `/var/spool/propolis/telnet`), `PROPOLIS_TELNET_OUTBOX_DIR` (default
   `/var/spool/propolis/telnet/outbox`; see "Outbox manifest" below).
+- **tftp** (`crates/sensor-tftp/src/main.rs`): `PROPOLIS_TFTP_SPOOL_DIR` (default
+  `/var/spool/propolis/tftp`, `sensor-tftp/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_TFTP_OUTBOX_DIR` (default
+  `/var/spool/propolis/tftp/outbox`; see "Outbox manifest" below). `PROPOLIS_COLLECTOR_ID` is
+  read by its canonical name only; there is no legacy bare spelling for this sensor.
+  `PROPOLIS_TFTP_BIND` is the only switch: the sensor is off until an operator sets it, and with no
+  bind (or an unparseable one) it logs the error and exits 1 without binding anything.
 - **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`).
 - **catchall**: no spool variable (never spools file bodies,
   `crates/sensor-catchall/src/main.rs#Config`); no
@@ -584,14 +601,14 @@ Sensor-specific extras:
 
 #### Outbox manifest (SP-B-1b)
 
-Every sensor that spools captured file bodies (ssh, ftp, adb, telnet) also writes a durable
+Every sensor that spools captured file bodies (ssh, ftp, adb, telnet, tftp) also writes a durable
 per-capture custody manifest row under its outbox directory as soon as the body is sealed - see
 `sensor_framework::outbox` and `sensor_framework::handoff::process_job`. Two variables govern it,
-read identically by each of those four sensors' `main.rs`:
+read identically by each of those five sensors' `main.rs`:
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_COLLECTOR_ID` (deprecated alias `COLLECTOR_ID`, still read; shared across all five binaries, not `PROPOLIS_<SENSOR>_*`) | no | `local` | Stamped onto every manifest row this sensor writes. **Must equal** the CommonName of the client certificate `shipper`'s `PROPOLIS_COLLECTOR_ID` presents to the gateway on this box, because a later stage joins the gateway's cert-derived collector id against this manifest on `(collector_id, occurrence_id)`. A single-node deployment with no shipper leaves this at `local`. |
+| `PROPOLIS_COLLECTOR_ID` (deprecated alias `COLLECTOR_ID`, still read; shared across all six binaries, not `PROPOLIS_<SENSOR>_*`) | no | `local` | Stamped onto every manifest row this sensor writes. **Must equal** the CommonName of the client certificate `shipper`'s `PROPOLIS_COLLECTOR_ID` presents to the gateway on this box, because a later stage joins the gateway's cert-derived collector id against this manifest on `(collector_id, occurrence_id)`. A single-node deployment with no shipper leaves this at `local`. |
 | `PROPOLIS_<SENSOR>_OUTBOX_DIR` | no | `<PROPOLIS_<SENSOR>_SPOOL_DIR>/outbox` | Root of the per-capture manifest JSON files (`<dir>/<capture_id>.json`). The default is derived from the sensor's own resolved spool directory (not a fixed shared path) so it always lands inside the writable root the sensor's systemd unit grants - a fixed shared `/var/lib/propolis/outbox` default is unwritable under `ProtectSystem=strict` and was the SP-B-1c regression this fixed. Manifest rows are keyed by a globally-unique `capture_id`, so even where two sensors' outbox dirs happened to coincide, writes would never collide. |
 
 ### Lenient sensors - cred, smtp

@@ -10,7 +10,7 @@ last-verified: 2026-08-26
 # Components
 
 The workspace (`Cargo.toml`, `resolver = "2"`, every crate `edition = "2024"`) has
-**24 member crates** under `crates/`, producing **17 binaries**. Eighteen crates are at
+**25 member crates** under `crates/`, producing **18 binaries**. Nineteen crates are at
 version `0.4.0`; the six added since `0.3.0` (`collector-wire`, `fleet`, `gateway`,
 `log-tailer`, `provision-certs`, `shipper`) are at `0.1.0`. This page is the canonical
 owner of the component inventory and the inter-crate dependency graph.
@@ -31,6 +31,7 @@ owner of the component inventory and the inter-crate dependency graph.
 | `sensor-http` | lib + bin | `sensor-http` | HTTP honeypot sensor (per-connection handler over the shared listener). |
 | `sensor-ftp` | lib + bin | `sensor-ftp` | FTP honeypot: capture hand-off and quarantine spool for uploads. |
 | `sensor-smtp` | lib + bin | `sensor-smtp` | SMTP honeypot sensor (per-connection handler over the shared listener). |
+| `sensor-tftp` | lib + bin | `sensor-tftp` | TFTP (UDP) honeypot, the one sensor that replies over UDP: reads get one fixed tiny error, writes are acknowledged and the body is captured to the quarantine spool; bytes sent never exceed bytes received. Off until `PROPOLIS_TFTP_BIND` is set. |
 | `sensor-cred` | lib + bin | `sensor-cred` | Credential-capture sensor covering the DB/remote protocols VNC, MySQL, MSSQL, PostgreSQL, MongoDB. |
 | `intake` | lib + bin | `intake` | Converts sensor wire events into core-scoring domain events; tails sensor NDJSON logs and appends to the ledger. |
 | `review` | lib + bin | `review` | Review-queue state machine, gatekeeper, vendor adapters (AbuseIPDB/DShield/OTX), VirusTotal scanner, malware fetcher, submission runner, and operator CLI. Owns its own migrator. |
@@ -51,17 +52,17 @@ Source: the `[workspace] members` list in `Cargo.toml`; each crate's `Cargo.toml
 
 - **Pure libraries (no binary, 7):** `sensor-wire`, `core-scoring`, `geoip`,
   `sensor-framework`, `fleet`, `log-tailer`, `collector-wire`.
-- **Sensor lib+bin crates (9):** `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
+- **Sensor lib+bin crates (10):** `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
   `sensor-redis`, `sensor-adb`, `sensor-http`, `sensor-ftp`, `sensor-smtp`,
-  `sensor-cred`. These 9 sensor crates cover 12 protocols (the `cred` sensor serves
-  five: VNC/MySQL/MSSQL/PostgreSQL/MongoDB).
+  `sensor-tftp`, `sensor-cred`. These 10 sensor crates cover 13 protocols (the `cred`
+  sensor serves five: VNC/MySQL/MSSQL/PostgreSQL/MongoDB).
 - **Data-plane lib+bin crates (4):** `intake`, `review`, `feed`, `console` each carry
   both `src/lib.rs` and `src/main.rs`, so each produces a library and a same-named
   binary from cargo's default binary-from-`main.rs`; none declares a `[[bin]]`.
 - **Split-deployment lib+bin crates (3):** `shipper`, `gateway`, `provision-certs`.
 - **Binary only:** `propolis` (no `src/lib.rs`).
 
-**17 binaries total:** the 9 sensor binaries plus `intake`, `review`, `feed`,
+**18 binaries total:** the 10 sensor binaries plus `intake`, `review`, `feed`,
 `console`, `propolis`, `shipper`, `gateway`, and `provision-certs`.
 
 Sensors have **no compiled-in default port** - listen addresses come from
@@ -82,7 +83,7 @@ graph TD
   tailer[log-tailer]
   cwire[collector-wire]
   fw[sensor-framework]
-  sensors["sensor-{catchall,ssh,telnet,redis,<br/>adb,http,ftp,smtp,cred}"]
+  sensors["sensor-{catchall,ssh,telnet,redis,<br/>adb,http,ftp,smtp,tftp,cred}"]
   intake[intake]
   review[review]
   feed[feed]

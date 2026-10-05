@@ -33,6 +33,7 @@ pub(crate) fn format_sensor_label(sensor: &str) -> String {
         // Acronyms the title-case fallback would mangle (mssql -> "Mssql", smtp -> "Smtp", adb -> "Adb").
         "mssql" => "MSSQL".into(),
         "smtp" => "SMTP".into(),
+        "tftp" => "TFTP".into(),
         "adb" => "ADB".into(),
         "catchall" | "catchall-sensor" => "General".into(),
         other => {
@@ -51,6 +52,7 @@ pub(crate) fn format_activity(sensor: &str, signal_type: &str) -> String {
     let service = match sensor {
         "ssh" => "SSH".to_string(),
         "ftp" => "FTP".to_string(),
+        "tftp" => "TFTP".to_string(),
         "http" => "HTTP".to_string(),
         "vnc" => "VNC".to_string(),
         "redis" => "Redis".to_string(),
@@ -201,6 +203,7 @@ mod tests {
         assert_eq!(format_sensor_label("mssql"), "MSSQL");
         assert_eq!(format_sensor_label("smtp"), "SMTP");
         assert_eq!(format_sensor_label("adb"), "ADB");
+        assert_eq!(format_sensor_label("tftp"), "TFTP");
         // format_activity inherits the fix via its `other => format_sensor_label(other)` delegation.
         assert!(format_activity("mssql", "honeypot_login_attempt").contains("MSSQL"));
     }

@@ -20,7 +20,7 @@ The version signals diverge across surfaces - read them together:
 
 | Fact | Value |
 |---|---|
-| Crate version | `0.4.0` for eighteen of the 24 crates, `0.1.0` for the six added since `0.3.0`; each crate pins its own (no `[workspace.package]`) |
+| Crate version | `0.4.0` for nineteen of the 25 crates, `0.1.0` for the six added since `0.3.0`; each crate pins its own (no `[workspace.package]`) |
 | Only release tag | `v0.1.0` (annotated, commit `e0bfd513`, 2026-08-02) |
 | Tags `v0.2.0` / `v0.3.0` / `v0.4.0` | do not exist |
 | `CHANGELOG.md` | a single undated `## Unreleased` section |

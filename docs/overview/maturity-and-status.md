@@ -17,7 +17,7 @@ operate at your own risk.
 
 The version signals diverge across surfaces; read them together, not in isolation:
 
-- **Crate version: `0.4.0`** for eighteen of the 24 workspace crates; the six
+- **Crate version: `0.4.0`** for nineteen of the 25 workspace crates; the six
   added since `0.3.0` (`collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper`) are at
   `0.1.0`. There is no shared `[workspace.package]` version key - each crate pins
   its own.
@@ -42,7 +42,7 @@ The following subsystems are implemented and carry substantial test suites
 - **Feed** - two-tier export, ASN suppression, fail-closed publisher.
 - **Console** - axum + minijinja + HTMX, the V12 theme system and evidence drawer,
   offline MaxMind enrichment, self-hosted fonts.
-- **12-protocol sensor surface** - nine sensor crates (see [Capabilities](capabilities.md)).
+- **13-protocol sensor surface** - ten sensor crates (see [Capabilities](capabilities.md)).
 - **Unified daemon** - supervises intake/review/feed/console plus ops-monitor
   self-alerting.
 - **Shared geoip crate** - extracted GeoLite2 reader.

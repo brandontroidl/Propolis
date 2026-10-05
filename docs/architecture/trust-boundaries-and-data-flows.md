@@ -23,7 +23,7 @@ page is the architectural view that ties them to the data flows.
 | Zone | Trust | What lives here |
 |---|---|---|
 | **Attacker** | Untrusted (hostile) | Any client reaching a sensor port; every byte is adversary-controlled. |
-| **Sensors** | Low-trust, exposed | The 9 sensor crates (12 protocols). Attacker-facing; run unprivileged, egress-free by construction. |
+| **Sensors** | Low-trust, exposed | The 10 sensor crates (13 protocols). Attacker-facing; run unprivileged, egress-free by construction. |
 | **Local channel** | Trusted host | Per-sensor NDJSON log files and the on-disk quarantine spool. One-directional, local storage. |
 | **Datastore** | Trusted | PostgreSQL: the append-only hash-chained ledger and its projections. |
 | **Platform** | Trusted | Intake, scoring, review, feed, malware fetcher, ops-alerting - the processing tier. |
@@ -35,7 +35,7 @@ flowchart LR
     attacker([Attacker<br/>untrusted])
 
     subgraph host[Trusted host]
-        sensors[Sensors<br/>9 crates / 12 protocols<br/>egress-free]
+        sensors[Sensors<br/>10 crates / 13 protocols<br/>egress-free]
         logs[(NDJSON logs<br/>+ quarantine spool)]
         intake[Intake<br/>tail + validate]
         db[(PostgreSQL<br/>append-only ledger<br/>+ projections)]

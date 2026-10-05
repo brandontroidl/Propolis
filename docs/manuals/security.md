@@ -62,7 +62,7 @@ Every boundary where untrusted or externally reachable data enters or leaves, an
 control that contains each, is owned by [attack surfaces](../security/attack-surfaces.md).
 The inbound and outbound surfaces:
 
-- **Sensor listeners** (9 crates / 12 protocols, no compiled-in default port): never-execute,
+- **Sensor listeners** (10 crates / 13 protocols, no compiled-in default port): never-execute,
   boundary `sanitize_value` on every attacker string, no HTTP client in the sensor closure,
   credential drop-at-parse. See [input handling](../security/input-handling.md) and
   [sample and credential privacy](../security/sample-and-credential-privacy.md).

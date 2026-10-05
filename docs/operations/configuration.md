@@ -63,7 +63,7 @@ rDNS) all default **off**; see [../security/outbound-controls.md](../security/ou
 ## Fail-fast validation
 
 Configuration is validated at startup. Most binaries (`propolis`, `intake`,
-`review`, `feed`, `console`, and sensors `ssh/telnet/http/ftp/redis/adb/catchall`)
+`review`, `feed`, `console`, and sensors `ssh/telnet/http/ftp/tftp/redis/adb/catchall`)
 **abort startup** on a missing required variable or a present-but-invalid /
 present-but-zero numeric bound - "zero never means unlimited"
 (`crates/propolis/src/config.rs#require_env`, `crates/propolis/src/config.rs#parse_positive_u64`). A misconfiguration cannot silently

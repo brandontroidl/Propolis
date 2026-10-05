@@ -9,7 +9,7 @@ last-verified: 2026-08-26
 
 # Sensors and networking
 
-There are 9 sensor crates covering 12 protocols (the `cred` sensor serves VNC,
+There are 10 sensor crates covering 13 protocols (the `cred` sensor serves VNC,
 MySQL, MSSQL, PostgreSQL, and MongoDB). Each sensor is a separate process with
 its own `/etc/propolis/<name>.env`. Sensors make **no outbound connections by
 design** and have no HTTP client in their dependency tree - if a sensor appears

@@ -30,7 +30,7 @@ liveness alert). Every component, stage, invariant, and procedure has a canonica
 owner. The `partial` rows carry a documented caveat, noted in the last
 column.
 
-## Component crates (24 crates / 17 binaries)
+## Component crates (25 crates / 18 binaries)
 
 Inventory and dependency graph owned by
 [architecture/components.md](architecture/components.md). Per-crate behavior lives in
@@ -50,7 +50,8 @@ the architecture and reference pages below.
 | `sensor-http` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | Per-connection HTTP honeypot handler. |
 | `sensor-ftp` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | Capture hand-off + quarantine spool for uploads; PASV data-peer validation. |
 | `sensor-smtp` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | Per-connection SMTP honeypot handler. |
-| `sensor-cred` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md) | documented | One binary, 5 protocols (VNC/MySQL/MSSQL/PostgreSQL/MongoDB) = the "9 crates / 12 protocols" count. |
+| `sensor-tftp` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md) | documented | The one UDP sensor that replies: reads get one fixed tiny error, writes are acknowledged and captured; bytes sent never exceed bytes received. Default-off. |
+| `sensor-cred` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md) | documented | One binary, 5 protocols (VNC/MySQL/MSSQL/PostgreSQL/MongoDB) = the "10 crates / 13 protocols" count. |
 | `intake` | [event-and-sample-lifecycle.md](architecture/event-and-sample-lifecycle.md), [architecture/pipeline.md](architecture/pipeline.md) | partial | Tailer + wire→domain conversion documented; intake's own INSERT path not traced line-by-line in evidence (no-`format!`-SQL grep covers it). |
 | `review` | [architecture/pipeline.md](architecture/pipeline.md), [reference/integrations.md](reference/integrations.md), [security/malware-custody.md](security/malware-custody.md) | documented | Review queue, gatekeeper, vendor adapters, VT scanner, fetcher, operator CLI. |
 | `feed` | [architecture/pipeline.md](architecture/pipeline.md), [reference/scoring-and-feed.md](reference/scoring-and-feed.md) | documented | Snapshot→export→atomic publish; 10 formats per tier/window; checksummed manifest. |

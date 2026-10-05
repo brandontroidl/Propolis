@@ -37,7 +37,7 @@ echo "==> installing binaries"
 # one host, so this list covers both topologies at once - a box running only the collector role
 # (or only the control-plane role) simply has no unit file for the other side's binaries and the
 # is-enabled guard below skips restarting what was never enabled.
-for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-cred gateway shipper; do
+for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-cred gateway shipper; do
     install -m 0755 "$BUILD_DIR/$bin" "/usr/local/bin/$bin"
 done
 
@@ -58,7 +58,7 @@ echo "==> deriving the fleet listener inventory"
 # shipper units are operator-installed per role (split deployment), so they are refreshed only
 # where they are already enabled, matching the is-enabled restart guards below.
 echo "==> installing systemd units and logrotate config"
-for unit in propolis.service sensor-catchall.service sensor-ssh.service sensor-telnet.service sensor-redis.service sensor-adb.service sensor-http.service sensor-ftp.service sensor-smtp.service sensor-cred.service; do
+for unit in propolis.service sensor-catchall.service sensor-ssh.service sensor-telnet.service sensor-redis.service sensor-adb.service sensor-http.service sensor-ftp.service sensor-smtp.service sensor-tftp.service sensor-cred.service; do
     install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
 for unit in gateway.service shipper.service; do
@@ -84,7 +84,7 @@ echo "==> reloading systemd unit files"
 systemctl daemon-reload
 
 echo "==> restarting sensors"
-for unit in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-cred; do
+for unit in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-cred; do
     if systemctl is-enabled --quiet "$unit.service" 2>/dev/null; then
         systemctl restart "$unit.service"
     fi

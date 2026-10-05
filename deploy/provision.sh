@@ -67,12 +67,13 @@ ensure_user propolis-adb
 ensure_user propolis-http
 ensure_user propolis-ftp
 ensure_user propolis-smtp
+ensure_user propolis-tftp
 ensure_user propolis-cred
 
 # propolis reads all sensors' logs (ReadOnlyPaths=/var/log/propolis in propolis.service). The
 # files themselves are group-readable (UMask=0027 in sensor units), so propolis needs
 # supplementary membership in each sensor's own group.
-run usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-cred propolis
+run usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-tftp,propolis-cred propolis
 
 # ---- 2. directories ----
 
@@ -97,6 +98,7 @@ ensure_dir /var/log/propolis/adb         0750 propolis-adb      propolis-adb
 ensure_dir /var/log/propolis/http        0750 propolis-http     propolis-http
 ensure_dir /var/log/propolis/ftp         0750 propolis-ftp      propolis-ftp
 ensure_dir /var/log/propolis/smtp        0750 propolis-smtp     propolis-smtp
+ensure_dir /var/log/propolis/tftp        0750 propolis-tftp     propolis-tftp
 ensure_dir /var/log/propolis/cred        0750 propolis-cred     propolis-cred
 # root-owned, NOT propolis: write permission on this directory would let a compromised propolis
 # daemon unlink/rename any child regardless of the child's own owner - including the sibling
@@ -134,6 +136,7 @@ ensure_dir /var/spool/propolis/ssh        0750 propolis-ssh      propolis-ssh
 ensure_dir /var/spool/propolis/adb       0750 propolis-adb      propolis-adb
 ensure_dir /var/spool/propolis/ftp       0750 propolis-ftp      propolis-ftp
 ensure_dir /var/spool/propolis/telnet     0750 propolis-telnet   propolis-telnet
+ensure_dir /var/spool/propolis/tftp       0750 propolis-tftp     propolis-tftp
 # propolis-owned, not a dedicated sensor user: unlike catchall/ssh/adb/ftp/telnet above (each
 # written by its own standalone sensor process), the malware fetcher runs inside propolis.service
 # itself - see deploy/propolis.service's own ReadWritePaths grant for this exact path.

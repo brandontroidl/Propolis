@@ -110,6 +110,21 @@ fn a_catchall_bind_list_yields_both_transports_for_every_port() {
     assert_eq!(parsed, expected);
 }
 
+#[test]
+fn a_tftp_bind_yields_one_udp_listener_named_tftp() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "tftp.env",
+        "PROPOLIS_TFTP_BIND=203.0.113.7:69\n",
+    );
+
+    let value = generate(dir.path()).unwrap();
+    let parsed = parse_listeners(&value).unwrap();
+
+    assert_eq!(parsed, vec![listener("tftp", Proto::Udp, 69)]);
+}
+
 /// The catch-all sensor still reads the deprecated bare spelling of its own bind variable. A box
 /// using it must not silently produce an inventory with no catch-all in it.
 #[test]

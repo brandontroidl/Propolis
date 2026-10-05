@@ -45,13 +45,13 @@ refuses (fail-closed) once the budget is reached (`crates/sensor-framework/src/s
 
 | Spool | Per-file cap | Global budget | Cite |
 |---|---|---|---|
-| `sensor-ssh`, `sensor-ftp`, `sensor-adb`, `sensor-telnet` capture | 10 MB | 100 MB | SSH `crates/sensor-ssh/src/server.rs#serve`, FTP `crates/sensor-ftp/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-ftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, ADB `crates/sensor-adb/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-adb/src/lib.rs#SPOOL_GLOBAL_BUDGET`, telnet `crates/sensor-telnet/src/lib.rs#start_test_server` |
+| `sensor-ssh`, `sensor-ftp`, `sensor-adb`, `sensor-telnet`, `sensor-tftp` capture | 10 MB | 100 MB | SSH `crates/sensor-ssh/src/server.rs#serve`, TFTP `crates/sensor-tftp/src/lib.rs#start_test_server`, FTP `crates/sensor-ftp/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-ftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, ADB `crates/sensor-adb/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-adb/src/lib.rs#SPOOL_GLOBAL_BUDGET`, telnet `crates/sensor-telnet/src/lib.rs#start_test_server` |
 | Fetcher (`/var/spool/propolis/fetched`) | `PROPOLIS_FETCH_MAX_BYTES` (default 10 MB) | **1 GB** (`FETCH_SPOOL_GLOBAL_BUDGET`) | `crates/propolis/src/main.rs#FETCH_SPOOL_GLOBAL_BUDGET`, `crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_BYTES` |
 
 Redis, HTTP, SMTP, cred, and catchall sensors never write a body to a spool (they capture
 metadata only), so they consume no spool budget. Telnet only spools when the shell phase sees a
 binary payload (a Mirai/Gafgyt dropper), never the login/password phase - but when it does, it
-draws from the same 10 MB/100 MB budget as ssh/ftp/adb. The fetcher spool is a growing malware
+draws from the same 10 MB/100 MB budget as ssh/ftp/adb/tftp. The fetcher spool is a growing malware
 corpus with a much larger budget than the incidental per-connection upload spools; its per-file
 cap is the same `PROPOLIS_FETCH_MAX_BYTES` the HTTP fetch enforces, so the two cannot drift.
 The global budgets are compile-time constants, not env vars; plan disk so

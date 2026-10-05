@@ -27,12 +27,12 @@ kinds of artifact:
    (connection, login attempt, command, upload, download). This is the system of
    record.
 2. **Samples** - captured file bodies (attacker uploads over SSH/SCP/SFTP, FTP
-   `STOR`, ADB push, and payloads the malware fetcher retrieved), held in a
+   `STOR`, TFTP `WRQ`, ADB push, and payloads the malware fetcher retrieved), held in a
    sterile on-disk quarantine spool and referenced from the database by SHA-256.
 3. **Scores** - a per-IP projection derived from the events: a time-decayed
    score, a confirmed-real latch, feed tier, and recommendation flags.
 
-The capture surface is nine sensor crates over twelve protocols; the full
+The capture surface is ten sensor crates over thirteen protocols; the full
 inventory is [`overview/capabilities`](../overview/capabilities.md), and per-
 protocol capture behavior is
 [`reference/sensor-behavior`](../reference/sensor-behavior.md).

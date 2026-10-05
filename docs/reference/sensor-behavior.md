@@ -13,7 +13,7 @@ Per-protocol capture behavior for the Propolis sensor layer: what each sensor
 impersonates, what it captures, which events it emits, and the shared framework
 knobs that bound every capture.
 
-There are **9 sensor crates covering 12 protocols** (the `cred` sensor serves
+There are **10 sensor crates covering 13 protocols** (the `cred` sensor serves
 VNC, MySQL, MSSQL, PostgreSQL, and MongoDB from one binary).
 
 **Canonical owners referenced here.** This page owns *capture behavior*. It does
@@ -92,6 +92,9 @@ address, spawns an accept loop, enforces `max_concurrent` with a
 - **UDP** (`run_udp_listener`, `crates/sensor-framework/src/listener.rs#run_udp_listener`): `UDP_MAX_DATAGRAM = 65536` buffer;
   **the socket is never handed to the handler**, so a UDP sensor cannot answer a
   probe by construction (`crates/sensor-framework/src/listener.rs#run_udp_listener`). Each datagram runs in its own bounded task.
+  The one deliberate exception is `sensor-tftp`, which does not use this listener: it
+  owns a request socket that only receives and a per-transfer socket whose every send
+  passes a byte budget (see [sensor-tftp](#sensor-tftp)).
 - **Dual-stack normalization** (`normalize_dual_stack`, `crates/sensor-framework/src/listener.rs#normalize_dual_stack`): maps
   `::ffff:a.b.c.d` down to plain IPv4 (port preserved) before WAN resolution, so a
   plain-IPv4 WAN map matches a dual-stack peer.
@@ -298,9 +301,9 @@ with 0640 permissions and re-hash-on-read fail-closed integrity
   synced, then hard-linked to its digest name (`sensor-framework/src/spool.rs#publish`, `sensor-framework/src/spool.rs#write_and_seal`).
 - `new()` recovers used bytes by scanning the directory at startup so a restart
   does not reset the ceiling (`sensor-framework/src/spool.rs#QuarantineSpool`, `sensor-framework/src/spool.rs#scan_existing_usage`).
-- **Only SSH, FTP, and ADB spool bodies.** All three use `max_file_size` =
+- **SSH, FTP, ADB, Telnet (binary payloads only), and TFTP spool bodies.** SSH, FTP, ADB and TFTP use `max_file_size` =
   10_000_000 (10&nbsp;MB) and `global_budget` = 100_000_000 (100&nbsp;MB). Redis,
-  Telnet, HTTP, SMTP, cred, and catchall never write a body to a spool (confirmed
+  HTTP, SMTP, cred, and catchall never write a body to a spool (confirmed
   by absence of `QuarantineSpool`/`CaptureHandoff` in those crates).
 
 ### Capture hand-off
@@ -512,6 +515,56 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
   `honeypot_malware_upload`.
 
+### sensor-tftp
+
+A TFTP (RFC 1350) honeypot on UDP, conventional port 69. It is the only sensor that
+answers over UDP, so its reply surface is bounded in code and **it is off until an
+operator sets `PROPOLIS_TFTP_BIND`**: with no bind it logs the error, exits 1 and binds
+nothing (`crates/sensor-tftp/src/main.rs#load_config_from`).
+
+- **Sockets.** A request socket on the configured bind only receives. Each valid RRQ or
+  WRQ moves to a fresh ephemeral socket bound on the same local IP, as the RFC specifies
+  (`crates/sensor-tftp/src/guarded.rs#Transfer`). Malformed datagrams and stray
+  DATA/ACK/ERROR packets on the request socket are dropped with no reply and no event
+  (`crates/sensor-tftp/src/handler.rs#classify`).
+- **Reads are never served.** An RRQ in a valid mode gets one ERROR 1 "File not found"
+  (at most 19 bytes), then silence. An unsupported mode, and any WRQ in `mail` or an
+  unknown mode, gets ERROR 4. No DATA packet can be built: the protocol module has no
+  DATA builder (`crates/sensor-tftp/src/protocol.rs#error`).
+- **Writes are acknowledged and captured.** A WRQ in `netascii` or `octet` mode gets
+  ACK 0, then lock-step ACKs for each in-order DATA block (fixed 512-byte blocks, no
+  option negotiation). A duplicate of the previous block is re-ACKed and not stored
+  again. Out-of-order blocks, block 0 and stray packets get no reply. The transfer ends
+  on the first short block (complete), a peer ERROR, the body cap (ERROR 3), the idle
+  timeout, the packet cap, or `max_duration`; whatever arrived is captured either way,
+  with `complete: false` unless the final short block was received
+  (`crates/sensor-tftp/src/handler.rs#UploadCapture`).
+- **Anti-amplification.** Every send goes through one `send_to`, behind a byte budget
+  that refuses any packet which would take bytes sent past bytes received from the
+  peer, the request datagram included (`crates/sensor-tftp/src/guarded.rs#ByteBudget`).
+  There is no retransmission, because that would be a send with nothing new received.
+  A spoofed request therefore reflects strictly fewer bytes than the spoofer sent: the
+  reply to an 8-byte request is at most 8 bytes, to a 4-byte request none.
+- **Source pinning.** The transfer socket sends only to the exact (ip, port) the
+  request came from and drops any packet from another source without counting it or
+  resetting the idle clock.
+- **Bounds.** `max_concurrent` permits (a request past the limit is dropped
+  unanswered), per-transfer read/idle timeout, `max_duration` (dropping the transfer
+  keeps what arrived), a packet cap derived from the body cap, and a retained-body cap of
+  `PROPOLIS_TFTP_MAX_CAPTURED_BYTES` (default 1_000_000, at most
+  `MAX_BODY_HARD_CAP` = 10_000_000, `crates/sensor-tftp/src/handler.rs#MAX_BODY_HARD_CAP`).
+  A WRQ that never delivers a byte is recorded only as a probe, not as an empty upload.
+- **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64
+  (`crates/sensor-tftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, `crates/sensor-tftp/src/lib.rs#CAPTURE_QUEUE_SIZE`,
+  `crates/sensor-tftp/src/lib.rs#start_test_server`). The body is never executed,
+  served or interpreted; `netascii` uploads are stored as the raw bytes received.
+- **Emits:** `honeypot_connection` per RRQ/WRQ (protocol `udp`, metadata `protocol_label`,
+  `filename`, `mode`, `direction` of `rrq` or `wrq`, all sanitized) and
+  `honeypot_malware_upload` (protocol `udp`, standard upload metadata). Both are
+  `authenticated=false` (TFTP has no authentication) and share one session id per
+  transfer. `wan_ip` resolves against the bind address, so a wildcard bind has the same
+  attribution limit as the catch-all's UDP path.
+
 ### sensor-redis
 
 Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
@@ -676,18 +729,19 @@ per-protocol bind var is required.
 ## Cross-cutting invariants
 
 - **Session id:** `Uuid::now_v7()` minted per accepted TCP connection by the
-  listener, per datagram for catchall UDP; carried on every event.
+  listener, per datagram for catchall UDP, per transfer for TFTP; carried on every event.
 - **Password discipline:** every login-capturing sensor reads the password only to
   advance the protocol and drops it - never stored, logged, or placed in any event
   field (SSH `crates/sensor-ssh/src/auth.rs`, telnet `crates/sensor-telnet/src/handler.rs#handle_connection`, FTP `crates/sensor-ftp/src/handler.rs#handle_connection`, redis
   `crates/sensor-redis/src/handler.rs#Session::handle_auth`, SMTP `crates/sensor-smtp/src/handler.rs#handle_connection`, cred handlers). Tests assert absence at
   the serialized-JSON level.
 - **`authenticated` flag:** `honeypot_connection` and `catchall_probe` are always
-  false; ADB events are always false (no auth step); `honeypot_login_attempt` is
+  false; ADB and TFTP events are always false (no auth step); `honeypot_login_attempt` is
   true; `honeypot_command_exec` reflects session auth state (redis/http false,
   ssh/telnet true post-login).
 - **Never-serve-outbound:** FTP RETR→550, FTP PORT/EPRT→502, ADB sync RECV→FAIL,
-  SSH `direct-tcpip` refused, catchall/UDP never responds, shell `wget`/`curl`
+  SSH `direct-tcpip` refused, catchall/UDP never responds, TFTP RRQ gets one tiny
+  error and never any file content, shell `wget`/`curl`
   canned - no sensor fetches or serves attacker-directed content.
 
 ## Notes

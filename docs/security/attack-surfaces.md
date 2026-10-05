@@ -29,7 +29,7 @@ For the trust model behind these boundaries see [threat-model.md](threat-model.m
 
 ## Sensor listeners
 
-The attacker-facing surface: **9 sensor crates covering 12 protocols** (the `cred`
+The attacker-facing surface: **10 sensor crates covering 13 protocols** (the `cred`
 sensor serves VNC / MySQL / MSSQL / PostgreSQL / MongoDB). Sensors have **no compiled-in
 default port** - ports come from the config/env the deploy units set; see
 [../reference/ports-and-protocols.md](../reference/ports-and-protocols.md) and

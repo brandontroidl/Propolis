@@ -24,7 +24,7 @@ reports. It is defensive tooling for infrastructure you own or are authorized to
 monitor.
 
 - Full framing: [`../overview/index.md`](../overview/index.md)
-- Feature inventory (9 sensor crates / 12 protocols, scoring, feed, console,
+- Feature inventory (10 sensor crates / 13 protocols, scoring, feed, console,
   opt-in enrichment): [`../overview/capabilities.md`](../overview/capabilities.md)
 - What it deliberately is **not** (not an IDS/IPS, not SaaS, not offensive, not
   fully egress-free): [`../overview/non-goals.md`](../overview/non-goals.md)

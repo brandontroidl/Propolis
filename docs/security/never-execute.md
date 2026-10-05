@@ -51,6 +51,7 @@ than shipping.
 | (redis) | `crates/sensor-redis/tests/integration.rs#never_exec_static_check` |
 | (smtp) | `crates/sensor-smtp/tests/integration.rs#never_exec_static_check` |
 | (telnet) | `crates/sensor-telnet/tests/integration.rs#never_exec_static_check` |
+| (tftp) | `crates/sensor-tftp/tests/integration.rs#never_exec_static_check` |
 
 The SSH test is broader than its own crate: it walks **both** `sensor-ssh/src`
 and `sensor-framework/src` (`crates/sensor-ssh/tests/shell_test.rs#never_exec_static_check`). The `FakeFs`/`FakeShell`

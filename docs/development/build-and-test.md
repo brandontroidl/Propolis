@@ -86,9 +86,9 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 2477 test functions** (1713 unit + 764 integration).
-- **DB-backed (`sqlx::test`): 202** - console 159, core-scoring 25, intake 7,
-  fleet 6, propolis 4, review 1. These provision a fresh database per test.
+- **Total: 2490 test functions** (1719 unit + 771 integration).
+- **DB-backed (`sqlx::test`): 208** - console 159, core-scoring 28, intake 7,
+  propolis 7, fleet 6, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
   default suite stays offline-deterministic; run it manually with
@@ -118,20 +118,20 @@ Per-crate breakdown:
 |---|---|---|---|
 | collector-wire | 9 | 0 | - |
 | console | 124 | 183 | auth_test, routes_test, samples_transport_test, server_test |
-| core-scoring | 67 | 26 | end_to_end, migrations, replay, repository, smoke, telemetry |
+| core-scoring | 67 | 29 | coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 36 | 58 | builder_test, exclusion_test, export_test, publisher_test |
 | fleet | 23 | 15 | deploy_inventory_test, probe_test, store_test |
 | gateway | 11 | 13 | handshake, spool, verify |
 | geoip | 4 | 0 | - |
 | intake | 11 | 20 | audit_regressions, converter_test, end_to_end, probe_filter |
 | log-tailer | 0 | 34 | cursor_test, tailer_test |
-| propolis | 100 | 23 | capture_to_console, docs_agreement, restore_rehearsal, shell_explain, smoke_test, ssh_capture_to_console |
+| propolis | 102 | 27 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 4 | provision |
 | review | 116 | 71 | cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
 | sensor-adb | 59 | 31 | integration |
 | sensor-catchall | 18 | 6 | integration |
 | sensor-cred | 14 | 8 | integration |
-| sensor-framework | 904 | 52 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
+| sensor-framework | 908 | 52 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
 | sensor-ftp | 7 | 14 | integration |
 | sensor-http | 8 | 16 | integration |
 | sensor-redis | 79 | 18 | integration |
@@ -140,7 +140,7 @@ Per-crate breakdown:
 | sensor-telnet | 40 | 21 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **1713** | **764** | |
+| **Total** | **1719** | **771** | |
 
 ### Test styles by layer
 
@@ -149,8 +149,8 @@ Per-crate breakdown:
   sensor contract (see [adding-a-sensor](adding-a-sensor.md#the-tests-a-sensor-must-pass)).
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
-  (25 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (174 uses) - needed wherever a test needs more than
+  (28 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
+  applies migrations manually (177 uses) - needed wherever a test needs more than
   one migration history in one database, or a history that keeps its own
   bookkeeping table (review, fleet). A bare
   `#[sqlx::test]` (3 uses, the console's `/ready` tests) also gets an empty

@@ -635,6 +635,177 @@ fn run_shell_explain(path: Option<&str>) -> i32 {
     }
 }
 
+const COVERAGE_USAGE: &str =
+    "usage: propolis coverage [--since <rfc3339>] [--until <rfc3339>] [--json] [--examples]";
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CoverageArgs {
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+    json: bool,
+    /// Include one raw (sanitized) example command per family; normalized shapes only otherwise.
+    examples: bool,
+}
+
+fn parse_coverage_args(args: &[String]) -> Result<CoverageArgs, String> {
+    fn instant(
+        flag: &str,
+        value: Option<&String>,
+    ) -> Result<chrono::DateTime<chrono::Utc>, String> {
+        let value = value.ok_or_else(|| format!("{flag} needs an RFC 3339 timestamp"))?;
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| format!("{flag} {value}: {e}"))
+    }
+    let mut parsed = CoverageArgs::default();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--since" => parsed.since = Some(instant("--since", it.next())?),
+            "--until" => parsed.until = Some(instant("--until", it.next())?),
+            "--json" => parsed.json = true,
+            "--examples" => parsed.examples = true,
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    Ok(parsed)
+}
+
+/// Map ledger rows into the analysis input. A command event without a recognized classification
+/// predates the emulator's per-line classification and carries nothing coverage can bucket, so it
+/// is left out; the count of those is returned.
+fn coverage_input(
+    rows: Vec<core_scoring::CoverageEventRow>,
+) -> (Vec<sensor_framework::coverage::CoverageEvent>, usize) {
+    use core_scoring::SignalType;
+    use sensor_framework::coverage::{CoverageEvent, CoverageSignal};
+    use sensor_framework::shell::CommandClass;
+
+    let mut events = Vec::with_capacity(rows.len());
+    let mut skipped = 0;
+    for row in rows {
+        let signal = match row.signal_type {
+            SignalType::HoneypotCommandExec => {
+                let class = match row.classification.as_deref() {
+                    Some("supported") => CommandClass::Supported,
+                    Some("partial") => CommandClass::Partial,
+                    Some("unknown") => CommandClass::Unknown,
+                    Some("parse_limit") => CommandClass::ParseLimit,
+                    _ => {
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                CoverageSignal::CommandExec {
+                    basename: row.command_basename,
+                    class,
+                    command: row.command,
+                }
+            }
+            SignalType::HoneypotFileDownload => CoverageSignal::FileDownload,
+            SignalType::HoneypotMalwareUpload => CoverageSignal::MalwareUpload,
+            SignalType::HoneypotLoginAttempt => CoverageSignal::LoginAttempt,
+            _ => continue,
+        };
+        events.push(CoverageEvent {
+            session_id: row.session_id,
+            order_key: (row.observed_at.timestamp_micros(), row.id),
+            signal,
+        });
+    }
+    (events, skipped)
+}
+
+/// Read the coverage events from `pool`, build the report and write it to `out`. Read-only: it
+/// issues one SELECT and starts nothing. Errors are operator-facing text.
+async fn run_coverage(
+    pool: &PgPool,
+    args: &CoverageArgs,
+    out: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let read = core_scoring::coverage_events(
+        pool,
+        args.since,
+        args.until,
+        core_scoring::MAX_COVERAGE_ROWS,
+    )
+    .await
+    .map_err(|e| format!("cannot read events: {e}"))?;
+    if read.truncated {
+        return Err(format!(
+            "more than {} matching events; narrow the range with --since/--until",
+            core_scoring::MAX_COVERAGE_ROWS
+        ));
+    }
+    let (events, skipped) = coverage_input(read.rows);
+    if skipped > 0 {
+        eprintln!("propolis coverage: skipped {skipped} command event(s) with no classification");
+    }
+    let window = (args.since.is_some() || args.until.is_some()).then(|| {
+        let rfc =
+            |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        sensor_framework::coverage::ReportWindow {
+            from: args.since.map(rfc),
+            to: args.until.map(rfc),
+        }
+    });
+    let mut report = sensor_framework::coverage::build_report(&events, window);
+    report.generated_at =
+        Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    if !args.examples {
+        report.strip_examples();
+    }
+    let text = if args.json {
+        format!("{}\n", report.to_json())
+    } else {
+        report.render_text()
+    };
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|e| format!("cannot write report: {e}"))
+}
+
+/// `propolis coverage`: an operator query. It reads only `DATABASE_URL` (not the daemon's full
+/// configuration), opens a small read-only pool and runs [`run_coverage`]; no migrations, tracing
+/// subscriber, listener, intake, review, feed, console, fleet or supervisor is started. Returns
+/// the process exit code.
+async fn run_coverage_cli(args: &[String]) -> i32 {
+    let args = match parse_coverage_args(args) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("propolis coverage: {e}\n{COVERAGE_USAGE}");
+            return 2;
+        }
+    };
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("propolis coverage: DATABASE_URL is not set");
+        return 1;
+    };
+    let pool = match PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&url)
+        .await
+    {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("propolis coverage: cannot connect to PostgreSQL: {e}");
+            return 1;
+        }
+    };
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let result = run_coverage(&pool, &args, &mut out).await;
+    drop(out);
+    pool.close().await;
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("propolis coverage: {e}");
+            1
+        }
+    }
+}
+
 // ---- entry point ----
 
 #[tokio::main]
@@ -666,6 +837,15 @@ async fn main() {
             && args.get(1).map(String::as_str) == Some("explain")
         {
             std::process::exit(run_shell_explain(args.get(2).map(String::as_str)));
+        }
+    }
+
+    // Operator query over the event database. Still ahead of tracing, migrations and every
+    // listener: it needs only DATABASE_URL and must never start the daemon.
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().map(String::as_str) == Some("coverage") {
+            std::process::exit(run_coverage_cli(&args[1..]).await);
         }
     }
 
@@ -1359,6 +1539,82 @@ async fn main() {
 
     pool.close().await;
     tracing::info!("propolis: shutdown complete");
+}
+
+#[cfg(test)]
+mod coverage_cli_tests {
+    use super::*;
+    use core_scoring::{CoverageEventRow, SignalType};
+    use sensor_framework::coverage::CoverageSignal;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn arguments_parse_and_bad_ones_are_rejected() {
+        assert_eq!(parse_coverage_args(&[]).unwrap(), CoverageArgs::default());
+        let parsed = parse_coverage_args(&argv(&[
+            "--since",
+            "2026-10-01T00:00:00Z",
+            "--until",
+            "2026-10-02T00:00:00+02:00",
+            "--json",
+            "--examples",
+        ]))
+        .unwrap();
+        assert!(parsed.json && parsed.examples);
+        assert_eq!(
+            parsed.since.unwrap().to_rfc3339(),
+            "2026-10-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            parsed.until.unwrap().to_rfc3339(),
+            "2026-10-01T22:00:00+00:00"
+        );
+
+        for bad in [
+            argv(&["--since"]),
+            argv(&["--since", "yesterday"]),
+            argv(&["--bogus"]),
+        ] {
+            assert!(parse_coverage_args(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn rows_map_to_signals_and_unclassified_commands_are_skipped() {
+        let at = "2026-10-01T10:00:00Z".parse().unwrap();
+        let row = |signal_type, classification: Option<&str>| CoverageEventRow {
+            session_id: sensor_framework::Uuid::from_u128(1),
+            signal_type,
+            observed_at: at,
+            id: 7,
+            classification: classification.map(str::to_string),
+            command_basename: Some("wget".to_string()),
+            command: Some("wget x".to_string()),
+        };
+        let (events, skipped) = coverage_input(vec![
+            row(SignalType::HoneypotCommandExec, Some("parse_limit")),
+            row(SignalType::HoneypotCommandExec, None),
+            row(SignalType::HoneypotCommandExec, Some("mystery")),
+            row(SignalType::HoneypotFileDownload, None),
+            row(SignalType::HoneypotMalwareUpload, None),
+            row(SignalType::HoneypotLoginAttempt, None),
+            row(SignalType::HoneypotConnection, None),
+        ]);
+        assert_eq!(skipped, 2);
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[0].signal,
+            CoverageSignal::CommandExec {
+                class: sensor_framework::shell::CommandClass::ParseLimit,
+                ..
+            }
+        ));
+        assert_eq!(events[0].order_key, (at.timestamp_micros(), 7));
+        assert_eq!(events[3].signal, CoverageSignal::LoginAttempt);
+    }
 }
 
 // Fix round 1, #2 (important): the empty-own_ips fail-closed check almost never fires in

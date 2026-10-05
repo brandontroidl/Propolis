@@ -7,8 +7,10 @@
 //! stored raw score to now without ever writing the projected value back - the
 //! double-decay guard depends on the stored value staying un-projected.
 
+pub mod coverage;
 pub mod events;
 pub mod replay;
 
+pub use coverage::{CoverageEventRow, CoverageEvents, MAX_COVERAGE_ROWS, coverage_events};
 pub use events::{RepoError, append_event, append_telemetry_event, read_score, read_stored_score};
 pub use replay::{ChainStatus, rebuild_projection, verify_chain, verify_chain_in_batches};

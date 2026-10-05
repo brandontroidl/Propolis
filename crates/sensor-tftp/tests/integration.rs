@@ -290,6 +290,46 @@ async fn wrq_upload_is_captured_in_the_spool_and_emits_both_events() {
 }
 
 #[tokio::test]
+async fn shutdown_drain_leaves_the_captured_body_in_the_spool_and_its_event_in_the_log() {
+    // What main does on SIGTERM: stop the listener, then drain the hand-off. The assertions read
+    // the spool and log with no polling, so they hold only if `drain` itself waited for the worker.
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let spool_dir = dir.path().join("spool");
+    let (addr, handle, handoff) = sensor_tftp::start_test_server_with_handoff(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        spool_dir.clone(),
+        Arc::new(WanResolver::new(HashMap::new())),
+        test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let mut client = Client::new().await;
+    let transfer = client.begin_write(addr, "drain.bin", "octet").await;
+    let body = b"drained-on-shutdown".to_vec();
+    client.send_block(transfer, 1, &body).await;
+    client.expect_ack(transfer, 1).await;
+    // The handler submits right after it sends the final ACK; give that task a moment to run.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    handle.abort();
+    let outcome = handoff.drain(Duration::from_secs(10)).await;
+    assert_eq!(outcome, sensor_framework::DrainOutcome::Drained);
+
+    let on_disk = std::fs::read(spool_dir.join(sha_hex(&body))).expect("body is in the spool");
+    assert_eq!(on_disk, body);
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains(SIGNAL_HONEYPOT_MALWARE_UPLOAD),
+        "the upload event is in the log"
+    );
+}
+
+#[tokio::test]
 async fn an_upload_that_ends_on_a_full_block_boundary_needs_the_zero_length_final_block() {
     let srv = TestServer::start().await;
     let mut client = Client::new().await;

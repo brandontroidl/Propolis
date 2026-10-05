@@ -34,6 +34,31 @@ pub async fn start_test_server(
     collector_id: String,
     outbox_dir: PathBuf,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
+    let (bound, handle, _handoff) = start_test_server_with_handoff(
+        addr,
+        log_path,
+        spool_dir,
+        wan_resolver,
+        bounds,
+        collector_id,
+        outbox_dir,
+    )
+    .await?;
+    Ok((bound, handle))
+}
+
+/// `start_test_server` plus the capture hand-off, so `main` can `drain` it on shutdown. A separate
+/// function rather than a wider return type so the many callers that never shut down (every
+/// integration test) are unchanged.
+pub async fn start_test_server_with_handoff(
+    addr: SocketAddr,
+    log_path: PathBuf,
+    spool_dir: PathBuf,
+    wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
+    collector_id: String,
+    outbox_dir: PathBuf,
+) -> std::io::Result<(SocketAddr, JoinHandle<()>, Arc<CaptureHandoff>)> {
     let emitter = Arc::new(EventEmitter::new(log_path.clone()));
 
     // Ensure the spool directory exists.
@@ -50,12 +75,13 @@ pub async fn start_test_server(
         collector_id,
         OutboxManifest::new(outbox_dir),
     ));
-    let _worker = handoff.start_worker();
+    handoff.start_worker();
 
     let per_source_cap = Some(sensor_framework::default_per_source_cap(
         bounds.max_concurrent,
     ));
-    run_tcp_listener(
+    let drain_handle = handoff.clone();
+    let (bound, handle) = run_tcp_listener(
         addr,
         bounds.clone(),
         per_source_cap,
@@ -78,5 +104,6 @@ pub async fn start_test_server(
             }
         },
     )
-    .await
+    .await?;
+    Ok((bound, handle, drain_handle))
 }

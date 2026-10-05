@@ -38,12 +38,23 @@
 //! the non-async portion of the work rather than a per-job `tokio::spawn`, specifically so that
 //! isolating a panic does not reintroduce concurrent `store` calls and undo the previous
 //! paragraph's guarantee.
+//!
+//! **Shutdown drains the queue, bounded by a deadline.** `start_worker` keeps the worker's
+//! `JoinHandle` inside the `CaptureHandoff`, and `drain` is the one call a sensor's `main` makes on
+//! SIGTERM: it stops `submit` from enqueuing, tells the worker to close the channel and finish what
+//! is already buffered, and waits for it up to a timeout so a wedged spool cannot hold the process
+//! past the service manager's stop timeout. Without it the runtime teardown killed the detached
+//! worker with accepted captures still queued. This drains the QUEUE only: a connection task that
+//! the runtime cancels at teardown never runs its Drop-time `submit`, so a capture still being
+//! assembled on a live connection at SIGTERM is lost (a documented residual; closing it needs
+//! per-connection task tracking in the listener, which is out of scope here).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sensor_wire::{SampleRef, SensorEvent};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::emit::EventEmitter;
@@ -57,6 +68,10 @@ use crate::spool::QuarantineSpool;
 /// component"), so this bounds it to what a real filename could plausibly be rather than an
 /// arbitrary cap.
 const MAX_ORIG_NAME_LEN: usize = 255;
+
+/// The bound each sensor's `main` passes to `CaptureHandoff::drain`. Well under systemd's default
+/// 90 s `TimeoutStopSec`, so a wedged spool costs a bounded stop delay rather than a SIGKILL.
+pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One capture awaiting hand-off: a body already fully read off the wire, the attacker-supplied
 /// filename if the protocol carries one (SCP/SFTP; empty where it does not, e.g. the catch-all's
@@ -145,19 +160,40 @@ pub fn upload_metadata(
     })
 }
 
-/// `submit` could not enqueue the job because the queue was already at capacity. `submit` never
-/// waits for room (see the module doc), so this is the immediate, synchronous outcome of a full
-/// queue, not a timeout or a retry-later signal.
+/// `submit` could not enqueue the job because the queue was already at capacity, or because the
+/// hand-off is shutting down (`drain` was called). `submit` never waits for room (see the module
+/// doc), so this is the immediate, synchronous outcome, not a timeout or a retry-later signal.
 #[derive(Debug)]
 pub struct CaptureDropped;
 
 impl std::fmt::Display for CaptureDropped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "capture queue full; job dropped")
+        write!(f, "capture queue full or closing; job dropped")
     }
 }
 
 impl std::error::Error for CaptureDropped {}
+
+/// How `CaptureHandoff::drain` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The worker processed every buffered job and exited before the deadline.
+    Drained,
+    /// The deadline passed with the worker still running (a wedged spool or emitter); it was
+    /// aborted and whatever was still queued is lost.
+    TimedOut,
+    /// The worker task ended abnormally (it panicked or was cancelled) rather than finishing.
+    WorkerFailed,
+    /// No worker was running: `start_worker` was never called, or `drain` already ran.
+    NotRunning,
+}
+
+impl DrainOutcome {
+    /// Whether nothing buffered was left behind.
+    pub fn is_clean(self) -> bool {
+        matches!(self, Self::Drained | Self::NotRunning)
+    }
+}
 
 /// Owns the queue, the drop counter, and the spool/emitter every enqueued job is eventually
 /// processed against. Cheap to share: construct one per sensor process, wrap it in an `Arc`, and
@@ -180,6 +216,16 @@ pub struct CaptureHandoff {
     /// Durable per-capture custody record store (SP-B-1b). See `process_job`'s doc for the
     /// ordering guarantee this exists to provide.
     outbox: Arc<OutboxManifest>,
+    /// Set by `drain`; `submit` refuses once it is true. `tx` lives in this struct, which every
+    /// connection handler holds an `Arc` of, so the channel never closes by dropping senders -
+    /// this flag plus `Receiver::close` in the worker is what ends the queue.
+    closing: AtomicBool,
+    /// Wakes the worker to close the channel and drain. `notify_one` stores a permit, so a signal
+    /// sent while the worker is mid-job is not lost.
+    stop: Arc<Notify>,
+    /// The worker task, retained so `drain` can await it (a detached handle is killed by runtime
+    /// teardown before it empties the queue).
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl CaptureHandoff {
@@ -214,6 +260,9 @@ impl CaptureHandoff {
             emitter: Arc::new(emitter),
             collector_id,
             outbox: Arc::new(outbox),
+            closing: AtomicBool::new(false),
+            stop: Arc::new(Notify::new()),
+            worker: Mutex::new(None),
         }
     }
 
@@ -221,8 +270,20 @@ impl CaptureHandoff {
     /// whether or not the queue had room. A full queue is reported as `Err(CaptureDropped)` and
     /// counted against `dropped_count`, never waited out - see the module doc for why blocking
     /// here would defeat the hand-off's entire reason for existing.
+    ///
+    /// After `drain` has been called this refuses without enqueuing and without touching the
+    /// full-queue counter: a closing worker must not be handed new work, and a shutdown refusal is
+    /// not the overload the counter measures.
     pub fn submit(&self, job: CaptureJob) -> Result<(), CaptureDropped> {
-        self.tx.try_send(job).map_err(|_| {
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(CaptureDropped);
+        }
+        self.tx.try_send(job).map_err(|e| {
+            // A receiver closed by a concurrent `drain` that raced the check above: refuse the
+            // same way, uncounted.
+            if matches!(e, mpsc::error::TrySendError::Closed(_)) {
+                return CaptureDropped;
+            }
             let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             // The drop is deliberate (covertness over completeness), but it must not be SILENT: an
             // attacker can induce it by flooding uploads past the single worker's drain rate, and
@@ -266,9 +327,11 @@ impl CaptureHandoff {
     /// panics, rather than silently spawning a second worker that would race the first for jobs
     /// and break the single-worker guarantee the module doc describes.
     ///
+    /// The task's handle is retained in `self` for `drain`; callers do not hold it.
+    ///
     /// # Panics
     /// If called more than once on the same `CaptureHandoff`.
-    pub fn start_worker(&self) -> JoinHandle<()> {
+    pub fn start_worker(&self) {
         let mut rx = self
             .rx
             .lock()
@@ -280,9 +343,25 @@ impl CaptureHandoff {
         let spool_refused = self.spool_refused.clone();
         let collector_id = self.collector_id.clone();
         let outbox = self.outbox.clone();
+        let stop = self.stop.clone();
 
-        tokio::spawn(async move {
-            while let Some(job) = rx.recv().await {
+        let handle = tokio::spawn(async move {
+            loop {
+                let job = tokio::select! {
+                    job = rx.recv() => job,
+                    _ = stop.notified() => {
+                        // Refuse further sends, then keep receiving until the buffer is empty:
+                        // `recv` returns the already-queued jobs after `close` and `None` once
+                        // they are gone.
+                        rx.close();
+                        while let Some(job) = rx.recv().await {
+                            process_job(&spool, &emitter, &spool_refused, &collector_id, &outbox, job)
+                                .await;
+                        }
+                        return;
+                    }
+                };
+                let Some(job) = job else { return };
                 process_job(
                     &spool,
                     &emitter,
@@ -293,7 +372,39 @@ impl CaptureHandoff {
                 )
                 .await;
             }
-        })
+        });
+        *self.worker.lock().unwrap() = Some(handle);
+    }
+
+    /// Stop accepting captures and finish the ones already queued, waiting at most `timeout`.
+    /// Call once at shutdown, after the listeners are stopped. `submit` refuses from the moment
+    /// this is called. On timeout the worker is aborted (a wedged spool or emitter must not hold
+    /// the process past the service manager's stop timeout) and the unprocessed jobs are lost; the
+    /// outcome says which happened so the caller can log it.
+    pub async fn drain(&self, timeout: Duration) -> DrainOutcome {
+        self.closing.store(true, Ordering::SeqCst);
+        let handle = self.worker.lock().unwrap().take();
+        let Some(mut handle) = handle else {
+            return DrainOutcome::NotRunning;
+        };
+        self.stop.notify_one();
+        let outcome = match tokio::time::timeout(timeout, &mut handle).await {
+            Ok(Ok(())) => DrainOutcome::Drained,
+            Ok(Err(_)) => DrainOutcome::WorkerFailed,
+            Err(_) => {
+                handle.abort();
+                DrainOutcome::TimedOut
+            }
+        };
+        match outcome {
+            DrainOutcome::Drained => tracing::info!("capture hand-off: queue drained on shutdown"),
+            _ => tracing::warn!(
+                ?outcome,
+                timeout_ms = timeout.as_millis() as u64,
+                "capture hand-off: shutdown drain incomplete; queued captures may be lost"
+            ),
+        }
+        outcome
     }
 }
 
@@ -510,7 +621,7 @@ mod tests {
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
         let handoff = test_handoff(spool, emitter, 16, dir.path());
-        let worker = handoff.start_worker();
+        handoff.start_worker();
 
         let body = b"malware payload".to_vec();
         handoff
@@ -523,7 +634,6 @@ mod tests {
 
         // Give worker time to process.
         wait_for_lines(&log_path, 1).await;
-        worker.abort();
 
         let content = tokio::fs::read_to_string(&log_path).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -606,7 +716,7 @@ mod tests {
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
         let handoff = test_handoff(spool, emitter, 16, dir.path());
-        let worker = handoff.start_worker();
+        handoff.start_worker();
 
         let raw_name = "evil\r\n\x1b[31mname\x1b[0m.bin";
         handoff
@@ -617,7 +727,6 @@ mod tests {
             })
             .unwrap();
         wait_for_lines(&log_path, 1).await;
-        worker.abort();
 
         let content = tokio::fs::read_to_string(&log_path).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -646,7 +755,7 @@ mod tests {
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(dir.path().join("events.jsonl"));
         let handoff = test_handoff(spool, emitter, 4, dir.path());
-        let _first = handoff.start_worker();
+        handoff.start_worker();
 
         let second =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handoff.start_worker()));
@@ -673,7 +782,7 @@ mod tests {
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
         let handoff = test_handoff(spool, emitter, 16, dir.path());
-        let worker = handoff.start_worker();
+        handoff.start_worker();
 
         handoff
             .submit(CaptureJob {
@@ -691,7 +800,6 @@ mod tests {
             .unwrap();
 
         wait_for_lines(&log_path, 1).await;
-        worker.abort();
 
         let content = tokio::fs::read_to_string(&log_path).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -721,7 +829,7 @@ mod tests {
         let spool = crate::spool::QuarantineSpool::new(spool_dir, 8, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
         let handoff = test_handoff(spool, emitter, 16, dir.path());
-        let worker = handoff.start_worker();
+        handoff.start_worker();
 
         handoff
             .submit(CaptureJob {
@@ -739,7 +847,6 @@ mod tests {
             .unwrap();
 
         wait_for_lines(&log_path, 1).await;
-        worker.abort();
 
         // The spool refusal is now counted (previously it was only a log line with no metric),
         // giving parity with the queue-drop `dropped_count`.
@@ -815,7 +922,7 @@ mod tests {
         let spool = crate::spool::QuarantineSpool::new(spool_dir.clone(), 4096, 1_000_000);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
         let handoff = Arc::new(test_handoff(spool, emitter, 64, dir.path()));
-        let worker = handoff.start_worker();
+        handoff.start_worker();
 
         const UNIQUE: usize = 10;
         const DUP_SUBMITTERS: usize = 10;
@@ -852,7 +959,6 @@ mod tests {
         }
 
         wait_for_lines(&log_path, UNIQUE + DUP_SUBMITTERS).await;
-        worker.abort();
 
         let content = tokio::fs::read_to_string(&log_path).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -924,7 +1030,7 @@ mod tests {
             "collector-1".to_string(),
             crate::outbox::OutboxManifest::new(outbox_dir.clone()),
         );
-        let worker = handoff.start_worker();
+        handoff.start_worker();
 
         handoff
             .submit(CaptureJob {
@@ -934,7 +1040,6 @@ mod tests {
             })
             .unwrap();
         wait_for_lines(&log_path, 1).await;
-        worker.abort();
 
         // The event carries an occurrence_id.
         let line = tokio::fs::read_to_string(&log_path).await.unwrap();
@@ -969,6 +1074,142 @@ mod tests {
         assert_eq!(
             row.custody_state,
             crate::outbox::CustodyDisposition::Pending
+        );
+    }
+
+    fn drain_job(body: Vec<u8>) -> CaptureJob {
+        CaptureJob {
+            body,
+            orig_name: String::new(),
+            event_builder: Box::new(|s| test_event(Some(s))),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_returns_only_after_every_queued_job_is_stored_and_emitted() {
+        // The shutdown loss this exists to close: jobs accepted into the queue but not yet
+        // processed. The worker is started and N distinct bodies are submitted back to back, then
+        // `drain` is called with no wait in between, so most are still buffered. The assertions
+        // read the event log and spool directly after `drain` returns, with no polling: an
+        // implementation that returned before the queue emptied (or aborted the worker) would see
+        // fewer than N lines and files.
+        const N: usize = 40;
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let spool = crate::spool::QuarantineSpool::new(spool_dir.clone(), 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(log_path.clone());
+        let handoff = test_handoff(spool, emitter, 64, dir.path());
+        handoff.start_worker();
+
+        for i in 0..N {
+            handoff
+                .submit(drain_job(format!("queued-body-{i}").into_bytes()))
+                .unwrap();
+        }
+        let outcome = handoff.drain(Duration::from_secs(15)).await;
+        assert_eq!(outcome, DrainOutcome::Drained);
+
+        let lines = std::fs::read_to_string(&log_path).unwrap().lines().count();
+        assert_eq!(
+            lines, N,
+            "every queued job must be emitted before drain returns"
+        );
+        let stored = std::fs::read_dir(&spool_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| crate::spool::is_canonical_sha256_hex(&e.file_name().to_string_lossy()))
+            .count();
+        assert_eq!(stored, N, "every queued body must be in the spool");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_gives_up_at_its_timeout_when_the_worker_is_wedged() {
+        // A job whose event builder blocks stands in for a wedged spool or emitter: the worker is
+        // stuck inside `process_job`, so it can never see the stop signal. `drain` must still
+        // return near its deadline, not wait for the stall, and say it timed out.
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(dir.path().join("events.jsonl"));
+        let handoff = test_handoff(spool, emitter, 4, dir.path());
+        handoff.start_worker();
+
+        handoff
+            .submit(CaptureJob {
+                body: b"wedges-the-worker".to_vec(),
+                orig_name: String::new(),
+                event_builder: Box::new(|s| {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    test_event(Some(s))
+                }),
+            })
+            .unwrap();
+        // Let the worker pick the job up so it is wedged mid-job rather than still queued.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let started = std::time::Instant::now();
+        let outcome = handoff.drain(Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, DrainOutcome::TimedOut);
+        assert!(!outcome.is_clean());
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "drain must return near its deadline, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_after_drain_does_not_enqueue() {
+        // A closing worker must not be handed new work. The queue has room (capacity 4, nothing
+        // submitted), so an implementation that only checked fullness would enqueue; the channel's
+        // remaining capacity shows whether anything was actually placed in it. The refusal is not
+        // a queue-full drop, so that counter stays at zero.
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(dir.path().join("events.jsonl"));
+        let handoff = test_handoff(spool, emitter, 4, dir.path());
+        handoff.start_worker();
+        assert_eq!(
+            handoff.drain(Duration::from_secs(5)).await,
+            DrainOutcome::Drained
+        );
+
+        assert!(handoff.submit(drain_job(b"late".to_vec())).is_err());
+        assert_eq!(
+            handoff.tx.capacity(),
+            4,
+            "a refused submit must not enqueue"
+        );
+        assert_eq!(handoff.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_without_a_running_worker_reports_not_running_and_still_closes_submit() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(dir.path().join("events.jsonl"));
+        let handoff = test_handoff(spool, emitter, 4, dir.path());
+
+        let outcome = handoff.drain(Duration::from_secs(1)).await;
+        assert_eq!(outcome, DrainOutcome::NotRunning);
+        assert!(outcome.is_clean());
+        assert!(handoff.submit(drain_job(b"x".to_vec())).is_err());
+        // A second drain after a real one is also a no-op.
+        handoff.start_worker();
+        assert_eq!(
+            handoff.drain(Duration::from_secs(5)).await,
+            DrainOutcome::Drained
+        );
+        assert_eq!(
+            handoff.drain(Duration::from_secs(5)).await,
+            DrainOutcome::NotRunning
         );
     }
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, WanResolver, shutdown_signal};
+use sensor_framework::{ConnectionBounds, SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal};
 use sensor_tftp::handler::MAX_BODY_HARD_CAP;
 
 /// Required, with no default: the sensor is off until an operator names a bind address. TFTP lets
@@ -234,7 +234,7 @@ async fn main() {
     let bind_addr = config.bind_addr;
 
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
-    let (bound, handle) = match sensor_tftp::start_test_server(
+    let (bound, handle, handoff) = match sensor_tftp::start_test_server_with_handoff(
         bind_addr,
         config.log_path,
         config.spool_dir,
@@ -256,6 +256,8 @@ async fn main() {
     shutdown_signal().await;
     tracing::info!("sensor-tftp: shutdown signal received; stopping");
     handle.abort();
+    // Queued captures only; a transfer cancelled mid-capture never submits (see handoff.rs).
+    handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
 }
 
 #[cfg(test)]

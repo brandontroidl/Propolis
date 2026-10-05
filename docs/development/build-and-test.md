@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 2566 test functions** (1757 unit + 809 integration).
+- **Total: 2571 test functions** (1761 unit + 810 integration).
 - **DB-backed (`sqlx::test`): 208** - console 159, core-scoring 28, intake 7,
   propolis 7, fleet 6, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -131,17 +131,17 @@ Per-crate breakdown:
 | sensor-adb | 59 | 31 | integration |
 | sensor-catchall | 18 | 6 | integration |
 | sensor-cred | 14 | 8 | integration |
-| sensor-framework | 917 | 56 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
+| sensor-framework | 921 | 56 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration |
 | sensor-ftp | 7 | 14 | integration |
 | sensor-http | 8 | 16 | integration |
 | sensor-redis | 79 | 18 | integration |
 | sensor-smtp | 6 | 18 | integration |
 | sensor-ssh | 61 | 109 | auth_test, crypto_test, integration, shell_test, transport_test |
 | sensor-telnet | 40 | 21 | integration |
-| sensor-tftp | 29 | 27 | integration |
+| sensor-tftp | 29 | 28 | integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **1757** | **809** | |
+| **Total** | **1761** | **810** | |
 
 ### Test styles by layer
 

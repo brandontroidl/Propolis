@@ -276,9 +276,11 @@ where
 /// Resolves when the process receives SIGINT (`Ctrl+C`) or, on Unix, SIGTERM (what `systemctl
 /// stop` sends - not SIGINT - to the hardened service units `internal/design/02-sensor-framework.
 /// md`'s "Isolation and deployment" section ships). A sensor's `main.rs` races this against
-/// continued serving, then aborts every listener `JoinHandle` it is holding; each connection
-/// already in flight still winds down on its own via `max_duration` (see `run_tcp_listener`), so
-/// no further coordination lives here - this function's only job is to resolve at the right time.
+/// continued serving, then aborts every listener `JoinHandle` it is holding. A sensor that has a
+/// capture worker then calls `CaptureHandoff::drain` so already-queued captures are written before
+/// the process exits. In-flight connection tasks are NOT awaited: the runtime cancels them at
+/// teardown, so a capture a connection had not yet submitted is lost (see `handoff.rs`'s module
+/// doc). This function's only job is to resolve at the right time.
 pub async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;

@@ -233,6 +233,39 @@ pub async fn serve(
     collector_id: String,
     outbox_dir: PathBuf,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
+    let (bound, handle, _handoff) = serve_with_handoff(
+        addr,
+        log_path,
+        spool_dir,
+        host_key_path,
+        wan_resolver,
+        bounds,
+        banner,
+        collector_id,
+        outbox_dir,
+    )
+    .await?;
+    Ok((bound, handle))
+}
+
+/// `serve` plus the capture hand-off, so `main` can `drain` it on shutdown. A separate function
+/// rather than a wider return type so the many callers that never shut down (every integration
+/// test) are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_handoff(
+    addr: SocketAddr,
+    log_path: PathBuf,
+    spool_dir: PathBuf,
+    host_key_path: PathBuf,
+    wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
+    banner: String,
+    collector_id: String,
+    outbox_dir: PathBuf,
+) -> Result<
+    (SocketAddr, JoinHandle<()>, Arc<CaptureHandoff>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     // The software-version this server sends in `SSH-2.0-<banner>`. Shared read-only across all
     // sessions, so one `Arc` rather than a clone per connection.
     let banner = Arc::new(banner);
@@ -263,7 +296,8 @@ pub async fn serve(
         collector_id,
         outbox,
     ));
-    let _worker = handoff.start_worker();
+    handoff.start_worker();
+    let drain_handle = handoff.clone();
 
     let read_timeout = bounds.read_timeout;
     let idle_timeout = bounds.idle_timeout;
@@ -314,7 +348,7 @@ pub async fn serve(
     )
     .await?;
 
-    Ok((bound_addr, handle))
+    Ok((bound_addr, handle, drain_handle))
 }
 
 /// Handle one SSH connection end to end: version exchange, key exchange, authentication,

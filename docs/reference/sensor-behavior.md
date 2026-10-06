@@ -567,7 +567,9 @@ nothing (`crates/sensor-tftp/src/main.rs#load_config_from`).
 
 ### sensor-mqtt
 
-A metadata-only MQTT honeypot on TCP, conventional port 1883. It is **off until an
+An MQTT honeypot on TCP, conventional port 1883. It records metadata for every PUBLISH and
+additionally spools a PUBLISH payload that passes the shared `looks_binary` gate
+(`crates/sensor-mqtt/src/handler.rs#on_publish`). It is **off until an
 operator sets `PROPOLIS_MQTT_BIND`**: with no bind it logs the error, exits 1 and binds
 nothing (`crates/sensor-mqtt/src/main.rs#load_config_from_env`). It speaks MQTT 3.1
 (`MQIsdp` level 3), 3.1.1 (`MQTT` level 4) and 5.0 (`MQTT` level 5), accepts any credential
@@ -575,7 +577,8 @@ on every connection (the deliberate low-interaction choice: it is what lets the
 post-CONNECT SUBSCRIBE and PUBLISH recon through, and every CONNECT is logged, so a
 brute-force run across connections is captured), and serves nothing: no message is ever
 delivered to a subscriber, retained, or forwarded, no outbound socket is opened, and nothing
-is executed or spooled.
+is executed. A binary PUBLISH payload is quarantined through the framework capture hand-off,
+under the process-wide capture-memory budget, and never run.
 
 - **Packets answered.** CONNECT (CONNACK accept `20 02 00 00`; for level 5
   `20 03 00 00 00`: ack flags 0, reason `0x00`, empty properties), SUBSCRIBE (SUBACK granting
@@ -634,7 +637,14 @@ is executed or spooled.
   when the prefix has non-UTF-8 or control bytes (`payload_preview_encoding` says which), and
   `payload_sha256` over the whole payload), or `AUTH` (5.0 only). Every attacker string is
   lossy-decoded, passed through `sanitize_value` and capped at 255 characters; no event
-  carries a sample.
+  carries a sample except the one below.
+- **Binary PUBLISH capture.** When a PUBLISH payload passes `looks_binary`, the metadata
+  event above is still emitted and the payload is also spooled, emitting a
+  `honeypot_malware_upload` event (`crates/sensor-mqtt/src/handler.rs#capture_job`) whose
+  metadata carries `topic`, `qos`, `retain`, `dup`, `capture_reason` =
+  `binary_publish_payload` and, in 5.0, `topic_alias`. The sample is named after the
+  sanitized, bounded topic (or `mqtt-publish-<session id>` when the topic is empty). A text
+  or control payload stays metadata-only.
 - **Malformed first packet.** A connection that sent bytes but whose first packet was
   malformed or not a CONNECT (a bad remaining length, an oversize declaration, a truncated or
   invalid CONNECT, a wrong fixed-header flag, a non-CONNECT first packet) emits a second

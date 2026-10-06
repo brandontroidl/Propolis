@@ -121,12 +121,14 @@ See [`security/input-handling.md`](../security/input-handling.md).
 
 ## The capture path
 
-Only these sensors write captured file *bodies* to disk - **SSH, FTP, ADB, TFTP**, and
-Telnet when its shell phase sees a binary payload.
-Redis, HTTP, SMTP, MQTT, cred, and catchall capture metadata only and never spool a
+Only these sensors write captured file *bodies* to disk - **SSH, FTP, ADB, TFTP**,
+Telnet when its shell phase sees a binary payload, and MQTT when a PUBLISH payload looks
+binary (`crates/sensor-mqtt/src/handler.rs#on_publish`).
+Redis, HTTP, SMTP, cred, and catchall capture metadata only and never spool a
 body (confirmed by the absence of `QuarantineSpool`/`CaptureHandoff` in those crates).
-MQTT records a PUBLISH as metadata (topic, QoS, length, a bounded preview and a SHA-256
-of the payload) and never delivers, retains, or forwards the message
+MQTT always records a PUBLISH as metadata (topic, QoS, length, a bounded preview and a SHA-256
+of the payload), spools the payload only when it passes the shared `looks_binary` gate, and
+never delivers, retains, or forwards the message
 (see [sensor behavior](../reference/sensor-behavior.md#sensor-mqtt)).
 TFTP is the one sensor that answers over UDP; its replies are bounded so that bytes sent
 never exceed bytes received, which is why it does not use the framework's receive-only

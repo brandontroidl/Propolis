@@ -528,8 +528,12 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   `MemoryMax`; the worst case is roughly `(max_concurrent + 64) * max_captured_bytes + 15 MB`.
 - mqtt: `PROPOLIS_MQTT_READ_TIMEOUT_MS`, `PROPOLIS_MQTT_IDLE_TIMEOUT_MS`,
   `PROPOLIS_MQTT_MAX_DURATION_SECS`, `PROPOLIS_MQTT_MAX_CAPTURED_BYTES`,
-  `PROPOLIS_MQTT_MAX_CONCURRENT`, `PROPOLIS_MQTT_LOG_PATH`, `PROPOLIS_MQTT_WAN_MAP`.
-  Metadata-only, so there is no spool, outbox, collector-id or capture-memory variable.
+  `PROPOLIS_MQTT_MAX_CONCURRENT`, `PROPOLIS_MQTT_LOG_PATH`, `PROPOLIS_MQTT_WAN_MAP`,
+  `PROPOLIS_MQTT_SPOOL_DIR` (default `/var/spool/propolis/mqtt`,
+  `sensor-mqtt/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_MQTT_OUTBOX_DIR` (default
+  `/var/spool/propolis/mqtt/outbox`; see "Outbox manifest" below), `PROPOLIS_COLLECTOR_ID`
+  and `PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES` (see "Capture memory budget" below). A PUBLISH
+  payload is spooled only when it looks binary; text payloads stay metadata-only.
   `PROPOLIS_MQTT_MAX_CAPTURED_BYTES` (default `1_000_000`) bounds the total bytes read per
   connection; a single packet is separately capped at 262144 bytes of declared remaining length
   (`sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`) and a connection at 1024 packets
@@ -622,7 +626,7 @@ read identically by each of those five sensors' `main.rs`:
 
 #### Capture memory budget
 
-Each of the five body-capturing sensors holds a process-wide ceiling on the bytes of captured
+Each of the six body-capturing sensors holds a process-wide ceiling on the bytes of captured
 bodies buffered in memory at once (`sensor_framework::capture_budget::CaptureMemoryBudget`), so
 many concurrent uploads cannot together push the process past its systemd `MemoryMax`. A body is
 charged in 64 KiB chunks from its first byte and refunded as soon as the hand-off worker has
@@ -636,6 +640,7 @@ sensor's `main.rs`:
 | `PROPOLIS_ADB_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
 | `PROPOLIS_TELNET_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
 | `PROPOLIS_TFTP_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
 
 When a capture hits the ceiling it keeps the prefix already buffered, stops growing, and the
 transfer is ended the way the protocol ends a full disk (FTP `451`, TFTP ERROR 3, SCP error byte,

@@ -60,17 +60,19 @@ event logs.
 | adb uploads | `PROPOLIS_ADB_SPOOL_DIR` | `/var/spool/propolis/adb` (`sensor-adb/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-adb (`deploy/provision.sh#ensure_dir /var/spool/propolis/adb`) |
 | telnet uploads | `PROPOLIS_TELNET_SPOOL_DIR` | `/var/spool/propolis/telnet` (`sensor-telnet/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-telnet (`deploy/provision.sh#ensure_dir /var/spool/propolis/telnet`) |
 | tftp uploads | `PROPOLIS_TFTP_SPOOL_DIR` | `/var/spool/propolis/tftp` (`sensor-tftp/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-tftp (`deploy/provision.sh#ensure_dir /var/spool/propolis/tftp`) |
+| mqtt uploads | `PROPOLIS_MQTT_SPOOL_DIR` | `/var/spool/propolis/mqtt` (`sensor-mqtt/src/main.rs#DEFAULT_SPOOL_DIR`) | 0750 propolis-mqtt (`deploy/provision.sh#ensure_dir /var/spool/propolis/mqtt`) |
 | catchall | (dir granted for symmetry, **unused** - catchall spools no bodies) | `/var/spool/propolis/catchall` | 0750 propolis-catchall (`deploy/provision.sh#ensure_dir /var/spool/propolis/catchall`) |
 | fetcher output | `PROPOLIS_SPOOL_ROOT` + `/fetched` (fn `fetch_spool_dir()`) | `/var/spool/propolis/fetched` (`crates/propolis/src/main.rs#fetch_spool_dir`; root `crates/review/src/spool.rs#DEFAULT_SPOOL_ROOT`) | 0750 propolis (`deploy/provision.sh#ensure_dir /var/spool/propolis/fetched`) |
 | ops spool root | `PROPOLIS_SPOOL_ROOT` (fn `ops_spool_root()`) | `/var/spool/propolis` (`crates/propolis/src/main.rs#ops_spool_root`; default `crates/review/src/spool.rs#DEFAULT_SPOOL_ROOT`) | 0755 root (`deploy/provision.sh#3/9 creating spool directories (mountpoints only)`) |
 
 - The fetcher output dir has a global byte budget of 1_000_000_000 bytes
   (`FETCH_SPOOL_GLOBAL_BUDGET`, `crates/propolis/src/main.rs#FETCH_SPOOL_GLOBAL_BUDGET`).
-- **smtp, redis, http, mqtt, cred** have **no** spool dir (no `*_SPOOL_DIR` env);
+- **smtp, redis, http, cred** have **no** spool dir (no `*_SPOOL_DIR` env);
   they capture inline only. Telnet spools only when the shell phase sees a
-  binary payload (a Mirai/Gafgyt dropper), never the login/password phase.
+  binary payload (a Mirai/Gafgyt dropper), never the login/password phase. MQTT
+  spools only a PUBLISH payload that passes the `looks_binary` gate, never a text one.
 
-Each of ssh/ftp/adb/telnet/tftp also writes a durable per-capture custody manifest
+Each of ssh/ftp/adb/telnet/tftp/mqtt also writes a durable per-capture custody manifest
 row (`PROPOLIS_<SENSOR>_OUTBOX_DIR`) as soon as a body is sealed - defaults to
 `<its own spool dir>/outbox` (e.g. `/var/spool/propolis/ssh/outbox`), not a
 separate path, so the write always lands inside that unit's own

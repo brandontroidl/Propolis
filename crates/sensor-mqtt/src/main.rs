@@ -1,15 +1,32 @@
 use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, WanResolver, shutdown_signal};
+use sensor_framework::{
+    CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+    SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal,
+};
 
 const ENV_BIND: &str = "PROPOLIS_MQTT_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_MQTT_WAN_MAP";
 const ENV_LOG_PATH: &str = "PROPOLIS_MQTT_LOG_PATH";
+const ENV_SPOOL_DIR: &str = "PROPOLIS_MQTT_SPOOL_DIR";
+/// Shared across every sensor binary AND `shipper` on this collector (see sensor-ssh's own
+/// `main.rs` for why): must match the shipper's client certificate CommonName.
+const ENV_COLLECTOR_ID: &str = "PROPOLIS_COLLECTOR_ID";
+/// Pre-rename bare spelling, still read via [`sensor_framework::env_with_legacy`] when
+/// `PROPOLIS_COLLECTOR_ID` is unset (see sensor-ssh's own `main.rs` for why).
+const ENV_COLLECTOR_ID_LEGACY: &str = "COLLECTOR_ID";
+/// Defaults to `<spool_dir>/outbox` (see [`resolve_outbox_dir`]), not a fixed path: the outbox
+/// must land inside this sensor's own writable spool root, which is already granted in its
+/// systemd `ReadWritePaths`.
+const ENV_OUTBOX_DIR: &str = "PROPOLIS_MQTT_OUTBOX_DIR";
+/// Ceiling, in bytes, on capture bodies buffered in memory across every connection. Defaults to
+/// 40% of the unit's 256M `MemoryMax` (see `deploy/sensor-mqtt.service`).
+const ENV_CAPTURE_MEMORY_BYTES: &str = "PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES";
 const ENV_READ_TIMEOUT_MS: &str = "PROPOLIS_MQTT_READ_TIMEOUT_MS";
 const ENV_IDLE_TIMEOUT_MS: &str = "PROPOLIS_MQTT_IDLE_TIMEOUT_MS";
 const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_MQTT_MAX_DURATION_SECS";
@@ -17,6 +34,8 @@ const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_MQTT_MAX_CAPTURED_BYTES";
 const ENV_MAX_CONCURRENT: &str = "PROPOLIS_MQTT_MAX_CONCURRENT";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/mqtt/events.jsonl";
+const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/mqtt";
+const DEFAULT_COLLECTOR_ID: &str = "local";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_DURATION_SECS: u64 = 600;
@@ -51,7 +70,21 @@ struct Config {
     bind_addr: SocketAddr,
     wan_map: HashMap<IpAddr, IpAddr>,
     log_path: PathBuf,
+    spool_dir: PathBuf,
     bounds: ConnectionBounds,
+    collector_id: String,
+    outbox_dir: PathBuf,
+    capture_memory_bytes: u64,
+}
+
+/// Resolve the outbox directory: the explicit `PROPOLIS_MQTT_OUTBOX_DIR` override if set, else a
+/// subdirectory of the sensor's own resolved spool root. The default must derive from
+/// `spool_dir` (not a fixed constant) so it also follows a `PROPOLIS_MQTT_SPOOL_DIR` override,
+/// and so it always lands inside the writable root the sensor's systemd unit already grants.
+fn resolve_outbox_dir(spool_dir: &Path, env_override: Option<String>) -> PathBuf {
+    env_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| spool_dir.join("outbox"))
 }
 
 fn load_config_from_env() -> Result<Config, ConfigError> {
@@ -64,11 +97,25 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let log_path = env::var(ENV_LOG_PATH)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_PATH));
+    let spool_dir = env::var(ENV_SPOOL_DIR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SPOOL_DIR));
+    let collector_id = sensor_framework::env_with_legacy(ENV_COLLECTOR_ID, ENV_COLLECTOR_ID_LEGACY)
+        .unwrap_or_else(|| DEFAULT_COLLECTOR_ID.to_string());
+    let outbox_dir = resolve_outbox_dir(&spool_dir, env::var(ENV_OUTBOX_DIR).ok());
 
     Ok(Config {
         bind_addr,
         wan_map,
         log_path,
+        spool_dir,
+        collector_id,
+        outbox_dir,
+        capture_memory_bytes: parse_positive_u64(
+            env::var(ENV_CAPTURE_MEMORY_BYTES).ok().as_deref(),
+            DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+            ENV_CAPTURE_MEMORY_BYTES,
+        )?,
         bounds: ConnectionBounds {
             read_timeout: Duration::from_millis(parse_positive_u64(
                 env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
@@ -170,11 +217,15 @@ async fn main() {
     let bind_addr = config.bind_addr;
 
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
-    let (bound, handle) = match sensor_mqtt::start_test_server(
+    let (bound, handle, handoff) = match sensor_mqtt::start_test_server_with_handoff(
         bind_addr,
         config.log_path,
+        config.spool_dir,
         wan_resolver,
         config.bounds,
+        config.collector_id,
+        config.outbox_dir,
+        Arc::new(CaptureMemoryBudget::new(config.capture_memory_bytes)),
     )
     .await
     {
@@ -188,8 +239,9 @@ async fn main() {
     tracing::info!(local = %bound, "sensor-mqtt: listening");
     shutdown_signal().await;
     tracing::info!("sensor-mqtt: shutdown signal received; stopping");
-    // Nothing is spooled or queued, so there is nothing to drain.
     handle.abort();
+    // Queued captures only; a connection cancelled mid-packet never submits (see handoff.rs).
+    handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
 }
 
 #[cfg(test)]
@@ -206,6 +258,35 @@ mod tests {
         assert_eq!(parse_positive_u32(None, 9, "f").unwrap(), 9);
         assert!(parse_positive_u32(Some("0"), 9, "f").is_err());
         assert!(parse_positive_u32(Some("4294967296"), 9, "f").is_err());
+    }
+
+    #[test]
+    fn outbox_defaults_under_the_spool_root_and_an_explicit_override_wins() {
+        let spool_dir = PathBuf::from("/custom/spool");
+        assert_eq!(
+            resolve_outbox_dir(&spool_dir, None),
+            PathBuf::from("/custom/spool/outbox")
+        );
+        assert_eq!(
+            resolve_outbox_dir(&spool_dir, Some("/explicit/outbox".to_string())),
+            PathBuf::from("/explicit/outbox")
+        );
+    }
+
+    #[test]
+    fn capture_memory_ceiling_defaults_and_rejects_zero_or_garbage() {
+        let parse = |raw: Option<&str>| {
+            parse_positive_u64(
+                raw,
+                DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+                ENV_CAPTURE_MEMORY_BYTES,
+            )
+        };
+        assert_eq!(parse(None).unwrap(), 107_374_182);
+        assert_eq!(parse(Some("5000000")).unwrap(), 5_000_000);
+        assert!(parse(Some("0")).is_err());
+        assert!(parse(Some("lots")).is_err());
+        assert!(parse(Some("-1")).is_err());
     }
 
     #[test]

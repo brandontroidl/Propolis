@@ -1,4 +1,4 @@
-//! Per-connection MQTT session handler: a metadata-only recon trap for TCP/1883.
+//! Per-connection MQTT session handler: a recon trap for TCP/1883 that spools binary payloads.
 //!
 //! It records who connects (CONNECT credentials, client id, will topic), what they subscribe to,
 //! and what they publish (topic plus bounded payload metadata), and answers MQTT 3.1, 3.1.1 and
@@ -6,6 +6,10 @@
 //! is never delivered to any subscriber, retained, or forwarded; there is no broker state; no
 //! outbound socket is ever opened; nothing is executed. Any credential is accepted (the deliberate
 //! low-interaction choice: it is what lets the post-CONNECT SUBSCRIBE and PUBLISH recon through).
+//!
+//! A PUBLISH payload that passes [`looks_binary`] is additionally handed to the capture hand-off
+//! and spooled as a potential malware sample (`honeypot_malware_upload`), bounded by the
+//! process-wide capture-memory budget; a text or control payload stays metadata-only.
 //!
 //! The CONNECT password and the 5.0 Authentication-Data property are credentials: each is read
 //! only to advance the parser and is dropped, never stored or logged.
@@ -33,12 +37,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::shell::looks_binary;
 use sensor_framework::{
-    ConnectionBounds, EventEmitter, Uuid, WanResolver, sanitize_value, to_hex_bounded,
+    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver, sanitize_value,
+    to_hex_bounded, upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
-    SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SIGNAL_HONEYPOT_SESSION_END, SensorEvent, WIRE_VERSION,
+    SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SIGNAL_HONEYPOT_SESSION_END,
+    SampleRef, SensorEvent, WIRE_VERSION,
 };
 
 pub const PROTOCOL_LABEL: &str = "mqtt";
@@ -58,6 +65,9 @@ const MAX_FIELD_LEN: usize = 255;
 /// Subscribe filters listed in one event (the SUBACK still answers every filter).
 const MAX_LOGGED_TOPICS: usize = 32;
 const PAYLOAD_PREVIEW_BYTES: usize = 256;
+/// The `capture_reason` stamped on a spooled PUBLISH payload: it passed the same `looks_binary`
+/// gate telnet, ssh and adb use before a shell-phase buffer is treated as a sample.
+const CAPTURE_REASON_BINARY_PUBLISH: &str = "binary_publish_payload";
 /// Wire bytes of a rejected first packet kept as hex in a malformed-connection event.
 const MALFORMED_SNIPPET_BYTES: usize = 32;
 
@@ -688,10 +698,25 @@ pub struct Observation {
     pub metadata: serde_json::Value,
 }
 
+/// A PUBLISH whose payload passed the [`looks_binary`] gate and so is to be spooled as a potential
+/// sample. It names the payload by length only: the payload is the tail of the packet body (see
+/// [`parse_publish`]), so [`handle_connection`] slices it out of the packet it already holds
+/// instead of the session copying up to `MAX_PACKET_BYTES` outside the capture-memory budget.
+#[derive(Debug)]
+pub struct CaptureRequest {
+    pub payload_len: usize,
+    /// The sanitized, bounded topic, or `None` when it is empty (the caller then names the sample
+    /// after the session).
+    pub orig_name: Option<String>,
+    /// The mqtt-specific fields merged into the `honeypot_malware_upload` metadata.
+    pub fields: serde_json::Value,
+}
+
 #[derive(Debug, Default)]
 pub struct Outcome {
     pub reply: Vec<u8>,
     pub events: Vec<Observation>,
+    pub capture: Option<CaptureRequest>,
     pub close: bool,
     /// Why the packet was refused, when it was (the connection closes). A clean DISCONNECT closes
     /// with no reason.
@@ -918,8 +943,7 @@ impl Session {
                 authenticated: true,
                 metadata,
             }],
-            close: false,
-            reject: None,
+            ..Outcome::default()
         }
     }
 
@@ -973,8 +997,7 @@ fn on_auth(body: &[u8]) -> Outcome {
             authenticated: false,
             metadata,
         }],
-        close: false,
-        reject: None,
+        ..Outcome::default()
     }
 }
 
@@ -1006,6 +1029,27 @@ fn on_publish(level: u8, pkt: &Packet) -> Outcome {
         (2, Some(id)) => ack(0x50, id).to_vec(),
         _ => Vec::new(),
     };
+    // The metadata event above is always emitted (so the topic and preview survive a refused or
+    // dropped capture). A payload that looks binary is additionally spooled as a potential sample;
+    // text and control payloads stay metadata-only.
+    let capture = looks_binary(publish.payload).then(|| {
+        let topic = text(publish.topic, MAX_FIELD_LEN);
+        let mut fields = serde_json::json!({
+            "topic": topic,
+            "qos": publish.qos,
+            "retain": publish.retain,
+            "dup": publish.dup,
+            "capture_reason": CAPTURE_REASON_BINARY_PUBLISH,
+        });
+        if let Some(alias) = publish.properties.topic_alias {
+            fields["topic_alias"] = alias.into();
+        }
+        CaptureRequest {
+            payload_len: publish.payload.len(),
+            orig_name: (!topic.is_empty()).then_some(topic),
+            fields,
+        }
+    });
     Outcome {
         reply,
         events: vec![Observation {
@@ -1013,8 +1057,8 @@ fn on_publish(level: u8, pkt: &Packet) -> Outcome {
             authenticated: false,
             metadata,
         }],
-        close: false,
-        reject: None,
+        capture,
+        ..Outcome::default()
     }
 }
 
@@ -1061,14 +1105,59 @@ fn on_subscribe(level: u8, body: &[u8]) -> Outcome {
             authenticated: false,
             metadata,
         }],
-        close: false,
-        reject: None,
+        ..Outcome::default()
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Socket loop
 // ---------------------------------------------------------------------------------------------
+
+/// Build the hand-off job for a spooled PUBLISH payload. The payload is charged to the
+/// capture-memory budget as it is copied in: a budget that cannot hold all of it leaves a prefix
+/// (`complete` false here, and the hand-off stamps `truncated` / `end_reason` itself), and one that
+/// holds none of it makes `submit` refuse the job. The packet was read whole, so a payload the
+/// budget did not cut is complete.
+fn capture_job(
+    handoff: &CaptureHandoff,
+    request: CaptureRequest,
+    payload: &[u8],
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+) -> CaptureJob {
+    let mut body = handoff.new_capture_body();
+    let complete = body.extend_from_slice(payload).is_ok();
+    let wire_size = payload.len() as u64;
+    let CaptureRequest {
+        orig_name, fields, ..
+    } = request;
+    CaptureJob {
+        body,
+        orig_name: orig_name.unwrap_or_else(|| format!("mqtt-publish-{session_id}")),
+        event_builder: Box::new(move |sample: SampleRef| {
+            let mut metadata = upload_metadata(PROTOCOL_LABEL, &sample, wire_size, complete);
+            if let (Some(map), Some(extra)) = (metadata.as_object_mut(), fields.as_object()) {
+                map.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            SensorEvent {
+                v: WIRE_VERSION,
+                source_ip,
+                wan_ip,
+                sensor: PROTOCOL_LABEL.to_string(),
+                signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
+                protocol: PROTO_TCP.to_string(),
+                // Every CONNECT is accepted, and a PUBLISH is only reachable after one.
+                authenticated: true,
+                observed_at: chrono::Utc::now(),
+                metadata,
+                sample: Some(sample),
+                session_id: Some(session_id),
+                occurrence_id: None,
+            }
+        }),
+    }
+}
 
 pub async fn handle_connection(
     mut stream: TcpStream,
@@ -1077,6 +1166,7 @@ pub async fn handle_connection(
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
+    handoff: Arc<CaptureHandoff>,
 ) {
     let source_ip: IpAddr = normalize_dual_stack(peer_addr).ip();
     let wan_ip = stream
@@ -1140,6 +1230,14 @@ pub async fn handle_connection(
         let outcome = session.on_packet(&packet);
         for obs in outcome.events {
             record(obs).await;
+        }
+        if let Some(request) = outcome.capture {
+            // The payload is the tail of the packet body (see `CaptureRequest`).
+            let start = packet.body.len().saturating_sub(request.payload_len);
+            let payload = packet.body.get(start..).unwrap_or_default();
+            let _ = handoff.submit(capture_job(
+                &handoff, request, payload, source_ip, wan_ip, session_id,
+            ));
         }
         if !was_connected && let Some(reason) = outcome.reject {
             record(malformed_observation(
@@ -2060,6 +2158,63 @@ mod tests {
         assert!(
             out.reply.is_empty(),
             "a PUBLISH never produces a forwarded PUBLISH"
+        );
+    }
+
+    fn publish_outcome(topic: &[u8], payload: &[u8]) -> Outcome {
+        connected().on_packet(&pkt(3, 0x01, [lenp(topic), payload.to_vec()].concat()))
+    }
+
+    #[test]
+    fn binary_publish_requests_a_capture_and_text_does_not() {
+        let mut elf = b"\x7fELF\x02\x01\x01\x00".to_vec();
+        elf.extend_from_slice(&[0u8; 56]);
+        let out = publish_outcome(b"fw/update", &elf);
+        let req = out.capture.expect("an ELF payload is spooled");
+        assert_eq!(req.payload_len, elf.len());
+        assert_eq!(req.orig_name.as_deref(), Some("fw/update"));
+        assert_eq!(req.fields["topic"], "fw/update");
+        assert_eq!(req.fields["qos"], 0);
+        assert_eq!(req.fields["retain"], true);
+        assert_eq!(req.fields["dup"], false);
+        assert_eq!(req.fields["capture_reason"], "binary_publish_payload");
+        assert_eq!(out.events.len(), 1, "the metadata event is still emitted");
+        assert_eq!(out.events[0].signal_type, SIGNAL_HONEYPOT_COMMAND_EXEC);
+
+        for text in [
+            br#"{"cmd":"reboot","delay":5}"#.as_slice(),
+            b"hello\r\nworld\t!",
+            b"",
+        ] {
+            assert!(publish_outcome(b"t", text).capture.is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn capture_gate_flips_at_the_shared_looks_binary_threshold() {
+        // looks_binary is strictly more than 30% non-printable: 3 of 10 is text, 4 of 10 is binary.
+        let at_threshold = [b'a', b'a', b'a', b'a', b'a', b'a', b'a', 0, 0, 0];
+        let over = [b'a', b'a', b'a', b'a', b'a', b'a', 0, 0, 0, 0];
+        assert!(publish_outcome(b"t", &at_threshold).capture.is_none());
+        assert!(publish_outcome(b"t", &over).capture.is_some());
+        // Valid UTF-8 beyond ASCII is non-printable to the gate, exactly as for the shell sensors.
+        assert!(publish_outcome(b"t", "ééééé".as_bytes()).capture.is_some());
+    }
+
+    #[test]
+    fn capture_name_is_the_sanitized_bounded_topic_or_absent() {
+        let bin = [0xFFu8; 8];
+        let long = vec![b'z'; 5000];
+        let out = publish_outcome(&[b"x\r\ny\x1b[2J".as_slice(), &long].concat(), &bin);
+        let name = out.capture.unwrap().orig_name.unwrap();
+        assert!(name.chars().count() <= MAX_FIELD_LEN);
+        assert!(!name.contains('\n') && !name.contains('\x1b'));
+        assert!(
+            publish_outcome(b"", &bin)
+                .capture
+                .unwrap()
+                .orig_name
+                .is_none()
         );
     }
 

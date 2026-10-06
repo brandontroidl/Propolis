@@ -2,8 +2,9 @@
 Description=Propolis MQTT honeypot sensor
 After=network.target
 
-# Metadata-only recon trap for TCP/1883: records CONNECT credentials, SUBSCRIBE topics and PUBLISH
-# metadata, and never delivers, retains or forwards a message. Off until an operator creates
+# Recon trap for TCP/1883: records CONNECT credentials, SUBSCRIBE topics and PUBLISH metadata,
+# spools a PUBLISH payload only when it looks binary, and never delivers, retains or forwards a
+# message. Off until an operator creates
 # /etc/propolis/mqtt.env with PROPOLIS_MQTT_BIND: without it the sensor refuses to start.
 # Port 1883 is unprivileged, so this unit deliberately grants no CAP_NET_BIND_SERVICE; an operator
 # who binds a port below 1024 must add the capability to a drop-in.
@@ -25,10 +26,12 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
-ReadWritePaths=/var/log/propolis/mqtt
+ReadWritePaths=/var/log/propolis/mqtt /var/spool/propolis/mqtt
 
 CapabilityBoundingSet=
 
+# PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES (env file) defaults to 40% of this value. If MemoryMax is
+# changed, set that variable too, or the capture ceiling stays at the 256M-derived default.
 MemoryMax=256M
 TasksMax=128
 CPUQuota=50%

@@ -3,10 +3,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, WanResolver};
+use sensor_framework::capture_budget::CAPTURE_CHUNK_BYTES;
+use sensor_framework::{
+    CaptureHandoff, CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+    WanResolver,
+};
 use sensor_wire::{
     SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
-    SIGNAL_HONEYPOT_SESSION_END, SensorEvent,
+    SIGNAL_HONEYPOT_MALWARE_UPLOAD, SIGNAL_HONEYPOT_SESSION_END, SensorEvent,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -25,32 +29,72 @@ fn test_bounds() -> ConnectionBounds {
 struct TestServer {
     addr: std::net::SocketAddr,
     log_path: PathBuf,
+    spool_dir: PathBuf,
     handle: JoinHandle<()>,
+    handoff: Arc<CaptureHandoff>,
+    budget: Arc<CaptureMemoryBudget>,
     _dir: tempfile::TempDir,
 }
 
 impl TestServer {
     async fn start() -> TestServer {
-        Self::start_with_bounds(test_bounds()).await
+        Self::start_with(test_bounds(), DEFAULT_CAPTURE_BUDGET_BYTES_256M).await
     }
 
     async fn start_with_bounds(bounds: ConnectionBounds) -> TestServer {
+        Self::start_with(bounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M).await
+    }
+
+    async fn start_with_capture_budget(ceiling: u64) -> TestServer {
+        Self::start_with(test_bounds(), ceiling).await
+    }
+
+    async fn start_with(bounds: ConnectionBounds, ceiling: u64) -> TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
+        let spool_dir = dir.path().join("spool");
         let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
-        let (addr, handle) = sensor_mqtt::start_test_server(
+        let budget = Arc::new(CaptureMemoryBudget::new(ceiling));
+        let (addr, handle, handoff) = sensor_mqtt::start_test_server_with_handoff(
             "127.0.0.1:0".parse().unwrap(),
             log_path.clone(),
+            spool_dir.clone(),
             wan_resolver,
             bounds,
+            "test".to_string(),
+            dir.path().join("outbox"),
+            budget.clone(),
         )
         .await
         .unwrap();
         TestServer {
             addr,
             log_path,
+            spool_dir,
             handle,
+            handoff,
+            budget,
             _dir: dir,
+        }
+    }
+
+    async fn uploads(&self) -> Vec<SensorEvent> {
+        self.events()
+            .await
+            .into_iter()
+            .filter(|e| e.signal_type == SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+            .collect()
+    }
+
+    async fn wait_for_budget_current(&self, bytes: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while self.budget.current_bytes() != bytes {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "budget current stayed at {} (wanted {bytes})",
+                self.budget.current_bytes()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -976,6 +1020,196 @@ async fn garbage_and_truncated_streams_do_not_crash_the_listener() {
     }
     let mut probe = Client::connect(srv.addr).await;
     probe.handshake().await;
+    srv.handle.abort();
+}
+
+impl TestServer {
+    /// The hand-off worker stores and fsyncs the body before it appends the event, off the
+    /// connection's response path, so poll with a generous deadline rather than a fixed sleep.
+    async fn wait_for_uploads(&self, n: usize) -> Vec<SensorEvent> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let uploads = self.uploads().await;
+            if uploads.len() >= n {
+                return uploads;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {n} upload event(s), saw {}",
+                uploads.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+fn elf_like(len: usize) -> Vec<u8> {
+    let mut b = b"\x7fELF\x02\x01\x01\x00".to_vec();
+    b.extend((0..len - b.len()).map(|i| (i % 251) as u8 | 0x80));
+    b
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn binary_publish_is_spooled_and_text_publish_is_not() {
+    let srv = TestServer::start().await;
+    let mut client = Client::connect(srv.addr).await;
+    client.handshake().await;
+
+    let text = br#"{"cmd":"status","id":7}"#;
+    let mut t = lenp(b"dev/status");
+    t.extend_from_slice(text);
+    client.send(&packet(0x30, &t)).await;
+
+    let payload = elf_like(4096);
+    let mut b = lenp(b"fw/update");
+    b.extend_from_slice(&[0x12, 0x34]);
+    b.extend_from_slice(&payload);
+    client.send(&packet(0x3B, &b)).await; // qos1, dup, retain
+    assert_eq!(client.read_n(4).await, vec![0x40, 0x02, 0x12, 0x34]);
+
+    let uploads = srv.wait_for_uploads(1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let uploads_after = srv.uploads().await;
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads_after.len(), 1, "the text PUBLISH is never spooled");
+
+    let up = &uploads_after[0];
+    let sample = up
+        .sample
+        .as_ref()
+        .expect("a spooled PUBLISH carries a sample");
+    assert_eq!(sample.sha256, sha256_hex(&payload));
+    assert_eq!(sample.size, payload.len() as u64);
+    assert_eq!(sample.orig_name, "fw/update");
+    let on_disk = tokio::fs::read(srv.spool_dir.join(&sample.sha256))
+        .await
+        .unwrap();
+    assert_eq!(on_disk, payload, "the spooled file is exactly the payload");
+    let m = &up.metadata;
+    assert_eq!(m["protocol_label"], "mqtt");
+    assert_eq!(m["topic"], "fw/update");
+    assert_eq!(m["qos"], 1);
+    assert_eq!(m["retain"], true);
+    assert_eq!(m["dup"], true);
+    assert_eq!(m["capture_reason"], "binary_publish_payload");
+    assert_eq!(m["wire_size"], payload.len());
+    assert_eq!(m["truncated"], false);
+    assert_eq!(m["complete"], true);
+    assert!(up.authenticated);
+    assert_eq!(up.sensor, "mqtt");
+    assert!(up.occurrence_id.is_some());
+
+    // Both PUBLISHes keep their metadata event, and only the spooled one carries a sample.
+    let publishes = srv.wait_for(2, command("PUBLISH")).await;
+    assert_eq!(publishes.len(), 2);
+    assert!(publishes.iter().all(|e| e.sample.is_none()));
+    let text_event = publishes
+        .iter()
+        .find(|e| e.metadata["topic"] == "dev/status")
+        .unwrap();
+    assert_eq!(text_event.metadata["payload_preview_encoding"], "text");
+
+    assert_eq!(srv.budget.current_bytes(), 0, "released after spooling");
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn level5_binary_publish_spools_only_the_payload_after_the_properties_block() {
+    let srv = TestServer::start().await;
+    let mut client = Client::connect(srv.addr).await;
+    client.handshake_v5().await;
+
+    let payload = elf_like(600);
+    let props = [vec![0x23, 0x00, 0x05], prop_pair(b"trace", &[b'x'; 200])].concat();
+    let mut p = lenp(b"cmd/exec");
+    p.extend(block(&props));
+    p.extend_from_slice(&payload);
+    client.send(&packet(0x30, &p)).await;
+
+    let uploads = srv.wait_for_uploads(1).await;
+    let sample = uploads[0].sample.as_ref().unwrap();
+    let on_disk = tokio::fs::read(srv.spool_dir.join(&sample.sha256))
+        .await
+        .unwrap();
+    assert_eq!(on_disk, payload);
+    assert_eq!(uploads[0].metadata["topic_alias"], 5);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn binary_publish_that_exhausts_the_budget_keeps_its_prefix() {
+    let srv = TestServer::start_with_capture_budget(CAPTURE_CHUNK_BYTES).await;
+    let kept = CAPTURE_CHUNK_BYTES as usize;
+    let payload = elf_like(100_000);
+    let mut p = lenp(b"big");
+    p.extend_from_slice(&payload);
+    let mut client = Client::connect(srv.addr).await;
+    client.handshake().await;
+    client.send(&packet(0x30, &p)).await;
+
+    let uploads = srv.wait_for_uploads(1).await;
+    let sample = uploads[0].sample.as_ref().unwrap();
+    assert_eq!(sample.size, kept as u64, "the prefix that fit is retained");
+    assert_eq!(uploads[0].metadata["truncated"], true);
+    assert_eq!(uploads[0].metadata["complete"], false);
+    assert_eq!(uploads[0].metadata["wire_size"], payload.len());
+    assert_eq!(uploads[0].metadata["end_reason"], "capture_memory_budget");
+    let on_disk = tokio::fs::read(srv.spool_dir.join(&sample.sha256))
+        .await
+        .unwrap();
+    assert_eq!(on_disk, payload[..kept]);
+    assert_eq!(srv.handoff.truncated_capture_count(), 1);
+    srv.wait_for_budget_current(0).await;
+    assert!(srv.budget.high_water_bytes() <= CAPTURE_CHUNK_BYTES);
+
+    // The room freed by spooling serves the next payload in full.
+    let small = elf_like(64);
+    let mut s = lenp(b"small");
+    s.extend_from_slice(&small);
+    client.send(&packet(0x30, &s)).await;
+    let uploads = srv.wait_for_uploads(2).await;
+    assert_eq!(uploads[1].sample.as_ref().unwrap().size, 64);
+    assert_eq!(uploads[1].metadata["complete"], true);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn binary_publish_with_no_budget_left_is_refused_but_its_metadata_event_survives() {
+    let srv = TestServer::start_with_capture_budget(CAPTURE_CHUNK_BYTES).await;
+    let holder = srv
+        .budget
+        .try_reserve(CAPTURE_CHUNK_BYTES)
+        .expect("the whole budget is free at start");
+
+    let mut client = Client::connect(srv.addr).await;
+    client.handshake().await;
+    let mut p = lenp(b"starved");
+    p.extend_from_slice(&elf_like(512));
+    client.send(&packet(0x30, &p)).await;
+
+    srv.wait_for(1, command("PUBLISH")).await;
+    assert_eq!(srv.handoff.refused_capture_count(), 1);
+    assert_eq!(srv.handoff.truncated_capture_count(), 0);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        srv.uploads().await.is_empty(),
+        "zero bytes buffered, no sample"
+    );
+
+    drop(holder);
+    let mut ok = lenp(b"later");
+    ok.extend_from_slice(&elf_like(512));
+    client.send(&packet(0x30, &ok)).await;
+    let uploads = srv.wait_for_uploads(1).await;
+    assert_eq!(uploads[0].metadata["topic"], "later");
     srv.handle.abort();
 }
 

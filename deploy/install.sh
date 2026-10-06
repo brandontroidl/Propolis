@@ -99,6 +99,7 @@ cat <<'EOF'
         tmpfs /var/spool/propolis/ftp      tmpfs noexec,nosuid,nodev,size=256M 0 0
         tmpfs /var/spool/propolis/telnet   tmpfs noexec,nosuid,nodev,size=256M 0 0
         tmpfs /var/spool/propolis/tftp     tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/mqtt     tmpfs noexec,nosuid,nodev,size=256M 0 0
         tmpfs /var/spool/propolis/fetched  tmpfs noexec,nosuid,nodev,size=1200M 0 0
         tmpfs /var/lib/propolis/spool      tmpfs noexec,nosuid,nodev,size=256M 0 0
 

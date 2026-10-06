@@ -101,8 +101,8 @@ fn mqtt_unit_has_hardening_directives_and_no_cap_net_bind() {
         "the capability bounding set must be explicitly emptied"
     );
     assert!(
-        unit.contains("ReadWritePaths=/var/log/propolis/mqtt\n"),
-        "metadata-only: the only writable path is the sensor's own log directory"
+        unit.contains("ReadWritePaths=/var/log/propolis/mqtt /var/spool/propolis/mqtt\n"),
+        "the only writable paths are the sensor's own log and binary-payload spool directories"
     );
     assert!(
         unit.contains("EnvironmentFile=/etc/propolis/mqtt.env"),
@@ -610,7 +610,7 @@ fn install_script_var_lib_root_is_root_owned() {
     );
 }
 
-/// The five `CaptureHandoff` body-capturing sensors (ssh/ftp/adb/telnet/tftp) each default their
+/// The six `CaptureHandoff` body-capturing sensors (ssh/ftp/adb/telnet/tftp/mqtt) each default their
 /// outbox manifest directory to `<default spool_dir>/outbox` (see e.g. `sensor-ssh/src/main.rs`'s
 /// `resolve_outbox_dir`). That default must always land inside a path the unit's own
 /// `ReadWritePaths` already grants, or the manifest write silently fails under
@@ -626,6 +626,7 @@ fn body_capturer_default_outbox_is_inside_read_write_paths() {
         ("sensor-adb.service", "/var/spool/propolis/adb"),
         ("sensor-telnet.service", "/var/spool/propolis/telnet"),
         ("sensor-tftp.service", "/var/spool/propolis/tftp"),
+        ("sensor-mqtt.service", "/var/spool/propolis/mqtt"),
     ] {
         let unit = std::fs::read_to_string(format!(
             "{}/../../deploy/{unit_file}",

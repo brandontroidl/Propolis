@@ -139,6 +139,7 @@ ensure_dir /var/spool/propolis/adb       0750 propolis-adb      propolis-adb
 ensure_dir /var/spool/propolis/ftp       0750 propolis-ftp      propolis-ftp
 ensure_dir /var/spool/propolis/telnet     0750 propolis-telnet   propolis-telnet
 ensure_dir /var/spool/propolis/tftp       0750 propolis-tftp     propolis-tftp
+ensure_dir /var/spool/propolis/mqtt       0750 propolis-mqtt     propolis-mqtt
 # propolis-owned, not a dedicated sensor user: unlike catchall/ssh/adb/ftp/telnet above (each
 # written by its own standalone sensor process), the malware fetcher runs inside propolis.service
 # itself - see deploy/propolis.service's own ReadWritePaths grant for this exact path.

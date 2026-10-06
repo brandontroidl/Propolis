@@ -4,6 +4,15 @@
 
 ### Added
 
+- **MQTT binary PUBLISH payloads are now spooled** - `sensor-mqtt` still records every PUBLISH as
+  metadata, and now also hands a payload that passes the shared `looks_binary` gate to the framework
+  capture hand-off, emitting a `honeypot_malware_upload` event (`capture_reason`
+  `binary_publish_payload`). Text payloads stay metadata-only. New `PROPOLIS_MQTT_SPOOL_DIR`
+  (default `/var/spool/propolis/mqtt`), `PROPOLIS_MQTT_OUTBOX_DIR` and
+  `PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES` variables; the unit grants the spool in `ReadWritePaths`,
+  `provision.sh` creates it, and the review spool walk (`BODY_SPOOLERS`) now includes `mqtt`.
+  Operators with an existing install should back `/var/spool/propolis/mqtt` with a
+  noexec,nosuid,nodev mount like the other spools.
 - **MQTT honeypot sensor (`sensor-mqtt`, default-off)** - a metadata-only recon trap for
   TCP/1883 that records MQTT 3.1/3.1.1 CONNECT credentials (never the password), SUBSCRIBE
   topics and PUBLISH topic and payload metadata (length, a bounded preview, a SHA-256), and

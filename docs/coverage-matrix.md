@@ -30,7 +30,7 @@ liveness alert). Every component, stage, invariant, and procedure has a canonica
 owner. The `partial` rows carry a documented caveat, noted in the last
 column.
 
-## Component crates (25 crates / 18 binaries)
+## Component crates (26 crates / 19 binaries)
 
 Inventory and dependency graph owned by
 [architecture/components.md](architecture/components.md). Per-crate behavior lives in
@@ -51,7 +51,8 @@ the architecture and reference pages below.
 | `sensor-ftp` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | Capture hand-off + quarantine spool for uploads; PASV data-peer validation. |
 | `sensor-smtp` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | Per-connection SMTP honeypot handler. |
 | `sensor-tftp` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md) | documented | The one UDP sensor that replies: reads get one fixed tiny error, writes are acknowledged and captured; bytes sent never exceed bytes received. Default-off. |
-| `sensor-cred` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md) | documented | One binary, 5 protocols (VNC/MySQL/MSSQL/PostgreSQL/MongoDB) = the "10 crates / 13 protocols" count. |
+| `sensor-mqtt` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md) | documented | Metadata-only MQTT 3.1/3.1.1 recon trap (TCP/1883): records CONNECT credentials (never the password), SUBSCRIBE topics and PUBLISH metadata; never delivers, retains or forwards a message. MQTT 5.0 is captured at CONNECT then declined. Default-off. |
+| `sensor-cred` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md) | documented | One binary, 5 protocols (VNC/MySQL/MSSQL/PostgreSQL/MongoDB) = the "11 crates / 14 protocols" count. |
 | `intake` | [event-and-sample-lifecycle.md](architecture/event-and-sample-lifecycle.md), [architecture/pipeline.md](architecture/pipeline.md) | partial | Tailer + wire→domain conversion documented; intake's own INSERT path not traced line-by-line in evidence (no-`format!`-SQL grep covers it). |
 | `review` | [architecture/pipeline.md](architecture/pipeline.md), [reference/integrations.md](reference/integrations.md), [security/malware-custody.md](security/malware-custody.md) | documented | Review queue, gatekeeper, vendor adapters, VT scanner, fetcher, operator CLI. |
 | `feed` | [architecture/pipeline.md](architecture/pipeline.md), [reference/scoring-and-feed.md](reference/scoring-and-feed.md) | documented | Snapshot→export→atomic publish; 10 formats per tier/window; checksummed manifest. |
@@ -99,7 +100,7 @@ narrative owner. Reference values (ports, routes, constants) are owned by the
 
 | Invariant | Doc page(s) | Coverage | Note |
 |---|---|---|---|
-| 1. Never-execute (no spawn/exec) | [security/never-execute.md](security/never-execute.md) | documented | Whole-workspace grep clean; 8 per-sensor static-check tests; W^X at deploy. The one flagged item (`sensor-catchall` lacks a `never_exec_static_check` regression test) is documented in never-execute.md. |
+| 1. Never-execute (no spawn/exec) | [security/never-execute.md](security/never-execute.md) | documented | Whole-workspace grep clean; 10 per-sensor static-check tests; W^X at deploy. The one flagged item (`sensor-catchall` lacks a `never_exec_static_check` regression test) is documented in never-execute.md. |
 | 2. Sensors egress-free by construction | [security/outbound-controls.md](security/outbound-controls.md), [security/supply-chain.md](security/supply-chain.md) | documented | Scoped to sensor crates (GLOBAL CORRECTION 1); the workspace is NOT egress-free - stated plainly. |
 | 3. Five gated outbound paths (all default OFF) | [security/outbound-controls.md](security/outbound-controls.md), [reference/environment-variables.md](reference/environment-variables.md) | documented | VT, vendor submitters, console rDNS, GeoLite2 (local, not network), ops-alert ntfy; each opt-in, several fail-closed. |
 | 4. Fetcher SSRF guard | [security/malware-custody.md](security/malware-custody.md), [security/input-handling.md](security/input-handling.md) | documented | Scheme allowlist, userinfo reject, DNS-rebinding defense, address pinning, forbidden-target check, tftp port lock. |

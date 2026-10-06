@@ -15,7 +15,7 @@ lifecycle mechanics only; exact env vars, ports, and paths are owned by the
 
 ## Production surface
 
-Production runs **one unified daemon plus ten sensor binaries**, all as systemd units
+Production runs **one unified daemon plus eleven sensor binaries**, all as systemd units
 installed by `deploy/install.sh`:
 
 - `propolis.service` runs `/usr/local/bin/propolis`, a single process holding the
@@ -23,7 +23,7 @@ installed by `deploy/install.sh`:
   PostgreSQL pool (`deploy/propolis.service#Description=Propolis unified daemon`,
   `deploy/propolis.service#ExecStart=/usr/local/bin/propolis`,
   `crates/propolis/src/main.rs`).
-- `sensor-<name>.service` for `catchall, ssh, telnet, redis, adb, http, ftp, smtp, tftp, cred`,
+- `sensor-<name>.service` for `catchall, ssh, telnet, redis, adb, http, ftp, smtp, tftp, mqtt, cred`,
   each running its own binary as its own system user, created by `deploy/install.sh`'s
   delegation to `deploy/provision.sh` (`deploy/provision.sh#ensure_user`,
   `deploy/sensor-ssh.service#User=propolis-ssh`).
@@ -49,12 +49,14 @@ Once every service has its `/etc/propolis/*.env`:
 # Example - enable and start every unit
 sudo systemctl enable --now propolis.service
 sudo systemctl enable --now sensor-catchall sensor-ssh sensor-telnet sensor-redis \
-  sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-cred
+  sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-cred
 ```
 
-`sensor-tftp` is the one sensor that is safe to leave out of that command: it is off until
-`/etc/propolis/tftp.env` sets `PROPOLIS_TFTP_BIND`, and without a bind it exits instead of
-listening. Enable it only on a host where inbound UDP/69 is meant to be open.
+`sensor-tftp` and `sensor-mqtt` are the sensors that are safe to leave out of that command:
+each is off until its env file (`/etc/propolis/tftp.env`, `/etc/propolis/mqtt.env`) sets
+`PROPOLIS_TFTP_BIND` or `PROPOLIS_MQTT_BIND`, and without a bind it exits instead of
+listening. Enable `sensor-tftp` only on a host where inbound UDP/69 is meant to be open, and
+`sensor-mqtt` only where inbound TCP/1883 is.
 
 `enable --now` both starts the unit and sets it to start at boot. Source:
 `docs/archive/2026-08-26/root/INSTALL.md#6. Start services` (the live `INSTALL.md` is now a redirect

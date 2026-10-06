@@ -13,7 +13,7 @@ Per-protocol capture behavior for the Propolis sensor layer: what each sensor
 impersonates, what it captures, which events it emits, and the shared framework
 knobs that bound every capture.
 
-There are **10 sensor crates covering 13 protocols** (the `cred` sensor serves
+There are **11 sensor crates covering 14 protocols** (the `cred` sensor serves
 VNC, MySQL, MSSQL, PostgreSQL, and MongoDB from one binary).
 
 **Canonical owners referenced here.** This page owns *capture behavior*. It does
@@ -565,6 +565,52 @@ nothing (`crates/sensor-tftp/src/main.rs#load_config_from`).
   transfer. `wan_ip` resolves against the bind address, so a wildcard bind has the same
   attribution limit as the catch-all's UDP path.
 
+### sensor-mqtt
+
+A metadata-only MQTT honeypot on TCP, conventional port 1883. It is **off until an
+operator sets `PROPOLIS_MQTT_BIND`**: with no bind it logs the error, exits 1 and binds
+nothing (`crates/sensor-mqtt/src/main.rs#load_config_from_env`). It speaks MQTT 3.1
+(`MQIsdp` level 3) and 3.1.1 (`MQTT` level 4), accepts any credential, and serves
+nothing: no message is ever delivered to a subscriber, retained, or forwarded, no
+outbound socket is opened, and nothing is executed or spooled.
+
+- **Packets answered.** CONNECT (CONNACK accept `20 02 00 00`), SUBSCRIBE (SUBACK granting
+  `min(requested, 1)` per filter, `0x80` for an invalid filter), UNSUBSCRIBE (UNSUBACK),
+  PUBLISH (QoS 0 silent, QoS 1 PUBACK, QoS 2 PUBREC then PUBCOMP on PUBREL), PINGREQ
+  (PINGRESP). DISCONNECT closes. Every other type, a reserved fixed-header flag violation
+  (SUBSCRIBE/UNSUBSCRIBE/PUBREL need `0b0010`, the rest `0`), a second CONNECT, any packet
+  before CONNECT, and AUTH close the connection without a reply
+  (`crates/sensor-mqtt/src/handler.rs#Session`).
+- **CONNECT.** The protocol name and level must pair as `MQIsdp`/3 or `MQTT`/4 or `MQTT`/5;
+  any other pair, the reserved connect-flag bit, a will-QoS or will-retain without a will,
+  will-QoS 3, or (before 5.0) a password flag without a username flag is malformed and closes
+  the connection with no event. The password is read only to reach the end of the payload and
+  is dropped; it never reaches an event or the log
+  (`crates/sensor-mqtt/src/handler.rs#parse_connect`).
+- **MQTT 5.0 is a known first-cut limitation.** A level-5 CONNECT is parsed (property blocks
+  are skipped without being interpreted), logged as a login attempt, then declined with
+  CONNACK reason `0x84` (unsupported protocol version) and closed. A 5.0 session is captured
+  at CONNECT and goes no further.
+- **Parser bounds.** The remaining-length varint is at most four bytes (a fifth continuation
+  byte closes the connection). A packet declaring more than `MAX_PACKET_BYTES` = 262144 bytes
+  is refused on the declaration alone, before any body is read
+  (`crates/sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`). The body is read through a limit of
+  the declared length, so memory grows with bytes actually received, never with what is
+  merely declared. A connection ends after `MAX_PACKETS` = 1024 packets
+  (`crates/sensor-mqtt/src/handler.rs#MAX_PACKETS`), at `max_captured_bytes` total bytes read,
+  on the first-byte `read_timeout` and per-read `idle_timeout`, or at `max_duration`.
+- **Emits:** `honeypot_connection` at accept; `honeypot_login_attempt`
+  (`authenticated=true`; `client_id`, `username` (empty when anonymous), `protocol_level`,
+  `keepalive`, `clean_session`, and `will_topic` and `will_payload_len` when a will is set;
+  never the password); `honeypot_command_exec` with `command` `SUBSCRIBE` (`topics` and `qos`
+  for the first 32 filters, `topic_count` for all) or `PUBLISH` (`topic`, `qos`, `retain`,
+  `dup`, `payload_len`, a `payload_preview` of at most 256 bytes as sanitized text or as hex
+  when the prefix has non-UTF-8 or control bytes (`payload_preview_encoding` says which), and
+  `payload_sha256` over the whole payload). Every attacker string is lossy-decoded, passed
+  through `sanitize_value` and capped at 255 characters; no event carries a sample.
+- **Bounds:** common defaults, `max_concurrent` 256, per-source admission cap. Strict
+  parsing: a zero or unparseable bound aborts startup. No spool.
+
 ### sensor-redis
 
 Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
@@ -733,7 +779,7 @@ per-protocol bind var is required.
 - **Password discipline:** every login-capturing sensor reads the password only to
   advance the protocol and drops it - never stored, logged, or placed in any event
   field (SSH `crates/sensor-ssh/src/auth.rs`, telnet `crates/sensor-telnet/src/handler.rs#handle_connection`, FTP `crates/sensor-ftp/src/handler.rs#handle_connection`, redis
-  `crates/sensor-redis/src/handler.rs#Session::handle_auth`, SMTP `crates/sensor-smtp/src/handler.rs#handle_connection`, cred handlers). Tests assert absence at
+  `crates/sensor-redis/src/handler.rs#Session::handle_auth`, SMTP `crates/sensor-smtp/src/handler.rs#handle_connection`, MQTT `crates/sensor-mqtt/src/handler.rs#parse_connect`, cred handlers). Tests assert absence at
   the serialized-JSON level.
 - **`authenticated` flag:** `honeypot_connection` and `catchall_probe` are always
   false; ADB and TFTP events are always false (no auth step); `honeypot_login_attempt` is
@@ -741,7 +787,8 @@ per-protocol bind var is required.
   ssh/telnet true post-login).
 - **Never-serve-outbound:** FTP RETR→550, FTP PORT/EPRT→502, ADB sync RECV→FAIL,
   SSH `direct-tcpip` refused, catchall/UDP never responds, TFTP RRQ gets one tiny
-  error and never any file content, shell `wget`/`curl`
+  error and never any file content, an MQTT PUBLISH is recorded but never delivered,
+  retained or forwarded, shell `wget`/`curl`
   canned - no sensor fetches or serves attacker-directed content.
 
 ## Notes

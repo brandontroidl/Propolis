@@ -88,6 +88,21 @@ fn the_generated_inventory_parses_and_names_each_sensor_as_it_reports_itself() {
 }
 
 #[test]
+fn an_mqtt_bind_yields_one_tcp_listener_named_mqtt() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "mqtt.env",
+        "PROPOLIS_MQTT_BIND=203.0.113.7:1883\n",
+    );
+
+    let value = generate(dir.path()).unwrap();
+    let parsed = parse_listeners(&value).unwrap();
+
+    assert_eq!(parsed, vec![listener("mqtt", Proto::Tcp, 1883)]);
+}
+
+#[test]
 fn a_catchall_bind_list_yields_both_transports_for_every_port() {
     let dir = tempfile::tempdir().unwrap();
     write(

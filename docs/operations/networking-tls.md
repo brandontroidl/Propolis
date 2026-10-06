@@ -18,7 +18,7 @@ page explains exposure and operator responsibilities.
 
 | Class | Components | Default binding |
 |---|---|---|
-| Attacker-facing | the ten sensors (ssh, telnet, http, ftp, smtp, tftp, redis, adb, catchall, cred) | operator-chosen `ip:port` per sensor - **no code default** |
+| Attacker-facing | the eleven sensors (ssh, telnet, http, ftp, smtp, tftp, mqtt, redis, adb, catchall, cred) | operator-chosen `ip:port` per sensor - **no code default** |
 | Operator-facing | console web UI (and `/health`, `/ready`, `/metrics` on the same port) | `127.0.0.1:8080` (loopback) |
 | No listener | `intake`, `review`, `feed`, and the unified daemon's fetcher | none (DB clients / outbound-only) |
 

@@ -1,0 +1,22 @@
+[package]
+name = "sensor-mqtt"
+version = "0.4.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "sensor-mqtt"
+path = "src/main.rs"
+
+[dependencies]
+sensor-wire = { path = "../sensor-wire" }
+sensor-framework = { path = "../sensor-framework" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
+serde_json = "1.0.151"
+chrono = { version = "0.4.45", features = ["serde"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+sha2 = "0.11.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

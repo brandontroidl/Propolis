@@ -32,7 +32,7 @@ kinds of artifact:
 3. **Scores** - a per-IP projection derived from the events: a time-decayed
    score, a confirmed-real latch, feed tier, and recommendation flags.
 
-The capture surface is ten sensor crates over thirteen protocols; the full
+The capture surface is eleven sensor crates over fourteen protocols; the full
 inventory is [`overview/capabilities`](../overview/capabilities.md), and per-
 protocol capture behavior is
 [`reference/sensor-behavior`](../reference/sensor-behavior.md).

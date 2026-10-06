@@ -21,7 +21,7 @@ Propolis is source-available and actively developed, with one tagged release
 ## Mental model
 
 One unified daemon (`propolis.service`) holds intake, review, feed, and console as
-concurrent tasks over one PostgreSQL pool; ten sensor binaries run as separate,
+concurrent tasks over one PostgreSQL pool; eleven sensor binaries run as separate,
 unprivileged units and append NDJSON logs the daemon tails. PostgreSQL is the single
 datastore. See [process topology](../architecture/process-topology.md) and
 [storage](../architecture/storage.md).

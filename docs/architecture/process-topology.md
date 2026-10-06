@@ -23,8 +23,8 @@ values named below are repeated only where they clarify the process model.
 
 ## Sensors - one OS process each
 
-Each sensor binary runs as its own systemd service (ten units:
-`deploy/sensor-{catchall,ssh,telnet,redis,adb,http,ftp,smtp,tftp,cred}.service`). Isolating
+Each sensor binary runs as its own systemd service (eleven units:
+`deploy/sensor-{catchall,ssh,telnet,redis,adb,http,ftp,smtp,tftp,mqtt,cred}.service`). Isolating
 sensors as separate processes keeps a sensor crash or compromise off the data plane.
 
 Each unit runs `ExecStart=/usr/local/bin/sensor-<x>` with
@@ -50,7 +50,7 @@ an actual process failure.
 This one unit **supersedes** the development-only `deploy/intake.service`,
 `review.service`, `feed.service`, and `console.service`. In production, one `propolis`
 process runs all four subsystems as concurrent tokio tasks over a single shared
-`PgPool`; `install.sh` installs exactly `propolis.service` plus the ten sensor units
+`PgPool`; `install.sh` installs exactly `propolis.service` plus the eleven sensor units
 and does not install the four standalone data-plane units.
 
 Source: `deploy/propolis.service` header and directives; `deploy/install.sh` unit list.

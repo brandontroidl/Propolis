@@ -29,6 +29,7 @@ sensor appends newline-delimited JSON events.
 | ftp | `PROPOLIS_FTP_LOG_PATH` | `/var/log/propolis/ftp/events.jsonl` (`sensor-ftp/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/ftp` (`deploy/provision.sh#ensure_dir /var/log/propolis/ftp`) |
 | smtp | `PROPOLIS_SMTP_LOG_PATH` | `/var/log/propolis/smtp/events.jsonl` (`sensor-smtp/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/smtp` (`deploy/provision.sh#ensure_dir /var/log/propolis/smtp`) |
 | tftp | `PROPOLIS_TFTP_LOG_PATH` | `/var/log/propolis/tftp/events.jsonl` (`sensor-tftp/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/tftp` (`deploy/provision.sh#ensure_dir /var/log/propolis/tftp`) |
+| mqtt | `PROPOLIS_MQTT_LOG_PATH` | `/var/log/propolis/mqtt/events.jsonl` (`sensor-mqtt/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/mqtt` (`deploy/provision.sh#ensure_dir /var/log/propolis/mqtt`) |
 | redis | `PROPOLIS_REDIS_LOG_PATH` | `/var/log/propolis/redis/events.jsonl` (`sensor-redis/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/redis` (`deploy/provision.sh#ensure_dir /var/log/propolis/redis`) |
 | adb | `PROPOLIS_ADB_LOG_PATH` | `/var/log/propolis/adb/events.jsonl` (`sensor-adb/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/adb` (`deploy/provision.sh#ensure_dir /var/log/propolis/adb`) |
 | catchall | `PROPOLIS_CATCHALL_LOG_PATH` | **`catchall-events.jsonl`** (relative, not absolute) (`sensor-catchall/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/catchall` (`deploy/provision.sh#ensure_dir /var/log/propolis/catchall`) |
@@ -65,7 +66,7 @@ event logs.
 
 - The fetcher output dir has a global byte budget of 1_000_000_000 bytes
   (`FETCH_SPOOL_GLOBAL_BUDGET`, `crates/propolis/src/main.rs#FETCH_SPOOL_GLOBAL_BUDGET`).
-- **smtp, redis, http, cred** have **no** spool dir (no `*_SPOOL_DIR` env);
+- **smtp, redis, http, mqtt, cred** have **no** spool dir (no `*_SPOOL_DIR` env);
   they capture inline only. Telnet spools only when the shell phase sees a
   binary payload (a Mirai/Gafgyt dropper), never the login/password phase.
 

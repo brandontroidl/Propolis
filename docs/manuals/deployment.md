@@ -31,7 +31,7 @@ sequence and the gates, not a re-listing.
 ## 0. Choose the deployment model
 
 Single node is the primary, documented model: one host runs the unified daemon
-plus the ten sensor processes, each its own systemd unit and OS user. A
+plus the eleven sensor processes, each its own systemd unit and OS user. A
 multi-node cluster sharing one PostgreSQL is an advanced, less-travelled path:
 the fetcher and vendor submission coordinate through the database, but feed
 publication across nodes is unverified and you must validate it yourself.

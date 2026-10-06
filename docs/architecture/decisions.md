@@ -80,7 +80,7 @@ static-check tests walk each crate's source tree and fail if a process-spawn con
 ever appears. Captured samples are written no-execute (`0640`, on a `noexec` mount) and
 are never run at any point - custody is store → hash → verify → human-approve → report.
 
-**Code evidence:** the eight `never_exec_static_check` tests (one gap: `sensor-catchall`
+**Code evidence:** the ten `never_exec_static_check` tests (one gap: `sensor-catchall`
 lacks its own regression test but is clean under the workspace grep);
 `MemoryDenyWriteExecute=yes` on every unit; the spool permissions and mount requirement.
 See [security/never-execute.md](../security/never-execute.md) and

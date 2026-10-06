@@ -76,6 +76,46 @@ fn tftp_unit_has_hardening_directives_and_cap_net_bind() {
     );
 }
 
+/// The MQTT sensor listens on 1883, an unprivileged port, so unlike the other sensor units it must
+/// carry no `CAP_NET_BIND_SERVICE` grant (least privilege), and stay off by default: the unit
+/// carries no compiled-in bind, so an installed-but-unconfigured unit has nothing to listen on.
+/// It is metadata-only, so it also has no spool path in `ReadWritePaths`.
+#[test]
+fn mqtt_unit_has_hardening_directives_and_no_cap_net_bind() {
+    let unit = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/sensor-mqtt.service"
+    ))
+    .unwrap();
+    assert_unit_hardened(&unit, "sensor-mqtt");
+    assert!(
+        !unit.contains("CAP_NET_BIND_SERVICE")
+            || unit
+                .lines()
+                .filter(|l| l.contains("CAP_NET_BIND_SERVICE"))
+                .all(|l| l.trim_start().starts_with('#')),
+        "port 1883 is unprivileged: the unit must not grant CAP_NET_BIND_SERVICE"
+    );
+    assert!(
+        unit.contains("CapabilityBoundingSet=\n"),
+        "the capability bounding set must be explicitly emptied"
+    );
+    assert!(
+        unit.contains("ReadWritePaths=/var/log/propolis/mqtt\n"),
+        "metadata-only: the only writable path is the sensor's own log directory"
+    );
+    assert!(
+        unit.contains("EnvironmentFile=/etc/propolis/mqtt.env"),
+        "the unit must read its bind from the operator's mqtt.env, with no inline default"
+    );
+    assert!(
+        !unit
+            .lines()
+            .any(|l| l.contains("PROPOLIS_MQTT_BIND") && !l.trim_start().starts_with('#')),
+        "the unit must not hardcode a bind address"
+    );
+}
+
 /// The three layers `internal/design/02-sensor-framework.md`'s "Isolation and deployment"
 /// requires of every sensor unit: least authority, resource caps, and containment. Shared by
 /// both units below so the two can never drift into checking different bars.
@@ -446,6 +486,10 @@ fn logrotate_config_covers_both_sensor_logs() {
     assert!(
         config.contains("/var/log/propolis/tftp/events.jsonl"),
         "must rotate the TFTP honeypot's log"
+    );
+    assert!(
+        config.contains("/var/log/propolis/mqtt/events.jsonl"),
+        "must rotate the MQTT honeypot's log"
     );
 }
 

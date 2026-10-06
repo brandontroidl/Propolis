@@ -87,7 +87,7 @@ fetch" guarantee and should be present in a new sensor's `tests/`:
   patterns (`std::process::Command`, `process::Command`, `Command::new`,
   `libc::exec`, `nix::unistd::exec`) and fails if any appear (e.g.
   `crates/sensor-http/tests/integration.rs#never_exec_static_check`). Present across the protocol
-  sensors (ftp, telnet, redis, adb, http, smtp, tftp, cred, ssh).
+  sensors (ftp, telnet, redis, adb, http, smtp, tftp, mqtt, cred, ssh).
 - **No HTTP-client dependency** - `crates/sensor-ssh/tests/shell_test.rs#sensor_ssh_has_no_http_client_dependency`
   (`sensor_ssh_has_no_http_client_dependency`) asserts the crate manifest declares
   none of `reqwest`, `hyper`, `ureq`, `curl`, `isahc`, `surf`, `attohttpc`. This

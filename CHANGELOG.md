@@ -4,6 +4,16 @@
 
 ### Added
 
+- **MQTT honeypot sensor (`sensor-mqtt`, default-off)** - a metadata-only recon trap for
+  TCP/1883 that records MQTT 3.1/3.1.1 CONNECT credentials (never the password), SUBSCRIBE
+  topics and PUBLISH topic and payload metadata (length, a bounded preview, a SHA-256), and
+  answers just enough of the protocol that a client carries on. It never delivers, retains or
+  forwards a message, opens no outbound connection, executes nothing and spools no body. The
+  parser caps a packet at 256 KiB of declared length, a connection at 1024 packets and the
+  configured byte budget, and refuses a malformed or oversize packet by closing the connection.
+  An MQTT 5.0 CONNECT is logged and then declined with CONNACK reason 0x84. The sensor is off
+  until `PROPOLIS_MQTT_BIND` is set, and its unit grants no `CAP_NET_BIND_SERVICE` (1883 is
+  unprivileged).
 - **Fake shell: a real grammar and faithful command modeling** - the shell the SSH, Telnet and ADB
   sensors present now lexes, parses and evaluates a shell-command subset (quotes, expansions,
   arithmetic, real pipelines, `&&`/`||`, subshells and `if`/`for`/`while`) instead of matching whole

@@ -44,7 +44,7 @@ default the binaries carry.
 
 ## Attacker-facing listeners (honeypot)
 
-Ten sensor crates cover thirteen protocols (the `cred` sensor serves five). All
+Eleven sensor crates cover fourteen protocols (the `cred` sensor serves five). All
 are internet-exposed honeypot listeners with an operator-chosen `ip:port` and no
 default. Every one is TCP except `sensor-tftp` (UDP only) and the UDP half of
 `sensor-catchall`.
@@ -57,6 +57,7 @@ default. Every one is TCP except `sensor-tftp` (UDP only) and the UDP half of
 | sensor-ftp | `PROPOLIS_FTP_BIND` (single) | FTP | 21 | Also opens passive-mode data ports at runtime (see below). `crates/sensor-ftp/src/main.rs#load_config_from_env` |
 | sensor-smtp | `PROPOLIS_SMTP_BIND` (single) | SMTP | 25 | Missing => error + exit (`crates/sensor-smtp/src/main.rs#main`) |
 | sensor-tftp | `PROPOLIS_TFTP_BIND` (single, UDP) | TFTP | 69/udp | Off until set: missing or invalid => error + exit 1, nothing bound (`crates/sensor-tftp/src/main.rs#load_config_from`). The one sensor that replies over UDP, bounded so bytes sent never exceed bytes received. Each transfer answers from its own ephemeral UDP port on the bind IP, so a host firewall must allow replies from, and a client may send to, ports other than 69. Unit grants `CAP_NET_BIND_SERVICE`. |
+| sensor-mqtt | `PROPOLIS_MQTT_BIND` (single) | MQTT | 1883 | Off until set: missing or invalid => error + exit 1, nothing bound (`crates/sensor-mqtt/src/main.rs#load_config_from_env`). Metadata-only: it never delivers, retains or forwards a PUBLISH, and spools no body. Port 1883 is unprivileged, so the unit grants no `CAP_NET_BIND_SERVICE` (it carries an empty `CapabilityBoundingSet`). MQTT 5.0 clients are captured at CONNECT then declined. |
 | sensor-redis | `PROPOLIS_REDIS_BIND` (single) | Redis | 6379 | `crates/sensor-redis/src/main.rs#load_config_from_env` |
 | sensor-adb | `PROPOLIS_ADB_BIND` (single) | ADB | 5555 | `crates/sensor-adb/src/main.rs#load_config_from_env` |
 | sensor-catchall | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list) | TCP + UDP, any port | (multi) | Both TCP and UDP attempted per address. Empty => `ConfigError::NoBindAddrs`, exit. Per-port bind failure is **non-fatal** (logged + skipped, sensor stays up). Unit grants `CAP_NET_BIND_SERVICE`. `crates/sensor-catchall/src/main.rs#parse_bind_addrs`, `crates/sensor-catchall/src/main.rs#main` |
@@ -94,7 +95,7 @@ Each attacker-facing sensor also reads a `*_WAN_MAP` env var (comma-separated
 Not a listener. See [environment-variables.md](environment-variables.md) for the
 exact per-sensor names (`PROPOLIS_SSH_WAN_MAP`, `PROPOLIS_TELNET_WAN_MAP`,
 `PROPOLIS_HTTP_WAN_MAP`, `PROPOLIS_FTP_WAN_MAP`, `PROPOLIS_SMTP_WAN_MAP`, `PROPOLIS_TFTP_WAN_MAP`,
-`PROPOLIS_REDIS_WAN_MAP`, `PROPOLIS_ADB_WAN_MAP`, `PROPOLIS_CATCHALL_WAN_MAP`,
+`PROPOLIS_MQTT_WAN_MAP`, `PROPOLIS_REDIS_WAN_MAP`, `PROPOLIS_ADB_WAN_MAP`, `PROPOLIS_CATCHALL_WAN_MAP`,
 `PROPOLIS_CRED_WAN_MAP`).
 
 `sensor-wire` is a decoder/library crate with no network listener [inferred: no
@@ -172,6 +173,7 @@ are **not** compiled-in defaults - each is set by the operator in
 | 69 (UDP) | attacker | TFTP (transfers continue on ephemeral UDP ports) | `PROPOLIS_TFTP_BIND` |
 | 80 | attacker | HTTP | `PROPOLIS_HTTP_BIND` |
 | 1433 | attacker | MSSQL (cred) | `PROPOLIS_CRED_MSSQL_BIND` |
+| 1883 | attacker | MQTT | `PROPOLIS_MQTT_BIND` |
 | 3306 | attacker | MySQL (cred) | `PROPOLIS_CRED_MYSQL_BIND` |
 | 5432 | attacker | PostgreSQL (cred) | `PROPOLIS_CRED_PG_BIND` |
 | 5555 | attacker | ADB | `PROPOLIS_ADB_BIND` |

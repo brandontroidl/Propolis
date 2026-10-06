@@ -1027,6 +1027,7 @@ fn service_label(sensor: &str) -> String {
         "ftp" => "FTP (21)",
         "smtp" => "SMTP (25)",
         "tftp" => "TFTP (69/udp)",
+        "mqtt" => "MQTT (1883)",
         "redis" => "Redis (6379)",
         "adb" => "ADB (5555)",
         "cred-vnc" => "VNC (5900)",
@@ -1299,6 +1300,7 @@ mod tests {
         assert_eq!(service_label("cred-vnc"), "VNC (5900)");
         assert_eq!(service_label("ssh"), "SSH (22)");
         assert_eq!(service_label("tftp"), "TFTP (69/udp)");
+        assert_eq!(service_label("mqtt"), "MQTT (1883)");
         assert_eq!(service_label("catchall"), "Catch-all (port scan)");
         // An unknown/renamed sensor is never dropped - it shows its raw name.
         assert_eq!(service_label("some-future-sensor"), "some-future-sensor");

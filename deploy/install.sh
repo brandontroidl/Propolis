@@ -9,7 +9,7 @@
 #
 #   - deploy/propolis.service                        (the unified daemon)
 #   - deploy/sensor-catchall.service, deploy/sensor-ssh.service   (unchanged from sub-project 2)
-#   - deploy/sensor-{telnet,redis,adb,http,ftp,smtp,tftp,cred}.service (sub-project 8 sensors)
+#   - deploy/sensor-{telnet,redis,adb,http,ftp,smtp,tftp,mqtt,cred}.service (sub-project 8 sensors)
 #
 # deploy/intake.service, deploy/review.service, deploy/feed.service, and deploy/console.service are
 # deliberately NOT installed here - internal/design/07-runtime-coordination-deployment.md's "What
@@ -118,7 +118,7 @@ EOF
 # ---- 4. binaries ----
 
 log "4/9 installing binaries to /usr/local/bin"
-for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-cred; do
+for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-cred; do
     src="$BUILD_DIR/$bin"
     dst="/usr/local/bin/$bin"
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -135,7 +135,7 @@ done
 # ---- 5. systemd units ----
 
 log "5/9 installing systemd units"
-for unit in propolis.service sensor-catchall.service sensor-ssh.service sensor-telnet.service sensor-redis.service sensor-adb.service sensor-http.service sensor-ftp.service sensor-smtp.service sensor-tftp.service sensor-cred.service; do
+for unit in propolis.service sensor-catchall.service sensor-ssh.service sensor-telnet.service sensor-redis.service sensor-adb.service sensor-http.service sensor-ftp.service sensor-smtp.service sensor-tftp.service sensor-mqtt.service sensor-cred.service; do
     run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
 

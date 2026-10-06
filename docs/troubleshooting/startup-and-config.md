@@ -54,7 +54,7 @@ Values and the full required/optional matrix:
 Two parse idioms exist and they are **not uniform**:
 
 - **Strict** (unified daemon, `intake`, `review`, `feed`, `console`, and sensors
-  `ssh`/`telnet`/`http`/`ftp`/`tftp`/`redis`/`adb`/`catchall`): a present-but-invalid or
+  `ssh`/`telnet`/`http`/`ftp`/`tftp`/`mqtt`/`redis`/`adb`/`catchall`): a present-but-invalid or
   present-but-zero numeric bound **aborts startup**. Zero is rejected on most
   bounds because "zero never means unlimited"
   (`parse_positive_u64`, `crates/propolis/src/config.rs#parse_positive_u64`). A few bounds allow 0 with a defined

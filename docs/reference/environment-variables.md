@@ -46,7 +46,7 @@ Which run mode a given deployment uses is an operator choice; both sets of
 Two fail-closed idioms recur; they are **not** uniform:
 
 - **Strict parse** - `propolis`, `intake`, `review`, `feed`, `console`, and
-  sensors `ssh`/`telnet`/`http`/`ftp`/`redis`/`adb`/`catchall`/`tftp`: a
+  sensors `ssh`/`telnet`/`http`/`ftp`/`redis`/`adb`/`catchall`/`tftp`/`mqtt`: a
   present-but-invalid or present-but-zero numeric bound **aborts startup**.
 - **Lenient parse** - sensors `cred` and `smtp` **only**: an invalid or zero
   bound silently falls back to the default (`parse_positive_u64` filters `>0`
@@ -468,7 +468,7 @@ Sensors are always separate processes. They have **no compiled-in default port**
 the bind address comes from config/env set by the deploy units. See
 [ports and protocols](ports-and-protocols.md).
 
-### Standard sensors (strict parse) - ssh, telnet, http, ftp, redis, adb, catchall, tftp
+### Standard sensors (strict parse) - ssh, telnet, http, ftp, redis, adb, catchall, tftp, mqtt
 
 Shared `ConnectionBounds` pattern via each crate's local
 `parse_positive_u64`/`parse_positive_u32`: unset → default; **present-but-zero or
@@ -484,6 +484,7 @@ null `wan_ip`); invalid entry → abort.
 | http | `PROPOLIS_HTTP_` | `PROPOLIS_HTTP_BIND` | `/var/log/propolis/http/events.jsonl` |
 | ftp | `PROPOLIS_FTP_` | `PROPOLIS_FTP_BIND` | `/var/log/propolis/ftp/events.jsonl` |
 | tftp | `PROPOLIS_TFTP_` | `PROPOLIS_TFTP_BIND` (UDP; unset aborts startup, `sensor-tftp/src/main.rs#load_config_from`) | `/var/log/propolis/tftp/events.jsonl` |
+| mqtt | `PROPOLIS_MQTT_` | `PROPOLIS_MQTT_BIND` (unset aborts startup, `sensor-mqtt/src/main.rs#load_config_from_env`) | `/var/log/propolis/mqtt/events.jsonl` |
 | redis | `PROPOLIS_REDIS_` | `PROPOLIS_REDIS_BIND` | `/var/log/propolis/redis/events.jsonl` |
 | adb | `PROPOLIS_ADB_` | `PROPOLIS_ADB_BIND` | `/var/log/propolis/adb/events.jsonl` |
 | catchall | `PROPOLIS_CATCHALL_` (bare `CATCHALL_` still read, deprecated) | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list, empty→abort) | `catchall-events.jsonl` (relative) |
@@ -525,6 +526,14 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   (`sensor-tftp/src/main.rs#DEFAULT_MAX_CONCURRENT`). Raising `PROPOLIS_TFTP_MAX_CAPTURED_BYTES`
   toward the 10 MB hard cap requires lowering `PROPOLIS_TFTP_MAX_CONCURRENT` to stay under
   `MemoryMax`; the worst case is roughly `(max_concurrent + 64) * max_captured_bytes + 15 MB`.
+- mqtt: `PROPOLIS_MQTT_READ_TIMEOUT_MS`, `PROPOLIS_MQTT_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_MQTT_MAX_DURATION_SECS`, `PROPOLIS_MQTT_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_MQTT_MAX_CONCURRENT`, `PROPOLIS_MQTT_LOG_PATH`, `PROPOLIS_MQTT_WAN_MAP`.
+  Metadata-only, so there is no spool, outbox, collector-id or capture-memory variable.
+  `PROPOLIS_MQTT_MAX_CAPTURED_BYTES` (default `1_000_000`) bounds the total bytes read per
+  connection; a single packet is separately capped at 262144 bytes of declared remaining length
+  (`sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`) and a connection at 1024 packets
+  (`sensor-mqtt/src/handler.rs#MAX_PACKETS`), neither configurable.
 - http: `PROPOLIS_HTTP_READ_TIMEOUT_MS`, `PROPOLIS_HTTP_IDLE_TIMEOUT_MS`,
   `PROPOLIS_HTTP_MAX_DURATION_SECS`, `PROPOLIS_HTTP_MAX_CAPTURED_BYTES`,
   `PROPOLIS_HTTP_MAX_CONCURRENT`, `PROPOLIS_HTTP_LOG_PATH`, `PROPOLIS_HTTP_WAN_MAP`.

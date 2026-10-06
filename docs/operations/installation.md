@@ -26,9 +26,9 @@ cargo build --release
 ```
 
 This produces the release binaries in `target/release/`: `propolis` plus the
-ten sensor binaries `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
+eleven sensor binaries `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
 `sensor-redis`, `sensor-adb`, `sensor-http`, `sensor-ftp`, `sensor-smtp`,
-`sensor-tftp`, `sensor-cred` (`deploy/install.sh#4/9 installing binaries to /usr/local/bin`). `install.sh` errors if any expected
+`sensor-tftp`, `sensor-mqtt`, `sensor-cred` (`deploy/install.sh#4/9 installing binaries to /usr/local/bin`). `install.sh` errors if any expected
 source binary is missing or non-executable, so build before you install
 (`deploy/install.sh#not found or not executable`). The build host must have the pinned Rust
 toolchain (`1.96.1`, `rust-toolchain.toml`); see
@@ -125,8 +125,8 @@ and a supplementary hardening block). Two important caveats:
 
 Capability grants differ per sensor: sensors that bind privileged ports
 (catchall/ssh/telnet/http/ftp/smtp/tftp) get `AmbientCapabilities=CAP_NET_BIND_SERVICE`;
-redis/adb/cred and the unified daemon carry an empty `CapabilityBoundingSet`
-(no privileged port). The full per-sensor cap/resource table lives in the
+redis/adb/mqtt/cred and the unified daemon carry an empty `CapabilityBoundingSet`
+(no privileged port; MQTT's 1883 is unprivileged). The full per-sensor cap/resource table lives in the
 evidence and in [../reference/ports-and-protocols.md](../reference/ports-and-protocols.md).
 
 The **standalone** `intake`/`review`/`feed`/`console` units are not installed by

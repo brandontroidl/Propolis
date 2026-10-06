@@ -34,6 +34,7 @@ pub(crate) fn format_sensor_label(sensor: &str) -> String {
         "mssql" => "MSSQL".into(),
         "smtp" => "SMTP".into(),
         "tftp" => "TFTP".into(),
+        "mqtt" => "MQTT".into(),
         "adb" => "ADB".into(),
         "catchall" | "catchall-sensor" => "General".into(),
         other => {
@@ -53,6 +54,7 @@ pub(crate) fn format_activity(sensor: &str, signal_type: &str) -> String {
         "ssh" => "SSH".to_string(),
         "ftp" => "FTP".to_string(),
         "tftp" => "TFTP".to_string(),
+        "mqtt" => "MQTT".to_string(),
         "http" => "HTTP".to_string(),
         "vnc" => "VNC".to_string(),
         "redis" => "Redis".to_string(),
@@ -204,6 +206,8 @@ mod tests {
         assert_eq!(format_sensor_label("smtp"), "SMTP");
         assert_eq!(format_sensor_label("adb"), "ADB");
         assert_eq!(format_sensor_label("tftp"), "TFTP");
+        assert_eq!(format_sensor_label("mqtt"), "MQTT");
+        assert!(format_activity("mqtt", "honeypot_command_exec").contains("MQTT"));
         // format_activity inherits the fix via its `other => format_sensor_label(other)` delegation.
         assert!(format_activity("mssql", "honeypot_login_attempt").contains("MSSQL"));
     }

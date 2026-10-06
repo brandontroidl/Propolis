@@ -21,7 +21,7 @@ before opening a pull request.
 ## 1. Get oriented: the repository
 
 Start with the [repository tour](../development/repository-tour.md). It maps the
-tree and the 25 workspace crates by concern (foundation libraries, the sensor
+tree and the 26 workspace crates by concern (foundation libraries, the sensor
 layer, the data plane, the unified daemon), and points at the canonical owner for
 each class of fact. There is no `Makefile` or `justfile`: build and test are
 plain `cargo`.

@@ -13,6 +13,7 @@ members = [
     "crates/sensor-http",
     "crates/sensor-ftp",
     "crates/sensor-smtp",
+    "crates/sensor-mqtt",
     "crates/sensor-tftp",
     "crates/sensor-cred",
     "crates/geoip",

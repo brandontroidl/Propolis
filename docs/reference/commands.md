@@ -22,7 +22,7 @@ Every workspace crate is edition 2024.
 ## Build
 
 ```
-cargo build            # debug build, all 25 workspace members
+cargo build            # debug build, all 26 workspace members
 cargo build --release  # release binaries into target/release/
 ```
 
@@ -104,7 +104,7 @@ refuses to start on a malformed value rather than substituting a default
 cargo run -p sensor-ssh        # binds its configured TCP/UDP address, writes NDJSON event logs
 ```
 
-The ten sensor binaries are `sensor-{catchall,ssh,telnet,redis,adb,http,ftp,smtp,tftp,cred}`.
+The eleven sensor binaries are `sensor-{catchall,ssh,telnet,redis,adb,http,ftp,smtp,tftp,mqtt,cred}`.
 A sensor has no compiled-in default port; the bind address comes from its env
 config (`/etc/propolis/<x>.env` in production).
 
@@ -166,7 +166,7 @@ sudo ./deploy/install.sh              # installs binaries + units; starts/enable
 ```
 
 `install.sh` provisions OS users, directories, spool mountpoints, the release
-binaries, `propolis.service` + the 10 sensor units, and a logrotate config. It
+binaries, `propolis.service` + the 11 sensor units, and a logrotate config. It
 does **not** start or enable any service, create/migrate the database, or write
 any operator-owned `/etc/propolis/*.env` file; the one env file it does write is
 the generated, secret-free `fleet-listeners.env`

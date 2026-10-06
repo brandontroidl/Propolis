@@ -33,9 +33,9 @@ Because the capability is simply absent from the dependency tree and the source,
 there is no exec path to reach - not a runtime guard that could be misconfigured
 off.
 
-## Static-check regression tests (8)
+## Static-check regression tests (10)
 
-Eight per-sensor tests walk their crate's `src/` tree and fail if any `.rs` file
+Ten per-sensor tests walk their crate's `src/` tree and fail if any `.rs` file
 contains `std::process::Command`, `process::Command`, or `Command::new` (the SSH
 test also bans `libc::exec` and `nix::unistd::exec`). They are regression guards:
 they exist so a future edit that introduces a spawn call fails the gate rather
@@ -52,6 +52,7 @@ than shipping.
 | (smtp) | `crates/sensor-smtp/tests/integration.rs#never_exec_static_check` |
 | (telnet) | `crates/sensor-telnet/tests/integration.rs#never_exec_static_check` |
 | (tftp) | `crates/sensor-tftp/tests/integration.rs#never_exec_static_check` |
+| (mqtt) | `crates/sensor-mqtt/tests/integration.rs#never_exec_static_check` |
 
 The SSH test is broader than its own crate: it walks **both** `sensor-ssh/src`
 and `sensor-framework/src` (`crates/sensor-ssh/tests/shell_test.rs#never_exec_static_check`). The `FakeFs`/`FakeShell`
@@ -62,7 +63,7 @@ guarding a fixed crate.
 ### Coverage gap
 
 `sensor-catchall` has an `integration.rs` but no `never_exec_static_check`, so
-seven sensor tests plus the SSH test's framework coverage make eight. The
+nine sensor tests plus the SSH test's framework coverage make ten. The
 whole-workspace grep above still shows `sensor-catchall`'s source is clean; only
 the per-crate regression guard is absent for it. [inferred] Adding the guard to
 `sensor-catchall` would close the asymmetry. See

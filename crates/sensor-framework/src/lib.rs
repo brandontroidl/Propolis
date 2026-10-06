@@ -8,6 +8,7 @@ pub mod admission;
 pub mod binaries;
 pub mod bounds;
 pub mod budget;
+pub mod capture_budget;
 pub mod command_codec;
 pub mod config;
 pub mod coverage;

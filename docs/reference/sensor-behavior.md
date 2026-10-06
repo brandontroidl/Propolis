@@ -570,27 +570,50 @@ nothing (`crates/sensor-tftp/src/main.rs#load_config_from`).
 A metadata-only MQTT honeypot on TCP, conventional port 1883. It is **off until an
 operator sets `PROPOLIS_MQTT_BIND`**: with no bind it logs the error, exits 1 and binds
 nothing (`crates/sensor-mqtt/src/main.rs#load_config_from_env`). It speaks MQTT 3.1
-(`MQIsdp` level 3) and 3.1.1 (`MQTT` level 4), accepts any credential, and serves
-nothing: no message is ever delivered to a subscriber, retained, or forwarded, no
-outbound socket is opened, and nothing is executed or spooled.
+(`MQIsdp` level 3), 3.1.1 (`MQTT` level 4) and 5.0 (`MQTT` level 5), accepts any credential
+on every connection (the deliberate low-interaction choice: it is what lets the
+post-CONNECT SUBSCRIBE and PUBLISH recon through, and every CONNECT is logged, so a
+brute-force run across connections is captured), and serves nothing: no message is ever
+delivered to a subscriber, retained, or forwarded, no outbound socket is opened, and nothing
+is executed or spooled.
 
-- **Packets answered.** CONNECT (CONNACK accept `20 02 00 00`), SUBSCRIBE (SUBACK granting
-  `min(requested, 1)` per filter, `0x80` for an invalid filter), UNSUBSCRIBE (UNSUBACK),
-  PUBLISH (QoS 0 silent, QoS 1 PUBACK, QoS 2 PUBREC then PUBCOMP on PUBREL), PINGREQ
-  (PINGRESP). DISCONNECT closes. Every other type, a reserved fixed-header flag violation
-  (SUBSCRIBE/UNSUBSCRIBE/PUBREL need `0b0010`, the rest `0`), a second CONNECT, any packet
-  before CONNECT, and AUTH close the connection without a reply
+- **Packets answered.** CONNECT (CONNACK accept `20 02 00 00`; for level 5
+  `20 03 00 00 00`: ack flags 0, reason `0x00`, empty properties), SUBSCRIBE (SUBACK granting
+  `min(requested, 1)` per filter, `0x80` for an invalid filter, `0x8F` in 5.0; the 5.0 SUBACK
+  is the packet id, an empty properties byte, then one reason per filter), UNSUBSCRIBE
+  (UNSUBACK; in 5.0 the packet id, an empty properties byte and a `0x00` reason per filter),
+  PUBLISH (QoS 0 silent, QoS 1 PUBACK, QoS 2 PUBREC then PUBCOMP on PUBREL; the 5.0 acks use
+  the short form with an implied success reason, which the spec allows), PINGREQ (PINGRESP),
+  and in 5.0 only AUTH (answered with AUTH reason `0x00`, no properties, and logged as a
+  `command` `AUTH` with its `reason_code` and `auth_method`). A 5.0 PUBACK, PUBREC or PUBCOMP
+  is parsed and ignored, since the sensor never sends a PUBLISH. DISCONNECT closes. Every
+  other type, a reserved fixed-header flag violation (SUBSCRIBE/UNSUBSCRIBE/PUBREL need
+  `0b0010`, the rest `0`), a second CONNECT, any packet before CONNECT, and (before 5.0)
+  AUTH, PUBACK, PUBREC or PUBCOMP close the connection without a reply
   (`crates/sensor-mqtt/src/handler.rs#Session`).
 - **CONNECT.** The protocol name and level must pair as `MQIsdp`/3 or `MQTT`/4 or `MQTT`/5;
   any other pair, the reserved connect-flag bit, a will-QoS or will-retain without a will,
   will-QoS 3, or (before 5.0) a password flag without a username flag is malformed and closes
-  the connection with no event. The password is read only to reach the end of the payload and
-  is dropped; it never reaches an event or the log
+  the connection, recorded as a malformed connection event (see below). The password is read
+  only to reach the end of the payload and is dropped; it never reaches an event or the log
   (`crates/sensor-mqtt/src/handler.rs#parse_connect`).
-- **MQTT 5.0 is a known first-cut limitation.** A level-5 CONNECT is parsed (property blocks
-  are skipped without being interpreted), logged as a login attempt, then declined with
-  CONNACK reason `0x84` (unsupported protocol version) and closed. A 5.0 session is captured
-  at CONNECT and goes no further.
+- **MQTT 5.0 properties.** A properties block is a varint byte length and then that many
+  bytes of identifier and typed value. It is parsed strictly inside its declared length with
+  checked indexing, reads at most `MAX_PROPERTIES` = 64 properties, and keeps at most
+  `MAX_LOGGED_USER_PROPERTIES` = 16 user properties (`user_property_count` counts them all)
+  (`crates/sensor-mqtt/src/handler.rs#parse_properties`). A malformed, unknown or
+  over-count property stops the block and sets `properties_parse_error` on the event; the
+  packet is not failed and the payload boundary stays exact, because the cursor lands on the
+  declared block end. Only a declared length that does not fit in the packet is malformed.
+  Session-Expiry-Interval, Receive-Maximum, Maximum-Packet-Size, Topic-Alias-Maximum,
+  Request-Response-Information, user properties and the Authentication-Method name are
+  decoded; Authentication-Data is a credential and, like the password, is read to advance
+  the parser and dropped, never stored or logged. A 5.0 PUBLISH payload is the remainder
+  after its properties block, and a Topic Alias is recorded as `topic_alias` and never
+  resolved. Levels 3 and 4 have no properties blocks.
+- **Keepalive.** After CONNECT the per-read idle wait is `min(idle_timeout, 1.5 x
+  keepalive)`; a keepalive of 0 leaves `idle_timeout` in charge, as a real broker's
+  keepalive-off does (`crates/sensor-mqtt/src/handler.rs#keepalive_idle`).
 - **Parser bounds.** The remaining-length varint is at most four bytes (a fifth continuation
   byte closes the connection). A packet declaring more than `MAX_PACKET_BYTES` = 262144 bytes
   is refused on the declaration alone, before any body is read
@@ -602,12 +625,28 @@ outbound socket is opened, and nothing is executed or spooled.
 - **Emits:** `honeypot_connection` at accept; `honeypot_login_attempt`
   (`authenticated=true`; `client_id`, `username` (empty when anonymous), `protocol_level`,
   `keepalive`, `clean_session`, and `will_topic` and `will_payload_len` when a will is set;
-  never the password); `honeypot_command_exec` with `command` `SUBSCRIBE` (`topics` and `qos`
+  for level 5 also `auth_method`, `session_expiry`, `receive_max`, `max_packet_size`,
+  `topic_alias_max`, `request_response_info` and `user_properties` (name and value pairs,
+  first 16) when present; never the password or the authentication data);
+  `honeypot_command_exec` with `command` `SUBSCRIBE` (`topics` and `qos`
   for the first 32 filters, `topic_count` for all) or `PUBLISH` (`topic`, `qos`, `retain`,
   `dup`, `payload_len`, a `payload_preview` of at most 256 bytes as sanitized text or as hex
   when the prefix has non-UTF-8 or control bytes (`payload_preview_encoding` says which), and
-  `payload_sha256` over the whole payload). Every attacker string is lossy-decoded, passed
-  through `sanitize_value` and capped at 255 characters; no event carries a sample.
+  `payload_sha256` over the whole payload), or `AUTH` (5.0 only). Every attacker string is
+  lossy-decoded, passed through `sanitize_value` and capped at 255 characters; no event
+  carries a sample.
+- **Malformed first packet.** A connection that sent bytes but whose first packet was
+  malformed or not a CONNECT (a bad remaining length, an oversize declaration, a truncated or
+  invalid CONNECT, a wrong fixed-header flag, a non-CONNECT first packet) emits a second
+  `honeypot_connection` event with `malformed=true`, a `reason`, `bytes_seen`, and
+  `first_bytes_hex`, at most 32 wire bytes as hex, never raw text
+  (`crates/sensor-mqtt/src/handler.rs#malformed_observation`). A connection that sent
+  nothing, and a malformed packet after a successful CONNECT, add no such event.
+- **Session end.** Every connection ends with one `honeypot_session_end` event
+  (`authenticated=false`; `packets`, `publishes`, `subscribes`, `bytes_in`, `duration_ms`
+  and the `client_id` when a CONNECT was seen)
+  (`crates/sensor-mqtt/src/handler.rs#Session::end_observation`). It is not emitted when
+  `max_duration` cancels the handler, because the listener drops the handler future.
 - **Bounds:** common defaults, `max_concurrent` 256, per-source admission cap. Strict
   parsing: a zero or unparseable bound aborts startup. No spool.
 

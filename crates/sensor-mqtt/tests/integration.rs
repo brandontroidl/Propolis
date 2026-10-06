@@ -6,7 +6,7 @@ use std::time::Duration;
 use sensor_framework::{ConnectionBounds, WanResolver};
 use sensor_wire::{
     SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
-    SensorEvent,
+    SIGNAL_HONEYPOT_SESSION_END, SensorEvent,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -125,6 +125,33 @@ fn connect_packet(level: u8, flags: u8, rest: &[u8]) -> Vec<u8> {
     packet(0x10, &b)
 }
 
+/// A 5.0 CONNECT with an explicit properties block (`props` is the block content).
+fn connect_v5_packet(flags: u8, keepalive: u16, props: &[u8], rest: &[u8]) -> Vec<u8> {
+    let mut b = lenp(b"MQTT");
+    b.push(5);
+    b.push(flags);
+    b.extend_from_slice(&keepalive.to_be_bytes());
+    b.extend(varint(props.len()));
+    b.extend_from_slice(props);
+    b.extend_from_slice(rest);
+    packet(0x10, &b)
+}
+
+/// A properties block as it appears on the wire: length varint, then the content.
+fn block(content: &[u8]) -> Vec<u8> {
+    [varint(content.len()), content.to_vec()].concat()
+}
+
+fn prop_str(id: u8, s: &[u8]) -> Vec<u8> {
+    [vec![id], lenp(s)].concat()
+}
+
+fn prop_pair(k: &[u8], v: &[u8]) -> Vec<u8> {
+    [vec![0x26], lenp(k), lenp(v)].concat()
+}
+
+const V5_CONNACK: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0x00];
+
 fn connect_with_creds() -> Vec<u8> {
     let mut rest = lenp(b"scanner-01");
     rest.extend(lenp(b"admin"));
@@ -171,6 +198,12 @@ impl Client {
     async fn handshake(&mut self) {
         self.send(&connect_with_creds()).await;
         assert_eq!(self.read_n(4).await, vec![0x20, 0x02, 0x00, 0x00]);
+    }
+
+    async fn handshake_v5(&mut self) {
+        self.send(&connect_v5_packet(0x02, 30, &[], &lenp(b"v5-client")))
+            .await;
+        assert_eq!(self.read_n(5).await, V5_CONNACK.to_vec());
     }
 }
 
@@ -240,23 +273,353 @@ async fn connect_31_is_accepted_and_will_is_recorded() {
 }
 
 #[tokio::test]
-async fn connect_level5_is_declined_0x84_but_still_logged() {
+async fn connect_level5_gets_v5_connack_and_logs_properties_without_credentials() {
     let srv = TestServer::start().await;
     let mut client = Client::connect(srv.addr).await;
+    let props = [
+        prop_str(0x15, b"SCRAM-SHA-256"),
+        prop_str(0x16, b"SECRET-AUTH-DATA"),
+        vec![0x11, 0x00, 0x00, 0x0E, 0x10], // session expiry 3600
+        vec![0x21, 0x00, 0x14],             // receive maximum 20
+        prop_pair(b"agent", b"mqtt-scan/1.0"),
+    ]
+    .concat();
     let mut rest = lenp(b"v5-scanner");
     rest.extend(lenp(b"root"));
     rest.extend(lenp(b"toor-secret"));
-    client.send(&connect_packet(5, 0xC2, &rest)).await;
-    assert_eq!(client.read_n(5).await, vec![0x20, 0x03, 0x00, 0x84, 0x00]);
-    client.expect_closed().await;
+    client
+        .send(&connect_v5_packet(0xC2, 30, &props, &rest))
+        .await;
+    // CONNACK: ack flags 0, reason 0x00 (success), empty properties.
+    assert_eq!(client.read_n(5).await, V5_CONNACK.to_vec());
 
     let login = srv
         .wait_for(1, is_signal(SIGNAL_HONEYPOT_LOGIN_ATTEMPT))
         .await;
-    assert_eq!(login[0].metadata["protocol_level"], 5);
-    assert_eq!(login[0].metadata["client_id"], "v5-scanner");
-    assert_eq!(login[0].metadata["username"], "root");
-    assert!(!srv.raw_events().await.contains("toor-secret"));
+    let m = &login[0].metadata;
+    assert!(login[0].authenticated);
+    assert_eq!(m["protocol_level"], 5);
+    assert_eq!(m["client_id"], "v5-scanner");
+    assert_eq!(m["username"], "root");
+    assert_eq!(m["auth_method"], "SCRAM-SHA-256");
+    assert_eq!(m["session_expiry"], 3600);
+    assert_eq!(m["receive_max"], 20);
+    assert_eq!(m["user_properties"][0]["name"], "agent");
+    assert_eq!(m["user_properties"][0]["value"], "mqtt-scan/1.0");
+    let raw = srv.raw_events().await;
+    assert!(!raw.contains("toor-secret"), "password leaked: {raw}");
+    assert!(!raw.contains("SECRET-AUTH-DATA"), "auth data leaked: {raw}");
+
+    // The session stays engaged afterwards.
+    client.send(&packet(0xC0, &[])).await;
+    assert_eq!(client.read_n(2).await, vec![0xD0, 0x00]);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn level5_subscribe_publish_unsubscribe_are_parsed_answered_in_v5_form_and_logged() {
+    let srv = TestServer::start().await;
+    let mut client = Client::connect(srv.addr).await;
+    client.handshake_v5().await;
+
+    // SUBSCRIBE with a subscription-identifier and a user property; options carry no-local.
+    let mut sub = vec![0x00, 0x10];
+    sub.extend(block(&[vec![0x0B, 0x07], prop_pair(b"k", b"v")].concat()));
+    sub.extend(lenp(b"$SYS/#"));
+    sub.push(0x05); // qos 1, no-local
+    sub.extend(lenp(b"home/+/temp"));
+    sub.push(0x02);
+    sub.extend(lenp(b"bad#"));
+    sub.push(0x00);
+    client.send(&packet(0x82, &sub)).await;
+    // SUBACK: id, empty properties, granted 1, granted 1 (qos 2 lowered), 0x8F invalid filter.
+    assert_eq!(
+        client.read_n(8).await,
+        vec![0x90, 0x06, 0x00, 0x10, 0x00, 0x01, 0x01, 0x8F]
+    );
+
+    // PUBLISH qos1 whose properties block is long enough for a two-byte length: the payload must
+    // begin after it.
+    let publish_props = [
+        vec![0x01, 0x01],
+        vec![0x23, 0x00, 0x05],
+        prop_pair(b"trace", &[b'x'; 200]),
+    ]
+    .concat();
+    let mut publish = lenp(b"cmd/exec");
+    publish.extend_from_slice(&[0xAB, 0xCD]);
+    publish.extend(block(&publish_props));
+    publish.extend_from_slice(b"hello");
+    client.send(&packet(0x32, &publish)).await;
+    assert_eq!(client.read_n(4).await, vec![0x40, 0x02, 0xAB, 0xCD]);
+
+    // UNSUBSCRIBE of two filters: UNSUBACK carries one reason code each.
+    let mut unsub = vec![0x00, 0x21];
+    unsub.extend(block(&[]));
+    unsub.extend(lenp(b"a/b"));
+    unsub.extend(lenp(b"c/d"));
+    client.send(&packet(0xA2, &unsub)).await;
+    assert_eq!(
+        client.read_n(7).await,
+        vec![0xB0, 0x05, 0x00, 0x21, 0x00, 0x00, 0x00]
+    );
+
+    let s = srv.wait_for(1, command("SUBSCRIBE")).await;
+    assert_eq!(s[0].metadata["topics"][0], "$SYS/#");
+    assert_eq!(s[0].metadata["topics"][1], "home/+/temp");
+    assert_eq!(s[0].metadata["qos"][1], 2);
+    assert_eq!(s[0].metadata["topic_count"], 3);
+    let p = srv.wait_for(1, command("PUBLISH")).await;
+    let m = &p[0].metadata;
+    assert_eq!(m["topic"], "cmd/exec");
+    assert_eq!(m["qos"], 1);
+    assert_eq!(m["payload_len"], 5);
+    assert_eq!(m["payload_preview"], "hello");
+    assert_eq!(
+        m["payload_sha256"],
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
+    assert_eq!(m["topic_alias"], 5);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn level5_auth_is_completed_and_pubrel_is_answered() {
+    let srv = TestServer::start().await;
+    let mut client = Client::connect(srv.addr).await;
+    client.handshake_v5().await;
+
+    let auth_props = [
+        prop_str(0x15, b"SCRAM-SHA-1"),
+        prop_str(0x16, b"AUTHBLOB-SECRET"),
+    ]
+    .concat();
+    let auth = [vec![0x19], block(&auth_props)].concat();
+    client.send(&packet(0xF0, &auth)).await;
+    assert_eq!(client.read_n(4).await, vec![0xF0, 0x02, 0x00, 0x00]);
+
+    // PUBREL with a reason code and properties, answered with a PUBCOMP.
+    let rel = [vec![0x00, 0x09, 0x00], block(&prop_str(0x1F, b"why"))].concat();
+    client.send(&packet(0x62, &rel)).await;
+    assert_eq!(client.read_n(4).await, vec![0x70, 0x02, 0x00, 0x09]);
+
+    let ev = srv.wait_for(1, command("AUTH")).await;
+    assert_eq!(ev[0].metadata["auth_method"], "SCRAM-SHA-1");
+    assert_eq!(ev[0].metadata["reason_code"], 0x19);
+    assert!(!srv.raw_events().await.contains("AUTHBLOB"));
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn level5_malformed_properties_flag_but_do_not_close_and_overrun_does() {
+    let srv = TestServer::start().await;
+    // An unknown property identifier inside a block that fits: logged with the flag, accepted.
+    let mut client = Client::connect(srv.addr).await;
+    client
+        .send(&connect_v5_packet(
+            0x02,
+            30,
+            &[0x7E, 0x00],
+            &lenp(b"odd-props"),
+        ))
+        .await;
+    assert_eq!(client.read_n(5).await, V5_CONNACK.to_vec());
+    let login = srv
+        .wait_for(1, is_signal(SIGNAL_HONEYPOT_LOGIN_ATTEMPT))
+        .await;
+    assert_eq!(login[0].metadata["client_id"], "odd-props");
+    assert_eq!(login[0].metadata["properties_parse_error"], true);
+
+    // A declared properties length past the end of the packet: the boundary is unknowable, so the
+    // CONNECT is malformed.
+    let mut over = lenp(b"MQTT");
+    over.extend_from_slice(&[5, 0x02, 0x00, 0x1E]);
+    over.extend(varint(500));
+    over.extend(lenp(b"c"));
+    let mut bad = Client::connect(srv.addr).await;
+    bad.send(&packet(0x10, &over)).await;
+    bad.expect_closed().await;
+    let ev = srv
+        .wait_for(1, |e| {
+            e.metadata.get("reason").and_then(|v| v.as_str()) == Some("malformed_connect")
+        })
+        .await;
+    assert_eq!(ev[0].metadata["malformed"], true);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn malformed_first_packet_emits_a_malformed_connection_event() {
+    let srv = TestServer::start().await;
+
+    // Reserved connect-flag bit.
+    let mut c = Client::connect(srv.addr).await;
+    let bad_connect = connect_packet(4, 0x03, &lenp(b"c"));
+    c.send(&bad_connect).await;
+    c.expect_closed().await;
+    // Non-CONNECT first packet.
+    let mut c = Client::connect(srv.addr).await;
+    c.send(&packet(0xC0, &[])).await;
+    c.expect_closed().await;
+    // 5-byte remaining-length varint.
+    let mut c = Client::connect(srv.addr).await;
+    c.send(&[0x10, 0x80, 0x80, 0x80, 0x80, 0x01]).await;
+    c.expect_closed().await;
+    // Oversize declaration.
+    let mut c = Client::connect(srv.addr).await;
+    c.send(&[0x10, 0xFF, 0xFF, 0xFF, 0x7F]).await;
+    c.expect_closed().await;
+
+    let by_reason = |reason: &'static str| {
+        move |e: &SensorEvent| {
+            e.signal_type == SIGNAL_HONEYPOT_CONNECTION
+                && e.metadata.get("reason").and_then(|v| v.as_str()) == Some(reason)
+        }
+    };
+    let ev = srv.wait_for(1, by_reason("malformed_connect")).await;
+    let m = &ev[0].metadata;
+    assert!(!ev[0].authenticated);
+    assert_eq!(m["malformed"], true);
+    assert_eq!(m["protocol_label"], "mqtt");
+    assert_eq!(m["bytes_seen"], bad_connect.len());
+    let hex: String = bad_connect.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(m["first_bytes_hex"], hex.as_str());
+
+    let ev = srv.wait_for(1, by_reason("first_packet_not_connect")).await;
+    assert_eq!(ev[0].metadata["bytes_seen"], 2);
+    assert_eq!(ev[0].metadata["first_bytes_hex"], "c000");
+    let ev = srv.wait_for(1, by_reason("bad_remaining_length")).await;
+    assert_eq!(ev[0].metadata["first_bytes_hex"], "1080808080");
+    srv.wait_for(1, by_reason("oversize_declaration")).await;
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn silent_connections_and_valid_sessions_emit_no_malformed_event() {
+    let srv = TestServer::start().await;
+    let bounds_idle = Client::connect(srv.addr).await; // sends nothing, then drops
+    drop(bounds_idle);
+    let mut ok = Client::connect(srv.addr).await;
+    ok.handshake().await;
+    drop(ok);
+    srv.wait_for(2, is_signal(SIGNAL_HONEYPOT_SESSION_END))
+        .await;
+    let malformed = srv
+        .events()
+        .await
+        .into_iter()
+        .filter(|e| e.metadata.get("malformed").is_some())
+        .count();
+    assert_eq!(malformed, 0);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn session_end_event_carries_the_counts() {
+    let srv = TestServer::start().await;
+    let mut client = Client::connect(srv.addr).await;
+    let connect = connect_with_creds();
+    client.handshake().await;
+
+    let mut publish = lenp(b"t");
+    publish.extend_from_slice(b"x");
+    let publish_pkt = packet(0x30, &publish);
+    client.send(&publish_pkt).await;
+    client.send(&publish_pkt).await;
+    let mut sub = vec![0x00, 0x01];
+    sub.extend(lenp(b"a/b"));
+    sub.push(0);
+    let sub_pkt = packet(0x82, &sub);
+    client.send(&sub_pkt).await;
+    assert_eq!(client.read_n(5).await, vec![0x90, 0x03, 0x00, 0x01, 0x00]);
+    let ping = packet(0xC0, &[]);
+    client.send(&ping).await;
+    assert_eq!(client.read_n(2).await, vec![0xD0, 0x00]);
+    let disconnect = packet(0xE0, &[]);
+    client.send(&disconnect).await;
+    client.expect_closed().await;
+
+    let ends = srv
+        .wait_for(1, is_signal(SIGNAL_HONEYPOT_SESSION_END))
+        .await;
+    assert_eq!(
+        ends.len(),
+        1,
+        "exactly one session-end event per connection"
+    );
+    let m = &ends[0].metadata;
+    assert_eq!(m["protocol_label"], "mqtt");
+    assert_eq!(m["client_id"], "scanner-01");
+    // CONNECT, 2 PUBLISH, SUBSCRIBE, PINGREQ, DISCONNECT.
+    assert_eq!(m["packets"], 6);
+    assert_eq!(m["publishes"], 2);
+    assert_eq!(m["subscribes"], 1);
+    let sent =
+        connect.len() + 2 * publish_pkt.len() + sub_pkt.len() + ping.len() + disconnect.len();
+    assert_eq!(m["bytes_in"], sent);
+    assert!(m["duration_ms"].is_u64());
+    assert!(!ends[0].authenticated);
+    assert_eq!(ends[0].sensor, "mqtt");
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn keepalive_bounds_the_idle_wait_after_connect() {
+    // idle_timeout is 5 s; a keepalive of 1 s closes the silent client at 1.5 s, not 5 s.
+    let srv = TestServer::start().await;
+    let mut client = Client::connect(srv.addr).await;
+    client
+        .send(&connect_v5_packet(0x02, 1, &[], &lenp(b"quiet")))
+        .await;
+    assert_eq!(client.read_n(5).await, V5_CONNACK.to_vec());
+    let started = std::time::Instant::now();
+    client.expect_closed().await;
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(1300) && waited < Duration::from_secs(3),
+        "closed after {waited:?}, expected about 1.5x the 1 s keepalive"
+    );
+    srv.wait_for(1, is_signal(SIGNAL_HONEYPOT_SESSION_END))
+        .await;
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn keepalive_zero_leaves_the_idle_timeout_in_charge() {
+    let bounds = ConnectionBounds {
+        idle_timeout: Duration::from_millis(600),
+        ..test_bounds()
+    };
+    let srv = TestServer::start_with_bounds(bounds).await;
+    let mut client = Client::connect(srv.addr).await;
+    client
+        .send(&connect_v5_packet(0x02, 0, &[], &lenp(b"no-ka")))
+        .await;
+    assert_eq!(client.read_n(5).await, V5_CONNACK.to_vec());
+    let started = std::time::Instant::now();
+    client.expect_closed().await;
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn every_connect_across_connections_is_a_login_attempt() {
+    // Accept-all auth stays: each connection's CONNECT, whatever the credential, is captured.
+    let srv = TestServer::start().await;
+    for i in 0..5u8 {
+        let mut client = Client::connect(srv.addr).await;
+        let mut rest = lenp(format!("brute-{i}").as_bytes());
+        rest.extend(lenp(b"admin"));
+        rest.extend(lenp(format!("guess-{i}").as_bytes()));
+        client.send(&connect_packet(4, 0xC2, &rest)).await;
+        assert_eq!(client.read_n(4).await, vec![0x20, 0x02, 0x00, 0x00]);
+    }
+    let logins = srv
+        .wait_for(5, is_signal(SIGNAL_HONEYPOT_LOGIN_ATTEMPT))
+        .await;
+    assert_eq!(logins.len(), 5);
+    assert!(logins.iter().all(|e| e.authenticated));
+    assert!(!srv.raw_events().await.contains("guess-"));
     srv.handle.abort();
 }
 
@@ -360,12 +723,13 @@ async fn unsubscribe_gets_unsuback() {
 }
 
 async fn assert_malformed_closes_and_listener_survives(srv: &TestServer, bytes: &[u8], what: &str) {
+    // Printed before the asserts so a panic's captured output names the failing case.
+    eprintln!("malformed case: {what}");
     let mut client = Client::connect(srv.addr).await;
     let _ = client.stream.write_all(bytes).await;
     client.expect_closed().await;
     let mut probe = Client::connect(srv.addr).await;
     probe.handshake().await;
-    let _ = what;
 }
 
 #[tokio::test]

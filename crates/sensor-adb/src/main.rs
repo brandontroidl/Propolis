@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal};
+use sensor_framework::{
+    CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+    SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal,
+};
 
 const ENV_BIND: &str = "PROPOLIS_ADB_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_ADB_WAN_MAP";
@@ -37,6 +40,9 @@ const ENV_COLLECTOR_ID_LEGACY: &str = "COLLECTOR_ID";
 /// must land inside this sensor's own writable spool root, which is already granted in its
 /// systemd `ReadWritePaths`.
 const ENV_OUTBOX_DIR: &str = "PROPOLIS_ADB_OUTBOX_DIR";
+/// Ceiling, in bytes, on capture bodies buffered in memory across every connection. Defaults to
+/// 40% of the unit's 256M `MemoryMax` (see `deploy/sensor-adb.service`).
+const ENV_CAPTURE_MEMORY_BYTES: &str = "PROPOLIS_ADB_CAPTURE_MEMORY_BYTES";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/adb/events.jsonl";
 const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/adb";
@@ -56,6 +62,7 @@ struct Config {
     bounds: ConnectionBounds,
     collector_id: String,
     outbox_dir: PathBuf,
+    capture_memory_bytes: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -216,6 +223,12 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         ENV_MAX_CONCURRENT,
     )?;
 
+    let capture_memory_bytes = parse_positive_u64(
+        env::var(ENV_CAPTURE_MEMORY_BYTES).ok().as_deref(),
+        DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+        ENV_CAPTURE_MEMORY_BYTES,
+    )?;
+
     Ok(Config {
         bind_addr,
         wan_map,
@@ -223,6 +236,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         spool_dir,
         collector_id,
         outbox_dir,
+        capture_memory_bytes,
         bounds: ConnectionBounds {
             read_timeout: Duration::from_millis(read_timeout_ms),
             idle_timeout: Duration::from_millis(idle_timeout_ms),
@@ -255,6 +269,7 @@ async fn main() {
         config.bounds,
         config.collector_id,
         config.outbox_dir,
+        Arc::new(CaptureMemoryBudget::new(config.capture_memory_bytes)),
     )
     .await
     {
@@ -334,6 +349,25 @@ mod tests {
             parse_positive_u64(Some("not-a-number"), 42, "x"),
             Err(ConfigError::InvalidBound { .. })
         ));
+    }
+
+    #[test]
+    fn capture_memory_ceiling_defaults_to_forty_percent_of_256m_and_rejects_zero_or_garbage() {
+        let parse = |raw: Option<&str>| {
+            parse_positive_u64(
+                raw,
+                DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+                ENV_CAPTURE_MEMORY_BYTES,
+            )
+        };
+        assert_eq!(parse(None).unwrap(), 107_374_182);
+        assert_eq!(parse(Some("5000000")).unwrap(), 5_000_000);
+        for bad in ["0", "-1", "lots", ""] {
+            assert!(
+                matches!(parse(Some(bad)), Err(ConfigError::InvalidBound { .. })),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -35,8 +35,8 @@ use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell, onlcr};
 use sensor_framework::upload_metadata;
 use sensor_framework::{
-    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget, EgressState,
-    EventEmitter, Uuid, WanResolver, limits_from,
+    CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget,
+    EgressState, EventEmitter, Uuid, WanResolver, limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
@@ -172,7 +172,7 @@ impl SessionEnd {
 /// destructor is the only code that still runs then. Until this existed the ADB shell was the one
 /// remaining sensor where that dropper left a flood event and no sample.
 struct ShellCapture {
-    body: Vec<u8>,
+    body: CaptureBody,
     /// Bytes the client sent, including any past the ceiling, so `wire_size` and `truncated` stay
     /// honest about the stored copy being a prefix.
     wire_bytes: u64,
@@ -196,7 +196,9 @@ impl ShellCapture {
         self.wire_bytes += data.len() as u64;
         let room = self.max_bytes.saturating_sub(self.body.len() as u64) as usize;
         if room > 0 {
-            self.body.extend_from_slice(&data[..data.len().min(room)]);
+            // A refusal keeps the prefix already held; the body remembers it was cut, and the
+            // hand-off marks the capture truncated. The session itself carries on regardless.
+            let _ = self.body.extend_from_slice(&data[..data.len().min(room)]);
         }
     }
 
@@ -207,14 +209,16 @@ impl ShellCapture {
 
 impl Drop for ShellCapture {
     fn drop(&mut self) {
-        if self.body.is_empty() {
+        // An empty body that was starved by the budget still goes to `submit`, which counts it as
+        // a refusal; a merely empty one has nothing to report.
+        if self.body.is_empty() && !self.body.is_exhausted() {
             return;
         }
-        if !self.binary_seen && !sensor_framework::shell::looks_binary(&self.body) {
+        if !self.binary_seen && !sensor_framework::shell::looks_binary(self.body.as_slice()) {
             return;
         }
         let end = self.stream_end.unwrap_or_else(|| self.session_end.get());
-        let body = std::mem::take(&mut self.body);
+        let body = std::mem::replace(&mut self.body, self.handoff.new_capture_body());
         let wire_size = self.wire_bytes;
         let (source_ip, wan_ip, session_id) = (self.source_ip, self.wan_ip, self.session_id);
         let _ = self.handoff.submit(CaptureJob {
@@ -291,7 +295,8 @@ struct PendingSend {
     orig_name: String,
     /// Permission bits of the SEND's `st_mode`, applied when the file lands in the fake tree.
     perm: u32,
-    body: Vec<u8>,
+    /// Charged to the sensor's process-wide capture memory budget while it is buffered.
+    body: CaptureBody,
     /// DATA payload bytes the client sent, including any drained past `MAX_SYNC_BODY`;
     /// `body.len()` is what was retained.
     wire_bytes: u64,
@@ -325,7 +330,9 @@ impl SyncState {
             return;
         }
         if let Some(dest) = push_destination(&pending.orig_name) {
-            let _ = self.fs.write_file_mode(dest, &pending.body, pending.perm);
+            let _ = self
+                .fs
+                .write_file_mode(dest, pending.body.as_slice(), pending.perm);
         }
     }
 
@@ -377,7 +384,7 @@ impl SyncState {
                     self.pending_send = Some(PendingSend {
                         orig_name,
                         perm,
-                        body: Vec::new(),
+                        body: self.handoff.new_capture_body(),
                         wire_bytes: 0,
                     });
                 }
@@ -389,11 +396,25 @@ impl SyncState {
                     let Some(chunk) = self.take_payload(sync_header.length) else {
                         break;
                     };
+                    let mut budget_exhausted = false;
                     if let Some(pending) = self.pending_send.as_mut() {
                         let storable = MAX_SYNC_BODY.saturating_sub(pending.body.len());
                         let take = storable.min(chunk.len());
-                        pending.body.extend_from_slice(&chunk[..take]);
+                        budget_exhausted = pending.body.extend_from_slice(&chunk[..take]).is_err();
                         pending.wire_bytes += chunk.len() as u64;
+                    }
+                    if budget_exhausted {
+                        // The process-wide capture budget is full. The prefix goes out now as an
+                        // incomplete capture and the push fails the way a full device's does, which
+                        // makes `adb push` abort rather than keep streaming.
+                        if let Some(job) = self.abandon() {
+                            let _ = self.handoff.submit(job);
+                        }
+                        response.extend_from_slice(&adb_proto::build_sync_message(
+                            adb_proto::SYNC_FAIL,
+                            b"No space left on device",
+                        ));
+                        break;
                     }
                 }
                 adb_proto::SYNC_DONE if self.pending_send.is_some() => {
@@ -897,7 +918,7 @@ async fn handle_open(
                             Box::new(shell),
                             Vec::new(),
                             ShellCapture {
-                                body: Vec::new(),
+                                body: handoff.new_capture_body(),
                                 wire_bytes: 0,
                                 binary_seen: false,
                                 max_bytes: max_captured_bytes,
@@ -1217,6 +1238,7 @@ mod tests {
             slots,
             "test".to_string(),
             sensor_framework::OutboxManifest::new(outbox_dir),
+            Arc::new(sensor_framework::CaptureMemoryBudget::new(u64::MAX)),
         ));
         (handoff, dir)
     }
@@ -1234,8 +1256,10 @@ mod tests {
     }
 
     fn probe_job() -> CaptureJob {
+        let mut body = CaptureBody::unbudgeted();
+        body.extend_from_slice(&[1]).unwrap();
         CaptureJob {
-            body: vec![1],
+            body,
             orig_name: "probe".into(),
             event_builder: Box::new(|_sample| unreachable!("never built")),
         }
@@ -1293,6 +1317,67 @@ mod tests {
             handoff.submit(probe_job()).is_err(),
             "the reset submitted the DATA it had"
         );
+    }
+
+    /// The process-wide capture budget runs out mid-push: the prefix that fit is queued as a
+    /// truncated capture, the push is failed with a sync FAIL, and a push that gets no bytes at
+    /// all queues nothing and is counted as refused.
+    #[test]
+    fn a_push_that_exhausts_the_capture_memory_budget_fails_and_keeps_the_prefix() {
+        use sensor_framework::CAPTURE_CHUNK_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let handoff = Arc::new(CaptureHandoff::new(
+            sensor_framework::QuarantineSpool::new(spool_dir, MAX_SYNC_BODY as u64, 100_000_000),
+            sensor_framework::EventEmitter::new(dir.path().join("events.jsonl")),
+            1,
+            "test".to_string(),
+            sensor_framework::OutboxManifest::new(dir.path().join("outbox")),
+            Arc::new(sensor_framework::CaptureMemoryBudget::new(
+                CAPTURE_CHUNK_BYTES,
+            )),
+        ));
+        let send =
+            || adb_proto::build_sync_message(adb_proto::SYNC_SEND, b"/data/local/tmp/big,33188");
+        let data = |n: usize| adb_proto::build_sync_message(adb_proto::SYNC_DATA, &vec![5u8; n]);
+        let new_sync = || {
+            SyncState::new(
+                "203.0.113.7".parse().unwrap(),
+                None,
+                Uuid::now_v7(),
+                handoff.clone(),
+                FakeFs::android(),
+            )
+        };
+
+        let mut sync = new_sync();
+        let mut wire = send();
+        wire.extend_from_slice(&data(40_000));
+        wire.extend_from_slice(&data(40_000));
+        let (response, upload) = sync.feed(&wire);
+        assert!(
+            upload.is_none(),
+            "the truncated prefix is submitted directly"
+        );
+        assert!(
+            response.starts_with(b"FAIL") && response.ends_with(b"No space left on device"),
+            "the push is failed, not acknowledged: {response:?}"
+        );
+        assert_eq!(handoff.truncated_capture_count(), 1);
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the prefix took the slot"
+        );
+
+        // The queued prefix still holds the only chunk, so the next push gets zero bytes.
+        let mut starved = new_sync();
+        let mut wire = send();
+        wire.extend_from_slice(&data(10));
+        let (response, _) = starved.feed(&wire);
+        assert!(response.starts_with(b"FAIL"));
+        assert_eq!(handoff.refused_capture_count(), 1);
+        assert_eq!(handoff.truncated_capture_count(), 1);
     }
 
     fn push(fs: FakeFs, path: &str, body: &[u8]) -> (Vec<u8>, Option<CaptureJob>) {
@@ -1389,7 +1474,7 @@ mod tests {
             b"ELF-adb-5521"
         );
         let job = upload.expect("the capture job is produced exactly as before");
-        assert_eq!(job.body, b"ELF-adb-5521");
+        assert_eq!(job.body.as_slice(), b"ELF-adb-5521");
         assert_eq!(job.orig_name, "/data/local/tmp/adb_payload");
         assert!(
             base.share().file_exists("/data/local/tmp/adb_payload"),
@@ -1488,7 +1573,7 @@ mod tests {
         let sync_reply = SyncHeader::parse(&response).unwrap();
         assert_eq!(sync_reply.id, adb_proto::SYNC_OKAY);
         let job = upload.expect("SEND+DATA+DONE must produce a capture job");
-        assert_eq!(job.body, b"hello");
+        assert_eq!(job.body.as_slice(), b"hello");
         assert_eq!(job.orig_name, "/data/local/tmp/evil.bin");
     }
 
@@ -1511,7 +1596,7 @@ mod tests {
 
         let (r3, u3) = sync.feed(&adb_proto::build_sync_done(0));
         assert_eq!(SyncHeader::parse(&r3).unwrap().id, adb_proto::SYNC_OKAY);
-        assert_eq!(u3.unwrap().body, b"AB");
+        assert_eq!(u3.unwrap().body.as_slice(), b"AB");
     }
 
     /// A SEND whose DONE never arrives (stream closed, session dropped) keeps the DATA that did,
@@ -1531,7 +1616,7 @@ mod tests {
         ));
         sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"AB"));
         let job = sync.abandon().expect("DATA arrived, so a capture");
-        assert_eq!(job.body, b"AB");
+        assert_eq!(job.body.as_slice(), b"AB");
         let sample_ref = sample(&job);
         let event = (job.event_builder)(sample_ref);
         assert_eq!(event.metadata["complete"], false);

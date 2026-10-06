@@ -28,13 +28,17 @@ pub mod wan;
 pub use admission::{PerSourceLimiter, SourceGuard, default_per_source_cap};
 pub use bounds::ConnectionBounds;
 pub use budget::{BudgetLimits, ConnectionBudget, EgressState, limits_from};
+pub use capture_budget::{
+    CAPTURE_CHUNK_BYTES, CaptureBody, CaptureExhausted, CaptureMemoryBudget,
+    DEFAULT_CAPTURE_BUDGET_BYTES_256M, default_capture_budget_bytes,
+};
 pub use command_codec::CommandCodec;
 pub use config::SensorConfig;
 pub use emit::EventEmitter;
 pub use env::env_with_legacy;
 pub use handoff::{
-    CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome, SHUTDOWN_DRAIN_TIMEOUT,
-    upload_metadata,
+    CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome,
+    END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, upload_metadata,
 };
 pub use listener::{run_tcp_listener, run_udp_listener, shutdown_signal};
 pub use outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};

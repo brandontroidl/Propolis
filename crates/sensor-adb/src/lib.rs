@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use sensor_framework::{
-    CaptureHandoff, ConnectionBounds, EventEmitter, OutboxManifest, QuarantineSpool, WanResolver,
-    run_tcp_listener,
+    CaptureHandoff, CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+    EventEmitter, OutboxManifest, QuarantineSpool, WanResolver, run_tcp_listener,
 };
 use tokio::task::JoinHandle;
 
@@ -53,14 +53,17 @@ pub async fn start_test_server(
         bounds,
         collector_id,
         outbox_dir,
+        Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES_256M)),
     )
     .await?;
     Ok((bound, handle))
 }
 
-/// `start_test_server` plus the capture hand-off, so `main` can `drain` it on shutdown. A separate
+/// `start_test_server` plus the capture hand-off, so `main` can `drain` it on shutdown, and the
+/// process-wide capture memory budget `main` built from its configured ceiling. A separate
 /// function rather than a wider return type so the many callers that never shut down (every
 /// integration test) are unchanged.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_test_server_with_handoff(
     addr: SocketAddr,
     log_path: PathBuf,
@@ -69,6 +72,7 @@ pub async fn start_test_server_with_handoff(
     bounds: ConnectionBounds,
     collector_id: String,
     outbox_dir: PathBuf,
+    capture_budget: Arc<CaptureMemoryBudget>,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>, Arc<CaptureHandoff>)> {
     std::fs::create_dir_all(&spool_dir)?;
 
@@ -83,6 +87,7 @@ pub async fn start_test_server_with_handoff(
         CAPTURE_QUEUE_SIZE,
         collector_id,
         OutboxManifest::new(outbox_dir),
+        capture_budget,
     ));
     handoff.start_worker();
 

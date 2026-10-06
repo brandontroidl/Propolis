@@ -7,7 +7,8 @@ use tokio::net::{TcpListener, TcpStream};
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
 use sensor_framework::{
-    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver, upload_metadata,
+    CaptureBody, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
+    upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
@@ -63,6 +64,9 @@ enum StorOutcome {
     /// The sensor stopped reading at `MAX_STOR_BODY + MAX_STOR_DRAIN`, the way a server stops
     /// when it cannot write any more of the file.
     DrainCapReached,
+    /// The process-wide capture memory budget had no room for more of the file. What was already
+    /// buffered is kept as a prefix; the reply is the same one a full disk gets.
+    CaptureBudgetExhausted,
 }
 
 /// A STOR upload being received: the retained body (at most `MAX_STOR_BODY`), the bytes the
@@ -70,7 +74,7 @@ enum StorOutcome {
 /// with the outcome, or from `Drop` as incomplete if the handler is cancelled mid-transfer (the
 /// listener's `max_duration` drops the whole future, so no code after the read would run).
 struct StorCapture {
-    body: Vec<u8>,
+    body: CaptureBody,
     wire_bytes: u64,
     submitted: bool,
     orig_name: String,
@@ -97,8 +101,11 @@ impl StorCapture {
                 Ok(Err(_)) | Err(_) => return StorOutcome::NetworkFailure,
                 Ok(Ok(n)) => {
                     let take = MAX_STOR_BODY.saturating_sub(self.body.len()).min(n);
-                    self.body.extend_from_slice(&chunk[..take]);
+                    let kept = self.body.extend_from_slice(&chunk[..take]);
                     self.wire_bytes += n as u64;
+                    if kept.is_err() {
+                        return StorOutcome::CaptureBudgetExhausted;
+                    }
                     if self.wire_bytes >= (MAX_STOR_BODY + MAX_STOR_DRAIN) as u64 {
                         return StorOutcome::DrainCapReached;
                     }
@@ -112,7 +119,7 @@ impl StorCapture {
             return;
         }
         self.submitted = true;
-        let body = std::mem::take(&mut self.body);
+        let body = std::mem::replace(&mut self.body, self.handoff.new_capture_body());
         let orig_name = self.orig_name.clone();
         let (source_ip, wan_ip, logged_in, session_id, wire_bytes) = (
             self.source_ip,
@@ -375,7 +382,7 @@ pub async fn handle_connection(
                         continue;
                     }
                     let mut capture = StorCapture {
-                        body: Vec::new(),
+                        body: handoff.new_capture_body(),
                         wire_bytes: 0,
                         submitted: false,
                         orig_name: filename.clone(),
@@ -390,7 +397,9 @@ pub async fn handle_connection(
                     let reply: &[u8] = match outcome {
                         StorOutcome::Complete => b"226 Transfer complete.\r\n",
                         StorOutcome::NetworkFailure => b"426 Failure reading network stream.\r\n",
-                        StorOutcome::DrainCapReached => b"451 Failure writing to local file.\r\n",
+                        StorOutcome::DrainCapReached | StorOutcome::CaptureBudgetExhausted => {
+                            b"451 Failure writing to local file.\r\n"
+                        }
                     };
                     let _ = write_line(&mut reader, reply).await;
                 } else {
@@ -532,12 +541,19 @@ mod tests {
             1,
             "test".to_string(),
             sensor_framework::OutboxManifest::new(outbox_dir),
+            Arc::new(sensor_framework::CaptureMemoryBudget::new(u64::MAX)),
         ))
+    }
+
+    fn body_of(bytes: &[u8]) -> CaptureBody {
+        let mut body = CaptureBody::unbudgeted();
+        body.extend_from_slice(bytes).unwrap();
+        body
     }
 
     fn probe_job() -> CaptureJob {
         CaptureJob {
-            body: vec![1],
+            body: body_of(&[1]),
             orig_name: "probe".into(),
             event_builder: Box::new(|_sample| unreachable!("never built")),
         }
@@ -550,7 +566,7 @@ mod tests {
     async fn stor_capture_is_submitted_when_the_handler_is_cancelled() {
         let handoff = one_slot_handoff();
         let capture = StorCapture {
-            body: b"MZ-part".to_vec(),
+            body: body_of(b"MZ-part"),
             wire_bytes: 7,
             submitted: false,
             orig_name: "x.bin".into(),
@@ -573,7 +589,7 @@ mod tests {
 
         let handoff = one_slot_handoff();
         let mut finished = StorCapture {
-            body: b"whole".to_vec(),
+            body: body_of(b"whole"),
             wire_bytes: 5,
             submitted: false,
             orig_name: "y.bin".into(),
@@ -590,7 +606,7 @@ mod tests {
             "exactly one submission: finish, not finish plus drop"
         );
         let empty = StorCapture {
-            body: Vec::new(),
+            body: CaptureBody::unbudgeted(),
             wire_bytes: 0,
             submitted: false,
             orig_name: "z.bin".into(),

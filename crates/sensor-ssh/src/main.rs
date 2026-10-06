@@ -17,8 +17,11 @@ use std::sync::Arc;
 
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal};
+use sensor_framework::{
+    CaptureMemoryBudget, ConnectionBounds, SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal,
+};
 use sensor_ssh::hostkey::HostKey;
+use sensor_ssh::server::DEFAULT_CAPTURE_BUDGET_BYTES;
 
 const ENV_BIND: &str = "PROPOLIS_SSH_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_SSH_WAN_MAP";
@@ -47,6 +50,10 @@ const ENV_COLLECTOR_ID_LEGACY: &str = "COLLECTOR_ID";
 /// must land inside this sensor's own writable spool root, which is already granted in its
 /// systemd `ReadWritePaths`.
 const ENV_OUTBOX_DIR: &str = "PROPOLIS_SSH_OUTBOX_DIR";
+/// Ceiling, in bytes, on capture bodies buffered in memory across every session. Defaults to 40%
+/// of the unit's 512M `MemoryMax` (`sensor_ssh::server::DEFAULT_CAPTURE_BUDGET_BYTES`; see
+/// `deploy/sensor-ssh.service`).
+const ENV_CAPTURE_MEMORY_BYTES: &str = "PROPOLIS_SSH_CAPTURE_MEMORY_BYTES";
 
 /// The software-version sent in `SSH-2.0-<this>`. Defaults to the OpenSSH build the shared persona
 /// claims (an Ubuntu 22.04 host -> OpenSSH 8.9p1), so the banner blends into the internet's largest
@@ -86,6 +93,7 @@ struct Config {
     banner: String,
     collector_id: String,
     outbox_dir: PathBuf,
+    capture_memory_bytes: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -208,6 +216,11 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let collector_id = sensor_framework::env_with_legacy(ENV_COLLECTOR_ID, ENV_COLLECTOR_ID_LEGACY)
         .unwrap_or_else(|| DEFAULT_COLLECTOR_ID.to_string());
     let outbox_dir = resolve_outbox_dir(&spool_dir, env::var(ENV_OUTBOX_DIR).ok());
+    let capture_memory_bytes = parse_positive_u64(
+        env::var(ENV_CAPTURE_MEMORY_BYTES).ok().as_deref(),
+        DEFAULT_CAPTURE_BUDGET_BYTES,
+        ENV_CAPTURE_MEMORY_BYTES,
+    )?;
 
     Ok(Config {
         bind_addr,
@@ -219,6 +232,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         banner,
         collector_id,
         outbox_dir,
+        capture_memory_bytes,
     })
 }
 
@@ -332,6 +346,7 @@ async fn main() {
         config.banner,
         config.collector_id,
         config.outbox_dir,
+        Arc::new(CaptureMemoryBudget::new(config.capture_memory_bytes)),
     )
     .await
     {
@@ -405,6 +420,21 @@ mod tests {
         let spool_dir = PathBuf::from("/custom/spool");
         let outbox_dir = resolve_outbox_dir(&spool_dir, None);
         assert_eq!(outbox_dir, PathBuf::from("/custom/spool/outbox"));
+    }
+
+    #[test]
+    fn capture_memory_ceiling_defaults_to_forty_percent_of_512m_and_rejects_zero_or_garbage() {
+        let parse = |raw: Option<&str>| {
+            parse_positive_u64(raw, DEFAULT_CAPTURE_BUDGET_BYTES, ENV_CAPTURE_MEMORY_BYTES)
+        };
+        assert_eq!(parse(None).unwrap(), 214_748_364);
+        assert_eq!(parse(Some("5000000")).unwrap(), 5_000_000);
+        for bad in ["0", "-1", "lots", ""] {
+            assert!(
+                matches!(parse(Some(bad)), Err(ConfigError::InvalidBound { .. })),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

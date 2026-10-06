@@ -24,6 +24,8 @@ ReadWritePaths=/var/log/propolis/ftp /var/spool/propolis/ftp
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
+# PROPOLIS_FTP_CAPTURE_MEMORY_BYTES (env file) defaults to 40% of this value. If MemoryMax is
+# changed, set that variable too, or the capture ceiling stays at the 256M-derived default.
 MemoryMax=256M
 TasksMax=128
 CPUQuota=50%

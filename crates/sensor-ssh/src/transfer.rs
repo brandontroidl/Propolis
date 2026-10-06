@@ -23,7 +23,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use sensor_framework::fakefs::FakeFs;
-use sensor_framework::{CaptureHandoff, CaptureJob, Uuid, upload_metadata};
+use sensor_framework::{CaptureBody, CaptureHandoff, CaptureJob, Uuid, upload_metadata};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
 };
@@ -99,7 +99,8 @@ pub struct ScpReceiver {
     filename: String,
     /// Permission bits from the C-line, applied when the file lands in the fake tree.
     perm: u32,
-    body: Vec<u8>,
+    /// Charged to the sensor's process-wide capture memory budget while it is buffered.
+    body: CaptureBody,
     /// Body bytes consumed off the wire for the current file, capped or not - what the client
     /// actually sent, as opposed to `body.len()`, what was retained.
     wire_bytes: u64,
@@ -126,13 +127,14 @@ impl ScpReceiver {
         fs: FakeFs,
         cmd: &str,
     ) -> (Self, Vec<u8>) {
+        let body = handoff.new_capture_body();
         (
             Self {
                 state: ScpState::WaitHeader,
                 line_buf: Vec::new(),
                 filename: String::new(),
                 perm: DEFAULT_UPLOAD_PERM,
-                body: Vec::new(),
+                body,
                 wire_bytes: 0,
                 source_ip,
                 wan_ip,
@@ -170,7 +172,9 @@ impl ScpReceiver {
             return;
         }
         if let Some(dest) = self.fs_destination() {
-            let _ = self.fs.write_file_mode(&dest, &self.body, self.perm);
+            let _ = self
+                .fs
+                .write_file_mode(&dest, self.body.as_slice(), self.perm);
         }
     }
 
@@ -189,10 +193,11 @@ impl ScpReceiver {
                             if let Some((perm, size, name)) = parse_scp_header(&self.line_buf) {
                                 self.filename = name;
                                 self.perm = perm;
-                                self.body.clear();
+                                // A fresh body, not `clear`: the previous file's was handed to the
+                                // hand-off, and nothing is reserved up front because the declared
+                                // size is attacker-controlled - the budget charges real bytes.
+                                self.body = self.handoff.new_capture_body();
                                 self.wire_bytes = 0;
-                                let capped = (size as usize).min(MAX_CAPTURE_BODY);
-                                self.body.reserve(capped);
                                 self.state = ScpState::ReadingBody {
                                     expected: size,
                                     consumed: 0,
@@ -222,23 +227,36 @@ impl ScpReceiver {
                     // Only store bytes up to the memory cap; the rest is drained to keep
                     // the protocol state machine aligned with the wire.
                     let storable = MAX_CAPTURE_BODY.saturating_sub(self.body.len()).min(take);
-                    if storable > 0 {
+                    let kept = if storable > 0 {
                         self.body
-                            .extend_from_slice(&data[offset..offset + storable]);
-                    }
+                            .extend_from_slice(&data[offset..offset + storable])
+                    } else {
+                        Ok(())
+                    };
 
                     *consumed += take;
                     self.wire_bytes += take as u64;
                     offset += take;
-                    if *consumed >= expected as usize {
+                    if kept.is_err() {
+                        // The process-wide capture budget is full. Keep the prefix, hand it off
+                        // now (the transfer is over, so nothing else will), and fail the copy the
+                        // way scp's own sink does when its disk fills: a warning byte plus text.
+                        let job = self.capture_job(false);
+                        let _ = self.handoff.submit(job);
+                        response.push(1);
+                        response.extend_from_slice(b"scp: No space left on device\n");
+                        self.state = ScpState::Done;
+                    } else if *consumed >= expected as usize {
                         self.state = ScpState::WaitTrailer;
                     }
                 }
                 ScpState::WaitTrailer => {
                     // The client sends a single \0 byte after the file body.
                     offset += 1;
-                    let _ = self.handoff.submit(self.capture_job(true));
+                    // The fake-tree copy reads the body, so it goes first: the job takes it.
                     self.land_in_fake_fs();
+                    let job = self.capture_job(true);
+                    let _ = self.handoff.submit(job);
                     response.push(0); // final ack
                     self.state = ScpState::Done;
                 }
@@ -263,8 +281,9 @@ impl ScpReceiver {
         unfinished.then(|| self.capture_job(false))
     }
 
-    fn capture_job(&self, complete: bool) -> CaptureJob {
-        let body = self.body.clone();
+    /// Moves the buffered body into a job, leaving an empty (uncharged) one behind.
+    fn capture_job(&mut self, complete: bool) -> CaptureJob {
+        let body = std::mem::replace(&mut self.body, self.handoff.new_capture_body());
         let orig_name = self.filename.clone();
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
@@ -365,7 +384,8 @@ struct SftpOpenFile {
     orig_name: String,
     /// Permission bits from the OPEN attrs, applied when the file lands in the fake tree.
     perm: u32,
-    body: Vec<u8>,
+    /// Charged to the sensor's process-wide capture memory budget while it is buffered.
+    body: CaptureBody,
     /// Bytes the client wrote to this handle, including any dropped past the per-file or
     /// per-session cap; `body.len()` is what was retained.
     wire_bytes: u64,
@@ -510,7 +530,7 @@ impl SftpHandler {
             SftpOpenFile {
                 orig_name: String::from_utf8_lossy(&filename).into_owned(),
                 perm,
-                body: Vec::new(),
+                body: self.handoff.new_capture_body(),
                 wire_bytes: 0,
             },
         );
@@ -542,18 +562,29 @@ impl SftpHandler {
         let stored = if let Some(file) = self.handles.get_mut(handle_str.as_ref()) {
             let file_room = SFTP_MAX_FILE_BODY.saturating_sub(file.body.len());
             let storable = data.len().min(file_room).min(session_room);
-            if storable > 0 {
-                file.body.extend_from_slice(&data[..storable]);
-            }
+            let before = file.body.len();
+            let kept = if storable > 0 {
+                file.body.extend_from_slice(&data[..storable])
+            } else {
+                Ok(())
+            };
             file.wire_bytes += data.len() as u64;
-            Some(storable)
+            // What the body really grew by: on a budget refusal that is less than `storable`.
+            Some((file.body.len() - before, kept.is_ok()))
         } else {
             None
         };
         match stored {
-            Some(storable) => {
-                self.resident_body += storable;
-                build_status(id, SSH_FX_OK)
+            Some((retained, within_budget)) => {
+                self.resident_body += retained;
+                // The process-wide capture budget is full: the prefix is kept, and the write
+                // fails the way a full disk's does, which makes sftp clients abort the transfer.
+                let status = if within_budget {
+                    SSH_FX_OK
+                } else {
+                    SSH_FX_FAILURE
+                };
+                build_status(id, status)
             }
             None => build_status(id, SSH_FX_OP_UNSUPPORTED),
         }
@@ -571,7 +602,9 @@ impl SftpHandler {
         let handle_str = String::from_utf8_lossy(&handle);
         if let Some(file) = self.handles.remove(handle_str.as_ref()) {
             self.resident_body = self.resident_body.saturating_sub(file.body.len());
-            if !file.body.is_empty() {
+            // A handle the budget starved of its first byte is submitted too, so the hand-off
+            // counts the refusal; it submits no sample for an empty exhausted body.
+            if !file.body.is_empty() || file.body.is_exhausted() {
                 self.land_in_fake_fs(&file);
                 let _ = self.handoff.submit(self.capture_job(file, true));
             }
@@ -590,7 +623,9 @@ impl SftpHandler {
             return;
         }
         if let Some(dest) = upload_destination(&file.orig_name) {
-            let _ = self.fs.write_file_mode(&dest, &file.body, file.perm);
+            let _ = self
+                .fs
+                .write_file_mode(&dest, file.body.as_slice(), file.perm);
         }
     }
 
@@ -812,6 +847,7 @@ mod tests {
             16,
             "test".to_string(),
             sensor_framework::OutboxManifest::new(outbox_dir),
+            Arc::new(sensor_framework::CaptureMemoryBudget::new(u64::MAX)),
         ))
     }
 
@@ -882,7 +918,10 @@ mod tests {
         scp.feed(b"C0644 100 dropper.bin\n");
         scp.feed(b"MZ-first-forty-bytes-of-a-hundred-byte-f");
         let job = scp.abandon().expect("bytes arrived, so a capture");
-        assert_eq!(job.body, b"MZ-first-forty-bytes-of-a-hundred-byte-f");
+        assert_eq!(
+            job.body.as_slice(),
+            b"MZ-first-forty-bytes-of-a-hundred-byte-f"
+        );
         assert_eq!(job.orig_name, "dropper.bin");
         let sample = sample_for(&job);
         let event = (job.event_builder)(sample);
@@ -907,7 +946,7 @@ mod tests {
         let job = trailerless
             .abandon()
             .expect("a complete body without its trailer is still a capture");
-        assert_eq!(job.body, b"ABC");
+        assert_eq!(job.body.as_slice(), b"ABC");
         let sample = sample_for(&job);
         let event = (job.event_builder)(sample);
         assert_eq!(event.metadata["complete"], false);
@@ -942,12 +981,15 @@ mod tests {
             1,
             "test".to_string(),
             sensor_framework::OutboxManifest::new(outbox_dir),
+            Arc::new(sensor_framework::CaptureMemoryBudget::new(u64::MAX)),
         ))
     }
 
     fn probe_job() -> CaptureJob {
+        let mut body = CaptureBody::unbudgeted();
+        body.extend_from_slice(&[1]).unwrap();
         CaptureJob {
-            body: vec![1],
+            body,
             orig_name: "probe".into(),
             event_builder: Box::new(|_sample| unreachable!("never built")),
         }
@@ -1071,7 +1113,7 @@ mod tests {
         let mut jobs = sftp.abandon();
         assert_eq!(jobs.len(), 1);
         let job = jobs.remove(0);
-        assert_eq!(job.body, b"\x7fELF-fr");
+        assert_eq!(job.body.as_slice(), b"\x7fELF-fr");
         assert_eq!(job.orig_name, "dropper.elf");
         let sample = sample_for(&job);
         let event = (job.event_builder)(sample);
@@ -1380,6 +1422,156 @@ mod tests {
         assert!(
             handoff.submit(probe_job()).is_err(),
             "evidence still submitted"
+        );
+    }
+
+    /// A one-slot hand-off (no worker) over a capture budget of `ceiling` bytes, with the budget.
+    fn budgeted_one_slot_handoff(
+        ceiling: u64,
+    ) -> (
+        Arc<CaptureHandoff>,
+        Arc<sensor_framework::CaptureMemoryBudget>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let spool =
+            sensor_framework::QuarantineSpool::new(spool_dir, MAX_CAPTURE_BODY as u64, 100_000_000);
+        let emitter = sensor_framework::EventEmitter::new(dir.path().join("events.jsonl"));
+        let outbox = sensor_framework::OutboxManifest::new(dir.path().join("outbox"));
+        std::mem::forget(dir);
+        let budget = Arc::new(sensor_framework::CaptureMemoryBudget::new(ceiling));
+        let handoff = Arc::new(CaptureHandoff::new(
+            spool,
+            emitter,
+            1,
+            "test".to_string(),
+            outbox,
+            budget.clone(),
+        ));
+        (handoff, budget)
+    }
+
+    #[test]
+    fn scp_capture_that_exhausts_the_memory_budget_keeps_its_prefix_and_fails_the_copy() {
+        use sensor_framework::CAPTURE_CHUNK_BYTES;
+        let (handoff, budget) = budgeted_one_slot_handoff(CAPTURE_CHUNK_BYTES);
+        let (mut scp, _) = ScpReceiver::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+            FakeFs::new(),
+            "scp -t /tmp/big",
+        );
+        scp.feed(b"C0644 200000 big.bin\n");
+        let reply = scp.feed(&vec![7u8; 100_000]);
+        assert_eq!(reply[0], 1, "an scp error byte, not a protocol ack");
+        assert!(reply.ends_with(b"No space left on device\n"));
+        assert_eq!(handoff.truncated_capture_count(), 1);
+        assert_eq!(handoff.refused_capture_count(), 0);
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the truncated prefix took the one queue slot"
+        );
+        // The transfer is over: nothing more is buffered and Drop does not submit a second copy.
+        assert!(scp.feed(&vec![7u8; 1000]).is_empty());
+        drop(scp);
+        assert_eq!(
+            budget.current_bytes(),
+            CAPTURE_CHUNK_BYTES,
+            "only the queued prefix's chunk is held; the receiver holds none"
+        );
+        assert_eq!(handoff.truncated_capture_count(), 1);
+    }
+
+    #[test]
+    fn scp_capture_that_gets_zero_bytes_submits_nothing_and_counts_a_refusal() {
+        use sensor_framework::CAPTURE_CHUNK_BYTES;
+        let (handoff, budget) = budgeted_one_slot_handoff(CAPTURE_CHUNK_BYTES);
+        let mut hog = handoff.new_capture_body();
+        hog.extend_from_slice(b"x").unwrap();
+        let (mut scp, _) = ScpReceiver::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+            FakeFs::new(),
+            "scp -t /tmp/none",
+        );
+        scp.feed(b"C0644 50 none.bin\n");
+        let reply = scp.feed(&[9u8; 50]);
+        assert_eq!(reply[0], 1);
+        assert_eq!(handoff.refused_capture_count(), 1);
+        assert_eq!(handoff.truncated_capture_count(), 0);
+        assert!(
+            handoff.submit(probe_job()).is_ok(),
+            "no sample was queued for a capture that got zero bytes"
+        );
+        drop(hog);
+        assert_eq!(budget.current_bytes(), 0);
+    }
+
+    #[test]
+    fn sftp_write_that_exhausts_the_memory_budget_fails_with_the_prefix_kept() {
+        use sensor_framework::CAPTURE_CHUNK_BYTES;
+        fn pkt(msg: u8, parts: &[&[u8]]) -> Vec<u8> {
+            let mut body = vec![msg];
+            for p in parts {
+                body.extend_from_slice(p);
+            }
+            let mut out = (body.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(&body);
+            out
+        }
+        fn s(b: &[u8]) -> Vec<u8> {
+            let mut v = (b.len() as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(b);
+            v
+        }
+        let (handoff, _budget) = budgeted_one_slot_handoff(CAPTURE_CHUNK_BYTES);
+        let mut sftp = SftpHandler::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+            FakeFs::new(),
+        );
+        let resp = sftp.feed(&pkt(
+            SSH_FXP_OPEN,
+            &[
+                &1u32.to_be_bytes(),
+                &s(b"big.bin"),
+                &SSH_FXF_WRITE.to_be_bytes(),
+                &0u32.to_be_bytes(),
+            ],
+        ));
+        let len = u32::from_be_bytes([resp[9], resp[10], resp[11], resp[12]]) as usize;
+        let handle = resp[13..13 + len].to_vec();
+        let write = |sftp: &mut SftpHandler, id: u32, data: &[u8]| {
+            let resp = sftp.feed(&pkt(
+                SSH_FXP_WRITE,
+                &[
+                    &id.to_be_bytes(),
+                    &s(&handle),
+                    &0u64.to_be_bytes(),
+                    &s(data),
+                ],
+            ));
+            u32::from_be_bytes([resp[9], resp[10], resp[11], resp[12]])
+        };
+        // 40 KB fits the single chunk; the next 40 KB needs a second chunk the budget lacks.
+        assert_eq!(write(&mut sftp, 2, &[1u8; 40_000]), SSH_FX_OK);
+        assert_eq!(write(&mut sftp, 3, &[2u8; 40_000]), SSH_FX_FAILURE);
+        assert_eq!(
+            sftp.resident_body, CAPTURE_CHUNK_BYTES as usize,
+            "the prefix that fit is what is resident"
+        );
+        sftp.feed(&pkt(SSH_FXP_CLOSE, &[&4u32.to_be_bytes(), &s(&handle)]));
+        assert_eq!(handoff.truncated_capture_count(), 1);
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the prefix was queued"
         );
     }
 

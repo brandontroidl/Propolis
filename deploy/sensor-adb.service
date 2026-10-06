@@ -22,6 +22,8 @@ RestrictAddressFamilies=AF_INET AF_INET6
 ReadWritePaths=/var/log/propolis/adb /var/spool/propolis/adb
 CapabilityBoundingSet=
 
+# PROPOLIS_ADB_CAPTURE_MEMORY_BYTES (env file) defaults to 40% of this value. If MemoryMax is
+# changed, set that variable too, or the capture ceiling stays at the 256M-derived default.
 MemoryMax=256M
 TasksMax=128
 CPUQuota=50%

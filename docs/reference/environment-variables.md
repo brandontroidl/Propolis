@@ -611,6 +611,33 @@ read identically by each of those five sensors' `main.rs`:
 | `PROPOLIS_COLLECTOR_ID` (deprecated alias `COLLECTOR_ID`, still read; shared across all six binaries, not `PROPOLIS_<SENSOR>_*`) | no | `local` | Stamped onto every manifest row this sensor writes. **Must equal** the CommonName of the client certificate `shipper`'s `PROPOLIS_COLLECTOR_ID` presents to the gateway on this box, because a later stage joins the gateway's cert-derived collector id against this manifest on `(collector_id, occurrence_id)`. A single-node deployment with no shipper leaves this at `local`. |
 | `PROPOLIS_<SENSOR>_OUTBOX_DIR` | no | `<PROPOLIS_<SENSOR>_SPOOL_DIR>/outbox` | Root of the per-capture manifest JSON files (`<dir>/<capture_id>.json`). The default is derived from the sensor's own resolved spool directory (not a fixed shared path) so it always lands inside the writable root the sensor's systemd unit grants - a fixed shared `/var/lib/propolis/outbox` default is unwritable under `ProtectSystem=strict` and was the SP-B-1c regression this fixed. Manifest rows are keyed by a globally-unique `capture_id`, so even where two sensors' outbox dirs happened to coincide, writes would never collide. |
 
+#### Capture memory budget
+
+Each of the five body-capturing sensors holds a process-wide ceiling on the bytes of captured
+bodies buffered in memory at once (`sensor_framework::capture_budget::CaptureMemoryBudget`), so
+many concurrent uploads cannot together push the process past its systemd `MemoryMax`. A body is
+charged in 64 KiB chunks from its first byte and refunded as soon as the hand-off worker has
+spooled it (`sensor_framework::handoff::process_job`). One variable per sensor, read by that
+sensor's `main.rs`:
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_SSH_CAPTURE_MEMORY_BYTES` | no | `214748364` (40% of the unit's `MemoryMax=512M`, `sensor-ssh/src/server.rs#DEFAULT_CAPTURE_BUDGET_BYTES`) | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_FTP_CAPTURE_MEMORY_BYTES` | no | `107374182` (40% of `MemoryMax=256M`, `sensor-framework/src/capture_budget.rs#DEFAULT_CAPTURE_BUDGET_BYTES_256M`) | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_ADB_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_TELNET_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_TFTP_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
+
+When a capture hits the ceiling it keeps the prefix already buffered, stops growing, and the
+transfer is ended the way the protocol ends a full disk (FTP `451`, TFTP ERROR 3, SCP error byte,
+SFTP `FAILURE`, ADB sync `FAIL`; a shell-stream capture just stops growing). The sample's event
+metadata carries `truncated: true`, `complete: false` and `end_reason: "capture_memory_budget"`. A
+capture that cannot buffer even one byte submits no sample and no `malware_upload` event (the
+ordinary connection event is unaffected); the hand-off counts it as refused. The 40% share is an
+unmeasured choice that leaves the rest of `MemoryMax` for the runtime, parsers, fake-filesystem
+state and allocator overhead, none of which this budget charges. Raise the variable only together
+with the unit's `MemoryMax`.
+
 ### Lenient sensors - cred, smtp
 
 Invalid or zero bound → **silent default**, not abort.

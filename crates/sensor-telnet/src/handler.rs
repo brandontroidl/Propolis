@@ -17,8 +17,8 @@ use sensor_framework::persona;
 use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell, onlcr};
 use sensor_framework::{
-    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget, EgressState,
-    EventEmitter, Uuid, WanResolver, limits_from, upload_metadata,
+    CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget,
+    EgressState, EventEmitter, Uuid, WanResolver, limits_from, upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
@@ -111,7 +111,7 @@ pub async fn handle_connection(
 
     // Built before `bounds` moves into the reader: the connection's one budget.
     let budget = ConnectionBudget::new(limits_from(&bounds));
-    let mut reader = LineReader::new(bounds);
+    let mut reader = LineReader::new(bounds, handoff.clone());
 
     let login_prompt = format!("{host} login: ");
     if write_telnet_data(&mut stream, write_timeout, login_prompt.as_bytes(), None)
@@ -176,7 +176,7 @@ pub async fn handle_connection(
     // dropping this whole future, so a submit written after the loop below never runs for a
     // session that hits the bound - and a dropper streaming a large payload is exactly the
     // session that does. `Drop` is the only code that runs on every exit path.
-    reader.arm_capture_submit(handoff.clone(), source_ip, wan_ip, session_id);
+    reader.arm_capture_submit(source_ip, wan_ip, session_id);
 
     loop {
         let Some(line) = reader.read_line(&mut stream, true).await else {
@@ -333,7 +333,10 @@ struct LineReader {
     /// capture buffer `take_capture` drains. Distinct from `total_captured`/`current`: those track
     /// line assembly and the whole-session byte budget, this tracks only the shell-phase bytes a
     /// caller has opted into preserving.
-    capture: Vec<u8>,
+    capture: CaptureBody,
+    /// Where `capture` bodies are allocated from (its process-wide memory budget) and submitted
+    /// to, so a drained capture is replaced by a fresh budgeted one.
+    handoff: Arc<CaptureHandoff>,
     /// Shell-phase bytes that arrived after `capture` hit `bounds.max_captured_bytes` and were
     /// dropped, so the emitted event can say the capture is a prefix and how big the whole was.
     capture_overflow: u64,
@@ -354,7 +357,6 @@ struct LineReader {
 
 /// The connection facts `LineReader::drop` stamps onto the capture it submits.
 struct CaptureSubmit {
-    handoff: Arc<CaptureHandoff>,
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
     session_id: Uuid,
@@ -365,14 +367,16 @@ struct CaptureSubmit {
 /// after the session loop runs. `CaptureHandoff::submit` never blocks, so it is safe here.
 impl Drop for LineReader {
     fn drop(&mut self) {
-        if self.capture.is_empty() {
+        // An empty body that was starved by the budget still goes to `submit`, which counts it as
+        // a refusal; a merely empty one has nothing to report.
+        if self.capture.is_empty() && !self.capture.is_exhausted() {
             return;
         }
         // The per-line flag is only raised once a complete line reached the shell. A payload
         // still mid-line when the session was cancelled never got one, so the bytes themselves
         // are the fallback test - otherwise a dropper's buffer reads as ordinary typing and is
         // thrown away, which is the loss this destructor exists to prevent.
-        if !self.binary_seen && !sensor_framework::shell::looks_binary(&self.capture) {
+        if !self.binary_seen && !sensor_framework::shell::looks_binary(self.capture.as_slice()) {
             return;
         }
         let Some(ctx) = self.submit.take() else {
@@ -388,7 +392,7 @@ impl Drop for LineReader {
         // incomplete rather than as a whole sample.
         let end = self.session_end;
         let (source_ip, wan_ip, session_id) = (ctx.source_ip, ctx.wan_ip, ctx.session_id);
-        let _ = ctx.handoff.submit(CaptureJob {
+        let _ = self.handoff.submit(CaptureJob {
             body,
             orig_name: format!("telnet-session-{session_id}"),
             event_builder: Box::new(move |sample: SampleRef| SensorEvent {
@@ -416,7 +420,7 @@ impl Drop for LineReader {
 }
 
 impl LineReader {
-    fn new(bounds: ConnectionBounds) -> Self {
+    fn new(bounds: ConnectionBounds, handoff: Arc<CaptureHandoff>) -> Self {
         Self {
             filter: IacFilter::new(),
             pending: VecDeque::new(),
@@ -425,7 +429,8 @@ impl LineReader {
             first_read: true,
             total_captured: 0,
             prev_cr: false,
-            capture: Vec::new(),
+            capture: handoff.new_capture_body(),
+            handoff,
             capture_overflow: 0,
             capturing: false,
             binary_seen: false,
@@ -436,15 +441,8 @@ impl LineReader {
 
     /// Let this reader hand its capture off when it is dropped. Called once, alongside
     /// `start_capture`.
-    fn arm_capture_submit(
-        &mut self,
-        handoff: Arc<CaptureHandoff>,
-        source_ip: IpAddr,
-        wan_ip: Option<IpAddr>,
-        session_id: Uuid,
-    ) {
+    fn arm_capture_submit(&mut self, source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) {
         self.submit = Some(CaptureSubmit {
-            handoff,
             source_ip,
             wan_ip,
             session_id,
@@ -470,8 +468,8 @@ impl LineReader {
     }
 
     /// Drain and return everything accumulated in the capture buffer so far.
-    fn take_capture(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.capture)
+    fn take_capture(&mut self) -> CaptureBody {
+        std::mem::replace(&mut self.capture, self.handoff.new_capture_body())
     }
 
     /// Shell-phase bytes the client sent while capturing, retained or dropped past the ceiling.
@@ -493,8 +491,12 @@ impl LineReader {
             .max_captured_bytes
             .saturating_sub(self.capture.len() as u64) as usize;
         let take = data.len().min(room);
-        self.capture.extend_from_slice(&data[..take]);
-        self.capture_overflow += (data.len() - take) as u64;
+        let before = self.capture.len();
+        // A budget refusal keeps the prefix already held and marks the body exhausted for the
+        // hand-off; what was not kept counts toward the overflow like bytes past the ceiling.
+        let _ = self.capture.extend_from_slice(&data[..take]);
+        let kept = self.capture.len() - before;
+        self.capture_overflow += (data.len() - kept) as u64;
     }
 
     /// Read one line (terminated by `\n` or `\r`) of already IAC-stripped, lossily-decoded text.
@@ -657,26 +659,24 @@ mod tests {
             1,
             "test".to_string(),
             sensor_framework::OutboxManifest::new(outbox_dir),
+            Arc::new(sensor_framework::CaptureMemoryBudget::new(u64::MAX)),
         ))
     }
 
     fn probe_job() -> CaptureJob {
+        let mut body = CaptureBody::unbudgeted();
+        body.extend_from_slice(&[1]).unwrap();
         CaptureJob {
-            body: vec![1],
+            body,
             orig_name: "probe".into(),
             event_builder: Box::new(|_sample| unreachable!("never built")),
         }
     }
 
     fn armed_reader(handoff: Arc<CaptureHandoff>) -> LineReader {
-        let mut reader = LineReader::new(test_bounds());
+        let mut reader = LineReader::new(test_bounds(), handoff);
         reader.start_capture();
-        reader.arm_capture_submit(
-            handoff,
-            "203.0.113.7".parse().unwrap(),
-            None,
-            Uuid::now_v7(),
-        );
+        reader.arm_capture_submit("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
         reader
     }
 
@@ -688,7 +688,10 @@ mod tests {
     async fn the_binary_shell_capture_survives_a_cancelled_session() {
         let handoff = one_slot_handoff();
         let mut reader = armed_reader(handoff.clone());
-        reader.capture.extend_from_slice(b"\x7fELF-payload-bytes");
+        reader
+            .capture
+            .extend_from_slice(b"\x7fELF-payload-bytes")
+            .unwrap();
         reader.flag_binary();
 
         let cancelled = tokio::time::timeout(std::time::Duration::from_millis(10), async move {
@@ -712,7 +715,10 @@ mod tests {
     async fn a_plaintext_session_submits_nothing_when_cancelled() {
         let handoff = one_slot_handoff();
         let mut reader = armed_reader(handoff.clone());
-        reader.capture.extend_from_slice(b"cat /proc/mounts\n");
+        reader
+            .capture
+            .extend_from_slice(b"cat /proc/mounts\n")
+            .unwrap();
 
         drop(reader);
         assert!(
@@ -726,7 +732,7 @@ mod tests {
         // Mirrors the login phase: bytes flow through the reader before start_capture is ever
         // called, and must never land in the capture buffer - this is the mechanism that keeps
         // the password out of any spooled evidence.
-        let mut reader = LineReader::new(test_bounds());
+        let mut reader = LineReader::new(test_bounds(), one_slot_handoff());
         reader.capture_bytes(b"root\r\nhunter2\r\n");
         assert!(
             reader.take_capture().is_empty(),
@@ -736,11 +742,14 @@ mod tests {
 
     #[test]
     fn capture_accumulates_post_iac_bytes_once_capturing() {
-        let mut reader = LineReader::new(test_bounds());
+        let mut reader = LineReader::new(test_bounds(), one_slot_handoff());
         reader.start_capture();
         reader.capture_bytes(b"echo hi\r\n");
         reader.capture_bytes(&[0x7f, 0xe1, 0x08, 0xff]);
-        assert_eq!(reader.take_capture(), b"echo hi\r\n\x7f\xe1\x08\xff");
+        assert_eq!(
+            reader.take_capture().as_slice(),
+            b"echo hi\r\n\x7f\xe1\x08\xff"
+        );
         // take_capture drains: a second call returns nothing more until fed again.
         assert!(reader.take_capture().is_empty());
     }
@@ -749,7 +758,7 @@ mod tests {
     fn capture_is_bounded_by_max_captured_bytes() {
         let mut bounds = test_bounds();
         bounds.max_captured_bytes = 10;
-        let mut reader = LineReader::new(bounds);
+        let mut reader = LineReader::new(bounds, one_slot_handoff());
         reader.start_capture();
         reader.capture_bytes(b"0123456789ABCDEF"); // 16 bytes offered, cap is 10
         // The whole offered size is still known, so the event can say the capture is a prefix.
@@ -769,12 +778,12 @@ mod tests {
         );
 
         let captured = reader.take_capture();
-        assert_eq!(captured, b"0123456789");
+        assert_eq!(captured.as_slice(), b"0123456789");
     }
 
     #[test]
     fn crnul_enter_does_not_orphan_nul_into_the_next_command() {
-        let mut reader = LineReader::new(test_bounds());
+        let mut reader = LineReader::new(test_bounds(), one_slot_handoff());
         let mut echo = Vec::new();
         // A real telnet client transmits a bare Enter as CR-NUL (RFC 854 s.4.3). Two commands, each
         // terminated that way: the NUL after the first must not corrupt the second command.
@@ -794,7 +803,7 @@ mod tests {
 
     #[test]
     fn typed_chars_are_echoed_and_backspace_erases() {
-        let mut reader = LineReader::new(test_bounds());
+        let mut reader = LineReader::new(test_bounds(), one_slot_handoff());
         let mut echo = Vec::new();
         // Type "ab", backspace (DEL), "c", Enter as CR-NUL.
         reader.feed(b"ab\x7fc\r\x00", true, &mut echo);
@@ -804,7 +813,7 @@ mod tests {
 
     #[test]
     fn password_read_hides_chars_but_still_echoes_the_enter() {
-        let mut reader = LineReader::new(test_bounds());
+        let mut reader = LineReader::new(test_bounds(), one_slot_handoff());
         let mut echo = Vec::new();
         reader.feed(b"secret\r\x00", false, &mut echo);
         assert_eq!(reader.pending.pop_front().as_deref(), Some("secret"));
@@ -814,7 +823,7 @@ mod tests {
 
     #[test]
     fn empty_enter_submits_an_empty_line_so_the_prompt_reprints() {
-        let mut reader = LineReader::new(test_bounds());
+        let mut reader = LineReader::new(test_bounds(), one_slot_handoff());
         let mut echo = Vec::new();
         reader.feed(b"\r\x00", true, &mut echo);
         assert_eq!(reader.pending.pop_front().as_deref(), Some(""));

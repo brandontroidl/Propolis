@@ -155,6 +155,9 @@ pub struct CaptureBody {
     budget: Arc<CaptureMemoryBudget>,
     buf: Vec<u8>,
     chunks: Vec<Reservation>,
+    /// Sticky: set the first time an append was refused for lack of budget, so the hand-off can
+    /// mark the capture truncated without every sensor threading its own flag.
+    exhausted: bool,
 }
 
 impl CaptureBody {
@@ -164,7 +167,19 @@ impl CaptureBody {
             budget,
             buf: Vec::new(),
             chunks: Vec::new(),
+            exhausted: false,
         }
+    }
+
+    /// A body charged to a private budget that can never refuse. For tests and fixtures only: a
+    /// sensor that used it would hold capture memory outside the process-wide ceiling.
+    pub fn unbudgeted() -> Self {
+        Self::with_budget(Arc::new(CaptureMemoryBudget::new(u64::MAX)))
+    }
+
+    /// Whether any append was refused for lack of budget (the body is then a truncated prefix).
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
     }
 
     fn charged_capacity(&self) -> usize {
@@ -175,7 +190,15 @@ impl CaptureBody {
     /// Appends `data`, reserving more chunks as needed. If a chunk cannot be reserved, as much of
     /// `data` as fits in already-charged capacity is still appended, nothing further is, and
     /// `Err(CaptureExhausted)` is returned: the caller keeps the prefix and marks truncation.
+    ///
+    /// Exhaustion is latched: once refused, every later call returns `Err` without appending or
+    /// reserving, even if other captures have since freed budget. Otherwise a continuing caller
+    /// would splice later bytes after the dropped ones and the hand-off would hash that gapped
+    /// body as a contiguous prefix.
     pub fn extend_from_slice(&mut self, data: &[u8]) -> Result<(), CaptureExhausted> {
+        if self.exhausted {
+            return Err(CaptureExhausted);
+        }
         let wanted = self.buf.len().saturating_add(data.len());
         let mut exhausted = false;
         while self.charged_capacity() < wanted {
@@ -198,6 +221,7 @@ impl CaptureBody {
             self.buf.extend_from_slice(head);
         }
         if exhausted {
+            self.exhausted = true;
             Err(CaptureExhausted)
         } else {
             Ok(())
@@ -386,6 +410,26 @@ mod tests {
     }
 
     #[test]
+    fn exhaustion_is_latched_even_after_budget_frees() {
+        let chunk = CAPTURE_CHUNK_BYTES as usize;
+        let b = Arc::new(CaptureMemoryBudget::new(2 * CAPTURE_CHUNK_BYTES));
+        let mut body = CaptureBody::with_budget(Arc::clone(&b));
+        // Another capture holds one chunk, so the body can only get one.
+        let other = b.try_reserve(CAPTURE_CHUNK_BYTES).unwrap();
+        let first: Vec<u8> = (0..chunk + 10).map(|i| (i % 251) as u8).collect();
+        assert_eq!(body.extend_from_slice(&first), Err(CaptureExhausted));
+        assert_eq!(body.len(), chunk);
+        let prefix = body.as_slice().to_vec();
+        assert_eq!(&prefix[..], &first[..chunk]);
+        // Room appears: without the latch this would append after the dropped bytes.
+        drop(other);
+        assert_eq!(body.extend_from_slice(b"later"), Err(CaptureExhausted));
+        assert_eq!(body.as_slice(), &prefix[..]);
+        assert_eq!(b.current_bytes(), CAPTURE_CHUNK_BYTES);
+        assert!(body.is_exhausted());
+    }
+
+    #[test]
     fn dropping_body_refunds_every_chunk() {
         let b = Arc::new(CaptureMemoryBudget::new(10 * CAPTURE_CHUNK_BYTES));
         let _other = b.try_reserve(123).unwrap();
@@ -418,8 +462,12 @@ mod tests {
         assert_eq!(c.extend_from_slice(b"c"), Err(CaptureExhausted));
         assert!(c.is_empty());
         drop(a);
-        c.extend_from_slice(b"c").unwrap();
-        assert_eq!(c.as_slice(), b"c");
+        // The refused body stays refused (latched); freed room serves a new body.
+        assert_eq!(c.extend_from_slice(b"c"), Err(CaptureExhausted));
+        assert!(c.is_empty());
+        let mut d = CaptureBody::with_budget(Arc::clone(&b));
+        d.extend_from_slice(b"d").unwrap();
+        assert_eq!(d.as_slice(), b"d");
     }
 
     #[test]

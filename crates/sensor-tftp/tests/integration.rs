@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, WanResolver};
+use sensor_framework::{
+    CAPTURE_CHUNK_BYTES, CaptureHandoff, CaptureMemoryBudget, ConnectionBounds,
+    DEFAULT_CAPTURE_BUDGET_BYTES_256M, WanResolver,
+};
 use sensor_wire::{
     PROTO_UDP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SensorEvent,
 };
@@ -29,6 +32,8 @@ struct TestServer {
     log_path: PathBuf,
     spool_dir: PathBuf,
     handle: JoinHandle<()>,
+    handoff: Arc<CaptureHandoff>,
+    budget: Arc<CaptureMemoryBudget>,
     _dir: tempfile::TempDir,
 }
 
@@ -41,10 +46,23 @@ impl TestServer {
         bounds: ConnectionBounds,
         wan_map: HashMap<std::net::IpAddr, std::net::IpAddr>,
     ) -> TestServer {
+        Self::start_full(bounds, wan_map, DEFAULT_CAPTURE_BUDGET_BYTES_256M).await
+    }
+
+    async fn start_with_capture_budget(ceiling: u64) -> TestServer {
+        Self::start_full(test_bounds(), HashMap::new(), ceiling).await
+    }
+
+    async fn start_full(
+        bounds: ConnectionBounds,
+        wan_map: HashMap<std::net::IpAddr, std::net::IpAddr>,
+        capture_ceiling: u64,
+    ) -> TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let spool_dir = dir.path().join("spool");
-        let (addr, handle) = sensor_tftp::start_test_server(
+        let budget = Arc::new(CaptureMemoryBudget::new(capture_ceiling));
+        let (addr, handle, handoff) = sensor_tftp::start_test_server_with_handoff(
             "127.0.0.1:0".parse().unwrap(),
             log_path.clone(),
             spool_dir.clone(),
@@ -52,6 +70,7 @@ impl TestServer {
             bounds,
             "test".to_string(),
             dir.path().join("outbox"),
+            budget.clone(),
         )
         .await
         .unwrap();
@@ -60,7 +79,21 @@ impl TestServer {
             log_path,
             spool_dir,
             handle,
+            handoff,
+            budget,
             _dir: dir,
+        }
+    }
+
+    async fn wait_for_budget_current(&self, bytes: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while self.budget.current_bytes() != bytes {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "budget current stayed at {} (wanted {bytes})",
+                self.budget.current_bytes()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -289,6 +322,138 @@ async fn wrq_upload_is_captured_in_the_spool_and_emits_both_events() {
     srv.handle.abort();
 }
 
+/// Sends `blocks` full blocks of `fill` and returns the transfer address plus how many were ACKed
+/// before the sensor answered with an ERROR (or all of them if it never did).
+async fn send_full_blocks(
+    client: &mut Client,
+    transfer: SocketAddr,
+    blocks: u16,
+    fill: u8,
+) -> (u16, Option<Vec<u8>>) {
+    let mut acked = 0;
+    for block in 1..=blocks {
+        client.send_block(transfer, block, &[fill; BLOCK]).await;
+        let (reply, _) = client.recv().await;
+        if reply == ack(block) {
+            acked = block;
+        } else {
+            return (acked, Some(reply));
+        }
+    }
+    (acked, None)
+}
+
+#[tokio::test]
+async fn capture_within_budget_is_complete_and_the_budget_returns_to_zero_after_spooling() {
+    let srv = TestServer::start_with_capture_budget(4 * CAPTURE_CHUNK_BYTES).await;
+    let mut client = Client::new().await;
+    let transfer = client.begin_write(srv.addr, "ok.bin", "octet").await;
+    let (acked, error) = send_full_blocks(&mut client, transfer, 3, 0x11).await;
+    assert_eq!((acked, error), (3, None));
+    client.send_block(transfer, 4, b"tail").await;
+    client.expect_ack(transfer, 4).await;
+
+    let upload = srv.wait_for_upload().await;
+    assert_eq!(upload.sample.as_ref().unwrap().size, (3 * BLOCK + 4) as u64);
+    assert_eq!(upload.metadata["complete"], true);
+    assert_eq!(upload.metadata["truncated"], false);
+    assert!(upload.metadata.get("end_reason").is_none());
+    assert_eq!(srv.budget.high_water_bytes(), CAPTURE_CHUNK_BYTES);
+    srv.wait_for_budget_current(0).await;
+    assert_eq!(srv.handoff.truncated_capture_count(), 0);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn capture_that_exhausts_the_budget_keeps_its_prefix_and_later_uploads_still_work() {
+    // One 64 KiB chunk = exactly 128 blocks of 512 bytes; block 129 needs a chunk that is not there.
+    let srv = TestServer::start_with_capture_budget(CAPTURE_CHUNK_BYTES).await;
+    let kept_blocks = (CAPTURE_CHUNK_BYTES as usize / BLOCK) as u16;
+    let mut client = Client::new().await;
+    let transfer = client.begin_write(srv.addr, "big.bin", "octet").await;
+    let (acked, error) = send_full_blocks(&mut client, transfer, kept_blocks + 1, 0x22).await;
+    assert_eq!(acked, kept_blocks, "every block that fit was acknowledged");
+    assert_eq!(
+        error_code(&error.expect("block past the budget is refused with an ERROR")),
+        3,
+        "disk full"
+    );
+
+    let upload = srv.wait_for_upload().await;
+    assert_eq!(upload.sample.as_ref().unwrap().size, CAPTURE_CHUNK_BYTES);
+    assert_eq!(upload.metadata["truncated"], true);
+    assert_eq!(upload.metadata["complete"], false);
+    assert_eq!(upload.metadata["end_reason"], "capture_memory_budget");
+    assert_eq!(srv.handoff.truncated_capture_count(), 1);
+    srv.wait_for_budget_current(0).await;
+
+    // The room freed by spooling the first capture serves the next one in full.
+    let mut second = Client::new().await;
+    let transfer = second.begin_write(srv.addr, "small.bin", "octet").await;
+    second.send_block(transfer, 1, b"MZ-small").await;
+    second.expect_ack(transfer, 1).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while srv.uploads().await.len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second upload never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let second_upload = &srv.uploads().await[1];
+    assert_eq!(second_upload.sample.as_ref().unwrap().size, 8);
+    assert_eq!(second_upload.metadata["complete"], true);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn concurrent_transfers_share_one_ceiling_and_a_zero_byte_capture_submits_no_sample() {
+    let ceiling = CAPTURE_CHUNK_BYTES;
+    let srv = TestServer::start_with_capture_budget(ceiling).await;
+
+    // A holds the only chunk (one short of finishing: a full block keeps the transfer open).
+    let mut a = Client::new().await;
+    let a_transfer = a.begin_write(srv.addr, "a.bin", "octet").await;
+    a.send_block(a_transfer, 1, &[1u8; BLOCK]).await;
+    a.expect_ack(a_transfer, 1).await;
+    srv.wait_for_budget_current(CAPTURE_CHUNK_BYTES).await;
+
+    // B's first block cannot be buffered at all: refused, no sample, refusal counted.
+    let mut b = Client::new().await;
+    let b_transfer = b.begin_write(srv.addr, "b.bin", "octet").await;
+    b.send_block(b_transfer, 1, &[2u8; BLOCK]).await;
+    let (reply, _) = b.recv().await;
+    assert_eq!(error_code(&reply), 3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while srv.handoff.refused_capture_count() < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "refusal never counted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(srv.handoff.truncated_capture_count(), 0);
+    assert!(srv.budget.high_water_bytes() <= ceiling);
+
+    // A finishes: its capture is the only sample, and B's probe event still exists.
+    a.send_block(a_transfer, 2, b"end").await;
+    a.expect_ack(a_transfer, 2).await;
+    srv.wait_for_upload().await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let uploads = srv.uploads().await;
+    assert_eq!(uploads.len(), 1, "no empty sample for the starved capture");
+    assert_eq!(uploads[0].sample.as_ref().unwrap().size, (BLOCK + 3) as u64);
+    let probes = srv
+        .events()
+        .await
+        .into_iter()
+        .filter(|e| e.signal_type == SIGNAL_HONEYPOT_CONNECTION)
+        .count();
+    assert_eq!(probes, 2);
+    srv.wait_for_budget_current(0).await;
+    srv.handle.abort();
+}
+
 #[tokio::test]
 async fn shutdown_drain_leaves_the_captured_body_in_the_spool_and_its_event_in_the_log() {
     // What main does on SIGTERM: stop the listener, then drain the hand-off. The assertions read
@@ -304,6 +469,7 @@ async fn shutdown_drain_leaves_the_captured_body_in_the_spool_and_its_event_in_t
         test_bounds(),
         "test".to_string(),
         dir.path().join("outbox"),
+        Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES_256M)),
     )
     .await
     .unwrap();

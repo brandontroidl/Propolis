@@ -72,6 +72,8 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # bytes, a concurrent-connection cap) bound one attacker; these bound all of them together. The
 # SSH session does real key-exchange crypto and holds a fake filesystem and shell state per
 # session, so it gets a higher ceiling than the catch-all's single-packet-and-done handler.
+# PROPOLIS_SSH_CAPTURE_MEMORY_BYTES (env file) defaults to 40% of this value. If MemoryMax is
+# changed, set that variable too, or the capture ceiling stays at the 512M-derived default.
 MemoryMax=512M
 TasksMax=128
 CPUQuota=75%

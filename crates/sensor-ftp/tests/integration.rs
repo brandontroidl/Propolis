@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, WanResolver};
+use sensor_framework::{
+    CAPTURE_CHUNK_BYTES, CaptureHandoff, CaptureMemoryBudget, ConnectionBounds,
+    DEFAULT_CAPTURE_BUDGET_BYTES_256M, WanResolver,
+};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -23,16 +26,23 @@ struct TestServer {
     log_path: PathBuf,
     spool_dir: PathBuf,
     handle: JoinHandle<()>,
+    handoff: Arc<CaptureHandoff>,
+    budget: Arc<CaptureMemoryBudget>,
     _dir: tempfile::TempDir,
 }
 
 impl TestServer {
     async fn start() -> TestServer {
+        Self::start_with_capture_budget(DEFAULT_CAPTURE_BUDGET_BYTES_256M).await
+    }
+
+    async fn start_with_capture_budget(ceiling: u64) -> TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let spool_dir = dir.path().join("spool");
         let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
-        let (addr, handle) = sensor_ftp::start_test_server(
+        let budget = Arc::new(CaptureMemoryBudget::new(ceiling));
+        let (addr, handle, handoff) = sensor_ftp::start_test_server_with_handoff(
             "127.0.0.1:0".parse().unwrap(),
             log_path.clone(),
             spool_dir.clone(),
@@ -40,6 +50,7 @@ impl TestServer {
             test_bounds(),
             "test".to_string(),
             dir.path().join("outbox"),
+            budget.clone(),
         )
         .await
         .unwrap();
@@ -48,8 +59,39 @@ impl TestServer {
             log_path,
             spool_dir,
             handle,
+            handoff,
+            budget,
             _dir: dir,
         }
+    }
+
+    /// Waits for `n` `honeypot_malware_upload` lines (see `wait_for_upload_event`).
+    async fn wait_for_upload_events(&self, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let seen = self
+                .events()
+                .await
+                .iter()
+                .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+                .count();
+            if seen >= n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {n} upload event(s), saw {seen}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn uploads(&self) -> Vec<sensor_wire::SensorEvent> {
+        self.events()
+            .await
+            .into_iter()
+            .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+            .collect()
     }
 
     async fn events(&self) -> Vec<sensor_wire::SensorEvent> {
@@ -282,6 +324,182 @@ async fn stor_upload_past_the_cap_is_marked_truncated() {
     assert_eq!(sample.size, CAP as u64, "only the prefix is retained");
     assert_eq!(upload.metadata["truncated"], true);
     assert_eq!(upload.metadata["wire_size"], sent as u64);
+    srv.handle.abort();
+}
+
+/// Opens a passive data connection and issues STOR, returning the live data stream once the 150
+/// has been read. The caller decides when (and whether) to close it.
+async fn begin_stor(client: &mut FtpClient, name: &str) -> TcpStream {
+    let data_addr = client.pasv().await;
+    let r = client.send(&format!("STOR {name}")).await;
+    assert!(r.starts_with("150"), "STOR 150: {r}");
+    TcpStream::connect(data_addr).await.unwrap()
+}
+
+/// A whole upload on a fresh connection. The write result is ignored: once the sensor stops
+/// reading (budget exhausted) it closes the data connection under the sender.
+async fn stor_whole(srv: &TestServer, name: &str, body: &[u8]) -> String {
+    let mut client = FtpClient::connect(srv.addr).await;
+    client.login("root", "toor").await;
+    let mut data = begin_stor(&mut client, name).await;
+    let _ = data.write_all(body).await;
+    drop(data);
+    client.read_reply().await
+}
+
+async fn wait_for_budget_current(srv: &TestServer, bytes: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while srv.budget.current_bytes() != bytes {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "budget current stayed at {} (wanted {bytes})",
+            srv.budget.current_bytes()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn capture_within_budget_is_complete_and_the_budget_returns_to_zero_after_spooling() {
+    let srv = TestServer::start_with_capture_budget(4 * CAPTURE_CHUNK_BYTES).await;
+    let body = vec![0x5Au8; 100_000];
+    let r = stor_whole(&srv, "/tmp/ok.bin", &body).await;
+    assert!(r.starts_with("226"), "{r}");
+    srv.wait_for_upload_event().await;
+
+    let uploads = srv.uploads().await;
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].sample.as_ref().unwrap().size, body.len() as u64);
+    assert_eq!(uploads[0].metadata["complete"], true);
+    assert_eq!(uploads[0].metadata["truncated"], false);
+    assert!(uploads[0].metadata.get("end_reason").is_none());
+    // 100_000 bytes held two 64 KiB chunks while buffered; the worker refunded them once spooled.
+    assert_eq!(srv.budget.high_water_bytes(), 2 * CAPTURE_CHUNK_BYTES);
+    assert_eq!(srv.budget.current_bytes(), 0);
+    assert_eq!(srv.handoff.truncated_capture_count(), 0);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn capture_that_exhausts_the_budget_keeps_its_prefix_and_later_uploads_still_work() {
+    let srv = TestServer::start_with_capture_budget(2 * CAPTURE_CHUNK_BYTES).await;
+    let kept = 2 * CAPTURE_CHUNK_BYTES as usize;
+    let body: Vec<u8> = (0..300_000usize).map(|i| (i % 251) as u8).collect();
+    let r = stor_whole(&srv, "/tmp/big.bin", &body).await;
+    assert!(
+        r.starts_with("451"),
+        "budget exhaustion ends the STOR like a full disk: {r}"
+    );
+    srv.wait_for_upload_event().await;
+
+    let uploads = srv.uploads().await;
+    let sample = uploads[0].sample.as_ref().unwrap();
+    assert_eq!(sample.size, kept as u64, "the prefix that fit is retained");
+    assert_eq!(uploads[0].metadata["truncated"], true);
+    assert_eq!(uploads[0].metadata["complete"], false);
+    assert_eq!(uploads[0].metadata["end_reason"], "capture_memory_budget");
+    let on_disk = tokio::fs::read(srv.spool_dir.join(&sample.sha256))
+        .await
+        .unwrap();
+    assert_eq!(
+        on_disk,
+        body[..kept],
+        "the stored bytes are exactly the leading prefix"
+    );
+    assert_eq!(srv.handoff.truncated_capture_count(), 1);
+    wait_for_budget_current(&srv, 0).await;
+
+    // The room freed by spooling the first capture serves the next one in full.
+    let r = stor_whole(&srv, "/tmp/small.bin", b"MZ-small").await;
+    assert!(r.starts_with("226"), "{r}");
+    srv.wait_for_upload_events(2).await;
+    let second = &srv.uploads().await[1];
+    assert_eq!(second.sample.as_ref().unwrap().size, 8);
+    assert_eq!(second.metadata["complete"], true);
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn concurrent_captures_share_one_ceiling() {
+    let ceiling = 3 * CAPTURE_CHUNK_BYTES;
+    let srv = TestServer::start_with_capture_budget(ceiling).await;
+
+    // Capture A takes one chunk and stays open.
+    let mut a_ctl = FtpClient::connect(srv.addr).await;
+    a_ctl.login("root", "toor").await;
+    let mut a_data = begin_stor(&mut a_ctl, "/tmp/a.bin").await;
+    a_data.write_all(&[1u8; 60_000]).await.unwrap();
+    wait_for_budget_current(&srv, CAPTURE_CHUNK_BYTES).await;
+
+    // Capture B wants three chunks but only two remain.
+    let mut b_ctl = FtpClient::connect(srv.addr).await;
+    b_ctl.login("root", "toor").await;
+    let mut b_data = begin_stor(&mut b_ctl, "/tmp/b.bin").await;
+    let _ = b_data.write_all(&vec![2u8; 150_000]).await;
+    let r = b_ctl.read_reply().await;
+    assert!(r.starts_with("451"), "{r}");
+    drop(b_data);
+    assert_eq!(
+        srv.budget.high_water_bytes(),
+        ceiling,
+        "reached, never past, the ceiling"
+    );
+
+    drop(a_data);
+    let r = a_ctl.read_reply().await;
+    assert!(r.starts_with("226"), "{r}");
+    srv.wait_for_upload_events(2).await;
+
+    let uploads = srv.uploads().await;
+    let mut sizes: Vec<u64> = uploads
+        .iter()
+        .map(|u| u.sample.as_ref().unwrap().size)
+        .collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![60_000, 2 * CAPTURE_CHUNK_BYTES]);
+    assert!(srv.budget.high_water_bytes() <= ceiling);
+    wait_for_budget_current(&srv, 0).await;
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn capture_that_gets_zero_bytes_submits_no_sample_and_counts_a_refusal() {
+    let srv = TestServer::start_with_capture_budget(CAPTURE_CHUNK_BYTES).await;
+
+    let mut a_ctl = FtpClient::connect(srv.addr).await;
+    a_ctl.login("root", "toor").await;
+    let mut a_data = begin_stor(&mut a_ctl, "/tmp/a.bin").await;
+    a_data.write_all(b"MZ-holder").await.unwrap();
+    wait_for_budget_current(&srv, CAPTURE_CHUNK_BYTES).await;
+
+    // The budget is full: B's first byte cannot be buffered at all.
+    let r = stor_whole(&srv, "/tmp/starved.bin", b"never kept").await;
+    assert!(r.starts_with("451"), "{r}");
+    assert_eq!(srv.handoff.refused_capture_count(), 1);
+    assert_eq!(srv.handoff.truncated_capture_count(), 0);
+
+    drop(a_data);
+    let r = a_ctl.read_reply().await;
+    assert!(r.starts_with("226"), "{r}");
+    srv.wait_for_upload_events(1).await;
+    // No artifact exists to poll for an absent event, so give a stray second one time to appear.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let uploads = srv.uploads().await;
+    assert_eq!(
+        uploads.len(),
+        1,
+        "only the holder's capture exists: {uploads:?}"
+    );
+    assert_eq!(uploads[0].sample.as_ref().unwrap().size, 9);
+    // The starved connection still produced its ordinary connection event (holder + starved).
+    assert_eq!(
+        srv.events()
+            .await
+            .iter()
+            .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_CONNECTION)
+            .count(),
+        2
+    );
     srv.handle.abort();
 }
 

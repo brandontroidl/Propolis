@@ -57,6 +57,7 @@ use sensor_wire::{SampleRef, SensorEvent};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::capture_budget::{CaptureBody, CaptureMemoryBudget};
 use crate::emit::EventEmitter;
 use crate::outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
 use crate::sanitize::sanitize_value;
@@ -73,13 +74,21 @@ const MAX_ORIG_NAME_LEN: usize = 255;
 /// 90 s `TimeoutStopSec`, so a wedged spool costs a bounded stop delay rather than a SIGKILL.
 pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The `end_reason` stamped on a capture whose body stopped growing because the process-wide
+/// [`CaptureMemoryBudget`] had no room. It overrides whatever end the sensor itself recorded: the
+/// transfer was cut by this sensor's memory ceiling, not by anything the peer did.
+pub const END_REASON_CAPTURE_MEMORY_BUDGET: &str = "capture_memory_budget";
+
 /// One capture awaiting hand-off: a body already fully read off the wire, the attacker-supplied
 /// filename if the protocol carries one (SCP/SFTP; empty where it does not, e.g. the catch-all's
 /// raw payload), and the closure that builds the sensor's own `SensorEvent` once the `SampleRef`
 /// is known - deferred because the ref's `sha256`/`size` do not exist until the worker has
 /// actually hashed and stored the body.
+///
+/// The body is a budget-charged [`CaptureBody`]: its memory counts against the sensor's
+/// process-wide ceiling from the first byte until the worker has spooled it (see `process_job`).
 pub struct CaptureJob {
-    pub body: Vec<u8>,
+    pub body: CaptureBody,
     pub orig_name: String,
     pub event_builder: Box<dyn FnOnce(SampleRef) -> SensorEvent + Send>,
 }
@@ -204,6 +213,13 @@ pub struct CaptureHandoff {
     tx: mpsc::Sender<CaptureJob>,
     rx: Mutex<Option<mpsc::Receiver<CaptureJob>>>,
     dropped: AtomicU64,
+    /// The process-wide ceiling on capture bodies buffered in memory. Sensors build every capture
+    /// buffer from it (`new_capture_body`), and the worker refunds a body once it is spooled.
+    budget: Arc<CaptureMemoryBudget>,
+    /// Submitted captures whose body kept only a prefix because the budget ran out.
+    truncated_captures: AtomicU64,
+    /// Submitted captures that got zero bytes (the budget was already full), so no sample exists.
+    refused_captures: AtomicU64,
     /// Captures the worker discarded because the spool refused the body (per-file cap or exhausted
     /// global budget). Behind an `Arc` because the worker task increments it; `submit` touches only
     /// `dropped`. Its counterpart accessor is `spool_refused_count`.
@@ -243,18 +259,26 @@ impl CaptureHandoff {
     /// silently break that join. In a single-node deployment with no shipper configured, pass
     /// `"local"` so the record is still well-formed. `outbox` is the durable manifest store the
     /// worker writes a `pending` row to for every captured body.
+    ///
+    /// `capture_budget` is the sensor process's one [`CaptureMemoryBudget`]; every capture buffer
+    /// is charged to it, so concurrent connections cannot together outgrow the unit's memory
+    /// limit.
     pub fn new(
         spool: QuarantineSpool,
         emitter: EventEmitter,
         queue_size: usize,
         collector_id: String,
         outbox: OutboxManifest,
+        capture_budget: Arc<CaptureMemoryBudget>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(queue_size);
         Self {
             tx,
             rx: Mutex::new(Some(rx)),
             dropped: AtomicU64::new(0),
+            budget: capture_budget,
+            truncated_captures: AtomicU64::new(0),
+            refused_captures: AtomicU64::new(0),
             spool_refused: Arc::new(AtomicU64::new(0)),
             spool: Arc::new(spool),
             emitter: Arc::new(emitter),
@@ -274,11 +298,27 @@ impl CaptureHandoff {
     /// After `drain` has been called this refuses without enqueuing and without touching the
     /// full-queue counter: a closing worker must not be handed new work, and a shutdown refusal is
     /// not the overload the counter measures.
+    ///
+    /// A body that is empty because the very first reservation was refused is not a capture: no
+    /// sample or `malware_upload` event is produced (the sensor's ordinary connection and probe
+    /// events are unaffected), the refusal counter is bumped, and this returns `Err`. A body that
+    /// kept a prefix is enqueued normally and counted as truncated; `process_job` marks it.
     pub fn submit(&self, job: CaptureJob) -> Result<(), CaptureDropped> {
+        if job.body.is_exhausted() && job.body.is_empty() {
+            let refused = self.refused_captures.fetch_add(1, Ordering::Relaxed) + 1;
+            if refused.is_power_of_two() {
+                tracing::warn!(
+                    refused_total = refused,
+                    "capture hand-off: capture memory budget full, empty capture refused (no sample)"
+                );
+            }
+            return Err(CaptureDropped);
+        }
+        let truncated_body = job.body.is_exhausted();
         if self.closing.load(Ordering::SeqCst) {
             return Err(CaptureDropped);
         }
-        self.tx.try_send(job).map_err(|e| {
+        let sent = self.tx.try_send(job).map_err(|e| {
             // A receiver closed by a concurrent `drain` that raced the check above: refuse the
             // same way, uncounted.
             if matches!(e, mpsc::error::TrySendError::Closed(_)) {
@@ -297,7 +337,19 @@ impl CaptureHandoff {
                 );
             }
             CaptureDropped
-        })
+        });
+        // Counted only once actually enqueued: a truncated job refused for shutdown or a full
+        // queue is not a submitted sample.
+        if sent.is_ok() && truncated_body {
+            let truncated = self.truncated_captures.fetch_add(1, Ordering::Relaxed) + 1;
+            if truncated.is_power_of_two() {
+                tracing::warn!(
+                    truncated_total = truncated,
+                    "capture hand-off: capture memory budget exhausted, sample truncated to its prefix"
+                );
+            }
+        }
+        sent
     }
 
     /// Total jobs `submit` has rejected for a full queue since construction: the operator-visible
@@ -305,6 +357,27 @@ impl CaptureHandoff {
     /// its covertness, and the drop is a metric the operator can see."
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// A fresh, empty capture buffer charged to this hand-off's budget. Every sensor builds its
+    /// capture buffers here so no body is buffered outside the process-wide ceiling.
+    pub fn new_capture_body(&self) -> CaptureBody {
+        CaptureBody::with_budget(self.budget.clone())
+    }
+
+    /// The process-wide capture budget, for its `current`/`high_water`/`refused` diagnostics.
+    pub fn capture_budget(&self) -> &CaptureMemoryBudget {
+        &self.budget
+    }
+
+    /// Captures submitted with only a prefix of their body because the budget ran out.
+    pub fn truncated_capture_count(&self) -> u64 {
+        self.truncated_captures.load(Ordering::Relaxed)
+    }
+
+    /// Captures refused outright (zero bytes buffered, so no sample) because the budget was full.
+    pub fn refused_capture_count(&self) -> u64 {
+        self.refused_captures.load(Ordering::Relaxed)
     }
 
     /// Total captures the worker discarded because the spool refused the body - the per-file cap or
@@ -430,15 +503,32 @@ async fn process_job(
     outbox: &OutboxManifest,
     job: CaptureJob,
 ) {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        spool.store(&job.body).map(|mut sample_ref| {
-            sample_ref.orig_name = sanitize_value(&job.orig_name, MAX_ORIG_NAME_LEN);
-            (job.event_builder)(sample_ref)
+    let CaptureJob {
+        body,
+        orig_name,
+        event_builder,
+    } = job;
+    let budget_truncated = body.is_exhausted();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let stored = spool.store(body.as_slice());
+        // `store` has copied the bytes to a synced file (or refused them) by the time it returns,
+        // so the in-memory body is dead weight from here: refund its budget now, before the
+        // manifest write and the event append (both can block on slow I/O) rather than at the end
+        // of the job. Unwinding out of `store` drops `body` the same way.
+        drop(body);
+        stored.map(|mut sample_ref| {
+            sample_ref.orig_name = sanitize_value(&orig_name, MAX_ORIG_NAME_LEN);
+            event_builder(sample_ref)
         })
     }));
 
     let mut event = match outcome {
-        Ok(Ok(event)) => event,
+        Ok(Ok(mut event)) => {
+            if budget_truncated {
+                mark_budget_truncated(&mut event.metadata);
+            }
+            event
+        }
         Ok(Err(e)) => {
             let refused = spool_refused.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(
@@ -496,6 +586,20 @@ async fn process_job(
         tracing::error!(
             error = %e,
             "capture hand-off: event emit failed after spool store succeeded"
+        );
+    }
+}
+
+/// Stamps a capture that the memory budget cut short: the retained bytes are a prefix
+/// (`truncated`), the transfer did not finish (`complete` false) and the cause is ours
+/// (`end_reason`). Done here, once, so no sensor can forget one of the three keys.
+fn mark_budget_truncated(metadata: &mut serde_json::Value) {
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert("truncated".into(), serde_json::Value::Bool(true));
+        map.insert("complete".into(), serde_json::Value::Bool(false));
+        map.insert(
+            "end_reason".into(),
+            serde_json::Value::String(END_REASON_CAPTURE_MEMORY_BUDGET.into()),
         );
     }
 }
@@ -571,7 +675,15 @@ mod tests {
             queue_size,
             "test".to_string(),
             crate::outbox::OutboxManifest::new(base_dir.join("outbox")),
+            Arc::new(CaptureMemoryBudget::new(u64::MAX)),
         )
+    }
+
+    /// A job body charged to a private never-refusing budget, for tests that are not about it.
+    fn body_of(bytes: &[u8]) -> CaptureBody {
+        let mut body = CaptureBody::unbudgeted();
+        body.extend_from_slice(bytes).unwrap();
+        body
     }
 
     /// Waits until the event log holds `n` lines, failing after a generous deadline. The worker
@@ -623,7 +735,7 @@ mod tests {
         let handoff = test_handoff(spool, emitter, 16, dir.path());
         handoff.start_worker();
 
-        let body = b"malware payload".to_vec();
+        let body = body_of(b"malware payload");
         handoff
             .submit(CaptureJob {
                 body,
@@ -656,7 +768,7 @@ mod tests {
         let handoff = test_handoff(spool, emitter, 1, dir.path());
 
         let job = || CaptureJob {
-            body: b"data".to_vec(),
+            body: body_of(b"data"),
             orig_name: String::new(),
             event_builder: Box::new(|s| test_event(Some(s))),
         };
@@ -677,14 +789,14 @@ mod tests {
         // Fill the queue, then verify submit returns immediately (does not block).
         handoff
             .submit(CaptureJob {
-                body: b"first".to_vec(),
+                body: body_of(b"first"),
                 orig_name: String::new(),
                 event_builder: Box::new(|s| test_event(Some(s))),
             })
             .unwrap();
         let start = std::time::Instant::now();
         let _ = handoff.submit(CaptureJob {
-            body: b"second".to_vec(),
+            body: body_of(b"second"),
             orig_name: String::new(),
             event_builder: Box::new(|s| test_event(Some(s))),
         });
@@ -721,7 +833,7 @@ mod tests {
         let raw_name = "evil\r\n\x1b[31mname\x1b[0m.bin";
         handoff
             .submit(CaptureJob {
-                body: b"payload".to_vec(),
+                body: body_of(b"payload"),
                 orig_name: raw_name.into(),
                 event_builder: Box::new(|sample| test_event(Some(sample))),
             })
@@ -786,14 +898,14 @@ mod tests {
 
         handoff
             .submit(CaptureJob {
-                body: b"first-panics".to_vec(),
+                body: body_of(b"first-panics"),
                 orig_name: String::new(),
                 event_builder: Box::new(|_sample| panic!("simulated buggy sensor closure")),
             })
             .unwrap();
         handoff
             .submit(CaptureJob {
-                body: b"second-ok".to_vec(),
+                body: body_of(b"second-ok"),
                 orig_name: String::new(),
                 event_builder: Box::new(|sample| test_event(Some(sample))),
             })
@@ -833,14 +945,14 @@ mod tests {
 
         handoff
             .submit(CaptureJob {
-                body: b"this body exceeds the eight byte limit".to_vec(),
+                body: body_of(b"this body exceeds the eight byte limit"),
                 orig_name: String::new(),
                 event_builder: Box::new(|sample| test_event(Some(sample))),
             })
             .unwrap();
         handoff
             .submit(CaptureJob {
-                body: b"ok".to_vec(),
+                body: body_of(b"ok"),
                 orig_name: String::new(),
                 event_builder: Box::new(|sample| test_event(Some(sample))),
             })
@@ -888,7 +1000,7 @@ mod tests {
                 std::thread::spawn(move || {
                     handoff
                         .submit(CaptureJob {
-                            body: b"x".to_vec(),
+                            body: body_of(b"x"),
                             orig_name: String::new(),
                             event_builder: Box::new(|s| test_event(Some(s))),
                         })
@@ -931,7 +1043,7 @@ mod tests {
         let mut handles = Vec::with_capacity(UNIQUE + DUP_SUBMITTERS);
         for i in 0..UNIQUE {
             let handoff = handoff.clone();
-            let body = format!("unique-body-{i}").into_bytes();
+            let body = body_of(format!("unique-body-{i}").as_bytes());
             handles.push(tokio::spawn(async move {
                 handoff
                     .submit(CaptureJob {
@@ -947,7 +1059,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 handoff
                     .submit(CaptureJob {
-                        body: DUP_BODY.to_vec(),
+                        body: body_of(DUP_BODY),
                         orig_name: String::new(),
                         event_builder: Box::new(|s| test_event(Some(s))),
                     })
@@ -1029,12 +1141,13 @@ mod tests {
             16,
             "collector-1".to_string(),
             crate::outbox::OutboxManifest::new(outbox_dir.clone()),
+            Arc::new(CaptureMemoryBudget::new(u64::MAX)),
         );
         handoff.start_worker();
 
         handoff
             .submit(CaptureJob {
-                body: b"malware payload".to_vec(),
+                body: body_of(b"malware payload"),
                 orig_name: "evil.bin".into(),
                 event_builder: Box::new(|sample| test_event(Some(sample))),
             })
@@ -1079,7 +1192,7 @@ mod tests {
 
     fn drain_job(body: Vec<u8>) -> CaptureJob {
         CaptureJob {
-            body,
+            body: body_of(&body),
             orig_name: String::new(),
             event_builder: Box::new(|s| test_event(Some(s))),
         }
@@ -1139,7 +1252,7 @@ mod tests {
 
         handoff
             .submit(CaptureJob {
-                body: b"wedges-the-worker".to_vec(),
+                body: body_of(b"wedges-the-worker"),
                 orig_name: String::new(),
                 event_builder: Box::new(|s| {
                     std::thread::sleep(Duration::from_millis(1500));
@@ -1211,5 +1324,249 @@ mod tests {
             handoff.drain(Duration::from_secs(5)).await,
             DrainOutcome::NotRunning
         );
+    }
+
+    use crate::capture_budget::CAPTURE_CHUNK_BYTES;
+
+    struct BudgetRig {
+        handoff: Arc<CaptureHandoff>,
+        budget: Arc<CaptureMemoryBudget>,
+        log_path: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    fn budget_rig(ceiling: u64) -> BudgetRig {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let budget = Arc::new(CaptureMemoryBudget::new(ceiling));
+        let handoff = Arc::new(CaptureHandoff::new(
+            crate::spool::QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000),
+            crate::emit::EventEmitter::new(log_path.clone()),
+            16,
+            "test".to_string(),
+            crate::outbox::OutboxManifest::new(dir.path().join("outbox")),
+            budget.clone(),
+        ));
+        handoff.start_worker();
+        BudgetRig {
+            handoff,
+            budget,
+            log_path,
+            _dir: dir,
+        }
+    }
+
+    fn events(path: &std::path::Path) -> Vec<SensorEvent> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reservation_is_released_after_spool_store_before_the_event_is_built() {
+        let rig = budget_rig(4 * CAPTURE_CHUNK_BYTES);
+        let mut body = rig.handoff.new_capture_body();
+        body.extend_from_slice(b"whole sample").unwrap();
+        assert_eq!(rig.budget.current_bytes(), CAPTURE_CHUNK_BYTES);
+
+        // The event builder runs inside the worker after `store` and before the manifest write
+        // and append, so what it observes is the budget at the moment the reservation is released.
+        let seen = Arc::new(AtomicU64::new(u64::MAX));
+        let (seen_in, budget_in) = (seen.clone(), rig.budget.clone());
+        rig.handoff
+            .submit(CaptureJob {
+                body,
+                orig_name: String::new(),
+                event_builder: Box::new(move |s| {
+                    seen_in.store(budget_in.current_bytes(), Ordering::SeqCst);
+                    test_event(Some(s))
+                }),
+            })
+            .unwrap();
+        wait_for_lines(&rig.log_path, 1).await;
+
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "refunded before event build"
+        );
+        assert_eq!(rig.budget.current_bytes(), 0);
+        assert_eq!(rig.budget.high_water_bytes(), CAPTURE_CHUNK_BYTES);
+        let ev = &events(&rig.log_path)[0];
+        assert_eq!(ev.sample.as_ref().unwrap().size, 12);
+        assert!(
+            ev.metadata.get("end_reason").is_none(),
+            "within budget is untouched"
+        );
+        assert_eq!(rig.handoff.truncated_capture_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn exhausted_capture_keeps_prefix_is_marked_and_later_capture_succeeds() {
+        // Room for exactly one chunk: a body of 1.5 chunks keeps one chunk of prefix.
+        let rig = budget_rig(CAPTURE_CHUNK_BYTES);
+        let chunk = CAPTURE_CHUNK_BYTES as usize;
+        let data: Vec<u8> = (0..chunk + chunk / 2).map(|i| (i % 251) as u8).collect();
+        let mut body = rig.handoff.new_capture_body();
+        assert!(body.extend_from_slice(&data).is_err());
+        assert!(body.is_exhausted());
+        rig.handoff
+            .submit(CaptureJob {
+                body,
+                orig_name: "big.bin".into(),
+                event_builder: Box::new(|s| {
+                    let mut e = test_event(Some(s));
+                    // what a sensor would have said had the budget not intervened
+                    e.metadata = serde_json::json!({"complete": true, "end_reason": "peer_closed"});
+                    e
+                }),
+            })
+            .unwrap();
+        wait_for_lines(&rig.log_path, 1).await;
+
+        let ev = &events(&rig.log_path)[0];
+        assert_eq!(
+            ev.sample.as_ref().unwrap().size,
+            chunk as u64,
+            "prefix kept"
+        );
+        assert_eq!(ev.metadata["truncated"], true);
+        assert_eq!(ev.metadata["complete"], false);
+        assert_eq!(ev.metadata["end_reason"], "capture_memory_budget");
+        assert_eq!(rig.handoff.truncated_capture_count(), 1);
+        assert_eq!(rig.handoff.refused_capture_count(), 0);
+        assert_eq!(
+            rig.budget.current_bytes(),
+            0,
+            "spooled, so the room is back"
+        );
+
+        // The freed room serves the next capture in full.
+        let mut again = rig.handoff.new_capture_body();
+        again.extend_from_slice(b"second").unwrap();
+        assert!(!again.is_exhausted());
+        rig.handoff
+            .submit(CaptureJob {
+                body: again,
+                orig_name: String::new(),
+                event_builder: Box::new(|s| test_event(Some(s))),
+            })
+            .unwrap();
+        wait_for_lines(&rig.log_path, 2).await;
+        let ev = &events(&rig.log_path)[1];
+        assert_eq!(ev.sample.as_ref().unwrap().size, 6);
+        assert!(ev.metadata.get("truncated").is_none());
+    }
+
+    #[tokio::test]
+    async fn zero_byte_exhausted_capture_submits_no_sample_and_counts_a_refusal() {
+        let rig = budget_rig(CAPTURE_CHUNK_BYTES);
+        let mut hog = rig.handoff.new_capture_body();
+        hog.extend_from_slice(b"x").unwrap();
+
+        let mut starved = rig.handoff.new_capture_body();
+        assert!(starved.extend_from_slice(b"never kept").is_err());
+        assert!(starved.is_empty());
+        let result = rig.handoff.submit(CaptureJob {
+            body: starved,
+            orig_name: String::new(),
+            event_builder: Box::new(|_| unreachable!("no sample for an empty refused capture")),
+        });
+        assert!(result.is_err());
+        assert_eq!(rig.handoff.refused_capture_count(), 1);
+        assert_eq!(rig.handoff.truncated_capture_count(), 0);
+        assert_eq!(rig.handoff.dropped_count(), 0, "not a queue drop");
+        assert_eq!(rig.budget.refused_reservations(), 1);
+
+        // Nothing was queued: drain finishes with an empty event log.
+        drop(hog);
+        assert_eq!(
+            rig.handoff.drain(Duration::from_secs(5)).await,
+            DrainOutcome::Drained
+        );
+        assert!(!rig.log_path.exists() || events(&rig.log_path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_job_refused_by_full_queue_or_shutdown_is_not_counted_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let budget = Arc::new(CaptureMemoryBudget::new(8 * CAPTURE_CHUNK_BYTES));
+        // Queue of one and no worker: the first job fills it, the second finds it full.
+        let handoff = CaptureHandoff::new(
+            crate::spool::QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000),
+            crate::emit::EventEmitter::new(dir.path().join("events.jsonl")),
+            1,
+            "test".to_string(),
+            crate::outbox::OutboxManifest::new(dir.path().join("outbox")),
+            budget.clone(),
+        );
+        // A body that kept a one-chunk prefix then hit exhaustion: a hog leaves exactly one chunk
+        // free while the body fills, and is released afterwards.
+        let mk = |budget: &Arc<CaptureMemoryBudget>| {
+            let free = budget.ceiling_bytes() - budget.current_bytes();
+            let hog = budget
+                .try_reserve(free - CAPTURE_CHUNK_BYTES)
+                .expect("hog fits");
+            let mut body = CaptureBody::with_budget(budget.clone());
+            let data = vec![9u8; CAPTURE_CHUNK_BYTES as usize + 5];
+            assert!(body.extend_from_slice(&data).is_err());
+            drop(hog);
+            assert!(body.is_exhausted() && !body.is_empty());
+            body
+        };
+
+        let job = |body| CaptureJob {
+            body,
+            orig_name: String::new(),
+            event_builder: Box::new(|s| test_event(Some(s))),
+        };
+        assert!(handoff.submit(job(mk(&budget))).is_ok());
+        assert_eq!(handoff.truncated_capture_count(), 1, "enqueued, so counted");
+
+        assert!(handoff.submit(job(mk(&budget))).is_err());
+        assert_eq!(handoff.dropped_count(), 1, "full queue is a drop");
+        assert_eq!(
+            handoff.truncated_capture_count(),
+            1,
+            "a refused truncated job is not a submitted sample"
+        );
+
+        // After drain begins, a shutdown refusal is not counted either.
+        assert_eq!(
+            handoff.drain(Duration::from_secs(1)).await,
+            DrainOutcome::NotRunning
+        );
+        assert!(handoff.submit(job(mk(&budget))).is_err());
+        assert_eq!(handoff.truncated_capture_count(), 1);
+        assert_eq!(handoff.dropped_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_or_refused_jobs_still_refund_their_reservation() {
+        let rig = budget_rig(8 * CAPTURE_CHUNK_BYTES);
+        assert_eq!(
+            rig.handoff.drain(Duration::from_secs(5)).await,
+            DrainOutcome::Drained
+        );
+        // After drain `submit` refuses; the refused job's body must still give its room back.
+        let mut body = rig.handoff.new_capture_body();
+        body.extend_from_slice(b"late").unwrap();
+        assert_eq!(rig.budget.current_bytes(), CAPTURE_CHUNK_BYTES);
+        assert!(
+            rig.handoff
+                .submit(CaptureJob {
+                    body,
+                    orig_name: String::new(),
+                    event_builder: Box::new(|s| test_event(Some(s))),
+                })
+                .is_err()
+        );
+        assert_eq!(rig.budget.current_bytes(), 0);
     }
 }

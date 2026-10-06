@@ -11,6 +11,7 @@
 //!                      duplicate DATA n-1 -> re-ACK, body untouched
 //!                      other DATA / stray packets -> ignored, no reply
 //!                      body cap hit -> ERROR 3                                  -> BodyCap
+//!                      capture memory budget full -> ERROR 3                    -> CaptureBudget
 //!                      idle / packet cap / peer ERROR / oversized DATA          -> ends, incomplete
 //! ```
 //!
@@ -23,8 +24,8 @@ use std::sync::Arc;
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{
-    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver, sanitize_value,
-    upload_metadata,
+    CaptureBody, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
+    sanitize_value, upload_metadata,
 };
 use sensor_wire::{
     PROTO_UDP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
@@ -112,6 +113,9 @@ enum Outcome {
     Malformed,
     /// The socket failed, or a reply could not be sent.
     Transport,
+    /// The process-wide capture memory budget had no room for more of the file; the prefix already
+    /// buffered is kept. Answered with the same ERROR a full disk gets.
+    CaptureBudget,
 }
 
 pub struct Sensor {
@@ -178,7 +182,7 @@ impl Sensor {
             }
             Direction::Wrq => {
                 let mut capture = UploadCapture {
-                    body: Vec::new(),
+                    body: self.handoff.new_capture_body(),
                     wire_bytes: 0,
                     submitted: false,
                     cap_hit: false,
@@ -215,7 +219,7 @@ async fn reply_error(transfer: &mut Transfer, code: u16, message: &str) {
 /// `Drop` as incomplete if the handler is cancelled mid-transfer (the `max_duration` timeout drops
 /// the whole future, so no code after the receive loop would run).
 struct UploadCapture {
-    body: Vec<u8>,
+    body: CaptureBody,
     wire_bytes: u64,
     submitted: bool,
     /// The body cap aborted the transfer. Recorded explicitly because the framework derives
@@ -268,8 +272,12 @@ impl UploadCapture {
                         return Outcome::Malformed;
                     }
                     let take = cap.saturating_sub(self.body.len()).min(payload.len());
-                    self.body.extend_from_slice(&payload[..take]);
+                    let kept = self.body.extend_from_slice(&payload[..take]);
                     self.wire_bytes += payload.len() as u64;
+                    if kept.is_err() {
+                        reply_error(transfer, ERR_DISK_FULL, MSG_DISK_FULL).await;
+                        return Outcome::CaptureBudget;
+                    }
 
                     if payload.len() < BLOCK_SIZE {
                         let _ = transfer.send(&protocol::ack(block)).await;
@@ -314,7 +322,7 @@ impl UploadCapture {
         if self.wire_bytes == 0 && !complete {
             return;
         }
-        let body = std::mem::take(&mut self.body);
+        let body = std::mem::replace(&mut self.body, self.handoff.new_capture_body());
         let orig_name = self.orig_name.clone();
         let (source_ip, wan_ip, session_id, wire_bytes, cap_hit) = (
             self.source_ip,
@@ -423,20 +431,26 @@ mod tests {
             1,
             "test".to_string(),
             sensor_framework::OutboxManifest::new(outbox_dir),
+            Arc::new(sensor_framework::CaptureMemoryBudget::new(u64::MAX)),
         ))
     }
 
     fn probe_job() -> CaptureJob {
+        let mut body = CaptureBody::unbudgeted();
+        body.extend_from_slice(&[1]).unwrap();
         CaptureJob {
-            body: vec![1],
+            body,
             orig_name: "probe".into(),
             event_builder: Box::new(|_sample| unreachable!("never built")),
         }
     }
 
     fn capture(wire_bytes: u64, handoff: &Arc<CaptureHandoff>) -> UploadCapture {
+        let mut body = CaptureBody::unbudgeted();
+        body.extend_from_slice(&vec![0xAA; wire_bytes as usize])
+            .unwrap();
         UploadCapture {
-            body: vec![0xAA; wire_bytes as usize],
+            body,
             wire_bytes,
             submitted: false,
             cap_hit: false,

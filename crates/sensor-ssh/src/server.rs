@@ -19,8 +19,9 @@ use tokio::task::JoinHandle;
 
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
 use sensor_framework::{
-    BudgetLimits, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget,
-    EgressState, EventEmitter, OutboxManifest, QuarantineSpool, WanResolver, limits_from,
+    BudgetLimits, CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, CaptureMemoryBudget,
+    ConnectionBounds, ConnectionBudget, EgressState, EventEmitter, OutboxManifest, QuarantineSpool,
+    WanResolver, default_capture_budget_bytes, limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
@@ -221,6 +222,9 @@ impl ChannelFlow {
 ///
 /// `collector_id`/`outbox_dir` (SP-B-1b) are the two arguments `handle_session` below does not
 /// need but the capture hand-off does - see `CaptureHandoff::new`'s doc for what they mean.
+///
+/// The capture memory budget is the default for this unit's `MemoryMax`
+/// ([`DEFAULT_CAPTURE_BUDGET_BYTES`]); `serve_with_handoff` takes an explicit one.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     addr: SocketAddr,
@@ -243,14 +247,22 @@ pub async fn serve(
         banner,
         collector_id,
         outbox_dir,
+        Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES)),
     )
     .await?;
     Ok((bound, handle))
 }
 
-/// `serve` plus the capture hand-off, so `main` can `drain` it on shutdown. A separate function
-/// rather than a wider return type so the many callers that never shut down (every integration
-/// test) are unchanged.
+/// `MemoryMax` in `deploy/sensor-ssh.service`, which the default capture budget is derived from.
+pub const UNIT_MEMORY_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The capture memory ceiling used when none is configured: 40% of [`UNIT_MEMORY_MAX_BYTES`].
+pub const DEFAULT_CAPTURE_BUDGET_BYTES: u64 = default_capture_budget_bytes(UNIT_MEMORY_MAX_BYTES);
+
+/// `serve` plus the capture hand-off, so `main` can `drain` it on shutdown, and the process-wide
+/// capture memory budget `main` built from its configured ceiling. A separate function rather than
+/// a wider return type so the many callers that never shut down (every integration test) are
+/// unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_with_handoff(
     addr: SocketAddr,
@@ -262,6 +274,7 @@ pub async fn serve_with_handoff(
     banner: String,
     collector_id: String,
     outbox_dir: PathBuf,
+    capture_budget: Arc<CaptureMemoryBudget>,
 ) -> Result<
     (SocketAddr, JoinHandle<()>, Arc<CaptureHandoff>),
     Box<dyn std::error::Error + Send + Sync>,
@@ -295,6 +308,7 @@ pub async fn serve_with_handoff(
         64,
         collector_id,
         outbox,
+        capture_budget,
     ));
     handoff.start_worker();
     let drain_handle = handoff.clone();
@@ -445,7 +459,7 @@ async fn handle_session(
     // the login password; no phase-gating is needed here the way telnet's LineReader needs
     // `start_capture` to exclude its pre-auth login prompt.
     let mut shell_capture = ShellCapture {
-        body: Vec::new(),
+        body: handoff.new_capture_body(),
         wire_bytes: 0,
         binary_seen: false,
         session_end: CaptureEnd::Cancelled,
@@ -953,7 +967,7 @@ async fn handle_session(
 /// channel is exactly the long session that does. `CaptureHandoff::submit` never blocks, so
 /// submitting from a destructor is safe.
 struct ShellCapture {
-    body: Vec<u8>,
+    body: CaptureBody,
     /// Channel bytes the client sent, retained or dropped past the ceiling, so the event can
     /// report the real size and whether the stored copy is a prefix.
     wire_bytes: u64,
@@ -977,7 +991,9 @@ impl ShellCapture {
         self.wire_bytes += data.len() as u64;
         let room = self.max_bytes.saturating_sub(self.body.len() as u64) as usize;
         if room > 0 {
-            self.body.extend_from_slice(&data[..data.len().min(room)]);
+            // A refusal keeps the prefix already held; the body remembers it was cut, and the
+            // hand-off marks the capture truncated. The session itself carries on regardless.
+            let _ = self.body.extend_from_slice(&data[..data.len().min(room)]);
         }
     }
 
@@ -995,16 +1011,18 @@ impl ShellCapture {
 
 impl Drop for ShellCapture {
     fn drop(&mut self) {
-        if self.body.is_empty() {
+        // An empty body that was starved by the budget still goes to `submit`, which counts it as
+        // a refusal; a merely empty one has nothing to report.
+        if self.body.is_empty() && !self.body.is_exhausted() {
             return;
         }
         // The flood flag is only raised once a complete line reached the shell, so a payload
         // still mid-line when the session was cancelled never got one. The bytes themselves are
         // the fallback test; without it that capture reads as ordinary typing and is discarded.
-        if !self.binary_seen && !sensor_framework::shell::looks_binary(&self.body) {
+        if !self.binary_seen && !sensor_framework::shell::looks_binary(self.body.as_slice()) {
             return;
         }
-        let body = std::mem::take(&mut self.body);
+        let body = std::mem::replace(&mut self.body, self.handoff.new_capture_body());
         let (wire_size, end) = (self.wire_bytes, self.session_end);
         let (source_ip, wan_ip, session_id) = (self.source_ip, self.wan_ip, self.session_id);
         let _ = self.handoff.submit(CaptureJob {
@@ -1209,12 +1227,15 @@ mod tests {
             1,
             "test".to_string(),
             OutboxManifest::new(outbox_dir),
+            Arc::new(CaptureMemoryBudget::new(u64::MAX)),
         ))
     }
 
     fn probe_job() -> CaptureJob {
+        let mut body = CaptureBody::unbudgeted();
+        body.extend_from_slice(&[1]).unwrap();
         CaptureJob {
-            body: vec![1],
+            body,
             orig_name: "probe".into(),
             event_builder: Box::new(|_sample| unreachable!("never built")),
         }
@@ -1222,7 +1243,7 @@ mod tests {
 
     fn capture(handoff: Arc<CaptureHandoff>) -> ShellCapture {
         ShellCapture {
-            body: Vec::new(),
+            body: handoff.new_capture_body(),
             wire_bytes: 0,
             binary_seen: false,
             session_end: CaptureEnd::Cancelled,
@@ -1350,6 +1371,43 @@ mod tests {
         assert!(
             handoff.submit(probe_job()).is_err(),
             "the one slot holds the capture the cancelled session had accumulated"
+        );
+    }
+
+    /// A shell capture the budget starved to zero bytes is a refusal the operator must see: it
+    /// reaches the hand-off (which counts it) and yields neither a queued job nor a sample.
+    #[tokio::test]
+    async fn a_shell_capture_starved_to_zero_bytes_counts_a_refusal_and_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let budget = Arc::new(CaptureMemoryBudget::new(
+            sensor_framework::CAPTURE_CHUNK_BYTES,
+        ));
+        let handoff = Arc::new(CaptureHandoff::new(
+            QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000),
+            EventEmitter::new(dir.path().join("events.jsonl")),
+            1,
+            "test".to_string(),
+            OutboxManifest::new(dir.path().join("outbox")),
+            budget.clone(),
+        ));
+        let _hog = budget
+            .try_reserve(sensor_framework::CAPTURE_CHUNK_BYTES)
+            .unwrap();
+
+        let mut shell_capture = capture(handoff.clone());
+        shell_capture.push(b"\x7fELF-payload-bytes");
+        shell_capture.flag_binary();
+        assert!(shell_capture.body.is_empty() && shell_capture.body.is_exhausted());
+        drop(shell_capture);
+
+        assert_eq!(handoff.refused_capture_count(), 1);
+        assert_eq!(handoff.truncated_capture_count(), 0);
+        assert_eq!(handoff.dropped_count(), 0);
+        assert!(
+            handoff.submit(probe_job()).is_ok(),
+            "nothing was queued, so the one slot is still free"
         );
     }
 

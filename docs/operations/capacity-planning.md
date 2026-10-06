@@ -80,6 +80,24 @@ sensor except SMTP and cred, which fall back to the default on invalid input
 `max_concurrent` raises peak memory and file-descriptor use; keep it under each unit's
 `LimitNOFILE`.
 
+## Capture memory budget (body-capturing sensors)
+
+`max_concurrent` times a per-connection body cap does not bound a sensor's memory on its own:
+many connections can each buffer an upload at once. The five sensors that buffer bodies (ssh,
+ftp, adb, telnet, tftp) therefore share one process-wide ceiling,
+`sensor_framework::capture_budget::CaptureMemoryBudget`, charged in 64 KiB chunks as a body grows
+and refunded as soon as the hand-off worker has spooled it. The ceiling is
+`PROPOLIS_<SENSOR>_CAPTURE_MEMORY_BYTES`, defaulting to 40% of the unit's `MemoryMax`: 107374182
+bytes (about 102 MiB) for the 256 M sensors, 214748364 bytes (about 205 MiB) for `sensor-ssh`.
+The 40% share is an unmeasured choice; the other 60% is headroom for the runtime, protocol
+parsers, shell and fake-filesystem state, queued events and allocator overhead, none of which
+the budget charges. A capture that hits the ceiling is stored as a truncated prefix
+(`end_reason: "capture_memory_budget"`), and one that cannot buffer a single byte produces no
+sample; see [environment variables](../reference/environment-variables.md) for the variables and
+the exact behavior. Raise the variable only together with the unit's `MemoryMax`. The per-unit
+counts (current, high-water, refused reservations, truncated and refused captures) are exposed by
+`CaptureHandoff` getters for diagnostics; no endpoint publishes them yet.
+
 ## Per-unit resource caps (systemd)
 
 The deploy units cap memory, tasks, CPU, and file descriptors. These are the hard ceilings a

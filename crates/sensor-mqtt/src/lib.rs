@@ -76,6 +76,7 @@ pub async fn start_test_server_with_handoff(
         bounds.clone(),
         per_source_cap,
         move |stream, peer, session_id| {
+            let local_addr = stream.local_addr().ok();
             let emitter = emitter.clone();
             let wan_resolver = wan_resolver.clone();
             let bounds = bounds.clone();
@@ -84,6 +85,7 @@ pub async fn start_test_server_with_handoff(
                 handler::handle_connection(
                     stream,
                     peer,
+                    local_addr,
                     session_id,
                     emitter,
                     wan_resolver,

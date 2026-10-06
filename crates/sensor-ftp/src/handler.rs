@@ -1,8 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
@@ -89,9 +89,9 @@ impl StorCapture {
     /// Read the upload from its data connection and return how it ended. Past the cap the read
     /// keeps draining (bounded by `MAX_STOR_DRAIN`, so a slow trickle cannot hold the data
     /// connection open forever) purely to measure the real size.
-    async fn receive(
+    async fn receive<D: AsyncRead + Unpin>(
         &mut self,
-        mut data: TcpStream,
+        mut data: D,
         idle_timeout: std::time::Duration,
     ) -> StorOutcome {
         let mut chunk = [0u8; 4096];
@@ -158,29 +158,28 @@ impl Drop for StorCapture {
     }
 }
 
-pub async fn handle_connection(
-    stream: TcpStream,
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_connection<S>(
+    stream: S,
     peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
     handoff: Arc<CaptureHandoff>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
-    let wan_ip = stream
-        .local_addr()
-        .ok()
+    let wan_ip = local_addr
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
     // The interface the control connection arrived on: the passive data listener binds here (not
-    // loopback) so a remote client can reach it. Captured before `stream` is consumed by the reader.
-    let control_local_ip = stream
-        .local_addr()
-        .ok()
-        .map(|a| normalize_dual_stack(a).ip());
+    // loopback) so a remote client can reach it. From the caller-supplied `local_addr`.
+    let control_local_ip = local_addr.map(|a| normalize_dual_stack(a).ip());
 
     let _ = emitter
         .append(&connection_event(source_ip, wan_ip, session_id))
@@ -481,12 +480,15 @@ fn split_ftp_command(line: &str) -> (&str, &str) {
     }
 }
 
-async fn write_line(reader: &mut BufReader<TcpStream>, data: &[u8]) -> Result<(), ()> {
+async fn write_line<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    data: &[u8],
+) -> Result<(), ()> {
     reader.get_mut().write_all(data).await.map_err(|_| ())
 }
 
-async fn read_line_bounded(
-    reader: &mut BufReader<TcpStream>,
+async fn read_line_bounded<S: AsyncRead + Unpin>(
+    reader: &mut BufReader<S>,
     bounds: &ConnectionBounds,
     total: &mut u64,
 ) -> Option<String> {

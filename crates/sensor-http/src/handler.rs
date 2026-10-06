@@ -1,8 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
@@ -90,19 +89,20 @@ const NGINX_413_HTML: &str = "<html>
 </html>
 ";
 
-pub async fn handle_connection(
-    mut stream: TcpStream,
+pub async fn handle_connection<S>(
+    mut stream: S,
     peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
-    let wan_ip = stream
-        .local_addr()
-        .ok()
+    let wan_ip = local_addr
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
@@ -322,7 +322,7 @@ impl BoundedReader {
         }
     }
 
-    async fn fill(&mut self, stream: &mut TcpStream) -> Option<usize> {
+    async fn fill<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> Option<usize> {
         if self.total_captured >= self.bounds.max_captured_bytes {
             return None;
         }
@@ -344,7 +344,7 @@ impl BoundedReader {
         }
     }
 
-    async fn read_request(&mut self, stream: &mut TcpStream) -> Option<HttpRequest> {
+    async fn read_request<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> Option<HttpRequest> {
         // Accumulate until we see the header terminator \r\n\r\n
         loop {
             if let Some(end) = find_header_end(&self.buf) {
@@ -357,10 +357,10 @@ impl BoundedReader {
         }
     }
 
-    async fn parse_request(
+    async fn parse_request<S: AsyncRead + Unpin>(
         &mut self,
         header_end: usize,
-        stream: &mut TcpStream,
+        stream: &mut S,
     ) -> Option<HttpRequest> {
         let header_bytes = self.buf[..header_end].to_vec();
         // Drain the headers plus the \r\n\r\n separator

@@ -1,8 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
@@ -22,19 +21,20 @@ const VNC_AUTH_CHALLENGE_LEN: usize = 16;
 const VNC_AUTH_RESPONSE_LEN: usize = 16;
 const SECURITY_RESULT_OK: &[u8] = &[0, 0, 0, 0];
 
-pub async fn handle_connection(
-    mut stream: TcpStream,
+pub async fn handle_connection<S>(
+    mut stream: S,
     peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
-    let wan_ip = stream
-        .local_addr()
-        .ok()
+    let wan_ip = local_addr
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
@@ -135,8 +135,8 @@ fn login_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> S
     }
 }
 
-async fn timed_read_exact(
-    stream: &mut TcpStream,
+async fn timed_read_exact<S: AsyncRead + Unpin>(
+    stream: &mut S,
     buf: &mut [u8],
     timeout: std::time::Duration,
 ) -> Result<(), ()> {

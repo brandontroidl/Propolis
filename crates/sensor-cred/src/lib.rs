@@ -21,14 +21,23 @@ pub async fn start_listener(
     let emitter = Arc::new(EventEmitter::new(log_path));
 
     match protocol {
-        "vnc" => start_with(addr, bounds, emitter, wan_resolver, vnc::handle_connection).await,
+        "vnc" => {
+            start_with(
+                addr,
+                bounds,
+                emitter,
+                wan_resolver,
+                vnc::handle_connection::<tokio::net::TcpStream>,
+            )
+            .await
+        }
         "mysql" => {
             start_with(
                 addr,
                 bounds,
                 emitter,
                 wan_resolver,
-                mysql::handle_connection,
+                mysql::handle_connection::<tokio::net::TcpStream>,
             )
             .await
         }
@@ -38,7 +47,7 @@ pub async fn start_listener(
                 bounds,
                 emitter,
                 wan_resolver,
-                mssql::handle_connection,
+                mssql::handle_connection::<tokio::net::TcpStream>,
             )
             .await
         }
@@ -48,7 +57,7 @@ pub async fn start_listener(
                 bounds,
                 emitter,
                 wan_resolver,
-                postgresql::handle_connection,
+                postgresql::handle_connection::<tokio::net::TcpStream>,
             )
             .await
         }
@@ -58,7 +67,7 @@ pub async fn start_listener(
                 bounds,
                 emitter,
                 wan_resolver,
-                mongodb::handle_connection,
+                mongodb::handle_connection::<tokio::net::TcpStream>,
             )
             .await
         }
@@ -77,6 +86,7 @@ where
     F: Fn(
             tokio::net::TcpStream,
             SocketAddr,
+            Option<SocketAddr>,
             sensor_framework::Uuid,
             Arc<EventEmitter>,
             Arc<WanResolver>,
@@ -95,10 +105,19 @@ where
         bounds.clone(),
         per_source_cap,
         move |stream, peer, session_id| {
+            let local_addr = stream.local_addr().ok();
             let emitter = emitter.clone();
             let wan_resolver = wan_resolver.clone();
             let bounds = bounds.clone();
-            handler(stream, peer, session_id, emitter, wan_resolver, bounds)
+            handler(
+                stream,
+                peer,
+                local_addr,
+                session_id,
+                emitter,
+                wan_resolver,
+                bounds,
+            )
         },
     )
     .await

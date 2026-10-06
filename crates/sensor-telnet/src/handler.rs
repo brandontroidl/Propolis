@@ -8,8 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use sensor_framework::fakefs::FakeFs;
 use sensor_framework::listener::normalize_dual_stack;
@@ -60,24 +59,26 @@ const PROMPT_PASSWORD: &[u8] = b"Password: ";
 /// Mirai/Gafgyt loader's binary dropper, which `FakeShell` otherwise suppresses to a one-line
 /// marker and would be lost. Capture starts only after login (`LineReader::start_capture`, called
 /// just before the shell loop below), so the attacker's password is never in the captured bytes.
-pub async fn handle_connection(
-    mut stream: TcpStream,
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_connection<S>(
+    mut stream: S,
     peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
     handoff: Arc<CaptureHandoff>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped IPv6 address
     // (::ffff:a.b.c.d from a dual-stack listener) matches the operator's plain-IPv4 WAN map entry
     // - mirrors sensor-ssh's `server::handle_session` handling of the same listener module doc
     // requirement.
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
-    let wan_ip = stream
-        .local_addr()
-        .ok()
+    let wan_ip = local_addr
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
@@ -248,8 +249,8 @@ fn encode_telnet_data(bytes: &[u8], shell: Option<&FakeShell>) -> Vec<u8> {
     escaped
 }
 
-async fn write_raw(
-    stream: &mut TcpStream,
+async fn write_raw<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     write_timeout: Duration,
     bytes: &[u8],
 ) -> Result<(), ()> {
@@ -259,8 +260,8 @@ async fn write_raw(
         .map_err(|_| ())
 }
 
-async fn write_telnet_data(
-    stream: &mut TcpStream,
+async fn write_telnet_data<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     write_timeout: Duration,
     bytes: &[u8],
     shell: Option<&FakeShell>,
@@ -512,7 +513,11 @@ impl LineReader {
     /// character is echoed back (backspace erases on screen); the Enter's CR-LF is echoed either way,
     /// so a password (echo=false) is hidden but its Enter still advances the line. Returns `None` on
     /// EOF, a read timeout/error, or the session's `max_captured_bytes` budget being exhausted.
-    async fn read_line(&mut self, stream: &mut TcpStream, echo: bool) -> Option<String> {
+    async fn read_line<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        echo: bool,
+    ) -> Option<String> {
         loop {
             if let Some(line) = self.pending.pop_front() {
                 return Some(line);

@@ -1,8 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::persona;
@@ -28,19 +27,20 @@ fn queue_id() -> String {
         .collect()
 }
 
-pub async fn handle_connection(
-    stream: TcpStream,
+pub async fn handle_connection<S>(
+    stream: S,
     peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
-    let wan_ip = stream
-        .local_addr()
-        .ok()
+    let wan_ip = local_addr
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
@@ -416,12 +416,15 @@ fn extract_header(body: &str, name: &str) -> String {
     String::new()
 }
 
-async fn write_reply(reader: &mut BufReader<TcpStream>, data: &[u8]) -> Result<(), ()> {
+async fn write_reply<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    data: &[u8],
+) -> Result<(), ()> {
     reader.get_mut().write_all(data).await.map_err(|_| ())
 }
 
-async fn read_line_bounded(
-    reader: &mut BufReader<TcpStream>,
+async fn read_line_bounded<S: AsyncRead + Unpin>(
+    reader: &mut BufReader<S>,
     bounds: &ConnectionBounds,
     total: &mut u64,
 ) -> Option<String> {
@@ -460,8 +463,8 @@ async fn read_line_bounded(
 /// and whether a terminator was actually seen. Decoding per line would count a replacement
 /// character's three bytes where the wire carried one, and the body's own decoding happens once
 /// over the whole message.
-async fn read_body_line(
-    reader: &mut BufReader<TcpStream>,
+async fn read_body_line<S: AsyncRead + Unpin>(
+    reader: &mut BufReader<S>,
     bounds: &ConnectionBounds,
     total: &mut u64,
 ) -> Option<Vec<u8>> {
@@ -495,8 +498,8 @@ async fn read_body_line(
 /// without an acknowledgement. Reading what fit in the budget and calling that the chunk was
 /// how a 512-byte declaration became a "queued" 156-byte message. A declared size of zero is a
 /// valid, complete, empty chunk (RFC 3030 allows `BDAT 0 LAST`), not exhausted capacity.
-async fn read_raw_chunk(
-    reader: &mut BufReader<TcpStream>,
+async fn read_raw_chunk<S: AsyncRead + Unpin>(
+    reader: &mut BufReader<S>,
     size: u64,
     bounds: &ConnectionBounds,
     total: &mut u64,
@@ -531,8 +534,8 @@ fn append_bounded(body: &mut Vec<u8>, bytes: &[u8]) {
 /// which keeps counting after the body stops growing so the event can say the body was cut.
 /// `None` when the client never sent the terminating `.` line (it hung up, went quiet, or ran
 /// out of budget): that is an unfinished transfer, not a message, and it gets no "queued".
-async fn read_data_body(
-    reader: &mut BufReader<TcpStream>,
+async fn read_data_body<S: AsyncRead + Unpin>(
+    reader: &mut BufReader<S>,
     bounds: &ConnectionBounds,
     total: &mut u64,
 ) -> Option<(Vec<u8>, usize)> {

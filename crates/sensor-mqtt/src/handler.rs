@@ -33,8 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::shell::looks_binary;
@@ -1159,19 +1158,21 @@ fn capture_job(
     }
 }
 
-pub async fn handle_connection(
-    mut stream: TcpStream,
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_connection<S>(
+    mut stream: S,
     peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
     handoff: Arc<CaptureHandoff>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let source_ip: IpAddr = normalize_dual_stack(peer_addr).ip();
-    let wan_ip = stream
-        .local_addr()
-        .ok()
+    let wan_ip = local_addr
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 

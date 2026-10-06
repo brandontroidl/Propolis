@@ -1,8 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
@@ -19,19 +18,20 @@ const TDS_PRELOGIN: u8 = 0x12;
 const TDS_LOGIN7: u8 = 0x10;
 const TDS_RESPONSE: u8 = 0x04;
 
-pub async fn handle_connection(
-    mut stream: TcpStream,
+pub async fn handle_connection<S>(
+    mut stream: S,
     peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
-    let wan_ip = stream
-        .local_addr()
-        .ok()
+    let wan_ip = local_addr
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
@@ -162,8 +162,8 @@ fn wrap_tds_packet(pkt_type: u8, payload: &[u8]) -> Vec<u8> {
     packet
 }
 
-async fn read_tds_packet(
-    stream: &mut TcpStream,
+async fn read_tds_packet<S: AsyncRead + Unpin>(
+    stream: &mut S,
     timeout: std::time::Duration,
 ) -> Option<(u8, Vec<u8>)> {
     let mut header = [0u8; 8];

@@ -1,8 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
@@ -17,19 +16,20 @@ const MAX_MSG_SIZE: usize = 65536;
 // MongoDB wire protocol opcodes
 const OP_MSG: u32 = 2013;
 
-pub async fn handle_connection(
-    mut stream: TcpStream,
+pub async fn handle_connection<S>(
+    mut stream: S,
     peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
-    let wan_ip = stream
-        .local_addr()
-        .ok()
+    let wan_ip = local_addr
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
@@ -104,7 +104,10 @@ struct MongoMsg {
     body: Vec<u8>,
 }
 
-async fn read_mongo_msg(stream: &mut TcpStream, timeout: std::time::Duration) -> Option<MongoMsg> {
+async fn read_mongo_msg<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    timeout: std::time::Duration,
+) -> Option<MongoMsg> {
     // Standard header: messageLength(4) + requestID(4) + responseTo(4) + opCode(4)
     let mut header = [0u8; 16];
     tokio::time::timeout(timeout, stream.read_exact(&mut header))
@@ -136,7 +139,11 @@ async fn read_mongo_msg(stream: &mut TcpStream, timeout: std::time::Duration) ->
     })
 }
 
-async fn send_op_msg_reply(stream: &mut TcpStream, request_id: i32, json: &str) -> Result<(), ()> {
+async fn send_op_msg_reply<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    request_id: i32,
+    json: &str,
+) -> Result<(), ()> {
     // Build a minimal BSON document from JSON-ish content
     // For simplicity, we'll build a raw BSON document with just enough to look right
     let bson_doc = build_minimal_bson(json);

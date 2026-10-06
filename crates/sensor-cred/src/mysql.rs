@@ -1,8 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
@@ -14,19 +13,20 @@ use sensor_wire::{
 const PROTOCOL_LABEL: &str = "mysql";
 const MAX_PACKET_SIZE: usize = 65536;
 
-pub async fn handle_connection(
-    mut stream: TcpStream,
+pub async fn handle_connection<S>(
+    mut stream: S,
     peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
-    let wan_ip = stream
-        .local_addr()
-        .ok()
+    let wan_ip = local_addr
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
@@ -108,8 +108,8 @@ fn wrap_packet(seq: u8, payload: &[u8]) -> Vec<u8> {
     packet
 }
 
-async fn read_mysql_packet(
-    stream: &mut TcpStream,
+async fn read_mysql_packet<S: AsyncRead + Unpin>(
+    stream: &mut S,
     timeout: std::time::Duration,
 ) -> Option<Vec<u8>> {
     let mut header = [0u8; 4];

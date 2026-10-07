@@ -102,6 +102,22 @@ impl From<ValidationError> for RepoError {
 /// auto-releases on commit or rollback.
 const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
 
+/// The dedup read: the newest prior observation of this source and signal. Runs inside the append
+/// lock on every scored event, so its plan decides intake throughput. Migration 0013's
+/// `event_dedup_idx` answers it in one backward step. The alternative the planner also weighs is
+/// walking `event_observed_at_idx` down from the ledger head until the source turns up, which
+/// costs one row per event newer than the source's last sighting, so it grows with intake lag.
+///
+/// The address is wrapped in a scalar subquery so the planner cannot see it. Given the literal
+/// value, it looks the address up in the column statistics, and a bot loop holding a large share
+/// of the ledger is estimated to turn up within a few rows of the head: the walk then costs about
+/// the same as the index on paper, and it was still chosen with `event_dedup_idx` present on a
+/// ledger shaped like the incident. Hidden, the address is costed as an average source, for which
+/// the walk is never competitive. `dedup_read_plan_*` in this module's tests holds the plan to the
+/// index.
+const DEDUP_PRIOR_SQL: &str = "SELECT MAX(observed_at) FROM event \
+     WHERE source_ip = (SELECT $1::inet) AND signal_type = $2 AND id < $3";
+
 /// Append one event to the ledger and update the `ip_score` projection in a
 /// single transaction, returning the new projection.
 ///
@@ -189,15 +205,12 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
 
     // 2e. Dedup on (source_ip, signal_type): the most recent prior observation,
     // excluding the row we just inserted (id < new_id).
-    let prior_observed: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT MAX(observed_at) FROM event \
-         WHERE source_ip = $1::inet AND signal_type = $2 AND id < $3",
-    )
-    .bind(event.source_ip.to_string())
-    .bind(event.signal_type)
-    .bind(new_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let prior_observed: Option<DateTime<Utc>> = sqlx::query_scalar(DEDUP_PRIOR_SQL)
+        .bind(event.source_ip.to_string())
+        .bind(event.signal_type)
+        .bind(new_id)
+        .fetch_one(&mut *tx)
+        .await?;
     // Symmetric window: dedup only a same-signal observation within DEDUP_WINDOW_SECONDS in
     // EITHER time direction. A one-sided `elapsed <= WINDOW` treats any negative elapsed
     // (an out-of-order/earlier-timestamped event from a buffered or clock-skewed sensor) as a
@@ -477,4 +490,156 @@ where
         tier: row.try_get("tier")?,
         delisted: row.try_get("delisted")?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bot loop whose history is all older than the rest of the ledger.
+    const HOT: &str = "198.51.100.3";
+    const LEDGER_ROWS: i64 = 100_000;
+    const HOT_ROWS: i64 = 30_000;
+
+    /// Loads a ledger shaped like the October 2026 incident: one source holds 30% of the rows, all
+    /// of them older than every other sensor's 70,000 newer rows, so its latest sighting sits far
+    /// below the head of `event_observed_at_idx`. Statistics are gathered from every row (the
+    /// targets exceed the table), so the planner's inputs are the same on every run. Returns the id
+    /// the next append would get, which is the `id < $3` bound the append path passes.
+    async fn load_incident_ledger(pool: &PgPool) -> sqlx::Result<i64> {
+        sqlx::query("ALTER TABLE event DISABLE TRIGGER trg_enforce_chain_linkage")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO event (source_ip, wan_ip, sensor, signal_type, protocol, authenticated, \
+                                category, weight, confidence, observed_at, metadata, prev_hash, hash) \
+             SELECT CASE WHEN g <= $2 THEN $3::inet ELSE '10.0.0.0'::inet + (g % 5000) END, \
+                    '203.0.113.10'::inet, \
+                    CASE WHEN g <= $2 THEN 'telnet' ELSE 'vnc' END, \
+                    'honeypot_command_exec', 'tcp', true, 'honeypot', 60, 0.950, \
+                    timestamptz '2026-08-01 00:00:00+00' + g * interval '10 seconds', \
+                    '{}'::jsonb, \
+                    CASE WHEN g = 1 THEN NULL ELSE sha256(int8send(g - 1)) END, \
+                    sha256(int8send(g)) \
+             FROM generate_series(1, $1) AS g",
+        )
+        .bind(LEDGER_ROWS)
+        .bind(HOT_ROWS)
+        .bind(HOT)
+        .execute(pool)
+        .await?;
+        sqlx::query("ALTER TABLE event ENABLE TRIGGER trg_enforce_chain_linkage")
+            .execute(pool)
+            .await?;
+        for column in ["id", "source_ip", "signal_type", "observed_at"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE event ALTER COLUMN {column} SET STATISTICS 10000"
+            )))
+            .execute(pool)
+            .await?;
+        }
+        sqlx::query("ANALYZE event").execute(pool).await?;
+        sqlx::query_scalar("SELECT max(id) + 1 FROM event")
+            .fetch_one(pool)
+            .await
+    }
+
+    fn index_names(node: &serde_json::Value, out: &mut Vec<String>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    match (key.as_str(), value) {
+                        ("Index Name", serde_json::Value::String(name)) => out.push(name.clone()),
+                        _ => index_names(value, out),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|i| index_names(i, out)),
+            _ => {}
+        }
+    }
+
+    /// The dedup read as it stood when the incident happened: the address bound as a literal.
+    const INCIDENT_DEDUP_SQL: &str = "SELECT MAX(observed_at) FROM event \
+         WHERE source_ip = $1::inet AND signal_type = $2 AND id < $3";
+
+    /// The indexes a custom plan of `sql` reads for the hot source, with the values the append
+    /// path binds.
+    async fn custom_plan_indexes<'e, E>(
+        exec: E,
+        sql: &str,
+        next_id: i64,
+    ) -> sqlx::Result<Vec<String>>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
+        let plan: serde_json::Value =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN (FORMAT JSON) {sql}")))
+                .bind(HOT)
+                .bind(SignalType::HoneypotCommandExec)
+                .bind(next_id)
+                .fetch_one(exec)
+                .await?;
+        let mut names = Vec::new();
+        index_names(&plan, &mut names);
+        Ok(names)
+    }
+
+    /// A custom plan for the incident's hot source reads the dedup index and never walks
+    /// `event_observed_at_idx`. The fixture is checked to provoke that walk for the statement and
+    /// schema the incident ran on, so the guard cannot pass on a ledger the planner would have
+    /// handled anyway.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dedup_read_plan_uses_the_dedup_index_on_an_incident_shaped_ledger(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let next_id = load_incident_ledger(&pool).await?;
+
+        let custom = custom_plan_indexes(&pool, DEDUP_PRIOR_SQL, next_id).await?;
+        assert!(
+            custom.iter().any(|n| n == "event_dedup_idx"),
+            "the dedup read must use event_dedup_idx, plan read {custom:?}"
+        );
+        assert!(
+            !custom.iter().any(|n| n == "event_observed_at_idx"),
+            "the dedup read must not walk event_observed_at_idx, plan read {custom:?}"
+        );
+
+        let mut tx = pool.begin().await?;
+        sqlx::query("DROP INDEX event_dedup_idx")
+            .execute(&mut *tx)
+            .await?;
+        let incident = custom_plan_indexes(&mut *tx, INCIDENT_DEDUP_SQL, next_id).await?;
+        tx.rollback().await?;
+        assert!(
+            incident.iter().any(|n| n == "event_observed_at_idx"),
+            "the incident's statement and schema must walk event_observed_at_idx on this ledger, \
+             or the guard above proves nothing; plan read {incident:?}"
+        );
+        Ok(())
+    }
+
+    /// The same statement as a generic prepared plan, the form a long-lived pooled connection
+    /// switches to after five executions.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dedup_read_plan_generic_form_uses_the_dedup_index(pool: PgPool) -> sqlx::Result<()> {
+        load_incident_ledger(&pool).await?;
+        let plan: serde_json::Value = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (GENERIC_PLAN, FORMAT JSON) {DEDUP_PRIOR_SQL}"
+        )))
+        .fetch_one(&pool)
+        .await?
+        .try_get(0)?;
+        let mut names = Vec::new();
+        index_names(&plan, &mut names);
+        assert!(
+            names.iter().any(|n| n == "event_dedup_idx"),
+            "the generic dedup plan must use event_dedup_idx, plan read {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "event_observed_at_idx"),
+            "the generic dedup plan must not walk event_observed_at_idx, plan read {names:?}"
+        );
+        Ok(())
+    }
 }

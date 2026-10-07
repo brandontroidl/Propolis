@@ -7,7 +7,9 @@
 
 use core_scoring::domain::enums::{Protocol, SignalType};
 use core_scoring::domain::types::EventInput;
-use core_scoring::repository::{RepoError, append_event, read_score};
+use core_scoring::repository::{
+    RepoError, append_event, read_score, read_stored_score, rebuild_projection,
+};
 
 use rust_decimal_macros::dec;
 use sqlx::PgPool;
@@ -99,6 +101,81 @@ async fn double_decay_guard_across_one_half_life(pool: PgPool) -> Result<(), Rep
     .await?;
     // stored raw at B = decay(40, 6h) + 40 = 20 + 40 = 60 (NOT decay(decay(40)) + 40).
     assert!((b.raw_score - dec!(60)).abs() < dec!(0.01));
+    Ok(())
+}
+
+/// The dedup window, read through the indexed lookup: a same-source same-signal sighting within 60s
+/// of the newest prior one (either direction, boundary included) adds no weight, and one at 61s
+/// does. The newest prior is the MAX of every earlier row, not the previous append, so an
+/// out-of-order sighting is measured against it. Another signal or another source is never a
+/// duplicate. Every sighting still counts, and replay, which recomputes dedup in memory, agrees.
+#[sqlx::test(migrations = "./migrations")]
+async fn dedup_window_holds_in_order_out_of_order_and_at_the_boundary(
+    pool: PgPool,
+) -> Result<(), RepoError> {
+    const IP: &str = "203.0.113.50";
+    // (timestamp, weight selecting the signal, whether this sighting must add its weight)
+    let steps: [(&str, u32, bool); 8] = [
+        ("2026-07-17T00:00:00Z", 60, true),  // first sighting
+        ("2026-07-17T00:00:30Z", 60, false), // 30s after the newest: duplicate
+        ("2026-07-17T00:01:31Z", 60, true),  // 61s after the newest (00:00:30): counted
+        ("2026-07-17T00:00:50Z", 60, false), // out of order, 41s before the newest: duplicate
+        ("2026-07-17T00:00:20Z", 60, true),  // out of order, 71s before the newest: counted
+        ("2026-07-17T00:02:31Z", 60, false), // exactly 60s after the newest: duplicate
+        ("2026-07-17T00:03:32Z", 60, true),  // 61s after the newest: counted
+        ("2026-07-17T00:03:40Z", 50, true),  // inside the window, but another signal
+    ];
+    // The raw score is clamped at 100, so the uncapped category weight is what shows whether a
+    // sighting added anything.
+    fn category_weight(s: &core_scoring::IpScore) -> rust_decimal::Decimal {
+        s.category_breakdown
+            .as_object()
+            .expect("category_breakdown is a map")
+            .values()
+            .map(|stat| -> rust_decimal::Decimal {
+                match &stat["weight"] {
+                    serde_json::Value::String(w) => w.parse().expect("decimal weight"),
+                    other => other.to_string().parse().expect("decimal weight"),
+                }
+            })
+            .sum()
+    }
+    let mut previous = dec!(0);
+    for (n, (ts, weight, adds)) in steps.into_iter().enumerate() {
+        let s = append_event(&pool, honeypot_input(IP, ts, weight)).await?;
+        assert_eq!(s.event_count, n as i32 + 1, "every sighting counts ({ts})");
+        let now = category_weight(&s);
+        let gained = now - previous;
+        if adds {
+            assert!(
+                gained > dec!(49),
+                "{ts} must add its weight, category weight went {previous} -> {now}"
+            );
+        } else {
+            assert!(
+                gained.abs() < dec!(1),
+                "{ts} is a duplicate and must add nothing, category weight went {previous} -> {now}"
+            );
+        }
+        previous = now;
+    }
+
+    // Same signal, inside the window, another source: not a duplicate of anything.
+    let other = append_event(
+        &pool,
+        honeypot_input("203.0.113.51", "2026-07-17T00:03:33Z", 60),
+    )
+    .await?;
+    assert_eq!(category_weight(&other), dec!(60));
+
+    let ip = IP.parse().unwrap();
+    let stored = read_stored_score(&pool, ip)
+        .await?
+        .expect("stored projection");
+    let replayed = rebuild_projection(&pool, ip)
+        .await?
+        .expect("replayed projection");
+    assert_eq!(replayed, stored, "replay must agree with the indexed dedup");
     Ok(())
 }
 

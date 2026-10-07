@@ -86,8 +86,8 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 3269 test functions** (2064 unit + 1205 integration).
-- **DB-backed (`sqlx::test`): 212** - console 163, core-scoring 28, intake 7,
+- **Total: 3272 test functions** (2066 unit + 1206 integration).
+- **DB-backed (`sqlx::test`): 215** - console 163, core-scoring 31, intake 7,
   propolis 7, fleet 6, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
@@ -118,7 +118,7 @@ Per-crate breakdown:
 |---|---|---|---|
 | collector-wire | 9 | 0 | - |
 | console | 127 | 187 | auth_test, routes_test, samples_transport_test, server_test |
-| core-scoring | 67 | 29 | coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
+| core-scoring | 69 | 30 | coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 36 | 58 | builder_test, exclusion_test, export_test, publisher_test |
 | fleet | 23 | 32 | deploy_inventory_test, probe_test, store_test |
 | gateway | 11 | 13 | handshake, spool, verify |
@@ -144,7 +144,7 @@ Per-crate breakdown:
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2064** | **1205** | |
+| **Total** | **2066** | **1206** | |
 
 ### Test styles by layer
 
@@ -153,7 +153,7 @@ Per-crate breakdown:
   sensor contract (see [adding-a-sensor](adding-a-sensor.md#the-tests-a-sensor-must-pass)).
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
-  (28 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
+  (31 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
   applies migrations manually (181 uses) - needed wherever a test needs more than
   one migration history in one database, or a history that keeps its own
   bookkeeping table (review, fleet). A bare

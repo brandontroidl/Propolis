@@ -627,8 +627,9 @@ Sensor-specific extras:
   `refusing to start`, before binding any listener (the plain one included), when exactly one of
   CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_HTTP_TLS_BIND` is set
   without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
-  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value is invalid, not
-  unset. CERT and KEY without a bind load and validate the pair, start no TLS listener, and log one
+  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of the
+  three is invalid, not unset (`crates/sensor-framework/src/tls.rs#tls_env_var`). CERT and KEY
+  without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
   (`deploy/fleet-listeners.sh#PROPOLIS_HTTP_TLS_BIND`), a TLS listener never starts implicitly.
 - **redis**: Redis TLS (all three default off; none has a compiled default):
@@ -643,8 +644,9 @@ Sensor-specific extras:
   `refusing to start`, before binding any listener (the plain one included), when exactly one of
   CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_REDIS_TLS_BIND` is set
   without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
-  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value is invalid, not
-  unset. CERT and KEY without a bind load and validate the pair, start no TLS listener, and log one
+  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of the
+  three is invalid, not unset (`crates/sensor-framework/src/tls.rs#tls_env_var`). CERT and KEY
+  without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
   (`deploy/fleet-listeners.sh#PROPOLIS_REDIS_TLS_BIND`), a TLS listener never starts implicitly.
 - **mqtt**: MQTT TLS (all three default off; none has a compiled default):
@@ -659,8 +661,9 @@ Sensor-specific extras:
   `refusing to start`, before binding any listener (the plain one included), when exactly one of
   CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_MQTT_TLS_BIND` is set
   without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
-  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value is invalid, not
-  unset. CERT and KEY without a bind load and validate the pair, start no TLS listener, and log one
+  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of the
+  three is invalid, not unset (`crates/sensor-framework/src/tls.rs#tls_env_var`). CERT and KEY
+  without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
   (`deploy/fleet-listeners.sh#PROPOLIS_MQTT_TLS_BIND`), a TLS listener never starts implicitly.
   The plain and TLS listeners share one capture-memory budget
@@ -680,9 +683,11 @@ Sensor-specific extras:
   value counts as unset), when `PROPOLIS_SMTP_TLS_BIND` is set without both paths, when
   `PROPOLIS_SMTP_TLS_BIND` or `PROPOLIS_SMTP_SUBMISSION_BIND` does not parse (unlike the lenient
   bound variables, a bad bind never falls back to a default), when a file is unreadable, not PEM
-  or a mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value is invalid,
-  not unset. If the OS refuses any one bind, the listeners already started are stopped and the
-  sensor exits 1 (`crates/sensor-smtp/src/lib.rs#start_listeners`). With CERT and KEY set and no
+  or a mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of
+  the four is invalid, not unset (`crates/sensor-framework/src/tls.rs#tls_env_var`,
+  `crates/sensor-smtp/src/lib.rs#tls_from_env`). If the OS refuses any one bind, the listeners
+  already started are stopped and the sensor exits 1
+  (`crates/sensor-smtp/src/lib.rs#start_listeners`). With CERT and KEY set and no
   `PROPOLIS_SMTP_TLS_BIND`, the pair enables STARTTLS on the plain listeners (25 and, if set, 587)
   and no implicit-TLS listener starts; unlike the other sensors this logs no warning, because the
   pair is in use. With no TLS variable set the sensor is unchanged: STARTTLS is advertised and
@@ -702,8 +707,9 @@ Sensor-specific extras:
   binding any listener (the plain one included), when exactly one of CERT and KEY is set (a blank
   value counts as unset), when `PROPOLIS_FTP_TLS_BIND` is set without both paths, when
   `PROPOLIS_FTP_TLS_BIND` does not parse (a bad bind never falls back to a default), when a file
-  is unreadable, not PEM or a mismatched pair, or when the key is group- or world-readable. A
-  non-UTF-8 value of any of the three is read as unset, not as invalid. If the OS refuses any one
+  is unreadable, not PEM or a mismatched pair, or when the key is group- or world-readable; a
+  non-UTF-8 value of any of the three is invalid, not unset
+  (`crates/sensor-framework/src/tls.rs#tls_env_var`). If the OS refuses any one
   bind, the listeners already started are stopped and the sensor exits 1
   (`crates/sensor-ftp/src/lib.rs#start_listeners`). With CERT and KEY set and no
   `PROPOLIS_FTP_TLS_BIND`, the pair enables AUTH TLS on the plain listener and no implicit-TLS

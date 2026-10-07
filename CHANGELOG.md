@@ -23,7 +23,7 @@
   pre-negotiation connection event stays untagged). Fail-closed: when either variable is present,
   exactly one set, a blank or non-UTF-8 value, or an unusable pair makes the sensor exit 1 before
   binding anything. A bind failure on one protocol is still logged and skipped. The unit gains
-  `ReadOnlyPaths=/etc/propolis/tls`. The MSSQL TDS-TLS adapter is validated against a rustls
+  `ReadOnlyPaths=-/etc/propolis/tls`. The MSSQL TDS-TLS adapter is validated against a rustls
   client and the MS-TDS text only; the owner smoke tests against real drivers are listed in
   `docs/operations/networking-tls.md`.
 - **FTPS and AUTH TLS on `sensor-ftp` (default off)** - `PROPOLIS_FTP_TLS_CERT` and
@@ -48,7 +48,7 @@
   invalid bind, or an unusable pair makes the sensor exit 1 before binding anything, and a bind
   failure on any listener stops the others and exits 1. Cert and key without a TLS bind enable
   AUTH TLS and open no 990 listener. `fleet-listeners.sh` derives an `ftp` tcp listener from
-  `PROPOLIS_FTP_TLS_BIND`, and the unit gains `ReadOnlyPaths=/etc/propolis/tls`.
+  `PROPOLIS_FTP_TLS_BIND`, and the unit gains `ReadOnlyPaths=-/etc/propolis/tls`.
 - **SMTPS, SMTP submission and STARTTLS on `sensor-smtp` (default off)** - `PROPOLIS_SMTP_TLS_CERT`
   and `PROPOLIS_SMTP_TLS_KEY` (the pair `provision-tls.sh` mints, key mode `0600`) turn STARTTLS
   from the old `454` reply into a real upgrade on the plain listeners. Two optional listeners in
@@ -66,7 +66,7 @@
   invalid bind, or an unusable pair makes the sensor exit 1 before binding anything, and a bind
   failure on any listener stops the others and exits 1. Cert and key without a TLS bind enable
   STARTTLS and open no 465 listener. `fleet-listeners.sh` derives an `smtp` tcp listener from
-  each of the two new bind variables, and the unit gains `ReadOnlyPaths=/etc/propolis/tls`.
+  each of the two new bind variables, and the unit gains `ReadOnlyPaths=-/etc/propolis/tls`.
 - **MQTTS on `sensor-mqtt` (default off)** - a second, implicit-TLS listener in the same process,
   serving the same persona into the same event log, enabled by `PROPOLIS_MQTT_TLS_BIND` (no
   compiled default; the deploy convention is `0.0.0.0:8883`) together with
@@ -81,7 +81,7 @@
   listener and log one warning, so a TLS listener never opens implicitly. Every session now ends
   with a stream shutdown (`close_notify` on TLS, a FIN on a plain connection). `fleet-listeners.sh`
   derives an `mqtt` tcp listener from `PROPOLIS_MQTT_TLS_BIND`, and the unit gains
-  `ReadOnlyPaths=/etc/propolis/tls`.
+  `ReadOnlyPaths=-/etc/propolis/tls`.
 - **Redis over TLS on `sensor-redis` (default off)** - a second, implicit-TLS (`rediss://`)
   listener in the same process, serving the same persona into the same event log, enabled by
   `PROPOLIS_REDIS_TLS_BIND` (no compiled default; the deploy convention is `0.0.0.0:6380`)
@@ -93,7 +93,7 @@
   bind, or an unusable pair makes the sensor exit 1 before binding anything. Cert and key without
   a TLS bind load and validate the pair, start no TLS listener and log one warning, so a TLS
   listener never opens implicitly. `fleet-listeners.sh` derives a `redis` tcp listener from
-  `PROPOLIS_REDIS_TLS_BIND`, and the unit gains `ReadOnlyPaths=/etc/propolis/tls`.
+  `PROPOLIS_REDIS_TLS_BIND`, and the unit gains `ReadOnlyPaths=-/etc/propolis/tls`.
 - **HTTPS on `sensor-http` (default off)** - a second, implicit-TLS listener in the same process,
   serving the same nginx persona into the same event log, enabled by `PROPOLIS_HTTP_TLS_BIND`
   (no compiled default; the deploy convention is `0.0.0.0:443`) together with
@@ -104,8 +104,8 @@
   the sensor exit 1 before binding anything. Cert and key without a TLS bind load and validate the
   pair, start no TLS listener and log one warning, so a TLS listener never opens implicitly.
   `fleet-listeners.sh` derives an `http` tcp listener from `PROPOLIS_HTTP_TLS_BIND`, and the unit
-  gains `ReadOnlyPaths=/etc/propolis/tls`.
-- **Sensor TLS foundation (capability only; no sensor binds TLS yet)** - `sensor-framework` gains
+  gains `ReadOnlyPaths=-/etc/propolis/tls`.
+- **Sensor TLS foundation** - `sensor-framework` gains
   a `tls` module: a fail-closed loader for a per-sensor certificate and key (a missing, oversized,
   non-regular, malformed or mismatched file, or a key readable by group or other, is an error and
   never a fallback), an implicit-TLS listener that reuses the plain TCP listener's connection
@@ -115,8 +115,8 @@
   pair that already exists. New `deploy/provision-tls.sh`, run by `install.sh` and `upgrade.sh`
   after the binaries are installed, mints the pairs into `/etc/propolis/tls`
   (`0711` root-owned, created by `provision.sh`; keys `0600`, certificates `0644`, both owned by
-  the sensor's user); a real certificate placed at those paths survives re-runs. No sensor reads
-  these files and no TLS port is opened until the per-sensor binds land.
+  the sensor's user); a real certificate placed at those paths survives re-runs. A minted pair is
+  used only once its sensor's TLS variables are set (the six entries above).
 - **MQTT binary PUBLISH payloads are now spooled** - `sensor-mqtt` still records every PUBLISH as
   metadata, and now also hands a payload that passes the shared `looks_binary` gate to the framework
   capture hand-off, emitting a `honeypot_malware_upload` event (`capture_reason`
@@ -245,6 +245,18 @@
 
 ### Fixed
 
+- **Sensor TLS finalize** - a TLS variable (or sensor-smtp's submission bind) holding a non-UTF-8
+  value is now invalid on every TLS sensor, and the sensor exits 1 before any bind. sensor-ftp and
+  sensor-smtp read such a value as unset, which silently skipped the 990, 465 or 587 listener or
+  turned TLS off; http, redis and mqtt converted it lossily. The six TLS units grant the TLS
+  directory as `ReadOnlyPaths=-/etc/propolis/tls`, so a host without `/etc/propolis/tls` no longer
+  fails every one of those units with `226/NAMESPACE`, TLS used or not; a configured pair that
+  cannot be read still refuses to start. A deploy test now holds the units carrying that line
+  equal to the sensors `provision-tls.sh` mints for. `deploy/sensor.env.example` showed
+  sensor-cred's `MAX_DURATION_SECS` and `MAX_CAPTURED_BYTES` defaults as 600 and 1000000; the code
+  defaults are 60 and 100000. The component inventory still called sensor-mqtt metadata-only
+  with MQTT 5.0 declined, and the troubleshooting page said sensors terminate no TLS. The
+  networking and TLS guide is reorganized around one table of every TLS surface.
 - **Split-deployment examples and references match the code** - the example env files named
   certificate files `provision-certs` never writes and called every one 0600, described the
   gateway address as `host:port` (only a literal IP and port is accepted), called the client

@@ -56,14 +56,13 @@ loopback-only; if you rebind it off-loopback, those endpoints become reachable
 too - front them with authentication at the proxy. Route ownership is in
 [../reference/console-routes.md](../reference/console-routes.md).
 
-## TLS posture - no in-process TLS
+## Console TLS posture - no in-process TLS
 
 > **The console has no built-in TLS.** It is plain HTTP/1.1 served by
 > `console::server::serve` on a plain `tokio::net::TcpListener`
 > (`crates/console/src/server.rs`) - there is no rustls or other TLS
 > setup in the console code. Do not assume the console terminates TLS itself.
-> The sensor framework carries a TLS capability for the attacker-facing
-> listeners, and `sensor-http` is the first sensor to use it; see
+> The attacker-facing sensors are different: six of them terminate TLS in-process, see
 > [Sensor TLS](#sensor-tls-attacker-facing-listeners).
 >
 > The console does bound its own connections whether or not a proxy is in
@@ -100,234 +99,65 @@ This is separate from the console and the gateway and shipper mTLS material: it 
 server-side TLS on the honeypot's own attacker-facing ports, so the sensors can answer
 HTTPS, MQTTS and the other encrypted variants of the protocols they imitate.
 
-> **Status: five sensors live.** The shared capability, the certificate minting and the deploy
-> wiring below are in place, and `sensor-http` serves HTTPS, `sensor-redis` serves Redis over TLS,
-> `sensor-mqtt` serves MQTTS, `sensor-smtp` serves SMTPS and SMTP STARTTLS and `sensor-ftp` serves
-> FTPS and FTP AUTH TLS (all below). The other surfaces are still pending `[planned]`: no other
-> sensor reads a TLS variable or listens with TLS.
->
-> **No implicit TLS bind.** A TLS listener exists only when its `*_TLS_BIND` variable (for
-> `sensor-smtp` also `PROPOLIS_SMTP_SUBMISSION_BIND`) is explicitly set.
-> `deploy/fleet-listeners.sh` derives the fleet inventory from the `*_BIND` variables, so a
-> compiled-in default bind would open a port the inventory never lists. A certificate and key
-> with no TLS bind are still loaded and validated (fail-closed), start no TLS listener, and log
-> one warning. The exception is `sensor-smtp` and `sensor-ftp`, where the pair also enables an
-> in-protocol upgrade (STARTTLS, AUTH TLS) on the plain listener, so it is in use and logs no
-> warning. `sensor-cred` has no TLS bind at all: its TLS runs on the existing plain binds, so the
-> pair opens no port and the inventory is unchanged.
->
-> Pending surfaces: none.
+### Overview
 
-What the framework provides (`crates/sensor-framework/src/tls.rs`): a fail-closed config
-loader (`crates/sensor-framework/src/tls.rs#load_server_config`), an implicit-TLS listener
-(`crates/sensor-framework/src/tls.rs#run_tls_listener`) that reuses the plain TCP listener's
-connection bounds, and a stream type for in-protocol upgrades such as STARTTLS
-(`crates/sensor-framework/src/tls.rs#MaybeTlsStream`).
+Six sensors speak TLS: `sensor-http`, `sensor-redis`, `sensor-mqtt`, `sensor-smtp`,
+`sensor-ftp` and `sensor-cred`. The others (ssh, telnet, adb, tftp, catchall) read no TLS
+variable. Every TLS surface is off until the operator sets its variables, and none has a
+compiled-in default. The shared pieces live in the sensor framework
+(`crates/sensor-framework/src/tls.rs`): a fail-closed loader
+(`crates/sensor-framework/src/tls.rs#load_server_config`), an implicit-TLS listener that reuses
+the plain TCP listener's connection bounds
+(`crates/sensor-framework/src/tls.rs#run_tls_listener`), the in-protocol upgrade path
+(`crates/sensor-framework/src/tls.rs#upgrade_buffered`, over
+`crates/sensor-framework/src/tls.rs#MaybeTlsStream`), and the fail-closed reader for the TLS
+variables (`crates/sensor-framework/src/tls.rs#tls_env_var`).
 
-### Live: HTTPS on `sensor-http`
+Three modes exist. **Implicit** TLS puts the handshake first on a dedicated port. **STARTTLS**
+(SMTP `STARTTLS`, FTP `AUTH TLS`) upgrades a plaintext session in place after a command. **In-band**
+TLS is negotiated inside the protocol's own startup on the existing port (sensor-cred), and for
+MongoDB the sensor **sniffs** the first bytes to tell a TLS client from a plaintext one.
 
-| Item | Value |
-|---|---|
-| Mode | implicit TLS (the handshake is the first thing on the connection), no client certificate |
-| Bind | `PROPOLIS_HTTP_TLS_BIND`, no compiled default; the deploy convention is `0.0.0.0:443` |
-| Certificate and key | `PROPOLIS_HTTP_TLS_CERT` (`/etc/propolis/tls/http.crt`), `PROPOLIS_HTTP_TLS_KEY` (`/etc/propolis/tls/http.key`, mode `0600`) |
-| Plain listener | unchanged, `PROPOLIS_HTTP_BIND`; both listeners run in one process and write one `events.jsonl` |
-| Unit | `deploy/sensor-http.service` adds `ReadOnlyPaths=/etc/propolis/tls`; `CAP_NET_BIND_SERVICE` stays for ports 80 and 443 |
-| Event tagging | events from a TLS session carry `"tls": true`; plain events have no such key |
+### TLS surfaces
 
-The sensor exits 1 with `refusing to start`, before binding anything, when exactly one of cert
-and key is set (a blank value counts as unset), when the TLS bind is set without both paths or
-does not parse, or when the pair is unusable (see [Loading is fail-closed](#loading-is-fail-closed)).
-If the OS refuses the TLS bind itself, the plain listener is stopped and the sensor exits 1.
-Variables are owned by [environment-variables.md](../reference/environment-variables.md);
-behavior by [sensor-behavior.md](../reference/sensor-behavior.md).
+Ports are the deploy conventions from `deploy/sensor.env.example`; the code has no default.
 
-### Live: Redis TLS on `sensor-redis`
+| Sensor | Port | Mode | Bind variable | Certificate and key variables |
+|---|---|---|---|---|
+| `sensor-http` | 443 | implicit (HTTPS) | `PROPOLIS_HTTP_TLS_BIND` | `PROPOLIS_HTTP_TLS_CERT`, `PROPOLIS_HTTP_TLS_KEY` |
+| `sensor-redis` | 6380 | implicit (`rediss://`) | `PROPOLIS_REDIS_TLS_BIND` | `PROPOLIS_REDIS_TLS_CERT`, `PROPOLIS_REDIS_TLS_KEY` |
+| `sensor-mqtt` | 8883 | implicit (MQTTS; MQTT 3.1, 3.1.1 and 5.0) | `PROPOLIS_MQTT_TLS_BIND` | `PROPOLIS_MQTT_TLS_CERT`, `PROPOLIS_MQTT_TLS_KEY` |
+| `sensor-smtp` | 465 | implicit (SMTPS) | `PROPOLIS_SMTP_TLS_BIND` | `PROPOLIS_SMTP_TLS_CERT`, `PROPOLIS_SMTP_TLS_KEY` |
+| `sensor-smtp` | 25, 587 | STARTTLS | `PROPOLIS_SMTP_BIND`, `PROPOLIS_SMTP_SUBMISSION_BIND` (plain listeners) | the smtp pair |
+| `sensor-ftp` | 990 | implicit (FTPS) | `PROPOLIS_FTP_TLS_BIND` | `PROPOLIS_FTP_TLS_CERT`, `PROPOLIS_FTP_TLS_KEY` |
+| `sensor-ftp` | 21 | STARTTLS (`AUTH TLS`; `PROT P` data channels) | `PROPOLIS_FTP_BIND` (plain listener) | the ftp pair |
+| `sensor-cred` | 5432 | in-band (PostgreSQL SSLRequest) | `PROPOLIS_CRED_PG_BIND` (plain listener) | `PROPOLIS_CRED_TLS_CERT`, `PROPOLIS_CRED_TLS_KEY` |
+| `sensor-cred` | 3306 | in-band (MySQL `CLIENT_SSL`) | `PROPOLIS_CRED_MYSQL_BIND` (plain listener) | the cred pair |
+| `sensor-cred` | 1433 | in-band (MSSQL TLS inside TDS PRELOGIN) | `PROPOLIS_CRED_MSSQL_BIND` (plain listener) | the cred pair |
+| `sensor-cred` | 27017 | sniff (MongoDB, first two bytes) | `PROPOLIS_CRED_MONGO_BIND` (plain listener) | the cred pair |
 
-| Item | Value |
-|---|---|
-| Mode | implicit TLS (`rediss://`; the handshake is the first thing on the connection), no client certificate, no STARTTLS |
-| Bind | `PROPOLIS_REDIS_TLS_BIND`, no compiled default; the deploy convention is `0.0.0.0:6380` |
-| Certificate and key | `PROPOLIS_REDIS_TLS_CERT` (`/etc/propolis/tls/redis.crt`), `PROPOLIS_REDIS_TLS_KEY` (`/etc/propolis/tls/redis.key`, mode `0600`) |
-| Plain listener | unchanged, `PROPOLIS_REDIS_BIND`; both listeners run in one process and write one `events.jsonl` |
-| Unit | `deploy/sensor-redis.service` adds `ReadOnlyPaths=/etc/propolis/tls`; no capability, since 6379 and 6380 are unprivileged |
-| Event tagging | events from a TLS session carry `"tls": true`; plain events have no such key |
+Common to every row:
 
-The sensor exits 1 with `refusing to start`, before binding anything, when exactly one of cert
-and key is set (a blank value counts as unset), when the TLS bind is set without both paths or
-does not parse, or when the pair is unusable (see [Loading is fail-closed](#loading-is-fail-closed)).
-If the OS refuses the TLS bind itself, the plain listener is stopped and the sensor exits 1.
-Variables are owned by [environment-variables.md](../reference/environment-variables.md);
-behavior by [sensor-behavior.md](../reference/sensor-behavior.md).
+- **Certificate and key paths.** The deploy values are `/etc/propolis/tls/<sensor>.crt` and
+  `/etc/propolis/tls/<sensor>.key` (key mode `0600`), minted by `deploy/provision-tls.sh` (see
+  [Certificate model](#certificate-model)). sensor-cred uses one pair for all four protocols;
+  VNC (5900) has no TLS.
+- **No client certificate** is requested on any surface.
+- **One process, one log.** A sensor's TLS listener runs in the same process as its plain one and
+  writes the same `events.jsonl`. For sensor-mqtt the two listeners also share one capture
+  hand-off, one capture-memory budget and one shutdown drain, so binary-PUBLISH spooling works
+  identically over TLS.
+- **Event tagging.** Events from a TLS session carry `"tls": true`; plaintext events have no such
+  key. For sensor-smtp and sensor-ftp that covers sessions upgraded by STARTTLS or AUTH TLS too,
+  and the ftp tag refers to the control channel only. For sensor-cred's PostgreSQL, MySQL and
+  MSSQL the connection event is written before negotiation and stays untagged; for MongoDB every
+  event of a TLS session is tagged.
+- **Plaintext clients** keep working on every plain listener with the pair set.
+- **Capabilities.** http (80, 443), ftp (21, 990) and smtp (25, 465, 587) keep
+  `CAP_NET_BIND_SERVICE`; redis, mqtt and cred grant none, since all their ports are unprivileged.
 
-### Live: MQTTS on `sensor-mqtt`
-
-| Item | Value |
-|---|---|
-| Mode | implicit TLS (the handshake is the first thing on the connection), no client certificate, no STARTTLS; MQTT 3.1, 3.1.1 and 5.0 all work over it |
-| Bind | `PROPOLIS_MQTT_TLS_BIND`, no compiled default; the deploy convention is `0.0.0.0:8883` |
-| Certificate and key | `PROPOLIS_MQTT_TLS_CERT` (`/etc/propolis/tls/mqtt.crt`), `PROPOLIS_MQTT_TLS_KEY` (`/etc/propolis/tls/mqtt.key`, mode `0600`) |
-| Plain listener | unchanged, `PROPOLIS_MQTT_BIND`; both listeners run in one process and write one `events.jsonl` |
-| Capture | the plain and TLS listeners share one capture hand-off, one capture-memory budget and one shutdown drain, so binary-PUBLISH spooling works identically over TLS |
-| Unit | `deploy/sensor-mqtt.service` adds `ReadOnlyPaths=/etc/propolis/tls`; no capability, since 1883 and 8883 are unprivileged |
-| Event tagging | events from a TLS session carry `"tls": true`; plain events have no such key |
-
-The sensor exits 1 with `refusing to start`, before binding anything, when exactly one of cert
-and key is set (a blank value counts as unset), when the TLS bind is set without both paths or
-does not parse, or when the pair is unusable (see [Loading is fail-closed](#loading-is-fail-closed)).
-If the OS refuses the TLS bind itself, the plain listener is stopped and the sensor exits 1.
-Variables are owned by [environment-variables.md](../reference/environment-variables.md);
-behavior by [sensor-behavior.md](../reference/sensor-behavior.md).
-
-### Live: SMTPS and STARTTLS on `sensor-smtp`
-
-| Item | Value |
-|---|---|
-| Modes | implicit TLS on the SMTPS port (the handshake comes before the banner), and STARTTLS on the plain listeners; no client certificate |
-| Plain bind | `PROPOLIS_SMTP_BIND` (25), required as before; offers STARTTLS and upgrades iff the cert and key are set |
-| Submission bind | `PROPOLIS_SMTP_SUBMISSION_BIND` (587), optional, no compiled default; the same plain session as 25, with STARTTLS iff the pair is set |
-| SMTPS bind | `PROPOLIS_SMTP_TLS_BIND` (465), optional, no compiled default; implicit TLS, requires the pair |
-| Certificate and key | `PROPOLIS_SMTP_TLS_CERT` (`/etc/propolis/tls/smtp.crt`), `PROPOLIS_SMTP_TLS_KEY` (`/etc/propolis/tls/smtp.key`, mode `0600`) |
-| Listeners | up to three in one process, writing one `events.jsonl`; 465 and 587 exist only when their bind is set |
-| Unit | `deploy/sensor-smtp.service` adds `ReadOnlyPaths=/etc/propolis/tls`; `CAP_NET_BIND_SERVICE` stays for ports 25, 465 and 587 |
-| Event tagging | connection, login and data events from a TLS session (implicit, or after STARTTLS) carry `"tls": true`; plain events have no such key |
-
-STARTTLS rules (`crates/sensor-smtp/src/handler.rs#handle_connection`; replies in
-[sensor-behavior.md](../reference/sensor-behavior.md#sensor-smtp)):
-
-- With the pair set, STARTTLS answers `220 2.0.0 Ready to start TLS` and upgrades in place. A
-  failed or stalled handshake ends the session; there is no plaintext fallback after the `220`.
-- Plaintext the client pipelined behind STARTTLS is never read as a command inside the TLS
-  session (the CVE-2011-0411 class). The sensor records one `honeypot_command_exec` event with
-  `starttls_refused` set to `pipelined_plaintext` and the byte count (the bytes themselves are
-  never captured), replies `554`, and closes the connection without sending the `220`.
-- After the upgrade the client must send EHLO again: MAIL, RCPT and BDAT state is discarded. The
-  per-connection capture cap (`total_read`) is kept across the upgrade.
-- A second STARTTLS inside TLS gets `503`, and EHLO inside TLS omits the STARTTLS extension.
-  STARTTLS with parameters gets `501` (only when TLS is configured).
-- With no pair set nothing changes: EHLO still advertises STARTTLS and every STARTTLS line gets
-  the unchanged `454` reply.
-- A cert and key with no `PROPOLIS_SMTP_TLS_BIND` and no submission bind still enable STARTTLS on
-  port 25 and open nothing else (pinned by the spawned-binary test
-  `crates/sensor-smtp/tests/tls.rs#a_valid_pair_without_a_tls_bind_enables_starttls_on_the_plain_listener_only`).
-
-Fail-closed: the sensor exits 1 with `refusing to start`, before binding anything, when exactly
-one of cert and key is set (a blank value counts as unset), when the SMTPS bind is set without
-both paths, when either extra bind does not parse, or when the pair is unusable (see
-[Loading is fail-closed](#loading-is-fail-closed)). If the OS refuses any one bind, the
-listeners already started are stopped and the sensor exits 1. An implicit handshake that fails
-is dropped with a debug log and no event. Variables are owned by
-[environment-variables.md](../reference/environment-variables.md); behavior by
-[sensor-behavior.md](../reference/sensor-behavior.md).
-
-### Live: FTPS and AUTH TLS on `sensor-ftp`
-
-| Item | Value |
-|---|---|
-| Modes | implicit TLS on the FTPS port (the handshake comes before the banner), and AUTH TLS on the plain listener; no client certificate |
-| Plain bind | `PROPOLIS_FTP_BIND` (21), required as before; answers AUTH TLS, PBSZ and PROT iff the cert and key are set |
-| FTPS bind | `PROPOLIS_FTP_TLS_BIND` (990), optional, no compiled default; implicit TLS, requires the pair |
-| Certificate and key | `PROPOLIS_FTP_TLS_CERT` (`/etc/propolis/tls/ftp.crt`), `PROPOLIS_FTP_TLS_KEY` (`/etc/propolis/tls/ftp.key`, mode `0600`) |
-| Listeners | up to two in one process, writing one `events.jsonl`; 990 exists only when its bind is set |
-| Passive data ports | unchanged (ephemeral, negotiated per session); with `PROT P` they carry TLS |
-| Unit | `deploy/sensor-ftp.service` adds `ReadOnlyPaths=/etc/propolis/tls`; `CAP_NET_BIND_SERVICE` stays for ports 21 and 990 |
-| Event tagging | connection, login and upload events from a session whose control channel is TLS (implicit, or after AUTH TLS) carry `"tls": true`; plain events have no such key |
-
-AUTH TLS rules (`crates/sensor-ftp/src/handler.rs#handle_connection`; replies in
-[sensor-behavior.md](../reference/sensor-behavior.md#sensor-ftp)):
-
-- With the pair set, `AUTH TLS`, `AUTH TLS-C`, `AUTH SSL` and `AUTH TLS-P` answer
-  `234 Proceed with negotiation.` and upgrade in place. Any other AUTH type gets `504`, and AUTH
-  inside TLS gets `503`. A failed or stalled handshake ends the session; there is no plaintext
-  fallback after the `234`.
-- Plaintext the client pipelined behind AUTH TLS is never read as a command inside the TLS
-  session (the CVE-2011-0411 class). The sensor records one `honeypot_command_exec` event with
-  `starttls_refused` set to `pipelined_plaintext` and the byte count (the bytes themselves are
-  never captured), replies `504 Pipelined commands after AUTH TLS refused.`, and closes the
-  connection without sending the `234`.
-- After the upgrade the session is reset as REIN would: the username, login state, PBSZ, PROT and
-  any open passive listener are discarded. The per-connection capture cap is kept across the
-  upgrade.
-- PBSZ (inside TLS only, always `0`) and then PROT (`C` or `P`; `S` and `E` get `536`) set the
-  data-channel protection. After `PROT P` the passive data socket is wrapped in TLS once the data
-  peer passed the source-IP check; the handshake is bounded by the read timeout and a failed one
-  gets `425`. STOR over `PROT P` is captured and spooled exactly like plaintext, and a data close
-  without `close_notify` counts as end of file. The `"tls"` tag refers to the control channel
-  only.
-- FEAT lists `AUTH`, `PBSZ` and `PROT` only when TLS is configured. With no pair set nothing
-  changes: AUTH, PBSZ and PROT answer `500` like any unknown command.
-- A cert and key with no `PROPOLIS_FTP_TLS_BIND` still enable AUTH TLS on port 21 and open nothing
-  else (pinned by the spawned-binary test
-  `crates/sensor-ftp/tests/tls_config.rs#a_valid_pair_without_a_tls_bind_enables_auth_tls_on_the_plain_listener_only`).
-
-Fail-closed: the sensor exits 1 with `refusing to start`, before binding anything, when exactly
-one of cert and key is set (a blank value counts as unset), when the FTPS bind is set without
-both paths, when the FTPS bind does not parse, or when the pair is unusable (see
-[Loading is fail-closed](#loading-is-fail-closed)). If the OS refuses any one bind, the
-listeners already started are stopped and the sensor exits 1. An implicit handshake that fails
-is dropped with a debug log and no event. Variables are owned by
-[environment-variables.md](../reference/environment-variables.md); behavior by
-[sensor-behavior.md](../reference/sensor-behavior.md).
-
-### Live: in-band TLS on `sensor-cred`
-
-| Item | Value |
-|---|---|
-| Modes | in-band on the existing plaintext ports: PostgreSQL SSLRequest (5432), MySQL `CLIENT_SSL` (3306), MSSQL TLS inside TDS PRELOGIN (1433), and a MongoDB ClientHello sniff (27017); VNC (5900) unchanged; no client certificate |
-| Binds | unchanged (`PROPOLIS_CRED_PG_BIND`, `PROPOLIS_CRED_MYSQL_BIND`, `PROPOLIS_CRED_MSSQL_BIND`, `PROPOLIS_CRED_MONGO_BIND`); there is no TLS bind and no new port, so `deploy/fleet-listeners.sh` derives nothing new |
-| Certificate and key | `PROPOLIS_CRED_TLS_CERT` (`/etc/propolis/tls/cred.crt`), `PROPOLIS_CRED_TLS_KEY` (`/etc/propolis/tls/cred.key`, mode `0600`); one pair for all four protocols |
-| Plaintext clients | keep working on every port with the pair set |
-| Unit | `deploy/sensor-cred.service` adds `ReadOnlyPaths=/etc/propolis/tls`; no capability, since every cred port is unprivileged |
-| Event tagging | events from a TLS session carry `"tls": true`; for PostgreSQL, MySQL and MSSQL the connection event is written before negotiation and stays untagged, for MongoDB every event of a TLS session is tagged |
-
-Per-protocol rules (replies and tables in
-[sensor-behavior.md](../reference/sensor-behavior.md#sensor-cred-vnc--mysql--mssql--postgresql--mongodb)):
-
-- **PostgreSQL:** an SSLRequest is answered `S` and the session continues over TLS; without the
-  pair it is answered `N` as before. Plaintext sent where the ClientHello belongs is never read
-  as a startup message: the handshake fails and the connection is dropped. A second SSLRequest
-  inside TLS closes the connection.
-- **MySQL:** the greeting advertises `CLIENT_SSL` only with the pair; a client's SSLRequest
-  switches to TLS before the HandshakeResponse, which is then answered OK at sequence id 3.
-- **MSSQL:** a client that asks for encryption (`ENCRYPT_ON` or `ENCRYPT_REQ`) is answered
-  `ENCRYPT_ON` and gets TLS inside TDS; TLS 1.3 session tickets are off for MSSQL only. A client
-  that offers `ENCRYPT_OFF` gets the pre-TLS PRELOGIN response byte for byte and a plaintext
-  session, and an `ENCRYPT_NOT_SUP` or silent client gets `ENCRYPT_NOT_SUP` and plaintext. A real
-  server with encryption on would answer `ENCRYPT_OFF` with `ENCRYPT_REQ` and force TLS; the
-  sensor deliberately does not, so the credentials of scanners that cannot do TLS are still
-  captured.
-- **MongoDB:** the first two bytes on the port are peeked, bounded by the read timeout; `0x16 0x03`
-  (a TLS record header) with the pair set selects TLS, anything else the plaintext path. After a
-  sniff that times out the plaintext path waits up to another read timeout, so a silent
-  connection can hold a slot for up to twice the read timeout, capped by the maximum session
-  duration.
-
-Fail-closed (`crates/sensor-cred/src/main.rs#main`): when either variable is present, the pair
-must load or the sensor exits 1 with `refusing to start` before binding any protocol: exactly one
-set, a blank or non-UTF-8 value, or an unusable pair (see
-[Loading is fail-closed](#loading-is-fail-closed)). On success it logs
-`TLS enabled for postgresql, mysql, mssql and mongodb`. Unlike the other TLS sensors, an OS bind
-failure does not stop the sensor: that one protocol is logged and skipped and the sensor exits 1
-only when every configured protocol failed to bind, because TLS adds no listener whose loss could
-hide behind the others. Variables are owned by
-[environment-variables.md](../reference/environment-variables.md); behavior by
-[sensor-behavior.md](../reference/sensor-behavior.md).
-
-**Validation scope and owner smoke tests.** The MSSQL TDS-TLS adapter is validated against a
-rustls client (TLS 1.2 and 1.3) framed by hand in
-`crates/sensor-cred/tests/tls_integration.rs` and against the MS-TDS text, not against real SQL
-Server drivers. Before relying on it, run against a TLS-enabled node:
-
-- `sqlcmd -N -C`, and .NET SqlClient with `Encrypt=True;TrustServerCertificate=True`;
-- FreeTDS `tsql` with `encryption = require` and with `encryption = off`;
-- go-mssqldb with `encrypt=true` and with `encrypt=disable`;
-- impacket `mssqlclient.py`;
-- any driver that attempts TLS 1.3 inside TDS 7.x. If one fails, the fallback is restricting
-  MSSQL to TLS 1.2, which is an owner decision;
-- plaintext PostgreSQL, MySQL and MongoDB clients, to confirm they are still served.
-
-Known follow-up: PostgreSQL does not yet answer a GSSENCRequest with `N`, as a real server
-without GSSAPI encryption does.
+Variables are owned by [environment-variables.md](../reference/environment-variables.md); replies
+and per-protocol behavior by [sensor-behavior.md](../reference/sensor-behavior.md).
 
 ### Certificate model
 
@@ -372,11 +202,44 @@ pair survives every re-run of `install.sh`, `upgrade.sh` or `provision-tls.sh`
   minted, so a new pair is never mixed with an old half. To supply a real pair, install both
   files.
 
-### Loading is fail-closed
+Restart the sensor after replacing its pair: the pair is loaded once, at start.
 
-The loader returns an error, and a sensor with a TLS bind configured refuses to start (no
-fallback to plaintext or to a default certificate), when any of these hold. This is the
-contract every per-sensor TLS bind follows
+### Running `provision-tls.sh`
+
+`install.sh` and `upgrade.sh` run it for you (see [installation](installation.md) and
+[upgrade, rollback and DR](upgrade-rollback-and-dr.md)). To run it manually, after
+`deploy/provision.sh` has created the directory and with a release build present:
+
+```
+sudo deploy/provision-tls.sh
+DRY_RUN=1 deploy/provision-tls.sh   # prints every action; needs no privilege or binary
+```
+
+It is idempotent. It reasserts ownership and mode on every run, so a pair minted by an
+interrupted earlier run is repaired. Minting a pair turns nothing on: a sensor uses it only once
+its env file names it.
+
+### Fail-closed rules
+
+A sensor never falls back to plaintext or to a default certificate where TLS was configured.
+Every refusal below happens before the sensor binds any listener, the plain one included: the
+process logs an error and exits 1. The error ends in `refusing to start`, except that
+sensor-smtp logs an unparseable bind as `invalid <VARIABLE>: "<value>"`.
+
+**Configuration.** Per sensor (`crates/sensor-http/src/main.rs#parse_tls`,
+`crates/sensor-redis/src/main.rs#parse_tls`, `crates/sensor-mqtt/src/main.rs#parse_tls`,
+`crates/sensor-smtp/src/lib.rs#tls_from_env`, `crates/sensor-ftp/src/main.rs#tls_paths`,
+`crates/sensor-cred/src/main.rs#main`):
+
+- exactly one of the cert and key variables is set (a blank value counts as unset, except for
+  sensor-cred, where a present but blank variable is itself an error);
+- a TLS bind is set without both paths;
+- a TLS bind, or smtp's submission bind, does not parse (a bad bind never falls back to a default);
+- any TLS variable holds a value that is not valid UTF-8. It is invalid, never read as unset,
+  which would silently turn TLS off or skip a listener
+  (`crates/sensor-framework/src/tls.rs#tls_env_var`).
+
+**The pair itself.** The loader returns an error when any of these hold
 (`crates/sensor-framework/src/tls.rs#load_server_config`,
 `crates/sensor-framework/src/tls.rs#TlsConfigError`):
 
@@ -390,40 +253,141 @@ contract every per-sensor TLS bind follows
 
 The certificate file is not mode-checked.
 
+**No implicit TLS bind.** A TLS listener exists only when its `*_TLS_BIND` variable (for
+sensor-smtp also `PROPOLIS_SMTP_SUBMISSION_BIND`) is explicitly set.
+`deploy/fleet-listeners.sh` derives the fleet inventory from the `*_BIND` variables, so a
+compiled-in default bind would open a port the inventory never lists. A certificate and key
+with no TLS bind are still loaded and validated (fail-closed), start no TLS listener, and log
+one warning. The exceptions:
+
+- sensor-smtp and sensor-ftp: the pair also enables STARTTLS or AUTH TLS on the plain listener,
+  so it is in use and logs no warning;
+- sensor-cred has no TLS bind at all: its TLS runs on the existing plain binds, so the pair
+  opens no port and the inventory is unchanged.
+
+**A bind the OS refuses.** For http, redis, mqtt, smtp and ftp, if the OS refuses any one bind,
+the listeners already started are stopped and the sensor exits 1. sensor-cred instead logs and
+skips that one protocol and exits 1 only when every configured protocol failed to bind, because
+its TLS adds no listener whose loss could hide behind the others.
+
+On success sensor-cred logs `TLS enabled for postgresql, mysql, mssql and mongodb`. Warnings and
+info lines are visible only with `RUST_LOG=info` or lower; the refusals are errors and always
+logged (see [troubleshooting](../troubleshooting/sensors-and-networking.md#sensor-tls)).
+
+### The unit's TLS directory grant
+
+Each of the six units carries `ReadOnlyPaths=-/etc/propolis/tls` (for example
+`deploy/sensor-http.service#ReadOnlyPaths=-/etc/propolis/tls`). Read-only because the sensor reads
+its pair and never writes it. The leading `-` makes a missing directory non-fatal: without it
+systemd refuses to start the unit (`226/NAMESPACE`) on a host where `/etc/propolis/tls` was
+never provisioned, even for a sensor that uses no TLS. Dropping the hard requirement costs no
+safety, because a configured pair that cannot be read still refuses to start in-process. A test
+holds the set of units carrying this line equal to the sensors `provision-tls.sh` mints for
+(`crates/sensor-framework/tests/deploy_test.rs#tls_dir_grant_units_match_provision_tls_sensors_exactly`).
+
 ### Handshake bound
 
 The handshake is cut at the sensor's read timeout (`ConnectionBounds::read_timeout`), so a
 client that stalls after connecting cannot hold a connection slot for the full session
 lifetime. The per-source cap, the global connection limit and the maximum session duration
 apply to TLS connections unchanged (`crates/sensor-framework/src/tls.rs#run_tls_listener`).
-A failed or timed-out handshake is logged at debug level only, because plaintext sent to a TLS
-port is the common scanner case.
+A failed or timed-out handshake is dropped with no event and logged at debug level only,
+because plaintext sent to a TLS port is the common scanner case.
 
-### STARTTLS upgrades
+### STARTTLS upgrades and pipelining refusal
 
 Protocols that switch to TLS in-band (SMTP `STARTTLS`, FTP `AUTH TLS`) go through one shared
 path, `crates/sensor-framework/src/tls.rs#upgrade_buffered`. The upgrade handshake is bounded by
-the same read timeout. If the client has already sent more plaintext after the STARTTLS command
-(command pipelining across the upgrade, the CVE-2011-0411 injection shape), the upgrade is
-refused and the connection dropped rather than letting those pre-handshake bytes be read inside
-the encrypted session. `sensor-cred`'s PostgreSQL and MySQL upgrades read without a user-space
-buffer, so they call `crates/sensor-framework/src/tls.rs#MaybeTlsStream` `upgrade` directly:
-plaintext sent after the request stays in the socket and fails the handshake. Its MSSQL handshake
-runs inside TDS packets instead (`crates/sensor-cred/src/tds_tls.rs`).
+the same read timeout, and a failed or stalled handshake ends the session: there is no plaintext
+fallback after the go-ahead reply. If the client has already sent more plaintext after the
+upgrade command (command pipelining across the upgrade, the CVE-2011-0411 injection shape), the
+upgrade is refused and the connection dropped rather than letting those pre-handshake bytes be
+read inside the encrypted session. The sensor records one `honeypot_command_exec` event with
+`starttls_refused` set to `pipelined_plaintext` and the byte count (the bytes themselves are
+never captured). The per-connection capture cap is kept across an upgrade.
 
-### Running provisioning by hand
+`sensor-cred`'s PostgreSQL and MySQL upgrades read without a user-space buffer, so they call
+`crates/sensor-framework/src/tls.rs#MaybeTlsStream` `upgrade` directly: plaintext sent after the
+request stays in the socket and fails the handshake. Its MSSQL handshake runs inside TDS packets
+instead (`crates/sensor-cred/src/tds_tls.rs`).
 
-`install.sh` and `upgrade.sh` run it for you (see [installation](installation.md) and
-[upgrade, rollback and DR](upgrade-rollback-and-dr.md)). To run it manually, after
-`deploy/provision.sh` has created the directory and with a release build present:
+#### `sensor-smtp` STARTTLS
 
-```
-sudo deploy/provision-tls.sh
-DRY_RUN=1 deploy/provision-tls.sh   # prints every action; needs no privilege or binary
-```
+Rules (`crates/sensor-smtp/src/handler.rs#handle_connection`; replies in
+[sensor-behavior.md](../reference/sensor-behavior.md#sensor-smtp)):
 
-It is idempotent. It reasserts ownership and mode on every run, so a pair minted by an
-interrupted earlier run is repaired.
+- With the pair set, STARTTLS answers `220 2.0.0 Ready to start TLS` and upgrades in place. A
+  pipelined STARTTLS gets `554` and the connection is closed without the `220`.
+- After the upgrade the client must send EHLO again: MAIL, RCPT and BDAT state is discarded.
+- A second STARTTLS inside TLS gets `503`, and EHLO inside TLS omits the STARTTLS extension.
+  STARTTLS with parameters gets `501` (only when TLS is configured).
+- With no pair set nothing changes: EHLO still advertises STARTTLS and every STARTTLS line gets
+  the unchanged `454` reply.
+- A cert and key with no `PROPOLIS_SMTP_TLS_BIND` and no submission bind still enable STARTTLS on
+  port 25 and open nothing else (pinned by the spawned-binary test
+  `crates/sensor-smtp/tests/tls.rs#a_valid_pair_without_a_tls_bind_enables_starttls_on_the_plain_listener_only`).
+
+#### `sensor-ftp` AUTH TLS
+
+Rules (`crates/sensor-ftp/src/handler.rs#handle_connection`; replies in
+[sensor-behavior.md](../reference/sensor-behavior.md#sensor-ftp)):
+
+- With the pair set, `AUTH TLS`, `AUTH TLS-C`, `AUTH SSL` and `AUTH TLS-P` answer
+  `234 Proceed with negotiation.` and upgrade in place. Any other AUTH type gets `504`, and AUTH
+  inside TLS gets `503`. A pipelined AUTH TLS gets
+  `504 Pipelined commands after AUTH TLS refused.` and the connection is closed without the `234`.
+- After the upgrade the session is reset as REIN would: the username, login state, PBSZ, PROT and
+  any open passive listener are discarded.
+- PBSZ (inside TLS only, always `0`) and then PROT (`C` or `P`; `S` and `E` get `536`) set the
+  data-channel protection. After `PROT P` the passive data socket is wrapped in TLS once the data
+  peer passed the source-IP check; the handshake is bounded by the read timeout and a failed one
+  gets `425`. STOR over `PROT P` is captured and spooled exactly like plaintext, and a data close
+  without `close_notify` counts as end of file.
+- FEAT lists `AUTH`, `PBSZ` and `PROT` only when TLS is configured. With no pair set nothing
+  changes: AUTH, PBSZ and PROT answer `500` like any unknown command.
+- A cert and key with no `PROPOLIS_FTP_TLS_BIND` still enable AUTH TLS on port 21 and open nothing
+  else (pinned by the spawned-binary test
+  `crates/sensor-ftp/tests/tls_config.rs#a_valid_pair_without_a_tls_bind_enables_auth_tls_on_the_plain_listener_only`).
+
+### `sensor-cred` in-band TLS
+
+Per-protocol rules (replies and tables in
+[sensor-behavior.md](../reference/sensor-behavior.md#sensor-cred-vnc--mysql--mssql--postgresql--mongodb)):
+
+- **PostgreSQL:** an SSLRequest is answered `S` and the session continues over TLS; without the
+  pair it is answered `N` as before. Plaintext sent where the ClientHello belongs is never read
+  as a startup message: the handshake fails and the connection is dropped. A second SSLRequest
+  inside TLS closes the connection.
+- **MySQL:** the greeting advertises `CLIENT_SSL` only with the pair; a client's SSLRequest
+  switches to TLS before the HandshakeResponse, which is then answered OK at sequence id 3.
+- **MSSQL:** a client that asks for encryption (`ENCRYPT_ON` or `ENCRYPT_REQ`) is answered
+  `ENCRYPT_ON` and gets TLS inside TDS; TLS 1.3 session tickets are off for MSSQL only. A client
+  that offers `ENCRYPT_OFF` gets the pre-TLS PRELOGIN response byte for byte and a plaintext
+  session, and an `ENCRYPT_NOT_SUP` or silent client gets `ENCRYPT_NOT_SUP` and plaintext. A real
+  server with encryption on would answer `ENCRYPT_OFF` with `ENCRYPT_REQ` and force TLS; the
+  sensor deliberately does not, so the credentials of scanners that cannot do TLS are still
+  captured.
+- **MongoDB (two-byte sniff):** the first two bytes on the port are peeked, bounded by the read
+  timeout; `0x16 0x03` (a TLS record header) with the pair set selects TLS, anything else the
+  plaintext path. After a sniff that times out the plaintext path waits up to another read
+  timeout, so a silent connection can hold a slot for up to twice the read timeout, capped by the
+  maximum session duration.
+
+**MSSQL validation status and owner smoke tests.** The MSSQL TDS-TLS adapter is validated
+against a rustls client (TLS 1.2 and 1.3) framed by hand in
+`crates/sensor-cred/tests/tls_integration.rs` and against the MS-TDS text, not against real SQL
+Server drivers. Before relying on it, run against a TLS-enabled node:
+
+- `sqlcmd -N -C`, and .NET SqlClient with `Encrypt=True;TrustServerCertificate=True`;
+- FreeTDS `tsql` with `encryption = require` and with `encryption = off`;
+- go-mssqldb with `encrypt=true` and with `encrypt=disable`;
+- impacket `mssqlclient.py`;
+- any driver that attempts TLS 1.3 inside TDS 7.x. If one fails, the fallback is restricting
+  MSSQL to TLS 1.2, which is an owner decision;
+- plaintext PostgreSQL, MySQL and MongoDB clients, to confirm they are still served.
+
+Known follow-up: PostgreSQL does not yet answer a GSSENCRequest with `N`, as a real server
+without GSSAPI encryption does.
 
 ## Firewall and exposure guidance
 
@@ -431,7 +395,8 @@ Based on `docs/archive/2026-08-26/root/INSTALL.md#Firewall considerations` (oper
 live `INSTALL.md` is now a redirect stub):
 
 - **Inbound:** allow the configured sensor ports from the internet (that is the
-  point). Allow nothing inbound to the console port from off-host - keep it
+  point), including any TLS ports you set a bind for (see [TLS surfaces](#tls-surfaces)).
+  Allow nothing inbound to the console port from off-host - keep it
   loopback, or reachable only through your proxy.
 - **Outbound:** the unified daemon needs outbound HTTPS to the vendor APIs *only
   if* review/VirusTotal are enabled, and outbound `5432` only if PostgreSQL is
@@ -450,5 +415,6 @@ live `INSTALL.md` is now a redirect stub):
 - [../reference/ports-and-protocols.md](../reference/ports-and-protocols.md) - exact ports/binds (canonical)
 - [../security/attack-surfaces.md](../security/attack-surfaces.md) - exposure as
   a threat surface
+- [../troubleshooting/sensors-and-networking.md](../troubleshooting/sensors-and-networking.md#sensor-tls) - sensor TLS failure modes
 - [configuration.md](configuration.md) - bind configuration
 - [secret-management.md](secret-management.md) - console auth secrets

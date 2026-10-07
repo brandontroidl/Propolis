@@ -53,6 +53,8 @@ enum ConfigError {
     /// The named cert or key env var was unset or blank while TLS was asked for by the other
     /// path var or by `PROPOLIS_HTTP_TLS_BIND`.
     TlsPathMissing(&'static str),
+    /// The named TLS env var was set to a value that is not valid UTF-8.
+    TlsVarNotUtf8(&'static str),
     InvalidWanMapEntry(String),
     InvalidBound {
         field: &'static str,
@@ -72,6 +74,7 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "{var} must be set to a PEM file path (TLS needs both {ENV_TLS_CERT} and {ENV_TLS_KEY})"
             ),
+            ConfigError::TlsVarNotUtf8(var) => write!(f, "{var} is set but is not valid UTF-8"),
             ConfigError::InvalidWanMapEntry(s) => write!(
                 f,
                 "invalid {ENV_WAN_MAP} entry {s:?}, expected local_ip=wan_ip"
@@ -189,13 +192,13 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_PATH));
 
-    // var_os + lossy: a non-UTF-8 value must fail parsing (refuse), not read as unset and
-    // silently disable TLS the way `env::var(..).ok()` would.
-    let env_str = |name: &str| env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    let tls_var = |name: &'static str| {
+        sensor_framework::tls_env_var(name).map_err(|_| ConfigError::TlsVarNotUtf8(name))
+    };
     let tls = parse_tls(
-        env_str(ENV_TLS_BIND).as_deref(),
-        env_str(ENV_TLS_CERT).as_deref(),
-        env_str(ENV_TLS_KEY).as_deref(),
+        tls_var(ENV_TLS_BIND)?.as_deref(),
+        tls_var(ENV_TLS_CERT)?.as_deref(),
+        tls_var(ENV_TLS_KEY)?.as_deref(),
     )?;
 
     Ok(Config {

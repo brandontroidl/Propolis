@@ -517,3 +517,48 @@ async fn a_valid_private_pair_brings_up_the_tls_listener_in_the_binary() {
         .unwrap();
     assert!(String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 200 OK"));
 }
+
+/// A non-UTF-8 value on any TLS variable is invalid, never read as unset (which would start the
+/// sensor without the TLS the operator configured): exit 1, naming the variable, before any
+/// listener binds.
+#[test]
+fn a_non_utf8_tls_var_exits_1_before_any_listener_binds() {
+    use std::os::unix::ffi::OsStrExt;
+    let bad = std::ffi::OsStr::from_bytes(b"/etc/propolis/tls/\xff");
+    for var in [
+        "PROPOLIS_HTTP_TLS_BIND",
+        "PROPOLIS_HTTP_TLS_CERT",
+        "PROPOLIS_HTTP_TLS_KEY",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sensor-http"))
+            .env_clear()
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "info")
+            .env("PROPOLIS_HTTP_BIND", "127.0.0.1:0")
+            .env("PROPOLIS_HTTP_LOG_PATH", dir.path().join("e.jsonl"))
+            .env(var, bad)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.kill();
+        let out = child.wait_with_output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(1), "{var}: {text}");
+        assert!(
+            text.contains(var) && text.contains("UTF-8"),
+            "{var}: {text}"
+        );
+        assert!(!text.contains("listening"), "{var}: bound first: {text}");
+    }
+}

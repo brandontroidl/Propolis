@@ -61,6 +61,8 @@ enum ConfigError {
     /// The named cert or key env var was unset or blank while the other half of the TLS
     /// configuration was present.
     TlsPathMissing(&'static str),
+    /// The named TLS env var was set to a value that is not valid UTF-8.
+    TlsVarNotUtf8(&'static str),
     /// `PROPOLIS_REDIS_BIND` was absent or unparseable.
     NoBind,
     InvalidBind(String),
@@ -81,6 +83,7 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "{var} must be set to a PEM file path (TLS needs both {ENV_TLS_CERT} and {ENV_TLS_KEY})"
             ),
+            ConfigError::TlsVarNotUtf8(var) => write!(f, "{var} is set but is not valid UTF-8"),
             ConfigError::NoBind => {
                 write!(f, "{ENV_BIND} must be set to a single ip:port bind address")
             }
@@ -242,13 +245,13 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         ENV_MAX_CONCURRENT,
     )?;
 
-    // var_os + lossy: a non-UTF-8 value becomes a parse failure (refuse) rather than silently
-    // reading as unset, which would disable TLS.
-    let env_str = |name: &str| env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    let tls_var = |name: &'static str| {
+        sensor_framework::tls_env_var(name).map_err(|_| ConfigError::TlsVarNotUtf8(name))
+    };
     let tls = parse_tls(
-        env_str(ENV_TLS_BIND).as_deref(),
-        env_str(ENV_TLS_CERT).as_deref(),
-        env_str(ENV_TLS_KEY).as_deref(),
+        tls_var(ENV_TLS_BIND)?.as_deref(),
+        tls_var(ENV_TLS_CERT)?.as_deref(),
+        tls_var(ENV_TLS_KEY)?.as_deref(),
     )?;
 
     Ok(Config {

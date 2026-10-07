@@ -44,8 +44,9 @@ pub fn plan_listeners(
 
 /// Resolve the TLS configuration from the environment, fail-closed. `lookup` is `std::env::var`
 /// in production. TLS is on iff BOTH the cert and key variables are set (a blank value counts as
-/// unset). Exactly one set, an unreadable or invalid pair, or a TLS bind with neither set is an
-/// error the caller must treat as fatal before binding anything.
+/// unset). A non-UTF-8 value on either variable, exactly one set, an unreadable or invalid pair,
+/// or a TLS bind with neither set is an error the caller must treat as fatal before binding
+/// anything.
 pub fn tls_from_env(
     cert_var: &str,
     key_var: &str,
@@ -53,13 +54,11 @@ pub fn tls_from_env(
     lookup: impl Fn(&str) -> Result<String, VarError>,
 ) -> Result<Option<TlsServer>, String> {
     let is_set = |var: &str| match lookup(var) {
-        Ok(value) => !value.trim().is_empty(),
-        Err(VarError::NotPresent) => false,
-        // Present but unusable: count it as set so the loader reports it rather than TLS silently
-        // staying off.
-        Err(VarError::NotUnicode(_)) => true,
+        Ok(value) => Ok(!value.trim().is_empty()),
+        Err(VarError::NotPresent) => Ok(false),
+        Err(VarError::NotUnicode(_)) => Err(format!("{var} is set but is not valid UTF-8")),
     };
-    match (is_set(cert_var), is_set(key_var)) {
+    match (is_set(cert_var)?, is_set(key_var)?) {
         (false, false) if tls_bind_configured => Err(format!(
             "a TLS bind is configured but {cert_var} and {key_var} are not set"
         )),
@@ -268,10 +267,18 @@ mod tests {
 
     #[test]
     fn tls_from_env_not_unicode_is_an_error_not_off() {
-        let lookup = |name: &str| match name {
-            "C" => Err(VarError::NotUnicode(std::ffi::OsString::new())),
-            _ => Err(VarError::NotPresent),
-        };
-        assert!(tls_from_env("C", "K", false, lookup).is_err());
+        for bad in ["C", "K"] {
+            let lookup = |name: &str| {
+                if name == bad {
+                    Err(VarError::NotUnicode(std::ffi::OsString::new()))
+                } else {
+                    Err(VarError::NotPresent)
+                }
+            };
+            let err = tls_from_env("C", "K", false, lookup)
+                .err()
+                .expect("a non-UTF-8 TLS variable must be an error, never TLS off");
+            assert!(err.contains(bad) && err.contains("UTF-8"), "{err}");
+        }
     }
 }

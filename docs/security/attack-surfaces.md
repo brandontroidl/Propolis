@@ -76,7 +76,7 @@ interpreted, and the connection is closed with a `554` before any handshake begi
 is reset after the upgrade. AUTH passwords are never captured over TLS, as on the plain
 listener. A half-configured or unusable pair makes the sensor refuse to start rather than serve
 plaintext. See
-[../operations/networking-tls.md](../operations/networking-tls.md#live-smtps-and-starttls-on-sensor-smtp).
+[../operations/networking-tls.md](../operations/networking-tls.md#sensor-smtp-starttls).
 
 `sensor-ftp` can expose one more port and a protocol upgrade. An implicit-TLS listener
 (conventionally 990, FTPS) exists only when `PROPOLIS_FTP_TLS_BIND` is set, so cert and key alone
@@ -92,7 +92,7 @@ matched the control connection, and uploads over it are quarantined by the same 
 budget and shutdown drain as plaintext uploads, and never run. Passwords are never captured over
 TLS, as on the plain listener. A half-configured or unusable pair makes the sensor refuse to
 start rather than serve plaintext. See
-[../operations/networking-tls.md](../operations/networking-tls.md#live-ftps-and-auth-tls-on-sensor-ftp).
+[../operations/networking-tls.md](../operations/networking-tls.md#sensor-ftp-auth-tls).
 
 `sensor-cred` opens no new port for TLS: with `PROPOLIS_CRED_TLS_CERT` and
 `PROPOLIS_CRED_TLS_KEY` set, the existing PostgreSQL, MySQL, MSSQL and MongoDB ports also accept a
@@ -110,7 +110,7 @@ TDS packet of at most 4096 bytes. Plaintext clients are still served on every po
 an MSSQL client that offers `ENCRYPT_OFF`. Passwords, DES and MD5 responses are never captured over
 TLS, as in plaintext. A half-configured or unusable pair makes the sensor refuse to start rather
 than serve plaintext. See
-[../operations/networking-tls.md](../operations/networking-tls.md#live-in-band-tls-on-sensor-cred).
+[../operations/networking-tls.md](../operations/networking-tls.md#sensor-cred-in-band-tls).
 
 Controls:
 

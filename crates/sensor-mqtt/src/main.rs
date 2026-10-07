@@ -59,6 +59,8 @@ enum ConfigError {
     InvalidTlsBind(String),
     /// A TLS env var was unset or blank while the TLS pair is incomplete or a TLS bind is set.
     TlsVarMissing(&'static str),
+    /// The named TLS env var was set to a value that is not valid UTF-8.
+    TlsVarNotUtf8(&'static str),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -75,6 +77,7 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "{var} must be set: TLS needs both {ENV_TLS_CERT} and {ENV_TLS_KEY}, and {ENV_TLS_BIND} requires them"
             ),
+            ConfigError::TlsVarNotUtf8(var) => write!(f, "{var} is set but is not valid UTF-8"),
         }
     }
 }
@@ -163,12 +166,13 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let collector_id = sensor_framework::env_with_legacy(ENV_COLLECTOR_ID, ENV_COLLECTOR_ID_LEGACY)
         .unwrap_or_else(|| DEFAULT_COLLECTOR_ID.to_string());
     let outbox_dir = resolve_outbox_dir(&spool_dir, env::var(ENV_OUTBOX_DIR).ok());
-    // var_os + lossy: a non-UTF-8 value must fail parsing (refuse), not read as "unset".
-    let env_str = |name: &str| env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    let tls_var = |name: &'static str| {
+        sensor_framework::tls_env_var(name).map_err(|_| ConfigError::TlsVarNotUtf8(name))
+    };
     let tls = parse_tls(
-        env_str(ENV_TLS_BIND).as_deref(),
-        env_str(ENV_TLS_CERT).as_deref(),
-        env_str(ENV_TLS_KEY).as_deref(),
+        tls_var(ENV_TLS_BIND)?.as_deref(),
+        tls_var(ENV_TLS_CERT)?.as_deref(),
+        tls_var(ENV_TLS_KEY)?.as_deref(),
     )?;
 
     Ok(Config {

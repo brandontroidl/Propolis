@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Security reviewer manual
@@ -114,7 +114,9 @@ Stated plainly and owned by [residual risks](../security/residual-risks.md):
 - The systemd `SystemCallFilter` shipped is a broad **development placeholder**, not a
   tightened per-binary seccomp allowlist - treat the syscall sandbox as effectively absent
   until an operator derives it.
-- **No in-process TLS** - the console is plain HTTP; any transport encryption is operator-provided.
+- **No in-process TLS on the console** - the console is plain HTTP; any transport encryption is
+  operator-provided. (Six sensors do serve TLS on their attacker-facing ports; that is honeypot
+  fidelity, not operator transport security.)
 - The `noexec,nosuid,nodev` spool mounts are printed as fstab guidance, not enforced from
   source - whether they are mounted on a given box is not verifiable from the code.
 - **Single-node blast radius** - no built-in redundancy, failover, or off-host replication.

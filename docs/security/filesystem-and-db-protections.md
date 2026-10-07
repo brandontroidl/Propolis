@@ -92,7 +92,8 @@ security-load-bearing choices:
   parsing as a best-effort scrub, not a guarantee: it covers only those buffers, not
   the parsed key the TLS configuration holds (`crates/sensor-framework/src/tls.rs#load_server_config`). Tests use
   ephemeral in-memory certificates (`crates/sensor-framework/src/tls.rs#server_config_from_pem`),
-  never a checked-in key. No sensor binds TLS yet. Operator guidance:
+  never a checked-in key. Each TLS unit reads the directory through
+  `ReadOnlyPaths=-/etc/propolis/tls`, so it can never write a key. Operator guidance:
   [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 - Dedicated users are created `--system --no-create-home --shell /usr/sbin/nologin`
   (`ensure_user`, `deploy/provision.sh#ensure_user`); no sensor user can log in.

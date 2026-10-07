@@ -107,9 +107,11 @@ pair (`PROPOLIS_HTTP_TLS_CERT` and `PROPOLIS_HTTP_TLS_KEY`, `PROPOLIS_MQTT_TLS_C
 `PROPOLIS_MQTT_TLS_KEY`, `PROPOLIS_REDIS_TLS_CERT` and `PROPOLIS_REDIS_TLS_KEY`,
 `PROPOLIS_SMTP_TLS_CERT` and `PROPOLIS_SMTP_TLS_KEY`, `PROPOLIS_FTP_TLS_CERT` and
 `PROPOLIS_FTP_TLS_KEY`, `PROPOLIS_CRED_TLS_CERT` and `PROPOLIS_CRED_TLS_KEY`, through the
-read-only `ReadOnlyPaths=/etc/propolis/tls` in `deploy/sensor-http.service`,
+read-only `ReadOnlyPaths=-/etc/propolis/tls` in `deploy/sensor-http.service`,
 `deploy/sensor-mqtt.service`, `deploy/sensor-redis.service`, `deploy/sensor-smtp.service`,
-`deploy/sensor-ftp.service` and `deploy/sensor-cred.service`); see [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+`deploy/sensor-ftp.service` and `deploy/sensor-cred.service`). The leading `-` makes the directory
+optional to systemd, so a unit still starts where it is absent; a configured pair that cannot be
+read refuses to start in-process. See [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 
 | Path | Mode | Owner | Created by |
 |---|---|---|---|

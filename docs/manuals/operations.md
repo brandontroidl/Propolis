@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Operator manual
@@ -127,7 +127,8 @@ checklist are owned by [backup and restore](../operations/backup-and-restore.md)
   [secret management](../operations/secret-management.md).
 - Configuration surface: [configuration](../operations/configuration.md); exact values in
   [environment variables](../reference/environment-variables.md).
-- Networking and TLS (no in-process TLS; front with an operator-provided reverse proxy):
+- Networking and TLS (the console has no in-process TLS, so front it with an operator-provided
+  reverse proxy; six sensors serve TLS on their attacker-facing ports, off until configured):
   [networking and TLS](../operations/networking-tls.md).
 - Upgrade, rollback, and DR context: [upgrade, rollback and DR](../operations/upgrade-rollback-and-dr.md).
 - Safe teardown (preserve or deliberately wipe evidence): [safe teardown](../getting-started/safe-teardown.md).

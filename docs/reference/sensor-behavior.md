@@ -1024,11 +1024,11 @@ per-protocol bind var is required.
     before binding any protocol; exactly one set, a blank or non-UTF-8 value, an unusable pair and
     a key that is not mode `0600` all count. Variables are in
     [environment-variables.md](environment-variables.md); the operator view is
-    [../operations/networking-tls.md](../operations/networking-tls.md#live-in-band-tls-on-sensor-cred).
+    [../operations/networking-tls.md](../operations/networking-tls.md#sensor-cred-in-band-tls).
   - **Validation scope:** the MSSQL TDS-TLS adapter is validated against a rustls client (TLS 1.2
     and 1.3) framed by hand in the tests and against the MS-TDS text, not against real SQL Server
     drivers. The owner smoke tests listed in
-    [../operations/networking-tls.md](../operations/networking-tls.md#live-in-band-tls-on-sensor-cred)
+    [../operations/networking-tls.md](../operations/networking-tls.md#sensor-cred-in-band-tls)
     are still to be run.
 
 ## Cross-cutting invariants

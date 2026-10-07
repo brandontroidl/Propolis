@@ -20,8 +20,10 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 ReadWritePaths=/var/log/propolis/ftp /var/spool/propolis/ftp
-# Per-sensor cert and key for PROPOLIS_FTP_TLS_CERT / PROPOLIS_FTP_TLS_KEY.
-ReadOnlyPaths=/etc/propolis/tls
+# Per-sensor cert and key for PROPOLIS_FTP_TLS_CERT / PROPOLIS_FTP_TLS_KEY. The leading "-" lets
+# the unit start where the directory is absent (TLS unused); a configured pair that cannot be read
+# still refuses to start in-process.
+ReadOnlyPaths=-/etc/propolis/tls
 
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE

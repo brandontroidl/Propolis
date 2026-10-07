@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Service lifecycle
@@ -56,7 +56,14 @@ sudo systemctl enable --now sensor-catchall sensor-ssh sensor-telnet sensor-redi
 each is off until its env file (`/etc/propolis/tftp.env`, `/etc/propolis/mqtt.env`) sets
 `PROPOLIS_TFTP_BIND` or `PROPOLIS_MQTT_BIND`, and without a bind it exits instead of
 listening. Enable `sensor-tftp` only on a host where inbound UDP/69 is meant to be open, and
-`sensor-mqtt` only where inbound TCP/1883 is.
+`sensor-mqtt` only where inbound TCP/1883 is (and TCP/8883, if `PROPOLIS_MQTT_TLS_BIND` is set).
+
+The TLS listeners (HTTPS 443, Redis 6380, MQTTS 8883, SMTPS 465, submission 587, FTPS 990) are
+off until their `*_TLS_BIND` (or `PROPOLIS_SMTP_SUBMISSION_BIND`) variable is set, so starting a
+sensor never opens one implicitly; sensor-cred's TLS runs on its existing ports. A sensor with a
+bad TLS setting exits 1 at start with `refusing to start`. See
+[networking-tls.md](networking-tls.md#sensor-tls-attacker-facing-listeners) for the variables
+and the failure modes.
 
 `enable --now` both starts the unit and sets it to start at boot. Source:
 `docs/archive/2026-08-26/root/INSTALL.md#6. Start services` (the live `INSTALL.md` is now a redirect

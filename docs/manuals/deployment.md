@@ -4,7 +4,7 @@ audience: deployer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Deployment manual
@@ -98,7 +98,9 @@ default), and no-listener subsystems.
 > only because it is loopback-only. Before any firewall change that could sever
 > access, confirm out-of-band administration first.
 
-- [`../operations/networking-tls.md`](../operations/networking-tls.md)
+- [`../operations/networking-tls.md`](../operations/networking-tls.md) - also the sensor TLS
+  guide: six sensors (http, redis, mqtt, smtp, ftp, cred) serve TLS on their attacker-facing
+  ports with a deploy-minted pair, each off until its variables are set
 - Ports/binds (canonical):
   [`../reference/ports-and-protocols.md`](../reference/ports-and-protocols.md)
 

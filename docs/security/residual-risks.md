@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Residual risks
@@ -28,10 +28,11 @@ should be treated as effectively absent; the other sandbox layers
 bounding, address-family restriction) still apply. See
 [hardening checklist step 1](./hardening-checklist.md).
 
-## No in-process TLS
+## No in-process TLS on the console
 
-The console serves plain HTTP on a `TcpListener` (`console::server::serve`, HTTP/1.1, no rustls). There
-is no built-in TLS anywhere in the platform. Confidentiality and integrity for
+The console serves plain HTTP on a `TcpListener` (`console::server::serve`, HTTP/1.1, no rustls). It
+has no built-in TLS; the only in-process TLS in the platform is on six sensors' attacker-facing
+ports, which protects nothing of the operator's. Confidentiality and integrity for
 console traffic beyond loopback depend entirely on an operator-provided reverse
 proxy. Do not assume transport encryption exists unless you configured it.
 

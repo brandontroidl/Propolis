@@ -41,10 +41,17 @@ fn parse_positive_u32(raw: Option<&str>, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// Unset or blank means "not configured". Anything else must parse or the sensor refuses to
-/// start: a typo must not silently drop a listener the derived fleet inventory will claim exists.
+/// Unset or blank means "not configured". Anything else, a non-UTF-8 value included, must parse
+/// or the sensor refuses to start: a typo must not silently drop a listener the derived fleet
+/// inventory will claim exists.
 fn optional_bind(var: &str) -> Option<SocketAddr> {
-    let raw = env::var(var).ok()?;
+    let raw = match sensor_framework::tls_env_var(var) {
+        Ok(raw) => raw?,
+        Err(e) => {
+            tracing::error!(error = %e, "sensor-smtp: invalid configuration; refusing to start");
+            std::process::exit(1);
+        }
+    };
     let raw = raw.trim();
     if raw.is_empty() {
         return None;

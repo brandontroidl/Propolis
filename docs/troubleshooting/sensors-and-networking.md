@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Sensors and networking
@@ -48,8 +48,8 @@ Work outward from the process:
 - **Bound to the wrong interface** - `127.0.0.1:22` only accepts loopback.
   Exposure needs `0.0.0.0:22` (or the specific public interface). This is an
   operator choice in the `.env`, not a code default.
-- **Privileged port without capability** - catchall/ssh/telnet/http/ftp/smtp
-  units carry `CAP_NET_BIND_SERVICE` for ports below 1024; redis/adb/cred do
+- **Privileged port without capability** - catchall/ssh/telnet/http/ftp/smtp/tftp
+  units carry `CAP_NET_BIND_SERVICE` for ports below 1024; redis/adb/mqtt/cred do
   not. Rebinding a no-capability sensor to a low port fails to bind.
 - **Port already owned** - a real service (e.g. the host's own `sshd`) holds the
   port. See bind conflicts in [Startup and config](startup-and-config.md).
@@ -101,9 +101,62 @@ not present as freshly minted each boot. If that path is not writable by
 (`0750 propolis-ssh`). The banner defaults to the persona OpenSSH version and can
 be overridden with `PROPOLIS_SSH_BANNER`.
 
-## No in-process TLS
+## Sensor TLS
 
-The console and sensors do not terminate TLS in-process. Any TLS is provided by
-an operator-run reverse proxy `[inferred]`; there is no built-in HTTPS to
-misconfigure at the application layer. See
-[Networking and TLS](../operations/networking-tls.md).
+Six sensors (http, redis, mqtt, smtp, ftp, cred) terminate TLS in-process; the variables, ports
+and rules are in [Networking and TLS](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+The console has no in-process TLS: put it behind your own reverse proxy.
+
+**The sensor exits 1 at start and the journal says `refusing to start`.** TLS is fail-closed:
+any doubt about the TLS setup stops the whole sensor, plain listener included, before it binds
+anything. With `Restart=always` that shows as a restart loop; read the one error line with
+`journalctl -u sensor-<name> -n 20`. The usual causes:
+
+- **Key mode.** The error names the key, its mode, and says `chmod 0600`. The key must have no
+  group or other permission bit; the certificate is not checked. A pair minted by
+  `deploy/provision-tls.sh` is already `0600`; a real certificate copied in by hand often is not.
+- **Missing pair.** `cannot read /etc/propolis/tls/<sensor>.crt` (or `.key`): the env file names
+  a file that is not there. Run `sudo deploy/provision-tls.sh` (it mints any missing pair and
+  repairs ownership), or fix the path. If `/etc/propolis/tls` itself is missing, run
+  `deploy/provision.sh` first.
+- **Half-set variables.** Only one of `*_TLS_CERT` and `*_TLS_KEY` is set, or a `*_TLS_BIND` is
+  set without both. The error names the variables involved. A blank value counts as unset, except
+  on sensor-cred, where a present but blank variable is itself an error.
+- **Non-UTF-8 value.** `<VARIABLE> is set but is not valid UTF-8` (or `environment variable
+  <VARIABLE> is not valid UTF-8`): a TLS variable or bind holds bytes that are not UTF-8, usually
+  an env file saved in a legacy encoding. It is never read as unset; rewrite the line as plain
+  ASCII.
+- **Unparseable bind.** `invalid <VARIABLE>`: the TLS bind is not an `ip:port`.
+- **Unusable file.** Not PEM, no certificate or key in it, larger than 1 MiB, not a regular
+  file, or a certificate and key that do not match.
+
+A missing `/etc/propolis/tls` directory does not stop a unit that uses no TLS: the units grant it
+as `ReadOnlyPaths=-/etc/propolis/tls`, where the `-` makes it optional.
+
+**The cert and key are set but the TLS port is not listening.** A TLS listener exists only when
+its `*_TLS_BIND` (or `PROPOLIS_SMTP_SUBMISSION_BIND`) is set; a pair alone opens no port and logs
+one warning. sensor-smtp and sensor-ftp use a pair alone for STARTTLS and AUTH TLS on the plain
+port, and sensor-cred never opens a TLS port: its TLS runs on the plain binds.
+
+**Clients connect but the TLS handshake fails, and nothing is logged.** Failed and timed-out
+handshakes are dropped with no event and logged at debug level only, because plaintext sent to a
+TLS port is the common scanner case. The certificate is self-signed for `localhost`, so a client
+that verifies certificates rejects it unless told not to.
+
+**Raising the log level.** Sensors log errors only when `RUST_LOG` is unset
+([`RUST_LOG`](../reference/environment-variables.md#rust_log)), so the "no TLS listener started"
+warning and the startup lines are hidden by default. Add a line to the sensor's env file and
+restart it:
+
+```
+# /etc/propolis/<sensor>.env
+RUST_LOG=info
+```
+
+`info` shows the startup, listening and warning lines. `debug` also logs each failed handshake;
+it is noisy on an internet-facing port, so set it only while diagnosing and revert afterwards.
+
+```
+sudo systemctl restart sensor-<sensor>
+journalctl -u sensor-<sensor> -f
+```

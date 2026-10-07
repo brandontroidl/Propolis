@@ -4,7 +4,7 @@ audience: evaluator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Evaluator manual
@@ -47,7 +47,7 @@ marketing-grade claims are called out where they are not source-evidenced.
 These are the constraints an evaluator most often misses. None is a defect to
 discover later - each is stated up front.
 
-- **No in-process TLS.** The console is plain HTTP on a loopback `TcpListener`.
+- **No in-process TLS on the console.** The console is plain HTTP on a loopback `TcpListener`.
   Any transport encryption is operator-provided (e.g. a reverse proxy). See
   [`../overview/limitations.md`](../overview/limitations.md) and
   [`../operations/networking-tls.md`](../operations/networking-tls.md).

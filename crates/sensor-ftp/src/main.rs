@@ -60,6 +60,8 @@ enum ConfigError {
     InvalidTlsBind(String),
     /// Exactly one of cert/key set, or a TLS bind without both. Names the variables only.
     TlsIncomplete(&'static str),
+    /// The named TLS env var was set to a value that is not valid UTF-8.
+    TlsVarNotUtf8(&'static str),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -73,6 +75,7 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::InvalidTlsBind(s) => write!(f, "invalid {ENV_TLS_BIND}: {s:?}"),
             ConfigError::TlsIncomplete(why) => write!(f, "{why}"),
+            ConfigError::TlsVarNotUtf8(var) => write!(f, "{var} is set but is not valid UTF-8"),
         }
     }
 }
@@ -131,8 +134,13 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         .trim()
         .parse()
         .map_err(|_| ConfigError::InvalidBind(bind_raw.clone()))?;
-    let tls_bind = match env::var(ENV_TLS_BIND) {
-        Ok(raw) if !raw.trim().is_empty() => Some(
+    // A non-UTF-8 value is invalid, never unset: reading it as unset would silently skip the 990
+    // listener or turn TLS off.
+    let tls_var = |name: &'static str| {
+        sensor_framework::tls_env_var(name).map_err(|_| ConfigError::TlsVarNotUtf8(name))
+    };
+    let tls_bind = match tls_var(ENV_TLS_BIND)? {
+        Some(raw) if !raw.trim().is_empty() => Some(
             raw.trim()
                 .parse()
                 .map_err(|_| ConfigError::InvalidTlsBind(raw.clone()))?,
@@ -140,8 +148,8 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         _ => None,
     };
     let tls_paths = tls_paths(
-        env::var(ENV_TLS_CERT).ok(),
-        env::var(ENV_TLS_KEY).ok(),
+        tls_var(ENV_TLS_CERT)?,
+        tls_var(ENV_TLS_KEY)?,
         tls_bind.is_some(),
     )?;
     let wan_map = parse_wan_map(&env::var(ENV_WAN_MAP).unwrap_or_default())?;

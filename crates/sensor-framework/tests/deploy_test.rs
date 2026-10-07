@@ -79,7 +79,8 @@ fn tftp_unit_has_hardening_directives_and_cap_net_bind() {
 /// The MQTT sensor listens on 1883, an unprivileged port, so unlike the other sensor units it must
 /// carry no `CAP_NET_BIND_SERVICE` grant (least privilege), and stay off by default: the unit
 /// carries no compiled-in bind, so an installed-but-unconfigured unit has nothing to listen on.
-/// It is metadata-only, so it also has no spool path in `ReadWritePaths`.
+/// It spools binary PUBLISH payloads, so its only writable paths are its own log directory and
+/// that spool directory.
 #[test]
 fn mqtt_unit_has_hardening_directives_and_no_cap_net_bind() {
     let unit = std::fs::read_to_string(concat!(
@@ -122,7 +123,7 @@ fn mqtt_unit_has_hardening_directives_and_no_cap_net_bind() {
 #[test]
 fn mqtt_unit_reads_tls_dir_read_only_and_grants_no_capability() {
     let unit = deploy_file("sensor-mqtt.service");
-    assert!(unit.contains("ReadOnlyPaths=/etc/propolis/tls\n"));
+    assert!(unit.lines().any(|l| l == TLS_READ_ONLY_LINE));
     assert!(unit.contains("CapabilityBoundingSet=\n"));
     assert!(
         unit.lines()
@@ -138,7 +139,7 @@ fn mqtt_unit_reads_tls_dir_read_only_and_grants_no_capability() {
 #[test]
 fn redis_unit_reads_tls_dir_read_only_and_grants_no_capability() {
     let unit = deploy_file("sensor-redis.service");
-    assert!(unit.contains("ReadOnlyPaths=/etc/propolis/tls\n"));
+    assert!(unit.lines().any(|l| l == TLS_READ_ONLY_LINE));
     assert!(unit.contains("CapabilityBoundingSet=\n"));
     assert!(
         unit.lines()
@@ -154,7 +155,7 @@ fn redis_unit_reads_tls_dir_read_only_and_grants_no_capability() {
 #[test]
 fn http_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
     let unit = deploy_file("sensor-http.service");
-    assert!(unit.contains("ReadOnlyPaths=/etc/propolis/tls\n"));
+    assert!(unit.lines().any(|l| l == TLS_READ_ONLY_LINE));
     assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
     assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
 }
@@ -166,7 +167,7 @@ fn http_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
 #[test]
 fn smtp_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
     let unit = deploy_file("sensor-smtp.service");
-    assert!(unit.contains("ReadOnlyPaths=/etc/propolis/tls\n"));
+    assert!(unit.lines().any(|l| l == TLS_READ_ONLY_LINE));
     assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
     assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
 }
@@ -177,7 +178,7 @@ fn smtp_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
 #[test]
 fn ftp_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
     let unit = deploy_file("sensor-ftp.service");
-    assert!(unit.contains("ReadOnlyPaths=/etc/propolis/tls\n"));
+    assert!(unit.lines().any(|l| l == TLS_READ_ONLY_LINE));
     assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
     assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
 }
@@ -189,7 +190,7 @@ fn ftp_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
 #[test]
 fn cred_unit_reads_tls_dir_read_only_and_grants_no_capability() {
     let unit = deploy_file("sensor-cred.service");
-    assert!(unit.contains("ReadOnlyPaths=/etc/propolis/tls\n"));
+    assert!(unit.lines().any(|l| l == TLS_READ_ONLY_LINE));
     assert!(unit.contains("CapabilityBoundingSet=\n"));
     assert!(
         unit.lines()
@@ -1402,6 +1403,73 @@ fn no_sensor_crate_depends_on_an_http_client() {
 /// Sensors with a TLS listener (telnet is deliberately out of scope).
 const TLS_SENSORS: [&str; 6] = ["http", "mqtt", "redis", "smtp", "ftp", "cred"];
 
+/// The TLS directory grant every TLS-capable sensor unit carries. The leading `-` makes a missing
+/// directory non-fatal: without it systemd refuses to start the unit (226/NAMESPACE) on a box where
+/// `/etc/propolis/tls` was never provisioned, even when the sensor uses no TLS. TLS itself stays
+/// fail-closed in-process, because the loader refuses a configured pair it cannot read.
+const TLS_READ_ONLY_LINE: &str = "ReadOnlyPaths=-/etc/propolis/tls";
+
+/// The sensors `deploy/provision-tls.sh` mints a pair for, parsed from its `TLS_SENSORS=(...)`.
+fn provision_tls_sensors() -> Vec<String> {
+    deploy_file("provision-tls.sh")
+        .lines()
+        .find_map(|l| l.strip_prefix("TLS_SENSORS=("))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .expect("provision-tls.sh has no TLS_SENSORS=(...) line at column 0")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Coverage gate for the per-unit TLS assertions above: those check only the units somebody
+/// listed. Both sides are derived from the files at test time, so a unit that gained (or kept) the
+/// TLS grant without a minted pair, or a minted sensor whose unit cannot read its pair, fails here.
+/// Any `ReadOnlyPaths` line naming the TLS directory counts, so a unit that reverts to the
+/// undashed form is caught as well.
+#[test]
+fn tls_dir_grant_units_match_provision_tls_sensors_exactly() {
+    let deploy_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy"));
+    let mut granted = std::collections::BTreeSet::new();
+    let mut units_seen = 0usize;
+    for entry in std::fs::read_dir(&deploy_dir).expect("failed to read deploy/") {
+        let name = entry
+            .expect("failed to read a deploy/ entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        let Some(sensor) = name
+            .strip_prefix("sensor-")
+            .and_then(|n| n.strip_suffix(".service"))
+        else {
+            continue;
+        };
+        units_seen += 1;
+        let unit = deploy_file(&name);
+        let tls_lines: Vec<&str> = unit
+            .lines()
+            .filter(|l| l.starts_with("ReadOnlyPaths=") && l.contains("/etc/propolis/tls"))
+            .collect();
+        if tls_lines.is_empty() {
+            continue;
+        }
+        assert_eq!(
+            tls_lines,
+            [TLS_READ_ONLY_LINE],
+            "deploy/{name} must grant the TLS directory exactly as `{TLS_READ_ONLY_LINE}`"
+        );
+        granted.insert(sensor.to_string());
+    }
+    assert!(
+        units_seen >= 9,
+        "only {units_seen} deploy/sensor-*.service units found: the walk is broken"
+    );
+    let minted: std::collections::BTreeSet<String> = provision_tls_sensors().into_iter().collect();
+    assert_eq!(
+        granted, minted,
+        "units granting {TLS_READ_ONLY_LINE} must be exactly the sensors provision-tls.sh mints for"
+    );
+}
+
 fn deploy_file(name: &str) -> String {
     std::fs::read_to_string(format!(
         "{}/../../deploy/{name}",
@@ -1443,13 +1511,7 @@ fn provision_tls_script_is_valid_bash_and_mints_for_provisioned_users() {
         "deploy/provision-tls.sh has a bash syntax error"
     );
 
-    let text = deploy_file("provision-tls.sh");
-    let list = text
-        .lines()
-        .find_map(|l| l.strip_prefix("TLS_SENSORS=("))
-        .and_then(|rest| rest.strip_suffix(')'))
-        .expect("provision-tls.sh has no TLS_SENSORS=(...) line at column 0");
-    let minted: Vec<&str> = list.split_whitespace().collect();
+    let minted = provision_tls_sensors();
     assert_eq!(minted, TLS_SENSORS);
 
     let provision = deploy_file("provision.sh");

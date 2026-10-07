@@ -37,7 +37,7 @@ pub enum TlsConfigError {
     EnvMissing {
         var: String,
     },
-    /// An env var was set but not valid unicode.
+    /// An env var was set but not valid UTF-8.
     EnvNotUnicode {
         var: String,
     },
@@ -75,7 +75,7 @@ impl fmt::Display for TlsConfigError {
         match self {
             Self::EnvMissing { var } => write!(f, "environment variable {var} is unset or empty"),
             Self::EnvNotUnicode { var } => {
-                write!(f, "environment variable {var} is not valid unicode")
+                write!(f, "environment variable {var} is not valid UTF-8")
             }
             Self::Io { path, source } => write!(f, "cannot read {}: {source}", path.display()),
             Self::NotRegularFile { path } => {
@@ -230,6 +230,27 @@ pub fn load_server_config_from_env(
     key_var: &str,
 ) -> Result<Arc<ServerConfig>, TlsConfigError> {
     load_server_config_with_env(cert_var, key_var, |name| std::env::var(name))
+}
+
+/// Read one TLS env var (a cert or key path, or a TLS bind) for a sensor's startup config parse.
+/// Unset is `Ok(None)`. A value that is not valid UTF-8 is `EnvNotUnicode`: never read as unset,
+/// which would silently turn TLS off or drop a listener, and never converted lossily into a path
+/// or address the operator did not write. Blank handling is left to the caller.
+pub fn tls_env_var(var: &str) -> Result<Option<String>, TlsConfigError> {
+    tls_env_value(var, std::env::var(var))
+}
+
+fn tls_env_value(
+    var: &str,
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<String>, TlsConfigError> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(TlsConfigError::EnvNotUnicode {
+            var: var.to_string(),
+        }),
+    }
 }
 
 /// Testable core of [`load_server_config_from_env`]; `lookup` is `std::env::var` in production.
@@ -628,6 +649,22 @@ mod tests {
                 OsString::new()
             ))),
             Err(TlsConfigError::EnvNotUnicode { .. })
+        ));
+    }
+
+    #[test]
+    fn tls_env_value_unset_is_none_and_not_unicode_is_an_error() {
+        assert!(matches!(
+            tls_env_value("C", Err(std::env::VarError::NotPresent)),
+            Ok(None)
+        ));
+        assert!(matches!(
+            tls_env_value("C", Ok(" ".to_string())),
+            Ok(Some(v)) if v == " "
+        ));
+        assert!(matches!(
+            tls_env_value("C", Err(std::env::VarError::NotUnicode(OsString::new()))),
+            Err(TlsConfigError::EnvNotUnicode { var }) if var == "C"
         ));
     }
 

@@ -30,7 +30,9 @@ ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 ReadWritePaths=/var/log/propolis/mqtt /var/spool/propolis/mqtt
 # MQTTS cert and key (PROPOLIS_MQTT_TLS_CERT / PROPOLIS_MQTT_TLS_KEY); read-only, never written.
-ReadOnlyPaths=/etc/propolis/tls
+# The leading "-" lets the unit start where the directory is absent (TLS unused); a configured
+# pair that cannot be read still refuses to start in-process.
+ReadOnlyPaths=-/etc/propolis/tls
 
 CapabilityBoundingSet=
 

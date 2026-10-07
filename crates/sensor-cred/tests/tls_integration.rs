@@ -132,6 +132,16 @@ impl TestServer {
         self.wait_event(sensor_wire::SIGNAL_HONEYPOT_CONNECTION)
             .await
     }
+
+    /// Every event of `signal` once the log has settled.
+    async fn settled(&self, signal: &str) -> Vec<SensorEvent> {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.events()
+            .await
+            .into_iter()
+            .filter(|e| e.signal_type == signal)
+            .collect()
+    }
 }
 
 fn tls_tag(event: &SensorEvent) -> Option<&serde_json::Value> {
@@ -154,14 +164,6 @@ async fn read_exact<S: AsyncRead + Unpin>(conn: &mut S, n: usize) -> Vec<u8> {
         .expect("read timed out")
         .expect("read failed");
     buf
-}
-
-/// The server closes: read to EOF (or error) within the wait.
-async fn assert_closed<S: AsyncRead + Unpin>(conn: &mut S) {
-    let mut sink = Vec::new();
-    let _ = tokio::time::timeout(WAIT, conn.read_to_end(&mut sink))
-        .await
-        .expect("server did not close the connection");
 }
 
 // ---- PostgreSQL ----
@@ -257,16 +259,36 @@ async fn pg_plaintext_after_s_is_dropped() {
     let mut conn = TcpStream::connect(srv.addr).await.unwrap();
     send(&mut conn, &PG_SSL_REQUEST).await;
     assert_eq!(read_exact(&mut conn, 1).await, b"S");
-    // A plaintext StartupMessage where the ClientHello belongs: no fallback.
-    send(&mut conn, &pg_startup("sneaky")).await;
-    assert_closed(&mut conn).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        srv.events()
-            .await
-            .iter()
-            .all(|e| e.signal_type != SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
-    );
+    // A full plaintext login where the ClientHello belongs: StartupMessage and PasswordMessage.
+    let mut plaintext = pg_startup("sneaky");
+    plaintext.extend_from_slice(&pg_message(b'p', b"md5aaaaaaaabbbbbbbbccccccccdddddddd\0"));
+    send(&mut conn, &plaintext).await;
+    // Closed well inside the server's 5s read timeout, so a server that merely waits does not
+    // pass by timing out.
+    let mut received = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, conn.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => received.extend_from_slice(&chunk[..n]),
+            Err(_) => panic!("server did not close; received {received:?}"),
+        }
+    }
+    // The only thing the server may send is TLS alert records (content type 0x15). Any pg
+    // backend message (an `R` authentication request first of all) means a plaintext fallback.
+    let mut rest = &received[..];
+    while !rest.is_empty() {
+        assert!(
+            rest.len() >= 5 && rest[0] == 0x15 && rest[1] == 0x03,
+            "not a TLS alert record after S: {received:?}"
+        );
+        let len = u16::from_be_bytes([rest[3], rest[4]]) as usize;
+        assert!(rest.len() >= 5 + len, "truncated record: {received:?}");
+        rest = &rest[5 + len..];
+    }
+    assert!(srv.settled(SIGNAL_HONEYPOT_LOGIN_ATTEMPT).await.is_empty());
     // The listener is unharmed.
     let mut again = TcpStream::connect(srv.addr).await.unwrap();
     send(&mut again, &PG_SSL_REQUEST).await;
@@ -603,6 +625,26 @@ async fn mssql_not_sup_client_stays_plain() {
     srv.handle.abort();
 }
 
+/// Capture first: a client that asked for encryption (and was answered ON) but then sends a
+/// plaintext Login7 instead of a TLS handshake still has its credential recorded, untagged.
+#[tokio::test]
+async fn mssql_plaintext_login7_after_encryption_on_is_captured() {
+    let pki = pki();
+    let srv = TestServer::start("mssql", Some(pki.tls.clone())).await;
+    for client in [0x01, 0x03] {
+        let (mut conn, reply) = mssql_prelogin(&srv, client).await;
+        assert_eq!(reply, Some(0x01));
+        mssql_plain_login(&mut conn, "fallbackuser").await;
+    }
+    let logins = srv.settled(SIGNAL_HONEYPOT_LOGIN_ATTEMPT).await;
+    assert_eq!(logins.len(), 2);
+    for login in &logins {
+        assert_eq!(username(login), Some("fallbackuser"));
+        assert_eq!(tls_tag(login), None);
+    }
+    srv.handle.abort();
+}
+
 #[tokio::test]
 async fn mssql_plain_login_unchanged_when_tls_disabled() {
     let srv = TestServer::start("mssql", None).await;
@@ -689,12 +731,61 @@ async fn mongodb_tls_client_on_plain_port_is_served_over_tls() {
     let login = srv.wait_event(SIGNAL_HONEYPOT_LOGIN_ATTEMPT).await;
     assert_eq!(username(&login), Some("tlsuser"));
     assert_eq!(tls_tag(&login), Some(&serde_json::Value::Bool(true)));
-    // TLS is known before the session starts, so the connection event is tagged too.
+    // TLS is known before the session starts, so the connection event is tagged too, and it is
+    // emitted once.
+    let connections = srv.settled(sensor_wire::SIGNAL_HONEYPOT_CONNECTION).await;
+    assert_eq!(connections.len(), 1);
     assert_eq!(
-        tls_tag(&srv.connection_event().await),
+        tls_tag(&connections[0]),
         Some(&serde_json::Value::Bool(true))
     );
     srv.handle.abort();
+}
+
+/// A TLS client that never completes the handshake is still recorded: one connection event,
+/// tagged `tls`, and no login. Covers a client that sends its ClientHello and closes, and one
+/// that rejects the server certificate.
+#[tokio::test]
+async fn mongodb_failed_tls_handshake_is_still_recorded() {
+    let pki = pki();
+
+    let srv = TestServer::start("mongodb", Some(pki.tls.clone())).await;
+    let mut hello = Vec::new();
+    let mut client = ClientConnection::new(pki.client.clone(), server_name()).unwrap();
+    while client.wants_write() {
+        client.write_tls(&mut hello).unwrap();
+    }
+    let mut tcp = TcpStream::connect(srv.addr).await.unwrap();
+    send(&mut tcp, &hello).await;
+    tcp.shutdown().await.unwrap();
+    drop(tcp);
+    assert_recorded_without_login(&srv).await;
+    srv.handle.abort();
+
+    let srv = TestServer::start("mongodb", Some(pki.tls.clone())).await;
+    let stranger = ClientConfig::builder()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    let tcp = TcpStream::connect(srv.addr).await.unwrap();
+    let handshake = tokio::time::timeout(
+        WAIT,
+        TlsConnector::from(Arc::new(stranger)).connect(server_name(), tcp),
+    )
+    .await
+    .expect("handshake did not finish");
+    assert!(handshake.is_err(), "an untrusted certificate is rejected");
+    assert_recorded_without_login(&srv).await;
+    srv.handle.abort();
+}
+
+async fn assert_recorded_without_login(srv: &TestServer) {
+    let connections = srv.settled(sensor_wire::SIGNAL_HONEYPOT_CONNECTION).await;
+    assert_eq!(connections.len(), 1, "one connection event");
+    assert_eq!(
+        tls_tag(&connections[0]),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert!(srv.settled(SIGNAL_HONEYPOT_LOGIN_ATTEMPT).await.is_empty());
 }
 
 #[tokio::test]
@@ -706,7 +797,9 @@ async fn mongodb_plaintext_client_still_works_when_tls_configured() {
     let login = srv.wait_event(SIGNAL_HONEYPOT_LOGIN_ATTEMPT).await;
     assert_eq!(username(&login), Some("plainuser"));
     assert_eq!(tls_tag(&login), None);
-    assert_eq!(tls_tag(&srv.connection_event().await), None);
+    let connections = srv.settled(sensor_wire::SIGNAL_HONEYPOT_CONNECTION).await;
+    assert_eq!(connections.len(), 1);
+    assert_eq!(tls_tag(&connections[0]), None);
     srv.handle.abort();
 }
 
@@ -862,19 +955,79 @@ fn cred_refuses_to_start_when_a_tls_var_is_not_utf8() {
     }
 }
 
+/// A fresh cert and key written under `dir` (key mode 0600): (cert path, key path).
+fn write_pair(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let (cert_path, key_path) = (dir.join("cred.crt"), dir.join("cred.key"));
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    (cert_path, key_path)
+}
+
+/// The sensor's log output from start until its first `listening` line (or 5s), then killed.
+fn startup_log(mut cmd: std::process::Command) -> String {
+    use std::io::BufRead;
+
+    cmd.stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut log = String::new();
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let done = line.contains("listening");
+            log.push_str(&line);
+            log.push('\n');
+            if done {
+                break;
+            }
+        }
+        log
+    });
+    let deadline = Instant::now() + WAIT;
+    while !reader.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    reader.join().unwrap()
+}
+
+/// The TLS success line names only the TLS-capable protocols that are bound, and says so when
+/// none is.
+#[test]
+fn cred_tls_log_names_only_bound_tls_protocols() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = write_pair(dir.path());
+
+    let mut cmd = sensor(dir.path(), "127.0.0.1:0");
+    cmd.env(CERT_VAR, &cert_path).env(KEY_VAR, &key_path);
+    let log = startup_log(cmd);
+    assert!(log.contains("TLS enabled for postgresql"), "{log}");
+    for unbound in ["mysql", "mssql", "mongodb"] {
+        assert!(!log.contains(unbound), "{unbound} is not bound: {log}");
+    }
+
+    let mut cmd = sensor(dir.path(), "127.0.0.1:0");
+    cmd.env_remove("PROPOLIS_CRED_PG_BIND")
+        .env("PROPOLIS_CRED_VNC_BIND", "127.0.0.1:0")
+        .env(CERT_VAR, &cert_path)
+        .env(KEY_VAR, &key_path);
+    let log = startup_log(cmd);
+    assert!(log.contains("no TLS-capable protocol is bound"), "{log}");
+    assert!(!log.contains("TLS enabled for"), "{log}");
+}
+
 /// The pass branch through the binary: a valid pair loads, the plaintext port binds, and main
 /// hands the config to the listener (an SSLRequest is answered `S`).
 #[test]
 fn cred_starts_with_a_valid_pair_and_answers_s() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempfile::tempdir().unwrap();
-    let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let (cert_path, key_path) = (dir.path().join("cred.crt"), dir.path().join("cred.key"));
-    std::fs::write(&cert_path, cert.pem()).unwrap();
-    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
-    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (cert_path, key_path) = write_pair(dir.path());
 
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()

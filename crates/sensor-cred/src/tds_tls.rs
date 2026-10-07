@@ -53,6 +53,31 @@ impl<S> TdsTlsAdapter<S> {
         }
     }
 
+    /// An adapter whose transport's first byte was already consumed by the caller (to tell a
+    /// plaintext Login7 from a framed handshake). The byte goes through the same framed-or-raw
+    /// decision a first read would make.
+    pub(crate) fn starting_with(inner: S, first: u8) -> Self {
+        let mut adapter = Self::new(inner);
+        adapter.hdr[0] = first;
+        adapter.hdr_len = 1;
+        adapter.classify_header();
+        adapter
+    }
+
+    /// After header bytes land in `hdr`: a first byte other than PRELOGIN switches reads to raw
+    /// for good, replaying the consumed bytes. Returns whether it switched.
+    fn classify_header(&mut self) -> bool {
+        if self.hdr[0] == TDS_PRELOGIN {
+            return false;
+        }
+        self.pushback[..self.hdr_len].copy_from_slice(&self.hdr[..self.hdr_len]);
+        self.pushback_len = self.hdr_len;
+        self.pushback_pos = 0;
+        self.raw_read = true;
+        self.hdr_len = 0;
+        true
+    }
+
     /// Stop framing writes. Call only after the TLS stream has been flushed, so any queued
     /// handshake tail (the TLS 1.2 server CCS + Finished) has already left framed.
     pub(crate) fn finish_handshake(&mut self) {
@@ -121,12 +146,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for TdsTlsAdapter<S> {
                 };
             }
             this.hdr_len += got;
-            if this.hdr[0] != TDS_PRELOGIN {
-                this.pushback[..this.hdr_len].copy_from_slice(&this.hdr[..this.hdr_len]);
-                this.pushback_len = this.hdr_len;
-                this.pushback_pos = 0;
-                this.raw_read = true;
-                this.hdr_len = 0;
+            if this.classify_header() {
                 continue;
             }
             if this.hdr_len < HEADER_LEN {
@@ -308,6 +328,25 @@ mod tests {
         let mut more = [0u8; 3];
         adapter.read_exact(&mut more).await.unwrap();
         assert_eq!(more, [0x12, 0x01, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn starting_with_a_consumed_byte_decides_as_a_first_read_would() {
+        // 0x12 consumed: the rest of the packet still de-frames.
+        let (a, mut peer) = duplex(64 * 1024);
+        let mut adapter = TdsTlsAdapter::starting_with(a, 0x12);
+        peer.write_all(&packet(&[5, 6, 7])[1..]).await.unwrap();
+        let mut got = [0u8; 3];
+        adapter.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, [5, 6, 7]);
+
+        // Any other byte consumed: raw from the start, with that byte replayed.
+        let (a, mut peer) = duplex(64 * 1024);
+        let mut adapter = TdsTlsAdapter::starting_with(a, 0x16);
+        peer.write_all(&[0x03, 0x01]).await.unwrap();
+        let mut got = [0u8; 3];
+        adapter.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, [0x16, 0x03, 0x01]);
     }
 
     #[tokio::test]

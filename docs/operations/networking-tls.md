@@ -283,7 +283,10 @@ the listeners already started are stopped and the sensor exits 1, logging
 same text ending `; skipping protocol <name>` and exits 1 only when every configured protocol
 failed to bind, because its TLS adds no listener whose loss could hide behind the others.
 
-On success sensor-cred logs `TLS enabled for postgresql, mysql, mssql and mongodb`. Sensors log
+On success sensor-cred logs `TLS enabled for <protocols>`, naming only the TLS-capable
+protocols (postgresql, mysql, mssql, mongodb) that have a bind configured; when none has (vnc
+only, for example) it logs the warning `TLS is configured but no TLS-capable protocol is bound`
+instead (`crates/sensor-cred/src/main.rs#TLS_CAPABLE`). Sensors log
 at `info` unless `RUST_LOG` says otherwise, so the warnings and info lines are visible by default
 (see [troubleshooting](../troubleshooting/sensors-and-networking.md#sensor-tls)).
 
@@ -379,10 +382,15 @@ Per-protocol rules (replies and tables in
   session, and an `ENCRYPT_NOT_SUP` or silent client gets `ENCRYPT_NOT_SUP` and plaintext. A real
   server with encryption on would answer `ENCRYPT_OFF` with `ENCRYPT_REQ` and force TLS; the
   sensor deliberately does not, so the credentials of scanners that cannot do TLS are still
-  captured.
+  captured. For the same reason a client that asked for encryption but then sends a plaintext
+  Login7 (first byte 0x10) instead of a handshake is served in plaintext and its username
+  captured, untagged. Only the low two bits of the client's ENCRYPTION value are read
+  (`v & 0x03`); all other bits, the client-certificate bit included, are ignored.
 - **MongoDB (two-byte sniff):** the first two bytes on the port are peeked, bounded by the read
   timeout; `0x16 0x03` (a TLS record header) with the pair set selects TLS, anything else the
-  plaintext path. After a sniff that times out the plaintext path waits up to another read
+  plaintext path. The connection event is written once the sniff decides, before the handshake,
+  tagged `"tls": true` when TLS was chosen, so a failed or abandoned handshake is still recorded.
+  After a sniff that times out the plaintext path waits up to another read
   timeout, so a silent connection can hold a slot for up to twice the read timeout, capped by the
   maximum session duration.
 

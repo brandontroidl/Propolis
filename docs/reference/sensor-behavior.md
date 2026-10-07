@@ -966,14 +966,21 @@ per-protocol bind var is required.
   port; vnc is unchanged. One certificate serves all four (`crates/sensor-cred/src/lib.rs#CredTls`).
   No client certificate is requested. Every handshake is bounded by the read timeout, and one that
   fails or stalls ends the session with no further event and no plaintext fallback (mssql and
-  mongodb also log it at debug level).
-  Plaintext clients keep working on every port.
+  mongodb also log it at debug level). The `honeypot_connection` event is always written before
+  the handshake, so a failed or abandoned handshake is still recorded.
+  Plaintext clients keep working on every port. At startup the sensor logs which of the
+  configured protocols TLS applies to, or a warning when none of the bound protocols can use it
+  (vnc only, for example) (`crates/sensor-cred/src/main.rs#TLS_CAPABLE`).
   - **postgresql:** an SSLRequest is answered `S` and the handshake runs on the same socket; the
     StartupMessage and everything after it then travel over TLS. The reads before the upgrade are
     exact-length reads with no user-space buffer, so plaintext the client sent after the
     SSLRequest is never replayed into the TLS session: it reaches the handshake as garbage and the
-    connection is dropped (the CVE-2021-23222 shape). A second SSLRequest inside TLS closes the
-    connection. Without the pair the answer is the unchanged `N`. A GSSENCRequest is not answered
+    connection is dropped. This guards against an on-path party injecting plaintext behind the
+    SSLRequest that a server would otherwise read as if it had arrived inside TLS. A plaintext
+    StartupMessage and PasswordMessage sent after `S` get at most a TLS alert, never a PostgreSQL
+    reply, and no login event
+    (`crates/sensor-cred/tests/tls_integration.rs#pg_plaintext_after_s_is_dropped`). A second
+    SSLRequest inside TLS closes the connection. Without the pair the answer is the unchanged `N`. A GSSENCRequest is not answered
     `N` the way a real server without GSSAPI answers it; that is a known gap.
   - **mysql:** the greeting advertises `CLIENT_SSL` (0x0800) only when the pair is set. A 32-byte
     SSLRequest packet carrying that flag switches the session to TLS before the
@@ -993,19 +1000,30 @@ per-protocol bind var is required.
     | `ENCRYPT_OFF` (0x00) | the pre-TLS PRELOGIN response, byte for byte (VERSION only, no ENCRYPTION option) | plaintext |
     | `ENCRYPT_NOT_SUP` (0x02), or no ENCRYPTION option | `ENCRYPT_NOT_SUP` | plaintext |
 
-    The client-certificate bit (0x80) is masked off first. This is deliberately not the MS-TDS
+    Only the low two bits of the client's value are read (`v & 0x03`); every other bit, the
+    client-certificate bit 0x80 included, is ignored. This is deliberately not the MS-TDS
     server table: a real server with encryption on answers an `ENCRYPT_OFF` client with
     `ENCRYPT_REQ` and forces TLS, which would lose the Login7, and so the username, of every
     scanner that cannot do TLS. The honeypot chooses capture over fidelity, so a client offering
     `ENCRYPT_OFF` sees exactly what it saw before TLS existed. Login-only encryption (a reply of
     `ENCRYPT_OFF`) is never offered, since it would need a TLS-to-plaintext switch after Login7.
+    The same capture-first rule covers a client that asked for encryption, was answered
+    `ENCRYPT_ON`, and then sends a plaintext Login7 (packet type 0x10) where the first TLS
+    handshake packet belongs: the first byte after PRELOGIN is read before the TDS-TLS adapter is
+    built, and a 0x10 takes the plaintext Login7 path, so the username is captured in an untagged
+    login event. Any other first byte goes to the adapter, which makes the same framed-or-raw
+    decision it makes for a first read (`crates/sensor-cred/src/tds_tls.rs#TdsTlsAdapter`).
     Without the pair, the PRELOGIN response carries no ENCRYPTION option, as before
     (`crates/sensor-cred/src/mssql.rs#prelogin_response_without_tls_is_byte_identical_to_before`).
   - **mongodb:** on its plaintext port the sensor peeks (never consumes) the first two bytes,
     bounded by the read timeout. When they are `0x16 0x03` (a TLS handshake record and the record
     version's major byte) and the pair is set, the connection is served over TLS, the way a mongod
     in `allowTLS` mode takes both on one port. Anything else, fewer than two bytes before the
-    timeout or end of stream, or no pair, takes the plaintext path. A MongoDB message starts with
+    timeout or end of stream, or no pair, takes the plaintext path. The connection event is
+    written as soon as the sniff decides and before any handshake, tagged `"tls": true` when TLS
+    was chosen, so a client that sends a ClientHello and then aborts, rejects the certificate, or
+    stalls is recorded exactly once, as it would be on a node without TLS
+    (`crates/sensor-cred/src/mongodb.rs#handle_sniffed`). A MongoDB message starts with
     its little-endian length, so a one-byte check would misroute every plaintext first message
     whose length is 22, 278, 534 and so on; with two bytes only a 790-byte first message still
     matches, and longer matching lengths exceed the 64 KiB message cap
@@ -1017,9 +1035,10 @@ per-protocol bind var is required.
   - **Event tagging:** events from a TLS session carry `"tls": true`; the key is absent, not
     false, on plaintext sessions (`crates/sensor-cred/src/lib.rs#with_tls`). For postgresql, mysql
     and mssql the `honeypot_connection` event is written before negotiation and stays untagged,
-    while the login and postgresql query events of a TLS session are tagged. For mongodb TLS is
-    known before the session starts, so every event of a TLS session is tagged, the connection
-    event included.
+    while the login and postgresql query events of a TLS session are tagged. For mongodb the sniff
+    decides TLS before the connection event is written, so every event of a TLS session is tagged,
+    the connection event included, even when the handshake then fails. An mssql Login7 captured
+    by the plaintext fallback above is untagged.
   - **Fail-closed:** when either variable is set (a blank value counts as unset) the pair must
     load, or the sensor exits 1 before binding any protocol; exactly one set, a non-UTF-8 value,
     an unusable pair and a key that is not mode `0600` all count. Variables are in

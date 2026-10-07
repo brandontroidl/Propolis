@@ -52,6 +52,10 @@ async fn starts_with_tls_record(stream: &TcpStream, limit: std::time::Duration) 
 /// The plaintext mongodb port. With `sniff` set, a connection whose first two bytes are a TLS
 /// record header is served over TLS on this same port, the way a mongod in `allowTLS` mode takes
 /// both; anything else, and every connection when `sniff` is `None`, takes the plaintext path.
+///
+/// The connection event is emitted once the sniff has decided, BEFORE any TLS handshake, so a
+/// client whose handshake fails or times out is still recorded (tagged `tls`), exactly as the same
+/// client would be on a sensor without TLS configured.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_sniffed(
     stream: TcpStream,
@@ -63,33 +67,31 @@ pub async fn handle_sniffed(
     bounds: ConnectionBounds,
     sniff: Option<TlsServer>,
 ) {
-    let Some(tls) = sniff else {
-        return handle_connection(
-            stream,
-            peer_addr,
-            local_addr,
-            session_id,
-            emitter,
-            wan_resolver,
-            bounds,
-            false,
-        )
-        .await;
+    let source_ip: IpAddr = normalize_dual_stack(peer_addr).ip();
+    let wan_ip = local_addr
+        .map(normalize_dual_stack)
+        .and_then(|local| wan_resolver.resolve(local.ip()));
+    let timeout = bounds.read_timeout;
+
+    let tls = match sniff {
+        Some(tls) if starts_with_tls_record(&stream, timeout).await => tls,
+        _ => {
+            let _ = emitter
+                .append(&connection_event(source_ip, wan_ip, session_id))
+                .await;
+            return handle_connection(
+                stream, source_ip, wan_ip, session_id, emitter, timeout, false,
+            )
+            .await;
+        }
     };
-    if !starts_with_tls_record(&stream, bounds.read_timeout).await {
-        return handle_connection(
-            stream,
-            peer_addr,
-            local_addr,
-            session_id,
-            emitter,
-            wan_resolver,
-            bounds,
-            false,
-        )
+    let _ = emitter
+        .append(&with_tls(
+            connection_event(source_ip, wan_ip, session_id),
+            true,
+        ))
         .await;
-    }
-    let secure = match tokio::time::timeout(bounds.read_timeout, tls.accept(stream)).await {
+    let secure = match tokio::time::timeout(timeout, tls.accept(stream)).await {
         Ok(Ok(secure)) => secure,
         Ok(Err(error)) => {
             tracing::debug!(peer = %peer_addr, %error, "mongodb tls handshake failed; dropping connection");
@@ -101,46 +103,24 @@ pub async fn handle_sniffed(
         }
     };
     handle_connection(
-        secure,
-        peer_addr,
-        local_addr,
-        session_id,
-        emitter,
-        wan_resolver,
-        bounds,
-        true,
+        secure, source_ip, wan_ip, session_id, emitter, timeout, true,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_connection<S>(
+/// One mongodb session after its connection event: answers isMaster/hello and records the
+/// username from the first saslStart/authenticate.
+async fn handle_connection<S>(
     mut stream: S,
-    peer_addr: SocketAddr,
-    local_addr: Option<SocketAddr>,
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
-    wan_resolver: Arc<WanResolver>,
-    bounds: ConnectionBounds,
+    timeout: std::time::Duration,
     tls: bool,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let norm_peer = normalize_dual_stack(peer_addr);
-    let source_ip: IpAddr = norm_peer.ip();
-    let wan_ip = local_addr
-        .map(normalize_dual_stack)
-        .and_then(|local| wan_resolver.resolve(local.ip()));
-
-    let _ = emitter
-        .append(&with_tls(
-            connection_event(source_ip, wan_ip, session_id),
-            tls,
-        ))
-        .await;
-
-    let timeout = bounds.read_timeout;
-
     // Read messages until we see an authenticate command or the connection drops
     loop {
         let Some(msg) = read_mongo_msg(&mut stream, timeout).await else {

@@ -745,7 +745,9 @@ Sensor-specific extras:
   exits 1 with `refusing to start` before binding any protocol. That covers exactly one of the
   two set, a non-UTF-8 value (invalid, not unset), a file that is unreadable, not PEM or a
   mismatched pair, and a key that is group- or world-readable. On success it logs
-  `TLS enabled for postgresql, mysql, mssql and mongodb`. With neither variable set (or both
+  `TLS enabled for <protocols>`, naming the TLS-capable protocols (postgresql, mysql, mssql,
+  mongodb) whose bind is set, or warns `TLS is configured but no TLS-capable protocol is bound`
+  when none is. With neither variable set (or both
   blank) the sensor is unchanged. Because no `*_BIND` variable is added, `deploy/fleet-listeners.sh` derives no extra
   listener from the pair.
 - **catchall**: no spool variable (never spools file bodies,

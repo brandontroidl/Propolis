@@ -10,6 +10,8 @@ use sensor_framework::{ConnectionBounds, WanResolver, shutdown_signal};
 const DEFAULT_LOG_DIR: &str = "/var/log/propolis/cred";
 const TLS_CERT_VAR: &str = "PROPOLIS_CRED_TLS_CERT";
 const TLS_KEY_VAR: &str = "PROPOLIS_CRED_TLS_KEY";
+/// The protocols `start_listener` hands the TLS config to; vnc ignores it.
+const TLS_CAPABLE: [&str; 4] = ["postgresql", "mysql", "mssql", "mongodb"];
 
 struct PortConfig {
     protocol: &'static str,
@@ -106,9 +108,19 @@ async fn main() {
         (Some(cert), Some(key)) => {
             match sensor_cred::CredTls::from_files(Path::new(&cert), Path::new(&key)) {
                 Ok(tls) => {
-                    tracing::info!(
-                        "sensor-cred: TLS enabled for postgresql, mysql, mssql and mongodb"
-                    );
+                    let capable: Vec<&str> = ports
+                        .iter()
+                        .map(|pc| pc.protocol)
+                        .filter(|protocol| TLS_CAPABLE.contains(protocol))
+                        .collect();
+                    if capable.is_empty() {
+                        tracing::warn!(
+                            "sensor-cred: TLS is configured but no TLS-capable protocol is bound ({})",
+                            TLS_CAPABLE.join(", ")
+                        );
+                    } else {
+                        tracing::info!("sensor-cred: TLS enabled for {}", capable.join(", "));
+                    }
                     Some(tls)
                 }
                 Err(e) => {

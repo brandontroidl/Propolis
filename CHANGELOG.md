@@ -15,12 +15,15 @@
   1.3 session tickets off for MSSQL only: a client offering `ENCRYPT_ON` or `ENCRYPT_REQ` is
   answered `ENCRYPT_ON` and gets TLS, a client offering `ENCRYPT_OFF` gets the pre-TLS PRELOGIN
   response byte for byte and a plaintext session (a real server would answer `ENCRYPT_REQ`; the
-  honeypot keeps the credentials of scanners that cannot do TLS), and `ENCRYPT_NOT_SUP` or no
-  option gets `ENCRYPT_NOT_SUP` and plaintext. MongoDB peeks the first two bytes and serves
-  `0x16 0x03` (a TLS record header) over TLS on the plaintext port, so a plaintext first message
-  whose length's low byte is `0x16` is no longer mistaken for TLS. Plaintext clients keep working
-  on every port. Events from a TLS session carry `"tls": true` (for PostgreSQL, MySQL and MSSQL the
-  pre-negotiation connection event stays untagged). Fail-closed: when either variable is set (a
+  honeypot keeps the credentials of scanners that cannot do TLS; for the same reason a client
+  that asked for encryption but then sends a plaintext Login7 is captured in plaintext), and
+  `ENCRYPT_NOT_SUP` or no option gets `ENCRYPT_NOT_SUP` and plaintext. MongoDB peeks the first two
+  bytes and serves `0x16 0x03` (a TLS record header) over TLS on the plaintext port, so a
+  plaintext first message whose length's low byte is `0x16` is no longer mistaken for TLS; its
+  connection event is written before the handshake, so a failed handshake is still recorded.
+  Plaintext clients keep working on every port. Events from a TLS session carry `"tls": true`
+  (for PostgreSQL, MySQL and MSSQL the pre-negotiation connection event stays untagged). The
+  startup line names only the TLS-capable protocols that are bound. Fail-closed: when either variable is set (a
   blank value counts as unset), exactly one set, a non-UTF-8 value, or an unusable pair makes the
   sensor exit 1 before binding anything. A bind failure on one protocol is still logged and skipped. The unit gains
   `ReadOnlyPaths=-/etc/propolis/tls`. The MSSQL TDS-TLS adapter is validated against a rustls

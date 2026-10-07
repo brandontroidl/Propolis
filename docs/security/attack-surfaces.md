@@ -102,12 +102,16 @@ at the read timeout, no client certificate is requested, the certificate is the 
 self-signed one named `localhost`, and a failed handshake ends the session with no plaintext
 fallback. PostgreSQL and MySQL read the pre-upgrade request with exact-length reads and no
 user-space buffer, so plaintext sent behind the request reaches the handshake as garbage and is
-never read as protocol (the CVE-2021-23222 shape). The MSSQL handshake runs inside TDS packets
+never read as protocol, so an on-path party cannot inject plaintext that a server would read as
+if it had arrived inside TLS. The MSSQL handshake runs inside TDS packets
 through a sensor-specific framing adapter (`crates/sensor-cred/src/tds_tls.rs`), which is parser
 code reachable by any client that offers encryption; it buffers at most one 8-byte TDS header in
 fixed-size storage, passes payload bytes straight to rustls, and frames each handshake write as one
 TDS packet of at most 4096 bytes. Plaintext clients are still served on every port, including
-an MSSQL client that offers `ENCRYPT_OFF`. Passwords, DES and MD5 responses are never captured over
+an MSSQL client that offers `ENCRYPT_OFF` and one that asks for encryption but then sends a
+plaintext Login7 instead of a handshake (one byte is read to tell the two apart; a handshake that
+has begun never falls back). A MongoDB client whose handshake fails is still recorded by its
+connection event. Passwords, DES and MD5 responses are never captured over
 TLS, as in plaintext. A half-configured or unusable pair makes the sensor refuse to start rather
 than serve plaintext. See
 [../operations/networking-tls.md](../operations/networking-tls.md#sensor-cred-in-band-tls).

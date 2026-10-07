@@ -33,7 +33,8 @@ const PL_TERMINATOR: u8 = 0xFF;
 const SERVER_VERSION: [u8; 6] = [15, 0, 16, 57, 0, 0];
 
 /// `starttls` set: PRELOGIN is answered per `negotiate_encryption` and, when that negotiates TLS,
-/// the handshake runs inside TDS PRELOGIN packets and Login7 arrives over TLS. `None`: the
+/// the handshake runs inside TDS PRELOGIN packets and Login7 arrives over TLS, unless the client
+/// sends a plaintext Login7 instead, which is captured untagged. `None`: the
 /// PRELOGIN response carries no ENCRYPTION option, as before.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_connection<S>(
@@ -61,7 +62,7 @@ pub async fn handle_connection<S>(
     let timeout = bounds.read_timeout;
 
     // 1. Read client PreLogin
-    let Some((pkt_type, prelogin)) = read_tds_packet(&mut stream, timeout).await else {
+    let Some((pkt_type, prelogin)) = read_tds_packet(&mut stream, None, timeout).await else {
         return;
     };
     if pkt_type != TDS_PRELOGIN {
@@ -79,7 +80,29 @@ pub async fn handle_connection<S>(
 
     match (starttls, negotiated) {
         (Some(tls), Some(Negotiated { tls: true, .. })) => {
-            let framed = TdsTlsAdapter::new(stream);
+            // Read (not peek: `S` is any stream) the first byte after PRELOGIN to choose the path.
+            let mut first = [0u8; 1];
+            match tokio::time::timeout(timeout, stream.read_exact(&mut first)).await {
+                Ok(Ok(_)) => {}
+                _ => return,
+            }
+            // Capture first: a client that asked for encryption but then sends a plaintext
+            // Login7 still has its credential recorded, as an ENCRYPT_OFF client would.
+            if first[0] == TDS_LOGIN7 {
+                tracing::debug!(peer = %peer_addr, "mssql client asked for encryption but sent a plaintext login7");
+                return finish_login(
+                    &mut stream,
+                    Some(first[0]),
+                    source_ip,
+                    wan_ip,
+                    session_id,
+                    &emitter,
+                    timeout,
+                    false,
+                )
+                .await;
+            }
+            let framed = TdsTlsAdapter::starting_with(stream, first[0]);
             let mut secure = match tokio::time::timeout(timeout, tls.accept(framed)).await {
                 Ok(Ok(secure)) => secure,
                 Ok(Err(error)) => {
@@ -100,6 +123,7 @@ pub async fn handle_connection<S>(
             secure.get_mut().0.finish_handshake();
             finish_login(
                 &mut secure,
+                None,
                 source_ip,
                 wan_ip,
                 session_id,
@@ -112,6 +136,7 @@ pub async fn handle_connection<S>(
         _ => {
             finish_login(
                 &mut stream,
+                None,
                 source_ip,
                 wan_ip,
                 session_id,
@@ -124,9 +149,12 @@ pub async fn handle_connection<S>(
     }
 }
 
-/// Read Login7, record the username, answer LOGINACK.
+/// Read Login7, record the username, answer LOGINACK. `first` is the packet's first byte when
+/// the caller has already consumed it.
+#[allow(clippy::too_many_arguments)]
 async fn finish_login<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
+    first: Option<u8>,
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
     session_id: Uuid,
@@ -134,7 +162,7 @@ async fn finish_login<S: AsyncRead + AsyncWrite + Unpin>(
     timeout: std::time::Duration,
     tls: bool,
 ) {
-    let Some((pkt_type, login7)) = read_tds_packet(stream, timeout).await else {
+    let Some((pkt_type, login7)) = read_tds_packet(stream, first, timeout).await else {
         return;
     };
     if pkt_type != TDS_LOGIN7 {
@@ -307,12 +335,21 @@ fn wrap_tds_packet(pkt_type: u8, payload: &[u8]) -> Vec<u8> {
     packet
 }
 
+/// One TDS packet. `first`: the header's first byte, already consumed by the caller.
 async fn read_tds_packet<S: AsyncRead + Unpin>(
     stream: &mut S,
+    first: Option<u8>,
     timeout: std::time::Duration,
 ) -> Option<(u8, Vec<u8>)> {
     let mut header = [0u8; 8];
-    tokio::time::timeout(timeout, stream.read_exact(&mut header))
+    let start = match first {
+        Some(byte) => {
+            header[0] = byte;
+            1
+        }
+        None => 0,
+    };
+    tokio::time::timeout(timeout, stream.read_exact(&mut header[start..]))
         .await
         .ok()?
         .ok()?;

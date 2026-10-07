@@ -84,7 +84,9 @@ pub async fn handle_connection(
                 }
                 // Every read above is an exact-length read on the raw socket with no user-space
                 // buffer, so no plaintext sent after the SSLRequest can be replayed into the TLS
-                // session (the CVE-2021-23222 shape). After `S` there is no plaintext fallback.
+                // session: a server that reads bytes buffered behind the SSLRequest as if they
+                // had arrived inside TLS lets an on-path party inject commands ahead of the
+                // handshake. After `S` there is no plaintext fallback.
                 stream = match stream.upgrade(tls, timeout).await {
                     Ok(upgraded) => upgraded,
                     Err(_) => return,

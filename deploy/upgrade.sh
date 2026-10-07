@@ -24,9 +24,30 @@ BUILD_DIR="$REPO_DIR/target/release"
 
 cd "$REPO_DIR"
 
+# bash reads this file incrementally and the pull below can replace it on disk, so everything
+# after the pull would otherwise run from the copy loaded BEFORE it: a release that changes this
+# script (a new binary in the list below, a new step) would half-apply, building the new tree but
+# installing from the old list. If the pull changed this file, run the new one instead. The guard
+# variable makes that second run skip the pull (so it cannot loop, and cannot move the tree again
+# mid-upgrade) and carries the pull timestamp across, so the deploy stamp still records when the
+# pull happened rather than when the re-exec did. deploy_test.rs runs this block against stubs.
+# BEGIN pull-and-reexec
 echo "==> pulling latest"
-PULLED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-sudo -u "$(stat -c '%U' "$REPO_DIR")" git pull
+if [ -n "${PROPOLIS_UPGRADE_REEXEC:-}" ]; then
+    PULLED_AT="${PROPOLIS_UPGRADE_PULLED_AT:?PROPOLIS_UPGRADE_REEXEC is set without PROPOLIS_UPGRADE_PULLED_AT}"
+    echo "    already pulled by the run that re-executed this script"
+else
+    PULLED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    SCRIPT_SUM_BEFORE="$(sha256sum < "$SCRIPT_DIR/upgrade.sh")"
+    sudo -u "$(stat -c '%U' "$REPO_DIR")" git pull
+    SCRIPT_SUM_AFTER="$(sha256sum < "$SCRIPT_DIR/upgrade.sh")"
+    if [ "$SCRIPT_SUM_BEFORE" != "$SCRIPT_SUM_AFTER" ]; then
+        echo "==> deploy/upgrade.sh changed in the pull, re-executing the new version"
+        export PROPOLIS_UPGRADE_REEXEC=1 PROPOLIS_UPGRADE_PULLED_AT="$PULLED_AT"
+        exec "$SCRIPT_DIR/upgrade.sh" "$@"
+    fi
+fi
+# END pull-and-reexec
 
 echo "==> building release"
 sudo -u "$(stat -c '%U' "$REPO_DIR")" cargo build --release --workspace --locked
@@ -37,8 +58,21 @@ echo "==> installing binaries"
 # one host, so this list covers both topologies at once - a box running only the collector role
 # (or only the control-plane role) simply has no unit file for the other side's binaries and the
 # is-enabled guard below skips restarting what was never enabled.
-for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred gateway shipper propolis-watch; do
+INSTALL_BINS=(propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred gateway shipper propolis-watch)
+for bin in "${INSTALL_BINS[@]}"; do
+    if [ ! -x "$BUILD_DIR/$bin" ]; then
+        echo "error: $BUILD_DIR/$bin was not built; the install list names a binary the workspace does not produce" >&2
+        exit 1
+    fi
     install -m 0755 "$BUILD_DIR/$bin" "/usr/local/bin/$bin"
+done
+# Re-read the destination rather than trust the loop: a binary missing from /usr/local/bin is a
+# service that fails to start after the restarts below, which is too late to be the first notice.
+for bin in "${INSTALL_BINS[@]}"; do
+    if [ ! -x "/usr/local/bin/$bin" ]; then
+        echo "error: /usr/local/bin/$bin is missing or not executable after the install" >&2
+        exit 1
+    fi
 done
 
 echo "==> ensuring dirs and users (provision.sh, idempotent)"

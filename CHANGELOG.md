@@ -368,6 +368,25 @@
 
 ### Fixed
 
+- **`upgrade.sh` no longer finishes an upgrade with the copy of itself it started from** - bash
+  reads a script as it runs, so after `git pull` replaced `deploy/upgrade.sh` the rest of the
+  upgrade ran the old text: a release that added `propolis-watch` to the binary list built it
+  and then installed from the list without it, leaving `/usr/local/bin/propolis-watch` missing.
+  When the pull changes the script, `upgrade.sh` now re-executes the new one with
+  `PROPOLIS_UPGRADE_REEXEC=1`, which makes that run skip the pull (it cannot loop) and carries
+  the first run's pull timestamp in `PROPOLIS_UPGRADE_PULLED_AT`, so the deploy stamp still
+  records when the pull happened. The binary install now checks each built binary exists
+  before installing it and, afterwards, that every listed binary is present in
+  `/usr/local/bin` before anything is stamped or restarted (`install.sh` does the same check
+  after its install). Both scripts keep the list in one `INSTALL_BINS` array, and a new test
+  compares it with the workspace's binary targets, so a binary added to the workspace but not
+  to the lists fails the build.
+- **The live-watch documentation no longer sends the reader to the honeypot's SSH sensor** -
+  its examples connected to port 22, which on a honeypot host is usually `sensor-ssh`; one
+  attempt landed in the fake shell. Every example now names the real sshd with
+  `-p <admin-port>`, `docs/operations/live-watch.md` warns against the sensor's listener and
+  shows `sudo ss -ltnp | grep sshd` to find the real port, and notes that a passphrase-protected
+  key needs `ssh-add` for unattended use.
 - **A command's standard input reaches it, and is captured** - an SSH exec ran at the request
   and closed the channel, so the payload a bot streamed after `cat > astats` or `cat > w.sh`
   hit a closed channel: the file stayed empty, nothing was captured, and the bot retried and

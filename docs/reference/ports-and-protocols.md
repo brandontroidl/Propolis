@@ -58,7 +58,7 @@ default. Every one is TCP except `sensor-tftp` (UDP only) and the UDP half of
 | sensor-smtp | `PROPOLIS_SMTP_BIND` (single) | SMTP | 25 | Missing => error + exit (`crates/sensor-smtp/src/main.rs#main`) |
 | sensor-tftp | `PROPOLIS_TFTP_BIND` (single, UDP) | TFTP | 69/udp | Off until set: missing or invalid => error + exit 1, nothing bound (`crates/sensor-tftp/src/main.rs#load_config_from`). The one sensor that replies over UDP, bounded so bytes sent never exceed bytes received. Each transfer answers from its own ephemeral UDP port on the bind IP, so a host firewall must allow replies from, and a client may send to, ports other than 69. Unit grants `CAP_NET_BIND_SERVICE`. |
 | sensor-mqtt | `PROPOLIS_MQTT_BIND` (single) | MQTT | 1883 | Off until set: missing or invalid => error + exit 1, nothing bound (`crates/sensor-mqtt/src/main.rs#load_config_from_env`). Metadata-only: it never delivers, retains or forwards a PUBLISH, and spools no body. Port 1883 is unprivileged, so the unit grants no `CAP_NET_BIND_SERVICE` (it carries an empty `CapabilityBoundingSet`). It speaks MQTT 3.1, 3.1.1 and 5.0. |
-| sensor-redis | `PROPOLIS_REDIS_BIND` (single) | Redis | 6379 | `crates/sensor-redis/src/main.rs#load_config_from_env` |
+| sensor-redis | `PROPOLIS_REDIS_BIND` (single); `PROPOLIS_REDIS_TLS_BIND` (single, optional) | Redis; Redis over implicit TLS (`rediss://`) | 6379; 6380 | `crates/sensor-redis/src/main.rs#load_config_from_env`. The TLS listener runs in the same process and writes the same event log, and exists only when `PROPOLIS_REDIS_TLS_BIND` is set, with `PROPOLIS_REDIS_TLS_CERT` and `PROPOLIS_REDIS_TLS_KEY` (`crates/sensor-redis/src/main.rs#parse_tls`). Both ports are unprivileged: the unit grants no capability, and `ReadOnlyPaths=/etc/propolis/tls` for the pair. |
 | sensor-adb | `PROPOLIS_ADB_BIND` (single) | ADB | 5555 | `crates/sensor-adb/src/main.rs#load_config_from_env` |
 | sensor-catchall | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list) | TCP + UDP, any port | (multi) | Both TCP and UDP attempted per address. Empty => `ConfigError::NoBindAddrs`, exit. Per-port bind failure is **non-fatal** (logged + skipped, sensor stays up). Unit grants `CAP_NET_BIND_SERVICE`. `crates/sensor-catchall/src/main.rs#parse_bind_addrs`, `crates/sensor-catchall/src/main.rs#main` |
 | sensor-cred | five per-protocol envs (below) | VNC / MySQL / MSSQL / PostgreSQL / MongoDB | (multi) | No single bind env; at least one required. `crates/sensor-cred/src/main.rs#main` |
@@ -180,6 +180,7 @@ are **not** compiled-in defaults - each is set by the operator in
 | 5555 | attacker | ADB | `PROPOLIS_ADB_BIND` |
 | 5900 | attacker | VNC (cred) | `PROPOLIS_CRED_VNC_BIND` |
 | 6379 | attacker | Redis | `PROPOLIS_REDIS_BIND` |
+| 6380 | attacker | Redis over implicit TLS (redis) | `PROPOLIS_REDIS_TLS_BIND` |
 | 27017 | attacker | MongoDB (cred) | `PROPOLIS_CRED_MONGO_BIND` |
 | (any) | attacker | Catchall (TCP+UDP, multi-port) | `PROPOLIS_CATCHALL_BIND_ADDRS` |
 | 8080 | operator + machine | Console UI + `/health` `/ready` `/metrics` (loopback default) | `PROPOLIS_CONSOLE_BIND` |

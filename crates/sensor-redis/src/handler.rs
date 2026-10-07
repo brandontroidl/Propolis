@@ -5,7 +5,7 @@
 //!
 //! Split mirrors sensor-telnet's `handler.rs` and sensor-ssh's `auth.rs`: [`Session::dispatch`]
 //! and its per-command handlers are pure functions of `(state, args) -> (reply bytes, events)`
-//! with no `TcpStream` of their own, so they are unit-tested directly below with no live socket.
+//! with no socket of their own, so they are unit-tested directly below with no live socket.
 //! [`handle_connection`] is the only function in this crate that performs socket I/O;
 //! it is exercised end-to-end by `tests/integration.rs` instead.
 //!
@@ -58,7 +58,16 @@ const READ_CHUNK_SIZE: usize = 1024;
 /// The `honeypot_connection` event: emitted once, immediately after accept, before any RESP
 /// command is read - `authenticated = false` unconditionally, regardless of what an `AUTH` later
 /// in the session does.
-fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
+fn connection_event(
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+    tls: bool,
+) -> SensorEvent {
+    let mut metadata = serde_json::json!({ "protocol_label": PROTOCOL_LABEL });
+    if tls {
+        metadata["tls"] = serde_json::Value::Bool(true);
+    }
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -68,7 +77,7 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid)
         protocol: PROTO_TCP.to_string(),
         authenticated: false,
         observed_at: chrono::Utc::now(),
-        metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
+        metadata,
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
@@ -266,6 +275,8 @@ pub struct Session {
     keys: HashMap<Vec<u8>, Vec<u8>>,
     /// Bytes of keys and values currently held, against `MAX_STORE_BYTES`.
     store_bytes: usize,
+    /// Connection arrived over TLS; stamped on every event as `"tls": true`.
+    tls: bool,
 }
 
 /// Distinct keys, and total key+value bytes, one session may hold. A SET that would exceed
@@ -287,7 +298,14 @@ impl Session {
             authenticated: false,
             keys: HashMap::new(),
             store_bytes: 0,
+            tls: false,
         }
+    }
+
+    /// Mark every event this session emits as having arrived over TLS.
+    pub fn with_tls(mut self, tls: bool) -> Self {
+        self.tls = tls;
+        self
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -304,8 +322,11 @@ impl Session {
         &self,
         signal_type: &str,
         authenticated: bool,
-        metadata: serde_json::Value,
+        mut metadata: serde_json::Value,
     ) -> SensorEvent {
+        if self.tls {
+            metadata["tls"] = serde_json::Value::Bool(true);
+        }
         SensorEvent {
             v: WIRE_VERSION,
             source_ip: self.source_ip,
@@ -531,10 +552,14 @@ impl Session {
 /// budget, or sends a structurally invalid command. Never panics and never propagates an I/O
 /// error to the caller - matches `sensor_framework::run_tcp_listener`'s per-connection isolation
 /// contract (see sensor-telnet's `handle_connection` doc for the same guarantee).
+// Eight parameters: the stream plus the per-connection context every sensor handler takes;
+// bundling them would diverge from the uniform handler shape the sibling sensors share.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_connection<S>(
     mut stream: S,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
+    tls: bool,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
@@ -548,12 +573,12 @@ pub async fn handle_connection<S>(
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
-    let conn_event = connection_event(source_ip, wan_ip, session_id);
+    let conn_event = connection_event(source_ip, wan_ip, session_id, tls);
     if emitter.append(&conn_event).await.is_err() {
         tracing::error!(%peer_addr, "redis: failed to append connection event");
     }
 
-    let mut session = Session::new(source_ip, wan_ip, session_id);
+    let mut session = Session::new(source_ip, wan_ip, session_id).with_tls(tls);
     let mut reader = RespReader::new(bounds);
 
     loop {
@@ -565,7 +590,8 @@ pub async fn handle_connection<S>(
                         tracing::error!(%peer_addr, "redis: failed to append command event");
                     }
                 }
-                if stream.write_all(&response).await.is_err() {
+                // flush: a TLS stream buffers records until flushed.
+                if stream.write_all(&response).await.is_err() || stream.flush().await.is_err() {
                     return;
                 }
             }
@@ -573,6 +599,9 @@ pub async fn handle_connection<S>(
                 let _ = stream
                     .write_all(&resp::error_reply("ERR Protocol error"))
                     .await;
+                let _ = stream.flush().await;
+                // close_notify after the farewell, as a real TLS server sends.
+                let _ = stream.shutdown().await;
                 return;
             }
             ReadOutcome::Closed => return,
@@ -676,7 +705,7 @@ mod tests {
 
     #[test]
     fn connection_event_is_unauthenticated_with_redis_label() {
-        let event = connection_event(ip("203.0.113.7"), None, Uuid::now_v7());
+        let event = connection_event(ip("203.0.113.7"), None, Uuid::now_v7(), false);
         assert!(!event.authenticated);
         assert_eq!(event.sensor, "redis");
         assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
@@ -1134,7 +1163,12 @@ mod tests {
     #[test]
     fn every_emitted_event_carries_redis_protocol_label_and_sensor() {
         let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
-        let mut all_events = vec![connection_event(ip("203.0.113.7"), None, Uuid::now_v7())];
+        let mut all_events = vec![connection_event(
+            ip("203.0.113.7"),
+            None,
+            Uuid::now_v7(),
+            false,
+        )];
         all_events.extend(session.dispatch(&args(&["AUTH", "pw"])).1);
         all_events.extend(session.dispatch(&args(&["SET", "k", "v"])).1);
         all_events.extend(session.dispatch(&args(&["CONFIG", "SET", "dir", "/tmp"])).1);
@@ -1156,6 +1190,61 @@ mod tests {
                     .and_then(|v| v.as_str()),
                 Some("redis")
             );
+        }
+    }
+
+    /// Drive one command of every event-emitting kind through `session` and collect the events.
+    fn every_kind_of_event(mut session: Session) -> Vec<SensorEvent> {
+        let mut events = Vec::new();
+        for cmd in [
+            args(&["AUTH", "pw"]),
+            args(&["SET", "k", "v"]),
+            args(&["CONFIG", "SET", "dir", "/tmp"]),
+            args(&["SLAVEOF", "198.51.100.50", "6379"]),
+            args(&["EVAL", "return 1", "0"]),
+        ] {
+            events.extend(session.dispatch(&cmd).1);
+        }
+        events
+    }
+
+    #[test]
+    fn connection_event_marks_tls_only_when_tls() {
+        let plain = connection_event(ip("203.0.113.7"), None, Uuid::now_v7(), false);
+        assert!(plain.metadata.get("tls").is_none());
+        let tls = connection_event(ip("203.0.113.7"), None, Uuid::now_v7(), true);
+        assert_eq!(
+            tls.metadata.get("tls").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            tls.metadata.get("protocol_label").and_then(|v| v.as_str()),
+            Some("redis")
+        );
+    }
+
+    #[test]
+    fn tls_session_tags_every_event_it_emits() {
+        let session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7()).with_tls(true);
+        let events = every_kind_of_event(session);
+        assert_eq!(events.len(), 5, "AUTH, SET, CONFIG SET, SLAVEOF, EVAL");
+        for event in &events {
+            assert_eq!(
+                event.metadata.get("tls").and_then(|v| v.as_bool()),
+                Some(true),
+                "{:?}",
+                event.metadata
+            );
+        }
+    }
+
+    #[test]
+    fn plain_session_events_have_no_tls_key() {
+        let session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let events = every_kind_of_event(session);
+        assert_eq!(events.len(), 5);
+        for event in &events {
+            assert!(event.metadata.get("tls").is_none(), "{:?}", event.metadata);
         }
     }
 

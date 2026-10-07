@@ -46,6 +46,14 @@ certificate is the deploy-minted self-signed one whose only name is `localhost`.
 or unusable cert and key pair makes the sensor refuse to start rather than serve plaintext. See
 [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 
+`sensor-redis` can likewise expose an implicit-TLS listener (conventionally 6380, `rediss://`). It
+exists only when `PROPOLIS_REDIS_TLS_BIND` is set, so cert and key alone open no new port. The
+surface and its limits match the HTTPS listener: a handshake that fails or stalls is cut at the
+read timeout and logged only at debug level, no client certificate is requested, there is no
+STARTTLS, and the certificate is the deploy-minted self-signed one named `localhost`. The AUTH
+password is never captured over TLS, as on the plain listener. A half-configured or unusable pair
+makes the sensor refuse to start rather than serve plaintext.
+
 Controls:
 
 - **Never-execute.** No sensor spawns a subprocess or execs; the honeypot captures, it

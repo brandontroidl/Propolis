@@ -26,6 +26,9 @@ const ENV_IDLE_TIMEOUT_MS: &str = "PROPOLIS_REDIS_IDLE_TIMEOUT_MS";
 const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_REDIS_MAX_DURATION_SECS";
 const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_REDIS_MAX_CAPTURED_BYTES";
 const ENV_MAX_CONCURRENT: &str = "PROPOLIS_REDIS_MAX_CONCURRENT";
+const ENV_TLS_BIND: &str = "PROPOLIS_REDIS_TLS_BIND";
+const ENV_TLS_CERT: &str = "PROPOLIS_REDIS_TLS_CERT";
+const ENV_TLS_KEY: &str = "PROPOLIS_REDIS_TLS_KEY";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/redis/events.jsonl";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
@@ -40,10 +43,24 @@ struct Config {
     wan_map: HashMap<IpAddr, IpAddr>,
     log_path: PathBuf,
     bounds: ConnectionBounds,
+    tls: Option<TlsConfig>,
+}
+
+/// A second, implicit-TLS listener (`rediss://`) beside the plaintext one.
+#[derive(Debug, Clone, PartialEq)]
+struct TlsConfig {
+    /// `None` when a cert and key are configured without a TLS bind: validated, never listened on.
+    bind_addr: Option<SocketAddr>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
 }
 
 #[derive(Debug, PartialEq)]
 enum ConfigError {
+    InvalidTlsBind(String),
+    /// The named cert or key env var was unset or blank while the other half of the TLS
+    /// configuration was present.
+    TlsPathMissing(&'static str),
     /// `PROPOLIS_REDIS_BIND` was absent or unparseable.
     NoBind,
     InvalidBind(String),
@@ -59,6 +76,11 @@ enum ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ConfigError::InvalidTlsBind(s) => write!(f, "invalid {ENV_TLS_BIND} address {s:?}"),
+            ConfigError::TlsPathMissing(var) => write!(
+                f,
+                "{var} must be set to a PEM file path (TLS needs both {ENV_TLS_CERT} and {ENV_TLS_KEY})"
+            ),
             ConfigError::NoBind => {
                 write!(f, "{ENV_BIND} must be set to a single ip:port bind address")
             }
@@ -143,6 +165,42 @@ fn parse_positive_u32(
     Ok(value)
 }
 
+/// TLS is enabled iff both the cert and key paths are set. `None` only when nothing TLS-related
+/// is configured; a bind without the pair, or exactly one of the pair, is an error so the caller
+/// refuses to start rather than serve plaintext where TLS was asked for. A pair without a bind
+/// parses (the caller still validates the files) but yields no listener. Blank counts as unset.
+fn parse_tls(
+    bind: Option<&str>,
+    cert: Option<&str>,
+    key: Option<&str>,
+) -> Result<Option<TlsConfig>, ConfigError> {
+    let path = |raw: Option<&str>| {
+        raw.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    };
+    let (cert_path, key_path) = (path(cert), path(key));
+    if bind.is_none() && cert_path.is_none() && key_path.is_none() {
+        return Ok(None);
+    }
+    // TLS is enabled iff both paths are set; a half-configured pair is reported as the missing half.
+    let cert_path = cert_path.ok_or(ConfigError::TlsPathMissing(ENV_TLS_CERT))?;
+    let key_path = key_path.ok_or(ConfigError::TlsPathMissing(ENV_TLS_KEY))?;
+    // The bind is never defaulted: the fleet inventory derives from the *_BIND vars.
+    let bind_addr = bind
+        .map(|raw| {
+            raw.trim()
+                .parse::<SocketAddr>()
+                .map_err(|_| ConfigError::InvalidTlsBind(raw.to_string()))
+        })
+        .transpose()?;
+    Ok(Some(TlsConfig {
+        bind_addr,
+        cert_path,
+        key_path,
+    }))
+}
+
 /// Load and validate configuration from environment variables. Fails closed: any missing bind
 /// address, malformed entry, or zero-valued bound is rejected here rather than silently
 /// substituted with a default that could disable the bound it names.
@@ -184,10 +242,20 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         ENV_MAX_CONCURRENT,
     )?;
 
+    // var_os + lossy: a non-UTF-8 value becomes a parse failure (refuse) rather than silently
+    // reading as unset, which would disable TLS.
+    let env_str = |name: &str| env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    let tls = parse_tls(
+        env_str(ENV_TLS_BIND).as_deref(),
+        env_str(ENV_TLS_CERT).as_deref(),
+        env_str(ENV_TLS_KEY).as_deref(),
+    )?;
+
     Ok(Config {
         bind_addr,
         wan_map,
         log_path,
+        tls,
         bounds: ConnectionBounds {
             read_timeout: Duration::from_millis(read_timeout_ms),
             idle_timeout: Duration::from_millis(idle_timeout_ms),
@@ -210,13 +278,41 @@ async fn main() {
         }
     };
 
+    // Load the cert and key before binding anything, plaintext included: a TLS misconfiguration
+    // must not leave a plaintext listener up.
+    let tls_server = match &config.tls {
+        Some(t) => match sensor_framework::load_server_config(&t.cert_path, &t.key_path) {
+            Ok(server_config) => {
+                let server = sensor_framework::TlsServer::from_config(server_config);
+                match t.bind_addr {
+                    Some(addr) => Some((addr, server)),
+                    None => {
+                        tracing::warn!(
+                            "sensor-redis: {ENV_TLS_CERT} and {ENV_TLS_KEY} are valid but \
+                             {ENV_TLS_BIND} is not set; no TLS listener started"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    cert = %t.cert_path.display(), key = %t.key_path.display(), error = %e,
+                    "sensor-redis: TLS configured but cert/key unusable; refusing to start"
+                );
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
 
     let (bound, handle) = match sensor_redis::start_test_server(
         config.bind_addr,
-        config.log_path,
-        wan_resolver,
-        config.bounds,
+        config.log_path.clone(),
+        wan_resolver.clone(),
+        config.bounds.clone(),
     )
     .await
     {
@@ -233,9 +329,37 @@ async fn main() {
 
     tracing::info!(local = %bound, "sensor-redis: listening");
 
+    let tls_handle = match tls_server {
+        Some((addr, server)) => {
+            match sensor_redis::start_test_server_tls(
+                addr,
+                config.log_path,
+                wan_resolver,
+                config.bounds,
+                server,
+            )
+            .await
+            {
+                Ok((bound, handle)) => {
+                    tracing::info!(local = %bound, "sensor-redis: listening (tls)");
+                    Some(handle)
+                }
+                Err(e) => {
+                    handle.abort();
+                    tracing::error!(addr = %addr, error = %e, "sensor-redis: failed to start tls server");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+
     shutdown_signal().await;
     tracing::info!("sensor-redis: shutdown signal received; stopping");
     handle.abort();
+    if let Some(h) = tls_handle {
+        h.abort();
+    }
 }
 
 #[cfg(test)]
@@ -307,5 +431,91 @@ mod tests {
     #[test]
     fn parse_positive_u32_accepts_explicit_value() {
         assert_eq!(parse_positive_u32(Some("7"), 1, "x").unwrap(), 7);
+    }
+
+    const CERT: &str = "/etc/propolis/tls/redis.crt";
+    const KEY: &str = "/etc/propolis/tls/redis.key";
+
+    #[test]
+    fn parse_tls_nothing_configured_is_none() {
+        assert_eq!(parse_tls(None, None, None), Ok(None));
+        // Blank paths are "unset", not a configuration.
+        assert_eq!(parse_tls(None, Some("  "), Some("")), Ok(None));
+    }
+
+    #[test]
+    fn parse_tls_full_is_some() {
+        assert_eq!(
+            parse_tls(Some("0.0.0.0:6380"), Some(CERT), Some(KEY)),
+            Ok(Some(TlsConfig {
+                bind_addr: Some("0.0.0.0:6380".parse().unwrap()),
+                cert_path: CERT.into(),
+                key_path: KEY.into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_tls_bind_without_cert_is_refused() {
+        assert_eq!(
+            parse_tls(Some("0.0.0.0:6380"), None, Some(KEY)),
+            Err(ConfigError::TlsPathMissing(ENV_TLS_CERT))
+        );
+        assert_eq!(
+            parse_tls(Some("0.0.0.0:6380"), None, None),
+            Err(ConfigError::TlsPathMissing(ENV_TLS_CERT))
+        );
+    }
+
+    #[test]
+    fn parse_tls_bind_without_key_is_refused() {
+        assert_eq!(
+            parse_tls(Some("0.0.0.0:6380"), Some(CERT), None),
+            Err(ConfigError::TlsPathMissing(ENV_TLS_KEY))
+        );
+    }
+
+    #[test]
+    fn parse_tls_blank_path_counts_as_missing() {
+        assert_eq!(
+            parse_tls(Some("0.0.0.0:6380"), Some("   "), Some(KEY)),
+            Err(ConfigError::TlsPathMissing(ENV_TLS_CERT))
+        );
+    }
+
+    #[test]
+    fn parse_tls_exactly_one_of_cert_and_key_without_bind_is_refused() {
+        assert_eq!(
+            parse_tls(None, Some(CERT), None),
+            Err(ConfigError::TlsPathMissing(ENV_TLS_KEY))
+        );
+        assert_eq!(
+            parse_tls(None, None, Some(KEY)),
+            Err(ConfigError::TlsPathMissing(ENV_TLS_CERT))
+        );
+    }
+
+    #[test]
+    fn parse_tls_pair_without_bind_has_no_listener() {
+        assert_eq!(
+            parse_tls(None, Some(CERT), Some(KEY)),
+            Ok(Some(TlsConfig {
+                bind_addr: None,
+                cert_path: CERT.into(),
+                key_path: KEY.into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_tls_rejects_bad_or_empty_bind() {
+        assert!(matches!(
+            parse_tls(Some("nonsense"), Some(CERT), Some(KEY)),
+            Err(ConfigError::InvalidTlsBind(_))
+        ));
+        assert!(matches!(
+            parse_tls(Some(""), Some(CERT), Some(KEY)),
+            Err(ConfigError::InvalidTlsBind(_))
+        ));
     }
 }

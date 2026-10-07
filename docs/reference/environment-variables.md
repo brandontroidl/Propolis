@@ -545,7 +545,9 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   (see "HTTP TLS" below).
 - redis: `PROPOLIS_REDIS_READ_TIMEOUT_MS`, `PROPOLIS_REDIS_IDLE_TIMEOUT_MS`,
   `PROPOLIS_REDIS_MAX_DURATION_SECS`, `PROPOLIS_REDIS_MAX_CAPTURED_BYTES`,
-  `PROPOLIS_REDIS_MAX_CONCURRENT`, `PROPOLIS_REDIS_LOG_PATH`, `PROPOLIS_REDIS_WAN_MAP`.
+  `PROPOLIS_REDIS_MAX_CONCURRENT`, `PROPOLIS_REDIS_LOG_PATH`, `PROPOLIS_REDIS_WAN_MAP`, and the
+  Redis TLS variables `PROPOLIS_REDIS_TLS_BIND`, `PROPOLIS_REDIS_TLS_CERT`,
+  `PROPOLIS_REDIS_TLS_KEY` (see "Redis TLS" below).
 - catchall: `PROPOLIS_CATCHALL_READ_TIMEOUT_MS`, `PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS`,
   `PROPOLIS_CATCHALL_MAX_DURATION_SECS`, `PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES`,
   `PROPOLIS_CATCHALL_MAX_CONCURRENT`.
@@ -625,6 +627,22 @@ Sensor-specific extras:
   unset. CERT and KEY without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
   (`deploy/fleet-listeners.sh#PROPOLIS_HTTP_TLS_BIND`), a TLS listener never starts implicitly.
+- **redis**: Redis TLS (all three default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_REDIS_TLS_BIND` | unset (the deploy convention is `0.0.0.0:6380`) | `ip:port` of the implicit-TLS (`rediss://`) listener. The listener exists only when this is set. |
+  | `PROPOLIS_REDIS_TLS_CERT` | unset (deploy value `/etc/propolis/tls/redis.crt`) | PEM certificate path. |
+  | `PROPOLIS_REDIS_TLS_KEY` | unset (deploy value `/etc/propolis/tls/redis.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-redis/src/main.rs#parse_tls`): the sensor exits 1 with
+  `refusing to start`, before binding any listener (the plain one included), when exactly one of
+  CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_REDIS_TLS_BIND` is set
+  without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
+  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value is invalid, not
+  unset. CERT and KEY without a bind load and validate the pair, start no TLS listener, and log one
+  warning. Because the fleet inventory derives from the `*_BIND` variables
+  (`deploy/fleet-listeners.sh#PROPOLIS_REDIS_TLS_BIND`), a TLS listener never starts implicitly.
 - **catchall**: no spool variable (never spools file bodies,
   `crates/sensor-catchall/src/main.rs#Config`); no
   outbox variable either (captures no file bodies, so nothing for SP-B-1b's

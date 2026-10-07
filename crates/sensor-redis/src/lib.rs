@@ -11,7 +11,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sensor_framework::{ConnectionBounds, EventEmitter, WanResolver, run_tcp_listener};
+use sensor_framework::{
+    ConnectionBounds, EventEmitter, TlsServer, WanResolver, run_tcp_listener, run_tls_listener,
+};
 use tokio::task::JoinHandle;
 
 /// Start the Redis honeypot server on `addr` (use `:0` for an ephemeral port - every test in
@@ -45,6 +47,49 @@ pub async fn start_test_server(
                     stream,
                     peer,
                     local_addr,
+                    false,
+                    session_id,
+                    emitter,
+                    wan_resolver,
+                    bounds,
+                )
+                .await;
+            }
+        },
+    )
+    .await
+}
+
+/// The TLS twin of [`start_test_server`]: same handler, bounds and per-source cap, with a TLS
+/// handshake (no client auth) in front of every accepted connection. A failed or stalled handshake
+/// is dropped without an event; events from an established session carry `"tls": true`.
+pub async fn start_test_server_tls(
+    addr: SocketAddr,
+    log_path: PathBuf,
+    wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
+    tls: TlsServer,
+) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
+    let emitter = Arc::new(EventEmitter::new(log_path));
+
+    let per_source_cap = Some(sensor_framework::default_per_source_cap(
+        bounds.max_concurrent,
+    ));
+    run_tls_listener(
+        addr,
+        bounds.clone(),
+        per_source_cap,
+        tls,
+        move |stream, peer, local_addr, session_id| {
+            let emitter = emitter.clone();
+            let wan_resolver = wan_resolver.clone();
+            let bounds = bounds.clone();
+            async move {
+                handler::handle_connection(
+                    stream,
+                    peer,
+                    local_addr,
+                    true,
                     session_id,
                     emitter,
                     wan_resolver,

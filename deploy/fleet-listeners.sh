@@ -85,6 +85,7 @@ for pair in \
     PROPOLIS_SSH_BIND:ssh \
     PROPOLIS_TELNET_BIND:telnet \
     PROPOLIS_REDIS_BIND:redis \
+    PROPOLIS_REDIS_TLS_BIND:redis \
     PROPOLIS_ADB_BIND:adb \
     PROPOLIS_HTTP_BIND:http \
     PROPOLIS_HTTP_TLS_BIND:http \

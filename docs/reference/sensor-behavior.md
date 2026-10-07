@@ -693,6 +693,22 @@ Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
   captured args), EVAL/SCRIPT (canned compile error + captured args, **never runs
   Lua**), unknown → Redis-exact error. Caps: metadata string 255, value 1024.
 - **Bounds:** common defaults, `max_concurrent` 256. No spool.
+- **Redis over TLS (optional):** when `PROPOLIS_REDIS_TLS_BIND` is set, a second implicit-TLS
+  (`rediss://`) listener in the same process serves the same persona and writes the same
+  `events.jsonl` (`crates/sensor-redis/src/lib.rs#start_test_server_tls`). No STARTTLS exists and
+  no client certificate is requested. The handshake is cut at the read timeout; a failed or stalled
+  handshake, including plaintext sent to the TLS port, is dropped with a debug log and emits no
+  event. Every event from a TLS session, the connection event, the login attempt and each command
+  event, carries `"tls": true`; the key is absent, not false, on the plain listener
+  (`crates/sensor-redis/src/handler.rs#connection_event`). The AUTH password is never captured over
+  TLS either. Replies are flushed, and after a protocol error the handler sends its error reply and
+  then shuts the stream down, which sends `close_notify`. Fail-closed: the sensor refuses to start
+  (exit 1, before any bind) on a half-configured or unusable cert and key pair, and the key must be
+  mode `0600`; an OS bind failure of the TLS listener stops the plain listener and exits 1. Cert and
+  key without `PROPOLIS_REDIS_TLS_BIND` load and validate, start no TLS listener, and log one
+  warning. Rules and variables are in [environment-variables.md](environment-variables.md); the
+  operator view is
+  [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt` (AUTH),
   `honeypot_command_exec` (CONFIG SET dir/dbfilename, SET, SLAVEOF/REPLICAOF,
   EVAL/SCRIPT).

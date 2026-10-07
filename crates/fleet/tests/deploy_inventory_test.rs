@@ -130,6 +130,33 @@ fn a_cert_and_key_without_an_http_tls_bind_derive_no_listener() {
 }
 
 #[test]
+fn a_redis_tls_bind_yields_one_tcp_listener_named_redis() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "redis.env",
+        "PROPOLIS_REDIS_TLS_BIND=203.0.113.7:6380\n",
+    );
+
+    let value = generate(dir.path()).unwrap();
+    let parsed = parse_listeners(&value).unwrap();
+
+    assert_eq!(parsed, vec![listener("redis", Proto::Tcp, 6380)]);
+}
+
+#[test]
+fn a_cert_and_key_without_a_redis_tls_bind_derive_no_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "redis.env",
+        "PROPOLIS_REDIS_TLS_CERT=/etc/propolis/tls/redis.crt\nPROPOLIS_REDIS_TLS_KEY=/etc/propolis/tls/redis.key\n",
+    );
+
+    assert_eq!(generate(dir.path()), None);
+}
+
+#[test]
 fn a_catchall_bind_list_yields_both_transports_for_every_port() {
     let dir = tempfile::tempdir().unwrap();
     write(

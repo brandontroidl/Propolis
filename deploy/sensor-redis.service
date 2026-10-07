@@ -20,6 +20,7 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 ReadWritePaths=/var/log/propolis/redis
+ReadOnlyPaths=/etc/propolis/tls
 CapabilityBoundingSet=
 
 MemoryMax=256M

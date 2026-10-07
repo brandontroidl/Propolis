@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Redis over TLS on `sensor-redis` (default off)** - a second, implicit-TLS (`rediss://`)
+  listener in the same process, serving the same persona into the same event log, enabled by
+  `PROPOLIS_REDIS_TLS_BIND` (no compiled default; the deploy convention is `0.0.0.0:6380`)
+  together with `PROPOLIS_REDIS_TLS_CERT` and `PROPOLIS_REDIS_TLS_KEY` (the pair
+  `provision-tls.sh` mints, key mode `0600`). There is no STARTTLS. Events from a TLS session
+  (connection, login, command) carry `"tls": true`; plain events are unchanged, and the AUTH
+  password is never captured. A failed or stalled handshake is dropped with no event and cut at
+  the read timeout. Fail-closed: exactly one of cert and key, a TLS bind without both, an invalid
+  bind, or an unusable pair makes the sensor exit 1 before binding anything. Cert and key without
+  a TLS bind load and validate the pair, start no TLS listener and log one warning, so a TLS
+  listener never opens implicitly. `fleet-listeners.sh` derives a `redis` tcp listener from
+  `PROPOLIS_REDIS_TLS_BIND`, and the unit gains `ReadOnlyPaths=/etc/propolis/tls`.
 - **HTTPS on `sensor-http` (default off)** - a second, implicit-TLS listener in the same process,
   serving the same nginx persona into the same event log, enabled by `PROPOLIS_HTTP_TLS_BIND`
   (no compiled default; the deploy convention is `0.0.0.0:443`) together with

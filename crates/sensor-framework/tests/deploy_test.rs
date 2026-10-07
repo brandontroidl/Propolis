@@ -116,6 +116,22 @@ fn mqtt_unit_has_hardening_directives_and_no_cap_net_bind() {
     );
 }
 
+/// The Redis sensor's deploy ports (6379 plain, 6380 TLS) are both unprivileged, so its unit grants
+/// no capability, and it reads its cert and key from the root-owned TLS directory, which
+/// `ProtectSystem=strict` leaves readable but which the unit must not be able to write.
+#[test]
+fn redis_unit_reads_tls_dir_read_only_and_grants_no_capability() {
+    let unit = deploy_file("sensor-redis.service");
+    assert!(unit.contains("ReadOnlyPaths=/etc/propolis/tls\n"));
+    assert!(unit.contains("CapabilityBoundingSet=\n"));
+    assert!(
+        unit.lines()
+            .filter(|l| l.contains("CAP_NET_BIND_SERVICE"))
+            .all(|l| l.trim_start().starts_with('#')),
+        "ports 6379 and 6380 are unprivileged: the unit must not grant CAP_NET_BIND_SERVICE"
+    );
+}
+
 /// The HTTP sensor's deploy ports (80 plain, 443 TLS) are both privileged, so its unit keeps
 /// `CAP_NET_BIND_SERVICE`, and it reads its cert and key from the root-owned TLS directory, which
 /// `ProtectSystem=strict` leaves readable but which the unit must not be able to write.

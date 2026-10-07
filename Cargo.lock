@@ -3478,11 +3478,13 @@ dependencies = [
  "chrono",
  "proptest",
  "rand 0.10.2",
+ "rcgen",
  "sensor-framework",
  "sensor-wire",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

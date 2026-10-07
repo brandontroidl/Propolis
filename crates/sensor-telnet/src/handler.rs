@@ -17,7 +17,7 @@ use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell, onlcr};
 use sensor_framework::{
     CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget,
-    EgressState, EventEmitter, Uuid, WanResolver, limits_from, upload_metadata,
+    EgressState, EventEmitter, UploadEnd, Uuid, WanResolver, limits_from, upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
@@ -406,10 +406,13 @@ impl Drop for LineReader {
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
                 metadata: {
-                    let mut m =
-                        upload_metadata(PROTOCOL_LABEL, &sample, wire_size, end.is_complete());
+                    let mut m = upload_metadata(
+                        PROTOCOL_LABEL,
+                        &sample,
+                        wire_size,
+                        UploadEnd::Session(end),
+                    );
                     m["capture_reason"] = serde_json::json!("binary_shell_payload");
-                    m["end_reason"] = serde_json::json!(end.label());
                     m
                 },
                 sample: Some(sample),

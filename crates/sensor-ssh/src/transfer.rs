@@ -23,7 +23,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use sensor_framework::fakefs::FakeFs;
-use sensor_framework::{CaptureBody, CaptureHandoff, CaptureJob, Uuid, upload_metadata};
+use sensor_framework::{
+    CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, UploadEnd, Uuid, upload_metadata,
+};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
 };
@@ -241,7 +243,8 @@ impl ScpReceiver {
                         // The process-wide capture budget is full. Keep the prefix, hand it off
                         // now (the transfer is over, so nothing else will), and fail the copy the
                         // way scp's own sink does when its disk fills: a warning byte plus text.
-                        let job = self.capture_job(false);
+                        let job =
+                            self.capture_job(UploadEnd::TransferCut(CaptureEnd::CaptureBudget));
                         let _ = self.handoff.submit(job);
                         response.push(1);
                         response.extend_from_slice(b"scp: No space left on device\n");
@@ -255,7 +258,7 @@ impl ScpReceiver {
                     offset += 1;
                     // The fake-tree copy reads the body, so it goes first: the job takes it.
                     self.land_in_fake_fs();
-                    let job = self.capture_job(true);
+                    let job = self.capture_job(UploadEnd::TransferComplete);
                     let _ = self.handoff.submit(job);
                     response.push(0); // final ack
                     self.state = ScpState::Done;
@@ -267,22 +270,29 @@ impl ScpReceiver {
         response
     }
 
-    /// The session is ending with the transfer unfinished: a body still in flight, or the whole
-    /// body received but the trailing `\0` never sent. What arrived is returned as a capture
-    /// marked incomplete, for the caller to submit: a dropper cut off before the trailer used to
-    /// leave no event and no bytes, as if it had never been sent. One-shot: the state moves to
-    /// `Done`, so `Drop` below cannot submit a second copy.
-    pub fn abandon(&mut self) -> Option<CaptureJob> {
+    /// The session or channel is ending, by `end`, with the transfer unfinished: a body still in
+    /// flight, or the whole body received but the trailing `\0` never sent. What arrived is
+    /// returned as a capture cut off by `end`, for the caller to submit: a dropper cut off before
+    /// the trailer used to leave no event and no bytes, as if it had never been sent. One-shot:
+    /// the state moves to `Done`, so `Drop` below cannot submit a second copy.
+    pub fn abandon(&mut self, end: CaptureEnd) -> Option<CaptureJob> {
         let unfinished = matches!(
             self.state,
             ScpState::ReadingBody { .. } | ScpState::WaitTrailer
         ) && self.wire_bytes > 0;
         self.state = ScpState::Done;
-        unfinished.then(|| self.capture_job(false))
+        unfinished.then(|| self.capture_job(UploadEnd::TransferCut(end)))
+    }
+
+    /// [`Self::abandon`], submitting the capture.
+    pub fn cut_off(&mut self, end: CaptureEnd) {
+        if let Some(job) = self.abandon(end) {
+            let _ = self.handoff.submit(job);
+        }
     }
 
     /// Moves the buffered body into a job, leaving an empty (uncharged) one behind.
-    fn capture_job(&mut self, complete: bool) -> CaptureJob {
+    fn capture_job(&mut self, end: UploadEnd) -> CaptureJob {
         let body = std::mem::replace(&mut self.body, self.handoff.new_capture_body());
         let orig_name = self.filename.clone();
         let source_ip = self.source_ip;
@@ -302,7 +312,7 @@ impl ScpReceiver {
                 protocol: PROTO_TCP.into(),
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
-                metadata: upload_metadata("ssh", &sample, wire_size, complete),
+                metadata: upload_metadata("ssh", &sample, wire_size, end),
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
@@ -314,12 +324,12 @@ impl ScpReceiver {
 /// The receiver is dropped however the session ends, including the listener's `max_duration`
 /// timeout, which cancels the whole handler future and never reaches any cleanup written after
 /// the packet loop. Submitting from `Drop` is what makes an unfinished transfer survive every
-/// exit path with one mechanism; `submit` never blocks, so this is safe in a destructor.
+/// exit path with one mechanism; `submit` never blocks, so this is safe in a destructor. Every
+/// ending the handler observes calls `cut_off` with it first (`server.rs`), so a transfer still
+/// open here is one no code saw end: the handler was cancelled.
 impl Drop for ScpReceiver {
     fn drop(&mut self) {
-        if let Some(job) = self.abandon() {
-            let _ = self.handoff.submit(job);
-        }
+        self.cut_off(CaptureEnd::Cancelled);
     }
 }
 
@@ -606,7 +616,9 @@ impl SftpHandler {
             // counts the refusal; it submits no sample for an empty exhausted body.
             if !file.body.is_empty() || file.body.is_exhausted() {
                 self.land_in_fake_fs(&file);
-                let _ = self.handoff.submit(self.capture_job(file, true));
+                let _ = self
+                    .handoff
+                    .submit(self.capture_job(file, UploadEnd::TransferComplete));
             }
             build_status(id, SSH_FX_OK)
         } else {
@@ -629,20 +641,27 @@ impl SftpHandler {
         }
     }
 
-    /// The session is ending with handles still open. Every one that received bytes is returned
-    /// as a capture marked incomplete, for the caller to submit; a file the client never CLOSEd
-    /// used to vanish with the session.
-    pub fn abandon(&mut self) -> Vec<CaptureJob> {
+    /// The session or channel is ending, by `end`, with handles still open. Every one that
+    /// received bytes is returned as a capture cut off by `end`, for the caller to submit; a file
+    /// the client never CLOSEd used to vanish with the session.
+    pub fn abandon(&mut self, end: CaptureEnd) -> Vec<CaptureJob> {
         self.resident_body = 0;
         let mut open: Vec<SftpOpenFile> = self.handles.drain().map(|(_, f)| f).collect();
         open.retain(|f| f.wire_bytes > 0);
         open.sort_by(|a, b| a.orig_name.cmp(&b.orig_name));
         open.into_iter()
-            .map(|file| self.capture_job(file, false))
+            .map(|file| self.capture_job(file, UploadEnd::TransferCut(end)))
             .collect()
     }
 
-    fn capture_job(&self, file: SftpOpenFile, complete: bool) -> CaptureJob {
+    /// [`Self::abandon`], submitting the captures.
+    pub fn cut_off(&mut self, end: CaptureEnd) {
+        for job in self.abandon(end) {
+            let _ = self.handoff.submit(job);
+        }
+    }
+
+    fn capture_job(&self, file: SftpOpenFile, end: UploadEnd) -> CaptureJob {
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
         let session_id = self.session_id;
@@ -660,7 +679,7 @@ impl SftpHandler {
                 protocol: PROTO_TCP.into(),
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
-                metadata: upload_metadata("ssh", &sample, wire_size, complete),
+                metadata: upload_metadata("ssh", &sample, wire_size, end),
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
@@ -670,12 +689,11 @@ impl SftpHandler {
 }
 
 /// See `ScpReceiver`'s `Drop`: the same one mechanism for every exit path, the listener's
-/// `max_duration` cancellation included.
+/// `max_duration` cancellation included, and the same reason a handle still open here was cut
+/// off by a cancellation.
 impl Drop for SftpHandler {
     fn drop(&mut self) {
-        for job in self.abandon() {
-            let _ = self.handoff.submit(job);
-        }
+        self.cut_off(CaptureEnd::Cancelled);
     }
 }
 
@@ -917,7 +935,11 @@ mod tests {
         );
         scp.feed(b"C0644 100 dropper.bin\n");
         scp.feed(b"MZ-first-forty-bytes-of-a-hundred-byte-f");
-        let job = scp.abandon().expect("bytes arrived, so a capture");
+        // The peer closing is what makes a shell capture whole; a transfer it closes before the
+        // trailer is still a fragment, and the reason says the peer closed it.
+        let job = scp
+            .abandon(CaptureEnd::PeerClosed)
+            .expect("bytes arrived, so a capture");
         assert_eq!(
             job.body.as_slice(),
             b"MZ-first-forty-bytes-of-a-hundred-byte-f"
@@ -926,9 +948,13 @@ mod tests {
         let sample = sample_for(&job);
         let event = (job.event_builder)(sample);
         assert_eq!(event.metadata["complete"], false);
+        assert_eq!(event.metadata["end_reason"], "peer_closed");
         assert_eq!(event.metadata["wire_size"], 40u64);
         assert_eq!(event.metadata["truncated"], false);
-        assert!(scp.abandon().is_none(), "abandon is one-shot");
+        assert!(
+            scp.abandon(CaptureEnd::PeerClosed).is_none(),
+            "abandon is one-shot"
+        );
 
         // The whole body arrived but the trailing NUL never did: the file is all there, the
         // protocol never finished, and the receiver used to keep nothing because its state was
@@ -944,12 +970,13 @@ mod tests {
         trailerless.feed(b"C0644 3 x\n");
         trailerless.feed(b"ABC");
         let job = trailerless
-            .abandon()
+            .abandon(CaptureEnd::IdleTimeout)
             .expect("a complete body without its trailer is still a capture");
         assert_eq!(job.body.as_slice(), b"ABC");
         let sample = sample_for(&job);
         let event = (job.event_builder)(sample);
         assert_eq!(event.metadata["complete"], false);
+        assert_eq!(event.metadata["end_reason"], "idle_timeout");
 
         // Nothing arrived after the header: nothing to keep.
         let (mut empty, _) = ScpReceiver::new(
@@ -961,7 +988,7 @@ mod tests {
             "scp -t /tmp",
         );
         empty.feed(b"C0644 100 dropper.bin\n");
-        assert!(empty.abandon().is_none());
+        assert!(empty.abandon(CaptureEnd::PeerClosed).is_none());
     }
 
     /// A hand-off with room for exactly one job, so a test can prove a submission happened
@@ -1110,7 +1137,7 @@ mod tests {
         write_pkt.extend_from_slice(&write);
         let _ = sftp.feed(&write_pkt);
 
-        let mut jobs = sftp.abandon();
+        let mut jobs = sftp.abandon(CaptureEnd::ClientLogout);
         assert_eq!(jobs.len(), 1);
         let job = jobs.remove(0);
         assert_eq!(job.body.as_slice(), b"\x7fELF-fr");
@@ -1118,7 +1145,11 @@ mod tests {
         let sample = sample_for(&job);
         let event = (job.event_builder)(sample);
         assert_eq!(event.metadata["complete"], false);
-        assert!(sftp.abandon().is_empty(), "handles are drained");
+        assert_eq!(event.metadata["end_reason"], "client_logout");
+        assert!(
+            sftp.abandon(CaptureEnd::ClientLogout).is_empty(),
+            "handles are drained"
+        );
         assert_eq!(sftp.resident_body, 0);
     }
 

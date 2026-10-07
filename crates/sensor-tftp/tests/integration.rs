@@ -323,6 +323,7 @@ async fn wrq_upload_is_captured_in_the_spool_and_emits_both_events() {
     assert_eq!(upload.metadata["wire_size"], body.len() as u64);
     assert_eq!(upload.metadata["truncated"], false);
     assert_eq!(upload.metadata["complete"], true);
+    assert_eq!(upload.metadata["end_reason"], "transfer_complete");
     assert_eq!(upload.metadata["orig_name"], "/tmp/evil.bin");
 
     let on_disk = tokio::fs::read(srv.spool_dir.join(&sample.sha256))
@@ -389,7 +390,7 @@ async fn capture_within_budget_is_complete_and_the_budget_returns_to_zero_after_
     assert_eq!(upload.sample.as_ref().unwrap().size, (3 * BLOCK + 4) as u64);
     assert_eq!(upload.metadata["complete"], true);
     assert_eq!(upload.metadata["truncated"], false);
-    assert!(upload.metadata.get("end_reason").is_none());
+    assert_eq!(upload.metadata["end_reason"], "transfer_complete");
     assert_eq!(srv.budget.high_water_bytes(), CAPTURE_CHUNK_BYTES);
     srv.wait_for_budget_current(0).await;
     assert_eq!(srv.handoff.truncated_capture_count(), 0);
@@ -776,6 +777,7 @@ async fn foreign_packets_do_not_keep_a_transfer_alive() {
     }
     let upload = srv.wait_for_upload().await;
     assert_eq!(upload.metadata["complete"], false);
+    assert_eq!(upload.metadata["end_reason"], "idle_timeout");
     assert_eq!(upload.sample.as_ref().unwrap().size, BLOCK as u64);
     srv.server.abort();
 }
@@ -803,6 +805,7 @@ async fn the_body_cap_truncates_still_captures_and_stops_the_transfer() {
     assert_eq!(upload.metadata["wire_size"], 1024);
     assert_eq!(upload.metadata["truncated"], true);
     assert_eq!(upload.metadata["complete"], false);
+    assert_eq!(upload.metadata["end_reason"], "capture_budget");
 
     // The transfer is over: further blocks get nothing.
     client.send_block(transfer, 3, &[9u8; BLOCK]).await;
@@ -849,6 +852,7 @@ async fn an_idle_transfer_is_captured_as_incomplete() {
 
     let upload = srv.wait_for_upload().await;
     assert_eq!(upload.metadata["complete"], false);
+    assert_eq!(upload.metadata["end_reason"], "idle_timeout");
     assert_eq!(upload.metadata["truncated"], false);
     assert_eq!(upload.sample.as_ref().unwrap().size, BLOCK as u64);
     srv.server.abort();
@@ -884,6 +888,7 @@ async fn max_duration_cancels_a_transfer_and_keeps_what_arrived() {
     // The idle timeout is 5 s, so only max_duration can end this.
     let upload = srv.wait_for_upload().await;
     assert_eq!(upload.metadata["complete"], false);
+    assert_eq!(upload.metadata["end_reason"], "session_cancelled");
     assert_eq!(upload.sample.as_ref().unwrap().size, BLOCK as u64);
     srv.server.abort();
 }
@@ -1043,6 +1048,7 @@ async fn a_peer_error_ends_the_transfer_and_keeps_the_fragment() {
 
     let upload = srv.wait_for_upload().await;
     assert_eq!(upload.metadata["complete"], false);
+    assert_eq!(upload.metadata["end_reason"], "peer_aborted");
     assert_eq!(upload.sample.as_ref().unwrap().size, BLOCK as u64);
     client.assert_silent(Duration::from_millis(200)).await;
     srv.server.abort();

@@ -106,7 +106,8 @@ pub enum CaptureEnd {
     /// Nothing recorded an end: the listener dropped the handler future at `max_duration`. It is
     /// the initial value because a cancelled future runs no code that could set anything else.
     Cancelled,
-    /// The peer closed the connection. Whatever it meant to send, it finished sending.
+    /// The peer closed the connection (or, for a file transfer, the channel or stream carrying
+    /// it). Whatever it meant to send on the session, it finished sending.
     PeerClosed,
     /// The peer asked to end the session (`exit`/`logout`, SSH's DISCONNECT).
     ClientLogout,
@@ -116,13 +117,17 @@ pub enum CaptureEnd {
     TransportError,
     /// The peer sent something the protocol could not parse, so the session could not continue.
     MalformedInput,
-    /// The session hit `max_captured_bytes`; the rest of the payload was never read off the wire.
+    /// The session hit a sensor-side read bound (`max_captured_bytes`, or a per-transfer limit
+    /// derived from it); the rest of the payload was never read off the wire.
     CaptureBudget,
+    /// The peer aborted the transfer with its protocol's own error message (a TFTP ERROR).
+    PeerAborted,
 }
 
 impl CaptureEnd {
-    /// Whether the captured bytes are the whole of what the peer sent. Only an end the PEER chose
-    /// qualifies: every other variant cut a transfer that was still in progress.
+    /// Whether a session-scoped capture's bytes are the whole of what the peer sent. Only an end
+    /// the PEER chose to reach qualifies: every other variant cut a payload still in progress. A
+    /// file transfer does not use this - its own end-of-file marker decides, see [`UploadEnd`].
     pub fn is_complete(self) -> bool {
         matches!(self, Self::PeerClosed | Self::ClientLogout)
     }
@@ -138,6 +143,46 @@ impl CaptureEnd {
             Self::TransportError => "transport_error",
             Self::MalformedInput => "malformed_input",
             Self::CaptureBudget => "capture_budget",
+            Self::PeerAborted => "peer_aborted",
+        }
+    }
+}
+
+/// How a captured upload ended: the one value [`upload_metadata`] derives both `complete` and
+/// `end_reason` from, so the two keys cannot disagree and no capture can leave the reason out.
+///
+/// A session-scoped capture (a binary payload streamed at a shell) has no end-of-file of its own,
+/// so how the session ended decides whether it is whole. A file transfer does have one, and only
+/// that marker makes it whole: an SCP body whose peer closed the connection before the trailer is
+/// a fragment even though `PeerClosed` would make a shell capture complete. Hence the transfer
+/// variants rather than a bare [`CaptureEnd`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadEnd {
+    /// A session-scoped capture, ended the way the session ended.
+    Session(CaptureEnd),
+    /// The transfer reached its protocol's end of file: SCP's trailer, SFTP's CLOSE, ADB's DONE,
+    /// FTP's data-connection close, TFTP's short final block, a whole MQTT PUBLISH.
+    TransferComplete,
+    /// The transfer was cut off before its end of file, by this.
+    TransferCut(CaptureEnd),
+}
+
+impl UploadEnd {
+    /// The event's `complete`.
+    pub fn is_complete(self) -> bool {
+        match self {
+            Self::Session(end) => end.is_complete(),
+            Self::TransferComplete => true,
+            Self::TransferCut(_) => false,
+        }
+    }
+
+    /// The event's `end_reason`. A cut-off transfer carries the label of what cut it, the same
+    /// strings a session-scoped capture uses.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session(end) | Self::TransferCut(end) => end.label(),
+            Self::TransferComplete => "transfer_complete",
         }
     }
 }
@@ -148,15 +193,15 @@ impl CaptureEnd {
 /// SFTP and ADB retain a 10 MB prefix and drain the rest to keep the protocol aligned), and an
 /// analysis of the prefix must never be read as an analysis of the file: `truncated` says the
 /// hash and size describe a prefix, and `wire_size` says how big the real upload was.
-/// `complete` says whether the transfer ended the way its protocol defines the end of a file
-/// (SCP's trailer, SFTP's CLOSE, ADB's DONE, FTP's data-connection close); false means the
-/// session ended, stalled or was cut off with the transfer still open, so the body is a fragment
-/// of whatever was being sent, kept because a fragment of a dropper is still evidence.
+/// `complete` and `end_reason` both come from `end` (see [`UploadEnd`]): false means the session
+/// ended, stalled or was cut off with the transfer still open, so the body is a fragment of
+/// whatever was being sent, kept because a fragment of a dropper is still evidence, and
+/// `end_reason` says what cut it.
 pub fn upload_metadata(
     protocol_label: &str,
     sample: &SampleRef,
     wire_size: u64,
-    complete: bool,
+    end: UploadEnd,
 ) -> serde_json::Value {
     serde_json::json!({
         "protocol_label": protocol_label,
@@ -165,7 +210,8 @@ pub fn upload_metadata(
         "orig_name": sample.orig_name,
         "wire_size": wire_size,
         "truncated": wire_size > sample.size,
-        "complete": complete,
+        "complete": end.is_complete(),
+        "end_reason": end.label(),
     })
 }
 
@@ -634,7 +680,12 @@ mod tests {
 
     #[test]
     fn upload_metadata_marks_a_capped_body_as_truncated_with_the_real_wire_size() {
-        let m = upload_metadata("ssh", &sample(10_000_000), 12_000_000, true);
+        let m = upload_metadata(
+            "ssh",
+            &sample(10_000_000),
+            12_000_000,
+            UploadEnd::TransferComplete,
+        );
         assert_eq!(m["truncated"], true);
         assert_eq!(m["wire_size"], 12_000_000u64);
         assert_eq!(m["size"], 10_000_000u64);
@@ -642,11 +693,12 @@ mod tests {
         assert_eq!(m["sha256"], "ab".repeat(32));
         assert_eq!(m["orig_name"], "payload.bin");
         assert_eq!(m["complete"], true);
+        assert_eq!(m["end_reason"], "transfer_complete");
     }
 
     #[test]
     fn upload_metadata_marks_a_complete_body_as_not_truncated() {
-        let m = upload_metadata("adb", &sample(4096), 4096, true);
+        let m = upload_metadata("adb", &sample(4096), 4096, UploadEnd::TransferComplete);
         assert_eq!(m["truncated"], false);
         assert_eq!(m["wire_size"], 4096u64);
     }
@@ -654,9 +706,135 @@ mod tests {
     /// A fragment below the cap is not truncated by the sensor, but it is not the file either.
     #[test]
     fn upload_metadata_keeps_incomplete_distinct_from_truncated() {
-        let m = upload_metadata("ssh", &sample(4096), 4096, false);
+        let m = upload_metadata(
+            "ssh",
+            &sample(4096),
+            4096,
+            UploadEnd::TransferCut(CaptureEnd::IdleTimeout),
+        );
         assert_eq!(m["truncated"], false);
         assert_eq!(m["complete"], false);
+        assert_eq!(m["end_reason"], "idle_timeout");
+    }
+
+    /// Every end, as every kind of capture, writes both keys, and `complete` is exactly what the
+    /// end says. The same `PeerClosed` is whole for a shell capture and a fragment for a file
+    /// transfer that never reached its end-of-file marker; the labels stay the strings the shell
+    /// sensors have always written.
+    #[test]
+    fn upload_metadata_derives_complete_and_end_reason_from_one_end() {
+        let all = [
+            (CaptureEnd::Cancelled, "session_cancelled", false),
+            (CaptureEnd::PeerClosed, "peer_closed", true),
+            (CaptureEnd::ClientLogout, "client_logout", true),
+            (CaptureEnd::IdleTimeout, "idle_timeout", false),
+            (CaptureEnd::TransportError, "transport_error", false),
+            (CaptureEnd::MalformedInput, "malformed_input", false),
+            (CaptureEnd::CaptureBudget, "capture_budget", false),
+            (CaptureEnd::PeerAborted, "peer_aborted", false),
+        ];
+        for (end, label, session_complete) in all {
+            let m = upload_metadata("ssh", &sample(8), 8, UploadEnd::Session(end));
+            assert_eq!(m["end_reason"], label, "{end:?}");
+            assert_eq!(m["complete"], session_complete, "{end:?}");
+            let m = upload_metadata("ssh", &sample(8), 8, UploadEnd::TransferCut(end));
+            assert_eq!(m["end_reason"], label, "{end:?}");
+            assert_eq!(
+                m["complete"], false,
+                "a cut transfer is a fragment: {end:?}"
+            );
+        }
+        let m = upload_metadata("ftp", &sample(8), 8, UploadEnd::TransferComplete);
+        assert_eq!(
+            (&m["complete"], &m["end_reason"]),
+            (
+                &serde_json::json!(true),
+                &serde_json::json!("transfer_complete")
+            )
+        );
+    }
+
+    /// The non-test source of every `.rs` file under `dir`, keyed by path: everything before the
+    /// file's `#[cfg(test)] mod`, so a test fixture building an event by hand is not counted.
+    fn production_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            if path.is_dir() {
+                production_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let live = text
+                    .find("\n#[cfg(test)]\nmod ")
+                    .map_or(text.as_str(), |cut| &text[..cut]);
+                out.push((path, live.to_string()));
+            }
+        }
+    }
+
+    /// The fleet pane read `end_reason` as "unrecorded" for most captures because only three call
+    /// sites added the key by hand. `upload_metadata` now always writes it; what is left to hold
+    /// is that every `honeypot_malware_upload` event a sensor builds gets its metadata there.
+    ///
+    /// The population is derived, not listed: every workspace crate whose production code builds
+    /// a `CaptureJob` captures bodies (this crate only defines it). In each, every construction of
+    /// an upload event must be matched by an `upload_metadata` call in the same file, and no file
+    /// may write `end_reason` itself, so a hand-rolled or hand-patched event fails here.
+    #[test]
+    fn every_body_capturing_sensor_builds_its_upload_events_through_upload_metadata() {
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let mut capturing = std::collections::BTreeSet::new();
+        let mut entries: Vec<_> = std::fs::read_dir(crates_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        for krate in entries {
+            let name = krate.file_name().unwrap().to_string_lossy().into_owned();
+            if name == "sensor-framework" {
+                continue;
+            }
+            let mut files = Vec::new();
+            production_sources(&krate.join("src"), &mut files);
+            if !files.iter().any(|(_, src)| src.contains("CaptureJob {")) {
+                continue;
+            }
+            capturing.insert(name.clone());
+            let mut built = 0;
+            for (path, src) in &files {
+                let events = src
+                    .matches("signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD")
+                    .count()
+                    + src.matches("\"honeypot_malware_upload\"").count();
+                let through_framework = src.matches("upload_metadata(").count();
+                assert_eq!(
+                    events,
+                    through_framework,
+                    "{}: {events} upload event(s) but {through_framework} upload_metadata call(s)",
+                    path.display()
+                );
+                assert!(
+                    !src.contains("\"end_reason\""),
+                    "{} writes end_reason itself; pass an UploadEnd to upload_metadata",
+                    path.display()
+                );
+                built += events;
+            }
+            assert!(
+                built > 0,
+                "{name} builds CaptureJobs but no upload event was found"
+            );
+        }
+        // Six crates capture bodies today; an empty or tiny set means the scan broke, not that
+        // the workspace stopped capturing.
+        assert!(
+            capturing.len() >= 6,
+            "body-capturing crates found: {capturing:?}"
+        );
     }
 
     /// Builds a `CaptureHandoff` wired to an `OutboxManifest` under `base_dir.join("outbox")`,

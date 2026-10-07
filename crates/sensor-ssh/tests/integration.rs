@@ -1484,7 +1484,7 @@ async fn sftp_put_attrs(
 }
 
 /// The upload event for the spooled body, proving the evidence path ran.
-async fn expect_capture_of(dir: &std::path::Path, body: &[u8]) {
+async fn expect_capture_of(dir: &std::path::Path, body: &[u8]) -> sensor_wire::SensorEvent {
     let event = poll_for_malware_upload_within(&dir.join("events.jsonl"), Duration::from_secs(8))
         .await
         .expect("the upload must still be captured");
@@ -1492,6 +1492,148 @@ async fn expect_capture_of(dir: &std::path::Path, body: &[u8]) {
     assert_eq!(stored.len(), 1, "one spooled body");
     assert_eq!(std::fs::read(&stored[0]).unwrap(), body);
     assert_eq!(event.metadata["size"], body.len() as u64);
+    event
+}
+
+// ---- how an SCP or SFTP transfer ended ----
+
+#[derive(Clone, Copy, Debug)]
+enum Transfer {
+    Scp,
+    Sftp,
+}
+
+/// How the client leaves a transfer it started but never finished.
+#[derive(Clone, Copy, Debug)]
+enum Abandon {
+    /// Stop sending and let the server's `idle_timeout` (or `max_duration`) end the session.
+    GoQuiet,
+    /// Send SSH_MSG_DISCONNECT with the transfer still open.
+    Disconnect,
+    /// Close the transfer's channel, leaving the session itself up.
+    CloseChannel,
+}
+
+const UNFINISHED_BODY: &[u8] = b"\x7fELF-first-forty-bytes-of-a-100-byte-f";
+
+/// Start a `kind` upload declaring 100 bytes, send 40, and leave it by `abandon`. The same bytes
+/// every time, so a difference in the recorded end can only come from how the transfer was left.
+async fn unfinished_transfer(
+    kind: Transfer,
+    bounds: ConnectionBounds,
+    abandon: Abandon,
+) -> sensor_wire::SensorEvent {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        bounds,
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+    let session = login(addr).await;
+    let mut channel = session.channel_open_session().await.unwrap();
+    match kind {
+        Transfer::Scp => {
+            channel
+                .exec(false, &b"scp -t /tmp/drop.bin"[..])
+                .await
+                .unwrap();
+            assert_eq!(read_at_least(&mut channel, 1).await, [0], "ready ack");
+            channel.data(&b"C0644 100 drop.bin\n"[..]).await.unwrap();
+            assert_eq!(read_at_least(&mut channel, 1).await, [0], "header ack");
+            channel.data(UNFINISHED_BODY).await.unwrap();
+        }
+        Transfer::Sftp => {
+            channel.request_subsystem(false, "sftp").await.unwrap();
+            channel
+                .data(&sftp_packet(1, &[&3u32.to_be_bytes()])[..])
+                .await
+                .unwrap();
+            assert_eq!(read_sftp_packet(&mut channel).await[4], 2, "VERSION");
+            let open = sftp_packet(
+                3,
+                &[
+                    &1u32.to_be_bytes(),
+                    &sftp_string(b"/tmp/drop.bin"),
+                    &0x0au32.to_be_bytes(),
+                    &0u32.to_be_bytes(),
+                ],
+            );
+            channel.data(&open[..]).await.unwrap();
+            let reply = read_sftp_packet(&mut channel).await;
+            assert_eq!(reply[4], 102, "HANDLE");
+            let handle_len = u32::from_be_bytes(reply[9..13].try_into().unwrap()) as usize;
+            let file = reply[13..13 + handle_len].to_vec();
+            let write = sftp_packet(
+                6,
+                &[
+                    &2u32.to_be_bytes(),
+                    &sftp_string(&file),
+                    &0u64.to_be_bytes(),
+                    &sftp_string(UNFINISHED_BODY),
+                ],
+            );
+            channel.data(&write[..]).await.unwrap();
+            assert_eq!(read_sftp_packet(&mut channel).await[4], 101, "WRITE status");
+        }
+    }
+    match abandon {
+        Abandon::GoQuiet => {}
+        Abandon::Disconnect => session
+            .disconnect(russh::Disconnect::ByApplication, "", "")
+            .await
+            .unwrap(),
+        Abandon::CloseChannel => channel.close().await.unwrap(),
+    }
+    let event = expect_capture_of(dir.path(), UNFINISHED_BODY).await;
+    drop(channel);
+    drop(session);
+    handle.abort();
+    assert_eq!(event.metadata["wire_size"], UNFINISHED_BODY.len() as u64);
+    event
+}
+
+/// The owner's fleet pane showed every unfinished SCP and SFTP capture as "unrecorded": the
+/// abandon path wrote no `end_reason`. Each way a client can leave a transfer open now records
+/// what ended it, and none of them is complete - not even the two that make a shell capture whole.
+#[tokio::test]
+async fn an_unfinished_scp_or_sftp_upload_records_what_ended_it() {
+    let quick_idle = ConnectionBounds {
+        idle_timeout: Duration::from_millis(600),
+        ..test_bounds()
+    };
+    let cancelled = ConnectionBounds {
+        idle_timeout: Duration::from_secs(20),
+        max_duration: Duration::from_secs(2),
+        ..test_bounds()
+    };
+    for kind in [Transfer::Scp, Transfer::Sftp] {
+        for (bounds, abandon, reason) in [
+            (quick_idle.clone(), Abandon::GoQuiet, "idle_timeout"),
+            (cancelled.clone(), Abandon::GoQuiet, "session_cancelled"),
+            (test_bounds(), Abandon::Disconnect, "client_logout"),
+            (test_bounds(), Abandon::CloseChannel, "peer_closed"),
+        ] {
+            let event = unfinished_transfer(kind, bounds, abandon).await;
+            assert_eq!(
+                event.metadata["end_reason"], reason,
+                "{kind:?} {abandon:?}: {:?}",
+                event.metadata
+            );
+            assert_eq!(
+                event.metadata["complete"], false,
+                "{kind:?} {abandon:?} never reached its end of file: {:?}",
+                event.metadata
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1506,7 +1648,9 @@ async fn a_file_uploaded_by_scp_is_read_by_a_later_exec_and_still_captured() {
     assert_eq!(exec_stdout(&session, "cat /tmp/payload").await, body);
     let listing = String::from_utf8_lossy(&exec_stdout(&session, "ls /tmp").await).into_owned();
     assert!(listing.contains("payload"), "ls saw: {listing:?}");
-    expect_capture_of(dir.path(), body).await;
+    let event = expect_capture_of(dir.path(), body).await;
+    assert_eq!(event.metadata["end_reason"], "transfer_complete");
+    assert_eq!(event.metadata["complete"], true);
 
     drop(session);
     handle.abort();
@@ -1695,7 +1839,9 @@ async fn a_file_uploaded_by_sftp_is_read_by_a_later_exec_and_still_captured() {
         exec_stdout(&session, "cat /var/tmp/sftp_payload").await,
         body
     );
-    expect_capture_of(dir.path(), body).await;
+    let event = expect_capture_of(dir.path(), body).await;
+    assert_eq!(event.metadata["end_reason"], "transfer_complete");
+    assert_eq!(event.metadata["complete"], true);
 
     drop(session);
     handle.abort();

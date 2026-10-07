@@ -593,6 +593,99 @@ async fn a_binary_payload_whose_stream_the_client_closes_is_recorded_as_complete
     );
 }
 
+/// How a `sync:` push under test ends.
+#[derive(Clone, Copy)]
+enum PushEnding {
+    /// SEND, DATA, DONE: the push finishes.
+    Done,
+    /// SEND and DATA, then the client's CLSE on the sync stream with no DONE.
+    CloseStream,
+    /// SEND and DATA, then silence until the session ends on its own.
+    GoQuiet,
+}
+
+/// Push one body over a `sync:` stream ended by `ending` and return the upload event. Every
+/// caller pushes the same body, so a difference in the recorded end can only come from the ending.
+async fn sync_push_session(
+    bounds: ConnectionBounds,
+    ending: PushEnding,
+) -> sensor_wire::SensorEvent {
+    let srv = TestServer::start_with(bounds).await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let server_id = open_stream(&mut conn, 1, "sync:").await;
+    let body = b"\x7fELF-adb-push-7731";
+    if matches!(ending, PushEnding::Done) {
+        sync_push(&mut conn, 1, server_id, "/data/local/tmp/bot", body).await;
+    } else {
+        for message in [
+            adb_proto::build_sync_message(adb_proto::SYNC_SEND, b"/data/local/tmp/bot,33188"),
+            adb_proto::build_sync_message(adb_proto::SYNC_DATA, body),
+        ] {
+            conn.write_all(&adb_proto::build_wrte(1, server_id, &message))
+                .await
+                .unwrap();
+            let (ack, _) = read_message(&mut conn).await;
+            assert_eq!(ack.command, adb_proto::A_OKAY);
+        }
+        if matches!(ending, PushEnding::CloseStream) {
+            conn.write_all(&adb_proto::build_clse(1, server_id))
+                .await
+                .unwrap();
+        }
+    }
+    wait_for_upload_event(&srv.log_path).await;
+    let upload = srv
+        .events()
+        .await
+        .into_iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .expect("the push must be recorded however it ended");
+    drop(conn);
+    srv.handle.abort();
+    assert_eq!(upload.metadata["wire_size"], body.len() as u64);
+    upload
+}
+
+#[tokio::test]
+async fn a_finished_push_is_recorded_as_a_complete_transfer() {
+    let upload = sync_push_session(test_bounds(), PushEnding::Done).await;
+    assert_eq!(upload.metadata["end_reason"], "transfer_complete");
+    assert_eq!(upload.metadata["complete"], true);
+}
+
+/// The client closing the stream is what makes a shell capture whole; a push it closes before
+/// DONE is still a fragment, and the reason says the peer closed it.
+#[tokio::test]
+async fn a_push_whose_stream_the_client_closes_before_done_is_a_peer_closed_fragment() {
+    let upload = sync_push_session(test_bounds(), PushEnding::CloseStream).await;
+    assert_eq!(upload.metadata["end_reason"], "peer_closed");
+    assert_eq!(upload.metadata["complete"], false);
+}
+
+#[tokio::test]
+async fn a_push_abandoned_mid_transfer_is_recorded_as_cut_short_by_the_idle_timeout() {
+    let bounds = ConnectionBounds {
+        idle_timeout: Duration::from_millis(600),
+        ..test_bounds()
+    };
+    let upload = sync_push_session(bounds, PushEnding::GoQuiet).await;
+    assert_eq!(upload.metadata["end_reason"], "idle_timeout");
+    assert_eq!(upload.metadata["complete"], false);
+}
+
+#[tokio::test]
+async fn a_push_cut_off_by_max_duration_is_recorded_as_session_cancelled() {
+    let bounds = ConnectionBounds {
+        max_duration: Duration::from_secs(2),
+        idle_timeout: Duration::from_secs(20),
+        ..test_bounds()
+    };
+    let upload = sync_push_session(bounds, PushEnding::GoQuiet).await;
+    assert_eq!(upload.metadata["end_reason"], "session_cancelled");
+    assert_eq!(upload.metadata["complete"], false);
+}
+
 /// An ordinary interactive session must never be spooled: the capture triggers on the bytes
 /// looking binary, and normal typed commands do not.
 #[tokio::test]

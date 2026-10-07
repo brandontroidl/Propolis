@@ -408,6 +408,7 @@ async fn stor_upload_captured_in_spool() {
     assert_eq!(upload.metadata["truncated"], false);
     assert_eq!(upload.metadata["wire_size"], body.len() as u64);
     assert_eq!(upload.metadata["complete"], true);
+    assert_eq!(upload.metadata["end_reason"], "transfer_complete");
 
     use sha2::{Digest, Sha256};
     let expected_hash = sensor_framework::to_hex_bounded(&Sha256::digest(body), 32);
@@ -504,7 +505,7 @@ async fn capture_within_budget_is_complete_and_the_budget_returns_to_zero_after_
     assert_eq!(uploads[0].sample.as_ref().unwrap().size, body.len() as u64);
     assert_eq!(uploads[0].metadata["complete"], true);
     assert_eq!(uploads[0].metadata["truncated"], false);
-    assert!(uploads[0].metadata.get("end_reason").is_none());
+    assert_eq!(uploads[0].metadata["end_reason"], "transfer_complete");
     // 100_000 bytes held two 64 KiB chunks while buffered; the worker refunded them once spooled.
     assert_eq!(srv.budget.high_water_bytes(), 2 * CAPTURE_CHUNK_BYTES);
     assert_eq!(srv.budget.current_bytes(), 0);
@@ -684,9 +685,38 @@ async fn stor_that_stalls_mid_transfer_is_426_and_recorded_as_incomplete() {
         .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
         .expect("the fragment is still captured");
     assert_eq!(upload.metadata["complete"], false);
+    assert_eq!(upload.metadata["end_reason"], "idle_timeout");
     assert_eq!(upload.metadata["wire_size"], fragment.len() as u64);
     assert_eq!(upload.sample.as_ref().unwrap().size, fragment.len() as u64);
     srv.handle.abort();
+}
+
+/// The listener's `max_duration` drops the handler mid-STOR; only the capture's destructor runs,
+/// and it must say the session was cancelled rather than borrow an ending nothing observed.
+#[tokio::test]
+async fn stor_cut_off_by_max_duration_is_recorded_as_session_cancelled() {
+    let srv = TestServer::start_tls_with_bounds(ConnectionBounds {
+        idle_timeout: Duration::from_secs(20),
+        max_duration: Duration::from_millis(1500),
+        ..test_bounds()
+    })
+    .await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    client.login("root", "toor").await;
+    let data_addr = client.pasv().await;
+    let r = client.send("STOR /tmp/slow.bin").await;
+    assert!(r.starts_with("150"), "{r}");
+    let fragment = b"MZ-a-dropper-still-arriving";
+    let mut data = TcpStream::connect(data_addr).await.unwrap();
+    data.write_all(fragment).await.unwrap();
+
+    srv.wait_for_upload_event().await;
+    let upload = srv.uploads().await.remove(0);
+    drop(data);
+    assert_eq!(upload.metadata["complete"], false);
+    assert_eq!(upload.metadata["end_reason"], "session_cancelled");
+    assert_eq!(upload.metadata["wire_size"], fragment.len() as u64);
+    srv.stop();
 }
 
 /// LIST with no data connection sent nothing; "Directory send OK" claimed otherwise.

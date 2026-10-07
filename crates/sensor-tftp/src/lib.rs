@@ -51,6 +51,9 @@ pub struct TftpServer {
     summary_handle: JoinHandle<()>,
     sensor: Arc<Sensor>,
     flood: Arc<RequestFlood>,
+    /// The request socket's port. The summary task and the shutdown flush emit outside every
+    /// request's scope, so each enters this one itself.
+    arrival: Arrival,
 }
 
 impl TftpServer {
@@ -64,9 +67,9 @@ impl TftpServer {
     /// Emit every rate-limited summary still accumulating, due or not. Bounded by the summary
     /// table's fixed capacity; called at shutdown after [`TftpServer::abort`].
     pub async fn flush_rate_limited(&self) {
-        self.sensor
-            .emit_summaries(self.flood.ledger.drain(), self.flood.ledger.window())
-            .await;
+        let summaries = self.flood.ledger.drain();
+        let window = self.flood.ledger.window();
+        arrival::scope(self.arrival, self.sensor.emit_summaries(summaries, window)).await;
     }
 }
 
@@ -153,7 +156,10 @@ pub async fn start_test_server_with_capture_budget(
         limiter,
         flood.clone(),
     ));
-    let summary_handle = tokio::spawn(emit_due_summaries(sensor.clone(), flood.clone()));
+    let summary_handle = tokio::spawn(arrival::scope(
+        arrival,
+        emit_due_summaries(sensor.clone(), flood.clone()),
+    ));
     Ok(TftpServer {
         addr: bound,
         handoff,
@@ -161,6 +167,7 @@ pub async fn start_test_server_with_capture_budget(
         summary_handle,
         sensor,
         flood,
+        arrival,
     })
 }
 

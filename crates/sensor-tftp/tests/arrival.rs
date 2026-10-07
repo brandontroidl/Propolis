@@ -73,6 +73,10 @@ fn events(log: &Path) -> Vec<SensorEvent> {
         .collect()
 }
 
+fn rate_limited(e: &SensorEvent) -> bool {
+    e.metadata["query_status"] == "rate_limited"
+}
+
 async fn recv(sock: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     let mut buf = vec![0u8; 2048];
     let (n, from) = tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf))
@@ -94,6 +98,19 @@ async fn wait_for(log: &Path, done: impl Fn(&[SensorEvent]) -> bool) -> Vec<Sens
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     events(log)
+}
+
+/// Read probes back to back from one source: with a budget of one per second, all but the first
+/// go to the flood ledger. Each send yields so the server drains its socket as it goes.
+async fn flood(to: SocketAddr, n: u16) {
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for i in 0..n {
+        client
+            .send_to(&request(1, format!("/f{i}").as_bytes()), to)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test]
@@ -135,4 +152,43 @@ async fn probe_and_upload_events_carry_the_request_sockets_port() {
         assert_eq!(e.metadata["local_port"], addr.port(), "{e:?}");
     }
     server.abort();
+}
+
+/// The summary timer runs on its own task, outside every request's scope.
+#[tokio::test]
+async fn a_rate_limit_summary_from_the_timer_carries_the_request_sockets_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let server = start(&log, dir.path(), rate(1, Duration::from_millis(200))).await;
+    flood(server.addr, 10).await;
+
+    let seen = wait_for(&log, |seen| seen.iter().any(rate_limited)).await;
+    for e in seen.iter().filter(|e| rate_limited(e)) {
+        assert_eq!(e.protocol, "udp", "{e:?}");
+        assert_eq!(e.metadata["local_port"], server.addr.port(), "{e:?}");
+    }
+    server.abort();
+}
+
+/// The shutdown flush runs on `main`'s task, after the request loop and the timer are stopped.
+#[tokio::test]
+async fn a_summary_flushed_at_shutdown_carries_the_request_sockets_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let server = start(&log, dir.path(), rate(1, Duration::from_secs(3600))).await;
+    flood(server.addr, 10).await;
+    // The one request inside the budget is logged; the rest wait in the ledger.
+    wait_for(&log, |seen| !seen.is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.abort();
+    assert!(
+        !events(&log).iter().any(rate_limited),
+        "the window has not ended, so only the flush may write the summary"
+    );
+    server.flush_rate_limited().await;
+
+    let summaries: Vec<SensorEvent> = events(&log).into_iter().filter(rate_limited).collect();
+    assert_eq!(summaries.len(), 1, "{summaries:?}");
+    assert_eq!(summaries[0].protocol, "udp");
+    assert_eq!(summaries[0].metadata["local_port"], server.addr.port());
 }

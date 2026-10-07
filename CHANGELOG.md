@@ -4,6 +4,20 @@
 
 ### Added
 
+- **Intake lag is visible and pages** - each intake poll records how many bytes of its log are
+  unread (`LogTailer::backlog_bytes`: the file past the read offset plus any rotated-out file
+  still being drained) and the `observed_at` of the last event it appended. `/metrics` publishes
+  `propolis_intake_bytes_behind{sensor}` and `propolis_intake_oldest_unread_age_seconds{sensor}`,
+  labelled with the `PROPOLIS_SENSOR_LOGS` name; the age is 0 when the poll read every complete
+  line and absent when lines wait but nothing has been appended since start, and a process that
+  tails nothing publishes neither. A new ops-alert condition, `intake-lagging`, pages when lines
+  have waited past max(10 min, 3 intake polls) for 10 minutes, or when the unread bytes rose at
+  three consecutive monitor polls that each found complete lines waiting; it clears when the log
+  is drained, or after three polls without growth once the wait is back under the threshold, and
+  never fires on an idle log. The fleet pane shows `behind: <bytes> / <age>` under LAST EVENT on
+  the listener rows of a log over the age threshold. No append-latency histogram: `/metrics` has
+  no histogram support. See `docs/operations/health-and-observability.md` and
+  `docs/troubleshooting/intake-backlog.md`.
 - **`propolis-watch`, a read-only live view of the sensors** - new crate `watch`, binary
   `propolis-watch`. It streams every event log named in `PROPOLIS_SENSOR_LOGS` as JSON Lines on
   stdout: a `start` record with the resolved sources, one `event` record per log line (the
@@ -368,6 +382,22 @@
 
 ### Fixed
 
+- **An intake that fell behind no longer slowed down because it was behind** - the dedup read
+  every scored append makes inside the global append lock (the newest prior observation of one
+  source and signal) had no index of its own, so the planner walked `event_observed_at_idx` down
+  from the newest row until it met the source: one row per event newer than that source's last
+  sighting. A lagging intake appends old `observed_at` values, so the walk grew with the lag and
+  the lag with the walk. A telnet stream from a bot loop ran at about one event a second for days
+  and, holding the append lock that long, held up every other sensor. Migration `0013` adds
+  `event_dedup_idx (source_ip, signal_type, observed_at)`, and the read passes the address through
+  a scalar subquery so the planner costs a hot source like any other: with the index alone it
+  still chose the walk for the two hottest sources of a test ledger. On a 7.5M-row ledger with
+  telnet 11 days behind the read went from 840 to 1060 ms to about 0.13 ms for those sources,
+  and the lagged append of a 100k-row source from 1.7 s to 0.69 s, its cost when caught up; the
+  rest is the per-event history aggregates, which are still to be made incremental. The index is
+  built inside the migration transaction at startup, before intake runs: 12 to 20 s for that
+  ledger held in RAM, longer on disk. Plan guards hold the read to the index on a ledger shaped
+  like the incident.
 - **A command's standard input reaches it, and is captured** - an SSH exec ran at the request
   and closed the channel, so the payload a bot streamed after `cat > astats` or `cat > w.sh`
   hit a closed channel: the file stayed empty, nothing was captured, and the bot retried and

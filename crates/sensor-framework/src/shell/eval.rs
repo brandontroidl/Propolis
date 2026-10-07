@@ -794,6 +794,7 @@ impl FakeShell {
             .take()
             .map(|stdin| std::mem::replace(&mut self.stdin, stdin));
         let outer_mark = std::mem::replace(&mut self.input_mark, self.stdin.session_pos());
+        let outer_typed = std::mem::take(&mut self.typed_output);
         let result = match command {
             Command::Subshell { body, .. } => self.eval_subshell(body),
             Command::Brace { body, .. } => self.eval_list(body),
@@ -815,8 +816,10 @@ impl FakeShell {
         if let Some(previous) = saved {
             self.stdin = previous;
         }
-        let routed = self.route(result, &plan, "sh");
+        let typed = std::mem::replace(&mut self.typed_output, outer_typed);
+        let routed = self.route(result, &plan, "sh", typed);
         self.input_mark = outer_mark;
+        self.pass_typed_output(typed, &plan);
         routed
     }
 
@@ -1004,7 +1007,9 @@ impl FakeShell {
             .map(|stdin| std::mem::replace(&mut self.stdin, stdin));
         let outer_mark = std::mem::replace(&mut self.input_mark, self.stdin.session_pos());
         let was_blocked = self.stdin.is_blocked();
+        let outer_typed = std::mem::take(&mut self.typed_output);
         let mut result = self.dispatch(&refs);
+        let typed = std::mem::replace(&mut self.typed_output, outer_typed);
         // A command whose input was cut off (Ctrl-C, a closed channel) dies at the read it was
         // waiting in, and the signal ends the rest of the line with it.
         if !was_blocked
@@ -1036,9 +1041,18 @@ impl FakeShell {
         let writer = refs.first().map_or("sh", |arg| command_basename(arg));
         // Routed before the mark goes back, so a file this command's output lands in is known to
         // hold what it read from the session input.
-        let routed = self.route(result, &plan, writer);
+        let routed = self.route(result, &plan, writer, typed);
         self.input_mark = outer_mark;
+        self.pass_typed_output(typed, &plan);
         routed
+    }
+
+    /// Typed bytes a command wrote to a standard output that stays the enclosing command's (a
+    /// group `{ echo ...; } > f`) are that command's typed output too.
+    fn pass_typed_output(&mut self, typed: bool, plan: &RedirPlan) {
+        if typed && matches!(plan.sink(1), Sink::Terminal(OutputFd::Stdout)) {
+            self.typed_output = true;
+        }
     }
 
     /// What an expansion that failed leaves: its own message and status 1, or, for a refusal by
@@ -1254,8 +1268,15 @@ impl FakeShell {
     }
 
     /// Send what a command wrote where its redirections point. Streams the redirections did not
-    /// move stay on the terminal.
-    fn route(&mut self, result: CommandResult, plan: &RedirPlan, writer: &str) -> CommandResult {
+    /// move stay on the terminal. `typed` says the command's output carries bytes the attacker
+    /// typed (`echo`, `printf`), so a file it lands in is noted as assembled from them.
+    fn route(
+        &mut self,
+        result: CommandResult,
+        plan: &RedirPlan,
+        writer: &str,
+        typed: bool,
+    ) -> CommandResult {
         if !plan.active {
             return result;
         }
@@ -1291,9 +1312,17 @@ impl FakeShell {
             } else {
                 Vec::new()
             };
+            let prior = content.len();
             content.extend_from_slice(&bytes);
-            if let Err(error) = self.traced_write_file(&path, &content) {
-                write_refusal = write_refusal.or_else(|| super::budget_refusal_text(&error));
+            match self.traced_write_file(&path, &content) {
+                Ok(()) if typed => {
+                    let (before, _) = content.split_at(prior.min(content.len()));
+                    self.note_typed_write(&path, before, &content);
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    write_refusal = write_refusal.or_else(|| super::budget_refusal_text(&error));
+                }
             }
         }
 

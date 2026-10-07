@@ -385,6 +385,7 @@ impl FakeShell {
             }
         }
         let status = printer.status;
+        self.note_typed_output(&printer.text);
         let mut result = CommandResult::stdout(printer.text);
         result.append(CommandResult::stderr(status, printer.err));
         result.status = status;

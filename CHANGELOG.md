@@ -4,6 +4,24 @@
 
 ### Added
 
+- **Echo-loader uploads are reassembled and captured** - a Mirai/Mozi telnet loader with no
+  usable `wget` uploads its downloader as some forty `busybox echo -ne '\xNN...' >> .i` lines,
+  runs `chmod 777 .i` and `./.i a b c d port`. Each line was logged but the file was never
+  captured, and the loader retried the whole session every few minutes. The shared shell (SSH,
+  telnet, ADB) now notes every file built from `echo`/`printf` output, chunk by chunk, and
+  captures it as one `honeypot_malware_upload` with `capture_reason` `echo_loader`,
+  `chunk_count` and `destination`, once the line that makes it executable or runs it has run, or
+  at the session's end for an assembly of two or more chunks never run. It goes through the
+  per-session stdin capture set (`StdinCaptures::record_assembled`; sensors pass it with
+  `FakeShell::with_captures` and report the ending with `StdinCaptures::end_session`), so one body
+  is one sample per session and the memory budget applies; a file is recognized by content, so
+  the loader's `cp /bin/ls .j && cat .i>.j && rm .i && cp .j .i` fallback is the same sample.
+  Each chunk's command event carries `assembled_file` and `chunk_index`. Running an assembled ELF
+  that holds a `GET <path> HTTP/1.x` request line with four octets and a port as arguments
+  executes nothing, answers as a downloader that cannot reach its server (no output, status 1),
+  and emits the stage-2 URL as a `honeypot_file_download` with `derived_from` `echo_loader_args`
+  and `derived_sha256`, which the review fetcher vets like any URL; the sensor makes no
+  connection. Additive metadata: no migration or wire version change.
 - **`propolis-watch`, a read-only live view of the sensors** - new crate `watch`, binary
   `propolis-watch`. It streams every event log named in `PROPOLIS_SENSOR_LOGS` as JSON Lines on
   stdout: a `start` record with the resolved sources, one `event` record per log line (the

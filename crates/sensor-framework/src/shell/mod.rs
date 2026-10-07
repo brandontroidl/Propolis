@@ -50,6 +50,7 @@ use crate::binaries;
 use crate::budget::{ConnectionBudget, Resource};
 use crate::command_codec::CommandCodec;
 use crate::fakefs::{Blob, FakeFs, FsCheckpoint, FsError, READ_CAP};
+use crate::held_input::StdinCaptures;
 use crate::persona;
 use crate::sanitize_value;
 
@@ -70,6 +71,7 @@ mod fsops;
 mod hashing;
 mod hostinfo;
 mod lex;
+mod loader;
 mod lookup;
 mod multicall;
 mod nameinfo;
@@ -393,6 +395,18 @@ pub struct FakeShell {
     input_mark: Option<usize>,
     /// The files written by commands that read the session input, in the order first written.
     input_sinks: Vec<String>,
+    /// Where files assembled from typed bytes are captured; `None` for a shell no sensor wired
+    /// to a capture hand-off.
+    captures: Option<StdinCaptures>,
+    /// Files this session built from `echo`/`printf` output, by path, as their last chunk left
+    /// them.
+    assembled: std::collections::BTreeMap<String, loader::Assembled>,
+    /// The command running right now wrote bytes the attacker typed (`echo`, `printf`).
+    typed_output: bool,
+    /// What the current line found for the assembled-file capture, acted on once it has run.
+    loader_line: loader::LineLoader,
+    /// The current line as typed, sanitized and capped like `metadata.command`.
+    line_command: String,
 }
 
 /// A line waiting for its input.
@@ -567,6 +581,11 @@ impl FakeShell {
             input_interrupt: None,
             input_mark: None,
             input_sinks: Vec::new(),
+            captures: None,
+            assembled: std::collections::BTreeMap::new(),
+            typed_output: false,
+            loader_line: loader::LineLoader::default(),
+            line_command: String::new(),
         };
         shell.install_processes();
         shell
@@ -617,6 +636,11 @@ impl FakeShell {
                 input_interrupt: self.input_interrupt,
                 input_mark: self.input_mark,
                 input_sinks: self.input_sinks.clone(),
+                captures: self.captures.clone(),
+                assembled: self.assembled.clone(),
+                typed_output: self.typed_output,
+                loader_line: self.loader_line.clone(),
+                line_command: self.line_command.clone(),
             }),
         }
     }
@@ -803,6 +827,7 @@ impl FakeShell {
         };
         let output = self.run_input(&decoded);
         self.end_input(&mut events, true);
+        self.flush_loader(&mut events);
         (output, events)
     }
 
@@ -832,10 +857,13 @@ impl FakeShell {
         if !self.stdin.is_blocked() {
             self.stdin = Stdin::Terminal;
             self.end_input(&mut events, true);
+            self.flush_loader(&mut events);
             return (LineStep::Ran(output), events);
         }
-        // The run that found the wait is undone, but what it decided still describes the line.
+        // The run that found the wait is undone, but what it decided still describes the line,
+        // and a stage-2 URL it derived goes out with the line's other events now, as they do.
         let trace = std::mem::take(&mut self.trace);
+        let derived = std::mem::take(&mut self.loader_line.urls);
         self.rollback(saved);
         self.trace = trace;
         self.held = Some(HeldLine {
@@ -843,6 +871,8 @@ impl FakeShell {
             command: sanitize_value(&raw, MAX_COMMAND_LEN),
         });
         self.end_input(&mut events, false);
+        self.loader_line.urls = derived;
+        self.flush_loader(&mut events);
         (LineStep::AwaitingInput, events)
     }
 
@@ -864,6 +894,7 @@ impl FakeShell {
             return CommandResult::silent(0);
         };
         self.begin_line();
+        self.line_command = held.command.clone();
         self.trace = LineTrace {
             decoded: held.decoded.clone(),
             ..LineTrace::default()
@@ -880,6 +911,9 @@ impl FakeShell {
         let interrupted = self.stdin.is_blocked();
         self.input_interrupt = None;
         self.stdin = Stdin::Terminal;
+        // The line's events, a derived URL among them, went out when it was held.
+        self.loader_line.urls.clear();
+        self.flush_loader(&mut Vec::new());
         tracing::debug!(target: "propolis::shell::trace", trace = ?self.trace, "shell line");
         // Killed by Ctrl-C, the job leaves the cursor after the `^C` the terminal echoed; an
         // interactive shell moves to a fresh line before its prompt.
@@ -917,6 +951,7 @@ impl FakeShell {
     fn begin_input(&mut self, line: &[u8]) -> Option<(String, Vec<SensorEvent>)> {
         let raw = String::from_utf8_lossy(line);
         self.begin_line();
+        self.line_command = sanitize_value(&raw, MAX_COMMAND_LEN);
         if raw.trim().is_empty() {
             if self.pending.is_empty() {
                 return None;
@@ -1105,6 +1140,8 @@ impl FakeShell {
         self.script_depth = 0;
         self.loop_depth = 0;
         self.busybox_depth = 0;
+        self.typed_output = false;
+        self.loader_line = loader::LineLoader::default();
     }
 
     /// Run one decoded input as a shell reads it, one physical line at a time: each line joins
@@ -1235,7 +1272,9 @@ impl FakeShell {
     }
 
     fn builtin_echo(&mut self, parts: &[&str]) -> CommandResult {
-        CommandResult::stdout(cmd_echo(self.echo_dialect(), &parts[1..]))
+        let out = cmd_echo(self.echo_dialect(), &parts[1..]);
+        self.note_typed_output(&out);
+        CommandResult::stdout(out)
     }
 
     /// Which `echo` is running: the busybox applet while one runs, otherwise the active shell
@@ -1340,6 +1379,8 @@ impl FakeShell {
             for target in args {
                 let path = self.resolve_logical(target);
                 self.traced_mark_executable(&path);
+                // An echo loader marks its assembled file executable once the last chunk is in.
+                self.loader_trigger(&path);
             }
         }
         CommandResult::silent(0)
@@ -1368,6 +1409,10 @@ impl FakeShell {
     fn invoke_path(&mut self, parts: &[&str]) -> CommandResult {
         let path = self.resolve_logical(parts[0]);
         if self.fs.is_executable(&path) {
+            if self.loader_exec(parts, &path) {
+                // A downloader that cannot reach its server: see `loader_exec`.
+                return CommandResult::silent(1);
+            }
             self.run_saved_executable(parts, &path)
         } else if self.fs.file_exists(&path) {
             CommandResult::stderr(

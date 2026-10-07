@@ -301,6 +301,25 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `honeypot_file_download` is emitted per distinct url, so a Mirai
   `(tftp ... || busybox tftp ...) > t` fallback chain yields one event
   (`download_targets`, `simple_commands`).
+- Echo-loader reassembly (`crates/sensor-framework/src/shell/loader.rs`). A Mirai or Mozi loader
+  with no usable `wget` uploads a small downloader as `busybox echo -ne '\xNN...' > .i`, then
+  `>> .i` per chunk, makes it executable (`chmod 777 .i`, or `cp /bin/ls .j && cat .i>.j && rm .i
+  && cp .j .i` where that fails) and runs `./.i a b c d port`. Every step answers as on the
+  reference box: the escapes write exact bytes, the writable-directory probe
+  (`>/var/run/.x&&cd /var/run;...;>/var/.x&&cd /var`) succeeds for every directory and ends in
+  `/var`, `busybox wget` prints its usage, `busybox cat /bin/ls|head -n 1` and `busybox hexdump -e
+  '16/1 "%c"' -n 52 /bin/ls` print the recorded x86-64 header bytes, and a missing `./Runn` gets
+  the active shell's not-found reply. The file the chunks built is captured as one
+  `echo_loader` sample when it is made executable or run, or when the session ends if never run,
+  and each chunk's command event names it; see
+  [events-and-signals.md](events-and-signals.md#echo-loader-captures-and-their-keys). Running the
+  assembled file executes nothing. When it is an ELF that holds an HTTP request line and its
+  arguments are four octets and a port, the shell answers as that downloader does when its server
+  cannot be reached: no output and status 1 [inferred: the exact status of the observed sample],
+  since this box connects nowhere and so never gets the stage 2 the loader looks for next; any
+  other session-made file runs as an empty program (status 0). The stage-2 URL it would have
+  requested is emitted as a `honeypot_file_download` marked `derived_from: echo_loader_args`, for
+  the vetted fetcher only ([attack-surfaces.md](../security/attack-surfaces.md#malware-fetcher-attacker-directed-outbound)).
 
 ### Command de-obfuscation
 

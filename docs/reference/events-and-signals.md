@@ -124,6 +124,7 @@ What each sensor writes:
 | mqtt PUBLISH | `transfer_complete` (the packet is read whole) | only `capture_memory_budget` |
 | ssh, telnet, adb binary shell payload | `peer_closed`, `client_logout` | `idle_timeout`, `transport_error`, `malformed_input` (ssh, adb), `capture_budget` (telnet, adb), `session_cancelled` |
 | ssh, telnet, adb standard input of a command (`exec_stdin`, `shell_stdin`) | `transfer_complete` (the SSH channel's EOF, Ctrl-D at the start of a terminal line) | `peer_aborted` (Ctrl-C), `capture_budget` (the input reached `max_captured_bytes`), `peer_closed` (the channel or ADB stream closed before end of input), `client_logout`, `idle_timeout`, `transport_error`, `malformed_input`, `session_cancelled` |
+| ssh, telnet, adb file assembled from `echo`/`printf` chunks (`echo_loader`) | `transfer_complete` (the file was made executable or run); for one never run, taken when the session ends, `peer_closed` or `client_logout` | the session's other endings, for a file never run: `idle_timeout`, `transport_error`, `malformed_input`, `capture_budget`, `session_cancelled` |
 
 Any of them can instead read `capture_memory_budget`. Events stored before `end_reason` was
 written for every capture (shell captures carried it earlier, the transfers did not) have no
@@ -156,6 +157,48 @@ rows carry three more keys:
 
 A session holds at most 16 distinct bodies (`crates/sensor-framework/src/held_input.rs#MAX_HELD_CAPTURES`);
 a further distinct one is submitted at once with `repeat_count` 1.
+
+#### Echo-loader captures and their keys
+
+A file the shell built from the output of `echo` or `printf` redirected into it (an echo loader's
+`busybox echo -ne '\xNN...' > .i`, then `>> .i` per chunk) is captured with `capture_reason`
+`echo_loader` through the same per-session set (`crates/sensor-framework/src/shell/loader.rs`,
+`crates/sensor-framework/src/held_input.rs#CAPTURE_REASON_ECHO_LOADER`). An assembly starts with a
+write to an empty file and grows by appends to the content its last chunk left; appending to any
+other file starts none. It is submitted once the line that makes it executable (`chmod`) or runs
+it has run, at most once per distinct SHA-256 per session, a body already captured as standard
+input included. A file is recognized by content, so a copy of the assembly made under another
+name (the loader's `cp /bin/ls .j && cat .i>.j && rm .i && cp .j .i` fallback) is the same
+sample. An assembly of two or more chunks that was never made executable or run is taken when the
+session ends, if it still holds what its last chunk left
+(`crates/sensor-framework/src/held_input.rs#MIN_UNRUN_CHUNKS`); a one-chunk `echo x > f` is not.
+The row carries `command` (the line that wrote the last chunk), `destination` (the file's path,
+`orig_name` its last component), `repeat_count` 1, and:
+
+| key | type | meaning |
+|---|---|---|
+| `chunk_count` | integer | how many `echo`/`printf` writes built the file |
+
+The command event of every line that wrote a chunk carries two keys that link it to the capture
+(same `session_id`, `assembled_file` equal to the capture's `destination`), so the chunks can be
+read as one upload:
+
+| key | type | meaning |
+|---|---|---|
+| `assembled_file` | string | the file the line wrote a chunk of, sanitized and capped at 512 characters |
+| `chunk_index` | integer | that chunk's number, 1 for the write that started the file |
+
+Running an assembled ELF as `PROG a b c d port` (four decimal octets and a port), when its bytes
+hold a `GET <path> HTTP/1.x` request line, emits a `honeypot_file_download` whose `url` is
+`http://a.b.c.d:port<path>`, the stage-2 URL the downloader would request, with two more keys:
+
+| key | type | meaning |
+|---|---|---|
+| `derived_from` | string | `echo_loader_args`: the URL was read off the downloader's arguments and request line, not typed |
+| `derived_sha256` | string | the SHA-256 of the downloader it came from, the `sha256` of its `echo_loader` capture |
+
+The event counts against the connection's download allowance like any other
+(`crates/sensor-framework/src/shell/loader.rs#FakeShell::flush_loader`).
 
 ### Arrival metadata key
 

@@ -2207,6 +2207,47 @@ async fn login_page_has_no_sign_out_link(pool: PgPool) {
 
 // --- detail ---
 
+/// A catch-all probe's evidence row names the port it landed on, read from the `local_port` the
+/// sensor framework stamps. The catch-all binds many ports, so without it every probe row reads
+/// the same `-`.
+#[sqlx::test(migrations = false)]
+async fn detail_shows_the_port_a_catchall_probe_arrived_on(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        EventInput::from_signal(
+            "203.0.113.61".parse().unwrap(),
+            None,
+            "catchall".into(),
+            SignalType::CatchallProbe,
+            Protocol::Tcp,
+            false,
+            chrono::Utc::now(),
+            serde_json::json!({ "payload_hex": "", "observed_len": 0, "local_port": 2323 }),
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let body = body_text(
+        test_app(state)
+            .oneshot(get_request(
+                "/ip/203.0.113.61",
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        body.contains("port 2323"),
+        "the probe row must name its arrival port: {body}"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn detail_shows_events_for_seeded_ip(pool: PgPool) {
     migrate(&pool).await;

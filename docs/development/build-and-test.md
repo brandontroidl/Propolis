@@ -86,8 +86,8 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 3180 test functions** (2025 unit + 1155 integration).
-- **DB-backed (`sqlx::test`): 211** - console 162, core-scoring 28, intake 7,
+- **Total: 3181 test functions** (2025 unit + 1156 integration).
+- **DB-backed (`sqlx::test`): 212** - console 163, core-scoring 28, intake 7,
   propolis 7, fleet 6, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
@@ -117,7 +117,7 @@ Per-crate breakdown:
 | Crate | Unit | Integration | Integration files |
 |---|---|---|---|
 | collector-wire | 9 | 0 | - |
-| console | 127 | 186 | auth_test, routes_test, samples_transport_test, server_test |
+| console | 127 | 187 | auth_test, routes_test, samples_transport_test, server_test |
 | core-scoring | 67 | 29 | coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 36 | 58 | builder_test, exclusion_test, export_test, publisher_test |
 | fleet | 23 | 32 | deploy_inventory_test, probe_test, store_test |
@@ -143,7 +143,7 @@ Per-crate breakdown:
 | sensor-tftp | 36 | 41 | arrival, env_strict, integration, shutdown |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **2025** | **1155** | |
+| **Total** | **2025** | **1156** | |
 
 ### Test styles by layer
 
@@ -153,7 +153,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (28 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (180 uses) - needed wherever a test needs more than
+  applies migrations manually (181 uses) - needed wherever a test needs more than
   one migration history in one database, or a history that keeps its own
   bookkeeping table (review, fleet). A bare
   `#[sqlx::test]` (3 uses, the console's `/ready` tests) also gets an empty

@@ -1129,8 +1129,11 @@ pub(crate) fn extract_detail(signal_type: &str, metadata: &serde_json::Value) ->
             .and_then(|v| v.as_str())
             .unwrap_or("-")
             .to_string(),
+        // `local_port` is the arrival port the sensor framework stamps on every event
+        // (`sensor_framework::arrival`); the catch-all binds many ports, so it is what tells
+        // its probes apart. No sensor has ever written a `port` key.
         "catchall_probe" => metadata
-            .get("port")
+            .get("local_port")
             .and_then(|v| v.as_u64())
             .map(|p| format!("port {p}"))
             .unwrap_or_else(|| "-".into()),
@@ -1392,9 +1395,12 @@ mod tests {
     }
 
     #[test]
-    fn extract_detail_catchall_probe_reads_port() {
-        let metadata = json!({ "port": 8080 });
+    fn extract_detail_catchall_probe_reads_the_stamped_local_port() {
+        let metadata = json!({ "payload_hex": "", "observed_len": 0, "local_port": 8080 });
         assert_eq!(extract_detail("catchall_probe", &metadata), "port 8080");
+        // `port` is not a key any sensor writes; reading it would be a second key for one fact.
+        let stray = json!({ "payload_hex": "", "observed_len": 0, "port": 8080 });
+        assert_eq!(extract_detail("catchall_probe", &stray), "-");
     }
 
     #[test]
@@ -1558,7 +1564,12 @@ mod tests {
 
     #[test]
     fn group_into_sessions_with_no_sessions_returns_empty_groups() {
-        let rows = vec![event_row(None, "catchall_probe", 5, json!({ "port": 22 }))];
+        let rows = vec![event_row(
+            None,
+            "catchall_probe",
+            5,
+            json!({ "local_port": 22 }),
+        )];
         let (groups, ungrouped) = group_into_sessions(rows, 3);
         assert!(groups.is_empty());
         assert_eq!(ungrouped.len(), 1);

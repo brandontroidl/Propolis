@@ -339,6 +339,9 @@
 
 ### Fixed
 
+- **The IP detail page shows a catch-all probe's port** - the evidence row read
+  `metadata.port`, which no sensor has ever written, so every catch-all probe showed `-`. It now
+  reads the stamped `metadata.local_port`.
 - **The fleet pane counts each listener, not each sensor** - LAST EVENT and 24H are per listener
   row, but the query grouped by sensor, so every port of a sensor showed the sensor's total (two
   Redis ports with the same count, HTTP 80 and 443 alike, every catch-all row identical). Activity

@@ -1270,6 +1270,12 @@ impl FakeShell {
     }
 
     fn builtin_wget(&mut self, parts: &[&str]) -> CommandResult {
+        // The applet's option string requires at least one URL (`-1`), and without one it prints
+        // its usage and exits 1. Loaders run a bare `busybox wget` to learn whether the applet
+        // is there, so this is the reply they read.
+        if self.busybox_depth > 0 && fetch_url_arg("wget", &parts[1..]).is_none() {
+            return CommandResult::stderr(1, busybox::wget_usage());
+        }
         let writes_stdout = matches!(wget_output(parts), WgetOutput::Stdout);
         let out = cmd_wget(parts, (self.clock)());
         let refused = self.save_fetched_file("wget", parts);
@@ -1374,11 +1380,12 @@ impl FakeShell {
                 self.shell_error(format_args!("{}: Is a directory", parts[0])),
             )
         } else {
-            // mksh says only "not found" for a path it cannot execute.
+            // mksh says only "not found" for a path it cannot execute, and so does dash: its
+            // `errmsg` words ENOENT from an exec as "not found" (`sh: 1: ./Runn: not found`).
             CommandResult::stderr(
                 127,
                 match self.active_level() {
-                    ShellLevel::AndroidMksh => self.not_found(parts[0]),
+                    ShellLevel::AndroidMksh | ShellLevel::Dash { .. } => self.not_found(parts[0]),
                     _ => self.shell_error(format_args!("{}: No such file or directory", parts[0])),
                 },
             )
@@ -2896,9 +2903,10 @@ fn first_non_flag_arg<'a>(args: &[&'a str]) -> Option<&'a str> {
 /// The dialect is the `echo` actually running. Ubuntu's dash is captured in the 2026-09-29 ground
 /// truth ("dash echo", "dash echo -e"): it decodes escapes always, `-e` is an ordinary operand and
 /// `\xHH` is not an escape. The Android mksh has no capture, so it keeps the bash rules
-/// ([unverified]). Escapes above 0x7f leave as the char with that code point rather than the raw
-/// byte until words and output carry bytes.
-fn cmd_echo(dialect: EchoDialect, args: &[&str]) -> String {
+/// ([unverified]). An escape writes the one byte it names, 0x80 to 0xff included: an echo loader
+/// assembles an ELF from `\xNN` chunks, and an escape that came out as the UTF-8 encoding of the
+/// code point wrote a different file from the one the attacker sent.
+fn cmd_echo(dialect: EchoDialect, args: &[&str]) -> Vec<u8> {
     if dialect == EchoDialect::Dash {
         return dash_echo(args);
     }
@@ -2926,10 +2934,10 @@ fn cmd_echo(dialect: EchoDialect, args: &[&str]) -> String {
         first_operand = idx + 1;
     }
 
-    let mut out = String::new();
+    let mut out = Vec::new();
     for (idx, tok) in args[first_operand..].iter().enumerate() {
         if idx > 0 {
-            out.push(' ');
+            out.push(b' ');
         }
         if interpret {
             if decode_echo_escapes_into(tok, &mut out, false) {
@@ -2937,11 +2945,11 @@ fn cmd_echo(dialect: EchoDialect, args: &[&str]) -> String {
                 return out;
             }
         } else {
-            out.push_str(tok);
+            out.extend_from_slice(tok.as_bytes());
         }
     }
     if trailing_newline {
-        out.push('\n');
+        out.push(b'\n');
     }
     out
 }
@@ -2957,22 +2965,22 @@ enum EchoDialect {
 
 /// dash's `echo`: only a first operand that is exactly `-n` is an option, and every operand is
 /// decoded as escapes with no `-e`.
-fn dash_echo(args: &[&str]) -> String {
+fn dash_echo(args: &[&str]) -> Vec<u8> {
     let (trailing_newline, operands) = match args.split_first() {
         Some((&"-n", rest)) => (false, rest),
         _ => (true, args),
     };
-    let mut out = String::new();
+    let mut out = Vec::new();
     for (idx, tok) in operands.iter().enumerate() {
         if idx > 0 {
-            out.push(' ');
+            out.push(b' ');
         }
         if decode_echo_escapes_into(tok, &mut out, true) {
             return out;
         }
     }
     if trailing_newline {
-        out.push('\n');
+        out.push(b'\n');
     }
     out
 }
@@ -2981,23 +2989,24 @@ fn dash_echo(args: &[&str]) -> String {
 /// `\c` escape was hit, which tells the caller to stop producing output entirely. Supports the
 /// escapes real-world loaders actually use: `\xHH` hex, `\0NNN`/`\NNN` octal, and the single-letter
 /// set (`\n \t \r \\ \a \b \f \v \0`). `dash` selects dash's set: bare `\NNN` octal is decoded and
-/// `\xHH` is not.
-fn decode_echo_escapes_into(s: &str, out: &mut String, dash: bool) -> bool {
+/// `\xHH` is not. An escape appends the byte it names; any other character appends its UTF-8.
+fn decode_echo_escapes_into(s: &str, out: &mut Vec<u8>, dash: bool) -> bool {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
-            out.push(c);
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             continue;
         }
         match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('a') => out.push('\x07'),
-            Some('b') => out.push('\x08'),
-            Some('f') => out.push('\x0c'),
-            Some('v') => out.push('\x0b'),
-            Some('\\') => out.push('\\'),
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('r') => out.push(b'\r'),
+            Some('a') => out.push(0x07),
+            Some('b') => out.push(0x08),
+            Some('f') => out.push(0x0c),
+            Some('v') => out.push(0x0b),
+            Some('\\') => out.push(b'\\'),
             Some('c') => return true, // stop all further output
             Some(first @ '1'..='7') if dash => {
                 // dash reads `\NNN` as octal (bash needs the leading 0): up to three digits,
@@ -3014,9 +3023,7 @@ fn decode_echo_escapes_into(s: &str, out: &mut String, dash: bool) -> bool {
                         None => break,
                     }
                 }
-                if let Some(ch) = char::from_u32(val & 0xff) {
-                    out.push(ch);
-                }
+                out.push(low_byte(val));
             }
             Some('x') if !dash => {
                 // Up to two hex digits.
@@ -3033,9 +3040,9 @@ fn decode_echo_escapes_into(s: &str, out: &mut String, dash: bool) -> bool {
                     }
                 }
                 if n == 0 {
-                    out.push_str("\\x"); // not a valid escape: emit literally
-                } else if let Some(ch) = char::from_u32(val) {
-                    out.push(ch);
+                    out.extend_from_slice(b"\\x"); // not a valid escape: emit literally
+                } else {
+                    out.push(low_byte(val));
                 }
             }
             Some('0') => {
@@ -3052,19 +3059,23 @@ fn decode_echo_escapes_into(s: &str, out: &mut String, dash: bool) -> bool {
                         None => break,
                     }
                 }
-                if let Some(ch) = char::from_u32(val) {
-                    out.push(ch);
-                }
+                // `\0777` is past a byte; the shells keep its low eight bits.
+                out.push(low_byte(val));
             }
             Some(other) => {
                 // Unknown escape: bash echo -e emits it verbatim (backslash included).
-                out.push('\\');
-                out.push(other);
+                out.push(b'\\');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
             }
-            None => out.push('\\'), // trailing backslash
+            None => out.push(b'\\'), // trailing backslash
         }
     }
     false
+}
+
+fn low_byte(value: u32) -> u8 {
+    u8::try_from(value & 0xff).unwrap_or(0)
 }
 
 // Declared with the test modules, after all production code: `trace_type_never_feeds_wire_output`

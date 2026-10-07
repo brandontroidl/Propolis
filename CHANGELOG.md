@@ -368,6 +368,14 @@
 
 ### Fixed
 
+- **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
+  0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
+  echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks
+  left a file that was not the one it sent. Both now produce one raw byte per escape, and an
+  octal escape past 0xff keeps its low eight bits. `busybox wget` with no URL prints BusyBox
+  1.30.1's wget usage on stderr and exits 1 (it printed a download transcript for an empty URL),
+  and dash answers a path that does not exist with `sh: N: ./x: not found`, as its `errmsg`
+  does, instead of bash's `No such file or directory`.
 - **A command's standard input reaches it, and is captured** - an SSH exec ran at the request
   and closed the channel, so the payload a bot streamed after `cat > astats` or `cat > w.sh`
   hit a closed channel: the file stayed empty, nothing was captured, and the bot retried and

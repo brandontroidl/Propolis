@@ -253,7 +253,9 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   need binary operands.
 - Implemented commands (`dispatch`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::dispatch`): `uname` (real per-flag field
   selection), `id`/`whoami`/`pwd`, `echo` (Gafgyt/BASHLITE `\xHH`-decoding
-  handshake returning `GAYFGT`, `crates/sensor-framework/src/shell/mod.rs#cmd_echo`, `crates/sensor-framework/src/shell/mod.rs#decode_echo_escapes_into`), `cat` (fakefs plus a special
+  handshake returning `GAYFGT`; every `\xHH` and octal escape, `echo` and `printf` alike, writes
+  the one byte it names, 0x80 to 0xff included, so a chunk redirected with `>` or `>>` puts the
+  attacker's exact bytes in the file, `crates/sensor-framework/src/shell/mod.rs#cmd_echo`, `crates/sensor-framework/src/shell/mod.rs#decode_echo_escapes_into`), `cat` (fakefs plus a special
   `/proc/self/cmdline` returning argv, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_cat`), `head` (`-n`/`-c` over a file or a pipe,
   `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_head`), `more` (copies its input through: the pty pager needs a
   terminal-rows model the shell does not have, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_more`) and `hexdump` (only `-e '16/1 "%c"'` with `-n`;
@@ -270,7 +272,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   so a size or mode cannot disagree with `stat`, `wc -c` or `md5sum`, `crates/sensor-framework/src/shell/fileinfo.rs#FakeShell::cmd_ls`),
   `cp`/`rm`/`mkdir` (they change the session's filesystem and report the real errors),
   `wget`/`curl` (canned transcripts, `-O-`/`-qO-` writes body to stdout, a saved
-  download becomes a file), `ping` (canned replies), `sh`/`bash`/`ash`
+  download becomes a file; `busybox wget` with no URL prints BusyBox 1.30.1's wget usage on
+  stderr and exits 1, `crates/sensor-framework/src/shell/busybox.rs#wget_usage`), `ping` (canned replies), `sh`/`bash`/`ash`
   (nested shell; `sh -c "CMD"` (also with `-c` clustered, `sh -lc`, `bash -ec`), `sh FILE` and a script piped to `sh` run their text in a shell level of their own), `enable` (bash's builtin list, since
   Mirai's telnet preamble sends it and only a non-bash says "command not found"), `mount`
   (the fake filesystem's mount table), `busybox` (the real v1.30.1 multi-call banner
@@ -279,13 +282,16 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   arguments as `tftp://host[:port]/file` / `ftp://host[:port]/file`, since neither command
   takes a url token),
   `chmod`/`cp`/`rm`/`mkdir`/`sleep` (silent success), `cd`, `exit`/`logout`; an
-  unknown command uses the active shell level's diagnostic form.
+  unknown command uses the active shell level's diagnostic form, and so does a path that does
+  not exist: bash's `No such file or directory`, dash's and mksh's `not found`
+  (`crates/sensor-framework/src/shell/mod.rs#FakeShell::invoke_path`).
 - BusyBox applet set is a single source of truth (`APPLET_ROWS`, `crates/sensor-framework/src/shell/busybox.rs#APPLET_ROWS`):
   the banner prints those rows and `busybox <applet>` recognizes exactly the names they list, so the
   two cannot contradict. Both are the reference build's own (BusyBox v1.30.1, 263 applets, captured
   from a bare `/bin/busybox`). A listed applet runs its modeled handler when there is one
   (`crates/sensor-framework/src/shell/mod.rs#FakeShell::cmd_busybox`) and otherwise succeeds silently:
-  its usage text is not captured, so none is invented. A name the banner does not list, `curl`
+  an applet's usage text is printed only where a handler models it (`kill`, `wget` without a
+  URL), so none is invented. A name the banner does not list, `curl`
   included (real busybox ships none), gives `applet not found` - matching the real-busybox check
   Mirai/Gafgyt perform.
 - Download capture handles direct, busybox, full-path, and

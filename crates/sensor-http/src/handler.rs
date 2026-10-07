@@ -89,10 +89,14 @@ const NGINX_413_HTML: &str = "<html>
 </html>
 ";
 
+// Eight parameters: the stream plus the per-connection context every sensor handler takes;
+// bundling them would diverge from the uniform handler shape the sibling sensors share.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_connection<S>(
     mut stream: S,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
+    tls: bool,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
@@ -106,7 +110,7 @@ pub async fn handle_connection<S>(
         .map(normalize_dual_stack)
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
-    let conn_event = connection_event(source_ip, wan_ip, session_id);
+    let conn_event = connection_event(source_ip, wan_ip, session_id, tls);
     if emitter.append(&conn_event).await.is_err() {
         tracing::error!(%peer_addr, "http: failed to append connection event");
     }
@@ -158,6 +162,9 @@ pub async fn handle_connection<S>(
             );
             metadata["body_preview"] = serde_json::Value::String(body_preview);
         }
+        if tls {
+            metadata["tls"] = serde_json::Value::Bool(true);
+        }
 
         let event = SensorEvent {
             v: WIRE_VERSION,
@@ -193,6 +200,10 @@ pub async fn handle_connection<S>(
             build_response(&request.method, &request.path)
         };
         let _ = stream.write_all(&response).await;
+        let _ = stream.flush().await;
+        // Over TLS this sends close_notify as nginx does; without it a real client logs an
+        // unexpected EOF, a tell. On plain TCP it is a FIN just before the drop.
+        let _ = stream.shutdown().await;
     }
 }
 
@@ -264,7 +275,17 @@ fn error_response(status: &str, body: &str, date: &str, is_head: bool) -> Vec<u8
     out
 }
 
-fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
+fn connection_event(
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+    tls: bool,
+) -> SensorEvent {
+    // The key is absent (not false) on the plain path so plain events stay byte-identical.
+    let mut metadata = serde_json::json!({ "protocol_label": PROTOCOL_LABEL });
+    if tls {
+        metadata["tls"] = serde_json::Value::Bool(true);
+    }
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -274,7 +295,7 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid)
         protocol: PROTO_TCP.to_string(),
         authenticated: false,
         observed_at: chrono::Utc::now(),
-        metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
+        metadata,
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
@@ -446,7 +467,7 @@ mod tests {
 
     #[test]
     fn connection_event_is_unauthenticated_with_http_label() {
-        let event = connection_event("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
+        let event = connection_event("203.0.113.7".parse().unwrap(), None, Uuid::now_v7(), false);
         assert!(!event.authenticated);
         assert_eq!(event.sensor, "http");
         assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
@@ -456,6 +477,21 @@ mod tests {
                 .metadata
                 .get("protocol_label")
                 .and_then(|v| v.as_str()),
+            Some("http")
+        );
+    }
+
+    #[test]
+    fn connection_event_marks_tls_only_when_tls() {
+        let plain = connection_event("203.0.113.7".parse().unwrap(), None, Uuid::now_v7(), false);
+        assert!(plain.metadata.get("tls").is_none());
+        let tls = connection_event("203.0.113.7".parse().unwrap(), None, Uuid::now_v7(), true);
+        assert_eq!(
+            tls.metadata.get("tls").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            tls.metadata.get("protocol_label").and_then(|v| v.as_str()),
             Some("http")
         );
     }

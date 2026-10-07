@@ -4,7 +4,7 @@ audience: maintainer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Documentation coverage matrix
@@ -47,7 +47,7 @@ the architecture and reference pages below.
 | `sensor-telnet` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | Option negotiation, accepts any credential, shared fake shell. |
 | `sensor-redis` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | RESP parse, canned replies, cred/command capture. |
 | `sensor-adb` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | `CNXN` handshake, `shell:` via fake shell, `sync:` push capture. |
-| `sensor-http` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | Per-connection HTTP honeypot handler. |
+| `sensor-http` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md), [operations/networking-tls.md](operations/networking-tls.md) | documented | Per-connection HTTP honeypot handler, plus an optional implicit-TLS HTTPS listener (default off, fail-closed on a bad cert and key pair). |
 | `sensor-ftp` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | Capture hand-off + quarantine spool for uploads; PASV data-peer validation. |
 | `sensor-smtp` | [reference/sensor-behavior.md](reference/sensor-behavior.md) | documented | Per-connection SMTP honeypot handler. |
 | `sensor-tftp` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md) | documented | The one UDP sensor that replies: reads get one fixed tiny error, writes are acknowledged and captured; bytes sent never exceed bytes received. Default-off. |

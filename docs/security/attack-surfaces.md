@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Attack surfaces
@@ -37,6 +37,14 @@ default port** - ports come from the config/env the deploy units set; see
 
 Exposes: raw attacker-chosen bytes on each protocol - banners, commands, credentials,
 uploaded sample bytes.
+
+`sensor-http` can also expose an implicit-TLS HTTPS listener (conventionally 443). It exists only
+when `PROPOLIS_HTTP_TLS_BIND` is set, so an operator who sets only the cert and key opens no new
+port. It adds a TLS handshake to the reachable surface: a failed or stalled handshake is cut at the
+read timeout and recorded nowhere but a debug log, no client certificate is requested, and the
+certificate is the deploy-minted self-signed one whose only name is `localhost`. A half-configured
+or unusable cert and key pair makes the sensor refuse to start rather than serve plaintext. See
+[../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 
 Controls:
 

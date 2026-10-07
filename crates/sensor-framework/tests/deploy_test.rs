@@ -116,6 +116,17 @@ fn mqtt_unit_has_hardening_directives_and_no_cap_net_bind() {
     );
 }
 
+/// The HTTP sensor's deploy ports (80 plain, 443 TLS) are both privileged, so its unit keeps
+/// `CAP_NET_BIND_SERVICE`, and it reads its cert and key from the root-owned TLS directory, which
+/// `ProtectSystem=strict` leaves readable but which the unit must not be able to write.
+#[test]
+fn http_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
+    let unit = deploy_file("sensor-http.service");
+    assert!(unit.contains("ReadOnlyPaths=/etc/propolis/tls\n"));
+    assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
+    assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
+}
+
 /// The three layers `internal/design/02-sensor-framework.md`'s "Isolation and deployment"
 /// requires of every sensor unit: least authority, resource caps, and containment. Shared by
 /// both units below so the two can never drift into checking different bars.

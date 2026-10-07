@@ -87,6 +87,7 @@ for pair in \
     PROPOLIS_REDIS_BIND:redis \
     PROPOLIS_ADB_BIND:adb \
     PROPOLIS_HTTP_BIND:http \
+    PROPOLIS_HTTP_TLS_BIND:http \
     PROPOLIS_FTP_BIND:ftp \
     PROPOLIS_SMTP_BIND:smtp \
     PROPOLIS_MQTT_BIND:mqtt \

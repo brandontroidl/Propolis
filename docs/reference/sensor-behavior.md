@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-01
+last-verified: 2026-10-06
 -->
 
 # Sensor behavior reference
@@ -482,6 +482,20 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
   no reply, as nginx gives none, and the event says `body_complete: false`.
 - **Bounds:** common defaults except **`max_concurrent` 512** (higher than the
   others, `crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`).
+- **HTTPS (optional):** when `PROPOLIS_HTTP_TLS_BIND` is set, a second implicit-TLS listener in the
+  same process serves the same nginx persona and writes the same `events.jsonl`
+  (`crates/sensor-http/src/lib.rs#start_test_server_tls`). No client certificate is requested.
+  The handshake is cut at the read timeout; a failed or stalled handshake, including plaintext sent
+  to the TLS port, is dropped with a debug log and emits no event. Every event from a TLS session,
+  the connection event and each request event, carries `"tls": true`; the key is absent, not false,
+  on the plain listener (`crates/sensor-http/src/handler.rs#connection_event`). After each response the
+  handler flushes and shuts the stream down, which sends `close_notify` over TLS as nginx does.
+  Fail-closed: the sensor refuses to start (exit 1, before any bind) on a half-configured or
+  unusable cert and key pair, and the key must be mode `0600`; an OS bind failure of the TLS
+  listener stops the plain listener and exits 1. Cert and key without `PROPOLIS_HTTP_TLS_BIND` load
+  and validate, start no TLS listener, and log one warning. Rules and variables are in
+  [environment-variables.md](environment-variables.md); the operator view is
+  [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 - **Capture:** no login, no spool. **The POST body is captured only as a truncated
   preview in metadata**, never stored as a file.
 - **Emits:** `honeypot_connection`, `honeypot_command_exec`.

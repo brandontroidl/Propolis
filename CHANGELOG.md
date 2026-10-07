@@ -4,6 +4,17 @@
 
 ### Added
 
+- **HTTPS on `sensor-http` (default off)** - a second, implicit-TLS listener in the same process,
+  serving the same nginx persona into the same event log, enabled by `PROPOLIS_HTTP_TLS_BIND`
+  (no compiled default; the deploy convention is `0.0.0.0:443`) together with
+  `PROPOLIS_HTTP_TLS_CERT` and `PROPOLIS_HTTP_TLS_KEY` (the pair `provision-tls.sh` mints, key
+  mode `0600`). Events from a TLS session carry `"tls": true`; plain events are unchanged. A
+  failed or stalled handshake is dropped with no event and cut at the read timeout. Fail-closed:
+  exactly one of cert and key, a TLS bind without both, an invalid bind, or an unusable pair makes
+  the sensor exit 1 before binding anything. Cert and key without a TLS bind load and validate the
+  pair, start no TLS listener and log one warning, so a TLS listener never opens implicitly.
+  `fleet-listeners.sh` derives an `http` tcp listener from `PROPOLIS_HTTP_TLS_BIND`, and the unit
+  gains `ReadOnlyPaths=/etc/propolis/tls`.
 - **Sensor TLS foundation (capability only; no sensor binds TLS yet)** - `sensor-framework` gains
   a `tls` module: a fail-closed loader for a per-sensor certificate and key (a missing, oversized,
   non-regular, malformed or mismatched file, or a key readable by group or other, is an error and

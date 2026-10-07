@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Ports and protocols
@@ -53,7 +53,7 @@ default. Every one is TCP except `sensor-tftp` (UDP only) and the UDP half of
 |---|---|---|---|---|
 | sensor-ssh | `PROPOLIS_SSH_BIND` (single `ip:port`) | SSH | 22 | Unit grants `CAP_NET_BIND_SERVICE` for privileged bind (`deploy/sensor-ssh.service`). Missing bind => `ConfigError::NoBind`, exit (`crates/sensor-ssh/src/main.rs#load_config_from_env`). |
 | sensor-telnet | `PROPOLIS_TELNET_BIND` (single) | Telnet | 23 | `crates/sensor-telnet/src/main.rs#load_config_from_env` |
-| sensor-http | `PROPOLIS_HTTP_BIND` (single) | HTTP | 80 | `crates/sensor-http/src/main.rs#load_config_from_env` |
+| sensor-http | `PROPOLIS_HTTP_BIND` (single); `PROPOLIS_HTTP_TLS_BIND` (single, optional) | HTTP; HTTPS (implicit TLS) | 80; 443 | `crates/sensor-http/src/main.rs#load_config_from_env`. The HTTPS listener runs in the same process and writes the same event log, and exists only when `PROPOLIS_HTTP_TLS_BIND` is set, with `PROPOLIS_HTTP_TLS_CERT` and `PROPOLIS_HTTP_TLS_KEY` (`crates/sensor-http/src/main.rs#parse_tls`). Unit grants `CAP_NET_BIND_SERVICE` for both privileged ports and `ReadOnlyPaths=/etc/propolis/tls` for the pair. |
 | sensor-ftp | `PROPOLIS_FTP_BIND` (single) | FTP | 21 | Also opens passive-mode data ports at runtime (see below). `crates/sensor-ftp/src/main.rs#load_config_from_env` |
 | sensor-smtp | `PROPOLIS_SMTP_BIND` (single) | SMTP | 25 | Missing => error + exit (`crates/sensor-smtp/src/main.rs#main`) |
 | sensor-tftp | `PROPOLIS_TFTP_BIND` (single, UDP) | TFTP | 69/udp | Off until set: missing or invalid => error + exit 1, nothing bound (`crates/sensor-tftp/src/main.rs#load_config_from`). The one sensor that replies over UDP, bounded so bytes sent never exceed bytes received. Each transfer answers from its own ephemeral UDP port on the bind IP, so a host firewall must allow replies from, and a client may send to, ports other than 69. Unit grants `CAP_NET_BIND_SERVICE`. |
@@ -172,6 +172,7 @@ are **not** compiled-in defaults - each is set by the operator in
 | 25 | attacker | SMTP | `PROPOLIS_SMTP_BIND` |
 | 69 (UDP) | attacker | TFTP (transfers continue on ephemeral UDP ports) | `PROPOLIS_TFTP_BIND` |
 | 80 | attacker | HTTP | `PROPOLIS_HTTP_BIND` |
+| 443 | attacker | HTTPS (http, implicit TLS) | `PROPOLIS_HTTP_TLS_BIND` |
 | 1433 | attacker | MSSQL (cred) | `PROPOLIS_CRED_MSSQL_BIND` |
 | 1883 | attacker | MQTT | `PROPOLIS_MQTT_BIND` |
 | 3306 | attacker | MySQL (cred) | `PROPOLIS_CRED_MYSQL_BIND` |

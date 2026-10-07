@@ -3445,11 +3445,13 @@ name = "sensor-http"
 version = "0.4.0"
 dependencies = [
  "chrono",
+ "rcgen",
  "sensor-framework",
  "sensor-wire",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

@@ -102,8 +102,9 @@ for the full variable reference.
 ## TLS material (per sensor)
 
 Self-signed certificate and key per TLS-capable sensor (http, mqtt, redis, smtp, ftp, cred),
-minted by `deploy/provision-tls.sh` (`deploy/provision-tls.sh#TLS_SENSORS`). No sensor reads
-them yet; see [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+minted by `deploy/provision-tls.sh` (`deploy/provision-tls.sh#TLS_SENSORS`). Only `sensor-http`
+reads its pair so far (`PROPOLIS_HTTP_TLS_CERT` and `PROPOLIS_HTTP_TLS_KEY`, through the read-only
+`ReadOnlyPaths=/etc/propolis/tls` in `deploy/sensor-http.service`); see [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 
 | Path | Mode | Owner | Created by |
 |---|---|---|---|

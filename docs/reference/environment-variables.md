@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-28
+last-verified: 2026-10-06
 -->
 
 # Environment variables
@@ -540,7 +540,9 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   (`sensor-mqtt/src/handler.rs#MAX_PACKETS`), neither configurable.
 - http: `PROPOLIS_HTTP_READ_TIMEOUT_MS`, `PROPOLIS_HTTP_IDLE_TIMEOUT_MS`,
   `PROPOLIS_HTTP_MAX_DURATION_SECS`, `PROPOLIS_HTTP_MAX_CAPTURED_BYTES`,
-  `PROPOLIS_HTTP_MAX_CONCURRENT`, `PROPOLIS_HTTP_LOG_PATH`, `PROPOLIS_HTTP_WAN_MAP`.
+  `PROPOLIS_HTTP_MAX_CONCURRENT`, `PROPOLIS_HTTP_LOG_PATH`, `PROPOLIS_HTTP_WAN_MAP`, and the
+  HTTPS variables `PROPOLIS_HTTP_TLS_BIND`, `PROPOLIS_HTTP_TLS_CERT`, `PROPOLIS_HTTP_TLS_KEY`
+  (see "HTTP TLS" below).
 - redis: `PROPOLIS_REDIS_READ_TIMEOUT_MS`, `PROPOLIS_REDIS_IDLE_TIMEOUT_MS`,
   `PROPOLIS_REDIS_MAX_DURATION_SECS`, `PROPOLIS_REDIS_MAX_CAPTURED_BYTES`,
   `PROPOLIS_REDIS_MAX_CONCURRENT`, `PROPOLIS_REDIS_LOG_PATH`, `PROPOLIS_REDIS_WAN_MAP`.
@@ -607,6 +609,22 @@ Sensor-specific extras:
   `PROPOLIS_TFTP_BIND` is the only switch: the sensor is off until an operator sets it, and with no
   bind (or an unparseable one) it logs the error and exits 1 without binding anything.
 - **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`).
+  HTTP TLS (all three default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_HTTP_TLS_BIND` | unset (the deploy convention is `0.0.0.0:443`) | `ip:port` of the HTTPS listener. The listener exists only when this is set. |
+  | `PROPOLIS_HTTP_TLS_CERT` | unset (deploy value `/etc/propolis/tls/http.crt`) | PEM certificate path. |
+  | `PROPOLIS_HTTP_TLS_KEY` | unset (deploy value `/etc/propolis/tls/http.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-http/src/main.rs#parse_tls`): the sensor exits 1 with
+  `refusing to start`, before binding any listener (the plain one included), when exactly one of
+  CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_HTTP_TLS_BIND` is set
+  without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
+  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value is invalid, not
+  unset. CERT and KEY without a bind load and validate the pair, start no TLS listener, and log one
+  warning. Because the fleet inventory derives from the `*_BIND` variables
+  (`deploy/fleet-listeners.sh#PROPOLIS_HTTP_TLS_BIND`), a TLS listener never starts implicitly.
 - **catchall**: no spool variable (never spools file bodies,
   `crates/sensor-catchall/src/main.rs#Config`); no
   outbox variable either (captures no file bodies, so nothing for SP-B-1b's

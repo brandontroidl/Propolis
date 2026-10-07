@@ -62,8 +62,8 @@ too - front them with authentication at the proxy. Route ownership is in
 > `console::server::serve` on a plain `tokio::net::TcpListener`
 > (`crates/console/src/server.rs`) - there is no rustls or other TLS
 > setup in the console code. Do not assume the console terminates TLS itself.
-> The sensor framework now carries a TLS capability for the attacker-facing
-> listeners, but no sensor binds TLS yet; see
+> The sensor framework carries a TLS capability for the attacker-facing
+> listeners, and `sensor-http` is the first sensor to use it; see
 > [Sensor TLS](#sensor-tls-attacker-facing-listeners).
 >
 > The console does bound its own connections whether or not a proxy is in
@@ -100,12 +100,18 @@ This is separate from the console and the gateway and shipper mTLS material: it 
 server-side TLS on the honeypot's own attacker-facing ports, so the sensors can answer
 HTTPS, MQTTS and the other encrypted variants of the protocols they imitate.
 
-> **Status: shared capability only.** The shared capability, the certificate minting and the
-> deploy wiring below are in place, but **no sensor binds a TLS listener yet** `[planned]`.
-> Nothing in a current install listens with TLS, and no sensor reads a TLS variable. Per-sensor
-> binds land next. Planned surfaces, all pending:
+> **Status: one sensor live.** The shared capability, the certificate minting and the deploy
+> wiring below are in place, and `sensor-http` now serves HTTPS (below). The other surfaces are
+> still pending `[planned]`: no other sensor reads a TLS variable or listens with TLS.
 >
-> - HTTPS on 443 (`sensor-http`)
+> **No implicit TLS bind.** A TLS listener exists only when its `*_TLS_BIND` variable is
+> explicitly set. `deploy/fleet-listeners.sh` derives the fleet inventory from the `*_BIND`
+> variables, so a compiled-in default bind would open a port the inventory never lists. A
+> certificate and key with no TLS bind are still loaded and validated (fail-closed), start no
+> TLS listener, and log one warning.
+>
+> Pending surfaces:
+>
 > - MQTTS on 8883 (`sensor-mqtt`)
 > - Redis TLS on 6380 (`sensor-redis`)
 > - SMTPS on 465, plus SMTP STARTTLS (`sensor-smtp`)
@@ -117,6 +123,24 @@ loader (`crates/sensor-framework/src/tls.rs#load_server_config`), an implicit-TL
 (`crates/sensor-framework/src/tls.rs#run_tls_listener`) that reuses the plain TCP listener's
 connection bounds, and a stream type for in-protocol upgrades such as STARTTLS
 (`crates/sensor-framework/src/tls.rs#MaybeTlsStream`).
+
+### Live: HTTPS on `sensor-http`
+
+| Item | Value |
+|---|---|
+| Mode | implicit TLS (the handshake is the first thing on the connection), no client certificate |
+| Bind | `PROPOLIS_HTTP_TLS_BIND`, no compiled default; the deploy convention is `0.0.0.0:443` |
+| Certificate and key | `PROPOLIS_HTTP_TLS_CERT` (`/etc/propolis/tls/http.crt`), `PROPOLIS_HTTP_TLS_KEY` (`/etc/propolis/tls/http.key`, mode `0600`) |
+| Plain listener | unchanged, `PROPOLIS_HTTP_BIND`; both listeners run in one process and write one `events.jsonl` |
+| Unit | `deploy/sensor-http.service` adds `ReadOnlyPaths=/etc/propolis/tls`; `CAP_NET_BIND_SERVICE` stays for ports 80 and 443 |
+| Event tagging | events from a TLS session carry `"tls": true`; plain events have no such key |
+
+The sensor exits 1 with `refusing to start`, before binding anything, when exactly one of cert
+and key is set (a blank value counts as unset), when the TLS bind is set without both paths or
+does not parse, or when the pair is unusable (see [Loading is fail-closed](#loading-is-fail-closed)).
+If the OS refuses the TLS bind itself, the plain listener is stopped and the sensor exits 1.
+Variables are owned by [environment-variables.md](../reference/environment-variables.md);
+behavior by [sensor-behavior.md](../reference/sensor-behavior.md).
 
 ### Certificate model
 
@@ -165,7 +189,7 @@ pair survives every re-run of `install.sh`, `upgrade.sh` or `provision-tls.sh`
 
 The loader returns an error, and a sensor with a TLS bind configured refuses to start (no
 fallback to plaintext or to a default certificate), when any of these hold. This is the
-contract the per-sensor binds will follow
+contract every per-sensor TLS bind follows
 (`crates/sensor-framework/src/tls.rs#load_server_config`,
 `crates/sensor-framework/src/tls.rs#TlsConfigError`):
 

@@ -48,31 +48,34 @@ Enforced by the console's accept loop (`console::server::ServeLimits::default`,
 | Body size | 2 MiB | `413` |
 | Shutdown grace | 10 s for open connections to finish | remaining connections dropped |
 
-## sensor-dns UDP reply rate limit
+## UDP reply rate limit (sensor-dns, sensor-tftp)
 
-A UDP source address can be forged, so every reply `sensor-dns` sends over UDP can be aimed at a
-victim. Each reply is already no larger than its query; this bounds how many there are. Token
-buckets keyed on the source network plus one global bucket
-(`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`, wired in
-`crates/sensor-dns/src/udp.rs#serve`). Behavior and the summary events are owned by
-[sensor-behavior.md](sensor-behavior.md#sensor-dns).
+A UDP source address can be forged, so every reply `sensor-dns` or `sensor-tftp` sends over UDP
+can be aimed at a victim. Each reply is already no larger than what the peer sent; this bounds
+how many there are. Each sensor has its own token buckets keyed on the source network plus one
+global bucket (`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`, wired in
+`crates/sensor-dns/src/udp.rs#serve` and `crates/sensor-tftp/src/lib.rs#serve`). Behavior and
+the summary events are owned by [sensor-behavior.md](sensor-behavior.md#sensor-dns) and
+[sensor-behavior.md](sensor-behavior.md#sensor-tftp).
 
 | Item | Value | Source |
 |---|---|---|
-| Per source network | 5 per s, burst 10 | `PROPOLIS_DNS_REPLY_RATE_PER_SOURCE`, `PROPOLIS_DNS_REPLY_BURST_PER_SOURCE` |
-| Global | 1000 per s, burst 2000 | `PROPOLIS_DNS_REPLY_RATE_GLOBAL`, `PROPOLIS_DNS_REPLY_BURST_GLOBAL` |
+| Per source network | 5 per s, burst 10 | `PROPOLIS_DNS_REPLY_RATE_PER_SOURCE`, `PROPOLIS_DNS_REPLY_BURST_PER_SOURCE`; `PROPOLIS_TFTP_REPLY_RATE_PER_SOURCE`, `PROPOLIS_TFTP_REPLY_BURST_PER_SOURCE` |
+| Global | 1000 per s, burst 2000 | `PROPOLIS_DNS_REPLY_RATE_GLOBAL`, `PROPOLIS_DNS_REPLY_BURST_GLOBAL`; `PROPOLIS_TFTP_REPLY_RATE_GLOBAL`, `PROPOLIS_TFTP_REPLY_BURST_GLOBAL` |
 | Source network | IPv4 /24 (IPv4-mapped IPv6 included), IPv6 /56 *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#SourceKey` |
 | Networks tracked | 4096, allocated once; a full table evicts the least recently seen of 4 sampled entries *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#DEFAULT_RATE_TABLE_CAPACITY` |
 | Over budget | no reply, no per-datagram event; counted in a summary | `crates/sensor-framework/src/rate_limit.rs#FloodLedger` |
 | Summary window | one `rate_limited` event per network per 10 s *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#DEFAULT_SUMMARY_WINDOW` |
 | Summaries held | 1024 networks, then one overflow summary; 8 samples and 32 distinct sources each *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#DEFAULT_SUMMARY_CAPACITY`, `crates/sensor-framework/src/rate_limit.rs#MAX_SUMMARY_SAMPLES`, `crates/sensor-framework/src/rate_limit.rs#MAX_SUMMARY_SOURCES` |
-| Shutdown flush | pending summaries written within 2 s *(hard-coded)* | `crates/sensor-dns/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT` |
+| Shutdown flush | pending summaries written within 2 s *(hard-coded)* | `crates/sensor-dns/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`, `crates/sensor-tftp/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT` |
 
-Every UDP datagram of at least a 12-byte header is charged, including ones that are rejected or
-suppressed rather than answered, because each would otherwise cost an event. A zero or
-non-numeric rate aborts startup; no value turns the limit off. TCP and DoT are not rate limited
-(their per-connection bounds are in [sensor-behavior.md](sensor-behavior.md#sensor-dns)).
-`sensor-tftp`, the other sensor that answers over UDP, does not use this limiter yet.
+`sensor-dns` charges every UDP datagram of at least a 12-byte header, including ones that are
+rejected or suppressed rather than answered, because each would otherwise cost an event.
+`sensor-tftp` charges every datagram on its request socket before parsing it, malformed ones
+included; the DATA and ACK packets of a running transfer arrive on that transfer's own socket and
+are not charged. A zero or non-numeric rate aborts startup; no value turns the limit off. DNS
+over TCP and DoT is not rate limited (its per-connection bounds are in
+[sensor-behavior.md](sensor-behavior.md#sensor-dns)).
 
 ## VirusTotal daily cap
 

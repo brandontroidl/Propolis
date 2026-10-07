@@ -1,21 +1,35 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
     CAPTURE_CHUNK_BYTES, CaptureHandoff, CaptureMemoryBudget, ConnectionBounds,
-    DEFAULT_CAPTURE_BUDGET_BYTES_256M, WanResolver,
+    DEFAULT_CAPTURE_BUDGET_BYTES_256M, Rate, RateLimitConfig, WanResolver,
 };
+use sensor_tftp::TftpServer;
 use sensor_wire::{
     PROTO_UDP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SensorEvent,
 };
 use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
 
 const BLOCK: usize = 512;
+
+fn rate(per_second: u32, burst: u32, global: u32, global_burst: u32) -> RateLimitConfig {
+    let nz = |n| NonZeroU32::new(n).unwrap();
+    RateLimitConfig::new(
+        Rate::new(nz(per_second), nz(burst)),
+        Rate::new(nz(global), nz(global_burst)),
+    )
+}
+
+/// Limits no ordinary test comes near, so only the flood tests see rate limiting.
+fn unlimited() -> RateLimitConfig {
+    rate(1_000_000, 1_000_000, 1_000_000, 1_000_000)
+}
 
 fn test_bounds() -> ConnectionBounds {
     ConnectionBounds {
@@ -31,7 +45,7 @@ struct TestServer {
     addr: SocketAddr,
     log_path: PathBuf,
     spool_dir: PathBuf,
-    handle: JoinHandle<()>,
+    server: TftpServer,
     handoff: Arc<CaptureHandoff>,
     budget: Arc<CaptureMemoryBudget>,
     _dir: tempfile::TempDir,
@@ -46,23 +60,40 @@ impl TestServer {
         bounds: ConnectionBounds,
         wan_map: HashMap<std::net::IpAddr, std::net::IpAddr>,
     ) -> TestServer {
-        Self::start_full(bounds, wan_map, DEFAULT_CAPTURE_BUDGET_BYTES_256M).await
+        Self::start_full(
+            bounds,
+            wan_map,
+            DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+            unlimited(),
+        )
+        .await
     }
 
     async fn start_with_capture_budget(ceiling: u64) -> TestServer {
-        Self::start_full(test_bounds(), HashMap::new(), ceiling).await
+        Self::start_full(test_bounds(), HashMap::new(), ceiling, unlimited()).await
+    }
+
+    async fn start_rated(rate: RateLimitConfig) -> TestServer {
+        Self::start_full(
+            test_bounds(),
+            HashMap::new(),
+            DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+            rate,
+        )
+        .await
     }
 
     async fn start_full(
         bounds: ConnectionBounds,
         wan_map: HashMap<std::net::IpAddr, std::net::IpAddr>,
         capture_ceiling: u64,
+        rate: RateLimitConfig,
     ) -> TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let spool_dir = dir.path().join("spool");
         let budget = Arc::new(CaptureMemoryBudget::new(capture_ceiling));
-        let (addr, handle, handoff) = sensor_tftp::start_test_server_with_handoff(
+        let server = sensor_tftp::start_test_server_with_capture_budget(
             "127.0.0.1:0".parse().unwrap(),
             log_path.clone(),
             spool_dir.clone(),
@@ -71,15 +102,16 @@ impl TestServer {
             "test".to_string(),
             dir.path().join("outbox"),
             budget.clone(),
+            rate,
         )
         .await
         .unwrap();
         TestServer {
-            addr,
+            addr: server.addr,
             log_path,
             spool_dir,
-            handle,
-            handoff,
+            handoff: server.handoff.clone(),
+            server,
             budget,
             _dir: dir,
         }
@@ -319,7 +351,7 @@ async fn wrq_upload_is_captured_in_the_spool_and_emits_both_events() {
         probe.session_id, upload.session_id,
         "one session id spans the probe and the upload"
     );
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 /// Sends `blocks` full blocks of `fill` and returns the transfer address plus how many were ACKed
@@ -361,7 +393,7 @@ async fn capture_within_budget_is_complete_and_the_budget_returns_to_zero_after_
     assert_eq!(srv.budget.high_water_bytes(), CAPTURE_CHUNK_BYTES);
     srv.wait_for_budget_current(0).await;
     assert_eq!(srv.handoff.truncated_capture_count(), 0);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -403,7 +435,7 @@ async fn capture_that_exhausts_the_budget_keeps_its_prefix_and_later_uploads_sti
     let second_upload = &srv.uploads().await[1];
     assert_eq!(second_upload.sample.as_ref().unwrap().size, 8);
     assert_eq!(second_upload.metadata["complete"], true);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -451,7 +483,7 @@ async fn concurrent_transfers_share_one_ceiling_and_a_zero_byte_capture_submits_
         .count();
     assert_eq!(probes, 2);
     srv.wait_for_budget_current(0).await;
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -461,7 +493,7 @@ async fn shutdown_drain_leaves_the_captured_body_in_the_spool_and_its_event_in_t
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("events.jsonl");
     let spool_dir = dir.path().join("spool");
-    let (addr, handle, handoff) = sensor_tftp::start_test_server_with_handoff(
+    let server = sensor_tftp::start_test_server_with_capture_budget(
         "127.0.0.1:0".parse().unwrap(),
         log_path.clone(),
         spool_dir.clone(),
@@ -470,20 +502,21 @@ async fn shutdown_drain_leaves_the_captured_body_in_the_spool_and_its_event_in_t
         "test".to_string(),
         dir.path().join("outbox"),
         Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES_256M)),
+        unlimited(),
     )
     .await
     .unwrap();
 
     let mut client = Client::new().await;
-    let transfer = client.begin_write(addr, "drain.bin", "octet").await;
+    let transfer = client.begin_write(server.addr, "drain.bin", "octet").await;
     let body = b"drained-on-shutdown".to_vec();
     client.send_block(transfer, 1, &body).await;
     client.expect_ack(transfer, 1).await;
     // The handler submits right after it sends the final ACK; give that task a moment to run.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    handle.abort();
-    let outcome = handoff.drain(Duration::from_secs(10)).await;
+    server.abort();
+    let outcome = server.handoff.drain(Duration::from_secs(10)).await;
     assert_eq!(outcome, sensor_framework::DrainOutcome::Drained);
 
     let on_disk = std::fs::read(spool_dir.join(sha_hex(&body))).expect("body is in the spool");
@@ -512,7 +545,7 @@ async fn an_upload_that_ends_on_a_full_block_boundary_needs_the_zero_length_fina
     let upload = srv.wait_for_upload().await;
     assert_eq!(upload.sample.as_ref().unwrap().size, BLOCK as u64);
     assert_eq!(upload.metadata["complete"], true);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -546,7 +579,7 @@ async fn rrq_gets_one_tiny_error_and_no_content() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].metadata["direction"], "rrq");
     assert_eq!(events[0].metadata["filename"], "/etc/passwd");
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 /// The reply to any exchange never carries more bytes than the peer sent. Discriminating cases:
@@ -608,7 +641,7 @@ async fn replies_never_exceed_what_the_peer_sent() {
         flood.received,
         flood.sent
     );
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -646,7 +679,7 @@ async fn a_full_upload_with_retransmits_and_noise_never_amplifies() {
         (20 * BLOCK + 3) as u64
     );
     assert_eq!(upload.metadata["truncated"], false);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -672,7 +705,7 @@ async fn duplicate_data_is_re_acked_and_not_stored_twice() {
     assert_eq!(sample.sha256, sha_hex(&expected));
     assert_eq!(sample.size, expected.len() as u64);
     assert_eq!(upload.metadata["wire_size"], expected.len() as u64);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -689,7 +722,7 @@ async fn out_of_order_blocks_and_block_zero_get_no_reply() {
 
     let upload = srv.wait_for_upload().await;
     assert_eq!(upload.sample.as_ref().unwrap().sha256, sha_hex(b"real"));
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 /// A packet from any source other than the requester's exact (ip, port) is dropped: no reply, no
@@ -721,7 +754,7 @@ async fn a_packet_from_another_source_is_dropped() {
     assert_eq!(upload.sample.as_ref().unwrap().sha256, sha_hex(b"GOOD"));
     assert_eq!(upload.metadata["wire_size"], 4);
     assert_eq!(srv.uploads().await.len(), 1);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -744,7 +777,7 @@ async fn foreign_packets_do_not_keep_a_transfer_alive() {
     let upload = srv.wait_for_upload().await;
     assert_eq!(upload.metadata["complete"], false);
     assert_eq!(upload.sample.as_ref().unwrap().size, BLOCK as u64);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -775,7 +808,7 @@ async fn the_body_cap_truncates_still_captures_and_stops_the_transfer() {
     client.send_block(transfer, 3, &[9u8; BLOCK]).await;
     client.assert_silent(Duration::from_millis(300)).await;
     assert_eq!(srv.uploads().await.len(), 1);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 /// A cap that is a multiple of the block size cuts exactly on a block boundary, so the retained
@@ -800,7 +833,7 @@ async fn a_block_aligned_body_cap_still_reports_truncated() {
     assert_eq!(upload.metadata["wire_size"], 1024);
     assert_eq!(upload.metadata["truncated"], true);
     assert_eq!(upload.metadata["complete"], false);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -818,7 +851,7 @@ async fn an_idle_transfer_is_captured_as_incomplete() {
     assert_eq!(upload.metadata["complete"], false);
     assert_eq!(upload.metadata["truncated"], false);
     assert_eq!(upload.sample.as_ref().unwrap().size, BLOCK as u64);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -835,7 +868,7 @@ async fn a_wrq_that_never_sends_data_is_only_a_probe() {
     let events = srv.events().await;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].metadata["direction"], "wrq");
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -852,7 +885,7 @@ async fn max_duration_cancels_a_transfer_and_keeps_what_arrived() {
     let upload = srv.wait_for_upload().await;
     assert_eq!(upload.metadata["complete"], false);
     assert_eq!(upload.sample.as_ref().unwrap().size, BLOCK as u64);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -902,7 +935,7 @@ async fn max_concurrent_drops_requests_beyond_the_limit() {
         answered,
         "the permit must be released when the transfer ends"
     );
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -930,7 +963,7 @@ async fn per_source_cap_drops_one_source_but_still_serves_another() {
     // A different source is unaffected even though the global limit has plenty of room.
     let mut other = Client::bound("127.0.0.3:0").await;
     other.begin_write(srv.addr, "other.bin", "octet").await;
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -971,7 +1004,7 @@ async fn filename_and_mode_are_sanitized_before_they_reach_an_event() {
     assert!(filename.contains("evil"));
     assert_eq!(upload.metadata["orig_name"].as_str().unwrap(), filename);
     assert_eq!(upload.sample.unwrap().orig_name, filename);
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -996,7 +1029,7 @@ async fn an_unsupported_mode_gets_error_4_and_no_transfer() {
             .all(|c| !c.is_control())
     );
     assert!(srv.uploads().await.is_empty());
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -1012,7 +1045,7 @@ async fn a_peer_error_ends_the_transfer_and_keeps_the_fragment() {
     assert_eq!(upload.metadata["complete"], false);
     assert_eq!(upload.sample.as_ref().unwrap().size, BLOCK as u64);
     client.assert_silent(Duration::from_millis(200)).await;
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -1025,7 +1058,7 @@ async fn an_oversized_data_packet_is_refused_and_not_stored() {
     assert_eq!(error_code(&reply), 4);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(srv.uploads().await.is_empty());
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 /// Garbage on the request socket must neither crash the listener nor draw a reply or an event.
@@ -1063,7 +1096,7 @@ async fn malformed_datagrams_are_ignored_and_the_listener_survives() {
     client.send_block(transfer, 1, b"ok").await;
     client.expect_ack(transfer, 1).await;
     srv.wait_for_upload().await;
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -1082,7 +1115,7 @@ async fn wan_ip_is_attributed_from_the_bind_address() {
         events[0].wan_ip,
         Some("198.51.100.4".parse::<std::net::IpAddr>().unwrap())
     );
-    srv.handle.abort();
+    srv.server.abort();
 }
 
 #[tokio::test]
@@ -1097,14 +1130,207 @@ async fn a_bind_that_cannot_be_taken_fails_instead_of_starting() {
         test_bounds(),
         "test".to_string(),
         dir.path().join("outbox"),
+        unlimited(),
     )
     .await;
     assert!(result.is_err());
 }
 
+// Request-socket rate limiting.
+
+fn md<'a>(e: &'a SensorEvent, key: &str) -> &'a serde_json::Value {
+    &e.metadata[key]
+}
+
+fn rate_limited(events: &[SensorEvent]) -> Vec<&SensorEvent> {
+    events
+        .iter()
+        .filter(|e| md(e, "query_status") == "rate_limited")
+        .collect()
+}
+
+fn suppressed_total(events: &[SensorEvent]) -> u64 {
+    rate_limited(events)
+        .iter()
+        .map(|e| md(e, "suppressed_count").as_u64().unwrap())
+        .sum()
+}
+
+fn probes(events: &[SensorEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| e.metadata.get("direction").is_some())
+        .count()
+}
+
+/// Send `n` RRQs back to back and count every reply that arrives within `settle` of the last
+/// one. Returns the replies and the time from the first send to the end of collection. Each send
+/// yields so the server drains its socket as it goes: a test runtime has one thread, and the
+/// kernel would otherwise drop what overflows the socket's receive buffer.
+async fn flood(client: &mut Client, to: SocketAddr, n: u16, settle: Duration) -> (usize, Duration) {
+    let started = std::time::Instant::now();
+    for i in 0..n {
+        client
+            .send(to, &rrq(format!("f{i}").as_bytes(), b"octet"))
+            .await;
+        tokio::task::yield_now().await;
+    }
+    let mut replies = 0;
+    while client.recv_within(settle).await.is_some() {
+        replies += 1;
+    }
+    (replies, started.elapsed())
+}
+
+#[tokio::test]
+async fn a_request_flood_gets_at_most_burst_plus_rate_replies_and_summary_events_not_one_each() {
+    let mut limits = rate(5, 10, 100_000, 100_000);
+    limits.summary_window = Duration::from_millis(400);
+    let srv = TestServer::start_rated(limits).await;
+    let mut client = Client::new().await;
+    let sent = 300u16;
+    let (replies, elapsed) = flood(&mut client, srv.addr, sent, Duration::from_millis(300)).await;
+    let ceiling = 10 + (5.0 * elapsed.as_secs_f64()).ceil() as usize;
+    assert!(
+        (10..=ceiling).contains(&replies),
+        "{replies} replies in {elapsed:?}; at most {ceiling} allowed"
+    );
+
+    // Every datagram is accounted for: handled ones one probe event each, the rest in summaries.
+    let expected_suppressed = u64::from(sent) - replies as u64;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while suppressed_total(&srv.events().await) < expected_suppressed {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "summaries cover {} of {expected_suppressed}",
+            suppressed_total(&srv.events().await)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let events = srv.events().await;
+    assert_eq!(suppressed_total(&events), expected_suppressed);
+    assert_eq!(probes(&events), replies);
+    let summaries = rate_limited(&events);
+    // One summary per window the flood touched, never one per datagram.
+    assert!(
+        !summaries.is_empty() && summaries.len() <= 4,
+        "{} summaries",
+        summaries.len()
+    );
+    assert_eq!(events.len(), replies + summaries.len(), "no other events");
+    let s = summaries[0];
+    assert_eq!(s.sensor, "tftp");
+    assert_eq!(s.signal_type, SIGNAL_HONEYPOT_CONNECTION);
+    assert_eq!(s.protocol, PROTO_UDP);
+    assert!(!s.authenticated);
+    assert_eq!(md(s, "protocol_label"), "tftp");
+    assert_eq!(md(s, "transport"), "udp");
+    assert_eq!(md(s, "source_prefix"), "127.0.0.0/24");
+    assert_eq!(s.source_ip, client.sock.local_addr().unwrap().ip());
+    assert_eq!(md(s, "distinct_sources"), 1);
+    let samples = md(s, "samples").as_array().unwrap();
+    assert!(!samples.is_empty() && samples.len() <= 8, "{samples:?}");
+    assert!(
+        samples[0].as_str().unwrap().starts_with("rrq f"),
+        "{samples:?}"
+    );
+    // The shortest request sent, "f0", is 11 bytes.
+    assert!(
+        md(s, "suppressed_bytes").as_u64().unwrap()
+            >= md(s, "suppressed_count").as_u64().unwrap() * 11
+    );
+    srv.server.abort();
+}
+
+#[tokio::test]
+async fn a_second_network_is_answered_while_the_first_is_limited() {
+    let srv = TestServer::start_rated(rate(1, 2, 100_000, 100_000)).await;
+    let mut flooder = Client::new().await;
+    let (replies, _) = flood(&mut flooder, srv.addr, 50, Duration::from_millis(200)).await;
+    assert!((2..=3).contains(&replies), "{replies}");
+    // 127.0.1.0/24 is a different source network on the same loopback interface.
+    let mut other = Client::bound("127.0.1.1:0").await;
+    for name in [&b"a.bin"[..], b"b.bin"] {
+        other.send(srv.addr, &rrq(name, b"octet")).await;
+        let (reply, _) = other.recv().await;
+        assert_eq!(error_code(&reply), 1);
+    }
+    // The flooder is still limited.
+    flooder.send(srv.addr, &rrq(b"again", b"octet")).await;
+    flooder.assert_silent(Duration::from_millis(200)).await;
+    srv.server.abort();
+}
+
+/// Every datagram on the request socket is charged before it is parsed, so junk over the limit is
+/// counted (as `malformed`) in the same summary as requests, and shutdown writes the summaries
+/// whose window has not ended.
+#[tokio::test]
+async fn shutdown_flushes_the_summaries_still_accumulating_and_junk_is_charged_too() {
+    let mut limits = rate(1, 1, 100_000, 100_000);
+    limits.summary_window = Duration::from_secs(3600);
+    let srv = TestServer::start_rated(limits).await;
+    let mut client = Client::new().await;
+    client.send(srv.addr, &rrq(b"first", b"octet")).await;
+    let (reply, _) = client.recv().await;
+    assert_eq!(error_code(&reply), 1, "the burst of one is answered");
+    for _ in 0..3 {
+        client.send(srv.addr, &[0, 9, 1, 2, 3]).await;
+        tokio::task::yield_now().await;
+    }
+    for i in 0..15 {
+        client
+            .send(srv.addr, &rrq(format!("g{i}").as_bytes(), b"octet"))
+            .await;
+        tokio::task::yield_now().await;
+    }
+    client.assert_silent(Duration::from_millis(300)).await;
+    assert!(
+        rate_limited(&srv.events().await).is_empty(),
+        "the window has not ended"
+    );
+
+    srv.server.abort();
+    srv.server.flush_rate_limited().await;
+    let events = srv.events().await;
+    let summaries = rate_limited(&events);
+    assert_eq!(summaries.len(), 1);
+    let s = summaries[0];
+    assert_eq!(md(s, "suppressed_count"), 18);
+    assert_eq!(md(s, "per_source_limited"), 18);
+    assert_eq!(md(s, "global_limited"), 0);
+    // Three 5-byte junk datagrams, ten 11-byte RRQs (g0..g9) and five 12-byte ones (g10..g14).
+    assert_eq!(md(s, "suppressed_bytes"), 3 * 5 + 10 * 11 + 5 * 12);
+    let samples: Vec<&str> = md(s, "samples")
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        samples,
+        [
+            "malformed",
+            "malformed",
+            "malformed",
+            "rrq g0",
+            "rrq g1",
+            "rrq g2",
+            "rrq g3",
+            "rrq g4"
+        ]
+    );
+    assert_eq!(
+        probes(&events),
+        1,
+        "only the answered request has its own event"
+    );
+}
+
+/// The source up to its test module. Only the `#[cfg(test)] mod tests` block is cut: a
+/// `#[cfg(test)]` item elsewhere (the transfer counter in handler.rs) stays in the scanned text.
 fn non_test_source(path: &std::path::Path) -> String {
     let text = std::fs::read_to_string(path).unwrap();
-    match text.find("#[cfg(test)]") {
+    match text.find("#[cfg(test)]\nmod tests") {
         Some(at) => text[..at].to_string(),
         None => text,
     }

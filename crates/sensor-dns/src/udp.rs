@@ -16,14 +16,14 @@ use chrono::Utc;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{
     Arrival, FloodLedger, FloodSummary, PerSourceLimiter, RateDecision, ReplyRateLimiter, Uuid,
-    arrival,
+    arrival, rate_limited_event,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::Ctx;
-use crate::events::{QueryRecord, QueryStatus, rate_limited_event, udp_query_event};
+use crate::events::{PROTOCOL_LABEL, QueryRecord, QueryStatus, SENSOR, udp_query_event};
 use crate::guarded::{ReplySocket, Sent, reply_gate};
 use crate::protocol::{HEADER_LEN, Transport, parse_query, qtype_name, refused_reply};
 
@@ -32,9 +32,6 @@ pub(crate) const RECV_BUFFER: usize = 65536;
 /// Backoff after a failed receive, so a persistent error (descriptor exhaustion) degrades to a
 /// slow retry instead of a hot loop.
 const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
-/// Bounds on how often due summaries are looked for: a tenth of the window, clamped.
-const MIN_SUMMARY_TICK: Duration = Duration::from_millis(10);
-const MAX_SUMMARY_TICK: Duration = Duration::from_secs(1);
 
 pub(crate) struct UdpSensor {
     pub ctx: Ctx,
@@ -136,8 +133,7 @@ fn flood_sample(datagram: &[u8]) -> String {
 /// ledger hands over the due summaries and forgets them first.
 pub(crate) async fn emit_due_summaries(sensor: Arc<UdpSensor>, flood: Arc<UdpFlood>) {
     let window = flood.ledger.window();
-    let tick = (window / 10).clamp(MIN_SUMMARY_TICK, MAX_SUMMARY_TICK);
-    let mut ticker = tokio::time::interval(tick);
+    let mut ticker = tokio::time::interval(flood.ledger.emit_interval());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
@@ -160,7 +156,15 @@ impl UdpSensor {
         let wan_ip = self.wan_ip();
         let (now, now_utc) = (Instant::now(), Utc::now());
         for summary in &summaries {
-            let event = rate_limited_event(summary, wan_ip, window, now, now_utc);
+            let event = rate_limited_event(
+                SENSOR,
+                PROTOCOL_LABEL,
+                summary,
+                wan_ip,
+                window,
+                now,
+                now_utc,
+            );
             if let Err(e) = arrival::scope(self.arrival, self.ctx.emitter.append(&event)).await {
                 tracing::error!(error = %e, "dns: failed to append event");
             }

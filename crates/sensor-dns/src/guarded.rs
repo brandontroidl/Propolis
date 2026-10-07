@@ -8,19 +8,16 @@
 //! crate's single `send_to`. A reflected spoofed query therefore returns no more bytes than the
 //! spoofer sent, and there is no retransmission path.
 //!
-//! [`reply_gate`] also refuses to answer a source that cannot be a real client (unspecified,
-//! broadcast, multicast) or a source port that belongs to a legacy UDP service (echo, daytime,
-//! qotd, chargen, time, and port 0): a query spoofed "from" one of those would make the sensor
-//! start a loop with a third party's service.
+//! [`reply_gate`] also refuses to answer a source that cannot be a real client or a source port
+//! that belongs to a legacy UDP service, through `sensor_framework::check_reply_source`, the check
+//! every UDP-replying sensor shares.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::{SourceRefusal, check_reply_source};
 use tokio::net::UdpSocket;
-
-pub const REFLECTIVE_SOURCE_PORTS: [u16; 6] = [0, 7, 13, 17, 19, 37];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuppressReason {
@@ -32,9 +29,18 @@ pub enum SuppressReason {
 impl SuppressReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            SuppressReason::ReflectiveSourcePort => "reflective_source_port",
-            SuppressReason::UnroutableSource => "unroutable_source",
+            SuppressReason::ReflectiveSourcePort => SourceRefusal::ReflectiveSourcePort.as_str(),
+            SuppressReason::UnroutableSource => SourceRefusal::UnroutableSource.as_str(),
             SuppressReason::ByteBudget => "byte_budget",
+        }
+    }
+}
+
+impl From<SourceRefusal> for SuppressReason {
+    fn from(refusal: SourceRefusal) -> Self {
+        match refusal {
+            SourceRefusal::ReflectiveSourcePort => SuppressReason::ReflectiveSourcePort,
+            SourceRefusal::UnroutableSource => SuppressReason::UnroutableSource,
         }
     }
 }
@@ -87,14 +93,7 @@ pub fn reply_gate(
     query_len: usize,
     reply_len: usize,
 ) -> Result<(), SuppressReason> {
-    let ip = normalize_dual_stack(peer).ip();
-    let broadcast = ip == IpAddr::V4(Ipv4Addr::BROADCAST);
-    if ip.is_unspecified() || broadcast || ip.is_multicast() {
-        return Err(SuppressReason::UnroutableSource);
-    }
-    if REFLECTIVE_SOURCE_PORTS.contains(&peer.port()) {
-        return Err(SuppressReason::ReflectiveSourcePort);
-    }
+    check_reply_source(peer)?;
     let mut budget = ByteBudget::default();
     budget.record_received(query_len);
     if !budget.try_spend(reply_len) {
@@ -153,6 +152,7 @@ impl ReplySocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sensor_framework::REFLECTIVE_SOURCE_PORTS;
     use std::time::Duration;
 
     #[test]

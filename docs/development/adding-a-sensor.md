@@ -102,7 +102,11 @@ A sensor that answers over UDP (`sensor-tftp` and `sensor-dns` do) is a reflecti
 more than the checks above. It cannot use `run_udp_listener`, which never gives a handler
 the socket. It must instead route every send through a byte budget that refuses any packet
 taking bytes sent past bytes received from the peer, pin each transfer to the requester's
-exact address, never retransmit, and bound concurrency. `sensor-tftp/tests/integration.rs`
+exact address, never retransmit, and bound concurrency. It must also refuse to send to the
+sources `crates/sensor-framework/src/reply_source.rs#check_reply_source` rejects, and charge
+every inbound datagram to a `crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`, with
+a `crates/sensor-framework/src/rate_limit.rs#FloodLedger` summarizing what it refuses, so a
+spoofed flood gets a bounded number of replies and events. `sensor-tftp/tests/integration.rs`
 shows the tests that go with it: a reply-size bound against minimal requests, a source
 mismatch drop, and a static check that the crate has exactly one UDP send site
 (`crates/sensor-tftp/tests/integration.rs#never_amplifies_static_check`).

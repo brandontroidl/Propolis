@@ -23,6 +23,7 @@ pub mod outbox;
 pub mod persona;
 pub mod rate_limit;
 pub mod replay;
+pub mod reply_source;
 pub mod sanitize;
 pub mod shell;
 pub mod spool;
@@ -50,7 +51,9 @@ pub use logging::init_logging;
 pub use outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
 pub use rate_limit::{
     FloodLedger, FloodSummary, Rate, RateDecision, RateLimitConfig, ReplyRateLimiter, SourceKey,
+    rate_limited_event,
 };
+pub use reply_source::{REFLECTIVE_SOURCE_PORTS, SourceRefusal, check_reply_source};
 pub use sanitize::{sanitize_value, to_hex_bounded};
 pub use spool::{QuarantineSpool, SpoolError};
 pub use tls::{

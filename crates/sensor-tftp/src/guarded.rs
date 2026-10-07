@@ -13,12 +13,15 @@
 //!
 //! The same type pins the peer: it records the exact (ip, port) the request came from, sends only
 //! there, and reports any datagram from another source as [`Received::Foreign`] without counting
-//! it toward the budget.
+//! it toward the budget. Before the budget it re-runs `sensor_framework::check_reply_source`, so
+//! no packet can go to an unroutable source or a legacy reflector's port even if a caller skipped
+//! the handler's own check.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
 use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::{SourceRefusal, check_reply_source};
 use tokio::net::UdpSocket;
 
 /// Running totals for one transfer. `received` is bytes accepted from the pinned peer (the request
@@ -74,6 +77,8 @@ pub enum Sent {
     Ok,
     /// Refused by the byte budget; nothing was sent.
     OverBudget,
+    /// The peer is not a source anything may be sent to; nothing was sent.
+    Refused(SourceRefusal),
     Failed(io::Error),
 }
 
@@ -117,9 +122,13 @@ impl Transfer {
         Ok(Received::FromPeer(n))
     }
 
-    /// Send `packet` to the pinned peer if the byte budget allows it. This is the only `send_to`
-    /// in the crate; `never_amplifies_static_check` in `tests/integration.rs` keeps it that way.
+    /// Send `packet` to the pinned peer if the source check and the byte budget allow it. This is
+    /// the only `send_to` in the crate; `never_amplifies_static_check` in `tests/integration.rs`
+    /// keeps it that way.
     pub async fn send(&mut self, packet: &[u8]) -> Sent {
+        if let Err(refusal) = check_reply_source(self.peer) {
+            return Sent::Refused(refusal);
+        }
         if !self.budget.try_send(packet.len()) {
             return Sent::OverBudget;
         }
@@ -208,6 +217,30 @@ mod tests {
             Received::FromPeer(4)
         );
         assert_eq!(transfer.budget().received(), 13);
+    }
+
+    /// `send` re-applies the source check before the budget, so a transfer pinned to a reflective
+    /// port or an unroutable source can send nothing, however much budget the peer earned.
+    #[tokio::test]
+    async fn send_refuses_reflective_ports_and_unroutable_sources_before_the_budget() {
+        for (peer, refusal) in [
+            ("198.51.100.9:7", SourceRefusal::ReflectiveSourcePort),
+            ("198.51.100.9:19", SourceRefusal::ReflectiveSourcePort),
+            ("198.51.100.9:0", SourceRefusal::ReflectiveSourcePort),
+            ("255.255.255.255:4000", SourceRefusal::UnroutableSource),
+            ("[::ffff:224.0.0.1]:4000", SourceRefusal::UnroutableSource),
+            ("0.0.0.0:4000", SourceRefusal::UnroutableSource),
+        ] {
+            let mut transfer =
+                Transfer::bind("127.0.0.1".parse().unwrap(), peer.parse().unwrap(), 30)
+                    .await
+                    .unwrap();
+            match transfer.send(&[0, 5, 0, 1, 0]).await {
+                Sent::Refused(got) => assert_eq!(got, refusal, "{peer}"),
+                other => panic!("{peer}: {other:?}"),
+            }
+            assert_eq!(transfer.budget().sent(), 0, "{peer}: budget spent");
+        }
     }
 
     #[tokio::test]

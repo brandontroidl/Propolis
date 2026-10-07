@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
-    CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EnvError,
-    SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal, strict_env_var,
+    CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EnvError, Rate,
+    RateLimitConfig, SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal, strict_env_var,
 };
 use sensor_tftp::handler::MAX_BODY_HARD_CAP;
 
@@ -33,6 +34,10 @@ const ENV_OUTBOX_DIR: &str = "PROPOLIS_TFTP_OUTBOX_DIR";
 /// Ceiling, in bytes, on capture bodies buffered in memory across every transfer. Defaults to 40%
 /// of the unit's 256M `MemoryMax` (see `deploy/sensor-tftp.service`).
 const ENV_CAPTURE_MEMORY_BYTES: &str = "PROPOLIS_TFTP_CAPTURE_MEMORY_BYTES";
+const ENV_REPLY_RATE_PER_SOURCE: &str = "PROPOLIS_TFTP_REPLY_RATE_PER_SOURCE";
+const ENV_REPLY_BURST_PER_SOURCE: &str = "PROPOLIS_TFTP_REPLY_BURST_PER_SOURCE";
+const ENV_REPLY_RATE_GLOBAL: &str = "PROPOLIS_TFTP_REPLY_RATE_GLOBAL";
+const ENV_REPLY_BURST_GLOBAL: &str = "PROPOLIS_TFTP_REPLY_BURST_GLOBAL";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/tftp/events.jsonl";
 const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/tftp";
@@ -47,6 +52,15 @@ const DEFAULT_MAX_CAPTURED_BYTES: u64 = 1_000_000;
 /// for Vec growth slack. Raising this, or `PROPOLIS_TFTP_MAX_CAPTURED_BYTES`, without lowering
 /// the other lets a single-host WRQ flood OOM the unit (`default_memory_budget_fits_memory_max`).
 const DEFAULT_MAX_CONCURRENT: u32 = 128;
+/// Datagrams on the request socket handled (and logged one by one) per second per source /24 or
+/// /56; the same defaults as sensor-dns.
+const DEFAULT_REPLY_RATE_PER_SOURCE: u32 = 5;
+const DEFAULT_REPLY_BURST_PER_SOURCE: u32 = 10;
+/// Datagrams on the request socket handled per second across every source.
+const DEFAULT_REPLY_RATE_GLOBAL: u32 = 1000;
+const DEFAULT_REPLY_BURST_GLOBAL: u32 = 2000;
+/// How long shutdown waits to write the rate-limited summaries still accumulating.
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 enum ConfigError {
@@ -102,6 +116,7 @@ struct Config {
     collector_id: String,
     outbox_dir: PathBuf,
     capture_memory_bytes: u64,
+    rate: RateLimitConfig,
 }
 
 /// Resolve the outbox directory: the explicit `PROPOLIS_TFTP_OUTBOX_DIR` override if set, else a
@@ -147,7 +162,20 @@ fn load_config_from(
         });
     }
 
+    let rate = |var: &'static str, default: u32| -> Result<NonZeroU32, ConfigError> {
+        parse_rate_value(get(var)?.as_deref(), default, var)
+    };
+    let per_source = Rate::new(
+        rate(ENV_REPLY_RATE_PER_SOURCE, DEFAULT_REPLY_RATE_PER_SOURCE)?,
+        rate(ENV_REPLY_BURST_PER_SOURCE, DEFAULT_REPLY_BURST_PER_SOURCE)?,
+    );
+    let global = Rate::new(
+        rate(ENV_REPLY_RATE_GLOBAL, DEFAULT_REPLY_RATE_GLOBAL)?,
+        rate(ENV_REPLY_BURST_GLOBAL, DEFAULT_REPLY_BURST_GLOBAL)?,
+    );
+
     Ok(Config {
+        rate: RateLimitConfig::new(per_source, global),
         bind_addr,
         wan_map,
         log_path,
@@ -242,6 +270,20 @@ fn parse_positive_u32(
     Ok(value)
 }
 
+/// A reply rate or burst: unset takes `default`; zero or unparseable is an error, so a rate can
+/// never be configured off.
+fn parse_rate_value(
+    raw: Option<&str>,
+    default: u32,
+    field: &'static str,
+) -> Result<NonZeroU32, ConfigError> {
+    let value = parse_positive_u32(raw, default, field)?;
+    NonZeroU32::new(value).ok_or(ConfigError::InvalidBound {
+        field,
+        value: value.to_string(),
+    })
+}
+
 #[tokio::main]
 async fn main() {
     sensor_framework::init_logging();
@@ -256,7 +298,7 @@ async fn main() {
     let bind_addr = config.bind_addr;
 
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
-    let (bound, handle, handoff) = match sensor_tftp::start_test_server_with_handoff(
+    let server = match sensor_tftp::start_test_server_with_capture_budget(
         bind_addr,
         config.log_path,
         config.spool_dir,
@@ -265,10 +307,11 @@ async fn main() {
         config.collector_id,
         config.outbox_dir,
         Arc::new(CaptureMemoryBudget::new(config.capture_memory_bytes)),
+        config.rate,
     )
     .await
     {
-        Ok(pair) => pair,
+        Ok(server) => server,
         Err(e) => {
             let e = sensor_framework::listener_start_error(bind_addr, e);
             tracing::error!("sensor-tftp: {e}; refusing to start");
@@ -276,12 +319,20 @@ async fn main() {
         }
     };
 
-    tracing::info!(local = %bound, "sensor-tftp: listening");
+    tracing::info!(local = %server.addr, "sensor-tftp: listening");
     shutdown_signal().await;
     tracing::info!("sensor-tftp: shutdown signal received; stopping");
-    handle.abort();
+    server.abort();
+    // The request loop is stopped, so the ledger can only shrink: write what it holds, bounded by
+    // its fixed capacity and by this timeout.
+    if tokio::time::timeout(SHUTDOWN_FLUSH_TIMEOUT, server.flush_rate_limited())
+        .await
+        .is_err()
+    {
+        tracing::warn!("sensor-tftp: rate-limited summaries not all written before shutdown");
+    }
     // Queued captures only; a transfer cancelled mid-capture never submits (see handoff.rs).
-    handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
+    server.handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
 }
 
 #[cfg(test)]
@@ -354,6 +405,61 @@ mod tests {
         assert_eq!(cfg.bounds.read_timeout, Duration::from_millis(30_000));
         assert_eq!(cfg.bounds.idle_timeout, Duration::from_millis(60_000));
         assert_eq!(cfg.bounds.max_duration, Duration::from_secs(600));
+        assert_eq!(
+            (
+                cfg.rate.per_source.per_second(),
+                cfg.rate.per_source.burst()
+            ),
+            (5, 10)
+        );
+        assert_eq!(
+            (cfg.rate.global.per_second(), cfg.rate.global.burst()),
+            (1000, 2000)
+        );
+    }
+
+    const RATES: [&str; 4] = [
+        ENV_REPLY_RATE_PER_SOURCE,
+        ENV_REPLY_BURST_PER_SOURCE,
+        ENV_REPLY_RATE_GLOBAL,
+        ENV_REPLY_BURST_GLOBAL,
+    ];
+
+    #[test]
+    fn a_zero_or_non_numeric_reply_rate_is_an_error_not_a_disabled_limit() {
+        for field in RATES {
+            for bad in ["0", "-5", "fast", "4294967296", ""] {
+                match load(&[(ENV_BIND, "203.0.113.7:69"), (field, bad)]) {
+                    Err(ConfigError::InvalidBound { field: f, value }) => {
+                        assert_eq!((f, value.as_str()), (field, bad));
+                    }
+                    other => panic!("{field}={bad:?}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reply_rates_load_each_from_its_own_variable() {
+        let cfg = load(&[
+            (ENV_BIND, "203.0.113.7:69"),
+            (ENV_REPLY_RATE_PER_SOURCE, "7"),
+            (ENV_REPLY_BURST_PER_SOURCE, "11"),
+            (ENV_REPLY_RATE_GLOBAL, "300"),
+            (ENV_REPLY_BURST_GLOBAL, "450"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                cfg.rate.per_source.per_second(),
+                cfg.rate.per_source.burst()
+            ),
+            (7, 11)
+        );
+        assert_eq!(
+            (cfg.rate.global.per_second(), cfg.rate.global.burst()),
+            (300, 450)
+        );
     }
 
     /// `MemoryMax=256M` in `deploy/sensor-tftp.service`. The defaults' worst case (every slot and

@@ -11,11 +11,13 @@
 #     directory, holds no database handle and no secrets per the spec's "Least authority").
 #   - /etc/propolis/catchall.env (mode 0600, owned by propolis-catchall), carrying this sensor's
 #     configuration. crates/sensor-catchall/src/main.rs reads env vars, not a TOML/CLI config
-#     file: CATCHALL_BIND_ADDRS (required, comma-separated ip:port list), CATCHALL_LOG_PATH,
-#     CATCHALL_WAN_MAP, CATCHALL_READ_TIMEOUT_MS, CATCHALL_IDLE_TIMEOUT_MS,
-#     CATCHALL_MAX_DURATION_SECS, CATCHALL_MAX_CAPTURED_BYTES, CATCHALL_MAX_CONCURRENT (see that
-#     file's ENV_* constants for defaults and validation). CATCHALL_LOG_PATH must point inside
-#     the log ReadWritePaths entry below (matched by deploy/logrotate-sensors.conf).
+#     file: PROPOLIS_CATCHALL_BIND_ADDRS (required, comma-separated ip:port list),
+#     PROPOLIS_CATCHALL_LOG_PATH, PROPOLIS_CATCHALL_WAN_MAP, PROPOLIS_CATCHALL_READ_TIMEOUT_MS,
+#     PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS, PROPOLIS_CATCHALL_MAX_DURATION_SECS,
+#     PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES, PROPOLIS_CATCHALL_MAX_CONCURRENT (see that file's
+#     ENV_* constants for defaults and validation; the bare CATCHALL_* spellings are deprecated
+#     fallbacks). The log path must point inside the log ReadWritePaths entry below (matched by
+#     deploy/logrotate-sensors.conf).
 #   - /var/log/propolis/catchall and /var/spool/propolis/catchall, owned by propolis-catchall.
 #   - the spool directory backed by a noexec,nosuid,nodev mount, not merely a directory with
 #     restrictive permission bits - see the ReadWritePaths comment below.

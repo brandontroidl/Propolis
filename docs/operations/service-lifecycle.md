@@ -68,6 +68,33 @@ bad TLS setting exits 1 at start with `refusing to start`. See
 [networking-tls.md](networking-tls.md#sensor-tls-attacker-facing-listeners) for the variables
 and the failure modes.
 
+### Enabling one sensor later
+
+Forwarding a port on the router only delivers packets to the host; nothing answers, and the
+fleet pane shows nothing, until the sensor is configured, running, and known to the daemon. To
+add one sensor to a running node (sensor-tftp as the example):
+
+1. Set its bind in its env file, for example `PROPOLIS_TFTP_BIND=0.0.0.0:69` in
+   `/etc/propolis/tftp.env`. Without a bind the sensor exits instead of listening.
+2. Start it and keep it across reboots: `sudo systemctl enable --now sensor-tftp`, then check
+   `systemctl status sensor-tftp` shows it running and its journal has a `listening` line.
+3. Make sure the daemon tails its event log: `PROPOLIS_SENSOR_LOGS` in
+   `/etc/propolis/propolis.env` must list `tftp:/var/log/propolis/tftp/events.jsonl`. A
+   `propolis.env` written before that sensor existed will not have it (compare with
+   `deploy/propolis.env.example#PROPOLIS_SENSOR_LOGS`).
+4. Regenerate the fleet listener inventory and restart the daemon so the fleet pane lists the
+   new listener: `sudo deploy/fleet-listeners.sh && sudo systemctl restart propolis`. The pane
+   only knows the listeners derived from the `*_BIND` variables at that moment
+   (`deploy/fleet-listeners.sh`); `upgrade.sh` reruns it for you on the next upgrade.
+5. Open the port where it is reachable from outside: on the router, forward the right protocol
+   (UDP for sensor-tftp, both UDP and TCP on 53 for sensor-dns, TCP for the rest), and allow
+   it in any host firewall. sensor-tftp also answers each transfer from its own ephemeral UDP port, so a host
+   firewall must allow those replies.
+
+A UDP listener's reachability always reads `unknown` in the fleet pane: a connect probe cannot
+prove a UDP port is answering, so the pane judges it by events arriving instead
+(`crates/fleet/src/probe.rs#UDP_NOT_PROBEABLE`).
+
 `enable --now` both starts the unit and sets it to start at boot. Source:
 `docs/archive/2026-08-26/root/INSTALL.md#6. Start services` (the live `INSTALL.md` is now a redirect
 stub). Runnable commands are collected in
@@ -112,11 +139,29 @@ Stopping a unit sends SIGTERM (SIGINT on Ctrl-C); the daemon treats both as a cl
 shutdown request (`crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`, `crates/propolis/src/main.rs#shutdown_signal`, `crates/propolis/src/main.rs#main`):
 
 1. cancel all subsystems;
-2. await their task handles, bounded by a **30 s `SHUTDOWN_TIMEOUT`**
-   (`crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`), then log a warning and stop waiting if any handle has not finished;
-3. `pool.close()`.
+2. await their task handles concurrently (`crates/propolis/src/main.rs#drain_subsystems`), bounded by a **30 s
+   `SHUTDOWN_TIMEOUT`** (`crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`);
+3. **abort** any subsystem still running after that and give it up to **2 s** to unwind
+   (`crates/propolis/src/main.rs#ABORT_WAIT`). Aborting a supervised subsystem also aborts the task
+   underneath it (`crates/propolis/src/supervisor.rs#spawn_supervised`), so its pooled database
+   connection is released;
+4. `pool.close()`, bounded by **5 s** (`crates/propolis/src/main.rs#POOL_CLOSE_TIMEOUT`); if it times out the
+   daemon logs a warning and exits with connections open.
 
-A clean stop exits 0.
+The stop is therefore bounded at **37 s** in the worst case (30 + 2 + 5,
+`crates/propolis/src/main.rs#WORST_CASE_STOP`), well inside systemd's default 90 s stop timeout; the unit
+sets no `TimeoutStopSec`, so that default applies. A build-time assertion keeps the sum under it.
+A normal stop finishes as soon as every subsystem has returned, usually in well under a second.
+
+When a subsystem had to be aborted, the journal names it in one warning:
+
+```
+propolis: shutdown timed out waiting for: <name>[, <name>...]; aborted
+```
+
+The names are the subsystem names used in the supervisor's own log lines (a sensor's configured
+name, `listener-probe`, `review`, `feed`, `virustotal`, `sample-retention`, `fetcher`, `console`,
+`ops-monitor`). Per-subsystem completion is logged at debug. A clean stop exits 0.
 
 ## Restart policy
 

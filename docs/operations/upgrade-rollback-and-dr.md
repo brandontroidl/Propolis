@@ -38,6 +38,11 @@ The script (run as root, `sudo ./deploy/upgrade.sh`):
    binaries are in place, then `shipper.service` if enabled (after the gateway it
    dials). `propolis.service` is restarted on every host, so the script must not be
    run on a collector of a [split deployment](split-deployment.md#upgrading).
+   The "restarting propolis" step waits for the old process to stop before the new one
+   starts, which takes at most 37 s (30 s subsystem grace, 2 s abort, 5 s pool close; see
+   [service lifecycle](service-lifecycle.md#stop-and-graceful-shutdown)). The journal names
+   any subsystem that had to be aborted. Ctrl-C there only stops `systemctl` waiting; the
+   stop continues in the background.
 
 The unified daemon is the production surface; the standalone `intake`/`review`/
 `feed`/`console` units are superseded by it and are not part of the upgrade

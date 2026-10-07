@@ -33,6 +33,32 @@ fn publish(state: &SupervisorHandle, name: &'static str, s: SubsysState) {
         .insert(name, s);
 }
 
+/// Aborts the tasks behind its handles when dropped, including when the owning future is aborted.
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+/// `spawn_supervised`, returning the subsystem name with its handle so shutdown can report which
+/// subsystem failed to stop.
+pub fn spawn_supervised_named<F, Fut>(
+    name: &'static str,
+    cancel: CancellationToken,
+    state: SupervisorHandle,
+    factory: F,
+) -> (&'static str, JoinHandle<()>)
+where
+    F: Fn(CancellationToken) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    (name, spawn_supervised(name, cancel, state, factory))
+}
+
 pub fn spawn_supervised<F, Fut>(
     name: &'static str,
     cancel: CancellationToken,
@@ -57,6 +83,10 @@ where
             let child_token = cancel.child_token();
             let started_at = Instant::now();
             let handle = tokio::spawn(factory(child_token));
+            // Dropping a JoinHandle detaches its task. If the shutdown path aborts this supervisor
+            // task, the subsystem underneath must die with it, or it keeps running (and holding
+            // its pooled connection) after the daemon believes it stopped it.
+            let _abort_inner = AbortOnDrop(vec![handle.abort_handle()]);
             publish(&state, name, SubsysState::Running);
 
             match handle.await {
@@ -167,6 +197,9 @@ pub async fn watch_children(
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(&'static str, bool)>(children.len().max(1));
     let aborts: Vec<_> = children.iter().map(|(_, h)| h.abort_handle()).collect();
+    // The waiter tasks below own the child handles, and dropping a handle detaches its task: if
+    // this future is itself aborted at shutdown, the children must still die with it.
+    let _abort_children = AbortOnDrop(aborts.clone());
     for (name, handle) in children {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -282,6 +315,64 @@ mod tests {
             state.lock().unwrap().get("test-group"),
             Some(&SubsysState::GaveUp)
         );
+    }
+
+    /// Aborting the supervisor task must take the subsystem under it down too; a detached inner
+    /// task would keep its pooled connection through shutdown.
+    #[tokio::test]
+    async fn aborting_the_supervisor_aborts_the_subsystem_beneath_it() {
+        let alive = Arc::new(());
+        let probe = Arc::downgrade(&alive);
+        let handle = spawn_supervised(
+            "test-abort",
+            CancellationToken::new(),
+            new_state(),
+            move |_| {
+                let alive = alive.clone();
+                async move {
+                    let _held = alive;
+                    std::future::pending::<()>().await;
+                }
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            probe.upgrade().is_some(),
+            "subsystem is running and holding its resource"
+        );
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while probe.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the inner subsystem must release its resource when the supervisor is aborted");
+    }
+
+    #[tokio::test]
+    async fn aborting_watch_children_aborts_the_children() {
+        let alive = Arc::new(());
+        let probe = Arc::downgrade(&alive);
+        let child = tokio::spawn(async move {
+            let _held = alive;
+            std::future::pending::<()>().await;
+        });
+        let watcher = tokio::spawn(watch_children(
+            CancellationToken::new(),
+            vec![("kid", child)],
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        watcher.abort();
+        let _ = watcher.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while probe.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("children must not outlive an aborted watcher");
     }
 
     #[tokio::test]

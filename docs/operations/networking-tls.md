@@ -215,16 +215,17 @@ names for the other six are in [TLS surfaces](#tls-surfaces). A sensor's env fil
 
    ```
    sudo deploy/fleet-listeners.sh
-   sudo systemctl restart propolis console
+   sudo systemctl restart propolis
    ```
 
-   (`propolis.service` and `console.service` read `/etc/propolis/fleet-listeners.env` at start;
-   restart only the units you run.) Without this step the pane has no declared listener for the
-   port, and the new listener's events show as an undeclared listener. A pair-only change opens
-   no port and needs no inventory refresh. On a split deployment the inventory is maintained
-   by hand, see [split-deployment.md](split-deployment.md).
-5. Open the port in the host firewall (see [Firewall and exposure
-   guidance](#firewall-and-exposure-guidance)).
+   (In production the console runs inside `propolis.service`, which reads
+   `/etc/propolis/fleet-listeners.env` at start; a separate `console.service` exists only for
+   development and is not installed by `install.sh`.) Without this step the pane has no
+   declared listener for the port, and the new listener's events show as an undeclared
+   listener. A pair-only change opens no port and needs no inventory refresh. On a split
+   deployment the inventory is maintained by hand, see [split-deployment.md](split-deployment.md).
+5. Make the port reachable: forward it on the router (every TLS port is TCP) and open it in the
+   host firewall (see [Firewall and exposure guidance](#firewall-and-exposure-guidance)).
 
 #### Verify
 

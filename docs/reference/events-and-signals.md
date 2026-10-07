@@ -70,7 +70,8 @@ SHA-256. The body travels out-of-band (the spool); only this reference rides the
 The `sha256` here is the key into [`sample_analysis`](database.md#table-sample_analysis-0009_sample_analysissql).
 
 Body-capturing sensors cap what they retain (10 MB for SCP, SFTP, ADB and FTP
-STOR; `PROPOLIS_TELNET_MAX_CAPTURED_BYTES` for a telnet binary-payload capture)
+STOR; `PROPOLIS_TELNET_MAX_CAPTURED_BYTES` for a telnet binary-payload capture; the
+sensor's `max_captured_bytes` for a command's standard input)
 and drain the rest to keep the protocol aligned. Their `honeypot_malware_upload`
 metadata therefore also carries `wire_size` (bytes the client actually sent) and
 `truncated` (`wire_size > size`), built by `sensor_framework::upload_metadata`.
@@ -108,7 +109,7 @@ endings of `crates/sensor-framework/src/handoff.rs#CaptureEnd`.
 | `transport_error` | the socket failed, or a reply could not be written |
 | `malformed_input` | the peer sent something the protocol could not parse |
 | `capture_budget` | a sensor-side read bound: `max_captured_bytes`, or a per-transfer cap derived from it |
-| `peer_aborted` | the peer aborted the transfer with its protocol's error message |
+| `peer_aborted` | the peer aborted the transfer with its protocol's error message, or with Ctrl-C at a terminal |
 | `session_cancelled` | the listener cancelled the handler at `max_duration`; no code observed another ending |
 | `capture_memory_budget` | the process-wide capture memory budget ran out; overrides any other value (`crates/sensor-framework/src/handoff.rs#mark_budget_truncated`) |
 
@@ -122,11 +123,39 @@ What each sensor writes:
 | tftp WRQ | `transfer_complete` (short final block) | `capture_budget` (body cap or packet allowance), `idle_timeout`, `peer_aborted` (ERROR from the peer), `malformed_input` (oversized DATA), `transport_error`, `session_cancelled` |
 | mqtt PUBLISH | `transfer_complete` (the packet is read whole) | only `capture_memory_budget` |
 | ssh, telnet, adb binary shell payload | `peer_closed`, `client_logout` | `idle_timeout`, `transport_error`, `malformed_input` (ssh, adb), `capture_budget` (telnet, adb), `session_cancelled` |
+| ssh, telnet, adb standard input of a command (`exec_stdin`, `shell_stdin`) | `transfer_complete` (the SSH channel's EOF, Ctrl-D at the start of a terminal line) | `peer_aborted` (Ctrl-C), `capture_budget` (the input reached `max_captured_bytes`), `peer_closed` (the channel or ADB stream closed before end of input), `client_logout`, `idle_timeout`, `transport_error`, `malformed_input`, `session_cancelled` |
 
 Any of them can instead read `capture_memory_budget`. Events stored before `end_reason` was
 written for every capture (shell captures carried it earlier, the transfers did not) have no
 key; the fleet pane's capture panel counts those as `unrecorded`
 (`crates/console/src/routes/fleet.rs#top_end_reasons`), and they are not backfilled.
+
+#### `capture_reason` and the standard-input keys
+
+Captures that are not a protocol's own file transfer say why the bytes were kept:
+
+| `capture_reason` | sensors | what was captured |
+|---|---|---|
+| `binary_shell_payload` | ssh, telnet, adb | bytes typed at an interactive shell that look binary (a dropper streamed at the prompt) |
+| `binary_publish_payload` | mqtt | a PUBLISH payload that looks binary |
+| `exec_stdin` | ssh (exec channel), adb (`shell:<command>`) | the standard input a command read: the data sent on its channel or stream |
+| `shell_stdin` | ssh, telnet, adb (interactive shell) | the input a typed line read: what was typed after it (`cat > f` takes the lines up to Ctrl-D) |
+
+Standard input is captured text and binary alike, once per distinct body (SHA-256 of the bytes
+kept) per session, when the session ends, including by the listener's `max_duration`
+cancellation (`crates/sensor-framework/src/held_input.rs#StdinCaptures`). Each body is held to
+`max_captured_bytes`, the rest counted in `wire_size`. Bytes a command consumed are captured
+only as its input, never also as a `binary_shell_payload`. The `exec_stdin` and `shell_stdin`
+rows carry three more keys:
+
+| key | type | meaning |
+|---|---|---|
+| `command` | string | the line that read the input, sanitized and capped at 1024 characters, as `metadata.command` records it |
+| `destination` | string or null | the first file the reading command wrote (`cat > f`, `dd of=f`, `base64 -d > f`), sanitized and capped at 512 characters; null when the input went to no file (a bare `sh` ran it). `orig_name` is its last component |
+| `repeat_count` | integer | how many times the session sent this exact body: a bot retrying an upload yields one sample with a count, not one sample per attempt. When a later copy arrived whole, the capture takes that copy's `end_reason` |
+
+A session holds at most 16 distinct bodies (`crates/sensor-framework/src/held_input.rs#MAX_HELD_CAPTURES`);
+a further distinct one is submitted at once with `repeat_count` 1.
 
 ### Arrival metadata key
 

@@ -187,7 +187,7 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
 - If the line is single-byte-XOR obfuscated, `command_decoded` and `xor_key` are
   added to metadata (`crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
 - One `ConnectionBudget` per connection (`crates/sensor-framework/src/budget.rs#ConnectionBudget`, limits in `crates/sensor-framework/src/budget.rs#BudgetLimits::standard`)
-  bounds what a session can make the sensor hold or send: 256 KiB of created file content and 4096
+  bounds what a session can make the sensor hold or send: 192 KiB of created file content and 4096
   created nodes (a removed file's slot is not freed), 64 recorded downloads per connection and 8 per
   line, 16 MiB written to the peer, and per input line a work allowance and a re-entry depth of 16.
   A refused write prints the kernel's own `No space left on device`, `File too large` or
@@ -197,6 +197,30 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   the reply that spent it.
 - A recognized fetch verb additionally emits `honeypot_file_download` with
   `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell/mod.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
+- **Standard input.** The sensors run each line through `start_line`
+  (`crates/sensor-framework/src/shell/mod.rs#FakeShell::start_line`), which decides by the
+  shell's own model of the commands whether the line reads the session's input: it runs the line
+  with that input open and empty, and a command that reads past what has arrived (`cat` with no
+  file or `-`, `cat > f`, `cat >> f`, `dd` without `if=`, `base64 -d`, `head`, `read`, a bare `sh`
+  given a script on a pipe, any of these inside `sh -c '...'`, a `{ }` group or a pipeline's first
+  stage) makes the line wait. Everything that run did is rolled back (the shell's state, the
+  connection's filesystem and the budget counters its writes moved), so the line runs exactly
+  once, by `finish_line`, on the input that arrived. A command that reads no input never waits,
+  whatever its name; a here-document, `< file` or a pipe gives a reader its input without the
+  session's. The waiting line's `honeypot_command_exec` is emitted at once, without `status`. How
+  the input arrives is the sensor's (`crates/sensor-framework/src/held_input.rs#HeldInput`): the
+  rest of an SSH exec channel up to its EOF, or what is typed at a terminal, in canonical mode:
+  a line reaches the command at Enter, Backspace and Ctrl-U edit the line being typed, Ctrl-D at
+  the start of a line is end of input (elsewhere it hands over the line so far), Ctrl-C kills the
+  command (status 130, the rest of the line skipped, `^C` echoed), control characters echo as
+  `^X`. Input cut off (a closed channel, the session's end) kills the command as a hangup (status
+  129) at the read it waited in, keeping what it wrote. The input is bounded by
+  `max_captured_bytes` and the capture memory budget; reaching either ends it there and the
+  command sees end of file. What the command consumed is captured as `exec_stdin` or
+  `shell_stdin` ([events-and-signals.md](events-and-signals.md#capture_reason-and-the-standard-input-keys)).
+  Output is sent when the command ends, not as it reads: a typed `cat` with no redirection prints
+  its lines after Ctrl-D, not one by one, and `read` or `head -n 1` at a terminal waits for Ctrl-D
+  where a real one returns after its line.
 - Shell identity is state, not fixed response text (`crates/sensor-framework/src/shell/mod.rs#ShellContext`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::prompt`). An Ubuntu login starts as
   `-bash`, uses the interactive command-not-found handler and a prompt that follows
   the working directory. SSH exec uses `bash: line 1:` diagnostics and no prompt.
@@ -240,11 +264,14 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_wc`), `od` (`-An -tx1`, the default octal words and `-A`
   radixes; other formats print nothing, `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_od`) and `grep` (only `-F` with `-c`, `-v`, `-i`;
   a search without `-F` prints nothing, `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_grep`),
-  `ls` (sorted, dotfiles hidden without `-a`),
+  `ls` (sorted, dotfiles hidden without `-a`, which does not add `.` and `..`; a file operand lists
+  itself, files before directories, a `DIR:` heading once there are several operands, a missing
+  one is `cannot access` with status 2; `-l` is GNU's long listing from the node facts `stat` prints,
+  so a size or mode cannot disagree with `stat`, `wc -c` or `md5sum`, `crates/sensor-framework/src/shell/fileinfo.rs#FakeShell::cmd_ls`),
   `cp`/`rm`/`mkdir` (they change the session's filesystem and report the real errors),
   `wget`/`curl` (canned transcripts, `-O-`/`-qO-` writes body to stdout, a saved
   download becomes a file), `ping` (canned replies), `sh`/`bash`/`ash`
-  (nested shell; `sh -c "CMD"`, `sh FILE` and a script piped to `sh` run their text in a shell level of their own), `enable` (bash's builtin list, since
+  (nested shell; `sh -c "CMD"` (also with `-c` clustered, `sh -lc`, `bash -ec`), `sh FILE` and a script piped to `sh` run their text in a shell level of their own), `enable` (bash's builtin list, since
   Mirai's telnet preamble sends it and only a non-bash says "command not found"), `mount`
   (the fake filesystem's mount table), `busybox` (the real v1.30.1 multi-call banner
   plus applet dispatch; an unlisted name gives `applet not found`),
@@ -392,13 +419,23 @@ captures SCP/SFTP transfers.
   untouched, and stderr is sent as `CHANNEL_EXTENDED_DATA` type 1
   (`SSH_EXTENDED_DATA_STDERR`) while stdout stays on `CHANNEL_DATA`. `exec <cmd>` runs
   once in the exec-mode shell (noninteractive bash diagnostics); `scp -t ` starts the
-  SCP receiver, `subsystem sftp` the SFTP handler. `MAX_LINE_LEN = 8192`
+  SCP receiver, `subsystem sftp` the SFTP handler. An exec command that reads its standard
+  input (see [Fake shell](#fake-shell-ssh-telnet-adb)) is held with the channel open: the
+  channel's data is its input, collected while the window is replenished as usual, until the
+  client's `CHANNEL_EOF`, a `CHANNEL_CLOSE` (the command is killed and nothing is sent), the
+  capture ceiling, or the session's end. With a pty the input is a terminal (echo, Ctrl-D,
+  Ctrl-C), without one a pipe. At the shell, a typed line that reads its input takes the bytes
+  after it (to Ctrl-D with a pty, to the channel's EOF without one) and the prompt returns when it
+  ends; those bytes are its input and are not also offered to the binary-payload capture
+  (`crates/sensor-ssh/src/server.rs#ChannelHandler`). `MAX_LINE_LEN = 8192`
   (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/server.rs#build_channel_extended_data`, `crates/sensor-ssh/src/server.rs#MAX_LINE_LEN`, `crates/sensor-framework/src/shell/mod.rs#onlcr`).
 - **Exec lifecycle:** a one-shot exec sends its queued output, then `exit-status`
   (`want_reply` false), then `CHANNEL_EOF`, then `CHANNEL_CLOSE`, each only once all
-  queued output has drained, so a window-stalled reply still ends cleanly. An
-  interactive shell that exits takes the same path. A peer `CHANNEL_EOF` is a
-  half-close and does not cut queued output (`crates/sensor-ssh/src/server.rs#build_exit_status`, `crates/sensor-ssh/src/server.rs#build_channel_eof`, `crates/sensor-ssh/src/server.rs#build_channel_close`).
+  queued output has drained, so a window-stalled reply still ends cleanly. A command that
+  reads no input does this at the request, whether or not the client ever sends EOF; one held
+  for its input does it when the input ends. An interactive shell that exits takes the same
+  path. A peer `CHANNEL_EOF` is a half-close and does not cut queued output; it ends a held
+  command's input (`crates/sensor-ssh/src/server.rs#build_exit_status`, `crates/sensor-ssh/src/server.rs#build_channel_eof`, `crates/sensor-ssh/src/server.rs#build_channel_close`, `crates/sensor-ssh/src/server.rs#finish_exec`).
 - **Write deadline:** the session stream is wrapped once in `TimeoutStream`, so a write
   or flush pending past `idle_timeout` fails rather than letting a peer that stops
   reading (a zero window with a full socket buffer) stall the handler; the egress budget
@@ -419,7 +456,7 @@ captures SCP/SFTP transfers.
   256 (`crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CONCURRENT`).
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
   `honeypot_command_exec`, `honeypot_file_download` (via shell),
-  `honeypot_malware_upload` (SCP/SFTP).
+  `honeypot_malware_upload` (SCP/SFTP, a binary shell payload, a command's standard input).
 
 ### sensor-telnet
 
@@ -438,7 +475,12 @@ credential, then presents the fake shell.
   `honeypot_login_attempt` (authenticated=true); enters the FakeShell. Echoes typed
   characters, hides password characters, prints the active level's prompt, and closes
   only when the shell reports `close_session` (see below). `MAX_LINE_LEN` 8192
-  (`crates/sensor-telnet/src/handler.rs#LineReader`).
+  (`crates/sensor-telnet/src/handler.rs#LineReader`). The reader keeps what it read off the
+  socket and cuts lines from it only as they are wanted, so a typed line that reads its input
+  (`cat > f`) takes the raw bytes after it, as a terminal, until Ctrl-D, the same input model as
+  the SSH shell (`crates/sensor-telnet/src/handler.rs#LineReader::read_held`). The rest of a
+  CR-LF or CR-NUL Enter already read stays with its line. The binary-payload capture keeps the
+  bytes the line reader consumed, so input a command consumed is captured once, as that.
 - **Data encoder** (`crates/sensor-telnet/src/handler.rs#encode_telnet_data`): every
   application byte the client reads (issue banner, login and password prompts,
   typed-character echo, shell output, shell prompt) goes through one encoder and the
@@ -462,9 +504,11 @@ credential, then presents the fake shell.
   (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`). A timed-out or failed write ends the session (recorded as
   `TransportError` where a capture is armed), so a client that stops reading cannot
   hold the handler on a blocked `write_all`.
-- **Bounds:** common defaults, `max_concurrent` 256. **Does not spool bodies.**
+- **Bounds:** common defaults, `max_concurrent` 256. Spools only shell-phase evidence: a binary
+  shell payload and the standard input a command read; there is no file-transfer protocol.
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
-  `honeypot_command_exec`, `honeypot_file_download` (via shell).
+  `honeypot_command_exec`, `honeypot_file_download` (via shell), `honeypot_malware_upload` (a
+  binary shell payload, a command's standard input).
 
 ### sensor-http
 
@@ -1059,7 +1103,14 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
   `sh: x: not found` rather than bash's `command not found`; authenticated **always
   false** - ADB has no auth step),
   `shell:<cmd>` → one-shot exec, `sync:` → file-transfer sub-protocol, anything
-  else refused. Sync sub-protocol: SEND/DATA/DONE → captures the pushed file →
+  else refused. A `shell:<cmd>` that reads its standard input (see
+  [Fake shell](#fake-shell-ssh-telnet-adb)) holds the stream open and takes its WRTE data as
+  input; legacy ADB has no end-of-input message on a shell stream, so the client's CLSE (the
+  command is killed, nothing is sent, the capture's end is `peer_closed`), the capture ceiling
+  (the command runs on what was kept and the stream closes after its output) or the session's
+  end ends it. At the interactive `shell:` a typed line that reads its input takes what is typed
+  after it until Ctrl-D, as on the SSH and telnet shells
+  (`crates/sensor-adb/src/handler.rs#HeldStdin`). Sync sub-protocol: SEND/DATA/DONE → captures the pushed file →
   `honeypot_malware_upload`; RECV → refused (`FAIL Permission denied`, **never
   serves outbound**); STAT → not-found. Sync body cap `MAX_SYNC_BODY` 10_000_000
   (a larger push keeps the prefix and is emitted with `truncated`/`wire_size`). A SEND
@@ -1104,7 +1155,8 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`lib.rs`).
 - **Bounds:** common defaults, `max_concurrent` 256.
 - **Emits:** `honeypot_connection`, `honeypot_command_exec` (shell),
-  `honeypot_malware_upload` (sync push). **All ADB events are authenticated=false.**
+  `honeypot_malware_upload` (sync push, a binary shell payload, a command's standard input).
+  **All ADB events are authenticated=false.**
 
 ### sensor-catchall
 

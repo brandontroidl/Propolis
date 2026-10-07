@@ -1352,6 +1352,42 @@ async fn an_adb_shell_command_that_reads_its_input_holds_the_stream_until_the_cl
     srv.handle.abort();
 }
 
+/// A binary payload a typed `cat > f` consumed is captured once, as that command's input: the
+/// shell capture, which keeps what was typed at the shell itself, never sees it.
+#[tokio::test]
+async fn bytes_a_typed_adb_command_consumed_are_not_also_captured_as_a_shell_payload() {
+    let srv = TestServer::start().await;
+    let (mut conn, server_id) = connect_shell(&srv, 1).await;
+    // High-bit bytes and no line ending until the Ctrl-D: a binary flood if the shell saw them.
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80 | (i & 0x3f)).collect();
+    let mut typed = b"cat > /data/local/tmp/bin\n".to_vec();
+    typed.extend_from_slice(&payload);
+    typed.extend_from_slice(b"\x04\x04");
+    conn.write_all(&adb_proto::build_wrte(1, server_id, &typed))
+        .await
+        .unwrap();
+    let (ack, _) = read_message(&mut conn).await;
+    assert_eq!(ack.command, adb_proto::A_OKAY);
+    let mut output = Vec::new();
+    while !output.ends_with(b"# ") {
+        let (wrte, data) = read_message(&mut conn).await;
+        output.extend_from_slice(&data);
+        acknowledge_wrte(&mut conn, &wrte).await;
+    }
+    conn.write_all(&adb_proto::build_clse(1, server_id))
+        .await
+        .unwrap();
+    drop(conn);
+    uploads(&srv, 1).await;
+    // Both captures are submitted as the session ends; give a second one time to appear.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let events = uploads(&srv, 1).await;
+    assert_eq!(events.len(), 1, "one capture of the bytes: {events:?}");
+    assert_eq!(events[0].metadata["capture_reason"], "shell_stdin");
+    assert_eq!(events[0].metadata["size"], payload.len());
+    srv.handle.abort();
+}
+
 /// The captures stored in `dir`: files named by the SHA-256 of their content. The spool also holds a
 /// `.staging/` directory, where a body is written before it is published under that name.
 fn spooled_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

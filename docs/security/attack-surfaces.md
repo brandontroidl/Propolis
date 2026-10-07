@@ -150,6 +150,20 @@ TLS, as in plaintext. A half-configured or unusable pair makes the sensor refuse
 than serve plaintext. See
 [../operations/networking-tls.md](../operations/networking-tls.md#sensor-cred-in-band-tls).
 
+The fake shell on SSH, telnet and ADB holds a command that reads its standard input open until
+that input ends, so a client can make the sensor keep a channel or stream open and collect bytes
+for it. That collection is bounded the way the binary shell capture is: each held input keeps at
+most `max_captured_bytes`, charged to the process-wide capture memory budget, and ends (the command
+then runs on what was kept) once either is reached; a client that stops sending is cut by the idle
+timeout and every session by `max_duration`. SSH still caps a connection at 10 channels and ADB at
+32 streams. The bodies a session's commands consumed are held, deduplicated, until the session ends,
+at most 16 distinct ones (a further one is submitted at once), so a retried upload costs one copy.
+Deciding whether a line waits runs the line once and rolls back what it did, which copies the
+connection's written-file overlay per line; that overlay is bounded by the connection budget's
+node and content limits. The held bytes are only ever written into the in-memory fake filesystem
+and the quarantine spool; nothing runs them. See
+[../reference/sensor-behavior.md](../reference/sensor-behavior.md#fake-shell-ssh-telnet-adb).
+
 Controls:
 
 - **Never-execute.** No sensor spawns a subprocess or execs; the honeypot captures, it

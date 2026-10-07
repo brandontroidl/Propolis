@@ -2239,3 +2239,35 @@ async fn cat_at_the_shell_takes_typed_lines_until_ctrl_d_and_captures_them() {
     assert_eq!(cut.metadata["end_reason"], "peer_aborted");
     assert_eq!(cut.metadata["complete"], false);
 }
+
+/// A binary payload a typed `cat > f` consumed is that command's input and is captured once, as
+/// `shell_stdin`. The same bytes typed at the shell itself would be a binary flood the shell
+/// capture keeps; here they never reached the shell, so it keeps nothing and no second sample of
+/// them appears.
+#[tokio::test]
+async fn bytes_a_typed_command_consumed_are_not_also_captured_as_a_shell_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+    let mut channel = open_shell(&session).await;
+    // High-bit bytes and no line ending until the Ctrl-D: a binary flood if the shell saw them.
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80 | (i & 0x3f)).collect();
+    let mut typed = b"cat > /tmp/bin\r".to_vec();
+    typed.extend_from_slice(&payload);
+    typed.extend_from_slice(b"\x04\x04");
+    channel.data(&typed[..]).await.unwrap();
+    read_to_prompt(&mut channel).await;
+    drop(channel);
+    drop(session);
+    uploads(&dir.path().join("events.jsonl"), 1).await;
+    // Both captures are submitted as the session ends; give a second one time to appear.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let events = uploads(&dir.path().join("events.jsonl"), 1).await;
+    handle.abort();
+    assert_eq!(events.len(), 1, "one capture of the bytes: {events:?}");
+    assert_eq!(events[0].metadata["capture_reason"], "shell_stdin");
+    assert_eq!(
+        events[0].sample.as_ref().unwrap().sha256,
+        sha256_hex(&payload)
+    );
+}

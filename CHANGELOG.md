@@ -339,6 +339,25 @@
 
 ### Fixed
 
+- **A command's standard input reaches it, and is captured** - an SSH exec ran at the request
+  and closed the channel, so the payload a bot streamed after `cat > astats` or `cat > w.sh`
+  hit a closed channel: the file stayed empty, nothing was captured, and the bot retried and
+  left. The fake shell now decides, by running the line against its own model of the commands
+  and rolling back what that run did (`FakeShell::start_line`), whether a line reads its input
+  (`cat`, `cat > f`, `dd` without `if=`, `base64 -d`, `head`, `read`, a bare `sh` on a pipe,
+  the same inside `sh -c`, a group or a pipeline). Such an SSH exec is held with the channel
+  open until the client's EOF (or CLOSE, the idle timeout, `max_captured_bytes`, the session's
+  end) and then runs once on the input, followed by its output, exit status, EOF and CLOSE; a
+  command that reads no input still completes at the request. At the SSH, telnet and ADB
+  shells a typed `cat > f` takes the lines after it until Ctrl-D, as a terminal does (Ctrl-C
+  kills it, status 130), and an ADB `shell:<command>` that reads input holds its stream until
+  the client closes it. Every consumed body, text or binary, becomes one
+  `honeypot_malware_upload` per distinct SHA-256 per session, with `capture_reason`
+  `exec_stdin` or `shell_stdin`, the `command`, the `destination` file and a `repeat_count`
+  for retried uploads; those bytes are no longer also offered to the binary-payload shell
+  capture. `ls` now lists a file operand (it said `No such file` for a file `wc` read) and has
+  a `-l` long listing from the facts `stat` prints, and `sh -lc`/`bash -ec` find their
+  clustered `-c` script instead of running the script text as a file name.
 - **Every captured upload records why it ended** - the fleet pane's capture panel gave
   `unrecorded` as the end reason of incomplete captures (ten of ten for SSH), because
   `upload_metadata` took only a `complete` flag and `end_reason` was added by hand at the three

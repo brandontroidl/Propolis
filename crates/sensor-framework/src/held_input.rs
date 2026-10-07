@@ -164,12 +164,23 @@ impl HeldInput {
         self.body.is_empty()
     }
 
+    /// The line that started this input ended with a CR, so an LF (or a telnet NUL) right after
+    /// it is the rest of that Enter, not an empty first line of input.
+    pub fn after_cr(mut self) -> Self {
+        self.prev_cr = true;
+        self
+    }
+
     /// Take `data` as input. Stops at the byte that ends the input (a terminal's Ctrl-D at the
     /// start of a line or Ctrl-C, or the capture ceiling), leaving the rest to the caller.
     pub fn feed(&mut self, data: &[u8]) -> Fed {
         match self.mode {
             InputMode::Pipe => {
-                let ended = (!self.release(data)).then_some(HeldEnd::Budget);
+                let skip = usize::from(
+                    std::mem::take(&mut self.prev_cr) && matches!(data.first(), Some(b'\n' | 0)),
+                );
+                let rest = data.get(skip..).unwrap_or_default();
+                let ended = (!self.release(rest)).then_some(HeldEnd::Budget);
                 Fed {
                     taken: data.len(),
                     echo: Vec::new(),

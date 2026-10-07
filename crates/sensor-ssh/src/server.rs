@@ -19,9 +19,11 @@ use tokio::task::JoinHandle;
 
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
 use sensor_framework::{
-    BudgetLimits, CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, CaptureMemoryBudget,
-    ConnectionBounds, ConnectionBudget, EgressState, EventEmitter, OutboxManifest, QuarantineSpool,
-    UploadEnd, WanResolver, default_capture_budget_bytes, limits_from,
+    BudgetLimits, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody, CaptureEnd,
+    CaptureHandoff, CaptureJob, CaptureMemoryBudget, CaptureSource, ConnectionBounds,
+    ConnectionBudget, EgressState, EventEmitter, HeldEnd, HeldInput, InputMode, OutboxManifest,
+    QuarantineSpool, StdinCaptures, UploadEnd, WanResolver, default_capture_budget_bytes,
+    limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
@@ -34,7 +36,7 @@ use crate::channel::{
 };
 use crate::fakefs::FakeFs;
 use crate::hostkey::HostKey;
-use crate::shell::{EmitContext, FakeShell, OutputFd, onlcr};
+use crate::shell::{CommandResult, EmitContext, FakeShell, LineStep, OutputFd, onlcr};
 use crate::timeout_stream::TimeoutStream;
 use crate::transfer::{ScpReceiver, SftpHandler};
 use crate::transport::cipher::TransportCipher;
@@ -60,10 +62,15 @@ const MAX_CHANNELS_PER_CONNECTION: usize = 10;
 enum ChannelHandler {
     /// Awaiting a channel request to determine the handler type.
     Pending,
-    /// Interactive fake shell with a line buffer for incremental input. Boxed: the shell owns a
-    /// whole filesystem snapshot and dwarfs the other variants, so an unboxed one would make
+    /// Interactive fake shell with a line buffer for incremental input, and the input of a typed
+    /// line that reads it (`cat > f` takes the lines after it until Ctrl-D). Boxed: the shell owns
+    /// a whole filesystem snapshot and dwarfs the other variants, so an unboxed one would make
     /// every `ChannelHandler` that size.
-    Shell(Box<FakeShell>, Vec<u8>),
+    Shell(Box<FakeShell>, Vec<u8>, Option<HeldInput>),
+    /// An exec command that reads its standard input, held until the input ends: the channel's
+    /// EOF, its CLOSE, the capture ceiling, or the session's end. Commands that do not read it
+    /// complete at the request and never get here.
+    Exec(Box<FakeShell>, Option<HeldInput>),
     /// SCP server-mode file receiver.
     Scp(ScpReceiver),
     /// SFTP subsystem handler.
@@ -72,12 +79,18 @@ enum ChannelHandler {
 
 impl ChannelHandler {
     /// The channel is going away, ended by `end`: a file transfer still open on it is submitted
-    /// as cut off by that, rather than by the `Cancelled` its `Drop` would have to assume.
+    /// as cut off by that, rather than by the `Cancelled` its `Drop` would have to assume, and a
+    /// command still reading its input ends with what arrived, killed by the hangup.
     fn cut_off(&mut self, end: CaptureEnd) {
         match self {
             Self::Scp(scp) => scp.cut_off(end),
             Self::Sftp(sftp) => sftp.cut_off(end),
-            Self::Pending | Self::Shell(..) => {}
+            Self::Shell(shell, _, held) | Self::Exec(shell, held) => {
+                if let Some(input) = held.take() {
+                    let _ = input.finish(shell, HeldEnd::Cut(end));
+                }
+            }
+            Self::Pending => {}
         }
     }
 }
@@ -482,436 +495,587 @@ async fn handle_session(
         session_id,
     };
 
+    // What commands on this connection read from their standard input: an exec channel's stream
+    // up to its EOF, or lines typed at the shell after `cat > f`. Submitted when the last handle
+    // goes, the held inputs' own included, so a cancelled session keeps them too.
+    let stdin_captures = StdinCaptures::new(
+        handoff.clone(),
+        CaptureSource {
+            sensor: "ssh",
+            source_ip,
+            wan_ip,
+            session_id,
+            authenticated: true,
+        },
+    );
+
     // ---- Main encrypted packet loop ----
     // Run as a block so that however the loop ends (clean close, read error, a failed write
     // propagating with `?`) the evidence held in `handler` and `shell_capture` is still
     // submitted below. A write error used to return straight out of this function and take a
     // half-received SCP or SFTP file with it.
     let loop_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
-    loop {
-        let payload =
-            match transport::read_packet_encrypted(&mut stream, &mut c2s_cipher, c2s_seq).await {
-                Ok(p) => p,
-                // These are four different endings, and a capture cannot say whether its bytes
-                // are whole unless they stay apart. A closed connection means the peer finished
-                // sending; a timeout or a socket error means it did not.
-                Err(e) => {
-                    shell_capture.mark_session_end(classify_read_failure(&e));
+        loop {
+            let payload =
+                match transport::read_packet_encrypted(&mut stream, &mut c2s_cipher, c2s_seq).await
+                {
+                    Ok(p) => p,
+                    // These are four different endings, and a capture cannot say whether its bytes
+                    // are whole unless they stay apart. A closed connection means the peer finished
+                    // sending; a timeout or a socket error means it did not.
+                    Err(e) => {
+                        shell_capture.mark_session_end(classify_read_failure(&e));
+                        break;
+                    }
+                };
+            c2s_seq = c2s_seq.wrapping_add(1);
+
+            if payload.is_empty() {
+                continue;
+            }
+
+            let msg_type = payload[0];
+
+            match msg_type {
+                SSH_MSG_DISCONNECT => {
+                    shell_capture.mark_session_end(CaptureEnd::ClientLogout);
                     break;
                 }
-            };
-        c2s_seq = c2s_seq.wrapping_add(1);
+                SSH_MSG_IGNORE | SSH_MSG_UNIMPLEMENTED => continue,
 
-        if payload.is_empty() {
-            continue;
-        }
-
-        let msg_type = payload[0];
-
-        match msg_type {
-            SSH_MSG_DISCONNECT => {
-                shell_capture.mark_session_end(CaptureEnd::ClientLogout);
-                break;
-            }
-            SSH_MSG_IGNORE | SSH_MSG_UNIMPLEMENTED => continue,
-
-            SSH_MSG_SERVICE_REQUEST => {
-                // Respond with SERVICE_ACCEPT for "ssh-userauth".
-                let accept = build_service_accept(b"ssh-userauth");
-                write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &accept).await?;
-            }
-
-            SSH_MSG_USERAUTH_REQUEST => {
-                let (response, events) = match auth_state.handle_userauth(&payload) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "malformed userauth");
-                        continue;
-                    }
-                };
-                for event in &events {
-                    emitter.append(event).await?;
+                SSH_MSG_SERVICE_REQUEST => {
+                    // Respond with SERVICE_ACCEPT for "ssh-userauth".
+                    let accept = build_service_accept(b"ssh-userauth");
+                    write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &accept).await?;
                 }
-                write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &response).await?;
-            }
 
-            SSH_MSG_CHANNEL_OPEN => {
-                let opened = match handle_channel_open(&payload) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "malformed channel open");
-                        continue;
-                    }
-                };
-                let response = if opened.accepted
-                    && (channels.len() >= MAX_CHANNELS_PER_CONNECTION
-                        || channels.contains_key(&opened.recipient_channel))
-                {
-                    build_channel_open_resource_shortage(opened.recipient_channel)
-                } else {
-                    opened.response
-                };
-                let accepted = opened.accepted
-                    && channels.len() < MAX_CHANNELS_PER_CONNECTION
-                    && !channels.contains_key(&opened.recipient_channel);
-                write_encrypted(
-                    &mut stream,
-                    &mut s2c_cipher,
-                    &mut s2c_seq,
-                    &response,
-                )
-                .await?;
-                if accepted {
-                    channels.insert(
-                        opened.recipient_channel,
-                        ChannelState {
-                            handler: ChannelHandler::Pending,
-                            flow: ChannelFlow::new(opened.peer_window, opened.peer_max_packet),
-                        },
-                    );
-                }
-            }
-
-            SSH_MSG_CHANNEL_REQUEST => {
-                let Some(ch_id) = channel_recipient(&payload, SSH_MSG_CHANNEL_REQUEST) else {
-                    continue;
-                };
-                let Some(state) = channels.get_mut(&ch_id) else {
-                    continue;
-                };
-                let request = match handle_channel_request(&payload, ch_id) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "malformed channel request");
-                        continue;
-                    }
-                };
-
-                let accepted = match &request.action {
-                    ChannelAction::PtyReq => {
-                        matches!(state.handler, ChannelHandler::Pending) && !state.flow.close_sent
-                    }
-                    ChannelAction::Shell | ChannelAction::Exec(_) => {
-                        matches!(state.handler, ChannelHandler::Pending) && !state.flow.close_sent
-                    }
-                    ChannelAction::Subsystem(name) => {
-                        name == "sftp"
-                            && matches!(state.handler, ChannelHandler::Pending)
-                            && !state.flow.close_sent
-                    }
-                    ChannelAction::Other => false,
-                };
-                if request.want_reply {
-                    let response = if accepted {
-                        build_channel_success(ch_id)
-                    } else {
-                        build_channel_failure(ch_id)
+                SSH_MSG_USERAUTH_REQUEST => {
+                    let (response, events) = match auth_state.handle_userauth(&payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "malformed userauth");
+                            continue;
+                        }
                     };
-                    write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &response)
-                        .await?;
+                    for event in &events {
+                        emitter.append(event).await?;
+                    }
+                    write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &response).await?;
                 }
 
-                if !accepted {
-                    continue;
+                SSH_MSG_CHANNEL_OPEN => {
+                    let opened = match handle_channel_open(&payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "malformed channel open");
+                            continue;
+                        }
+                    };
+                    let response = if opened.accepted
+                        && (channels.len() >= MAX_CHANNELS_PER_CONNECTION
+                            || channels.contains_key(&opened.recipient_channel))
+                    {
+                        build_channel_open_resource_shortage(opened.recipient_channel)
+                    } else {
+                        opened.response
+                    };
+                    let accepted = opened.accepted
+                        && channels.len() < MAX_CHANNELS_PER_CONNECTION
+                        && !channels.contains_key(&opened.recipient_channel);
+                    write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &response).await?;
+                    if accepted {
+                        channels.insert(
+                            opened.recipient_channel,
+                            ChannelState {
+                                handler: ChannelHandler::Pending,
+                                flow: ChannelFlow::new(opened.peer_window, opened.peer_max_packet),
+                            },
+                        );
+                    }
                 }
 
-                match request.action {
-                    ChannelAction::PtyReq => {
-                        state.flow.pty = true;
-                    }
-                    ChannelAction::Shell => {
-                        let ctx = EmitContext {
-                            source_ip,
-                            wan_ip,
-                            authenticated: auth_state.is_authenticated(),
-                            protocol_label: "ssh".to_string(),
-                            session_id: Some(session_id),
-                        };
-                        let shell = FakeShell::new(base_fs.share(), ctx).with_budget(budget.clone());
-                        let prompt = shell.prompt();
-                        state.handler = ChannelHandler::Shell(Box::new(shell), Vec::new());
-                        if state.flow.pty {
-                            state.flow.queue(OutputFd::Stdout, prompt.into_bytes());
-                            flush_channel_output(
-                                &mut stream,
-                                &mut s2c_cipher,
-                                &mut s2c_seq,
-                                ch_id,
-                                &mut state.flow,
-                                &budget,
-                            )
-                            .await?;
+                SSH_MSG_CHANNEL_REQUEST => {
+                    let Some(ch_id) = channel_recipient(&payload, SSH_MSG_CHANNEL_REQUEST) else {
+                        continue;
+                    };
+                    let Some(state) = channels.get_mut(&ch_id) else {
+                        continue;
+                    };
+                    let request = match handle_channel_request(&payload, ch_id) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "malformed channel request");
+                            continue;
                         }
-                    }
-                    ChannelAction::Exec(cmd) => {
-                        // Emit a command_exec event for the exec command itself.
-                        let shell_ctx = EmitContext {
-                            source_ip,
-                            wan_ip,
-                            authenticated: auth_state.is_authenticated(),
-                            protocol_label: "ssh".to_string(),
-                            session_id: Some(session_id),
-                        };
-                        let mut shell =
-                            FakeShell::exec(base_fs.share(), shell_ctx).with_budget(budget.clone());
-                        let (output, events) = shell.handle_input(&cmd);
-                        for event in &events {
-                            emitter.append(event).await?;
-                        }
+                    };
 
-                        if cmd.starts_with("scp -t ") {
-                            // SCP server mode.
-                            let (scp, initial) = ScpReceiver::new(
-                                source_ip,
-                                wan_ip,
-                                session_id,
-                                handoff.clone(),
-                                base_fs.share(),
-                                &cmd,
-                            );
-                            state.handler = ChannelHandler::Scp(scp);
-                            state.flow.queue(OutputFd::Stdout, initial);
-                            flush_channel_output(
-                                &mut stream,
-                                &mut s2c_cipher,
-                                &mut s2c_seq,
-                                ch_id,
-                                &mut state.flow,
-                                &budget,
-                            )
-                            .await?;
+                    let accepted = match &request.action {
+                        ChannelAction::PtyReq => {
+                            matches!(state.handler, ChannelHandler::Pending)
+                                && !state.flow.close_sent
+                        }
+                        ChannelAction::Shell | ChannelAction::Exec(_) => {
+                            matches!(state.handler, ChannelHandler::Pending)
+                                && !state.flow.close_sent
+                        }
+                        ChannelAction::Subsystem(name) => {
+                            name == "sftp"
+                                && matches!(state.handler, ChannelHandler::Pending)
+                                && !state.flow.close_sent
+                        }
+                        ChannelAction::Other => false,
+                    };
+                    if request.want_reply {
+                        let response = if accepted {
+                            build_channel_success(ch_id)
                         } else {
-                            // One-shot exec: queue stream-aware output, then exit-status, EOF and
-                            // CLOSE. Large output remains queued until the peer replenishes its
-                            // window instead of being emitted as one invalid SSH packet.
-                            for segment in output.output {
-                                let bytes = if state.flow.pty {
-                                    onlcr(&segment.bytes)
-                                } else {
-                                    segment.bytes
-                                };
-                                state.flow.queue(segment.fd, bytes);
-                            }
-                            state.flow.finish_status = Some(output.status);
-                            flush_channel_output(
-                                &mut stream,
-                                &mut s2c_cipher,
-                                &mut s2c_seq,
-                                ch_id,
-                                &mut state.flow,
-                                &budget,
-                            )
+                            build_channel_failure(ch_id)
+                        };
+                        write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &response)
                             .await?;
-                        }
                     }
-                    ChannelAction::Subsystem(name) => {
-                        if name == "sftp" {
-                            let sftp = SftpHandler::new(
+
+                    if !accepted {
+                        continue;
+                    }
+
+                    match request.action {
+                        ChannelAction::PtyReq => {
+                            state.flow.pty = true;
+                        }
+                        ChannelAction::Shell => {
+                            let ctx = EmitContext {
                                 source_ip,
                                 wan_ip,
-                                session_id,
-                                handoff.clone(),
-                                base_fs.share(),
-                            );
-                            state.handler = ChannelHandler::Sftp(sftp);
-                        }
-                    }
-                    ChannelAction::Other => {}
-                }
-            }
-
-            SSH_MSG_CHANNEL_DATA => {
-                // Parse: byte(94) + uint32(channel) + string(data)
-                if payload.len() < 9 {
-                    continue;
-                }
-                let ch_id = u32::from_be_bytes(payload[1..5].try_into().unwrap());
-                let Some(state) = channels.get_mut(&ch_id) else {
-                    continue;
-                };
-                if state.flow.close_sent {
-                    continue;
-                }
-                let data_len = u32::from_be_bytes(payload[5..9].try_into().unwrap()) as usize;
-                if data_len > CHANNEL_MAX_PACKET_SIZE as usize || payload.len() < 9 + data_len {
-                    continue;
-                }
-                let data = &payload[9..9 + data_len];
-                let pty = state.flow.pty;
-                let mut nonpty_segments = Vec::new();
-
-                match &mut state.handler {
-                    ChannelHandler::Shell(shell, line_buf) => {
-                        // Accumulate the raw bytes as evidence before any line-buffering or echo
-                        // logic below touches them, bounded so a captured session can never grow
-                        // past `max_captured_bytes` - the operator-configured ceiling this crate's
-                        // own `ConnectionBounds` defines. Whether the buffer is ever submitted
-                        // depends on `binary_seen`, set below when the shared FakeShell flags a
-                        // binary flood; a plaintext-only session accumulates here but the buffer is
-                        // discarded, never spooled, once the loop ends.
-                        shell_capture.push(data);
-
-                        // A real interactive session runs the client terminal in raw mode and relies
-                        // on the SERVER to echo keystrokes. Without that echo the attacker types into
-                        // a blank screen and the session looks frozen (and no-echo is itself a tell,
-                        // since every real shell echoes). So each printable byte is echoed as it
-                        // arrives, backspace erases on screen, and Enter echoes CR-LF and shows a
-                        // fresh prompt - even for an empty line, as a real shell does.
-                        let mut responses = Vec::new();
-                        let mut prev_cr = false;
-                        let mut close_shell = false;
-                        for &byte in data {
-                            match byte {
-                                b'\r' | b'\n' => {
-                                    // Swallow the LF of a CR-LF pair so Enter is one line, not two.
-                                    if byte == b'\n' && prev_cr {
-                                        prev_cr = false;
-                                        continue;
-                                    }
-                                    prev_cr = byte == b'\r';
-                                    if pty {
-                                        responses.extend_from_slice(b"\r\n");
-                                    }
-                                    if !line_buf.is_empty() {
-                                        let line = String::from_utf8_lossy(line_buf).to_string();
-                                        line_buf.clear();
-                                        let (output, events) = shell.handle_input(&line);
-                                        for event in &events {
-                                            if event.metadata.get("flood").and_then(|v| v.as_str())
-                                                == Some("binary")
-                                            {
-                                                shell_capture.flag_binary();
-                                            }
-                                            if emitter.append(event).await.is_err() {
-                                                tracing::error!(%peer_addr, "ssh: failed to append command event");
-                                            }
-                                        }
-                                        if !output.is_empty() && pty {
-                                            // The shared shell emits bare LF; a raw-mode client
-                                            // terminal needs CR-LF or each line renders indented
-                                            // (the cursor never returns to column 0). The Enter echo
-                                            // and prompt above already use \r\n; match them.
-                                            responses.extend_from_slice(&onlcr(output.bytes()));
-                                        } else if !pty {
-                                            nonpty_segments.extend(output.output.clone());
-                                        }
-                                        close_shell = output.close_session;
-                                    }
-                                    if close_shell {
-                                        break;
-                                    }
-                                    if pty {
-                                        responses.extend_from_slice(shell.prompt().as_bytes());
-                                    }
-                                }
-                                // Backspace / DEL: erase the last char on screen too.
-                                0x7f | 0x08 => {
-                                    prev_cr = false;
-                                    if line_buf.pop().is_some() && pty {
-                                        responses.extend_from_slice(b"\x08 \x08");
-                                    }
-                                }
-                                // Printable byte: buffer and echo it.
-                                b if b >= 0x20 => {
-                                    prev_cr = false;
-                                    line_buf.push(b);
-                                    if pty {
-                                        responses.push(b);
-                                    }
-                                    // Flush a too-long line so a stream of non-newline bytes cannot
-                                    // grow memory without bound.
-                                    if line_buf.len() >= MAX_LINE_LEN {
-                                        let line = String::from_utf8_lossy(line_buf).to_string();
-                                        line_buf.clear();
-                                        let (output, events) = shell.handle_input(&line);
-                                        for event in &events {
-                                            if event.metadata.get("flood").and_then(|v| v.as_str())
-                                                == Some("binary")
-                                            {
-                                                shell_capture.flag_binary();
-                                            }
-                                            if emitter.append(event).await.is_err() {
-                                                tracing::error!(%peer_addr, "ssh: failed to append command event");
-                                            }
-                                        }
-                                        close_shell = output.close_session;
-                                        if close_shell {
-                                            break;
-                                        }
-                                    }
-                                }
-                                // Other control bytes (tab, Ctrl-*, escape sequences): consume
-                                // without echo, matching a shell in a minimal cooked-ish mode.
-                                _ => prev_cr = false,
+                                authenticated: auth_state.is_authenticated(),
+                                protocol_label: "ssh".to_string(),
+                                session_id: Some(session_id),
+                            };
+                            let shell =
+                                FakeShell::new(base_fs.share(), ctx).with_budget(budget.clone());
+                            let prompt = shell.prompt();
+                            state.handler =
+                                ChannelHandler::Shell(Box::new(shell), Vec::new(), None);
+                            if state.flow.pty {
+                                state.flow.queue(OutputFd::Stdout, prompt.into_bytes());
+                                flush_channel_output(
+                                    &mut stream,
+                                    &mut s2c_cipher,
+                                    &mut s2c_seq,
+                                    ch_id,
+                                    &mut state.flow,
+                                    &budget,
+                                )
+                                .await?;
                             }
                         }
-                        state.flow.queue(OutputFd::Stdout, responses);
-                        for segment in nonpty_segments {
-                            state.flow.queue(segment.fd, segment.bytes);
-                        }
-                        if close_shell {
-                            state.flow.finish_status = Some(0);
-                        }
-                        flush_channel_output(
-                            &mut stream,
-                            &mut s2c_cipher,
-                            &mut s2c_seq,
-                            ch_id,
-                            &mut state.flow,
-                            &budget,
-                        )
-                        .await?;
-                    }
-                    ChannelHandler::Scp(scp) => {
-                        let response = scp.feed(data);
-                        state.flow.queue(OutputFd::Stdout, response);
-                        flush_channel_output(
-                            &mut stream,
-                            &mut s2c_cipher,
-                            &mut s2c_seq,
-                            ch_id,
-                            &mut state.flow,
-                            &budget,
-                        )
-                        .await?;
-                    }
-                    ChannelHandler::Sftp(sftp) => {
-                        let response = sftp.feed(data);
-                        state.flow.queue(OutputFd::Stdout, response);
-                        flush_channel_output(
-                            &mut stream,
-                            &mut s2c_cipher,
-                            &mut s2c_seq,
-                            ch_id,
-                            &mut state.flow,
-                            &budget,
-                        )
-                        .await?;
-                    }
-                    ChannelHandler::Pending => {}
-                }
-                state.flow.local_consumed = state.flow.local_consumed.saturating_add(data_len as u32);
-                if state.flow.local_consumed >= crate::channel::INITIAL_WINDOW_SIZE / 2 {
-                        let adjust = build_channel_window_adjust(ch_id, state.flow.local_consumed);
-                        write_encrypted(
-                            &mut stream,
-                            &mut s2c_cipher,
-                            &mut s2c_seq,
-                            &adjust,
-                        )
-                        .await?;
-                    state.flow.local_consumed = 0;
-                }
-            }
+                        ChannelAction::Exec(cmd) => {
+                            // Emit a command_exec event for the exec command itself.
+                            let shell_ctx = EmitContext {
+                                source_ip,
+                                wan_ip,
+                                authenticated: auth_state.is_authenticated(),
+                                protocol_label: "ssh".to_string(),
+                                session_id: Some(session_id),
+                            };
+                            let mut shell = FakeShell::exec(base_fs.share(), shell_ctx)
+                                .with_budget(budget.clone())
+                                .with_terminal_input(state.flow.pty);
+                            let is_scp = cmd.starts_with("scp -t ");
+                            // The shell decides whether the command reads its standard input (see
+                            // `FakeShell::start_line`); scp's input is the transfer, read below.
+                            let (step, events) = if is_scp {
+                                let (output, events) = shell.handle_input(&cmd);
+                                (LineStep::Ran(output), events)
+                            } else {
+                                shell.start_line(&cmd)
+                            };
+                            for event in &events {
+                                emitter.append(event).await?;
+                            }
 
-            SSH_MSG_CHANNEL_WINDOW_ADJUST => {
-                if payload.len() >= 9 {
+                            if is_scp {
+                                // SCP server mode.
+                                let (scp, initial) = ScpReceiver::new(
+                                    source_ip,
+                                    wan_ip,
+                                    session_id,
+                                    handoff.clone(),
+                                    base_fs.share(),
+                                    &cmd,
+                                );
+                                state.handler = ChannelHandler::Scp(scp);
+                                state.flow.queue(OutputFd::Stdout, initial);
+                                flush_channel_output(
+                                    &mut stream,
+                                    &mut s2c_cipher,
+                                    &mut s2c_seq,
+                                    ch_id,
+                                    &mut state.flow,
+                                    &budget,
+                                )
+                                .await?;
+                            } else {
+                                match step {
+                                    LineStep::Ran(output) => {
+                                        // One-shot exec: queue stream-aware output, then exit-status,
+                                        // EOF and CLOSE. Large output remains queued until the peer
+                                        // replenishes its window instead of being emitted as one
+                                        // invalid SSH packet.
+                                        finish_exec(&mut state.flow, output);
+                                        flush_channel_output(
+                                            &mut stream,
+                                            &mut s2c_cipher,
+                                            &mut s2c_seq,
+                                            ch_id,
+                                            &mut state.flow,
+                                            &budget,
+                                        )
+                                        .await?;
+                                    }
+                                    LineStep::AwaitingInput => {
+                                        // Nothing is sent: the channel stays open, as it does while a
+                                        // real command waits in `read`, and the data the client sends
+                                        // next is the command's input.
+                                        let mode = if state.flow.pty {
+                                            InputMode::Terminal
+                                        } else {
+                                            InputMode::Pipe
+                                        };
+                                        let input = HeldInput::new(
+                                            &shell,
+                                            mode,
+                                            &stdin_captures,
+                                            CAPTURE_REASON_EXEC_STDIN,
+                                            max_captured_bytes,
+                                        );
+                                        state.handler =
+                                            ChannelHandler::Exec(Box::new(shell), Some(input));
+                                    }
+                                }
+                            }
+                        }
+                        ChannelAction::Subsystem(name) => {
+                            if name == "sftp" {
+                                let sftp = SftpHandler::new(
+                                    source_ip,
+                                    wan_ip,
+                                    session_id,
+                                    handoff.clone(),
+                                    base_fs.share(),
+                                );
+                                state.handler = ChannelHandler::Sftp(sftp);
+                            }
+                        }
+                        ChannelAction::Other => {}
+                    }
+                }
+
+                SSH_MSG_CHANNEL_DATA => {
+                    // Parse: byte(94) + uint32(channel) + string(data)
+                    if payload.len() < 9 {
+                        continue;
+                    }
                     let ch_id = u32::from_be_bytes(payload[1..5].try_into().unwrap());
                     let Some(state) = channels.get_mut(&ch_id) else {
                         continue;
                     };
-                    let add = u32::from_be_bytes(payload[5..9].try_into().unwrap());
-                    state.flow.peer_window = state.flow.peer_window.saturating_add(u64::from(add));
+                    if state.flow.close_sent {
+                        continue;
+                    }
+                    let data_len = u32::from_be_bytes(payload[5..9].try_into().unwrap()) as usize;
+                    if data_len > CHANNEL_MAX_PACKET_SIZE as usize || payload.len() < 9 + data_len {
+                        continue;
+                    }
+                    let data = &payload[9..9 + data_len];
+                    let pty = state.flow.pty;
+                    let mut nonpty_segments = Vec::new();
+
+                    match &mut state.handler {
+                        ChannelHandler::Shell(shell, line_buf, held) => {
+                            // A real interactive session runs the client terminal in raw mode and relies
+                            // on the SERVER to echo keystrokes. Without that echo the attacker types into
+                            // a blank screen and the session looks frozen (and no-echo is itself a tell,
+                            // since every real shell echoes). So each printable byte is echoed as it
+                            // arrives, backspace erases on screen, and Enter echoes CR-LF and shows a
+                            // fresh prompt - even for an empty line, as a real shell does.
+                            //
+                            // While a typed line waits for its input (`cat > f`), the bytes are that
+                            // command's, until the input ends (Ctrl-D, Ctrl-C), and the rest of the
+                            // packet is the shell's again.
+                            let mut responses = Vec::new();
+                            // The bytes the shell itself was typed, kept as evidence in case they turn
+                            // out to be a binary flood. Input a held command consumed is captured as
+                            // that command's input instead, so no byte is captured twice.
+                            let mut typed = Vec::new();
+                            let mut prev_cr = false;
+                            let mut close_shell = false;
+                            let mut at = 0;
+                            while at < data.len() && !close_shell {
+                                if let Some(input) = held.as_mut() {
+                                    let fed = input.feed(&data[at..]);
+                                    at += fed.taken;
+                                    if pty {
+                                        responses.extend_from_slice(&fed.echo);
+                                    }
+                                    if let Some(end) = fed.ended
+                                        && let Some(input) = held.take()
+                                    {
+                                        let output = input.finish(shell, end);
+                                        close_shell = deliver_output(
+                                            output,
+                                            pty,
+                                            &mut responses,
+                                            &mut nonpty_segments,
+                                        );
+                                        if !close_shell && pty {
+                                            responses.extend_from_slice(shell.prompt().as_bytes());
+                                        }
+                                    }
+                                    continue;
+                                }
+                                let byte = data[at];
+                                at += 1;
+                                typed.push(byte);
+                                match byte {
+                                    b'\r' | b'\n' => {
+                                        // Swallow the LF of a CR-LF pair so Enter is one line, not two.
+                                        if byte == b'\n' && prev_cr {
+                                            prev_cr = false;
+                                            continue;
+                                        }
+                                        prev_cr = byte == b'\r';
+                                        if pty {
+                                            responses.extend_from_slice(b"\r\n");
+                                        }
+                                        if !line_buf.is_empty() {
+                                            let line =
+                                                String::from_utf8_lossy(line_buf).to_string();
+                                            line_buf.clear();
+                                            match run_typed_line(
+                                                shell,
+                                                &line,
+                                                held,
+                                                prev_cr,
+                                                pty,
+                                                &stdin_captures,
+                                                max_captured_bytes,
+                                                &emitter,
+                                                &mut shell_capture,
+                                                peer_addr,
+                                            )
+                                            .await
+                                            {
+                                                Some(output) => {
+                                                    close_shell = deliver_output(
+                                                        output,
+                                                        pty,
+                                                        &mut responses,
+                                                        &mut nonpty_segments,
+                                                    );
+                                                }
+                                                // The prompt comes back when the command ends.
+                                                None => continue,
+                                            }
+                                        }
+                                        if close_shell {
+                                            break;
+                                        }
+                                        if pty {
+                                            responses.extend_from_slice(shell.prompt().as_bytes());
+                                        }
+                                    }
+                                    // Backspace / DEL: erase the last char on screen too.
+                                    0x7f | 0x08 => {
+                                        prev_cr = false;
+                                        if line_buf.pop().is_some() && pty {
+                                            responses.extend_from_slice(b"\x08 \x08");
+                                        }
+                                    }
+                                    // Printable byte: buffer and echo it.
+                                    b if b >= 0x20 => {
+                                        prev_cr = false;
+                                        line_buf.push(b);
+                                        if pty {
+                                            responses.push(b);
+                                        }
+                                        // Flush a too-long line so a stream of non-newline bytes cannot
+                                        // grow memory without bound.
+                                        if line_buf.len() >= MAX_LINE_LEN {
+                                            let line =
+                                                String::from_utf8_lossy(line_buf).to_string();
+                                            line_buf.clear();
+                                            if let Some(output) = run_typed_line(
+                                                shell,
+                                                &line,
+                                                held,
+                                                false,
+                                                pty,
+                                                &stdin_captures,
+                                                max_captured_bytes,
+                                                &emitter,
+                                                &mut shell_capture,
+                                                peer_addr,
+                                            )
+                                            .await
+                                            {
+                                                close_shell = output.close_session;
+                                            }
+                                        }
+                                    }
+                                    // Other control bytes (tab, Ctrl-*, escape sequences): consume
+                                    // without echo, matching a shell in a minimal cooked-ish mode.
+                                    _ => prev_cr = false,
+                                }
+                            }
+                            // Bounded so a captured session can never grow past `max_captured_bytes`,
+                            // the operator-configured ceiling this crate's own `ConnectionBounds`
+                            // defines. Whether the buffer is ever submitted depends on `binary_seen`,
+                            // set when the shared FakeShell flags a binary flood; a plaintext-only
+                            // session accumulates here but the buffer is discarded, never spooled,
+                            // once the loop ends.
+                            shell_capture.push(&typed);
+                            state.flow.queue(OutputFd::Stdout, responses);
+                            for segment in nonpty_segments {
+                                state.flow.queue(segment.fd, segment.bytes);
+                            }
+                            if close_shell {
+                                state.flow.finish_status = Some(0);
+                            }
+                            flush_channel_output(
+                                &mut stream,
+                                &mut s2c_cipher,
+                                &mut s2c_seq,
+                                ch_id,
+                                &mut state.flow,
+                                &budget,
+                            )
+                            .await?;
+                        }
+                        ChannelHandler::Exec(shell, held) => {
+                            if let Some(input) = held.as_mut() {
+                                let fed = input.feed(data);
+                                state.flow.queue(OutputFd::Stdout, fed.echo);
+                                if let Some(end) = fed.ended
+                                    && let Some(input) = held.take()
+                                {
+                                    finish_exec(&mut state.flow, input.finish(shell, end));
+                                }
+                                flush_channel_output(
+                                    &mut stream,
+                                    &mut s2c_cipher,
+                                    &mut s2c_seq,
+                                    ch_id,
+                                    &mut state.flow,
+                                    &budget,
+                                )
+                                .await?;
+                            }
+                        }
+                        ChannelHandler::Scp(scp) => {
+                            let response = scp.feed(data);
+                            state.flow.queue(OutputFd::Stdout, response);
+                            flush_channel_output(
+                                &mut stream,
+                                &mut s2c_cipher,
+                                &mut s2c_seq,
+                                ch_id,
+                                &mut state.flow,
+                                &budget,
+                            )
+                            .await?;
+                        }
+                        ChannelHandler::Sftp(sftp) => {
+                            let response = sftp.feed(data);
+                            state.flow.queue(OutputFd::Stdout, response);
+                            flush_channel_output(
+                                &mut stream,
+                                &mut s2c_cipher,
+                                &mut s2c_seq,
+                                ch_id,
+                                &mut state.flow,
+                                &budget,
+                            )
+                            .await?;
+                        }
+                        ChannelHandler::Pending => {}
+                    }
+                    state.flow.local_consumed =
+                        state.flow.local_consumed.saturating_add(data_len as u32);
+                    if state.flow.local_consumed >= crate::channel::INITIAL_WINDOW_SIZE / 2 {
+                        let adjust = build_channel_window_adjust(ch_id, state.flow.local_consumed);
+                        write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &adjust)
+                            .await?;
+                        state.flow.local_consumed = 0;
+                    }
+                }
+
+                SSH_MSG_CHANNEL_WINDOW_ADJUST => {
+                    if payload.len() >= 9 {
+                        let ch_id = u32::from_be_bytes(payload[1..5].try_into().unwrap());
+                        let Some(state) = channels.get_mut(&ch_id) else {
+                            continue;
+                        };
+                        let add = u32::from_be_bytes(payload[5..9].try_into().unwrap());
+                        state.flow.peer_window =
+                            state.flow.peer_window.saturating_add(u64::from(add));
+                        flush_channel_output(
+                            &mut stream,
+                            &mut s2c_cipher,
+                            &mut s2c_seq,
+                            ch_id,
+                            &mut state.flow,
+                            &budget,
+                        )
+                        .await?;
+                    }
+                }
+
+                SSH_MSG_CHANNEL_EOF => {
+                    // Half-close: the peer will send no more channel data, but queued server output
+                    // and the channel's own EOF/CLOSE lifecycle still have to drain. A command still
+                    // reading its input sees end of file now, runs to its end and the channel closes
+                    // with its exit status, as `cat > f` does when its stdin pipe closes.
+                    let Some(ch_id) = channel_recipient(&payload, SSH_MSG_CHANNEL_EOF) else {
+                        continue;
+                    };
+                    let Some(state) = channels.get_mut(&ch_id) else {
+                        continue;
+                    };
+                    let pty = state.flow.pty;
+                    let mut nonpty_segments = Vec::new();
+                    match &mut state.handler {
+                        ChannelHandler::Exec(shell, held) => {
+                            if let Some(input) = held.take() {
+                                finish_exec(&mut state.flow, input.finish(shell, HeldEnd::Eof));
+                            }
+                        }
+                        ChannelHandler::Shell(shell, _, held) => {
+                            if let Some(input) = held.take() {
+                                let output = input.finish(shell, HeldEnd::Eof);
+                                let mut responses = Vec::new();
+                                let close_shell = deliver_output(
+                                    output,
+                                    pty,
+                                    &mut responses,
+                                    &mut nonpty_segments,
+                                );
+                                if !close_shell && pty {
+                                    responses.extend_from_slice(shell.prompt().as_bytes());
+                                }
+                                state.flow.queue(OutputFd::Stdout, responses);
+                                for segment in nonpty_segments {
+                                    state.flow.queue(segment.fd, segment.bytes);
+                                }
+                                if close_shell {
+                                    state.flow.finish_status = Some(0);
+                                }
+                            }
+                        }
+                        ChannelHandler::Pending
+                        | ChannelHandler::Scp(_)
+                        | ChannelHandler::Sftp(_) => {}
+                    }
                     flush_channel_output(
                         &mut stream,
                         &mut s2c_cipher,
@@ -922,35 +1086,32 @@ async fn handle_session(
                     )
                     .await?;
                 }
-            }
 
-            SSH_MSG_CHANNEL_EOF => {
-                // Half-close: the peer will send no more channel data, but queued server output
-                // and the channel's own EOF/CLOSE lifecycle still have to drain.
-            }
-
-            SSH_MSG_CHANNEL_CLOSE => {
-                let Some(ch_id) = channel_recipient(&payload, SSH_MSG_CHANNEL_CLOSE) else {
-                    continue;
-                };
-                if let Some(mut state) = channels.remove(&ch_id) {
-                    // The peer closed this channel itself, whatever later becomes of the session.
-                    state.handler.cut_off(CaptureEnd::PeerClosed);
-                    if !state.flow.close_sent {
-                        let close = build_channel_close(ch_id);
-                        let _ = write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &close).await;
+                SSH_MSG_CHANNEL_CLOSE => {
+                    let Some(ch_id) = channel_recipient(&payload, SSH_MSG_CHANNEL_CLOSE) else {
+                        continue;
+                    };
+                    if let Some(mut state) = channels.remove(&ch_id) {
+                        // The peer closed this channel itself, whatever later becomes of the session.
+                        state.handler.cut_off(CaptureEnd::PeerClosed);
+                        if !state.flow.close_sent {
+                            let close = build_channel_close(ch_id);
+                            let _ =
+                                write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &close)
+                                    .await;
+                        }
                     }
                 }
-            }
 
-            _ => {
-                // Send UNIMPLEMENTED for anything we do not handle.
-                let unimpl = build_unimplemented(c2s_seq.wrapping_sub(1));
-                let _ = write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &unimpl).await;
+                _ => {
+                    // Send UNIMPLEMENTED for anything we do not handle.
+                    let unimpl = build_unimplemented(c2s_seq.wrapping_sub(1));
+                    let _ =
+                        write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &unimpl).await;
+                }
             }
         }
-    }
-    Ok(())
+        Ok(())
     }
     .await;
 
@@ -1077,6 +1238,84 @@ impl Drop for ShellCapture {
 }
 
 // ---- Helpers ----
+
+/// Queue an exec command's output, then its exit status, which the flow follows with EOF and
+/// CLOSE once the output has drained.
+fn finish_exec(flow: &mut ChannelFlow, output: CommandResult) {
+    let pty = flow.pty;
+    for segment in output.output {
+        let bytes = if pty {
+            onlcr(&segment.bytes)
+        } else {
+            segment.bytes
+        };
+        flow.queue(segment.fd, bytes);
+    }
+    flow.finish_status = Some(output.status);
+}
+
+/// Add what an interactive line printed to the reply: one CR-LF-translated stream on a pty,
+/// whose client terminal is in raw mode and would otherwise render each line indented, or the
+/// separate streams without one. Returns whether the line ended the session.
+fn deliver_output(
+    output: CommandResult,
+    pty: bool,
+    responses: &mut Vec<u8>,
+    segments: &mut Vec<crate::shell::OutputSegment>,
+) -> bool {
+    if pty {
+        responses.extend_from_slice(&onlcr(output.bytes()));
+    } else {
+        segments.extend(output.output.iter().cloned());
+    }
+    output.close_session
+}
+
+/// Run one line typed at an interactive shell and append its events. Returns what it printed,
+/// or `None` when it waits for its input (see `FakeShell::start_line`), which `held` then
+/// collects. `after_cr` says the line ended with a CR, so an LF right after it is not input.
+#[allow(clippy::too_many_arguments)]
+async fn run_typed_line(
+    shell: &mut FakeShell,
+    line: &str,
+    held: &mut Option<HeldInput>,
+    after_cr: bool,
+    pty: bool,
+    stdin_captures: &StdinCaptures,
+    max_captured_bytes: u64,
+    emitter: &EventEmitter,
+    shell_capture: &mut ShellCapture,
+    peer_addr: SocketAddr,
+) -> Option<CommandResult> {
+    let (step, events) = shell.start_line(line);
+    for event in &events {
+        if event.metadata.get("flood").and_then(|v| v.as_str()) == Some("binary") {
+            shell_capture.flag_binary();
+        }
+        if emitter.append(event).await.is_err() {
+            tracing::error!(%peer_addr, "ssh: failed to append command event");
+        }
+    }
+    match step {
+        LineStep::Ran(output) => Some(output),
+        LineStep::AwaitingInput => {
+            let mode = if pty {
+                InputMode::Terminal
+            } else {
+                InputMode::Pipe
+            };
+            let input = HeldInput::new(
+                shell,
+                mode,
+                stdin_captures,
+                CAPTURE_REASON_SHELL_STDIN,
+                max_captured_bytes,
+            );
+            *held = Some(if after_cr { input.after_cr() } else { input });
+            None
+        }
+    }
+}
 
 /// What a failed packet read says about the session's ending. `read_exact` on a socket the peer
 /// closed reports `UnexpectedEof`, which is the peer finishing rather than anything going wrong;

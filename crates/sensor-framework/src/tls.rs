@@ -35,10 +35,6 @@ const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
 /// only the OS or rustls error, never the bytes read.
 #[derive(Debug)]
 pub enum TlsConfigError {
-    /// An env var was set but not valid UTF-8.
-    EnvNotUnicode {
-        var: String,
-    },
     Io {
         path: PathBuf,
         source: io::Error,
@@ -73,9 +69,6 @@ pub enum TlsConfigError {
 impl fmt::Display for TlsConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EnvNotUnicode { var } => {
-                write!(f, "environment variable {var} is not valid UTF-8")
-            }
             Self::Io { path, source } => write!(f, "cannot read {}: {source}", path.display()),
             Self::NotRegularFile { path } => {
                 write!(f, "{} is not a regular file", path.display())
@@ -233,32 +226,6 @@ pub fn load_server_config(
     key_pem.fill(0);
     cert_pem.fill(0);
     result
-}
-
-/// The one reader for every sensor TLS env var (a cert or key path, a TLS bind, smtp's
-/// submission bind), so all six TLS sensors apply the same rule. Unset is `Ok(None)`. The value
-/// is trimmed of leading and trailing ASCII whitespace, and a value blank after the trim is also
-/// `Ok(None)`, matching `deploy/fleet-listeners.sh`, which skips blank binds. A value that is
-/// not valid UTF-8 is `EnvNotUnicode`: never read as unset, which would silently turn TLS off or
-/// drop a listener, and never converted lossily into a path or address the operator did not write.
-pub fn tls_env_var(var: &str) -> Result<Option<String>, TlsConfigError> {
-    tls_env_value(var, std::env::var(var))
-}
-
-fn tls_env_value(
-    var: &str,
-    value: Result<String, std::env::VarError>,
-) -> Result<Option<String>, TlsConfigError> {
-    match value {
-        Ok(value) => {
-            let trimmed = value.trim_matches(|c: char| c.is_ascii_whitespace());
-            Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
-        }
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(TlsConfigError::EnvNotUnicode {
-            var: var.to_string(),
-        }),
-    }
 }
 
 /// Cheaply cloneable TLS acceptor (an `Arc<ServerConfig>` inside).
@@ -464,7 +431,6 @@ impl AsyncWrite for MaybeTlsStream {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
@@ -611,41 +577,6 @@ mod tests {
         assert!(matches!(
             load_server_config(&c, &k),
             Err(TlsConfigError::KeyPermissions { .. })
-        ));
-    }
-
-    #[test]
-    fn tls_env_value_unset_is_none_and_not_unicode_is_an_error() {
-        assert!(matches!(
-            tls_env_value("C", Err(std::env::VarError::NotPresent)),
-            Ok(None)
-        ));
-        assert!(matches!(
-            tls_env_value("C", Err(std::env::VarError::NotUnicode(OsString::new()))),
-            Err(TlsConfigError::EnvNotUnicode { var }) if var == "C"
-        ));
-    }
-
-    #[test]
-    fn tls_env_value_is_trimmed_and_blank_is_unset() {
-        for blank in ["", " ", "\t", " \t\r\n "] {
-            assert!(
-                matches!(tls_env_value("C", Ok(blank.to_string())), Ok(None)),
-                "{blank:?}"
-            );
-        }
-        assert!(matches!(
-            tls_env_value("C", Ok("\t 0.0.0.0:443 \n".to_string())),
-            Ok(Some(v)) if v == "0.0.0.0:443"
-        ));
-        assert!(matches!(
-            tls_env_value("C", Ok(" /etc/propolis/tls/x.key".to_string())),
-            Ok(Some(v)) if v == "/etc/propolis/tls/x.key"
-        ));
-        // Only ASCII whitespace is trimmed: a no-break space is part of the value.
-        assert!(matches!(
-            tls_env_value("C", Ok("\u{a0}".to_string())),
-            Ok(Some(v)) if v == "\u{a0}"
         ));
     }
 

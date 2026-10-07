@@ -37,7 +37,7 @@ pub use capture_budget::{
 pub use command_codec::CommandCodec;
 pub use config::SensorConfig;
 pub use emit::EventEmitter;
-pub use env::env_with_legacy;
+pub use env::{EnvError, env_with_legacy, strict_env_var};
 pub use handoff::{
     CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome,
     END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, upload_metadata,
@@ -49,7 +49,7 @@ pub use sanitize::{sanitize_value, to_hex_bounded};
 pub use spool::{QuarantineSpool, SpoolError};
 pub use tls::{
     MaybeTlsStream, TlsConfigError, TlsServer, load_server_config, run_tls_listener,
-    server_config_from_pem, tls_env_var, upgrade_buffered,
+    server_config_from_pem, upgrade_buffered,
 };
 pub use uuid::Uuid;
 pub use wan::WanResolver;

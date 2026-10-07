@@ -1,13 +1,12 @@
 use std::collections::HashMap;
-use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
-    CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
-    SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal,
+    CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EnvError,
+    SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal, strict_env_var,
 };
 use sensor_tftp::handler::MAX_BODY_HARD_CAP;
 
@@ -54,13 +53,28 @@ enum ConfigError {
     NoBind,
     InvalidBind(String),
     InvalidWanMapEntry(String),
-    InvalidBound { field: &'static str, value: String },
-    BoundTooLarge { field: &'static str, max: u64 },
+    InvalidBound {
+        field: &'static str,
+        value: String,
+    },
+    BoundTooLarge {
+        field: &'static str,
+        max: u64,
+    },
+    /// An env var held bytes that are not valid UTF-8; never read as unset.
+    Env(EnvError),
+}
+
+impl From<EnvError> for ConfigError {
+    fn from(e: EnvError) -> Self {
+        ConfigError::Env(e)
+    }
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ConfigError::Env(e) => write!(f, "{e}"),
             ConfigError::NoBind => {
                 write!(f, "{ENV_BIND} must be set (the sensor is off by default)")
             }
@@ -104,25 +118,25 @@ fn resolve_outbox_dir(spool_dir: &Path, env_override: Option<String>) -> PathBuf
 /// tests). A missing bind, a malformed value, or a zero or oversized bound is an error: the caller
 /// exits without binding anything, and no default ever stands in for a bad value.
 fn load_config_from(
-    get: impl Fn(&str) -> Option<String>,
-    collector_id: String,
+    get: impl Fn(&str) -> Result<Option<String>, EnvError>,
 ) -> Result<Config, ConfigError> {
-    let bind_raw = get(ENV_BIND).ok_or(ConfigError::NoBind)?;
+    let bind_raw = get(ENV_BIND)?.ok_or(ConfigError::NoBind)?;
     let bind_addr: SocketAddr = bind_raw
         .trim()
         .parse()
         .map_err(|_| ConfigError::InvalidBind(bind_raw.clone()))?;
-    let wan_map = parse_wan_map(&get(ENV_WAN_MAP).unwrap_or_default())?;
-    let log_path = get(ENV_LOG_PATH)
+    let wan_map = parse_wan_map(&get(ENV_WAN_MAP)?.unwrap_or_default())?;
+    let log_path = get(ENV_LOG_PATH)?
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH));
-    let spool_dir = get(ENV_SPOOL_DIR)
+    let spool_dir = get(ENV_SPOOL_DIR)?
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SPOOL_DIR));
-    let outbox_dir = resolve_outbox_dir(&spool_dir, get(ENV_OUTBOX_DIR));
+    let outbox_dir = resolve_outbox_dir(&spool_dir, get(ENV_OUTBOX_DIR)?);
+    let collector_id = get(ENV_COLLECTOR_ID)?.unwrap_or_else(|| DEFAULT_COLLECTOR_ID.to_string());
 
     let max_captured_bytes = parse_positive_u64(
-        get(ENV_MAX_CAPTURED_BYTES).as_deref(),
+        get(ENV_MAX_CAPTURED_BYTES)?.as_deref(),
         DEFAULT_MAX_CAPTURED_BYTES,
         ENV_MAX_CAPTURED_BYTES,
     )?;
@@ -141,29 +155,29 @@ fn load_config_from(
         collector_id,
         outbox_dir,
         capture_memory_bytes: parse_positive_u64(
-            get(ENV_CAPTURE_MEMORY_BYTES).as_deref(),
+            get(ENV_CAPTURE_MEMORY_BYTES)?.as_deref(),
             DEFAULT_CAPTURE_BUDGET_BYTES_256M,
             ENV_CAPTURE_MEMORY_BYTES,
         )?,
         bounds: ConnectionBounds {
             read_timeout: Duration::from_millis(parse_positive_u64(
-                get(ENV_READ_TIMEOUT_MS).as_deref(),
+                get(ENV_READ_TIMEOUT_MS)?.as_deref(),
                 DEFAULT_READ_TIMEOUT_MS,
                 ENV_READ_TIMEOUT_MS,
             )?),
             idle_timeout: Duration::from_millis(parse_positive_u64(
-                get(ENV_IDLE_TIMEOUT_MS).as_deref(),
+                get(ENV_IDLE_TIMEOUT_MS)?.as_deref(),
                 DEFAULT_IDLE_TIMEOUT_MS,
                 ENV_IDLE_TIMEOUT_MS,
             )?),
             max_duration: Duration::from_secs(parse_positive_u64(
-                get(ENV_MAX_DURATION_SECS).as_deref(),
+                get(ENV_MAX_DURATION_SECS)?.as_deref(),
                 DEFAULT_MAX_DURATION_SECS,
                 ENV_MAX_DURATION_SECS,
             )?),
             max_captured_bytes,
             max_concurrent: parse_positive_u32(
-                get(ENV_MAX_CONCURRENT).as_deref(),
+                get(ENV_MAX_CONCURRENT)?.as_deref(),
                 DEFAULT_MAX_CONCURRENT,
                 ENV_MAX_CONCURRENT,
             )?,
@@ -232,11 +246,7 @@ fn parse_positive_u32(
 async fn main() {
     sensor_framework::init_logging();
 
-    let collector_id = env::var(ENV_COLLECTOR_ID)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_COLLECTOR_ID.to_string());
-    let config = match load_config_from(|name| env::var(name).ok(), collector_id) {
+    let config = match load_config_from(strict_env_var) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "sensor-tftp: invalid configuration; refusing to start");
@@ -278,16 +288,34 @@ async fn main() {
 mod tests {
     use super::*;
 
-    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<Option<String>, EnvError> {
         let map: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        move |name| map.get(name).cloned()
+        move |name| Ok(map.get(name).cloned())
     }
 
     fn load(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
-        load_config_from(vars(pairs), "local".to_string())
+        load_config_from(vars(pairs))
+    }
+
+    #[test]
+    fn a_non_utf8_variable_is_a_config_error_never_a_default() {
+        let get = |name: &str| {
+            if name == ENV_MAX_CONCURRENT {
+                Err(EnvError::NotUnicode {
+                    var: name.to_string(),
+                })
+            } else if name == ENV_BIND {
+                Ok(Some("203.0.113.7:69".to_string()))
+            } else {
+                Ok(None)
+            }
+        };
+        let err = load_config_from(get).expect_err("must not fall back to the default");
+        assert!(matches!(err, ConfigError::Env(_)), "{err}");
+        assert!(err.to_string().contains(ENV_MAX_CONCURRENT));
     }
 
     /// Default-off: with nothing configured the sensor refuses to start, so it can never bind a

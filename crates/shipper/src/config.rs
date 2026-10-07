@@ -189,6 +189,15 @@ pub fn load_config_from_env() -> Result<Config, ConfigError> {
     let client_cert_path = required_path(ENV_CLIENT_CERT_PATH)?;
     let client_key_path = required_path(ENV_CLIENT_KEY_PATH)?;
     let collector_id = sensor_framework::env_with_legacy(ENV_COLLECTOR_ID, ENV_COLLECTOR_ID_LEGACY)
+        .map_err(|e| ConfigError::Invalid {
+            field: ENV_COLLECTOR_ID,
+            value: String::new(),
+            reason: match e {
+                sensor_framework::EnvError::NotUnicode { .. } => {
+                    "this or its legacy spelling is not valid UTF-8"
+                }
+            },
+        })?
         .ok_or(ConfigError::Missing(ENV_COLLECTOR_ID))?;
 
     let sensor_logs_raw = required_var(ENV_SENSOR_LOGS)?;

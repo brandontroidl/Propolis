@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,35 +41,47 @@ fn parse_positive_u32(raw: Option<&str>, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// Read through `sensor_framework::strict_env_var`: unset or blank is `None`, and a non-UTF-8
+/// value refuses to start, so no variable is ever silently read as unset or defaulted.
+fn env_or_exit(var: &str) -> Option<String> {
+    match sensor_framework::strict_env_var(var) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::error!(error = %e, "sensor-cred: invalid configuration; refusing to start");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     sensor_framework::init_logging();
 
-    let wan_map = parse_wan_map(&env::var("PROPOLIS_CRED_WAN_MAP").unwrap_or_default());
+    let wan_map = parse_wan_map(&env_or_exit("PROPOLIS_CRED_WAN_MAP").unwrap_or_default());
     let wan_resolver = Arc::new(WanResolver::new(wan_map));
-    let log_dir = env::var("PROPOLIS_CRED_LOG_DIR")
+    let log_dir = env_or_exit("PROPOLIS_CRED_LOG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_DIR));
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_DIR));
 
     let bounds = ConnectionBounds {
         read_timeout: Duration::from_millis(parse_positive_u64(
-            env::var("PROPOLIS_CRED_READ_TIMEOUT_MS").ok().as_deref(),
+            env_or_exit("PROPOLIS_CRED_READ_TIMEOUT_MS").as_deref(),
             30_000,
         )),
         idle_timeout: Duration::from_millis(parse_positive_u64(
-            env::var("PROPOLIS_CRED_IDLE_TIMEOUT_MS").ok().as_deref(),
+            env_or_exit("PROPOLIS_CRED_IDLE_TIMEOUT_MS").as_deref(),
             60_000,
         )),
         max_duration: Duration::from_secs(parse_positive_u64(
-            env::var("PROPOLIS_CRED_MAX_DURATION_SECS").ok().as_deref(),
+            env_or_exit("PROPOLIS_CRED_MAX_DURATION_SECS").as_deref(),
             60,
         )),
         max_captured_bytes: parse_positive_u64(
-            env::var("PROPOLIS_CRED_MAX_CAPTURED_BYTES").ok().as_deref(),
+            env_or_exit("PROPOLIS_CRED_MAX_CAPTURED_BYTES").as_deref(),
             100_000,
         ),
         max_concurrent: parse_positive_u32(
-            env::var("PROPOLIS_CRED_MAX_CONCURRENT").ok().as_deref(),
+            env_or_exit("PROPOLIS_CRED_MAX_CONCURRENT").as_deref(),
             256,
         ),
     };
@@ -84,7 +95,7 @@ async fn main() {
         ("PROPOLIS_CRED_PG_BIND", "postgresql"),
         ("PROPOLIS_CRED_MONGO_BIND", "mongodb"),
     ] {
-        if let Ok(bind_str) = env::var(env_key) {
+        if let Some(bind_str) = env_or_exit(env_key) {
             if let Ok(bind) = bind_str.trim().parse::<SocketAddr>() {
                 ports.push(PortConfig { protocol, bind });
             } else {
@@ -94,16 +105,8 @@ async fn main() {
         }
     }
 
-    // Fail closed: either TLS var set means the pair must load, or nothing binds at all. Read
-    // through tls_env_var, so a blank value is unset and a non-UTF-8 one is an error.
-    let tls_var = |var: &str| match sensor_framework::tls_env_var(var) {
-        Ok(value) => value,
-        Err(e) => {
-            tracing::error!(error = %e, "sensor-cred: invalid configuration; refusing to start");
-            std::process::exit(1);
-        }
-    };
-    let tls = match (tls_var(TLS_CERT_VAR), tls_var(TLS_KEY_VAR)) {
+    // Fail closed: either TLS var set means the pair must load, or nothing binds at all.
+    let tls = match (env_or_exit(TLS_CERT_VAR), env_or_exit(TLS_KEY_VAR)) {
         (None, None) => None,
         (Some(cert), Some(key)) => {
             match sensor_cred::CredTls::from_files(Path::new(&cert), Path::new(&key)) {

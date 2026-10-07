@@ -110,8 +110,8 @@ compiled-in default. The shared pieces live in the sensor framework
 the plain TCP listener's connection bounds
 (`crates/sensor-framework/src/tls.rs#run_tls_listener`), the in-protocol upgrade path
 (`crates/sensor-framework/src/tls.rs#upgrade_buffered`, over
-`crates/sensor-framework/src/tls.rs#MaybeTlsStream`), and the fail-closed reader for the TLS
-variables (`crates/sensor-framework/src/tls.rs#tls_env_var`).
+`crates/sensor-framework/src/tls.rs#MaybeTlsStream`), and the fail-closed env reader every
+sensor variable goes through (`crates/sensor-framework/src/env.rs#strict_env_var`).
 
 Three modes exist. **Implicit** TLS puts the handshake first on a dedicated port. **STARTTLS**
 (SMTP `STARTTLS`, FTP `AUTH TLS`) upgrades a plaintext session in place after a command. **In-band**
@@ -339,7 +339,9 @@ in `refusing to start`.
 
 **How the variables are read.** All six sensors read every TLS variable (each `*_TLS_BIND`,
 `*_TLS_CERT` and `*_TLS_KEY`, and `PROPOLIS_SMTP_SUBMISSION_BIND`) through one reader,
-`crates/sensor-framework/src/tls.rs#tls_env_var`, so one rule holds everywhere:
+`crates/sensor-framework/src/env.rs#strict_env_var`, so one rule holds everywhere (the same
+reader serves every other sensor variable; see
+[environment variables](../reference/environment-variables.md#sensor-binaries)):
 
 - unset is unset;
 - the value is trimmed of leading and trailing ASCII whitespace;
@@ -357,7 +359,7 @@ in `refusing to start`.
 - a TLS bind, or smtp's submission bind, does not parse (a bad bind never falls back to a default);
 - any TLS variable holds a value that is not valid UTF-8. It is invalid, never read as unset,
   which would silently turn TLS off or skip a listener
-  (`crates/sensor-framework/src/tls.rs#tls_env_var`).
+  (`crates/sensor-framework/src/env.rs#strict_env_var`).
 
 **The pair itself.** The loader returns an error when any of these hold
 (`crates/sensor-framework/src/tls.rs#load_server_config`,

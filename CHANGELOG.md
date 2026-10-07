@@ -262,6 +262,21 @@
 
 ### Fixed
 
+- **A non-UTF-8 environment variable is a startup error in every sensor, never read as unset** -
+  most sensor variables were read with `env::var(..).ok()` or `if let Ok(..)`, so a value that was
+  not valid UTF-8 silently fell back to the default or skipped the work: a bound or a timeout
+  reverted to its default, a log path or collector id was replaced, and `sensor-cred` skipped a
+  protocol's `PROPOLIS_CRED_*_BIND` listener the fleet inventory still claimed. All eleven sensors
+  (and the collector id read in `shipper`) now read every variable through
+  `sensor_framework::strict_env_var` (renamed from `tls_env_var`, with its error type
+  `EnvError`, and moved from `tls.rs` to `env.rs`; no alias is kept), which exits 1 before any
+  bind with `environment variable <NAME> is not valid UTF-8`. `env_with_legacy` now applies the
+  same rule to both spellings. Side effects of the shared reader on valid UTF-8: a value is
+  trimmed of ASCII whitespace (a numeric bound written with a stray space now parses), and a
+  value blank after the trim counts as unset: an optional variable falls back to its default
+  where it used to error or be used as an empty string (a blank `PROPOLIS_CRED_*_BIND` now skips
+  that protocol, a blank `PROPOLIS_SSH_BANNER` or collector id takes the default), and a blank
+  required bind is still a startup error.
 - **`sensor-ftp` treats `pasv` and `nlst` like their uppercase forms** - the PASV/EPSV and
   LIST/NLST replies were chosen by a case-sensitive comparison, so lowercase `pasv` got the EPSV
   style `229` reply and lowercase `nlst` got the long LIST output. Every other verb was already

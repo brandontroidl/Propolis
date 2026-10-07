@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
-    ConnectionBounds, TlsServer, WanResolver, listener_start_error, shutdown_signal,
+    ConnectionBounds, EnvError, TlsServer, WanResolver, listener_start_error, shutdown_signal,
+    strict_env_var,
 };
 
 const ENV_BIND: &str = "PROPOLIS_HTTP_BIND";
@@ -55,13 +55,19 @@ enum ConfigError {
     /// The named cert or key env var was unset or blank while TLS was asked for by the other
     /// path var or by `PROPOLIS_HTTP_TLS_BIND`.
     TlsPathMissing(&'static str),
-    /// The named TLS env var was set to a value that is not valid UTF-8.
-    TlsVarNotUtf8(&'static str),
+    /// An env var held bytes that are not valid UTF-8; never read as unset.
+    Env(EnvError),
     InvalidWanMapEntry(String),
     InvalidBound {
         field: &'static str,
         value: String,
     },
+}
+
+impl From<EnvError> for ConfigError {
+    fn from(e: EnvError) -> Self {
+        ConfigError::Env(e)
+    }
 }
 
 impl std::fmt::Display for ConfigError {
@@ -76,7 +82,7 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "{var} must be set to a PEM file path (TLS needs both {ENV_TLS_CERT} and {ENV_TLS_KEY})"
             ),
-            ConfigError::TlsVarNotUtf8(var) => write!(f, "{var} is set but is not valid UTF-8"),
+            ConfigError::Env(e) => write!(f, "{e}"),
             ConfigError::InvalidWanMapEntry(s) => write!(
                 f,
                 "invalid {ENV_WAN_MAP} entry {s:?}, expected local_ip=wan_ip"
@@ -178,23 +184,20 @@ fn parse_tls(
 }
 
 fn load_config_from_env() -> Result<Config, ConfigError> {
-    let bind_raw = env::var(ENV_BIND).map_err(|_| ConfigError::NoBind)?;
+    let bind_raw = strict_env_var(ENV_BIND)?.ok_or(ConfigError::NoBind)?;
     let bind_addr: SocketAddr = bind_raw
         .trim()
         .parse()
         .map_err(|_| ConfigError::InvalidBind(bind_raw.clone()))?;
-    let wan_map = parse_wan_map(&env::var(ENV_WAN_MAP).unwrap_or_default())?;
-    let log_path = env::var(ENV_LOG_PATH)
+    let wan_map = parse_wan_map(&strict_env_var(ENV_WAN_MAP)?.unwrap_or_default())?;
+    let log_path = strict_env_var(ENV_LOG_PATH)?
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_PATH));
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH));
 
-    let tls_var = |name: &'static str| {
-        sensor_framework::tls_env_var(name).map_err(|_| ConfigError::TlsVarNotUtf8(name))
-    };
     let tls = parse_tls(
-        tls_var(ENV_TLS_BIND)?.as_deref(),
-        tls_var(ENV_TLS_CERT)?.as_deref(),
-        tls_var(ENV_TLS_KEY)?.as_deref(),
+        strict_env_var(ENV_TLS_BIND)?.as_deref(),
+        strict_env_var(ENV_TLS_CERT)?.as_deref(),
+        strict_env_var(ENV_TLS_KEY)?.as_deref(),
     )?;
 
     Ok(Config {
@@ -204,27 +207,27 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         tls,
         bounds: ConnectionBounds {
             read_timeout: Duration::from_millis(parse_positive_u64(
-                env::var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
+                strict_env_var(ENV_READ_TIMEOUT_MS)?.as_deref(),
                 DEFAULT_READ_TIMEOUT_MS,
                 ENV_READ_TIMEOUT_MS,
             )?),
             idle_timeout: Duration::from_millis(parse_positive_u64(
-                env::var(ENV_IDLE_TIMEOUT_MS).ok().as_deref(),
+                strict_env_var(ENV_IDLE_TIMEOUT_MS)?.as_deref(),
                 DEFAULT_IDLE_TIMEOUT_MS,
                 ENV_IDLE_TIMEOUT_MS,
             )?),
             max_duration: Duration::from_secs(parse_positive_u64(
-                env::var(ENV_MAX_DURATION_SECS).ok().as_deref(),
+                strict_env_var(ENV_MAX_DURATION_SECS)?.as_deref(),
                 DEFAULT_MAX_DURATION_SECS,
                 ENV_MAX_DURATION_SECS,
             )?),
             max_captured_bytes: parse_positive_u64(
-                env::var(ENV_MAX_CAPTURED_BYTES).ok().as_deref(),
+                strict_env_var(ENV_MAX_CAPTURED_BYTES)?.as_deref(),
                 DEFAULT_MAX_CAPTURED_BYTES,
                 ENV_MAX_CAPTURED_BYTES,
             )?,
             max_concurrent: parse_positive_u32(
-                env::var(ENV_MAX_CONCURRENT).ok().as_deref(),
+                strict_env_var(ENV_MAX_CONCURRENT)?.as_deref(),
                 DEFAULT_MAX_CONCURRENT,
                 ENV_MAX_CONCURRENT,
             )?,
@@ -347,7 +350,7 @@ mod tests {
     #[test]
     fn load_config_missing_bind_fails() {
         let result = load_config_from_env();
-        if env::var(ENV_BIND).is_err() {
+        if std::env::var(ENV_BIND).is_err() {
             assert!(matches!(result, Err(ConfigError::NoBind)));
         }
     }

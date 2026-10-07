@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 2949 test functions** (1919 unit + 1030 integration).
+- **Total: 2975 test functions** (1923 unit + 1052 integration).
 - **DB-backed (`sqlx::test`): 208** - console 159, core-scoring 28, intake 7,
   propolis 7, fleet 6, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -128,21 +128,21 @@ Per-crate breakdown:
 | propolis | 102 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
 | review | 116 | 71 | cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
-| sensor-adb | 61 | 31 | integration |
-| sensor-catchall | 18 | 6 | integration |
-| sensor-cred | 32 | 32 | integration, tls_integration |
-| sensor-framework | 959 | 81 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration, tls_integration |
-| sensor-ftp | 13 | 46 | integration, tls_config |
-| sensor-http | 15 | 37 | integration, tls |
-| sensor-mqtt | 64 | 52 | integration, tls |
-| sensor-redis | 89 | 36 | integration, tls |
-| sensor-smtp | 12 | 38 | integration, tls |
-| sensor-ssh | 66 | 109 | auth_test, crypto_test, integration, shell_test, transport_test |
-| sensor-telnet | 41 | 21 | integration |
-| sensor-tftp | 30 | 31 | integration |
+| sensor-adb | 61 | 33 | env_strict, integration |
+| sensor-catchall | 18 | 8 | env_strict, integration |
+| sensor-cred | 32 | 34 | env_strict, integration, tls_integration |
+| sensor-framework | 962 | 81 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration, tls_integration |
+| sensor-ftp | 13 | 48 | env_strict, integration, tls_config |
+| sensor-http | 15 | 39 | env_strict, integration, tls |
+| sensor-mqtt | 64 | 54 | env_strict, integration, tls |
+| sensor-redis | 89 | 38 | env_strict, integration, tls |
+| sensor-smtp | 12 | 40 | env_strict, integration, tls |
+| sensor-ssh | 66 | 111 | auth_test, crypto_test, env_strict, integration, shell_test, transport_test |
+| sensor-telnet | 41 | 23 | env_strict, integration |
+| sensor-tftp | 31 | 33 | env_strict, integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **1919** | **1030** | |
+| **Total** | **1923** | **1052** | |
 
 ### Test styles by layer
 

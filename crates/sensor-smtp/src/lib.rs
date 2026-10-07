@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sensor_framework::{
-    ConnectionBounds, EventEmitter, MaybeTlsStream, TlsConfigError, TlsServer, WanResolver,
+    ConnectionBounds, EnvError, EventEmitter, MaybeTlsStream, TlsServer, WanResolver,
     listener_start_error, load_server_config, run_tcp_listener, run_tls_listener,
 };
 use tokio::task::JoinHandle;
@@ -42,7 +42,7 @@ pub fn plan_listeners(
 }
 
 /// Resolve the TLS configuration from the environment, fail-closed. `lookup` is
-/// `sensor_framework::tls_env_var` in production, so a value arrives trimmed and a blank one as
+/// `sensor_framework::strict_env_var` in production, so a value arrives trimmed and a blank one as
 /// unset. TLS is on iff BOTH the cert and key variables are set. A non-UTF-8 value on either
 /// variable, exactly one set, an unreadable or invalid pair, or a TLS bind with neither set is an
 /// error the caller must treat as fatal before binding anything.
@@ -50,7 +50,7 @@ pub fn tls_from_env(
     cert_var: &str,
     key_var: &str,
     tls_bind_configured: bool,
-    lookup: impl Fn(&str) -> Result<Option<String>, TlsConfigError>,
+    lookup: impl Fn(&str) -> Result<Option<String>, EnvError>,
 ) -> Result<Option<TlsServer>, String> {
     let get = |var: &str| lookup(var).map_err(|e| e.to_string());
     match (get(cert_var)?, get(key_var)?) {
@@ -221,9 +221,9 @@ mod tests {
         assert!(matches!(plan[0].1, ListenerKind::Plain { tls: Some(_) }));
     }
 
-    /// A lookup over already-normalized values, as `tls_env_var` returns them (blank never
+    /// A lookup over already-normalized values, as `strict_env_var` returns them (blank never
     /// arrives here; it is `None`, which the framework's own test covers).
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<Option<String>, TlsConfigError> {
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<Option<String>, EnvError> {
         let map: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -260,7 +260,7 @@ mod tests {
         for bad in ["C", "K"] {
             let lookup = |name: &str| {
                 if name == bad {
-                    Err(TlsConfigError::EnvNotUnicode {
+                    Err(EnvError::NotUnicode {
                         var: name.to_string(),
                     })
                 } else {

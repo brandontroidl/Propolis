@@ -473,6 +473,19 @@ Sensors are always separate processes. They have **no compiled-in default port**
 the bind address comes from config/env set by the deploy units. See
 [ports and protocols](ports-and-protocols.md).
 
+**How every sensor variable is read.** All eleven sensor binaries (ssh, telnet, http, ftp, redis,
+adb, catchall, tftp, mqtt, smtp, cred) read every `PROPOLIS_*` variable below, and the bare
+`COLLECTOR_ID` and `CATCHALL_*` legacy spellings, through one reader,
+`crates/sensor-framework/src/env.rs#strict_env_var` (the legacy-name fallback,
+`crates/sensor-framework/src/env.rs#env_with_legacy`, applies the same rule to both names). Unset
+is unset. The value is trimmed of leading and trailing ASCII whitespace, and a value that is blank
+after the trim counts as unset, the same way `deploy/fleet-listeners.sh` skips a blank bind; for a
+required bind that means a blank value is the same startup error as a missing one. A value that is
+not valid UTF-8 is invalid, never unset and never replaced by a default: the sensor logs
+`environment variable <NAME> is not valid UTF-8` and exits 1 before binding anything. This holds
+for the lenient sensors too (cred, smtp): "lenient" below covers only an unparseable or zero
+bound, never a non-UTF-8 value. The per-variable rules below apply to the value after this step.
+
 ### Standard sensors (strict parse) - ssh, telnet, http, ftp, redis, adb, catchall, tftp, mqtt
 
 Shared `ConnectionBounds` pattern via each crate's local
@@ -602,7 +615,7 @@ Sensor-specific extras:
   (default `/var/lib/propolis/ssh/host_key`, `sensor-ssh/src/main.rs#DEFAULT_HOST_KEY_PATH`), `PROPOLIS_SSH_SPOOL_DIR`
   (default `/var/spool/propolis/ssh`, `sensor-ssh/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_SSH_BANNER` (default =
   persona `OPENSSH_VERSION` = `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10`, `sensor-ssh/src/main.rs#DEFAULT_BANNER` +
-  `sensor-framework/src/persona.rs#OPENSSH_VERSION`; unset → default, a set-but-blank value is sent as-is (`sensor-ssh/src/main.rs#load_config_from_env`)), `PROPOLIS_SSH_OUTBOX_DIR` (default
+  `sensor-framework/src/persona.rs#OPENSSH_VERSION`; unset or blank → default, `sensor-ssh/src/main.rs#load_config_from_env`), `PROPOLIS_SSH_OUTBOX_DIR` (default
   `/var/spool/propolis/ssh/outbox`; see "Outbox manifest" below).
 - **ftp** (`crates/sensor-ftp/src/main.rs`): `PROPOLIS_FTP_SPOOL_DIR` (default
   `/var/spool/propolis/ftp`, `sensor-ftp/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_FTP_OUTBOX_DIR` (default
@@ -619,13 +632,10 @@ Sensor-specific extras:
   read by its canonical name only; there is no legacy bare spelling for this sensor.
   `PROPOLIS_TFTP_BIND` is the only switch: the sensor is off until an operator sets it, and with no
   bind (or an unparseable one) it logs the error and exits 1 without binding anything.
-- **How every TLS variable is read** (http, redis, mqtt, smtp, ftp and cred; every `*_TLS_BIND`,
-  `*_TLS_CERT` and `*_TLS_KEY`, and `PROPOLIS_SMTP_SUBMISSION_BIND`): one reader,
-  `crates/sensor-framework/src/tls.rs#tls_env_var`. Unset is unset. The value is trimmed of
-  leading and trailing ASCII whitespace, and a value that is blank after the trim counts as unset,
-  the same way `deploy/fleet-listeners.sh` skips a blank bind. A value that is not valid UTF-8 is
-  invalid, never unset: the sensor exits 1 with `refusing to start`. The per-sensor rules below
-  apply to the values after this step.
+- **TLS variables** (http, redis, mqtt, smtp, ftp and cred; every `*_TLS_BIND`, `*_TLS_CERT` and
+  `*_TLS_KEY`, and `PROPOLIS_SMTP_SUBMISSION_BIND`) are read by the same reader described under
+  "How every sensor variable is read" above. The per-sensor rules below apply to the values after
+  that step.
 - **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`).
   HTTP TLS (all three default off; none has a compiled default):
 
@@ -640,7 +650,7 @@ Sensor-specific extras:
   CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_HTTP_TLS_BIND` is set
   without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
   mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of the
-  three is invalid, not unset (`crates/sensor-framework/src/tls.rs#tls_env_var`). CERT and KEY
+  three is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY
   without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
   (`deploy/fleet-listeners.sh#PROPOLIS_HTTP_TLS_BIND`), a TLS listener never starts implicitly.
@@ -657,7 +667,7 @@ Sensor-specific extras:
   CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_REDIS_TLS_BIND` is set
   without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
   mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of the
-  three is invalid, not unset (`crates/sensor-framework/src/tls.rs#tls_env_var`). CERT and KEY
+  three is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY
   without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
   (`deploy/fleet-listeners.sh#PROPOLIS_REDIS_TLS_BIND`), a TLS listener never starts implicitly.
@@ -674,7 +684,7 @@ Sensor-specific extras:
   CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_MQTT_TLS_BIND` is set
   without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
   mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of the
-  three is invalid, not unset (`crates/sensor-framework/src/tls.rs#tls_env_var`). CERT and KEY
+  three is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY
   without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
   (`deploy/fleet-listeners.sh#PROPOLIS_MQTT_TLS_BIND`), a TLS listener never starts implicitly.
@@ -696,7 +706,7 @@ Sensor-specific extras:
   `PROPOLIS_SMTP_TLS_BIND` or `PROPOLIS_SMTP_SUBMISSION_BIND` does not parse (unlike the lenient
   bound variables, a bad bind never falls back to a default), when a file is unreadable, not PEM
   or a mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of
-  the four is invalid, not unset (`crates/sensor-framework/src/tls.rs#tls_env_var`,
+  the four is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`,
   `crates/sensor-smtp/src/lib.rs#tls_from_env`). If the OS refuses any one bind, the listeners
   already started are stopped and the sensor exits 1
   (`crates/sensor-smtp/src/lib.rs#start_listeners`). With CERT and KEY set and no
@@ -721,7 +731,7 @@ Sensor-specific extras:
   `PROPOLIS_FTP_TLS_BIND` does not parse (a bad bind never falls back to a default), when a file
   is unreadable, not PEM or a mismatched pair, or when the key is group- or world-readable; a
   non-UTF-8 value of any of the three is invalid, not unset
-  (`crates/sensor-framework/src/tls.rs#tls_env_var`). If the OS refuses any one
+  (`crates/sensor-framework/src/env.rs#strict_env_var`). If the OS refuses any one
   bind, the listeners already started are stopped and the sensor exits 1
   (`crates/sensor-ftp/src/lib.rs#start_listeners`). With CERT and KEY set and no
   `PROPOLIS_FTP_TLS_BIND`, the pair enables AUTH TLS on the plain listener and no implicit-TLS

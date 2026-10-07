@@ -12,7 +12,6 @@
 //! "zero does not mean unlimited".
 
 use std::collections::HashMap;
-use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +20,7 @@ use std::time::Duration;
 use sensor_catchall::handler;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{
-    ConnectionBounds, EventEmitter, WanResolver, run_tcp_listener, run_udp_listener,
+    ConnectionBounds, EnvError, EventEmitter, WanResolver, run_tcp_listener, run_udp_listener,
     shutdown_signal,
 };
 use tokio::task::JoinHandle;
@@ -50,21 +49,8 @@ fn legacy_name(canonical: &str) -> &str {
     canonical.strip_prefix("PROPOLIS_").unwrap_or(canonical)
 }
 
-fn env_var(name: &str) -> Result<String, env::VarError> {
-    match env::var(name) {
-        Ok(value) => Ok(value),
-        Err(_) => {
-            let legacy = legacy_name(name);
-            let value = env::var(legacy)?;
-            tracing::warn!(
-                canonical = name,
-                legacy,
-                "catchall: read a deprecated bare env var name; rename it to the canonical \
-                 PROPOLIS_-prefixed form (the bare spelling will stop being read in a future release)"
-            );
-            Ok(value)
-        }
-    }
+fn env_var(name: &str) -> Result<Option<String>, EnvError> {
+    sensor_framework::env_with_legacy(name, legacy_name(name))
 }
 
 const DEFAULT_LOG_PATH: &str = "catchall-events.jsonl";
@@ -100,11 +86,20 @@ enum ConfigError {
         field: &'static str,
         value: String,
     },
+    /// An env var held bytes that are not valid UTF-8; never read as unset.
+    Env(EnvError),
+}
+
+impl From<EnvError> for ConfigError {
+    fn from(e: EnvError) -> Self {
+        ConfigError::Env(e)
+    }
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ConfigError::Env(e) => write!(f, "{e}"),
             ConfigError::NoBindAddrs => write!(
                 f,
                 "{ENV_BIND_ADDRS} must name at least one bind address (comma-separated ip:port)"
@@ -217,34 +212,34 @@ fn parse_positive_u32(
 /// address, malformed entry, or zero-valued bound is rejected here rather than silently
 /// substituted with a default that could disable the bound it names.
 fn load_config_from_env() -> Result<Config, ConfigError> {
-    let bind_addrs = parse_bind_addrs(&env_var(ENV_BIND_ADDRS).unwrap_or_default())?;
-    let wan_map = parse_wan_map(&env_var(ENV_WAN_MAP).unwrap_or_default())?;
-    let log_path = env_var(ENV_LOG_PATH)
+    let bind_addrs = parse_bind_addrs(&env_var(ENV_BIND_ADDRS)?.unwrap_or_default())?;
+    let wan_map = parse_wan_map(&env_var(ENV_WAN_MAP)?.unwrap_or_default())?;
+    let log_path = env_var(ENV_LOG_PATH)?
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_PATH));
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH));
 
     let read_timeout_ms = parse_positive_u64(
-        env_var(ENV_READ_TIMEOUT_MS).ok().as_deref(),
+        env_var(ENV_READ_TIMEOUT_MS)?.as_deref(),
         DEFAULT_READ_TIMEOUT_MS,
         ENV_READ_TIMEOUT_MS,
     )?;
     let idle_timeout_ms = parse_positive_u64(
-        env_var(ENV_IDLE_TIMEOUT_MS).ok().as_deref(),
+        env_var(ENV_IDLE_TIMEOUT_MS)?.as_deref(),
         DEFAULT_IDLE_TIMEOUT_MS,
         ENV_IDLE_TIMEOUT_MS,
     )?;
     let max_duration_secs = parse_positive_u64(
-        env_var(ENV_MAX_DURATION_SECS).ok().as_deref(),
+        env_var(ENV_MAX_DURATION_SECS)?.as_deref(),
         DEFAULT_MAX_DURATION_SECS,
         ENV_MAX_DURATION_SECS,
     )?;
     let max_captured_bytes = parse_positive_u64(
-        env_var(ENV_MAX_CAPTURED_BYTES).ok().as_deref(),
+        env_var(ENV_MAX_CAPTURED_BYTES)?.as_deref(),
         DEFAULT_MAX_CAPTURED_BYTES,
         ENV_MAX_CAPTURED_BYTES,
     )?;
     let max_concurrent = parse_positive_u32(
-        env_var(ENV_MAX_CONCURRENT).ok().as_deref(),
+        env_var(ENV_MAX_CONCURRENT)?.as_deref(),
         DEFAULT_MAX_CONCURRENT,
         ENV_MAX_CONCURRENT,
     )?;

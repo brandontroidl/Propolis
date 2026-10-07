@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,17 +40,22 @@ fn parse_positive_u32(raw: Option<&str>, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// Read through `sensor_framework::tls_env_var`: unset or blank means "not configured". Anything
-/// else, a non-UTF-8 value included, must parse or the sensor refuses to start: a typo must not
-/// silently drop a listener the derived fleet inventory will claim exists.
-fn optional_bind(var: &str) -> Option<SocketAddr> {
-    let raw = match sensor_framework::tls_env_var(var) {
-        Ok(raw) => raw?,
+/// Read through `sensor_framework::strict_env_var`: unset or blank is `None`, and a non-UTF-8
+/// value refuses to start, so no variable is ever silently read as unset or defaulted.
+fn env_or_exit(var: &str) -> Option<String> {
+    match sensor_framework::strict_env_var(var) {
+        Ok(value) => value,
         Err(e) => {
             tracing::error!(error = %e, "sensor-smtp: invalid configuration; refusing to start");
             std::process::exit(1);
         }
-    };
+    }
+}
+
+/// Unset or blank means "not configured". Anything else must parse or the sensor refuses to
+/// start: a typo must not silently drop a listener the derived fleet inventory will claim exists.
+fn optional_bind(var: &str) -> Option<SocketAddr> {
+    let raw = env_or_exit(var)?;
     match raw.parse() {
         Ok(addr) => Some(addr),
         Err(_) => {
@@ -65,12 +69,9 @@ fn optional_bind(var: &str) -> Option<SocketAddr> {
 async fn main() {
     sensor_framework::init_logging();
 
-    let bind_raw = match env::var(ENV_BIND) {
-        Ok(v) => v,
-        Err(_) => {
-            tracing::error!("{ENV_BIND} must be set");
-            std::process::exit(1);
-        }
+    let Some(bind_raw) = env_or_exit(ENV_BIND) else {
+        tracing::error!("{ENV_BIND} must be set");
+        std::process::exit(1);
     };
     let bind_addr: SocketAddr = match bind_raw.trim().parse() {
         Ok(a) => a,
@@ -80,30 +81,30 @@ async fn main() {
         }
     };
 
-    let wan_map = parse_wan_map(&env::var(ENV_WAN_MAP).unwrap_or_default());
-    let log_path = env::var(ENV_LOG_PATH)
+    let wan_map = parse_wan_map(&env_or_exit(ENV_WAN_MAP).unwrap_or_default());
+    let log_path = env_or_exit(ENV_LOG_PATH)
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_LOG_PATH));
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH));
 
     let bounds = ConnectionBounds {
         read_timeout: Duration::from_millis(parse_positive_u64(
-            env::var("PROPOLIS_SMTP_READ_TIMEOUT_MS").ok().as_deref(),
+            env_or_exit("PROPOLIS_SMTP_READ_TIMEOUT_MS").as_deref(),
             30_000,
         )),
         idle_timeout: Duration::from_millis(parse_positive_u64(
-            env::var("PROPOLIS_SMTP_IDLE_TIMEOUT_MS").ok().as_deref(),
+            env_or_exit("PROPOLIS_SMTP_IDLE_TIMEOUT_MS").as_deref(),
             60_000,
         )),
         max_duration: Duration::from_secs(parse_positive_u64(
-            env::var("PROPOLIS_SMTP_MAX_DURATION_SECS").ok().as_deref(),
+            env_or_exit("PROPOLIS_SMTP_MAX_DURATION_SECS").as_deref(),
             600,
         )),
         max_captured_bytes: parse_positive_u64(
-            env::var("PROPOLIS_SMTP_MAX_CAPTURED_BYTES").ok().as_deref(),
+            env_or_exit("PROPOLIS_SMTP_MAX_CAPTURED_BYTES").as_deref(),
             1_000_000,
         ),
         max_concurrent: parse_positive_u32(
-            env::var("PROPOLIS_SMTP_MAX_CONCURRENT").ok().as_deref(),
+            env_or_exit("PROPOLIS_SMTP_MAX_CONCURRENT").as_deref(),
             256,
         ),
     };
@@ -116,7 +117,7 @@ async fn main() {
         ENV_TLS_CERT,
         ENV_TLS_KEY,
         tls_bind.is_some(),
-        sensor_framework::tls_env_var,
+        sensor_framework::strict_env_var,
     ) {
         Ok(tls) => tls,
         Err(e) => {

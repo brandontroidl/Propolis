@@ -23,7 +23,7 @@ DRY_RUN="${DRY_RUN:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROVISION_CERTS_BIN="${PROVISION_CERTS_BIN:-$SCRIPT_DIR/../target/release/provision-certs}"
 TLS_DIR=/etc/propolis/tls
-TLS_SENSORS=(http mqtt redis smtp ftp cred)
+TLS_SENSORS=(http mqtt redis smtp ftp cred dns)
 
 log() { printf '==> %s\n' "$*"; }
 

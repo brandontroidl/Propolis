@@ -51,8 +51,8 @@ fn ssh_unit_has_hardening_directives() {
     assert_unit_hardened(&unit, "sensor-ssh");
 }
 
-/// The TFTP sensor is the one unit that answers over UDP. It must clear the same bar as every
-/// other sensor, bind port 69 without root, and stay off by default: the unit carries no
+/// The TFTP sensor is one of the two units that answer over UDP. It must clear the same bar as
+/// every other sensor, bind port 69 without root, and stay off by default: the unit carries no
 /// compiled-in bind, so an installed-but-unconfigured unit has nothing to listen on.
 #[test]
 fn tftp_unit_has_hardening_directives_and_cap_net_bind() {
@@ -74,6 +74,41 @@ fn tftp_unit_has_hardening_directives_and_cap_net_bind() {
             .any(|l| l.contains("PROPOLIS_TFTP_BIND") && !l.trim_start().starts_with('#')),
         "the unit must not hardcode a bind address"
     );
+}
+
+/// The DNS sensor answers over UDP and TCP on 53 and optionally DNS over TLS on 853, all
+/// privileged ports, so it keeps `CAP_NET_BIND_SERVICE`. It stays off by default (no inline bind)
+/// and captures no bodies, so its only writable path is its own log directory.
+#[test]
+fn dns_unit_has_hardening_directives_and_cap_net_bind() {
+    let unit = deploy_file("sensor-dns.service");
+    assert_unit_hardened(&unit, "sensor-dns");
+    assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
+    assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
+    assert!(
+        unit.contains("EnvironmentFile=/etc/propolis/dns.env"),
+        "the unit must read its bind from the operator's dns.env, with no inline default"
+    );
+    assert!(
+        !unit
+            .lines()
+            .any(|l| l.contains("PROPOLIS_DNS_BIND") && !l.trim_start().starts_with('#')),
+        "the unit must not hardcode a bind address"
+    );
+    assert!(
+        unit.contains("ReadWritePaths=/var/log/propolis/dns\n"),
+        "the only writable path is the sensor's own log directory"
+    );
+}
+
+/// The DNS sensor reads its DoT cert and key from the root-owned TLS directory, read-only, and
+/// keeps the capability its privileged ports need.
+#[test]
+fn dns_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
+    let unit = deploy_file("sensor-dns.service");
+    assert!(unit.lines().any(|l| l == TLS_READ_ONLY_LINE));
+    assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
+    assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
 }
 
 /// The MQTT sensor listens on 1883, an unprivileged port, so unlike the other sensor units it must
@@ -574,6 +609,10 @@ fn logrotate_config_covers_both_sensor_logs() {
     assert!(
         config.contains("/var/log/propolis/mqtt/events.jsonl"),
         "must rotate the MQTT honeypot's log"
+    );
+    assert!(
+        config.contains("/var/log/propolis/dns/events.jsonl"),
+        "must rotate the DNS honeypot's log"
     );
 }
 
@@ -1401,7 +1440,7 @@ fn no_sensor_crate_depends_on_an_http_client() {
 }
 
 /// Sensors with a TLS listener (telnet is deliberately out of scope).
-const TLS_SENSORS: [&str; 6] = ["http", "mqtt", "redis", "smtp", "ftp", "cred"];
+const TLS_SENSORS: [&str; 7] = ["http", "mqtt", "redis", "smtp", "ftp", "cred", "dns"];
 
 /// The TLS directory grant every TLS-capable sensor unit carries. The leading `-` makes a missing
 /// directory non-fatal: without it systemd refuses to start the unit (226/NAMESPACE) on a box where
@@ -1554,7 +1593,7 @@ fn both_deploy_scripts_mint_tls_certs_at_the_right_point() {
     assert!(upgrade.contains("PROVISION_CERTS_BIN=\"$BUILD_DIR/provision-certs\""));
 }
 
-/// Real dry-run of install.sh: the tls dir at 0711, one --sensor-tls call over all six sensors,
+/// Real dry-run of install.sh: the tls dir at 0711, one --sensor-tls call over all seven sensors,
 /// and per-sensor ownership + modes (key 0600 owned by the sensor's own user).
 #[test]
 fn install_dry_run_mints_and_locks_down_a_pair_per_tls_sensor() {
@@ -1576,7 +1615,7 @@ fn install_dry_run_mints_and_locks_down_a_pair_per_tls_sensor() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("--sensor-tls /etc/propolis/tls http mqtt redis smtp ftp cred\n"),
+        stdout.contains("--sensor-tls /etc/propolis/tls http mqtt redis smtp ftp cred dns\n"),
         "{stdout}"
     );
     for s in TLS_SENSORS {

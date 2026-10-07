@@ -69,12 +69,13 @@ ensure_user propolis-ftp
 ensure_user propolis-smtp
 ensure_user propolis-tftp
 ensure_user propolis-mqtt
+ensure_user propolis-dns
 ensure_user propolis-cred
 
 # propolis reads all sensors' logs (ReadOnlyPaths=/var/log/propolis in propolis.service). The
 # files themselves are group-readable (UMask=0027 in sensor units), so propolis needs
 # supplementary membership in each sensor's own group.
-run usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-tftp,propolis-mqtt,propolis-cred propolis
+run usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-tftp,propolis-mqtt,propolis-dns,propolis-cred propolis
 
 # ---- 2. directories ----
 
@@ -105,6 +106,7 @@ ensure_dir /var/log/propolis/ftp         0750 propolis-ftp      propolis-ftp
 ensure_dir /var/log/propolis/smtp        0750 propolis-smtp     propolis-smtp
 ensure_dir /var/log/propolis/tftp        0750 propolis-tftp     propolis-tftp
 ensure_dir /var/log/propolis/mqtt        0750 propolis-mqtt     propolis-mqtt
+ensure_dir /var/log/propolis/dns         0750 propolis-dns      propolis-dns
 ensure_dir /var/log/propolis/cred        0750 propolis-cred     propolis-cred
 # root-owned, NOT propolis: write permission on this directory would let a compromised propolis
 # daemon unlink/rename any child regardless of the child's own owner - including the sibling

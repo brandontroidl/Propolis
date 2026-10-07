@@ -15,6 +15,7 @@ members = [
     "crates/sensor-smtp",
     "crates/sensor-mqtt",
     "crates/sensor-tftp",
+    "crates/sensor-dns",
     "crates/sensor-cred",
     "crates/geoip",
     "crates/log-tailer",

@@ -4,7 +4,7 @@ audience: evaluator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Maturity and status
@@ -17,8 +17,8 @@ operate at your own risk.
 
 The version signals diverge across surfaces; read them together, not in isolation:
 
-- **Crate version: `0.4.0`** for twenty of the 26 workspace crates; the six
-  added since `0.3.0` (`collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper`) are at
+- **Crate version: `0.4.0`** for twenty-one of the 27 workspace crates; six
+  (`collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper`) are at
   `0.1.0`. There is no shared `[workspace.package]` version key - each crate pins
   its own.
 - **Only one release tag exists: `v0.1.0`** (annotated, at commit `e0bfd513`,
@@ -42,7 +42,7 @@ The following subsystems are implemented and carry substantial test suites
 - **Feed** - two-tier export, ASN suppression, fail-closed publisher.
 - **Console** - axum + minijinja + HTMX, the V12 theme system and evidence drawer,
   offline MaxMind enrichment, self-hosted fonts.
-- **14-protocol sensor surface** - eleven sensor crates (see [Capabilities](capabilities.md)).
+- **15-protocol sensor surface** - twelve sensor crates (see [Capabilities](capabilities.md)).
 - **Unified daemon** - supervises intake/review/feed/console plus ops-monitor
   self-alerting.
 - **Shared geoip crate** - extracted GeoLite2 reader.

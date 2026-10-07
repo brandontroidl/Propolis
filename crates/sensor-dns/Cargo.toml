@@ -1,0 +1,23 @@
+[package]
+name = "sensor-dns"
+version = "0.4.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "sensor-dns"
+path = "src/main.rs"
+
+[dependencies]
+sensor-wire = { path = "../sensor-wire" }
+sensor-framework = { path = "../sensor-framework" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
+serde_json = "1.0.151"
+chrono = { version = "0.4.45", features = ["serde"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+rcgen = "0.14.9"
+# Client side of the TLS tests only; the sensor itself reaches rustls through sensor-framework.
+tokio-rustls = "0.26.4"

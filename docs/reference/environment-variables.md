@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Environment variables
@@ -46,7 +46,7 @@ Which run mode a given deployment uses is an operator choice; both sets of
 Two fail-closed idioms recur; they are **not** uniform:
 
 - **Strict parse** - `propolis`, `intake`, `review`, `feed`, `console`, and
-  sensors `ssh`/`telnet`/`http`/`ftp`/`redis`/`adb`/`catchall`/`tftp`/`mqtt`: a
+  sensors `ssh`/`telnet`/`http`/`ftp`/`redis`/`adb`/`catchall`/`tftp`/`mqtt`/`dns`: a
   present-but-invalid or present-but-zero numeric bound **aborts startup**.
 - **Lenient parse** - sensors `cred` and `smtp` **only**: an invalid or zero
   bound silently falls back to the default (`parse_positive_u64` filters `>0`
@@ -88,7 +88,7 @@ console rDNS parse booleans more broadly (called out below).
   variable.
 - Required: no. When it is unset or does not parse, `propolis` and `console` log at `info`
   (`propolis/src/main.rs#main`, `console/src/main.rs#main`).
-- Sensors: all eleven sensor binaries log at `info` when it is unset; a set `RUST_LOG` overrides
+- Sensors: all twelve sensor binaries log at `info` when it is unset; a set `RUST_LOG` overrides
   that default, and an invalid directive in it is skipped rather than failing startup. Each
   calls `sensor_framework::init_logging` (`crates/sensor-framework/src/logging.rs#init_logging`),
   which installs an `EnvFilter` with an `info` default directive, and `sensor-framework` enables
@@ -473,8 +473,8 @@ Sensors are always separate processes. They have **no compiled-in default port**
 the bind address comes from config/env set by the deploy units. See
 [ports and protocols](ports-and-protocols.md).
 
-**How every sensor variable is read.** All eleven sensor binaries (ssh, telnet, http, ftp, redis,
-adb, catchall, tftp, mqtt, smtp, cred) read every `PROPOLIS_*` variable below, and the bare
+**How every sensor variable is read.** All twelve sensor binaries (ssh, telnet, http, ftp, redis,
+adb, catchall, tftp, mqtt, dns, smtp, cred) read every `PROPOLIS_*` variable below, and the bare
 `COLLECTOR_ID` and `CATCHALL_*` legacy spellings, through one reader,
 `crates/sensor-framework/src/env.rs#strict_env_var` (the legacy-name fallback,
 `crates/sensor-framework/src/env.rs#env_with_legacy`, applies the same rule to both names). Unset
@@ -486,7 +486,7 @@ not valid UTF-8 is invalid, never unset and never replaced by a default: the sen
 for the lenient sensors too (cred, smtp): "lenient" below covers only an unparseable or zero
 bound, never a non-UTF-8 value. The per-variable rules below apply to the value after this step.
 
-### Standard sensors (strict parse) - ssh, telnet, http, ftp, redis, adb, catchall, tftp, mqtt
+### Standard sensors (strict parse) - ssh, telnet, http, ftp, redis, adb, catchall, tftp, mqtt, dns
 
 Shared `ConnectionBounds` pattern via each crate's local
 `parse_positive_u64`/`parse_positive_u32`: unset → default; **present-but-zero or
@@ -503,6 +503,7 @@ null `wan_ip`); invalid entry → abort.
 | ftp | `PROPOLIS_FTP_` | `PROPOLIS_FTP_BIND` | `/var/log/propolis/ftp/events.jsonl` |
 | tftp | `PROPOLIS_TFTP_` | `PROPOLIS_TFTP_BIND` (UDP; unset aborts startup, `sensor-tftp/src/main.rs#load_config_from`) | `/var/log/propolis/tftp/events.jsonl` |
 | mqtt | `PROPOLIS_MQTT_` | `PROPOLIS_MQTT_BIND` (unset aborts startup, `sensor-mqtt/src/main.rs#load_config_from_env`) | `/var/log/propolis/mqtt/events.jsonl` |
+| dns | `PROPOLIS_DNS_` | `PROPOLIS_DNS_BIND` (UDP and TCP; unset aborts startup, `sensor-dns/src/main.rs#load_config_from`) | `/var/log/propolis/dns/events.jsonl` |
 | redis | `PROPOLIS_REDIS_` | `PROPOLIS_REDIS_BIND` | `/var/log/propolis/redis/events.jsonl` |
 | adb | `PROPOLIS_ADB_` | `PROPOLIS_ADB_BIND` | `/var/log/propolis/adb/events.jsonl` |
 | catchall | `PROPOLIS_CATCHALL_` (bare `CATCHALL_` still read, deprecated) | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list, empty→abort) | `catchall-events.jsonl` (relative) |
@@ -513,10 +514,10 @@ Common per-sensor variables (each uses its own prefix; catchall uses `PROPOLIS_C
 |---|---|---|---|
 | `<P>WAN_MAP` (catchall `PROPOLIS_CATCHALL_WAN_MAP`) | no | empty map | invalid entry → abort |
 | `<P>LOG_PATH` (catchall `PROPOLIS_CATCHALL_LOG_PATH`) | no | see table above | |
-| `<P>READ_TIMEOUT_MS` | no | `30_000` (catchall `5_000`) | ms; zero → abort |
-| `<P>IDLE_TIMEOUT_MS` | no | `60_000` (catchall `5_000`) | ms; zero → abort |
-| `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`) | secs; zero → abort |
-| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (catchall `4_096`) | bytes; zero → abort |
+| `<P>READ_TIMEOUT_MS` | no | `30_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
+| `<P>IDLE_TIMEOUT_MS` | no | `60_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
+| `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`; dns `120`) | secs; zero → abort |
+| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (catchall `4_096`; dns `262_144`) | bytes; zero → abort |
 | `<P>MAX_CONCURRENT` | no | `256` (http `512`, tftp `128`) | u32; zero → abort |
 
 The `<P>` rows above, instantiated per sensor (each name is read literally by that sensor's
@@ -560,6 +561,18 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   connection; a single packet is separately capped at 262144 bytes of declared remaining length
   (`sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`) and a connection at 1024 packets
   (`sensor-mqtt/src/handler.rs#MAX_PACKETS`), neither configurable.
+- dns: `PROPOLIS_DNS_READ_TIMEOUT_MS`, `PROPOLIS_DNS_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_DNS_MAX_DURATION_SECS`, `PROPOLIS_DNS_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_DNS_MAX_CONCURRENT`, `PROPOLIS_DNS_LOG_PATH`, `PROPOLIS_DNS_WAN_MAP`, and the DoT
+  variables `PROPOLIS_DNS_TLS_BIND`, `PROPOLIS_DNS_TLS_CERT`, `PROPOLIS_DNS_TLS_KEY` (see "DNS
+  TLS" below). `PROPOLIS_DNS_MAX_CAPTURED_BYTES` bounds the bytes read per TCP or DoT connection
+  (64 queries of 4096 bytes); a UDP datagram is one query and is not counted against it.
+  `PROPOLIS_DNS_MAX_CONCURRENT` applies separately to each of the three surfaces: the UDP handler
+  pool, the TCP listener and the DoT listener. `PROPOLIS_DNS_BIND` is the only switch and serves
+  UDP and TCP on the same `ip:port`: the sensor is off until an operator sets it, and if either
+  transport cannot bind it exits 1 with nothing left listening. A UDP datagram's handling is cut
+  at the read timeout. There are no spool, outbox or collector-id variables: the sensor captures
+  no bodies.
 - http: `PROPOLIS_HTTP_READ_TIMEOUT_MS`, `PROPOLIS_HTTP_IDLE_TIMEOUT_MS`,
   `PROPOLIS_HTTP_MAX_DURATION_SECS`, `PROPOLIS_HTTP_MAX_CAPTURED_BYTES`,
   `PROPOLIS_HTTP_MAX_CONCURRENT`, `PROPOLIS_HTTP_LOG_PATH`, `PROPOLIS_HTTP_WAN_MAP`, and the
@@ -632,7 +645,7 @@ Sensor-specific extras:
   read by its canonical name only; there is no legacy bare spelling for this sensor.
   `PROPOLIS_TFTP_BIND` is the only switch: the sensor is off until an operator sets it, and with no
   bind (or an unparseable one) it logs the error and exits 1 without binding anything.
-- **TLS variables** (http, redis, mqtt, smtp, ftp and cred; every `*_TLS_BIND`, `*_TLS_CERT` and
+- **TLS variables** (http, redis, mqtt, smtp, ftp, cred and dns; every `*_TLS_BIND`, `*_TLS_CERT` and
   `*_TLS_KEY`, and `PROPOLIS_SMTP_SUBMISSION_BIND`) are read by the same reader described under
   "How every sensor variable is read" above. The per-sensor rules below apply to the values after
   that step.
@@ -690,6 +703,24 @@ Sensor-specific extras:
   (`deploy/fleet-listeners.sh#PROPOLIS_MQTT_TLS_BIND`), a TLS listener never starts implicitly.
   The plain and TLS listeners share one capture-memory budget
   (`PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES`), so the ceiling covers both together.
+- **dns**: DNS TLS (DNS over TLS, RFC 7858; all three default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_DNS_TLS_BIND` | unset (the deploy convention is `<ip>:853`) | `ip:port` of the DNS over TLS listener. The listener exists only when this is set. |
+  | `PROPOLIS_DNS_TLS_CERT` | unset (deploy value `/etc/propolis/tls/dns.crt`) | PEM certificate path. |
+  | `PROPOLIS_DNS_TLS_KEY` | unset (deploy value `/etc/propolis/tls/dns.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-dns/src/main.rs#parse_tls`): the sensor exits 1 with
+  `refusing to start`, before binding any listener (the plain UDP and TCP pair included), when
+  exactly one of CERT and KEY is set (a blank value counts as unset), when
+  `PROPOLIS_DNS_TLS_BIND` is set without both paths, when the bind does not parse, when a file
+  is unreadable, not PEM or a mismatched pair, or when the key is group- or world-readable; a
+  non-UTF-8 value of any of the three is invalid, not unset
+  (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY without a bind load and
+  validate the pair, start no TLS listener, and log one warning. Because the fleet inventory
+  derives from the `*_BIND` variables (`deploy/fleet-listeners.sh#PROPOLIS_DNS_TLS_BIND`), a TLS
+  listener never starts implicitly.
 - **smtp**: SMTP TLS and extra listeners (all four default off; none has a compiled default):
 
   | Variable | Default | Meaning |

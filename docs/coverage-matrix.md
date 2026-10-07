@@ -4,7 +4,7 @@ audience: maintainer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Documentation coverage matrix
@@ -30,7 +30,7 @@ liveness alert). Every component, stage, invariant, and procedure has a canonica
 owner. The `partial` rows carry a documented caveat, noted in the last
 column.
 
-## Component crates (26 crates / 19 binaries)
+## Component crates (27 crates / 20 binaries)
 
 Inventory and dependency graph owned by
 [architecture/components.md](architecture/components.md). Per-crate behavior lives in
@@ -50,9 +50,10 @@ the architecture and reference pages below.
 | `sensor-http` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md), [operations/networking-tls.md](operations/networking-tls.md) | documented | Per-connection HTTP honeypot handler, plus an optional implicit-TLS HTTPS listener (default off, fail-closed on a bad cert and key pair). |
 | `sensor-ftp` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md), [operations/networking-tls.md](operations/networking-tls.md) | documented | Capture hand-off + quarantine spool for uploads; PASV data-peer validation. Also optional AUTH TLS on the plain listener and an implicit-TLS (FTPS, TCP/990) listener, with a TLS-protected passive data channel after `PROT P` (all default off, fail-closed on a bad cert and key pair). |
 | `sensor-smtp` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md), [operations/networking-tls.md](operations/networking-tls.md) | documented | Per-connection SMTP honeypot handler, plus optional STARTTLS, a submission listener (TCP/587) and an implicit-TLS (SMTPS, TCP/465) listener (all default off, fail-closed on a bad cert and key pair). |
-| `sensor-tftp` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md) | documented | The one UDP sensor that replies: reads get one fixed tiny error, writes are acknowledged and captured; bytes sent never exceed bytes received. Default-off. |
+| `sensor-tftp` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md) | documented | One of the two UDP sensors that reply: reads get one fixed tiny error, writes are acknowledged and captured; bytes sent never exceed bytes received. Default-off. |
 | `sensor-mqtt` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md), [operations/networking-tls.md](operations/networking-tls.md) | documented | MQTT 3.1/3.1.1/5.0 recon trap (TCP/1883): records CONNECT credentials (never the password), SUBSCRIBE topics and PUBLISH metadata, and spools a PUBLISH payload that looks binary as a `honeypot_malware_upload` sample; never delivers, retains or forwards a message. Logs malformed first packets and a per-connection session-end summary. Also an optional implicit-TLS (MQTTS, TCP/8883) listener (default off, fail-closed on a bad cert and key pair). Default-off. |
-| `sensor-cred` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md), [operations/networking-tls.md](operations/networking-tls.md) | documented | One binary, 5 protocols (VNC/MySQL/MSSQL/PostgreSQL/MongoDB) = the "11 crates / 14 protocols" count. Also optional TLS on the existing ports: in-band for PostgreSQL, MySQL and MSSQL (TLS inside TDS), sniffed for MongoDB; no new port (default off, fail-closed on a bad cert and key pair). |
+| `sensor-dns` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md), [operations/networking-tls.md](operations/networking-tls.md) | documented | DNS on UDP+TCP/53 and optional DoT/853: REFUSED with the question echoed, nothing appended; replies never exceed queries; probe signals as metadata. Default-off. |
+| `sensor-cred` | [reference/sensor-behavior.md](reference/sensor-behavior.md), [reference/ports-and-protocols.md](reference/ports-and-protocols.md), [operations/networking-tls.md](operations/networking-tls.md) | documented | One binary, 5 protocols (VNC/MySQL/MSSQL/PostgreSQL/MongoDB) = the "12 crates / 15 protocols" count. Also optional TLS on the existing ports: in-band for PostgreSQL, MySQL and MSSQL (TLS inside TDS), sniffed for MongoDB; no new port (default off, fail-closed on a bad cert and key pair). |
 | `intake` | [event-and-sample-lifecycle.md](architecture/event-and-sample-lifecycle.md), [architecture/pipeline.md](architecture/pipeline.md) | partial | Tailer + wire→domain conversion documented; intake's own INSERT path not traced line-by-line in evidence (no-`format!`-SQL grep covers it). |
 | `review` | [architecture/pipeline.md](architecture/pipeline.md), [reference/integrations.md](reference/integrations.md), [security/malware-custody.md](security/malware-custody.md) | documented | Review queue, gatekeeper, vendor adapters, VT scanner, fetcher, operator CLI. |
 | `feed` | [architecture/pipeline.md](architecture/pipeline.md), [reference/scoring-and-feed.md](reference/scoring-and-feed.md) | documented | Snapshot→export→atomic publish; 10 formats per tier/window; checksummed manifest. |
@@ -130,7 +131,7 @@ Owned by the `operations/` section, with symptom-based recovery in `troubleshoot
 | Deployment models (single-node / cluster / dev units) | [operations/deployment-models.md](operations/deployment-models.md) | partial | Single-node fully documented; multi-node aggregation `[inferred]` (see pipeline table). |
 | Configuration (env vars, defaults, bounds) | [operations/configuration.md](operations/configuration.md), [reference/environment-variables.md](reference/environment-variables.md) | documented | Every `PROPOLIS_*` var, default, bound, and fail behavior owned by the env-vars reference. |
 | Secret management | [operations/secret-management.md](operations/secret-management.md) | documented | Per-service `/etc/propolis/*.env`, mode `0600`, operator-created; no secret from argv. |
-| Networking / TLS | [operations/networking-tls.md](operations/networking-tls.md) | partial | Loopback-default console; console TLS is an `[inferred]` reverse-proxy concern, no in-process TLS on the console (GLOBAL CORRECTION 3). Sensor TLS on the six TLS sensors' attacker-facing ports is documented in full (one surface table, certificate model, fail-closed rules). |
+| Networking / TLS | [operations/networking-tls.md](operations/networking-tls.md) | partial | Loopback-default console; console TLS is an `[inferred]` reverse-proxy concern, no in-process TLS on the console (GLOBAL CORRECTION 3). Sensor TLS on the seven TLS sensors' attacker-facing ports is documented in full (one surface table, certificate model, fail-closed rules). |
 | Service lifecycle (start/stop/status/upgrade) | [operations/service-lifecycle.md](operations/service-lifecycle.md), [reference/commands.md](reference/commands.md) | documented | `systemctl enable --now`; graceful 30s shutdown; `upgrade.sh` in-place; migrations at startup. |
 | Health / readiness / metrics / alerts | [operations/health-and-observability.md](operations/health-and-observability.md), [reference/console-routes.md](reference/console-routes.md) | documented | `/health`, `/ready` (503 fail-closed), `/metrics` Prometheus, `/logs` ring; opt-in ntfy ops-alerting. |
 | Capacity planning | [operations/capacity-planning.md](operations/capacity-planning.md) | documented | Resource caps per unit; PgPool sizing; single-daemon footprint. |

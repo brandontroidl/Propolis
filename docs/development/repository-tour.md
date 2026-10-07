@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Repository tour
@@ -17,12 +17,12 @@ tables, ports, routes, and constants are owned by the
 
 | Path | What it holds |
 |---|---|
-| `Cargo.toml` | Workspace root: `resolver = "2"`, 26 members, no `[workspace.dependencies]` and no `[workspace.package]` (every crate declares its own version and deps). |
+| `Cargo.toml` | Workspace root: `resolver = "2"`, 27 members, no `[workspace.dependencies]` and no `[workspace.package]` (every crate declares its own version and deps). |
 | `Cargo.lock` | Committed, frozen in CI via `--locked`. |
 | `rust-toolchain.toml` | Pins the exact toolchain (`1.96.1`) + `clippy`, `rustfmt`. See [toolchain-and-environment](toolchain-and-environment.md). |
 | `.cargo/config.toml` | Redirects crates-io to the vendored source tree. |
 | `vendor/` | All dependencies vendored in-tree. Do not edit. See [schema-and-migrations](schema-and-migrations.md#vendoring) and [`reference/dependencies`](../reference/dependencies.md). |
-| `crates/` | The 26 workspace members (below). |
+| `crates/` | The 27 workspace members (below). |
 | `deploy/` | systemd units + `install.sh`. Owns real bind ports/paths at deploy time. See [`reference/ports-and-protocols`](../reference/ports-and-protocols.md). |
 | `.github/workflows/ci.yml` | The authoritative build/test gate. See [build-and-test](build-and-test.md). |
 | `.env` | Gitignored local dev config (test `DATABASE_URL`, podman recipe). Not committed. |
@@ -32,7 +32,7 @@ tables, ports, routes, and constants are owned by the
 
 ## Crates
 
-26 workspace members (`Cargo.toml#members`). Full component inventory with binaries and dependency edges lives in [`architecture/components`](../architecture/components.md); the summary by concern:
+27 workspace members (`Cargo.toml#members`). Full component inventory with binaries and dependency edges lives in [`architecture/components`](../architecture/components.md); the summary by concern:
 
 **Foundation libraries (no internal deps):**
 - `core-scoring` - event ledger, chain-hashing, scoring, blocklist eligibility; owns the core DB migrations (`crates/core-scoring/migrations/`).
@@ -43,7 +43,7 @@ tables, ports, routes, and constants are owned by the
 
 **Sensor layer:**
 - `sensor-framework` - the shared harness (listener lifecycle, WAN attribution, sanitize, emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds). Depends only on `sensor-wire`.
-- `sensor-{catchall,ssh,telnet,redis,adb,http,ftp,smtp,tftp,mqtt,cred}` - the 11 sensor binaries covering 14 protocols (`cred` alone serves VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Each depends only on `sensor-wire` + `sensor-framework` + `tokio`. See [adding-a-sensor](adding-a-sensor.md) and [`architecture/sensors`](../architecture/sensors.md).
+- `sensor-{catchall,ssh,telnet,redis,adb,http,ftp,smtp,tftp,mqtt,dns,cred}` - the 12 sensor binaries covering 15 protocols (`cred` alone serves VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Each depends only on `sensor-wire` + `sensor-framework` + `tokio`. See [adding-a-sensor](adding-a-sensor.md) and [`architecture/sensors`](../architecture/sensors.md).
 
 **Data plane:**
 - `intake` - tails sensor NDJSON logs, converts wire events to domain events, appends to the ledger.

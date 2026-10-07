@@ -1,8 +1,8 @@
 //! sensor-tftp: a TFTP (UDP/69) honeypot that records read and write probes and captures uploaded
-//! payloads. It is the one sensor that replies over UDP, so its reply surface is bounded by
-//! construction: see [`guarded`] for the byte-budget guarantee and [`handler`] for the state
-//! machine. It never serves file content, never retransmits, and never opens an outbound
-//! connection.
+//! payloads. It is one of two sensors that reply over UDP (sensor-dns is the other), so its reply
+//! surface is bounded by construction: see [`guarded`] for the byte-budget guarantee and
+//! [`handler`] for the state machine. It never serves file content, never retransmits, and never
+//! opens an outbound connection.
 
 pub mod guarded;
 pub mod handler;

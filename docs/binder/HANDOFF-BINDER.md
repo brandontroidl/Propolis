@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Propolis handoff binder
@@ -65,10 +65,10 @@ The essentials a new owner needs on day one:
 
 - **What runs:** one unified `propolis` daemon (intake + review + feed + console
   + VirusTotal + malware fetcher + ops-monitor, as supervised tokio tasks over
-  one PostgreSQL pool) plus eleven attacker-facing sensor processes, each its own
+  one PostgreSQL pool) plus twelve attacker-facing sensor processes, each its own
   systemd service and OS user. See [§4](#4-system-architecture).
 - **State of the code:** source-available and actively developed. Crate version
-  is `0.4.0` for twenty of the 26 crates (the six added since `0.3.0` are at
+  is `0.4.0` for twenty-one of the 27 crates (six crates are still at
   `0.1.0`), but the **only release tag is `v0.1.0`**; the current tree is untagged.
   Not certified or production-blessed. See
   [§3](#3-current-implementation-status).
@@ -96,8 +96,8 @@ map is [`DOCUMENTATION.md`](../../DOCUMENTATION.md).
 **What it is** ([overview](../overview/index.md),
 [capabilities](../overview/capabilities.md)):
 
-- A **honeypot layer** - eleven sensor crates presenting fourteen protocol listeners
-  (SSH, Telnet, HTTP, FTP, SMTP, TFTP, MQTT, Redis, ADB, plus VNC/MySQL/MSSQL/PostgreSQL/
+- A **honeypot layer** - twelve sensor crates presenting fifteen protocol listeners
+  (SSH, Telnet, HTTP, FTP, SMTP, TFTP, MQTT, DNS, Redis, ADB, plus VNC/MySQL/MSSQL/PostgreSQL/
   MongoDB from the credential sensor), each a separate OS process.
 - A **scoring and review pipeline** - a hash-chained event ledger, a time-decayed
   per-IP score behind a confirmed-real gate, an operator review queue, and a
@@ -142,7 +142,7 @@ Read the version signals together, not in isolation
 
 | Fact | Value |
 |---|---|
-| Crate version (no `[workspace.package]` key) | `0.4.0` for twenty of the 26 crates; `0.1.0` for `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper` |
+| Crate version (no `[workspace.package]` key) | `0.4.0` for twenty-one of the 27 crates; `0.1.0` for `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper` |
 | Only release tag | `v0.1.0` (annotated, commit `e0bfd513`, 2026-08-02) |
 | `v0.2.0` / `v0.3.0` / `v0.4.0` tags | do not exist - the `0.4.0` tree is **untagged** |
 | `CHANGELOG.md` | a single, undated `## Unreleased` section, not version-partitioned |
@@ -162,7 +162,7 @@ current tree. See [console architecture](../architecture/console.md).
 **Implemented and substantial** (declared-test counts, not a verified green run
 in this pass): core scoring, intake, review/reporting with AbuseIPDB/DShield/OTX
 adapters, the two-tier feed with a fail-closed publisher, the console, the
-14-protocol sensor surface, and the unified daemon with ops self-alerting.
+15-protocol sensor surface, and the unified daemon with ops self-alerting.
 
 **Partial / opt-in / conditional** (off-by-default, not absent): reverse DNS
 enrichment, ASN suppression, MaxMind GeoLite2 geo/ASN (requires an operator-
@@ -181,7 +181,7 @@ and [audits](../history/audits.md).
 ## 4. System architecture
 
 Full section: [architecture index](../architecture/index.md). Propolis is a Rust
-workspace of **26 crates producing 19 binaries**
+workspace of **27 crates producing 20 binaries**
 ([components](../architecture/components.md)).
 
 **The one-node model** ([process topology](../architecture/process-topology.md)).
@@ -193,8 +193,8 @@ sensor binary, so a crash or compromise in a sensor cannot take down the data
 plane. In production one `propolis.service` supersedes the dev-only standalone
 `intake`/`review`/`feed`/`console` units.
 
-**Sensors** ([sensor architecture](../architecture/sensors.md)). **Eleven sensor
-crates cover fourteen protocols** (the `sensor-cred` crate serves five:
+**Sensors** ([sensor architecture](../architecture/sensors.md)). **Twelve sensor
+crates cover fifteen protocols** (the `sensor-cred` crate serves five:
 VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Every sensor is a thin protocol front-end on
 one shared `sensor-framework` that owns the listener, per-connection bounds
 (concurrency semaphore, timeouts), WAN attribution, the single `sanitize_value`
@@ -336,7 +336,7 @@ Full section: [deployment models](../operations/deployment-models.md),
 [installation](../operations/installation.md).
 
 **Models.** Linux + systemd. The primary, documented model is **single-node**: one
-host runs the unified `propolis` daemon plus the eleven sensor services. A
+host runs the unified `propolis` daemon plus the twelve sensor services. A
 multi-node cluster sharing one PostgreSQL database is possible: the malware
 fetcher's claims and budgets and vendor-submission idempotency are enforced in the
 database, while feed publication across nodes is still `[inferred]` from
@@ -347,9 +347,9 @@ Rust `1.96.1` on the build host only.
 
 **Install** (`sudo ./deploy/install.sh`, root; `--dry-run` needs no privilege).
 Build first (`cargo build --release`); the script errors if a binary is missing.
-It creates 12 system users, config/log/state directories with specific
-owners/modes, spool mountpoints, installs the 12 binaries to `/usr/local/bin`, the
-12 production units, and a logrotate config, then `daemon-reload`. Notable:
+It creates 13 system users, config/log/state directories with specific
+owners/modes, spool mountpoints, installs the 13 binaries to `/usr/local/bin`, the
+13 production units, and a logrotate config, then `daemon-reload`. Notable:
 `/var/lib/propolis` is 0755 root-owned deliberately so a compromised daemon cannot
 swap the sibling SSH host-key dir.
 
@@ -360,7 +360,7 @@ fabricating." You author them by hand before starting anything.
 
 **Units.** `propolis.service` is `Restart=on-failure` (its in-process supervisor
 restarts panicked subsystems, so a process exit only means fail-fast or an
-operator stop); the eleven `sensor-*.service` units are `Restart=always`. All units
+operator stop); the twelve `sensor-*.service` units are `Restart=always`. All units
 apply a least-authority sandbox (`NoNewPrivileges`, `ProtectSystem=strict`,
 `PrivateTmp`, `PrivateDevices`, `MemoryDenyWriteExecute`, per-sensor capability
 sets - only privileged-port sensors get `CAP_NET_BIND_SERVICE`).
@@ -780,8 +780,8 @@ consult each for the authoritative table:
 | [dependencies](../reference/dependencies.md) | dependency and vendoring model |
 | [glossary](../reference/glossary.md) | terminology |
 
-**Quick facts to anchor the numbers** (each owned by a page above): 26 crates /
-19 binaries; 11 sensor crates / 14 protocols; 34 console routes (8 public, 26
+**Quick facts to anchor the numbers** (each owned by a page above): 27 crates /
+20 binaries; 12 sensor crates / 15 protocols; 34 console routes (8 public, 26
 session-gated); scoring half-life 6h; tiers Aggressive (score ≥ 90, confidence ≥
 0.95) and Standard (≥ 75, ≥ 0.70); tier TTLs 24h/48h; retention windows
 `24h,7d,30d,60d,90d`; feed build interval 900s; spool budgets 100 MB per spooling

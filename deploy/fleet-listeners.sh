@@ -96,6 +96,7 @@ for pair in \
     PROPOLIS_SMTP_TLS_BIND:smtp \
     PROPOLIS_MQTT_BIND:mqtt \
     PROPOLIS_MQTT_TLS_BIND:mqtt \
+    PROPOLIS_DNS_TLS_BIND:dns \
     PROPOLIS_CRED_VNC_BIND:vnc \
     PROPOLIS_CRED_MYSQL_BIND:mysql \
     PROPOLIS_CRED_MSSQL_BIND:mssql \
@@ -112,6 +113,15 @@ done
 addr="$(read_env_var PROPOLIS_TFTP_BIND)"
 if [ -n "$addr" ]; then
     add_entry tftp udp "$(port_of "$addr")"
+fi
+
+# sensor-dns binds UDP and TCP on the same address (RFC 7766 makes TCP mandatory) and refuses to
+# start unless both bind, so one variable yields two listeners.
+addr="$(read_env_var PROPOLIS_DNS_BIND)"
+if [ -n "$addr" ]; then
+    port="$(port_of "$addr")"
+    add_entry dns udp "$port"
+    add_entry dns tcp "$port"
 fi
 
 # sensor-catchall takes a comma-separated list and binds BOTH TCP and UDP for every entry, so each

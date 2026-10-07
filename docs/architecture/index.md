@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Architecture
@@ -13,7 +13,7 @@ Propolis is a defensive single-node honeypot and threat-intelligence platform: a
 of attacker-facing sensors that capture unsolicited traffic, a scoring engine that
 turns captured events into an IP reputation ledger, and a review/enrichment/feed
 pipeline plus an operator console built on top of that ledger. It is a Rust workspace
-of 26 crates producing 19 binaries.
+of 27 crates producing 20 binaries.
 
 For what Propolis is at the product level, its use cases, and its non-goals, see
 [../overview/index.md](../overview/index.md). For maturity and version/tag state, see

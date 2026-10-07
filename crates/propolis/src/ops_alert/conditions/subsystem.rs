@@ -248,6 +248,7 @@ mod tests {
             "smtp",
             "tftp",
             "mqtt",
+            "dns",
             "cred-vnc",
             "cred-mysql",
             "cred-mssql",

@@ -4,15 +4,15 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Components
 
 The workspace (`Cargo.toml`, `resolver = "2"`, every crate `edition = "2024"`) has
-**26 member crates** under `crates/`, producing **19 binaries**. Twenty crates are at
-version `0.4.0`; the six added since `0.3.0` (`collector-wire`, `fleet`, `gateway`,
-`log-tailer`, `provision-certs`, `shipper`) are at `0.1.0`. This page is the canonical
+**27 member crates** under `crates/`, producing **20 binaries**. Twenty-one crates are at
+version `0.4.0`; the other six (`collector-wire`, `fleet`, `gateway`, `log-tailer`,
+`provision-certs`, `shipper`) are at `0.1.0`. This page is the canonical
 owner of the component inventory and the inter-crate dependency graph.
 
 ## Crate inventory
@@ -22,7 +22,7 @@ owner of the component inventory and the inter-crate dependency graph.
 | `sensor-wire` | library (leaf) | none | Frozen sensor->intake NDJSON wire format (`WIRE_VERSION = 1`); the single source of truth imported by every sensor and by intake. |
 | `core-scoring` | library (leaf) | none | Event ledger and scoring engine: append events, chain-hashing, `ip_score`, blocklist eligibility; owns the core migrations. |
 | `geoip` | library (leaf) | none | Offline MaxMind GeoLite2 City + ASN enrichment (local file reads only, egress-free); both DBs optional. |
-| `sensor-framework` | library | none | Shared sensor harness: TCP/UDP listener lifecycle, WAN attribution, sanitize, event emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds. Also provides per-sensor server-side TLS (`crates/sensor-framework/src/tls.rs`): a fail-closed cert/key loader, an implicit-TLS listener and a plaintext-to-TLS stream for STARTTLS-style upgrades. Six sensors use it (http, redis, mqtt, smtp, ftp, cred); see [Networking and TLS](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners). |
+| `sensor-framework` | library | none | Shared sensor harness: TCP/UDP listener lifecycle, WAN attribution, sanitize, event emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds. Also provides per-sensor server-side TLS (`crates/sensor-framework/src/tls.rs`): a fail-closed cert/key loader, an implicit-TLS listener and a plaintext-to-TLS stream for STARTTLS-style upgrades. Seven sensors use it (http, redis, mqtt, smtp, ftp, cred, dns); see [Networking and TLS](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners). |
 | `sensor-catchall` | lib + bin | `sensor-catchall` | Passive protocol-agnostic TCP/UDP catch-all; emits `catchall_probe` for unprompted traffic. |
 | `sensor-ssh` | lib + bin | `sensor-ssh` | SSH honeypot: full handshake via own crypto primitives, fake shell, SCP/SFTP capture. |
 | `sensor-telnet` | lib + bin | `sensor-telnet` | Telnet honeypot: minimal option negotiation, accepts any credential, shared fake shell. |
@@ -31,8 +31,9 @@ owner of the component inventory and the inter-crate dependency graph.
 | `sensor-http` | lib + bin | `sensor-http` | HTTP honeypot sensor (per-connection handler over the shared listener). Optional implicit-TLS HTTPS listener (443 by deploy convention). |
 | `sensor-ftp` | lib + bin | `sensor-ftp` | FTP honeypot: capture hand-off and quarantine spool for uploads. TLS on two surfaces: `AUTH TLS` (with `PROT P` data channels) on the plain listener, and an optional implicit-TLS FTPS listener (990 by deploy convention). |
 | `sensor-smtp` | lib + bin | `sensor-smtp` | SMTP honeypot sensor (per-connection handler over the shared listener). TLS on two surfaces: `STARTTLS` on the plain listeners, and an optional implicit-TLS SMTPS listener (465 by deploy convention). |
-| `sensor-tftp` | lib + bin | `sensor-tftp` | TFTP (UDP) honeypot, the one sensor that replies over UDP: reads get one fixed tiny error, writes are acknowledged and the body is captured to the quarantine spool; bytes sent never exceed bytes received. Off until `PROPOLIS_TFTP_BIND` is set. |
+| `sensor-tftp` | lib + bin | `sensor-tftp` | TFTP (UDP) honeypot, one of the two sensors that reply over UDP: reads get one fixed tiny error, writes are acknowledged and the body is captured to the quarantine spool; bytes sent never exceed bytes received. Off until `PROPOLIS_TFTP_BIND` is set. |
 | `sensor-mqtt` | lib + bin | `sensor-mqtt` | MQTT 3.1/3.1.1/5.0 honeypot (TCP/1883, optional implicit-TLS MQTTS on 8883): records CONNECT credentials (never the password), SUBSCRIBE topics and PUBLISH topic/payload metadata, and spools a PUBLISH payload that looks binary to the quarantine spool; never delivers, retains or forwards a message. Off until `PROPOLIS_MQTT_BIND` is set. |
+| `sensor-dns` | lib + bin | `sensor-dns` | DNS honeypot (UDP+TCP/53 on one bind, optional DNS over TLS on 853): records every query's header, question and EDNS with derived probe signals (zone transfer, ANY amplification, CHAOS fingerprint, recursion), answers REFUSED with the question echoed and nothing appended so a UDP reply never exceeds its query; serves no records. Off until `PROPOLIS_DNS_BIND` is set. |
 | `sensor-cred` | lib + bin | `sensor-cred` | Credential-capture sensor covering the DB/remote protocols VNC, MySQL, MSSQL, PostgreSQL, MongoDB. With one certificate pair, the last four negotiate TLS in-band on their existing ports (no TLS bind; VNC has none). |
 | `intake` | lib + bin | `intake` | Converts sensor wire events into core-scoring domain events; tails sensor NDJSON logs and appends to the ledger. |
 | `review` | lib + bin | `review` | Review-queue state machine, gatekeeper, vendor adapters (AbuseIPDB/DShield/OTX), VirusTotal scanner, malware fetcher, submission runner, and operator CLI. Owns its own migrator. |
@@ -53,9 +54,9 @@ Source: the `[workspace] members` list in `Cargo.toml`; each crate's `Cargo.toml
 
 - **Pure libraries (no binary, 7):** `sensor-wire`, `core-scoring`, `geoip`,
   `sensor-framework`, `fleet`, `log-tailer`, `collector-wire`.
-- **Sensor lib+bin crates (11):** `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
+- **Sensor lib+bin crates (12):** `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
   `sensor-redis`, `sensor-adb`, `sensor-http`, `sensor-ftp`, `sensor-smtp`,
-  `sensor-tftp`, `sensor-mqtt`, `sensor-cred`. These 11 sensor crates cover 14 protocols (the `cred`
+  `sensor-tftp`, `sensor-mqtt`, `sensor-dns`, `sensor-cred`. These 12 sensor crates cover 15 protocols (the `cred`
   sensor serves five: VNC/MySQL/MSSQL/PostgreSQL/MongoDB).
 - **Data-plane lib+bin crates (4):** `intake`, `review`, `feed`, `console` each carry
   both `src/lib.rs` and `src/main.rs`, so each produces a library and a same-named
@@ -63,7 +64,7 @@ Source: the `[workspace] members` list in `Cargo.toml`; each crate's `Cargo.toml
 - **Split-deployment lib+bin crates (3):** `shipper`, `gateway`, `provision-certs`.
 - **Binary only:** `propolis` (no `src/lib.rs`).
 
-**19 binaries total:** the 11 sensor binaries plus `intake`, `review`, `feed`,
+**20 binaries total:** the 12 sensor binaries plus `intake`, `review`, `feed`,
 `console`, `propolis`, `shipper`, `gateway`, and `provision-certs`.
 
 Sensors have **no compiled-in default port** - listen addresses come from
@@ -84,7 +85,7 @@ graph TD
   tailer[log-tailer]
   cwire[collector-wire]
   fw[sensor-framework]
-  sensors["sensor-{catchall,ssh,telnet,redis,<br/>adb,http,ftp,smtp,tftp,mqtt,cred}"]
+  sensors["sensor-{catchall,ssh,telnet,redis,<br/>adb,http,ftp,smtp,tftp,mqtt,dns,cred}"]
   intake[intake]
   review[review]
   feed[feed]

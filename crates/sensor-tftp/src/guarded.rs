@@ -1,9 +1,9 @@
 //! The only code in this crate that can put a UDP packet on the wire.
 //!
-//! TFTP is the one sensor that answers over UDP, and a UDP reply is the raw material of a
-//! reflection attack: the source address of a datagram is whatever the sender wrote, so every
-//! packet this sensor emits can be aimed at a victim by a spoofer. The construction here removes
-//! the amplification, not just the attack: a [`Transfer`] owns the transfer socket privately and
+//! TFTP answers over UDP (as does sensor-dns, behind its own guard), and a UDP reply is the raw
+//! material of a reflection attack: the source address of a datagram is whatever the sender
+//! wrote, so every packet this sensor emits can be aimed at a victim by a spoofer. The
+//! construction here removes the amplification, not just the attack: a [`Transfer`] owns the transfer socket privately and
 //! its single `send_to` call sits behind [`ByteBudget`], which refuses any packet that would take
 //! the bytes sent past the bytes received from the peer. Reflection of a spoofed request therefore
 //! returns no more bytes than the spoofer sent (the reply can equal the request in size, never

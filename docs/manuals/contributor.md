@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Contributor manual
@@ -21,7 +21,7 @@ before opening a pull request.
 ## 1. Get oriented: the repository
 
 Start with the [repository tour](../development/repository-tour.md). It maps the
-tree and the 26 workspace crates by concern (foundation libraries, the sensor
+tree and the 27 workspace crates by concern (foundation libraries, the sensor
 layer, the data plane, the unified daemon), and points at the canonical owner for
 each class of fact. There is no `Makefile` or `justfile`: build and test are
 plain `cargo`.

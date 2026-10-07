@@ -4,7 +4,7 @@ audience: maintainer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Maintainer manual
@@ -20,7 +20,7 @@ The version signals diverge across surfaces - read them together:
 
 | Fact | Value |
 |---|---|
-| Crate version | `0.4.0` for twenty of the 26 crates, `0.1.0` for the six added since `0.3.0`; each crate pins its own (no `[workspace.package]`) |
+| Crate version | `0.4.0` for twenty-one of the 27 crates, `0.1.0` for the other six; each crate pins its own (no `[workspace.package]`) |
 | Only release tag | `v0.1.0` (annotated, commit `e0bfd513`, 2026-08-02) |
 | Tags `v0.2.0` / `v0.3.0` / `v0.4.0` | do not exist |
 | `CHANGELOG.md` | a single undated `## Unreleased` section |

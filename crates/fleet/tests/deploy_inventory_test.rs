@@ -129,6 +129,52 @@ fn a_cert_and_key_without_an_mqtt_tls_bind_derive_no_listener() {
     assert_eq!(generate(dir.path()), None);
 }
 
+/// sensor-dns binds UDP and TCP on one address and refuses to start unless both bind, so the one
+/// variable must derive both listeners.
+#[test]
+fn a_dns_bind_yields_a_udp_and_a_tcp_listener_on_the_same_port() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "dns.env", "PROPOLIS_DNS_BIND=203.0.113.7:53\n");
+
+    let value = generate(dir.path()).unwrap();
+    let mut parsed = parse_listeners(&value).unwrap();
+    parsed.sort();
+
+    let mut expected = vec![
+        listener("dns", Proto::Tcp, 53),
+        listener("dns", Proto::Udp, 53),
+    ];
+    expected.sort();
+    assert_eq!(parsed, expected);
+}
+
+#[test]
+fn a_dns_tls_bind_yields_one_tcp_listener_named_dns() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "dns.env",
+        "PROPOLIS_DNS_TLS_BIND=203.0.113.7:853\n",
+    );
+
+    let value = generate(dir.path()).unwrap();
+    let parsed = parse_listeners(&value).unwrap();
+
+    assert_eq!(parsed, vec![listener("dns", Proto::Tcp, 853)]);
+}
+
+#[test]
+fn a_cert_and_key_without_a_dns_tls_bind_derive_no_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "dns.env",
+        "PROPOLIS_DNS_TLS_CERT=/etc/propolis/tls/dns.crt\nPROPOLIS_DNS_TLS_KEY=/etc/propolis/tls/dns.key\n",
+    );
+
+    assert_eq!(generate(dir.path()), None);
+}
+
 #[test]
 fn an_ftp_tls_bind_yields_one_tcp_listener_named_ftp() {
     let dir = tempfile::tempdir().unwrap();

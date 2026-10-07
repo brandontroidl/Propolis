@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Build and test
@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 2980 test functions** (1923 unit + 1057 integration).
+- **Total: 3100 test functions** (1977 unit + 1123 integration).
 - **DB-backed (`sqlx::test`): 208** - console 159, core-scoring 28, intake 7,
   propolis 7, fleet 6, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -120,7 +120,7 @@ Per-crate breakdown:
 | console | 124 | 183 | auth_test, routes_test, samples_transport_test, server_test |
 | core-scoring | 67 | 29 | coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 36 | 58 | builder_test, exclusion_test, export_test, publisher_test |
-| fleet | 23 | 29 | deploy_inventory_test, probe_test, store_test |
+| fleet | 23 | 32 | deploy_inventory_test, probe_test, store_test |
 | gateway | 11 | 13 | handshake, spool, verify |
 | geoip | 4 | 0 | - |
 | intake | 11 | 20 | audit_regressions, converter_test, end_to_end, probe_filter |
@@ -131,7 +131,8 @@ Per-crate breakdown:
 | sensor-adb | 61 | 33 | env_strict, integration |
 | sensor-catchall | 18 | 8 | env_strict, integration |
 | sensor-cred | 32 | 39 | env_strict, integration, tls_integration |
-| sensor-framework | 962 | 81 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration, tls_integration |
+| sensor-dns | 54 | 61 | env_strict, integration, tls |
+| sensor-framework | 962 | 83 | budget_product_test, build_stamp_test, deploy_test, listener_integration, shell_replay, spool_integration, tls_integration |
 | sensor-ftp | 13 | 48 | env_strict, integration, tls_config |
 | sensor-http | 15 | 39 | env_strict, integration, tls |
 | sensor-mqtt | 64 | 54 | env_strict, integration, tls |
@@ -142,7 +143,7 @@ Per-crate breakdown:
 | sensor-tftp | 31 | 33 | env_strict, integration |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **1923** | **1057** | |
+| **Total** | **1977** | **1123** | |
 
 ### Test styles by layer
 

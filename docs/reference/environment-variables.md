@@ -458,9 +458,11 @@ defaults and the same strict-parse/fail-closed rules unless noted.
 - **`intake`** (`crates/intake/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
   `PROPOLIS_CURSOR_DIR`, `PROPOLIS_POLL_INTERVAL_MS`, `PROPOLIS_SENSOR_LOGS`
   (req, empty→abort).
-- **`propolis-watch`** (`crates/watch/src/main.rs#main`): `PROPOLIS_SENSOR_LOGS` only (req; unset,
-  invalid or not UTF-8 → one `error` record on stdout and exit 1), the same value the daemon
-  reads. It also reads `SSH_ORIGINAL_COMMAND`, which sshd sets for a forced command, as extra
+- **`propolis-watch`** (`crates/watch/src/main.rs#main`): `PROPOLIS_SENSOR_LOGS` only, the same
+  value the daemon reads. When it is unset the watcher reads that one key from
+  `/etc/propolis/watch.env` (`crates/watch/src/config.rs#WATCH_ENV_PATH`), which
+  `deploy/watch-env.sh` derives from `propolis.env`; found in neither, invalid, or not UTF-8 →
+  one `error` record on stdout and exit 1. It also reads `SSH_ORIGINAL_COMMAND`, which sshd sets for a forced command, as extra
   arguments through the same allowlist as its argv (not UTF-8 → exit 2). It reads no secret and
   no other variable; see [live watch](../operations/live-watch.md).
 - **`review`** (`crates/review/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),

@@ -274,21 +274,25 @@ Controls:
   pinned by `crates/sensor-framework/tests/deploy_test.rs#watch_authorized_keys_example_forces_the_watcher_under_restrict`).
   The watcher opens no socket and links no database driver
   (`crates/watch/tests/read_only.rs#never_opens_a_socket_or_reaches_a_database`).
-- **No secret on the path.** The account cannot read `/etc/propolis/propolis.env`; the forced
-  command carries only `PROPOLIS_SENSOR_LOGS`, which names log paths. No password can log in to
-  the account (its password field is `*`), and journal access is not granted unless the operator
-  adds `systemd-journal` by hand.
+- **Cannot add a key.** The account's home is root:propolis-watch 0750, its `.ssh` root:root
+  0755 and `authorized_keys` root:root 0644, so it can read the keys that log in to it but cannot
+  append one, replace the file, or rename `.ssh` aside, even if attacker data ever got it to run
+  code (`deploy/provision.sh#ensure_dir /var/lib/propolis-watch`). sshd's StrictModes accepts
+  root-owned key files and directories that no one else can write.
+- **No secret on the path.** The account cannot read `/etc/propolis/propolis.env`. Its log list
+  comes from `/etc/propolis/watch.env`, which `deploy/watch-env.sh` derives from `propolis.env`
+  by copying the one `PROPOLIS_SENSOR_LOGS` line, checks holds nothing else before renaming it
+  into place, and writes root:propolis-watch 0640
+  (`crates/sensor-framework/tests/deploy_test.rs#watch_env_copies_only_the_sensor_logs_line_from_propolis_env`).
+  The watcher reads only that key from it. No password can log in to the account (its password
+  field is `*`), and journal access is not granted unless the operator adds `systemd-journal` by
+  hand.
 
 The stream carries attacker-controlled text. Sensors sanitize every attacker string before it
 enters an event ([input-handling.md](input-handling.md)), and the watcher JSON-escapes whatever
 it emits, so a control byte arrives as an escape sequence rather than acting on a terminal. But
 the content is still written by attackers: a human or an AI assistant reading the stream must
 treat it as data, never as instructions, the same as any captured payload.
-
-The account's `authorized_keys` is owned by `propolis-watch` itself, as sshd's StrictModes
-expects of a user's own key file. The watcher has no code path that writes it, but a flaw that
-let attacker data execute code as `propolis-watch` could append a key there; making the file and
-its directory root-owned would close that, and is not what the shipped setup does.
 
 ## Enrichment and reporting egress
 

@@ -5,19 +5,16 @@
 #     ssh-keygen -t ed25519 -f ~/.ssh/propolis_watch -C watch@workstation
 #   Paste only its PUBLIC half (~/.ssh/propolis_watch.pub) into the line below, on the honeypot.
 #   The private key never leaves the reading machine.
-# - The file is 0600 and owned by propolis-watch; deploy/provision.sh creates the 0700 .ssh
-#   directory around it. sshd ignores the file (StrictModes) if either is group- or world-writable.
+# - The file is root:root 0644, inside the root:root 0755 .ssh directory deploy/provision.sh
+#   creates, so the propolis-watch account can read its keys but never add one. sshd accepts that
+#   (StrictModes wants the file and the directories above it owned by root or the user and
+#   writable by no one else).
 # - `restrict` turns off port, agent and X11 forwarding, pty allocation and ~/.ssh/rc for this key.
 # - `command=` is a forced command: whatever the client asks to run, sshd runs this instead and puts
 #   the client's request in SSH_ORIGINAL_COMMAND, which propolis-watch reads as its arguments
 #   through the same allowlist as its argv (unknown words exit 2). So this key can run the watcher
 #   and nothing else.
-# - The watcher reads PROPOLIS_SENSOR_LOGS from its environment and cannot read
-#   /etc/propolis/propolis.env (it carries the database URL and console password), so the forced
-#   command sets the one non-secret value it needs. Copy it from the daemon's env file exactly:
-#     sudo grep '^PROPOLIS_SENSOR_LOGS=' /etc/propolis/propolis.env
-#   If the two ever differ, the watcher's start record and heartbeat show which paths it follows.
-#
-# One line per key; the value below is the deploy/propolis.env.example default, shortened here to
-# two sensors for readability.
-restrict,command="PROPOLIS_SENSOR_LOGS='catchall:/var/log/propolis/catchall/events.jsonl,ssh:/var/log/propolis/ssh/events.jsonl' /usr/local/bin/propolis-watch" ssh-ed25519 AAAA... watch@workstation
+# - The watcher finds the sensor-log list in /etc/propolis/watch.env, which deploy/watch-env.sh
+#   derives from the daemon's propolis.env on every provision and upgrade. Nothing about the list
+#   belongs in this file.
+restrict,command="/usr/local/bin/propolis-watch" ssh-ed25519 AAAA... watch@workstation

@@ -125,14 +125,16 @@ several are outbound paths (see warning under Operations). See
 ## Live watch
 
 ```
-sudo -u propolis-watch env "$(sudo grep -m1 '^PROPOLIS_SENSOR_LOGS=' /etc/propolis/propolis.env)" /usr/local/bin/propolis-watch
+sudo -u propolis-watch /usr/local/bin/propolis-watch
+sudo ./deploy/watch-env.sh            # refresh /etc/propolis/watch.env after changing PROPOLIS_SENSOR_LOGS
 ssh -i ~/.ssh/propolis_watch propolis-watch@honeypot -- --sensor ssh   # from the reading machine
 ```
 
 `propolis-watch` streams every sensor event log as JSON Lines on stdout, read-only; it takes
 `--sensor <label>` (repeatable), `--signal <type>`, `--source-ip <ip>`, `--journal` and
-`--since-start`, and exits 2 on anything else. The first form passes only the one non-secret
-variable it needs, never the whole env file. Setup, envelope and filters:
+`--since-start`, and exits 2 on anything else. It reads its log list from
+`/etc/propolis/watch.env`, a one-line copy `deploy/watch-env.sh` derives from `propolis.env`, so
+it never sees the daemon's secrets. Setup, envelope and filters:
 [`../operations/live-watch.md`](../operations/live-watch.md).
 
 ## Migrations

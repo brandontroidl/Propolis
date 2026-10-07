@@ -59,6 +59,19 @@ fn never_writes_a_file() {
     }
 }
 
+/// Opening is allowed, read-only `File::open` only, and only where the watcher has a reason to
+/// open a file itself: `/etc/propolis/watch.env` (config.rs) and the heartbeat's readability probe
+/// (status.rs). The logs are opened inside log-tailer.
+#[test]
+fn opens_files_only_read_only_and_only_in_the_two_expected_places() {
+    let mut open_sites: Vec<String> = Vec::new();
+    for (name, src) in src_files() {
+        open_sites.extend(src.match_indices("File::open(").map(|_| name.clone()));
+    }
+    open_sites.dedup();
+    assert_eq!(open_sites, ["config.rs", "status.rs"]);
+}
+
 #[test]
 fn never_opens_a_socket_or_reaches_a_database() {
     for (name, src) in src_files() {

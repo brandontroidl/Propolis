@@ -161,6 +161,7 @@ fn streams_each_kind_of_line_in_order_follows_copytruncate_and_never_touches_the
     assert_eq!(start_record["kind"], "start");
     assert_eq!(start_record["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(start_record["start_at"], "end");
+    assert_eq!(start_record["sources_from"], "env");
     let labels: Vec<&str> = start_record["sources"]
         .as_array()
         .unwrap()
@@ -337,7 +338,11 @@ fn a_refused_argument_exits_2_before_reading_anything() {
 
 #[test]
 fn a_missing_or_invalid_log_list_exits_1_with_an_error_record() {
-    for value in [None, Some(""), Some("no-colon")] {
+    // With the variable unset the watcher falls back to the derived file; that case is only
+    // observable as a failure on a host that has no such file.
+    let unset_fails = !std::path::Path::new(watch::config::WATCH_ENV_PATH).exists();
+    let cases = [None, Some(""), Some("no-colon")];
+    for value in cases.into_iter().filter(|v| v.is_some() || unset_fails) {
         let mut cmd = command("unused");
         match value {
             None => cmd.env_remove("PROPOLIS_SENSOR_LOGS"),

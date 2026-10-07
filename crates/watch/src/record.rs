@@ -77,7 +77,12 @@ impl Filter {
     }
 }
 
-pub fn start(version: &str, sources: &[(String, &Path)], options: &Options) -> Value {
+pub fn start(
+    version: &str,
+    sources: &[(String, &Path)],
+    sources_from: &str,
+    options: &Options,
+) -> Value {
     json!({
         "kind": "start",
         "ts": now(),
@@ -86,6 +91,7 @@ pub fn start(version: &str, sources: &[(String, &Path)], options: &Options) -> V
             .iter()
             .map(|(label, path)| json!({"label": label, "path": path_text(path)}))
             .collect::<Vec<_>>(),
+        "sources_from": sources_from,
         "start_at": if options.since_start { "beginning" } else { "end" },
         "journal": options.journal,
         "filters": {
@@ -104,10 +110,11 @@ pub struct FileReport<'a> {
     pub lines_seen: u64,
 }
 
-pub fn heartbeat(files: &[FileReport<'_>]) -> Value {
+pub fn heartbeat(files: &[FileReport<'_>], sources_from: &str) -> Value {
     json!({
         "kind": "heartbeat",
         "ts": now(),
+        "sources_from": sources_from,
         "files": files
             .iter()
             .map(|f| json!({
@@ -277,20 +284,25 @@ mod tests {
             ..Options::default()
         };
         let path = Path::new("/l/ssh.jsonl");
-        let start = start("0.4.0", &[("ssh".to_string(), path)], &options);
+        let start = start("0.4.0", &[("ssh".to_string(), path)], "env", &options);
+        assert_eq!(start["sources_from"], "env");
         assert_eq!(start["kind"], "start");
         assert_eq!(start["version"], "0.4.0");
         assert_eq!(start["sources"][0]["label"], "ssh");
         assert_eq!(start["start_at"], "end");
         assert_eq!(start["filters"]["sensor"][0], "ssh");
 
-        let hb = heartbeat(&[FileReport {
-            label: "ssh",
-            path,
-            status: FileStatus::Missing,
-            size: None,
-            lines_seen: 3,
-        }]);
+        let hb = heartbeat(
+            &[FileReport {
+                label: "ssh",
+                path,
+                status: FileStatus::Missing,
+                size: None,
+                lines_seen: 3,
+            }],
+            "/etc/propolis/watch.env",
+        );
+        assert_eq!(hb["sources_from"], "/etc/propolis/watch.env");
         assert_eq!(hb["kind"], "heartbeat");
         assert!(hb["ts"].as_str().unwrap().ends_with('Z'));
         assert_eq!(

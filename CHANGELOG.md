@@ -19,10 +19,15 @@
   `SSH_ORIGINAL_COMMAND`, split on whitespace only through the same allowlist, so it can run as
   an SSH forced command: `deploy/provision.sh` now creates a `propolis-watch` login account
   (home `/var/lib/propolis-watch`, shell `/bin/sh`, password field `*`, read-only membership in
-  every sensor group, no journal access unless added by hand), `install.sh` and `upgrade.sh`
-  install the binary, and `deploy/watch-authorized-keys.example` shows the `restrict`ed
-  forced-command key line. No key is generated or installed. See
-  `docs/operations/live-watch.md`.
+  every sensor group, no journal access unless added by hand), with its home, `.ssh` and
+  `authorized_keys` owned by root so the account cannot add a key to itself; `install.sh` and
+  `upgrade.sh` install the binary; and `deploy/watch-authorized-keys.example` shows the
+  `restrict`ed forced-command key line, `command="/usr/local/bin/propolis-watch"`. When
+  `PROPOLIS_SENSOR_LOGS` is not in its environment the watcher reads that one key from
+  `/etc/propolis/watch.env`, which the new `deploy/watch-env.sh` derives from `propolis.env` on
+  every provision (so every install and upgrade), copying only that line, root:propolis-watch
+  0640, atomically; the start record and heartbeat say which source the list came from. No key
+  is generated or installed. See `docs/operations/live-watch.md`.
 - **`log-tailer` gains a cursorless mode and owns the sensor-log list parser** -
   `LogTailer::without_cursor` reads and follows rotation like the cursor-backed tailer but has
   no cursor to load or save, and `read_batch_entries` reports each over-length discard in place.

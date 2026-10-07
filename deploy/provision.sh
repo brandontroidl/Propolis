@@ -143,10 +143,16 @@ ensure_dir /var/lib/propolis/feed         0755 propolis          propolis
 # must exist or ProtectSystem=strict's bind-mount setup fails with NAMESPACE.
 ensure_dir /var/lib/propolis/ssh          0750 propolis-ssh      propolis-ssh
 # propolis-watch's home, outside /var/lib/propolis so it shares nothing with the daemon's state.
-# sshd's StrictModes refuses keys under a group- or world-writable home or .ssh; these modes pass.
-# The authorized_keys file inside is the operator's to create (deploy/watch-authorized-keys.example).
-ensure_dir /var/lib/propolis-watch        0750 propolis-watch    propolis-watch
-ensure_dir /var/lib/propolis-watch/.ssh   0700 propolis-watch    propolis-watch
+# Root-owned all the way down, so the account cannot change which keys log in to it: owning its
+# home would let it rename a root-owned .ssh aside and create its own, and owning .ssh or
+# authorized_keys would let it append a key. The account only needs to traverse to the key file,
+# which sshd reads with the user's privileges; the group x bit on the home and the world r/x bits
+# on .ssh give it that and nothing more. sshd's StrictModes accepts files and directories owned by
+# root or the user that no one else can write (sshd(8), FILES, ~/.ssh/authorized_keys); these pass.
+# The authorized_keys file inside is the operator's to create, root:root 0644
+# (deploy/watch-authorized-keys.example).
+ensure_dir /var/lib/propolis-watch        0750 root              propolis-watch
+ensure_dir /var/lib/propolis-watch/.ssh   0755 root              root
 
 # ---- 3. spool directories (mount points only - see printed fstab guidance in install.sh) ----
 
@@ -174,3 +180,8 @@ ensure_dir /var/spool/propolis/mqtt       0750 propolis-mqtt     propolis-mqtt
 # written by its own standalone sensor process), the malware fetcher runs inside propolis.service
 # itself - see deploy/propolis.service's own ReadWritePaths grant for this exact path.
 ensure_dir /var/spool/propolis/fetched   0750 propolis          propolis
+
+# The watcher's copy of PROPOLIS_SENSOR_LOGS, derived from propolis.env on every provision (so on
+# every upgrade); see watch-env.sh's header. After the users exist, since it sets the file's group.
+log "deriving /etc/propolis/watch.env for propolis-watch"
+DRY_RUN="$DRY_RUN" "$(dirname "${BASH_SOURCE[0]}")/watch-env.sh"

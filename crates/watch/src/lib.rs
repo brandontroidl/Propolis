@@ -9,6 +9,7 @@
 //! See `docs/operations/live-watch.md`.
 
 pub mod args;
+pub mod config;
 pub mod journal;
 pub mod record;
 pub mod status;

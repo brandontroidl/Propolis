@@ -61,6 +61,19 @@ shipped systemd timer or cron**. Without operator configuration, the feed is bui
 locally but not pushed anywhere. See
 [`../operations/routine-procedures.md`](../operations/routine-procedures.md).
 
+## Tailer misreads a small rotated log as growth
+
+Open item, not yet fixed. The log tailer that intake, the shipper and `propolis-watch` share
+detects a `copytruncate` rotation by the read offset passing the file's size, or by the first 256
+bytes changing. Below 256 bytes those bytes change with ordinary appends too, so a file that was
+under 256 bytes and has only grown is trusted as growth
+(`crates/log-tailer/src/tailer.rs#LogTailer::maybe_false_positive_replaced`). If such a small log
+is rotated and refilled past the old read offset before the next poll (one second for intake, a
+quarter second for the watcher), the tailer keeps reading from the old offset and the start of the
+new content is skipped. A production log is rotated at 100 MB (`deploy/logrotate-sensors.conf`),
+so the window is narrow: it needs a rotation of an almost empty log, forced by hand, followed by
+a burst. A fix needs a rotation signal that does not depend on the size of the leading window.
+
 ## Egress paths exist and must be understood
 
 Sensors are egress-free, but the platform has a small number of enrichment/reporting

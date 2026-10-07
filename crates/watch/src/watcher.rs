@@ -35,6 +35,7 @@ struct Source {
 /// Streams until writing to `out` fails, then returns that error.
 pub fn run(
     logs: Vec<SensorLogConfig>,
+    logs_from: &str,
     options: &Options,
     version: &str,
     out: &mut impl Write,
@@ -59,7 +60,11 @@ pub fn run(
         .iter()
         .map(|s| (s.label.clone(), s.path.as_path()))
         .collect();
-    if let Err(e) = emit(out, record::start(version, &listed, options), None) {
+    if let Err(e) = emit(
+        out,
+        record::start(version, &listed, logs_from, options),
+        None,
+    ) {
         return e;
     }
 
@@ -79,7 +84,7 @@ pub fn run(
         (None, None)
     };
 
-    let error = follow(&mut sources, &filter, journal, out);
+    let error = follow(&mut sources, logs_from, &filter, journal, out);
     if let Some(child) = child.as_mut() {
         let _ = child.kill();
         let _ = child.wait();
@@ -89,6 +94,7 @@ pub fn run(
 
 fn follow(
     sources: &mut [Source],
+    logs_from: &str,
     filter: &Filter,
     mut journal: Option<Receiver<Value>>,
     out: &mut impl Write,
@@ -103,7 +109,7 @@ fn follow(
             }
         }
         if Instant::now() >= next_heartbeat {
-            if let Err(e) = emit(out, heartbeat(sources), None) {
+            if let Err(e) = emit(out, heartbeat(sources, logs_from), None) {
                 return e;
             }
             next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
@@ -162,7 +168,7 @@ fn drain(source: &mut Source, filter: &Filter, out: &mut impl Write) -> io::Resu
     }
 }
 
-fn heartbeat(sources: &[Source]) -> Value {
+fn heartbeat(sources: &[Source], logs_from: &str) -> Value {
     let reports: Vec<FileReport<'_>> = sources
         .iter()
         .map(|s| {
@@ -176,7 +182,7 @@ fn heartbeat(sources: &[Source]) -> Value {
             }
         })
         .collect();
-    record::heartbeat(&reports)
+    record::heartbeat(&reports, logs_from)
 }
 
 fn emit(out: &mut impl Write, record: Value, label: Option<&str>) -> io::Result<()> {

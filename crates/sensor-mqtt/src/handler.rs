@@ -1112,6 +1112,14 @@ fn on_subscribe(level: u8, body: &[u8]) -> Outcome {
 // Socket loop
 // ---------------------------------------------------------------------------------------------
 
+/// Mark an event as having arrived over TLS. The key is absent (not `false`) on a plaintext
+/// connection so plaintext events stay byte-identical to a sensor with no TLS configured.
+fn stamp_tls(metadata: &mut serde_json::Value, tls: bool) {
+    if tls {
+        metadata["tls"] = serde_json::Value::Bool(true);
+    }
+}
+
 /// Build the hand-off job for a spooled PUBLISH payload. The payload is charged to the
 /// capture-memory budget as it is copied in: a budget that cannot hold all of it leaves a prefix
 /// (`complete` false here, and the hand-off stamps `truncated` / `end_reason` itself), and one that
@@ -1124,6 +1132,7 @@ fn capture_job(
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
     session_id: Uuid,
+    tls: bool,
 ) -> CaptureJob {
     let mut body = handoff.new_capture_body();
     let complete = body.extend_from_slice(payload).is_ok();
@@ -1139,6 +1148,7 @@ fn capture_job(
             if let (Some(map), Some(extra)) = (metadata.as_object_mut(), fields.as_object()) {
                 map.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
+            stamp_tls(&mut metadata, tls);
             SensorEvent {
                 v: WIRE_VERSION,
                 source_ip,
@@ -1163,6 +1173,7 @@ pub async fn handle_connection<S>(
     mut stream: S,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
+    tls: bool,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
@@ -1192,8 +1203,10 @@ pub async fn handle_connection<S>(
             occurrence_id: None,
         };
     let record = async |obs: Observation| {
+        let mut metadata = obs.metadata;
+        stamp_tls(&mut metadata, tls);
         let _ = emitter
-            .append(&identify(obs.signal_type, obs.authenticated, obs.metadata))
+            .append(&identify(obs.signal_type, obs.authenticated, metadata))
             .await;
     };
 
@@ -1237,7 +1250,7 @@ pub async fn handle_connection<S>(
             let start = packet.body.len().saturating_sub(request.payload_len);
             let payload = packet.body.get(start..).unwrap_or_default();
             let _ = handoff.submit(capture_job(
-                &handoff, request, payload, source_ip, wan_ip, session_id,
+                &handoff, request, payload, source_ip, wan_ip, session_id, tls,
             ));
         }
         if !was_connected && let Some(reason) = outcome.reject {
@@ -1249,8 +1262,12 @@ pub async fn handle_connection<S>(
             .await;
         }
         if !outcome.reply.is_empty() {
-            let write =
-                tokio::time::timeout(bounds.idle_timeout, stream.write_all(&outcome.reply)).await;
+            // Flushed inside the same bound: a TLS stream may hold the reply in its record buffer.
+            let write = tokio::time::timeout(bounds.idle_timeout, async {
+                stream.write_all(&outcome.reply).await?;
+                stream.flush().await
+            })
+            .await;
             if !matches!(write, Ok(Ok(()))) {
                 break;
             }
@@ -1260,6 +1277,8 @@ pub async fn handle_connection<S>(
         }
     }
     record(session.end_observation(total_read, started.elapsed())).await;
+    // Sends close_notify on a TLS stream so a real client sees a clean close, not a truncation.
+    let _ = tokio::time::timeout(bounds.idle_timeout, stream.shutdown()).await;
 }
 
 #[cfg(test)]

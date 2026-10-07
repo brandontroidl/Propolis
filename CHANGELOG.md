@@ -4,6 +4,21 @@
 
 ### Added
 
+- **MQTTS on `sensor-mqtt` (default off)** - a second, implicit-TLS listener in the same process,
+  serving the same persona into the same event log, enabled by `PROPOLIS_MQTT_TLS_BIND` (no
+  compiled default; the deploy convention is `0.0.0.0:8883`) together with
+  `PROPOLIS_MQTT_TLS_CERT` and `PROPOLIS_MQTT_TLS_KEY` (the pair `provision-tls.sh` mints, key
+  mode `0600`). MQTT 3.1, 3.1.1 and 5.0 work over it, there is no STARTTLS, and binary-PUBLISH
+  spooling, the capture memory budget and the shutdown drain are shared with the plain listener.
+  Events from a TLS session (connection, login, command, malformed first packet, malware upload,
+  session end) carry `"tls": true`; plain events are unchanged. A failed or stalled handshake is
+  dropped with no event and cut at the read timeout. Fail-closed: exactly one of cert and key, a
+  TLS bind without both, an invalid bind, or an unusable pair makes the sensor exit 1 before
+  binding anything. Cert and key without a TLS bind load and validate the pair, start no TLS
+  listener and log one warning, so a TLS listener never opens implicitly. Every session now ends
+  with a stream shutdown (`close_notify` on TLS, a FIN on a plain connection). `fleet-listeners.sh`
+  derives an `mqtt` tcp listener from `PROPOLIS_MQTT_TLS_BIND`, and the unit gains
+  `ReadOnlyPaths=/etc/propolis/tls`.
 - **Redis over TLS on `sensor-redis` (default off)** - a second, implicit-TLS (`rediss://`)
   listener in the same process, serving the same persona into the same event log, enabled by
   `PROPOLIS_REDIS_TLS_BIND` (no compiled default; the deploy convention is `0.0.0.0:6380`)

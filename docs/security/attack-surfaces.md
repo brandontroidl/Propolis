@@ -54,6 +54,15 @@ STARTTLS, and the certificate is the deploy-minted self-signed one named `localh
 password is never captured over TLS, as on the plain listener. A half-configured or unusable pair
 makes the sensor refuse to start rather than serve plaintext.
 
+`sensor-mqtt` can also expose an implicit-TLS listener (conventionally 8883, MQTTS). It exists only
+when `PROPOLIS_MQTT_TLS_BIND` is set, so cert and key alone open no new port. The surface and its
+limits match the HTTPS listener: a handshake that fails or stalls is cut at the read timeout and
+logged only at debug level, no client certificate is requested, there is no STARTTLS, and the
+certificate is the deploy-minted self-signed one named `localhost`. The MQTT password is never
+captured over TLS, as on the plain listener. Binary PUBLISH payloads sent over TLS are quarantined
+by the same hand-off, byte budget and shutdown drain as the plain listener, and never run. A
+half-configured or unusable pair makes the sensor refuse to start rather than serve plaintext.
+
 Controls:
 
 - **Never-execute.** No sensor spawns a subprocess or execs; the honeypot captures, it

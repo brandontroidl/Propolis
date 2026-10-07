@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use sensor_framework::{
     CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
-    SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal,
+    SHUTDOWN_DRAIN_TIMEOUT, TlsServer, WanResolver, shutdown_signal,
 };
 
 const ENV_BIND: &str = "PROPOLIS_MQTT_BIND";
@@ -27,6 +27,11 @@ const ENV_OUTBOX_DIR: &str = "PROPOLIS_MQTT_OUTBOX_DIR";
 /// Ceiling, in bytes, on capture bodies buffered in memory across every connection. Defaults to
 /// 40% of the unit's 256M `MemoryMax` (see `deploy/sensor-mqtt.service`).
 const ENV_CAPTURE_MEMORY_BYTES: &str = "PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES";
+/// MQTTS listener address. TLS is enabled iff BOTH `PROPOLIS_MQTT_TLS_CERT` and
+/// `PROPOLIS_MQTT_TLS_KEY` are set; the deploy env file supplies `0.0.0.0:8883` for the bind.
+const ENV_TLS_BIND: &str = "PROPOLIS_MQTT_TLS_BIND";
+const ENV_TLS_CERT: &str = "PROPOLIS_MQTT_TLS_CERT";
+const ENV_TLS_KEY: &str = "PROPOLIS_MQTT_TLS_KEY";
 const ENV_READ_TIMEOUT_MS: &str = "PROPOLIS_MQTT_READ_TIMEOUT_MS";
 const ENV_IDLE_TIMEOUT_MS: &str = "PROPOLIS_MQTT_IDLE_TIMEOUT_MS";
 const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_MQTT_MAX_DURATION_SECS";
@@ -47,7 +52,13 @@ enum ConfigError {
     NoBind,
     InvalidBind(String),
     InvalidWanMapEntry(String),
-    InvalidBound { field: &'static str, value: String },
+    InvalidBound {
+        field: &'static str,
+        value: String,
+    },
+    InvalidTlsBind(String),
+    /// A TLS env var was unset or blank while the TLS pair is incomplete or a TLS bind is set.
+    TlsVarMissing(&'static str),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -59,14 +70,63 @@ impl std::fmt::Display for ConfigError {
             ConfigError::InvalidBound { field, value } => {
                 write!(f, "{field} must be positive, got {value:?}")
             }
+            ConfigError::InvalidTlsBind(s) => write!(f, "invalid {ENV_TLS_BIND}: {s:?}"),
+            ConfigError::TlsVarMissing(var) => write!(
+                f,
+                "{var} must be set: TLS needs both {ENV_TLS_CERT} and {ENV_TLS_KEY}, and {ENV_TLS_BIND} requires them"
+            ),
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
 
+/// The TLS pair (both paths always present) and the MQTTS bind, if one is configured.
+#[derive(Debug, Clone, PartialEq)]
+struct TlsConfig {
+    bind_addr: Option<SocketAddr>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+}
+
+/// `None` only when no TLS variable is set at all. Anything else must be a complete, parseable
+/// configuration: exactly one of cert/key, or a bind without the pair, is an error so the caller
+/// refuses to start rather than serving plaintext where TLS was asked for. A blank value counts as
+/// unset. An empty `PROPOLIS_MQTT_TLS_BIND=` is an invalid address (refuse), not "off".
+fn parse_tls(
+    bind: Option<&str>,
+    cert: Option<&str>,
+    key: Option<&str>,
+) -> Result<Option<TlsConfig>, ConfigError> {
+    let path = |raw: Option<&str>| {
+        raw.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    };
+    let (cert_path, key_path) = (path(cert), path(key));
+    let bind_addr = bind
+        .map(|raw| {
+            raw.trim()
+                .parse::<SocketAddr>()
+                .map_err(|_| ConfigError::InvalidTlsBind(raw.to_string()))
+        })
+        .transpose()?;
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => Ok(Some(TlsConfig {
+            bind_addr,
+            cert_path,
+            key_path,
+        })),
+        (Some(_), None) => Err(ConfigError::TlsVarMissing(ENV_TLS_KEY)),
+        (None, Some(_)) => Err(ConfigError::TlsVarMissing(ENV_TLS_CERT)),
+        (None, None) if bind.is_some() => Err(ConfigError::TlsVarMissing(ENV_TLS_CERT)),
+        (None, None) => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Config {
+    tls: Option<TlsConfig>,
     bind_addr: SocketAddr,
     wan_map: HashMap<IpAddr, IpAddr>,
     log_path: PathBuf,
@@ -103,8 +163,16 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let collector_id = sensor_framework::env_with_legacy(ENV_COLLECTOR_ID, ENV_COLLECTOR_ID_LEGACY)
         .unwrap_or_else(|| DEFAULT_COLLECTOR_ID.to_string());
     let outbox_dir = resolve_outbox_dir(&spool_dir, env::var(ENV_OUTBOX_DIR).ok());
+    // var_os + lossy: a non-UTF-8 value must fail parsing (refuse), not read as "unset".
+    let env_str = |name: &str| env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    let tls = parse_tls(
+        env_str(ENV_TLS_BIND).as_deref(),
+        env_str(ENV_TLS_CERT).as_deref(),
+        env_str(ENV_TLS_KEY).as_deref(),
+    )?;
 
     Ok(Config {
+        tls,
         bind_addr,
         wan_map,
         log_path,
@@ -216,16 +284,42 @@ async fn main() {
     };
     let bind_addr = config.bind_addr;
 
+    // Before ANY listener binds (plaintext included): an unusable cert/key pair must not leave a
+    // plaintext sensor running where the operator asked for TLS.
+    let tls_server = match &config.tls {
+        Some(t) => match sensor_framework::load_server_config(&t.cert_path, &t.key_path) {
+            Ok(server_config) => Some((t.bind_addr, TlsServer::from_config(server_config))),
+            Err(e) => {
+                tracing::error!(
+                    cert = %t.cert_path.display(), key = %t.key_path.display(), error = %e,
+                    "sensor-mqtt: TLS configured but cert/key unusable; refusing to start"
+                );
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
-    let (bound, handle, handoff) = match sensor_mqtt::start_test_server_with_handoff(
-        bind_addr,
-        config.log_path,
+    let handoff = match sensor_mqtt::new_capture_handoff(
+        config.log_path.clone(),
         config.spool_dir,
-        wan_resolver,
-        config.bounds,
         config.collector_id,
         config.outbox_dir,
         Arc::new(CaptureMemoryBudget::new(config.capture_memory_bytes)),
+    ) {
+        Ok(handoff) => handoff,
+        Err(e) => {
+            tracing::error!(error = %e, "sensor-mqtt: failed to start");
+            std::process::exit(1);
+        }
+    };
+    let (bound, handle) = match sensor_mqtt::start_plain_listener(
+        bind_addr,
+        config.log_path.clone(),
+        wan_resolver.clone(),
+        config.bounds.clone(),
+        handoff.clone(),
     )
     .await
     {
@@ -235,11 +329,46 @@ async fn main() {
             std::process::exit(1);
         }
     };
-
     tracing::info!(local = %bound, "sensor-mqtt: listening");
+
+    let tls_handle = match tls_server {
+        Some((Some(tls_addr), server)) => {
+            match sensor_mqtt::start_tls_listener(
+                tls_addr,
+                config.log_path,
+                wan_resolver,
+                config.bounds,
+                handoff.clone(),
+                server,
+            )
+            .await
+            {
+                Ok((tls_bound, tls_handle)) => {
+                    tracing::info!(local = %tls_bound, "sensor-mqtt: listening (tls)");
+                    Some(tls_handle)
+                }
+                Err(e) => {
+                    handle.abort();
+                    tracing::error!(addr = %tls_addr, error = %e, "sensor-mqtt: failed to start tls listener; refusing to start");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some((None, _)) => {
+            tracing::warn!(
+                "sensor-mqtt: TLS cert is configured but no TLS bind uses it ({ENV_TLS_BIND} is unset); no TLS listener started"
+            );
+            None
+        }
+        None => None,
+    };
+
     shutdown_signal().await;
     tracing::info!("sensor-mqtt: shutdown signal received; stopping");
     handle.abort();
+    if let Some(tls_handle) = tls_handle {
+        tls_handle.abort();
+    }
     // Queued captures only; a connection cancelled mid-packet never submits (see handoff.rs).
     handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
 }
@@ -287,6 +416,76 @@ mod tests {
         assert!(parse(Some("0")).is_err());
         assert!(parse(Some("lots")).is_err());
         assert!(parse(Some("-1")).is_err());
+    }
+
+    #[test]
+    fn parse_tls_absent_is_none() {
+        assert_eq!(parse_tls(None, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_tls_full_is_some() {
+        let got = parse_tls(
+            Some("0.0.0.0:8883"),
+            Some("/etc/propolis/tls/mqtt.crt"),
+            Some("/etc/propolis/tls/mqtt.key"),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            Some(TlsConfig {
+                bind_addr: Some("0.0.0.0:8883".parse().unwrap()),
+                cert_path: "/etc/propolis/tls/mqtt.crt".into(),
+                key_path: "/etc/propolis/tls/mqtt.key".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_tls_pair_without_bind_keeps_the_pair_for_validation() {
+        let got = parse_tls(None, Some("/c"), Some("/k")).unwrap().unwrap();
+        assert_eq!(got.bind_addr, None);
+    }
+
+    #[test]
+    fn parse_tls_exactly_one_of_cert_and_key_is_refused() {
+        for bind in [None, Some("0.0.0.0:8883")] {
+            assert!(matches!(
+                parse_tls(bind, Some("/c"), None),
+                Err(ConfigError::TlsVarMissing(ENV_TLS_KEY))
+            ));
+            assert!(matches!(
+                parse_tls(bind, None, Some("/k")),
+                Err(ConfigError::TlsVarMissing(ENV_TLS_CERT))
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_tls_bind_without_the_pair_is_refused() {
+        assert!(matches!(
+            parse_tls(Some("0.0.0.0:8883"), None, None),
+            Err(ConfigError::TlsVarMissing(_))
+        ));
+    }
+
+    #[test]
+    fn parse_tls_blank_path_counts_as_missing() {
+        assert!(matches!(
+            parse_tls(Some("0.0.0.0:8883"), Some("   "), Some("/k")),
+            Err(ConfigError::TlsVarMissing(ENV_TLS_CERT))
+        ));
+        assert_eq!(parse_tls(None, Some(""), Some(" ")).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_tls_rejects_bad_or_empty_bind() {
+        for bind in ["nonsense", ""] {
+            assert!(matches!(
+                parse_tls(Some(bind), Some("/c"), Some("/k")),
+                Err(ConfigError::InvalidTlsBind(_))
+            ));
+        }
     }
 
     #[test]

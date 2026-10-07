@@ -92,6 +92,7 @@ for pair in \
     PROPOLIS_FTP_BIND:ftp \
     PROPOLIS_SMTP_BIND:smtp \
     PROPOLIS_MQTT_BIND:mqtt \
+    PROPOLIS_MQTT_TLS_BIND:mqtt \
     PROPOLIS_CRED_VNC_BIND:vnc \
     PROPOLIS_CRED_MYSQL_BIND:mysql \
     PROPOLIS_CRED_MSSQL_BIND:mssql \

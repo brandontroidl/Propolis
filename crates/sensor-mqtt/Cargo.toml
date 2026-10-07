@@ -20,3 +20,6 @@ sha2 = "0.11.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+rcgen = "0.14.9"
+# Client side of the TLS tests only; the sensor itself reaches rustls through sensor-framework.
+tokio-rustls = "0.26.4"

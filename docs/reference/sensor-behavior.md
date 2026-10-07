@@ -672,7 +672,29 @@ under the process-wide capture-memory budget, and never run.
   (`crates/sensor-mqtt/src/handler.rs#Session::end_observation`). It is not emitted when
   `max_duration` cancels the handler, because the listener drops the handler future.
 - **Bounds:** common defaults, `max_concurrent` 256, per-source admission cap. Strict
-  parsing: a zero or unparseable bound aborts startup. No spool.
+  parsing: a zero or unparseable bound aborts startup. Only a binary PUBLISH payload is spooled
+  (see above); a text payload is never spooled.
+- **MQTT over TLS (optional):** when `PROPOLIS_MQTT_TLS_BIND` is set, a second implicit-TLS
+  (MQTTS) listener in the same process serves the same persona and writes the same
+  `events.jsonl` (`crates/sensor-mqtt/src/lib.rs#start_tls_listener`). MQTT 3.1, 3.1.1 and 5.0
+  all work over it. No STARTTLS exists and no client certificate is requested. The handshake is
+  cut at the read timeout; a failed or stalled handshake, including plaintext sent to the TLS
+  port, is dropped with a debug log and emits no event. Every event from a TLS session, the
+  connection event, the login attempt, each command event, the malformed-first-packet event, the
+  `honeypot_malware_upload` event and the session-end event, carries `"tls": true`; the key is
+  absent, not false, on the plain listener (`crates/sensor-mqtt/src/handler.rs#stamp_tls`).
+  Binary-PUBLISH spooling, the capture-memory budget and the shutdown drain apply identically
+  over TLS: the plain and TLS listeners share one capture hand-off, one budget and one drain
+  (`crates/sensor-mqtt/src/lib.rs#new_capture_handoff`). Replies are flushed, and every session
+  ends with a stream shutdown, which sends `close_notify` on TLS and a FIN on a plain
+  connection (the plain listener now closes its side cleanly too; no new event or reply
+  results). No refusal replies are added. Fail-closed: the sensor refuses to start (exit 1,
+  before any bind) on a half-configured or unusable cert and key pair, and the key must be mode
+  `0600`; an OS bind failure of the TLS listener stops the plain listener and exits 1. Cert and
+  key without `PROPOLIS_MQTT_TLS_BIND` load and validate, start no TLS listener, and log one
+  warning. Rules and variables are in [environment-variables.md](environment-variables.md); the
+  operator view is
+  [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 
 ### sensor-redis
 

@@ -103,6 +103,33 @@ fn an_mqtt_bind_yields_one_tcp_listener_named_mqtt() {
 }
 
 #[test]
+fn an_mqtt_tls_bind_yields_one_tcp_listener_named_mqtt() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "mqtt.env",
+        "PROPOLIS_MQTT_TLS_BIND=203.0.113.7:8883\n",
+    );
+
+    let value = generate(dir.path()).unwrap();
+    let parsed = parse_listeners(&value).unwrap();
+
+    assert_eq!(parsed, vec![listener("mqtt", Proto::Tcp, 8883)]);
+}
+
+#[test]
+fn a_cert_and_key_without_an_mqtt_tls_bind_derive_no_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "mqtt.env",
+        "PROPOLIS_MQTT_TLS_CERT=/etc/propolis/tls/mqtt.crt\nPROPOLIS_MQTT_TLS_KEY=/etc/propolis/tls/mqtt.key\n",
+    );
+
+    assert_eq!(generate(dir.path()), None);
+}
+
+#[test]
 fn an_http_tls_bind_yields_one_tcp_listener_named_http() {
     let dir = tempfile::tempdir().unwrap();
     write(

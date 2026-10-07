@@ -531,8 +531,10 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   `PROPOLIS_MQTT_MAX_CONCURRENT`, `PROPOLIS_MQTT_LOG_PATH`, `PROPOLIS_MQTT_WAN_MAP`,
   `PROPOLIS_MQTT_SPOOL_DIR` (default `/var/spool/propolis/mqtt`,
   `sensor-mqtt/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_MQTT_OUTBOX_DIR` (default
-  `/var/spool/propolis/mqtt/outbox`; see "Outbox manifest" below), `PROPOLIS_COLLECTOR_ID`
-  and `PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES` (see "Capture memory budget" below). A PUBLISH
+  `/var/spool/propolis/mqtt/outbox`; see "Outbox manifest" below), `PROPOLIS_COLLECTOR_ID`,
+  `PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES` (see "Capture memory budget" below), and the MQTTS
+  variables `PROPOLIS_MQTT_TLS_BIND`, `PROPOLIS_MQTT_TLS_CERT`, `PROPOLIS_MQTT_TLS_KEY` (see
+  "MQTT TLS" below). A PUBLISH
   payload is spooled only when it looks binary; text payloads stay metadata-only.
   `PROPOLIS_MQTT_MAX_CAPTURED_BYTES` (default `1_000_000`) bounds the total bytes read per
   connection; a single packet is separately capped at 262144 bytes of declared remaining length
@@ -643,6 +645,24 @@ Sensor-specific extras:
   unset. CERT and KEY without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
   (`deploy/fleet-listeners.sh#PROPOLIS_REDIS_TLS_BIND`), a TLS listener never starts implicitly.
+- **mqtt**: MQTT TLS (all three default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_MQTT_TLS_BIND` | unset (the deploy convention is `0.0.0.0:8883`) | `ip:port` of the implicit-TLS (MQTTS) listener. The listener exists only when this is set. |
+  | `PROPOLIS_MQTT_TLS_CERT` | unset (deploy value `/etc/propolis/tls/mqtt.crt`) | PEM certificate path. |
+  | `PROPOLIS_MQTT_TLS_KEY` | unset (deploy value `/etc/propolis/tls/mqtt.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-mqtt/src/main.rs#parse_tls`): the sensor exits 1 with
+  `refusing to start`, before binding any listener (the plain one included), when exactly one of
+  CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_MQTT_TLS_BIND` is set
+  without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
+  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value is invalid, not
+  unset. CERT and KEY without a bind load and validate the pair, start no TLS listener, and log one
+  warning. Because the fleet inventory derives from the `*_BIND` variables
+  (`deploy/fleet-listeners.sh#PROPOLIS_MQTT_TLS_BIND`), a TLS listener never starts implicitly.
+  The plain and TLS listeners share one capture-memory budget
+  (`PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES`), so the ceiling covers both together.
 - **catchall**: no spool variable (never spools file bodies,
   `crates/sensor-catchall/src/main.rs#Config`); no
   outbox variable either (captures no file bodies, so nothing for SP-B-1b's

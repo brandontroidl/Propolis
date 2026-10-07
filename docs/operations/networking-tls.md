@@ -100,10 +100,10 @@ This is separate from the console and the gateway and shipper mTLS material: it 
 server-side TLS on the honeypot's own attacker-facing ports, so the sensors can answer
 HTTPS, MQTTS and the other encrypted variants of the protocols they imitate.
 
-> **Status: two sensors live.** The shared capability, the certificate minting and the deploy
-> wiring below are in place, and `sensor-http` serves HTTPS and `sensor-redis` serves Redis over
-> TLS (both below). The other surfaces are still pending `[planned]`: no other sensor reads a TLS
-> variable or listens with TLS.
+> **Status: three sensors live.** The shared capability, the certificate minting and the deploy
+> wiring below are in place, and `sensor-http` serves HTTPS, `sensor-redis` serves Redis over TLS
+> and `sensor-mqtt` serves MQTTS (all below). The other surfaces are still pending `[planned]`:
+> no other sensor reads a TLS variable or listens with TLS.
 >
 > **No implicit TLS bind.** A TLS listener exists only when its `*_TLS_BIND` variable is
 > explicitly set. `deploy/fleet-listeners.sh` derives the fleet inventory from the `*_BIND`
@@ -113,7 +113,6 @@ HTTPS, MQTTS and the other encrypted variants of the protocols they imitate.
 >
 > Pending surfaces:
 >
-> - MQTTS on 8883 (`sensor-mqtt`)
 > - SMTPS on 465, plus SMTP STARTTLS (`sensor-smtp`)
 > - FTPS on 990, plus FTP AUTH TLS (`sensor-ftp`)
 > - in-band TLS for the `sensor-cred` PostgreSQL, MySQL, MSSQL and MongoDB protocols
@@ -151,6 +150,25 @@ behavior by [sensor-behavior.md](../reference/sensor-behavior.md).
 | Certificate and key | `PROPOLIS_REDIS_TLS_CERT` (`/etc/propolis/tls/redis.crt`), `PROPOLIS_REDIS_TLS_KEY` (`/etc/propolis/tls/redis.key`, mode `0600`) |
 | Plain listener | unchanged, `PROPOLIS_REDIS_BIND`; both listeners run in one process and write one `events.jsonl` |
 | Unit | `deploy/sensor-redis.service` adds `ReadOnlyPaths=/etc/propolis/tls`; no capability, since 6379 and 6380 are unprivileged |
+| Event tagging | events from a TLS session carry `"tls": true`; plain events have no such key |
+
+The sensor exits 1 with `refusing to start`, before binding anything, when exactly one of cert
+and key is set (a blank value counts as unset), when the TLS bind is set without both paths or
+does not parse, or when the pair is unusable (see [Loading is fail-closed](#loading-is-fail-closed)).
+If the OS refuses the TLS bind itself, the plain listener is stopped and the sensor exits 1.
+Variables are owned by [environment-variables.md](../reference/environment-variables.md);
+behavior by [sensor-behavior.md](../reference/sensor-behavior.md).
+
+### Live: MQTTS on `sensor-mqtt`
+
+| Item | Value |
+|---|---|
+| Mode | implicit TLS (the handshake is the first thing on the connection), no client certificate, no STARTTLS; MQTT 3.1, 3.1.1 and 5.0 all work over it |
+| Bind | `PROPOLIS_MQTT_TLS_BIND`, no compiled default; the deploy convention is `0.0.0.0:8883` |
+| Certificate and key | `PROPOLIS_MQTT_TLS_CERT` (`/etc/propolis/tls/mqtt.crt`), `PROPOLIS_MQTT_TLS_KEY` (`/etc/propolis/tls/mqtt.key`, mode `0600`) |
+| Plain listener | unchanged, `PROPOLIS_MQTT_BIND`; both listeners run in one process and write one `events.jsonl` |
+| Capture | the plain and TLS listeners share one capture hand-off, one capture-memory budget and one shutdown drain, so binary-PUBLISH spooling works identically over TLS |
+| Unit | `deploy/sensor-mqtt.service` adds `ReadOnlyPaths=/etc/propolis/tls`; no capability, since 1883 and 8883 are unprivileged |
 | Event tagging | events from a TLS session carry `"tls": true`; plain events have no such key |
 
 The sensor exits 1 with `refusing to start`, before binding anything, when exactly one of cert

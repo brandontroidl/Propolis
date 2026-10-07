@@ -6,8 +6,10 @@ After=network.target
 # spools a PUBLISH payload only when it looks binary, and never delivers, retains or forwards a
 # message. Off until an operator creates
 # /etc/propolis/mqtt.env with PROPOLIS_MQTT_BIND: without it the sensor refuses to start.
-# Port 1883 is unprivileged, so this unit deliberately grants no CAP_NET_BIND_SERVICE; an operator
-# who binds a port below 1024 must add the capability to a drop-in.
+# Optional implicit-TLS twin (MQTTS) on TCP/8883 when PROPOLIS_MQTT_TLS_BIND, _TLS_CERT and
+# _TLS_KEY are all set; a partial or unusable TLS configuration refuses to start.
+# Ports 1883 and 8883 are unprivileged, so this unit deliberately grants no CAP_NET_BIND_SERVICE;
+# an operator who binds a port below 1024 must add the capability to a drop-in.
 
 [Service]
 Type=simple
@@ -27,6 +29,8 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 ReadWritePaths=/var/log/propolis/mqtt /var/spool/propolis/mqtt
+# MQTTS cert and key (PROPOLIS_MQTT_TLS_CERT / PROPOLIS_MQTT_TLS_KEY); read-only, never written.
+ReadOnlyPaths=/etc/propolis/tls
 
 CapabilityBoundingSet=
 

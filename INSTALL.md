@@ -10,7 +10,7 @@
 - **Configuration** (all environment variables):
   [docs/operations/configuration.md](docs/operations/configuration.md) ·
   [docs/reference/environment-variables.md](docs/reference/environment-variables.md)
-- **Networking / TLS** (there is no in-process TLS - use a reverse proxy):
+- **Networking / TLS** (the console has no in-process TLS, so use a reverse proxy; six sensors terminate TLS themselves):
   [docs/operations/networking-tls.md](docs/operations/networking-tls.md)
 - **Before internet exposure:**
   [docs/getting-started/production-readiness-checklist.md](docs/getting-started/production-readiness-checklist.md)

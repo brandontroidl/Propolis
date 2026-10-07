@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Secret management
@@ -94,6 +94,31 @@ scanning is outbound egress and defaults off.
 An optional bearer token for a protected ntfy topic used by operational
 self-alerting (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`). Only relevant
 when `PROPOLIS_OPS_ENABLED=true`.
+
+### Sensor TLS private keys (optional, opt-in)
+
+Each of the six TLS sensors (http, redis, mqtt, smtp, ftp, cred) has a private key at
+`/etc/propolis/tls/<sensor>.key`, minted by `deploy/provision-tls.sh` or installed by the
+operator. This is the only secret that lives outside the `.env` files, and the `.env` files hold
+only its path (`PROPOLIS_<SENSOR>_TLS_KEY`), never its content.
+
+- **Location, owner, mode.** `/etc/propolis/tls/<sensor>.key`, owned by `propolis-<sensor>`, mode
+  `0600`, in a traverse-only `0711` root-owned directory
+  ([where the files live](networking-tls.md#where-the-files-live)). The sensor refuses to start
+  when the key has any group or other permission bit set
+  (`crates/sensor-framework/src/tls.rs#load_server_config`). The certificate (`0644`) is public.
+- **Never committed.** Keep `/etc/propolis/tls` out of version control and out of backups you
+  do not control. A minted key is a throwaway for a self-signed certificate, but a key installed
+  for a real certificate is a real credential.
+- **Never in logs.** A malformed PEM is reported as the file name and a fixed fault phrase; the
+  loader scrubs the buffers it read the key into, and no error carries key bytes
+  (`crates/sensor-framework/src/tls.rs#pem_error_kind`).
+- **Encrypted keys are not supported.** The sensor has no passphrase input; the key is stored
+  unencrypted, so the file mode is the control
+  ([key formats](networking-tls.md#install-a-real-certificate)).
+- **Rotation.** Replace the certificate and the key together and restart the sensor; there is no
+  hot reload. The commands are in
+  [Install a real certificate](networking-tls.md#install-a-real-certificate).
 
 ## Handling rules
 

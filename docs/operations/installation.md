@@ -63,11 +63,11 @@ points provision identically, `deploy/install.sh#run_provision`); steps 4-9 run 
 
 | Step | Action | Cite |
 |---|---|---|
-| 1/9 | Creates 10 system users (`propolis` + one per sensor) with `useradd --system --no-create-home --shell /usr/sbin/nologin --user-group`, then adds `propolis` to each sensor's group so the daemon can read group-readable sensor logs | `deploy/provision.sh#ensure_user`, `deploy/provision.sh#usermod -aG` |
+| 1/9 | Creates 12 system users (`propolis` + one per each of the eleven sensors) with `useradd --system --no-create-home --shell /usr/sbin/nologin --user-group`, then adds `propolis` to each sensor's group so the daemon can read group-readable sensor logs | `deploy/provision.sh#ensure_user`, `deploy/provision.sh#usermod -aG` |
 | 2/9 | Creates config/log/state directories with specific owners and modes (see [../reference/filesystem-paths.md](../reference/filesystem-paths.md)) | `deploy/provision.sh#2/9 creating directories` |
 | 3/9 | Creates spool mountpoints; **prints fstab guidance for the `noexec,nosuid,nodev` mounts but does not create them** | `deploy/provision.sh#3/9 creating spool directories (mountpoints only)`, fstab guidance `deploy/install.sh#NOT DONE BY THIS SCRIPT` |
 | 4/9 | `install -m 0755` each binary to `/usr/local/bin/`, then mints the per-sensor self-signed TLS pairs into `/etc/propolis/tls` with `deploy/provision-tls.sh` (idempotent; needs the release `provision-certs` binary, so it runs after the build, not inside `provision.sh`). Minting turns nothing on: a sensor uses its pair only once its TLS variables are set; see [networking-tls.md](networking-tls.md#sensor-tls-attacker-facing-listeners) | `deploy/install.sh#4/9 installing binaries to /usr/local/bin`, `deploy/install.sh#run_provision_tls` |
-| 5/9 | `install -m 0644` the 10 production units to `/etc/systemd/system/` | `deploy/install.sh#5/9 installing systemd units` |
+| 5/9 | `install -m 0644` the 12 production units (`propolis.service` and the 11 sensor units) to `/etc/systemd/system/` | `deploy/install.sh#5/9 installing systemd units` |
 | 6/9 | Installs `logrotate-sensors.conf` to `/etc/logrotate.d/propolis-sensors` | `deploy/install.sh#6/9 installing logrotate config` |
 | 7/9 | Derives the fleet listener inventory from the sensors' own bind variables (`deploy/fleet-listeners.sh`) | `deploy/install.sh#7/9 deriving the fleet listener inventory` |
 | 8/9 | Records the deploy stamp (commit this box last deployed) for the console's fleet pane (`deploy/deploy-stamp.sh`) | `deploy/install.sh#8/9 recording the deploy stamp` |
@@ -98,7 +98,7 @@ You must author the
 
 ## 3. Systemd units
 
-`install.sh` installs 10 production units to `/etc/systemd/system/`:
+`install.sh` installs 12 production units to `/etc/systemd/system/` (`deploy/install.sh#for unit in propolis.service`):
 
 - **`propolis.service`** - the unified daemon: `Type=simple`, `User=propolis`,
   `EnvironmentFile=/etc/propolis/propolis.env`, `ExecStart=/usr/local/bin/propolis`,
@@ -107,7 +107,7 @@ You must author the
   daemon's internal supervisor restarts a panicked subsystem in-process, so a
   full process exit only ever means a fail-fast (bad config / DB unreachable /
   migration failure) or an operator stop (`deploy/propolis.service#Restart=on-failure`).
-- **Nine `sensor-*.service` units** - `Type=simple`, per-sensor `User`/`Group`,
+- **Eleven `sensor-*.service` units** - `Type=simple`, per-sensor `User`/`Group`,
   `EnvironmentFile=/etc/propolis/<name>.env`, `ExecStart=/usr/local/bin/sensor-<name>`,
   `Restart=always`, `RestartSec=10` (`deploy/sensor-ssh.service` is the
   reference unit).

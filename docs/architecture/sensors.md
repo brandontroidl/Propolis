@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Sensor architecture
@@ -84,6 +84,33 @@ process refuse to start on most sensors ("zero never means unlimited"). Exact
 defaults, and the two sensors that fall back to defaults instead of refusing
 (SMTP and cred), are owned by
 [`reference/environment-variables.md`](../reference/environment-variables.md).
+
+### Server-side TLS
+
+Six of the eleven sensors terminate TLS in-process (http, redis, mqtt, smtp, ftp, cred); ssh,
+telnet, adb, tftp and catchall do not. The framework owns the shared parts in
+`crates/sensor-framework/src/tls.rs`: a fail-closed loader for one certificate and key per sensor
+(`crates/sensor-framework/src/tls.rs#load_server_config`), an implicit-TLS listener that wraps
+the plain listener's bounds so the per-source cap, the global limit and the session cap apply
+unchanged (`crates/sensor-framework/src/tls.rs#run_tls_listener`), and a plaintext-to-TLS stream
+for in-protocol upgrades (`crates/sensor-framework/src/tls.rs#MaybeTlsStream`,
+`crates/sensor-framework/src/tls.rs#upgrade_buffered`). Handlers are generic over the stream (or take
+`MaybeTlsStream` where a session can upgrade), so the protocol code is the same over plaintext
+and TLS. No client certificate is ever requested.
+
+Three modes, chosen per protocol:
+
+- **Implicit** (http 443, redis 6380, mqtt 8883, smtp 465, ftp 990): a second listener in the
+  same process, started only when its `*_TLS_BIND` variable is set.
+- **STARTTLS** (smtp `STARTTLS`, ftp `AUTH TLS`): the plain listener upgrades in place after the
+  command, and refuses plaintext pipelined behind it.
+- **In-band** (cred: PostgreSQL, MySQL, MSSQL; MongoDB sniffs the first bytes): TLS is
+  negotiated inside the protocol's own startup on the existing port; no TLS port is added.
+
+Every TLS surface is off until its variables are set. TLS events carry `"tls": true` in their
+metadata ([events and signals](../reference/events-and-signals.md#tls-metadata-keys)). The
+surfaces, variables, certificate handling and operator procedures are owned by
+[Networking and TLS](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 
 ### WAN resolution
 

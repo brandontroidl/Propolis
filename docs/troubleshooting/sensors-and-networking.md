@@ -125,17 +125,24 @@ and rules are in [Networking and TLS](../operations/networking-tls.md#sensor-tls
 The console has no in-process TLS: put it behind your own reverse proxy.
 
 **The sensor exits 1 at start and the journal says `refusing to start`.** TLS is fail-closed:
-any doubt about the TLS setup stops the whole sensor, plain listener included, before it binds
-anything. With `Restart=always` that shows as a restart loop; read the one error line with
+any doubt about the TLS configuration or the pair stops the whole sensor, plain listener included,
+before it binds anything; a bind the OS refuses (last item) stops it after its earlier listeners
+bound. With `Restart=always` that shows as a restart loop; read the one error line with
 `journalctl -u sensor-<name> -n 20`. The usual causes:
 
 - **Key mode.** The error names the key, its mode, and says `chmod 0600`. The key must have no
   group or other permission bit; the certificate is not checked. A pair minted by
   `deploy/provision-tls.sh` is already `0600`; a real certificate copied in by hand often is not.
-- **Missing pair.** `cannot read /etc/propolis/tls/<sensor>.crt` (or `.key`): the env file names
-  a file that is not there. Run `sudo deploy/provision-tls.sh` (it mints any missing pair and
-  repairs ownership), or fix the path. If `/etc/propolis/tls` itself is missing, run
-  `deploy/provision.sh` first.
+- **Missing or unreadable pair.** `cannot read /etc/propolis/tls/<sensor>.crt` (or `.key`)
+  followed by an OS error. `No such file or directory`: the env file names a file that is not
+  there. `Permission denied`: the file exists but the sensor's user cannot open it, usually
+  because it is owned by root or another account (a pair copied in with `cp` as root). Check
+  with `ls -l /etc/propolis/tls`; each file must be owned by `propolis-<sensor>` (the key
+  `0600`, the certificate `0644`) and the directory must be traversable (`0711`). Run
+  `sudo deploy/provision-tls.sh` to repair ownership and mode on a minted or installed pair
+  (it mints only a missing pair, and needs a build tree), or fix it by hand as in
+  [Install a real certificate](../operations/networking-tls.md#install-a-real-certificate),
+  or fix the path. If `/etc/propolis/tls` itself is missing, run `deploy/provision.sh` first.
 - **Half-set variables.** Only one of `*_TLS_CERT` and `*_TLS_KEY` is set, or a `*_TLS_BIND` is
   set without both. The error names the variables involved. On every TLS sensor a value is
   trimmed and a blank one counts as unset, so `PROPOLIS_<X>_TLS_BIND=` means no TLS listener.
@@ -149,8 +156,14 @@ anything. With `Restart=always` that shows as a restart loop; read the one error
   `malformed PEM in <path>: <fault>`, where the fault is a fixed phrase such as
   `missing section end marker` (often a key pasted onto one line); the file's content is never
   logged.
-- **TLS port already in use.** `cannot start listener on <ip:port>: Address already in use`:
-  see [Port not listening](#port-not-listening).
+- **TLS port in use or not permitted.** The TLS listener is bound last, after the plain one,
+  so this is not caught by the configuration checks. The journal shows
+  `<sensor>: cannot start listener on <ip:port>: Address already in use (os error 98); refusing
+  to start` (another process holds the port) or `...: Permission denied (os error 13); refusing
+  to start` (a port below 1024 on a unit without `CAP_NET_BIND_SERVICE`; only redis, mqtt and
+  cred lack it, and their TLS ports are unprivileged). The sensor tears the plain listener down
+  and exits 1, so neither port is served. Free the port or change the bind; see
+  [Port not listening](#port-not-listening).
 
 A missing `/etc/propolis/tls` directory does not stop a unit that uses no TLS: the units grant it
 as `ReadOnlyPaths=-/etc/propolis/tls`, where the `-` makes it optional.

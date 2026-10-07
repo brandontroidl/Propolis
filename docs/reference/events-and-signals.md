@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Events and signals reference
@@ -51,7 +51,7 @@ Sensor-emittable constants are provided so literals are not hand-typed:
   `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec`,
   `honeypot_malware_upload`, `honeypot_file_download`, plus the telemetry constant
   `honeypot_session_end` (`crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_SESSION_END`) - recorded in the ledger but never scored;
-  no sensor crate emits it yet. The remaining signal types (Suricata, WAF, port scan,
+  only `sensor-mqtt` emits it so far. The remaining signal types (Suricata, WAF, port scan,
   and so on) originate from other layers, not sensor-wire.
 - Protocol (`crates/sensor-wire/src/lib.rs#PROTO_TCP`, `crates/sensor-wire/src/lib.rs#PROTO_UDP`, `crates/sensor-wire/src/lib.rs#PROTO_ICMP`): `tcp`, `udp`, `icmp`.
 
@@ -89,6 +89,37 @@ the buffer that holds it, not by code after the session loop, which a cancelled 
 never reaches. The IP detail page shows such
 rows with status `incomplete`.
 
+### TLS metadata keys
+
+Events from the six TLS sensors (http, redis, mqtt, smtp, ftp, cred) carry these keys in
+`metadata`. They are ordinary metadata, not wire-format fields.
+
+| key | type | meaning |
+|---|---|---|
+| `tls` | bool | Present, and always `true`, only on events of a TLS session. It is **absent** on plaintext events, never `false`, so a consumer tests for the key, not its value (`crates/sensor-smtp/src/handler.rs#tag_tls`, `crates/sensor-ftp/src/handler.rs#tag_tls`, `crates/sensor-mqtt/src/handler.rs#stamp_tls`, `crates/sensor-cred/src/lib.rs#with_tls`; http and redis set it inline in their handlers). |
+| `starttls_refused` | string | Only on the refusal event described below; always `"pipelined_plaintext"` today. |
+| `pipelined_bytes` | integer | Only on the refusal event: how many plaintext bytes the client sent behind the upgrade command. The bytes themselves are never captured. |
+
+Scope of the `tls` tag: for sensor-smtp and sensor-ftp it covers a session upgraded by `STARTTLS`
+or `AUTH TLS` from the upgrade on (earlier events stay untagged, and the ftp tag describes the
+control channel only); for sensor-cred's PostgreSQL, MySQL and MSSQL the connection event is
+written before negotiation and stays untagged, while every MongoDB event of a TLS session is
+tagged. Per-sensor details are in [sensor-behavior.md](sensor-behavior.md) and
+[networking-tls.md](../operations/networking-tls.md#tls-surfaces).
+
+**Protocol refusal events.** `starttls_refused` and `pipelined_bytes` appear on one
+`honeypot_command_exec` event that sensor-smtp (`command` `STARTTLS`) and sensor-ftp (`command`
+`AUTH`) write when a client pipelined plaintext behind the upgrade command. The upgrade is
+refused and the connection closed. The event belongs to the plaintext phase, so it carries no
+`tls` key (`crates/sensor-smtp/src/handler.rs#starttls_refused_event`,
+`crates/sensor-ftp/src/handler.rs#auth_refused_event`). Its `authenticated` is `false` for smtp and
+the session's login state for ftp.
+
+**`honeypot_command_exec` is not only shell commands.** Across the sensors it records protocol
+commands too: sensor-smtp's `DATA` and its `STARTTLS` refusal, sensor-ftp's `AUTH` refusal, MQTT
+`SUBSCRIBE`, `PUBLISH` and `AUTH`, and Redis and HTTP requests, alongside the shell lines of the
+SSH, telnet and ADB sensors. Its weight and category are the same whichever produced it.
+
 ## Signal types
 
 17 signal types (`signal_type_enum`, mirrored by Rust `SignalType`). Sixteen of them
@@ -113,7 +144,7 @@ is stored as `NUMERIC(4,3)` in `event`.
 |---|---|---|---|---|
 | `honeypot_connection` | 40 | 0.900 | honeypot | TCP connection established to a honeypot service |
 | `honeypot_login_attempt` | 50 | 0.920 | honeypot | credential submitted to a fake service |
-| `honeypot_command_exec` | 60 | 0.950 | honeypot | command run in the fake shell |
+| `honeypot_command_exec` | 60 | 0.950 | honeypot | command run in the fake shell, or a protocol command (smtp DATA, the STARTTLS and AUTH TLS refusals, MQTT SUBSCRIBE and PUBLISH) |
 | `honeypot_malware_upload` | 80 | 0.980 | honeypot | file uploaded to a honeypot (highest weight/confidence) |
 | `honeypot_file_download` | 70 | 0.960 | honeypot | attacker pulled a file / fetched a payload |
 | `suricata_sev1` | 30 | 0.700 | ids | Suricata alert, severity 1 |

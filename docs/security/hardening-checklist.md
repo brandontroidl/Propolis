@@ -65,7 +65,7 @@ captured binary from being executed. See [malware custody](./malware-custody.md)
 
 ## 4. Terminate TLS in a reverse proxy
 
-The console has **no in-process TLS** (only the attacker-facing sensors do). It is plain HTTP on a `TcpListener`
+The console has **no in-process TLS** (six of the eleven sensors, the attacker-facing ones, terminate TLS themselves; ssh, telnet, adb, tftp and catchall do not). It is plain HTTP on a `TcpListener`
 (`console::server::serve`, HTTP/1.1, no rustls). If the console must be reachable beyond loopback,
 front it with an operator-provided TLS-terminating reverse proxy bound to
 loopback upstream. This is an operator responsibility, not a built-in feature.

@@ -129,16 +129,30 @@
   `provision.sh` creates it, and the review spool walk (`BODY_SPOOLERS`) now includes `mqtt`.
   Operators with an existing install should back `/var/spool/propolis/mqtt` with a
   noexec,nosuid,nodev mount like the other spools.
-- **MQTT honeypot sensor (`sensor-mqtt`, default-off)** - a metadata-only recon trap for
-  TCP/1883 that records MQTT 3.1/3.1.1 CONNECT credentials (never the password), SUBSCRIBE
-  topics and PUBLISH topic and payload metadata (length, a bounded preview, a SHA-256), and
-  answers just enough of the protocol that a client carries on. It never delivers, retains or
-  forwards a message, opens no outbound connection, executes nothing and spools no body. The
-  parser caps a packet at 256 KiB of declared length, a connection at 1024 packets and the
-  configured byte budget, and refuses a malformed or oversize packet by closing the connection.
-  An MQTT 5.0 CONNECT is logged and then declined with CONNACK reason 0x84. The sensor is off
-  until `PROPOLIS_MQTT_BIND` is set, and its unit grants no `CAP_NET_BIND_SERVICE` (1883 is
-  unprivileged).
+- **MQTT 5.0 on `sensor-mqtt`, and a session summary** - the sensor first declined a 5.0 CONNECT
+  with CONNACK reason `0x84`, so a strict 5.0 scanner stopped at CONNECT and none of its
+  SUBSCRIBE or PUBLISH recon was captured. It now speaks 5.0 in full: CONNECT (with its will
+  properties), PUBLISH, SUBSCRIBE, UNSUBSCRIBE, PUBREL and AUTH are parsed and answered in 5.0 wire
+  form, and 3.1 and 3.1.1 behave as before. A properties block is parsed strictly inside its
+  declared length (at most 64 properties, no panic on any input), so a malformed property sets
+  `properties_parse_error` but can neither corrupt the packet boundary nor fail the packet. The
+  recon-relevant properties are logged (session expiry, receive and packet-size maxima, topic alias
+  and its maximum, request-response-information, the authentication-method name, and the first 16
+  user properties with a full count); Authentication-Data is a credential and, like the password,
+  is never stored or logged. Also new: a connection whose first packet is malformed or not a
+  CONNECT now emits a second `honeypot_connection` event (`malformed`, a `reason`, a bounded hex
+  snippet) instead of closing silently; every connection ends with a `honeypot_session_end`
+  summary (packets, publishes, subscribes, bytes, duration, client id); and the idle wait after
+  CONNECT is bounded by 1.5 times the client keepalive.
+- **MQTT honeypot sensor (`sensor-mqtt`, default-off)** - a recon trap for TCP/1883 that records
+  MQTT CONNECT credentials (never the password), SUBSCRIBE topics and PUBLISH topic and payload
+  metadata (length, a bounded preview, a SHA-256), and answers just enough of the protocol that a
+  client carries on. It never delivers, retains or forwards a message, opens no outbound
+  connection and executes nothing; a binary PUBLISH payload is quarantined, never run (see the
+  entries above). The parser caps a packet at 256 KiB of declared length, a connection at 1024
+  packets and the configured byte budget, and refuses a malformed or oversize packet by closing
+  the connection. The sensor is off until `PROPOLIS_MQTT_BIND` is set, and its unit grants no
+  `CAP_NET_BIND_SERVICE` (1883 is unprivileged).
 - **Fake shell: a real grammar and faithful command modeling** - the shell the SSH, Telnet and ADB
   sensors present now lexes, parses and evaluates a shell-command subset (quotes, expansions,
   arithmetic, real pipelines, `&&`/`||`, subshells and `if`/`for`/`while`) instead of matching whole
@@ -280,7 +294,8 @@
   gateway address as `host:port` (only a literal IP and port is accepted), called the client
   certificate revocable (nothing revokes one), and gave a re-provisioning recipe for more
   collectors that the tool cannot carry out. The environment variable reference said the sensors
-  log at `info` without `RUST_LOG`; every binary except `propolis` and `console` logs only errors.
+  log at `info` without `RUST_LOG`; they then logged only errors (the sensors now default to
+  `info`, see above), and every binary except `propolis`, `console` and the sensors still does.
   The gateway unit suggested a capability grant for a port below 1024 that `PrivateUsers=yes`
   makes useless. These, the reference's gateway and shipper tables, and the backup, upgrade and
   compatibility pages are corrected.

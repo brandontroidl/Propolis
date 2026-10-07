@@ -189,10 +189,10 @@ are **not** compiled-in defaults - each is set by the operator in
 | 5900 | attacker | VNC (cred) | `PROPOLIS_CRED_VNC_BIND` |
 | 6379 | attacker | Redis | `PROPOLIS_REDIS_BIND` |
 | 6380 | attacker | Redis over implicit TLS (redis) | `PROPOLIS_REDIS_TLS_BIND` |
+| 8080 | operator + machine | Console UI + `/health` `/ready` `/metrics` (loopback default) | `PROPOLIS_CONSOLE_BIND` |
 | 8883 | attacker | MQTTS (mqtt, implicit TLS) | `PROPOLIS_MQTT_TLS_BIND` |
 | 27017 | attacker | MongoDB (cred, plain + sniffed TLS) | `PROPOLIS_CRED_MONGO_BIND` |
 | (any) | attacker | Catchall (TCP+UDP, multi-port) | `PROPOLIS_CATCHALL_BIND_ADDRS` |
-| 8080 | operator + machine | Console UI + `/health` `/ready` `/metrics` (loopback default) | `PROPOLIS_CONSOLE_BIND` |
 
 ## Sockets
 

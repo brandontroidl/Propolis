@@ -23,7 +23,7 @@ cargo build --release  # release binaries (README.md:42, docs/operations/install
 > **After any `cargo vendor`, build in release too.** A debug/test build can pass
 > while a release build fails on vendored-checksum issues. Run
 > `cargo build --release --locked` after re-vendoring. See
-> [schema-and-migrations](schema-and-migrations.md#vendoring).
+> [schema-and-migrations](schema-and-migrations.md#vendoring-and-rebuild-after-vendor).
 
 ## The gate (independent CI jobs)
 

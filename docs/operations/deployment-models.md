@@ -4,7 +4,7 @@ audience: deployer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Deployment models
@@ -87,7 +87,7 @@ installer does not do yet, are in [split deployment](split-deployment.md).
   (`deploy/propolis.service#MemoryMax=1G`, `deploy/propolis.service#TasksMax=256`,
   `deploy/propolis.service#CPUQuota=100%`, `deploy/propolis.service#LimitNOFILE=4096`) - the highest
   in the deploy set, since one
-  process holds all four subsystems. Per-sensor caps are lower (256M–512M). See
+  process holds all four subsystems. Per-sensor caps are lower (256M to 512M). See
   [capacity-planning.md](capacity-planning.md).
 
 ## Maturity

@@ -187,22 +187,133 @@ is neither the owner nor in the directory's group, so it needs the execute bit t
 key by exact name, while without the read bit nobody can list which sensors have TLS. A
 `0750` directory would lock every sensor out of its own key.
 
-### Replacing the self-signed pair with a real certificate
+### Enable TLS on one sensor
 
-Put both files at the paths above (`<sensor>.crt` and `<sensor>.key`). `provision-tls.sh`
-skips a sensor whose certificate **and** key already exist as non-empty regular files, so a real
-pair survives every re-run of `install.sh`, `upgrade.sh` or `provision-tls.sh`
-(`crates/provision-certs/src/lib.rs#provision_sensor_tls`). Two consequences:
+Minting a pair turns nothing on. The steps below use sensor-http (HTTPS on 443); the variable
+names for the other five are in [TLS surfaces](#tls-surfaces). A sensor's env file is
+`/etc/propolis/<sensor>.env` with the sensor name as in the unit without the `sensor-` prefix
+(`http.env` for `sensor-http.service`).
 
-- A path that is a **symlink** counts as present and is never replaced, and
-  `provision-tls.sh` neither follows it to change ownership or mode nor changes the link
-  itself (`deploy/provision-tls.sh#operator-managed`). The operator owns the permissions of
-  whatever it points at, and the key must still satisfy the `0600` rule below.
+1. Confirm the pair exists: `ls -l /etc/propolis/tls/http.crt /etc/propolis/tls/http.key`. A
+   normal `install.sh` or `upgrade.sh` minted it; if not, see
+   [Running `provision-tls.sh`](#running-provision-tlssh).
+2. Add the variables to `/etc/propolis/http.env`:
+
+   ```
+   PROPOLIS_HTTP_TLS_BIND=0.0.0.0:443
+   PROPOLIS_HTTP_TLS_CERT=/etc/propolis/tls/http.crt
+   PROPOLIS_HTTP_TLS_KEY=/etc/propolis/tls/http.key
+   ```
+
+   For smtp, ftp and cred the cert and key variables alone enable STARTTLS, `AUTH TLS` or the
+   in-band TLS on the existing plain ports (and open nothing); add `PROPOLIS_SMTP_TLS_BIND`,
+   `PROPOLIS_SMTP_SUBMISSION_BIND` or `PROPOLIS_FTP_TLS_BIND` only to open 465, 587 or 990.
+3. Restart the sensor: `sudo systemctl restart sensor-http`. The pair is read once, at start.
+4. If step 2 added a bind (any `*_TLS_BIND`, or the smtp submission bind), refresh the fleet
+   inventory so the fleet pane lists the new port, then restart the processes that load it:
+
+   ```
+   sudo deploy/fleet-listeners.sh
+   sudo systemctl restart propolis console
+   ```
+
+   (`propolis.service` and `console.service` read `/etc/propolis/fleet-listeners.env` at start;
+   restart only the units you run.) Without this step the pane has no declared listener for the
+   port, and the new listener's events show as an undeclared listener. A pair-only change opens
+   no port and needs no inventory refresh. On a split deployment the inventory is maintained
+   by hand, see [split-deployment.md](split-deployment.md).
+5. Open the port in the host firewall (see [Firewall and exposure
+   guidance](#firewall-and-exposure-guidance)).
+
+#### Verify
+
+Check all four, in this order:
+
+- **Listening.** `sudo ss -ltn 'sport = :443'` shows a `LISTEN` socket on the bind address.
+- **Journal.** `journalctl -u sensor-http -n 20` shows no `refusing to start` line and, for
+  http, redis and mqtt, `sensor-http: listening (tls)` with the bound address. sensor-smtp and
+  sensor-ftp log one `listening` line per bound listener, so the TLS bind appears as a second or
+  third line; sensor-cred logs `TLS enabled for postgresql, mysql, ...` naming the protocols
+  that have a bind.
+- **Handshake.** `openssl s_client -connect <host>:443 </dev/null` prints the certificate chain
+  and the negotiated protocol (`TLSv1.3` or `TLSv1.2`). With the minted pair the subject is
+  `CN=localhost` and the last lines read `Verify return code: 18 (self-signed certificate)`;
+  with a real certificate and a matching `-servername`, `0 (ok)`. For the in-protocol upgrades
+  use the matching mode: `openssl s_client -starttls smtp -connect <host>:25`, `-starttls ftp
+  -connect <host>:21`, `-starttls postgres -connect <host>:5432`, `-starttls mysql -connect
+  <host>:3306`, and a plain `-connect <host>:27017` for MongoDB. MSSQL runs TLS inside TDS, so
+  `s_client` cannot reach it; use the drivers listed under
+  [MSSQL validation status](#sensor-cred-in-band-tls).
+- **Events.** After one real connection, the sensor's log carries events tagged `"tls":true`:
+  `grep -c '"tls":true' /var/log/propolis/http/events.jsonl` (sensor-cred writes one
+  `<protocol>.jsonl` per protocol under `/var/log/propolis/cred`). Plaintext events carry no
+  such key.
+
+A failed handshake is logged at debug level only (see [handshake bound](#handshake-bound)); the
+[troubleshooting entry](../troubleshooting/sensors-and-networking.md#sensor-tls) says how to raise
+the level.
+
+### Install a real certificate
+
+Replace the self-signed pair with a certificate your clients can verify. The files go at the same
+paths (`/etc/propolis/tls/<sensor>.crt` and `<sensor>.key`) with the same owner and modes as the
+minted pair; `SENSOR` is `http`, `redis`, `mqtt`, `smtp`, `ftp` or `cred`:
+
+```
+SENSOR=http
+sudo install -o "propolis-$SENSOR" -g "propolis-$SENSOR" -m 0644 fullchain.pem "/etc/propolis/tls/$SENSOR.crt"
+sudo install -o "propolis-$SENSOR" -g "propolis-$SENSOR" -m 0600 privkey.pem "/etc/propolis/tls/$SENSOR.key"
+sudo systemctl restart "sensor-$SENSOR"
+```
+
+`install` sets owner and mode as it writes, so the key is never briefly readable by others. The
+certificate file may hold the whole chain, leaf first and then intermediates. Rotation is the same
+three commands: there is no hot reload, and the sensor keeps serving the old pair until the
+restart. One pair per sensor: the key is never shared between sensors.
+
+What the loader accepts (`crates/sensor-framework/src/tls.rs#build`, through
+`rustls_pki_types::PrivateKeyDer::pem_slice_iter` and `CertificateDer::pem_slice_iter`):
+
+- **Key formats.** An **unencrypted** PEM key in PKCS#8 (`BEGIN PRIVATE KEY`), PKCS#1
+  (`BEGIN RSA PRIVATE KEY`) or SEC1 (`BEGIN EC PRIVATE KEY`) form; the first such section is used.
+  **Encrypted keys are not supported and there is no passphrase variable.** An
+  `ENCRYPTED PRIVATE KEY` section is skipped by the parser, so the sensor reports `no private
+  key found in <path>`, and an old-style key with `Proc-Type: 4,ENCRYPTED` headers is rejected as
+  malformed PEM. Decrypt it first into a private directory (`umask 077; openssl pkey -in
+  encrypted.key -out privkey.pem`), install `privkey.pem` as above, and delete the plain copy.
+- **Key mode.** Any group or other permission bit on the key is refused before it is read
+  (`0600`, or `0400`).
+- **Let's Encrypt.** Do not point a sensor at `/etc/letsencrypt/live/...`. Those keys are
+  root's: a `0640` key fails the mode check above, and a root-owned `0600` key cannot be opened
+  by the sensor's user (`Permission denied`). Copy `fullchain.pem` and `privkey.pem` with the
+  commands above, and repeat the copy and restart after each renewal (a certbot
+  `--deploy-hook` script can run exactly those three commands).
+- **Paths outside `/etc/propolis/tls`.** The variables may name any path, but every sensor unit
+  has `ProtectHome=yes`, so nothing under `/home` or `/root` is visible to it, and the sensor's
+  user must be able to read the file through every directory on the path (a mode `0700` directory
+  of root's blocks it). Only `/etc/propolis/tls` is granted explicitly
+  (`ReadOnlyPaths=-/etc/propolis/tls`). Prefer the standard location.
+
+#### Interaction with `provision-tls.sh`
+
+`provision-tls.sh` skips a sensor whose certificate **and** key already exist, so a real pair
+survives every re-run of `install.sh`, `upgrade.sh` or `provision-tls.sh`
+(`crates/provision-certs/src/lib.rs#provision_sensor_tls`). Existence is judged by
+`std::fs::metadata`, which follows symlinks, and means a non-empty regular file:
+
+- A symlink to a **non-empty regular file counts as present** and is never replaced.
+  `provision-tls.sh` neither follows it to change ownership or mode nor changes the link itself
+  (`deploy/provision-tls.sh#operator-managed`). The operator owns the permissions of whatever it
+  points at, and the key must still satisfy the `0600` rule above. A **dangling symlink, or one
+  whose target is empty or not a regular file, counts as absent**: it is removed and replaced by
+  a freshly minted pair.
 - If only one file of a pair is present, the stray is removed and a fresh self-signed pair is
   minted, so a new pair is never mixed with an old half. To supply a real pair, install both
   files.
 
-Restart the sensor after replacing its pair: the pair is loaded once, at start.
+Re-running `provision-tls.sh` needs a build tree, because `provision-certs` is not installed to
+`/usr/local/bin` (it runs from `target/release/provision-certs` or `PROVISION_CERTS_BIN`); the
+`install` commands above need none.
 
 ### Running `provision-tls.sh`
 
@@ -222,8 +333,9 @@ its env file names it.
 ### Fail-closed rules
 
 A sensor never falls back to plaintext or to a default certificate where TLS was configured.
-Every refusal below happens before the sensor binds any listener, the plain one included: the
-process logs an error and exits 1. The error ends in `refusing to start`.
+Every refusal below except [a bind the OS refuses](#fail-closed-rules) happens before the sensor
+binds any listener, the plain one included: the process logs an error and exits 1. The error ends
+in `refusing to start`.
 
 **How the variables are read.** All six sensors read every TLS variable (each `*_TLS_BIND`,
 `*_TLS_CERT` and `*_TLS_KEY`, and `PROPOLIS_SMTP_SUBMISSION_BIND`) through one reader,
@@ -276,12 +388,23 @@ one warning. The exceptions:
 - sensor-cred has no TLS bind at all: its TLS runs on the existing plain binds, so the pair
   opens no port and the inventory is unchanged.
 
-**A bind the OS refuses.** For http, redis, mqtt, smtp and ftp, if the OS refuses any one bind,
-the listeners already started are stopped and the sensor exits 1, logging
-`<sensor>: cannot start listener on <address>: <OS error>; refusing to start`
-(`crates/sensor-framework/src/listener.rs#listener_start_error`). sensor-cred instead logs the
-same text ending `; skipping protocol <name>` and exits 1 only when every configured protocol
-failed to bind, because its TLS adds no listener whose loss could hide behind the others.
+**A bind the OS refuses.** Port in use, a port below 1024 without `CAP_NET_BIND_SERVICE`, or an
+address that is not local cannot be checked in advance, so this refusal comes after the
+configuration and the pair were accepted and after the sensor's earlier listeners bound. The
+plain listener is bound first and the TLS listener last, so a TLS bind that fails leaves the
+plain listener already open for a moment: the sensor stops every listener it started (the plain
+port is not served either) and exits 1. For http, redis, mqtt, smtp and ftp every sensor logs the
+same line, with the same words whichever listener failed
+(`crates/sensor-framework/src/listener.rs#listener_start_error`):
+
+```
+<sensor>: cannot start listener on <address>: <OS error>; refusing to start
+```
+
+for example `sensor-http: cannot start listener on 0.0.0.0:443: Address already in use (os error
+98); refusing to start`. sensor-cred instead logs the same text ending `; skipping protocol
+<name>` and exits 1 only when every configured protocol failed to bind, because its TLS adds no
+listener whose loss could hide behind the others.
 
 On success sensor-cred logs `TLS enabled for <protocols>`, naming only the TLS-capable
 protocols (postgresql, mysql, mssql, mongodb) that have a bind configured; when none has (vnc

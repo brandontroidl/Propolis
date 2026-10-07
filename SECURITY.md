@@ -22,7 +22,7 @@ deployment scripts.
 ## Full policy and design posture
 
 The complete, canonical version of this policy - including the security design posture
-and what is deliberately **not** guaranteed (no in-process TLS, the placeholder syscall
+and what is deliberately **not** guaranteed (no in-process TLS on the console, the placeholder syscall
 filter, single-node blast radius) - is at
 **[docs/security/vulnerability-disclosure.md](docs/security/vulnerability-disclosure.md)**.
 

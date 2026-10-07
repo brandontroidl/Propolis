@@ -4,7 +4,7 @@ audience: evaluator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-01
+last-verified: 2026-10-06
 -->
 
 # Limitations
@@ -22,10 +22,11 @@ built-in high availability, failover, or off-host redundancy. Backup and recover
 are operator responsibilities - see
 [`../operations/backup-and-restore.md`](../operations/backup-and-restore.md).
 
-## No in-process TLS
+## No in-process TLS on the console
 
 The console serves **plain HTTP on a loopback `TcpListener`** (`console::server::serve`, HTTP/1.1, no
-rustls). There is no built-in transport encryption. Exposing the console beyond
+rustls). There is no built-in transport encryption for it (six sensors do terminate TLS on their
+attacker-facing ports, which does not protect operator traffic). Exposing the console beyond
 loopback requires an operator-provided reverse proxy or tunnel to add TLS
 `[inferred]`. See [`../operations/networking-tls.md`](../operations/networking-tls.md).
 

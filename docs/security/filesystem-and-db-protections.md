@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Filesystem and database protections
@@ -80,6 +80,20 @@ security-load-bearing choices:
   user** - created by hand by the operator, never by `install.sh`. No secret is
   read from argv or baked into a unit file. See
   [../operations/secret-management.md](../operations/secret-management.md).
+- **Sensor TLS keys** (`/etc/propolis/tls/<sensor>.key`, `0600`, owned by that sensor's own
+  user) are generated on the host at deploy time by `provision-certs --sensor-tls`
+  (`crates/provision-certs/src/lib.rs#provision_sensor_tls`) and never committed. The
+  provisioner writes each file to a new inode created with its final mode, then renames it
+  into place, so a key is never briefly more readable (`crates/provision-certs/src/lib.rs#write`).
+  The directory is `0711` root-owned (traverse-only) so a sensor can open only its own key by
+  name. The shared loader refuses a key with any group or other permission bit set and
+  returns an error that carries no key bytes or PEM text
+  (`crates/sensor-framework/src/tls.rs#TlsConfigError`); it overwrites its read buffers after
+  parsing as a best-effort scrub, not a guarantee: it covers only those buffers, not
+  the parsed key the TLS configuration holds (`crates/sensor-framework/src/tls.rs#load_server_config`). Tests use
+  ephemeral in-memory certificates (`crates/sensor-framework/src/tls.rs#server_config_from_pem`),
+  never a checked-in key. No sensor binds TLS yet. Operator guidance:
+  [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 - Dedicated users are created `--system --no-create-home --shell /usr/sbin/nologin`
   (`ensure_user`, `deploy/provision.sh#ensure_user`); no sensor user can log in.
 

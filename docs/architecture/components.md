@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Components
@@ -22,7 +22,7 @@ owner of the component inventory and the inter-crate dependency graph.
 | `sensor-wire` | library (leaf) | none | Frozen sensor->intake NDJSON wire format (`WIRE_VERSION = 1`); the single source of truth imported by every sensor and by intake. |
 | `core-scoring` | library (leaf) | none | Event ledger and scoring engine: append events, chain-hashing, `ip_score`, blocklist eligibility; owns the core migrations. |
 | `geoip` | library (leaf) | none | Offline MaxMind GeoLite2 City + ASN enrichment (local file reads only, egress-free); both DBs optional. |
-| `sensor-framework` | library | none | Shared sensor harness: TCP/UDP listener lifecycle, WAN attribution, sanitize, event emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds. |
+| `sensor-framework` | library | none | Shared sensor harness: TCP/UDP listener lifecycle, WAN attribution, sanitize, event emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds. Also provides per-sensor server-side TLS (`crates/sensor-framework/src/tls.rs`): a fail-closed cert/key loader, an implicit-TLS listener and a plaintext-to-TLS stream for STARTTLS-style upgrades; no sensor binds TLS yet. |
 | `sensor-catchall` | lib + bin | `sensor-catchall` | Passive protocol-agnostic TCP/UDP catch-all; emits `catchall_probe` for unprompted traffic. |
 | `sensor-ssh` | lib + bin | `sensor-ssh` | SSH honeypot: full handshake via own crypto primitives, fake shell, SCP/SFTP capture. |
 | `sensor-telnet` | lib + bin | `sensor-telnet` | Telnet honeypot: minimal option negotiation, accepts any credential, shared fake shell. |
@@ -44,7 +44,7 @@ owner of the component inventory and the inter-crate dependency graph.
 | `collector-wire` | library (leaf) | none | Collector-to-gateway wire protocol: sequenced, hash-chained batch frames, acks, and the mutual-TLS configs both ends build from one pinned CA. |
 | `shipper` | lib + bin | `shipper` | Collector side of the split deployment: tails a sensor log through `log-tailer`, assembles the next sequenced batch, ships it to the gateway over mutual TLS, and advances its durable state only after a confirmed ack. |
 | `gateway` | lib + bin | `gateway` | Control-plane side of the split deployment: a client-certificate-required TLS accept loop that verifies each collector's sequence and hash chain and appends accepted records to a per-collector spool in sensor NDJSON shape, which intake tails unchanged. |
-| `provision-certs` | lib + bin | `provision-certs` | Mints a private CA, the gateway server certificate and one collector client certificate per run, isolated so its certificate library never enters the daemon dependency trees. |
+| `provision-certs` | lib + bin | `provision-certs` | Mints a private CA, the gateway server certificate and one collector client certificate per run, isolated so its certificate library never enters the daemon dependency trees. With `--sensor-tls <out-dir> <sensor>...` it instead mints one self-signed TLS pair per sensor (kept if both files already exist), driven by `deploy/provision-tls.sh`. |
 
 Source: the `[workspace] members` list in `Cargo.toml`; each crate's `Cargo.toml` and
 `src/lib.rs` / `src/main.rs`.

@@ -1315,3 +1315,174 @@ fn no_sensor_crate_depends_on_an_http_client() {
         "expected every sensor crate to be walked, found only {checked:?}"
     );
 }
+
+/// Sensors with a TLS listener (telnet is deliberately out of scope).
+const TLS_SENSORS: [&str; 6] = ["http", "mqtt", "redis", "smtp", "ftp", "cred"];
+
+fn deploy_file(name: &str) -> String {
+    std::fs::read_to_string(format!(
+        "{}/../../deploy/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap_or_else(|e| panic!("failed to read deploy/{name}: {e}"))
+}
+
+/// The key directory is root-owned and traverse-only: sensor uids need x to open their own key by
+/// name, nobody needs to list it. 0750 would lock every sensor out.
+#[test]
+fn tls_dir_is_provisioned_root_owned_and_traverse_only() {
+    assert!(provisioned_dirs().contains("/etc/propolis/tls"));
+    let line = deploy_file("provision.sh")
+        .lines()
+        .find(|l| {
+            l.split_whitespace().take(2).collect::<Vec<_>>() == ["ensure_dir", "/etc/propolis/tls"]
+        })
+        .expect("provision.sh has no ensure_dir line for /etc/propolis/tls")
+        .to_string();
+    assert_eq!(
+        line.split_whitespace().collect::<Vec<_>>(),
+        ["ensure_dir", "/etc/propolis/tls", "0711", "root", "root"]
+    );
+}
+
+/// provision-tls.sh must be valid bash, and every sensor it mints for must be a user that
+/// provision.sh creates (the chown would fail otherwise).
+#[test]
+fn provision_tls_script_is_valid_bash_and_mints_for_provisioned_users() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/provision-tls.sh");
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(script)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "deploy/provision-tls.sh has a bash syntax error"
+    );
+
+    let text = deploy_file("provision-tls.sh");
+    let list = text
+        .lines()
+        .find_map(|l| l.strip_prefix("TLS_SENSORS=("))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .expect("provision-tls.sh has no TLS_SENSORS=(...) line at column 0");
+    let minted: Vec<&str> = list.split_whitespace().collect();
+    assert_eq!(minted, TLS_SENSORS);
+
+    let provision = deploy_file("provision.sh");
+    for sensor in minted {
+        let user = format!("ensure_user propolis-{sensor}");
+        assert!(
+            provision.lines().any(|l| l.trim_end() == user),
+            "provision.sh does not create propolis-{sensor}"
+        );
+    }
+}
+
+/// Ordering contract: install mints after the binaries are installed; upgrade mints after the
+/// build, after provision.sh created the directory, and before the first restart.
+#[test]
+fn both_deploy_scripts_mint_tls_certs_at_the_right_point() {
+    let install = deploy_file("install.sh");
+    let upgrade = deploy_file("upgrade.sh");
+    let at = |s: &str, pred: &dyn Fn(&str) -> bool| {
+        s.lines()
+            .position(|l| pred(l.trim_start()))
+            .expect("expected line not found")
+    };
+
+    let bins_at = at(&install, &|l| l.starts_with("for bin in "));
+    let mint_at = at(&install, &|l| l == "run_provision_tls");
+    assert!(
+        bins_at < mint_at,
+        "install.sh must mint after installing binaries"
+    );
+    assert!(install.contains("PROVISION_CERTS_BIN=\"$BUILD_DIR/provision-certs\""));
+
+    let build_at = at(&upgrade, &|l| l.contains("cargo build --release"));
+    let prov_at = at(&upgrade, &|l| l == "\"$SCRIPT_DIR/provision.sh\"");
+    let tls_at = at(&upgrade, &|l| {
+        l.starts_with("PROVISION_CERTS_BIN=") && l.contains("provision-tls.sh")
+    });
+    let restart_at = at(&upgrade, &|l| l.starts_with("systemctl restart"));
+    assert!(build_at < prov_at && prov_at < tls_at && tls_at < restart_at);
+    assert!(upgrade.contains("PROVISION_CERTS_BIN=\"$BUILD_DIR/provision-certs\""));
+}
+
+/// Real dry-run of install.sh: the tls dir at 0711, one --sensor-tls call over all six sensors,
+/// and per-sensor ownership + modes (key 0600 owned by the sensor's own user).
+#[test]
+fn install_dry_run_mints_and_locks_down_a_pair_per_tls_sensor() {
+    let out = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .arg("--dry-run")
+    .output()
+    .expect("failed to run install.sh --dry-run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("install -d -m 0711 -o root -g root /etc/propolis/tls\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("--sensor-tls /etc/propolis/tls http mqtt redis smtp ftp cred\n"),
+        "{stdout}"
+    );
+    for s in TLS_SENSORS {
+        for needle in [
+            // One path per chown/chmod: the loop skips a symlinked path rather than following it,
+            // so it cannot batch the pair into a single chown.
+            format!("chown propolis-{s}:propolis-{s} /etc/propolis/tls/{s}.key\n"),
+            format!("chmod 0600 /etc/propolis/tls/{s}.key\n"),
+            format!("chown propolis-{s}:propolis-{s} /etc/propolis/tls/{s}.crt\n"),
+            format!("chmod 0644 /etc/propolis/tls/{s}.crt\n"),
+        ] {
+            assert!(stdout.contains(&needle), "missing `{needle}` in:\n{stdout}");
+        }
+    }
+}
+
+/// A private key must never be committed: the repo rule is generate-at-deploy, ephemeral in tests.
+/// The needles are assembled at runtime so this file does not match itself, and no other file
+/// under crates/ or deploy/ may spell a PEM private-key header (tests assert on "PRIVATE KEY"
+/// without the BEGIN prefix instead).
+#[test]
+fn no_private_key_pem_is_committed_under_crates_or_deploy() {
+    let needles: Vec<String> = ["", "RSA ", "EC ", "ENCRYPTED ", "OPENSSH "]
+        .iter()
+        .map(|p| format!("BEGIN {p}PRIVATE KEY"))
+        .collect();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut stack = vec![root.join("crates"), root.join("deploy")];
+    let mut scanned = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                stack.push(path);
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                scanned += 1;
+                for n in &needles {
+                    assert!(
+                        !text.contains(n.as_str()),
+                        "{} contains a PEM private key header",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "the walk is broken: only {scanned} text files scanned"
+    );
+}

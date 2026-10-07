@@ -23,6 +23,7 @@ pub mod replay;
 pub mod sanitize;
 pub mod shell;
 pub mod spool;
+pub mod tls;
 pub mod wan;
 
 pub use admission::{PerSourceLimiter, SourceGuard, default_per_source_cap};
@@ -44,5 +45,9 @@ pub use listener::{run_tcp_listener, run_udp_listener, shutdown_signal};
 pub use outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
 pub use sanitize::{sanitize_value, to_hex_bounded};
 pub use spool::{QuarantineSpool, SpoolError};
+pub use tls::{
+    MaybeTlsStream, TlsConfigError, TlsServer, load_server_config, load_server_config_from_env,
+    load_server_config_with_env, run_tls_listener, server_config_from_pem,
+};
 pub use uuid::Uuid;
 pub use wan::WanResolver;

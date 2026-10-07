@@ -17,6 +17,9 @@ libc = "0.2.186"
 unicode-normalization = "0.1.25"
 tracing = "0.1.44"
 uuid = { version = "1", features = ["v7", "serde"] }
+tokio-rustls = "0.26.4"
+rustls-pki-types = "1.15.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+rcgen = "0.14.9"

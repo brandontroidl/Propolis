@@ -4,7 +4,7 @@ audience: deployer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Installation
@@ -66,7 +66,7 @@ points provision identically, `deploy/install.sh#run_provision`); steps 4-9 run 
 | 1/9 | Creates 10 system users (`propolis` + one per sensor) with `useradd --system --no-create-home --shell /usr/sbin/nologin --user-group`, then adds `propolis` to each sensor's group so the daemon can read group-readable sensor logs | `deploy/provision.sh#ensure_user`, `deploy/provision.sh#usermod -aG` |
 | 2/9 | Creates config/log/state directories with specific owners and modes (see [../reference/filesystem-paths.md](../reference/filesystem-paths.md)) | `deploy/provision.sh#2/9 creating directories` |
 | 3/9 | Creates spool mountpoints; **prints fstab guidance for the `noexec,nosuid,nodev` mounts but does not create them** | `deploy/provision.sh#3/9 creating spool directories (mountpoints only)`, fstab guidance `deploy/install.sh#NOT DONE BY THIS SCRIPT` |
-| 4/9 | `install -m 0755` each binary to `/usr/local/bin/` | `deploy/install.sh#4/9 installing binaries to /usr/local/bin` |
+| 4/9 | `install -m 0755` each binary to `/usr/local/bin/`, then mints the per-sensor self-signed TLS pairs into `/etc/propolis/tls` with `deploy/provision-tls.sh` (idempotent; needs the release `provision-certs` binary, so it runs after the build, not inside `provision.sh`). No sensor binds TLS yet; see [networking-tls.md](networking-tls.md#sensor-tls-attacker-facing-listeners) | `deploy/install.sh#4/9 installing binaries to /usr/local/bin`, `deploy/install.sh#run_provision_tls` |
 | 5/9 | `install -m 0644` the 10 production units to `/etc/systemd/system/` | `deploy/install.sh#5/9 installing systemd units` |
 | 6/9 | Installs `logrotate-sensors.conf` to `/etc/logrotate.d/propolis-sensors` | `deploy/install.sh#6/9 installing logrotate config` |
 | 7/9 | Derives the fleet listener inventory from the sensors' own bind variables (`deploy/fleet-listeners.sh`) | `deploy/install.sh#7/9 deriving the fleet listener inventory` |
@@ -172,7 +172,7 @@ forms are collected in [../reference/commands.md](../reference/commands.md).
 
 In-place upgrades use `sudo ./deploy/upgrade.sh` (requires root): it pulls, runs
 `cargo build --release --workspace --locked` as the repo-owner user, reinstalls the binaries, runs
-`provision.sh`, reinstalls the unit files and logrotate config, runs
+`provision.sh`, runs `provision-tls.sh` (idempotent; keeps any existing TLS pair), reinstalls the unit files and logrotate config, runs
 `daemon-reload`, restarts only the enabled sensor units, and restarts
 `propolis.service` last so migrations run and sensors reconnect
 (`deploy/upgrade.sh`). Rollback and DR are owned by

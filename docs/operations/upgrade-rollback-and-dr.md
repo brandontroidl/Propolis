@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Upgrade, rollback and disaster recovery
@@ -22,8 +22,13 @@ The script (run as root, `sudo ./deploy/upgrade.sh`):
    dependency resolution cannot drift from the reviewed lockfile.
 2. Installs the built binaries (`propolis`, the 11 sensors, `gateway`, `shipper`)
    to `/usr/local/bin/` with `install -m 0755`.
-3. Runs `deploy/provision.sh` (idempotent users + directories), reinstalls the
-   production unit files and `logrotate-sensors.conf` (the same set `install.sh`
+3. Runs `deploy/provision.sh` (idempotent users + directories), then
+   `deploy/provision-tls.sh`, which mints a self-signed TLS pair for each
+   TLS-capable sensor that lacks one and leaves any existing pair, including an
+   operator-supplied real certificate, untouched (`deploy/upgrade.sh#provision-tls.sh`;
+   run by hand with `sudo deploy/provision-tls.sh`, `DRY_RUN=1` to preview, see
+   [networking-tls.md](networking-tls.md#sensor-tls-attacker-facing-listeners)).
+   It then reinstalls the production unit files and `logrotate-sensors.conf` (the same set `install.sh`
    installs; `gateway.service`/`shipper.service` only where already enabled), then
    runs `systemctl daemon-reload` so the restarts below pick up the new unit
    definitions.

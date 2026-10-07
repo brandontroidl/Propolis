@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Filesystem paths
@@ -98,6 +98,22 @@ for the full variable reference.
 - The aggregated node's `ReadWritePaths=/var/lib/propolis` is deliberately wider
   than intake's cursors-only grant, because the single process owns cursors,
   feed output, and spool together.
+
+## TLS material (per sensor)
+
+Self-signed certificate and key per TLS-capable sensor (http, mqtt, redis, smtp, ftp, cred),
+minted by `deploy/provision-tls.sh` (`deploy/provision-tls.sh#TLS_SENSORS`). No sensor reads
+them yet; see [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+
+| Path | Mode | Owner | Created by |
+|---|---|---|---|
+| `/etc/propolis/tls` | 0711 | root:root | `deploy/provision.sh#ensure_dir /etc/propolis/tls` |
+| `/etc/propolis/tls/<sensor>.key` | 0600 | propolis-`<sensor>` | `deploy/provision-tls.sh#provision-certs`, ownership and mode reasserted by `deploy/provision-tls.sh#chmod "$mode" "$path"` |
+| `/etc/propolis/tls/<sensor>.crt` | 0644 | propolis-`<sensor>` | same as the key |
+
+The directory is traverse-only (no read bit) so a sensor opens its own key by name but nobody
+can list the directory. A real certificate placed at these paths is kept on re-runs; a symlink
+at a path is operator-managed and is not re-owned or re-permissioned.
 
 ## Split deployment (gateway and shipper)
 

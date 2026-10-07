@@ -44,6 +44,11 @@ done
 echo "==> ensuring dirs and users (provision.sh, idempotent)"
 "$SCRIPT_DIR/provision.sh"
 
+# After provision.sh (needs /etc/propolis/tls) and the binary install above, before the unit
+# install and every restart, so a sensor restarted below with a *_TLS_BIND finds its pair.
+echo "==> minting per-sensor TLS certificates (provision-tls.sh, idempotent)"
+PROVISION_CERTS_BIN="$BUILD_DIR/provision-certs" "$SCRIPT_DIR/provision-tls.sh"
+
 # Before the restarts, because the units read this file at start. Derived from the sensors' own
 # bind variables rather than hand-maintained in propolis.env, so the fleet pane describes the
 # listeners this box actually runs; see fleet-listeners.sh's header.

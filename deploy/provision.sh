@@ -90,6 +90,10 @@ ensure_dir() {
 
 log "2/9 creating directories"
 ensure_dir /etc/propolis                  0755 root              root
+# Per-sensor TLS key material (deploy/provision-tls.sh). 0711 not 0750: the sensor uids are neither
+# owner nor group, so they need x to open their own key by exact name; without r nobody can list
+# which sensors have TLS. The keys themselves are 0600 owned by their own sensor user.
+ensure_dir /etc/propolis/tls              0711 root              root
 ensure_dir /var/log/propolis              0755 root              root
 ensure_dir /var/log/propolis/catchall     0750 propolis-catchall propolis-catchall
 ensure_dir /var/log/propolis/ssh          0750 propolis-ssh      propolis-ssh

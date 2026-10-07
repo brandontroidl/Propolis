@@ -10,6 +10,7 @@
 #   - deploy/propolis.service                        (the unified daemon)
 #   - deploy/sensor-catchall.service, deploy/sensor-ssh.service   (unchanged from sub-project 2)
 #   - deploy/sensor-{telnet,redis,adb,http,ftp,smtp,tftp,mqtt,cred}.service (sub-project 8 sensors)
+#   - per-sensor self-signed TLS pairs in /etc/propolis/tls (deploy/provision-tls.sh), after the binaries.
 #
 # deploy/intake.service, deploy/review.service, deploy/feed.service, and deploy/console.service are
 # deliberately NOT installed here - internal/design/07-runtime-coordination-deployment.md's "What
@@ -132,6 +133,13 @@ for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor
     fi
     install -m 0755 "$src" "$dst"
 done
+
+# Needs the freshly built release binary (the install loop above deliberately does not install
+# provision-certs: it is a deploy tool, not a service), so it runs here and not inside
+# provision.sh, which runs before binaries exist. Creates no env var; the operator still points
+# each sensor's PROPOLIS_<X>_TLS_CERT/_TLS_KEY at the minted files.
+run_provision_tls() { DRY_RUN="$DRY_RUN" PROVISION_CERTS_BIN="$BUILD_DIR/provision-certs" "$SCRIPT_DIR/provision-tls.sh"; }
+run_provision_tls
 
 # ---- 5. systemd units ----
 

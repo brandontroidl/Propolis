@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Sensor TLS foundation (capability only; no sensor binds TLS yet)** - `sensor-framework` gains
+  a `tls` module: a fail-closed loader for a per-sensor certificate and key (a missing, oversized,
+  non-regular, malformed or mismatched file, or a key readable by group or other, is an error and
+  never a fallback), an implicit-TLS listener that reuses the plain TCP listener's connection
+  bounds and cuts the handshake at the read timeout, and a plaintext-to-TLS stream type for
+  STARTTLS-style upgrades. No client certificates are requested. `provision-certs` gains
+  `--sensor-tls <out-dir> <sensor>...`, which mints one self-signed pair per sensor and keeps a
+  pair that already exists. New `deploy/provision-tls.sh`, run by `install.sh` and `upgrade.sh`
+  after the binaries are installed, mints the pairs into `/etc/propolis/tls`
+  (`0711` root-owned, created by `provision.sh`; keys `0600`, certificates `0644`, both owned by
+  the sensor's user); a real certificate placed at those paths survives re-runs. No sensor reads
+  these files and no TLS port is opened until the per-sensor binds land.
 - **MQTT binary PUBLISH payloads are now spooled** - `sensor-mqtt` still records every PUBLISH as
   metadata, and now also hands a payload that passes the shared `looks_binary` gate to the framework
   capture hand-off, emitting a `honeypot_malware_upload` event (`capture_reason`

@@ -1,6 +1,8 @@
 //! Mints a private CA, a gateway server cert, and a per-collector client cert with
 //! `rcgen`, isolated in its own crate so `rcgen` never enters the daemon dependency
-//! trees (the gateway and shipper only ever load PEMs `provision` already wrote).
+//! trees (the gateway and shipper only ever load PEMs `provision` already wrote). Also mints
+//! per-sensor self-signed TLS leaves (`provision_sensor_tls`) for the honeypot sensors' own TLS
+//! listeners.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -15,6 +17,8 @@ use rcgen::{
 pub enum ProvisionError {
     #[error("collector id is not a safe filename component: {0:?}")]
     InvalidCollectorId(String),
+    #[error("sensor name is not a safe filename component: {0:?}")]
+    InvalidSensorName(String),
     #[error("certificate generation failed: {0}")]
     Rcgen(#[from] rcgen::Error),
     #[error("failed to write {path}: {source}")]
@@ -125,4 +129,59 @@ pub fn provision(out: &Path, gateway_dns: &str, collector_id: &str) -> Result<()
     write(collector_key_path, collector_key.serialize_pem(), 0o600)?;
 
     Ok(())
+}
+
+/// Common name and only SAN of every per-sensor self-signed certificate. Fixed on purpose: a
+/// deploy-host name here would fingerprint the box to anyone who scans the TLS port, and an
+/// operator who wants a real name supplies a real certificate (kept untouched, see below).
+pub const SENSOR_TLS_COMMON_NAME: &str = "localhost";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensorTlsOutcome {
+    /// A new key and self-signed certificate were written.
+    Minted,
+    /// Both files already existed and were left untouched.
+    Kept,
+}
+
+/// Mint a self-signed leaf for one sensor into `out` as `<sensor>.crt` (0644) and `<sensor>.key`
+/// (0600), unless BOTH already exist (an earlier mint or an operator-supplied real certificate),
+/// in which case neither is touched. `out` must already exist (deploy/provision.sh owns its mode).
+/// Existence is judged by `std::fs::metadata` (follows symlinks) being a non-empty regular file, so
+/// an operator's symlink to a real certificate counts as present and is never replaced.
+/// If only one of the pair is present (an interrupted mint), the stray is removed first so a new
+/// pair is never mixed with an old half: a mismatched pair would make the sensor refuse to start
+/// and a re-run would then skip it forever. The certificate is written before the key.
+pub fn provision_sensor_tls(out: &Path, sensor: &str) -> Result<SensorTlsOutcome, ProvisionError> {
+    if !is_safe_path_component(sensor) {
+        return Err(ProvisionError::InvalidSensorName(sensor.to_string()));
+    }
+    let crt_path = out.join(format!("{sensor}.crt"));
+    let key_path = out.join(format!("{sensor}.key"));
+    let present = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0);
+    if present(&crt_path) && present(&key_path) {
+        return Ok(SensorTlsOutcome::Kept);
+    }
+    for stray in [&crt_path, &key_path] {
+        match std::fs::remove_file(stray) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ProvisionError::Io {
+                    path: stray.clone(),
+                    source,
+                });
+            }
+        }
+    }
+    let key = KeyPair::generate()?;
+    let mut params = CertificateParams::new(vec![SENSOR_TLS_COMMON_NAME.to_string()])?;
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, SENSOR_TLS_COMMON_NAME);
+    let cert = params.self_signed(&key)?;
+    write(crt_path, cert.pem(), 0o644)?;
+    write(key_path, key.serialize_pem(), 0o600)?;
+    Ok(SensorTlsOutcome::Minted)
 }

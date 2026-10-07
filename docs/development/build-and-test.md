@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 3150 test functions** (2016 unit + 1134 integration).
+- **Total: 3151 test functions** (2016 unit + 1135 integration).
 - **DB-backed (`sqlx::test`): 208** - console 159, core-scoring 28, intake 7,
   propolis 7, fleet 6, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -140,10 +140,10 @@ Per-crate breakdown:
 | sensor-smtp | 12 | 40 | env_strict, integration, tls |
 | sensor-ssh | 66 | 111 | auth_test, crypto_test, env_strict, integration, shell_test, transport_test |
 | sensor-telnet | 41 | 23 | env_strict, integration |
-| sensor-tftp | 36 | 37 | env_strict, integration |
+| sensor-tftp | 36 | 38 | env_strict, integration, shutdown |
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
-| **Total** | **2016** | **1134** | |
+| **Total** | **2016** | **1135** | |
 
 ### Test styles by layer
 

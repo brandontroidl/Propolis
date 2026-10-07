@@ -791,6 +791,185 @@ impl FakeShell {
         acc.status = u8::from(failed);
         acc
     }
+
+    /// `ls [-l] [-a|-A] [OPERAND...]`. An operand that is a file lists itself, one that is a
+    /// directory its contents (sorted, dotfiles hidden without `-a`), with a `DIR:` heading once
+    /// there is more than one operand; files come before directories, as GNU orders them. `-l` is
+    /// the long listing, from the same node facts `stat` prints, so the two cannot disagree on a
+    /// size or mode. A missing operand is GNU's `cannot access` complaint and status 2.
+    ///
+    /// The short listing joins names with two spaces whatever the output is, as it always has
+    /// here; GNU prints one name per line to a pipe and columns to a terminal [unverified for the
+    /// column widths]. Other options are accepted and ignored.
+    pub(super) fn cmd_ls(&mut self, parts: &[&str]) -> CommandResult {
+        let args = parts.get(1..).unwrap_or(&[]);
+        let show_hidden = args
+            .iter()
+            .any(|a| a.starts_with('-') && (a.contains('a') || a.contains('A')));
+        let long = args
+            .iter()
+            .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('l'));
+        let mut operands: Vec<&str> = args
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('-') || *a == "-")
+            .collect();
+        let headed = operands.len() > 1;
+        if operands.is_empty() {
+            operands.push(".");
+        }
+        let mut errors = String::new();
+        let mut files: Vec<&str> = Vec::new();
+        let mut dirs: Vec<&str> = Vec::new();
+        for operand in operands {
+            let path = self.resolve_logical(operand);
+            // A link named as an operand is listed as a link by `-l`, and followed otherwise.
+            let Some(stat) = self.fs.stat(&path, !long) else {
+                errors.push_str(&format!(
+                    "ls: cannot access '{operand}': No such file or directory\n"
+                ));
+                continue;
+            };
+            if stat.kind == FileKind::Directory {
+                dirs.push(operand);
+            } else {
+                files.push(operand);
+            }
+        }
+        files.sort_unstable();
+        dirs.sort_unstable();
+
+        let mut out = String::new();
+        if !files.is_empty() {
+            let entries: Vec<(String, String)> = files
+                .iter()
+                .map(|file| ((*file).to_string(), (*file).to_string()))
+                .collect();
+            match self.ls_group(&entries, long, false) {
+                Ok(text) => out.push_str(&text),
+                Err(()) => return stopped(),
+            }
+        }
+        for dir in dirs {
+            let logical = self.resolve_logical(dir);
+            let mut names = self.fs.list_dir(&logical).unwrap_or_default();
+            if !show_hidden {
+                names.retain(|name| !name.starts_with('.'));
+            }
+            names.sort();
+            let entries: Vec<(String, String)> = names
+                .into_iter()
+                .map(|name| {
+                    let typed = if logical == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{logical}/{name}")
+                    };
+                    (name, typed)
+                })
+                .collect();
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            if headed {
+                out.push_str(&format!("{dir}:\n"));
+            }
+            match self.ls_group(&entries, long, true) {
+                Ok(text) => out.push_str(&text),
+                Err(()) => return stopped(),
+            }
+        }
+
+        let status = if errors.is_empty() { 0 } else { 2 };
+        let mut result = CommandResult::silent(status);
+        result.append(CommandResult::stderr(status, errors));
+        result.append(CommandResult::one(
+            super::OutputFd::Stdout,
+            status,
+            out.into_bytes(),
+        ));
+        result
+    }
+
+    /// One group of `ls` output: `entries` are (name shown, path), listed as they come. A long
+    /// listing of a directory's contents starts with its `total` in 1 KiB blocks, as GNU's does.
+    fn ls_group(
+        &mut self,
+        entries: &[(String, String)],
+        long: bool,
+        in_directory: bool,
+    ) -> Result<String, ()> {
+        if !long {
+            if entries.is_empty() {
+                return Ok(String::new());
+            }
+            let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+            return Ok(names.join("  ") + "\n");
+        }
+        let mut rows = Vec::with_capacity(entries.len());
+        for (name, typed) in entries {
+            if let Some(facts) = self.node_facts(typed, false)? {
+                rows.push((name.as_str(), facts));
+            }
+        }
+        let now = (self.clock)().timestamp();
+        let size_of = |facts: &Facts| match facts.stat.kind {
+            FileKind::CharDevice => format!("{}, {}", facts.rdev.0, facts.rdev.1),
+            _ => facts.size.to_string(),
+        };
+        let width = |column: &dyn Fn(&Facts) -> usize| {
+            rows.iter()
+                .map(|(_, facts)| column(facts))
+                .max()
+                .unwrap_or(0)
+        };
+        let links_w = width(&|f| f.links.to_string().len());
+        let user_w = width(&|f| f.uid_name.chars().count());
+        let group_w = width(&|f| f.gid_name.chars().count());
+        let size_w = width(&|f| size_of(f).len());
+        let mut out = String::new();
+        if in_directory {
+            let blocks = rows
+                .iter()
+                .map(|(_, facts)| facts.blocks)
+                .fold(0u64, u64::saturating_add);
+            out.push_str(&format!("total {}\n", ceil_div(blocks, 2)));
+        }
+        for (name, facts) in &rows {
+            let shown = match &facts.link {
+                Some(target) => format!("{name} -> {target}"),
+                None => (*name).to_string(),
+            };
+            out.push_str(&format!(
+                "{} {:>links_w$} {:<user_w$} {:<group_w$} {:>size_w$} {} {shown}\n",
+                mode_string(facts.stat.mode, facts.stat.kind),
+                facts.links,
+                facts.uid_name,
+                facts.gid_name,
+                size_of(facts),
+                ls_time(facts.stat.mtime, now, self.dialect()),
+            ));
+        }
+        Ok(out)
+    }
+}
+
+/// The time column of `ls -l`. GNU shows the time of day for a file modified within the last six
+/// months (and not in the future) and the year otherwise; toybox shows an ISO date
+/// [unverified for toybox].
+fn ls_time(mtime: i64, now: i64, dialect: Dialect) -> String {
+    const SIX_MONTHS: i64 = 15_778_476;
+    let Some(time) = DateTime::from_timestamp(mtime, 0) else {
+        return "Jan  1  1970".to_string();
+    };
+    if dialect == Dialect::Toybox {
+        return time.format("%Y-%m-%d %H:%M").to_string();
+    }
+    if mtime > now.saturating_sub(SIX_MONTHS) && mtime <= now {
+        time.format("%b %e %H:%M").to_string()
+    } else {
+        time.format("%b %e  %Y").to_string()
+    }
 }
 
 /// `-c` ends its output with a newline, `--printf` does not.

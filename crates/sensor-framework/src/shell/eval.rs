@@ -259,12 +259,31 @@ impl ShellState {
 /// Where a command's standard input comes from.
 #[derive(Debug, Clone)]
 pub(super) enum Stdin {
-    /// The terminal: nothing more to read without another input line.
+    /// The terminal as [`FakeShell::handle_input`] models it: nothing more to read without
+    /// another input line, so a reader sees end of input at once.
     Terminal,
-    Data {
-        bytes: Vec<u8>,
-        pos: usize,
-    },
+    /// A pipe, a here-document or a file: all of it is here.
+    Data { bytes: Vec<u8>, pos: usize },
+    /// The session's own input to a line that reads it (an SSH exec channel, or the terminal of
+    /// a shell run through [`FakeShell::start_line`]), as much of it as has arrived.
+    Session(SessionInput),
+}
+
+/// The session input a line reads: what has arrived, whether more can, and whether a reader asked
+/// for more than had arrived. That last fact is the whole of the shell's decision that a line
+/// waits for its input: a command that never reads standard input never sets it, whatever its
+/// name, and one that does sets it by reading, through the same calls every reader makes.
+#[derive(Debug, Clone)]
+pub(super) struct SessionInput {
+    bytes: Vec<u8>,
+    pos: usize,
+    /// Nothing more will arrive: a read past the end sees end of input, as it does on a pipe.
+    eof: bool,
+    /// The input is a terminal: a bare `sh` opens an interactive level on it rather than reading
+    /// a script from it.
+    tty: bool,
+    /// A read wanted more than had arrived while more still could.
+    blocked: bool,
 }
 
 impl Stdin {
@@ -272,15 +291,52 @@ impl Stdin {
         Self::Data { bytes, pos: 0 }
     }
 
+    pub(super) fn session(bytes: Vec<u8>, eof: bool, tty: bool) -> Self {
+        Self::Session(SessionInput {
+            bytes,
+            pos: 0,
+            eof,
+            tty,
+            blocked: false,
+        })
+    }
+
+    /// The unread bytes and the read position, or `None` for the terminal.
+    fn unread(&mut self) -> Option<(&[u8], &mut usize)> {
+        match self {
+            Self::Terminal => None,
+            Self::Data { bytes, pos } => Some((bytes.get(*pos..).unwrap_or(&[]), pos)),
+            Self::Session(input) => {
+                Some((input.bytes.get(input.pos..).unwrap_or(&[]), &mut input.pos))
+            }
+        }
+    }
+
+    /// Note that a reader asked for more than has arrived, when more still can.
+    fn want_more(&mut self) {
+        if let Self::Session(input) = self
+            && !input.eof
+        {
+            input.blocked = true;
+        }
+    }
+
+    /// Whether a reader of this session input has asked for more than had arrived.
+    pub(super) fn is_blocked(&self) -> bool {
+        matches!(self, Self::Session(input) if input.blocked)
+    }
+
+    /// How far into the session input the readers have got, `None` for any other input.
+    pub(super) fn session_pos(&self) -> Option<usize> {
+        match self {
+            Self::Session(input) => Some(input.pos),
+            _ => None,
+        }
+    }
+
     /// The next line without its newline, and whether a newline ended it. `None` at end of input.
     pub(super) fn read_line(&mut self) -> Option<(Vec<u8>, bool)> {
-        let Self::Data { bytes, pos } = self else {
-            return None;
-        };
-        let rest = bytes.get(*pos..).unwrap_or(&[]);
-        if rest.is_empty() {
-            return None;
-        }
+        let (rest, pos) = self.unread()?;
         let (line, ended) = match rest.iter().position(|&b| b == b'\n') {
             Some(end) => (rest.get(..end).unwrap_or(&[]).to_vec(), true),
             None => (rest.to_vec(), false),
@@ -288,29 +344,46 @@ impl Stdin {
         *pos = pos
             .saturating_add(line.len())
             .saturating_add(usize::from(ended));
-        Some((line, ended))
+        if !ended {
+            self.want_more();
+        }
+        (ended || !line.is_empty()).then_some((line, ended))
     }
 
     /// Up to `n` bytes not yet read, so a reader that stops early leaves the rest for the next.
     pub(super) fn take(&mut self, n: u64) -> Vec<u8> {
-        let Self::Data { bytes, pos } = self else {
+        let Some((rest, pos)) = self.unread() else {
             return Vec::new();
         };
-        let rest = bytes.get(*pos..).unwrap_or(&[]);
-        let want = usize::try_from(n).unwrap_or(usize::MAX).min(rest.len());
+        let asked = usize::try_from(n).unwrap_or(usize::MAX);
+        let want = asked.min(rest.len());
         let taken = rest.get(..want).unwrap_or(&[]).to_vec();
         *pos = pos.saturating_add(want);
+        if want < asked {
+            self.want_more();
+        }
         taken
     }
 
     /// Everything not yet read.
     pub(super) fn take_rest(&mut self) -> Vec<u8> {
-        let Self::Data { bytes, pos } = self else {
+        let Some((rest, pos)) = self.unread() else {
             return Vec::new();
         };
-        let rest = bytes.get(*pos..).unwrap_or(&[]).to_vec();
-        *pos = bytes.len();
-        rest
+        let taken = rest.to_vec();
+        *pos = pos.saturating_add(taken.len());
+        self.want_more();
+        taken
+    }
+
+    /// A script piped to a bare `sh`: everything not yet read, or `None` when the input is a
+    /// terminal, which a bare `sh` reads as an interactive shell instead.
+    pub(super) fn take_script(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Self::Terminal => None,
+            Self::Session(input) if input.tty => None,
+            Self::Data { .. } | Self::Session(_) => Some(self.take_rest()),
+        }
     }
 }
 
@@ -720,6 +793,7 @@ impl FakeShell {
             .stdin
             .take()
             .map(|stdin| std::mem::replace(&mut self.stdin, stdin));
+        let outer_mark = std::mem::replace(&mut self.input_mark, self.stdin.session_pos());
         let result = match command {
             Command::Subshell { body, .. } => self.eval_subshell(body),
             Command::Brace { body, .. } => self.eval_list(body),
@@ -741,7 +815,9 @@ impl FakeShell {
         if let Some(previous) = saved {
             self.stdin = previous;
         }
-        self.route(result, &plan, "sh")
+        let routed = self.route(result, &plan, "sh");
+        self.input_mark = outer_mark;
+        routed
     }
 
     fn eval_subshell(&mut self, body: &List) -> CommandResult {
@@ -926,7 +1002,18 @@ impl FakeShell {
             .stdin
             .take()
             .map(|stdin| std::mem::replace(&mut self.stdin, stdin));
+        let outer_mark = std::mem::replace(&mut self.input_mark, self.stdin.session_pos());
+        let was_blocked = self.stdin.is_blocked();
         let mut result = self.dispatch(&refs);
+        // A command whose input was cut off (Ctrl-C, a closed channel) dies at the read it was
+        // waiting in, and the signal ends the rest of the line with it.
+        if !was_blocked
+            && self.stdin.is_blocked()
+            && let Some(status) = self.input_interrupt
+        {
+            result.status = status;
+            result.stop_line = true;
+        }
         // Charged here, once per command and before output is routed, so bytes a redirection
         // sends to a file cost the line as much as bytes sent to the terminal, and a re-entrant
         // command's output is not counted twice.
@@ -947,7 +1034,11 @@ impl FakeShell {
             }
         }
         let writer = refs.first().map_or("sh", |arg| command_basename(arg));
-        self.route(result, &plan, writer)
+        // Routed before the mark goes back, so a file this command's output lands in is known to
+        // hold what it read from the session input.
+        let routed = self.route(result, &plan, writer);
+        self.input_mark = outer_mark;
+        routed
     }
 
     /// What an expansion that failed leaves: its own message and status 1, or, for a refusal by

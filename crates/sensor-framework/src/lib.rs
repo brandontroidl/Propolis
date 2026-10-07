@@ -17,6 +17,7 @@ pub mod emit;
 pub mod env;
 pub mod fakefs;
 pub mod handoff;
+pub mod held_input;
 pub mod listener;
 pub mod logging;
 pub mod outbox;
@@ -45,6 +46,10 @@ pub use env::{EnvError, env_with_legacy, strict_env_var};
 pub use handoff::{
     CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome,
     END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, UploadEnd, upload_metadata,
+};
+pub use held_input::{
+    CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureSource, Fed, HeldEnd, HeldInput,
+    InputMode, MAX_HELD_CAPTURES, StdinCaptures,
 };
 pub use listener::{listener_start_error, run_tcp_listener, run_udp_listener, shutdown_signal};
 pub use logging::init_logging;

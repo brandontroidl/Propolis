@@ -1760,16 +1760,385 @@ fn watch_user_reads_every_sensor_log_and_nothing_more_by_default() {
 #[test]
 fn both_deploy_scripts_install_the_watcher_binary() {
     for script in ["install.sh", "upgrade.sh"] {
-        let text = deploy_file(script);
-        let loop_line = text
-            .lines()
-            .find(|l| l.trim_start().starts_with("for bin in "))
-            .unwrap_or_else(|| panic!("{script} has no binary install loop"));
         assert!(
-            loop_line
-                .split_whitespace()
-                .any(|t| t.trim_end_matches(';') == "propolis-watch"),
+            install_bin_list(script).contains("propolis-watch"),
             "{script} does not install propolis-watch"
+        );
+    }
+}
+
+/// The names in `INSTALL_BINS=(...)` of a deploy script: the one list its install loop and its
+/// post-install check both walk.
+fn install_bin_list(script: &str) -> std::collections::BTreeSet<String> {
+    let text = deploy_file(script);
+    let list = text
+        .lines()
+        .find_map(|l| l.strip_prefix("INSTALL_BINS=("))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("{script} has no single-line INSTALL_BINS=(...) at column 0"));
+    list.split_whitespace().map(str::to_string).collect()
+}
+
+/// Every binary target in the workspace, derived from the crates themselves: a crate with a
+/// `src/main.rs` builds the `[[bin]]` names its manifest declares, or the package name when it
+/// declares none.
+fn workspace_binaries() -> std::collections::BTreeSet<String> {
+    let crates_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    let mut bins = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&crates_dir).expect("failed to read crates/") {
+        let dir = entry.expect("failed to read a crates/ entry").path();
+        if !dir.join("Cargo.toml").is_file() {
+            continue;
+        }
+        assert!(
+            !dir.join("src/bin").exists(),
+            "{} has src/bin/, which this derivation does not read; extend it before adding one",
+            dir.display()
+        );
+        if !dir.join("src/main.rs").is_file() {
+            continue;
+        }
+        let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        let quoted_name = |l: &str| {
+            l.trim()
+                .strip_prefix("name")
+                .and_then(|r| r.trim_start().strip_prefix('='))
+                .map(|r| r.trim().trim_matches('"').to_string())
+        };
+        let mut section = "";
+        let mut declared = Vec::new();
+        let mut package = None;
+        for line in manifest.lines() {
+            let t = line.trim();
+            if t.starts_with('[') {
+                section = if t == "[[bin]]" {
+                    "bin"
+                } else if t == "[package]" {
+                    "package"
+                } else {
+                    ""
+                };
+            } else if section == "bin" {
+                declared.extend(quoted_name(t));
+            } else if section == "package" {
+                package = package.or_else(|| quoted_name(t));
+            }
+        }
+        if declared.is_empty() {
+            declared
+                .push(package.unwrap_or_else(|| panic!("{} has no package name", dir.display())));
+        }
+        bins.extend(declared);
+    }
+    assert!(bins.len() >= 15, "the workspace walk is broken: {bins:?}");
+    bins
+}
+
+/// Workspace binaries that are deliberately not installed to /usr/local/bin. A binary added to the
+/// workspace belongs in neither place by default: it fails the test below until someone either
+/// adds it to the install lists or lists it here with the reason.
+const NOT_INSTALLED_BINS: [&str; 5] = [
+    // Superseded by the unified `propolis` daemon in production; kept for development only
+    // (install.sh's header, "What gets retired").
+    "intake",
+    "review",
+    "feed",
+    "console",
+    // A deploy tool run from the build directory by provision-tls.sh (PROVISION_CERTS_BIN), not a
+    // service.
+    "provision-certs",
+];
+
+/// A release that adds a binary to the workspace but not to the install lists leaves that binary
+/// built and never installed (the `propolis-watch` outage: upgrade.sh built it and installed from
+/// a list that did not name it). Both sides are derived from the files at test time. The install
+/// lists differ in exactly the gateway and shipper, which only upgrade.sh installs (a fresh single
+/// box has no unit for them; the split-deployment roles install them through upgrade.sh).
+#[test]
+fn install_lists_cover_exactly_the_workspace_binaries_meant_to_be_installed() {
+    let expected: std::collections::BTreeSet<String> = workspace_binaries()
+        .into_iter()
+        .filter(|b| !NOT_INSTALLED_BINS.contains(&b.as_str()))
+        .collect();
+    for excluded in NOT_INSTALLED_BINS {
+        assert!(
+            workspace_binaries().contains(excluded),
+            "NOT_INSTALLED_BINS names {excluded}, which is no longer a workspace binary"
+        );
+    }
+
+    let upgrade = install_bin_list("upgrade.sh");
+    assert_eq!(
+        upgrade, expected,
+        "upgrade.sh's INSTALL_BINS must be exactly the workspace binaries meant to be installed"
+    );
+
+    let install = install_bin_list("install.sh");
+    let upgrade_only: std::collections::BTreeSet<String> =
+        upgrade.difference(&install).cloned().collect();
+    assert_eq!(
+        upgrade_only,
+        ["gateway", "shipper"].map(String::from).into(),
+        "install.sh and upgrade.sh must differ only by the split-deployment gateway and shipper"
+    );
+    assert!(
+        install.is_subset(&upgrade),
+        "install.sh installs a binary upgrade.sh does not"
+    );
+}
+
+/// The lines of `upgrade.sh` between its pull-and-reexec markers.
+fn pull_and_reexec_block() -> String {
+    let text = deploy_file("upgrade.sh");
+    let mut inside = false;
+    let mut block = String::new();
+    for line in text.lines() {
+        match line {
+            "# END pull-and-reexec" => inside = false,
+            _ if inside => {
+                block.push_str(line);
+                block.push('\n');
+            }
+            "# BEGIN pull-and-reexec" => inside = true,
+            _ => {}
+        }
+    }
+    assert!(!block.is_empty(), "upgrade.sh has no pull-and-reexec block");
+    block
+}
+
+/// The re-exec has to happen before anything that depends on the script's own content: the build,
+/// the binary list, the provisioning and the restarts. After the pull and before all of them.
+#[test]
+fn upgrade_script_reexecs_after_the_pull_and_before_any_build_or_install() {
+    let upgrade = deploy_file("upgrade.sh");
+    let lines: Vec<&str> = upgrade.lines().collect();
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(needle))
+            .unwrap_or_else(|| panic!("upgrade.sh has no line starting with `{needle}`"))
+    };
+    let pull = at("sudo -u \"$(stat -c '%U' \"$REPO_DIR\")\" git pull");
+    let reexec = at("exec \"$BASH\" \"$SCRIPT_DIR/upgrade.sh\" \"$@\"");
+    let build = at("sudo -u \"$(stat -c '%U' \"$REPO_DIR\")\" cargo build");
+    let first_install = at("install -m 0755");
+    let provision = at("\"$SCRIPT_DIR/provision.sh\"");
+    let first_restart = at("systemctl restart");
+    assert!(
+        pull < reexec
+            && reexec < build
+            && build < first_install
+            && first_install < provision
+            && provision < first_restart,
+        "the re-exec (line {}) must follow the pull (line {}) and precede the build (line {}), \
+         the installs (line {}), provisioning (line {}) and the restarts (line {})",
+        reexec + 1,
+        pull + 1,
+        build + 1,
+        first_install + 1,
+        provision + 1,
+        first_restart + 1
+    );
+    let block = pull_and_reexec_block();
+    assert!(block.contains("PROPOLIS_UPGRADE_REEXEC"));
+    assert!(
+        block.contains("sha256sum"),
+        "the re-exec must be conditional on the file changing"
+    );
+}
+
+struct ReexecRun {
+    output: std::process::Output,
+    pulls: usize,
+}
+
+/// Runs a copy of the real pull-and-reexec block as `deploy/upgrade.sh` of a throwaway tree, with
+/// a stub `sudo` standing in for `sudo -u <owner> git pull`. The stub counts pulls and, when
+/// `pull_rewrites_script`, rewrites the running script the way a pull of a release that changes
+/// upgrade.sh does. The script ends in a `CONTINUED` line so the output shows how many times
+/// execution got past the block.
+fn run_pull_and_reexec(pull_rewrites_script: bool, env: &[(&str, &str)]) -> ReexecRun {
+    let tmp = tempfile::tempdir().unwrap();
+    let deploy = tmp.path().join("deploy");
+    let stubs = tmp.path().join("stubs");
+    std::fs::create_dir_all(&deploy).unwrap();
+    std::fs::create_dir_all(&stubs).unwrap();
+    let pull_log = tmp.path().join("pulls.log");
+    let script = deploy.join("upgrade.sh");
+    write_executable(
+        &script,
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\n\
+             SCRIPT_DIR=\"$(cd \"$(dirname \"${{BASH_SOURCE[0]}}\")\" && pwd)\"\n\
+             REPO_DIR=\"$(cd \"$SCRIPT_DIR/..\" && pwd)\"\n\
+             echo ENTERED\n\
+             {}\
+             echo \"CONTINUED pulled_at=$PULLED_AT args=$* guard=${{PROPOLIS_UPGRADE_REEXEC:-none}}\"\n",
+            pull_and_reexec_block()
+        ),
+    );
+    // `sudo -u <owner> git pull`: record it, and optionally change the script like a real pull.
+    write_executable(
+        &stubs.join("sudo"),
+        "#!/bin/sh\n[ \"$1\" = \"-u\" ] && [ \"$3\" = \"git\" ] && [ \"$4\" = \"pull\" ] || exit 64\n\
+         echo pull >> \"$PULL_LOG\"\n\
+         [ \"$(wc -l < \"$PULL_LOG\")\" -le 3 ] || exit 70\n\
+         [ -z \"$PULL_REWRITES_SCRIPT\" ] || printf '# changed by pull\\n' >> \"$UPGRADE_SCRIPT\"\n",
+    );
+    let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+    let mut cmd = std::process::Command::new(&script);
+    cmd.args(["--flag", "value"])
+        .env("PATH", path)
+        .env("PULL_LOG", &pull_log)
+        .env("UPGRADE_SCRIPT", &script)
+        .env_remove("PROPOLIS_UPGRADE_REEXEC")
+        .env_remove("PROPOLIS_UPGRADE_PULLED_AT");
+    if pull_rewrites_script {
+        cmd.env("PULL_REWRITES_SCRIPT", "1");
+    } else {
+        cmd.env_remove("PULL_REWRITES_SCRIPT");
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("failed to run the fixture upgrade.sh");
+    let pulls = std::fs::read_to_string(&pull_log)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    ReexecRun { output, pulls }
+}
+
+/// How many times the script started: a re-exec starts it a second time, where merely setting the
+/// guard variable and carrying on does not.
+fn script_starts(run: &ReexecRun) -> usize {
+    String::from_utf8_lossy(&run.output.stdout)
+        .lines()
+        .filter(|l| *l == "ENTERED")
+        .count()
+}
+
+fn continued_lines(run: &ReexecRun) -> Vec<String> {
+    String::from_utf8_lossy(&run.output.stdout)
+        .lines()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The defect: a pull that replaces upgrade.sh must not leave the rest of the upgrade running from
+/// the old copy. The stub rewrites the script on EVERY pull, so a re-executed run that pulled again
+/// would loop; the guard has to hold it to exactly one pull, one pass through the rest of the
+/// script, the original arguments, and the first run's pull timestamp.
+#[test]
+fn upgrade_reexecs_once_when_the_pull_changes_the_script_and_does_not_pull_again() {
+    let run = run_pull_and_reexec(true, &[]);
+    assert!(
+        run.output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.output.stderr)
+    );
+    assert_eq!(run.pulls, 1, "the re-executed run must not pull again");
+    assert_eq!(
+        script_starts(&run),
+        2,
+        "the changed script must be exec'd anew"
+    );
+    let continued = continued_lines(&run);
+    assert_eq!(
+        continued.len(),
+        1,
+        "stdout: {}",
+        String::from_utf8_lossy(&run.output.stdout)
+    );
+    assert!(
+        continued[0].ends_with("args=--flag value guard=1"),
+        "the surviving run must be the re-executed one, with the original arguments: {continued:?}"
+    );
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    assert!(stdout.contains("re-executing the new version"), "{stdout}");
+    let pulled_at = continued[0]
+        .strip_prefix("CONTINUED pulled_at=")
+        .and_then(|r| r.split_once(' '))
+        .map(|(t, _)| t)
+        .unwrap();
+    assert!(
+        pulled_at.len() == 20 && pulled_at.ends_with('Z') && pulled_at.as_bytes()[10] == b'T',
+        "the stamp's PULLED_AT must be the pull's UTC timestamp, got {pulled_at:?}"
+    );
+}
+
+#[test]
+fn upgrade_does_not_reexec_when_the_pull_leaves_the_script_unchanged() {
+    let run = run_pull_and_reexec(false, &[]);
+    assert!(run.output.status.success());
+    assert_eq!(run.pulls, 1);
+    let continued = continued_lines(&run);
+    assert_eq!(continued.len(), 1);
+    assert!(continued[0].ends_with("guard=none"), "{continued:?}");
+    assert_eq!(script_starts(&run), 1);
+    assert!(
+        !String::from_utf8_lossy(&run.output.stdout).contains("re-executing"),
+        "an unchanged script must not be re-executed"
+    );
+}
+
+/// The guard alone skips the pull, takes PULLED_AT from the environment, and fails closed when the
+/// timestamp is missing rather than stamping an empty or invented one.
+#[test]
+fn upgrade_guard_skips_the_pull_and_requires_the_carried_timestamp() {
+    let run = run_pull_and_reexec(
+        true,
+        &[
+            ("PROPOLIS_UPGRADE_REEXEC", "1"),
+            ("PROPOLIS_UPGRADE_PULLED_AT", "2026-01-02T03:04:05Z"),
+        ],
+    );
+    assert!(run.output.status.success());
+    assert_eq!(run.pulls, 0, "the guard must skip the pull");
+    assert_eq!(
+        continued_lines(&run),
+        ["CONTINUED pulled_at=2026-01-02T03:04:05Z args=--flag value guard=1"]
+    );
+
+    let run = run_pull_and_reexec(true, &[("PROPOLIS_UPGRADE_REEXEC", "1")]);
+    assert!(
+        !run.output.status.success(),
+        "a guarded run with no carried timestamp must abort"
+    );
+    assert_eq!(run.pulls, 0);
+    assert!(continued_lines(&run).is_empty());
+}
+
+/// Both loops run under `set -e` with an explicit check, so a listed binary the build did not
+/// produce stops the upgrade before the stamp and the restarts, and a binary absent from
+/// /usr/local/bin afterwards is caught before any service is restarted onto it.
+#[test]
+fn upgrade_script_fails_on_a_missing_binary_before_the_restarts() {
+    let upgrade = deploy_file("upgrade.sh");
+    let lines: Vec<&str> = upgrade.lines().map(str::trim_start).collect();
+    let src_check = lines
+        .iter()
+        .position(|l| l.starts_with("if [ ! -x \"$BUILD_DIR/$bin\" ]"))
+        .expect("upgrade.sh does not check each built binary exists before installing it");
+    let dst_check = lines
+        .iter()
+        .position(|l| l.starts_with("if [ ! -x \"/usr/local/bin/$bin\" ]"))
+        .expect("upgrade.sh has no post-install check of /usr/local/bin");
+    let stamp = lines
+        .iter()
+        .position(|l| l.contains("\"$SCRIPT_DIR/deploy-stamp.sh\""))
+        .unwrap();
+    let first_restart = lines
+        .iter()
+        .position(|l| l.starts_with("systemctl restart"))
+        .unwrap();
+    assert!(src_check < dst_check && dst_check < stamp && stamp < first_restart);
+    for check in [src_check, dst_check] {
+        assert!(
+            lines[check..check + 4].contains(&"exit 1"),
+            "the check at line {} must exit non-zero",
+            check + 1
         );
     }
 }

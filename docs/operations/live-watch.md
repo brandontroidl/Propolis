@@ -130,6 +130,19 @@ write `authorized_keys`, cannot write `.ssh`, and cannot rename `.ssh` aside, be
 own its home. sshd's StrictModes accepts this, since it asks only that the key file and the
 directories above it be owned by root or the user and writable by no one else (sshd(8), FILES).
 
+**Never point the watcher at the honeypot's SSH listener.** On a honeypot host, port 22 is
+usually `sensor-ssh`, the fake SSH sensor (`PROPOLIS_SSH_BIND`; see
+[ports and protocols](../reference/ports-and-protocols.md)), not the administrative sshd. A
+connection there lands in the fake shell, runs no forced command and reaches no log. Every example below uses `-p <admin-port>`: the
+port of the real sshd, which an operator who moved it off 22 to make room for the sensor knows
+already, and which this finds on the honeypot:
+
+```
+sudo ss -ltnp | grep sshd
+```
+
+Use the port of the `sshd` process, not of any `sensor-ssh` listener.
+
 On Debian, step by step:
 
 1. **On the reading machine**, generate a key used for nothing else:
@@ -175,13 +188,19 @@ On Debian, step by step:
    `/etc/ssh/sshd_config.d/`) sets `AllowUsers` or `AllowGroups`, add `propolis-watch` or its
    group, then `sudo sshd -t && sudo systemctl reload ssh`. With neither set, nothing changes.
 
-5. **From the reading machine**, connect. Arguments go after `--`:
+5. **From the reading machine**, connect to the real sshd on `<admin-port>`. Arguments go after
+   `--`:
 
    ```
-   ssh -i ~/.ssh/propolis_watch propolis-watch@honeypot
-   ssh -i ~/.ssh/propolis_watch propolis-watch@honeypot -- --sensor ssh
-   ssh -i ~/.ssh/propolis_watch propolis-watch@honeypot -- --signal honeypot_login_attempt --since-start
+   ssh -p <admin-port> -i ~/.ssh/propolis_watch propolis-watch@honeypot
+   ssh -p <admin-port> -i ~/.ssh/propolis_watch propolis-watch@honeypot -- --sensor ssh
+   ssh -p <admin-port> -i ~/.ssh/propolis_watch propolis-watch@honeypot -- --signal honeypot_login_attempt --since-start
    ```
+
+   A key protected by a passphrase cannot be used by an unattended reader, which has nobody to
+   type it: load it into an agent first with `ssh-add ~/.ssh/propolis_watch`, and the reader
+   connects through that agent. The alternative, a key with no passphrase, is a file that grants
+   read access to the event ledger's raw input to whoever copies it.
 
    The first line printed is the `start` record and the second a heartbeat; check its `files` for
    any `missing` or `unreadable` log. Closing the connection ends the watcher within one heartbeat

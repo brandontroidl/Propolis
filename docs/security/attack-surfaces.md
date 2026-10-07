@@ -265,7 +265,8 @@ systemd timer or cron unit. See [../operations/deployment-models.md](../operatio
 
 ## Live watch (`propolis-watch` over SSH)
 
-An operator-installed read path, not a listener Propolis opens: the honeypot's own sshd accepts
+An operator-installed read path, not a listener Propolis opens: the honeypot host's administrative
+sshd (not `sensor-ssh`, which is the fake SSH sensor and often holds port 22) accepts
 one dedicated key for the `propolis-watch` account and runs the watcher as that key's forced
 command. Absent until the operator adds a key to `/var/lib/propolis-watch/.ssh/authorized_keys`;
 `deploy/provision.sh` creates the account and the empty `.ssh` directory, never a key. Setup:

@@ -572,7 +572,21 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   UDP and TCP on the same `ip:port`: the sensor is off until an operator sets it, and if either
   transport cannot bind it exits 1 with nothing left listening. A UDP datagram's handling is cut
   at the read timeout. There are no spool, outbox or collector-id variables: the sensor captures
-  no bodies.
+  no bodies. Four more variables set the UDP reply rate limit
+  (`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`), each a positive `u32` where
+  zero or a non-number aborts startup (a rate can never be configured off):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_DNS_REPLY_RATE_PER_SOURCE` | `5` (`sensor-dns/src/main.rs#DEFAULT_REPLY_RATE_PER_SOURCE`) | UDP datagrams answered per second per source network (the IPv4 /24 or IPv6 /56). |
+  | `PROPOLIS_DNS_REPLY_BURST_PER_SOURCE` | `10` (`sensor-dns/src/main.rs#DEFAULT_REPLY_BURST_PER_SOURCE`) | How many a quiet source network may send at once before the per-second rate applies. |
+  | `PROPOLIS_DNS_REPLY_RATE_GLOBAL` | `1000` (`sensor-dns/src/main.rs#DEFAULT_REPLY_RATE_GLOBAL`) | UDP datagrams answered per second across every source. |
+  | `PROPOLIS_DNS_REPLY_BURST_GLOBAL` | `2000` (`sensor-dns/src/main.rs#DEFAULT_REPLY_BURST_GLOBAL`) | The global burst. |
+
+  The limit applies to UDP only; a TCP or DoT client is proven by its handshake. A datagram over
+  either budget gets no reply and no event of its own; it is counted in one `rate_limited`
+  summary event per source network per 10 s (see
+  [sensor-behavior](sensor-behavior.md#sensor-dns)).
 - http: `PROPOLIS_HTTP_READ_TIMEOUT_MS`, `PROPOLIS_HTTP_IDLE_TIMEOUT_MS`,
   `PROPOLIS_HTTP_MAX_DURATION_SECS`, `PROPOLIS_HTTP_MAX_CAPTURED_BYTES`,
   `PROPOLIS_HTTP_MAX_CONCURRENT`, `PROPOLIS_HTTP_LOG_PATH`, `PROPOLIS_HTTP_WAN_MAP`, and the

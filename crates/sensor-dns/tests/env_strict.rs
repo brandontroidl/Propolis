@@ -19,6 +19,10 @@ const VARS: &[&str] = &[
     "PROPOLIS_DNS_MAX_DURATION_SECS",
     "PROPOLIS_DNS_MAX_CAPTURED_BYTES",
     "PROPOLIS_DNS_MAX_CONCURRENT",
+    "PROPOLIS_DNS_REPLY_RATE_PER_SOURCE",
+    "PROPOLIS_DNS_REPLY_BURST_PER_SOURCE",
+    "PROPOLIS_DNS_REPLY_RATE_GLOBAL",
+    "PROPOLIS_DNS_REPLY_BURST_GLOBAL",
 ];
 
 /// Runs the sensor with a valid minimal config plus `bad` set to non-UTF-8 bytes (if given), and

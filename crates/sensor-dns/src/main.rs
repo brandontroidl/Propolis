@@ -9,11 +9,14 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, EnvError, WanResolver, shutdown_signal};
+use sensor_framework::{
+    ConnectionBounds, EnvError, Rate, RateLimitConfig, WanResolver, shutdown_signal,
+};
 
 const ENV_BIND: &str = "PROPOLIS_DNS_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_DNS_WAN_MAP";
@@ -26,6 +29,10 @@ const ENV_MAX_CONCURRENT: &str = "PROPOLIS_DNS_MAX_CONCURRENT";
 const ENV_TLS_BIND: &str = "PROPOLIS_DNS_TLS_BIND";
 const ENV_TLS_CERT: &str = "PROPOLIS_DNS_TLS_CERT";
 const ENV_TLS_KEY: &str = "PROPOLIS_DNS_TLS_KEY";
+const ENV_REPLY_RATE_PER_SOURCE: &str = "PROPOLIS_DNS_REPLY_RATE_PER_SOURCE";
+const ENV_REPLY_BURST_PER_SOURCE: &str = "PROPOLIS_DNS_REPLY_BURST_PER_SOURCE";
+const ENV_REPLY_RATE_GLOBAL: &str = "PROPOLIS_DNS_REPLY_RATE_GLOBAL";
+const ENV_REPLY_BURST_GLOBAL: &str = "PROPOLIS_DNS_REPLY_BURST_GLOBAL";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/dns/events.jsonl";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
@@ -35,6 +42,14 @@ const DEFAULT_MAX_DURATION_SECS: u64 = 120;
 const DEFAULT_MAX_CAPTURED_BYTES: u64 = 262_144;
 /// Applied separately to the UDP handler pool, the TCP listener and the DoT listener.
 const DEFAULT_MAX_CONCURRENT: u32 = 256;
+/// UDP datagrams answered (and logged one by one) per second per source /24 or /56.
+const DEFAULT_REPLY_RATE_PER_SOURCE: u32 = 5;
+const DEFAULT_REPLY_BURST_PER_SOURCE: u32 = 10;
+/// UDP datagrams answered per second across every source.
+const DEFAULT_REPLY_RATE_GLOBAL: u32 = 1000;
+const DEFAULT_REPLY_BURST_GLOBAL: u32 = 2000;
+/// How long shutdown waits to write the rate-limited summaries still accumulating.
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -42,6 +57,7 @@ struct Config {
     wan_map: HashMap<IpAddr, IpAddr>,
     log_path: PathBuf,
     bounds: ConnectionBounds,
+    rate: RateLimitConfig,
     tls: Option<TlsConfig>,
 }
 
@@ -154,6 +170,20 @@ fn parse_positive_u32(
     }
 }
 
+/// A reply rate or burst: unset takes `default`; zero or unparseable is an error, so a rate can
+/// never be configured off.
+fn parse_rate_value(
+    raw: Option<&str>,
+    default: u32,
+    field: &'static str,
+) -> Result<NonZeroU32, ConfigError> {
+    let value = parse_positive_u32(raw, default, field)?;
+    NonZeroU32::new(value).ok_or(ConfigError::InvalidBound {
+        field,
+        value: value.to_string(),
+    })
+}
+
 /// `None` only when nothing TLS-related is configured. A bind without the pair, or exactly one of
 /// the pair, is an error so the sensor refuses to start rather than run without the TLS that was
 /// asked for. A pair without a bind parses (the caller still validates the files) but yields no
@@ -226,6 +256,18 @@ fn load_config_from(
         ENV_MAX_CONCURRENT,
     )?;
 
+    let rate = |var: &'static str, default: u32| -> Result<NonZeroU32, ConfigError> {
+        parse_rate_value(get(var)?.as_deref(), default, var)
+    };
+    let per_source = Rate::new(
+        rate(ENV_REPLY_RATE_PER_SOURCE, DEFAULT_REPLY_RATE_PER_SOURCE)?,
+        rate(ENV_REPLY_BURST_PER_SOURCE, DEFAULT_REPLY_BURST_PER_SOURCE)?,
+    );
+    let global = Rate::new(
+        rate(ENV_REPLY_RATE_GLOBAL, DEFAULT_REPLY_RATE_GLOBAL)?,
+        rate(ENV_REPLY_BURST_GLOBAL, DEFAULT_REPLY_BURST_GLOBAL)?,
+    );
+
     let tls = parse_tls(
         get(ENV_TLS_BIND)?.as_deref(),
         get(ENV_TLS_CERT)?.as_deref(),
@@ -236,6 +278,7 @@ fn load_config_from(
         bind_addr,
         wan_map,
         log_path,
+        rate: RateLimitConfig::new(per_source, global),
         tls,
         bounds: ConnectionBounds {
             read_timeout: Duration::from_millis(read_timeout_ms),
@@ -294,6 +337,7 @@ async fn main() {
         config.log_path.clone(),
         wan_resolver.clone(),
         config.bounds.clone(),
+        config.rate,
     )
     .await
     {
@@ -322,8 +366,7 @@ async fn main() {
                     Some(handle)
                 }
                 Err(e) => {
-                    plain.udp_handle.abort();
-                    plain.tcp_handle.abort();
+                    plain.abort();
                     let e = sensor_framework::listener_start_error(addr, e);
                     tracing::error!("sensor-dns: {e}; refusing to start");
                     std::process::exit(1);
@@ -335,10 +378,17 @@ async fn main() {
 
     shutdown_signal().await;
     tracing::info!("sensor-dns: shutdown signal received; stopping");
-    plain.udp_handle.abort();
-    plain.tcp_handle.abort();
+    plain.abort();
     if let Some(h) = tls_handle {
         h.abort();
+    }
+    // The listeners are stopped, so the ledger can only shrink: write what it holds, bounded by
+    // its fixed capacity and by this timeout.
+    if tokio::time::timeout(SHUTDOWN_FLUSH_TIMEOUT, plain.flush_rate_limited())
+        .await
+        .is_err()
+    {
+        tracing::warn!("sensor-dns: rate-limited summaries not all written before shutdown");
     }
 }
 
@@ -415,7 +465,63 @@ mod tests {
         assert_eq!(c.bounds.max_duration, Duration::from_secs(120));
         assert_eq!(c.bounds.max_captured_bytes, 262_144);
         assert_eq!(c.bounds.max_concurrent, 256);
+        assert_eq!(
+            (c.rate.per_source.per_second(), c.rate.per_source.burst()),
+            (5, 10)
+        );
+        assert_eq!(
+            (c.rate.global.per_second(), c.rate.global.burst()),
+            (1000, 2000)
+        );
         assert_eq!(c.tls, None);
+    }
+
+    const RATES: [&str; 4] = [
+        ENV_REPLY_RATE_PER_SOURCE,
+        ENV_REPLY_BURST_PER_SOURCE,
+        ENV_REPLY_RATE_GLOBAL,
+        ENV_REPLY_BURST_GLOBAL,
+    ];
+
+    #[test]
+    fn a_zero_or_non_numeric_reply_rate_is_an_error_not_a_disabled_limit() {
+        for field in RATES {
+            for bad in ["0", "-5", "fast", "4294967296"] {
+                assert_eq!(
+                    load_config_from(env(&[BIND, (field, bad)])).unwrap_err(),
+                    ConfigError::InvalidBound {
+                        field,
+                        value: bad.to_string()
+                    },
+                    "{field}={bad}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reply_rates_load_each_from_its_own_variable_and_blank_takes_the_default() {
+        let c = load_config_from(env(&[
+            BIND,
+            (ENV_REPLY_RATE_PER_SOURCE, "7"),
+            (ENV_REPLY_BURST_PER_SOURCE, "11"),
+            (ENV_REPLY_RATE_GLOBAL, "300"),
+            (ENV_REPLY_BURST_GLOBAL, "450"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (c.rate.per_source.per_second(), c.rate.per_source.burst()),
+            (7, 11)
+        );
+        assert_eq!(
+            (c.rate.global.per_second(), c.rate.global.burst()),
+            (300, 450)
+        );
+        let mut pairs = vec![BIND];
+        pairs.extend(RATES.iter().map(|f| (*f, " ")));
+        let blank = load_config_from(env(&pairs)).unwrap();
+        let defaults = load_config_from(env(&[BIND])).unwrap();
+        assert_eq!(blank.rate, defaults.rate);
     }
 
     #[test]

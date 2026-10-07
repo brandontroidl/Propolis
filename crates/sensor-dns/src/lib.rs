@@ -3,7 +3,10 @@
 //! the same REFUSED reply, the query's header rewritten and its question echoed, nothing appended
 //! (see [`protocol::refused_reply`]). A UDP reply is therefore never larger than the query that
 //! caused it, and [`guarded`] holds the crate's single UDP send site behind a byte budget and a
-//! source-address gate. The sensor never opens an outbound connection.
+//! source-address gate. UDP datagrams are also rate limited per source network and in total
+//! (`sensor_framework::rate_limit`): one over its budget gets no reply and no event of its own,
+//! only a share of one bounded summary event per source network per window. The sensor never
+//! opens an outbound connection.
 //!
 //! `main.rs` and the tests both start the sensor through [`start_test_server`] and
 //! [`start_test_server_tls`], so the tests exercise the code the binary runs.
@@ -19,15 +22,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use sensor_framework::{
-    ConnectionBounds, EventEmitter, PerSourceLimiter, TlsServer, WanResolver,
-    default_per_source_cap, run_tcp_listener, run_tls_listener,
+    ConnectionBounds, EventEmitter, FloodLedger, PerSourceLimiter, RateLimitConfig,
+    ReplyRateLimiter, TlsServer, WanResolver, default_per_source_cap, run_tcp_listener,
+    run_tls_listener,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use guarded::ReplySocket;
-use udp::UdpSensor;
+use udp::{UdpFlood, UdpSensor};
 
 /// Shared per-listener state handed to every handler.
 #[derive(Clone)]
@@ -43,17 +47,40 @@ pub struct PlainListeners {
     pub tcp: SocketAddr,
     pub udp_handle: JoinHandle<()>,
     pub tcp_handle: JoinHandle<()>,
+    /// Emits rate-limited summaries as their windows end.
+    pub summary_handle: JoinHandle<()>,
+    sensor: Arc<UdpSensor>,
+    flood: Arc<UdpFlood>,
+}
+
+impl PlainListeners {
+    /// Stop serving: no datagram or connection is taken after this returns.
+    pub fn abort(&self) {
+        self.udp_handle.abort();
+        self.tcp_handle.abort();
+        self.summary_handle.abort();
+    }
+
+    /// Emit every rate-limited summary still accumulating, due or not. Bounded by the summary
+    /// table's fixed capacity; called at shutdown after [`PlainListeners::abort`].
+    pub async fn flush_rate_limited(&self) {
+        self.sensor
+            .emit_summaries(self.flood.ledger.drain(), self.flood.ledger.window())
+            .await;
+    }
 }
 
 /// Bind UDP and TCP on the same ip:port and serve both. UDP is bound first but not served until
 /// TCP binds too, so a failed TCP bind drops the UDP socket before returning: nothing is left
 /// listening on a half-started sensor. With port 0 the TCP bind on the port UDP drew may collide
-/// with another process, so the pair is retried a few times.
+/// with another process, so the pair is retried a few times. `rate` bounds UDP only: a TCP or
+/// DoT source is proven by its handshake and cannot aim the sensor at a third party.
 pub async fn start_test_server(
     addr: SocketAddr,
     log_path: PathBuf,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
+    rate: RateLimitConfig,
 ) -> std::io::Result<PlainListeners> {
     let ctx = Ctx {
         emitter: Arc::new(EventEmitter::new(log_path)),
@@ -87,12 +114,27 @@ pub async fn start_test_server(
                 });
                 let semaphore = Arc::new(Semaphore::new(bounds.max_concurrent as usize));
                 let limiter = PerSourceLimiter::new(per_source_cap);
-                let udp_handle = tokio::spawn(udp::serve(socket, sensor, semaphore, limiter));
+                let flood = Arc::new(UdpFlood {
+                    limiter: ReplyRateLimiter::new(&rate),
+                    ledger: FloodLedger::new(&rate),
+                });
+                let udp_handle = tokio::spawn(udp::serve(
+                    socket,
+                    sensor.clone(),
+                    semaphore,
+                    limiter,
+                    flood.clone(),
+                ));
+                let summary_handle =
+                    tokio::spawn(udp::emit_due_summaries(sensor.clone(), flood.clone()));
                 return Ok(PlainListeners {
                     udp: udp_bound,
                     tcp: tcp_bound,
                     udp_handle,
                     tcp_handle,
+                    summary_handle,
+                    sensor,
+                    flood,
                 });
             }
             Err(e)

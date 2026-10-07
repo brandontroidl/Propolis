@@ -114,11 +114,23 @@ pub enum Sent {
 /// The listening socket's reply side.
 pub struct ReplySocket {
     socket: Arc<UdpSocket>,
+    /// Sends attempted, so in-crate tests can prove a suppressed reply never reached the socket.
+    #[cfg(test)]
+    sends: std::sync::atomic::AtomicUsize,
 }
 
 impl ReplySocket {
     pub fn new(socket: Arc<UdpSocket>) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            #[cfg(test)]
+            sends: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sends(&self) -> usize {
+        self.sends.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Re-runs [`reply_gate`], then the crate's single `send_to`, to exactly `peer` as
@@ -128,6 +140,9 @@ impl ReplySocket {
         if let Err(reason) = reply_gate(peer, query_len, reply.len()) {
             return Sent::Refused(reason);
         }
+        #[cfg(test)]
+        self.sends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.socket.send_to(reply, peer).await {
             Ok(_) => Sent::Ok,
             Err(e) => Sent::Failed(e),
@@ -225,6 +240,26 @@ mod tests {
         let peer = addr("198.51.100.9:40000");
         assert_eq!(reply_gate(peer, 20, 21), Err(SuppressReason::ByteBudget));
         assert_eq!(reply_gate(peer, 20, 20), Ok(()));
+    }
+
+    /// `send_reply` re-applies the whole gate, not only the size check, so a caller that skipped
+    /// the gate still cannot answer a reflective port or an unroutable source.
+    #[tokio::test]
+    async fn send_reply_regates_ports_and_sources_before_the_socket() {
+        let reply = ReplySocket::new(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        for (peer, reason) in [
+            ("198.51.100.9:7", SuppressReason::ReflectiveSourcePort),
+            ("198.51.100.9:0", SuppressReason::ReflectiveSourcePort),
+            ("255.255.255.255:5353", SuppressReason::UnroutableSource),
+            ("[::ffff:224.0.0.1]:5353", SuppressReason::UnroutableSource),
+            ("[ff02::1]:5353", SuppressReason::UnroutableSource),
+        ] {
+            match reply.send_reply(addr(peer), 30, &[0u8; 30]).await {
+                Sent::Refused(got) => assert_eq!(got, reason, "{peer}"),
+                other => panic!("{peer}: {other:?}"),
+            }
+        }
+        assert_eq!(reply.sends(), 0);
     }
 
     #[tokio::test]

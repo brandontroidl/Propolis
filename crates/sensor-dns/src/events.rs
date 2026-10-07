@@ -1,4 +1,5 @@
-//! Event records for the DNS sensor: one per query (UDP, TCP or DoT), one per TCP/DoT connection.
+//! Event records for the DNS sensor: one per query (UDP, TCP or DoT), one per TCP/DoT connection,
+//! and one per source network per window for UDP datagrams the rate limit refused.
 //!
 //! UDP query events are `honeypot_connection` over `udp`: a UDP source is forgeable, so the
 //! lower-weight signal is used, as `sensor-tftp` does. TCP and DoT query events are
@@ -7,14 +8,16 @@
 //! (`probe_signals`), never a `signal_type`. Nothing here performs I/O.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
-use chrono::Utc;
-use sensor_framework::{Uuid, sanitize_value};
+use chrono::{DateTime, SecondsFormat, Utc};
+use sensor_framework::{FloodSummary, Uuid, sanitize_value};
 use sensor_wire::{
     PROTO_TCP, PROTO_UDP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION, SensorEvent,
     WIRE_VERSION,
 };
 use serde_json::{Map, Value, json};
+use tokio::time::Instant;
 
 use crate::guarded::SuppressReason;
 use crate::protocol::{
@@ -249,6 +252,53 @@ pub fn connection_event(
         source_ip,
         wan_ip,
         session_id,
+    )
+}
+
+/// One source network's UDP datagrams that got no reply and no event of their own over one
+/// window because the reply rate limit refused them. `honeypot_connection` over `udp` like a
+/// single UDP query; `source_ip` is the first address seen from the network in the window and
+/// `source_prefix` names the network (`"overflow"` for networks that arrived while the summary
+/// table was full). `first_seen` and `last_seen` are wall-clock times reconstructed from the
+/// monotonic instants at emission.
+pub fn rate_limited_event(
+    s: &FloodSummary,
+    wan_ip: Option<IpAddr>,
+    window: Duration,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+) -> SensorEvent {
+    let wall = |at: Instant| {
+        let ago = chrono::Duration::from_std(now.saturating_duration_since(at)).unwrap_or_default();
+        (now_utc - ago).to_rfc3339_opts(SecondsFormat::Millis, true)
+    };
+    let source_prefix = match s.key {
+        Some(key) => key.to_string(),
+        None => "overflow".to_string(),
+    };
+    let metadata = json!({
+        "protocol_label": PROTOCOL_LABEL,
+        "transport": Transport::Udp.label(),
+        "query_status": "rate_limited",
+        "source_prefix": source_prefix,
+        "suppressed_count": s.count,
+        "suppressed_bytes": s.bytes,
+        "per_source_limited": s.source_limited,
+        "global_limited": s.global_limited,
+        "first_seen": wall(s.first_seen),
+        "last_seen": wall(s.last_seen),
+        "window_secs": window.as_secs_f64(),
+        "samples": s.samples,
+        "distinct_sources": s.distinct_sources as u64,
+        "distinct_sources_capped": s.distinct_sources_capped,
+    });
+    event(
+        SIGNAL_HONEYPOT_CONNECTION,
+        PROTO_UDP,
+        metadata,
+        s.first_source,
+        wan_ip,
+        Uuid::now_v7(),
     )
 }
 
@@ -502,6 +552,49 @@ mod tests {
         assert_eq!(c_dot.metadata["tls"], true);
         assert_eq!(c_plain.signal_type, SIGNAL_HONEYPOT_CONNECTION);
         assert_eq!(c_plain.protocol, PROTO_TCP);
+    }
+
+    #[test]
+    fn rate_limited_event_shape() {
+        let now = Instant::now();
+        let now_utc: DateTime<Utc> = "2026-10-07T12:00:10Z".parse().unwrap();
+        let mut s = FloodSummary {
+            key: Some(sensor_framework::SourceKey::V4([198, 51, 100])),
+            first_source: "198.51.100.9".parse().unwrap(),
+            count: 500,
+            bytes: 14_500,
+            source_limited: 490,
+            global_limited: 10,
+            first_seen: now - Duration::from_secs(10),
+            last_seen: now - Duration::from_millis(250),
+            samples: vec!["ANY example.com.".into()],
+            distinct_sources: 3,
+            distinct_sources_capped: false,
+        };
+        let e = rate_limited_event(&s, None, Duration::from_secs(10), now, now_utc);
+        assert_eq!(e.signal_type, SIGNAL_HONEYPOT_CONNECTION);
+        assert_eq!(e.protocol, PROTO_UDP);
+        assert_eq!(e.source_ip, s.first_source);
+        let md = &e.metadata;
+        assert_eq!(md["query_status"], "rate_limited");
+        assert_eq!(md["transport"], "udp");
+        assert_eq!(md["source_prefix"], "198.51.100.0/24");
+        assert_eq!(md["suppressed_count"], 500);
+        assert_eq!(md["suppressed_bytes"], 14_500);
+        assert_eq!(md["per_source_limited"], 490);
+        assert_eq!(md["global_limited"], 10);
+        assert_eq!(md["first_seen"], "2026-10-07T12:00:00.000Z");
+        assert_eq!(md["last_seen"], "2026-10-07T12:00:09.750Z");
+        assert_eq!(md["window_secs"], 10.0);
+        assert_eq!(md["samples"], json!(["ANY example.com."]));
+        assert_eq!(md["distinct_sources"], 3);
+        assert_eq!(md["distinct_sources_capped"], false);
+        for absent in ["qname", "rcode", "reply_len", "tls", "command"] {
+            assert!(md.get(absent).is_none(), "{absent}");
+        }
+        s.key = None;
+        let overflow = rate_limited_event(&s, None, Duration::from_secs(10), now, now_utc);
+        assert_eq!(overflow.metadata["source_prefix"], "overflow");
     }
 
     #[test]

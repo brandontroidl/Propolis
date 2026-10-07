@@ -3,12 +3,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_dns::PlainListeners;
-use sensor_framework::{ConnectionBounds, WanResolver};
+use sensor_framework::{ConnectionBounds, Rate, RateLimitConfig, WanResolver};
 use sensor_wire::{
     PROTO_TCP, PROTO_UDP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION, SensorEvent,
 };
@@ -43,6 +44,19 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
+fn rate(per_second: u32, burst: u32, global: u32, global_burst: u32) -> RateLimitConfig {
+    let nz = |n| NonZeroU32::new(n).unwrap();
+    RateLimitConfig::new(
+        Rate::new(nz(per_second), nz(burst)),
+        Rate::new(nz(global), nz(global_burst)),
+    )
+}
+
+/// Limits no ordinary test comes near, so only the flood tests see rate limiting.
+fn unlimited() -> RateLimitConfig {
+    rate(1_000_000, 1_000_000, 1_000_000, 1_000_000)
+}
+
 impl Server {
     async fn start() -> Server {
         Server::start_with(test_bounds(), HashMap::new()).await
@@ -52,6 +66,14 @@ impl Server {
         bounds: ConnectionBounds,
         wan: HashMap<std::net::IpAddr, std::net::IpAddr>,
     ) -> Server {
+        Server::start_rated(bounds, wan, unlimited()).await
+    }
+
+    async fn start_rated(
+        bounds: ConnectionBounds,
+        wan: HashMap<std::net::IpAddr, std::net::IpAddr>,
+        rate: RateLimitConfig,
+    ) -> Server {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("events.jsonl");
         let listeners = sensor_dns::start_test_server(
@@ -59,6 +81,7 @@ impl Server {
             log.clone(),
             Arc::new(WanResolver::new(wan)),
             bounds,
+            rate,
         )
         .await
         .unwrap();
@@ -746,6 +769,7 @@ async fn a_taken_tcp_port_fails_start_and_leaves_no_udp_listener() {
         dir.path().join("e.jsonl"),
         Arc::new(WanResolver::new(HashMap::new())),
         test_bounds(),
+        unlimited(),
     )
     .await;
     assert!(result.is_err(), "start must fail when TCP cannot bind");
@@ -764,16 +788,188 @@ async fn a_taken_udp_port_fails_start() {
         dir.path().join("e.jsonl"),
         Arc::new(WanResolver::new(HashMap::new())),
         test_bounds(),
+        unlimited(),
     )
     .await;
     assert!(result.is_err());
 }
 
+// UDP rate limiting.
+
+fn status_count(events: &[SensorEvent], status: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| md(e, "query_status") == status)
+        .count()
+}
+
+fn suppressed_total(events: &[SensorEvent]) -> u64 {
+    events
+        .iter()
+        .filter(|e| md(e, "query_status") == "rate_limited")
+        .map(|e| md(e, "suppressed_count").as_u64().unwrap())
+        .sum()
+}
+
+/// Send `n` queries back to back and collect every reply that arrives within `settle` of the
+/// last one. Returns the replies and the time from the first send to the end of collection.
+/// Each send yields so the server drains its socket as it goes: a test runtime has one thread,
+/// and the kernel would otherwise drop what overflows the socket's receive buffer.
+async fn flood(client: &Client, to: SocketAddr, n: u16, settle: Duration) -> (usize, Duration) {
+    let started = std::time::Instant::now();
+    for id in 0..n {
+        client.send(to, &example(id)).await;
+        tokio::task::yield_now().await;
+    }
+    let mut replies = 0;
+    while client.recv_within(settle).await.is_some() {
+        replies += 1;
+    }
+    (replies, started.elapsed())
+}
+
+#[tokio::test]
+async fn a_udp_flood_gets_at_most_burst_plus_rate_replies_and_summary_events_not_one_each() {
+    let mut limits = rate(5, 10, 100_000, 100_000);
+    limits.summary_window = Duration::from_millis(400);
+    let server = Server::start_rated(test_bounds(), HashMap::new(), limits).await;
+    let client = Client::new().await;
+    let sent = 300u16;
+    let (replies, elapsed) = flood(
+        &client,
+        server.listeners.udp,
+        sent,
+        Duration::from_millis(300),
+    )
+    .await;
+    let ceiling = 10 + (5.0 * elapsed.as_secs_f64()).ceil() as usize;
+    assert!(
+        (10..=ceiling).contains(&replies),
+        "{replies} replies in {elapsed:?}; at most {ceiling} allowed"
+    );
+
+    // Every datagram is accounted for: answered ones one event each, the rest in summaries.
+    let expected_suppressed = u64::from(sent) - replies as u64;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while suppressed_total(&server.events()) < expected_suppressed {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "summaries cover {} of {expected_suppressed}",
+            suppressed_total(&server.events())
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let events = server.events();
+    assert_eq!(suppressed_total(&events), expected_suppressed);
+    assert_eq!(status_count(&events, "answered"), replies);
+    let summaries: Vec<&SensorEvent> = events
+        .iter()
+        .filter(|e| md(e, "query_status") == "rate_limited")
+        .collect();
+    // One summary per window the flood touched, never one per datagram.
+    assert!(
+        !summaries.is_empty() && summaries.len() <= 4,
+        "{} summaries",
+        summaries.len()
+    );
+    assert_eq!(events.len(), replies + summaries.len(), "no other events");
+    let s = summaries[0];
+    assert_eq!(s.signal_type, SIGNAL_HONEYPOT_CONNECTION);
+    assert_eq!(s.protocol, PROTO_UDP);
+    assert_eq!(md(s, "source_prefix"), "127.0.0.0/24");
+    assert_eq!(s.source_ip, client.socket.local_addr().unwrap().ip());
+    assert_eq!(md(s, "distinct_sources"), 1);
+    let samples = md(s, "samples").as_array().unwrap();
+    assert!(!samples.is_empty() && samples.len() <= 8, "{samples:?}");
+    assert_eq!(samples[0], "A example.com.");
+    assert!(
+        md(s, "suppressed_bytes").as_u64().unwrap()
+            >= md(s, "suppressed_count").as_u64().unwrap() * 29
+    );
+}
+
+#[tokio::test]
+async fn a_second_network_is_answered_while_the_first_is_limited() {
+    let server =
+        Server::start_rated(test_bounds(), HashMap::new(), rate(1, 2, 100_000, 100_000)).await;
+    let flooder = Client::new().await;
+    let (replies, _) = flood(
+        &flooder,
+        server.listeners.udp,
+        50,
+        Duration::from_millis(200),
+    )
+    .await;
+    assert!(replies <= 3, "{replies}");
+    // 127.0.1.0/24 is a different source network on the same loopback interface.
+    let other = Client {
+        socket: UdpSocket::bind("127.0.1.1:0").await.unwrap(),
+    };
+    for id in [900u16, 901] {
+        other.send(server.listeners.udp, &example(id)).await;
+        let (reply, _) = other.recv().await;
+        assert_eq!(u16::from_be_bytes([reply[0], reply[1]]), id);
+    }
+    // The flooder is still limited.
+    flooder.send(server.listeners.udp, &example(999)).await;
+    flooder.assert_silent(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn the_global_budget_limits_many_networks_together() {
+    let server = Server::start_rated(test_bounds(), HashMap::new(), rate(1000, 1000, 1, 3)).await;
+    let mut answered = 0;
+    for net in 1..=6u8 {
+        let client = Client {
+            socket: UdpSocket::bind(format!("127.0.{net}.1:0")).await.unwrap(),
+        };
+        client
+            .send(server.listeners.udp, &example(u16::from(net)))
+            .await;
+        if client
+            .recv_within(Duration::from_millis(200))
+            .await
+            .is_some()
+        {
+            answered += 1;
+        }
+    }
+    assert!((3..=4).contains(&answered), "{answered} of 6 answered");
+}
+
+#[tokio::test]
+async fn shutdown_flushes_the_summaries_still_accumulating() {
+    let mut limits = rate(1, 1, 100_000, 100_000);
+    limits.summary_window = Duration::from_secs(3600);
+    let server = Server::start_rated(test_bounds(), HashMap::new(), limits).await;
+    let client = Client::new().await;
+    let (replies, _) = flood(
+        &client,
+        server.listeners.udp,
+        20,
+        Duration::from_millis(200),
+    )
+    .await;
+    assert_eq!(replies, 1);
+    assert_eq!(
+        status_count(&server.events(), "rate_limited"),
+        0,
+        "the window has not ended"
+    );
+    server.listeners.abort();
+    server.listeners.flush_rate_limited().await;
+    let events = server.events();
+    assert_eq!(status_count(&events, "rate_limited"), 1);
+    assert_eq!(suppressed_total(&events), 19);
+}
+
 // Static checks.
 
+/// The source up to its test module. Only the `#[cfg(test)] mod tests` block is cut: a
+/// `#[cfg(test)]` item elsewhere (the send counter in guarded.rs) stays in the scanned text.
 fn non_test_source(path: &Path) -> String {
     let text = std::fs::read_to_string(path).unwrap();
-    match text.find("#[cfg(test)]") {
+    match text.find("#[cfg(test)]\nmod tests") {
         Some(at) => text[..at].to_string(),
         None => text,
     }
@@ -833,7 +1029,7 @@ fn never_amplifies_static_check() {
             ".send(",
             ".try_send(",
             ".try_send_to(",
-            ".poll_send_to(",
+            "poll_send",
             ".write(",
             ".write_buf(",
             ".write_vectored(",
@@ -844,7 +1040,8 @@ fn never_amplifies_static_check() {
                 "{name} must not use {banned}: the only writes are the guarded send and the framed write"
             );
         }
-        send_sites.extend(src.match_indices(".send_to(").map(|_| name.clone()));
+        // Without the dot, so a UFCS call (`UdpSocket::send_to(&s, ..)`) counts as a site too.
+        send_sites.extend(src.match_indices("send_to(").map(|_| name.clone()));
         write_sites.extend(src.match_indices(".write_all(").map(|_| name.clone()));
         if name != "lib.rs" {
             assert!(

@@ -953,7 +953,7 @@ per-protocol bind var is required.
 | **vnc** (`vnc.rs`) | RFB 3.8, VNC Auth type 2 (5900) | Sends a 16-byte random challenge, reads the DES response; the attempt is the signal (plaintext unrecoverable) → `honeypot_login_attempt` with no username (`crates/sensor-cred/src/vnc.rs#handle_connection`). |
 | **mysql** (`mysql.rs`) | MySQL 5.7.42 (3306) | Sends a greeting with per-connection random thread id + 20-byte scramble, parses the username from HandshakeResponse41, drops the password → login event (`crates/sensor-cred/src/mysql.rs#handle_connection`, `crates/sensor-cred/src/mysql.rs#build_greeting`). |
 | **mssql** (`mssql.rs`) | SQL Server 2019 (15.0.16.57) TDS (1433) | PreLogin/Login7; parses the UTF-16LE username from Login7, sends LOGINACK (`crates/sensor-cred/src/mssql.rs#handle_connection`, `crates/sensor-cred/src/mssql.rs#parse_login7_username`, `crates/sensor-cred/src/mssql.rs#build_loginack`). |
-| **postgresql** (`postgresql.rs`) | PostgreSQL (5432) | StartupMessage (an SSLRequest is declined with `N`, or accepted with `S` when TLS is configured, see below), parses the `user` param, sends AuthenticationMD5Password with a per-connection random salt, reads and discards the PasswordMessage → login event; then AuthenticationOk, a PostgreSQL 14 ParameterStatus set, BackendKeyData and ReadyForQuery, and a query loop: each simple query → `honeypot_command_exec` with the statement text, answered `ERROR 42501 permission denied` and ReadyForQuery, until Terminate, 200 statements, or the byte budget. Extended protocol: Parse records the SQL and answers ParseComplete; Bind, Describe (ParameterDescription then NoData for a statement, NoData for a portal) and Close get their completions; Execute is refused with 42501 and everything after it, a simple Query included, is discarded until Sync. |
+| **postgresql** (`postgresql.rs`) | PostgreSQL (5432) | StartupMessage (a GSSENCRequest is declined with `N`; an SSLRequest is declined with `N`, or accepted with `S` when TLS is configured, see below), parses the `user` param, sends AuthenticationMD5Password with a per-connection random salt, reads and discards the PasswordMessage → login event; then AuthenticationOk, a PostgreSQL 14 ParameterStatus set, BackendKeyData and ReadyForQuery, and a query loop: each simple query → `honeypot_command_exec` with the statement text, answered `ERROR 42501 permission denied` and ReadyForQuery, until Terminate, 200 statements, or the byte budget. Extended protocol: Parse records the SQL and answers ParseComplete; Bind, Describe (ParameterDescription then NoData for a statement, NoData for a portal) and Close get their completions; Execute is refused with 42501 and everything after it, a simple Query included, is discarded until Sync. |
 | **mongodb** (`mongodb.rs`) | MongoDB OP_MSG (27017) | Answers isMaster/hello; on saslStart/authenticate extracts the SCRAM `n=<user>` or BSON `user` → login event (`crates/sensor-cred/src/mongodb.rs#handle_connection`, `crates/sensor-cred/src/mongodb.rs#extract_scram_username`, `crates/sensor-cred/src/mongodb.rs#extract_bson_string`). |
 
 - Every cred protocol emits `honeypot_connection` + `honeypot_login_attempt`
@@ -982,8 +982,15 @@ per-protocol bind var is required.
     StartupMessage and PasswordMessage sent after `S` get at most a TLS alert, never a PostgreSQL
     reply, and no login event
     (`crates/sensor-cred/tests/tls_integration.rs#pg_plaintext_after_s_is_dropped`). A second
-    SSLRequest inside TLS closes the connection. Without the pair the answer is the unchanged `N`. A GSSENCRequest is not answered
-    `N` the way a real server without GSSAPI answers it; that is a known gap.
+    SSLRequest inside TLS closes the connection. Without the pair the answer is the unchanged `N`.
+    A GSSENCRequest (code 80877104, sent first by libpq with its default `gssencmode=prefer`) is
+    answered with a single `N`, with or without the pair, and the sensor keeps reading: the client
+    then sends an SSLRequest (answered as above) or a plain StartupMessage
+    (`crates/sensor-cred/src/postgresql.rs#handle_connection`). As in PostgreSQL's own startup
+    handling, each request kind is honoured at most once per connection and none inside TLS, so
+    at most two negotiation packets precede the StartupMessage; a repeated request closes the
+    connection without a reply
+    (`crates/sensor-cred/tests/tls_integration.rs#pg_repeated_negotiation_requests_close_the_connection`).
   - **mysql:** the greeting advertises `CLIENT_SSL` (0x0800) only when the pair is set. A 32-byte
     SSLRequest packet carrying that flag switches the session to TLS before the
     HandshakeResponse41, which then arrives over TLS and is answered OK with sequence id 3 (greeting

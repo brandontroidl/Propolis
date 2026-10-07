@@ -19,6 +19,9 @@ use crate::{with_tls, write_flush};
 const PROTOCOL_LABEL: &str = "postgresql";
 const MAX_STARTUP_MSG: usize = 65536;
 const SSL_REQUEST_CODE: i32 = 80_877_103;
+/// Sent first by libpq with `gssencmode=prefer` (its default) when built with GSSAPI, then
+/// followed by an SSLRequest or a plain StartupMessage on the same connection.
+const GSSENC_REQUEST_CODE: i32 = 80_877_104;
 
 // PostgreSQL message types (server -> client)
 const AUTH_MD5_PASSWORD: i32 = 5;
@@ -49,79 +52,76 @@ pub async fn handle_connection(
 
     let timeout = bounds.read_timeout;
 
-    // 1. Read StartupMessage (no message type byte - just length + protocol + params)
-    let mut len_buf = [0u8; 4];
-    if timed_read_exact(&mut stream, &mut len_buf, timeout)
-        .await
-        .is_err()
-    {
-        return;
-    }
-    let msg_len = i32::from_be_bytes(len_buf) as usize;
-    if !(8..=MAX_STARTUP_MSG).contains(&msg_len) {
-        return;
-    }
-
-    let mut body = vec![0u8; msg_len - 4];
-    if timed_read_exact(&mut stream, &mut body, timeout)
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    // Check protocol version (3.0 = 196608)
-    if body.len() < 4 {
-        return;
-    }
-    let protocol = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-
-    if protocol == SSL_REQUEST_CODE {
-        match starttls.as_ref() {
-            Some(tls) => {
-                if write_flush(&mut stream, b"S").await.is_err() {
-                    return;
-                }
-                // Every read above is an exact-length read on the raw socket with no user-space
-                // buffer, so no plaintext sent after the SSLRequest can be replayed into the TLS
-                // session: a server that reads bytes buffered behind the SSLRequest as if they
-                // had arrived inside TLS lets an on-path party inject commands ahead of the
-                // handshake. After `S` there is no plaintext fallback.
-                stream = match stream.upgrade(tls, timeout).await {
-                    Ok(upgraded) => upgraded,
-                    Err(_) => return,
-                };
-            }
-            None => {
-                if write_flush(&mut stream, b"N").await.is_err() {
-                    return;
-                }
-            }
-        }
-        // The client now sends its StartupMessage, inside TLS if upgraded.
-        let mut len_buf2 = [0u8; 4];
-        if timed_read_exact(&mut stream, &mut len_buf2, timeout)
+    // 1. Read the StartupMessage (no message type byte - just length + protocol + params), after
+    // any SSLRequest or GSSENCRequest a driver sends first. Like PostgreSQL's own
+    // ProcessStartupPacket, each negotiation request is honoured at most once per connection and
+    // not at all inside TLS, so at most two precede the real startup (GSSENCRequest, then
+    // SSLRequest) and a client that keeps negotiating is closed rather than looped forever.
+    let mut ssl_done = false;
+    let mut gss_done = false;
+    let body = loop {
+        let mut len_buf = [0u8; 4];
+        if timed_read_exact(&mut stream, &mut len_buf, timeout)
             .await
             .is_err()
         {
             return;
         }
-        let msg_len2 = i32::from_be_bytes(len_buf2) as usize;
-        if !(8..=MAX_STARTUP_MSG).contains(&msg_len2) {
+        let msg_len = i32::from_be_bytes(len_buf) as usize;
+        if !(8..=MAX_STARTUP_MSG).contains(&msg_len) {
             return;
         }
-        body = vec![0u8; msg_len2 - 4];
+
+        let mut body = vec![0u8; msg_len - 4];
         if timed_read_exact(&mut stream, &mut body, timeout)
             .await
             .is_err()
         {
             return;
         }
-        // A second SSLRequest inside TLS is not a startup message; a real server refuses it.
-        if stream.is_tls() && body[..4] == SSL_REQUEST_CODE.to_be_bytes() {
-            return;
+
+        // `msg_len >= 8` makes the 4-byte protocol code always present. Protocol 3.0 is 196608.
+        let protocol = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+        match protocol {
+            SSL_REQUEST_CODE if !ssl_done && !stream.is_tls() => {
+                ssl_done = true;
+                match starttls.as_ref() {
+                    Some(tls) => {
+                        if write_flush(&mut stream, b"S").await.is_err() {
+                            return;
+                        }
+                        // Every read above is an exact-length read on the raw socket with no
+                        // user-space buffer, so no plaintext sent after the SSLRequest can be
+                        // replayed into the TLS session: a server that reads bytes buffered
+                        // behind the SSLRequest as if they had arrived inside TLS lets an
+                        // on-path party inject commands ahead of the handshake. After `S` there
+                        // is no plaintext fallback.
+                        stream = match stream.upgrade(tls, timeout).await {
+                            Ok(upgraded) => upgraded,
+                            Err(_) => return,
+                        };
+                    }
+                    None => {
+                        if write_flush(&mut stream, b"N").await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            GSSENC_REQUEST_CODE if !gss_done && !stream.is_tls() => {
+                // A server without GSSAPI answers a single `N` and keeps reading: the client then
+                // sends an SSLRequest or a plain StartupMessage.
+                gss_done = true;
+                if write_flush(&mut stream, b"N").await.is_err() {
+                    return;
+                }
+            }
+            // A repeated request, or any request inside TLS, is not a startup message; a real
+            // server refuses it.
+            SSL_REQUEST_CODE | GSSENC_REQUEST_CODE => return,
+            _ => break body,
         }
-    }
+    };
     let tls = stream.is_tls();
 
     // Parse key=value pairs from startup message (after 4-byte protocol version)

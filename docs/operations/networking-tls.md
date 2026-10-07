@@ -498,7 +498,8 @@ Per-protocol rules (replies and tables in
 - **PostgreSQL:** an SSLRequest is answered `S` and the session continues over TLS; without the
   pair it is answered `N` as before. Plaintext sent where the ClientHello belongs is never read
   as a startup message: the handshake fails and the connection is dropped. A second SSLRequest
-  inside TLS closes the connection.
+  inside TLS closes the connection. A GSSENCRequest is answered `N` with or without the pair, and
+  the client's SSLRequest or plain StartupMessage follows on the same connection.
 - **MySQL:** the greeting advertises `CLIENT_SSL` only with the pair; a client's SSLRequest
   switches to TLS before the HandshakeResponse, which is then answered OK at sequence id 3.
 - **MSSQL:** a client that asks for encryption (`ENCRYPT_ON` or `ENCRYPT_REQ`) is answered
@@ -531,9 +532,6 @@ Server drivers. Before relying on it, run against a TLS-enabled node:
 - any driver that attempts TLS 1.3 inside TDS 7.x. If one fails, the fallback is restricting
   MSSQL to TLS 1.2, which is an owner decision;
 - plaintext PostgreSQL, MySQL and MongoDB clients, to confirm they are still served.
-
-Known follow-up: PostgreSQL does not yet answer a GSSENCRequest with `N`, as a real server
-without GSSAPI encryption does.
 
 ## Firewall and exposure guidance
 

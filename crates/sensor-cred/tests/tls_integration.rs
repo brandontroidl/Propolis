@@ -296,6 +296,122 @@ async fn pg_plaintext_after_s_is_dropped() {
     srv.handle.abort();
 }
 
+const PG_GSSENC_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x30];
+
+/// The server closes without sending a byte (well inside its 5s read timeout, so a server that
+/// merely waits does not pass by timing out).
+async fn assert_closed_silently<S: AsyncRead + Unpin>(conn: &mut S) {
+    let mut chunk = [0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(2), conn.read(&mut chunk)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!(
+            "server sent {n} bytes instead of closing: {:?}",
+            &chunk[..n]
+        ),
+        Err(_) => panic!("server did not close"),
+    }
+}
+
+/// Both setups must behave the same for a GSSENCRequest: TLS configured or not.
+fn gss_setups() -> [(&'static str, Option<CredTls>); 2] {
+    [("tls configured", Some(pki().tls.clone())), ("plain", None)]
+}
+
+#[tokio::test]
+async fn pg_gssencrequest_is_answered_n_then_plain_startup_is_captured() {
+    for (setup, tls) in gss_setups() {
+        let srv = TestServer::start("postgresql", tls).await;
+        let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+        send(&mut conn, &PG_GSSENC_REQUEST).await;
+        assert_eq!(read_exact(&mut conn, 1).await, b"N", "{setup}");
+        pg_login_and_query(&mut conn, "gssplain").await;
+        let login = srv.wait_event(SIGNAL_HONEYPOT_LOGIN_ATTEMPT).await;
+        assert_eq!(username(&login), Some("gssplain"), "{setup}");
+        assert_eq!(tls_tag(&login), None, "{setup}");
+        srv.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn pg_gssencrequest_then_sslrequest_upgrades_and_is_tagged_tls() {
+    let pki = pki();
+    let srv = TestServer::start("postgresql", Some(pki.tls.clone())).await;
+    let mut tcp = TcpStream::connect(srv.addr).await.unwrap();
+    send(&mut tcp, &PG_GSSENC_REQUEST).await;
+    assert_eq!(read_exact(&mut tcp, 1).await, b"N");
+    send(&mut tcp, &PG_SSL_REQUEST).await;
+    assert_eq!(read_exact(&mut tcp, 1).await, b"S");
+    let mut conn = TlsConnector::from(pki.client.clone())
+        .connect(server_name(), tcp)
+        .await
+        .unwrap();
+    pg_login_and_query(&mut conn, "gssthentls").await;
+    let login = srv.wait_event(SIGNAL_HONEYPOT_LOGIN_ATTEMPT).await;
+    assert_eq!(username(&login), Some("gssthentls"));
+    assert_eq!(tls_tag(&login), Some(&serde_json::Value::Bool(true)));
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn pg_gssencrequest_then_sslrequest_without_tls_config_is_n_n_then_plain() {
+    let srv = TestServer::start("postgresql", None).await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    send(&mut conn, &PG_GSSENC_REQUEST).await;
+    assert_eq!(read_exact(&mut conn, 1).await, b"N");
+    send(&mut conn, &PG_SSL_REQUEST).await;
+    assert_eq!(read_exact(&mut conn, 1).await, b"N");
+    pg_login_and_query(&mut conn, "gssnossl").await;
+    let login = srv.wait_event(SIGNAL_HONEYPOT_LOGIN_ATTEMPT).await;
+    assert_eq!(username(&login), Some("gssnossl"));
+    assert_eq!(tls_tag(&login), None);
+    srv.handle.abort();
+}
+
+/// A client cannot loop negotiation forever: a repeated request is not answered a second time.
+#[tokio::test]
+async fn pg_repeated_negotiation_requests_close_the_connection() {
+    // A repeated SSLRequest is only answered `N` (and so repeatable) without a TLS config.
+    let mut cases: Vec<(&str, Option<CredTls>, &[u8; 8])> = gss_setups()
+        .into_iter()
+        .map(|(setup, tls)| (setup, tls, &PG_GSSENC_REQUEST))
+        .collect();
+    cases.push(("plain, ssl", None, &PG_SSL_REQUEST));
+    for (setup, tls, repeated) in cases {
+        let srv = TestServer::start("postgresql", tls).await;
+        let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+        send(&mut conn, repeated).await;
+        assert_eq!(read_exact(&mut conn, 1).await, b"N", "{setup}");
+        send(&mut conn, repeated).await;
+        assert_closed_silently(&mut conn).await;
+        assert!(
+            srv.settled(SIGNAL_HONEYPOT_LOGIN_ATTEMPT).await.is_empty(),
+            "{setup}"
+        );
+        // The listener is unharmed.
+        let mut again = TcpStream::connect(srv.addr).await.unwrap();
+        send(&mut again, &PG_GSSENC_REQUEST).await;
+        assert_eq!(read_exact(&mut again, 1).await, b"N", "{setup}");
+        srv.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn pg_gssencrequest_inside_tls_closes_the_connection() {
+    let pki = pki();
+    let srv = TestServer::start("postgresql", Some(pki.tls.clone())).await;
+    let mut tcp = TcpStream::connect(srv.addr).await.unwrap();
+    send(&mut tcp, &PG_SSL_REQUEST).await;
+    assert_eq!(read_exact(&mut tcp, 1).await, b"S");
+    let mut conn = TlsConnector::from(pki.client.clone())
+        .connect(server_name(), tcp)
+        .await
+        .unwrap();
+    send(&mut conn, &PG_GSSENC_REQUEST).await;
+    assert_closed_silently(&mut conn).await;
+    assert!(srv.settled(SIGNAL_HONEYPOT_LOGIN_ATTEMPT).await.is_empty());
+    srv.handle.abort();
+}
+
 // ---- MySQL ----
 
 async fn mysql_read<S: AsyncRead + Unpin>(conn: &mut S) -> (u8, Vec<u8>) {

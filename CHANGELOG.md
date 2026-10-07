@@ -4,6 +4,15 @@
 
 ### Added
 
+- **`sensor-cred` PostgreSQL answers a GSSENCRequest with `N`** - libpq sends a GSSENCRequest
+  (code 80877104) before anything else when built with GSSAPI, and a real server without GSS
+  encryption answers one `N` byte and keeps reading. The sensor did not handle it, so such a client
+  never reached the StartupMessage and its credentials were not captured. It now answers `N`, with
+  or without a TLS pair, and continues with the client's SSLRequest (answered `S` over TLS when
+  configured, tagged `"tls": true`) or plain StartupMessage. As in PostgreSQL, each negotiation
+  request is honoured once per connection and none inside TLS, so at most two precede the
+  StartupMessage and a repeated one closes the connection. A repeated SSLRequest on a plaintext
+  connection used to be read as a malformed StartupMessage; it now closes the connection too.
 - **In-band TLS on `sensor-cred` (default off)** - `PROPOLIS_CRED_TLS_CERT` and
   `PROPOLIS_CRED_TLS_KEY` (the pair `provision-tls.sh` mints, key mode `0600`) enable TLS on the
   existing PostgreSQL, MySQL, MSSQL and MongoDB ports. There is no TLS bind and no new port, so

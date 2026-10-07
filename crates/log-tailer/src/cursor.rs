@@ -116,22 +116,28 @@ impl DurableCursor {
     /// missing log file is the tailer's own case to handle (poll until it appears), not
     /// evidence of rotation.
     pub fn detect_rotation(&self, state: &CursorState) -> RotationEvent {
-        let metadata = match std::fs::metadata(&self.log_path) {
-            Ok(m) => m,
-            Err(_) => return RotationEvent::None,
-        };
-
-        if metadata.ino() != state.inode {
-            return RotationEvent::InodeChanged;
-        }
-        if state.offset > metadata.len() {
-            return RotationEvent::Truncated;
-        }
-        if compute_fingerprint(&self.log_path) != state.fingerprint {
-            return RotationEvent::Replaced;
-        }
-        RotationEvent::None
+        detect_rotation(&self.log_path, state)
     }
+}
+
+/// [`DurableCursor::detect_rotation`] without a cursor: it only ever reads `log_path`, so a
+/// tailer that never persists a position (see `LogTailer::without_cursor`) uses it directly.
+pub(crate) fn detect_rotation(log_path: &Path, state: &CursorState) -> RotationEvent {
+    let metadata = match std::fs::metadata(log_path) {
+        Ok(m) => m,
+        Err(_) => return RotationEvent::None,
+    };
+
+    if metadata.ino() != state.inode {
+        return RotationEvent::InodeChanged;
+    }
+    if state.offset > metadata.len() {
+        return RotationEvent::Truncated;
+    }
+    if compute_fingerprint(log_path) != state.fingerprint {
+        return RotationEvent::Replaced;
+    }
+    RotationEvent::None
 }
 
 /// Reads `path`'s inode number, or `0` (never a real inode on Linux) if it can't be stat'd.

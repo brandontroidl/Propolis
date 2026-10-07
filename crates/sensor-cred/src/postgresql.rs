@@ -2,34 +2,41 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
-use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
+use sensor_framework::{
+    ConnectionBounds, EventEmitter, MaybeTlsStream, TlsServer, Uuid, WanResolver,
+};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
     SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
 };
 
+use crate::{with_tls, write_flush};
+
 const PROTOCOL_LABEL: &str = "postgresql";
 const MAX_STARTUP_MSG: usize = 65536;
+const SSL_REQUEST_CODE: i32 = 80_877_103;
 
 // PostgreSQL message types (server -> client)
 const AUTH_MD5_PASSWORD: i32 = 5;
 const AUTH_OK: i32 = 0;
 
-pub async fn handle_connection<S>(
-    mut stream: S,
+/// `starttls` set: an SSLRequest is answered `S` and the session continues over TLS on this same
+/// socket, as a real server with `ssl = on` does. `None`: answered `N`, as before.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_connection(
+    mut stream: MaybeTlsStream,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
+    starttls: Option<TlsServer>,
+) {
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
     let wan_ip = local_addr
@@ -69,13 +76,27 @@ pub async fn handle_connection<S>(
     }
     let protocol = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
 
-    // Handle SSL request (protocol = 80877103)
-    if protocol == 80877103 {
-        // Decline SSL with 'N'
-        if stream.write_all(b"N").await.is_err() {
-            return;
+    if protocol == SSL_REQUEST_CODE {
+        match starttls.as_ref() {
+            Some(tls) => {
+                if write_flush(&mut stream, b"S").await.is_err() {
+                    return;
+                }
+                // Every read above is an exact-length read on the raw socket with no user-space
+                // buffer, so no plaintext sent after the SSLRequest can be replayed into the TLS
+                // session (the CVE-2021-23222 shape). After `S` there is no plaintext fallback.
+                stream = match stream.upgrade(tls, timeout).await {
+                    Ok(upgraded) => upgraded,
+                    Err(_) => return,
+                };
+            }
+            None => {
+                if write_flush(&mut stream, b"N").await.is_err() {
+                    return;
+                }
+            }
         }
-        // Client will resend StartupMessage without SSL
+        // The client now sends its StartupMessage, inside TLS if upgraded.
         let mut len_buf2 = [0u8; 4];
         if timed_read_exact(&mut stream, &mut len_buf2, timeout)
             .await
@@ -94,7 +115,12 @@ pub async fn handle_connection<S>(
         {
             return;
         }
+        // A second SSLRequest inside TLS is not a startup message; a real server refuses it.
+        if stream.is_tls() && body[..4] == SSL_REQUEST_CODE.to_be_bytes() {
+            return;
+        }
     }
+    let tls = stream.is_tls();
 
     // Parse key=value pairs from startup message (after 4-byte protocol version)
     let username = parse_startup_params(&body[4..], "user");
@@ -109,7 +135,7 @@ pub async fn handle_connection<S>(
     auth_msg.extend_from_slice(&body_len.to_be_bytes());
     auth_msg.extend_from_slice(&AUTH_MD5_PASSWORD.to_be_bytes());
     auth_msg.extend_from_slice(&salt);
-    if stream.write_all(&auth_msg).await.is_err() {
+    if write_flush(&mut stream, &auth_msg).await.is_err() {
         return;
     }
 
@@ -146,7 +172,10 @@ pub async fn handle_connection<S>(
     // Password hash is read only to advance the protocol; discarded.
 
     let _ = emitter
-        .append(&login_event(source_ip, wan_ip, &username, session_id))
+        .append(&with_tls(
+            login_event(source_ip, wan_ip, &username, session_id),
+            tls,
+        ))
         .await;
 
     // 4. Send AuthenticationOk, then what a real server sends before it will take a query:
@@ -162,7 +191,7 @@ pub async fn handle_connection<S>(
     }
     ok_msg.extend_from_slice(&backend_key_data());
     ok_msg.extend_from_slice(&READY_FOR_QUERY_IDLE);
-    if stream.write_all(&ok_msg).await.is_err() {
+    if write_flush(&mut stream, &ok_msg).await.is_err() {
         return;
     }
 
@@ -214,7 +243,10 @@ pub async fn handle_connection<S>(
             // Extended-protocol Sync ends the error state and the client waits for ReadyForQuery.
             b'S' => {
                 skip_until_sync = false;
-                if stream.write_all(&READY_FOR_QUERY_IDLE).await.is_err() {
+                if write_flush(&mut stream, &READY_FOR_QUERY_IDLE)
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -225,11 +257,14 @@ pub async fn handle_connection<S>(
             b'Q' => {
                 let sql = String::from_utf8_lossy(body.strip_suffix(&[0]).unwrap_or(&body));
                 let _ = emitter
-                    .append(&query_event(source_ip, wan_ip, &sql, session_id))
+                    .append(&with_tls(
+                        query_event(source_ip, wan_ip, &sql, session_id),
+                        tls,
+                    ))
                     .await;
                 let mut reply = error_response("42501", "permission denied");
                 reply.extend_from_slice(&READY_FOR_QUERY_IDLE);
-                if stream.write_all(&reply).await.is_err() {
+                if write_flush(&mut stream, &reply).await.is_err() {
                     return;
                 }
             }
@@ -252,14 +287,17 @@ pub async fn handle_connection<S>(
                 }
                 statements.insert(name, params);
                 let _ = emitter
-                    .append(&query_event(source_ip, wan_ip, &sql, session_id))
+                    .append(&with_tls(
+                        query_event(source_ip, wan_ip, &sql, session_id),
+                        tls,
+                    ))
                     .await;
-                if stream.write_all(&PARSE_COMPLETE).await.is_err() {
+                if write_flush(&mut stream, &PARSE_COMPLETE).await.is_err() {
                     return;
                 }
             }
             b'B' => {
-                if stream.write_all(&BIND_COMPLETE).await.is_err() {
+                if write_flush(&mut stream, &BIND_COMPLETE).await.is_err() {
                     return;
                 }
             }
@@ -277,19 +315,19 @@ pub async fn handle_connection<S>(
                     reply.extend_from_slice(&parameter_description(&params));
                 }
                 reply.extend_from_slice(&NO_DATA);
-                if stream.write_all(&reply).await.is_err() {
+                if write_flush(&mut stream, &reply).await.is_err() {
                     return;
                 }
             }
             b'C' => {
-                if stream.write_all(&CLOSE_COMPLETE).await.is_err() {
+                if write_flush(&mut stream, &CLOSE_COMPLETE).await.is_err() {
                     return;
                 }
             }
             b'E' => {
                 skip_until_sync = true;
                 let reply = error_response("42501", "permission denied");
-                if stream.write_all(&reply).await.is_err() {
+                if write_flush(&mut stream, &reply).await.is_err() {
                     return;
                 }
             }

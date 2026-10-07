@@ -4,6 +4,28 @@
 
 ### Added
 
+- **In-band TLS on `sensor-cred` (default off)** - `PROPOLIS_CRED_TLS_CERT` and
+  `PROPOLIS_CRED_TLS_KEY` (the pair `provision-tls.sh` mints, key mode `0600`) enable TLS on the
+  existing PostgreSQL, MySQL, MSSQL and MongoDB ports. There is no TLS bind and no new port, so
+  the fleet inventory is unchanged; VNC is unchanged. PostgreSQL answers an SSLRequest `S` (until
+  now always `N`) and continues over TLS; a second SSLRequest inside TLS closes the connection and
+  plaintext sent after the `S` fails the handshake. MySQL advertises `CLIENT_SSL` and switches to
+  TLS on a client SSLRequest, answering the HandshakeResponse with OK at sequence id 3. MSSQL runs
+  the handshake inside TDS PRELOGIN packets, then Login7 and LOGINACK as raw TLS records, with TLS
+  1.3 session tickets off for MSSQL only: a client offering `ENCRYPT_ON` or `ENCRYPT_REQ` is
+  answered `ENCRYPT_ON` and gets TLS, a client offering `ENCRYPT_OFF` gets the pre-TLS PRELOGIN
+  response byte for byte and a plaintext session (a real server would answer `ENCRYPT_REQ`; the
+  honeypot keeps the credentials of scanners that cannot do TLS), and `ENCRYPT_NOT_SUP` or no
+  option gets `ENCRYPT_NOT_SUP` and plaintext. MongoDB peeks the first two bytes and serves
+  `0x16 0x03` (a TLS record header) over TLS on the plaintext port, so a plaintext first message
+  whose length's low byte is `0x16` is no longer mistaken for TLS. Plaintext clients keep working
+  on every port. Events from a TLS session carry `"tls": true` (for PostgreSQL, MySQL and MSSQL the
+  pre-negotiation connection event stays untagged). Fail-closed: when either variable is present,
+  exactly one set, a blank or non-UTF-8 value, or an unusable pair makes the sensor exit 1 before
+  binding anything. A bind failure on one protocol is still logged and skipped. The unit gains
+  `ReadOnlyPaths=/etc/propolis/tls`. The MSSQL TDS-TLS adapter is validated against a rustls
+  client and the MS-TDS text only; the owner smoke tests against real drivers are listed in
+  `docs/operations/networking-tls.md`.
 - **FTPS and AUTH TLS on `sensor-ftp` (default off)** - `PROPOLIS_FTP_TLS_CERT` and
   `PROPOLIS_FTP_TLS_KEY` (the pair `provision-tls.sh` mints, key mode `0600`) enable AUTH TLS on
   the plain listener, which until now answered `500`. One optional listener in the same process,

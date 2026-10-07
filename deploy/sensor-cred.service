@@ -20,6 +20,8 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 ReadWritePaths=/var/log/propolis/cred
+# Per-sensor cert and key for PROPOLIS_CRED_TLS_CERT / PROPOLIS_CRED_TLS_KEY.
+ReadOnlyPaths=/etc/propolis/tls
 CapabilityBoundingSet=
 
 MemoryMax=256M

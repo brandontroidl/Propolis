@@ -182,6 +182,23 @@ fn ftp_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
     assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
 }
 
+/// The cred sensor's deploy ports (5432, 3306, 1433, 27017, 5900) are all unprivileged and its TLS
+/// runs on those same ports, so its unit grants no capability, and it reads its cert and key from
+/// the root-owned TLS directory, which `ProtectSystem=strict` leaves readable but which the unit
+/// must not be able to write.
+#[test]
+fn cred_unit_reads_tls_dir_read_only_and_grants_no_capability() {
+    let unit = deploy_file("sensor-cred.service");
+    assert!(unit.contains("ReadOnlyPaths=/etc/propolis/tls\n"));
+    assert!(unit.contains("CapabilityBoundingSet=\n"));
+    assert!(
+        unit.lines()
+            .filter(|l| l.contains("CAP_NET_BIND_SERVICE"))
+            .all(|l| l.trim_start().starts_with('#')),
+        "every cred port is unprivileged: the unit must not grant CAP_NET_BIND_SERVICE"
+    );
+}
+
 /// The three layers `internal/design/02-sensor-framework.md`'s "Isolation and deployment"
 /// requires of every sensor unit: least authority, resource caps, and containment. Shared by
 /// both units below so the two can never drift into checking different bars.

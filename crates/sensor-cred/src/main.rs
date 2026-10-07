@@ -8,6 +8,8 @@ use std::time::Duration;
 use sensor_framework::{ConnectionBounds, WanResolver, shutdown_signal};
 
 const DEFAULT_LOG_DIR: &str = "/var/log/propolis/cred";
+const TLS_CERT_VAR: &str = "PROPOLIS_CRED_TLS_CERT";
+const TLS_KEY_VAR: &str = "PROPOLIS_CRED_TLS_KEY";
 
 struct PortConfig {
     protocol: &'static str,
@@ -90,6 +92,22 @@ async fn main() {
         }
     }
 
+    // Fail closed: either TLS var set means the pair must load, or nothing binds at all.
+    let tls = if env::var_os(TLS_CERT_VAR).is_some() || env::var_os(TLS_KEY_VAR).is_some() {
+        match sensor_cred::CredTls::from_env(TLS_CERT_VAR, TLS_KEY_VAR) {
+            Ok(tls) => {
+                tracing::info!("sensor-cred: TLS enabled for postgresql, mysql, mssql and mongodb");
+                Some(tls)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "sensor-cred: TLS is configured but the certificate or key cannot be loaded; refusing to start");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     if ports.is_empty() {
         tracing::error!(
             "sensor-cred: no bind addresses configured; set at least one PROPOLIS_CRED_*_BIND"
@@ -97,6 +115,8 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Unlike sensors whose TLS adds a listener, a bind failure here skips that one protocol: the
+    // five are independent traps and TLS adds no listener whose loss could hide behind the others.
     let mut handles = Vec::new();
     for pc in &ports {
         let log_path = log_dir.join(format!("{}.jsonl", pc.protocol));
@@ -106,6 +126,7 @@ async fn main() {
             wan_resolver.clone(),
             bounds.clone(),
             pc.protocol,
+            tls.clone(),
         )
         .await
         {

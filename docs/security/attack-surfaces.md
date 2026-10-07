@@ -94,6 +94,24 @@ TLS, as on the plain listener. A half-configured or unusable pair makes the sens
 start rather than serve plaintext. See
 [../operations/networking-tls.md](../operations/networking-tls.md#live-ftps-and-auth-tls-on-sensor-ftp).
 
+`sensor-cred` opens no new port for TLS: with `PROPOLIS_CRED_TLS_CERT` and
+`PROPOLIS_CRED_TLS_KEY` set, the existing PostgreSQL, MySQL, MSSQL and MongoDB ports also accept a
+TLS handshake, in-band after an SSLRequest, a `CLIENT_SSL` SSLRequest or a PRELOGIN asking for
+encryption, or on MongoDB when the first two bytes are a TLS record header. Each handshake is cut
+at the read timeout, no client certificate is requested, the certificate is the deploy-minted
+self-signed one named `localhost`, and a failed handshake ends the session with no plaintext
+fallback. PostgreSQL and MySQL read the pre-upgrade request with exact-length reads and no
+user-space buffer, so plaintext sent behind the request reaches the handshake as garbage and is
+never read as protocol (the CVE-2021-23222 shape). The MSSQL handshake runs inside TDS packets
+through a sensor-specific framing adapter (`crates/sensor-cred/src/tds_tls.rs`), which is parser
+code reachable by any client that offers encryption; it buffers at most one 8-byte TDS header in
+fixed-size storage, passes payload bytes straight to rustls, and frames each handshake write as one
+TDS packet of at most 4096 bytes. Plaintext clients are still served on every port, including
+an MSSQL client that offers `ENCRYPT_OFF`. Passwords, DES and MD5 responses are never captured over
+TLS, as in plaintext. A half-configured or unusable pair makes the sensor refuse to start rather
+than serve plaintext. See
+[../operations/networking-tls.md](../operations/networking-tls.md#live-in-band-tls-on-sensor-cred).
+
 Controls:
 
 - **Never-execute.** No sensor spawns a subprocess or execs; the honeypot captures, it

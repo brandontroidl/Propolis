@@ -252,6 +252,28 @@ fn a_cert_and_key_without_a_redis_tls_bind_derive_no_listener() {
     assert_eq!(generate(dir.path()), None);
 }
 
+/// sensor-cred's TLS runs in-band (or by sniff) on its existing plaintext ports, so a cert and
+/// key add no listener: the inventory is exactly what the plain binds already derive.
+#[test]
+fn a_cred_cert_and_key_derive_no_new_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "cred.env",
+        "PROPOLIS_CRED_TLS_CERT=/etc/propolis/tls/cred.crt\nPROPOLIS_CRED_TLS_KEY=/etc/propolis/tls/cred.key\n",
+    );
+    assert_eq!(generate(dir.path()), None);
+
+    write(
+        dir.path(),
+        "cred.env",
+        "PROPOLIS_CRED_PG_BIND=0.0.0.0:5432\nPROPOLIS_CRED_TLS_CERT=/etc/propolis/tls/cred.crt\nPROPOLIS_CRED_TLS_KEY=/etc/propolis/tls/cred.key\n",
+    );
+    let value = generate(dir.path()).unwrap();
+    let parsed = parse_listeners(&value).unwrap();
+    assert_eq!(parsed, vec![listener("postgresql", Proto::Tcp, 5432)]);
+}
+
 #[test]
 fn a_catchall_bind_list_yields_both_transports_for_every_port() {
     let dir = tempfile::tempdir().unwrap();

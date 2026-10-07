@@ -36,6 +36,7 @@ impl TestServer {
             wan_resolver,
             test_bounds(),
             protocol,
+            None,
         )
         .await
         .unwrap();

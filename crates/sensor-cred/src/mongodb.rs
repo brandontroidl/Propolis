@@ -1,14 +1,17 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::net::TcpStream;
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
-use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
+use sensor_framework::{ConnectionBounds, EventEmitter, TlsServer, Uuid, WanResolver};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
 };
+
+use crate::{with_tls, write_flush};
 
 const PROTOCOL_LABEL: &str = "mongodb";
 const MAX_MSG_SIZE: usize = 65536;
@@ -16,6 +19,101 @@ const MAX_MSG_SIZE: usize = 65536;
 // MongoDB wire protocol opcodes
 const OP_MSG: u32 = 2013;
 
+/// The first two bytes of a TLS handshake record (a ClientHello): content type 0x16, then the
+/// major byte of the record version, 0x03 for every SSL 3.0 to TLS 1.3 record. A MongoDB wire
+/// message starts with its little-endian length instead. Byte 0 alone matches any plaintext
+/// first message whose length is 0x16 modulo 256 (22, 278, 534, ...); also requiring byte 1 to be
+/// 0x03 leaves only lengths of the form 0x..0316 (790, 66326, ...), and the 65536-byte message cap
+/// rejects every such length past the first.
+const TLS_RECORD_PREFIX: [u8; 2] = [0x16, 0x03];
+
+/// While only one byte of a would-be ClientHello has arrived, how long to wait before peeking
+/// again. `peek` does not consume, so the socket stays readable and an immediate re-peek would
+/// spin; this only runs when byte 0 is 0x16 and byte 1 has not arrived yet.
+const SNIFF_REPEEK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Whether the first bytes on `stream` are a TLS record header. Peeks (never consumes) until two
+/// bytes are buffered, bounded by `limit`. A first byte other than 0x16 decides at once; fewer
+/// than two bytes before the limit or EOF count as not TLS.
+async fn starts_with_tls_record(stream: &TcpStream, limit: std::time::Duration) -> bool {
+    let sniff = async {
+        let mut head = [0u8; 2];
+        loop {
+            match stream.peek(&mut head).await {
+                Ok(n) if n >= 2 => return head == TLS_RECORD_PREFIX,
+                Ok(1) if head[0] == TLS_RECORD_PREFIX[0] => tokio::time::sleep(SNIFF_REPEEK).await,
+                _ => return false,
+            }
+        }
+    };
+    tokio::time::timeout(limit, sniff).await.unwrap_or(false)
+}
+
+/// The plaintext mongodb port. With `sniff` set, a connection whose first two bytes are a TLS
+/// record header is served over TLS on this same port, the way a mongod in `allowTLS` mode takes
+/// both; anything else, and every connection when `sniff` is `None`, takes the plaintext path.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_sniffed(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    session_id: Uuid,
+    emitter: Arc<EventEmitter>,
+    wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
+    sniff: Option<TlsServer>,
+) {
+    let Some(tls) = sniff else {
+        return handle_connection(
+            stream,
+            peer_addr,
+            local_addr,
+            session_id,
+            emitter,
+            wan_resolver,
+            bounds,
+            false,
+        )
+        .await;
+    };
+    if !starts_with_tls_record(&stream, bounds.read_timeout).await {
+        return handle_connection(
+            stream,
+            peer_addr,
+            local_addr,
+            session_id,
+            emitter,
+            wan_resolver,
+            bounds,
+            false,
+        )
+        .await;
+    }
+    let secure = match tokio::time::timeout(bounds.read_timeout, tls.accept(stream)).await {
+        Ok(Ok(secure)) => secure,
+        Ok(Err(error)) => {
+            tracing::debug!(peer = %peer_addr, %error, "mongodb tls handshake failed; dropping connection");
+            return;
+        }
+        Err(_elapsed) => {
+            tracing::debug!(peer = %peer_addr, "mongodb tls handshake timed out; dropping connection");
+            return;
+        }
+    };
+    handle_connection(
+        secure,
+        peer_addr,
+        local_addr,
+        session_id,
+        emitter,
+        wan_resolver,
+        bounds,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_connection<S>(
     mut stream: S,
     peer_addr: SocketAddr,
@@ -24,6 +122,7 @@ pub async fn handle_connection<S>(
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
+    tls: bool,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -34,7 +133,10 @@ pub async fn handle_connection<S>(
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
     let _ = emitter
-        .append(&connection_event(source_ip, wan_ip, session_id))
+        .append(&with_tls(
+            connection_event(source_ip, wan_ip, session_id),
+            tls,
+        ))
         .await;
 
     let timeout = bounds.read_timeout;
@@ -82,7 +184,10 @@ pub async fn handle_connection<S>(
             let username = sanitize_value(&username.unwrap_or_default(), 255);
 
             let _ = emitter
-                .append(&login_event(source_ip, wan_ip, &username, session_id))
+                .append(&with_tls(
+                    login_event(source_ip, wan_ip, &username, session_id),
+                    tls,
+                ))
                 .await;
 
             // Send a saslContinue-style response (the auth will fail, but we got the credential)
@@ -162,7 +267,7 @@ async fn send_op_msg_reply<S: AsyncWrite + Unpin>(
     packet.extend_from_slice(&OP_MSG.to_le_bytes());
     packet.extend_from_slice(&op_msg_body);
 
-    stream.write_all(&packet).await.map_err(|_| ())
+    write_flush(stream, &packet).await.map_err(|_| ())
 }
 
 /// Build a minimal valid BSON document from a flat key-value shape. This is deliberately simple -
@@ -321,6 +426,48 @@ fn login_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server side of a loopback connection after the client wrote `chunks`, pausing between
+    /// them, and then either half-closed (`eof`) or stayed open.
+    async fn sniff_after(chunks: &[&[u8]], eof: bool, limit: std::time::Duration) -> bool {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chunks: Vec<Vec<u8>> = chunks.iter().map(|c| c.to_vec()).collect();
+        let client = tokio::spawn(async move {
+            let mut conn = TcpStream::connect(addr).await.unwrap();
+            for chunk in chunks {
+                conn.write_all(&chunk).await.unwrap();
+                conn.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if eof {
+                conn.shutdown().await.unwrap();
+            }
+            // Hold the socket open past the sniff limit.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        });
+        let (server, _) = listener.accept().await.unwrap();
+        let verdict = starts_with_tls_record(&server, limit).await;
+        client.abort();
+        verdict
+    }
+
+    #[tokio::test]
+    async fn sniff_needs_both_record_header_bytes() {
+        let limit = std::time::Duration::from_secs(2);
+        assert!(sniff_after(&[&[0x16, 0x03, 0x01]], false, limit).await);
+        // byte 1 arriving in a later segment is still waited for
+        assert!(sniff_after(&[&[0x16], &[0x03]], false, limit).await);
+        // a plaintext message of length 278 (0x116) starts 0x16 0x01
+        assert!(!sniff_after(&[&[0x16, 0x01, 0x00, 0x00]], false, limit).await);
+        assert!(!sniff_after(&[&[0x3a, 0x00, 0x00, 0x00]], false, limit).await);
+        // one byte then EOF, one byte then silence, and silence are plaintext once the limit ends
+        let short = std::time::Duration::from_millis(200);
+        assert!(!sniff_after(&[&[0x16]], true, short).await);
+        assert!(!sniff_after(&[&[0x16]], false, short).await);
+        assert!(!sniff_after(&[], false, short).await);
+    }
 
     #[test]
     fn extract_scram_username_from_payload() {

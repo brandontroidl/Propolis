@@ -951,12 +951,85 @@ per-protocol bind var is required.
 | **vnc** (`vnc.rs`) | RFB 3.8, VNC Auth type 2 (5900) | Sends a 16-byte random challenge, reads the DES response; the attempt is the signal (plaintext unrecoverable) → `honeypot_login_attempt` with no username (`crates/sensor-cred/src/vnc.rs#handle_connection`). |
 | **mysql** (`mysql.rs`) | MySQL 5.7.42 (3306) | Sends a greeting with per-connection random thread id + 20-byte scramble, parses the username from HandshakeResponse41, drops the password → login event (`crates/sensor-cred/src/mysql.rs#handle_connection`, `crates/sensor-cred/src/mysql.rs#build_greeting`). |
 | **mssql** (`mssql.rs`) | SQL Server 2019 (15.0.16.57) TDS (1433) | PreLogin/Login7; parses the UTF-16LE username from Login7, sends LOGINACK (`crates/sensor-cred/src/mssql.rs#handle_connection`, `crates/sensor-cred/src/mssql.rs#parse_login7_username`, `crates/sensor-cred/src/mssql.rs#build_loginack`). |
-| **postgresql** (`postgresql.rs`) | PostgreSQL (5432) | StartupMessage (declines SSL with `N`), parses the `user` param, sends AuthenticationMD5Password with a per-connection random salt, reads and discards the PasswordMessage → login event; then AuthenticationOk, a PostgreSQL 14 ParameterStatus set, BackendKeyData and ReadyForQuery, and a query loop: each simple query → `honeypot_command_exec` with the statement text, answered `ERROR 42501 permission denied` and ReadyForQuery, until Terminate, 200 statements, or the byte budget. Extended protocol: Parse records the SQL and answers ParseComplete; Bind, Describe (ParameterDescription then NoData for a statement, NoData for a portal) and Close get their completions; Execute is refused with 42501 and everything after it, a simple Query included, is discarded until Sync. |
+| **postgresql** (`postgresql.rs`) | PostgreSQL (5432) | StartupMessage (an SSLRequest is declined with `N`, or accepted with `S` when TLS is configured, see below), parses the `user` param, sends AuthenticationMD5Password with a per-connection random salt, reads and discards the PasswordMessage → login event; then AuthenticationOk, a PostgreSQL 14 ParameterStatus set, BackendKeyData and ReadyForQuery, and a query loop: each simple query → `honeypot_command_exec` with the statement text, answered `ERROR 42501 permission denied` and ReadyForQuery, until Terminate, 200 statements, or the byte budget. Extended protocol: Parse records the SQL and answers ParseComplete; Bind, Describe (ParameterDescription then NoData for a statement, NoData for a portal) and Close get their completions; Execute is refused with 42501 and everything after it, a simple Query included, is discarded until Sync. |
 | **mongodb** (`mongodb.rs`) | MongoDB OP_MSG (27017) | Answers isMaster/hello; on saslStart/authenticate extracts the SCRAM `n=<user>` or BSON `user` → login event (`crates/sensor-cred/src/mongodb.rs#handle_connection`, `crates/sensor-cred/src/mongodb.rs#extract_scram_username`, `crates/sensor-cred/src/mongodb.rs#extract_bson_string`). |
 
 - Every cred protocol emits `honeypot_connection` + `honeypot_login_attempt`
   (authenticated=true). Username sanitized cap 255. **No spool**; passwords, DES
   responses, and MD5 responses are never stored.
+- **Bind failures:** a protocol whose bind the OS refuses is logged and skipped; the others keep
+  running, and the sensor exits 1 only when every configured protocol failed to bind
+  (`crates/sensor-cred/src/main.rs#main`). The five are independent traps, and TLS adds no
+  listener of its own whose loss this could hide.
+- **TLS (optional):** `PROPOLIS_CRED_TLS_CERT` and `PROPOLIS_CRED_TLS_KEY` together enable TLS
+  on the existing postgresql, mysql, mssql and mongodb ports. There is no TLS bind and no new
+  port; vnc is unchanged. One certificate serves all four (`crates/sensor-cred/src/lib.rs#CredTls`).
+  No client certificate is requested. Every handshake is bounded by the read timeout, and one that
+  fails or stalls ends the session with no further event and no plaintext fallback (mssql and
+  mongodb also log it at debug level).
+  Plaintext clients keep working on every port.
+  - **postgresql:** an SSLRequest is answered `S` and the handshake runs on the same socket; the
+    StartupMessage and everything after it then travel over TLS. The reads before the upgrade are
+    exact-length reads with no user-space buffer, so plaintext the client sent after the
+    SSLRequest is never replayed into the TLS session: it reaches the handshake as garbage and the
+    connection is dropped (the CVE-2021-23222 shape). A second SSLRequest inside TLS closes the
+    connection. Without the pair the answer is the unchanged `N`. A GSSENCRequest is not answered
+    `N` the way a real server without GSSAPI answers it; that is a known gap.
+  - **mysql:** the greeting advertises `CLIENT_SSL` (0x0800) only when the pair is set. A 32-byte
+    SSLRequest packet carrying that flag switches the session to TLS before the
+    HandshakeResponse41, which then arrives over TLS and is answered OK with sequence id 3 (greeting
+    0, SSLRequest 1, response 2). A client that ignores the flag is served exactly as before (OK at
+    sequence id 2) (`crates/sensor-cred/src/mysql.rs#is_ssl_request`).
+  - **mssql:** TLS inside TDS, per MS-TDS for TDS 7.x: the PRELOGIN response carries an ENCRYPTION
+    option, the handshake records travel inside TDS PRELOGIN (0x12) packets, and once it completes
+    Login7 and LOGINACK flow as raw TLS records (`crates/sensor-cred/src/tds_tls.rs`). TLS 1.3
+    session tickets are switched off for mssql only, because a ticket written after the handshake
+    would reach a client that has already stopped de-framing. The reply to the client's ENCRYPTION
+    option (`crates/sensor-cred/src/mssql.rs#negotiate_encryption`):
+
+    | Client offers | Reply | Session |
+    |---|---|---|
+    | `ENCRYPT_ON` (0x01) or `ENCRYPT_REQ` (0x03) | `ENCRYPT_ON` | TLS |
+    | `ENCRYPT_OFF` (0x00) | the pre-TLS PRELOGIN response, byte for byte (VERSION only, no ENCRYPTION option) | plaintext |
+    | `ENCRYPT_NOT_SUP` (0x02), or no ENCRYPTION option | `ENCRYPT_NOT_SUP` | plaintext |
+
+    The client-certificate bit (0x80) is masked off first. This is deliberately not the MS-TDS
+    server table: a real server with encryption on answers an `ENCRYPT_OFF` client with
+    `ENCRYPT_REQ` and forces TLS, which would lose the Login7, and so the username, of every
+    scanner that cannot do TLS. The honeypot chooses capture over fidelity, so a client offering
+    `ENCRYPT_OFF` sees exactly what it saw before TLS existed. Login-only encryption (a reply of
+    `ENCRYPT_OFF`) is never offered, since it would need a TLS-to-plaintext switch after Login7.
+    Without the pair, the PRELOGIN response carries no ENCRYPTION option, as before
+    (`crates/sensor-cred/src/mssql.rs#prelogin_response_without_tls_is_byte_identical_to_before`).
+  - **mongodb:** on its plaintext port the sensor peeks (never consumes) the first two bytes,
+    bounded by the read timeout. When they are `0x16 0x03` (a TLS handshake record and the record
+    version's major byte) and the pair is set, the connection is served over TLS, the way a mongod
+    in `allowTLS` mode takes both on one port. Anything else, fewer than two bytes before the
+    timeout or end of stream, or no pair, takes the plaintext path. A MongoDB message starts with
+    its little-endian length, so a one-byte check would misroute every plaintext first message
+    whose length is 22, 278, 534 and so on; with two bytes only a 790-byte first message still
+    matches, and longer matching lengths exceed the 64 KiB message cap
+    (`crates/sensor-cred/src/mongodb.rs#TLS_RECORD_PREFIX`). When only `0x16` has arrived the peek
+    is retried every 10 ms (`crates/sensor-cred/src/mongodb.rs#SNIFF_REPEEK`). After a sniff that
+    times out, the plaintext path waits up to another read timeout for the message header, so a
+    silent connection can hold a slot for up to twice the read timeout, still capped by the
+    maximum session duration.
+  - **Event tagging:** events from a TLS session carry `"tls": true`; the key is absent, not
+    false, on plaintext sessions (`crates/sensor-cred/src/lib.rs#with_tls`). For postgresql, mysql
+    and mssql the `honeypot_connection` event is written before negotiation and stays untagged,
+    while the login and postgresql query events of a TLS session are tagged. For mongodb TLS is
+    known before the session starts, so every event of a TLS session is tagged, the connection
+    event included.
+  - **Fail-closed:** when either variable is present the pair must load, or the sensor exits 1
+    before binding any protocol; exactly one set, a blank or non-UTF-8 value, an unusable pair and
+    a key that is not mode `0600` all count. Variables are in
+    [environment-variables.md](environment-variables.md); the operator view is
+    [../operations/networking-tls.md](../operations/networking-tls.md#live-in-band-tls-on-sensor-cred).
+  - **Validation scope:** the MSSQL TDS-TLS adapter is validated against a rustls client (TLS 1.2
+    and 1.3) framed by hand in the tests and against the MS-TDS text, not against real SQL Server
+    drivers. The owner smoke tests listed in
+    [../operations/networking-tls.md](../operations/networking-tls.md#live-in-band-tls-on-sensor-cred)
+    are still to be run.
 
 ## Cross-cutting invariants
 

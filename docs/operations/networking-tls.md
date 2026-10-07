@@ -113,11 +113,10 @@ HTTPS, MQTTS and the other encrypted variants of the protocols they imitate.
 > with no TLS bind are still loaded and validated (fail-closed), start no TLS listener, and log
 > one warning. The exception is `sensor-smtp` and `sensor-ftp`, where the pair also enables an
 > in-protocol upgrade (STARTTLS, AUTH TLS) on the plain listener, so it is in use and logs no
-> warning.
+> warning. `sensor-cred` has no TLS bind at all: its TLS runs on the existing plain binds, so the
+> pair opens no port and the inventory is unchanged.
 >
-> Pending surfaces:
->
-> - in-band TLS for the `sensor-cred` PostgreSQL, MySQL, MSSQL and MongoDB protocols
+> Pending surfaces: none.
 
 What the framework provides (`crates/sensor-framework/src/tls.rs`): a fail-closed config
 loader (`crates/sensor-framework/src/tls.rs#load_server_config`), an implicit-TLS listener
@@ -270,6 +269,66 @@ is dropped with a debug log and no event. Variables are owned by
 [environment-variables.md](../reference/environment-variables.md); behavior by
 [sensor-behavior.md](../reference/sensor-behavior.md).
 
+### Live: in-band TLS on `sensor-cred`
+
+| Item | Value |
+|---|---|
+| Modes | in-band on the existing plaintext ports: PostgreSQL SSLRequest (5432), MySQL `CLIENT_SSL` (3306), MSSQL TLS inside TDS PRELOGIN (1433), and a MongoDB ClientHello sniff (27017); VNC (5900) unchanged; no client certificate |
+| Binds | unchanged (`PROPOLIS_CRED_PG_BIND`, `PROPOLIS_CRED_MYSQL_BIND`, `PROPOLIS_CRED_MSSQL_BIND`, `PROPOLIS_CRED_MONGO_BIND`); there is no TLS bind and no new port, so `deploy/fleet-listeners.sh` derives nothing new |
+| Certificate and key | `PROPOLIS_CRED_TLS_CERT` (`/etc/propolis/tls/cred.crt`), `PROPOLIS_CRED_TLS_KEY` (`/etc/propolis/tls/cred.key`, mode `0600`); one pair for all four protocols |
+| Plaintext clients | keep working on every port with the pair set |
+| Unit | `deploy/sensor-cred.service` adds `ReadOnlyPaths=/etc/propolis/tls`; no capability, since every cred port is unprivileged |
+| Event tagging | events from a TLS session carry `"tls": true`; for PostgreSQL, MySQL and MSSQL the connection event is written before negotiation and stays untagged, for MongoDB every event of a TLS session is tagged |
+
+Per-protocol rules (replies and tables in
+[sensor-behavior.md](../reference/sensor-behavior.md#sensor-cred-vnc--mysql--mssql--postgresql--mongodb)):
+
+- **PostgreSQL:** an SSLRequest is answered `S` and the session continues over TLS; without the
+  pair it is answered `N` as before. Plaintext sent where the ClientHello belongs is never read
+  as a startup message: the handshake fails and the connection is dropped. A second SSLRequest
+  inside TLS closes the connection.
+- **MySQL:** the greeting advertises `CLIENT_SSL` only with the pair; a client's SSLRequest
+  switches to TLS before the HandshakeResponse, which is then answered OK at sequence id 3.
+- **MSSQL:** a client that asks for encryption (`ENCRYPT_ON` or `ENCRYPT_REQ`) is answered
+  `ENCRYPT_ON` and gets TLS inside TDS; TLS 1.3 session tickets are off for MSSQL only. A client
+  that offers `ENCRYPT_OFF` gets the pre-TLS PRELOGIN response byte for byte and a plaintext
+  session, and an `ENCRYPT_NOT_SUP` or silent client gets `ENCRYPT_NOT_SUP` and plaintext. A real
+  server with encryption on would answer `ENCRYPT_OFF` with `ENCRYPT_REQ` and force TLS; the
+  sensor deliberately does not, so the credentials of scanners that cannot do TLS are still
+  captured.
+- **MongoDB:** the first two bytes on the port are peeked, bounded by the read timeout; `0x16 0x03`
+  (a TLS record header) with the pair set selects TLS, anything else the plaintext path. After a
+  sniff that times out the plaintext path waits up to another read timeout, so a silent
+  connection can hold a slot for up to twice the read timeout, capped by the maximum session
+  duration.
+
+Fail-closed (`crates/sensor-cred/src/main.rs#main`): when either variable is present, the pair
+must load or the sensor exits 1 with `refusing to start` before binding any protocol: exactly one
+set, a blank or non-UTF-8 value, or an unusable pair (see
+[Loading is fail-closed](#loading-is-fail-closed)). On success it logs
+`TLS enabled for postgresql, mysql, mssql and mongodb`. Unlike the other TLS sensors, an OS bind
+failure does not stop the sensor: that one protocol is logged and skipped and the sensor exits 1
+only when every configured protocol failed to bind, because TLS adds no listener whose loss could
+hide behind the others. Variables are owned by
+[environment-variables.md](../reference/environment-variables.md); behavior by
+[sensor-behavior.md](../reference/sensor-behavior.md).
+
+**Validation scope and owner smoke tests.** The MSSQL TDS-TLS adapter is validated against a
+rustls client (TLS 1.2 and 1.3) framed by hand in
+`crates/sensor-cred/tests/tls_integration.rs` and against the MS-TDS text, not against real SQL
+Server drivers. Before relying on it, run against a TLS-enabled node:
+
+- `sqlcmd -N -C`, and .NET SqlClient with `Encrypt=True;TrustServerCertificate=True`;
+- FreeTDS `tsql` with `encryption = require` and with `encryption = off`;
+- go-mssqldb with `encrypt=true` and with `encrypt=disable`;
+- impacket `mssqlclient.py`;
+- any driver that attempts TLS 1.3 inside TDS 7.x. If one fails, the fallback is restricting
+  MSSQL to TLS 1.2, which is an owner decision;
+- plaintext PostgreSQL, MySQL and MongoDB clients, to confirm they are still served.
+
+Known follow-up: PostgreSQL does not yet answer a GSSENCRequest with `N`, as a real server
+without GSSAPI encryption does.
+
 ### Certificate model
 
 Each TLS-capable sensor gets its own self-signed certificate and key, minted at deploy time
@@ -347,7 +406,10 @@ path, `crates/sensor-framework/src/tls.rs#upgrade_buffered`. The upgrade handsha
 the same read timeout. If the client has already sent more plaintext after the STARTTLS command
 (command pipelining across the upgrade, the CVE-2011-0411 injection shape), the upgrade is
 refused and the connection dropped rather than letting those pre-handshake bytes be read inside
-the encrypted session.
+the encrypted session. `sensor-cred`'s PostgreSQL and MySQL upgrades read without a user-space
+buffer, so they call `crates/sensor-framework/src/tls.rs#MaybeTlsStream` `upgrade` directly:
+plaintext sent after the request stays in the socket and fails the handshake. Its MSSQL handshake
+runs inside TDS packets instead (`crates/sensor-cred/src/tds_tls.rs`).
 
 ### Running provisioning by hand
 

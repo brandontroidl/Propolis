@@ -713,6 +713,23 @@ Sensor-specific extras:
   (`deploy/fleet-listeners.sh#PROPOLIS_FTP_TLS_BIND`), the implicit listener never starts
   implicitly. The plain and implicit listeners share one capture-memory budget
   (`PROPOLIS_FTP_CAPTURE_MEMORY_BYTES`), so the ceiling covers both together.
+- **cred**: TLS on the existing PostgreSQL, MySQL, MSSQL and MongoDB ports (both default off;
+  neither has a compiled default). There is no TLS bind variable: TLS is negotiated in-band, or
+  sniffed for MongoDB, on the plain binds, so it opens no new port.
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_CRED_TLS_CERT` | unset (deploy value `/etc/propolis/tls/cred.crt`) | PEM certificate path, shared by all four protocols. Together with the key it enables the PostgreSQL SSLRequest, MySQL CLIENT_SSL, MSSQL PRELOGIN encryption and MongoDB ClientHello paths. |
+  | `PROPOLIS_CRED_TLS_KEY` | unset (deploy value `/etc/propolis/tls/cred.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-cred/src/main.rs#main`, `crates/sensor-cred/src/lib.rs#CredTls`):
+  when either variable is present in the environment, the pair must load or the sensor exits 1
+  with `refusing to start` before binding any protocol. That covers exactly one of the two set, a
+  blank value, a non-UTF-8 value (invalid, not unset), a file that is unreadable, not PEM or a
+  mismatched pair, and a key that is group- or world-readable. On success it logs
+  `TLS enabled for postgresql, mysql, mssql and mongodb`. With neither variable set the sensor is
+  unchanged. Because no `*_BIND` variable is added, `deploy/fleet-listeners.sh` derives no extra
+  listener from the pair.
 - **catchall**: no spool variable (never spools file bodies,
   `crates/sensor-catchall/src/main.rs#Config`); no
   outbox variable either (captures no file bodies, so nothing for SP-B-1b's
@@ -783,7 +800,10 @@ Invalid or zero bound → **silent default**, not abort.
   `PROPOLIS_CRED_READ_TIMEOUT_MS` (`30_000`), `PROPOLIS_CRED_IDLE_TIMEOUT_MS` (`60_000`),
   `PROPOLIS_CRED_MAX_DURATION_SECS` (**`60`**, differs from others' 600),
   `PROPOLIS_CRED_MAX_CAPTURED_BYTES` (**`100_000`**, differs from others' 1_000_000),
-  `PROPOLIS_CRED_MAX_CONCURRENT` (`256`).
+  `PROPOLIS_CRED_MAX_CONCURRENT` (`256`). A bind failure on one protocol is logged and that
+  protocol is skipped; the others keep running. The TLS variables `PROPOLIS_CRED_TLS_CERT` and
+  `PROPOLIS_CRED_TLS_KEY` are strict, not lenient: see the cred entry under the sensor TLS
+  variables above.
 
 ---
 

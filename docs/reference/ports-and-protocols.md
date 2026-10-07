@@ -61,20 +61,25 @@ default. Every one is TCP except `sensor-tftp` (UDP only) and the UDP half of
 | sensor-redis | `PROPOLIS_REDIS_BIND` (single); `PROPOLIS_REDIS_TLS_BIND` (single, optional) | Redis; Redis over implicit TLS (`rediss://`) | 6379; 6380 | `crates/sensor-redis/src/main.rs#load_config_from_env`. The TLS listener runs in the same process and writes the same event log, and exists only when `PROPOLIS_REDIS_TLS_BIND` is set, with `PROPOLIS_REDIS_TLS_CERT` and `PROPOLIS_REDIS_TLS_KEY` (`crates/sensor-redis/src/main.rs#parse_tls`). Both ports are unprivileged: the unit grants no capability, and `ReadOnlyPaths=/etc/propolis/tls` for the pair. |
 | sensor-adb | `PROPOLIS_ADB_BIND` (single) | ADB | 5555 | `crates/sensor-adb/src/main.rs#load_config_from_env` |
 | sensor-catchall | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list) | TCP + UDP, any port | (multi) | Both TCP and UDP attempted per address. Empty => `ConfigError::NoBindAddrs`, exit. Per-port bind failure is **non-fatal** (logged + skipped, sensor stays up). Unit grants `CAP_NET_BIND_SERVICE`. `crates/sensor-catchall/src/main.rs#parse_bind_addrs`, `crates/sensor-catchall/src/main.rs#main` |
-| sensor-cred | five per-protocol envs (below) | VNC / MySQL / MSSQL / PostgreSQL / MongoDB | (multi) | No single bind env; at least one required. `crates/sensor-cred/src/main.rs#main` |
+| sensor-cred | five per-protocol envs (below) | VNC / MySQL / MSSQL / PostgreSQL / MongoDB, the last four with optional in-band TLS | (multi) | No single bind env; at least one required. A bind failure on one protocol is logged and skipped. With `PROPOLIS_CRED_TLS_CERT` and `PROPOLIS_CRED_TLS_KEY` set, TLS runs on the same ports and opens no new one (no TLS bind). All ports are unprivileged: the unit grants no capability, and `ReadOnlyPaths=/etc/propolis/tls` for the pair. `crates/sensor-cred/src/main.rs#main` |
 
 ### sensor-cred per-protocol binds
 
 Each is an independent `ip:port`; at least one must be set. An invalid value or
-no env set at all exits with code 1 (`crates/sensor-cred/src/main.rs#main`).
+no env set at all exits with code 1 (`crates/sensor-cred/src/main.rs#main`). If the
+OS refuses one bind, that protocol is logged and skipped; the sensor exits 1 only
+when every configured protocol fails to bind.
 
-| Protocol | Bind env | Conventional port |
-|---|---|---|
-| VNC | `PROPOLIS_CRED_VNC_BIND` | 5900 |
-| MySQL | `PROPOLIS_CRED_MYSQL_BIND` | 3306 |
-| MSSQL | `PROPOLIS_CRED_MSSQL_BIND` | 1433 |
-| PostgreSQL | `PROPOLIS_CRED_PG_BIND` | 5432 |
-| MongoDB | `PROPOLIS_CRED_MONGO_BIND` | 27017 |
+| Protocol | Bind env | Conventional port | TLS with the pair set |
+|---|---|---|---|
+| VNC | `PROPOLIS_CRED_VNC_BIND` | 5900 | none |
+| MySQL | `PROPOLIS_CRED_MYSQL_BIND` | 3306 | in-band, `CLIENT_SSL` SSLRequest |
+| MSSQL | `PROPOLIS_CRED_MSSQL_BIND` | 1433 | in-band, TLS inside TDS PRELOGIN |
+| PostgreSQL | `PROPOLIS_CRED_PG_BIND` | 5432 | in-band, SSLRequest answered `S` |
+| MongoDB | `PROPOLIS_CRED_MONGO_BIND` | 27017 | sniffed, a TLS record header selects TLS |
+
+Plaintext clients keep working on every port. Behavior is in
+[sensor-behavior.md](sensor-behavior.md#sensor-cred-vnc--mysql--mssql--postgresql--mongodb).
 
 > Conventional ports are the well-known ports these services normally use; they
 > are examples of what an operator typically configures, not values the binary
@@ -176,16 +181,16 @@ are **not** compiled-in defaults - each is set by the operator in
 | 465 | attacker | SMTPS (smtp, implicit TLS) | `PROPOLIS_SMTP_TLS_BIND` |
 | 587 | attacker | SMTP submission (smtp, plain + STARTTLS) | `PROPOLIS_SMTP_SUBMISSION_BIND` |
 | 990 | attacker | FTPS (ftp, implicit TLS) | `PROPOLIS_FTP_TLS_BIND` |
-| 1433 | attacker | MSSQL (cred) | `PROPOLIS_CRED_MSSQL_BIND` |
+| 1433 | attacker | MSSQL (cred, plain + in-band TLS) | `PROPOLIS_CRED_MSSQL_BIND` |
 | 1883 | attacker | MQTT | `PROPOLIS_MQTT_BIND` |
-| 3306 | attacker | MySQL (cred) | `PROPOLIS_CRED_MYSQL_BIND` |
-| 5432 | attacker | PostgreSQL (cred) | `PROPOLIS_CRED_PG_BIND` |
+| 3306 | attacker | MySQL (cred, plain + in-band TLS) | `PROPOLIS_CRED_MYSQL_BIND` |
+| 5432 | attacker | PostgreSQL (cred, plain + in-band TLS) | `PROPOLIS_CRED_PG_BIND` |
 | 5555 | attacker | ADB | `PROPOLIS_ADB_BIND` |
 | 5900 | attacker | VNC (cred) | `PROPOLIS_CRED_VNC_BIND` |
 | 6379 | attacker | Redis | `PROPOLIS_REDIS_BIND` |
 | 6380 | attacker | Redis over implicit TLS (redis) | `PROPOLIS_REDIS_TLS_BIND` |
 | 8883 | attacker | MQTTS (mqtt, implicit TLS) | `PROPOLIS_MQTT_TLS_BIND` |
-| 27017 | attacker | MongoDB (cred) | `PROPOLIS_CRED_MONGO_BIND` |
+| 27017 | attacker | MongoDB (cred, plain + sniffed TLS) | `PROPOLIS_CRED_MONGO_BIND` |
 | (any) | attacker | Catchall (TCP+UDP, multi-port) | `PROPOLIS_CATCHALL_BIND_ADDRS` |
 | 8080 | operator + machine | Console UI + `/health` `/ready` `/metrics` (loopback default) | `PROPOLIS_CONSOLE_BIND` |
 

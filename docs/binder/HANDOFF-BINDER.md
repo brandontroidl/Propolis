@@ -68,7 +68,7 @@ The essentials a new owner needs on day one:
   one PostgreSQL pool) plus twelve attacker-facing sensor processes, each its own
   systemd service and OS user. See [§4](#4-system-architecture).
 - **State of the code:** source-available and actively developed. Crate version
-  is `0.4.0` for twenty-one of the 27 crates (six crates are still at
+  is `0.4.0` for twenty-two of the 28 crates (six crates are still at
   `0.1.0`), but the **only release tag is `v0.1.0`**; the current tree is untagged.
   Not certified or production-blessed. See
   [§3](#3-current-implementation-status).
@@ -142,7 +142,7 @@ Read the version signals together, not in isolation
 
 | Fact | Value |
 |---|---|
-| Crate version (no `[workspace.package]` key) | `0.4.0` for twenty-one of the 27 crates; `0.1.0` for `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper` |
+| Crate version (no `[workspace.package]` key) | `0.4.0` for twenty-two of the 28 crates; `0.1.0` for `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper` |
 | Only release tag | `v0.1.0` (annotated, commit `e0bfd513`, 2026-08-02) |
 | `v0.2.0` / `v0.3.0` / `v0.4.0` tags | do not exist - the `0.4.0` tree is **untagged** |
 | `CHANGELOG.md` | a single, undated `## Unreleased` section, not version-partitioned |
@@ -181,7 +181,7 @@ and [audits](../history/audits.md).
 ## 4. System architecture
 
 Full section: [architecture index](../architecture/index.md). Propolis is a Rust
-workspace of **27 crates producing 20 binaries**
+workspace of **28 crates producing 21 binaries**
 ([components](../architecture/components.md)).
 
 **The one-node model** ([process topology](../architecture/process-topology.md)).
@@ -780,8 +780,8 @@ consult each for the authoritative table:
 | [dependencies](../reference/dependencies.md) | dependency and vendoring model |
 | [glossary](../reference/glossary.md) | terminology |
 
-**Quick facts to anchor the numbers** (each owned by a page above): 27 crates /
-20 binaries; 12 sensor crates / 15 protocols; 34 console routes (8 public, 26
+**Quick facts to anchor the numbers** (each owned by a page above): 28 crates /
+21 binaries; 12 sensor crates / 15 protocols; 34 console routes (8 public, 26
 session-gated); scoring half-life 6h; tiers Aggressive (score ≥ 90, confidence ≥
 0.95) and Standard (≥ 75, ≥ 0.70); tier TTLs 24h/48h; retention windows
 `24h,7d,30d,60d,90d`; feed build interval 900s; spool budgets 100 MB per spooling

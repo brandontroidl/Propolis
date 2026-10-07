@@ -1670,3 +1670,229 @@ fn no_private_key_pem_is_committed_under_crates_or_deploy() {
         "the walk is broken: only {scanned} text files scanned"
     );
 }
+
+/// The groups `provision.sh` adds `user` to with `usermod -aG <groups> <user>`.
+fn supplementary_groups(provision: &str, user: &str) -> HashSet<String> {
+    provision
+        .lines()
+        .filter_map(|l| {
+            let tokens: Vec<&str> = l.split_whitespace().collect();
+            match tokens.as_slice() {
+                ["run", "usermod", "-aG", groups, who] if *who == user => Some(groups.to_string()),
+                _ => None,
+            }
+        })
+        .flat_map(|groups| groups.split(',').map(str::to_string).collect::<Vec<_>>())
+        .collect()
+}
+
+/// The live watcher's account must be able to read every sensor's event log and nothing else:
+/// its groups are exactly the owning groups of the log directories `provision.sh` creates (read
+/// through the 0750/0640 group bits, never write), and `systemd-journal` stays an opt-in the
+/// operator adds by hand. It must also be reachable by SSH: a real shell for the forced command,
+/// a home for authorized_keys, and a password field sshd does not treat as locked.
+#[test]
+fn watch_user_reads_every_sensor_log_and_nothing_more_by_default() {
+    let provision = deploy_file("provision.sh");
+    let log_groups: HashSet<String> = provision
+        .lines()
+        .filter_map(|l| {
+            let tokens: Vec<&str> = l.split_whitespace().collect();
+            match tokens.as_slice() {
+                ["ensure_dir", path, mode, _owner, group]
+                    if path.starts_with("/var/log/propolis/") =>
+                {
+                    assert_eq!(*mode, "0750", "{path} must stay owner-write, group-read");
+                    Some(group.to_string())
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    assert!(log_groups.len() >= 12, "parsed only {log_groups:?}");
+    assert_eq!(
+        supplementary_groups(&provision, "propolis-watch"),
+        log_groups
+    );
+    assert_eq!(
+        supplementary_groups(&provision, "propolis-watch"),
+        supplementary_groups(&provision, "propolis"),
+        "the watcher reads exactly the logs the daemon reads"
+    );
+    let watch_groups = supplementary_groups(&provision, "propolis-watch");
+    assert!(
+        !watch_groups.contains("systemd-journal") && !watch_groups.contains("adm"),
+        "journal access is an opt-in step, not provisioned"
+    );
+    assert!(provision.lines().any(|l| l.trim()
+        == "run useradd --system --no-create-home --home-dir /var/lib/propolis-watch --shell /bin/sh --user-group propolis-watch"));
+    assert!(
+        provision
+            .lines()
+            .any(|l| l.trim() == "run usermod -p '*' propolis-watch")
+    );
+    // Root-owned all the way to the key file, so the account cannot change which keys log in.
+    for expected in [
+        [
+            "ensure_dir",
+            "/var/lib/propolis-watch",
+            "0750",
+            "root",
+            "propolis-watch",
+        ],
+        [
+            "ensure_dir",
+            "/var/lib/propolis-watch/.ssh",
+            "0755",
+            "root",
+            "root",
+        ],
+    ] {
+        assert!(
+            provision
+                .lines()
+                .any(|l| l.split_whitespace().collect::<Vec<_>>() == expected),
+            "provision.sh must run {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn both_deploy_scripts_install_the_watcher_binary() {
+    for script in ["install.sh", "upgrade.sh"] {
+        let text = deploy_file(script);
+        let loop_line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("for bin in "))
+            .unwrap_or_else(|| panic!("{script} has no binary install loop"));
+        assert!(
+            loop_line
+                .split_whitespace()
+                .any(|t| t.trim_end_matches(';') == "propolis-watch"),
+            "{script} does not install propolis-watch"
+        );
+    }
+}
+
+/// The example key line is the whole security boundary of the remote read path, so its options
+/// are pinned: `restrict` first, a forced command that runs only the watcher, and no option that
+/// would hand back a pty or a forward. It must carry a placeholder, never a real key.
+#[test]
+fn watch_authorized_keys_example_forces_the_watcher_under_restrict() {
+    let example = deploy_file("watch-authorized-keys.example");
+    let lines: Vec<&str> = example
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one example key line");
+    let line = lines[0];
+    let (options, rest) = line
+        .split_once(" ssh-ed25519 ")
+        .expect("an ssh-ed25519 key line");
+    assert_eq!(
+        options, "restrict,command=\"/usr/local/bin/propolis-watch\"",
+        "the key's only options are restrict and the bare forced command; the log list comes \
+         from /etc/propolis/watch.env, never a hand-kept copy here"
+    );
+    assert!(
+        rest.starts_with("AAAA... "),
+        "the example must not carry a real key"
+    );
+}
+
+/// Runs deploy/watch-env.sh against `source` content, writing into a fresh directory, and returns
+/// the directory and the script's output.
+fn run_watch_env(source: Option<&str>, dry_run: bool) -> (tempfile::TempDir, std::process::Output) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("propolis.env");
+    if let Some(content) = source {
+        std::fs::write(&src, content).unwrap();
+    }
+    let out = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/watch-env.sh"
+    ))
+    .arg(&src)
+    .arg(dir.path().join("watch.env"))
+    .env("DRY_RUN", if dry_run { "1" } else { "0" })
+    .output()
+    .expect("run deploy/watch-env.sh");
+    assert!(
+        out.status.success(),
+        "watch-env.sh failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (dir, out)
+}
+
+/// The watcher's account may read watch.env, so nothing from propolis.env but the one key may
+/// ever reach it: the database URL and the console password sit in the same source file.
+#[test]
+fn watch_env_copies_only_the_sensor_logs_line_from_propolis_env() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = "DATABASE_URL=postgres://propolis:EXAMPLE-SECRET@localhost/propolis\n\
+                   PROPOLIS_CONSOLE_PASSWORD=EXAMPLE-SECRET\n\
+                   # PROPOLIS_SENSOR_LOGS=commented:/var/log/x.jsonl\n\
+                   PROPOLIS_SENSOR_LOGS=old:/var/log/old.jsonl\n\
+                   PROPOLIS_SENSOR_LOGS_EXTRA=EXAMPLE-SECRET\n\
+                   PROPOLIS_SENSOR_LOGS=ssh:/var/log/propolis/ssh/events.jsonl\n\
+                   PROPOLIS_VENDOR_ABUSEIPDB_KEY=EXAMPLE-SECRET\n";
+    let (dir, _) = run_watch_env(Some(fixture), false);
+    let written = std::fs::read_to_string(dir.path().join("watch.env")).unwrap();
+    assert_eq!(
+        written,
+        "PROPOLIS_SENSOR_LOGS=ssh:/var/log/propolis/ssh/events.jsonl\n"
+    );
+    assert!(!written.contains("EXAMPLE-SECRET"));
+    let mode = std::fs::metadata(dir.path().join("watch.env"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o640);
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["propolis.env", "watch.env"],
+        "no temporary file left behind"
+    );
+}
+
+#[test]
+fn watch_env_writes_nothing_without_the_key_without_a_source_or_in_dry_run() {
+    let (dir, _) = run_watch_env(
+        Some("DATABASE_URL=postgres://u:EXAMPLE-SECRET@h/db\n"),
+        false,
+    );
+    assert!(!dir.path().join("watch.env").exists());
+    let (dir, _) = run_watch_env(None, false);
+    assert!(!dir.path().join("watch.env").exists());
+    let (dir, out) = run_watch_env(Some("PROPOLIS_SENSOR_LOGS=a:/x\n"), true);
+    assert!(!dir.path().join("watch.env").exists());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("[dry-run]"));
+}
+
+/// Derived on every provision, which upgrade.sh runs, and only once the account it hands the file
+/// to exists.
+#[test]
+fn provision_derives_watch_env_after_creating_the_account() {
+    let provision = deploy_file("provision.sh");
+    let lines: Vec<&str> = provision.lines().collect();
+    let derive = lines
+        .iter()
+        .position(|l| l.contains("/watch-env.sh\""))
+        .expect("provision.sh never runs watch-env.sh");
+    let account = lines
+        .iter()
+        .position(|l| l.contains("usermod -aG") && l.trim_end().ends_with(" propolis-watch"))
+        .expect("provision.sh never sets the watch account's groups");
+    assert!(account < derive);
+    assert!(
+        lines[derive].contains("DRY_RUN=\"$DRY_RUN\""),
+        "dry runs must stay dry"
+    );
+    assert!(deploy_file("upgrade.sh").contains("/provision.sh\""));
+}

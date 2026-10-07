@@ -37,7 +37,7 @@ echo "==> installing binaries"
 # one host, so this list covers both topologies at once - a box running only the collector role
 # (or only the control-plane role) simply has no unit file for the other side's binaries and the
 # is-enabled guard below skips restarting what was never enabled.
-for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred gateway shipper; do
+for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred gateway shipper propolis-watch; do
     install -m 0755 "$BUILD_DIR/$bin" "/usr/local/bin/$bin"
 done
 

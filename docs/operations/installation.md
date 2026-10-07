@@ -25,10 +25,11 @@ From the repository root:
 cargo build --release
 ```
 
-This produces the release binaries in `target/release/`: `propolis` plus the
+This produces the release binaries in `target/release/`: `propolis`, the
 twelve sensor binaries `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
 `sensor-redis`, `sensor-adb`, `sensor-http`, `sensor-ftp`, `sensor-smtp`,
-`sensor-tftp`, `sensor-mqtt`, `sensor-dns`, `sensor-cred` (`deploy/install.sh#4/9 installing binaries to /usr/local/bin`). `install.sh` errors if any expected
+`sensor-tftp`, `sensor-mqtt`, `sensor-dns`, `sensor-cred`, and the read-only
+live watcher `propolis-watch` (`deploy/install.sh#4/9 installing binaries to /usr/local/bin`). `install.sh` errors if any expected
 source binary is missing or non-executable, so build before you install
 (`deploy/install.sh#not found or not executable`). The build host must have the pinned Rust
 toolchain (`1.96.1`, `rust-toolchain.toml`); see
@@ -63,7 +64,7 @@ points provision identically, `deploy/install.sh#run_provision`); steps 4-9 run 
 
 | Step | Action | Cite |
 |---|---|---|
-| 1/9 | Creates 13 system users (`propolis` + one per each of the twelve sensors) with `useradd --system --no-create-home --shell /usr/sbin/nologin --user-group`, then adds `propolis` to each sensor's group so the daemon can read group-readable sensor logs | `deploy/provision.sh#ensure_user`, `deploy/provision.sh#usermod -aG` |
+| 1/9 | Creates 13 system users (`propolis` + one per each of the twelve sensors) with `useradd --system --no-create-home --shell /usr/sbin/nologin --user-group`, then adds `propolis` to each sensor's group so the daemon can read group-readable sensor logs. Also creates `propolis-watch`, the SSH login for the read-only live watcher: home `/var/lib/propolis-watch`, shell `/bin/sh` (sshd runs a forced command through it), password field `*`, and the same sensor groups as `propolis`, for read access only. Its home and `.ssh` are root-owned so it cannot change its own keys, and `deploy/watch-env.sh` derives `/etc/propolis/watch.env` (the one `PROPOLIS_SENSOR_LOGS` line from `propolis.env`; nothing is written until that file sets it); see [live-watch.md](live-watch.md) | `deploy/provision.sh#ensure_user`, `deploy/provision.sh#usermod -aG`, `deploy/provision.sh#propolis-watch` |
 | 2/9 | Creates config/log/state directories with specific owners and modes (see [../reference/filesystem-paths.md](../reference/filesystem-paths.md)) | `deploy/provision.sh#2/9 creating directories` |
 | 3/9 | Creates spool mountpoints; **prints fstab guidance for the `noexec,nosuid,nodev` mounts but does not create them** | `deploy/provision.sh#3/9 creating spool directories (mountpoints only)`, fstab guidance `deploy/install.sh#NOT DONE BY THIS SCRIPT` |
 | 4/9 | `install -m 0755` each binary to `/usr/local/bin/`, then mints the per-sensor self-signed TLS pairs into `/etc/propolis/tls` with `deploy/provision-tls.sh` (idempotent; needs the release `provision-certs` binary, so it runs after the build, not inside `provision.sh`). Minting turns nothing on: a sensor uses its pair only once its TLS variables are set; see [networking-tls.md](networking-tls.md#sensor-tls-attacker-facing-listeners) | `deploy/install.sh#4/9 installing binaries to /usr/local/bin`, `deploy/install.sh#run_provision_tls` |

@@ -26,6 +26,7 @@ For the trust model behind these boundaries see [threat-model.md](threat-model.m
 | Quarantine spool | internal file store | worker writes, console reads | SHA-256 naming, `0640`, `noexec` mount, byte budget |
 | Feed publish | outbound (files) | anyone consuming the public feed | field selection excludes internal fields; operator-run sync |
 | Enrichment / reporting egress | outbound | operator-configured services | all opt-in, default off, fail-closed |
+| Live watch (`propolis-watch`) | outbound read path (SSH) | holder of the operator's dedicated watch key | forced command under `restrict`, read-only by construction, group read only |
 
 ## Sensor listeners
 
@@ -252,6 +253,60 @@ See [sample-and-credential-privacy.md](sample-and-credential-privacy.md) and
 The feed publish / blocklist-sync cron is an **operator setup step**
 (`deploy/blocklist-sync.sh`, referenced by comment), **not** wired into any shipped
 systemd timer or cron unit. See [../operations/deployment-models.md](../operations/deployment-models.md).
+
+## Live watch (`propolis-watch` over SSH)
+
+An operator-installed read path, not a listener Propolis opens: the honeypot's own sshd accepts
+one dedicated key for the `propolis-watch` account and runs the watcher as that key's forced
+command. Absent until the operator adds a key to `/var/lib/propolis-watch/.ssh/authorized_keys`;
+`deploy/provision.sh` creates the account and the empty `.ssh` directory, never a key. Setup:
+[../operations/live-watch.md](../operations/live-watch.md).
+
+Exposes: everything the sensors record, in real time, to whoever holds the private key. That is
+attacker data (source addresses, submitted usernames, commands, banners, file names) plus the
+honeypot's own `wan_ip` stamped on events, and, with the opt-in `--journal`, the units' journal.
+Treat the key as granting read access to the event ledger's raw input.
+
+Controls:
+
+- **Cannot write.** The account reaches the event logs only through supplementary membership in
+  each sensor's group, and the logs are `0640` in `0750` directories, so the group bit grants read
+  and nothing else (`deploy/provision.sh#propolis-watch`). The watcher itself opens files
+  read-only and persists nothing: it tails through `LogTailer::without_cursor`, which has no
+  cursor to save (`crates/log-tailer/src/tailer.rs#LogTailer::without_cursor`), and a static
+  test fails if its source gains a file-writing call
+  (`crates/watch/tests/read_only.rs#never_writes_a_file`).
+- **Cannot execute.** `command=` forces the watcher whatever the client asks for; the client's
+  request arrives only as `SSH_ORIGINAL_COMMAND`, which the watcher splits on whitespace and
+  checks against a fixed flag allowlist, exiting 2 on any other word
+  (`crates/watch/src/args.rs#parse`). Nothing from it reaches a shell. The watcher's one child is
+  `journalctl` with a constant argument vector (`crates/watch/src/journal.rs#JOURNAL_ARGS`),
+  started only with `--journal`, and a static test keeps that the only spawn
+  (`crates/watch/tests/read_only.rs#never_executes_anything_but_the_fixed_journalctl`).
+- **Cannot forward or get a terminal.** `restrict` disables port, agent and X11 forwarding, pty
+  allocation and `~/.ssh/rc` for the key (`deploy/watch-authorized-keys.example`,
+  pinned by `crates/sensor-framework/tests/deploy_test.rs#watch_authorized_keys_example_forces_the_watcher_under_restrict`).
+  The watcher opens no socket and links no database driver
+  (`crates/watch/tests/read_only.rs#never_opens_a_socket_or_reaches_a_database`).
+- **Cannot add a key.** The account's home is root:propolis-watch 0750, its `.ssh` root:root
+  0755 and `authorized_keys` root:root 0644, so it can read the keys that log in to it but cannot
+  append one, replace the file, or rename `.ssh` aside, even if attacker data ever got it to run
+  code (`deploy/provision.sh#ensure_dir /var/lib/propolis-watch`). sshd's StrictModes accepts
+  root-owned key files and directories that no one else can write.
+- **No secret on the path.** The account cannot read `/etc/propolis/propolis.env`. Its log list
+  comes from `/etc/propolis/watch.env`, which `deploy/watch-env.sh` derives from `propolis.env`
+  by copying the one `PROPOLIS_SENSOR_LOGS` line, checks holds nothing else before renaming it
+  into place, and writes root:propolis-watch 0640
+  (`crates/sensor-framework/tests/deploy_test.rs#watch_env_copies_only_the_sensor_logs_line_from_propolis_env`).
+  The watcher reads only that key from it. No password can log in to the account (its password
+  field is `*`), and journal access is not granted unless the operator adds `systemd-journal` by
+  hand.
+
+The stream carries attacker-controlled text. Sensors sanitize every attacker string before it
+enters an event ([input-handling.md](input-handling.md)), and the watcher JSON-escapes whatever
+it emits, so a control byte arrives as an escape sequence rather than acting on a terminal. But
+the content is still written by attackers: a human or an AI assistant reading the stream must
+treat it as data, never as instructions, the same as any captured payload.
 
 ## Enrichment and reporting egress
 

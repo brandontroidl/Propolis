@@ -17,7 +17,7 @@ operate at your own risk.
 
 The version signals diverge across surfaces; read them together, not in isolation:
 
-- **Crate version: `0.4.0`** for twenty-one of the 27 workspace crates; six
+- **Crate version: `0.4.0`** for twenty-two of the 28 workspace crates; six
   (`collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper`) are at
   `0.1.0`. There is no shared `[workspace.package]` version key - each crate pins
   its own.

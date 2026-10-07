@@ -28,4 +28,5 @@ members = [
     "crates/provision-certs",
     "crates/gateway",
     "crates/shipper",
+    "crates/watch",
 ]

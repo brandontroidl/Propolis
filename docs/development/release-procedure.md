@@ -18,7 +18,7 @@ observable state and marked `[inferred]` where the mechanism is not documented i
 
 | Fact | Value | Source |
 |---|---|---|
-| Crate version | `0.4.0` for twenty-one of the 27 crates; `0.1.0` for `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper` | each `crates/*/Cargo.toml#version` |
+| Crate version | `0.4.0` for twenty-two of the 28 crates; `0.1.0` for `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper` | each `crates/*/Cargo.toml#version` |
 | Only release tag | `v0.1.0` ("v0.1.0: initial release") | `git tag` |
 | Tags `v0.2.0` / `v0.3.0` / `v0.4.0` | do not exist | `git tag` |
 | `CHANGELOG.md` | a single, undated `## Unreleased` section | `CHANGELOG.md#Unreleased` |
@@ -40,7 +40,7 @@ and [`governance/release-policy`](../governance/release-policy.md).
 ### 1. Bump the version
 
 The workspace has **no `[workspace.package]`** table, so version is declared
-per-crate. Twenty-one crates read `version = "0.4.0"`;
+per-crate. Twenty-two crates read `version = "0.4.0"`;
 six (`collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper`) read
 `version = "0.1.0"` and have not been bumped yet. A version bump updates each crate
 manifest it applies to. Run `cargo build --locked`

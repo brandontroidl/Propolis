@@ -42,16 +42,23 @@ impl EventEmitter {
     /// returns the id actually written. Minting here - the single chokepoint every sensor uses -
     /// guarantees every event that lands in the local log has a stable id with no per-sensor code
     /// required to set one.
+    ///
+    /// The same chokepoint stamps `metadata.local_port` from the listener the calling task is
+    /// serving (see [`crate::arrival`]), so no sensor builds that key itself either.
     pub async fn append(&self, event: &SensorEvent) -> std::io::Result<uuid::Uuid> {
         let occurrence_id = event.occurrence_id.unwrap_or_else(uuid::Uuid::now_v7);
+        let arrival = crate::arrival::current();
 
-        // Serialize with the id set. Only clone when we actually minted one; a caller that already
-        // stamped the id (the capture worker, Task 4) pays no clone.
-        let line = if event.occurrence_id.is_some() {
+        // Only clone when something is added; an event outside any listener scope that already
+        // carries its id (a test, a tool) pays no clone.
+        let line = if event.occurrence_id.is_some() && arrival.is_none() {
             serde_json::to_string(event)
         } else {
             let mut e = event.clone();
             e.occurrence_id = Some(occurrence_id);
+            if let Some(arrival) = arrival {
+                crate::arrival::stamp(&mut e, arrival);
+            }
             serde_json::to_string(&e)
         }
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -216,6 +223,35 @@ mod tests {
         let line = std::fs::read_to_string(&log).unwrap();
         let written: SensorEvent = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(written.occurrence_id, Some(fixed));
+    }
+
+    #[tokio::test]
+    async fn append_stamps_the_arrival_port_inside_a_listener_scope_and_nothing_outside_one() {
+        use crate::arrival::{Arrival, LOCAL_PORT_KEY, scope};
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let emitter = EventEmitter::new(log.clone());
+        // A pre-minted id must not skip the stamp: the capture worker always arrives with one.
+        let mut with_id = sample_event();
+        with_id.occurrence_id = Some(uuid::Uuid::now_v7());
+        scope(Arrival::new(2222), emitter.append(&with_id))
+            .await
+            .unwrap();
+        scope(Arrival::new(22), emitter.append(&sample_event()))
+            .await
+            .unwrap();
+        emitter.append(&sample_event()).await.unwrap();
+
+        let written: Vec<SensorEvent> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(written[0].metadata[LOCAL_PORT_KEY], 2222);
+        assert_eq!(written[0].occurrence_id, with_id.occurrence_id);
+        assert_eq!(written[1].metadata[LOCAL_PORT_KEY], 22);
+        assert_eq!(written[1].metadata["command"], "uname -a");
+        assert!(written[2].metadata.get(LOCAL_PORT_KEY).is_none());
     }
 
     #[tokio::test]

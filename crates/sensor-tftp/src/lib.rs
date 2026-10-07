@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
-    CaptureHandoff, CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
-    EventEmitter, FloodLedger, OutboxManifest, PerSourceLimiter, QuarantineSpool, RateDecision,
-    RateLimitConfig, ReplyRateLimiter, WanResolver, default_per_source_cap,
+    Arrival, CaptureHandoff, CaptureMemoryBudget, ConnectionBounds,
+    DEFAULT_CAPTURE_BUDGET_BYTES_256M, EventEmitter, FloodLedger, OutboxManifest, PerSourceLimiter,
+    QuarantineSpool, RateDecision, RateLimitConfig, ReplyRateLimiter, WanResolver, arrival,
+    default_per_source_cap,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
@@ -50,6 +51,9 @@ pub struct TftpServer {
     summary_handle: JoinHandle<()>,
     sensor: Arc<Sensor>,
     flood: Arc<RequestFlood>,
+    /// The request socket's port. The summary task and the shutdown flush emit outside every
+    /// request's scope, so each enters this one itself.
+    arrival: Arrival,
 }
 
 impl TftpServer {
@@ -63,9 +67,9 @@ impl TftpServer {
     /// Emit every rate-limited summary still accumulating, due or not. Bounded by the summary
     /// table's fixed capacity; called at shutdown after [`TftpServer::abort`].
     pub async fn flush_rate_limited(&self) {
-        self.sensor
-            .emit_summaries(self.flood.ledger.drain(), self.flood.ledger.window())
-            .await;
+        let summaries = self.flood.ledger.drain();
+        let window = self.flood.ledger.window();
+        arrival::scope(self.arrival, self.sensor.emit_summaries(summaries, window)).await;
     }
 }
 
@@ -143,14 +147,19 @@ pub async fn start_test_server_with_capture_budget(
         ledger: FloodLedger::new(&rate),
     });
 
+    let arrival = Arrival::new(bound.port());
     let serve_handle = tokio::spawn(serve(
         socket,
+        arrival,
         sensor.clone(),
         semaphore,
         limiter,
         flood.clone(),
     ));
-    let summary_handle = tokio::spawn(emit_due_summaries(sensor.clone(), flood.clone()));
+    let summary_handle = tokio::spawn(arrival::scope(
+        arrival,
+        emit_due_summaries(sensor.clone(), flood.clone()),
+    ));
     Ok(TftpServer {
         addr: bound,
         handoff,
@@ -158,6 +167,7 @@ pub async fn start_test_server_with_capture_budget(
         summary_handle,
         sensor,
         flood,
+        arrival,
     })
 }
 
@@ -167,8 +177,13 @@ pub async fn start_test_server_with_capture_budget(
 /// charged; the DATA and ACK packets of a running transfer arrive on its own socket, already
 /// pinned to one peer. A request that cannot get a per-source slot or a concurrency permit is
 /// dropped unanswered, like any other lost datagram, and the loop keeps draining the socket.
+///
+/// `arrival` is this socket's bound port. Every event of a request, its upload's included, is
+/// stamped with it: the request arrived here even though its transfer runs on its own ephemeral
+/// socket.
 async fn serve(
     socket: UdpSocket,
+    arrival: Arrival,
     sensor: Arc<Sensor>,
     semaphore: Arc<Semaphore>,
     limiter: PerSourceLimiter,
@@ -218,7 +233,10 @@ async fn serve(
         tokio::spawn(async move {
             let _permit = permit;
             let _source_guard = source_guard;
-            let handled = tokio::time::timeout(max_duration, sensor.handle_request(peer, request));
+            let handled = tokio::time::timeout(
+                max_duration,
+                arrival::scope(arrival, sensor.handle_request(peer, request)),
+            );
             if handled.await.is_err() {
                 tracing::warn!(%peer, "tftp: transfer exceeded max_duration; dropped");
             }

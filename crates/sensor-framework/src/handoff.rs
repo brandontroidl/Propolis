@@ -57,6 +57,7 @@ use sensor_wire::{SampleRef, SensorEvent};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::arrival::{self, Arrival};
 use crate::capture_budget::{CaptureBody, CaptureMemoryBudget};
 use crate::emit::EventEmitter;
 use crate::outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
@@ -91,6 +92,13 @@ pub struct CaptureJob {
     pub body: CaptureBody,
     pub orig_name: String,
     pub event_builder: Box<dyn FnOnce(SampleRef) -> SensorEvent + Send>,
+}
+
+/// A job as it waits in the queue: with the listener the submitting connection arrived on, read
+/// in `submit` because the worker's own task is outside every listener's scope.
+struct Queued {
+    job: CaptureJob,
+    arrival: Option<Arrival>,
 }
 
 /// Why a session-scoped capture stopped, and therefore whether its bytes are the whole of what
@@ -256,8 +264,8 @@ impl DrainOutcome {
 /// `start_worker` is meant to be called exactly once regardless of how many handlers share the
 /// `Arc`.
 pub struct CaptureHandoff {
-    tx: mpsc::Sender<CaptureJob>,
-    rx: Mutex<Option<mpsc::Receiver<CaptureJob>>>,
+    tx: mpsc::Sender<Queued>,
+    rx: Mutex<Option<mpsc::Receiver<Queued>>>,
     dropped: AtomicU64,
     /// The process-wide ceiling on capture bodies buffered in memory. Sensors build every capture
     /// buffer from it (`new_capture_body`), and the worker refunds a body once it is spooled.
@@ -364,7 +372,11 @@ impl CaptureHandoff {
         if self.closing.load(Ordering::SeqCst) {
             return Err(CaptureDropped);
         }
-        let sent = self.tx.try_send(job).map_err(|e| {
+        let queued = Queued {
+            job,
+            arrival: arrival::current(),
+        };
+        let sent = self.tx.try_send(queued).map_err(|e| {
             // A receiver closed by a concurrent `drain` that raced the check above: refuse the
             // same way, uncounted.
             if matches!(e, mpsc::error::TrySendError::Closed(_)) {
@@ -547,13 +559,17 @@ async fn process_job(
     spool_refused: &AtomicU64,
     collector_id: &str,
     outbox: &OutboxManifest,
-    job: CaptureJob,
+    queued: Queued,
 ) {
-    let CaptureJob {
-        body,
-        orig_name,
-        event_builder,
-    } = job;
+    let Queued {
+        job:
+            CaptureJob {
+                body,
+                orig_name,
+                event_builder,
+            },
+        arrival,
+    } = queued;
     let budget_truncated = body.is_exhausted();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let stored = spool.store(body.as_slice());
@@ -628,7 +644,11 @@ async fn process_job(
         }
     }
 
-    if let Err(e) = emitter.append(&event).await {
+    let appended = match arrival {
+        Some(arrival) => arrival::scope(arrival, emitter.append(&event)).await,
+        None => emitter.append(&event).await,
+    };
+    if let Err(e) = appended {
         tracing::error!(
             error = %e,
             "capture hand-off: event emit failed after spool store succeeded"
@@ -933,6 +953,51 @@ mod tests {
         let sample = event.sample.unwrap();
         assert!(!sample.sha256.is_empty());
         assert_eq!(sample.size, b"malware payload".len() as u64);
+    }
+
+    /// The worker emits on its own task, outside every listener's scope, so the upload event is
+    /// stamped with the port the SUBMITTING connection arrived on or not at all. Two submissions
+    /// from two listeners must keep their own ports, and one from outside any listener gets none.
+    #[tokio::test]
+    async fn the_upload_event_carries_the_submitting_connections_arrival_port() {
+        use crate::arrival::{Arrival, LOCAL_PORT_KEY, scope};
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(log_path.clone());
+        let handoff = test_handoff(spool, emitter, 16, dir.path());
+        handoff.start_worker();
+
+        let job = |name: &str| CaptureJob {
+            body: body_of(name.as_bytes()),
+            orig_name: name.into(),
+            event_builder: Box::new(|sample| test_event(Some(sample))),
+        };
+        scope(Arrival::new(2222), async { handoff.submit(job("a")) })
+            .await
+            .unwrap();
+        scope(Arrival::new(5555), async { handoff.submit(job("b")) })
+            .await
+            .unwrap();
+        handoff.submit(job("c")).unwrap();
+        wait_for_lines(&log_path, 3).await;
+
+        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let ports: std::collections::HashMap<String, Option<u64>> = content
+            .lines()
+            .map(|l| serde_json::from_str::<SensorEvent>(l).unwrap())
+            .map(|e| {
+                (
+                    e.sample.unwrap().orig_name,
+                    e.metadata.get(LOCAL_PORT_KEY).and_then(|p| p.as_u64()),
+                )
+            })
+            .collect();
+        assert_eq!(ports["a"], Some(2222));
+        assert_eq!(ports["b"], Some(5555));
+        assert_eq!(ports["c"], None);
     }
 
     #[tokio::test]

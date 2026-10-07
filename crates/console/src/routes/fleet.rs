@@ -12,10 +12,17 @@
 //!
 //! **The inventory is the row set, not the ledger.** Rows are built by walking the configured
 //! listeners and joining the ledger onto them, never the other way round: a listener with no
-//! events must appear, saying `never`, because "produced nothing" is exactly the state worth
-//! seeing. A sensor present in the ledger but absent from the inventory gets its own row flagged
+//! events must appear, saying `none in 30d`, because "produced nothing" is exactly the state worth
+//! seeing. A listener present in the ledger but absent from the inventory gets its own row flagged
 //! `undeclared listener`, which catches the inventory drifting after a port was added on the box
 //! but not at the control plane.
+//!
+//! **A listener is `(sensor, transport, port)` on both sides.** The ledger's side is
+//! `event.sensor`, `event.protocol` and the `metadata.local_port` the sensor framework stamps on
+//! every event (`sensor_framework::arrival`). Events from before that stamp existed are given to
+//! their sensor's listener when it declares exactly one, and otherwise shown on one `port not
+//! recorded` row per sensor rather than guessed onto a port. Activity is read from two ranges on
+//! `observed_at` (the last 24 hours, and the 30 days before), never the whole ledger.
 //!
 //! **Every panel soft-fails; nothing here returns a 503.** On this page a hard error would hide
 //! the very failure the operator came to see, and a query error rendering as "0" would be worse
@@ -197,34 +204,133 @@ fn sev_class(level: Level) -> &'static str {
     }
 }
 
-/// Per-sensor ledger activity, keyed by the sensor's OWN reported name (`event.sensor`), which is
-/// what the inventory is keyed on too. See `fleet::inventory`'s note on why the
-/// `PROPOLIS_SENSOR_LOGS` label is the wrong key.
-struct SensorActivity {
+/// How far back the LAST EVENT column looks. The ledger is never scanned whole on a page load: a
+/// listener whose newest event is older than this reads `none in 30d`, which is true whether it
+/// went quiet a month ago or never produced anything. `ACTIVITY_LOOKBACK_LABEL` is the same window
+/// in the page's words; the two are kept side by side so they cannot describe different windows.
+const ACTIVITY_LOOKBACK: &str = "30 days";
+const ACTIVITY_LOOKBACK_LABEL: &str = "none in 30d";
+
+/// One listener as the ledger names it: the sensor's OWN reported name (`event.sensor`, which is
+/// what the inventory is keyed on too - see `fleet::inventory`'s note on why the
+/// `PROPOLIS_SENSOR_LOGS` label is the wrong key), the transport (`event.protocol`), and the port
+/// the framework stamped as `metadata.local_port`. `None` for an event written before sensors
+/// recorded their port.
+type ActivityKey = (String, String, Option<u16>);
+
+/// Ledger activity for one [`ActivityKey`] within the lookback.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Activity {
     last_event_at: Option<DateTime<Utc>>,
     events_24h: i64,
 }
 
-async fn sensor_activity(db: &PgPool) -> Result<HashMap<String, SensorActivity>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT sensor, \
-                max(observed_at) AS last_event_at, \
-                count(*) FILTER (WHERE observed_at >= now() - interval '24 hours') AS events_24h \
-         FROM event GROUP BY sensor",
+impl Activity {
+    fn merge(&mut self, other: Activity) {
+        self.last_event_at = self.last_event_at.max(other.last_event_at);
+        self.events_24h += other.events_24h;
+    }
+}
+
+/// Per-listener activity from two range-bounded reads, neither of which touches the ledger
+/// outside the lookback: the last 24 hours (the count and the newest event), then the rest of the
+/// lookback (the newest event only, for listeners quiet today). Both are ranges on `observed_at`,
+/// which `event_observed_at_idx` serves.
+///
+/// The two statements see different `now()`s, a few milliseconds apart. That can only make an
+/// event fall in both ranges, never in neither, and the second read contributes nothing but a
+/// `max`, so the overlap changes no number.
+async fn listener_activity(db: &PgPool) -> Result<HashMap<ActivityKey, Activity>, sqlx::Error> {
+    let recent = sqlx::query(
+        "SELECT sensor, protocol::text AS protocol, metadata->>'local_port' AS local_port, \
+                count(*) AS events_24h, max(observed_at) AS last_event_at \
+         FROM event \
+         WHERE observed_at >= now() - interval '24 hours' \
+         GROUP BY 1, 2, 3",
     )
     .fetch_all(db)
     .await?;
-    let mut out = HashMap::with_capacity(rows.len());
-    for row in rows {
-        out.insert(
-            row.try_get::<String, _>("sensor")?,
-            SensorActivity {
-                last_event_at: row.try_get("last_event_at")?,
-                events_24h: row.try_get("events_24h")?,
-            },
-        );
+    // Audited: interpolates only the `ACTIVITY_LOOKBACK` constant, never user input.
+    let earlier = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT sensor, protocol::text AS protocol, metadata->>'local_port' AS local_port, \
+                0::bigint AS events_24h, max(observed_at) AS last_event_at \
+         FROM event \
+         WHERE observed_at >= now() - interval '{ACTIVITY_LOOKBACK}' \
+           AND observed_at < now() - interval '24 hours' \
+         GROUP BY 1, 2, 3"
+    )))
+    .fetch_all(db)
+    .await?;
+
+    let mut out: HashMap<ActivityKey, Activity> = HashMap::new();
+    for row in recent.iter().chain(earlier.iter()) {
+        // A value that is not a port number (absent, or written by something other than the
+        // framework) cannot name a listener, so it is filed with the unrecorded ones rather than
+        // dropped: the events still happened and still count.
+        let port = row
+            .try_get::<Option<String>, _>("local_port")?
+            .and_then(|p| p.parse::<u16>().ok());
+        let key = (row.try_get("sensor")?, row.try_get("protocol")?, port);
+        out.entry(key).or_default().merge(Activity {
+            last_event_at: row.try_get("last_event_at")?,
+            events_24h: row.try_get("events_24h")?,
+        });
     }
     Ok(out)
+}
+
+/// The ledger's activity, attributed to listener rows.
+#[derive(Debug, Default, PartialEq)]
+struct Attributed {
+    /// Keyed by `(sensor, protocol, port)`, declared or not.
+    by_listener: HashMap<(String, String, u16), Activity>,
+    /// Events with no recorded port from a sensor that does not have exactly one declared
+    /// listener, so they cannot be given to one. One entry per sensor.
+    unrecorded: HashMap<String, Activity>,
+}
+
+/// Attribute each key's activity to a listener. An event with no recorded port goes to its
+/// sensor's listener when the inventory declares exactly one (every pre-upgrade event of a
+/// single-port sensor came in on that port, whatever transport it names); otherwise it is kept
+/// apart, per sensor, rather than guessed onto one of several ports. Two collectors declaring the
+/// same `(protocol, port)` for a sensor are one listener here, since the ledger does not record
+/// which collector an event came from.
+fn attribute(
+    activity: HashMap<ActivityKey, Activity>,
+    inventory: &[fleet::Listener],
+) -> Attributed {
+    let mut declared: HashMap<&str, HashSet<(&'static str, u16)>> = HashMap::new();
+    for l in inventory {
+        declared
+            .entry(l.sensor.as_str())
+            .or_default()
+            .insert((l.protocol.as_str(), l.port));
+    }
+    let mut out = Attributed::default();
+    for ((sensor, protocol, port), seen) in activity {
+        let key = match port {
+            Some(port) => (sensor, protocol, port),
+            None => match declared.get(sensor.as_str()) {
+                Some(only) if only.len() == 1 => {
+                    let &(protocol, port) = only.iter().next().expect("one element");
+                    (sensor, protocol.to_string(), port)
+                }
+                _ => {
+                    out.unrecorded.entry(sensor).or_default().merge(seen);
+                    continue;
+                }
+            },
+        };
+        out.by_listener.entry(key).or_default().merge(seen);
+    }
+    out
+}
+
+/// The LAST EVENT cell's words.
+fn last_event_text(last_event_at: Option<DateTime<Utc>>) -> String {
+    last_event_at
+        .map(format_relative_time)
+        .unwrap_or_else(|| ACTIVITY_LOOKBACK_LABEL.to_string())
 }
 
 /// Capture completeness per sensor.
@@ -648,7 +754,10 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         })
         .collect();
 
-    let activity = degraded.soft("sensor activity", sensor_activity(&state.db).await);
+    let activity = attribute(
+        degraded.soft("listener activity", listener_activity(&state.db).await),
+        &state.fleet_listeners,
+    );
 
     let mut listeners = Vec::with_capacity(state.fleet_listeners.len());
     let mut levels = Vec::with_capacity(state.fleet_listeners.len());
@@ -692,7 +801,11 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         }
         let reach_detail = (!detail_parts.is_empty()).then(|| detail_parts.join("; "));
 
-        let seen = activity.get(&listener.sensor);
+        let seen = activity.by_listener.get(&(
+            listener.sensor.clone(),
+            listener.protocol.as_str().to_string(),
+            listener.port,
+        ));
         let last_event_at = seen.and_then(|a| a.last_event_at);
         let event_level = event_age_level(last_event_at, now);
         let state_level = combine(&[reach, event_level]);
@@ -730,9 +843,7 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
                 .map(|p| format_relative_time(p.attempted_at))
                 .unwrap_or_else(|| "never".to_string()),
             confirmed_ago: probe.and_then(|p| p.confirmed_at).map(format_relative_time),
-            last_event_ago: last_event_at
-                .map(format_relative_time)
-                .unwrap_or_else(|| "never".to_string()),
+            last_event_ago: last_event_text(last_event_at),
             last_event_dot: dot_class(event_level),
             events_24h: seen.map(|a| a.events_24h).unwrap_or(0),
             state_level: state_level.class(),
@@ -740,21 +851,76 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         });
     }
 
-    // A sensor the ledger has seen but the inventory does not name. The events are real, so the
-    // pane must show them, and it must say plainly that the control plane was never told this
-    // listener exists rather than quietly folding it in as if it had been.
-    let declared: HashSet<&str> = state
+    let declared_sensors: HashSet<&str> = state
         .fleet_listeners
         .iter()
         .map(|l| l.sensor.as_str())
         .collect();
-    let mut undeclared: Vec<&String> = activity
-        .keys()
-        .filter(|s| !declared.contains(s.as_str()))
+
+    // Events with no recorded port, from a sensor the inventory declares several listeners for.
+    // They cannot be given to any one of those rows, and dropping them would make the page's
+    // numbers quietly smaller than the ledger's, so they get one row per sensor that says so. It
+    // is not a listener: it counts toward no total and no headline, and its dots stay neutral,
+    // because nothing about it wants the operator. It disappears once that history is older than
+    // the lookback.
+    let mut unrecorded: Vec<(&String, &Activity)> = activity
+        .unrecorded
+        .iter()
+        .filter(|(sensor, _)| declared_sensors.contains(sensor.as_str()))
         .collect();
-    undeclared.sort();
-    for sensor in undeclared {
-        let seen = &activity[sensor];
+    unrecorded.sort_by_key(|(sensor, _)| sensor.as_str());
+    let mut unrecorded_rows = Vec::with_capacity(unrecorded.len());
+    for (sensor, seen) in unrecorded {
+        unrecorded_rows.push(ListenerRow {
+            collector: "unknown".into(),
+            sensor: sensor.clone(),
+            sensor_label: format_sensor_label(sensor),
+            protocol: "--".into(),
+            port: "--".into(),
+            vantage: String::new(),
+            reach: "port not recorded".into(),
+            reach_level: Level::Ok.class(),
+            reach_dot: dot_class(Level::Ok),
+            reach_detail: Some(
+                "events recorded before sensors stamped their listener port, so they cannot be \
+                 attributed to one of this sensor's listeners"
+                    .into(),
+            ),
+            probe_ago: "--".into(),
+            confirmed_ago: None,
+            last_event_ago: last_event_text(seen.last_event_at),
+            last_event_dot: dot_class(Level::Ok),
+            events_24h: seen.events_24h,
+            state_level: Level::Ok.class(),
+            declared: true,
+        });
+    }
+
+    // A listener the ledger has seen but the inventory does not name: a port a declared sensor
+    // was never declared on, or a sensor the inventory does not know at all (whose pre-upgrade
+    // events have no port to show). The events are real, so the pane must show them, and it must
+    // say plainly that the control plane was never told this listener exists rather than quietly
+    // folding it in as if it had been.
+    let declared_keys: HashSet<(&str, &str, u16)> = state
+        .fleet_listeners
+        .iter()
+        .map(|l| (l.sensor.as_str(), l.protocol.as_str(), l.port))
+        .collect();
+    let mut undeclared: Vec<_> = activity
+        .by_listener
+        .iter()
+        .filter(|((s, p, port), _)| !declared_keys.contains(&(s.as_str(), p.as_str(), *port)))
+        .map(|((s, p, port), seen)| (s.as_str(), Some((p.as_str(), *port)), seen))
+        .chain(
+            activity
+                .unrecorded
+                .iter()
+                .filter(|(sensor, _)| !declared_sensors.contains(sensor.as_str()))
+                .map(|(sensor, seen)| (sensor.as_str(), None, seen)),
+        )
+        .collect();
+    undeclared.sort_by_key(|&(sensor, listener, _)| (sensor, listener));
+    for (sensor, listener, seen) in undeclared {
         let event_level = event_age_level(seen.last_event_at, now);
         unknown += 1;
         levels.push(Level::Unknown);
@@ -764,23 +930,27 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         event_levels.push(event_level);
         listeners.push(ListenerRow {
             collector: "unknown".into(),
-            sensor: sensor.clone(),
+            sensor: sensor.to_string(),
             sensor_label: format_sensor_label(sensor),
-            protocol: "--".into(),
-            port: "--".into(),
+            protocol: listener.map_or("--", |(p, _)| p).to_string(),
+            port: listener.map_or("--".to_string(), |(_, port)| port.to_string()),
             vantage: String::new(),
             reach: "undeclared listener".into(),
             reach_level: Level::Unknown.class(),
             reach_dot: dot_class(Level::Unknown),
-            reach_detail: Some(
-                "this sensor is producing events but is not in PROPOLIS_FLEET_LISTENERS".into(),
-            ),
+            reach_detail: Some(match listener {
+                Some(_) => {
+                    "this listener is producing events but is not in PROPOLIS_FLEET_LISTENERS"
+                        .into()
+                }
+                None => "this sensor is producing events but is not in \
+                         PROPOLIS_FLEET_LISTENERS; they were recorded before sensors stamped \
+                         their listener port"
+                    .into(),
+            }),
             probe_ago: "never".into(),
             confirmed_ago: None,
-            last_event_ago: seen
-                .last_event_at
-                .map(format_relative_time)
-                .unwrap_or_else(|| "never".to_string()),
+            last_event_ago: last_event_text(seen.last_event_at),
             last_event_dot: dot_class(event_level),
             events_24h: seen.events_24h,
             state_level: Level::Unknown.class(),
@@ -844,7 +1014,9 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         (false, None) => "never".to_string(),
     };
 
+    // Counted before the unrecorded-port rows join the table: they are not listeners.
     let total = listeners.len();
+    listeners.extend(unrecorded_rows);
     let headline_level = combine(&levels);
     // From the two checks separately, not from their combined severity: a fleet that is fully
     // probed and confirmed but has one quiet listener also combines to `Warn`, and describing that
@@ -941,6 +1113,89 @@ async fn fleet_status_fragment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inv(entries: &[(&str, &str, fleet::Proto, u16)]) -> Vec<fleet::Listener> {
+        entries
+            .iter()
+            .map(|&(collector, sensor, protocol, port)| fleet::Listener {
+                collector_id: collector.into(),
+                sensor: sensor.into(),
+                protocol,
+                port,
+            })
+            .collect()
+    }
+
+    fn seen(events_24h: i64) -> Activity {
+        Activity {
+            last_event_at: Some(Utc::now()),
+            events_24h,
+        }
+    }
+
+    fn key(sensor: &str, protocol: &str, port: Option<u16>) -> ActivityKey {
+        (sensor.into(), protocol.into(), port)
+    }
+
+    /// Unstamped history goes to the one listener a sensor declares, whatever transport it names:
+    /// a pre-upgrade single-port sensor received every event there. Two collectors declaring the
+    /// same listener are still one listener to the ledger, which records no collector.
+    #[test]
+    fn unstamped_events_join_the_only_declared_listener() {
+        let inventory = inv(&[
+            ("a", "ssh", fleet::Proto::Tcp, 22),
+            ("b", "ssh", fleet::Proto::Tcp, 22),
+        ]);
+        let activity = HashMap::from([
+            (key("ssh", "tcp", Some(22)), seen(1)),
+            (key("ssh", "tcp", None), seen(2)),
+            (key("ssh", "udp", None), seen(4)),
+        ]);
+        let got = attribute(activity, &inventory);
+        assert_eq!(
+            got.by_listener[&("ssh".into(), "tcp".into(), 22)].events_24h,
+            7
+        );
+        assert!(got.unrecorded.is_empty());
+    }
+
+    /// With several declared listeners there is no right port to guess, and with none there is no
+    /// listener at all: both keep the unstamped events apart, one entry per sensor.
+    #[test]
+    fn unstamped_events_of_a_multi_listener_or_undeclared_sensor_stay_apart() {
+        let inventory = inv(&[
+            ("a", "smtp", fleet::Proto::Tcp, 25),
+            ("a", "smtp", fleet::Proto::Tcp, 587),
+        ]);
+        let activity = HashMap::from([
+            (key("smtp", "tcp", Some(25)), seen(1)),
+            (key("smtp", "tcp", None), seen(2)),
+            (key("smtp", "udp", None), seen(3)),
+            (key("redis", "tcp", None), seen(4)),
+        ]);
+        let got = attribute(activity, &inventory);
+        assert_eq!(got.unrecorded["smtp"].events_24h, 5);
+        assert_eq!(got.unrecorded["redis"].events_24h, 4);
+        assert_eq!(got.by_listener.len(), 1);
+        assert!(
+            !got.by_listener
+                .contains_key(&("smtp".into(), "tcp".into(), 587))
+        );
+    }
+
+    #[test]
+    fn merging_activity_sums_counts_and_keeps_the_newest_event() {
+        let older = Utc::now() - chrono::Duration::days(2);
+        let mut a = Activity {
+            last_event_at: Some(older),
+            events_24h: 0,
+        };
+        a.merge(seen(3));
+        assert_eq!(a.events_24h, 3);
+        assert!(a.last_event_at > Some(older));
+        a.merge(Activity::default());
+        assert!(a.last_event_at > Some(older));
+    }
 
     const RUNNING: &str = "abc123abc123";
     const HEAD: &str = "abc123abc123def456def456def456def456def4";

@@ -8,7 +8,9 @@
 //! `max_captured_bytes` to its own reads (see `bounds.rs`'s module doc for why the split sits
 //! there). This module owns only what is identical for every sensor regardless of protocol: the
 //! loop, panic isolation at the connection/datagram boundary, the concurrency and duration
-//! bounds, and never sending a UDP response.
+//! bounds, never sending a UDP response, and running each handler inside an
+//! [`crate::arrival::scope`] naming the port it arrived on, which `EventEmitter::append` stamps
+//! onto every event the handler emits.
 //!
 //! A per-port bind failure is non-fatal at the sensor level, but that property is realized by the
 //! *caller*: `run_tcp_listener`/`run_udp_listener` each bind exactly one address and return `Err`
@@ -26,6 +28,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::admission::PerSourceLimiter;
+use crate::arrival::{self, Arrival};
 use crate::bounds::ConnectionBounds;
 
 /// Maximum size of a single UDP datagram (the IPv4/IPv6 payload ceiling), so `recv_from` never
@@ -150,7 +153,13 @@ where
             };
 
             let session_id = uuid::Uuid::now_v7();
-            let fut = handler(stream, peer, session_id);
+            // The accepted socket's own local port. It cannot differ from the bound port on any
+            // socket this loop accepts, so the bound port is an exact stand-in when the lookup
+            // fails on an already-broken socket, rather than leaving the event unattributed.
+            let local_port = stream
+                .local_addr()
+                .map_or(bound_addr.port(), |local| local.port());
+            let fut = arrival::scope(Arrival::new(local_port), handler(stream, peer, session_id));
             tokio::spawn(async move {
                 // Held for the connection's whole lifetime; dropped (releasing the permit and the
                 // per-source slot) when this outer task ends, which happens only once the inner
@@ -262,7 +271,7 @@ where
                 }
             };
             let data = buf[..n].to_vec();
-            let fut = handler(data, peer);
+            let fut = arrival::scope(Arrival::new(bound_addr.port()), handler(data, peer));
             tokio::spawn(async move {
                 let _permit = permit; // released when this handler task ends
                 let _source_guard = source_guard;

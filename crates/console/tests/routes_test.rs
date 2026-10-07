@@ -2207,6 +2207,47 @@ async fn login_page_has_no_sign_out_link(pool: PgPool) {
 
 // --- detail ---
 
+/// A catch-all probe's evidence row names the port it landed on, read from the `local_port` the
+/// sensor framework stamps. The catch-all binds many ports, so without it every probe row reads
+/// the same `-`.
+#[sqlx::test(migrations = false)]
+async fn detail_shows_the_port_a_catchall_probe_arrived_on(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        EventInput::from_signal(
+            "203.0.113.61".parse().unwrap(),
+            None,
+            "catchall".into(),
+            SignalType::CatchallProbe,
+            Protocol::Tcp,
+            false,
+            chrono::Utc::now(),
+            serde_json::json!({ "payload_hex": "", "observed_len": 0, "local_port": 2323 }),
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let body = body_text(
+        test_app(state)
+            .oneshot(get_request(
+                "/ip/203.0.113.61",
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        body.contains("port 2323"),
+        "the probe row must name its arrival port: {body}"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn detail_shows_events_for_seeded_ip(pool: PgPool) {
     migrate(&pool).await;
@@ -5054,9 +5095,11 @@ async fn fleet_page_lists_every_configured_listener_even_with_no_events(pool: Pg
         table.contains("tcp/23"),
         "the configured telnet listener has no events and must still appear: {table}"
     );
+    // Not `never`: the page reads only the 30-day lookback, so it cannot tell a listener that went
+    // quiet a month ago from one that never produced anything, and must not claim the second.
     assert!(
-        table.contains("never"),
-        "the eventless listener must read `never`, not blank: {table}"
+        table.contains("none in 30d"),
+        "the eventless listener must say it has nothing in the lookback, not be blank: {table}"
     );
 }
 
@@ -5237,6 +5280,234 @@ async fn fleet_page_flags_a_ledger_sensor_missing_from_the_inventory_as_undeclar
     assert!(
         table.contains("Redis"),
         "the undeclared sensor must be named: {table}"
+    );
+}
+
+/// One event from `sensor` over `protocol`, stamped with `local_port` as the sensor framework does
+/// (`None` for one written before the stamp existed), observed `ago` in the past. `n` varies the
+/// source and the second so a batch of them are distinct events.
+fn ev_on(
+    sensor: &str,
+    protocol: Protocol,
+    local_port: Option<u16>,
+    ago: chrono::Duration,
+    n: u8,
+) -> EventInput {
+    let metadata = match local_port {
+        Some(port) => serde_json::json!({ "local_port": port }),
+        None => serde_json::json!({}),
+    };
+    EventInput::from_signal(
+        format!("203.0.113.{n}").parse().unwrap(),
+        None,
+        sensor.into(),
+        SignalType::HoneypotConnection,
+        protocol,
+        false,
+        chrono::Utc::now() - ago - chrono::Duration::seconds(i64::from(n)),
+        metadata,
+        None,
+    )
+}
+
+/// Appends `count` events from one listener.
+async fn append_on(
+    pool: &PgPool,
+    sensor: &str,
+    protocol: Protocol,
+    local_port: Option<u16>,
+    ago: chrono::Duration,
+    count: u8,
+) {
+    for n in 1..=count {
+        append_event(pool, ev_on(sensor, protocol, local_port, ago, n))
+            .await
+            .unwrap();
+    }
+}
+
+/// The `<tr>` of the listener table containing `needle`; panics naming the table when there is no
+/// such row, or when there is more than one.
+fn listener_row<'a>(table: &'a str, needle: &str) -> &'a str {
+    let rows: Vec<&str> = table
+        .split("<tr")
+        .skip(1)
+        .filter(|row| row.contains(needle))
+        .collect();
+    assert_eq!(rows.len(), 1, "want one row containing {needle:?}: {table}");
+    rows[0]
+}
+
+/// The 24h count a listener row renders.
+fn count_24h(row: &str) -> i64 {
+    let cell = row
+        .split(r#"<td class="count">"#)
+        .nth(1)
+        .and_then(|rest| rest.split("</td>").next())
+        .unwrap_or_else(|| panic!("no 24h cell in {row}"));
+    cell.trim().parse().unwrap()
+}
+
+/// The defect the owner saw: every port of a sensor showed the sensor's total, because activity
+/// was grouped by sensor alone. Each pair here differs in its counts, so a page that sums a
+/// sensor's listeners renders the same number twice and fails: two Redis ports, HTTP plain vs
+/// TLS, and the catch-all's TCP and UDP listeners on the SAME port number.
+#[sqlx::test(migrations = false)]
+async fn fleet_rows_count_each_listener_not_the_whole_sensor(pool: PgPool) {
+    migrate(&pool).await;
+    let hour = chrono::Duration::hours(1);
+    append_on(&pool, "redis", Protocol::Tcp, Some(6379), hour, 3).await;
+    append_on(&pool, "redis", Protocol::Tcp, Some(6380), hour, 1).await;
+    append_on(&pool, "http", Protocol::Tcp, Some(80), hour, 2).await;
+    append_on(&pool, "http", Protocol::Tcp, Some(443), hour, 5).await;
+    append_on(&pool, "catchall", Protocol::Tcp, Some(1024), hour, 1).await;
+    append_on(&pool, "catchall", Protocol::Udp, Some(1024), hour, 4).await;
+
+    let body = fleet_body(test_state_full(
+        pool,
+        None,
+        vec![
+            listener("redis", fleet::Proto::Tcp, 6379),
+            listener("redis", fleet::Proto::Tcp, 6380),
+            listener("http", fleet::Proto::Tcp, 80),
+            listener("http", fleet::Proto::Tcp, 443),
+            listener("catchall", fleet::Proto::Tcp, 1024),
+            listener("catchall", fleet::Proto::Udp, 1024),
+        ],
+        None,
+    ))
+    .await;
+    let table = listener_table(&body);
+
+    for (listener, want) in [
+        ("tcp/6379<", 3),
+        ("tcp/6380<", 1),
+        ("tcp/80<", 2),
+        ("tcp/443<", 5),
+        ("tcp/1024<", 1),
+        ("udp/1024<", 4),
+    ] {
+        assert_eq!(
+            count_24h(listener_row(table, listener)),
+            want,
+            "{listener}: {table}"
+        );
+    }
+    assert!(
+        !table.contains("undeclared listener") && !table.contains("port not recorded"),
+        "every event here belongs to a declared listener: {table}"
+    );
+}
+
+/// The 24h column counts only the last 24 hours, and LAST EVENT reaches back through the 30-day
+/// lookback but not past it. One listener's only event is three days old: zero today, last seen
+/// `3d ago`. Another's only event is 40 days old: outside the lookback, so it reads like a
+/// listener with no events at all.
+#[sqlx::test(migrations = false)]
+async fn fleet_rows_count_the_last_day_and_look_back_thirty_days(pool: PgPool) {
+    migrate(&pool).await;
+    append_on(
+        &pool,
+        "ssh",
+        Protocol::Tcp,
+        Some(22),
+        chrono::Duration::days(3),
+        1,
+    )
+    .await;
+    append_on(
+        &pool,
+        "telnet",
+        Protocol::Tcp,
+        Some(23),
+        chrono::Duration::days(40),
+        1,
+    )
+    .await;
+    append_on(
+        &pool,
+        "ftp",
+        Protocol::Tcp,
+        Some(21),
+        chrono::Duration::hours(2),
+        2,
+    )
+    .await;
+    append_on(
+        &pool,
+        "ftp",
+        Protocol::Tcp,
+        Some(21),
+        chrono::Duration::hours(30),
+        3,
+    )
+    .await;
+
+    let body = fleet_body(test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("telnet", fleet::Proto::Tcp, 23),
+            listener("ftp", fleet::Proto::Tcp, 21),
+        ],
+        None,
+    ))
+    .await;
+    let table = listener_table(&body);
+
+    let ssh = listener_row(table, "tcp/22<");
+    assert_eq!(count_24h(ssh), 0, "{ssh}");
+    assert!(ssh.contains("3d ago"), "{ssh}");
+    let telnet = listener_row(table, "tcp/23<");
+    assert_eq!(count_24h(telnet), 0, "{telnet}");
+    assert!(telnet.contains("none in 30d"), "{telnet}");
+    let ftp = listener_row(table, "tcp/21<");
+    assert_eq!(count_24h(ftp), 2, "{ftp}");
+    assert!(ftp.contains("2h ago"), "{ftp}");
+}
+
+/// History written before sensors stamped their port. A sensor with one declared listener can only
+/// have received it there, so it counts on that row; a sensor with several cannot be split, so its
+/// unstamped events get one `port not recorded` row of their own, which is not a listener and must
+/// not change the listener total. A port the inventory never declared is its own undeclared row.
+#[sqlx::test(migrations = false)]
+async fn fleet_attributes_unstamped_history_without_guessing_a_port(pool: PgPool) {
+    migrate(&pool).await;
+    let hour = chrono::Duration::hours(1);
+    append_on(&pool, "ssh", Protocol::Tcp, None, hour, 2).await;
+    append_on(&pool, "ssh", Protocol::Tcp, Some(22), hour, 1).await;
+    append_on(&pool, "smtp", Protocol::Tcp, None, hour, 4).await;
+    append_on(&pool, "smtp", Protocol::Tcp, Some(25), hour, 1).await;
+    append_on(&pool, "smtp", Protocol::Tcp, Some(587), hour, 2).await;
+    append_on(&pool, "smtp", Protocol::Tcp, Some(2525), hour, 3).await;
+
+    let body = fleet_body(test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("smtp", fleet::Proto::Tcp, 25),
+            listener("smtp", fleet::Proto::Tcp, 587),
+        ],
+        None,
+    ))
+    .await;
+    let table = listener_table(&body);
+
+    assert_eq!(count_24h(listener_row(table, "tcp/22<")), 3, "{table}");
+    assert_eq!(count_24h(listener_row(table, "tcp/25<")), 1, "{table}");
+    assert_eq!(count_24h(listener_row(table, "tcp/587<")), 2, "{table}");
+    let unrecorded = listener_row(table, "port not recorded");
+    assert!(unrecorded.contains("SMTP"), "{unrecorded}");
+    assert_eq!(count_24h(unrecorded), 4, "{unrecorded}");
+    let undeclared = listener_row(table, "tcp/2525<");
+    assert!(undeclared.contains("undeclared listener"), "{undeclared}");
+    assert_eq!(count_24h(undeclared), 3, "{undeclared}");
+    // Three declared listeners and one undeclared one; the unrecorded row is not a listener.
+    assert!(
+        body.contains("<small>/ 4</small>"),
+        "the listener total must not count the port-not-recorded row: {body}"
     );
 }
 
@@ -6128,9 +6399,9 @@ async fn fleet_listener_last_event_column_carries_a_dot_matching_its_level(pool:
     );
     assert!(
         table.contains(
-            r#"<td class="seen"><span class="dot dot--watch" aria-hidden="true"></span> never</td>"#
+            r#"<td class="seen"><span class="dot dot--watch" aria-hidden="true"></span> none in 30d</td>"#
         ),
-        "a listener that has never produced an event must carry the unknown dot, not bare `never` text: {table}"
+        "a listener with no event in the lookback must carry the unknown dot, not bare text: {table}"
     );
 }
 

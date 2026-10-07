@@ -5,6 +5,7 @@
 //! of the same sub-project) are thin compositions over it.
 
 pub mod admission;
+pub mod arrival;
 pub mod binaries;
 pub mod bounds;
 pub mod budget;
@@ -30,6 +31,7 @@ pub mod tls;
 pub mod wan;
 
 pub use admission::{PerSourceLimiter, SourceGuard, default_per_source_cap};
+pub use arrival::Arrival;
 pub use bounds::ConnectionBounds;
 pub use budget::{BudgetLimits, ConnectionBudget, EgressState, limits_from};
 pub use capture_budget::{

@@ -16,16 +16,21 @@
 //! ```
 //!
 //! The sensor never serves content, never retransmits, and replies to a packet only with a packet
-//! no larger than the budget the peer's own traffic earned (see [`crate::guarded`]). Uploaded
-//! bytes are written to the quarantine spool and never interpreted.
+//! no larger than the budget the peer's own traffic earned (see [`crate::guarded`]). A request
+//! from a source nothing may be sent to (`sensor_framework::check_reply_source`) is recorded with
+//! its `suppress_reason` and gets no transfer socket at all. Uploaded bytes are written to the
+//! quarantine spool and never interpreted.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::Utc;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{
-    CaptureBody, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
-    sanitize_value, upload_metadata,
+    CaptureBody, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, FloodSummary,
+    SourceRefusal, Uuid, WanResolver, check_reply_source, rate_limited_event, sanitize_value,
+    upload_metadata,
 };
 use sensor_wire::{
     PROTO_UDP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
@@ -128,17 +133,47 @@ pub struct Sensor {
     /// offers no per-datagram local address; under a wildcard bind this is the wildcard, the same
     /// limit `sensor-catchall` documents).
     pub local_ip: IpAddr,
+    /// Transfer sockets bound, so in-crate tests can prove a suppressed request never got one.
+    #[cfg(test)]
+    pub(crate) transfers_bound: std::sync::atomic::AtomicUsize,
 }
 
 impl Sensor {
+    fn wan_ip(&self) -> Option<IpAddr> {
+        self.wan_resolver
+            .resolve(normalize_dual_stack(SocketAddr::new(self.local_ip, 0)).ip())
+    }
+
+    /// Append one `rate_limited` event per summary.
+    pub(crate) async fn emit_summaries(&self, summaries: Vec<FloodSummary>, window: Duration) {
+        if summaries.is_empty() {
+            return;
+        }
+        let wan_ip = self.wan_ip();
+        let (now, now_utc) = (Instant::now(), Utc::now());
+        for summary in &summaries {
+            let event = rate_limited_event(
+                PROTOCOL_LABEL,
+                PROTOCOL_LABEL,
+                summary,
+                wan_ip,
+                window,
+                now,
+                now_utc,
+            );
+            if let Err(e) = self.emitter.append(&event).await {
+                tracing::error!(error = %e, "tftp: failed to append event");
+            }
+        }
+    }
+
     /// Handle one request. The caller bounds the whole call with `max_duration`; dropping the
     /// future mid-transfer submits whatever was received as an incomplete capture.
     pub async fn handle_request(&self, peer: SocketAddr, request: OwnedRequest) {
         let source_ip = normalize_dual_stack(peer).ip();
-        let wan_ip = self
-            .wan_resolver
-            .resolve(normalize_dual_stack(SocketAddr::new(self.local_ip, 0)).ip());
+        let wan_ip = self.wan_ip();
         let session_id = Uuid::now_v7();
+        let refusal = check_reply_source(peer).err();
         let filename = sanitize_value(
             &String::from_utf8_lossy(&request.filename),
             MAX_FILENAME_LEN,
@@ -152,9 +187,13 @@ impl Sensor {
             &filename,
             &mode_text,
             request.direction,
+            refusal,
         );
         if let Err(e) = self.emitter.append(&event).await {
             tracing::error!(%peer, error = %e, "tftp: failed to append probe event");
+        }
+        if refusal.is_some() {
+            return;
         }
 
         let mut transfer = match Transfer::bind(self.local_ip, peer, request.datagram_len).await {
@@ -164,6 +203,9 @@ impl Sensor {
                 return;
             }
         };
+        #[cfg(test)]
+        self.transfers_bound
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mode = Mode::from_bytes(&request.mode);
         let writable = matches!(mode, Some(Mode::Netascii | Mode::Octet));
@@ -381,6 +423,20 @@ fn upload_metadata_with_cap(
     metadata
 }
 
+/// `"<rrq|wrq> <filename>"` for a rate-limited summary's sample, or `"malformed"` for anything
+/// that is not a request. The ledger sanitizes and caps it, and runs this only while the summary
+/// has room for another sample.
+pub(crate) fn flood_sample(datagram: &[u8]) -> String {
+    match classify(datagram) {
+        Some(r) => format!(
+            "{} {}",
+            r.direction.label(),
+            String::from_utf8_lossy(&r.filename)
+        ),
+        None => "malformed".to_string(),
+    }
+}
+
 fn connection_event(
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
@@ -388,7 +444,17 @@ fn connection_event(
     filename: &str,
     mode: &str,
     direction: Direction,
+    refusal: Option<SourceRefusal>,
 ) -> SensorEvent {
+    let mut metadata = serde_json::json!({
+        "protocol_label": PROTOCOL_LABEL,
+        "filename": filename,
+        "mode": mode,
+        "direction": direction.label(),
+    });
+    if let Some(refusal) = refusal {
+        metadata["suppress_reason"] = serde_json::json!(refusal.as_str());
+    }
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -398,12 +464,7 @@ fn connection_event(
         protocol: PROTO_UDP.to_string(),
         authenticated: false,
         observed_at: chrono::Utc::now(),
-        metadata: serde_json::json!({
-            "protocol_label": PROTOCOL_LABEL,
-            "filename": filename,
-            "mode": mode,
-            "direction": direction.label(),
-        }),
+        metadata,
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
@@ -510,6 +571,104 @@ mod tests {
         assert!(handoff.submit(probe_job()).is_err());
     }
 
+    fn sensor(log: &std::path::Path) -> Sensor {
+        Sensor {
+            emitter: Arc::new(EventEmitter::new(log.to_path_buf())),
+            wan_resolver: Arc::new(WanResolver::new(std::collections::HashMap::new())),
+            bounds: ConnectionBounds {
+                read_timeout: std::time::Duration::from_millis(200),
+                idle_timeout: std::time::Duration::from_millis(200),
+                max_duration: std::time::Duration::from_secs(5),
+                max_captured_bytes: 1_000_000,
+                max_concurrent: 16,
+            },
+            handoff: one_slot_handoff(),
+            local_ip: "127.0.0.1".parse().unwrap(),
+            transfers_bound: Default::default(),
+        }
+    }
+
+    fn last_event(log: &std::path::Path) -> SensorEvent {
+        let text = std::fs::read_to_string(log).unwrap();
+        serde_json::from_str(text.lines().last().unwrap()).unwrap()
+    }
+
+    fn bound(sensor: &Sensor) -> usize {
+        sensor
+            .transfers_bound
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The handler, not only the transfer's send, refuses every suppressed source: the probe event
+    /// records why, and no transfer socket is bound, so not even the first reply can leave. Both
+    /// directions are covered, since a WRQ's first reply is ACK 0 rather than an ERROR.
+    #[tokio::test]
+    async fn the_handler_suppresses_reflective_ports_and_unroutable_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let sensor = sensor(&log);
+        for (peer, reason) in [
+            ("198.51.100.9:7", "reflective_source_port"),
+            ("198.51.100.9:13", "reflective_source_port"),
+            ("198.51.100.9:17", "reflective_source_port"),
+            ("198.51.100.9:19", "reflective_source_port"),
+            ("198.51.100.9:37", "reflective_source_port"),
+            ("198.51.100.9:0", "reflective_source_port"),
+            ("255.255.255.255:4000", "unroutable_source"),
+            ("0.0.0.0:4000", "unroutable_source"),
+            ("224.0.0.1:4000", "unroutable_source"),
+            ("[::ffff:224.0.0.1]:4000", "unroutable_source"),
+            ("[::ffff:255.255.255.255]:4000", "unroutable_source"),
+            ("[ff02::1]:4000", "unroutable_source"),
+            ("[::]:4000", "unroutable_source"),
+        ] {
+            for datagram in [
+                &b"\x00\x01boot.bin\x00octet\x00"[..],
+                b"\x00\x02up.bin\x00octet\x00",
+            ] {
+                let request = classify(datagram).unwrap();
+                let direction = request.direction.label();
+                sensor.handle_request(peer.parse().unwrap(), request).await;
+                let e = last_event(&log);
+                assert_eq!(e.metadata["direction"], direction, "{peer}");
+                assert_eq!(e.metadata["suppress_reason"], reason, "{peer} {direction}");
+                assert_eq!(
+                    bound(&sensor),
+                    0,
+                    "{peer} {direction}: a transfer was bound"
+                );
+            }
+        }
+
+        // The counter does count: an ordinary client gets a transfer and its one ERROR.
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = classify(b"\x00\x01boot.bin\x00octet\x00").unwrap();
+        sensor
+            .handle_request(client.local_addr().unwrap(), request)
+            .await;
+        assert!(last_event(&log).metadata.get("suppress_reason").is_none());
+        assert_eq!(bound(&sensor), 1);
+        let mut buf = [0u8; 64];
+        let (n, _) = client.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..4], &[0, 5, 0, 1], "{:?}", &buf[..n]);
+    }
+
+    #[test]
+    fn flood_samples_name_the_request_or_say_malformed() {
+        assert_eq!(
+            flood_sample(b"\x00\x01boot.bin\x00octet\x00"),
+            "rrq boot.bin"
+        );
+        assert_eq!(flood_sample(b"\x00\x02a b\x00netascii\x00"), "wrq a b");
+        assert_eq!(flood_sample(b"\x00\x01noterminator"), "malformed");
+        assert_eq!(
+            flood_sample(&[0, 4, 0, 1]),
+            "malformed",
+            "ACK is not a request"
+        );
+        assert_eq!(flood_sample(&[]), "malformed");
+    }
+
     #[test]
     fn classify_accepts_only_well_formed_requests() {
         let rrq = classify(b"\x00\x01a.bin\x00octet\x00").unwrap();
@@ -543,7 +702,9 @@ mod tests {
             "boot.bin",
             "octet",
             Direction::Wrq,
+            None,
         );
+        assert!(event.metadata.get("suppress_reason").is_none());
         assert!(!event.authenticated);
         assert_eq!(event.sensor, "tftp");
         assert_eq!(event.protocol, PROTO_UDP);

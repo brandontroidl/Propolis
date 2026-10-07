@@ -547,6 +547,22 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   (`sensor-tftp/src/main.rs#DEFAULT_MAX_CONCURRENT`). Raising `PROPOLIS_TFTP_MAX_CAPTURED_BYTES`
   toward the 10 MB hard cap requires lowering `PROPOLIS_TFTP_MAX_CONCURRENT` to stay under
   `MemoryMax`; the worst case is roughly `(max_concurrent + 64) * max_captured_bytes + 15 MB`.
+  Four more variables set the request-socket rate limit
+  (`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`), each a positive `u32` where
+  zero or a non-number aborts startup (a rate can never be configured off). The defaults equal
+  sensor-dns's:
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_TFTP_REPLY_RATE_PER_SOURCE` | `5` (`sensor-tftp/src/main.rs#DEFAULT_REPLY_RATE_PER_SOURCE`) | Datagrams on the request socket handled per second per source network (the IPv4 /24 or IPv6 /56). |
+  | `PROPOLIS_TFTP_REPLY_BURST_PER_SOURCE` | `10` (`sensor-tftp/src/main.rs#DEFAULT_REPLY_BURST_PER_SOURCE`) | How many a quiet source network may send at once before the per-second rate applies. |
+  | `PROPOLIS_TFTP_REPLY_RATE_GLOBAL` | `1000` (`sensor-tftp/src/main.rs#DEFAULT_REPLY_RATE_GLOBAL`) | Datagrams on the request socket handled per second across every source. |
+  | `PROPOLIS_TFTP_REPLY_BURST_GLOBAL` | `2000` (`sensor-tftp/src/main.rs#DEFAULT_REPLY_BURST_GLOBAL`) | The global burst. |
+
+  A datagram over either budget gets no reply and no event of its own; it is counted in one
+  `rate_limited` summary event per source network per 10 s (see
+  [sensor-behavior](sensor-behavior.md#sensor-tftp)). A running transfer's packets arrive on its
+  own socket and are not charged.
 - mqtt: `PROPOLIS_MQTT_READ_TIMEOUT_MS`, `PROPOLIS_MQTT_IDLE_TIMEOUT_MS`,
   `PROPOLIS_MQTT_MAX_DURATION_SECS`, `PROPOLIS_MQTT_MAX_CAPTURED_BYTES`,
   `PROPOLIS_MQTT_MAX_CONCURRENT`, `PROPOLIS_MQTT_LOG_PATH`, `PROPOLIS_MQTT_WAN_MAP`,

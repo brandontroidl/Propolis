@@ -615,21 +615,56 @@ nothing (`crates/sensor-tftp/src/main.rs#load_config_from`).
 - **Source pinning.** The transfer socket sends only to the exact (ip, port) the
   request came from and drops any packet from another source without counting it or
   resetting the idle clock.
-- **Bounds.** `max_concurrent` permits (a request past the limit is dropped
-  unanswered), per-transfer read/idle timeout, `max_duration` (dropping the transfer
-  keeps what arrived), a packet cap derived from the body cap, and a retained-body cap of
-  `PROPOLIS_TFTP_MAX_CAPTURED_BYTES` (default 1_000_000, at most
+- **Source check.** A request from an unspecified, broadcast or multicast address (IPv4-mapped
+  IPv6 judged as the IPv4 it maps) or from a source port in
+  `crates/sensor-framework/src/reply_source.rs#REFLECTIVE_SOURCE_PORTS` (0, echo 7, daytime 13,
+  qotd 17, chargen 19, time 37) gets no transfer socket and no packet at all, not even the first
+  ERROR or ACK 0. It is still recorded, with a `suppress_reason` of `unroutable_source` or
+  `reflective_source_port` (`crates/sensor-tftp/src/handler.rs#Sensor::handle_request`). The
+  check is the one `sensor-dns` uses
+  (`crates/sensor-framework/src/reply_source.rs#check_reply_source`), and the transfer's send
+  re-runs it before the byte budget (`crates/sensor-tftp/src/guarded.rs#Transfer::send`).
+- **Rate limit** (`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`, wired in
+  `crates/sensor-tftp/src/lib.rs#serve`). The byte budget stops amplification, not reflection
+  itself: without a rate limit one spoofer can make the sensor send a victim one ERROR per
+  request at line rate. Every datagram on the request socket, before it is parsed, takes a token
+  from its source network's bucket (the IPv4 /24, IPv4-mapped IPv6 included, or the IPv6 /56) and
+  from a global bucket, with the same defaults as `sensor-dns`: 5 per second with a burst of 10
+  per network and 1000 per second with a burst of 2000 in total (`PROPOLIS_TFTP_REPLY_*`, see
+  [environment-variables.md](environment-variables.md)). A datagram over either budget gets no
+  reply and no event of its own; it is counted in its network's summary and one `rate_limited`
+  event per network is written when its 10-second window ends (see Emits), with the same tables,
+  eviction, overflow summary and 2-second shutdown flush as `sensor-dns`. Malformed datagrams are
+  charged too, so a junk flood is summarized rather than invisible. The DATA, ACK and ERROR
+  packets of a running transfer arrive on its own ephemeral socket and are not charged: the
+  transfer is already pinned to one peer and answers only within that peer's byte budget.
+- **Bounds.** The rate limit above; `max_concurrent` permits and the per-source admission cap (a
+  request past either is dropped unanswered), per-transfer read/idle timeout, `max_duration`
+  (dropping the transfer keeps what arrived), a packet cap derived from the body cap, and a
+  retained-body cap of `PROPOLIS_TFTP_MAX_CAPTURED_BYTES` (default 1_000_000, at most
   `MAX_BODY_HARD_CAP` = 10_000_000, `crates/sensor-tftp/src/handler.rs#MAX_BODY_HARD_CAP`).
-  A WRQ that never delivers a byte is recorded only as a probe, not as an empty upload.
+  A WRQ that never delivers a byte is recorded only as a probe, not as an empty upload. A zero or
+  unparseable bound or rate aborts startup.
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64
   (`crates/sensor-tftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, `crates/sensor-tftp/src/lib.rs#CAPTURE_QUEUE_SIZE`,
   `crates/sensor-tftp/src/lib.rs#start_test_server`). The body is never executed,
   served or interpreted; `netascii` uploads are stored as the raw bytes received.
-- **Emits:** `honeypot_connection` per RRQ/WRQ (protocol `udp`, metadata `protocol_label`,
-  `filename`, `mode`, `direction` of `rrq` or `wrq`, all sanitized) and
-  `honeypot_malware_upload` (protocol `udp`, standard upload metadata). Both are
-  `authenticated=false` (TFTP has no authentication) and share one session id per
-  transfer. `wan_ip` resolves against the bind address, so a wildcard bind has the same
+- **Emits:** `honeypot_connection` per RRQ/WRQ the sensor handles (protocol `udp`, metadata
+  `protocol_label`, `filename`, `mode`, `direction` of `rrq` or `wrq`, all sanitized, and
+  `suppress_reason` when the source check refused it) and `honeypot_malware_upload` (protocol
+  `udp`, standard upload metadata). Both share one session id per transfer. A request dropped by
+  the per-source cap or the `max_concurrent` pool gets no event, only a `warn` log line at
+  power-of-two totals. Rate-limited datagrams produce one `honeypot_connection` (protocol `udp`,
+  `query_status` `rate_limited`) per source network per window, the same event `sensor-dns`
+  writes (`crates/sensor-framework/src/rate_limit.rs#rate_limited_event`): `source_ip` is the
+  first address seen from the network in the window, and the metadata carries `protocol_label`
+  `tftp`, `transport` `udp`, `source_prefix` (CIDR, or `overflow`), `suppressed_count`,
+  `suppressed_bytes` (each datagram counted up to the 1024-byte receive buffer,
+  `crates/sensor-tftp/src/handler.rs#RECV_BUFFER`), `per_source_limited`, `global_limited`,
+  `first_seen`, `last_seen`, `window_secs`, up to 8 sanitized `samples` of `"<rrq|wrq>
+  <filename>"` (or `malformed`), and `distinct_sources` (counted up to 32, with
+  `distinct_sources_capped` set beyond that). All TFTP events are `authenticated=false` (TFTP has
+  no authentication). `wan_ip` resolves against the bind address, so a wildcard bind has the same
   attribution limit as the catch-all's UDP path.
 
 ### sensor-mqtt
@@ -788,8 +823,9 @@ gets the same REFUSED reply, and it never resolves, forwards, or looks anything 
   (`crates/sensor-dns/src/guarded.rs#ReplySocket`), `crates/sensor-dns/src/guarded.rs#reply_gate`
   refuses to answer an unspecified, broadcast or multicast source, a source port in
   `crates/sensor-framework/src/reply_source.rs#REFLECTIVE_SOURCE_PORTS` (0, echo 7, daytime 13,
-  qotd 17, chargen 19, time 37), both through the shared
-  `crates/sensor-framework/src/reply_source.rs#check_reply_source`, and any reply a byte budget
+  qotd 17, chargen 19, time 37), both through
+  `crates/sensor-framework/src/reply_source.rs#check_reply_source`, which `sensor-tftp` shares,
+  and any reply a byte budget
   seeded with the query length would refuse.
   Such a query is still recorded, with `query_status` `suppressed` and a `suppress_reason`
   (`reflective_source_port`, `unroutable_source`, `byte_budget`). A rejected datagram gets no
@@ -1216,8 +1252,8 @@ per-protocol bind var is required.
 ## Cross-cutting invariants
 
 - **Session id:** `Uuid::now_v7()` minted per accepted TCP connection by the
-  listener, per datagram for catchall UDP and DNS UDP (and per summary for a DNS
-  `rate_limited` event), per transfer for TFTP; carried on every event.
+  listener, per datagram for catchall UDP and DNS UDP, per transfer for TFTP, and per summary
+  for a DNS or TFTP `rate_limited` event; carried on every event.
 - **Password discipline:** every login-capturing sensor reads the password only to
   advance the protocol and drops it - never stored, logged, or placed in any event
   field (SSH `crates/sensor-ssh/src/auth.rs`, telnet `crates/sensor-telnet/src/handler.rs#handle_connection`, FTP `crates/sensor-ftp/src/handler.rs#handle_connection`, redis

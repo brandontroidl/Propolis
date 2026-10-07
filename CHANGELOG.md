@@ -4,6 +4,28 @@
 
 ### Added
 
+- **`sensor-tftp` rate limits its request socket and refuses reflector and unroutable
+  sources** - the byte budget already kept every reply no larger than what the peer sent, but a
+  spoofed request flood still drew one ERROR per request at line rate toward the forged source,
+  and one event per request in the log. Every datagram on the request socket, malformed ones
+  included, now takes a token from its source network's bucket (IPv4 /24, IPv6 /56: 5 per
+  second, burst 10) and a global one (1000 per second, burst 2000), the same `ReplyRateLimiter`
+  and defaults as `sensor-dns`, set by `PROPOLIS_TFTP_REPLY_RATE_PER_SOURCE`,
+  `PROPOLIS_TFTP_REPLY_BURST_PER_SOURCE`, `PROPOLIS_TFTP_REPLY_RATE_GLOBAL` and
+  `PROPOLIS_TFTP_REPLY_BURST_GLOBAL` (positive integers; zero or garbage refuses to start). A
+  datagram over the limit gets no reply and no event of its own; each source network gets one
+  `query_status` `rate_limited` summary event per 10 s, the same event `sensor-dns` writes, with
+  samples of `"<rrq|wrq> <filename>"` or `malformed`, and shutdown writes the summaries still
+  accumulating. The packets of a running transfer arrive on its own socket and are not charged.
+  A request from source port 0, 7, 13, 17, 19 or 37, or from an unspecified, broadcast or
+  multicast address, now gets no transfer socket and no packet at all, not even the first ERROR
+  or ACK 0; its probe event carries `suppress_reason` (`reflective_source_port` or
+  `unroutable_source`). The transfer's send re-checks the same rule. The check
+  (`check_reply_source`) and the summary event (`rate_limited_event`) moved into
+  `sensor-framework`, and `sensor-dns` now uses the same implementations; its behavior is
+  unchanged. `start_test_server` and `start_test_server_with_capture_budget` (formerly
+  `start_test_server_with_handoff`) take the rate configuration and return a `TftpServer`.
+
 - **DNS honeypot sensor (default off)** - new crate and binary `sensor-dns`. `PROPOLIS_DNS_BIND`
   serves DNS over UDP and TCP on the same address (conventionally 53); if either transport cannot
   bind, the sensor exits 1 with nothing left listening. `PROPOLIS_DNS_TLS_BIND` adds DNS over TLS

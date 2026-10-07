@@ -4,6 +4,35 @@
 
 ### Added
 
+- **`propolis-watch`, a read-only live view of the sensors** - new crate `watch`, binary
+  `propolis-watch`. It streams every event log named in `PROPOLIS_SENSOR_LOGS` as JSON Lines on
+  stdout: a `start` record with the resolved sources, one `event` record per log line (the
+  sensor's JSON embedded byte for byte, or `raw` text when a line is not a JSON object), a
+  `dropped` record in place of each line over the 1 MiB cap, and a `heartbeat` every 10 s giving
+  each log's status (`following`, `missing` or `unreadable`), size and lines seen, so a quiet
+  node is distinguishable from a dead stream and a mistyped log path shows on the first
+  heartbeat. It starts at the end of each log by default (`--since-start` replays the current
+  file), follows `copytruncate` rotation, filters with `--sensor`, `--signal` and
+  `--source-ip`, and with `--journal` adds the `sensor-*` and `propolis` units' journal from a
+  `journalctl` child with a fixed argument vector. It writes no file, opens no socket and needs
+  no database or credential; a static test holds its source to that. Arguments also come from
+  `SSH_ORIGINAL_COMMAND`, split on whitespace only through the same allowlist, so it can run as
+  an SSH forced command: `deploy/provision.sh` now creates a `propolis-watch` login account
+  (home `/var/lib/propolis-watch`, shell `/bin/sh`, password field `*`, read-only membership in
+  every sensor group, no journal access unless added by hand), with its home, `.ssh` and
+  `authorized_keys` owned by root so the account cannot add a key to itself; `install.sh` and
+  `upgrade.sh` install the binary; and `deploy/watch-authorized-keys.example` shows the
+  `restrict`ed forced-command key line, `command="/usr/local/bin/propolis-watch"`. When
+  `PROPOLIS_SENSOR_LOGS` is not in its environment the watcher reads that one key from
+  `/etc/propolis/watch.env`, which the new `deploy/watch-env.sh` derives from `propolis.env` on
+  every provision (so every install and upgrade), copying only that line, root:propolis-watch
+  0640, atomically; the start record and heartbeat say which source the list came from. No key
+  is generated or installed. See `docs/operations/live-watch.md`.
+- **`log-tailer` gains a cursorless mode and owns the sensor-log list parser** -
+  `LogTailer::without_cursor` reads and follows rotation like the cursor-backed tailer but has
+  no cursor to load or save, and `read_batch_entries` reports each over-length discard in place.
+  `parse_sensor_logs` replaces the three copies of the `name:path` grammar in `propolis`,
+  `intake` and `shipper`; their behavior and error messages are unchanged.
 - **Every event records the port it arrived on** - the sensor framework stamps
   `metadata.local_port` (an integer: the accepted TCP socket's local port, or the bound UDP
   socket's port) on every event every sensor emits, uploads and the DNS and TFTP rate-limit
@@ -339,6 +368,25 @@
 
 ### Fixed
 
+- **A command's standard input reaches it, and is captured** - an SSH exec ran at the request
+  and closed the channel, so the payload a bot streamed after `cat > astats` or `cat > w.sh`
+  hit a closed channel: the file stayed empty, nothing was captured, and the bot retried and
+  left. The fake shell now decides, by running the line against its own model of the commands
+  and rolling back what that run did (`FakeShell::start_line`), whether a line reads its input
+  (`cat`, `cat > f`, `dd` without `if=`, `base64 -d`, `head`, `read`, a bare `sh` on a pipe,
+  the same inside `sh -c`, a group or a pipeline). Such an SSH exec is held with the channel
+  open until the client's EOF (or CLOSE, the idle timeout, `max_captured_bytes`, the session's
+  end) and then runs once on the input, followed by its output, exit status, EOF and CLOSE; a
+  command that reads no input still completes at the request. At the SSH, telnet and ADB
+  shells a typed `cat > f` takes the lines after it until Ctrl-D, as a terminal does (Ctrl-C
+  kills it, status 130), and an ADB `shell:<command>` that reads input holds its stream until
+  the client closes it. Every consumed body, text or binary, becomes one
+  `honeypot_malware_upload` per distinct SHA-256 per session, with `capture_reason`
+  `exec_stdin` or `shell_stdin`, the `command`, the `destination` file and a `repeat_count`
+  for retried uploads; those bytes are no longer also offered to the binary-payload shell
+  capture. `ls` now lists a file operand (it said `No such file` for a file `wc` read) and has
+  a `-l` long listing from the facts `stat` prints, and `sh -lc`/`bash -ec` find their
+  clustered `-c` script instead of running the script text as a file name.
 - **Every captured upload records why it ended** - the fleet pane's capture panel gave
   `unrecorded` as the end reason of incomplete captures (ten of ten for SSH), because
   `upload_metadata` took only a `complete` flag and `end_reason` was added by hand at the three

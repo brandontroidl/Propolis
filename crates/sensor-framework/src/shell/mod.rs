@@ -49,7 +49,7 @@ use sensor_wire::{
 use crate::binaries;
 use crate::budget::{ConnectionBudget, Resource};
 use crate::command_codec::CommandCodec;
-use crate::fakefs::{Blob, FakeFs, FsError, READ_CAP};
+use crate::fakefs::{Blob, FakeFs, FsCheckpoint, FsError, READ_CAP};
 use crate::persona;
 use crate::sanitize_value;
 
@@ -118,6 +118,7 @@ const MAX_URL_LEN: usize = 512;
 /// driving it. Every current and planned caller uses the same string for both - there is no
 /// observed case where a `FakeShell` consumer's `sensor` name differs from its `protocol_label` -
 /// so one field covers both rather than two that would only ever be set identically.
+#[derive(Clone)]
 pub struct EmitContext {
     pub source_ip: IpAddr,
     pub wan_ip: Option<IpAddr>,
@@ -379,9 +380,65 @@ pub struct FakeShell {
     /// When the session began on the shell's clock: the start time of the processes the session
     /// owns in the process table.
     session_started: chrono::DateTime<chrono::Utc>,
+    /// The line [`Self::start_line`] found waiting for its input, run by [`Self::finish_line`]
+    /// once the input has ended.
+    held: Option<HeldLine>,
+    /// The session input is a terminal (a login shell, or an exec channel with a pty), not a pipe.
+    tty_input: bool,
+    /// The status a read that waits for more session input ends its line with, while
+    /// [`Self::finish_line`] runs a line whose input was cut off; `None` when it ended normally.
+    input_interrupt: Option<u8>,
+    /// How far into the session input the readers had got when the running command started, so
+    /// a write it makes can be told apart as one carrying what it read.
+    input_mark: Option<usize>,
+    /// The files written by commands that read the session input, in the order first written.
+    input_sinks: Vec<String>,
+}
+
+/// A line waiting for its input.
+#[derive(Clone)]
+struct HeldLine {
+    decoded: String,
+    /// The line as typed, sanitized and capped for event metadata.
+    command: String,
+}
+
+/// What [`FakeShell::checkpoint`] saved.
+struct Checkpoint {
+    fs: FsCheckpoint,
+    shell: Box<FakeShell>,
+}
+
+/// The most files [`FakeShell::input_destination`] keeps for one line.
+const MAX_INPUT_SINKS: usize = 8;
+
+/// What became of a line given to [`FakeShell::start_line`].
+#[derive(Debug)]
+pub enum LineStep {
+    /// The line ran.
+    Ran(CommandResult),
+    /// A command on the line reads standard input past what has arrived, so the line waits for
+    /// it, as a real shell's command blocks in `read`. Nothing it did is kept: the shell is as it
+    /// was before the line, and [`FakeShell::finish_line`] runs it once its input has ended.
+    AwaitingInput,
+}
+
+/// How the input of a line held by [`FakeShell::start_line`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputEnd {
+    /// End of input: the channel's EOF, Ctrl-D at the start of a terminal line, or the sensor
+    /// no longer taking more. Readers see end of file and finish normally.
+    Eof,
+    /// Ctrl-C on a terminal: the command waiting in its read is killed by SIGINT (status 130) and
+    /// the rest of the line does not run.
+    Interrupt,
+    /// The channel or the session went away with the input still open: the command is killed by
+    /// SIGHUP (status 129) at the read it was waiting in.
+    Hangup,
 }
 
 /// One entry of the shell stack.
+#[derive(Clone)]
 struct Frame {
     kind: FrameKind,
     state: ShellState,
@@ -505,9 +562,71 @@ impl FakeShell {
             busybox_depth: 0,
             props: std::collections::BTreeMap::new(),
             session_started: chrono::Utc::now(),
+            held: None,
+            tty_input: context != ShellContext::ExecC,
+            input_interrupt: None,
+            input_mark: None,
+            input_sinks: Vec::new(),
         };
         shell.install_processes();
         shell
+    }
+
+    /// The same shell with its session input a terminal (`true`) or a pipe. Exec shells read a
+    /// pipe unless the channel asked for a pty; every other shell reads a terminal.
+    pub fn with_terminal_input(mut self, tty: bool) -> Self {
+        self.tty_input = tty;
+        self
+    }
+
+    /// Everything running a line can change, saved so the line can be undone. The struct literal
+    /// names every field, so a field added later cannot be left out of the copy unnoticed.
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            fs: self.fs.checkpoint(),
+            shell: Box::new(Self {
+                fs: self.fs.share(),
+                ctx: self.ctx.clone(),
+                codec: self.codec.clone(),
+                binary_flagged: self.binary_flagged,
+                flavor: self.flavor,
+                context: self.context,
+                frames: self.frames.clone(),
+                hostname: self.hostname.clone(),
+                clock: self.clock,
+                trace: self.trace.clone(),
+                trace_stack: self.trace_stack.clone(),
+                trace_nodes: self.trace_nodes,
+                trace_dropped: self.trace_dropped,
+                line: self.line.clone(),
+                depth: self.depth,
+                pending: self.pending.clone(),
+                pending_bytes: self.pending_bytes,
+                stdin: self.stdin.clone(),
+                pids: self.pids.clone(),
+                next_job: self.next_job,
+                deferred_stderr: self.deferred_stderr.clone(),
+                last_subst_status: self.last_subst_status,
+                script_depth: self.script_depth,
+                loop_depth: self.loop_depth,
+                busybox_depth: self.busybox_depth,
+                props: self.props.clone(),
+                session_started: self.session_started,
+                held: self.held.clone(),
+                tty_input: self.tty_input,
+                input_interrupt: self.input_interrupt,
+                input_mark: self.input_mark,
+                input_sinks: self.input_sinks.clone(),
+            }),
+        }
+    }
+
+    /// Return to `saved`: the filesystem every share of it sees, and this shell's own state.
+    fn rollback(&mut self, saved: Checkpoint) {
+        let Checkpoint { fs, mut shell } = saved;
+        self.fs.rollback(fs);
+        std::mem::swap(&mut shell.fs, &mut self.fs);
+        *self = *shell;
     }
 
     /// What the engine decided while running the most recent non-blank input line. For tests and
@@ -674,17 +793,138 @@ impl FakeShell {
     /// every idle newline a client sends. This is the one place this function departs from
     /// "every call captures exactly one event" - called out here since it is the one behavior in
     /// this module not dictated directly by the interface.
+    ///
+    /// Standard input at the terminal reads as empty here: a command that reads it sees end of
+    /// input at once. A sensor that delivers the session's input to such a command uses
+    /// [`Self::start_line`] instead.
     pub fn handle_input(&mut self, line: impl AsRef<[u8]>) -> (CommandResult, Vec<SensorEvent>) {
-        let raw = String::from_utf8_lossy(line.as_ref());
+        let Some((decoded, mut events)) = self.begin_input(line.as_ref()) else {
+            return (CommandResult::silent(0), Vec::new());
+        };
+        let output = self.run_input(&decoded);
+        self.end_input(&mut events, true);
+        (output, events)
+    }
+
+    /// [`Self::handle_input`] for a line whose commands may read the session's own input: the
+    /// remaining bytes of an SSH exec channel, or what is typed at the terminal after the line.
+    ///
+    /// Whether the line reads it is the shell's own model of its commands, found by running it:
+    /// the line runs with the session input empty and still open, and if a command reads past
+    /// what has arrived (`cat` with no file operand or `-`, `cat > f`, `dd` without `if=`,
+    /// `base64 -d`, `head`, `read`, a bare `sh` given a script on a pipe, the same inside
+    /// `sh -c '...'` or a pipeline's first stage), everything it did is undone and the line
+    /// waits: [`LineStep::AwaitingInput`]. A command that does not read standard input never
+    /// waits, whatever its name, and a line without one runs to completion here as
+    /// [`Self::handle_input`] would run it.
+    ///
+    /// The events are those of [`Self::handle_input`], returned now either way, so the command is
+    /// on record however its input ends. A waiting line's event carries no `status`: that is not
+    /// known until it runs.
+    pub fn start_line(&mut self, line: impl AsRef<[u8]>) -> (LineStep, Vec<SensorEvent>) {
+        let raw = String::from_utf8_lossy(line.as_ref()).into_owned();
+        let Some((decoded, mut events)) = self.begin_input(raw.as_bytes()) else {
+            return (LineStep::Ran(CommandResult::silent(0)), Vec::new());
+        };
+        let saved = self.checkpoint();
+        self.stdin = Stdin::session(Vec::new(), false, self.tty_input);
+        let output = self.run_input(&decoded);
+        if !self.stdin.is_blocked() {
+            self.stdin = Stdin::Terminal;
+            self.end_input(&mut events, true);
+            return (LineStep::Ran(output), events);
+        }
+        // The run that found the wait is undone, but what it decided still describes the line.
+        let trace = std::mem::take(&mut self.trace);
+        self.rollback(saved);
+        self.trace = trace;
+        self.held = Some(HeldLine {
+            decoded,
+            command: sanitize_value(&raw, MAX_COMMAND_LEN),
+        });
+        self.end_input(&mut events, false);
+        (LineStep::AwaitingInput, events)
+    }
+
+    /// Whether a line given to [`Self::start_line`] is waiting for its input.
+    pub fn is_awaiting_input(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// The waiting line as typed, sanitized and capped like `metadata.command`.
+    pub fn awaiting_command(&self) -> Option<&str> {
+        self.held.as_ref().map(|held| held.command.as_str())
+    }
+
+    /// Run the line [`Self::start_line`] left waiting, now that its input has ended: `input` is
+    /// every byte the command can read, and `end` how the input ended. Nothing happens when no
+    /// line is waiting.
+    pub fn finish_line(&mut self, input: &[u8], end: InputEnd) -> CommandResult {
+        let Some(held) = self.held.take() else {
+            return CommandResult::silent(0);
+        };
+        self.begin_line();
+        self.trace = LineTrace {
+            decoded: held.decoded.clone(),
+            ..LineTrace::default()
+        };
+        self.advance_shell_line();
+        self.input_sinks.clear();
+        self.input_interrupt = match end {
+            InputEnd::Eof => None,
+            InputEnd::Interrupt => Some(130),
+            InputEnd::Hangup => Some(129),
+        };
+        self.stdin = Stdin::session(input.to_vec(), end == InputEnd::Eof, self.tty_input);
+        let mut output = self.run_input(&held.decoded);
+        let interrupted = self.stdin.is_blocked();
+        self.input_interrupt = None;
+        self.stdin = Stdin::Terminal;
+        tracing::debug!(target: "propolis::shell::trace", trace = ?self.trace, "shell line");
+        // Killed by Ctrl-C, the job leaves the cursor after the `^C` the terminal echoed; an
+        // interactive shell moves to a fresh line before its prompt.
+        if interrupted && end == InputEnd::Interrupt && self.context != ShellContext::ExecC {
+            output.append(CommandResult::stdout(b"\n".to_vec()));
+            output.status = 130;
+        }
+        output
+    }
+
+    /// The file that holds what the last line run by [`Self::finish_line`] read from its input:
+    /// the first file written by a command that read it (`cat > f`, `dd of=f`, `base64 -d > f`).
+    /// `None` when that input went nowhere a file holds (a bare `sh` ran it, it was discarded).
+    pub fn input_destination(&self) -> Option<&str> {
+        self.input_sinks.first().map(String::as_str)
+    }
+
+    /// Note `path` as a file a command wrote while it was reading the session input.
+    fn note_input_sink(&mut self, path: &str) {
+        let reading = matches!(
+            (self.input_mark, self.stdin.session_pos()),
+            (Some(mark), Some(pos)) if pos > mark
+        );
+        if reading
+            && self.input_sinks.len() < MAX_INPUT_SINKS
+            && !self.input_sinks.iter().any(|sink| sink == path)
+        {
+            self.input_sinks.push(path.to_string());
+        }
+    }
+
+    /// The common start of [`Self::handle_input`] and [`Self::start_line`]: the line's events and
+    /// its decoded text, or `None` for a blank line outside any open construct, which is no
+    /// command at all.
+    fn begin_input(&mut self, line: &[u8]) -> Option<(String, Vec<SensorEvent>)> {
+        let raw = String::from_utf8_lossy(line);
         self.begin_line();
         if raw.trim().is_empty() {
             if self.pending.is_empty() {
-                return (CommandResult::silent(0), Vec::new());
+                return None;
             }
             // A blank line inside an open construct (a here-document body, a continued command)
             // belongs to it, and is still not a command of its own.
             self.advance_shell_line();
-            return (self.feed_line(""), Vec::new());
+            return Some((String::new(), Vec::new()));
         }
         self.trace = LineTrace::default();
         self.advance_shell_line();
@@ -707,7 +947,7 @@ impl FakeShell {
         // >20k `command_exec` events this way). In both cases we STILL dispatch below so the fake
         // shell keeps responding - a silently dead session is itself a tell - but emit at most ONE
         // marker event per session per flood kind rather than one event per garbage line.
-        let mut events = if is_binary_line(&decoded) {
+        let events = if is_binary_line(&decoded) {
             self.trace.binary_line = true;
             if std::mem::replace(&mut self.binary_flagged, true) {
                 Vec::new()
@@ -799,8 +1039,12 @@ impl FakeShell {
             }
             evs
         };
+        Some((decoded, events))
+    }
 
-        let output = self.run_input(&decoded);
+    /// The common end of [`Self::handle_input`] and [`Self::start_line`], once the line has run.
+    /// `ran` is false for a line left waiting, whose final status is not known yet.
+    fn end_input(&self, events: &mut [SensorEvent], ran: bool) {
         tracing::debug!(target: "propolis::shell::trace", trace = ?self.trace, "shell line");
         // Only the normal path pushed CommandExec; the flood markers carry no trace worth
         // classifying. The trace is final here, so the coverage fields are added in place and
@@ -809,8 +1053,10 @@ impl FakeShell {
             && let Some(obj) = events.first_mut().and_then(|e| e.metadata.as_object_mut())
         {
             self.annotate_coverage(obj);
+            if !ran {
+                obj.remove("status");
+            }
         }
-        (output, events)
     }
 
     /// Operator-facing coverage fields for the command_exec event: derived category words and
@@ -1311,10 +1557,13 @@ impl FakeShell {
     fn traced_write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
         let result = self.fs.write_file(path, bytes);
         match &result {
-            Ok(()) => self.trace_fs(FsEffect::Wrote {
-                path: path.to_string(),
-                bytes: bytes.len(),
-            }),
+            Ok(()) => {
+                self.trace_fs(FsEffect::Wrote {
+                    path: path.to_string(),
+                    bytes: bytes.len(),
+                });
+                self.note_input_sink(path);
+            }
             Err(error) => self.trace_denied(path, error),
         }
         result
@@ -1324,10 +1573,13 @@ impl FakeShell {
         let len = usize::try_from(blob.len()).unwrap_or(usize::MAX);
         let result = self.fs.write_blob(path, blob, mode);
         match &result {
-            Ok(()) => self.trace_fs(FsEffect::Wrote {
-                path: path.to_string(),
-                bytes: len,
-            }),
+            Ok(()) => {
+                self.trace_fs(FsEffect::Wrote {
+                    path: path.to_string(),
+                    bytes: len,
+                });
+                self.note_input_sink(path);
+            }
             Err(error) => self.trace_denied(path, error),
         }
         result
@@ -1698,40 +1950,22 @@ impl FakeShell {
         }
     }
 
-    fn cmd_ls(&mut self, parts: &[&str]) -> CommandResult {
-        let cwd = self.cwd().to_string();
-        let target = first_non_flag_arg(&parts[1..]).unwrap_or(cwd.as_str());
-        let show_hidden = parts[1..]
-            .iter()
-            .any(|a| a.starts_with('-') && (a.contains('a') || a.contains('A')));
-        let listed = self.resolve_logical(target);
-        match self.fs.list_dir(&listed) {
-            Some(mut entries) => {
-                // A real `ls` hides dotfiles without `-a` and sorts what it prints. Listing the
-                // `.x` probe files a loader had just dropped was a tell on both counts.
-                if !show_hidden {
-                    entries.retain(|name| !name.starts_with('.'));
-                }
-                entries.sort();
-                if entries.is_empty() {
-                    CommandResult::silent(0)
-                } else {
-                    CommandResult::stdout(entries.join("  ") + "\n")
-                }
-            }
-            None => CommandResult::stderr(
-                2,
-                format!("ls: cannot access '{target}': No such file or directory\n"),
-            ),
-        }
-    }
-
     /// `sh` / `bash`. A bare invocation pushes a nested interactive shell level, or, when a
     /// script is piped in, runs it; `sh -c "CMD"` and `sh FILE` run their text in a shell level of
     /// their own that ends with it, since loaders stage their payload that way.
     fn cmd_shell_spawn(&mut self, parts: &[&str]) -> CommandResult {
         let shell = command_basename(parts[0]);
-        let script_at = parts.iter().position(|&p| p == "-c");
+        // `-c` may be clustered with other options among the leading ones: the persistence step
+        // `sh -lc '... && cat > UNIT && systemctl ...'` ran as `sh FILE` with the script as the
+        // file name until this looked for it there.
+        let script_at = parts.iter().position(|&p| p == "-c").or_else(|| {
+            parts
+                .iter()
+                .skip(1)
+                .take_while(|p| p.starts_with('-') && **p != "-" && **p != "--")
+                .position(|p| !p.starts_with("--") && p.contains('c'))
+                .map(|index| index + 1)
+        });
         let script = script_at.and_then(|pos| parts.get(pos + 1));
         if let (Some(script), Some(at)) = (script, script_at) {
             if script.trim().is_empty() {
@@ -2887,6 +3121,8 @@ mod procs_tests;
 mod read_tests;
 #[cfg(test)]
 mod readlink_tests;
+#[cfg(test)]
+mod stdin_tests;
 #[cfg(test)]
 mod sysres_tests;
 #[cfg(test)]

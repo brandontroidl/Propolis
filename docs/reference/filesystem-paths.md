@@ -90,6 +90,7 @@ for the full variable reference.
 | GeoIP databases | `PROPOLIS_GEOIP_DIR` | **no default - enrichment disabled when unset** (`geoip_dir` parse, `console/src/main.rs#load_config_from_env`; `feed/src/main.rs#load_config_from_env`) | not created by install.sh |
 | aggregated-node writable state | (unit grant) | `/var/lib/propolis` (`deploy/propolis.service#ReadWritePaths=/var/lib/propolis`) | `/var/lib/propolis` 0755 root (`deploy/provision.sh#root-owned, NOT propolis`) |
 | ops spool bounded-buffer dir | (const) | `/var/lib/propolis/spool` (`deploy/provision.sh#ensure_dir /var/lib/propolis/spool`) | 0750 propolis |
+| `propolis-watch` login home (holds `.ssh/authorized_keys` for the forced-command key) | (provisioned) | `/var/lib/propolis-watch` (`deploy/provision.sh#ensure_dir /var/lib/propolis-watch`) | 0750 root:propolis-watch; `.ssh` 0755 root:root; the operator creates `authorized_keys` root:root 0644, so the account can read its keys but never change them (see [live watch](../operations/live-watch.md)) |
 
 - **GeoIP** expects `GeoLite2-City.mmdb` + `GeoLite2-ASN.mmdb` under
   `PROPOLIS_GEOIP_DIR` (`crates/geoip/src/lib.rs#load`, `crates/geoip/src/lib.rs#load_asn_only`). When the var is unset,
@@ -150,6 +151,11 @@ itself) and `/var/log/propolis`.
   `console.env`, `ssh.env`, `catchall.env`, `propolis.env` at
   `deploy/propolis.service#EnvironmentFile=/etc/propolis/propolis.env`). `install.sh` does **not** create these env files
   (`deploy/install.sh#OPERATOR-owned /etc/propolis/*.env file`) - the operator populates them.
+- **Derived, secret-free env files** written by deploy scripts, never by hand:
+  `/etc/propolis/fleet-listeners.env` (`deploy/fleet-listeners.sh`) and
+  `/etc/propolis/watch.env`, root:propolis-watch 0640, holding only the `PROPOLIS_SENSOR_LOGS` line
+  copied from `propolis.env` for the live watcher (`deploy/watch-env.sh`, run by `provision.sh`;
+  see [live watch](../operations/live-watch.md)).
 - **Feed status:** the console reads (read-only)
   `PROPOLIS_FEED_OUTPUT_DIR`/`manifest.json` for its feed-status page; the unit
   grants `ReadOnlyPaths=/var/lib/propolis/feed` (`console.service`).

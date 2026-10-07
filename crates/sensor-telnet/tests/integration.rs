@@ -1114,3 +1114,64 @@ fn walkdir_or_manual(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     walk(dir, &mut files);
     files
 }
+
+/// Telnet runs the same terminal as the SSH shell: `cat > f` takes the lines typed after it until
+/// Ctrl-D, the file holds them, and the input is captured once as `shell_stdin`. The text is not a
+/// binary flood, so the shell's own capture stays empty: each byte goes to one capture.
+#[tokio::test]
+async fn cat_at_the_telnet_shell_takes_typed_lines_until_ctrl_d_and_captures_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let (addr, handle) = sensor_telnet::start_test_server(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        dir.path().join("spool"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    login(&mut conn, b"root", b"password").await;
+    // The command, its input and the Ctrl-D in one write, as a script sends them, CR-NUL Enters
+    // included.
+    conn.write_all(b"cat > /tmp/typed\r\0#!/bin/sh\r\0echo telnet-dropper\r\0\x04")
+        .await
+        .unwrap();
+    let echoed = read_until_contains(&mut conn, b"root@server01:~# ").await;
+    let echoed = String::from_utf8_lossy(&echoed);
+    assert!(
+        echoed.contains("#!/bin/sh\r\necho telnet-dropper\r\n"),
+        "{echoed:?}"
+    );
+    conn.write_all(b"cat /tmp/typed\r\n").await.unwrap();
+    let read_back = read_until_contains(&mut conn, b"telnet-dropper\r\nroot@server01").await;
+    assert!(String::from_utf8_lossy(&read_back).contains("#!/bin/sh\r\n"));
+    conn.write_all(b"exit\r\n").await.unwrap();
+    wait_for_upload_event(&log_path).await;
+    drop(conn);
+    handle.abort();
+
+    let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+    let uploads: Vec<sensor_wire::SensorEvent> = content
+        .lines()
+        .map(|l| serde_json::from_str::<sensor_wire::SensorEvent>(l).unwrap())
+        .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .collect();
+    assert_eq!(uploads.len(), 1, "{uploads:?}");
+    let metadata = &uploads[0].metadata;
+    assert_eq!(metadata["capture_reason"], "shell_stdin");
+    assert_eq!(metadata["end_reason"], "transfer_complete");
+    assert_eq!(metadata["destination"], "/tmp/typed");
+    assert_eq!(metadata["command"], "cat > /tmp/typed");
+    assert_eq!(metadata["size"], "#!/bin/sh\necho telnet-dropper\n".len());
+    let stored = spooled_files(&dir.path().join("spool"));
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        std::fs::read(&stored[0]).unwrap(),
+        b"#!/bin/sh\necho telnet-dropper\n"
+    );
+}

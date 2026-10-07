@@ -137,6 +137,14 @@ pub struct ConnectionBudget {
     limits: BudgetLimits,
 }
 
+/// The filesystem-side counters of a budget at one moment, see [`ConnectionBudget::fs_counters`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FsCounters {
+    owned_bytes: u64,
+    overlay_nodes: u64,
+    last_refusal: u8,
+}
+
 /// Take one unit from `counter` if it is under `limit`.
 fn take_slot(counter: &AtomicU64, limit: u64) -> bool {
     counter
@@ -286,6 +294,24 @@ impl ConnectionBudget {
 
     fn refuse(&self, which: u8) {
         self.last_refusal.store(which, Relaxed);
+    }
+
+    /// The counters a filesystem write moves, for a shell line that is run and then rolled back
+    /// (see `FakeFs::checkpoint`). The event and download counters are charged before a line runs
+    /// and are not part of it.
+    pub(crate) fn fs_counters(&self) -> FsCounters {
+        FsCounters {
+            owned_bytes: self.owned_bytes.load(Relaxed),
+            overlay_nodes: self.overlay_nodes.load(Relaxed),
+            last_refusal: self.last_refusal.load(Relaxed),
+        }
+    }
+
+    /// Put back what [`Self::fs_counters`] read.
+    pub(crate) fn restore_fs_counters(&self, saved: FsCounters) {
+        self.owned_bytes.store(saved.owned_bytes, Relaxed);
+        self.overlay_nodes.store(saved.overlay_nodes, Relaxed);
+        self.last_refusal.store(saved.last_refusal, Relaxed);
     }
 
     /// The most memory this budget lets one connection hold: `owned_bytes` (content and node

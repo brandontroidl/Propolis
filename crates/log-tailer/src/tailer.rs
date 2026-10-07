@@ -5,9 +5,33 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::cursor::{CursorState, DurableCursor, RotationEvent, compute_fingerprint, get_inode};
+use crate::cursor::{
+    CursorState, DurableCursor, RotationEvent, compute_fingerprint, detect_rotation, get_inode,
+};
+
+/// One item of a batch read, in file order: a complete line, or the place where an over-length
+/// line ([`MAX_LINE_BYTES`]) was discarded instead of buffered. [`LogTailer::read_batch`] keeps
+/// only the lines; a reader that must not drop anything silently uses
+/// [`LogTailer::read_batch_entries`] and reports the discards itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailEntry {
+    Line(String),
+    /// `bytes` is the discarded line's length including its terminating `\n`.
+    Discarded {
+        bytes: u64,
+    },
+}
+
+/// Where a [`LogTailer::without_cursor`] tailer begins reading the file it finds at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartAt {
+    /// From offset 0 of the current file.
+    Beginning,
+    /// After the last complete line already in the file, so only lines appended later are read.
+    End,
+}
 
 /// Below this size, `compute_fingerprint`'s `min(256, size)` window can shift from ordinary
 /// append growth alone (no rotation at all), producing a fingerprint "mismatch" that does not
@@ -45,7 +69,9 @@ struct UncommittedRead {
 /// which is safe only if it never persists after a failure - see [`UncommittedRead`].
 pub struct LogTailer {
     log_path: PathBuf,
-    cursor: DurableCursor,
+    /// `None` for a [`Self::without_cursor`] tailer, which has nowhere to persist to and so can
+    /// never write a file.
+    cursor: Option<DurableCursor>,
     state: CursorState,
     /// Handle most recently opened for `log_path`, corresponding to `state.inode`. Kept across
     /// calls so that when the path is rotated out from under us (rotation by rename), this handle
@@ -85,6 +111,34 @@ impl LogTailer {
             offset: 0,
             fingerprint: [0u8; 32],
         });
+        Self::with_state(log_path, Some(cursor), state)
+    }
+
+    /// A tailer that reads and follows rotation exactly like [`Self::new`] but has no cursor: it
+    /// neither loads nor persists a position, so it opens `log_path` read-only and writes nothing
+    /// anywhere. [`Self::persist_cursor`] on it is an error. For a live reader that wants the same
+    /// line, rotation and over-length handling without leaving state behind.
+    pub fn without_cursor(log_path: PathBuf, start: StartAt) -> Self {
+        let state = match start {
+            // Inode 0 is never real (see `get_inode`), so the first read stamps the file it finds
+            // and starts at offset 0, exactly as a fresh `new` tailer does.
+            StartAt::Beginning => CursorState {
+                inode: 0,
+                offset: 0,
+                fingerprint: [0u8; 32],
+            },
+            // A file that does not exist yet stamps inode 0 here too, so when it appears its
+            // whole content is read: all of it was written after the start.
+            StartAt::End => CursorState {
+                inode: get_inode(&log_path),
+                offset: end_of_last_complete_line(&log_path),
+                fingerprint: compute_fingerprint(&log_path),
+            },
+        };
+        Self::with_state(log_path, None, state)
+    }
+
+    fn with_state(log_path: PathBuf, cursor: Option<DurableCursor>, state: CursorState) -> Self {
         let last_known_size = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
         Self {
             log_path,
@@ -102,6 +156,18 @@ impl LogTailer {
     /// cursor stays at its start so the next call re-reads it once it is complete. A missing log
     /// file yields an empty batch, not an error (the sensor may not have started yet).
     pub fn read_batch(&mut self, max_lines: usize) -> Vec<String> {
+        self.read_batch_entries(max_lines)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                TailEntry::Line(line) => Some(line),
+                TailEntry::Discarded { .. } => None,
+            })
+            .collect()
+    }
+
+    /// [`Self::read_batch`] with each over-length discard reported in place. `max_lines` counts
+    /// lines only; discards ride along uncounted.
+    pub fn read_batch_entries(&mut self, max_lines: usize) -> Vec<TailEntry> {
         if max_lines == 0 {
             return Vec::new();
         }
@@ -123,17 +189,19 @@ impl LogTailer {
 
         // 1. Drain any inodes rotated out from under us, oldest-first and to exhaustion, BEFORE the
         //    current file - otherwise a backlog larger than one batch is lost across a rotation.
-        let mut lines = Vec::new();
-        while lines.len() < max_lines {
-            let want = max_lines - lines.len();
+        let mut entries = Vec::new();
+        let mut line_count = 0;
+        while line_count < max_lines {
+            let want = max_lines - line_count;
             let exhausted = match self.pending_drains.front_mut() {
                 None => break,
                 Some((old_file, old_offset)) => {
                     match read_lines_from(old_file, *old_offset, want) {
                         Ok((drained, consumed)) => {
                             *old_offset += consumed;
-                            let got = drained.len();
-                            lines.extend(drained);
+                            let got = count_lines(&drained);
+                            line_count += got;
+                            entries.extend(drained);
                             got < want // fewer than requested => this old inode has no more lines
                         }
                         // Unreadable old handle: abandon it (its data is unrecoverable regardless).
@@ -150,26 +218,27 @@ impl LogTailer {
                 }
             }
         }
-        if lines.len() >= max_lines {
+        if line_count >= max_lines {
             self.refresh_last_known_size();
-            return lines;
+            return entries;
         }
 
         // 2. Read the current inode for the remainder.
         let Ok(mut file) = File::open(&self.log_path) else {
             // Missing (or otherwise unopenable) log file: nothing more to read this round.
-            return lines;
+            return entries;
         };
 
-        let remaining = max_lines - lines.len();
-        if let Ok((new_lines, consumed)) = read_lines_from(&mut file, self.state.offset, remaining)
+        let remaining = max_lines - line_count;
+        if let Ok((new_entries, consumed)) =
+            read_lines_from(&mut file, self.state.offset, remaining)
         {
             self.advance(consumed as usize);
-            lines.extend(new_lines);
+            entries.extend(new_entries);
         }
         self.file = Some(file);
         self.refresh_last_known_size();
-        lines
+        entries
     }
 
     /// Manually advances the cursor's read position by `bytes`, independent of any particular
@@ -235,9 +304,16 @@ impl LogTailer {
         self.state.offset = offset;
     }
 
-    /// Persists the current cursor state via `DurableCursor::save`.
+    /// Persists the current cursor state via `DurableCursor::save`. A [`Self::without_cursor`]
+    /// tailer has nowhere to persist to: this returns `ErrorKind::Unsupported` and writes nothing.
     pub fn persist_cursor(&self) -> io::Result<()> {
-        self.cursor.save(&self.state)
+        match &self.cursor {
+            Some(cursor) => cursor.save(&self.state),
+            None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this tailer was built without a cursor and persists nothing",
+            )),
+        }
     }
 
     fn refresh_last_known_size(&mut self) {
@@ -250,7 +326,7 @@ impl LogTailer {
     /// displaced inode's still-open handle is moved to `pending_drains`, which `read_batch` then
     /// drains to exhaustion before the new file.
     fn handle_rotation(&mut self) {
-        match self.cursor.detect_rotation(&self.state) {
+        match detect_rotation(&self.log_path, &self.state) {
             RotationEvent::None => {}
             RotationEvent::Truncated => self.reset_to_current_file(),
             RotationEvent::Replaced => {
@@ -320,28 +396,37 @@ impl LogTailer {
     }
 }
 
-/// Reads up to `max_lines` complete (`\n`-terminated) lines from `file`, starting at
-/// `start_offset`. Returns the lines and the number of bytes actually consumed (the sum of each
-/// accepted line's length including its trailing `\n`). An incomplete trailing line - EOF reached
-/// without a `\n` - is left unconsumed: `consumed` stops short of it so the next read starts at
-/// its beginning again.
 /// Hard cap on a single log line intake will buffer. Sensors already bound their captured fields
 /// (`*_MAX_CAPTURED_BYTES`, ~1 MiB), so a real line never approaches this; the cap defends the
 /// low-trust sensor boundary intake crosses - a compromised or malfunctioning sensor writing an
 /// enormous (or endless, unterminated) line must not drive unbounded allocation here.
-const MAX_LINE_BYTES: u64 = 1_048_576;
+pub const MAX_LINE_BYTES: u64 = 1_048_576;
 
+fn count_lines(entries: &[TailEntry]) -> usize {
+    entries
+        .iter()
+        .filter(|e| matches!(e, TailEntry::Line(_)))
+        .count()
+}
+
+/// Reads up to `max_lines` complete (`\n`-terminated) lines from `file`, starting at
+/// `start_offset`, with a [`TailEntry::Discarded`] in place of each over-length line skipped on
+/// the way. Returns the entries and the number of bytes actually consumed (every accepted or
+/// discarded line's length including its trailing `\n`). An incomplete trailing line - EOF
+/// reached without a `\n` - is left unconsumed: `consumed` stops short of it so the next read
+/// starts at its beginning again.
 fn read_lines_from(
     file: &mut File,
     start_offset: u64,
     max_lines: usize,
-) -> io::Result<(Vec<String>, u64)> {
+) -> io::Result<(Vec<TailEntry>, u64)> {
     file.seek(SeekFrom::Start(start_offset))?;
     let mut reader = BufReader::new(file);
-    let mut lines = Vec::new();
+    let mut entries = Vec::new();
+    let mut lines = 0;
     let mut consumed: u64 = 0;
 
-    while lines.len() < max_lines {
+    while lines < max_lines {
         let mut buf = Vec::new();
         // Read at most MAX_LINE_BYTES + 1 so a runaway line cannot allocate without bound.
         let bytes_read = (&mut reader)
@@ -358,11 +443,13 @@ fn read_lines_from(
                 // unconsumed - it may still be mid-write and complete on a later poll.
                 match skip_to_newline(&mut reader)? {
                     Some(skipped) => {
-                        consumed += bytes_read as u64 + skipped;
+                        let bytes = bytes_read as u64 + skipped;
+                        consumed += bytes;
                         tracing::warn!(
                             max_bytes = MAX_LINE_BYTES,
                             "intake: discarded an over-length log line from a sensor (low-trust boundary)"
                         );
+                        entries.push(TailEntry::Discarded { bytes });
                         continue;
                     }
                     None => break,
@@ -374,10 +461,37 @@ fn read_lines_from(
         buf.pop(); // drop the trailing '\n'
         // Lossy rather than a hard error: a corrupt line should not crash the tailer. The
         // converter (Task 1) applies the real, fail-closed NDJSON validation downstream.
-        lines.push(String::from_utf8_lossy(&buf).into_owned());
+        entries.push(TailEntry::Line(String::from_utf8_lossy(&buf).into_owned()));
+        lines += 1;
     }
 
-    Ok((lines, consumed))
+    Ok((entries, consumed))
+}
+
+/// The offset just past the last `\n` in `path`, so a reader starting there never begins inside
+/// a line the writer has not finished. Looks back at most [`MAX_LINE_BYTES`]: a longer unfinished
+/// tail is over-length anyway, and starting at the end of the file then is no worse. A missing or
+/// unreadable file is offset 0.
+fn end_of_last_complete_line(path: &Path) -> u64 {
+    let Ok(mut file) = File::open(path) else {
+        return 0;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return 0;
+    };
+    let window = len.min(MAX_LINE_BYTES);
+    let mut tail = Vec::new();
+    let read = file
+        .seek(SeekFrom::Start(len - window))
+        .and_then(|_| file.take(window).read_to_end(&mut tail));
+    if read.is_err() {
+        return len;
+    }
+    match tail.iter().rposition(|&b| b == b'\n') {
+        Some(i) => len - window + i as u64 + 1,
+        None if window == len => 0,
+        None => len,
+    }
 }
 
 /// Reads and discards bytes (in bounded chunks) until and including the next `\n`. Returns the

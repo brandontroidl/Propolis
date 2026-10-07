@@ -7,7 +7,6 @@
 //! nothing is run, in keeping with the never-exec guarantee that no file is ever handed to an
 //! interpreter here.
 
-use super::eval::Stdin;
 use super::{CommandResult, FakeShell, Flow, FrameKind, ShellLevel};
 
 /// The default field separators: space, tab, newline.
@@ -468,15 +467,11 @@ impl FakeShell {
     }
 
     /// What a bare `sh` or `bash` does with a script piped to it: run it as a script in a shell
-    /// level of its own. `None` when standard input is the terminal.
+    /// level of its own. `None` when standard input is a terminal.
     pub(super) fn take_piped_script(&mut self) -> Option<String> {
-        match &self.stdin {
-            Stdin::Terminal => None,
-            Stdin::Data { .. } => {
-                let bytes = self.stdin.take_rest();
-                Some(String::from_utf8_lossy(&bytes).into_owned())
-            }
-        }
+        self.stdin
+            .take_script()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     }
 }
 

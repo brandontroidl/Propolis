@@ -120,7 +120,7 @@ EOF
 # ---- 4. binaries ----
 
 log "4/9 installing binaries to /usr/local/bin"
-for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred; do
+for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred propolis-watch; do
     src="$BUILD_DIR/$bin"
     dst="/usr/local/bin/$bin"
     if [ "$DRY_RUN" -eq 1 ]; then

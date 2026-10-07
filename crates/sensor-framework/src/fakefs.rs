@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::binaries::{self, BinaryImage};
-use crate::budget::{BudgetError, BudgetLimits, ConnectionBudget};
+use crate::budget::{BudgetError, BudgetLimits, ConnectionBudget, FsCounters};
 use crate::persona;
 
 /// Unix seconds stamped on every baked node (2024-01-01T00:00:00Z). Persona data: invisible until
@@ -461,7 +461,7 @@ impl Snapshot {
 }
 
 /// What the session changed on top of the snapshot. Overlay nodes are keyed by physical path.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Overlay {
     nodes: HashMap<String, Node>,
     /// Physical paths removed this session, baked-in ones included: a file the shell said it
@@ -476,7 +476,7 @@ struct Overlay {
 /// that needs it locks once at the top and passes the guard's contents to private helpers
 /// (`node_at`, `resolve`, `lookup`, ...) that take `&Persistent`; no helper locks, so no path
 /// can lock twice. No guard is held across an `.await` (this module has none).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Persistent {
     overlay: Overlay,
     /// `chattr` bits by physical path; an entry keeps its slot (and charge) once made.
@@ -503,6 +503,13 @@ pub struct FakeFs {
     /// and removals land in the overlay above it. Per instance, never shared: each shell's
     /// process table is its own.
     generated: HashMap<String, Node>,
+}
+
+/// What [`FakeFs::checkpoint`] saved.
+pub(crate) struct FsCheckpoint {
+    persistent: Persistent,
+    generated: HashMap<String, Node>,
+    counters: FsCounters,
 }
 
 /// The most generated nodes one filesystem holds. The shell's process table is a handful of
@@ -630,6 +637,27 @@ impl FakeFs {
             budget: Arc::clone(&self.budget),
             generated: HashMap::new(),
         }
+    }
+
+    /// Everything a shell line can change here: the shared written state, this instance's generated
+    /// nodes and the budget counters the writes moved. A line that turns out to wait for its input
+    /// is run once to find that out and then put back with [`Self::rollback`], so its writes
+    /// happen only once, when it runs for real.
+    pub(crate) fn checkpoint(&self) -> FsCheckpoint {
+        FsCheckpoint {
+            persistent: self.lock().clone(),
+            generated: self.generated.clone(),
+            counters: self.budget.fs_counters(),
+        }
+    }
+
+    /// Put back the state [`Self::checkpoint`] saved. The shared state is replaced in place, so
+    /// every share of this filesystem sees the rollback: nothing else can have run in between,
+    /// since one connection's shells all run on its one task and a line runs to completion.
+    pub(crate) fn rollback(&mut self, saved: FsCheckpoint) {
+        *self.lock() = saved.persistent;
+        self.generated = saved.generated;
+        self.budget.restore_fs_counters(saved.counters);
     }
 
     /// The shared state, locked. A poisoned lock is recovered: every mutation below leaves the

@@ -14,10 +14,11 @@ use sensor_framework::fakefs::FakeFs;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::persona;
 use sensor_framework::sanitize_value;
-use sensor_framework::shell::{EmitContext, FakeShell, onlcr};
+use sensor_framework::shell::{EmitContext, FakeShell, LineStep, onlcr};
 use sensor_framework::{
-    CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget,
-    EgressState, EventEmitter, UploadEnd, Uuid, WanResolver, limits_from, upload_metadata,
+    CAPTURE_REASON_SHELL_STDIN, CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, CaptureSource,
+    ConnectionBounds, ConnectionBudget, EgressState, EventEmitter, HeldEnd, HeldInput, InputMode,
+    StdinCaptures, UploadEnd, Uuid, WanResolver, limits_from, upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
@@ -179,12 +180,26 @@ pub async fn handle_connection<S>(
     // session that does. `Drop` is the only code that runs on every exit path.
     reader.arm_capture_submit(source_ip, wan_ip, session_id);
 
+    // What commands read from the terminal (`cat > f` takes the lines after it until Ctrl-D),
+    // captured once per distinct body and submitted when this session's future goes, cancelled
+    // or not.
+    let stdin_captures = StdinCaptures::new(
+        handoff.clone(),
+        CaptureSource {
+            sensor: PROTOCOL_LABEL,
+            source_ip,
+            wan_ip,
+            session_id,
+            authenticated: true,
+        },
+    );
+    let max_stdin_bytes = reader.bounds.max_captured_bytes;
+
     loop {
         let Some(line) = reader.read_line(&mut stream, true).await else {
             break;
         };
-        let (output, events) = shell.handle_input(&line);
-        let close_session = output.close_session;
+        let (step, events) = shell.start_line(&line);
         for event in &events {
             if event.metadata.get("flood").and_then(|v| v.as_str()) == Some("binary") {
                 reader.flag_binary();
@@ -193,6 +208,28 @@ pub async fn handle_connection<S>(
                 tracing::error!(%peer_addr, "telnet: failed to append command event");
             }
         }
+        let output = match step {
+            LineStep::Ran(output) => output,
+            LineStep::AwaitingInput => {
+                // The bytes after the line are the command's input until it ends, as on the
+                // terminal a real telnetd hands the shell; they never reach the line reader.
+                let mut input = HeldInput::new(
+                    &shell,
+                    InputMode::Terminal,
+                    &stdin_captures,
+                    CAPTURE_REASON_SHELL_STDIN,
+                    max_stdin_bytes,
+                );
+                match reader.read_held(&mut stream, &mut input).await {
+                    Some(end) => input.finish(&mut shell, end),
+                    None => {
+                        let _ = input.finish(&mut shell, HeldEnd::Cut(reader.session_end));
+                        break;
+                    }
+                }
+            }
+        };
+        let close_session = output.close_session;
 
         if close_session {
             // Not charged: the session ends with this write, so there is no later write for the
@@ -238,9 +275,14 @@ fn encode_telnet_data(bytes: &[u8], shell: Option<&FakeShell>) -> Vec<u8> {
         Some(shell) => shell.encode_output(&terminal),
         None => terminal,
     };
-    let iac_count = coded.iter().filter(|&&byte| byte == 0xff).count();
-    let mut escaped = Vec::with_capacity(coded.len().saturating_add(iac_count));
-    for byte in coded {
+    escape_iac(&coded)
+}
+
+/// RFC 854 escaping: a literal 0xff data byte is sent doubled so it is not read as IAC.
+fn escape_iac(bytes: &[u8]) -> Vec<u8> {
+    let iac_count = bytes.iter().filter(|&&byte| byte == 0xff).count();
+    let mut escaped = Vec::with_capacity(bytes.len().saturating_add(iac_count));
+    for &byte in bytes {
         escaped.push(byte);
         if byte == 0xff {
             escaped.push(0xff);
@@ -318,10 +360,11 @@ fn login_event(
 /// the whole session's captured input regardless of how many lines it spans.
 struct LineReader {
     filter: IacFilter,
-    /// Complete lines already extracted from a read that produced more than one (an attacker
-    /// script can write several `\n`-terminated lines in a single write, faster than this reader
-    /// consumes them one at a time).
-    pending: VecDeque<String>,
+    /// IAC-stripped bytes read off the socket and not yet consumed. An attacker script can write
+    /// several lines in one write, faster than they are consumed one at a time, and a line that
+    /// reads its input (`cat > f`) takes the bytes after it raw, so lines are cut from here only
+    /// as they are wanted.
+    unread: VecDeque<u8>,
     /// Bytes accumulated for the line currently being assembled.
     current: Vec<u8>,
     bounds: ConnectionBounds,
@@ -427,7 +470,7 @@ impl LineReader {
     fn new(bounds: ConnectionBounds, handoff: Arc<CaptureHandoff>) -> Self {
         Self {
             filter: IacFilter::new(),
-            pending: VecDeque::new(),
+            unread: VecDeque::new(),
             current: Vec::new(),
             bounds,
             first_read: true,
@@ -522,58 +565,8 @@ impl LineReader {
         echo: bool,
     ) -> Option<String> {
         loop {
-            if let Some(line) = self.pending.pop_front() {
-                return Some(line);
-            }
-
-            if self.total_captured >= self.bounds.max_captured_bytes {
-                self.session_end = CaptureEnd::CaptureBudget;
-                return None;
-            }
-
-            let per_read_timeout = if self.first_read {
-                self.bounds.read_timeout
-            } else {
-                self.bounds.idle_timeout
-            };
-
-            let mut raw = [0u8; READ_CHUNK_SIZE];
-            let n = match tokio::time::timeout(per_read_timeout, stream.read(&mut raw)).await {
-                // Three different endings, and a capture can only say whether its bytes are whole
-                // if they stay apart: the peer closing is the one that means "it finished
-                // sending".
-                Ok(Ok(0)) => {
-                    self.session_end = CaptureEnd::PeerClosed;
-                    return None;
-                }
-                Ok(Err(_)) => {
-                    self.session_end = CaptureEnd::TransportError;
-                    return None;
-                }
-                Err(_) => {
-                    self.session_end = CaptureEnd::IdleTimeout;
-                    return None;
-                }
-                Ok(Ok(n)) => n,
-            };
-            self.first_read = false;
-            self.total_captured += n as u64;
-
-            let mut data = Vec::new();
-            let mut response = Vec::new();
-            self.filter.process(&raw[..n], &mut data, &mut response);
-            self.capture_bytes(&data);
-            if !response.is_empty()
-                && write_raw(stream, self.bounds.idle_timeout, &response)
-                    .await
-                    .is_err()
-            {
-                self.session_end = CaptureEnd::TransportError;
-                return None;
-            }
-
             let mut echo_out = Vec::new();
-            self.feed(&data, echo, &mut echo_out);
+            let line = self.next_line(echo, &mut echo_out);
             if !echo_out.is_empty()
                 && write_telnet_data(stream, self.bounds.idle_timeout, &echo_out, None)
                     .await
@@ -582,11 +575,107 @@ impl LineReader {
                 self.session_end = CaptureEnd::TransportError;
                 return None;
             }
+            if line.is_some() {
+                return line;
+            }
+            if !self.fill(stream).await {
+                return None;
+            }
         }
     }
 
-    /// Extract complete lines from already-IAC-filtered `data` into `pending`, and, since the sensor
-    /// now offers `WILL ECHO`, produce the server-side echo into `echo_out`.
+    /// Hand the bytes after a line that reads its input to `input` until the input ends (Ctrl-D,
+    /// Ctrl-C, the capture ceiling), echoing them as the terminal does. `None` when the session
+    /// ended first; `session_end` says how. The bytes after the end are left for the next line.
+    async fn read_held<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        input: &mut HeldInput,
+    ) -> Option<HeldEnd> {
+        if std::mem::take(&mut self.prev_cr) {
+            input.follow_cr();
+        }
+        loop {
+            if !self.unread.is_empty() {
+                let fed = input.feed(self.unread.make_contiguous());
+                self.unread.drain(..fed.taken);
+                // The terminal's echo already carries CR-LF, so it skips the newline translation
+                // shell output gets.
+                if !fed.echo.is_empty()
+                    && write_raw(stream, self.bounds.idle_timeout, &escape_iac(&fed.echo))
+                        .await
+                        .is_err()
+                {
+                    self.session_end = CaptureEnd::TransportError;
+                    return None;
+                }
+                if fed.ended.is_some() {
+                    return fed.ended;
+                }
+                continue;
+            }
+            if !self.fill(stream).await {
+                return None;
+            }
+        }
+    }
+
+    /// Read once from the socket into `unread`, answering any option negotiation it carried.
+    /// False when the session ended instead (EOF, a timeout, an error, the session's
+    /// `max_captured_bytes`), with `session_end` saying which.
+    async fn fill<S: AsyncRead + AsyncWrite + Unpin>(&mut self, stream: &mut S) -> bool {
+        if self.total_captured >= self.bounds.max_captured_bytes {
+            self.session_end = CaptureEnd::CaptureBudget;
+            return false;
+        }
+
+        let per_read_timeout = if self.first_read {
+            self.bounds.read_timeout
+        } else {
+            self.bounds.idle_timeout
+        };
+
+        let mut raw = [0u8; READ_CHUNK_SIZE];
+        let n = match tokio::time::timeout(per_read_timeout, stream.read(&mut raw)).await {
+            // Three different endings, and a capture can only say whether its bytes are whole
+            // if they stay apart: the peer closing is the one that means "it finished
+            // sending".
+            Ok(Ok(0)) => {
+                self.session_end = CaptureEnd::PeerClosed;
+                return false;
+            }
+            Ok(Err(_)) => {
+                self.session_end = CaptureEnd::TransportError;
+                return false;
+            }
+            Err(_) => {
+                self.session_end = CaptureEnd::IdleTimeout;
+                return false;
+            }
+            Ok(Ok(n)) => n,
+        };
+        self.first_read = false;
+        self.total_captured += n as u64;
+
+        let mut data = Vec::new();
+        let mut response = Vec::new();
+        self.filter.process(&raw[..n], &mut data, &mut response);
+        if !response.is_empty()
+            && write_raw(stream, self.bounds.idle_timeout, &response)
+                .await
+                .is_err()
+        {
+            self.session_end = CaptureEnd::TransportError;
+            return false;
+        }
+        self.unread.extend(data);
+        true
+    }
+
+    /// Cut the next line from `unread`, and, since the sensor offers `WILL ECHO`, produce the
+    /// server-side echo of the bytes it consumed into `echo_out`. `None` once `unread` runs out
+    /// before a line ends; the partial line stays in `current`. The bytes it consumes are the
+    /// shell's, so they are what the binary-payload capture keeps.
     ///
     /// - A bare Enter arrives as CR, CR-LF, or (RFC 854 s.4.3) **CR-NUL**; `prev_cr` collapses the
     ///   pair and NUL bytes are dropped, so a stray NUL never orphans onto the next line as a leading
@@ -597,8 +686,11 @@ impl LineReader {
     ///   still advances the cursor).
     /// - Printable bytes are buffered and, when `echo`, echoed; backspace/DEL erases one buffered
     ///   byte and, when `echo`, rubs it out on screen (`\b \b`). Other control bytes are ignored.
-    fn feed(&mut self, data: &[u8], echo: bool, echo_out: &mut Vec<u8>) {
-        for &byte in data {
+    fn next_line(&mut self, echo: bool, echo_out: &mut Vec<u8>) -> Option<String> {
+        let mut consumed = Vec::new();
+        let mut line = None;
+        while let Some(byte) = self.unread.pop_front() {
+            consumed.push(byte);
             // Swallow the LF of a CR-LF Enter (the CR already submitted the line).
             if self.prev_cr {
                 self.prev_cr = false;
@@ -609,9 +701,14 @@ impl LineReader {
             match byte {
                 b'\r' | b'\n' => {
                     self.prev_cr = byte == b'\r';
+                    // The rest of a CR-LF or CR-NUL Enter, when it is already here, belongs to
+                    // this line: the password's would otherwise be read in the shell phase.
+                    if self.prev_cr && matches!(self.unread.front(), Some(b'\n' | 0)) {
+                        consumed.extend(self.unread.pop_front());
+                        self.prev_cr = false;
+                    }
                     echo_out.push(b'\n');
-                    self.pending
-                        .push_back(String::from_utf8_lossy(&self.current).into_owned());
+                    line = Some(String::from_utf8_lossy(&self.current).into_owned());
                     self.current.clear();
                 }
                 0 => {} // CR-NUL padding: drop.
@@ -626,14 +723,18 @@ impl LineReader {
                         echo_out.push(b);
                     }
                     if self.current.len() >= MAX_LINE_LEN {
-                        self.pending
-                            .push_back(String::from_utf8_lossy(&self.current).into_owned());
+                        line = Some(String::from_utf8_lossy(&self.current).into_owned());
                         self.current.clear();
                     }
                 }
                 _ => {} // other control bytes: ignore.
             }
+            if line.is_some() {
+                break;
+            }
         }
+        self.capture_bytes(&consumed);
+        line
     }
 }
 
@@ -795,14 +896,17 @@ mod tests {
         let mut echo = Vec::new();
         // A real telnet client transmits a bare Enter as CR-NUL (RFC 854 s.4.3). Two commands, each
         // terminated that way: the NUL after the first must not corrupt the second command.
-        reader.feed(b"echo one\r\x00echo two\r\x00", false, &mut echo);
-        assert_eq!(reader.pending.pop_front().as_deref(), Some("echo one"));
+        reader.unread.extend(b"echo one\r\x00echo two\r\x00");
         assert_eq!(
-            reader.pending.pop_front().as_deref(),
+            reader.next_line(false, &mut echo).as_deref(),
+            Some("echo one")
+        );
+        assert_eq!(
+            reader.next_line(false, &mut echo).as_deref(),
             Some("echo two"),
             "the NUL from the first CR-NUL Enter must not orphan onto the next command"
         );
-        assert!(reader.pending.is_empty());
+        assert_eq!(reader.next_line(false, &mut echo), None);
         assert!(
             reader.current.is_empty(),
             "no orphaned NUL left dangling in the line buffer"
@@ -814,8 +918,8 @@ mod tests {
         let mut reader = LineReader::new(test_bounds(), one_slot_handoff());
         let mut echo = Vec::new();
         // Type "ab", backspace (DEL), "c", Enter as CR-NUL.
-        reader.feed(b"ab\x7fc\r\x00", true, &mut echo);
-        assert_eq!(reader.pending.pop_front().as_deref(), Some("ac"));
+        reader.unread.extend(b"ab\x7fc\r\x00");
+        assert_eq!(reader.next_line(true, &mut echo).as_deref(), Some("ac"));
         assert_eq!(echo, b"ab\x08 \x08c\n");
     }
 
@@ -823,8 +927,11 @@ mod tests {
     fn password_read_hides_chars_but_still_echoes_the_enter() {
         let mut reader = LineReader::new(test_bounds(), one_slot_handoff());
         let mut echo = Vec::new();
-        reader.feed(b"secret\r\x00", false, &mut echo);
-        assert_eq!(reader.pending.pop_front().as_deref(), Some("secret"));
+        reader.unread.extend(b"secret\r\x00");
+        assert_eq!(
+            reader.next_line(false, &mut echo).as_deref(),
+            Some("secret")
+        );
         // Password characters are not echoed; only the Enter's CR-LF advances the cursor.
         assert_eq!(echo, b"\n");
     }
@@ -833,9 +940,29 @@ mod tests {
     fn empty_enter_submits_an_empty_line_so_the_prompt_reprints() {
         let mut reader = LineReader::new(test_bounds(), one_slot_handoff());
         let mut echo = Vec::new();
-        reader.feed(b"\r\x00", true, &mut echo);
-        assert_eq!(reader.pending.pop_front().as_deref(), Some(""));
+        reader.unread.extend(b"\r\x00");
+        assert_eq!(reader.next_line(true, &mut echo).as_deref(), Some(""));
         assert_eq!(echo, b"\n");
+    }
+
+    /// The shell's binary-payload capture keeps the bytes the line reader consumed, and only
+    /// those: what is still unread when a line ends belongs to whoever reads it next (a held
+    /// command's input is captured as that, never twice).
+    #[test]
+    fn only_the_bytes_a_line_consumed_reach_the_shell_capture() {
+        let mut reader = LineReader::new(test_bounds(), one_slot_handoff());
+        reader.start_capture();
+        reader.unread.extend(b"cat > f\r\npayload-for-cat");
+        let mut echo = Vec::new();
+        assert_eq!(
+            reader.next_line(true, &mut echo).as_deref(),
+            Some("cat > f")
+        );
+        assert_eq!(reader.take_capture().as_slice(), b"cat > f\r\n");
+        assert_eq!(
+            reader.unread.iter().copied().collect::<Vec<u8>>(),
+            b"payload-for-cat"
+        );
     }
 
     #[test]

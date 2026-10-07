@@ -51,7 +51,7 @@ const MAX_DETECT_ATTEMPTS: u8 = 8;
 
 /// One per session. Tracks a detected single-byte XOR obfuscation key and applies it to input
 /// (decode) and output (encode/mirror).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CommandCodec {
     key: Option<u8>,
     /// Lines on which detection ran and found no key. Once it reaches [`MAX_DETECT_ATTEMPTS`] the

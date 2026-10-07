@@ -1,0 +1,20 @@
+# /var/lib/propolis-watch/.ssh/authorized_keys for the read-only live watcher.
+# Full procedure: docs/operations/live-watch.md.
+#
+# - Generate a DEDICATED key on the machine that will read the stream, used for nothing else:
+#     ssh-keygen -t ed25519 -f ~/.ssh/propolis_watch -C watch@workstation
+#   Paste only its PUBLIC half (~/.ssh/propolis_watch.pub) into the line below, on the honeypot.
+#   The private key never leaves the reading machine.
+# - The file is root:root 0644, inside the root:root 0755 .ssh directory deploy/provision.sh
+#   creates, so the propolis-watch account can read its keys but never add one. sshd accepts that
+#   (StrictModes wants the file and the directories above it owned by root or the user and
+#   writable by no one else).
+# - `restrict` turns off port, agent and X11 forwarding, pty allocation and ~/.ssh/rc for this key.
+# - `command=` is a forced command: whatever the client asks to run, sshd runs this instead and puts
+#   the client's request in SSH_ORIGINAL_COMMAND, which propolis-watch reads as its arguments
+#   through the same allowlist as its argv (unknown words exit 2). So this key can run the watcher
+#   and nothing else.
+# - The watcher finds the sensor-log list in /etc/propolis/watch.env, which deploy/watch-env.sh
+#   derives from the daemon's propolis.env on every provision and upgrade. Nothing about the list
+#   belongs in this file.
+restrict,command="/usr/local/bin/propolis-watch" ssh-ed25519 AAAA... watch@workstation

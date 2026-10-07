@@ -1898,3 +1898,376 @@ async fn an_upload_larger_than_the_connection_budget_is_bounded_but_still_captur
     drop(session);
     handle.abort();
 }
+
+// ---- standard input on exec channels and typed at the shell ----
+
+/// 70000 bytes that start like an ELF and cover every byte value: the `astats` upload.
+fn elf_payload() -> Vec<u8> {
+    let mut body = b"\x7fELF\x02\x01\x01".to_vec();
+    body.extend((0..70_000 - 7).map(|i| (i % 251) as u8));
+    body
+}
+
+/// `elf_payload`'s MD5, computed outside the code under test.
+const ELF_PAYLOAD_MD5: &str = "bfaca0ed90caafcc4381d056dd93f4f8";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Run `cmd` on a fresh exec channel, stream `body` to it, and assert the channel stays open
+/// while the command waits for the rest of its input; then send EOF and return the output and
+/// exit status, as a bot piping a file into `ssh host cmd` sees them.
+async fn exec_with_stdin(
+    session: &russh::client::Handle<TestHandler>,
+    cmd: &str,
+    body: &[u8],
+) -> (String, u32) {
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel.exec(false, cmd.as_bytes()).await.unwrap();
+    channel.data(body).await.unwrap();
+    let early = tokio::time::timeout(Duration::from_millis(300), channel.wait()).await;
+    assert!(
+        early.is_err(),
+        "`{cmd}` answered before its input ended: {early:?}"
+    );
+    channel.eof().await.unwrap();
+    let mut out = Vec::new();
+    let mut status = None;
+    while let Some(message) = tokio::time::timeout(Duration::from_secs(10), channel.wait())
+        .await
+        .expect("timed out waiting for the command to end after EOF")
+    {
+        match message {
+            russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. } => {
+                out.extend_from_slice(&data);
+            }
+            russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+            russh::ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    (
+        String::from_utf8_lossy(&out).into_owned(),
+        status.expect("the exec reported an exit status"),
+    )
+}
+
+/// Every `honeypot_malware_upload` event in the log once `count` of them are there.
+async fn uploads(log_path: &std::path::Path, count: usize) -> Vec<sensor_wire::SensorEvent> {
+    for _ in 0..160 {
+        if let Ok(content) = tokio::fs::read_to_string(log_path).await {
+            let found: Vec<sensor_wire::SensorEvent> = content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<sensor_wire::SensorEvent>(line).ok())
+                .filter(|event| event.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+                .collect();
+            if found.len() >= count {
+                return found;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fewer than {count} uploads were recorded");
+}
+
+/// The owner-observed campaign, one exec channel per command on one connection: the dropper
+/// script and the systemd unit streamed as text, the ELF streamed three times. The bot's view
+/// (statuses, the size and digest it reads back, nothing running) matches what it sent, and the
+/// evidence is one capture per distinct body, the retried ELF counted rather than repeated.
+#[tokio::test]
+async fn the_campaign_uploads_land_whole_over_one_connection_and_each_body_is_captured_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+
+    let (out, status) = exec_status(&session, "uname -a").await;
+    assert_eq!(status, 0);
+    assert!(out.starts_with("Linux "), "{out}");
+    assert_eq!(exec_status(&session, "nproc").await.1, 0);
+
+    let script = b"#!/bin/sh\necho dropper-script-marker\n";
+    let dropper = r#"cd "/dev/shm" && if [ ! -f "w.sh" ]; then cat > "w.sh" && chmod +x w.sh; fi"#;
+    assert_eq!(
+        exec_with_stdin(&session, dropper, script).await,
+        (String::new(), 0)
+    );
+    assert_eq!(
+        exec_status(
+            &session,
+            "cat /dev/shm/w.sh; test -x /dev/shm/w.sh && echo exec-bit"
+        )
+        .await,
+        (
+            "#!/bin/sh\necho dropper-script-marker\nexec-bit\n".to_string(),
+            0
+        )
+    );
+
+    // A multi-line persistence step with a `\` continuation reads no channel input, so it
+    // completes at once like any other.
+    let cron = "(crontab -l 2>/dev/null; echo \"@reboot /dev/shm/w.sh\") \\\n  | crontab - 2>/dev/null; echo cron-done";
+    assert_eq!(exec_status(&session, cron).await.0, "cron-done\n");
+
+    let unit = b"[Unit]\nDescription=netai\n[Service]\nExecStart=/dev/shm/w.sh\n";
+    let systemd = "sh -lc 'mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/watcher-netai.service && echo unit-written'";
+    assert_eq!(
+        exec_with_stdin(&session, systemd, unit).await,
+        ("unit-written\n".to_string(), 0)
+    );
+    assert_eq!(
+        exec_stdout(
+            &session,
+            "cat /root/.config/systemd/user/watcher-netai.service"
+        )
+        .await,
+        unit
+    );
+
+    let elf = elf_payload();
+    let astats =
+        "cd /dev/shm || cd /tmp || cd /var/run || cd /mnt || cd /root || cd / && cat > astats";
+    for _ in 0..3 {
+        assert_eq!(
+            exec_status(&session, "ps aux | grep astats | grep -v grep | wc -l").await,
+            ("0\n".to_string(), 0)
+        );
+        assert_eq!(
+            exec_with_stdin(&session, astats, &elf).await,
+            (String::new(), 0)
+        );
+    }
+    let (out, status) = exec_status(
+        &session,
+        "cd /dev/shm && ls -la astats; wc -c astats; md5sum astats",
+    )
+    .await;
+    assert_eq!(status, 0, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines[0].starts_with("-rw-r--r-- 1 root root 70000 ") && lines[0].ends_with(" astats"),
+        "{out}"
+    );
+    assert_eq!(lines[1], "70000 astats");
+    assert_eq!(lines[2], format!("{ELF_PAYLOAD_MD5}  astats"));
+
+    drop(session);
+    let events = uploads(&dir.path().join("events.jsonl"), 3).await;
+    handle.abort();
+    assert_eq!(events.len(), 3, "one capture per distinct body");
+    let by_size = |size: usize| {
+        events
+            .iter()
+            .find(|event| event.metadata["size"] == size as u64)
+            .unwrap_or_else(|| panic!("no capture of {size} bytes: {events:?}"))
+    };
+    for (body, repeats, destination) in [
+        (&script[..], 1, "/dev/shm/w.sh"),
+        (
+            &unit[..],
+            1,
+            "/root/.config/systemd/user/watcher-netai.service",
+        ),
+        (&elf[..], 3, "/dev/shm/astats"),
+    ] {
+        let event = by_size(body.len());
+        let sample = event.sample.as_ref().unwrap();
+        assert_eq!(sample.sha256, sha256_hex(body));
+        assert_eq!(event.metadata["sha256"], sha256_hex(body));
+        assert_eq!(event.metadata["capture_reason"], "exec_stdin");
+        assert_eq!(event.metadata["end_reason"], "transfer_complete");
+        assert_eq!(event.metadata["complete"], true);
+        assert_eq!(event.metadata["truncated"], false);
+        assert_eq!(event.metadata["repeat_count"], repeats);
+        assert_eq!(event.metadata["destination"], destination);
+        assert_eq!(
+            std::fs::read(dir.path().join("spool").join(&sample.sha256)).unwrap(),
+            body,
+            "the spooled body is what was sent"
+        );
+    }
+}
+
+/// A client that streams a payload and never sends EOF holds the command until the session's
+/// idle timeout; what arrived is captured, marked cut off by that timeout.
+#[tokio::test]
+async fn a_payload_without_eof_is_captured_as_cut_off_by_the_idle_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        ConnectionBounds {
+            idle_timeout: Duration::from_millis(800),
+            ..test_bounds()
+        },
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+    let session = login(addr).await;
+    let channel = session.channel_open_session().await.unwrap();
+    channel
+        .exec(false, &b"cat > /tmp/partial"[..])
+        .await
+        .unwrap();
+    channel.data(&b"\x7fELF-no-eof-follows"[..]).await.unwrap();
+    let events = uploads(&dir.path().join("events.jsonl"), 1).await;
+    handle.abort();
+    let metadata = &events[0].metadata;
+    assert_eq!(metadata["capture_reason"], "exec_stdin");
+    assert_eq!(metadata["end_reason"], "idle_timeout");
+    assert_eq!(metadata["complete"], false);
+    assert_eq!(metadata["size"], 19);
+    assert_eq!(metadata["command"], "cat > /tmp/partial");
+    drop(channel);
+}
+
+/// A command that reads no input completes at the request even if the client never sends EOF
+/// (an exec whose stdin stays open, as an SDK leaves it).
+#[tokio::test]
+async fn an_exec_that_reads_no_input_completes_without_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel
+        .exec(false, &b"echo no-input-needed"[..])
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let mut status = None;
+    while let Some(message) = tokio::time::timeout(Duration::from_secs(2), channel.wait())
+        .await
+        .expect("a stdin-free command must not wait for EOF")
+    {
+        match message {
+            russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+            russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+            russh::ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        (out.as_slice(), status),
+        (&b"no-input-needed\n"[..], Some(0))
+    );
+    drop(session);
+    handle.abort();
+}
+
+/// Read a pty shell channel until its output ends with the prompt.
+async fn read_to_prompt(channel: &mut russh::Channel<russh::client::Msg>) -> String {
+    let mut out = Vec::new();
+    while !out.ends_with(b"# ") {
+        match tokio::time::timeout(Duration::from_secs(10), channel.wait())
+            .await
+            .expect("timed out waiting for the prompt")
+        {
+            Some(russh::ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+            Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) | None => break,
+            Some(_) => {}
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `cat > f` at an interactive shell takes the typed lines that follow as its input until
+/// Ctrl-D, as a terminal does, echoing them; the file holds them and they are captured.
+#[tokio::test]
+async fn cat_at_the_shell_takes_typed_lines_until_ctrl_d_and_captures_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+    let mut channel = open_shell(&session).await;
+
+    channel.data(&b"cat > /tmp/typed\r"[..]).await.unwrap();
+    let echoed = tokio::time::timeout(Duration::from_millis(300), async {
+        let mut out = Vec::new();
+        while let Some(russh::ChannelMsg::Data { data }) = channel.wait().await {
+            out.extend_from_slice(&data);
+        }
+        out
+    })
+    .await;
+    assert!(echoed.is_err(), "no prompt while `cat` waits for its input");
+    channel.data(&b"hello\rworld\r\x04"[..]).await.unwrap();
+    let reply = read_to_prompt(&mut channel).await;
+    assert!(
+        reply.contains("hello\r\nworld\r\n") && reply.ends_with(":~# "),
+        "{reply:?}"
+    );
+    let read_back = shell_line(&mut channel, "cat /tmp/typed").await;
+    assert!(read_back.contains("hello\r\nworld\r\n"), "{read_back:?}");
+
+    // Ctrl-C kills the reader: `^C`, a fresh line, the prompt, and status 130.
+    channel
+        .data(&b"cat > /tmp/cut\rkept\rlost\x03"[..])
+        .await
+        .unwrap();
+    let reply = read_to_prompt(&mut channel).await;
+    assert!(reply.contains("lost^C\r\n"), "{reply:?}");
+    assert!(shell_line(&mut channel, "echo $?").await.contains("130"));
+
+    drop(channel);
+    drop(session);
+    let events = uploads(&dir.path().join("events.jsonl"), 2).await;
+    handle.abort();
+    let typed = events
+        .iter()
+        .find(|event| event.metadata["size"] == 12)
+        .expect("the typed file is captured");
+    assert_eq!(typed.metadata["capture_reason"], "shell_stdin");
+    assert_eq!(typed.metadata["end_reason"], "transfer_complete");
+    assert_eq!(typed.metadata["destination"], "/tmp/typed");
+    assert_eq!(
+        typed.sample.as_ref().unwrap().sha256,
+        sha256_hex(b"hello\nworld\n")
+    );
+    let cut = events
+        .iter()
+        .find(|event| event.metadata["size"] == 5)
+        .expect("the interrupted input is captured");
+    assert_eq!(cut.metadata["end_reason"], "peer_aborted");
+    assert_eq!(cut.metadata["complete"], false);
+}
+
+/// A binary payload a typed `cat > f` consumed is that command's input and is captured once, as
+/// `shell_stdin`. The same bytes typed at the shell itself would be a binary flood the shell
+/// capture keeps; here they never reached the shell, so it keeps nothing and no second sample of
+/// them appears.
+#[tokio::test]
+async fn bytes_a_typed_command_consumed_are_not_also_captured_as_a_shell_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+    let mut channel = open_shell(&session).await;
+    // High-bit bytes and no line ending until the Ctrl-D: a binary flood if the shell saw them.
+    let payload: Vec<u8> = (0u8..200).map(|i| 0x80 | (i & 0x3f)).collect();
+    let mut typed = b"cat > /tmp/bin\r".to_vec();
+    typed.extend_from_slice(&payload);
+    typed.extend_from_slice(b"\x04\x04");
+    channel.data(&typed[..]).await.unwrap();
+    read_to_prompt(&mut channel).await;
+    drop(channel);
+    drop(session);
+    uploads(&dir.path().join("events.jsonl"), 1).await;
+    // Both captures are submitted as the session ends; give a second one time to appear.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let events = uploads(&dir.path().join("events.jsonl"), 1).await;
+    handle.abort();
+    assert_eq!(events.len(), 1, "one capture of the bytes: {events:?}");
+    assert_eq!(events[0].metadata["capture_reason"], "shell_stdin");
+    assert_eq!(
+        events[0].sample.as_ref().unwrap().sha256,
+        sha256_hex(&payload)
+    );
+}

@@ -77,6 +77,25 @@ ensure_user propolis-cred
 # supplementary membership in each sensor's own group.
 run usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-tftp,propolis-mqtt,propolis-dns,propolis-cred propolis
 
+# propolis-watch: the account an operator's dedicated SSH key logs into to run the read-only live
+# watcher as a forced command (docs/operations/live-watch.md). Unlike the service users it needs a
+# home (for ~/.ssh/authorized_keys) and a real shell, because sshd runs a forced command through
+# the login shell with -c; the forced command, not the shell, is what the key can run.
+if id -u propolis-watch >/dev/null 2>&1; then
+    log "user propolis-watch already exists"
+else
+    run useradd --system --no-create-home --home-dir /var/lib/propolis-watch --shell /bin/sh --user-group propolis-watch
+    [ "$DRY_RUN" -eq 1 ] || log "created user propolis-watch"
+fi
+# No password can ever match '*', so password login is impossible. Not useradd's default '!':
+# sshd(8) treats a leading '!' as a locked account and refuses it even for a valid key.
+run usermod -p '*' propolis-watch
+# Read access to each sensor's event log and nothing more: the log directories are 0750 and the
+# files 0640 (UMask=0027 in the sensor units), owned by the sensor user and group, so group
+# membership grants read and never write. systemd-journal is deliberately NOT added here; reading
+# the units' journal with --journal is an opt-in step in docs/operations/live-watch.md.
+run usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-tftp,propolis-mqtt,propolis-dns,propolis-cred propolis-watch
+
 # ---- 2. directories ----
 
 ensure_dir() {
@@ -123,6 +142,17 @@ ensure_dir /var/lib/propolis/feed         0755 propolis          propolis
 # fingerprint itself as freshly minted). Listed in sensor-ssh.service's ReadWritePaths, so it
 # must exist or ProtectSystem=strict's bind-mount setup fails with NAMESPACE.
 ensure_dir /var/lib/propolis/ssh          0750 propolis-ssh      propolis-ssh
+# propolis-watch's home, outside /var/lib/propolis so it shares nothing with the daemon's state.
+# Root-owned all the way down, so the account cannot change which keys log in to it: owning its
+# home would let it rename a root-owned .ssh aside and create its own, and owning .ssh or
+# authorized_keys would let it append a key. The account only needs to traverse to the key file,
+# which sshd reads with the user's privileges; the group x bit on the home and the world r/x bits
+# on .ssh give it that and nothing more. sshd's StrictModes accepts files and directories owned by
+# root or the user that no one else can write (sshd(8), FILES, ~/.ssh/authorized_keys); these pass.
+# The authorized_keys file inside is the operator's to create, root:root 0644
+# (deploy/watch-authorized-keys.example).
+ensure_dir /var/lib/propolis-watch        0750 root              propolis-watch
+ensure_dir /var/lib/propolis-watch/.ssh   0755 root              root
 
 # ---- 3. spool directories (mount points only - see printed fstab guidance in install.sh) ----
 
@@ -150,3 +180,8 @@ ensure_dir /var/spool/propolis/mqtt       0750 propolis-mqtt     propolis-mqtt
 # written by its own standalone sensor process), the malware fetcher runs inside propolis.service
 # itself - see deploy/propolis.service's own ReadWritePaths grant for this exact path.
 ensure_dir /var/spool/propolis/fetched   0750 propolis          propolis
+
+# The watcher's copy of PROPOLIS_SENSOR_LOGS, derived from propolis.env on every provision (so on
+# every upgrade); see watch-env.sh's header. After the users exist, since it sets the file's group.
+log "deriving /etc/propolis/watch.env for propolis-watch"
+DRY_RUN="$DRY_RUN" "$(dirname "${BASH_SOURCE[0]}")/watch-env.sh"

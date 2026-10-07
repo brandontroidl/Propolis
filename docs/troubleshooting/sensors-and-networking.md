@@ -53,9 +53,22 @@ Work outward from the process:
   not. Rebinding a no-capability sensor to a low port fails to bind.
 - **Port already owned** - a real service (e.g. the host's own `sshd`) holds the
   port. See bind conflicts in [Startup and config](startup-and-config.md).
-- **DNS on port 53 next to a local resolver** - a `PROPOLIS_DNS_BIND` of `0.0.0.0:53` on a
-  host whose own resolver stub already listens on port 53 fails with `Address already in use`
-  and the sensor exits 1 [inferred]. Bind the public address instead of the wildcard.
+- **DNS on port 53 next to a local resolver** - the sensor exits 1 with
+  `sensor-dns: udp: cannot start listener on 0.0.0.0:53: Address already in use (os error 98);
+  refusing to start` (UDP binds first; `tcp` or `dot` names the other listeners). Find the
+  holder with `sudo ss -lunpt 'sport = :53'`. Linux refuses a wildcard bind over a specific one
+  and a specific bind under a wildcard one, so the fix depends on what the holder binds:
+  - systemd-resolved holds only `127.0.0.53:53` and `127.0.0.54:53`: bind the public address
+    (it coexists), or set `DNSStubListener=no` in `/etc/systemd/resolved.conf` and restart
+    `systemd-resolved` to free the port for a wildcard bind.
+  - A resolver on the wildcard (dnsmasq without `bind-interfaces`, named with its default
+    `listen-on`) blocks every bind of port 53, the public address included. Narrow it to
+    loopback: dnsmasq `bind-interfaces` with `listen-address=127.0.0.1`; unbound
+    `interface: 127.0.0.1`; named `listen-on { 127.0.0.1; };`.
+  - Behind NAT the public address is not on the host: bind the private address and map it with
+    `PROPOLIS_DNS_WAN_MAP`.
+
+  Details are in [sensor-behavior](../reference/sensor-behavior.md#sensor-dns).
 
 Every sensor logs a listener that fails to start, after its configuration
 validated, in one form
@@ -72,7 +85,9 @@ exits 1. Two sensors skip one failed address instead of exiting: catchall logs
 `catchall: tcp cannot start listener on ...; skipping this port` (or `udp`),
 and cred logs `...; skipping protocol <name>`. Each exits 1 with
 `no listener started on any configured address; refusing to start` only when
-every address failed.
+every address failed. `sensor-dns`, whose one bind starts two listeners, names
+the transport first: `sensor-dns: udp: cannot start listener on ...` (or `tcp`,
+or `dot` for the DNS over TLS listener).
 
 ## Bind address vs. exposure
 

@@ -15,14 +15,29 @@
   the source ports 0, 7, 13, 17, 19 and 37 (recorded as `suppressed`). A message with QR set, a
   non-zero opcode (NOTIFY, UPDATE), QDCOUNT other than 1, a compression pointer or bad label in
   the question, a name over 255 bytes, a truncated question, or an answer or authority record
-  (except the SOA of an IXFR over TCP) is recorded as `rejected` and gets no reply; on TCP and DoT
-  it also closes the connection, as does a length prefix under 12 or over 4096. A connection
-  carries at most 64 queries. A UDP query is a `honeypot_connection` over `udp`; a TCP or DoT
-  connection is one `honeypot_connection` plus one `honeypot_command_exec` per query, with
-  `command` `"<QTYPE> <qname>"`. Metadata records the header, the question (qname in escaped
-  presentation form, sanitized), the EDNS buffer size, DO bit and option codes (never option
-  data), and `probe_signals`: `amplification_probe`, `open_resolver_probe`,
-  `zone_transfer_probe`, `chaos_fingerprint_probe`. DoT events carry `"tls": true`. The unit
+  (except exactly one SOA authority record on an IXFR over TCP; an unparseable one is
+  `malformed_authority`) is recorded as `rejected` and gets no reply; on TCP and DoT it also
+  closes the connection, as does a length prefix under 12 or over 4096, a message that would pass
+  `PROPOLIS_DNS_MAX_CAPTURED_BYTES` (`byte_cap`; default 262272, 64 maximum-size queries with
+  their 2-byte prefixes), and a body cut short or not arriving within the read timeout
+  (`truncated_body`, `body_timeout`), each recorded with its `declared_len`. A connection carries
+  at most 64 queries, and a reply must be written within the read timeout. UDP replies are rate
+  limited per source network (IPv4 /24, IPv6 /56: 5 per second, burst 10) and in total (1000 per
+  second, burst 2000), set by `PROPOLIS_DNS_REPLY_RATE_PER_SOURCE`,
+  `PROPOLIS_DNS_REPLY_BURST_PER_SOURCE`, `PROPOLIS_DNS_REPLY_RATE_GLOBAL` and
+  `PROPOLIS_DNS_REPLY_BURST_GLOBAL` (positive integers; zero refuses to start). A datagram over
+  the limit gets no reply and no event of its own; each source network gets one
+  `query_status` `rate_limited` summary event per 10 s with counts, bytes, first and last seen
+  and up to 8 sample questions, so a flood cannot become a log flood. The limiter
+  (`ReplyRateLimiter`, `FloodLedger`) lives in `sensor-framework` with fixed-size tables. A UDP
+  query is a `honeypot_connection` over `udp`; a TCP or DoT connection is one
+  `honeypot_connection` plus one `honeypot_command_exec` per message, with `command`
+  `"<QTYPE> <qname>"`, or `malformed` for a message whose question did not parse. Metadata
+  records the header, the question (qname in escaped presentation form, sanitized), the EDNS
+  buffer size, DO bit and option codes (never option data), and `probe_signals`:
+  `amplification_probe`, `open_resolver_probe` (RD with class IN or ANY), `zone_transfer_probe`,
+  `chaos_fingerprint_probe`. DoT events carry `"tls": true`. A bind failure names the transport
+  (`udp`, `tcp`, `dot`) and the address. The unit
   `deploy/sensor-dns.service` grants `CAP_NET_BIND_SERVICE` and
   `ReadOnlyPaths=-/etc/propolis/tls`; `provision.sh` creates `propolis-dns` and its log
   directory, `provision-tls.sh` mints a `dns` pair, and the fleet inventory derives

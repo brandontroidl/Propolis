@@ -72,7 +72,12 @@ refuses unspecified, broadcast and multicast sources and the source ports of leg
 (0, 7, 13, 17, 19, 37); a static test keeps it the only send site
 (`crates/sensor-dns/tests/integration.rs#never_amplifies_static_check`). It serves no records,
 never resolves or forwards, and never answers a message with QR set, so two DNS sensors cannot
-loop. On TCP 53 a connection is bounded to 64 messages of at most 4096 bytes each.
+loop. Bounding size removes amplification but not one-for-one reflection, so UDP replies are
+also rate limited per source network and in total
+(`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`): a spoofer gets at most a burst
+plus the sustained rate of replies aimed at any one network, and an over-limit datagram costs one
+share of a bounded summary event rather than an event of its own, so the flood cannot fill the
+event log either. On TCP 53 a connection is bounded to 64 messages of at most 4096 bytes each.
 
 `sensor-dns` can also expose a DNS over TLS listener (conventionally 853). It exists only when
 `PROPOLIS_DNS_TLS_BIND` is set, so cert and key alone open no new port. The surface and its

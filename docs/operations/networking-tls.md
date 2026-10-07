@@ -228,7 +228,7 @@ names for the other six are in [TLS surfaces](#tls-surfaces). A sensor's env fil
 
 #### Verify
 
-Check all four, in this order:
+Check the first four, in this order; the fifth is the end-to-end check for `sensor-dns`:
 
 - **Listening.** `sudo ss -ltn 'sport = :443'` shows a `LISTEN` socket on the bind address.
 - **Journal.** `journalctl -u sensor-http -n 20` shows no `refusing to start` line and, for
@@ -250,6 +250,14 @@ Check all four, in this order:
   `grep -c '"tls":true' /var/log/propolis/http/events.jsonl` (sensor-cred writes one
   `<protocol>.jsonl` per protocol under `/var/log/propolis/cred`). Plaintext events carry no
   such key.
+- **DNS over TLS.** `sudo ss -ltnp 'sport = :853'` shows the listener held by `sensor-dns`.
+  `dig +tls @<host> -p 853 example.com` (BIND 9.18 or later; it does not check the self-signed
+  certificate unless asked to) answers `status: REFUSED` with flags `qr rd`, the question
+  echoed and `ADDITIONAL: 0`; `kdig +tls @<host> -p 853 example.com` from Knot is the
+  equivalent [inferred]. The query lands in `/var/log/propolis/dns/events.jsonl` as a
+  `honeypot_connection` and a `honeypot_command_exec` with `command` `A example.com.`, both
+  carrying `"tls":true`. The full UDP, TCP and DoT recipe is in
+  [sensor-behavior](../reference/sensor-behavior.md#sensor-dns).
 
 A failed handshake is logged at debug level only (see [handshake bound](#handshake-bound)); the
 [troubleshooting entry](../troubleshooting/sensors-and-networking.md#sensor-tls) says how to raise

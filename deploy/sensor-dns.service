@@ -5,9 +5,12 @@ After=network.target
 # Answers DNS over UDP and TCP on PROPOLIS_DNS_BIND (both, or the sensor refuses to start) and,
 # when PROPOLIS_DNS_TLS_BIND is set, DNS over TLS. It serves no records: every query gets REFUSED
 # with the question echoed and nothing appended, so a UDP reply is never larger than the query
-# that caused it and a spoofed query cannot be reflected at a victim with any gain. Off until an
-# operator creates /etc/propolis/dns.env with PROPOLIS_DNS_BIND. Bind the public address, not
-# 0.0.0.0, on a host whose own resolver stub already listens on port 53.
+# that caused it and a spoofed query cannot be reflected at a victim with any gain; UDP replies
+# are also rate limited per source network. Off until an operator creates /etc/propolis/dns.env
+# with PROPOLIS_DNS_BIND. If port 53 is taken, `ss -lunpt 'sport = :53'` names the holder: the
+# systemd-resolved stub (127.0.0.53) blocks only a 0.0.0.0 bind, so bind the public address; a
+# resolver on the wildcard (dnsmasq, named) blocks every bind until it is narrowed to loopback.
+# See deploy/sensor.env.example.
 
 [Service]
 Type=simple

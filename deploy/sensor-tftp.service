@@ -2,8 +2,9 @@
 Description=Propolis TFTP honeypot sensor
 After=network.target
 
-# One of two sensors that answer over UDP (sensor-dns is the other). Replies are bounded in code (bytes sent never exceed
-# bytes received from the peer; reads are never served; no retransmission), so a spoofed request
+# One of two sensors that answer over UDP (sensor-dns is the other). Replies are bounded in code
+# (bytes sent never exceed bytes received from the peer; reads are never served; no
+# retransmission), so a spoofed request
 # cannot be reflected at a victim with any gain. Off until an operator creates
 # /etc/propolis/tftp.env with PROPOLIS_TFTP_BIND: without it the sensor binds nothing and exits.
 # Open inbound UDP/69 only on hosts that are meant to run it.

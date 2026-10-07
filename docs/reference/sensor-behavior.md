@@ -768,9 +768,12 @@ gets the same REFUSED reply, and it never resolves, forwards, or looks anything 
   ever followed), an extended or reserved label type (`bad_label`), a name over 255 wire bytes
   (`name_too_long`), or a name, type or class running past the end (`truncated_question`).
   Last, any answer record, or any authority record (`answer_or_authority_present`), except that
-  an IXFR over TCP may carry the one SOA authority record RFC 1995 requires. The EDNS scan never
+  an IXFR over TCP may carry the one SOA authority record RFC 1995 requires: exactly one
+  authority record, of type SOA. Any other authority type is `answer_or_authority_present`, and
+  an authority record that does not parse is `malformed_authority`. The EDNS scan never
   rejects: it walks at most 8 additional records for an OPT, skipping owner-name pointers
-  without following them, and records two OPT records, a non-root OPT owner or an option
+  without following them and holding each owner name to 255 wire bytes, root byte included, and
+  records two OPT records, a non-root OPT owner, an unparseable additional record or an option
   running past its data as `edns_malformed`. At most 16 option codes are kept; option data is
   never stored (an ECS option carries a third party's subnet). The qname is rendered in RFC 1035
   master-file form, so every byte survives as printable ASCII (`\.`, `\\`, `\DDD`).
@@ -791,6 +794,25 @@ gets the same REFUSED reply, and it never resolves, forwards, or looks anything 
   reply; a datagram shorter than a header gets neither a reply nor an event.
   `crates/sensor-dns/tests/integration.rs#never_amplifies_static_check` keeps the send site and
   the TCP write site to one each.
+- **UDP rate limit** (`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`). Bounding
+  each reply's size stops amplification, not reflection itself: without a rate limit one
+  spoofer can make the sensor send a victim one reply per query at line rate. Every UDP datagram
+  of at least a header first takes a token from its source network's bucket (the IPv4 /24,
+  IPv4-mapped IPv6 included, or the IPv6 /56) and from a global bucket. The defaults are 5 per
+  second with a burst of 10 per network and 1000 per second with a burst of 2000 in total
+  (`PROPOLIS_DNS_REPLY_*`, see
+  [environment-variables.md](environment-variables.md)). The first datagrams of a burst are
+  handled, answered and logged as usual. A datagram over either budget gets no reply (there is
+  no truncated "slip" reply: a honeypot has no legitimate client to steer to TCP) and no event of
+  its own. It is counted instead in its network's summary in
+  `crates/sensor-framework/src/rate_limit.rs#FloodLedger`, and one `rate_limited` event per
+  network is written when its 10-second window ends (see Emits), so a flood costs the log at most
+  one event per network per window. The network table holds 4096 networks and the summary table
+  1024, both allocated once: a full network table evicts the least recently seen of four sampled
+  entries, and a network arriving at a full summary table is counted in one `overflow` summary.
+  At shutdown the summaries still accumulating are written, bounded by those tables and a
+  2-second timeout. TCP and DoT are not rate limited: the handshake proves the source, so they
+  cannot be aimed at a third party.
 - **TCP and DNS over TLS** (`crates/sensor-dns/src/stream.rs#handle_connection`). RFC 1035
   length-prefixed framing; pipelined queries are answered in order. A length prefix under 12
   is rejected as `short_header` and one over
@@ -798,17 +820,37 @@ gets the same REFUSED reply, and it never resolves, forwards, or looks anything 
   without reading the body; either, or any rejected message, ends the connection without a
   reply. A connection carries at most
   `crates/sensor-dns/src/stream.rs#MAX_QUERIES_PER_CONNECTION` (64) queries and at most
-  `max_captured_bytes` bytes; the first message must arrive within `read_timeout` and each later
-  one within `idle_timeout`. Every exit path shuts the stream down, so a DoT session ends with
-  `close_notify`. DoT (`crates/sensor-dns/src/lib.rs#start_test_server_tls`) runs the same
-  handler behind an implicit-TLS handshake cut at the read timeout; a failed or stalled
-  handshake, plaintext included, is dropped with no event. No ALPN is advertised.
-- **Emits:** UDP: one `honeypot_connection` (protocol `udp`) per datagram, with its own session
-  id. TCP and DoT: one `honeypot_connection` (protocol `tcp`) per connection, then one
+  `max_captured_bytes` bytes, each message charged its 2-byte prefix as well as its body (the
+  default 262_272 is exactly 64 maximum-size messages). A message that would pass that cap is
+  not read and is rejected as `byte_cap`; a body the peer cuts short is `truncated_body`, and one
+  that does not arrive within `read_timeout` is `body_timeout`. Each of those carries the
+  `declared_len` and ends the connection. The first message must arrive within `read_timeout`
+  and each later one within `idle_timeout`; a silent connection ends with no further event. A
+  reply must be written within `read_timeout`, so a peer that stops reading cannot hold the
+  handler. Every exit path of the handler shuts the stream down, so a DoT session it ends
+  finishes with `close_notify`. The exception is `max_duration`: the listener drops the handler
+  wherever it is waiting, which closes the connection with no `close_notify` and no event. DoT
+  (`crates/sensor-dns/src/lib.rs#start_test_server_tls`) runs the same handler behind an
+  implicit-TLS handshake cut at the read timeout; a failed or stalled handshake, plaintext
+  included, is dropped with no event. No ALPN is advertised.
+- **Emits:** UDP: one `honeypot_connection` (protocol `udp`) per datagram the sensor handles,
+  with its own session id. Not every datagram is handled one by one: one over the rate limit is
+  counted in a summary instead, and one dropped by the per-source admission cap or the
+  `max_concurrent` pool, or whose handling `read_timeout` cuts off before the event is written,
+  gets no event, only a `warn` log line at power-of-two totals. Rate-limited datagrams produce one
+  `honeypot_connection` (protocol `udp`, `query_status` `rate_limited`) per source network per
+  window (`crates/sensor-dns/src/events.rs#rate_limited_event`): `source_ip` is the first address
+  seen from the network in the window, and the metadata carries `source_prefix` (CIDR, or
+  `overflow`), `suppressed_count`, `suppressed_bytes`, `per_source_limited` and
+  `global_limited` (which budget refused them), `first_seen` and `last_seen` (RFC 3339),
+  `window_secs`, up to 8 sanitized `samples` of `"<QTYPE> <qname>"` (or `malformed`), and
+  `distinct_sources` (counted up to 32, with `distinct_sources_capped` set beyond that). TCP and
+  DoT: one `honeypot_connection` (protocol `tcp`) per connection, then one
   `honeypot_command_exec` (protocol `tcp`) per message, with `command` `"<QTYPE> <qname>"` or
   `malformed`. Events are appended before the reply is sent. Metadata: `protocol_label` `dns`,
-  `transport`, `query_status` (`answered`, `rejected` or `suppressed`), `reject_reason`,
-  `query_len`, `declared_len` (TCP framing rejects), `msg_index` (TCP/DoT), the header
+  `transport`, `query_status` (`answered`, `rejected`, `suppressed` or `rate_limited`),
+  `reject_reason`, `query_len`, `declared_len` (TCP framing rejects), `msg_index` (TCP/DoT), the
+  header
   (`dns_id`, `flags_raw`, the four counts, `opcode`, `opcode_name`, `rd`, `ad`, `cd`), the
   question (`qname` sanitized and capped at 1024 characters, `qname_mixed_case`,
   `qname_labels`, `qname_wire_len`, `qtype`, `qtype_name`, `qclass`, `qclass_name`), `edns`
@@ -818,15 +860,43 @@ gets the same REFUSED reply, and it never resolves, forwards, or looks anything 
   (`crates/sensor-dns/src/events.rs#stamp_tls`). All DNS events are `authenticated=false`.
 - **Probe signals** (`crates/sensor-dns/src/events.rs#probe_signals`), metadata only, never a
   `signal_type`: `amplification_probe` (UDP ANY, or UDP TXT/DNSKEY/RRSIG with an EDNS buffer
-  over 512), `open_resolver_probe` (RD set, class IN, not a transfer), `zone_transfer_probe`
-  (AXFR or IXFR), `chaos_fingerprint_probe` (class CH, for example `version.bind`).
-- **Bounds:** `max_concurrent` applies separately to the UDP handler pool, the TCP listener and
-  the DoT listener, each with the per-source admission cap; a UDP datagram's handling is cut at
-  `read_timeout`. Strict parsing: a zero or unparseable bound aborts startup. Nothing is
-  spooled.
-- **Wildcard binds.** A host whose own resolver stub already listens on port 53 makes a
-  wildcard `0.0.0.0:53` bind fail with `Address already in use` [inferred]; bind the public
-  address instead.
+  over 512), `open_resolver_probe` (RD set, class IN or ANY, not a transfer),
+  `zone_transfer_probe` (AXFR or IXFR), `chaos_fingerprint_probe` (class CH, for example
+  `version.bind`).
+- **Bounds:** the UDP rate limit above; `max_concurrent` applies separately to the UDP handler
+  pool, the TCP listener and the DoT listener, each with the per-source admission cap; a UDP
+  datagram's handling is cut at `read_timeout`. Strict parsing: a zero or unparseable bound or
+  rate aborts startup. Nothing is spooled.
+- **Port 53 already in use.** A bind failure names the transport and the address, for example
+  `sensor-dns: udp: cannot start listener on 0.0.0.0:53: Address already in use (os error 98);
+  refusing to start` (`tcp` and `dot` likewise). Find the holder with
+  `sudo ss -lunpt 'sport = :53'`. Linux refuses a wildcard bind over any specific bind of the
+  same port and a specific bind under a wildcard one, for UDP and TCP alike. So against the
+  systemd-resolved stub, which holds only `127.0.0.53:53` (and `127.0.0.54:53`), binding the
+  public address works and `0.0.0.0:53` does not; against a resolver holding the wildcard
+  (dnsmasq without `bind-interfaces`, named with its default `listen-on`, unbound with
+  `interface: 0.0.0.0` [inferred]) no bind of port 53 works until that resolver is narrowed. The
+  fixes: for systemd-resolved, set `DNSStubListener=no` in `resolved.conf`, or bind the public
+  address; for dnsmasq, `bind-interfaces` with `listen-address=127.0.0.1`; for unbound,
+  `interface: 127.0.0.1`; for named, `listen-on { 127.0.0.1; };`. A host behind NAT binds its
+  private address and maps it with `PROPOLIS_DNS_WAN_MAP`.
+- **WAN attribution.** TCP and DoT events resolve `wan_ip` from the accepted socket's local
+  address. UDP has no per-datagram local address, so UDP events (and `rate_limited` summaries)
+  resolve it against the bind address, as `sensor-tftp` does: under a wildcard bind with a WAN
+  map keyed on the public address, UDP events carry a null `wan_ip` while TCP events on the
+  same port carry the mapped one. Bind the specific address when WAN attribution matters.
+- **Verify from outside.** `dig @<host> example.com` (UDP), `dig +tcp @<host> example.com` and,
+  with DoT on, `dig +tls @<host> -p 853 example.com` (BIND 9.18 or later; `kdig +tls @<host> -p
+  853 example.com` from Knot is the equivalent [inferred]). The deploy certificate is
+  self-signed, and neither tool checks it by default. Each answer shows `status: REFUSED`, flags
+  `qr rd` (plus `WARNING: recursion requested but not available`, since RA is never set),
+  `QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 0`, the question echoed, and no `OPT
+  PSEUDOSECTION` even though `dig` sends EDNS. The UDP query lands as `honeypot_connection` with
+  `protocol` `udp`; the TCP and DoT queries as `honeypot_command_exec` with `protocol` `tcp` and
+  `command` `A example.com.`, each after a `honeypot_connection` for the connection, the DoT
+  ones with `"tls": true`. On the host, `ss -lunp 'sport = :53'` shows the UDP socket and
+  `ss -ltnp 'sport = :53 or sport = :853'` the TCP and DoT listeners, all held by
+  `sensor-dns`.
 
 ### sensor-redis
 
@@ -1143,8 +1213,8 @@ per-protocol bind var is required.
 ## Cross-cutting invariants
 
 - **Session id:** `Uuid::now_v7()` minted per accepted TCP connection by the
-  listener, per datagram for catchall UDP and DNS UDP, per transfer for TFTP; carried on every
-  event.
+  listener, per datagram for catchall UDP and DNS UDP (and per summary for a DNS
+  `rate_limited` event), per transfer for TFTP; carried on every event.
 - **Password discipline:** every login-capturing sensor reads the password only to
   advance the protocol and drops it - never stored, logged, or placed in any event
   field (SSH `crates/sensor-ssh/src/auth.rs`, telnet `crates/sensor-telnet/src/handler.rs#handle_connection`, FTP `crates/sensor-ftp/src/handler.rs#handle_connection`, redis

@@ -169,6 +169,11 @@ The mapping a conventional `deploy/`-based single-node setup configures. These
 are **not** compiled-in defaults - each is set by the operator in
 `/etc/propolis/<sensor>.env`.
 
+Forwarding one of these ports on the router does nothing on its own: the sensor must also be
+configured, enabled, tailed by the daemon, and present in the fleet listener inventory. Follow
+[enabling one sensor later](../operations/service-lifecycle.md#enabling-one-sensor-later) for
+the full sequence.
+
 | Port | Facing | Service | Bind env |
 |---|---|---|---|
 | 21 | attacker | FTP (+ dynamic PASV data ports) | `PROPOLIS_FTP_BIND` |

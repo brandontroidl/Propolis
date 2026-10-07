@@ -65,6 +65,33 @@ bad TLS setting exits 1 at start with `refusing to start`. See
 [networking-tls.md](networking-tls.md#sensor-tls-attacker-facing-listeners) for the variables
 and the failure modes.
 
+### Enabling one sensor later
+
+Forwarding a port on the router only delivers packets to the host; nothing answers, and the
+fleet pane shows nothing, until the sensor is configured, running, and known to the daemon. To
+add one sensor to a running node (sensor-tftp as the example):
+
+1. Set its bind in its env file, for example `PROPOLIS_TFTP_BIND=0.0.0.0:69` in
+   `/etc/propolis/tftp.env`. Without a bind the sensor exits instead of listening.
+2. Start it and keep it across reboots: `sudo systemctl enable --now sensor-tftp`, then check
+   `systemctl status sensor-tftp` shows it running and its journal has a `listening` line.
+3. Make sure the daemon tails its event log: `PROPOLIS_SENSOR_LOGS` in
+   `/etc/propolis/propolis.env` must list `tftp:/var/log/propolis/tftp/events.jsonl`. A
+   `propolis.env` written before that sensor existed will not have it (compare with
+   `deploy/propolis.env.example#PROPOLIS_SENSOR_LOGS`).
+4. Regenerate the fleet listener inventory and restart the daemon so the fleet pane lists the
+   new listener: `sudo deploy/fleet-listeners.sh && sudo systemctl restart propolis`. The pane
+   only knows the listeners derived from the `*_BIND` variables at that moment
+   (`deploy/fleet-listeners.sh`); `upgrade.sh` reruns it for you on the next upgrade.
+5. Open the port where it is reachable from outside: on the router, forward the right protocol
+   (UDP for sensor-tftp, TCP for the rest), and allow it in any host
+   firewall. sensor-tftp also answers each transfer from its own ephemeral UDP port, so a host
+   firewall must allow those replies.
+
+A UDP listener's reachability always reads `unknown` in the fleet pane: a connect probe cannot
+prove a UDP port is answering, so the pane judges it by events arriving instead
+(`crates/fleet/src/probe.rs#UDP_NOT_PROBEABLE`).
+
 `enable --now` both starts the unit and sets it to start at boot. Source:
 `docs/archive/2026-08-26/root/INSTALL.md#6. Start services` (the live `INSTALL.md` is now a redirect
 stub). Runnable commands are collected in

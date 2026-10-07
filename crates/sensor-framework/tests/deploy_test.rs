@@ -1670,3 +1670,137 @@ fn no_private_key_pem_is_committed_under_crates_or_deploy() {
         "the walk is broken: only {scanned} text files scanned"
     );
 }
+
+/// The groups `provision.sh` adds `user` to with `usermod -aG <groups> <user>`.
+fn supplementary_groups(provision: &str, user: &str) -> HashSet<String> {
+    provision
+        .lines()
+        .filter_map(|l| {
+            let tokens: Vec<&str> = l.split_whitespace().collect();
+            match tokens.as_slice() {
+                ["run", "usermod", "-aG", groups, who] if *who == user => Some(groups.to_string()),
+                _ => None,
+            }
+        })
+        .flat_map(|groups| groups.split(',').map(str::to_string).collect::<Vec<_>>())
+        .collect()
+}
+
+/// The live watcher's account must be able to read every sensor's event log and nothing else:
+/// its groups are exactly the owning groups of the log directories `provision.sh` creates (read
+/// through the 0750/0640 group bits, never write), and `systemd-journal` stays an opt-in the
+/// operator adds by hand. It must also be reachable by SSH: a real shell for the forced command,
+/// a home for authorized_keys, and a password field sshd does not treat as locked.
+#[test]
+fn watch_user_reads_every_sensor_log_and_nothing_more_by_default() {
+    let provision = deploy_file("provision.sh");
+    let log_groups: HashSet<String> = provision
+        .lines()
+        .filter_map(|l| {
+            let tokens: Vec<&str> = l.split_whitespace().collect();
+            match tokens.as_slice() {
+                ["ensure_dir", path, mode, _owner, group]
+                    if path.starts_with("/var/log/propolis/") =>
+                {
+                    assert_eq!(*mode, "0750", "{path} must stay owner-write, group-read");
+                    Some(group.to_string())
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    assert!(log_groups.len() >= 12, "parsed only {log_groups:?}");
+    assert_eq!(
+        supplementary_groups(&provision, "propolis-watch"),
+        log_groups
+    );
+    assert_eq!(
+        supplementary_groups(&provision, "propolis-watch"),
+        supplementary_groups(&provision, "propolis"),
+        "the watcher reads exactly the logs the daemon reads"
+    );
+    let watch_groups = supplementary_groups(&provision, "propolis-watch");
+    assert!(
+        !watch_groups.contains("systemd-journal") && !watch_groups.contains("adm"),
+        "journal access is an opt-in step, not provisioned"
+    );
+    assert!(provision.lines().any(|l| l.trim()
+        == "run useradd --system --no-create-home --home-dir /var/lib/propolis-watch --shell /bin/sh --user-group propolis-watch"));
+    assert!(
+        provision
+            .lines()
+            .any(|l| l.trim() == "run usermod -p '*' propolis-watch")
+    );
+    for (dir, mode) in [
+        ("/var/lib/propolis-watch", "0750"),
+        ("/var/lib/propolis-watch/.ssh", "0700"),
+    ] {
+        assert!(
+            provision
+                .lines()
+                .any(|l| l.split_whitespace().collect::<Vec<_>>()
+                    == ["ensure_dir", dir, mode, "propolis-watch", "propolis-watch"]),
+            "{dir} must be provisioned {mode} propolis-watch:propolis-watch"
+        );
+    }
+}
+
+#[test]
+fn both_deploy_scripts_install_the_watcher_binary() {
+    for script in ["install.sh", "upgrade.sh"] {
+        let text = deploy_file(script);
+        let loop_line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("for bin in "))
+            .unwrap_or_else(|| panic!("{script} has no binary install loop"));
+        assert!(
+            loop_line
+                .split_whitespace()
+                .any(|t| t.trim_end_matches(';') == "propolis-watch"),
+            "{script} does not install propolis-watch"
+        );
+    }
+}
+
+/// The example key line is the whole security boundary of the remote read path, so its options
+/// are pinned: `restrict` first, a forced command that runs only the watcher, and no option that
+/// would hand back a pty or a forward. It must carry a placeholder, never a real key.
+#[test]
+fn watch_authorized_keys_example_forces_the_watcher_under_restrict() {
+    let example = deploy_file("watch-authorized-keys.example");
+    let lines: Vec<&str> = example
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one example key line");
+    let line = lines[0];
+    let (options, rest) = line
+        .split_once(" ssh-ed25519 ")
+        .expect("an ssh-ed25519 key line");
+    assert!(options.starts_with("restrict,command=\""), "{options}");
+    assert!(
+        options.ends_with(" /usr/local/bin/propolis-watch\""),
+        "{options}"
+    );
+    let command = &options["restrict,command=\"".len()..options.len() - 1];
+    assert!(command.starts_with("PROPOLIS_SENSOR_LOGS='"), "{command}");
+    for banned in [
+        "pty",
+        "port-forwarding",
+        "agent",
+        "X11",
+        "permitopen",
+        "tunnel",
+        ";",
+        "&",
+        "|",
+        "$",
+        "`",
+    ] {
+        assert!(!command.contains(banned) && !options.contains(&format!(",{banned}")));
+    }
+    assert!(
+        rest.starts_with("AAAA... "),
+        "the example must not carry a real key"
+    );
+}

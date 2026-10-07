@@ -22,7 +22,7 @@ Every workspace crate is edition 2024.
 ## Build
 
 ```
-cargo build            # debug build, all 27 workspace members
+cargo build            # debug build, all 28 workspace members
 cargo build --release  # release binaries into target/release/
 ```
 
@@ -122,6 +122,19 @@ fetcher, and the ops-monitor are each **opt-in** and default OFF; when enabled,
 several are outbound paths (see warning under Operations). See
 [`../architecture/process-topology.md`](../architecture/process-topology.md).
 
+## Live watch
+
+```
+sudo -u propolis-watch env "$(sudo grep -m1 '^PROPOLIS_SENSOR_LOGS=' /etc/propolis/propolis.env)" /usr/local/bin/propolis-watch
+ssh -i ~/.ssh/propolis_watch propolis-watch@honeypot -- --sensor ssh   # from the reading machine
+```
+
+`propolis-watch` streams every sensor event log as JSON Lines on stdout, read-only; it takes
+`--sensor <label>` (repeatable), `--signal <type>`, `--source-ip <ip>`, `--journal` and
+`--since-start`, and exits 2 on anything else. The first form passes only the one non-secret
+variable it needs, never the whole env file. Setup, envelope and filters:
+[`../operations/live-watch.md`](../operations/live-watch.md).
+
 ## Migrations
 
 There is no standalone migrate command in the shipped surface. The `propolis`
@@ -165,8 +178,8 @@ sudo ./deploy/install.sh --dry-run    # prints every action, needs no privilege,
 sudo ./deploy/install.sh              # installs binaries + units; starts/enables NOTHING
 ```
 
-`install.sh` provisions OS users, directories, spool mountpoints, the release
-binaries, `propolis.service` + the 12 sensor units, and a logrotate config. It
+`install.sh` provisions OS users (including the `propolis-watch` login for the live watcher),
+directories, spool mountpoints, the release binaries (including `propolis-watch`), `propolis.service` + the 12 sensor units, and a logrotate config. It
 does **not** start or enable any service, create/migrate the database, or write
 any operator-owned `/etc/propolis/*.env` file; the one env file it does write is
 the generated, secret-free `fleet-listeners.env`

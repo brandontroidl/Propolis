@@ -30,7 +30,7 @@ liveness alert). Every component, stage, invariant, and procedure has a canonica
 owner. The `partial` rows carry a documented caveat, noted in the last
 column.
 
-## Component crates (27 crates / 20 binaries)
+## Component crates (28 crates / 21 binaries)
 
 Inventory and dependency graph owned by
 [architecture/components.md](architecture/components.md). Per-crate behavior lives in
@@ -64,6 +64,7 @@ the architecture and reference pages below.
 | `collector-wire` | [architecture/components.md](architecture/components.md), [architecture/evidence-provenance-and-artifact-custody.md](architecture/evidence-provenance-and-artifact-custody.md) | partial | Frame, ack and TLS rules live in the crate's own docs; no reference page. |
 | `shipper` | [operations/split-deployment.md](operations/split-deployment.md), [reference/environment-variables.md](reference/environment-variables.md) | partial | Setup, verification, chain reset and troubleshooting documented; the page's known limitations (no timeouts, a blank log line stops it, state-write failure loses batches) are unfixed. |
 | `gateway` | [operations/split-deployment.md](operations/split-deployment.md), [reference/environment-variables.md](reference/environment-variables.md), [architecture/evidence-provenance-and-artifact-custody.md](architecture/evidence-provenance-and-artifact-custody.md) | partial | Setup and operation documented; read and idle timeouts are parsed but not applied, and nothing rotates its spool. |
+| `watch` | [operations/live-watch.md](operations/live-watch.md), [security/attack-surfaces.md](security/attack-surfaces.md), [reference/commands.md](reference/commands.md) | documented | `propolis-watch`: read-only JSON Lines stream of the sensor event logs (and optionally the journal), its envelope, filters and SSH forced-command setup. |
 | `provision-certs` | [operations/split-deployment.md](operations/split-deployment.md), [architecture/components.md](architecture/components.md) | partial | Usage, outputs and rotation documented; one collector per CA, no revocation, no expiry. |
 
 The 4 retired dev units (`intake`/`review`/`feed`/`console.service`) are documented as

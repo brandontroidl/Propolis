@@ -4,6 +4,30 @@
 
 ### Added
 
+- **`propolis-watch`, a read-only live view of the sensors** - new crate `watch`, binary
+  `propolis-watch`. It streams every event log named in `PROPOLIS_SENSOR_LOGS` as JSON Lines on
+  stdout: a `start` record with the resolved sources, one `event` record per log line (the
+  sensor's JSON embedded byte for byte, or `raw` text when a line is not a JSON object), a
+  `dropped` record in place of each line over the 1 MiB cap, and a `heartbeat` every 10 s giving
+  each log's status (`following`, `missing` or `unreadable`), size and lines seen, so a quiet
+  node is distinguishable from a dead stream and a mistyped log path shows on the first
+  heartbeat. It starts at the end of each log by default (`--since-start` replays the current
+  file), follows `copytruncate` rotation, filters with `--sensor`, `--signal` and
+  `--source-ip`, and with `--journal` adds the `sensor-*` and `propolis` units' journal from a
+  `journalctl` child with a fixed argument vector. It writes no file, opens no socket and needs
+  no database or credential; a static test holds its source to that. Arguments also come from
+  `SSH_ORIGINAL_COMMAND`, split on whitespace only through the same allowlist, so it can run as
+  an SSH forced command: `deploy/provision.sh` now creates a `propolis-watch` login account
+  (home `/var/lib/propolis-watch`, shell `/bin/sh`, password field `*`, read-only membership in
+  every sensor group, no journal access unless added by hand), `install.sh` and `upgrade.sh`
+  install the binary, and `deploy/watch-authorized-keys.example` shows the `restrict`ed
+  forced-command key line. No key is generated or installed. See
+  `docs/operations/live-watch.md`.
+- **`log-tailer` gains a cursorless mode and owns the sensor-log list parser** -
+  `LogTailer::without_cursor` reads and follows rotation like the cursor-backed tailer but has
+  no cursor to load or save, and `read_batch_entries` reports each over-length discard in place.
+  `parse_sensor_logs` replaces the three copies of the `name:path` grammar in `propolis`,
+  `intake` and `shipper`; their behavior and error messages are unchanged.
 - **Every event records the port it arrived on** - the sensor framework stamps
   `metadata.local_port` (an integer: the accepted TCP socket's local port, or the bound UDP
   socket's port) on every event every sensor emits, uploads and the DNS and TFTP rate-limit

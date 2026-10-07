@@ -107,6 +107,11 @@ The console has a session-gated live log viewer at `/logs`, backed by an in-memo
 `crates/console/src/log_buffer.rs#LogBuffer`). It is a convenience tail, not a durable log store; the journal and the
 NDJSON files are authoritative.
 
+For a live view of the NDJSON files themselves, every event as the sensor wrote it plus a
+10-second heartbeat naming each configured log as `following`, `missing` or `unreadable`, run
+the read-only `propolis-watch`, locally or over a forced-command SSH key; see
+[live watch](./live-watch.md).
+
 ### Overload counters
 
 Two capture-hand-off counters, surfaced as journal WARNs, tell an operator that samples are

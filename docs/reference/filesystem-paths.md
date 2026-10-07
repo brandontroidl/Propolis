@@ -90,6 +90,7 @@ for the full variable reference.
 | GeoIP databases | `PROPOLIS_GEOIP_DIR` | **no default - enrichment disabled when unset** (`geoip_dir` parse, `console/src/main.rs#load_config_from_env`; `feed/src/main.rs#load_config_from_env`) | not created by install.sh |
 | aggregated-node writable state | (unit grant) | `/var/lib/propolis` (`deploy/propolis.service#ReadWritePaths=/var/lib/propolis`) | `/var/lib/propolis` 0755 root (`deploy/provision.sh#root-owned, NOT propolis`) |
 | ops spool bounded-buffer dir | (const) | `/var/lib/propolis/spool` (`deploy/provision.sh#ensure_dir /var/lib/propolis/spool`) | 0750 propolis |
+| `propolis-watch` login home (holds `.ssh/authorized_keys` for the forced-command key) | (provisioned) | `/var/lib/propolis-watch` (`deploy/provision.sh#ensure_dir /var/lib/propolis-watch`) | 0750 propolis-watch; `.ssh` 0700 propolis-watch; the operator creates `authorized_keys` 0600 (see [live watch](../operations/live-watch.md)) |
 
 - **GeoIP** expects `GeoLite2-City.mmdb` + `GeoLite2-ASN.mmdb` under
   `PROPOLIS_GEOIP_DIR` (`crates/geoip/src/lib.rs#load`, `crates/geoip/src/lib.rs#load_asn_only`). When the var is unset,

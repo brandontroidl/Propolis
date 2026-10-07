@@ -138,7 +138,7 @@ variable in this section plus the universal ones above.
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs (`crates/propolis/src/config.rs#parse_sensor_logs`). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
+| `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, split on the first colon of each entry (`crates/log-tailer/src/sensor_logs.rs#parse_sensor_logs`, the one parser the daemon, standalone `intake`, `shipper`'s `SENSOR_LOGS` and `propolis-watch` share). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
 | `PROPOLIS_CURSOR_DIR` | no | `/var/lib/propolis/cursors` (`crates/propolis/src/config.rs#DEFAULT_CURSOR_DIR`) | any path; no validation |
 | `PROPOLIS_POLL_INTERVAL_MS` | no | `1000` (`crates/propolis/src/config.rs#DEFAULT_POLL_INTERVAL_MS`) | positive u64 ms; zero/unparseable → abort |
 
@@ -458,6 +458,11 @@ defaults and the same strict-parse/fail-closed rules unless noted.
 - **`intake`** (`crates/intake/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
   `PROPOLIS_CURSOR_DIR`, `PROPOLIS_POLL_INTERVAL_MS`, `PROPOLIS_SENSOR_LOGS`
   (req, empty→abort).
+- **`propolis-watch`** (`crates/watch/src/main.rs#main`): `PROPOLIS_SENSOR_LOGS` only (req; unset,
+  invalid or not UTF-8 → one `error` record on stdout and exit 1), the same value the daemon
+  reads. It also reads `SSH_ORIGINAL_COMMAND`, which sshd sets for a forced command, as extra
+  arguments through the same allowlist as its argv (not UTF-8 → exit 2). It reads no secret and
+  no other variable; see [live watch](../operations/live-watch.md).
 - **`review`** (`crates/review/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
   `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, `PROPOLIS_SUBMIT_POLL_INTERVAL_SECS`, and
   the full `PROPOLIS_VENDOR_*` set (`_KEY`/`_URL`/`_ENABLED`/`_COOLDOWN_HOURS`/

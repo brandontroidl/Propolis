@@ -10,7 +10,7 @@ last-verified: 2026-10-07
 # Components
 
 The workspace (`Cargo.toml`, `resolver = "2"`, every crate `edition = "2024"`) has
-**27 member crates** under `crates/`, producing **20 binaries**. Twenty-one crates are at
+**28 member crates** under `crates/`, producing **21 binaries**. Twenty-two crates are at
 version `0.4.0`; the other six (`collector-wire`, `fleet`, `gateway`, `log-tailer`,
 `provision-certs`, `shipper`) are at `0.1.0`. This page is the canonical
 owner of the component inventory and the inter-crate dependency graph.
@@ -41,10 +41,11 @@ owner of the component inventory and the inter-crate dependency graph.
 | `console` | lib + bin | `console` | Operator web console (axum): auth (argon2 password / session / CSRF / rate-limit), dashboard, review queue, IP detail, feed status, `/metrics`, live `/logs`. |
 | `propolis` | binary only | `propolis` | Unified daemon composing intake + review + feed + console + VirusTotal + fetcher + ops-monitor as concurrent tokio tasks on one `PgPool`. |
 | `fleet` | library (leaf) | none | Fleet health: the listener inventory the control plane believes exists, the durable result of probing it, and the rules that turn both into an operator verdict; owns its own migrations under its own bookkeeping table. |
-| `log-tailer` | library (leaf) | none | File tailing with a durable, rotation-aware cursor and the over-length line discard; extracted from `intake` so the shipper can tail sensor logs without the control-plane database stack. |
+| `log-tailer` | library (leaf) | none | File tailing with a durable, rotation-aware cursor and the over-length line discard; extracted from `intake` so the shipper can tail sensor logs without the control-plane database stack. Also owns the one `name:path` sensor-log list parser, and a cursorless mode (`LogTailer::without_cursor`) that persists nothing, for the live watcher. |
 | `collector-wire` | library (leaf) | none | Collector-to-gateway wire protocol: sequenced, hash-chained batch frames, acks, and the mutual-TLS configs both ends build from one pinned CA. |
 | `shipper` | lib + bin | `shipper` | Collector side of the split deployment: tails a sensor log through `log-tailer`, assembles the next sequenced batch, ships it to the gateway over mutual TLS, and advances its durable state only after a confirmed ack. |
 | `gateway` | lib + bin | `gateway` | Control-plane side of the split deployment: a client-certificate-required TLS accept loop that verifies each collector's sequence and hash chain and appends accepted records to a per-collector spool in sensor NDJSON shape, which intake tails unchanged. |
+| `watch` | lib + bin | `propolis-watch` | Read-only live view for the operator: streams every sensor event log named in `PROPOLIS_SENSOR_LOGS` (and, with `--journal`, the units' journal) as JSON Lines on stdout through `log-tailer`'s cursorless mode, with a heartbeat naming each log's status. Writes no file, opens no socket, holds no database handle; meant to run as an SSH forced command. See [live watch](../operations/live-watch.md). |
 | `provision-certs` | lib + bin | `provision-certs` | Mints a private CA, the gateway server certificate and one collector client certificate per run, isolated so its certificate library never enters the daemon dependency trees. With `--sensor-tls <out-dir> <sensor>...` it instead mints one self-signed TLS pair per sensor (kept if both files already exist), driven by `deploy/provision-tls.sh`. |
 
 Source: the `[workspace] members` list in `Cargo.toml`; each crate's `Cargo.toml` and
@@ -62,10 +63,12 @@ Source: the `[workspace] members` list in `Cargo.toml`; each crate's `Cargo.toml
   both `src/lib.rs` and `src/main.rs`, so each produces a library and a same-named
   binary from cargo's default binary-from-`main.rs`; none declares a `[[bin]]`.
 - **Split-deployment lib+bin crates (3):** `shipper`, `gateway`, `provision-certs`.
+- **Operator tool lib+bin crate (1):** `watch`, whose binary is `propolis-watch` (a `[[bin]]`
+  entry, so the installed name says what it belongs to).
 - **Binary only:** `propolis` (no `src/lib.rs`).
 
-**20 binaries total:** the 12 sensor binaries plus `intake`, `review`, `feed`,
-`console`, `propolis`, `shipper`, `gateway`, and `provision-certs`.
+**21 binaries total:** the 12 sensor binaries plus `intake`, `review`, `feed`,
+`console`, `propolis`, `shipper`, `gateway`, `provision-certs`, and `propolis-watch`.
 
 Sensors have **no compiled-in default port** - listen addresses come from
 config/environment set by the deploy units, not from source. See
@@ -94,6 +97,7 @@ graph TD
   shipper[shipper]
   gateway[gateway]
   certs[provision-certs]
+  watchc[watch]
 
   fw --> wire
   sensors --> wire
@@ -125,6 +129,7 @@ graph TD
   gateway --> cwire
   gateway --> fw
   certs --> cwire
+  watchc --> tailer
 ```
 
 Source: the `[dependencies]` sections of each crate's `Cargo.toml`, as `cargo metadata

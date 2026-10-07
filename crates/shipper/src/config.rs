@@ -43,11 +43,7 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 2000;
 
 /// One sensor log this collector tails, parsed from one `name:path` entry of `SENSOR_LOGS`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SensorLogConfig {
-    pub name: String,
-    pub log_path: PathBuf,
-}
+pub use log_tailer::SensorLogConfig;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -115,36 +111,19 @@ fn required_path(field: &'static str) -> Result<PathBuf, ConfigError> {
     required_var(field).map(PathBuf::from)
 }
 
-/// Parse a comma-separated `name:path,name:path` list, same grammar as
-/// `propolis::config`'s `PROPOLIS_SENSOR_LOGS` parser (`splitn(2, ':')`, both sides required
-/// non-empty). At least one entry is required: an empty `SENSOR_LOGS` leaves this collector
+/// Parse a comma-separated `name:path,name:path` list through the shared
+/// `log_tailer::parse_sensor_logs`, the same parser `PROPOLIS_SENSOR_LOGS` uses. At least one
+/// entry is required: an empty `SENSOR_LOGS` leaves this collector
 /// with nothing to ship, which is a misconfiguration, not a valid idle state.
 fn parse_sensor_logs(raw: &str) -> Result<Vec<SensorLogConfig>, ConfigError> {
-    let logs: Vec<SensorLogConfig> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|entry| {
-            let mut parts = entry.splitn(2, ':');
-            let name = parts.next().unwrap_or_default();
-            let path = parts.next().unwrap_or_default();
-            if name.is_empty() || path.is_empty() {
-                return Err(ConfigError::Invalid {
-                    field: ENV_SENSOR_LOGS,
-                    value: entry.to_string(),
-                    reason: "expected name:path",
-                });
-            }
-            Ok(SensorLogConfig {
-                name: name.to_string(),
-                log_path: PathBuf::from(path),
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    if logs.is_empty() {
-        return Err(ConfigError::Missing(ENV_SENSOR_LOGS));
-    }
-    Ok(logs)
+    log_tailer::parse_sensor_logs(raw).map_err(|e| match e {
+        log_tailer::SensorLogsError::Empty => ConfigError::Missing(ENV_SENSOR_LOGS),
+        log_tailer::SensorLogsError::InvalidEntry(value) => ConfigError::Invalid {
+            field: ENV_SENSOR_LOGS,
+            value,
+            reason: "expected name:path",
+        },
+    })
 }
 
 /// Parse an optional positive `u64` bound: `None` (the env var was unset) falls back to

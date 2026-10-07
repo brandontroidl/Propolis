@@ -32,13 +32,7 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
 /// confirms in and the window the console trusts a confirmation in drift apart.
 const DEFAULT_PROBE_INTERVAL_SECS: u64 = 300;
 
-/// One entry of `PROPOLIS_SENSOR_LOGS`: a sensor's name (for logging/metrics) and the absolute
-/// path to its NDJSON log file. Mirrors the design doc's `SensorLogConfig`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SensorLogConfig {
-    name: String,
-    log_path: PathBuf,
-}
+use log_tailer::SensorLogConfig;
 
 #[derive(Debug)]
 struct Config {
@@ -94,34 +88,17 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Parses `PROPOLIS_SENSOR_LOGS`'s comma-separated `name:path` entries (e.g.
-/// `catchall:/var/log/propolis/catchall/events.jsonl,ssh:/var/log/propolis/ssh/events.jsonl`).
-/// Splits each entry on the FIRST colon only (`splitn(2, ':')`): a sensor name never contains
-/// one, but a log path could in principle (an unusual but legal POSIX filename). Rejects an
-/// empty list outright, matching `sensor-catchall`'s `parse_bind_addrs` - at least one real
+/// Parses `PROPOLIS_SENSOR_LOGS` through the shared `log_tailer::parse_sensor_logs` (e.g.
+/// `catchall:/var/log/propolis/catchall/events.jsonl,ssh:/var/log/propolis/ssh/events.jsonl`),
+/// mapping its errors into this binary's own. An empty list is rejected: at least one real
 /// sensor is required.
 fn parse_sensor_logs(raw: &str) -> Result<Vec<SensorLogConfig>, ConfigError> {
-    let logs: Vec<SensorLogConfig> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|entry| {
-            let mut parts = entry.splitn(2, ':');
-            let name = parts.next().unwrap_or_default();
-            let path = parts.next().unwrap_or_default();
-            if name.is_empty() || path.is_empty() {
-                return Err(ConfigError::InvalidSensorLogEntry(entry.to_string()));
-            }
-            Ok(SensorLogConfig {
-                name: name.to_string(),
-                log_path: PathBuf::from(path),
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    if logs.is_empty() {
-        return Err(ConfigError::NoSensorLogs);
-    }
-    Ok(logs)
+    log_tailer::parse_sensor_logs(raw).map_err(|e| match e {
+        log_tailer::SensorLogsError::Empty => ConfigError::NoSensorLogs,
+        log_tailer::SensorLogsError::InvalidEntry(entry) => {
+            ConfigError::InvalidSensorLogEntry(entry)
+        }
+    })
 }
 
 /// Parses an optional positive `u64` bound: `None` (the env var was unset) falls back to

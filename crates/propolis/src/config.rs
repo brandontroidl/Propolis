@@ -69,12 +69,8 @@ const DEFAULT_FETCH_USER_AGENT: &str = "Wget/1.21.3";
 const DEFAULT_DEPLOY_STAMP: &str = "/var/lib/propolis/deploy-stamp.json";
 
 /// One sensor log entry: a sensor's name (for logging/metrics) and the absolute path to its
-/// NDJSON log file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SensorLogConfig {
-    pub name: String,
-    pub log_path: PathBuf,
-}
+/// NDJSON log file. The grammar is owned by `log_tailer::parse_sensor_logs`.
+pub use log_tailer::SensorLogConfig;
 
 /// Consolidated configuration for every Propolis subsystem.
 #[derive(Debug)]
@@ -322,31 +318,14 @@ fn parse_bool_flag(name: &str, default: bool) -> bool {
 }
 
 fn parse_sensor_logs(raw: &str) -> Result<Vec<SensorLogConfig>, ConfigError> {
-    let logs: Vec<SensorLogConfig> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|entry| {
-            let mut parts = entry.splitn(2, ':');
-            let name = parts.next().unwrap_or_default();
-            let path = parts.next().unwrap_or_default();
-            if name.is_empty() || path.is_empty() {
-                return Err(ConfigError::Invalid {
-                    field: "PROPOLIS_SENSOR_LOGS",
-                    value: entry.to_string(),
-                    reason: "expected name:path",
-                });
-            }
-            Ok(SensorLogConfig {
-                name: name.to_string(),
-                log_path: PathBuf::from(path),
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    if logs.is_empty() {
-        return Err(ConfigError::Missing("PROPOLIS_SENSOR_LOGS"));
-    }
-    Ok(logs)
+    log_tailer::parse_sensor_logs(raw).map_err(|e| match e {
+        log_tailer::SensorLogsError::Empty => ConfigError::Missing("PROPOLIS_SENSOR_LOGS"),
+        log_tailer::SensorLogsError::InvalidEntry(value) => ConfigError::Invalid {
+            field: "PROPOLIS_SENSOR_LOGS",
+            value,
+            reason: "expected name:path",
+        },
+    })
 }
 
 fn parse_cidr_list(raw: &str) -> Result<Vec<IpNet>, ConfigError> {

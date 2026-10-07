@@ -262,6 +262,12 @@
 
 ### Fixed
 
+- **`deploy/sensor.env.example` lists the real `sensor-catchall` defaults** - the example block
+  showed the shell sensors' bounds (30000 ms read, 60000 ms idle, 600 s duration, 1000000 bytes)
+  and the deprecated bare `CATCHALL_MAX_CONCURRENT` name. The sensor's compiled defaults are 5000
+  ms, 5000 ms, 30 s and 4096 bytes (`crates/sensor-catchall/src/main.rs`), and the block now says
+  so, uses the `PROPOLIS_` name throughout, and notes that the compiled default log path is
+  relative.
 - **A non-UTF-8 environment variable is a startup error in every sensor, never read as unset** -
   most sensor variables were read with `env::var(..).ok()` or `if let Ok(..)`, so a value that was
   not valid UTF-8 silently fell back to the default or skipped the work: a bound or a timeout

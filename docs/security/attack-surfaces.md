@@ -79,6 +79,16 @@ plus the sustained rate of replies aimed at any one network, and an over-limit d
 share of a bounded summary event rather than an event of its own, so the flood cannot fill the
 event log either. On TCP 53 a connection is bounded to 64 messages of at most 4096 bytes each.
 
+`sensor-tftp` is the other UDP reflection surface, and it carries the same two controls. A
+request from a refused source (the reflective ports above, or an unspecified, broadcast or
+multicast address, checked after IPv4-mapped normalization by
+`crates/sensor-framework/src/reply_source.rs#check_reply_source`) is recorded and gets no transfer
+socket, so not even the first ERROR or ACK leaves; `crates/sensor-tftp/src/guarded.rs#send`
+repeats the check before every packet. Every datagram on the request port is charged to the same
+per-network and global `ReplyRateLimiter` before it is parsed, so junk cannot slip past the limit,
+and over-limit requests fold into bounded summary events. Packets on an established transfer's
+ephemeral port are not charged: that socket is already tied to the one peer that requested it.
+
 `sensor-dns` can also expose a DNS over TLS listener (conventionally 853). It exists only when
 `PROPOLIS_DNS_TLS_BIND` is set, so cert and key alone open no new port. The surface and its
 limits match the HTTPS listener: a handshake that fails or stalls is cut at the read timeout and

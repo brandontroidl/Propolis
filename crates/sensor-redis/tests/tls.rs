@@ -455,6 +455,52 @@ fn invalid_tls_bind_refuses_to_start() {
     assert_refuses(dir.path(), &[("PROPOLIS_REDIS_TLS_BIND", "bogus")]);
 }
 
+/// The plain listener binds first; a TLS bind that then fails (address in use) must take the
+/// whole sensor down with the uniform message, leaving nothing serving on the plain port.
+#[test]
+fn a_tls_bind_already_in_use_exits_1_and_leaves_the_plain_port_unserved() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let (cert_path, key_path) = (dir.path().join("c.pem"), dir.path().join("k.pem"));
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken_addr = taken.local_addr().unwrap().to_string();
+    let plain_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let plain_bind = format!("127.0.0.1:{plain_port}");
+    let log = dir.path().join("e.jsonl");
+
+    let (code, out) = run_binary(
+        &[
+            ("PROPOLIS_REDIS_BIND", &plain_bind),
+            ("PROPOLIS_REDIS_LOG_PATH", log.to_str().unwrap()),
+            ("PROPOLIS_REDIS_TLS_BIND", &taken_addr),
+            ("PROPOLIS_REDIS_TLS_CERT", cert_path.to_str().unwrap()),
+            ("PROPOLIS_REDIS_TLS_KEY", key_path.to_str().unwrap()),
+        ],
+        Duration::from_secs(10),
+    );
+    assert_eq!(code, Some(1), "expected exit 1, output: {out}");
+    assert!(
+        out.contains(&format!(
+            "sensor-redis: cannot start listener on {taken_addr}: "
+        )),
+        "output: {out}"
+    );
+    assert!(out.contains("refusing to start"), "output: {out}");
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", plain_port)).is_err(),
+        "the plain listener was left serving after the TLS bind failed"
+    );
+    drop(taken);
+}
+
 #[test]
 fn no_tls_vars_keeps_the_plain_sensor_running() {
     let dir = tempfile::tempdir().unwrap();

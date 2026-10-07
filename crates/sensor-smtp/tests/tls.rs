@@ -65,6 +65,10 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> TestServer {
+        Self::start_with_bounds(test_bounds()).await
+    }
+
+    async fn start_with_bounds(bounds: ConnectionBounds) -> TestServer {
         let (server, connector) = ephemeral();
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
@@ -81,7 +85,7 @@ impl TestServer {
             ],
             log_path.clone(),
             Arc::new(WanResolver::new(HashMap::new())),
-            test_bounds(),
+            bounds,
         )
         .await
         .unwrap();
@@ -330,12 +334,14 @@ async fn starttls_upgrades_then_forces_a_fresh_ehlo_and_tags_later_events() {
 async fn pipelined_plaintext_after_starttls_is_refused_and_recorded() {
     let srv = TestServer::start().await;
     let mut client = SmtpClient::connect(srv.plain).await;
-    let injected = b"MAIL FROM:<evil@x.test>\r\n";
+    // AUTH PLAIN is chosen because it emits a login event if it is ever interpreted: a command
+    // that emits nothing (MAIL FROM) would make the "never ran" assertion below vacuous.
+    let injected = b"AUTH PLAIN AGV2aWwAcGFzcw==\r\n";
     let mut burst = b"STARTTLS\r\n".to_vec();
     burst.extend_from_slice(injected);
-    // One 35-byte write is one loopback segment, so the server's single read returns both lines
-    // and the injected one is already buffered behind STARTTLS. Two writes would race the
-    // server's read and could take the legitimate 220 path.
+    // One write is one loopback segment, so the server's single read returns both lines and the
+    // injected one is already buffered behind STARTTLS. Two writes would race the server's read
+    // and could take the legitimate 220 path.
     client.write_raw(&burst).await;
 
     let reply = client.read_reply().await;
@@ -348,6 +354,8 @@ async fn pipelined_plaintext_after_starttls_is_refused_and_recorded() {
         "the connection must close after the refusal"
     );
 
+    // `events()` waits 250 ms, long enough for a late login event from a wrongly interpreted
+    // injection to land.
     let events = srv.events().await;
     let refused = events
         .iter()
@@ -364,8 +372,184 @@ async fn pipelined_plaintext_after_starttls_is_refused_and_recorded() {
     );
     assert_eq!(refused.metadata["pipelined_bytes"], injected.len());
     assert!(refused.sample.is_none());
-    // The injected MAIL FROM was never interpreted as a command.
-    assert!(!events.iter().any(is_data_event));
+    // The injected AUTH PLAIN was never interpreted as a command.
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT),
+        "the injected AUTH PLAIN produced a login event: {events:?}"
+    );
+    srv.stop();
+}
+
+#[tokio::test]
+async fn starttls_discards_recipients_given_before_the_upgrade() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.plain).await;
+    assert!(
+        client
+            .send_multiline("EHLO a")
+            .await
+            .contains("250-STARTTLS")
+    );
+    assert!(
+        client
+            .send("RCPT TO:<pre-upgrade@x.test>")
+            .await
+            .starts_with("250")
+    );
+    assert_eq!(
+        client.send("STARTTLS").await,
+        "220 2.0.0 Ready to start TLS\r\n"
+    );
+
+    let mut client = client.into_tls(&srv.connector).await;
+    assert!(client.send_multiline("EHLO b").await.starts_with("250-"));
+    // No MAIL FROM here on purpose: MAIL FROM itself clears the recipient list, which would hide
+    // a missing post-upgrade reset.
+    let r = client.deliver("post-upgrade@d.test").await;
+    assert!(r.starts_with("250 2.0.0 Ok: queued as"), "{r}");
+
+    let events = srv.events().await;
+    let data = events.iter().find(|e| is_data_event(e)).unwrap();
+    assert_eq!(
+        data.metadata["rcpt_to"],
+        serde_json::json!(["post-upgrade@d.test"]),
+        "the pre-upgrade recipient leaked into the TLS message"
+    );
+    assert_eq!(data.metadata.get("tls"), Some(&serde_json::json!(true)));
+    srv.stop();
+}
+
+/// Sends `BDAT <len>[ LAST]` plus the raw chunk and returns the reply.
+async fn bdat<S: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut SmtpClient<S>,
+    chunk: &[u8],
+    last: bool,
+) -> String {
+    let mut wire = format!(
+        "BDAT {}{}\r\n",
+        chunk.len(),
+        if last { " LAST" } else { "" }
+    )
+    .into_bytes();
+    wire.extend_from_slice(chunk);
+    client.write_raw(&wire).await;
+    client.read_reply().await
+}
+
+#[tokio::test]
+async fn starttls_discards_a_bdat_chunk_received_before_the_upgrade() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.plain).await;
+    assert!(
+        client
+            .send_multiline("EHLO a")
+            .await
+            .contains("250-STARTTLS")
+    );
+    let pre = b"Subject: leaked\r\n\r\npre-upgrade-chunk";
+    let r = bdat(&mut client, pre, false).await;
+    assert!(r.starts_with("250 2.0.0 Ok: "), "{r}");
+    assert_eq!(
+        client.send("STARTTLS").await,
+        "220 2.0.0 Ready to start TLS\r\n"
+    );
+
+    let mut client = client.into_tls(&srv.connector).await;
+    assert!(client.send_multiline("EHLO b").await.starts_with("250-"));
+    let post = b"Subject: kept\r\n\r\npost-upgrade-chunk";
+    let r = bdat(&mut client, post, true).await;
+    assert!(r.starts_with("250 2.0.0 Ok: queued as"), "{r}");
+
+    let events = srv.events().await;
+    let data = events.iter().find(|e| is_data_event(e)).unwrap();
+    assert_eq!(
+        data.metadata["body_size"],
+        post.len(),
+        "the pre-upgrade chunk was counted into the TLS message"
+    );
+    assert_eq!(
+        meta_str(data, "subject"),
+        Some("kept"),
+        "the pre-upgrade chunk's headers lead the TLS message"
+    );
+    assert_eq!(data.metadata["chunking"], true);
+    assert_eq!(data.metadata.get("tls"), Some(&serde_json::json!(true)));
+    srv.stop();
+}
+
+#[tokio::test]
+async fn bdat_over_implicit_tls_is_tagged_tls() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect_implicit(srv.implicit, &srv.connector).await;
+    assert!(client.send_multiline("EHLO a").await.starts_with("250-"));
+    let r = bdat(&mut client, b"Subject: s\r\n\r\nbody", true).await;
+    assert!(r.starts_with("250 2.0.0 Ok: queued as"), "{r}");
+
+    let events = srv.events().await;
+    let data = events.iter().find(|e| is_data_event(e)).unwrap();
+    assert_eq!(data.metadata["chunking"], true);
+    assert_eq!(data.metadata.get("tls"), Some(&serde_json::json!(true)));
+    srv.stop();
+}
+
+#[tokio::test]
+async fn auth_login_over_starttls_is_tagged_tls() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.plain).await;
+    assert_eq!(
+        client.send("STARTTLS").await,
+        "220 2.0.0 Ready to start TLS\r\n"
+    );
+    let mut client = client.into_tls(&srv.connector).await;
+    assert!(client.send_multiline("EHLO b").await.starts_with("250-"));
+    assert!(client.send("AUTH LOGIN").await.starts_with("334"));
+    assert!(client.send("YWRtaW4=").await.starts_with("334"));
+    let r = client.send("c2VjcmV0").await;
+    assert!(r.starts_with("235"), "{r}");
+
+    let events = srv.events().await;
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .expect("login event");
+    assert_eq!(meta_str(login, "username"), Some("admin"));
+    assert_eq!(login.metadata.get("tls"), Some(&serde_json::json!(true)));
+    assert!(login.metadata.get("password").is_none());
+    srv.stop();
+}
+
+#[tokio::test]
+async fn a_stalled_starttls_handshake_is_cut_at_the_read_timeout() {
+    let srv = TestServer::start_with_bounds(ConnectionBounds {
+        read_timeout: Duration::from_secs(1),
+        ..test_bounds()
+    })
+    .await;
+    let mut client = SmtpClient::connect(srv.plain).await;
+    assert_eq!(
+        client.send("STARTTLS").await,
+        "220 2.0.0 Ready to start TLS\r\n"
+    );
+    // The ClientHello never comes. Without the handshake bound the session would live until
+    // max_duration (30 s) and the 4 s window below would expire.
+    let started = std::time::Instant::now();
+    let closed = tokio::time::timeout(
+        Duration::from_secs(4),
+        client.reader.get_mut().read(&mut [0u8; 16]),
+    )
+    .await
+    .expect("the stalled handshake held the session past the read timeout");
+    assert!(matches!(closed, Ok(0) | Err(_)), "{closed:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(800),
+        "closed before the read timeout: {:?}",
+        started.elapsed()
+    );
+
+    let mut fresh = SmtpClient::connect(srv.plain).await;
+    assert!(fresh.send_multiline("EHLO x").await.contains("250"));
     srv.stop();
 }
 

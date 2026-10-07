@@ -505,7 +505,9 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
 Impersonates **vsFTPd 3.0.5** (conventional port 21).
 
 - **Behavior** (`handler.rs`): banner `220 (vsFTPd 3.0.5)`. Verbs
-  (case-insensitive, `crates/sensor-ftp/src/handler.rs#handle_connection`): USER→331, PASS→login event + 230 (password
+  (case-insensitive, including the PASV/EPSV and LIST/NLST distinctions: lowercase `pasv`
+  gets the 227 reply and lowercase `nlst` the bare-names listing,
+  `crates/sensor-ftp/src/handler.rs#handle_connection`): USER→331, PASS→login event + 230 (password
   dropped), SYST→`215 UNIX Type: L8`, FEAT, PWD/CWD, TYPE (validated), SIZE/MDTM
   (canned `readme.txt`, 4096 bytes), REST, PASV/EPSV (opens a passive data listener
   on the control interface), LIST/NLST (canned listing), STOR (captures upload →

@@ -283,7 +283,10 @@ pub async fn handle_connection(
         // lowercase `syst`/`user` must dispatch like its uppercase form rather than falling through
         // to "500 Unknown command" - a one-command tell that a lowercase probe would out. Only the
         // verb is normalized; `arg` (e.g. a filename) keeps its case, matching the TYPE arm below.
-        match cmd.to_ascii_uppercase().as_str() {
+        // The arms that tell two verbs of one arm apart (PASV/EPSV, LIST/NLST) compare `verb`, not
+        // the raw `cmd`, for the same reason.
+        let verb = cmd.to_ascii_uppercase();
+        match verb.as_str() {
             "USER" => {
                 username = sanitize_value(arg, MAX_USERNAME_LEN);
                 let _ = write_line(&mut reader, b"331 Please specify the password.\r\n").await;
@@ -438,7 +441,7 @@ pub async fn handle_connection(
                 match TcpListener::bind((bind_ip, 0)).await {
                     Ok(listener) => {
                         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-                        let resp = if cmd == "PASV" {
+                        let resp = if verb == "PASV" {
                             // 227 must carry an IPv4 host to dial: prefer the WAN IPv4, else the
                             // bound IPv4; if neither is a usable IPv4 (IPv6-only control), refuse
                             // rather than advertise an unreachable address.
@@ -499,7 +502,7 @@ pub async fn handle_connection(
                                     {
                                         Some(mut data) => {
                                             // LIST is the long ls -l form; NLST is bare names only.
-                                            let payload = if cmd == "NLST" {
+                                            let payload = if verb == "NLST" {
                                                 CANNED_NLST
                                             } else {
                                                 CANNED_LIST

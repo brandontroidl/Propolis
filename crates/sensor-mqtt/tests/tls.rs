@@ -599,6 +599,46 @@ fn invalid_tls_bind_refuses_to_start() {
     refuses(&[("PROPOLIS_MQTT_TLS_BIND", "bogus".into())], dir.path());
 }
 
+/// The plain listener binds first; a TLS bind that then fails (address in use) must take the
+/// whole sensor down with the uniform message, leaving nothing serving on the plain port.
+#[test]
+fn a_tls_bind_already_in_use_exits_1_and_leaves_the_plain_port_unserved() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let (cert_path, key_path) = (dir.path().join("c.pem"), dir.path().join("k.pem"));
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken_addr = taken.local_addr().unwrap().to_string();
+    let plain_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let out = refuses(
+        &[
+            ("PROPOLIS_MQTT_BIND", format!("127.0.0.1:{plain_port}")),
+            ("PROPOLIS_MQTT_TLS_BIND", taken_addr.clone()),
+            ("PROPOLIS_MQTT_TLS_CERT", cert_path.display().to_string()),
+            ("PROPOLIS_MQTT_TLS_KEY", key_path.display().to_string()),
+        ],
+        dir.path(),
+    );
+    assert!(
+        out.contains(&format!(
+            "sensor-mqtt: cannot start listener on {taken_addr}: "
+        )),
+        "output: {out}"
+    );
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", plain_port)).is_err(),
+        "the plain listener was left serving after the TLS bind failed"
+    );
+    drop(taken);
+}
+
 #[test]
 fn a_valid_pair_without_a_tls_bind_starts_no_tls_listener_and_warns() {
     use std::os::unix::fs::PermissionsExt;

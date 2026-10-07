@@ -504,8 +504,16 @@ fn a_tls_bind_already_in_use_names_the_address_and_refuses_to_start() {
     write_key(&dir.path().join("k.pem"), &key, 0o600);
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let taken_addr = taken.local_addr().unwrap().to_string();
+    // A concrete plain port (base_env's is ephemeral) so the test can probe it afterwards: the
+    // plain listener binds first, then the TLS bind fails, and nothing may be left serving.
+    let plain_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let plain_bind = format!("127.0.0.1:{plain_port}");
     let output = refuses(
         &[
+            ("PROPOLIS_HTTP_BIND", &plain_bind),
             ("PROPOLIS_HTTP_TLS_BIND", &taken_addr),
             ("PROPOLIS_HTTP_TLS_CERT", &p(dir.path(), "c.pem")),
             ("PROPOLIS_HTTP_TLS_KEY", &p(dir.path(), "k.pem")),
@@ -517,6 +525,10 @@ fn a_tls_bind_already_in_use_names_the_address_and_refuses_to_start() {
             "sensor-http: cannot start listener on {taken_addr}: "
         )),
         "output: {output}"
+    );
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", plain_port)).is_err(),
+        "the plain listener was left serving after the TLS bind failed"
     );
     drop(taken);
 }

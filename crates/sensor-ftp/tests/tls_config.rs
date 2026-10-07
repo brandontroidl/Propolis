@@ -63,6 +63,63 @@ fn invalid_tls_bind_exits_1() {
     assert_refuses_to_start(&[("PROPOLIS_FTP_TLS_BIND", "not-an-address")]);
 }
 
+/// The plain listener binds first; a TLS bind that then fails (address in use) must take the
+/// whole sensor down with the uniform message, leaving nothing serving on the plain port.
+#[test]
+fn a_tls_bind_already_in_use_exits_1_and_leaves_the_plain_port_unserved() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let (cert_path, key_path) = (dir.path().join("c.pem"), dir.path().join("k.pem"));
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken_addr = taken.local_addr().unwrap().to_string();
+    let plain_port = free_port();
+    let plain_bind = format!("127.0.0.1:{plain_port}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sensor-ftp"))
+        .env_clear()
+        .env("NO_COLOR", "1")
+        .env("PROPOLIS_FTP_BIND", &plain_bind)
+        .env("PROPOLIS_FTP_LOG_PATH", dir.path().join("events.jsonl"))
+        .env("PROPOLIS_FTP_SPOOL_DIR", dir.path().join("spool"))
+        .env("PROPOLIS_FTP_TLS_BIND", &taken_addr)
+        .env("PROPOLIS_FTP_TLS_CERT", &cert_path)
+        .env("PROPOLIS_FTP_TLS_KEY", &key_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1), "output: {text}");
+    assert!(
+        text.contains(&format!(
+            "sensor-ftp: cannot start listener on {taken_addr}: "
+        )),
+        "output: {text}"
+    );
+    assert!(text.contains("refusing to start"), "output: {text}");
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", plain_port)).is_err(),
+        "the plain listener was left serving after the TLS bind failed"
+    );
+    drop(taken);
+}
+
 /// A non-UTF-8 value on any TLS variable is invalid, never read as unset (which would silently
 /// skip the 990 listener or turn AUTH TLS off): exit 1, naming the variable, before any listener
 /// binds.

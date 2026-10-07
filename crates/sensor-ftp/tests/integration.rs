@@ -109,6 +109,10 @@ impl TestServer {
     /// A plain listener that honours AUTH TLS plus an implicit-FTPS listener, one cert, one
     /// shared hand-off and budget.
     async fn start_tls() -> TestServer {
+        Self::start_tls_with_bounds(test_bounds()).await
+    }
+
+    async fn start_tls_with_bounds(bounds: ConnectionBounds) -> TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let spool_dir = dir.path().join("spool");
@@ -129,7 +133,7 @@ impl TestServer {
             log_path.clone(),
             spool_dir.clone(),
             wan_resolver,
-            test_bounds(),
+            bounds,
             "test".to_string(),
             dir.path().join("outbox"),
             budget.clone(),
@@ -966,11 +970,14 @@ async fn auth_tls_upgrades_resets_login_state_and_tags_events() {
 async fn auth_tls_with_pipelined_plaintext_is_refused_and_recorded() {
     let srv = TestServer::start_tls().await;
     let mut client = FtpClient::connect(srv.tls_addr.unwrap()).await;
-    // ONE write, so the injected command is buffered behind AUTH TLS.
+    // ONE write, so the injected commands are buffered behind AUTH TLS. USER/PASS is chosen
+    // because PASS is a command that emits a login event if it is ever interpreted: a command
+    // that emits nothing would make the "never ran" assertion below vacuous.
+    let injected = "USER x\r\nPASS y\r\n";
     client
         .reader
         .get_mut()
-        .write_all(b"AUTH TLS\r\nUSER evil\r\n")
+        .write_all(format!("AUTH TLS\r\n{injected}").as_bytes())
         .await
         .unwrap();
     assert_eq!(
@@ -979,6 +986,8 @@ async fn auth_tls_with_pipelined_plaintext_is_refused_and_recorded() {
     );
     assert_eq!(client.read_reply().await, "", "the connection is closed");
 
+    // A late login event from a wrongly interpreted injection would land after the reply.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let events = srv.events().await;
     let refusal = events
         .iter()
@@ -986,13 +995,13 @@ async fn auth_tls_with_pipelined_plaintext_is_refused_and_recorded() {
         .expect("refusal event");
     assert_eq!(refusal.metadata["command"], "AUTH");
     assert_eq!(refusal.metadata["starttls_refused"], "pipelined_plaintext");
-    assert_eq!(refusal.metadata["pipelined_bytes"], "USER evil\r\n".len());
+    assert_eq!(refusal.metadata["pipelined_bytes"], injected.len());
     assert!(refusal.metadata.get("tls").is_none());
     assert!(
         events
             .iter()
             .all(|e| e.signal_type != sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT),
-        "the injected USER must never run"
+        "the injected PASS must never produce a login event"
     );
     srv.stop();
 }
@@ -1167,6 +1176,321 @@ async fn prot_p_data_handshake_failure_is_425() {
     raw.write_all(&[0x41u8; 512]).await.unwrap();
     let r = client.read_reply().await;
     assert!(r.starts_with("425 Failed to establish connection."), "{r}");
+    assert!(client.send("NOOP").await.starts_with("200"));
+    srv.stop();
+}
+
+/// A data connection that reaches the passive port from 127.0.0.2 while the control connection
+/// came from 127.0.0.1: the shape of an off-path host racing the port. Linux routes all of
+/// 127.0.0.0/8 to loopback, so no extra interface is needed.
+async fn connect_from_other_ip(addr: std::net::SocketAddr) -> TcpStream {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+    socket.connect(addr).await.unwrap()
+}
+
+/// STOR on an already-armed passive port from the control peer's own address, to completion.
+async fn stor_on<S: AsyncRead + AsyncWrite + Unpin>(
+    srv: &TestServer,
+    client: &mut FtpClient<S>,
+    data_addr: std::net::SocketAddr,
+    name: &str,
+    body: &[u8],
+    prot_p: bool,
+) {
+    send_only(client, &format!("STOR {name}")).await;
+    let r = client.read_reply().await;
+    assert!(r.starts_with("150"), "STOR 150: {r}");
+    if prot_p {
+        let mut data = tls_data(data_addr, srv.connector.as_ref().unwrap()).await;
+        data.write_all(body).await.unwrap();
+        data.flush().await.unwrap();
+        drop(data);
+    } else {
+        let mut data = TcpStream::connect(data_addr).await.unwrap();
+        data.write_all(body).await.unwrap();
+        drop(data);
+    }
+    let r = client.read_reply().await;
+    assert!(r.starts_with("226"), "STOR 226: {r}");
+}
+
+/// LIST on an already-armed passive port from the control peer's own address, to completion.
+async fn list_on<S: AsyncRead + AsyncWrite + Unpin>(
+    srv: &TestServer,
+    client: &mut FtpClient<S>,
+    data_addr: std::net::SocketAddr,
+    prot_p: bool,
+) -> String {
+    send_only(client, "LIST").await;
+    let r = client.read_reply().await;
+    assert!(r.starts_with("150"), "LIST 150: {r}");
+    let mut listing = String::new();
+    if prot_p {
+        let mut data = tls_data(data_addr, srv.connector.as_ref().unwrap()).await;
+        data.read_to_string(&mut listing).await.unwrap();
+    } else {
+        let mut data = TcpStream::connect(data_addr).await.unwrap();
+        data.read_to_string(&mut listing).await.unwrap();
+    }
+    let r = client.read_reply().await;
+    assert!(r.starts_with("226"), "LIST 226: {r}");
+    listing
+}
+
+/// One hijack attempt on `verb` (`STOR` or `LIST`): a data connection from another source IP is
+/// refused with vsftpd's reply and nothing is captured, then the same armed port still serves its
+/// real owner, which proves the refusal was the peer check and not a broken session.
+async fn hijack_attempt<S: AsyncRead + AsyncWrite + Unpin>(
+    srv: &TestServer,
+    client: &mut FtpClient<S>,
+    verb: &str,
+    prot_p: bool,
+    label: &str,
+) {
+    let data_addr = client.pasv().await;
+    send_only(
+        client,
+        if verb == "STOR" {
+            "STOR evil.bin"
+        } else {
+            "LIST"
+        },
+    )
+    .await;
+    let r = client.read_reply().await;
+    assert!(r.starts_with("150"), "{label}: {verb} 150: {r}");
+
+    let mut hijacker = connect_from_other_ip(data_addr).await;
+    let _ = hijacker.write_all(b"MZ-hijacked").await;
+    drop(hijacker);
+
+    let r = client.read_reply().await;
+    assert_eq!(r, "425 Security: bad IP connecting.\r\n", "{label}: {verb}");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        srv.uploads().await.is_empty(),
+        "{label}: the hijacker's bytes were captured"
+    );
+
+    // The port is still armed for the control peer.
+    if verb == "STOR" {
+        let body = b"MZ-from-the-real-peer";
+        stor_on(srv, client, data_addr, "real.bin", body, prot_p).await;
+        srv.wait_for_upload_events(1).await;
+        let uploads = srv.uploads().await;
+        assert_eq!(uploads.len(), 1, "{label}");
+        assert_eq!(
+            uploads[0].sample.as_ref().unwrap().size,
+            body.len() as u64,
+            "{label}"
+        );
+        assert_eq!(
+            uploads[0].metadata["wire_size"],
+            body.len() as u64,
+            "{label}"
+        );
+    } else {
+        assert_eq!(
+            list_on(srv, client, data_addr, prot_p).await,
+            LIST_BODY,
+            "{label}"
+        );
+    }
+}
+
+async fn assert_hijack_refused_in_every_channel_mode(verb: &str) {
+    for mode in [
+        "plain control",
+        "tls control, PROT C",
+        "tls control, PROT P",
+    ] {
+        // A fresh server per mode so each starts with an empty event log.
+        let srv = TestServer::start_tls().await;
+        match mode {
+            "plain control" => {
+                let mut client = FtpClient::connect(srv.tls_addr.unwrap()).await;
+                client.login("root", "x").await;
+                hijack_attempt(&srv, &mut client, verb, false, mode).await;
+            }
+            "tls control, PROT C" => {
+                let mut client = auth_tls(&srv).await;
+                client.login("root", "x").await;
+                assert!(client.send("PBSZ 0").await.starts_with("200"));
+                assert!(client.send("PROT C").await.starts_with("200"));
+                hijack_attempt(&srv, &mut client, verb, false, mode).await;
+            }
+            _ => {
+                let mut client = private_session(&srv).await;
+                hijack_attempt(&srv, &mut client, verb, true, mode).await;
+            }
+        }
+        srv.stop();
+    }
+}
+
+#[tokio::test]
+async fn stor_data_connection_from_another_ip_is_refused_and_captures_nothing() {
+    assert_hijack_refused_in_every_channel_mode("STOR").await;
+}
+
+#[tokio::test]
+async fn list_data_connection_from_another_ip_is_refused() {
+    assert_hijack_refused_in_every_channel_mode("LIST").await;
+}
+
+#[tokio::test]
+async fn auth_tls_discards_the_plaintext_login_so_a_later_upload_is_unauthenticated() {
+    let srv = TestServer::start_tls().await;
+    let mut client = FtpClient::connect(srv.tls_addr.unwrap()).await;
+    client.login("root", "toor").await;
+    assert_eq!(
+        client.send("AUTH TLS").await,
+        "234 Proceed with negotiation.\r\n"
+    );
+    let mut client = client.into_tls(srv.connector.as_ref().unwrap()).await;
+
+    // No login inside the TLS session: the cleartext one must not carry over.
+    let data_addr = client.pasv().await;
+    stor_on(
+        &srv,
+        &mut client,
+        data_addr,
+        "a.bin",
+        b"MZ-before-login",
+        false,
+    )
+    .await;
+    srv.wait_for_upload_events(1).await;
+    assert!(
+        !srv.uploads().await[0].authenticated,
+        "an upload after AUTH TLS with no new login was recorded as authenticated"
+    );
+
+    // The field is live: a login inside the TLS session flips it.
+    client.login("root", "toor").await;
+    let data_addr = client.pasv().await;
+    stor_on(
+        &srv,
+        &mut client,
+        data_addr,
+        "b.bin",
+        b"MZ-after-login",
+        false,
+    )
+    .await;
+    srv.wait_for_upload_events(2).await;
+    assert!(srv.uploads().await[1].authenticated);
+    srv.stop();
+}
+
+#[tokio::test]
+async fn auth_tls_discards_a_passive_listener_opened_in_cleartext() {
+    let srv = TestServer::start_tls().await;
+    let mut client = FtpClient::connect(srv.tls_addr.unwrap()).await;
+    let _old_port = client.pasv().await;
+    assert_eq!(
+        client.send("AUTH TLS").await,
+        "234 Proceed with negotiation.\r\n"
+    );
+    let mut client = client.into_tls(srv.connector.as_ref().unwrap()).await;
+
+    // Only the NOT-armed replies are acceptable: a 150 would mean the cleartext listener is
+    // still serving transfers inside the protected session.
+    assert_eq!(client.send("LIST").await, "425 Use PORT or PASV first.\r\n");
+    assert_eq!(
+        client.send("STOR a.bin").await,
+        "425 Use PORT or PASV first.\r\n"
+    );
+    srv.stop();
+}
+
+#[tokio::test]
+async fn pasv_and_nlst_are_case_insensitive_like_the_other_verbs() {
+    let srv = TestServer::start().await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    client.login("root", "x").await;
+
+    let r = client.send("pasv").await;
+    assert!(r.starts_with("227 Entering Passive Mode ("), "{r}");
+    let data_addr = parse_pasv_addr(&r);
+    send_only(&mut client, "nlst").await;
+    assert!(client.read_reply().await.starts_with("150"));
+    let mut data = TcpStream::connect(data_addr).await.unwrap();
+    let mut names = String::new();
+    data.read_to_string(&mut names).await.unwrap();
+    assert_eq!(
+        names, "readme.txt\r\npub\r\n",
+        "lowercase nlst is bare names"
+    );
+    assert!(client.read_reply().await.starts_with("226"));
+
+    let r = client.send("EpSv").await;
+    assert!(
+        r.starts_with("229 Entering Extended Passive Mode (|||"),
+        "{r}"
+    );
+    let r = client.send("pAsV").await;
+    assert!(r.starts_with("227 "), "{r}");
+    srv.stop();
+}
+
+fn stall_bounds() -> ConnectionBounds {
+    ConnectionBounds {
+        read_timeout: Duration::from_secs(1),
+        ..test_bounds()
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_auth_tls_handshake_is_cut_at_the_read_timeout() {
+    let srv = TestServer::start_tls_with_bounds(stall_bounds()).await;
+    let mut client = FtpClient::connect(srv.tls_addr.unwrap()).await;
+    assert_eq!(
+        client.send("AUTH TLS").await,
+        "234 Proceed with negotiation.\r\n"
+    );
+    // The ClientHello never comes. Without the handshake bound the session would live until
+    // max_duration (30 s) and the 4 s window below would expire.
+    let started = std::time::Instant::now();
+    let closed = tokio::time::timeout(
+        Duration::from_secs(4),
+        client.reader.get_mut().read(&mut [0u8; 16]),
+    )
+    .await
+    .expect("the stalled handshake held the session past the read timeout");
+    assert!(matches!(closed, Ok(0) | Err(_)), "{closed:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(800),
+        "closed before the read timeout: {:?}",
+        started.elapsed()
+    );
+
+    // The listener is unaffected.
+    let mut fresh = FtpClient::connect(srv.tls_addr.unwrap()).await;
+    assert!(fresh.send("NOOP").await.starts_with("200"));
+    srv.stop();
+}
+
+#[tokio::test]
+async fn a_stalled_prot_p_data_handshake_is_cut_at_the_read_timeout() {
+    let srv = TestServer::start_tls_with_bounds(stall_bounds()).await;
+    let mut client = private_session(&srv).await;
+    let data_addr = client.pasv().await;
+    send_only(&mut client, "LIST").await;
+    assert!(client.read_reply().await.starts_with("150"));
+
+    // Connect from the control peer's own address and then say nothing. The accept wait is the
+    // 5 s idle timeout; the handshake bound is 1 s, so a 4 s window separates them.
+    let _stalled = TcpStream::connect(data_addr).await.unwrap();
+    let started = std::time::Instant::now();
+    let r = client.read_reply_within(Duration::from_secs(4)).await;
+    assert!(r.starts_with("425 Failed to establish connection."), "{r}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(800),
+        "refused before the read timeout: {:?}",
+        started.elapsed()
+    );
     assert!(client.send("NOOP").await.starts_with("200"));
     srv.stop();
 }

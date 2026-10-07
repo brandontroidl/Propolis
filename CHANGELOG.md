@@ -248,6 +248,11 @@
 
 ### Fixed
 
+- **`sensor-ftp` treats `pasv` and `nlst` like their uppercase forms** - the PASV/EPSV and
+  LIST/NLST replies were chosen by a case-sensitive comparison, so lowercase `pasv` got the EPSV
+  style `229` reply and lowercase `nlst` got the long LIST output. Every other verb was already
+  case-insensitive. The TLS reset, data-peer and bind-failure guards that were correct but
+  unguarded by tests now each have a test.
 - **A malformed PEM error never carries key bytes** - the PEM parser's own error prints the
   offending line or section label as a byte list, and for a key written header, body and footer on
   one line that label is the whole key, which every TLS sensor then logged at error level. The

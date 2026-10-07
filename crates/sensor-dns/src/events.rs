@@ -21,8 +21,8 @@ use tokio::time::Instant;
 
 use crate::guarded::SuppressReason;
 use crate::protocol::{
-    CLASS_CH, CLASS_IN, EdnsScan, Header, Question, RejectReason, TYPE_ANY, TYPE_AXFR, TYPE_DNSKEY,
-    TYPE_IXFR, TYPE_RRSIG, TYPE_TXT, Transport, opcode_name, qclass_name, qtype_name,
+    CLASS_ANY, CLASS_CH, CLASS_IN, EdnsScan, Header, Question, RejectReason, TYPE_ANY, TYPE_AXFR,
+    TYPE_DNSKEY, TYPE_IXFR, TYPE_RRSIG, TYPE_TXT, Transport, opcode_name, qclass_name, qtype_name,
 };
 
 pub const PROTOCOL_LABEL: &str = "dns";
@@ -48,7 +48,8 @@ pub struct QueryRecord<'a> {
     pub status: QueryStatus,
     /// TCP: the message bytes, excluding the length prefix; 0 when the body was not read.
     pub query_len: usize,
-    /// TCP `short_header` / `oversize` only.
+    /// TCP framing rejections only (`short_header`, `oversize`, `byte_cap`, `truncated_body`,
+    /// `body_timeout`): the length prefix the peer sent.
     pub declared_len: Option<usize>,
     /// TCP/DoT only, 0-based within the connection.
     pub msg_index: Option<usize>,
@@ -75,7 +76,7 @@ pub fn probe_signals(
     {
         out.push("amplification_probe");
     }
-    if header.rd() && q.qclass == CLASS_IN && !transfer {
+    if header.rd() && (q.qclass == CLASS_IN || q.qclass == CLASS_ANY) && !transfer {
         out.push("open_resolver_probe");
     }
     if transfer {
@@ -370,6 +371,14 @@ mod tests {
         );
         let a = parsed(0, &[b"example", b"com"], 1, CLASS_IN);
         assert!(signals(&a, None, Transport::Udp).is_empty());
+        // QCLASS ANY with RD asks a recursive server just as IN does.
+        let rd_class_any = parsed(FLAG_RD, &[b"example", b"com"], 1, CLASS_ANY);
+        assert_eq!(
+            signals(&rd_class_any, None, Transport::Tcp),
+            vec!["open_resolver_probe"]
+        );
+        let rd_class_hs = parsed(FLAG_RD, &[b"example", b"com"], 1, 4);
+        assert!(signals(&rd_class_hs, None, Transport::Tcp).is_empty());
 
         let rd_axfr = parsed(FLAG_RD, &[b"example", b"com"], TYPE_AXFR, CLASS_IN);
         assert_eq!(
@@ -595,6 +604,27 @@ mod tests {
         s.key = None;
         let overflow = rate_limited_event(&s, None, Duration::from_secs(10), now, now_utc);
         assert_eq!(overflow.metadata["source_prefix"], "overflow");
+    }
+
+    /// The parser's presentation format is already printable ASCII under 1024 characters, so the
+    /// sanitizer is the second line, not the first: `Question` is public, and whatever qname
+    /// reaches an event (the `qname` field and the TCP `command`) still goes through it.
+    #[test]
+    fn a_qname_the_parser_would_never_produce_is_still_sanitized_and_capped() {
+        let mut q = parsed(0, &[b"x"], 1, CLASS_IN);
+        q.question.qname = format!("a\r\nforged\u{202E}{}", "b".repeat(2000));
+        let e = stream_query_event(
+            &answered(&q, Transport::Tcp, false),
+            ip(),
+            None,
+            Uuid::now_v7(),
+        );
+        let qname = e.metadata["qname"].as_str().unwrap();
+        assert!(qname.starts_with("a forgedb"), "{qname:.40}");
+        assert_eq!(qname.len(), MAX_QNAME_TEXT_LEN);
+        let command = e.metadata["command"].as_str().unwrap();
+        assert!(command.starts_with("A a forgedb"), "{command:.40}");
+        assert_eq!(command.len(), 2 + MAX_QNAME_TEXT_LEN);
     }
 
     #[test]

@@ -667,23 +667,123 @@ async fn tcp_idle_connection_is_closed_within_the_read_timeout() {
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
+/// Two 78-byte queries cost 2 * (2 + 78) = 160 bytes with their prefixes. A cap of 159 must
+/// refuse the second (it would also admit it if the prefixes were not charged: 156 <= 159); a
+/// cap of 160 must answer both.
 #[tokio::test]
-async fn tcp_max_captured_bytes_ends_the_connection() {
-    let bounds = ConnectionBounds {
-        max_captured_bytes: 100,
-        ..test_bounds()
-    };
-    let server = Server::start_with(bounds, HashMap::new()).await;
-    let mut conn = TcpStream::connect(server.listeners.tcp).await.unwrap();
+async fn tcp_max_captured_bytes_charges_each_prefix_and_ends_the_connection() {
     let label = [b'x'; 60];
-    // 78 bytes plus the prefix: the first fits in 100, the second would not.
     let first = query(1, 0, &[&label], TYPE_A, CLASS_IN);
     let second = query(2, 0, &[&label], TYPE_A, CLASS_IN);
     assert_eq!(first.len(), 78);
+
+    let bounds = ConnectionBounds {
+        max_captured_bytes: 159,
+        ..test_bounds()
+    };
+    let server = Server::start_with(bounds.clone(), HashMap::new()).await;
+    let mut conn = TcpStream::connect(server.listeners.tcp).await.unwrap();
     conn.write_all(&framed(&first)).await.unwrap();
     assert!(read_framed(&mut conn).await.is_some());
     conn.write_all(&framed(&second)).await.unwrap();
     assert_eof(&mut conn).await;
+    let e = server
+        .wait_for("byte_cap", |e| md(e, "reject_reason") == "byte_cap")
+        .await;
+    assert_eq!(md(&e, "declared_len"), 78);
+    assert_eq!(md(&e, "msg_index"), 1);
+    assert_eq!(md(&e, "query_len"), 0);
+    assert_eq!(md(&e, "command"), "malformed");
+
+    let bounds = ConnectionBounds {
+        max_captured_bytes: 160,
+        ..bounds
+    };
+    let server = Server::start_with(bounds, HashMap::new()).await;
+    let mut conn = TcpStream::connect(server.listeners.tcp).await.unwrap();
+    conn.write_all(&framed(&first)).await.unwrap();
+    conn.write_all(&framed(&second)).await.unwrap();
+    assert!(read_framed(&mut conn).await.is_some());
+    assert!(read_framed(&mut conn).await.is_some(), "160 holds both");
+}
+
+#[tokio::test]
+async fn a_stalled_message_body_is_cut_at_the_read_timeout_with_an_event() {
+    let bounds = ConnectionBounds {
+        read_timeout: Duration::from_millis(300),
+        idle_timeout: Duration::from_secs(20),
+        ..test_bounds()
+    };
+    let server = Server::start_with(bounds, HashMap::new()).await;
+    let mut conn = TcpStream::connect(server.listeners.tcp).await.unwrap();
+    let msg = example(1);
+    let started = std::time::Instant::now();
+    conn.write_all(&framed(&msg)[..2 + 5]).await.unwrap();
+    assert_eof(&mut conn).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let e = server
+        .wait_for("body_timeout", |e| md(e, "reject_reason") == "body_timeout")
+        .await;
+    assert_eq!(md(&e, "declared_len"), msg.len() as u64);
+    assert_eq!(md(&e, "query_status"), "rejected");
+}
+
+#[tokio::test]
+async fn a_body_cut_short_by_the_peer_is_recorded_as_truncated() {
+    let server = Server::start().await;
+    let mut conn = TcpStream::connect(server.listeners.tcp).await.unwrap();
+    let msg = example(1);
+    conn.write_all(&framed(&msg)[..2 + 5]).await.unwrap();
+    conn.shutdown().await.unwrap();
+    assert_eof(&mut conn).await;
+    let e = server
+        .wait_for("truncated_body", |e| {
+            md(e, "reject_reason") == "truncated_body"
+        })
+        .await;
+    assert_eq!(md(&e, "declared_len"), msg.len() as u64);
+}
+
+/// Between queries the connection waits the idle timeout, not the read timeout, in both
+/// directions.
+#[tokio::test]
+async fn the_wait_between_queries_is_the_idle_timeout() {
+    let short_read = ConnectionBounds {
+        read_timeout: Duration::from_millis(300),
+        idle_timeout: Duration::from_secs(5),
+        ..test_bounds()
+    };
+    let server = Server::start_with(short_read, HashMap::new()).await;
+    let mut conn = TcpStream::connect(server.listeners.tcp).await.unwrap();
+    conn.write_all(&framed(&example(1))).await.unwrap();
+    assert!(read_framed(&mut conn).await.is_some());
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    conn.write_all(&framed(&example(2))).await.unwrap();
+    let reply = read_framed(&mut conn)
+        .await
+        .expect("still open after 900 ms");
+    assert_eq!(&reply[0..2], &[0, 2]);
+
+    let short_idle = ConnectionBounds {
+        read_timeout: Duration::from_secs(5),
+        idle_timeout: Duration::from_millis(300),
+        ..test_bounds()
+    };
+    let server = Server::start_with(short_idle, HashMap::new()).await;
+    let mut conn = TcpStream::connect(server.listeners.tcp).await.unwrap();
+    conn.write_all(&framed(&example(1))).await.unwrap();
+    assert!(read_framed(&mut conn).await.is_some());
+    let started = std::time::Instant::now();
+    assert_eof(&mut conn).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
@@ -772,7 +872,13 @@ async fn a_taken_tcp_port_fails_start_and_leaves_no_udp_listener() {
         unlimited(),
     )
     .await;
-    assert!(result.is_err(), "start must fail when TCP cannot bind");
+    let err = result.err().expect("start must fail when TCP cannot bind");
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(
+        err.to_string()
+            .starts_with(&format!("tcp: cannot start listener on {addr}: ")),
+        "{err}"
+    );
     UdpSocket::bind(addr)
         .await
         .expect("the UDP socket of a failed start must have been released");
@@ -791,7 +897,12 @@ async fn a_taken_udp_port_fails_start() {
         unlimited(),
     )
     .await;
-    assert!(result.is_err());
+    let err = result.err().expect("start must fail when UDP cannot bind");
+    assert!(
+        err.to_string()
+            .starts_with(&format!("udp: cannot start listener on {addr}: ")),
+        "{err}"
+    );
 }
 
 // UDP rate limiting.

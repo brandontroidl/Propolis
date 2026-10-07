@@ -524,7 +524,7 @@ fn a_tls_bind_already_in_use_exits_1_and_leaves_the_plain_ports_unserved() {
     assert_eq!(code, Some(1), "expected exit 1, output: {out}");
     assert!(
         out.contains(&format!(
-            "sensor-dns: cannot start listener on {taken_addr}: "
+            "sensor-dns: dot: cannot start listener on {taken_addr}: "
         )),
         "output: {out}"
     );

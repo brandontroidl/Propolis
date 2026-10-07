@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use sensor_framework::{
     ConnectionBounds, EventEmitter, FloodLedger, PerSourceLimiter, RateLimitConfig,
-    ReplyRateLimiter, TlsServer, WanResolver, default_per_source_cap, run_tcp_listener,
-    run_tls_listener,
+    ReplyRateLimiter, TlsServer, WanResolver, default_per_source_cap, listener_start_error,
+    run_tcp_listener, run_tls_listener,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
@@ -32,6 +32,14 @@ use tokio::task::JoinHandle;
 
 use guarded::ReplySocket;
 use udp::{UdpFlood, UdpSensor};
+
+/// A bind failure naming the transport (`udp`, `tcp` or `dot`) as well as the address, since
+/// one `PROPOLIS_DNS_BIND` starts two listeners and a resolver can hold either. Keeps the
+/// error's kind.
+fn start_error(transport: &str, addr: SocketAddr, error: std::io::Error) -> std::io::Error {
+    let error = listener_start_error(addr, error);
+    std::io::Error::new(error.kind(), format!("{transport}: {error}"))
+}
 
 /// Shared per-listener state handed to every handler.
 #[derive(Clone)]
@@ -90,7 +98,9 @@ pub async fn start_test_server(
     let per_source_cap = default_per_source_cap(bounds.max_concurrent);
     let attempts = if addr.port() == 0 { 8 } else { 1 };
     for attempt in 1..=attempts {
-        let udp = UdpSocket::bind(addr).await?;
+        let udp = UdpSocket::bind(addr)
+            .await
+            .map_err(|e| start_error("udp", addr, e))?;
         let udp_bound = udp.local_addr()?;
         let tcp_addr = SocketAddr::new(addr.ip(), udp_bound.port());
         let tcp_ctx = ctx.clone();
@@ -146,7 +156,7 @@ pub async fn start_test_server(
             }
             Err(e) => {
                 drop(udp);
-                return Err(e);
+                return Err(start_error("tcp", tcp_addr, e));
             }
         }
     }
@@ -178,4 +188,5 @@ pub async fn start_test_server_tls(
         },
     )
     .await
+    .map_err(|e| start_error("dot", addr, e))
 }

@@ -38,8 +38,11 @@ const DEFAULT_LOG_PATH: &str = "/var/log/propolis/dns/events.jsonl";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_DURATION_SECS: u64 = 120;
-/// 64 queries of 4096 bytes: the TCP/DoT bytes read per connection.
-const DEFAULT_MAX_CAPTURED_BYTES: u64 = 262_144;
+/// The TCP/DoT bytes read per connection. Every message charges its 2-byte length prefix too, so
+/// this is exactly enough for a connection's 64 queries at the 4096-byte maximum: 262_272.
+const DEFAULT_MAX_CAPTURED_BYTES: u64 = (sensor_dns::stream::MAX_QUERIES_PER_CONNECTION
+    * (2 + sensor_dns::stream::MAX_TCP_MESSAGE_BYTES))
+    as u64;
 /// Applied separately to the UDP handler pool, the TCP listener and the DoT listener.
 const DEFAULT_MAX_CONCURRENT: u32 = 256;
 /// UDP datagrams answered (and logged one by one) per second per source /24 or /56.
@@ -343,7 +346,7 @@ async fn main() {
     {
         Ok(listeners) => listeners,
         Err(e) => {
-            let e = sensor_framework::listener_start_error(config.bind_addr, e);
+            // `e` already names the transport and the address that failed.
             tracing::error!("sensor-dns: {e}; refusing to start");
             std::process::exit(1);
         }
@@ -367,7 +370,6 @@ async fn main() {
                 }
                 Err(e) => {
                     plain.abort();
-                    let e = sensor_framework::listener_start_error(addr, e);
                     tracing::error!("sensor-dns: {e}; refusing to start");
                     std::process::exit(1);
                 }
@@ -463,7 +465,7 @@ mod tests {
         assert_eq!(c.bounds.read_timeout, Duration::from_millis(30_000));
         assert_eq!(c.bounds.idle_timeout, Duration::from_millis(30_000));
         assert_eq!(c.bounds.max_duration, Duration::from_secs(120));
-        assert_eq!(c.bounds.max_captured_bytes, 262_144);
+        assert_eq!(c.bounds.max_captured_bytes, 262_272);
         assert_eq!(c.bounds.max_concurrent, 256);
         assert_eq!(
             (c.rate.per_source.per_second(), c.rate.per_source.burst()),

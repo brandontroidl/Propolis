@@ -517,7 +517,7 @@ Common per-sensor variables (each uses its own prefix; catchall uses `PROPOLIS_C
 | `<P>READ_TIMEOUT_MS` | no | `30_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
 | `<P>IDLE_TIMEOUT_MS` | no | `60_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
 | `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`; dns `120`) | secs; zero → abort |
-| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (catchall `4_096`; dns `262_144`) | bytes; zero → abort |
+| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (catchall `4_096`; dns `262_272`) | bytes; zero → abort |
 | `<P>MAX_CONCURRENT` | no | `256` (http `512`, tftp `128`) | u32; zero → abort |
 
 The `<P>` rows above, instantiated per sensor (each name is read literally by that sensor's
@@ -565,8 +565,12 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   `PROPOLIS_DNS_MAX_DURATION_SECS`, `PROPOLIS_DNS_MAX_CAPTURED_BYTES`,
   `PROPOLIS_DNS_MAX_CONCURRENT`, `PROPOLIS_DNS_LOG_PATH`, `PROPOLIS_DNS_WAN_MAP`, and the DoT
   variables `PROPOLIS_DNS_TLS_BIND`, `PROPOLIS_DNS_TLS_CERT`, `PROPOLIS_DNS_TLS_KEY` (see "DNS
-  TLS" below). `PROPOLIS_DNS_MAX_CAPTURED_BYTES` bounds the bytes read per TCP or DoT connection
-  (64 queries of 4096 bytes); a UDP datagram is one query and is not counted against it.
+  TLS" below). `PROPOLIS_DNS_MAX_CAPTURED_BYTES` bounds the bytes read per TCP or DoT connection,
+  each message charged its 2-byte length prefix as well as its body: the default
+  `64 * (2 + 4096) = 262_272` (`sensor-dns/src/main.rs#DEFAULT_MAX_CAPTURED_BYTES`) is exactly
+  enough for a connection's 64 queries at the 4096-byte maximum. A message that would pass the
+  cap is not read; the connection ends with a `rejected` event, `reject_reason` `byte_cap`. A UDP
+  datagram is one query and is not counted against it.
   `PROPOLIS_DNS_MAX_CONCURRENT` applies separately to each of the three surfaces: the UDP handler
   pool, the TCP listener and the DoT listener. `PROPOLIS_DNS_BIND` is the only switch and serves
   UDP and TCP on the same `ip:port`: the sensor is off until an operator sets it, and if either

@@ -24,6 +24,7 @@ pub const FLAG_Z: u16 = 0x0040;
 pub const FLAG_AD: u16 = 0x0020;
 pub const FLAG_CD: u16 = 0x0010;
 
+pub const TYPE_SOA: u16 = 6;
 pub const TYPE_TXT: u16 = 16;
 pub const TYPE_OPT: u16 = 41;
 pub const TYPE_RRSIG: u16 = 46;
@@ -33,6 +34,7 @@ pub const TYPE_AXFR: u16 = 252;
 pub const TYPE_ANY: u16 = 255;
 pub const CLASS_IN: u16 = 1;
 pub const CLASS_CH: u16 = 3;
+pub const CLASS_ANY: u16 = 255;
 
 /// Bound on the owner-name walk inside an additional record, so a name of many tiny labels
 /// cannot turn the scan into a long loop.
@@ -130,6 +132,12 @@ pub enum RejectReason {
     /// Produced only by the TCP framing (a length prefix over the message cap), never by
     /// [`parse_query`].
     Oversize,
+    /// TCP framing only: the next message would take the connection past `max_captured_bytes`.
+    ByteCap,
+    /// TCP framing only: the peer closed or failed before the declared body arrived in full.
+    TruncatedBody,
+    /// TCP framing only: the declared body did not arrive within the read timeout.
+    BodyTimeout,
     ResponseInbound,
     Opcode,
     Qdcount,
@@ -138,6 +146,8 @@ pub enum RejectReason {
     NameTooLong,
     TruncatedQuestion,
     AnswerOrAuthorityPresent,
+    /// The one authority record an IXFR request may carry does not parse.
+    MalformedAuthority,
 }
 
 impl RejectReason {
@@ -145,6 +155,9 @@ impl RejectReason {
         match self {
             RejectReason::ShortHeader => "short_header",
             RejectReason::Oversize => "oversize",
+            RejectReason::ByteCap => "byte_cap",
+            RejectReason::TruncatedBody => "truncated_body",
+            RejectReason::BodyTimeout => "body_timeout",
             RejectReason::ResponseInbound => "response_inbound",
             RejectReason::Opcode => "opcode",
             RejectReason::Qdcount => "qdcount",
@@ -153,6 +166,7 @@ impl RejectReason {
             RejectReason::NameTooLong => "name_too_long",
             RejectReason::TruncatedQuestion => "truncated_question",
             RejectReason::AnswerOrAuthorityPresent => "answer_or_authority_present",
+            RejectReason::MalformedAuthority => "malformed_authority",
         }
     }
 }
@@ -217,17 +231,25 @@ pub fn parse_query(msg: &[u8], transport: Transport) -> Result<Query, Rejected> 
             Some(question),
         ));
     }
-    // RFC 1995: an IXFR request carries the client's SOA in the authority section.
-    let ixfr_soa =
-        transport == Transport::Tcp && header.nscount == 1 && question.qtype == TYPE_IXFR;
-    if header.nscount > 0 && !ixfr_soa {
-        return Err(reject(
-            RejectReason::AnswerOrAuthorityPresent,
-            Some(header),
-            Some(question),
-        ));
+    // RFC 1995: an IXFR request carries the client's SOA in the authority section. Only that
+    // shape is admitted: over TCP, an IXFR question, exactly one authority record, an SOA.
+    let mut additional_start = question.end;
+    if header.nscount > 0 {
+        let ixfr =
+            transport == Transport::Tcp && header.nscount == 1 && question.qtype == TYPE_IXFR;
+        let reason = match ixfr.then(|| read_rr(msg, question.end)) {
+            Some(Some(rr)) if rr.rtype == TYPE_SOA => {
+                additional_start = rr.next;
+                None
+            }
+            Some(None) => Some(RejectReason::MalformedAuthority),
+            Some(Some(_)) | None => Some(RejectReason::AnswerOrAuthorityPresent),
+        };
+        if let Some(reason) = reason {
+            return Err(reject(reason, Some(header), Some(question)));
+        }
     }
-    let edns = scan_edns(msg, &header, question.end);
+    let edns = scan_edns(msg, header.arcount, additional_start);
     Ok(Query {
         header,
         question,
@@ -327,6 +349,11 @@ fn read_rr(msg: &[u8], pos: usize) -> Option<Rr> {
             _ => {}
         }
         if b == 0 {
+            // The root's zero byte counts toward the 255, as in `parse_question`.
+            wire += 1;
+            if wire > MAX_NAME_WIRE_LEN {
+                return None;
+            }
             name_end = Some(pos + 1);
             break;
         }
@@ -385,18 +412,14 @@ fn parse_opt(msg: &[u8], rr: &Rr) -> Option<Edns> {
     })
 }
 
-/// Look for the OPT record among the first [`MAX_ADDITIONAL_WALK`] additional records, after
-/// skipping the authority records `parse_query` admitted (none, or an IXFR request's SOA).
-fn scan_edns(msg: &[u8], header: &Header, question_end: usize) -> EdnsScan {
-    let mut pos = question_end;
-    for _ in 0..header.nscount {
-        match read_rr(msg, pos) {
-            Some(rr) => pos = rr.next,
-            None => return EdnsScan::Malformed,
-        }
-    }
+/// Look for the OPT record among the first [`MAX_ADDITIONAL_WALK`] additional records, which
+/// start at `start`: after the question, and after the one SOA an IXFR request may carry
+/// (`parse_query` has already parsed and admitted it, so an authority problem is never reported
+/// here as an EDNS problem).
+fn scan_edns(msg: &[u8], arcount: u16, start: usize) -> EdnsScan {
+    let mut pos = start;
     let mut found = None;
-    for _ in 0..usize::from(header.arcount).min(MAX_ADDITIONAL_WALK) {
+    for _ in 0..usize::from(arcount).min(MAX_ADDITIONAL_WALK) {
         let Some(rr) = read_rr(msg, pos) else {
             return EdnsScan::Malformed;
         };
@@ -776,6 +799,60 @@ mod tests {
     }
 
     #[test]
+    fn ixfr_authority_must_be_an_soa() {
+        let mut msg = with_soa_authority(query(7, 0, &[b"example", b"com"], TYPE_IXFR, 1));
+        // Retype the authority record (owner is the root byte right after the question) as A.
+        let at = query(7, 0, &[b"example", b"com"], TYPE_IXFR, 1).len() + 1;
+        msg[at..at + 2].copy_from_slice(&1u16.to_be_bytes());
+        let r = reason(&msg, Transport::Tcp);
+        assert_eq!(r.reason, RejectReason::AnswerOrAuthorityPresent);
+        assert!(r.header.is_some() && r.question.is_some());
+    }
+
+    #[test]
+    fn a_malformed_ixfr_authority_is_its_own_rejection_not_an_edns_flag() {
+        let full = with_soa_authority(query(7, 0, &[b"example", b"com"], TYPE_IXFR, 1));
+        let r = reason(&full[..full.len() - 1], Transport::Tcp);
+        assert_eq!(r.reason, RejectReason::MalformedAuthority);
+        assert_eq!(r.reason.as_str(), "malformed_authority");
+        assert!(r.header.is_some() && r.question.is_some());
+    }
+
+    /// An additional record owned by `labels`, ARCOUNT bumped.
+    fn with_named_a(msg: &mut Vec<u8>, labels: &[&[u8]]) {
+        for l in labels {
+            msg.push(l.len() as u8);
+            msg.extend_from_slice(l);
+        }
+        msg.push(0);
+        msg.extend(1u16.to_be_bytes());
+        msg.extend(1u16.to_be_bytes());
+        msg.extend(0u32.to_be_bytes());
+        msg.extend(4u16.to_be_bytes());
+        msg.extend([192, 0, 2, 1]);
+        bump_arcount(msg);
+    }
+
+    #[test]
+    fn an_additional_owner_name_counts_its_root_byte_toward_255() {
+        let l = [b'a'; 63];
+        let mut at_255 = example();
+        with_named_a(&mut at_255, &[&l, &l, &l, &[b'b'; 61]]);
+        let at_255 = with_opt(at_255, 4096, false, &[]);
+        assert!(matches!(
+            parse_query(&at_255, Transport::Udp).unwrap().edns,
+            EdnsScan::Present(_)
+        ));
+        let mut at_256 = example();
+        with_named_a(&mut at_256, &[&l, &l, &l, &[b'b'; 62]]);
+        let at_256 = with_opt(at_256, 4096, false, &[]);
+        assert_eq!(
+            parse_query(&at_256, Transport::Udp).unwrap().edns,
+            EdnsScan::Malformed
+        );
+    }
+
+    #[test]
     fn axfr_with_authority_is_rejected_on_tcp() {
         let msg = with_soa_authority(query(7, 0, &[b"example", b"com"], TYPE_AXFR, 1));
         assert_eq!(
@@ -853,8 +930,9 @@ mod tests {
 
     #[test]
     fn opt_beyond_the_eighth_additional_rr_is_not_seen() {
+        // The OPT is the ninth record: exactly one past the walk.
         let mut msg = example();
-        for _ in 0..9 {
+        for _ in 0..8 {
             with_dummy_a(&mut msg);
         }
         let msg = with_opt(msg, 4096, false, &[]);

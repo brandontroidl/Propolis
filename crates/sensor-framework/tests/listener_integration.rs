@@ -409,3 +409,97 @@ async fn per_source_slot_is_released_when_the_connection_ends() {
     }
     handle.abort();
 }
+
+fn probe_event(protocol: &str) -> sensor_wire::SensorEvent {
+    sensor_wire::SensorEvent {
+        v: sensor_wire::WIRE_VERSION,
+        source_ip: "203.0.113.7".parse().unwrap(),
+        wan_ip: None,
+        sensor: "probe".into(),
+        signal_type: sensor_wire::SIGNAL_CATCHALL_PROBE.into(),
+        protocol: protocol.into(),
+        authenticated: false,
+        observed_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
+        sample: None,
+        session_id: None,
+        occurrence_id: None,
+    }
+}
+
+/// Two TCP listeners and a UDP listener writing through ONE emitter, the way a multi-port sensor
+/// is built: each event must carry the port of the listener its connection or datagram arrived
+/// on, never a sibling's. This is the framework's half of the fleet pane's per-listener counts.
+#[tokio::test]
+async fn every_listener_stamps_its_own_port_onto_the_events_its_handler_emits() {
+    use sensor_framework::EventEmitter;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let emitter = Arc::new(EventEmitter::new(log.clone()));
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    let mut tcp = Vec::new();
+    for _ in 0..2 {
+        let emitter = emitter.clone();
+        tcp.push(
+            run_tcp_listener(addr, test_bounds(), None, move |stream, _peer, _id| {
+                let emitter = emitter.clone();
+                async move {
+                    drop(stream);
+                    emitter.append(&probe_event("tcp")).await.unwrap();
+                }
+            })
+            .await
+            .unwrap(),
+        );
+    }
+    let udp_emitter = emitter.clone();
+    let (udp_addr, udp_handle) =
+        run_udp_listener(addr, test_bounds(), None, move |_data, _peer| {
+            let emitter = udp_emitter.clone();
+            async move {
+                emitter.append(&probe_event("udp")).await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+    // One connection to the first listener, two to the second, so a stamp that named the wrong
+    // listener could not produce the right counts by accident.
+    for (i, (bound, _)) in tcp.iter().enumerate() {
+        for _ in 0..=i {
+            let _ = TcpStream::connect(bound).await.unwrap();
+        }
+    }
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.send_to(b"probe", udp_addr).await.unwrap();
+
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let content = tokio::fs::read_to_string(&log).await.unwrap_or_default();
+            if content.lines().count() >= 4 {
+                return content
+                    .lines()
+                    .map(|l| serde_json::from_str::<sensor_wire::SensorEvent>(l).unwrap())
+                    .collect::<Vec<_>>();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all four events should be written");
+
+    let count = |protocol: &str, port: u16| {
+        events
+            .iter()
+            .filter(|e| e.protocol == protocol && e.metadata["local_port"] == port)
+            .count()
+    };
+    assert_eq!(count("tcp", tcp[0].0.port()), 1, "{events:?}");
+    assert_eq!(count("tcp", tcp[1].0.port()), 2, "{events:?}");
+    assert_eq!(count("udp", udp_addr.port()), 1, "{events:?}");
+    for (_, handle) in &tcp {
+        handle.abort();
+    }
+    udp_handle.abort();
+}

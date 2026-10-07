@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use sensor_framework::{
-    ConnectionBounds, EventEmitter, FloodLedger, PerSourceLimiter, RateLimitConfig,
+    Arrival, ConnectionBounds, EventEmitter, FloodLedger, PerSourceLimiter, RateLimitConfig,
     ReplyRateLimiter, TlsServer, WanResolver, default_per_source_cap, listener_start_error,
     run_tcp_listener, run_tls_listener,
 };
@@ -121,6 +121,7 @@ pub async fn start_test_server(
                     ctx: ctx.clone(),
                     reply: ReplySocket::new(socket.clone()),
                     local_ip: udp_bound.ip(),
+                    arrival: Arrival::new(udp_bound.port()),
                 });
                 let semaphore = Arc::new(Semaphore::new(bounds.max_concurrent as usize));
                 let limiter = PerSourceLimiter::new(per_source_cap);

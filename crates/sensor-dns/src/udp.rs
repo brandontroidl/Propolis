@@ -15,7 +15,8 @@ use std::time::Duration;
 use chrono::Utc;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{
-    FloodLedger, FloodSummary, PerSourceLimiter, RateDecision, ReplyRateLimiter, Uuid,
+    Arrival, FloodLedger, FloodSummary, PerSourceLimiter, RateDecision, ReplyRateLimiter, Uuid,
+    arrival,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
@@ -41,6 +42,10 @@ pub(crate) struct UdpSensor {
     /// The address the socket is bound to. UDP offers no per-datagram local address, so WAN
     /// attribution resolves against the bind address (under a wildcard bind, the wildcard).
     pub local_ip: IpAddr,
+    /// The bound port, stamped on every event this surface emits. This socket is not run by
+    /// `run_udp_listener` and its events leave from per-datagram and summary tasks, so the scope
+    /// that listener would have entered is entered here, at each append.
+    pub arrival: Arrival,
 }
 
 /// The UDP surface's rate limiter and the ledger of what it refused.
@@ -156,7 +161,7 @@ impl UdpSensor {
         let (now, now_utc) = (Instant::now(), Utc::now());
         for summary in &summaries {
             let event = rate_limited_event(summary, wan_ip, window, now, now_utc);
-            if let Err(e) = self.ctx.emitter.append(&event).await {
+            if let Err(e) = arrival::scope(self.arrival, self.ctx.emitter.append(&event)).await {
                 tracing::error!(error = %e, "dns: failed to append event");
             }
         }
@@ -209,7 +214,7 @@ impl UdpSensor {
         };
 
         let event = udp_query_event(&record, source_ip, wan_ip, session_id);
-        if let Err(e) = self.ctx.emitter.append(&event).await {
+        if let Err(e) = arrival::scope(self.arrival, self.ctx.emitter.append(&event)).await {
             tracing::error!(error = %e, "dns: failed to append event");
         }
 
@@ -261,6 +266,7 @@ mod tests {
                 },
             },
             local_ip: socket.local_addr().unwrap().ip(),
+            arrival: Arrival::new(socket.local_addr().unwrap().port()),
             reply: ReplySocket::new(socket),
         }
     }

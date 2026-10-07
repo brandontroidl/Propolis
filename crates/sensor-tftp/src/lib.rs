@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
-    CaptureHandoff, CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
-    EventEmitter, OutboxManifest, PerSourceLimiter, QuarantineSpool, WanResolver,
-    default_per_source_cap,
+    Arrival, CaptureHandoff, CaptureMemoryBudget, ConnectionBounds,
+    DEFAULT_CAPTURE_BUDGET_BYTES_256M, EventEmitter, OutboxManifest, PerSourceLimiter,
+    QuarantineSpool, WanResolver, arrival, default_per_source_cap,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
@@ -99,15 +99,26 @@ pub async fn start_test_server_with_handoff(
         local_ip: bound.ip(),
     });
 
-    let handle = tokio::spawn(serve(socket, sensor, semaphore, limiter));
+    let handle = tokio::spawn(serve(
+        socket,
+        Arrival::new(bound.port()),
+        sensor,
+        semaphore,
+        limiter,
+    ));
     Ok((bound, handle, drain_handle))
 }
 
 /// The request loop. This socket only ever receives: replies leave from a per-transfer socket
 /// (`guarded::Transfer`), as RFC 1350 specifies. A request that cannot get a concurrency permit
 /// is dropped unanswered, like any other lost datagram, and the loop keeps draining the socket.
+///
+/// `arrival` is this socket's bound port. Every event of a request, its upload's included, is
+/// stamped with it: the request arrived here even though its transfer runs on its own ephemeral
+/// socket.
 async fn serve(
     socket: UdpSocket,
+    arrival: Arrival,
     sensor: Arc<Sensor>,
     semaphore: Arc<Semaphore>,
     limiter: PerSourceLimiter,
@@ -148,7 +159,10 @@ async fn serve(
         tokio::spawn(async move {
             let _permit = permit;
             let _source_guard = source_guard;
-            let handled = tokio::time::timeout(max_duration, sensor.handle_request(peer, request));
+            let handled = tokio::time::timeout(
+                max_duration,
+                arrival::scope(arrival, sensor.handle_request(peer, request)),
+            );
             if handled.await.is_err() {
                 tracing::warn!(%peer, "tftp: transfer exceeded max_duration; dropped");
             }

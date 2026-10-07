@@ -20,6 +20,7 @@ pub mod listener;
 pub mod logging;
 pub mod outbox;
 pub mod persona;
+pub mod rate_limit;
 pub mod replay;
 pub mod sanitize;
 pub mod shell;
@@ -45,6 +46,9 @@ pub use handoff::{
 pub use listener::{listener_start_error, run_tcp_listener, run_udp_listener, shutdown_signal};
 pub use logging::init_logging;
 pub use outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
+pub use rate_limit::{
+    FloodLedger, FloodSummary, Rate, RateDecision, RateLimitConfig, ReplyRateLimiter, SourceKey,
+};
 pub use sanitize::{sanitize_value, to_hex_bounded};
 pub use spool::{QuarantineSpool, SpoolError};
 pub use tls::{

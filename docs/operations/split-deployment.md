@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Split deployment
@@ -219,7 +219,7 @@ files expect it to match the shipper's. Then:
 
    ```sh
    sudo useradd --system --no-create-home --shell /usr/sbin/nologin --user-group propolis-shipper
-   sudo usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-tftp,propolis-mqtt,propolis-cred propolis-shipper
+   sudo usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-tftp,propolis-mqtt,propolis-dns,propolis-cred propolis-shipper
    sudo install -d -m 0755 -o root -g root /etc/propolis/certs
    sudo install -d -m 0700 -o propolis-shipper -g propolis-shipper /var/lib/propolis/shipper
    ```
@@ -360,7 +360,7 @@ PROPOLIS_FLEET_PROBE_SOURCE_IPS=192.0.2.20
   (`sudo -i` would start you in `/root`, where these relative paths do not exist):
 
   ```sh
-  for bin in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-cred shipper; do
+  for bin in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred shipper; do
       install -m 0755 "target/release/$bin" "/usr/local/bin/$bin"
   done
   ./deploy/provision.sh

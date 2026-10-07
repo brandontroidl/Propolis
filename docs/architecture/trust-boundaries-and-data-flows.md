@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Trust boundaries and data flows
@@ -23,7 +23,7 @@ page is the architectural view that ties them to the data flows.
 | Zone | Trust | What lives here |
 |---|---|---|
 | **Attacker** | Untrusted (hostile) | Any client reaching a sensor port; every byte is adversary-controlled. |
-| **Sensors** | Low-trust, exposed | The 11 sensor crates (14 protocols). Attacker-facing; run unprivileged, egress-free by construction. |
+| **Sensors** | Low-trust, exposed | The 12 sensor crates (15 protocols). Attacker-facing; run unprivileged, egress-free by construction. |
 | **Local channel** | Trusted host | Per-sensor NDJSON log files and the on-disk quarantine spool. One-directional, local storage. |
 | **Datastore** | Trusted | PostgreSQL: the append-only hash-chained ledger and its projections. |
 | **Platform** | Trusted | Intake, scoring, review, feed, malware fetcher, ops-alerting - the processing tier. |
@@ -35,7 +35,7 @@ flowchart LR
     attacker([Attacker<br/>untrusted])
 
     subgraph host[Trusted host]
-        sensors[Sensors<br/>11 crates / 14 protocols<br/>egress-free]
+        sensors[Sensors<br/>12 crates / 15 protocols<br/>egress-free]
         logs[(NDJSON logs<br/>+ quarantine spool)]
         intake[Intake<br/>tail + validate]
         db[(PostgreSQL<br/>append-only ledger<br/>+ projections)]

@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Ports and protocols
@@ -44,10 +44,10 @@ default the binaries carry.
 
 ## Attacker-facing listeners (honeypot)
 
-Eleven sensor crates cover fourteen protocols (the `cred` sensor serves five). All
+Twelve sensor crates cover fifteen protocols (the `cred` sensor serves five). All
 are internet-exposed honeypot listeners with an operator-chosen `ip:port` and no
-default. Every one is TCP except `sensor-tftp` (UDP only) and the UDP half of
-`sensor-catchall`.
+default. Every one is TCP except `sensor-tftp` (UDP only), the UDP half of
+`sensor-dns` and the UDP half of `sensor-catchall`.
 
 | Sensor | Bind env | Protocol(s) | Conventional port | Notes |
 |---|---|---|---|---|
@@ -56,8 +56,9 @@ default. Every one is TCP except `sensor-tftp` (UDP only) and the UDP half of
 | sensor-http | `PROPOLIS_HTTP_BIND` (single); `PROPOLIS_HTTP_TLS_BIND` (single, optional) | HTTP; HTTPS (implicit TLS) | 80; 443 | `crates/sensor-http/src/main.rs#load_config_from_env`. The HTTPS listener runs in the same process and writes the same event log, and exists only when `PROPOLIS_HTTP_TLS_BIND` is set, with `PROPOLIS_HTTP_TLS_CERT` and `PROPOLIS_HTTP_TLS_KEY` (`crates/sensor-http/src/main.rs#parse_tls`). Unit grants `CAP_NET_BIND_SERVICE` for both privileged ports and `ReadOnlyPaths=-/etc/propolis/tls` for the pair. |
 | sensor-ftp | `PROPOLIS_FTP_BIND` (single); `PROPOLIS_FTP_TLS_BIND` (single, optional) | FTP; FTPS (implicit TLS) | 21; 990 | Also opens passive-mode data ports at runtime (see below). `crates/sensor-ftp/src/main.rs#load_config_from_env`. Both listeners run in one process and write one event log; 990 exists only when `PROPOLIS_FTP_TLS_BIND` is set (`crates/sensor-ftp/src/lib.rs#plan_listeners`). With `PROPOLIS_FTP_TLS_CERT` and `PROPOLIS_FTP_TLS_KEY` set, AUTH TLS upgrades the control channel on 21 (otherwise `500`); 990 requires the pair (`crates/sensor-ftp/src/main.rs#tls_paths`). The unit keeps `CAP_NET_BIND_SERVICE` for 21 and 990 and adds `ReadOnlyPaths=-/etc/propolis/tls` for the pair. |
 | sensor-smtp | `PROPOLIS_SMTP_BIND` (single); `PROPOLIS_SMTP_SUBMISSION_BIND` (single, optional); `PROPOLIS_SMTP_TLS_BIND` (single, optional) | SMTP; SMTP submission; SMTP over implicit TLS (SMTPS) | 25; 587; 465 | Missing `PROPOLIS_SMTP_BIND` => error + exit (`crates/sensor-smtp/src/main.rs#main`). All listeners run in one process and write one event log; 587 and 465 exist only when their bind is set (`crates/sensor-smtp/src/lib.rs#plan_listeners`). With `PROPOLIS_SMTP_TLS_CERT` and `PROPOLIS_SMTP_TLS_KEY` set, STARTTLS upgrades sessions on 25 and 587 (otherwise the unchanged `454` reply); 465 requires the pair (`crates/sensor-smtp/src/lib.rs#tls_from_env`). The unit keeps `CAP_NET_BIND_SERVICE` for 25, 465 and 587 and adds `ReadOnlyPaths=-/etc/propolis/tls` for the pair. |
-| sensor-tftp | `PROPOLIS_TFTP_BIND` (single, UDP) | TFTP | 69/udp | Off until set: missing or invalid => error + exit 1, nothing bound (`crates/sensor-tftp/src/main.rs#load_config_from`). The one sensor that replies over UDP, bounded so bytes sent never exceed bytes received. Each transfer answers from its own ephemeral UDP port on the bind IP, so a host firewall must allow replies from, and a client may send to, ports other than 69. Unit grants `CAP_NET_BIND_SERVICE`. |
+| sensor-tftp | `PROPOLIS_TFTP_BIND` (single, UDP) | TFTP | 69/udp | Off until set: missing or invalid => error + exit 1, nothing bound (`crates/sensor-tftp/src/main.rs#load_config_from`). One of the two sensors that reply over UDP, bounded so bytes sent never exceed bytes received. Each transfer answers from its own ephemeral UDP port on the bind IP, so a host firewall must allow replies from, and a client may send to, ports other than 69. Unit grants `CAP_NET_BIND_SERVICE`. |
 | sensor-mqtt | `PROPOLIS_MQTT_BIND` (single); `PROPOLIS_MQTT_TLS_BIND` (single, optional) | MQTT; MQTT over implicit TLS (MQTTS) | 1883; 8883 | Off until set: missing or invalid => error + exit 1, nothing bound (`crates/sensor-mqtt/src/main.rs#load_config_from_env`). It never delivers, retains or forwards a PUBLISH, and spools a payload only when it looks binary. Ports 1883 and 8883 are unprivileged, so the unit grants no `CAP_NET_BIND_SERVICE` (it carries an empty `CapabilityBoundingSet`). It speaks MQTT 3.1, 3.1.1 and 5.0. The TLS listener runs in the same process, shares the plain listener's capture hand-off and budget, writes the same event log, and exists only when `PROPOLIS_MQTT_TLS_BIND` is set, with `PROPOLIS_MQTT_TLS_CERT` and `PROPOLIS_MQTT_TLS_KEY` (`crates/sensor-mqtt/src/main.rs#parse_tls`); the unit adds `ReadOnlyPaths=-/etc/propolis/tls` for the pair. |
+| sensor-dns | `PROPOLIS_DNS_BIND` (single; UDP and TCP); `PROPOLIS_DNS_TLS_BIND` (single, optional) | DNS; DNS over TLS | 53/udp+tcp; 853 | Off until set: missing or invalid => error + exit 1, nothing bound (`crates/sensor-dns/src/main.rs#load_config_from`). One bind serves both transports, and if either cannot bind the sensor exits 1 with nothing left listening. Every query gets REFUSED with nothing appended, so a UDP reply never exceeds the query. The DoT listener runs in the same process, writes the same event log, and exists only when `PROPOLIS_DNS_TLS_BIND` is set, with `PROPOLIS_DNS_TLS_CERT` and `PROPOLIS_DNS_TLS_KEY` (`crates/sensor-dns/src/main.rs#parse_tls`). Unit grants `CAP_NET_BIND_SERVICE` for 53 and 853 and `ReadOnlyPaths=-/etc/propolis/tls` for the pair. Bind the public address: a host resolver stub on port 53 makes a wildcard bind fail [inferred]. |
 | sensor-redis | `PROPOLIS_REDIS_BIND` (single); `PROPOLIS_REDIS_TLS_BIND` (single, optional) | Redis; Redis over implicit TLS (`rediss://`) | 6379; 6380 | `crates/sensor-redis/src/main.rs#load_config_from_env`. The TLS listener runs in the same process and writes the same event log, and exists only when `PROPOLIS_REDIS_TLS_BIND` is set, with `PROPOLIS_REDIS_TLS_CERT` and `PROPOLIS_REDIS_TLS_KEY` (`crates/sensor-redis/src/main.rs#parse_tls`). Both ports are unprivileged: the unit grants no capability, and `ReadOnlyPaths=-/etc/propolis/tls` for the pair. |
 | sensor-adb | `PROPOLIS_ADB_BIND` (single) | ADB | 5555 | `crates/sensor-adb/src/main.rs#load_config_from_env` |
 | sensor-catchall | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list) | TCP + UDP, any port | (multi) | Both TCP and UDP attempted per address. Empty => `ConfigError::NoBindAddrs`, exit. Per-port bind failure is **non-fatal** (logged + skipped, sensor stays up). Unit grants `CAP_NET_BIND_SERVICE`. `crates/sensor-catchall/src/main.rs#parse_bind_addrs`, `crates/sensor-catchall/src/main.rs#main` |
@@ -100,7 +101,7 @@ Each attacker-facing sensor also reads a `*_WAN_MAP` env var (comma-separated
 Not a listener. See [environment-variables.md](environment-variables.md) for the
 exact per-sensor names (`PROPOLIS_SSH_WAN_MAP`, `PROPOLIS_TELNET_WAN_MAP`,
 `PROPOLIS_HTTP_WAN_MAP`, `PROPOLIS_FTP_WAN_MAP`, `PROPOLIS_SMTP_WAN_MAP`, `PROPOLIS_TFTP_WAN_MAP`,
-`PROPOLIS_MQTT_WAN_MAP`, `PROPOLIS_REDIS_WAN_MAP`, `PROPOLIS_ADB_WAN_MAP`, `PROPOLIS_CATCHALL_WAN_MAP`,
+`PROPOLIS_MQTT_WAN_MAP`, `PROPOLIS_DNS_WAN_MAP`, `PROPOLIS_REDIS_WAN_MAP`, `PROPOLIS_ADB_WAN_MAP`, `PROPOLIS_CATCHALL_WAN_MAP`,
 `PROPOLIS_CRED_WAN_MAP`).
 
 `sensor-wire` is a decoder/library crate with no network listener [inferred: no
@@ -175,11 +176,13 @@ are **not** compiled-in defaults - each is set by the operator in
 | 22 | attacker | SSH | `PROPOLIS_SSH_BIND` |
 | 23 | attacker | Telnet | `PROPOLIS_TELNET_BIND` |
 | 25 | attacker | SMTP | `PROPOLIS_SMTP_BIND` |
+| 53 (UDP+TCP) | attacker | DNS | `PROPOLIS_DNS_BIND` |
 | 69 (UDP) | attacker | TFTP (transfers continue on ephemeral UDP ports) | `PROPOLIS_TFTP_BIND` |
 | 80 | attacker | HTTP | `PROPOLIS_HTTP_BIND` |
 | 443 | attacker | HTTPS (http, implicit TLS) | `PROPOLIS_HTTP_TLS_BIND` |
 | 465 | attacker | SMTPS (smtp, implicit TLS) | `PROPOLIS_SMTP_TLS_BIND` |
 | 587 | attacker | SMTP submission (smtp, plain + STARTTLS) | `PROPOLIS_SMTP_SUBMISSION_BIND` |
+| 853 | attacker | DNS over TLS (dns, implicit TLS) | `PROPOLIS_DNS_TLS_BIND` |
 | 990 | attacker | FTPS (ftp, implicit TLS) | `PROPOLIS_FTP_TLS_BIND` |
 | 1433 | attacker | MSSQL (cred, plain + in-band TLS) | `PROPOLIS_CRED_MSSQL_BIND` |
 | 1883 | attacker | MQTT | `PROPOLIS_MQTT_BIND` |

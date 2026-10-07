@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Security reviewer manual
@@ -62,7 +62,7 @@ Every boundary where untrusted or externally reachable data enters or leaves, an
 control that contains each, is owned by [attack surfaces](../security/attack-surfaces.md).
 The inbound and outbound surfaces:
 
-- **Sensor listeners** (11 crates / 14 protocols, no compiled-in default port): never-execute,
+- **Sensor listeners** (12 crates / 15 protocols, no compiled-in default port): never-execute,
   boundary `sanitize_value` on every attacker string, no HTTP client in the sensor closure,
   credential drop-at-parse. See [input handling](../security/input-handling.md) and
   [sample and credential privacy](../security/sample-and-credential-privacy.md).
@@ -115,7 +115,7 @@ Stated plainly and owned by [residual risks](../security/residual-risks.md):
   tightened per-binary seccomp allowlist - treat the syscall sandbox as effectively absent
   until an operator derives it.
 - **No in-process TLS on the console** - the console is plain HTTP; any transport encryption is
-  operator-provided. (Six sensors do serve TLS on their attacker-facing ports; that is honeypot
+  operator-provided. (Seven sensors do serve TLS on their attacker-facing ports; that is honeypot
   fidelity, not operator transport security.)
 - The `noexec,nosuid,nodev` spool mounts are printed as fstab guidance, not enforced from
   source - whether they are mounted on a given box is not verifiable from the code.

@@ -1,7 +1,7 @@
 # Propolis
 
 Propolis is a self-hosted honeypot for collecting and reviewing hostile network traffic.
-It includes native sensors for SSH, Telnet, HTTP, FTP, SMTP, TFTP, MQTT, Redis, ADB,
+It includes native sensors for SSH, Telnet, HTTP, FTP, SMTP, TFTP, MQTT, Redis, ADB, DNS,
 VNC, MySQL, MSSQL, PostgreSQL, and MongoDB, plus a silent catch-all listener that records probes on
 whatever other TCP and UDP ports you point it at.
 

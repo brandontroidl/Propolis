@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Startup and config failures
@@ -54,7 +54,7 @@ Values and the full required/optional matrix:
 Two parse idioms exist and they are **not uniform**:
 
 - **Strict** (unified daemon, `intake`, `review`, `feed`, `console`, and sensors
-  `ssh`/`telnet`/`http`/`ftp`/`tftp`/`mqtt`/`redis`/`adb`/`catchall`): a present-but-invalid or
+  `ssh`/`telnet`/`http`/`ftp`/`tftp`/`mqtt`/`dns`/`redis`/`adb`/`catchall`): a present-but-invalid or
   present-but-zero numeric bound **aborts startup**. Zero is rejected on most
   bounds because "zero never means unlimited"
   (`parse_positive_u64`, `crates/propolis/src/config.rs#parse_positive_u64`). A few bounds allow 0 with a defined
@@ -89,7 +89,7 @@ A sensor or the console fails to bind when the port is already held. Causes:
   `sensor-ssh` is also bound to `0.0.0.0:22`). Move the real service or the sensor.
 - Privileged ports (< 1024): the sensor units that need them carry
   `AmbientCapabilities=CAP_NET_BIND_SERVICE`
-  (catchall/ssh/telnet/http/ftp/smtp/tftp); redis/adb/cred have no privileged-port
+  (catchall/ssh/telnet/http/ftp/smtp/tftp/dns); redis/adb/mqtt/cred have no privileged-port
   capability by design. If you rebind one of the no-capability sensors to a
   port < 1024 it will fail to bind. The console binds unprivileged `8080` and
   needs no capability.

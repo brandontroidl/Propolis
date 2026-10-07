@@ -4,7 +4,7 @@ audience: evaluator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Evaluator manual
@@ -24,7 +24,7 @@ reports. It is defensive tooling for infrastructure you own or are authorized to
 monitor.
 
 - Full framing: [`../overview/index.md`](../overview/index.md)
-- Feature inventory (11 sensor crates / 14 protocols, scoring, feed, console,
+- Feature inventory (12 sensor crates / 15 protocols, scoring, feed, console,
   opt-in enrichment): [`../overview/capabilities.md`](../overview/capabilities.md)
 - What it deliberately is **not** (not an IDS/IPS, not SaaS, not offensive, not
   fully egress-free): [`../overview/non-goals.md`](../overview/non-goals.md)
@@ -35,7 +35,7 @@ Read this before forming an opinion - the version signals diverge and the
 marketing-grade claims are called out where they are not source-evidenced.
 
 - **Source-available and actively developed; not certified or
-  production-blessed.** Crate version is `0.4.0` (six newer crates are at `0.1.0`), but
+  production-blessed.** Crate version is `0.4.0` (six crates are still at `0.1.0`), but
   the only release tag is `v0.1.0` - the current tree is untagged, roughly three
   unpublished minor bumps past the tag. `CHANGELOG.md` is a single undated
   `## Unreleased` section. Details, plus which subsystems are substantial vs

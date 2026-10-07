@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Residual risks
@@ -31,7 +31,7 @@ bounding, address-family restriction) still apply. See
 ## No in-process TLS on the console
 
 The console serves plain HTTP on a `TcpListener` (`console::server::serve`, HTTP/1.1, no rustls). It
-has no built-in TLS; the only in-process TLS in the platform is on six sensors' attacker-facing
+has no built-in TLS; the only in-process TLS in the platform is on seven sensors' attacker-facing
 ports, which protects nothing of the operator's. Confidentiality and integrity for
 console traffic beyond loopback depend entirely on an operator-provided reverse
 proxy. Do not assume transport encryption exists unless you configured it.

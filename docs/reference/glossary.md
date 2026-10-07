@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Glossary
@@ -22,7 +22,7 @@ what connects to them.
 
 ### Sensor
 
-An attacker-facing decoy service. There are 11 sensor crates covering 14
+An attacker-facing decoy service. There are 12 sensor crates covering 15
 protocols (the `cred` sensor alone serves VNC/MySQL/MSSQL/PostgreSQL/MongoDB).
 Each sensor runs as its own OS process, binds a configured address, and writes
 NDJSON event logs; it holds no HTTP client and makes no outbound requests (see

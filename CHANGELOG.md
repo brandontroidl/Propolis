@@ -4,6 +4,31 @@
 
 ### Added
 
+- **DNS honeypot sensor (default off)** - new crate and binary `sensor-dns`. `PROPOLIS_DNS_BIND`
+  serves DNS over UDP and TCP on the same address (conventionally 53); if either transport cannot
+  bind, the sensor exits 1 with nothing left listening. `PROPOLIS_DNS_TLS_BIND` adds DNS over TLS
+  (conventionally 853) with `PROPOLIS_DNS_TLS_CERT` and `PROPOLIS_DNS_TLS_KEY`, under the same
+  fail-closed rules as the other TLS sensors. It serves no records: every query that parses gets
+  REFUSED, the query's header rewritten (ID kept, RD and CD copied) and its first question echoed,
+  nothing appended, so a UDP reply is never larger than its query; the crate's one UDP `send_to`
+  re-checks that with a byte budget and refuses unspecified, broadcast and multicast sources and
+  the source ports 0, 7, 13, 17, 19 and 37 (recorded as `suppressed`). A message with QR set, a
+  non-zero opcode (NOTIFY, UPDATE), QDCOUNT other than 1, a compression pointer or bad label in
+  the question, a name over 255 bytes, a truncated question, or an answer or authority record
+  (except the SOA of an IXFR over TCP) is recorded as `rejected` and gets no reply; on TCP and DoT
+  it also closes the connection, as does a length prefix under 12 or over 4096. A connection
+  carries at most 64 queries. A UDP query is a `honeypot_connection` over `udp`; a TCP or DoT
+  connection is one `honeypot_connection` plus one `honeypot_command_exec` per query, with
+  `command` `"<QTYPE> <qname>"`. Metadata records the header, the question (qname in escaped
+  presentation form, sanitized), the EDNS buffer size, DO bit and option codes (never option
+  data), and `probe_signals`: `amplification_probe`, `open_resolver_probe`,
+  `zone_transfer_probe`, `chaos_fingerprint_probe`. DoT events carry `"tls": true`. The unit
+  `deploy/sensor-dns.service` grants `CAP_NET_BIND_SERVICE` and
+  `ReadOnlyPaths=-/etc/propolis/tls`; `provision.sh` creates `propolis-dns` and its log
+  directory, `provision-tls.sh` mints a `dns` pair, and the fleet inventory derives
+  `dns/udp/<port>` and `dns/tcp/<port>` from the one bind plus `dns/tcp/<port>` from the TLS
+  bind. Known fingerprint costs: no OPT record is returned even when the query carried one, and
+  a denied zone transfer gets REFUSED, which some real servers answer with NOTAUTH.
 - **`sensor-cred` PostgreSQL answers a GSSENCRequest with `N`** - libpq sends a GSSENCRequest
   (code 80877104) before anything else when built with GSSAPI, and a real server without GSS
   encryption answers one `N` byte and keeps reading. The sensor did not handle it, so such a client

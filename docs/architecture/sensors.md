@@ -4,12 +4,12 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Sensor architecture
 
-Propolis captures attacker activity through **eleven sensor crates covering fourteen
+Propolis captures attacker activity through **twelve sensor crates covering fifteen
 emulated protocols**, plus one protocol-agnostic passive listener. Every sensor is
 a thin protocol front-end built on one shared crate, `sensor-framework`, which owns
 the parts that must behave identically everywhere: the listener, connection bounds,
@@ -87,8 +87,8 @@ defaults, and the two sensors that fall back to defaults instead of refusing
 
 ### Server-side TLS
 
-Six of the eleven sensors terminate TLS in-process (http, redis, mqtt, smtp, ftp, cred); ssh,
-telnet, adb, tftp and catchall do not. The framework owns the shared parts in
+Seven of the twelve sensors terminate TLS in-process (http, redis, mqtt, smtp, ftp, cred, dns);
+ssh, telnet, adb, tftp and catchall do not. The framework owns the shared parts in
 `crates/sensor-framework/src/tls.rs`: a fail-closed loader for one certificate and key per sensor
 (`crates/sensor-framework/src/tls.rs#load_server_config`), an implicit-TLS listener that wraps
 the plain listener's bounds so the per-source cap, the global limit and the session cap apply
@@ -100,7 +100,7 @@ and TLS. No client certificate is ever requested.
 
 Three modes, chosen per protocol:
 
-- **Implicit** (http 443, redis 6380, mqtt 8883, smtp 465, ftp 990): a second listener in the
+- **Implicit** (http 443, redis 6380, mqtt 8883, smtp 465, ftp 990, dns 853): a second listener in the
   same process, started only when its `*_TLS_BIND` variable is set.
 - **STARTTLS** (smtp `STARTTLS`, ftp `AUTH TLS`): the plain listener upgrades in place after the
   command, and refuses plaintext pipelined behind it.
@@ -151,15 +151,16 @@ See [`security/input-handling.md`](../security/input-handling.md).
 Only these sensors write captured file *bodies* to disk - **SSH, FTP, ADB, TFTP**,
 Telnet when its shell phase sees a binary payload, and MQTT when a PUBLISH payload looks
 binary (`crates/sensor-mqtt/src/handler.rs#on_publish`).
-Redis, HTTP, SMTP, cred, and catchall capture metadata only and never spool a
+Redis, HTTP, SMTP, cred, DNS, and catchall capture metadata only and never spool a
 body (confirmed by the absence of `QuarantineSpool`/`CaptureHandoff` in those crates).
 MQTT always records a PUBLISH as metadata (topic, QoS, length, a bounded preview and a SHA-256
 of the payload), spools the payload only when it passes the shared `looks_binary` gate, and
 never delivers, retains, or forwards the message
 (see [sensor behavior](../reference/sensor-behavior.md#sensor-mqtt)).
-TFTP is the one sensor that answers over UDP; its replies are bounded so that bytes sent
-never exceed bytes received, which is why it does not use the framework's receive-only
-UDP listener (see [sensor behavior](../reference/sensor-behavior.md#sensor-tftp)).
+TFTP and DNS are the two sensors that answer over UDP; both bound their replies so bytes sent
+never exceed bytes received, which is why neither uses the framework's receive-only UDP
+listener (see [sensor-tftp](../reference/sensor-behavior.md#sensor-tftp) and
+[sensor-dns](../reference/sensor-behavior.md#sensor-dns)).
 
 For the spooling sensors the path is deliberately **off the connection's reply
 path**, for covertness - response latency must not leak whether a capture happened:
@@ -217,13 +218,14 @@ types and the signal vocabulary are owned by
 - **`sensor-cred`** is one binary with one listener per configured database/remote
   protocol - **VNC, MySQL, MSSQL, PostgreSQL, MongoDB**. Each speaks just enough of
   its handshake to elicit a credential attempt, drops the credential, and emits a
-  login attempt. This is why eleven crates cover fourteen protocols.
+  login attempt. This is why twelve crates cover fifteen protocols.
 
 ## Never-serve-outbound
 
 No sensor fetches or serves attacker-directed content: FTP `RETR`→550 and
-`PORT/EPRT`→502, ADB sync `RECV`→FAIL, SSH `direct-tcpip` refused, catchall and all
-UDP never respond, and shell `wget`/`curl` are canned
+`PORT/EPRT`→502, ADB sync `RECV`→FAIL, SSH `direct-tcpip` refused, catchall never
+responds, the two UDP sensors that reply send only a tiny TFTP error or ACK and a DNS
+REFUSED with no record, and shell `wget`/`curl` are canned
 (`sensor-wire`/handler evidence, cross-cutting). This invariant is part of the trust
 boundary; see
 [`security/attack-surfaces.md`](../security/attack-surfaces.md) and

@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Filesystem paths
@@ -30,6 +30,7 @@ sensor appends newline-delimited JSON events.
 | smtp | `PROPOLIS_SMTP_LOG_PATH` | `/var/log/propolis/smtp/events.jsonl` (`sensor-smtp/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/smtp` (`deploy/provision.sh#ensure_dir /var/log/propolis/smtp`) |
 | tftp | `PROPOLIS_TFTP_LOG_PATH` | `/var/log/propolis/tftp/events.jsonl` (`sensor-tftp/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/tftp` (`deploy/provision.sh#ensure_dir /var/log/propolis/tftp`) |
 | mqtt | `PROPOLIS_MQTT_LOG_PATH` | `/var/log/propolis/mqtt/events.jsonl` (`sensor-mqtt/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/mqtt` (`deploy/provision.sh#ensure_dir /var/log/propolis/mqtt`) |
+| dns | `PROPOLIS_DNS_LOG_PATH` | `/var/log/propolis/dns/events.jsonl` (`sensor-dns/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/dns` (`deploy/provision.sh#ensure_dir /var/log/propolis/dns`) |
 | redis | `PROPOLIS_REDIS_LOG_PATH` | `/var/log/propolis/redis/events.jsonl` (`sensor-redis/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/redis` (`deploy/provision.sh#ensure_dir /var/log/propolis/redis`) |
 | adb | `PROPOLIS_ADB_LOG_PATH` | `/var/log/propolis/adb/events.jsonl` (`sensor-adb/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/adb` (`deploy/provision.sh#ensure_dir /var/log/propolis/adb`) |
 | catchall | `PROPOLIS_CATCHALL_LOG_PATH` | **`catchall-events.jsonl`** (relative, not absolute) (`sensor-catchall/src/main.rs#DEFAULT_LOG_PATH`) | `/var/log/propolis/catchall` (`deploy/provision.sh#ensure_dir /var/log/propolis/catchall`) |
@@ -67,7 +68,7 @@ event logs.
 
 - The fetcher output dir has a global byte budget of 1_000_000_000 bytes
   (`FETCH_SPOOL_GLOBAL_BUDGET`, `crates/propolis/src/main.rs#FETCH_SPOOL_GLOBAL_BUDGET`).
-- **smtp, redis, http, cred** have **no** spool dir (no `*_SPOOL_DIR` env);
+- **smtp, redis, http, cred, dns** have **no** spool dir (no `*_SPOOL_DIR` env);
   they capture inline only. Telnet spools only when the shell phase sees a
   binary payload (a Mirai/Gafgyt dropper), never the login/password phase. MQTT
   spools only a PUBLISH payload that passes the `looks_binary` gate, never a text one.
@@ -101,15 +102,16 @@ for the full variable reference.
 
 ## TLS material (per sensor)
 
-Self-signed certificate and key per TLS-capable sensor (http, mqtt, redis, smtp, ftp, cred),
-minted by `deploy/provision-tls.sh` (`deploy/provision-tls.sh#TLS_SENSORS`). All six read their
-pair (`PROPOLIS_HTTP_TLS_CERT` and `PROPOLIS_HTTP_TLS_KEY`, `PROPOLIS_MQTT_TLS_CERT` and
+Self-signed certificate and key per TLS-capable sensor (http, mqtt, redis, smtp, ftp, cred,
+dns), minted by `deploy/provision-tls.sh` (`deploy/provision-tls.sh#TLS_SENSORS`). All seven read
+their pair (`PROPOLIS_HTTP_TLS_CERT` and `PROPOLIS_HTTP_TLS_KEY`, `PROPOLIS_MQTT_TLS_CERT` and
 `PROPOLIS_MQTT_TLS_KEY`, `PROPOLIS_REDIS_TLS_CERT` and `PROPOLIS_REDIS_TLS_KEY`,
 `PROPOLIS_SMTP_TLS_CERT` and `PROPOLIS_SMTP_TLS_KEY`, `PROPOLIS_FTP_TLS_CERT` and
-`PROPOLIS_FTP_TLS_KEY`, `PROPOLIS_CRED_TLS_CERT` and `PROPOLIS_CRED_TLS_KEY`, through the
-read-only `ReadOnlyPaths=-/etc/propolis/tls` in `deploy/sensor-http.service`,
+`PROPOLIS_FTP_TLS_KEY`, `PROPOLIS_CRED_TLS_CERT` and `PROPOLIS_CRED_TLS_KEY`,
+`PROPOLIS_DNS_TLS_CERT` and `PROPOLIS_DNS_TLS_KEY`, through the read-only
+`ReadOnlyPaths=-/etc/propolis/tls` in `deploy/sensor-http.service`,
 `deploy/sensor-mqtt.service`, `deploy/sensor-redis.service`, `deploy/sensor-smtp.service`,
-`deploy/sensor-ftp.service` and `deploy/sensor-cred.service`). The leading `-` makes the directory
+`deploy/sensor-ftp.service`, `deploy/sensor-cred.service` and `deploy/sensor-dns.service`). The leading `-` makes the directory
 optional to systemd, so a unit still starts where it is absent; a configured pair that cannot be
 read refuses to start in-process. See [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 

@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Overview
@@ -42,7 +42,7 @@ Such a source is never reported to a vendor on volume alone. The exact rule is i
   inline.
 - Not multi-tenant and not a hosted service.
 - Not an offensive tool. Captured payloads are stored and may be looked up, never run.
-- No TLS on the console. It is plain HTTP on loopback; put a proxy in front. Six of the eleven
+- No TLS on the console. It is plain HTTP on loopback; put a proxy in front. Seven of the twelve
   sensors do terminate TLS themselves on their attacker-facing ports (see
   [networking and TLS](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners)).
 

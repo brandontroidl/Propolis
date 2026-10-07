@@ -4,7 +4,7 @@ audience: deployer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Installation
@@ -26,9 +26,9 @@ cargo build --release
 ```
 
 This produces the release binaries in `target/release/`: `propolis` plus the
-eleven sensor binaries `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
+twelve sensor binaries `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
 `sensor-redis`, `sensor-adb`, `sensor-http`, `sensor-ftp`, `sensor-smtp`,
-`sensor-tftp`, `sensor-mqtt`, `sensor-cred` (`deploy/install.sh#4/9 installing binaries to /usr/local/bin`). `install.sh` errors if any expected
+`sensor-tftp`, `sensor-mqtt`, `sensor-dns`, `sensor-cred` (`deploy/install.sh#4/9 installing binaries to /usr/local/bin`). `install.sh` errors if any expected
 source binary is missing or non-executable, so build before you install
 (`deploy/install.sh#not found or not executable`). The build host must have the pinned Rust
 toolchain (`1.96.1`, `rust-toolchain.toml`); see
@@ -63,11 +63,11 @@ points provision identically, `deploy/install.sh#run_provision`); steps 4-9 run 
 
 | Step | Action | Cite |
 |---|---|---|
-| 1/9 | Creates 12 system users (`propolis` + one per each of the eleven sensors) with `useradd --system --no-create-home --shell /usr/sbin/nologin --user-group`, then adds `propolis` to each sensor's group so the daemon can read group-readable sensor logs | `deploy/provision.sh#ensure_user`, `deploy/provision.sh#usermod -aG` |
+| 1/9 | Creates 13 system users (`propolis` + one per each of the twelve sensors) with `useradd --system --no-create-home --shell /usr/sbin/nologin --user-group`, then adds `propolis` to each sensor's group so the daemon can read group-readable sensor logs | `deploy/provision.sh#ensure_user`, `deploy/provision.sh#usermod -aG` |
 | 2/9 | Creates config/log/state directories with specific owners and modes (see [../reference/filesystem-paths.md](../reference/filesystem-paths.md)) | `deploy/provision.sh#2/9 creating directories` |
 | 3/9 | Creates spool mountpoints; **prints fstab guidance for the `noexec,nosuid,nodev` mounts but does not create them** | `deploy/provision.sh#3/9 creating spool directories (mountpoints only)`, fstab guidance `deploy/install.sh#NOT DONE BY THIS SCRIPT` |
 | 4/9 | `install -m 0755` each binary to `/usr/local/bin/`, then mints the per-sensor self-signed TLS pairs into `/etc/propolis/tls` with `deploy/provision-tls.sh` (idempotent; needs the release `provision-certs` binary, so it runs after the build, not inside `provision.sh`). Minting turns nothing on: a sensor uses its pair only once its TLS variables are set; see [networking-tls.md](networking-tls.md#sensor-tls-attacker-facing-listeners) | `deploy/install.sh#4/9 installing binaries to /usr/local/bin`, `deploy/install.sh#run_provision_tls` |
-| 5/9 | `install -m 0644` the 12 production units (`propolis.service` and the 11 sensor units) to `/etc/systemd/system/` | `deploy/install.sh#5/9 installing systemd units` |
+| 5/9 | `install -m 0644` the 13 production units (`propolis.service` and the 12 sensor units) to `/etc/systemd/system/` | `deploy/install.sh#5/9 installing systemd units` |
 | 6/9 | Installs `logrotate-sensors.conf` to `/etc/logrotate.d/propolis-sensors` | `deploy/install.sh#6/9 installing logrotate config` |
 | 7/9 | Derives the fleet listener inventory from the sensors' own bind variables (`deploy/fleet-listeners.sh`) | `deploy/install.sh#7/9 deriving the fleet listener inventory` |
 | 8/9 | Records the deploy stamp (commit this box last deployed) for the console's fleet pane (`deploy/deploy-stamp.sh`) | `deploy/install.sh#8/9 recording the deploy stamp` |
@@ -98,7 +98,7 @@ You must author the
 
 ## 3. Systemd units
 
-`install.sh` installs 12 production units to `/etc/systemd/system/` (`deploy/install.sh#for unit in propolis.service`):
+`install.sh` installs 13 production units to `/etc/systemd/system/` (`deploy/install.sh#for unit in propolis.service`):
 
 - **`propolis.service`** - the unified daemon: `Type=simple`, `User=propolis`,
   `EnvironmentFile=/etc/propolis/propolis.env`, `ExecStart=/usr/local/bin/propolis`,
@@ -107,7 +107,7 @@ You must author the
   daemon's internal supervisor restarts a panicked subsystem in-process, so a
   full process exit only ever means a fail-fast (bad config / DB unreachable /
   migration failure) or an operator stop (`deploy/propolis.service#Restart=on-failure`).
-- **Eleven `sensor-*.service` units** - `Type=simple`, per-sensor `User`/`Group`,
+- **Twelve `sensor-*.service` units** - `Type=simple`, per-sensor `User`/`Group`,
   `EnvironmentFile=/etc/propolis/<name>.env`, `ExecStart=/usr/local/bin/sensor-<name>`,
   `Restart=always`, `RestartSec=10` (`deploy/sensor-ssh.service` is the
   reference unit).
@@ -124,11 +124,11 @@ and a supplementary hardening block). Two important caveats:
 > close, not a delivered control.
 
 Capability grants differ per sensor: sensors that bind privileged ports
-(catchall/ssh/telnet/http/ftp/smtp/tftp) get `AmbientCapabilities=CAP_NET_BIND_SERVICE`;
+(catchall/ssh/telnet/http/ftp/smtp/tftp/dns) get `AmbientCapabilities=CAP_NET_BIND_SERVICE`;
 redis/adb/mqtt/cred and the unified daemon carry an empty `CapabilityBoundingSet`
 (no privileged port: MQTT's 1883 and 8883 and Redis's 6379 and 6380 are unprivileged, and
-sensor-cred's TLS shares its plain ports). http, ftp and smtp keep the capability for their TLS
-ports too (443; 990; 465 and 587). The full per-sensor cap/resource table lives in the
+sensor-cred's TLS shares its plain ports). http, ftp, smtp and dns keep the capability for their
+TLS ports too (443; 990; 465 and 587; 853). The full per-sensor cap/resource table lives in the
 evidence and in [../reference/ports-and-protocols.md](../reference/ports-and-protocols.md).
 
 The **standalone** `intake`/`review`/`feed`/`console` units are not installed by

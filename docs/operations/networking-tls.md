@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Networking and TLS
@@ -18,7 +18,7 @@ page explains exposure and operator responsibilities.
 
 | Class | Components | Default binding |
 |---|---|---|
-| Attacker-facing | the eleven sensors (ssh, telnet, http, ftp, smtp, tftp, mqtt, redis, adb, catchall, cred) | operator-chosen `ip:port` per sensor - **no code default** |
+| Attacker-facing | the twelve sensors (ssh, telnet, http, ftp, smtp, tftp, mqtt, dns, redis, adb, catchall, cred) | operator-chosen `ip:port` per sensor - **no code default** |
 | Operator-facing | console web UI (and `/health`, `/ready`, `/metrics` on the same port) | `127.0.0.1:8080` (loopback) |
 | No listener | `intake`, `review`, `feed`, and the unified daemon's fetcher | none (DB clients / outbound-only) |
 
@@ -62,7 +62,7 @@ too - front them with authentication at the proxy. Route ownership is in
 > `console::server::serve` on a plain `tokio::net::TcpListener`
 > (`crates/console/src/server.rs`) - there is no rustls or other TLS
 > setup in the console code. Do not assume the console terminates TLS itself.
-> The attacker-facing sensors are different: six of them terminate TLS in-process, see
+> The attacker-facing sensors are different: seven of them terminate TLS in-process, see
 > [Sensor TLS](#sensor-tls-attacker-facing-listeners).
 >
 > The console does bound its own connections whether or not a proxy is in
@@ -101,8 +101,8 @@ HTTPS, MQTTS and the other encrypted variants of the protocols they imitate.
 
 ### Overview
 
-Six sensors speak TLS: `sensor-http`, `sensor-redis`, `sensor-mqtt`, `sensor-smtp`,
-`sensor-ftp` and `sensor-cred`. The others (ssh, telnet, adb, tftp, catchall) read no TLS
+Seven sensors speak TLS: `sensor-http`, `sensor-redis`, `sensor-mqtt`, `sensor-smtp`,
+`sensor-ftp`, `sensor-cred` and `sensor-dns`. The others (ssh, telnet, adb, tftp, catchall) read no TLS
 variable. Every TLS surface is off until the operator sets its variables, and none has a
 compiled-in default. The shared pieces live in the sensor framework
 (`crates/sensor-framework/src/tls.rs`): a fail-closed loader
@@ -135,6 +135,7 @@ Ports are the deploy conventions from `deploy/sensor.env.example`; the code has 
 | `sensor-cred` | 3306 | in-band (MySQL `CLIENT_SSL`) | `PROPOLIS_CRED_MYSQL_BIND` (plain listener) | the cred pair |
 | `sensor-cred` | 1433 | in-band (MSSQL TLS inside TDS PRELOGIN) | `PROPOLIS_CRED_MSSQL_BIND` (plain listener) | the cred pair |
 | `sensor-cred` | 27017 | sniff (MongoDB, first two bytes) | `PROPOLIS_CRED_MONGO_BIND` (plain listener) | the cred pair |
+| `sensor-dns` | 853 | implicit (DNS over TLS, RFC 7858) | `PROPOLIS_DNS_TLS_BIND` | `PROPOLIS_DNS_TLS_CERT`, `PROPOLIS_DNS_TLS_KEY` |
 
 Common to every row:
 
@@ -153,7 +154,7 @@ Common to every row:
   MSSQL the connection event is written before negotiation and stays untagged; for MongoDB every
   event of a TLS session is tagged.
 - **Plaintext clients** keep working on every plain listener with the pair set.
-- **Capabilities.** http (80, 443), ftp (21, 990) and smtp (25, 465, 587) keep
+- **Capabilities.** http (80, 443), ftp (21, 990), smtp (25, 465, 587) and dns (53, 853) keep
   `CAP_NET_BIND_SERVICE`; redis, mqtt and cred grant none, since all their ports are unprivileged.
 
 Variables are owned by [environment-variables.md](../reference/environment-variables.md); replies
@@ -163,7 +164,7 @@ and per-protocol behavior by [sensor-behavior.md](../reference/sensor-behavior.m
 
 Each TLS-capable sensor gets its own self-signed certificate and key, minted at deploy time
 by `provision-certs --sensor-tls` (`crates/provision-certs/src/lib.rs#provision_sensor_tls`,
-driven by `deploy/provision-tls.sh#TLS_SENSORS`: http, mqtt, redis, smtp, ftp, cred). The
+driven by `deploy/provision-tls.sh#TLS_SENSORS`: http, mqtt, redis, smtp, ftp, cred, dns). The
 common name and only subject alternative name of every certificate is `localhost`
 (`crates/provision-certs/src/lib.rs#SENSOR_TLS_COMMON_NAME`), fixed so that a deploy host's
 name never appears in a certificate anyone can fetch by connecting to the port. The private
@@ -190,7 +191,7 @@ key by exact name, while without the read bit nobody can list which sensors have
 ### Enable TLS on one sensor
 
 Minting a pair turns nothing on. The steps below use sensor-http (HTTPS on 443); the variable
-names for the other five are in [TLS surfaces](#tls-surfaces). A sensor's env file is
+names for the other six are in [TLS surfaces](#tls-surfaces). A sensor's env file is
 `/etc/propolis/<sensor>.env` with the sensor name as in the unit without the `sensor-` prefix
 (`http.env` for `sensor-http.service`).
 
@@ -231,7 +232,8 @@ Check all four, in this order:
 
 - **Listening.** `sudo ss -ltn 'sport = :443'` shows a `LISTEN` socket on the bind address.
 - **Journal.** `journalctl -u sensor-http -n 20` shows no `refusing to start` line and, for
-  http, redis and mqtt, `sensor-http: listening (tls)` with the bound address. sensor-smtp and
+  http, redis, mqtt and dns, `sensor-http: listening (tls)` (`sensor-dns: listening (tls)` and
+  so on) with the bound address. sensor-smtp and
   sensor-ftp log one `listening` line per bound listener, so the TLS bind appears as a second or
   third line; sensor-cred logs `TLS enabled for postgresql, mysql, ...` naming the protocols
   that have a bind.
@@ -257,7 +259,7 @@ the level.
 
 Replace the self-signed pair with a certificate your clients can verify. The files go at the same
 paths (`/etc/propolis/tls/<sensor>.crt` and `<sensor>.key`) with the same owner and modes as the
-minted pair; `SENSOR` is `http`, `redis`, `mqtt`, `smtp`, `ftp` or `cred`:
+minted pair; `SENSOR` is `http`, `redis`, `mqtt`, `smtp`, `ftp`, `cred` or `dns`:
 
 ```
 SENSOR=http
@@ -337,7 +339,7 @@ Every refusal below except [a bind the OS refuses](#fail-closed-rules) happens b
 binds any listener, the plain one included: the process logs an error and exits 1. The error ends
 in `refusing to start`.
 
-**How the variables are read.** All six sensors read every TLS variable (each `*_TLS_BIND`,
+**How the variables are read.** All seven sensors read every TLS variable (each `*_TLS_BIND`,
 `*_TLS_CERT` and `*_TLS_KEY`, and `PROPOLIS_SMTP_SUBMISSION_BIND`) through one reader,
 `crates/sensor-framework/src/env.rs#strict_env_var`, so one rule holds everywhere (the same
 reader serves every other sensor variable; see
@@ -352,7 +354,8 @@ reader serves every other sensor variable; see
 **Configuration.** Per sensor (`crates/sensor-http/src/main.rs#parse_tls`,
 `crates/sensor-redis/src/main.rs#parse_tls`, `crates/sensor-mqtt/src/main.rs#parse_tls`,
 `crates/sensor-smtp/src/lib.rs#tls_from_env`, `crates/sensor-ftp/src/main.rs#tls_paths`,
-`crates/sensor-cred/src/main.rs#main`), after that reading step:
+`crates/sensor-cred/src/main.rs#main`, `crates/sensor-dns/src/main.rs#parse_tls`), after that
+reading step:
 
 - exactly one of the cert and key variables is set;
 - a TLS bind is set without both paths;
@@ -395,7 +398,9 @@ address that is not local cannot be checked in advance, so this refusal comes af
 configuration and the pair were accepted and after the sensor's earlier listeners bound. The
 plain listener is bound first and the TLS listener last, so a TLS bind that fails leaves the
 plain listener already open for a moment: the sensor stops every listener it started (the plain
-port is not served either) and exits 1. For http, redis, mqtt, smtp and ftp every sensor logs the
+port is not served either) and exits 1. For sensor-dns the plain listeners are the UDP and TCP
+pair on `PROPOLIS_DNS_BIND`, bound together before the DoT listener. For http, redis, mqtt, smtp,
+ftp and dns every sensor logs the
 same line, with the same words whichever listener failed
 (`crates/sensor-framework/src/listener.rs#listener_start_error`):
 
@@ -417,7 +422,7 @@ at `info` unless `RUST_LOG` says otherwise, so the warnings and info lines are v
 
 ### The unit's TLS directory grant
 
-Each of the six units carries `ReadOnlyPaths=-/etc/propolis/tls` (for example
+Each of the seven units carries `ReadOnlyPaths=-/etc/propolis/tls` (for example
 `deploy/sensor-http.service#ReadOnlyPaths=-/etc/propolis/tls`). Read-only because the sensor reads
 its pair and never writes it. The leading `-` makes a missing directory non-fatal: without it
 systemd refuses to start the unit (`226/NAMESPACE`) on a host where `/etc/propolis/tls` was

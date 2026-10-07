@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Service lifecycle
@@ -15,7 +15,7 @@ lifecycle mechanics only; exact env vars, ports, and paths are owned by the
 
 ## Production surface
 
-Production runs **one unified daemon plus eleven sensor binaries**, all as systemd units
+Production runs **one unified daemon plus twelve sensor binaries**, all as systemd units
 installed by `deploy/install.sh`:
 
 - `propolis.service` runs `/usr/local/bin/propolis`, a single process holding the
@@ -23,7 +23,7 @@ installed by `deploy/install.sh`:
   PostgreSQL pool (`deploy/propolis.service#Description=Propolis unified daemon`,
   `deploy/propolis.service#ExecStart=/usr/local/bin/propolis`,
   `crates/propolis/src/main.rs`).
-- `sensor-<name>.service` for `catchall, ssh, telnet, redis, adb, http, ftp, smtp, tftp, mqtt, cred`,
+- `sensor-<name>.service` for `catchall, ssh, telnet, redis, adb, http, ftp, smtp, tftp, mqtt, dns, cred`,
   each running its own binary as its own system user, created by `deploy/install.sh`'s
   delegation to `deploy/provision.sh` (`deploy/provision.sh#ensure_user`,
   `deploy/sensor-ssh.service#User=propolis-ssh`).
@@ -49,16 +49,19 @@ Once every service has its `/etc/propolis/*.env`:
 # Example - enable and start every unit
 sudo systemctl enable --now propolis.service
 sudo systemctl enable --now sensor-catchall sensor-ssh sensor-telnet sensor-redis \
-  sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-cred
+  sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred
 ```
 
-`sensor-tftp` and `sensor-mqtt` are the sensors that are safe to leave out of that command:
-each is off until its env file (`/etc/propolis/tftp.env`, `/etc/propolis/mqtt.env`) sets
-`PROPOLIS_TFTP_BIND` or `PROPOLIS_MQTT_BIND`, and without a bind it exits instead of
-listening. Enable `sensor-tftp` only on a host where inbound UDP/69 is meant to be open, and
-`sensor-mqtt` only where inbound TCP/1883 is (and TCP/8883, if `PROPOLIS_MQTT_TLS_BIND` is set).
+`sensor-tftp`, `sensor-mqtt` and `sensor-dns` are the sensors that are safe to leave out of that
+command: each is off until its env file (`/etc/propolis/tftp.env`, `/etc/propolis/mqtt.env`,
+`/etc/propolis/dns.env`) sets `PROPOLIS_TFTP_BIND`, `PROPOLIS_MQTT_BIND` or
+`PROPOLIS_DNS_BIND`, and without a bind it exits instead of listening. Enable `sensor-tftp` only
+on a host where inbound UDP/69 is meant to be open, `sensor-mqtt` only where inbound TCP/1883 is
+(and TCP/8883, if `PROPOLIS_MQTT_TLS_BIND` is set), and `sensor-dns` only where inbound UDP and
+TCP/53 are (and TCP/853, if `PROPOLIS_DNS_TLS_BIND` is set).
 
-The TLS listeners (HTTPS 443, Redis 6380, MQTTS 8883, SMTPS 465, submission 587, FTPS 990) are
+The TLS listeners (HTTPS 443, Redis 6380, MQTTS 8883, SMTPS 465, submission 587, FTPS 990, DNS
+over TLS 853) are
 off until their `*_TLS_BIND` (or `PROPOLIS_SMTP_SUBMISSION_BIND`) variable is set, so starting a
 sensor never opens one implicitly; sensor-cred's TLS runs on its existing ports. A sensor with a
 bad TLS setting exits 1 at start with `refusing to start`. See

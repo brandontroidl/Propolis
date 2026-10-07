@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Events and signals reference
@@ -91,12 +91,12 @@ rows with status `incomplete`.
 
 ### TLS metadata keys
 
-Events from the six TLS sensors (http, redis, mqtt, smtp, ftp, cred) carry these keys in
+Events from the seven TLS sensors (http, redis, mqtt, smtp, ftp, cred, dns) carry these keys in
 `metadata`. They are ordinary metadata, not wire-format fields.
 
 | key | type | meaning |
 |---|---|---|
-| `tls` | bool | Present, and always `true`, only on events of a TLS session. It is **absent** on plaintext events, never `false`, so a consumer tests for the key, not its value (`crates/sensor-smtp/src/handler.rs#tag_tls`, `crates/sensor-ftp/src/handler.rs#tag_tls`, `crates/sensor-mqtt/src/handler.rs#stamp_tls`, `crates/sensor-cred/src/lib.rs#with_tls`; http and redis set it inline in their handlers). |
+| `tls` | bool | Present, and always `true`, only on events of a TLS session. It is **absent** on plaintext events, never `false`, so a consumer tests for the key, not its value (`crates/sensor-smtp/src/handler.rs#tag_tls`, `crates/sensor-ftp/src/handler.rs#tag_tls`, `crates/sensor-mqtt/src/handler.rs#stamp_tls`, `crates/sensor-cred/src/lib.rs#with_tls`, `crates/sensor-dns/src/events.rs#stamp_tls`; http and redis set it inline in their handlers). |
 | `starttls_refused` | string | Only on the refusal event described below; always `"pipelined_plaintext"` today. |
 | `pipelined_bytes` | integer | Only on the refusal event: how many plaintext bytes the client sent behind the upgrade command. The bytes themselves are never captured. |
 
@@ -117,8 +117,17 @@ the session's login state for ftp.
 
 **`honeypot_command_exec` is not only shell commands.** Across the sensors it records protocol
 commands too: sensor-smtp's `DATA` and its `STARTTLS` refusal, sensor-ftp's `AUTH` refusal, MQTT
-`SUBSCRIBE`, `PUBLISH` and `AUTH`, and Redis and HTTP requests, alongside the shell lines of the
-SSH, telnet and ADB sensors. Its weight and category are the same whichever produced it.
+`SUBSCRIBE`, `PUBLISH` and `AUTH`, Redis and HTTP requests, and DNS queries over TCP and DoT,
+alongside the shell lines of the SSH, telnet and ADB sensors. Its weight and category are the
+same whichever produced it.
+
+**DNS probe signals are metadata.** sensor-dns classifies each parsed query into zero or more of
+`amplification_probe`, `open_resolver_probe`, `zone_transfer_probe` and
+`chaos_fingerprint_probe`, recorded in the `probe_signals` metadata array
+(`crates/sensor-dns/src/events.rs#probe_signals`). They are never `signal_type` values and carry
+no weight of their own: a UDP query is a `honeypot_connection` and a TCP or DoT query a
+`honeypot_command_exec`, whatever its probe signals. The rules are in
+[sensor-behavior.md](sensor-behavior.md#sensor-dns).
 
 ## Signal types
 
@@ -142,7 +151,7 @@ is stored as `NUMERIC(4,3)` in `event`.
 
 | signal_type | weight | confidence | category | meaning [inferred] |
 |---|---|---|---|---|
-| `honeypot_connection` | 40 | 0.900 | honeypot | TCP connection established to a honeypot service |
+| `honeypot_connection` | 40 | 0.900 | honeypot | TCP connection established to a honeypot service, or a UDP probe (tftp request, dns query) |
 | `honeypot_login_attempt` | 50 | 0.920 | honeypot | credential submitted to a fake service |
 | `honeypot_command_exec` | 60 | 0.950 | honeypot | command run in the fake shell, or a protocol command (smtp DATA, the STARTTLS and AUTH TLS refusals, MQTT SUBSCRIBE and PUBLISH) |
 | `honeypot_malware_upload` | 80 | 0.980 | honeypot | file uploaded to a honeypot (highest weight/confidence) |

@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Concurrency and failure modes
@@ -30,8 +30,8 @@ cooperation (`crates/sensor-framework/src/listener.rs`, `bounds.rs`, `admission.
   frees its slot on any exit (finish, panic, timeout, abort). Sensors pass
   `default_per_source_cap(max_concurrent)`, a quarter of `max_concurrent`, floor 2,
   never above `max_concurrent`. The gateway passes `None` (no cap): its one trusted
-  shipper opens many connections from a single IP. The TFTP sensor, which runs its own
-  receive loop, applies the same limiter and derivation. Refusals are logged at
+  shipper opens many connections from a single IP. The TFTP and DNS sensors, which run their
+  own UDP receive loops, apply the same limiter and derivation. Refusals are logged at
   power-of-two totals.
 - **`max_concurrent`** - a `tokio::sync::Semaphore` seeded with that many permits. A
   connection accepted while every permit is held is **refused immediately** (the socket

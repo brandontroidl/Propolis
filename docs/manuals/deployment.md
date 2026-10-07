@@ -4,7 +4,7 @@ audience: deployer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Deployment manual
@@ -31,7 +31,7 @@ sequence and the gates, not a re-listing.
 ## 0. Choose the deployment model
 
 Single node is the primary, documented model: one host runs the unified daemon
-plus the eleven sensor processes, each its own systemd unit and OS user. A
+plus the twelve sensor processes, each its own systemd unit and OS user. A
 multi-node cluster sharing one PostgreSQL is an advanced, less-travelled path:
 the fetcher and vendor submission coordinate through the database, but feed
 publication across nodes is unverified and you must validate it yourself.
@@ -99,7 +99,7 @@ default), and no-listener subsystems.
 > access, confirm out-of-band administration first.
 
 - [`../operations/networking-tls.md`](../operations/networking-tls.md) - also the sensor TLS
-  guide: six sensors (http, redis, mqtt, smtp, ftp, cred) serve TLS on their attacker-facing
+  guide: seven sensors (http, redis, mqtt, smtp, ftp, cred, dns) serve TLS on their attacker-facing
   ports with a deploy-minted pair, each off until its variables are set
 - Ports/binds (canonical):
   [`../reference/ports-and-protocols.md`](../reference/ports-and-protocols.md)

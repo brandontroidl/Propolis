@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Never-execute invariant
@@ -53,6 +53,7 @@ than shipping.
 | (telnet) | `crates/sensor-telnet/tests/integration.rs#never_exec_static_check` |
 | (tftp) | `crates/sensor-tftp/tests/integration.rs#never_exec_static_check` |
 | (mqtt) | `crates/sensor-mqtt/tests/integration.rs#never_exec_static_check` |
+| (dns) | `crates/sensor-dns/tests/integration.rs#never_exec_static_check` |
 
 The SSH test is broader than its own crate: it walks **both** `sensor-ssh/src`
 and `sensor-framework/src` (`crates/sensor-ssh/tests/shell_test.rs#never_exec_static_check`). The `FakeFs`/`FakeShell`

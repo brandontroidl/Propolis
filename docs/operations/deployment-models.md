@@ -4,7 +4,7 @@ audience: deployer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Deployment models
@@ -21,7 +21,7 @@ One host runs everything:
   the operator console as concurrent tokio tasks over a single PgPool
   (`crates/propolis/src/main.rs`, `deploy/propolis.service`).
 - The **sensor binaries** (`sensor-ssh`, `sensor-telnet`, `sensor-http`,
-  `sensor-ftp`, `sensor-smtp`, `sensor-tftp`, `sensor-mqtt`, `sensor-redis`, `sensor-adb`, `sensor-catchall`,
+  `sensor-ftp`, `sensor-smtp`, `sensor-tftp`, `sensor-mqtt`, `sensor-dns`, `sensor-redis`, `sensor-adb`, `sensor-catchall`,
   `sensor-cred`) each run as their own systemd service and their own OS user.
   Sensors are always separate processes; they are never embedded in the unified
   daemon.

@@ -4,12 +4,12 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Sensors and networking
 
-There are 11 sensor crates covering 14 protocols (the `cred` sensor serves VNC,
+There are 12 sensor crates covering 15 protocols (the `cred` sensor serves VNC,
 MySQL, MSSQL, PostgreSQL, and MongoDB). Each sensor is a separate process with
 its own `/etc/propolis/<name>.env`. Sensors make **no outbound connections by
 design** and have no HTTP client in their dependency tree - if a sensor appears
@@ -48,11 +48,14 @@ Work outward from the process:
 - **Bound to the wrong interface** - `127.0.0.1:22` only accepts loopback.
   Exposure needs `0.0.0.0:22` (or the specific public interface). This is an
   operator choice in the `.env`, not a code default.
-- **Privileged port without capability** - catchall/ssh/telnet/http/ftp/smtp/tftp
+- **Privileged port without capability** - catchall/ssh/telnet/http/ftp/smtp/tftp/dns
   units carry `CAP_NET_BIND_SERVICE` for ports below 1024; redis/adb/mqtt/cred do
   not. Rebinding a no-capability sensor to a low port fails to bind.
 - **Port already owned** - a real service (e.g. the host's own `sshd`) holds the
   port. See bind conflicts in [Startup and config](startup-and-config.md).
+- **DNS on port 53 next to a local resolver** - a `PROPOLIS_DNS_BIND` of `0.0.0.0:53` on a
+  host whose own resolver stub already listens on port 53 fails with `Address already in use`
+  and the sensor exits 1 [inferred]. Bind the public address instead of the wildcard.
 
 Every sensor logs a listener that fails to start, after its configuration
 validated, in one form
@@ -120,7 +123,7 @@ be overridden with `PROPOLIS_SSH_BANNER`.
 
 ## Sensor TLS
 
-Six sensors (http, redis, mqtt, smtp, ftp, cred) terminate TLS in-process; the variables, ports
+Seven sensors (http, redis, mqtt, smtp, ftp, cred, dns) terminate TLS in-process; the variables, ports
 and rules are in [Networking and TLS](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 The console has no in-process TLS: put it behind your own reverse proxy.
 

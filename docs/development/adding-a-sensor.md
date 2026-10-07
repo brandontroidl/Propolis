@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Adding or modifying a sensor
@@ -87,7 +87,7 @@ fetch" guarantee and should be present in a new sensor's `tests/`:
   patterns (`std::process::Command`, `process::Command`, `Command::new`,
   `libc::exec`, `nix::unistd::exec`) and fails if any appear (e.g.
   `crates/sensor-http/tests/integration.rs#never_exec_static_check`). Present across the protocol
-  sensors (ftp, telnet, redis, adb, http, smtp, tftp, mqtt, cred, ssh).
+  sensors (ftp, telnet, redis, adb, http, smtp, tftp, mqtt, dns, cred, ssh).
 - **No HTTP-client dependency** - `crates/sensor-ssh/tests/shell_test.rs#sensor_ssh_has_no_http_client_dependency`
   (`sensor_ssh_has_no_http_client_dependency`) asserts the crate manifest declares
   none of `reqwest`, `hyper`, `ureq`, `curl`, `isahc`, `surf`, `attohttpc`. This
@@ -98,7 +98,7 @@ fetch" guarantee and should be present in a new sensor's `tests/`:
   `tokio`'s `process` feature stays off, so adding process-spawning capability
   requires a visible `Cargo.toml` diff.
 
-A sensor that answers over UDP (only `sensor-tftp` does) is a reflection risk and needs
+A sensor that answers over UDP (`sensor-tftp` and `sensor-dns` do) is a reflection risk and needs
 more than the checks above. It cannot use `run_udp_listener`, which never gives a handler
 the socket. It must instead route every send through a byte budget that refuses any packet
 taking bytes sent past bytes received from the peer, pin each transfer to the requester's
@@ -106,6 +106,8 @@ exact address, never retransmit, and bound concurrency. `sensor-tftp/tests/integ
 shows the tests that go with it: a reply-size bound against minimal requests, a source
 mismatch drop, and a static check that the crate has exactly one UDP send site
 (`crates/sensor-tftp/tests/integration.rs#never_amplifies_static_check`).
+`crates/sensor-dns/tests/integration.rs#never_amplifies_static_check` is the second example: one
+UDP send site behind a reply gate, one framed TCP write site, and no socket call anywhere else.
 
 The doc/code agreement gate (`crates/propolis/tests/docs_agreement.rs`) additionally
 fails CI if a new `PROPOLIS_*` / `CATCHALL_*` env-var name in source is absent from

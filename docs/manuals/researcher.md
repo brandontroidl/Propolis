@@ -4,7 +4,7 @@ audience: researcher
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Researcher manual
@@ -32,7 +32,7 @@ kinds of artifact:
 3. **Scores** - a per-IP projection derived from the events: a time-decayed
    score, a confirmed-real latch, feed tier, and recommendation flags.
 
-The capture surface is eleven sensor crates over fourteen protocols; the full
+The capture surface is twelve sensor crates over fifteen protocols; the full
 inventory is [`overview/capabilities`](../overview/capabilities.md), and per-
 protocol capture behavior is
 [`reference/sensor-behavior`](../reference/sensor-behavior.md).

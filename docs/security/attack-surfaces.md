@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Attack surfaces
@@ -29,7 +29,7 @@ For the trust model behind these boundaries see [threat-model.md](threat-model.m
 
 ## Sensor listeners
 
-The attacker-facing surface: **11 sensor crates covering 14 protocols** (the `cred`
+The attacker-facing surface: **12 sensor crates covering 15 protocols** (the `cred`
 sensor serves VNC / MySQL / MSSQL / PostgreSQL / MongoDB). Sensors have **no compiled-in
 default port** - ports come from the config/env the deploy units set; see
 [../reference/ports-and-protocols.md](../reference/ports-and-protocols.md) and
@@ -62,6 +62,25 @@ certificate is the deploy-minted self-signed one named `localhost`. The MQTT pas
 captured over TLS, as on the plain listener. Binary PUBLISH payloads sent over TLS are quarantined
 by the same hand-off, byte budget and shutdown drain as the plain listener, and never run. A
 half-configured or unusable pair makes the sensor refuse to start rather than serve plaintext.
+
+`sensor-dns` answers over UDP, so its reply is a reflection surface: a UDP source address is
+whatever the sender wrote. The reply is bounded by construction: it is the query's own header
+rewritten plus its first question, nothing appended, so it is never larger than the query
+(`crates/sensor-dns/src/protocol.rs#refused_reply`). The crate's one UDP `send_to` sits behind
+`crates/sensor-dns/src/guarded.rs#reply_gate`, which re-checks that with a byte budget and
+refuses unspecified, broadcast and multicast sources and the source ports of legacy reflectors
+(0, 7, 13, 17, 19, 37); a static test keeps it the only send site
+(`crates/sensor-dns/tests/integration.rs#never_amplifies_static_check`). It serves no records,
+never resolves or forwards, and never answers a message with QR set, so two DNS sensors cannot
+loop. On TCP 53 a connection is bounded to 64 messages of at most 4096 bytes each.
+
+`sensor-dns` can also expose a DNS over TLS listener (conventionally 853). It exists only when
+`PROPOLIS_DNS_TLS_BIND` is set, so cert and key alone open no new port. The surface and its
+limits match the HTTPS listener: a handshake that fails or stalls is cut at the read timeout and
+logged only at debug level, no client certificate is requested, and the certificate is the
+deploy-minted self-signed one named `localhost`. The same REFUSED reply and the same per-connection
+bounds apply as on TCP 53. A half-configured or unusable pair makes the sensor refuse to start
+rather than serve plaintext.
 
 `sensor-smtp` can expose up to two more ports and a protocol upgrade. An implicit-TLS listener
 (conventionally 465, SMTPS) and a submission listener (conventionally 587, plain with STARTTLS)

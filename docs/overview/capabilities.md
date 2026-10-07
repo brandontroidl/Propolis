@@ -4,7 +4,7 @@ audience: evaluator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Capabilities
@@ -15,7 +15,7 @@ pages.
 
 ## Sensors
 
-Eleven sensor programs cover fourteen protocols. Each runs as its own systemd service under
+Twelve sensor programs cover fifteen protocols. Each runs as its own systemd service under
 its own user.
 
 | Sensor | Protocol | What it records |
@@ -27,6 +27,7 @@ its own user.
 | `sensor-smtp` | SMTP | AUTH credentials, message envelope and body |
 | `sensor-tftp` | TFTP (UDP) | Read and write probes with filename and mode, and uploaded payloads; never serves a file |
 | `sensor-mqtt` | MQTT | CONNECT credentials (never the password), SUBSCRIBE topics, PUBLISH topic and payload metadata, and PUBLISH payloads that look binary; never delivers, retains or forwards a message |
+| `sensor-dns` | DNS (UDP, TCP, DoT) | Every query's name, type, class, flags and EDNS, with zone-transfer, ANY, CHAOS and recursion probes flagged; answers REFUSED and never serves a record |
 | `sensor-redis` | Redis | AUTH, config and command probes |
 | `sensor-adb` | ADB | Shell commands, pushed files |
 | `sensor-cred` | VNC, MySQL, MSSQL, PostgreSQL, MongoDB | Authentication attempts and usernames |

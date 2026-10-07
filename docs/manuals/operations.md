@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Operator manual
@@ -21,7 +21,7 @@ Propolis is source-available and actively developed, with one tagged release
 ## Mental model
 
 One unified daemon (`propolis.service`) holds intake, review, feed, and console as
-concurrent tasks over one PostgreSQL pool; eleven sensor binaries run as separate,
+concurrent tasks over one PostgreSQL pool; twelve sensor binaries run as separate,
 unprivileged units and append NDJSON logs the daemon tails. PostgreSQL is the single
 datastore. See [process topology](../architecture/process-topology.md) and
 [storage](../architecture/storage.md).
@@ -128,7 +128,7 @@ checklist are owned by [backup and restore](../operations/backup-and-restore.md)
 - Configuration surface: [configuration](../operations/configuration.md); exact values in
   [environment variables](../reference/environment-variables.md).
 - Networking and TLS (the console has no in-process TLS, so front it with an operator-provided
-  reverse proxy; six sensors serve TLS on their attacker-facing ports, off until configured):
+  reverse proxy; seven sensors serve TLS on their attacker-facing ports, off until configured):
   [networking and TLS](../operations/networking-tls.md).
 - Upgrade, rollback, and DR context: [upgrade, rollback and DR](../operations/upgrade-rollback-and-dr.md).
 - Safe teardown (preserve or deliberately wipe evidence): [safe teardown](../getting-started/safe-teardown.md).

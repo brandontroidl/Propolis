@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Upgrade, rollback and disaster recovery
@@ -20,7 +20,7 @@ The script (run as root, `sudo ./deploy/upgrade.sh`):
 1. Runs `git pull` and `cargo build --release --workspace --locked` **as the
    repo-owner user**, not as root, so build output keeps the owner's identity and
    dependency resolution cannot drift from the reviewed lockfile.
-2. Installs the built binaries (`propolis`, the 11 sensors, `gateway`, `shipper`)
+2. Installs the built binaries (`propolis`, the 12 sensors, `gateway`, `shipper`)
    to `/usr/local/bin/` with `install -m 0755`.
 3. Runs `deploy/provision.sh` (idempotent users + directories), then
    `deploy/provision-tls.sh`, which mints a self-signed TLS pair for each

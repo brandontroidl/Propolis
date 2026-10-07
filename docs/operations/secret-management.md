@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Secret management
@@ -97,7 +97,7 @@ when `PROPOLIS_OPS_ENABLED=true`.
 
 ### Sensor TLS private keys (optional, opt-in)
 
-Each of the six TLS sensors (http, redis, mqtt, smtp, ftp, cred) has a private key at
+Each of the seven TLS sensors (http, redis, mqtt, smtp, ftp, cred, dns) has a private key at
 `/etc/propolis/tls/<sensor>.key`, minted by `deploy/provision-tls.sh` or installed by the
 operator. This is the only secret that lives outside the `.env` files, and the `.env` files hold
 only its path (`PROPOLIS_<SENSOR>_TLS_KEY`), never its content.

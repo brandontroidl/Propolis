@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Sensor behavior reference
@@ -13,7 +13,7 @@ Per-protocol capture behavior for the Propolis sensor layer: what each sensor
 impersonates, what it captures, which events it emits, and the shared framework
 knobs that bound every capture.
 
-There are **11 sensor crates covering 14 protocols** (the `cred` sensor serves
+There are **12 sensor crates covering 15 protocols** (the `cred` sensor serves
 VNC, MySQL, MSSQL, PostgreSQL, and MongoDB from one binary).
 
 **Canonical owners referenced here.** This page owns *capture behavior*. It does
@@ -92,9 +92,11 @@ address, spawns an accept loop, enforces `max_concurrent` with a
 - **UDP** (`run_udp_listener`, `crates/sensor-framework/src/listener.rs#run_udp_listener`): `UDP_MAX_DATAGRAM = 65536` buffer;
   **the socket is never handed to the handler**, so a UDP sensor cannot answer a
   probe by construction (`crates/sensor-framework/src/listener.rs#run_udp_listener`). Each datagram runs in its own bounded task.
-  The one deliberate exception is `sensor-tftp`, which does not use this listener: it
-  owns a request socket that only receives and a per-transfer socket whose every send
-  passes a byte budget (see [sensor-tftp](#sensor-tftp)).
+  The two deliberate exceptions are `sensor-tftp` and `sensor-dns`, which do not use this
+  listener: `sensor-tftp` owns a request socket that only receives and a per-transfer socket
+  whose every send passes a byte budget (see [sensor-tftp](#sensor-tftp)), and `sensor-dns`
+  answers each query with a reply no larger than the query, through one guarded send (see
+  [sensor-dns](#sensor-dns)).
 - **Dual-stack normalization** (`normalize_dual_stack`, `crates/sensor-framework/src/listener.rs#normalize_dual_stack`): maps
   `::ffff:a.b.c.d` down to plain IPv4 (port preserved) before WAN resolution, so a
   plain-IPv4 WAN map matches a dual-stack peer.
@@ -582,8 +584,8 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
 
 ### sensor-tftp
 
-A TFTP (RFC 1350) honeypot on UDP, conventional port 69. It is the only sensor that
-answers over UDP, so its reply surface is bounded in code and **it is off until an
+A TFTP (RFC 1350) honeypot on UDP, conventional port 69. It is one of two sensors that
+answer over UDP, so its reply surface is bounded in code and **it is off until an
 operator sets `PROPOLIS_TFTP_BIND`**: with no bind it logs the error, exits 1 and binds
 nothing (`crates/sensor-tftp/src/main.rs#load_config_from`).
 
@@ -746,6 +748,85 @@ under the process-wide capture-memory budget, and never run.
   warning. Rules and variables are in [environment-variables.md](environment-variables.md); the
   operator view is
   [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+
+### sensor-dns
+
+A DNS honeypot with three surfaces: UDP and TCP on the one `PROPOLIS_DNS_BIND` address
+(conventional port 53) and, optionally, DNS over TLS (RFC 7858, conventional port 853). It is
+**off until an operator sets `PROPOLIS_DNS_BIND`**: with no bind it logs the error, exits 1 and
+binds nothing (`crates/sensor-dns/src/main.rs#load_config_from`). UDP and TCP are bound together
+or not at all: UDP is bound first but not served until TCP binds on the same port, and if either
+bind fails the sensor exits 1 with nothing left listening
+(`crates/sensor-dns/src/lib.rs#start_test_server`). It serves no records: every query that parses
+gets the same REFUSED reply, and it never resolves, forwards, or looks anything up.
+
+- **Parsing** (`crates/sensor-dns/src/protocol.rs#parse_query`). Checks run in a fixed order and
+  the first failure rejects the message: shorter than the 12-byte header (`short_header`), QR set
+  (`response_inbound`: a response arriving inbound is never answered, so two DNS honeypots cannot
+  loop), a non-zero opcode such as NOTIFY or UPDATE (`opcode`), QDCOUNT other than 1
+  (`qdcount`), then the question: a compression pointer (`compression_pointer`; no pointer is
+  ever followed), an extended or reserved label type (`bad_label`), a name over 255 wire bytes
+  (`name_too_long`), or a name, type or class running past the end (`truncated_question`).
+  Last, any answer record, or any authority record (`answer_or_authority_present`), except that
+  an IXFR over TCP may carry the one SOA authority record RFC 1995 requires. The EDNS scan never
+  rejects: it walks at most 8 additional records for an OPT, skipping owner-name pointers
+  without following them, and records two OPT records, a non-root OPT owner or an option
+  running past its data as `edns_malformed`. At most 16 option codes are kept; option data is
+  never stored (an ECS option carries a third party's subnet). The qname is rendered in RFC 1035
+  master-file form, so every byte survives as printable ASCII (`\.`, `\\`, `\DDD`).
+- **The one reply** (`crates/sensor-dns/src/protocol.rs#refused_reply`): the query's own header
+  rewritten in place (ID kept, QR set, opcode 0, AA/TC/RA/Z/AD clear, RD and CD copied, RCODE 5
+  REFUSED, QDCOUNT 1, other counts 0) followed by the first question copied verbatim, nothing
+  appended. Its length is the end of the question, never more than the query, so on UDP **bytes
+  sent never exceed bytes received**. AXFR and IXFR get the same REFUSED. No OPT record is
+  returned even when the query had one; that is a known fingerprint, since a real EDNS responder
+  returns an OPT [inferred].
+- **UDP send guard.** Before the crate's single `send_to`
+  (`crates/sensor-dns/src/guarded.rs#ReplySocket`), `crates/sensor-dns/src/guarded.rs#reply_gate`
+  refuses to answer an unspecified, broadcast or multicast source, a source port in
+  `crates/sensor-dns/src/guarded.rs#REFLECTIVE_SOURCE_PORTS` (0, echo 7, daytime 13, qotd 17,
+  chargen 19, time 37), and any reply a byte budget seeded with the query length would refuse.
+  Such a query is still recorded, with `query_status` `suppressed` and a `suppress_reason`
+  (`reflective_source_port`, `unroutable_source`, `byte_budget`). A rejected datagram gets no
+  reply; a datagram shorter than a header gets neither a reply nor an event.
+  `crates/sensor-dns/tests/integration.rs#never_amplifies_static_check` keeps the send site and
+  the TCP write site to one each.
+- **TCP and DNS over TLS** (`crates/sensor-dns/src/stream.rs#handle_connection`). RFC 1035
+  length-prefixed framing; pipelined queries are answered in order. A length prefix under 12
+  is rejected as `short_header` and one over
+  `crates/sensor-dns/src/stream.rs#MAX_TCP_MESSAGE_BYTES` (4096) as `oversize`, in both cases
+  without reading the body; either, or any rejected message, ends the connection without a
+  reply. A connection carries at most
+  `crates/sensor-dns/src/stream.rs#MAX_QUERIES_PER_CONNECTION` (64) queries and at most
+  `max_captured_bytes` bytes; the first message must arrive within `read_timeout` and each later
+  one within `idle_timeout`. Every exit path shuts the stream down, so a DoT session ends with
+  `close_notify`. DoT (`crates/sensor-dns/src/lib.rs#start_test_server_tls`) runs the same
+  handler behind an implicit-TLS handshake cut at the read timeout; a failed or stalled
+  handshake, plaintext included, is dropped with no event. No ALPN is advertised.
+- **Emits:** UDP: one `honeypot_connection` (protocol `udp`) per datagram, with its own session
+  id. TCP and DoT: one `honeypot_connection` (protocol `tcp`) per connection, then one
+  `honeypot_command_exec` (protocol `tcp`) per message, with `command` `"<QTYPE> <qname>"` or
+  `malformed`. Events are appended before the reply is sent. Metadata: `protocol_label` `dns`,
+  `transport`, `query_status` (`answered`, `rejected` or `suppressed`), `reject_reason`,
+  `query_len`, `declared_len` (TCP framing rejects), `msg_index` (TCP/DoT), the header
+  (`dns_id`, `flags_raw`, the four counts, `opcode`, `opcode_name`, `rd`, `ad`, `cd`), the
+  question (`qname` sanitized and capped at 1024 characters, `qname_mixed_case`,
+  `qname_labels`, `qname_wire_len`, `qtype`, `qtype_name`, `qclass`, `qclass_name`), `edns`
+  (`version`, `udp_payload_size`, `do`, `extended_rcode`, `option_codes`) or `edns_malformed`,
+  `probe_signals`, and for an answered query `rcode` `REFUSED` and `reply_len`. DoT events carry
+  `"tls": true`; the key is absent on the plain surfaces
+  (`crates/sensor-dns/src/events.rs#stamp_tls`). All DNS events are `authenticated=false`.
+- **Probe signals** (`crates/sensor-dns/src/events.rs#probe_signals`), metadata only, never a
+  `signal_type`: `amplification_probe` (UDP ANY, or UDP TXT/DNSKEY/RRSIG with an EDNS buffer
+  over 512), `open_resolver_probe` (RD set, class IN, not a transfer), `zone_transfer_probe`
+  (AXFR or IXFR), `chaos_fingerprint_probe` (class CH, for example `version.bind`).
+- **Bounds:** `max_concurrent` applies separately to the UDP handler pool, the TCP listener and
+  the DoT listener, each with the per-source admission cap; a UDP datagram's handling is cut at
+  `read_timeout`. Strict parsing: a zero or unparseable bound aborts startup. Nothing is
+  spooled.
+- **Wildcard binds.** A host whose own resolver stub already listens on port 53 makes a
+  wildcard `0.0.0.0:53` bind fail with `Address already in use` [inferred]; bind the public
+  address instead.
 
 ### sensor-redis
 
@@ -1062,20 +1143,21 @@ per-protocol bind var is required.
 ## Cross-cutting invariants
 
 - **Session id:** `Uuid::now_v7()` minted per accepted TCP connection by the
-  listener, per datagram for catchall UDP, per transfer for TFTP; carried on every event.
+  listener, per datagram for catchall UDP and DNS UDP, per transfer for TFTP; carried on every
+  event.
 - **Password discipline:** every login-capturing sensor reads the password only to
   advance the protocol and drops it - never stored, logged, or placed in any event
   field (SSH `crates/sensor-ssh/src/auth.rs`, telnet `crates/sensor-telnet/src/handler.rs#handle_connection`, FTP `crates/sensor-ftp/src/handler.rs#handle_connection`, redis
   `crates/sensor-redis/src/handler.rs#Session::handle_auth`, SMTP `crates/sensor-smtp/src/handler.rs#handle_connection`, MQTT `crates/sensor-mqtt/src/handler.rs#parse_connect`, cred handlers). Tests assert absence at
   the serialized-JSON level.
 - **`authenticated` flag:** `honeypot_connection` and `catchall_probe` are always
-  false; ADB and TFTP events are always false (no auth step); `honeypot_login_attempt` is
+  false; ADB, TFTP and DNS events are always false (no auth step); `honeypot_login_attempt` is
   true; `honeypot_command_exec` reflects session auth state (redis/http false,
   ssh/telnet true post-login).
 - **Never-serve-outbound:** FTP RETR→550, FTP PORT/EPRT→502, ADB sync RECV→FAIL,
   SSH `direct-tcpip` refused, catchall/UDP never responds, TFTP RRQ gets one tiny
   error and never any file content, an MQTT PUBLISH is recorded but never delivered,
-  retained or forwarded, shell `wget`/`curl`
+  retained or forwarded, a DNS query gets REFUSED and no record, shell `wget`/`curl`
   canned - no sensor fetches or serves attacker-directed content.
 
 ## Notes

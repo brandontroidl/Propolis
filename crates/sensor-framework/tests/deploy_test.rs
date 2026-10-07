@@ -1920,7 +1920,7 @@ fn upgrade_script_reexecs_after_the_pull_and_before_any_build_or_install() {
             .unwrap_or_else(|| panic!("upgrade.sh has no line starting with `{needle}`"))
     };
     let pull = at("sudo -u \"$(stat -c '%U' \"$REPO_DIR\")\" git pull");
-    let reexec = at("exec \"$SCRIPT_DIR/upgrade.sh\" \"$@\"");
+    let reexec = at("exec \"$BASH\" \"$SCRIPT_DIR/upgrade.sh\" \"$@\"");
     let build = at("sudo -u \"$(stat -c '%U' \"$REPO_DIR\")\" cargo build");
     let first_install = at("install -m 0755");
     let provision = at("\"$SCRIPT_DIR/provision.sh\"");

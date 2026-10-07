@@ -44,7 +44,7 @@ else
     if [ "$SCRIPT_SUM_BEFORE" != "$SCRIPT_SUM_AFTER" ]; then
         echo "==> deploy/upgrade.sh changed in the pull, re-executing the new version"
         export PROPOLIS_UPGRADE_REEXEC=1 PROPOLIS_UPGRADE_PULLED_AT="$PULLED_AT"
-        exec "$SCRIPT_DIR/upgrade.sh" "$@"
+        exec "$BASH" "$SCRIPT_DIR/upgrade.sh" "$@"
     fi
 fi
 # END pull-and-reexec

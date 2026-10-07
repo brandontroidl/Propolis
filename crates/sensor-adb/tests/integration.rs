@@ -1252,6 +1252,106 @@ async fn unsupported_open_destination_is_refused_with_close_not_okay() {
     srv.handle.abort();
 }
 
+/// Every `honeypot_malware_upload` event once `count` of them are in the log.
+async fn uploads(srv: &TestServer, count: usize) -> Vec<sensor_wire::SensorEvent> {
+    for _ in 0..200 {
+        let found: Vec<sensor_wire::SensorEvent> = srv
+            .events()
+            .await
+            .into_iter()
+            .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+            .collect();
+        if found.len() >= count {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fewer than {count} uploads were recorded");
+}
+
+/// The interactive `adb shell` runs the same terminal as SSH and telnet: `cat > f` takes the
+/// lines typed after it until Ctrl-D, the file holds them, and they are captured once as
+/// `shell_stdin`.
+#[tokio::test]
+async fn cat_at_the_adb_shell_takes_typed_lines_until_ctrl_d_and_captures_them() {
+    let srv = TestServer::start().await;
+    let (mut conn, server_id) = connect_shell(&srv, 1).await;
+    conn.write_all(&adb_proto::build_wrte(
+        1,
+        server_id,
+        b"cat > /data/local/tmp/typed\nhello\nworld\n\x04",
+    ))
+    .await
+    .unwrap();
+    let (ack, _) = read_message(&mut conn).await;
+    assert_eq!(ack.command, adb_proto::A_OKAY);
+    let mut output = Vec::new();
+    while !output.ends_with(b"# ") {
+        let (wrte, data) = read_message(&mut conn).await;
+        output.extend_from_slice(&data);
+        acknowledge_wrte(&mut conn, &wrte).await;
+    }
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("hello\r\nworld\r\n"), "{output:?}");
+    let seen = send_shell_line(&mut conn, 1, server_id, "cat /data/local/tmp/typed").await;
+    assert!(seen.contains("hello\r\nworld\r\n"), "{seen:?}");
+
+    conn.write_all(&adb_proto::build_clse(1, server_id))
+        .await
+        .unwrap();
+    drop(conn);
+    let events = uploads(&srv, 1).await;
+    let metadata = &events[0].metadata;
+    assert_eq!(metadata["capture_reason"], "shell_stdin");
+    assert_eq!(metadata["end_reason"], "transfer_complete");
+    assert_eq!(metadata["destination"], "/data/local/tmp/typed");
+    assert_eq!(metadata["size"], 12);
+    assert!(!events[0].authenticated);
+    srv.handle.abort();
+}
+
+/// A `shell:<command>` that reads its input stays open and takes the stream's data, as a device
+/// does. Legacy ADB has no end-of-input message, so the client's CLSE is what ends it: the file
+/// holds what arrived, and the capture says the close cut it.
+#[tokio::test]
+async fn an_adb_shell_command_that_reads_its_input_holds_the_stream_until_the_client_closes_it() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let server_id = open_stream(&mut conn, 1, "shell:cat > /data/local/tmp/piped").await;
+    conn.write_all(&adb_proto::build_wrte(1, server_id, b"\x7fELF-adb-stdin"))
+        .await
+        .unwrap();
+    let (ack, _) = read_message(&mut conn).await;
+    assert_eq!(ack.command, adb_proto::A_OKAY);
+    let mut header = [0u8; adb_proto::HEADER_LEN];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), conn.read_exact(&mut header))
+            .await
+            .is_err(),
+        "nothing is sent while the command waits for its input"
+    );
+    conn.write_all(&adb_proto::build_clse(1, server_id))
+        .await
+        .unwrap();
+    let (clse, _) = read_message(&mut conn).await;
+    assert_eq!(clse.command, adb_proto::A_CLSE);
+
+    let shell_id = open_stream(&mut conn, 2, "shell:").await;
+    let (prompt, _) = read_message(&mut conn).await;
+    acknowledge_wrte(&mut conn, &prompt).await;
+    let seen = send_shell_line(&mut conn, 2, shell_id, "cat /data/local/tmp/piped").await;
+    assert!(seen.contains("ELF-adb-stdin"), "{seen:?}");
+    drop(conn);
+    let events = uploads(&srv, 1).await;
+    let metadata = &events[0].metadata;
+    assert_eq!(metadata["capture_reason"], "exec_stdin");
+    assert_eq!(metadata["end_reason"], "peer_closed");
+    assert_eq!(metadata["complete"], false);
+    assert_eq!(metadata["destination"], "/data/local/tmp/piped");
+    srv.handle.abort();
+}
+
 /// The captures stored in `dir`: files named by the SHA-256 of their content. The spool also holds a
 /// `.staging/` directory, where a body is written before it is published under that name.
 fn spooled_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

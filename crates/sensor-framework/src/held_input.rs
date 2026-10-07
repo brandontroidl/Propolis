@@ -166,9 +166,8 @@ impl HeldInput {
 
     /// The line that started this input ended with a CR, so an LF (or a telnet NUL) right after
     /// it is the rest of that Enter, not an empty first line of input.
-    pub fn after_cr(mut self) -> Self {
+    pub fn follow_cr(&mut self) {
         self.prev_cr = true;
-        self
     }
 
     /// Take `data` as input. Stops at the byte that ends the input (a terminal's Ctrl-D at the

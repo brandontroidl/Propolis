@@ -32,11 +32,12 @@ use tokio::net::TcpStream;
 use sensor_framework::fakefs::FakeFs;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
-use sensor_framework::shell::{EmitContext, FakeShell, onlcr};
+use sensor_framework::shell::{CommandResult, EmitContext, FakeShell, LineStep, onlcr};
 use sensor_framework::upload_metadata;
 use sensor_framework::{
-    CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget,
-    EgressState, EventEmitter, UploadEnd, Uuid, WanResolver, limits_from,
+    CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody, CaptureEnd, CaptureHandoff,
+    CaptureJob, CaptureSource, ConnectionBounds, ConnectionBudget, EgressState, EventEmitter,
+    HeldEnd, HeldInput, InputMode, StdinCaptures, UploadEnd, Uuid, WanResolver, limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
@@ -122,14 +123,44 @@ impl Stream {
 
 enum StreamKind {
     /// Interactive `shell:` session: `FakeShell` plus a partial-line buffer for incremental
-    /// input, and the raw-byte capture of everything the client streamed at it. A one-shot
-    /// `shell:<command>` never reaches this table at all - see `handle_open`'s doc.
+    /// input, the raw-byte capture of what the client typed at the shell itself, and the input of
+    /// a typed line that reads it (`cat > f` takes the lines after it until Ctrl-D).
     /// Boxed: the shell owns a whole filesystem snapshot and dwarfs the sync variant.
-    Shell(Box<FakeShell>, Vec<u8>, ShellCapture, bool),
+    Shell(Box<FakeShell>, Vec<u8>, ShellCapture, bool, HeldStdin),
+    /// A `shell:<command>` that reads its standard input, held until the input ends. Legacy ADB
+    /// has no end-of-input message on a shell stream, so the peer's CLSE (or the capture ceiling)
+    /// is what ends it.
+    Exec(Box<FakeShell>, HeldStdin),
     /// A `shell:<command>` whose response is still being paced by peer OKAY messages.
     OneShot,
     /// `sync:` file-transfer sub-protocol session.
     Sync(SyncState),
+}
+
+/// The input of a held shell line, recorded with the session's real ending if the session ends
+/// with it still open: `read_message` records that ending in `SessionEnd` before the streams are
+/// dropped, and on the listener's `max_duration` cancellation it still reads `Cancelled`.
+struct HeldStdin {
+    input: Option<HeldInput>,
+    session_end: SessionEnd,
+}
+
+impl HeldStdin {
+    /// The peer closed the stream with the input still open: the command is killed by the
+    /// hangup with what arrived, and the input is captured as cut off by the close.
+    fn close(&mut self, shell: &mut FakeShell) {
+        if let Some(input) = self.input.take() {
+            let _ = input.finish(shell, HeldEnd::Cut(CaptureEnd::PeerClosed));
+        }
+    }
+}
+
+impl Drop for HeldStdin {
+    fn drop(&mut self) {
+        if let Some(input) = self.input.take() {
+            input.abandon(self.session_end.get());
+        }
+    }
 }
 
 /// How the session as a whole ended, shared between the reader that observes the ending and the
@@ -682,6 +713,18 @@ pub async fn handle_connection(
     // The connection's one filesystem: each shell stream opens a share of it, so a file written on
     // one stream is readable on the next and a new connection starts clean.
     let base_fs = FakeFs::android().with_budget(budget.clone());
+    // What shell commands read from their streams, captured once per distinct body and submitted
+    // when this session's future goes, cancelled or not.
+    let stdin_captures = StdinCaptures::new(
+        handoff.clone(),
+        CaptureSource {
+            sensor: PROTOCOL_LABEL,
+            source_ip,
+            wan_ip,
+            session_id,
+            authenticated: false,
+        },
+    );
     let mut reader = MessageReader::new(bounds, session_end.clone());
 
     // ---- CNXN handshake ----
@@ -733,6 +776,7 @@ pub async fn handle_connection(
                     max_captured_bytes,
                     &budget,
                     &base_fs,
+                    &stdin_captures,
                     peer_maxdata,
                     write_timeout,
                 )
@@ -755,6 +799,8 @@ pub async fn handle_connection(
                     &handoff,
                     peer_addr,
                     &budget,
+                    &stdin_captures,
+                    max_captured_bytes,
                     peer_maxdata,
                     write_timeout,
                 )
@@ -805,9 +851,11 @@ pub async fn handle_connection(
                     // whatever it meant to send - regardless of how the connection later ends.
                     // Recorded before the remove's value is dropped, which is what submits it.
                     match &mut s.kind {
-                        StreamKind::Shell(_, _, capture, _) => {
+                        StreamKind::Shell(shell, _, capture, _, held) => {
                             capture.stream_end = Some(CaptureEnd::PeerClosed);
+                            held.close(shell);
                         }
+                        StreamKind::Exec(shell, held) => held.close(shell),
                         StreamKind::Sync(sync) => sync.stream_end = Some(CaptureEnd::PeerClosed),
                         StreamKind::OneShot => {}
                     }
@@ -853,6 +901,7 @@ async fn handle_open(
     max_captured_bytes: u64,
     budget: &Arc<ConnectionBudget>,
     base_fs: &FakeFs,
+    stdin_captures: &StdinCaptures,
     peer_maxdata: usize,
     write_timeout: Duration,
 ) -> Result<(), ()> {
@@ -905,13 +954,38 @@ async fn handle_open(
                 Some(cmd) => {
                     // One-shot exec: run once, write output (if any), then close - mirrors real
                     // adb's `shell:<command>` semantics (the stream closes when the command
-                    // exits) and sensor-ssh's `ChannelAction::Exec` one-shot pattern.
-                    let (output, events) = shell.handle_input(&cmd);
+                    // exits) and sensor-ssh's `ChannelAction::Exec` one-shot pattern. A command
+                    // that reads its standard input waits for it instead, as on a device.
+                    let (step, events) = shell.start_line(&cmd);
                     for event in &events {
                         if emitter.append(event).await.is_err() {
                             tracing::error!(%peer_addr, "adb: failed to append command event");
                         }
                     }
+                    let output = match step {
+                        LineStep::Ran(output) => output,
+                        LineStep::AwaitingInput => {
+                            let input = HeldInput::new(
+                                &shell,
+                                InputMode::Pipe,
+                                stdin_captures,
+                                CAPTURE_REASON_EXEC_STDIN,
+                                max_captured_bytes,
+                            );
+                            let held = HeldStdin {
+                                input: Some(input),
+                                session_end: session_end.clone(),
+                            };
+                            streams.insert(
+                                server_id,
+                                Stream::new(
+                                    client_local_id,
+                                    StreamKind::Exec(Box::new(shell), held),
+                                ),
+                            );
+                            return Ok(());
+                        }
+                    };
                     let mut entry = Stream::new(client_local_id, StreamKind::OneShot);
                     entry.queue(onlcr(output.bytes()));
                     entry.close_after_drain = true;
@@ -948,6 +1022,10 @@ async fn handle_open(
                                 session_id,
                             },
                             false,
+                            HeldStdin {
+                                input: None,
+                                session_end: session_end.clone(),
+                            },
                         ),
                     );
                     entry.queue(prompt);
@@ -1007,6 +1085,50 @@ async fn handle_open(
     Ok(())
 }
 
+/// Run one line typed at the interactive shell and append its events. Returns what it printed,
+/// or `None` when it waits for its input (see `FakeShell::start_line`), which `held` then
+/// collects as a terminal would. `after_cr` says the line ended with a CR, so an LF right after it
+/// is not input.
+#[allow(clippy::too_many_arguments)]
+async fn run_typed_line(
+    shell: &mut FakeShell,
+    line: &str,
+    held: &mut HeldStdin,
+    after_cr: bool,
+    stdin_captures: &StdinCaptures,
+    max_captured_bytes: u64,
+    emitter: &Arc<EventEmitter>,
+    capture: &mut ShellCapture,
+    peer_addr: SocketAddr,
+) -> Option<CommandResult> {
+    let (step, events) = shell.start_line(line);
+    for event in &events {
+        if event.metadata.get("flood").and_then(|v| v.as_str()) == Some("binary") {
+            capture.flag_binary();
+        }
+        if emitter.append(event).await.is_err() {
+            tracing::error!(%peer_addr, "adb: failed to append command event");
+        }
+    }
+    match step {
+        LineStep::Ran(output) => Some(output),
+        LineStep::AwaitingInput => {
+            let mut input = HeldInput::new(
+                shell,
+                InputMode::Terminal,
+                stdin_captures,
+                CAPTURE_REASON_SHELL_STDIN,
+                max_captured_bytes,
+            );
+            if after_cr {
+                input.follow_cr();
+            }
+            held.input = Some(input);
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_wrte(
     stream: &mut TcpStream,
@@ -1017,6 +1139,8 @@ async fn handle_wrte(
     handoff: &Arc<CaptureHandoff>,
     peer_addr: SocketAddr,
     budget: &Arc<ConnectionBudget>,
+    stdin_captures: &StdinCaptures,
+    max_captured_bytes: u64,
     peer_maxdata: usize,
     write_timeout: Duration,
 ) -> Result<(), ()> {
@@ -1031,12 +1155,34 @@ async fn handle_wrte(
     let mut queued_response = Vec::new();
 
     match &mut entry.kind {
-        StreamKind::Shell(shell, line_buf, capture, prev_cr) => {
-            // Raw bytes first, before any line framing: a payload streamed with no newline never
-            // becomes a line, and that is exactly the dropper this capture exists for.
-            capture.push(data);
+        StreamKind::Shell(shell, line_buf, capture, prev_cr, held) => {
             let mut responses = Vec::new();
-            for &byte in data {
+            // The bytes the shell itself was typed, kept before any line framing: a payload
+            // streamed with no newline never becomes a line, and that is exactly the dropper this
+            // capture exists for. Input a held command consumed is captured as that command's
+            // input instead, so no byte is captured twice.
+            let mut typed = Vec::new();
+            let mut at = 0;
+            while at < data.len() && !close_shell {
+                if let Some(input) = held.input.as_mut() {
+                    let fed = input.feed(&data[at..]);
+                    at += fed.taken;
+                    responses.extend_from_slice(&fed.echo);
+                    if let Some(end) = fed.ended
+                        && let Some(input) = held.input.take()
+                    {
+                        let output = input.finish(shell, end);
+                        responses.extend_from_slice(&onlcr(output.bytes()));
+                        close_shell = output.close_session;
+                        if !close_shell {
+                            responses.extend_from_slice(&shell_prompt(shell));
+                        }
+                    }
+                    continue;
+                }
+                let byte = data[at];
+                at += 1;
+                typed.push(byte);
                 if *prev_cr {
                     *prev_cr = false;
                     if byte == b'\n' {
@@ -1049,17 +1195,24 @@ async fn handle_wrte(
                     if !line_buf.is_empty() {
                         let line = String::from_utf8_lossy(line_buf).into_owned();
                         line_buf.clear();
-                        let (output, events) = shell.handle_input(&line);
-                        for event in &events {
-                            if event.metadata.get("flood").and_then(|v| v.as_str())
-                                == Some("binary")
-                            {
-                                capture.flag_binary();
-                            }
-                            if emitter.append(event).await.is_err() {
-                                tracing::error!(%peer_addr, "adb: failed to append command event");
-                            }
-                        }
+                        let Some(output) = run_typed_line(
+                            shell,
+                            &line,
+                            held,
+                            *prev_cr,
+                            stdin_captures,
+                            max_captured_bytes,
+                            emitter,
+                            capture,
+                            peer_addr,
+                        )
+                        .await
+                        else {
+                            // The held input took over the rest of this Enter. The prompt comes
+                            // back when the command ends.
+                            *prev_cr = false;
+                            continue;
+                        };
                         responses.extend_from_slice(&onlcr(output.bytes()));
                         close_shell = output.close_session;
                         if close_shell {
@@ -1081,24 +1234,25 @@ async fn handle_wrte(
                     if line_buf.len() >= MAX_SHELL_LINE_LEN {
                         let line = String::from_utf8_lossy(line_buf).into_owned();
                         line_buf.clear();
-                        let (output, events) = shell.handle_input(&line);
-                        for event in &events {
-                            if event.metadata.get("flood").and_then(|v| v.as_str())
-                                == Some("binary")
-                            {
-                                capture.flag_binary();
-                            }
-                            if emitter.append(event).await.is_err() {
-                                tracing::error!(%peer_addr, "adb: failed to append command event");
-                            }
-                        }
-                        close_shell = output.close_session;
-                        if close_shell {
-                            break;
+                        if let Some(output) = run_typed_line(
+                            shell,
+                            &line,
+                            held,
+                            false,
+                            stdin_captures,
+                            max_captured_bytes,
+                            emitter,
+                            capture,
+                            peer_addr,
+                        )
+                        .await
+                        {
+                            close_shell = output.close_session;
                         }
                     }
                 }
             }
+            capture.push(&typed);
             write_or_err(
                 stream,
                 write_timeout,
@@ -1125,6 +1279,25 @@ async fn handle_wrte(
                 let _ = handoff.submit(job);
             }
             queued_response = response;
+        }
+        StreamKind::Exec(shell, held) => {
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_okay(server_id, client_local_id),
+            )
+            .await?;
+            if let Some(input) = held.input.as_mut() {
+                let fed = input.feed(data);
+                if let Some(end) = fed.ended
+                    && let Some(input) = held.input.take()
+                {
+                    // The input reached the capture ceiling: the command runs on what was kept
+                    // and the stream closes when it ends, as for any `shell:<command>`.
+                    queued_response = onlcr(input.finish(shell, end).bytes());
+                    close_shell = true;
+                }
+            }
         }
         StreamKind::OneShot => {}
     }

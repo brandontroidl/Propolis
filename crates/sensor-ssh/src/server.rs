@@ -874,8 +874,13 @@ async fn handle_session(
                                                         &mut nonpty_segments,
                                                     );
                                                 }
-                                                // The prompt comes back when the command ends.
-                                                None => continue,
+                                                // The held input took over the rest of this
+                                                // Enter. The prompt comes back when the command
+                                                // ends.
+                                                None => {
+                                                    prev_cr = false;
+                                                    continue;
+                                                }
                                             }
                                         }
                                         if close_shell {
@@ -1304,14 +1309,17 @@ async fn run_typed_line(
             } else {
                 InputMode::Pipe
             };
-            let input = HeldInput::new(
+            let mut input = HeldInput::new(
                 shell,
                 mode,
                 stdin_captures,
                 CAPTURE_REASON_SHELL_STDIN,
                 max_captured_bytes,
             );
-            *held = Some(if after_cr { input.after_cr() } else { input });
+            if after_cr {
+                input.follow_cr();
+            }
+            *held = Some(input);
             None
         }
     }

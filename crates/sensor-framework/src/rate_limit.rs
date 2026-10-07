@@ -6,8 +6,9 @@
 //! limit one spoofer drives the sensor at line rate, laundering the flood's origin and making the
 //! operator's address the source of unsolicited traffic. [`ReplyRateLimiter`] caps that rate per
 //! source network and in total; [`FloodLedger`] lets a sensor stop writing one event per datagram
-//! for a source over its budget and write one bounded summary per window instead, so a flood
-//! cannot turn into a log flood either.
+//! for a source over its budget and write one bounded summary per window instead
+//! ([`rate_limited_event`], the same shape for every sensor), so a flood cannot turn into a log
+//! flood either.
 //!
 //! Sources are aggregated to the network a single host can usually spoof or own wholesale: the
 //! /24 for IPv4 (IPv4-mapped IPv6 is IPv4) and the /56 for IPv6, the smallest prefix commonly
@@ -29,7 +30,11 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use chrono::{DateTime, SecondsFormat, Utc};
+use sensor_wire::{PROTO_UDP, SIGNAL_HONEYPOT_CONNECTION, SensorEvent, WIRE_VERSION};
+use serde_json::json;
 use tokio::time::Instant;
+use uuid::Uuid;
 
 use crate::listener::normalize_dual_stack;
 use crate::sanitize::sanitize_value;
@@ -49,6 +54,9 @@ pub const MAX_SUMMARY_SOURCES: usize = 32;
 pub const MAX_SUMMARY_SAMPLE_LEN: usize = 1100;
 /// Slots examined when a full key table must evict one.
 const EVICTION_SAMPLES: usize = 4;
+/// Bounds on [`FloodLedger::emit_interval`].
+const MIN_EMIT_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_EMIT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A source network: the /24 of an IPv4 address or the /56 of an IPv6 address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -475,6 +483,66 @@ impl FloodLedger {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.entries.len() + usize::from(state.overflow.is_some())
     }
+
+    /// How often a sensor should look for due summaries: a tenth of the window, clamped, so a
+    /// summary is written at most that late.
+    pub fn emit_interval(&self) -> Duration {
+        (self.window / 10).clamp(MIN_EMIT_INTERVAL, MAX_EMIT_INTERVAL)
+    }
+}
+
+/// One source network's UDP datagrams that got no reply and no event of their own over one
+/// window because the reply rate limit refused them, as the `honeypot_connection` over `udp` a
+/// single datagram would be. `source_ip` is the first address seen from the network in the window
+/// and `source_prefix` names the network (`"overflow"` for networks that arrived while the summary
+/// table was full). `first_seen` and `last_seen` are wall-clock times reconstructed from the
+/// monotonic instants at emission.
+pub fn rate_limited_event(
+    sensor: &str,
+    protocol_label: &str,
+    s: &FloodSummary,
+    wan_ip: Option<IpAddr>,
+    window: Duration,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+) -> SensorEvent {
+    let wall = |at: Instant| {
+        let ago = chrono::Duration::from_std(now.saturating_duration_since(at)).unwrap_or_default();
+        (now_utc - ago).to_rfc3339_opts(SecondsFormat::Millis, true)
+    };
+    let source_prefix = match s.key {
+        Some(key) => key.to_string(),
+        None => "overflow".to_string(),
+    };
+    SensorEvent {
+        v: WIRE_VERSION,
+        source_ip: s.first_source,
+        wan_ip,
+        sensor: sensor.into(),
+        signal_type: SIGNAL_HONEYPOT_CONNECTION.into(),
+        protocol: PROTO_UDP.into(),
+        authenticated: false,
+        observed_at: now_utc,
+        metadata: json!({
+            "protocol_label": protocol_label,
+            "transport": "udp",
+            "query_status": "rate_limited",
+            "source_prefix": source_prefix,
+            "suppressed_count": s.count,
+            "suppressed_bytes": s.bytes,
+            "per_source_limited": s.source_limited,
+            "global_limited": s.global_limited,
+            "first_seen": wall(s.first_seen),
+            "last_seen": wall(s.last_seen),
+            "window_secs": window.as_secs_f64(),
+            "samples": s.samples,
+            "distinct_sources": s.distinct_sources as u64,
+            "distinct_sources_capped": s.distinct_sources_capped,
+        }),
+        sample: None,
+        session_id: Some(Uuid::now_v7()),
+        occurrence_id: None,
+    }
 }
 
 #[cfg(test)]
@@ -787,5 +855,102 @@ mod tests {
         assert_eq!(due[0].key, Some(key("192.0.2.1:1")));
         assert_eq!(l.pending(), 1);
         assert_eq!(l.take_due(t0 + Duration::from_secs(15)).len(), 1);
+    }
+
+    #[test]
+    fn the_emit_interval_is_a_tenth_of_the_window_clamped() {
+        let at = |window: Duration| ledger(1, window).emit_interval();
+        assert_eq!(at(Duration::from_millis(400)), Duration::from_millis(40));
+        assert_eq!(at(Duration::from_secs(10)), Duration::from_secs(1));
+        assert_eq!(at(Duration::from_secs(3600)), Duration::from_secs(1));
+        assert_eq!(at(Duration::from_millis(50)), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn rate_limited_event_shape() {
+        let now = Instant::now();
+        let now_utc: DateTime<Utc> = "2026-10-07T12:00:10Z".parse().unwrap();
+        let mut s = FloodSummary {
+            key: Some(SourceKey::V4([198, 51, 100])),
+            first_source: "198.51.100.9".parse().unwrap(),
+            count: 500,
+            bytes: 14_500,
+            source_limited: 490,
+            global_limited: 10,
+            first_seen: now - Duration::from_secs(10),
+            last_seen: now - Duration::from_millis(250),
+            samples: vec!["ANY example.com.".into()],
+            distinct_sources: 3,
+            distinct_sources_capped: false,
+        };
+        let e = rate_limited_event(
+            "dns",
+            "dns",
+            &s,
+            None,
+            Duration::from_secs(10),
+            now,
+            now_utc,
+        );
+        assert_eq!(e.sensor, "dns");
+        assert_eq!(e.signal_type, SIGNAL_HONEYPOT_CONNECTION);
+        assert_eq!(e.protocol, PROTO_UDP);
+        assert!(!e.authenticated);
+        assert!(e.session_id.is_some() && e.sample.is_none());
+        assert_eq!(e.source_ip, s.first_source);
+        let md = e.metadata.as_object().unwrap();
+        let mut keys: Vec<&str> = md.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want = vec![
+            "protocol_label",
+            "transport",
+            "query_status",
+            "source_prefix",
+            "suppressed_count",
+            "suppressed_bytes",
+            "per_source_limited",
+            "global_limited",
+            "first_seen",
+            "last_seen",
+            "window_secs",
+            "samples",
+            "distinct_sources",
+            "distinct_sources_capped",
+        ];
+        want.sort_unstable();
+        assert_eq!(keys, want);
+        assert_eq!(md["protocol_label"], "dns");
+        assert_eq!(md["query_status"], "rate_limited");
+        assert_eq!(md["transport"], "udp");
+        assert_eq!(md["source_prefix"], "198.51.100.0/24");
+        assert_eq!(md["suppressed_count"], 500);
+        assert_eq!(md["suppressed_bytes"], 14_500);
+        assert_eq!(md["per_source_limited"], 490);
+        assert_eq!(md["global_limited"], 10);
+        assert_eq!(md["first_seen"], "2026-10-07T12:00:00.000Z");
+        assert_eq!(md["last_seen"], "2026-10-07T12:00:09.750Z");
+        assert_eq!(md["window_secs"], 10.0);
+        assert_eq!(md["samples"], json!(["ANY example.com."]));
+        assert_eq!(md["distinct_sources"], 3);
+        assert_eq!(md["distinct_sources_capped"], false);
+
+        s.key = None;
+        let overflow = rate_limited_event(
+            "tftp",
+            "tftp",
+            &s,
+            None,
+            Duration::from_secs(10),
+            now,
+            now_utc,
+        );
+        assert_eq!(overflow.metadata["source_prefix"], "overflow");
+        assert_eq!(
+            (
+                overflow.sensor.as_str(),
+                overflow.metadata["protocol_label"].as_str()
+            ),
+            ("tftp", Some("tftp"))
+        );
     }
 }

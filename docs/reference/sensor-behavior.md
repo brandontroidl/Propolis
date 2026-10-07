@@ -787,8 +787,10 @@ gets the same REFUSED reply, and it never resolves, forwards, or looks anything 
 - **UDP send guard.** Before the crate's single `send_to`
   (`crates/sensor-dns/src/guarded.rs#ReplySocket`), `crates/sensor-dns/src/guarded.rs#reply_gate`
   refuses to answer an unspecified, broadcast or multicast source, a source port in
-  `crates/sensor-dns/src/guarded.rs#REFLECTIVE_SOURCE_PORTS` (0, echo 7, daytime 13, qotd 17,
-  chargen 19, time 37), and any reply a byte budget seeded with the query length would refuse.
+  `crates/sensor-framework/src/reply_source.rs#REFLECTIVE_SOURCE_PORTS` (0, echo 7, daytime 13,
+  qotd 17, chargen 19, time 37), both through the shared
+  `crates/sensor-framework/src/reply_source.rs#check_reply_source`, and any reply a byte budget
+  seeded with the query length would refuse.
   Such a query is still recorded, with `query_status` `suppressed` and a `suppress_reason`
   (`reflective_source_port`, `unroutable_source`, `byte_budget`). A rejected datagram gets no
   reply; a datagram shorter than a header gets neither a reply nor an event.
@@ -839,7 +841,8 @@ gets the same REFUSED reply, and it never resolves, forwards, or looks anything 
   `max_concurrent` pool, or whose handling `read_timeout` cuts off before the event is written,
   gets no event, only a `warn` log line at power-of-two totals. Rate-limited datagrams produce one
   `honeypot_connection` (protocol `udp`, `query_status` `rate_limited`) per source network per
-  window (`crates/sensor-dns/src/events.rs#rate_limited_event`): `source_ip` is the first address
+  window (`crates/sensor-framework/src/rate_limit.rs#rate_limited_event`): `source_ip` is the first
+  address
   seen from the network in the window, and the metadata carries `source_prefix` (CIDR, or
   `overflow`), `suppressed_count`, `suppressed_bytes`, `per_source_limited` and
   `global_limited` (which budget refused them), `first_seen` and `last_seen` (RFC 3339),

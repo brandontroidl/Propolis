@@ -3370,7 +3370,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3385,7 +3384,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3402,7 +3400,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3423,6 +3420,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
  "unicode-normalization",
  "uuid",
 ]
@@ -3441,7 +3439,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3457,7 +3454,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3474,7 +3470,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3492,7 +3487,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3509,7 +3503,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3530,7 +3523,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "x25519-dalek",
 ]
 
@@ -3546,7 +3538,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3561,7 +3552,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

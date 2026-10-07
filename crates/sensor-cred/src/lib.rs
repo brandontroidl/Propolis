@@ -6,12 +6,12 @@ mod tds_tls;
 pub mod vnc;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sensor_framework::{
     ConnectionBounds, EventEmitter, MaybeTlsStream, TlsConfigError, TlsServer, WanResolver,
-    load_server_config_from_env, run_tcp_listener, server_config_from_pem,
+    load_server_config, run_tcp_listener, server_config_from_pem,
 };
 use sensor_wire::SensorEvent;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -29,9 +29,9 @@ pub struct CredTls {
 }
 
 impl CredTls {
-    /// Fail-closed load from the two env vars naming the cert and key files.
-    pub fn from_env(cert_var: &str, key_var: &str) -> Result<Self, TlsConfigError> {
-        let config = load_server_config_from_env(cert_var, key_var)?;
+    /// Fail-closed load of the cert and key files (`sensor_framework::load_server_config`).
+    pub fn from_files(cert_path: &Path, key_path: &Path) -> Result<Self, TlsConfigError> {
+        let config = load_server_config(cert_path, key_path)?;
         let mut mssql = (*config).clone();
         mssql.send_tls13_tickets = 0;
         Ok(Self {

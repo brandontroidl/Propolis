@@ -265,7 +265,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    sensor_framework::init_logging();
 
     let config = match load_config_from_env() {
         Ok(c) => c,
@@ -311,7 +311,8 @@ async fn main() {
                 handles.push(handle);
             }
             Err(e) => {
-                tracing::warn!(%addr, error = %e, "catchall: tcp bind failed; skipping this port");
+                let e = sensor_framework::listener_start_error(*addr, e);
+                tracing::warn!("catchall: tcp {e}; skipping this port");
             }
         }
 
@@ -337,13 +338,16 @@ async fn main() {
                 handles.push(handle);
             }
             Err(e) => {
-                tracing::warn!(%addr, error = %e, "catchall: udp bind failed; skipping this port");
+                let e = sensor_framework::listener_start_error(*addr, e);
+                tracing::warn!("catchall: udp {e}; skipping this port");
             }
         }
     }
 
     if handles.is_empty() {
-        tracing::error!("catchall: no listener bound on any configured address; exiting");
+        tracing::error!(
+            "catchall: no listener started on any configured address; refusing to start"
+        );
         std::process::exit(1);
     }
 

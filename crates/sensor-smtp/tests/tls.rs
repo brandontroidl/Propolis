@@ -582,6 +582,42 @@ async fn a_bind_failure_on_any_listener_exits_1_and_leaves_nothing_serving() {
     drop(taken);
 }
 
+/// Blank or whitespace-only TLS and submission vars read as unset, as
+/// `deploy/fleet-listeners.sh` reads a blank bind: one plain listener, still running.
+#[test]
+fn blank_tls_vars_are_unset() {
+    use std::time::Instant;
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sensor-smtp"))
+        .env_clear()
+        .env("NO_COLOR", "1")
+        .env("PROPOLIS_SMTP_BIND", "127.0.0.1:0")
+        .env("PROPOLIS_SMTP_LOG_PATH", dir.path().join("events.jsonl"))
+        .env("PROPOLIS_SMTP_SUBMISSION_BIND", " ")
+        .env("PROPOLIS_SMTP_TLS_BIND", "")
+        .env("PROPOLIS_SMTP_TLS_CERT", "  ")
+        .env("PROPOLIS_SMTP_TLS_KEY", "\t")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let still_running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(still_running, "blank vars must read as unset: {text}");
+    assert_eq!(text.matches("sensor-smtp: listening").count(), 1, "{text}");
+}
+
 /// Cert and key with no TLS bind and no submission bind: the one plain listener runs, no
 /// implicit-TLS listener exists, and STARTTLS is live on it. Key material is written at runtime
 /// into a tempdir, key mode 0600.
@@ -599,9 +635,7 @@ async fn a_valid_pair_without_a_tls_bind_enables_starttls_on_the_plain_listener_
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sensor-smtp"))
         .env_clear()
-        // A workspace build unifies tracing-subscriber's `env-filter` feature on, which makes an
-        // unset RUST_LOG mean errors only; the info line asserted below needs info.
-        .env("RUST_LOG", "info")
+        // RUST_LOG is left unset: the info line asserted below relies on the INFO default.
         .env("NO_COLOR", "1")
         .env("PROPOLIS_SMTP_BIND", format!("127.0.0.1:{port}"))
         .env("PROPOLIS_SMTP_LOG_PATH", dir.path().join("events.jsonl"))
@@ -690,7 +724,6 @@ fn a_non_utf8_tls_var_exits_1_before_any_listener_binds() {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sensor-smtp"))
             .env_clear()
             .env("NO_COLOR", "1")
-            .env("RUST_LOG", "info")
             .env("PROPOLIS_SMTP_BIND", "127.0.0.1:0")
             .env("PROPOLIS_SMTP_LOG_PATH", dir.path().join("events.jsonl"))
             .env(var, bad)

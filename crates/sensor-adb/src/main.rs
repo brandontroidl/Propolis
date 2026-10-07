@@ -249,7 +249,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    sensor_framework::init_logging();
 
     let config = match load_config_from_env() {
         Ok(c) => c,
@@ -275,11 +275,8 @@ async fn main() {
     {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::error!(
-                addr = %config.bind_addr,
-                error = %e,
-                "sensor-adb: failed to start server"
-            );
+            let e = sensor_framework::listener_start_error(config.bind_addr, e);
+            tracing::error!("sensor-adb: {e}; refusing to start");
             std::process::exit(1);
         }
     };

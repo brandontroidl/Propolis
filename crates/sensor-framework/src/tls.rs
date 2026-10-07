@@ -30,13 +30,11 @@ use crate::listener::run_tcp_listener;
 /// misconfiguration (or a wrong path such as a device or log), refused rather than slurped.
 const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
 
-/// Why a TLS config could not be built. No variant ever carries key bytes or PEM text.
+/// Why a TLS config could not be built. No variant carries file content: a PEM failure is
+/// reduced to a fixed description (see [`pem_error_kind`]), and `Io` and `Rustls` errors hold
+/// only the OS or rustls error, never the bytes read.
 #[derive(Debug)]
 pub enum TlsConfigError {
-    /// An env var naming a cert or key path was unset or empty.
-    EnvMissing {
-        var: String,
-    },
     /// An env var was set but not valid UTF-8.
     EnvNotUnicode {
         var: String,
@@ -56,9 +54,11 @@ pub enum TlsConfigError {
         path: PathBuf,
         mode: u32,
     },
+    /// `kind` is a constant, never the parser's error: `pem::Error`'s Display prints the offending
+    /// line or section label as raw bytes, which for a one-line PEM is the whole key.
     Pem {
         path: PathBuf,
-        source: rustls_pki_types::pem::Error,
+        kind: &'static str,
     },
     NoCertificate {
         path: PathBuf,
@@ -73,7 +73,6 @@ pub enum TlsConfigError {
 impl fmt::Display for TlsConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EnvMissing { var } => write!(f, "environment variable {var} is unset or empty"),
             Self::EnvNotUnicode { var } => {
                 write!(f, "environment variable {var} is not valid UTF-8")
             }
@@ -91,8 +90,8 @@ impl fmt::Display for TlsConfigError {
                 "private key {} has mode {mode:04o}; group/other access must be removed (chmod 0600)",
                 path.display()
             ),
-            Self::Pem { path, source } => {
-                write!(f, "malformed PEM in {}: {source}", path.display())
+            Self::Pem { path, kind } => {
+                write!(f, "malformed PEM in {}: {kind}", path.display())
             }
             Self::NoCertificate { path } => {
                 write!(f, "no certificate found in {}", path.display())
@@ -109,10 +108,30 @@ impl std::error::Error for TlsConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Pem { source, .. } => Some(source),
             Self::Rustls(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+/// Total over `pem::Error`; the wildcard arm exists because the enum is `#[non_exhaustive]`.
+fn pem_error_kind(error: &rustls_pki_types::pem::Error) -> &'static str {
+    use rustls_pki_types::pem::Error;
+    match error {
+        Error::MissingSectionEnd { .. } => "missing section end marker",
+        Error::IllegalSectionStart { .. } => "illegal section start",
+        Error::Base64Decode(_) => "base64 decode error",
+        Error::Io(_) => "I/O error",
+        Error::NoItemsFound => "no items found",
+        Error::SectionTooLarge => "section too large",
+        _ => "malformed PEM",
+    }
+}
+
+fn pem_error(path: &Path) -> impl FnOnce(rustls_pki_types::pem::Error) -> TlsConfigError + '_ {
+    move |error| TlsConfigError::Pem {
+        path: path.to_path_buf(),
+        kind: pem_error_kind(&error),
     }
 }
 
@@ -124,10 +143,7 @@ fn build(
 ) -> Result<Arc<ServerConfig>, TlsConfigError> {
     let certs = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| TlsConfigError::Pem {
-            path: cert_path.to_path_buf(),
-            source,
-        })?;
+        .map_err(pem_error(cert_path))?;
     if certs.is_empty() {
         return Err(TlsConfigError::NoCertificate {
             path: cert_path.to_path_buf(),
@@ -136,10 +152,7 @@ fn build(
     let key = PrivateKeyDer::pem_slice_iter(key_pem)
         .next()
         .transpose()
-        .map_err(|source| TlsConfigError::Pem {
-            path: key_path.to_path_buf(),
-            source,
-        })?
+        .map_err(pem_error(key_path))?
         .ok_or_else(|| TlsConfigError::NoPrivateKey {
             path: key_path.to_path_buf(),
         })?;
@@ -222,20 +235,12 @@ pub fn load_server_config(
     result
 }
 
-/// Load via two env vars naming the cert and key paths. A var that is unset or empty is
-/// `EnvMissing` (the caller invokes this only when a TLS bind is configured, so absence is a
-/// startup error).
-pub fn load_server_config_from_env(
-    cert_var: &str,
-    key_var: &str,
-) -> Result<Arc<ServerConfig>, TlsConfigError> {
-    load_server_config_with_env(cert_var, key_var, |name| std::env::var(name))
-}
-
-/// Read one TLS env var (a cert or key path, or a TLS bind) for a sensor's startup config parse.
-/// Unset is `Ok(None)`. A value that is not valid UTF-8 is `EnvNotUnicode`: never read as unset,
-/// which would silently turn TLS off or drop a listener, and never converted lossily into a path
-/// or address the operator did not write. Blank handling is left to the caller.
+/// The one reader for every sensor TLS env var (a cert or key path, a TLS bind, smtp's
+/// submission bind), so all six TLS sensors apply the same rule. Unset is `Ok(None)`. The value
+/// is trimmed of leading and trailing ASCII whitespace, and a value blank after the trim is also
+/// `Ok(None)`, matching `deploy/fleet-listeners.sh`, which skips blank binds. A value that is
+/// not valid UTF-8 is `EnvNotUnicode`: never read as unset, which would silently turn TLS off or
+/// drop a listener, and never converted lossily into a path or address the operator did not write.
 pub fn tls_env_var(var: &str) -> Result<Option<String>, TlsConfigError> {
     tls_env_value(var, std::env::var(var))
 }
@@ -245,32 +250,15 @@ fn tls_env_value(
     value: Result<String, std::env::VarError>,
 ) -> Result<Option<String>, TlsConfigError> {
     match value {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) => {
+            let trimmed = value.trim_matches(|c: char| c.is_ascii_whitespace());
+            Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+        }
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(TlsConfigError::EnvNotUnicode {
             var: var.to_string(),
         }),
     }
-}
-
-/// Testable core of [`load_server_config_from_env`]; `lookup` is `std::env::var` in production.
-pub fn load_server_config_with_env(
-    cert_var: &str,
-    key_var: &str,
-    lookup: impl Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<Arc<ServerConfig>, TlsConfigError> {
-    let get = |var: &str| match lookup(var) {
-        Ok(value) if !value.is_empty() => Ok(PathBuf::from(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Err(TlsConfigError::EnvMissing {
-            var: var.to_string(),
-        }),
-        Err(std::env::VarError::NotUnicode(_)) => Err(TlsConfigError::EnvNotUnicode {
-            var: var.to_string(),
-        }),
-    };
-    let cert = get(cert_var)?;
-    let key = get(key_var)?;
-    load_server_config(&cert, &key)
 }
 
 /// Cheaply cloneable TLS acceptor (an `Arc<ServerConfig>` inside).
@@ -627,40 +615,10 @@ mod tests {
     }
 
     #[test]
-    fn env_missing_and_empty_are_errors() {
-        assert!(matches!(
-            load_server_config_with_env("C", "K", |_| Err(std::env::VarError::NotPresent)),
-            Err(TlsConfigError::EnvMissing { var }) if var == "C"
-        ));
-        assert!(matches!(
-            load_server_config_with_env("C", "K", |n| if n == "C" {
-                Ok("/nonexistent/cert".to_string())
-            } else {
-                Ok(String::new())
-            }),
-            Err(TlsConfigError::EnvMissing { var }) if var == "K"
-        ));
-    }
-
-    #[test]
-    fn env_not_unicode_is_error() {
-        assert!(matches!(
-            load_server_config_with_env("C", "K", |_| Err(std::env::VarError::NotUnicode(
-                OsString::new()
-            ))),
-            Err(TlsConfigError::EnvNotUnicode { .. })
-        ));
-    }
-
-    #[test]
     fn tls_env_value_unset_is_none_and_not_unicode_is_an_error() {
         assert!(matches!(
             tls_env_value("C", Err(std::env::VarError::NotPresent)),
             Ok(None)
-        ));
-        assert!(matches!(
-            tls_env_value("C", Ok(" ".to_string())),
-            Ok(Some(v)) if v == " "
         ));
         assert!(matches!(
             tls_env_value("C", Err(std::env::VarError::NotUnicode(OsString::new()))),
@@ -669,21 +627,128 @@ mod tests {
     }
 
     #[test]
-    fn env_happy_path() {
-        let (_dir, c, k, _) = files(0o600);
-        let result = load_server_config_with_env("C", "K", |n| {
-            Ok(if n == "C" { &c } else { &k }
-                .to_string_lossy()
-                .into_owned())
-        });
-        assert!(result.is_ok());
+    fn tls_env_value_is_trimmed_and_blank_is_unset() {
+        for blank in ["", " ", "\t", " \t\r\n "] {
+            assert!(
+                matches!(tls_env_value("C", Ok(blank.to_string())), Ok(None)),
+                "{blank:?}"
+            );
+        }
+        assert!(matches!(
+            tls_env_value("C", Ok("\t 0.0.0.0:443 \n".to_string())),
+            Ok(Some(v)) if v == "0.0.0.0:443"
+        ));
+        assert!(matches!(
+            tls_env_value("C", Ok(" /etc/propolis/tls/x.key".to_string())),
+            Ok(Some(v)) if v == "/etc/propolis/tls/x.key"
+        ));
+        // Only ASCII whitespace is trimmed: a no-break space is part of the value.
+        assert!(matches!(
+            tls_env_value("C", Ok("\u{a0}".to_string())),
+            Ok(Some(v)) if v == "\u{a0}"
+        ));
+    }
+
+    /// `e` and every error in its `source()` chain, each through Display and Debug.
+    fn renderings(e: &TlsConfigError) -> Vec<String> {
+        let mut out = vec![format!("{e}"), format!("{e:?}")];
+        let mut next = std::error::Error::source(e);
+        while let Some(source) = next {
+            out.push(format!("{source}"));
+            out.push(format!("{source:?}"));
+            next = source.source();
+        }
+        out
+    }
+
+    /// No rendering of `e` may hold any 8 consecutive bytes of `body`: as text, as a decimal byte
+    /// list (how `{:?}` prints a `Vec<u8>`), or as lowercase or uppercase hex (packed, or a
+    /// `{:02x?}` list).
+    fn assert_no_leak(e: &TlsConfigError, body: &[u8]) {
+        assert!(body.len() >= 8, "fixture body too short to test");
+        for text in renderings(e) {
+            for w in body.windows(8) {
+                let hex: Vec<String> = w.iter().map(|b| format!("{b:02x}")).collect();
+                let needles = [
+                    String::from_utf8_lossy(w).into_owned(),
+                    w.iter().map(u8::to_string).collect::<Vec<_>>().join(", "),
+                    hex.concat(),
+                    hex.concat().to_uppercase(),
+                    hex.join(", "),
+                    hex.join(", ").to_uppercase(),
+                ];
+                for needle in needles {
+                    assert!(
+                        !text.contains(&needle),
+                        "body bytes {needle:?} leaked into error: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The base64 body of a freshly generated key, every line joined, headers dropped.
+    fn key_body(key_pem: &str) -> String {
+        key_pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect()
+    }
+
+    // A key written header, body and footer on ONE line parses as a section whose label runs to
+    // the last five dashes, so the parser's MissingSectionEnd carries the whole key as its
+    // end marker. The Pem variant must not pass that on, from the key slot or the cert slot (an
+    // operator may point both env vars at one combined PEM).
+    #[test]
+    fn malformed_pem_errors_never_carry_body_bytes() {
+        let (cert, key, _) = ephemeral();
+        let body = key_body(&key);
+        let kw = ["PRI", "VATE"].concat();
+        let (begin, end) = (
+            format!("-----BEGIN {kw} KEY-----"),
+            format!("-----END {kw} KEY-----"),
+        );
+        let shapes = [
+            format!("{begin}{body}{end}"),
+            format!("{begin}{body}{end}\n"),
+            format!("{begin}{body}\n{end}\n"),
+            format!("{begin}\n{body}\n"),
+            format!("{begin}\n{body}!!\n{end}\n"),
+        ];
+        for shape in &shapes {
+            for err in [
+                server_config_from_pem(cert.as_bytes(), shape.as_bytes()).unwrap_err(),
+                server_config_from_pem(shape.as_bytes(), key.as_bytes()).unwrap_err(),
+            ] {
+                assert_no_leak(&err, body.as_bytes());
+            }
+        }
+        let one_line = shapes[0].as_bytes();
+        assert!(matches!(
+            server_config_from_pem(cert.as_bytes(), one_line),
+            Err(TlsConfigError::Pem { .. })
+        ));
+
+        // Through the file loader too, with the one-line key in both the key and the cert file.
+        let dir = tempfile::tempdir().unwrap();
+        let (c, k) = (dir.path().join("c.crt"), dir.path().join("k.key"));
+        write_with_mode(&c, cert.as_bytes(), 0o644);
+        write_with_mode(&k, one_line, 0o600);
+        let err = load_server_config(&c, &k).unwrap_err();
+        assert!(matches!(err, TlsConfigError::Pem { .. }), "{err:?}");
+        assert_no_leak(&err, body.as_bytes());
+        write_with_mode(&c, one_line, 0o644);
+        write_with_mode(&k, key.as_bytes(), 0o600);
+        let err = load_server_config(&c, &k).unwrap_err();
+        assert!(matches!(err, TlsConfigError::Pem { .. }), "{err:?}");
+        assert_no_leak(&err, body.as_bytes());
     }
 
     #[test]
     fn error_display_never_contains_key_material() {
         let (cert, key, _) = ephemeral();
         let (_, other_key, _) = ephemeral();
-        let body: String = key.lines().nth(1).unwrap().chars().take(20).collect();
+        let body = key_body(&key);
         let (_dir, c, k, _) = files(0o644);
         let errors = [
             server_config_from_pem(b"", key.as_bytes()).unwrap_err(),
@@ -695,10 +760,11 @@ mod tests {
             server_config_from_pem(cert.as_bytes(), other_key.as_bytes()).unwrap_err(),
             load_server_config(&c, &k).unwrap_err(),
         ];
+        let header = format!("{} KEY", ["PRI", "VATE"].concat());
         for e in errors {
-            for text in [format!("{e}"), format!("{e:?}")] {
-                assert!(!text.contains("PRIVATE KEY"), "{text}");
-                assert!(!text.contains(&body), "{text}");
+            assert_no_leak(&e, body.as_bytes());
+            for text in renderings(&e) {
+                assert!(!text.contains(&header), "{text}");
             }
         }
     }
@@ -716,8 +782,8 @@ mod tests {
             format!("-----BEGIN {kw} KEY-----\n{marker}!!!notbase64\n-----END {kw} KEY-----\n");
         let err = server_config_from_pem(cert.as_bytes(), garbage_key.as_bytes()).unwrap_err();
         let header = format!("{kw} KEY");
-        for text in [format!("{err}"), format!("{err:?}")] {
-            assert!(!text.contains(marker), "key body leaked into error: {text}");
+        assert_no_leak(&err, marker.as_bytes());
+        for text in renderings(&err) {
             assert!(!text.contains(&header), "{text}");
         }
     }

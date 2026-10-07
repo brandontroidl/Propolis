@@ -821,6 +821,28 @@ fn cred_refuses_to_start_with_only_one_tls_var() {
     let mut cmd = sensor(pki_dir.path(), "127.0.0.1:0");
     cmd.env(CERT_VAR, &cert_path);
     assert_eq!(exit_code(cmd), Some(1));
+    // A blank partner is unset, so it does not complete the pair.
+    let mut cmd = sensor(pki_dir.path(), "127.0.0.1:0");
+    cmd.env(CERT_VAR, &cert_path).env(KEY_VAR, " ");
+    assert_eq!(exit_code(cmd), Some(1));
+}
+
+/// Blank or whitespace-only cert and key vars read as unset (the rule every TLS sensor shares):
+/// the plaintext sensor starts and keeps running.
+#[test]
+fn cred_starts_in_plaintext_when_both_tls_vars_are_blank() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = sensor(dir.path(), "127.0.0.1:0");
+    cmd.env(CERT_VAR, "").env(KEY_VAR, " \t");
+    let mut child = cmd.spawn().unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    let still_running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        still_running,
+        "blank TLS vars must read as unset, not refuse"
+    );
 }
 
 /// A cert or key variable that is set but not UTF-8 is a configuration error, not "unset": with

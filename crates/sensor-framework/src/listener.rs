@@ -37,6 +37,17 @@ const UDP_MAX_DATAGRAM: usize = 65536;
 /// core at 100% retrying an error that will not clear itself instantly.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 
+/// The error a sensor logs when a listener fails to start after its config validated: names the
+/// address and the OS error, keeping the error's kind. Every sensor logs it as
+/// `<sensor>: <this error>; refusing to start` (or `; skipping ...` where one failed address is
+/// not fatal), so one troubleshooting entry covers every sensor.
+pub fn listener_start_error(addr: SocketAddr, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!("cannot start listener on {addr}: {error}"),
+    )
+}
+
 /// Bind one TCP address and run its accept loop as a spawned task, returning immediately with the
 /// actual bound address (useful for an ephemeral `:0` port, as every test in
 /// `tests/listener_integration.rs` relies on) and a `JoinHandle` the caller can `.abort()` to stop
@@ -358,5 +369,19 @@ mod tests {
         // 2001:db8::1 is not in the ::ffff:0:0/96 mapped range - must pass through untouched.
         let addr: SocketAddr = "[2001:db8::1]:4242".parse().unwrap();
         assert_eq!(normalize_dual_stack(addr), addr);
+    }
+
+    #[tokio::test]
+    async fn listener_start_error_names_the_address_and_the_os_error() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = taken.local_addr().unwrap();
+        let os_error = TcpListener::bind(addr).await.unwrap_err();
+        let os_text = os_error.to_string();
+        let error = listener_start_error(addr, os_error);
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(
+            error.to_string(),
+            format!("cannot start listener on {addr}: {os_text}")
+        );
     }
 }

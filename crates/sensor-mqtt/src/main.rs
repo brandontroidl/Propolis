@@ -94,23 +94,18 @@ struct TlsConfig {
 
 /// `None` only when no TLS variable is set at all. Anything else must be a complete, parseable
 /// configuration: exactly one of cert/key, or a bind without the pair, is an error so the caller
-/// refuses to start rather than serving plaintext where TLS was asked for. A blank value counts as
-/// unset. An empty `PROPOLIS_MQTT_TLS_BIND=` is an invalid address (refuse), not "off".
+/// refuses to start rather than serving plaintext where TLS was asked for. Inputs come from
+/// `sensor_framework::tls_env_var`, already trimmed with blank read as unset, so an empty
+/// `PROPOLIS_MQTT_TLS_BIND=` is "off", as `deploy/fleet-listeners.sh` reads it.
 fn parse_tls(
     bind: Option<&str>,
     cert: Option<&str>,
     key: Option<&str>,
 ) -> Result<Option<TlsConfig>, ConfigError> {
-    let path = |raw: Option<&str>| {
-        raw.map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    };
-    let (cert_path, key_path) = (path(cert), path(key));
+    let (cert_path, key_path) = (cert.map(PathBuf::from), key.map(PathBuf::from));
     let bind_addr = bind
         .map(|raw| {
-            raw.trim()
-                .parse::<SocketAddr>()
+            raw.parse::<SocketAddr>()
                 .map_err(|_| ConfigError::InvalidTlsBind(raw.to_string()))
         })
         .transpose()?;
@@ -277,7 +272,7 @@ fn parse_positive_u32(
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    sensor_framework::init_logging();
 
     let config = match load_config_from_env() {
         Ok(c) => c,
@@ -329,7 +324,8 @@ async fn main() {
     {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::error!(addr = %bind_addr, error = %e, "sensor-mqtt: failed to start");
+            let e = sensor_framework::listener_start_error(bind_addr, e);
+            tracing::error!("sensor-mqtt: {e}; refusing to start");
             std::process::exit(1);
         }
     };
@@ -353,7 +349,8 @@ async fn main() {
                 }
                 Err(e) => {
                     handle.abort();
-                    tracing::error!(addr = %tls_addr, error = %e, "sensor-mqtt: failed to start tls listener; refusing to start");
+                    let e = sensor_framework::listener_start_error(tls_addr, e);
+                    tracing::error!("sensor-mqtt: {e}; refusing to start");
                     std::process::exit(1);
                 }
             }
@@ -424,6 +421,7 @@ mod tests {
 
     #[test]
     fn parse_tls_absent_is_none() {
+        // Blank values never reach here: tls_env_var reads them as unset.
         assert_eq!(parse_tls(None, None, None).unwrap(), None);
     }
 
@@ -474,22 +472,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_tls_blank_path_counts_as_missing() {
+    fn parse_tls_rejects_a_bad_bind() {
         assert!(matches!(
-            parse_tls(Some("0.0.0.0:8883"), Some("   "), Some("/k")),
-            Err(ConfigError::TlsVarMissing(ENV_TLS_CERT))
+            parse_tls(Some("nonsense"), Some("/c"), Some("/k")),
+            Err(ConfigError::InvalidTlsBind(_))
         ));
-        assert_eq!(parse_tls(None, Some(""), Some(" ")).unwrap(), None);
-    }
-
-    #[test]
-    fn parse_tls_rejects_bad_or_empty_bind() {
-        for bind in ["nonsense", ""] {
-            assert!(matches!(
-                parse_tls(Some(bind), Some("/c"), Some("/k")),
-                Err(ConfigError::InvalidTlsBind(_))
-            ));
-        }
     }
 
     #[test]

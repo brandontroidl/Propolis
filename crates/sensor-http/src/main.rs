@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, TlsServer, WanResolver, shutdown_signal};
+use sensor_framework::{
+    ConnectionBounds, TlsServer, WanResolver, listener_start_error, shutdown_signal,
+};
 
 const ENV_BIND: &str = "PROPOLIS_HTTP_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_HTTP_WAN_MAP";
@@ -146,29 +148,23 @@ fn parse_positive_u32(
     Ok(value)
 }
 
-/// TLS is enabled iff both the cert and key paths are set (blank counts as unset). Anything
-/// less than that while TLS was asked for, by one path var or by a bind, is a refusal: the
-/// caller exits rather than serving plaintext where TLS was intended. With no TLS var set at
-/// all the sensor behaves exactly as before. The TLS bind has no compiled default.
+/// TLS is enabled iff both the cert and key paths are set. Inputs come from
+/// `sensor_framework::tls_env_var`, already trimmed with blank read as unset. Anything less than
+/// a pair while TLS was asked for, by one path var or by a bind, is a refusal: the caller exits
+/// rather than serving plaintext where TLS was intended. With no TLS var set at all the sensor
+/// behaves exactly as before. The TLS bind has no compiled default.
 fn parse_tls(
     bind: Option<&str>,
     cert: Option<&str>,
     key: Option<&str>,
 ) -> Result<Option<TlsConfig>, ConfigError> {
-    let path = |raw: Option<&str>| {
-        raw.map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    };
-    let (cert_path, key_path) = (path(cert), path(key));
-    let bind_addr = match bind {
-        Some(raw) => Some(
-            raw.trim()
-                .parse::<SocketAddr>()
-                .map_err(|_| ConfigError::InvalidTlsBind(raw.to_string()))?,
-        ),
-        None => None,
-    };
+    let (cert_path, key_path) = (cert.map(PathBuf::from), key.map(PathBuf::from));
+    let bind_addr = bind
+        .map(|raw| {
+            raw.parse::<SocketAddr>()
+                .map_err(|_| ConfigError::InvalidTlsBind(raw.to_string()))
+        })
+        .transpose()?;
     match (bind_addr, cert_path, key_path) {
         (None, None, None) => Ok(None),
         (_, None, _) => Err(ConfigError::TlsPathMissing(ENV_TLS_CERT)),
@@ -238,7 +234,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    sensor_framework::init_logging();
 
     let config = match load_config_from_env() {
         Ok(c) => c,
@@ -284,7 +280,8 @@ async fn main() {
     {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::error!(addr = %config.bind_addr, error = %e, "sensor-http: failed to start server");
+            let e = listener_start_error(config.bind_addr, e);
+            tracing::error!("sensor-http: {e}; refusing to start");
             std::process::exit(1);
         }
     };
@@ -307,7 +304,8 @@ async fn main() {
                 }
                 Err(e) => {
                     handle.abort();
-                    tracing::error!(addr = %addr, error = %e, "sensor-http: failed to start tls server");
+                    let e = listener_start_error(addr, e);
+                    tracing::error!("sensor-http: {e}; refusing to start");
                     std::process::exit(1);
                 }
             }
@@ -367,8 +365,8 @@ mod tests {
 
     #[test]
     fn parse_tls_unset_is_none() {
+        // Blank values never reach here: tls_env_var reads them as unset.
         assert_eq!(parse_tls(None, None, None), Ok(None));
-        assert_eq!(parse_tls(None, Some("  "), Some("")), Ok(None));
     }
 
     #[test]
@@ -395,7 +393,7 @@ mod tests {
             Err(ConfigError::TlsPathMissing(ENV_TLS_KEY))
         );
         assert_eq!(
-            parse_tls(Some("0.0.0.0:443"), CRT, Some("   ")),
+            parse_tls(Some("0.0.0.0:443"), CRT, None),
             Err(ConfigError::TlsPathMissing(ENV_TLS_KEY))
         );
     }
@@ -409,13 +407,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_tls_rejects_bad_or_empty_bind() {
+    fn parse_tls_rejects_a_bad_bind() {
         assert!(matches!(
             parse_tls(Some("nonsense"), CRT, KEY),
-            Err(ConfigError::InvalidTlsBind(_))
-        ));
-        assert!(matches!(
-            parse_tls(Some(""), CRT, KEY),
             Err(ConfigError::InvalidTlsBind(_))
         ));
     }

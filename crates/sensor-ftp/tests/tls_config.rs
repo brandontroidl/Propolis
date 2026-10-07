@@ -79,7 +79,6 @@ fn a_non_utf8_tls_var_exits_1_before_any_listener_binds() {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sensor-ftp"))
             .env_clear()
             .env("NO_COLOR", "1")
-            .env("RUST_LOG", "info")
             .env("PROPOLIS_FTP_BIND", "127.0.0.1:0")
             .env("PROPOLIS_FTP_LOG_PATH", dir.path().join("events.jsonl"))
             .env("PROPOLIS_FTP_SPOOL_DIR", dir.path().join("spool"))
@@ -119,6 +118,53 @@ fn no_tls_configuration_keeps_running_as_before() {
     );
 }
 
+/// Blank or whitespace-only TLS vars read as unset, as `deploy/fleet-listeners.sh` reads a blank
+/// bind: the plain sensor keeps running.
+#[test]
+fn blank_tls_vars_are_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = sensor(
+        dir.path(),
+        &[
+            ("PROPOLIS_FTP_TLS_BIND", ""),
+            ("PROPOLIS_FTP_TLS_CERT", "  "),
+            ("PROPOLIS_FTP_TLS_KEY", "\t"),
+        ],
+    );
+    assert!(
+        exit_within(&mut child, Duration::from_secs(1)).is_none(),
+        "blank TLS vars must read as unset, not refuse"
+    );
+}
+
+/// Cert and key paths padded with whitespace are trimmed: a valid pair still loads.
+#[test]
+fn padded_cert_and_key_paths_are_trimmed() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let (cert_path, key_path) = (dir.path().join("c.pem"), dir.path().join("k.pem"));
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (padded_cert, padded_key) = (
+        format!(" {}", cert_path.display()),
+        format!("{}\t", key_path.display()),
+    );
+    let mut child = sensor(
+        dir.path(),
+        &[
+            ("PROPOLIS_FTP_TLS_CERT", &padded_cert),
+            ("PROPOLIS_FTP_TLS_KEY", &padded_key),
+        ],
+    );
+    assert!(
+        exit_within(&mut child, Duration::from_secs(1)).is_none(),
+        "padded paths must be trimmed, not refused"
+    );
+}
+
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
@@ -148,9 +194,7 @@ async fn a_valid_pair_without_a_tls_bind_enables_auth_tls_on_the_plain_listener_
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_sensor-ftp"))
         .env_clear()
-        // A workspace build unifies tracing-subscriber's `env-filter` feature on, which makes an
-        // unset RUST_LOG mean errors only; the info line asserted below needs info.
-        .env("RUST_LOG", "info")
+        // RUST_LOG is left unset: the info line asserted below relies on the INFO default.
         .env("NO_COLOR", "1")
         .env("PROPOLIS_FTP_BIND", format!("127.0.0.1:{port}"))
         .env("PROPOLIS_FTP_LOG_PATH", dir.path().join("events.jsonl"))

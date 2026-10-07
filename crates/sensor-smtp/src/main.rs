@@ -41,9 +41,9 @@ fn parse_positive_u32(raw: Option<&str>, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// Unset or blank means "not configured". Anything else, a non-UTF-8 value included, must parse
-/// or the sensor refuses to start: a typo must not silently drop a listener the derived fleet
-/// inventory will claim exists.
+/// Read through `sensor_framework::tls_env_var`: unset or blank means "not configured". Anything
+/// else, a non-UTF-8 value included, must parse or the sensor refuses to start: a typo must not
+/// silently drop a listener the derived fleet inventory will claim exists.
 fn optional_bind(var: &str) -> Option<SocketAddr> {
     let raw = match sensor_framework::tls_env_var(var) {
         Ok(raw) => raw?,
@@ -52,14 +52,10 @@ fn optional_bind(var: &str) -> Option<SocketAddr> {
             std::process::exit(1);
         }
     };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
     match raw.parse() {
         Ok(addr) => Some(addr),
         Err(_) => {
-            tracing::error!("invalid {var}: {raw:?}");
+            tracing::error!("sensor-smtp: invalid {var}: {raw:?}; refusing to start");
             std::process::exit(1);
         }
     }
@@ -67,7 +63,7 @@ fn optional_bind(var: &str) -> Option<SocketAddr> {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    sensor_framework::init_logging();
 
     let bind_raw = match env::var(ENV_BIND) {
         Ok(v) => v,
@@ -116,9 +112,12 @@ async fn main() {
     // leaves a plaintext listener running.
     let submission_bind = optional_bind(ENV_SUBMISSION_BIND);
     let tls_bind = optional_bind(ENV_TLS_BIND);
-    let tls = match sensor_smtp::tls_from_env(ENV_TLS_CERT, ENV_TLS_KEY, tls_bind.is_some(), |v| {
-        env::var(v)
-    }) {
+    let tls = match sensor_smtp::tls_from_env(
+        ENV_TLS_CERT,
+        ENV_TLS_KEY,
+        tls_bind.is_some(),
+        sensor_framework::tls_env_var,
+    ) {
         Ok(tls) => tls,
         Err(e) => {
             tracing::error!(error = %e, "sensor-smtp: invalid TLS configuration; refusing to start");
@@ -138,7 +137,7 @@ async fn main() {
         match sensor_smtp::start_listeners(listeners, log_path, wan_resolver, bounds).await {
             Ok(started) => started,
             Err(e) => {
-                tracing::error!(error = %e, "sensor-smtp: failed to start");
+                tracing::error!("sensor-smtp: {e}; refusing to start");
                 std::process::exit(1);
             }
         };

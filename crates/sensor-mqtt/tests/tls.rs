@@ -447,11 +447,9 @@ async fn plain_listener_events_have_no_tls_key() {
 fn run_binary(envs: &[(&str, &str)], wait: Duration) -> (Option<i32>, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sensor-mqtt"))
         .env_clear()
-        // NO_COLOR keeps ANSI escapes out of the log text the tests match on.
+        // NO_COLOR keeps ANSI escapes out of the log text the tests match on. RUST_LOG is left
+        // unset: the warning and info lines asserted below rely on the INFO default.
         .env("NO_COLOR", "1")
-        // A workspace build unifies tracing-subscriber's `env-filter` feature on, which makes an
-        // unset RUST_LOG mean errors only; the warning and info lines asserted below need info.
-        .env("RUST_LOG", "info")
         .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -631,6 +629,22 @@ fn no_tls_vars_keeps_the_plain_sensor_running() {
     assert_eq!(code, None, "plain sensor exited: {out}");
 }
 
+/// Blank or whitespace-only TLS vars read as unset, as `deploy/fleet-listeners.sh` reads a blank
+/// bind: the plain sensor runs, no TLS listener, no refusal.
+#[test]
+fn blank_tls_vars_are_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envs = base_env(dir.path());
+    envs.push(("PROPOLIS_MQTT_TLS_BIND", String::new()));
+    envs.push(("PROPOLIS_MQTT_TLS_CERT", "  ".into()));
+    envs.push(("PROPOLIS_MQTT_TLS_KEY", "\t".into()));
+    let borrowed: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let (code, out) = run_binary(&borrowed, Duration::from_secs(2));
+    assert_eq!(code, None, "sensor must keep running, output: {out}");
+    assert!(out.contains("sensor-mqtt: listening"), "output: {out}");
+    assert!(!out.contains("(tls)"), "output: {out}");
+}
+
 /// A non-UTF-8 value on any TLS variable is invalid, never read as unset (which would start the
 /// sensor without the TLS the operator configured): exit 1, naming the variable, before any
 /// listener binds.
@@ -648,7 +662,6 @@ fn a_non_utf8_tls_var_exits_1_before_any_listener_binds() {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sensor-mqtt"))
             .env_clear()
             .env("NO_COLOR", "1")
-            .env("RUST_LOG", "info")
             .env("PROPOLIS_MQTT_BIND", "127.0.0.1:0")
             .env("PROPOLIS_MQTT_LOG_PATH", dir.path().join("e.jsonl"))
             .env("PROPOLIS_MQTT_SPOOL_DIR", dir.path().join("spool"))

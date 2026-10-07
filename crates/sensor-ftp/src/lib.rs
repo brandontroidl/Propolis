@@ -7,7 +7,7 @@ use std::sync::Arc;
 use sensor_framework::{
     CaptureHandoff, CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
     EventEmitter, MaybeTlsStream, OutboxManifest, QuarantineSpool, TlsServer, WanResolver,
-    run_tcp_listener, run_tls_listener,
+    listener_start_error, run_tcp_listener, run_tls_listener,
 };
 use tokio::task::JoinHandle;
 
@@ -95,8 +95,8 @@ pub async fn start_test_server_with_handoff(
 }
 
 /// Starts every listener over ONE emitter, spool, capture hand-off and capture budget. A bind
-/// failure on any listener aborts the ones already started and returns the error, so a half-bound
-/// sensor never runs.
+/// failure on any listener aborts the ones already started and returns the error, naming the
+/// failed address ([`listener_start_error`]), so a half-bound sensor never runs.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_listeners(
     listeners: Vec<(SocketAddr, ListenerKind)>,
@@ -196,7 +196,7 @@ pub async fn start_listeners(
                 for (_, h) in &started {
                     h.abort();
                 }
-                return Err(e);
+                return Err(listener_start_error(addr, e));
             }
         }
     }

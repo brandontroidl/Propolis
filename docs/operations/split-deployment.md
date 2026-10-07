@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-28
+last-verified: 2026-10-06
 -->
 
 # Split deployment
@@ -510,8 +510,8 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
   apart there (`crates/fleet/src/store.rs#confirm_sensor`, `crates/console/src/routes/fleet.rs`).
 - `gateway` and `shipper` have no `--version`, and the deploy stamp records only `propolis` and
   `console` (`deploy/deploy-stamp.sh`), so their installed build is not visible.
-- The sensors, too, log only errors when `RUST_LOG` is unset; `propolis` and `console` are the only
-  binaries that default to `info` ([environment variables](../reference/environment-variables.md#rust_log)).
+- `propolis`, `console` and the sensors default to `info` when `RUST_LOG` is unset; every other
+  binary logs only errors ([environment variables](../reference/environment-variables.md#rust_log)).
 
 ## Related
 

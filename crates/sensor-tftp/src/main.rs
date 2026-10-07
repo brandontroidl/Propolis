@@ -230,7 +230,7 @@ fn parse_positive_u32(
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    sensor_framework::init_logging();
 
     let collector_id = env::var(ENV_COLLECTOR_ID)
         .ok()
@@ -260,7 +260,8 @@ async fn main() {
     {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::error!(addr = %bind_addr, error = %e, "sensor-tftp: failed to start");
+            let e = sensor_framework::listener_start_error(bind_addr, e);
+            tracing::error!("sensor-tftp: {e}; refusing to start");
             std::process::exit(1);
         }
     };

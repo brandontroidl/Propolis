@@ -11,7 +11,6 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "i
 serde_json = "1.0.151"
 chrono = { version = "0.4.45", features = ["serde"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

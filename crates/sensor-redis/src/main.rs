@@ -171,18 +171,14 @@ fn parse_positive_u32(
 /// TLS is enabled iff both the cert and key paths are set. `None` only when nothing TLS-related
 /// is configured; a bind without the pair, or exactly one of the pair, is an error so the caller
 /// refuses to start rather than serve plaintext where TLS was asked for. A pair without a bind
-/// parses (the caller still validates the files) but yields no listener. Blank counts as unset.
+/// parses (the caller still validates the files) but yields no listener. Inputs come from
+/// `sensor_framework::tls_env_var`, already trimmed with blank read as unset.
 fn parse_tls(
     bind: Option<&str>,
     cert: Option<&str>,
     key: Option<&str>,
 ) -> Result<Option<TlsConfig>, ConfigError> {
-    let path = |raw: Option<&str>| {
-        raw.map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    };
-    let (cert_path, key_path) = (path(cert), path(key));
+    let (cert_path, key_path) = (cert.map(PathBuf::from), key.map(PathBuf::from));
     if bind.is_none() && cert_path.is_none() && key_path.is_none() {
         return Ok(None);
     }
@@ -192,8 +188,7 @@ fn parse_tls(
     // The bind is never defaulted: the fleet inventory derives from the *_BIND vars.
     let bind_addr = bind
         .map(|raw| {
-            raw.trim()
-                .parse::<SocketAddr>()
+            raw.parse::<SocketAddr>()
                 .map_err(|_| ConfigError::InvalidTlsBind(raw.to_string()))
         })
         .transpose()?;
@@ -271,7 +266,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    sensor_framework::init_logging();
 
     let config = match load_config_from_env() {
         Ok(c) => c,
@@ -321,11 +316,8 @@ async fn main() {
     {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::error!(
-                addr = %config.bind_addr,
-                error = %e,
-                "sensor-redis: failed to start server"
-            );
+            let e = sensor_framework::listener_start_error(config.bind_addr, e);
+            tracing::error!("sensor-redis: {e}; refusing to start");
             std::process::exit(1);
         }
     };
@@ -349,7 +341,8 @@ async fn main() {
                 }
                 Err(e) => {
                     handle.abort();
-                    tracing::error!(addr = %addr, error = %e, "sensor-redis: failed to start tls server");
+                    let e = sensor_framework::listener_start_error(addr, e);
+                    tracing::error!("sensor-redis: {e}; refusing to start");
                     std::process::exit(1);
                 }
             }
@@ -441,9 +434,8 @@ mod tests {
 
     #[test]
     fn parse_tls_nothing_configured_is_none() {
+        // Blank values never reach here: tls_env_var reads them as unset.
         assert_eq!(parse_tls(None, None, None), Ok(None));
-        // Blank paths are "unset", not a configuration.
-        assert_eq!(parse_tls(None, Some("  "), Some("")), Ok(None));
     }
 
     #[test]
@@ -479,14 +471,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_tls_blank_path_counts_as_missing() {
-        assert_eq!(
-            parse_tls(Some("0.0.0.0:6380"), Some("   "), Some(KEY)),
-            Err(ConfigError::TlsPathMissing(ENV_TLS_CERT))
-        );
-    }
-
-    #[test]
     fn parse_tls_exactly_one_of_cert_and_key_without_bind_is_refused() {
         assert_eq!(
             parse_tls(None, Some(CERT), None),
@@ -511,13 +495,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_tls_rejects_bad_or_empty_bind() {
+    fn parse_tls_rejects_a_bad_bind() {
         assert!(matches!(
             parse_tls(Some("nonsense"), Some(CERT), Some(KEY)),
-            Err(ConfigError::InvalidTlsBind(_))
-        ));
-        assert!(matches!(
-            parse_tls(Some(""), Some(CERT), Some(KEY)),
             Err(ConfigError::InvalidTlsBind(_))
         ));
     }

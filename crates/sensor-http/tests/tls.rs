@@ -245,11 +245,9 @@ impl Proc {
     fn spawn(envs: &[(&str, &str)]) -> Proc {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sensor-http"))
             .env_clear()
-            // NO_COLOR keeps ANSI escapes out of the log text the tests match on.
+            // NO_COLOR keeps ANSI escapes out of the log text the tests match on. RUST_LOG is
+            // left unset: the info lines matched below rely on the INFO default.
             .env("NO_COLOR", "1")
-            // A workspace build unifies tracing-subscriber's `env-filter` feature on, which makes
-            // an unset RUST_LOG mean errors only; the tests match on info lines.
-            .env("RUST_LOG", "info")
             .envs(envs.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -435,6 +433,94 @@ fn a_group_readable_valid_key_refuses_to_start_before_any_listener_binds() {
     assert!(!output.contains("listening"), "output: {output}");
 }
 
+/// With RUST_LOG unset the sensor logs at INFO, so a deployed sensor reports its listening line,
+/// whatever features a workspace build unified into tracing-subscriber.
+#[test]
+fn info_is_the_default_log_level_when_rust_log_is_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = base_env(dir.path());
+    let refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert!(!refs.iter().any(|(k, _)| *k == "RUST_LOG"));
+    let p = Proc::spawn(&refs);
+    assert!(
+        p.wait_for_output("sensor-http: listening", Duration::from_secs(10)),
+        "output: {}",
+        p.output()
+    );
+    assert!(p.output().contains(" INFO "), "output: {}", p.output());
+}
+
+/// Blank or whitespace-only TLS vars read as unset (as deploy/fleet-listeners.sh reads a blank
+/// bind): the plain sensor starts, no TLS listener, no refusal.
+#[test]
+fn blank_tls_vars_are_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envs = base_env(dir.path());
+    envs.push(("PROPOLIS_HTTP_TLS_BIND".into(), String::new()));
+    envs.push(("PROPOLIS_HTTP_TLS_CERT".into(), "  ".into()));
+    envs.push(("PROPOLIS_HTTP_TLS_KEY".into(), "\t".into()));
+    let refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut p = Proc::spawn(&refs);
+    assert!(
+        p.wait_for_output("listening", Duration::from_secs(10)),
+        "output: {}",
+        p.output()
+    );
+    assert_eq!(p.exit_code_within(Duration::from_millis(500)), None);
+    assert!(!p.output().contains("(tls)"), "{}", p.output());
+}
+
+/// A TLS bind and paths padded with whitespace are trimmed, not refused.
+#[test]
+fn padded_tls_vars_are_trimmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key, _) = ephemeral();
+    std::fs::write(dir.path().join("c.pem"), &cert).unwrap();
+    write_key(&dir.path().join("k.pem"), &key, 0o600);
+    let mut envs = base_env(dir.path());
+    envs.push(("PROPOLIS_HTTP_TLS_BIND".into(), " 127.0.0.1:0 ".into()));
+    envs.push((
+        "PROPOLIS_HTTP_TLS_CERT".into(),
+        format!(" {}", p(dir.path(), "c.pem")),
+    ));
+    envs.push((
+        "PROPOLIS_HTTP_TLS_KEY".into(),
+        format!("{}\t", p(dir.path(), "k.pem")),
+    ));
+    let refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let proc = Proc::spawn(&refs);
+    assert!(
+        proc.wait_for_output("listening (tls)", Duration::from_secs(10)),
+        "output: {}",
+        proc.output()
+    );
+}
+
+#[test]
+fn a_tls_bind_already_in_use_names_the_address_and_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key, _) = ephemeral();
+    std::fs::write(dir.path().join("c.pem"), &cert).unwrap();
+    write_key(&dir.path().join("k.pem"), &key, 0o600);
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken_addr = taken.local_addr().unwrap().to_string();
+    let output = refuses(
+        &[
+            ("PROPOLIS_HTTP_TLS_BIND", &taken_addr),
+            ("PROPOLIS_HTTP_TLS_CERT", &p(dir.path(), "c.pem")),
+            ("PROPOLIS_HTTP_TLS_KEY", &p(dir.path(), "k.pem")),
+        ],
+        dir.path(),
+    );
+    assert!(
+        output.contains(&format!(
+            "sensor-http: cannot start listener on {taken_addr}: "
+        )),
+        "output: {output}"
+    );
+    drop(taken);
+}
+
 #[test]
 fn no_tls_vars_keeps_the_plain_sensor_running() {
     let dir = tempfile::tempdir().unwrap();
@@ -534,7 +620,6 @@ fn a_non_utf8_tls_var_exits_1_before_any_listener_binds() {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sensor-http"))
             .env_clear()
             .env("NO_COLOR", "1")
-            .env("RUST_LOG", "info")
             .env("PROPOLIS_HTTP_BIND", "127.0.0.1:0")
             .env("PROPOLIS_HTTP_LOG_PATH", dir.path().join("e.jsonl"))
             .env(var, bad)

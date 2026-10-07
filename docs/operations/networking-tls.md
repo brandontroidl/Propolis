@@ -223,16 +223,24 @@ its env file names it.
 
 A sensor never falls back to plaintext or to a default certificate where TLS was configured.
 Every refusal below happens before the sensor binds any listener, the plain one included: the
-process logs an error and exits 1. The error ends in `refusing to start`, except that
-sensor-smtp logs an unparseable bind as `invalid <VARIABLE>: "<value>"`.
+process logs an error and exits 1. The error ends in `refusing to start`.
+
+**How the variables are read.** All six sensors read every TLS variable (each `*_TLS_BIND`,
+`*_TLS_CERT` and `*_TLS_KEY`, and `PROPOLIS_SMTP_SUBMISSION_BIND`) through one reader,
+`crates/sensor-framework/src/tls.rs#tls_env_var`, so one rule holds everywhere:
+
+- unset is unset;
+- the value is trimmed of leading and trailing ASCII whitespace;
+- a value blank after the trim counts as unset, as `deploy/fleet-listeners.sh` skips a blank
+  bind, so `PROPOLIS_HTTP_TLS_BIND=` means no TLS listener, never an invalid address;
+- a value that is not valid UTF-8 is invalid, never read as unset (see below).
 
 **Configuration.** Per sensor (`crates/sensor-http/src/main.rs#parse_tls`,
 `crates/sensor-redis/src/main.rs#parse_tls`, `crates/sensor-mqtt/src/main.rs#parse_tls`,
 `crates/sensor-smtp/src/lib.rs#tls_from_env`, `crates/sensor-ftp/src/main.rs#tls_paths`,
-`crates/sensor-cred/src/main.rs#main`):
+`crates/sensor-cred/src/main.rs#main`), after that reading step:
 
-- exactly one of the cert and key variables is set (a blank value counts as unset, except for
-  sensor-cred, where a present but blank variable is itself an error);
+- exactly one of the cert and key variables is set;
 - a TLS bind is set without both paths;
 - a TLS bind, or smtp's submission bind, does not parse (a bad bind never falls back to a default);
 - any TLS variable holds a value that is not valid UTF-8. It is invalid, never read as unset,
@@ -246,7 +254,10 @@ sensor-smtp logs an unparseable bind as `invalid <VARIABLE>: "<value>"`.
 - the certificate or key file is missing or unreadable;
 - the path is not a regular file;
 - the file is larger than 1 MiB (`MAX_PEM_FILE_BYTES`);
-- the PEM is malformed, or holds no certificate or no private key;
+- the PEM is malformed, or holds no certificate or no private key. The error names the file and
+  a fixed description of the fault (for example `missing section end marker`), never the
+  parser's own message, which can quote the file's bytes: a key written on one line would
+  otherwise land in the log (`crates/sensor-framework/src/tls.rs#pem_error_kind`);
 - rustls rejects the pair, including a certificate and key that do not match;
 - the **key file has any group or other permission bit set**. It is checked before the file is
   read, and the error names the mode and says to `chmod 0600`.
@@ -266,13 +277,15 @@ one warning. The exceptions:
   opens no port and the inventory is unchanged.
 
 **A bind the OS refuses.** For http, redis, mqtt, smtp and ftp, if the OS refuses any one bind,
-the listeners already started are stopped and the sensor exits 1. sensor-cred instead logs and
-skips that one protocol and exits 1 only when every configured protocol failed to bind, because
-its TLS adds no listener whose loss could hide behind the others.
+the listeners already started are stopped and the sensor exits 1, logging
+`<sensor>: cannot start listener on <address>: <OS error>; refusing to start`
+(`crates/sensor-framework/src/listener.rs#listener_start_error`). sensor-cred instead logs the
+same text ending `; skipping protocol <name>` and exits 1 only when every configured protocol
+failed to bind, because its TLS adds no listener whose loss could hide behind the others.
 
-On success sensor-cred logs `TLS enabled for postgresql, mysql, mssql and mongodb`. Warnings and
-info lines are visible only with `RUST_LOG=info` or lower; the refusals are errors and always
-logged (see [troubleshooting](../troubleshooting/sensors-and-networking.md#sensor-tls)).
+On success sensor-cred logs `TLS enabled for postgresql, mysql, mssql and mongodb`. Sensors log
+at `info` unless `RUST_LOG` says otherwise, so the warnings and info lines are visible by default
+(see [troubleshooting](../troubleshooting/sensors-and-networking.md#sensor-tls)).
 
 ### The unit's TLS directory grant
 

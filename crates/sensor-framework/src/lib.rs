@@ -17,6 +17,7 @@ pub mod env;
 pub mod fakefs;
 pub mod handoff;
 pub mod listener;
+pub mod logging;
 pub mod outbox;
 pub mod persona;
 pub mod replay;
@@ -41,14 +42,14 @@ pub use handoff::{
     CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome,
     END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, upload_metadata,
 };
-pub use listener::{run_tcp_listener, run_udp_listener, shutdown_signal};
+pub use listener::{listener_start_error, run_tcp_listener, run_udp_listener, shutdown_signal};
+pub use logging::init_logging;
 pub use outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
 pub use sanitize::{sanitize_value, to_hex_bounded};
 pub use spool::{QuarantineSpool, SpoolError};
 pub use tls::{
-    MaybeTlsStream, TlsConfigError, TlsServer, load_server_config, load_server_config_from_env,
-    load_server_config_with_env, run_tls_listener, server_config_from_pem, tls_env_var,
-    upgrade_buffered,
+    MaybeTlsStream, TlsConfigError, TlsServer, load_server_config, run_tls_listener,
+    server_config_from_pem, tls_env_var, upgrade_buffered,
 };
 pub use uuid::Uuid;
 pub use wan::WanResolver;

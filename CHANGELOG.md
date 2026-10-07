@@ -20,9 +20,9 @@
   `0x16 0x03` (a TLS record header) over TLS on the plaintext port, so a plaintext first message
   whose length's low byte is `0x16` is no longer mistaken for TLS. Plaintext clients keep working
   on every port. Events from a TLS session carry `"tls": true` (for PostgreSQL, MySQL and MSSQL the
-  pre-negotiation connection event stays untagged). Fail-closed: when either variable is present,
-  exactly one set, a blank or non-UTF-8 value, or an unusable pair makes the sensor exit 1 before
-  binding anything. A bind failure on one protocol is still logged and skipped. The unit gains
+  pre-negotiation connection event stays untagged). Fail-closed: when either variable is set (a
+  blank value counts as unset), exactly one set, a non-UTF-8 value, or an unusable pair makes the
+  sensor exit 1 before binding anything. A bind failure on one protocol is still logged and skipped. The unit gains
   `ReadOnlyPaths=-/etc/propolis/tls`. The MSSQL TDS-TLS adapter is validated against a rustls
   client and the MS-TDS text only; the owner smoke tests against real drivers are listed in
   `docs/operations/networking-tls.md`.
@@ -245,6 +245,16 @@
 
 ### Fixed
 
+- **A malformed PEM error never carries key bytes** - the PEM parser's own error prints the
+  offending line or section label as a byte list, and for a key written header, body and footer on
+  one line that label is the whole key, which every TLS sensor then logged at error level. The
+  error now names the file and a fixed description of the fault (for example
+  `missing section end marker`) for both the certificate and the key file, and keeps no parser
+  error in its source chain.
+- **Sensors log at `info` by default** - every sensor called `tracing_subscriber::fmt::init()`,
+  whose default is `error` once a workspace build unifies the `env-filter` feature in, so a
+  deployed sensor logged no listening lines and no warnings. All eleven now default to `info`, and
+  `RUST_LOG` still overrides it, however the binary is built.
 - **Sensor TLS finalize** - a TLS variable (or sensor-smtp's submission bind) holding a non-UTF-8
   value is now invalid on every TLS sensor, and the sensor exits 1 before any bind. sensor-ftp and
   sensor-smtp read such a value as unset, which silently skipped the 990, 465 or 587 listener or
@@ -337,6 +347,17 @@
 
 ### Changed
 
+- **One reading rule for every sensor TLS variable** - all six TLS sensors read each
+  `*_TLS_BIND`, `*_TLS_CERT`, `*_TLS_KEY` and `PROPOLIS_SMTP_SUBMISSION_BIND` the same way: the
+  value is trimmed of ASCII whitespace and a blank one counts as unset, as
+  `deploy/fleet-listeners.sh` already treated a blank bind. Until now a blank TLS bind made http,
+  redis and mqtt exit 1 as an invalid address, a blank cert or key made sensor-cred exit 1, and
+  smtp and ftp did not trim paths. A non-UTF-8 value is still invalid.
+- **One bind-failure message** - a listener that fails to start after its configuration validated
+  is logged by every sensor as
+  `<sensor>: cannot start listener on <ip:port>: <OS error>; refusing to start` (catchall and cred,
+  which skip one failed address, end that line `; skipping ...` and refuse only when every address
+  failed). The behavior is unchanged.
 - **A snooze can be finished and a delist undone** - the Snoozed tab had no decision controls and
   nothing re-surfaces a decided entry, so deferring a decision quietly meant never making one; the
   history tabs also rendered rows with an empty CSRF token. The tab now carries Approve, Reject and

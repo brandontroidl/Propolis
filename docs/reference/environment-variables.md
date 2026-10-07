@@ -87,16 +87,21 @@ console rDNS parse booleans more broadly (called out below).
 - Read by: every binary except `provision-certs`, as `tracing_subscriber`'s standard `EnvFilter`
   variable.
 - Required: no. When it is unset or does not parse, `propolis` and `console` log at `info`
-  (`propolis/src/main.rs#main`, `console/src/main.rs#main`). Every other binary - the sensors,
-  `gateway`, `shipper`, and the standalone `intake`, `review` and `feed` - logs **errors only**.
-  Each calls `tracing_subscriber::fmt::init()` (for example `crates/gateway/src/main.rs#main`),
-  whose default filter is `error` once the `env-filter` feature is on, and a workspace build
-  (`cargo build --release` at the workspace root, as the deployment manual has you run it before
-  `deploy/install.sh`, or `cargo build --release --workspace --locked` as `deploy/upgrade.sh` runs
-  it) turns the feature on for every member because `propolis`, `console` and `sensor-catchall`
-  enable it. Set
-  `RUST_LOG=info` in a unit's env file to see its startup and warning lines: with it unset, a
-  healthy release-built `gateway` prints nothing at all (observed 2026-09-28).
+  (`propolis/src/main.rs#main`, `console/src/main.rs#main`).
+- Sensors: all eleven sensor binaries log at `info` when it is unset; a set `RUST_LOG` overrides
+  that default, and an invalid directive in it is skipped rather than failing startup. Each
+  calls `sensor_framework::init_logging` (`crates/sensor-framework/src/logging.rs#init_logging`),
+  which installs an `EnvFilter` with an `info` default directive, and `sensor-framework` enables
+  the `env-filter` feature itself, so the default is the same however the binary is built.
+- Every other binary - `gateway`, `shipper`, and the standalone `intake`, `review` and `feed` -
+  logs **errors only**. Each calls `tracing_subscriber::fmt::init()` (for example
+  `crates/gateway/src/main.rs#main`), whose default filter is `error` once the `env-filter`
+  feature is on, and a workspace build (`cargo build --release` at the workspace root, as the
+  deployment manual has you run it before `deploy/install.sh`, or
+  `cargo build --release --workspace --locked` as `deploy/upgrade.sh` runs it) turns the feature
+  on for every member because `propolis`, `console` and `sensor-framework` enable it. Set
+  `RUST_LOG=info` in such a unit's env file to see its startup and warning lines: with it unset,
+  a healthy release-built `gateway` prints nothing at all (observed 2026-09-28).
 
 ### `PROPOLIS_HOSTNAME`
 - Read by: `sensor-framework::persona::hostname()`
@@ -614,6 +619,13 @@ Sensor-specific extras:
   read by its canonical name only; there is no legacy bare spelling for this sensor.
   `PROPOLIS_TFTP_BIND` is the only switch: the sensor is off until an operator sets it, and with no
   bind (or an unparseable one) it logs the error and exits 1 without binding anything.
+- **How every TLS variable is read** (http, redis, mqtt, smtp, ftp and cred; every `*_TLS_BIND`,
+  `*_TLS_CERT` and `*_TLS_KEY`, and `PROPOLIS_SMTP_SUBMISSION_BIND`): one reader,
+  `crates/sensor-framework/src/tls.rs#tls_env_var`. Unset is unset. The value is trimmed of
+  leading and trailing ASCII whitespace, and a value that is blank after the trim counts as unset,
+  the same way `deploy/fleet-listeners.sh` skips a blank bind. A value that is not valid UTF-8 is
+  invalid, never unset: the sensor exits 1 with `refusing to start`. The per-sensor rules below
+  apply to the values after this step.
 - **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`).
   HTTP TLS (all three default off; none has a compiled default):
 
@@ -729,12 +741,12 @@ Sensor-specific extras:
   | `PROPOLIS_CRED_TLS_KEY` | unset (deploy value `/etc/propolis/tls/cred.key`) | PEM private key path; must be mode `0600`. |
 
   Fail-closed (`crates/sensor-cred/src/main.rs#main`, `crates/sensor-cred/src/lib.rs#CredTls`):
-  when either variable is present in the environment, the pair must load or the sensor exits 1
-  with `refusing to start` before binding any protocol. That covers exactly one of the two set, a
-  blank value, a non-UTF-8 value (invalid, not unset), a file that is unreadable, not PEM or a
+  when either variable is set (a blank value counts as unset), the pair must load or the sensor
+  exits 1 with `refusing to start` before binding any protocol. That covers exactly one of the
+  two set, a non-UTF-8 value (invalid, not unset), a file that is unreadable, not PEM or a
   mismatched pair, and a key that is group- or world-readable. On success it logs
-  `TLS enabled for postgresql, mysql, mssql and mongodb`. With neither variable set the sensor is
-  unchanged. Because no `*_BIND` variable is added, `deploy/fleet-listeners.sh` derives no extra
+  `TLS enabled for postgresql, mysql, mssql and mongodb`. With neither variable set (or both
+  blank) the sensor is unchanged. Because no `*_BIND` variable is added, `deploy/fleet-listeners.sh` derives no extra
   listener from the pair.
 - **catchall**: no spool variable (never spools file bodies,
   `crates/sensor-catchall/src/main.rs#Config`); no

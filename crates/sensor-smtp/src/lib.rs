@@ -1,13 +1,12 @@
 pub mod handler;
 
-use std::env::VarError;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sensor_framework::{
-    ConnectionBounds, EventEmitter, MaybeTlsStream, TlsServer, WanResolver,
-    load_server_config_with_env, run_tcp_listener, run_tls_listener,
+    ConnectionBounds, EventEmitter, MaybeTlsStream, TlsConfigError, TlsServer, WanResolver,
+    listener_start_error, load_server_config, run_tcp_listener, run_tls_listener,
 };
 use tokio::task::JoinHandle;
 
@@ -42,30 +41,26 @@ pub fn plan_listeners(
     Ok(plan)
 }
 
-/// Resolve the TLS configuration from the environment, fail-closed. `lookup` is `std::env::var`
-/// in production. TLS is on iff BOTH the cert and key variables are set (a blank value counts as
-/// unset). A non-UTF-8 value on either variable, exactly one set, an unreadable or invalid pair,
-/// or a TLS bind with neither set is an error the caller must treat as fatal before binding
-/// anything.
+/// Resolve the TLS configuration from the environment, fail-closed. `lookup` is
+/// `sensor_framework::tls_env_var` in production, so a value arrives trimmed and a blank one as
+/// unset. TLS is on iff BOTH the cert and key variables are set. A non-UTF-8 value on either
+/// variable, exactly one set, an unreadable or invalid pair, or a TLS bind with neither set is an
+/// error the caller must treat as fatal before binding anything.
 pub fn tls_from_env(
     cert_var: &str,
     key_var: &str,
     tls_bind_configured: bool,
-    lookup: impl Fn(&str) -> Result<String, VarError>,
+    lookup: impl Fn(&str) -> Result<Option<String>, TlsConfigError>,
 ) -> Result<Option<TlsServer>, String> {
-    let is_set = |var: &str| match lookup(var) {
-        Ok(value) => Ok(!value.trim().is_empty()),
-        Err(VarError::NotPresent) => Ok(false),
-        Err(VarError::NotUnicode(_)) => Err(format!("{var} is set but is not valid UTF-8")),
-    };
-    match (is_set(cert_var)?, is_set(key_var)?) {
-        (false, false) if tls_bind_configured => Err(format!(
+    let get = |var: &str| lookup(var).map_err(|e| e.to_string());
+    match (get(cert_var)?, get(key_var)?) {
+        (None, None) if tls_bind_configured => Err(format!(
             "a TLS bind is configured but {cert_var} and {key_var} are not set"
         )),
-        (false, false) => Ok(None),
-        (true, false) => Err(format!("{cert_var} is set but {key_var} is not")),
-        (false, true) => Err(format!("{key_var} is set but {cert_var} is not")),
-        (true, true) => load_server_config_with_env(cert_var, key_var, &lookup)
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(format!("{cert_var} is set but {key_var} is not")),
+        (None, Some(_)) => Err(format!("{key_var} is set but {cert_var} is not")),
+        (Some(cert), Some(key)) => load_server_config(Path::new(&cert), Path::new(&key))
             .map(|config| Some(TlsServer::from_config(config)))
             .map_err(|e| e.to_string()),
     }
@@ -90,9 +85,10 @@ pub async fn start_test_server(
 }
 
 /// Bind every listener in order, sharing one event emitter. If any bind fails the listeners
-/// already started are aborted and the error is returned: a half-bound sensor would make the
-/// derived fleet inventory claim ports that are not served. Each listener keeps its own
-/// connection cap and per-source cap (`run_tcp_listener` owns them per bind).
+/// already started are aborted and the error, naming the failed address
+/// ([`listener_start_error`]), is returned: a half-bound sensor would make the derived fleet
+/// inventory claim ports that are not served. Each listener keeps its own connection cap and
+/// per-source cap (`run_tcp_listener` owns them per bind).
 pub async fn start_listeners(
     listeners: Vec<(SocketAddr, ListenerKind)>,
     log_path: PathBuf,
@@ -174,7 +170,7 @@ pub async fn start_listeners(
                 for (_, handle) in &started {
                     handle.abort();
                 }
-                return Err(e);
+                return Err(listener_start_error(addr, e));
             }
         }
     }
@@ -225,12 +221,14 @@ mod tests {
         assert!(matches!(plan[0].1, ListenerKind::Plain { tls: Some(_) }));
     }
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, VarError> {
+    /// A lookup over already-normalized values, as `tls_env_var` returns them (blank never
+    /// arrives here; it is `None`, which the framework's own test covers).
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<Option<String>, TlsConfigError> {
         let map: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        move |name| map.get(name).cloned().ok_or(VarError::NotPresent)
+        move |name| Ok(map.get(name).cloned())
     }
 
     #[test]
@@ -239,19 +237,11 @@ mod tests {
         assert!(matches!(none(false), Ok(None)));
         assert!(none(true).is_err());
 
-        // Blank counts as unset.
-        assert!(matches!(
-            tls_from_env("C", "K", false, env_of(&[("C", ""), ("K", "  ")])),
-            Ok(None)
-        ));
-
         // Exactly one of the pair is an error with or without a TLS bind.
         for bind in [false, true] {
             assert!(tls_from_env("C", "K", bind, env_of(&[("C", "/x")])).is_err());
             assert!(tls_from_env("C", "K", bind, env_of(&[("K", "/x")])).is_err());
         }
-        // A blank partner does not rescue a lone value.
-        assert!(tls_from_env("C", "K", false, env_of(&[("C", "/x"), ("K", " ")])).is_err());
 
         // Both set but unreadable: an error, never Ok(None).
         assert!(
@@ -270,9 +260,11 @@ mod tests {
         for bad in ["C", "K"] {
             let lookup = |name: &str| {
                 if name == bad {
-                    Err(VarError::NotUnicode(std::ffi::OsString::new()))
+                    Err(TlsConfigError::EnvNotUnicode {
+                        var: name.to_string(),
+                    })
                 } else {
-                    Err(VarError::NotPresent)
+                    Ok(None)
                 }
             };
             let err = tls_from_env("C", "K", false, lookup)

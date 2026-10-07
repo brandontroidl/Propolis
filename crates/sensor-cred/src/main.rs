@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,7 +42,7 @@ fn parse_positive_u32(raw: Option<&str>, default: u32) -> u32 {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    sensor_framework::init_logging();
 
     let wan_map = parse_wan_map(&env::var("PROPOLIS_CRED_WAN_MAP").unwrap_or_default());
     let wan_resolver = Arc::new(WanResolver::new(wan_map));
@@ -92,20 +92,37 @@ async fn main() {
         }
     }
 
-    // Fail closed: either TLS var set means the pair must load, or nothing binds at all.
-    let tls = if env::var_os(TLS_CERT_VAR).is_some() || env::var_os(TLS_KEY_VAR).is_some() {
-        match sensor_cred::CredTls::from_env(TLS_CERT_VAR, TLS_KEY_VAR) {
-            Ok(tls) => {
-                tracing::info!("sensor-cred: TLS enabled for postgresql, mysql, mssql and mongodb");
-                Some(tls)
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "sensor-cred: TLS is configured but the certificate or key cannot be loaded; refusing to start");
-                std::process::exit(1);
+    // Fail closed: either TLS var set means the pair must load, or nothing binds at all. Read
+    // through tls_env_var, so a blank value is unset and a non-UTF-8 one is an error.
+    let tls_var = |var: &str| match sensor_framework::tls_env_var(var) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::error!(error = %e, "sensor-cred: invalid configuration; refusing to start");
+            std::process::exit(1);
+        }
+    };
+    let tls = match (tls_var(TLS_CERT_VAR), tls_var(TLS_KEY_VAR)) {
+        (None, None) => None,
+        (Some(cert), Some(key)) => {
+            match sensor_cred::CredTls::from_files(Path::new(&cert), Path::new(&key)) {
+                Ok(tls) => {
+                    tracing::info!(
+                        "sensor-cred: TLS enabled for postgresql, mysql, mssql and mongodb"
+                    );
+                    Some(tls)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "sensor-cred: TLS is configured but the certificate or key cannot be loaded; refusing to start");
+                    std::process::exit(1);
+                }
             }
         }
-    } else {
-        None
+        (Some(_), None) | (None, Some(_)) => {
+            tracing::error!(
+                "sensor-cred: TLS needs both {TLS_CERT_VAR} and {TLS_KEY_VAR}, but only one is set; refusing to start"
+            );
+            std::process::exit(1);
+        }
     };
 
     if ports.is_empty() {
@@ -135,13 +152,16 @@ async fn main() {
                 handles.push(handle);
             }
             Err(e) => {
-                tracing::error!(protocol = pc.protocol, addr = %pc.bind, error = %e, "sensor-cred: failed to start; skipping protocol");
+                let e = sensor_framework::listener_start_error(pc.bind, e);
+                tracing::error!("sensor-cred: {e}; skipping protocol {}", pc.protocol);
             }
         }
     }
 
     if handles.is_empty() {
-        tracing::error!("sensor-cred: all configured protocols failed to bind; exiting");
+        tracing::error!(
+            "sensor-cred: no listener started on any configured address; refusing to start"
+        );
         std::process::exit(1);
     }
 

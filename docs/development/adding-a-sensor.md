@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-06
 -->
 
 # Adding or modifying a sensor
@@ -47,7 +47,7 @@ composes rather than reimplements:
 
 A minimal sensor `main.rs` (pattern, from `crates/sensor-catchall/src/main.rs`):
 
-1. `tracing_subscriber::fmt::init()`.
+1. `sensor_framework::init_logging()` (`info` by default, `RUST_LOG` overrides it).
 2. Load and **validate** config from environment variables; on any malformed or
    zero-valued bound, log and `std::process::exit(1)` - fail closed, never
    substitute a default that disables the bound it names (`main.rs` `load_config_from_env`).

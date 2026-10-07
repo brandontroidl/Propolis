@@ -54,6 +54,23 @@ Work outward from the process:
 - **Port already owned** - a real service (e.g. the host's own `sshd`) holds the
   port. See bind conflicts in [Startup and config](startup-and-config.md).
 
+Every sensor logs a listener that fails to start, after its configuration
+validated, in one form
+(`crates/sensor-framework/src/listener.rs#listener_start_error`):
+
+```
+<sensor>: cannot start listener on <ip:port>: <OS error>; refusing to start
+```
+
+for example `Address already in use (os error 98)` (another process holds the
+port) or `Permission denied (os error 13)` (a port below 1024 without
+`CAP_NET_BIND_SERVICE`). The sensor stops any listener it already started and
+exits 1. Two sensors skip one failed address instead of exiting: catchall logs
+`catchall: tcp cannot start listener on ...; skipping this port` (or `udp`),
+and cred logs `...; skipping protocol <name>`. Each exits 1 with
+`no listener started on any configured address; refusing to start` only when
+every address failed.
+
 ## Bind address vs. exposure
 
 The honeypot is meant to be reached from the internet, but the surrounding
@@ -120,15 +137,20 @@ anything. With `Restart=always` that shows as a restart loop; read the one error
   repairs ownership), or fix the path. If `/etc/propolis/tls` itself is missing, run
   `deploy/provision.sh` first.
 - **Half-set variables.** Only one of `*_TLS_CERT` and `*_TLS_KEY` is set, or a `*_TLS_BIND` is
-  set without both. The error names the variables involved. A blank value counts as unset, except
-  on sensor-cred, where a present but blank variable is itself an error.
+  set without both. The error names the variables involved. On every TLS sensor a value is
+  trimmed and a blank one counts as unset, so `PROPOLIS_<X>_TLS_BIND=` means no TLS listener.
 - **Non-UTF-8 value.** `<VARIABLE> is set but is not valid UTF-8` (or `environment variable
   <VARIABLE> is not valid UTF-8`): a TLS variable or bind holds bytes that are not UTF-8, usually
   an env file saved in a legacy encoding. It is never read as unset; rewrite the line as plain
   ASCII.
 - **Unparseable bind.** `invalid <VARIABLE>`: the TLS bind is not an `ip:port`.
 - **Unusable file.** Not PEM, no certificate or key in it, larger than 1 MiB, not a regular
-  file, or a certificate and key that do not match.
+  file, or a certificate and key that do not match. A malformed PEM is reported as
+  `malformed PEM in <path>: <fault>`, where the fault is a fixed phrase such as
+  `missing section end marker` (often a key pasted onto one line); the file's content is never
+  logged.
+- **TLS port already in use.** `cannot start listener on <ip:port>: Address already in use`:
+  see [Port not listening](#port-not-listening).
 
 A missing `/etc/propolis/tls` directory does not stop a unit that uses no TLS: the units grant it
 as `ReadOnlyPaths=-/etc/propolis/tls`, where the `-` makes it optional.
@@ -143,18 +165,18 @@ handshakes are dropped with no event and logged at debug level only, because pla
 TLS port is the common scanner case. The certificate is self-signed for `localhost`, so a client
 that verifies certificates rejects it unless told not to.
 
-**Raising the log level.** Sensors log errors only when `RUST_LOG` is unset
-([`RUST_LOG`](../reference/environment-variables.md#rust_log)), so the "no TLS listener started"
-warning and the startup lines are hidden by default. Add a line to the sensor's env file and
-restart it:
+**Raising the log level.** Sensors log at `info` when `RUST_LOG` is unset
+([`RUST_LOG`](../reference/environment-variables.md#rust_log)), so the startup, listening and
+"no TLS listener started" warning lines are in the journal by default. `RUST_LOG` overrides the
+default; to also log each failed handshake, add a line to the sensor's env file and restart it:
 
 ```
 # /etc/propolis/<sensor>.env
-RUST_LOG=info
+RUST_LOG=debug
 ```
 
-`info` shows the startup, listening and warning lines. `debug` also logs each failed handshake;
-it is noisy on an internet-facing port, so set it only while diagnosing and revert afterwards.
+`debug` is noisy on an internet-facing port, so set it only while diagnosing and remove it
+afterwards.
 
 ```
 sudo systemctl restart sensor-<sensor>

@@ -1020,9 +1020,9 @@ per-protocol bind var is required.
     while the login and postgresql query events of a TLS session are tagged. For mongodb TLS is
     known before the session starts, so every event of a TLS session is tagged, the connection
     event included.
-  - **Fail-closed:** when either variable is present the pair must load, or the sensor exits 1
-    before binding any protocol; exactly one set, a blank or non-UTF-8 value, an unusable pair and
-    a key that is not mode `0600` all count. Variables are in
+  - **Fail-closed:** when either variable is set (a blank value counts as unset) the pair must
+    load, or the sensor exits 1 before binding any protocol; exactly one set, a non-UTF-8 value,
+    an unusable pair and a key that is not mode `0600` all count. Variables are in
     [environment-variables.md](environment-variables.md); the operator view is
     [../operations/networking-tls.md](../operations/networking-tls.md#sensor-cred-in-band-tls).
   - **Validation scope:** the MSSQL TDS-TLS adapter is validated against a rustls client (TLS 1.2

@@ -107,16 +107,16 @@ fn resolve_outbox_dir(spool_dir: &Path, env_override: Option<String>) -> PathBuf
         .unwrap_or_else(|| spool_dir.join("outbox"))
 }
 
-/// Unset or empty counts as not set. Both set enables TLS; exactly one set, or a TLS bind without
-/// both, is an error so a half-configured sensor never starts (and never binds a plaintext port
-/// the operator believed was protected).
+/// Inputs come from `sensor_framework::tls_env_var`, already trimmed with blank read as unset.
+/// Both set enables TLS; exactly one set, or a TLS bind without both, is an error so a
+/// half-configured sensor never starts (and never binds a plaintext port the operator believed
+/// was protected).
 fn tls_paths(
     cert: Option<String>,
     key: Option<String>,
     tls_bind_set: bool,
 ) -> Result<Option<(PathBuf, PathBuf)>, ConfigError> {
-    let set = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
-    match (set(cert), set(key)) {
+    match (cert, key) {
         (Some(c), Some(k)) => Ok(Some((PathBuf::from(c), PathBuf::from(k)))),
         (None, None) if tls_bind_set => Err(ConfigError::TlsIncomplete(
             "PROPOLIS_FTP_TLS_BIND is set but PROPOLIS_FTP_TLS_CERT and PROPOLIS_FTP_TLS_KEY are not",
@@ -139,14 +139,12 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let tls_var = |name: &'static str| {
         sensor_framework::tls_env_var(name).map_err(|_| ConfigError::TlsVarNotUtf8(name))
     };
-    let tls_bind = match tls_var(ENV_TLS_BIND)? {
-        Some(raw) if !raw.trim().is_empty() => Some(
-            raw.trim()
-                .parse()
-                .map_err(|_| ConfigError::InvalidTlsBind(raw.clone()))?,
-        ),
-        _ => None,
-    };
+    let tls_bind = tls_var(ENV_TLS_BIND)?
+        .map(|raw| {
+            raw.parse()
+                .map_err(|_| ConfigError::InvalidTlsBind(raw.clone()))
+        })
+        .transpose()?;
     let tls_paths = tls_paths(
         tls_var(ENV_TLS_CERT)?,
         tls_var(ENV_TLS_KEY)?,
@@ -266,7 +264,7 @@ fn parse_positive_u32(
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    sensor_framework::init_logging();
 
     let config = match load_config_from_env() {
         Ok(c) => c,
@@ -320,7 +318,7 @@ async fn main() {
     {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::error!(error = %e, "sensor-ftp: failed to start");
+            tracing::error!("sensor-ftp: {e}; refusing to start");
             std::process::exit(1);
         }
     };
@@ -369,14 +367,14 @@ mod tests {
 
     #[test]
     fn tls_is_enabled_only_by_a_complete_pair_and_fails_closed() {
+        // Blank values never reach here: tls_env_var reads them as unset.
         let some = |s: &str| Some(s.to_string());
         assert!(tls_paths(None, None, false).unwrap().is_none());
-        assert!(tls_paths(some(""), some("  "), false).unwrap().is_none());
         assert!(tls_paths(some("/c"), some("/k"), false).unwrap().is_some());
         assert!(tls_paths(some("/c"), some("/k"), true).unwrap().is_some());
         assert!(tls_paths(some("/c"), None, false).is_err());
         assert!(tls_paths(None, some("/k"), false).is_err());
-        assert!(tls_paths(some("/c"), some(""), false).is_err());
+        assert!(tls_paths(some("/c"), None, true).is_err());
         assert!(tls_paths(None, None, true).is_err());
     }
 

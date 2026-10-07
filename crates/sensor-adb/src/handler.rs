@@ -36,7 +36,7 @@ use sensor_framework::shell::{EmitContext, FakeShell, onlcr};
 use sensor_framework::upload_metadata;
 use sensor_framework::{
     CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, ConnectionBudget,
-    EgressState, EventEmitter, Uuid, WanResolver, limits_from,
+    EgressState, EventEmitter, UploadEnd, Uuid, WanResolver, limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
@@ -234,10 +234,13 @@ impl Drop for ShellCapture {
                 authenticated: false,
                 observed_at: chrono::Utc::now(),
                 metadata: {
-                    let mut m =
-                        upload_metadata(PROTOCOL_LABEL, &sample, wire_size, end.is_complete());
+                    let mut m = upload_metadata(
+                        PROTOCOL_LABEL,
+                        &sample,
+                        wire_size,
+                        UploadEnd::Session(end),
+                    );
                     m["capture_reason"] = serde_json::json!("binary_shell_payload");
-                    m["end_reason"] = serde_json::json!(end.label());
                     m
                 },
                 sample: Some(sample),
@@ -265,6 +268,10 @@ struct SyncState {
     /// A share of the connection's filesystem: a completed push is also written into it, so a
     /// later shell command on the connection can read the file back.
     fs: FakeFs,
+    /// Set when the peer closed THIS stream with a CLSE, which cuts a SEND still open on it
+    /// whatever later becomes of the connection; otherwise the session's ending did.
+    stream_end: Option<CaptureEnd>,
+    session_end: SessionEnd,
 }
 
 /// The fake-tree path a push to `raw` is written to, or `None` when it must not be: empty,
@@ -279,10 +286,12 @@ fn push_destination(raw: &str) -> Option<&str> {
 }
 
 /// A SEND still open when the stream is closed, the session ends, or the handler future is
-/// cancelled is submitted as an incomplete capture. `submit` never blocks, so it is safe here.
+/// cancelled is submitted as an incomplete capture, cut off by whichever of those happened.
+/// `submit` never blocks, so it is safe here.
 impl Drop for SyncState {
     fn drop(&mut self) {
-        if let Some(job) = self.abandon() {
+        let end = self.stream_end.unwrap_or_else(|| self.session_end.get());
+        if let Some(job) = self.abandon(end) {
             let _ = self.handoff.submit(job);
         }
     }
@@ -309,6 +318,7 @@ impl SyncState {
         session_id: Uuid,
         handoff: Arc<CaptureHandoff>,
         fs: FakeFs,
+        session_end: SessionEnd,
     ) -> Self {
         Self {
             buf: Vec::new(),
@@ -318,6 +328,8 @@ impl SyncState {
             session_id,
             handoff,
             fs,
+            stream_end: None,
+            session_end,
         }
     }
 
@@ -407,7 +419,7 @@ impl SyncState {
                         // The process-wide capture budget is full. The prefix goes out now as an
                         // incomplete capture and the push fails the way a full device's does, which
                         // makes `adb push` abort rather than keep streaming.
-                        if let Some(job) = self.abandon() {
+                        if let Some(job) = self.abandon(CaptureEnd::CaptureBudget) {
                             let _ = self.handoff.submit(job);
                         }
                         response.extend_from_slice(&adb_proto::build_sync_message(
@@ -422,7 +434,7 @@ impl SyncState {
                     self.buf.drain(..adb_proto::SYNC_HEADER_LEN);
                     if let Some(pending) = self.pending_send.take() {
                         self.land_in_fake_fs(&pending);
-                        upload = Some(self.build_capture_job(pending, true));
+                        upload = Some(self.build_capture_job(pending, UploadEnd::TransferComplete));
                     }
                     response.extend_from_slice(&adb_proto::build_sync_message(
                         adb_proto::SYNC_OKAY,
@@ -486,25 +498,27 @@ impl SyncState {
         Some(payload)
     }
 
-    /// The sub-stream cannot make forward progress. DATA already received for an open SEND is
-    /// still evidence, so it goes out as an incomplete capture rather than being discarded.
+    /// The sub-stream cannot make forward progress: the peer sent sync input this state machine
+    /// cannot parse. DATA already received for an open SEND is still evidence, so it goes out as
+    /// an incomplete capture rather than being discarded.
     fn reset(&mut self) {
-        if let Some(job) = self.abandon() {
+        if let Some(job) = self.abandon(CaptureEnd::MalformedInput) {
             let _ = self.handoff.submit(job);
         }
         self.buf.clear();
     }
 
-    /// The stream or session is ending with a `SEND` still open (no `DONE` arrived). The bytes
-    /// that did are returned as a capture marked incomplete; they used to be dropped with the
-    /// stream.
-    fn abandon(&mut self) -> Option<CaptureJob> {
+    /// The stream or session is ending, by `end`, with a `SEND` still open (no `DONE` arrived).
+    /// The bytes that did are returned as a capture cut off by `end`; they used to be dropped
+    /// with the stream.
+    fn abandon(&mut self, end: CaptureEnd) -> Option<CaptureJob> {
         self.buf.clear();
         let pending = self.pending_send.take()?;
-        (pending.wire_bytes > 0).then(|| self.build_capture_job(pending, false))
+        (pending.wire_bytes > 0)
+            .then(|| self.build_capture_job(pending, UploadEnd::TransferCut(end)))
     }
 
-    fn build_capture_job(&self, pending: PendingSend, complete: bool) -> CaptureJob {
+    fn build_capture_job(&self, pending: PendingSend, end: UploadEnd) -> CaptureJob {
         let source_ip = self.source_ip;
         let wan_ip = self.wan_ip;
         let session_id = self.session_id;
@@ -521,7 +535,7 @@ impl SyncState {
                 protocol: PROTO_TCP.to_string(),
                 authenticated: false,
                 observed_at: chrono::Utc::now(),
-                metadata: upload_metadata(PROTOCOL_LABEL, &sample, wire_size, complete),
+                metadata: upload_metadata(PROTOCOL_LABEL, &sample, wire_size, end),
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
@@ -790,8 +804,12 @@ pub async fn handle_connection(
                     // The peer closed this stream itself, so whatever it streamed at the shell is
                     // whatever it meant to send - regardless of how the connection later ends.
                     // Recorded before the remove's value is dropped, which is what submits it.
-                    if let StreamKind::Shell(_, _, capture, _) = &mut s.kind {
-                        capture.stream_end = Some(CaptureEnd::PeerClosed);
+                    match &mut s.kind {
+                        StreamKind::Shell(_, _, capture, _) => {
+                            capture.stream_end = Some(CaptureEnd::PeerClosed);
+                        }
+                        StreamKind::Sync(sync) => sync.stream_end = Some(CaptureEnd::PeerClosed),
+                        StreamKind::OneShot => {}
                     }
                     let _ = write_or_err(
                         &mut stream,
@@ -965,6 +983,7 @@ async fn handle_open(
                         session_id,
                         handoff.clone(),
                         base_fs.share(),
+                        session_end.clone(),
                     )),
                 ),
             );
@@ -1251,6 +1270,7 @@ mod tests {
             Uuid::now_v7(),
             handoff,
             FakeFs::android(),
+            SessionEnd::new(),
         );
         (state, dir)
     }
@@ -1277,6 +1297,7 @@ mod tests {
             Uuid::now_v7(),
             handoff.clone(),
             FakeFs::android(),
+            SessionEnd::new(),
         );
         sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
@@ -1301,6 +1322,7 @@ mod tests {
             Uuid::now_v7(),
             handoff.clone(),
             FakeFs::android(),
+            SessionEnd::new(),
         );
         sync.feed(&adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
@@ -1348,6 +1370,7 @@ mod tests {
                 Uuid::now_v7(),
                 handoff.clone(),
                 FakeFs::android(),
+                SessionEnd::new(),
             )
         };
 
@@ -1394,6 +1417,7 @@ mod tests {
             Uuid::now_v7(),
             handoff,
             fs,
+            SessionEnd::new(),
         );
         let mut wire = adb_proto::build_sync_message(
             adb_proto::SYNC_SEND,
@@ -1440,6 +1464,7 @@ mod tests {
             Uuid::now_v7(),
             handoff,
             base.share(),
+            SessionEnd::new(),
         );
         let mut wire =
             adb_proto::build_sync_message(adb_proto::SYNC_SEND, b"/data/local/tmp/nomode");
@@ -1507,6 +1532,7 @@ mod tests {
             Uuid::now_v7(),
             handoff,
             base.share(),
+            SessionEnd::new(),
         );
         let mut stat = |path: &str| {
             let (reply, upload) = sync.feed(&adb_proto::build_sync_message(
@@ -1615,12 +1641,15 @@ mod tests {
             b"/data/local/tmp/x,33188",
         ));
         sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"AB"));
-        let job = sync.abandon().expect("DATA arrived, so a capture");
+        let job = sync
+            .abandon(CaptureEnd::PeerClosed)
+            .expect("DATA arrived, so a capture");
         assert_eq!(job.body.as_slice(), b"AB");
         let sample_ref = sample(&job);
         let event = (job.event_builder)(sample_ref);
         assert_eq!(event.metadata["complete"], false);
-        assert!(sync.abandon().is_none());
+        assert_eq!(event.metadata["end_reason"], "peer_closed");
+        assert!(sync.abandon(CaptureEnd::PeerClosed).is_none());
 
         // A SEND with no DATA yet has nothing to keep.
         let (mut bare, _bare_dir) = test_sync_state();
@@ -1628,7 +1657,7 @@ mod tests {
             adb_proto::SYNC_SEND,
             b"/tmp/y,420",
         ));
-        assert!(bare.abandon().is_none());
+        assert!(bare.abandon(CaptureEnd::PeerClosed).is_none());
 
         let (mut done, _done_dir) = test_sync_state();
         let (_, upload) = done.feed(
@@ -1643,6 +1672,7 @@ mod tests {
         let sample_ref = sample(&job);
         let event = (job.event_builder)(sample_ref);
         assert_eq!(event.metadata["complete"], true);
+        assert_eq!(event.metadata["end_reason"], "transfer_complete");
     }
 
     #[test]

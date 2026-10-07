@@ -89,6 +89,45 @@ the buffer that holds it, not by code after the session loop, which a cancelled 
 never reaches. The IP detail page shows such
 rows with status `incomplete`.
 
+#### `end_reason`
+
+Every upload row also carries `end_reason`, what ended the capture. `upload_metadata` takes it as a
+required `UploadEnd` and derives `complete` from the same value, so the two keys are always
+present together and cannot disagree (`crates/sensor-framework/src/handoff.rs#UploadEnd`,
+`crates/sensor-framework/src/handoff.rs#upload_metadata`). A file transfer is complete only at its
+own end of file; cut off before it, it carries the label of what cut it with `complete` false,
+even where the same label makes a shell capture complete. The cut-off labels are the session
+endings of `crates/sensor-framework/src/handoff.rs#CaptureEnd`.
+
+| value | meaning |
+|---|---|
+| `transfer_complete` | the transfer reached its protocol's end of file (always `complete` true) |
+| `peer_closed` | the peer closed the connection, or the channel or stream carrying the transfer |
+| `client_logout` | the peer asked to end the session (`exit`/`logout`, SSH DISCONNECT) |
+| `idle_timeout` | nothing arrived within `idle_timeout` (or `read_timeout` for the first read) |
+| `transport_error` | the socket failed, or a reply could not be written |
+| `malformed_input` | the peer sent something the protocol could not parse |
+| `capture_budget` | a sensor-side read bound: `max_captured_bytes`, or a per-transfer cap derived from it |
+| `peer_aborted` | the peer aborted the transfer with its protocol's error message |
+| `session_cancelled` | the listener cancelled the handler at `max_duration`; no code observed another ending |
+| `capture_memory_budget` | the process-wide capture memory budget ran out; overrides any other value (`crates/sensor-framework/src/handoff.rs#mark_budget_truncated`) |
+
+What each sensor writes:
+
+| capture | `complete` true | `complete` false |
+|---|---|---|
+| ssh SCP, SFTP | `transfer_complete` (SCP trailer, SFTP CLOSE) | the session's ending: `peer_closed` (socket or the transfer's channel closed), `client_logout`, `idle_timeout`, `transport_error`, `malformed_input`, `session_cancelled` |
+| adb sync push | `transfer_complete` (DONE) | `peer_closed` (CLSE of the sync stream, or the socket), `idle_timeout`, `transport_error`, `malformed_input` (including a sync message the stream cannot parse), `capture_budget`, `session_cancelled` |
+| ftp STOR | `transfer_complete` (data connection closed) | `idle_timeout`, `transport_error`, `capture_budget` (the drain cap), `session_cancelled` |
+| tftp WRQ | `transfer_complete` (short final block) | `capture_budget` (body cap or packet allowance), `idle_timeout`, `peer_aborted` (ERROR from the peer), `malformed_input` (oversized DATA), `transport_error`, `session_cancelled` |
+| mqtt PUBLISH | `transfer_complete` (the packet is read whole) | only `capture_memory_budget` |
+| ssh, telnet, adb binary shell payload | `peer_closed`, `client_logout` | `idle_timeout`, `transport_error`, `malformed_input` (ssh, adb), `capture_budget` (telnet, adb), `session_cancelled` |
+
+Any of them can instead read `capture_memory_budget`. Events stored before `end_reason` was
+written for every capture (shell captures carried it earlier, the transfers did not) have no
+key; the fleet pane's capture panel counts those as `unrecorded`
+(`crates/console/src/routes/fleet.rs#top_end_reasons`), and they are not backfilled.
+
 ### Arrival metadata key
 
 Every event a sensor emits carries the local port of the listener its connection or datagram

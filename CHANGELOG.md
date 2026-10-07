@@ -368,6 +368,20 @@
 
 ### Fixed
 
+- **Every captured upload records why it ended** - the fleet pane's capture panel gave
+  `unrecorded` as the end reason of incomplete captures (ten of ten for SSH), because
+  `upload_metadata` took only a `complete` flag and `end_reason` was added by hand at the three
+  shell-capture sites. SCP, SFTP, ADB sync, FTP STOR, TFTP WRQ and MQTT PUBLISH captures never
+  carried it. `upload_metadata` now takes a required `UploadEnd` and writes both `complete` and
+  `end_reason` from it, so neither can be omitted or disagree. A finished transfer reads
+  `transfer_complete`; a transfer cut off before its end of file carries what cut it
+  (`peer_closed`, `client_logout`, `idle_timeout`, `session_cancelled`, `transport_error`,
+  `malformed_input`, `capture_budget`, and for a TFTP peer ERROR the new `peer_aborted`) with
+  `complete` false, even where the same label makes a shell capture complete. SSH passes each open
+  SCP or SFTP transfer the session's real ending, or `peer_closed` when its channel is closed; an
+  ADB sync stream the client closes records `peer_closed`; FTP records an idle data connection as
+  `idle_timeout` and a failed one as `transport_error`. The shell-capture labels are unchanged.
+  Events already stored keep no `end_reason` and still read `unrecorded`; nothing is backfilled.
 - **The IP detail page shows a catch-all probe's port** - the evidence row read
   `metadata.port`, which no sensor has ever written, so every catch-all probe showed `-`. It now
   reads the stamped `metadata.local_port`.

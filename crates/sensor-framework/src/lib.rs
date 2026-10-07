@@ -44,7 +44,7 @@ pub use emit::EventEmitter;
 pub use env::{EnvError, env_with_legacy, strict_env_var};
 pub use handoff::{
     CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome,
-    END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, upload_metadata,
+    END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, UploadEnd, upload_metadata,
 };
 pub use listener::{listener_start_error, run_tcp_listener, run_udp_listener, shutdown_signal};
 pub use logging::init_logging;

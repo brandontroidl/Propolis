@@ -7,8 +7,8 @@ use tokio::net::{TcpListener, TcpStream};
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
 use sensor_framework::{
-    CaptureBody, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, MaybeTlsStream,
-    TlsServer, Uuid, WanResolver, upgrade_buffered, upload_metadata,
+    CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter,
+    MaybeTlsStream, TlsServer, UploadEnd, Uuid, WanResolver, upgrade_buffered, upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
@@ -113,7 +113,9 @@ async fn send_and_close<W: AsyncWrite + Unpin>(
 enum StorOutcome {
     /// The client closed the data connection: the whole file arrived.
     Complete,
-    /// The data connection went quiet or failed part way: what arrived is a fragment.
+    /// The data connection went quiet for `idle_timeout` part way: what arrived is a fragment.
+    IdleTimeout,
+    /// The data connection failed part way: what arrived is a fragment.
     NetworkFailure,
     /// The sensor stopped reading at `MAX_STOR_BODY + MAX_STOR_DRAIN`, the way a server stops
     /// when it cannot write any more of the file.
@@ -121,6 +123,19 @@ enum StorOutcome {
     /// The process-wide capture memory budget had no room for more of the file. What was already
     /// buffered is kept as a prefix; the reply is the same one a full disk gets.
     CaptureBudgetExhausted,
+}
+
+impl StorOutcome {
+    fn end(self) -> UploadEnd {
+        match self {
+            Self::Complete => UploadEnd::TransferComplete,
+            Self::IdleTimeout => UploadEnd::TransferCut(CaptureEnd::IdleTimeout),
+            Self::NetworkFailure => UploadEnd::TransferCut(CaptureEnd::TransportError),
+            Self::DrainCapReached | Self::CaptureBudgetExhausted => {
+                UploadEnd::TransferCut(CaptureEnd::CaptureBudget)
+            }
+        }
+    }
 }
 
 /// A STOR upload being received: the retained body (at most `MAX_STOR_BODY`), the bytes the
@@ -161,7 +176,8 @@ impl StorCapture {
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     return StorOutcome::Complete;
                 }
-                Ok(Err(_)) | Err(_) => return StorOutcome::NetworkFailure,
+                Ok(Err(_)) => return StorOutcome::NetworkFailure,
+                Err(_) => return StorOutcome::IdleTimeout,
                 Ok(Ok(n)) => {
                     let take = MAX_STOR_BODY.saturating_sub(self.body.len()).min(n);
                     let kept = self.body.extend_from_slice(&chunk[..take]);
@@ -177,7 +193,7 @@ impl StorCapture {
         }
     }
 
-    fn finish(&mut self, complete: bool) {
+    fn finish(&mut self, end: UploadEnd) {
         if self.submitted {
             return;
         }
@@ -196,7 +212,7 @@ impl StorCapture {
             body,
             orig_name,
             event_builder: Box::new(move |sample: SampleRef| {
-                let mut metadata = upload_metadata(PROTOCOL_LABEL, &sample, wire_bytes, complete);
+                let mut metadata = upload_metadata(PROTOCOL_LABEL, &sample, wire_bytes, end);
                 if tls {
                     tag_tls(&mut metadata);
                 }
@@ -223,7 +239,7 @@ impl StorCapture {
 impl Drop for StorCapture {
     fn drop(&mut self) {
         if self.wire_bytes > 0 {
-            self.finish(false);
+            self.finish(UploadEnd::TransferCut(CaptureEnd::Cancelled));
         }
     }
 }
@@ -579,10 +595,12 @@ pub async fn handle_connection(
                         handoff: handoff.clone(),
                     };
                     let outcome = capture.receive(data, bounds.idle_timeout).await;
-                    capture.finish(outcome == StorOutcome::Complete);
+                    capture.finish(outcome.end());
                     let reply: &[u8] = match outcome {
                         StorOutcome::Complete => b"226 Transfer complete.\r\n",
-                        StorOutcome::NetworkFailure => b"426 Failure reading network stream.\r\n",
+                        StorOutcome::IdleTimeout | StorOutcome::NetworkFailure => {
+                            b"426 Failure reading network stream.\r\n"
+                        }
                         StorOutcome::DrainCapReached | StorOutcome::CaptureBudgetExhausted => {
                             b"451 Failure writing to local file.\r\n"
                         }
@@ -839,7 +857,7 @@ mod tests {
             session_id: Uuid::now_v7(),
             handoff: handoff.clone(),
         };
-        finished.finish(true);
+        finished.finish(UploadEnd::TransferComplete);
         drop(finished);
         assert!(
             handoff.submit(probe_job()).is_err(),
@@ -973,6 +991,23 @@ mod tests {
         };
         assert_eq!(c.receive(reset, idle).await, StorOutcome::NetworkFailure);
         assert_eq!(c.wire_bytes, 3);
+    }
+
+    /// Each way a STOR ends maps to its own reason, and only the data connection's close is a
+    /// whole file. A timeout and a socket failure both used to be one `NetworkFailure`.
+    #[test]
+    fn each_stor_outcome_names_its_own_end() {
+        let ends = [
+            (StorOutcome::Complete, "transfer_complete", true),
+            (StorOutcome::IdleTimeout, "idle_timeout", false),
+            (StorOutcome::NetworkFailure, "transport_error", false),
+            (StorOutcome::DrainCapReached, "capture_budget", false),
+            (StorOutcome::CaptureBudgetExhausted, "capture_budget", false),
+        ];
+        for (outcome, label, complete) in ends {
+            assert_eq!(outcome.end().label(), label, "{outcome:?}");
+            assert_eq!(outcome.end().is_complete(), complete, "{outcome:?}");
+        }
     }
 
     #[test]

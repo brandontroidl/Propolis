@@ -38,8 +38,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::shell::looks_binary;
 use sensor_framework::{
-    CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver, sanitize_value,
-    to_hex_bounded, upload_metadata,
+    CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, UploadEnd, Uuid,
+    WanResolver, sanitize_value, to_hex_bounded, upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
@@ -1122,9 +1122,9 @@ fn stamp_tls(metadata: &mut serde_json::Value, tls: bool) {
 
 /// Build the hand-off job for a spooled PUBLISH payload. The payload is charged to the
 /// capture-memory budget as it is copied in: a budget that cannot hold all of it leaves a prefix
-/// (`complete` false here, and the hand-off stamps `truncated` / `end_reason` itself), and one that
-/// holds none of it makes `submit` refuse the job. The packet was read whole, so a payload the
-/// budget did not cut is complete.
+/// (cut by `capture_budget` here, which the hand-off then stamps as `capture_memory_budget` with
+/// `truncated`), and one that holds none of it makes `submit` refuse the job. The packet was read
+/// whole, so a payload the budget did not cut is a complete transfer.
 fn capture_job(
     handoff: &CaptureHandoff,
     request: CaptureRequest,
@@ -1135,7 +1135,11 @@ fn capture_job(
     tls: bool,
 ) -> CaptureJob {
     let mut body = handoff.new_capture_body();
-    let complete = body.extend_from_slice(payload).is_ok();
+    let end = if body.extend_from_slice(payload).is_ok() {
+        UploadEnd::TransferComplete
+    } else {
+        UploadEnd::TransferCut(CaptureEnd::CaptureBudget)
+    };
     let wire_size = payload.len() as u64;
     let CaptureRequest {
         orig_name, fields, ..
@@ -1144,7 +1148,7 @@ fn capture_job(
         body,
         orig_name: orig_name.unwrap_or_else(|| format!("mqtt-publish-{session_id}")),
         event_builder: Box::new(move |sample: SampleRef| {
-            let mut metadata = upload_metadata(PROTOCOL_LABEL, &sample, wire_size, complete);
+            let mut metadata = upload_metadata(PROTOCOL_LABEL, &sample, wire_size, end);
             if let (Some(map), Some(extra)) = (metadata.as_object_mut(), fields.as_object()) {
                 map.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
@@ -1284,6 +1288,65 @@ pub async fn handle_connection<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PUBLISH is read whole, so the only thing that can cut its payload is the capture memory
+    /// budget; a payload that fit is a complete transfer.
+    #[test]
+    fn a_publish_capture_is_complete_unless_the_budget_cut_it() {
+        use sensor_framework::{
+            CAPTURE_CHUNK_BYTES, CaptureMemoryBudget, OutboxManifest, QuarantineSpool,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let handoff = CaptureHandoff::new(
+            QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000),
+            EventEmitter::new(dir.path().join("events.jsonl")),
+            4,
+            "test".to_string(),
+            OutboxManifest::new(dir.path().join("outbox")),
+            Arc::new(CaptureMemoryBudget::new(CAPTURE_CHUNK_BYTES)),
+        );
+        let end_of = |payload: &[u8]| {
+            let request = CaptureRequest {
+                payload_len: payload.len(),
+                orig_name: Some("t".into()),
+                fields: serde_json::json!({}),
+            };
+            let job = capture_job(
+                &handoff,
+                request,
+                payload,
+                "203.0.113.7".parse().unwrap(),
+                None,
+                Uuid::now_v7(),
+                false,
+            );
+            let sample = SampleRef {
+                sha256: "ab".repeat(32),
+                size: job.body.len() as u64,
+                orig_name: job.orig_name.clone(),
+                capture_id: None,
+            };
+            let m = (job.event_builder)(sample).metadata;
+            (m["end_reason"].clone(), m["complete"].clone())
+        };
+        assert_eq!(
+            end_of(&[0x7f; 100]),
+            (
+                serde_json::json!("transfer_complete"),
+                serde_json::json!(true)
+            )
+        );
+        let over = vec![0x7fu8; CAPTURE_CHUNK_BYTES as usize + 1];
+        assert_eq!(
+            end_of(&over),
+            (
+                serde_json::json!("capture_budget"),
+                serde_json::json!(false)
+            )
+        );
+    }
 
     fn lenp(s: &[u8]) -> Vec<u8> {
         let mut v = (s.len() as u16).to_be_bytes().to_vec();

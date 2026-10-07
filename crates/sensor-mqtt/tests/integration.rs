@@ -1103,6 +1103,7 @@ async fn binary_publish_is_spooled_and_text_publish_is_not() {
     assert_eq!(m["wire_size"], payload.len());
     assert_eq!(m["truncated"], false);
     assert_eq!(m["complete"], true);
+    assert_eq!(m["end_reason"], "transfer_complete");
     assert!(up.authenticated);
     assert_eq!(up.sensor, "mqtt");
     assert!(up.occurrence_id.is_some());
@@ -1178,6 +1179,7 @@ async fn binary_publish_that_exhausts_the_budget_keeps_its_prefix() {
     let uploads = srv.wait_for_uploads(2).await;
     assert_eq!(uploads[1].sample.as_ref().unwrap().size, 64);
     assert_eq!(uploads[1].metadata["complete"], true);
+    assert_eq!(uploads[1].metadata["end_reason"], "transfer_complete");
     srv.handle.abort();
 }
 

@@ -21,7 +21,7 @@ use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
 use sensor_framework::{
     BudgetLimits, CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, CaptureMemoryBudget,
     ConnectionBounds, ConnectionBudget, EgressState, EventEmitter, OutboxManifest, QuarantineSpool,
-    WanResolver, default_capture_budget_bytes, limits_from,
+    UploadEnd, WanResolver, default_capture_budget_bytes, limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
@@ -68,6 +68,18 @@ enum ChannelHandler {
     Scp(ScpReceiver),
     /// SFTP subsystem handler.
     Sftp(SftpHandler),
+}
+
+impl ChannelHandler {
+    /// The channel is going away, ended by `end`: a file transfer still open on it is submitted
+    /// as cut off by that, rather than by the `Cancelled` its `Drop` would have to assume.
+    fn cut_off(&mut self, end: CaptureEnd) {
+        match self {
+            Self::Scp(scp) => scp.cut_off(end),
+            Self::Sftp(sftp) => sftp.cut_off(end),
+            Self::Pending | Self::Shell(..) => {}
+        }
+    }
 }
 
 struct ChannelState {
@@ -921,11 +933,13 @@ async fn handle_session(
                 let Some(ch_id) = channel_recipient(&payload, SSH_MSG_CHANNEL_CLOSE) else {
                     continue;
                 };
-                if let Some(state) = channels.remove(&ch_id)
-                    && !state.flow.close_sent
-                {
-                    let close = build_channel_close(ch_id);
-                    let _ = write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &close).await;
+                if let Some(mut state) = channels.remove(&ch_id) {
+                    // The peer closed this channel itself, whatever later becomes of the session.
+                    state.handler.cut_off(CaptureEnd::PeerClosed);
+                    if !state.flow.close_sent {
+                        let close = build_channel_close(ch_id);
+                        let _ = write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &close).await;
+                    }
                 }
             }
 
@@ -940,10 +954,6 @@ async fn handle_session(
     }
     .await;
 
-    // A transfer still open when the session ends is kept as an incomplete capture: the SCP and
-    // SFTP handlers submit it from `Drop` (see `transfer.rs`), which is the only code that runs
-    // when the listener cancels this future at `max_duration`, so nothing is done here.
-
     // A binary payload was seen somewhere in the shell phase (a Mirai/Gafgyt dropper streamed
     // over the "shell" - never a real interactive command, since FakeShell's binary-flood
     // detector only trips on a line that is mostly non-printable). Preserve the raw bytes as
@@ -954,6 +964,13 @@ async fn handle_session(
     // cut the session with a payload still arriving.
     if loop_result.is_err() {
         shell_capture.mark_session_end(CaptureEnd::TransportError);
+    }
+
+    // A transfer still open when the session ends is kept as an incomplete capture cut off by
+    // that ending. When the listener cancels this future at `max_duration` none of this runs, and
+    // the SCP and SFTP handlers' `Drop` submits it as cancelled instead (see `transfer.rs`).
+    for state in channels.values_mut() {
+        state.handler.cut_off(shell_capture.session_end);
     }
 
     loop_result
@@ -1038,18 +1055,17 @@ impl Drop for ShellCapture {
                 authenticated: true,
                 observed_at: chrono::Utc::now(),
                 // Through `upload_metadata` like every other capture, so this one also carries
-                // size, wire_size, truncated and complete. Hand-rolling the object here left
-                // `complete` absent, and the console reads a missing `complete` as true - so a
-                // fragment from a cancelled session displayed as a whole sample.
+                // size, wire_size, truncated, complete and end_reason. Hand-rolling the object
+                // here left `complete` absent, and the console reads a missing `complete` as true
+                // - so a fragment from a cancelled session displayed as a whole sample.
                 metadata: {
                     let mut m = sensor_framework::upload_metadata(
                         "ssh",
                         &sample,
                         wire_size,
-                        end.is_complete(),
+                        UploadEnd::Session(end),
                     );
                     m["capture_reason"] = serde_json::json!("binary_shell_payload");
-                    m["end_reason"] = serde_json::json!(end.label());
                     m
                 },
                 sample: Some(sample),

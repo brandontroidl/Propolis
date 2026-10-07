@@ -28,9 +28,9 @@ use std::time::Duration;
 use chrono::Utc;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{
-    CaptureBody, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, FloodSummary,
-    SourceRefusal, Uuid, WanResolver, check_reply_source, rate_limited_event, sanitize_value,
-    upload_metadata,
+    CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter,
+    FloodSummary, SourceRefusal, UploadEnd, Uuid, WanResolver, check_reply_source,
+    rate_limited_event, sanitize_value, upload_metadata,
 };
 use sensor_wire::{
     PROTO_UDP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
@@ -121,6 +121,21 @@ enum Outcome {
     /// The process-wide capture memory budget had no room for more of the file; the prefix already
     /// buffered is kept. Answered with the same ERROR a full disk gets.
     CaptureBudget,
+}
+
+impl Outcome {
+    fn end(self) -> UploadEnd {
+        let cut = match self {
+            Self::Complete => return UploadEnd::TransferComplete,
+            // Both are this sensor's read bounds, the packet allowance derived from the body cap.
+            Self::BodyCap | Self::PacketCap | Self::CaptureBudget => CaptureEnd::CaptureBudget,
+            Self::Idle => CaptureEnd::IdleTimeout,
+            Self::PeerError => CaptureEnd::PeerAborted,
+            Self::Malformed => CaptureEnd::MalformedInput,
+            Self::Transport => CaptureEnd::TransportError,
+        };
+        UploadEnd::TransferCut(cut)
+    }
 }
 
 pub struct Sensor {
@@ -242,7 +257,7 @@ impl Sensor {
                     sent = transfer.budget().sent(),
                     "tftp: upload ended"
                 );
-                capture.finish(outcome == Outcome::Complete);
+                capture.finish(outcome.end());
             }
         }
     }
@@ -353,7 +368,7 @@ impl UploadCapture {
         }
     }
 
-    fn finish(&mut self, complete: bool) {
+    fn finish(&mut self, end: UploadEnd) {
         if self.submitted {
             return;
         }
@@ -361,7 +376,7 @@ impl UploadCapture {
         // A WRQ that never delivered a byte is a probe, already recorded as such; an empty
         // malware_upload would only add noise. A completed empty file (DATA 1 with no payload) is a
         // real, if odd, upload.
-        if self.wire_bytes == 0 && !complete {
+        if self.wire_bytes == 0 && !end.is_complete() {
             return;
         }
         let body = std::mem::replace(&mut self.body, self.handoff.new_capture_body());
@@ -390,7 +405,7 @@ impl UploadCapture {
                     PROTOCOL_LABEL,
                     &sample,
                     wire_bytes,
-                    complete,
+                    end,
                     cap_hit,
                 ),
                 sample: Some(sample),
@@ -404,7 +419,7 @@ impl UploadCapture {
 
 impl Drop for UploadCapture {
     fn drop(&mut self) {
-        self.finish(false);
+        self.finish(UploadEnd::TransferCut(CaptureEnd::Cancelled));
     }
 }
 
@@ -413,10 +428,10 @@ fn upload_metadata_with_cap(
     protocol_label: &str,
     sample: &SampleRef,
     wire_bytes: u64,
-    complete: bool,
+    end: UploadEnd,
     cap_hit: bool,
 ) -> serde_json::Value {
-    let mut metadata = upload_metadata(protocol_label, sample, wire_bytes, complete);
+    let mut metadata = upload_metadata(protocol_label, sample, wire_bytes, end);
     if cap_hit {
         metadata["truncated"] = serde_json::Value::Bool(true);
     }
@@ -543,7 +558,7 @@ mod tests {
 
         let handoff = one_slot_handoff();
         let mut finished = capture(5, &handoff);
-        finished.finish(true);
+        finished.finish(UploadEnd::TransferComplete);
         drop(finished);
         assert!(
             handoff.submit(probe_job()).is_err(),
@@ -555,7 +570,7 @@ mod tests {
     fn a_wrq_that_delivered_nothing_submits_no_capture() {
         let handoff = one_slot_handoff();
         let mut empty = capture(0, &handoff);
-        empty.finish(false);
+        empty.finish(UploadEnd::TransferCut(CaptureEnd::IdleTimeout));
         drop(empty);
         assert!(
             handoff.submit(probe_job()).is_ok(),
@@ -567,8 +582,27 @@ mod tests {
     fn a_completed_empty_upload_is_still_a_capture() {
         let handoff = one_slot_handoff();
         let mut empty = capture(0, &handoff);
-        empty.finish(true);
+        empty.finish(UploadEnd::TransferComplete);
         assert!(handoff.submit(probe_job()).is_err());
+    }
+
+    /// Every way a WRQ ends names its own reason, and only the short final block is whole.
+    #[test]
+    fn each_upload_outcome_names_its_own_end() {
+        let ends = [
+            (Outcome::Complete, "transfer_complete", true),
+            (Outcome::BodyCap, "capture_budget", false),
+            (Outcome::PacketCap, "capture_budget", false),
+            (Outcome::CaptureBudget, "capture_budget", false),
+            (Outcome::Idle, "idle_timeout", false),
+            (Outcome::PeerError, "peer_aborted", false),
+            (Outcome::Malformed, "malformed_input", false),
+            (Outcome::Transport, "transport_error", false),
+        ];
+        for (outcome, label, complete) in ends {
+            assert_eq!(outcome.end().label(), label, "{outcome:?}");
+            assert_eq!(outcome.end().is_complete(), complete, "{outcome:?}");
+        }
     }
 
     fn sensor(log: &std::path::Path) -> Sensor {

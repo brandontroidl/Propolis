@@ -77,6 +77,13 @@ emit only the SP2 signal subset (`catchall_probe`, `honeypot_connection`,
 `honeypot_login_attempt`, `honeypot_command_exec`, `honeypot_malware_upload`,
 `honeypot_file_download`; `crates/sensor-wire/src/lib.rs#SIGNAL_CATCHALL_PROBE`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_CONNECTION`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_LOGIN_ATTEMPT`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_COMMAND_EXEC`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_MALWARE_UPLOAD`, `crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_FILE_DOWNLOAD`).
 
+A sensor that captures bodies builds each `honeypot_malware_upload` event's metadata with
+`upload_metadata`, passing the `UploadEnd` that really ended the capture (see
+[`end_reason`](../reference/events-and-signals.md#end_reason)). It must not hand-roll that object or
+write `end_reason` itself:
+`crates/sensor-framework/src/handoff.rs#every_body_capturing_sensor_builds_its_upload_events_through_upload_metadata`
+scans every crate that builds a `CaptureJob` and fails on either.
+
 ## The tests a sensor must pass
 
 Sensors test with **real TCP** against an ephemeral `:0` listener per connection

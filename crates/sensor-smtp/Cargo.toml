@@ -20,3 +20,6 @@ rand = { version = "0.10.2", features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+rcgen = "0.14.9"
+# Client side of the TLS tests; sensor-framework does not re-export it.
+tokio-rustls = "0.26.4"

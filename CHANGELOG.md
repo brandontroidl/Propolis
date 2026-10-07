@@ -4,6 +4,24 @@
 
 ### Added
 
+- **SMTPS, SMTP submission and STARTTLS on `sensor-smtp` (default off)** - `PROPOLIS_SMTP_TLS_CERT`
+  and `PROPOLIS_SMTP_TLS_KEY` (the pair `provision-tls.sh` mints, key mode `0600`) turn STARTTLS
+  from the old `454` reply into a real upgrade on the plain listeners. Two optional listeners in
+  the same process, writing the same event log, exist only when their bind is set (no compiled
+  default): `PROPOLIS_SMTP_SUBMISSION_BIND` (deploy convention `0.0.0.0:587`, plain with
+  STARTTLS) and `PROPOLIS_SMTP_TLS_BIND` (`0.0.0.0:465`, implicit TLS, requires the pair).
+  STARTTLS replies `220 2.0.0 Ready to start TLS`, refuses plaintext pipelined behind it with
+  one `honeypot_command_exec` event (`starttls_refused: pipelined_plaintext`, the byte count,
+  never the bytes) and a `554` before any handshake, forces a fresh EHLO and resets MAIL, RCPT
+  and BDAT state after the upgrade, answers a second STARTTLS inside TLS with `503`, and answers
+  STARTTLS with parameters with `501` (only when TLS is configured). EHLO inside TLS omits
+  STARTTLS. Connection, login and data events from a TLS session carry `"tls": true`; plain
+  events are unchanged, and with no TLS variable set the sensor is byte-identical (STARTTLS
+  advertised, `454`). Fail-closed: exactly one of cert and key, a TLS bind without both, an
+  invalid bind, or an unusable pair makes the sensor exit 1 before binding anything, and a bind
+  failure on any listener stops the others and exits 1. Cert and key without a TLS bind enable
+  STARTTLS and open no 465 listener. `fleet-listeners.sh` derives an `smtp` tcp listener from
+  each of the two new bind variables, and the unit gains `ReadOnlyPaths=/etc/propolis/tls`.
 - **MQTTS on `sensor-mqtt` (default off)** - a second, implicit-TLS listener in the same process,
   serving the same persona into the same event log, enabled by `PROPOLIS_MQTT_TLS_BIND` (no
   compiled default; the deploy convention is `0.0.0.0:8883`) together with

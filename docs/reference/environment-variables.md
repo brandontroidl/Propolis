@@ -663,6 +663,30 @@ Sensor-specific extras:
   (`deploy/fleet-listeners.sh#PROPOLIS_MQTT_TLS_BIND`), a TLS listener never starts implicitly.
   The plain and TLS listeners share one capture-memory budget
   (`PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES`), so the ceiling covers both together.
+- **smtp**: SMTP TLS and extra listeners (all four default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_SMTP_SUBMISSION_BIND` | unset (the deploy convention is `0.0.0.0:587`) | `ip:port` of an extra plain listener (submission). It serves the same session as `PROPOLIS_SMTP_BIND`, with STARTTLS iff the cert and key are set. The listener exists only when this is set. |
+  | `PROPOLIS_SMTP_TLS_BIND` | unset (the deploy convention is `0.0.0.0:465`) | `ip:port` of the implicit-TLS (SMTPS) listener. The listener exists only when this is set, and it requires the cert and key. |
+  | `PROPOLIS_SMTP_TLS_CERT` | unset (deploy value `/etc/propolis/tls/smtp.crt`) | PEM certificate path. Together with the key it enables STARTTLS on the plain listeners. |
+  | `PROPOLIS_SMTP_TLS_KEY` | unset (deploy value `/etc/propolis/tls/smtp.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-smtp/src/lib.rs#tls_from_env`,
+  `crates/sensor-smtp/src/main.rs#main`): the sensor exits 1 with `refusing to start`, before
+  binding any listener (the plain one included), when exactly one of CERT and KEY is set (a blank
+  value counts as unset), when `PROPOLIS_SMTP_TLS_BIND` is set without both paths, when
+  `PROPOLIS_SMTP_TLS_BIND` or `PROPOLIS_SMTP_SUBMISSION_BIND` does not parse (unlike the lenient
+  bound variables, a bad bind never falls back to a default), when a file is unreadable, not PEM
+  or a mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value is invalid,
+  not unset. If the OS refuses any one bind, the listeners already started are stopped and the
+  sensor exits 1 (`crates/sensor-smtp/src/lib.rs#start_listeners`). With CERT and KEY set and no
+  `PROPOLIS_SMTP_TLS_BIND`, the pair enables STARTTLS on the plain listeners (25 and, if set, 587)
+  and no implicit-TLS listener starts; unlike the other sensors this logs no warning, because the
+  pair is in use. With no TLS variable set the sensor is unchanged: STARTTLS is advertised and
+  answered with `454`. Because the fleet inventory derives from the `*_BIND` variables
+  (`deploy/fleet-listeners.sh#PROPOLIS_SMTP_SUBMISSION_BIND`,
+  `deploy/fleet-listeners.sh#PROPOLIS_SMTP_TLS_BIND`), neither extra listener starts implicitly.
 - **catchall**: no spool variable (never spools file bodies,
   `crates/sensor-catchall/src/main.rs#Config`); no
   outbox variable either (captures no file bodies, so nothing for SP-B-1b's
@@ -718,7 +742,10 @@ Invalid or zero bound → **silent default**, not abort.
   `/var/log/propolis/smtp/events.jsonl`), `PROPOLIS_SMTP_READ_TIMEOUT_MS`
   (`30_000`), `PROPOLIS_SMTP_IDLE_TIMEOUT_MS` (`60_000`),
   `PROPOLIS_SMTP_MAX_DURATION_SECS` (`600`), `PROPOLIS_SMTP_MAX_CAPTURED_BYTES`
-  (`1_000_000`), `PROPOLIS_SMTP_MAX_CONCURRENT` (`256`).
+  (`1_000_000`), `PROPOLIS_SMTP_MAX_CONCURRENT` (`256`). The extra-listener and TLS variables
+  `PROPOLIS_SMTP_SUBMISSION_BIND`, `PROPOLIS_SMTP_TLS_BIND`, `PROPOLIS_SMTP_TLS_CERT` and
+  `PROPOLIS_SMTP_TLS_KEY` are strict, not lenient: see the smtp entry under the sensor TLS
+  variables above.
 - **sensor-cred** (`crates/sensor-cred/src/main.rs`): multi-protocol
   (VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Bind variables `PROPOLIS_CRED_VNC_BIND`,
   `PROPOLIS_CRED_MYSQL_BIND`, `PROPOLIS_CRED_MSSQL_BIND`, `PROPOLIS_CRED_PG_BIND`,

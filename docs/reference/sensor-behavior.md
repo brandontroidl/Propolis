@@ -742,7 +742,8 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
 - **Behavior** (`handler.rs`): banner `220 <host> ESMTP Postfix (Ubuntu)` (persona
   host). EHLO advertises PIPELINING, SIZE 10240000, ETRN, STARTTLS, AUTH PLAIN
   LOGIN, ENHANCEDSTATUSCODES, 8BITMIME, DSN, SMTPUTF8, CHUNKING (`crates/sensor-smtp/src/handler.rs#handle_connection`). Verbs
-  (`crates/sensor-smtp/src/handler.rs#handle_connection`): HELO/EHLO, STARTTLS (`454 TLS not available` - no in-process TLS),
+  (`crates/sensor-smtp/src/handler.rs#handle_connection`): HELO/EHLO, STARTTLS (`454 TLS not available` unless TLS is
+  configured, see "SMTP over TLS" below),
   AUTH PLAIN (decodes username, drops password → `honeypot_login_attempt`), AUTH
   LOGIN (username captured, password dropped), MAIL FROM / RCPT TO, DATA (captures
   mail_from/rcpt_to/subject/body_size → `honeypot_command_exec`, replies with a
@@ -757,8 +758,43 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
   the default on invalid/zero input rather than refusing to start**
   (`crates/sensor-smtp/src/main.rs#parse_positive_u64`, `crates/sensor-smtp/src/main.rs#parse_positive_u32`) - differs from the reject-on-zero sensors. No spool (message
   body captured as size and subject only, never stored as a file).
+- **SMTP over TLS (optional):** `PROPOLIS_SMTP_TLS_CERT` and `PROPOLIS_SMTP_TLS_KEY` together
+  enable STARTTLS on the plain listeners (25 and the optional 587,
+  `PROPOLIS_SMTP_SUBMISSION_BIND`); `PROPOLIS_SMTP_TLS_BIND` adds an implicit-TLS (SMTPS, 465)
+  listener that needs the pair. All listeners run in one process and write one `events.jsonl`
+  (`crates/sensor-smtp/src/lib.rs#start_listeners`); 465 and 587 exist only when their bind is
+  set. No client certificate is requested. Rules, in the order the handler checks them
+  (`crates/sensor-smtp/src/handler.rs#handle_connection`):
+  - Inside TLS (implicit, or after an upgrade) STARTTLS gets `503 5.5.1 Error: TLS already
+    active`, and EHLO omits the STARTTLS extension; on a plain session it is offered.
+  - STARTTLS with parameters, when TLS is configured, gets `501 5.5.4 Syntax error (no
+    parameters allowed)`.
+  - Plaintext the client sent behind STARTTLS (already buffered when the line is read) is
+    refused before any `220`: one `honeypot_command_exec` event with `command` `STARTTLS`,
+    `starttls_refused` `pipelined_plaintext` and `pipelined_bytes` (the count; the injected bytes
+    are never captured or interpreted), then `554 5.5.1 Error: command pipelining after
+    STARTTLS`, a flush, a stream shutdown and the end of the session. The event is
+    plaintext-phase and carries no `"tls"` key.
+  - Otherwise `220 2.0.0 Ready to start TLS`, then the handshake bounded by the read timeout
+    (`crates/sensor-framework/src/tls.rs#upgrade_buffered`). A failed handshake ends the session
+    with no plaintext fallback. After the upgrade MAIL FROM, RCPT TO and BDAT state is reset and
+    the client must EHLO again; the per-connection captured-byte count is kept.
+  - With no pair configured every STARTTLS line, with or without parameters, gets the unchanged
+    `454 4.7.0 TLS not available due to local problem`, and EHLO still advertises STARTTLS.
+  - Connection, login (`AUTH PLAIN` and `AUTH LOGIN`) and data events from a TLS session carry
+    `"tls": true`; the key is absent, not false, on plain sessions
+    (`crates/sensor-smtp/src/handler.rs#tag_tls`). Passwords are never captured, TLS or not.
+    QUIT sends `221` then a stream shutdown (`close_notify` on TLS).
+  - An implicit handshake that fails or stalls is dropped with a debug log and emits no event.
+  - Fail-closed: the sensor refuses to start (exit 1, before any bind) on a half-configured or
+    unusable pair, a TLS bind without a pair, or an unparseable extra bind, and the key must be
+    mode `0600`; an OS bind failure on any listener stops the others and exits 1. A pair with
+    no TLS bind is not an error: it enables STARTTLS and opens no 465 listener. Variables and
+    the full rules are in [environment-variables.md](environment-variables.md); the operator
+    view is
+    [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
-  `honeypot_command_exec` (DATA).
+  `honeypot_command_exec` (DATA, and the pipelined-STARTTLS refusal).
 
 ### sensor-adb
 

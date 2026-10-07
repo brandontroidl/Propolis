@@ -20,6 +20,8 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 ReadWritePaths=/var/log/propolis/smtp
+# SMTP TLS cert and key (PROPOLIS_SMTP_TLS_CERT / PROPOLIS_SMTP_TLS_KEY); read-only, never written.
+ReadOnlyPaths=/etc/propolis/tls
 
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE

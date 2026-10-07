@@ -10,6 +10,10 @@ use sensor_framework::{ConnectionBounds, WanResolver, shutdown_signal};
 const ENV_BIND: &str = "PROPOLIS_SMTP_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_SMTP_WAN_MAP";
 const ENV_LOG_PATH: &str = "PROPOLIS_SMTP_LOG_PATH";
+const ENV_SUBMISSION_BIND: &str = "PROPOLIS_SMTP_SUBMISSION_BIND";
+const ENV_TLS_BIND: &str = "PROPOLIS_SMTP_TLS_BIND";
+const ENV_TLS_CERT: &str = "PROPOLIS_SMTP_TLS_CERT";
+const ENV_TLS_KEY: &str = "PROPOLIS_SMTP_TLS_KEY";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/smtp/events.jsonl";
 
@@ -35,6 +39,23 @@ fn parse_positive_u32(raw: Option<&str>, default: u32) -> u32 {
     raw.and_then(|s| s.parse::<u32>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(default)
+}
+
+/// Unset or blank means "not configured". Anything else must parse or the sensor refuses to
+/// start: a typo must not silently drop a listener the derived fleet inventory will claim exists.
+fn optional_bind(var: &str) -> Option<SocketAddr> {
+    let raw = env::var(var).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.parse() {
+        Ok(addr) => Some(addr),
+        Err(_) => {
+            tracing::error!("invalid {var}: {raw:?}");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[tokio::main]
@@ -84,18 +105,43 @@ async fn main() {
         ),
     };
 
+    // All configuration is validated before the first socket is bound, so a bad TLS setup never
+    // leaves a plaintext listener running.
+    let submission_bind = optional_bind(ENV_SUBMISSION_BIND);
+    let tls_bind = optional_bind(ENV_TLS_BIND);
+    let tls = match sensor_smtp::tls_from_env(ENV_TLS_CERT, ENV_TLS_KEY, tls_bind.is_some(), |v| {
+        env::var(v)
+    }) {
+        Ok(tls) => tls,
+        Err(e) => {
+            tracing::error!(error = %e, "sensor-smtp: invalid TLS configuration; refusing to start");
+            std::process::exit(1);
+        }
+    };
+    let listeners = match sensor_smtp::plan_listeners(bind_addr, submission_bind, tls_bind, tls) {
+        Ok(listeners) => listeners,
+        Err(e) => {
+            tracing::error!("sensor-smtp: {e}; refusing to start");
+            std::process::exit(1);
+        }
+    };
+
     let wan_resolver = Arc::new(WanResolver::new(wan_map));
-    let (bound, handle) =
-        match sensor_smtp::start_test_server(bind_addr, log_path, wan_resolver, bounds).await {
-            Ok(pair) => pair,
+    let started =
+        match sensor_smtp::start_listeners(listeners, log_path, wan_resolver, bounds).await {
+            Ok(started) => started,
             Err(e) => {
-                tracing::error!(addr = %bind_addr, error = %e, "sensor-smtp: failed to start");
+                tracing::error!(error = %e, "sensor-smtp: failed to start");
                 std::process::exit(1);
             }
         };
 
-    tracing::info!(local = %bound, "sensor-smtp: listening");
+    for (bound, _) in &started {
+        tracing::info!(local = %bound, "sensor-smtp: listening");
+    }
     shutdown_signal().await;
     tracing::info!("sensor-smtp: shutdown signal received; stopping");
-    handle.abort();
+    for (_, handle) in &started {
+        handle.abort();
+    }
 }

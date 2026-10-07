@@ -6,7 +6,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::persona;
 use sensor_framework::sanitize_value;
-use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
+use sensor_framework::{
+    ConnectionBounds, EventEmitter, MaybeTlsStream, TlsServer, Uuid, WanResolver, upgrade_buffered,
+};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
     SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
@@ -27,17 +29,20 @@ fn queue_id() -> String {
         .collect()
 }
 
-pub async fn handle_connection<S>(
-    stream: S,
+/// Serves one SMTP session. `stream` is `Tls` for an implicit-TLS (465) connection and `Plain`
+/// otherwise; `tls` is `Some` iff a certificate is configured, which is what lets STARTTLS upgrade
+/// a plain session instead of getting the `454` reply.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_connection(
+    stream: MaybeTlsStream,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
     session_id: Uuid,
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
+    tls: Option<TlsServer>,
+) {
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
     let wan_ip = local_addr
@@ -45,7 +50,12 @@ pub async fn handle_connection<S>(
         .and_then(|local| wan_resolver.resolve(local.ip()));
 
     let _ = emitter
-        .append(&connection_event(source_ip, wan_ip, session_id))
+        .append(&connection_event(
+            source_ip,
+            wan_ip,
+            session_id,
+            stream.is_tls(),
+        ))
         .await;
 
     // The advertised identity comes from the shared persona so the SMTP hostname matches uname /
@@ -54,19 +64,6 @@ pub async fn handle_connection<S>(
     // handler/reply below, since advertising one the server does not honor is itself a tell.
     let host = persona::hostname();
     let banner = format!("220 {host} ESMTP Postfix (Ubuntu)\r\n");
-    let ehlo_reply = format!(
-        "250-{host}\r\n\
-         250-PIPELINING\r\n\
-         250-SIZE 10240000\r\n\
-         250-ETRN\r\n\
-         250-STARTTLS\r\n\
-         250-AUTH PLAIN LOGIN\r\n\
-         250-ENHANCEDSTATUSCODES\r\n\
-         250-8BITMIME\r\n\
-         250-DSN\r\n\
-         250-SMTPUTF8\r\n\
-         250 CHUNKING\r\n"
-    );
     let helo_reply = format!("250 {host}\r\n");
 
     let mut reader = BufReader::new(stream);
@@ -89,25 +86,86 @@ pub async fn handle_connection<S>(
         let upper = line.to_ascii_uppercase();
 
         if upper.starts_with("EHLO") {
-            let _ = write_reply(&mut reader, ehlo_reply.as_bytes()).await;
+            // Postfix never offers STARTTLS on a session that already has TLS. On a plain session it
+            // is offered even with no certificate configured (the 454 below answers it), so every
+            // advertised capability still has a matching reply.
+            let reply = ehlo_reply(&host, !reader.get_ref().is_tls());
+            let _ = write_reply(&mut reader, reply.as_bytes()).await;
         } else if upper.starts_with("HELO") {
             // HELO gets a single-line greeting; only EHLO returns the multiline extension list.
             let _ = write_reply(&mut reader, helo_reply.as_bytes()).await;
         } else if upper.starts_with("STARTTLS") {
-            // Advertised in EHLO, so it must be answered - but this low-interaction sensor has no
-            // TLS. Postfix's own "TLS temporarily unavailable" reply is realistic and needs no
-            // handshake, unlike a 502 that would contradict the advertised STARTTLS capability.
-            let _ = write_reply(
-                &mut reader,
-                b"454 4.7.0 TLS not available due to local problem\r\n",
-            )
-            .await;
+            if reader.get_ref().is_tls() {
+                let _ = write_reply(&mut reader, b"503 5.5.1 Error: TLS already active\r\n").await;
+            } else if upper.trim_end() != "STARTTLS" && tls.is_some() {
+                // RFC 3207 section 4: the STARTTLS verb takes no parameters. Only with TLS
+                // configured; without it the unchanged 454 below answers every STARTTLS line.
+                let _ = write_reply(
+                    &mut reader,
+                    b"501 5.5.4 Syntax error (no parameters allowed)\r\n",
+                )
+                .await;
+            } else if let Some(tls) = tls.as_ref() {
+                // CVE-2011-0411 shape: bytes the client pipelined behind STARTTLS were sent in
+                // plaintext and must never be read as commands inside the TLS session. Refuse
+                // before the 220 so the client never believes a handshake is coming, and record
+                // the attempt.
+                let pipelined = reader.buffer().len();
+                if pipelined > 0 {
+                    let _ = emitter
+                        .append(&starttls_refused_event(
+                            source_ip, wan_ip, session_id, pipelined,
+                        ))
+                        .await;
+                    let _ = write_reply(
+                        &mut reader,
+                        b"554 5.5.1 Error: command pipelining after STARTTLS\r\n",
+                    )
+                    .await;
+                    let _ = reader.get_mut().shutdown().await;
+                    return;
+                }
+                if write_reply(&mut reader, b"220 2.0.0 Ready to start TLS\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                // The only upgrade path: upgrade_buffered re-checks for buffered plaintext and
+                // builds a fresh BufReader. Any failure ends the session; there is no plaintext
+                // fallback after the 220.
+                let Ok(upgraded) = upgrade_buffered(reader, tls, bounds.read_timeout).await else {
+                    return;
+                };
+                reader = upgraded;
+                // RFC 3207 section 4.2: the server discards what it learned before the upgrade and
+                // the client must EHLO again. `total_read` is deliberately kept: the capture cap is
+                // per connection.
+                mail_from.clear();
+                rcpt_to.clear();
+                bdat_body.clear();
+                bdat_received = 0;
+            } else {
+                // No cert/key configured: Postfix's own "TLS temporarily unavailable" reply needs
+                // no handshake and does not contradict the advertised STARTTLS capability.
+                let _ = write_reply(
+                    &mut reader,
+                    b"454 4.7.0 TLS not available due to local problem\r\n",
+                )
+                .await;
+            }
         } else if upper.starts_with("AUTH PLAIN ") {
             // AUTH PLAIN <base64(NUL user NUL pass)> - decode username, drop password
             let encoded = line[11..].trim();
             let username = decode_auth_plain(encoded).unwrap_or_default();
             let _ = emitter
-                .append(&login_event(source_ip, wan_ip, &username, session_id))
+                .append(&login_event(
+                    source_ip,
+                    wan_ip,
+                    &username,
+                    session_id,
+                    reader.get_ref().is_tls(),
+                ))
                 .await;
             let _ = write_reply(&mut reader, b"235 2.7.0 Authentication successful\r\n").await;
         } else if upper.starts_with("AUTH LOGIN") {
@@ -130,6 +188,7 @@ pub async fn handle_connection<S>(
                     wan_ip,
                     &sanitize_value(&username, MAX_USERNAME_LEN),
                     session_id,
+                    reader.get_ref().is_tls(),
                 ))
                 .await;
             let _ = write_reply(&mut reader, b"235 2.7.0 Authentication successful\r\n").await;
@@ -157,6 +216,7 @@ pub async fn handle_connection<S>(
                 body_size: received,
                 truncated: received > body.len(),
                 chunking: false,
+                tls: reader.get_ref().is_tls(),
             };
             let _ = emitter
                 .append(&data_event(source_ip, wan_ip, &msg, session_id))
@@ -200,6 +260,7 @@ pub async fn handle_connection<S>(
                             body_size: bdat_received,
                             truncated: bdat_received > bdat_body.len(),
                             chunking: true,
+                            tls: reader.get_ref().is_tls(),
                         };
                         let _ = emitter
                             .append(&data_event(source_ip, wan_ip, &msg, session_id))
@@ -224,6 +285,8 @@ pub async fn handle_connection<S>(
             let _ = write_reply(&mut reader, b"250 2.0.0 Ok\r\n").await;
         } else if upper.starts_with("QUIT") {
             let _ = write_reply(&mut reader, b"221 2.0.0 Bye\r\n").await;
+            // On a TLS session this sends close_notify instead of a bare TCP close.
+            let _ = reader.get_mut().shutdown().await;
             return;
         } else if upper.starts_with("VRFY") {
             let _ = write_reply(
@@ -239,7 +302,43 @@ pub async fn handle_connection<S>(
     }
 }
 
-fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
+fn ehlo_reply(host: &str, offer_starttls: bool) -> String {
+    let starttls = if offer_starttls {
+        "250-STARTTLS\r\n"
+    } else {
+        ""
+    };
+    format!(
+        "250-{host}\r\n\
+         250-PIPELINING\r\n\
+         250-SIZE 10240000\r\n\
+         250-ETRN\r\n\
+         {starttls}\
+         250-AUTH PLAIN LOGIN\r\n\
+         250-ENHANCEDSTATUSCODES\r\n\
+         250-8BITMIME\r\n\
+         250-DSN\r\n\
+         250-SMTPUTF8\r\n\
+         250 CHUNKING\r\n"
+    )
+}
+
+/// Adds `"tls": true` to event metadata. The key is absent on plaintext events, so a consumer
+/// reads "has the key" as "was TLS" and existing plaintext events are unchanged.
+fn tag_tls(metadata: &mut serde_json::Value, tls: bool) {
+    if tls && let Some(map) = metadata.as_object_mut() {
+        map.insert("tls".to_string(), serde_json::Value::Bool(true));
+    }
+}
+
+fn connection_event(
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+    tls: bool,
+) -> SensorEvent {
+    let mut metadata = serde_json::json!({ "protocol_label": PROTOCOL_LABEL });
+    tag_tls(&mut metadata, tls);
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -249,7 +348,7 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid)
         protocol: PROTO_TCP.to_string(),
         authenticated: false,
         observed_at: chrono::Utc::now(),
-        metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
+        metadata,
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
@@ -261,7 +360,13 @@ fn login_event(
     wan_ip: Option<IpAddr>,
     username: &str,
     session_id: Uuid,
+    tls: bool,
 ) -> SensorEvent {
+    let mut metadata = serde_json::json!({
+        "protocol_label": PROTOCOL_LABEL,
+        "username": username,
+    });
+    tag_tls(&mut metadata, tls);
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -271,10 +376,7 @@ fn login_event(
         protocol: PROTO_TCP.to_string(),
         authenticated: true,
         observed_at: chrono::Utc::now(),
-        metadata: serde_json::json!({
-            "protocol_label": PROTOCOL_LABEL,
-            "username": username,
-        }),
+        metadata,
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
@@ -292,6 +394,8 @@ struct ReceivedMessage<'a> {
     truncated: bool,
     /// Delivered with BDAT (CHUNKING) rather than DATA.
     chunking: bool,
+    /// The session was TLS when the message arrived.
+    tls: bool,
 }
 
 fn data_event(
@@ -307,7 +411,22 @@ fn data_event(
         body_size,
         truncated,
         chunking,
+        tls,
     } = *msg;
+    // `command` stays "DATA" for a message delivered by BDAT too: it is the same "a message
+    // body was received" observation for everything downstream; `chunking` says which
+    // transfer the client chose.
+    let mut metadata = serde_json::json!({
+        "protocol_label": PROTOCOL_LABEL,
+        "command": "DATA",
+        "mail_from": sanitize_value(mail_from, 255),
+        "rcpt_to": rcpt_to.iter().map(|r| sanitize_value(r, 255)).collect::<Vec<_>>(),
+        "subject": sanitize_value(subject, 512),
+        "body_size": body_size,
+        "truncated": truncated,
+        "chunking": chunking,
+    });
+    tag_tls(&mut metadata, tls);
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -317,18 +436,35 @@ fn data_event(
         protocol: PROTO_TCP.to_string(),
         authenticated: false,
         observed_at: chrono::Utc::now(),
-        // `command` stays "DATA" for a message delivered by BDAT too: it is the same "a message
-        // body was received" observation for everything downstream; `chunking` says which
-        // transfer the client chose.
+        metadata,
+        sample: None,
+        session_id: Some(session_id),
+        occurrence_id: None,
+    }
+}
+
+/// A STARTTLS that arrived with plaintext already buffered behind it. The pipelined bytes are
+/// counted, not captured: they are the injection payload and are never interpreted.
+fn starttls_refused_event(
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+    pipelined_bytes: usize,
+) -> SensorEvent {
+    SensorEvent {
+        v: WIRE_VERSION,
+        source_ip,
+        wan_ip,
+        sensor: PROTOCOL_LABEL.to_string(),
+        signal_type: SIGNAL_HONEYPOT_COMMAND_EXEC.to_string(),
+        protocol: PROTO_TCP.to_string(),
+        authenticated: false,
+        observed_at: chrono::Utc::now(),
         metadata: serde_json::json!({
             "protocol_label": PROTOCOL_LABEL,
-            "command": "DATA",
-            "mail_from": sanitize_value(mail_from, 255),
-            "rcpt_to": rcpt_to.iter().map(|r| sanitize_value(r, 255)).collect::<Vec<_>>(),
-            "subject": sanitize_value(subject, 512),
-            "body_size": body_size,
-            "truncated": truncated,
-            "chunking": chunking,
+            "command": "STARTTLS",
+            "starttls_refused": "pipelined_plaintext",
+            "pipelined_bytes": pipelined_bytes,
         }),
         sample: None,
         session_id: Some(session_id),
@@ -420,7 +556,10 @@ async fn write_reply<S: AsyncRead + AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
     data: &[u8],
 ) -> Result<(), ()> {
-    reader.get_mut().write_all(data).await.map_err(|_| ())
+    let inner = reader.get_mut();
+    inner.write_all(data).await.map_err(|_| ())?;
+    // tokio-rustls can leave a written record unsent until flushed; a no-op on plain TCP.
+    inner.flush().await.map_err(|_| ())
 }
 
 async fn read_line_bounded<S: AsyncRead + Unpin>(
@@ -560,10 +699,11 @@ mod tests {
 
     #[test]
     fn connection_event_fields() {
-        let event = connection_event("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
+        let event = connection_event("203.0.113.7".parse().unwrap(), None, Uuid::now_v7(), false);
         assert!(!event.authenticated);
         assert_eq!(event.sensor, "smtp");
         assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
+        assert!(event.metadata.get("tls").is_none());
     }
 
     #[test]
@@ -573,6 +713,7 @@ mod tests {
             None,
             "admin",
             Uuid::now_v7(),
+            false,
         );
         assert!(event.authenticated);
         assert_eq!(
@@ -580,6 +721,64 @@ mod tests {
             Some("admin")
         );
         assert!(event.metadata.get("password").is_none());
+        assert!(event.metadata.get("tls").is_none());
+    }
+
+    fn message(tls: bool) -> ReceivedMessage<'static> {
+        ReceivedMessage {
+            mail_from: "a@b.test",
+            rcpt_to: &[],
+            subject: "s",
+            body_size: 1,
+            truncated: false,
+            chunking: false,
+            tls,
+        }
+    }
+
+    #[test]
+    fn tls_tag_is_present_only_when_true() {
+        let ip = "203.0.113.7".parse().unwrap();
+        let id = Uuid::now_v7();
+        for tls in [true, false] {
+            let events = [
+                connection_event(ip, None, id, tls),
+                login_event(ip, None, "u", id, tls),
+                data_event(ip, None, &message(tls), id),
+            ];
+            for event in events {
+                if tls {
+                    assert_eq!(event.metadata.get("tls"), Some(&serde_json::json!(true)));
+                } else {
+                    assert!(event.metadata.get("tls").is_none(), "{:?}", event.metadata);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn starttls_refused_event_records_the_count_and_never_the_bytes() {
+        let event =
+            starttls_refused_event("203.0.113.7".parse().unwrap(), None, Uuid::now_v7(), 31);
+        assert_eq!(event.signal_type, SIGNAL_HONEYPOT_COMMAND_EXEC);
+        assert_eq!(event.metadata["command"], "STARTTLS");
+        assert_eq!(event.metadata["starttls_refused"], "pipelined_plaintext");
+        assert_eq!(event.metadata["pipelined_bytes"], 31);
+        assert!(event.metadata.get("tls").is_none());
+        assert!(event.sample.is_none());
+    }
+
+    #[test]
+    fn ehlo_reply_offers_starttls_only_when_asked() {
+        let with = ehlo_reply("h", true);
+        let without = ehlo_reply("h", false);
+        assert!(with.contains("250-STARTTLS\r\n"));
+        assert!(!without.contains("STARTTLS"));
+        for reply in [&with, &without] {
+            assert!(reply.starts_with("250-h\r\n"));
+            assert!(reply.contains("250-AUTH PLAIN LOGIN\r\n"));
+            assert!(reply.ends_with("250 CHUNKING\r\n"));
+        }
     }
 
     #[test]

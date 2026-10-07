@@ -130,6 +130,48 @@ fn a_cert_and_key_without_an_mqtt_tls_bind_derive_no_listener() {
 }
 
 #[test]
+fn an_smtp_submission_bind_yields_one_tcp_listener_named_smtp() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "smtp.env",
+        "PROPOLIS_SMTP_SUBMISSION_BIND=203.0.113.7:587\n",
+    );
+
+    let value = generate(dir.path()).unwrap();
+    let parsed = parse_listeners(&value).unwrap();
+
+    assert_eq!(parsed, vec![listener("smtp", Proto::Tcp, 587)]);
+}
+
+#[test]
+fn an_smtp_tls_bind_yields_one_tcp_listener_named_smtp() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "smtp.env",
+        "PROPOLIS_SMTP_TLS_BIND=203.0.113.7:465\n",
+    );
+
+    let value = generate(dir.path()).unwrap();
+    let parsed = parse_listeners(&value).unwrap();
+
+    assert_eq!(parsed, vec![listener("smtp", Proto::Tcp, 465)]);
+}
+
+#[test]
+fn a_cert_and_key_without_an_smtp_tls_bind_derive_no_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "smtp.env",
+        "PROPOLIS_SMTP_TLS_CERT=/etc/propolis/tls/smtp.crt\nPROPOLIS_SMTP_TLS_KEY=/etc/propolis/tls/smtp.key\n",
+    );
+
+    assert_eq!(generate(dir.path()), None);
+}
+
+#[test]
 fn an_http_tls_bind_yields_one_tcp_listener_named_http() {
     let dir = tempfile::tempdir().unwrap();
     write(

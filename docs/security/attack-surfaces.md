@@ -63,6 +63,21 @@ captured over TLS, as on the plain listener. Binary PUBLISH payloads sent over T
 by the same hand-off, byte budget and shutdown drain as the plain listener, and never run. A
 half-configured or unusable pair makes the sensor refuse to start rather than serve plaintext.
 
+`sensor-smtp` can expose up to two more ports and a protocol upgrade. An implicit-TLS listener
+(conventionally 465, SMTPS) and a submission listener (conventionally 587, plain with STARTTLS)
+each exist only when `PROPOLIS_SMTP_TLS_BIND` or `PROPOLIS_SMTP_SUBMISSION_BIND` is set, so cert
+and key alone open no new port. They do enable STARTTLS on the plain listeners (25, and 587 when
+set), which adds a handshake to those sessions: a failed or stalled handshake ends the session,
+and the same limits as the HTTPS listener apply (no client certificate, a deploy-minted
+self-signed certificate named `localhost`, handshake failures logged only at debug level). The
+STARTTLS upgrade refuses plaintext pipelined behind the command (the injection class of
+CVE-2011-0411): the bytes are counted in one `honeypot_command_exec` event, never captured or
+interpreted, and the connection is closed with a `554` before any handshake begins. Session state
+is reset after the upgrade. AUTH passwords are never captured over TLS, as on the plain
+listener. A half-configured or unusable pair makes the sensor refuse to start rather than serve
+plaintext. See
+[../operations/networking-tls.md](../operations/networking-tls.md#live-smtps-and-starttls-on-sensor-smtp).
+
 Controls:
 
 - **Never-execute.** No sensor spawns a subprocess or execs; the honeypot captures, it

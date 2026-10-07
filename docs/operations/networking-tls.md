@@ -100,20 +100,22 @@ This is separate from the console and the gateway and shipper mTLS material: it 
 server-side TLS on the honeypot's own attacker-facing ports, so the sensors can answer
 HTTPS, MQTTS and the other encrypted variants of the protocols they imitate.
 
-> **Status: three sensors live.** The shared capability, the certificate minting and the deploy
-> wiring below are in place, and `sensor-http` serves HTTPS, `sensor-redis` serves Redis over TLS
-> and `sensor-mqtt` serves MQTTS (all below). The other surfaces are still pending `[planned]`:
-> no other sensor reads a TLS variable or listens with TLS.
+> **Status: four sensors live.** The shared capability, the certificate minting and the deploy
+> wiring below are in place, and `sensor-http` serves HTTPS, `sensor-redis` serves Redis over TLS,
+> `sensor-mqtt` serves MQTTS and `sensor-smtp` serves SMTPS and SMTP STARTTLS (all below). The
+> other surfaces are still pending `[planned]`: no other sensor reads a TLS variable or listens
+> with TLS.
 >
-> **No implicit TLS bind.** A TLS listener exists only when its `*_TLS_BIND` variable is
-> explicitly set. `deploy/fleet-listeners.sh` derives the fleet inventory from the `*_BIND`
-> variables, so a compiled-in default bind would open a port the inventory never lists. A
-> certificate and key with no TLS bind are still loaded and validated (fail-closed), start no
-> TLS listener, and log one warning.
+> **No implicit TLS bind.** A TLS listener exists only when its `*_TLS_BIND` variable (for
+> `sensor-smtp` also `PROPOLIS_SMTP_SUBMISSION_BIND`) is explicitly set.
+> `deploy/fleet-listeners.sh` derives the fleet inventory from the `*_BIND` variables, so a
+> compiled-in default bind would open a port the inventory never lists. A certificate and key
+> with no TLS bind are still loaded and validated (fail-closed), start no TLS listener, and log
+> one warning. The exception is `sensor-smtp`, where the pair also enables an
+> in-protocol upgrade (STARTTLS) on the plain listener, so it is in use and logs no warning.
 >
 > Pending surfaces:
 >
-> - SMTPS on 465, plus SMTP STARTTLS (`sensor-smtp`)
 > - FTPS on 990, plus FTP AUTH TLS (`sensor-ftp`)
 > - in-band TLS for the `sensor-cred` PostgreSQL, MySQL, MSSQL and MongoDB protocols
 
@@ -177,6 +179,47 @@ does not parse, or when the pair is unusable (see [Loading is fail-closed](#load
 If the OS refuses the TLS bind itself, the plain listener is stopped and the sensor exits 1.
 Variables are owned by [environment-variables.md](../reference/environment-variables.md);
 behavior by [sensor-behavior.md](../reference/sensor-behavior.md).
+
+### Live: SMTPS and STARTTLS on `sensor-smtp`
+
+| Item | Value |
+|---|---|
+| Modes | implicit TLS on the SMTPS port (the handshake comes before the banner), and STARTTLS on the plain listeners; no client certificate |
+| Plain bind | `PROPOLIS_SMTP_BIND` (25), required as before; offers STARTTLS and upgrades iff the cert and key are set |
+| Submission bind | `PROPOLIS_SMTP_SUBMISSION_BIND` (587), optional, no compiled default; the same plain session as 25, with STARTTLS iff the pair is set |
+| SMTPS bind | `PROPOLIS_SMTP_TLS_BIND` (465), optional, no compiled default; implicit TLS, requires the pair |
+| Certificate and key | `PROPOLIS_SMTP_TLS_CERT` (`/etc/propolis/tls/smtp.crt`), `PROPOLIS_SMTP_TLS_KEY` (`/etc/propolis/tls/smtp.key`, mode `0600`) |
+| Listeners | up to three in one process, writing one `events.jsonl`; 465 and 587 exist only when their bind is set |
+| Unit | `deploy/sensor-smtp.service` adds `ReadOnlyPaths=/etc/propolis/tls`; `CAP_NET_BIND_SERVICE` stays for ports 25, 465 and 587 |
+| Event tagging | connection, login and data events from a TLS session (implicit, or after STARTTLS) carry `"tls": true`; plain events have no such key |
+
+STARTTLS rules (`crates/sensor-smtp/src/handler.rs#handle_connection`; replies in
+[sensor-behavior.md](../reference/sensor-behavior.md#sensor-smtp)):
+
+- With the pair set, STARTTLS answers `220 2.0.0 Ready to start TLS` and upgrades in place. A
+  failed or stalled handshake ends the session; there is no plaintext fallback after the `220`.
+- Plaintext the client pipelined behind STARTTLS is never read as a command inside the TLS
+  session (the CVE-2011-0411 class). The sensor records one `honeypot_command_exec` event with
+  `starttls_refused` set to `pipelined_plaintext` and the byte count (the bytes themselves are
+  never captured), replies `554`, and closes the connection without sending the `220`.
+- After the upgrade the client must send EHLO again: MAIL, RCPT and BDAT state is discarded. The
+  per-connection capture cap (`total_read`) is kept across the upgrade.
+- A second STARTTLS inside TLS gets `503`, and EHLO inside TLS omits the STARTTLS extension.
+  STARTTLS with parameters gets `501` (only when TLS is configured).
+- With no pair set nothing changes: EHLO still advertises STARTTLS and every STARTTLS line gets
+  the unchanged `454` reply.
+- A cert and key with no `PROPOLIS_SMTP_TLS_BIND` and no submission bind still enable STARTTLS on
+  port 25 and open nothing else (pinned by the spawned-binary test
+  `crates/sensor-smtp/tests/tls.rs#a_valid_pair_without_a_tls_bind_enables_starttls_on_the_plain_listener_only`).
+
+Fail-closed: the sensor exits 1 with `refusing to start`, before binding anything, when exactly
+one of cert and key is set (a blank value counts as unset), when the SMTPS bind is set without
+both paths, when either extra bind does not parse, or when the pair is unusable (see
+[Loading is fail-closed](#loading-is-fail-closed)). If the OS refuses any one bind, the
+listeners already started are stopped and the sensor exits 1. An implicit handshake that fails
+is dropped with a debug log and no event. Variables are owned by
+[environment-variables.md](../reference/environment-variables.md); behavior by
+[sensor-behavior.md](../reference/sensor-behavior.md).
 
 ### Certificate model
 

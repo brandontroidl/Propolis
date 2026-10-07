@@ -103,11 +103,12 @@ for the full variable reference.
 
 Self-signed certificate and key per TLS-capable sensor (http, mqtt, redis, smtp, ftp, cred),
 minted by `deploy/provision-tls.sh` (`deploy/provision-tls.sh#TLS_SENSORS`). Only `sensor-http`,
-`sensor-mqtt` and `sensor-redis` read their pair so far (`PROPOLIS_HTTP_TLS_CERT` and
-`PROPOLIS_HTTP_TLS_KEY`, `PROPOLIS_MQTT_TLS_CERT` and `PROPOLIS_MQTT_TLS_KEY`,
-`PROPOLIS_REDIS_TLS_CERT` and `PROPOLIS_REDIS_TLS_KEY`, through the read-only
-`ReadOnlyPaths=/etc/propolis/tls` in `deploy/sensor-http.service`, `deploy/sensor-mqtt.service`
-and `deploy/sensor-redis.service`); see [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+`sensor-mqtt`, `sensor-redis` and `sensor-smtp` read their pair so far (`PROPOLIS_HTTP_TLS_CERT`
+and `PROPOLIS_HTTP_TLS_KEY`, `PROPOLIS_MQTT_TLS_CERT` and `PROPOLIS_MQTT_TLS_KEY`,
+`PROPOLIS_REDIS_TLS_CERT` and `PROPOLIS_REDIS_TLS_KEY`, `PROPOLIS_SMTP_TLS_CERT` and
+`PROPOLIS_SMTP_TLS_KEY`, through the read-only `ReadOnlyPaths=/etc/propolis/tls` in
+`deploy/sensor-http.service`, `deploy/sensor-mqtt.service`, `deploy/sensor-redis.service` and
+`deploy/sensor-smtp.service`); see [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 
 | Path | Mode | Owner | Created by |
 |---|---|---|---|

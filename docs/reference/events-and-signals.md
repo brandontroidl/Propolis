@@ -89,6 +89,26 @@ the buffer that holds it, not by code after the session loop, which a cancelled 
 never reaches. The IP detail page shows such
 rows with status `incomplete`.
 
+### Arrival metadata key
+
+Every event a sensor emits carries the local port of the listener its connection or datagram
+arrived on. It is ordinary metadata, not a wire-format field, so no schema or wire version changed;
+a JSON integer survives the `JSONB` round trip the hash chain re-reads (see
+[database.md](database.md)).
+
+| key | type | meaning |
+|---|---|---|
+| `local_port` | integer | The accepted TCP socket's local port, or the bound UDP socket's port. Written by `EventEmitter::append` from the listener the emitting task serves (`crates/sensor-framework/src/arrival.rs#scope`, `crates/sensor-framework/src/emit.rs#append`), never by a sensor: `run_tcp_listener`, `run_tls_listener` and `run_udp_listener` set it for every handler. An upload carries the port of the connection that submitted it (`crates/sensor-framework/src/handoff.rs#submit`). sensor-dns stamps its UDP port on query and `rate_limited` summary events, and sensor-tftp stamps the request socket's port (69 in a deployment) on every event of a request, its upload included, though the transfer itself runs on an ephemeral port. |
+
+The transport is `protocol` (`tcp` or `udp`), not a metadata key. The pair (`protocol`,
+`local_port`) names one listener: the catch-all's TCP and UDP listeners on the same port number
+are told apart only by `protocol`. Events written before this key existed have no `local_port`;
+how the fleet pane attributes them is in
+[health and observability](../operations/health-and-observability.md#fleet-pane-listener-activity).
+Every sensor crate's `tests/arrival.rs` drives its real listeners and checks the key, and
+`crates/sensor-framework/tests/arrival_coverage.rs#every_sensor_crate_tests_its_arrival_stamp`
+fails when a workspace sensor crate has no such test.
+
 ### TLS metadata keys
 
 Events from the seven TLS sensors (http, redis, mqtt, smtp, ftp, cred, dns) carry these keys in

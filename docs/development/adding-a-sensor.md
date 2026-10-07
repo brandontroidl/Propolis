@@ -109,6 +109,16 @@ mismatch drop, and a static check that the crate has exactly one UDP send site
 `crates/sensor-dns/tests/integration.rs#never_amplifies_static_check` is the second example: one
 UDP send site behind a reply gate, one framed TCP write site, and no socket call anywhere else.
 
+Every event must carry `metadata.local_port`, the port it arrived on, or the fleet pane cannot
+give it to a listener (see [events and signals](../reference/events-and-signals.md#arrival-metadata-key)).
+A sensor built on `run_tcp_listener`, `run_tls_listener` or `run_udp_listener` gets it for free,
+as long as it emits from the handler's own task. A sensor that owns its socket, or emits from a
+task it spawned, wraps that work in `sensor_framework::arrival::scope` itself, as `sensor-dns` and
+`sensor-tftp` do. Each sensor crate needs a `tests/arrival.rs` that drives its real listeners and
+checks the key on what they emit;
+`crates/sensor-framework/tests/arrival_coverage.rs#every_sensor_crate_tests_its_arrival_stamp`
+fails until a new sensor crate has one.
+
 The doc/code agreement gate (`crates/propolis/tests/docs_agreement.rs`) additionally
 fails CI if a new `PROPOLIS_*` / `CATCHALL_*` env-var name in source is absent from
 `INSTALL.md`.

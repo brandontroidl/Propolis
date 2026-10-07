@@ -4,6 +4,13 @@
 
 ### Added
 
+- **Every event records the port it arrived on** - the sensor framework stamps
+  `metadata.local_port` (an integer: the accepted TCP socket's local port, or the bound UDP
+  socket's port) on every event every sensor emits, uploads and DNS rate-limit summaries
+  included, without any sensor building the key. The transport stays in `protocol`. Additive
+  metadata: no migration, no wire or schema version change, and the hash chain is unaffected.
+  Each sensor crate gains a `tests/arrival.rs` that checks it against its real listeners, and a
+  coverage test fails for a sensor crate without one.
 - **DNS honeypot sensor (default off)** - new crate and binary `sensor-dns`. `PROPOLIS_DNS_BIND`
   serves DNS over UDP and TCP on the same address (conventionally 53); if either transport cannot
   bind, the sensor exits 1 with nothing left listening. `PROPOLIS_DNS_TLS_BIND` adds DNS over TLS
@@ -311,6 +318,17 @@
 
 ### Fixed
 
+- **The fleet pane counts each listener, not each sensor** - LAST EVENT and 24H are per listener
+  row, but the query grouped by sensor, so every port of a sensor showed the sensor's total (two
+  Redis ports with the same count, HTTP 80 and 443 alike, every catch-all row identical). Activity
+  is now keyed by sensor, `protocol` and the new `metadata.local_port`. The query also aggregated
+  the whole event ledger on every load and 30-second refresh; it now reads the last 24 hours for
+  the count and the 30 days before that for LAST EVENT, both ranges on `observed_at`. A listener
+  with nothing in those 30 days reads `none in 30d` instead of `never`, which the page can no
+  longer prove. Events recorded before the upgrade have no port: they count on the sensor's row
+  when it declares exactly one listener, and otherwise on one `port not recorded` row per sensor,
+  which is not a listener and ages out after 30 days. A port present in the ledger but missing
+  from `PROPOLIS_FLEET_LISTENERS` gets its own `undeclared listener` row.
 - **`propolis` stops in at most 37 s, and the journal names a subsystem that would not stop** -
   after the shutdown signal the daemon waited 30 s for its subsystems, logged "shutdown timed
   out", then called `pool.close()`, which waits for every checked-out connection to be returned.

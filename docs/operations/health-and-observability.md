@@ -4,12 +4,13 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Health and observability
 
-The health, readiness, and metrics endpoints; how the daemon logs; the drop and spool-refusal
+The health, readiness, and metrics endpoints; what the fleet pane's per-listener activity
+counts; how the daemon logs; the drop and spool-refusal
 counters an operator watches under load; and the opt-in ops-alert monitor. Route details are
 owned by [console routes](../reference/console-routes.md); this page is the operational view.
 
@@ -32,6 +33,36 @@ load-balancer/monitor readiness check that also proves the DB is reachable. `/me
 no session gate and, unless `PROPOLIS_CONSOLE_METRICS_TOKEN` is set, no bearer check; leaving it
 open is acceptable only because the console is loopback-only
 (`crates/console/src/routes/metrics.rs`, `crates/console/src/routes/metrics.rs#metrics`). If you proxy the console, do not expose `/metrics` publicly.
+
+## Fleet pane: listener activity
+
+The fleet pane (`/fleet`, session-gated) has one row per listener in the inventory
+(`PROPOLIS_FLEET_LISTENERS`, see [environment variables](../reference/environment-variables.md)).
+A listener is a sensor name, a transport and a port. Its **Last event** and **24h** columns count
+the events whose `sensor`, `protocol` and `metadata.local_port` match it; `local_port` is
+stamped on every event by the sensor framework (see
+[events and signals](../reference/events-and-signals.md#arrival-metadata-key)). So HTTP's 80 and
+443, two Redis ports, or the catch-all's TCP and UDP listeners on one port number each show
+their own numbers (`crates/console/src/routes/fleet.rs#attribute`).
+
+Both columns read bounded ranges of the ledger, never the whole of it, on every load and every
+30-second refresh (`crates/console/src/routes/fleet.rs#listener_activity`):
+
+| Column | Reads | Outside the range |
+|---|---|---|
+| 24h | events with `observed_at` in the last 24 hours | not counted |
+| Last event | the newest event in the last 30 days (`crates/console/src/routes/fleet.rs#ACTIVITY_LOOKBACK`) | `none in 30d`, which is also what a listener that never produced an event shows: the pane cannot tell the two apart without reading the whole ledger, so it does not claim `never` |
+
+Events recorded before sensors stamped `local_port` have no port. A sensor whose inventory
+declares exactly one listener received all of them there, so they count on that row. A sensor
+with several declared listeners gets one extra row labelled `port not recorded` holding those
+events, rather than a guess at which port they came in on. That row is not a listener: it is left
+out of the listener total and the headline, its dots stay neutral, and it disappears once the
+pre-upgrade history is older than 30 days.
+
+A listener present in the ledger but not in the inventory gets an `undeclared listener` row with
+its transport and port. A sensor the inventory does not name at all keeps one such row with no
+port for its pre-upgrade events.
 
 ## Metrics
 

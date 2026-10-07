@@ -345,11 +345,8 @@ impl MaybeTlsStream {
     /// (`TimedOut`), or a handshake failure; after `Err` the stream is consumed and the connection
     /// MUST be dropped (no plaintext fallback).
     ///
-    /// Buffered-plaintext rule (STARTTLS injection class, CVE-2011-0411 shape): a handler that
-    /// wraps the stream in a `BufReader` must call this only after confirming
-    /// `reader.buffer().is_empty()`, then pass `reader.into_inner()`; if bytes are buffered past
-    /// the STARTTLS command line it must drop the connection instead. The framework cannot
-    /// enforce this.
+    /// A handler that reads through a `BufReader` must not call this directly: use
+    /// [`upgrade_buffered`], which enforces the buffered-plaintext rule.
     pub async fn upgrade(
         self,
         tls: &TlsServer,
@@ -370,6 +367,32 @@ impl MaybeTlsStream {
             )),
         }
     }
+}
+
+/// STARTTLS / AUTH TLS for a session read through a `BufReader`: the one path smtp and ftp use.
+///
+/// Bytes already buffered past the STARTTLS command were sent in plaintext before the handshake
+/// (the CVE-2011-0411 command-injection shape); interpreting them inside the TLS session would
+/// let a man-in-the-middle prepend commands. This refuses the upgrade with `InvalidData` naming the
+/// byte count instead of discarding them silently, so the caller drops the connection and can
+/// record the attempt. A caller that wants to answer with an error reply instead of the go-ahead
+/// checks `reader.buffer().is_empty()` before writing it. Otherwise the result is a fresh
+/// `BufReader` over the upgraded stream, so no pre-handshake state survives. Errors as
+/// [`MaybeTlsStream::upgrade`]; on any `Err` the connection MUST be dropped.
+pub async fn upgrade_buffered(
+    reader: tokio::io::BufReader<MaybeTlsStream>,
+    tls: &TlsServer,
+    timeout: std::time::Duration,
+) -> io::Result<tokio::io::BufReader<MaybeTlsStream>> {
+    let pipelined = reader.buffer().len();
+    if pipelined > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{pipelined} plaintext bytes pipelined after STARTTLS"),
+        ));
+    }
+    let upgraded = reader.into_inner().upgrade(tls, timeout).await?;
+    Ok(tokio::io::BufReader::new(upgraded))
 }
 
 impl AsyncRead for MaybeTlsStream {

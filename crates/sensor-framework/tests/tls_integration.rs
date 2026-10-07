@@ -336,6 +336,88 @@ async fn maybe_tls_upgrade_roundtrip() {
     handle.abort();
 }
 
+#[tokio::test]
+async fn upgrade_buffered_roundtrip_over_a_bufreader() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let f = fixture();
+    let server = f.server.clone();
+    let (addr, handle) = run_tcp_listener(any_local(), test_bounds(), None, move |tcp, _p, _id| {
+        let server = server.clone();
+        async move {
+            let mut reader = BufReader::new(MaybeTlsStream::Plain(tcp));
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "STARTTLS\n");
+            reader.get_mut().write_all(b"OK\n").await.unwrap();
+            reader.get_mut().flush().await.unwrap();
+            let mut reader =
+                sensor_framework::upgrade_buffered(reader, &server, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+            assert!(reader.get_ref().is_tls());
+            let mut buf = [0u8; 5];
+            reader.read_exact(&mut buf).await.unwrap();
+            reader.get_mut().write_all(&buf).await.unwrap();
+            reader.get_mut().flush().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(b"STARTTLS\n").await.unwrap();
+    let mut ok = [0u8; 3];
+    tcp.read_exact(&mut ok).await.unwrap();
+    assert_eq!(&ok, b"OK\n");
+    let mut client = f.connector.connect(localhost(), tcp).await.unwrap();
+    client.write_all(b"hello").await.unwrap();
+    let mut got = [0u8; 5];
+    client.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"hello");
+    handle.abort();
+}
+
+/// The STARTTLS command-injection shape: plaintext pipelined after STARTTLS in the same segment
+/// must refuse the upgrade (naming the byte count), never be read inside the TLS session.
+#[tokio::test]
+async fn upgrade_buffered_refuses_plaintext_pipelined_after_starttls() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let f = fixture();
+    let server = f.server.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Error>(1);
+    let (addr, handle) = run_tcp_listener(any_local(), test_bounds(), None, move |tcp, _p, _id| {
+        let server = server.clone();
+        let tx = tx.clone();
+        async move {
+            // Let the whole pipelined segment land so one buffer fill holds both lines.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let mut reader = BufReader::new(MaybeTlsStream::Plain(tcp));
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "STARTTLS\n");
+            match sensor_framework::upgrade_buffered(reader, &server, Duration::from_secs(5)).await
+            {
+                Err(err) => {
+                    let _ = tx.send(err).await;
+                }
+                Ok(_) => panic!("pipelined plaintext must refuse the upgrade"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(b"STARTTLS\nQUIT\n").await.unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("server reported")
+        .expect("an error was sent");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("5 plaintext bytes"), "{err}");
+    handle.abort();
+}
+
 /// An established loopback TLS pair: (server-side stream, client-side stream).
 async fn tls_pair(
     f: &Fixture,

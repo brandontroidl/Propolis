@@ -188,6 +188,15 @@ apply to TLS connections unchanged (`crates/sensor-framework/src/tls.rs#run_tls_
 A failed or timed-out handshake is logged at debug level only, because plaintext sent to a TLS
 port is the common scanner case.
 
+### STARTTLS upgrades
+
+Protocols that switch to TLS in-band (SMTP `STARTTLS`, FTP `AUTH TLS`) go through one shared
+path, `crates/sensor-framework/src/tls.rs#upgrade_buffered`. The upgrade handshake is bounded by
+the same read timeout. If the client has already sent more plaintext after the STARTTLS command
+(command pipelining across the upgrade, the CVE-2011-0411 injection shape), the upgrade is
+refused and the connection dropped rather than letting those pre-handshake bytes be read inside
+the encrypted session.
+
 ### Running provisioning by hand
 
 `install.sh` and `upgrade.sh` run it for you (see [installation](installation.md) and

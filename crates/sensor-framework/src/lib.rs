@@ -48,8 +48,8 @@ pub use handoff::{
     END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, UploadEnd, upload_metadata,
 };
 pub use held_input::{
-    CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureSource, Fed, HeldEnd, HeldInput,
-    InputMode, MAX_HELD_CAPTURES, StdinCaptures,
+    CAPTURE_REASON_ECHO_LOADER, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN,
+    CaptureSource, Fed, HeldEnd, HeldInput, InputMode, MAX_HELD_CAPTURES, StdinCaptures,
 };
 pub use listener::{listener_start_error, run_tcp_listener, run_udp_listener, shutdown_signal};
 pub use logging::init_logging;

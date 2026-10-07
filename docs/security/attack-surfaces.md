@@ -196,6 +196,15 @@ to the vetted IP (never re-resolved), and a forbidden-target check rejecting own
 reserved IP ranges (with IPv6 canonicalization first). See
 [outbound-controls.md](outbound-controls.md).
 
+A URL the shell derives rather than reads off a typed fetch command (an assembled echo-loader
+downloader run as `PROG a b c d port`, whose request line names the path; `derived_from`
+`echo_loader_args`, see
+[events-and-signals.md](../reference/events-and-signals.md#echo-loader-captures-and-their-keys))
+takes the same path and no other: the sensor only emits it as a `honeypot_file_download` event,
+the fetcher picks it up from the event log like any typed URL, and the vetter decides whether it
+is fetched. The sensor opens no connection for it and never runs the file it came from
+(`crates/sensor-framework/src/shell/loader.rs#FakeShell::loader_exec`).
+
 ## Console (HTTP)
 
 Axum + minijinja server-rendered HTML. **34 routes: 8 public, 26 session-gated**
@@ -256,7 +265,8 @@ systemd timer or cron unit. See [../operations/deployment-models.md](../operatio
 
 ## Live watch (`propolis-watch` over SSH)
 
-An operator-installed read path, not a listener Propolis opens: the honeypot's own sshd accepts
+An operator-installed read path, not a listener Propolis opens: the honeypot host's administrative
+sshd (not `sensor-ssh`, which is the fake SSH sensor and often holds port 22) accepts
 one dedicated key for the `propolis-watch` account and runs the watcher as that key's forced
 command. Absent until the operator adds a key to `/var/lib/propolis-watch/.ssh/authorized_keys`;
 `deploy/provision.sh` creates the account and the empty `.ssh` directory, never a key. Setup:

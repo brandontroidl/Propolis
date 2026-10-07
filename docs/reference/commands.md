@@ -127,7 +127,7 @@ several are outbound paths (see warning under Operations). See
 ```
 sudo -u propolis-watch /usr/local/bin/propolis-watch
 sudo ./deploy/watch-env.sh            # refresh /etc/propolis/watch.env after changing PROPOLIS_SENSOR_LOGS
-ssh -i ~/.ssh/propolis_watch propolis-watch@honeypot -- --sensor ssh   # from the reading machine
+ssh -p <admin-port> -i ~/.ssh/propolis_watch propolis-watch@honeypot -- --sensor ssh   # from the reading machine; the real sshd's port, never the sensor-ssh listener
 ```
 
 `propolis-watch` streams every sensor event log as JSON Lines on stdout, read-only; it takes

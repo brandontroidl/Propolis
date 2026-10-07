@@ -2,9 +2,9 @@
 //!
 //! Droppers use `printf '%s' ...` or `printf '%s\n' ...` to emit a payload exactly and
 //! `printf '\xNN\xNN...'` to assemble bytes one escape at a time. The format is interpreted here,
-//! never handed to a host `printf`, and the only thing done with it is turning text into text, so
-//! the shell's never-exec and no-network guarantees hold by construction. Escapes above 0x7f leave
-//! as the char with that code point, the convention `echo` follows until output carries bytes.
+//! never handed to a host `printf`, and the only thing done with it is turning text into bytes, so
+//! the shell's never-exec and no-network guarantees hold by construction. An escape writes the one
+//! byte it names, 0x80 to 0xff included, as `echo` does.
 #![deny(
     clippy::arithmetic_side_effects,
     clippy::unwrap_used,
@@ -46,25 +46,25 @@ fn take_digits(chars: &mut Peekable<Chars<'_>>, base: u32, max: usize, init: u32
 
 /// Decode one escape (the backslash already consumed) into `out`. Returns `true` for `\c`, which
 /// stops all further output. Octal is `\NNN` or `\0NNN`.
-fn decode_escape(chars: &mut Peekable<Chars<'_>>, out: &mut String) -> bool {
+fn decode_escape(chars: &mut Peekable<Chars<'_>>, out: &mut Vec<u8>) -> bool {
     match chars.next() {
-        Some('n') => out.push('\n'),
-        Some('t') => out.push('\t'),
-        Some('r') => out.push('\r'),
-        Some('a') => out.push('\x07'),
-        Some('b') => out.push('\x08'),
-        Some('f') => out.push('\x0c'),
-        Some('v') => out.push('\x0b'),
-        Some('\\') => out.push('\\'),
-        Some('"') => out.push('"'),
-        Some('\'') => out.push('\''),
+        Some('n') => out.push(b'\n'),
+        Some('t') => out.push(b'\t'),
+        Some('r') => out.push(b'\r'),
+        Some('a') => out.push(0x07),
+        Some('b') => out.push(0x08),
+        Some('f') => out.push(0x0c),
+        Some('v') => out.push(0x0b),
+        Some('\\') => out.push(b'\\'),
+        Some('"') => out.push(b'"'),
+        Some('\'') => out.push(b'\''),
         Some('c') => return true,
         Some('x') => {
             let (val, taken) = take_digits(chars, 16, 2, 0);
             if taken == 0 {
-                out.push_str("\\x");
-            } else if let Some(ch) = char::from_u32(val & 0xff) {
-                out.push(ch);
+                out.extend_from_slice(b"\\x");
+            } else {
+                out.push(low_byte(val));
             }
         }
         Some(first @ '0'..='7') => {
@@ -74,17 +74,24 @@ fn decode_escape(chars: &mut Peekable<Chars<'_>>, out: &mut String) -> bool {
                 (first.to_digit(8).unwrap_or(0), 2)
             };
             let (val, _) = take_digits(chars, 8, more, init);
-            if let Some(ch) = char::from_u32(val & 0xff) {
-                out.push(ch);
-            }
+            out.push(low_byte(val));
         }
         Some(other) => {
-            out.push('\\');
-            out.push(other);
+            out.push(b'\\');
+            push_char(out, other);
         }
-        None => out.push('\\'),
+        None => out.push(b'\\'),
     }
     false
+}
+
+fn low_byte(value: u32) -> u8 {
+    u8::try_from(value & 0xff).unwrap_or(0)
+}
+
+fn push_char(out: &mut Vec<u8>, c: char) {
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
 }
 
 #[derive(Default)]
@@ -210,25 +217,21 @@ fn format_int(spec: &Spec, conv: char, value: i64) -> String {
 struct Printer<'a> {
     operands: &'a [&'a str],
     next: usize,
-    text: String,
+    text: Vec<u8>,
     err: String,
     status: u8,
     stopped: bool,
 }
 
 impl<'a> Printer<'a> {
-    fn emit(&mut self, s: &str) {
+    fn emit(&mut self, bytes: &[u8]) {
         let room = PRINTF_MAX_OUTPUT.saturating_sub(self.text.len());
-        if s.len() <= room {
-            self.text.push_str(s);
+        if bytes.len() <= room {
+            self.text.extend_from_slice(bytes);
             return;
         }
-        for c in s.chars() {
-            if c.len_utf8() > PRINTF_MAX_OUTPUT.saturating_sub(self.text.len()) {
-                break;
-            }
-            self.text.push(c);
-        }
+        self.text
+            .extend_from_slice(bytes.get(..room).unwrap_or_default());
         self.stopped = true;
     }
 
@@ -250,7 +253,7 @@ impl<'a> Printer<'a> {
             }
             match c {
                 '\\' => {
-                    let mut piece = String::new();
+                    let mut piece = Vec::new();
                     let stop = decode_escape(&mut chars, &mut piece);
                     self.emit(&piece);
                     if stop {
@@ -260,7 +263,7 @@ impl<'a> Printer<'a> {
                 '%' => {
                     if chars.peek() == Some(&'%') {
                         chars.next();
-                        self.emit("%");
+                        self.emit(b"%");
                     } else {
                         had_spec = true;
                         self.convert(&mut chars);
@@ -268,7 +271,7 @@ impl<'a> Printer<'a> {
                 }
                 other => {
                     let mut buf = [0u8; 4];
-                    self.emit(other.encode_utf8(&mut buf));
+                    self.emit(other.encode_utf8(&mut buf).as_bytes());
                 }
             }
         }
@@ -305,11 +308,11 @@ impl<'a> Printer<'a> {
                     Some(p) => op.chars().take(p).collect(),
                     None => op.to_string(),
                 };
-                self.emit(&pad(&spec, "", &body, false));
+                self.emit(pad(&spec, "", &body, false).as_bytes());
             }
             'b' => {
                 let op = self.operand().unwrap_or("");
-                let mut decoded = String::new();
+                let mut decoded = Vec::new();
                 let mut it = op.chars().peekable();
                 while let Some(c) = it.next() {
                     if c == '\\' {
@@ -318,14 +321,14 @@ impl<'a> Printer<'a> {
                             break;
                         }
                     } else {
-                        decoded.push(c);
+                        push_char(&mut decoded, c);
                     }
                 }
                 self.emit(&decoded);
             }
             'c' => {
                 let first: String = self.operand().unwrap_or("").chars().take(1).collect();
-                self.emit(&pad(&spec, "", &first, false));
+                self.emit(pad(&spec, "", &first, false).as_bytes());
             }
             'd' | 'i' | 'o' | 'u' | 'x' | 'X' => {
                 let value = match self.operand() {
@@ -338,7 +341,7 @@ impl<'a> Printer<'a> {
                         0
                     }),
                 };
-                self.emit(&format_int(&spec, conv, value));
+                self.emit(format_int(&spec, conv, value).as_bytes());
             }
             _ => self.invalid(),
         }
@@ -368,7 +371,7 @@ impl FakeShell {
         let mut printer = Printer {
             operands,
             next: 0,
-            text: String::new(),
+            text: Vec::new(),
             err: String::new(),
             status: 0,
             stopped: false,
@@ -382,6 +385,7 @@ impl FakeShell {
             }
         }
         let status = printer.status;
+        self.note_typed_output(&printer.text);
         let mut result = CommandResult::stdout(printer.text);
         result.append(CommandResult::stderr(status, printer.err));
         result.status = status;

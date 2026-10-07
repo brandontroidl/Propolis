@@ -81,6 +81,31 @@ pub(super) fn is_applet(name: &str) -> bool {
     APPLETS.contains(&name)
 }
 
+/// `wget` run without a URL: `bb_show_usage`'s text on standard error. Composed from BusyBox
+/// 1.30.1's `networking/wget.c` usage strings under the Debian package configs this build comes
+/// from (`debian/config/pkg/deb` and `static` of 1:1.30.1-7: `FEATURE_WGET_LONG_OPTIONS=y`,
+/// `FEATURE_WGET_TIMEOUT` unset, `FEATURE_VERBOSE_USAGE=y`), so `[-T SEC]` and its line are absent.
+/// [unverified] against a pty capture of the reference host.
+pub(super) fn wget_usage() -> String {
+    format!(
+        "{}\n\nUsage: wget [-c|--continue] [--spider] [-q|--quiet] [-O|--output-document FILE]\n\
+         \t[--header 'header: value'] [-Y|--proxy on/off] [-P DIR]\n\
+         \t[-S|--server-response] [-U|--user-agent AGENT] URL...\n\
+         \n\
+         Retrieve files via HTTP or FTP\n\
+         \n\
+         \t--spider\tOnly check URL existence: $? is 0 if exists\n\
+         \t-c\t\tContinue retrieval of aborted transfer\n\
+         \t-q\t\tQuiet\n\
+         \t-P DIR\t\tSave to DIR (default .)\n\
+         \t-S    \t\tShow server response\n\
+         \t-O FILE\t\tSave to FILE ('-' for stdout)\n\
+         \t-U STR\t\tUse STR for User-Agent header\n\
+         \t-Y on/off\tUse proxy\n",
+        BANNER_PREAMBLE[0]
+    )
+}
+
 /// What a bare `busybox` prints.
 pub(super) fn banner() -> String {
     let mut text = String::new();

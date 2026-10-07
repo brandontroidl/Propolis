@@ -1,6 +1,10 @@
 # /var/lib/propolis-watch/.ssh/authorized_keys for the read-only live watcher.
 # Full procedure: docs/operations/live-watch.md.
 #
+# - This file belongs to the host's real administrative sshd. Connect with `ssh -p <admin-port>`,
+#   never to port 22 unless that is the real sshd: on a honeypot host 22 is usually sensor-ssh,
+#   the fake SSH sensor, which reads no authorized_keys. Find the real port with
+#   `sudo ss -ltnp | grep sshd`.
 # - Generate a DEDICATED key on the machine that will read the stream, used for nothing else:
 #     ssh-keygen -t ed25519 -f ~/.ssh/propolis_watch -C watch@workstation
 #   Paste only its PUBLIC half (~/.ssh/propolis_watch.pub) into the line below, on the honeypot.

@@ -18,6 +18,24 @@
   the listener rows of a log over the age threshold. No append-latency histogram: `/metrics` has
   no histogram support. See `docs/operations/health-and-observability.md` and
   `docs/troubleshooting/intake-backlog.md`.
+- **Echo-loader uploads are reassembled and captured** - a Mirai/Mozi telnet loader with no
+  usable `wget` uploads its downloader as some forty `busybox echo -ne '\xNN...' >> .i` lines,
+  runs `chmod 777 .i` and `./.i a b c d port`. Each line was logged but the file was never
+  captured, and the loader retried the whole session every few minutes. The shared shell (SSH,
+  telnet, ADB) now notes every file built from `echo`/`printf` output, chunk by chunk, and
+  captures it as one `honeypot_malware_upload` with `capture_reason` `echo_loader`,
+  `chunk_count` and `destination`, once the line that makes it executable or runs it has run, or
+  at the session's end for an assembly of two or more chunks never run. It goes through the
+  per-session stdin capture set (`StdinCaptures::record_assembled`; sensors pass it with
+  `FakeShell::with_captures` and report the ending with `StdinCaptures::end_session`), so one body
+  is one sample per session and the memory budget applies; a file is recognized by content, so
+  the loader's `cp /bin/ls .j && cat .i>.j && rm .i && cp .j .i` fallback is the same sample.
+  Each chunk's command event carries `assembled_file` and `chunk_index`. Running an assembled ELF
+  that holds a `GET <path> HTTP/1.x` request line with four octets and a port as arguments
+  executes nothing, answers as a downloader that cannot reach its server (no output, status 1),
+  and emits the stage-2 URL as a `honeypot_file_download` with `derived_from` `echo_loader_args`
+  and `derived_sha256`, which the review fetcher vets like any URL; the sensor makes no
+  connection. Additive metadata: no migration or wire version change.
 - **`propolis-watch`, a read-only live view of the sensors** - new crate `watch`, binary
   `propolis-watch`. It streams every event log named in `PROPOLIS_SENSOR_LOGS` as JSON Lines on
   stdout: a `start` record with the resolved sources, one `event` record per log line (the
@@ -398,6 +416,33 @@
   built inside the migration transaction at startup, before intake runs: 12 to 20 s for that
   ledger held in RAM, longer on disk. Plan guards hold the read to the index on a ledger shaped
   like the incident.
+- **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
+  0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
+  echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks
+  left a file that was not the one it sent. Both now produce one raw byte per escape, and an
+  octal escape past 0xff keeps its low eight bits. `busybox wget` with no URL prints BusyBox
+  1.30.1's wget usage on stderr and exits 1 (it printed a download transcript for an empty URL),
+  and dash answers a path that does not exist with `sh: N: ./x: not found`, as its `errmsg`
+  does, instead of bash's `No such file or directory`.
+- **`upgrade.sh` no longer finishes an upgrade with the copy of itself it started from** - bash
+  reads a script as it runs, so after `git pull` replaced `deploy/upgrade.sh` the rest of the
+  upgrade ran the old text: a release that added `propolis-watch` to the binary list built it
+  and then installed from the list without it, leaving `/usr/local/bin/propolis-watch` missing.
+  When the pull changes the script, `upgrade.sh` now re-executes the new one with
+  `PROPOLIS_UPGRADE_REEXEC=1`, which makes that run skip the pull (it cannot loop) and carries
+  the first run's pull timestamp in `PROPOLIS_UPGRADE_PULLED_AT`, so the deploy stamp still
+  records when the pull happened. The binary install now checks each built binary exists
+  before installing it and, afterwards, that every listed binary is present in
+  `/usr/local/bin` before anything is stamped or restarted (`install.sh` does the same check
+  after its install). Both scripts keep the list in one `INSTALL_BINS` array, and a new test
+  compares it with the workspace's binary targets, so a binary added to the workspace but not
+  to the lists fails the build.
+- **The live-watch documentation no longer sends the reader to the honeypot's SSH sensor** -
+  its examples connected to port 22, which on a honeypot host is usually `sensor-ssh`; one
+  attempt landed in the fake shell. Every example now names the real sshd with
+  `-p <admin-port>`, `docs/operations/live-watch.md` warns against the sensor's listener and
+  shows `sudo ss -ltnp | grep sshd` to find the real port, and notes that a passphrase-protected
+  key needs `ssh-add` for unattended use.
 - **A command's standard input reaches it, and is captured** - an SSH exec ran at the request
   and closed the channel, so the payload a bot streamed after `cat > astats` or `cat > w.sh`
   hit a closed channel: the file stayed empty, nothing was captured, and the bot retried and

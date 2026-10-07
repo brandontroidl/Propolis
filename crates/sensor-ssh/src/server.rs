@@ -651,8 +651,9 @@ async fn handle_session(
                                 protocol_label: "ssh".to_string(),
                                 session_id: Some(session_id),
                             };
-                            let shell =
-                                FakeShell::new(base_fs.share(), ctx).with_budget(budget.clone());
+                            let shell = FakeShell::new(base_fs.share(), ctx)
+                                .with_budget(budget.clone())
+                                .with_captures(stdin_captures.clone());
                             let prompt = shell.prompt();
                             state.handler =
                                 ChannelHandler::Shell(Box::new(shell), Vec::new(), None);
@@ -680,7 +681,8 @@ async fn handle_session(
                             };
                             let mut shell = FakeShell::exec(base_fs.share(), shell_ctx)
                                 .with_budget(budget.clone())
-                                .with_terminal_input(state.flow.pty);
+                                .with_terminal_input(state.flow.pty)
+                                .with_captures(stdin_captures.clone());
                             let is_scp = cmd.starts_with("scp -t ");
                             // The shell decides whether the command reads its standard input (see
                             // `FakeShell::start_line`); scp's input is the transfer, read below.
@@ -1138,6 +1140,9 @@ async fn handle_session(
     for state in channels.values_mut() {
         state.handler.cut_off(shell_capture.session_end);
     }
+    // A file a shell saw assembled from typed `echo` chunks and never ran is captured as the
+    // session leaves it, ended this way.
+    stdin_captures.end_session(shell_capture.session_end);
 
     loop_result
 }

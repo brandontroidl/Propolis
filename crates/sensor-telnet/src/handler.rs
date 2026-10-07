@@ -156,7 +156,7 @@ pub async fn handle_connection<S>(
         protocol_label: PROTOCOL_LABEL.to_string(),
         session_id: Some(session_id),
     };
-    let mut shell = FakeShell::new(FakeFs::new(), ctx).with_budget(budget.clone());
+    let shell = FakeShell::new(FakeFs::new(), ctx).with_budget(budget.clone());
 
     if write_telnet_data(
         &mut stream,
@@ -194,6 +194,8 @@ pub async fn handle_connection<S>(
         },
     );
     let max_stdin_bytes = reader.bounds.max_captured_bytes;
+    // A file the shell sees assembled from typed `echo` chunks is captured through the same set.
+    let mut shell = shell.with_captures(stdin_captures.clone());
 
     loop {
         let Some(line) = reader.read_line(&mut stream, true).await else {
@@ -257,8 +259,10 @@ pub async fn handle_connection<S>(
             break;
         }
     }
+    // A file assembled and never run is captured as the session leaves it, ended this way.
+    stdin_captures.end_session(reader.session_end);
 
-    // Nothing is recorded here. Every exit above - and every one inside `read_line` - names the
+    // Nothing else is recorded here. Every exit above - and every one inside `read_line` - names the
     // ending that produced it, because they do not mean the same thing: a logout leaves a whole
     // capture, an idle timeout or a failed write leaves a fragment. This line used to set
     // "complete" for all of them alike. The capture itself is submitted by `LineReader`'s `Drop`

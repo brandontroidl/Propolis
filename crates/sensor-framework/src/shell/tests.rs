@@ -7,7 +7,11 @@ mod echo_tests {
 
     /// The bash builtin, the dialect every test below that names no other means.
     fn cmd_echo(args: &[&str]) -> String {
-        crate::shell::cmd_echo(EchoDialect::Bash, args)
+        echo_in(EchoDialect::Bash, args)
+    }
+
+    fn echo_in(dialect: EchoDialect, args: &[&str]) -> String {
+        String::from_utf8(crate::shell::cmd_echo(dialect, args)).expect("ASCII output")
     }
 
     fn run(sh: &mut FakeShell, line: &str) -> String {
@@ -39,23 +43,118 @@ mod echo_tests {
     fn dash_echo_interprets_escapes_without_dash_e() {
         // Captured on Ubuntu 22.04: `dash -c "echo '\101\xff'"` printed `A\xff` (octal decoded,
         // hex not) and `dash -c "echo -e '\101'"` printed `-e A`.
+        assert_eq!(echo_in(EchoDialect::Dash, &["\\101\\xff"]), "A\\xff\n");
+        assert_eq!(echo_in(EchoDialect::Dash, &["-e", "\\101"]), "-e A\n");
+        assert_eq!(echo_in(EchoDialect::Dash, &["a\\tb\\0101"]), "a\tbA\n");
+    }
+
+    /// An escape is the byte it names. Every value 0x00 to 0xff survives `\xNN` (bash and busybox)
+    /// and `\0NNN` / `\NNN` octal (bash, dash) as that one byte, never as the UTF-8 encoding of a
+    /// code point: an echo loader's chunks are an ELF, and the file must hold the attacker's bytes.
+    #[test]
+    fn escapes_write_raw_bytes_for_every_value() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        let hex: String = all.iter().map(|b| format!("\\x{b:02x}")).collect();
+        let octal: String = all.iter().map(|b| format!("\\0{b:03o}")).collect();
+        for (dialect, text) in [
+            (EchoDialect::Bash, &hex),
+            (EchoDialect::Busybox, &hex),
+            (EchoDialect::Bash, &octal),
+        ] {
+            let mut want = all.clone();
+            want.push(b'\n');
+            assert_eq!(crate::shell::cmd_echo(dialect, &["-e", text]), want);
+        }
+        // dash decodes `\0NNN` with no `-e`.
+        let mut want = all.clone();
+        want.push(b'\n');
+        assert_eq!(crate::shell::cmd_echo(EchoDialect::Dash, &[&octal]), want);
+        // A literal non-ASCII character typed into the line stays its UTF-8 bytes.
         assert_eq!(
-            crate::shell::cmd_echo(EchoDialect::Dash, &["\\101\\xff"]),
-            "A\\xff\n"
+            crate::shell::cmd_echo(EchoDialect::Bash, &["-ne", "\u{e9}\\xe9"]),
+            vec![0xc3, 0xa9, 0xe9]
         );
+    }
+
+    /// A chunk redirected into a file lands there byte for byte, `>` and `>>` alike.
+    #[test]
+    fn binary_chunks_append_to_a_file_exactly() {
+        let mut sh = shell();
+        run(&mut sh, "cd /tmp");
+        run(
+            &mut sh,
+            "/bin/busybox echo -ne '\\x7f\\x45\\x4c\\x46\\x02\\x80' > .i",
+        );
+        run(
+            &mut sh,
+            "/bin/busybox echo -ne '\\xff\\x00\\x0a\\xc3' >> .i",
+        );
+        run(&mut sh, "printf '\\x90\\377' >> .i");
         assert_eq!(
-            crate::shell::cmd_echo(EchoDialect::Dash, &["-e", "\\101"]),
-            "-e A\n"
+            sh.fs.read_all("/tmp/.i", 1 << 20).unwrap(),
+            b"\x7fELF\x02\x80\xff\x00\x0a\xc3\x90\xff"
         );
+    }
+
+    /// The Mozi loader's writable-directory probe: every directory on the list is writable on
+    /// this box as on a real Ubuntu root, so each `>DIR/.x` succeeds and the chain ends in the
+    /// last one, `/var`, before the marker.
+    #[test]
+    fn the_writable_directory_probe_ends_in_the_last_directory() {
+        let mut sh = shell();
+        run(&mut sh, "sh");
+        let out = run(
+            &mut sh,
+            ">/var/run/.x&&cd /var/run;>/mnt/.x&&cd /mnt;>/usr/.x&&cd /usr;>/dev/.x&&cd /dev;\
+             >/dev/shm/.x&&cd /dev/shm;>/tmp/.x&&cd /tmp;>/var/.x&&cd /var;\
+             /bin/busybox echo -e '\\x42\\x4b\\x54\\x4b\\x45\\x52'",
+        );
+        assert_eq!(out, "BKTKER\n");
+        assert_eq!(sh.cwd(), "/var");
+        for dir in ["/run", "/mnt", "/usr", "/dev", "/dev/shm", "/tmp", "/var"] {
+            assert!(sh.fs.file_exists(&format!("{dir}/.x")), "{dir}/.x");
+        }
+    }
+
+    /// `busybox wget` with no URL prints the applet's usage on standard error and exits 1, and
+    /// records no download.
+    #[test]
+    fn busybox_wget_without_a_url_prints_its_usage() {
+        let mut sh = shell();
+        run(&mut sh, "sh");
+        let (result, events) = sh.handle_input(
+            "/bin/busybox wget;/bin/busybox echo -ne '\\x42\\x4b\\x54\\x4b\\x45\\x52'",
+        );
+        let text = result.to_string();
+        assert!(
+            text.starts_with(
+                "BusyBox v1.30.1 (Ubuntu 1:1.30.1-7ubuntu3.1) multi-call binary.\n\nUsage: wget "
+            ),
+            "{text:?}"
+        );
+        assert!(text.ends_with("\t-Y on/off\tUse proxy\nBKTKER"), "{text:?}");
+        assert_eq!(events.len(), 1, "no download event: {events:?}");
+        let (wget, _) = sh.handle_input("/bin/busybox wget");
+        assert_eq!(wget.status, 1);
+        assert_eq!(wget.output.len(), 1);
+        assert_eq!(wget.output[0].fd, crate::shell::OutputFd::Stderr);
+    }
+
+    /// dash words a missing path the way it words a missing command; bash names the errno.
+    #[test]
+    fn a_missing_path_is_not_found_in_dash_and_no_such_file_in_bash() {
+        let mut sh = shell();
         assert_eq!(
-            crate::shell::cmd_echo(EchoDialect::Dash, &["a\\tb\\0101"]),
-            "a\tbA\n"
+            run(&mut sh, "./Runn"),
+            "-bash: ./Runn: No such file or directory\n"
         );
+        run(&mut sh, "sh");
+        assert_eq!(run(&mut sh, "./Runn"), "sh: 1: ./Runn: not found\n");
     }
 
     #[test]
     fn only_an_exact_dash_n_is_a_flag_in_dash() {
-        let dash = |args: &[&str]| crate::shell::cmd_echo(EchoDialect::Dash, args);
+        let dash = |args: &[&str]| echo_in(EchoDialect::Dash, args);
         assert_eq!(dash(&["-n", "hi"]), "hi");
         assert_eq!(dash(&["-en", "hi"]), "-en hi\n");
         assert_eq!(dash(&["-E", "hi"]), "-E hi\n");

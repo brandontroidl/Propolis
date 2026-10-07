@@ -196,6 +196,20 @@ impl SessionEnd {
     }
 }
 
+/// Hands the session's ending to its stdin captures when the handler returns, for the files a
+/// shell saw assembled from typed `echo` chunks and never ran, which are captured then. Every exit
+/// records its ending in `SessionEnd` first; on the listener's cancellation it reads `Cancelled`.
+struct CapturesEnd {
+    captures: StdinCaptures,
+    session_end: SessionEnd,
+}
+
+impl Drop for CapturesEnd {
+    fn drop(&mut self) {
+        self.captures.end_session(self.session_end.get());
+    }
+}
+
 /// The raw `shell:` stream bytes of one session, submitted from `Drop`.
 ///
 /// The same reasoning as `sensor-ssh`'s guard of the same name: a dropper streaming a payload at
@@ -725,6 +739,10 @@ pub async fn handle_connection(
             authenticated: false,
         },
     );
+    let _captures_end = CapturesEnd {
+        captures: stdin_captures.clone(),
+        session_end: session_end.clone(),
+    };
     let mut reader = MessageReader::new(bounds, session_end.clone());
 
     // ---- CNXN handshake ----
@@ -941,7 +959,9 @@ async fn handle_open(
             };
             // The Android device this sensor announces, not the Linux server the other sensors
             // present: a Nexus 5 banner followed by an Ubuntu bash was a one-command tell.
-            let mut shell = FakeShell::android(base_fs.share(), ctx).with_budget(budget.clone());
+            let mut shell = FakeShell::android(base_fs.share(), ctx)
+                .with_budget(budget.clone())
+                .with_captures(stdin_captures.clone());
 
             write_or_err(
                 stream,

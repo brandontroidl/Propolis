@@ -120,7 +120,8 @@ EOF
 # ---- 4. binaries ----
 
 log "4/9 installing binaries to /usr/local/bin"
-for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred propolis-watch; do
+INSTALL_BINS=(propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred propolis-watch)
+for bin in "${INSTALL_BINS[@]}"; do
     src="$BUILD_DIR/$bin"
     dst="/usr/local/bin/$bin"
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -133,6 +134,14 @@ for bin in propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor
     fi
     install -m 0755 "$src" "$dst"
 done
+if [ "$DRY_RUN" -eq 0 ]; then
+    for bin in "${INSTALL_BINS[@]}"; do
+        if [ ! -x "/usr/local/bin/$bin" ]; then
+            echo "error: /usr/local/bin/$bin is missing or not executable after the install" >&2
+            exit 1
+        fi
+    done
+fi
 
 # Needs the freshly built release binary (the install loop above deliberately does not install
 # provision-certs: it is a deploy tool, not a service), so it runs here and not inside

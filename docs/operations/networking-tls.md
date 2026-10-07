@@ -100,23 +100,23 @@ This is separate from the console and the gateway and shipper mTLS material: it 
 server-side TLS on the honeypot's own attacker-facing ports, so the sensors can answer
 HTTPS, MQTTS and the other encrypted variants of the protocols they imitate.
 
-> **Status: four sensors live.** The shared capability, the certificate minting and the deploy
+> **Status: five sensors live.** The shared capability, the certificate minting and the deploy
 > wiring below are in place, and `sensor-http` serves HTTPS, `sensor-redis` serves Redis over TLS,
-> `sensor-mqtt` serves MQTTS and `sensor-smtp` serves SMTPS and SMTP STARTTLS (all below). The
-> other surfaces are still pending `[planned]`: no other sensor reads a TLS variable or listens
-> with TLS.
+> `sensor-mqtt` serves MQTTS, `sensor-smtp` serves SMTPS and SMTP STARTTLS and `sensor-ftp` serves
+> FTPS and FTP AUTH TLS (all below). The other surfaces are still pending `[planned]`: no other
+> sensor reads a TLS variable or listens with TLS.
 >
 > **No implicit TLS bind.** A TLS listener exists only when its `*_TLS_BIND` variable (for
 > `sensor-smtp` also `PROPOLIS_SMTP_SUBMISSION_BIND`) is explicitly set.
 > `deploy/fleet-listeners.sh` derives the fleet inventory from the `*_BIND` variables, so a
 > compiled-in default bind would open a port the inventory never lists. A certificate and key
 > with no TLS bind are still loaded and validated (fail-closed), start no TLS listener, and log
-> one warning. The exception is `sensor-smtp`, where the pair also enables an
-> in-protocol upgrade (STARTTLS) on the plain listener, so it is in use and logs no warning.
+> one warning. The exception is `sensor-smtp` and `sensor-ftp`, where the pair also enables an
+> in-protocol upgrade (STARTTLS, AUTH TLS) on the plain listener, so it is in use and logs no
+> warning.
 >
 > Pending surfaces:
 >
-> - FTPS on 990, plus FTP AUTH TLS (`sensor-ftp`)
 > - in-band TLS for the `sensor-cred` PostgreSQL, MySQL, MSSQL and MongoDB protocols
 
 What the framework provides (`crates/sensor-framework/src/tls.rs`): a fail-closed config
@@ -215,6 +215,55 @@ STARTTLS rules (`crates/sensor-smtp/src/handler.rs#handle_connection`; replies i
 Fail-closed: the sensor exits 1 with `refusing to start`, before binding anything, when exactly
 one of cert and key is set (a blank value counts as unset), when the SMTPS bind is set without
 both paths, when either extra bind does not parse, or when the pair is unusable (see
+[Loading is fail-closed](#loading-is-fail-closed)). If the OS refuses any one bind, the
+listeners already started are stopped and the sensor exits 1. An implicit handshake that fails
+is dropped with a debug log and no event. Variables are owned by
+[environment-variables.md](../reference/environment-variables.md); behavior by
+[sensor-behavior.md](../reference/sensor-behavior.md).
+
+### Live: FTPS and AUTH TLS on `sensor-ftp`
+
+| Item | Value |
+|---|---|
+| Modes | implicit TLS on the FTPS port (the handshake comes before the banner), and AUTH TLS on the plain listener; no client certificate |
+| Plain bind | `PROPOLIS_FTP_BIND` (21), required as before; answers AUTH TLS, PBSZ and PROT iff the cert and key are set |
+| FTPS bind | `PROPOLIS_FTP_TLS_BIND` (990), optional, no compiled default; implicit TLS, requires the pair |
+| Certificate and key | `PROPOLIS_FTP_TLS_CERT` (`/etc/propolis/tls/ftp.crt`), `PROPOLIS_FTP_TLS_KEY` (`/etc/propolis/tls/ftp.key`, mode `0600`) |
+| Listeners | up to two in one process, writing one `events.jsonl`; 990 exists only when its bind is set |
+| Passive data ports | unchanged (ephemeral, negotiated per session); with `PROT P` they carry TLS |
+| Unit | `deploy/sensor-ftp.service` adds `ReadOnlyPaths=/etc/propolis/tls`; `CAP_NET_BIND_SERVICE` stays for ports 21 and 990 |
+| Event tagging | connection, login and upload events from a session whose control channel is TLS (implicit, or after AUTH TLS) carry `"tls": true`; plain events have no such key |
+
+AUTH TLS rules (`crates/sensor-ftp/src/handler.rs#handle_connection`; replies in
+[sensor-behavior.md](../reference/sensor-behavior.md#sensor-ftp)):
+
+- With the pair set, `AUTH TLS`, `AUTH TLS-C`, `AUTH SSL` and `AUTH TLS-P` answer
+  `234 Proceed with negotiation.` and upgrade in place. Any other AUTH type gets `504`, and AUTH
+  inside TLS gets `503`. A failed or stalled handshake ends the session; there is no plaintext
+  fallback after the `234`.
+- Plaintext the client pipelined behind AUTH TLS is never read as a command inside the TLS
+  session (the CVE-2011-0411 class). The sensor records one `honeypot_command_exec` event with
+  `starttls_refused` set to `pipelined_plaintext` and the byte count (the bytes themselves are
+  never captured), replies `504 Pipelined commands after AUTH TLS refused.`, and closes the
+  connection without sending the `234`.
+- After the upgrade the session is reset as REIN would: the username, login state, PBSZ, PROT and
+  any open passive listener are discarded. The per-connection capture cap is kept across the
+  upgrade.
+- PBSZ (inside TLS only, always `0`) and then PROT (`C` or `P`; `S` and `E` get `536`) set the
+  data-channel protection. After `PROT P` the passive data socket is wrapped in TLS once the data
+  peer passed the source-IP check; the handshake is bounded by the read timeout and a failed one
+  gets `425`. STOR over `PROT P` is captured and spooled exactly like plaintext, and a data close
+  without `close_notify` counts as end of file. The `"tls"` tag refers to the control channel
+  only.
+- FEAT lists `AUTH`, `PBSZ` and `PROT` only when TLS is configured. With no pair set nothing
+  changes: AUTH, PBSZ and PROT answer `500` like any unknown command.
+- A cert and key with no `PROPOLIS_FTP_TLS_BIND` still enable AUTH TLS on port 21 and open nothing
+  else (pinned by the spawned-binary test
+  `crates/sensor-ftp/tests/tls_config.rs#a_valid_pair_without_a_tls_bind_enables_auth_tls_on_the_plain_listener_only`).
+
+Fail-closed: the sensor exits 1 with `refusing to start`, before binding anything, when exactly
+one of cert and key is set (a blank value counts as unset), when the FTPS bind is set without
+both paths, when the FTPS bind does not parse, or when the pair is unusable (see
 [Loading is fail-closed](#loading-is-fail-closed)). If the OS refuses any one bind, the
 listeners already started are stopped and the sensor exits 1. An implicit handshake that fails
 is dropped with a debug log and no event. Variables are owned by

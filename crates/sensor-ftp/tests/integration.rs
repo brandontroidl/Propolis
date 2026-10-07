@@ -5,11 +5,16 @@ use std::time::Duration;
 
 use sensor_framework::{
     CAPTURE_CHUNK_BYTES, CaptureHandoff, CaptureMemoryBudget, ConnectionBounds,
-    DEFAULT_CAPTURE_BUDGET_BYTES_256M, WanResolver,
+    DEFAULT_CAPTURE_BUDGET_BYTES_256M, TlsServer, WanResolver, server_config_from_pem,
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use sensor_ftp::ListenerKind;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 fn test_bounds() -> ConnectionBounds {
     ConnectionBounds {
@@ -28,7 +33,39 @@ struct TestServer {
     handle: JoinHandle<()>,
     handoff: Arc<CaptureHandoff>,
     budget: Arc<CaptureMemoryBudget>,
+    /// Plain control listener WITH AUTH TLS honoured (only set by `start_tls`).
+    tls_addr: Option<std::net::SocketAddr>,
+    /// Implicit FTPS listener (only set by `start_tls`).
+    implicit_addr: Option<std::net::SocketAddr>,
+    connector: Option<TlsConnector>,
+    extra_handles: Vec<JoinHandle<()>>,
     _dir: tempfile::TempDir,
+}
+
+/// A fresh in-memory self-signed cert: the server side and a client that trusts exactly it. The
+/// key never touches disk.
+fn ephemeral_tls() -> (TlsServer, TlsConnector) {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let server = TlsServer::from_config(
+        server_config_from_pem(
+            cert.pem().as_bytes(),
+            signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap(),
+    );
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(cert.der().to_vec()))
+        .unwrap();
+    let client = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    (server, TlsConnector::from(Arc::new(client)))
+}
+
+fn localhost() -> ServerName<'static> {
+    ServerName::try_from("localhost").unwrap()
 }
 
 impl TestServer {
@@ -61,7 +98,65 @@ impl TestServer {
             handle,
             handoff,
             budget,
+            tls_addr: None,
+            implicit_addr: None,
+            connector: None,
+            extra_handles: Vec::new(),
             _dir: dir,
+        }
+    }
+
+    /// A plain listener that honours AUTH TLS plus an implicit-FTPS listener, one cert, one
+    /// shared hand-off and budget.
+    async fn start_tls() -> TestServer {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let spool_dir = dir.path().join("spool");
+        let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
+        let budget = Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES_256M));
+        let (server, connector) = ephemeral_tls();
+        let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (mut started, handoff) = sensor_ftp::start_listeners(
+            vec![
+                (
+                    loopback,
+                    ListenerKind::Plain {
+                        tls: Some(server.clone()),
+                    },
+                ),
+                (loopback, ListenerKind::Implicit { tls: server }),
+            ],
+            log_path.clone(),
+            spool_dir.clone(),
+            wan_resolver,
+            test_bounds(),
+            "test".to_string(),
+            dir.path().join("outbox"),
+            budget.clone(),
+        )
+        .await
+        .unwrap();
+        let (implicit_addr, implicit_handle) = started.remove(1);
+        let (addr, handle) = started.remove(0);
+        TestServer {
+            addr,
+            log_path,
+            spool_dir,
+            handle,
+            handoff,
+            budget,
+            tls_addr: Some(addr),
+            implicit_addr: Some(implicit_addr),
+            connector: Some(connector),
+            extra_handles: vec![implicit_handle],
+            _dir: dir,
+        }
+    }
+
+    fn stop(self) {
+        self.handle.abort();
+        for h in &self.extra_handles {
+            h.abort();
         }
     }
 
@@ -134,12 +229,12 @@ impl TestServer {
     }
 }
 
-struct FtpClient {
-    reader: BufReader<TcpStream>,
+struct FtpClient<S> {
+    reader: BufReader<S>,
 }
 
-impl FtpClient {
-    async fn connect(addr: std::net::SocketAddr) -> FtpClient {
+impl FtpClient<TcpStream> {
+    async fn connect(addr: std::net::SocketAddr) -> FtpClient<TcpStream> {
         let stream = TcpStream::connect(addr).await.unwrap();
         let mut client = FtpClient {
             reader: BufReader::new(stream),
@@ -149,6 +244,38 @@ impl FtpClient {
         client
     }
 
+    /// Handshake over the plain control socket after a 234. `into_inner` is safe here: the
+    /// server sends nothing between its 234 and our ClientHello.
+    async fn into_tls(self, connector: &TlsConnector) -> FtpClient<TlsStream<TcpStream>> {
+        let tcp = self.reader.into_inner();
+        let tls = connector
+            .connect(localhost(), tcp)
+            .await
+            .expect("client handshake");
+        FtpClient {
+            reader: BufReader::new(tls),
+        }
+    }
+
+    async fn connect_implicit(
+        addr: std::net::SocketAddr,
+        connector: &TlsConnector,
+    ) -> FtpClient<TlsStream<TcpStream>> {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let tls = connector
+            .connect(localhost(), tcp)
+            .await
+            .expect("client handshake");
+        let mut client = FtpClient {
+            reader: BufReader::new(tls),
+        };
+        let banner = client.read_reply().await;
+        assert!(banner.starts_with("220"), "banner: {banner}");
+        client
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> FtpClient<S> {
     async fn read_reply(&mut self) -> String {
         self.read_reply_within(Duration::from_secs(3)).await
     }
@@ -168,6 +295,7 @@ impl FtpClient {
             .write_all(format!("{cmd}\r\n").as_bytes())
             .await
             .unwrap();
+        self.reader.get_mut().flush().await.unwrap();
         self.read_reply().await
     }
 
@@ -329,7 +457,7 @@ async fn stor_upload_past_the_cap_is_marked_truncated() {
 
 /// Opens a passive data connection and issues STOR, returning the live data stream once the 150
 /// has been read. The caller decides when (and whether) to close it.
-async fn begin_stor(client: &mut FtpClient, name: &str) -> TcpStream {
+async fn begin_stor(client: &mut FtpClient<TcpStream>, name: &str) -> TcpStream {
     let data_addr = client.pasv().await;
     let r = client.send(&format!("STOR {name}")).await;
     assert!(r.starts_with("150"), "STOR 150: {r}");
@@ -715,6 +843,332 @@ async fn list_returns_canned_directory() {
     let r = client.read_reply().await;
     assert!(r.starts_with("226"), "LIST 226: {r}");
     srv.handle.abort();
+}
+
+async fn tls_data(addr: std::net::SocketAddr, connector: &TlsConnector) -> TlsStream<TcpStream> {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    connector
+        .connect(localhost(), tcp)
+        .await
+        .expect("data handshake")
+}
+
+/// Reads a multi-line reply (`211-` ... `211 `) into one string.
+async fn read_feat<S: AsyncRead + AsyncWrite + Unpin>(client: &mut FtpClient<S>) -> String {
+    client
+        .reader
+        .get_mut()
+        .write_all(b"FEAT\r\n")
+        .await
+        .unwrap();
+    client.reader.get_mut().flush().await.unwrap();
+    let mut all = String::new();
+    loop {
+        let line = client.read_reply().await;
+        assert!(!line.is_empty(), "connection closed mid-FEAT: {all}");
+        let last = line.starts_with("211 ");
+        all.push_str(&line);
+        if last {
+            return all;
+        }
+    }
+}
+
+/// Upgrades a fresh connection to the plain+AUTH TLS listener to TLS.
+async fn auth_tls(srv: &TestServer) -> FtpClient<TlsStream<TcpStream>> {
+    let mut client = FtpClient::connect(srv.tls_addr.unwrap()).await;
+    assert_eq!(
+        client.send("AUTH TLS").await,
+        "234 Proceed with negotiation.\r\n"
+    );
+    client.into_tls(srv.connector.as_ref().unwrap()).await
+}
+
+/// TLS control channel with PBSZ 0 and PROT P done.
+async fn private_session(srv: &TestServer) -> FtpClient<TlsStream<TcpStream>> {
+    let mut client = auth_tls(srv).await;
+    client.login("root", "x").await;
+    assert!(client.send("PBSZ 0").await.starts_with("200"));
+    assert!(client.send("PROT P").await.starts_with("200"));
+    client
+}
+
+async fn send_only<S: AsyncRead + AsyncWrite + Unpin>(client: &mut FtpClient<S>, cmd: &str) {
+    client
+        .reader
+        .get_mut()
+        .write_all(format!("{cmd}\r\n").as_bytes())
+        .await
+        .unwrap();
+    client.reader.get_mut().flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn feat_lists_tls_verbs_only_when_tls_is_configured() {
+    let plain = TestServer::start().await;
+    let mut client = FtpClient::connect(plain.addr).await;
+    let feat = read_feat(&mut client).await;
+    for verb in ["AUTH", "PBSZ", "PROT"] {
+        assert!(!feat.contains(verb), "{feat}");
+    }
+    plain.stop();
+
+    let srv = TestServer::start_tls().await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    let feat = read_feat(&mut client).await;
+    for verb in [" AUTH TLS\r\n", " PBSZ\r\n", " PROT\r\n"] {
+        assert!(feat.contains(verb), "{feat}");
+    }
+    srv.stop();
+}
+
+#[tokio::test]
+async fn auth_tls_without_configured_tls_is_500_unknown_command() {
+    let srv = TestServer::start().await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    for cmd in ["AUTH TLS", "PBSZ 0", "PROT P"] {
+        assert_eq!(client.send(cmd).await, "500 Unknown command.\r\n", "{cmd}");
+    }
+    srv.stop();
+}
+
+#[tokio::test]
+async fn auth_tls_upgrades_resets_login_state_and_tags_events() {
+    let srv = TestServer::start_tls().await;
+    let mut client = FtpClient::connect(srv.tls_addr.unwrap()).await;
+    assert!(client.send("USER pre").await.starts_with("331"));
+    assert_eq!(
+        client.send("AUTH TLS").await,
+        "234 Proceed with negotiation.\r\n"
+    );
+    let mut client = client.into_tls(srv.connector.as_ref().unwrap()).await;
+    assert!(client.send("PASS x").await.starts_with("230"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let events = srv.events().await;
+    assert!(
+        events[0].metadata.get("tls").is_none(),
+        "the plaintext-phase connection event carries no tls tag"
+    );
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .unwrap();
+    assert_eq!(
+        login.metadata["username"], "",
+        "USER sent in cleartext is discarded"
+    );
+    assert_eq!(login.metadata["tls"], true);
+    srv.stop();
+}
+
+#[tokio::test]
+async fn auth_tls_with_pipelined_plaintext_is_refused_and_recorded() {
+    let srv = TestServer::start_tls().await;
+    let mut client = FtpClient::connect(srv.tls_addr.unwrap()).await;
+    // ONE write, so the injected command is buffered behind AUTH TLS.
+    client
+        .reader
+        .get_mut()
+        .write_all(b"AUTH TLS\r\nUSER evil\r\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        client.read_reply().await,
+        "504 Pipelined commands after AUTH TLS refused.\r\n"
+    );
+    assert_eq!(client.read_reply().await, "", "the connection is closed");
+
+    let events = srv.events().await;
+    let refusal = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .expect("refusal event");
+    assert_eq!(refusal.metadata["command"], "AUTH");
+    assert_eq!(refusal.metadata["starttls_refused"], "pipelined_plaintext");
+    assert_eq!(refusal.metadata["pipelined_bytes"], "USER evil\r\n".len());
+    assert!(refusal.metadata.get("tls").is_none());
+    assert!(
+        events
+            .iter()
+            .all(|e| e.signal_type != sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT),
+        "the injected USER must never run"
+    );
+    srv.stop();
+}
+
+#[tokio::test]
+async fn auth_tls_variants_and_errors() {
+    let srv = TestServer::start_tls().await;
+    let mut client = FtpClient::connect(srv.tls_addr.unwrap()).await;
+    assert!(client.send("AUTH GSSAPI").await.starts_with("504"));
+    assert!(client.send("PBSZ 0").await.starts_with("503"));
+    assert!(client.send("PROT P").await.starts_with("503"));
+    assert_eq!(
+        client.send("AUTH TLS").await,
+        "234 Proceed with negotiation.\r\n"
+    );
+    let mut client = client.into_tls(srv.connector.as_ref().unwrap()).await;
+    assert!(
+        client.send("PROT P").await.starts_with("503"),
+        "PROT before PBSZ"
+    );
+    assert_eq!(client.send("PBSZ 0").await, "200 PBSZ set to 0.\r\n");
+    assert_eq!(client.send("PROT P").await, "200 PROT now Private.\r\n");
+    assert_eq!(client.send("PROT C").await, "200 PROT now Clear.\r\n");
+    assert!(client.send("PROT S").await.starts_with("536"));
+    assert!(client.send("PROT Z").await.starts_with("504"));
+    assert!(client.send("AUTH TLS").await.starts_with("503"));
+
+    let mut fresh = FtpClient::connect(srv.tls_addr.unwrap()).await;
+    assert!(fresh.send("AUTH ssl").await.starts_with("234"));
+    srv.stop();
+}
+
+#[tokio::test]
+async fn implicit_ftps_990_login_and_tls_tag() {
+    let srv = TestServer::start_tls().await;
+    let mut client =
+        FtpClient::connect_implicit(srv.implicit_addr.unwrap(), srv.connector.as_ref().unwrap())
+            .await;
+    client.login("root", "x").await;
+    assert!(client.send("AUTH TLS").await.starts_with("503"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let events = srv.events().await;
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .unwrap();
+    assert_eq!(login.metadata["tls"], true);
+    assert!(login.metadata.get("password").is_none());
+    for e in &events {
+        assert_eq!(
+            e.metadata["tls"], true,
+            "every implicit-session event is tagged"
+        );
+    }
+    srv.stop();
+}
+
+#[tokio::test]
+async fn implicit_ftps_handshake_failure_is_silent_and_listener_survives() {
+    let srv = TestServer::start_tls().await;
+    let mut raw = TcpStream::connect(srv.implicit_addr.unwrap())
+        .await
+        .unwrap();
+    raw.write_all(&[0x41u8; 2048]).await.unwrap();
+    let mut buf = [0u8; 256];
+    let mut banner = Vec::new();
+    // rustls may send a fatal alert before closing; a "220" banner must never arrive.
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match raw.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => banner.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "connection must close");
+    assert!(!banner.starts_with(b"220"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        srv.events().await.is_empty(),
+        "no event for a failed handshake"
+    );
+
+    let mut client =
+        FtpClient::connect_implicit(srv.implicit_addr.unwrap(), srv.connector.as_ref().unwrap())
+            .await;
+    client.login("root", "x").await;
+    srv.stop();
+}
+
+const LIST_BODY: &str = "-rw-r--r--    1 0        0            4096 Jan 16  2024 readme.txt\r\ndrwxr-xr-x    2 0        0            4096 Jan 16  2024 pub\r\n";
+
+#[tokio::test]
+async fn prot_p_list_is_tls_on_the_data_channel() {
+    let srv = TestServer::start_tls().await;
+    let mut client = private_session(&srv).await;
+    let data_addr = client.pasv().await;
+    send_only(&mut client, "LIST").await;
+    assert!(client.read_reply().await.starts_with("150"));
+    let mut data = tls_data(data_addr, srv.connector.as_ref().unwrap()).await;
+    let mut listing = String::new();
+    data.read_to_string(&mut listing).await.unwrap();
+    assert_eq!(listing, LIST_BODY);
+    assert!(client.read_reply().await.starts_with("226"));
+    srv.stop();
+}
+
+#[tokio::test]
+async fn prot_c_list_stays_cleartext_on_a_tls_control_channel() {
+    let srv = TestServer::start_tls().await;
+    let mut client = auth_tls(&srv).await;
+    client.login("root", "x").await;
+    assert!(client.send("PBSZ 0").await.starts_with("200"));
+    assert!(client.send("PROT C").await.starts_with("200"));
+    let data_addr = client.pasv().await;
+    send_only(&mut client, "LIST").await;
+    assert!(client.read_reply().await.starts_with("150"));
+    let mut data = TcpStream::connect(data_addr).await.unwrap();
+    let mut listing = String::new();
+    data.read_to_string(&mut listing).await.unwrap();
+    assert_eq!(listing, LIST_BODY);
+    assert!(client.read_reply().await.starts_with("226"));
+    srv.stop();
+}
+
+#[tokio::test]
+async fn prot_p_stor_is_captured_and_close_without_close_notify_is_complete() {
+    let srv = TestServer::start_tls().await;
+    let mut client = private_session(&srv).await;
+    let data_addr = client.pasv().await;
+    send_only(&mut client, "STOR evil.bin").await;
+    assert!(client.read_reply().await.starts_with("150"));
+
+    let body = b"MZ-tls-body";
+    let mut data = tls_data(data_addr, srv.connector.as_ref().unwrap()).await;
+    data.write_all(body).await.unwrap();
+    data.flush().await.unwrap();
+    // Dropped without shutdown(): no close_notify, the way FTPS clients commonly finish.
+    drop(data);
+
+    let r = client.read_reply().await;
+    assert!(r.starts_with("226"), "STOR reply: {r}");
+    srv.wait_for_upload_event().await;
+    let upload = srv.uploads().await.remove(0);
+    let sample = upload.sample.as_ref().unwrap();
+    use sha2::{Digest, Sha256};
+    assert_eq!(upload.metadata["complete"], true);
+    assert_eq!(upload.metadata["wire_size"], body.len() as u64);
+    assert_eq!(upload.metadata["tls"], true);
+    assert_eq!(sample.size, body.len() as u64);
+    assert_eq!(
+        sample.sha256,
+        sensor_framework::to_hex_bounded(&Sha256::digest(body), 32)
+    );
+    let on_disk = tokio::fs::read(srv.spool_dir.join(&sample.sha256))
+        .await
+        .unwrap();
+    assert_eq!(on_disk, body);
+    srv.stop();
+}
+
+#[tokio::test]
+async fn prot_p_data_handshake_failure_is_425() {
+    let srv = TestServer::start_tls().await;
+    let mut client = private_session(&srv).await;
+    let data_addr = client.pasv().await;
+    send_only(&mut client, "LIST").await;
+    assert!(client.read_reply().await.starts_with("150"));
+    let mut raw = TcpStream::connect(data_addr).await.unwrap();
+    raw.write_all(&[0x41u8; 512]).await.unwrap();
+    let r = client.read_reply().await;
+    assert!(r.starts_with("425 Failed to establish connection."), "{r}");
+    assert!(client.send("NOOP").await.starts_with("200"));
+    srv.stop();
 }
 
 fn walk_rs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

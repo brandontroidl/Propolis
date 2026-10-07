@@ -171,6 +171,17 @@ fn smtp_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
     assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
 }
 
+/// The FTP sensor's deploy ports (21 plain, 990 implicit FTPS) are privileged, so its unit keeps
+/// `CAP_NET_BIND_SERVICE`, and it reads its cert and key from the root-owned TLS directory, which
+/// `ProtectSystem=strict` leaves readable but which the unit must not be able to write.
+#[test]
+fn ftp_unit_reads_tls_dir_read_only_and_keeps_cap_net_bind() {
+    let unit = deploy_file("sensor-ftp.service");
+    assert!(unit.contains("ReadOnlyPaths=/etc/propolis/tls\n"));
+    assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
+    assert!(unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
+}
+
 /// The three layers `internal/design/02-sensor-framework.md`'s "Isolation and deployment"
 /// requires of every sensor unit: least authority, resource caps, and containment. Shared by
 /// both units below so the two can never drift into checking different bars.

@@ -526,8 +526,57 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
   sanitized cap 255.
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`crates/sensor-ftp/src/lib.rs#SPOOL_MAX_FILE_SIZE`, `crates/sensor-ftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, `crates/sensor-ftp/src/lib.rs#CAPTURE_QUEUE_SIZE`, `crates/sensor-ftp/src/lib.rs#start_test_server`).
 - **Bounds:** common defaults, `max_concurrent` 256.
+- **FTPS and AUTH TLS (optional):** `PROPOLIS_FTP_TLS_CERT` and `PROPOLIS_FTP_TLS_KEY` together
+  enable AUTH TLS on the plain listener (21); `PROPOLIS_FTP_TLS_BIND` adds an implicit-TLS (FTPS,
+  990) listener that needs the pair, where the handshake comes before the banner. Both run in one
+  process, write one `events.jsonl` and share one capture hand-off and capture memory budget
+  (`crates/sensor-ftp/src/lib.rs#start_listeners`); 990 exists only when its bind is set. No
+  client certificate is requested. Rules, in the order the handler checks them
+  (`crates/sensor-ftp/src/handler.rs#handle_connection`):
+  - With no pair configured, AUTH, PBSZ and PROT get the unchanged `500 Unknown command.`, and
+    FEAT omits `AUTH SSL`, `AUTH TLS`, `PBSZ` and `PROT`. With the pair, FEAT lists them.
+  - AUTH inside TLS (implicit, or after an upgrade) gets `503 Bad sequence of commands.`. On a
+    plain session `AUTH TLS`, `AUTH TLS-C`, `AUTH SSL` and `AUTH TLS-P` are accepted (the mechanism
+    is case-insensitive); any other mechanism gets `504 Unknown AUTH type.`.
+  - Bytes the client sent behind the AUTH line (already buffered when it is read) are refused
+    before any `234`: one `honeypot_command_exec` event with `command` `AUTH`, `starttls_refused`
+    `pipelined_plaintext` and `pipelined_bytes` (the count; the injected bytes are never captured
+    or interpreted), then `504 Pipelined commands after AUTH TLS refused.`, a stream shutdown and
+    the end of the session. The event is plaintext-phase and carries no `"tls"` key.
+  - Otherwise `234 Proceed with negotiation.`, then the handshake bounded by the read timeout
+    (`crates/sensor-framework/src/tls.rs#upgrade_buffered`). A failed handshake ends the session
+    with no plaintext fallback. The upgrade then resets the session as REIN would: the username,
+    the login state, PBSZ, PROT and any open passive listener are discarded, so a USER sent in
+    cleartext does not carry into the protected session and the client must log in again; the
+    per-connection captured-byte count is kept.
+  - PBSZ is accepted only inside TLS and answers `200 PBSZ set to 0.` whatever the argument;
+    on a plain control channel it gets `503 Bad sequence of commands.`. PROT needs TLS and a
+    prior PBSZ, otherwise `503 Bad sequence of commands.`; then `PROT C` gets `200 PROT now Clear.`,
+    `PROT P` gets `200 PROT now Private.`, `PROT S` and `PROT E` get `536 PROT not supported.`
+    and anything else `504 Bad PROT command.`.
+  - After `PROT P` the passive data connection is wrapped in TLS, but only after the data peer
+    passed the same source-IP check as a plaintext transfer (`data_peer_matches`), so an off-path
+    connector never reaches the handshake. The data handshake is bounded by the read timeout and a
+    failed or stalled one gets `425 Failed to establish connection.`. LIST and NLST send the
+    listing and then close the data stream (`close_notify` on TLS). STOR over `PROT P` is captured
+    and spooled exactly like plaintext (same caps, same `honeypot_malware_upload` event), and a
+    data connection closed without a `close_notify` counts as the end of the file, as vsftpd
+    tolerates it (`crates/sensor-ftp/src/handler.rs#protect_data`).
+  - Connection, login and upload events from a session whose **control channel** is TLS carry
+    `"tls": true`; the key is absent, not false, on plain sessions
+    (`crates/sensor-ftp/src/handler.rs#tag_tls`). Data-channel protection (`PROT`) does not
+    change the tag, and the connection event of a plain session that later upgrades stays
+    untagged. Passwords are never captured, TLS or not. QUIT sends `221` then a stream shutdown
+    (`close_notify` on TLS).
+  - An implicit handshake that fails or stalls is dropped with a debug log and emits no event.
+  - Fail-closed: the sensor refuses to start (exit 1, before any bind) on a half-configured or
+    unusable pair, a TLS bind without a pair, or an unparseable TLS bind, and the key must be
+    mode `0600`; an OS bind failure on any listener stops the others and exits 1. A pair with no
+    TLS bind is not an error: it enables AUTH TLS and opens no 990 listener. Variables and the
+    full rules are in [environment-variables.md](environment-variables.md); the operator view is
+    [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
-  `honeypot_malware_upload`.
+  `honeypot_malware_upload`, and `honeypot_command_exec` (only the pipelined-AUTH-TLS refusal).
 
 ### sensor-tftp
 

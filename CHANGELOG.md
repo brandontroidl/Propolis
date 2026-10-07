@@ -4,6 +4,29 @@
 
 ### Added
 
+- **FTPS and AUTH TLS on `sensor-ftp` (default off)** - `PROPOLIS_FTP_TLS_CERT` and
+  `PROPOLIS_FTP_TLS_KEY` (the pair `provision-tls.sh` mints, key mode `0600`) enable AUTH TLS on
+  the plain listener, which until now answered `500`. One optional listener in the same process,
+  writing the same event log and sharing the capture hand-off and memory budget, exists only when
+  its bind is set (no compiled default): `PROPOLIS_FTP_TLS_BIND` (deploy convention
+  `0.0.0.0:990`, implicit TLS, requires the pair). `AUTH TLS`, `TLS-C`, `SSL` and `TLS-P` answer
+  `234` and upgrade, other AUTH types get `504`, AUTH inside TLS gets `503`. Plaintext pipelined
+  behind AUTH TLS is refused before any `234` with one `honeypot_command_exec` event
+  (`starttls_refused: pipelined_plaintext`, the byte count, never the bytes), a
+  `504 Pipelined commands after AUTH TLS refused.` and a close. The upgrade resets the session as
+  REIN would (user, login, PBSZ, PROT, passive listener) and keeps the captured-byte count.
+  PBSZ is accepted inside TLS only (`200 PBSZ set to 0.`), PROT takes `C` and `P` after PBSZ
+  (`S` and `E` get `536`), FEAT lists AUTH, PBSZ and PROT only when TLS is configured, and with no
+  pair set AUTH, PBSZ and PROT still answer `500`. After `PROT P` the passive data socket is
+  wrapped in TLS once the data peer passed the source-IP check (handshake bounded by the read
+  timeout, a failure gets `425`), STOR over it is spooled exactly like plaintext, and a data close
+  without `close_notify` counts as end of file. Connection, login and upload events from a session
+  whose control channel is TLS carry `"tls": true`; plain events are unchanged. QUIT now shuts the
+  stream down after `221`. Fail-closed: exactly one of cert and key, a TLS bind without both, an
+  invalid bind, or an unusable pair makes the sensor exit 1 before binding anything, and a bind
+  failure on any listener stops the others and exits 1. Cert and key without a TLS bind enable
+  AUTH TLS and open no 990 listener. `fleet-listeners.sh` derives an `ftp` tcp listener from
+  `PROPOLIS_FTP_TLS_BIND`, and the unit gains `ReadOnlyPaths=/etc/propolis/tls`.
 - **SMTPS, SMTP submission and STARTTLS on `sensor-smtp` (default off)** - `PROPOLIS_SMTP_TLS_CERT`
   and `PROPOLIS_SMTP_TLS_KEY` (the pair `provision-tls.sh` mints, key mode `0600`) turn STARTTLS
   from the old `454` reply into a real upgrade on the plain listeners. Two optional listeners in

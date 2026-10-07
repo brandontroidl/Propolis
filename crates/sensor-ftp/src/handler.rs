@@ -2,17 +2,18 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
 use sensor_framework::{
-    CaptureBody, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, Uuid, WanResolver,
-    upload_metadata,
+    CaptureBody, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, MaybeTlsStream,
+    TlsServer, Uuid, WanResolver, upgrade_buffered, upload_metadata,
 };
 use sensor_wire::{
-    PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
-    SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
+    PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
+    SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
+    WIRE_VERSION,
 };
 
 const PROTOCOL_LABEL: &str = "ftp";
@@ -28,6 +29,13 @@ const MAX_STOR_DRAIN: usize = 10_000_000;
 // are that daemon's real output. A banner that matches no daemon - or a banner and FEAT that do not
 // belong to the same daemon - is itself the fingerprint.
 const BANNER: &[u8] = b"220 (vsFTPd 3.0.5)\r\n";
+
+// vsftpd 3.0.5's FEAT, limited to what this sensor actually backs (SIZE/MDTM/REST are implemented
+// below; EPRT is omitted since active mode is not supported). With ssl_enable vsftpd also lists the
+// TLS verbs, so they appear only when this sensor really answers them.
+const FEAT_PLAIN: &[u8] =
+    b"211-Features:\r\n EPSV\r\n MDTM\r\n PASV\r\n REST STREAM\r\n SIZE\r\n TVFS\r\n UTF8\r\n211 End\r\n";
+const FEAT_TLS: &[u8] = b"211-Features:\r\n AUTH SSL\r\n AUTH TLS\r\n EPSV\r\n MDTM\r\n PASV\r\n PBSZ\r\n PROT\r\n REST STREAM\r\n SIZE\r\n TVFS\r\n UTF8\r\n211 End\r\n";
 
 /// The one advertised regular file, kept consistent across LIST, SIZE and MDTM (an epoch mtime and a
 /// listing size that disagreed with SIZE were tells). vsftpd renders numeric uid/gid by default and,
@@ -51,6 +59,52 @@ const CANNED_NLST: &str = "readme.txt\r\npub\r\n";
 /// normalized IP only.
 fn data_peer_matches(control_ip: IpAddr, data_peer: SocketAddr) -> bool {
     normalize_dual_stack(data_peer).ip() == control_ip
+}
+
+/// Inserts `"tls": true` into event metadata. The key is present only for TLS sessions (never
+/// `false`), so a consumer cannot mistake an absent tag for a recorded "not TLS".
+fn tag_tls(metadata: &mut serde_json::Value) {
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("tls".to_string(), serde_json::Value::Bool(true));
+    }
+}
+
+/// The data connection as the client's PROT level requires. `None` means the TLS handshake the
+/// client owed on an accepted PROT P connection failed or timed out. Called only AFTER
+/// `data_peer_matches` accepted the peer, so an off-path hijacker never reaches the handshake.
+async fn protect_data(
+    data: TcpStream,
+    prot_private: bool,
+    tls: Option<&TlsServer>,
+    timeout: std::time::Duration,
+) -> Option<MaybeTlsStream> {
+    if !prot_private {
+        return Some(MaybeTlsStream::Plain(data));
+    }
+    // PROT P is only reachable once TLS is configured (the PROT arm is gated on it); a missing
+    // server here is a bug, refused rather than downgraded to cleartext.
+    let tls = tls?;
+    match tokio::time::timeout(timeout, tls.accept(data)).await {
+        Ok(Ok(stream)) => Some(MaybeTlsStream::Tls(Box::new(stream))),
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "ftps data channel handshake failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("ftps data channel handshake timed out");
+            None
+        }
+    }
+}
+
+async fn send_and_close<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    // close_notify on TLS, FIN on plain.
+    writer.shutdown().await
 }
 
 /// How a STOR data transfer ended. In stream mode the client closing the data connection is the
@@ -81,6 +135,8 @@ struct StorCapture {
     source_ip: IpAddr,
     wan_ip: Option<IpAddr>,
     logged_in: bool,
+    /// The control channel was TLS; tags the upload event.
+    tls: bool,
     session_id: Uuid,
     handoff: Arc<CaptureHandoff>,
 }
@@ -98,6 +154,13 @@ impl StorCapture {
         loop {
             match tokio::time::timeout(idle_timeout, data.read(&mut chunk)).await {
                 Ok(Ok(0)) => return StorOutcome::Complete,
+                // A TLS client that just closes the data connection (no close_notify) surfaces as
+                // UnexpectedEof. vsftpd tolerates that by default (strict_ssl_read_eof=NO) and FTPS
+                // clients routinely do it, so it is the end of the file. A plain TcpStream read
+                // never yields this kind.
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return StorOutcome::Complete;
+                }
                 Ok(Err(_)) | Err(_) => return StorOutcome::NetworkFailure,
                 Ok(Ok(n)) => {
                     let take = MAX_STOR_BODY.saturating_sub(self.body.len()).min(n);
@@ -121,29 +184,36 @@ impl StorCapture {
         self.submitted = true;
         let body = std::mem::replace(&mut self.body, self.handoff.new_capture_body());
         let orig_name = self.orig_name.clone();
-        let (source_ip, wan_ip, logged_in, session_id, wire_bytes) = (
+        let (source_ip, wan_ip, logged_in, tls, session_id, wire_bytes) = (
             self.source_ip,
             self.wan_ip,
             self.logged_in,
+            self.tls,
             self.session_id,
             self.wire_bytes,
         );
         let job = CaptureJob {
             body,
             orig_name,
-            event_builder: Box::new(move |sample: SampleRef| SensorEvent {
-                v: WIRE_VERSION,
-                source_ip,
-                wan_ip,
-                sensor: PROTOCOL_LABEL.to_string(),
-                signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
-                protocol: PROTO_TCP.to_string(),
-                authenticated: logged_in,
-                observed_at: chrono::Utc::now(),
-                metadata: upload_metadata(PROTOCOL_LABEL, &sample, wire_bytes, complete),
-                sample: Some(sample),
-                session_id: Some(session_id),
-                occurrence_id: None,
+            event_builder: Box::new(move |sample: SampleRef| {
+                let mut metadata = upload_metadata(PROTOCOL_LABEL, &sample, wire_bytes, complete);
+                if tls {
+                    tag_tls(&mut metadata);
+                }
+                SensorEvent {
+                    v: WIRE_VERSION,
+                    source_ip,
+                    wan_ip,
+                    sensor: PROTOCOL_LABEL.to_string(),
+                    signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
+                    protocol: PROTO_TCP.to_string(),
+                    authenticated: logged_in,
+                    observed_at: chrono::Utc::now(),
+                    metadata,
+                    sample: Some(sample),
+                    session_id: Some(session_id),
+                    occurrence_id: None,
+                }
             }),
         };
         let _ = self.handoff.submit(job);
@@ -159,8 +229,8 @@ impl Drop for StorCapture {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_connection<S>(
-    stream: S,
+pub async fn handle_connection(
+    stream: MaybeTlsStream,
     peer_addr: SocketAddr,
     local_addr: Option<SocketAddr>,
     session_id: Uuid,
@@ -168,9 +238,8 @@ pub async fn handle_connection<S>(
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
     handoff: Arc<CaptureHandoff>,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
+    tls: Option<TlsServer>,
+) {
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
     let wan_ip = local_addr
@@ -182,7 +251,12 @@ pub async fn handle_connection<S>(
     let control_local_ip = local_addr.map(|a| normalize_dual_stack(a).ip());
 
     let _ = emitter
-        .append(&connection_event(source_ip, wan_ip, session_id))
+        .append(&connection_event(
+            source_ip,
+            wan_ip,
+            session_id,
+            stream.is_tls(),
+        ))
         .await;
 
     let mut reader = BufReader::new(stream);
@@ -192,6 +266,10 @@ pub async fn handle_connection<S>(
 
     let mut username = String::new();
     let mut logged_in = false;
+    // RFC 4217 data-channel state: PBSZ must precede PROT, and only PROT P protects the data.
+    let mut pbsz_done = false;
+    let mut prot_private = false;
+    // Not reset by an AUTH TLS upgrade: the capture cap is per connection.
     let mut total_read: u64 = 0;
     let mut pasv_listener: Option<TcpListener> = None;
 
@@ -214,21 +292,106 @@ pub async fn handle_connection<S>(
                 // Password read to advance protocol; immediately dropped.
                 logged_in = true;
                 let _ = emitter
-                    .append(&login_event(source_ip, wan_ip, &username, session_id))
+                    .append(&login_event(
+                        source_ip,
+                        wan_ip,
+                        &username,
+                        session_id,
+                        reader.get_ref().is_tls(),
+                    ))
                     .await;
                 let _ = write_line(&mut reader, b"230 Login successful.\r\n").await;
             }
             "SYST" => {
                 let _ = write_line(&mut reader, b"215 UNIX Type: L8\r\n").await;
             }
+            "AUTH" => match tls.as_ref() {
+                // No TLS configured: AUTH is an unknown verb, as before TLS support existed.
+                None => {
+                    let _ = write_line(&mut reader, b"500 Unknown command.\r\n").await;
+                }
+                Some(tls_server) => {
+                    let mechanism = arg.to_ascii_uppercase();
+                    if reader.get_ref().is_tls() {
+                        let _ = write_line(&mut reader, b"503 Bad sequence of commands.\r\n").await;
+                    } else if !matches!(mechanism.as_str(), "TLS" | "TLS-C" | "SSL" | "TLS-P") {
+                        let _ = write_line(&mut reader, b"504 Unknown AUTH type.\r\n").await;
+                    } else {
+                        // Bytes already buffered behind the AUTH line were sent in plaintext
+                        // before the handshake: a man-in-the-middle prepending commands to the
+                        // TLS session (CVE-2011-0411 shape). Refuse, record, and close rather
+                        // than answer 234. Checked before the 234 so the client never gets a
+                        // go-ahead for an upgrade that will not happen.
+                        let pipelined = reader.buffer().len();
+                        if pipelined > 0 {
+                            let _ = emitter
+                                .append(&auth_refused_event(
+                                    source_ip, wan_ip, logged_in, session_id, pipelined,
+                                ))
+                                .await;
+                            let _ = write_line(
+                                &mut reader,
+                                b"504 Pipelined commands after AUTH TLS refused.\r\n",
+                            )
+                            .await;
+                            let _ = reader.get_mut().shutdown().await;
+                            return;
+                        }
+                        if write_line(&mut reader, b"234 Proceed with negotiation.\r\n")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        match upgrade_buffered(reader, tls_server, bounds.read_timeout).await {
+                            Ok(upgraded) => reader = upgraded,
+                            Err(error) => {
+                                tracing::debug!(%peer_addr, %error, "auth tls upgrade failed; closing");
+                                return;
+                            }
+                        }
+                        // RFC 4217 section 4: the upgrade resets the session as if REIN, so a
+                        // USER sent in cleartext does not carry into the protected session.
+                        username.clear();
+                        logged_in = false;
+                        pbsz_done = false;
+                        prot_private = false;
+                        pasv_listener = None;
+                    }
+                }
+            },
+            // With no TLS configured these fall through to the 500 arm, unchanged.
+            "PBSZ" if tls.is_some() => {
+                let reply: &[u8] = if reader.get_ref().is_tls() {
+                    pbsz_done = true;
+                    b"200 PBSZ set to 0.\r\n"
+                } else {
+                    b"503 Bad sequence of commands.\r\n"
+                };
+                let _ = write_line(&mut reader, reply).await;
+            }
+            "PROT" if tls.is_some() => {
+                let reply: &[u8] = if !reader.get_ref().is_tls() || !pbsz_done {
+                    b"503 Bad sequence of commands.\r\n"
+                } else {
+                    match arg.to_ascii_uppercase().as_str() {
+                        "C" => {
+                            prot_private = false;
+                            b"200 PROT now Clear.\r\n"
+                        }
+                        "P" => {
+                            prot_private = true;
+                            b"200 PROT now Private.\r\n"
+                        }
+                        "S" | "E" => b"536 PROT not supported.\r\n",
+                        _ => b"504 Bad PROT command.\r\n",
+                    }
+                };
+                let _ = write_line(&mut reader, reply).await;
+            }
             "FEAT" => {
-                // vsftpd 3.0.5's FEAT, limited to what this sensor actually backs (SIZE/MDTM/REST
-                // are implemented below; EPRT is omitted since active mode is not supported).
-                let _ = write_line(
-                    &mut reader,
-                    b"211-Features:\r\n EPSV\r\n MDTM\r\n PASV\r\n REST STREAM\r\n SIZE\r\n TVFS\r\n UTF8\r\n211 End\r\n",
-                )
-                .await;
+                let feat = if tls.is_some() { FEAT_TLS } else { FEAT_PLAIN };
+                let _ = write_line(&mut reader, feat).await;
             }
             "PWD" | "XPWD" => {
                 let _ = write_line(&mut reader, b"257 \"/\" is the current directory\r\n").await;
@@ -324,20 +487,33 @@ pub async fn handle_connection<S>(
                         write_line(&mut reader, b"150 Here comes the directory listing.\r\n").await;
                     let reply: &[u8] =
                         match tokio::time::timeout(bounds.idle_timeout, listener.accept()).await {
-                            Ok(Ok((mut data, data_peer))) => {
+                            Ok(Ok((data, data_peer))) => {
                                 if data_peer_matches(source_ip, data_peer) {
-                                    // LIST is the long ls -l form; NLST is bare names only.
-                                    let payload = if cmd == "NLST" {
-                                        CANNED_NLST
-                                    } else {
-                                        CANNED_LIST
-                                    };
-                                    let sent = data.write_all(payload.as_bytes()).await;
-                                    drop(data);
-                                    if sent.is_ok() {
-                                        b"226 Directory send OK.\r\n"
-                                    } else {
-                                        b"426 Failure writing network stream.\r\n"
+                                    match protect_data(
+                                        data,
+                                        prot_private,
+                                        tls.as_ref(),
+                                        bounds.read_timeout,
+                                    )
+                                    .await
+                                    {
+                                        Some(mut data) => {
+                                            // LIST is the long ls -l form; NLST is bare names only.
+                                            let payload = if cmd == "NLST" {
+                                                CANNED_NLST
+                                            } else {
+                                                CANNED_LIST
+                                            };
+                                            if send_and_close(&mut data, payload.as_bytes())
+                                                .await
+                                                .is_ok()
+                                            {
+                                                b"226 Directory send OK.\r\n"
+                                            } else {
+                                                b"426 Failure writing network stream.\r\n"
+                                            }
+                                        }
+                                        None => b"425 Failed to establish connection.\r\n",
                                     }
                                 } else {
                                     drop(data);
@@ -380,6 +556,13 @@ pub async fn handle_connection<S>(
                             write_line(&mut reader, b"425 Security: bad IP connecting.\r\n").await;
                         continue;
                     }
+                    let Some(data) =
+                        protect_data(data, prot_private, tls.as_ref(), bounds.read_timeout).await
+                    else {
+                        let _ = write_line(&mut reader, b"425 Failed to establish connection.\r\n")
+                            .await;
+                        continue;
+                    };
                     let mut capture = StorCapture {
                         body: handoff.new_capture_body(),
                         wire_bytes: 0,
@@ -388,6 +571,7 @@ pub async fn handle_connection<S>(
                         source_ip,
                         wan_ip,
                         logged_in,
+                        tls: reader.get_ref().is_tls(),
                         session_id,
                         handoff: handoff.clone(),
                     };
@@ -415,6 +599,8 @@ pub async fn handle_connection<S>(
             }
             "QUIT" => {
                 let _ = write_line(&mut reader, b"221 Goodbye.\r\n").await;
+                // close_notify on a TLS control channel, FIN on plain.
+                let _ = reader.get_mut().shutdown().await;
                 return;
             }
             "NOOP" => {
@@ -427,7 +613,16 @@ pub async fn handle_connection<S>(
     }
 }
 
-fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
+fn connection_event(
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+    tls: bool,
+) -> SensorEvent {
+    let mut metadata = serde_json::json!({ "protocol_label": PROTOCOL_LABEL });
+    if tls {
+        tag_tls(&mut metadata);
+    }
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -437,7 +632,7 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid)
         protocol: PROTO_TCP.to_string(),
         authenticated: false,
         observed_at: chrono::Utc::now(),
-        metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
+        metadata,
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
@@ -449,7 +644,15 @@ fn login_event(
     wan_ip: Option<IpAddr>,
     username: &str,
     session_id: Uuid,
+    tls: bool,
 ) -> SensorEvent {
+    let mut metadata = serde_json::json!({
+        "protocol_label": PROTOCOL_LABEL,
+        "username": username,
+    });
+    if tls {
+        tag_tls(&mut metadata);
+    }
     SensorEvent {
         v: WIRE_VERSION,
         source_ip,
@@ -459,9 +662,36 @@ fn login_event(
         protocol: PROTO_TCP.to_string(),
         authenticated: true,
         observed_at: chrono::Utc::now(),
+        metadata,
+        sample: None,
+        session_id: Some(session_id),
+        occurrence_id: None,
+    }
+}
+
+/// An AUTH TLS refused because the client pipelined plaintext behind it. Always plaintext-phase,
+/// so it carries no `tls` tag.
+fn auth_refused_event(
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    authenticated: bool,
+    session_id: Uuid,
+    pipelined_bytes: usize,
+) -> SensorEvent {
+    SensorEvent {
+        v: WIRE_VERSION,
+        source_ip,
+        wan_ip,
+        sensor: PROTOCOL_LABEL.to_string(),
+        signal_type: SIGNAL_HONEYPOT_COMMAND_EXEC.to_string(),
+        protocol: PROTO_TCP.to_string(),
+        authenticated,
+        observed_at: chrono::Utc::now(),
         metadata: serde_json::json!({
             "protocol_label": PROTOCOL_LABEL,
-            "username": username,
+            "command": "AUTH",
+            "starttls_refused": "pipelined_plaintext",
+            "pipelined_bytes": pipelined_bytes,
         }),
         sample: None,
         session_id: Some(session_id),
@@ -484,7 +714,10 @@ async fn write_line<S: AsyncRead + AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
     data: &[u8],
 ) -> Result<(), ()> {
-    reader.get_mut().write_all(data).await.map_err(|_| ())
+    let inner = reader.get_mut();
+    inner.write_all(data).await.map_err(|_| ())?;
+    // A TLS stream can hold written records until flushed.
+    inner.flush().await.map_err(|_| ())
 }
 
 async fn read_line_bounded<S: AsyncRead + Unpin>(
@@ -575,6 +808,7 @@ mod tests {
             source_ip: "203.0.113.7".parse().unwrap(),
             wan_ip: None,
             logged_in: true,
+            tls: false,
             session_id: Uuid::now_v7(),
             handoff: handoff.clone(),
         };
@@ -598,6 +832,7 @@ mod tests {
             source_ip: "203.0.113.7".parse().unwrap(),
             wan_ip: None,
             logged_in: true,
+            tls: false,
             session_id: Uuid::now_v7(),
             handoff: handoff.clone(),
         };
@@ -615,6 +850,7 @@ mod tests {
             source_ip: "203.0.113.7".parse().unwrap(),
             wan_ip: None,
             logged_in: true,
+            tls: false,
             session_id: Uuid::now_v7(),
             handoff: one_slot_handoff(),
         };
@@ -628,7 +864,8 @@ mod tests {
 
     #[test]
     fn connection_event_is_unauthenticated_with_ftp_label() {
-        let event = connection_event("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
+        let event = connection_event("203.0.113.7".parse().unwrap(), None, Uuid::now_v7(), false);
+        assert!(event.metadata.get("tls").is_none());
         assert!(!event.authenticated);
         assert_eq!(event.sensor, "ftp");
         assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
@@ -641,7 +878,9 @@ mod tests {
             None,
             "admin",
             Uuid::now_v7(),
+            false,
         );
+        assert!(event.metadata.get("tls").is_none());
         assert!(event.authenticated);
         assert_eq!(event.sensor, "ftp");
         assert_eq!(event.signal_type, SIGNAL_HONEYPOT_LOGIN_ATTEMPT);
@@ -650,6 +889,87 @@ mod tests {
             Some("admin")
         );
         assert!(event.metadata.get("password").is_none());
+    }
+
+    #[test]
+    fn tls_tag_present_only_when_true() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let conn = connection_event(ip, None, Uuid::now_v7(), true);
+        let login = login_event(ip, None, "a", Uuid::now_v7(), true);
+        assert_eq!(conn.metadata["tls"], true);
+        assert_eq!(login.metadata["tls"], true);
+    }
+
+    #[test]
+    fn auth_refused_event_shape() {
+        let event = auth_refused_event(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            false,
+            Uuid::now_v7(),
+            17,
+        );
+        assert_eq!(event.signal_type, SIGNAL_HONEYPOT_COMMAND_EXEC);
+        assert_eq!(event.metadata["command"], "AUTH");
+        assert_eq!(event.metadata["starttls_refused"], "pipelined_plaintext");
+        assert_eq!(event.metadata["pipelined_bytes"], 17);
+        assert!(event.metadata.get("tls").is_none());
+    }
+
+    /// Yields three bytes, then a configured error.
+    struct ThenError {
+        sent: bool,
+        kind: std::io::ErrorKind,
+    }
+
+    impl AsyncRead for ThenError {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.sent {
+                return std::task::Poll::Ready(Err(self.kind.into()));
+            }
+            self.sent = true;
+            buf.put_slice(b"abc");
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn capture_for_receive() -> StorCapture {
+        StorCapture {
+            body: CaptureBody::unbudgeted(),
+            wire_bytes: 0,
+            submitted: false,
+            orig_name: "r.bin".into(),
+            source_ip: "203.0.113.7".parse().unwrap(),
+            wan_ip: None,
+            logged_in: true,
+            tls: true,
+            session_id: Uuid::now_v7(),
+            handoff: one_slot_handoff(),
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_treats_unexpected_eof_as_complete_but_other_errors_as_failure() {
+        let idle = std::time::Duration::from_secs(1);
+        let mut c = capture_for_receive();
+        let eof = ThenError {
+            sent: false,
+            kind: std::io::ErrorKind::UnexpectedEof,
+        };
+        assert_eq!(c.receive(eof, idle).await, StorOutcome::Complete);
+        assert_eq!(c.wire_bytes, 3);
+
+        let mut c = capture_for_receive();
+        let reset = ThenError {
+            sent: false,
+            kind: std::io::ErrorKind::ConnectionReset,
+        };
+        assert_eq!(c.receive(reset, idle).await, StorOutcome::NetworkFailure);
+        assert_eq!(c.wire_bytes, 3);
     }
 
     #[test]

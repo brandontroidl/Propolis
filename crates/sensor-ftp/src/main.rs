@@ -7,10 +7,16 @@ use std::time::Duration;
 
 use sensor_framework::{
     CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
-    SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal,
+    SHUTDOWN_DRAIN_TIMEOUT, TlsServer, WanResolver, load_server_config, shutdown_signal,
 };
 
 const ENV_BIND: &str = "PROPOLIS_FTP_BIND";
+/// Optional implicit-FTPS listener (990). Needs both `_TLS_CERT` and `_TLS_KEY`.
+const ENV_TLS_BIND: &str = "PROPOLIS_FTP_TLS_BIND";
+/// Cert and key paths. TLS is enabled iff BOTH are set; AUTH TLS on `PROPOLIS_FTP_BIND` is honoured
+/// only then.
+const ENV_TLS_CERT: &str = "PROPOLIS_FTP_TLS_CERT";
+const ENV_TLS_KEY: &str = "PROPOLIS_FTP_TLS_KEY";
 const ENV_WAN_MAP: &str = "PROPOLIS_FTP_WAN_MAP";
 const ENV_LOG_PATH: &str = "PROPOLIS_FTP_LOG_PATH";
 const ENV_SPOOL_DIR: &str = "PROPOLIS_FTP_SPOOL_DIR";
@@ -47,7 +53,13 @@ enum ConfigError {
     NoBind,
     InvalidBind(String),
     InvalidWanMapEntry(String),
-    InvalidBound { field: &'static str, value: String },
+    InvalidBound {
+        field: &'static str,
+        value: String,
+    },
+    InvalidTlsBind(String),
+    /// Exactly one of cert/key set, or a TLS bind without both. Names the variables only.
+    TlsIncomplete(&'static str),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -59,6 +71,8 @@ impl std::fmt::Display for ConfigError {
             ConfigError::InvalidBound { field, value } => {
                 write!(f, "{field} must be positive, got {value:?}")
             }
+            ConfigError::InvalidTlsBind(s) => write!(f, "invalid {ENV_TLS_BIND}: {s:?}"),
+            ConfigError::TlsIncomplete(why) => write!(f, "{why}"),
         }
     }
 }
@@ -66,6 +80,9 @@ impl std::fmt::Display for ConfigError {
 #[derive(Debug, Clone)]
 struct Config {
     bind_addr: SocketAddr,
+    tls_bind: Option<SocketAddr>,
+    /// Cert and key paths, present iff TLS is enabled.
+    tls_paths: Option<(PathBuf, PathBuf)>,
     wan_map: HashMap<IpAddr, IpAddr>,
     log_path: PathBuf,
     spool_dir: PathBuf,
@@ -87,12 +104,46 @@ fn resolve_outbox_dir(spool_dir: &Path, env_override: Option<String>) -> PathBuf
         .unwrap_or_else(|| spool_dir.join("outbox"))
 }
 
+/// Unset or empty counts as not set. Both set enables TLS; exactly one set, or a TLS bind without
+/// both, is an error so a half-configured sensor never starts (and never binds a plaintext port
+/// the operator believed was protected).
+fn tls_paths(
+    cert: Option<String>,
+    key: Option<String>,
+    tls_bind_set: bool,
+) -> Result<Option<(PathBuf, PathBuf)>, ConfigError> {
+    let set = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    match (set(cert), set(key)) {
+        (Some(c), Some(k)) => Ok(Some((PathBuf::from(c), PathBuf::from(k)))),
+        (None, None) if tls_bind_set => Err(ConfigError::TlsIncomplete(
+            "PROPOLIS_FTP_TLS_BIND is set but PROPOLIS_FTP_TLS_CERT and PROPOLIS_FTP_TLS_KEY are not",
+        )),
+        (None, None) => Ok(None),
+        _ => Err(ConfigError::TlsIncomplete(
+            "PROPOLIS_FTP_TLS_CERT and PROPOLIS_FTP_TLS_KEY must be set together",
+        )),
+    }
+}
+
 fn load_config_from_env() -> Result<Config, ConfigError> {
     let bind_raw = env::var(ENV_BIND).map_err(|_| ConfigError::NoBind)?;
     let bind_addr: SocketAddr = bind_raw
         .trim()
         .parse()
         .map_err(|_| ConfigError::InvalidBind(bind_raw.clone()))?;
+    let tls_bind = match env::var(ENV_TLS_BIND) {
+        Ok(raw) if !raw.trim().is_empty() => Some(
+            raw.trim()
+                .parse()
+                .map_err(|_| ConfigError::InvalidTlsBind(raw.clone()))?,
+        ),
+        _ => None,
+    };
+    let tls_paths = tls_paths(
+        env::var(ENV_TLS_CERT).ok(),
+        env::var(ENV_TLS_KEY).ok(),
+        tls_bind.is_some(),
+    )?;
     let wan_map = parse_wan_map(&env::var(ENV_WAN_MAP).unwrap_or_default())?;
     let log_path = env::var(ENV_LOG_PATH)
         .map(PathBuf::from)
@@ -106,6 +157,8 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
 
     Ok(Config {
         bind_addr,
+        tls_bind,
+        tls_paths,
         wan_map,
         log_path,
         spool_dir,
@@ -215,6 +268,7 @@ async fn main() {
         }
     };
     let bind_addr = config.bind_addr;
+    let tls_bind = config.tls_bind;
     let wan_map = config.wan_map;
     let log_path = config.log_path;
     let spool_dir = config.spool_dir;
@@ -223,9 +277,29 @@ async fn main() {
     let outbox_dir = config.outbox_dir;
     let capture_memory_bytes = config.capture_memory_bytes;
 
+    // Validated and loaded BEFORE any socket is bound, so a bad TLS config never leaves a
+    // plaintext listener running.
+    let tls = match config.tls_paths {
+        None => None,
+        Some((cert, key)) => match load_server_config(&cert, &key) {
+            Ok(server_config) => Some(TlsServer::from_config(server_config)),
+            Err(e) => {
+                tracing::error!(error = %e, "sensor-ftp: invalid TLS configuration; refusing to start");
+                std::process::exit(1);
+            }
+        },
+    };
+    let listeners = match sensor_ftp::plan_listeners(bind_addr, tls_bind, tls) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("sensor-ftp: {e}; refusing to start");
+            std::process::exit(1);
+        }
+    };
+
     let wan_resolver = Arc::new(WanResolver::new(wan_map));
-    let (bound, handle, handoff) = match sensor_ftp::start_test_server_with_handoff(
-        bind_addr,
+    let (started, handoff) = match sensor_ftp::start_listeners(
+        listeners,
         log_path,
         spool_dir,
         wan_resolver,
@@ -238,15 +312,19 @@ async fn main() {
     {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::error!(addr = %bind_addr, error = %e, "sensor-ftp: failed to start");
+            tracing::error!(error = %e, "sensor-ftp: failed to start");
             std::process::exit(1);
         }
     };
 
-    tracing::info!(local = %bound, "sensor-ftp: listening");
+    for (bound, _) in &started {
+        tracing::info!(local = %bound, "sensor-ftp: listening");
+    }
     shutdown_signal().await;
     tracing::info!("sensor-ftp: shutdown signal received; stopping");
-    handle.abort();
+    for (_, handle) in &started {
+        handle.abort();
+    }
     // Queued captures only; a connection cancelled mid-capture never submits (see handoff.rs).
     handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
 }
@@ -279,6 +357,19 @@ mod tests {
         assert!(parse(Some("0")).is_err());
         assert!(parse(Some("lots")).is_err());
         assert!(parse(Some("-1")).is_err());
+    }
+
+    #[test]
+    fn tls_is_enabled_only_by_a_complete_pair_and_fails_closed() {
+        let some = |s: &str| Some(s.to_string());
+        assert!(tls_paths(None, None, false).unwrap().is_none());
+        assert!(tls_paths(some(""), some("  "), false).unwrap().is_none());
+        assert!(tls_paths(some("/c"), some("/k"), false).unwrap().is_some());
+        assert!(tls_paths(some("/c"), some("/k"), true).unwrap().is_some());
+        assert!(tls_paths(some("/c"), None, false).is_err());
+        assert!(tls_paths(None, some("/k"), false).is_err());
+        assert!(tls_paths(some("/c"), some(""), false).is_err());
+        assert!(tls_paths(None, None, true).is_err());
     }
 
     #[test]

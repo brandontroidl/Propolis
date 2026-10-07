@@ -515,7 +515,9 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   `PROPOLIS_ADB_LOG_PATH`, `PROPOLIS_ADB_WAN_MAP`.
 - ftp: `PROPOLIS_FTP_READ_TIMEOUT_MS`, `PROPOLIS_FTP_IDLE_TIMEOUT_MS`,
   `PROPOLIS_FTP_MAX_DURATION_SECS`, `PROPOLIS_FTP_MAX_CAPTURED_BYTES`, `PROPOLIS_FTP_MAX_CONCURRENT`,
-  `PROPOLIS_FTP_LOG_PATH`, `PROPOLIS_FTP_WAN_MAP`.
+  `PROPOLIS_FTP_LOG_PATH`, `PROPOLIS_FTP_WAN_MAP`. The TLS variables `PROPOLIS_FTP_TLS_BIND`,
+  `PROPOLIS_FTP_TLS_CERT` and `PROPOLIS_FTP_TLS_KEY` are documented with the sensor TLS
+  variables below.
 - tftp: `PROPOLIS_TFTP_READ_TIMEOUT_MS`, `PROPOLIS_TFTP_IDLE_TIMEOUT_MS`,
   `PROPOLIS_TFTP_MAX_DURATION_SECS`, `PROPOLIS_TFTP_MAX_CAPTURED_BYTES`,
   `PROPOLIS_TFTP_MAX_CONCURRENT`, `PROPOLIS_TFTP_LOG_PATH`, `PROPOLIS_TFTP_WAN_MAP`.
@@ -687,6 +689,30 @@ Sensor-specific extras:
   answered with `454`. Because the fleet inventory derives from the `*_BIND` variables
   (`deploy/fleet-listeners.sh#PROPOLIS_SMTP_SUBMISSION_BIND`,
   `deploy/fleet-listeners.sh#PROPOLIS_SMTP_TLS_BIND`), neither extra listener starts implicitly.
+- **ftp**: FTPS and AUTH TLS (all three default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_FTP_TLS_BIND` | unset (the deploy convention is `0.0.0.0:990`) | `ip:port` of the implicit-TLS (FTPS) listener. The listener exists only when this is set, and it requires the cert and key. |
+  | `PROPOLIS_FTP_TLS_CERT` | unset (deploy value `/etc/propolis/tls/ftp.crt`) | PEM certificate path. Together with the key it enables AUTH TLS on the plain listener. |
+  | `PROPOLIS_FTP_TLS_KEY` | unset (deploy value `/etc/propolis/tls/ftp.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-ftp/src/main.rs#tls_paths`,
+  `crates/sensor-ftp/src/main.rs#main`): the sensor exits 1 with `refusing to start`, before
+  binding any listener (the plain one included), when exactly one of CERT and KEY is set (a blank
+  value counts as unset), when `PROPOLIS_FTP_TLS_BIND` is set without both paths, when
+  `PROPOLIS_FTP_TLS_BIND` does not parse (a bad bind never falls back to a default), when a file
+  is unreadable, not PEM or a mismatched pair, or when the key is group- or world-readable. A
+  non-UTF-8 value of any of the three is read as unset, not as invalid. If the OS refuses any one
+  bind, the listeners already started are stopped and the sensor exits 1
+  (`crates/sensor-ftp/src/lib.rs#start_listeners`). With CERT and KEY set and no
+  `PROPOLIS_FTP_TLS_BIND`, the pair enables AUTH TLS on the plain listener and no implicit-TLS
+  listener starts; unlike the other sensors this logs no warning, because the pair is in use.
+  With no TLS variable set the sensor is unchanged: AUTH, PBSZ and PROT answer `500` and FEAT
+  does not list them. Because the fleet inventory derives from the `*_BIND` variables
+  (`deploy/fleet-listeners.sh#PROPOLIS_FTP_TLS_BIND`), the implicit listener never starts
+  implicitly. The plain and implicit listeners share one capture-memory budget
+  (`PROPOLIS_FTP_CAPTURE_MEMORY_BYTES`), so the ceiling covers both together.
 - **catchall**: no spool variable (never spools file bodies,
   `crates/sensor-catchall/src/main.rs#Config`); no
   outbox variable either (captures no file bodies, so nothing for SP-B-1b's

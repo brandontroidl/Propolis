@@ -78,6 +78,22 @@ listener. A half-configured or unusable pair makes the sensor refuse to start ra
 plaintext. See
 [../operations/networking-tls.md](../operations/networking-tls.md#live-smtps-and-starttls-on-sensor-smtp).
 
+`sensor-ftp` can expose one more port and a protocol upgrade. An implicit-TLS listener
+(conventionally 990, FTPS) exists only when `PROPOLIS_FTP_TLS_BIND` is set, so cert and key alone
+open no new port. They do enable AUTH TLS on the plain listener (21), which adds a handshake to
+those sessions: a failed or stalled handshake ends the session, and the same limits as the HTTPS
+listener apply (no client certificate, a deploy-minted self-signed certificate named `localhost`,
+handshake failures logged only at debug level). The AUTH TLS upgrade refuses plaintext pipelined
+behind the command (the injection class of CVE-2011-0411): the bytes are counted in one
+`honeypot_command_exec` event, never captured or interpreted, and the connection is closed with a
+`504` before any handshake begins. Session state, including login, is reset after the upgrade.
+After `PROT P` a passive data connection also carries a TLS handshake, but only once its source IP
+matched the control connection, and uploads over it are quarantined by the same hand-off, byte
+budget and shutdown drain as plaintext uploads, and never run. Passwords are never captured over
+TLS, as on the plain listener. A half-configured or unusable pair makes the sensor refuse to
+start rather than serve plaintext. See
+[../operations/networking-tls.md](../operations/networking-tls.md#live-ftps-and-auth-tls-on-sensor-ftp).
+
 Controls:
 
 - **Never-execute.** No sensor spawns a subprocess or execs; the honeypot captures, it

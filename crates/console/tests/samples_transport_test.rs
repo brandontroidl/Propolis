@@ -43,6 +43,7 @@ fn state(db: PgPool) -> AppState {
         trusted_proxy: false,
         metrics_token: None,
         gave_up_subsystems: console::no_subsystem_health(),
+        intake_lag: console::intake_lag::no_intake_lag(),
     }
 }
 

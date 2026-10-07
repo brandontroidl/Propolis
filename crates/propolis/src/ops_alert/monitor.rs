@@ -195,11 +195,13 @@ impl<P: Poster> Monitor<P> {
     }
 }
 
-/// All eleven operational conditions, in a stable order. Built fresh on each (re)start so per-
-/// condition state (backlog history, the chain-verify cache) resets cleanly after a supervised
-/// restart.
+/// All twelve operational conditions, in a stable order. Built fresh on each (re)start so per-
+/// condition state (backlog history, the chain-verify cache, intake lag tracks) resets cleanly
+/// after a supervised restart.
 pub fn default_conditions() -> Vec<Box<dyn Condition>> {
-    use super::conditions::{backlog, capacity, chain, feed, intake, malware, subsystem, vendor};
+    use super::conditions::{
+        backlog, capacity, chain, feed, intake, intake_lag, malware, subsystem, vendor,
+    };
     vec![
         Box::new(subsystem::SubsystemGaveUp),
         Box::new(subsystem::SensorDown),
@@ -207,6 +209,7 @@ pub fn default_conditions() -> Vec<Box<dyn Condition>> {
         Box::new(backlog::Backlog::new()),
         Box::new(chain::ChainVerify::new()),
         Box::new(intake::IntakeStalled),
+        Box::new(intake_lag::IntakeLagging::new()),
         Box::new(feed::FeedStale),
         Box::new(feed::FeedPushStale::new()),
         Box::new(vendor::VendorFailures),
@@ -293,6 +296,7 @@ mod tests {
             fetch_enabled: false,
             supervisor: Arc::new(Mutex::new(HashMap::new())),
             intake_progress: Arc::new(Mutex::new(HashMap::new())),
+            intake_poll_interval: Duration::from_secs(1),
             feed_marker_path: "/nonexistent".into(),
             feed_push_marker_path: "/nonexistent".into(),
             feed_build_interval: Duration::from_secs(300),
@@ -405,7 +409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_conditions_are_the_eleven_expected_ids() {
+    async fn default_conditions_are_the_twelve_expected_ids() {
         let ids: Vec<&str> = default_conditions().iter().map(|c| c.id()).collect();
         assert_eq!(
             ids,
@@ -416,6 +420,7 @@ mod tests {
                 "fetcher-backlog",
                 "chain-verify",
                 "intake-stalled",
+                "intake-lagging",
                 "feed-stale",
                 "feed-push-stale",
                 "vendor-failures",

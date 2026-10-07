@@ -699,6 +699,47 @@ mod tests {
         assert!(readable.contains("4242") && readable.contains("events recorded"));
     }
 
+    /// A listener row whose intake log is behind carries the badge as a word-bearing pill in the
+    /// LAST EVENT cell; a row that is not behind carries nothing, not an empty pill.
+    #[test]
+    fn a_behind_listener_row_shows_its_backlog_and_a_current_one_shows_nothing() {
+        let env = environment();
+        let tmpl = env.get_template("fleet_status_fragment.html").unwrap();
+        let row = |behind: Option<&str>| {
+            minijinja::context! {
+                collector => "local", sensor => "telnet", sensor_label => "Telnet",
+                protocol => "tcp", port => "23", vantage => "", reach => "reachable",
+                reach_level => "ok", reach_dot => "dot dot--low", reach_detail => (),
+                probe_ago => "1 minute ago", confirmed_ago => (),
+                last_event_ago => "11 days ago", last_event_dot => "dot dot--high",
+                behind => behind, events_24h => 0, state_level => "warn", declared => true,
+            }
+        };
+
+        let lagging = tmpl
+            .render(minijinja::context! {
+                listeners => vec![row(Some("behind: 6.6 GB / 11 d"))],
+                ..fleet_base_context()
+            })
+            .unwrap();
+        // Autoescaping writes the slash as `&#x2f;`; a browser shows "behind: 6.6 GB / 11 d".
+        assert!(
+            lagging.contains(r#"<span class="sev sev--high">behind: 6.6 GB &#x2f; 11 d</span>"#),
+            "the behind row must carry its badge: {lagging}"
+        );
+
+        let current = tmpl
+            .render(minijinja::context! {
+                listeners => vec![row(None)],
+                ..fleet_base_context()
+            })
+            .unwrap();
+        assert!(
+            !current.contains("behind:") && !current.contains("sev sev--high"),
+            "a row that is not behind must show no badge: {current}"
+        );
+    }
+
     /// The fleet page polls; a poll that starts failing leaves the last render on screen with
     /// server-computed ages that never move again. `data-live` is what opts the container into
     /// the stale handling in `assets/live-panels.js`, so losing the attribute silently restores that bug.

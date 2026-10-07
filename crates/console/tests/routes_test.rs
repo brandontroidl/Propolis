@@ -90,6 +90,7 @@ fn test_state_full(
         trusted_proxy: false,
         metrics_token: None,
         gave_up_subsystems: console::no_subsystem_health(),
+        intake_lag: console::intake_lag::no_intake_lag(),
     }
 }
 
@@ -4511,6 +4512,50 @@ async fn metrics_omits_feed_entries_when_unconfigured(pool: PgPool) {
     assert!(!body.contains("propolis_feed_entries"));
 }
 
+/// A lagging telnet log as the daemon would report it: 6.6 GB unread, the last appended event 11
+/// days old, its events carrying the sensor name `telnet`.
+fn telnet_eleven_days_behind() -> console::intake_lag::IntakeLagSource {
+    Arc::new(|| {
+        vec![console::intake_lag::IntakeLag {
+            log: "telnet".into(),
+            sensors: vec!["telnet".into()],
+            bytes_behind: 6_600_000_000,
+            oldest_unread_age: Some(std::time::Duration::from_secs(11 * 86_400 + 60)),
+            behind: true,
+        }]
+    })
+}
+
+/// `/metrics` publishes whatever backlog the daemon hands `AppState`, and a process that tails
+/// nothing publishes no lag series at all rather than a reassuring zero.
+#[sqlx::test(migrations = false)]
+async fn metrics_publish_the_intake_backlog_the_daemon_reports(pool: PgPool) {
+    migrate(&pool).await;
+    let mut state = test_state(pool.clone());
+    state.intake_lag = telnet_eleven_days_behind();
+    let body = body_text(
+        test_app(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(body.contains("propolis_intake_bytes_behind{sensor=\"telnet\"} 6600000000\n"));
+    assert!(body.contains("propolis_intake_oldest_unread_age_seconds{sensor=\"telnet\"} 950460\n"));
+
+    let standalone = body_text(
+        test_app(test_state(pool))
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !standalone.contains("propolis_intake_"),
+        "nothing measured must mean no series: {standalone}"
+    );
+}
+
 // --- logs ---
 
 #[sqlx::test(migrations = false)]
@@ -5031,6 +5076,33 @@ async fn insert_probe(
     .execute(pool)
     .await
     .unwrap();
+}
+
+/// The incident's view: telnet's log is days behind, so its listener row says how far, and the
+/// caught-up ssh row says nothing.
+#[sqlx::test(migrations = false)]
+async fn fleet_marks_the_listener_rows_of_a_lagging_log_with_its_backlog(pool: PgPool) {
+    migrate(&pool).await;
+    let mut state = test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("telnet", fleet::Proto::Tcp, 23),
+        ],
+        None,
+    );
+    state.intake_lag = telnet_eleven_days_behind();
+    let body = fleet_body(state).await;
+    let table = listener_table(&body);
+    assert!(
+        listener_row(table, "tcp/23").contains("behind: 6.6 GB &#x2f; 11 d"),
+        "{table}"
+    );
+    assert!(
+        !listener_row(table, "tcp/22").contains("behind:"),
+        "{table}"
+    );
 }
 
 #[sqlx::test(migrations = false)]

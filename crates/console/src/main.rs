@@ -351,6 +351,7 @@ async fn main() {
         trusted_proxy: config.trusted_proxy,
         metrics_token: config.metrics_token.map(Arc::from),
         gave_up_subsystems: console::no_subsystem_health(),
+        intake_lag: console::intake_lag::no_intake_lag(),
     };
 
     tracing::info!(bind = %bind_addr, "console: starting");

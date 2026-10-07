@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Process and service topology
@@ -144,8 +144,12 @@ handle are shared into the ops-monitor; the `LogBuffer` is shared tracing -> con
 ### Shutdown
 
 When `shutdown_signal()` (`crates/propolis/src/main.rs#shutdown_signal`) resolves on SIGINT/SIGTERM, `main` calls
-`cancel.cancel()`, awaits all handles with a `SHUTDOWN_TIMEOUT` of 30 s, then closes the
-pool. (`crates/propolis/src/main.rs#main`, `crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`)
+`cancel.cancel()` and awaits all named handles with a `SHUTDOWN_TIMEOUT` of 30 s. Any
+subsystem still running is aborted, named in a warning, and given 2 s to unwind; the pool
+close is then bounded at 5 s, so a stop takes at most 37 s. See
+[service lifecycle](../operations/service-lifecycle.md#stop-and-graceful-shutdown).
+(`crates/propolis/src/main.rs#main`, `crates/propolis/src/main.rs#drain_subsystems`,
+`crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`)
 
 ## Feed publishing
 

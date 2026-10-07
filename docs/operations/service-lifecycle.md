@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-06
+last-verified: 2026-10-07
 -->
 
 # Service lifecycle
@@ -109,11 +109,29 @@ Stopping a unit sends SIGTERM (SIGINT on Ctrl-C); the daemon treats both as a cl
 shutdown request (`crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`, `crates/propolis/src/main.rs#shutdown_signal`, `crates/propolis/src/main.rs#main`):
 
 1. cancel all subsystems;
-2. await their task handles, bounded by a **30 s `SHUTDOWN_TIMEOUT`**
-   (`crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`), then log a warning and stop waiting if any handle has not finished;
-3. `pool.close()`.
+2. await their task handles concurrently (`crates/propolis/src/main.rs#drain_subsystems`), bounded by a **30 s
+   `SHUTDOWN_TIMEOUT`** (`crates/propolis/src/main.rs#SHUTDOWN_TIMEOUT`);
+3. **abort** any subsystem still running after that and give it up to **2 s** to unwind
+   (`crates/propolis/src/main.rs#ABORT_WAIT`). Aborting a supervised subsystem also aborts the task
+   underneath it (`crates/propolis/src/supervisor.rs#spawn_supervised`), so its pooled database
+   connection is released;
+4. `pool.close()`, bounded by **5 s** (`crates/propolis/src/main.rs#POOL_CLOSE_TIMEOUT`); if it times out the
+   daemon logs a warning and exits with connections open.
 
-A clean stop exits 0.
+The stop is therefore bounded at **37 s** in the worst case (30 + 2 + 5,
+`crates/propolis/src/main.rs#WORST_CASE_STOP`), well inside systemd's default 90 s stop timeout; the unit
+sets no `TimeoutStopSec`, so that default applies. A build-time assertion keeps the sum under it.
+A normal stop finishes as soon as every subsystem has returned, usually in well under a second.
+
+When a subsystem had to be aborted, the journal names it in one warning:
+
+```
+propolis: shutdown timed out waiting for: <name>[, <name>...]; aborted
+```
+
+The names are the subsystem names used in the supervisor's own log lines (a sensor's configured
+name, `listener-probe`, `review`, `feed`, `virustotal`, `sample-retention`, `fetcher`, `console`,
+`ops-monitor`). Per-subsystem completion is logged at debug. A clean stop exits 0.
 
 ## Restart policy
 

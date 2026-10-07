@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-05
+last-verified: 2026-10-07
 -->
 
 # Safe teardown
@@ -23,7 +23,8 @@ sudo systemctl stop propolis.service
 ```
 
 The daemon shuts down gracefully on `SIGTERM`: it cancels its subsystems, waits up to
-30 seconds for in-flight work, then exits and closes the database pool. Ctrl-C does the
+30 seconds for in-flight work, aborts anything still running, and closes the database pool
+(at most 37 seconds in total). Ctrl-C does the
 same for an evaluation run.
 
 ## 2. Keep them stopped

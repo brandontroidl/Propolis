@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use config::SensorLogConfig;
 use ops_alert::condition::{IntakeProgress, SensorIntake, SupervisorHandle};
 use ops_alert::conditions::intake::progress_from_batch;
-use supervisor::spawn_supervised;
+use supervisor::spawn_supervised_named;
 
 use console::AppState;
 use console::auth::{PasswordStore, RateLimiter, SessionStore};
@@ -116,6 +116,22 @@ fn own_ips_lack_a_public_address(own_ips: &HashSet<IpAddr>) -> bool {
 }
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an aborted subsystem gets to unwind (drop its pooled connection) before shutdown moves on.
+const ABORT_WAIT: Duration = Duration::from_secs(2);
+
+/// Bound on `pool.close()`, which otherwise waits for every checked-out connection to come back.
+const POOL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// systemd's default `TimeoutStopSec` (`DefaultTimeoutStopSec`); the unit sets none. Past it the
+/// manager SIGKILLs the daemon, so the whole stop path must finish well inside it.
+const SYSTEMD_DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Worst-case stop: subsystem grace, abort unwind, pool close.
+const WORST_CASE_STOP: Duration = SHUTDOWN_TIMEOUT
+    .saturating_add(ABORT_WAIT)
+    .saturating_add(POOL_CLOSE_TIMEOUT);
+const _: () = assert!(WORST_CASE_STOP.as_secs() * 2 <= SYSTEMD_DEFAULT_STOP_TIMEOUT.as_secs());
 
 /// How long the console waits for open connections to finish on shutdown. Must stay below
 /// `SHUTDOWN_TIMEOUT`: the live log stream never ends on its own, so an unbounded wait for it
@@ -1029,7 +1045,7 @@ async fn main() {
     tracing::info!("propolis: starting unified daemon");
 
     let cancel = CancellationToken::new();
-    let mut handles = Vec::new();
+    let mut handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
 
     let events_ingested = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let events_rejected = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1059,7 +1075,7 @@ async fn main() {
         let progress = intake_progress.clone();
         let sensor_probe_sources = probe_sources.clone();
 
-        handles.push(spawn_supervised(
+        handles.push(spawn_supervised_named(
             sensor_name,
             cancel.clone(),
             supervisor_state.clone(),
@@ -1112,7 +1128,7 @@ async fn main() {
             interval: config.fleet_probe_interval,
             timeout: config.fleet_probe_timeout,
         };
-        handles.push(spawn_supervised(
+        handles.push(spawn_supervised_named(
             "listener-probe",
             cancel.clone(),
             supervisor_state.clone(),
@@ -1136,7 +1152,7 @@ async fn main() {
         let submit_interval = config.submit_poll_interval;
         let vendors = config.vendors.clone();
 
-        handles.push(spawn_supervised(
+        handles.push(spawn_supervised_named(
             "review",
             cancel.clone(),
             supervisor_state.clone(),
@@ -1223,7 +1239,7 @@ async fn main() {
         let output_dir = config.feed_output_dir.clone();
         let build_interval = config.feed_build_interval;
 
-        handles.push(spawn_supervised(
+        handles.push(spawn_supervised_named(
             "feed",
             cancel.clone(),
             supervisor_state.clone(),
@@ -1261,7 +1277,7 @@ async fn main() {
             pending_recheck_secs: config.vt_pending_recheck_secs,
         };
 
-        handles.push(spawn_supervised(
+        handles.push(spawn_supervised_named(
             "virustotal",
             cancel.clone(),
             supervisor_state.clone(),
@@ -1297,7 +1313,7 @@ async fn main() {
     // its spools were bounded only by the byte budgets, which then refused NEW evidence once old
     // samples had filled them. Retention is not a scanning concern; it runs whether or not any
     // analysis is configured.
-    handles.push(spawn_supervised(
+    handles.push(spawn_supervised_named(
         "sample-retention",
         cancel.clone(),
         supervisor_state.clone(),
@@ -1332,7 +1348,7 @@ async fn main() {
         let fetch_read_timeout = config.fetch_read_timeout;
         let fetch_total_timeout = config.fetch_total_timeout;
 
-        handles.push(spawn_supervised(
+        handles.push(spawn_supervised_named(
             "fetcher",
             cancel.clone(),
             supervisor_state.clone(),
@@ -1472,7 +1488,7 @@ async fn main() {
         let rej = events_rejected.clone();
         let console_supervisor = supervisor_state.clone();
 
-        handles.push(spawn_supervised(
+        handles.push(spawn_supervised_named(
             "console",
             cancel.clone(),
             supervisor_state.clone(),
@@ -1537,7 +1553,7 @@ async fn main() {
             ops_alert::conditions::feed::push_marker_path(&config.feed_output_dir);
         let feed_build_interval = config.feed_build_interval;
 
-        handles.push(spawn_supervised(
+        handles.push(spawn_supervised_named(
             "ops-monitor",
             cancel.clone(),
             supervisor_state.clone(),
@@ -1629,25 +1645,182 @@ async fn main() {
     // 12. Cancel all subsystems.
     cancel.cancel();
 
-    // 13. Await all handles with timeout.
-    let shutdown = async {
-        for handle in handles {
-            let _ = handle.await;
-        }
-    };
+    // 13. Drain the subsystems within the budget; abort and name any that did not stop.
+    drain_subsystems(handles, SHUTDOWN_TIMEOUT).await;
 
-    if tokio::time::timeout(SHUTDOWN_TIMEOUT, shutdown)
+    // Aborted tasks have released their connections, so this normally returns at once; the bound
+    // is for a task stuck in synchronous code, which an abort cannot interrupt.
+    if tokio::time::timeout(POOL_CLOSE_TIMEOUT, pool.close())
         .await
         .is_err()
     {
         tracing::warn!(
-            timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
-            "propolis: shutdown timed out; exiting"
+            timeout_secs = POOL_CLOSE_TIMEOUT.as_secs(),
+            "propolis: database pool did not close in time; exiting with connections open"
+        );
+    }
+    tracing::info!("propolis: shutdown complete");
+}
+
+/// Awaits every subsystem handle concurrently for up to `budget`. Any still running after that is
+/// aborted (a task that ignores cancellation would otherwise keep its pooled connection and wedge
+/// `pool.close()`), given `ABORT_WAIT` to unwind, and its name returned.
+async fn drain_subsystems(
+    handles: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+    budget: Duration,
+) -> Vec<&'static str> {
+    let names: Vec<&'static str> = handles.iter().map(|(name, _)| *name).collect();
+    let aborts: Vec<_> = handles.iter().map(|(_, h)| h.abort_handle()).collect();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    for (index, (_, handle)) in handles.into_iter().enumerate() {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = handle.await;
+            let _ = tx.send(index);
+        });
+    }
+    drop(tx);
+
+    let mut running = vec![true; names.len()];
+    collect_stopped(&mut rx, &mut running, &names, budget).await;
+
+    let stragglers: Vec<usize> = (0..names.len()).filter(|i| running[*i]).collect();
+    if stragglers.is_empty() {
+        return Vec::new();
+    }
+    let straggler_names: Vec<&'static str> = stragglers.iter().map(|i| names[*i]).collect();
+    tracing::warn!(
+        timeout_secs = budget.as_secs(),
+        "propolis: shutdown timed out waiting for: {}; aborted",
+        straggler_names.join(", ")
+    );
+    for &i in &stragglers {
+        aborts[i].abort();
+    }
+    collect_stopped(&mut rx, &mut running, &names, ABORT_WAIT).await;
+    straggler_names
+}
+
+/// Marks subsystems stopped as their completion indices arrive, until all are done, the channel
+/// closes, or `wait` elapses.
+async fn collect_stopped(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>,
+    running: &mut [bool],
+    names: &[&'static str],
+    wait: Duration,
+) {
+    let _ = tokio::time::timeout(wait, async {
+        while running.iter().any(|r| *r) {
+            let Some(index) = rx.recv().await else { break };
+            running[index] = false;
+            tracing::debug!(subsystem = names[index], "propolis: subsystem stopped");
+        }
+    })
+    .await;
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::task::JoinHandle;
+
+    fn obeys(token: &CancellationToken) -> JoinHandle<()> {
+        let token = token.clone();
+        tokio::spawn(async move { token.cancelled().await })
+    }
+
+    /// Ignores cancellation; flips `dropped` when its future is dropped (the abort).
+    fn ignores_cancellation(dropped: Arc<AtomicBool>) -> JoinHandle<()> {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        tokio::spawn(async move {
+            let _flag = Flag(dropped);
+            std::future::pending::<()>().await;
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subsystem_that_ignores_cancellation_is_aborted_and_named() {
+        let token = CancellationToken::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let handles = vec![
+            ("good-a", obeys(&token)),
+            ("stuck", ignores_cancellation(dropped.clone())),
+            ("good-b", obeys(&token)),
+        ];
+        token.cancel();
+        // A regression that waits forever fails here instead of hanging the suite.
+        let stragglers =
+            tokio::time::timeout(WORST_CASE_STOP, drain_subsystems(handles, SHUTDOWN_TIMEOUT))
+                .await
+                .expect("drain must finish within the stop budget");
+        assert_eq!(stragglers, vec!["stuck"]);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the straggler was aborted, not left running"
         );
     }
 
-    pool.close().await;
-    tracing::info!("propolis: shutdown complete");
+    #[tokio::test(start_paused = true)]
+    async fn well_behaved_subsystems_are_all_awaited_and_not_reported() {
+        let token = CancellationToken::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let slow_done = finished.clone();
+        let slow_token = token.clone();
+        let slow = tokio::spawn(async move {
+            slow_token.cancelled().await;
+            // Slower than the others but inside the budget: must be awaited, not aborted.
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            slow_done.store(true, Ordering::SeqCst);
+        });
+        let handles = vec![("a", obeys(&token)), ("slow", slow), ("b", obeys(&token))];
+        token.cancel();
+        let stragglers = drain_subsystems(handles, SHUTDOWN_TIMEOUT).await;
+        assert!(stragglers.is_empty(), "{stragglers:?}");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the slow subsystem ran to completion"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_returns_promptly_when_everything_finishes_early() {
+        let token = CancellationToken::new();
+        let handles = vec![("a", obeys(&token)), ("b", obeys(&token))];
+        token.cancel();
+        let started = tokio::time::Instant::now();
+        let stragglers = drain_subsystems(handles, SHUTDOWN_TIMEOUT).await;
+        assert!(stragglers.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "drain waited {:?} for subsystems that had already stopped",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_set_drains_immediately() {
+        assert!(
+            drain_subsystems(Vec::new(), SHUTDOWN_TIMEOUT)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// The end-to-end stop budget must leave room under systemd's default stop timeout. The const
+    /// assertion next to `WORST_CASE_STOP` enforces it at build time; this pins the intent and the
+    /// console grace ordering.
+    #[test]
+    fn worst_case_stop_fits_inside_the_systemd_default() {
+        assert_eq!(WORST_CASE_STOP, Duration::from_secs(37));
+        assert!(WORST_CASE_STOP < SYSTEMD_DEFAULT_STOP_TIMEOUT);
+        assert!(CONSOLE_SHUTDOWN_GRACE < SHUTDOWN_TIMEOUT);
+    }
 }
 
 #[cfg(test)]

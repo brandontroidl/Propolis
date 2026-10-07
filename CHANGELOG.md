@@ -271,6 +271,17 @@
 
 ### Fixed
 
+- **`propolis` stops in at most 37 s, and the journal names a subsystem that would not stop** -
+  after the shutdown signal the daemon waited 30 s for its subsystems, logged "shutdown timed
+  out", then called `pool.close()`, which waits for every checked-out connection to be returned.
+  A subsystem that ignored cancellation was never aborted (and aborting the supervisor task
+  would have left the task under it running), so it kept its connection, `pool.close()` never
+  returned, and `systemctl restart propolis` (and so `deploy/upgrade.sh`) sat until systemd's 90 s
+  stop timeout SIGKILLed the process. Shutdown now aborts every subsystem still running after
+  the 30 s grace (including the task beneath a supervised subsystem and the children of a
+  supervised group), allows 2 s for them to unwind, bounds `pool.close()` at 5 s, and logs
+  `propolis: shutdown timed out waiting for: <names>; aborted`. A build-time assertion keeps the
+  total under systemd's default stop timeout.
 - **`deploy/sensor.env.example` lists the real `sensor-catchall` defaults** - the example block
   showed the shell sensors' bounds (30000 ms read, 60000 ms idle, 600 s duration, 1000000 bytes)
   and the deprecated bare `CATCHALL_MAX_CONCURRENT` name. The sensor's compiled defaults are 5000

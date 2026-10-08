@@ -133,12 +133,19 @@ shell over ADB and carries busybox and `su`.
 `fakefs.rs` is an in-memory static snapshot, fresh per session, with no real
 filesystem underneath, so path traversal is structurally impossible
 (`crates/sensor-framework/src/fakefs.rs`). It serves canned `/etc/hostname`,
-`/etc/passwd` (9 accounts incl. root, `ubuntu` uid 1000, `www-data`, `sshd`),
-`/etc/hosts` (loopback and IPv6 multicast only - no routable IPs), `/etc/os-release`,
-`/proc/version`, `/proc/cpuinfo` (Intel Xeon E5-2686 v4, 1 core), and one mount table
+`/etc/passwd` and `/etc/group` (a stock 22.04 cloud image's system accounts plus `ubuntu`
+uid 1000 and `lxd`, `crates/sensor-framework/src/etc.rs#PASSWD`), `/etc/shadow` and
+`/etc/gshadow` (mode 0640, group `shadow`; root's yescrypt-shaped hash is random per process
+and hashes no password, `crates/sensor-framework/src/etc.rs#root_password_hash`),
+`/etc/hosts` (loopback and IPv6 multicast only - no routable IPs), `/etc/os-release` (a link
+to `../usr/lib/os-release`, as on 22.04), the installer's static netplan file
+(`/etc/netplan/00-installer-config.yaml`, RFC 1918 address), `/etc/default/locale`, root's
+`.bashrc` and `.profile` (the stock ones), `/proc/version`, `/proc/cpuinfo` (Intel Xeon
+E5-2686 v4, 1 core, every field a real one lists), `/proc/meminfo`, and one mount table
 behind `/proc/mounts`, `/proc/self/mounts`, `/etc/mtab`, `/proc/self/mountinfo` and the
-shell's `mount` (a stock Ubuntu cloud image on `/dev/sda1`; every mount point it names is
-a directory the shell will enter). Directories include `/`, `/tmp`, `/root`, `/etc`,
+shell's `mount` (a stock Ubuntu cloud image on `/dev/root`, the Xen disk `xvda`; every mount
+point it names is a directory the shell will enter). A file the session writes carries the
+session clock's time, so `ls -l` dates it now. Directories include `/`, `/tmp`, `/root`, `/etc`,
 `/home/ubuntu`, the loader-probed `/var/run`, `/mnt`, `/usr`, `/dev`, `/dev/shm`, and the
 `/sys`, `/run` and `/boot` subtrees the mount table names. The Ubuntu persona has the 73
 executables recorded from a real Ubuntu 22.04 (`/bin/busybox`, `/bin/ls`, `/bin/echo`,
@@ -285,7 +292,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   glibc-compatible conversions, `getline` and output redirection; `system()`, `cmd | getline` and `print | cmd` run their text
   through this shell's own evaluator; mawk's number output, usage text and error wordings,
   `crates/sensor-framework/src/shell/awk.rs#FakeShell::cmd_awk`, `crates/sensor-framework/src/shell/cfmt.rs`),
-  `ls` (sorted, dotfiles hidden without `-a`, which does not add `.` and `..`; a file operand lists
+  `ls` (sorted, dotfiles hidden without `-a`, which lists `.` and `..` first where `-A` does not;
+  one name a line when standard output is no terminal, as over SSH exec or into a pipe; a file operand lists
   itself, files before directories, a `DIR:` heading once there are several operands, a missing
   one is `cannot access` with status 2; `-l` is GNU's long listing from the node facts `stat` prints,
   so a size or mode cannot disagree with `stat`, `wc -c` or `md5sum`, `crates/sensor-framework/src/shell/fileinfo.rs#FakeShell::cmd_ls`),

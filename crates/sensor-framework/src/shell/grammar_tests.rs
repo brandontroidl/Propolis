@@ -402,7 +402,8 @@ mod redirection {
             run(&mut sh, "x='a b'; echo hi > $x"),
             "-bash: $x: ambiguous redirect\n"
         );
-        assert_eq!(run(&mut sh, "ls -a"), "");
+        // Nothing was created: `ls -a` lists only the directory and its parent.
+        assert_eq!(run(&mut sh, "ls -a"), ".  ..\n");
         assert_eq!(run(&mut sh, "echo hi > \"$x\"; ls"), "a b\n");
         assert_eq!(run(&mut sh, "echo hi > *.q_none"), "");
         assert_eq!(run(&mut sh, "ls"), "*.q_none  a b\n");
@@ -1137,8 +1138,9 @@ mod shell_levels {
             run(&mut sh, &format!("cat /proc/{pid}/mounts")),
             run(&mut sh, "cat /proc/self/mounts")
         );
-        // A pid outside the process table is no process (pid 1 is init, a row of it).
-        assert!(run(&mut sh, "cat /proc/4/cmdline").contains("No such file"));
+        // A pid outside the process table is no process (pid 1 is init, a row of it; 7 is no
+        // kernel thread of the modeled kernel).
+        assert!(run(&mut sh, "cat /proc/7/cmdline").contains("No such file"));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! `env` and `printenv` through `handle_input`. The variables they print are the session's own, so
 //! the expectations are compared with `export`, `$HOME` and a nested shell rather than with a
-//! second copy of the persona's values. Ordering is by name on purpose: GNU prints in process
-//! environment order, and the replay harness compares bytes. The wording of the error lines is
-//! coreutils 8.32 and toybox as remembered, not captured, and the cases that pin it say so.
+//! second copy of the persona's values. The order is bash's environment order, the buckets of its
+//! variable hash table, recorded on Ubuntu 22.04 (2026-10-07); it is a function of the names, so
+//! a replay is still byte-stable. The wording of the error lines is coreutils 8.32 and toybox as
+//! remembered, not captured, and the cases that pin it say so.
 
 use super::{CommandResult, EmitContext, FakeShell, HandlerId, OutputFd};
 use crate::fakefs::FakeFs;
@@ -56,14 +57,50 @@ fn names(listing: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The names of a real SSH session's `env`, in the order the reference printed them.
+const RECORDED_ORDER: [&str; 20] = [
+    "SHELL",
+    "PWD",
+    "LOGNAME",
+    "XDG_SESSION_TYPE",
+    "MOTD_SHOWN",
+    "HOME",
+    "LANG",
+    "LS_COLORS",
+    "SSH_CONNECTION",
+    "LESSCLOSE",
+    "XDG_SESSION_CLASS",
+    "TERM",
+    "LESSOPEN",
+    "USER",
+    "SHLVL",
+    "XDG_SESSION_ID",
+    "XDG_RUNTIME_DIR",
+    "SSH_CLIENT",
+    "PATH",
+    "SSH_TTY",
+];
+
+/// `found` lists the recorded names it holds in the recorded order, and ends with `_`.
+fn in_recorded_order(found: &[&str]) -> bool {
+    let known: Vec<&&str> = found
+        .iter()
+        .filter(|name| RECORDED_ORDER.contains(name))
+        .collect();
+    let positions: Vec<usize> = known
+        .iter()
+        .map(|name| RECORDED_ORDER.iter().position(|r| *r == **name).unwrap())
+        .collect();
+    positions.windows(2).all(|w| w[0] < w[1]) && found.last() == Some(&"_")
+}
+
 #[test]
-fn env_lists_the_exported_variables_sorted_by_name() {
+fn env_lists_the_exported_variables_in_bash_order() {
     let mut sh = shell();
     let listing = out(&mut sh, "env");
     let found = names(&listing);
-    let mut sorted = found.clone();
-    sorted.sort_unstable();
-    assert_eq!(found, sorted, "{listing}");
+    assert!(in_recorded_order(&found), "{found:?}");
+    assert!(listing.ends_with("_=/usr/bin/env\n"), "{listing}");
     for expected in [
         "HOME=/root\n",
         "USER=root\n",
@@ -81,19 +118,71 @@ fn env_lists_the_exported_variables_sorted_by_name() {
 }
 
 #[test]
-fn the_order_is_by_name_whatever_order_the_variables_were_set_in() {
-    let mut sh = shell();
-    sh.handle_input("export Zed=1; export alpha=2; export Mid=3; export _x=4");
-    let listing = out(&mut sh, "env");
+fn the_order_depends_on_the_names_not_the_order_they_were_set_in() {
+    let mut first = shell();
+    first.handle_input("export Zed=1; export alpha=2; export Mid=3; export _x=4");
+    let mut second = shell();
+    second.handle_input("export _x=4; export Mid=3; export alpha=2; export Zed=1");
+    let listing = out(&mut first, "env");
+    assert_eq!(listing, out(&mut second, "env"));
+    assert!(in_recorded_order(&names(&listing)), "{listing}");
+}
+
+/// The recorded SSH sessions' variables, exec and interactive: what `pam_env`, `pam_systemd`,
+/// `pam_motd` and sshd set, `SHLVL` as each shell exports it, and no `MAIL`.
+#[test]
+fn an_ssh_session_has_the_login_variables_of_the_reference() {
+    let ssh = EmitContext {
+        protocol_label: "ssh".to_string(),
+        ..ctx()
+    };
+    let mut exec = FakeShell::exec(FakeFs::new(), ssh.clone());
+    let listing = out(&mut exec, "env");
     let found = names(&listing);
-    let position = |name: &str| found.iter().position(|n| *n == name).unwrap();
-    // Bytewise: upper case before `_` before lower case.
-    assert!(position("Mid") < position("Zed"));
-    assert!(position("Zed") < position("_x"));
-    assert!(position("_x") < position("alpha"));
-    let mut sorted = found.clone();
-    sorted.sort_unstable();
-    assert_eq!(found, sorted);
+    for name in [
+        "SHELL",
+        "PWD",
+        "LOGNAME",
+        "XDG_SESSION_TYPE",
+        "MOTD_SHOWN",
+        "HOME",
+        "LANG",
+        "SSH_CONNECTION",
+        "XDG_SESSION_CLASS",
+        "USER",
+        "SHLVL",
+        "XDG_SESSION_ID",
+        "XDG_RUNTIME_DIR",
+        "SSH_CLIENT",
+        "PATH",
+        "_",
+    ] {
+        assert!(found.contains(&name), "{name} in {listing}");
+    }
+    for absent in ["MAIL", "TERM", "SSH_TTY", "LS_COLORS"] {
+        assert!(!found.contains(&absent), "{absent} in {listing}");
+    }
+    assert!(in_recorded_order(&found), "{found:?}");
+    assert!(listing.contains("LANG=C.UTF-8\n") && listing.contains("MOTD_SHOWN=pam\n"));
+    // bash -c exports SHLVL one lower to what it execs; the shell's own is 1.
+    assert!(listing.contains("SHLVL=0\n"), "{listing}");
+    assert_eq!(out(&mut exec, "echo $SHLVL"), "1\n");
+    assert_eq!(out(&mut exec, "printenv SHLVL"), "0\n");
+    // The client half is the session's peer, the server half the persona's address.
+    let client = out(&mut exec, "printenv SSH_CLIENT");
+    let connection = out(&mut exec, "printenv SSH_CONNECTION");
+    let port = client.split(' ').nth(1).unwrap().to_string();
+    assert_eq!(client, format!("203.0.113.7 {port} 22\n"));
+    assert_eq!(connection, format!("203.0.113.7 {port} 172.31.16.42 22\n"));
+
+    let mut login = FakeShell::new(FakeFs::new(), ssh);
+    let listing = out(&mut login, "env");
+    let found = names(&listing);
+    for name in ["TERM", "SSH_TTY", "LS_COLORS", "LESSOPEN", "LESSCLOSE"] {
+        assert!(found.contains(&name), "{name} in {listing}");
+    }
+    assert!(listing.contains("SHLVL=1\n") && !found.contains(&"MAIL"));
+    assert!(in_recorded_order(&found), "{found:?}");
 }
 
 #[test]
@@ -109,7 +198,11 @@ fn the_output_is_byte_stable_across_runs_and_shells() {
     let printenv = out(&mut first, "printenv");
     assert_eq!(printenv, out(&mut first, "printenv"));
     assert_eq!(printenv, out(&mut second, "printenv"));
-    assert_eq!(env, printenv, "no operand: the two print the same list");
+    // No operand: the two print the same list, each with its own path as `_`.
+    assert_eq!(
+        env.replace("_=/usr/bin/env", "_=/usr/bin/printenv"),
+        printenv
+    );
 }
 
 #[test]
@@ -192,12 +285,17 @@ fn an_assignment_is_the_commands_environment_and_does_not_leak() {
 fn assignments_without_a_command_print_the_edited_environment_and_leave_the_session_alone() {
     let mut sh = shell();
     let listing = out(&mut sh, "env ZZ=1 AA=2");
-    assert!(listing.contains("AA=2\n") && listing.contains("ZZ=1\n"));
     assert!(listing.contains("HOME=/root\n"));
+    // setenv(3) appends a new name, so env's own additions follow what it inherited, in the
+    // order given; a name it inherited is replaced in place.
+    assert!(
+        listing.ends_with("_=/usr/bin/env\nZZ=1\nAA=2\n"),
+        "{listing}"
+    );
     let found = names(&listing);
-    let mut sorted = found.clone();
-    sorted.sort_unstable();
-    assert_eq!(found, sorted);
+    assert!(in_recorded_order(&found[..found.len() - 2]), "{listing}");
+    let replaced = out(&mut sh, "env HOME=/x");
+    assert!(replaced.contains("HOME=/x\n") && replaced.ends_with("_=/usr/bin/env\n"));
     assert_eq!(answer(&mut sh, "printenv AA").2, 1);
     assert_eq!(answer(&mut sh, "printenv ZZ").2, 1);
 }
@@ -214,7 +312,7 @@ fn dash_i_starts_from_an_empty_environment() {
     assert_eq!(out(&mut sh, "env - FOO=1"), "FOO=1\n");
     assert_eq!(
         out(&mut sh, "env --ignore-environment FOO=1 BAR=2"),
-        "BAR=2\nFOO=1\n"
+        "FOO=1\nBAR=2\n"
     );
     // The session's own environment is untouched afterwards.
     assert_eq!(out(&mut sh, "printenv HOME"), "/root\n");

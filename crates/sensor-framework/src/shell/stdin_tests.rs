@@ -17,6 +17,14 @@ fn ctx() -> EmitContext {
     }
 }
 
+/// Whether an `ls -l` row dates its file in the recent form (`Oct  7 12:00`, a time of day where an
+/// old file shows its year), as it does for a file the session wrote.
+fn recent_stamp(row: &str) -> bool {
+    row.split_whitespace()
+        .nth(7)
+        .is_some_and(|field| field.len() == 5 && field.as_bytes()[2] == b':')
+}
+
 /// One connection's filesystem, and an exec shell on it per channel, as sensor-ssh builds them.
 struct Connection {
     fs: FakeFs,
@@ -98,10 +106,15 @@ fn a_streamed_binary_lands_whole_and_every_reader_agrees_on_it() {
     );
     let (out, status) = conn.run("ls /dev/shm");
     assert_eq!((out.as_str(), status), ("astats\n", 0));
-    assert_eq!(
-        conn.run("test -f /dev/shm/astats && chmod +x /dev/shm/astats && ls -l /dev/shm/astats")
-            .0,
-        "-rwxr-xr-x 1 root root 70000 Jan  1  2024 /dev/shm/astats\n"
+    // The file was written just now, so ls shows the time of day rather than a year.
+    let listed = conn
+        .run("test -f /dev/shm/astats && chmod +x /dev/shm/astats && ls -l /dev/shm/astats")
+        .0;
+    assert!(
+        listed.starts_with("-rwxr-xr-x 1 root root 70000 ")
+            && listed.ends_with(" /dev/shm/astats\n")
+            && recent_stamp(&listed),
+        "{listed:?}"
     );
     // Nothing was ever run, so the bot's liveness check finds no process.
     assert_eq!(
@@ -305,7 +318,14 @@ fn ls_lists_a_file_operand_and_reports_a_missing_one() {
     );
     let (out, status) = conn.run("ls -l /tmp");
     assert_eq!(status, 0);
-    assert_eq!(out, "total 4\n-rw-r--r-- 1 root root 3 Jan  1  2024 one\n");
+    let (total, row) = out.split_once('\n').unwrap();
+    assert_eq!(total, "total 4");
+    assert!(
+        row.starts_with("-rw-r--r-- 1 root root 3 ")
+            && row.ends_with(" one\n")
+            && recent_stamp(row),
+        "{out:?}"
+    );
     let (out, _) = conn.run("ls /tmp/one /tmp");
     assert_eq!(out, "/tmp/one\n\n/tmp:\none\n");
 }

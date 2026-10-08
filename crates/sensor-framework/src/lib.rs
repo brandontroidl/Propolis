@@ -15,6 +15,7 @@ pub mod config;
 pub mod coverage;
 pub mod emit;
 pub mod env;
+pub mod etc;
 pub mod fakefs;
 pub mod handoff;
 pub mod held_input;

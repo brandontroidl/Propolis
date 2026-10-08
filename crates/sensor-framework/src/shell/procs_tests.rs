@@ -134,8 +134,12 @@ fn ps_aux_has_the_aux_column_shape() {
         assert!(fields[1].parse::<u32>().is_ok(), "pid: {line}");
         assert!(fields[2].contains('.') && fields[3].contains('.'), "{line}");
         assert!(fields[4].parse::<u64>().is_ok() && fields[5].parse::<u64>().is_ok());
-        assert!(fields[6] == "?" || fields[6].starts_with("pts/"), "{line}");
-        assert!(fields[7].starts_with(['S', 'R']), "{line}");
+        assert!(
+            ["?", "tty1", "ttyS0"].contains(&fields[6]) || fields[6].starts_with("pts/"),
+            "{line}"
+        );
+        // Sleeping, running, or an idle kernel worker.
+        assert!(fields[7].starts_with(['S', 'R', 'I']), "{line}");
         assert!(fields[9].contains(':'), "TIME is M:SS: {line}");
     }
     // The process listing itself, running, last.
@@ -197,15 +201,18 @@ fn a_bare_ps_and_ps_w_list_this_terminal_in_their_own_layouts() {
         row_of(&wide, &me),
         [me.as_str(), "pts/0", "Ss", "0:00", "-bash"]
     );
-    // `-e` and `-A` list every process in the short layout, `ax` in the BSD one.
+    // `-e` and `-A` list every process in the short layout, `ax` in the BSD one: as many rows
+    // as `ps aux` lists.
+    let every = rows(&out(&mut sh, "ps aux")).len();
+    assert!(every > 60, "kernel threads and daemons: {every}");
     for line in ["ps -e", "ps -A"] {
         let all = out(&mut sh, line);
         assert_eq!(all.lines().next(), bare.lines().next(), "{line}");
-        assert_eq!(rows(&all).len(), 6, "{line}: {all}");
+        assert_eq!(rows(&all).len(), every, "{line}: {all}");
     }
     let ax = out(&mut sh, "ps ax");
     assert_eq!(ax.lines().next(), wide.lines().next());
-    assert_eq!(rows(&ax).len(), 6, "{ax}");
+    assert_eq!(rows(&ax).len(), every, "{ax}");
 }
 
 #[test]
@@ -337,26 +344,31 @@ fn top_batch_prints_one_bounded_snapshot_of_the_table() {
             lines[0]
         );
         assert!(lines[0].contains(" load average: "), "{}", lines[0]);
-        // Tasks counts the rows below, `top` itself among them and running.
-        let table_rows = lines
+        // Tasks counts the rows below, `top` itself among them and running, and they are the
+        // processes `ps aux` lists (both list themselves).
+        let table: Vec<&str> = lines
             .iter()
             .skip_while(|l| !l.trim_start().starts_with("PID"))
             .skip(1)
-            .count();
-        assert_eq!(table_rows, 6, "{line}: {text}");
-        assert!(
-            lines[1].starts_with("Tasks:   6 total,   1 running,   5 sleeping"),
-            "{}",
-            lines[1]
+            .copied()
+            .collect();
+        assert_eq!(
+            lines[1],
+            format!(
+                "Tasks: {:>3} total,   1 running, {:>3} sleeping,   0 stopped,   0 zombie",
+                table.len(),
+                table.len() - 1
+            ),
+            "{line}"
         );
+        assert_eq!(table.len(), rows(&out(&mut sh, "ps aux")).len(), "{line}");
         assert!(lines[3].starts_with("MiB Mem :"), "{}", lines[3]);
         // One snapshot whatever -n asks: the header appears once.
         assert_eq!(text.matches("top - ").count(), 1, "{line}");
         assert!(row_of(&text, &me).contains(&"bash"), "{line}");
-        assert_eq!(
-            text.lines().last().unwrap().split_whitespace().last(),
-            Some("top")
-        );
+        // Sorted by %CPU: `top` itself, the one running, comes first (recorded).
+        assert_eq!(table[0].split_whitespace().last(), Some("top"), "{line}");
+        assert_eq!(table[0].split_whitespace().nth(7), Some("R"), "{line}");
     }
 }
 
@@ -422,11 +434,13 @@ fn the_shells_own_pid_node_equals_what_proc_self_gives_a_shell() {
 #[test]
 fn a_pid_outside_the_table_reads_as_absent() {
     let mut sh = shell();
+    // Pid 7 is no thread of the modeled kernel (the table skips it, as 5.15's does), and a kernel
+    // thread such as 2 has no working directory to read.
     for path in [
-        "/proc/4/cmdline",
-        "/proc/4/exe",
-        "/proc/4/status",
-        "/proc/4/comm",
+        "/proc/7/cmdline",
+        "/proc/7/exe",
+        "/proc/7/status",
+        "/proc/7/comm",
         "/proc/99999/stat",
         "/proc/2/cwd",
     ] {
@@ -438,8 +452,8 @@ fn a_pid_outside_the_table_reads_as_absent() {
             "{path}"
         );
     }
-    assert_eq!(answer(&mut sh, "ls /proc/4").2, 2);
-    assert_eq!(answer(&mut sh, "test -d /proc/4").2, 1);
+    assert_eq!(answer(&mut sh, "ls /proc/7").2, 2);
+    assert_eq!(answer(&mut sh, "test -d /proc/7").2, 1);
     assert_eq!(answer(&mut sh, "test -d /proc/1").2, 0);
     // The phone too.
     let mut phone = phone();
@@ -461,18 +475,24 @@ fn every_row_has_the_six_nodes_and_they_agree_with_ps() {
             format!("{comm}\n")
         );
         let cmdline = out(&mut sh, &format!("cat /proc/{pid}/cmdline"));
-        assert_eq!(
-            cmdline.trim_end_matches('\0').replace('\0', " "),
-            fields[3..].join(" "),
-            "pid {pid}"
-        );
-        // stat: pid (comm) S ppid ...
+        // A kernel thread has no argument vector: ps shows `[comm]` and its cmdline is empty.
+        let kernel = fields.get(3).is_some_and(|args| args.starts_with('['));
+        if kernel {
+            assert_eq!(cmdline, "", "pid {pid}");
+        } else {
+            assert_eq!(
+                cmdline.trim_end_matches('\0').replace('\0', " "),
+                fields[3..].join(" "),
+                "pid {pid}"
+            );
+        }
+        // stat: pid (comm) S ppid ... A comm with a space would split; none here has one.
         let stat = out(&mut sh, &format!("cat /proc/{pid}/stat"));
         let stat_fields: Vec<&str> = stat.split_whitespace().collect();
         assert_eq!(stat_fields.len(), 52, "pid {pid}: {stat}");
         assert_eq!(stat_fields[0], pid);
         assert_eq!(stat_fields[1], format!("({comm})"));
-        assert!(matches!(stat_fields[2], "S" | "R"));
+        assert!(matches!(stat_fields[2], "S" | "R" | "I"));
         assert_eq!(stat_fields[3], ppid);
         let status = out(&mut sh, &format!("cat /proc/{pid}/status"));
         let field = |name: &str| -> String {
@@ -487,10 +507,20 @@ fn every_row_has_the_six_nodes_and_they_agree_with_ps() {
         assert_eq!(field("Pid"), pid);
         assert_eq!(field("Tgid"), pid);
         assert_eq!(field("PPid"), ppid);
-        assert_eq!(field("Uid"), "0\t0\t0\t0");
+        // The owner `ps` shows is the one the node carries.
+        let uid = out(&mut sh, &format!("ps -o uid= -p {pid}"))
+            .trim()
+            .to_string();
+        assert_eq!(
+            field("Uid"),
+            format!("{uid}\t{uid}\t{uid}\t{uid}"),
+            "pid {pid}"
+        );
         assert!(field("State").starts_with(stat_fields[2]));
-        assert!(!out(&mut sh, &format!("readlink /proc/{pid}/exe")).is_empty());
-        assert!(!out(&mut sh, &format!("readlink /proc/{pid}/cwd")).is_empty());
+        if !kernel {
+            assert!(!out(&mut sh, &format!("readlink /proc/{pid}/exe")).is_empty());
+            assert!(!out(&mut sh, &format!("readlink /proc/{pid}/cwd")).is_empty());
+        }
         // The VM figures ps prints are the ones the node carries.
         let ps = out(&mut sh, &format!("ps -o vsz=,rss= -p {pid}"));
         let ps_fields: Vec<&str> = ps.split_whitespace().collect();
@@ -508,8 +538,17 @@ fn the_directory_lists_the_nodes_and_proc_lists_the_pids() {
         "cmdline  comm  cwd  exe  mountinfo  mounts  stat  status\n"
     );
     let listing = out(&mut sh, "ls /proc");
-    // `/proc/net` is a directory of the same set, not a process.
-    let mut found: Vec<&str> = listing.split_whitespace().filter(|n| *n != "net").collect();
+    // The kernel's own files and `/proc/net` sit beside the pid directories.
+    for name in ["cpuinfo", "loadavg", "meminfo", "net", "uptime", "version"] {
+        assert!(
+            listing.split_whitespace().any(|n| n == name),
+            "{name}: {listing}"
+        );
+    }
+    let mut found: Vec<&str> = listing
+        .split_whitespace()
+        .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+        .collect();
     found.sort_unstable();
     let ps = out(&mut sh, "ps -eo pid=");
     let mut want: Vec<&str> = ps.split_whitespace().collect();
@@ -644,9 +683,11 @@ fn pgrep_and_pidof_name_the_modeled_processes() {
         answer(&mut sh, "pgrep cron"),
         ("641\n".into(), "".into(), 0)
     );
+    // init, and the session's user manager (`systemd --user`), which pam_systemd started.
+    let manager: u32 = me.parse::<u32>().unwrap() - 4;
     assert_eq!(
         answer(&mut sh, "pgrep -x systemd"),
-        ("1\n".into(), "".into(), 0)
+        (format!("1\n{manager}\n"), "".into(), 0)
     );
     assert_eq!(out(&mut sh, "pgrep bash"), format!("{me}\n"));
     // Two sshd rows: the listener first by pid, the session's child after.
@@ -735,14 +776,20 @@ fn the_pattern_engine_reads_the_regular_expressions_scripts_write() {
         ("c\\.on", false),
         ("CRON", false),
     ] {
-        let plain = answer(&mut sh, &format!("pgrep '{pattern}'")).0 == "641\n";
+        // Other names may match too (`cr` is in `ecryptfs-kthrea`); the question is cron's.
+        let plain = answer(&mut sh, &format!("pgrep '{pattern}'"))
+            .0
+            .lines()
+            .any(|pid| pid == "641");
         assert_eq!(plain, matches, "pgrep '{pattern}'");
     }
     assert_eq!(out(&mut sh, "pgrep -i CRON"), "641\n");
     assert_eq!(out(&mut sh, "pgrep -x cron"), "641\n");
+    // Every row of the table (what `ps -e` lists less itself) but cron.
+    let table = rows(&out(&mut sh, "ps -e")).len() - 1;
     assert_eq!(
         answer(&mut sh, "pgrep -v -x cron | wc -l").0,
-        "4\n",
+        format!("{}\n", table - 1),
         "every row but cron"
     );
 }
@@ -1033,9 +1080,11 @@ fn the_enumerate_and_clear_sequence_finds_nothing_to_kill() {
         &mut sh,
         "for p in /proc/[0-9]*; do kill -0 $(basename $p) && echo $(basename $p); done",
     );
+    // Every row of the table: what `ps -e` lists, less `ps` itself.
+    let table = rows(&out(&mut sh, "ps -e")).len() - 1;
     assert_eq!(
         counted.lines().count(),
-        5,
+        table,
         "every pid the glob names is a live target: {counted}"
     );
     assert_eq!(
@@ -1052,13 +1101,28 @@ fn each_persona_has_its_own_rows_and_the_commands_it_ships() {
     // Ubuntu over SSH.
     let mut ssh = shell();
     let me = pid_of_shell(&mut ssh);
-    assert_eq!(
-        out(&mut ssh, "pgrep -l .")
-            .lines()
-            .map(|l| l.split_once(' ').unwrap().1)
-            .collect::<Vec<_>>(),
-        ["systemd", "cron", "sshd", "sshd", "bash"]
-    );
+    let names: Vec<String> = out(&mut ssh, "pgrep -l .")
+        .lines()
+        .map(|l| l.split_once(' ').unwrap().1.to_string())
+        .collect();
+    // init first, the login shell last; the services and kernel threads of a 22.04 server
+    // between.
+    assert_eq!(names.first().map(String::as_str), Some("systemd"));
+    assert_eq!(names.last().map(String::as_str), Some("bash"));
+    for daemon in [
+        "kthreadd",
+        "systemd-journal",
+        "systemd-resolve",
+        "cron",
+        "dbus-daemon",
+        "rsyslogd",
+        "systemd-logind",
+        "agetty",
+        "(sd-pam)",
+    ] {
+        assert!(names.iter().any(|n| n == daemon), "{daemon}: {names:?}");
+    }
+    assert_eq!(names.iter().filter(|n| *n == "sshd").count(), 2);
     assert!(out(&mut ssh, "pgrep -f 'sshd: root@pts/0'").lines().count() == 1);
     // Over telnet the daemon is telnetd and the shell is its direct child.
     let mut tel = telnet();
@@ -1146,13 +1210,16 @@ fn lookup_commands_agree_with_dispatch_for_the_new_names() {
 #[test]
 fn the_table_is_small_and_every_row_is_well_formed() {
     for (label, mut sh, floor, ceiling) in [
-        ("ssh", shell(), 5usize, 6usize),
-        ("telnet", telnet(), 4, 6),
+        ("ssh", shell(), 60usize, 120usize),
+        ("telnet", telnet(), 60, 120),
         ("phone", phone(), 4, 6),
     ] {
-        // `/proc/net` is a directory of the same set, not a process.
+        // Only the numeric names are processes.
         let listing = out(&mut sh, "ls /proc");
-        let pids: Vec<&str> = listing.split_whitespace().filter(|n| *n != "net").collect();
+        let pids: Vec<&str> = listing
+            .split_whitespace()
+            .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+            .collect();
         let count = pids.len();
         assert!((floor..=ceiling).contains(&count), "{label}: {count} rows");
         let mut seen = std::collections::HashSet::new();
@@ -1163,8 +1230,12 @@ fn the_table_is_small_and_every_row_is_well_formed() {
                 comm.ends_with('\n') && comm.trim_end().len() <= 15,
                 "{label}: {comm:?}"
             );
+            // A kernel thread's is empty; every other one ends in NUL.
             let cmdline = out(&mut sh, &format!("cat /proc/{pid}/cmdline"));
-            assert!(cmdline.ends_with('\0'), "{label}: {cmdline:?}");
+            assert!(
+                cmdline.is_empty() || cmdline.ends_with('\0'),
+                "{label}: {cmdline:?}"
+            );
             let status = out(&mut sh, &format!("cat /proc/{pid}/status"));
             assert!(status.len() < 2_048, "{label}: status is bounded");
         }
@@ -1202,16 +1273,32 @@ fn ps_and_top_output_is_bounded_whatever_the_arguments() {
         })
         .collect();
     fs.set_generated(nodes);
-    assert_eq!(fs.list_dir("/proc").unwrap().len(), GENERATED_MAX);
+    let generated = fs
+        .list_dir("/proc")
+        .unwrap()
+        .iter()
+        .filter(|name| name.chars().all(|c| c.is_ascii_digit()))
+        .count();
+    assert_eq!(generated, GENERATED_MAX);
     assert!(fs.is_dir("/proc/100000") && !fs.is_dir(&format!("/proc/{}", 100_000 + GENERATED_MAX)));
 }
 
 #[test]
 fn the_generated_nodes_do_not_leak_into_the_persona_snapshot() {
-    // A filesystem no shell has installed processes on has the listing it always had.
-    assert_eq!(FakeFs::new().list_dir("/proc"), Some(Vec::new()));
+    // A filesystem no shell has installed processes on lists only its own nodes: no pid, no
+    // daemon image.
+    let listed = FakeFs::new().list_dir("/proc").unwrap();
+    assert!(
+        listed
+            .iter()
+            .all(|name| !name.chars().all(|c| c.is_ascii_digit())),
+        "{listed:?}"
+    );
     assert_eq!(FakeFs::android().list_dir("/proc"), Some(Vec::new()));
-    assert!(FakeFs::new().list_dir("/usr/sbin").unwrap().is_empty());
+    assert_eq!(
+        FakeFs::new().list_dir("/usr/sbin"),
+        Some(vec!["ip".to_string()])
+    );
     // A session's own removals and writes still win over the generated nodes.
     let mut sh = shell();
     assert_eq!(answer(&mut sh, "rm /proc/641/comm").2, 0);
@@ -1581,7 +1668,8 @@ fn an_exec_request_has_no_tty_so_its_descriptors_are_pipes_and_nothing_names_a_p
             "{target:?}"
         );
     }
-    assert_eq!(out(&mut sh, "ls /proc/self/fd"), "0  1  2\n");
+    // Standard output is a pipe too, so `ls` lists one name a line.
+    assert_eq!(out(&mut sh, "ls /proc/self/fd"), "0\n1\n2\n");
     assert!(!out(&mut sh, "cat /proc/self/maps").is_empty());
     assert_eq!(
         answer(&mut sh, "ls /dev/pts/0").2,

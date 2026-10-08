@@ -126,19 +126,23 @@ fn blocks_of(kind: FileKind, size: u64) -> u64 {
     }
 }
 
-/// `st_dev` for a mount: `8:N` for an `sdaN` disk, `179:N` for an Android block device, and an
-/// anonymous `0:N` for the rest [unverified: the numbers are plausible, not recorded].
+/// `st_dev` for a mount: `202:N` for the Xen disk's partition N (`/dev/root` is the first,
+/// `xvda1`), `179:N` for an Android block device, and an anonymous `0:N` for the rest
+/// [unverified: the numbers are plausible, not recorded].
 fn device_of(mount: Option<&MountEntry>) -> u64 {
     let Some(mount) = mount else {
         return 0;
     };
     let pair = |major: u64, minor: u64| major.saturating_mul(256).saturating_add(minor);
+    if mount.source == "/dev/root" {
+        return pair(202, 1);
+    }
     if let Some(n) = mount
         .source
-        .strip_prefix("/dev/sda")
+        .strip_prefix("/dev/xvda")
         .and_then(|n| n.parse::<u64>().ok())
     {
-        return pair(8, n);
+        return pair(202, n);
     }
     if mount.source.starts_with("/dev/block/") {
         return pair(179, (fnv(mount.source) % 32).saturating_add(1));
@@ -270,25 +274,20 @@ impl FakeShell {
     }
 
     fn group_name(&self, gid: u32) -> String {
-        let table: &[(u32, &str)] = if self.flavor == ShellFlavor::AndroidSh {
-            &[(0, "root"), (1000, "system"), (2000, "shell")]
-        } else {
-            &[
-                (0, "root"),
-                (1, "daemon"),
-                (2, "bin"),
-                (3, "sys"),
-                (4, "adm"),
-                (5, "tty"),
-                (6, "disk"),
-                (8, "mail"),
-                (27, "sudo"),
-                (33, "www-data"),
-                (100, "users"),
-                (1000, "ubuntu"),
-                (65534, "nogroup"),
-            ]
-        };
+        if self.flavor == ShellFlavor::Bash {
+            // The group file the box holds, as `user_name` reads the passwd file.
+            let group = self.fs.read_all("/etc/group", 65_536).unwrap_or_default();
+            return String::from_utf8_lossy(&group)
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split(':');
+                    let name = fields.next()?;
+                    fields.next()?;
+                    (fields.next()?.parse::<u32>().ok()? == gid).then(|| name.to_string())
+                })
+                .unwrap_or_else(|| gid.to_string());
+        }
+        let table: &[(u32, &str)] = &[(0, "root"), (1000, "system"), (2000, "shell")];
         table
             .iter()
             .find(|(id, _)| *id == gid)
@@ -798,14 +797,20 @@ impl FakeShell {
     /// the long listing, from the same node facts `stat` prints, so the two cannot disagree on a
     /// size or mode. A missing operand is GNU's `cannot access` complaint and status 2.
     ///
-    /// The short listing joins names with two spaces whatever the output is, as it always has
-    /// here; GNU prints one name per line to a pipe and columns to a terminal [unverified for the
-    /// column widths]. Other options are accepted and ignored.
+    /// The short listing is one name per line when standard output is no terminal (an SSH exec,
+    /// a pipeline stage, a substitution), as GNU's is (recorded on Ubuntu 22.04: `ls -a /` over
+    /// SSH exec lists one name a line), and names joined by two spaces at a terminal
+    /// [unverified for GNU's column widths]. `-a` lists `.` and `..` first, `-A` does not
+    /// (recorded). Other options are accepted and ignored.
     pub(super) fn cmd_ls(&mut self, parts: &[&str]) -> CommandResult {
         let args = parts.get(1..).unwrap_or(&[]);
-        let show_hidden = args
-            .iter()
-            .any(|a| a.starts_with('-') && (a.contains('a') || a.contains('A')));
+        let flags = |c: char| {
+            args.iter()
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(c))
+                || args.contains(&if c == 'a' { "--all" } else { "--almost-all" })
+        };
+        let dot_entries = flags('a');
+        let show_hidden = dot_entries || flags('A');
         let long = args
             .iter()
             .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('l'));
@@ -857,17 +862,23 @@ impl FakeShell {
                 names.retain(|name| !name.starts_with('.'));
             }
             names.sort();
-            let entries: Vec<(String, String)> = names
-                .into_iter()
-                .map(|name| {
-                    let typed = if logical == "/" {
-                        format!("/{name}")
-                    } else {
-                        format!("{logical}/{name}")
-                    };
-                    (name, typed)
-                })
-                .collect();
+            let mut entries: Vec<(String, String)> = Vec::new();
+            if dot_entries {
+                let parent = match logical.rfind('/') {
+                    Some(0) | None => "/".to_string(),
+                    Some(at) => logical.get(..at).unwrap_or("/").to_string(),
+                };
+                entries.push((".".to_string(), logical.clone()));
+                entries.push(("..".to_string(), parent));
+            }
+            entries.extend(names.into_iter().map(|name| {
+                let typed = if logical == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{logical}/{name}")
+                };
+                (name, typed)
+            }));
             if !out.is_empty() {
                 out.push('\n');
             }
@@ -904,7 +915,12 @@ impl FakeShell {
                 return Ok(String::new());
             }
             let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
-            return Ok(names.join("  ") + "\n");
+            let separator = if self.stdout_is_terminal() {
+                "  "
+            } else {
+                "\n"
+            };
+            return Ok(names.join(separator) + "\n");
         }
         let mut rows = Vec::with_capacity(entries.len());
         for (name, typed) in entries {

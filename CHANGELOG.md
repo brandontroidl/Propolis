@@ -403,7 +403,23 @@
   `time dd` agrees with dd's summary; `history` lists the interactive shell's lines and nothing
   under `bash -c`. `dd if=/dev/zero of=FILE` writes its zeros as an O(1) fill (the survey's 10 MB
   probe answered `File too large`), and dd's byte-count sizes keep a decimal below 10 only
-  (`(10 MB, 10 MiB)`, it printed `(10.5 MB, 10.0 MiB)`).
+  (`(10 MB, 10 MiB)`, it printed `(10.5 MB, 10.0 MiB)`). The host itself is one model the
+  commands agree on: the process table holds a 22.04 server's kernel threads and services
+  (journald, resolved, networkd, cron, dbus, rsyslogd, logind, the getty pair, the session's
+  `systemd --user`) with their real owners, so `ps aux`, `top -bn1`, `pgrep`, `/proc/PID` and
+  `/proc/loadavg` (now present, as is a ticking `/proc/uptime`) count the same rows; `ss` lists
+  resolved's stub on 127.0.0.53 beside sshd in iproute2 5.15's recorded layout, and
+  `/proc/net/udp` the same socket. `/proc/cpuinfo` lists every field (the `model name` grep was
+  empty), `/etc/shadow`, `/etc/gshadow`, `/etc/group` and the installer's netplan file exist
+  (root's hash is a random yescrypt-shaped string that hashes no password), root's dotfiles
+  are the stock ones, the root disk is `/dev/root` on the Xen `xvda` the CPU implies, `/tmp` is
+  sticky and `/proc`/`/sys` read-only, and `/lib32`/`/libx32` join the usrmerge links. An SSH
+  session's environment carries `SSH_CLIENT`, `SSH_CONNECTION`, `LANG`, `SHLVL`, the `XDG_*`
+  set and, interactively, `SSH_TTY`, `TERM` and `LS_COLORS`, in bash's own hash order (`env` printed
+  four variables); `MAIL` is set over telnet only, because a jammy SSH login has none (recorded).
+  `ls -a` lists `.` and `..` and the short listing is one name a line off a terminal, a file
+  the session writes is dated now rather than 2024, and `uname -a` and `/proc/version` carry the
+  kernel's build date [unverified].
 - **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
   0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
   echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks

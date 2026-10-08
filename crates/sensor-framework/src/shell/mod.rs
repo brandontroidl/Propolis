@@ -417,6 +417,9 @@ pub struct FakeShell {
     timing: timing::Timing,
     /// The interactive login shell's command history, oldest first, as `history` lists it.
     history: Vec<String>,
+    /// The running command was started by `env`, not by the shell: its environment is the one
+    /// `env` built, with no `_` that only bash adds.
+    env_launch: bool,
 }
 
 /// The most entries `history` keeps: Ubuntu's stock `.bashrc` sets `HISTSIZE=1000`.
@@ -601,8 +604,10 @@ impl FakeShell {
             line_command: String::new(),
             timing: timing::Timing::default(),
             history: Vec::new(),
+            env_launch: false,
         };
         shell.install_processes();
+        shell.install_session_env();
         shell
     }
 
@@ -610,6 +615,7 @@ impl FakeShell {
     /// pipe unless the channel asked for a pty; every other shell reads a terminal.
     pub fn with_terminal_input(mut self, tty: bool) -> Self {
         self.tty_input = tty;
+        self.set_terminal_env(tty);
         self
     }
 
@@ -658,6 +664,7 @@ impl FakeShell {
                 line_command: self.line_command.clone(),
                 timing: self.timing,
                 history: self.history.clone(),
+                env_launch: self.env_launch,
             }),
         }
     }
@@ -679,6 +686,8 @@ impl FakeShell {
     /// The same shell reading its time from `clock` instead of the system clock.
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        // Files written now carry this clock's date.
+        self.fs.set_clock(clock);
         // The session began now on this clock, and every start time in the process table follows.
         self.session_started = clock();
         self.install_processes();
@@ -801,6 +810,12 @@ impl FakeShell {
 
     fn is_bash(&self) -> bool {
         matches!(self.active_level(), ShellLevel::Bash { .. })
+    }
+
+    /// Whether the running command writes to the session's terminal: the session has one, and
+    /// the command is not a pipeline stage, a substitution or a script's (which write to a pipe).
+    fn stdout_is_terminal(&self) -> bool {
+        self.tty_input && self.script_depth == 0
     }
 
     /// What the active shell says for a command it cannot find.
@@ -1160,6 +1175,7 @@ impl FakeShell {
         self.busybox_depth = 0;
         self.typed_output = false;
         self.loader_line = loader::LineLoader::default();
+        self.refresh_clock_nodes();
     }
 
     /// Run one decoded input as a shell reads it, one physical line at a time: each line joins

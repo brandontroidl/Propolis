@@ -26,15 +26,21 @@ const DEFAULT_HOSTNAME: &str = "server01";
 
 /// `uname -r` for this host (jammy's 5.15 HWE-adjacent GA kernel).
 pub const KERNEL_RELEASE: &str = "5.15.0-91-generic";
-/// The `#NNN-Ubuntu SMP ...` build tag that follows the release in `uname -a` / `/proc/version`.
-pub const KERNEL_BUILD: &str = "#101-Ubuntu SMP";
+/// The `#NNN-Ubuntu SMP <build date>` tag that follows the release in `uname -a`, `uname -v` and
+/// `/proc/version`. Every Ubuntu kernel prints its build date here; the bare `#101-Ubuntu SMP` it
+/// used to be is a tag no real kernel shows. The date is the one Ubuntu's 5.15.0-91.101 build
+/// carries [unverified: from knowledge of that release, not recorded from a host].
+pub const KERNEL_BUILD: &str = "#101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023";
 pub const ARCH: &str = "x86_64";
 pub const OS_NAME: &str = "Ubuntu";
 pub const OS_PRETTY: &str = "Ubuntu 22.04.4 LTS";
 pub const OS_VERSION: &str = "22.04.4 LTS (Jammy Jellyfish)";
 pub const OS_VERSION_ID: &str = "22.04";
-/// The gcc build stamp jammy's kernels are compiled with, for `/proc/version`.
-pub const GCC_BUILD: &str = "(gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0)";
+/// The toolchain stamp jammy's kernels are built with, for `/proc/version`: since 5.15 the kernel
+/// names the linker after the compiler (recorded on a reference host's `/proc/version`:
+/// `(gcc ..., GNU ld version ...)`); jammy's is binutils 2.38.
+pub const GCC_BUILD: &str =
+    "(gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, GNU ld (GNU Binutils for Ubuntu) 2.38)";
 
 /// The OpenSSH version string that ships on THIS distro (jammy's `openssh-server`), used as the SSH
 /// banner default so the advertised version and the shell's `/etc/os-release` cannot contradict.
@@ -138,11 +144,15 @@ mod tests {
 
     #[test]
     fn uname_matches_historical_default() {
-        // Locks the exact byte layout the shell emitted before persona was extracted, so the
-        // refactor cannot silently change what an attacker's `uname -a` sees.
+        // Locks the exact bytes an attacker's `uname -a` sees: the build tag carries its date, as
+        // every Ubuntu kernel's does.
         assert_eq!(
             uname_all("server01"),
-            "Linux server01 5.15.0-91-generic #101-Ubuntu SMP x86_64 x86_64 x86_64 GNU/Linux"
+            "Linux server01 5.15.0-91-generic #101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023 x86_64 x86_64 x86_64 GNU/Linux"
+        );
+        assert_eq!(
+            proc_version(),
+            "Linux version 5.15.0-91-generic (buildd@lcy02-amd64-051) (gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, GNU ld (GNU Binutils for Ubuntu) 2.38) #101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023"
         );
     }
 

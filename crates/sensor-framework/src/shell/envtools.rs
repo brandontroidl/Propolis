@@ -60,26 +60,147 @@ fn unrecognized_long(cmd: &str, arg: &str) -> String {
     format!("{cmd}: unrecognized option '{arg}'\n{}", try_help(cmd))
 }
 
-/// The exported variables of `vars` as `(name, value)`, sorted by name.
-fn exported_sorted(vars: &BTreeMap<String, Var>) -> Vec<(&str, &str)> {
+/// The bucket of bash 5.1's 1024-bucket variable table that `name` hashes to (FNV-1, 32 bits).
+/// bash builds a child's environment by walking that table bucket by bucket, so this is the order
+/// `env` prints in: recorded on Ubuntu 22.04 (2026-10-07), an SSH session's `env` lists `SHELL`,
+/// `PWD`, `LOGNAME`, `XDG_SESSION_TYPE`, ..., `PATH`, exactly the ascending buckets of the names.
+fn bash_bucket(name: &str) -> u32 {
+    let mut hash: u32 = 2_166_136_261;
+    for byte in name.bytes() {
+        hash = hash.wrapping_mul(16_777_619);
+        hash ^= u32::from(byte);
+    }
+    hash & 1_023
+}
+
+/// The exported variables of `vars` as `(name, value)`: in bash's environment order for the
+/// Ubuntu shell, by name for the phone's (whose order no capture shows) [unverified for mksh].
+fn exported_in_order(vars: &BTreeMap<String, Var>, bash: bool) -> Vec<(&str, &str)> {
     let mut listed: Vec<(&str, &str)> = vars
         .iter()
         .filter(|(_, var)| var.exported)
         .map(|(name, var)| (name.as_str(), var.value.as_str()))
         .collect();
-    listed.sort_unstable();
+    if bash {
+        // `_`, the command's own path, is put last when bash runs it.
+        listed.sort_by_key(|(name, _)| (*name == "_", bash_bucket(name), *name));
+    } else {
+        listed.sort_unstable();
+    }
     listed
 }
 
-fn render(vars: &BTreeMap<String, Var>, terminator: char) -> String {
+fn render(vars: &BTreeMap<String, Var>, terminator: char, bash: bool) -> String {
     let mut out = String::new();
-    for (name, value) in exported_sorted(vars) {
+    for (name, value) in exported_in_order(vars, bash) {
         out.push_str(name);
         out.push('=');
         out.push_str(value);
         out.push(terminator);
     }
     out
+}
+
+/// The `LS_COLORS` Ubuntu 22.04's `.bashrc` exports through `dircolors -b` (recorded from an
+/// interactive SSH session on the reference, 2026-10-07).
+const LS_COLORS: &str = "rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=30;41:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.arc=01;31:*.arj=01;31:*.taz=01;31:*.lha=01;31:*.lz4=01;31:*.lzh=01;31:*.lzma=01;31:*.tlz=01;31:*.txz=01;31:*.tzo=01;31:*.t7z=01;31:*.zip=01;31:*.z=01;31:*.dz=01;31:*.gz=01;31:*.lrz=01;31:*.lz=01;31:*.lzo=01;31:*.xz=01;31:*.zst=01;31:*.tzst=01;31:*.bz2=01;31:*.bz=01;31:*.tbz=01;31:*.tbz2=01;31:*.tz=01;31:*.deb=01;31:*.rpm=01;31:*.jar=01;31:*.war=01;31:*.ear=01;31:*.sar=01;31:*.rar=01;31:*.alz=01;31:*.ace=01;31:*.zoo=01;31:*.cpio=01;31:*.7z=01;31:*.rz=01;31:*.cab=01;31:*.wim=01;31:*.swm=01;31:*.dwm=01;31:*.esd=01;31:*.jpg=01;35:*.jpeg=01;35:*.mjpg=01;35:*.mjpeg=01;35:*.gif=01;35:*.bmp=01;35:*.pbm=01;35:*.pgm=01;35:*.ppm=01;35:*.tga=01;35:*.xbm=01;35:*.xpm=01;35:*.tif=01;35:*.tiff=01;35:*.png=01;35:*.svg=01;35:*.svgz=01;35:*.mng=01;35:*.pcx=01;35:*.mov=01;35:*.mpg=01;35:*.mpeg=01;35:*.m2v=01;35:*.mkv=01;35:*.webm=01;35:*.webp=01;35:*.ogm=01;35:*.mp4=01;35:*.m4v=01;35:*.mp4v=01;35:*.vob=01;35:*.qt=01;35:*.nuv=01;35:*.wmv=01;35:*.asf=01;35:*.rm=01;35:*.rmvb=01;35:*.flc=01;35:*.avi=01;35:*.fli=01;35:*.flv=01;35:*.gl=01;35:*.dl=01;35:*.xcf=01;35:*.xwd=01;35:*.yuv=01;35:*.cgm=01;35:*.emf=01;35:*.ogv=01;35:*.ogx=01;35:*.aac=00;36:*.au=00;36:*.flac=00;36:*.m4a=00;36:*.mid=00;36:*.midi=00;36:*.mka=00;36:*.mp3=00;36:*.mpc=00;36:*.ogg=00;36:*.ra=00;36:*.wav=00;36:*.oga=00;36:*.opus=00;36:*.spx=00;36:*.xspf=00;36:";
+
+/// The persona's own address, the server half of `SSH_CONNECTION` (the one `ip addr` shows).
+const SERVER_ADDRESS: &str = "172.31.16.42";
+
+impl FakeShell {
+    /// The variables a session's login puts in the environment, beyond what every shell has.
+    /// Recorded on Ubuntu 22.04 over SSH (2026-10-07): `pam_env` sets `LANG` from
+    /// `/etc/default/locale`, `pam_systemd` the `XDG_*` session variables, `pam_motd`
+    /// `MOTD_SHOWN=pam`, sshd `SSH_CLIENT`/`SSH_CONNECTION` (and `SSH_TTY` with a terminal), and
+    /// the stock `.bashrc` of an interactive shell `LS_COLORS`, `LESSOPEN` and `LESSCLOSE`.
+    /// sshd under PAM sets no `MAIL` (recorded: absent from both an exec and an interactive
+    /// session). `DBUS_SESSION_BUS_ADDRESS` is the user bus of a server with `dbus-user-session`
+    /// [unverified: the reference had no user bus]. A telnet login goes through `login(1)`, which
+    /// sets `MAIL` and no `SSH_*` [unverified]. The client half of the SSH variables is the
+    /// session's own peer and a port fixed by the session; the server half is the persona's.
+    pub(super) fn install_session_env(&mut self) {
+        if self.flavor != ShellFlavor::Bash {
+            return;
+        }
+        let pid = self.state().pid;
+        let ssh = self.ctx.protocol_label == "ssh";
+        let interactive = self.context == super::ShellContext::LoginInteractive;
+        let session_id = (pid % 9_000).saturating_add(120).to_string();
+        let client_port = 32_768u32.saturating_add(pid.wrapping_mul(7_919) % 28_232);
+        let client = self.ctx.source_ip.to_string();
+        let mut set = |name: &str, value: String| self.state_mut().set_var(name, value, true);
+        set("LANG", "C.UTF-8".to_string());
+        set("SHLVL", "1".to_string());
+        set("MOTD_SHOWN", "pam".to_string());
+        set("XDG_SESSION_TYPE", "tty".to_string());
+        set("XDG_SESSION_CLASS", "user".to_string());
+        set("XDG_SESSION_ID", session_id);
+        set("XDG_RUNTIME_DIR", "/run/user/0".to_string());
+        set(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/run/user/0/bus".to_string(),
+        );
+        if ssh {
+            set("SSH_CLIENT", format!("{client} {client_port} 22"));
+            set(
+                "SSH_CONNECTION",
+                format!("{client} {client_port} {SERVER_ADDRESS} 22"),
+            );
+        } else {
+            set("MAIL", "/var/mail/root".to_string());
+        }
+        if interactive {
+            set("LS_COLORS", LS_COLORS.to_string());
+            set("LESSOPEN", "| /usr/bin/lesspipe %s".to_string());
+            set("LESSCLOSE", "/usr/bin/lesspipe %s %s".to_string());
+        }
+        self.set_terminal_env(interactive);
+    }
+
+    /// `TERM`, and for SSH `SSH_TTY`, exactly when the session has a terminal.
+    pub(super) fn set_terminal_env(&mut self, tty: bool) {
+        if self.flavor != ShellFlavor::Bash {
+            return;
+        }
+        let ssh = self.ctx.protocol_label == "ssh";
+        let state = self.state_mut();
+        if tty {
+            // The client's own terminal type is not passed down; the common one stands in
+            // [unverified].
+            state.set_var("TERM", "xterm-256color".to_string(), true);
+            if ssh {
+                state.set_var("SSH_TTY", "/dev/pts/0".to_string(), true);
+            }
+        } else {
+            state.vars.remove("TERM");
+            state.vars.remove("SSH_TTY");
+        }
+    }
+
+    /// The environment the shell hands a command it starts from `path`: its exported variables,
+    /// `_` set to the command's path, and, under `bash -c` (an SSH exec), `SHLVL` one lower than
+    /// the shell's own, as bash exports it to the commands it execs (recorded on Ubuntu 22.04:
+    /// `echo $SHLVL` is 1 and `printenv SHLVL` is 0 in the same exec session).
+    pub(super) fn child_environment(&self, path: &str) -> BTreeMap<String, Var> {
+        let mut vars = self.state().vars.clone();
+        if self.flavor == ShellFlavor::Bash && !self.env_launch {
+            vars.insert(
+                "_".to_string(),
+                Var {
+                    value: path.to_string(),
+                    exported: true,
+                },
+            );
+            if self.context == super::ShellContext::ExecC
+                && let Some(level) = vars.get_mut("SHLVL")
+                && let Ok(n) = level.value.parse::<i64>()
+            {
+                level.value = n.saturating_sub(1).max(0).to_string();
+            }
+        }
+        vars
+    }
 }
 
 /// What `env`'s options and operands ask for: the edits to the environment, in the order they
@@ -148,9 +269,9 @@ impl FakeShell {
             }
         }
         let terminator = if null { '\0' } else { '\n' };
-        let vars = &self.state().vars;
+        let vars = &self.child_environment("/usr/bin/printenv");
         if names.is_empty() {
-            return CommandResult::stdout(render(vars, terminator));
+            return CommandResult::stdout(render(vars, terminator, true));
         }
         let mut out = String::new();
         let mut missing = false;
@@ -180,10 +301,35 @@ impl FakeShell {
             Err(refusal) => return refusal,
         };
         if plan.command.is_empty() {
-            let mut vars = self.state().vars.clone();
-            plan.apply(&mut vars);
+            // env prints its own environment: what it inherited, in bash's order, edited in
+            // place, then each new assignment appended in the order given, as setenv(3) leaves
+            // it.
+            let mut vars = self.child_environment("/usr/bin/env");
+            if plan.ignore {
+                vars.retain(|_, var| !var.exported);
+            }
+            for name in &plan.unsets {
+                vars.remove(*name);
+            }
+            let mut listed: Vec<(String, String)> = exported_in_order(&vars, gnu)
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            for (name, value) in &plan.sets {
+                match listed
+                    .iter_mut()
+                    .find(|(listed_name, _)| listed_name == name)
+                {
+                    Some(slot) => slot.1 = (*value).to_string(),
+                    None => listed.push(((*name).to_string(), (*value).to_string())),
+                }
+            }
             let terminator = if plan.null { '\0' } else { '\n' };
-            return CommandResult::stdout(render(&vars, terminator));
+            let mut out = String::new();
+            for (name, value) in listed {
+                out.push_str(&format!("{name}={value}{terminator}"));
+            }
+            return CommandResult::stdout(out);
         }
         if plan.null {
             return CommandResult::stderr(
@@ -205,8 +351,14 @@ impl FakeShell {
         // a shell level cannot make the restore land on another level's state.
         let frame = self.frames.len().saturating_sub(1);
         let saved = self.state().vars.clone();
-        plan.apply(&mut self.state_mut().vars);
+        // The command inherits env's own environment, `_` included (bash set it for env), with
+        // env's edits applied; no `_` of its own is added for it.
+        let mut inherited = self.child_environment("/usr/bin/env");
+        plan.apply(&mut inherited);
+        self.state_mut().vars = inherited;
+        let launched = std::mem::replace(&mut self.env_launch, true);
         let result = self.dispatch_nested(plan.command);
+        self.env_launch = launched;
         if let Some(level) = self.frames.get_mut(frame) {
             level.state.vars = saved;
         }

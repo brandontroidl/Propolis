@@ -389,7 +389,14 @@ async fn the_campaign_page_shows_members_representative_and_indicators(pool: PgP
     assert!(page.contains(&format!("href=\"/campaigns/{sequence}/approve\"")));
 
     let (_, page) = console.get(&format!("/campaigns/{sample}")).await;
-    assert!(page.contains("127.0.0.1 rival.example.net"), "{page}");
+    // Shown defanged, the live value only behind the explicit "copy original" action.
+    assert!(
+        page.contains("<code class=\"ioc-value\">127[.]0[.]0[.]1 rival[.]example[.]net</code>"),
+        "{page}"
+    );
+    assert!(page.contains("data-copy=\"127[.]0[.]0[.]1 rival[.]example[.]net\""));
+    assert!(page.contains("data-copy=\"127.0.0.1 rival.example.net\""));
+    assert!(page.contains(">copy original</button>"));
     assert!(page.contains("hosts entry"));
 
     // One indicator carried by three members' commands is one row, not three.
@@ -413,6 +420,14 @@ async fn the_campaign_page_shows_members_representative_and_indicators(pool: PgP
         "{page}"
     );
     assert!(page.contains("3 hosts, 6&times;"), "{page}");
+    assert!(
+        page.contains("<code class=\"ioc-value\">hxxp://198[.]51[.]100[.]70/kswpad</code>"),
+        "{page}"
+    );
+    assert!(
+        !page.contains("href=\"http://198.51.100.70"),
+        "an indicator is never a link"
+    );
     assert!(page.contains("event 1000"), "{page}");
 
     let (status, _) = console.get("/campaigns/999999").await;

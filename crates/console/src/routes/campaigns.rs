@@ -24,7 +24,7 @@ use axum::{Extension, Form, Router};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use minijinja::context;
 use review::campaign::Kind;
-use review::ioc::IocKind;
+use review::ioc::{self, IocKind};
 use review::queue::ReviewQueue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -446,7 +446,10 @@ struct MemberRow {
 #[derive(Debug, Serialize)]
 pub(crate) struct IocRow {
     pub kind: &'static str,
+    /// As stored: offered only through the explicit "copy original" action.
     pub value: String,
+    /// What the page shows and the plain copy action copies (`review::ioc::defang`).
+    pub defanged: String,
     pub detail: String,
     /// The artifact it came from (a sample digest), or the address and event of the first
     /// command that carried it.
@@ -461,10 +464,13 @@ pub(crate) struct IocRow {
 
 fn ioc_row(r: &sqlx::postgres::PgRow) -> Result<IocRow, sqlx::Error> {
     let kind: String = r.try_get("kind")?;
+    let value: String = r.try_get("value")?;
+    let detail: String = r.try_get("detail")?;
     Ok(IocRow {
         kind: IocKind::parse(&kind).map_or("indicator", IocKind::label),
-        value: r.try_get("value")?,
-        detail: r.try_get("detail")?,
+        defanged: ioc::defang(&value),
+        value,
+        detail: ioc::defang(&detail),
         sample: r.try_get("artifact_sha256")?,
         source_ip: r.try_get("source_ip")?,
         event_id: r.try_get("event_id")?,
@@ -528,7 +534,7 @@ fn representative(value: &Value) -> Representative {
         sha256: text("sha256"),
         origin: text("origin"),
         orig_name: text("orig_name"),
-        url: text("url"),
+        url: text("url").map(|u| ioc::defang(&u)),
         sensors: list("sensors"),
     }
 }

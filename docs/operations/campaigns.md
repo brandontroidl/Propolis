@@ -148,7 +148,10 @@ Each indicator carries its provenance: the artifact's digest, or the address and
 id that carried it. Limits: 64 indicators per artifact, 16 per command, 256 command indicators per
 address. Every value and detail passes the sensors' sanitizer and a byte cap (256 and 128 bytes)
 before it is stored (`crates/review/src/ioc.rs#sanitize_field`), and the console renders them as
-escaped text, never as a link. Indicators are not published to the feed or to vendors; that is a
+escaped text, never as a link, and defanged (`crates/review/src/ioc.rs#defang`): `http` becomes
+`hxxp`, the dots of host names and IPv4 addresses `[.]`, IPv6 colons `[:]` and an email or
+user-information `@` `[@]`. Each indicator has a "copy" button for the defanged form and a separate
+"copy original" button for the live value. Nothing is resolved or looked up to display them. Indicators are not published to the feed or to vendors; that is a
 separate decision.
 
 ## Limits

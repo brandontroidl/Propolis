@@ -51,17 +51,17 @@
 </div>
 
 <div class="panel">
-  <div class="panel-head">Indicators <span class="dim">extracted, not published</span></div>
+  <div class="panel-head">Indicators <span class="dim">extracted, not published; shown defanged</span></div>
   {% if artifact_iocs or command_iocs %}
   <div class="table-wrap">
   <table class="table-compact">
     <thead><tr><th>Kind</th><th>Value</th><th>Detail</th><th>From</th></tr></thead>
     <tbody>
       {% for i in artifact_iocs %}
-      <tr><td>{{ i.kind }}</td><td><code class="ioc-value">{{ i.value }}</code></td><td class="dim">{{ i.detail }}</td><td class="mono"><a href="/samples/{{ i.sample }}">sample {{ i.sample[:12] }}</a></td></tr>
+      <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td class="mono"><a href="/samples/{{ i.sample }}">sample {{ i.sample[:12] }}</a></td></tr>
       {% endfor %}
       {% for i in command_iocs %}
-      <tr><td>{{ i.kind }}</td><td><code class="ioc-value">{{ i.value }}</code></td><td class="dim">{{ i.detail }}</td><td class="mono">{{ i.hosts }} host{% if i.hosts != 1 %}s{% endif %}, {{ i.sightings }}&times; <span class="dim">first</span> {{ m.ip_evidence_link(i.source_ip) }} <span class="dim">event {{ i.event_id }}</span></td></tr>
+      <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td class="mono">{{ i.hosts }} host{% if i.hosts != 1 %}s{% endif %}, {{ i.sightings }}&times; <span class="dim">first</span> {{ m.ip_evidence_link(i.source_ip) }} <span class="dim">event {{ i.event_id }}</span></td></tr>
       {% endfor %}
     </tbody>
   </table>

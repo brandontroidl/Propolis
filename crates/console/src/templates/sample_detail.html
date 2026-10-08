@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Sample {{ sha256[:12] }} - Propolis{% endblock %}
 {% block content %}
+{% import "macros.html" as m %}
 <p><a href="/samples">&larr; All samples</a></p>
 <h1 class="mono campaign-label">{{ sha256 }}</h1>
 <p class="page-sub">{% if spooled %}{{ size }} in the {{ bucket }} spool. <a href="/samples/download/{{ sha256 }}">Download</a>{% else %}Not in any spool (aged out, or not shipped yet).{% endif %}</p>
@@ -19,14 +20,14 @@
 </div>
 
 <div class="panel">
-  <div class="panel-head">Indicators <span class="dim">extracted from this artifact, not published</span></div>
+  <div class="panel-head">Indicators <span class="dim">extracted from this artifact, not published; shown defanged</span></div>
   {% if scan_state == "done" %}
     {% if iocs %}
     <div class="table-wrap">
     <table class="table-compact">
       <thead><tr><th>Kind</th><th>Value</th><th>Detail</th></tr></thead>
       <tbody>
-        {% for i in iocs %}<tr><td>{{ i.kind }}</td><td><code class="ioc-value">{{ i.value }}</code></td><td class="dim">{{ i.detail }}</td></tr>{% endfor %}
+        {% for i in iocs %}<tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>

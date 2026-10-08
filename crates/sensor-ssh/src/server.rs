@@ -651,8 +651,11 @@ async fn handle_session(
                                 protocol_label: "ssh".to_string(),
                                 session_id: Some(session_id),
                             };
+                            // Without a pty the shell's input is a pipe: no prompt, no terminal
+                            // variables, and a bare `sh` reads the rest of it as a script.
                             let shell = FakeShell::new(base_fs.share(), ctx)
                                 .with_budget(budget.clone())
+                                .with_terminal_input(state.flow.pty)
                                 .with_captures(stdin_captures.clone());
                             let prompt = shell.prompt();
                             state.handler =
@@ -820,10 +823,32 @@ async fn handle_session(
                                     if pty {
                                         responses.extend_from_slice(&fed.echo);
                                     }
+                                    // The command may have read what it wanted from this line
+                                    // (`read x`), with more input still able to come.
+                                    let resumed = if fed.ended.is_none() && fed.line {
+                                        input
+                                            .resume(shell)
+                                            .map(|output| (output, input.ended_on_cr()))
+                                    } else {
+                                        None
+                                    };
                                     if let Some(end) = fed.ended
                                         && let Some(input) = held.take()
                                     {
                                         let output = input.finish(shell, end);
+                                        close_shell = deliver_output(
+                                            output,
+                                            pty,
+                                            &mut responses,
+                                            &mut nonpty_segments,
+                                        );
+                                        if !close_shell && pty {
+                                            responses.extend_from_slice(shell.prompt().as_bytes());
+                                        }
+                                    } else if let Some((output, after_cr)) = resumed {
+                                        // Done: what follows this Enter is the shell's.
+                                        prev_cr = after_cr;
+                                        *held = None;
                                         close_shell = deliver_output(
                                             output,
                                             pty,
@@ -1078,6 +1103,11 @@ async fn handle_session(
                                     state.flow.finish_status = Some(0);
                                 }
                             }
+                            // Without a pty the shell reads a pipe, and its end is the shell's:
+                            // bash exits with the status of the last command it ran.
+                            if !pty && state.flow.finish_status.is_none() {
+                                state.flow.finish_status = Some(shell.last_status());
+                            }
                         }
                         ChannelHandler::Pending
                         | ChannelHandler::Scp(_)
@@ -1324,6 +1354,7 @@ async fn run_typed_line(
             if after_cr {
                 input.follow_cr();
             }
+            input.per_line();
             *held = Some(input);
             None
         }

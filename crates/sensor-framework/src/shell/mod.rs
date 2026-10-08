@@ -435,7 +435,15 @@ struct HeldLine {
     decoded: String,
     /// The line as typed, sanitized and capped for event metadata.
     command: String,
+    /// [`FakeShell::try_finish_line`] runs made so far.
+    attempts: u32,
 }
+
+/// The most times [`FakeShell::try_finish_line`] reruns one waiting line, and the most input it
+/// reruns it on: enough for the lines a person or a script answers a prompt with, and a bound on
+/// the rework a long paste into `cat > f` can cause.
+pub const RESUME_ATTEMPTS: u32 = 64;
+pub const RESUME_BYTES: usize = 65_536;
 
 /// What [`FakeShell::checkpoint`] saved.
 struct Checkpoint {
@@ -905,11 +913,20 @@ impl FakeShell {
         self.held = Some(HeldLine {
             decoded,
             command: sanitize_value(&raw, MAX_COMMAND_LEN),
+            attempts: 0,
         });
         self.end_input(&mut events, false);
         self.loader_line.urls = derived;
         self.flush_loader(&mut events);
         (LineStep::AwaitingInput, events)
+    }
+
+    /// The status of the last command the login shell ran (`$?`): what the shell exits with
+    /// when its input ends.
+    pub fn last_status(&self) -> u8 {
+        self.frames
+            .first()
+            .map_or(0, |frame| frame.state.last_status)
     }
 
     /// Whether a line given to [`Self::start_line`] is waiting for its input.
@@ -929,6 +946,40 @@ impl FakeShell {
         let Some(held) = self.held.take() else {
             return CommandResult::silent(0);
         };
+        self.run_held(held, input, Some(end)).0
+    }
+
+    /// Run the waiting line on the input typed so far, with more still able to come, as a real
+    /// command reading a terminal runs once Enter hands it a line: `read x; echo $x` and
+    /// `head -n 1` answer after the first line, not after Ctrl-D. `Some` is what the line printed
+    /// when it completed on that input; `None` leaves it waiting, exactly as it was, because a
+    /// command on it still wants more (`cat > f` until Ctrl-D, a second `read`). Each attempt
+    /// reruns the line from the start, so only the first [`RESUME_ATTEMPTS`] lines and
+    /// [`RESUME_BYTES`] of input are tried; past them the line waits for its input to end.
+    pub fn try_finish_line(&mut self, input: &[u8]) -> Option<CommandResult> {
+        let held = self.held.as_mut()?;
+        if held.attempts >= RESUME_ATTEMPTS || input.len() > RESUME_BYTES {
+            return None;
+        }
+        held.attempts = held.attempts.saturating_add(1);
+        let saved = self.checkpoint();
+        let held = self.held.take()?;
+        let (output, wants_more) = self.run_held(held, input, None);
+        if wants_more {
+            self.rollback(saved);
+            return None;
+        }
+        Some(output)
+    }
+
+    /// Run `held` on `input`: ended as `end` says, or still open with `None`. Returns the output
+    /// and whether a reader asked for more than `input` held.
+    fn run_held(
+        &mut self,
+        held: HeldLine,
+        input: &[u8],
+        end: Option<InputEnd>,
+    ) -> (CommandResult, bool) {
         self.begin_line();
         self.line_command = held.command.clone();
         self.trace = LineTrace {
@@ -938,13 +989,17 @@ impl FakeShell {
         self.advance_shell_line();
         self.input_sinks.clear();
         self.input_interrupt = match end {
-            InputEnd::Eof => None,
-            InputEnd::Interrupt => Some(130),
-            InputEnd::Hangup => Some(129),
+            None | Some(InputEnd::Eof) => None,
+            Some(InputEnd::Interrupt) => Some(130),
+            Some(InputEnd::Hangup) => Some(129),
         };
-        self.stdin = Stdin::session(input.to_vec(), end == InputEnd::Eof, self.tty_input);
+        self.stdin = Stdin::session(input.to_vec(), end == Some(InputEnd::Eof), self.tty_input);
         let mut output = self.run_input(&held.decoded);
         let interrupted = self.stdin.is_blocked();
+        if end.is_none() && interrupted {
+            // Still waiting: the caller undoes this run.
+            return (output, true);
+        }
         self.input_interrupt = None;
         self.stdin = Stdin::Terminal;
         // The line's events, a derived URL among them, went out when it was held.
@@ -953,11 +1008,11 @@ impl FakeShell {
         tracing::debug!(target: "propolis::shell::trace", trace = ?self.trace, "shell line");
         // Killed by Ctrl-C, the job leaves the cursor after the `^C` the terminal echoed; an
         // interactive shell moves to a fresh line before its prompt.
-        if interrupted && end == InputEnd::Interrupt && self.context != ShellContext::ExecC {
+        if interrupted && end == Some(InputEnd::Interrupt) && self.context != ShellContext::ExecC {
             output.append(CommandResult::stdout(b"\n".to_vec()));
             output.status = 130;
         }
-        output
+        (output, false)
     }
 
     /// The file that holds what the last line run by [`Self::finish_line`] read from its input:

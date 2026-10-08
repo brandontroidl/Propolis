@@ -2271,3 +2271,67 @@ async fn bytes_a_typed_command_consumed_are_not_also_captured_as_a_shell_payload
         sha256_hex(&payload)
     );
 }
+
+/// A line reader at the shell answers when Enter hands it its line, as on a real terminal:
+/// `read x; echo got=$x` prints and the prompt returns after `hello`, with no Ctrl-D, and the
+/// bytes typed after that Enter are the next command.
+#[tokio::test]
+async fn a_read_at_the_shell_answers_on_its_line_not_at_ctrl_d() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+    let mut channel = open_shell(&session).await;
+    channel.data(&b"read x; echo got=$x\r"[..]).await.unwrap();
+    channel.data(&b"hello\r"[..]).await.unwrap();
+    let reply = read_to_prompt(&mut channel).await;
+    assert!(reply.contains("hello\r\ngot=hello\r\n"), "{reply:?}");
+    // One packet carrying the answer and the next command: the command is the shell's.
+    channel
+        .data(&b"head -n 1\rline1\recho after\r"[..])
+        .await
+        .unwrap();
+    let mut reply = read_to_prompt(&mut channel).await;
+    if !reply.contains("after\r\n") {
+        reply.push_str(&read_to_prompt(&mut channel).await);
+    }
+    assert!(reply.contains("line1\r\nline1\r\n"), "{reply:?}");
+    assert!(reply.contains("echo after\r\nafter\r\n"), "{reply:?}");
+    drop(channel);
+    drop(session);
+    handle.abort();
+}
+
+/// A shell request without a pty reads a pipe: a bare `sh` takes the rest of the input as its
+/// script, and the session ends with the input, reporting the last command's status.
+#[tokio::test]
+async fn a_shell_without_a_pty_hands_a_bare_sh_the_rest_of_its_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let session = login(addr).await;
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel.request_shell(false).await.unwrap();
+    channel
+        .data(&b"echo $TERM-${SSH_TTY}-\nsh\necho in-script\nexit 3\n"[..])
+        .await
+        .unwrap();
+    channel.eof().await.unwrap();
+    let mut out = Vec::new();
+    let mut status = None;
+    while let Some(message) = tokio::time::timeout(Duration::from_secs(10), channel.wait())
+        .await
+        .expect("timed out waiting for the shell to end")
+    {
+        match message {
+            russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. } => {
+                out.extend_from_slice(&data);
+            }
+            russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+            russh::ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    assert_eq!(String::from_utf8_lossy(&out), "--\nin-script\n");
+    assert_eq!(status, Some(3));
+    drop(session);
+    handle.abort();
+}

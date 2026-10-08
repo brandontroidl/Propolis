@@ -431,7 +431,14 @@
   replies it never sent (it printed BusyBox's layout on Ubuntu) and fails names the box cannot
   resolve as `getent` does; `ssh` times out on connect. A file the session writes now runs as
   itself whatever its name (`/tmp/w` used to run `w`), and a copy of a modeled binary runs as
-  that binary; `ls -d` lists a directory operand itself.
+  that binary; `ls -d` lists a directory operand itself. At an interactive terminal (SSH with a
+  pty, telnet, ADB) `read x` and `head -n 1` answer when Enter hands them their line, where they
+  waited for Ctrl-D: each Enter reruns the waiting line on the input so far (at most 64 times, on
+  at most 64 KiB) and keeps the run only if nothing still wants more, so `cat > f` still reads to
+  Ctrl-D and what is typed after a finished `read` is the next command. An SSH shell without a pty
+  reads a pipe as bash does: a bare `sh` reads the rest of the input as its script (it opened a
+  nested interactive level), there is no prompt, history or terminal variable, and the client's
+  EOF ends the shell with the last command's status (the session used to stay open).
 - **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
   0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
   echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks

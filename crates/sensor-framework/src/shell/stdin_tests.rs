@@ -4,7 +4,7 @@
 
 use md5::{Digest, Md5};
 
-use super::{EmitContext, FakeShell, InputEnd, LineStep};
+use super::{EmitContext, FakeShell, InputEnd, LineStep, RESUME_ATTEMPTS};
 use crate::fakefs::FakeFs;
 
 fn ctx() -> EmitContext {
@@ -328,4 +328,108 @@ fn ls_lists_a_file_operand_and_reports_a_missing_one() {
     );
     let (out, _) = conn.run("ls /tmp/one /tmp");
     assert_eq!(out, "/tmp/one\n\n/tmp:\none\n");
+}
+
+/// At a terminal a line reader answers once Enter hands it its line, as a real one does in
+/// canonical mode: `read x` and `head -n 1` finish on the first line, without waiting for
+/// Ctrl-D. A reader that wants more stays waiting, and nothing it did is kept until it finishes.
+#[test]
+fn a_terminal_line_reader_finishes_on_its_line_and_a_whole_input_reader_waits() {
+    let fs = FakeFs::new();
+    let mut sh = FakeShell::new(fs.share(), ctx());
+    assert!(matches!(
+        sh.start_line("read x; echo got=$x").0,
+        LineStep::AwaitingInput
+    ));
+    assert!(sh.try_finish_line(b"").is_none(), "no line yet");
+    assert!(sh.try_finish_line(b"hel").is_none(), "no Enter yet");
+    let done = sh
+        .try_finish_line(b"hello\n")
+        .expect("a whole line is enough");
+    assert_eq!((done.to_string().as_str(), done.status), ("got=hello\n", 0));
+    assert!(!sh.is_awaiting_input());
+    assert_eq!(sh.handle_input("echo $x").0.to_string(), "hello\n");
+
+    assert!(matches!(
+        sh.start_line("head -n 1").0,
+        LineStep::AwaitingInput
+    ));
+    assert_eq!(
+        sh.try_finish_line(b"line1\n").map(|r| r.to_string()),
+        Some("line1\n".to_string())
+    );
+
+    // Two reads want two lines: the first alone leaves the line waiting, unchanged.
+    assert!(matches!(
+        sh.start_line("read a; read b; echo $a-$b").0,
+        LineStep::AwaitingInput
+    ));
+    assert!(sh.try_finish_line(b"one\n").is_none());
+    assert!(sh.is_awaiting_input());
+    assert_eq!(
+        sh.try_finish_line(b"one\ntwo\n").map(|r| r.to_string()),
+        Some("one-two\n".to_string())
+    );
+
+    // `cat > f` reads to the end: no line finishes it, and the file it would write is not there
+    // until the input ends.
+    assert!(matches!(
+        sh.start_line("cat > /tmp/typed").0,
+        LineStep::AwaitingInput
+    ));
+    assert!(sh.try_finish_line(b"a\n").is_none());
+    assert!(
+        !fs.share().file_exists("/tmp/typed"),
+        "the waiting run was undone"
+    );
+    let done = sh.finish_line(b"a\nb\n", InputEnd::Eof);
+    assert_eq!(done.status, 0);
+    assert_eq!(fs.read_all("/tmp/typed", 64).unwrap(), b"a\nb\n");
+}
+
+/// Each try reruns the line, so a line is tried a bounded number of times and on bounded input;
+/// past either it waits for the input to end, as before.
+#[test]
+fn a_waiting_line_is_retried_a_bounded_number_of_times() {
+    let mut sh = FakeShell::new(FakeFs::new(), ctx());
+    assert!(matches!(
+        sh.start_line("read a; read b; echo $a-$b").0,
+        LineStep::AwaitingInput
+    ));
+    for _ in 0..RESUME_ATTEMPTS {
+        assert!(sh.try_finish_line(b"one\n").is_none());
+    }
+    assert!(
+        sh.try_finish_line(b"one\ntwo\n").is_none(),
+        "no tries left, though the input would do"
+    );
+    assert_eq!(
+        sh.finish_line(b"one\ntwo\n", InputEnd::Eof).to_string(),
+        "one-two\n"
+    );
+    // The byte bound: a line handed more than it reruns on waits for the end.
+    assert!(matches!(sh.start_line("read a").0, LineStep::AwaitingInput));
+    let big = format!("{}\n", "x".repeat(super::RESUME_BYTES));
+    assert!(sh.try_finish_line(big.as_bytes()).is_none());
+    assert!(sh.is_awaiting_input());
+}
+
+/// A login shell whose input is a pipe (an SSH shell request without a pty) is not interactive:
+/// a bare `sh` reads the rest of that input as its script, history keeps nothing, and the
+/// terminal and `.bashrc` variables are absent.
+#[test]
+fn a_shell_without_a_terminal_hands_its_input_to_a_bare_sh_as_a_script() {
+    let mut sh = FakeShell::new(FakeFs::new(), ctx()).with_terminal_input(false);
+    assert!(matches!(sh.start_line("sh").0, LineStep::AwaitingInput));
+    let ran = sh.finish_line(b"echo in-script\nexit 3\n", InputEnd::Eof);
+    assert_eq!((ran.to_string().as_str(), ran.status), ("in-script\n", 3));
+    assert_eq!(sh.last_status(), 3);
+    assert_eq!(sh.handle_input("history").0.to_string(), "");
+    let env = sh.handle_input("env").0.to_string();
+    for name in ["TERM=", "SSH_TTY=", "LS_COLORS=", "LESSOPEN="] {
+        assert!(!env.contains(name), "{name}: {env}");
+    }
+    // With a terminal the same `sh` opens an interactive level instead.
+    let mut tty = FakeShell::new(FakeFs::new(), ctx());
+    assert!(matches!(tty.start_line("sh").0, LineStep::Ran(_)));
 }

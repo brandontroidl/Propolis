@@ -126,6 +126,9 @@ pub struct Fed {
     pub echo: Vec<u8>,
     /// Set once the input has ended; the caller then calls [`HeldInput::finish`].
     pub ended: Option<HeldEnd>,
+    /// A terminal line reached the command (input made [`HeldInput::per_line`] stops right after
+    /// it), so the caller may try [`HeldInput::resume`].
+    pub line: bool,
 }
 
 /// The input of one held line, collected as it arrives and bounded by `max_captured_bytes` and
@@ -141,6 +144,8 @@ pub struct HeldInput {
     line: Vec<u8>,
     /// The previous byte was a CR, so a following LF or NUL is the rest of the same Enter.
     prev_cr: bool,
+    /// Stop after each line handed to the command, for the caller to try [`HeldInput::resume`].
+    per_line: bool,
     command: String,
     reason: &'static str,
     captures: StdinCaptures,
@@ -165,6 +170,7 @@ impl HeldInput {
             max_bytes,
             line: Vec::new(),
             prev_cr: false,
+            per_line: false,
             command: shell.awaiting_command().unwrap_or_default().to_string(),
             reason,
             captures: captures.clone(),
@@ -187,6 +193,29 @@ impl HeldInput {
         self.prev_cr = true;
     }
 
+    /// Hand a terminal's input over line by line: [`HeldInput::feed`] stops after each Enter so
+    /// the caller can [`HeldInput::resume`] the command on what it has, and the bytes after that
+    /// Enter stay the caller's if the command is done. For an interactive shell's terminal, where
+    /// what follows a finished `read` is the next command line.
+    pub fn per_line(&mut self) {
+        self.per_line = self.mode == InputMode::Terminal;
+    }
+
+    /// The last line handed over ended with a CR, so an LF right after it belongs to that Enter.
+    pub fn ended_on_cr(&self) -> bool {
+        self.prev_cr
+    }
+
+    /// Run the held line on the lines typed so far, the input still open. `Some` is its output
+    /// when that was enough for it (`read x`, `head -n 1`); the input is then recorded as
+    /// complete and this is done. `None` leaves it waiting for more.
+    pub fn resume(&mut self, shell: &mut FakeShell) -> Option<CommandResult> {
+        let result = shell.try_finish_line(self.body.as_slice())?;
+        let destination = shell.input_destination().map(str::to_string);
+        self.record(UploadEnd::TransferComplete, destination);
+        Some(result)
+    }
+
     /// Take `data` as input. Stops at the byte that ends the input (a terminal's Ctrl-D at the
     /// start of a line or Ctrl-C, or the capture ceiling), leaving the rest to the caller.
     pub fn feed(&mut self, data: &[u8]) -> Fed {
@@ -201,6 +230,7 @@ impl HeldInput {
                     taken: data.len(),
                     echo: Vec::new(),
                     ended,
+                    line: false,
                 }
             }
             InputMode::Terminal => self.feed_terminal(data),
@@ -242,6 +272,10 @@ impl HeldInput {
                     line.push(b'\n');
                     if !self.release(&line) {
                         fed.ended = Some(HeldEnd::Budget);
+                        return fed;
+                    }
+                    if self.per_line {
+                        fed.line = true;
                         return fed;
                     }
                 }
@@ -737,6 +771,47 @@ mod tests {
         let fed = input.feed(b"tail\x04\x04echo next");
         assert_eq!((fed.taken, fed.ended), (6, Some(HeldEnd::Eof)));
         assert_eq!(input.body.as_slice(), b"ac\nde\n\x01q\ntail");
+    }
+
+    /// Handed over line by line, the input stops after each Enter; a reader that has its line
+    /// finishes there, the input is captured as complete, and what follows is the shell's.
+    #[tokio::test]
+    async fn per_line_input_stops_at_each_enter_and_a_finished_reader_leaves_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let mut shell = FakeShell::new(FakeFs::new(), ctx());
+        assert!(matches!(
+            shell.start_line("read x; echo got=$x").0,
+            LineStep::AwaitingInput
+        ));
+        let mut input = HeldInput::new(
+            &shell,
+            InputMode::Terminal,
+            &captures,
+            "shell_stdin",
+            1 << 20,
+        );
+        input.per_line();
+        let fed = input.feed(b"hello\recho next\r");
+        assert_eq!((fed.taken, fed.line, fed.ended), (6, true, None));
+        assert_eq!(fed.echo, b"hello\r\n");
+        assert!(input.ended_on_cr());
+        let output = input.resume(&mut shell).expect("`read` has its line");
+        assert_eq!(output.to_string(), "got=hello\n");
+        assert!(!shell.is_awaiting_input());
+        drop(input);
+        drop(shell);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["metadata"]["end_reason"], "transfer_complete");
+        assert_eq!(events[0]["metadata"]["size"], 6);
+        // Without `per_line` a terminal input takes every line it is given at once.
+        let (_shell, mut whole, _captures) = terminal(1 << 20);
+        let fed = whole.feed(b"a\rb\r");
+        assert_eq!((fed.taken, fed.line), (4, false));
     }
 
     #[tokio::test]

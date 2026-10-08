@@ -274,9 +274,14 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `max_captured_bytes` and the capture memory budget; reaching either ends it there and the
   command sees end of file. What the command consumed is captured as `exec_stdin` or
   `shell_stdin` ([events-and-signals.md](events-and-signals.md#capture_reason-and-the-standard-input-keys)).
-  Output is sent when the command ends, not as it reads: a typed `cat` with no redirection prints
-  its lines after Ctrl-D, not one by one, and `read` or `head -n 1` at a terminal waits for Ctrl-D
-  where a real one returns after its line.
+  At an interactive shell's terminal each Enter reruns the waiting line on the lines typed so far
+  with the input still open (`crates/sensor-framework/src/shell/mod.rs#FakeShell::try_finish_line`):
+  a line whose readers had all they wanted finishes there, so `read x; echo $x` and `head -n 1`
+  answer after their line as a real terminal's do, and the bytes after that Enter are the next
+  command. A line that still wants more (`cat > f`) is undone and keeps waiting; it is rerun at
+  most `RESUME_ATTEMPTS` (64) times and on at most `RESUME_BYTES` (64 KiB) of input, past which
+  it waits for the input to end. Output is sent when the command ends, not as it reads: a typed
+  `cat` with no redirection prints its lines after Ctrl-D, not one by one.
 - Shell identity is state, not fixed response text (`crates/sensor-framework/src/shell/mod.rs#ShellContext`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::prompt`). An Ubuntu login starts as
   `-bash`, uses the interactive command-not-found handler and a prompt that follows
   the working directory. SSH exec uses `bash: line 1:` diagnostics and no prompt.
@@ -534,9 +539,13 @@ captures SCP/SFTP transfers.
   client's `CHANNEL_EOF`, a `CHANNEL_CLOSE` (the command is killed and nothing is sent), the
   capture ceiling, or the session's end. With a pty the input is a terminal (echo, Ctrl-D,
   Ctrl-C), without one a pipe. At the shell, a typed line that reads its input takes the bytes
-  after it (to Ctrl-D with a pty, to the channel's EOF without one) and the prompt returns when it
-  ends; those bytes are its input and are not also offered to the binary-payload capture
-  (`crates/sensor-ssh/src/server.rs#ChannelHandler`). `MAX_LINE_LEN = 8192`
+  after it (with a pty, each line until the command has what it reads for, or to Ctrl-D; without
+  one, to the channel's EOF) and the prompt returns when it ends; those bytes are its input and
+  are not also offered to the binary-payload capture
+  (`crates/sensor-ssh/src/server.rs#ChannelHandler`). A shell without a pty reads a pipe as
+  bash does: no prompt, no `TERM`, `SSH_TTY` or `.bashrc` variables, no history, a bare `sh`
+  reads the rest of the input as its script, and the client's `CHANNEL_EOF` ends the shell
+  with the last command's status. `MAX_LINE_LEN = 8192`
   (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/server.rs#build_channel_extended_data`, `crates/sensor-ssh/src/server.rs#MAX_LINE_LEN`, `crates/sensor-framework/src/shell/mod.rs#onlcr`).
 - **Exec lifecycle:** a one-shot exec sends its queued output, then `exit-status`
   (`want_reply` false), then `CHANNEL_EOF`, then `CHANNEL_CLOSE`, each only once all
@@ -586,7 +595,8 @@ credential, then presents the fake shell.
   only when the shell reports `close_session` (see below). `MAX_LINE_LEN` 8192
   (`crates/sensor-telnet/src/handler.rs#LineReader`). The reader keeps what it read off the
   socket and cuts lines from it only as they are wanted, so a typed line that reads its input
-  (`cat > f`) takes the raw bytes after it, as a terminal, until Ctrl-D, the same input model as
+  (`cat > f`) takes the raw bytes after it, as a terminal, until Ctrl-D or until the command has
+  the lines it reads for (`read x`), the same input model as
   the SSH shell (`crates/sensor-telnet/src/handler.rs#LineReader::read_held`). The rest of a
   CR-LF or CR-NUL Enter already read stays with its line. The binary-payload capture keeps the
   bytes the line reader consumed, so input a command consumed is captured once, as that.
@@ -1218,7 +1228,8 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
   command is killed, nothing is sent, the capture's end is `peer_closed`), the capture ceiling
   (the command runs on what was kept and the stream closes after its output) or the session's
   end ends it. At the interactive `shell:` a typed line that reads its input takes what is typed
-  after it until Ctrl-D, as on the SSH and telnet shells
+  after it until Ctrl-D or until the command has the lines it reads for, as on the SSH and
+  telnet shells
   (`crates/sensor-adb/src/handler.rs#HeldStdin`). Sync sub-protocol: SEND/DATA/DONE → captures the pushed file →
   `honeypot_malware_upload`; RECV → refused (`FAIL Permission denied`, **never
   serves outbound**); STAT → not-found. Sync body cap `MAX_SYNC_BODY` 10_000_000

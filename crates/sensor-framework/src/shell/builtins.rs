@@ -185,9 +185,10 @@ impl FakeShell {
 
     /// Note a line typed at the interactive login shell, as bash with Ubuntu's stock
     /// `HISTCONTROL=ignoreboth` does: a line starting with a space is not kept, nor a repeat of
-    /// the line before it.
+    /// the line before it. A login shell without a terminal is not interactive and keeps none.
     pub(super) fn record_history(&mut self, raw: &str) {
         if self.context != super::ShellContext::LoginInteractive
+            || !self.tty_input
             || !matches!(self.active_level(), ShellLevel::Bash { .. })
             || !self.pending.is_empty()
         {

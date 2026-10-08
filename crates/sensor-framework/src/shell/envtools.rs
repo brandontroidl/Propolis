@@ -186,8 +186,11 @@ impl FakeShell {
                 state.set_var("SSH_TTY", "/dev/pts/0".to_string(), true);
             }
         } else {
-            state.vars.remove("TERM");
-            state.vars.remove("SSH_TTY");
+            // Without a terminal bash is not interactive and the stock `.bashrc` returns before
+            // it sets the `less` and `ls` variables.
+            for name in ["TERM", "SSH_TTY", "LS_COLORS", "LESSOPEN", "LESSCLOSE"] {
+                state.vars.remove(name);
+            }
         }
     }
 

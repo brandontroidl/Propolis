@@ -152,8 +152,15 @@
   its line, now reported as `intake wedged at <sensor>` after three consecutive refusals of the
   same line, quoted by `intake-stalled`. Probe confirmations are recorded only for lines the
   append reached. The console's delist, relist and delete take the append lock, so one landing
-  mid-batch is no longer overwritten. A lost commit acknowledgement still replays a batch
-  (at-least-once). `append_bench` gains a `batched` mode that also reports how long a second
+  mid-batch is no longer overwritten, and the review queue's population scan skips a delisted
+  address. The position after a partial commit is computed from the line lengths recorded at
+  read time (`LogTailer::commit_batch_through`), not by reading again: a re-read goes through
+  rotation handling, and a `copytruncate` landing during the append returned the new file's
+  first lines, which were then marked done unread; now a changed file means the batch is read
+  again from its start (replayed, never skipped). The cursor is persisted after a partial
+  commit so a restart resumes at the refused line, and a dropped connection between refusals
+  no longer resets the three-poll wedge count. A lost commit acknowledgement still replays a
+  batch (at-least-once). `append_bench` gains a `batched` mode that also reports how long a second
   writer waits on the lock.
 
 - **Declared crawlers can be kept out of the published feed by address, and the HTTP sensor labels

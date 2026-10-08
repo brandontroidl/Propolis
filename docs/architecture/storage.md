@@ -153,7 +153,10 @@ An append reads a source's `ip_score` when it starts and writes it back at commi
 console's delist, relist and delete take the same lock for their transaction
 (`crates/core-scoring/src/repository/events.rs#begin_exclusive`); without it, one landing
 mid-batch would be overwritten (a delete undone, a delist's flags lost) and the review queue would
-re-queue the address.
+re-queue the address. That lock is the global one every sensor's appends wait on, so those console
+transactions hold every writer for their duration and must stay short (three statements today).
+The review queue's population scan also skips a delisted address outright, so a stale
+eligibility flag cannot queue one.
 
 The lock is held for the whole batch, so a batch bounds how long other writers wait. Measured on
 a 1M-row ledger with a 200k-event hot source (tmpfs-backed server, where a commit costs nothing

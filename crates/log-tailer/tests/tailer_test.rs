@@ -607,3 +607,80 @@ fn a_byte_budget_applies_across_a_draining_inode_and_loses_nothing() {
     }
     assert_eq!(seen, vec!["old2", "old3", "new1", "new2"]);
 }
+
+fn numbered(prefix: &str, n: usize) -> String {
+    (0..n)
+        .map(|i| format!("{prefix}-{i:03}-padding-padding-padding-padding\n"))
+        .collect()
+}
+
+fn line_of(prefix: &str, i: usize) -> String {
+    format!("{prefix}-{i:03}-padding-padding-padding-padding")
+}
+
+/// Accepting a prefix moves the positions over exactly those lines without reading them again;
+/// the next read starts at the first line not accepted.
+#[test]
+fn commit_batch_through_starts_the_next_read_after_the_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, numbered("l", 12)).unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(8).len(), 8);
+    assert!(tailer.commit_batch_through(5));
+    assert_eq!(tailer.read_batch(100)[0], line_of("l", 5));
+    // Nothing to accept past what the batch returned, and nothing uncommitted after a commit.
+    tailer.commit_batch();
+    assert!(!tailer.commit_batch_through(1));
+}
+
+/// A `copytruncate` that lands between the read and the accept (the append is in flight) must
+/// not make the accept skip lines: the tailer refuses, and after a rewind the next read starts
+/// at the NEW file's first line, not at the line count of the old batch.
+#[test]
+fn commit_batch_through_refuses_after_a_copytruncate_and_skips_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, numbered("old", 13)).unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(3).len(), 3);
+    tailer.commit_batch();
+    assert_eq!(tailer.read_batch(10).len(), 10);
+
+    // copytruncate: the same inode is emptied and refilled.
+    std::fs::write(&log_path, "").unwrap();
+    append(&log_path, &numbered("new", 20));
+
+    assert!(
+        !tailer.commit_batch_through(5),
+        "must not accept over a replaced file"
+    );
+    tailer.rewind_batch();
+    assert_eq!(
+        tailer.read_batch(3),
+        vec![line_of("new", 0), line_of("new", 1), line_of("new", 2)]
+    );
+}
+
+/// The positions are right across a rotated-out inode that is still being drained: the prefix may
+/// end inside the drain or in the new file.
+#[test]
+fn commit_batch_through_spans_a_draining_inode_and_the_new_file() {
+    for (prefix, next) in [(2usize, line_of("old", 3)), (6, line_of("new", 1))] {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        std::fs::write(&log_path, numbered("old", 6)).unwrap();
+        let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+        assert_eq!(tailer.read_batch(1).len(), 1);
+        tailer.commit_batch();
+        std::fs::rename(&log_path, dir.path().join("events.jsonl.1")).unwrap();
+        std::fs::write(&log_path, numbered("new", 4)).unwrap();
+
+        // old-001 .. old-005 then new-000 .. new-003.
+        assert_eq!(tailer.read_batch(9).len(), 9);
+        assert!(tailer.commit_batch_through(prefix), "prefix {prefix}");
+        let rest = tailer.read_batch(100);
+        assert_eq!(rest[0], next, "prefix {prefix}");
+        assert_eq!(rest.len(), 9 - prefix, "prefix {prefix}");
+    }
+}

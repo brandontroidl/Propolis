@@ -240,7 +240,7 @@ async fn run_intake_sensor(
             );
         }
 
-        if result.errors == 0
+        if result.cursor_moved()
             && let Err(e) = runner.persist_cursor()
         {
             tracing::error!(sensor = %name, error = %e, "intake: cursor persist failed");

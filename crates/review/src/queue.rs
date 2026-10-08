@@ -84,6 +84,7 @@ impl ReviewQueue {
              FROM ip_score \
              WHERE recommended_for_vendor = TRUE \
                AND eligible = TRUE \
+               AND NOT delisted \
                AND source_ip NOT IN (SELECT source_ip FROM review_queue) \
              ON CONFLICT (source_ip) DO NOTHING",
         )

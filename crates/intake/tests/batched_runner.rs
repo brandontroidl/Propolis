@@ -183,6 +183,45 @@ async fn a_line_the_database_refuses_stops_the_batch_and_the_prefix_is_not_repla
     assert_eq!(verify_chain(&pool).await.unwrap(), ChainStatus::Intact);
 }
 
+/// The cursor is persisted after a partial commit, so a restart (an operator's response to a
+/// wedge page) resumes at the refused line instead of replaying what already committed.
+#[sqlx::test(migrations = false)]
+async fn a_restart_after_a_partial_commit_resumes_at_the_refused_line(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let lines: Vec<String> = (0..20)
+        .map(|n| {
+            let metadata = if n == 12 {
+                serde_json::json!({ "command": "echo \u{0}" })
+            } else {
+                serde_json::json!({ "n": n })
+            };
+            line(n, SIGNAL_HONEYPOT_COMMAND_EXEC, metadata)
+        })
+        .collect();
+    write_lines(dir.path(), &lines);
+
+    let mut first = runner(&pool, dir.path());
+    let result = first.run_batch().await;
+    assert_eq!((result.ingested, result.errors), (12, 1));
+    assert!(
+        result.cursor_moved(),
+        "the loop persists after a partial commit"
+    );
+    first.persist_cursor().unwrap();
+    drop(first);
+
+    let mut restarted = runner(&pool, dir.path());
+    let again = restarted.run_batch().await;
+    assert_eq!((again.ingested, again.errors), (0, 1));
+    assert!(!again.cursor_moved());
+    assert_eq!(
+        ledger_rows(&pool).await,
+        12,
+        "the restart replayed the committed prefix"
+    );
+}
+
 /// After a batch has grown to its largest, a burst of near-megabyte lines must not be read a
 /// thousand at a time: a batch stops at the byte budget, so memory is bounded by bytes, and every
 /// line still gets ingested across batches.

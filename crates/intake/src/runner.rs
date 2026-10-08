@@ -40,6 +40,17 @@ pub struct RunBatchResult {
     pub errors: usize,
 }
 
+impl RunBatchResult {
+    /// Whether the intake loop should persist the cursor after this batch. The runner leaves the
+    /// tailer at the first line that failed to reach the ledger (or at the batch start if it could
+    /// not tell), so persisting is always safe; it is worth doing whenever the position moved,
+    /// including after a partial commit, so a restart (an operator's response to a wedge page)
+    /// does not replay what already committed. An idle failure moved nothing and is skipped.
+    pub fn cursor_moved(&self) -> bool {
+        self.errors == 0 || self.ingested > 0 || self.rejected > 0 || self.probe_confirmations > 0
+    }
+}
+
 /// Polls one sensor's NDJSON log via `LogTailer` and appends each valid line to the
 /// `core-scoring` ledger.
 pub struct IntakeRunner {
@@ -349,20 +360,19 @@ impl IntakeRunner {
                     "append failed, stopping batch"
                 );
                 self.note_failure(&e, pending.get(outcome.appended));
-                // Back to the start of the batch, then forward over exactly the lines reached.
-                self.tailer.rewind_batch();
-                if reached > 0 {
-                    if self.tailer.read_batch(reached).len() == reached {
-                        self.tailer.commit_batch();
-                    } else {
-                        // The log changed under the re-read (rotated or truncated): do not guess
-                        // where the prefix ended. Replaying it is the safe direction.
+                // Accept exactly the lines reached, computed from the lengths recorded when they
+                // were read; never by reading them again, which would go through rotation
+                // handling and could return a different file's lines (a `copytruncate` landing
+                // while the append was in flight). If the tailer cannot do that safely, the whole
+                // batch is read again: replayed, never skipped.
+                if reached == 0 || !self.tailer.commit_batch_through(reached) {
+                    if reached > 0 {
                         tracing::warn!(
                             sensor = %self.sensor_name,
-                            "could not re-read the committed prefix; the batch will be read again"
+                            "the log changed under a failed batch; it will be read again from the start"
                         );
-                        self.tailer.rewind_batch();
                     }
+                    self.tailer.rewind_batch();
                 }
             }
         }
@@ -374,8 +384,10 @@ impl IntakeRunner {
 
     /// Tracks how many polls in a row the same line was refused for a reason of its own.
     fn note_failure(&mut self, error: &core_scoring::RepoError, at: Option<&Pending>) {
+        // A failure that is not about one line (a dropped connection) says nothing about whether
+        // the wedged line is still refused, so it neither counts toward nor clears the streak:
+        // a database that blips between refusals must not keep the report from ever appearing.
         let Some(p) = at.filter(|_| error.is_event_specific()) else {
-            self.wedge = None;
             return;
         };
         let polls = match &self.wedge {
@@ -431,6 +443,86 @@ mod tests {
             MIN_BATCH_LINES
         );
         assert_eq!(next_batch_size(1000, 0, 0, false), MIN_BATCH_LINES);
+    }
+
+    fn lazy_runner() -> IntakeRunner {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap();
+        let dir = std::env::temp_dir().join("intake-runner-unit-no-io");
+        IntakeRunner::new(
+            LogTailer::new(dir.join("none.jsonl"), dir.join("cursors")),
+            pool,
+            "telnet".into(),
+            Arc::new(HashSet::new()),
+            Duration::from_secs(1),
+        )
+    }
+
+    fn pending(hash: u64) -> Pending {
+        Pending {
+            line: 0,
+            observed_at: "2026-09-01T00:00:00Z".parse().unwrap(),
+            sensor: "telnet".into(),
+            line_hash: hash,
+        }
+    }
+
+    fn refused() -> core_scoring::RepoError {
+        core_scoring::RepoError::Invalid(core_scoring::ValidationError::SensorEmpty)
+    }
+
+    fn blip() -> core_scoring::RepoError {
+        core_scoring::RepoError::Db(sqlx::Error::PoolTimedOut)
+    }
+
+    /// A database that drops a connection between refusals of the same line must not keep the
+    /// wedge report from ever appearing: a blip neither counts toward the streak nor clears it.
+    /// A different refused line starts a new streak.
+    #[tokio::test]
+    async fn a_connection_blip_neither_counts_toward_nor_clears_the_wedge_streak() {
+        let mut runner = lazy_runner();
+        let line = pending(7);
+        runner.note_failure(&refused(), Some(&line));
+        runner.note_failure(&refused(), Some(&line));
+        runner.note_failure(&blip(), Some(&line));
+        assert!(
+            runner.wedged().is_none(),
+            "two refusals are not yet a wedge"
+        );
+        runner.note_failure(&blip(), None);
+        runner.note_failure(&refused(), Some(&line));
+        assert!(
+            runner.wedged().is_some(),
+            "the blips must not have reset the streak"
+        );
+
+        runner.note_failure(&refused(), Some(&pending(8)));
+        assert!(
+            runner.wedged().is_none(),
+            "a different line starts a new streak"
+        );
+    }
+
+    #[test]
+    fn the_cursor_is_persisted_whenever_the_position_moved() {
+        let moved = |ingested, rejected, probe_confirmations, errors| {
+            RunBatchResult {
+                ingested,
+                rejected,
+                probe_confirmations,
+                errors,
+            }
+            .cursor_moved()
+        };
+        assert!(moved(0, 0, 0, 0), "a clean empty batch");
+        assert!(moved(5, 0, 0, 0));
+        assert!(moved(12, 0, 0, 1), "a partial commit before a refused line");
+        assert!(
+            moved(0, 3, 0, 1),
+            "rejected lines committed before a refused line"
+        );
+        assert!(!moved(0, 0, 0, 1), "an idle failure moved nothing");
     }
 
     #[test]

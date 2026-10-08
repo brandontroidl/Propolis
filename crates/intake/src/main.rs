@@ -227,13 +227,12 @@ async fn shutdown_signal() {
     }
 }
 
-/// One sensor's poll loop: read a batch, append what converts, and persist the cursor only when
-/// the whole batch appended cleanly. Guarding on `result.errors == 0` before persisting is the
-/// at-least-once guarantee (`IntakeRunner::persist_cursor`'s own doc comment and
-/// `internal/design/03-event-intake-aggregation.md`'s "Cursor advancement rules": "Database
-/// error: cursor does NOT advance"): persisting past a batch that hit a database error partway
-/// through would durably skip the failed line - and everything the tailer already read after it
-/// in that batch - instead of retrying it on the next poll.
+/// One sensor's poll loop: read a batch, append what converts, and persist the cursor when the
+/// position moved (`RunBatchResult::cursor_moved`). After a database error the runner leaves the
+/// tailer AT the first line that failed to reach the ledger, never past it, so persisting is the
+/// at-least-once guarantee intact (`internal/design/03-event-intake-aggregation.md`'s "Cursor
+/// advancement rules": "Database error: cursor does NOT advance" past the failed line), and it
+/// stops a restart from replaying the part of a batch that already committed.
 async fn run_sensor_loop(
     sensor: SensorLogConfig,
     pool: PgPool,
@@ -265,7 +264,7 @@ async fn run_sensor_loop(
             );
         }
 
-        if result.errors == 0
+        if result.cursor_moved()
             && let Err(e) = runner.persist_cursor()
         {
             tracing::error!(sensor = %name, error = %e, "intake: cursor persist failed");

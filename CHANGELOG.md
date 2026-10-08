@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- **The configuration check no longer reports a loopback-only service as exposed** - on its
+  first production run `deploy/config-check.sh` warned that the host's PostgreSQL on 5432 was
+  "reachable from anywhere the network allows", and would have called it `DANGEROUS` behind an
+  open firewall, while it listened only on `127.0.0.1` and `[::1]`. The verdict came from the
+  sensor's configured `0.0.0.0` instead of the address the other process is bound to. Exposure
+  is now judged from the holder's own sockets: any non-loopback one makes it exposed, loopback
+  only does not. A loopback-only holder still fails the row, because the sensor's wildcard bind
+  cannot share the port, and its fix line now says to bind the sensor to the host's network
+  address instead.
 - **Modeled binaries survive inspection** - every executable the Ubuntu persona serves was its
   recorded 64-byte header followed by `0x80 | (offset & 0x3f)` filler, identical for every
   binary, so `busybox cat /proc/self/exe` flooded two megabytes of U+FFFD and `readelf` found

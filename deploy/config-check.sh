@@ -398,12 +398,18 @@ name_matches() {
 }
 
 # listen_probe PROTO PORT BIND EXPECTED-BINARY: sets LISTEN_STATE (ours | foreign | ownerless |
-# none | unavailable) and LISTEN_NAMES (the foreign process names, comma separated).
+# none | unavailable), LISTEN_NAMES (the foreign process names, comma separated) and
+# LISTEN_EXPOSED (1 when a socket not owned by the sensor is bound to a non-loopback address).
+# Exposure is judged from where the other socket is actually bound, not from the sensor's
+# configured address: a database on 127.0.0.1:5432 blocks a sensor on 0.0.0.0:5432 but is not
+# reachable from the network.
 listen_probe() {
     local proto="$1" port="$2" bind="$3" expected="$4"
     local line state rq sq laddr peer rest lhost chost re name ours=0 foreign="" ownerless=0
+    local line_foreign
     LISTEN_STATE=none
     LISTEN_NAMES=""
+    LISTEN_EXPOSED=0
     if [ "$SS_OK" -eq 0 ]; then
         LISTEN_STATE=unavailable
         return 0
@@ -424,17 +430,25 @@ listen_probe() {
         fi
         if [[ "$rest" != *'users:'* ]]; then
             ownerless=1
+            is_loopback "$lhost" || LISTEN_EXPOSED=1
             continue
         fi
+        line_foreign=0
         while [[ "$rest" =~ $re ]]; do
             name="${BASH_REMATCH[1]}"
             rest="${rest#*"${BASH_REMATCH[0]}"}"
             if name_matches "$name" "$expected"; then
                 ours=1
-            elif [[ ",$foreign," != *",$name,"* ]]; then
-                foreign="${foreign:+$foreign,}$name"
+            else
+                line_foreign=1
+                if [[ ",$foreign," != *",$name,"* ]]; then
+                    foreign="${foreign:+$foreign,}$name"
+                fi
             fi
         done
+        if [ "$line_foreign" -eq 1 ] && ! is_loopback "$lhost"; then
+            LISTEN_EXPOSED=1
+        fi
     done <<<"${SS_OUT[$proto]}"
     if [ "$ours" -eq 1 ]; then
         LISTEN_STATE=ours
@@ -976,9 +990,15 @@ check_listener() {
         foreign)
             foreign=1
             setcell "$i" listen fail "OTHER:$LISTEN_NAMES"
-            finding fail "$scope" "listen:$proto:$port" \
-                "$proto/$port is held by another process ($LISTEN_NAMES), not $expected: $unit cannot bind it, so $scope is not being collected" \
-                "sudo ss -$([ "$proto" = udp ] && echo lunp || echo ltnp) 'sport = :$port'; stop that process or move it off $proto/$port (a database belongs on 127.0.0.1), then: sudo systemctl restart $unit.service"
+            if [ "$LISTEN_EXPOSED" -eq 1 ]; then
+                finding fail "$scope" "listen:$proto:$port" \
+                    "$proto/$port is held by another process ($LISTEN_NAMES), not $expected: $unit cannot bind it, so $scope is not being collected" \
+                    "sudo ss -$([ "$proto" = udp ] && echo lunp || echo ltnp) 'sport = :$port'; stop that process or move it off $proto/$port (a database belongs on 127.0.0.1), then: sudo systemctl restart $unit.service"
+            else
+                finding fail "$scope" "listen:$proto:$port" \
+                    "$proto/$port is held on loopback only by another process ($LISTEN_NAMES), so it is not reachable from the network, but $unit cannot bind ${addr} over it and $scope is not being collected" \
+                    "keep that process on loopback and give the sensor this host's network address instead (a specific address can share the port with a loopback listener): set ${R_VAR[$i]}=<this host's address>:$port in $ENV_DIR/*.env, then: sudo systemctl restart $unit.service"
+            fi
             ;;
         ownerless)
             if [ "$unit_known" -eq 1 ] && [ "$a" != active ]; then
@@ -1025,12 +1045,12 @@ check_listener() {
                 fi
                 ;;
         esac
-        if [ "$foreign" -eq 1 ] && [ "$FW_STATE" = open ]; then
+        if [ "$foreign" -eq 1 ] && [ "$LISTEN_EXPOSED" -eq 1 ] && [ "$FW_STATE" = open ]; then
             setcell "$i" firewall fail "OPEN to a non-sensor"
             finding fail "$scope" "danger:$proto:$port" \
                 "DANGEROUS: $proto/$port is open in the $FW_KIND firewall and bound by a process that is not $expected${LISTEN_NAMES:+ ($LISTEN_NAMES)}: a real service is exposed to the internet through a honeypot port" \
                 "close it: $(fw_close_fix "$proto" "$port")   (or stop/rebind that service to 127.0.0.1, then restart $unit.service)"
-        elif [ "$foreign" -eq 1 ] && [ "$FW_STATE" = none ]; then
+        elif [ "$foreign" -eq 1 ] && [ "$LISTEN_EXPOSED" -eq 1 ] && [ "$FW_STATE" = none ]; then
             finding warn "$scope" "nofw:$proto:$port" \
                 "no host firewall was detected and $proto/$port is held by a non-sensor process: it is reachable from anywhere the network allows" \
                 "install and enable a host firewall, or move that service to 127.0.0.1"

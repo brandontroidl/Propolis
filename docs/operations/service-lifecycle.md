@@ -218,11 +218,20 @@ EVENTS column is keyed by the name the sensor reports in `event.sensor` (`postgr
 read-only query fails; the password is handed to `psql` through its environment, never on a
 command line.
 
-**The dangerous row.** A port that is open in the firewall and held by a process that is not
-the expected sensor is reported first, as `DANGEROUS`, for example a host PostgreSQL on 5432
-while `sensor-cred` is configured for it and the firewall exposes 5432. Its fix line names the
-firewall command that closes the port. A foreign holder behind a closed firewall is still a
-failure, but not that one.
+**The dangerous row.** A port that is open in the firewall and held, on a non-loopback
+address, by a process that is not the expected sensor is reported first, as `DANGEROUS`, for
+example a host PostgreSQL listening on `0.0.0.0:5432` while `sensor-cred` is configured for it
+and the firewall exposes 5432. Its fix line names the firewall command that closes the port. A
+foreign holder behind a closed firewall is still a failure, but not that one.
+
+Exposure is judged from the address the other process actually listens on, not from the
+sensor's configured address. A host PostgreSQL on `127.0.0.1:5432` and `[::1]:5432` (the
+Debian default) is not reachable from the network, but it still stops `sensor-cred` binding
+`0.0.0.0:5432`, so the row fails as `held on loopback only`. The fix is to leave the database
+on loopback and bind the sensor to the host's network address
+(`PROPOLIS_CRED_PG_BIND=<address>:5432`): a specific address can share a port with a
+loopback listener, a wildcard cannot. That address must not change, so reserve it if it comes
+from DHCP.
 
 Below the table, HOST rows cover what no single listener owns: the log rotation timer, its
 state file (older than three hours fails, the daemon's `rotation-stale` threshold) and the

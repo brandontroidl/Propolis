@@ -951,6 +951,72 @@ fn a_foreign_holder_with_no_firewall_detected_warns_it_is_reachable() {
     assert!(!msgs.contains("DANGEROUS"), "{msgs}");
 }
 
+// The production box's case: the host's own PostgreSQL on 127.0.0.1 and [::1] blocks sensor-cred's
+// 0.0.0.0:5432 bind, while the firewall allows 5432. Exposure is a property of where the other
+// process listens, so this is a collection failure, never DANGEROUS and never "reachable".
+#[test]
+fn a_loopback_only_holder_blocks_the_sensor_but_is_not_reported_as_exposed() {
+    let tcp = [
+        ("0.0.0.0:22", "sensor-ssh"),
+        ("0.0.0.0:1883", "sensor-mqtt"),
+        ("127.0.0.1:5432", "postgres"),
+        ("[::1]:5432", "postgres"),
+        ("203.0.113.7:53", "sensor-dns"),
+    ];
+    let udp = [
+        ("0.0.0.0:69", "sensor-tftp"),
+        ("203.0.113.7:53", "sensor-dns"),
+    ];
+
+    let fx = Fx::new();
+    fx.ss(&tcp, &udp);
+    let r = fx.run(&[]);
+    assert_eq!(r.code, 2);
+    let v = fx.json();
+    assert_eq!(check(&v, "postgresql", "tcp", "listen"), "fail");
+    assert_ne!(check(&v, "postgresql", "tcp", "firewall"), "fail");
+    let msgs = finding_messages(&v).join("\n");
+    assert!(!msgs.contains("DANGEROUS"), "{msgs}");
+    assert!(
+        msgs.contains("tcp/5432 is held on loopback only by another process (postgres), so it is not reachable from the network"),
+        "{msgs}"
+    );
+    assert!(
+        msgs.contains("set PROPOLIS_CRED_PG_BIND=<this host's address>:5432"),
+        "{msgs}"
+    );
+    assert!(!msgs.contains("move it off tcp/5432"), "{msgs}");
+
+    let fx = Fx::new();
+    fx.remove_stub("ufw");
+    fx.ss(&tcp, &udp);
+    let msgs = finding_messages(&fx.json()).join("\n");
+    assert!(msgs.contains("held on loopback only"), "{msgs}");
+    assert!(!msgs.contains("reachable from anywhere"), "{msgs}");
+}
+
+// One non-loopback socket is enough: a holder on loopback AND a network address is exposed.
+#[test]
+fn a_holder_on_loopback_and_a_network_address_is_still_exposed() {
+    let fx = Fx::new();
+    fx.ss(
+        &[
+            ("0.0.0.0:22", "sensor-ssh"),
+            ("0.0.0.0:1883", "sensor-mqtt"),
+            ("127.0.0.1:5432", "postgres"),
+            ("198.51.100.20:5432", "postgres"),
+            ("203.0.113.7:53", "sensor-dns"),
+        ],
+        &[
+            ("0.0.0.0:69", "sensor-tftp"),
+            ("203.0.113.7:53", "sensor-dns"),
+        ],
+    );
+    let msgs = finding_messages(&fx.json()).join("\n");
+    assert!(msgs.contains("DANGEROUS: tcp/5432"), "{msgs}");
+    assert!(!msgs.contains("held on loopback only"), "{msgs}");
+}
+
 #[test]
 fn a_local_resolver_on_another_address_is_not_a_conflict_with_the_sensor() {
     let fx = Fx::new();

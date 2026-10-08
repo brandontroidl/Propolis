@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Campaigns and indicators
@@ -26,13 +26,38 @@ Cheapest first; an address can be a member of several campaigns.
 | Same commands (`command_sequence`) | every address that ran a shell session whose command run has the same fingerprint | the fingerprint |
 | Multi-service scan (`scanner`) | every address that reached 3 distinct sensors within one clock hour | the first 3 sensors it reached in that hour, sorted |
 
-**Fingerprint.** Each command is reduced to a shape: escape runs, long hex and base64 runs and
-whitespace runs replaced the way the sensors' flood gate does it, then IPv4 and bracketed IPv6
-addresses become `<ip>` and a port after an address or host name becomes `<port>`
-(`crates/review/src/campaign/fingerprint.rs#normalize`). Consecutive repeats collapse, so an echo
-loader's chunk count, a `cat > astats` retried three times, or the repeats the flood gate
-summarized away do not split one tool into several campaigns. The fingerprint is a running SHA-256
-over the collapsed shapes (`crates/review/src/campaign/fingerprint.rs#RunDigest`).
+**Shape.** Each command is reduced to a shape (`crates/review/src/campaign/fingerprint.rs#normalize`):
+
+- escape runs, long hex and base64 runs and whitespace runs replaced the way the sensors' flood
+  gate does it;
+- IPv4 and bracketed IPv6 addresses become `<ip>` and a port after an address or host name becomes
+  `<port>`;
+- per-session random tokens become placeholders: a run of 4 or more decimal digits is `<num>`
+  (`echo P155084A` is `echo P<num>A`, `$(( 155084 + 1 ))` is `$(( <num> + 1 ))`), a word of 6 or
+  more hex characters holding both a digit and a letter is `<hex>` (`N=49482a1671`), and the value
+  of a `NAME=value` assignment of 8 or more characters with 3 or more digits is `<tok>`.
+
+Numbers of 3 digits or fewer are kept, because they are part of the tool: `x86` and `arm7`,
+`-p 22`, `sleep 30`, `ttyS0`. A 4-digit file mode after `chmod` (`0755`) is kept for the same
+reason. Consecutive repeats of a shape collapse, so an echo loader's chunk count, a `cat > astats`
+retried three times, or the repeats the flood gate summarized away do not split one tool into
+several campaigns.
+
+**Fingerprint.** The campaign key is a running SHA-256 over the first 4 shapes of a run that are
+not shell-entry lines (`crates/review/src/campaign/fingerprint.rs#KEY_SHAPES`,
+`crates/review/src/campaign/fingerprint.rs#RunDigest`), not over the whole run. The shell-entry
+lines (`start`, `enable`, `config terminal`, `system`, `linuxshell`, `su`, `shell`, `sh`) are how
+a device lets a bot in, not the bot, and are skipped. A bot that disconnects after five commands
+and one that runs sixteen are the same campaign; two loaders that share their first four commands
+and differ afterwards are one campaign too. Two classes are keyed as one each:
+
+- a run whose first command is an HTTP request line or header (`GET / HTTP/1.1`,
+  `User-Agent: ...`), a client that spoke HTTP to a shell port, in any header order;
+- a run of shell-entry lines only, a login that went nowhere.
+
+`crates/review/tests/campaign_test.rs` holds the cases: one loader cut at 1 to 16 commands, loaders
+that share three commands staying apart, `x86` against `arm7`, the random-token families, header
+probes and entry-only runs.
 
 **Runs.** A session's run ends at a gap of more than 10 minutes between two of its own commands
 (`crates/review/src/campaign/mod.rs#SESSION_IDLE_SECS`), once its sensor has logged events an hour
@@ -42,9 +67,12 @@ fewer than 20 characters, a bare `enable; system; shell; sh`, joins nothing
 (`crates/review/src/campaign/mod.rs#MIN_RUN_CHARS`). Samples a session uploads are linked to the
 campaign its run joins.
 
-**Labels.** A campaign's label and representative come from the lowest event id that formed it: a
-sample's digest and file name, a command sequence's first three shapes after the shell-entry
-preamble with the full shape list, or a scanner's sensor set.
+**Labels.** A campaign's representative comes from the lowest event id that formed it: a sample's
+digest and file name, a command sequence's full shape list, or a scanner's sensor set. A command
+sequence's label is the fewest and most commands its runs held, as `3-16 commands`, then its first
+three shapes after the shell-entry lines, or `http request sent to a shell port` or
+`shell entry only` for the two classes above. The count includes the entry lines and stops at 64
+(`crates/review/src/campaign/mod.rs#MAX_RUN_SHAPES`).
 
 ## How it runs
 
@@ -89,8 +117,24 @@ running other test suites, so the figures are indicative):
 
 ### Rebuilding
 
-The campaign tables are derived state. To rebuild them, stop the daemon, empty them and set
+The campaign tables are derived state. To rebuild them all, stop the daemon, empty them and set
 `campaign_cursor.last_event_id` to 0; on the next start the indexer reads the whole ledger again.
+
+A change to the command-sequence fingerprint does not need that. `campaign_cursor.fingerprint_version`
+records which version built the command-sequence campaigns and the sessions' working state
+(`crates/review/src/campaign/mod.rs#FINGERPRINT_VERSION`); migration 0016 marks an existing
+database version 1, the key over the whole run. The first indexing batch of a build with another
+version deletes the command-sequence campaigns (their members, days, sensors and linked samples
+go with them), the sessions and the watermarks, remembers where the cursor was as `rebuild_until`,
+and reads the ledger again from the start up to that event, applying only the command rules: sample
+and scanner campaigns, scan windows, indicators and pending downloads are not touched, and nothing
+is counted twice. Events past `rebuild_until` are indexed by the ordinary rules, so the ledger can
+keep growing while it runs. It takes about as long as the first catch-up, and the console shows
+how far it has got. Review decisions live in `review_queue`, which nothing here references, and
+are not affected; campaign ids of the command-sequence campaigns change, so a bookmarked
+`/campaigns/N` for one of them no longer resolves.
+`crates/review/tests/campaign_test.rs#a_database_built_with_the_old_fingerprint_is_rebuilt_in_place`
+runs it against a database in the old state.
 
 ## On the console
 
@@ -156,8 +200,19 @@ separate decision.
 
 ## Limits
 
-- A session whose later commands the sensor's flood gate summarized has a shorter run than an
-  unsummarized one when the summarized commands were new shapes; repeats are not affected.
+- A session that stops before its fourth command past the shell-entry lines has the opening it
+  has, so a loader whose sessions are cut at 1, 2 or 3 commands is up to three campaigns besides
+  the main one. They are not joined to the campaign whose opening they begin: that decision
+  would depend on which campaigns exist when the run ends, which differs between indexing batch by
+  batch and in one pass, and a join could not be undone when a second loader with the same
+  opening appeared.
+- Loaders that share their first four commands past the shell-entry lines are one campaign
+  whatever they do next; a session whose flood-gate summary replaced new shapes inside those four
+  is keyed by the commands that were written.
+- A decimal run of 4 or more digits is a number whatever it names: loaders that differ only in
+  a 4 or 5 digit port, a delay or a password such as `123456` are one campaign. A random token of
+  letters and fewer than 3 digits is kept as written.
+- All HTTP request lines on a shell port are one campaign, whatever client sent them.
 - A quiet sensor's last sessions are grouped when it next logs anything an hour past them.
 - A node feeding a sensor name while lagging another node by most of an hour can have a run cut
   short by the sweep, so the same session lands in a different campaign than one pass would put it.

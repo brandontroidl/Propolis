@@ -285,12 +285,19 @@ migration's two `INSERT ... SELECT` statements again with the daemon stopped.
 independent check (`crates/core-scoring/src/repository/breadth_sets_tests.rs#breadth_sets_match_the_whole_history_aggregates_after_every_append`).
 
 <a id="campaign-tables"></a>
-## Campaign and indicator tables (`0015_campaigns.sql`)
+## Campaign and indicator tables (`0015_campaigns.sql`, `0016_campaign_fingerprint.sql`)
 
 Derived from the ledger by the campaign indexer, a bounded background job, never by the append
 path; [campaigns](../operations/campaigns.md) explains the grouping rules. Like `ip_score` they
 can be rebuilt: empty them, set `campaign_cursor.last_event_id` to 0, and the indexer works
-through the ledger again.
+through the ledger again. Migration 0016 adds `campaign_cursor.fingerprint_version` (existing
+rows are version 1) and `rebuild_until`, with which the indexer rebuilds only the
+command-sequence state when the fingerprint changes
+(`crates/core-scoring/migrations/0016_campaign_fingerprint.sql#fingerprint_version`),
+`campaign.min_shapes` and `max_shapes`, the fewest and most commands a command-sequence
+campaign's runs held (`crates/core-scoring/migrations/0016_campaign_fingerprint.sql#min_shapes`),
+and `campaign_session.payload`, the shapes folded into a run's key
+(`crates/core-scoring/migrations/0016_campaign_fingerprint.sql#payload`).
 
 | table | holds | key | source |
 |---|---|---|---|
@@ -432,6 +439,7 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 | `0013` | index `event_dedup_idx (source_ip, signal_type, observed_at)` for the append path's dedup read; built inside the migration transaction, so writes to `event` wait for the build ([schema-and-migrations](../development/schema-and-migrations.md#index-builds)) |
 | `0014` | tables `ip_vantage (source_ip, wan_ip, saw_authenticated_tcp)` and `ip_sensor (source_ip, sensor)`, the [breadth sets](#breadth-sets) the append path counts from; backfilled from the ledger under a `SHARE` lock on `event` |
 | `0015` | the [campaign and indicator tables](#campaign-tables) and the indexer's cursor (starting at 0, no backfill: the indexer reads the ledger in batches after startup) |
+| `0016` | `campaign_cursor.fingerprint_version` and `rebuild_until`, `campaign.min_shapes` and `max_shapes`, `campaign_session.payload` (see [campaign tables](#campaign-tables)); no data is rewritten, the indexer rebuilds the command-sequence campaigns itself on its next batch |
 
 **review** (`crates/review/migrations/`):
 

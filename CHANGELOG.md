@@ -4,6 +4,25 @@
 
 ### Fixed
 
+- **Command-sequence campaigns are one per tool, not one per session length** - observed on the
+  live console 2026-10-08: 947 campaigns, most of them fragments of a few bots. The fingerprint
+  keyed on the whole normalized session, so one Mirai-family loader was about 40 campaigns
+  ("1 commands: ...", "2 commands: ...", up to 16) because sessions stop at different points, a
+  `start ; enable ; config terminal` login was ten, and `echo P155084A ; id ; echo $(( 155084 + 1 ))`
+  or `N=49482a1671; ...` was one campaign per host because a random number differed. The key is now
+  over the first 4 commands past the shell-entry lines, so a bot cut after 5 commands and one that
+  runs 16 are the same campaign (a session cut before its fourth command is keyed by the commands
+  it has); decimal runs of 4 or more digits, hex words of 6 or more characters and identifier
+  values of `NAME=value` are placeholders, while short numbers (`x86`, `arm7`, `-p 22`) and
+  `chmod` modes are kept; HTTP request lines sent to a shell port are one campaign instead of one
+  per header order; a run of login lines only is one campaign. A campaign's label gives the range
+  of command counts (`3-16 commands: ...`). On a synthetic replica of the observed shapes, 106
+  sessions went from 69 campaigns to 11. Migration 0016 marks existing databases as built by the
+  old key; the indexer then rebuilds the command-sequence campaigns from the ledger on its next
+  batches (about as long as the first catch-up), leaving sample and scanner campaigns and
+  indicators as they are. Campaign ids of command-sequence campaigns change. See
+  `docs/operations/campaigns.md`.
+
 - **An ADB base64 APK loader no longer loops on `wc: not found`** - observed live 2026-10-07: a bot
   pushed an APK to `/data/local/tmp` in about 57 `echo -n '<base64>' >> f.b64` commands, checked
   `wc -c < f.b64`, got `sh: wc: not found` from the Android shell, deleted everything and started

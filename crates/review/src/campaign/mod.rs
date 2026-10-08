@@ -5,11 +5,12 @@
 //! - **sample**: every address that uploaded a captured sample, or reported a URL the fetcher
 //!   retrieved it from, is a member of that sample's campaign (a worm copies itself byte for byte).
 //! - **command_sequence**: a shell session's run of commands, reduced to its [`fingerprint`] (the
-//!   normalized shapes, consecutive repeats collapsed), joins the campaign of that fingerprint once
-//!   the run ends: at a gap of [`SESSION_IDLE_SECS`] between two of its commands, once its sensor
-//!   has logged events [`SESSION_SWEEP_SECS`] newer than its last command, or at
-//!   [`MAX_RUN_SHAPES`] shapes. A run shorter than [`MIN_RUN_CHARS`] characters of shapes (a bare
-//!   `enable; sh`) joins nothing.
+//!   first [`fingerprint::KEY_SHAPES`] normalized shapes past the shell-entry lines, consecutive
+//!   repeats collapsed), joins the campaign of that fingerprint once the run ends: at a gap of
+//!   [`SESSION_IDLE_SECS`] between two of its commands, once its sensor has logged events
+//!   [`SESSION_SWEEP_SECS`] newer than its last command, or at [`MAX_RUN_SHAPES`] shapes. A run
+//!   shorter than [`MIN_RUN_CHARS`] characters of shapes (a bare `enable; sh`) joins nothing. A
+//!   campaign records the fewest and most shapes its runs held, for its label.
 //! - **scanner**: an address that reaches [`SCANNER_MIN_SENSORS`] distinct sensors within one
 //!   [`SCANNER_WINDOW_SECS`] window joins the campaign of that sensor set.
 //!
@@ -32,6 +33,17 @@
 //! arrives more than [`SESSION_SWEEP_SECS`] of its sensor's clock after its previous one while
 //! being under [`SESSION_IDLE_SECS`] after it in its own time, which takes one node feeding a
 //! sensor name lagging another by most of an hour.
+//!
+//! # Changing the fingerprint
+//!
+//! The command-sequence campaigns and the sessions' working state are a function of
+//! [`fingerprint`]. `campaign_cursor.fingerprint_version` records which version built them; when it
+//! is behind [`FINGERPRINT_VERSION`], the next [`index_batch`] deletes the command-sequence
+//! campaigns, the sessions and the watermarks, remembers the old cursor as `rebuild_until`, and
+//! reads the ledger again from the start in command-only mode: the events up to `rebuild_until`
+//! rebuild the sessions and command-sequence campaigns and leave the sample and scanner campaigns,
+//! the scan windows, the indicators and the pending downloads, which do not depend on the
+//! fingerprint, exactly as they were. Past `rebuild_until` the indexer is the ordinary one.
 //!
 //! Two passes per tick read other state: [`resolve_pending_fetches`] links a download to the
 //! sample the fetcher later captured from its URL, and [`scan_artifacts`] extracts indicators from
@@ -60,8 +72,13 @@ pub const SESSION_IDLE_SECS: i64 = 600;
 /// last command: the session went quiet. Longer than [`SESSION_IDLE_SECS`] so the sensor clock,
 /// which several nodes can feed with different lags, only decides for sessions that are long over.
 pub const SESSION_SWEEP_SECS: i64 = 3600;
-/// A run is grouped on its first this many collapsed shapes.
+/// A run is grouped, whatever its state, once it holds this many collapsed shapes; the label's
+/// longest run is counted to here.
 pub const MAX_RUN_SHAPES: i32 = 64;
+/// The version of the command-sequence fingerprint this build writes. Raise it with any change to
+/// [`fingerprint`] that changes a key; the indexer then rebuilds what the old one wrote. 1 was the
+/// key over the whole normalized run.
+pub const FINGERPRINT_VERSION: i32 = 2;
 /// A run whose shapes total fewer characters than this joins no campaign.
 pub const MIN_RUN_CHARS: i32 = 20;
 /// The scanner rule's window.
@@ -198,18 +215,64 @@ pub async fn index_batch(pool: &PgPool, limit: i64) -> Result<BatchOutcome, sqlx
     if !try_lock(&mut tx).await? {
         return Ok(BatchOutcome::LockedOut);
     }
-    let cursor: i64 =
-        sqlx::query_scalar("SELECT last_event_id FROM campaign_cursor WHERE singleton FOR UPDATE")
-            .fetch_one(&mut *tx)
-            .await?;
+    let (mut cursor, mut rebuild_until, version): (i64, Option<i64>, i32) = sqlx::query_as(
+        "SELECT last_event_id, rebuild_until, fingerprint_version FROM campaign_cursor \
+         WHERE singleton FOR UPDATE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let mut changed = false;
+    if version != FINGERPRINT_VERSION {
+        begin_rebuild(&mut tx).await?;
+        rebuild_until = Some(cursor).filter(|c| *c > 0);
+        cursor = 0;
+        changed = true;
+    }
+    // While rebuilding, only the events the old cursor had already passed are read, in
+    // command-only mode; when they are used up the batch carries on as an ordinary one.
+    let mut replay = rebuild_until.filter(|until| cursor < *until);
+    let mut events = read_events(&mut tx, cursor, replay, limit).await?;
+    if events.is_empty() && replay.is_some() {
+        cursor = replay.take().unwrap_or(cursor);
+        changed = true;
+        events = read_events(&mut tx, cursor, None, limit).await?;
+    }
+    let Some(last_id) = events.last().map(|e| e.id) else {
+        if changed {
+            save_cursor(&mut tx, cursor, replay).await?;
+        }
+        tx.commit().await?;
+        return Ok(BatchOutcome::Indexed(0));
+    };
+
+    let mut batch = Batch::load(&mut tx).await?;
+    batch.replay = replay.is_some();
+    for event in &events {
+        batch.process(&mut tx, event).await?;
+    }
+    batch.sweep_idle_runs(&mut tx).await?;
+    batch.flush(&mut tx).await?;
+    save_cursor(&mut tx, last_id, replay.filter(|until| last_id < *until)).await?;
+    tx.commit().await?;
+    Ok(BatchOutcome::Indexed(events.len()))
+}
+
+/// Ledger rows past `cursor` in id order, up to `limit`, and not past `until` when rebuilding.
+async fn read_events(
+    tx: &mut Transaction<'_, Postgres>,
+    cursor: i64,
+    until: Option<i64>,
+    limit: i64,
+) -> Result<Vec<EventRow>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, host(source_ip) AS source_ip, sensor, signal_type::text AS signal, \
                 observed_at, metadata, session_id::text AS session_id \
-         FROM event WHERE id > $1 ORDER BY id LIMIT $2",
+         FROM event WHERE id > $1 AND id <= $3 ORDER BY id LIMIT $2",
     )
     .bind(cursor)
     .bind(limit)
-    .fetch_all(&mut *tx)
+    .bind(until.unwrap_or(i64::MAX))
+    .fetch_all(&mut **tx)
     .await?;
     let mut events = Vec::with_capacity(rows.len());
     for row in rows {
@@ -223,25 +286,39 @@ pub async fn index_batch(pool: &PgPool, limit: i64) -> Result<BatchOutcome, sqlx
             session_id: row.try_get("session_id")?,
         });
     }
-    let Some(last_id) = events.last().map(|e| e.id) else {
-        tx.commit().await?;
-        return Ok(BatchOutcome::Indexed(0));
-    };
+    Ok(events)
+}
 
-    let mut batch = Batch::load(&mut tx).await?;
-    for event in &events {
-        batch.process(&mut tx, event).await?;
-    }
-    batch.sweep_idle_runs(&mut tx).await?;
-    batch.flush(&mut tx).await?;
+async fn save_cursor(
+    tx: &mut Transaction<'_, Postgres>,
+    last_event_id: i64,
+    rebuild_until: Option<i64>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE campaign_cursor SET last_event_id = $1, updated_at = now() WHERE singleton",
+        "UPDATE campaign_cursor SET last_event_id = $1, rebuild_until = $2, \
+             fingerprint_version = $3, updated_at = now() WHERE singleton",
     )
-    .bind(last_id)
-    .execute(&mut *tx)
+    .bind(last_event_id)
+    .bind(rebuild_until)
+    .bind(FINGERPRINT_VERSION)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
-    Ok(BatchOutcome::Indexed(events.len()))
+    Ok(())
+}
+
+/// Drop what the previous fingerprint version wrote: the command-sequence campaigns (their members,
+/// days, sensors and linked samples go with them) and the working state that holds a run's digest.
+/// The caller reads the ledger again from the start. The sample and scanner campaigns, the scan
+/// windows, the indicators and the pending downloads are not a function of the fingerprint and stay.
+async fn begin_rebuild(tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx::Error> {
+    for sql in [
+        "DELETE FROM campaign WHERE kind = 'command_sequence'",
+        "DELETE FROM campaign_session",
+        "DELETE FROM campaign_watermark",
+    ] {
+        sqlx::query(sql).execute(&mut **tx).await?;
+    }
+    Ok(())
 }
 
 async fn try_lock(tx: &mut Transaction<'_, Postgres>) -> Result<bool, sqlx::Error> {
@@ -375,6 +452,8 @@ struct CampaignDelta {
     members: BTreeMap<String, MemberDelta>,
     days: BTreeSet<(NaiveDate, String)>,
     sensors: BTreeMap<String, i64>,
+    /// The fewest and most shapes the runs of a command-sequence campaign held.
+    shapes: Option<(i32, i32)>,
 }
 
 /// One sighting of a source in a campaign.
@@ -388,6 +467,8 @@ struct Sighting<'a> {
     last_seen: DateTime<Utc>,
     sightings: i64,
     uploaded: bool,
+    /// For a command sequence, the shapes in the run.
+    shapes: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +505,9 @@ struct Batch {
     ioc_room: HashMap<String, i64>,
     pending_fetches: BTreeMap<(Vec<u8>, String), PendingFetch>,
     artifact_scans: BTreeSet<String>,
+    /// Rebuilding command-sequence state from events the sample, scanner and indicator passes
+    /// have already read: only the command rules run.
+    replay: bool,
 }
 
 impl Batch {
@@ -449,13 +533,17 @@ impl Batch {
         if event.signal == "honeypot_session_end" {
             return Ok(());
         }
-        self.scan_window(tx, event).await?;
+        if !self.replay {
+            self.scan_window(tx, event).await?;
+        }
         match event.signal.as_str() {
             "honeypot_command_exec" => {
                 if let Some(command) = command_of(&event.metadata) {
                     self.command(tx, event, command).await?;
-                    self.record_iocs(tx, event, &ioc::extract_from_command(command))
-                        .await?;
+                    if !self.replay {
+                        self.record_iocs(tx, event, &ioc::extract_from_command(command))
+                            .await?;
+                    }
                 }
             }
             "honeypot_malware_upload" => {
@@ -468,7 +556,7 @@ impl Batch {
                     self.upload(tx, event, sha).await?;
                 }
             }
-            "honeypot_file_download" => {
+            "honeypot_file_download" if !self.replay => {
                 if let Some(url) = event.metadata.get("url").and_then(Value::as_str) {
                     self.record_iocs(tx, event, &ioc::extract_from_command(url))
                         .await?;
@@ -500,9 +588,14 @@ impl Batch {
                 members: BTreeMap::new(),
                 days: BTreeSet::new(),
                 sensors: BTreeMap::new(),
+                shapes: None,
             });
         if s.rep.event_id < delta.rep.event_id {
             delta.rep = s.rep;
+        }
+        if let Some(n) = s.shapes {
+            let (fewest, most) = delta.shapes.unwrap_or((n, n));
+            delta.shapes = Some((fewest.min(n), most.max(n)));
         }
         delta.first_seen = delta.first_seen.min(s.first_seen);
         delta.last_seen = delta.last_seen.max(s.last_seen);
@@ -538,8 +631,8 @@ impl Batch {
         }
         let row = sqlx::query(
             "SELECT host(source_ip) AS source_ip, sensor, run, first_seen, last_seen, \
-                    first_event_id, last_event_id, shapes, shape_chars, last_shape, chain, \
-                    campaign_key, closed, pending_samples \
+                    first_event_id, last_event_id, shapes, shape_chars, payload, last_shape, \
+                    chain, campaign_key, closed, pending_samples \
              FROM campaign_session WHERE session_id = $1::uuid",
         )
         .bind(session_id)
@@ -625,6 +718,7 @@ impl Batch {
             last_seen: s.last_seen,
             sightings: 1,
             uploaded: false,
+            shapes: Some(s.digest.shapes),
         });
         for sha in s.pending_samples.drain(..) {
             self.links.insert((Kind::CommandSequence, key.clone(), sha));
@@ -682,6 +776,34 @@ impl Batch {
         event: &EventRow,
         sha: &str,
     ) -> Result<(), sqlx::Error> {
+        if !self.replay {
+            self.sight_upload(event, sha);
+        }
+        let Some(session_id) = event.session_id.as_deref() else {
+            return Ok(());
+        };
+        if let Some(mut s) = self.session(tx, session_id).await? {
+            match (&s.campaign_key, s.closed) {
+                (Some(key), _) => {
+                    self.links
+                        .insert((Kind::CommandSequence, key.clone(), sha.to_string()));
+                }
+                (None, false) => {
+                    if s.pending_samples.len() < MAX_SESSION_SAMPLES
+                        && !s.pending_samples.iter().any(|p| p == sha)
+                    {
+                        s.pending_samples.push(sha.to_string());
+                    }
+                }
+                (None, true) => {}
+            }
+            self.put_session(session_id, s);
+        }
+        Ok(())
+    }
+
+    /// The uploading address is a member of the sample's campaign.
+    fn sight_upload(&mut self, event: &EventRow, sha: &str) {
         let orig_name = text_field(&event.metadata, "sample_orig_name", 64);
         let label = if orig_name.is_empty() {
             format!("sample {}", &sha[..12])
@@ -714,32 +836,11 @@ impl Batch {
             last_seen: event.observed_at,
             sightings: 1,
             uploaded: true,
+            shapes: None,
         });
         self.links
             .insert((Kind::Sample, sha.to_string(), sha.to_string()));
         self.artifact_scans.insert(sha.to_string());
-
-        let Some(session_id) = event.session_id.as_deref() else {
-            return Ok(());
-        };
-        if let Some(mut s) = self.session(tx, session_id).await? {
-            match (&s.campaign_key, s.closed) {
-                (Some(key), _) => {
-                    self.links
-                        .insert((Kind::CommandSequence, key.clone(), sha.to_string()));
-                }
-                (None, false) => {
-                    if s.pending_samples.len() < MAX_SESSION_SAMPLES
-                        && !s.pending_samples.iter().any(|p| p == sha)
-                    {
-                        s.pending_samples.push(sha.to_string());
-                    }
-                }
-                (None, true) => {}
-            }
-            self.put_session(session_id, s);
-        }
-        Ok(())
     }
 
     async fn download(
@@ -832,6 +933,7 @@ impl Batch {
             last_seen,
             sightings,
             uploaded: false,
+            shapes: None,
         });
         self.links
             .insert((Kind::Sample, sha.to_string(), sha.to_string()));
@@ -898,6 +1000,7 @@ impl Batch {
                     last_seen: event.observed_at,
                     sightings: 1,
                     uploaded: false,
+                    shapes: None,
                 });
             }
             self.windows_dirty.insert(key.clone());
@@ -1095,6 +1198,7 @@ fn session_from_row(r: &sqlx::postgres::PgRow) -> Result<Session, sqlx::Error> {
             last_shape: bytes32("last_shape")?,
             shapes: r.try_get("shapes")?,
             shape_chars: r.try_get("shape_chars")?,
+            payload: r.try_get("payload")?,
         },
         campaign_key: r.try_get("campaign_key")?,
         closed: r.try_get("closed")?,
@@ -1110,12 +1214,14 @@ async fn write_session(
     sqlx::query(
         "INSERT INTO campaign_session (session_id, source_ip, sensor, run, first_seen, last_seen, \
              first_event_id, last_event_id, shapes, shape_chars, last_shape, chain, campaign_key, \
-             closed, pending_samples) \
-         VALUES ($1::uuid, $2::inet, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+             closed, pending_samples, payload) \
+         VALUES ($1::uuid, $2::inet, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                 $16) \
          ON CONFLICT (session_id) DO UPDATE SET \
            run = EXCLUDED.run, first_seen = EXCLUDED.first_seen, last_seen = EXCLUDED.last_seen, \
            first_event_id = EXCLUDED.first_event_id, last_event_id = EXCLUDED.last_event_id, \
            shapes = EXCLUDED.shapes, shape_chars = EXCLUDED.shape_chars, \
+           payload = EXCLUDED.payload, \
            last_shape = EXCLUDED.last_shape, chain = EXCLUDED.chain, \
            campaign_key = EXCLUDED.campaign_key, closed = EXCLUDED.closed, \
            pending_samples = EXCLUDED.pending_samples",
@@ -1135,6 +1241,7 @@ async fn write_session(
     .bind(&s.campaign_key)
     .bind(s.closed)
     .bind(&s.pending_samples)
+    .bind(s.digest.payload)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1173,12 +1280,17 @@ async fn run_representative(
         .iter()
         .map(|s| ioc::sanitize_field(&ioc::redact_secrets(s), fingerprint::MAX_SHAPE_CHARS))
         .collect();
-    let label = ioc::sanitize_field(&fingerprint::label(&shapes), 200);
+    let opening = ioc::sanitize_field(&fingerprint::opening(&shapes), 200);
+    // Provisional: the campaign's run lengths are only known to the whole campaign, and
+    // `write_campaign` rewrites the label from them.
+    let provisional = shapes.len() as i32;
+    let label = ioc::sanitize_field(&fingerprint::label(&opening, provisional, provisional), 200);
     Ok((
         label,
         json!({
             "source_ip": source_ip,
             "session_id": session_id,
+            "opening": opening,
             "shapes": shapes,
         }),
     ))
@@ -1216,11 +1328,19 @@ async fn write_campaign(
             true,
         ) => run_representative(tx, source_ip, session_id, *first_event_id, *last_event_id).await?,
     };
-    let id: i64 = sqlx::query_scalar(
+    let (id, stored_label, fewest, most, opening): (
+        i64,
+        String,
+        Option<i32>,
+        Option<i32>,
+        Option<String>,
+    ) = sqlx::query_as(
         "INSERT INTO campaign (kind, key, label, representative, rep_event_id, first_seen, \
-                               last_seen, sightings) \
-         VALUES ($1, $2, $3, COALESCE($4, '{}'::jsonb), $5, $6, $7, $8) \
+                               last_seen, sightings, min_shapes, max_shapes) \
+         VALUES ($1, $2, $3, COALESCE($4, '{}'::jsonb), $5, $6, $7, $8, $9, $10) \
          ON CONFLICT (kind, key) DO UPDATE SET \
+           min_shapes = LEAST(campaign.min_shapes, EXCLUDED.min_shapes), \
+           max_shapes = GREATEST(campaign.max_shapes, EXCLUDED.max_shapes), \
            label = CASE WHEN EXCLUDED.rep_event_id < campaign.rep_event_id \
                         THEN EXCLUDED.label ELSE campaign.label END, \
            representative = CASE WHEN EXCLUDED.rep_event_id < campaign.rep_event_id \
@@ -1229,7 +1349,7 @@ async fn write_campaign(
            first_seen = LEAST(campaign.first_seen, EXCLUDED.first_seen), \
            last_seen = GREATEST(campaign.last_seen, EXCLUDED.last_seen), \
            sightings = campaign.sightings + EXCLUDED.sightings \
-         RETURNING id",
+         RETURNING id, label, min_shapes, max_shapes, representative->>'opening'",
     )
     .bind(kind.as_str())
     .bind(key)
@@ -1239,8 +1359,23 @@ async fn write_campaign(
     .bind(delta.first_seen)
     .bind(delta.last_seen)
     .bind(delta.sightings)
+    .bind(delta.shapes.map(|(fewest, _)| fewest))
+    .bind(delta.shapes.map(|(_, most)| most))
     .fetch_one(&mut **tx)
     .await?;
+    // A command sequence's label states how long its runs were, which no single run knows.
+    if let (Kind::CommandSequence, Some(fewest), Some(most), Some(opening)) =
+        (kind, fewest, most, opening)
+    {
+        let wanted = ioc::sanitize_field(&fingerprint::label(&opening, fewest, most), 200);
+        if wanted != stored_label {
+            sqlx::query("UPDATE campaign SET label = $2 WHERE id = $1")
+                .bind(id)
+                .bind(&wanted)
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
 
     let (mut ips, mut firsts, mut lasts, mut counts, mut uploads) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());

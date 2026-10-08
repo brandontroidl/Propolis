@@ -4,6 +4,21 @@
 
 ### Fixed
 
+- **Modeled binaries survive inspection** - every executable the Ubuntu persona serves was its
+  recorded 64-byte header followed by `0x80 | (offset & 0x3f)` filler, identical for every
+  binary, so `busybox cat /proc/self/exe` flooded two megabytes of U+FFFD and `readelf` found
+  noise where the program headers belong. The body is now generated from the recorded header
+  (`crates/sensor-framework/src/elf_body.rs`): program headers that match the sections,
+  `.interp`, a per-binary build ID, libc imports with their `GLIBC_2.x` versions, relocations,
+  `.dynamic`, usage strings for the program, instruction-shaped `.text` and the section header
+  table at the recorded offset. `readelf -lhSdV --dyn-syms` parses all 84 images without a
+  warning, `file` reports a dynamically linked PIE with the x86-64 loader (busybox, recorded as a
+  static `ET_EXEC`, reports statically linked), and `strings` shows the loader, imports, versions
+  and usage line. Still generated per byte in constant memory at the recorded size; no real
+  binary is shipped. `/bin/ls` keeps its first newline at 409. A whole-file `busybox hexdump -e
+  '16/1 "%c"'` without `-v` of a binary now prints nothing (the image has the zero runs the real
+  tool squeezes to `*`, which is not modeled). The bytes of every image changed, so its digests
+  did: any stored fingerprint of a served binary is stale.
 - **SSH bare connects, banner grabs and bad version strings are now recorded** - the SSH sensor
   emitted `honeypot_connection` only after key exchange, so a Shodan/Censys-style scanner that
   read the banner and left, a client that sent a malformed identification line, and a bare TCP

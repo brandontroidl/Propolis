@@ -147,15 +147,35 @@ shell's `mount` (a stock Ubuntu cloud image on `/dev/root`, the Xen disk `xvda`;
 point it names is a directory the shell will enter). A file the session writes carries the
 session clock's time, so `ls -l` dates it now. Directories include `/`, `/tmp`, `/root`, `/etc`,
 `/home/ubuntu`, the loader-probed `/var/run`, `/mnt`, `/usr`, `/dev`, `/dev/shm`, and the
-`/sys`, `/run` and `/boot` subtrees the mount table names. The Ubuntu persona has the 73
+`/sys`, `/run` and `/boot` subtrees the mount table names. The Ubuntu persona has the 84
 executables recorded from a real Ubuntu 22.04 (`/bin/busybox`, `/bin/ls`, `/bin/echo`,
 `/bin/cat`, `/bin/bash`, `/usr/bin/wget` and the rest of `BINARIES`,
 `crates/sensor-framework/src/binaries.rs#BINARIES`; `/bin/sh` is a link to dash), each a
-synthetic ELF image: the first 64 bytes a real one starts with, then generated filler out to
-its real size, so a probe that reads the header or the length sees what Ubuntu shows and
-`cp /bin/busybox x` has something to copy. The images are generated data, never a file of the
-host, and nothing runs them. Only `/bin/ls` holds a newline before offset 410 (at 409, as
-the recorded `head -n 1` shows). `/proc/self/exe` is the executable of the process that
+synthetic ELF image: the first 64 bytes a real one starts with, then a body generated from that
+header out to its real size (`crates/sensor-framework/src/elf_body.rs`), so a probe that reads
+the header or the length sees what Ubuntu shows and `cp /bin/busybox x` has something to copy.
+
+The body is laid out the way the GNU toolchain lays out a binary with that header's counts and
+offsets, so the tools an attacker inspects a binary with agree with it: `readelf -lhSdV
+--dyn-syms` reads it without a warning, `file` calls every image but busybox an "ELF 64-bit LSB
+pie executable, x86-64, ... dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2,
+BuildID[sha1]=..., for GNU/Linux 3.2.0, stripped" and busybox (whose recorded header is a static
+`ET_EXEC`) "statically linked", `strings` opens on the loader path, the imported libc names,
+`libc.so.6` and its `GLIBC_2.x` versions and finds the program's usage line further in, and
+`objdump -d` decodes `endbr64` at the entry point and names the PLT stubs (`strerror@plt`);
+`crates/sensor-framework/examples/elf_image.rs` writes one image to a file to run them on. It has
+a program header table that matches the sections, `.interp`, a per-binary GNU build ID,
+`.dynsym`/`.dynstr`/version tables importing real libc symbol names under their glibc versions,
+relocations, `.dynamic`, a `.rodata` of short usage and error strings for that program, zero
+padding at alignment boundaries, a `.text` of instruction-shaped noise seeded per binary (it
+decodes and means nothing; no real code is shipped and none runs), and the section header table
+at the recorded `e_shoff`. Each byte is computed from the image and its offset in constant time
+and memory, nothing is stored, and every binary differs from every other (`true` and `false`,
+which share a header and size, included); the digest of each is the same in every session
+(`crates/sensor-framework/src/binaries.rs#GOLDEN_SHA256`). The images are generated data, never
+a file of the host, and nothing runs them. `/bin/ls` holds its first newline at 409 (as the
+recorded `head -n 1` shows); busybox and `ip` hold theirs in the recorded header, and every other
+image past it, where its layout puts it. `/proc/self/exe` is the executable of the process that
 opens it: an applet of `busybox` reads busybox, a direct `cat` reads cat, a redirection the
 shell opens (`cat < /proc/self/exe`) and `/proc/$$/exe` read bash (dash in a shell opened
 with `sh`). The phone's binaries stay stubs and it has no `/proc/self/exe`. A copy of the

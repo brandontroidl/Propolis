@@ -1,9 +1,11 @@
 //! The executables the Ubuntu persona presents, as synthetic ELF images. Each one is the first 64
-//! bytes a real Ubuntu 22.04 binary starts with, then generated filler out to the size it really
-//! has, so `cat /bin/echo`, `cat /proc/self/exe` and a byte-range read of `/bin/ls` show the header
-//! and the length a probe compares. Nothing here is read from the host: the header constants are
-//! data recorded once from the reference system, the filler is a pure function of the byte offset,
-//! and no image is ever handed to anything that runs it. Never-exec and no-fetch are untouched.
+//! bytes a real Ubuntu 22.04 binary starts with, then a body generated from that header out to the
+//! size it really has ([`crate::elf_body`]), so `cat /bin/echo`, `cat /proc/self/exe` and a
+//! byte-range read of `/bin/ls` show the header and the length a probe compares, and `readelf`,
+//! `file` and `strings` find the program headers, sections, loader and imports a binary has.
+//! Nothing here is read from the host: the header constants are data recorded once from the
+//! reference system, the body is a pure function of the row and the byte offset, and no image is
+//! ever handed to anything that runs it. Never-exec and no-fetch are untouched.
 //!
 //! The table is the one source of the binary set. `FakeFs::new` builds a regular node per entry, the
 //! shell registry derives its node facts from it (so a lookup and the content behind it cannot
@@ -142,6 +144,7 @@ impl BinaryImage {
             header: self.header,
             len: self.size,
             newline_at: self.newline_at,
+            name: self.name,
         }
     }
 
@@ -226,17 +229,23 @@ pub fn is_busybox(image: &ElfImage) -> bool {
 /// copy inside the connection's content allowance, as `cp` already does by sharing the blob. Anything
 /// that is not exactly an image (the size and header are compared first) is stored as it came.
 pub fn image_blob_for(bytes: &[u8]) -> Option<Blob> {
+    const CHUNK: usize = 1 << 16;
     let head = bytes.get(..ELF_HEADER_LEN)?;
     let length = u64::try_from(bytes.len()).ok()?;
     BINARIES
         .iter()
         .filter(|binary| binary.size == length && binary.header[..] == *head)
         .find(|binary| {
-            let image = binary.image();
+            let body = binary.image().body();
+            let mut generated = Vec::with_capacity(CHUNK);
             bytes
-                .iter()
-                .zip(0u64..)
-                .all(|(&byte, offset)| image.byte_at(offset) == byte)
+                .chunks(CHUNK)
+                .zip((0u64..).step_by(CHUNK))
+                .all(|(chunk, from)| {
+                    generated.clear();
+                    body.append_range(from, from + chunk.len() as u64, &mut generated);
+                    generated == chunk
+                })
         })
         .map(BinaryImage::blob)
 }
@@ -1013,29 +1022,10 @@ mod tests {
         assert_eq!(head.len(), 410);
         assert_eq!(head.get(409), Some(&0x0a));
         assert!(!head[..409].contains(&0x0a));
-        // Past the plant the filler is newline-free again, to the end.
+        // Past it the body has the newlines a binary's bytes do, out to the recorded size.
         let rest = fs.read_range("/bin/ls", 410, u64::MAX).unwrap();
         assert_eq!(rest.len() as u64, 138_216 - 410);
-        assert!(!rest.contains(&0x0a));
-    }
-
-    /// Only ls plants a newline; every other image's newlines are the ones its recorded header
-    /// carries (busybox's `e_phnum` is `0x0a`), never filler.
-    #[test]
-    fn filler_never_produces_a_newline() {
-        for binary in BINARIES {
-            let image = binary.image();
-            for offset in (64..binary.size).step_by(4099) {
-                let expected_newline = binary.newline_at == Some(offset);
-                assert_eq!(
-                    image.byte_at(offset) == 0x0a,
-                    expected_newline,
-                    "{} at {offset}",
-                    binary.name
-                );
-                assert_eq!(image.byte_at(offset) & 0x80 != 0, !expected_newline);
-            }
-        }
+        assert!(rest.iter().filter(|b| **b == 0x0a).count() > 10);
     }
 
     /// Class, byte order and machine in every header say 64-bit little-endian x86-64, which is
@@ -1052,28 +1042,44 @@ mod tests {
         }
     }
 
-    /// The reference implementation of the generator, written from the rule and sharing no code
-    /// with it: the header, then `0x80 | (offset & 0x3f)`, with the ls newline planted.
-    fn reference_digest(binary: &BinaryImage) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-        let mut buffer = Vec::with_capacity(8192);
-        for offset in 0..binary.size {
-            let byte = if offset < 64 {
-                binary.header()[offset as usize]
-            } else if binary.name == "ls" && offset == 409 {
-                0x0a
-            } else {
-                0x80 | (offset & 0x3f) as u8
-            };
-            buffer.push(byte);
-            if buffer.len() == 8192 {
-                hasher.update(&buffer);
-                buffer.clear();
-            }
-        }
-        hasher.update(&buffer);
-        hasher.finalize().to_vec()
-    }
+    /// The SHA-256 of each image as generated when the layout was written and checked with
+    /// `file`, `readelf` and `objdump` (`elf_body_tests.rs`). A probe that hashes a binary on one
+    /// visit and again on the next must get the same answer, so a change to any of these is a
+    /// change to what every deployed sensor serves, and has to be deliberate.
+    const GOLDEN_SHA256: [(&str, &str); 8] = [
+        (
+            "busybox",
+            "07a69aaffb5f3e576a2160f81b78286a648007a0a6f0b521f79db2fa7c71ab75",
+        ),
+        (
+            "ls",
+            "531929008e9b5466ab17f4cac720029409d5b70bc4c90ca5649b6523669f44ce",
+        ),
+        (
+            "cat",
+            "f7d33ccf5072017d5cdea07d4a119267d7968a59baa1addbc000047493606ee6",
+        ),
+        (
+            "echo",
+            "53424cc3da4cca0c9d57d2cfd8881b3d468a3fea114e4c2debeb739c491cdb55",
+        ),
+        (
+            "dash",
+            "c904084ffcbfdf5593796ccbe24df9e34817b881fffb711f153a03d1ffc978dd",
+        ),
+        (
+            "bash",
+            "23bbe65be4cbaf09b258def0c8ad76616590c0228dda7744523f2a40dfd1f3ee",
+        ),
+        (
+            "true",
+            "b2de1b80d3da78d9c868e414ccba5e5b28ba748149909005e328843ddfa6cfad",
+        ),
+        (
+            "false",
+            "e5d20cf62e2bd4eb04258fd45d3c452211776745368a24a6e3fc18bad0577092",
+        ),
+    ];
 
     fn blob_digest(binary: &BinaryImage) -> Vec<u8> {
         let blob = binary.blob();
@@ -1087,18 +1093,13 @@ mod tests {
         hasher.finalize().to_vec()
     }
 
-    /// An image is a pure function of its table row: generated twice on separate threads it hashes
-    /// the same, and it hashes what an independent implementation of the rule produces. It has no
-    /// input (cwd, environment, hostname, clock) to vary; a process-level variation test would need
-    /// a spawned process, which this crate never has.
+    /// An image is a pure function of its table row: generated on separate threads it hashes the
+    /// same, and it hashes what it hashed when it was checked. It has no input (cwd, environment,
+    /// hostname, clock) to vary; a process-level variation test would need a spawned process,
+    /// which this crate never has.
     #[test]
-    fn an_image_is_the_same_on_every_thread_and_matches_the_reference() {
-        let names = [
-            "busybox", "ls", "cat", "echo", "dash", "bash", "true", "false",
-        ];
-        for name in names {
-            let binary = find(name).unwrap();
-            let reference = reference_digest(binary);
+    fn an_image_is_the_same_on_every_thread_and_matches_its_recorded_digest() {
+        for (name, golden) in GOLDEN_SHA256 {
             let digests: Vec<Vec<u8>> = (0..4)
                 .map(|_| std::thread::spawn(move || blob_digest(find(name).unwrap())))
                 .collect::<Vec<_>>()
@@ -1106,7 +1107,7 @@ mod tests {
                 .map(|handle| handle.join().unwrap())
                 .collect();
             for digest in digests {
-                assert_eq!(digest, reference, "{name}");
+                assert_eq!(hex(&digest), golden, "{name}");
             }
         }
     }

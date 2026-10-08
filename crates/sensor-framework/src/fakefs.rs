@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::binaries::{self, BinaryImage};
 use crate::budget::{BudgetError, BudgetLimits, ConnectionBudget, FsCounters};
+use crate::elf_body::ElfBody;
 use crate::etc;
 use crate::persona;
 
@@ -210,35 +211,32 @@ impl Node {
 /// Bytes of the recorded header every synthetic executable starts with.
 pub const ELF_HEADER_LEN: usize = 64;
 
-/// A synthetic executable: a recorded header, then filler out to `len`. The whole file is this
-/// description, so it costs the same to hold whatever its size, and any range of it costs only the
-/// bytes asked for.
+/// A synthetic executable: a recorded header, then a body generated from it out to `len`
+/// ([`crate::elf_body`]). The whole file is this description, so it costs the same to hold
+/// whatever its size, and any range of it costs only the bytes asked for.
 ///
-/// The filler byte at offset `i >= 64` is `0x80 | (i & 0x3f)`. The high bit is always set, so filler
-/// is never a newline: the first newline a line-reading command meets is one the header carries or
-/// the one planted at `newline_at`.
+/// The first newline a line-reading command meets is one the header carries or the one at
+/// `newline_at`; with neither, wherever the generated body puts its first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElfImage {
     pub header: [u8; ELF_HEADER_LEN],
     pub len: u64,
-    /// An offset at or past the header that holds `0x0a` instead of filler.
+    /// The offset, at or past the header, of the image's first `0x0a`.
     pub newline_at: Option<u64>,
+    /// The program the image is: it seeds the body and picks the strings its `.rodata` holds.
+    pub name: &'static str,
 }
 
 impl ElfImage {
-    /// Byte `index` of the file; meaningful for `index < len`.
-    #[deny(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+    /// Byte `index` of the file; meaningful for `index < len`. Builds the layout each call: read
+    /// a range through [`ElfImage::body`] instead.
     pub fn byte_at(&self, index: u64) -> u8 {
-        if let Some(byte) = usize::try_from(index)
-            .ok()
-            .and_then(|at| self.header.get(at))
-        {
-            return *byte;
-        }
-        if self.newline_at == Some(index) {
-            return 0x0a;
-        }
-        0x80 | u8::try_from(index & 0x3f).unwrap_or(0)
+        self.body().byte_at(index)
+    }
+
+    /// The generated content, laid out once for any number of reads.
+    pub fn body(&self) -> ElfBody {
+        ElfBody::new(self)
     }
 }
 
@@ -286,9 +284,7 @@ impl Piece {
             Piece::Counter { seed, .. } => {
                 out.extend((from..to).map(|i| counter_byte(*seed, i)));
             }
-            Piece::Elf(image) => {
-                out.extend((from..to).map(|i| image.byte_at(i)));
-            }
+            Piece::Elf(image) => image.body().append_range(from, to, out),
         }
     }
 }
@@ -2805,10 +2801,13 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
                             0x80 | (i & 0x3f) as u8
                         }
                     }));
+                    // Random bytes are no ELF header the generator lays out, so the body is the
+                    // filler it keeps for one.
                     pieces.push(Piece::Elf(ElfImage {
                         header,
                         len,
                         newline_at,
+                        name: "",
                     }));
                 }
                 0 => {

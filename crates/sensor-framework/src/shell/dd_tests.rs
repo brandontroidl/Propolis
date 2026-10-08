@@ -1,5 +1,5 @@
-//! `dd` through `handle_input`, over the F1 images. Expected data bytes are rebuilt here from the
-//! recorded 64-byte headers and the filler rule, not read back through the code under test. The
+//! `dd` through `handle_input`, over the F1 images. Expected data bytes are the images read
+//! directly, not through the command under test (the generator has its own tests). The
 //! record lines and the GNU summary layout are the ones in the ground-truth capture ("dd"
 //! section); the summary's elapsed time is synthesized, so only its layout is asserted for a run
 //! and the captured (bytes, time) pairs are asserted through `summary_line`.
@@ -30,19 +30,9 @@ fn run(sh: &mut FakeShell, line: &str) -> CommandResult {
     sh.handle_input(line).0
 }
 
-/// The modeled image of `name`: its recorded header, then `0x80 | (offset & 0x3f)` with a newline
-/// planted at 409 in `ls` (the only filler the tests reach past the header).
+/// The first 4096 bytes of the modeled image of `name`, the most the tests reach.
 fn image(name: &str) -> Vec<u8> {
-    let binary = binaries::find(name).unwrap();
-    let mut bytes = binary.header().to_vec();
-    for offset in 64..binary.size.min(4096) {
-        bytes.push(if name == "ls" && offset == 409 {
-            0x0a
-        } else {
-            0x80 | u8::try_from(offset & 0x3f).unwrap()
-        });
-    }
-    bytes
+    binaries::find(name).unwrap().blob().read_range(0, 4096)
 }
 
 fn stdout_of(out: &CommandResult) -> Vec<u8> {

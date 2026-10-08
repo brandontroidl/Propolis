@@ -668,6 +668,60 @@ fn the_daemons_splitting_rules_are_followed_first_colon_trim_and_blank_entries()
     let msgs = finding_messages(&v).join("\n");
     assert!(!msgs.contains("malformed"), "{msgs}");
     assert_eq!(check(&v, "ssh", "tcp", "intake"), "ok");
+    // Split on the FIRST colon: the label is `extra` and the path keeps its own colon.
+    assert!(
+        msgs.contains(&format!(
+            "entry 'extra:{logs}/odd:name/events.jsonl' matches no configured sensor's log path"
+        )),
+        "{msgs}"
+    );
+}
+
+#[test]
+fn ufw_default_allow_incoming_opens_every_port_and_a_loopback_bind_needs_no_rule() {
+    let fx = Fx::new();
+    fx.write(
+        "state/ufw",
+        "Status: active\nDefault: allow (incoming), allow (outgoing), disabled (routed)\n\nTo                         Action      From\n--                         ------      ----\n",
+    );
+    let v = fx.json();
+    assert_eq!(
+        listener(&v, "ssh", "tcp")["checks"]["firewall"]["text"],
+        "open"
+    );
+
+    let fx = Fx::new();
+    fx.write(
+        "etc/ssh.env",
+        &format!(
+            "PROPOLIS_SSH_BIND=127.0.0.1:22\nPROPOLIS_SSH_LOG_PATH={}/ssh/events.jsonl\n",
+            fx.logs()
+        ),
+    );
+    fx.write(
+        "state/ufw",
+        &UFW_ALL
+            .replace("22/tcp                     ALLOW IN    Anywhere\n", "")
+            .replace("22/tcp (v6)                ALLOW IN    Anywhere (v6)\n", ""),
+    );
+    fx.ss(
+        &[
+            ("127.0.0.1:22", "sensor-ssh"),
+            ("0.0.0.0:1883", "sensor-mqtt"),
+            ("0.0.0.0:5432", "sensor-cred"),
+            ("203.0.113.7:53", "sensor-dns"),
+        ],
+        &[
+            ("0.0.0.0:69", "sensor-tftp"),
+            ("203.0.113.7:53", "sensor-dns"),
+        ],
+    );
+    let r = fx.run(&[]);
+    assert_eq!(r.code, 0, "{}", r.out);
+    assert_eq!(
+        listener(&fx.json(), "ssh", "tcp")["checks"]["firewall"]["text"],
+        "loopback"
+    );
 }
 
 #[test]

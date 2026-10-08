@@ -3835,7 +3835,7 @@ async fn feed_page_reads_manifest_correctly(pool: PgPool) {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("manifest.json"),
-        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":3,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":11,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}}}"#,
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":3,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":11,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}},"windows":[{"label":"7d","count":2,"sha256":"f00d","valid_until":"2026-08-05T14:00:00Z"}]}"#,
     )
     .unwrap();
 
@@ -3853,8 +3853,9 @@ async fn feed_page_reads_manifest_correctly(pool: PgPool) {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
+    // Manifest times render in the console's own "YYYY-MM-DD HH:MM UTC" form, never raw RFC 3339.
     assert!(
-        body.contains("2026-07-29T14:00:00Z"),
+        body.contains("2026-07-29 14:00 UTC"),
         "missing build time: {body}"
     );
     assert!(
@@ -3866,8 +3867,16 @@ async fn feed_page_reads_manifest_correctly(pool: PgPool) {
         "missing standard count: {body}"
     );
     assert!(
-        body.contains("2026-07-30T14:00:00Z"),
-        "missing aggressive valid_until: {body}"
+        body.contains("2026-07-30 14:00 UTC") && body.contains("2026-07-31 14:00 UTC"),
+        "missing tier valid_until: {body}"
+    );
+    assert!(
+        body.contains("2026-08-05 14:00 UTC"),
+        "missing retention window valid_until: {body}"
+    );
+    assert!(
+        !body.contains("T14:00:00Z"),
+        "a raw RFC 3339 manifest time reached the page: {body}"
     );
     // A manifest from before the exclusions field existed still parses (serde default) and renders
     // ASN suppression as off rather than collapsing the page.
@@ -7179,4 +7188,69 @@ async fn assets_are_served_with_their_type_and_revalidated_by_etag(pool: PgPool)
         .await
         .unwrap();
     assert_eq!(nested.status(), StatusCode::NOT_FOUND);
+}
+
+// --- console polish: folding, paging, log fields, queue context ---
+
+/// Renders `uri` for a logged-in operator and returns the status and body.
+async fn get_page(state: AppState, uri: &str) -> (StatusCode, String) {
+    let (_, cookie) = state.sessions.create();
+    let response = test_app(state)
+        .oneshot(get_request(
+            uri,
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_text(response).await)
+}
+
+/// `n` seconds before now, as the RFC 3339 text the event fixtures take.
+fn secs_ago(n: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::seconds(n)).to_rfc3339()
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_labels_the_transport_as_an_acronym(pool: PgPool) {
+    migrate(&pool).await;
+    let sid = Uuid::now_v7();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.150",
+            "telnet",
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            &secs_ago(60),
+            serde_json::json!({ "command": "uname -a" }),
+            sid,
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.150",
+            "tftp",
+            SignalType::HoneypotConnection,
+            Protocol::Udp,
+            false,
+            &secs_ago(30),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = get_page(test_state(pool), "/ip/203.0.113.150").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Telnet / TCP"), "session header: {body}");
+    assert!(body.contains("<td>UDP</td>"), "ungrouped row: {body}");
+    assert!(
+        !body.contains("Tcp") && !body.contains("Udp"),
+        "a Rust enum name reached the page: {body}"
+    );
 }

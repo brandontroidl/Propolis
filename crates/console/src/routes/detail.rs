@@ -79,7 +79,8 @@ use crate::routes::context::{BaseContext, base_context};
 use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
 use crate::routes::format::{
-    format_activity, format_relative_time, format_sensor_label, format_timestamp, tier_label,
+    format_activity, format_relative_time, format_sensor_label, format_timestamp, protocol_label,
+    tier_label,
 };
 use crate::templates::script_json;
 
@@ -745,7 +746,7 @@ async fn fetch_evidence_rows(
                 .get("xor_key")
                 .and_then(|v| v.as_u64())
                 .map(|k| format!("0x{k:02x}")),
-            protocol: format!("{protocol:?}"),
+            protocol: protocol_label(protocol).to_string(),
             authenticated: row.try_get("authenticated")?,
             wan_ip: row
                 .try_get::<Option<String>, _>("wan_ip")?
@@ -1278,7 +1279,7 @@ mod tests {
             activity: format_activity("ssh", signal_type),
             detail: extract_detail(signal_type, &metadata),
             xor_badge: None,
-            protocol: "Tcp".into(),
+            protocol: "TCP".into(),
             authenticated: true,
             wan_ip: "203.0.113.9".into(),
             metadata_json: metadata.to_string(),

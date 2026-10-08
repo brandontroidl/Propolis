@@ -3,7 +3,7 @@
 //! one shared copy rather than two that can drift on the next edit.
 
 use chrono::{DateTime, Utc};
-use core_scoring::FeedTier;
+use core_scoring::{FeedTier, Protocol};
 
 /// Renders a UTC timestamp the same way on every page: `2026-07-17 00:00 UTC`.
 pub(crate) fn format_timestamp(dt: DateTime<Utc>) -> String {
@@ -16,6 +16,16 @@ pub(crate) fn tier_label(t: FeedTier) -> &'static str {
     match t {
         FeedTier::Aggressive => "aggressive",
         FeedTier::Standard => "standard",
+    }
+}
+
+/// The display label for an event's transport. `Protocol`'s `Debug` output (`Tcp`) is a Rust
+/// identifier, not how anyone writes the protocol's name.
+pub(crate) fn protocol_label(p: Protocol) -> &'static str {
+    match p {
+        Protocol::Tcp => "TCP",
+        Protocol::Udp => "UDP",
+        Protocol::Icmp => "ICMP",
     }
 }
 

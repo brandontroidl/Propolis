@@ -139,9 +139,21 @@ pub fn environment() -> Environment<'static> {
         .expect("integrity.html must be a valid template");
     env.add_template("samples.html", SAMPLES_HTML)
         .expect("samples.html must be a valid template");
+    env.add_template("sample_detail.html", SAMPLE_DETAIL_HTML)
+        .expect("sample_detail.html must be a valid template");
+    env.add_template("campaigns.html", CAMPAIGNS_HTML)
+        .expect("campaigns.html must be a valid template");
+    env.add_template("campaign_detail.html", CAMPAIGN_DETAIL_HTML)
+        .expect("campaign_detail.html must be a valid template");
+    env.add_template("campaign_approve.html", CAMPAIGN_APPROVE_HTML)
+        .expect("campaign_approve.html must be a valid template");
     env
 }
 
+const SAMPLE_DETAIL_HTML: &str = include_str!("templates/sample_detail.html");
+const CAMPAIGNS_HTML: &str = include_str!("templates/campaigns.html");
+const CAMPAIGN_DETAIL_HTML: &str = include_str!("templates/campaign_detail.html");
+const CAMPAIGN_APPROVE_HTML: &str = include_str!("templates/campaign_approve.html");
 const IPS_HTML: &str = include_str!("templates/ips.html");
 const INTEGRITY_HTML: &str = include_str!("templates/integrity.html");
 const SAMPLES_HTML: &str = include_str!("templates/samples.html");

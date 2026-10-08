@@ -7,6 +7,7 @@
 //! session-gated automatically.
 
 pub mod assets;
+pub mod campaigns;
 pub(crate) mod context;
 pub mod dashboard;
 pub(crate) mod degraded;
@@ -61,6 +62,7 @@ pub fn router(state: AppState) -> Router {
         .merge(ips::router())
         .merge(integrity::router())
         .merge(samples::router())
+        .merge(campaigns::router())
         .merge(logs::router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

@@ -9,12 +9,16 @@ use minijinja::context;
 use serde::Serialize;
 
 use crate::AppState;
+use crate::routes::campaigns::{
+    CampaignRef, artifact_iocs, campaigns_by_sample, campaigns_linking_sample,
+};
 use crate::routes::context::base_context;
 use crate::routes::error::AppError;
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/samples", get(samples_page))
+        .route("/samples/{sha256}", get(sample_page))
         .route("/samples/download/{sha256}", get(download_sample))
 }
 
@@ -34,6 +38,8 @@ struct SampleRow {
     /// How the fetcher's transport was authenticated for each URL that returned this body; empty
     /// for a body no fetch produced (a sensor upload). See `sample_transport`.
     transport: Vec<TransportTag>,
+    /// The sample's own campaign: every address that uploaded it or reported a URL serving it.
+    campaign: Option<CampaignRef>,
 }
 
 /// One distinct transport-authentication state among the fetches that returned a sample.
@@ -246,9 +252,20 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         .collect();
 
     let max_source_ips = max_source_ips_shown();
-    let mut samples = Vec::new();
+    let mut files = Vec::new();
     for (sensor, dir) in spool_dirs() {
         for file in review::spool::list_samples(&dir).await.unwrap_or_default() {
+            files.push((sensor, file));
+        }
+    }
+    let shas: Vec<String> = files.iter().map(|(_, f)| f.sha256.clone()).collect();
+    let campaigns = degraded.soft(
+        "sample campaigns",
+        campaigns_by_sample(&state.db, &shas).await,
+    );
+    let mut samples = Vec::new();
+    {
+        for (sensor, file) in files {
             let vt = vt_results.get(&file.sha256);
             let all_ips = source_ips_by_sha.get(&file.sha256);
             let source_ips: Vec<String> = all_ips
@@ -262,6 +279,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
             samples.push(SampleRow {
                 sha256_short: file.sha256[..12].to_string(),
                 size: format_bytes(file.size),
+                campaign: campaigns.get(&file.sha256).cloned(),
                 sha256: file.sha256,
                 sensor: sensor.to_string(),
                 vt_detected: vt.map(|(d, _, _)| *d),
@@ -292,6 +310,60 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         status_counts,
         fetch_attempts_total,
     })?))
+}
+
+/// `GET /samples/{sha256}` - one sample: where it is spooled, the campaigns it belongs to, and the
+/// indicators extracted from it. The digest is validated before it touches a query or a path.
+async fn sample_page(
+    State(state): State<AppState>,
+    AxumPath(sha256): AxumPath<String>,
+) -> Result<Response, AppError> {
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok((axum::http::StatusCode::BAD_REQUEST, "invalid sha256").into_response());
+    }
+    let sha256 = sha256.to_ascii_lowercase();
+    let mut spooled = None;
+    for (bucket, dir) in spool_dirs() {
+        // Not following a link: a planted symlink under a digest name is not a sample.
+        if let Ok(meta) = std::fs::symlink_metadata(dir.join(&sha256))
+            && meta.is_file()
+        {
+            spooled = Some((bucket, meta.len()));
+            break;
+        }
+    }
+
+    let base = base_context(&state.db, state.startup_time, state.version).await;
+    let mut degraded = base.degraded;
+    let campaigns: Vec<CampaignRef> = degraded.soft(
+        "sample campaigns",
+        campaigns_linking_sample(&state.db, &sha256).await,
+    );
+    let scan_state: Option<String> = degraded.soft(
+        "indicator scan state",
+        sqlx::query_scalar("SELECT state FROM ioc_artifact_scan WHERE sha256 = $1")
+            .bind(&sha256)
+            .fetch_optional(&state.db)
+            .await,
+    );
+    let iocs = degraded.soft("indicators", artifact_iocs(&state.db, &sha256).await);
+
+    let tmpl = state.templates.get_template("sample_detail.html")?;
+    Ok(Html(tmpl.render(context! {
+        active_nav => "samples",
+        pending_count => base.pending_count,
+        uptime => base.uptime,
+        version => base.version,
+        degraded => degraded.names(),
+        spooled => spooled.is_some(),
+        bucket => spooled.map(|(b, _)| b).unwrap_or_default(),
+        size => spooled.map(|(_, s)| format_bytes(s)).unwrap_or_default(),
+        sha256,
+        campaigns,
+        scan_state => scan_state.unwrap_or_default(),
+        iocs,
+    })?)
+    .into_response())
 }
 
 async fn download_sample(AxumPath(sha256): AxumPath<String>) -> Response {

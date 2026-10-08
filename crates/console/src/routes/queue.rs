@@ -32,6 +32,7 @@ use sqlx::{PgPool, Row};
 
 use crate::AppState;
 use crate::auth::Session;
+use crate::routes::campaigns::{CampaignRef, campaigns_by_ip};
 use crate::routes::context::{BaseContext, base_context};
 use crate::routes::detail::extract_detail;
 use crate::routes::error::AppError;
@@ -198,6 +199,9 @@ struct RowContext {
     /// Set when the address has more events than [`CONTEXT_SAMPLE`]: the counts above then
     /// describe that many of its events, and this says so ("5,000 of 7,845").
     sampled: Option<String>,
+    /// The largest campaign the address belongs to, with its pending member count, so a row from
+    /// a fifty-host campaign says so and links to approving them together.
+    campaign: Option<CampaignRef>,
 }
 
 #[derive(Debug, Serialize)]
@@ -299,6 +303,7 @@ async fn row_context(pool: &PgPool, ip: IpAddr, event_count: i32) -> Result<RowC
                 group_digits(i64::from(event_count).max(sampled))
             )
         }),
+        campaign: None,
     })
 }
 
@@ -367,7 +372,7 @@ async fn queue_page(
         .generate_csrf(&session.id)
         .unwrap_or_default();
 
-    let rows: Vec<QueueRowView> = match query.tab.review_state() {
+    let mut rows: Vec<QueueRowView> = match query.tab.review_state() {
         None => pending_rows(&state.db, query.sort, &csrf_token).await?,
         // The token goes to the history tabs too: the Snoozed tab carries real decision controls
         // (it is the only route back out of a snooze), and those POST like any other.
@@ -383,8 +388,26 @@ async fn queue_page(
         pending_count,
         uptime,
         version,
-        degraded,
+        mut degraded,
     } = base_context(&state.db, state.startup_time, state.version).await;
+
+    // Campaign membership for every row with a context line, in one query.
+    let ips: Vec<String> = rows
+        .iter()
+        .filter(|r| r.context.is_some())
+        .map(|r| r.ip.clone())
+        .collect();
+    let mut campaigns = degraded.soft(
+        "campaign membership",
+        campaigns_by_ip(&state.db, &ips).await,
+    );
+    for row in &mut rows {
+        if let Some(context) = row.context.as_mut() {
+            context.campaign = campaigns
+                .remove(&row.ip)
+                .and_then(|list| list.into_iter().next());
+        }
+    }
 
     let tmpl = state.templates.get_template("queue.html")?;
     let html = tmpl.render(context! {

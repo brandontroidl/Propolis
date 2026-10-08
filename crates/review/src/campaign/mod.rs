@@ -132,10 +132,18 @@ pub struct TickStats {
 }
 
 /// One tick: index up to [`MAX_BATCHES_PER_TICK`] batches, resolve pending download links, scan
-/// queued artifacts in `spool_dirs`, and drop working state past its retention.
-pub async fn run_tick(pool: &PgPool, spool_dirs: &[(&'static str, PathBuf)]) -> TickStats {
+/// queued artifacts in `spool_dirs`, and drop working state past its retention. `stop` is asked
+/// between steps, so a shutdown waits for one batch at most, never a whole tick.
+pub async fn run_tick(
+    pool: &PgPool,
+    spool_dirs: &[(&'static str, PathBuf)],
+    stop: &(dyn Fn() -> bool + Sync),
+) -> TickStats {
     let mut stats = TickStats::default();
     for _ in 0..MAX_BATCHES_PER_TICK {
+        if stop() {
+            return stats;
+        }
         match index_batch(pool, BATCH_EVENTS).await {
             Ok(BatchOutcome::Indexed(n)) => {
                 stats.batches += 1;
@@ -155,9 +163,15 @@ pub async fn run_tick(pool: &PgPool, spool_dirs: &[(&'static str, PathBuf)]) -> 
             }
         }
     }
+    if stop() {
+        return stats;
+    }
     match resolve_pending_fetches(pool).await {
         Ok(n) => stats.fetch_links = n,
         Err(e) => tracing::warn!(error = %e, "campaigns: resolving download links failed"),
+    }
+    if stop() {
+        return stats;
     }
     match scan_artifacts(pool, spool_dirs).await {
         Ok(n) => stats.artifacts_scanned = n,

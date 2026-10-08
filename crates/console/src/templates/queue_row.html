@@ -38,6 +38,7 @@
     {% if c.signals %}<span class="sev-tags ctx-item">{% for s in c.signals %}<span class="sev sev--{{ s.sev }}">{{ s.label }} {{ s.count }}</span>{% endfor %}</span>{% endif %}
     {% if c.notable %}<span class="ctx-item ctx-notable"><span class="dim">{% if c.notable.kind == "upload" %}uploaded{% elif c.notable.kind == "fetch" %}fetched{% else %}first command{% endif %}</span> <code class="mono">{{ c.notable.text }}</code></span>{% endif %}
     {% if c.sampled %}<span class="ctx-item faint">counts from {{ c.sampled }} events</span>{% endif %}
+    {% if c.campaign %}<span class="ctx-item ctx-campaign">part of <a href="/campaigns/{{ c.campaign.id }}">campaign {{ c.campaign.id }}</a>, {{ c.campaign.members }} host{% if c.campaign.members != 1 %}s{% endif %}{% if c.campaign.role == "infected host" %} <span class="dim">(infected hosts)</span>{% endif %}{% if c.campaign.pending > 1 %} <a href="/campaigns/{{ c.campaign.id }}/approve">approve all {{ c.campaign.pending }} pending&hellip;</a>{% endif %}</span>{% endif %}
   </td>
 </tr>
 {% endif %}

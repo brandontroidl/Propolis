@@ -70,6 +70,19 @@
 </div>
 
 <div class="panel">
+  <div class="panel-head">Campaigns <span class="dim">other addresses doing the same thing</span></div>
+  {% if campaigns %}
+  <ul class="campaign-refs">
+    {% for c in campaigns %}
+    <li><a href="/campaigns/{{ c.id }}">{{ c.label }}</a> <span class="dim">{{ c.kind }}, {{ c.members }} host{% if c.members != 1 %}s{% endif %}{% if c.role == "infected host" %}, members are likely infected hosts{% endif %}{% if c.pending > 0 %}, {{ c.pending }} pending review{% endif %}</span></li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="dim">not part of a campaign{% if campaign_indexer_behind > 0 %} yet; the campaign indexer is {{ campaign_indexer_behind }} events behind the ledger{% endif %}</p>
+  {% endif %}
+</div>
+
+<div class="panel">
   <div class="panel-head">Network profile</div>
   <table class="table-compact">
     <tbody>

@@ -53,6 +53,12 @@ fn fetch_spool_dir() -> std::path::PathBuf {
 const SAMPLE_RETENTION_DAYS: u64 = 30;
 const SAMPLE_RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// How often the campaign indexer looks for new ledger rows once it has caught up.
+const CAMPAIGN_TICK_INTERVAL: Duration = Duration::from_secs(15);
+/// The pause between ticks while it works through a backlog, so a large catch-up shares the
+/// database with intake instead of running back to back.
+const CAMPAIGN_CATCHUP_PAUSE: Duration = Duration::from_millis(500);
+
 /// Root of the capture spool the ops-monitor's capacity condition watches for free space. The
 /// per-sensor and fetched subdirectories all live under it, so it is the volume that fills as
 /// captured samples accumulate.
@@ -1367,6 +1373,53 @@ async fn main() {
             }
         },
     ));
+
+    // 8c. Campaign indexer (docs/operations/campaigns.md): groups sources into campaigns and
+    // extracts indicators, off the append path, a bounded batch of ledger rows per step. Local work
+    // only: it reads the database and the spools and makes no outbound connection, so it runs on
+    // every deployment.
+    {
+        let pool_campaigns = pool.clone();
+        handles.push(spawn_supervised_named(
+            "campaigns",
+            cancel.clone(),
+            supervisor_state.clone(),
+            move |token| {
+                let pool = pool_campaigns.clone();
+                async move {
+                    let spool_dirs = review::spool::all_body_dirs();
+                    loop {
+                        if token.is_cancelled() {
+                            return;
+                        }
+                        let stop = || token.is_cancelled();
+                        let stats = review::campaign::run_tick(&pool, &spool_dirs, &stop).await;
+                        if stats.events > 0 || stats.fetch_links > 0 || stats.artifacts_scanned > 0
+                        {
+                            tracing::info!(
+                                events = stats.events,
+                                batches = stats.batches,
+                                caught_up = stats.caught_up,
+                                fetch_links = stats.fetch_links,
+                                artifacts_scanned = stats.artifacts_scanned,
+                                "campaigns: indexed"
+                            );
+                        }
+                        let backlog = stats.batches > 0 && !stats.caught_up;
+                        let pause = if backlog {
+                            CAMPAIGN_CATCHUP_PAUSE
+                        } else {
+                            CAMPAIGN_TICK_INTERVAL
+                        };
+                        tokio::select! {
+                            _ = tokio::time::sleep(pause) => {}
+                            _ = token.cancelled() => {}
+                        }
+                    }
+                }
+            },
+        ));
+    }
 
     // 9. Spawn malware fetcher if enabled.
     if config.fetch_enabled {

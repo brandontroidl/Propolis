@@ -21,7 +21,7 @@ const VARS: &[&str] = &[
     "PROPOLIS_SSH_BANNER",
     "PROPOLIS_SSH_OUTBOX_DIR",
     "PROPOLIS_SSH_CAPTURE_MEMORY_BYTES",
-    "PROPOLIS_SSH_COMMAND_EVENT_RATE",
+    "PROPOLIS_SSH_COMMAND_EVENT_RATE_PER_MIN",
     "PROPOLIS_SSH_COMMAND_EVENT_BURST",
     "PROPOLIS_COLLECTOR_ID",
     "COLLECTOR_ID",
@@ -75,7 +75,7 @@ fn a_non_utf8_value_exits_1_before_any_listener_binds() {
 #[test]
 fn a_zero_or_garbage_command_event_budget_exits_1_before_any_listener_binds() {
     for var in [
-        "PROPOLIS_SSH_COMMAND_EVENT_RATE",
+        "PROPOLIS_SSH_COMMAND_EVENT_RATE_PER_MIN",
         "PROPOLIS_SSH_COMMAND_EVENT_BURST",
     ] {
         for bad in ["0", "-1", "lots", "4294967296"] {

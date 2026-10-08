@@ -89,12 +89,12 @@ by [events-and-signals.md](events-and-signals.md#command-summary-keys).
 
 | Item | Value | Source |
 |---|---|---|
-| Per source network | 2 per s, burst 200 | `PROPOLIS_SSH_COMMAND_EVENT_RATE`, `PROPOLIS_SSH_COMMAND_EVENT_BURST`; `PROPOLIS_TELNET_COMMAND_EVENT_RATE`, `PROPOLIS_TELNET_COMMAND_EVENT_BURST`; `PROPOLIS_ADB_COMMAND_EVENT_RATE`, `PROPOLIS_ADB_COMMAND_EVENT_BURST` |
+| Per source network | 12 per minute, burst 200 | `PROPOLIS_SSH_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_SSH_COMMAND_EVENT_BURST`; `PROPOLIS_TELNET_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_TELNET_COMMAND_EVENT_BURST`; `PROPOLIS_ADB_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_ADB_COMMAND_EVENT_BURST` |
 | Global | none: only the per-network bucket refuses *(hard-coded)* | `crates/sensor-framework/src/command_flood.rs#CommandEventGate::new` |
 | Source network | IPv4 /24 (IPv4-mapped IPv6 included), IPv6 /56 *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#SourceKey` |
 | Networks tracked (buckets) | 4096, with eviction *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#DEFAULT_RATE_TABLE_CAPACITY` |
 | Summary window | 60 s per network, checked each second *(hard-coded)* | `crates/sensor-framework/src/command_flood.rs#COMMAND_SUMMARY_WINDOW` |
-| Always written per window | each distinct command's first sighting (128 tracked) and each address's first command event (64 tracked) *(hard-coded)* | `crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_COMMANDS`, `crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_ADDRESSES` |
+| Always written per window | the first sighting of each command shape (128 tracked; `crates/sensor-framework/src/command_flood.rs#command_shape`) and each address's first command event (64 tracked), never an echo-loader chunk *(hard-coded)* | `crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_COMMANDS`, `crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_ADDRESSES` |
 | Summaries held | 1024 networks, then one overflow summary; 8 samples of 256 bytes and 32 sessions each *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#DEFAULT_SUMMARY_CAPACITY`, `crates/sensor-framework/src/command_flood.rs#MAX_COMMAND_SAMPLE_LEN`, `crates/sensor-framework/src/command_flood.rs#MAX_SUMMARY_SESSIONS` |
 | Shutdown flush | pending summaries written within 2 s *(hard-coded)* | `crates/sensor-telnet/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`, `crates/sensor-ssh/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`, `crates/sensor-adb/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT` |
 

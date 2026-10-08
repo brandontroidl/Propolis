@@ -209,16 +209,16 @@ when and why in [sensor-behavior](sensor-behavior.md#command-event-budget-ssh-te
 `source_ip`, `wan_ip`, `sensor` and `authenticated` are those of the first suppressed event, its
 protocol is `tcp`, and its `session_id` is fresh: the commands came from several sessions, none
 of which it belongs to. `command` is a readable line for the timeline, `<N repeated commands from
-<prefix> summarized; each distinct command's first sighting is logged in full>`.
+<prefix> summarized; the first of each command shape is logged in full>`.
 
 | key | type | meaning |
 |---|---|---|
 | `command_summary` | boolean | always `true`; marks the event as a summary |
 | `source_prefix` | string | the source network in CIDR form (`198.51.100.0/24`), or `overflow` for networks that arrived while the summary table was full |
 | `suppressed_count` | integer | command events this summary stands for |
-| `distinct_commands` | integer | distinct commands among them |
-| `distinct_commands_capped` | boolean | more distinct commands arrived than the window could tell apart (always `true` for `overflow`) |
-| `samples` | array of strings | up to 8 distinct suppressed commands, sanitized, at most 256 characters each |
+| `distinct_commands` | integer | distinct command shapes among them (escapes, hex and base64 runs taken out, `crates/sensor-framework/src/command_flood.rs#command_shape`), so all of a loader's echo chunks count once |
+| `distinct_commands_capped` | boolean | more shapes arrived than the window could tell apart (always `true` for `overflow`) |
+| `samples` | array of strings | one suppressed command per shape, up to 8, sanitized, at most 256 characters each |
 | `first_seen`, `last_seen` | string | RFC 3339 times of the first and last suppressed command |
 | `window_secs` | number | the window length, 60 |
 | `session_count` | integer | distinct sessions the suppressed commands came from, at most 32 |
@@ -229,12 +229,15 @@ of which it belongs to. `command` is a readable line for the timeline, `<N repea
 Scoring treats a summary as one `honeypot_command_exec` from its `source_ip`; `suppressed_count`
 is data for the analyst, not a weight. The merit path loses nothing: a same-signal event from
 one address within 60 s of the previous one adds no weight anyway (`DEDUP_WINDOW_SECONDS`, see
-[scoring-and-feed](scoring-and-feed.md)), and every address that runs commands keeps its own first
-command event of each window, so its weight and its 0.950 confidence still arrive. The volume
-path does slow, since it counts established events: a source still sending past its budget
-reaches the 1000-event volume threshold at about two command events a second plus its other
-events, instead of its full rate; with the defaults that is at most about 400 s later
-([rate limits](rate-limits-and-budgets.md#shell-command-event-budget-ssh-telnet-adb)).
+[scoring-and-feed](scoring-and-feed.md)), and every address that runs a command other than an
+echo-loader chunk keeps its own first command event of each window, so its weight and its 0.950
+confidence still arrive. The volume path does slow, since it counts established events: past its
+budget a source adds about 12 command events a minute plus its first sightings, on top of its
+connections, logins, downloads and captures, which are never summarized
+([rate limits](rate-limits-and-budgets.md#shell-command-event-budget-ssh-telnet-adb)). For the
+observed loop that is roughly 60 established events a minute instead of about 450, so it reaches
+the 1000-event threshold in about a quarter of an hour instead of a few minutes [inferred:
+arithmetic from the observed loop, not a measured scoring run].
 
 ### Arrival metadata key
 

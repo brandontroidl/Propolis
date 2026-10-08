@@ -338,18 +338,27 @@ applied as the last step of each line, `crates/sensor-framework/src/shell/mod.rs
 - **Only logging changes.** The command has already run when the gate sees its event: every
   reply, file and capture is the same whether its event is written or summarized.
 - **The budget.** A token bucket per source network (IPv4 /24, IPv6 /56, the same key as the
-  UDP reply limit), charged one token per `honeypot_command_exec`: a burst of 200, then 2 a
-  second (`PROPOLIS_<SENSOR>_COMMAND_EVENT_RATE` / `_BURST`, see
+  UDP reply limit), charged one token per `honeypot_command_exec`: a burst of 200, then 12 a
+  minute (`PROPOLIS_<SENSOR>_COMMAND_EVENT_RATE_PER_MIN` / `_BURST`, see
   [environment variables](environment-variables.md#standard-sensors-strict-parse---ssh-telnet-http-ftp-redis-adb-catchall-tftp-mqtt-dns)).
   Within it, events are exactly as before.
-- **First sightings.** The first time a command is seen from the network in a 60 s window it is
-  written in full even with the bucket empty (and takes a token if one is left), so a new
-  command always appears. A window remembers 128 distinct commands
-  (`crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_COMMANDS`); past that, a new command
-  goes by the bucket. Each address's first command event in the window is written too, for up to
-  64 addresses of the network (`crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_ADDRESSES`):
+- **First sightings.** The first time a command *shape* is seen from the network in a 60 s
+  window, the command is written in full even with the bucket empty (and takes a token if one is
+  left), so a new kind of command always appears. The shape
+  (`crates/sensor-framework/src/command_flood.rs#command_shape`) is the line with its payload taken
+  out: each run of `\xNN` or `\NNN` escapes, each run of 16 or more hex digits and each
+  base64-looking run of 24 or more characters becomes a placeholder, and whitespace runs collapse
+  to one space. So a loader's echo chunks, which differ only in their bytes, and its markers,
+  whether fixed or random per session, are one shape each; the observed 53-line session is 16
+  shapes. A window remembers 128 shapes
+  (`crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_COMMANDS`); past that, a new one goes
+  by the bucket. Each address's first command event in the window is written too, for up to 64
+  addresses of the network (`crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_ADDRESSES`):
   scoring is per address and the budget per network, so a host whose commands all repeat a
   neighbour's would otherwise have no command event at all.
+- **Echo-loader chunks are never firsts.** A command event carrying `assembled_file` (one chunk
+  of an echo-loader upload) goes by the bucket alone: its bytes are in the `echo_loader` capture,
+  and the summary keeps `assembled_file` and the highest suppressed `chunk_index`.
 - **Never summarized** (`crates/sensor-framework/src/command_flood.rs#summarizable`): anything that
   is not a plain command event. Logins and connections never pass through the shell;
   `honeypot_file_download` (a fetch verb's URL or an echo-loader's derived stage-2 URL), every
@@ -366,14 +375,16 @@ applied as the last step of each line, `crates/sensor-framework/src/shell/mod.rs
   nothing writes nothing. A session's end does not write the summary early: its window outlives
   it, so the bot's next session is still measured against the same first sightings.
 - **Bounded.** The bucket table holds 4096 networks with eviction; the window table 1024
-  networks, each with at most 128 command digests, 8 samples of at most 256 bytes and 32 session
+  networks, each with at most 128 shape digests, 64 addresses, 8 samples of at most 256 bytes and 32 session
   ids; a network arriving while it is full is counted in one `overflow` summary without first
   sightings (`crates/sensor-framework/src/command_flood.rs#CommandEventGate::admit_at`). The
   worst case is a few MiB per sensor.
-- **What it leaves.** With the defaults a source that keeps sending writes at most
-  200 + 2 per second of individual command events, plus per minute up to 128 first sightings, one
-  first event per address and one summary: the observed bot, at about 4.3 commands a second with every chunk a distinct
-  command, is cut to roughly 3 a second, not to zero. A lower rate cuts it further.
+- **What it leaves.** With the defaults a source that keeps sending writes at most 200 + 12 a
+  minute of individual command events, plus per minute one first sighting per shape, one first
+  event per address and one summary. The observed loop (the 53-line session, four at once from
+  one address, a new round every 30 s) is 4,240 command events in ten minutes ungated and 407
+  individual events plus 10 summaries with the gate
+  (`crates/sensor-framework/src/command_flood.rs#the_observed_loader_loop_is_bounded_by_burst_rate_shapes_and_addresses`).
 
 ### Command de-obfuscation
 

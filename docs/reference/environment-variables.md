@@ -548,7 +548,7 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
 
   | Variable | Default | Meaning |
   |---|---|---|
-  | `PROPOLIS_SSH_COMMAND_EVENT_RATE`, `PROPOLIS_TELNET_COMMAND_EVENT_RATE`, `PROPOLIS_ADB_COMMAND_EVENT_RATE` | `2` (`crates/sensor-framework/src/command_flood.rs#DEFAULT_COMMAND_EVENT_RATE`) | Command events per second per source network once the burst is spent. |
+  | `PROPOLIS_SSH_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_TELNET_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_ADB_COMMAND_EVENT_RATE_PER_MIN` | `12` (`crates/sensor-framework/src/command_flood.rs#DEFAULT_COMMAND_EVENTS_PER_MIN`) | Command events per minute per source network once the burst is spent. |
   | `PROPOLIS_SSH_COMMAND_EVENT_BURST`, `PROPOLIS_TELNET_COMMAND_EVENT_BURST`, `PROPOLIS_ADB_COMMAND_EVENT_BURST` | `200` (`crates/sensor-framework/src/command_flood.rs#DEFAULT_COMMAND_EVENT_BURST`) | Command events a quiet source network may write at once. |
 
   What is never summarized, and the summary event, are in

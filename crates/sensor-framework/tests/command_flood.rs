@@ -129,14 +129,21 @@ fn parallel_loader_sessions_past_the_budget_change_only_which_command_events_are
     let plain = commands(&plain_events);
     assert_eq!(plain.len(), total, "no gate, one event per command");
     let gated = commands(&gated_events);
-    // The whole run is well inside one window: the burst, the first sighting of each distinct
-    // command, and one token a second.
+    // The upload chunks (the `> .i` and `>> .i` echo lines) are never first sightings; every other
+    // line is one shape of its own.
+    let firsts: Vec<String> = session()
+        .into_iter()
+        .filter(|line| !line.contains("echo -ne"))
+        .collect();
+    assert_eq!(firsts.len(), 8);
+    // The whole run is well inside one window: the burst, one first sighting per shape, and one
+    // token a second.
     assert!(
-        gated.len() <= BURST as usize + session().len() + refill,
+        gated.len() <= BURST as usize + firsts.len() + refill,
         "{} individual events",
         gated.len()
     );
-    for line in session() {
+    for line in &firsts {
         assert!(
             gated.iter().any(|e| e.metadata["command"] == line.as_str()),
             "first sighting logged: {line}"
@@ -155,13 +162,15 @@ fn parallel_loader_sessions_past_the_budget_change_only_which_command_events_are
     assert_eq!(summaries.len(), 1);
     let s = &summaries[0];
     assert_eq!(s.count as usize + gated.len(), total);
-    assert_eq!(s.distinct_commands, session().len() as u64);
-    // The first session to run each line holds its first sighting, so it never folds anything.
-    assert_eq!(s.sessions, rounds * parallel - 1);
+    // Eight first-sighting shapes and the two chunk forms (`> .i`, `>> .i`).
+    assert_eq!(s.distinct_commands, 10);
+    // Every session wrote chunks past the burst.
+    assert_eq!(s.sessions, rounds * parallel);
     assert_eq!(s.assembled_file.as_deref(), Some("/tmp/.i"));
     assert_eq!(s.max_chunk_index, Some(45));
 
-    // Another network running the same loop meanwhile has its own whole budget.
+    // Another network running the same loop meanwhile has its own whole budget: its burst, not
+    // the loader's empty bucket.
     let (_, bystander) = run(BYSTANDER, Some(&gate), 1, 1);
-    assert_eq!(commands(&bystander).len(), session().len());
+    assert!(commands(&bystander).len() > BURST as usize);
 }

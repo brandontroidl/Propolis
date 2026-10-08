@@ -66,7 +66,7 @@ struct Config {
     command_events: CommandEventConfig,
 }
 
-/// The sensor name in `PROPOLIS_ADB_COMMAND_EVENT_RATE` and `..._BURST`.
+/// The sensor name in `PROPOLIS_ADB_COMMAND_EVENT_RATE_PER_MIN` and `..._BURST`.
 const COMMAND_EVENT_SENSOR: &str = "adb";
 /// How long shutdown waits for the command summaries still accumulating to be written.
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);

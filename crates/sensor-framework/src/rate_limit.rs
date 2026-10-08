@@ -106,17 +106,44 @@ impl fmt::Display for SourceKey {
 /// never be configured into "disabled".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rate {
-    per_second: NonZeroU32,
+    count: NonZeroU32,
+    period: Duration,
     burst: NonZeroU32,
 }
 
 impl Rate {
+    /// `per_second` tokens a second.
     pub const fn new(per_second: NonZeroU32, burst: NonZeroU32) -> Self {
-        Self { per_second, burst }
+        Self {
+            count: per_second,
+            period: Duration::from_secs(1),
+            burst,
+        }
     }
 
+    /// `per_minute` tokens a minute, for budgets too slow to state per second.
+    pub const fn per_minute(per_minute: NonZeroU32, burst: NonZeroU32) -> Self {
+        Self {
+            count: per_minute,
+            period: Duration::from_secs(60),
+            burst,
+        }
+    }
+
+    /// Tokens per [`Self::period`].
+    pub fn count(self) -> u32 {
+        self.count.get()
+    }
+
+    /// The period [`Self::count`] tokens refill over: a second, or a minute for
+    /// [`Self::per_minute`].
+    pub fn period(self) -> Duration {
+        self.period
+    }
+
+    /// Tokens a second, for a rate built with [`Self::new`].
     pub fn per_second(self) -> u32 {
-        self.per_second.get()
+        self.count.get()
     }
 
     pub fn burst(self) -> u32 {
@@ -125,7 +152,7 @@ impl Rate {
 
     /// Time one token takes to refill, at least a nanosecond so no rate rounds to "unlimited".
     fn interval(self) -> Duration {
-        (Duration::from_secs(1) / self.per_second.get()).max(Duration::from_nanos(1))
+        (self.period / self.count.get()).max(Duration::from_nanos(1))
     }
 
     /// How far ahead of now the arrival time may run: room for `burst - 1` more tokens.
@@ -737,6 +764,27 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(allowed(&limiter, k, t0, 3), 1);
         assert_eq!(allowed(&limiter, k, t0 + Duration::from_millis(500), 3), 1);
+    }
+
+    #[test]
+    fn a_per_minute_rate_refills_one_token_per_sixtieth_of_its_count() {
+        let rate = Rate::per_minute(nz(12), nz(3));
+        assert_eq!((rate.count(), rate.period()), (12, Duration::from_secs(60)));
+        let limiter =
+            ReplyRateLimiter::new(&RateLimitConfig::new(rate, Rate::new(nz(1000), nz(2000))));
+        let k = key("192.0.2.1:1");
+        let t0 = Instant::now();
+        assert_eq!(allowed(&limiter, k, t0, 10), 3);
+        assert_eq!(
+            allowed(&limiter, k, t0 + Duration::from_millis(4_999), 3),
+            0
+        );
+        assert_eq!(allowed(&limiter, k, t0 + Duration::from_secs(5), 3), 1);
+        assert_eq!(
+            allowed(&limiter, k, t0 + Duration::from_secs(65), 30),
+            3,
+            "never past the burst"
+        );
     }
 
     #[test]

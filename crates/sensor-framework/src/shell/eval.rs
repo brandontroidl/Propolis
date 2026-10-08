@@ -1335,6 +1335,7 @@ impl FakeShell {
         writer: &str,
         typed: bool,
     ) -> CommandResult {
+        let carried = self.cat_origin.take();
         if !plan.active {
             return result;
         }
@@ -1373,6 +1374,11 @@ impl FakeShell {
             let prior = content.len();
             content.extend_from_slice(&bytes);
             match self.traced_write_file(&path, &content) {
+                Ok(()) if !append && carried.is_some() => {
+                    if let Some(origin) = carried.clone() {
+                        self.set_origin(&path, origin);
+                    }
+                }
                 Ok(()) if typed => {
                     let (before, _) = content.split_at(prior.min(content.len()));
                     self.note_typed_write(&path, before, &content);

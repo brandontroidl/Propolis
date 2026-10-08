@@ -5,9 +5,11 @@
 //! `src/main.rs` (the `review` binary) composes them into the submission
 //! daemon and CLI dispatch.
 
+pub mod campaign;
 pub mod cli;
 pub mod fetcher;
 pub mod gatekeeper;
+pub mod ioc;
 pub mod queue;
 pub mod spool;
 pub mod submit;

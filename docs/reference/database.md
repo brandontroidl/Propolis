@@ -17,7 +17,8 @@ tiers, and eligibility live in [scoring-and-feed.md](scoring-and-feed.md).
 Three crates own schema through three independent migration sets:
 
 - **core-scoring** (`crates/core-scoring/migrations/*.sql`) owns `event`, `ip_score`,
-  `ip_vantage`, `ip_sensor`, `sample_analysis`, and all five enum types.
+  `ip_vantage`, `ip_sensor`, `sample_analysis`, the campaign and indicator tables, and all five
+  enum types.
 - **review** (`crates/review/migrations/*.sql`) owns `review_queue`,
   `vendor_submission`, `fetch_attempt`, `fetch_daily_usage`.
 - **fleet** (`crates/fleet/migrations/*.sql`) owns `listener_probe`.
@@ -283,6 +284,34 @@ migration's two `INSERT ... SELECT` statements again with the daemon stopped.
 `rebuild_projection` does not read them: it counts from the ledger rows, so a replay is an
 independent check (`crates/core-scoring/src/repository/breadth_sets_tests.rs#breadth_sets_match_the_whole_history_aggregates_after_every_append`).
 
+<a id="campaign-tables"></a>
+## Campaign and indicator tables (`0015_campaigns.sql`)
+
+Derived from the ledger by the campaign indexer, a bounded background job, never by the append
+path; [campaigns](../operations/campaigns.md) explains the grouping rules. Like `ip_score` they
+can be rebuilt: empty them, set `campaign_cursor.last_event_id` to 0, and the indexer works
+through the ledger again.
+
+| table | holds | key | source |
+|---|---|---|---|
+| `campaign_cursor` | the last event id indexed | single row | `crates/core-scoring/migrations/0015_campaigns.sql#campaign_cursor` |
+| `campaign` | one row per campaign: `kind` (`sample`, `command_sequence`, `scanner`), `key`, `label`, `representative` (JSONB), `rep_event_id`, `first_seen`, `last_seen`, `member_count`, `sightings`, `self_propagating` | `id`; UNIQUE `(kind, key)` | `crates/core-scoring/migrations/0015_campaigns.sql#CREATE TABLE campaign (` |
+| `campaign_member` | one row per campaign and source address: first and last seen, sightings, `uploaded` | `(campaign_id, source_ip)`; index on `source_ip` | `crates/core-scoring/migrations/0015_campaigns.sql#campaign_member` |
+| `campaign_member_day` | the UTC days each member was seen | `(campaign_id, day, source_ip)` | `crates/core-scoring/migrations/0015_campaigns.sql#campaign_member_day` |
+| `campaign_sensor` | sightings per sensor | `(campaign_id, sensor)` | `crates/core-scoring/migrations/0015_campaigns.sql#campaign_sensor` |
+| `campaign_sample` | samples linked to a campaign | `(campaign_id, sha256)`; index on `sha256` | `crates/core-scoring/migrations/0015_campaigns.sql#campaign_sample` |
+| `campaign_session` | indexer state: one shell session's current run (running digest, shape count, campaign once grouped) | `session_id` | `crates/core-scoring/migrations/0015_campaigns.sql#campaign_session` |
+| `campaign_watermark` | indexer state: newest `observed_at` read per sensor | `sensor` | `crates/core-scoring/migrations/0015_campaigns.sql#campaign_watermark` |
+| `campaign_scan_window` | indexer state: distinct sensors per source per window | `(source_ip, window_start)` | `crates/core-scoring/migrations/0015_campaigns.sql#campaign_scan_window` |
+| `campaign_pending_fetch` | downloads waiting for a fetch outcome | `(url_hash, source_ip)` | `crates/core-scoring/migrations/0015_campaigns.sql#campaign_pending_fetch` |
+| `ioc` | indicators: `kind`, `value`, `detail`, and either `artifact_sha256` or `event_id` with `source_ip` | `id`; partial UNIQUE `(artifact_sha256, kind, value)` and `(source_ip, kind, value)` | `crates/core-scoring/migrations/0015_campaigns.sql#ioc_artifact_uq` |
+| `ioc_artifact_scan` | captured artifacts queued for indicator extraction, and the outcome | `sha256` | `crates/core-scoring/migrations/0015_campaigns.sql#ioc_artifact_scan` |
+
+`ioc.value` is at most 256 characters and `ioc.detail` 128, both sanitized before they are
+written. A password hash is stored only as a marker (`sha512-crypt sha256:<16 hex>`), never the
+crypt string (`crates/review/src/ioc.rs#password_hashes`). The working-state tables are pruned two
+days behind their sensor's clock (`crates/review/src/campaign/mod.rs#prune`).
+
 ## Table: `sample_analysis` (`0009_sample_analysis.sql`)
 
 VirusTotal-style verdict per captured sample, keyed by SHA-256; links to a
@@ -399,6 +428,7 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 | `0012` | `signal_type_enum` value `honeypot_session_end` (unscored interaction telemetry) |
 | `0013` | index `event_dedup_idx (source_ip, signal_type, observed_at)` for the append path's dedup read; built inside the migration transaction, so writes to `event` wait for the build ([schema-and-migrations](../development/schema-and-migrations.md#index-builds)) |
 | `0014` | tables `ip_vantage (source_ip, wan_ip, saw_authenticated_tcp)` and `ip_sensor (source_ip, sensor)`, the [breadth sets](#breadth-sets) the append path counts from; backfilled from the ledger under a `SHARE` lock on `event` |
+| `0015` | the [campaign and indicator tables](#campaign-tables) and the indexer's cursor (starting at 0, no backfill: the indexer reads the ledger in batches after startup) |
 
 **review** (`crates/review/migrations/`):
 

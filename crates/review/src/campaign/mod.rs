@@ -817,7 +817,10 @@ impl Batch {
                     representative: json!({
                         "sha256": sha,
                         "origin": "fetched",
-                        "url": ioc::sanitize_field(url, ioc::MAX_IOC_VALUE_BYTES),
+                        "url": ioc::sanitize_field(
+                            &ioc::redact_secrets(url),
+                            ioc::MAX_IOC_VALUE_BYTES
+                        ),
                         "sensor": sensor,
                         "source_ip": source_ip,
                     }),
@@ -1168,7 +1171,7 @@ async fn run_representative(
     );
     let shapes: Vec<String> = shapes
         .iter()
-        .map(|s| ioc::sanitize_field(s, fingerprint::MAX_SHAPE_CHARS))
+        .map(|s| ioc::sanitize_field(&ioc::redact_secrets(s), fingerprint::MAX_SHAPE_CHARS))
         .collect();
     let label = ioc::sanitize_field(&fingerprint::label(&shapes), 200);
     Ok((
@@ -1386,25 +1389,25 @@ pub fn scan_artifact(
     sha256: &str,
 ) -> (ArtifactScan, Vec<Indicator>) {
     for (bucket, dir) in spool_dirs {
-        match sensor_framework::spool::read_verified(
-            dir,
-            sha256,
-            ioc::MAX_ARTIFACT_TEXT_BYTES as u64,
-        ) {
+        match sensor_framework::spool::read_verified(dir, sha256, ioc::MAX_BINARY_SCAN_BYTES as u64)
+        {
             Ok(bytes) => {
-                return match ioc::extract_from_artifact(&bytes) {
-                    Some(found) => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        (
-                            ArtifactScan::Done {
-                                indicators: found.len(),
-                                self_propagating: ioc::self_propagating(&text),
-                            },
-                            found,
-                        )
-                    }
-                    None => (ArtifactScan::NotText, Vec::new()),
+                // A compiled bot is read through its printable strings; one with none is recorded
+                // as not text rather than as scanned clean.
+                let Some((_, text)) = ioc::artifact_text(&bytes) else {
+                    return (ArtifactScan::TooBig, Vec::new());
                 };
+                if text.trim().is_empty() {
+                    return (ArtifactScan::NotText, Vec::new());
+                }
+                let found = ioc::extract_artifact_text(&text);
+                return (
+                    ArtifactScan::Done {
+                        indicators: found.len(),
+                        self_propagating: ioc::self_propagating(&text),
+                    },
+                    found,
+                );
             }
             Err(sensor_framework::SpoolError::FileSizeExceeded { .. }) => {
                 return (ArtifactScan::TooBig, Vec::new());

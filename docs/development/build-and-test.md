@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 3408 test functions** (2150 unit + 1258 integration).
+- **Total: 3416 test functions** (2158 unit + 1258 integration).
 - **DB-backed (`sqlx::test`): 245** - console 179, core-scoring 35, review 10,
   intake 8, propolis 7, fleet 6. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -127,7 +127,7 @@ Per-crate breakdown:
 | log-tailer | 3 | 47 | cursor_test, cursorless_test, tailer_test |
 | propolis | 121 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
-| review | 133 | 80 | campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
+| review | 141 | 80 | campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
 | sensor-adb | 61 | 43 | arrival, env_strict, integration |
 | sensor-catchall | 18 | 9 | arrival, env_strict, integration |
 | sensor-cred | 32 | 40 | arrival, env_strict, integration, tls_integration |
@@ -144,7 +144,7 @@ Per-crate breakdown:
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2150** | **1258** | |
+| **Total** | **2158** | **1258** | |
 
 ### Test styles by layer
 

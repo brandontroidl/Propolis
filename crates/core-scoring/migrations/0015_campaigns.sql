@@ -135,11 +135,13 @@ CREATE TABLE campaign_pending_fetch (
 -- Indicators, each with its provenance: a captured artifact (artifact_sha256) or the first command
 -- or download event that carried it (event_id, with its source). Values are sanitized and capped
 -- before they are written and are attacker data all the same. A password hash is stored only as a
--- marker (its scheme and a digest prefix of the crypt string), never the hash itself.
+-- marker (its scheme and a digest prefix of the crypt string), never the hash itself, and an
+-- embedded credential only as a 'credentials' row naming how it was carried, never its value.
 CREATE TABLE ioc (
     id              BIGSERIAL   PRIMARY KEY,
     kind            TEXT        NOT NULL CHECK (kind IN ('url', 'endpoint', 'ssh_key', 'rsa_key',
-                        'password_hash', 'irc_server', 'irc_channel', 'hosts_entry', 'persistence')),
+                        'password_hash', 'irc_server', 'irc_channel', 'hosts_entry', 'persistence',
+                        'proxy', 'credentials')),
     value           TEXT        NOT NULL CHECK (char_length(value) BETWEEN 1 AND 256),
     detail          TEXT        NOT NULL DEFAULT '' CHECK (char_length(detail) <= 128),
     artifact_sha256 TEXT        CHECK (artifact_sha256 ~ '^[0-9a-f]{64}$'),

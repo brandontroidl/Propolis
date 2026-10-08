@@ -307,9 +307,12 @@ through the ledger again.
 | `ioc` | indicators: `kind`, `value`, `detail`, and either `artifact_sha256` or `event_id` with `source_ip` | `id`; partial UNIQUE `(artifact_sha256, kind, value)` and `(source_ip, kind, value)` | `crates/core-scoring/migrations/0015_campaigns.sql#ioc_artifact_uq` |
 | `ioc_artifact_scan` | captured artifacts queued for indicator extraction, and the outcome | `sha256` | `crates/core-scoring/migrations/0015_campaigns.sql#ioc_artifact_scan` |
 
-`ioc.value` is at most 256 characters and `ioc.detail` 128, both sanitized before they are
-written. A password hash is stored only as a marker (`sha512-crypt sha256:<16 hex>`), never the
-crypt string (`crates/review/src/ioc.rs#password_hashes`). The working-state tables are pruned two
+`ioc.kind` is one of `url`, `endpoint`, `ssh_key`, `rsa_key`, `password_hash`, `irc_server`,
+`irc_channel`, `hosts_entry`, `persistence`, `proxy` and `credentials`. `ioc.value` is at most
+256 characters and `ioc.detail` 128, both sanitized and stripped of URL user information and
+`Authorization` values before they are written. A password hash is stored only as a marker
+(`sha512-crypt sha256:<16 hex>`), never the crypt string (`crates/review/src/ioc.rs#password_hashes`),
+and a `credentials` row names only how a credential was carried, never its value. The working-state tables are pruned two
 days behind their sensor's clock (`crates/review/src/campaign/mod.rs#prune`).
 
 ## Table: `sample_analysis` (`0009_sample_analysis.sql`)

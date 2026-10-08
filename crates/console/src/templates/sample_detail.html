@@ -33,8 +33,8 @@
     {% else %}
     <p class="dim">scanned; no indicators found</p>
     {% endif %}
-  {% elif scan_state == "not_text" %}<p class="dim">not scanned: not a text artifact</p>
-  {% elif scan_state == "too_big" %}<p class="dim">not scanned: larger than the indicator scan reads</p>
+  {% elif scan_state == "not_text" %}<p class="dim">scanned; no printable strings to read</p>
+  {% elif scan_state == "too_big" %}<p class="dim">not scanned: larger than the indicator scan reads (8 MiB)</p>
   {% elif scan_state == "missing" %}<p class="dim">not scanned: the body was never found in a spool</p>
   {% elif scan_state == "pending" %}<p class="dim">queued for scanning</p>
   {% else %}<p class="dim">not queued: no event has named this sample yet</p>

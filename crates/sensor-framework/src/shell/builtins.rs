@@ -117,6 +117,96 @@ impl FakeShell {
         self.logout_shell()
     }
 
+    /// bash's `history`. An interactive login shell lists what was typed as `%5d  %s` lines
+    /// (recorded on Ubuntu 22.04: `    1  echo one`); a shell run by `bash -c`, as an SSH exec is,
+    /// keeps no history and lists nothing (recorded: `history | tail -5` printed nothing, status
+    /// 0). `-c` clears, `-d N` deletes, `N` lists the last N, and a word that is no number is
+    /// bash's `numeric argument required`, status 1, in either shell.
+    pub(super) fn builtin_history(&mut self, parts: &[&str]) -> CommandResult {
+        let args = parts.get(1..).unwrap_or(&[]);
+        let mut count: Option<usize> = None;
+        let mut iter = args.iter();
+        while let Some(&arg) = iter.next() {
+            match arg {
+                "-c" => {
+                    self.history.clear();
+                    return CommandResult::silent(0);
+                }
+                "-d" => {
+                    let Some(position) = iter.next().and_then(|n| n.parse::<usize>().ok()) else {
+                        return CommandResult::stderr(
+                            1,
+                            self.shell_error("history: -d: option requires an argument"),
+                        );
+                    };
+                    if position == 0 || position > self.history.len() {
+                        return CommandResult::stderr(
+                            1,
+                            self.shell_error(format_args!(
+                                "history: {position}: history position out of range"
+                            )),
+                        );
+                    }
+                    self.history.remove(position.saturating_sub(1));
+                    return CommandResult::silent(0);
+                }
+                "-a" | "-n" | "-r" | "-w" | "-p" | "-s" => return CommandResult::silent(0),
+                "--" => {}
+                word => match word.parse::<usize>() {
+                    Ok(n) => count = Some(n),
+                    Err(_) => {
+                        return CommandResult::stderr(
+                            1,
+                            self.shell_error(format_args!(
+                                "history: {word}: numeric argument required"
+                            )),
+                        );
+                    }
+                },
+            }
+        }
+        let keeps = self.context == super::ShellContext::LoginInteractive;
+        if !keeps {
+            return CommandResult::silent(0);
+        }
+        let total = self.history.len();
+        let skip = count.map_or(0, |n| total.saturating_sub(n));
+        let mut out = String::new();
+        for (index, line) in self.history.iter().enumerate().skip(skip) {
+            out.push_str(&format!("{:5}  {line}\n", index.saturating_add(1)));
+        }
+        CommandResult::stdout(out)
+    }
+
+    /// `history` in a shell that has no such builtin (dash, mksh).
+    pub(super) fn builtin_history_not_found(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::stderr(127, self.not_found("history"))
+    }
+
+    /// Note a line typed at the interactive login shell, as bash with Ubuntu's stock
+    /// `HISTCONTROL=ignoreboth` does: a line starting with a space is not kept, nor a repeat of
+    /// the line before it.
+    pub(super) fn record_history(&mut self, raw: &str) {
+        if self.context != super::ShellContext::LoginInteractive
+            || !matches!(self.active_level(), ShellLevel::Bash { .. })
+            || !self.pending.is_empty()
+        {
+            return;
+        }
+        let line = raw.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() || line.starts_with(' ') {
+            return;
+        }
+        let line = super::sanitize_value(line, super::MAX_COMMAND_LEN);
+        if self.history.last() == Some(&line) {
+            return;
+        }
+        if self.history.len() >= super::HISTORY_MAX {
+            self.history.remove(0);
+        }
+        self.history.push(line);
+    }
+
     fn top_frame_is_scoped(&self) -> bool {
         self.frames
             .last()

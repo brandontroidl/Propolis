@@ -703,6 +703,34 @@ impl FakeShell {
     }
 
     fn eval_pipeline(&mut self, pipeline: &Pipeline) -> CommandResult {
+        let Some(posix) = pipeline.timed else {
+            return self.eval_untimed(pipeline);
+        };
+        match self.active_level() {
+            // dash has no `time` keyword and Ubuntu ships no /usr/bin/time, so the word is a
+            // command it cannot find.
+            ShellLevel::Dash { .. } => CommandResult::stderr(127, self.not_found("time")),
+            level => {
+                let before = self.timing;
+                let mut result = self.eval_untimed(pipeline);
+                let spent = self.timing.since(&before);
+                let report = if level == ShellLevel::AndroidMksh {
+                    super::timing::mksh_report(&spent)
+                } else {
+                    super::timing::bash_report(&spent, posix)
+                };
+                let (status, flow) = (result.status, result.flow);
+                result.append(CommandResult::stderr(status, report));
+                result.flow = flow;
+                result
+            }
+        }
+    }
+
+    fn eval_untimed(&mut self, pipeline: &Pipeline) -> CommandResult {
+        if pipeline.stages.is_empty() {
+            return CommandResult::silent(0);
+        }
         if let ([stage], false) = (pipeline.stages.as_slice(), pipeline.bang) {
             return self.eval_command(stage);
         }

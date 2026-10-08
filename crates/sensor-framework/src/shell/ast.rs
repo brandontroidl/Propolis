@@ -124,6 +124,9 @@ pub(super) enum AndOrOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Pipeline {
     pub bang: bool,
+    /// bash's `time` keyword before the pipeline: `Some(true)` for `time -p`. The stages may be
+    /// empty under it (`time` alone times nothing).
+    pub timed: Option<bool>,
     pub stages: Vec<Command>,
 }
 

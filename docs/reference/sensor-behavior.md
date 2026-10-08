@@ -247,6 +247,15 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   what bash and dash also reject prints their syntax error and status 2. `read`, `export`,
   `unset`, `set`, `shift`, `umask`, `break`, `continue`, `cd`, `exit` act on the shell itself
   (`crates/sensor-framework/src/shell/builtins.rs`); `source`, `.` and `eval` only record intent.
+  bash's `time [-p]` keyword times a pipeline and reports on the shell's standard error, outside
+  the command's own redirections, in bash 5.1's `\nreal\t0m0.019s` (or `-p`'s `real 0.00`) form;
+  dash has no such keyword (`sh: 1: time: not found`). Nothing is measured: `sleep` adds what it
+  was asked for, `dd` the elapsed time its own summary reports, and each command started from a
+  file a fixed process cost, so `time dd ...` reports a `real` no shorter than dd's `copied, S s`
+  and `time true` reports zeros (`crates/sensor-framework/src/shell/timing.rs#bash_report`).
+  `history` lists what the interactive login shell was typed as `    1  echo one`, under Ubuntu's
+  `HISTCONTROL=ignoreboth`; a `bash -c` (SSH exec) shell keeps none and lists nothing
+  (`crates/sensor-framework/src/shell/builtins.rs#FakeShell::builtin_history`).
   `$$` and `$!` come from a per-session process id seeded from the session id
   (`crates/sensor-framework/src/persona.rs#session_pid`), and the shell's own `/proc/PID` reads as
   `/proc/self`. Words are strings: byte-string arguments are deferred to the command families that
@@ -261,7 +270,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   terminal-rows model the shell does not have, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_more`) and `hexdump` (only `-e '16/1 "%c"'` with `-n`;
   any other format prints nothing, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_hexdump`), `dd` (`if`, `of`, `bs`, `ibs`, `obs`, `count`, `skip`, `seek`,
   `conv=notrunc`, `status`; the bytes are read once at offset `skip*bs` for `bs*count`, bounded by what the line has left, then the record
-  lines on stderr, plus GNU's summary whose elapsed time is synthesized, `crates/sensor-framework/src/shell/dd.rs#FakeShell::cmd_dd`),
+  lines on stderr, plus GNU's summary whose elapsed time is synthesized; `if=/dev/zero of=FILE` writes its zeros as an O(1)
+  fill, up to 1 GiB, so a disk-speed probe gets the size it asked for, `crates/sensor-framework/src/shell/dd.rs#FakeShell::cmd_dd`),
   `wc` (`-c -l -w -m` over a file or a pipe, GNU column widths and `total` row,
   `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_wc`), `od` (`-An -tx1`, `-c`, the default octal words and `-A`
   radixes; other formats print nothing, `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_od`), `grep` (GNU grep 3.7:
@@ -290,7 +300,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `tftp`/`ftpget` (silent; the download url is synthesized from the separate host and file
   arguments as `tftp://host[:port]/file` / `ftp://host[:port]/file`, since neither command
   takes a url token),
-  `chmod`/`cp`/`rm`/`mkdir`/`sleep` (silent success), `cd`, `exit`/`logout`; an
+  `chmod`/`cp`/`rm`/`mkdir` (silent success), `sleep` (returns at once; GNU's errors for a
+  missing or bad interval), `cd`, `exit`/`logout`; an
   unknown command uses the active shell level's diagnostic form, and so does a path that does
   not exist: bash's `No such file or directory`, dash's and mksh's `not found`
   (`crates/sensor-framework/src/shell/mod.rs#FakeShell::invoke_path`).

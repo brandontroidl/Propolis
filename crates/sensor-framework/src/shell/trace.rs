@@ -200,6 +200,8 @@ pub enum HandlerId {
     Su,
     Exit,
     Logout,
+    /// bash's `history`: the interactive login shell's typed lines.
+    History,
     Read,
     Export,
     Unset,

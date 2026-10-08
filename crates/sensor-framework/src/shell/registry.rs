@@ -323,6 +323,17 @@ fn register_core(r: &mut Registry) {
         FakeShell::builtin_logout,
     );
     r.register_unresolved("logout", HandlerId::Logout, FakeShell::builtin_logout);
+    r.register_builtin_if(
+        "history",
+        is_bash,
+        HandlerId::History,
+        FakeShell::builtin_history,
+    );
+    r.register_unresolved(
+        "history",
+        HandlerId::History,
+        FakeShell::builtin_history_not_found,
+    );
     // The builtins that act on the shell itself. `source` is bash's; dash and mksh have only `.`.
     r.register_builtin("read", HandlerId::Read, FakeShell::builtin_read);
     r.register_builtin("export", HandlerId::Export, FakeShell::builtin_export);

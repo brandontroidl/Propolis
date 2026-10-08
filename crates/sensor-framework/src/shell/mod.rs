@@ -92,6 +92,7 @@ mod sysres;
 mod test_builtin;
 mod textproc;
 mod texttools;
+mod timing;
 mod trace;
 
 use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
@@ -412,7 +413,14 @@ pub struct FakeShell {
     loader_line: loader::LineLoader,
     /// The current line as typed, sanitized and capped like `metadata.command`.
     line_command: String,
+    /// The time the session's commands claim to have taken, for `time`.
+    timing: timing::Timing,
+    /// The interactive login shell's command history, oldest first, as `history` lists it.
+    history: Vec<String>,
 }
+
+/// The most entries `history` keeps: Ubuntu's stock `.bashrc` sets `HISTSIZE=1000`.
+const HISTORY_MAX: usize = 1_000;
 
 /// A line waiting for its input.
 #[derive(Clone)]
@@ -591,6 +599,8 @@ impl FakeShell {
             typed_output: false,
             loader_line: loader::LineLoader::default(),
             line_command: String::new(),
+            timing: timing::Timing::default(),
+            history: Vec::new(),
         };
         shell.install_processes();
         shell
@@ -646,6 +656,8 @@ impl FakeShell {
                 typed_output: self.typed_output,
                 loader_line: self.loader_line.clone(),
                 line_command: self.line_command.clone(),
+                timing: self.timing,
+                history: self.history.clone(),
             }),
         }
     }
@@ -955,6 +967,7 @@ impl FakeShell {
     /// command at all.
     fn begin_input(&mut self, line: &[u8]) -> Option<(String, Vec<SensorEvent>)> {
         let raw = String::from_utf8_lossy(line);
+        self.record_history(&raw);
         self.begin_line();
         self.line_command = sanitize_value(&raw, MAX_COMMAND_LEN);
         if raw.trim().is_empty() {
@@ -1241,10 +1254,20 @@ impl FakeShell {
         }
         let (id, handler) = self.resolve(parts);
         if let Some(handler) = handler {
+            if Registry::builtin().kind(command_basename(parts[0]), self)
+                == Some(registry::CommandKind::External)
+            {
+                let seed = self.state().pid;
+                self.timing.process(seed);
+            }
             return handler(self, parts);
         }
         match id {
-            HandlerId::PathInvoke => self.invoke_path(parts),
+            HandlerId::PathInvoke => {
+                let seed = self.state().pid;
+                self.timing.process(seed);
+                self.invoke_path(parts)
+            }
             // An interactive bash on Ubuntu prefixes the message with its own name; the bare form
             // matched no real shell.
             HandlerId::NotFound => {
@@ -1391,8 +1414,42 @@ impl FakeShell {
         CommandResult::silent(0)
     }
 
-    fn builtin_sleep(&mut self, _parts: &[&str]) -> CommandResult {
-        CommandResult::silent(0)
+    /// `sleep N[smhd]...`: returns at once, and the time it would have taken is what `time`
+    /// reports for it. GNU coreutils 8.32's errors for a missing or bad operand.
+    fn builtin_sleep(&mut self, parts: &[&str]) -> CommandResult {
+        let operands: Vec<&str> = parts
+            .get(1..)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .filter(|a| *a != "--")
+            .collect();
+        if operands.is_empty() {
+            return CommandResult::stderr(
+                1,
+                "sleep: missing operand\nTry 'sleep --help' for more information.\n",
+            );
+        }
+        match timing::sleep_ns(&operands) {
+            Some(ns) => {
+                self.timing.wait(ns);
+                CommandResult::silent(0)
+            }
+            None => {
+                let bad = operands
+                    .iter()
+                    .find(|o| timing::sleep_ns(&[o]).is_none())
+                    .copied()
+                    .unwrap_or("");
+                CommandResult::stderr(
+                    1,
+                    format!(
+                        "sleep: invalid time interval '{}'\nTry 'sleep --help' for more information.\n",
+                        sanitize_value(bad, MAX_URL_LEN)
+                    ),
+                )
+            }
+        }
     }
 
     /// Already root on this box, so `su` (and `su -`, `su root`) opens another bash
@@ -3194,3 +3251,5 @@ mod tests;
 mod textproc_tests;
 #[cfg(test)]
 mod texttools_tests;
+#[cfg(test)]
+mod timing_tests;

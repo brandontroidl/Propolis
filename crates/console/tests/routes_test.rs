@@ -7356,3 +7356,202 @@ async fn logs_page_shows_fields_and_folds_repeated_info_runs(pool: PgPool) {
     assert!(body.contains(r#"<option value="WARN" selected>"#), "{body}");
     assert!(body.contains("2 lower-level rows hidden"), "{body}");
 }
+
+/// Scores `n` addresses under 10.1.0.0/16 directly in `ip_score`. Raw scores and decay anchors
+/// vary independently, so ordering by stored raw score and ordering by live score disagree.
+async fn seed_scored_population(pool: &PgPool, n: i32) {
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+             distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
+             first_seen, last_seen) \
+         SELECT '10.1.0.0'::inet + i, 10 + (i * 37 % 90), now() - (i * 13 % 48) * interval '1 hour', \
+                0.5, 1 + i % 50, 1, false, 1 + i % 3, 1, now() - interval '3 days', \
+                now() - (i * 13 % 48) * interval '1 hour' \
+         FROM generate_series(1, $1) AS i",
+    )
+    .bind(n)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The addresses an Attackers page lists, in order.
+fn listed_ips(body: &str) -> Vec<String> {
+    body.split(r#"<td class="ip"><a class="insp" href="/ip/"#)
+        .skip(1)
+        .map(|rest| rest[..rest.find('"').unwrap()].to_string())
+        .collect()
+}
+
+/// The scores an Attackers page lists, in order.
+fn listed_scores(body: &str) -> Vec<f64> {
+    body.split(r#"<td class="count"><strong>"#)
+        .skip(1)
+        .map(|rest| rest[..rest.find('<').unwrap()].parse().unwrap())
+        .collect()
+}
+
+/// The value of the `name=` parameter on the pager link labelled `label`.
+fn pager_param(body: &str, label: &str, name: &str) -> Option<String> {
+    body.split("<a href=\"").skip(1).find_map(|link| {
+        let (href, text) = link.split_once("\">")?;
+        if !text.starts_with(label) {
+            return None;
+        }
+        let at = href.find(&format!("{name}="))? + name.len() + 1;
+        Some(href[at..].split('&').next().unwrap().to_string())
+    })
+}
+
+#[sqlx::test(migrations = false)]
+async fn attackers_pages_through_every_address_once_in_live_score_order(pool: PgPool) {
+    migrate(&pool).await;
+    seed_scored_population(&pool, 1003).await;
+    let state = test_state(pool.clone());
+
+    let (status, first) = get_page(state.clone(), "/ips").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        first.contains("showing 1-500 of 1,003 scored addresses"),
+        "{first}"
+    );
+    let page1 = listed_ips(&first);
+    assert_eq!(page1.len(), 500);
+    assert!(pager_param(&first, "&larr; Previous", "before").is_none());
+    let after = pager_param(&first, "Next &rarr;", "after").expect("a next page");
+    assert_eq!(after, page1[499]);
+
+    // An address scored above everything while the operator reads page one must not shift page
+    // two: it resumes after the row page one ended on, where an OFFSET would repeat that row.
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+             distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
+             first_seen, last_seen) \
+         VALUES ('10.2.0.1', 99, now(), 0.5, 1, 1, false, 1, 1, now(), now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (_, second) = get_page(
+        state.clone(),
+        &format!("/ips?sort=score&dir=desc&after={after}"),
+    )
+    .await;
+    assert!(
+        second.contains("showing 502-1,001 of 1,004 scored addresses"),
+        "{second}"
+    );
+    let page2 = listed_ips(&second);
+    assert_eq!(page2.len(), 500);
+    let after = pager_param(&second, "Next &rarr;", "after").expect("a third page");
+    let (_, third) = get_page(
+        state.clone(),
+        &format!("/ips?sort=score&dir=desc&after={after}"),
+    )
+    .await;
+    assert!(
+        third.contains("showing 1,002-1,004 of 1,004 scored addresses"),
+        "{third}"
+    );
+    let page3 = listed_ips(&third);
+    assert_eq!(page3.len(), 3);
+    assert!(pager_param(&third, "Next &rarr;", "after").is_none());
+
+    let mut all: Vec<String> = page1.iter().chain(&page2).chain(&page3).cloned().collect();
+    let in_order = [
+        listed_scores(&first),
+        listed_scores(&second),
+        listed_scores(&third),
+    ]
+    .concat();
+    assert!(
+        in_order.windows(2).all(|w| w[0] >= w[1]),
+        "pages must run in live-score order across their boundaries: {in_order:?}"
+    );
+    all.sort();
+    let listed = all.len();
+    all.dedup();
+    assert_eq!(all.len(), listed, "an address appeared on two pages");
+    assert_eq!(
+        listed, 1003,
+        "every originally scored address appears exactly once"
+    );
+
+    // Previous from page three is page two again.
+    let before = pager_param(&third, "&larr; Previous", "before").expect("a previous page");
+    let (_, back) = get_page(
+        state.clone(),
+        &format!("/ips?sort=score&dir=desc&before={before}"),
+    )
+    .await;
+    assert_eq!(listed_ips(&back), page2);
+    assert!(back.contains("showing 502-1,001 of 1,004"), "{back}");
+
+    // The other sorts page by the same rule, ascending too.
+    let (_, ev1) = get_page(state.clone(), "/ips?sort=events&dir=asc").await;
+    let after = pager_param(&ev1, "Next &rarr;", "after").unwrap();
+    let (_, ev2) = get_page(state, &format!("/ips?sort=events&dir=asc&after={after}")).await;
+    let counts = |body: &str| -> Vec<i64> {
+        body.split(r#"<td class="count">"#)
+            .skip(1)
+            .filter(|r| !r.starts_with('<'))
+            .map(|r| r[..r.find('<').unwrap()].parse().unwrap())
+            .collect()
+    };
+    let both = [counts(&ev1), counts(&ev2)].concat();
+    assert_eq!(both.len(), 1000);
+    assert!(both.windows(2).all(|w| w[0] <= w[1]), "{both:?}");
+}
+
+#[sqlx::test(migrations = false)]
+async fn attackers_first_page_survives_a_lost_cursor_orders_capped_ties_and_states_tiers(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    seed_scored_population(&pool, 3).await;
+    let state = test_state(pool);
+
+    for uri in ["/ips?after=192.0.2.250", "/ips?before=not-an-address"] {
+        let (status, body) = get_page(state.clone(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(body.contains("this is the first page"), "{uri}: {body}");
+        assert!(
+            body.contains("showing 1-3 of 3 scored addresses"),
+            "{uri}: {body}"
+        );
+        assert_eq!(listed_ips(&body).len(), 3, "{uri}");
+    }
+    // Two addresses whose breadth lifts them past the cap both show 100.0. They are ordered by how
+    // far past it they are, the order they keep as they decay, not by address (which would put
+    // .2 first under the descending tiebreak).
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+             distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
+             first_seen, last_seen) \
+         VALUES ('10.3.0.1', 90, now(), 0.5, 1, 1, false, 5, 1, now(), now()), \
+                ('10.3.0.2', 80, now(), 0.5, 1, 1, false, 5, 1, now(), now())",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let (_, plain) = get_page(state, "/ips").await;
+    assert!(!plain.contains("this is the first page"), "{plain}");
+    assert_eq!(
+        &listed_ips(&plain)[..2],
+        ["10.3.0.1", "10.3.0.2"],
+        "{plain}"
+    );
+    assert_eq!(&listed_scores(&plain)[..2], [100.0, 100.0], "{plain}");
+    // The tier rule is stated where the column is, with where to read the rest.
+    assert!(
+        plain.contains(
+            "aggressive needs raw &ge; 90 and confidence &ge; 0.95, standard &ge; 75 and &ge; 0.70"
+        ),
+        "{plain}"
+    );
+    assert!(
+        plain.contains("docs/reference/scoring-and-feed.md#tier"),
+        "{plain}"
+    );
+}

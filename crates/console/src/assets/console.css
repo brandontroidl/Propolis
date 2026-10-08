@@ -456,6 +456,15 @@ td.ip a:hover { color: var(--brand); }
 .chart-box-sm { position: relative; height: 220px; }
 .chart-box-compact { position: relative; height: 110px; margin: 0.75rem 0 0.5rem; }
 
+/* -- Attackers paging and the tier/score note above the table -- */
+.ips-count { margin-bottom: 0.6rem; }
+.table-note { font-size: 0.78rem; color: var(--text-muted); margin: 0 0 0.75rem; max-width: 70rem; }
+.table-note strong { color: var(--text); font-weight: 600; }
+.pager { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.6rem 0; font-size: 0.8rem; }
+.pager a, .pager span { padding: 0.25rem 0.65rem; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+.pager a:hover { border-color: var(--border-bright); text-decoration: none; }
+.pager span { color: var(--text-faint); }
+
 .section-title { font-size: 0.9rem; font-weight: 600; margin: 1.75rem 0 0.75rem; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 

@@ -81,7 +81,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 | GET | `/fleet/status` | `fleet_status_fragment` | HTMX, polled every 30 s; stale handling in `assets/live-panels.js` | `routes/fleet.rs` |
 | GET | `/search/events` | `search_events` | doubles as HTMX load-more when `HX-Request` present; `400` on a control character or an over-512-byte query param | `crates/console/src/routes/search.rs#search_events` |
 | GET | `/search/ips` | `search_ips` | `400` on a control character or an over-512-byte query param | `crates/console/src/routes/search.rs#search_ips` |
-| GET | `/ips` | `ip_list` | `ip_score` list, capped 500 rows | `crates/console/src/routes/ips.rs#ip_list`, `crates/console/src/routes/ips.rs#fetch_ips_ordered` |
+| GET | `/ips` | `ip_list` | `ip_score` list, 500 rows a page; `?sort=score\|events\|first\|last`, `?dir=asc\|desc`, keyset `?after=<ip>` / `?before=<ip>` (an unscored or malformed cursor restarts at the first page); counts exact to 100,000 rows, estimated past it | `crates/console/src/routes/ips.rs#ip_list`, `crates/console/src/routes/ips.rs#fetch_page`, `crates/console/src/routes/ips.rs#SCORE_ORDER_KEY` |
 | GET | `/integrity` | `integrity_page` | | `crates/console/src/routes/integrity.rs#integrity_page` |
 | POST | `/integrity/verify` | `run_verify` | CSRF (403); one verification at a time (409 while one runs) | `routes/integrity.rs` |
 | GET | `/samples` | `samples_page` | | `crates/console/src/routes/samples.rs#samples_page` |

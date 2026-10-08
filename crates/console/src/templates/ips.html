@@ -2,15 +2,30 @@
 {% block title %}All IPs - Propolis{% endblock %}
 {% block content %}
 {% import "macros.html" as m %}
-<h1>Attackers <span class="dim">({{ total }})</span></h1>
-
+{% macro pager() -%}
+{% if prev_before or next_after %}
+<nav class="pager" aria-label="Attackers pages">
+  {% if prev_before %}<a href="/ips?sort={{ sort }}&dir={{ dir }}">First</a><a href="/ips?sort={{ sort }}&dir={{ dir }}&before={{ prev_before }}">&larr; Previous</a>{% else %}<span class="dim">First</span><span class="dim">&larr; Previous</span>{% endif %}
+  {% if next_after %}<a href="/ips?sort={{ sort }}&dir={{ dir }}&after={{ next_after }}">Next &rarr;</a>{% else %}<span class="dim">Next &rarr;</span>{% endif %}
+</nav>
+{% endif %}
+{%- endmacro %}
+<h1>Attackers</h1>
+{% if shown > 0 %}
+<p class="page-sub ips-count">showing {{ shown_from }}-{{ shown_to }}{% if not position_exact %} (position estimated){% endif %} of {% if total_exact %}{{ total }}{% else %}about {{ total }} (estimate){% endif %} scored addresses</p>
+{% endif %}
+{% if cursor_lost %}
+<p class="degraded">That page started at an address that is no longer scored, so this is the first page.</p>
+{% endif %}
+<p class="table-note" id="tier-note"><strong>Tier</strong> is set when an address is scored, from its raw score and its strongest signal's confidence: aggressive needs raw &ge; 90 and confidence &ge; 0.95, standard &ge; 75 and &ge; 0.70. <strong>Score</strong> is live, decayed since the last event and weighted for breadth, so a 100.0 can be standard while a 99.9 is aggressive. Rules: <span class="mono">docs/reference/scoring-and-feed.md#tier</span></p>
+{{ pager() }}
 <div class="table-wrap">
 <table class="table-compact">
   <thead>
     <tr>
       <th class="count"><a href="/ips?sort=score&dir={% if sort == 'score' and dir == 'desc' %}asc{% else %}desc{% endif %}">Score{% if sort == 'score' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
       <th>IP</th>
-      <th>Tier</th>
+      <th title="aggressive: raw score &ge; 90 and confidence &ge; 0.95; standard: &ge; 75 and &ge; 0.70; set when scored" aria-describedby="tier-note">Tier</th>
       <th class="count"><a href="/ips?sort=events&dir={% if sort == 'events' and dir == 'desc' %}asc{% else %}desc{% endif %}">Events{% if sort == 'events' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
       <th>Categories</th>
       <th>WANs</th>
@@ -36,8 +51,9 @@
   </tbody>
 </table>
 </div>
+{{ pager() }}
 
-{% if total == 0 %}
+{% if shown == 0 %}
 <p class="empty-line">no scored IPs yet</p>
 {% endif %}
 {% endblock %}

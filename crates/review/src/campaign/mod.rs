@@ -340,7 +340,8 @@ struct EventRow {
 }
 
 /// A plain command line from a command event: not a flood marker, not a summary of suppressed
-/// commands.
+/// commands. A line the sensor recovered from a single-byte XOR (Mirai's `lghkel` for `enable`)
+/// is the decoded text, so it fingerprints and labels as the plain-text session would.
 fn command_of(metadata: &Value) -> Option<&str> {
     if metadata.get("flood").is_some()
         || metadata
@@ -349,7 +350,41 @@ fn command_of(metadata: &Value) -> Option<&str> {
     {
         return None;
     }
-    metadata.get("command").and_then(Value::as_str)
+    metadata
+        .get("command_decoded")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| metadata.get("command").and_then(Value::as_str))
+}
+
+/// The most XOR-encoded lines a representative keeps.
+const MAX_ENCODED_LINES: usize = 8;
+
+/// The lines of a run that were sent XOR-encoded: the raw text, the key and the decoded text, for
+/// the campaign page, since the label and shapes show only the decoded form.
+fn encoded_lines(metadata: &[Value]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for m in metadata {
+        let (Some(raw), Some(key), Some(decoded)) = (
+            m.get("command").and_then(Value::as_str),
+            m.get("xor_key").and_then(Value::as_u64),
+            m.get("command_decoded").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let raw = ioc::sanitize_field(&ioc::redact_secrets(raw), fingerprint::MAX_SHAPE_CHARS);
+        if out.len() < MAX_ENCODED_LINES && !out.iter().any(|e| e["raw"] == raw) {
+            out.push(json!({
+                "raw": raw,
+                "key": key,
+                "decoded": ioc::sanitize_field(
+                    &ioc::redact_secrets(decoded),
+                    fingerprint::MAX_SHAPE_CHARS
+                ),
+            }));
+        }
+    }
+    out
 }
 
 fn is_sha256_hex(s: &str) -> bool {
@@ -1293,6 +1328,7 @@ async fn run_representative(
             "source_ip": source_ip,
             "session_id": session_id,
             "opening": opening,
+            "encoded": encoded_lines(&metadata),
             "shapes": shapes,
         }),
     ))

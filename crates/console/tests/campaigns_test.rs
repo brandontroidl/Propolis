@@ -349,6 +349,28 @@ async fn attacker_text_is_rendered_escaped_and_never_as_a_link(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn the_raw_form_of_xor_encoded_lines_is_shown_escaped(pool: PgPool) {
+    migrate(&pool).await;
+    seed(&pool, b"#!/bin/sh\necho xor\n").await;
+    let sequence = campaign_id(&pool, "command_sequence").await;
+    sqlx::query(
+        "UPDATE campaign SET representative = representative || \
+         '{\"encoded\": [{\"raw\": \"lghkel<b>\", \"key\": 9, \"decoded\": \"enable\"}]}'::jsonb \
+         WHERE id = $1",
+    )
+    .bind(sequence)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let console = Console::new(pool.clone());
+    let (status, page) = console.get(&format!("/campaigns/{sequence}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("lghkel&lt;b&gt;"), "{page}");
+    assert!(page.contains("sent XOR-encoded, key 9"), "{page}");
+    assert!(!page.contains("lghkel<b>"));
+}
+
+#[sqlx::test(migrations = false)]
 async fn the_campaign_page_shows_members_representative_and_indicators(pool: PgPool) {
     migrate(&pool).await;
     let sha = seed(

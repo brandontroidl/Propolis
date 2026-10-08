@@ -994,6 +994,93 @@ async fn runs_of_shell_entry_lines_only_are_one_campaign(pool: PgPool) {
     );
 }
 
+/// Mirai's login sequence and a payload sent XOR-obfuscated with key 9 (`lghkel` is `enable`): the
+/// sensor decodes the line and records both. The campaign is keyed and labeled on the decoded
+/// text, so these sessions join the plain-text ones, and the page can still show the raw form.
+#[sqlx::test(migrations = false)]
+async fn xor_encoded_sessions_join_the_plain_text_family(pool: PgPool) {
+    migrate(&pool).await;
+    let xor9 = |s: &str| -> String { s.bytes().map(|b| char::from(b ^ 9)).collect() };
+    assert_eq!(xor9("enable"), "lghkel");
+    let payload = &MIRAI[..6];
+    // The encoded session is first, so it is the campaign's representative.
+    let encoded = Uuid::now_v7();
+    let mut at = t0();
+    for decoded in ENTRY[..3].iter().chain(payload) {
+        append(
+            &pool,
+            "192.0.2.1",
+            "telnet",
+            SignalType::HoneypotCommandExec,
+            at,
+            json!({ "command": xor9(decoded), "command_decoded": decoded, "xor_key": 9 }),
+            Some(encoded),
+        )
+        .await;
+        at += Duration::seconds(2);
+    }
+    let mut plain: Vec<&str> = ENTRY[..3].to_vec();
+    plain.extend(payload);
+    session_of(
+        &pool,
+        "192.0.2.2",
+        "telnet",
+        t0() + Duration::minutes(5),
+        &plain,
+    )
+    .await;
+    // A third session sends only the encoded login lines; a fourth the same lines in plain text.
+    for (ip, key) in [("192.0.2.3", true), ("192.0.2.4", false)] {
+        let session = Uuid::now_v7();
+        for (i, line) in ["enable", "system", "shell", "linuxshell"]
+            .iter()
+            .enumerate()
+        {
+            let metadata = if key {
+                json!({ "command": xor9(line), "command_decoded": line, "xor_key": 9 })
+            } else {
+                json!({ "command": line })
+            };
+            append(
+                &pool,
+                ip,
+                "telnet",
+                SignalType::HoneypotCommandExec,
+                t0() + Duration::minutes(10) + Duration::seconds(2 * i as i64),
+                metadata,
+                Some(session),
+            )
+            .await;
+        }
+    }
+    end_runs(&pool, &["telnet"]).await;
+    index_all(&pool).await;
+
+    let found = sequences(&pool).await;
+    assert_eq!(found.len(), 2, "{found:?}");
+    // Both have two members (the encoded and the plain session of each family); sorted by label.
+    assert_eq!(found[0], ("4 commands: shell entry only".to_string(), 2));
+    assert!(found[1].0.starts_with("6 commands: >/var/run"), "{found:?}");
+    assert_eq!(found[1].1, 2);
+    let rep: Value = sqlx::query_scalar(
+        "SELECT representative FROM campaign WHERE kind = 'command_sequence' AND member_count = 2 \
+         AND label LIKE '6 commands%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rep["source_ip"], "192.0.2.1");
+    // The shapes are the decoded text: the login lines, then the payload.
+    assert_eq!(rep["shapes"][0], "enable");
+    assert_eq!(rep["shapes"][3], MIRAI[0]);
+    let first = &rep["encoded"][0];
+    assert_eq!(
+        (first["raw"].as_str(), first["key"].as_u64()),
+        (Some("lghkel"), Some(9))
+    );
+    assert_eq!(first["decoded"], "enable");
+}
+
 // ---- rebuilding what an older fingerprint wrote ----
 
 async fn non_command_rows(pool: &PgPool) -> Vec<String> {

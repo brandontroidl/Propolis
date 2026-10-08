@@ -34,6 +34,10 @@
   <p class="dim">Commands, normalized: addresses, ports and payload runs replaced, repeats collapsed.</p>
   <ol class="shape-list mono">{% for s in r.shapes %}<li>{{ s }}</li>{% endfor %}</ol>
   {% endif %}
+  {% if r.encoded %}
+  <p class="dim">Sent XOR-encoded by this session; the commands above are the decoded text.</p>
+  <ul class="shape-list mono">{% for e in r.encoded %}<li>{{ e.raw }} <span class="dim">sent XOR-encoded, key {{ e.key }}, decoded</span> {{ e.decoded }}</li>{% endfor %}</ul>
+  {% endif %}
   {% if r.sha256 %}
   <p>Sample <a class="mono" href="/samples/{{ r.sha256 }}">{{ r.sha256 }}</a>{% if r.orig_name %} <span class="dim">named</span> <code>{{ r.orig_name }}</code>{% endif %}{% if r.origin %} <span class="dim">({{ r.origin }})</span>{% endif %}</p>
   {% if r.url %}<p><span class="dim">fetched from</span> <code class="ioc-value">{{ r.url }}</code></p>{% endif %}

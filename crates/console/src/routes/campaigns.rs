@@ -500,11 +500,20 @@ struct Representative {
     source_ip: Option<String>,
     session_id: Option<String>,
     shapes: Vec<String>,
+    /// Lines the representative session sent XOR-encoded; the shapes show them decoded.
+    encoded: Vec<EncodedLine>,
     sha256: Option<String>,
     origin: Option<String>,
     orig_name: Option<String>,
     url: Option<String>,
     sensors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EncodedLine {
+    raw: String,
+    key: u64,
+    decoded: String,
 }
 
 fn representative(value: &Value) -> Representative {
@@ -531,6 +540,21 @@ fn representative(value: &Value) -> Representative {
         source_ip: text("source_ip"),
         session_id: text("session_id"),
         shapes: list("shapes"),
+        encoded: value
+            .get("encoded")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| {
+                        Some(EncodedLine {
+                            raw: e.get("raw")?.as_str()?.to_string(),
+                            key: e.get("key")?.as_u64()?,
+                            decoded: e.get("decoded")?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         sha256: text("sha256"),
         origin: text("origin"),
         orig_name: text("orig_name"),

@@ -312,6 +312,8 @@ async fn metrics(
     writeln!(out, "# TYPE propolis_events_rejected_total counter").unwrap();
     writeln!(out, "propolis_events_rejected_total {rejected}").unwrap();
 
+    push_intake_lag(&mut out, (state.intake_lag)());
+
     // Console saturation: each of these moves only when a bound refused work, so a non-zero rate
     // is a login spray or a connection flood, not ordinary use.
     push_counter(
@@ -364,6 +366,53 @@ fn push_gauge(out: &mut String, name: &str, help: &str, value: i64) {
     writeln!(out, "# HELP {name} {help}").unwrap();
     writeln!(out, "# TYPE {name} gauge").unwrap();
     writeln!(out, "{name} {value}").unwrap();
+}
+
+/// The per-log intake backlog, labelled with the log's `PROPOLIS_SENSOR_LOGS` name. A process that
+/// tails nothing reports no logs and emits neither metric: an absent series says nobody measured,
+/// where a zero would say caught up. A log with lines waiting but no event appended since start
+/// has no age to report, so it gets a bytes sample and no age sample.
+fn push_intake_lag(out: &mut String, mut logs: Vec<crate::intake_lag::IntakeLag>) {
+    if logs.is_empty() {
+        return;
+    }
+    logs.sort_by(|a, b| a.log.cmp(&b.log));
+    writeln!(
+        out,
+        "# HELP propolis_intake_bytes_behind Unread bytes of each intake log after its latest poll, rotated-out files still being drained included."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE propolis_intake_bytes_behind gauge").unwrap();
+    for lag in &logs {
+        writeln!(
+            out,
+            "propolis_intake_bytes_behind{{sensor=\"{}\"}} {}",
+            escape_label(&lag.log),
+            lag.bytes_behind
+        )
+        .unwrap();
+    }
+    writeln!(
+        out,
+        "# HELP propolis_intake_oldest_unread_age_seconds How long the oldest unread line of each intake log has waited: 0 when the latest poll read every complete line, otherwise now minus the observed_at of the last event appended from it."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "# TYPE propolis_intake_oldest_unread_age_seconds gauge"
+    )
+    .unwrap();
+    for lag in &logs {
+        if let Some(age) = lag.oldest_unread_age {
+            writeln!(
+                out,
+                "propolis_intake_oldest_unread_age_seconds{{sensor=\"{}\"}} {}",
+                escape_label(&lag.log),
+                age.as_secs()
+            )
+            .unwrap();
+        }
+    }
 }
 
 fn push_counter(out: &mut String, name: &str, help: &str, value: u64) {
@@ -460,6 +509,51 @@ mod tests {
     fn escape_label_escapes_backslash_quote_and_newline() {
         assert_eq!(escape_label(r#"a\b"c\nd"#), r#"a\\b\"c\\nd"#);
         assert_eq!(escape_label("plain"), "plain");
+    }
+
+    fn lag(log: &str, bytes: u64, age: Option<u64>) -> crate::intake_lag::IntakeLag {
+        crate::intake_lag::IntakeLag {
+            log: log.into(),
+            sensors: vec![log.into()],
+            bytes_behind: bytes,
+            oldest_unread_age: age.map(std::time::Duration::from_secs),
+            behind: false,
+        }
+    }
+
+    #[test]
+    fn intake_lag_is_one_series_per_log_and_an_unknown_age_is_absent_not_zero() {
+        let mut out = String::new();
+        push_intake_lag(
+            &mut out,
+            vec![
+                lag("telnet", 6_600_000_000, Some(950_400)),
+                lag("cred-vnc", 0, Some(0)),
+                lag("ssh", 4_096, None),
+            ],
+        );
+        assert!(out.contains("# TYPE propolis_intake_bytes_behind gauge\n"));
+        assert!(out.contains("propolis_intake_bytes_behind{sensor=\"telnet\"} 6600000000\n"));
+        assert!(out.contains("propolis_intake_bytes_behind{sensor=\"cred-vnc\"} 0\n"));
+        assert!(out.contains("propolis_intake_bytes_behind{sensor=\"ssh\"} 4096\n"));
+        assert!(
+            out.contains("propolis_intake_oldest_unread_age_seconds{sensor=\"telnet\"} 950400\n")
+        );
+        assert!(out.contains("propolis_intake_oldest_unread_age_seconds{sensor=\"cred-vnc\"} 0\n"));
+        assert!(
+            !out.contains("propolis_intake_oldest_unread_age_seconds{sensor=\"ssh\"}"),
+            "no appended event to measure from must leave the age absent: {out}"
+        );
+        let cred = out.find("{sensor=\"cred-vnc\"}").unwrap();
+        let telnet = out.find("{sensor=\"telnet\"}").unwrap();
+        assert!(cred < telnet, "series are ordered by log name: {out}");
+    }
+
+    #[test]
+    fn a_process_tailing_nothing_emits_no_intake_lag_series() {
+        let mut out = String::new();
+        push_intake_lag(&mut out, Vec::new());
+        assert_eq!(out, "");
     }
 
     #[test]

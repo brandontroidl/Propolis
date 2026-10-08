@@ -140,7 +140,7 @@ variable in this section plus the universal ones above.
 |---|---|---|---|
 | `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, split on the first colon of each entry (`crates/log-tailer/src/sensor_logs.rs#parse_sensor_logs`, the one parser the daemon, standalone `intake`, `shipper`'s `SENSOR_LOGS` and `propolis-watch` share). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
 | `PROPOLIS_CURSOR_DIR` | no | `/var/lib/propolis/cursors` (`crates/propolis/src/config.rs#DEFAULT_CURSOR_DIR`) | any path; no validation |
-| `PROPOLIS_POLL_INTERVAL_MS` | no | `1000` (`crates/propolis/src/config.rs#DEFAULT_POLL_INTERVAL_MS`) | positive u64 ms; zero/unparseable → abort |
+| `PROPOLIS_POLL_INTERVAL_MS` | no | `1000` (`crates/propolis/src/config.rs#DEFAULT_POLL_INTERVAL_MS`) | positive u64 ms; zero/unparseable → abort. Three intervals, if longer than ten minutes, become the `intake-lagging` age threshold (`crates/propolis/src/ops_alert/conditions/intake_lag.rs#age_threshold`) |
 
 ### Review
 

@@ -419,3 +419,139 @@ fn rewind_recovers_reads_across_two_rotations_in_one_uncommitted_batch() {
          reading it"
     );
 }
+
+fn append(path: &std::path::Path, text: &str) {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+}
+
+#[test]
+fn backlog_counts_unread_bytes_and_reaches_zero_when_caught_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "aaaa\nbb\ncc\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.backlog_bytes(), 11, "nothing read yet");
+
+    assert_eq!(tailer.read_batch(1), vec!["aaaa"]);
+    tailer.commit_batch();
+    assert_eq!(tailer.backlog_bytes(), 6);
+
+    assert_eq!(tailer.read_batch(10), vec!["bb", "cc"]);
+    tailer.commit_batch();
+    assert_eq!(tailer.backlog_bytes(), 0, "caught up");
+
+    append(&log_path, "dd\nee");
+    assert_eq!(
+        tailer.backlog_bytes(),
+        5,
+        "growth counts before the next read"
+    );
+    assert_eq!(tailer.read_batch(10), vec!["dd"]);
+    tailer.commit_batch();
+    assert_eq!(
+        tailer.backlog_bytes(),
+        2,
+        "an incomplete trailing line is still unread"
+    );
+}
+
+#[test]
+fn backlog_after_a_rewind_counts_the_rewound_lines_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "a\nb\nc\n").unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(2), vec!["a", "b"]);
+    tailer.rewind_batch();
+    assert_eq!(tailer.backlog_bytes(), 6);
+}
+
+#[test]
+fn backlog_includes_a_rotated_out_inode_still_being_drained() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "old1\nold2\nold3\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(1), vec!["old1"]);
+    tailer.commit_batch();
+
+    std::fs::rename(&log_path, dir.path().join("events.jsonl.1")).unwrap();
+    std::fs::write(&log_path, "new1\n").unwrap();
+    assert_eq!(
+        tailer.backlog_bytes(),
+        10,
+        "until the next read notices the rotation, the open descriptor's remainder is the backlog"
+    );
+
+    assert_eq!(tailer.read_batch(1), vec!["old2"]);
+    tailer.commit_batch();
+    assert_eq!(
+        tailer.backlog_bytes(),
+        5 + 5,
+        "old3 left in the rotated-out inode, plus all of the new file"
+    );
+
+    assert_eq!(tailer.read_batch(10), vec!["old3", "new1"]);
+    tailer.commit_batch();
+    assert_eq!(tailer.backlog_bytes(), 0);
+}
+
+#[test]
+fn backlog_counts_a_truncated_file_in_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "event1\nevent2\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(10).len(), 2);
+    tailer.commit_batch();
+    assert_eq!(tailer.backlog_bytes(), 0);
+
+    // copytruncate: same inode, shorter than the offset, read again from 0.
+    std::fs::write(&log_path, "e3\n").unwrap();
+    assert_eq!(tailer.backlog_bytes(), 3);
+}
+
+#[test]
+fn backlog_before_any_read_follows_the_persisted_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let cursor_dir = dir.path().join("cursors");
+    std::fs::write(&log_path, "one\ntwo\n").unwrap();
+    {
+        let mut tailer = LogTailer::new(log_path.clone(), cursor_dir.clone());
+        assert_eq!(tailer.read_batch(1), vec!["one"]);
+        tailer.commit_batch();
+        tailer.persist_cursor().unwrap();
+    }
+    assert_eq!(
+        LogTailer::new(log_path.clone(), cursor_dir.clone()).backlog_bytes(),
+        4,
+        "a restart resumes at the persisted offset"
+    );
+
+    // Replaced by rename while no tailer ran: the next read starts the new inode from 0.
+    std::fs::rename(&log_path, dir.path().join("events.jsonl.1")).unwrap();
+    std::fs::write(&log_path, "three\n").unwrap();
+    assert_eq!(LogTailer::new(log_path, cursor_dir).backlog_bytes(), 6);
+}
+
+#[test]
+fn backlog_of_a_missing_file_or_a_reader_started_at_the_end_is_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    assert_eq!(
+        LogTailer::new(log_path.clone(), dir.path().join("cursors")).backlog_bytes(),
+        0
+    );
+
+    std::fs::write(&log_path, "already there\n").unwrap();
+    let tailer = LogTailer::without_cursor(log_path.clone(), log_tailer::StartAt::End);
+    assert_eq!(tailer.backlog_bytes(), 0);
+    append(&log_path, "later\n");
+    assert_eq!(tailer.backlog_bytes(), 6);
+}

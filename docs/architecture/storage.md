@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-28
+last-verified: 2026-10-07
 -->
 
 # Storage and database model
@@ -105,6 +105,14 @@ read the same `prev_hash` and both insert against it) and the projection UPSERT
 cannot lose an update. The lock auto-releases at transaction end, so a rolled-back
 append never leaves it held. See
 [concurrency and failure](./concurrency-and-failure.md).
+
+Because every sensor's appends wait on this one lock, the cost of the reads inside it is the
+intake rate for the whole node. The chain-head read is a single backward step on the primary
+key, and the dedup read (the newest prior event of the same source and signal) a single step on
+`event_dedup_idx`, which migration `0013` added after a lagging intake made the read cost grow
+with the lag ([database reference](../reference/database.md)). The breadth inputs, distinct WAN
+vantages and distinct sensors, still read the source's whole history on every append
+([limitations](../overview/limitations.md#intake-append-cost-grows-with-a-sources-history)).
 
 All event inserts are fully parameterized (`$n` bound values via the runtime
 `sqlx::query*` API); no SQL query text is built with string formatting anywhere in

@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::cursor::{
@@ -304,6 +305,41 @@ impl LogTailer {
         self.state.offset = offset;
     }
 
+    /// Bytes not yet consumed: the unread remainder of every rotated-out inode still being drained,
+    /// plus the file being read past the read offset. This is how far behind the reader is, in
+    /// bytes, and it costs one `fstat` per held file - no read.
+    ///
+    /// The file being read is measured through the descriptor the last read opened, so a rename
+    /// rotation the tailer has not noticed yet still counts the old inode's remainder, and the new
+    /// file joins the count on the next read. Before any read, the path is measured, and a file
+    /// whose inode is not the cursor's counts in full, as the next read starts it from 0. A file
+    /// shorter than the offset was truncated and counts in full for the same reason. A missing
+    /// file counts 0. An incomplete trailing line counts as unread, because it is.
+    ///
+    /// Call it between batches: the offsets of an uncommitted batch have already moved past the
+    /// lines it handed out.
+    pub fn backlog_bytes(&self) -> u64 {
+        let drains: u64 = self
+            .pending_drains
+            .iter()
+            .map(|(file, offset)| {
+                file.metadata()
+                    .map_or(0, |m| m.len().saturating_sub(*offset))
+            })
+            .sum();
+        let current = match &self.file {
+            Some(file) => file
+                .metadata()
+                .map_or(0, |m| unread_past(m.len(), self.state.offset)),
+            None => match std::fs::metadata(&self.log_path) {
+                Ok(m) if m.ino() == self.state.inode => unread_past(m.len(), self.state.offset),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            },
+        };
+        drains.saturating_add(current)
+    }
+
     /// Persists the current cursor state via `DurableCursor::save`. A [`Self::without_cursor`]
     /// tailer has nowhere to persist to: this returns `ErrorKind::Unsupported` and writes nothing.
     pub fn persist_cursor(&self) -> io::Result<()> {
@@ -401,6 +437,12 @@ impl LogTailer {
 /// low-trust sensor boundary intake crosses - a compromised or malfunctioning sensor writing an
 /// enormous (or endless, unterminated) line must not drive unbounded allocation here.
 pub const MAX_LINE_BYTES: u64 = 1_048_576;
+
+/// Bytes of a `len`-byte file a reader at `offset` has yet to read. A file shorter than the offset
+/// was truncated under the reader, which restarts it from 0, so all of it is unread.
+fn unread_past(len: u64, offset: u64) -> u64 {
+    if len < offset { len } else { len - offset }
+}
 
 fn count_lines(entries: &[TailEntry]) -> usize {
     entries

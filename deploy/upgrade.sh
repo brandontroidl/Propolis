@@ -106,6 +106,15 @@ for unit in gateway.service shipper.service; do
     fi
 done
 install -m 0644 "$SCRIPT_DIR/logrotate-sensors.conf" /etc/logrotate.d/propolis-sensors
+# The policy's prerotate hook calls the guard, so it ships with the policy; a missing guard would
+# fail every rotation closed.
+install -m 0755 "$SCRIPT_DIR/logrotate-guard.sh" /usr/local/sbin/propolis-logrotate-guard
+# Propolis rotates its own logs on its own timer rather than trusting the distro's logrotate.timer,
+# which sat inactive for eleven days in October 2026 while a sensor log grew to 6.6 GB. Installed
+# unconditionally (no env file or role decides it) and enabled after the reload below.
+for unit in propolis-logrotate.service propolis-logrotate.timer; do
+    install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
+done
 
 # After every step that can fail (the build, and every install above), and before the restarts, so
 # the console reads it as soon as it comes back up. Recording it any earlier - this used to run
@@ -121,6 +130,11 @@ PROPOLIS_DEPLOY_PULLED_AT="$PULLED_AT" "$SCRIPT_DIR/deploy-stamp.sh" "$REPO_DIR"
 # Before any restart, or the restarts would start the OLD unit definitions.
 echo "==> reloading systemd unit files"
 systemctl daemon-reload
+
+# Idempotent: enabling an enabled timer is a no-op, and --now starts it if something stopped it.
+# Before the restarts so a failure here (set -e) aborts before any service is bounced.
+echo "==> enabling the log rotation timer"
+systemctl enable --now propolis-logrotate.timer
 
 echo "==> restarting sensors"
 for unit in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred; do

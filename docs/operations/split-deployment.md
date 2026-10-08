@@ -366,8 +366,14 @@ PROPOLIS_FLEET_PROBE_SOURCE_IPS=192.0.2.20
   ./deploy/provision.sh
   install -m 0644 deploy/sensor-*.service deploy/shipper.service /etc/systemd/system/
   install -m 0644 deploy/logrotate-sensors.conf /etc/logrotate.d/propolis-sensors
+  install -m 0755 deploy/logrotate-guard.sh /usr/local/sbin/propolis-logrotate-guard
+  install -m 0644 deploy/propolis-logrotate.service deploy/propolis-logrotate.timer /etc/systemd/system/
   systemctl daemon-reload
+  systemctl enable --now propolis-logrotate.timer
   ```
+
+  The guard goes in with the policy: the policy calls it before every rotation, so a missing
+  guard stops every sensor log from rotating.
 
   Then restart each enabled sensor unit, and `shipper.service` last.
 

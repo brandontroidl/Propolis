@@ -1,0 +1,21 @@
+# Hourly trigger for propolis-logrotate.service, independent of the distro's logrotate.timer.
+#
+# Hourly because rotation is size-based (100M): the interval bounds how far a log can overshoot,
+# and the sensor-log-oversized alert fires at three times the size, so an hour of flood traffic
+# cannot reach it. OnActiveSec runs one rotation soon after the timer is enabled, so the upgrade
+# that installs this unit also works off an existing backlog without waiting for the hour.
+# Persistent=true runs a missed hour at the next boot (the box was off), and RandomizedDelaySec
+# keeps it off the top of the hour. The daemon's rotation-stale alert fires when the state file
+# (see the service) is more than three hours old.
+[Unit]
+Description=Hourly rotation of Propolis sensor event logs
+
+[Timer]
+OnCalendar=hourly
+OnActiveSec=2min
+RandomizedDelaySec=120
+Persistent=true
+Unit=propolis-logrotate.service
+
+[Install]
+WantedBy=timers.target

@@ -127,6 +127,33 @@ impl Outcome {
     }
 }
 
+/// What the log-rotation conditions (`sensor-log-oversized`, `rotation-stale`) read: the sensor
+/// logs the daemon tails, the filesystem that holds them, the rotation timer's state file, and the
+/// policy it rotates by. Paths are fields, not constants in the conditions, so tests point them at
+/// a temp directory.
+#[derive(Clone)]
+pub struct RotationCtx {
+    pub logs: Vec<log_tailer::SensorLogConfig>,
+    pub volume: PathBuf,
+    pub state_path: PathBuf,
+    pub policy_path: PathBuf,
+}
+
+impl RotationCtx {
+    /// The production layout `deploy/` installs (see `conditions::sensor_log`'s constants).
+    pub fn production(logs: Vec<log_tailer::SensorLogConfig>) -> Self {
+        use super::conditions::sensor_log::{
+            LOGROTATE_POLICY_PATH, LOGROTATE_STATE_PATH, SENSOR_LOG_ROOT,
+        };
+        Self {
+            logs,
+            volume: SENSOR_LOG_ROOT.into(),
+            state_path: LOGROTATE_STATE_PATH.into(),
+            policy_path: LOGROTATE_POLICY_PATH.into(),
+        }
+    }
+}
+
 /// The shared handles conditions read from. Cloneable so the supervised monitor task can own a copy.
 #[derive(Clone)]
 pub struct MonitorCtx {
@@ -157,6 +184,7 @@ pub struct MonitorCtx {
     /// The daemon's feed build interval, used with `cfg.feed_stale_multiple` to derive the staleness
     /// threshold.
     pub feed_build_interval: Duration,
+    pub rotation: RotationCtx,
     pub cfg: OpsAlertConfig,
 }
 

@@ -10,6 +10,22 @@ pub(crate) fn format_timestamp(dt: DateTime<Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M UTC").to_string()
 }
 
+/// A count with thousands separators: `29296` as `29,296`.
+pub(crate) fn group_digits(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The lowercase display label for a feed tier, matching the CSS class suffixes in
 /// `templates/base_head.html` (`.tier-aggressive` / `.tier-standard`).
 pub(crate) fn tier_label(t: FeedTier) -> &'static str {
@@ -48,6 +64,12 @@ pub(crate) fn format_sensor_label(sensor: &str) -> String {
         "dns" => "DNS".into(),
         "adb" => "ADB".into(),
         "catchall" | "catchall-sensor" => "General".into(),
+        // The credential sensor's listeners are named for the service they imitate.
+        "cred-vnc" => "VNC".into(),
+        "cred-mysql" => "MySQL".into(),
+        "cred-mssql" => "MSSQL".into(),
+        "cred-pg" => "PostgreSQL".into(),
+        "cred-mongo" => "MongoDB".into(),
         other => {
             let mut s = other.to_string();
             if let Some(first) = s.get_mut(0..1) {
@@ -212,6 +234,16 @@ mod tests {
     }
 
     #[test]
+    fn group_digits_puts_a_comma_every_three_places() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1000), "1,000");
+        assert_eq!(group_digits(29296), "29,296");
+        assert_eq!(group_digits(1234567), "1,234,567");
+        assert_eq!(group_digits(-1234), "-1,234");
+    }
+
+    #[test]
     fn acronym_sensor_labels_are_fully_uppercased_not_title_cased() {
         // The title-case fallback renders these as Mssql / Smtp / Adb - wrong for acronyms.
         assert_eq!(format_sensor_label("mssql"), "MSSQL");
@@ -221,6 +253,8 @@ mod tests {
         assert_eq!(format_sensor_label("mqtt"), "MQTT");
         assert!(format_activity("mqtt", "honeypot_command_exec").contains("MQTT"));
         assert_eq!(format_sensor_label("dns"), "DNS");
+        assert_eq!(format_sensor_label("cred-vnc"), "VNC");
+        assert_eq!(format_sensor_label("cred-pg"), "PostgreSQL");
         assert!(format_activity("dns", "honeypot_command_exec").contains("DNS"));
         // format_activity inherits the fix via its `other => format_sensor_label(other)` delegation.
         assert!(format_activity("mssql", "honeypot_login_attempt").contains("MSSQL"));

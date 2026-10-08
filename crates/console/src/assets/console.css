@@ -456,6 +456,16 @@ td.ip a:hover { color: var(--brand); }
 .chart-box-sm { position: relative; height: 220px; }
 .chart-box-compact { position: relative; height: 110px; margin: 0.75rem 0 0.5rem; }
 
+/* -- Review queue: the context line under each pending row -- */
+tr.has-context td { border-bottom: none; padding-bottom: 0.2rem; }
+tr.queue-context td { padding-top: 0; font-size: 0.76rem; color: var(--text-muted); }
+tr.queue-context td > * { margin-right: 0.9rem; }
+tr.queue-context:hover td { background: transparent; }
+.ctx-sensors { display: inline-flex; gap: 0.3rem; }
+.ctx-chip { font-family: var(--font-mono); font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: var(--radius-sm); background: var(--surface-raised); border: 1px solid var(--border); color: var(--text); }
+.ctx-item { display: inline-flex; align-items: center; gap: 0.35rem; vertical-align: middle; }
+.ctx-notable code { color: var(--text); font-size: 0.74rem; overflow-wrap: anywhere; }
+
 /* -- Attackers paging and the tier/score note above the table -- */
 .ips-count { margin-bottom: 0.6rem; }
 .table-note { font-size: 0.78rem; color: var(--text-muted); margin: 0 0 0.75rem; max-width: 70rem; }

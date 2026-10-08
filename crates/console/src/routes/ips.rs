@@ -34,7 +34,7 @@ use sqlx::PgPool;
 use crate::AppState;
 use crate::routes::context::base_context;
 use crate::routes::error::AppError;
-use crate::routes::format::{format_relative_time, format_timestamp};
+use crate::routes::format::{format_relative_time, format_timestamp, group_digits};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/ips", get(ip_list))
@@ -338,22 +338,6 @@ async fn total_count(db: &PgPool) -> Result<Count, AppError> {
     })
 }
 
-/// `29296` as `29,296`.
-fn group_digits(n: i64) -> String {
-    let digits = n.unsigned_abs().to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
-    if n < 0 {
-        out.push('-');
-    }
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 #[derive(sqlx::FromRow)]
 struct IpRowRaw {
     ip: String,
@@ -365,18 +349,4 @@ struct IpRowRaw {
     first_seen: chrono::DateTime<chrono::Utc>,
     last_seen: chrono::DateTime<chrono::Utc>,
     eligible: bool,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn group_digits_puts_a_comma_every_three_places() {
-        assert_eq!(group_digits(0), "0");
-        assert_eq!(group_digits(999), "999");
-        assert_eq!(group_digits(1000), "1,000");
-        assert_eq!(group_digits(29296), "29,296");
-        assert_eq!(group_digits(1234567), "1,234,567");
-    }
 }

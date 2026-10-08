@@ -7555,3 +7555,173 @@ async fn attackers_first_page_survives_a_lost_cursor_orders_capped_ties_and_stat
         "{plain}"
     );
 }
+
+/// Appends one session's events for `ip` on `sensor`, a second apart, starting `start_ago`
+/// seconds ago.
+async fn append_session(
+    pool: &PgPool,
+    ip: &str,
+    sensor: &str,
+    session_id: Uuid,
+    start_ago: i64,
+    steps: &[(SignalType, serde_json::Value)],
+) {
+    for (i, (signal, metadata)) in steps.iter().enumerate() {
+        append_event(
+            pool,
+            ev_with_session(
+                ip,
+                sensor,
+                *signal,
+                Protocol::Tcp,
+                true,
+                &secs_ago(start_ago - i as i64),
+                metadata.clone(),
+                session_id,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+fn cmd(command: &str) -> (SignalType, serde_json::Value) {
+    (
+        SignalType::HoneypotCommandExec,
+        serde_json::json!({ "command": command }),
+    )
+}
+
+fn telnet_login(user: &str) -> (SignalType, serde_json::Value) {
+    (
+        SignalType::HoneypotLoginAttempt,
+        serde_json::json!({ "username": user }),
+    )
+}
+
+/// The context line rendered under `ip`'s pending row.
+fn queue_context<'a>(body: &'a str, ip: &str) -> &'a str {
+    let start = body
+        .find(&format!(r#"id="context-{ip}""#))
+        .unwrap_or_else(|| panic!("no context row for {ip}: {body}"));
+    &body[start..start + body[start..].find("</tr>").unwrap()]
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_rows_say_where_the_address_came_from_and_what_it_did(pool: PgPool) {
+    migrate(&pool).await;
+    // A: three sessionless events from the seed, then two telnet sessions. Its first command is a
+    // shell-entry preamble line, so the line must skip to the first one that says something.
+    seed_recommended(&pool, "203.0.113.160", 900).await;
+    append_session(
+        &pool,
+        "203.0.113.160",
+        "telnet",
+        Uuid::now_v7(),
+        600,
+        &[
+            telnet_login("admin"),
+            cmd("enable"),
+            cmd("system"),
+            cmd("shell"),
+            cmd("sh"),
+            cmd("cat /proc/mounts"),
+        ],
+    )
+    .await;
+    append_session(
+        &pool,
+        "203.0.113.160",
+        "telnet",
+        Uuid::now_v7(),
+        300,
+        &[telnet_login("cht"), cmd("enable"), cmd("uname -a")],
+    )
+    .await;
+    // B: ran a command and then uploaded a file; the upload is what it came to do.
+    seed_recommended(&pool, "203.0.113.161", 900).await;
+    append_session(
+        &pool,
+        "203.0.113.161",
+        "telnet",
+        Uuid::now_v7(),
+        600,
+        &[
+            cmd("echo hi"),
+            (
+                SignalType::HoneypotMalwareUpload,
+                serde_json::json!({
+                    "sample_orig_name": ".i",
+                    "sample_sha256": "ab".repeat(32),
+                    "sample_size": 5120,
+                }),
+            ),
+        ],
+    )
+    .await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let (status, body) = get_page(test_state(pool), "/queue").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let a = queue_context(&body, "203.0.113.160");
+    // Sensors by event count: telnet's nine first, then the seed's three one-event sensors.
+    assert!(
+        a.contains(
+            r#"<span class="ctx-chip">Telnet</span><span class="ctx-chip">General</span><span class="ctx-chip">Honeypot-sensor</span><span class="ctx-chip">Ssh-sensor</span>"#
+        ),
+        "{a}"
+    );
+    // Two sessions: the seed's events carry none, and nine telnet events are not nine sessions.
+    assert!(a.contains(">2 sessions<"), "{a}");
+    assert!(
+        a.contains(r#"<span class="sev sev--high">command exec 7</span><span class="sev sev--watch">login attempt 3</span><span class="sev sev--low">probe 1</span>"#),
+        "{a}"
+    );
+    assert!(
+        a.contains(r#"first command</span> <code class="mono">cat &#x2f;proc&#x2f;mounts</code>"#),
+        "{a}"
+    );
+    assert!(!a.contains("counts from"), "{a}");
+
+    let b = queue_context(&body, "203.0.113.161");
+    assert!(
+        a.contains(">2 sessions<") && b.contains(">1 session<"),
+        "{b}"
+    );
+    assert!(
+        b.contains(r#"uploaded</span> <code class="mono">.i (abababababab..., 5.0 KB)</code>"#),
+        "{b}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_flooding_queue_entry_is_described_from_a_bounded_sample(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.162", 900).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+    // 5,001 more events written straight to the ledger (each linked to the chain head, as the
+    // trigger requires), and the projection told it holds 5,004 in all.
+    sqlx::query(
+        "DO $$ DECLARE head bytea; i int; BEGIN \
+           FOR i IN 1..5001 LOOP \
+             SELECT hash INTO head FROM event ORDER BY id DESC LIMIT 1; \
+             INSERT INTO event (source_ip, sensor, signal_type, protocol, authenticated, category, \
+                                weight, confidence, observed_at, prev_hash, hash) \
+             VALUES ('203.0.113.162', 'telnet', 'honeypot_connection', 'tcp', false, 'network', \
+                     1, 0.5, now() - interval '1 minute', head, \
+                     sha256(convert_to(i::text, 'UTF8'))); \
+           END LOOP; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE ip_score SET event_count = 5004 WHERE source_ip = '203.0.113.162'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (_, body) = get_page(test_state(pool), "/queue").await;
+    let c = queue_context(&body, "203.0.113.162");
+    assert!(c.contains("counts from 5,000 of 5,004 events"), "{c}");
+}

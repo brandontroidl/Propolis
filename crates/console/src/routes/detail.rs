@@ -1150,7 +1150,8 @@ pub(crate) fn extract_detail(signal_type: &str, metadata: &serde_json::Value) ->
 }
 
 /// Human-readable byte count for the malware-upload detail column (`4.2 KB`, `1.1 MB`).
-fn format_bytes(b: u64) -> String {
+/// `pub(crate)` because the review queue's row context names upload sizes the same way.
+pub(crate) fn format_bytes(b: u64) -> String {
     if b < 1024 {
         format!("{b} B")
     } else if b < 1024 * 1024 {

@@ -223,8 +223,8 @@ path.
 
 **Console** ([console](../architecture/console.md)). Server-rendered axum +
 minijinja + HTMX + self-hosted Chart.js. It serves **plain HTTP on a loopback
-`TcpListener` - there is no in-process TLS**. It exposes **34 routes (8 public,
-26 session-gated)**, sets `X-Frame-Options: DENY`, `nosniff` and a Content-Security-Policy
+`TcpListener` - there is no in-process TLS**. It exposes **39 routes (8 public,
+31 session-gated)**, sets `X-Frame-Options: DENY`, `nosniff` and a Content-Security-Policy
 with no inline script or style globally (`/samples/download` keeps a stricter
 `default-src 'none'`).
 
@@ -772,7 +772,7 @@ consult each for the authoritative table:
 | [database](../reference/database.md) | tables, columns, enums, migrations, the hash-chain canonical encoding |
 | [events-and-signals](../reference/events-and-signals.md) | signal types, event fields, weights |
 | [sensor-behavior](../reference/sensor-behavior.md) | per-protocol capture behavior (banners, verbs, caps) |
-| [console-routes](../reference/console-routes.md) | the 34 routes (8 public, 26 session-gated) and per-route auth/CSRF |
+| [console-routes](../reference/console-routes.md) | the 39 routes (8 public, 31 session-gated) and per-route auth/CSRF |
 | [scoring-and-feed](../reference/scoring-and-feed.md) | scoring constants, thresholds, tiers, TTLs, retention windows |
 | [integrations](../reference/integrations.md) | VirusTotal, vendor submitters, ntfy, GeoLite2 wire contracts |
 | [rate-limits-and-budgets](../reference/rate-limits-and-budgets.md) | fetcher/vendor/VT budgets and spool byte limits |

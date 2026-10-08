@@ -43,7 +43,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 
 ## Route table
 
-**8 public + 26 session-gated = 34 routes** (one row per method and path; `/login` serves GET and POST).
+**8 public + 31 session-gated = 39 routes** (one row per method and path; `/login` and `/campaigns/{id}/approve` serve GET and POST).
 
 ### Public (no session)
 
@@ -64,7 +64,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 |---|---|---|---|---|
 | GET | `/` | `dashboard` | 6 stat cards, 2 Chart.js charts; Recent activity reads the newest 1,000 events and folds runs from one source, sensor and signal into 20 rows | `crates/console/src/routes/dashboard.rs#dashboard`, `crates/console/src/routes/dashboard.rs#fold_recent` |
 | GET | `/dashboard/chart` | `dashboard_chart_fragment` | HTMX; `?range=1h\|24h\|7d\|30d`, malformed -> `24h` | `crates/console/src/routes/dashboard.rs#dashboard_chart_fragment` |
-| GET | `/queue` | `queue_page` | review queue; each pending row carries a context line built from at most 5,000 of its events | `crates/console/src/routes/queue.rs#queue_page`, `crates/console/src/routes/queue.rs#row_context` |
+| GET | `/queue` | `queue_page` | review queue; each pending row carries a context line built from at most 5,000 of its events, and the largest campaign it belongs to with a link to approve that campaign's pending members | `crates/console/src/routes/queue.rs#queue_page`, `crates/console/src/routes/queue.rs#row_context`, `crates/console/src/routes/campaigns.rs#campaigns_by_ip` |
 | POST | `/queue/{ip}/approve` | `approve` | CSRF required | `crates/console/src/routes/queue.rs#approve` |
 | POST | `/queue/{ip}/reject` | `reject` | CSRF required | `crates/console/src/routes/queue.rs#reject` |
 | POST | `/queue/{ip}/snooze` | `snooze` | CSRF required | `crates/console/src/routes/queue.rs#snooze` |
@@ -84,7 +84,12 @@ login rate limiting) are owned by [authentication and authorization](../security
 | GET | `/ips` | `ip_list` | `ip_score` list, 500 rows a page; `?sort=score\|events\|first\|last`, `?dir=asc\|desc`, keyset `?after=<ip>` / `?before=<ip>` (an unscored or malformed cursor restarts at the first page); counts exact to 100,000 rows, estimated past it | `crates/console/src/routes/ips.rs#ip_list`, `crates/console/src/routes/ips.rs#fetch_page`, `crates/console/src/routes/ips.rs#SCORE_ORDER_KEY` |
 | GET | `/integrity` | `integrity_page` | | `crates/console/src/routes/integrity.rs#integrity_page` |
 | POST | `/integrity/verify` | `run_verify` | CSRF (403); one verification at a time (409 while one runs) | `routes/integrity.rs` |
-| GET | `/samples` | `samples_page` | | `crates/console/src/routes/samples.rs#samples_page` |
+| GET | `/samples` | `samples_page` | each sample links to its own page and its campaign | `crates/console/src/routes/samples.rs#samples_page` |
+| GET | `/samples/{sha256}` | `sample_page` | the spool holding it, its campaigns, its indicators and their scan state; `400` unless 64 hex digits | `crates/console/src/routes/samples.rs#sample_page` |
+| GET | `/campaigns` | `list_page` | 200 most recently active campaigns; `?kind=sample\|command_sequence\|scanner`; distinct hosts per day over 14 days; indexer lag when it is behind the ledger | `crates/console/src/routes/campaigns.rs#list_page` |
+| GET | `/campaigns/{id}` | `detail_page` | members (500 most recent) with review state, representative session or sample, linked samples, indicators; missing id -> `404` | `crates/console/src/routes/campaigns.rs#detail_page` |
+| GET | `/campaigns/{id}/approve` | `approve_confirm` | the confirmation step: lists the pending members (at most 1,000) and carries them in the form; changes nothing | `crates/console/src/routes/campaigns.rs#approve_confirm` |
+| POST | `/campaigns/{id}/approve` | `approve_members` | CSRF required (`403`); approves the confirmed addresses that are still pending members, nothing else; `400` on a malformed list | `crates/console/src/routes/campaigns.rs#approve_members` |
 | GET | `/samples/download/{sha256}` | `download_sample` | hardened download; sets a per-route CSP | `crates/console/src/routes/samples.rs#download_sample`, `crates/console/src/routes/samples.rs#serve_sample` |
 | GET | `/logs` | `logs_page` | in-memory ring-buffer snapshot with each entry's structured fields; adjacent identical INFO entries folded with a count; opens filtered to WARN and above | `crates/console/src/routes/logs.rs#logs_page`, `crates/console/src/routes/logs.rs#fold_entries` |
 | GET | `/logs/stream` | `logs_stream` | SSE (`text/event-stream`); each event is one `LogEntry` as JSON, `fields` included | `crates/console/src/routes/logs.rs#logs_stream`, `crates/console/src/log_buffer.rs#LogEntry` |
@@ -120,6 +125,14 @@ csrf token" (`crates/console/src/routes/queue.rs#unsnooze` unsnooze, `crates/con
 | Snooze | `POST /queue/{ip}/snooze` | `ReviewQueue::snooze` | HTMX row partial |
 | Delist | `POST /ip/{ip}/delist` | delete `review_queue` row; set `ip_score.delisted=TRUE, eligible=FALSE, recommended_for_vendor=FALSE, recommended_for_blocklist=FALSE` | `303` → `/ip/{ip}` |
 | Delete | `POST /ip/{ip}/delete` | purge `review_queue` + `vendor_submission` + `ip_score` rows | `303` → `/queue` |
+| Approve a campaign | `POST /campaigns/{id}/approve` | `ReviewQueue::approve` for each confirmed address that is still a pending member | page listing approved and skipped addresses |
+
+The campaign approval is the one bulk decision, and it is two steps by construction:
+`GET /campaigns/{id}/approve` shows the count and the list and carries the list in its form,
+and the POST intersects that list with the campaign's pending members at the moment it runs
+(`crates/console/src/routes/campaigns.rs#approve_members`). A member that became pending after the
+confirmation was shown, or a listed address that is no longer pending, is not approved
+(`crates/console/tests/campaigns_test.rs#approving_a_campaign_confirms_the_list_first_and_approves_only_it`).
 
 Approve/reject/snooze converge in `act` (`crates/console/src/routes/queue.rs#act`), then re-read the score and
 render the `queue_row.html` partial (`queue_moved_row.html` when the decision came from a history tab,

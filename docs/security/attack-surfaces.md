@@ -207,7 +207,7 @@ is fetched. The sensor opens no connection for it and never runs the file it cam
 
 ## Console (HTTP)
 
-Axum + minijinja server-rendered HTML. **34 routes: 8 public, 26 session-gated**
+Axum + minijinja server-rendered HTML. **39 routes: 8 public, 31 session-gated**
 (canonical table: [../reference/console-routes.md](../reference/console-routes.md)).
 Default bind is loopback-only (`127.0.0.1:8080`); the operator opts into a wider bind.
 

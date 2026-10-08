@@ -23,6 +23,7 @@ for everything else.
 - **Run a node day to day** - [routine procedures](operations/routine-procedures.md),
   [health and observability](operations/health-and-observability.md),
   [live watch](operations/live-watch.md),
+  [campaigns and indicators](operations/campaigns.md),
   [retention](operations/retention.md),
   [backup and restore](operations/backup-and-restore.md),
   [upgrade, rollback and DR](operations/upgrade-rollback-and-dr.md).

@@ -299,6 +299,16 @@ no weight of their own: a UDP query is a `honeypot_connection` and a TCP or DoT 
 `honeypot_command_exec`, whatever its probe signals. The rules are in
 [sensor-behavior.md](sensor-behavior.md#sensor-dns).
 
+### Metadata the campaign indexer reads
+
+The [campaign indexer](../operations/campaigns.md) reads these persisted keys and nothing else:
+`command` on `honeypot_command_exec` (skipped when `flood` or `command_summary` is present),
+`sample_sha256` and `sample_orig_name` on `honeypot_malware_upload` (folded in by intake from the
+SampleRef), `capture_reason`, and `url` on `honeypot_file_download`. It groups command events by
+`session_id`, so a sensor that sends none produces no command-sequence campaigns
+(`crates/review/src/campaign/mod.rs#command_of`). `honeypot_session_end` is telemetry and is
+skipped by every rule.
+
 ## Signal types
 
 17 signal types (`signal_type_enum`, mirrored by Rust `SignalType`). Sixteen of them

@@ -160,8 +160,8 @@ propolis: shutdown timed out waiting for: <name>[, <name>...]; aborted
 ```
 
 The names are the subsystem names used in the supervisor's own log lines (a sensor's configured
-name, `listener-probe`, `review`, `feed`, `virustotal`, `sample-retention`, `fetcher`, `console`,
-`ops-monitor`). Per-subsystem completion is logged at debug. A clean stop exits 0.
+name, `listener-probe`, `review`, `feed`, `virustotal`, `sample-retention`, `campaigns`, `fetcher`,
+`console`, `ops-monitor`). Per-subsystem completion is logged at debug. A clean stop exits 0.
 
 ## Restart policy
 

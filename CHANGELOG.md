@@ -16,6 +16,26 @@
 
 ### Added
 
+- **Campaigns** - addresses doing the same thing are grouped into one campaign: the same captured
+  sample (a worm copying itself), the same normalized command sequence (addresses, ports, markers
+  and payload runs replaced, repeats collapsed; the w.sh script, the 45-command survey, Mirai
+  loaders), or three sensors reached from one address within an hour. A bounded background
+  indexer (`campaigns` subsystem) builds them from the ledger past a cursor, off the append path
+  (migration `0015`, no backfill; it reads an existing ledger at about 6,000 events a second after
+  the upgrade). New `/campaigns` and `/campaigns/{id}` pages; the review queue, IP and Samples
+  pages link to an address's or sample's campaign; `/samples/{sha256}` shows a sample's
+  campaigns and indicators. Approving a campaign's pending members is one explicit action that
+  lists them first and approves only the listed ones still pending. A sample campaign whose script
+  scans for and copies itself to new hosts shows its members as infected hosts on the console; the
+  vendor submission wording is unchanged. See `docs/operations/campaigns.md`.
+- **Indicators from artifacts and commands** - URLs, `/dev/tcp` endpoints, SSH and PEM key
+  fingerprints, crypt-hash markers (never the hash), IRC servers and channels, `/etc/hosts`
+  sinkholes, cron, systemd, rc.local, init.d, shell-profile and `chattr +i` persistence with their
+  drop paths, and proxy `CONNECT` templates and gateway hosts are extracted from commands, download
+  URLs and captured artifacts (binaries through their printable strings), sanitized, capped and
+  stored with their provenance. Embedded credentials are recorded only as present, never their
+  value. They are shown on the sample and campaign
+  pages and are not published to the feed or vendors.
 - **Console log view keeps fields and folds repeats** - the `/logs` ring now keeps each event's
   structured fields (`statement`, `elapsed`, `reason`, `sensor`, ...), so "slow statement" and
   "submission held" say what was slow and why it was held. Values are capped at 512 bytes, 32

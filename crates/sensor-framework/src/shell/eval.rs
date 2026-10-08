@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use super::ast::{
-    AndOr, AndOrOp, Command, List, ListItem, Near, Pipeline, Redir, RedirOp, RedirTarget,
+    AndOr, AndOrOp, CaseArm, Command, List, ListItem, Near, Pipeline, Redir, RedirOp, RedirTarget,
     SimpleCommand, Word,
 };
 use super::expand::ExpandError;
@@ -498,6 +498,7 @@ impl FakeShell {
         }
         self.pending.clear();
         self.pending_bytes = 0;
+        self.note_unit(&text);
         self.execute_unit(parsed, base_line)
     }
 
@@ -804,6 +805,7 @@ impl FakeShell {
             Command::If { redirs, .. } => (ParseNode::If, redirs),
             Command::For { redirs, .. } => (ParseNode::For, redirs),
             Command::While { redirs, .. } => (ParseNode::While, redirs),
+            Command::Case { redirs, .. } => (ParseNode::Case, redirs),
             Command::Simple(_) | Command::Unsupported(_) => return CommandResult::silent(0),
         };
         let max_depth = self.budget().limits().max_depth;
@@ -847,6 +849,7 @@ impl FakeShell {
             Command::While {
                 cond, body, until, ..
             } => self.eval_while(cond, body, *until),
+            Command::Case { word, arms, .. } => self.eval_case(word, arms),
             Command::Simple(_) | Command::Unsupported(_) => CommandResult::silent(0),
         };
         if let Some(previous) = saved {
@@ -910,6 +913,24 @@ impl FakeShell {
             None => acc.status = 0,
         }
         acc
+    }
+
+    /// `case WORD in ... esac`: the first arm with a matching pattern runs; no match is status 0.
+    fn eval_case(&mut self, word: &Word, arms: &[CaseArm]) -> CommandResult {
+        let subject = match self.expand_scalar(word) {
+            Ok(subject) => subject,
+            Err(error) => return self.expand_failure(error),
+        };
+        for arm in arms {
+            for pattern in &arm.patterns {
+                match self.case_pattern_matches(pattern, &subject) {
+                    Ok(true) => return self.eval_list(&arm.body),
+                    Ok(false) => {}
+                    Err(error) => return self.expand_failure(error),
+                }
+            }
+        }
+        CommandResult::silent(0)
     }
 
     fn eval_for(&mut self, var: &str, words: Option<&[Word]>, body: &List) -> CommandResult {
@@ -992,8 +1013,8 @@ impl FakeShell {
     }
 
     fn simple_inner(&mut self, simple: &SimpleCommand) -> CommandResult {
-        let argv = match self.expand_argv(&simple.words) {
-            Ok(argv) => argv,
+        let (argv, unset) = match self.expand_argv_flagged(&simple.words) {
+            Ok(expanded) => expanded,
             Err(error) => return self.expand_failure(error),
         };
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -1044,6 +1065,7 @@ impl FakeShell {
         let outer_mark = std::mem::replace(&mut self.input_mark, self.stdin.session_pos());
         let was_blocked = self.stdin.is_blocked();
         let outer_typed = std::mem::take(&mut self.typed_output);
+        self.note_fetch(&refs, &unset, &simple.words);
         let mut result = self.dispatch(&refs);
         let typed = std::mem::replace(&mut self.typed_output, outer_typed);
         // A command whose input was cut off (Ctrl-C, a closed channel) dies at the read it was

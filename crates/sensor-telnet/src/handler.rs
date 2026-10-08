@@ -17,8 +17,9 @@ use sensor_framework::sanitize_value;
 use sensor_framework::shell::{EmitContext, FakeShell, LineStep, onlcr};
 use sensor_framework::{
     CAPTURE_REASON_SHELL_STDIN, CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, CaptureSource,
-    ConnectionBounds, ConnectionBudget, EgressState, EventEmitter, HeldEnd, HeldInput, InputMode,
-    StdinCaptures, UploadEnd, Uuid, WanResolver, limits_from, upload_metadata,
+    CommandEventGate, ConnectionBounds, ConnectionBudget, EgressState, EventEmitter, HeldEnd,
+    HeldInput, InputMode, StdinCaptures, UploadEnd, Uuid, WanResolver, limits_from,
+    upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
@@ -70,6 +71,7 @@ pub async fn handle_connection<S>(
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
     handoff: Arc<CaptureHandoff>,
+    command_events: Arc<CommandEventGate>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -111,8 +113,9 @@ pub async fn handle_connection<S>(
         return;
     }
 
-    // Built before `bounds` moves into the reader: the connection's one budget.
-    let budget = ConnectionBudget::new(limits_from(&bounds));
+    // Built before `bounds` moves into the reader: the connection's one budget, which also carries
+    // the sensor's per-source command-event budget to the shell.
+    let budget = ConnectionBudget::with_command_gate(limits_from(&bounds), command_events);
     let mut reader = LineReader::new(bounds, handoff.clone());
 
     let login_prompt = format!("{host} login: ");

@@ -36,8 +36,9 @@ use sensor_framework::shell::{CommandResult, EmitContext, FakeShell, LineStep, o
 use sensor_framework::upload_metadata;
 use sensor_framework::{
     CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody, CaptureEnd, CaptureHandoff,
-    CaptureJob, CaptureSource, ConnectionBounds, ConnectionBudget, EgressState, EventEmitter,
-    HeldEnd, HeldInput, InputMode, StdinCaptures, UploadEnd, Uuid, WanResolver, limits_from,
+    CaptureJob, CaptureSource, CommandEventGate, ConnectionBounds, ConnectionBudget, EgressState,
+    EventEmitter, HeldEnd, HeldInput, InputMode, StdinCaptures, UploadEnd, Uuid, WanResolver,
+    limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
@@ -692,6 +693,7 @@ impl MessageReader {
 /// panics and never propagates an I/O error to the caller - any read/write failure or malformed
 /// input simply ends the session early, matching `sensor_framework::run_tcp_listener`'s
 /// per-connection isolation contract.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -700,6 +702,7 @@ pub async fn handle_connection(
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
     handoff: Arc<CaptureHandoff>,
+    command_events: Arc<CommandEventGate>,
 ) {
     // Normalize dual-stack mapped addresses before resolving WAN - mirrors sensor-telnet/
     // sensor-ssh's own handling of the same listener module doc requirement.
@@ -722,8 +725,8 @@ pub async fn handle_connection(
     let max_captured_bytes = bounds.max_captured_bytes;
     let write_timeout = bounds.idle_timeout;
     // The connection's one budget, cloned into every stream's shell so the streams share a ceiling
-    // instead of each holding a full one.
-    let budget = ConnectionBudget::new(limits_from(&bounds));
+    // instead of each holding a full one. It carries the sensor's per-source command-event budget.
+    let budget = ConnectionBudget::with_command_gate(limits_from(&bounds), command_events);
     // The connection's one filesystem: each shell stream opens a share of it, so a file written on
     // one stream is readable on the next and a new connection starts clean.
     let base_fs = FakeFs::android().with_budget(budget.clone());

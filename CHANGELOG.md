@@ -4,6 +4,26 @@
 
 ### Added
 
+- **Per-source command-event budget with flood summaries (ssh, telnet, adb)** - a handful of
+  Mirai-family echo loaders, each running the same ~53-command session around the clock and
+  several at once, made telnet 97% of all events (~15 a second, 2,555 from one address in ten
+  minutes), outran log rotation and put intake 6.6 GB behind. The per-connection cap of 256 could
+  not see it. Each of the three sensors now holds a token bucket per source network (/24 or /56)
+  charged by `honeypot_command_exec` events only (`CommandEventGate` in
+  `sensor_framework::command_flood`, reached through `ConnectionBudget::with_command_gate`):
+  burst 200, then 2 a second, set by `PROPOLIS_<SSH|TELNET|ADB>_COMMAND_EVENT_RATE` / `_BURST` (a positive integer;
+  zero or garbage exits 1). Past it, a command event is not written but counted into one
+  `honeypot_command_exec` per network per 60 s window with `command_summary: true`,
+  `suppressed_count`, `distinct_commands`, up to 8 samples, first and last seen, `session_count`
+  and, for echo-loader chunks, `assembled_file` and `max_chunk_index`; it is written when the
+  window ends and at shutdown. Never summarized: logins, connections, downloads and derived
+  URLs, every capture upload, the per-session flood markers, the first sighting of each distinct
+  command per network per window, and each address's first command event per window (scoring is
+  per address). Replies are unchanged: only logging is summarized. The summary scores as one
+  command event; the merit path is unaffected (60 s dedup), the volume path reaches its threshold
+  later. With the defaults the observed bot drops from about 4.3 to about 3 events a second, so
+  the rate may need lowering on a busy box. Additive metadata: no migration or wire version
+  change.
 - **Echo-loader uploads are reassembled and captured** - a Mirai/Mozi telnet loader with no
   usable `wget` uploads its downloader as some forty `busybox echo -ne '\xNN...' >> .i` lines,
   runs `chmod 777 .i` and `./.i a b c d port`. Each line was logged but the file was never

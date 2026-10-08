@@ -11,6 +11,7 @@ pub mod bounds;
 pub mod budget;
 pub mod capture_budget;
 pub mod command_codec;
+pub mod command_flood;
 pub mod config;
 pub mod coverage;
 pub mod emit;
@@ -40,6 +41,10 @@ pub use capture_budget::{
     DEFAULT_CAPTURE_BUDGET_BYTES_256M, default_capture_budget_bytes,
 };
 pub use command_codec::CommandCodec;
+pub use command_flood::{
+    CommandEventConfig, CommandEventConfigError, CommandEventGate, CommandSummary,
+    command_summary_event,
+};
 pub use config::SensorConfig;
 pub use emit::EventEmitter;
 pub use env::{EnvError, env_with_legacy, strict_env_var};

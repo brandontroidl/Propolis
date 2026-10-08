@@ -19,11 +19,11 @@ use tokio::task::JoinHandle;
 
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
 use sensor_framework::{
-    BudgetLimits, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody, CaptureEnd,
-    CaptureHandoff, CaptureJob, CaptureMemoryBudget, CaptureSource, ConnectionBounds,
-    ConnectionBudget, EgressState, EventEmitter, HeldEnd, HeldInput, InputMode, OutboxManifest,
-    QuarantineSpool, StdinCaptures, UploadEnd, WanResolver, default_capture_budget_bytes,
-    limits_from,
+    Arrival, BudgetLimits, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody,
+    CaptureEnd, CaptureHandoff, CaptureJob, CaptureMemoryBudget, CaptureSource, CommandEventConfig,
+    CommandEventGate, ConnectionBounds, ConnectionBudget, EgressState, EventEmitter, HeldEnd,
+    HeldInput, InputMode, OutboxManifest, QuarantineSpool, StdinCaptures, UploadEnd, WanResolver,
+    default_capture_budget_bytes, limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
@@ -273,6 +273,7 @@ pub async fn serve(
         collector_id,
         outbox_dir,
         Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES)),
+        Arc::new(CommandEventGate::new(CommandEventConfig::default())),
     )
     .await?;
     Ok((bound, handle))
@@ -284,10 +285,11 @@ pub const UNIT_MEMORY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// The capture memory ceiling used when none is configured: 40% of [`UNIT_MEMORY_MAX_BYTES`].
 pub const DEFAULT_CAPTURE_BUDGET_BYTES: u64 = default_capture_budget_bytes(UNIT_MEMORY_MAX_BYTES);
 
-/// `serve` plus the capture hand-off, so `main` can `drain` it on shutdown, and the process-wide
-/// capture memory budget `main` built from its configured ceiling. A separate function rather than
-/// a wider return type so the many callers that never shut down (every integration test) are
-/// unchanged.
+/// `serve` plus the capture hand-off, so `main` can `drain` it on shutdown, the process-wide
+/// capture memory budget `main` built from its configured ceiling, and the sensor's per-source
+/// command-event budget, which `main` flushes on shutdown. A separate function rather than a wider
+/// return type so the many callers that never shut down (every integration test) are unchanged.
+/// The returned handle stops the listener and the command-summary writer together.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_with_handoff(
     addr: SocketAddr,
@@ -300,6 +302,7 @@ pub async fn serve_with_handoff(
     collector_id: String,
     outbox_dir: PathBuf,
     capture_budget: Arc<CaptureMemoryBudget>,
+    command_events: Arc<CommandEventGate>,
 ) -> Result<
     (SocketAddr, JoinHandle<()>, Arc<CaptureHandoff>),
     Box<dyn std::error::Error + Send + Sync>,
@@ -323,6 +326,8 @@ pub async fn serve_with_handoff(
     std::fs::create_dir_all(&spool_dir)?;
 
     let emitter = Arc::new(EventEmitter::new(log_path.clone()));
+    let summary_emitter = emitter.clone();
+    let summary_gate = command_events.clone();
     let spool = QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000);
     // The handoff's emitter writes to the same log file. EventEmitter opens with O_APPEND
     // on each write so concurrent emitters to the same path are safe.
@@ -361,6 +366,7 @@ pub async fn serve_with_handoff(
             let handoff = handoff.clone();
             let wan_resolver = wan_resolver.clone();
             let banner = banner.clone();
+            let command_events = command_events.clone();
             // Wrapped once here rather than at each read: every transport function is generic over
             // AsyncRead/AsyncWrite, so the whole session inherits the per-read bound - including
             // any read added later, which a per-call-site timeout would miss.
@@ -377,6 +383,7 @@ pub async fn serve_with_handoff(
                     banner,
                     max_captured_bytes,
                     budget_limits,
+                    command_events,
                 )
                 .await
                 {
@@ -387,7 +394,12 @@ pub async fn serve_with_handoff(
     )
     .await?;
 
-    Ok((bound_addr, handle, drain_handle))
+    let writer = summary_gate.spawn_writer(summary_emitter, Arrival::new(bound_addr.port()));
+    Ok((
+        bound_addr,
+        sensor_framework::command_flood::with_writer(handle, writer),
+        drain_handle,
+    ))
 }
 
 /// Handle one SSH connection end to end: version exchange, key exchange, authentication,
@@ -404,6 +416,7 @@ async fn handle_session(
     banner: Arc<String>,
     max_captured_bytes: u64,
     budget_limits: BudgetLimits,
+    command_events: Arc<CommandEventGate>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ---- Phase 1: version exchange ----
     let (client_version, server_version) =
@@ -463,8 +476,9 @@ async fn handle_session(
     let local_addr = stream.get_ref().local_addr().map(normalize_dual_stack).ok();
     let wan_ip = local_addr.and_then(|la| wan_resolver.resolve(la.ip()));
     let mut auth_state = AuthState::new(source_ip, wan_ip, session_id);
-    // The one budget of this connection, cloned into every shell it opens.
-    let budget = ConnectionBudget::new(budget_limits);
+    // The one budget of this connection, cloned into every shell it opens. It carries the sensor's
+    // per-source command-event budget to each of them.
+    let budget = ConnectionBudget::with_command_gate(budget_limits, command_events);
     // The one filesystem of this connection: every shell and exec opens a share of it, so a file
     // written on one channel is readable on the next, and a new connection starts clean.
     let base_fs = FakeFs::new().with_budget(budget.clone());

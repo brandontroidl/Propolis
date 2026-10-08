@@ -1276,6 +1276,86 @@ async fn shell_line(channel: &mut russh::Channel<russh::client::Msg>, line: &str
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Past the source's command-event budget, shell lines and exec requests keep their exact replies
+/// while the repeats fold into one summary, written at shutdown; login and connection events stay.
+#[tokio::test]
+async fn repeated_commands_past_the_source_budget_fold_into_a_summary() {
+    use sensor_framework::{
+        Arrival, CaptureMemoryBudget, CommandEventConfig, CommandEventGate, EventEmitter, Rate,
+    };
+    use std::num::NonZeroU32;
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let gate = Arc::new(CommandEventGate::new(CommandEventConfig {
+        rate: Rate::new(NonZeroU32::MIN, NonZeroU32::new(3).unwrap()),
+        ..CommandEventConfig::default()
+    }));
+    let started = std::time::Instant::now();
+    let (addr, handle, _handoff) = sensor_ssh::serve_with_handoff(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        test_bounds(),
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+        Arc::new(CaptureMemoryBudget::new(
+            sensor_ssh::server::DEFAULT_CAPTURE_BUDGET_BYTES,
+        )),
+        gate.clone(),
+    )
+    .await
+    .unwrap();
+    let session = login(addr).await;
+    let mut shell = open_shell(&session).await;
+    let first = shell_line(&mut shell, "uname -a").await;
+    for _ in 0..9 {
+        assert_eq!(shell_line(&mut shell, "uname -a").await, first);
+    }
+    let exec_first = exec_stdout(&session, "id").await;
+    for _ in 0..4 {
+        assert_eq!(exec_stdout(&session, "id").await, exec_first);
+    }
+    let refill = started.elapsed().as_secs() + 1;
+    drop(shell);
+    drop(session);
+    handle.abort();
+    gate.flush(
+        &EventEmitter::new(log_path.clone()),
+        Arrival::new(addr.port()),
+    )
+    .await;
+
+    let events: Vec<sensor_wire::SensorEvent> = std::fs::read_to_string(&log_path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let count = |signal: &str| events.iter().filter(|e| e.signal_type == signal).count();
+    assert_eq!(count(sensor_wire::SIGNAL_HONEYPOT_CONNECTION), 1);
+    assert_eq!(count(sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT), 1);
+    let commands: Vec<&sensor_wire::SensorEvent> = events
+        .iter()
+        .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .collect();
+    let (summaries, individual): (Vec<&sensor_wire::SensorEvent>, Vec<_>) = commands
+        .into_iter()
+        .partition(|e| e.metadata.get("command_summary").is_some());
+    assert_eq!(summaries.len(), 1);
+    let suppressed = summaries[0].metadata["suppressed_count"].as_u64().unwrap();
+    assert_eq!(individual.len() as u64 + suppressed, 15);
+    // The burst of three holds both first sightings; one token a second refills.
+    assert!(
+        individual.len() as u64 <= 3 + refill,
+        "{} individual command events",
+        individual.len()
+    );
+    assert_eq!(summaries[0].sensor, "ssh");
+    assert_eq!(summaries[0].metadata["distinct_commands"], 2);
+}
+
 #[tokio::test]
 async fn a_file_written_by_one_exec_is_read_by_the_next_exec_of_the_same_connection() {
     let dir = tempfile::tempdir().unwrap();

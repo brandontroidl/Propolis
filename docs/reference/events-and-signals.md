@@ -200,6 +200,42 @@ hold a `GET <path> HTTP/1.x` request line, emits a `honeypot_file_download` whos
 The event counts against the connection's download allowance like any other
 (`crates/sensor-framework/src/shell/loader.rs#FakeShell::flush_loader`).
 
+#### Command summary keys
+
+A shell command event (ssh, telnet, adb) over its source network's command-event budget is not
+written; it is counted into one `honeypot_command_exec` per source network per 60 s window,
+marked `command_summary: true` (`crates/sensor-framework/src/command_flood.rs#command_summary_event`;
+when and why in [sensor-behavior](sensor-behavior.md#command-event-budget-ssh-telnet-adb)). Its
+`source_ip`, `wan_ip`, `sensor` and `authenticated` are those of the first suppressed event, its
+protocol is `tcp`, and its `session_id` is fresh: the commands came from several sessions, none
+of which it belongs to. `command` is a readable line for the timeline, `<N repeated commands from
+<prefix> summarized; each distinct command's first sighting is logged in full>`.
+
+| key | type | meaning |
+|---|---|---|
+| `command_summary` | boolean | always `true`; marks the event as a summary |
+| `source_prefix` | string | the source network in CIDR form (`198.51.100.0/24`), or `overflow` for networks that arrived while the summary table was full |
+| `suppressed_count` | integer | command events this summary stands for |
+| `distinct_commands` | integer | distinct commands among them |
+| `distinct_commands_capped` | boolean | more distinct commands arrived than the window could tell apart (always `true` for `overflow`) |
+| `samples` | array of strings | up to 8 distinct suppressed commands, sanitized, at most 256 characters each |
+| `first_seen`, `last_seen` | string | RFC 3339 times of the first and last suppressed command |
+| `window_secs` | number | the window length, 60 |
+| `session_count` | integer | distinct sessions the suppressed commands came from, at most 32 |
+| `session_count_capped` | boolean | more sessions than that |
+| `assembled_file` | string | when an echo-loader chunk was suppressed: the file of the highest suppressed chunk |
+| `max_chunk_index` | integer | that chunk's `chunk_index` |
+
+Scoring treats a summary as one `honeypot_command_exec` from its `source_ip`; `suppressed_count`
+is data for the analyst, not a weight. The merit path loses nothing: a same-signal event from
+one address within 60 s of the previous one adds no weight anyway (`DEDUP_WINDOW_SECONDS`, see
+[scoring-and-feed](scoring-and-feed.md)), and every address that runs commands keeps its own first
+command event of each window, so its weight and its 0.950 confidence still arrive. The volume
+path does slow, since it counts established events: a source still sending past its budget
+reaches the 1000-event volume threshold at about two command events a second plus its other
+events, instead of its full rate; with the defaults that is at most about 400 s later
+([rate limits](rate-limits-and-budgets.md#shell-command-event-budget-ssh-telnet-adb)).
+
 ### Arrival metadata key
 
 Every event a sensor emits carries the local port of the listener its connection or datagram

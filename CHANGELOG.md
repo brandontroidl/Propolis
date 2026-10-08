@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- **The configuration check's `fix:` lines now run when pasted** - observed live 2026-10-08: the
+  no-log finding's `grep LOG_PATH /etc/propolis/*.env` was refused (those files are root-only),
+  and the no-events finding's line ran `psql "$DATABASE_URL" ...` (unset in an operator's shell)
+  followed by prose, which bash parsed as an `if` and answered with a continuation prompt. A
+  `fix:` is now only a command, or commands joined with `&&` or `;`, with `sudo` wherever root is
+  needed and absolute paths for the repository's scripts; the ledger query reads `DATABASE_URL`
+  with `sudo` and runs `psql` as `propolis`. Instructions that are not commands (edit a file,
+  change a bind address, install a firewall rule or a key) print as `do:`, and the explanation
+  moved into the finding text. `--json` keeps its shape and gains `fix_kind` (`run`, `manual`)
+  and `id` on each finding. `config_check_test` raises every finding id (a new finding with no
+  fixture fails) and executes each `fix` in bash against stub commands, failing on a parse error,
+  stderr output, or a root-only command or env-file read without `sudo`.
+
 - **An ADB base64 APK loader no longer loops on `wc: not found`** - observed live 2026-10-07: a bot
   pushed an APK to `/data/local/tmp` in about 57 `echo -n '<base64>' >> f.b64` commands, checked
   `wc -c < f.b64`, got `sh: wc: not found` from the Android shell, deleted everything and started

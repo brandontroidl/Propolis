@@ -243,7 +243,28 @@ enabled with no bind variable set (the look of a misspelled `*_BIND` name); and,
 `propolis-watch` is installed, `watch.env` against `propolis.env` and the watcher's
 authorized key.
 
-Every finding prints an exact fix line. The exit status is `0` all ok, `1` warnings or checks
+Every finding carries the next step, in one of two labelled forms, and the explanation lives in
+the finding text above it, never in the step itself:
+
+- `fix:` is a command line, or several joined with `&&` or `;`, to paste exactly as printed
+  from a non-root shell in any directory. Root-only actions carry their own `sudo` (reading
+  `/etc/propolis/*.env`, `journalctl`, `systemctl`, `ss -p`, `ufw`, `install`), and nothing in
+  it is a placeholder or prose. The ledger query for an `EVENTS` finding reads `DATABASE_URL`
+  out of `propolis.env` with `sudo` and runs `psql` as the `propolis` account, because that
+  variable is not set in an operator's shell. The URL is then an argument of that `psql`, so it
+  is visible in the process list for the length of the query (the report's own query avoids
+  this by using `PG*` variables, which a pasted line cannot).
+- `do:` is a manual step, not a command: edit a file, change a bind address, install a firewall
+  or a key. It names the file and the value, and any restart that follows is written in the same
+  line as `then run: ...`. Do not paste a `do:` line.
+
+In `--json` each finding has `id` (the check that raised it), `fix`, and `fix_kind` (`run`,
+`manual`, or empty when there is no step). `crates/sensor-framework/tests/config_check_test.rs`
+raises every finding id against stub commands and executes each `fix` in bash, failing on a
+parse error, any output on stderr, or a root-only command or env-file read without `sudo`; a new
+finding with no fixture fails it.
+
+The exit status is `0` all ok, `1` warnings or checks
 that could not be answered, `2` at least one failure; a usage error is `64`.
 
 **Without root** it still runs, and says what it could not see under `LIMITED CHECKS`. Sensor

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 #
 # Read-only deployment configuration check: compares what is CONFIGURED with what is RUNNING, one
-# row per sensor listener, plus the host-wide pieces a listener depends on, and prints an exact fix
-# line for everything that is wrong.
+# row per sensor listener, plus the host-wide pieces a listener depends on, and prints the next step
+# for everything that is wrong: a `fix:` line is a command to paste as-is (non-root, with sudo
+# where root is needed; explanation is in the finding text above it), a `do:` line is a manual
+# step (edit a file, install a firewall) that is not a command and must not be pasted.
 #
 # WHY THIS EXISTS. Five faults on the production box (2026-10-07) were each found by accident: a
 # typo in PROPOLIS_SENSOR_LOGS, MQTT's log absent from that list, sensor-cred's PostgreSQL listener
@@ -186,32 +188,55 @@ F_LEVEL=()
 F_SCOPE=()
 F_MSG=()
 F_FIX=()
+F_KIND=()
+F_ID=()
 declare -A F_SEEN=()
 LIMITED=()
 declare -A L_SEEN=()
 UNKNOWN_COUNT=0
 
-# finding LEVEL SCOPE KEY MESSAGE [FIX]: KEY de-duplicates (five sensor-cred rows share one unit,
-# and one unit finding is enough).
+# finding LEVEL SCOPE KEY MESSAGE [FIX [KIND]]: KEY de-duplicates (five sensor-cred rows share one
+# unit, and one unit finding is enough). The part of KEY before its first ':' is the finding's id,
+# unique per call site (the test suite enumerates the ids from this file and requires each to be
+# exercised).
+#
+# FIX is printed as `fix:` when KIND is run (the default): it must be one or more complete shell
+# commands, joined with && or ;, that work exactly as pasted by a non-root operator in bash, with
+# sudo wherever root is needed and no prose or placeholders. Anything that is an instruction rather
+# than a command (edit a file, install a firewall) is passed with KIND manual and printed as `do:`.
+# Explanation always belongs in MESSAGE, never in a run line.
 finding() {
-    local level="$1" scope="$2" key="$3" msg="$4" fix="${5:-}"
+    local level="$1" scope="$2" key="$3" msg="$4" fix="${5:-}" kind="${6:-run}"
     if [ -n "${F_SEEN["$key"]+x}" ]; then
         return 0
     fi
     F_SEEN["$key"]=1
+    if [ -z "$fix" ]; then
+        kind=""
+    fi
     if [[ "$key" == danger:* ]]; then
         # An exposed non-sensor service is what the operator must read first.
         F_LEVEL=("$level" "${F_LEVEL[@]}")
         F_SCOPE=("$(clean "$scope")" "${F_SCOPE[@]}")
         F_MSG=("$(clean "$msg")" "${F_MSG[@]}")
         F_FIX=("$(clean "$fix")" "${F_FIX[@]}")
+        F_KIND=("$kind" "${F_KIND[@]}")
+        F_ID=("${key%%:*}" "${F_ID[@]}")
         return 0
     fi
     F_LEVEL+=("$level")
     F_SCOPE+=("$(clean "$scope")")
     F_MSG+=("$(clean "$msg")")
     F_FIX+=("$(clean "$fix")")
+    F_KIND+=("$kind")
+    F_ID+=("${key%%:*}")
 }
+
+# q VALUE: VALUE shell-quoted for a run line (a path with a space, or a quote, still pastes whole).
+q() { printf '%q' "$1"; }
+
+# The upgrade run, by absolute path so it works from any directory.
+upgrade_fix() { printf 'sudo %s' "$(q "$SCRIPT_DIR/upgrade.sh")"; }
 
 limit() {
     if [ -z "${L_SEEN["$1"]+x}" ]; then
@@ -661,6 +686,15 @@ fw_state() {
     fi
 }
 
+# The firewall fix is a command only for the two firewalls with a one-line rule command; for raw
+# nftables (rules live in the operator's own ruleset file) it is an instruction.
+fw_fix_kind() {
+    case "$FW_KIND" in
+        ufw | firewalld) printf 'run' ;;
+        *) printf 'manual' ;;
+    esac
+}
+
 fw_open_fix() {
     local proto="$1" port="$2"
     case "$FW_KIND" in
@@ -677,6 +711,18 @@ fw_close_fix() {
         firewalld) printf 'sudo firewall-cmd --permanent --remove-port=%s/%s && sudo firewall-cmd --reload' "$port" "$proto" ;;
         *) printf 'remove the rule accepting %s dport %s from your nftables input chain' "$proto" "$port" ;;
     esac
+}
+
+# ledger_query_fix SENSOR: the newest event for one sensor, run the way the daemon connects (as the
+# propolis account, with the DATABASE_URL from its root-only env file). The operator's shell has no
+# DATABASE_URL, so it is read with sudo; surrounding quotes are stripped as the daemon's env-file
+# reader does. The URL is an argument of psql, so it is visible in the process list for the length of
+# the query on this host (the script's own ledger query avoids that with PG* variables; a pasted
+# one-liner cannot, short of writing a file).
+ledger_query_fix() {
+    local sensor="$1" envf
+    envf="$(q "$ENV_DIR/propolis.env")"
+    printf '%s' "sudo -u propolis psql \"\$(sudo grep -h '^DATABASE_URL=' $envf | tail -n 1 | cut -d= -f2- | tr -d \"'\\\"\")\" -c \"SELECT max(observed_at) FROM event WHERE sensor = '$sensor'\""
 }
 
 # ---- PROPOLIS_SENSOR_LOGS ------------------------------------------------------------------
@@ -936,7 +982,7 @@ check_listener() {
         setcell "$i" listen fail "bad bind"
         finding fail "$scope" "badbind:${R_VAR[$i]}:$addr" \
             "${R_VAR[$i]}=$addr has no usable port, so $unit refuses to start" \
-            "edit ${R_VAR[$i]} in $ENV_DIR/*.env to ip:port (1-65535), then: sudo systemctl restart $unit.service"
+            "edit ${R_VAR[$i]} in $ENV_DIR/*.env to ip:port (1-65535), then run: sudo systemctl restart $unit.service" manual
         return 0
     fi
 
@@ -950,30 +996,30 @@ check_listener() {
     elif [ -z "$e" ]; then
         unit_down=1
         setcell "$i" unit fail "not installed"
-        finding fail "$unit" "unit:$unit" "$unit.service is not installed but $scope is configured (${R_VAR[$i]})" \
-            "sudo install -m 0644 $ufile /etc/systemd/system/$unit.service && sudo systemctl daemon-reload && sudo systemctl enable --now $unit.service"
+        finding fail "$unit" "unit-missing:$unit" "$unit.service is not installed but $scope is configured (${R_VAR[$i]})" \
+            "sudo install -m 0644 $(q "$ufile") /etc/systemd/system/$unit.service && sudo systemctl daemon-reload && sudo systemctl enable --now $unit.service"
     elif [ "$e" = masked ]; then
         unit_down=1
         setcell "$i" unit fail "masked"
-        finding fail "$unit" "unit:$unit" "$unit.service is masked" \
+        finding fail "$unit" "unit-masked:$unit" "$unit.service is masked" \
             "sudo systemctl unmask $unit.service && sudo systemctl enable --now $unit.service"
     elif [ "$a" = active ]; then
         if unit_is_enabled "$unit"; then
             setcell "$i" unit ok "active"
         else
             setcell "$i" unit warn "active, not enabled"
-            finding warn "$unit" "unit:$unit" "$unit.service is running but not enabled, so it will not start after a reboot" \
+            finding warn "$unit" "unit-notenabled:$unit" "$unit.service is running but not enabled, so it will not start after a reboot" \
                 "sudo systemctl enable $unit.service"
         fi
     else
         unit_down=1
         if unit_is_enabled "$unit"; then
             setcell "$i" unit fail "$a"
-            finding fail "$unit" "unit:$unit" "$unit.service is enabled but $a" \
-                "sudo journalctl -u $unit.service -n 50 --no-pager; fix what it reports, then: sudo systemctl restart $unit.service"
+            finding fail "$unit" "unit-down:$unit" "$unit.service is enabled but $a: read its log, fix what it reports, then run: sudo systemctl restart $unit.service" \
+                "sudo journalctl -u $unit.service -n 50 --no-pager"
         else
             setcell "$i" unit fail "not enabled ($a)"
-            finding fail "$unit" "unit:$unit" "$unit.service is configured (${R_VAR[$i]}) but not enabled and $a" \
+            finding fail "$unit" "unit-disabled:$unit" "$unit.service is configured (${R_VAR[$i]}) but not enabled and $a" \
                 "sudo systemctl enable --now $unit.service"
         fi
     fi
@@ -991,22 +1037,22 @@ check_listener() {
             foreign=1
             setcell "$i" listen fail "OTHER:$LISTEN_NAMES"
             if [ "$LISTEN_EXPOSED" -eq 1 ]; then
-                finding fail "$scope" "listen:$proto:$port" \
-                    "$proto/$port is held by another process ($LISTEN_NAMES), not $expected: $unit cannot bind it, so $scope is not being collected" \
-                    "sudo ss -$([ "$proto" = udp ] && echo lunp || echo ltnp) 'sport = :$port'; stop that process or move it off $proto/$port (a database belongs on 127.0.0.1), then: sudo systemctl restart $unit.service"
+                finding fail "$scope" "listen-foreign:$proto:$port" \
+                    "$proto/$port is held by another process ($LISTEN_NAMES), not $expected: $unit cannot bind it, so $scope is not being collected. Stop that process or move it off $proto/$port (a database belongs on 127.0.0.1), then run: sudo systemctl restart $unit.service" \
+                    "sudo ss -$([ "$proto" = udp ] && echo lunp || echo ltnp) 'sport = :$port'"
             else
-                finding fail "$scope" "listen:$proto:$port" \
+                finding fail "$scope" "listen-loopback:$proto:$port" \
                     "$proto/$port is held on loopback only by another process ($LISTEN_NAMES), so it is not reachable from the network, but $unit cannot bind ${addr} over it and $scope is not being collected" \
-                    "keep that process on loopback and give the sensor this host's network address instead (a specific address can share the port with a loopback listener): set ${R_VAR[$i]}=<this host's address>:$port in $ENV_DIR/*.env, then: sudo systemctl restart $unit.service"
+                    "keep that process on loopback and give the sensor this host's network address instead (a specific address can share the port with a loopback listener): set ${R_VAR[$i]}=<this host's address>:$port in $ENV_DIR/*.env, then run: sudo systemctl restart $unit.service" manual
             fi
             ;;
         ownerless)
             if [ "$unit_known" -eq 1 ] && [ "$a" != active ]; then
                 foreign=1
                 setcell "$i" listen fail "OTHER:owner unknown"
-                finding fail "$scope" "listen:$proto:$port" \
-                    "$proto/$port is bound by a process that is not $expected ($unit is not running); its name is hidden without root" \
-                    "sudo ss -$([ "$proto" = udp ] && echo lunp || echo ltnp) 'sport = :$port' to name it; stop it or move it off $proto/$port, then: sudo systemctl restart $unit.service"
+                finding fail "$scope" "listen-ownerless:$proto:$port" \
+                    "$proto/$port is bound by a process that is not $expected ($unit is not running); its name is hidden without root. Name it with the command below, stop it or move it off $proto/$port, then run: sudo systemctl restart $unit.service" \
+                    "sudo ss -$([ "$proto" = udp ] && echo lunp || echo ltnp) 'sport = :$port'"
             else
                 setcell "$i" listen unknown "bound, owner unknown"
                 limit "socket owners hidden: ports show 'bound, owner unknown (run as root to name it)'"
@@ -1015,7 +1061,7 @@ check_listener() {
         none)
             setcell "$i" listen fail "nothing listening"
             if [ "$unit_down" -eq 0 ]; then
-                finding fail "$scope" "listen:$proto:$port" \
+                finding fail "$scope" "listen-none:$proto:$port" \
                     "nothing is listening on $proto/$port although $unit is active (the bind failed and the sensor skipped it, or it is bound to another address)" \
                     "sudo journalctl -u $unit.service -n 50 --no-pager | grep -i bind"
             fi
@@ -1039,7 +1085,7 @@ check_listener() {
                     setcell "$i" firewall warn "closed"
                     finding warn "$scope" "fw:$proto:$port" \
                         "$proto/$port is served by $expected but the $FW_KIND firewall does not allow it, so nothing reaches this sensor" \
-                        "$(fw_open_fix "$proto" "$port")"
+                        "$(fw_open_fix "$proto" "$port")" "$(fw_fix_kind)"
                 else
                     setcell "$i" firewall ok "closed"
                 fi
@@ -1048,12 +1094,12 @@ check_listener() {
         if [ "$foreign" -eq 1 ] && [ "$LISTEN_EXPOSED" -eq 1 ] && [ "$FW_STATE" = open ]; then
             setcell "$i" firewall fail "OPEN to a non-sensor"
             finding fail "$scope" "danger:$proto:$port" \
-                "DANGEROUS: $proto/$port is open in the $FW_KIND firewall and bound by a process that is not $expected${LISTEN_NAMES:+ ($LISTEN_NAMES)}: a real service is exposed to the internet through a honeypot port" \
-                "close it: $(fw_close_fix "$proto" "$port")   (or stop/rebind that service to 127.0.0.1, then restart $unit.service)"
+                "DANGEROUS: $proto/$port is open in the $FW_KIND firewall and bound by a process that is not $expected${LISTEN_NAMES:+ ($LISTEN_NAMES)}: a real service is exposed to the internet through a honeypot port. Close the port with the line below, or stop/rebind that service to 127.0.0.1 and then run: sudo systemctl restart $unit.service" \
+                "$(fw_close_fix "$proto" "$port")" "$(fw_fix_kind)"
         elif [ "$foreign" -eq 1 ] && [ "$LISTEN_EXPOSED" -eq 1 ] && [ "$FW_STATE" = none ]; then
             finding warn "$scope" "nofw:$proto:$port" \
                 "no host firewall was detected and $proto/$port is held by a non-sensor process: it is reachable from anywhere the network allows" \
-                "install and enable a host firewall, or move that service to 127.0.0.1"
+                "install and enable a host firewall, or move that service to 127.0.0.1" manual
         fi
     fi
 
@@ -1063,7 +1109,7 @@ check_listener() {
         setcell "$i" log warn "relative default"
         finding warn "$scope" "logpath:$sensor" \
             "$sensor has no PROPOLIS_CATCHALL_LOG_PATH: its compiled default is a relative path the unit's sandbox cannot write" \
-            "add PROPOLIS_CATCHALL_LOG_PATH=/var/log/propolis/catchall/events.jsonl to $ENV_DIR/catchall.env, then: sudo systemctl restart $unit.service"
+            "add PROPOLIS_CATCHALL_LOG_PATH=/var/log/propolis/catchall/events.jsonl to $ENV_DIR/catchall.env, then run: sudo systemctl restart $unit.service" manual
     elif lstat="$(stat -c '%Y %s' -- "$lp" 2>/dev/null)"; then
         lm="${lstat%% *}"
         ls="${lstat##* }"
@@ -1072,19 +1118,19 @@ check_listener() {
         text="$(human_age "$age") $(human_bytes "$ls")/$(human_bytes "$ROTATE_SIZE")"
         if [ "$ls" -ge $((ROTATE_SIZE * 3)) ]; then
             setcell "$i" log fail "$text"
-            finding fail "$scope" "logsize:$lp" \
-                "$lp is $(human_bytes "$ls"), more than 3x the rotation size ($(human_bytes "$ROTATE_SIZE")): rotation is not keeping up" \
-                "sudo systemctl start propolis-logrotate.service; sudo journalctl -u propolis-logrotate.service -n 30 --no-pager   (a refused log: docs/operations/retention.md, 'A log too large to rotate')"
+            finding fail "$scope" "logsize-fail:$lp" \
+                "$lp is $(human_bytes "$ls"), more than 3x the rotation size ($(human_bytes "$ROTATE_SIZE")): rotation is not keeping up. For a log the rotation refused, see docs/operations/retention.md, 'A log too large to rotate'" \
+                "sudo systemctl start propolis-logrotate.service; sudo journalctl -u propolis-logrotate.service -n 30 --no-pager"
         elif [ "$ls" -ge $((ROTATE_SIZE * 2)) ]; then
             setcell "$i" log warn "$text"
-            finding warn "$scope" "logsize:$lp" \
+            finding warn "$scope" "logsize-warn:$lp" \
                 "$lp is $(human_bytes "$ls"), over 2x the rotation size ($(human_bytes "$ROTATE_SIZE"))" \
                 "sudo systemctl start propolis-logrotate.service"
         elif [ "$listen_ok" -eq 1 ] && [ "$age" -gt $((STALE_HOURS * 3600)) ]; then
             setcell "$i" log warn "quiet $text"
             finding warn "$scope" "logquiet:$lp" \
-                "$lp has not been written for $(human_age "$age") although $unit is bound and running" \
-                "sudo journalctl -u $unit.service -n 50 --no-pager   (confirm traffic reaches the port; check the firewall and upstream filtering)"
+                "$lp has not been written for $(human_age "$age") although $unit is bound and running: confirm traffic reaches the port (check the firewall and upstream filtering)" \
+                "sudo journalctl -u $unit.service -n 50 --no-pager"
         else
             setcell "$i" log ok "$text"
         fi
@@ -1096,7 +1142,7 @@ check_listener() {
         if [ "$unit_down" -eq 0 ] && [ "$listen_ok" -eq 1 ]; then
             finding warn "$scope" "logmissing:$lp" \
                 "$lp does not exist although $unit is running and bound: no event has been written, or the sensor writes elsewhere" \
-                "grep LOG_PATH $ENV_DIR/*.env; sudo journalctl -u $unit.service -n 50 --no-pager"
+                "sudo grep -H LOG_PATH $(q "$ENV_DIR")/*.env; sudo journalctl -u $unit.service -n 50 --no-pager"
         fi
     fi
 
@@ -1117,14 +1163,14 @@ check_listener() {
             setcell "$i" intake ok "$found"
         elif [ -n "$same_label" ]; then
             setcell "$i" intake fail "wrong path"
-            finding fail "$scope" "intake:$lp" \
+            finding fail "$scope" "intake-wrongpath:$lp" \
                 "$INTAKE_VAR names '$want_label:$same_label' but $sensor writes $lp: intake tails a file the sensor never writes" \
-                "in $INTAKE_FILE set the entry to $want_label:$lp, then: sudo systemctl restart propolis.service && sudo $SCRIPT_DIR/watch-env.sh"
+                "in $INTAKE_FILE set the entry to $want_label:$lp, then run: sudo systemctl restart propolis.service && sudo $(q "$SCRIPT_DIR/watch-env.sh")" manual
         else
             setcell "$i" intake fail "absent"
-            finding fail "$scope" "intake:$lp" \
+            finding fail "$scope" "intake-absent:$lp" \
                 "$lp is not in $INTAKE_VAR: events from $sensor are never ingested" \
-                "append ,$want_label:$lp to $INTAKE_VAR in $INTAKE_FILE, then: sudo systemctl restart propolis.service && sudo $SCRIPT_DIR/watch-env.sh"
+                "append ,$want_label:$lp to $INTAKE_VAR in $INTAKE_FILE, then run: sudo systemctl restart propolis.service && sudo $(q "$SCRIPT_DIR/watch-env.sh")" manual
         fi
     elif [ "$INTAKE_STATE" = unreadable ]; then
         setcell "$i" intake unknown "?"
@@ -1140,14 +1186,14 @@ check_listener() {
         local age_s="${EV_AGE["$sensor"]:-}"
         if [ -z "$age_s" ]; then
             setcell "$i" events warn "none in 7d"
-            finding warn "$scope" "events:$sensor" \
-                "the ledger holds no event from sensor '$sensor' in the last 7 days" \
-                "psql \"\$DATABASE_URL\" -c \"SELECT max(observed_at) FROM event WHERE sensor = '$sensor'\"; if the log is growing, check intake: sudo journalctl -u propolis.service -n 50 --no-pager"
+            finding warn "$scope" "events-none:$sensor" \
+                "the ledger holds no event from sensor '$sensor' in the last 7 days: the first command shows its newest event ever; if the log is growing, the second shows whether intake is following it" \
+                "$(ledger_query_fix "$sensor"); sudo journalctl -u propolis.service -n 50 --no-pager"
         elif [ "$age_s" -gt $((STALE_HOURS * 3600)) ]; then
             setcell "$i" events warn "$(human_age "$age_s") ago"
-            finding warn "$scope" "events:$sensor" \
-                "the newest '$sensor' event in the ledger is $(human_age "$age_s") old" \
-                "sudo journalctl -u propolis.service -n 50 --no-pager   (is intake following the log?)"
+            finding warn "$scope" "events-old:$sensor" \
+                "the newest '$sensor' event in the ledger is $(human_age "$age_s") old: check whether intake is following the log" \
+                "sudo journalctl -u propolis.service -n 50 --no-pager"
         else
             setcell "$i" events ok "$(human_age "$age_s") ago"
         fi
@@ -1168,8 +1214,8 @@ check_rotation() {
         else
             worst=fail
             parts+=("timer ${a:-not installed}")
-            finding fail "logrotate" "timer" "propolis-logrotate.timer is ${a:-not installed}: nothing rotates the sensor logs (October 2026: a dead timer let one log reach 6.6 GB)" \
-                "sudo systemctl enable --now propolis-logrotate.timer   (not installed: sudo ./deploy/upgrade.sh)"
+            finding fail "logrotate" "timer" "propolis-logrotate.timer is ${a:-not installed}: nothing rotates the sensor logs (October 2026: a dead timer let one log reach 6.6 GB). If the timer unit is not installed at all, run the upgrade script instead: $(upgrade_fix)" \
+                "sudo systemctl enable --now propolis-logrotate.timer"
         fi
         if [ "$a" = active ] && [ -n "$e" ] && ! { [ "$e" = enabled ] || [ "$e" = enabled-runtime ]; }; then
             if [ "$worst" = ok ]; then worst=warn; fi
@@ -1203,13 +1249,13 @@ check_rotation() {
     if [ ! -r "$ROTATE_POLICY" ]; then
         worst=fail
         parts+=("policy missing")
-        finding fail "logrotate" "policy" "$ROTATE_POLICY is not installed" "sudo install -m 0644 $SCRIPT_DIR/logrotate-sensors.conf $ROTATE_POLICY"
+        finding fail "logrotate" "policy" "$ROTATE_POLICY is not installed" "sudo install -m 0644 $(q "$SCRIPT_DIR/logrotate-sensors.conf") $(q "$ROTATE_POLICY")"
     fi
     if [ ! -x "$ROTATE_GUARD" ]; then
         worst=fail
         parts+=("guard missing")
         finding fail "logrotate" "guard" "$ROTATE_GUARD is not installed or not executable: every rotation fails closed" \
-            "sudo install -m 0755 $SCRIPT_DIR/logrotate-guard.sh $ROTATE_GUARD"
+            "sudo install -m 0755 $(q "$SCRIPT_DIR/logrotate-guard.sh") $(q "$ROTATE_GUARD")"
     fi
     local text="" p
     for p in "${parts[@]}"; do text="${text:+$text, }$p"; done
@@ -1261,14 +1307,14 @@ check_binaries() {
     if [ "${#missing[@]}" -gt 0 ]; then
         worst=fail
         text="$text, MISSING: ${missing[*]}"
-        finding fail "binaries" "bins-missing" "binaries missing from $BIN_DIR: ${missing[*]} (the units that run them fail to start)" \
-            "sudo ./deploy/upgrade.sh   (or: sudo install -m 0755 $BUILD_DIR/<name> $BIN_DIR/<name>)"
+        finding fail "binaries" "bins-missing" "binaries missing from $BIN_DIR: ${missing[*]} (the units that run them fail to start); the upgrade script builds and installs them" \
+            "$(upgrade_fix)"
     fi
     if [ "${#differ[@]}" -gt 0 ]; then
         if [ "$worst" = ok ]; then worst=warn; fi
         text="$text, differ from $BUILD_DIR: ${differ[*]}"
         finding warn "binaries" "bins-differ" "installed binaries differ from the build in $BUILD_DIR: ${differ[*]} (built but not installed, or the install did not replace them)" \
-            "sudo ./deploy/upgrade.sh"
+            "$(upgrade_fix)"
     fi
     global binaries "$worst" "$text"
 
@@ -1277,7 +1323,7 @@ check_binaries() {
     if [ ! -r "$STAMP_FILE" ]; then
         global deploy-stamp warn "$STAMP_FILE not found: no deploy has recorded itself"
         finding warn "deploy-stamp" "stamp-missing" "$STAMP_FILE not found, so the installed version cannot be compared with the checkout" \
-            "sudo ./deploy/upgrade.sh"
+            "$(upgrade_fix)"
         return 0
     fi
     stamp="$(cat -- "$STAMP_FILE" 2>/dev/null)" || stamp=""
@@ -1288,20 +1334,20 @@ check_binaries() {
     if [ -z "$head" ]; then
         worst=warn
         text="stamp has no head_sha"
-        finding warn "deploy-stamp" "stamp-nohead" "$STAMP_FILE records no head_sha" "sudo ./deploy/upgrade.sh"
+        finding warn "deploy-stamp" "stamp-nohead" "$STAMP_FILE records no head_sha" "$(upgrade_fix)"
     elif [ -z "$installed" ]; then
         worst=warn
         text="$text, installed propolis version not recorded"
         finding warn "deploy-stamp" "stamp-noinstalled" "the stamp records no installed propolis revision (the binary did not answer --version at deploy time)" \
-            "sudo ./deploy/upgrade.sh"
+            "$(upgrade_fix)"
     else
         case "$head" in
             "${installed%+dirty}"*) text="$text, propolis binary ${installed:0:12}" ;;
             *)
                 worst=fail
                 text="$text, propolis binary ${installed:0:12} (MISMATCH)"
-                finding fail "deploy-stamp" "stamp-mismatch" "the installed propolis binary reports ${installed:0:12} but the deploy built $head: the install did not replace the binary" \
-                    "sudo ./deploy/upgrade.sh   (a first run after a script change re-executes itself; run it twice if the binary is still old)"
+                finding fail "deploy-stamp" "stamp-mismatch" "the installed propolis binary reports ${installed:0:12} but the deploy built $head: the install did not replace the binary (a first run after a script change re-executes itself; run the upgrade twice if the binary is still old)" \
+                    "$(upgrade_fix)"
                 ;;
         esac
     fi
@@ -1311,7 +1357,7 @@ check_binaries() {
             if [ "$worst" = ok ]; then worst=warn; fi
             text="$text, checkout is at ${git_head:0:12}"
             finding warn "deploy-stamp" "stamp-behind" "the checkout is at ${git_head:0:12} but the last deploy was ${head:0:12}" \
-                "sudo ./deploy/upgrade.sh"
+                "$(upgrade_fix)"
         fi
     fi
     global deploy-stamp "$worst" "$text"
@@ -1328,7 +1374,7 @@ check_intake_list() {
             if [ "$ROW_COUNT" -gt 0 ]; then
                 global intake-list fail "no PROPOLIS_SENSOR_LOGS in $ENV_DIR/propolis.env"
                 finding fail "intake-list" "intake-none" "PROPOLIS_SENSOR_LOGS is not set in $ENV_DIR/propolis.env (nor PROPOLIS_SHIPPER_SENSOR_LOGS in shipper.env): the daemon refuses to start and no sensor log is ingested" \
-                    "set PROPOLIS_SENSOR_LOGS=<label>:<path>,... in $ENV_DIR/propolis.env (see deploy/propolis.env.example), then: sudo systemctl restart propolis.service"
+                    "set PROPOLIS_SENSOR_LOGS=<label>:<path>,... in $ENV_DIR/propolis.env (see deploy/propolis.env.example), then run: sudo systemctl restart propolis.service" manual
             fi
             ;;
         present)
@@ -1340,7 +1386,7 @@ check_intake_list() {
                 sug="$(suggest_entry "${IN_BAD[$i]}" "${IN_BAD_WHY[$i]}")"
                 finding fail "intake-list" "intake-bad:${IN_BAD[$i]}" \
                     "$INTAKE_VAR entry '${IN_BAD[$i]}' is malformed (${IN_BAD_WHY[$i]}; expected label:path): the daemon refuses to start" \
-                    "edit $INTAKE_FILE${sug:+ and change it to $sug}, then: sudo systemctl restart propolis.service"
+                    "edit $INTAKE_FILE${sug:+ and change it to $sug}, then run: sudo systemctl restart propolis.service" manual
             done
             for ((i = 0; i < ${#IN_LABEL[@]}; i++)); do
                 for ((j = i + 1; j < ${#IN_LABEL[@]}; j++)); do
@@ -1348,12 +1394,12 @@ check_intake_list() {
                         worst=fail
                         finding fail "intake-list" "intake-duplabel:${IN_LABEL[$i]}" \
                             "label '${IN_LABEL[$i]}' appears twice in $INTAKE_VAR (${IN_PATH[$i]} and ${IN_PATH[$j]}): per-log state is keyed by label" \
-                            "give each entry a unique label in $INTAKE_FILE, then: sudo systemctl restart propolis.service"
+                            "give each entry a unique label in $INTAKE_FILE, then run: sudo systemctl restart propolis.service" manual
                     elif [ "${IN_PATH[$i]}" = "${IN_PATH[$j]}" ]; then
                         if [ "$worst" = ok ]; then worst=warn; fi
                         finding warn "intake-list" "intake-duppath:${IN_PATH[$i]}" \
                             "path ${IN_PATH[$i]} is listed twice in $INTAKE_VAR (labels ${IN_LABEL[$i]} and ${IN_LABEL[$j]}): every event is read twice" \
-                            "remove one of the two entries from $INTAKE_FILE, then: sudo systemctl restart propolis.service"
+                            "remove one of the two entries from $INTAKE_FILE, then run: sudo systemctl restart propolis.service" manual
                     fi
                 done
             done
@@ -1365,7 +1411,7 @@ check_intake_list() {
                         if [ "$worst" = ok ]; then worst=warn; fi
                         finding warn "intake-list" "intake-rel:$lp" \
                             "$INTAKE_VAR entry '${IN_LABEL[$i]}:$lp' has a relative path, which resolves against the daemon's working directory" \
-                            "use an absolute path in $INTAKE_FILE"
+                            "use an absolute path in $INTAKE_FILE" manual
                         continue
                         ;;
                 esac
@@ -1378,12 +1424,12 @@ check_intake_list() {
                         worst=fail
                         finding fail "intake-list" "intake-nodir:$lp" \
                             "$INTAKE_VAR entry '${IN_LABEL[$i]}:$lp' names a directory that does not exist, and no configured sensor writes to it (a typo?)" \
-                            "correct the path in $INTAKE_FILE (sensors write under /var/log/propolis/<name>/), then: sudo systemctl restart propolis.service"
+                            "correct the path in $INTAKE_FILE (sensors write under /var/log/propolis/<name>/), then run: sudo systemctl restart propolis.service" manual
                     else
                         if [ "$worst" = ok ]; then worst=warn; fi
                         finding warn "intake-list" "intake-orphan:$lp" \
                             "$INTAKE_VAR entry '${IN_LABEL[$i]}:$lp' matches no configured sensor's log path (a typo, or a sensor configured on another host)" \
-                            "check the path against the sensor's *_LOG_PATH in $ENV_DIR, or remove the entry from $INTAKE_FILE"
+                            "check the path against the sensor's *_LOG_PATH in $ENV_DIR, or remove the entry from $INTAKE_FILE" manual
                     fi
                 fi
             done
@@ -1409,7 +1455,7 @@ check_intake_list() {
                 worst=fail
                 finding fail "intake-list" "intake-name:$file:$tname" \
                     "$file sets '$name', which is not a variable anything reads (expected PROPOLIS_SENSOR_LOGS, or PROPOLIS_SHIPPER_SENSOR_LOGS on a collector, with no space before '=')" \
-                    "rename it to PROPOLIS_SENSOR_LOGS in $file, then: sudo systemctl restart propolis.service"
+                    "rename it to PROPOLIS_SENSOR_LOGS in $file, then run: sudo systemctl restart propolis.service" manual
             fi
         done <<<"$hits"
     done
@@ -1432,7 +1478,7 @@ check_watcher() {
         worst=fail
         parts+=("watch.env missing")
         finding fail "watcher" "watch-env-missing" "$wenv does not exist: propolis-watch has no log list and exits" \
-            "sudo $SCRIPT_DIR/watch-env.sh"
+            "sudo $(q "$SCRIPT_DIR/watch-env.sh")"
     elif [ ! -r "$wenv" ]; then
         worst=unknown
         parts+=("watch.env unreadable")
@@ -1442,7 +1488,7 @@ check_watcher() {
         if [ -z "$watch_line" ]; then
             worst=fail
             parts+=("watch.env has no PROPOLIS_SENSOR_LOGS")
-            finding fail "watcher" "watch-env-empty" "$wenv sets no PROPOLIS_SENSOR_LOGS" "sudo $SCRIPT_DIR/watch-env.sh"
+            finding fail "watcher" "watch-env-empty" "$wenv sets no PROPOLIS_SENSOR_LOGS" "sudo $(q "$SCRIPT_DIR/watch-env.sh")"
         elif [ -r "$ENV_DIR/propolis.env" ]; then
             src_line="$(grep -E '^PROPOLIS_SENSOR_LOGS=' "$ENV_DIR/propolis.env" 2>/dev/null | tail -n 1 || true)"
             if [ "$src_line" = "$watch_line" ]; then
@@ -1451,7 +1497,7 @@ check_watcher() {
                 worst=fail
                 parts+=("watch.env differs from propolis.env")
                 finding fail "watcher" "watch-env-drift" "$wenv differs from PROPOLIS_SENSOR_LOGS in propolis.env: the watcher follows a different list than the daemon" \
-                    "sudo $SCRIPT_DIR/watch-env.sh"
+                    "sudo $(q "$SCRIPT_DIR/watch-env.sh")"
             fi
         else
             parts+=("watch.env present (propolis.env unreadable, drift not checked)")
@@ -1465,7 +1511,7 @@ check_watcher() {
         if [ "$worst" = ok ]; then worst=warn; fi
         parts+=("authorized_keys empty")
         finding warn "watcher" "watch-key-empty" "$key_file is empty: nobody can start the watcher" \
-            "install the forced-command key per docs/operations/live-watch.md (template: deploy/watch-authorized-keys.example)"
+            "install the forced-command key per docs/operations/live-watch.md (template: deploy/watch-authorized-keys.example)" manual
     elif [ -d "$WATCH_HOME" ] && [ ! -x "$WATCH_HOME" ]; then
         parts+=("authorized_keys not readable")
         worst=unknown
@@ -1474,7 +1520,7 @@ check_watcher() {
         if [ "$worst" = ok ]; then worst=warn; fi
         parts+=("no authorized key")
         finding warn "watcher" "watch-key-missing" "$key_file does not exist: nobody can start the watcher" \
-            "install the forced-command key per docs/operations/live-watch.md (template: deploy/watch-authorized-keys.example)"
+            "install the forced-command key per docs/operations/live-watch.md (template: deploy/watch-authorized-keys.example)" manual
     fi
     local p
     text=""
@@ -1485,7 +1531,7 @@ check_watcher() {
 # An enabled or running sensor unit with no bind configured is the fingerprint of a misspelled
 # bind variable: the sensor starts, finds nothing to bind and exits or idles.
 check_unconfigured_units() {
-    local b k have_row worst=ok list="" name
+    local b k have_row worst=ok list=""
     if [ "${#UNREADABLE_ENV[@]}" -gt 0 ]; then
         # An unreadable env file may be exactly the one holding the missing bind: say nothing
         # rather than accuse a sensor of having none.
@@ -1500,14 +1546,13 @@ check_unconfigured_units() {
         done
         if [ "$have_row" -eq 1 ]; then continue; fi
         probe_unit "$b"
-        name="${b#sensor-}"
         if [ "${U_ACTIVE["$b"]}" = unavailable ]; then continue; fi
         if unit_is_enabled "$b" || [ "${U_ACTIVE["$b"]}" = active ]; then
             worst=fail
             list="${list:+$list, }$b"
             finding fail "units" "noconfig:$b" \
-                "$b.service is enabled or running but no bind variable is set for it in $ENV_DIR (the sensor has nothing to bind; a misspelled variable name looks like this)" \
-                "grep -n BIND $ENV_DIR/${name}.env; compare with deploy/sensor.env.example, fix the name, then: sudo systemctl restart $b.service"
+                "$b.service is enabled or running but no bind variable is set for it in $ENV_DIR (the sensor has nothing to bind; a misspelled variable name looks like this). List the bind variables the env files do set, compare them with deploy/sensor.env.example, fix the name, then run: sudo systemctl restart $b.service" \
+                "sudo grep -H BIND $(q "$ENV_DIR")/*.env"
         fi
     done
     if [ "$worst" = ok ]; then
@@ -1521,7 +1566,7 @@ check_env_files() {
     if [ "${#ENV_FILES[@]}" -eq 0 ]; then
         global env-files warn "no *.env files in $ENV_DIR"
         finding warn "env-files" "env-none" "no *.env files in $ENV_DIR: nothing is configured on this host" \
-            "copy deploy/sensor.env.example and deploy/propolis.env.example to $ENV_DIR and fill them in (docs/operations/installation.md)"
+            "copy deploy/sensor.env.example and deploy/propolis.env.example to $ENV_DIR and fill them in (docs/operations/installation.md)" manual
     elif [ "${#UNREADABLE_ENV[@]}" -gt 0 ]; then
         global env-files unknown "${#UNREADABLE_ENV[@]} of ${#ENV_FILES[@]} env files unreadable as this user"
     elif [ "$ROW_COUNT" -eq 0 ]; then
@@ -1629,8 +1674,9 @@ emit_json() {
     printf '],"findings":['
     sep=""
     for ((i = 0; i < ${#F_LEVEL[@]}; i++)); do
-        printf '%s{"level":"%s","scope":%s,"message":%s,"fix":%s}' \
-            "$sep" "${F_LEVEL[$i]}" "$(jstr "${F_SCOPE[$i]}")" "$(jstr "${F_MSG[$i]}")" "$(jstr "${F_FIX[$i]}")"
+        printf '%s{"level":"%s","id":%s,"scope":%s,"message":%s,"fix":%s,"fix_kind":%s}' \
+            "$sep" "${F_LEVEL[$i]}" "$(jstr "${F_ID[$i]}")" "$(jstr "${F_SCOPE[$i]}")" "$(jstr "${F_MSG[$i]}")" \
+            "$(jstr "${F_FIX[$i]}")" "$(jstr "${F_KIND[$i]}")"
         sep=","
     done
     printf ']}\n'
@@ -1689,7 +1735,11 @@ emit_text() {
         for ((i = 0; i < ${#F_LEVEL[@]}; i++)); do
             printf '  %s  %s: %s\n' "$(mark "${F_LEVEL[$i]}")" "${F_SCOPE[$i]}" "${F_MSG[$i]}"
             if [ -n "${F_FIX[$i]}" ]; then
-                printf '        fix: %s\n' "${F_FIX[$i]}"
+                if [ "${F_KIND[$i]}" = manual ]; then
+                    printf '        do:  %s\n' "${F_FIX[$i]}"
+                else
+                    printf '        fix: %s\n' "${F_FIX[$i]}"
+                fi
             fi
         done
     fi

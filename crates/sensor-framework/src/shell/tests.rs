@@ -1473,8 +1473,20 @@ mod shell_detection_tests {
     fn chmod_and_drop_chain_verbs_never_say_command_not_found() {
         // `chmod +x x` returning "command not found" is impossible on real Linux and aborts the
         // loader before it runs its payload - the most direct capture-costing tell in the shell.
-        let (out, _) = shell().handle_input("chmod +x /tmp/x");
+        let mut sh = shell();
+        sh.handle_input("touch /tmp/x");
+        let (out, _) = sh.handle_input("chmod +x /tmp/x");
         assert_eq!(out, "");
+        // A file that is not there is named, as GNU chmod does (Ubuntu 22.04), and the status
+        // is 1, so `chmod +x x && ./x` does not run what was never fetched.
+        let (out, _) = sh.handle_input("chmod +x /tmp/nosuch /tmp/x");
+        assert_eq!(
+            out,
+            "chmod: cannot access '/tmp/nosuch': No such file or directory\n"
+        );
+        assert_eq!(out.status, 1);
+        assert_eq!(sh.handle_input("chmod -f +x /tmp/nosuch").0.status, 1);
+        assert_eq!(sh.handle_input("chmod -f +x /tmp/nosuch").0, "");
         // The rest answer as the real commands do: silence on success, the real message on a
         // path that is not there. They used to be silent either way, which is how a loader
         // could `cp` a payload and then not find it.

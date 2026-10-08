@@ -54,6 +54,7 @@ use crate::sanitize_value;
 mod admin;
 mod android;
 mod androidsys;
+mod arch;
 mod arith;
 mod ast;
 mod awk;
@@ -414,6 +415,10 @@ pub struct FakeShell {
     /// Files this session built from `echo`/`printf` output, by path, as their last chunk left
     /// them.
     assembled: std::collections::BTreeMap<String, loader::Assembled>,
+    /// Where each file the session fetched came from, by path; see [`arch`].
+    origins: std::collections::BTreeMap<String, arch::Origin>,
+    /// The origin of the one file `cat` just read, for the redirection that writes its output.
+    cat_origin: Option<arch::Origin>,
     /// The command running right now wrote bytes the attacker typed (`echo`, `printf`).
     typed_output: bool,
     /// The standard input of the command running right now is the typed output of the pipeline
@@ -624,6 +629,8 @@ impl FakeShell {
             input_sinks: Vec::new(),
             captures: None,
             assembled: std::collections::BTreeMap::new(),
+            origins: std::collections::BTreeMap::new(),
+            cat_origin: None,
             typed_output: false,
             piped_typed: false,
             decoded: None,
@@ -688,6 +695,8 @@ impl FakeShell {
                 input_sinks: self.input_sinks.clone(),
                 captures: self.captures.clone(),
                 assembled: self.assembled.clone(),
+                origins: self.origins.clone(),
+                cat_origin: self.cat_origin.clone(),
                 typed_output: self.typed_output,
                 piped_typed: self.piped_typed,
                 decoded: self.decoded.clone(),
@@ -1497,17 +1506,37 @@ impl FakeShell {
         // Silent like the real thing, but an executable mode on a file the attacker
         // created is remembered so that running it afterwards succeeds.
         let mut args = parts[1..].iter().filter(|a| !a.starts_with('-'));
-        if let Some(mode) = args.next()
-            && mode_grants_execute(mode)
-        {
-            for target in args {
-                let path = self.resolve_logical(target);
+        let quiet = parts[1..]
+            .iter()
+            .any(|a| a.starts_with('-') && a.contains('f'));
+        let grants = args.next().is_some_and(|mode| mode_grants_execute(mode));
+        let mut result = CommandResult::silent(0);
+        for target in args {
+            let path = self.resolve_logical(target);
+            // GNU chmod names each missing operand and goes on with the rest; a loop that fetched
+            // nothing (`wget ... && chmod +x x && ./x`) then stops there instead of running a
+            // file that is not there. Only GNU chmod on the Ubuntu persona is worded: the
+            // phone's and busybox's messages are not recorded, so they stay silent.
+            if self.flavor == ShellFlavor::Bash
+                && self.busybox_depth == 0
+                && self.fs.stat(&path, true).is_none()
+            {
+                if !quiet {
+                    result.append(CommandResult::stderr(
+                        1,
+                        format!("chmod: cannot access '{target}': No such file or directory\n"),
+                    ));
+                }
+                result.status = 1;
+                continue;
+            }
+            if grants {
                 self.traced_mark_executable(&path);
                 // An echo loader marks its assembled file executable once the last chunk is in.
                 self.loader_trigger(&path);
             }
         }
-        CommandResult::silent(0)
+        result
     }
 
     /// `sleep N[smhd]...`: returns at once, and the time it would have taken is what `time`
@@ -1567,6 +1596,11 @@ impl FakeShell {
     fn invoke_path(&mut self, parts: &[&str]) -> CommandResult {
         let path = self.resolve_logical(parts[0]);
         if self.fs.is_executable(&path) {
+            if let Some(image) = self.foreign_image(&path) {
+                // The kernel refuses the binary, so nothing of it runs; the capture still gets it.
+                self.loader_trigger(&path);
+                return self.exec_format_refusal(parts[0], image);
+            }
             if self.loader_exec(parts, &path) {
                 // A downloader that cannot reach its server: see `loader_exec`.
                 return CommandResult::silent(1);
@@ -1788,6 +1822,7 @@ impl FakeShell {
         let result = self.fs.write_file(path, bytes);
         match &result {
             Ok(()) => {
+                self.forget_origin(path);
                 self.trace_fs(FsEffect::Wrote {
                     path: path.to_string(),
                     bytes: bytes.len(),
@@ -1804,6 +1839,7 @@ impl FakeShell {
         let result = self.fs.write_blob(path, blob, mode);
         match &result {
             Ok(()) => {
+                self.forget_origin(path);
                 self.trace_fs(FsEffect::Wrote {
                     path: path.to_string(),
                     bytes: len,
@@ -1818,10 +1854,13 @@ impl FakeShell {
     fn traced_remove(&mut self, path: &str) -> Result<bool, FsError> {
         let result = self.fs.remove_path(path);
         match &result {
-            Ok(existed) => self.trace_fs(FsEffect::Removed {
-                path: path.to_string(),
-                existed: *existed,
-            }),
+            Ok(existed) => {
+                self.forget_origin(path);
+                self.trace_fs(FsEffect::Removed {
+                    path: path.to_string(),
+                    existed: *existed,
+                });
+            }
             Err(error) => self.trace_denied(path, error),
         }
         result
@@ -1966,7 +2005,14 @@ impl FakeShell {
         let name = download_save_name(cmd, parts)?;
         let path = self.resolve_logical(&name);
         match self.traced_write_file(&path, FETCHED_BODY.as_bytes()) {
-            Ok(()) => None,
+            Ok(()) => {
+                let url = match fetch_attempt(parts) {
+                    Some(Fetch::Url(url)) => Some(url),
+                    _ => None,
+                };
+                self.note_origin(&path, url, &name);
+                None
+            }
             Err(error) => budget_refusal_text(&error)
                 .map(|reason| (sanitize_value(&name, MAX_URL_LEN), reason)),
         }
@@ -2056,7 +2102,7 @@ impl FakeShell {
             );
         }
         match self.traced_write_blob(&dst_path, blob, mode) {
-            Ok(()) => {}
+            Ok(()) => self.copy_origin(&src_path, &dst_path),
             Err(FsError::ReadOnly) => {
                 return CommandResult::stderr(
                     1,
@@ -3305,6 +3351,8 @@ mod admin_tests;
 mod android_tests;
 #[cfg(test)]
 mod androidsys_tests;
+#[cfg(test)]
+mod arch_tests;
 #[cfg(test)]
 mod base64_tests;
 #[cfg(test)]

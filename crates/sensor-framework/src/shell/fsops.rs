@@ -734,7 +734,9 @@ impl FakeShell {
                     .content_and_mode(src_path)
                     .map_err(|error| reason(&error))?;
                 self.traced_write_blob(dst_path, blob, mode)
-                    .map_err(|error| reason(&error))
+                    .map_err(|error| reason(&error))?;
+                self.copy_origin(src_path, dst_path);
+                Ok(())
             }
             FileKind::Symlink => {
                 let held = self.fs.link_target(src_path).ok_or(NO_SUCH)?;

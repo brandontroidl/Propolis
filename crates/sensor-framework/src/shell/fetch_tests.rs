@@ -63,7 +63,12 @@ const DROPPER: [&str; 6] = [
 
 #[test]
 fn a_script_written_by_echo_reports_nothing_until_it_runs_and_then_what_it_fetched() {
-    for mut sh in [shell(), android()] {
+    // Each build for another CPU fails to start, so the loop goes on to the first one the persona
+    // runs and its `&& break` ends it there: x86_64 on Ubuntu, the first ARM build (a 32-bit ARM
+    // build of any generation runs on the armv7l phone) on Android.
+    let ubuntu = ["mips", "mpsl", "arm4", "arm5", "arm6", "arm7", "x86_64"];
+    let phone = ["mips", "mpsl", "arm4"];
+    for (mut sh, builds) in [(shell(), &ubuntu[..]), (android(), &phone[..])] {
         // The phone's shell starts in a read-only `/`.
         sh.handle_input("cd /data/local/tmp 2>/dev/null; cd /tmp 2>/dev/null");
         for line in &DROPPER[..5] {
@@ -72,9 +77,8 @@ fn a_script_written_by_echo_reports_nothing_until_it_runs_and_then_what_it_fetch
             assert_eq!(events.len(), 1, "{line}: the command event alone");
         }
         let (_, events) = sh.handle_input(DROPPER[5]);
-        // The fake fetch succeeds and runs, so the loop's `&& break` ends it after the first
-        // architecture, as it would for a bot whose first binary ran.
-        assert_eq!(urls(&events), vec![at("mips")]);
+        let expected: Vec<String> = builds.iter().map(|build| at(build)).collect();
+        assert_eq!(urls(&events), expected);
     }
 }
 

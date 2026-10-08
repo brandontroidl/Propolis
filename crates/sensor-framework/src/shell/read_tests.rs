@@ -437,16 +437,20 @@ fn a_reader_stops_taking_operands_once_the_line_allowance_is_spent() {
 }
 
 #[test]
-fn the_phone_has_none_of_these_readers() {
+fn the_phone_has_head_and_tail_but_neither_more_nor_hexdump() {
     let mut sh = FakeShell::android(FakeFs::android(), ctx());
-    for name in [
-        "head -n 1 /system/build.prop",
-        "tail -n 1 /system/build.prop",
-        "more /default.prop",
-        "hexdump /default.prop",
-    ] {
+    for name in ["more /default.prop", "hexdump /default.prop"] {
         let out = run(&mut sh, name);
         assert_eq!(out.status, 127, "{name}");
         assert!(out.contains("not found"), "{name}: {out}");
+    }
+    // `head` and `tail` are toybox applets linked into `/system/bin` since 6.0.
+    for name in [
+        "head -n 1 /system/build.prop",
+        "tail -n 1 /system/build.prop",
+    ] {
+        let out = run(&mut sh, name);
+        assert_eq!(out.status, 0, "{name}");
+        assert!(!out.is_empty(), "{name}");
     }
 }

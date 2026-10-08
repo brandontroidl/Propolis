@@ -94,6 +94,8 @@ pub enum HandlerId {
     Hexdump,
     More,
     Dd,
+    /// `tr`: the Android shell's toybox translate/delete/squeeze over standard input.
+    Tr,
     Readlink,
     /// `realpath`: the canonical path, through the same resolver as `readlink -f`.
     Realpath,

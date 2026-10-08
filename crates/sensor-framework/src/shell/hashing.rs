@@ -28,16 +28,21 @@ use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
 pub(super) fn register(r: &mut Registry) {
     // `md5sum`, `sha1sum` and `sha256sum` are applets of the captured BusyBox, so `busybox
     // sha256sum` reaches these handlers as `busybox wc` does; `cksum` is not an applet.
-    r.register_if("md5sum", ubuntu, HandlerId::Md5sum, FakeShell::cmd_md5sum);
+    r.register_if(
+        "md5sum",
+        super::multicall::bare_applet,
+        HandlerId::Md5sum,
+        FakeShell::cmd_md5sum,
+    );
     r.register_if(
         "sha1sum",
-        ubuntu,
+        super::multicall::bare_applet,
         HandlerId::Sha1sum,
         FakeShell::cmd_sha1sum,
     );
     r.register_if(
         "sha256sum",
-        ubuntu,
+        super::multicall::bare_applet,
         HandlerId::Sha256sum,
         FakeShell::cmd_sha256sum,
     );
@@ -171,7 +176,16 @@ impl FakeShell {
         prog: &str,
         line_of: fn(&[u8]) -> String,
     ) -> CommandResult {
-        let files = match parse(prog, parts.get(1..).unwrap_or(&[])) {
+        // Toybox's `-b` prints the digest alone, with no name column; it is the one option its
+        // sums have. (GNU's `-b` only changes the read mode, which is not modeled.)
+        let hash_only = self.flavor == ShellFlavor::AndroidSh && parts.contains(&"-b");
+        let operands: Vec<&str> = parts
+            .iter()
+            .skip(1)
+            .copied()
+            .filter(|arg| !(hash_only && *arg == "-b"))
+            .collect();
+        let files = match parse(prog, &operands) {
             Parsed::Files(files) => files,
             Parsed::Fail(text) => return CommandResult::stderr(1, text),
             Parsed::Unmodeled => return CommandResult::silent(0),
@@ -203,6 +217,7 @@ impl FakeShell {
             }
             let head = line_of(&bytes);
             let row = match (name, cksum) {
+                _ if hash_only => format!("{head}\n"),
                 // `cksum` names no standard input; the `*sum` tools call it `-`.
                 (None, true) => format!("{head}\n"),
                 (None, false) => format!("{head}  -\n"),

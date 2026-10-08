@@ -27,9 +27,19 @@ const HEXDUMP_RAW_FORMAT: &str = "16/1 \"%c\"";
 
 pub(super) fn register(r: &mut Registry) {
     r.register("cat", HandlerId::Cat, FakeShell::cmd_cat);
-    // The phone's toolbox has no recorded answer for these, and it answers "not found" today.
-    r.register_if("head", ubuntu, HandlerId::Head, FakeShell::cmd_head);
-    r.register_if("tail", ubuntu, HandlerId::Tail, FakeShell::cmd_tail);
+    // The phone's toolbox has no `more`; `head` and `tail` are toybox's.
+    r.register_if(
+        "head",
+        super::multicall::bare_applet,
+        HandlerId::Head,
+        FakeShell::cmd_head,
+    );
+    r.register_if(
+        "tail",
+        super::multicall::bare_applet,
+        HandlerId::Tail,
+        FakeShell::cmd_tail,
+    );
     r.register_if("more", ubuntu, HandlerId::More, FakeShell::cmd_more);
     r.register_if(
         "hexdump",

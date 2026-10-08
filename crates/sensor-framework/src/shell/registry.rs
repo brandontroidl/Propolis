@@ -79,6 +79,7 @@ impl Registry {
         super::texttools::register(&mut registry);
         super::grep::register(&mut registry);
         super::textproc::register(&mut registry);
+        super::tr::register(&mut registry);
         super::awk::register(&mut registry);
         super::binview::register(&mut registry);
         super::printf::register(&mut registry);

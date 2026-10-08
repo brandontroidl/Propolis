@@ -416,6 +416,7 @@ pub(crate) struct TrackedFile {
     pub path: String,
     /// The content the last chunk left, so a file overwritten since is not taken for it.
     pub sha256: [u8; 32],
+    pub len: u64,
     pub chunk_count: u32,
     pub command: String,
 }
@@ -504,6 +505,12 @@ impl StdinCaptures {
                 set.tracked.push(file);
             }
         }
+    }
+
+    /// The assemblies the session's shells have reported so far, for a shell that starts a line
+    /// to continue what another one began.
+    pub(crate) fn tracked_assembled(&self) -> Vec<TrackedFile> {
+        self.lock().tracked.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CaptureSet> {
@@ -1027,5 +1034,154 @@ mod tests {
         drop(captures);
         handoff.drain(std::time::Duration::from_secs(5)).await;
         assert!(events(dir.path()).is_empty());
+    }
+
+    /// Standard base64 of `data`, written here independently of the shell's own encoder so the
+    /// loader test below cannot agree with the shell by sharing its mistakes.
+    fn base64_of(data: &[u8]) -> String {
+        const SYMBOLS: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut text = String::new();
+        for group in data.chunks(3) {
+            let [a, b, c] = [0usize, 1, 2].map(|i| u32::from(group.get(i).copied().unwrap_or(0)));
+            let word = (a << 16) | (b << 8) | c;
+            for (i, shift) in [18u32, 12, 6, 0].into_iter().enumerate() {
+                if i <= group.len() {
+                    text.push(char::from(SYMBOLS[((word >> shift) & 63) as usize]));
+                } else {
+                    text.push('=');
+                }
+            }
+        }
+        text
+    }
+
+    /// A small ZIP that looks like an APK to `pm`: the local-header magic, the manifest entry's
+    /// name, and bytes past 0x7f. Built here; it is not any real package.
+    fn synthetic_apk() -> Vec<u8> {
+        let mut apk = b"PK\x03\x04".to_vec();
+        apk.extend_from_slice(b"AndroidManifest.xml");
+        apk.extend((0..=255u8).cycle().take(900));
+        apk
+    }
+
+    fn sha_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// The loader an ADB bot runs: base64 text appended chunk by chunk with `echo -n`, its size
+    /// checked, decoded, the decode's size checked, then `pm install`. Every command is its own
+    /// `shell:<command>` stream, so its own shell over the connection's shared filesystem. The
+    /// decoded APK is the sample, captured when `pm install` takes it, once.
+    #[tokio::test]
+    async fn a_base64_loader_run_as_separate_exec_shells_is_captured_decoded_at_pm_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let fs = FakeFs::android();
+        let run = |line: &str| {
+            let mut shell = FakeShell::android(fs.share(), ctx()).with_captures(captures.clone());
+            shell.handle_input(line).0
+        };
+        let apk = synthetic_apk();
+        let text = base64_of(&apk);
+        let b64 = "/data/local/tmp/probe.apk.b64";
+        let dec = "/data/local/tmp/probe.apk.dec";
+        let installed = "/data/local/tmp/probe.apk";
+
+        run(&format!("rm -f '{b64}' '{dec}' '{installed}'"));
+        let chunks: Vec<&str> = text
+            .as_bytes()
+            .chunks(120)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        for chunk in &chunks {
+            assert_eq!(run(&format!("echo -n '{chunk}' >> '{b64}'")).status, 0);
+        }
+        let counted = run(&format!("wc -c < '{b64}'"));
+        assert_eq!(
+            (counted.status, counted.bytes()),
+            (0, format!("{}\n", text.len()).as_bytes())
+        );
+        assert_eq!(run(&format!("base64 -d '{b64}' > '{dec}'")).status, 0);
+        let counted = run(&format!("wc -c < '{dec}'"));
+        assert_eq!(counted.bytes(), format!("{}\n", apk.len()).as_bytes());
+        assert_eq!(run(&format!("mv '{dec}' '{installed}'")).status, 0);
+        let result = run(&format!("pm install -r '{installed}'"));
+        assert_eq!(result.status, 0);
+        assert!(
+            result.contains("Success"),
+            "{}",
+            String::from_utf8_lossy(result.bytes())
+        );
+        // Installing it again is the same sample.
+        run(&format!("pm install -r '{installed}'"));
+
+        captures.end_session(CaptureEnd::PeerClosed);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        let apks: Vec<_> = events
+            .iter()
+            .filter(|e| e["metadata"]["sha256"] == sha_hex(&apk))
+            .collect();
+        assert_eq!(apks.len(), 1, "{events:?}");
+        let meta = &apks[0]["metadata"];
+        assert_eq!(meta["capture_reason"], "echo_loader");
+        assert_eq!(meta["size"], apk.len());
+        assert_eq!(meta["chunk_count"], chunks.len());
+        assert_eq!(meta["destination"], installed);
+        assert_eq!(meta["end_reason"], "transfer_complete");
+        // The base64 text it was built from is the only other sample, taken as the session ends.
+        assert_eq!(events.len(), 2, "{events:?}");
+        let source_text = events
+            .iter()
+            .find(|e| e["metadata"]["sha256"] == sha_hex(text.as_bytes()))
+            .unwrap();
+        assert_eq!(source_text["metadata"]["end_reason"], "peer_closed");
+    }
+
+    /// A decode of typed input counts as many chunks as the input did, so a loader that decodes
+    /// and leaves is still captured as the session ends; a decode of a system file is nobody's
+    /// upload.
+    #[tokio::test]
+    async fn a_decoded_assembly_never_installed_is_taken_at_the_session_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let fs = FakeFs::android();
+        let run = |line: &str| {
+            FakeShell::android(fs.share(), ctx())
+                .with_captures(captures.clone())
+                .handle_input(line)
+                .0
+        };
+        let apk = synthetic_apk();
+        let text = base64_of(&apk);
+        for chunk in text.as_bytes().chunks(200) {
+            let chunk = std::str::from_utf8(chunk).unwrap();
+            run(&format!("echo -n '{chunk}' >> /data/local/tmp/p.b64"));
+        }
+        run("base64 -d /data/local/tmp/p.b64 > /data/local/tmp/p.bin");
+        run("base64 /system/build.prop | base64 -d > /data/local/tmp/sys.bin");
+        captures.end_session(CaptureEnd::IdleTimeout);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        let decoded = events
+            .iter()
+            .find(|e| e["metadata"]["sha256"] == sha_hex(&apk))
+            .unwrap_or_else(|| panic!("the decoded file was not captured: {events:?}"));
+        assert_eq!(decoded["metadata"]["destination"], "/data/local/tmp/p.bin");
+        assert_eq!(decoded["metadata"]["end_reason"], "idle_timeout");
+        assert!(
+            events
+                .iter()
+                .all(|e| e["metadata"]["destination"] != "/data/local/tmp/sys.bin"),
+            "{events:?}"
+        );
     }
 }

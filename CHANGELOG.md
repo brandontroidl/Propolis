@@ -4,6 +4,28 @@
 
 ### Fixed
 
+- **An ADB base64 APK loader no longer loops on `wc: not found`** - observed live 2026-10-07: a bot
+  pushed an APK to `/data/local/tmp` in about 57 `echo -n '<base64>' >> f.b64` commands, checked
+  `wc -c < f.b64`, got `sh: wc: not found` from the Android shell, deleted everything and started
+  over (48 rounds seen, 110 to 150 events per 10 minutes), so it never reached the decode or the
+  install and no APK was ever captured. The Android shell now has the toybox tools a loader checks
+  its work with: `wc`, `base64`, `md5sum`, `sha1sum`, `sha256sum`, `head`, `tail`, `cut`, `tr`,
+  `od`, `which`, `id`, `mkdir`, `cp`, `mv`, `rm` and `sleep`, in `/system/bin` and in `toybox`'s
+  list. Presence is taken from toybox's `Android.mk` at the persona's own release (6.0.1); `base64`
+  and `sha256sum` are linked here although that release does not, so the loader proceeds
+  (`crates/sensor-framework/src/shell/multicall.rs#TOYBOX_APPLETS` gives the reasoning). Their output
+  and error lines follow that release's source: `wc` prints unpadded counts, `base64 -d` is the
+  lenient decoder, and options, operand counts and refusals come from a port of its argument parser
+  (`toyopt.rs`). The decoded bytes of an assembled base64 file are an assembly of their own, found
+  across the separate shells of a connection (every `adb shell CMD` is one), and are captured as an
+  `echo_loader` sample when `pm install` is given the file, when it is made executable or run, or
+  when the session ends. `pm install` now prints what `Pm.runInstall` of Android 6.0.1 prints
+  (`\tpkg: PATH`, then `Success` or `Failure [INSTALL_PARSE_FAILED_NOT_APK]`,
+  `INSTALL_PARSE_FAILED_BAD_MANIFEST` or `INSTALL_FAILED_INVALID_URI`) by judging the file.
+  `base64 -d` on both personas wrote every byte above 0x7f as two UTF-8 bytes; it writes the bytes.
+  The connection's filesystem budget (196,608 bytes, shared by the base64 text and the decoded
+  file) still limits the APK to about 84,000 bytes.
+
 - **The configuration check no longer reports a loopback-only service as exposed** - on its
   first production run `deploy/config-check.sh` warned that the host's PostgreSQL on 5432 was
   "reachable from anywhere the network allows", and would have called it `DANGEROUS` behind an

@@ -19,13 +19,18 @@ use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
 use crate::fakefs::{FileKind, FsError};
 
 pub(super) fn register(r: &mut Registry) {
-    // The phone's toolbox has no recorded answer for these, and it answers "not found" today.
-    r.register_if("wc", ubuntu, HandlerId::Wc, FakeShell::cmd_wc);
-    r.register_if("od", ubuntu, HandlerId::Od, FakeShell::cmd_od);
-}
-
-fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {
-    shell.flavor == ShellFlavor::Bash
+    r.register_if(
+        "wc",
+        super::multicall::bare_applet,
+        HandlerId::Wc,
+        FakeShell::cmd_wc,
+    );
+    r.register_if(
+        "od",
+        super::multicall::bare_applet,
+        HandlerId::Od,
+        FakeShell::cmd_od,
+    );
 }
 
 /// The result of a line whose allowance ran out while a tool was reading.
@@ -232,11 +237,16 @@ impl FakeShell {
     /// `wc` for `-c -l -w -m` over standard input or files, with GNU's layout and the `total` row
     /// for several operands. `-L` and the long options with arguments are not modeled.
     pub(super) fn cmd_wc(&mut self, parts: &[&str]) -> CommandResult {
-        let plan = match parse_wc(parts.get(1..).unwrap_or(&[])) {
+        let mut plan = match parse_wc(parts.get(1..).unwrap_or(&[])) {
             Some(Ok(plan)) => plan,
             Some(Err(text)) => return CommandResult::stderr(1, text),
             None => return CommandResult::silent(0),
         };
+        let android = self.flavor == ShellFlavor::AndroidSh;
+        if android {
+            plan.bytes |= plan.chars;
+            plan.chars = false;
+        }
         let names: Vec<Option<&str>> = if plan.files.is_empty() {
             vec![None]
         } else {
@@ -274,7 +284,13 @@ impl FakeShell {
             }
             slots.push(slot);
         }
-        let width = wc_width(plan.selected(), &slots);
+        // Toybox's `show_lengths` joins the counts with single spaces, no padding, and `-m` and
+        // `-c` share one column (`lib/args.c` flags `m` as `c` too).
+        let width = if android {
+            1
+        } else {
+            wc_width(plan.selected(), &slots)
+        };
         let mut acc = CommandResult::silent(0);
         let mut failed = false;
         let mut total = Counts::default();

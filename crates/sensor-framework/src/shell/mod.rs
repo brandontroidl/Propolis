@@ -98,6 +98,8 @@ mod textproc;
 mod texttools;
 mod tftp;
 mod timing;
+mod toyopt;
+mod tr;
 mod trace;
 
 use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
@@ -414,6 +416,12 @@ pub struct FakeShell {
     assembled: std::collections::BTreeMap<String, loader::Assembled>,
     /// The command running right now wrote bytes the attacker typed (`echo`, `printf`).
     typed_output: bool,
+    /// The standard input of the command running right now is the typed output of the pipeline
+    /// stage before it.
+    piped_typed: bool,
+    /// What the last `base64 -d` decoded from typed input, so the file it lands in is noted as an
+    /// assembly of as many chunks as its source was.
+    decoded: Option<loader::Decoded>,
     /// What the current line found for the assembled-file capture, acted on once it has run.
     loader_line: loader::LineLoader,
     /// The current line as typed, sanitized and capped like `metadata.command`.
@@ -613,6 +621,8 @@ impl FakeShell {
             captures: None,
             assembled: std::collections::BTreeMap::new(),
             typed_output: false,
+            piped_typed: false,
+            decoded: None,
             loader_line: loader::LineLoader::default(),
             line_command: String::new(),
             timing: timing::Timing::default(),
@@ -673,6 +683,8 @@ impl FakeShell {
                 captures: self.captures.clone(),
                 assembled: self.assembled.clone(),
                 typed_output: self.typed_output,
+                piped_typed: self.piped_typed,
+                decoded: self.decoded.clone(),
                 loader_line: self.loader_line.clone(),
                 line_command: self.line_command.clone(),
                 timing: self.timing,
@@ -1252,7 +1264,10 @@ impl FakeShell {
         self.loop_depth = 0;
         self.busybox_depth = 0;
         self.typed_output = false;
+        self.piped_typed = false;
+        self.decoded = None;
         self.loader_line = loader::LineLoader::default();
+        self.import_assembled();
         self.refresh_clock_nodes();
     }
 
@@ -1364,6 +1379,13 @@ impl FakeShell {
             {
                 let seed = self.state().pid;
                 self.timing.process(seed);
+            }
+            // Toybox parses its own options before the applet runs, so its refusals come first.
+            if self.flavor == ShellFlavor::AndroidSh
+                && let Some(refusal) =
+                    toyopt::check(command_basename(parts[0]), parts.get(1..).unwrap_or(&[]))
+            {
+                return CommandResult::stderr(1, refusal);
             }
             return handler(self, parts);
         }

@@ -5,12 +5,16 @@
 //! here reads a file, starts a process or opens a socket. Only the Android shell has them; on bash
 //! they are "not found".
 //!
-//! No toybox or toolbox applet list was captured for this device. The bare listings are therefore
-//! not an AOSP list from memory: they are the names the persona's own `/system/bin` already
-//! advertises, split by who the persona's code already says provides them (`getprop` and `setprop`
-//! are toolbox commands, see `android.rs`; the other advertised utilities are toybox's). The test
-//! module reconciles both lists against the filesystem listing, so they cannot drift from it.
-//! Everything below the persona's own facts is marked `[unverified]`.
+//! No toybox or toolbox applet list was captured from a device. The bare listings are the names
+//! the persona's own `/system/bin` advertises, split by who provides them. The test module
+//! reconciles both lists against the filesystem listing, so they cannot drift from it.
+//!
+//! The persona announces Android 6.0.1, so the reference for what toybox links into `/system/bin`
+//! is toybox's `Android.mk` at tag `android-6.0.1_r81` (`ALL_TOOLS`), and for what its applets
+//! print `toys/*` of that tag, not a newer release. Two things in it differ from the lists below
+//! and are left as they are because they are not part of this change: that file also links
+//! `getprop`, `setprop` and `ifconfig` from toybox, where these lists give the first two and the
+//! third to toolbox. Everything below the persona's own facts and that source is `[unverified]`.
 #![deny(
     clippy::arithmetic_side_effects,
     clippy::unwrap_used,
@@ -35,10 +39,67 @@ fn android(shell: &FakeShell, _parts: &[&str]) -> bool {
 }
 
 /// The toybox-backed names of the advertised `/system/bin`.
-pub(super) const TOYBOX_APPLETS: [&str; 19] = [
-    "cat", "chmod", "date", "df", "du", "env", "find", "free", "hostname", "ls", "mount", "nc",
-    "netstat", "ping", "reboot", "route", "stat", "umount", "uptime",
+///
+/// The text, hashing and file tools a loader uses to check what it staged (`wc`, `md5sum`,
+/// `sha1sum`, `head`, `tail`, `cut`, `tr`, `od`, `which`, `id`, `mkdir`, `cp`, `mv`, `rm`,
+/// `sleep`) are in `ALL_TOOLS` of toybox's `Android.mk` at tag `android-6.0.1_r81`, which is what
+/// links them into `/system/bin`. `base64` and `sha256sum` are NOT there: that release compiles
+/// `base64` (reachable as `toybox base64`) but links neither, and has no `sha256sum` at all; both
+/// are linked from Android 7.0 and 8.0 on. They are listed anyway, deliberately, because the
+/// ADB bots this sensor exists to catch target devices that have them, and a phone that answers
+/// "not found" sends the loader away before it stages anything. `xxd` is linked from 7.0 as well
+/// and is left out; `dd` is a toolbox (NetBSD) tool on this release whose summary line is not
+/// modeled, so it stays "not found".
+pub(super) const TOYBOX_APPLETS: [&str; 36] = [
+    "base64",
+    "cat",
+    "chmod",
+    "cp",
+    "cut",
+    "date",
+    "df",
+    "du",
+    "env",
+    "find",
+    "free",
+    "head",
+    "hostname",
+    "id",
+    "ls",
+    "md5sum",
+    "mkdir",
+    "mount",
+    "mv",
+    "nc",
+    "netstat",
+    "od",
+    "ping",
+    "reboot",
+    "rm",
+    "route",
+    "sha1sum",
+    "sha256sum",
+    "sleep",
+    "stat",
+    "tail",
+    "tr",
+    "umount",
+    "uptime",
+    "wc",
+    "which",
 ];
+
+/// Whether the registry entry named by `parts[0]` exists on this shell: every Ubuntu tool, and on
+/// the phone the names [`TOYBOX_APPLETS`] lists. For the tools the two personas share a handler for.
+pub(super) fn bare_applet(shell: &FakeShell, parts: &[&str]) -> bool {
+    match shell.flavor {
+        ShellFlavor::Bash => true,
+        ShellFlavor::AndroidSh => parts
+            .first()
+            .map(|name| name.rsplit('/').next().unwrap_or(name))
+            .is_some_and(|name| TOYBOX_APPLETS.contains(&name)),
+    }
+}
 
 /// The toolbox-backed names of the advertised `/system/bin`. `ps`, `top` and `ifconfig` are
 /// toolbox's on Android 6 [unverified]; toybox took them over in a later release.

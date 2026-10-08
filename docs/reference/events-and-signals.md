@@ -179,6 +179,16 @@ The row carries `command` (the line that wrote the last chunk), `destination` (t
 |---|---|---|
 | `chunk_count` | integer | how many `echo`/`printf` writes built the file |
 
+A loader that sends the file as base64 text (`echo -n '<base64>' >> f.b64` per chunk, then
+`base64 -d f.b64 > f.dec`) builds two assemblies: the text, and the bytes it decodes to. The
+decode of a file an assembly left, or of standard input piped from `echo` or `printf`, is itself
+an assembly counting as many chunks as its input did, so the decoded file is submitted under the
+same rules: when it is made executable or run, when `pm install` is given it (Android shell), or
+when the session ends. Both are `echo_loader` rows, told apart by `sha256`; the decode's `command` is
+the `base64 -d` line. On ADB every `shell:<command>` is its own shell, so assemblies are shared
+across the shells of one connection
+(`crates/sensor-framework/src/shell/loader.rs#FakeShell::import_assembled`).
+
 The command event of every line that wrote a chunk carries two keys that link it to the capture
 (same `session_id`, `assembled_file` equal to the capture's `destination`), so the chunks can be
 read as one upload:

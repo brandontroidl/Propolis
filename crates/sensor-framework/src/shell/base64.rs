@@ -21,12 +21,13 @@ use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
 
 pub(super) fn register(r: &mut Registry) {
     // Not an applet of the captured BusyBox, so `busybox base64` answers "applet not found" on
-    // its own; only the Ubuntu coreutils binary exists.
-    r.register_if("base64", ubuntu, HandlerId::Base64, FakeShell::cmd_base64);
-}
-
-fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {
-    shell.flavor == ShellFlavor::Bash
+    // its own; the Ubuntu coreutils binary and the phone's toybox applet are the two that exist.
+    r.register_if(
+        "base64",
+        super::multicall::bare_applet,
+        HandlerId::Base64,
+        FakeShell::cmd_base64,
+    );
 }
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -266,7 +267,180 @@ fn decode(data: &[u8], ignore_garbage: bool) -> Decoded {
     decoded
 }
 
+// ---------------------------------------------------------------------------- toybox (Android)
+
+/// Bytes toybox's `do_base64` takes per `read`: its 4096-byte `toybuf` less the 128 it keeps for
+/// the alphabet. [unverified] against a device: the size of `toybuf` is read from `toys.h`.
+const TOYBOX_READ: usize = 3968;
+
+/// The `-d`, `-i` and `-w` of `base64 [-di] [-w COLUMNS] [FILE...]` in toybox 6.0.1
+/// (`toys/other/base64.c`). `toyopt` has already refused anything else.
+struct ToyboxPlan<'a> {
+    decode: bool,
+    ignore: bool,
+    columns: usize,
+    files: Vec<&'a str>,
+}
+
+fn parse_toybox<'a>(args: &[&'a str]) -> ToyboxPlan<'a> {
+    let mut plan = ToyboxPlan {
+        decode: false,
+        ignore: false,
+        columns: DEFAULT_WRAP,
+        files: Vec::new(),
+    };
+    let mut options = true;
+    let mut i = 0usize;
+    while let Some(&arg) = args.get(i) {
+        i = i.saturating_add(1);
+        if !options || arg == "-" || !arg.starts_with('-') {
+            plan.files.push(arg);
+        } else if arg == "--" {
+            options = false;
+        } else {
+            let cluster = arg.get(1..).unwrap_or("");
+            for (at, flag) in cluster.char_indices() {
+                match flag {
+                    'd' => plan.decode = true,
+                    'i' => plan.ignore = true,
+                    'w' => {
+                        let attached = cluster.get(at.saturating_add(1)..).unwrap_or("");
+                        let text = if attached.is_empty() {
+                            let next = args.get(i).copied().unwrap_or("");
+                            i = i.saturating_add(1);
+                            next
+                        } else {
+                            attached
+                        };
+                        plan.columns = text.parse().unwrap_or(DEFAULT_WRAP).max(1);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    plan
+}
+
+/// `do_base64` encoding, including the release's own line and padding bookkeeping: `x` counts the
+/// characters on the current line, the padding loop runs on it, and the final newline is written
+/// unless nothing was printed since the last line break.
+fn toybox_encode(data: &[u8], columns: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits, mut x) = (0u32, 0u32, 0usize);
+    let push = |out: &mut Vec<u8>, index: u32| {
+        let at = usize::try_from(index & 0x3f).unwrap_or(0);
+        out.push(ALPHABET.get(at).copied().unwrap_or(b'A'));
+    };
+    for &byte in data {
+        acc = (acc << 8) | u32::from(byte);
+        bits = bits.saturating_add(8);
+        while bits >= 6 {
+            bits = bits.saturating_sub(6);
+            push(&mut out, acc >> bits);
+            acc &= (1u32 << bits).saturating_sub(1);
+            x = x.saturating_add(1);
+            if columns == x {
+                out.push(b'\n');
+                x = 0;
+            }
+        }
+    }
+    if bits > 0 {
+        push(&mut out, acc << 6u32.saturating_sub(bits));
+        x = x.saturating_add(1);
+    }
+    loop {
+        let pad = x & 3 != 0;
+        x = x.saturating_add(1);
+        if !pad {
+            break;
+        }
+        out.push(b'=');
+    }
+    if x != 1 {
+        out.push(b'\n');
+    }
+    out
+}
+
+/// `do_base64` decoding: lenient. A `=` ends the decode at once; a byte outside the alphabet that
+/// is not a newline (or any byte, under `-i`) drops the rest of the `read` it arrived in and the
+/// decode carries on with the next one. Nothing is reported, and the status stays 0.
+fn toybox_decode(data: &[u8], ignore: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for read in data.chunks(TOYBOX_READ) {
+        for &byte in read {
+            if byte == b'=' {
+                return out;
+            }
+            if let Some(value) = sextet_value(byte) {
+                acc = (acc << 6) | value;
+                bits = bits.saturating_add(6);
+                if bits >= 8 {
+                    bits = bits.saturating_sub(8);
+                    out.push(u8::try_from((acc >> bits) & 0xff).unwrap_or(0));
+                    acc &= (1u32 << bits).saturating_sub(1);
+                }
+                continue;
+            }
+            if byte == b'\n' || ignore {
+                continue;
+            }
+            break;
+        }
+    }
+    out
+}
+
 impl FakeShell {
+    /// toybox's `base64`: each operand (standard input for none or `-`) encoded or decoded on its
+    /// own, a file it cannot open reported as `base64: NAME: No such file or directory` with the
+    /// rest still done and status 1. Bounded like the GNU path.
+    fn toybox_base64(&mut self, parts: &[&str]) -> CommandResult {
+        let plan = parse_toybox(parts.get(1..).unwrap_or(&[]));
+        let allowance = self.read_cap().min(self.line.remaining());
+        let room = if plan.decode {
+            allowance
+        } else {
+            allowance / 3
+        };
+        let names: Vec<Option<&str>> = if plan.files.is_empty() {
+            vec![None]
+        } else {
+            plan.files.iter().copied().map(Some).collect()
+        };
+        let mut acc = CommandResult::silent(0);
+        let mut failed = false;
+        for name in names {
+            let data = match self.read_source(parts, name, room) {
+                Ok(data) => data,
+                Err(error) => {
+                    failed = true;
+                    acc.append(CommandResult::stderr(
+                        1,
+                        format!("base64: {}: {}\n", name.unwrap_or("-"), errno_text(&error)),
+                    ));
+                    continue;
+                }
+            };
+            if !self.charge_work(len_u64(data.len())) {
+                return stopped();
+            }
+            if plan.decode {
+                let decoded = toybox_decode(&data, plan.ignore);
+                self.note_decoded(&data, matches!(name, None | Some("-")), &decoded);
+                acc.append(CommandResult::stdout(decoded));
+            } else {
+                acc.append(CommandResult::stdout(toybox_encode(&data, plan.columns)));
+            }
+        }
+        acc.status = u8::from(failed);
+        acc
+    }
+
     /// `base64` and `base64 -d` (with `-i`, `-w`) over standard input or one file, as GNU
     /// coreutils prints them. `--help` and `--version` are not modeled.
     ///
@@ -274,6 +448,9 @@ impl FakeShell {
     /// most three of output with a wrap width of one); an input longer than that is encoded up to
     /// that point.
     pub(super) fn cmd_base64(&mut self, parts: &[&str]) -> CommandResult {
+        if self.flavor == ShellFlavor::AndroidSh {
+            return self.toybox_base64(parts);
+        }
         let plan = match parse_base64(parts.get(1..).unwrap_or(&[])) {
             Parsed::Run(plan) => plan,
             Parsed::Fail(text) => return CommandResult::stderr(1, text),
@@ -305,9 +482,8 @@ impl FakeShell {
             return CommandResult::stdout(encode(&data, plan.wrap));
         }
         let decoded = decode(&data, plan.ignore_garbage);
-        // Output is text-based for now: a decoded byte is the character with its code point.
-        let text: String = decoded.bytes.iter().map(|&byte| char::from(byte)).collect();
-        let mut result = CommandResult::stdout(text);
+        self.note_decoded(&data, matches!(plan.file, None | Some("-")), &decoded.bytes);
+        let mut result = CommandResult::stdout(decoded.bytes);
         if decoded.invalid {
             result.append(CommandResult::stderr(1, "base64: invalid input\n"));
             result.status = 1;

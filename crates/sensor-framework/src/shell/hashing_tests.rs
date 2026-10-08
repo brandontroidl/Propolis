@@ -199,16 +199,49 @@ fn the_sums_are_busybox_applets_and_cksum_is_not() {
 }
 
 #[test]
-fn they_are_absent_on_the_phone() {
+fn only_cksum_is_absent_on_the_phone() {
     let mut phone = FakeShell::android(FakeFs::android(), ctx());
-    for name in ["sha256sum", "sha1sum", "md5sum", "cksum"] {
-        let (stdout, stderr, status) = answer(&mut phone, name);
-        assert_eq!(
-            (stdout.as_str(), stderr.as_str(), status),
-            ("", format!("sh: {name}: not found\n").as_str(), 127),
-            "{name}"
-        );
+    let (stdout, stderr, status) = answer(&mut phone, "cksum");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), status),
+        ("", "sh: cksum: not found\n", 127)
+    );
+    // The three sums are toybox applets (`sha256sum` linked past its release; see `multicall.rs`).
+    for name in ["sha256sum", "sha1sum", "md5sum"] {
+        assert_eq!(answer(&mut phone, name).2, 0, "{name}");
     }
+}
+
+/// Toybox prints the digest alone under `-b`, where GNU's `-b` changes nothing visible, and
+/// refuses every other option.
+#[test]
+fn the_phones_sums_take_only_dash_b() {
+    let mut phone = FakeShell::android(FakeFs::android(), ctx());
+    phone.handle_input("echo -n abc > /data/local/tmp/g");
+    assert_eq!(
+        out(&mut phone, "md5sum /data/local/tmp/g"),
+        format!("{ABC_MD5}  /data/local/tmp/g\n")
+    );
+    assert_eq!(
+        out(&mut phone, "md5sum -b /data/local/tmp/g"),
+        format!("{ABC_MD5}\n")
+    );
+    assert_eq!(
+        out(&mut phone, "sha1sum -b /data/local/tmp/g"),
+        format!("{ABC_SHA1}\n")
+    );
+    assert_eq!(
+        answer(&mut phone, "sha1sum -c /data/local/tmp/g"),
+        ("".into(), "sha1sum: Unknown option c\n".into(), 1)
+    );
+    assert_eq!(
+        answer(&mut phone, "md5sum /nope"),
+        (
+            "".into(),
+            "md5sum: /nope: No such file or directory\n".into(),
+            1
+        )
+    );
 }
 
 /// A probe that fingerprints a binary by its digest sees one answer in every session: the image

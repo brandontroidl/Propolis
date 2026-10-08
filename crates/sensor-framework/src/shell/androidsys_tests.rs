@@ -150,16 +150,96 @@ fn pm_path_agrees_with_the_listing() {
 #[test]
 fn pm_install_and_uninstall() {
     let mut sh = android();
-    assert_eq!(
-        answer(&mut sh, "pm install -r /data/local/tmp/a.apk"),
-        ("Success\n".into(), "".into(), 0)
-    );
     assert_eq!(out(&mut sh, "pm uninstall com.android.chrome"), "Success\n");
     assert_eq!(out(&mut sh, "pm uninstall no.such.pkg"), "Failure\n");
-    let (stdout, stderr, status) = answer(&mut sh, "pm install");
-    assert_eq!((stdout.as_str(), status), ("", 1));
-    assert!(stderr.starts_with("usage: pm"), "{stderr:?}");
     assert!(answer(&mut sh, "pm").1.starts_with("usage: pm"));
+}
+
+/// `pm install` as `Pm.runInstall` of Android 6.0.1 answers it: `\tpkg: PATH` on standard error
+/// first, then `Success`, or `Failure [REASON]` on standard error. The verdict comes from the file.
+#[test]
+fn pm_install_judges_the_file_it_is_given() {
+    let mut sh = android();
+    sh.handle_input("printf 'PK\\003\\004AndroidManifest.xml' > /data/local/tmp/ok.apk");
+    sh.handle_input("printf 'PK\\003\\004classes.dex' > /data/local/tmp/nomanifest.apk");
+    sh.handle_input("echo -n 'not a zip' > /data/local/tmp/junk.apk");
+    for (line, want) in [
+        (
+            "pm install -r /data/local/tmp/ok.apk",
+            ("Success\n", "\tpkg: /data/local/tmp/ok.apk\n", 0),
+        ),
+        (
+            "pm install /data/local/tmp/nomanifest.apk",
+            (
+                "",
+                "\tpkg: /data/local/tmp/nomanifest.apk\nFailure [INSTALL_PARSE_FAILED_BAD_MANIFEST]\n",
+                1,
+            ),
+        ),
+        (
+            "pm install /data/local/tmp/junk.apk",
+            (
+                "",
+                "\tpkg: /data/local/tmp/junk.apk\nFailure [INSTALL_PARSE_FAILED_NOT_APK]\n",
+                1,
+            ),
+        ),
+        (
+            "pm install /data/local/tmp/absent.apk",
+            (
+                "",
+                "\tpkg: /data/local/tmp/absent.apk\nFailure [INSTALL_FAILED_INVALID_URI]\n",
+                1,
+            ),
+        ),
+    ] {
+        let (stdout, stderr, status) = answer(&mut sh, line);
+        assert_eq!((stdout.as_str(), stderr.as_str(), status), want, "{line}");
+    }
+}
+
+/// The option handling of `Pm.runInstall`: `-rt` is `-r` with `t` as data nobody reads, a flag that
+/// takes a value reads it from the same word or the next, and anything else is refused.
+#[test]
+fn pm_install_parses_its_options_like_the_release() {
+    let mut sh = android();
+    sh.handle_input("printf 'PK\\003\\004AndroidManifest.xml' > /data/local/tmp/ok.apk");
+    for line in [
+        "pm install -rt /data/local/tmp/ok.apk",
+        "pm install -r -d -g -t -l -s -f /data/local/tmp/ok.apk",
+        "pm install -i com.example.store /data/local/tmp/ok.apk",
+        "pm install -icom.example.store /data/local/tmp/ok.apk",
+        "pm install --abi armeabi-v7a /data/local/tmp/ok.apk",
+        "pm install -- /data/local/tmp/ok.apk",
+    ] {
+        let (stdout, _, status) = answer(&mut sh, line);
+        assert_eq!((stdout.as_str(), status), ("Success\n", 0), "{line}");
+    }
+    assert_eq!(
+        answer(&mut sh, "pm install -x /data/local/tmp/ok.apk"),
+        ("".into(), "Error: Unknown option: -x\n".into(), 1)
+    );
+    assert_eq!(
+        answer(&mut sh, "pm install -i"),
+        ("".into(), "Error: no value specified for -i\n".into(), 1)
+    );
+    assert_eq!(
+        answer(&mut sh, "pm install"),
+        (
+            "".into(),
+            "\tpkg: null\nError: no package specified\n".into(),
+            1
+        )
+    );
+    // A second operand is the verification file, echoed the same way.
+    assert_eq!(
+        answer(
+            &mut sh,
+            "pm install /data/local/tmp/ok.apk /data/local/tmp/ok.apk"
+        )
+        .1,
+        "\tpkg: /data/local/tmp/ok.apk\n\tver: /data/local/tmp/ok.apk\n"
+    );
 }
 
 #[test]
@@ -366,10 +446,14 @@ fn the_handlers_never_reach_the_host() {
     // An argument that looks like something to run or fetch is only text.
     for line in [
         "am start -d http://203.0.113.9/payload.sh",
-        "pm install /data/local/tmp/payload.apk",
         "dumpsys $(echo evil)",
     ] {
         assert!(answer(&mut sh, line).1.is_empty(), "{line}");
     }
+    // `pm install` names the file and judges it, and only that: nothing it names is run.
+    assert_eq!(
+        answer(&mut sh, "pm install /data/local/tmp/payload.apk").1,
+        "\tpkg: /data/local/tmp/payload.apk\nFailure [INSTALL_FAILED_INVALID_URI]\n"
+    );
     assert_eq!(out(&mut sh, "pwd"), "/\n");
 }

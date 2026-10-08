@@ -31,12 +31,12 @@ pub(super) fn register(r: &mut Registry) {
         FakeShell::builtin_command,
     );
     r.register_builtin("type", HandlerId::Type, FakeShell::builtin_type);
-    // The phone has no `which` file, and it answers "not found" today.
-    r.register_if("which", ubuntu, HandlerId::Which, FakeShell::cmd_which);
-}
-
-fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {
-    shell.flavor == ShellFlavor::Bash
+    r.register_if(
+        "which",
+        super::multicall::bare_applet,
+        HandlerId::Which,
+        FakeShell::cmd_which,
+    );
 }
 
 /// The words the grammar reserves, which `type` calls keywords. They are parser syntax, not

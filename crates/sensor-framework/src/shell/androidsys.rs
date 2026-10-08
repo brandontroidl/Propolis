@@ -11,6 +11,10 @@
 //! the same bounded write path as `touch` and `cp`. Every list and output below is a fixed size, and
 //! the only attacker text echoed back is cut to [`ECHO_MAX`] characters.
 //!
+//! The exception is `pm install`, whose lines and options are `Pm.runInstall`'s at tag
+//! `android-6.0.1_r81`, and which judges the file it is given and hands an assembled one to the
+//! loader capture (see `loader.rs`).
+//!
 //! Persona-derived facts (`wm`'s panel size) match the Nexus 5 the persona presents. Only Android's
 //! shell has these commands; on bash they are "not found". Anything no capture backs is marked
 //! `[unverified]`; `getenforce`'s answer is the stock Android 6.0 default and is not.
@@ -22,7 +26,7 @@
 
 use super::registry::Registry;
 use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, budget_refusal_text};
-use crate::fakefs::FsError;
+use crate::fakefs::{FsError, READ_CAP};
 
 pub(super) fn register(r: &mut Registry) {
     r.register_if(
@@ -284,17 +288,7 @@ impl FakeShell {
                 Some(apk) => CommandResult::stdout(format!("package:{apk}\n")),
                 None => CommandResult::silent(1),
             },
-            (Some("install"), _) => {
-                let path = args
-                    .get(1..)
-                    .unwrap_or(&[])
-                    .iter()
-                    .find(|arg| !arg.starts_with('-'));
-                match path {
-                    Some(_) => CommandResult::stdout(PM_OK),
-                    None => CommandResult::stderr(1, PM_USAGE),
-                }
-            }
+            (Some("install"), _) => self.pm_install(args.get(1..).unwrap_or(&[])),
             (Some("uninstall"), _) => {
                 let name = args
                     .get(1..)
@@ -309,6 +303,88 @@ impl FakeShell {
             }
             _ => CommandResult::stderr(1, PM_USAGE),
         }
+    }
+
+    /// `pm install [-lrtsfdg] [-i INSTALLER] [--originating-uri URI] [--referrer URI] [--abi ABI]
+    /// [--user ID] PATH [VERIFICATION]`, ported from `Pm.runInstall` at tag `android-6.0.1_r81`:
+    /// `\tpkg: PATH` on standard error whatever follows, then `Success` (status 0) or `Failure
+    /// [REASON]` on standard error (status 1). The Streamed Install lines of newer releases are
+    /// `adb install` talking, not `pm`. Nothing is installed; the package list does not change.
+    ///
+    /// An APK that reaches `pm` is the attacker's own file, so it is also handed to the loader
+    /// capture, as it is when it is made executable or run: this is where a base64 loader's
+    /// decoded APK stops being a file in the staging directory and becomes the sample.
+    fn pm_install(&mut self, args: &[&str]) -> CommandResult {
+        let mut at = 0usize;
+        while let Some(&arg) = args.get(at).filter(|arg| arg.starts_with('-')) {
+            at = at.saturating_add(1);
+            if arg == "--" {
+                break;
+            }
+            // `nextOption` splits `-rt` into `-r` with `t` as its data; only a flag that takes a
+            // value ever reads that data.
+            let (option, attached) = match arg.get(..2).filter(|_| !arg.starts_with("--")) {
+                Some(short) if arg.len() > 2 => (short, arg.get(2..)),
+                _ => (arg, None),
+            };
+            let takes_value = matches!(
+                option,
+                "-i" | "--originating-uri" | "--referrer" | "--abi" | "--user"
+            );
+            if matches!(option, "-l" | "-r" | "-t" | "-s" | "-f" | "-d" | "-g") {
+                continue;
+            }
+            if !takes_value {
+                return CommandResult::stderr(
+                    1,
+                    format!("Error: Unknown option: {}\n", clip(option)),
+                );
+            }
+            let value = attached.or_else(|| {
+                let next = args.get(at).filter(|next| !next.starts_with('-'))?;
+                at = at.saturating_add(1);
+                Some(*next)
+            });
+            if value.is_none() {
+                let text = match option {
+                    "-i" => "Error: no value specified for -i\n",
+                    "--originating-uri" => "Error: must supply argument for --originating-uri\n",
+                    "--referrer" => "Error: must supply argument for --referrer\n",
+                    // `--abi` and `--user` would throw from the missing value; the stack trace is
+                    // not modeled.
+                    _ => return CommandResult::silent(1),
+                };
+                return CommandResult::stderr(1, text);
+            }
+        }
+        let package = args.get(at).copied();
+        let mut result = CommandResult::stderr(
+            0,
+            format!(
+                "\tpkg: {}\n",
+                package.map_or_else(|| "null".to_string(), clip)
+            ),
+        );
+        let Some(package) = package else {
+            result.append(CommandResult::stderr(1, "Error: no package specified\n"));
+            return result;
+        };
+        if let Some(verification) = args.get(at.saturating_add(1)) {
+            result.append(CommandResult::stderr(
+                0,
+                format!("\tver: {}\n", clip(verification)),
+            ));
+        }
+        let path = self.resolve_logical(package);
+        let body = self.fs.read_all(&path, READ_CAP).ok();
+        self.loader_trigger(&path);
+        match apk_failure(body.as_deref()) {
+            None => result.append(CommandResult::stdout(PM_OK)),
+            Some(reason) => {
+                result.append(CommandResult::stderr(1, format!("Failure [{reason}]\n")))
+            }
+        }
+        result
     }
 
     /// `am start ...` and `am broadcast ...` echo the intent they parsed and start nothing.
@@ -389,6 +465,33 @@ impl FakeShell {
             return CommandResult::silent(0);
         }
         CommandResult::stdout(LOGCAT)
+    }
+}
+
+/// The reason `pm install` gives for a file that is not an installable APK, or `None` for one that
+/// is. Only what the file shows is judged: a ZIP (`PK\x03\x04`) holding an `AndroidManifest.xml`
+/// entry installs, since nothing here parses the manifest or checks a signature.
+///
+/// The names are `PackageManager` constants. A file that is no ZIP is `INSTALL_PARSE_FAILED_NOT_APK`
+/// (`PackageParser.parseApkLite`, `Failed to parse`), a ZIP without the manifest is
+/// `INSTALL_PARSE_FAILED_BAD_MANIFEST` (`PackageParser`, `has no manifest`), and a path the
+/// package manager cannot open is `INSTALL_FAILED_INVALID_URI` [unverified]: the constant exists in
+/// `PackageManagerService`, but the missing-file path to it was not traced.
+fn apk_failure(body: Option<&[u8]>) -> Option<&'static str> {
+    const MANIFEST: &[u8] = b"AndroidManifest.xml";
+    let Some(body) = body else {
+        return Some("INSTALL_FAILED_INVALID_URI");
+    };
+    if !body.starts_with(b"PK\x03\x04") {
+        return Some("INSTALL_PARSE_FAILED_NOT_APK");
+    }
+    if body
+        .windows(MANIFEST.len())
+        .any(|window| window == MANIFEST)
+    {
+        None
+    } else {
+        Some("INSTALL_PARSE_FAILED_BAD_MANIFEST")
     }
 }
 

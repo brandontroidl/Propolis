@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 3567 test functions** (2246 unit + 1321 integration).
+- **Total: 3597 test functions** (2275 unit + 1322 integration).
 - **DB-backed (`sqlx::test`): 245** - console 179, core-scoring 35, review 10,
   intake 8, propolis 7, fleet 6. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -128,11 +128,11 @@ Per-crate breakdown:
 | propolis | 133 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
 | review | 142 | 80 | campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
-| sensor-adb | 61 | 43 | arrival, env_strict, integration |
+| sensor-adb | 61 | 44 | arrival, env_strict, integration |
 | sensor-catchall | 18 | 9 | arrival, env_strict, integration |
 | sensor-cred | 32 | 40 | arrival, env_strict, integration, tls_integration |
 | sensor-dns | 64 | 70 | arrival, env_strict, integration, tls |
-| sensor-framework | 1109 | 158 | arrival_coverage, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, listener_integration, shell_replay, spool_integration, tls_integration |
+| sensor-framework | 1138 | 158 | arrival_coverage, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, listener_integration, shell_replay, spool_integration, tls_integration |
 | sensor-ftp | 14 | 50 | arrival, env_strict, integration, tls_config |
 | sensor-http | 15 | 40 | arrival, env_strict, integration, tls |
 | sensor-mqtt | 65 | 55 | arrival, env_strict, integration, tls |
@@ -144,7 +144,7 @@ Per-crate breakdown:
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2246** | **1321** | |
+| **Total** | **2275** | **1322** | |
 
 ### Test styles by layer
 

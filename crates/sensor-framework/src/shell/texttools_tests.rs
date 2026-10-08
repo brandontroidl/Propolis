@@ -571,6 +571,81 @@ fn grep_f_reports_a_binary_match_instead_of_printing_the_bytes() {
     );
 }
 
+fn phone() -> FakeShell {
+    FakeShell::android(FakeFs::android(), ctx())
+}
+
+/// Toybox's `wc` (6.0.1, `toys/posix/wc.c`): counts joined by single spaces with no padding, the
+/// name after them only when an operand was given. `wc -c < f` is the bare number a loader reads.
+#[test]
+fn the_phones_wc_prints_unpadded_counts_and_a_name_only_for_an_operand() {
+    let mut sh = phone();
+    put(&mut sh, "/data/local/tmp/f", b"one two\nthree");
+    assert_eq!(
+        answer(&mut sh, "wc -c < /data/local/tmp/f"),
+        ("13\n".into(), "".into(), 0)
+    );
+    assert_eq!(
+        out(&mut sh, "wc -c /data/local/tmp/f"),
+        "13 /data/local/tmp/f\n"
+    );
+    assert_eq!(
+        out(&mut sh, "wc /data/local/tmp/f"),
+        "1 3 13 /data/local/tmp/f\n"
+    );
+    assert_eq!(out(&mut sh, "wc < /data/local/tmp/f"), "1 3 13\n");
+    assert_eq!(out(&mut sh, "wc -lw < /data/local/tmp/f"), "1 3\n");
+    // `-m` shares the byte column with `-c`, so naming both prints it once.
+    assert_eq!(out(&mut sh, "wc -mc < /data/local/tmp/f"), "13\n");
+    assert_eq!(
+        out(&mut sh, "wc -c /data/local/tmp/f /data/local/tmp/f"),
+        "13 /data/local/tmp/f\n13 /data/local/tmp/f\n26 total\n"
+    );
+    // The same call on Ubuntu pads to GNU's width.
+    let mut ubuntu = shell();
+    put(&mut ubuntu, "/tmp/f", b"one two\nthree");
+    assert_eq!(out(&mut ubuntu, "wc /tmp/f"), " 1  3 13 /tmp/f\n");
+}
+
+#[test]
+fn the_phones_wc_reports_a_missing_file_in_toyboxs_words_and_goes_on() {
+    let mut sh = phone();
+    sh.handle_input("echo -n abc > /data/local/tmp/f");
+    assert_eq!(
+        answer(&mut sh, "wc -c /nope /data/local/tmp/f"),
+        (
+            // `toys.optc > 1` prints the total row whether or not every operand opened.
+            "3 /data/local/tmp/f\n3 total\n".into(),
+            "wc: /nope: No such file or directory\n".into(),
+            1
+        )
+    );
+    assert_eq!(
+        answer(&mut sh, "wc -z"),
+        ("".into(), "wc: Unknown option z\n".into(), 1)
+    );
+    assert_eq!(
+        answer(&mut sh, "wc --bytes"),
+        ("".into(), "wc: Unknown option bytes\n".into(), 1)
+    );
+}
+
+#[test]
+fn the_phone_has_od_and_the_loaders_other_checkers() {
+    let mut sh = phone();
+    sh.handle_input("echo -n abc > /data/local/tmp/f");
+    for line in [
+        "od /data/local/tmp/f",
+        "head -n 1 /data/local/tmp/f",
+        "tail -n 1 /data/local/tmp/f",
+        "cut -c1 /data/local/tmp/f",
+        "which sh",
+        "id",
+    ] {
+        assert_eq!(answer(&mut sh, line).2, 0, "{line}");
+    }
+}
+
 #[test]
 fn the_text_tools_are_applets_of_the_modeled_busybox_and_absent_on_the_phone() {
     let mut sh = shell();
@@ -591,12 +666,11 @@ fn the_text_tools_are_applets_of_the_modeled_busybox_and_absent_on_the_phone() {
     }
 
     let mut phone = FakeShell::android(FakeFs::android(), ctx());
-    for name in ["wc", "grep", "od"] {
-        let (stdout, stderr, status) = answer(&mut phone, name);
-        assert_eq!(
-            (stdout.as_str(), stderr.as_str(), status),
-            ("", format!("sh: {name}: not found\n").as_str(), 127),
-            "{name}"
-        );
-    }
+    // `wc` and `od` are toybox applets on the phone; `grep` is compiled into toybox 6.0.1 but not
+    // linked into `/system/bin`.
+    let (stdout, stderr, status) = answer(&mut phone, "grep");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), status),
+        ("", "sh: grep: not found\n", 127)
+    );
 }

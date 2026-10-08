@@ -206,8 +206,144 @@ fn it_is_an_ubuntu_binary_and_not_a_busybox_applet() {
         answer(&mut sh, "busybox base64 /tmp/g"),
         ("".into(), "base64: applet not found\n".into(), 127)
     );
+    // The phone has toybox's applet, not BusyBox's.
     let mut phone = FakeShell::android(FakeFs::android(), ctx());
-    assert_eq!(answer(&mut phone, "base64 /etc/hostname").2, 127);
+    assert_eq!(
+        answer(&mut phone, "busybox base64 /system/build.prop").2,
+        127
+    );
+    assert_eq!(answer(&mut phone, "base64 /system/build.prop").2, 0);
+}
+
+fn phone() -> FakeShell {
+    FakeShell::android(FakeFs::android(), ctx())
+}
+
+/// Bytes a shell's filesystem holds at `path`.
+fn file(sh: &FakeShell, path: &str) -> Vec<u8> {
+    sh.fs.read_all(path, 1 << 20).unwrap()
+}
+
+/// A decoded byte above 0x7f is that byte, not the two UTF-8 bytes of its code point: an APK or an
+/// ELF is nothing but such bytes.
+#[test]
+fn decoded_binary_bytes_are_written_as_they_are() {
+    for (mut sh, dir) in [(shell(), "/tmp"), (phone(), "/data/local/tmp")] {
+        sh.handle_input(format!("printf '%s' '//6AAAEC' | base64 -d > {dir}/bin"));
+        assert_eq!(
+            file(&sh, &format!("{dir}/bin")),
+            [0xff, 0xfe, 0x80, 0x00, 0x01, 0x02]
+        );
+    }
+}
+
+#[test]
+fn toybox_encodes_like_gnu_until_the_padding_quirk() {
+    let mut sh = phone();
+    sh.handle_input("echo -n hi > /data/local/tmp/h");
+    assert_eq!(
+        answer(&mut sh, "base64 /data/local/tmp/h"),
+        ("aGk=\n".into(), "".into(), 0)
+    );
+    sh.handle_input("echo -n abc > /data/local/tmp/h3");
+    assert_eq!(out(&mut sh, "base64 /data/local/tmp/h3"), "YWJj\n");
+    sh.handle_input("echo -n '' > /data/local/tmp/e");
+    assert_eq!(out(&mut sh, "base64 /data/local/tmp/e"), "");
+    // A full 76-column line is followed by its newline once, not twice.
+    sh.handle_input(format!("echo -n {} > /data/local/tmp/b", "a".repeat(57)));
+    assert_eq!(
+        out(&mut sh, "base64 /data/local/tmp/b"),
+        format!("{}\n", "YWFh".repeat(19))
+    );
+}
+
+/// `do_base64` pads by the column it stopped at, not by the group of four, so a wrap width that is
+/// not a multiple of four pads a short last line to four: ported from the 6.0.1 source, not seen
+/// on a device.
+#[test]
+fn toybox_pads_by_the_column_it_stopped_at() {
+    let mut sh = phone();
+    sh.handle_input("echo -n hello > /data/local/tmp/h");
+    assert_eq!(
+        out(&mut sh, "base64 -w 5 /data/local/tmp/h"),
+        "aGVsb\nG8==\n"
+    );
+    assert_eq!(
+        out(&mut sh, "base64 -w 4 /data/local/tmp/h"),
+        "aGVs\nbG8=\n"
+    );
+}
+
+#[test]
+fn toybox_decodes_leniently_and_says_nothing() {
+    let mut sh = phone();
+    let mut decode = |text: &str, flags: &str| {
+        put(&mut sh, "/data/local/tmp/in", text.as_bytes());
+        answer(&mut sh, &format!("base64 {flags} /data/local/tmp/in"))
+    };
+    assert_eq!(decode("aGk=", "-d"), ("hi".into(), "".into(), 0));
+    // A newline is skipped; any other byte outside the alphabet ends the read it came in, with no
+    // complaint and status 0 (GNU reports `invalid input` and exits 1).
+    assert_eq!(decode("aG\nk=", "-d"), ("hi".into(), "".into(), 0));
+    assert_eq!(decode("aGk$QUJD", "-d"), ("hi".into(), "".into(), 0));
+    // `-i` drops the stray byte and carries on.
+    assert_eq!(decode("aG k=", "-d"), ("h".into(), "".into(), 0));
+    assert_eq!(decode("aG k=", "-di"), ("hi".into(), "".into(), 0));
+    // `=` ends the decode at once, whatever follows it.
+    assert_eq!(decode("aGk=QUJD", "-d"), ("hi".into(), "".into(), 0));
+    // Bits left over short of a byte are dropped.
+    assert_eq!(decode("aGk", "-d"), ("hi".into(), "".into(), 0));
+    assert_eq!(decode("a", "-d"), ("".into(), "".into(), 0));
+}
+
+/// A bad byte drops only the rest of the `read` it arrived in; the next read decodes on. A decode
+/// that stopped for good, or ignored the bad byte, would give a different answer here.
+#[test]
+fn toybox_loses_only_the_rest_of_the_read_a_bad_byte_arrived_in() {
+    let mut sh = phone();
+    // One full read of 3968 bytes opening with a bad byte, then the next read.
+    let text = format!("!{}aGk=", "A".repeat(3967));
+    put(&mut sh, "/data/local/tmp/in", text.as_bytes());
+    assert_eq!(
+        answer(&mut sh, "base64 -d /data/local/tmp/in"),
+        ("hi".into(), "".into(), 0)
+    );
+}
+
+#[test]
+fn toybox_refuses_options_it_does_not_have_in_its_own_words() {
+    let mut sh = phone();
+    for (line, want) in [
+        ("base64 --decode /x", "base64: Unknown option decode\n"),
+        ("base64 -z /x", "base64: Unknown option z\n"),
+        ("base64 -w", "base64: Missing argument to -w\n"),
+        ("base64 -w x /x", "base64: not integer: x\n"),
+        ("base64 -d -w 5 /x", "base64: No 'w' with 'd'\n"),
+    ] {
+        assert_eq!(answer(&mut sh, line), ("".into(), want.into(), 1), "{line}");
+    }
+    assert_eq!(
+        answer(&mut sh, "base64 -d /nope"),
+        (
+            "".into(),
+            "base64: /nope: No such file or directory\n".into(),
+            1
+        )
+    );
+}
+
+/// The decode of a file or pipe the attacker typed is itself a typed file; one that came from a
+/// system file is not.
+#[test]
+fn only_a_decode_of_typed_input_is_noted_as_an_assembly() {
+    let mut sh = phone();
+    sh.handle_input("echo -n 'aGk=' > /data/local/tmp/t");
+    sh.handle_input("base64 -d /data/local/tmp/t > /data/local/tmp/typed");
+    sh.handle_input("echo -n aGk= | base64 -d > /data/local/tmp/piped");
+    sh.handle_input("base64 /system/build.prop | base64 -d > /data/local/tmp/system");
+    assert!(sh.is_assembled("/data/local/tmp/typed"));
+    assert!(sh.is_assembled("/data/local/tmp/piped"));
+    assert!(!sh.is_assembled("/data/local/tmp/system"));
 }
 
 #[test]

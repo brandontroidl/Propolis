@@ -188,7 +188,9 @@ session wrote runs as itself whatever its name: `/tmp/w` is the attacker's file,
 `FakeFs::android()` is the same machinery over the phone's filesystem: `/system` (mounted
 read-only, so a write there is refused as on a real device), `/system/bin`,
 `/system/xbin/busybox`, `/data/local/tmp` and `/sdcard` (the two directories an ADB
-dropper writes to), `/default.prop`, `/system/build.prop` and an Android mount table.
+dropper writes to), `/default.prop`, `/system/build.prop` and an Android mount table. The phone
+is a rooted device, so files a shell writes belong to `root` and carry the session clock as their
+modification time, as `id` and the prompt say.
 
 The snapshot is **writable for the length of one session**: a bare redirection, a fetch
 that saves to a file, `cp`, `mkdir` and `rm` all change what the rest of that session
@@ -428,7 +430,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   '16/1 "%c"' -n 52 /bin/ls` print the recorded x86-64 header bytes, and a missing `./Runn` gets
   the active shell's not-found reply. The file the chunks built is captured as one
   `echo_loader` sample when it is made executable or run, or when the session ends if never run,
-  and each chunk's command event names it; see
+  and each chunk's command event names it (a base64 loader's decoded file is a second sample of the
+  same kind, also taken when the Android shell's `pm install` is given it); see
   [events-and-signals.md](events-and-signals.md#echo-loader-captures-and-their-keys). Running the
   assembled file executes nothing. When it is an ELF that holds an HTTP request line and its
   arguments are four octets and a port, the shell answers as that downloader does when its server
@@ -437,6 +440,37 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   other session-made file runs as an empty program (status 0). The stage-2 URL it would have
   requested is emitted as a `honeypot_file_download` marked `derived_from: echo_loader_args`, for
   the vetted fetcher only ([attack-surfaces.md](../security/attack-surfaces.md#malware-fetcher-attacker-directed-outbound)).
+- Base64 APK loaders on the Android shell (`crates/sensor-framework/src/shell/loader.rs`,
+  `crates/sensor-framework/src/shell/androidsys.rs#FakeShell::pm_install`). An ADB bot that stages an
+  APK as `echo -n '<base64>' >> f.b64` per chunk, checks `wc -c < f.b64`, decodes with
+  `base64 -d f.b64 > f.dec`, checks the size again and runs `pm install -r f.apk` used to be
+  answered `wc: not found` at the first size check, so it rebuilt the file from scratch for ever
+  and never decoded or installed anything. The phone now answers each step. The decoded bytes are
+  captured as an `echo_loader` sample (SHA-256 of the real APK bytes, not of the base64 text) when
+  `pm install` is given the file, or when it is made executable, or at the session's end; the
+  base64 text is a second sample at the end. `pm install` prints what `Pm.runInstall` of Android
+  6.0.1 prints: `\tpkg: PATH` on standard error, then `Success` on standard output, or `Failure
+  [INSTALL_PARSE_FAILED_NOT_APK]` (not a ZIP), `Failure [INSTALL_PARSE_FAILED_BAD_MANIFEST]` (a ZIP
+  with no `AndroidManifest.xml` entry) or `Failure [INSTALL_FAILED_INVALID_URI]` [inferred: the
+  constant exists, the missing-file path to it was not traced] (no such file). Nothing is
+  installed and the package list does not change. Every `shell:<command>` of one ADB connection
+  is a shell of its own over the connection's shared filesystem; the assemblies they build are
+  shared too, which is what lets chunks sent one command at a time add up
+  (`crates/sensor-framework/src/shell/loader.rs#FakeShell::import_assembled`). The connection's
+  filesystem budget (`owned_bytes` 196,608) holds the base64 text and the decoded file together,
+  so an APK past about 84,000 bytes is refused with `No space left on device` part way through.
+- Android toybox applets (`crates/sensor-framework/src/shell/multicall.rs#TOYBOX_APPLETS`). The
+  phone's `/system/bin` links the tools a loader checks its staged file with: `wc`, `base64`,
+  `md5sum`, `sha1sum`, `sha256sum`, `head`, `tail`, `cut`, `tr`, `od`, `which`, `id`, `mkdir`, `cp`,
+  `mv`, `rm`, `sleep` (and the ones it had). Their options, operand counts and error lines follow
+  toybox 6.0.1's own parser (`crates/sensor-framework/src/shell/toyopt.rs`): an unknown option is
+  `wc: Unknown option z`, `base64 --decode` is `base64: Unknown option decode`, a missing operand is
+  `which: Needs 1 argument`. `wc` joins its counts with single spaces and names the file only when
+  an operand was given, so `wc -c < f` is the bare number. `base64 -d` is toybox's lenient decoder:
+  a stray byte drops the rest of that read and the status stays 0, and `=` ends the decode. The
+  names and the source of each applet's presence are in the module doc of `multicall.rs`:
+  `base64` and `sha256sum` are linked here although that release links neither, and `xxd`, `dd`,
+  `settings` and `monkey` are not offered.
 
 ### Command-event budget (ssh, telnet, adb)
 

@@ -101,14 +101,36 @@ fn an_unknown_applet_gets_each_binarys_not_found_form() {
     );
     // A name the shell models only for the Ubuntu persona is not an applet on the phone.
     assert_eq!(
-        answer(&mut sh, "toybox head -n1 /system/build.prop").1,
-        "toybox: Unknown command head\n"
+        answer(&mut sh, "toybox more /default.prop").1,
+        "toybox: Unknown command more\n"
     );
 }
 
 #[test]
 fn a_listed_applet_without_a_model_succeeds_silently() {
     let mut sh = android();
+    // The tools a loader checks its staged file with are modeled and refuse a bare call the way
+    // the real ones do (`cp` wants two operands), so only the older, unmodeled names are held to
+    // a silent success.
+    let loader_tools = [
+        "base64",
+        "cp",
+        "cut",
+        "head",
+        "id",
+        "md5sum",
+        "mkdir",
+        "mv",
+        "od",
+        "rm",
+        "sha1sum",
+        "sha256sum",
+        "sleep",
+        "tail",
+        "tr",
+        "wc",
+        "which",
+    ];
     for name in TOYBOX_APPLETS {
         // `stat` and `nc` are modeled and, like the real ones, refuse to run with no operand.
         let operand = match name {
@@ -121,7 +143,9 @@ fn a_listed_applet_without_a_model_succeeds_silently() {
             !stderr.contains("Unknown command"),
             "`toybox {name}` contradicts the listing: {stderr:?}"
         );
-        assert_eq!(status, 0, "toybox {name}");
+        if !loader_tools.contains(&name) {
+            assert_eq!(status, 0, "toybox {name}");
+        }
         let _ = stdout;
     }
     for name in TOOLBOX_APPLETS {
@@ -143,7 +167,7 @@ fn a_bare_binary_lists_the_advertised_applets() {
     assert_eq!((err.as_str(), status), ("", 0));
     assert_eq!(
         toybox,
-        "cat\nchmod\ndate\ndf\ndu\nenv\nfind\nfree\nhostname\nls\nmount\nnc\nnetstat\nping\nreboot\nroute\nstat\numount\nuptime\n"
+        "base64\ncat\nchmod\ncp\ncut\ndate\ndf\ndu\nenv\nfind\nfree\nhead\nhostname\nid\nls\nmd5sum\nmkdir\nmount\nmv\nnc\nnetstat\nod\nping\nreboot\nrm\nroute\nsha1sum\nsha256sum\nsleep\nstat\ntail\ntr\numount\nuptime\nwc\nwhich\n"
     );
     assert_eq!(
         answer(&mut sh, "toolbox"),

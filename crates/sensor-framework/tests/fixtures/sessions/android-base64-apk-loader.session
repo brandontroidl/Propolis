@@ -1,0 +1,43 @@
+# The base64 APK loader an ADB bot runs, rebuilt around a synthetic 57-byte ZIP (a manifest entry
+# name and filler, no real package). The replies are toybox 6.0.1's and `Pm.runInstall`'s, read from
+# their sources at tag android-6.0.1_r81 and not checked against a device; `base64` and
+# `sha256sum` answer where that release links neither (see `shell/multicall.rs`).
+# source: synthetic reproduction of an ADB base64 APK chunk loader seen 2026-10-07
+# date: 2026-10-08
+# protocol: adb
+# persona: android
+$ rm -f '/data/local/tmp/probe.apk.b64' '/data/local/tmp/probe.apk.dec' '/data/local/tmp/probe.apk'
+@events 1
+$ echo -n 'UEsDBEFuZHJvaWRNYW5pZmVzdC54' >> '/data/local/tmp/probe.apk.b64'
+@events 1
+$ echo -n 'bWyA/wABc3ludGhldGljLXRlc3Qt' >> '/data/local/tmp/probe.apk.b64'
+@events 1
+$ echo -n 'Ym9keS0wMTIzNDU2Nzg5' >> '/data/local/tmp/probe.apk.b64'
+@events 1
+$ wc -c < '/data/local/tmp/probe.apk.b64'
+> 76
+@events 1
+$ base64 -d '/data/local/tmp/probe.apk.b64' > '/data/local/tmp/probe.apk.dec'
+@events 1
+$ wc -c < '/data/local/tmp/probe.apk.dec'
+> 57
+@events 1
+$ mv '/data/local/tmp/probe.apk.dec' '/data/local/tmp/probe.apk'
+@events 1
+$ pm install -r '/data/local/tmp/probe.apk'
+>e \tpkg: /data/local/tmp/probe.apk
+> Success
+@events 1
+$ ls -l /data/local/tmp/probe.apk
+> -rw-r--r-- 1 root root 57 2026-09-29 12:00 /data/local/tmp/probe.apk
+@events 1
+$ echo -n 'not an apk' > '/data/local/tmp/junk.apk'
+@events 1
+$ pm install -r '/data/local/tmp/junk.apk'
+>e \tpkg: /data/local/tmp/junk.apk
+> Failure [INSTALL_PARSE_FAILED_NOT_APK]
+@events 1
+$ pm install -r '/data/local/tmp/absent.apk'
+>e \tpkg: /data/local/tmp/absent.apk
+> Failure [INSTALL_FAILED_INVALID_URI]
+@events 1

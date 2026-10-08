@@ -1751,3 +1751,162 @@ async fn an_adb_push_and_a_later_shell_write_share_one_owned_bytes_budget() {
     );
     srv.handle.abort();
 }
+
+/// Run `command` as its own `shell:<command>` stream on `conn`, as `adb shell COMMAND` does, and
+/// return everything it printed up to the stream's CLSE.
+async fn exec(conn: &mut TcpStream, local_id: u32, command: &str) -> String {
+    conn.write_all(&adb_proto::build_open(
+        local_id,
+        &format!("shell:{command}"),
+    ))
+    .await
+    .unwrap();
+    let (okay, _) = read_message(conn).await;
+    assert_eq!(okay.command, adb_proto::A_OKAY, "{command}");
+    let server_id = okay.arg0;
+    let mut output = Vec::new();
+    loop {
+        let (message, data) = read_message(conn).await;
+        match message.command {
+            adb_proto::A_WRTE => {
+                output.extend_from_slice(&data);
+                conn.write_all(&adb_proto::build_okay(local_id, server_id))
+                    .await
+                    .unwrap();
+            }
+            adb_proto::A_CLSE => break,
+            other => panic!("{command}: unexpected message {other:#x}"),
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+/// Standard base64, written here without the sensor's own code so the expected text and the
+/// decoded sample are not checked against the thing under test.
+fn base64_text(data: &[u8]) -> String {
+    const SYMBOLS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::new();
+    for group in data.chunks(3) {
+        let [a, b, c] = [0usize, 1, 2].map(|i| u32::from(group.get(i).copied().unwrap_or(0)));
+        let word = (a << 16) | (b << 8) | c;
+        for (i, shift) in [18u32, 12, 6, 0].into_iter().enumerate() {
+            text.push(if i <= group.len() {
+                char::from(SYMBOLS[((word >> shift) & 63) as usize])
+            } else {
+                '='
+            });
+        }
+    }
+    text
+}
+
+/// The loop an ADB bot was stuck in: it appends a base64 APK to a file in `echo -n` chunks, asks
+/// `wc -c` how big the file is, and on an error rebuilds from scratch for ever. Driven over one
+/// connection with every command its own exec stream, the way the bot sends them: no command may
+/// answer `not found`, the decode and its size must come out right, `pm install` must answer as a
+/// device does, and the decoded APK must be captured once, with the SHA-256 of its real bytes,
+/// however many times the bot repeats the round.
+#[tokio::test]
+async fn a_base64_apk_loader_over_exec_streams_reaches_install_and_is_captured_decoded() {
+    use sha2::{Digest, Sha256};
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+
+    // A small ZIP with the manifest entry's name and bytes past 0x7f. Built here; not a package.
+    let mut apk = b"PK\x03\x04AndroidManifest.xml".to_vec();
+    apk.extend((0..=255u8).cycle().take(300));
+    let text = base64_text(&apk);
+    let (b64, dec, installed) = (
+        "/data/local/tmp/probe.apk.b64",
+        "/data/local/tmp/probe.apk.dec",
+        "/data/local/tmp/probe.apk",
+    );
+    let chunks: Vec<&str> = text
+        .as_bytes()
+        .chunks(100)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect();
+
+    let mut stream_id = 0u32;
+    let mut run = |command: String| {
+        stream_id += 1;
+        (stream_id, command)
+    };
+    for round in 0..2 {
+        let mut transcript = Vec::new();
+        for command in [format!("rm -f '{b64}' '{dec}' '{installed}'")]
+            .into_iter()
+            .chain(
+                chunks
+                    .iter()
+                    .map(|chunk| format!("echo -n '{chunk}' >> '{b64}'")),
+            )
+            .chain([
+                format!("wc -c < '{b64}'"),
+                "ls -l /data/local/tmp/".to_string(),
+                format!("base64 -d '{b64}' > '{dec}'"),
+                format!("wc -c < '{dec}'"),
+                format!("mv '{dec}' '{installed}'"),
+                format!("pm install -r '{installed}'"),
+            ])
+        {
+            let (id, command) = run(command);
+            let printed = exec(&mut conn, id, &command).await;
+            transcript.push((command, printed));
+        }
+        for (command, printed) in &transcript {
+            assert!(
+                !printed.contains("not found"),
+                "round {round}: `{command}` answered {printed:?}"
+            );
+        }
+        let reply = |prefix: &str| {
+            transcript
+                .iter()
+                .find(|(command, _)| command.starts_with(prefix))
+                .map(|(_, printed)| printed.as_str())
+                .unwrap()
+        };
+        assert_eq!(
+            reply("wc -c < '/data/local/tmp/probe.apk.b64'"),
+            format!("{}\r\n", text.len())
+        );
+        assert_eq!(
+            reply("wc -c < '/data/local/tmp/probe.apk.dec'"),
+            format!("{}\r\n", apk.len())
+        );
+        let listing = reply("ls -l");
+        assert!(listing.contains("probe.apk.b64"), "{listing:?}");
+        let install = reply("pm install");
+        assert!(install.contains("Success"), "round {round}: {install:?}");
+    }
+
+    drop(conn);
+    // The decoded APK and the base64 text it was built from, taken once each whatever the rounds.
+    let expected: String = Sha256::digest(&apk)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let uploads = uploads(&srv, 2).await;
+    let decoded: Vec<_> = uploads
+        .iter()
+        .filter(|e| e.metadata["sha256"] == expected.as_str())
+        .collect();
+    assert_eq!(decoded.len(), 1, "the decoded APK, once: {uploads:?}");
+    let meta = &decoded[0].metadata;
+    assert_eq!(meta["capture_reason"], "echo_loader");
+    assert_eq!(meta["size"], apk.len());
+    assert_eq!(meta["chunk_count"], chunks.len());
+    assert_eq!(meta["destination"], installed);
+    assert_eq!(meta["end_reason"], "transfer_complete");
+    assert!(!decoded[0].authenticated);
+    let spooled = spooled_files(&srv.spool_dir);
+    assert!(
+        spooled.iter().any(|path| path
+            .file_name()
+            .is_some_and(|name| name == expected.as_str())),
+        "the decoded bytes are in the quarantine spool: {spooled:?}"
+    );
+    srv.handle.abort();
+}

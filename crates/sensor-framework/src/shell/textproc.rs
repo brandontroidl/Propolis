@@ -20,7 +20,12 @@ use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
 use crate::fakefs::{FsError, READ_CAP};
 
 pub(super) fn register(r: &mut Registry) {
-    r.register_if("cut", ubuntu, HandlerId::Cut, FakeShell::cmd_cut);
+    r.register_if(
+        "cut",
+        super::multicall::bare_applet,
+        HandlerId::Cut,
+        FakeShell::cmd_cut,
+    );
     r.register_if("tee", ubuntu, HandlerId::Tee, FakeShell::cmd_tee);
 }
 

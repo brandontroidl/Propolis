@@ -737,6 +737,7 @@ impl FakeShell {
         self.trace_open(&[], ParseNode::Pipeline, HandlerId::Compound);
         let mut acc = CommandResult::silent(0);
         let mut carried: Option<Vec<u8>> = None;
+        let mut carried_typed = false;
         let count = pipeline.stages.len();
         for (index, stage) in pipeline.stages.iter().enumerate() {
             let last = index.saturating_add(1) == count;
@@ -748,7 +749,14 @@ impl FakeShell {
             let stdin = carried.take().map(Stdin::data);
             let saved = stdin.map(|s| std::mem::replace(&mut self.stdin, s));
             self.script_depth = self.script_depth.saturating_add(1);
+            // Whether this stage's input is typed output of the one before it, and whether its own
+            // output is, are what let `echo B64 | base64 -d > f` be seen as an assembly.
+            let outer_typed = std::mem::take(&mut self.typed_output);
+            self.piped_typed = std::mem::take(&mut carried_typed);
             let mut ran = self.eval_command(stage);
+            self.piped_typed = false;
+            carried_typed = std::mem::replace(&mut self.typed_output, outer_typed);
+            self.typed_output |= carried_typed;
             self.script_depth = self.script_depth.saturating_sub(1);
             if let Some(previous) = saved {
                 self.stdin = previous;

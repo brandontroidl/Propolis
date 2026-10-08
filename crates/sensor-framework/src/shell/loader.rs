@@ -53,6 +53,13 @@ pub(super) struct Assembled {
     command: String,
 }
 
+/// The bytes a `base64 -d` decoded from typed input, and how many typed writes built that input.
+#[derive(Clone, Debug)]
+pub(super) struct Decoded {
+    sha256: [u8; 32],
+    chunks: u32,
+}
+
 /// What one line found for the capture, acted on by [`FakeShell::flush_loader`] once the line
 /// has run, so a line run only to learn whether it waits for input leaves nothing behind.
 #[derive(Clone, Debug, Default)]
@@ -80,6 +87,12 @@ impl FakeShell {
         self
     }
 
+    /// Whether the file at `path` is one this shell is tracking as an assembly of typed bytes.
+    #[cfg(test)]
+    pub(super) fn is_assembled(&self, path: &str) -> bool {
+        self.assembled.contains_key(path)
+    }
+
     /// The running command wrote `out`, bytes the attacker typed, to its standard output.
     pub(super) fn note_typed_output(&mut self, out: &[u8]) {
         if !out.is_empty() {
@@ -87,13 +100,61 @@ impl FakeShell {
         }
     }
 
+    /// `decoded` is what a `base64 -d` just made from `input`, which the attacker typed when it is
+    /// piped from typed output or is a file an assembly of this session left. The decode is noted
+    /// so the file it lands in counts as many chunks as its source did.
+    pub(super) fn note_decoded(&mut self, input: &[u8], from_pipe: bool, decoded: &[u8]) {
+        let chunks = if from_pipe && self.piped_typed {
+            Some(1)
+        } else {
+            let sha256 = digest(input);
+            self.assembled
+                .values()
+                .find(|known| known.sha256 == sha256)
+                .map(|known| known.chunks)
+        };
+        if let Some(chunks) = chunks {
+            self.note_typed_output(decoded);
+            self.decoded = Some(Decoded {
+                sha256: digest(decoded),
+                chunks,
+            });
+        }
+    }
+
+    /// Pick up the assemblies other shells of this session left, so a loader that runs each
+    /// command as its own `shell:<command>` stream (`adb shell CMD`) builds one file across them.
+    /// A path this shell already knows keeps its own, newer, record.
+    pub(super) fn import_assembled(&mut self) {
+        let Some(captures) = &self.captures else {
+            return;
+        };
+        for file in captures.tracked_assembled() {
+            if self.assembled.len() >= MAX_ASSEMBLED {
+                break;
+            }
+            self.assembled
+                .entry(file.path.clone())
+                .or_insert(Assembled {
+                    sha256: file.sha256,
+                    len: file.len,
+                    chunks: file.chunk_count,
+                    command: file.command,
+                });
+        }
+    }
+
     /// Typed bytes reached the file `path`: it held `prior` before the write and `content` after.
-    /// A write to an empty file starts an assembly; one appended to an assembly as its last chunk
+    /// A write to an empty file starts an assembly (of as many chunks as the input of a decode
+    /// that made `content` was); one appended to an assembly as its last chunk
     /// left it adds a chunk. Appending to anything else (a system file, an assembly something
     /// else has changed since) is not one: what the file holds is not all the attacker's.
     pub(super) fn note_typed_write(&mut self, path: &str, prior: &[u8], content: &[u8]) {
         let chunks = if prior.is_empty() {
-            1
+            self.decoded
+                .as_ref()
+                .filter(|decoded| decoded.sha256 == digest(content))
+                .map_or(1, |decoded| decoded.chunks)
         } else {
             match self.assembled.get(path) {
                 Some(known)
@@ -238,6 +299,7 @@ impl FakeShell {
                 .map(|(path, known)| TrackedFile {
                     path: path.clone(),
                     sha256: known.sha256,
+                    len: known.len,
                     chunk_count: known.chunks,
                     command: known.command.clone(),
                 })

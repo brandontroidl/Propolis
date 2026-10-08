@@ -23,7 +23,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use sensor_framework::{CaptureEnd, Uuid, sanitize_value};
+use sensor_framework::{CaptureEnd, Uuid, sanitize_value, session_end_metadata};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
     SIGNAL_HONEYPOT_SESSION_END, SensorEvent, WIRE_VERSION,
@@ -144,12 +144,8 @@ impl AuthState {
         client_version: Option<&str>,
         elapsed: Duration,
     ) -> SensorEvent {
-        let mut metadata = serde_json::json!({
-            "protocol_label": "ssh",
-            "end_reason": end.label(),
-            "phase": phase,
-            "duration_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-        });
+        let mut metadata = session_end_metadata("ssh", end, elapsed);
+        metadata["phase"] = serde_json::Value::String(phase.to_owned());
         if let Some(version) = client_version {
             metadata["client_version"] =
                 serde_json::Value::String(sanitize_value(version, MAX_METADATA_STRING_LEN));

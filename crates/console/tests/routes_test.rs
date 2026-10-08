@@ -25,7 +25,7 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use console::auth::{self, PasswordStore, RateLimiter, SessionStore};
-use console::log_buffer::LogEntry;
+use console::log_buffer::{LogEntry, LogField};
 use console::{AppState, routes};
 use core_scoring::{EventInput, Protocol, SignalType, append_event};
 use futures::StreamExt;
@@ -90,6 +90,7 @@ fn test_state_full(
         trusted_proxy: false,
         metrics_token: None,
         gave_up_subsystems: console::no_subsystem_health(),
+        intake_lag: console::intake_lag::no_intake_lag(),
     }
 }
 
@@ -3834,7 +3835,7 @@ async fn feed_page_reads_manifest_correctly(pool: PgPool) {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("manifest.json"),
-        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":3,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":11,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}}}"#,
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":3,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":11,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}},"windows":[{"label":"7d","count":2,"sha256":"f00d","valid_until":"2026-08-05T14:00:00Z"}]}"#,
     )
     .unwrap();
 
@@ -3852,8 +3853,9 @@ async fn feed_page_reads_manifest_correctly(pool: PgPool) {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
+    // Manifest times render in the console's own "YYYY-MM-DD HH:MM UTC" form, never raw RFC 3339.
     assert!(
-        body.contains("2026-07-29T14:00:00Z"),
+        body.contains("2026-07-29 14:00 UTC"),
         "missing build time: {body}"
     );
     assert!(
@@ -3865,8 +3867,16 @@ async fn feed_page_reads_manifest_correctly(pool: PgPool) {
         "missing standard count: {body}"
     );
     assert!(
-        body.contains("2026-07-30T14:00:00Z"),
-        "missing aggressive valid_until: {body}"
+        body.contains("2026-07-30 14:00 UTC") && body.contains("2026-07-31 14:00 UTC"),
+        "missing tier valid_until: {body}"
+    );
+    assert!(
+        body.contains("2026-08-05 14:00 UTC"),
+        "missing retention window valid_until: {body}"
+    );
+    assert!(
+        !body.contains("T14:00:00Z"),
+        "a raw RFC 3339 manifest time reached the page: {body}"
     );
     // A manifest from before the exclusions field existed still parses (serde default) and renders
     // ASN suppression as off rather than collapsing the page.
@@ -4511,6 +4521,50 @@ async fn metrics_omits_feed_entries_when_unconfigured(pool: PgPool) {
     assert!(!body.contains("propolis_feed_entries"));
 }
 
+/// A lagging telnet log as the daemon would report it: 6.6 GB unread, the last appended event 11
+/// days old, its events carrying the sensor name `telnet`.
+fn telnet_eleven_days_behind() -> console::intake_lag::IntakeLagSource {
+    Arc::new(|| {
+        vec![console::intake_lag::IntakeLag {
+            log: "telnet".into(),
+            sensors: vec!["telnet".into()],
+            bytes_behind: 6_600_000_000,
+            oldest_unread_age: Some(std::time::Duration::from_secs(11 * 86_400 + 60)),
+            behind: true,
+        }]
+    })
+}
+
+/// `/metrics` publishes whatever backlog the daemon hands `AppState`, and a process that tails
+/// nothing publishes no lag series at all rather than a reassuring zero.
+#[sqlx::test(migrations = false)]
+async fn metrics_publish_the_intake_backlog_the_daemon_reports(pool: PgPool) {
+    migrate(&pool).await;
+    let mut state = test_state(pool.clone());
+    state.intake_lag = telnet_eleven_days_behind();
+    let body = body_text(
+        test_app(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(body.contains("propolis_intake_bytes_behind{sensor=\"telnet\"} 6600000000\n"));
+    assert!(body.contains("propolis_intake_oldest_unread_age_seconds{sensor=\"telnet\"} 950460\n"));
+
+    let standalone = body_text(
+        test_app(test_state(pool))
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !standalone.contains("propolis_intake_"),
+        "nothing measured must mean no series: {standalone}"
+    );
+}
+
 // --- logs ---
 
 #[sqlx::test(migrations = false)]
@@ -4522,6 +4576,7 @@ async fn logs_page_renders_snapshot_with_level_based_markup(pool: PgPool) {
         level: "ERROR".to_string(),
         target: "propolis::intake".to_string(),
         message: "<script>alert(1)</script>".to_string(),
+        fields: Vec::new(),
     });
     let (_, cookie) = state.sessions.create();
     let app = test_app(state);
@@ -4602,6 +4657,10 @@ async fn logs_stream_is_sse_and_broadcasts_pushed_entries(pool: PgPool) {
         level: "WARN".to_string(),
         target: "propolis::review".to_string(),
         message: "queue scan degraded".to_string(),
+        fields: vec![LogField {
+            key: "reason".to_string(),
+            value: "statement timeout".to_string(),
+        }],
     });
 
     let mut body = response.into_body().into_data_stream();
@@ -4623,6 +4682,12 @@ async fn logs_stream_is_sse_and_broadcasts_pushed_entries(pool: PgPool) {
     assert!(
         text.contains(r#""message":"queue scan degraded""#),
         "expected the pushed entry's message in the SSE frame: {text}"
+    );
+    // The live stream carries the structured fields too, or a live line would lose what the
+    // page's first render shows.
+    assert!(
+        text.contains(r#""fields":[{"key":"reason","value":"statement timeout"}]"#),
+        "expected the pushed entry's fields in the SSE frame: {text}"
     );
 }
 
@@ -5031,6 +5096,33 @@ async fn insert_probe(
     .execute(pool)
     .await
     .unwrap();
+}
+
+/// The incident's view: telnet's log is days behind, so its listener row says how far, and the
+/// caught-up ssh row says nothing.
+#[sqlx::test(migrations = false)]
+async fn fleet_marks_the_listener_rows_of_a_lagging_log_with_its_backlog(pool: PgPool) {
+    migrate(&pool).await;
+    let mut state = test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("telnet", fleet::Proto::Tcp, 23),
+        ],
+        None,
+    );
+    state.intake_lag = telnet_eleven_days_behind();
+    let body = fleet_body(state).await;
+    let table = listener_table(&body);
+    assert!(
+        listener_row(table, "tcp/23").contains("behind: 6.6 GB &#x2f; 11 d"),
+        "{table}"
+    );
+    assert!(
+        !listener_row(table, "tcp/22").contains("behind:"),
+        "{table}"
+    );
 }
 
 #[sqlx::test(migrations = false)]
@@ -7107,4 +7199,696 @@ async fn assets_are_served_with_their_type_and_revalidated_by_etag(pool: PgPool)
         .await
         .unwrap();
     assert_eq!(nested.status(), StatusCode::NOT_FOUND);
+}
+
+// --- console polish: folding, paging, log fields, queue context ---
+
+/// Renders `uri` for a logged-in operator and returns the status and body.
+async fn get_page(state: AppState, uri: &str) -> (StatusCode, String) {
+    let (_, cookie) = state.sessions.create();
+    let response = test_app(state)
+        .oneshot(get_request(
+            uri,
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_text(response).await)
+}
+
+/// `n` seconds before now, as the RFC 3339 text the event fixtures take.
+fn secs_ago(n: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::seconds(n)).to_rfc3339()
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_labels_the_transport_as_an_acronym(pool: PgPool) {
+    migrate(&pool).await;
+    let sid = Uuid::now_v7();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.150",
+            "telnet",
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            &secs_ago(60),
+            serde_json::json!({ "command": "uname -a" }),
+            sid,
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.150",
+            "tftp",
+            SignalType::HoneypotConnection,
+            Protocol::Udp,
+            false,
+            &secs_ago(30),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = get_page(test_state(pool), "/ip/203.0.113.150").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Telnet / TCP"), "session header: {body}");
+    assert!(body.contains("<td>UDP</td>"), "ungrouped row: {body}");
+    assert!(
+        !body.contains("Tcp") && !body.contains("Udp"),
+        "a Rust enum name reached the page: {body}"
+    );
+}
+
+fn log_entry(level: &str, target: &str, message: &str, fields: &[(&str, &str)]) -> LogEntry {
+    LogEntry {
+        timestamp: "2026-10-07T22:31:04.512+00:00".to_string(),
+        level: level.to_string(),
+        target: target.to_string(),
+        message: message.to_string(),
+        fields: fields
+            .iter()
+            .map(|(k, v)| LogField {
+                key: k.to_string(),
+                value: v.to_string(),
+            })
+            .collect(),
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_page_shows_fields_and_folds_repeated_info_runs(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let batch = |sensor, n| {
+        log_entry(
+            "INFO",
+            "intake",
+            "batch processed",
+            &[("sensor", sensor), ("ingested", n), ("rejected", "0")],
+        )
+    };
+    for entry in [
+        batch("telnet", "50"),
+        batch("vnc", "12"),
+        batch("telnet", "48"),
+        batch("telnet", "50"),
+        log_entry(
+            "WARN",
+            "sqlx::query",
+            "slow statement",
+            &[
+                ("statement", "SELECT count(*) FROM event"),
+                ("elapsed", "1.52s"),
+            ],
+        ),
+        batch("ssh", "7"),
+        batch("ssh", "9"),
+        log_entry(
+            "WARN",
+            "review::submit",
+            "submission held",
+            &[("reason", "vendor quota reached")],
+        ),
+    ] {
+        state.log_buffer.push(entry);
+    }
+
+    let (status, body) = get_page(state, "/logs").await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Four rows: the run of four, the WARN, the run of two, the second WARN. A fold that ignored
+    // adjacency would make one row of six.
+    assert_eq!(
+        body.matches(r#"<div class="log-line "#).count(),
+        4,
+        "{body}"
+    );
+    assert!(body.contains(">x4<"), "first run's count: {body}");
+    assert!(body.contains(">x2<"), "second run's count: {body}");
+    assert!(!body.contains(">x6<"), "runs across a WARN folded: {body}");
+    assert!(
+        body.contains(r#"<span class="log-v">telnet</span>/<span class="log-v">vnc</span>"#),
+        "the fold names the sensors it covers: {body}"
+    );
+    // Every folded entry's own fields stay reachable in the expanded row.
+    assert_eq!(
+        body.matches(r#"<span class="log-v">50</span>"#).count(),
+        3,
+        "{body}"
+    );
+    for field in [
+        "SELECT count(*) FROM event",
+        "1.52s",
+        "vendor quota reached",
+        ">statement<",
+        ">reason<",
+    ] {
+        assert!(body.contains(field), "missing {field}: {body}");
+    }
+    // Warnings are what the view opens on; the lower rows are counted, not lost.
+    assert!(body.contains(r#"<option value="WARN" selected>"#), "{body}");
+    assert!(body.contains("2 lower-level rows hidden"), "{body}");
+}
+
+/// Scores `n` addresses under 10.1.0.0/16 directly in `ip_score`. Raw scores and decay anchors
+/// vary independently, so ordering by stored raw score and ordering by live score disagree.
+async fn seed_scored_population(pool: &PgPool, n: i32) {
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+             distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
+             first_seen, last_seen) \
+         SELECT '10.1.0.0'::inet + i, 10 + (i * 37 % 90), now() - (i * 13 % 48) * interval '1 hour', \
+                0.5, 1 + i % 50, 1, false, 1 + i % 3, 1, now() - interval '3 days', \
+                now() - (i * 13 % 48) * interval '1 hour' \
+         FROM generate_series(1, $1) AS i",
+    )
+    .bind(n)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The addresses an Attackers page lists, in order.
+fn listed_ips(body: &str) -> Vec<String> {
+    body.split(r#"<td class="ip"><a class="insp" href="/ip/"#)
+        .skip(1)
+        .map(|rest| rest[..rest.find('"').unwrap()].to_string())
+        .collect()
+}
+
+/// The scores an Attackers page lists, in order.
+fn listed_scores(body: &str) -> Vec<f64> {
+    body.split(r#"<td class="count"><strong>"#)
+        .skip(1)
+        .map(|rest| rest[..rest.find('<').unwrap()].parse().unwrap())
+        .collect()
+}
+
+/// The value of the `name=` parameter on the pager link labelled `label`.
+fn pager_param(body: &str, label: &str, name: &str) -> Option<String> {
+    body.split("<a href=\"").skip(1).find_map(|link| {
+        let (href, text) = link.split_once("\">")?;
+        if !text.starts_with(label) {
+            return None;
+        }
+        let at = href.find(&format!("{name}="))? + name.len() + 1;
+        Some(href[at..].split('&').next().unwrap().to_string())
+    })
+}
+
+#[sqlx::test(migrations = false)]
+async fn attackers_pages_through_every_address_once_in_live_score_order(pool: PgPool) {
+    migrate(&pool).await;
+    seed_scored_population(&pool, 1003).await;
+    let state = test_state(pool.clone());
+
+    let (status, first) = get_page(state.clone(), "/ips").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        first.contains("showing 1-500 of 1,003 scored addresses"),
+        "{first}"
+    );
+    let page1 = listed_ips(&first);
+    assert_eq!(page1.len(), 500);
+    assert!(pager_param(&first, "&larr; Previous", "before").is_none());
+    let after = pager_param(&first, "Next &rarr;", "after").expect("a next page");
+    assert_eq!(after, page1[499]);
+
+    // An address scored above everything while the operator reads page one must not shift page
+    // two: it resumes after the row page one ended on, where an OFFSET would repeat that row.
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+             distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
+             first_seen, last_seen) \
+         VALUES ('10.2.0.1', 99, now(), 0.5, 1, 1, false, 1, 1, now(), now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (_, second) = get_page(
+        state.clone(),
+        &format!("/ips?sort=score&dir=desc&after={after}"),
+    )
+    .await;
+    assert!(
+        second.contains("showing 502-1,001 of 1,004 scored addresses"),
+        "{second}"
+    );
+    let page2 = listed_ips(&second);
+    assert_eq!(page2.len(), 500);
+    let after = pager_param(&second, "Next &rarr;", "after").expect("a third page");
+    let (_, third) = get_page(
+        state.clone(),
+        &format!("/ips?sort=score&dir=desc&after={after}"),
+    )
+    .await;
+    assert!(
+        third.contains("showing 1,002-1,004 of 1,004 scored addresses"),
+        "{third}"
+    );
+    let page3 = listed_ips(&third);
+    assert_eq!(page3.len(), 3);
+    assert!(pager_param(&third, "Next &rarr;", "after").is_none());
+
+    let mut all: Vec<String> = page1.iter().chain(&page2).chain(&page3).cloned().collect();
+    let in_order = [
+        listed_scores(&first),
+        listed_scores(&second),
+        listed_scores(&third),
+    ]
+    .concat();
+    assert!(
+        in_order.windows(2).all(|w| w[0] >= w[1]),
+        "pages must run in live-score order across their boundaries: {in_order:?}"
+    );
+    all.sort();
+    let listed = all.len();
+    all.dedup();
+    assert_eq!(all.len(), listed, "an address appeared on two pages");
+    assert_eq!(
+        listed, 1003,
+        "every originally scored address appears exactly once"
+    );
+
+    // Previous from page three is page two again.
+    let before = pager_param(&third, "&larr; Previous", "before").expect("a previous page");
+    let (_, back) = get_page(
+        state.clone(),
+        &format!("/ips?sort=score&dir=desc&before={before}"),
+    )
+    .await;
+    assert_eq!(listed_ips(&back), page2);
+    assert!(back.contains("showing 502-1,001 of 1,004"), "{back}");
+
+    // The other sorts page by the same rule, ascending too.
+    let (_, ev1) = get_page(state.clone(), "/ips?sort=events&dir=asc").await;
+    let after = pager_param(&ev1, "Next &rarr;", "after").unwrap();
+    let (_, ev2) = get_page(state, &format!("/ips?sort=events&dir=asc&after={after}")).await;
+    let counts = |body: &str| -> Vec<i64> {
+        body.split(r#"<td class="count">"#)
+            .skip(1)
+            .filter(|r| !r.starts_with('<'))
+            .map(|r| r[..r.find('<').unwrap()].parse().unwrap())
+            .collect()
+    };
+    let both = [counts(&ev1), counts(&ev2)].concat();
+    assert_eq!(both.len(), 1000);
+    assert!(both.windows(2).all(|w| w[0] <= w[1]), "{both:?}");
+}
+
+#[sqlx::test(migrations = false)]
+async fn attackers_first_page_survives_a_lost_cursor_orders_capped_ties_and_states_tiers(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    seed_scored_population(&pool, 3).await;
+    let state = test_state(pool);
+
+    for uri in ["/ips?after=192.0.2.250", "/ips?before=not-an-address"] {
+        let (status, body) = get_page(state.clone(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(body.contains("this is the first page"), "{uri}: {body}");
+        assert!(
+            body.contains("showing 1-3 of 3 scored addresses"),
+            "{uri}: {body}"
+        );
+        assert_eq!(listed_ips(&body).len(), 3, "{uri}");
+    }
+    // Two addresses whose breadth lifts them past the cap both show 100.0. They are ordered by how
+    // far past it they are, the order they keep as they decay, not by address (which would put
+    // .2 first under the descending tiebreak).
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+             distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
+             first_seen, last_seen) \
+         VALUES ('10.3.0.1', 90, now(), 0.5, 1, 1, false, 5, 1, now(), now()), \
+                ('10.3.0.2', 80, now(), 0.5, 1, 1, false, 5, 1, now(), now())",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let (_, plain) = get_page(state, "/ips").await;
+    assert!(!plain.contains("this is the first page"), "{plain}");
+    assert_eq!(
+        &listed_ips(&plain)[..2],
+        ["10.3.0.1", "10.3.0.2"],
+        "{plain}"
+    );
+    assert_eq!(&listed_scores(&plain)[..2], [100.0, 100.0], "{plain}");
+    // The tier rule is stated where the column is, with where to read the rest.
+    assert!(
+        plain.contains(
+            "aggressive needs raw &ge; 90 and confidence &ge; 0.95, standard &ge; 75 and &ge; 0.70"
+        ),
+        "{plain}"
+    );
+    assert!(
+        plain.contains("docs/reference/scoring-and-feed.md#tier"),
+        "{plain}"
+    );
+}
+
+/// Appends one session's events for `ip` on `sensor`, a second apart, starting `start_ago`
+/// seconds ago.
+async fn append_session(
+    pool: &PgPool,
+    ip: &str,
+    sensor: &str,
+    session_id: Uuid,
+    start_ago: i64,
+    steps: &[(SignalType, serde_json::Value)],
+) {
+    for (i, (signal, metadata)) in steps.iter().enumerate() {
+        append_event(
+            pool,
+            ev_with_session(
+                ip,
+                sensor,
+                *signal,
+                Protocol::Tcp,
+                true,
+                &secs_ago(start_ago - i as i64),
+                metadata.clone(),
+                session_id,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+fn cmd(command: &str) -> (SignalType, serde_json::Value) {
+    (
+        SignalType::HoneypotCommandExec,
+        serde_json::json!({ "command": command }),
+    )
+}
+
+fn telnet_login(user: &str) -> (SignalType, serde_json::Value) {
+    (
+        SignalType::HoneypotLoginAttempt,
+        serde_json::json!({ "username": user }),
+    )
+}
+
+/// The context line rendered under `ip`'s pending row.
+fn queue_context<'a>(body: &'a str, ip: &str) -> &'a str {
+    let start = body
+        .find(&format!(r#"id="context-{ip}""#))
+        .unwrap_or_else(|| panic!("no context row for {ip}: {body}"));
+    &body[start..start + body[start..].find("</tr>").unwrap()]
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_rows_say_where_the_address_came_from_and_what_it_did(pool: PgPool) {
+    migrate(&pool).await;
+    // A: three sessionless events from the seed, then two telnet sessions. Its first command is a
+    // shell-entry preamble line, so the line must skip to the first one that says something.
+    seed_recommended(&pool, "203.0.113.160", 900).await;
+    append_session(
+        &pool,
+        "203.0.113.160",
+        "telnet",
+        Uuid::now_v7(),
+        600,
+        &[
+            telnet_login("admin"),
+            cmd("enable"),
+            cmd("system"),
+            cmd("shell"),
+            cmd("sh"),
+            cmd("cat /proc/mounts"),
+        ],
+    )
+    .await;
+    append_session(
+        &pool,
+        "203.0.113.160",
+        "telnet",
+        Uuid::now_v7(),
+        300,
+        &[telnet_login("cht"), cmd("enable"), cmd("uname -a")],
+    )
+    .await;
+    // B: ran a command and then uploaded a file; the upload is what it came to do.
+    seed_recommended(&pool, "203.0.113.161", 900).await;
+    append_session(
+        &pool,
+        "203.0.113.161",
+        "telnet",
+        Uuid::now_v7(),
+        600,
+        &[
+            cmd("echo hi"),
+            (
+                SignalType::HoneypotMalwareUpload,
+                serde_json::json!({
+                    "sample_orig_name": ".i",
+                    "sample_sha256": "ab".repeat(32),
+                    "sample_size": 5120,
+                }),
+            ),
+        ],
+    )
+    .await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let (status, body) = get_page(test_state(pool), "/queue").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let a = queue_context(&body, "203.0.113.160");
+    // Sensors by event count: telnet's nine first, then the seed's three one-event sensors.
+    assert!(
+        a.contains(
+            r#"<span class="ctx-chip">Telnet</span><span class="ctx-chip">General</span><span class="ctx-chip">Honeypot-sensor</span><span class="ctx-chip">Ssh-sensor</span>"#
+        ),
+        "{a}"
+    );
+    // Two sessions: the seed's events carry none, and nine telnet events are not nine sessions.
+    assert!(a.contains(">2 sessions<"), "{a}");
+    assert!(
+        a.contains(r#"<span class="sev sev--high">command exec 7</span><span class="sev sev--watch">login attempt 3</span><span class="sev sev--low">probe 1</span>"#),
+        "{a}"
+    );
+    assert!(
+        a.contains(r#"first command</span> <code class="mono">cat &#x2f;proc&#x2f;mounts</code>"#),
+        "{a}"
+    );
+    assert!(!a.contains("counts from"), "{a}");
+
+    let b = queue_context(&body, "203.0.113.161");
+    assert!(
+        a.contains(">2 sessions<") && b.contains(">1 session<"),
+        "{b}"
+    );
+    assert!(
+        b.contains(r#"uploaded</span> <code class="mono">.i (abababababab..., 5.0 KB)</code>"#),
+        "{b}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_flooding_queue_entry_is_described_from_a_bounded_sample(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.162", 900).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+    // 5,001 more events written straight to the ledger (each linked to the chain head, as the
+    // trigger requires), and the projection told it holds 5,004 in all.
+    sqlx::query(
+        "DO $$ DECLARE head bytea; i int; BEGIN \
+           FOR i IN 1..5001 LOOP \
+             SELECT hash INTO head FROM event ORDER BY id DESC LIMIT 1; \
+             INSERT INTO event (source_ip, sensor, signal_type, protocol, authenticated, category, \
+                                weight, confidence, observed_at, prev_hash, hash) \
+             VALUES ('203.0.113.162', 'telnet', 'honeypot_connection', 'tcp', false, 'network', \
+                     1, 0.5, now() - interval '1 minute', head, \
+                     sha256(convert_to(i::text, 'UTF8'))); \
+           END LOOP; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE ip_score SET event_count = 5004 WHERE source_ip = '203.0.113.162'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (_, body) = get_page(test_state(pool), "/queue").await;
+    let c = queue_context(&body, "203.0.113.162");
+    assert!(c.contains("counts from 5,000 of 5,004 events"), "{c}");
+}
+
+/// The Recent activity rows of a dashboard page: (activity, events cell, source).
+fn recent_rows(body: &str) -> Vec<(String, String, String)> {
+    let panel = &body[body.find(">Recent activity<").unwrap()..];
+    let panel = &panel[..panel.find("</table>").unwrap()];
+    panel
+        .split("<tr>")
+        .skip(2)
+        .map(|row| {
+            let cells: Vec<&str> = row.split("<td").skip(1).collect();
+            let text = |cell: &str| -> String {
+                let inner = &cell[cell.find('>').unwrap() + 1..];
+                let mut out = String::new();
+                let mut in_tag = false;
+                for ch in inner[..inner.find("</td>").unwrap()].chars() {
+                    match ch {
+                        '<' => in_tag = true,
+                        '>' => in_tag = false,
+                        c if !in_tag => out.push(c),
+                        _ => {}
+                    }
+                }
+                out.trim().to_string()
+            };
+            (text(cells[1]), text(cells[2]), text(cells[3]))
+        })
+        .collect()
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_recent_activity_folds_a_flood_into_one_row_per_run(pool: PgPool) {
+    migrate(&pool).await;
+    let sid = Uuid::now_v7();
+    let flood = |ago: i64| {
+        ev_with_session(
+            "203.0.113.170",
+            "telnet",
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            &secs_ago(ago),
+            serde_json::json!({ "command": "echo" }),
+            sid,
+        )
+    };
+    // Oldest first: five from the flooding source, one SSH login from another, then thirty more.
+    for ago in (300..305).rev() {
+        append_event(&pool, flood(ago)).await.unwrap();
+    }
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.171",
+            "ssh",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            false,
+            &secs_ago(200),
+        ),
+    )
+    .await
+    .unwrap();
+    for ago in (10..40).rev() {
+        append_event(&pool, flood(ago)).await.unwrap();
+    }
+
+    let (_, body) = get_page(test_state(pool), "/").await;
+
+    assert_eq!(
+        recent_rows(&body),
+        [
+            (
+                "Telnet command execution".to_string(),
+                "x30".to_string(),
+                "203.0.113.170".to_string()
+            ),
+            (
+                "SSH login attempt".to_string(),
+                "1".to_string(),
+                "203.0.113.171".to_string()
+            ),
+            (
+                "Telnet command execution".to_string(),
+                "x5".to_string(),
+                "203.0.113.170".to_string()
+            ),
+        ],
+        "{body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_folds_retried_sessions_and_echo_loader_chunks(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.180";
+    let script = [cmd("enable"), cmd("sh"), cmd("cat /proc/mounts")];
+    // A retry loop: the same three commands three times, each under a different username, then a
+    // session that ran something else.
+    for (n, user) in ["admin", "cht", "administrator"].iter().enumerate() {
+        let mut steps = vec![telnet_login(user)];
+        steps.extend(script.iter().cloned());
+        append_session(
+            &pool,
+            ip,
+            "telnet",
+            Uuid::now_v7(),
+            3000 - n as i64 * 100,
+            &steps,
+        )
+        .await;
+    }
+    // The newest session wrote a five-chunk echo loader between two ordinary commands.
+    let mut steps = vec![telnet_login("root"), cmd("cd /tmp")];
+    for index in 1..=5u64 {
+        steps.push((
+            SignalType::HoneypotCommandExec,
+            serde_json::json!({
+                "command": format!("/bin/busybox echo -ne '\\x7f\\x45' >> .i"),
+                "assembled_file": "/tmp/.i",
+                "chunk_index": index,
+            }),
+        ));
+    }
+    steps.push(cmd("chmod 777 .i"));
+    append_session(&pool, ip, "telnet", Uuid::now_v7(), 600, &steps).await;
+
+    let (status, body) = get_page(test_state(pool), &format!("/ip/{ip}")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Two top-level cards (the loader session and the fold) and three member cards inside the
+    // fold. A fold that also swallowed the loader session would leave one top-level card.
+    assert_eq!(
+        body.matches(r#"class="session-card fold-group""#).count(),
+        1,
+        "{body}"
+    );
+    assert_eq!(
+        body.matches(r#"<details class="session-card" id="session-"#)
+            .count(),
+        4,
+        "{body}"
+    );
+    assert!(body.contains(">x3 identical sessions<"), "{body}");
+    assert!(body.contains("users: admin, cht, administrator"), "{body}");
+    assert!(body.contains(">3 commands each<"), "{body}");
+
+    // The five chunk writes are one row, the lines behind its expander; the commands around them
+    // keep their own rows.
+    assert!(
+        body.contains(r#"<span class="chunk-count">5 echo chunks</span> to <span class="mono">&#x2f;tmp&#x2f;.i</span> <span class="dim">(chunks 1-5)</span>"#),
+        "{body}"
+    );
+    assert_eq!(
+        body.matches(r#"<tr class="chunk-run">"#).count(),
+        1,
+        "{body}"
+    );
+    assert_eq!(body.matches("&gt;&gt; .i</li>").count(), 5, "{body}");
+    assert!(
+        body.contains("<td class=\"mono\">cd &#x2f;tmp</td>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<td class=\"mono\">chmod 777 .i</td>"),
+        "{body}"
+    );
 }

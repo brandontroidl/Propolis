@@ -63,7 +63,9 @@
           <td class="mono dim">{% if r.vantage %}{{ r.vantage }}{% else %}<span class="faint">no probe has run</span>{% endif %}</td>
           <td class="seen dim">{{ r.probe_ago }}</td>
           <td class="seen dim">{% if r.confirmed_ago %}{{ r.confirmed_ago }}{% else %}<span class="faint">never</span>{% endif %}</td>
-          <td class="seen"><span class="{{ r.last_event_dot }}" aria-hidden="true"></span> {{ r.last_event_ago }}</td>
+          {# A backlog makes LAST EVENT read like a quiet sensor while its events are still waiting
+             in the intake log, so the badge sits in this cell, and only while the log is behind. #}
+          <td class="seen"><span class="{{ r.last_event_dot }}" aria-hidden="true"></span> {{ r.last_event_ago }}{% if r.behind %}<div><span class="sev sev--high">{{ r.behind }}</span></div>{% endif %}</td>
           <td class="count">{{ r.events_24h }}</td>
         </tr>
         {% endfor %}

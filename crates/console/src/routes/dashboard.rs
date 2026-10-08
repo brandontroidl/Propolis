@@ -41,8 +41,8 @@ use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
 use crate::routes::feed::read_manifest;
 use crate::routes::format::{
-    format_activity, format_relative_time, format_sensor_label, severity_rank, signal_severity,
-    signal_tag_label,
+    format_activity, format_relative_time, format_sensor_label, format_timestamp, severity_rank,
+    signal_severity, signal_tag_label,
 };
 use crate::templates::script_json;
 
@@ -60,11 +60,77 @@ struct RecentSubmission {
     success: bool,
 }
 
+/// One row of Recent activity: a run of consecutive events with the same source, sensor and signal
+/// type, newest run first ([`fold_recent`]).
 #[derive(Debug, Serialize)]
 struct RecentEvent {
+    /// How long ago the run's newest event was.
     relative_time: String,
+    /// The run's oldest and newest event times, for the row's tooltip.
+    first_at: String,
+    last_at: String,
     activity: String,
     source_ip: String,
+    count: usize,
+    /// The run reaches the end of what was read, so it may continue further back: its count is
+    /// a lower bound and renders as `N+`.
+    open_ended: bool,
+}
+
+/// One `event` row as Recent activity reads it, newest first.
+#[derive(Debug, Clone, PartialEq)]
+struct RecentRaw {
+    observed_at: chrono::DateTime<chrono::Utc>,
+    sensor: String,
+    signal_type: String,
+    source_ip: String,
+}
+
+/// Events Recent activity reads, newest first, to fill its rows. A flood longer than this shows
+/// as one `N+` row.
+const RECENT_SCAN: i64 = 1000;
+
+/// Rows Recent activity shows.
+const RECENT_ROWS: usize = 20;
+
+/// Folds newest-first `events` into runs of consecutive events from one source with one sensor
+/// and signal type, keeping the newest `rows` runs. Only adjacent events fold, so the panel still
+/// reads in time order; one source flooding the honeypot takes one row instead of every row.
+/// `scan_full` says the read stopped at its limit, so the last run may continue past it.
+fn fold_recent(events: &[RecentRaw], rows: usize, scan_full: bool) -> Vec<RecentEvent> {
+    let mut runs: Vec<(&RecentRaw, &RecentRaw, usize)> = Vec::new();
+    for e in events {
+        match runs.last_mut() {
+            Some((newest, oldest, count))
+                if newest.source_ip == e.source_ip
+                    && newest.sensor == e.sensor
+                    && newest.signal_type == e.signal_type =>
+            {
+                *oldest = e;
+                *count += 1;
+            }
+            _ => {
+                if runs.len() == rows {
+                    break;
+                }
+                runs.push((e, e, 1));
+            }
+        }
+    }
+    let last_run = runs.len();
+    let reached_end = scan_full && runs.iter().map(|r| r.2).sum::<usize>() == events.len();
+    runs.into_iter()
+        .enumerate()
+        .map(|(i, (newest, oldest, count))| RecentEvent {
+            relative_time: format_relative_time(newest.observed_at),
+            first_at: format_timestamp(oldest.observed_at),
+            last_at: format_timestamp(newest.observed_at),
+            activity: format_activity(&newest.sensor, &newest.signal_type),
+            source_ip: newest.source_ip.clone(),
+            count,
+            open_ended: reached_end && i + 1 == last_run,
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -167,26 +233,31 @@ async fn dashboard(
     let top_attacker_ip = top_attacker.as_ref().map(|t| t.0.as_str()).unwrap_or("--");
     let top_attacker_score = top_attacker.as_ref().map(|t| t.1.as_str()).unwrap_or("");
 
+    // The newest RECENT_SCAN events, read backwards off `event_observed_at_idx`, folded into runs.
     let recent_event_rows = degraded.soft(
         "recent events",
         sqlx::query(
             "SELECT observed_at, sensor, signal_type::text, host(source_ip) AS source_ip \
-             FROM event ORDER BY observed_at DESC LIMIT 20",
+             FROM event ORDER BY observed_at DESC, id DESC LIMIT $1",
         )
+        .bind(RECENT_SCAN)
         .fetch_all(&state.db)
         .await,
     );
-    let mut recent_events = Vec::with_capacity(recent_event_rows.len());
-    for row in recent_event_rows {
-        let observed_at: chrono::DateTime<chrono::Utc> = row.try_get("observed_at")?;
-        let sensor: String = row.try_get("sensor")?;
-        let signal_type: String = row.try_get("signal_type")?;
-        recent_events.push(RecentEvent {
-            relative_time: format_relative_time(observed_at),
-            activity: format_activity(&sensor, &signal_type),
+    let mut recent_raw = Vec::with_capacity(recent_event_rows.len());
+    for row in &recent_event_rows {
+        recent_raw.push(RecentRaw {
+            observed_at: row.try_get("observed_at")?,
+            sensor: row.try_get("sensor")?,
+            signal_type: row.try_get("signal_type")?,
             source_ip: row.try_get("source_ip")?,
         });
     }
+    let recent_events = fold_recent(
+        &recent_raw,
+        RECENT_ROWS,
+        recent_raw.len() as i64 == RECENT_SCAN,
+    );
 
     let protocol_rows = degraded.soft(
         "protocol distribution",
@@ -607,6 +678,51 @@ async fn five_minute_series(db: &PgPool) -> Result<(Vec<String>, Vec<i64>), sqlx
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw(ip: &str, signal: &str, secs_ago: i64) -> RecentRaw {
+        RecentRaw {
+            observed_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            sensor: "telnet".into(),
+            signal_type: signal.into(),
+            source_ip: ip.into(),
+        }
+    }
+
+    #[test]
+    fn fold_recent_keeps_the_newest_runs_and_marks_only_a_run_cut_by_the_scan() {
+        let a = "203.0.113.1";
+        let b = "203.0.113.2";
+        let events = vec![
+            raw(a, "honeypot_command_exec", 1),
+            raw(a, "honeypot_command_exec", 2),
+            raw(a, "honeypot_command_exec", 3),
+            raw(b, "honeypot_command_exec", 4),
+            raw(a, "honeypot_command_exec", 5),
+            raw(a, "honeypot_login_attempt", 6),
+            raw(a, "honeypot_login_attempt", 7),
+        ];
+
+        let all = fold_recent(&events, 20, false);
+        let shape: Vec<(&str, usize, bool)> = all
+            .iter()
+            .map(|r| (r.source_ip.as_str(), r.count, r.open_ended))
+            .collect();
+        assert_eq!(
+            shape,
+            [(a, 3, false), (b, 1, false), (a, 1, false), (a, 2, false)]
+        );
+        assert_eq!(all[3].activity, "Telnet login attempt");
+
+        // The scan stopped at its limit: the last run may go further back.
+        let cut = fold_recent(&events, 20, true);
+        assert!(cut[3].open_ended && !cut[2].open_ended);
+
+        // Fewer rows than runs: the newest two, and neither reaches the end of the scan.
+        let two = fold_recent(&events, 2, true);
+        assert_eq!(two.len(), 2);
+        assert_eq!((two[0].count, two[1].count), (3, 1));
+        assert!(!two[1].open_ended);
+    }
 
     #[test]
     fn normalize_dashboard_range_accepts_known_values_and_defaults_to_24h() {

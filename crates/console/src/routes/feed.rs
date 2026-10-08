@@ -208,12 +208,19 @@ async fn feed_page(
             degraded,
             feed_disabled,
             has_build => true,
-            build_time => m.build_time,
+            build_time => display_timestamp(&m.build_time),
             aggressive_count => m.tiers.aggressive.count,
-            aggressive_valid_until => m.tiers.aggressive.valid_until,
+            aggressive_valid_until => display_timestamp(&m.tiers.aggressive.valid_until),
             standard_count => m.tiers.standard.count,
-            standard_valid_until => m.tiers.standard.valid_until,
-            windows => m.windows,
+            standard_valid_until => display_timestamp(&m.tiers.standard.valid_until),
+            windows => m
+                .windows
+                .into_iter()
+                .map(|w| WindowManifest {
+                    valid_until: display_timestamp(&w.valid_until),
+                    ..w
+                })
+                .collect::<Vec<_>>(),
             exclusions => m.exclusions,
             tab,
             aggressive_entries,

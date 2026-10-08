@@ -33,8 +33,12 @@ use sqlx::{PgPool, Row};
 use crate::AppState;
 use crate::auth::Session;
 use crate::routes::context::{BaseContext, base_context};
+use crate::routes::detail::extract_detail;
 use crate::routes::error::AppError;
-use crate::routes::format::{format_timestamp, tier_label};
+use crate::routes::format::{
+    format_sensor_label, format_timestamp, group_digits, signal_severity, signal_tag_label,
+    tier_label,
+};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -175,6 +179,182 @@ struct QueueRowView {
     submissions: String,
     notes: String,
     csrf_token: String,
+    /// What the address did, for the pending tab's context line ([`row_context`]). `None` on the
+    /// history tabs and on a decision's re-rendered row, which renders without the line.
+    context: Option<RowContext>,
+}
+
+/// The pending tab's per-row context: enough to decide most entries without opening them.
+#[derive(Debug, Serialize)]
+struct RowContext {
+    /// Display labels of the sensors the address reached, most events first.
+    sensors: Vec<String>,
+    /// Distinct sessions (connections with a session id).
+    sessions: i64,
+    /// The most frequent signal types, most frequent first, at most [`CONTEXT_SIGNALS`].
+    signals: Vec<SignalCount>,
+    /// The first upload or download it made, else its first command past a shell-entry preamble.
+    notable: Option<Notable>,
+    /// Set when the address has more events than [`CONTEXT_SAMPLE`]: the counts above then
+    /// describe that many of its events, and this says so ("5,000 of 7,845").
+    sampled: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SignalCount {
+    label: &'static str,
+    sev: &'static str,
+    count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct Notable {
+    /// `upload`, `fetch` or `command`.
+    kind: &'static str,
+    text: String,
+}
+
+/// Events read per row for the context line's counts. Most addresses have fewer, and the line is
+/// exact for them; a flood is described from this many and labelled as such.
+const CONTEXT_SAMPLE: i64 = 5000;
+
+/// Signal types named on the context line.
+const CONTEXT_SIGNALS: usize = 3;
+
+/// Commands read, oldest first, looking for the first one past the preamble.
+const CONTEXT_COMMANDS: i64 = 64;
+
+/// Longest command or URL shown on the context line, in characters.
+const CONTEXT_TEXT_CHARS: usize = 96;
+
+/// The lines Mirai-family telnet loaders send to reach a shell before doing anything (see
+/// `crates/sensor-telnet/tests/echo_loader.rs`). Every such session starts with them, so the
+/// first of them says nothing about what the address came to do.
+const SHELL_ENTRY_PREAMBLE: &[&str] = &[
+    "start",
+    "enable",
+    "config terminal",
+    "system",
+    "linuxshell",
+    "su",
+    "shell",
+    "sh",
+];
+
+/// Builds [`RowContext`] for `ip` from at most [`CONTEXT_SAMPLE`] events, its first upload or
+/// download (indexed on `(source_ip, signal_type, observed_at)`), and at most
+/// [`CONTEXT_COMMANDS`] of its earliest commands.
+async fn row_context(pool: &PgPool, ip: IpAddr, event_count: i32) -> Result<RowContext, AppError> {
+    let ip_text = ip.to_string();
+    let rows = sqlx::query(
+        "WITH s AS MATERIALIZED ( \
+             SELECT sensor, signal_type, session_id FROM event \
+             WHERE source_ip = $1::inet LIMIT $2) \
+         SELECT sensor, signal_type::text AS signal_type, count(*) AS n, \
+                (SELECT count(DISTINCT session_id) FROM s) AS sessions, \
+                (SELECT count(*) FROM s) AS sampled \
+         FROM s GROUP BY sensor, signal_type",
+    )
+    .bind(&ip_text)
+    .bind(CONTEXT_SAMPLE)
+    .fetch_all(pool)
+    .await?;
+
+    let mut sessions = 0;
+    let mut sampled = 0;
+    let mut by_sensor: BTreeMap<String, i64> = BTreeMap::new();
+    let mut by_signal: BTreeMap<String, i64> = BTreeMap::new();
+    for row in &rows {
+        let n: i64 = row.try_get("n")?;
+        sessions = row.try_get("sessions")?;
+        sampled = row.try_get("sampled")?;
+        *by_sensor.entry(row.try_get("sensor")?).or_default() += n;
+        *by_signal.entry(row.try_get("signal_type")?).or_default() += n;
+    }
+    let mut sensors: Vec<(String, i64)> = by_sensor.into_iter().collect();
+    sensors.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut signals: Vec<(String, i64)> = by_signal.into_iter().collect();
+    signals.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    Ok(RowContext {
+        sensors: sensors
+            .iter()
+            .map(|(s, _)| format_sensor_label(s))
+            .collect(),
+        sessions,
+        signals: signals
+            .iter()
+            .take(CONTEXT_SIGNALS)
+            .map(|(s, count)| SignalCount {
+                label: signal_tag_label(s),
+                sev: signal_severity(s),
+                count: *count,
+            })
+            .collect(),
+        notable: notable_action(pool, &ip_text).await?,
+        sampled: (sampled >= CONTEXT_SAMPLE).then(|| {
+            format!(
+                "{} of {}",
+                group_digits(sampled),
+                group_digits(i64::from(event_count).max(sampled))
+            )
+        }),
+    })
+}
+
+/// The address's first upload or download, else its first command that is not part of the
+/// shell-entry preamble.
+async fn notable_action(pool: &PgPool, ip: &str) -> Result<Option<Notable>, AppError> {
+    let transfer = sqlx::query(
+        "SELECT signal_type::text AS signal_type, metadata FROM event \
+         WHERE source_ip = $1::inet \
+           AND signal_type IN ('honeypot_malware_upload', 'honeypot_file_download') \
+         ORDER BY observed_at, id LIMIT 1",
+    )
+    .bind(ip)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(row) = transfer {
+        let signal: String = row.try_get("signal_type")?;
+        let metadata: serde_json::Value = row.try_get("metadata")?;
+        return Ok(Some(Notable {
+            kind: if signal == "honeypot_malware_upload" {
+                "upload"
+            } else {
+                "fetch"
+            },
+            text: clip(&extract_detail(&signal, &metadata)),
+        }));
+    }
+
+    let commands: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT metadata FROM event \
+         WHERE source_ip = $1::inet AND signal_type = 'honeypot_command_exec' \
+         ORDER BY observed_at, id LIMIT $2",
+    )
+    .bind(ip)
+    .bind(CONTEXT_COMMANDS)
+    .fetch_all(pool)
+    .await?;
+    Ok(commands
+        .iter()
+        .map(|m| extract_detail("honeypot_command_exec", m))
+        .find(|c| {
+            let c = c.trim().to_ascii_lowercase();
+            c != "-" && !c.is_empty() && !SHELL_ENTRY_PREAMBLE.contains(&c.as_str())
+        })
+        .map(|c| Notable {
+            kind: "command",
+            text: clip(c.trim()),
+        }))
+}
+
+/// `text` cut to [`CONTEXT_TEXT_CHARS`] characters, with an ellipsis when cut.
+fn clip(text: &str) -> String {
+    match text.char_indices().nth(CONTEXT_TEXT_CHARS) {
+        Some((at, _)) => format!("{}...", &text[..at]),
+        None => text.to_string(),
+    }
 }
 
 async fn queue_page(
@@ -262,18 +442,19 @@ async fn pending_rows(
     }
     sort_pending(&mut pending, sort);
 
-    Ok(pending
-        .into_iter()
-        .map(|(ip, notes, score)| {
-            row_view(
-                ip,
-                ReviewState::Pending,
-                notes.as_deref(),
-                &score,
-                csrf_token,
-            )
-        })
-        .collect())
+    let mut rows = Vec::with_capacity(pending.len());
+    for (ip, notes, score) in pending {
+        let mut row = row_view(
+            ip,
+            ReviewState::Pending,
+            notes.as_deref(),
+            &score,
+            csrf_token,
+        );
+        row.context = Some(row_context(pool, ip, score.event_count).await?);
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// The approved/rejected/snoozed tabs: `review_queue` exposes no `list_pending`-style method for
@@ -628,6 +809,7 @@ fn row_view(
         submissions: String::new(),
         notes: notes.unwrap_or_default().to_string(),
         csrf_token: csrf_token.to_string(),
+        context: None,
     }
 }
 

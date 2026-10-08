@@ -2,8 +2,82 @@
 
 ## Unreleased
 
+### Fixed
+
+- **SSH bare connects, banner grabs and bad version strings are now recorded** - the SSH sensor
+  emitted `honeypot_connection` only after key exchange, so a Shodan/Censys-style scanner that
+  read the banner and left, a client that sent a malformed identification line, and a bare TCP
+  probe left no event (the fleet probe reported "socket answered, no line reached intake" for
+  tcp/22). The event is now emitted at accept, once per connection, like the other TCP sensors.
+  A connection that ends before key exchange completes also emits one `honeypot_session_end`
+  (telemetry, unscored) with `end_reason`, `phase`, `duration_ms` and the sanitized
+  `client_version` when received. Consequence: such connections now carry the same
+  `honeypot_connection` weight (40) as a telnet connect did already. No migration or wire change.
+
 ### Added
 
+- **Console log view keeps fields and folds repeats** - the `/logs` ring now keeps each event's
+  structured fields (`statement`, `elapsed`, `reason`, `sensor`, ...), so "slow statement" and
+  "submission held" say what was slow and why it was held. Values are capped at 512 bytes, 32
+  fields and a 2 KiB message, and the ring is held to 2 MiB charged from allocated capacity as
+  well as to its 1000 entries. The view shows fields inline and expands to all of them, folds
+  adjacent identical INFO entries from one target into one row with a count and the values each
+  field took, and opens filtered to warnings and errors with a count of the rows it hides; the
+  live stream folds by the same rule.
+- **Attackers pages through every scored address** - `/ips` stopped silently at 500 rows. It now
+  pages 500 at a time with a keyset cursor (`?after=` / `?before=`, the address the page
+  continues from) and says "showing 501-1,000 of N", exact to 100,000 rows and a labelled
+  estimate past that. The score sort orders by a key equal in order to the live score but
+  constant over time, so rows clamped at 100 do not trade places between pages. A note above
+  the table states the tier rule and why tier and live score can disagree.
+- **Review rows say what the address did** - each pending row has a context line: the sensors
+  it reached, its session count, its three most frequent signals, and its first upload or
+  download, else its first command after the Mirai shell-entry preamble. Counts come from at
+  most 5,000 of the address's events and say so when that is not all of them.
+- **Recent activity folds a flooding source** - the dashboard reads the newest 1,000 events and
+  folds consecutive events with one source, sensor and signal into one row with a count,
+  keeping the newest 20 runs, so one source can no longer fill the panel.
+- **IP page folds retries and echo-loader chunks** - consecutive sessions from one sensor that
+  ran the same commands fold into one card with a count and the usernames tried, and a run of
+  echo-loader chunk writes to one file (`assembled_file` / `chunk_index`) is one row,
+  "N echo chunks to FILE", with the lines behind an expander.
+- **Per-source command-event budget with flood summaries (ssh, telnet, adb)** - a handful of
+  Mirai-family echo loaders, each running the same ~53-command session around the clock and
+  several at once, made telnet 97% of all events (~15 a second, 2,555 from one address in ten
+  minutes), outran log rotation and put intake 6.6 GB behind. The per-connection cap of 256 could
+  not see it. Each of the three sensors now holds a token bucket per source network (/24 or /56)
+  charged by `honeypot_command_exec` events only (`CommandEventGate` in
+  `sensor_framework::command_flood`, reached through `ConnectionBudget::with_command_gate`):
+  burst 200, then 12 a minute, set by `PROPOLIS_<SSH|TELNET|ADB>_COMMAND_EVENT_RATE_PER_MIN` and
+  `_BURST` (a positive integer; zero or garbage exits 1; `Rate::per_minute` is new in
+  `sensor_framework::rate_limit`). Past it, a command event is not written but counted into one
+  `honeypot_command_exec` per network per 60 s window with `command_summary: true`,
+  `suppressed_count`, `distinct_commands` (shapes), up to 8 samples, first and last seen,
+  `session_count` and, for echo-loader chunks, `assembled_file` and `max_chunk_index`; it is
+  written when the window ends and at shutdown. Never summarized: logins, connections, downloads
+  and derived URLs, every capture upload, the per-session flood markers, the first command of each
+  shape per network per window (`command_shape` takes out `\xNN`/`\NNN` escape runs, hex runs of
+  16+ and base64-looking runs of 24+, so the observed 53-line session is 16 shapes whatever its
+  marker), and each address's first command event per window (scoring is per address). An
+  echo-loader chunk (a command event with `assembled_file`) is never a first: its bytes are in the
+  capture. Replies are unchanged: only logging is summarized. The summary scores as one command
+  event; the merit path is unaffected (60 s dedup), the volume path reaches its threshold later.
+  The observed loop, four parallel sessions every 30 s for ten minutes, drops from 4,240 command
+  events to 407 plus 10 summaries. Additive metadata: no migration or wire version change.
+- **Intake lag is visible and pages** - each intake poll records how many bytes of its log are
+  unread (`LogTailer::backlog_bytes`: the file past the read offset plus any rotated-out file
+  still being drained) and the `observed_at` of the last event it appended. `/metrics` publishes
+  `propolis_intake_bytes_behind{sensor}` and `propolis_intake_oldest_unread_age_seconds{sensor}`,
+  labelled with the `PROPOLIS_SENSOR_LOGS` name; the age is 0 when the poll read every complete
+  line and absent when lines wait but nothing has been appended since start, and a process that
+  tails nothing publishes neither. A new ops-alert condition, `intake-lagging`, pages when lines
+  have waited past max(10 min, 3 intake polls) for 10 minutes, or when the unread bytes rose at
+  three consecutive monitor polls that each found complete lines waiting; it clears when the log
+  is drained, or after three polls without growth once the wait is back under the threshold, and
+  never fires on an idle log. The fleet pane shows `behind: <bytes> / <age>` under LAST EVENT on
+  the listener rows of a log over the age threshold. No append-latency histogram: `/metrics` has
+  no histogram support. See `docs/operations/health-and-observability.md` and
+  `docs/troubleshooting/intake-backlog.md`.
 - **Echo-loader uploads are reassembled and captured** - a Mirai/Mozi telnet loader with no
   usable `wget` uploads its downloader as some forty `busybox echo -ne '\xNN...' >> .i` lines,
   runs `chmod 777 .i` and `./.i a b c d port`. Each line was logged but the file was never
@@ -439,6 +513,42 @@
   reads a pipe as bash does: a bare `sh` reads the rest of the input as its script (it opened a
   nested interactive level), there is no prompt, history or terminal variable, and the client's
   EOF ends the shell with the last command's status (the session used to stay open).
+- **Console labels** - protocols read `TCP` / `UDP` instead of the enum names `Tcp` / `Udp`; the
+  feed status tab's build and valid-until times use the console's `YYYY-MM-DD HH:MM UTC` form
+  instead of raw RFC 3339; credential-sensor listeners read as their service (`VNC`, `MySQL`,
+  ...) instead of `Cred-vnc`; IP-page sessions ending in the same minute keep their real order.
+- **An intake that fell behind no longer slowed down because it was behind** - the dedup read
+  every scored append makes inside the global append lock (the newest prior observation of one
+  source and signal) had no index of its own, so the planner walked `event_observed_at_idx` down
+  from the newest row until it met the source: one row per event newer than that source's last
+  sighting. A lagging intake appends old `observed_at` values, so the walk grew with the lag and
+  the lag with the walk. A telnet stream from a bot loop ran at about one event a second for days
+  and, holding the append lock that long, held up every other sensor. Migration `0013` adds
+  `event_dedup_idx (source_ip, signal_type, observed_at)`, and the read passes the address through
+  a scalar subquery so the planner costs a hot source like any other: with the index alone it
+  still chose the walk for the two hottest sources of a test ledger. On a 7.5M-row ledger with
+  telnet 11 days behind the read went from 840 to 1060 ms to about 0.13 ms for those sources,
+  and the lagged append of a 100k-row source from 1.7 s to 0.69 s, its cost when caught up; the
+  rest is the per-event history aggregates, which are still to be made incremental. The index is
+  built inside the migration transaction at startup, before intake runs: 12 to 20 s for that
+  ledger held in RAM, longer on disk. Plan guards hold the read to the index on a ledger shaped
+  like the incident.
+- **An append no longer costs more the longer its source has been seen** - every scored append
+  counted the source's distinct WAN vantages and distinct sensors by reading every earlier event
+  of that source (a `GROUP BY wan_ip` and a `COUNT(DISTINCT sensor)`), inside the global append
+  lock. On a 7.5M-row ledger that was 0.73 s per event for a source with 100k events, 3.5 s at
+  200k, 7.1 s at 800k and 9.4 s at 1.5M, and a long-running bot loop on one address set the pace
+  for every sensor: three fresh sources appending beside a 1.5M-event one managed about one
+  event a second between them. Migration `0014` adds two projection tables, `ip_vantage
+  (source_ip, wan_ip, saw_authenticated_tcp)` and `ip_sensor (source_ip, sensor)`, which the
+  append folds each scored event into under the same lock and reads by primary key; telemetry
+  never writes them. The same appends now take 2.8 to 3.3 ms whatever the history, against 3.1
+  ms for a source never seen, and the four mixed sources together reach 358 events a second.
+  The migration backfills both tables from the ledger at startup, before intake runs: 23 to 26 s
+  for that ledger held in RAM, longer on disk. `rebuild_projection` still counts from the ledger
+  rows, so a replay checks the tables; a property test compares the tables with the old
+  aggregates after every append of random multi-source sequences with telemetry and
+  out-of-order events.
 - **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
   0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
   echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks

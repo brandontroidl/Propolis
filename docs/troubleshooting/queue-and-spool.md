@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Queue and spool
@@ -32,6 +32,10 @@ When traffic looks under-recorded, check which bound is biting.
   `DEDUP_WINDOW_SECONDS = 60` records the event but adds no score weight
   (`crates/core-scoring/src/scoring/constants.rs#DEDUP_WINDOW_SECONDS`). So "event count rose but
   score did not" during rapid repeats is correct behavior, not a lost event.
+- **Command-event budget** - on ssh, telnet and adb, a source network repeating commands past
+  its budget (default burst 200, then 12 a minute) stops getting one `honeypot_command_exec` per
+  command; its repeats are counted in one `command_summary` event per minute instead. See
+  [below](#a-telnet-or-ssh-bot-loop-floods-the-event-log).
 
 ### Counters to read
 
@@ -51,6 +55,48 @@ curl -s localhost:8080/metrics | grep -E 'events_(ingested|rejected)_total|revie
 
 Field ownership and the full metric list:
 [Health and observability](../operations/health-and-observability.md).
+
+## A telnet or ssh bot loop floods the event log
+
+Symptom: one sensor, usually telnet, writes several events a second, nearly all
+`honeypot_command_exec` from a few addresses running the same loader session over and over,
+several at once. On 2026-10-07 a handful of Mirai-family echo loaders made telnet 97% of all
+events at about 15 a second, one address wrote 2,555 in ten minutes, and the log outran log
+rotation and intake until the backlog reached 6.6 GB.
+
+What prevents a recurrence: the per-source command-event budget
+([sensor behavior](../reference/sensor-behavior.md#command-event-budget-ssh-telnet-adb)). Each
+source network gets a burst of command events and then a steady rate; past that, a command whose
+shape the network has already run this minute (the line with its escapes and encoded payload
+taken out, so every echo chunk is one shape) is counted into one summary event per minute, while
+the first of each new shape, each address's first command, every login, connection, capture and
+download keeps its own event. Echo-loader chunks are never kept for being new: the capture holds
+their bytes. The bot is answered exactly as before, so it does not notice. In the tests, the
+observed loop (four parallel sessions every 30 s) drops from 4,240 command events in ten minutes
+to 407 plus 10 summaries.
+
+To confirm it is working, look for summaries in the sensor's log:
+
+```
+grep -c '"command_summary":true' /var/log/propolis/telnet/events.jsonl
+grep '"command_summary":true' /var/log/propolis/telnet/events.jsonl | tail -n 1
+```
+
+Each carries `suppressed_count`, `source_prefix` and up to eight sample commands. The defaults
+still let a loop through at 12 command events a minute per network, plus the first of each
+shape and each address per minute. If intake is still behind, lower the rate in the sensor's
+environment file (`/etc/propolis/telnet.env`; ssh and adb read `/etc/propolis/ssh.env` and
+`/etc/propolis/adb.env`), for example:
+
+```
+PROPOLIS_TELNET_COMMAND_EVENT_RATE_PER_MIN=4
+PROPOLIS_TELNET_COMMAND_EVENT_BURST=100
+```
+
+and restart that sensor; zero or a non-number refuses to start
+([environment variables](../reference/environment-variables.md#standard-sensors-strict-parse---ssh-telnet-http-ftp-redis-adb-catchall-tftp-mqtt-dns)).
+A backlog that already exists does not shrink by itself; draining or archiving it is a separate
+step ([intake backlog](intake-backlog.md#recovering-a-backlog-too-large-to-drain)).
 
 ## Log rotation can lose a small window of events
 

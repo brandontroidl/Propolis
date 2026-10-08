@@ -61,6 +61,23 @@ shipped systemd timer or cron**. Without operator configuration, the feed is bui
 locally but not pushed anywhere. See
 [`../operations/routine-procedures.md`](../operations/routine-procedures.md).
 
+## Intake appends one event per transaction
+
+Open item. Intake appends one event per transaction under a single lock that keeps the hash
+chain in order, so the per-event cost sets the pace for every sensor
+(`crates/core-scoring/src/repository/events.rs#append_event`). That cost no longer grows with
+intake lag (migration `0013`, the dedup read; see [intake backlog](../troubleshooting/intake-backlog.md))
+or with a source's history (migration `0014`, the breadth sets; see
+[database reference](../reference/database.md#breadth-sets)): on a 7.5M-row test ledger held in
+RAM an append took about 3 ms for a source with 1.5M earlier events, the same as for a source
+never seen. What remains is each append's own round trips and commit, which caps the node at a
+few hundred events a second, lower where each commit waits on a disk flush `[inferred]`. Appending a batch of
+lines in one transaction, still one event at a time in order, is the next change `[planned]`.
+
+The `intake-lagging` alert and the fleet pane's behind badge make a backlog visible;
+they do not remove it. While intake is behind, a `copytruncate` rotation of the log drops the
+unread part from ingest (it stays in the rotated copy), and the lag readings fall back with it.
+
 ## Tailer misreads a small rotated log as growth
 
 Open item, not yet fixed. The log tailer that intake, the shipper and `propolis-watch` share

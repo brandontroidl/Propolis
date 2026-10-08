@@ -60,7 +60,7 @@ you are on the right host and database, then:
 ```bash
 sudo rm -rf /var/spool/propolis/*/     # samples: live malware, handle in isolation
 sudo rm -rf /var/log/propolis/*/       # sensor logs
-dropdb propolis                        # or truncate event, ip_score, review_queue
+dropdb propolis                        # or truncate event, ip_score, ip_vantage, ip_sensor, review_queue
 ```
 
 For an evaluation, `podman rm -f propolis-pg` and `rm -rf /tmp/propolis-eval` remove

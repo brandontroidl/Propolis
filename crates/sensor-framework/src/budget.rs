@@ -1,7 +1,9 @@
 //! Per-connection resource budgets for the fake shell. One [`ConnectionBudget`] belongs to one
 //! connection and is shared by every [`crate::shell::FakeShell`] and [`crate::fakefs::FakeFs`] on
 //! it (SSH shell and exec channels, ADB's streams, telnet's one shell), so opening more channels or
-//! streams cannot multiply a ceiling. It holds counters only; the connection-level bounds in
+//! streams cannot multiply a ceiling. It holds counters, plus a handle on the sensor's per-source
+//! command-event budget ([`crate::command_flood`]), which is shared across connections and so
+//! cannot be a counter here; the connection-level bounds in
 //! [`crate::bounds::ConnectionBounds`] (duration, concurrency, captured bytes) stay where they are.
 //!
 //! The counters are atomics because the shells and filesystems that share a budget live across
@@ -20,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
 
 use crate::bounds::ConnectionBounds;
+use crate::command_flood::CommandEventGate;
 use crate::shell::MAX_COMMANDS_PER_SESSION;
 
 /// The longest input line any transport buffers before flushing it to the shell; the resident cost
@@ -135,6 +138,9 @@ pub struct ConnectionBudget {
     /// The resource behind the most recent refusal, read back by the shell for its trace.
     last_refusal: AtomicU8,
     limits: BudgetLimits,
+    /// The sensor's per-source command-event budget, shared with every other connection: the one
+    /// ceiling here that is not the connection's alone. `None` writes every command event.
+    command_gate: Option<Arc<CommandEventGate>>,
 }
 
 /// The filesystem-side counters of a budget at one moment, see [`ConnectionBudget::fs_counters`].
@@ -156,7 +162,17 @@ fn take_slot(counter: &AtomicU64, limit: u64) -> bool {
 
 impl ConnectionBudget {
     pub fn new(limits: BudgetLimits) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::build(limits, None))
+    }
+
+    /// A connection's budget whose shells pass their command events through `gate`, the
+    /// sensor's per-source command-event budget.
+    pub fn with_command_gate(limits: BudgetLimits, gate: Arc<CommandEventGate>) -> Arc<Self> {
+        Arc::new(Self::build(limits, Some(gate)))
+    }
+
+    fn build(limits: BudgetLimits, command_gate: Option<Arc<CommandEventGate>>) -> Self {
+        Self {
             owned_bytes: AtomicU64::new(0),
             overlay_nodes: AtomicU64::new(0),
             command_events: AtomicU64::new(0),
@@ -166,11 +182,17 @@ impl ConnectionBudget {
             download_cap_marked: AtomicBool::new(false),
             last_refusal: AtomicU8::new(REFUSED_NONE),
             limits,
-        })
+            command_gate,
+        }
     }
 
     pub fn limits(&self) -> &BudgetLimits {
         &self.limits
+    }
+
+    /// The sensor's per-source command-event budget, when the connection has one.
+    pub fn command_gate(&self) -> Option<&CommandEventGate> {
+        self.command_gate.as_deref()
     }
 
     /// Bytes currently charged to overlay content.

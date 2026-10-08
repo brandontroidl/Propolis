@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-05
+last-verified: 2026-10-07
 -->
 
 # Console tour
@@ -30,7 +30,10 @@ The front page: scored addresses, pending reviews and approvals today; events in
 last hour and the last 24 hours with the age of the newest event as a pipeline-health
 signal; the current feed size; a 24-hour events chart with 1h, 7d and 30d ranges; the
 protocol breakdown; the most active addresses with an hourly activity strip; and the
-most recent events and vendor submissions.
+most recent events and vendor submissions. Recent activity folds consecutive events from
+one source with the same sensor and signal into one row with a count (`x37`), so one
+source flooding the honeypot takes one row; it reads the newest 1,000 events, and a run
+that reaches back past them shows its count as `x1000+`.
 
 If a panel's query fails, the page still renders and an amber banner at the top names
 the panels that are showing placeholders. A zero on the dashboard with no banner is a
@@ -38,8 +41,12 @@ real zero.
 
 ## Review
 
-Addresses that have reached a tier and are waiting for a decision. For each you can
-approve, reject or snooze. Approve is what lets an address into the `aggressive` or
+Addresses that have reached a tier and are waiting for a decision. Under each pending
+row a context line says what the address did: the sensors it reached, how many sessions,
+its three most frequent signals, and its first upload or download, or failing that its
+first command after the `enable` / `system` / `shell` / `sh` preamble Mirai-family
+loaders open with. For an address with more than 5,000 events the counts describe 5,000
+of them, and the line says so. For each you can approve, reject or snooze. Approve is what lets an address into the `aggressive` or
 `standard` feed files and, if a vendor is configured, allows a report. The Approved,
 Rejected and Snoozed tabs show past decisions.
 
@@ -58,12 +65,25 @@ score can be rebuilt from it.
 
 ## Attackers
 
-Every scored address, sortable, up to 500 rows. The Search page covers the rest.
+Every scored address, sortable by score, events, first seen or last seen, 500 to a page,
+with Previous and Next links and a "showing 501-1,000 of N" line. Pages resume from the
+last address shown, so an address scored while you page does not repeat or skip a row.
+Past 100,000 addresses the total is the database's estimate and says so.
+
+The **score** column is the live score: decayed since the address's last event and
+weighted for how many of your WAN addresses it hit. The **tier** was set when the address
+was last scored, from its raw score and its strongest signal's confidence, so a standard
+address can show 100.0 while an aggressive one shows 99.9. A note above the table states
+the thresholds; their owner is [scoring and feed](../reference/scoring-and-feed.md#tier).
 
 ## Address detail
 
 One address: score and tier, the gates it has passed, the activity chart, and the
-evidence timeline grouped into sessions where the sensor recorded one. Below that,
+evidence timeline grouped into sessions where the sensor recorded one. Consecutive
+sessions that ran the same commands (a loader retrying under a new username) fold into
+one card marked `x3 identical sessions` with the usernames tried, each session still
+inside it, and an echo loader's chunk writes to one file are one row, `40 echo chunks
+to /tmp/.i`, with the lines behind an expander. Below that,
 which of your WAN addresses it hit, which services it probed, vendor submissions, and
 the malware linked to it, marked as uploaded directly or fetched from a URL it
 reported. A truncated upload is labelled as such.
@@ -99,7 +119,12 @@ is the on-demand version.
 
 ## Logs
 
-The daemon's own log, streamed live, for watching intake and the subsystems work.
+The daemon's own log, streamed live, for watching intake and the subsystems work. Each
+row shows its structured fields (`sensor=telnet`, `elapsed=1.5s`, `reason=...`) and
+expands to all of them. Adjacent identical INFO lines from one target fold into one row
+with a count and the values each field took (`batch processed x42 sensor=telnet/vnc`).
+The view opens showing warnings and errors, with a line saying how many lower-level rows
+it hides and a button to show everything.
 
 ## Themes
 

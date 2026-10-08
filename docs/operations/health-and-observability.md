@@ -64,6 +64,21 @@ A listener present in the ledger but not in the inventory gets an `undeclared li
 its transport and port. A sensor the inventory does not name at all keeps one such row with no
 port for its pre-upgrade events.
 
+### Behind badge
+
+**Last event** is the newest event in the ledger, so when intake is behind a sensor's log it
+shows how far intake has read, not when the sensor last saw traffic. A listener row whose log is
+behind says so under that column, as `behind: 6.6 GB / 11 d`: the unread bytes of the log and
+how long its oldest unread line has waited (see the two intake metrics below). The badge appears
+only while that wait exceeds the `intake-lagging` age threshold, ten minutes or three intake
+polls, whichever is longer, so a caught-up or idle sensor shows nothing
+(`crates/console/src/routes/fleet.rs#behind_by_sensor`). It is matched to rows by the sensor names
+the log's events carried, not by the `PROPOLIS_SENSOR_LOGS` label (a `cred-vnc` log's events say
+`vnc`), so a log that has not appended an event since the daemon started cannot badge a row yet.
+It is the instantaneous reading; the ops alert below adds persistence and a growth rule. The
+standalone `console` binary tails nothing and never shows it. What to do about it:
+[intake backlog](../troubleshooting/intake-backlog.md).
+
 ## Metrics
 
 `/metrics` derives everything from live DB queries plus the feed `manifest.json` on every
@@ -83,6 +98,22 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
 - Feed (from `manifest.json` when a feed dir is configured): `propolis_feed_entries{tier}`,
   `propolis_feed_window_entries{window}`, `propolis_feed_last_build_timestamp`.
 - In-memory process counters: `propolis_events_ingested_total`, `propolis_events_rejected_total`.
+- Intake backlog, one series per intake log, labelled `sensor` with its `PROPOLIS_SENSOR_LOGS`
+  name, from what each intake loop recorded after its latest poll (unified daemon only; the
+  standalone console tails nothing and publishes neither, rather than a zero that would claim a
+  caught-up log; `crates/console/src/routes/metrics.rs#push_intake_lag`):
+  - `propolis_intake_bytes_behind{sensor}` - unread bytes of the log: the file past the read
+    offset, plus the remainder of any rotated-out file still being drained, plus an unfinished
+    last line (`crates/log-tailer/src/tailer.rs#backlog_bytes`). Absent until the log's first
+    poll finishes.
+  - `propolis_intake_oldest_unread_age_seconds{sensor}` - how long the oldest unread line has
+    waited. `0` when the latest poll read every complete line. While complete lines are waiting,
+    now minus the `observed_at` of the last event appended from the log, which bounds the wait
+    of the next unread line. Absent while lines wait and no event has been appended since the
+    daemon started, because there is nothing to measure from
+    (`crates/propolis/src/ops_alert/conditions/intake_lag.rs#oldest_unread_age`).
+
+  There is no append-latency histogram: the metrics endpoint emits gauges and counters only.
 - Console saturation counters, each moving only when a bound refused work (a steady rate
   means a login spray or a connection flood, not ordinary use):
   `propolis_console_login_refused_per_ip_total`, `propolis_console_login_refused_global_total`,
@@ -104,8 +135,14 @@ Paths are owned by [filesystem paths](../reference/filesystem-paths.md).
 
 The console has a session-gated live log viewer at `/logs`, backed by an in-memory ring of the
 **1000** most recent tracing events (`crates/propolis/src/main.rs#LOG_BUFFER_CAPACITY`,
-`crates/console/src/log_buffer.rs#LogBuffer`). It is a convenience tail, not a durable log store; the journal and the
-NDJSON files are authoritative.
+`crates/console/src/log_buffer.rs#LogBuffer`), fewer when they are large: the ring is also held
+to 2 MiB charged from the entries' allocated size
+(`crates/console/src/log_buffer.rs#RING_BYTE_BUDGET`). Each entry keeps its structured fields,
+capped at 512 bytes a value, 32 fields and a 2 KiB message
+(`crates/console/src/log_buffer.rs#MAX_FIELD_VALUE_BYTES`,
+`crates/console/src/log_buffer.rs#MAX_FIELDS`, `crates/console/src/log_buffer.rs#MAX_MESSAGE_BYTES`).
+It is a convenience tail, not a durable log store; the journal and the NDJSON files are
+authoritative.
 
 For a live view of the NDJSON files themselves, every event as the sensor wrote it plus a
 10-second heartbeat naming each configured log as `following`, `missing` or `unreadable`, run
@@ -162,6 +199,24 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
   `FEED_PUSH_EXPECTED` is set, and then only after the same threshold has elapsed
   since the daemon started, since without the flag the monitor cannot tell a broken
   cron from no cron and a fresh deployment must not page before its first cron run);
+- an intake falling behind its log (`intake-lagging`, Warning). `intake-stalled` fires only when
+  a sensor's cursor stops moving with input waiting; an intake that keeps moving but more slowly
+  than its sensor writes never trips it, and that is how a telnet log once grew to 6.6 GB over
+  eleven days unnoticed. `intake-lagging` reads the two intake metrics above and fires when
+  either rule holds for a log
+  (`crates/propolis/src/ops_alert/conditions/intake_lag.rs#IntakeLagging`):
+  - **age**: its oldest unread line has waited longer than ten minutes or three intake polls
+    (`PROPOLIS_POLL_INTERVAL_MS`), whichever is longer, continuously for ten minutes;
+  - **growth**: its unread bytes rose at each of three consecutive monitor polls, each of which
+    found complete lines waiting. This fires within minutes of a log starting to run away.
+
+  The page names each log with its backlog, as `telnet (6.6 GB / 11 d)`. It clears when the log
+  is read to the end, or when the wait is back under the threshold and the backlog has not grown
+  for three consecutive polls, so a backlog hovering at the edge does not page and recover in
+  turn. An idle log never fires: with nothing unread there is no wait and no growth, and an
+  unfinished last line neither ages nor grows. The thresholds are fixed, not `PROPOLIS_OPS_*`
+  variables. While a log has not finished its first poll the condition reads it as unknown, not
+  healthy, and the monitor's own stale-probe warning covers a log that never reports;
 - vendor submission failure rate over `VENDOR_FAIL_PCT` (50%) within `VENDOR_WINDOW_SECS`
   (3600 s), gated by `VENDOR_MIN_SAMPLES` (20);
 - review backlog over `BACKLOG_MAX` (500) held for `BACKLOG_FOR_SECS` (900 s);

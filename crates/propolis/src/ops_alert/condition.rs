@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use super::config::OpsAlertConfig;
@@ -64,15 +65,36 @@ pub fn is_sensor(name: &str) -> bool {
 }
 
 /// Per-sensor intake liveness, written by each sensor's intake loop and read by the
-/// `intake-stalled` condition. `last_advanced_at` is the monitor-clock instant that sensor last
-/// consumed input; `backlog` is whether the most recent poll left unconsumed input (a full batch,
-/// or an append error with a line in hand). A sensor is stalled when it has backlog but has not
-/// advanced for `stall_for` - the backlog flag is what distinguishes a wedged ingest pipeline from
-/// a quiet honeypot with simply nothing to read.
-#[derive(Debug, Clone, Copy)]
+/// `intake-stalled` and `intake-lagging` conditions, `/metrics` and the fleet pane.
+/// `last_advanced_at` is the monitor-clock instant that sensor last consumed input; `backlog` is
+/// whether the most recent poll left unconsumed input (a full batch, or an append error with a
+/// line in hand). A sensor is stalled when it has backlog but has not advanced for `stall_for` -
+/// the backlog flag is what distinguishes a wedged ingest pipeline from a quiet honeypot with
+/// simply nothing to read.
+#[derive(Debug, Clone)]
 pub struct SensorIntake {
     pub last_advanced_at: Instant,
     pub backlog: bool,
+    /// Unread bytes of the log after the latest poll (`LogTailer::backlog_bytes`); `None` until the
+    /// first poll finishes, which readers treat as not measured rather than caught up.
+    pub bytes_behind: Option<u64>,
+    /// `observed_at` of the last event the loop appended; `None` until it appends one.
+    pub last_ingested_observed_at: Option<DateTime<Utc>>,
+    /// The `event.sensor` names the log's appended events carried, for the fleet pane.
+    pub reported_sensors: Vec<String>,
+}
+
+impl SensorIntake {
+    /// The entry a loop seeds before its first poll: recently alive, nothing measured yet.
+    pub fn started(now: Instant) -> Self {
+        Self {
+            last_advanced_at: now,
+            backlog: false,
+            bytes_behind: None,
+            last_ingested_observed_at: None,
+            reported_sensors: Vec::new(),
+        }
+    }
 }
 
 /// Shared per-sensor intake map, keyed by the same leaked sensor name the supervisor uses. Each
@@ -123,6 +145,9 @@ pub struct MonitorCtx {
     pub fetch_enabled: bool,
     pub supervisor: SupervisorHandle,
     pub intake_progress: IntakeProgress,
+    /// How often an idle intake loop polls its log (`PROPOLIS_POLL_INTERVAL_MS`); three of them
+    /// raise the `intake-lagging` age threshold above its ten-minute floor.
+    pub intake_poll_interval: Duration,
     /// Sibling marker file the feed loop touches on each successful publish (its mtime is the last
     /// publish time). See `conditions::feed`.
     pub feed_marker_path: PathBuf,

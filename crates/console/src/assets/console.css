@@ -431,6 +431,15 @@ td.ip a:hover { color: var(--brand); }
 .session-user { color: var(--info-text); }
 .session-count { margin-left: auto; white-space: nowrap; }
 .evidence-table th, .evidence-table td { padding: 0.45rem 0.75rem; font-size: 0.8rem; }
+/* Repeated identical sessions: one card holding the members, each still its own card. */
+.fold-count { font-family: var(--font-mono); font-weight: 600; color: var(--text); background: var(--bg); border: 1px solid var(--border-bright); border-radius: var(--radius-sm); padding: 0 0.4rem; font-size: 0.74rem; }
+.fold-members { padding: 0.6rem 0.6rem 0.6rem 1.2rem; }
+/* A run of echo-loader chunk writes: one row, the lines behind an expander. */
+.chunk-toggle > summary { cursor: pointer; }
+.chunk-toggle > summary:hover { color: var(--text); }
+.chunk-count { font-weight: 600; color: var(--high-text); }
+.chunk-lines { margin: 0.4rem 0 0; padding-left: 2.2rem; font-size: 0.72rem; max-height: 22rem; overflow-y: auto; }
+.chunk-lines li { white-space: pre-wrap; word-break: break-all; padding: 0.05rem 0; }
 .raw-toggle { display: inline-block; }
 .raw-toggle > summary { cursor: pointer; color: var(--text-muted); font-size: 0.72rem; }
 .raw-toggle > summary:hover { color: var(--text); }
@@ -455,6 +464,28 @@ td.ip a:hover { color: var(--brand); }
 .chart-box { position: relative; height: 200px; margin: 0.75rem 0 0.5rem; }
 .chart-box-sm { position: relative; height: 220px; }
 .chart-box-compact { position: relative; height: 110px; margin: 0.75rem 0 0.5rem; }
+
+/* -- Dashboard Recent activity: a folded run's count -- */
+.run-count { font-family: var(--font-mono); font-weight: 600; color: var(--text); }
+
+/* -- Review queue: the context line under each pending row -- */
+tr.has-context td { border-bottom: none; padding-bottom: 0.2rem; }
+tr.queue-context td { padding-top: 0; font-size: 0.76rem; color: var(--text-muted); }
+tr.queue-context td > * { margin-right: 0.9rem; }
+tr.queue-context:hover td { background: transparent; }
+.ctx-sensors { display: inline-flex; gap: 0.3rem; }
+.ctx-chip { font-family: var(--font-mono); font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: var(--radius-sm); background: var(--surface-raised); border: 1px solid var(--border); color: var(--text); }
+.ctx-item { display: inline-flex; align-items: center; gap: 0.35rem; vertical-align: middle; }
+.ctx-notable code { color: var(--text); font-size: 0.74rem; overflow-wrap: anywhere; }
+
+/* -- Attackers paging and the tier/score note above the table -- */
+.ips-count { margin-bottom: 0.6rem; }
+.table-note { font-size: 0.78rem; color: var(--text-muted); margin: 0 0 0.75rem; max-width: 70rem; }
+.table-note strong { color: var(--text); font-weight: 600; }
+.pager { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.6rem 0; font-size: 0.8rem; }
+.pager a, .pager span { padding: 0.25rem 0.65rem; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+.pager a:hover { border-color: var(--border-bright); text-decoration: none; }
+.pager span { color: var(--text-faint); }
 
 .section-title { font-size: 0.9rem; font-weight: 600; margin: 1.75rem 0 0.75rem; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
@@ -507,8 +538,44 @@ button:hover { border-color: var(--text-muted); }
 .log-viewer { height: 65vh; min-height: 320px; overflow-y: auto; background: var(--bg); padding: 0.4rem 0; }
 .log-lines { display: flex; flex-direction: column; }
 .log-line {
-  display: flex; align-items: baseline; gap: 0.6rem; padding: 0.15rem 0.9rem;
-  font-family: var(--font-mono); font-size: 0.78rem; white-space: pre-wrap; word-break: break-word; border-left: 2px solid transparent;
+  font-family: var(--font-mono); font-size: 0.78rem; border-left: 2px solid transparent;
+}
+.log-summary {
+  display: flex; align-items: baseline; gap: 0.6rem; padding: 0.15rem 0.9rem 0.15rem 1.5rem;
+  white-space: pre-wrap; word-break: break-word; list-style: none;
+}
+/* An expandable row (one with fields, or a fold) carries a hand-drawn caret in the gutter, as the
+   session cards do; a plain row keeps the same indent so the columns still line up. */
+summary.log-summary { cursor: pointer; position: relative; }
+summary.log-summary::-webkit-details-marker { display: none; }
+summary.log-summary::before { content: "\25B8"; position: absolute; left: 0.75rem; color: var(--text-faint); font-size: 0.65rem; transition: transform 120ms ease; }
+.log-entry[open] > summary.log-summary::before { transform: rotate(90deg); }
+summary.log-summary:hover { background: var(--surface-raised); }
+.log-kv { white-space: nowrap; }
+/* Inline on the row each value is cut to a readable width; the expanded row shows it whole. */
+.log-summary .log-v { display: inline-block; max-width: 36ch; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; vertical-align: bottom; }
+.log-k { color: var(--text-faint); }
+.log-v { color: var(--info-text); }
+.log-more { color: var(--text-faint); }
+.log-count { display: inline-block; font-weight: 600; font-size: 0.7rem; color: var(--text); background: var(--surface-raised); border: 1px solid var(--border-bright); border-radius: var(--radius-sm); padding: 0 0.35em; margin-right: 0.2rem; }
+.log-detail { padding: 0.3rem 0.9rem 0.6rem 1.5rem; }
+.log-fields { display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 0.9rem; margin: 0; }
+.log-fields dt { color: var(--text-faint); }
+.log-fields dd { margin: 0; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.log-members { width: auto; }
+.log-members td { padding: 0.1rem 0.9rem 0.1rem 0; border: none; font-size: 0.74rem; vertical-align: top; }
+.log-members .log-kv { white-space: normal; word-break: break-word; }
+.log-hidden { margin: 0; padding: 0.45rem 0.95rem; font-size: 0.76rem; color: var(--text-muted); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 0.75rem; }
+.log-hidden[hidden] { display: none; }
+.log-hidden button { font-size: 0.7rem; padding: 0.15rem 0.55rem; }
+@media (max-width: 640px) {
+  /* Time, level and target share the first line; the message and its fields take the next. */
+  .log-summary { flex-wrap: wrap; gap: 0.1rem 0.5rem; padding-left: 1.3rem; }
+  .log-message { flex-basis: 100%; }
+  .log-target { max-width: 55%; }
+  .log-summary .log-v { max-width: 22ch; }
+  .log-detail { padding-left: 1.3rem; }
+  .log-kv { white-space: normal; }
 }
 .log-line.level-error { background: var(--alert-dim); border-left-color: var(--alert); }
 .log-line.level-warn { background: var(--attention-dim); border-left-color: var(--attention); }

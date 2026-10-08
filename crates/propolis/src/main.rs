@@ -170,10 +170,8 @@ async fn run_intake_sensor(
     // its first real stall, rather than looking stalled from t=0.
     {
         let mut map = intake_progress.lock().unwrap_or_else(|p| p.into_inner());
-        map.entry(intake_key).or_insert(SensorIntake {
-            last_advanced_at: Instant::now(),
-            backlog: false,
-        });
+        map.entry(intake_key)
+            .or_insert_with(|| SensorIntake::started(Instant::now()));
     }
 
     loop {
@@ -187,23 +185,30 @@ async fn run_intake_sensor(
 
         let result = runner.run_batch().await;
 
-        // Publish intake liveness for the ops-monitor's intake-stalled condition.
+        // Publish intake liveness and lag for the ops-monitor's intake-stalled and intake-lagging
+        // conditions, `/metrics` and the fleet pane.
         let (advanced, backlog) = progress_from_batch(
             result.ingested,
             result.rejected,
             result.probe_confirmations,
             result.errors,
         );
+        let bytes_behind = runner.backlog_bytes();
         {
             let mut map = intake_progress.lock().unwrap_or_else(|p| p.into_inner());
-            let entry = map.entry(intake_key).or_insert(SensorIntake {
-                last_advanced_at: Instant::now(),
-                backlog: false,
-            });
+            let entry = map
+                .entry(intake_key)
+                .or_insert_with(|| SensorIntake::started(Instant::now()));
             if advanced {
                 entry.last_advanced_at = Instant::now();
             }
             entry.backlog = backlog;
+            entry.bytes_behind = Some(bytes_behind);
+            entry.last_ingested_observed_at = runner.last_ingested_observed_at();
+            // The set only grows, so an unchanged length is an unchanged set.
+            if entry.reported_sensors.len() != runner.reported_sensors().len() {
+                entry.reported_sensors = runner.reported_sensors().iter().cloned().collect();
+            }
         }
 
         // The probe confirmations are logged but deliberately left out of the two counters
@@ -437,6 +442,35 @@ struct ConsoleRuntime {
     events_rejected: Arc<std::sync::atomic::AtomicU64>,
     /// The supervisor map, so `/ready` can report a subsystem that has given up.
     supervisor: SupervisorHandle,
+    /// Each intake log's backlog, for `/metrics` and the fleet pane.
+    intake_lag: console::intake_lag::IntakeLagSource,
+}
+
+/// The console's view of the intake loops' backlog: one entry per log that has finished a poll,
+/// judged behind by the same rule as the `intake-lagging` condition's age branch.
+fn intake_lag_source(
+    progress: IntakeProgress,
+    poll_interval: Duration,
+) -> console::intake_lag::IntakeLagSource {
+    use ops_alert::conditions::intake_lag::{age_threshold, is_behind, oldest_unread_age};
+    let threshold = age_threshold(poll_interval);
+    Arc::new(move || {
+        let now = chrono::Utc::now();
+        let map = progress.lock().unwrap_or_else(|p| p.into_inner());
+        map.iter()
+            .filter_map(|(log, intake)| {
+                let bytes_behind = intake.bytes_behind?;
+                let age = oldest_unread_age(intake, now);
+                Some(console::intake_lag::IntakeLag {
+                    log: (*log).to_string(),
+                    sensors: intake.reported_sensors.clone(),
+                    bytes_behind,
+                    oldest_unread_age: age,
+                    behind: is_behind(age, threshold),
+                })
+            })
+            .collect()
+    })
 }
 
 /// Console web server. Mirrors `console/src/main.rs`.
@@ -458,6 +492,7 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         events_ingested,
         events_rejected,
         supervisor,
+        intake_lag,
     } = rt;
     // Sorted so the readiness body is stable across polls; a poisoned lock reads as "nothing
     // known", never as a crash inside the probe.
@@ -513,6 +548,7 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         trusted_proxy,
         metrics_token: metrics_token.map(Arc::from),
         gave_up_subsystems,
+        intake_lag,
     };
 
     console::warn_if_console_exposed(bind_addr);
@@ -1487,6 +1523,7 @@ async fn main() {
         let ing = events_ingested.clone();
         let rej = events_rejected.clone();
         let console_supervisor = supervisor_state.clone();
+        let console_intake_lag = intake_lag_source(intake_progress.clone(), config.poll_interval);
 
         handles.push(spawn_supervised_named(
             "console",
@@ -1504,6 +1541,7 @@ async fn main() {
                 let fleet_listeners = console_fleet_listeners.clone();
                 let deploy_stamp_path = console_deploy_stamp.clone();
                 let supervisor = console_supervisor.clone();
+                let intake_lag = console_intake_lag.clone();
                 async move {
                     run_console(
                         ConsoleRuntime {
@@ -1523,6 +1561,7 @@ async fn main() {
                             events_ingested: ing,
                             events_rejected: rej,
                             supervisor,
+                            intake_lag,
                         },
                         token,
                     )
@@ -1552,6 +1591,7 @@ async fn main() {
         let feed_push_marker =
             ops_alert::conditions::feed::push_marker_path(&config.feed_output_dir);
         let feed_build_interval = config.feed_build_interval;
+        let intake_poll_interval = config.poll_interval;
 
         handles.push(spawn_supervised_named(
             "ops-monitor",
@@ -1581,6 +1621,7 @@ async fn main() {
                         fetch_enabled,
                         supervisor,
                         intake_progress,
+                        intake_poll_interval,
                         feed_marker_path,
                         feed_push_marker_path,
                         feed_build_interval,
@@ -1968,5 +2009,99 @@ mod own_ips_public_address_tests {
         );
 
         std::fs::set_permissions(&bad_parent, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+}
+
+#[cfg(test)]
+mod intake_lag_source_tests {
+    use super::*;
+
+    /// What the console receives from the intake map: a log that has not finished a poll is left
+    /// out (unmeasured, not caught up), a log read to the end is not behind, and a log whose lines
+    /// have waited 11 days is behind with its own sensor names attached.
+    #[test]
+    fn the_console_sees_measured_logs_only_and_the_age_rule_decides_behind() {
+        let progress: IntakeProgress = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut map = progress.lock().unwrap();
+            map.insert("ssh", SensorIntake::started(Instant::now()));
+            let mut vnc = SensorIntake::started(Instant::now());
+            vnc.bytes_behind = Some(120);
+            vnc.last_ingested_observed_at = Some(chrono::Utc::now());
+            map.insert("cred-vnc", vnc);
+            let mut telnet = SensorIntake::started(Instant::now());
+            telnet.backlog = true;
+            telnet.bytes_behind = Some(6_600_000_000);
+            telnet.last_ingested_observed_at =
+                Some(chrono::Utc::now() - chrono::Duration::days(11));
+            telnet.reported_sensors = vec!["telnet".into()];
+            map.insert("telnet", telnet);
+        }
+
+        let mut logs = intake_lag_source(progress, Duration::from_secs(1))();
+        logs.sort_by(|a, b| a.log.cmp(&b.log));
+        assert_eq!(
+            logs.iter().map(|l| l.log.as_str()).collect::<Vec<_>>(),
+            vec!["cred-vnc", "telnet"]
+        );
+        assert!(!logs[0].behind);
+        assert_eq!(logs[0].oldest_unread_age, Some(Duration::ZERO));
+        assert!(logs[1].behind);
+        assert_eq!(logs[1].bytes_behind, 6_600_000_000);
+        assert_eq!(logs[1].sensors, vec!["telnet".to_string()]);
+        assert!(logs[1].oldest_unread_age >= Some(Duration::from_secs(11 * 86_400)));
+    }
+
+    /// The intake loop itself publishes the backlog reading, from `None` before its first poll to
+    /// the bytes left after it. Lines that fail to parse are consumed without a database, which
+    /// is what lets the real loop run here on a pool that never connects.
+    #[tokio::test]
+    async fn the_intake_loop_publishes_its_backlog_after_each_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        std::fs::write(&log_path, "not json\n".repeat(150)).unwrap();
+        let progress: IntakeProgress = Arc::new(Mutex::new(HashMap::new()));
+        let cancel = CancellationToken::new();
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://unused/unused")
+            .unwrap();
+        let task = tokio::spawn(run_intake_sensor(
+            SensorLogConfig {
+                name: "telnet".into(),
+                log_path,
+            },
+            "telnet",
+            pool,
+            dir.path().join("cursors"),
+            Duration::from_millis(10),
+            cancel.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            progress.clone(),
+            Arc::new(HashSet::new()),
+            Duration::from_secs(600),
+        ));
+
+        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let bytes = progress
+                    .lock()
+                    .unwrap()
+                    .get("telnet")
+                    .and_then(|s| s.bytes_behind);
+                if bytes == Some(0) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        cancel.cancel();
+        task.await.unwrap();
+        assert!(
+            drained.is_ok(),
+            "the loop never published a drained backlog: {:?}",
+            progress.lock().unwrap().get("telnet")
+        );
     }
 }

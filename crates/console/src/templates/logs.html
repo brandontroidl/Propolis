@@ -5,33 +5,63 @@
 
 <div class="filter-form">
   <div class="field">
-    <label for="log-level-filter">Level</label>
+    <label for="log-level-filter">Show</label>
     <select id="log-level-filter">
-      <option value="">Any</option>
-      <option value="ERROR">Error</option>
-      <option value="WARN">Warn</option>
-      <option value="INFO">Info</option>
-      <option value="DEBUG">Debug</option>
-      <option value="TRACE">Trace</option>
+      <option value="ERROR">Errors only</option>
+      <option value="WARN" selected>Warnings and errors</option>
+      <option value="INFO">Info and above</option>
+      <option value="DEBUG">Debug and above</option>
+      <option value="">Everything</option>
     </select>
   </div>
   <div class="field">
     <label for="log-text-filter">Filter</label>
-    <input type="text" id="log-text-filter" placeholder="target or message text..." autocomplete="off">
+    <input type="text" id="log-text-filter" placeholder="target, message or field..." autocomplete="off">
   </div>
   <button type="button" id="log-pause-toggle">Pause</button>
 </div>
 
 <div class="panel">
   <div class="panel-head">Live tail<span id="log-connection-status" class="dim mono">connecting...</span></div>
+  {#- Rows below the level filter are hidden by logs.js; this line says how many, so a quiet
+      warnings view never reads as an empty log. Without script every row shows and it stays hidden. -#}
+  <p class="log-hidden" id="log-hidden" hidden><span id="log-hidden-text">{{ below_warn }} lower-level row{% if below_warn != 1 %}s{% endif %} hidden</span> <button type="button" id="log-show-all">Show everything</button></p>
   <div class="log-viewer" id="log-viewer">
     <div class="log-lines" id="log-lines">
-      {% for e in entries %}
-      <div class="log-line level-{{ e.level|lower }}" data-level="{{ e.level|upper }}">
-        <span class="log-time mono">{{ e.timestamp }}</span>
-        <span class="log-level-badge log-level-badge-{{ e.level|lower }}">{{ e.level }}</span>
-        <span class="log-target mono">{{ e.target }}</span>
-        <span class="log-message">{{ e.message }}</span>
+      {% for r in rows %}
+      <div class="log-line level-{{ r.level_slug }}" data-level="{{ r.level|upper }}" data-target="{{ r.target }}" data-message="{{ r.message }}" data-count="{{ r.count }}">
+        {% if r.fields or r.count > 1 %}
+        <details class="log-entry">
+          <summary class="log-summary">
+            <span class="log-time mono" title="{{ r.timestamp }}">{{ r.time }}</span>
+            <span class="log-level-badge log-level-badge-{{ r.level_slug }}">{{ r.level }}</span>
+            <span class="log-target mono">{{ r.target }}</span>
+            <span class="log-message">{{ r.message }}{% if r.count > 1 %} <span class="log-count" title="{{ r.count }} identical entries in a row, {{ r.first_timestamp }} to {{ r.timestamp }}">x{{ r.count }}</span>{% endif %}{% for f in r.fields %} <span class="log-kv" data-key="{{ f.key }}" data-more="{{ f.more }}"><span class="log-k">{{ f.key }}</span>=<span class="log-vals">{% for v in f.values %}{% if not loop.first %}/{% endif %}<span class="log-v">{{ v }}</span>{% endfor %}</span>{% if f.more > 0 %}<span class="log-more">/+{{ f.more }}</span>{% endif %}</span>{% endfor %}</span>
+          </summary>
+          <div class="log-detail">
+            {% if r.count > 1 %}
+            <table class="log-members">
+              <tbody>
+                {% for m in r.members %}
+                <tr><td class="log-time mono">{{ m.time }}</td><td>{% for f in m.fields %}<span class="log-kv"><span class="log-k">{{ f.key }}</span>=<span class="log-v">{{ f.value }}</span></span> {% else %}<span class="dim">no fields</span>{% endfor %}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            {% else %}
+            <dl class="log-fields">
+              {% for f in r.fields %}<dt>{{ f.key }}</dt><dd class="mono">{{ f.values|first }}</dd>{% endfor %}
+            </dl>
+            {% endif %}
+          </div>
+        </details>
+        {% else %}
+        <div class="log-summary">
+          <span class="log-time mono" title="{{ r.timestamp }}">{{ r.time }}</span>
+          <span class="log-level-badge log-level-badge-{{ r.level_slug }}">{{ r.level }}</span>
+          <span class="log-target mono">{{ r.target }}</span>
+          <span class="log-message">{{ r.message }}</span>
+        </div>
+        {% endif %}
       </div>
       {% else %}
       <p class="empty-line" id="log-empty">no log entries yet</p>

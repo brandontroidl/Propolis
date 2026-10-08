@@ -2,13 +2,13 @@
 //! `core_scoring::append_event`, the per-poll unit of work a sensor's intake loop repeats. See
 //! "The runner" in `internal/design/03-event-intake-aggregation.md`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::converter::convert;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use core_scoring::{append_event, append_telemetry_event};
 use log_tailer::LogTailer;
 use sensor_wire::SensorEvent;
@@ -46,7 +46,14 @@ pub struct IntakeRunner {
     sensor_name: String,
     probe_sources: Arc<HashSet<IpAddr>>,
     probe_grace: Duration,
+    last_ingested_observed_at: Option<DateTime<Utc>>,
+    reported_sensors: BTreeSet<String>,
 }
+
+/// How many distinct `event.sensor` names one log's runner remembers. A log carries one sensor's
+/// events, so a handful is generous; the bound only stops a misbehaving sensor writing a fresh
+/// name per line from growing the set without limit.
+const MAX_REPORTED_SENSORS: usize = 8;
 
 impl IntakeRunner {
     /// `probe_sources` are the control plane's own egress addresses, from
@@ -72,7 +79,30 @@ impl IntakeRunner {
             sensor_name,
             probe_sources,
             probe_grace,
+            last_ingested_observed_at: None,
+            reported_sensors: BTreeSet::new(),
         }
+    }
+
+    /// How many bytes of this sensor's log are still unread; see
+    /// [`LogTailer::backlog_bytes`] for exactly what is counted.
+    pub fn backlog_bytes(&self) -> u64 {
+        self.tailer.backlog_bytes()
+    }
+
+    /// `observed_at` of the last event this runner appended, in log order; `None` until it has
+    /// appended one. While the log is behind, the next unread line was written after this one, so
+    /// `now` minus this bounds how long that line has waited.
+    pub fn last_ingested_observed_at(&self) -> Option<DateTime<Utc>> {
+        self.last_ingested_observed_at
+    }
+
+    /// The `event.sensor` names this log's appended events carried, the first eight distinct
+    /// ones. The fleet pane keys listeners on that name, not on the
+    /// `PROPOLIS_SENSOR_LOGS` label this runner was started under, so this is how a log's state
+    /// finds its listener rows.
+    pub fn reported_sensors(&self) -> &BTreeSet<String> {
+        &self.reported_sensors
     }
 
     /// Reads and processes one batch (up to 100 lines) from the tailer.
@@ -164,13 +194,21 @@ impl IntakeRunner {
             // refuse each other's signals (see `core_scoring::repository`), so routing on the
             // signal's own classification here is what lets a sensor emit an outcome record at
             // all: handing one to `append_event` is a hard error, by design.
+            let observed_at = input.observed_at;
+            let sensor = input.sensor.clone();
             let appended = if input.signal_type.is_telemetry() {
                 append_telemetry_event(&self.pool, input).await
             } else {
                 append_event(&self.pool, input).await.map(|_score| ())
             };
             match appended {
-                Ok(()) => result.ingested += 1,
+                Ok(()) => {
+                    result.ingested += 1;
+                    self.last_ingested_observed_at = Some(observed_at);
+                    if self.reported_sensors.len() < MAX_REPORTED_SENSORS {
+                        self.reported_sensors.insert(sensor);
+                    }
+                }
                 Err(e) => {
                     tracing::error!(
                         sensor = %self.sensor_name,

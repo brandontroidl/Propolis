@@ -376,3 +376,71 @@ async fn rotation_survival_no_events_lost() {
         );
     }
 }
+
+/// The lag inputs the daemon publishes per log: after a full batch the unread bytes are exactly
+/// the line left behind, the last ingested `observed_at` is the 100th line's, and the sensor name
+/// is the one the events carried rather than the log's label. A drained log reads 0 bytes behind.
+#[sqlx::test(migrations = false)]
+async fn runner_reports_backlog_last_observed_and_the_sensor_name_its_events_carried(pool: PgPool) {
+    sqlx::migrate!("../core-scoring/migrations")
+        .run(&pool)
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let start = chrono::Utc::now() - chrono::Duration::days(11);
+    let events: Vec<SensorEvent> = (0..101i64)
+        .map(|i| SensorEvent {
+            v: WIRE_VERSION,
+            source_ip: format!("198.51.100.{}", i + 1).parse().unwrap(),
+            wan_ip: Some("203.0.113.4".parse().unwrap()),
+            sensor: "vnc".into(),
+            signal_type: SIGNAL_HONEYPOT_LOGIN_ATTEMPT.into(),
+            protocol: PROTO_TCP.into(),
+            authenticated: true,
+            observed_at: start + chrono::Duration::seconds(i),
+            metadata: serde_json::json!({"protocol_label": "vnc"}),
+            sample: None,
+            session_id: None,
+            occurrence_id: None,
+        })
+        .collect();
+    for event in &events {
+        write_event_line(&log_path, event);
+    }
+    let last_line_bytes = serde_json::to_string(&events[100]).unwrap().len() as u64 + 1;
+
+    let tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    let mut runner = IntakeRunner::new(
+        tailer,
+        pool.clone(),
+        "cred-vnc".into(),
+        no_probe_sources(),
+        PROBE_GRACE,
+    );
+    assert_eq!(
+        runner.backlog_bytes(),
+        std::fs::metadata(&log_path).unwrap().len()
+    );
+    assert_eq!(runner.last_ingested_observed_at(), None);
+    assert!(runner.reported_sensors().is_empty());
+
+    assert_eq!(runner.run_batch().await.ingested, 100);
+    assert_eq!(runner.backlog_bytes(), last_line_bytes);
+    assert_eq!(
+        runner.last_ingested_observed_at(),
+        Some(events[99].observed_at)
+    );
+    assert_eq!(
+        runner.reported_sensors().iter().collect::<Vec<_>>(),
+        vec!["vnc"],
+        "the event's own sensor name, not the cred-vnc log label"
+    );
+
+    assert_eq!(runner.run_batch().await.ingested, 1);
+    assert_eq!(runner.backlog_bytes(), 0);
+    assert_eq!(
+        runner.last_ingested_observed_at(),
+        Some(events[100].observed_at)
+    );
+}

@@ -79,7 +79,8 @@ use crate::routes::context::{BaseContext, base_context};
 use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
 use crate::routes::format::{
-    format_activity, format_relative_time, format_sensor_label, format_timestamp, tier_label,
+    format_activity, format_relative_time, format_sensor_label, format_timestamp, protocol_label,
+    tier_label,
 };
 use crate::templates::script_json;
 
@@ -147,15 +148,49 @@ struct SessionGroup {
     command_count: usize,
     event_count: usize,
     events: Vec<EventRow>,
+    /// How the card's table lists `events`: one row per event, except that a run of echo-loader
+    /// chunk writes to one file is one row ([`timeline_items`]).
+    items: Vec<TimelineItem>,
     expanded: bool,
-    /// The latest `observed_at` in the group, formatted like `start_time`. Not rendered by the
-    /// template (there's no "session end" field in the card header - `duration` already conveys
+    /// The latest `observed_at` in the group. Not rendered by the template (there's no "session end" field in the card header - `duration` already conveys
     /// the span) - it exists purely as [`group_into_sessions`]'s sort key, per the design spec's
     /// "Order sessions by most recent first (latest `observed_at` in each group)": sorting on
     /// `start_time` instead would put a still-ongoing long session behind a short session that
     /// started later but both started and ended after it.
     #[serde(skip)]
-    end_time: String,
+    end_time: DateTime<Utc>,
+    /// The session's commands in order: what [`fold_repeated_sessions`] compares.
+    #[serde(skip)]
+    commands: Vec<String>,
+}
+
+/// One row of a session card: `events[start..end]` of its session. A single event unless
+/// `chunk_file` is set, in which case the range is a run of consecutive command lines that each
+/// wrote one echo-loader chunk to that file (the sensor's `assembled_file`/`chunk_index` keys).
+#[derive(Debug, Serialize)]
+struct TimelineItem {
+    start: usize,
+    end: usize,
+    chunk_file: Option<String>,
+    first_chunk: u64,
+    last_chunk: u64,
+}
+
+/// Consecutive sessions from one sensor that ran the same command sequence, newest first: a
+/// retry loop re-running one script shows as one card with a count instead of a card per retry.
+#[derive(Debug, Serialize)]
+struct SessionFold {
+    sessions: Vec<SessionGroup>,
+    repeat: usize,
+    /// The distinct usernames the sessions logged in with, in first-seen order.
+    users: Vec<String>,
+    /// The oldest session's start, and how long ago the newest one started.
+    first_start: String,
+    latest_relative: String,
+    sensor: String,
+    protocol: String,
+    command_count: usize,
+    expanded: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,6 +341,7 @@ async fn detail(
         .last()
         .map(|e| format_cursor(e.raw_observed_at, e.id));
     let (sessions, ungrouped) = group_into_sessions(all_events, 3);
+    let session_folds = fold_repeated_sessions(sessions);
 
     let wan_rows = sqlx::query(
         "SELECT host(wan_ip) AS wan_ip, COUNT(*) AS event_count, \
@@ -471,7 +507,7 @@ async fn detail(
         max_confidence => format!("{:.3}", score.max_confidence),
         first_seen => format_timestamp(score.first_seen),
         last_seen => format_timestamp(score.last_seen),
-        sessions,
+        session_folds,
         ungrouped,
         total_event_count,
         has_more_events,
@@ -523,11 +559,12 @@ async fn events_fragment(
     // page load's newest-first cards, these are all strictly older than what is already on
     // screen, so none of them is "the current activity" an operator lands on an open view of.
     let (sessions, ungrouped) = group_into_sessions(events, 0);
+    let session_folds = fold_repeated_sessions(sessions);
 
     let tmpl = state.templates.get_template("events_fragment.html")?;
     let html = tmpl.render(context! {
         ip => ip.to_string(),
-        sessions,
+        session_folds,
         ungrouped,
         has_more_events,
         next_cursor,
@@ -745,7 +782,7 @@ async fn fetch_evidence_rows(
                 .get("xor_key")
                 .and_then(|v| v.as_u64())
                 .map(|k| format!("0x{k:02x}")),
-            protocol: format!("{protocol:?}"),
+            protocol: protocol_label(protocol).to_string(),
             authenticated: row.try_get("authenticated")?,
             wan_ip: row
                 .try_get::<Option<String>, _>("wan_ip")?
@@ -1149,7 +1186,8 @@ pub(crate) fn extract_detail(signal_type: &str, metadata: &serde_json::Value) ->
 }
 
 /// Human-readable byte count for the malware-upload detail column (`4.2 KB`, `1.1 MB`).
-fn format_bytes(b: u64) -> String {
+/// `pub(crate)` because the review queue's row context names upload sizes the same way.
+pub(crate) fn format_bytes(b: u64) -> String {
     if b < 1024 {
         format!("{b} B")
     } else if b < 1024 * 1024 {
@@ -1209,10 +1247,11 @@ fn group_into_sessions(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let command_count = events
+            let commands: Vec<String> = events
                 .iter()
                 .filter(|e| e.signal_type_raw == "honeypot_command_exec")
-                .count();
+                .map(|e| e.detail.clone())
+                .collect();
 
             SessionGroup {
                 session_id,
@@ -1222,11 +1261,13 @@ fn group_into_sessions(
                 sensor: format_sensor_label(&events[0].sensor_raw),
                 protocol: events[0].protocol.clone(),
                 username,
-                command_count,
+                command_count: commands.len(),
                 event_count: events.len(),
-                end_time: format_timestamp(end),
+                end_time: end,
+                items: timeline_items(&events),
                 events,
                 expanded: false,
+                commands,
             }
         })
         .collect();
@@ -1234,11 +1275,91 @@ fn group_into_sessions(
     // Most-recent-first by session END (latest `observed_at` in the group) -
     // `internal/design/11-console-forensics.md`'s "Order sessions by most recent first (latest
     // `observed_at` in each group)", not by when each session started.
-    groups.sort_by(|a, b| b.end_time.cmp(&a.end_time));
+    groups.sort_by_key(|g| std::cmp::Reverse(g.end_time));
     for (i, g) in groups.iter_mut().enumerate() {
         g.expanded = i < recent_expanded;
     }
     (groups, ungrouped)
+}
+
+/// The echo-loader chunk a command event wrote: the file and the chunk's number.
+fn chunk_of(event: &EventRow) -> Option<(&str, u64)> {
+    if event.signal_type_raw != "honeypot_command_exec" {
+        return None;
+    }
+    Some((
+        event.metadata.get("assembled_file")?.as_str()?,
+        event.metadata.get("chunk_index")?.as_u64()?,
+    ))
+}
+
+/// Lists a session's events (oldest first) as card rows: each event its own row, except that two
+/// or more consecutive chunk writes to the same file become one row. Only adjacent chunks join,
+/// so anything the loader ran between two chunks still shows where it happened.
+fn timeline_items(events: &[EventRow]) -> Vec<TimelineItem> {
+    let mut items: Vec<TimelineItem> = Vec::new();
+    for (i, event) in events.iter().enumerate() {
+        let chunk = chunk_of(event);
+        if let (Some((file, index)), Some(last)) = (chunk, items.last_mut())
+            && chunk_of(&events[last.end - 1]).is_some_and(|(f, _)| f == file)
+        {
+            last.end = i + 1;
+            last.chunk_file = Some(file.to_string());
+            last.last_chunk = index;
+            continue;
+        }
+        items.push(TimelineItem {
+            start: i,
+            end: i + 1,
+            chunk_file: None,
+            first_chunk: chunk.map_or(0, |(_, n)| n),
+            last_chunk: chunk.map_or(0, |(_, n)| n),
+        });
+    }
+    items
+}
+
+/// Folds consecutive sessions (newest first, as [`group_into_sessions`] orders them) from one
+/// sensor that ran the same, non-empty command sequence. A session that ran no commands never
+/// folds: two bare logins with different credentials are two attempts worth seeing.
+fn fold_repeated_sessions(groups: Vec<SessionGroup>) -> Vec<SessionFold> {
+    let mut folds: Vec<Vec<SessionGroup>> = Vec::new();
+    for group in groups {
+        if let Some(run) = folds.last_mut()
+            && let Some(prev) = run.last()
+            && !group.commands.is_empty()
+            && prev.sensor == group.sensor
+            && prev.commands == group.commands
+        {
+            run.push(group);
+            continue;
+        }
+        folds.push(vec![group]);
+    }
+    folds
+        .into_iter()
+        .map(|sessions| {
+            let mut users: Vec<String> = Vec::new();
+            for s in sessions.iter().rev() {
+                if !s.username.is_empty() && !users.contains(&s.username) {
+                    users.push(s.username.clone());
+                }
+            }
+            let newest = &sessions[0];
+            let oldest = &sessions[sessions.len() - 1];
+            SessionFold {
+                repeat: sessions.len(),
+                users,
+                first_start: oldest.start_time.clone(),
+                latest_relative: newest.start_relative.clone(),
+                sensor: newest.sensor.clone(),
+                protocol: newest.protocol.clone(),
+                command_count: newest.command_count,
+                expanded: newest.expanded,
+                sessions,
+            }
+        })
+        .collect()
 }
 
 /// `IpAddr::to_string()`/`Display` can only ever produce digits, `.`, and `:` - never an HTML
@@ -1278,7 +1399,7 @@ mod tests {
             activity: format_activity("ssh", signal_type),
             detail: extract_detail(signal_type, &metadata),
             xor_badge: None,
-            protocol: "Tcp".into(),
+            protocol: "TCP".into(),
             authenticated: true,
             wan_ip: "203.0.113.9".into(),
             metadata_json: metadata.to_string(),
@@ -1573,6 +1694,101 @@ mod tests {
         let (groups, ungrouped) = group_into_sessions(rows, 3);
         assert!(groups.is_empty());
         assert_eq!(ungrouped.len(), 1);
+    }
+
+    fn command(sid: &str, ago: i64, command: &str) -> EventRow {
+        event_row(
+            Some(sid),
+            "honeypot_command_exec",
+            ago,
+            json!({ "command": command }),
+        )
+    }
+
+    fn chunk(sid: &str, ago: i64, file: &str, index: u64) -> EventRow {
+        event_row(
+            Some(sid),
+            "honeypot_command_exec",
+            ago,
+            json!({ "command": format!("echo -ne '\\x7f' >> {file}"), "assembled_file": file, "chunk_index": index }),
+        )
+    }
+
+    #[test]
+    fn only_adjacent_chunk_writes_to_one_file_share_a_row() {
+        let rows = vec![
+            command("s", 100, "enable"),
+            chunk("s", 99, "/tmp/.i", 1),
+            chunk("s", 98, "/tmp/.i", 2),
+            chunk("s", 97, "/tmp/.i", 3),
+            command("s", 96, "chmod 777 .i"),
+            chunk("s", 95, "/tmp/.j", 1),
+            chunk("s", 94, "/tmp/.i", 4),
+        ];
+        let (groups, _) = group_into_sessions(rows, 1);
+        let shape: Vec<(usize, Option<&str>, u64, u64)> = groups[0]
+            .items
+            .iter()
+            .map(|i| {
+                (
+                    i.end - i.start,
+                    i.chunk_file.as_deref(),
+                    i.first_chunk,
+                    i.last_chunk,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (1, None, 0, 0),
+                (3, Some("/tmp/.i"), 1, 3),
+                (1, None, 0, 0),
+                (1, None, 1, 1),
+                (1, None, 4, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_adjacent_sessions_with_the_same_commands_fold() {
+        let login = |sid: &str, ago: i64, user: &str| {
+            event_row(
+                Some(sid),
+                "honeypot_login_attempt",
+                ago,
+                json!({ "username": user }),
+            )
+        };
+        // Newest first once grouped: s1 s2 run "a b", s3 runs "a c", s4 "a b" again, s5 and s6
+        // run nothing.
+        let rows = vec![
+            login("s1", 100, "cht"),
+            command("s1", 99, "a"),
+            command("s1", 98, "b"),
+            login("s2", 200, "admin"),
+            command("s2", 199, "a"),
+            command("s2", 198, "b"),
+            command("s3", 300, "a"),
+            command("s3", 299, "c"),
+            command("s4", 400, "a"),
+            command("s4", 399, "b"),
+            login("s5", 500, "root"),
+            login("s6", 600, "root"),
+        ];
+        let (groups, _) = group_into_sessions(rows, 1);
+
+        let folds = fold_repeated_sessions(groups);
+
+        let shape: Vec<usize> = folds.iter().map(|f| f.repeat).collect();
+        assert_eq!(shape, [2, 1, 1, 1, 1]);
+        assert_eq!(folds[0].users, ["admin", "cht"]);
+        assert_eq!(folds[0].command_count, 2);
+        assert!(
+            folds[0].expanded,
+            "the newest fold opens like the newest card"
+        );
+        assert_eq!(folds[0].sessions[0].session_id, "s1");
     }
 
     #[test]

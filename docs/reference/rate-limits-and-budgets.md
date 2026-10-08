@@ -77,6 +77,32 @@ are not charged. A zero or non-numeric rate aborts startup; no value turns the l
 over TCP and DoT is not rate limited (its per-connection bounds are in
 [sensor-behavior.md](sensor-behavior.md#sensor-dns)).
 
+## Shell command-event budget (ssh, telnet, adb)
+
+Bounds how many `honeypot_command_exec` events one source network writes, not what the shell
+does: every command is answered the same, and the events over the budget are counted into one
+summary per network per window. One budget per sensor process
+(`crates/sensor-framework/src/command_flood.rs#CommandEventGate`). Behavior, what is never
+summarized and why are owned by
+[sensor-behavior.md](sensor-behavior.md#command-event-budget-ssh-telnet-adb); the summary's keys
+by [events-and-signals.md](events-and-signals.md#command-summary-keys).
+
+| Item | Value | Source |
+|---|---|---|
+| Per source network | 12 per minute, burst 200 | `PROPOLIS_SSH_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_SSH_COMMAND_EVENT_BURST`; `PROPOLIS_TELNET_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_TELNET_COMMAND_EVENT_BURST`; `PROPOLIS_ADB_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_ADB_COMMAND_EVENT_BURST` |
+| Global | none: only the per-network bucket refuses *(hard-coded)* | `crates/sensor-framework/src/command_flood.rs#CommandEventGate::new` |
+| Source network | IPv4 /24 (IPv4-mapped IPv6 included), IPv6 /56 *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#SourceKey` |
+| Networks tracked (buckets) | 4096, with eviction *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#DEFAULT_RATE_TABLE_CAPACITY` |
+| Summary window | 60 s per network, checked each second *(hard-coded)* | `crates/sensor-framework/src/command_flood.rs#COMMAND_SUMMARY_WINDOW` |
+| Always written per window | the first sighting of each command shape (128 tracked; `crates/sensor-framework/src/command_flood.rs#command_shape`) and each address's first command event (64 tracked), never an echo-loader chunk *(hard-coded)* | `crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_COMMANDS`, `crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_ADDRESSES` |
+| Summaries held | 1024 networks, then one overflow summary; 8 samples of 256 bytes and 32 sessions each *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#DEFAULT_SUMMARY_CAPACITY`, `crates/sensor-framework/src/command_flood.rs#MAX_COMMAND_SAMPLE_LEN`, `crates/sensor-framework/src/command_flood.rs#MAX_SUMMARY_SESSIONS` |
+| Shutdown flush | pending summaries written within 2 s *(hard-coded)* | `crates/sensor-telnet/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`, `crates/sensor-ssh/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`, `crates/sensor-adb/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT` |
+
+The per-connection cap of 256 command events
+(`crates/sensor-framework/src/shell/mod.rs#MAX_COMMANDS_PER_SESSION`) still applies first; this
+budget is what a source spreading its commands over many sessions meets. A zero or non-numeric
+rate or burst aborts startup; no value turns the budget off.
+
 ## VirusTotal daily cap
 
 Enforced by a single `DailyBudget` owned across every scan cycle

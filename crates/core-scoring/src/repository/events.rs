@@ -13,17 +13,19 @@
 //! [`APPEND_LOCK_KEY`]). The transaction first pins `READ COMMITTED` isolation
 //! (required for the lock to serialize correctly), then acquires the lock before
 //! the chain-head read, so the chain-head read + event INSERT + projection read +
-//! `ip_score` UPSERT all execute as one serialized critical section. Under READ
-//! COMMITTED each statement takes a fresh snapshot, so once the lock is granted
-//! the chain-head read sees the prior appender's committed row (under REPEATABLE
-//! READ / SERIALIZABLE the snapshot would freeze before the lock and the chain
-//! could fork - hence the explicit pin). This guarantees, under any number of
-//! concurrent callers:
+//! vantage/sensor set upserts + `ip_score` UPSERT all execute as one serialized
+//! critical section. Under READ COMMITTED each statement takes a fresh snapshot,
+//! so once the lock is granted the chain-head read sees the prior appender's
+//! committed row (under REPEATABLE READ / SERIALIZABLE the snapshot would freeze
+//! before the lock and the chain could fork - hence the explicit pin). This
+//! guarantees, under any number of concurrent callers:
 //!
 //! - the tamper-evident hash chain cannot fork (no two appends can read the
 //!   same `prev_hash` and both insert against it);
 //! - the `ip_score` projection UPSERT cannot lose an update to a
 //!   last-write-wins race;
+//! - the `ip_vantage` / `ip_sensor` sets an append counts from hold every
+//!   scored event committed before it;
 //! - the dedup window read (`MAX(observed_at)` for the same `source_ip` +
 //!   `signal_type`) cannot be bypassed by an interleaved concurrent insert.
 //!
@@ -43,7 +45,7 @@ use std::net::IpAddr;
 use chrono::{DateTime, NaiveDate, SubsecRound, Utc};
 use sqlx::{PgPool, Postgres, Row};
 
-use crate::domain::enums::{Category, SignalType};
+use crate::domain::enums::{Category, Protocol, SignalType};
 use crate::domain::types::{EventInput, IpScore, ValidationError};
 use crate::hashing::chain_hash;
 use crate::scoring::breadth::{WanVantage, distinct_wan_count};
@@ -74,11 +76,12 @@ pub enum RepoError {
     NotScorable(SignalType),
 }
 
-/// Excludes telemetry rows from a scoring aggregate that reads the whole ledger for one source.
-/// A macro rather than a `const` so the queries stay `&'static str` literals that sqlx accepts
-/// without a dynamic-SQL escape hatch, while the predicate itself has one home;
-/// `telemetry_exclusion_names_every_telemetry_signal` fails if a telemetry signal is added
-/// without extending it.
+/// Excludes telemetry rows from a read of a source's ledger rows for scoring: `rebuild_projection`
+/// loads its events through it. A macro rather than a `const` so the queries stay `&'static str`
+/// literals that sqlx accepts without a dynamic-SQL escape hatch.
+/// `the_exclusion_predicate_names_every_telemetry_signal` fails if a telemetry signal is added
+/// without extending it. Migration 0014's backfill spells the same predicate out, since a
+/// migration file cannot use the macro.
 macro_rules! exclude_telemetry {
     () => {
         "signal_type <> 'honeypot_session_end'"
@@ -101,6 +104,22 @@ impl From<ValidationError> for RepoError {
 /// lifetime of the append transaction via `pg_advisory_xact_lock`, which
 /// auto-releases on commit or rollback.
 const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
+
+/// The dedup read: the newest prior observation of this source and signal. Runs inside the append
+/// lock on every scored event, so its plan decides intake throughput. Migration 0013's
+/// `event_dedup_idx` answers it in one backward step. The alternative the planner also weighs is
+/// walking `event_observed_at_idx` down from the ledger head until the source turns up, which
+/// costs one row per event newer than the source's last sighting, so it grows with intake lag.
+///
+/// The address is wrapped in a scalar subquery so the planner cannot see it. Given the literal
+/// value, it looks the address up in the column statistics, and a bot loop holding a large share
+/// of the ledger is estimated to turn up within a few rows of the head: the walk then costs about
+/// the same as the index on paper, and it was still chosen with `event_dedup_idx` present on a
+/// ledger shaped like the incident. Hidden, the address is costed as an average source, for which
+/// the walk is never competitive. `dedup_read_plan_*` in this module's tests holds the plan to the
+/// index.
+const DEDUP_PRIOR_SQL: &str = "SELECT MAX(observed_at) FROM event \
+     WHERE source_ip = (SELECT $1::inet) AND signal_type = $2 AND id < $3";
 
 /// Append one event to the ledger and update the `ip_score` projection in a
 /// single transaction, returning the new projection.
@@ -189,15 +208,12 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
 
     // 2e. Dedup on (source_ip, signal_type): the most recent prior observation,
     // excluding the row we just inserted (id < new_id).
-    let prior_observed: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT MAX(observed_at) FROM event \
-         WHERE source_ip = $1::inet AND signal_type = $2 AND id < $3",
-    )
-    .bind(event.source_ip.to_string())
-    .bind(event.signal_type)
-    .bind(new_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let prior_observed: Option<DateTime<Utc>> = sqlx::query_scalar(DEDUP_PRIOR_SQL)
+        .bind(event.source_ip.to_string())
+        .bind(event.signal_type)
+        .bind(new_id)
+        .fetch_one(&mut *tx)
+        .await?;
     // Symmetric window: dedup only a same-signal observation within DEDUP_WINDOW_SECONDS in
     // EITHER time direction. A one-sided `elapsed <= WINDOW` treats any negative elapsed
     // (an out-of-order/earlier-timestamped event from a buffered or clock-skewed sensor) as a
@@ -207,48 +223,8 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
         None => false,
     };
 
-    // 2f. Breadth inputs from the ledger for this source (INCLUDING the row just
-    // inserted). One vantage per distinct non-null wan_ip; `saw_authenticated_tcp`
-    // is true if ANY event from this source on that wan was authenticated tcp.
-    // Telemetry rows are excluded here and in the distinct-sensor count below. Skipping only
-    // their own projection would not be enough: these two read EVERY ledger row for the source,
-    // so an outcome record would silently add a vantage or a sensor to the next scored event's
-    // breadth. `rebuild_projection` excludes them the same way, or replay would diverge.
-    let vantage_rows = sqlx::query(concat!(
-        "SELECT host(wan_ip) AS wan, \
-                bool_or(protocol = 'tcp' AND authenticated) AS auth_tcp \
-         FROM event \
-         WHERE source_ip = $1::inet AND wan_ip IS NOT NULL AND ",
-        exclude_telemetry!(),
-        " GROUP BY wan_ip"
-    ))
-    .bind(event.source_ip.to_string())
-    .fetch_all(&mut *tx)
-    .await?;
-    let mut vantages: Vec<WanVantage> = Vec::with_capacity(vantage_rows.len());
-    for row in vantage_rows {
-        let wan: String = row.try_get("wan")?;
-        let saw_authenticated_tcp: bool =
-            row.try_get::<Option<bool>, _>("auth_tcp")?.unwrap_or(false);
-        let wan_ip: IpAddr = wan
-            .parse()
-            .map_err(|e| RepoError::Corrupt(format!("stored wan_ip {wan}: {e}")))?;
-        vantages.push(WanVantage {
-            wan_ip,
-            saw_authenticated_tcp,
-        });
-    }
-    let dwc = distinct_wan_count(&vantages) as i32;
-
-    let dsc: i64 = sqlx::query_scalar(concat!(
-        "SELECT COUNT(DISTINCT sensor) FROM event \
-         WHERE source_ip = $1::inet AND ",
-        exclude_telemetry!()
-    ))
-    .bind(event.source_ip.to_string())
-    .fetch_one(&mut *tx)
-    .await?;
-    let dsc = dsc as i32;
+    // 2f. Breadth inputs for this source, INCLUDING the row just inserted.
+    let (dwc, dsc) = fold_breadth_sets(&mut tx, &event).await?;
 
     // 2g. Pure projection step (no DB, no clock).
     let new_score = apply_event(stored, &event, HALF_LIFE_SECONDS, deduped, dwc, dsc);
@@ -313,7 +289,7 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
 /// append and [`append_telemetry_event`] so the two can never compute the chain differently; both
 /// call it while holding the append advisory lock, which is what makes the head read and the
 /// insert one critical section.
-async fn insert_chained(
+pub(super) async fn insert_chained(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     event: &EventInput,
 ) -> Result<i64, RepoError> {
@@ -347,6 +323,75 @@ async fn insert_chained(
     .fetch_one(&mut **tx)
     .await?;
     Ok(new_id)
+}
+
+/// Fold one scored event into its source's vantage and sensor sets (migration 0014) and return the
+/// breadth inputs `apply_event` takes: the distinct authenticated WAN vantage count and the
+/// distinct sensor count, both including this event.
+///
+/// The sets hold exactly what the whole-history aggregates this replaced derived from the ledger
+/// (a `GROUP BY wan_ip` with `bool_or(protocol = 'tcp' AND authenticated)`, and a
+/// `COUNT(DISTINCT sensor)`, each over the source's scored rows), so each append reads one row per
+/// WAN and one per sensor however long the source's history is. Called only by [`append_event`],
+/// under the append lock, after the event row is inserted; [`append_telemetry_event`] never calls
+/// it, which is what keeps telemetry out of breadth. `rebuild_projection` still derives both
+/// inputs from the ledger rows themselves, so replay stays an independent check on these sets.
+///
+/// The vantage upsert writes only when the flag turns from false to true. Ever-seen is an OR over
+/// the source's history, so a conflicting row that is already true, or an event that is not
+/// authenticated TCP, changes nothing, and skipping the write spares a dead row version per event
+/// for a bot loop that hits the same WAN all day.
+async fn fold_breadth_sets(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &EventInput,
+) -> Result<(i32, i32), RepoError> {
+    let source_ip = event.source_ip.to_string();
+    if let Some(wan_ip) = event.wan_ip {
+        sqlx::query(
+            "INSERT INTO ip_vantage (source_ip, wan_ip, saw_authenticated_tcp) \
+             VALUES ($1::inet, $2::inet, $3) \
+             ON CONFLICT (source_ip, wan_ip) DO UPDATE \
+             SET saw_authenticated_tcp = ip_vantage.saw_authenticated_tcp OR EXCLUDED.saw_authenticated_tcp \
+             WHERE EXCLUDED.saw_authenticated_tcp AND NOT ip_vantage.saw_authenticated_tcp",
+        )
+        .bind(&source_ip)
+        .bind(wan_ip.to_string())
+        .bind(event.protocol == Protocol::Tcp && event.authenticated)
+        .execute(&mut **tx)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO ip_sensor (source_ip, sensor) VALUES ($1::inet, $2) \
+         ON CONFLICT (source_ip, sensor) DO NOTHING",
+    )
+    .bind(&source_ip)
+    .bind(&event.sensor)
+    .execute(&mut **tx)
+    .await?;
+
+    let vantage_rows = sqlx::query(
+        "SELECT host(wan_ip) AS wan, saw_authenticated_tcp FROM ip_vantage WHERE source_ip = $1::inet",
+    )
+    .bind(&source_ip)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut vantages: Vec<WanVantage> = Vec::with_capacity(vantage_rows.len());
+    for row in vantage_rows {
+        let wan: String = row.try_get("wan")?;
+        let wan_ip: IpAddr = wan
+            .parse()
+            .map_err(|e| RepoError::Corrupt(format!("stored wan_ip {wan}: {e}")))?;
+        vantages.push(WanVantage {
+            wan_ip,
+            saw_authenticated_tcp: row.try_get("saw_authenticated_tcp")?,
+        });
+    }
+    let sensors: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ip_sensor WHERE source_ip = $1::inet")
+            .bind(&source_ip)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok((distinct_wan_count(&vantages) as i32, sensors as i32))
 }
 
 /// Append a TELEMETRY event: it joins the hash chain like any other record, and touches no
@@ -477,4 +522,156 @@ where
         tier: row.try_get("tier")?,
         delisted: row.try_get("delisted")?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bot loop whose history is all older than the rest of the ledger.
+    const HOT: &str = "198.51.100.3";
+    const LEDGER_ROWS: i64 = 100_000;
+    const HOT_ROWS: i64 = 30_000;
+
+    /// Loads a ledger shaped like the October 2026 incident: one source holds 30% of the rows, all
+    /// of them older than every other sensor's 70,000 newer rows, so its latest sighting sits far
+    /// below the head of `event_observed_at_idx`. Statistics are gathered from every row (the
+    /// targets exceed the table), so the planner's inputs are the same on every run. Returns the id
+    /// the next append would get, which is the `id < $3` bound the append path passes.
+    async fn load_incident_ledger(pool: &PgPool) -> sqlx::Result<i64> {
+        sqlx::query("ALTER TABLE event DISABLE TRIGGER trg_enforce_chain_linkage")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO event (source_ip, wan_ip, sensor, signal_type, protocol, authenticated, \
+                                category, weight, confidence, observed_at, metadata, prev_hash, hash) \
+             SELECT CASE WHEN g <= $2 THEN $3::inet ELSE '10.0.0.0'::inet + (g % 5000) END, \
+                    '203.0.113.10'::inet, \
+                    CASE WHEN g <= $2 THEN 'telnet' ELSE 'vnc' END, \
+                    'honeypot_command_exec', 'tcp', true, 'honeypot', 60, 0.950, \
+                    timestamptz '2026-08-01 00:00:00+00' + g * interval '10 seconds', \
+                    '{}'::jsonb, \
+                    CASE WHEN g = 1 THEN NULL ELSE sha256(int8send(g - 1)) END, \
+                    sha256(int8send(g)) \
+             FROM generate_series(1, $1) AS g",
+        )
+        .bind(LEDGER_ROWS)
+        .bind(HOT_ROWS)
+        .bind(HOT)
+        .execute(pool)
+        .await?;
+        sqlx::query("ALTER TABLE event ENABLE TRIGGER trg_enforce_chain_linkage")
+            .execute(pool)
+            .await?;
+        for column in ["id", "source_ip", "signal_type", "observed_at"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE event ALTER COLUMN {column} SET STATISTICS 10000"
+            )))
+            .execute(pool)
+            .await?;
+        }
+        sqlx::query("ANALYZE event").execute(pool).await?;
+        sqlx::query_scalar("SELECT max(id) + 1 FROM event")
+            .fetch_one(pool)
+            .await
+    }
+
+    fn index_names(node: &serde_json::Value, out: &mut Vec<String>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    match (key.as_str(), value) {
+                        ("Index Name", serde_json::Value::String(name)) => out.push(name.clone()),
+                        _ => index_names(value, out),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|i| index_names(i, out)),
+            _ => {}
+        }
+    }
+
+    /// The dedup read as it stood when the incident happened: the address bound as a literal.
+    const INCIDENT_DEDUP_SQL: &str = "SELECT MAX(observed_at) FROM event \
+         WHERE source_ip = $1::inet AND signal_type = $2 AND id < $3";
+
+    /// The indexes a custom plan of `sql` reads for the hot source, with the values the append
+    /// path binds.
+    async fn custom_plan_indexes<'e, E>(
+        exec: E,
+        sql: &str,
+        next_id: i64,
+    ) -> sqlx::Result<Vec<String>>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
+        let plan: serde_json::Value =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN (FORMAT JSON) {sql}")))
+                .bind(HOT)
+                .bind(SignalType::HoneypotCommandExec)
+                .bind(next_id)
+                .fetch_one(exec)
+                .await?;
+        let mut names = Vec::new();
+        index_names(&plan, &mut names);
+        Ok(names)
+    }
+
+    /// A custom plan for the incident's hot source reads the dedup index and never walks
+    /// `event_observed_at_idx`. The fixture is checked to provoke that walk for the statement and
+    /// schema the incident ran on, so the guard cannot pass on a ledger the planner would have
+    /// handled anyway.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dedup_read_plan_uses_the_dedup_index_on_an_incident_shaped_ledger(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let next_id = load_incident_ledger(&pool).await?;
+
+        let custom = custom_plan_indexes(&pool, DEDUP_PRIOR_SQL, next_id).await?;
+        assert!(
+            custom.iter().any(|n| n == "event_dedup_idx"),
+            "the dedup read must use event_dedup_idx, plan read {custom:?}"
+        );
+        assert!(
+            !custom.iter().any(|n| n == "event_observed_at_idx"),
+            "the dedup read must not walk event_observed_at_idx, plan read {custom:?}"
+        );
+
+        let mut tx = pool.begin().await?;
+        sqlx::query("DROP INDEX event_dedup_idx")
+            .execute(&mut *tx)
+            .await?;
+        let incident = custom_plan_indexes(&mut *tx, INCIDENT_DEDUP_SQL, next_id).await?;
+        tx.rollback().await?;
+        assert!(
+            incident.iter().any(|n| n == "event_observed_at_idx"),
+            "the incident's statement and schema must walk event_observed_at_idx on this ledger, \
+             or the guard above proves nothing; plan read {incident:?}"
+        );
+        Ok(())
+    }
+
+    /// The same statement as a generic prepared plan, the form a long-lived pooled connection
+    /// switches to after five executions.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dedup_read_plan_generic_form_uses_the_dedup_index(pool: PgPool) -> sqlx::Result<()> {
+        load_incident_ledger(&pool).await?;
+        let plan: serde_json::Value = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (GENERIC_PLAN, FORMAT JSON) {DEDUP_PRIOR_SQL}"
+        )))
+        .fetch_one(&pool)
+        .await?
+        .try_get(0)?;
+        let mut names = Vec::new();
+        index_names(&plan, &mut names);
+        assert!(
+            names.iter().any(|n| n == "event_dedup_idx"),
+            "the generic dedup plan must use event_dedup_idx, plan read {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "event_observed_at_idx"),
+            "the generic dedup plan must not walk event_observed_at_idx, plan read {names:?}"
+        );
+        Ok(())
+    }
 }

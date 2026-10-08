@@ -9,6 +9,7 @@
 //! `internal/design/06-console-observability.md`.
 
 pub mod auth;
+pub mod intake_lag;
 pub mod log_buffer;
 pub mod rdns;
 pub mod routes;
@@ -132,6 +133,10 @@ pub struct AppState {
     /// map; the standalone console binary and tests use [`no_subsystem_health`], which reports
     /// nothing dead because there is nothing supervised.
     pub gave_up_subsystems: SubsystemHealth,
+    /// Per-log intake backlog, read by `/metrics` and the fleet pane. The unified daemon wires it
+    /// to its intake loops; the standalone console binary and tests use
+    /// [`intake_lag::no_intake_lag`], which reports nothing, so no lag series is published.
+    pub intake_lag: intake_lag::IntakeLagSource,
 }
 
 /// Reports the supervised subsystems that have given up; empty when everything is running or

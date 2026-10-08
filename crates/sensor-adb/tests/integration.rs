@@ -64,6 +64,46 @@ impl TestServer {
         }
     }
 
+    /// A server whose per-source command-event budget is `rate` per second after a burst of
+    /// `burst`.
+    async fn start_with_command_budget(rate: u32, burst: u32) -> TestServer {
+        use sensor_framework::{
+            CaptureMemoryBudget, CommandEventConfig, CommandEventGate,
+            DEFAULT_CAPTURE_BUDGET_BYTES_256M, Rate,
+        };
+        use std::num::NonZeroU32;
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let spool_dir = dir.path().join("spool");
+        let gate = CommandEventGate::new(CommandEventConfig {
+            rate: Rate::new(
+                NonZeroU32::new(rate).unwrap(),
+                NonZeroU32::new(burst).unwrap(),
+            ),
+            ..CommandEventConfig::default()
+        });
+        let (addr, handle, _handoff) = sensor_adb::start_test_server_with_handoff(
+            "127.0.0.1:0".parse().unwrap(),
+            log_path.clone(),
+            spool_dir.clone(),
+            Arc::new(WanResolver::new(HashMap::new())),
+            test_bounds(),
+            "test".to_string(),
+            dir.path().join("outbox"),
+            Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES_256M)),
+            Arc::new(gate),
+        )
+        .await
+        .unwrap();
+        TestServer {
+            addr,
+            log_path,
+            spool_dir,
+            handle,
+            _dir: dir,
+        }
+    }
+
     async fn events(&self) -> Vec<sensor_wire::SensorEvent> {
         let content = tokio::fs::read_to_string(&self.log_path)
             .await
@@ -1084,7 +1124,9 @@ async fn concurrent_shell_and_sync_streams_on_one_connection() {
 
 #[tokio::test]
 async fn shell_streams_of_one_connection_share_one_command_ceiling() {
-    let srv = TestServer::start().await;
+    // The source's own command-event budget is set past the connection's ceiling, so only the
+    // ceiling decides here.
+    let srv = TestServer::start_with_command_budget(1_000, 1_000).await;
     let mut conn = TcpStream::connect(srv.addr).await.unwrap();
     cnxn_handshake(&mut conn).await;
 
@@ -1178,6 +1220,42 @@ async fn a_new_adb_connection_does_not_see_files_written_by_an_earlier_one() {
     assert!(
         !seen.contains("adb-leak-2706"),
         "a new connection saw the previous connection's file: {seen:?}"
+    );
+    srv.handle.abort();
+}
+
+/// Past the source's command-event budget a repeated command keeps its exact reply but no longer
+/// gets an event of its own; the connection event stays.
+#[tokio::test]
+async fn a_repeated_command_past_the_source_budget_is_answered_but_not_logged_each_time() {
+    let srv = TestServer::start_with_command_budget(1, 3).await;
+    let started = std::time::Instant::now();
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    cnxn_handshake(&mut conn).await;
+    let server_id = open_stream(&mut conn, 10, "shell:").await;
+    let (prompt, _) = read_message(&mut conn).await;
+    acknowledge_wrte(&mut conn, &prompt).await;
+    let first = send_shell_line(&mut conn, 10, server_id, "getprop ro.product.model").await;
+    for _ in 0..19 {
+        let again = send_shell_line(&mut conn, 10, server_id, "getprop ro.product.model").await;
+        assert_eq!(again, first, "the reply never changes");
+    }
+    let refill = started.elapsed().as_secs() as usize + 1;
+    let events = srv.events().await;
+    let commands = events
+        .iter()
+        .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .count();
+    assert!(
+        (3..=3 + refill).contains(&commands),
+        "{commands} command events for 20 commands"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_CONNECTION)
+            .count(),
+        1
     );
     srv.handle.abort();
 }

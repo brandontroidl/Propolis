@@ -872,6 +872,7 @@ impl FakeShell {
         let output = self.run_input(&decoded);
         self.end_input(&mut events, true);
         self.flush_loader(&mut events);
+        self.gate_events(&mut events);
         (output, events)
     }
 
@@ -902,6 +903,7 @@ impl FakeShell {
             self.stdin = Stdin::Terminal;
             self.end_input(&mut events, true);
             self.flush_loader(&mut events);
+            self.gate_events(&mut events);
             return (LineStep::Ran(output), events);
         }
         // The run that found the wait is undone, but what it decided still describes the line,
@@ -918,6 +920,7 @@ impl FakeShell {
         self.end_input(&mut events, false);
         self.loader_line.urls = derived;
         self.flush_loader(&mut events);
+        self.gate_events(&mut events);
         (LineStep::AwaitingInput, events)
     }
 
@@ -927,6 +930,15 @@ impl FakeShell {
         self.frames
             .first()
             .map_or(0, |frame| frame.state.last_status)
+    }
+
+    /// The last step of a line's events: the connection's command-event gate, when it has one,
+    /// folds a command event over its source's budget into a summary. Only logging changes; the
+    /// line has already run and its output is the same either way.
+    fn gate_events(&self, events: &mut Vec<SensorEvent>) {
+        if let Some(gate) = self.budget().command_gate() {
+            gate.filter(events);
+        }
     }
 
     /// Whether a line given to [`Self::start_line`] is waiting for its input.

@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
-    CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EnvError,
+    Arrival, CaptureMemoryBudget, CommandEventConfig, CommandEventConfigError, CommandEventGate,
+    ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EnvError, EventEmitter,
     SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal, strict_env_var,
 };
 
@@ -62,7 +63,13 @@ struct Config {
     collector_id: String,
     outbox_dir: PathBuf,
     capture_memory_bytes: u64,
+    command_events: CommandEventConfig,
 }
+
+/// The sensor name in `PROPOLIS_ADB_COMMAND_EVENT_RATE_PER_MIN` and `..._BURST`.
+const COMMAND_EVENT_SENSOR: &str = "adb";
+/// How long shutdown waits for the command summaries still accumulating to be written.
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq)]
 enum ConfigError {
@@ -78,6 +85,8 @@ enum ConfigError {
     },
     /// An env var held bytes that are not valid UTF-8; never read as unset.
     Env(EnvError),
+    /// The command-event rate or burst was zero or not a positive integer.
+    CommandEvents(CommandEventConfigError),
 }
 
 impl From<EnvError> for ConfigError {
@@ -86,10 +95,17 @@ impl From<EnvError> for ConfigError {
     }
 }
 
+impl From<CommandEventConfigError> for ConfigError {
+    fn from(e: CommandEventConfigError) -> Self {
+        ConfigError::CommandEvents(e)
+    }
+}
+
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::Env(e) => write!(f, "{e}"),
+            ConfigError::CommandEvents(e) => write!(f, "{e}"),
             ConfigError::NoBind => {
                 write!(f, "{ENV_BIND} must be set to a single ip:port bind address")
             }
@@ -246,6 +262,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         collector_id,
         outbox_dir,
         capture_memory_bytes,
+        command_events: CommandEventConfig::from_env(COMMAND_EVENT_SENSOR)?,
         bounds: ConnectionBounds {
             read_timeout: Duration::from_millis(read_timeout_ms),
             idle_timeout: Duration::from_millis(idle_timeout_ms),
@@ -269,6 +286,8 @@ async fn main() {
     };
 
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
+    let command_events = Arc::new(CommandEventGate::new(config.command_events));
+    let summary_emitter = EventEmitter::new(config.log_path.clone());
 
     let (bound, handle, handoff) = match sensor_adb::start_test_server_with_handoff(
         config.bind_addr,
@@ -279,6 +298,7 @@ async fn main() {
         config.collector_id,
         config.outbox_dir,
         Arc::new(CaptureMemoryBudget::new(config.capture_memory_bytes)),
+        command_events.clone(),
     )
     .await
     {
@@ -295,6 +315,17 @@ async fn main() {
     shutdown_signal().await;
     tracing::info!("sensor-adb: shutdown signal received; stopping");
     handle.abort();
+    // The listener is stopped, so no new command reaches the gate: write the summaries still
+    // accumulating, bounded by the window table's capacity and by this timeout.
+    if tokio::time::timeout(
+        SHUTDOWN_FLUSH_TIMEOUT,
+        command_events.flush(&summary_emitter, Arrival::new(bound.port())),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("sensor-adb: command summaries not all written before shutdown");
+    }
     // Queued captures only; a connection cancelled mid-capture never submits (see handoff.rs).
     handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
 }

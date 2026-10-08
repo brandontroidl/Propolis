@@ -19,11 +19,11 @@ use tokio::task::JoinHandle;
 
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
 use sensor_framework::{
-    BudgetLimits, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody, CaptureEnd,
-    CaptureHandoff, CaptureJob, CaptureMemoryBudget, CaptureSource, ConnectionBounds,
-    ConnectionBudget, EgressState, EventEmitter, HeldEnd, HeldInput, InputMode, OutboxManifest,
-    QuarantineSpool, StdinCaptures, UploadEnd, WanResolver, default_capture_budget_bytes,
-    limits_from,
+    Arrival, BudgetLimits, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody,
+    CaptureEnd, CaptureHandoff, CaptureJob, CaptureMemoryBudget, CaptureSource, CommandEventConfig,
+    CommandEventGate, ConnectionBounds, ConnectionBudget, EgressState, EventEmitter, HeldEnd,
+    HeldInput, InputMode, OutboxManifest, QuarantineSpool, StdinCaptures, UploadEnd, WanResolver,
+    default_capture_budget_bytes, limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
@@ -273,6 +273,7 @@ pub async fn serve(
         collector_id,
         outbox_dir,
         Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES)),
+        Arc::new(CommandEventGate::new(CommandEventConfig::default())),
     )
     .await?;
     Ok((bound, handle))
@@ -284,10 +285,11 @@ pub const UNIT_MEMORY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// The capture memory ceiling used when none is configured: 40% of [`UNIT_MEMORY_MAX_BYTES`].
 pub const DEFAULT_CAPTURE_BUDGET_BYTES: u64 = default_capture_budget_bytes(UNIT_MEMORY_MAX_BYTES);
 
-/// `serve` plus the capture hand-off, so `main` can `drain` it on shutdown, and the process-wide
-/// capture memory budget `main` built from its configured ceiling. A separate function rather than
-/// a wider return type so the many callers that never shut down (every integration test) are
-/// unchanged.
+/// `serve` plus the capture hand-off, so `main` can `drain` it on shutdown, the process-wide
+/// capture memory budget `main` built from its configured ceiling, and the sensor's per-source
+/// command-event budget, which `main` flushes on shutdown. A separate function rather than a wider
+/// return type so the many callers that never shut down (every integration test) are unchanged.
+/// The returned handle stops the listener and the command-summary writer together.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_with_handoff(
     addr: SocketAddr,
@@ -300,6 +302,7 @@ pub async fn serve_with_handoff(
     collector_id: String,
     outbox_dir: PathBuf,
     capture_budget: Arc<CaptureMemoryBudget>,
+    command_events: Arc<CommandEventGate>,
 ) -> Result<
     (SocketAddr, JoinHandle<()>, Arc<CaptureHandoff>),
     Box<dyn std::error::Error + Send + Sync>,
@@ -323,6 +326,8 @@ pub async fn serve_with_handoff(
     std::fs::create_dir_all(&spool_dir)?;
 
     let emitter = Arc::new(EventEmitter::new(log_path.clone()));
+    let summary_emitter = emitter.clone();
+    let summary_gate = command_events.clone();
     let spool = QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000);
     // The handoff's emitter writes to the same log file. EventEmitter opens with O_APPEND
     // on each write so concurrent emitters to the same path are safe.
@@ -361,6 +366,7 @@ pub async fn serve_with_handoff(
             let handoff = handoff.clone();
             let wan_resolver = wan_resolver.clone();
             let banner = banner.clone();
+            let command_events = command_events.clone();
             // Wrapped once here rather than at each read: every transport function is generic over
             // AsyncRead/AsyncWrite, so the whole session inherits the per-read bound - including
             // any read added later, which a per-call-site timeout would miss.
@@ -377,6 +383,7 @@ pub async fn serve_with_handoff(
                     banner,
                     max_captured_bytes,
                     budget_limits,
+                    command_events,
                 )
                 .await
                 {
@@ -387,7 +394,12 @@ pub async fn serve_with_handoff(
     )
     .await?;
 
-    Ok((bound_addr, handle, drain_handle))
+    let writer = summary_gate.spawn_writer(summary_emitter, Arrival::new(bound_addr.port()));
+    Ok((
+        bound_addr,
+        sensor_framework::command_flood::with_writer(handle, writer),
+        drain_handle,
+    ))
 }
 
 /// Handle one SSH connection end to end: version exchange, key exchange, authentication,
@@ -404,45 +416,89 @@ async fn handle_session(
     banner: Arc<String>,
     max_captured_bytes: u64,
     budget_limits: BudgetLimits,
+    command_events: Arc<CommandEventGate>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // ---- Phase 1: version exchange ----
-    let (client_version, server_version) =
-        transport::do_version_exchange_server_with_version(&mut stream, &banner).await?;
+    let started = std::time::Instant::now();
+    // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped
+    // IPv6 address (::ffff:a.b.c.d from a dual-stack listener) matches the operator's
+    // plain-IPv4 WAN map entry.
+    let norm_peer = normalize_dual_stack(peer_addr);
+    let source_ip: IpAddr = norm_peer.ip();
+    let local_addr = stream.get_ref().local_addr().map(normalize_dual_stack).ok();
+    let wan_ip = local_addr.and_then(|la| wan_resolver.resolve(la.ip()));
+    let mut auth_state = AuthState::new(source_ip, wan_ip, session_id);
 
-    // ---- Phase 2: key exchange ----
+    // The accept is the observation: emitted before the version exchange so a scanner that reads
+    // the banner and leaves, a client that sends garbage, and a bare TCP probe are recorded like
+    // every other sensor's connect. Exactly once per connection; nothing later emits another.
+    let conn_event = auth_state.emit_connection_event();
+    emitter.append(&conn_event).await?;
 
-    // Server sends KEXINIT (s2c packet #0).
-    let server_kexinit = transport::build_kexinit();
-    transport::write_packet_unencrypted(&mut stream, &server_kexinit).await?;
+    // Phases 1 and 2 run as a block so a connection that ends inside them still gets its end
+    // event below, with the client version if it got that far.
+    let mut handshake_phase = HandshakePhase::VersionExchange;
+    let mut client_version_seen: Option<String> = None;
+    let handshake: Result<_, transport::TransportError> = async {
+        // ---- Phase 1: version exchange ----
+        let (client_version, server_version) =
+            transport::do_version_exchange_server_with_version(&mut stream, &banner).await?;
+        client_version_seen = Some(client_version.clone());
+        handshake_phase = HandshakePhase::KeyExchange;
 
-    // Read client's KEXINIT (c2s packet #0).
-    let client_kexinit_pkt = transport::read_packet_unencrypted(&mut stream).await?;
-    let _client_kexinit = transport::parse_kexinit(&client_kexinit_pkt.payload)?;
+        // ---- Phase 2: key exchange ----
 
-    // Read client's ECDH_INIT (c2s packet #1).
-    let client_ecdh_init = transport::read_packet_unencrypted(&mut stream).await?;
+        // Server sends KEXINIT (s2c packet #0).
+        let server_kexinit = transport::build_kexinit();
+        transport::write_packet_unencrypted(&mut stream, &server_kexinit).await?;
 
-    // Perform key exchange: computes shared secret, signs exchange hash, sends ECDH_REPLY
-    // (s2c packet #1).
-    let session_keys = perform_kex_server(
-        &mut stream,
-        &host_key,
-        &client_kexinit_pkt.payload,
-        &server_kexinit,
-        &client_version,
-        &server_version,
-        &client_ecdh_init.payload,
-    )
-    .await?;
+        // Read client's KEXINIT (c2s packet #0).
+        let client_kexinit_pkt = transport::read_packet_unencrypted(&mut stream).await?;
+        let _client_kexinit = transport::parse_kexinit(&client_kexinit_pkt.payload)?;
 
-    // Server sends NEWKEYS (s2c packet #2).
-    transport::write_packet_unencrypted(&mut stream, &[SSH_MSG_NEWKEYS]).await?;
+        // Read client's ECDH_INIT (c2s packet #1).
+        let client_ecdh_init = transport::read_packet_unencrypted(&mut stream).await?;
 
-    // Read client's NEWKEYS (c2s packet #2).
-    let newkeys_pkt = transport::read_packet_unencrypted(&mut stream).await?;
-    if newkeys_pkt.payload.first() != Some(&SSH_MSG_NEWKEYS) {
-        return Err("expected SSH_MSG_NEWKEYS".into());
+        // Perform key exchange: computes shared secret, signs exchange hash, sends ECDH_REPLY
+        // (s2c packet #1).
+        let session_keys = perform_kex_server(
+            &mut stream,
+            &host_key,
+            &client_kexinit_pkt.payload,
+            &server_kexinit,
+            &client_version,
+            &server_version,
+            &client_ecdh_init.payload,
+        )
+        .await?;
+
+        // Server sends NEWKEYS (s2c packet #2).
+        transport::write_packet_unencrypted(&mut stream, &[SSH_MSG_NEWKEYS]).await?;
+
+        // Read client's NEWKEYS (c2s packet #2).
+        let newkeys_pkt = transport::read_packet_unencrypted(&mut stream).await?;
+        if newkeys_pkt.payload.first() != Some(&SSH_MSG_NEWKEYS) {
+            return Err(transport::TransportError::Malformed(
+                "expected SSH_MSG_NEWKEYS",
+            ));
+        }
+        Ok(session_keys)
     }
+    .await;
+    let session_keys = match handshake {
+        Ok(keys) => keys,
+        Err(e) => {
+            let end = auth_state.handshake_end_event(
+                classify_read_failure(&e),
+                handshake_phase.label(),
+                client_version_seen.as_deref(),
+                started.elapsed(),
+            );
+            if let Err(append_err) = emitter.append(&end).await {
+                tracing::error!(error = %append_err, "ssh: failed to append handshake end event");
+            }
+            return Err(e.into());
+        }
+    };
 
     // ---- Phase 3: encrypted transport ----
 
@@ -455,23 +511,12 @@ async fn handle_session(
     let mut c2s_seq: u32 = 3;
     let mut s2c_seq: u32 = 3;
 
-    // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped
-    // IPv6 address (::ffff:a.b.c.d from a dual-stack listener) matches the operator's
-    // plain-IPv4 WAN map entry.
-    let norm_peer = normalize_dual_stack(peer_addr);
-    let source_ip: IpAddr = norm_peer.ip();
-    let local_addr = stream.get_ref().local_addr().map(normalize_dual_stack).ok();
-    let wan_ip = local_addr.and_then(|la| wan_resolver.resolve(la.ip()));
-    let mut auth_state = AuthState::new(source_ip, wan_ip, session_id);
-    // The one budget of this connection, cloned into every shell it opens.
-    let budget = ConnectionBudget::new(budget_limits);
+    // The one budget of this connection, cloned into every shell it opens. It carries the sensor's
+    // per-source command-event budget to each of them.
+    let budget = ConnectionBudget::with_command_gate(budget_limits, command_events);
     // The one filesystem of this connection: every shell and exec opens a share of it, so a file
     // written on one channel is readable on the next, and a new connection starts clean.
     let base_fs = FakeFs::new().with_budget(budget.clone());
-
-    // Emit honeypot_connection (authenticated=false, pre-auth).
-    let conn_event = auth_state.emit_connection_event();
-    emitter.append(&conn_event).await?;
 
     // RFC 4254 permits several channels on one connection. Keep their handlers and independent
     // flow-control windows separate, with a hard cap so OPEN floods cannot pin unbounded shells.
@@ -1357,6 +1402,23 @@ async fn run_typed_line(
             input.per_line();
             *held = Some(input);
             None
+        }
+    }
+}
+
+/// Where in the pre-encryption handshake a connection was when it ended, recorded as the `phase`
+/// of its `honeypot_session_end` event.
+#[derive(Clone, Copy)]
+enum HandshakePhase {
+    VersionExchange,
+    KeyExchange,
+}
+
+impl HandshakePhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::VersionExchange => "version_exchange",
+            Self::KeyExchange => "key_exchange",
         }
     }
 }

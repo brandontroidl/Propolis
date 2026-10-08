@@ -69,10 +69,10 @@ points provision identically, `deploy/install.sh#run_provision`); steps 4-9 run 
 | 3/9 | Creates spool mountpoints; **prints fstab guidance for the `noexec,nosuid,nodev` mounts but does not create them** | `deploy/provision.sh#3/9 creating spool directories (mountpoints only)`, fstab guidance `deploy/install.sh#NOT DONE BY THIS SCRIPT` |
 | 4/9 | `install -m 0755` each binary to `/usr/local/bin/`, then mints the per-sensor self-signed TLS pairs into `/etc/propolis/tls` with `deploy/provision-tls.sh` (idempotent; needs the release `provision-certs` binary, so it runs after the build, not inside `provision.sh`). Minting turns nothing on: a sensor uses its pair only once its TLS variables are set; see [networking-tls.md](networking-tls.md#sensor-tls-attacker-facing-listeners) | `deploy/install.sh#4/9 installing binaries to /usr/local/bin`, `deploy/install.sh#run_provision_tls` |
 | 5/9 | `install -m 0644` the 13 production units (`propolis.service` and the 12 sensor units) to `/etc/systemd/system/` | `deploy/install.sh#5/9 installing systemd units` |
-| 6/9 | Installs `logrotate-sensors.conf` to `/etc/logrotate.d/propolis-sensors` | `deploy/install.sh#6/9 installing logrotate config` |
+| 6/9 | Installs `logrotate-sensors.conf` to `/etc/logrotate.d/propolis-sensors`, the free-space guard `logrotate-guard.sh` to `/usr/local/sbin/propolis-logrotate-guard` (0755; the policy calls it), and `propolis-logrotate.service` and `propolis-logrotate.timer` to `/etc/systemd/system/`. See [retention](retention.md#log-rotation) | `deploy/install.sh#6/9 installing logrotate config, free-space guard, and the Propolis rotation timer` |
 | 7/9 | Derives the fleet listener inventory from the sensors' own bind variables (`deploy/fleet-listeners.sh`) | `deploy/install.sh#7/9 deriving the fleet listener inventory` |
 | 8/9 | Records the deploy stamp (commit this box last deployed) for the console's fleet pane (`deploy/deploy-stamp.sh`) | `deploy/install.sh#8/9 recording the deploy stamp` |
-| 9/9 | `systemctl daemon-reload` | `deploy/install.sh#9/9 reloading systemd unit files` |
+| 9/9 | `systemctl daemon-reload`, then `systemctl enable --now propolis-logrotate.timer`: the one unit `install.sh` enables, because it needs no env file and an unrotated sensor log fills the disk | `deploy/install.sh#9/9 reloading systemd unit files`, `deploy/install.sh#systemctl enable --now propolis-logrotate.timer` |
 
 Notable directory choices (`deploy/provision.sh#2/9 creating directories`,
 `deploy/provision.sh#3/9 creating spool directories (mountpoints only)`): `/var/lib/propolis` is
@@ -84,14 +84,14 @@ owned by [../reference/filesystem-paths.md](../reference/filesystem-paths.md).
 
 ### What `install.sh` deliberately does NOT do
 
-It does not start or enable any service, does not create or migrate the
+It does not start or enable any service (apart from `propolis-logrotate.timer`, above), does not create or migrate the
 database, and **does not create or edit any operator-owned `/etc/propolis/*.env` file** -
 those carry secrets the script "has no business fabricating"; the one file it
 generates, the secret-free `/etc/propolis/fleet-listeners.env`, comes from
 `deploy/fleet-listeners.sh` in step 7
 (`deploy/install.sh#fleet-listeners.env`). Its final message states that services are
 installed but not started, and the database is untouched
-(`deploy/install.sh#Services are installed but NOT started or enabled, and the database is untouched.`).
+(`deploy/install.sh#Services are installed but NOT started or enabled (except propolis-logrotate.timer), and the database is untouched.`).
 You must author the
 `.env` files yourself before starting anything - see
 [configuration.md](configuration.md) and
@@ -175,8 +175,8 @@ forms are collected in [../reference/commands.md](../reference/commands.md).
 
 In-place upgrades use `sudo ./deploy/upgrade.sh` (requires root): it pulls, runs
 `cargo build --release --workspace --locked` as the repo-owner user, reinstalls the binaries, runs
-`provision.sh`, runs `provision-tls.sh` (idempotent; keeps any existing TLS pair), reinstalls the unit files and logrotate config, runs
-`daemon-reload`, restarts only the enabled sensor units, and restarts
+`provision.sh`, runs `provision-tls.sh` (idempotent; keeps any existing TLS pair), reinstalls the unit files, logrotate config and free-space guard, runs
+`daemon-reload`, enables the `propolis-logrotate.timer` (idempotent), restarts only the enabled sensor units, and restarts
 `propolis.service` last so migrations run and sensors reconnect
 (`deploy/upgrade.sh`). Rollback and DR are owned by
 [upgrade-rollback-and-dr.md](upgrade-rollback-and-dr.md).

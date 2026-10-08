@@ -45,7 +45,10 @@ Two paths differ from the pattern:
   unlike every other sensor which names a single file.
 
 logrotate config `deploy/logrotate-sensors.conf` rotates `/var/log/propolis/*`
-event logs.
+event logs, run hourly by `propolis-logrotate.timer` with its state in
+`/var/lib/propolis/logrotate.state` (root-written; the daemon only reads its modification time).
+The policy's `prerotate` hook is `/usr/local/sbin/propolis-logrotate-guard`. See
+[retention](../operations/retention.md#log-rotation).
 
 ## Spool / quarantine (uploaded-artifact capture)
 

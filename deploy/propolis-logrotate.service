@@ -1,0 +1,52 @@
+# Rotates the sensor event logs (deploy/logrotate-sensors.conf), driven by propolis-logrotate.timer.
+#
+# Why Propolis runs its own rotation instead of relying on the distro's logrotate.timer: in October
+# 2026 that timer was inactive for eleven days on the production box, nothing rotated, and the
+# telnet log reached 6.6 GB on a /var that was 80% full. The size cap in the logrotate policy only
+# works if something runs logrotate, so Propolis installs and enables the thing that does.
+#
+# --state: a state file of its own, so this run neither depends on nor contends for the distro's
+# /var/lib/logrotate/logrotate.status, and the daemon's rotation-stale alert has a file whose
+# modification time is exactly "the last time this unit ran logrotate" (logrotate rewrites its state
+# file on every run, rotation or not). /var/lib/propolis is root-owned 0755 (deploy/provision.sh), so
+# the daemon can stat the file but cannot replace it.
+#
+# Free space: the policy's prerotate hook (deploy/logrotate-guard.sh) refuses to copytruncate a log
+# that does not fit on its filesystem. A refused log makes logrotate, and so this unit, exit non-zero
+# (visible in `systemctl --failed` and `journalctl -u propolis-logrotate.service`) while every other
+# log still rotates.
+#
+# Runs as root: logrotate must read 0750 sensor-owned directories and chown the rotated copy back to
+# the sensor user. The sandbox below confines it to the two trees it writes.
+[Unit]
+Description=Rotate Propolis sensor event logs
+Documentation=file:///etc/logrotate.d/propolis-sensors
+ConditionPathExists=/etc/logrotate.d/propolis-sensors
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate --state /var/lib/propolis/logrotate.state /etc/logrotate.d/propolis-sensors
+UMask=0022
+
+# Stop a hung rotation (a wedged filesystem) from blocking every later timer run.
+TimeoutStartSec=30min
+
+ProtectSystem=strict
+ReadWritePaths=/var/log/propolis /var/lib/propolis
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

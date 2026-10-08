@@ -19,6 +19,18 @@
   '16/1 "%c"'` without `-v` of a binary now prints nothing (the image has the zero runs the real
   tool squeezes to `*`, which is not modeled). The bytes of every image changed, so its digests
   did: any stored fingerprint of a served binary is stale.
+- **Shell `tftp` downloads are read in every common form** - a telnet dropper's classic
+  `tftp HOST -c get FILE` was recorded as `tftp://HOST:get` (the `-c get` pair taken for a port, the
+  file name lost), while the BusyBox form was right. The shell now parses BusyBox
+  (`-g -r REMOTE [-l LOCAL] HOST [PORT]`, any flag order, `-gr` clusters, attached values),
+  tftp-hpa one-shot (`HOST [PORT] -c get REMOTE`, the server last, or `HOST:FILE`), IPv6 in
+  brackets or bare, and quoted or escaped arguments, into `tftp://HOST[:PORT]/FILE`. A command line
+  whose server or file cannot be read, or whose address, port or file name would not make a sound
+  URL, now emits `honeypot_file_download` with the raw `command` and no `url` instead of a guessed
+  one, so the fetcher is never handed a malformed target (it already skips url-less events). A
+  `tftp` upload (`-p`, `put`) is not a download and emits no download event; the command event
+  still records it. A host with no file no longer yields a bare `tftp://HOST`. No wire or migration
+  change.
 - **SSH bare connects, banner grabs and bad version strings are now recorded** - the SSH sensor
   emitted `honeypot_connection` only after key exchange, so a Shodan/Censys-style scanner that
   read the banner and left, a client that sent a malformed identification line, and a bare TCP
@@ -31,6 +43,21 @@
 
 ### Added
 
+- **Propolis rotates its own sensor logs, and alerts when rotation fails** - the policy in
+  `/etc/logrotate.d/propolis-sensors` relied on the distribution's `logrotate.timer`, which was
+  inactive for eleven days on the production box; nothing rotated, one telnet log reached 6.6 GB
+  and `/var` reached 80% used. `propolis-logrotate.timer` (hourly, persistent) now runs
+  `logrotate` on that policy with its own state file, and `install.sh` and `upgrade.sh` install
+  and enable it, so a normal upgrade is the rollout. A `prerotate` free-space guard
+  (`/usr/local/sbin/propolis-logrotate-guard`) refuses to `copytruncate` a log that does not fit
+  on its filesystem, leaving it untouched while the other logs still rotate. Two ops-alert
+  conditions: `sensor-log-oversized` (a configured sensor log over three times the rotation size,
+  or the log filesystem over 85% used; clears below twice the size and 80%) and `rotation-stale`
+  (the rotation state file not rewritten for three hours). The monitor now evaluates fourteen
+  conditions. The hand recovery for a log too large to rotate is in
+  [retention](docs/operations/retention.md#a-log-too-large-to-rotate). A collector host that
+  installs by hand (split deployment) must also install the guard, units and timer; its page lists
+  the commands.
 - **Console log view keeps fields and folds repeats** - the `/logs` ring now keeps each event's
   structured fields (`statement`, `elapsed`, `reason`, `sensor`, ...), so "slow statement" and
   "submission held" say what was slow and why it was held. Values are capped at 512 bytes, 32

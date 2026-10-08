@@ -86,7 +86,11 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
+<<<<<<< HEAD
 - **Total: 3440 test functions** (2194 unit + 1246 integration).
+=======
+- **Total: 3457 test functions** (2205 unit + 1252 integration).
+>>>>>>> main
 - **DB-backed (`sqlx::test`): 230** - console 173, core-scoring 35, intake 8,
   propolis 7, fleet 6, review 1. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -125,14 +129,18 @@ Per-crate breakdown:
 | geoip | 4 | 0 | - |
 | intake | 11 | 21 | audit_regressions, converter_test, end_to_end, probe_filter |
 | log-tailer | 3 | 47 | cursor_test, cursorless_test, tailer_test |
-| propolis | 121 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
+| propolis | 133 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
 | review | 116 | 71 | cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
 | sensor-adb | 61 | 43 | arrival, env_strict, integration |
 | sensor-catchall | 18 | 9 | arrival, env_strict, integration |
 | sensor-cred | 32 | 40 | arrival, env_strict, integration, tls_integration |
 | sensor-dns | 64 | 70 | arrival, env_strict, integration, tls |
+<<<<<<< HEAD
 | sensor-framework | 1098 | 98 | arrival_coverage, budget_product_test, build_stamp_test, command_flood, deploy_test, listener_integration, shell_replay, spool_integration, tls_integration |
+=======
+| sensor-framework | 1097 | 104 | arrival_coverage, budget_product_test, build_stamp_test, command_flood, deploy_test, listener_integration, shell_replay, spool_integration, tls_integration |
+>>>>>>> main
 | sensor-ftp | 14 | 50 | arrival, env_strict, integration, tls_config |
 | sensor-http | 15 | 40 | arrival, env_strict, integration, tls |
 | sensor-mqtt | 65 | 55 | arrival, env_strict, integration, tls |
@@ -144,7 +152,11 @@ Per-crate breakdown:
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
+<<<<<<< HEAD
 | **Total** | **2194** | **1246** | |
+=======
+| **Total** | **2205** | **1252** | |
+>>>>>>> main
 
 ### Test styles by layer
 

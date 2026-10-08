@@ -82,8 +82,22 @@ whose log grows faster than that falls behind, and the badge and `intake-lagging
 
 A log that is not rotated makes it worse but does not cause it: rotation caps the file size,
 not the rate. If `/var/log/propolis/<sensor>/events.jsonl` is far past the 100 MB rotation size,
-check that the distribution's logrotate timer is running (`systemctl status logrotate.timer`);
-the installers install the policy (`/etc/logrotate.d/propolis-sensors`) but not the timer.
+check that Propolis's own rotation timer is running
+(`systemctl list-timers propolis-logrotate.timer`, then
+`journalctl -u propolis-logrotate.service`); rotation does not depend on the distribution's
+`logrotate.timer`. Both installers enable the timer, and a log that outgrows its filesystem is
+left alone by the free-space guard until you
+[archive and truncate it](../operations/retention.md#a-log-too-large-to-rotate).
+
+### Preventing it
+
+In October 2026 the distribution's timer was inactive for eleven days; nothing rotated, a
+telnet log reached 6.6 GB and `/var` reached 80% used. Three things now stand between that and a
+repeat: the hourly `propolis-logrotate.timer` (installed and enabled by `install.sh` and
+`upgrade.sh`), the `sensor-log-oversized` alert (a log over three times the rotation size, or
+the log filesystem over 85% used), and the `rotation-stale` alert (no rotation run for three
+hours). See [retention](../operations/retention.md#log-rotation) and the
+[ops-alert monitor](../operations/health-and-observability.md#ops-alert-monitor-opt-in).
 
 What keeps a bot loop from building the backlog in the first place is on the sensor side: ssh,
 telnet and adb hold a per-source command-event budget, so past it a loader's repeated commands

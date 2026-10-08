@@ -96,6 +96,7 @@ mod sysres;
 mod test_builtin;
 mod textproc;
 mod texttools;
+mod tftp;
 mod timing;
 mod trace;
 
@@ -1135,7 +1136,7 @@ impl FakeShell {
             let per_line_cap = self.budget().limits().download_per_line;
             let mut recorded_this_line: u64 = 0;
             let mut download_capped = false;
-            for url in download_targets(&decoded) {
+            for fetch in download_targets(&decoded) {
                 // The per-line cap is tested first so a URL refused by it spends none of the
                 // connection's allowance.
                 if recorded_this_line >= per_line_cap {
@@ -1149,7 +1150,16 @@ impl FakeShell {
                 }
                 recorded_this_line = recorded_this_line.saturating_add(1);
                 self.trace.events.push(TraceEventKind::FileDownload);
-                let sanitized_url = sanitize_value(&url, MAX_URL_LEN);
+                let metadata = match &fetch {
+                    Fetch::Url(url) => serde_json::json!({
+                        "protocol_label": self.ctx.protocol_label,
+                        "url": sanitize_value(url, MAX_URL_LEN),
+                    }),
+                    Fetch::Unparsed(raw) => serde_json::json!({
+                        "protocol_label": self.ctx.protocol_label,
+                        "command": sanitize_value(raw, MAX_COMMAND_LEN),
+                    }),
+                };
                 evs.push(SensorEvent {
                     v: WIRE_VERSION,
                     source_ip: self.ctx.source_ip,
@@ -1159,10 +1169,7 @@ impl FakeShell {
                     protocol: PROTO_TCP.into(),
                     authenticated: self.ctx.authenticated,
                     observed_at: (self.clock)(),
-                    metadata: serde_json::json!({
-                        "protocol_label": self.ctx.protocol_label,
-                        "url": sanitized_url,
-                    }),
+                    metadata,
                     sample: None,
                     session_id: self.ctx.session_id,
                     occurrence_id: None,
@@ -2427,7 +2434,10 @@ fn command_basename(token: &str) -> &str {
 /// captured. The busybox *applet* token is matched raw, exactly like `cmd_busybox`/`busybox::is_applet`
 /// do: real busybox resolves an applet by bare name only, so `busybox /bin/tftp` is "applet not
 /// found" and must not be recorded as a fetch the persona did not answer in character.
-fn download_target(parts: &[&str]) -> Option<String> {
+///
+/// A `tftp` whose server or file cannot be read (see [`tftp`]) is [`Fetch::Unparsed`], never a
+/// guessed URL; a `tftp` upload (`-p`, `put`) fetches nothing and is not a fetch at all.
+fn fetch_attempt(parts: &[&str]) -> Option<Fetch> {
     const FETCHERS: [&str; 4] = ["wget", "curl", "tftp", "ftpget"];
     // BusyBox ships wget/tftp/ftpget applets but NOT curl, so `busybox curl` is "applet not found"
     // (see `busybox::applets`) and must not be recorded as a fetch the persona did not answer in
@@ -2441,9 +2451,35 @@ fn download_target(parts: &[&str]) -> Option<String> {
         _ => return None,
     };
     match cmd {
-        "tftp" => tftp_url(args),
-        "ftpget" => ftpget_url(args),
-        _ => fetch_url_arg(cmd, args).map(str::to_string),
+        "tftp" => {
+            let request = tftp::parse(args);
+            match (request.op, request.url) {
+                (tftp::Op::Put, _) => None,
+                (tftp::Op::Get, Some(url)) => Some(Fetch::Url(url)),
+                (tftp::Op::Get, None) => Some(Fetch::Unparsed(parts.join(" "))),
+            }
+        }
+        "ftpget" => ftpget_url(args).map(Fetch::Url),
+        _ => fetch_url_arg(cmd, args).map(|url| Fetch::Url(url.to_string())),
+    }
+}
+
+/// A retrieval a command line attempts, as the `honeypot_file_download` event records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Fetch {
+    /// The target parsed into a URL the fetcher may be handed.
+    Url(String),
+    /// A fetch whose server or file could not be read from the command line. The event carries
+    /// the raw command and no `url`, so the fetcher never sees a guessed or malformed target.
+    Unparsed(String),
+}
+
+/// The URL of a fetch, for tests that only care about the target.
+#[cfg(test)]
+fn download_target(parts: &[&str]) -> Option<String> {
+    match fetch_attempt(parts) {
+        Some(Fetch::Url(url)) => Some(url),
+        _ => None,
     }
 }
 
@@ -2521,21 +2557,21 @@ const LONG_OPTIONS_WITH_VALUE: [&str; 18] = [
 /// examined on its own; the fallback pair `wget X || busybox wget X` names one URL and yields
 /// one event. The raw-line scheme scan stays as the last resort for a URL inside quotes
 /// (`sh -c "wget http://h/x; ..."`), where the separators belong to a quoted script.
-fn download_targets(decoded: &str) -> Vec<String> {
-    let mut urls: Vec<String> = Vec::new();
+fn download_targets(decoded: &str) -> Vec<Fetch> {
+    let mut fetches: Vec<Fetch> = Vec::new();
     for tokens in simple_commands(decoded) {
-        if let Some(url) = download_target(&tokens)
-            && !urls.contains(&url)
+        if let Some(fetch) = fetch_attempt(&tokens)
+            && !fetches.contains(&fetch)
         {
-            urls.push(url);
+            fetches.push(fetch);
         }
     }
-    if urls.is_empty()
+    if !fetches.iter().any(|f| matches!(f, Fetch::Url(_)))
         && let Some(url) = url_if_fetch_line(decoded)
     {
-        urls.push(url.to_string());
+        fetches.push(Fetch::Url(url.to_string()));
     }
-    urls
+    fetches
 }
 
 /// Split a line into its simple commands' token lists at `;`, `|`, `||`, `&&`, a background `&`,
@@ -2586,30 +2622,6 @@ pub enum ControlOp {
     And,
     /// `||`: run only if the previous command failed.
     Or,
-}
-
-/// `tftp [-g|-p] [-l LOCAL] [-r REMOTE] HOST [PORT]` (BusyBox) -> `tftp://HOST[:PORT]/REMOTE`.
-/// `-r`/`-l` consume the next token; other flags do not. Flag order varies between loaders
-/// (`-g -r FILE HOST` and `-g HOST -r FILE` are both common), so positionals are collected rather
-/// than indexed. With only `-l` given, BusyBox uses it as the remote name too. No host -> `None`;
-/// a host with no file still yields `tftp://HOST`, since the retrieval host is evidence on its own.
-fn tftp_url(args: &[&str]) -> Option<String> {
-    let mut remote = None;
-    let mut local = None;
-    let mut positional = Vec::new();
-    let mut it = args.iter();
-    while let Some(&a) = it.next() {
-        match a {
-            "-r" => remote = it.next().copied(),
-            "-l" => local = it.next().copied(),
-            _ if a.starts_with('-') => {}
-            _ => positional.push(a),
-        }
-    }
-    let host = *positional.first()?;
-    let port = positional.get(1);
-    let file = remote.or(local);
-    Some(join_fetch_url("tftp", host, port.copied(), file))
 }
 
 /// `ftpget [-c] [-v] [-u USER] [-p PASS] [-P PORT] HOST [LOCAL] REMOTE` (BusyBox) ->
@@ -3015,19 +3027,9 @@ fn download_save_name(cmd: &str, parts: &[&str]) -> Option<String> {
             }
             None
         }
-        // BusyBox `tftp -g -r REMOTE [-l LOCAL] HOST`: the local name wins when given.
-        "tftp" => {
-            let (mut remote, mut local) = (None, None);
-            let mut it = args.iter();
-            while let Some(&a) = it.next() {
-                match a {
-                    "-r" => remote = it.next().copied(),
-                    "-l" => local = it.next().copied(),
-                    _ => {}
-                }
-            }
-            local.or(remote).map(str::to_string)
-        }
+        // Every `tftp` form (see `tftp::parse`): the local name wins when given, an upload saves
+        // nothing.
+        "tftp" => tftp::parse(args).save,
         // BusyBox `ftpget [opts] HOST [LOCAL] REMOTE`: the local name is the second positional
         // when three are given, else the remote name doubles as it.
         "ftpget" => {
@@ -3371,5 +3373,7 @@ mod tests;
 mod textproc_tests;
 #[cfg(test)]
 mod texttools_tests;
+#[cfg(test)]
+mod tftp_tests;
 #[cfg(test)]
 mod timing_tests;

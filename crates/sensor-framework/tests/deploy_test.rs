@@ -2265,3 +2265,319 @@ fn provision_derives_watch_env_after_creating_the_account() {
     );
     assert!(deploy_file("upgrade.sh").contains("/provision.sh\""));
 }
+
+// ---- log rotation: Propolis runs logrotate itself, with a free-space guard ----
+//
+// In October 2026 the distro's logrotate.timer was inactive for eleven days, nothing rotated, and
+// the telnet log reached 6.6 GB. These tests pin the three things that prevent a repeat: the
+// rotation does not depend on the distro timer, both deploy entry points install and enable it,
+// and a log too large to copy is refused instead of filling the disk.
+
+/// The file's directives only: the headers explain the design in words these assertions look for.
+fn uncommented(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The service runs logrotate on Propolis's policy with a state file of its own (not the distro's
+/// shared one, which another job could lock or reset), and the timer is hourly and persistent.
+#[test]
+fn propolis_logrotate_units_use_their_own_state_file_and_an_hourly_persistent_timer() {
+    let service = uncommented(&deploy_file("propolis-logrotate.service"));
+    let exec = service
+        .lines()
+        .find(|l| l.starts_with("ExecStart="))
+        .expect("propolis-logrotate.service has no ExecStart");
+    assert!(
+        exec.contains(
+            "logrotate --state /var/lib/propolis/logrotate.state /etc/logrotate.d/propolis-sensors"
+        ),
+        "the service must run logrotate on the Propolis policy with its own state file: {exec}"
+    );
+    assert!(
+        !service.contains("/var/lib/logrotate/logrotate.status")
+            && !exec.contains("/etc/logrotate.conf"),
+        "must not share the distro's state file or run the distro's whole config"
+    );
+    assert!(service.contains("Type=oneshot"));
+    let writable = service
+        .lines()
+        .find(|l| l.starts_with("ReadWritePaths="))
+        .expect("ProtectSystem=strict needs an explicit write grant");
+    assert!(
+        writable.contains("/var/log/propolis") && writable.contains("/var/lib/propolis"),
+        "must be able to write the logs and its state file: {writable}"
+    );
+    assert!(service.contains("ProtectSystem=strict"));
+
+    let timer = uncommented(&deploy_file("propolis-logrotate.timer"));
+    for directive in [
+        "OnCalendar=hourly",
+        "Persistent=true",
+        "RandomizedDelaySec=",
+        "Unit=propolis-logrotate.service",
+        "WantedBy=timers.target",
+    ] {
+        assert!(timer.contains(directive), "timer is missing {directive}");
+    }
+}
+
+/// Both entry points install the units and the guard, and enable the timer only after systemd has
+/// reloaded (a unit systemd has not loaded cannot be enabled); upgrade does it before any restart
+/// so a failure aborts before a service is bounced.
+#[test]
+fn install_and_upgrade_install_and_enable_the_rotation_timer_after_the_reload() {
+    for script_name in ["install.sh", "upgrade.sh"] {
+        let script = deploy_file(script_name);
+        let lines: Vec<&str> = script.lines().map(str::trim_start).collect();
+        for unit in ["propolis-logrotate.service", "propolis-logrotate.timer"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("for unit in ") && l.contains(unit)),
+                "{script_name} never installs {unit}"
+            );
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("logrotate-guard.sh")
+                && l.contains("install -m 0755")
+                && l.contains("/usr/local/sbin/propolis-logrotate-guard")),
+            "{script_name} must install the free-space guard executable where the policy calls it"
+        );
+        let reload = lines
+            .iter()
+            .position(|l| l.ends_with("systemctl daemon-reload"))
+            .unwrap_or_else(|| panic!("{script_name} never reloads systemd"));
+        let enable = lines
+            .iter()
+            .position(|l| l.ends_with("systemctl enable --now propolis-logrotate.timer"))
+            .unwrap_or_else(|| panic!("{script_name} never enables the rotation timer"));
+        assert!(
+            reload < enable,
+            "{script_name} enables the timer (line {}) before the reload (line {})",
+            enable + 1,
+            reload + 1
+        );
+    }
+    let upgrade = deploy_file("upgrade.sh");
+    let lines: Vec<&str> = upgrade.lines().map(str::trim_start).collect();
+    let enable = lines
+        .iter()
+        .position(|l| l.ends_with("systemctl enable --now propolis-logrotate.timer"))
+        .unwrap();
+    let first_restart = lines
+        .iter()
+        .position(|l| l.starts_with("systemctl restart"))
+        .unwrap();
+    assert!(
+        enable < first_restart,
+        "upgrade.sh must enable the timer before restarting"
+    );
+}
+
+/// The dry run shows the operator, and CI, the enable.
+#[test]
+fn install_dry_run_installs_the_guard_and_enables_the_rotation_timer() {
+    let output = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .arg("--dry-run")
+    .output()
+    .expect("failed to run deploy/install.sh --dry-run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "propolis-logrotate.service /etc/systemd/system/propolis-logrotate.service",
+        "propolis-logrotate.timer /etc/systemd/system/propolis-logrotate.timer",
+        "/usr/local/sbin/propolis-logrotate-guard",
+        "[dry-run] systemctl enable --now propolis-logrotate.timer",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "dry-run output missing {expected:?}"
+        );
+    }
+}
+
+/// The policy's `prerotate` hook is what calls the guard, once per log, with the log path.
+#[test]
+fn the_logrotate_policy_runs_the_free_space_guard_per_log_before_rotating() {
+    let conf = uncommented(&deploy_file("logrotate-sensors.conf"));
+    let hook = conf
+        .split("prerotate")
+        .nth(1)
+        .and_then(|rest| rest.split("endscript").next())
+        .expect("the policy has no prerotate script");
+    assert!(
+        hook.contains("/usr/local/sbin/propolis-logrotate-guard \"$1\""),
+        "the hook must pass the log path to the guard: {hook}"
+    );
+    assert!(
+        !conf.contains("sharedscripts"),
+        "sharedscripts would make one oversized log's refusal skip every log in its pattern"
+    );
+    assert!(conf.contains("copytruncate"));
+}
+
+fn run_guard(log: &Path, reserve: &str) -> std::process::Output {
+    std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/logrotate-guard.sh"
+    ))
+    .arg(log)
+    .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", reserve)
+    .output()
+    .expect("failed to run deploy/logrotate-guard.sh")
+}
+
+/// A log that fits is rotated; one that cannot be copied is refused with the recovery pointer.
+/// The free space is the real one on the test's filesystem; the reserve is what moves the line.
+#[test]
+fn the_guard_admits_a_log_that_fits_and_refuses_one_that_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    std::fs::write(&log, vec![b'x'; 4096]).unwrap();
+
+    let fits = run_guard(&log, "0");
+    assert!(
+        fits.status.success(),
+        "a 4 KiB log with no reserve must be admitted: {}",
+        String::from_utf8_lossy(&fits.stderr)
+    );
+
+    let refused = run_guard(&log, "999999999999999");
+    assert!(
+        !refused.status.success(),
+        "a reserve no volume can meet must refuse"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("refusing to rotate"), "{stderr}");
+    assert!(
+        stderr.contains("A log too large to rotate"),
+        "must point at the recovery: {stderr}"
+    );
+
+    // The copy itself, not just the reserve, is accounted: a sparse log larger than any volume
+    // (8 TiB) cannot fit with the reserve at zero either. Skipped where the filesystem cannot
+    // hold a file that large.
+    let huge = dir.path().join("huge.jsonl");
+    let f = std::fs::File::create(&huge).unwrap();
+    if f.set_len(8 * 1024 * 1024 * 1024 * 1024).is_ok() {
+        assert!(
+            !run_guard(&huge, "0").status.success(),
+            "a log larger than the free space must be refused even with no reserve"
+        );
+    }
+
+    let no_arg = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/logrotate-guard.sh"
+    ))
+    .output()
+    .unwrap();
+    assert!(
+        !no_arg.status.success(),
+        "the guard must fail closed without a log path"
+    );
+}
+
+/// The shipped policy stanza, run by real logrotate against a temp directory: the oversized log is
+/// refused and left untouched, the healthy one is still rotated, logrotate exits non-zero (the
+/// service shows failed), and the state file is still written (the rotation-stale alert reads it).
+#[test]
+fn logrotate_skips_only_the_log_the_guard_refuses() {
+    if std::process::Command::new("logrotate")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("logrotate is not installed here; skipping the end-to-end rotation check");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big.jsonl");
+    let small = dir.path().join("small.jsonl");
+    std::fs::write(&small, vec![b'x'; 8192]).unwrap();
+    let f = std::fs::File::create(&big).unwrap();
+    if f.set_len(8 * 1024 * 1024 * 1024 * 1024).is_err() {
+        eprintln!("this filesystem cannot hold an 8 TiB sparse file; skipping");
+        return;
+    }
+
+    // The shipped stanza, retargeted: its own directives, this guard, these logs, a 1k trigger.
+    let shipped = deploy_file("logrotate-sensors.conf");
+    let stanza = &shipped[shipped.find('{').expect("policy has no stanza")..];
+    let guard = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/logrotate-guard.sh"
+    );
+    let stanza = stanza
+        .replace("/usr/local/sbin/propolis-logrotate-guard", guard)
+        .replace("size 100M", "size 1k");
+    assert!(
+        stanza.contains("size 1k") && stanza.contains(guard),
+        "retargeting failed"
+    );
+    let conf = dir.path().join("policy.conf");
+    std::fs::write(
+        &conf,
+        format!("{}\n{}\n{stanza}", big.display(), small.display()),
+    )
+    .unwrap();
+    let state = dir.path().join("logrotate.state");
+
+    // Bounded: if the guard ever admitted the 8 TiB log, logrotate would sit copying it, and a
+    // hung test is a worse signal than a failed one.
+    let mut child = std::process::Command::new("logrotate")
+        .arg("--state")
+        .arg(&state)
+        .arg(&conf)
+        .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "0")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("logrotate did not finish in 60 s: the guard admitted the oversized log");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(
+        !status.success(),
+        "a refused log must make logrotate exit non-zero so the unit shows failed"
+    );
+    assert!(
+        dir.path().join("small.jsonl.1").exists(),
+        "the healthy log must still rotate: {stderr}"
+    );
+    assert_eq!(
+        std::fs::metadata(&small).unwrap().len(),
+        0,
+        "copytruncate emptied it"
+    );
+    assert!(
+        !dir.path().join("big.jsonl.1").exists(),
+        "the refused log must not be copied"
+    );
+    assert_eq!(
+        std::fs::metadata(&big).unwrap().len(),
+        8 * 1024 * 1024 * 1024 * 1024,
+        "the refused log must be untouched"
+    );
+    assert!(
+        state.exists(),
+        "logrotate still writes its state file after a refusal"
+    );
+}

@@ -7815,3 +7815,80 @@ async fn dashboard_recent_activity_folds_a_flood_into_one_row_per_run(pool: PgPo
         "{body}"
     );
 }
+
+#[sqlx::test(migrations = false)]
+async fn detail_folds_retried_sessions_and_echo_loader_chunks(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.180";
+    let script = [cmd("enable"), cmd("sh"), cmd("cat /proc/mounts")];
+    // A retry loop: the same three commands three times, each under a different username, then a
+    // session that ran something else.
+    for (n, user) in ["admin", "cht", "administrator"].iter().enumerate() {
+        let mut steps = vec![telnet_login(user)];
+        steps.extend(script.iter().cloned());
+        append_session(
+            &pool,
+            ip,
+            "telnet",
+            Uuid::now_v7(),
+            3000 - n as i64 * 100,
+            &steps,
+        )
+        .await;
+    }
+    // The newest session wrote a five-chunk echo loader between two ordinary commands.
+    let mut steps = vec![telnet_login("root"), cmd("cd /tmp")];
+    for index in 1..=5u64 {
+        steps.push((
+            SignalType::HoneypotCommandExec,
+            serde_json::json!({
+                "command": format!("/bin/busybox echo -ne '\\x7f\\x45' >> .i"),
+                "assembled_file": "/tmp/.i",
+                "chunk_index": index,
+            }),
+        ));
+    }
+    steps.push(cmd("chmod 777 .i"));
+    append_session(&pool, ip, "telnet", Uuid::now_v7(), 600, &steps).await;
+
+    let (status, body) = get_page(test_state(pool), &format!("/ip/{ip}")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Two top-level cards (the loader session and the fold) and three member cards inside the
+    // fold. A fold that also swallowed the loader session would leave one top-level card.
+    assert_eq!(
+        body.matches(r#"class="session-card fold-group""#).count(),
+        1,
+        "{body}"
+    );
+    assert_eq!(
+        body.matches(r#"<details class="session-card" id="session-"#)
+            .count(),
+        4,
+        "{body}"
+    );
+    assert!(body.contains(">x3 identical sessions<"), "{body}");
+    assert!(body.contains("users: admin, cht, administrator"), "{body}");
+    assert!(body.contains(">3 commands each<"), "{body}");
+
+    // The five chunk writes are one row, the lines behind its expander; the commands around them
+    // keep their own rows.
+    assert!(
+        body.contains(r#"<span class="chunk-count">5 echo chunks</span> to <span class="mono">&#x2f;tmp&#x2f;.i</span> <span class="dim">(chunks 1-5)</span>"#),
+        "{body}"
+    );
+    assert_eq!(
+        body.matches(r#"<tr class="chunk-run">"#).count(),
+        1,
+        "{body}"
+    );
+    assert_eq!(body.matches("&gt;&gt; .i</li>").count(), 5, "{body}");
+    assert!(
+        body.contains("<td class=\"mono\">cd &#x2f;tmp</td>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<td class=\"mono\">chmod 777 .i</td>"),
+        "{body}"
+    );
+}

@@ -1,4 +1,18 @@
-{% for session in sessions %}
+{% macro event_row(event) -%}
+<tr>
+  <td class="seen dim">{{ event.relative_time }}</td>
+  <td>{{ event.activity }}</td>
+  <td class="mono">{{ event.detail }}{% if event.xor_badge %} <span class="dim" title="command recovered from single-byte-XOR obfuscation; raw bytes in the raw view">(de-obfuscated, xor {{ event.xor_badge }})</span>{% endif %}</td>
+  <td>
+    <details class="raw-toggle">
+      <summary>raw</summary>
+      <pre class="raw-json">{{ event.metadata_json }}</pre>
+    </details>
+  </td>
+</tr>
+{%- endmacro %}
+
+{% macro card(session) -%}
 <details class="session-card" id="session-{{ session.session_id }}" {% if session.expanded %}open{% endif %}>
   <summary class="session-header">
     <span class="session-time mono">{{ session.start_time }}</span>
@@ -12,23 +26,52 @@
     <table class="evidence-table">
       <thead><tr><th>Time</th><th>Activity</th><th>Detail</th><th></th></tr></thead>
       <tbody>
-        {% for event in session.events %}
-        <tr>
-          <td class="seen dim">{{ event.relative_time }}</td>
-          <td>{{ event.activity }}</td>
-          <td class="mono">{{ event.detail }}{% if event.xor_badge %} <span class="dim" title="command recovered from single-byte-XOR obfuscation; raw bytes in the raw view">(de-obfuscated, xor {{ event.xor_badge }})</span>{% endif %}</td>
+        {% for item in session.items %}
+        {% if item.chunk_file %}
+        {% set first = session.events[item.start] %}
+        <tr class="chunk-run">
+          <td class="seen dim">{{ first.relative_time }}</td>
+          <td>{{ first.activity }}</td>
           <td>
-            <details class="raw-toggle">
-              <summary>raw</summary>
-              <pre class="raw-json">{{ event.metadata_json }}</pre>
+            <details class="chunk-toggle">
+              <summary><span class="chunk-count">{{ item.end - item.start }} echo chunks</span> to <span class="mono">{{ item.chunk_file }}</span> <span class="dim">(chunks {{ item.first_chunk }}-{{ item.last_chunk }})</span></summary>
+              <ol class="chunk-lines mono">
+                {% for e in session.events[item.start:item.end] %}<li><span class="dim">{{ e.relative_time }}</span> {{ e.detail }}</li>{% endfor %}
+              </ol>
             </details>
           </td>
+          <td></td>
         </tr>
+        {% else %}
+        {{ event_row(session.events[item.start]) }}
+        {% endif %}
         {% endfor %}
       </tbody>
     </table>
   </div>
 </details>
+{%- endmacro %}
+
+{% for fold in session_folds %}
+{% if fold.repeat == 1 %}
+{{ card(fold.sessions[0]) }}
+{% else %}
+{#- Consecutive sessions that ran the same commands: one card with the count, the sessions
+    themselves one level down so each keeps its own times and credentials. -#}
+<details class="session-card fold-group" {% if fold.expanded %}open{% endif %}>
+  <summary class="session-header">
+    <span class="session-time mono">{{ fold.first_start }}</span>
+    <span class="dim">latest {{ fold.latest_relative }}</span>
+    <span class="session-meta">{{ fold.sensor }} / {{ fold.protocol }}</span>
+    <span class="fold-count">x{{ fold.repeat }} identical sessions</span>
+    {% if fold.users %}<span class="session-user mono">user{% if fold.users|length != 1 %}s{% endif %}: {{ fold.users|join(", ") }}</span>{% endif %}
+    <span class="session-count dim">{{ fold.command_count }} command{% if fold.command_count != 1 %}s{% endif %} each</span>
+  </summary>
+  <div class="fold-members">
+    {% for session in fold.sessions %}{{ card(session) }}{% endfor %}
+  </div>
+</details>
+{% endif %}
 {% endfor %}
 
 {% if ungrouped %}

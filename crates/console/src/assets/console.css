@@ -431,6 +431,15 @@ td.ip a:hover { color: var(--brand); }
 .session-user { color: var(--info-text); }
 .session-count { margin-left: auto; white-space: nowrap; }
 .evidence-table th, .evidence-table td { padding: 0.45rem 0.75rem; font-size: 0.8rem; }
+/* Repeated identical sessions: one card holding the members, each still its own card. */
+.fold-count { font-family: var(--font-mono); font-weight: 600; color: var(--text); background: var(--bg); border: 1px solid var(--border-bright); border-radius: var(--radius-sm); padding: 0 0.4rem; font-size: 0.74rem; }
+.fold-members { padding: 0.6rem 0.6rem 0.6rem 1.2rem; }
+/* A run of echo-loader chunk writes: one row, the lines behind an expander. */
+.chunk-toggle > summary { cursor: pointer; }
+.chunk-toggle > summary:hover { color: var(--text); }
+.chunk-count { font-weight: 600; color: var(--high-text); }
+.chunk-lines { margin: 0.4rem 0 0; padding-left: 2.2rem; font-size: 0.72rem; max-height: 22rem; overflow-y: auto; }
+.chunk-lines li { white-space: pre-wrap; word-break: break-all; padding: 0.05rem 0; }
 .raw-toggle { display: inline-block; }
 .raw-toggle > summary { cursor: pointer; color: var(--text-muted); font-size: 0.72rem; }
 .raw-toggle > summary:hover { color: var(--text); }

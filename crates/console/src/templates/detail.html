@@ -269,7 +269,7 @@
   <div class="panel-body" id="evidence-timeline">
     {% include "session_cards.html" %}
 
-    {% if not sessions and not ungrouped %}
+    {% if not session_folds and not ungrouped %}
     <p class="empty-line">No events recorded for this IP.</p>
     {% endif %}
   </div>

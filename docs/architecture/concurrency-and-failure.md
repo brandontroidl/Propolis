@@ -93,12 +93,27 @@ Intake takes the lock once per **batch**, not once per line: `append_events`
 (`crates/core-scoring/src/repository/batch.rs#append_events`) runs the same critical section for
 up to 1000 events in one transaction and leaves exactly the state the per-event path would
 ([storage](./storage.md#batched-append)). A batch that fails rolls back whole. If one event
-caused the failure, the batch is retried in halves so the events before it commit; intake then
-counts one error, does not advance the cursor, and rewinds, so the next poll reads the whole
-batch again and the events already committed are absorbed by the dedup window. Nothing after
-the failing event is written, and nothing is skipped. An event that the database always
-refuses therefore holds that sensor's intake at that line until it is removed from the log, as
-it did one event at a time; a connection error is retried at once without splitting.
+caused the failure (an invalid event, a stored projection that will not decode, a data
+exception or constraint violation), the batch is retried in halves so the events before it
+commit. Intake then counts one error and moves its read position past exactly the lines that
+committed (and any rejected or probe lines among them), without persisting the cursor, so the
+next poll starts at the failed line: committed events are not appended a second time, and
+nothing after the failing event is written or skipped. A failure at the first line of a batch
+reports nothing ingested, so the intake loop sleeps its poll interval instead of retrying at
+once. An event the database always refuses therefore holds that sensor's intake at that line
+until it is removed from the log, as it did one event at a time; the third consecutive poll
+refusing the same line logs `intake wedged at <sensor>` with the event's `observed_at` and the
+SQLSTATE, and `intake-stalled` quotes the same text when it fires. Nothing skips or quarantines
+the line: that is the operator's decision. An error that is not about one event (a lost
+connection, a lock timeout) is returned without splitting the batch and is retried on the next
+poll.
+
+One duplicate source remains: if the connection drops after Postgres committed a batch but
+before the acknowledgement arrives, the batch is reported as failed and read again, so its
+events enter the ledger a second time. The dedup window absorbs their score weight but not the
+extra ledger rows or the source's event counters. That is the at-least-once guarantee's price
+(a crash before the cursor is persisted replays up to a batch the same way), and it is the only
+way a healthy database sees an event twice.
 
 Concurrent NDJSON log appends (multiple connections through one `EventEmitter` behind an
 `Arc`) are serialized by the OS: one `O_APPEND` `write_all` of the whole line is atomic

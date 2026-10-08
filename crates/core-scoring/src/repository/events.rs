@@ -107,6 +107,29 @@ macro_rules! stored_score_columns {
 }
 pub(crate) use stored_score_columns;
 
+/// Open a transaction that holds the append lock, for a writer OUTSIDE this module that changes
+/// `ip_score` (the console's delist, relist and delete). An append reads an address's projection
+/// when it starts and writes it back when it commits; a change made in between is overwritten by
+/// that write (a delete is undone, a delist loses its flags). Taking the same lock makes the
+/// change land either entirely before the append's read or entirely after its commit, for both
+/// the single and the batched path. The lock is released at commit or rollback.
+///
+/// READ COMMITTED is pinned first for the reason `append_event` pins it: each later statement
+/// must take a fresh snapshot after the lock is granted.
+pub async fn begin_exclusive(
+    pool: &PgPool,
+) -> Result<sqlx::Transaction<'static, Postgres>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(APPEND_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
 // Manual `From` (not thiserror `#[from]`) so we do not require `ValidationError`
 // to implement `std::error::Error`; it stays a plain domain value type.
 impl From<ValidationError> for RepoError {
@@ -162,13 +185,42 @@ const DEDUP_PRIOR_SQL: &str = "SELECT MAX(observed_at) FROM event \
 ///
 /// `canonical_bytes`/`chain_hash` stay unchanged (deterministic already); normalization belongs
 /// at the append boundary, and every append path (single, telemetry, batch) goes through here.
-pub(super) fn normalize_event(event: EventInput) -> EventInput {
-    let mut confidence = event.confidence;
-    confidence.rescale(3);
-    EventInput {
-        observed_at: event.observed_at.trunc_subsecs(6),
-        confidence,
-        ..event
+pub(super) fn normalize_event(mut event: EventInput) -> EventInput {
+    normalize_in_place(&mut event);
+    event
+}
+
+/// [`normalize_event`] without moving the event, for a batch that owns a thousand of them.
+pub(super) fn normalize_in_place(event: &mut EventInput) {
+    event.confidence.rescale(3);
+    event.observed_at = event.observed_at.trunc_subsecs(6);
+}
+
+impl RepoError {
+    /// Whether one bad event can cause this error, so that retrying a smaller slice of a batch
+    /// can isolate the event: a failed validation, a stored-state or decode failure met while
+    /// reading that event's source (one-at-a-time ingestion commits everything before the first
+    /// such event too), a data exception (SQLSTATE class 22, such as a NUL character in metadata
+    /// that `jsonb` rejects) or a constraint violation (class 23). A connection error, a pool
+    /// timeout or the chain trigger's own exception says nothing about any one event, and
+    /// retrying smaller would only repeat it.
+    pub fn is_event_specific(&self) -> bool {
+        match self {
+            RepoError::Invalid(_) | RepoError::Corrupt(_) => true,
+            RepoError::Db(sqlx::Error::Database(db)) => db
+                .code()
+                .is_some_and(|code| code.starts_with("22") || code.starts_with("23")),
+            RepoError::Db(sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// The SQLSTATE of a database error, for an operator reading why an event is refused.
+    pub fn sqlstate(&self) -> Option<String> {
+        match self {
+            RepoError::Db(sqlx::Error::Database(db)) => db.code().map(|c| c.to_string()),
+            _ => None,
+        }
     }
 }
 

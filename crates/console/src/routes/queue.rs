@@ -23,7 +23,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Form, Router};
 use chrono::{DateTime, Utc};
-use core_scoring::{Category, IpScore, ReviewState, read_score};
+use core_scoring::{Category, IpScore, ReviewState, begin_exclusive, read_score};
 use minijinja::context;
 use review::queue::ReviewQueue;
 use rust_decimal::prelude::ToPrimitive;
@@ -686,7 +686,9 @@ async fn delist(
         return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
     }
 
-    let mut tx = state.db.begin().await?;
+    // Under the append lock: an append in flight reads this address's projection and writes it
+    // back, and would overwrite the flags set here (see `begin_exclusive`).
+    let mut tx = begin_exclusive(&state.db).await?;
     sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
         .bind(ip.to_string())
         .execute(&mut *tx)
@@ -730,7 +732,8 @@ async fn relist(
         return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
     }
 
-    let mut tx = state.db.begin().await?;
+    // Under the append lock, so the re-derived flags are not overwritten by an append in flight.
+    let mut tx = begin_exclusive(&state.db).await?;
     let cleared = sqlx::query("UPDATE ip_score SET delisted = FALSE WHERE source_ip = $1::inet")
         .bind(ip.to_string())
         .execute(&mut *tx)
@@ -789,7 +792,8 @@ async fn delete_ip(
     // Literal statements (sqlx requires a static SQL string, and it is the right guard here): the
     // ONLY dynamic value is the bound `$1` IP, never the table name.
     let ip_str = ip.to_string();
-    let mut tx = state.db.begin().await?;
+    // Under the append lock, so an append in flight cannot write the purged row back.
+    let mut tx = begin_exclusive(&state.db).await?;
     sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
         .bind(&ip_str)
         .execute(&mut *tx)

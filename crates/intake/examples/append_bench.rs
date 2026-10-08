@@ -181,7 +181,7 @@ async fn batched(url: &str, seconds: u64, batch: usize, ips: Vec<IpAddr>) {
             })
             .collect();
         let start = Instant::now();
-        let outcome = append_events(&pool, &events).await;
+        let outcome = append_events(&pool, events).await;
         times.push(start.elapsed());
         assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
         total += outcome.appended as u64;

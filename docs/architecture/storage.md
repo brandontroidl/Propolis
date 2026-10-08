@@ -142,10 +142,18 @@ failed validation, a data exception such as a NUL character in metadata that `js
 constraint violation), `append_events` retries it in halves, so the events before the bad one
 commit and the bad one is isolated in a logarithmic number of transactions; it reports how many
 leading events are durable and the error of the next. That is where one-at-a-time ingestion would
-have stopped, and intake treats it the same way: the cursor does not advance and the batch is read
-again ([concurrency and failure](./concurrency-and-failure.md#serialized-single-writer-append)).
-Any other error, a lost connection or a lock timeout, is returned at once with the failed attempt
-rolled back.
+have stopped, and intake treats it the same way: the cursor is not persisted and the next poll
+starts at the failed event
+([concurrency and failure](./concurrency-and-failure.md#serialized-single-writer-append)). A
+stored projection that cannot be decoded counts as one event's failure too. Any other error, a
+lost connection or a lock timeout, is returned at once with the failed attempt rolled back, and
+the batch is tried again on the next poll.
+
+An append reads a source's `ip_score` when it starts and writes it back at commit, so the
+console's delist, relist and delete take the same lock for their transaction
+(`crates/core-scoring/src/repository/events.rs#begin_exclusive`); without it, one landing
+mid-batch would be overwritten (a delete undone, a delist's flags lost) and the review queue would
+re-queue the address.
 
 The lock is held for the whole batch, so a batch bounds how long other writers wait. Measured on
 a 1M-row ledger with a 200k-event hot source (tmpfs-backed server, where a commit costs nothing

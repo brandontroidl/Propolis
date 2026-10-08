@@ -232,6 +232,7 @@ mod tests {
             bytes_behind: bytes,
             last_ingested_observed_at: last,
             reported_sensors: vec!["telnet".into()],
+            wedge: None,
         }
     }
 

@@ -555,3 +555,55 @@ fn backlog_of_a_missing_file_or_a_reader_started_at_the_end_is_zero() {
     append(&log_path, "later\n");
     assert_eq!(tailer.backlog_bytes(), 6);
 }
+
+/// A batch stops BEFORE the line that would pass the byte budget, and that line is not consumed:
+/// the next read starts at it.
+#[test]
+fn a_byte_budget_stops_the_batch_before_the_line_that_would_pass_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "aaaa\nbbbb\ncccc\ndddd\n").unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    // 5 bytes a line with its newline: 12 bytes holds two.
+    assert_eq!(tailer.read_batch_bounded(100, 12), vec!["aaaa", "bbbb"]);
+    assert_eq!(tailer.read_batch_bounded(100, 12), vec!["cccc", "dddd"]);
+    assert!(tailer.read_batch_bounded(100, 12).is_empty());
+}
+
+/// The first line of a batch goes through whatever the budget, so a budget below one line cannot
+/// stall the reader.
+#[test]
+fn a_budget_smaller_than_one_line_still_returns_one_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "aaaa\nbbbb\n").unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch_bounded(100, 1), vec!["aaaa"]);
+    assert_eq!(tailer.read_batch_bounded(100, 0), vec!["bbbb"]);
+}
+
+/// The budget spans a rotated-out inode being drained and the new file: the batch stops inside the
+/// drain at the budget, and nothing is lost or repeated across the batches.
+#[test]
+fn a_byte_budget_applies_across_a_draining_inode_and_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "old1\nold2\nold3\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(1), vec!["old1"]);
+    tailer.commit_batch();
+    std::fs::rename(&log_path, dir.path().join("events.jsonl.1")).unwrap();
+    std::fs::write(&log_path, "new1\nnew2\n").unwrap();
+
+    let mut seen = Vec::new();
+    for _ in 0..10 {
+        let batch = tailer.read_batch_bounded(100, 10);
+        if batch.is_empty() {
+            break;
+        }
+        assert!(batch.len() <= 2, "{batch:?}");
+        seen.extend(batch);
+        tailer.commit_batch();
+    }
+    assert_eq!(seen, vec!["old2", "old3", "new1", "new2"]);
+}

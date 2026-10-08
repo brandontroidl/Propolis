@@ -145,6 +145,42 @@ async fn a_line_from_a_configured_probe_source_never_reaches_the_ledger(pool: Pg
     );
 }
 
+/// A probe line behind a line the database refuses has not been reached, so it must not be
+/// confirmed: it is read again every poll, and confirming it each time would stamp a wedged
+/// sensor's probe row fresh forever. One in front of the refused line is reached, and counts once.
+#[sqlx::test(migrations = false)]
+async fn a_probe_line_behind_a_refused_line_is_not_confirmed(pool: PgPool) {
+    migrate(&pool).await;
+    seed_probe_row(&pool, "ssh").await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let mut refused = connection_line(ATTACKER, "ssh");
+    refused.metadata = serde_json::json!({ "command": "a\u{0}b" });
+    write_line(&log_path, &refused);
+    write_line(&log_path, &connection_line(PROBER, "ssh"));
+
+    let mut runner = IntakeRunner::new(
+        LogTailer::new(log_path, dir.path().join("cursors")),
+        pool.clone(),
+        "ssh".into(),
+        probe_sources(),
+        PROBE_GRACE,
+    );
+    for _ in 0..2 {
+        let result = runner.run_batch().await;
+        assert_eq!(
+            (result.errors, result.ingested, result.probe_confirmations),
+            (1, 0, 0)
+        );
+    }
+    let rows = read_all(&pool).await.unwrap();
+    assert!(
+        rows[0].confirmed_at.is_none(),
+        "a probe line behind a refused line was confirmed"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn a_line_from_any_other_address_is_ingested_normally(pool: PgPool) {
     migrate(&pool).await;

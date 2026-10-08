@@ -83,6 +83,9 @@ pub struct SensorIntake {
     pub last_ingested_observed_at: Option<DateTime<Utc>>,
     /// The `event.sensor` names the log's appended events carried, for the fleet pane.
     pub reported_sensors: Vec<String>,
+    /// Set while the database keeps refusing the same line of this log (`IntakeRunner::wedged`);
+    /// `intake-stalled` quotes it, so the page says why the cursor is not moving.
+    pub wedge: Option<String>,
 }
 
 impl SensorIntake {
@@ -94,6 +97,7 @@ impl SensorIntake {
             bytes_behind: None,
             last_ingested_observed_at: None,
             reported_sensors: Vec::new(),
+            wedge: None,
         }
     }
 }

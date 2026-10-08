@@ -33,8 +33,8 @@ pub use domain::weights::{SignalWeight, signal_weight};
 pub use net::{embedded_ipv4, is_reserved_ip};
 pub use repository::{
     BatchAppend, ChainStatus, CoverageEventRow, CoverageEvents, MAX_COVERAGE_ROWS, RepoError,
-    append_event, append_events, append_telemetry_event, coverage_events, read_score,
-    rebuild_projection, verify_chain,
+    append_event, append_events, append_telemetry_event, begin_exclusive, coverage_events,
+    read_score, rebuild_projection, verify_chain,
 };
 pub use scoring::breadth::effective_score;
 pub use scoring::persistence::persistence_points;

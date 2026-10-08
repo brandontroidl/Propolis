@@ -187,7 +187,7 @@ async fn ingest_batched(
     let mut turn = 0;
     while at < events.len() {
         let end = (at + plan[turn % plan.len()]).min(events.len());
-        let outcome = append_events(pool, &events[at..end]).await;
+        let outcome = append_events(pool, events[at..end].to_vec()).await;
         if let Some(failure) = outcome.failure {
             return Err(failure);
         }
@@ -337,7 +337,7 @@ async fn in_batch_duplicate_is_counted_but_adds_no_weight(pool: PgPool) -> sqlx:
         t0() + Duration::seconds(10),
         1,
     );
-    let outcome = append_events(&pool, &[first, second]).await;
+    let outcome = append_events(&pool, vec![first, second]).await;
     assert!(outcome.failure.is_none());
     assert_eq!(outcome.appended, 2);
     let score = read_stored(&pool, "192.0.2.50").await;
@@ -386,7 +386,7 @@ async fn a_poisoned_event_commits_the_prefix_and_names_the_failure(
         .collect();
     events[6].metadata = serde_json::json!({ "command": "echo \u{0}" });
 
-    let outcome = append_events(&pool, &events).await;
+    let outcome = append_events(&pool, events.clone()).await;
     assert_eq!(outcome.appended, 6);
     let failure = outcome.failure.expect("the poisoned event must fail");
     assert!(
@@ -437,7 +437,7 @@ async fn a_poisoned_event_at_the_edges_of_a_batch(pool: PgPool) -> sqlx::Result<
             })
             .collect();
         events[poisoned].metadata = serde_json::json!({ "c": "\u{0}" });
-        let outcome = append_events(&pool, &events).await;
+        let outcome = append_events(&pool, events.clone()).await;
         assert_eq!(
             outcome.appended, want_appended,
             "len {len} poisoned {poisoned}"
@@ -445,6 +445,48 @@ async fn a_poisoned_event_at_the_edges_of_a_batch(pool: PgPool) -> sqlx::Result<
         assert!(outcome.failure.is_some(), "len {len} poisoned {poisoned}");
         assert_eq!(ledger_rows(&pool).await, want_appended as i64);
     }
+    Ok(())
+}
+
+/// A stored projection that cannot be decoded (here a `category_breakdown` that is not a map)
+/// fails the batch that reads it. One-at-a-time ingestion commits every event before the first
+/// one for that source, so the batch must too: it is isolated by halving like any one-event
+/// failure, not allowed to cost the whole batch.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_corrupt_stored_projection_costs_only_events_from_its_first_event(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+         distinct_categories, category_breakdown, first_seen, last_seen) \
+         VALUES ('192.0.2.77'::inet, 1, $1, 0, 1, 0, '\"not a map\"'::jsonb, $1, $1)",
+    )
+    .bind(t0())
+    .execute(&pool)
+    .await?;
+    let events: Vec<EventInput> = [SOURCES[0], SOURCES[1], "192.0.2.77", SOURCES[2], SOURCES[3]]
+        .iter()
+        .enumerate()
+        .map(|(n, ip)| {
+            event(
+                ip,
+                SignalType::HoneypotCommandExec,
+                t0() + Duration::minutes(n as i64),
+                n,
+            )
+        })
+        .collect();
+
+    let outcome = append_events(&pool, events.clone()).await;
+    assert_eq!(
+        outcome.appended, 2,
+        "the two events before the corrupt source commit"
+    );
+    assert!(matches!(outcome.failure, Some(RepoError::Corrupt(_))));
+    assert_eq!(ledger_rows(&pool).await, 2);
+
+    let single = append_event(&pool, events[2].clone()).await;
+    assert!(matches!(single, Err(RepoError::Corrupt(_))), "{single:?}");
     Ok(())
 }
 
@@ -463,7 +505,7 @@ async fn an_invalid_event_stops_the_batch_at_its_position(pool: PgPool) -> sqlx:
         })
         .collect();
     events[3].sensor = String::new();
-    let outcome = append_events(&pool, &events).await;
+    let outcome = append_events(&pool, events.clone()).await;
     assert_eq!(outcome.appended, 3);
     assert!(matches!(outcome.failure, Some(RepoError::Invalid(_))));
     assert_eq!(ledger_rows(&pool).await, 3);
@@ -493,7 +535,7 @@ async fn a_failure_not_caused_by_one_event_commits_nothing(pool: PgPool) -> sqlx
             )
         })
         .collect();
-    let outcome = append_events(&pool, &events).await;
+    let outcome = append_events(&pool, events.clone()).await;
     assert_eq!(outcome.appended, 0);
     assert!(outcome.failure.is_some());
     assert_eq!(ledger_rows(&pool).await, 0);
@@ -529,7 +571,7 @@ async fn concurrent_batches_and_single_appends_keep_one_chain(pool: PgPool) -> s
                     })
                     .collect();
                 if worker % 2 == 0 {
-                    let outcome = append_events(&pool, &events).await;
+                    let outcome = append_events(&pool, events.clone()).await;
                     assert!(outcome.failure.is_none() && outcome.appended == events.len());
                 } else {
                     for e in events {

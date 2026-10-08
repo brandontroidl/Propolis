@@ -53,7 +53,7 @@ use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 use crate::scoring::constants::{DEDUP_WINDOW_SECONDS, HALF_LIFE_SECONDS};
 use crate::scoring::engine::apply_event;
 
-use super::events::{APPEND_LOCK_KEY, RepoError, normalize_event, score_from_row};
+use super::events::{APPEND_LOCK_KEY, RepoError, normalize_in_place, score_from_row};
 
 /// Outcome of [`append_events`]. `events[..appended]` are durably in the ledger, in order;
 /// `failure`, when set, is the error of `events[appended]`, and nothing after it was written.
@@ -63,36 +63,20 @@ pub struct BatchAppend {
     pub failure: Option<RepoError>,
 }
 
-/// Whether `error` is something one bad event can cause, so retrying a smaller slice can isolate
-/// it: a failed validation, a data exception (SQLSTATE class 22, such as a NUL character in
-/// metadata that `jsonb` rejects) or a constraint violation (class 23). A connection error, a pool
-/// timeout or the chain trigger's own exception says nothing about any one event, and retrying
-/// smaller would only repeat it.
-fn is_event_specific(error: &RepoError) -> bool {
-    match error {
-        RepoError::Invalid(_) => true,
-        RepoError::Db(sqlx::Error::Database(db)) => db
-            .code()
-            .is_some_and(|code| code.starts_with("22") || code.starts_with("23")),
-        _ => false,
-    }
-}
-
 /// Append `events` in order, scored events and telemetry alike (each routed as the single-event
-/// functions would), in as few transactions as the failure semantics above allow.
-pub async fn append_events(pool: &PgPool, events: &[EventInput]) -> BatchAppend {
+/// functions would), in as few transactions as the failure semantics above allow. Takes the
+/// events by value: a batch can be a megabyte per line times a thousand lines, and the caller has
+/// no use for the copy this would otherwise force.
+pub async fn append_events(pool: &PgPool, mut events: Vec<EventInput>) -> BatchAppend {
     // Validation is per event and free, so the first invalid event bounds the prefix to append,
     // exactly where one-at-a-time ingestion would have stopped.
     let first_invalid = events
         .iter()
         .enumerate()
         .find_map(|(i, e)| e.validate().err().map(|v| (i, v)));
-    let valid = first_invalid.as_ref().map_or(events.len(), |(i, _)| *i);
-    let normalized: Vec<EventInput> = events[..valid]
-        .iter()
-        .cloned()
-        .map(normalize_event)
-        .collect();
+    events.truncate(first_invalid.as_ref().map_or(events.len(), |(i, _)| *i));
+    events.iter_mut().for_each(normalize_in_place);
+    let normalized = events;
 
     let mut done = 0;
     let mut end = normalized.len();
@@ -102,7 +86,7 @@ pub async fn append_events(pool: &PgPool, events: &[EventInput]) -> BatchAppend 
                 done = end;
                 end = normalized.len();
             }
-            Err(e) if end - done > 1 && is_event_specific(&e) => {
+            Err(e) if end - done > 1 && e.is_event_specific() => {
                 end = done + (end - done) / 2;
             }
             Err(e) => {
@@ -384,7 +368,7 @@ async fn insert_events(
             .map(|e| e.wan_ip.map(|ip| ip.to_string()))
             .collect::<Vec<_>>(),
     )
-    .bind(events.iter().map(|e| e.sensor.clone()).collect::<Vec<_>>())
+    .bind(events.iter().map(|e| e.sensor.as_str()).collect::<Vec<_>>())
     .bind(events.iter().map(|e| e.signal_type).collect::<Vec<_>>())
     .bind(events.iter().map(|e| e.protocol).collect::<Vec<_>>())
     .bind(events.iter().map(|e| e.authenticated).collect::<Vec<_>>())
@@ -392,12 +376,7 @@ async fn insert_events(
     .bind(events.iter().map(|e| e.weight as i32).collect::<Vec<_>>())
     .bind(events.iter().map(|e| e.confidence).collect::<Vec<_>>())
     .bind(events.iter().map(|e| e.observed_at).collect::<Vec<_>>())
-    .bind(
-        events
-            .iter()
-            .map(|e| e.metadata.clone())
-            .collect::<Vec<_>>(),
-    )
+    .bind(events.iter().map(|e| &e.metadata).collect::<Vec<_>>())
     .bind(prev_hashes)
     .bind(hashes)
     .bind(events.iter().map(|e| e.session_id).collect::<Vec<_>>())

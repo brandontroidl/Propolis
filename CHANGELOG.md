@@ -122,13 +122,22 @@
   test ledger with a 200k-event source (RAM-backed server): about 350 to 470 events a second one at
   a time, 11,000 to 13,600 in batches of 1000, with the lock held about 70 to 90 ms per batch.
   The runner's read size now adapts to lag: 100 lines when caught up, doubling to 1000 while a log
-  keeps filling whole batches, bounded by an 8 MiB byte budget, back to 100 on a short or failed
-  batch. A batch that fails is retried in halves when one event can be the cause (invalid, a data
-  exception such as a NUL in metadata, a constraint), so the events before it commit; the cursor
-  still does not advance past a failed batch and nothing is skipped, as before. Unchanged and
-  still true: an event the database refuses on every attempt holds that sensor's intake at its
-  line. `append_bench` gains a `batched` mode that also reports how long a second writer waits
-  on the lock.
+  keeps filling whole batches, back to 100 on a short or failed batch; the tailer enforces an 8 MiB
+  byte budget in the read itself (`LogTailer::read_batch_bounded`), so a burst of near-megabyte
+  lines cannot make a batch a gigabyte. A batch that fails is retried in halves when one event
+  can be the cause (invalid, a stored projection that will not decode, a data exception such as a
+  NUL in metadata, a constraint), so the events before it commit, and intake moves its read
+  position past exactly those lines: the next poll starts at the failed line, the committed
+  prefix is not appended again (it would otherwise be re-appended as new ledger rows on every
+  poll with no pause, inflating the source's event counters toward volume listing), and a failure
+  at the first line reports nothing ingested so the loop sleeps. Nothing is skipped or
+  quarantined: an event the database refuses on every attempt still holds that sensor's intake at
+  its line, now reported as `intake wedged at <sensor>` after three consecutive refusals of the
+  same line, quoted by `intake-stalled`. Probe confirmations are recorded only for lines the
+  append reached. The console's delist, relist and delete take the append lock, so one landing
+  mid-batch is no longer overwritten. A lost commit acknowledgement still replays a batch
+  (at-least-once). `append_bench` gains a `batched` mode that also reports how long a second
+  writer waits on the lock.
 
 - **`deploy/config-check.sh` compares the configuration with what is running** - five faults on
   the production box were each found by accident: a typo in `PROPOLIS_SENSOR_LOGS`, MQTT's log

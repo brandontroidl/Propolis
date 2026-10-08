@@ -239,11 +239,14 @@ All three values are hard-coded; there is no environment variable.
 |---|---|---|
 | Lines per batch when caught up | 100 | `crates/intake/src/runner.rs#MIN_BATCH_LINES` |
 | Most lines per batch | 1000 | `crates/intake/src/runner.rs#MAX_BATCH_LINES` |
-| Most bytes a grown batch may hold | 8 MiB | `crates/intake/src/runner.rs#MAX_BATCH_BYTES` |
+| Most bytes of line content one batch reads | 8 MiB, plus at most one line | `crates/intake/src/runner.rs#MAX_BATCH_BYTES` |
 
+The byte budget is enforced by the read itself: the tailer stops before the line that would pass
+it (`crates/log-tailer/src/tailer.rs#LogTailer::read_batch_bounded`), and always returns the
+first line, so a batch of near-1 MiB lines holds about eight of them whatever the line count.
 A batch that reads as many lines as it asked for doubles the next one, up to the maximum and the
-byte budget (lines near 1 MiB each hold the batch at 100); a batch that reads fewer, or that
-failed, returns to 100 (`crates/intake/src/runner.rs#next_batch_size`). The maximum bounds how
+byte budget; a batch that reads fewer, or that failed, returns to 100
+(`crates/intake/src/runner.rs#next_batch_size`). The maximum bounds how
 long one sensor's backlog can make every other writer wait for the lock: about 70 to 90 ms at
 1000 lines on the test ledger in [storage](../architecture/storage.md#batched-append).
 

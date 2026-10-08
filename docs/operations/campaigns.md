@@ -43,6 +43,14 @@ reason. Consecutive repeats of a shape collapse, so an echo loader's chunk count
 retried three times, or the repeats the flood gate summarized away do not split one tool into
 several campaigns.
 
+A line the sensor recovered from a single-byte XOR (Mirai's login `lghkel ; zpz}ld ; zalee` is
+`enable ; system ; shell` with key 9) is shaped, keyed and labeled as its decoded text
+(`command_decoded` in the event), so it joins the sessions that sent the same commands in plain
+text and is recognized as a shell-entry line. The campaign page lists the raw form, the key and
+the decoded text of the representative session's encoded lines
+(`crates/review/src/campaign/mod.rs#encoded_lines`). Indicators are extracted from the decoded
+text too, for events indexed after this change.
+
 **Fingerprint.** The campaign key is a running SHA-256 over the first 4 shapes of a run that are
 not shell-entry lines (`crates/review/src/campaign/fingerprint.rs#KEY_SHAPES`,
 `crates/review/src/campaign/fingerprint.rs#RunDigest`), not over the whole run. The shell-entry

@@ -34,10 +34,12 @@
 # database URL is unreadable. A check that cannot be answered is reported as unknown ("?"), counts
 # as a warning in the exit status, and is listed under LIMITED CHECKS: it is never a pass.
 #
-# Usage: config-check.sh [--json] [--report-only] [--no-events] [--env-dir DIR]
+# Usage: config-check.sh [--json] [--report-only] [--no-events] [--env-dir DIR] [--newest-event SENSOR]
 #   --json         one JSON document on stdout instead of the table
 #   --report-only  print the report but always exit 0 (upgrade.sh uses this)
 #   --no-events    skip the ledger query
+#   --newest-event SENSOR  print when the ledger last saw SENSOR (any age) and exit; the events
+#                  findings' fix line, so the database URL never reaches a command line
 #   --env-dir DIR  directory holding the env files   (default /etc/propolis)
 # Exit status: 0 all ok, 1 warnings or unknown checks, 2 at least one failure, 64 bad usage.
 #
@@ -59,9 +61,10 @@ ENV_DIR=/etc/propolis
 JSON=0
 REPORT_ONLY=0
 NO_EVENTS=0
+NEWEST_EVENT=""
 
 usage() {
-    echo "usage: $0 [--json] [--report-only] [--no-events] [--env-dir DIR]" >&2
+    echo "usage: $0 [--json] [--report-only] [--no-events] [--env-dir DIR] [--newest-event SENSOR]" >&2
 }
 
 while [ "$#" -gt 0 ]; do
@@ -69,6 +72,20 @@ while [ "$#" -gt 0 ]; do
         --json) JSON=1 ;;
         --report-only) REPORT_ONLY=1 ;;
         --no-events) NO_EVENTS=1 ;;
+        --newest-event)
+            if [ "$#" -lt 2 ]; then
+                usage
+                exit 64
+            fi
+            case "$2" in
+                '' | *[!a-z0-9_-]*)
+                    echo "error: --newest-event takes a sensor name (a-z, 0-9, _ and -)" >&2
+                    exit 64
+                    ;;
+            esac
+            NEWEST_EVENT="$2"
+            shift
+            ;;
         --env-dir)
             if [ "$#" -lt 2 ]; then
                 usage
@@ -713,16 +730,16 @@ fw_close_fix() {
     esac
 }
 
-# ledger_query_fix SENSOR: the newest event for one sensor, run the way the daemon connects (as the
-# propolis account, with the DATABASE_URL from its root-only env file). The operator's shell has no
-# DATABASE_URL, so it is read with sudo; surrounding quotes are stripped as the daemon's env-file
-# reader does. The URL is an argument of psql, so it is visible in the process list for the length of
-# the query on this host (the script's own ledger query avoids that with PG* variables; a pasted
-# one-liner cannot, short of writing a file).
+# ledger_query_fix SENSOR: the newest event for one sensor, by running this script's own
+# --newest-event mode as root. The operator's shell has no DATABASE_URL (it is in a root-only env
+# file), and passing it to psql would put the password on psql's argv; the mode reads it itself and
+# hands it to psql through PG* variables, like the report's own ledger query.
 ledger_query_fix() {
-    local sensor="$1" envf
-    envf="$(q "$ENV_DIR/propolis.env")"
-    printf '%s' "sudo -u propolis psql \"\$(sudo grep -h '^DATABASE_URL=' $envf | tail -n 1 | cut -d= -f2- | tr -d \"'\\\"\")\" -c \"SELECT max(observed_at) FROM event WHERE sensor = '$sensor'\""
+    local sensor="$1" envarg=""
+    if [ "$ENV_DIR" != /etc/propolis ]; then
+        envarg=" --env-dir $(q "$ENV_DIR")"
+    fi
+    printf 'sudo %s%s --newest-event %s' "$(q "$SCRIPT_DIR/config-check.sh")" "$envarg" "$(q "$sensor")"
 }
 
 # ---- PROPOLIS_SENSOR_LOGS ------------------------------------------------------------------
@@ -870,33 +887,25 @@ pg_urldecode() {
     printf '%b' "${s//%/\\x}"
 }
 
-run_events() {
-    local url rest query db auth hostport user pass host port q kv key val out line
-    if [ "$NO_EVENTS" -eq 1 ]; then
-        EV_REASON="disabled by --no-events"
-        return 0
-    fi
+# ledger_psql SQL: runs one read-only statement against the ledger with psql's unaligned,
+# tuples-only output on stdout. The connection comes from DATABASE_URL in propolis.env and reaches
+# psql only through PG* variables. Returns 10 (env file unreadable), 11 (no DATABASE_URL), 12 (no
+# psql) or 13 (not a postgres:// URL) without running anything; otherwise psql's own status.
+ledger_psql() {
+    local sql="$1" url rest query db auth hostport user pass host port q kv key val
     if [ -e "$ENV_DIR/propolis.env" ] && [ ! -r "$ENV_DIR/propolis.env" ]; then
-        EV_REASON="$ENV_DIR/propolis.env not readable"
-        limit "ledger query skipped: $EV_REASON (run as root)"
-        return 0
+        return 10
     fi
     url="$(read_env_var_in DATABASE_URL "$ENV_DIR/propolis.env")"
     if [ -z "$url" ]; then
-        EV_REASON="no DATABASE_URL in $ENV_DIR/propolis.env"
-        return 0
+        return 11
     fi
     if ! have psql; then
-        EV_REASON="psql not installed"
-        limit "ledger query skipped: psql not installed"
-        return 0
+        return 12
     fi
     case "$url" in
         postgres://* | postgresql://*) rest="${url#*://}" ;;
-        *)
-            EV_REASON="DATABASE_URL is not a postgres:// URL"
-            return 0
-            ;;
+        *) return 13 ;;
     esac
     query=""
     case "$rest" in *\?*) query="${rest#*\?}"; rest="${rest%%\?*}" ;; esac
@@ -925,30 +934,75 @@ run_events() {
             sslmode) sslmode="$val" ;;
         esac
     done
-    out="$TMP_DIR/events.out"
-    if (
+    (
         export PGUSER="$(pg_urldecode "$user")" PGPASSWORD="$(pg_urldecode "$pass")" PGDATABASE="$(pg_urldecode "$db")"
         export PGHOST="$host" PGCONNECT_TIMEOUT=5 PGAPPNAME=propolis-config-check
         export PGOPTIONS='-c statement_timeout=3000 -c default_transaction_read_only=on'
         if [ -n "$port" ]; then export PGPORT="$port"; fi
         if [ -n "$sslmode" ]; then export PGSSLMODE="$sslmode"; fi
         if have timeout; then
-            exec timeout 10 psql -X -A -t -F '|' -c "SELECT sensor, (extract(epoch FROM now() - max(observed_at)))::bigint FROM event WHERE observed_at > now() - interval '7 days' GROUP BY sensor"
+            exec timeout 10 psql -X -A -t -F '|' -c "$sql"
         else
-            exec psql -X -A -t -F '|' -c "SELECT sensor, (extract(epoch FROM now() - max(observed_at)))::bigint FROM event WHERE observed_at > now() - interval '7 days' GROUP BY sensor"
+            exec psql -X -A -t -F '|' -c "$sql"
         fi
-    ) >"$out" 2>/dev/null; then
-        EV_STATE=ok
-        while IFS='|' read -r key val; do
-            case "$val" in '' | *[!0-9]*) continue ;; esac
-            [ -n "$key" ] || continue
-            EV_AGE["$key"]="$val"
-        done <"$out"
-    else
-        EV_REASON="ledger query failed or timed out"
-        limit "ledger query skipped: the database could not be queried read-only within its timeout"
-    fi
+    )
 }
+
+run_events() {
+    local out rc=0 key val
+    if [ "$NO_EVENTS" -eq 1 ]; then
+        EV_REASON="disabled by --no-events"
+        return 0
+    fi
+    out="$TMP_DIR/events.out"
+    ledger_psql "SELECT sensor, (extract(epoch FROM now() - max(observed_at)))::bigint FROM event WHERE observed_at > now() - interval '7 days' GROUP BY sensor" >"$out" 2>/dev/null || rc=$?
+    case "$rc" in
+        0)
+            EV_STATE=ok
+            while IFS='|' read -r key val; do
+                case "$val" in '' | *[!0-9]*) continue ;; esac
+                [ -n "$key" ] || continue
+                EV_AGE["$key"]="$val"
+            done <"$out"
+            ;;
+        10)
+            EV_REASON="$ENV_DIR/propolis.env not readable"
+            limit "ledger query skipped: $EV_REASON (run as root)"
+            ;;
+        11) EV_REASON="no DATABASE_URL in $ENV_DIR/propolis.env" ;;
+        12)
+            EV_REASON="psql not installed"
+            limit "ledger query skipped: psql not installed"
+            ;;
+        13) EV_REASON="DATABASE_URL is not a postgres:// URL" ;;
+        *)
+            EV_REASON="ledger query failed or timed out"
+            limit "ledger query skipped: the database could not be queried read-only within its timeout"
+            ;;
+    esac
+}
+
+# --newest-event SENSOR: prints when the ledger last received an event from SENSOR (any age) and
+# exits. Read-only, through the same connection path as the report; the target of the events
+# findings' fix line.
+newest_event() {
+    local sensor="$1" rc=0 out
+    out="$(ledger_psql "SELECT max(observed_at) FROM event WHERE sensor = '$sensor'")" || rc=$?
+    case "$rc" in
+        0) printf 'sensor %s: newest event %s\n' "$sensor" "${out:-none in the ledger}" ;;
+        10) echo "error: $ENV_DIR/propolis.env is not readable (run as root)" >&2 ;;
+        11) echo "error: no DATABASE_URL in $ENV_DIR/propolis.env" >&2 ;;
+        12) echo "error: psql is not installed" >&2 ;;
+        13) echo "error: DATABASE_URL is not a postgres:// URL" >&2 ;;
+        *) echo "error: the ledger query failed or timed out" >&2 ;;
+    esac
+    return "$rc"
+}
+
+if [ -n "$NEWEST_EVENT" ]; then
+    newest_event "$NEWEST_EVENT" || exit 1
+    exit 0
+fi
 
 # ---- per-listener checks -------------------------------------------------------------------
 

@@ -249,11 +249,11 @@ the finding text above it, never in the step itself:
 - `fix:` is a command line, or several joined with `&&` or `;`, to paste exactly as printed
   from a non-root shell in any directory. Root-only actions carry their own `sudo` (reading
   `/etc/propolis/*.env`, `journalctl`, `systemctl`, `ss -p`, `ufw`, `install`), and nothing in
-  it is a placeholder or prose. The ledger query for an `EVENTS` finding reads `DATABASE_URL`
-  out of `propolis.env` with `sudo` and runs `psql` as the `propolis` account, because that
-  variable is not set in an operator's shell. The URL is then an argument of that `psql`, so it
-  is visible in the process list for the length of the query (the report's own query avoids
-  this by using `PG*` variables, which a pasted line cannot).
+  it is a placeholder or prose. The ledger query for an `EVENTS` finding is the script itself,
+  `sudo .../config-check.sh --newest-event SENSOR`, which prints when the ledger last saw that
+  sensor (any age) and exits. It reads `DATABASE_URL` from `propolis.env` as root and hands it to
+  `psql` through `PG*` variables, so the URL and password are never on a command line; no `fix:`
+  line contains `DATABASE_URL`, `psql` or a connection string.
 - `do:` is a manual step, not a command: edit a file, change a bind address, install a firewall
   or a key. It names the file and the value, and any restart that follows is written in the same
   line as `then run: ...`. Do not paste a `do:` line.

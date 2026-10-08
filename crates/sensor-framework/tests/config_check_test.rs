@@ -1983,7 +1983,7 @@ printf '%s\n' "$line" >> "$FIXLOG"
 while [ $# -gt 0 ]; do case "$1" in -u) shift 2 ;; -*) shift ;; *) break ;; esac; done
 cmd="$1"; shift
 if [ -x "$FIXSTUBS/$cmd" ]; then UNDER_SUDO=1 exec "$FIXSTUBS/$cmd" "$@"; fi
-case "$cmd" in /*) if [ -x "$cmd" ]; then printf 'root-script sudo=1 [%s]\n' "$cmd" >> "$FIXLOG"; exit 0; fi ;; esac
+case "$cmd" in /*) if [ -x "$cmd" ]; then line="root-script sudo=1 [$cmd]"; for a in "$@"; do line="$line [$a]"; done; printf '%s\n' "$line" >> "$FIXLOG"; exit 0; fi ;; esac
 echo "sudo: $cmd: command not found" >&2
 exit 127
 "#,
@@ -2033,6 +2033,20 @@ fn assert_fix_contract(fx: &Fx, what: &str, id: &str, kind: &str, fix: &str) {
         kind == "run" || kind == "manual",
         "{what}: fix_kind must be run or manual, got {kind:?}"
     );
+    // A secret must never ride on a command line, and a pasted line must not reach for the
+    // database directly: the script's own --newest-event mode does that through PG* variables.
+    for forbidden in [
+        "DATABASE_URL",
+        "psql",
+        "postgres://",
+        "postgresql://",
+        "PGPASSWORD",
+    ] {
+        assert!(
+            !fix.contains(forbidden),
+            "{what}: a fix line must not contain {forbidden}: {fix}"
+        );
+    }
     if kind == "manual" {
         return;
     }
@@ -2068,24 +2082,15 @@ fn assert_fix_contract(fx: &Fx, what: &str, id: &str, kind: &str, fix: &str) {
         );
     }
     if id == "events-none" {
-        let psql = recorded
+        let script = recorded
             .iter()
-            .find(|l| l.starts_with("psql "))
-            .unwrap_or_else(|| panic!("{what}: the ledger query never reached psql: {fix}"));
-        let sensor = fix
-            .split("sensor = '")
-            .nth(1)
-            .and_then(|r| r.split('\'').next())
-            .unwrap_or_else(|| panic!("{what}: no sensor in the query: {fix}"));
+            .find(|l| l.starts_with("root-script "))
+            .unwrap_or_else(|| {
+                panic!("{what}: the ledger query is not a root run of the script: {fix}")
+            });
         assert!(
-            psql.contains(&format!(
-                "[postgres://propolis:s3cret%21pw@db.example.invalid:5433/propolis?sslmode=require] [-c] [SELECT max(observed_at) FROM event WHERE sensor = '{sensor}']"
-            )),
-            "{what}: psql must get the URL from the env file, then the query: {psql}"
-        );
-        assert!(
-            psql.contains("sudo=1"),
-            "{what}: the query runs as the propolis account: {psql}"
+            script.contains("config-check.sh] ") && script.contains("[--newest-event] ["),
+            "{what}: {script}"
         );
     }
 }
@@ -2423,41 +2428,61 @@ fn every_finding_has_a_fix_that_is_a_command_run_as_pasted_or_a_labelled_manual_
 }
 
 #[test]
-fn the_ledger_query_fix_reads_the_url_with_sudo_and_survives_quotes_and_shell_characters() {
-    // A quoted value and a URL carrying '&', '?', '%' and a space-encoded option: the line must
-    // hand psql the URL as ONE argument, unquoted by the env-file rules.
+fn the_newest_event_mode_reaches_the_ledger_through_the_environment_never_an_argument() {
+    // The fix line for a silent sensor runs this mode. The password-bearing URL must reach psql
+    // only as PG* variables, whether the env file quotes the value or not.
     let url = "postgres://u:p%40ss@db.example.invalid:5432/propolis?sslmode=require&options=-c%20x";
     for quoted in [format!("\"{url}\""), format!("'{url}'"), url.to_string()] {
         let fx = Fx::new();
-        fx.install_fix_stubs();
         fx.set_env_line(
             "etc/propolis.env",
             "DATABASE_URL=",
             Some(&format!("DATABASE_URL={quoted}")),
         );
-        fx.write(
-            "state/psql_out",
-            "ssh|60\nmqtt|90\ntftp|100\ndns|30\ncred-pg|5\n",
-        );
-        let v = fx.json();
-        let f = v["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["id"] == "events-none")
-            .unwrap();
-        let fix = f["fix"].as_str().unwrap();
-        assert_eq!(f["fix_kind"], "run");
-        let (code, err, recorded) = fx.run_fix(fix);
-        assert_eq!((code, err.as_str()), (0, ""), "{fix}");
-        let psql = recorded.iter().find(|l| l.starts_with("psql ")).unwrap();
+        fx.write("state/psql_out", "2027-01-01 00:00:00+00\n");
+        let r = fx.run(&["--newest-event", "postgresql"]);
+        assert_eq!(r.code, 0, "{quoted}: {}{}", r.out, r.err);
         assert!(
-            psql.contains(&format!(
-                "[{url}] [-c] [SELECT max(observed_at) FROM event WHERE sensor = 'postgresql']"
-            )),
-            "{quoted}: {psql}"
+            r.has("sensor postgresql: newest event 2027-01-01 00:00:00+00"),
+            "{}",
+            r.out
         );
+        let log = fx.read("state/psql.log");
+        let argv = log.lines().find(|l| l.starts_with("ARGV:")).unwrap();
+        assert!(
+            argv.contains("SELECT max(observed_at) FROM event WHERE sensor = 'postgresql'"),
+            "{argv}"
+        );
+        for secret in ["p%40ss", "p@ss", "postgres://", "db.example.invalid"] {
+            assert!(
+                !argv.contains(secret),
+                "{secret} reached psql's argv: {argv}"
+            );
+        }
+        assert!(log.lines().any(|l| l == "PGPASSWORD=p@ss"), "{log}");
+        assert!(
+            log.lines().any(|l| l == "PGHOST=db.example.invalid"),
+            "{log}"
+        );
+        assert!(
+            log.lines()
+                .any(|l| l.starts_with("PGOPTIONS=")
+                    && l.contains("default_transaction_read_only=on")),
+            "{log}"
+        );
+        assert!(!r.out.contains("p%40ss") && !r.err.contains("p%40ss"));
     }
+    // A name that is not a plain sensor name is refused before any query (it is interpolated).
+    let fx = Fx::new();
+    let r = fx.run(&["--newest-event", "x'; DROP TABLE event; --"]);
+    assert_eq!(r.code, 64, "{}", r.err);
+    assert!(!fx.p("state/psql.log").exists());
+    // Without a readable URL it fails loudly instead of printing an empty answer.
+    let fx = Fx::new();
+    fx.set_env_line("etc/propolis.env", "DATABASE_URL=", None);
+    let r = fx.run(&["--newest-event", "ssh"]);
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("no DATABASE_URL"), "{}", r.err);
 }
 
 #[test]

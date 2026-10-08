@@ -9,8 +9,9 @@
   and the no-events finding's line ran `psql "$DATABASE_URL" ...` (unset in an operator's shell)
   followed by prose, which bash parsed as an `if` and answered with a continuation prompt. A
   `fix:` is now only a command, or commands joined with `&&` or `;`, with `sudo` wherever root is
-  needed and absolute paths for the repository's scripts; the ledger query reads `DATABASE_URL`
-  with `sudo` and runs `psql` as `propolis`. Instructions that are not commands (edit a file,
+  needed and absolute paths for the repository's scripts; the ledger query is the script's
+  new `--newest-event SENSOR` mode run with `sudo`, which reaches the database through `PG*`
+  variables so no connection string or password is ever on a command line. Instructions that are not commands (edit a file,
   change a bind address, install a firewall rule or a key) print as `do:`, and the explanation
   moved into the finding text. `--json` keeps its shape and gains `fix_kind` (`run`, `manual`)
   and `id` on each finding. `config_check_test` raises every finding id (a new finding with no

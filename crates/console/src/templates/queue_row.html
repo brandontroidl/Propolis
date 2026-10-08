@@ -1,26 +1,30 @@
 {% import "macros.html" as m %}
-<tr id="row-{{ row.ip }}"{% if row.context %} class="has-context"{% endif %}>
+<tr id="row-{{ row.ip }}" class="qrow{% if row.context %} has-context{% endif %}">
   <td class="ip">{{ m.ip_evidence_link(row.ip) }}</td>
-  <td class="score"><span class="meter"><span class="meter-fill{% if row.score_pct >= 90 %} meter-fill--crit{% elif row.score_pct >= 75 %} meter-fill--high{% elif row.score_pct >= 50 %} meter-fill--warn{% endif %} pct-{{ row.score_pct }}"></span></span>{{ row.score }}</td>
-  <td>
+  <td class="score {{ m.score_class(row.tier) }}">{{ row.score }}</td>
+  <td class="tier-cell">
     {% if row.tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>
     {% elif row.tier == "standard" %}<span class="tier tier-standard">Standard</span>
     {% else %}<span class="tier tier-none">-</span>{% endif %}
   </td>
-  <td>{{ row.categories }}</td>
   <td class="count">{{ row.event_count }}</td>
-  <td class="seen">{{ row.first_seen }}</td>
-  <td class="seen">{{ row.last_seen }}</td>
-  <td>
+  <td class="active-cell"{% if row.active_title %} title="{{ row.active_title }}"{% endif %}>{{ row.active }}</td>
+  <td class="actions-cell">
     {% if row.is_pending %}
     <div class="actions">
-      <textarea name="notes" placeholder="Notes (optional)">{{ row.notes }}</textarea>
       <input type="hidden" name="csrf_token" value="{{ row.csrf_token }}">
       <div class="buttons">
         <button type="button" class="btn-approve" hx-post="/queue/{{ row.ip }}/approve" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Approve</button>
         <button type="button" class="btn-reject" hx-post="/queue/{{ row.ip }}/reject" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Reject</button>
         <button type="button" class="btn-snooze" hx-post="/queue/{{ row.ip }}/snooze" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Snooze</button>
       </div>
+      {#- The note rides inside this row, so `hx-include="closest tr"` posts it with the decision
+          whether or not the toggle is open (a closed <details> still has its textarea in the
+          form data). Open by default only when the entry already carries a note. -#}
+      <details class="qnote"{% if row.notes %} open{% endif %}>
+        <summary>note</summary>
+        <textarea name="notes" placeholder="Notes (optional)" aria-label="Note for {{ row.ip }}">{{ row.notes }}</textarea>
+      </details>
     </div>
     {% else %}
     <span class="state-pill state-{{ row.state }}">{{ row.state }}</span>
@@ -29,16 +33,16 @@
   </td>
 </tr>
 {#- The context line rides in its own row so it can span the table. A decision swaps out only the
-    row above (`hx-target="closest tr"`), so the line stays with the entry it describes. -#}
+    row above (`hx-target="closest tr"`), so the line stays with the entry it describes. Order is
+    what the address did first, then the campaign, then the dim facts (where, how many sessions)
+    and the signal chips. -#}
 {% if row.context %}{% set c = row.context %}
 <tr class="queue-context" id="context-{{ row.ip }}">
-  <td colspan="8">
-    <span class="ctx-sensors">{% for s in c.sensors %}<span class="ctx-chip">{{ s }}</span>{% endfor %}</span>
-    {% if c.sessions > 0 %}<span class="ctx-item">{{ c.sessions }} session{% if c.sessions != 1 %}s{% endif %}</span>{% endif %}
-    {% if c.signals %}<span class="sev-tags ctx-item">{% for s in c.signals %}<span class="sev sev--{{ s.sev }}">{{ s.label }} {{ s.count }}</span>{% endfor %}</span>{% endif %}
-    {% if c.notable %}<span class="ctx-item ctx-notable"><span class="dim">{% if c.notable.kind == "upload" %}uploaded{% elif c.notable.kind == "fetch" %}fetched{% else %}first command{% endif %}</span> <code class="mono">{{ c.notable.text }}</code></span>{% endif %}
-    {% if c.sampled %}<span class="ctx-item faint">counts from {{ c.sampled }} events</span>{% endif %}
-    {% if c.campaign %}<span class="ctx-item ctx-campaign">part of <a href="/campaigns/{{ c.campaign.id }}">campaign {{ c.campaign.id }}</a>, {{ c.campaign.members }} host{% if c.campaign.members != 1 %}s{% endif %}{% if c.campaign.role == "infected host" %} <span class="dim">(infected hosts)</span>{% endif %}{% if c.campaign.pending > 1 %} <a href="/campaigns/{{ c.campaign.id }}/approve">approve all {{ c.campaign.pending }} pending&hellip;</a>{% endif %}</span>{% endif %}
+  <td colspan="6">
+    {% if c.notable %}<span class="ctx-what"><span class="ctx-verb">{% if c.notable.kind == "upload" %}uploaded{% elif c.notable.kind == "fetch" %}fetched{% else %}ran{% endif %}</span> <code class="mono ctx-code" title="{{ c.notable.full }}">{{ c.notable.text }}</code></span>{% endif %}
+    {% if c.campaign and c.campaign.members > 1 %}<span class="ctx-campaign">part of <a href="/campaigns/{{ c.campaign.id }}">campaign {{ c.campaign.id }}</a>, {{ c.campaign.members }} host{% if c.campaign.members != 1 %}s{% endif %}{% if c.campaign.role == "infected host" %} <span class="dim">(infected hosts)</span>{% endif %}{% if c.campaign.pending > 1 %} <a href="/campaigns/{{ c.campaign.id }}/approve">approve all {{ c.campaign.pending }} pending&hellip;</a>{% endif %}</span>{% endif %}
+    <span class="ctx-dim">{% for s in c.sensors %}<span class="ctx-chip">{{ s }}</span>{% endfor %}{% if c.sessions > 0 %}<span>{{ c.sessions }} session{% if c.sessions != 1 %}s{% endif %}</span>{% endif %}</span>
+    {% if c.signals %}<span class="sev-tags"{% if c.sampled %} title="counts from {{ c.sampled }} events"{% endif %}>{% for s in c.signals %}<span class="sev sev--{{ s.sev }}">{{ s.label }} {{ s.count }}</span>{% endfor %}</span>{% endif %}
   </td>
 </tr>
 {% endif %}

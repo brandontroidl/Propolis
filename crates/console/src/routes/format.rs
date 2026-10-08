@@ -186,6 +186,57 @@ pub(crate) fn severity_rank(severity: &str) -> u8 {
     }
 }
 
+/// The review queue's single "Active" cell: how long an address has been active, as text, plus
+/// the exact first and last timestamps for a `title` attribute.
+///
+/// Within one UTC day the span reads as a clock range (`10:58-18:11 UTC`, prefixed with the date
+/// unless it is `now`'s date, so an old row is not mistaken for today's). Across midnight a clock
+/// range would not say how long, so it reads as a length plus recency (`2d, last 3 min ago`).
+/// `now` is a parameter so the boundaries can be tested.
+pub(crate) fn format_active(
+    first: DateTime<Utc>,
+    last: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> (String, String) {
+    let title = format!(
+        "first {}, last {}",
+        format_timestamp(first),
+        format_timestamp(last)
+    );
+    if first.date_naive() == last.date_naive() {
+        let clock = if first.format("%H:%M").to_string() == last.format("%H:%M").to_string() {
+            format!("{} UTC", first.format("%H:%M"))
+        } else {
+            format!("{}-{} UTC", first.format("%H:%M"), last.format("%H:%M"))
+        };
+        let text = if first.date_naive() == now.date_naive() {
+            clock
+        } else {
+            format!("{}, {clock}", first.format("%b %-d"))
+        };
+        return (text, title);
+    }
+    let span = last - first;
+    let length = if span.num_hours() < 1 {
+        format!("{}m", span.num_minutes().max(1))
+    } else if span.num_hours() < 24 {
+        format!("{}h", span.num_hours())
+    } else {
+        format!("{}d", span.num_days())
+    };
+    let ago = (now - last).max(chrono::Duration::zero());
+    let ago = if ago.num_seconds() < 60 {
+        "just now".to_string()
+    } else if ago.num_minutes() < 60 {
+        format!("{} min ago", ago.num_minutes())
+    } else if ago.num_hours() < 24 {
+        format!("{} h ago", ago.num_hours())
+    } else {
+        format!("{} d ago", ago.num_days())
+    };
+    (format!("{length}, last {ago}"), title)
+}
+
 /// Coarsens a UTC timestamp to "how long ago", in the largest whole unit that fits - used by the
 /// dashboard's recent-activity table, where an exact `format_timestamp` value is more precision
 /// than an operator scanning twenty rows needs.
@@ -241,6 +292,83 @@ mod tests {
         assert_eq!(group_digits(29296), "29,296");
         assert_eq!(group_digits(1234567), "1,234,567");
         assert_eq!(group_digits(-1234), "-1,234");
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn active_same_day_today_is_a_bare_clock_range() {
+        let now = at("2026-10-08T20:00:00Z");
+        let (text, title) =
+            format_active(at("2026-10-08T10:58:40Z"), at("2026-10-08T18:11:05Z"), now);
+        assert_eq!(text, "10:58-18:11 UTC");
+        assert_eq!(
+            title,
+            "first 2026-10-08 10:58 UTC, last 2026-10-08 18:11 UTC"
+        );
+    }
+
+    #[test]
+    fn active_within_one_minute_collapses_to_a_single_time() {
+        let now = at("2026-10-08T20:00:00Z");
+        let (text, _) = format_active(at("2026-10-08T10:58:01Z"), at("2026-10-08T10:58:59Z"), now);
+        assert_eq!(text, "10:58 UTC");
+    }
+
+    #[test]
+    fn active_same_day_on_an_earlier_date_carries_the_date() {
+        let now = at("2026-10-08T01:00:00Z");
+        let (text, _) = format_active(at("2026-10-05T10:58:00Z"), at("2026-10-05T18:11:00Z"), now);
+        assert_eq!(text, "Oct 5, 10:58-18:11 UTC");
+    }
+
+    #[test]
+    fn active_across_midnight_under_an_hour_is_minutes_not_zero_days() {
+        let now = at("2026-10-08T00:13:30Z");
+        let (text, _) = format_active(at("2026-10-07T23:50:00Z"), at("2026-10-08T00:10:00Z"), now);
+        assert_eq!(text, "20m, last 3 min ago");
+    }
+
+    #[test]
+    fn active_length_unit_changes_at_one_hour_and_one_day() {
+        // Every span below starts on the previous UTC day, so none is read as a clock range.
+        let now = at("2026-10-09T01:30:00Z");
+        let last = at("2026-10-09T00:30:00Z");
+        assert_eq!(
+            format_active(last - Duration::minutes(59), last, now).0,
+            "59m, last 1 h ago"
+        );
+        assert_eq!(
+            format_active(last - Duration::minutes(60), last, now).0,
+            "1h, last 1 h ago"
+        );
+        assert_eq!(
+            format_active(last - Duration::minutes(24 * 60 - 1), last, now).0,
+            "23h, last 1 h ago"
+        );
+        assert_eq!(
+            format_active(last - Duration::hours(24), last, now).0,
+            "1d, last 1 h ago"
+        );
+        assert_eq!(
+            format_active(last - Duration::hours(50), last, now).0,
+            "2d, last 1 h ago"
+        );
+    }
+
+    #[test]
+    fn active_recency_buckets() {
+        let first = at("2026-10-01T00:00:00Z");
+        let last = at("2026-10-05T12:00:00Z");
+        let ago = |d: Duration| format_active(first, last, last + d).0;
+        assert_eq!(ago(Duration::seconds(59)), "4d, last just now");
+        assert_eq!(ago(Duration::seconds(60)), "4d, last 1 min ago");
+        assert_eq!(ago(Duration::minutes(59)), "4d, last 59 min ago");
+        assert_eq!(ago(Duration::minutes(60)), "4d, last 1 h ago");
+        assert_eq!(ago(Duration::hours(24)), "4d, last 1 d ago");
+        assert_eq!(ago(Duration::seconds(-30)), "4d, last just now");
     }
 
     #[test]

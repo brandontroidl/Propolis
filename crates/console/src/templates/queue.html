@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Review queue - Propolis{% endblock %}
 {% block content %}
+{% import "macros.html" as m %}
 <h1>Review queue <span class="dim">({{ pending_count }} pending)</span></h1>
 <div class="tab-bar">
   {% for tab_name in ["pending", "approved", "rejected", "snoozed"] %}
@@ -12,39 +13,76 @@
 pending queue on its own. Decide one below, or return it to pending to deal with it alongside the
 rest.</p>
 {% endif %}
-{% if rows %}
-<div class="panel">
+{% if tab == "pending" and items %}
+{#- Sorting lives here rather than in the column headers: Active covers two keys, and the headers
+    are hidden on a narrow screen. -#}
+<nav class="sortbar" aria-label="Sort the pending entries">
+  <span class="dim">Sort by</span>
+  {% for key, name in [["score", "score"], ["event_count", "events"], ["first_seen", "first seen"], ["last_seen", "last seen"]] %}
+  <a href="/queue?sort={{ key }}" class="{% if sort == key %}active{% endif %}">{{ name }}</a>
+  {% endfor %}
+</nav>
+<div class="panel queue-panel queue-panel--pending">
+<table class="table-compact">
+  {{ m.queue_cols() }}
+  <thead>
+    <tr>
+      <th>IP</th>
+      <th>Score</th>
+      <th>Tier</th>
+      <th class="count">Events</th>
+      <th>Active</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in items %}
+    {% if item.group %}{% set g = item.group %}
+    <tr class="queue-group" id="group-{{ g.id }}">
+      <td colspan="6">
+        <details class="qgroup">
+          <summary>
+            <span class="qg-title">
+              <span class="qg-label campaign-label">{{ g.label }}</span>
+              <span class="qg-meta"><a href="/campaigns/{{ g.id }}">campaign {{ g.id }}</a> ({{ g.kind }}) &middot; {{ g.shown }} pending here{% if g.pending != g.shown %}, {{ g.pending }} campaign-wide{% endif %} &middot; {{ g.members }} host{% if g.members != 1 %}s{% endif %}{% if g.infected %} <span class="dim">(infected hosts)</span>{% endif %}</span>
+            </span>
+            {% if g.what %}<span class="ctx-what qg-what"><span class="ctx-verb">{% if g.what.kind == "upload" %}uploaded{% elif g.what.kind == "fetch" %}fetched{% else %}ran{% endif %}</span> <code class="mono ctx-code" title="{{ g.what.full }}">{{ g.what.text }}</code></span>{% endif %}
+            <span class="qg-side">
+              <span class="qg-top"><span class="dim">top</span> <span class="score {{ m.score_class(g.top_tier) }}">{{ g.top_score }}</span></span>
+              <a class="qg-approve" href="/campaigns/{{ g.id }}/approve">Approve all {{ g.pending }}&hellip;</a>
+            </span>
+          </summary>
+          <table class="table-compact qmembers">
+            {{ m.queue_cols() }}
+            <tbody>
+              {% for row in g.rows %}{% include "queue_row.html" %}{% endfor %}
+            </tbody>
+          </table>
+        </details>
+      </td>
+    </tr>
+    {% else %}{% set row = item.row %}{% include "queue_row.html" %}{% endif %}
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% elif tab != "pending" and rows %}
+<div class="panel queue-panel">
 <table class="table-compact">
   <thead>
     <tr>
       <th>IP</th>
-      {% if tab == "pending" %}
-      <th><a href="/queue?sort=score" class="{% if sort == "score" %}active{% endif %}">Score</a></th>
-      {% else %}
       <th>Score</th>
-      {% endif %}
       <th>Tier</th>
-      <th>Categories</th>
-      {% if tab == "pending" %}
-      <th class="count"><a href="/queue?sort=event_count" class="{% if sort == "event_count" %}active{% endif %}">Events</a></th>
-      <th><a href="/queue?sort=first_seen" class="{% if sort == "first_seen" %}active{% endif %}">First seen</a></th>
-      <th><a href="/queue?sort=last_seen" class="{% if sort == "last_seen" %}active{% endif %}">Last seen</a></th>
-      <th>Actions</th>
-      {% else %}
       <th class="count">Events</th>
       <th>Decided</th>
       {% if tab == "approved" %}<th>Submissions</th>{% endif %}
       <th>Notes</th>
       {% if tab == "snoozed" %}<th>Actions</th>{% endif %}
-      {% endif %}
     </tr>
   </thead>
   <tbody>
-    {% if tab == "pending" %}
-      {% for row in rows %}{% include "queue_row.html" %}{% endfor %}
-    {% else %}
-      {% for row in rows %}{% include "queue_history_row.html" %}{% endfor %}
-    {% endif %}
+    {% for row in rows %}{% include "queue_history_row.html" %}{% endfor %}
   </tbody>
 </table>
 </div>

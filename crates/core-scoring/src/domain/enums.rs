@@ -112,7 +112,8 @@ impl SignalType {
     /// and deriving scoring behaviour from it would silently reclassify a signal the day someone
     /// tuned it to zero. Everything that keeps telemetry out of scoring keys on this list -
     /// `repository::append_event` refuses it outright, `append_telemetry_event` is the only way
-    /// in, and both the incremental aggregates and `rebuild_projection` exclude these rows.
+    /// in and never writes the breadth sets, and both the sets' backfill (migration 0014) and
+    /// `rebuild_projection` exclude these rows.
     pub const TELEMETRY: [SignalType; 1] = [SignalType::HoneypotSessionEnd];
 
     pub fn is_telemetry(self) -> bool {

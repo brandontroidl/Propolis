@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Capacity planning
@@ -118,7 +118,9 @@ failure](../architecture/concurrency-and-failure.md).
 ## Database growth
 
 The `event` table grows with every captured event and never self-truncates; `ip_score` holds
-one row per source IP. Scoring uses time-decay on read, so old events keep contributing to
+one row per source IP, and `ip_vantage` and `ip_sensor` one row per source and WAN address or
+sensor it was seen on (on a 7.5M-row, 3.9 GB test ledger with 300k sources, 47 MB and 93 MB).
+Scoring uses time-decay on read, so old events keep contributing to
 storage even after their scoring weight has decayed away. Growth is driven by attack volume and
 sensor exposure, not by a fixed schedule. There is **no built-in event-table pruning**; plan
 database storage for sustained ingest and prune with your own retention job if needed. Sample

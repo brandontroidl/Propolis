@@ -81,10 +81,12 @@ capturing. So the sensor handler does no more than build a `CaptureJob` and `sub
 All appends to the event ledger serialize against **one transaction-scoped Postgres
 advisory lock** (`pg_advisory_xact_lock`, `crates/core-scoring/src/repository/events.rs`).
 The transaction pins `READ COMMITTED`, acquires the lock, then does the chain-head read,
-event INSERT, projection read, and `ip_score` UPSERT as one critical section. Under any
+event INSERT, projection read, the upserts and reads of the source's WAN and sensor sets
+(`ip_vantage`, `ip_sensor`), and the `ip_score` UPSERT as one critical section. Under any
 number of concurrent callers this guarantees the hash chain cannot fork, the projection
-UPSERT cannot lose an update, and the dedup-window read cannot be bypassed by an
-interleaved insert. The lock auto-releases at transaction end, so a rolled-back append
+UPSERT cannot lose an update, the breadth sets hold every scored event committed before the
+append that reads them, and the dedup-window read cannot be bypassed by an interleaved
+insert. The lock auto-releases at transaction end, so a rolled-back append
 never leaves it held. See [storage](./storage.md).
 
 Concurrent NDJSON log appends (multiple connections through one `EventEmitter` behind an
@@ -135,7 +137,9 @@ missing or malformed input.
   reads again at once while lines remain; it sleeps for the poll interval only when a batch
   comes back empty (`crates/propolis/src/main.rs#run_intake_sensor`). Its rate is set by the
   serialized append lock: one append at a time across every sensor, so a slow append for one
-  source holds up all of them. Intake does not shed load; when a sensor writes faster than
+  source holds up all of them. No read inside the lock grows with a source's history or with
+  intake lag, so an append costs a few milliseconds whichever source it is for
+  ([storage](./storage.md#serialized-single-writer-append)). Intake does not shed load; when a sensor writes faster than
   intake appends, the backlog stays in the log, and the `intake-lagging` alert and the fleet
   pane's behind badge report it ([intake backlog](../troubleshooting/intake-backlog.md)).
 - The **console** binds loopback-only by default and derives metrics from live DB

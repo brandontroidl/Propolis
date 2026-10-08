@@ -27,8 +27,8 @@ it - and links there for the values.
 Schema is split across three migration sets, each listed migration by migration in
 [reference/database.md](../reference/database.md#migration-change-map):
 
-- **`core-scoring`** owns `event`, `ip_score`, `sample_analysis`, and all five enum
-  types.
+- **`core-scoring`** owns `event`, `ip_score`, `ip_vantage`, `ip_sensor`,
+  `sample_analysis`, and all five enum types.
 - **`review`** owns `review_queue`, `vendor_submission`, `fetch_attempt`, and
   `fetch_daily_usage`. It depends on the `review_state_enum` created by
   core-scoring's first migration - a deliberate cross-crate schema dependency so the
@@ -111,8 +111,12 @@ intake rate for the whole node. The chain-head read is a single backward step on
 key, and the dedup read (the newest prior event of the same source and signal) a single step on
 `event_dedup_idx`, which migration `0013` added after a lagging intake made the read cost grow
 with the lag ([database reference](../reference/database.md)). The breadth inputs, distinct WAN
-vantages and distinct sensors, still read the source's whole history on every append
-([limitations](../overview/limitations.md#intake-append-cost-grows-with-a-sources-history)).
+vantages and distinct sensors, are counted from the source's rows in `ip_vantage` and
+`ip_sensor`, which the same critical section updates; migration `0014` replaced a read of the
+source's whole history on every append with them ([breadth sets](../reference/database.md#breadth-sets)).
+No read inside the lock grows with a source's history or with the ledger's size beyond an index
+descent. What remains per event is the round trips and the commit
+([limitations](../overview/limitations.md#intake-appends-one-event-per-transaction)).
 
 All event inserts are fully parameterized (`$n` bound values via the runtime
 `sqlx::query*` API); no SQL query text is built with string formatting anywhere in
@@ -128,6 +132,12 @@ counts, distinct WAN/sensor counts, first/last seen) and the derived feed flags
 `delisted`). Because it is a projection, it can be **rebuilt from the ledger** - which
 is exactly why the console's `delete_ip` action purges the `ip_score` and review rows
 but deliberately never touches the `event` ledger.
+
+`ip_vantage` and `ip_sensor` are projections of the same kind: the WAN addresses and sensors
+each source has been seen on, which `distinct_wan_count` and `distinct_sensor_count` are
+counted from. They follow the ledger, not `ip_score`, so `delete_ip` leaves them in place.
+`rebuild_projection` recounts both inputs from the ledger rows instead of reading these
+tables, so a replay checks them ([breadth sets](../reference/database.md#breadth-sets)).
 
 Two projection columns are worth calling out for their integrity intent (values and
 formulas owned by [reference/scoring-and-feed.md](../reference/scoring-and-feed.md)):

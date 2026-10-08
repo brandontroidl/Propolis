@@ -97,6 +97,10 @@ impl Registry {
         super::netcat::register(&mut registry);
         super::sysres::register(&mut registry);
         super::fileinfo::register(&mut registry);
+        super::admin::register(&mut registry);
+        super::pkg::register(&mut registry);
+        super::hw::register(&mut registry);
+        super::netclient::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }
@@ -277,7 +281,6 @@ fn register_core(r: &mut Registry) {
     r.register_builtin("false", HandlerId::False, FakeShell::builtin_false);
     r.register("wget", HandlerId::Wget, FakeShell::builtin_wget);
     r.register("curl", HandlerId::Curl, FakeShell::builtin_curl);
-    r.register("ping", HandlerId::Ping, FakeShell::builtin_ping);
     // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
     // for sh/bash instantly outs the honeypot and the dropper leaves. Model a nested shell.
     // sh and bash are always present. `ash` is BusyBox's shell, a file on neither persona

@@ -364,6 +364,45 @@ impl FakeShell {
             .find(|p| p.ppid == 1 && p.comm == comm)
             .map(|p| p.pid)
     }
+
+    /// What `systemctl status` reads of a service's main process: the first child of init (or,
+    /// for `user@0.service`, the session's user manager) under the kernel name `comm` and, when
+    /// given, on the terminal `tty` (the two gettys share a name).
+    pub(super) fn service_process(&self, comm: &str, tty: Option<&str>) -> Option<ServiceProc> {
+        let table = self.process_table();
+        table
+            .procs
+            .iter()
+            .find(|p| p.ppid == 1 && p.pid != 1 && p.comm == comm && tty.is_none_or(|t| p.tty == t))
+            .map(|p| ServiceProc {
+                pid: p.pid,
+                started: table.started_at(p),
+                argv: p.argv.clone(),
+                comm: p.comm.clone(),
+                rss_kib: p.rss_kib,
+                cpu_secs: p.cpu_secs,
+            })
+    }
+
+    /// When the box booted, on the shell clock: what every boot-started unit's `since` reads.
+    pub(super) fn boot_time(&self) -> DateTime<Utc> {
+        self.process_table().boot
+    }
+
+    /// When this session logged in, on the shell clock.
+    pub(super) fn session_time(&self) -> DateTime<Utc> {
+        self.process_table().session
+    }
+}
+
+/// A service's main process, as `systemctl status` shows it.
+pub(super) struct ServiceProc {
+    pub(super) pid: u32,
+    pub(super) started: DateTime<Utc>,
+    pub(super) argv: Vec<String>,
+    pub(super) comm: String,
+    pub(super) rss_kib: u64,
+    pub(super) cpu_secs: u64,
 }
 
 fn root_proc(

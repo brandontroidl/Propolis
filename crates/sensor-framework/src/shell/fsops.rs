@@ -286,7 +286,7 @@ impl FakeShell {
         }
     }
 
-    fn traced_symlink(&mut self, path: &str, target: &str) -> Result<(), FsError> {
+    pub(super) fn traced_symlink(&mut self, path: &str, target: &str) -> Result<(), FsError> {
         let result = self.fs.create_symlink(path, target);
         match &result {
             Ok(()) => self.trace_fs(FsEffect::Created {

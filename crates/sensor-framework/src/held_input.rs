@@ -945,7 +945,8 @@ mod tests {
         upload_chunks(&mut shell, ".i", DOWNLOADER);
         shell.handle_input("cp /bin/ls .i");
         let (out, line_events) = shell.handle_input("chmod +x .i; ./.i 203 0 113 9 80");
-        assert_eq!(out.status, 0);
+        // The copy is `ls`, and runs as `ls` does: none of the operands exists.
+        assert_eq!(out.status, 2);
         assert_eq!(line_events.len(), 1, "no derived URL: {line_events:?}");
         drop(shell);
         drop(captures);

@@ -1297,7 +1297,7 @@ fn the_generated_nodes_do_not_leak_into_the_persona_snapshot() {
     assert_eq!(FakeFs::android().list_dir("/proc"), Some(Vec::new()));
     assert_eq!(
         FakeFs::new().list_dir("/usr/sbin"),
-        Some(vec!["ip".to_string()])
+        Some(vec!["ip".to_string(), "sshd".to_string()])
     );
     // A session's own removals and writes still win over the generated nodes.
     let mut sh = shell();

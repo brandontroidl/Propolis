@@ -431,6 +431,16 @@ impl FakeShell {
             .collect()
     }
 
+    /// The first non-loopback interface's name, MAC and address, as `ip link` shows them: what
+    /// `lshw -C network` describes, so the two cannot disagree.
+    pub(super) fn primary_interface(&self) -> Option<(&'static str, String, String)> {
+        self.net_model()
+            .ifaces
+            .iter()
+            .find(|iface| !iface.loopback)
+            .map(|iface| (iface.name, mac_text(iface.mac), v4_text(iface.addr)))
+    }
+
     /// The pid and name a listener shows: the modeled process of that name, or none if the table
     /// holds no such process.
     fn listener_owner(&self, listener: &Listener) -> Option<(u32, &'static str)> {

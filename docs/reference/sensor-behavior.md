@@ -160,7 +160,10 @@ opens it: an applet of `busybox` reads busybox, a direct `cat` reads cat, a redi
 shell opens (`cat < /proc/self/exe`) and `/proc/$$/exe` read bash (dash in a shell opened
 with `sh`). The phone's binaries stay stubs and it has no `/proc/self/exe`. A copy of the
 busybox image runs as a renamed busybox does: `.bb: applet not found` (127), or the
-multi-call binary when the copy's name begins `busybox`.
+multi-call binary when the copy's name begins `busybox`. A copy of any other modeled binary
+runs as that binary (`cp /bin/dash /tmp/x; /tmp/x -c CMD` is `sh -c CMD`), and a file the
+session wrote runs as itself whatever its name: `/tmp/w` is the attacker's file, never `w`
+(`crates/sensor-framework/src/shell/mod.rs#FakeShell::run_saved_executable`).
 
 `FakeFs::android()` is the same machinery over the phone's filesystem: `/system` (mounted
 read-only, so a write there is refused as on a real device), `/system/bin`,
@@ -173,6 +176,52 @@ sees, and `chmod` marks a file executable so running it succeeds. That is what l
 loader chain behave: `>/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/` completes, and
 `wget URL -O x; chmod 777 x; ./x; rm -rf x` finds its payload at every step and leaves
 nothing behind. Nothing persists between sessions.
+
+### Persona fidelity
+
+The Ubuntu persona is one host that every command describes the same way, because each
+fact has one source that every reader consults. A fingerprinting survey compares answers
+across commands, so the agreement is the property, not any single format:
+
+- **Processes.** One table (`crates/sensor-framework/src/shell/procs.rs#FakeShell::process_table`)
+  holds a 22.04 server's kernel threads and services with their owners, priorities and start
+  times. `ps`, `top`, `pgrep`, `pidof`, the `/proc/<pid>` tree, `/proc/loadavg`'s task count,
+  and `systemctl status`'s main PID, memory and command line all read it.
+- **Time.** One boot time and load figure (`crates/sensor-framework/src/shell/hostinfo.rs#uptime_secs`)
+  behind `uptime`, `uptime -p`, `/proc/uptime`, `/proc/loadavg`, `top`'s header, `w` and the
+  `START` and `since` of every process and unit. A file the session writes carries the session
+  clock's time.
+- **Network.** One model behind `ip addr`, `ip route`, `hostname -I`, `ss`, `/proc/net/*` and
+  `lshw -C network` (the MAC and address `ip link` shows). `ss` lists resolved's stub on
+  `127.0.0.53` beside sshd, in iproute2 5.15's recorded layout.
+- **Units.** A service is running exactly when its main process is a row of the table; whether
+  it is enabled is the symlink under `/etc/systemd/system/*.wants` the filesystem holds, so
+  `systemctl enable`/`disable` change what `is-enabled` and `ls` read. A unit file the session
+  writes loads from where it was written, `enable` links it with systemd's own messages, and it
+  stays `inactive (dead)`: nothing is ever started
+  (`crates/sensor-framework/src/shell/admin.rs#FakeShell::cmd_systemctl`).
+- **Scheduled jobs.** `crontab` reads and writes `/var/spool/cron/crontabs/root` with the header
+  Debian's cron writes and its recorded validation errors, so `crontab -l`, `cat` and `ls -l`
+  agree (`crates/sensor-framework/src/shell/admin.rs#FakeShell::cmd_crontab`).
+- **Packages.** One package database (`crates/sensor-framework/src/packages.rs#installed`),
+  recorded from a 22.04 server install, behind `dpkg -l`, `dpkg -s`, `apt list` and apt's
+  install and upgrade answers. `openssh-*` is at the version the SSH banner announces and that
+  `ssh -V` prints. Nothing is ever fetched or installed: `apt update` reports the indexes
+  unchanged, `install` of an installed package is "already the newest version" and of anything
+  else "Unable to locate package"
+  (`crates/sensor-framework/src/shell/pkg.rs#FakeShell::cmd_apt`).
+- **Hardware.** `/proc/cpuinfo`, `nproc`, `top`'s CPU line, `lspci`, `lshw` and the `xvda` disk
+  describe one Xen guest with one Xeon E5-2686 v4
+  (`crates/sensor-framework/src/shell/hw.rs#FakeShell::cmd_lspci`).
+- **Accounts and logins.** `/etc/passwd`, `/etc/group`, `/etc/shadow` (root's hash is random
+  per process and hashes no password) and `getent` agree; an SSH exec logs nobody in, so
+  `who` is empty and `uptime` says `0 users`, while an interactive login is the one user
+  `who` and `w` show, from the session's own peer address.
+
+Formats were recorded on 2026-10-07 from a systemd-booted `ubuntu:22.04` reference (coreutils
+8.32, procps-ng 3.3.17, iproute2 5.15, systemd 249, OpenSSH 8.9p1, dpkg 1.21.1, apt 2.4.14,
+cron 3.0pl1); what could not be recorded there (the reference ran on other hardware and could
+not send ICMP) is marked `[unverified]` where the code defines it.
 
 ### Fake shell (SSH, Telnet, ADB)
 
@@ -300,7 +349,14 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `cp`/`rm`/`mkdir` (they change the session's filesystem and report the real errors),
   `wget`/`curl` (canned transcripts, `-O-`/`-qO-` writes body to stdout, a saved
   download becomes a file; `busybox wget` with no URL prints BusyBox 1.30.1's wget usage on
-  stderr and exits 1, `crates/sensor-framework/src/shell/busybox.rs#wget_usage`), `ping` (canned replies), `sh`/`bash`/`ash`
+  stderr and exits 1, `crates/sensor-framework/src/shell/busybox.rs#wget_usage`), `ping` (on Ubuntu iputils' report of a
+  host that answers every probe, invented and never sent: a dotted address or a name `/etc/hosts` lists answers with a round trip
+  that is a function of the address, any other name is `Name or service not known` as `getent hosts` reports it, and the wait is
+  charged to `time`, `crates/sensor-framework/src/shell/netclient.rs#FakeShell::cmd_ping`; BusyBox's canned replies on the phone
+  and under `busybox ping`), `ssh` (the client of the persona's OpenSSH: `-V` prints the version the banner and the
+  `openssh-client` package carry, a bare `ssh` the recorded usage, any reachable-looking destination `Connection timed out` after
+  the connect timeout and status 255; it connects to nothing, `crates/sensor-framework/src/shell/netclient.rs#FakeShell::cmd_ssh`),
+  `sh`/`bash`/`ash`
   (nested shell; `sh -c "CMD"` (also with `-c` clustered, `sh -lc`, `bash -ec`), `sh FILE` and a script piped to `sh` run their text in a shell level of their own), `enable` (bash's builtin list, since
   Mirai's telnet preamble sends it and only a non-bash says "command not found"), `mount`
   (the fake filesystem's mount table), `busybox` (the real v1.30.1 multi-call banner

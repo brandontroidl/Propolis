@@ -195,6 +195,20 @@ pub enum HandlerId {
     Dig,
     /// `nc`: intent capture. Never connects, listens or runs the `-e` command.
     Nc,
+    /// The `ssh` client: version, usage and a connect that never leaves the box.
+    Ssh,
+    /// `systemctl` and `crontab`: the modeled units and the session's crontab file.
+    Systemctl,
+    Crontab,
+    /// `who` and `w`: the session's own login, from the process table.
+    Who,
+    W,
+    /// `dpkg`, `apt` and `apt-get`: the one modeled package database.
+    Dpkg,
+    Apt,
+    /// `lspci` and `lshw`: the modeled Xen guest's devices.
+    Lspci,
+    Lshw,
     Sleep,
     Cd,
     Su,

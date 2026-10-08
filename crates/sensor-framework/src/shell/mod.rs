@@ -54,6 +54,7 @@ use crate::held_input::StdinCaptures;
 use crate::persona;
 use crate::sanitize_value;
 
+mod admin;
 mod android;
 mod androidsys;
 mod arith;
@@ -73,15 +74,18 @@ mod fsops;
 mod grep;
 mod hashing;
 mod hostinfo;
+mod hw;
 mod lex;
 mod loader;
 mod lookup;
 mod multicall;
 mod nameinfo;
 mod netcat;
+mod netclient;
 mod netinfo;
 mod parse;
 mod pathtools;
+mod pkg;
 mod printf;
 mod procs;
 mod read;
@@ -1237,11 +1241,22 @@ impl FakeShell {
     /// `/bin/sh`) - which IoT loaders routinely use - resolves to the same applet a bare invocation
     /// would, the way a real shell finds it on PATH. Only the command token is normalised;
     /// arguments are untouched. A name the registry lacks is a path invocation when the token has
-    /// a slash and not-found otherwise; those two have no handler in the registry.
+    /// a slash and not-found otherwise; those two have no handler in the registry. So is a path to
+    /// a file the session wrote, whatever its name: `/tmp/w` is the attacker's file, not `w`.
     fn resolve(&self, parts: &[&str]) -> (HandlerId, Option<HandlerFn>) {
         let Some(first) = parts.first() else {
             return (HandlerId::Empty, None);
         };
+        if first.contains('/') {
+            let absolute = if first.starts_with('/') {
+                (*first).to_string()
+            } else {
+                format!("{}/{first}", self.cwd().trim_end_matches('/'))
+            };
+            if self.fs.is_session_file(&absolute) {
+                return (HandlerId::PathInvoke, None);
+            }
+        }
         if let Some((id, handler)) =
             Registry::builtin().lookup(command_basename(first), self, parts)
         {
@@ -1522,13 +1537,33 @@ impl FakeShell {
     /// (`cp /usr/bin/busybox /tmp/.bb && /tmp/.bb PROBE` prints `.bb: applet not found`, status
     /// 127, on the reference system).
     fn run_saved_executable(&mut self, parts: &[&str], path: &str) -> CommandResult {
-        let is_busybox = self
+        let image = self
             .fs
             .content_and_mode(path)
             .ok()
-            .and_then(|(blob, _)| blob.as_elf())
-            .is_some_and(|image| binaries::is_busybox(&image));
+            .and_then(|(blob, _)| blob.as_elf());
+        let is_busybox = image.as_ref().is_some_and(binaries::is_busybox);
         if !is_busybox {
+            // A copy of another modeled binary (`cp /bin/sh /tmp/x; /tmp/x -c ...`) runs as that
+            // binary does.
+            // The command a copy answers to is its binary's, or the alias that runs it (`sh` is
+            // dash, `awk` is mawk).
+            let copied = image.and_then(|image| {
+                let binary = binaries::BINARIES
+                    .iter()
+                    .find(|binary| binary.image() == image)?;
+                Some(
+                    binaries::ALIASES
+                        .iter()
+                        .find(|alias| alias.target == binary.name)
+                        .map_or(binary.name, |alias| alias.name),
+                )
+            });
+            if let Some(name) = copied {
+                let mut argv = vec![name];
+                argv.extend_from_slice(parts.get(1..).unwrap_or(&[]));
+                return self.dispatch_nested(&argv);
+            }
             return CommandResult::silent(0);
         }
         let name = command_basename(parts[0]);
@@ -3204,6 +3239,8 @@ fn low_byte(value: u32) -> u8 {
 // Declared with the test modules, after all production code: `trace_type_never_feeds_wire_output`
 // reads each file of this module up to its first `#[cfg(test)]` as the production source, and skips
 // the files that hold only tests.
+#[cfg(test)]
+mod admin_tests;
 #[cfg(test)]
 mod android_tests;
 #[cfg(test)]

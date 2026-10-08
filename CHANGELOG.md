@@ -419,7 +419,19 @@
   four variables); `MAIL` is set over telnet only, because a jammy SSH login has none (recorded).
   `ls -a` lists `.` and `..` and the short listing is one name a line off a terminal, a file
   the session writes is dated now rather than 2024, and `uname -a` and `/proc/version` carry the
-  kernel's build date [unverified].
+  kernel's build date [unverified]. `systemctl`, `crontab`, `apt`/`apt-get`/`dpkg`, `ssh`,
+  `lspci`, `lshw`, `who` and `w` exist (`which apt` and `ssh -V` answered nothing):
+  `systemctl list-units --state=running` lists the services whose processes `ps` shows, `status`
+  reads their PID and memory from the same rows, and enabling is the `.wants` symlink the
+  filesystem holds, so a dropped `kworker.service` is linked with systemd's own `Created
+  symlink` message and never started. `crontab` keeps its table in cron's spool with Debian's
+  header and errors. One package table recorded from a 22.04 server install answers `dpkg -l`,
+  `dpkg -s` and `apt list`, with `openssh-*` at the banner's version; `apt install` of anything
+  not installed cannot be located and nothing is fetched. `ping` prints iputils' report of
+  replies it never sent (it printed BusyBox's layout on Ubuntu) and fails names the box cannot
+  resolve as `getent` does; `ssh` times out on connect. A file the session writes now runs as
+  itself whatever its name (`/tmp/w` used to run `w`), and a copy of a modeled binary runs as
+  that binary; `ls -d` lists a directory operand itself.
 - **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
   0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
   echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks

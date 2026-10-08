@@ -109,6 +109,20 @@ const LS_COLORS: &str = "rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35
 const SERVER_ADDRESS: &str = "172.31.16.42";
 
 impl FakeShell {
+    /// logind's number for this login (`XDG_SESSION_ID`, the `session-N.scope` systemd lists),
+    /// fixed by the session.
+    pub(super) fn login_session_number(&self) -> u32 {
+        let pid = self.frames.first().map_or(0, |frame| frame.state.pid);
+        (pid % 9_000).saturating_add(120)
+    }
+
+    /// The source port of the client's connection as `SSH_CLIENT` reports it, fixed by the
+    /// session.
+    pub(super) fn client_port(&self) -> u32 {
+        let pid = self.frames.first().map_or(0, |frame| frame.state.pid);
+        32_768u32.saturating_add(pid.wrapping_mul(7_919) % 28_232)
+    }
+
     /// The variables a session's login puts in the environment, beyond what every shell has.
     /// Recorded on Ubuntu 22.04 over SSH (2026-10-07): `pam_env` sets `LANG` from
     /// `/etc/default/locale`, `pam_systemd` the `XDG_*` session variables, `pam_motd`
@@ -123,11 +137,10 @@ impl FakeShell {
         if self.flavor != ShellFlavor::Bash {
             return;
         }
-        let pid = self.state().pid;
         let ssh = self.ctx.protocol_label == "ssh";
         let interactive = self.context == super::ShellContext::LoginInteractive;
-        let session_id = (pid % 9_000).saturating_add(120).to_string();
-        let client_port = 32_768u32.saturating_add(pid.wrapping_mul(7_919) % 28_232);
+        let session_id = self.login_session_number().to_string();
+        let client_port = self.client_port();
         let client = self.ctx.source_ip.to_string();
         let mut set = |name: &str, value: String| self.state_mut().set_var(name, value, true);
         set("LANG", "C.UTF-8".to_string());

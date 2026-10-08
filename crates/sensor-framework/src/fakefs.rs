@@ -595,6 +595,13 @@ impl Builder {
         self.nodes.insert(path.to_string(), node);
     }
 
+    /// Give the node already built at `path` the group `gid`.
+    fn set_gid(&mut self, path: &str, gid: u32) {
+        if let Some(node) = self.nodes.get_mut(path) {
+            node.meta.gid = gid;
+        }
+    }
+
     fn symlink(&mut self, path: &str, target: &str) {
         self.nodes.insert(path.to_string(), Node::symlink(target));
     }
@@ -877,6 +884,7 @@ impl FakeFs {
                 "os-release",
                 "resolv.conf",
                 "shadow",
+                "systemd",
             ],
         );
         b.dir("/home", &["ubuntu"]);
@@ -941,7 +949,50 @@ impl FakeFs {
                 "tmp",
             ],
         );
-        b.dir("/var/tmp", &[]);
+        b.dir_mode("/var/tmp", &[], 0o1777);
+        // cron's spool: `crontab` writes the user's table here as group `crontab`, and the
+        // directory is `drwx-wx--T root crontab` as Debian's cron package makes it.
+        b.dir("/var/spool", &["cron"]);
+        b.dir("/var/spool/cron", &["crontabs"]);
+        b.dir_mode("/var/spool/cron/crontabs", &[], 0o1730);
+        b.set_gid("/var/spool/cron/crontabs", etc::CRONTAB_GID);
+        // The units a stock server enables, as the symlinks `systemctl enable` made: `systemctl
+        // is-enabled`, `enable` and `disable` read and change these and nothing else.
+        let mut wants_dirs: Vec<(&str, Vec<&str>)> = Vec::new();
+        for &(target, unit) in etc::ENABLED_UNITS {
+            match wants_dirs.iter_mut().find(|(t, _)| *t == target) {
+                Some((_, units)) => units.push(unit),
+                None => wants_dirs.push((target, vec![unit])),
+            }
+            b.symlink(
+                &format!("/etc/systemd/system/{target}.wants/{unit}"),
+                &format!("/lib/systemd/system/{unit}"),
+            );
+        }
+        let mut system_entries: Vec<String> = wants_dirs
+            .iter()
+            .map(|(target, _)| format!("{target}.wants"))
+            .collect();
+        for (target, units) in &wants_dirs {
+            let mut units = units.clone();
+            units.sort_unstable();
+            b.dir(&format!("/etc/systemd/system/{target}.wants"), &units);
+        }
+        for (alias, unit) in [
+            ("sshd.service", "ssh.service"),
+            ("syslog.service", "rsyslog.service"),
+        ] {
+            b.symlink(
+                &format!("/etc/systemd/system/{alias}"),
+                &format!("/lib/systemd/system/{unit}"),
+            );
+            system_entries.push(alias.to_string());
+        }
+        system_entries.sort_unstable();
+        let system_entries: Vec<&str> = system_entries.iter().map(String::as_str).collect();
+        b.dir("/etc/systemd/system", &system_entries);
+        b.dir("/etc/systemd/user", &[]);
+        b.dir("/etc/systemd", &["system", "user"]);
         b.dir("/run", &["lock", "user"]);
         b.dir("/mnt", &[]);
         b.dir(
@@ -997,7 +1048,10 @@ impl FakeFs {
         // iproute2 ships `ip` in /usr/bin and links /usr/sbin/ip to it (recorded), so `which ip`
         // finds /usr/sbin/ip first.
         b.symlink("/usr/sbin/ip", "/bin/ip");
-        b.dir("/usr/sbin", &["ip"]);
+        b.dir("/usr/sbin", &["ip", "sshd"]);
+        // `crontab` is setgid `crontab`, so it can write the spool (recorded `-rwxr-sr-x root
+        // crontab`).
+        b.set_gid("/usr/bin/crontab", etc::CRONTAB_GID);
         b.dir("/usr/lib", &["os-release"]);
         b.dir("/usr/lib32", &[]);
         b.dir("/usr/lib64", &[]);
@@ -1467,6 +1521,16 @@ impl FakeFs {
         })
     }
 
+    /// Whether `path`, every link followed, is a regular file this session wrote rather than one
+    /// the box shipped: running it runs the attacker's file, never the modeled command that
+    /// happens to share its name.
+    pub fn is_session_file(&self, path: &str) -> bool {
+        let p = self.lock();
+        self.lookup(&p, path).is_some_and(|(physical, node)| {
+            matches!(node.kind, NodeKind::Regular(_)) && p.overlay.nodes.contains_key(&physical)
+        })
+    }
+
     /// Whether `path` is a directory this box presents, following symlinks. `cd` and the write
     /// probes consult this, so the shell never lets an attacker enter a directory that `ls /`
     /// did not show, and never refuses one it did.
@@ -1688,6 +1752,24 @@ impl FakeFs {
             .nodes
             .insert(physical, self.stamped(Node::symlink(target)));
         Ok(())
+    }
+
+    /// Give the file the session wrote at `path` the group `gid`, as a setgid tool's own write
+    /// does (`crontab` installs into its spool as group `crontab`). Only a node this session
+    /// wrote changes; `false` when there is none.
+    pub fn set_written_group(&mut self, path: &str, gid: u32) -> bool {
+        let mut guard = self.lock();
+        let p = &mut *guard;
+        let Ok(physical) = self.resolve(p, path, false) else {
+            return false;
+        };
+        match p.overlay.nodes.get_mut(&physical) {
+            Some(node) => {
+                node.meta.gid = gid;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The ext2 attribute bits (`chattr`) of the node `path` names, or `None` when nothing is
@@ -2552,7 +2634,10 @@ mod tests {
 /dev/mqueue:
 /dev/pts: 0 ptmx
 /dev/shm:
-/etc: alternatives default group gshadow hostname hosts mtab netplan os-release passwd resolv.conf shadow
+/etc: alternatives default group gshadow hostname hosts mtab netplan os-release passwd resolv.conf shadow systemd
+/etc/systemd: system user
+/etc/systemd/system: getty.target.wants graphical.target.wants multi-user.target.wants sshd.service sysinit.target.wants syslog.service
+/etc/systemd/system/sysinit.target.wants: apparmor.service blk-availability.service keyboard-setup.service lvm2-monitor.service multipathd.service systemd-timesyncd.service
 /home: ubuntu
 /mnt:
 /root: .bashrc .cache .profile .ssh
@@ -2575,6 +2660,9 @@ mod tests {
 /tmp:
 /usr: bin games include lib lib32 lib64 libx32 local sbin share src
 /var: backups cache lib local lock log mail opt run spool tmp
+/var/spool: cron
+/var/spool/cron: crontabs
+/var/spool/cron/crontabs:
 /var/tmp:
 ";
 

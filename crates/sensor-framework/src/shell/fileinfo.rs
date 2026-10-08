@@ -801,7 +801,7 @@ impl FakeShell {
     /// a pipeline stage, a substitution), as GNU's is (recorded on Ubuntu 22.04: `ls -a /` over
     /// SSH exec lists one name a line), and names joined by two spaces at a terminal
     /// [unverified for GNU's column widths]. `-a` lists `.` and `..` first, `-A` does not
-    /// (recorded). Other options are accepted and ignored.
+    /// (recorded); `-d` lists a directory operand itself. Other options are accepted and ignored.
     pub(super) fn cmd_ls(&mut self, parts: &[&str]) -> CommandResult {
         let args = parts.get(1..).unwrap_or(&[]);
         let flags = |c: char| {
@@ -814,6 +814,8 @@ impl FakeShell {
         let long = args
             .iter()
             .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('l'));
+        // `-d` lists a directory operand as itself, not its contents.
+        let as_entries = flags('d') || args.contains(&"--directory");
         let mut operands: Vec<&str> = args
             .iter()
             .copied()
@@ -835,7 +837,7 @@ impl FakeShell {
                 ));
                 continue;
             };
-            if stat.kind == FileKind::Directory {
+            if stat.kind == FileKind::Directory && !as_entries {
                 dirs.push(operand);
             } else {
                 files.push(operand);
@@ -1323,7 +1325,7 @@ impl<'a> Parser<'a, '_> {
 
 /// `pat` against `text` as `fnmatch` with no flags matches it: `*`, `?`, bracket classes with
 /// ranges and `!`/`^` negation, and a backslash quoting the next character.
-fn glob_match(pat: &str, text: &str, fold: bool) -> bool {
+pub(super) fn glob_match(pat: &str, text: &str, fold: bool) -> bool {
     let pat: Vec<char> = pat.chars().collect();
     let text: Vec<char> = text.chars().collect();
     let same = |a: char, b: char| {

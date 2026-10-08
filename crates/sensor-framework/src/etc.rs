@@ -110,6 +110,36 @@ ubuntu:x:1000:
 /// The `shadow` group's id, which owns `/etc/shadow` and `/etc/gshadow`.
 pub const SHADOW_GID: u32 = 42;
 
+/// The `crontab` group's id, which owns cron's spool and every table `crontab` installs.
+pub const CRONTAB_GID: u32 = 104;
+
+/// The units a stock 22.04 server image enables, by the target whose `.wants` directory links
+/// them: what `systemctl enable` left behind (`[Install] WantedBy=` of each unit) [unverified:
+/// composed from the units' packaging, the reference container's enabled set being a subset].
+pub const ENABLED_UNITS: &[(&str, &str)] = &[
+    ("getty.target", "getty@tty1.service"),
+    ("graphical.target", "udisks2.service"),
+    ("multi-user.target", "ModemManager.service"),
+    ("multi-user.target", "console-setup.service"),
+    ("multi-user.target", "cron.service"),
+    ("multi-user.target", "networkd-dispatcher.service"),
+    ("multi-user.target", "rsyslog.service"),
+    ("multi-user.target", "setvtrgb.service"),
+    ("multi-user.target", "snapd.apparmor.service"),
+    ("multi-user.target", "snapd.seeded.service"),
+    ("multi-user.target", "snapd.service"),
+    ("multi-user.target", "ssh.service"),
+    ("multi-user.target", "systemd-networkd.service"),
+    ("multi-user.target", "systemd-resolved.service"),
+    ("multi-user.target", "unattended-upgrades.service"),
+    ("sysinit.target", "apparmor.service"),
+    ("sysinit.target", "blk-availability.service"),
+    ("sysinit.target", "keyboard-setup.service"),
+    ("sysinit.target", "lvm2-monitor.service"),
+    ("sysinit.target", "multipathd.service"),
+    ("sysinit.target", "systemd-timesyncd.service"),
+];
+
 /// The day (since the epoch) the image's system accounts were made, and the day root's password
 /// was last set: 2024-02-28 and 2024-03-08, inside the 22.04.4 point release's life [unverified].
 const ACCOUNTS_DAY: u32 = 19_781;

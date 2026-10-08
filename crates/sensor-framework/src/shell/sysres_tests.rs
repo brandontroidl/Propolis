@@ -886,8 +886,9 @@ fn du_of_a_modeled_directory_is_a_bounded_number() {
     let kib: u64 = size.parse().unwrap();
     // Seven small files at a block each (group, gshadow, hostname, hosts, passwd, resolv.conf,
     // shadow), the links at none, the alternatives directory at a block, `default` and `netplan`
-    // at a block each plus their one file's, under the directory's own block.
-    assert_eq!(kib, 7 * 4 + 4 + 2 * 8 + 4);
+    // at a block each plus their one file's, `systemd` with `system`, `user` and the four
+    // `.wants` directories of links at a block each, under the directory's own block.
+    assert_eq!(kib, 7 * 4 + 4 + 2 * 8 + 7 * 4 + 4);
     assert_eq!(out(&mut sh, "du -s /etc"), text, "repeatable");
     // The sum is of what `ls` shows: the directory's block plus each listed name measured alone.
     let listed = out(&mut sh, "ls /etc");

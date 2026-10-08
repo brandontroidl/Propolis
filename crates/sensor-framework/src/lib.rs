@@ -22,6 +22,7 @@ pub mod held_input;
 pub mod listener;
 pub mod logging;
 pub mod outbox;
+pub mod packages;
 pub mod persona;
 pub mod rate_limit;
 pub mod replay;

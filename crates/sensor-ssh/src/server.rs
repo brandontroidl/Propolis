@@ -405,44 +405,87 @@ async fn handle_session(
     max_captured_bytes: u64,
     budget_limits: BudgetLimits,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // ---- Phase 1: version exchange ----
-    let (client_version, server_version) =
-        transport::do_version_exchange_server_with_version(&mut stream, &banner).await?;
+    let started = std::time::Instant::now();
+    // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped
+    // IPv6 address (::ffff:a.b.c.d from a dual-stack listener) matches the operator's
+    // plain-IPv4 WAN map entry.
+    let norm_peer = normalize_dual_stack(peer_addr);
+    let source_ip: IpAddr = norm_peer.ip();
+    let local_addr = stream.get_ref().local_addr().map(normalize_dual_stack).ok();
+    let wan_ip = local_addr.and_then(|la| wan_resolver.resolve(la.ip()));
+    let mut auth_state = AuthState::new(source_ip, wan_ip, session_id);
 
-    // ---- Phase 2: key exchange ----
+    // The accept is the observation: emitted before the version exchange so a scanner that reads
+    // the banner and leaves, a client that sends garbage, and a bare TCP probe are recorded like
+    // every other sensor's connect. Exactly once per connection; nothing later emits another.
+    let conn_event = auth_state.emit_connection_event();
+    emitter.append(&conn_event).await?;
 
-    // Server sends KEXINIT (s2c packet #0).
-    let server_kexinit = transport::build_kexinit();
-    transport::write_packet_unencrypted(&mut stream, &server_kexinit).await?;
+    // Phases 1 and 2 run as a block so a connection that ends inside them still gets its end
+    // event below, with the client version if it got that far.
+    let mut handshake_phase = HandshakePhase::VersionExchange;
+    let mut client_version_seen: Option<String> = None;
+    let handshake: Result<_, transport::TransportError> = async {
+        // ---- Phase 1: version exchange ----
+        let (client_version, server_version) =
+            transport::do_version_exchange_server_with_version(&mut stream, &banner).await?;
+        client_version_seen = Some(client_version.clone());
+        handshake_phase = HandshakePhase::KeyExchange;
 
-    // Read client's KEXINIT (c2s packet #0).
-    let client_kexinit_pkt = transport::read_packet_unencrypted(&mut stream).await?;
-    let _client_kexinit = transport::parse_kexinit(&client_kexinit_pkt.payload)?;
+        // ---- Phase 2: key exchange ----
 
-    // Read client's ECDH_INIT (c2s packet #1).
-    let client_ecdh_init = transport::read_packet_unencrypted(&mut stream).await?;
+        // Server sends KEXINIT (s2c packet #0).
+        let server_kexinit = transport::build_kexinit();
+        transport::write_packet_unencrypted(&mut stream, &server_kexinit).await?;
 
-    // Perform key exchange: computes shared secret, signs exchange hash, sends ECDH_REPLY
-    // (s2c packet #1).
-    let session_keys = perform_kex_server(
-        &mut stream,
-        &host_key,
-        &client_kexinit_pkt.payload,
-        &server_kexinit,
-        &client_version,
-        &server_version,
-        &client_ecdh_init.payload,
-    )
-    .await?;
+        // Read client's KEXINIT (c2s packet #0).
+        let client_kexinit_pkt = transport::read_packet_unencrypted(&mut stream).await?;
+        let _client_kexinit = transport::parse_kexinit(&client_kexinit_pkt.payload)?;
 
-    // Server sends NEWKEYS (s2c packet #2).
-    transport::write_packet_unencrypted(&mut stream, &[SSH_MSG_NEWKEYS]).await?;
+        // Read client's ECDH_INIT (c2s packet #1).
+        let client_ecdh_init = transport::read_packet_unencrypted(&mut stream).await?;
 
-    // Read client's NEWKEYS (c2s packet #2).
-    let newkeys_pkt = transport::read_packet_unencrypted(&mut stream).await?;
-    if newkeys_pkt.payload.first() != Some(&SSH_MSG_NEWKEYS) {
-        return Err("expected SSH_MSG_NEWKEYS".into());
+        // Perform key exchange: computes shared secret, signs exchange hash, sends ECDH_REPLY
+        // (s2c packet #1).
+        let session_keys = perform_kex_server(
+            &mut stream,
+            &host_key,
+            &client_kexinit_pkt.payload,
+            &server_kexinit,
+            &client_version,
+            &server_version,
+            &client_ecdh_init.payload,
+        )
+        .await?;
+
+        // Server sends NEWKEYS (s2c packet #2).
+        transport::write_packet_unencrypted(&mut stream, &[SSH_MSG_NEWKEYS]).await?;
+
+        // Read client's NEWKEYS (c2s packet #2).
+        let newkeys_pkt = transport::read_packet_unencrypted(&mut stream).await?;
+        if newkeys_pkt.payload.first() != Some(&SSH_MSG_NEWKEYS) {
+            return Err(transport::TransportError::Malformed(
+                "expected SSH_MSG_NEWKEYS",
+            ));
+        }
+        Ok(session_keys)
     }
+    .await;
+    let session_keys = match handshake {
+        Ok(keys) => keys,
+        Err(e) => {
+            let end = auth_state.handshake_end_event(
+                classify_read_failure(&e),
+                handshake_phase.label(),
+                client_version_seen.as_deref(),
+                started.elapsed(),
+            );
+            if let Err(append_err) = emitter.append(&end).await {
+                tracing::error!(error = %append_err, "ssh: failed to append handshake end event");
+            }
+            return Err(e.into());
+        }
+    };
 
     // ---- Phase 3: encrypted transport ----
 
@@ -455,23 +498,11 @@ async fn handle_session(
     let mut c2s_seq: u32 = 3;
     let mut s2c_seq: u32 = 3;
 
-    // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped
-    // IPv6 address (::ffff:a.b.c.d from a dual-stack listener) matches the operator's
-    // plain-IPv4 WAN map entry.
-    let norm_peer = normalize_dual_stack(peer_addr);
-    let source_ip: IpAddr = norm_peer.ip();
-    let local_addr = stream.get_ref().local_addr().map(normalize_dual_stack).ok();
-    let wan_ip = local_addr.and_then(|la| wan_resolver.resolve(la.ip()));
-    let mut auth_state = AuthState::new(source_ip, wan_ip, session_id);
     // The one budget of this connection, cloned into every shell it opens.
     let budget = ConnectionBudget::new(budget_limits);
     // The one filesystem of this connection: every shell and exec opens a share of it, so a file
     // written on one channel is readable on the next, and a new connection starts clean.
     let base_fs = FakeFs::new().with_budget(budget.clone());
-
-    // Emit honeypot_connection (authenticated=false, pre-auth).
-    let conn_event = auth_state.emit_connection_event();
-    emitter.append(&conn_event).await?;
 
     // RFC 4254 permits several channels on one connection. Keep their handlers and independent
     // flow-control windows separate, with a hard cap so OPEN floods cannot pin unbounded shells.
@@ -1326,6 +1357,23 @@ async fn run_typed_line(
             }
             *held = Some(input);
             None
+        }
+    }
+}
+
+/// Where in the pre-encryption handshake a connection was when it ended, recorded as the `phase`
+/// of its `honeypot_session_end` event.
+#[derive(Clone, Copy)]
+enum HandshakePhase {
+    VersionExchange,
+    KeyExchange,
+}
+
+impl HandshakePhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::VersionExchange => "version_exchange",
+            Self::KeyExchange => "key_exchange",
         }
     }
 }

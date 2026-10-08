@@ -90,10 +90,30 @@ struct ListenerRow {
     confirmed_ago: Option<String>,
     last_event_ago: String,
     last_event_dot: &'static str,
+    /// "behind: 6.6 GB / 11 d" while the intake log carrying this sensor's events is behind, and
+    /// `None` otherwise. It sits under LAST EVENT because a backlog is what makes that column lie:
+    /// the sensor is busy, and its events are still waiting in the log.
+    behind: Option<String>,
     events_24h: i64,
     state_level: &'static str,
     /// False for a sensor seen in the ledger that the inventory does not know about.
     declared: bool,
+}
+
+/// The badge text for every `event.sensor` name a behind intake log carried. A log whose state is
+/// not behind contributes nothing, so a caught-up or idle sensor shows no badge.
+fn behind_by_sensor(logs: &[crate::intake_lag::IntakeLag]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for log in logs.iter().filter(|l| l.behind) {
+        let text = format!(
+            "behind: {}",
+            crate::intake_lag::format_backlog(log.bytes_behind, log.oldest_unread_age)
+        );
+        for sensor in &log.sensors {
+            out.entry(sensor.clone()).or_insert_with(|| text.clone());
+        }
+    }
+    out
 }
 
 /// Capture completeness for one sensor over the recent window.
@@ -737,6 +757,7 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
     // would get a page on which every row read stale, and one who sped it up would keep a rule
     // looser than the evidence allows.
     let probe_interval = state.fleet_probe_interval;
+    let behind = behind_by_sensor(&(state.intake_lag)());
 
     let probe_rows = degraded.soft("listener probes", fleet::store::read_all(&state.db).await);
     let probes: HashMap<(String, String, String, u16), fleet::ProbeRow> = probe_rows
@@ -845,6 +866,7 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
             confirmed_ago: probe.and_then(|p| p.confirmed_at).map(format_relative_time),
             last_event_ago: last_event_text(last_event_at),
             last_event_dot: dot_class(event_level),
+            behind: behind.get(&listener.sensor).cloned(),
             events_24h: seen.map(|a| a.events_24h).unwrap_or(0),
             state_level: state_level.class(),
             declared: true,
@@ -890,6 +912,8 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
             confirmed_ago: None,
             last_event_ago: last_event_text(seen.last_event_at),
             last_event_dot: dot_class(Level::Ok),
+            // Old history, not a listener: the sensor's own rows carry its badge.
+            behind: None,
             events_24h: seen.events_24h,
             state_level: Level::Ok.class(),
             declared: true,
@@ -952,6 +976,7 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
             confirmed_ago: None,
             last_event_ago: last_event_text(seen.last_event_at),
             last_event_dot: dot_class(event_level),
+            behind: behind.get(sensor).cloned(),
             events_24h: seen.events_24h,
             state_level: Level::Unknown.class(),
             declared: false,
@@ -1181,6 +1206,40 @@ mod tests {
             !got.by_listener
                 .contains_key(&("smtp".into(), "tcp".into(), 587))
         );
+    }
+
+    /// The badge follows the sensor names a log's events carried, and only a log judged behind
+    /// produces one: a caught-up log with bytes in flight, or an idle one, shows nothing.
+    #[test]
+    fn behind_badges_key_on_the_reported_sensor_names_of_behind_logs_only() {
+        use crate::intake_lag::IntakeLag;
+        use std::time::Duration;
+        let logs = vec![
+            IntakeLag {
+                log: "cred-vnc".into(),
+                sensors: vec!["vnc".into()],
+                bytes_behind: 6_600_000_000,
+                oldest_unread_age: Some(Duration::from_secs(11 * 86_400)),
+                behind: true,
+            },
+            IntakeLag {
+                log: "ssh".into(),
+                sensors: vec!["ssh".into()],
+                bytes_behind: 900,
+                oldest_unread_age: Some(Duration::ZERO),
+                behind: false,
+            },
+        ];
+        let got = behind_by_sensor(&logs);
+        assert_eq!(
+            got.get("vnc").map(String::as_str),
+            Some("behind: 6.6 GB / 11 d")
+        );
+        assert!(
+            !got.contains_key("cred-vnc"),
+            "the log label is not a listener name"
+        );
+        assert!(!got.contains_key("ssh"));
     }
 
     #[test]

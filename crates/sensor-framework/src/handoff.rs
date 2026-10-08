@@ -223,6 +223,21 @@ pub fn upload_metadata(
     })
 }
 
+/// The `honeypot_session_end` metadata object for a connection that ended before it reached the
+/// protocol's own session: why (`end_reason`, from [`CaptureEnd::label`]) and how long it lasted.
+/// Built here so the `end_reason` key has one home in the framework, next to the upload events'.
+pub fn session_end_metadata(
+    protocol_label: &str,
+    end: CaptureEnd,
+    elapsed: std::time::Duration,
+) -> serde_json::Value {
+    serde_json::json!({
+        "protocol_label": protocol_label,
+        "end_reason": end.label(),
+        "duration_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    })
+}
+
 /// `submit` could not enqueue the job because the queue was already at capacity, or because the
 /// hand-off is shutting down (`drain` was called). `submit` never waits for room (see the module
 /// doc), so this is the immediate, synchronous outcome, not a timeout or a retry-later signal.

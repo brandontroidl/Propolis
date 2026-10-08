@@ -51,7 +51,7 @@ Sensor-emittable constants are provided so literals are not hand-typed:
   `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec`,
   `honeypot_malware_upload`, `honeypot_file_download`, plus the telemetry constant
   `honeypot_session_end` (`crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_SESSION_END`) - recorded in the ledger but never scored;
-  only `sensor-mqtt` emits it so far. The remaining signal types (Suricata, WAF, port scan,
+  only `sensor-mqtt` (every session) and `sensor-ssh` (a connection that ends before key exchange completes) emit it so far. The remaining signal types (Suricata, WAF, port scan,
   and so on) originate from other layers, not sensor-wire.
 - Protocol (`crates/sensor-wire/src/lib.rs#PROTO_TCP`, `crates/sensor-wire/src/lib.rs#PROTO_UDP`, `crates/sensor-wire/src/lib.rs#PROTO_ICMP`): `tcp`, `udp`, `icmp`.
 

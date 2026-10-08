@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-28
+last-verified: 2026-10-07
 -->
 
 # Database reference
@@ -89,7 +89,16 @@ Base `0002_event.sql`; hardened by `0004`; `session_id` added by `0007`.
 | `session_id` | UUID | nullable; correlates one sensor session | `crates/core-scoring/migrations/0007_session_id.sql#session_id` |
 
 Indexes: `event_source_ip_idx (source_ip)` (`crates/core-scoring/migrations/0002_event.sql#event_source_ip_idx`), `event_observed_at_idx
-(observed_at)` (`crates/core-scoring/migrations/0002_event.sql#event_observed_at_idx`), `event_session_idx (source_ip, session_id)` (`crates/core-scoring/migrations/0007_session_id.sql#event_session_idx`).
+(observed_at)` (`crates/core-scoring/migrations/0002_event.sql#event_observed_at_idx`), `event_session_idx (source_ip, session_id)` (`crates/core-scoring/migrations/0007_session_id.sql#event_session_idx`), `event_dedup_idx (source_ip, signal_type, observed_at)` (`crates/core-scoring/migrations/0013_event_dedup_index.sql#event_dedup_idx`).
+
+`event_dedup_idx` serves the dedup read every scored append makes inside the append lock
+(`crates/core-scoring/src/repository/events.rs#DEDUP_PRIOR_SQL`). That statement hides the
+source address from the planner, so a bot loop that holds a large share of the ledger is costed
+as an average source and read through this index, rather than by walking
+`event_observed_at_idx` down from the newest row. The walk costs one row per event newer than
+the source's last sighting, which grows while intake is behind. The plan is held by
+`crates/core-scoring/src/repository/events.rs#dedup_read_plan_uses_the_dedup_index_on_an_incident_shaped_ledger`
+and `crates/core-scoring/src/repository/events.rs#dedup_read_plan_generic_form_uses_the_dedup_index`.
 
 The `metadata` column is documented "sanitized at capture" (`crates/core-scoring/migrations/0002_event.sql#metadata`); the
 sanitizer path itself lives outside the schema. The DB does **not** enforce the
@@ -352,6 +361,7 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 | `0010` | `ip_score.active_days INTEGER DEFAULT 1` + `last_active_day DATE`; backfills day counts |
 | `0011` | `ip_score.established_event_count INTEGER DEFAULT 0`; backfills TCP-only counts |
 | `0012` | `signal_type_enum` value `honeypot_session_end` (unscored interaction telemetry) |
+| `0013` | index `event_dedup_idx (source_ip, signal_type, observed_at)` for the append path's dedup read; built inside the migration transaction, so writes to `event` wait for the build ([schema-and-migrations](../development/schema-and-migrations.md#index-builds)) |
 
 **review** (`crates/review/migrations/`):
 

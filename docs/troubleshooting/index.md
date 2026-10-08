@@ -31,6 +31,7 @@ is a service that exits immediately at boot with a logged reason. Start with
 | "migrations failed" at start | schema drift, partial/edited migration, permissions | [Database](database.md) |
 | `/ready` returns 503 | database ping failing (fail-closed readiness) | [Database](database.md) |
 | Integrity page reports the chain broken | hash-chain verification failed over the `event` ledger | [Database](database.md) |
+| Fleet pane: a busy sensor's last event is days ago, or a `behind:` badge / `intake-lagging` page | intake is behind that sensor's log | [Intake backlog](intake-backlog.md) |
 | Events being dropped under load | capture bounds hit, queue/spool pressure, disk | [Queue and spool](queue-and-spool.md) |
 | One sensor writes a flood of command events from a few addresses | a looping loader past (or under) the command-event budget | [Queue and spool](queue-and-spool.md#a-telnet-or-ssh-bot-loop-floods-the-event-log) |
 | Samples not appearing / spool filling | spool budget, disk, sensor not spooling | [Queue and spool](queue-and-spool.md) |

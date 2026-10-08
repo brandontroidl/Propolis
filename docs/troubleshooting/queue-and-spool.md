@@ -96,7 +96,7 @@ PROPOLIS_TELNET_COMMAND_EVENT_BURST=100
 and restart that sensor; zero or a non-number refuses to start
 ([environment variables](../reference/environment-variables.md#standard-sensors-strict-parse---ssh-telnet-http-ftp-redis-adb-catchall-tftp-mqtt-dns)).
 A backlog that already exists does not shrink by itself; draining or archiving it is a separate
-step.
+step ([intake backlog](intake-backlog.md#recovering-a-backlog-too-large-to-drain)).
 
 ## Log rotation can lose a small window of events
 

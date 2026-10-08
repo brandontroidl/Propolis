@@ -1188,6 +1188,156 @@ async fn a_peer_that_stalls_mid_handshake_is_dropped_at_the_read_timeout() {
     );
 }
 
+/// Every event in the log whose signal is `signal`.
+fn logged(log: &std::path::Path, signal: &str) -> Vec<sensor_wire::SensorEvent> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str::<sensor_wire::SensorEvent>(l).unwrap())
+        .filter(|e| e.signal_type == signal)
+        .collect()
+}
+
+/// Wait for the first `signal` event to appear, then give a duplicate time to show up before
+/// returning every one logged: a second event would land within the same session teardown.
+async fn settled(log: &std::path::Path, signal: &str) -> Vec<sensor_wire::SensorEvent> {
+    for _ in 0..100 {
+        if !logged(log, signal).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    logged(log, signal)
+}
+
+#[tokio::test]
+async fn a_bare_tcp_connect_is_one_connection_event_and_a_peer_closed_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let log = dir.path().join("events.jsonl");
+
+    drop(tokio::net::TcpStream::connect(addr).await.unwrap());
+
+    let conns = settled(&log, sensor_wire::SIGNAL_HONEYPOT_CONNECTION).await;
+    let ends = settled(&log, sensor_wire::SIGNAL_HONEYPOT_SESSION_END).await;
+    handle.abort();
+    assert_eq!(conns.len(), 1, "{conns:?}");
+    assert!(!conns[0].authenticated);
+    assert!(conns[0].session_id.is_some());
+    assert!(conns[0].metadata["local_port"].as_u64().unwrap() > 0);
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(ends[0].metadata["end_reason"], "peer_closed");
+    assert_eq!(ends[0].metadata["phase"], "version_exchange");
+    assert!(ends[0].metadata.get("client_version").is_none());
+    assert_eq!(ends[0].session_id, conns[0].session_id);
+}
+
+#[tokio::test]
+async fn a_banner_grab_is_one_connection_event_and_a_peer_closed_end() {
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let log = dir.path().join("events.jsonl");
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut banner = [0u8; 64];
+    let n = stream.read(&mut banner).await.unwrap();
+    assert!(banner[..n].starts_with(b"SSH-2.0-"));
+    drop(stream);
+
+    let conns = settled(&log, sensor_wire::SIGNAL_HONEYPOT_CONNECTION).await;
+    let ends = settled(&log, sensor_wire::SIGNAL_HONEYPOT_SESSION_END).await;
+    handle.abort();
+    assert_eq!(conns.len(), 1, "{conns:?}");
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(ends[0].metadata["end_reason"], "peer_closed");
+    assert_eq!(ends[0].metadata["phase"], "version_exchange");
+}
+
+#[tokio::test]
+async fn a_non_ssh_client_is_one_connection_event_and_a_malformed_input_end() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let log = dir.path().join("events.jsonl");
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: sensor.example\r\n\r\n")
+        .await
+        .unwrap();
+
+    let conns = settled(&log, sensor_wire::SIGNAL_HONEYPOT_CONNECTION).await;
+    let ends = settled(&log, sensor_wire::SIGNAL_HONEYPOT_SESSION_END).await;
+    handle.abort();
+    assert_eq!(conns.len(), 1, "{conns:?}");
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(ends[0].metadata["end_reason"], "malformed_input");
+    assert_eq!(ends[0].metadata["phase"], "key_exchange");
+    assert_eq!(ends[0].metadata["client_version"], "GET / HTTP/1.1");
+}
+
+#[tokio::test]
+async fn a_client_that_never_sends_its_version_ends_by_the_read_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let bounds = ConnectionBounds {
+        read_timeout: Duration::from_secs(1),
+        idle_timeout: Duration::from_secs(1),
+        ..test_bounds()
+    };
+    let (addr, handle) = sensor_ssh::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        dir.path().join("host_key"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        bounds,
+        "OpenSSH_9.6p1".to_string(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+    let log = dir.path().join("events.jsonl");
+
+    let _held = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    let conns = settled(&log, sensor_wire::SIGNAL_HONEYPOT_CONNECTION).await;
+    let ends = settled(&log, sensor_wire::SIGNAL_HONEYPOT_SESSION_END).await;
+    handle.abort();
+    assert_eq!(conns.len(), 1, "{conns:?}");
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(ends[0].metadata["end_reason"], "idle_timeout");
+}
+
+#[tokio::test]
+async fn a_full_login_session_still_logs_exactly_one_connection_event_and_no_handshake_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start_server(dir.path()).await;
+    let log = dir.path().join("events.jsonl");
+
+    let session = login(addr).await;
+    let out = exec_stdout(&session, "echo hi").await;
+    assert_eq!(out, b"hi\n");
+    drop(session);
+
+    let conns = settled(&log, sensor_wire::SIGNAL_HONEYPOT_CONNECTION).await;
+    let logins = logged(&log, sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT);
+    let ends = logged(&log, sensor_wire::SIGNAL_HONEYPOT_SESSION_END);
+    handle.abort();
+    assert_eq!(conns.len(), 1, "{conns:?}");
+    assert!(!conns[0].authenticated);
+    assert_eq!(logins.len(), 1);
+    assert_eq!(logins[0].session_id, conns[0].session_id);
+    assert!(
+        ends.is_empty(),
+        "an established session is not a handshake end: {ends:?}"
+    );
+}
+
 async fn start_server(
     dir: &std::path::Path,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {

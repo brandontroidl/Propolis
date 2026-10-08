@@ -137,6 +137,7 @@ async fn panel_after_session(pool: PgPool, ending: Ending) -> String {
             trusted_proxy: false,
             metrics_token: None,
             gave_up_subsystems: console::no_subsystem_health(),
+            intake_lag: console::intake_lag::no_intake_lag(),
         };
         let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
         let app =

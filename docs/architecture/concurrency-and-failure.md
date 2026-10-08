@@ -131,8 +131,13 @@ missing or malformed input.
   per-source cap (a quarter of `max_concurrent` by default) for any single source IP -
   they do not queue.
 - **Capture** sheds load by dropping jobs past the bounded queue - it does not block.
-- **Intake** polls the sensor logs on an interval; it advances a per-sensor cursor and
-  is naturally rate-limited by its poll interval and the serialized append lock.
+- **Intake** reads each sensor log 100 lines a batch, advancing a per-sensor cursor, and
+  reads again at once while lines remain; it sleeps for the poll interval only when a batch
+  comes back empty (`crates/propolis/src/main.rs#run_intake_sensor`). Its rate is set by the
+  serialized append lock: one append at a time across every sensor, so a slow append for one
+  source holds up all of them. Intake does not shed load; when a sensor writes faster than
+  intake appends, the backlog stays in the log, and the `intake-lagging` alert and the fleet
+  pane's behind badge report it ([intake backlog](../troubleshooting/intake-backlog.md)).
 - The **console** binds loopback-only by default and derives metrics from live DB
   queries per scrape (not pre-aggregated).
 

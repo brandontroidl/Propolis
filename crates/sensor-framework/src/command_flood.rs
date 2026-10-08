@@ -1325,7 +1325,8 @@ mod tests {
             "every command counted once"
         );
         let windows = minutes + 1;
-        let (shapes, addresses) = (16u64, 1u64);
+        // Sixteen shapes, of which the three chunk forms are never firsts; one address.
+        let (shapes, addresses) = (13u64, 1u64);
         let bound = u64::from(DEFAULT_COMMAND_EVENT_BURST)
             + u64::from(DEFAULT_COMMAND_EVENTS_PER_MIN) * (minutes + 1)
             + shapes * windows

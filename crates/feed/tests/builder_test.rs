@@ -286,6 +286,79 @@ async fn delisted_qualifying_ip_is_excluded_from_output() {
     assert!(!snapshot.standard.iter().any(|e| e.source_ip == ip));
 }
 
+/// Like `seed_qualifying` but the honeypot event carries a crawler User-Agent, as the HTTP sensor
+/// records it.
+async fn seed_claiming_crawler(pool: &PgPool, ip: IpAddr, now: DateTime<Utc>) {
+    reset_ip(pool, ip).await;
+    let claimed = EventInput::from_signal(
+        ip,
+        None,
+        "feed-test-sensor".into(),
+        SignalType::HoneypotMalwareUpload,
+        Protocol::Tcp,
+        true,
+        now,
+        serde_json::json!({
+            "user_agent": "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+            "claimed_crawler": "ClaudeBot",
+        }),
+        None,
+    );
+    append_event(pool, claimed).await.unwrap();
+    append_event(
+        pool,
+        ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
+    )
+    .await
+    .unwrap();
+    let queue = ReviewQueue::new();
+    queue.populate(pool).await.unwrap();
+    queue.approve(pool, ip, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_claimed_crawler_is_published_unless_its_address_is_in_an_operator_range_file() {
+    let pool = setup_pool().await;
+    let now = Utc::now();
+    let spoofer: IpAddr = "45.10.30.201".parse().unwrap();
+    let listed: IpAddr = "45.10.30.202".parse().unwrap();
+    seed_claiming_crawler(&pool, spoofer, now).await;
+    seed_claiming_crawler(&pool, listed, now).await;
+
+    let config = FeedConfig::default();
+    let baseline = FeedBuilder::build(
+        &pool,
+        &ExclusionEngine::new(Vec::new(), Vec::new()),
+        &config,
+    )
+    .await
+    .unwrap();
+    for ip in [spoofer, listed] {
+        assert!(
+            baseline.aggressive.iter().any(|e| e.source_ip == ip),
+            "{ip}: a claimed crawler qualifies on its behaviour; the User-Agent exempts nothing"
+        );
+    }
+
+    // The operator's file lists only the second address's range. Both addresses sent the same
+    // ClaudeBot User-Agent; only the address decides.
+    let nets = feed::exclusion::parse_allowlist_text(
+        "# operator-verified crawler range\n45.10.30.202/32\n",
+    )
+    .unwrap();
+    let snapshot = FeedBuilder::build(&pool, &ExclusionEngine::new(nets, Vec::new()), &config)
+        .await
+        .unwrap();
+    assert!(
+        snapshot.aggressive.iter().any(|e| e.source_ip == spoofer),
+        "a User-Agent claiming ClaudeBot from an unlisted address must still be published"
+    );
+    assert!(
+        !snapshot.aggressive.iter().any(|e| e.source_ip == listed),
+        "an address in the operator's range file must be excluded"
+    );
+}
+
 #[tokio::test]
 async fn all_output_timestamps_are_coarsened_to_hour_boundaries() {
     let pool = setup_pool().await;

@@ -16,6 +16,6 @@ pub mod publisher;
 pub use builder::{
     FeedBuilder, FeedConfig, FeedEntry, FeedError, FeedSnapshot, WindowFeed, coarsen_to_hour,
 };
-pub use exclusion::ExclusionEngine;
+pub use exclusion::{AllowlistFileError, ExclusionEngine, load_allowlist_file};
 pub use export::{export_cidr, export_csv, export_json, export_plaintext};
 pub use publisher::{PublishError, Publisher, recover_interrupted_publish};

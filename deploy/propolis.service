@@ -66,7 +66,9 @@
 #     PROPOLIS_FEED_BUILD_INTERVAL_SECS (default 900), PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS
 #     (default 24), PROPOLIS_FEED_STANDARD_TTL_HOURS (default 48), PROPOLIS_FEED_WINDOWS
 #     (default 24h,7d,30d,60d,90d - retention feeds published as all-{label}.*), PROPOLIS_FEED_ALLOWLIST
-#     (optional CIDR list), PROPOLIS_FEED_DELIST (optional IP list), PROPOLIS_CONSOLE_BIND
+#     (optional CIDR list), PROPOLIS_FEED_ALLOWLIST_FILE (optional path to a CIDR file, one per
+#     line, readable by the propolis user, not under /home; a bad line stops startup),
+#     PROPOLIS_FEED_DELIST (optional IP list), PROPOLIS_CONSOLE_BIND
 #     (default 127.0.0.1:8080), PROPOLIS_CONSOLE_PASSWORD (required),
 #     PROPOLIS_CONSOLE_SESSION_SECRET (optional 64-hex-char/32-byte key - unset generates a fresh
 #     random one on every start, which only means sessions do not survive a restart, matching

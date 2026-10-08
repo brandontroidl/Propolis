@@ -389,6 +389,31 @@ async fn user_agent_captured_in_metadata() {
         .and_then(|v| v.as_str())
         .unwrap();
     assert!(ua.contains("Mozilla"), "user-agent: {ua}");
+    assert!(
+        cmd.metadata.get("claimed_crawler").is_none(),
+        "an ordinary User-Agent carries no crawler label"
+    );
+    srv.handle.abort();
+}
+
+#[tokio::test]
+async fn a_claimed_crawler_is_labelled_but_still_recorded_as_the_same_signal() {
+    let srv = TestServer::start().await;
+    let _ = send_request(
+        srv.addr,
+        "GET / HTTP/1.1\r\nHost: test\r\nUser-Agent: Mozilla/5.0 (compatible; ClaudeBot/1.0)\r\n\r\n",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let cmd = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .expect("a claimed crawler's request is still recorded as the ordinary request signal");
+    assert_eq!(
+        cmd.metadata.get("claimed_crawler").and_then(|v| v.as_str()),
+        Some("ClaudeBot")
+    );
     srv.handle.abort();
 }
 

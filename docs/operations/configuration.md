@@ -50,7 +50,7 @@ for the complete set and exact values.
 | Database | PgPool connection and size | `DATABASE_URL` (required), `PROPOLIS_DB_MAX_CONNECTIONS` |
 | Intake | which sensor logs to tail, cursor state, poll cadence | `PROPOLIS_SENSOR_LOGS` (required), `PROPOLIS_CURSOR_DIR`, `PROPOLIS_POLL_INTERVAL_MS` |
 | Review | scoring/review loop cadence and vendor submitters | `PROPOLIS_REVIEW_ENABLED`, `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, `PROPOLIS_VENDOR_<V>_*` |
-| Feed | blocklist output dir, build cadence, tiers/windows, allow/delist | `PROPOLIS_FEED_ENABLED`, `PROPOLIS_FEED_OUTPUT_DIR`, `PROPOLIS_FEED_BUILD_INTERVAL_SECS`, `PROPOLIS_FEED_WINDOWS`, `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ASN_ALLOWLIST`, `PROPOLIS_FEED_DELIST` |
+| Feed | blocklist output dir, build cadence, tiers/windows, allow/delist | `PROPOLIS_FEED_ENABLED`, `PROPOLIS_FEED_OUTPUT_DIR`, `PROPOLIS_FEED_BUILD_INTERVAL_SECS`, `PROPOLIS_FEED_WINDOWS`, `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE`, `PROPOLIS_FEED_ASN_ALLOWLIST`, `PROPOLIS_FEED_DELIST` |
 | Console | bind address, auth, session, enrichment | `PROPOLIS_CONSOLE_BIND`, `PROPOLIS_CONSOLE_PASSWORD` (required), `PROPOLIS_CONSOLE_SESSION_SECRET`, `PROPOLIS_GEOIP_DIR`, `PROPOLIS_CONSOLE_RDNS_ENABLED` |
 | VirusTotal | sample scanning (opt-in egress) | `PROPOLIS_VT_ENABLED`, `PROPOLIS_VT_KEY`, `PROPOLIS_VT_UPLOAD`, `PROPOLIS_VT_SCAN_INTERVAL_SECS` |
 | Malware fetcher | artifact retrieval (opt-in egress) | `PROPOLIS_FETCH_ENABLED` and the `PROPOLIS_FETCH_*` bounds |
@@ -86,8 +86,43 @@ Fail-closed pairings worth noting (all owned by the reference table):
   (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`).
 - `PROPOLIS_FEED_WINDOWS` fails closed on any malformed entry rather than
   skipping it (`crates/propolis/src/config.rs#parse_window_list`).
+- `PROPOLIS_FEED_ALLOWLIST_FILE` refuses to start on an unreadable file, a line that is not a
+  CIDR, or an entry wider than /8 (IPv4) or /16 (IPv6); see
+  [the allowlist file procedure](#keeping-declared-crawlers-out-of-the-feed)
+  (`crates/feed/src/exclusion.rs#load_allowlist_file`).
 - `PROPOLIS_FEED_ASN_ALLOWLIST` is inert unless `PROPOLIS_GEOIP_DIR` is set and
   the GeoLite2-ASN database loads (`crates/propolis/src/config.rs#parse_asn_list`, `crates/propolis/src/main.rs#main`).
+
+## Keeping declared crawlers out of the feed
+
+Research and AI crawlers (ClaudeBot, Googlebot, CensysInspect and others) hit the HTTP
+sensor. To keep a crawler operator's addresses out of the published feed, list the ranges
+the operator publishes in a local file. A User-Agent never exempts an address: anyone can
+send "ClaudeBot", so a request that claims it from an unlisted address is scored and
+published like any other.
+
+1. Create the file, one CIDR per line, `#` for comments. A bare address is refused; write
+   a single host as `/32` (or `/128`).
+2. Put it where the service user can read it and the unit can see it. Under
+   `ProtectSystem=strict` `/etc` stays readable, so `/etc/propolis/feed-allowlist.txt` works
+   with mode `0640`, owner `root`, group `propolis` (`propolis.service`) or `propolis-feed`
+   (`feed.service`). Do not use a path under `/home` (`ProtectHome=yes` hides it). The file
+   is only read, so no `ReadWritePaths` entry is needed.
+3. Set `PROPOLIS_FEED_ALLOWLIST_FILE=/etc/propolis/feed-allowlist.txt` in the unit's env
+   file and restart the service. The file is read once at startup; edits do nothing until
+   the next restart.
+4. Check the journal: a valid file starts normally. A missing or unreadable file, any line
+   that is not a CIDR, a bare address, an entry wider than /8 (IPv4) or /16 (IPv6), more
+   than 50,000 entries, more than 1 MiB, or non-UTF-8 content stops the service at startup
+   (a bad line is reported with its line number). It never starts with a partial list, so fix the
+   file and start again.
+
+The daemon fetches nothing: you copy the ranges from the operator's own published list.
+
+What the allowlist covers: it only keeps addresses out of the published feed (build and
+publish). Today it does not stop an address being scored or queued for review, and the
+vendor submission path does not consult it, so a listed crawler can still reach the review
+queue and be submitted to a vendor if you approve it.
 
 ## Sensor binds and WAN attribution
 

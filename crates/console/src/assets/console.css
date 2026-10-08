@@ -469,15 +469,90 @@ td.ip a:hover { color: var(--brand); }
 .run-count { font-family: var(--font-mono); font-weight: 600; color: var(--text); }
 
 /* -- Review queue: the context line under each pending row -- */
-tr.has-context td { border-bottom: none; padding-bottom: 0.2rem; }
-tr.queue-context td { padding-top: 0; font-size: 0.76rem; color: var(--text-muted); }
-tr.queue-context td > * { margin-right: 0.9rem; }
+tr.has-context td { border-bottom: none; padding-bottom: 0.15rem; }
+tr.queue-context td { padding-top: 0; padding-bottom: 0.55rem; font-size: 0.76rem; color: var(--text-muted); }
+tr.queue-context td > * { margin-right: 1rem; vertical-align: middle; }
 tr.queue-context:hover td { background: transparent; }
-.ctx-sensors { display: inline-flex; gap: 0.3rem; }
-.ctx-chip { font-family: var(--font-mono); font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: var(--radius-sm); background: var(--surface-raised); border: 1px solid var(--border); color: var(--text); }
-.ctx-item { display: inline-flex; align-items: center; gap: 0.35rem; vertical-align: middle; }
-.ctx-notable code { color: var(--text); font-size: 0.74rem; overflow-wrap: anywhere; }
+/* What it did leads and is the only part at full strength; the rest recedes. */
+.ctx-what { white-space: nowrap; }
+.ctx-verb { color: var(--text-faint); }
+.ctx-code { display: inline-block; max-width: 42ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; color: var(--text); font-size: 0.74rem; }
 .ctx-campaign a { color: var(--link); }
+.ctx-dim { color: var(--text-faint); font-size: 0.72rem; }
+.ctx-dim > * + *::before { content: "\00b7"; margin: 0 0.4rem; }
+.ctx-chip { font-family: var(--font-mono); }
+tr.queue-context .sev-tags { display: inline-flex; }
+/* Signal counts are reference, not alarm: neutral chips, with colour kept only for the worst rung. */
+tr.queue-context .sev { font-size: 0.66rem; padding: 0 0.4rem; background: transparent; border-color: var(--border); color: var(--text-muted); }
+tr.queue-context .sev--crit { color: var(--alert-text); border-color: var(--alert-dim); background: var(--alert-dim); }
+
+/* -- Review queue: layout, score, active span, notes, campaign groups -- */
+.sortbar { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; align-items: baseline; font-size: 0.78rem; margin: 0 0 0.6rem; }
+.sortbar a { color: var(--text-muted); }
+.sortbar a:hover { color: var(--text); }
+.sortbar a.active { color: var(--brand); font-weight: 600; }
+/* Fixed layout with shared column widths so the member tables nested in a group line up under the
+   page's headers; the widths come from the <colgroup> in macros.html. */
+.queue-panel--pending table { table-layout: fixed; }
+.qc-ip { width: 17%; } .qc-score { width: 7%; } .qc-tier { width: 10%; } .qc-events { width: 7%; } .qc-active { width: 21%; } .qc-actions { width: 38%; }
+.queue-panel td.ip { white-space: normal; overflow-wrap: anywhere; }
+td.score { font-weight: 600; }
+.score--aggressive { color: var(--alert-text); }
+.score--standard { color: var(--attention-text); }
+.score--none { color: var(--text-muted); }
+td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-muted); white-space: nowrap; }
+/* A group is one item: a tinted block with an accent rail down its whole left edge (header and, when
+   open, the members) and a heavier rule under it, so where it ends is as plain as where it starts. */
+.queue-group > td { padding: 0; background: var(--attention-dim); border-left: 4px solid var(--brand); border-bottom: 2px solid var(--border-bright); }
+.qgroup > summary {
+  display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto; gap: 0.2rem 1rem; align-items: center;
+  padding: 0.65rem 0.9rem 0.65rem 2rem; position: relative; cursor: pointer; list-style: none;
+}
+.qg-head { display: flex; align-items: baseline; gap: 0.6rem; min-width: 0; }
+.qg-count { flex: none; font-size: 0.72rem; font-weight: 700; color: var(--brand-ink); background: var(--brand); border-radius: 999px; padding: 0.05rem 0.55rem; }
+.qgroup > summary::-webkit-details-marker { display: none; }
+.qgroup > summary::before { content: "\25b8"; position: absolute; left: 0.8rem; top: 0.7rem; color: var(--brand); }
+.qgroup[open] > summary::before { content: "\25be"; }
+.qgroup[open] > summary { border-bottom: 1px solid var(--border); }
+.qg-title { min-width: 0; }
+.qg-label { display: block; min-width: 0; font-size: 0.86rem; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qg-meta { display: block; font-size: 0.74rem; color: var(--text-muted); }
+.qg-meta a { color: var(--link); }
+.qg-what { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 0.76rem; color: var(--text-muted); }
+.qg-side { display: flex; align-items: center; gap: 0.9rem; white-space: nowrap; }
+.qg-top { font-size: 0.74rem; }
+.qg-top .score { font-family: var(--font-mono); font-weight: 600; }
+.qg-approve { border: 1px solid var(--good); color: var(--good-text); border-radius: var(--radius-sm); padding: 0.3rem 0.7rem; font-size: 0.78rem; font-weight: 600; }
+.qg-approve:hover { background: var(--good-dim); text-decoration: none; }
+/* Open members sit on a darker inset under the header and are indented, so they read as inside it. */
+.qmembers { background: rgba(0, 0, 0, 0.16); }
+@media (min-width: 641px) {
+  .qmembers td:first-child { padding-left: 1.6rem; }
+}
+/* Narrow screens: each pending entry becomes a small card (address and score on top, counts under,
+   actions last) instead of a table that would have to scroll sideways. */
+@media (max-width: 640px) {
+  .queue-panel--pending table, .queue-panel--pending tbody, .queue-panel--pending tr, .queue-panel--pending td { display: block; width: auto; }
+  .queue-panel--pending thead, .queue-panel--pending colgroup { display: none; }
+  .queue-panel--pending .qmembers { border-left-width: 2px; }
+  tr.qrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0.25rem 0.7rem; align-items: baseline; padding: 0.7rem 0.75rem 0.2rem; }
+  tr.qrow:not(.has-context) { border-bottom: 1px solid var(--border); padding-bottom: 0.7rem; }
+  tr.qrow > td { padding: 0; border: none; }
+  tr.qrow > td.ip { grid-column: 1; grid-row: 1; }
+  tr.qrow > td.score { grid-column: 2; grid-row: 1; }
+  tr.qrow > td.tier-cell { grid-column: 3; grid-row: 1; }
+  tr.qrow > td.count { grid-column: 1; grid-row: 2; text-align: left; font-size: 0.76rem; color: var(--text-muted); }
+  tr.qrow > td.count::after { content: " events"; }
+  tr.qrow > td.active-cell { grid-column: 2 / 4; grid-row: 2; text-align: right; white-space: normal; }
+  tr.qrow > td.actions-cell { grid-column: 1 / -1; grid-row: 3; margin-top: 0.35rem; }
+  tr.queue-context > td { padding: 0 0.75rem 0.7rem; border-bottom: 1px solid var(--border); }
+  tr.queue-context > td > * { display: inline-block; margin: 0 0.8rem 0.2rem 0; }
+  .ctx-what { white-space: normal; display: block !important; }
+  .ctx-code { max-width: 100%; }
+  .qgroup > summary { grid-template-columns: minmax(0, 1fr); padding-right: 0.75rem; }
+  .qg-side { justify-content: space-between; }
+  .qg-what { white-space: nowrap; }
+}
 
 /* Campaigns: labels and indicators are attacker text, so they wrap anywhere rather than widen a table. */
 .campaign-label { overflow-wrap: anywhere; }
@@ -513,14 +588,21 @@ tr.queue-context:hover td { background: transparent; }
 .load-more { width: 100%; max-width: 220px; }
 
 /* ============================ Actions & buttons ============================ */
-.actions { display: flex; flex-direction: column; gap: 0.4rem; min-width: 220px; }
-.actions textarea {
-  width: 100%; resize: vertical; min-height: 1.6rem; height: 1.6rem; transition: height 150ms ease;
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.6rem; }
+.actions .buttons { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+/* The note toggle: collapsed it is a quiet word beside the buttons; open it takes its own line. */
+.qnote > summary { list-style: none; cursor: pointer; color: var(--text-faint); font-size: 0.76rem; padding: 0.2rem 0.3rem; border-radius: var(--radius-sm); }
+.qnote > summary::-webkit-details-marker { display: none; }
+.qnote > summary::before { content: "+ "; }
+.qnote[open] > summary::before { content: "\2212  "; }
+.qnote > summary:hover { color: var(--text); }
+.qnote[open] { flex: 1 1 100%; }
+.qnote textarea {
+  display: block; width: 100%; resize: vertical; min-height: 3rem; margin-top: 0.3rem;
   background: var(--bg); border: 1px solid var(--border); color: var(--text);
   font-family: var(--font-sans); font-size: 0.8rem; border-radius: var(--radius-sm); padding: 0.35rem 0.5rem;
 }
-.actions textarea:focus { height: 3.5rem; border-color: var(--border-bright); outline: none; }
-.actions .buttons { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.qnote textarea:focus { border-color: var(--border-bright); outline: none; }
 button, .btn {
   font-family: var(--font-sans); font-size: 0.78rem; font-weight: 600;
   border: 1px solid var(--border); background: var(--surface-raised); color: var(--text);

@@ -118,6 +118,16 @@ becoming script execution.
   `concat!(include_str!(..))`: the head, the vendored Chart.js UMD bundle, chart
   defaults, the vendored htmx bundle, and the tail. Both JS libraries are unmodified
   upstream, **self-hosted, no CDN at runtime**.
+- **Review queue layout** - the pending tab groups by campaign without any script: a native
+  `<details>` row per campaign that has two or more listed pending members, whose member rows sit
+  in a nested table sharing the page's `<colgroup>` widths (`macros.html#queue_cols`). An address
+  in several campaigns is listed under the one with the most pending members, then the most hosts,
+  then the lowest id (`routes/queue.rs#group_home`); its other campaigns appear on its IP page.
+  Scores are numbers coloured by feed tier, "Active" is one cell (`routes/format.rs#format_active`:
+  a clock range within one UTC day, a length plus recency across days, exact timestamps in the
+  `title`), and below 640 px each entry stacks as a card (all rules in `console.css`, no inline
+  style). Group counts are rendered with the page and are not updated when a member is decided in
+  place; the approve confirmation lists the live pending set.
 - **HTMX fragment model** - several routes return partials rather than full pages:
   the dashboard and IP-detail charts, the IP-detail event timeline (keyset
   pagination), the queue-row partials after an action, and search "load more". A

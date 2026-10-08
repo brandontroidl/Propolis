@@ -370,7 +370,13 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   plus applet dispatch; an unlisted name gives `applet not found`),
   `tftp`/`ftpget` (silent; the download url is synthesized from the separate host and file
   arguments as `tftp://host[:port]/file` / `ftp://host[:port]/file`, since neither command
-  takes a url token),
+  takes a url token. `tftp` is read in its BusyBox form (`-g -r REMOTE [-l LOCAL] HOST [PORT]`,
+  any flag order) and its tftp-hpa one-shot form (`HOST [PORT] -c get REMOTE`, the server last, or
+  `get HOST:REMOTE`), with IPv6 hosts in brackets and quoted or escaped arguments; a `tftp` whose
+  server or file cannot be read, or would not make a sound url, emits `honeypot_file_download`
+  with the raw `command` and no `url`, so the fetcher is never handed a guessed target; a `tftp`
+  upload (`-p`, `put`) emits no download event and saves no file,
+  `crates/sensor-framework/src/shell/tftp.rs#parse`),
   `chmod`/`cp`/`rm`/`mkdir` (silent success), `sleep` (returns at once; GNU's errors for a
   missing or bad interval), `cd`, `exit`/`logout`; an
   unknown command uses the active shell level's diagnostic form, and so does a path that does

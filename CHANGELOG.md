@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- **Shell `tftp` downloads are read in every common form** - a telnet dropper's classic
+  `tftp HOST -c get FILE` was recorded as `tftp://HOST:get` (the `-c get` pair taken for a port, the
+  file name lost), while the BusyBox form was right. The shell now parses BusyBox
+  (`-g -r REMOTE [-l LOCAL] HOST [PORT]`, any flag order, `-gr` clusters, attached values),
+  tftp-hpa one-shot (`HOST [PORT] -c get REMOTE`, the server last, or `HOST:FILE`), IPv6 in
+  brackets or bare, and quoted or escaped arguments, into `tftp://HOST[:PORT]/FILE`. A command line
+  whose server or file cannot be read, or whose address, port or file name would not make a sound
+  URL, now emits `honeypot_file_download` with the raw `command` and no `url` instead of a guessed
+  one, so the fetcher is never handed a malformed target (it already skips url-less events). A
+  `tftp` upload (`-p`, `put`) is not a download and emits no download event; the command event
+  still records it. A host with no file no longer yields a bare `tftp://HOST`. No wire or migration
+  change.
 - **SSH bare connects, banner grabs and bad version strings are now recorded** - the SSH sensor
   emitted `honeypot_connection` only after key exchange, so a Shodan/Censys-style scanner that
   read the banner and left, a client that sent a malformed identification line, and a bare TCP

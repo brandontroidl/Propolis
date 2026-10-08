@@ -339,7 +339,8 @@ fn only_a_decode_of_typed_input_is_noted_as_an_assembly() {
     let mut sh = phone();
     sh.handle_input("echo -n 'aGk=' > /data/local/tmp/t");
     sh.handle_input("base64 -d /data/local/tmp/t > /data/local/tmp/typed");
-    sh.handle_input("echo -n aGk= | base64 -d > /data/local/tmp/piped");
+    // Different text from the file above: the same text would be found by content alone.
+    sh.handle_input("echo -n aGkh | base64 -d > /data/local/tmp/piped");
     sh.handle_input("base64 /system/build.prop | base64 -d > /data/local/tmp/system");
     assert!(sh.is_assembled("/data/local/tmp/typed"));
     assert!(sh.is_assembled("/data/local/tmp/piped"));

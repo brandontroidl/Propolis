@@ -404,6 +404,22 @@ captures SCP/SFTP transfers.
   `crates/sensor-ssh/src/main.rs#main`). Banner default is the persona OpenSSH version
   (`crates/sensor-ssh/src/main.rs#DEFAULT_BANNER`). A residual HASSHServer distinguishability from the minimal
   KEXINIT offer is a tracked follow-up (`crates/sensor-ssh/src/main.rs#DEFAULT_BANNER`).
+- **Connection event at accept.** `honeypot_connection` (`authenticated=false`) is emitted
+  once per connection at accept, before the version exchange, like every other TCP sensor
+  (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/auth.rs#AuthState::emit_connection_event`).
+  A scanner that reads the banner and leaves, a client that sends a bad version string, and a
+  bare TCP probe are therefore recorded, and the fleet probe's "socket answered" check sees a
+  line for port 22. Nothing later emits a second connection event. It was previously emitted
+  only after key exchange, so those three produced no event.
+- **Handshake end.** A connection that ends before key exchange completes (banner grab, bare
+  probe, non-SSH bytes, a stalled or truncated handshake) emits one `honeypot_session_end`
+  (telemetry, never scored) with `end_reason` (`peer_closed`, `idle_timeout`, `malformed_input`,
+  or `transport_error`), `phase` (`version_exchange` or `key_exchange`), `duration_ms`, and
+  `client_version` (sanitized, bounded) when the client's identification line arrived
+  (`crates/sensor-ssh/src/auth.rs#AuthState::handshake_end_event`). A connection that completes
+  key exchange emits none (its later endings are recorded on the capture events), and none is
+  emitted when `max_duration` cancels the handler. The sensor still proceeds into key exchange
+  after a non-`SSH-` identification line; the line is not rejected.
 - **Auth** (`auth.rs`): **accepts every credential and method** - reaching userauth
   is itself crypto proof the peer is real - except `none`, which is rejected with
   `USERAUTH_FAILURE` listing `publickey,password` to defeat the

@@ -120,6 +120,33 @@ fn authenticated_latch_stays_true() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
+fn handshake_end_event_is_unscored_telemetry_with_a_sanitized_client_version() {
+    use sensor_framework::CaptureEnd;
+    let state = AuthState::new("203.0.113.7".parse().unwrap(), None, Uuid::now_v7());
+    let evil = "SSH-2.0-x\r\n{\"v\":1,\"signal_type\":\"evil\"}";
+    let event = state.handshake_end_event(
+        CaptureEnd::MalformedInput,
+        "key_exchange",
+        Some(evil),
+        std::time::Duration::from_millis(42),
+    );
+    assert_eq!(event.signal_type, sensor_wire::SIGNAL_HONEYPOT_SESSION_END);
+    assert!(!event.authenticated);
+    assert_eq!(event.metadata["end_reason"], "malformed_input");
+    assert_eq!(event.metadata["phase"], "key_exchange");
+    assert_eq!(event.metadata["duration_ms"], 42);
+    let version = event.metadata["client_version"].as_str().unwrap();
+    assert!(!version.contains('\n') && !version.contains('\r'));
+    let none = state.handshake_end_event(
+        CaptureEnd::PeerClosed,
+        "version_exchange",
+        None,
+        std::time::Duration::ZERO,
+    );
+    assert!(none.metadata.get("client_version").is_none());
+}
+
+#[test]
 fn emit_connection_event_is_unauthenticated_ssh_connection() {
     let state = AuthState::new(
         "203.0.113.7".parse().unwrap(),

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+
+- **SSH bare connects, banner grabs and bad version strings are now recorded** - the SSH sensor
+  emitted `honeypot_connection` only after key exchange, so a Shodan/Censys-style scanner that
+  read the banner and left, a client that sent a malformed identification line, and a bare TCP
+  probe left no event (the fleet probe reported "socket answered, no line reached intake" for
+  tcp/22). The event is now emitted at accept, once per connection, like the other TCP sensors.
+  A connection that ends before key exchange completes also emits one `honeypot_session_end`
+  (telemetry, unscored) with `end_reason`, `phase`, `duration_ms` and the sanitized
+  `client_version` when received. Consequence: such connections now carry the same
+  `honeypot_connection` weight (40) as a telnet connect did already. No migration or wire change.
+
 ### Added
 
 - **Echo-loader uploads are reassembled and captured** - a Mirai/Mozi telnet loader with no

@@ -456,6 +456,9 @@ td.ip a:hover { color: var(--brand); }
 .chart-box-sm { position: relative; height: 220px; }
 .chart-box-compact { position: relative; height: 110px; margin: 0.75rem 0 0.5rem; }
 
+/* -- Dashboard Recent activity: a folded run's count -- */
+.run-count { font-family: var(--font-mono); font-weight: 600; color: var(--text); }
+
 /* -- Review queue: the context line under each pending row -- */
 tr.has-context td { border-bottom: none; padding-bottom: 0.2rem; }
 tr.queue-context td { padding-top: 0; font-size: 0.76rem; color: var(--text-muted); }

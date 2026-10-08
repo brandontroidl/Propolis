@@ -7725,3 +7725,93 @@ async fn a_flooding_queue_entry_is_described_from_a_bounded_sample(pool: PgPool)
     let c = queue_context(&body, "203.0.113.162");
     assert!(c.contains("counts from 5,000 of 5,004 events"), "{c}");
 }
+
+/// The Recent activity rows of a dashboard page: (activity, events cell, source).
+fn recent_rows(body: &str) -> Vec<(String, String, String)> {
+    let panel = &body[body.find(">Recent activity<").unwrap()..];
+    let panel = &panel[..panel.find("</table>").unwrap()];
+    panel
+        .split("<tr>")
+        .skip(2)
+        .map(|row| {
+            let cells: Vec<&str> = row.split("<td").skip(1).collect();
+            let text = |cell: &str| -> String {
+                let inner = &cell[cell.find('>').unwrap() + 1..];
+                let mut out = String::new();
+                let mut in_tag = false;
+                for ch in inner[..inner.find("</td>").unwrap()].chars() {
+                    match ch {
+                        '<' => in_tag = true,
+                        '>' => in_tag = false,
+                        c if !in_tag => out.push(c),
+                        _ => {}
+                    }
+                }
+                out.trim().to_string()
+            };
+            (text(cells[1]), text(cells[2]), text(cells[3]))
+        })
+        .collect()
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_recent_activity_folds_a_flood_into_one_row_per_run(pool: PgPool) {
+    migrate(&pool).await;
+    let sid = Uuid::now_v7();
+    let flood = |ago: i64| {
+        ev_with_session(
+            "203.0.113.170",
+            "telnet",
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            &secs_ago(ago),
+            serde_json::json!({ "command": "echo" }),
+            sid,
+        )
+    };
+    // Oldest first: five from the flooding source, one SSH login from another, then thirty more.
+    for ago in (300..305).rev() {
+        append_event(&pool, flood(ago)).await.unwrap();
+    }
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.171",
+            "ssh",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            false,
+            &secs_ago(200),
+        ),
+    )
+    .await
+    .unwrap();
+    for ago in (10..40).rev() {
+        append_event(&pool, flood(ago)).await.unwrap();
+    }
+
+    let (_, body) = get_page(test_state(pool), "/").await;
+
+    assert_eq!(
+        recent_rows(&body),
+        [
+            (
+                "Telnet command execution".to_string(),
+                "x30".to_string(),
+                "203.0.113.170".to_string()
+            ),
+            (
+                "SSH login attempt".to_string(),
+                "1".to_string(),
+                "203.0.113.171".to_string()
+            ),
+            (
+                "Telnet command execution".to_string(),
+                "x5".to_string(),
+                "203.0.113.170".to_string()
+            ),
+        ],
+        "{body}"
+    );
+}

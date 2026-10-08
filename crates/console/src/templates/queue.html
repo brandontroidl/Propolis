@@ -43,8 +43,8 @@ rest.</p>
         <details class="qgroup">
           <summary>
             <span class="qg-title">
-              <span class="qg-label campaign-label">{{ g.label }}</span>
-              <span class="qg-meta"><a href="/campaigns/{{ g.id }}">campaign {{ g.id }}</a> ({{ g.kind }}) &middot; {{ g.shown }} pending here{% if g.pending != g.shown %}, {{ g.pending }} campaign-wide{% endif %} &middot; {{ g.members }} host{% if g.members != 1 %}s{% endif %}{% if g.infected %} <span class="dim">(infected hosts)</span>{% endif %}</span>
+              <span class="qg-head"><span class="qg-count">{{ g.shown }} pending</span><span class="qg-label campaign-label">{{ g.label }}</span></span>
+              <span class="qg-meta"><a href="/campaigns/{{ g.id }}">campaign {{ g.id }}</a> ({{ g.kind }}){% if g.pending != g.shown %} &middot; {{ g.pending }} pending campaign-wide{% endif %} &middot; {{ g.members }} host{% if g.members != 1 %}s{% endif %}{% if g.infected %} <span class="dim">(infected hosts)</span>{% endif %}</span>
             </span>
             {% if g.what %}<span class="ctx-what qg-what"><span class="ctx-verb">{% if g.what.kind == "upload" %}uploaded{% elif g.what.kind == "fetch" %}fetched{% else %}ran{% endif %}</span> <code class="mono ctx-code" title="{{ g.what.full }}">{{ g.what.text }}</code></span>{% endif %}
             <span class="qg-side">

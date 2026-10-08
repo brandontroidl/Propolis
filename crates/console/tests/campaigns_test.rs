@@ -649,7 +649,10 @@ async fn pending_members_of_one_campaign_form_one_group_and_singles_stay_rows(po
             "{ip} not in group"
         );
     }
-    assert!(group.contains("3 pending here"), "{group}");
+    assert!(
+        group.contains("<span class=\"qg-count\">3 pending</span>"),
+        "{group}"
+    );
     assert!(group.contains("5 hosts"), "{group}");
     assert!(
         group.contains(&format!(

@@ -501,17 +501,21 @@ td.score { font-weight: 600; }
 .score--standard { color: var(--attention-text); }
 .score--none { color: var(--text-muted); }
 td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-muted); white-space: nowrap; }
-.queue-group > td { padding: 0; }
+/* A group is one item: a tinted block with an accent rail down its whole left edge (header and, when
+   open, the members) and a heavier rule under it, so where it ends is as plain as where it starts. */
+.queue-group > td { padding: 0; background: var(--attention-dim); border-left: 4px solid var(--brand); border-bottom: 2px solid var(--border-bright); }
 .qgroup > summary {
   display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto; gap: 0.2rem 1rem; align-items: center;
-  padding: 0.6rem 0.9rem 0.6rem 2rem; position: relative; cursor: pointer; list-style: none; background: var(--surface-raised);
+  padding: 0.65rem 0.9rem 0.65rem 2rem; position: relative; cursor: pointer; list-style: none;
 }
+.qg-head { display: flex; align-items: baseline; gap: 0.6rem; min-width: 0; }
+.qg-count { flex: none; font-size: 0.72rem; font-weight: 700; color: var(--brand-ink); background: var(--brand); border-radius: 999px; padding: 0.05rem 0.55rem; }
 .qgroup > summary::-webkit-details-marker { display: none; }
 .qgroup > summary::before { content: "\25b8"; position: absolute; left: 0.8rem; top: 0.7rem; color: var(--brand); }
 .qgroup[open] > summary::before { content: "\25be"; }
 .qgroup[open] > summary { border-bottom: 1px solid var(--border); }
 .qg-title { min-width: 0; }
-.qg-label { display: block; font-size: 0.86rem; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qg-label { display: block; min-width: 0; font-size: 0.86rem; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .qg-meta { display: block; font-size: 0.74rem; color: var(--text-muted); }
 .qg-meta a { color: var(--link); }
 .qg-what { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 0.76rem; color: var(--text-muted); }
@@ -520,7 +524,11 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .qg-top .score { font-family: var(--font-mono); font-weight: 600; }
 .qg-approve { border: 1px solid var(--good); color: var(--good-text); border-radius: var(--radius-sm); padding: 0.3rem 0.7rem; font-size: 0.78rem; font-weight: 600; }
 .qg-approve:hover { background: var(--good-dim); text-decoration: none; }
-.qmembers { border-left: 2px solid var(--border-bright); }
+/* Open members sit on a darker inset under the header and are indented, so they read as inside it. */
+.qmembers { background: rgba(0, 0, 0, 0.16); }
+@media (min-width: 641px) {
+  .qmembers td:first-child { padding-left: 1.6rem; }
+}
 /* Narrow screens: each pending entry becomes a small card (address and score on top, counts under,
    actions last) instead of a table that would have to scroll sideways. */
 @media (max-width: 640px) {

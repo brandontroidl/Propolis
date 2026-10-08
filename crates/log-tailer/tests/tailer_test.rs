@@ -637,6 +637,27 @@ fn commit_batch_through_starts_the_next_read_after_the_prefix() {
 /// A `copytruncate` that lands between the read and the accept (the append is in flight) must
 /// not make the accept skip lines: the tailer refuses, and after a rewind the next read starts
 /// at the NEW file's first line, not at the line count of the old batch.
+/// A file under the 256-byte fingerprint window changes its fingerprint with every append, so an
+/// ordinary append between the read and the accept must not read as a replacement: the prefix is
+/// accepted and nothing is replayed.
+#[test]
+fn commit_batch_through_accepts_a_small_file_that_only_grew() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "aaaaaaaaa\nbbbbbbbbb\nccccccccc\nddddddddd\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(4).len(), 4);
+    append(&log_path, "eeeeeeeee\nfffffffff\n");
+    assert!(
+        tailer.commit_batch_through(2),
+        "an append is not a rotation"
+    );
+    assert_eq!(
+        tailer.read_batch(10),
+        vec!["ccccccccc", "ddddddddd", "eeeeeeeee", "fffffffff"]
+    );
+}
+
 #[test]
 fn commit_batch_through_refuses_after_a_copytruncate_and_skips_nothing() {
     let dir = tempfile::tempdir().unwrap();

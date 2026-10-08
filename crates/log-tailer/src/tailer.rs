@@ -328,10 +328,14 @@ impl LogTailer {
         if !uncommitted.spans_valid || lines > uncommitted.spans.len() {
             return false;
         }
-        if matches!(
-            detect_rotation(&self.log_path, &self.state),
-            RotationEvent::Truncated | RotationEvent::Replaced
-        ) {
+        // The same judgement `handle_rotation` makes: a content mismatch on a file that was under
+        // the fingerprint window and has only grown is ordinary appending, not a replacement.
+        let changed = match detect_rotation(&self.log_path, &self.state) {
+            RotationEvent::Truncated => true,
+            RotationEvent::Replaced => !self.maybe_false_positive_replaced(),
+            RotationEvent::None | RotationEvent::InodeChanged => false,
+        };
+        if changed {
             return false;
         }
         let spans = uncommitted.spans[..lines].to_vec();

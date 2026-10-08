@@ -416,6 +416,22 @@
   built inside the migration transaction at startup, before intake runs: 12 to 20 s for that
   ledger held in RAM, longer on disk. Plan guards hold the read to the index on a ledger shaped
   like the incident.
+- **An append no longer costs more the longer its source has been seen** - every scored append
+  counted the source's distinct WAN vantages and distinct sensors by reading every earlier event
+  of that source (a `GROUP BY wan_ip` and a `COUNT(DISTINCT sensor)`), inside the global append
+  lock. On a 7.5M-row ledger that was 0.73 s per event for a source with 100k events, 3.5 s at
+  200k, 7.1 s at 800k and 9.4 s at 1.5M, and a long-running bot loop on one address set the pace
+  for every sensor: three fresh sources appending beside a 1.5M-event one managed about one
+  event a second between them. Migration `0014` adds two projection tables, `ip_vantage
+  (source_ip, wan_ip, saw_authenticated_tcp)` and `ip_sensor (source_ip, sensor)`, which the
+  append folds each scored event into under the same lock and reads by primary key; telemetry
+  never writes them. The same appends now take 2.8 to 3.3 ms whatever the history, against 3.1
+  ms for a source never seen, and the four mixed sources together reach 358 events a second.
+  The migration backfills both tables from the ledger at startup, before intake runs: 23 to 26 s
+  for that ledger held in RAM, longer on disk. `rebuild_projection` still counts from the ledger
+  rows, so a replay checks the tables; a property test compares the tables with the old
+  aggregates after every append of random multi-source sequences with telemetry and
+  out-of-order events.
 - **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
   0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
   echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks

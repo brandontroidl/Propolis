@@ -1,12 +1,13 @@
 //! Interaction telemetry must be recorded and must never move a score - neither the score of the
-//! event that carries it, nor the score of a LATER real event that reads the ledger for its
-//! breadth inputs.
+//! event that carries it, nor the score of a LATER real event whose breadth inputs count the
+//! source's WAN vantages and sensors.
 //!
-//! The second half is the part a weight cannot buy: the append path derives distinct-sensor and
-//! per-WAN vantage counts from every row it finds for a source, and `rebuild_projection` mirrors
-//! those derivations. A telemetry row that merely projected as zero would still have been
-//! counted there, so these tests compare a scored sequence WITH telemetry interleaved against
-//! the identical sequence without it, through both the incremental path and a rebuild.
+//! The second half is the part a weight cannot buy: the append path counts distinct sensors and
+//! per-WAN vantages from the source's `ip_vantage` / `ip_sensor` sets, and `rebuild_projection`
+//! derives the same counts from every ledger row it loads for the source. A telemetry row that
+//! merely projected as zero would still have been counted there, so these tests compare a scored
+//! sequence WITH telemetry interleaved against the identical sequence without it, through both
+//! the incremental path and a rebuild.
 
 use core_scoring::domain::enums::{Protocol, SignalType};
 use core_scoring::domain::types::EventInput;
@@ -256,8 +257,9 @@ async fn each_append_path_refuses_the_other_kind(pool: PgPool) -> Result<(), Rep
     Ok(())
 }
 
-/// Every telemetry signal must be named by the SQL exclusion the aggregates use. Adding a
-/// telemetry variant without extending that predicate would silently let it back into breadth.
+/// Every telemetry signal must be named by the SQL exclusion that `rebuild_projection` and the
+/// breadth-set backfill use. Adding a telemetry variant without extending that predicate would
+/// silently let it back into breadth.
 #[sqlx::test(migrations = "./migrations")]
 async fn the_exclusion_predicate_names_every_telemetry_signal(
     pool: PgPool,

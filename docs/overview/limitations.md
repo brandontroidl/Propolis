@@ -61,25 +61,20 @@ shipped systemd timer or cron**. Without operator configuration, the feed is bui
 locally but not pushed anywhere. See
 [`../operations/routine-procedures.md`](../operations/routine-procedures.md).
 
-## Intake append cost grows with a source's history
+## Intake appends one event per transaction
 
-Open item, partly fixed. Intake appends one event per transaction under a single lock that keeps
-the hash chain in order, so the slowest append sets the pace for every sensor
-(`crates/core-scoring/src/repository/events.rs#append_event`). Migration `0013` removed the cost
-that grew with intake lag (the dedup read; see [intake backlog](../troubleshooting/intake-backlog.md)).
-Two remain:
+Open item. Intake appends one event per transaction under a single lock that keeps the hash
+chain in order, so the per-event cost sets the pace for every sensor
+(`crates/core-scoring/src/repository/events.rs#append_event`). That cost no longer grows with
+intake lag (migration `0013`, the dedup read; see [intake backlog](../troubleshooting/intake-backlog.md))
+or with a source's history (migration `0014`, the breadth sets; see
+[database reference](../reference/database.md#breadth-sets)): on a 7.5M-row test ledger held in
+RAM an append took about 3 ms for a source with 1.5M earlier events, the same as for a source
+never seen. What remains is each append's own round trips and commit, which caps the node at a
+few hundred events a second, lower where each commit waits on a disk flush `[inferred]`. Appending a batch of
+lines in one transaction, still one event at a time in order, is the next change `[planned]`.
 
-- **Per-event history reads.** Each scored append reads every earlier event of its source to
-  count distinct WAN vantages and sensors. That is linear in the source's history: on a 7.5M-row
-  test ledger an append for a source with 100k events took about 0.7 s, and for one with 1.5M
-  events about 7 s. A long-running bot loop on one address therefore still caps intake for its
-  sensor, and through the lock slows the others. Keeping those per-source sets in the projection,
-  so each append reads a handful of rows, is the next change `[planned]`.
-- **One transaction and one lock acquisition per event.** Each append pays its own round trips
-  and commit. Appending a batch of lines in one transaction, still one event at a time in order,
-  is planned after the history reads `[planned]`.
-
-The `intake-lagging` alert and the fleet pane's behind badge make the resulting backlog visible;
+The `intake-lagging` alert and the fleet pane's behind badge make a backlog visible;
 they do not remove it. While intake is behind, a `copytruncate` rotation of the log drops the
 unread part from ingest (it stays in the rotated copy), and the lag readings fall back with it.
 

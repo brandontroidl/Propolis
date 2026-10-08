@@ -7,6 +7,8 @@
 //! stored raw score to now without ever writing the projected value back - the
 //! double-decay guard depends on the stored value staying un-projected.
 
+#[cfg(test)]
+mod breadth_sets_tests;
 pub mod coverage;
 pub mod events;
 pub mod replay;

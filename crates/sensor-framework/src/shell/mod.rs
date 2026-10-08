@@ -58,16 +58,19 @@ mod android;
 mod androidsys;
 mod arith;
 mod ast;
+mod awk;
 mod base64;
 mod binview;
 mod builtins;
 mod busybox;
+mod cfmt;
 mod dd;
 mod envtools;
 mod eval;
 mod expand;
 mod fileinfo;
 mod fsops;
+mod grep;
 mod hashing;
 mod hostinfo;
 mod lex;
@@ -83,9 +86,11 @@ mod printf;
 mod procs;
 mod read;
 mod readlink;
+mod regex;
 mod registry;
 mod sysres;
 mod test_builtin;
+mod textproc;
 mod texttools;
 mod trace;
 
@@ -3185,5 +3190,7 @@ mod sysres_tests;
 mod test_builtin_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod textproc_tests;
 #[cfg(test)]
 mod texttools_tests;

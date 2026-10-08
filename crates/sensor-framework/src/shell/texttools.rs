@@ -1,5 +1,5 @@
-//! `wc`, `grep -F` and `od`: the tools a recorded chain inspects a file it just wrote with
-//! (`wc -c .fxcat` is `1 .fxcat`, `od -An -tx1 .fxcat` is ` 0a`, pty README finding 7).
+//! `wc` and `od`: the tools a recorded chain inspects a file it just wrote with (`wc -c .fxcat` is
+//! `1 .fxcat`, `od -An -tx1 .fxcat` is ` 0a`, pty README finding 7). `grep` lives in `grep.rs`.
 //!
 //! Each reads the modeled bytes of its operands (or standard input) through the same bounded
 //! reader as `cat`, so the figures come from the file the session holds and cannot drift from it.
@@ -21,7 +21,6 @@ use crate::fakefs::{FileKind, FsError};
 pub(super) fn register(r: &mut Registry) {
     // The phone's toolbox has no recorded answer for these, and it answers "not found" today.
     r.register_if("wc", ubuntu, HandlerId::Wc, FakeShell::cmd_wc);
-    r.register_if("grep", ubuntu, HandlerId::Grep, FakeShell::cmd_grep);
     r.register_if("od", ubuntu, HandlerId::Od, FakeShell::cmd_od);
 }
 
@@ -304,211 +303,6 @@ impl FakeShell {
     }
 }
 
-// -------------------------------------------------------------------------------------- grep
-
-const GREP_USAGE: &str =
-    "Usage: grep [OPTION]... PATTERNS [FILE]...\nTry 'grep --help' for more information.\n";
-
-struct GrepPlan<'a> {
-    fixed: bool,
-    count: bool,
-    invert: bool,
-    fold: bool,
-    pattern: Option<&'a str>,
-    files: Vec<&'a str>,
-}
-
-/// The command line of a `grep`, or `None` for any option outside `-F -c -v -i`.
-fn parse_grep<'a>(args: &[&'a str]) -> Option<GrepPlan<'a>> {
-    let mut plan = GrepPlan {
-        fixed: false,
-        count: false,
-        invert: false,
-        fold: false,
-        pattern: None,
-        files: Vec::new(),
-    };
-    let mut options = true;
-    for &arg in args {
-        if !options || arg == "-" || !arg.starts_with('-') {
-            if plan.pattern.is_none() {
-                plan.pattern = Some(arg);
-            } else {
-                plan.files.push(arg);
-            }
-        } else if arg == "--" {
-            options = false;
-        } else if let Some(long) = arg.strip_prefix("--") {
-            match long {
-                "fixed-strings" => plan.fixed = true,
-                "count" => plan.count = true,
-                "invert-match" => plan.invert = true,
-                "ignore-case" => plan.fold = true,
-                _ => return None,
-            }
-        } else {
-            for flag in arg.get(1..).unwrap_or("").chars() {
-                match flag {
-                    'F' => plan.fixed = true,
-                    'c' => plan.count = true,
-                    'v' => plan.invert = true,
-                    'i' => plan.fold = true,
-                    _ => return None,
-                }
-            }
-        }
-    }
-    Some(plan)
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    needle.is_empty()
-        || haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
-}
-
-/// What one input yielded: how many lines were selected and the text to print for them.
-struct Selection {
-    selected: u64,
-    text: Vec<u8>,
-    /// The input holds a NUL and a line was selected, so it is reported instead of printed.
-    binary_hit: bool,
-}
-
-/// The lines of `data` that match any of `patterns` (or, inverted, none of them).
-fn select_lines(data: &[u8], patterns: &[Vec<u8>], plan: &GrepPlan<'_>, prefix: &str) -> Selection {
-    let mut selection = Selection {
-        selected: 0,
-        text: Vec::new(),
-        binary_hit: false,
-    };
-    if data.is_empty() {
-        return selection;
-    }
-    let binary = data.contains(&0);
-    let body = data.strip_suffix(b"\n").unwrap_or(data);
-    for line in body.split(|byte| *byte == b'\n') {
-        let hit = if plan.fold {
-            let folded = line.to_ascii_lowercase();
-            patterns.iter().any(|pattern| contains(&folded, pattern))
-        } else {
-            patterns.iter().any(|pattern| contains(line, pattern))
-        };
-        if hit == plan.invert {
-            continue;
-        }
-        selection.selected = selection.selected.saturating_add(1);
-        if plan.count {
-            continue;
-        }
-        if binary {
-            selection.binary_hit = true;
-            break;
-        }
-        selection.text.extend_from_slice(prefix.as_bytes());
-        selection.text.extend_from_slice(line);
-        selection.text.push(b'\n');
-    }
-    selection
-}
-
-impl FakeShell {
-    /// `grep -F` (with `-c`, `-v`, `-i`) over standard input or files: the lines containing the
-    /// literal pattern, status 0 if one was selected, 1 if none, 2 on an error. No regular
-    /// expression engine exists here, so a pattern searched without `-F`, or any other option, is
-    /// not modeled: it prints nothing and succeeds.
-    pub(super) fn cmd_grep(&mut self, parts: &[&str]) -> CommandResult {
-        let Some(plan) = parse_grep(parts.get(1..).unwrap_or(&[])) else {
-            return CommandResult::silent(0);
-        };
-        let Some(pattern) = plan.pattern else {
-            return CommandResult::stderr(2, GREP_USAGE);
-        };
-        if !plan.fixed {
-            return CommandResult::silent(0);
-        }
-        let folded;
-        let pattern = if plan.fold {
-            folded = pattern.to_ascii_lowercase();
-            folded.as_str()
-        } else {
-            pattern
-        };
-        // Each line of the pattern text is one pattern.
-        let patterns: Vec<Vec<u8>> = pattern
-            .split('\n')
-            .map(|line| line.as_bytes().to_vec())
-            .collect();
-        let busybox = self.busybox_depth > 0;
-        let names: Vec<Option<&str>> = if plan.files.is_empty() {
-            vec![None]
-        } else {
-            plan.files.iter().copied().map(Some).collect()
-        };
-        let labelled = names.len() > 1;
-        let cap = self.read_cap();
-        let mut acc = CommandResult::silent(0);
-        let mut errored = false;
-        let mut any = false;
-        for name in names {
-            let label = match name {
-                None | Some("-") => "(standard input)",
-                Some(path) => path,
-            };
-            let bytes = match self.read_source(parts, name, cap) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    errored = true;
-                    acc.append(CommandResult::stderr(
-                        2,
-                        format!("grep: {label}: {}\n", errno_text(&error)),
-                    ));
-                    continue;
-                }
-            };
-            if !self.charge_work(len_u64(bytes.len())) {
-                return stopped();
-            }
-            let prefix = if labelled && !plan.count {
-                format!("{label}:")
-            } else {
-                String::new()
-            };
-            let picked = select_lines(&bytes, &patterns, &plan, &prefix);
-            any |= picked.selected > 0;
-            if plan.count {
-                let head = if labelled {
-                    format!("{label}:")
-                } else {
-                    String::new()
-                };
-                acc.append(CommandResult::stdout(format!(
-                    "{head}{}\n",
-                    picked.selected
-                )));
-            } else if picked.binary_hit {
-                // [unverified] both wordings: GNU 3.7 reports on standard error, the BusyBox
-                // applet on standard output; neither was captured.
-                if busybox {
-                    acc.append(CommandResult::stdout(format!(
-                        "Binary file {label} matches\n"
-                    )));
-                } else {
-                    acc.append(CommandResult::stderr(
-                        0,
-                        format!("grep: {label}: binary file matches\n"),
-                    ));
-                }
-            } else {
-                acc.append(CommandResult::stdout(picked.text));
-            }
-        }
-        acc.status = if errored { 2 } else { u8::from(!any) };
-        acc
-    }
-}
-
 // ---------------------------------------------------------------------------------------- od
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -525,6 +319,26 @@ enum Format {
     Hex1,
     /// The default and `-o`: each two-byte little-endian word as six octal digits.
     Octal2,
+    /// `-c` and `-t c`: each byte as a character, a C escape or three octal digits.
+    Char,
+}
+
+/// One byte as `od -c` shows it, right-aligned in four columns (recorded: `od -c /bin/true` on
+/// Ubuntu 22.04 opens ` 177   E   L   F 002 001 001  \0`).
+fn od_char(byte: u8) -> String {
+    let cell = match byte {
+        0 => "\\0".to_string(),
+        0x07 => "\\a".to_string(),
+        0x08 => "\\b".to_string(),
+        0x0c => "\\f".to_string(),
+        b'\n' => "\\n".to_string(),
+        b'\r' => "\\r".to_string(),
+        b'\t' => "\\t".to_string(),
+        0x0b => "\\v".to_string(),
+        0x20..=0x7e => char::from(byte).to_string(),
+        other => format!("{other:03o}"),
+    };
+    format!("{cell:>4}")
 }
 
 struct OdPlan<'a> {
@@ -593,10 +407,15 @@ fn parse_od<'a>(args: &[&'a str]) -> Option<OdPlan<'a>> {
                     plan.format = match od_value(cluster, at, args, &mut i)? {
                         "x1" => Format::Hex1,
                         "o2" => Format::Octal2,
+                        "c" => Format::Char,
                         _ => return None,
                     };
                     formats = formats.saturating_add(1);
                     break;
+                }
+                'c' => {
+                    plan.format = Format::Char;
+                    formats = formats.saturating_add(1);
                 }
                 'o' => {
                     plan.format = Format::Octal2;
@@ -652,6 +471,11 @@ fn od_render(data: &[u8], plan: &OdPlan<'_>) -> String {
                     let high = pair.get(1).copied().unwrap_or(0);
                     let word = u16::from_le_bytes([low, high]);
                     out.push_str(&format!(" {word:06o}"));
+                }
+            }
+            Format::Char => {
+                for &byte in chunk {
+                    out.push_str(&od_char(byte));
                 }
             }
         }

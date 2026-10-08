@@ -104,6 +104,10 @@ pub enum HandlerId {
     Wc,
     Grep,
     Od,
+    /// `cut`, `tee` and `awk`: the field, copy and scripting tools a survey pipes through.
+    Cut,
+    Tee,
+    Awk,
     /// `xxd` and `strings`: the hex dumper and the printable-run extractor over modeled bytes.
     Xxd,
     Strings,

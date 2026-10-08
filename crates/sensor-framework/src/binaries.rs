@@ -13,10 +13,14 @@
 //! first 64 bytes. `tests/fixtures/ubuntu-2204-elf-headers.tsv` holds the same rows and the golden
 //! test compares the two, so editing either alone fails.
 //!
+//! Rows after `su` were recorded on 2026-10-07 from a systemd-booted Ubuntu 22.04 reference with the
+//! same method (`stat`, `head -c 64 | od`), for the commands the survey work models. `awk` is the
+//! Debian alternatives chain `/usr/bin/awk -> /etc/alternatives/awk -> /usr/bin/mawk`, recorded link
+//! by link the same day.
+//!
 //! Left out on purpose: two of the three scripts (`gunzip`, `service`), whose first bytes are text
-//! and would need their real bodies, and `awk`, whose path is a symlink chain the recording did not
-//! capture link by link. The third, `which`, is the one script the box models ([`WHICH_SCRIPT`]),
-//! because the lookup commands must be able to find it.
+//! and would need their real bodies. The third, `which`, is the one script the box models
+//! ([`WHICH_SCRIPT`]), because the lookup commands must be able to find it.
 
 use crate::fakefs::{Blob, ELF_HEADER_LEN, ElfImage};
 
@@ -158,15 +162,28 @@ pub struct Alias {
     pub name: &'static str,
     /// Where the link lives.
     pub path: &'static str,
-    /// The link target, relative to the link's directory, as on the reference system.
+    /// The binary the name runs, by its table name. Without `via` it is also the link's text,
+    /// relative to the link's directory, as on the reference system.
     pub target: &'static str,
+    /// A Debian alternatives link between the two: the name's link reads this path, and this path
+    /// links to the target's physical path.
+    pub via: Option<&'static str>,
 }
 
-pub const ALIASES: [Alias; 1] = [Alias {
-    name: "sh",
-    path: "/usr/bin/sh",
-    target: "dash",
-}];
+pub const ALIASES: [Alias; 2] = [
+    Alias {
+        name: "sh",
+        path: "/usr/bin/sh",
+        target: "dash",
+        via: None,
+    },
+    Alias {
+        name: "awk",
+        path: "/usr/bin/awk",
+        target: "mawk",
+        via: Some("/etc/alternatives/awk"),
+    },
+];
 
 const fn nibble(digit: u8) -> u8 {
     match digit {
@@ -808,6 +825,22 @@ pub const BINARIES: &[BinaryImage] = &[
         55_680,
         0o4755,
         "7f454c4602010100000000000000000003003e0001000000203f0000000000004000000000000000c0d100000000000000000000400038000d0040001f001e00",
+        None,
+    ),
+    BinaryImage::new(
+        "tee",
+        "/usr/bin/tee",
+        35_336,
+        0o755,
+        "7f454c4602010100000000000000000003003e0001000000902f0000000000004000000000000000488200000000000000000000400038000d0040001f001e00",
+        None,
+    ),
+    BinaryImage::new(
+        "mawk",
+        "/usr/bin/mawk",
+        158_504,
+        0o755,
+        "7f454c4602010100000000000000000003003e000100000010620000000000004000000000000000a86302000000000000000000400038000d0040001e001d00",
         None,
     ),
 ];

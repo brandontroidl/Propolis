@@ -1004,7 +1004,7 @@ fn the_enumerate_and_clear_sequence_finds_nothing_to_kill() {
     let mut sh = shell();
     assert_eq!(
         answer(&mut sh, "ps w | grep -E 'miner|bot'"),
-        ("".into(), "".into(), 0)
+        ("".into(), "".into(), 1)
     );
     assert_eq!(
         answer(&mut sh, "ps aux | grep -v grep | grep -F miner").2,

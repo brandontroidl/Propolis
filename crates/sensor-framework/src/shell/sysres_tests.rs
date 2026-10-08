@@ -881,8 +881,9 @@ fn du_of_a_modeled_directory_is_a_bounded_number() {
     let (size, name) = text.trim_end().split_once('\t').unwrap();
     assert_eq!(name, "/etc");
     let kib: u64 = size.parse().unwrap();
-    // Six small files at a block each and a link, under the directory's own block.
-    assert_eq!(kib, 28);
+    // Six small files at a block each, a link, and the alternatives directory (a block, its one
+    // entry a link), under the directory's own block.
+    assert_eq!(kib, 32);
     assert_eq!(out(&mut sh, "du -s /etc"), text, "repeatable");
     // The sum is of what `ls` shows: the directory's block plus each listed name measured alone.
     let listed = out(&mut sh, "ls /etc");

@@ -804,9 +804,11 @@ impl FakeFs {
         // brand-new box as not even having a /root or /tmp at all.
         b.dir("/tmp", &[]);
         b.dir("/root", &[]);
+        b.dir("/etc/alternatives", &["awk"]);
         b.dir(
             "/etc",
             &[
+                "alternatives",
                 "group",
                 "hostname",
                 "mtab",
@@ -914,7 +916,13 @@ impl FakeFs {
             b.image(binary);
         }
         for alias in binaries::ALIASES {
-            b.symlink(alias.path, alias.target);
+            match (alias.via, binaries::find(alias.target)) {
+                (Some(via), Some(target)) => {
+                    b.symlink(alias.path, via);
+                    b.symlink(via, target.path);
+                }
+                _ => b.symlink(alias.path, alias.target),
+            }
         }
         b.binary(binaries::WHICH_PATH, binaries::WHICH_SCRIPT);
         // The usrmerge layout: the top-level names are symlinks into /usr, with relative targets
@@ -2436,7 +2444,7 @@ mod tests {
 /dev/mqueue:
 /dev/pts: 0 ptmx
 /dev/shm:
-/etc: group hostname hosts mtab os-release passwd resolv.conf
+/etc: alternatives group hostname hosts mtab os-release passwd resolv.conf
 /home: ubuntu
 /mnt:
 /root:

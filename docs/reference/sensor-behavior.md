@@ -263,9 +263,18 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `conv=notrunc`, `status`; the bytes are read once at offset `skip*bs` for `bs*count`, bounded by what the line has left, then the record
   lines on stderr, plus GNU's summary whose elapsed time is synthesized, `crates/sensor-framework/src/shell/dd.rs#FakeShell::cmd_dd`),
   `wc` (`-c -l -w -m` over a file or a pipe, GNU column widths and `total` row,
-  `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_wc`), `od` (`-An -tx1`, the default octal words and `-A`
-  radixes; other formats print nothing, `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_od`) and `grep` (only `-F` with `-c`, `-v`, `-i`;
-  a search without `-F` prints nothing, `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_grep`),
+  `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_wc`), `od` (`-An -tx1`, `-c`, the default octal words and `-A`
+  radixes; other formats print nothing, `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_od`), `grep` (GNU grep 3.7:
+  basic, `-E`, `-F` and an approximated `-P` syntax through a linear-time POSIX matcher, with `-i -v -c -n -o -q -s -w -x -l -L
+  -h -H -m -e -f -A -B -C -r -Z -a`, GNU's compile-error wordings and status 0/1/2,
+  `crates/sensor-framework/src/shell/grep.rs#FakeShell::cmd_grep`, `crates/sensor-framework/src/shell/regex.rs#Regex`),
+  `cut` (`-b -c -f -d -s --complement --output-delimiter`, `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_cut`),
+  `tee` (`-a`; its files are written like a redirection, so a body it saves from the session input is captured,
+  `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_tee`), `awk`/`mawk` (an interpreter for mawk 1.3.4's
+  language: patterns, `BEGIN`/`END`, fields, arrays, user functions, the string and math built-ins, `printf` through
+  glibc-compatible conversions, `getline` and output redirection; `system()`, `cmd | getline` and `print | cmd` run their text
+  through this shell's own evaluator; mawk's number output, usage text and error wordings,
+  `crates/sensor-framework/src/shell/awk.rs#FakeShell::cmd_awk`, `crates/sensor-framework/src/shell/cfmt.rs`),
   `ls` (sorted, dotfiles hidden without `-a`, which does not add `.` and `..`; a file operand lists
   itself, files before directories, a `DIR:` heading once there are several operands, a missing
   one is `cannot access` with status 2; `-l` is GNU's long listing from the node facts `stat` prints,

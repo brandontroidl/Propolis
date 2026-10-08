@@ -386,6 +386,18 @@
 
 ### Fixed
 
+- **A host survey gets the answers an Ubuntu 22.04 server gives (T9)** - a fingerprinting
+  script run twice against the fleet on 2026-10-07 (45 commands: `nproc`, `/proc/cpuinfo`,
+  `top -bn1 | grep '^%Cpu'`, `free | grep -i '^Mem:' | awk ...`, `cut`, `ip addr`, `which apt`,
+  `time dd ...`) got empty or `command not found` answers no real host gives. Every new format
+  below was recorded the same day from a systemd-booted `ubuntu:22.04` reference (grep 3.7,
+  coreutils 8.32, mawk 1.3.4 20200120); a format that could not be recorded is marked
+  `[unverified]` where it is written. `grep` matches basic, extended and fixed patterns (it
+  printed nothing for anything but `-F`) through a new linear-time POSIX matcher
+  (`shell/regex.rs`) with GNU's options, context lines and compile errors; `cut`, `tee` and
+  `awk`/`mawk` (an interpreter for the language, whose `system()` and command pipes run through
+  the fake shell itself) are new; `od -c` is modeled. `tee` and `mawk` join the recorded binary
+  table, and `/usr/bin/awk` is the alternatives link to `mawk` as on the reference.
 - **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
   0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
   echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks

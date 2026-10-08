@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Input handling
@@ -111,7 +111,9 @@ Attacker input cannot drive unbounded resource use:
   counter rather than blocking or growing unbounded. See
   [../architecture/concurrency-and-failure.md](../architecture/concurrency-and-failure.md).
 - **Console read pages are bounded:** event/IP listings paginate (search page size 50; the
-  attacker IP list caps at 500 rows). See [../reference/console-routes.md](../reference/console-routes.md).
+  attacker IP list pages 500 rows at a time by keyset, and its counts stop at 100,000 rows;
+  each review-queue context line reads at most 5,000 of its address's events; the dashboard's
+  Recent activity reads the newest 1,000 events). See [../reference/console-routes.md](../reference/console-routes.md).
 - **The opt-in reverse-DNS cache is capacity-bounded:** at most 4096 distinct IPs
   (`crates/console/src/rdns.rs`'s `CACHE_CAPACITY`), with expired entries swept and the oldest
   surviving entry evicted on every insert once full - an operator (or a compromised session)

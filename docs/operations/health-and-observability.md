@@ -135,8 +135,14 @@ Paths are owned by [filesystem paths](../reference/filesystem-paths.md).
 
 The console has a session-gated live log viewer at `/logs`, backed by an in-memory ring of the
 **1000** most recent tracing events (`crates/propolis/src/main.rs#LOG_BUFFER_CAPACITY`,
-`crates/console/src/log_buffer.rs#LogBuffer`). It is a convenience tail, not a durable log store; the journal and the
-NDJSON files are authoritative.
+`crates/console/src/log_buffer.rs#LogBuffer`), fewer when they are large: the ring is also held
+to 2 MiB charged from the entries' allocated size
+(`crates/console/src/log_buffer.rs#RING_BYTE_BUDGET`). Each entry keeps its structured fields,
+capped at 512 bytes a value, 32 fields and a 2 KiB message
+(`crates/console/src/log_buffer.rs#MAX_FIELD_VALUE_BYTES`,
+`crates/console/src/log_buffer.rs#MAX_FIELDS`, `crates/console/src/log_buffer.rs#MAX_MESSAGE_BYTES`).
+It is a convenience tail, not a durable log store; the journal and the NDJSON files are
+authoritative.
 
 For a live view of the NDJSON files themselves, every event as the sensor wrote it plus a
 10-second heartbeat naming each configured log as `following`, `missing` or `unreadable`, run

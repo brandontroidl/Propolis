@@ -4,6 +4,32 @@
 
 ### Added
 
+- **Console log view keeps fields and folds repeats** - the `/logs` ring now keeps each event's
+  structured fields (`statement`, `elapsed`, `reason`, `sensor`, ...), so "slow statement" and
+  "submission held" say what was slow and why it was held. Values are capped at 512 bytes, 32
+  fields and a 2 KiB message, and the ring is held to 2 MiB charged from allocated capacity as
+  well as to its 1000 entries. The view shows fields inline and expands to all of them, folds
+  adjacent identical INFO entries from one target into one row with a count and the values each
+  field took, and opens filtered to warnings and errors with a count of the rows it hides; the
+  live stream folds by the same rule.
+- **Attackers pages through every scored address** - `/ips` stopped silently at 500 rows. It now
+  pages 500 at a time with a keyset cursor (`?after=` / `?before=`, the address the page
+  continues from) and says "showing 501-1,000 of N", exact to 100,000 rows and a labelled
+  estimate past that. The score sort orders by a key equal in order to the live score but
+  constant over time, so rows clamped at 100 do not trade places between pages. A note above
+  the table states the tier rule and why tier and live score can disagree.
+- **Review rows say what the address did** - each pending row has a context line: the sensors
+  it reached, its session count, its three most frequent signals, and its first upload or
+  download, else its first command after the Mirai shell-entry preamble. Counts come from at
+  most 5,000 of the address's events and say so when that is not all of them.
+- **Recent activity folds a flooding source** - the dashboard reads the newest 1,000 events and
+  folds consecutive events with one source, sensor and signal into one row with a count,
+  keeping the newest 20 runs, so one source can no longer fill the panel.
+- **IP page folds retries and echo-loader chunks** - consecutive sessions from one sensor that
+  ran the same commands fold into one card with a count and the usernames tried, and a run of
+  echo-loader chunk writes to one file (`assembled_file` / `chunk_index`) is one row,
+  "N echo chunks to FILE", with the lines behind an expander.
+
 - **Intake lag is visible and pages** - each intake poll records how many bytes of its log are
   unread (`LogTailer::backlog_bytes`: the file past the read offset plus any rotated-out file
   still being drained) and the `observed_at` of the last event it appended. `/metrics` publishes
@@ -400,6 +426,10 @@
 
 ### Fixed
 
+- **Console labels** - protocols read `TCP` / `UDP` instead of the enum names `Tcp` / `Udp`; the
+  feed status tab's build and valid-until times use the console's `YYYY-MM-DD HH:MM UTC` form
+  instead of raw RFC 3339; credential-sensor listeners read as their service (`VNC`, `MySQL`,
+  ...) instead of `Cred-vnc`; IP-page sessions ending in the same minute keep their real order.
 - **An intake that fell behind no longer slowed down because it was behind** - the dedup read
   every scored append makes inside the global append lock (the newest prior observation of one
   source and signal) had no index of its own, so the planner walked `event_observed_at_idx` down

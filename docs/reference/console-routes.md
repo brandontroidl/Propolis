@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Console routes and APIs
@@ -62,9 +62,9 @@ login rate limiting) are owned by [authentication and authorization](../security
 
 | Method | Path | Handler | Notes | Source |
 |---|---|---|---|---|
-| GET | `/` | `dashboard` | 6 stat cards, 2 Chart.js charts | `crates/console/src/routes/dashboard.rs#dashboard` |
+| GET | `/` | `dashboard` | 6 stat cards, 2 Chart.js charts; Recent activity reads the newest 1,000 events and folds runs from one source, sensor and signal into 20 rows | `crates/console/src/routes/dashboard.rs#dashboard`, `crates/console/src/routes/dashboard.rs#fold_recent` |
 | GET | `/dashboard/chart` | `dashboard_chart_fragment` | HTMX; `?range=1h\|24h\|7d\|30d`, malformed -> `24h` | `crates/console/src/routes/dashboard.rs#dashboard_chart_fragment` |
-| GET | `/queue` | `queue_page` | review queue | `crates/console/src/routes/queue.rs#queue_page` |
+| GET | `/queue` | `queue_page` | review queue; each pending row carries a context line built from at most 5,000 of its events | `crates/console/src/routes/queue.rs#queue_page`, `crates/console/src/routes/queue.rs#row_context` |
 | POST | `/queue/{ip}/approve` | `approve` | CSRF required | `crates/console/src/routes/queue.rs#approve` |
 | POST | `/queue/{ip}/reject` | `reject` | CSRF required | `crates/console/src/routes/queue.rs#reject` |
 | POST | `/queue/{ip}/snooze` | `snooze` | CSRF required | `crates/console/src/routes/queue.rs#snooze` |
@@ -72,7 +72,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 | POST | `/ip/{ip}/delist` | `delist` | CSRF required | `routes/queue.rs` |
 | POST | `/ip/{ip}/relist` | `relist` | CSRF required | `routes/queue.rs` |
 | POST | `/ip/{ip}/delete` | `delete_ip` | CSRF required | `routes/queue.rs` |
-| GET | `/ip/{ip}` | `detail` | drawer mode via `?drawer=1` + `HX-Request`; missing IP -> `404` | `crates/console/src/routes/detail.rs#detail` |
+| GET | `/ip/{ip}` | `detail` | drawer mode via `?drawer=1` + `HX-Request`; missing IP -> `404`; identical consecutive sessions and echo-loader chunk runs fold | `crates/console/src/routes/detail.rs#detail`, `crates/console/src/routes/detail.rs#fold_repeated_sessions`, `crates/console/src/routes/detail.rs#timeline_items` |
 | GET | `/ip/{ip}/events` | `events_fragment` | HTMX keyset pagination | `crates/console/src/routes/detail.rs#events_fragment` |
 | GET | `/ip/{ip}/chart` | `chart_fragment` | HTMX | `crates/console/src/routes/detail.rs#chart_fragment` |
 | GET | `/feed` | `feed_page` | `?tab=status\|entries` | `crates/console/src/routes/feed.rs#feed_page` |
@@ -86,8 +86,8 @@ login rate limiting) are owned by [authentication and authorization](../security
 | POST | `/integrity/verify` | `run_verify` | CSRF (403); one verification at a time (409 while one runs) | `routes/integrity.rs` |
 | GET | `/samples` | `samples_page` | | `crates/console/src/routes/samples.rs#samples_page` |
 | GET | `/samples/download/{sha256}` | `download_sample` | hardened download; sets a per-route CSP | `crates/console/src/routes/samples.rs#download_sample`, `crates/console/src/routes/samples.rs#serve_sample` |
-| GET | `/logs` | `logs_page` | in-memory ring-buffer snapshot | `crates/console/src/routes/logs.rs#logs_page` |
-| GET | `/logs/stream` | `logs_stream` | SSE (`text/event-stream`) | `crates/console/src/routes/logs.rs#logs_stream` |
+| GET | `/logs` | `logs_page` | in-memory ring-buffer snapshot with each entry's structured fields; adjacent identical INFO entries folded with a count; opens filtered to WARN and above | `crates/console/src/routes/logs.rs#logs_page`, `crates/console/src/routes/logs.rs#fold_entries` |
+| GET | `/logs/stream` | `logs_stream` | SSE (`text/event-stream`); each event is one `LogEntry` as JSON, `fields` included | `crates/console/src/routes/logs.rs#logs_stream`, `crates/console/src/log_buffer.rs#LogEntry` |
 
 ## CSRF model
 

@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Console architecture
@@ -125,7 +125,10 @@ becoming script execution.
   full page otherwise. IP detail additionally renders into a `drawer_shell.html`
   layout when `?drawer=1` and `HX-Request` are both present (the **evidence drawer**).
 - **Logs** stream over Server-Sent Events (`/logs/stream`, `text/event-stream`) from
-  an in-memory ring buffer; a lagged receiver is skipped, not fatal.
+  an in-memory ring buffer held to an entry count and a byte budget; a lagged receiver is
+  skipped, not fatal. Entries carry their structured fields; the page folds adjacent
+  identical INFO entries server-side for the first render (`routes/logs.rs#fold_entries`)
+  and `assets/logs.js` folds live lines by the same rule.
 
 ## Theme system (V12) and fonts
 

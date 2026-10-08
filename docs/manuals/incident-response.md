@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Incident-responder manual
@@ -57,12 +57,13 @@ Routes are owned by [console routes](../reference/console-routes.md).
 - **Event history** - `GET /ip/{ip}/events`: the attacker's captured events for that IP,
   keyset-paginated.
 - **Search** - `GET /search/events` and `/search/ips` to pivot across the corpus;
-  `GET /ips` lists scored IPs (capped 500 rows).
+  `GET /ips` lists every scored IP, 500 to a page.
 - **Samples** - `GET /samples` lists captured samples; `GET /samples/download/{sha256}`
   streams the raw body as `application/octet-stream` with `Content-Disposition: attachment`
   and `Content-Security-Policy: default-src 'none'` (a hardened download - see custody below
   before you open anything).
-- **Live logs** - `GET /logs` is a 1000-event in-memory ring, a convenience tail only; the
+- **Live logs** - `GET /logs` is an in-memory ring of at most 1000 events, with their fields,
+  opening on warnings and errors; a convenience tail only; the
   journal and the NDJSON files are authoritative
   ([health and observability](../operations/health-and-observability.md)).
 

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::converter::convert;
 use chrono::{DateTime, Utc};
-use core_scoring::{append_event, append_telemetry_event};
+use core_scoring::{EventInput, append_events};
 use log_tailer::LogTailer;
 use sensor_wire::SensorEvent;
 use sqlx::PgPool;
@@ -48,6 +48,48 @@ pub struct IntakeRunner {
     probe_grace: Duration,
     last_ingested_observed_at: Option<DateTime<Utc>>,
     reported_sensors: BTreeSet<String>,
+    /// Lines the next `run_batch` reads; see [`next_batch_size`].
+    batch_size: usize,
+}
+
+/// The fewest lines a batch reads, and what every runner starts at and returns to once it has
+/// caught up: a quiet sensor keeps the small transactions it always had.
+pub const MIN_BATCH_LINES: usize = 100;
+
+/// The most lines a batch reads. The append lock is held for the whole batch's transaction, so
+/// this bounds how long one sensor's backlog can make every other writer wait; at the measured
+/// per-event cost it keeps that to under 0.1 s (`docs/architecture/storage.md`, "Batched append").
+pub const MAX_BATCH_LINES: usize = 1000;
+
+/// Upper bound on the bytes one batch holds in memory, so lines far larger than the typical
+/// 1 KB cannot make a full-size batch large. It limits growth above [`MIN_BATCH_LINES`] only; the
+/// floor is the size the runner always read.
+const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// The line count for the batch after one that read `lines_read` of `current` lines (`bytes_read`
+/// bytes) and did or did not fail.
+///
+/// A full batch means more is waiting, so double it, up to [`MAX_BATCH_LINES`] and the byte
+/// budget: a backlog is cleared in fewer, larger transactions (each saves a lock acquisition and
+/// a commit). A short batch means the log is drained, so return to [`MIN_BATCH_LINES`]. A failed
+/// batch also returns to the floor: the retry should be small, and a failure that is one event's
+/// fault costs fewer rolled-back rows that way.
+pub fn next_batch_size(
+    current: usize,
+    lines_read: usize,
+    bytes_read: usize,
+    failed: bool,
+) -> usize {
+    if failed || lines_read < current {
+        return MIN_BATCH_LINES;
+    }
+    let average_line = (bytes_read / lines_read.max(1)).max(1);
+    let by_bytes = MAX_BATCH_BYTES / average_line;
+    current
+        .saturating_mul(2)
+        .min(MAX_BATCH_LINES)
+        .min(by_bytes)
+        .max(MIN_BATCH_LINES)
 }
 
 /// How many distinct `event.sensor` names one log's runner remembers. A log carries one sensor's
@@ -81,6 +123,7 @@ impl IntakeRunner {
             probe_grace,
             last_ingested_observed_at: None,
             reported_sensors: BTreeSet::new(),
+            batch_size: MIN_BATCH_LINES,
         }
     }
 
@@ -105,15 +148,19 @@ impl IntakeRunner {
         &self.reported_sensors
     }
 
-    /// Reads and processes one batch (up to 100 lines) from the tailer.
+    /// Reads and processes one batch from the tailer: [`MIN_BATCH_LINES`] lines when caught up,
+    /// growing to [`MAX_BATCH_LINES`] while the log keeps filling a whole batch (see
+    /// [`next_batch_size`]).
     ///
     /// A line that is not valid JSON, or that `convert` rejects, is counted in `rejected` and
     /// skipped: both are permanent failures, so retrying them next poll would just re-reject them
     /// forever while blocking every line behind them.
     ///
-    /// A database error from `append_event` is treated differently: it may be transient (a
-    /// dropped connection, lock contention), and every subsequent call is likely to fail the same
-    /// way, so the batch STOPS at the first one instead of plowing through the rest. `read_batch`
+    /// Every convertible line is appended in ONE transaction (`core_scoring::append_events`),
+    /// which holds the ledger's append lock once for the batch. A database error from it is
+    /// treated differently from a rejected line: it may be transient (a dropped connection, lock
+    /// contention), and every subsequent call is likely to fail the same way, so the batch STOPS
+    /// at the first failing event, and events before it are already committed. `read_batch`
     /// has already advanced the tailer's in-memory offset past every line in this batch
     /// (including the ones left unprocessed after the failure), so the batch is REWOUND here:
     /// the next poll re-reads the failed line and everything behind it.
@@ -128,10 +175,15 @@ impl IntakeRunner {
     /// Lines that succeeded before the failure are replayed on the retry. That is the intended
     /// trade: the ledger's dedup window absorbs a duplicate, and nothing absorbs a skip.
     pub async fn run_batch(&mut self) -> RunBatchResult {
-        let lines = self.tailer.read_batch(100);
+        let lines = self.tailer.read_batch(self.batch_size);
         let mut result = RunBatchResult::default();
+        // Converted events in log order, each with the rejected and probe counts as they stood
+        // just before it, so a failure can report only the lines that were actually reached.
+        let mut pending: Vec<(EventInput, usize, usize)> = Vec::with_capacity(lines.len());
+        let mut bytes_read = 0usize;
 
         for line in &lines {
+            bytes_read += line.len();
             let event: SensorEvent = match serde_json::from_str(line) {
                 Ok(event) => event,
                 Err(e) => {
@@ -190,43 +242,41 @@ impl IntakeRunner {
                 }
             };
 
-            // Telemetry takes the unscored append path. The two are separate functions that
-            // refuse each other's signals (see `core_scoring::repository`), so routing on the
-            // signal's own classification here is what lets a sensor emit an outcome record at
-            // all: handing one to `append_event` is a hard error, by design.
-            let observed_at = input.observed_at;
-            let sensor = input.sensor.clone();
-            let appended = if input.signal_type.is_telemetry() {
-                append_telemetry_event(&self.pool, input).await
-            } else {
-                append_event(&self.pool, input).await.map(|_score| ())
-            };
-            match appended {
-                Ok(()) => {
-                    result.ingested += 1;
-                    self.last_ingested_observed_at = Some(observed_at);
-                    if self.reported_sensors.len() < MAX_REPORTED_SENSORS {
-                        self.reported_sensors.insert(sensor);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        sensor = %self.sensor_name,
-                        error = ?e,
-                        "append failed, stopping batch"
-                    );
-                    result.errors += 1;
-                    break;
-                }
-            }
+            pending.push((input, result.rejected, result.probe_confirmations));
         }
 
-        if result.errors > 0 {
+        // One transaction for the whole batch (telemetry and scored events alike, in log order).
+        // `append_events` routes each event to the scored or telemetry path the way the
+        // single-event functions do, and on failure reports how many leading events are durable.
+        let inputs: Vec<EventInput> = pending.iter().map(|(input, _, _)| input.clone()).collect();
+        let outcome = append_events(&self.pool, &inputs).await;
+        for (input, _, _) in &pending[..outcome.appended] {
+            result.ingested += 1;
+            self.last_ingested_observed_at = Some(input.observed_at);
+            if self.reported_sensors.len() < MAX_REPORTED_SENSORS {
+                self.reported_sensors.insert(input.sensor.clone());
+            }
+        }
+        if let Some(e) = outcome.failure {
+            tracing::error!(
+                sensor = %self.sensor_name,
+                error = ?e,
+                appended = outcome.appended,
+                "append failed, stopping batch"
+            );
+            result.errors += 1;
+            // Lines after the failed one are rewound and read again, so they are not counted yet.
+            if let Some(&(_, rejected, probes)) = pending.get(outcome.appended) {
+                result.rejected = rejected;
+                result.probe_confirmations = probes;
+            }
             self.tailer.rewind_batch();
         } else {
             self.tailer.commit_batch();
         }
 
+        self.batch_size =
+            next_batch_size(self.batch_size, lines.len(), bytes_read, result.errors > 0);
         result
     }
 
@@ -238,5 +288,66 @@ impl IntakeRunner {
     /// unconditionally is correct for the same reason.
     pub fn persist_cursor(&self) -> std::io::Result<()> {
         self.tailer.persist_cursor()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LINE: usize = 1000;
+
+    #[test]
+    fn a_full_batch_doubles_up_to_the_cap() {
+        let mut size = MIN_BATCH_LINES;
+        let mut seen = vec![size];
+        for _ in 0..6 {
+            size = next_batch_size(size, size, size * LINE, false);
+            seen.push(size);
+        }
+        assert_eq!(seen, [100, 200, 400, 800, 1000, 1000, 1000]);
+        assert_eq!(MAX_BATCH_LINES, 1000);
+    }
+
+    #[test]
+    fn a_short_batch_returns_to_the_floor() {
+        assert_eq!(
+            next_batch_size(800, 799, 799 * LINE, false),
+            MIN_BATCH_LINES
+        );
+        assert_eq!(next_batch_size(1000, 0, 0, false), MIN_BATCH_LINES);
+    }
+
+    #[test]
+    fn a_failed_batch_returns_to_the_floor_even_when_full() {
+        assert_eq!(next_batch_size(800, 800, 800 * LINE, true), MIN_BATCH_LINES);
+    }
+
+    #[test]
+    fn large_lines_stop_growth_at_the_byte_budget_but_never_below_the_floor() {
+        // 100 KiB lines: 8 MiB holds 80, below the floor, so growth stalls at the floor.
+        assert_eq!(
+            next_batch_size(100, 100, 100 * 100 * 1024, false),
+            MIN_BATCH_LINES
+        );
+        // 16 KiB lines: 8 MiB holds 512.
+        assert_eq!(next_batch_size(400, 400, 400 * 16 * 1024, false), 512);
+    }
+
+    #[test]
+    fn every_bound_holds_for_any_input() {
+        for current in [0usize, 1, 99, 100, 101, 999, 1000, usize::MAX] {
+            for lines in [0usize, 1, 100, 1000, usize::MAX / 2] {
+                for bytes in [0usize, 1, 1 << 20, usize::MAX / 2] {
+                    for failed in [false, true] {
+                        let next = next_batch_size(current, lines, bytes, failed);
+                        assert!(
+                            (MIN_BATCH_LINES..=MAX_BATCH_LINES).contains(&next),
+                            "{current} {lines} {bytes} {failed} -> {next}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

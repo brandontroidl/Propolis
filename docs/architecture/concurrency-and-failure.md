@@ -89,6 +89,17 @@ append that reads them, and the dedup-window read cannot be bypassed by an inter
 insert. The lock auto-releases at transaction end, so a rolled-back append
 never leaves it held. See [storage](./storage.md).
 
+Intake takes the lock once per **batch**, not once per line: `append_events`
+(`crates/core-scoring/src/repository/batch.rs#append_events`) runs the same critical section for
+up to 1000 events in one transaction and leaves exactly the state the per-event path would
+([storage](./storage.md#batched-append)). A batch that fails rolls back whole. If one event
+caused the failure, the batch is retried in halves so the events before it commit; intake then
+counts one error, does not advance the cursor, and rewinds, so the next poll reads the whole
+batch again and the events already committed are absorbed by the dedup window. Nothing after
+the failing event is written, and nothing is skipped. An event that the database always
+refuses therefore holds that sensor's intake at that line until it is removed from the log, as
+it did one event at a time; a connection error is retried at once without splitting.
+
 Concurrent NDJSON log appends (multiple connections through one `EventEmitter` behind an
 `Arc`) are serialized by the OS: one `O_APPEND` `write_all` of the whole line is atomic
 on a local filesystem, so lines are never interleaved or overwritten. This guarantee
@@ -133,13 +144,14 @@ missing or malformed input.
   per-source cap (a quarter of `max_concurrent` by default) for any single source IP -
   they do not queue.
 - **Capture** sheds load by dropping jobs past the bounded queue - it does not block.
-- **Intake** reads each sensor log 100 lines a batch, advancing a per-sensor cursor, and
+- **Intake** reads each sensor log 100 lines a batch, growing to 1000 while the log keeps
+  filling a whole batch, advancing a per-sensor cursor, and
   reads again at once while lines remain; it sleeps for the poll interval only when a batch
   comes back empty (`crates/propolis/src/main.rs#run_intake_sensor`). Its rate is set by the
-  serialized append lock: one append at a time across every sensor, so a slow append for one
+  serialized append lock: one batch at a time across every sensor, so a slow batch for one
   source holds up all of them. No read inside the lock grows with a source's history or with
-  intake lag, so an append costs a few milliseconds whichever source it is for
-  ([storage](./storage.md#serialized-single-writer-append)). Intake does not shed load; when a sensor writes faster than
+  intake lag, and a batch holds the lock for tens of milliseconds
+  ([storage](./storage.md#batched-append)). Intake does not shed load; when a sensor writes faster than
   intake appends, the backlog stays in the log, and the `intake-lagging` alert and the fleet
   pane's behind badge report it ([intake backlog](../troubleshooting/intake-backlog.md)).
 - The **console** binds loopback-only by default and derives metrics from live DB

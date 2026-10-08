@@ -14,6 +14,10 @@
 //! `latency` appends `n` events per source, sequentially, each observed `lag_secs` before now (an
 //! intake working through a backlog appends old `observed_at` values), and prints
 //! mean/p50/p95/max per source.
+//! `batched` appends `batch` events per `append_events` call from one writer for the given wall
+//! time (events round-robin over the sources) and prints the event rate, the per-batch time, and
+//! how long a probe queueing on the append lock waited:
+//! `... -- batched <seconds> <batch> <source_ip>...`.
 //! `throughput` runs one task per source (one source standing in for one sensor's intake loop) for
 //! the given wall time on a pool of the given size, and prints the aggregate append rate.
 
@@ -23,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use core_scoring::{EventInput, Protocol, SignalType, append_event};
+use core_scoring::{EventInput, Protocol, SignalType, append_event, append_events};
 use sqlx::postgres::PgPoolOptions;
 
 fn event_for(ip: IpAddr, seq: u64, lag: chrono::Duration) -> EventInput {
@@ -128,6 +132,83 @@ async fn throughput(url: &str, seconds: u64, pool_size: u32, ips: Vec<IpAddr>) {
     );
 }
 
+/// The key `core_scoring` serializes every append on (`APPEND_LOCK_KEY`), repeated here so a probe
+/// can queue on the same lock the appenders hold. The bench is a measuring tool for a scratch
+/// database; if the key ever changes the probe reads near zero, which the printed batch times
+/// would contradict.
+const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
+
+/// One writer appending `batch` events per `append_events` call for `seconds`, while a probe on a
+/// second connection repeatedly queues on the append lock and times how long it waits. The probe
+/// is what another sensor's writer would experience: its wait is the time the batch holds the lock
+/// from the moment the probe arrives, so its maximum is bounded by one batch's hold time.
+async fn batched(url: &str, seconds: u64, batch: usize, ips: Vec<IpAddr>) {
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(url)
+        .await
+        .expect("connect");
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let probe_pool = pool.clone();
+    let probe_stop = stop.clone();
+    let probe = tokio::spawn(async move {
+        let mut waits = Vec::new();
+        while !probe_stop.load(Ordering::Relaxed) {
+            let mut tx = probe_pool.begin().await.expect("probe begin");
+            let start = Instant::now();
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(APPEND_LOCK_KEY)
+                .execute(&mut *tx)
+                .await
+                .expect("probe lock");
+            waits.push(start.elapsed());
+            tx.rollback().await.expect("probe rollback");
+            tokio::time::sleep(Duration::from_millis(7)).await;
+        }
+        waits
+    });
+
+    let begin = Instant::now();
+    let mut times = Vec::new();
+    let mut total = 0u64;
+    let mut seq = 0u64;
+    while begin.elapsed() < Duration::from_secs(seconds) {
+        let events: Vec<EventInput> = (0..batch)
+            .map(|i| {
+                let ip = ips[(seq as usize + i) % ips.len()];
+                event_for(ip, seq + i as u64, chrono::Duration::zero())
+            })
+            .collect();
+        let start = Instant::now();
+        let outcome = append_events(&pool, &events).await;
+        times.push(start.elapsed());
+        assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+        total += outcome.appended as u64;
+        seq += batch as u64;
+    }
+    let elapsed = begin.elapsed().as_secs_f64();
+    stop.store(true, Ordering::Relaxed);
+    let mut waits = probe.await.expect("probe task");
+    waits.sort();
+    times.sort();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    println!(
+        "batched batch={batch} seconds={elapsed:.1} events={total} events_per_s={:.1} \
+         batch_ms_mean={:.1} p50={:.1} p95={:.1} max={:.1} \
+         lock_wait_probe_n={} wait_ms_p50={:.1} p95={:.1} max={:.1}",
+        total as f64 / elapsed,
+        ms(times.iter().sum::<Duration>() / times.len() as u32),
+        ms(percentile(&times, 0.50)),
+        ms(percentile(&times, 0.95)),
+        ms(times[times.len() - 1]),
+        waits.len(),
+        ms(percentile(&waits, 0.50)),
+        ms(percentile(&waits, 0.95)),
+        ms(waits[waits.len() - 1]),
+    );
+}
+
 #[tokio::main]
 async fn main() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must name a scratch database");
@@ -150,9 +231,16 @@ async fn main() {
             let pool_size: u32 = args[2].parse().expect("pool_size");
             throughput(&url, seconds, pool_size, parse_ips(&args[3..])).await;
         }
+        Some("batched") if args.len() >= 4 => {
+            let seconds: u64 = args[1].parse().expect("seconds");
+            let batch: usize = args[2].parse().expect("batch");
+            assert!(batch > 0, "batch must be positive");
+            batched(&url, seconds, batch, parse_ips(&args[3..])).await;
+        }
         _ => {
             eprintln!(
-                "usage: append_bench latency <n> <lag_secs> <ip>... | throughput <seconds> <pool> <ip>..."
+                "usage: append_bench latency <n> <lag_secs> <ip>... | throughput <seconds> <pool> <ip>... \
+                 | batched <seconds> <batch> <ip>..."
             );
             std::process::exit(2);
         }

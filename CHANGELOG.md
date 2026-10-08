@@ -105,6 +105,31 @@
 
 ### Added
 
+- **Intake appends a batch of lines in one transaction** - after the dedup index (migration `0013`)
+  and the incremental breadth sets (migration `0014`) removed the costs that grew with lag and with
+  a source's history, what remained was one transaction, one lock acquisition and one commit per
+  line, which held the node to a few hundred events a second whatever the hardware. A new
+  `core_scoring::append_events` appends a batch (scored events and telemetry, in log order) with
+  one lock acquisition: it hashes the chain in order from one head read, loads each touched
+  source's score, vantages, sensors and dedup lookup once, folds the events through the same
+  `apply_event` in order, inserts the ledger rows with one multi-row `INSERT` and writes each
+  touched source once. No migration, no change to the hash chain, the scoring formulas or the
+  ledger's order. A property test (`crates/core-scoring/tests/batch_equivalence.rs`: eight
+  seeds, 32 streams of 20 to 160 events over six sources, every signal type, duplicates, out-of-order
+  and sub-microsecond timestamps, cut into batches of 1 to the whole stream) holds the ledger rows
+  with their hashes, `ip_score`, `ip_vantage` and `ip_sensor` byte-identical to one-at-a-time
+  ingestion and runs `verify_chain` and `rebuild_projection` on the batch-built ledger. On a 1M-row
+  test ledger with a 200k-event source (RAM-backed server): about 350 to 470 events a second one at
+  a time, 11,000 to 13,600 in batches of 1000, with the lock held about 70 to 90 ms per batch.
+  The runner's read size now adapts to lag: 100 lines when caught up, doubling to 1000 while a log
+  keeps filling whole batches, bounded by an 8 MiB byte budget, back to 100 on a short or failed
+  batch. A batch that fails is retried in halves when one event can be the cause (invalid, a data
+  exception such as a NUL in metadata, a constraint), so the events before it commit; the cursor
+  still does not advance past a failed batch and nothing is skipped, as before. Unchanged and
+  still true: an event the database refuses on every attempt holds that sensor's intake at its
+  line. `append_bench` gains a `batched` mode that also reports how long a second writer waits
+  on the lock.
+
 - **`deploy/config-check.sh` compares the configuration with what is running** - five faults on
   the production box were each found by accident: a typo in `PROPOLIS_SENSOR_LOGS`, MQTT's log
   absent from that list, sensor-cred's PostgreSQL listener never producing a log (with 5432 open in

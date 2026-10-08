@@ -115,8 +115,45 @@ vantages and distinct sensors, are counted from the source's rows in `ip_vantage
 `ip_sensor`, which the same critical section updates; migration `0014` replaced a read of the
 source's whole history on every append with them ([breadth sets](../reference/database.md#breadth-sets)).
 No read inside the lock grows with a source's history or with the ledger's size beyond an index
-descent. What remains per event is the round trips and the commit
-([limitations](../overview/limitations.md#intake-appends-one-event-per-transaction)).
+descent.
+
+#### Batched append
+
+Intake does not append a line at a time. `append_events`
+(`crates/core-scoring/src/repository/batch.rs#append_events`) writes a batch of events, scored
+and telemetry alike, in **one transaction that takes the lock once**. It reads the chain head once
+and computes each event's hash against the previous event's, in order. It reads each touched
+source's `ip_score`, vantage and sensor rows and each (source, signal) dedup lookup once, before
+the batch's rows exist, then folds the events through the same pure `apply_event` in order, so
+event k sees events 0 to k-1 of its own batch exactly as the one-at-a-time path sees them in the
+database. The ledger rows go in with one multi-row `INSERT` in chain order, and each touched
+source's changed vantages, new sensors and final `ip_score` are written once. The result is
+byte-identical to calling `append_event` / `append_telemetry_event` per event
+(`crates/core-scoring/tests/batch_equivalence.rs`): the same ledger rows and chain hashes, the
+same breadth sets and `ip_score` rows. The chain trigger still checks every row against the one
+before it, so a wrong link fails the statement rather than forking the chain.
+
+The score fold stays one step per event, because decay, dedup and tier depend on order; the batch
+saves the round trips, the commits and the per-event writes, not the arithmetic. A duplicate
+inside a batch is deduped like the second of two sequential appends.
+
+If a batch fails it rolls back as a unit. When the error is one a single event can cause (a
+failed validation, a data exception such as a NUL character in metadata that `jsonb` rejects, a
+constraint violation), `append_events` retries it in halves, so the events before the bad one
+commit and the bad one is isolated in a logarithmic number of transactions; it reports how many
+leading events are durable and the error of the next. That is where one-at-a-time ingestion would
+have stopped, and intake treats it the same way: the cursor does not advance and the batch is read
+again ([concurrency and failure](./concurrency-and-failure.md#serialized-single-writer-append)).
+Any other error, a lost connection or a lock timeout, is returned at once with the failed attempt
+rolled back.
+
+The lock is held for the whole batch, so a batch bounds how long other writers wait. Measured on
+a 1M-row ledger with a 200k-event hot source (tmpfs-backed server, where a commit costs nothing
+extra): one-at-a-time about 350 to 470 events a second; batches of 100, 500, 1000 and 2000
+about 5,800 to 8,500, 11,000, 11,000 to 13,600 and 12,000 to 15,000 a second, with the lock held
+about 12 to 17 ms, 45 ms, 70 to 90 ms and 130 to 160 ms per batch. Intake's batch size starts at
+100 lines and grows to at most 1000 while a log keeps filling a whole batch
+([rate limits and budgets](../reference/rate-limits-and-budgets.md#intake-batch-size)).
 
 All event inserts are fully parameterized (`$n` bound values via the runtime
 `sqlx::query*` API); no SQL query text is built with string formatting anywhere in

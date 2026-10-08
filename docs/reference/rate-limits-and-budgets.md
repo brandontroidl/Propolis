@@ -229,6 +229,24 @@ unchanged. No other encoding (base64, UTF-16) is decoded.
 timeout 2 s, max retries 5 per wait, whole transfer wrapped in the fetcher's
 total timeout (hard outer cap). All *(hard-coded)*.
 
+## Intake batch size
+
+Each intake poll reads a batch of lines from the sensor's log and appends it in one transaction
+that holds the ledger's append lock (`crates/intake/src/runner.rs#IntakeRunner::run_batch`).
+All three values are hard-coded; there is no environment variable.
+
+| Item | Value | Source |
+|---|---|---|
+| Lines per batch when caught up | 100 | `crates/intake/src/runner.rs#MIN_BATCH_LINES` |
+| Most lines per batch | 1000 | `crates/intake/src/runner.rs#MAX_BATCH_LINES` |
+| Most bytes a grown batch may hold | 8 MiB | `crates/intake/src/runner.rs#MAX_BATCH_BYTES` |
+
+A batch that reads as many lines as it asked for doubles the next one, up to the maximum and the
+byte budget (lines near 1 MiB each hold the batch at 100); a batch that reads fewer, or that
+failed, returns to 100 (`crates/intake/src/runner.rs#next_batch_size`). The maximum bounds how
+long one sensor's backlog can make every other writer wait for the lock: about 70 to 90 ms at
+1000 lines on the test ledger in [storage](../architecture/storage.md#batched-append).
+
 ## Pipeline loop intervals
 
 Daemon loop cadences (not egress-producing on their own):

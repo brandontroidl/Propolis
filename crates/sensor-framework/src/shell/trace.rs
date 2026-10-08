@@ -70,6 +70,7 @@ pub enum ParseNode {
     If,
     For,
     While,
+    Case,
     /// A construct outside the grammar subset, skipped with status 0.
     Unsupported,
 }
@@ -621,13 +622,13 @@ mod tests {
     #[test]
     fn an_unsupported_construct_is_recorded_as_skipped() {
         let mut sh = shell();
-        let (out, _) = sh.handle_input("case x in x) echo hi;; esac");
+        let (out, _) = sh.handle_input("[[ -f /etc/hostname ]]");
         assert!(out.is_empty());
         let command = only_command(&sh);
         assert_eq!(command.node, ParseNode::Unsupported);
         assert_eq!(
             command.unsupported,
-            Some(crate::shell::UnsupportedKind::Case)
+            Some(crate::shell::UnsupportedKind::DoubleBracket)
         );
         assert_eq!(command.status, 0);
     }

@@ -877,10 +877,7 @@ fn a_port_held_by_another_process_that_the_firewall_exposes_is_the_dangerous_row
         "{msgs}"
     );
     assert!(msgs.contains("DANGEROUS: tcp/5432 is open in the ufw firewall and bound by a process that is not sensor-cred (postgres)"), "{msgs}");
-    assert!(
-        msgs.contains("close it: sudo ufw delete allow 5432/tcp"),
-        "{msgs}"
-    );
+    assert!(msgs.contains("| sudo ufw delete allow 5432/tcp"), "{msgs}");
     assert!(
         v["findings"][0]["message"]
             .as_str()
@@ -1141,7 +1138,7 @@ fn unit_states_are_told_apart_with_their_own_fix_lines() {
     );
     assert!(
         msgs.contains(
-            "sensor-tftp.service is enabled but failed | sudo journalctl -u sensor-tftp.service"
+            "sensor-tftp.service is enabled but failed: read its log, fix what it reports, then run: sudo systemctl restart sensor-tftp.service | sudo journalctl -u sensor-tftp.service"
         ),
         "{msgs}"
     );
@@ -1903,6 +1900,635 @@ fn an_unreadable_firewall_is_unknown_but_a_readable_active_one_wins() {
             .unwrap()
             .contains("firewall rules unreadable: ufw is installed")
     }));
+}
+
+// ---- fix lines -----------------------------------------------------------------------------
+//
+// The report's `fix:` lines are copy-pasted by an operator who is not root and has no
+// DATABASE_URL in their shell. Two went wrong live (a grep of root-only env files with no sudo, and
+// a psql line followed by prose that bash parsed as an `if`), so the contract is enforced here for
+// every finding the script can raise, by EXECUTING each `fix` line in bash against stub commands
+// that record who ran them. A parse check alone would pass `sudo`-less commands.
+
+/// The privileged commands a run fix may only invoke through sudo.
+const ROOT_COMMANDS: [&str; 7] = [
+    "systemctl",
+    "journalctl",
+    "ss",
+    "ufw",
+    "firewall-cmd",
+    "nft",
+    "install",
+];
+
+/// Every finding id in the script: the part of each `finding LEVEL "scope" "KEY"` key before its
+/// first colon. One id per call site, so a new finding is a new id.
+fn script_finding_ids() -> Vec<String> {
+    let text = std::fs::read_to_string(SCRIPT).unwrap();
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("finding fail \"") || l.starts_with("finding warn \""))
+        .map(|l| {
+            let key = l.split('"').nth(3).unwrap_or_else(|| panic!("{l}"));
+            key.split(':').next().unwrap().to_string()
+        })
+        .collect()
+}
+
+impl Fx {
+    /// Stub commands for executing a fix line: `sudo` runs a stub of that name with UNDER_SUDO=1
+    /// (or a root script by absolute path, which it only records), every other command records
+    /// whether it ran under sudo. Nothing else is on PATH, so an unlisted command is "not found".
+    fn install_fix_stubs(&self) {
+        let find = |t: &str| -> String {
+            ["/usr/bin", "/bin"]
+                .iter()
+                .map(|d| format!("{d}/{t}"))
+                .find(|p| Path::new(p).exists())
+                .unwrap_or_else(|| panic!("no {t} on this host"))
+        };
+        // One write per record: the stages of a pipeline (journalctl | grep) append concurrently,
+        // and piecewise printf calls interleave into blank or spliced lines.
+        let record = |name: &str| {
+            format!(
+                "line=\"{name} sudo=${{UNDER_SUDO:-0}}\"\nfor a in \"$@\"; do line=\"$line [$a]\"; done\nprintf '%s\\n' \"$line\" >> \"$FIXLOG\"\n"
+            )
+        };
+        for name in ["systemctl", "ss", "ufw", "firewall-cmd", "nft", "psql"] {
+            self.exec(&format!("fixstubs/{name}"), &record(name));
+        }
+        // A log line that a `| grep -i bind` filter keeps, so the pipeline's exit status is 0.
+        self.exec(
+            "fixstubs/journalctl",
+            &format!("{}echo 'failed to bind 0.0.0.0'\n", record("journalctl")),
+        );
+        // install checks its source exists: a fix that names a missing file fails here, loudly.
+        self.exec(
+            "fixstubs/install",
+            &format!(
+                "{}n=$#; i=0; for a in \"$@\"; do i=$((i+1)); [ $i -eq $((n-1)) ] && src=$a; done\n[ -f \"$src\" ] || {{ echo \"install: cannot stat $src\" >&2; exit 1; }}\n",
+                record("install")
+            ),
+        );
+        // grep really runs, so a fix that reads DATABASE_URL out of the env file gets the real URL.
+        self.exec(
+            "fixstubs/grep",
+            &format!("{}exec {} \"$@\"\n", record("grep"), find("grep")),
+        );
+        self.exec(
+            "fixstubs/sudo",
+            r#"line=sudo
+for a in "$@"; do line="$line [$a]"; done
+printf '%s\n' "$line" >> "$FIXLOG"
+while [ $# -gt 0 ]; do case "$1" in -u) shift 2 ;; -*) shift ;; *) break ;; esac; done
+cmd="$1"; shift
+if [ -x "$FIXSTUBS/$cmd" ]; then UNDER_SUDO=1 exec "$FIXSTUBS/$cmd" "$@"; fi
+case "$cmd" in /*) if [ -x "$cmd" ]; then line="root-script sudo=1 [$cmd]"; for a in "$@"; do line="$line [$a]"; done; printf '%s\n' "$line" >> "$FIXLOG"; exit 0; fi ;; esac
+echo "sudo: $cmd: command not found" >&2
+exit 127
+"#,
+        );
+        for t in ["tail", "cut", "tr", "head"] {
+            std::os::unix::fs::symlink(find(t), self.p(&format!("fixstubs/{t}"))).unwrap();
+        }
+    }
+
+    /// Runs `fix` as an operator would paste it (bash -c, a directory that is not the repo, no
+    /// DATABASE_URL, no sudo-free access to anything); returns (exit, stderr, recorded commands).
+    fn run_fix(&self, fix: &str) -> (i32, String, Vec<String>) {
+        let log = self.p("fixlog");
+        let _ = std::fs::remove_file(&log);
+        std::fs::create_dir_all(self.p("cwd")).unwrap();
+        let out = Command::new(BASH)
+            .arg("-c")
+            .arg(fix)
+            .current_dir(self.p("cwd"))
+            .env_clear()
+            .env("PATH", self.p("fixstubs"))
+            .env("FIXSTUBS", self.p("fixstubs"))
+            .env("FIXLOG", &log)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let recorded = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            recorded,
+        )
+    }
+}
+
+/// Asserts the contract for one finding's fix and returns nothing; `what` names it for failures.
+fn assert_fix_contract(fx: &Fx, what: &str, id: &str, kind: &str, fix: &str) {
+    if fix.is_empty() {
+        assert_eq!(kind, "", "{what}: a finding with no fix has no fix_kind");
+        return;
+    }
+    assert!(
+        kind == "run" || kind == "manual",
+        "{what}: fix_kind must be run or manual, got {kind:?}"
+    );
+    // A secret must never ride on a command line, and a pasted line must not reach for the
+    // database directly: the script's own --newest-event mode does that through PG* variables.
+    for forbidden in [
+        "DATABASE_URL",
+        "psql",
+        "postgres://",
+        "postgresql://",
+        "PGPASSWORD",
+    ] {
+        assert!(
+            !fix.contains(forbidden),
+            "{what}: a fix line must not contain {forbidden}: {fix}"
+        );
+    }
+    if kind == "manual" {
+        return;
+    }
+    let parse = Command::new(BASH).args(["-n", "-c", fix]).output().unwrap();
+    assert!(
+        parse.status.success(),
+        "{what}: a run fix must parse as shell: {fix}\n{}",
+        String::from_utf8_lossy(&parse.stderr)
+    );
+    let (code, err, recorded) = fx.run_fix(fix);
+    assert!(
+        err.is_empty(),
+        "{what}: running the fix wrote to stderr (prose, a missing command, a bad path): {fix}\n{err}"
+    );
+    assert_eq!(code, 0, "{what}: the fix exited {code}: {fix}");
+    assert!(
+        !recorded.is_empty(),
+        "{what}: the fix ran no command: {fix}"
+    );
+    for line in recorded
+        .iter()
+        .filter(|l| !l.starts_with("sudo ") && !l.starts_with("root-script "))
+    {
+        let name = line.split_whitespace().next().unwrap();
+        let under_sudo = line.contains(" sudo=1");
+        assert!(
+            under_sudo || !ROOT_COMMANDS.contains(&name),
+            "{what}: {name} needs root but ran without sudo: {fix}\n{line}"
+        );
+        assert!(
+            under_sudo || !line.contains(".env"),
+            "{what}: an env file is root-only and was read without sudo: {fix}\n{line}"
+        );
+    }
+    if id == "events-none" {
+        let script = recorded
+            .iter()
+            .find(|l| l.starts_with("root-script "))
+            .unwrap_or_else(|| {
+                panic!("{what}: the ledger query is not a root run of the script: {fix}")
+            });
+        assert!(
+            script.contains("config-check.sh] ") && script.contains("[--newest-event] ["),
+            "{what}: {script}"
+        );
+    }
+}
+
+fn use_nft(fx: &Fx, input_ports: &str, forward_ports: &str) {
+    fx.remove_stub("ufw");
+    fx.exec("stubs/nft", "[ -f \"$STUB_STATE/nft\" ] && cat \"$STUB_STATE/nft\" && exit 0\necho 'Operation not permitted' >&2; exit 1\n");
+    fx.write(
+        "state/nft",
+        &format!(
+            "table inet filter {{\n\tchain input {{\n\t\ttype filter hook input priority filter; policy drop;\n\t\ttcp dport {{ {input_ports} }} accept\n\t\tudp dport 69 accept\n\t\tudp dport 53 accept\n\t\ttcp dport 53 accept\n\t}}\n\tchain forward {{\n\t\ttype filter hook forward priority filter; policy drop;\n\t\ttcp dport {{ {forward_ports} }} accept\n\t}}\n}}\n"
+        ),
+    );
+}
+
+fn use_firewalld_without_ssh(fx: &Fx) {
+    fx.remove_stub("ufw");
+    fx.exec(
+        "stubs/firewall-cmd",
+        r#"case "$*" in
+  "--state") echo running ;;
+  "--get-active-zones") printf 'public\n  interfaces: eth0\n' ;;
+  "--zone=public --list-all") printf 'public (active)\n  ports: 1883/tcp 5432/tcp 69/udp\n  services: dns\n' ;;
+  "--permanent --service=dns --get-ports") echo "53/tcp 53/udp" ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+}
+
+/// A host PostgreSQL on 0.0.0.0:5432 where sensor-cred should be.
+fn foreign_holder_on_5432(fx: &Fx) {
+    fx.ss(
+        &[
+            ("0.0.0.0:22", "sensor-ssh"),
+            ("0.0.0.0:1883", "sensor-mqtt"),
+            ("0.0.0.0:5432", "postgres"),
+            ("203.0.113.7:53", "sensor-dns"),
+        ],
+        &[
+            ("0.0.0.0:69", "sensor-tftp"),
+            ("203.0.113.7:53", "sensor-dns"),
+        ],
+    );
+}
+
+fn set_stamp_installed_empty(fx: &Fx) {
+    let head = fx.head.clone();
+    let stamp = fx.read("state/deploy-stamp.json").replace(
+        &format!("\"propolis\": \"{}\"", &head[..12]),
+        "\"propolis\": \"\"",
+    );
+    fx.write("state/deploy-stamp.json", &stamp);
+}
+
+type Scenario = (&'static str, fn(&Fx));
+
+/// One fixture per way the host can be wrong; together they raise every finding id.
+fn fix_scenarios() -> Vec<Scenario> {
+    vec![
+        ("bad bind", |fx| {
+            fx.write("etc/telnet.env", "PROPOLIS_TELNET_BIND=0.0.0.0:99999\n");
+        }),
+        ("unit states", |fx| {
+            fx.write("repo/deploy/sensor-mqtt.service", "[Unit]\n");
+            std::fs::remove_file(fx.p("state/enabled/sensor-mqtt.service")).unwrap();
+            std::fs::remove_file(fx.p("state/active/sensor-mqtt.service")).unwrap();
+            fx.unit("sensor-ssh.service", "disabled", "inactive");
+            fx.unit("sensor-tftp.service", "enabled", "failed");
+            fx.unit("sensor-dns.service", "disabled", "active");
+            fx.unit("sensor-cred.service", "masked", "inactive");
+        }),
+        ("foreign holder behind an open ufw", foreign_holder_on_5432),
+        ("foreign holder behind an open nftables", |fx| {
+            use_nft(fx, "22, 1883, 5432", "9999");
+            foreign_holder_on_5432(fx);
+        }),
+        ("foreign holder, no firewall", |fx| {
+            fx.remove_stub("ufw");
+            foreign_holder_on_5432(fx);
+        }),
+        ("loopback holder", |fx| {
+            fx.ss(
+                &[
+                    ("0.0.0.0:22", "sensor-ssh"),
+                    ("0.0.0.0:1883", "sensor-mqtt"),
+                    ("127.0.0.1:5432", "postgres"),
+                    ("203.0.113.7:53", "sensor-dns"),
+                ],
+                &[
+                    ("0.0.0.0:69", "sensor-tftp"),
+                    ("203.0.113.7:53", "sensor-dns"),
+                ],
+            );
+        }),
+        ("holder of unknown name, unit stopped", |fx| {
+            fx.unit("sensor-cred.service", "enabled", "inactive");
+            fx.ss(
+                &[
+                    ("0.0.0.0:22", "sensor-ssh"),
+                    ("0.0.0.0:1883", "sensor-mqtt"),
+                    ("0.0.0.0:5432", ""),
+                    ("203.0.113.7:53", "sensor-dns"),
+                ],
+                &[
+                    ("0.0.0.0:69", "sensor-tftp"),
+                    ("203.0.113.7:53", "sensor-dns"),
+                ],
+            );
+        }),
+        ("nothing listening", |fx| {
+            fx.ss(
+                &[
+                    ("0.0.0.0:22", "sensor-ssh"),
+                    ("0.0.0.0:5432", "sensor-cred"),
+                    ("203.0.113.7:53", "sensor-dns"),
+                ],
+                &[
+                    ("0.0.0.0:69", "sensor-tftp"),
+                    ("203.0.113.7:53", "sensor-dns"),
+                ],
+            );
+        }),
+        ("ufw closes the port", |fx| {
+            fx.write(
+                "state/ufw",
+                &UFW_ALL
+                    .replace("22/tcp                     ALLOW IN    Anywhere\n", "")
+                    .replace("22/tcp (v6)                ALLOW IN    Anywhere (v6)\n", ""),
+            );
+        }),
+        ("firewalld closes the port", |fx| {
+            use_firewalld_without_ssh(fx)
+        }),
+        ("nftables closes the port", |fx| {
+            use_nft(fx, "1883, 5432", "22");
+        }),
+        ("catchall without a log path", |fx| {
+            fx.write(
+                "etc/catchall.env",
+                "PROPOLIS_CATCHALL_BIND_ADDRS=0.0.0.0:1024\n",
+            );
+            fx.unit("sensor-catchall.service", "enabled", "active");
+        }),
+        ("log sizes, quiet and missing", |fx| {
+            fx.write(
+                "etc-logrotate/propolis-sensors",
+                "/x\n{\n    size 1k\n    rotate 5\n}\n",
+            );
+            fx.log("logs/ssh/events.jsonl", 3500, NOW - 60);
+            fx.log("logs/mqtt/events.jsonl", 2500, NOW - 60);
+            fx.touch("logs/tftp/events.jsonl", NOW - 3 * 86400);
+            std::fs::remove_file(fx.p("logs/dns/events.jsonl")).unwrap();
+        }),
+        ("intake path typo", |fx| {
+            let logs = fx.logs();
+            let text = fx.read("etc/propolis.env").replace(
+                &format!("mqtt:{logs}/mqtt/events.jsonl"),
+                &format!("mqtt:{logs}/mqtt/event.jsonl"),
+            );
+            fx.write("etc/propolis.env", &text);
+        }),
+        ("intake entry absent", |fx| {
+            let logs = fx.logs();
+            let line = format!(
+                "PROPOLIS_SENSOR_LOGS=ssh:{logs}/ssh/events.jsonl,dns:{logs}/dns/events.jsonl,tftp:{logs}/tftp/events.jsonl,cred-pg:{logs}/cred/postgresql.jsonl"
+            );
+            fx.set_env_line("etc/propolis.env", "PROPOLIS_SENSOR_LOGS=", Some(&line));
+        }),
+        ("intake wrong separator", |fx| {
+            let logs = fx.logs();
+            let text = fx.read("etc/propolis.env").replace(
+                &format!("ssh:{logs}/ssh/events.jsonl"),
+                &format!("ssh;{logs}/ssh/events.jsonl"),
+            );
+            fx.write("etc/propolis.env", &text);
+        }),
+        ("intake duplicates", |fx| {
+            let logs = fx.logs();
+            fx.set_env_line(
+                "etc/propolis.env",
+                "PROPOLIS_SENSOR_LOGS=",
+                Some(&format!(
+                    "PROPOLIS_SENSOR_LOGS=ssh:{logs}/ssh/events.jsonl,mqtt:{logs}/mqtt/events.jsonl,mqtt:{logs}/dns/events.jsonl,dns2:{logs}/dns/events.jsonl,tftp:{logs}/tftp/events.jsonl,cred-pg:{logs}/cred/postgresql.jsonl,dns:{logs}/dns/events.jsonl"
+                )),
+            );
+        }),
+        ("intake relative path and missing directory", |fx| {
+            let logs = fx.logs();
+            let text = fx.read("etc/propolis.env").replace(
+                "PROPOLIS_SENSOR_LOGS=",
+                &format!(
+                    "PROPOLIS_SENSOR_LOGS=rel:relative/p.jsonl,typo:{logs}/nosuchdir/events.jsonl,"
+                ),
+            );
+            fx.write("etc/propolis.env", &text);
+        }),
+        ("intake variable misspelled", |fx| {
+            let logs = fx.logs();
+            fx.set_env_line(
+                "etc/propolis.env",
+                "PROPOLIS_SENSOR_LOGS=",
+                Some(&format!("PROPOLIS_SENSOR_LOG=ssh:{logs}/ssh/events.jsonl")),
+            );
+        }),
+        ("ledger has no or old events", |fx| {
+            fx.write(
+                "state/psql_out",
+                "ssh|60\nmqtt|90000\ntftp|100\ndns|30\ncred-pg|5\n",
+            );
+        }),
+        ("rotation dead", |fx| {
+            fx.unit("propolis-logrotate.timer", "enabled", "inactive");
+            fx.write("state/failed/propolis-logrotate.service", "failed");
+            std::fs::remove_file(fx.p("sbin/propolis-logrotate-guard")).unwrap();
+            std::fs::remove_file(fx.p("etc-logrotate/propolis-sensors")).unwrap();
+            std::fs::remove_file(fx.p("state/logrotate.state")).unwrap();
+        }),
+        ("rotation stale and timer not enabled", |fx| {
+            fx.unit("propolis-logrotate.timer", "disabled", "active");
+            fx.touch("state/logrotate.state", NOW - 4 * 3600);
+        }),
+        ("binaries missing and different", |fx| {
+            std::fs::remove_file(fx.p("bin/sensor-mqtt")).unwrap();
+            fx.write("build/sensor-ssh", "new build");
+        }),
+        ("stamp behind the checkout and binary mismatch", |fx| {
+            let head = fx.head.clone();
+            let stamp = fx.read("state/deploy-stamp.json").replace(
+                &format!("\"propolis\": \"{}\"", &head[..12]),
+                "\"propolis\": \"deadbeef0000\"",
+            );
+            fx.write("state/deploy-stamp.json", &stamp);
+            let st = Command::new("git")
+                .current_dir(fx.p("repo"))
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "y",
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }),
+        ("no deploy stamp", |fx| {
+            std::fs::remove_file(fx.p("state/deploy-stamp.json")).unwrap();
+        }),
+        ("stamp without head", |fx| {
+            fx.write("state/deploy-stamp.json", "{}\n");
+        }),
+        ("stamp without installed version", |fx| {
+            set_stamp_installed_empty(fx);
+        }),
+        ("watcher env missing, key empty", |fx| {
+            std::fs::remove_file(fx.p("etc/watch.env")).unwrap();
+            fx.write("home-watch/.ssh/authorized_keys", "");
+        }),
+        ("watcher env without a list, key missing", |fx| {
+            fx.write("etc/watch.env", "UNRELATED=1\n");
+            std::fs::remove_file(fx.p("home-watch/.ssh/authorized_keys")).unwrap();
+        }),
+        ("watcher env drifted", |fx| {
+            fx.write("etc/watch.env", "PROPOLIS_SENSOR_LOGS=ssh:/old/path\n");
+        }),
+        ("enabled unit with no bind", |fx| {
+            fx.unit("sensor-redis.service", "enabled", "active");
+            fx.write("etc/redis.env", "PROPOLIS_REDIS_BNID=0.0.0.0:6379\n");
+        }),
+        ("no env files", |fx| {
+            std::fs::remove_dir_all(fx.p("etc")).unwrap();
+            std::fs::create_dir_all(fx.p("etc")).unwrap();
+            // No units either, so nothing is "enabled with no bind" in an empty directory.
+            for d in ["state/enabled", "state/active"] {
+                std::fs::remove_dir_all(fx.p(d)).unwrap();
+            }
+        }),
+    ]
+}
+
+#[test]
+fn every_finding_has_a_fix_that_is_a_command_run_as_pasted_or_a_labelled_manual_step() {
+    let ids = script_finding_ids();
+    let expected: std::collections::BTreeSet<String> = ids.iter().cloned().collect();
+    assert_eq!(
+        ids.len(),
+        expected.len(),
+        "each finding call site needs its own id (the key prefix before ':'): {ids:?}"
+    );
+    assert!(
+        expected.len() >= 45,
+        "the id enumeration found too few call sites ({}): is the finding(...) layout changed?",
+        expected.len()
+    );
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut runs = 0;
+    let mut manuals = 0;
+    for (name, build) in fix_scenarios() {
+        let fx = Fx::new();
+        fx.install_fix_stubs();
+        build(&fx);
+        let v = fx.json();
+        for f in v["findings"].as_array().unwrap() {
+            let id = f["id"].as_str().unwrap();
+            let kind = f["fix_kind"].as_str().unwrap();
+            let fix = f["fix"].as_str().unwrap();
+            assert!(
+                expected.contains(id),
+                "{name}: the script raised id {id:?} that the source enumeration does not list"
+            );
+            let what = format!("scenario '{name}', finding {id}");
+            assert_fix_contract(&fx, &what, id, kind, fix);
+            match kind {
+                "run" => runs += 1,
+                "manual" => manuals += 1,
+                _ => {}
+            }
+            seen.insert(id.to_string());
+        }
+    }
+    let missing: Vec<&String> = expected.difference(&seen).collect();
+    assert!(
+        missing.is_empty(),
+        "findings no scenario exercises (add a fixture that raises each, so its fix is checked): {missing:?}"
+    );
+    assert!(runs > 40 && manuals > 8, "runs {runs}, manuals {manuals}");
+}
+
+#[test]
+fn the_newest_event_mode_reaches_the_ledger_through_the_environment_never_an_argument() {
+    // The fix line for a silent sensor runs this mode. The password-bearing URL must reach psql
+    // only as PG* variables, whether the env file quotes the value or not.
+    let url = "postgres://u:p%40ss@db.example.invalid:5432/propolis?sslmode=require&options=-c%20x";
+    for quoted in [format!("\"{url}\""), format!("'{url}'"), url.to_string()] {
+        let fx = Fx::new();
+        fx.set_env_line(
+            "etc/propolis.env",
+            "DATABASE_URL=",
+            Some(&format!("DATABASE_URL={quoted}")),
+        );
+        fx.write("state/psql_out", "2027-01-01 00:00:00+00\n");
+        let r = fx.run(&["--newest-event", "postgresql"]);
+        assert_eq!(r.code, 0, "{quoted}: {}{}", r.out, r.err);
+        assert!(
+            r.has("sensor postgresql: newest event 2027-01-01 00:00:00+00"),
+            "{}",
+            r.out
+        );
+        let log = fx.read("state/psql.log");
+        let argv = log.lines().find(|l| l.starts_with("ARGV:")).unwrap();
+        assert!(
+            argv.contains("SELECT max(observed_at) FROM event WHERE sensor = 'postgresql'"),
+            "{argv}"
+        );
+        for secret in ["p%40ss", "p@ss", "postgres://", "db.example.invalid"] {
+            assert!(
+                !argv.contains(secret),
+                "{secret} reached psql's argv: {argv}"
+            );
+        }
+        assert!(log.lines().any(|l| l == "PGPASSWORD=p@ss"), "{log}");
+        assert!(
+            log.lines().any(|l| l == "PGHOST=db.example.invalid"),
+            "{log}"
+        );
+        assert!(
+            log.lines()
+                .any(|l| l.starts_with("PGOPTIONS=")
+                    && l.contains("default_transaction_read_only=on")),
+            "{log}"
+        );
+        assert!(!r.out.contains("p%40ss") && !r.err.contains("p%40ss"));
+    }
+    // A name that is not a plain sensor name is refused before any query (it is interpolated).
+    let fx = Fx::new();
+    let r = fx.run(&["--newest-event", "x'; DROP TABLE event; --"]);
+    assert_eq!(r.code, 64, "{}", r.err);
+    assert!(!fx.p("state/psql.log").exists());
+    // Without a readable URL it fails loudly instead of printing an empty answer.
+    let fx = Fx::new();
+    fx.set_env_line("etc/propolis.env", "DATABASE_URL=", None);
+    let r = fx.run(&["--newest-event", "ssh"]);
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("no DATABASE_URL"), "{}", r.err);
+}
+
+#[test]
+fn the_report_prints_fix_for_commands_and_do_for_manual_steps_and_json_carries_the_kind() {
+    let fx = Fx::new();
+    // A disabled unit (a command) and a missing intake entry (an instruction) in one report.
+    fx.unit("sensor-ssh.service", "disabled", "inactive");
+    let logs = fx.logs();
+    let line = format!(
+        "PROPOLIS_SENSOR_LOGS=ssh:{logs}/ssh/events.jsonl,dns:{logs}/dns/events.jsonl,tftp:{logs}/tftp/events.jsonl,cred-pg:{logs}/cred/postgresql.jsonl"
+    );
+    fx.set_env_line("etc/propolis.env", "PROPOLIS_SENSOR_LOGS=", Some(&line));
+    let r = fx.run(&[]);
+    assert!(
+        r.has("        fix: sudo systemctl enable --now sensor-ssh.service\n"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.has("        do:  append ,mqtt:"),
+        "an instruction is not printed as a fix:\n{}",
+        r.out
+    );
+    assert!(
+        !r.out
+            .lines()
+            .any(|l| l.trim_start().starts_with("fix: append")),
+        "{}",
+        r.out
+    );
+    let kinds: Vec<(String, String)> = fx.json()["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["id"].as_str().unwrap().to_string(),
+                f["fix_kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(
+        kinds.contains(&("unit-disabled".into(), "run".into()))
+            && kinds.contains(&("intake-absent".into(), "manual".into())),
+        "{kinds:?}"
+    );
 }
 
 // ---- output contracts ----------------------------------------------------------------------

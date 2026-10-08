@@ -2529,21 +2529,38 @@ fn logrotate_skips_only_the_log_the_guard_refuses() {
     .unwrap();
     let state = dir.path().join("logrotate.state");
 
-    let out = std::process::Command::new("logrotate")
+    // Bounded: if the guard ever admitted the 8 TiB log, logrotate would sit copying it, and a
+    // hung test is a worse signal than a failed one.
+    let mut child = std::process::Command::new("logrotate")
         .arg("--state")
         .arg(&state)
         .arg(&conf)
         .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "0")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("logrotate did not finish in 60 s: the guard admitted the oversized log");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
     assert!(
-        !out.status.success(),
+        !status.success(),
         "a refused log must make logrotate exit non-zero so the unit shows failed"
     );
     assert!(
         dir.path().join("small.jsonl.1").exists(),
-        "the healthy log must still rotate: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "the healthy log must still rotate: {stderr}"
     );
     assert_eq!(
         std::fs::metadata(&small).unwrap().len(),

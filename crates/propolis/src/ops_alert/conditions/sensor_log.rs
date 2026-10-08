@@ -454,7 +454,9 @@ mod tests {
     #[tokio::test]
     async fn it_names_the_oversized_log_then_holds_through_the_hysteresis_band_then_clears() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("policy"), "{\n    size 100M\n}\n").unwrap();
+        // Not the 100 MiB default, so a condition that ignored the policy file would disagree
+        // with every threshold below: 150 MiB to fire, 100 MiB to clear.
+        std::fs::write(tmp.path().join("policy"), "{\n    size 50M\n}\n").unwrap();
         let cond = SensorLogOversized::new();
         let ctx = ctx(rotation_in(tmp.path(), &["telnet", "ssh", "dns"]));
 
@@ -469,20 +471,20 @@ mod tests {
                     "the disk is fine, rotation is not"
                 );
                 assert!(detail.contains("telnet 6.1 GiB"), "{detail}");
-                assert!(detail.contains("100.0 MiB"), "{detail}");
+                assert!(detail.contains("50.0 MiB"), "{detail}");
                 assert!(!detail.contains("ssh"), "{detail}");
             }
             other => panic!("expected the 6.6 GB telnet log to fire, got {other:?}"),
         }
 
-        make_log(tmp.path(), "telnet", 250 * MIB);
+        make_log(tmp.path(), "telnet", 120 * MIB);
         assert!(
             matches!(cond.assess(&ctx, 10.0), Outcome::Firing { .. }),
             "between the 2x and 3x marks a firing alert holds"
         );
-        make_log(tmp.path(), "telnet", 150 * MIB);
+        make_log(tmp.path(), "telnet", 90 * MIB);
         assert_eq!(cond.assess(&ctx, 10.0), Outcome::Ok);
-        make_log(tmp.path(), "telnet", 250 * MIB);
+        make_log(tmp.path(), "telnet", 120 * MIB);
         assert_eq!(
             cond.assess(&ctx, 10.0),
             Outcome::Ok,

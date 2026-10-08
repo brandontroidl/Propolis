@@ -127,7 +127,7 @@ impl FakeShell {
                     "fqdn" | "long" => answer = Some(host.clone()),
                     "domain" => answer = Some(String::new()),
                     "ip-address" => answer = Some(self.hostname_address()),
-                    "all-ip-addresses" => answer = Some(String::new()),
+                    "all-ip-addresses" => answer = Some(self.all_addresses()),
                     "file" => {
                         args.next();
                         setting = true;
@@ -142,7 +142,7 @@ impl FakeShell {
                     'f' => answer = Some(host.clone()),
                     'd' => answer = Some(String::new()),
                     'i' => answer = Some(self.hostname_address()),
-                    'I' => answer = Some(String::new()),
+                    'I' => answer = Some(self.all_addresses()),
                     'b' => {}
                     'F' => {
                         args.next();
@@ -159,9 +159,17 @@ impl FakeShell {
         }
     }
 
+    /// `hostname -I`: every non-loopback interface address of the network model `ip addr` shows,
+    /// each followed by a space (recorded on Ubuntu 22.04: `10.20.30.253 ` and the newline).
+    fn all_addresses(&self) -> String {
+        self.interface_addresses()
+            .iter()
+            .map(|addr| format!("{addr} "))
+            .collect()
+    }
+
     /// What the name resolves to through the hosts file the persona carries: Debian's `127.0.1.1`
-    /// line for the Ubuntu box, loopback for the phone. `-I` lists interface addresses, and none
-    /// is modeled, so it prints an empty line [unverified].
+    /// line for the Ubuntu box, loopback for the phone.
     fn hostname_address(&self) -> String {
         match self.flavor {
             ShellFlavor::AndroidSh => "127.0.0.1".to_string(),
@@ -713,8 +721,8 @@ fn uptime_pretty(secs: u64) -> String {
 
 impl FakeShell {
     /// `uptime [-p|-s]`, the procps layout: ` HH:MM:SS up <duration>,  1 user,  load average: a,
-    /// b, c`. One user is the session itself [unverified]; options it does not model print the
-    /// default line.
+    /// b, c`. An interactive login is the one user; an SSH exec logs nobody in (recorded on Ubuntu
+    /// 22.04: `0 users`). Options it does not model print the default line.
     pub(super) fn cmd_uptime(&mut self, parts: &[&str]) -> CommandResult {
         let now = self.now();
         let secs = uptime_secs(&now);
@@ -730,9 +738,10 @@ impl FakeShell {
             expand("%Y-%m-%d %H:%M:%S", &boot)
         } else {
             format!(
-                "{} up {},  1 user,  load average: {}",
+                "{} up {},  {},  load average: {}",
                 expand(" %H:%M:%S", &now),
                 uptime_short(secs),
+                self.users_text(),
                 load_average(&now)
             )
         };

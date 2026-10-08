@@ -301,6 +301,19 @@ impl FakeShell {
         }
         v4_text(self.model_gateway())
     }
+
+    /// The IPv4 address `ping` and `ssh` would connect to: a dotted address as typed, otherwise
+    /// the first one the modeled hosts file lists for the name. `None` is a name `getent hosts`
+    /// and `nslookup` also fail to resolve, so the client tools report it the same way.
+    pub(super) fn resolve_host_v4(&self, name: &str) -> Option<String> {
+        if let Some(addr) = parse_v4(name) {
+            return Some(v4_text(addr));
+        }
+        self.hosts()
+            .addrs(name, false)
+            .first()
+            .map(|addr| (*addr).to_string())
+    }
 }
 
 // --------------------------------------------------------------------------------------- getent

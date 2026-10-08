@@ -133,12 +133,19 @@ shell over ADB and carries busybox and `su`.
 `fakefs.rs` is an in-memory static snapshot, fresh per session, with no real
 filesystem underneath, so path traversal is structurally impossible
 (`crates/sensor-framework/src/fakefs.rs`). It serves canned `/etc/hostname`,
-`/etc/passwd` (9 accounts incl. root, `ubuntu` uid 1000, `www-data`, `sshd`),
-`/etc/hosts` (loopback and IPv6 multicast only - no routable IPs), `/etc/os-release`,
-`/proc/version`, `/proc/cpuinfo` (Intel Xeon E5-2686 v4, 1 core), and one mount table
+`/etc/passwd` and `/etc/group` (a stock 22.04 cloud image's system accounts plus `ubuntu`
+uid 1000 and `lxd`, `crates/sensor-framework/src/etc.rs#PASSWD`), `/etc/shadow` and
+`/etc/gshadow` (mode 0640, group `shadow`; root's yescrypt-shaped hash is random per process
+and hashes no password, `crates/sensor-framework/src/etc.rs#root_password_hash`),
+`/etc/hosts` (loopback and IPv6 multicast only - no routable IPs), `/etc/os-release` (a link
+to `../usr/lib/os-release`, as on 22.04), the installer's static netplan file
+(`/etc/netplan/00-installer-config.yaml`, RFC 1918 address), `/etc/default/locale`, root's
+`.bashrc` and `.profile` (the stock ones), `/proc/version`, `/proc/cpuinfo` (Intel Xeon
+E5-2686 v4, 1 core, every field a real one lists), `/proc/meminfo`, and one mount table
 behind `/proc/mounts`, `/proc/self/mounts`, `/etc/mtab`, `/proc/self/mountinfo` and the
-shell's `mount` (a stock Ubuntu cloud image on `/dev/sda1`; every mount point it names is
-a directory the shell will enter). Directories include `/`, `/tmp`, `/root`, `/etc`,
+shell's `mount` (a stock Ubuntu cloud image on `/dev/root`, the Xen disk `xvda`; every mount
+point it names is a directory the shell will enter). A file the session writes carries the
+session clock's time, so `ls -l` dates it now. Directories include `/`, `/tmp`, `/root`, `/etc`,
 `/home/ubuntu`, the loader-probed `/var/run`, `/mnt`, `/usr`, `/dev`, `/dev/shm`, and the
 `/sys`, `/run` and `/boot` subtrees the mount table names. The Ubuntu persona has the 73
 executables recorded from a real Ubuntu 22.04 (`/bin/busybox`, `/bin/ls`, `/bin/echo`,
@@ -153,7 +160,10 @@ opens it: an applet of `busybox` reads busybox, a direct `cat` reads cat, a redi
 shell opens (`cat < /proc/self/exe`) and `/proc/$$/exe` read bash (dash in a shell opened
 with `sh`). The phone's binaries stay stubs and it has no `/proc/self/exe`. A copy of the
 busybox image runs as a renamed busybox does: `.bb: applet not found` (127), or the
-multi-call binary when the copy's name begins `busybox`.
+multi-call binary when the copy's name begins `busybox`. A copy of any other modeled binary
+runs as that binary (`cp /bin/dash /tmp/x; /tmp/x -c CMD` is `sh -c CMD`), and a file the
+session wrote runs as itself whatever its name: `/tmp/w` is the attacker's file, never `w`
+(`crates/sensor-framework/src/shell/mod.rs#FakeShell::run_saved_executable`).
 
 `FakeFs::android()` is the same machinery over the phone's filesystem: `/system` (mounted
 read-only, so a write there is refused as on a real device), `/system/bin`,
@@ -166,6 +176,52 @@ sees, and `chmod` marks a file executable so running it succeeds. That is what l
 loader chain behave: `>/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/` completes, and
 `wget URL -O x; chmod 777 x; ./x; rm -rf x` finds its payload at every step and leaves
 nothing behind. Nothing persists between sessions.
+
+### Persona fidelity
+
+The Ubuntu persona is one host that every command describes the same way, because each
+fact has one source that every reader consults. A fingerprinting survey compares answers
+across commands, so the agreement is the property, not any single format:
+
+- **Processes.** One table (`crates/sensor-framework/src/shell/procs.rs#FakeShell::process_table`)
+  holds a 22.04 server's kernel threads and services with their owners, priorities and start
+  times. `ps`, `top`, `pgrep`, `pidof`, the `/proc/<pid>` tree, `/proc/loadavg`'s task count,
+  and `systemctl status`'s main PID, memory and command line all read it.
+- **Time.** One boot time and load figure (`crates/sensor-framework/src/shell/hostinfo.rs#uptime_secs`)
+  behind `uptime`, `uptime -p`, `/proc/uptime`, `/proc/loadavg`, `top`'s header, `w` and the
+  `START` and `since` of every process and unit. A file the session writes carries the session
+  clock's time.
+- **Network.** One model behind `ip addr`, `ip route`, `hostname -I`, `ss`, `/proc/net/*` and
+  `lshw -C network` (the MAC and address `ip link` shows). `ss` lists resolved's stub on
+  `127.0.0.53` beside sshd, in iproute2 5.15's recorded layout.
+- **Units.** A service is running exactly when its main process is a row of the table; whether
+  it is enabled is the symlink under `/etc/systemd/system/*.wants` the filesystem holds, so
+  `systemctl enable`/`disable` change what `is-enabled` and `ls` read. A unit file the session
+  writes loads from where it was written, `enable` links it with systemd's own messages, and it
+  stays `inactive (dead)`: nothing is ever started
+  (`crates/sensor-framework/src/shell/admin.rs#FakeShell::cmd_systemctl`).
+- **Scheduled jobs.** `crontab` reads and writes `/var/spool/cron/crontabs/root` with the header
+  Debian's cron writes and its recorded validation errors, so `crontab -l`, `cat` and `ls -l`
+  agree (`crates/sensor-framework/src/shell/admin.rs#FakeShell::cmd_crontab`).
+- **Packages.** One package database (`crates/sensor-framework/src/packages.rs#installed`),
+  recorded from a 22.04 server install, behind `dpkg -l`, `dpkg -s`, `apt list` and apt's
+  install and upgrade answers. `openssh-*` is at the version the SSH banner announces and that
+  `ssh -V` prints. Nothing is ever fetched or installed: `apt update` reports the indexes
+  unchanged, `install` of an installed package is "already the newest version" and of anything
+  else "Unable to locate package"
+  (`crates/sensor-framework/src/shell/pkg.rs#FakeShell::cmd_apt`).
+- **Hardware.** `/proc/cpuinfo`, `nproc`, `top`'s CPU line, `lspci`, `lshw` and the `xvda` disk
+  describe one Xen guest with one Xeon E5-2686 v4
+  (`crates/sensor-framework/src/shell/hw.rs#FakeShell::cmd_lspci`).
+- **Accounts and logins.** `/etc/passwd`, `/etc/group`, `/etc/shadow` (root's hash is random
+  per process and hashes no password) and `getent` agree; an SSH exec logs nobody in, so
+  `who` is empty and `uptime` says `0 users`, while an interactive login is the one user
+  `who` and `w` show, from the session's own peer address.
+
+Formats were recorded on 2026-10-07 from a systemd-booted `ubuntu:22.04` reference (coreutils
+8.32, procps-ng 3.3.17, iproute2 5.15, systemd 249, OpenSSH 8.9p1, dpkg 1.21.1, apt 2.4.14,
+cron 3.0pl1); what could not be recorded there (the reference ran on other hardware and could
+not send ICMP) is marked `[unverified]` where the code defines it.
 
 ### Fake shell (SSH, Telnet, ADB)
 
@@ -220,9 +276,14 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `max_captured_bytes` and the capture memory budget; reaching either ends it there and the
   command sees end of file. What the command consumed is captured as `exec_stdin` or
   `shell_stdin` ([events-and-signals.md](events-and-signals.md#capture_reason-and-the-standard-input-keys)).
-  Output is sent when the command ends, not as it reads: a typed `cat` with no redirection prints
-  its lines after Ctrl-D, not one by one, and `read` or `head -n 1` at a terminal waits for Ctrl-D
-  where a real one returns after its line.
+  At an interactive shell's terminal each Enter reruns the waiting line on the lines typed so far
+  with the input still open (`crates/sensor-framework/src/shell/mod.rs#FakeShell::try_finish_line`):
+  a line whose readers had all they wanted finishes there, so `read x; echo $x` and `head -n 1`
+  answer after their line as a real terminal's do, and the bytes after that Enter are the next
+  command. A line that still wants more (`cat > f`) is undone and keeps waiting; it is rerun at
+  most `RESUME_ATTEMPTS` (64) times and on at most `RESUME_BYTES` (64 KiB) of input, past which
+  it waits for the input to end. Output is sent when the command ends, not as it reads: a typed
+  `cat` with no redirection prints its lines after Ctrl-D, not one by one.
 - Shell identity is state, not fixed response text (`crates/sensor-framework/src/shell/mod.rs#ShellContext`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::prompt`). An Ubuntu login starts as
   `-bash`, uses the interactive command-not-found handler and a prompt that follows
   the working directory. SSH exec uses `bash: line 1:` diagnostics and no prompt.
@@ -249,6 +310,15 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   what bash and dash also reject prints their syntax error and status 2. `read`, `export`,
   `unset`, `set`, `shift`, `umask`, `break`, `continue`, `cd`, `exit` act on the shell itself
   (`crates/sensor-framework/src/shell/builtins.rs`); `source`, `.` and `eval` only record intent.
+  bash's `time [-p]` keyword times a pipeline and reports on the shell's standard error, outside
+  the command's own redirections, in bash 5.1's `\nreal\t0m0.019s` (or `-p`'s `real 0.00`) form;
+  dash has no such keyword (`sh: 1: time: not found`). Nothing is measured: `sleep` adds what it
+  was asked for, `dd` the elapsed time its own summary reports, and each command started from a
+  file a fixed process cost, so `time dd ...` reports a `real` no shorter than dd's `copied, S s`
+  and `time true` reports zeros (`crates/sensor-framework/src/shell/timing.rs#bash_report`).
+  `history` lists what the interactive login shell was typed as `    1  echo one`, under Ubuntu's
+  `HISTCONTROL=ignoreboth`; a `bash -c` (SSH exec) shell keeps none and lists nothing
+  (`crates/sensor-framework/src/shell/builtins.rs#FakeShell::builtin_history`).
   `$$` and `$!` come from a per-session process id seeded from the session id
   (`crates/sensor-framework/src/persona.rs#session_pid`), and the shell's own `/proc/PID` reads as
   `/proc/self`. Words are strings: byte-string arguments are deferred to the command families that
@@ -263,19 +333,37 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   terminal-rows model the shell does not have, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_more`) and `hexdump` (only `-e '16/1 "%c"'` with `-n`;
   any other format prints nothing, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_hexdump`), `dd` (`if`, `of`, `bs`, `ibs`, `obs`, `count`, `skip`, `seek`,
   `conv=notrunc`, `status`; the bytes are read once at offset `skip*bs` for `bs*count`, bounded by what the line has left, then the record
-  lines on stderr, plus GNU's summary whose elapsed time is synthesized, `crates/sensor-framework/src/shell/dd.rs#FakeShell::cmd_dd`),
+  lines on stderr, plus GNU's summary whose elapsed time is synthesized; `if=/dev/zero of=FILE` writes its zeros as an O(1)
+  fill, up to 1 GiB, so a disk-speed probe gets the size it asked for, `crates/sensor-framework/src/shell/dd.rs#FakeShell::cmd_dd`),
   `wc` (`-c -l -w -m` over a file or a pipe, GNU column widths and `total` row,
-  `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_wc`), `od` (`-An -tx1`, the default octal words and `-A`
-  radixes; other formats print nothing, `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_od`) and `grep` (only `-F` with `-c`, `-v`, `-i`;
-  a search without `-F` prints nothing, `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_grep`),
-  `ls` (sorted, dotfiles hidden without `-a`, which does not add `.` and `..`; a file operand lists
+  `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_wc`), `od` (`-An -tx1`, `-c`, the default octal words and `-A`
+  radixes; other formats print nothing, `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_od`), `grep` (GNU grep 3.7:
+  basic, `-E`, `-F` and an approximated `-P` syntax through a linear-time POSIX matcher, with `-i -v -c -n -o -q -s -w -x -l -L
+  -h -H -m -e -f -A -B -C -r -Z -a`, GNU's compile-error wordings and status 0/1/2,
+  `crates/sensor-framework/src/shell/grep.rs#FakeShell::cmd_grep`, `crates/sensor-framework/src/shell/regex.rs#Regex`),
+  `cut` (`-b -c -f -d -s --complement --output-delimiter`, `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_cut`),
+  `tee` (`-a`; its files are written like a redirection, so a body it saves from the session input is captured,
+  `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_tee`), `awk`/`mawk` (an interpreter for mawk 1.3.4's
+  language: patterns, `BEGIN`/`END`, fields, arrays, user functions, the string and math built-ins, `printf` through
+  glibc-compatible conversions, `getline` and output redirection; `system()`, `cmd | getline` and `print | cmd` run their text
+  through this shell's own evaluator; mawk's number output, usage text and error wordings,
+  `crates/sensor-framework/src/shell/awk.rs#FakeShell::cmd_awk`, `crates/sensor-framework/src/shell/cfmt.rs`),
+  `ls` (sorted, dotfiles hidden without `-a`, which lists `.` and `..` first where `-A` does not;
+  one name a line when standard output is no terminal, as over SSH exec or into a pipe; a file operand lists
   itself, files before directories, a `DIR:` heading once there are several operands, a missing
   one is `cannot access` with status 2; `-l` is GNU's long listing from the node facts `stat` prints,
   so a size or mode cannot disagree with `stat`, `wc -c` or `md5sum`, `crates/sensor-framework/src/shell/fileinfo.rs#FakeShell::cmd_ls`),
   `cp`/`rm`/`mkdir` (they change the session's filesystem and report the real errors),
   `wget`/`curl` (canned transcripts, `-O-`/`-qO-` writes body to stdout, a saved
   download becomes a file; `busybox wget` with no URL prints BusyBox 1.30.1's wget usage on
-  stderr and exits 1, `crates/sensor-framework/src/shell/busybox.rs#wget_usage`), `ping` (canned replies), `sh`/`bash`/`ash`
+  stderr and exits 1, `crates/sensor-framework/src/shell/busybox.rs#wget_usage`), `ping` (on Ubuntu iputils' report of a
+  host that answers every probe, invented and never sent: a dotted address or a name `/etc/hosts` lists answers with a round trip
+  that is a function of the address, any other name is `Name or service not known` as `getent hosts` reports it, and the wait is
+  charged to `time`, `crates/sensor-framework/src/shell/netclient.rs#FakeShell::cmd_ping`; BusyBox's canned replies on the phone
+  and under `busybox ping`), `ssh` (the client of the persona's OpenSSH: `-V` prints the version the banner and the
+  `openssh-client` package carry, a bare `ssh` the recorded usage, any reachable-looking destination `Connection timed out` after
+  the connect timeout and status 255; it connects to nothing, `crates/sensor-framework/src/shell/netclient.rs#FakeShell::cmd_ssh`),
+  `sh`/`bash`/`ash`
   (nested shell; `sh -c "CMD"` (also with `-c` clustered, `sh -lc`, `bash -ec`), `sh FILE` and a script piped to `sh` run their text in a shell level of their own), `enable` (bash's builtin list, since
   Mirai's telnet preamble sends it and only a non-bash says "command not found"), `mount`
   (the fake filesystem's mount table), `busybox` (the real v1.30.1 multi-call banner
@@ -283,7 +371,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `tftp`/`ftpget` (silent; the download url is synthesized from the separate host and file
   arguments as `tftp://host[:port]/file` / `ftp://host[:port]/file`, since neither command
   takes a url token),
-  `chmod`/`cp`/`rm`/`mkdir`/`sleep` (silent success), `cd`, `exit`/`logout`; an
+  `chmod`/`cp`/`rm`/`mkdir` (silent success), `sleep` (returns at once; GNU's errors for a
+  missing or bad interval), `cd`, `exit`/`logout`; an
   unknown command uses the active shell level's diagnostic form, and so does a path that does
   not exist: bash's `No such file or directory`, dash's and mksh's `not found`
   (`crates/sensor-framework/src/shell/mod.rs#FakeShell::invoke_path`).
@@ -531,9 +620,13 @@ captures SCP/SFTP transfers.
   client's `CHANNEL_EOF`, a `CHANNEL_CLOSE` (the command is killed and nothing is sent), the
   capture ceiling, or the session's end. With a pty the input is a terminal (echo, Ctrl-D,
   Ctrl-C), without one a pipe. At the shell, a typed line that reads its input takes the bytes
-  after it (to Ctrl-D with a pty, to the channel's EOF without one) and the prompt returns when it
-  ends; those bytes are its input and are not also offered to the binary-payload capture
-  (`crates/sensor-ssh/src/server.rs#ChannelHandler`). `MAX_LINE_LEN = 8192`
+  after it (with a pty, each line until the command has what it reads for, or to Ctrl-D; without
+  one, to the channel's EOF) and the prompt returns when it ends; those bytes are its input and
+  are not also offered to the binary-payload capture
+  (`crates/sensor-ssh/src/server.rs#ChannelHandler`). A shell without a pty reads a pipe as
+  bash does: no prompt, no `TERM`, `SSH_TTY` or `.bashrc` variables, no history, a bare `sh`
+  reads the rest of the input as its script, and the client's `CHANNEL_EOF` ends the shell
+  with the last command's status. `MAX_LINE_LEN = 8192`
   (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/server.rs#build_channel_extended_data`, `crates/sensor-ssh/src/server.rs#MAX_LINE_LEN`, `crates/sensor-framework/src/shell/mod.rs#onlcr`).
 - **Exec lifecycle:** a one-shot exec sends its queued output, then `exit-status`
   (`want_reply` false), then `CHANNEL_EOF`, then `CHANNEL_CLOSE`, each only once all
@@ -586,7 +679,8 @@ credential, then presents the fake shell.
   only when the shell reports `close_session` (see below). `MAX_LINE_LEN` 8192
   (`crates/sensor-telnet/src/handler.rs#LineReader`). The reader keeps what it read off the
   socket and cuts lines from it only as they are wanted, so a typed line that reads its input
-  (`cat > f`) takes the raw bytes after it, as a terminal, until Ctrl-D, the same input model as
+  (`cat > f`) takes the raw bytes after it, as a terminal, until Ctrl-D or until the command has
+  the lines it reads for (`read x`), the same input model as
   the SSH shell (`crates/sensor-telnet/src/handler.rs#LineReader::read_held`). The rest of a
   CR-LF or CR-NUL Enter already read stays with its line. The binary-payload capture keeps the
   bytes the line reader consumed, so input a command consumed is captured once, as that.
@@ -1221,7 +1315,8 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
   command is killed, nothing is sent, the capture's end is `peer_closed`), the capture ceiling
   (the command runs on what was kept and the stream closes after its output) or the session's
   end ends it. At the interactive `shell:` a typed line that reads its input takes what is typed
-  after it until Ctrl-D, as on the SSH and telnet shells
+  after it until Ctrl-D or until the command has the lines it reads for, as on the SSH and
+  telnet shells
   (`crates/sensor-adb/src/handler.rs#HeldStdin`). Sync sub-protocol: SEND/DATA/DONE → captures the pushed file →
   `honeypot_malware_upload`; RECV → refused (`FAIL Permission denied`, **never
   serves outbound**); STAT → not-found. Sync body cap `MAX_SYNC_BODY` 10_000_000

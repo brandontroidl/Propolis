@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::binaries::{self, BinaryImage};
 use crate::budget::{BudgetError, BudgetLimits, ConnectionBudget, FsCounters};
+use crate::etc;
 use crate::persona;
 
 /// Unix seconds stamped on every baked node (2024-01-01T00:00:00Z). Persona data: invisible until
@@ -503,7 +504,13 @@ pub struct FakeFs {
     /// and removals land in the overlay above it. Per instance, never shared: each shell's
     /// process table is its own.
     generated: HashMap<String, Node>,
+    /// The time a write stamps on what it writes: the session's clock, so a file written now
+    /// lists with today's date (a fixed 2024 date on a file the attacker just wrote was a tell).
+    clock: FsClock,
 }
+
+/// Where a filesystem reads the time it stamps on writes.
+pub type FsClock = fn() -> chrono::DateTime<chrono::Utc>;
 
 /// What [`FakeFs::checkpoint`] saved.
 pub(crate) struct FsCheckpoint {
@@ -512,9 +519,10 @@ pub(crate) struct FsCheckpoint {
     counters: FsCounters,
 }
 
-/// The most generated nodes one filesystem holds. The shell's process table is a handful of
-/// processes with a few nodes each; the bound only keeps a caller's bug from growing the map.
-pub const GENERATED_MAX: usize = 256;
+/// The most generated nodes one filesystem holds. The shell's process table is about ninety rows
+/// (kernel threads with four nodes each, the rest with nine); the bound only keeps a caller's bug
+/// from growing the map.
+pub const GENERATED_MAX: usize = 2_048;
 
 impl Default for FakeFs {
     fn default() -> Self {
@@ -562,6 +570,36 @@ impl Builder {
             path.to_string(),
             Node::directory(entries.iter().map(|e| e.to_string()).collect()),
         );
+    }
+
+    /// A file with its own permission bits, group and date, where the stock `0644 root:root` at the
+    /// persona's date would be wrong (`/etc/shadow` is `0640 root:shadow`).
+    fn file_meta(
+        &mut self,
+        path: &str,
+        content: impl Into<Vec<u8>>,
+        permissions: u32,
+        gid: u32,
+        mtime: i64,
+    ) {
+        let mut node = Node::regular(Blob::from_bytes(content), MODE_REGULAR | permissions);
+        node.meta.gid = gid;
+        node.meta.mtime = mtime;
+        self.nodes.insert(path.to_string(), node);
+    }
+
+    /// A directory with its own permission bits (`/root` is `0700`).
+    fn dir_mode(&mut self, path: &str, entries: &[&str], permissions: u32) {
+        let mut node = Node::directory(entries.iter().map(|e| e.to_string()).collect());
+        node.meta.mode = 0o040_000 | permissions;
+        self.nodes.insert(path.to_string(), node);
+    }
+
+    /// Give the node already built at `path` the group `gid`.
+    fn set_gid(&mut self, path: &str, gid: u32) {
+        if let Some(node) = self.nodes.get_mut(path) {
+            node.meta.gid = gid;
+        }
     }
 
     fn symlink(&mut self, path: &str, target: &str) {
@@ -623,6 +661,7 @@ impl FakeFs {
             persistent: Arc::new(Mutex::new(Persistent::default())),
             budget: ConnectionBudget::new(BudgetLimits::default()),
             generated: HashMap::new(),
+            clock: chrono::Utc::now,
         }
     }
 
@@ -636,7 +675,20 @@ impl FakeFs {
             persistent: Arc::clone(&self.persistent),
             budget: Arc::clone(&self.budget),
             generated: HashMap::new(),
+            clock: self.clock,
         }
+    }
+
+    /// Stamp writes with `clock` instead of the system clock. A shell with a fixed clock (a
+    /// replay) hands it down so its listings repeat byte for byte.
+    pub fn set_clock(&mut self, clock: FsClock) {
+        self.clock = clock;
+    }
+
+    /// `node` with this filesystem's time as its modification time.
+    fn stamped(&self, mut node: Node) -> Node {
+        node.meta.mtime = (self.clock)().timestamp();
+        node
     }
 
     /// Everything a shell line can change here: the shared written state, this instance's generated
@@ -684,6 +736,14 @@ impl FakeFs {
             .collect();
     }
 
+    /// Replace one generated node, or add it while the set has room: the nodes that follow the
+    /// clock (`/proc/uptime`, `/proc/loadavg`) are refreshed this way without rebuilding the set.
+    pub fn put_generated(&mut self, path: &str, node: Node) {
+        if self.generated.len() < GENERATED_MAX || self.generated.contains_key(path) {
+            self.generated.insert(path.to_string(), node);
+        }
+    }
+
     /// This filesystem charging `budget` instead of its own standard-limits one, so it shares a
     /// ceiling with the rest of its connection.
     pub fn with_budget(mut self, budget: Arc<ConnectionBudget>) -> Self {
@@ -714,36 +774,35 @@ impl FakeFs {
         let mut b = Builder::new();
 
         b.file("/etc/hostname", format!("{host}\n"));
-        b.file(
-            "/etc/passwd",
-            "root:x:0:0:root:/root:/bin/bash\n\
-             daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
-             bin:x:2:2:bin:/bin:/usr/sbin/nologin\n\
-             sys:x:3:3:sys:/dev:/usr/sbin/nologin\n\
-             mail:x:8:8:mail:/var/mail:/usr/sbin/nologin\n\
-             www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n\
-             nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n\
-             sshd:x:105:65534::/run/sshd:/usr/sbin/nologin\n\
-             ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n",
+        // The account database a real 22.04 server has (`crate::etc`): every account the process
+        // table runs a daemon as, and every group the files and `ls -l` name.
+        b.file("/etc/passwd", etc::PASSWD);
+        b.file("/etc/group", etc::GROUP);
+        b.file_meta(
+            "/etc/shadow",
+            etc::shadow(),
+            0o640,
+            etc::SHADOW_GID,
+            PERSONA_MTIME,
         );
-        // Every group the passwd file and `ls -l` name, so `getent group` and `cat /etc/group`
-        // agree with them. Memberships are the stock Ubuntu cloud image's login user.
-        b.file(
-            "/etc/group",
-            "root:x:0:\n\
-             daemon:x:1:\n\
-             bin:x:2:\n\
-             sys:x:3:\n\
-             adm:x:4:ubuntu\n\
-             tty:x:5:\n\
-             disk:x:6:\n\
-             mail:x:8:\n\
-             sudo:x:27:ubuntu\n\
-             www-data:x:33:\n\
-             users:x:100:\n\
-             nogroup:x:65534:\n\
-             ubuntu:x:1000:\n",
+        b.file_meta(
+            "/etc/gshadow",
+            etc::gshadow(),
+            0o640,
+            etc::SHADOW_GID,
+            PERSONA_MTIME,
         );
+        b.file_meta(
+            "/etc/netplan/00-installer-config.yaml",
+            etc::NETPLAN,
+            0o600,
+            0,
+            PERSONA_MTIME,
+        );
+        b.dir("/etc/netplan", &["00-installer-config.yaml"]);
+        // What `pam_env` reads into every login's `LANG` (the value `env` shows).
+        b.file("/etc/default/locale", "LANG=C.UTF-8\n");
+        b.dir("/etc/default", &["locale"]);
         // The synthetic resolver is the model gateway (the same 172.31.16.1 `ip route` shows),
         // never a real nameserver: `nslookup` and `dig` name it and query nothing.
         b.file("/etc/resolv.conf", "nameserver 172.31.16.1\n");
@@ -758,21 +817,9 @@ impl FakeFs {
                  ff02::2 ip6-allrouters\n"
             ),
         );
-        b.file(
-            "/etc/os-release",
-            format!(
-                "NAME=\"{name}\"\n\
-                 VERSION=\"{version}\"\n\
-                 ID=ubuntu\n\
-                 ID_LIKE=debian\n\
-                 PRETTY_NAME=\"{pretty}\"\n\
-                 VERSION_ID=\"{vid}\"\n",
-                name = persona::OS_NAME,
-                version = persona::OS_VERSION,
-                pretty = persona::OS_PRETTY,
-                vid = persona::OS_VERSION_ID,
-            ),
-        );
+        // `/etc/os-release` is a link to the file base-files installs, as on the reference.
+        b.file("/usr/lib/os-release", etc::os_release());
+        b.symlink("/etc/os-release", "../usr/lib/os-release");
         b.file("/proc/version", format!("{}\n", persona::proc_version()));
         // One mount table behind every file that exposes it, so `cat /proc/mounts`,
         // `/proc/self/mounts`, `/etc/mtab` (a symlink to the second, as on Ubuntu), `mountinfo`
@@ -782,38 +829,62 @@ impl FakeFs {
         b.dir("/proc/self", &["mountinfo", "mounts"]);
         b.file("/proc/self/mounts", render_mounts(&MOUNT_TABLE));
         b.file("/proc/self/mountinfo", render_mountinfo(&MOUNT_TABLE));
-        b.file(
-            "/proc/cpuinfo",
-            "processor\t: 0\n\
-             vendor_id\t: GenuineIntel\n\
-             model name\t: Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz\n\
-             cpu cores\t: 1\n",
-        );
+        b.file("/proc/cpuinfo", UBUNTU_CPUINFO);
         b.file("/proc/meminfo", render_meminfo(&UBUNTU_MEMINFO));
+        // The kernel's own files; the pid directories, `net`, `uptime` and `loadavg` are the
+        // shell's generated set and join the listing from there. procfs and sysfs roots are 0555.
+        b.dir_mode(
+            "/proc",
+            &["cpuinfo", "meminfo", "mounts", "self", "version"],
+            0o555,
+        );
 
         b.dir(
             "/",
             &[
-                "bin", "boot", "dev", "etc", "home", "lib", "lib64", "media", "mnt", "opt", "proc",
-                "root", "run", "sbin", "srv", "sys", "tmp", "usr", "var",
+                "bin", "boot", "dev", "etc", "home", "lib", "lib32", "lib64", "libx32", "media",
+                "mnt", "opt", "proc", "root", "run", "sbin", "srv", "sys", "tmp", "usr", "var",
             ],
         );
-        // A freshly-booted honeypot has an empty /tmp and an empty (dotfiles-only, so invisible
-        // to a plain `ls`) /root - both are present as *known, empty* directories rather than
-        // absent, so `ls` on either returns a correct empty listing instead of misreporting a
-        // brand-new box as not even having a /root or /tmp at all.
-        b.dir("/tmp", &[]);
-        b.dir("/root", &[]);
+        // A freshly-booted honeypot has an empty /tmp, sticky and world-writable as every Linux
+        // has it, and a /root holding only the dotfiles a root that has logged in before has (so
+        // a plain `ls` lists nothing there, and `ls -a` what the reference listed).
+        b.dir_mode("/tmp", &[], 0o1777);
+        b.dir_mode("/root", &[".bashrc", ".cache", ".profile", ".ssh"], 0o700);
+        b.file_meta(
+            "/root/.bashrc",
+            etc::ROOT_BASHRC,
+            0o644,
+            0,
+            etc::ROOT_BASHRC_MTIME,
+        );
+        b.file_meta(
+            "/root/.profile",
+            etc::ROOT_PROFILE,
+            0o644,
+            0,
+            etc::ROOT_PROFILE_MTIME,
+        );
+        b.dir_mode("/root/.cache", &["motd.legal-displayed"], 0o700);
+        b.file("/root/.cache/motd.legal-displayed", "");
+        b.dir_mode("/root/.ssh", &[], 0o700);
+        b.dir("/etc/alternatives", &["awk"]);
         b.dir(
             "/etc",
             &[
+                "alternatives",
+                "default",
                 "group",
+                "gshadow",
                 "hostname",
                 "mtab",
+                "netplan",
                 "passwd",
                 "hosts",
                 "os-release",
                 "resolv.conf",
+                "shadow",
+                "systemd",
             ],
         );
         b.dir("/home", &["ubuntu"]);
@@ -821,7 +892,7 @@ impl FakeFs {
         // that `cat /proc/mounts` lists never fails.
         b.dir("/boot", &["efi", "grub"]);
         b.dir("/boot/efi", &["EFI"]);
-        b.dir(
+        b.dir_mode(
             "/sys",
             &[
                 "block",
@@ -836,6 +907,7 @@ impl FakeFs {
                 "module",
                 "power",
             ],
+            0o555,
         );
         b.dir("/sys/fs", &["bpf", "cgroup", "ext4", "fuse", "pstore"]);
         b.dir("/sys/fs/cgroup", &[]);
@@ -877,13 +949,57 @@ impl FakeFs {
                 "tmp",
             ],
         );
-        b.dir("/var/tmp", &[]);
+        b.dir_mode("/var/tmp", &[], 0o1777);
+        // cron's spool: `crontab` writes the user's table here as group `crontab`, and the
+        // directory is `drwx-wx--T root crontab` as Debian's cron package makes it.
+        b.dir("/var/spool", &["cron"]);
+        b.dir("/var/spool/cron", &["crontabs"]);
+        b.dir_mode("/var/spool/cron/crontabs", &[], 0o1730);
+        b.set_gid("/var/spool/cron/crontabs", etc::CRONTAB_GID);
+        // The units a stock server enables, as the symlinks `systemctl enable` made: `systemctl
+        // is-enabled`, `enable` and `disable` read and change these and nothing else.
+        let mut wants_dirs: Vec<(&str, Vec<&str>)> = Vec::new();
+        for &(target, unit) in etc::ENABLED_UNITS {
+            match wants_dirs.iter_mut().find(|(t, _)| *t == target) {
+                Some((_, units)) => units.push(unit),
+                None => wants_dirs.push((target, vec![unit])),
+            }
+            b.symlink(
+                &format!("/etc/systemd/system/{target}.wants/{unit}"),
+                &format!("/lib/systemd/system/{unit}"),
+            );
+        }
+        let mut system_entries: Vec<String> = wants_dirs
+            .iter()
+            .map(|(target, _)| format!("{target}.wants"))
+            .collect();
+        for (target, units) in &wants_dirs {
+            let mut units = units.clone();
+            units.sort_unstable();
+            b.dir(&format!("/etc/systemd/system/{target}.wants"), &units);
+        }
+        for (alias, unit) in [
+            ("sshd.service", "ssh.service"),
+            ("syslog.service", "rsyslog.service"),
+        ] {
+            b.symlink(
+                &format!("/etc/systemd/system/{alias}"),
+                &format!("/lib/systemd/system/{unit}"),
+            );
+            system_entries.push(alias.to_string());
+        }
+        system_entries.sort_unstable();
+        let system_entries: Vec<&str> = system_entries.iter().map(String::as_str).collect();
+        b.dir("/etc/systemd/system", &system_entries);
+        b.dir("/etc/systemd/user", &[]);
+        b.dir("/etc/systemd", &["system", "user"]);
         b.dir("/run", &["lock", "user"]);
         b.dir("/mnt", &[]);
         b.dir(
             "/usr",
             &[
-                "bin", "games", "include", "lib", "lib64", "local", "sbin", "share", "src",
+                "bin", "games", "include", "lib", "lib32", "lib64", "libx32", "local", "sbin",
+                "share", "src",
             ],
         );
         b.dir(
@@ -914,17 +1030,32 @@ impl FakeFs {
             b.image(binary);
         }
         for alias in binaries::ALIASES {
-            b.symlink(alias.path, alias.target);
+            match (alias.via, binaries::find(alias.target)) {
+                (Some(via), Some(target)) => {
+                    b.symlink(alias.path, via);
+                    b.symlink(via, target.path);
+                }
+                _ => b.symlink(alias.path, alias.target),
+            }
         }
         b.binary(binaries::WHICH_PATH, binaries::WHICH_SCRIPT);
         // The usrmerge layout: the top-level names are symlinks into /usr, with relative targets
         // as the real ones have, and their targets must be directories.
-        for name in ["bin", "sbin", "lib", "lib64"] {
+        // 22.04's amd64 base-files carries the multilib pair too (recorded `ls -la /`).
+        for name in ["bin", "sbin", "lib", "lib32", "lib64", "libx32"] {
             b.symlink(&format!("/{name}"), &format!("usr/{name}"));
         }
-        b.dir("/usr/sbin", &[]);
-        b.dir("/usr/lib", &[]);
+        // iproute2 ships `ip` in /usr/bin and links /usr/sbin/ip to it (recorded), so `which ip`
+        // finds /usr/sbin/ip first.
+        b.symlink("/usr/sbin/ip", "/bin/ip");
+        b.dir("/usr/sbin", &["ip", "sshd"]);
+        // `crontab` is setgid `crontab`, so it can write the spool (recorded `-rwxr-sr-x root
+        // crontab`).
+        b.set_gid("/usr/bin/crontab", etc::CRONTAB_GID);
+        b.dir("/usr/lib", &["os-release"]);
+        b.dir("/usr/lib32", &[]);
         b.dir("/usr/lib64", &[]);
+        b.dir("/usr/libx32", &[]);
         b.symlink("/var/run", "/run");
         b.symlink("/var/lock", "/run/lock");
         b.symlink("/etc/mtab", "/proc/self/mounts");
@@ -1390,6 +1521,16 @@ impl FakeFs {
         })
     }
 
+    /// Whether `path`, every link followed, is a regular file this session wrote rather than one
+    /// the box shipped: running it runs the attacker's file, never the modeled command that
+    /// happens to share its name.
+    pub fn is_session_file(&self, path: &str) -> bool {
+        let p = self.lock();
+        self.lookup(&p, path).is_some_and(|(physical, node)| {
+            matches!(node.kind, NodeKind::Regular(_)) && p.overlay.nodes.contains_key(&physical)
+        })
+    }
+
     /// Whether `path` is a directory this box presents, following symlinks. `cd` and the write
     /// probes consult this, so the shell never lets an attacker enter a directory that `ls /`
     /// did not show, and never refuses one it did.
@@ -1487,7 +1628,9 @@ impl FakeFs {
             return Err(error.into());
         }
         p.overlay.tombstones.remove(&physical);
-        p.overlay.nodes.insert(physical, Node::regular(blob, mode));
+        p.overlay
+            .nodes
+            .insert(physical, self.stamped(Node::regular(blob, mode)));
         Ok(())
     }
 
@@ -1570,7 +1713,7 @@ impl FakeFs {
         p.overlay.tombstones.remove(&physical);
         p.overlay
             .nodes
-            .insert(physical, Node::directory(Vec::new()));
+            .insert(physical, self.stamped(Node::directory(Vec::new())));
         Ok(())
     }
 
@@ -1605,8 +1748,28 @@ impl FakeFs {
             }
         }
         p.overlay.tombstones.remove(&physical);
-        p.overlay.nodes.insert(physical, Node::symlink(target));
+        p.overlay
+            .nodes
+            .insert(physical, self.stamped(Node::symlink(target)));
         Ok(())
+    }
+
+    /// Give the file the session wrote at `path` the group `gid`, as a setgid tool's own write
+    /// does (`crontab` installs into its spool as group `crontab`). Only a node this session
+    /// wrote changes; `false` when there is none.
+    pub fn set_written_group(&mut self, path: &str, gid: u32) -> bool {
+        let mut guard = self.lock();
+        let p = &mut *guard;
+        let Ok(physical) = self.resolve(p, path, false) else {
+            return false;
+        };
+        match p.overlay.nodes.get_mut(&physical) {
+            Some(node) => {
+                node.meta.gid = gid;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The ext2 attribute bits (`chattr`) of the node `path` names, or `None` when nothing is
@@ -1900,8 +2063,10 @@ pub const MOUNT_TABLE: [MountEntry; 20] = [
         "tmpfs",
         "rw,nosuid,nodev,noexec,relatime,size=402244k,mode=755,inode64",
     ),
+    // Ubuntu's cloud images boot without an initramfs root device name, so the root filesystem
+    // shows as `/dev/root` (the Xen disk's first partition, `xvda1`).
     MountEntry::new(
-        "/dev/sda1",
+        "/dev/root",
         "/",
         "ext4",
         "rw,relatime,discard,errors=remount-ro",
@@ -1974,7 +2139,7 @@ pub const MOUNT_TABLE: [MountEntry; 20] = [
         "rw,nosuid,nodev,noexec,relatime",
     ),
     MountEntry::new(
-        "/dev/sda15",
+        "/dev/xvda15",
         "/boot/efi",
         "vfat",
         "rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro",
@@ -1986,6 +2151,39 @@ pub const MOUNT_TABLE: [MountEntry; 20] = [
         "rw,nosuid,nodev,relatime,size=402240k,nr_inodes=100560,mode=700,inode64",
     ),
 ];
+
+/// The one vCPU of the Ubuntu host, an EC2 Xen guest on a Broadwell E5-2686 v4. The layout (the
+/// tab-padded keys, the blank line that ends a processor's block) is the 5.15 kernel's, recorded on
+/// 2026-10-07 from a reference host's `/proc/cpuinfo`; the values describe this persona's CPU and
+/// are [unverified]: composed from what EC2 publishes for its `t2` family, not captured from one.
+/// `nproc` counts its `processor` entries and `top` its one `%Cpu(s)` line, so the three agree.
+pub const UBUNTU_CPUINFO: &str = "processor\t: 0\n\
+vendor_id\t: GenuineIntel\n\
+cpu family\t: 6\n\
+model\t\t: 79\n\
+model name\t: Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz\n\
+stepping\t: 1\n\
+microcode\t: 0xb000040\n\
+cpu MHz\t\t: 2299.998\n\
+cache size\t: 46080 KB\n\
+physical id\t: 0\n\
+siblings\t: 1\n\
+core id\t\t: 0\n\
+cpu cores\t: 1\n\
+apicid\t\t: 0\n\
+initial apicid\t: 0\n\
+fpu\t\t: yes\n\
+fpu_exception\t: yes\n\
+cpuid level\t: 13\n\
+wp\t\t: yes\n\
+flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx rdtscp lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm cpuid_fault invpcid_single pti fsgsbase bmi1 avx2 smep bmi2 erms invpcid xsaveopt\n\
+bugs\t\t: cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs itlb_multihit mmio_stale_data\n\
+bogomips\t: 4599.99\n\
+clflush size\t: 64\n\
+cache_alignment\t: 64\n\
+address sizes\t: 46 bits physical, 48 bits virtual\n\
+power management:\n\
+\n";
 
 /// One `/proc/meminfo` line: the field, its value, and whether the kernel writes ` kB` after it
 /// (the huge-page counts are bare numbers).
@@ -2178,11 +2376,11 @@ mod tests {
         let mounts = read_string(&fs, "/proc/mounts");
         assert_eq!(read_string(&fs, "/proc/self/mounts"), mounts);
         assert_eq!(read_string(&fs, "/etc/mtab"), mounts);
-        assert!(mounts.contains("/dev/sda1 / ext4 rw,relatime,discard,errors=remount-ro 0 0\n"));
+        assert!(mounts.contains("/dev/root / ext4 rw,relatime,discard,errors=remount-ro 0 0\n"));
         assert_eq!(mounts.lines().count(), MOUNT_TABLE.len());
         let info = read_string(&fs, "/proc/self/mountinfo");
         assert_eq!(info.lines().count(), MOUNT_TABLE.len());
-        assert!(info.contains(" / / rw,relatime - ext4 /dev/sda1 rw,discard,errors=remount-ro\n"));
+        assert!(info.contains(" / / rw,relatime - ext4 /dev/root rw,discard,errors=remount-ro\n"));
         for m in MOUNT_TABLE {
             assert!(
                 fs.is_dir(m.point),
@@ -2428,7 +2626,7 @@ mod tests {
     ];
 
     const UBUNTU_LISTINGS: &str = "\
-/: bin boot dev etc home lib lib64 media mnt opt proc root run sbin srv sys tmp usr var
+/: bin boot dev etc home lib lib32 lib64 libx32 media mnt opt proc root run sbin srv sys tmp usr var
 /boot: efi grub
 /boot/efi: EFI
 /dev: hugepages mqueue null pts random shm stderr stdin stdout tty urandom zero
@@ -2436,10 +2634,13 @@ mod tests {
 /dev/mqueue:
 /dev/pts: 0 ptmx
 /dev/shm:
-/etc: group hostname hosts mtab os-release passwd resolv.conf
+/etc: alternatives default group gshadow hostname hosts mtab netplan os-release passwd resolv.conf shadow systemd
+/etc/systemd: system user
+/etc/systemd/system: getty.target.wants graphical.target.wants multi-user.target.wants sshd.service sysinit.target.wants syslog.service
+/etc/systemd/system/sysinit.target.wants: apparmor.service blk-availability.service keyboard-setup.service lvm2-monitor.service multipathd.service systemd-timesyncd.service
 /home: ubuntu
 /mnt:
-/root:
+/root: .bashrc .cache .profile .ssh
 /run: lock user
 /run/lock:
 /run/user: 0
@@ -2457,8 +2658,11 @@ mod tests {
 /sys/kernel/security:
 /sys/kernel/tracing:
 /tmp:
-/usr: bin games include lib lib64 local sbin share src
+/usr: bin games include lib lib32 lib64 libx32 local sbin share src
 /var: backups cache lib local lock log mail opt run spool tmp
+/var/spool: cron
+/var/spool/cron: crontabs
+/var/spool/cron/crontabs:
 /var/tmp:
 ";
 
@@ -2538,11 +2742,18 @@ selinuxfs /sys/fs/selinux selinuxfs rw,relatime 0 0
                 assert_eq!(listed.join(" "), names.trim(), "{name}: ls {path}");
             }
         }
-        // /var/run was an empty directory and is /run now, as on a real box; /proc, /bin and the
-        // other directories that were only implied used to refuse a listing and now list empty.
+        // /var/run was an empty directory and is /run now, as on a real box; /proc lists the
+        // kernel's own files (a shell adds its pid directories).
         let fs = FakeFs::new();
         assert_eq!(fs.list_dir("/var/run"), fs.list_dir("/run"));
-        assert_eq!(fs.list_dir("/proc"), Some(Vec::new()));
+        assert_eq!(
+            fs.list_dir("/proc"),
+            Some(
+                ["cpuinfo", "meminfo", "mounts", "self", "version"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
     }
 
     #[test]

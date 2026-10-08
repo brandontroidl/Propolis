@@ -96,7 +96,7 @@ fn stat_of_a_modeled_file_shows_the_size_mode_and_owner_the_filesystem_holds() {
         .trim_end()
         .to_string();
     let expected = format!(
-        "  File: /etc/hostname\n  Size: {len:<10}\tBlocks: 8          IO Block: 4096   regular file\nDevice: 801h/2049d\tInode: {inode:<10}  Links: 1\nAccess: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)\nAccess: 2024-01-01 00:00:00.000000000 +0000\nModify: 2024-01-01 00:00:00.000000000 +0000\nChange: 2024-01-01 00:00:00.000000000 +0000\n Birth: 2024-01-01 00:00:00.000000000 +0000\n"
+        "  File: /etc/hostname\n  Size: {len:<10}\tBlocks: 8          IO Block: 4096   regular file\nDevice: ca01h/51713d\tInode: {inode:<10}  Links: 1\nAccess: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)\nAccess: 2024-01-01 00:00:00.000000000 +0000\nModify: 2024-01-01 00:00:00.000000000 +0000\nChange: 2024-01-01 00:00:00.000000000 +0000\n Birth: 2024-01-01 00:00:00.000000000 +0000\n"
     );
     assert_eq!(
         answer(&mut sh, "stat /etc/hostname"),
@@ -114,7 +114,7 @@ fn stat_c_size_equals_the_file_length_and_agrees_with_wc() {
     sh.fs.write_file("/tmp/five", &[b'z'; 5000]).unwrap();
     assert_eq!(out(&mut sh, "stat -c %s /tmp/five"), "5000\n");
     assert_eq!(out(&mut sh, "wc -c < /tmp/five"), "5000\n");
-    for path in ["/etc/passwd", "/etc/hosts", "/etc/os-release"] {
+    for path in ["/etc/passwd", "/etc/hosts", "/usr/lib/os-release"] {
         let len = sh.fs.read_all(path, 1 << 20).unwrap().len();
         assert_eq!(
             out(&mut sh, &format!("stat -c %s {path}")),
@@ -211,7 +211,7 @@ fn stat_format_directives_read_the_modeled_metadata() {
     );
     assert_eq!(
         out(&mut sh, "stat -c '%F|%a|%A' /tmp"),
-        "directory|755|drwxr-xr-x\n"
+        "directory|1777|drwxrwxrwt\n"
     );
     assert_eq!(
         out(&mut sh, "stat -c '%F %t,%T' /dev/null"),
@@ -243,13 +243,14 @@ fn stat_format_directives_read_the_modeled_metadata() {
 
 #[test]
 fn stat_terse_and_the_filesystem_form_agree_with_the_models() {
-    let mut sh = shell();
+    let mut sh = shell().with_clock(noon);
     sh.fs.write_file("/tmp/nine", b"123456789").unwrap();
     let inode = out(&mut sh, "stat -c %i /tmp/nine").trim_end().to_string();
+    // A file written now carries the session clock's time, on the root disk's device.
     assert_eq!(
         out(&mut sh, "stat -t /tmp/nine"),
         format!(
-            "/tmp/nine 9 8 81a4 0 0 801 {inode} 1 0 0 1704067200 1704067200 1704067200 1704067200 4096\n"
+            "/tmp/nine 9 8 81a4 0 0 ca01 {inode} 1 0 0 1790683200 1790683200 1790683200 1790683200 4096\n"
         )
     );
     // `-f` takes the capacity `df` shows for the mount, in 4 KiB blocks.
@@ -297,8 +298,8 @@ fn stat_inode_device_and_link_count_come_from_the_node_and_are_stable() {
     assert_ne!(a, out(&mut sh, "stat -c '%i %D %d' /bin/cat"));
     assert_eq!(a, out(&mut sh, "stat -c '%i %D %d' /bin/ls"), "repeatable");
     assert_eq!(out(&mut sh, "stat -c %i /"), "2\n");
-    // The device is the mount's: the root disk, then the tmpfs, which is not it.
-    assert!(a.contains(" 801 2049\n"), "{a}");
+    // The device is the mount's: the root disk (`xvda1`, 202:1), then the tmpfs, which is not it.
+    assert!(a.contains(" ca01 51713\n"), "{a}");
     assert_ne!(
         out(&mut sh, "stat -c %D /run"),
         out(&mut sh, "stat -c %D /")
@@ -937,7 +938,7 @@ fn find_reports_a_malformed_expression_as_findutils_does() {
 
 #[test]
 fn the_phone_has_stat_and_find_with_toybox_wording() {
-    let mut sh = phone();
+    let mut sh = phone().with_clock(noon);
     sh.fs.make_dir("/data/local/tmp/t").unwrap();
     sh.fs.write_file("/data/local/tmp/t/a", b"hello").unwrap();
     assert_eq!(
@@ -950,7 +951,8 @@ fn the_phone_has_stat_and_find_with_toybox_wording() {
         "{text}"
     );
     assert!(!text.contains("Birth"), "toybox has no birth time: {text}");
-    assert!(text.contains("Modify: 2024-01-01 00:00:00.000000000 +0000\n"));
+    // Written now, so stamped with the session clock.
+    assert!(text.contains("Modify: 2026-09-29 12:00:00.000000000 +0000\n"));
     assert_eq!(
         out(&mut sh, "find /data/local/tmp/t"),
         lines(&["/data/local/tmp/t", "/data/local/tmp/t/a"])
@@ -1180,6 +1182,23 @@ fn the_commands_read_the_model_and_change_nothing() {
             sh.fs.list_dir("/proc")
         )
     );
+}
+
+/// The modes every Ubuntu 22.04 host shows for its special directories (recorded `ls -la /`):
+/// a sticky world-writable `/tmp`, read-only procfs and sysfs roots, a private `/root`, and the
+/// multilib links base-files ships.
+#[test]
+fn the_root_directories_have_the_modes_a_real_host_shows() {
+    let mut sh = shell();
+    assert_eq!(
+        out(&mut sh, "stat -c '%A %n' /tmp /proc /sys /root /etc"),
+        "drwxrwxrwt /tmp\ndr-xr-xr-x /proc\ndr-xr-xr-x /sys\ndrwx------ /root\ndrwxr-xr-x /etc\n"
+    );
+    assert_eq!(
+        out(&mut sh, "readlink /lib32 /libx32"),
+        "usr/lib32\nusr/libx32\n"
+    );
+    assert_eq!(answer(&mut sh, "test -d /libx32/").2, 0);
 }
 
 #[test]

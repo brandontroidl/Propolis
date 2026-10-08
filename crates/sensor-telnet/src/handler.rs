@@ -225,8 +225,11 @@ pub async fn handle_connection<S>(
                     CAPTURE_REASON_SHELL_STDIN,
                     max_stdin_bytes,
                 );
-                match reader.read_held(&mut stream, &mut input).await {
-                    Some(end) => input.finish(&mut shell, end),
+                // Each Enter hands the command its line: `read x` finishes on the first.
+                input.per_line();
+                match reader.read_held(&mut stream, &mut input, &mut shell).await {
+                    Some(HeldOutcome::Ended(end)) => input.finish(&mut shell, end),
+                    Some(HeldOutcome::Resumed(output)) => output,
                     None => {
                         let _ = input.finish(&mut shell, HeldEnd::Cut(reader.session_end));
                         break;
@@ -358,6 +361,14 @@ fn login_event(
         session_id: Some(session_id),
         occurrence_id: None,
     }
+}
+
+/// How the input of a held line came to an end.
+enum HeldOutcome {
+    /// The input ended (Ctrl-D, Ctrl-C, the capture ceiling): run the line on it.
+    Ended(HeldEnd),
+    /// The command finished on the lines typed so far; this is what it printed.
+    Resumed(sensor_framework::shell::CommandResult),
 }
 
 /// Buffered, IAC-stripping line reader. One instance per connection; `bounds` governs every
@@ -592,13 +603,15 @@ impl LineReader {
     }
 
     /// Hand the bytes after a line that reads its input to `input` until the input ends (Ctrl-D,
-    /// Ctrl-C, the capture ceiling), echoing them as the terminal does. `None` when the session
-    /// ended first; `session_end` says how. The bytes after the end are left for the next line.
+    /// Ctrl-C, the capture ceiling) or the command has read all it wanted from the lines typed
+    /// so far, echoing them as the terminal does. `None` when the session ended first;
+    /// `session_end` says how. The bytes after the end are left for the next line.
     async fn read_held<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
         stream: &mut S,
         input: &mut HeldInput,
-    ) -> Option<HeldEnd> {
+        shell: &mut FakeShell,
+    ) -> Option<HeldOutcome> {
         if std::mem::take(&mut self.prev_cr) {
             input.follow_cr();
         }
@@ -616,8 +629,14 @@ impl LineReader {
                     self.session_end = CaptureEnd::TransportError;
                     return None;
                 }
-                if fed.ended.is_some() {
-                    return fed.ended;
+                if let Some(end) = fed.ended {
+                    return Some(HeldOutcome::Ended(end));
+                }
+                if fed.line
+                    && let Some(output) = input.resume(shell)
+                {
+                    self.prev_cr = input.ended_on_cr();
+                    return Some(HeldOutcome::Resumed(output));
                 }
                 continue;
             }

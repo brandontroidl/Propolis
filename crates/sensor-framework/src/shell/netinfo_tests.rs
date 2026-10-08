@@ -483,64 +483,82 @@ fn daemon_pid(sh: &mut FakeShell, comm: &str) -> String {
 }
 
 #[test]
-fn ubuntu_ss_and_the_proc_files_show_the_sshd_listener_of_the_process_table() {
+fn ubuntu_ss_and_the_proc_files_show_the_sockets_of_the_process_table() {
     let mut sh = shell();
+    // Byte for byte what `ss -tuln | cat -A` showed on Ubuntu 22.04 (2026-10-07): resolved's
+    // stub on UDP and TCP, then sshd on both families, every row padded to the Process column.
+    assert_eq!(
+        out(&mut sh, "ss -tuln"),
+        "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess\n\
+         udp   UNCONN 0      0      127.0.0.53%lo:53        0.0.0.0:*          \n\
+         tcp   LISTEN 0      4096   127.0.0.53%lo:53        0.0.0.0:*          \n\
+         tcp   LISTEN 0      128          0.0.0.0:22        0.0.0.0:*          \n\
+         tcp   LISTEN 0      128             [::]:22           [::]:*          \n"
+    );
+    assert_eq!(out(&mut sh, "ss -tuln | wc -l"), "5\n");
+    // One protocol: no Netid column.
+    assert_eq!(
+        out(&mut sh, "ss -tln").lines().next(),
+        Some("State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess")
+    );
     let pid = daemon_pid(&mut sh, "sshd");
+    let resolved = daemon_pid(&mut sh, "systemd-resolve");
     let full = out(&mut sh, "ss -tulpn");
     let lines: Vec<&str> = full.lines().collect();
-    assert_eq!(
-        lines.len(),
-        3,
-        "the header and the two sshd sockets: {full}"
-    );
-    assert!(
-        lines[0].starts_with("Netid") && lines[0].ends_with("Process"),
-        "{full}"
-    );
-    assert!(
-        lines[1].contains("0.0.0.0:22") && lines[1].contains("LISTEN"),
-        "{full}"
-    );
-    assert!(lines[2].contains("[::]:22"), "{full}");
-    for line in &lines[1..] {
+    assert_eq!(lines.len(), 5, "{full}");
+    for line in &lines[3..] {
         assert!(
-            line.contains(&format!("users:((\"sshd\",pid={pid},fd=")),
+            line.contains(&format!("    users:((\"sshd\",pid={pid},fd=")),
             "{line}: ps says sshd is {pid}"
         );
     }
-    // Without -p there is no Process column; without -n the port is its service name.
-    let plain = out(&mut sh, "ss -tl");
     assert!(
-        !plain.contains("users:") && !plain.contains("Process"),
-        "{plain}"
+        lines[1].contains(&format!(
+            "users:((\"systemd-resolve\",pid={resolved},fd=13))"
+        )),
+        "{full}"
     );
+    // The Process column is as wide as its widest cell, so the header is padded out to it.
+    assert_eq!(lines[0].len(), lines[1].len(), "{full}");
+    // Without -n the port is its service name.
+    let plain = out(&mut sh, "ss -tl");
+    assert!(!plain.contains("users:"), "{plain}");
     assert!(
         plain.contains("0.0.0.0:ssh") && plain.contains("[::]:ssh"),
         "{plain}"
     );
-    assert!(out(&mut sh, "ss -tln").contains("0.0.0.0:22"));
-    // Only listeners exist: neither a bare `ss` nor `-u` has a row, and `-4` drops the v6 one.
+    assert!(plain.contains("127.0.0.53%lo:domain"), "{plain}");
+    // Only bound and listening sockets exist: a bare `ss` lists none, and `-4` drops the v6 one.
     assert_eq!(out(&mut sh, "ss").lines().count(), 1);
-    assert_eq!(out(&mut sh, "ss -ul").lines().count(), 1);
-    assert_eq!(out(&mut sh, "ss -4tln").lines().count(), 2);
+    assert_eq!(out(&mut sh, "ss -ul").lines().count(), 2);
+    assert_eq!(out(&mut sh, "ss -4tln").lines().count(), 3);
     assert_eq!(
         out(&mut sh, "ss -H -tln").lines().count(),
-        2,
+        3,
         "-H drops the header"
     );
     // /proc/net/tcp and tcp6 carry the same sockets, inode for inode.
     let tcp = out(&mut sh, "cat /proc/net/tcp");
-    let row: Vec<&str> = tcp.lines().nth(1).unwrap().split_whitespace().collect();
-    assert_eq!(row[1], "00000000:0016", "port 22");
-    assert_eq!(row[3], "0A", "LISTEN");
+    let rows: Vec<Vec<&str>> = tcp
+        .lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], "3500007F:0035", "127.0.0.53 port 53");
+    assert_eq!(rows[1][1], "00000000:0016", "port 22");
+    assert_eq!(rows[1][3], "0A", "LISTEN");
     let tcp6 = out(&mut sh, "cat /proc/net/tcp6");
     let row6: Vec<&str> = tcp6.lines().nth(1).unwrap().split_whitespace().collect();
     assert_eq!(row6[1], format!("{}:0016", "0".repeat(32)));
-    assert_ne!(row[9], row6[9], "two sockets, two inodes");
-    assert_eq!(tcp.lines().count(), 2);
+    assert_ne!(rows[1][9], row6[9], "two sockets, two inodes");
     assert_eq!(tcp6.lines().count(), 2);
-    // No UDP socket exists.
-    assert_eq!(out(&mut sh, "cat /proc/net/udp").lines().count(), 1);
+    // The one UDP socket is resolved's stub, owned by its account.
+    let udp = out(&mut sh, "cat /proc/net/udp");
+    assert_eq!(udp.lines().count(), 2, "{udp}");
+    let udp_row: Vec<&str> = udp.lines().nth(1).unwrap().split_whitespace().collect();
+    assert_eq!(udp_row[1], "3500007F:0035");
+    assert_eq!(udp_row[7], "102", "uid of systemd-resolve");
     assert_eq!(out(&mut sh, "cat /proc/net/udp6").lines().count(), 1);
 }
 
@@ -549,7 +567,8 @@ fn over_telnet_the_listener_is_telnetd_on_23() {
     let mut sh = telnet();
     let pid = daemon_pid(&mut sh, "telnetd");
     let full = out(&mut sh, "ss -tlnp");
-    assert_eq!(full.lines().count(), 2, "{full}");
+    // The header, resolved's stub and telnetd.
+    assert_eq!(full.lines().count(), 3, "{full}");
     assert!(full.contains("0.0.0.0:23"), "{full}");
     assert!(
         full.contains(&format!("users:((\"telnetd\",pid={pid},fd=")),

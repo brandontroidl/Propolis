@@ -77,6 +77,9 @@ impl Registry {
         super::test_builtin::register(&mut registry);
         super::lookup::register(&mut registry);
         super::texttools::register(&mut registry);
+        super::grep::register(&mut registry);
+        super::textproc::register(&mut registry);
+        super::awk::register(&mut registry);
         super::binview::register(&mut registry);
         super::printf::register(&mut registry);
         super::base64::register(&mut registry);
@@ -94,6 +97,10 @@ impl Registry {
         super::netcat::register(&mut registry);
         super::sysres::register(&mut registry);
         super::fileinfo::register(&mut registry);
+        super::admin::register(&mut registry);
+        super::pkg::register(&mut registry);
+        super::hw::register(&mut registry);
+        super::netclient::register(&mut registry);
         register_nodes(&mut registry);
         registry
     }
@@ -274,7 +281,6 @@ fn register_core(r: &mut Registry) {
     r.register_builtin("false", HandlerId::False, FakeShell::builtin_false);
     r.register("wget", HandlerId::Wget, FakeShell::builtin_wget);
     r.register("curl", HandlerId::Curl, FakeShell::builtin_curl);
-    r.register("ping", HandlerId::Ping, FakeShell::builtin_ping);
     // Shell-availability fingerprint: every real system has /bin/sh, so "command not found"
     // for sh/bash instantly outs the honeypot and the dropper leaves. Model a nested shell.
     // sh and bash are always present. `ash` is BusyBox's shell, a file on neither persona
@@ -320,6 +326,17 @@ fn register_core(r: &mut Registry) {
         FakeShell::builtin_logout,
     );
     r.register_unresolved("logout", HandlerId::Logout, FakeShell::builtin_logout);
+    r.register_builtin_if(
+        "history",
+        is_bash,
+        HandlerId::History,
+        FakeShell::builtin_history,
+    );
+    r.register_unresolved(
+        "history",
+        HandlerId::History,
+        FakeShell::builtin_history_not_found,
+    );
     // The builtins that act on the shell itself. `source` is bash's; dash and mksh have only `.`.
     r.register_builtin("read", HandlerId::Read, FakeShell::builtin_read);
     r.register_builtin("export", HandlerId::Export, FakeShell::builtin_export);

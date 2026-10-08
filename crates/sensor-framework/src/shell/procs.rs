@@ -107,6 +107,9 @@ enum Started {
     Session,
     /// The moment the command that lists it runs (`ps` and `top` themselves).
     Now,
+    /// This many seconds before the command that lists it runs: a worker thread the kernel
+    /// started recently.
+    Ago(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -115,13 +118,13 @@ struct Proc {
     ppid: u32,
     /// The kernel's short name, at most 15 characters.
     comm: String,
-    /// The argument vector, empty for none.
+    /// The argument vector, empty for none (a kernel thread, shown as `[comm]`).
     argv: Vec<String>,
-    /// The `/proc/<pid>/stat` state letter: `S` or `R`.
+    /// The `/proc/<pid>/stat` state letter: `S`, `R` or `I` (an idle kernel worker).
     state: char,
     /// What follows the state letter in the BSD `STAT` column.
     mark: &'static str,
-    /// `pts/0`, or `?` for none.
+    /// `pts/0`, `tty1`, or `?` for none.
     tty: &'static str,
     started: Started,
     vsz_kib: u64,
@@ -133,11 +136,46 @@ struct Proc {
     cwd: String,
     /// Part of this session's terminal group: what a bare `ps` lists.
     attached: bool,
+    /// The owner, as `/etc/passwd` names it.
+    user: &'static str,
+    uid: u32,
+    /// `rt` for a real-time process; anything else is a normal one, whose `top` `PR` is 20 plus
+    /// its nice value.
+    prio: &'static str,
+    nice: i8,
 }
 
 impl Proc {
     fn stat_column(&self) -> String {
         format!("{}{}", self.state, self.mark)
+    }
+
+    /// The owner as procps' 8-wide `USER` column shows it: a longer name is cut to seven
+    /// characters and a `+` (recorded: `systemd+` for `systemd-resolve`, `message+`).
+    fn user_column(&self) -> String {
+        if self.user.len() > 8 {
+            format!("{}+", self.user.get(..7).unwrap_or(self.user))
+        } else {
+            self.user.to_string()
+        }
+    }
+
+    /// `top`'s `PR`: `rt` for a real-time process, else 20 plus the nice value.
+    fn top_priority(&self) -> String {
+        if self.prio == "rt" {
+            "rt".to_string()
+        } else {
+            20i16.saturating_add(i16::from(self.nice)).to_string()
+        }
+    }
+
+    /// The `priority` field of `/proc/<pid>/stat`: -100 for real-time priority 99.
+    fn stat_priority(&self) -> String {
+        if self.prio == "rt" {
+            "-100".to_string()
+        } else {
+            self.top_priority()
+        }
     }
 
     /// The command line as `ps` prints it: the arguments joined by spaces, or `[comm]` for a
@@ -175,6 +213,11 @@ impl Table {
                 .unwrap_or(self.boot),
             Started::Session => self.session,
             Started::Now => self.now,
+            Started::Ago(secs) => self
+                .now
+                .checked_sub_signed(seconds(secs))
+                .unwrap_or(self.now)
+                .max(self.boot),
         }
     }
 
@@ -182,7 +225,7 @@ impl Table {
     fn start_ticks(&self, p: &Proc) -> u64 {
         match p.started {
             Started::Boot(ticks) => ticks,
-            Started::Session | Started::Now => {
+            Started::Session | Started::Now | Started::Ago(_) => {
                 let at = self.started_at(p);
                 let secs = at.signed_duration_since(self.boot).num_seconds();
                 u64::try_from(secs).unwrap_or(0).saturating_mul(HZ)
@@ -279,6 +322,37 @@ impl FakeShell {
         // whole set, so it has to be handed everything at once.
         nodes.extend(self.net_nodes(table.boot.timestamp()));
         self.fs.set_generated(nodes);
+        self.refresh_clock_nodes();
+    }
+
+    /// `/proc/uptime` and `/proc/loadavg` as of the shell clock: refreshed at every input line,
+    /// so they agree with `uptime`, `top` and `ps` run on the same line. The uptime is the one
+    /// [`uptime_secs`] gives every command and the load the figures `uptime` prints; the idle time
+    /// is a one-CPU box idle 99.2% of the time [unverified], and the task count is the table's
+    /// rows plus a few threads for each multi-threaded daemon [unverified].
+    pub(super) fn refresh_clock_nodes(&mut self) {
+        let now = self.now();
+        let secs = uptime_secs(&now);
+        let centis = u64::from(now.timestamp_subsec_millis() / 10);
+        let total = secs.saturating_mul(100).saturating_add(centis);
+        let idle = total.saturating_mul(992) / 1_000;
+        let uptime = format!("{secs}.{centis:02} {}.{:02}\n", idle / 100, idle % 100);
+        let table = self.process_table();
+        let threads: usize = table
+            .procs
+            .iter()
+            .map(|p| if p.mark.contains('l') { 4 } else { 1 })
+            .sum();
+        let last_pid = self.pids.peek().saturating_sub(1);
+        let loadavg = format!(
+            "{} 1/{threads} {last_pid}\n",
+            load_average(&now).replace(", ", " ")
+        );
+        let boot = table.boot.timestamp();
+        self.fs
+            .put_generated("/proc/uptime", file_node(uptime, now.timestamp()));
+        self.fs
+            .put_generated("/proc/loadavg", file_node(loadavg, boot));
     }
 
     /// The pid of the daemon the modeled init started under the kernel name `comm` (`sshd`,
@@ -290,6 +364,45 @@ impl FakeShell {
             .find(|p| p.ppid == 1 && p.comm == comm)
             .map(|p| p.pid)
     }
+
+    /// What `systemctl status` reads of a service's main process: the first child of init (or,
+    /// for `user@0.service`, the session's user manager) under the kernel name `comm` and, when
+    /// given, on the terminal `tty` (the two gettys share a name).
+    pub(super) fn service_process(&self, comm: &str, tty: Option<&str>) -> Option<ServiceProc> {
+        let table = self.process_table();
+        table
+            .procs
+            .iter()
+            .find(|p| p.ppid == 1 && p.pid != 1 && p.comm == comm && tty.is_none_or(|t| p.tty == t))
+            .map(|p| ServiceProc {
+                pid: p.pid,
+                started: table.started_at(p),
+                argv: p.argv.clone(),
+                comm: p.comm.clone(),
+                rss_kib: p.rss_kib,
+                cpu_secs: p.cpu_secs,
+            })
+    }
+
+    /// When the box booted, on the shell clock: what every boot-started unit's `since` reads.
+    pub(super) fn boot_time(&self) -> DateTime<Utc> {
+        self.process_table().boot
+    }
+
+    /// When this session logged in, on the shell clock.
+    pub(super) fn session_time(&self) -> DateTime<Utc> {
+        self.process_table().session
+    }
+}
+
+/// A service's main process, as `systemctl status` shows it.
+pub(super) struct ServiceProc {
+    pub(super) pid: u32,
+    pub(super) started: DateTime<Utc>,
+    pub(super) argv: Vec<String>,
+    pub(super) comm: String,
+    pub(super) rss_kib: u64,
+    pub(super) cpu_secs: u64,
 }
 
 fn root_proc(
@@ -317,6 +430,400 @@ fn root_proc(
         exe: exe.to_string(),
         cwd: "/".to_string(),
         attached: false,
+        user: "root",
+        uid: 0,
+        prio: "20",
+        nice: 0,
+    }
+}
+
+/// One kernel thread of the modeled 5.15 kernel on a one-vCPU Xen guest: pid, name, state, `STAT`
+/// suffix, and the clock tick after boot it started at.
+type Kthread = (u32, &'static str, char, &'static str, u64);
+
+/// The kernel threads a freshly booted Ubuntu 22.04 EC2 (Xen HVM, one vCPU) instance shows, in pid
+/// order [unverified: composed from knowledge of 5.15's threads, not captured].
+const UBUNTU_KTHREADS: &[Kthread] = &[
+    (2, "kthreadd", 'S', "", 0),
+    (3, "rcu_gp", 'I', "<", 0),
+    (4, "rcu_par_gp", 'I', "<", 0),
+    (5, "slub_flushwq", 'I', "<", 0),
+    (6, "netns", 'I', "<", 0),
+    (8, "kworker/0:0H-events_highpri", 'I', "<", 1),
+    (10, "mm_percpu_wq", 'I', "<", 1),
+    (11, "rcu_tasks_rude_", 'S', "", 1),
+    (12, "rcu_tasks_trace", 'S', "", 1),
+    (13, "ksoftirqd/0", 'S', "", 1),
+    (14, "rcu_sched", 'I', "", 1),
+    (15, "migration/0", 'S', "", 1),
+    (16, "idle_inject/0", 'S', "", 1),
+    (18, "cpuhp/0", 'S', "", 1),
+    (19, "kdevtmpfs", 'S', "", 2),
+    (20, "inet_frag_wq", 'I', "<", 2),
+    (21, "kauditd", 'S', "", 2),
+    (22, "xenbus", 'S', "", 2),
+    (23, "xenwatch", 'S', "", 2),
+    (24, "khungtaskd", 'S', "", 2),
+    (25, "oom_reaper", 'S', "", 2),
+    (26, "writeback", 'I', "<", 2),
+    (27, "kcompactd0", 'S', "", 2),
+    (28, "ksmd", 'S', "N", 2),
+    (29, "khugepaged", 'S', "N", 2),
+    (76, "kintegrityd", 'I', "<", 3),
+    (77, "kblockd", 'I', "<", 3),
+    (78, "blkcg_punt_bio", 'I', "<", 3),
+    (79, "tpm_dev_wq", 'I', "<", 3),
+    (80, "ata_sff", 'I', "<", 3),
+    (81, "md", 'I', "<", 3),
+    (82, "edac-poller", 'I', "<", 3),
+    (83, "devfreq_wq", 'I', "<", 3),
+    (84, "watchdogd", 'S', "", 3),
+    (85, "kworker/0:1H-kblockd", 'I', "<", 3),
+    (87, "kswapd0", 'S', "", 3),
+    (88, "ecryptfs-kthrea", 'S', "", 3),
+    (90, "kthrotld", 'I', "<", 3),
+    (91, "acpi_thermal_pm", 'I', "<", 3),
+    (92, "scsi_eh_0", 'S', "", 4),
+    (93, "scsi_tmf_0", 'I', "<", 4),
+    (94, "scsi_eh_1", 'S', "", 4),
+    (95, "scsi_tmf_1", 'I', "<", 4),
+    (97, "vfio-irqfd-clea", 'I', "<", 4),
+    (98, "mld", 'I', "<", 4),
+    (99, "ipv6_addrconf", 'I', "<", 4),
+    (110, "kstrp", 'I', "<", 4),
+    (113, "zswap-shrink", 'I', "<", 4),
+    (114, "kworker/u31:0", 'I', "<", 4),
+    (119, "charger_manager", 'I', "<", 5),
+    (189, "jbd2/xvda1-8", 'S', "", 112),
+    (190, "ext4-rsv-conver", 'I', "<", 112),
+    (264, "kaluad", 'I', "<", 160),
+    (266, "kmpath_rdacd", 'I', "<", 160),
+    (267, "kmpathd", 'I', "<", 160),
+    (268, "kmpath_handlerd", 'I', "<", 160),
+];
+
+/// One daemon systemd starts on the modeled box.
+struct Daemon {
+    pid: u32,
+    user: &'static str,
+    uid: u32,
+    comm: &'static str,
+    argv: &'static [&'static str],
+    exe: &'static str,
+    /// The clock tick after boot it started at.
+    started: u64,
+    /// Virtual size, resident size (KiB) and CPU seconds used.
+    sizes: (u64, u64, u64),
+    mark: &'static str,
+    tty: &'static str,
+    prio: &'static str,
+    nice: i8,
+}
+
+// One positional row per service keeps the table below readable as a `ps` listing.
+#[allow(clippy::too_many_arguments)]
+const fn daemon(
+    pid: u32,
+    who: (&'static str, u32),
+    comm: &'static str,
+    argv: &'static [&'static str],
+    exe: &'static str,
+    started: u64,
+    sizes: (u64, u64, u64),
+    mark: &'static str,
+) -> Daemon {
+    Daemon {
+        pid,
+        user: who.0,
+        uid: who.1,
+        comm,
+        argv,
+        exe,
+        started,
+        sizes,
+        mark,
+        tty: "?",
+        prio: "20",
+        nice: 0,
+    }
+}
+
+const ROOT: (&str, u32) = ("root", 0);
+
+/// The services of a stock Ubuntu 22.04 server image, each the main process of a unit
+/// `systemctl list-units --state=running` lists, owned by the account `/etc/passwd` gives it
+/// [unverified: sizes and pids composed, not captured]. `cron` (641) and the `sshd` listener
+/// (721) keep the pids recorded sessions and the tests have always seen.
+const UBUNTU_DAEMONS: &[Daemon] = &[
+    Daemon {
+        nice: -1,
+        ..daemon(
+            239,
+            ROOT,
+            "systemd-journal",
+            &["/lib/systemd/systemd-journald"],
+            "/usr/lib/systemd/systemd-journald",
+            215,
+            (64_116, 15_628, 1),
+            "<s",
+        )
+    },
+    Daemon {
+        prio: "rt",
+        ..daemon(
+            269,
+            ROOT,
+            "multipathd",
+            &["/sbin/multipathd", "-d", "-s"],
+            "/usr/sbin/multipathd",
+            240,
+            (289_312, 27_080, 5),
+            "Lsl",
+        )
+    },
+    daemon(
+        272,
+        ROOT,
+        "systemd-udevd",
+        &["/lib/systemd/systemd-udevd"],
+        "/usr/lib/systemd/systemd-udevd",
+        243,
+        (25_404, 6_148, 0),
+        "s",
+    ),
+    daemon(
+        540,
+        ("systemd-network", 101),
+        "systemd-network",
+        &["/lib/systemd/systemd-networkd"],
+        "/usr/lib/systemd/systemd-networkd",
+        1_160,
+        (16_120, 8_004, 0),
+        "s",
+    ),
+    daemon(
+        542,
+        ("systemd-resolve", 102),
+        "systemd-resolve",
+        &["/lib/systemd/systemd-resolved"],
+        "/usr/lib/systemd/systemd-resolved",
+        1_210,
+        (25_536, 12_896, 0),
+        "s",
+    ),
+    daemon(
+        544,
+        ("systemd-timesync", 106),
+        "systemd-timesyn",
+        &["/lib/systemd/systemd-timesyncd"],
+        "/usr/lib/systemd/systemd-timesyncd",
+        1_212,
+        (89_352, 6_488, 0),
+        "sl",
+    ),
+    daemon(
+        641,
+        ROOT,
+        "cron",
+        &["/usr/sbin/cron", "-f", "-P"],
+        "/usr/sbin/cron",
+        1_480,
+        (7_288, 4_636, 0),
+        "s",
+    ),
+    daemon(
+        642,
+        ("messagebus", 103),
+        "dbus-daemon",
+        &[
+            "@dbus-daemon",
+            "--system",
+            "--address=systemd:",
+            "--nofork",
+            "--nopidfile",
+            "--systemd-activation",
+            "--syslog-only",
+        ],
+        "/usr/bin/dbus-daemon",
+        1_482,
+        (8_540, 4_564, 0),
+        "s",
+    ),
+    daemon(
+        648,
+        ROOT,
+        "networkd-dispat",
+        &[
+            "/usr/bin/python3",
+            "/usr/bin/networkd-dispatcher",
+            "--run-startup-triggers",
+        ],
+        "/usr/bin/python3.10",
+        1_490,
+        (33_076, 19_120, 0),
+        "s",
+    ),
+    daemon(
+        649,
+        ROOT,
+        "polkitd",
+        &["/usr/libexec/polkitd", "--no-debug"],
+        "/usr/libexec/polkitd",
+        1_492,
+        (234_484, 6_764, 0),
+        "sl",
+    ),
+    daemon(
+        650,
+        ("syslog", 104),
+        "rsyslogd",
+        &["/usr/sbin/rsyslogd", "-n", "-iNONE"],
+        "/usr/sbin/rsyslogd",
+        1_493,
+        (222_400, 5_168, 0),
+        "sl",
+    ),
+    daemon(
+        652,
+        ROOT,
+        "snapd",
+        &["/usr/lib/snapd/snapd"],
+        "/usr/lib/snapd/snapd",
+        1_495,
+        (1_171_912, 35_764, 4),
+        "sl",
+    ),
+    daemon(
+        655,
+        ROOT,
+        "systemd-logind",
+        &["/lib/systemd/systemd-logind"],
+        "/usr/lib/systemd/systemd-logind",
+        1_497,
+        (15_336, 6_880, 0),
+        "s",
+    ),
+    daemon(
+        658,
+        ROOT,
+        "udisksd",
+        &["/usr/libexec/udisks2/udisksd"],
+        "/usr/libexec/udisks2/udisksd",
+        1_499,
+        (392_840, 12_324, 0),
+        "sl",
+    ),
+    Daemon {
+        tty: "ttyS0",
+        ..daemon(
+            670,
+            ROOT,
+            "agetty",
+            &[
+                "/sbin/agetty",
+                "-o",
+                "-p -- \\u",
+                "--keep-baud",
+                "115200,57600,38400,9600",
+                "ttyS0",
+                "vt220",
+            ],
+            "/usr/sbin/agetty",
+            1_560,
+            (6_216, 1_052, 0),
+            "s+",
+        )
+    },
+    Daemon {
+        tty: "tty1",
+        ..daemon(
+            674,
+            ROOT,
+            "agetty",
+            &[
+                "/sbin/agetty",
+                "-o",
+                "-p -- \\u",
+                "--noclear",
+                "tty1",
+                "linux",
+            ],
+            "/usr/sbin/agetty",
+            1_562,
+            (6_172, 1_076, 0),
+            "s+",
+        )
+    },
+    daemon(
+        679,
+        ROOT,
+        "unattended-upgr",
+        &[
+            "/usr/bin/python3",
+            "/usr/share/unattended-upgrades/unattended-upgrade-shutdown",
+            "--wait-for-signal",
+        ],
+        "/usr/bin/python3.10",
+        1_590,
+        (109_748, 21_312, 0),
+        "sl",
+    ),
+    daemon(
+        690,
+        ROOT,
+        "ModemManager",
+        &["/usr/sbin/ModemManager"],
+        "/usr/sbin/ModemManager",
+        1_640,
+        (317_012, 11_904, 0),
+        "sl",
+    ),
+];
+
+fn kthread(row: &Kthread) -> Proc {
+    let &(pid, comm, state, mark, ticks) = row;
+    // A `<` worker runs at the highest priority; `ksmd` and `khugepaged` are niced.
+    let nice = match (mark, comm) {
+        ("<", _) => -20,
+        (_, "ksmd") => 5,
+        (_, "khugepaged") => 19,
+        _ => 0,
+    };
+    Proc {
+        state,
+        mark,
+        nice,
+        wchan: "-",
+        exe: String::new(),
+        ..root_proc(
+            pid,
+            if pid == 2 { 0 } else { 2 },
+            comm,
+            &[],
+            "",
+            Started::Boot(ticks),
+            (0, 0, 0),
+        )
+    }
+}
+
+fn daemon_row(d: &Daemon) -> Proc {
+    Proc {
+        mark: d.mark,
+        tty: d.tty,
+        user: d.user,
+        uid: d.uid,
+        prio: d.prio,
+        nice: d.nice,
+        ..root_proc(
+            d.pid,
+            1,
+            d.comm,
+            d.argv,
+            d.exe,
+            Started::Boot(d.started),
+            d.sizes,
+        )
     }
 }
 
@@ -329,26 +836,59 @@ fn ubuntu_rows(
     exec: bool,
 ) -> Vec<Proc> {
     const DAEMON_PID: u32 = 721;
-    let mut rows = vec![
-        root_proc(
+    let mut rows = vec![root_proc(
+        1,
+        0,
+        "systemd",
+        &["/sbin/init"],
+        "/usr/lib/systemd/systemd",
+        Started::Boot(100),
+        (167_800, 12_916, 3),
+    )];
+    rows.extend(UBUNTU_KTHREADS.iter().map(kthread));
+    rows.extend(UBUNTU_DAEMONS.iter().map(daemon_row));
+    // Workers the kernel started and retired since boot, as any box that has been up a while has.
+    for (offset, comm, ago) in [
+        (41, "kworker/0:2-events", 1_340),
+        (17, "kworker/u30:1-events_unbound", 610),
+        (9, "kworker/0:0-events", 95),
+    ] {
+        let pid = login.saturating_sub(offset);
+        if pid > DAEMON_PID.saturating_add(1) {
+            rows.push(Proc {
+                state: 'I',
+                mark: "",
+                wchan: "-",
+                exe: String::new(),
+                ..root_proc(pid, 2, comm, &[], "", Started::Ago(ago), (0, 0, 0))
+            });
+        }
+    }
+    // The session's user manager: pam_systemd starts `user@0.service` for the login.
+    let manager = login.saturating_sub(4);
+    if manager > DAEMON_PID.saturating_add(1) {
+        rows.push(root_proc(
+            manager,
             1,
-            0,
             "systemd",
-            &["/sbin/init"],
+            &["/lib/systemd/systemd", "--user"],
             "/usr/lib/systemd/systemd",
-            Started::Boot(100),
-            (167_800, 11_484, 3),
-        ),
-        root_proc(
-            641,
-            1,
-            "cron",
-            &["/usr/sbin/cron", "-f", "-P"],
-            "/usr/sbin/cron",
-            Started::Boot(1_480),
-            (8_536, 2_940, 0),
-        ),
-    ];
+            Started::Session,
+            (17_064, 9_652, 0),
+        ));
+        rows.push(Proc {
+            mark: "",
+            ..root_proc(
+                manager.saturating_add(1),
+                manager,
+                "(sd-pam)",
+                &["(sd-pam)"],
+                "/usr/lib/systemd/systemd",
+                Started::Session,
+                (170_252, 4_812, 0),
+            )
+        });
+    }
     let shell_parent = if telnet {
         rows.push(root_proc(
             DAEMON_PID,
@@ -490,9 +1030,43 @@ fn stub_binary(len: u64) -> Node {
 
 fn process_nodes(table: &Table, mounts: &[u8], mountinfo: &[u8]) -> HashMap<String, Node> {
     let mut nodes = HashMap::new();
+    // One copy of each mount table, shared by every row's node.
+    let mounts_blob = Blob::from_bytes(mounts.to_vec());
+    let mountinfo_blob = Blob::from_bytes(mountinfo.to_vec());
+    let shared_node = |blob: &Blob, mtime: i64| {
+        let mut node = Node::regular(blob.clone(), 0o100_444);
+        node.meta.mtime = mtime;
+        node
+    };
     for p in &table.procs {
         let mtime = table.started_at(p).timestamp();
         let base = format!("/proc/{}", p.pid);
+        if p.argv.is_empty() && p.exe.is_empty() {
+            // A kernel thread: the files a reader of its row looks at, and no image or tables.
+            let mut dir = Node::directory(
+                ["cmdline", "comm", "stat", "status"]
+                    .iter()
+                    .map(|e| (*e).to_string())
+                    .collect(),
+            );
+            dir.meta.mode = 0o040_555;
+            dir.meta.mtime = mtime;
+            nodes.insert(base.clone(), dir);
+            nodes.insert(format!("{base}/cmdline"), file_node(Vec::new(), mtime));
+            nodes.insert(
+                format!("{base}/comm"),
+                file_node(format!("{}\n", p.comm), mtime),
+            );
+            nodes.insert(
+                format!("{base}/stat"),
+                file_node(stat_line(table, p), mtime),
+            );
+            nodes.insert(
+                format!("{base}/status"),
+                file_node(status_text(table, p), mtime),
+            );
+            continue;
+        }
         let entries = [
             "cmdline",
             "comm",
@@ -544,8 +1118,11 @@ fn process_nodes(table: &Table, mounts: &[u8], mountinfo: &[u8]) -> HashMap<Stri
         );
         nodes.insert(format!("{base}/cwd"), link_node(&p.cwd, mtime));
         nodes.insert(format!("{base}/exe"), link_node(&p.exe, mtime));
-        nodes.insert(format!("{base}/mountinfo"), file_node(mountinfo, mtime));
-        nodes.insert(format!("{base}/mounts"), file_node(mounts, mtime));
+        nodes.insert(
+            format!("{base}/mountinfo"),
+            shared_node(&mountinfo_blob, mtime),
+        );
+        nodes.insert(format!("{base}/mounts"), shared_node(&mounts_blob, mtime));
         nodes.insert(
             format!("{base}/stat"),
             file_node(stat_line(table, p), mtime),
@@ -567,11 +1144,28 @@ fn process_nodes(table: &Table, mounts: &[u8], mountinfo: &[u8]) -> HashMap<Stri
             nodes.insert(path.to_string(), stub);
         }
     } else {
-        let binaries: [(&str, u64); 4] = [
+        // The images behind the daemons' `exe` links. Sizes [unverified]: plausible for jammy's
+        // packages, not recorded (sshd's recorded image is in the binaries table and wins).
+        let binaries: [(&str, u64); 19] = [
             ("/usr/lib/systemd/systemd", 1_841_488),
             ("/usr/sbin/sshd", 1_070_560),
             ("/usr/sbin/cron", 56_048),
             ("/usr/sbin/telnetd", 51_512),
+            ("/usr/lib/systemd/systemd-journald", 162_256),
+            ("/usr/sbin/multipathd", 128_920),
+            ("/usr/lib/systemd/systemd-udevd", 2_166_744),
+            ("/usr/lib/systemd/systemd-networkd", 2_166_744),
+            ("/usr/lib/systemd/systemd-resolved", 538_168),
+            ("/usr/lib/systemd/systemd-timesyncd", 51_856),
+            ("/usr/bin/dbus-daemon", 248_496),
+            ("/usr/bin/python3.10", 5_904_904),
+            ("/usr/libexec/polkitd", 129_336),
+            ("/usr/sbin/rsyslogd", 727_248),
+            ("/usr/lib/snapd/snapd", 25_620_472),
+            ("/usr/lib/systemd/systemd-logind", 265_720),
+            ("/usr/libexec/udisks2/udisksd", 559_232),
+            ("/usr/sbin/agetty", 64_840),
+            ("/usr/sbin/ModemManager", 2_093_216),
         ];
         for (path, len) in binaries {
             if table.procs.iter().any(|p| p.exe == path) {
@@ -938,8 +1532,8 @@ fn stat_line(table: &Table, p: &Proc) -> String {
         "0".to_string(),
         "0".to_string(),
         "0".to_string(),
-        "20".to_string(),
-        "0".to_string(),
+        p.stat_priority(),
+        p.nice.to_string(),
         "1".to_string(),
         "0".to_string(),
         table.start_ticks(p).to_string(),
@@ -980,6 +1574,7 @@ fn stat_line(table: &Table, p: &Proc) -> String {
 fn status_text(table: &Table, p: &Proc) -> String {
     let state = match p.state {
         'R' => "R (running)",
+        'I' => "I (idle)",
         _ => "S (sleeping)",
     };
     let kb = |kib: u64| format!("{kib:>8} kB");
@@ -995,8 +1590,18 @@ fn status_text(table: &Table, p: &Proc) -> String {
     lines.push(format!("Pid:\t{}", p.pid));
     lines.push(format!("PPid:\t{}", p.ppid));
     lines.push("TracerPid:\t0".to_string());
-    lines.push("Uid:\t0\t0\t0\t0".to_string());
-    lines.push("Gid:\t0\t0\t0\t0".to_string());
+    lines.push(format!("Uid:\t{0}\t{0}\t{0}\t{0}", p.uid));
+    // Each service account's primary group is its own; root's is root.
+    let gid = match p.uid {
+        0 => 0,
+        101 => 102,
+        102 => 103,
+        103 => 105,
+        104 => 106,
+        106 => 108,
+        other => other,
+    };
+    lines.push(format!("Gid:\t{gid}\t{gid}\t{gid}\t{gid}"));
     lines.push("FDSize:\t64".to_string());
     lines.push("Groups:\t".to_string());
     if !table.android {
@@ -1491,8 +2096,8 @@ impl Table {
         match col {
             Col::Pid => p.pid.to_string(),
             Col::Ppid => p.ppid.to_string(),
-            Col::Uid => "0".to_string(),
-            Col::User | Col::UidName => "root".to_string(),
+            Col::Uid => p.uid.to_string(),
+            Col::User | Col::UidName => p.user_column(),
             Col::Comm => p.comm.clone(),
             Col::Args | Col::CmdArgs => p.args(),
             Col::CmdComm => p.comm.clone(),
@@ -1579,8 +2184,8 @@ struct PsPlan {
     pids: Option<Vec<u32>>,
     /// `-C`: only processes with these command names.
     names: Option<Vec<String>>,
-    /// `-u`, `-U`, `-G`: no process belongs to anyone but root.
-    nobody: bool,
+    /// `-u`, `-U`, `-G`: only processes owned by these names or ids.
+    users: Option<Vec<String>>,
     /// `-o`: the columns, with a header of its own where one was given.
     custom: Option<Vec<(Col, Option<String>)>>,
     headers: bool,
@@ -1657,7 +2262,7 @@ fn parse_ps(args: &[&str]) -> Result<PsPlan, String> {
         all: false,
         pids: None,
         names: None,
-        nobody: false,
+        users: None,
         custom: None,
         headers: true,
         version: false,
@@ -1707,7 +2312,7 @@ fn parse_ps(args: &[&str]) -> Result<PsPlan, String> {
                         plan.names = Some(list.split(',').map(str::to_string).collect());
                     }
                     ('u' | 'U' | 'G' | 'g', Some(list)) => {
-                        plan.nobody = !list.split(',').any(|id| id == "root" || id == "0");
+                        plan.users = Some(list.split(',').map(str::to_string).collect());
                     }
                     ('t' | 'O', Some(_)) => {}
                     _ => return Err("unsupported SysV option".to_string()),
@@ -1764,14 +2369,17 @@ impl FakeShell {
             resolve_proc_self(exe_name)
                 .map_or_else(|| format!("/usr/bin/{exe_name}"), str::to_string)
         };
+        let tty = self.session_tty();
         Proc {
             pid,
             ppid: self.state().pid,
             comm: exe_name.to_string(),
             argv,
             state: 'R',
-            mark: "+",
-            tty: self.session_tty(),
+            // In the terminal's foreground group only when there is a terminal (recorded: an SSH
+            // exec's `ps` shows `R`, an interactive one `R+`).
+            mark: if tty == "?" { "" } else { "+" },
+            tty,
             started: Started::Now,
             vsz_kib: 12_648,
             rss_kib: 3_352,
@@ -1780,6 +2388,10 @@ impl FakeShell {
             exe,
             cwd: self.cwd().to_string(),
             attached: true,
+            user: "root",
+            uid: 0,
+            prio: "20",
+            nice: 0,
         }
     }
 
@@ -1812,8 +2424,12 @@ impl FakeShell {
         let own = self.self_row(parts, "ps");
         let mut rows: Vec<Proc> = table.procs.clone();
         rows.push(own);
-        if plan.nobody {
-            rows.clear();
+        if let Some(users) = &plan.users {
+            rows.retain(|p| {
+                users
+                    .iter()
+                    .any(|u| u == p.user || u.parse::<u32>().is_ok_and(|id| id == p.uid))
+            });
         }
         if let Some(pids) = &plan.pids {
             rows.retain(|p| pids.contains(&p.pid));
@@ -1938,9 +2554,10 @@ impl FakeShell {
         let (running, total) = (rows.iter().filter(|p| p.state == 'R').count(), rows.len());
         let secs = uptime_secs(&table.now);
         let mut out = format!(
-            "top - {} up {},  1 user,  load average: {}\n",
+            "top - {} up {},  {},  load average: {}\n",
             expand("%H:%M:%S", &table.now),
             uptime_short(secs),
+            self.users_text(),
             load_average(&table.now)
         );
         out.push_str(&format!(
@@ -1967,29 +2584,52 @@ impl FakeShell {
         out.push_str(
             "    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n",
         );
+        // procps sorts by %CPU: `top` itself, running, first (recorded on Ubuntu 22.04, where it
+        // led the list at 6.7), then the rest in pid order.
+        rows.sort_by_key(|p| (p.state != 'R', p.pid));
         for p in &rows {
             let shared = p.rss_kib.saturating_mul(3).div_euclid(5);
+            let cpu = if p.state == 'R' { "6.2" } else { "0.0" };
             out.push_str(&format!(
                 "{:>7} {:<9} {:>2} {:>3} {:>7} {:>6} {:>6} {} {:>5} {:>5} {:>9} {}\n",
                 p.pid,
-                "root",
-                20,
-                0,
+                p.user_column(),
+                p.top_priority(),
+                p.nice,
                 p.vsz_kib,
                 p.rss_kib,
                 shared,
                 p.state,
-                "0.0",
+                cpu,
                 tenths(p.rss_kib.saturating_mul(100), MEM_TOTAL_KIB),
                 format!(
                     "{}:{:02}.00",
                     p.cpu_secs.div_euclid(60),
                     p.cpu_secs.rem_euclid(60)
                 ),
-                p.comm
+                top_command(&p.comm)
             ));
         }
         clip(out)
+    }
+
+    /// `N users` as `uptime`, `w` and `top` print it: an SSH exec request logs no user in (no
+    /// utmp entry; recorded `0 users` on Ubuntu 22.04), an interactive login logs in one.
+    pub(super) fn users_text(&self) -> &'static str {
+        match self.context {
+            ShellContext::ExecC => "0 users",
+            ShellContext::LoginInteractive | ShellContext::AndroidMksh => "1 user",
+        }
+    }
+}
+
+/// The `COMMAND` cell of a non-terminal `top`: its 80 columns leave the last column eight, so a
+/// longer name is cut to seven and a `+` (recorded: `systemd+`, `dbus-da+`, `rsyslogd`).
+fn top_command(comm: &str) -> String {
+    if comm.chars().count() > 8 {
+        format!("{}+", comm.chars().take(7).collect::<String>())
+    } else {
+        comm.to_string()
     }
 }
 

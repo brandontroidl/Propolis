@@ -188,13 +188,15 @@ fn getent_looks_up_a_uid_or_gid_by_number() {
     );
     assert_eq!(out(&mut sh, "getent group 27"), "sudo:x:27:ubuntu\n");
     assert_eq!(out(&mut sh, "getent group 65534"), "nogroup:x:65534:\n");
-    // A uid is not a gid: 65534 is both, but 105 is only sshd's uid.
+    // A uid is not a gid: 105 is sshd's uid and the messagebus group's gid.
     assert_eq!(
         out(&mut sh, "getent passwd 105"),
         "sshd:x:105:65534::/run/sshd:/usr/sbin/nologin\n"
     );
+    assert_eq!(out(&mut sh, "getent group 105"), "messagebus:x:105:\n");
+    // 999 is lxd's uid and no group's gid.
     assert_eq!(
-        answer(&mut sh, "getent group 105"),
+        answer(&mut sh, "getent group 999"),
         (String::new(), String::new(), 2)
     );
 }

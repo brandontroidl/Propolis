@@ -7,8 +7,9 @@
 //!   projection and MUST reproduce, field for field, the projection the
 //!   incremental write path arrived at. It does this by recomputing IN MEMORY,
 //!   for each event in insertion (`id`) order, exactly the dedup / breadth /
-//!   sensor inputs that `append_event` computed via SQL at the moment it
-//!   appended that event, then folding through the same pure
+//!   sensor inputs that `append_event` computed at the moment it appended that
+//!   event (the dedup read from the ledger, breadth and sensors from the
+//!   `ip_vantage` / `ip_sensor` sets it maintains), then folding through the same pure
 //!   [`apply_event`](crate::scoring::engine::apply_event). Determinism is
 //!   guaranteed BY CONSTRUCTION: same event order + same per-event inputs +
 //!   same pure fold => same output. If the two ever diverge, the
@@ -109,17 +110,18 @@ fn reconstruct_event(row: &PgRow) -> Result<EventInput, RepoError> {
 ///
 /// Fetches this source's events in insertion (`id`) order - the SAME order
 /// `append_event` applied them - and folds them through `apply_event` from
-/// `None`, recomputing per-event dedup, breadth, and sensor inputs in memory to
-/// mirror exactly what `append_event` computed via SQL when it appended each
-/// event. Returns the final projection, anchored (like the stored row) at the
+/// `None`, recomputing per-event dedup, breadth, and sensor inputs in memory from
+/// the ledger rows themselves, never from the `ip_vantage` / `ip_sensor` sets
+/// `append_event` reads them from, so a replay is an independent check on those
+/// sets. Returns the final projection, anchored (like the stored row) at the
 /// last event's `observed_at`.
 ///
 /// Returns `Ok(None)` if the source has no events (nothing to rebuild, matching
 /// `read_score`); fails closed with [`RepoError::Corrupt`] only if a stored value
 /// cannot be parsed.
 pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<Option<IpScore>, RepoError> {
-    // Telemetry rows are excluded here exactly as the incremental path excludes them from its
-    // own aggregates: not loading them at all is what keeps the fold, the vantages and the
+    // Telemetry rows are excluded here exactly as the incremental path keeps them out of its
+    // breadth sets: not loading them at all is what keeps the fold, the vantages and the
     // distinct-sensor count identical between replay and append. `verify_chain` still reads
     // every row - a telemetry record is part of the hash chain, it is just not part of a score.
     let rows = sqlx::query(concat!(
@@ -164,8 +166,7 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<Option<IpSc
 
         // Breadth over events 0..=k: one vantage per distinct non-null wan_ip,
         // authenticated-TCP iff ANY event so far on that wan was tcp+auth.
-        // Mirrors the `GROUP BY wan_ip, bool_or(protocol='tcp' AND authenticated)`
-        // query (which sees exactly rows 0..=k at that transaction time).
+        // Equals the `ip_vantage` rows for this source after event k's upsert.
         let mut vantages: Vec<WanVantage> = Vec::new();
         for e in &events[..=k] {
             let Some(wan_ip) = e.wan_ip else { continue };
@@ -180,7 +181,7 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<Option<IpSc
         }
         let dwc = distinct_wan_count(&vantages) as i32;
 
-        // Distinct sensors among 0..=k. Mirrors `COUNT(DISTINCT sensor)`.
+        // Distinct sensors among 0..=k: the `ip_sensor` rows after event k's upsert.
         let mut sensors: Vec<&str> = events[..=k].iter().map(|e| e.sensor.as_str()).collect();
         sensors.sort_unstable();
         sensors.dedup();

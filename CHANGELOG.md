@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+
+- **SSH bare connects, banner grabs and bad version strings are now recorded** - the SSH sensor
+  emitted `honeypot_connection` only after key exchange, so a Shodan/Censys-style scanner that
+  read the banner and left, a client that sent a malformed identification line, and a bare TCP
+  probe left no event (the fleet probe reported "socket answered, no line reached intake" for
+  tcp/22). The event is now emitted at accept, once per connection, like the other TCP sensors.
+  A connection that ends before key exchange completes also emits one `honeypot_session_end`
+  (telemetry, unscored) with `end_reason`, `phase`, `duration_ms` and the sanitized
+  `client_version` when received. Consequence: such connections now carry the same
+  `honeypot_connection` weight (40) as a telnet connect did already. No migration or wire change.
+
 ### Added
 
 - **Console log view keeps fields and folds repeats** - the `/logs` ring now keeps each event's
@@ -29,7 +41,29 @@
   ran the same commands fold into one card with a count and the usernames tried, and a run of
   echo-loader chunk writes to one file (`assembled_file` / `chunk_index`) is one row,
   "N echo chunks to FILE", with the lines behind an expander.
-
+- **Per-source command-event budget with flood summaries (ssh, telnet, adb)** - a handful of
+  Mirai-family echo loaders, each running the same ~53-command session around the clock and
+  several at once, made telnet 97% of all events (~15 a second, 2,555 from one address in ten
+  minutes), outran log rotation and put intake 6.6 GB behind. The per-connection cap of 256 could
+  not see it. Each of the three sensors now holds a token bucket per source network (/24 or /56)
+  charged by `honeypot_command_exec` events only (`CommandEventGate` in
+  `sensor_framework::command_flood`, reached through `ConnectionBudget::with_command_gate`):
+  burst 200, then 12 a minute, set by `PROPOLIS_<SSH|TELNET|ADB>_COMMAND_EVENT_RATE_PER_MIN` and
+  `_BURST` (a positive integer; zero or garbage exits 1; `Rate::per_minute` is new in
+  `sensor_framework::rate_limit`). Past it, a command event is not written but counted into one
+  `honeypot_command_exec` per network per 60 s window with `command_summary: true`,
+  `suppressed_count`, `distinct_commands` (shapes), up to 8 samples, first and last seen,
+  `session_count` and, for echo-loader chunks, `assembled_file` and `max_chunk_index`; it is
+  written when the window ends and at shutdown. Never summarized: logins, connections, downloads
+  and derived URLs, every capture upload, the per-session flood markers, the first command of each
+  shape per network per window (`command_shape` takes out `\xNN`/`\NNN` escape runs, hex runs of
+  16+ and base64-looking runs of 24+, so the observed 53-line session is 16 shapes whatever its
+  marker), and each address's first command event per window (scoring is per address). An
+  echo-loader chunk (a command event with `assembled_file`) is never a first: its bytes are in the
+  capture. Replies are unchanged: only logging is summarized. The summary scores as one command
+  event; the merit path is unaffected (60 s dedup), the volume path reaches its threshold later.
+  The observed loop, four parallel sessions every 30 s for ten minutes, drops from 4,240 command
+  events to 407 plus 10 summaries. Additive metadata: no migration or wire version change.
 - **Intake lag is visible and pages** - each intake poll records how many bytes of its log are
   unread (`LogTailer::backlog_bytes`: the file past the read offset plus any rotated-out file
   still being drained) and the `observed_at` of the last event it appended. `/metrics` publishes
@@ -446,6 +480,22 @@
   built inside the migration transaction at startup, before intake runs: 12 to 20 s for that
   ledger held in RAM, longer on disk. Plan guards hold the read to the index on a ledger shaped
   like the incident.
+- **An append no longer costs more the longer its source has been seen** - every scored append
+  counted the source's distinct WAN vantages and distinct sensors by reading every earlier event
+  of that source (a `GROUP BY wan_ip` and a `COUNT(DISTINCT sensor)`), inside the global append
+  lock. On a 7.5M-row ledger that was 0.73 s per event for a source with 100k events, 3.5 s at
+  200k, 7.1 s at 800k and 9.4 s at 1.5M, and a long-running bot loop on one address set the pace
+  for every sensor: three fresh sources appending beside a 1.5M-event one managed about one
+  event a second between them. Migration `0014` adds two projection tables, `ip_vantage
+  (source_ip, wan_ip, saw_authenticated_tcp)` and `ip_sensor (source_ip, sensor)`, which the
+  append folds each scored event into under the same lock and reads by primary key; telemetry
+  never writes them. The same appends now take 2.8 to 3.3 ms whatever the history, against 3.1
+  ms for a source never seen, and the four mixed sources together reach 358 events a second.
+  The migration backfills both tables from the ledger at startup, before intake runs: 23 to 26 s
+  for that ledger held in RAM, longer on disk. `rebuild_projection` still counts from the ledger
+  rows, so a replay checks the tables; a property test compares the tables with the old
+  aggregates after every append of random multi-source sequences with telemetry and
+  out-of-order events.
 - **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
   0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
   echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks

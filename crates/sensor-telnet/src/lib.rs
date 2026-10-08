@@ -12,8 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use sensor_framework::{
-    CaptureHandoff, CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
-    EventEmitter, OutboxManifest, QuarantineSpool, WanResolver, run_tcp_listener,
+    Arrival, CaptureHandoff, CaptureMemoryBudget, CommandEventConfig, CommandEventGate,
+    ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EventEmitter, OutboxManifest,
+    QuarantineSpool, WanResolver, command_flood, run_tcp_listener,
 };
 use tokio::task::JoinHandle;
 
@@ -43,15 +44,17 @@ pub async fn start_test_server(
         collector_id,
         outbox_dir,
         Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES_256M)),
+        Arc::new(CommandEventGate::new(CommandEventConfig::default())),
     )
     .await?;
     Ok((bound, handle))
 }
 
-/// `start_test_server` plus the capture hand-off, so `main` can `drain` it on shutdown, and the
-/// process-wide capture memory budget `main` built from its configured ceiling. A separate
-/// function rather than a wider return type so the many callers that never shut down (every
-/// integration test) are unchanged.
+/// `start_test_server` plus the capture hand-off, so `main` can `drain` it on shutdown, the
+/// process-wide capture memory budget `main` built from its configured ceiling, and the sensor's
+/// per-source command-event budget, which `main` flushes on shutdown. A separate function rather
+/// than a wider return type so the many callers that never shut down (every integration test) are
+/// unchanged. The returned handle stops the listener and the command-summary writer together.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_test_server_with_handoff(
     addr: SocketAddr,
@@ -62,8 +65,11 @@ pub async fn start_test_server_with_handoff(
     collector_id: String,
     outbox_dir: PathBuf,
     capture_budget: Arc<CaptureMemoryBudget>,
+    command_events: Arc<CommandEventGate>,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>, Arc<CaptureHandoff>)> {
     let emitter = Arc::new(EventEmitter::new(log_path.clone()));
+    let summary_emitter = emitter.clone();
+    let summary_gate = command_events.clone();
 
     // Ensure the spool directory exists.
     std::fs::create_dir_all(&spool_dir)?;
@@ -96,6 +102,7 @@ pub async fn start_test_server_with_handoff(
             let handoff = handoff.clone();
             let wan_resolver = wan_resolver.clone();
             let bounds = bounds.clone();
+            let command_events = command_events.clone();
             async move {
                 handler::handle_connection(
                     stream,
@@ -106,11 +113,17 @@ pub async fn start_test_server_with_handoff(
                     wan_resolver,
                     bounds,
                     handoff,
+                    command_events,
                 )
                 .await;
             }
         },
     )
     .await?;
-    Ok((bound, handle, drain_handle))
+    let writer = summary_gate.spawn_writer(summary_emitter, Arrival::new(bound.port()));
+    Ok((
+        bound,
+        command_flood::with_writer(handle, writer),
+        drain_handle,
+    ))
 }

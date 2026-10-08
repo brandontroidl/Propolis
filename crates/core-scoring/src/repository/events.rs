@@ -13,17 +13,19 @@
 //! [`APPEND_LOCK_KEY`]). The transaction first pins `READ COMMITTED` isolation
 //! (required for the lock to serialize correctly), then acquires the lock before
 //! the chain-head read, so the chain-head read + event INSERT + projection read +
-//! `ip_score` UPSERT all execute as one serialized critical section. Under READ
-//! COMMITTED each statement takes a fresh snapshot, so once the lock is granted
-//! the chain-head read sees the prior appender's committed row (under REPEATABLE
-//! READ / SERIALIZABLE the snapshot would freeze before the lock and the chain
-//! could fork - hence the explicit pin). This guarantees, under any number of
-//! concurrent callers:
+//! vantage/sensor set upserts + `ip_score` UPSERT all execute as one serialized
+//! critical section. Under READ COMMITTED each statement takes a fresh snapshot,
+//! so once the lock is granted the chain-head read sees the prior appender's
+//! committed row (under REPEATABLE READ / SERIALIZABLE the snapshot would freeze
+//! before the lock and the chain could fork - hence the explicit pin). This
+//! guarantees, under any number of concurrent callers:
 //!
 //! - the tamper-evident hash chain cannot fork (no two appends can read the
 //!   same `prev_hash` and both insert against it);
 //! - the `ip_score` projection UPSERT cannot lose an update to a
 //!   last-write-wins race;
+//! - the `ip_vantage` / `ip_sensor` sets an append counts from hold every
+//!   scored event committed before it;
 //! - the dedup window read (`MAX(observed_at)` for the same `source_ip` +
 //!   `signal_type`) cannot be bypassed by an interleaved concurrent insert.
 //!
@@ -43,7 +45,7 @@ use std::net::IpAddr;
 use chrono::{DateTime, NaiveDate, SubsecRound, Utc};
 use sqlx::{PgPool, Postgres, Row};
 
-use crate::domain::enums::{Category, SignalType};
+use crate::domain::enums::{Category, Protocol, SignalType};
 use crate::domain::types::{EventInput, IpScore, ValidationError};
 use crate::hashing::chain_hash;
 use crate::scoring::breadth::{WanVantage, distinct_wan_count};
@@ -74,11 +76,12 @@ pub enum RepoError {
     NotScorable(SignalType),
 }
 
-/// Excludes telemetry rows from a scoring aggregate that reads the whole ledger for one source.
-/// A macro rather than a `const` so the queries stay `&'static str` literals that sqlx accepts
-/// without a dynamic-SQL escape hatch, while the predicate itself has one home;
-/// `telemetry_exclusion_names_every_telemetry_signal` fails if a telemetry signal is added
-/// without extending it.
+/// Excludes telemetry rows from a read of a source's ledger rows for scoring: `rebuild_projection`
+/// loads its events through it. A macro rather than a `const` so the queries stay `&'static str`
+/// literals that sqlx accepts without a dynamic-SQL escape hatch.
+/// `the_exclusion_predicate_names_every_telemetry_signal` fails if a telemetry signal is added
+/// without extending it. Migration 0014's backfill spells the same predicate out, since a
+/// migration file cannot use the macro.
 macro_rules! exclude_telemetry {
     () => {
         "signal_type <> 'honeypot_session_end'"
@@ -220,48 +223,8 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
         None => false,
     };
 
-    // 2f. Breadth inputs from the ledger for this source (INCLUDING the row just
-    // inserted). One vantage per distinct non-null wan_ip; `saw_authenticated_tcp`
-    // is true if ANY event from this source on that wan was authenticated tcp.
-    // Telemetry rows are excluded here and in the distinct-sensor count below. Skipping only
-    // their own projection would not be enough: these two read EVERY ledger row for the source,
-    // so an outcome record would silently add a vantage or a sensor to the next scored event's
-    // breadth. `rebuild_projection` excludes them the same way, or replay would diverge.
-    let vantage_rows = sqlx::query(concat!(
-        "SELECT host(wan_ip) AS wan, \
-                bool_or(protocol = 'tcp' AND authenticated) AS auth_tcp \
-         FROM event \
-         WHERE source_ip = $1::inet AND wan_ip IS NOT NULL AND ",
-        exclude_telemetry!(),
-        " GROUP BY wan_ip"
-    ))
-    .bind(event.source_ip.to_string())
-    .fetch_all(&mut *tx)
-    .await?;
-    let mut vantages: Vec<WanVantage> = Vec::with_capacity(vantage_rows.len());
-    for row in vantage_rows {
-        let wan: String = row.try_get("wan")?;
-        let saw_authenticated_tcp: bool =
-            row.try_get::<Option<bool>, _>("auth_tcp")?.unwrap_or(false);
-        let wan_ip: IpAddr = wan
-            .parse()
-            .map_err(|e| RepoError::Corrupt(format!("stored wan_ip {wan}: {e}")))?;
-        vantages.push(WanVantage {
-            wan_ip,
-            saw_authenticated_tcp,
-        });
-    }
-    let dwc = distinct_wan_count(&vantages) as i32;
-
-    let dsc: i64 = sqlx::query_scalar(concat!(
-        "SELECT COUNT(DISTINCT sensor) FROM event \
-         WHERE source_ip = $1::inet AND ",
-        exclude_telemetry!()
-    ))
-    .bind(event.source_ip.to_string())
-    .fetch_one(&mut *tx)
-    .await?;
-    let dsc = dsc as i32;
+    // 2f. Breadth inputs for this source, INCLUDING the row just inserted.
+    let (dwc, dsc) = fold_breadth_sets(&mut tx, &event).await?;
 
     // 2g. Pure projection step (no DB, no clock).
     let new_score = apply_event(stored, &event, HALF_LIFE_SECONDS, deduped, dwc, dsc);
@@ -326,7 +289,7 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
 /// append and [`append_telemetry_event`] so the two can never compute the chain differently; both
 /// call it while holding the append advisory lock, which is what makes the head read and the
 /// insert one critical section.
-async fn insert_chained(
+pub(super) async fn insert_chained(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     event: &EventInput,
 ) -> Result<i64, RepoError> {
@@ -360,6 +323,75 @@ async fn insert_chained(
     .fetch_one(&mut **tx)
     .await?;
     Ok(new_id)
+}
+
+/// Fold one scored event into its source's vantage and sensor sets (migration 0014) and return the
+/// breadth inputs `apply_event` takes: the distinct authenticated WAN vantage count and the
+/// distinct sensor count, both including this event.
+///
+/// The sets hold exactly what the whole-history aggregates this replaced derived from the ledger
+/// (a `GROUP BY wan_ip` with `bool_or(protocol = 'tcp' AND authenticated)`, and a
+/// `COUNT(DISTINCT sensor)`, each over the source's scored rows), so each append reads one row per
+/// WAN and one per sensor however long the source's history is. Called only by [`append_event`],
+/// under the append lock, after the event row is inserted; [`append_telemetry_event`] never calls
+/// it, which is what keeps telemetry out of breadth. `rebuild_projection` still derives both
+/// inputs from the ledger rows themselves, so replay stays an independent check on these sets.
+///
+/// The vantage upsert writes only when the flag turns from false to true. Ever-seen is an OR over
+/// the source's history, so a conflicting row that is already true, or an event that is not
+/// authenticated TCP, changes nothing, and skipping the write spares a dead row version per event
+/// for a bot loop that hits the same WAN all day.
+async fn fold_breadth_sets(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &EventInput,
+) -> Result<(i32, i32), RepoError> {
+    let source_ip = event.source_ip.to_string();
+    if let Some(wan_ip) = event.wan_ip {
+        sqlx::query(
+            "INSERT INTO ip_vantage (source_ip, wan_ip, saw_authenticated_tcp) \
+             VALUES ($1::inet, $2::inet, $3) \
+             ON CONFLICT (source_ip, wan_ip) DO UPDATE \
+             SET saw_authenticated_tcp = ip_vantage.saw_authenticated_tcp OR EXCLUDED.saw_authenticated_tcp \
+             WHERE EXCLUDED.saw_authenticated_tcp AND NOT ip_vantage.saw_authenticated_tcp",
+        )
+        .bind(&source_ip)
+        .bind(wan_ip.to_string())
+        .bind(event.protocol == Protocol::Tcp && event.authenticated)
+        .execute(&mut **tx)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO ip_sensor (source_ip, sensor) VALUES ($1::inet, $2) \
+         ON CONFLICT (source_ip, sensor) DO NOTHING",
+    )
+    .bind(&source_ip)
+    .bind(&event.sensor)
+    .execute(&mut **tx)
+    .await?;
+
+    let vantage_rows = sqlx::query(
+        "SELECT host(wan_ip) AS wan, saw_authenticated_tcp FROM ip_vantage WHERE source_ip = $1::inet",
+    )
+    .bind(&source_ip)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut vantages: Vec<WanVantage> = Vec::with_capacity(vantage_rows.len());
+    for row in vantage_rows {
+        let wan: String = row.try_get("wan")?;
+        let wan_ip: IpAddr = wan
+            .parse()
+            .map_err(|e| RepoError::Corrupt(format!("stored wan_ip {wan}: {e}")))?;
+        vantages.push(WanVantage {
+            wan_ip,
+            saw_authenticated_tcp: row.try_get("saw_authenticated_tcp")?,
+        });
+    }
+    let sensors: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ip_sensor WHERE source_ip = $1::inet")
+            .bind(&source_ip)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok((distinct_wan_count(&vantages) as i32, sensors as i32))
 }
 
 /// Append a TELEMETRY event: it joins the hash chain like any other record, and touches no

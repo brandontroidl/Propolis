@@ -312,3 +312,119 @@ async fn a_mozi_echo_loader_session_is_answered_exactly_and_its_upload_captured_
     assert_eq!(bodies, 1);
     handle.abort();
 }
+
+/// The loader looping from one address, as it did live: past the source's command-event budget
+/// every reply is still exact (`replay` checks each byte), every login, connection, capture and
+/// derived download keeps its own event, each distinct command is logged at least once, and the
+/// suppressed command events come back as one summary when the sensor shuts down.
+#[tokio::test]
+async fn a_looping_loader_past_its_command_budget_is_summarized_not_silenced() {
+    use sensor_framework::rate_limit::Rate;
+    use sensor_framework::{
+        Arrival, CaptureMemoryBudget, CommandEventConfig, CommandEventGate,
+        DEFAULT_CAPTURE_BUDGET_BYTES_256M, EventEmitter,
+    };
+    use sensor_wire::{
+        SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_FILE_DOWNLOAD,
+        SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SIGNAL_HONEYPOT_MALWARE_UPLOAD,
+    };
+    use std::num::NonZeroU32;
+
+    const SESSIONS: usize = 5;
+    const BURST: u32 = 30;
+    const RATE: u32 = 1;
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let gate = Arc::new(CommandEventGate::new(CommandEventConfig {
+        rate: Rate::new(
+            NonZeroU32::new(RATE).unwrap(),
+            NonZeroU32::new(BURST).unwrap(),
+        ),
+        ..CommandEventConfig::default()
+    }));
+    let started = std::time::Instant::now();
+    let (addr, handle, _handoff) = sensor_telnet::start_test_server_with_handoff(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        dir.path().join("spool"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+        Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES_256M)),
+        gate.clone(),
+    )
+    .await
+    .unwrap();
+    let elf = synthetic_elf();
+    let (lines, chunks) = session_lines(&elf);
+    for _ in 0..SESSIONS {
+        replay(addr, &elf).await;
+    }
+    let of = |events: &[SensorEvent], signal: &str| {
+        events
+            .iter()
+            .filter(|e| e.signal_type == signal)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    wait_for_events(&log_path, |events| {
+        of(events, SIGNAL_HONEYPOT_MALWARE_UPLOAD).len() == SESSIONS
+    })
+    .await;
+    let elapsed = started.elapsed().as_secs() + 1;
+    handle.abort();
+    gate.flush(
+        &EventEmitter::new(log_path.clone()),
+        Arrival::new(addr.port()),
+    )
+    .await;
+    let events = wait_for_events(&log_path, |events| {
+        events
+            .iter()
+            .any(|e| e.metadata.get("command_summary").is_some())
+    })
+    .await;
+
+    // Nothing that is not a plain command event lost its own.
+    assert_eq!(of(&events, SIGNAL_HONEYPOT_CONNECTION).len(), SESSIONS);
+    assert_eq!(of(&events, SIGNAL_HONEYPOT_LOGIN_ATTEMPT).len(), SESSIONS);
+    assert_eq!(of(&events, SIGNAL_HONEYPOT_MALWARE_UPLOAD).len(), SESSIONS);
+    let downloads = of(&events, SIGNAL_HONEYPOT_FILE_DOWNLOAD);
+    assert_eq!(downloads.len(), SESSIONS, "every derived URL");
+    assert!(downloads.iter().all(|e| e.metadata["url"] == STAGE2_URL));
+
+    let commands = of(&events, SIGNAL_HONEYPOT_COMMAND_EXEC);
+    let (summaries, individual): (Vec<_>, Vec<_>) = commands
+        .iter()
+        .partition(|e| e.metadata.get("command_summary").is_some());
+    let total = lines.len() * SESSIONS;
+    assert_eq!(summaries.len(), 1, "one window, one summary");
+    let summary = &summaries[0].metadata;
+    assert_eq!(
+        individual.len() as u64 + summary["suppressed_count"].as_u64().unwrap(),
+        total as u64,
+        "every command is either its own event or counted in the summary"
+    );
+    assert!(
+        individual.len() as u64
+            <= u64::from(BURST) + u64::from(RATE) * elapsed + lines.len() as u64,
+        "{} individual command events in {elapsed} s",
+        individual.len()
+    );
+    assert!(individual.len() < total, "the budget suppressed something");
+    for line in &lines {
+        assert!(
+            individual
+                .iter()
+                .any(|e| e.metadata["command"] == line.as_str()),
+            "a distinct command is logged at least once: {line}"
+        );
+    }
+    assert_eq!(summary["source_prefix"], "127.0.0.0/24");
+    assert_eq!(summary["assembled_file"], "/var/.i");
+    assert_eq!(summary["max_chunk_index"], chunks);
+    assert!(summary["session_count"].as_u64().unwrap() >= 1);
+    assert_eq!(summaries[0].sensor, "telnet");
+    assert_eq!(summaries[0].metadata["local_port"], addr.port());
+}

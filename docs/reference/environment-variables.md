@@ -539,6 +539,20 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
 - adb: `PROPOLIS_ADB_READ_TIMEOUT_MS`, `PROPOLIS_ADB_IDLE_TIMEOUT_MS`,
   `PROPOLIS_ADB_MAX_DURATION_SECS`, `PROPOLIS_ADB_MAX_CAPTURED_BYTES`, `PROPOLIS_ADB_MAX_CONCURRENT`,
   `PROPOLIS_ADB_LOG_PATH`, `PROPOLIS_ADB_WAN_MAP`.
+- ssh, telnet and adb also read a per-source command-event budget
+  (`crates/sensor-framework/src/command_flood.rs#CommandEventConfig::from_lookup`): how many
+  `honeypot_command_exec` events one source network (the IPv4 /24 or IPv6 /56) may write before
+  its further repeated commands are folded into one summary per 60 s. Each is a positive `u32`;
+  zero, a negative number or a non-number aborts startup, and no value turns the budget off. The
+  shell's replies never depend on it.
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_SSH_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_TELNET_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_ADB_COMMAND_EVENT_RATE_PER_MIN` | `12` (`crates/sensor-framework/src/command_flood.rs#DEFAULT_COMMAND_EVENTS_PER_MIN`) | Command events per minute per source network once the burst is spent. |
+  | `PROPOLIS_SSH_COMMAND_EVENT_BURST`, `PROPOLIS_TELNET_COMMAND_EVENT_BURST`, `PROPOLIS_ADB_COMMAND_EVENT_BURST` | `200` (`crates/sensor-framework/src/command_flood.rs#DEFAULT_COMMAND_EVENT_BURST`) | Command events a quiet source network may write at once. |
+
+  What is never summarized, and the summary event, are in
+  [sensor-behavior](sensor-behavior.md#command-event-budget-ssh-telnet-adb).
 - ftp: `PROPOLIS_FTP_READ_TIMEOUT_MS`, `PROPOLIS_FTP_IDLE_TIMEOUT_MS`,
   `PROPOLIS_FTP_MAX_DURATION_SECS`, `PROPOLIS_FTP_MAX_CAPTURED_BYTES`, `PROPOLIS_FTP_MAX_CONCURRENT`,
   `PROPOLIS_FTP_LOG_PATH`, `PROPOLIS_FTP_WAN_MAP`. The TLS variables `PROPOLIS_FTP_TLS_BIND`,

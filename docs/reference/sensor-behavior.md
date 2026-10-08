@@ -181,7 +181,9 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   binary line or a line past the per-connection cap of 256 commands
   (`MAX_COMMANDS_PER_SESSION`, `crates/sensor-framework/src/shell/mod.rs#MAX_COMMANDS_PER_SESSION`, shared by every shell on the connection through
   `crates/sensor-framework/src/budget.rs#ConnectionBudget`) yields at most one marker event per session
-  per flood kind; a blank line produces no event or output (`crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`). The raw
+  per flood kind; a blank line produces no event or output (`crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
+  A repeated command past its source network's command-event budget is folded into a summary
+  instead ([below](#command-event-budget-ssh-telnet-adb)). The raw
   line is recorded verbatim in
   `metadata.command`, sanitized and capped at `MAX_COMMAND_LEN = 1024` (`crates/sensor-framework/src/shell/mod.rs#MAX_COMMAND_LEN`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
 - If the line is single-byte-XOR obfuscated, `command_decoded` and `xor_key` are
@@ -321,6 +323,69 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   requested is emitted as a `honeypot_file_download` marked `derived_from: echo_loader_args`, for
   the vetted fetcher only ([attack-surfaces.md](../security/attack-surfaces.md#malware-fetcher-attacker-directed-outbound)).
 
+### Command-event budget (ssh, telnet, adb)
+
+A Mirai-family echo loader runs the same fifty-odd commands per session, several sessions at once
+from one address, without pause. One command was one event, so a handful of such bots made telnet
+97% of all events and put intake eleven days behind its log
+([queue and spool troubleshooting](../troubleshooting/queue-and-spool.md#a-telnet-or-ssh-bot-loop-floods-the-event-log)).
+The per-connection cap of 256 cannot see it, since every session stays far under it. Each of the
+three sensors therefore holds one budget per source network for the whole process
+(`crates/sensor-framework/src/command_flood.rs#CommandEventGate`, carried to every shell of a
+connection by `crates/sensor-framework/src/budget.rs#ConnectionBudget::with_command_gate` and
+applied as the last step of each line, `crates/sensor-framework/src/shell/mod.rs#FakeShell::gate_events`).
+
+- **Only logging changes.** The command has already run when the gate sees its event: every
+  reply, file and capture is the same whether its event is written or summarized.
+- **The budget.** A token bucket per source network (IPv4 /24, IPv6 /56, the same key as the
+  UDP reply limit), charged one token per `honeypot_command_exec`: a burst of 200, then 12 a
+  minute (`PROPOLIS_<SENSOR>_COMMAND_EVENT_RATE_PER_MIN` / `_BURST`, see
+  [environment variables](environment-variables.md#standard-sensors-strict-parse---ssh-telnet-http-ftp-redis-adb-catchall-tftp-mqtt-dns)).
+  Within it, events are exactly as before.
+- **First sightings.** The first time a command *shape* is seen from the network in a 60 s
+  window, the command is written in full even with the bucket empty (and takes a token if one is
+  left), so a new kind of command always appears. The shape
+  (`crates/sensor-framework/src/command_flood.rs#command_shape`) is the line with its payload taken
+  out: each run of `\xNN` or `\NNN` escapes, each run of 16 or more hex digits and each
+  base64-looking run of 24 or more characters becomes a placeholder, and whitespace runs collapse
+  to one space. So a loader's echo chunks, which differ only in their bytes, and its markers,
+  whether fixed or random per session, are one shape each; the observed 53-line session is 16
+  shapes. A window remembers 128 shapes
+  (`crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_COMMANDS`); past that, a new one goes
+  by the bucket. Each address's first command event in the window is written too, for up to 64
+  addresses of the network (`crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_ADDRESSES`):
+  scoring is per address and the budget per network, so a host whose commands all repeat a
+  neighbour's would otherwise have no command event at all.
+- **Echo-loader chunks are never firsts.** A command event carrying `assembled_file` (one chunk
+  of an echo-loader upload) goes by the bucket alone: its bytes are in the `echo_loader` capture,
+  and the summary keeps `assembled_file` and the highest suppressed `chunk_index`.
+- **Never summarized** (`crates/sensor-framework/src/command_flood.rs#summarizable`): anything that
+  is not a plain command event. Logins and connections never pass through the shell;
+  `honeypot_file_download` (a fetch verb's URL or an echo-loader's derived stage-2 URL), every
+  `honeypot_malware_upload` (`exec_stdin`, `shell_stdin`, `echo_loader` captures), the
+  per-session `binary`, `command_cap` and `download_cap` markers and the summaries themselves are
+  passed through untouched and spend nothing.
+- **The summary.** A command event over the budget is counted into its network's summary for the
+  window: one `honeypot_command_exec` with `command_summary: true`, written when the window ends
+  (checked each second) and at shutdown (within 2 s,
+  `crates/sensor-telnet/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`,
+  `crates/sensor-ssh/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`,
+  `crates/sensor-adb/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`). Its keys are in
+  [events-and-signals](events-and-signals.md#command-summary-keys). A window that suppressed
+  nothing writes nothing. A session's end does not write the summary early: its window outlives
+  it, so the bot's next session is still measured against the same first sightings.
+- **Bounded.** The bucket table holds 4096 networks with eviction; the window table 1024
+  networks, each with at most 128 shape digests, 64 addresses, 8 samples of at most 256 bytes and 32 session
+  ids; a network arriving while it is full is counted in one `overflow` summary without first
+  sightings (`crates/sensor-framework/src/command_flood.rs#CommandEventGate::admit_at`). The
+  worst case is a few MiB per sensor.
+- **What it leaves.** With the defaults a source that keeps sending writes at most 200 + 12 a
+  minute of individual command events, plus per minute one first sighting per shape, one first
+  event per address and one summary. The observed loop (the 53-line session, four at once from
+  one address, a new round every 30 s) is 4,240 command events in ten minutes ungated and 407
+  individual events plus 10 summaries with the gate
+  (`crates/sensor-framework/src/command_flood.rs#the_observed_loader_loop_is_bounded_by_burst_rate_shapes_and_addresses`).
+
 ### Command de-obfuscation
 
 `command_codec.rs` decodes single-byte-XOR obfuscated telnet/shell probes
@@ -404,6 +469,22 @@ captures SCP/SFTP transfers.
   `crates/sensor-ssh/src/main.rs#main`). Banner default is the persona OpenSSH version
   (`crates/sensor-ssh/src/main.rs#DEFAULT_BANNER`). A residual HASSHServer distinguishability from the minimal
   KEXINIT offer is a tracked follow-up (`crates/sensor-ssh/src/main.rs#DEFAULT_BANNER`).
+- **Connection event at accept.** `honeypot_connection` (`authenticated=false`) is emitted
+  once per connection at accept, before the version exchange, like every other TCP sensor
+  (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/auth.rs#AuthState::emit_connection_event`).
+  A scanner that reads the banner and leaves, a client that sends a bad version string, and a
+  bare TCP probe are therefore recorded, and the fleet probe's "socket answered" check sees a
+  line for port 22. Nothing later emits a second connection event. It was previously emitted
+  only after key exchange, so those three produced no event.
+- **Handshake end.** A connection that ends before key exchange completes (banner grab, bare
+  probe, non-SSH bytes, a stalled or truncated handshake) emits one `honeypot_session_end`
+  (telemetry, never scored) with `end_reason` (`peer_closed`, `idle_timeout`, `malformed_input`,
+  or `transport_error`), `phase` (`version_exchange` or `key_exchange`), `duration_ms`, and
+  `client_version` (sanitized, bounded) when the client's identification line arrived
+  (`crates/sensor-ssh/src/auth.rs#AuthState::handshake_end_event`). A connection that completes
+  key exchange emits none (its later endings are recorded on the capture events), and none is
+  emitted when `max_duration` cancels the handler. The sensor still proceeds into key exchange
+  after a non-`SSH-` identification line; the line is not rejected.
 - **Auth** (`auth.rs`): **accepts every credential and method** - reaching userauth
   is itself crypto proof the peer is real - except `none`, which is rejected with
   `USERAUTH_FAILURE` listing `publickey,password` to defeat the
@@ -482,6 +563,9 @@ captures SCP/SFTP transfers.
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
   `honeypot_command_exec`, `honeypot_file_download` (via shell),
   `honeypot_malware_upload` (SCP/SFTP, a binary shell payload, a command's standard input).
+  Shell and exec channels share the connection's handle on the sensor's
+  [command-event budget](#command-event-budget-ssh-telnet-adb): repeats past it become one
+  `command_summary` event per source network per minute.
 
 ### sensor-telnet
 
@@ -533,7 +617,10 @@ credential, then presents the fake shell.
   shell payload and the standard input a command read; there is no file-transfer protocol.
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
   `honeypot_command_exec`, `honeypot_file_download` (via shell), `honeypot_malware_upload` (a
-  binary shell payload, a command's standard input).
+  binary shell payload, a command's standard input). A looping loader's repeated commands past
+  the [command-event budget](#command-event-budget-ssh-telnet-adb) become one `command_summary`
+  event per source network per minute; its logins, connections, captures and derived URLs keep
+  their own events.
 
 ### sensor-http
 
@@ -1181,6 +1268,9 @@ Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional por
 - **Bounds:** common defaults, `max_concurrent` 256.
 - **Emits:** `honeypot_connection`, `honeypot_command_exec` (shell),
   `honeypot_malware_upload` (sync push, a binary shell payload, a command's standard input).
+  Every shell stream shares the connection's handle on the sensor's
+  [command-event budget](#command-event-budget-ssh-telnet-adb): repeats past it become one
+  `command_summary` event per source network per minute.
   **All ADB events are authenticated=false.**
 
 ### sensor-catchall

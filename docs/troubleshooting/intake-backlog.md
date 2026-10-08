@@ -48,7 +48,7 @@ because all appends share one lock (see [why it happens](#why-it-happens)).
 
 Intake appends one event at a time, each in its own transaction under a single append lock
 that keeps the hash chain in order (`crates/core-scoring/src/repository/events.rs#append_event`).
-Whatever one append costs, every sensor waits for. Two costs grew without bound:
+Whatever one append costs, every sensor waits for. Two costs used to grow without bound:
 
 1. **The dedup read, while behind. Fixed by migration `0013`.** Each scored append looks up the
    newest prior event of the same source and signal. Before `event_dedup_idx` existed the
@@ -63,16 +63,34 @@ Whatever one append costs, every sensor waits for. Two costs grew without bound:
    psql "$DATABASE_URL" -c "SELECT indexname FROM pg_indexes WHERE indexname = 'event_dedup_idx'"
    ```
 
-2. **The per-event history reads. Still open.** Each scored append also reads every earlier
-   event of its source to count distinct WAN vantages and sensors, so a source with hundreds of
-   thousands of events costs seconds per event whether or not intake is behind
-   ([limitations](../overview/limitations.md#intake-append-cost-grows-with-a-sources-history)).
-   A long-running bot loop on one address is the case that hits it.
+2. **The per-event history reads. Fixed by migration `0014`.** Each scored append also counts
+   the distinct WAN vantages and sensors of its source. It used to read every earlier event of
+   the source to do it, so a long-running bot loop on one address cost seconds per event whether
+   or not intake was behind: 0.7 s at 100k events and 9 s at 1.5M on a test ledger. The counts
+   now come from the `ip_vantage` and `ip_sensor` tables, a few rows per source, and the same
+   appends take about 3 ms ([breadth sets](../reference/database.md#breadth-sets)). To confirm
+   a daemon has them:
+
+   ```
+   psql "$DATABASE_URL" -c "SELECT to_regclass('ip_vantage'), to_regclass('ip_sensor')"
+   ```
+
+What is left is the per-event round trips and commit, one transaction per line, which holds the
+node to a few hundred events a second in total
+([limitations](../overview/limitations.md#intake-appends-one-event-per-transaction)). A sensor
+whose log grows faster than that falls behind, and the badge and `intake-lagging` show it.
 
 A log that is not rotated makes it worse but does not cause it: rotation caps the file size,
 not the rate. If `/var/log/propolis/<sensor>/events.jsonl` is far past the 100 MB rotation size,
 check that the distribution's logrotate timer is running (`systemctl status logrotate.timer`);
 the installers install the policy (`/etc/logrotate.d/propolis-sensors`) but not the timer.
+
+What keeps a bot loop from building the backlog in the first place is on the sensor side: ssh,
+telnet and adb hold a per-source command-event budget, so past it a loader's repeated commands
+become one summary event per source network per minute instead of one line each, while its new
+commands, logins, connections, captures and downloads keep their own events
+([a telnet or ssh bot loop floods the event log](queue-and-spool.md#a-telnet-or-ssh-bot-loop-floods-the-event-log)).
+That cuts the rate a loop writes; it does not drain a backlog that already exists.
 
 ## Recovering a backlog too large to drain
 
@@ -95,8 +113,7 @@ What this costs, stated plainly:
   from every console view, the feed and vendor reports. Keep the archive.
 - The archive also holds every line intake had already ingested from that file, so it is not
   the backlog alone.
-- There is no re-import tool. Replaying a multi-gigabyte archive through intake would run into
-  the same per-event cost (cause 2 above) `[planned]`.
+- There is no re-import tool `[planned]`.
 
 The same happens without anyone asking: a scheduled `copytruncate` rotation of a log intake is
 behind on drops the unread part from ingest in the same way, and the lag metrics then read
@@ -107,5 +124,8 @@ on a sensor that had been behind, is that.
 
 - [Health and observability](../operations/health-and-observability.md) - the badge, the
   metrics and the `intake-lagging` condition.
-- [Database reference](../reference/database.md) - `event_dedup_idx` and migration `0013`.
+- [Database reference](../reference/database.md) - `event_dedup_idx` (migration `0013`) and
+  the breadth sets (migration `0014`).
 - [Retention](../operations/retention.md) - the log rotation policy.
+- [Queue and spool](queue-and-spool.md#a-telnet-or-ssh-bot-loop-floods-the-event-log) - the
+  command-event budget that summarizes a bot loop's repeated commands.

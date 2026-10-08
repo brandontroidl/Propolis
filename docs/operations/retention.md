@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-07
 -->
 
 # Retention
@@ -89,7 +89,11 @@ Consequences for an operator:
   events or score row;
 - the hash-chained event ledger means deletions break chain continuity, so prune with that
   trade-off in mind. See [storage](../architecture/storage.md) and [database
-  reference](../reference/database.md).
+  reference](../reference/database.md);
+- the per-source WAN and sensor sets (`ip_vantage`, `ip_sensor`) are kept by the append path
+  and are not pruned with the ledger: after deleting events, rebuild them from what remains
+  ([breadth sets](../reference/database.md#breadth-sets)), or later appends keep counting the
+  deleted events' WANs and sensors.
 
 ## Log rotation
 

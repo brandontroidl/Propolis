@@ -21,10 +21,12 @@
 //! `tests/auth_test.rs` covers this.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
-use sensor_framework::{Uuid, sanitize_value};
+use sensor_framework::{CaptureEnd, Uuid, sanitize_value, session_end_metadata};
 use sensor_wire::{
-    PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
+    PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
+    SIGNAL_HONEYPOT_SESSION_END, SensorEvent, WIRE_VERSION,
 };
 
 use crate::transport::{
@@ -125,6 +127,39 @@ impl AuthState {
             authenticated: false,
             observed_at: chrono::Utc::now(),
             metadata: serde_json::json!({ "protocol_label": "ssh" }),
+            sample: None,
+            session_id: Some(self.session_id),
+            occurrence_id: None,
+        }
+    }
+
+    /// The `honeypot_session_end` event for a connection that ended before the encrypted
+    /// transport existed (banner grab, bare probe, garbage or stalled handshake). `end` is the
+    /// reason, `phase` the handshake step it ended in, `client_version` the identification string
+    /// when one was received (sanitized: it is attacker-controlled). Telemetry only, never scored.
+    pub fn handshake_end_event(
+        &self,
+        end: CaptureEnd,
+        phase: &str,
+        client_version: Option<&str>,
+        elapsed: Duration,
+    ) -> SensorEvent {
+        let mut metadata = session_end_metadata("ssh", end, elapsed);
+        metadata["phase"] = serde_json::Value::String(phase.to_owned());
+        if let Some(version) = client_version {
+            metadata["client_version"] =
+                serde_json::Value::String(sanitize_value(version, MAX_METADATA_STRING_LEN));
+        }
+        SensorEvent {
+            v: WIRE_VERSION,
+            source_ip: self.source_ip,
+            wan_ip: self.wan_ip,
+            sensor: "ssh".into(),
+            signal_type: SIGNAL_HONEYPOT_SESSION_END.into(),
+            protocol: PROTO_TCP.into(),
+            authenticated: false,
+            observed_at: chrono::Utc::now(),
+            metadata,
             sample: None,
             session_id: Some(self.session_id),
             occurrence_id: None,

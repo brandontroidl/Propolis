@@ -17,7 +17,7 @@ tiers, and eligibility live in [scoring-and-feed.md](scoring-and-feed.md).
 Three crates own schema through three independent migration sets:
 
 - **core-scoring** (`crates/core-scoring/migrations/*.sql`) owns `event`, `ip_score`,
-  `sample_analysis`, and all five enum types.
+  `ip_vantage`, `ip_sensor`, `sample_analysis`, and all five enum types.
 - **review** (`crates/review/migrations/*.sql`) owns `review_queue`,
   `vendor_submission`, `fetch_attempt`, `fetch_daily_usage`.
 - **fleet** (`crates/fleet/migrations/*.sql`) owns `listener_probe`.
@@ -247,6 +247,42 @@ migration that embeds a scoring formula in SQL; `0010` explicitly refuses to dup
 tier logic in SQL (`crates/core-scoring/migrations/0010_active_days.sql#it does not re-derive the tier/recommendation flags in SQL`). The authoritative formulas are in
 [scoring-and-feed.md](scoring-and-feed.md).
 
+<a id="breadth-sets"></a>
+## Tables: `ip_vantage` and `ip_sensor` (breadth sets, `0014_breadth_sets.sql`)
+
+The two per-source sets `distinct_wan_count` and `distinct_sensor_count` are counted from.
+Like `ip_score` they are projections of the ledger: no foreign key ties them to `ip_score`, and
+the console's `delete_ip`, which removes a score row but keeps the ledger, leaves them in place,
+so a later event from that address still counts its whole history.
+
+| table | column | type | constraint | source |
+|---|---|---|---|---|
+| `ip_vantage` | `source_ip` | INET | NOT NULL; PK with `wan_ip` | `crates/core-scoring/migrations/0014_breadth_sets.sql#ip_vantage` |
+| `ip_vantage` | `wan_ip` | INET | NOT NULL | `crates/core-scoring/migrations/0014_breadth_sets.sql#wan_ip` |
+| `ip_vantage` | `saw_authenticated_tcp` | BOOLEAN | NOT NULL | `crates/core-scoring/migrations/0014_breadth_sets.sql#saw_authenticated_tcp` |
+| `ip_sensor` | `source_ip` | INET | NOT NULL; PK with `sensor` | `crates/core-scoring/migrations/0014_breadth_sets.sql#ip_sensor` |
+| `ip_sensor` | `sensor` | TEXT | NOT NULL | `crates/core-scoring/migrations/0014_breadth_sets.sql#sensor` |
+
+`ip_vantage` has one row per source and non-null WAN address the source was seen on, and
+`saw_authenticated_tcp` is true once any scored event on that WAN was authenticated TCP.
+`ip_sensor` has one row per source and sensor. Each scored append folds its event into both
+inside the append lock and reads them back by primary key
+(`crates/core-scoring/src/repository/events.rs#fold_breadth_sets`); `distinct_wan_count`
+applies the breadth rule (authenticated vantages only, one per /24 or /64) to the vantage rows,
+and `distinct_sensor_count` is the sensor row count. Telemetry never writes either table:
+`append_telemetry_event` does not touch them.
+
+The migration creates both tables and fills them from the ledger with a `GROUP BY` over every
+scored row (telemetry excluded), holding `SHARE` on `event` so no append slips between the read
+and the commit ([schema-and-migrations](../development/schema-and-migrations.md#index-builds)).
+
+The tables summarize the ledger as the append path wrote it. A row that reaches `event` any
+other way, or a pruning job that deletes events (see [retention](../operations/retention.md#event-and-score-retention)),
+leaves them out of step with it. To rebuild them from the ledger, empty both and run the
+migration's two `INSERT ... SELECT` statements again with the daemon stopped.
+`rebuild_projection` does not read them: it counts from the ledger rows, so a replay is an
+independent check (`crates/core-scoring/src/repository/breadth_sets_tests.rs#breadth_sets_match_the_whole_history_aggregates_after_every_append`).
+
 ## Table: `sample_analysis` (`0009_sample_analysis.sql`)
 
 VirusTotal-style verdict per captured sample, keyed by SHA-256; links to a
@@ -362,6 +398,7 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 | `0011` | `ip_score.established_event_count INTEGER DEFAULT 0`; backfills TCP-only counts |
 | `0012` | `signal_type_enum` value `honeypot_session_end` (unscored interaction telemetry) |
 | `0013` | index `event_dedup_idx (source_ip, signal_type, observed_at)` for the append path's dedup read; built inside the migration transaction, so writes to `event` wait for the build ([schema-and-migrations](../development/schema-and-migrations.md#index-builds)) |
+| `0014` | tables `ip_vantage (source_ip, wan_ip, saw_authenticated_tcp)` and `ip_sensor (source_ip, sensor)`, the [breadth sets](#breadth-sets) the append path counts from; backfilled from the ledger under a `SHARE` lock on `event` |
 
 **review** (`crates/review/migrations/`):
 

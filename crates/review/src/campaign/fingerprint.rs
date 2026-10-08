@@ -292,6 +292,8 @@ pub struct RunDigest {
     pub shape_chars: i32,
     /// Shapes folded into `chain`: at most [`KEY_SHAPES`], none of them a shell-entry line.
     pub payload: i32,
+    /// Collapsed shapes that are shell-entry lines.
+    pub entry_shapes: i32,
 }
 
 impl Default for RunDigest {
@@ -302,6 +304,7 @@ impl Default for RunDigest {
             shapes: 0,
             shape_chars: 0,
             payload: 0,
+            entry_shapes: 0,
         }
     }
 }
@@ -324,7 +327,11 @@ impl RunDigest {
         self.shape_chars = self
             .shape_chars
             .saturating_add(i32::try_from(shape.chars().count()).unwrap_or(i32::MAX));
-        if is_entry(shape) || self.payload >= key_shapes {
+        if is_entry(shape) {
+            self.entry_shapes += 1;
+            return true;
+        }
+        if self.payload >= key_shapes {
             return true;
         }
         if self.payload == 0 && is_http_request(shape) {
@@ -343,6 +350,12 @@ impl RunDigest {
         true
     }
 
+    /// The commands in the run for a label: the collapsed shapes past the shell-entry lines, or
+    /// all of them for a run that is entry lines only.
+    pub fn commands(&self) -> i32 {
+        command_count(self.shapes, self.entry_shapes)
+    }
+
     /// The campaign key in lowercase hex: the digest over the opening commands, or one fixed key
     /// for a run that never got past the shell-entry lines.
     pub fn key(&self) -> String {
@@ -353,6 +366,20 @@ impl RunDigest {
         };
         key.iter().map(|b| format!("{b:02x}")).collect()
     }
+}
+
+fn command_count(shapes: i32, entry_shapes: i32) -> i32 {
+    if shapes > entry_shapes {
+        shapes - entry_shapes
+    } else {
+        shapes
+    }
+}
+
+/// [`RunDigest::commands`] for a run given as its collapsed shapes.
+pub fn commands_in(shapes: &[String]) -> i32 {
+    let entry = shapes.iter().filter(|s| is_entry(s)).count();
+    command_count(shapes.len() as i32, entry as i32)
 }
 
 /// The collapsed shapes of a run, given its commands in order, at most `max`.

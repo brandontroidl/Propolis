@@ -71,8 +71,8 @@ campaign its run joins.
 digest and file name, a command sequence's full shape list, or a scanner's sensor set. A command
 sequence's label is the fewest and most commands its runs held, as `3-16 commands`, then its first
 three shapes after the shell-entry lines, or `http request sent to a shell port` or
-`shell entry only` for the two classes above. The count includes the entry lines and stops at 64
-(`crates/review/src/campaign/mod.rs#MAX_RUN_SHAPES`).
+`shell entry only` for the two classes above. The count is commands past the shell-entry lines (all lines for a run of entry lines only), and a
+run is counted to 64 shapes (`crates/review/src/campaign/mod.rs#MAX_RUN_SHAPES`).
 
 ## How it runs
 

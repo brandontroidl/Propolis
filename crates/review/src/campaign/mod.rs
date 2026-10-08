@@ -631,7 +631,7 @@ impl Batch {
         }
         let row = sqlx::query(
             "SELECT host(source_ip) AS source_ip, sensor, run, first_seen, last_seen, \
-                    first_event_id, last_event_id, shapes, shape_chars, payload, last_shape, \
+                    first_event_id, last_event_id, shapes, shape_chars, payload, entry_shapes, last_shape, \
                     chain, campaign_key, closed, pending_samples \
              FROM campaign_session WHERE session_id = $1::uuid",
         )
@@ -718,7 +718,7 @@ impl Batch {
             last_seen: s.last_seen,
             sightings: 1,
             uploaded: false,
-            shapes: Some(s.digest.shapes),
+            shapes: Some(s.digest.commands()),
         });
         for sha in s.pending_samples.drain(..) {
             self.links.insert((Kind::CommandSequence, key.clone(), sha));
@@ -1199,6 +1199,7 @@ fn session_from_row(r: &sqlx::postgres::PgRow) -> Result<Session, sqlx::Error> {
             shapes: r.try_get("shapes")?,
             shape_chars: r.try_get("shape_chars")?,
             payload: r.try_get("payload")?,
+            entry_shapes: r.try_get("entry_shapes")?,
         },
         campaign_key: r.try_get("campaign_key")?,
         closed: r.try_get("closed")?,
@@ -1214,14 +1215,14 @@ async fn write_session(
     sqlx::query(
         "INSERT INTO campaign_session (session_id, source_ip, sensor, run, first_seen, last_seen, \
              first_event_id, last_event_id, shapes, shape_chars, last_shape, chain, campaign_key, \
-             closed, pending_samples, payload) \
+             closed, pending_samples, payload, entry_shapes) \
          VALUES ($1::uuid, $2::inet, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                 $16) \
+                 $16, $17) \
          ON CONFLICT (session_id) DO UPDATE SET \
            run = EXCLUDED.run, first_seen = EXCLUDED.first_seen, last_seen = EXCLUDED.last_seen, \
            first_event_id = EXCLUDED.first_event_id, last_event_id = EXCLUDED.last_event_id, \
            shapes = EXCLUDED.shapes, shape_chars = EXCLUDED.shape_chars, \
-           payload = EXCLUDED.payload, \
+           payload = EXCLUDED.payload, entry_shapes = EXCLUDED.entry_shapes, \
            last_shape = EXCLUDED.last_shape, chain = EXCLUDED.chain, \
            campaign_key = EXCLUDED.campaign_key, closed = EXCLUDED.closed, \
            pending_samples = EXCLUDED.pending_samples",
@@ -1242,6 +1243,7 @@ async fn write_session(
     .bind(s.closed)
     .bind(&s.pending_samples)
     .bind(s.digest.payload)
+    .bind(s.digest.entry_shapes)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1283,7 +1285,7 @@ async fn run_representative(
     let opening = ioc::sanitize_field(&fingerprint::opening(&shapes), 200);
     // Provisional: the campaign's run lengths are only known to the whole campaign, and
     // `write_campaign` rewrites the label from them.
-    let provisional = shapes.len() as i32;
+    let provisional = fingerprint::commands_in(&shapes);
     let label = ioc::sanitize_field(&fingerprint::label(&opening, provisional, provisional), 200);
     Ok((
         label,

@@ -771,25 +771,31 @@ async fn a_loader_stopped_at_any_point_after_its_opening_is_one_campaign(pool: P
     assert_eq!(found.len(), key, "{found:?}");
     let opening = ">/var/run/.x&&cd /var/run;>/tmp/.x&&cd /tmp;>/dev/.x&&cd /dev \
                    ; /bin/busybox ZXCVB ; /bin/busybox cat /proc/mounts";
-    // The sessions that came in through the four entry lines count them: the odd cut 5 is the
-    // shortest run (5 shapes), the even cut 16 the longest (4 entry lines and 16 commands).
+    // Half the sessions came in through the four entry lines; the label counts commands only, so
+    // the range is 4 to 16 whatever the way in.
     assert_eq!(
         found[0],
-        (format!("5-20 commands: {opening}"), (16 - key + 1) as i32)
+        (format!("4-16 commands: {opening}"), (16 - key + 1) as i32)
     );
-    // Each shorter cut is its own campaign, labeled with the opening it has (the count includes
-    // the entry lines the even cuts came in through).
+    // Each shorter cut is its own campaign, labeled with the opening it has.
     let mut shorter: Vec<String> = found[1..]
         .iter()
         .map(|(l, n)| {
             assert_eq!(*n, 1);
-            l.split_once(": ").unwrap().1.to_string()
+            l.clone()
         })
         .collect();
-    shorter.sort_by_key(String::len);
+    shorter.sort();
     let first = &opening[..opening.find(" ;").unwrap()];
     let second = &opening[..opening.rfind(" ; ").unwrap()];
-    assert_eq!(shorter, vec![first, second, opening]);
+    assert_eq!(
+        shorter,
+        vec![
+            format!("1 command: {first}"),
+            format!("2 commands: {second}"),
+            format!("3 commands: {opening}"),
+        ]
+    );
 }
 
 /// Two loaders that share their first commands are different tools once they diverge inside the
@@ -1350,7 +1356,7 @@ async fn snapshot(pool: &PgPool) -> BTreeMap<&'static str, Vec<String>> {
             "session",
             "SELECT concat_ws('|', session_id, host(source_ip), sensor, run, first_seen, \
                 last_seen, first_event_id, last_event_id, shapes, shape_chars, encode(last_shape, 'hex'), \
-                encode(chain, 'hex'), payload, campaign_key, closed, pending_samples::text) \
+                encode(chain, 'hex'), payload, entry_shapes, campaign_key, closed, pending_samples::text) \
                 FROM campaign_session",
         ),
         (
@@ -1541,7 +1547,12 @@ async fn command_oracle_groups(pool: &PgPool) -> BTreeSet<(Vec<String>, i32, i32
                 .map(|s| s.to_string())
                 .collect(),
         };
-        let n = run.shapes.len() as i32;
+        // Commands, not login lines (a run of login lines only counts those).
+        let n = if payload.is_empty() {
+            run.shapes.len()
+        } else {
+            payload.len()
+        } as i32;
         let entry = groups
             .entry(opening)
             .or_insert_with(|| (BTreeSet::new(), n, n));

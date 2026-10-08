@@ -13,12 +13,14 @@ ALTER TABLE campaign_cursor
     ADD COLUMN fingerprint_version INTEGER NOT NULL DEFAULT 1,
     ADD COLUMN rebuild_until       BIGINT;
 
--- Shapes in the run (shell-entry lines included): the fewest and most over a campaign's runs, for
--- its label. NULL for campaigns that are not command sequences.
+-- Commands in the run, shell-entry lines not counted (all of them for a run of entry lines only):
+-- the fewest and most over a campaign's runs, for its label. NULL for campaigns that are not
+-- command sequences.
 ALTER TABLE campaign
     ADD COLUMN min_shapes INTEGER,
     ADD COLUMN max_shapes INTEGER;
 
 -- Shapes of the run folded into campaign_session.chain, the opening commands the key is over.
 ALTER TABLE campaign_session
-    ADD COLUMN payload INTEGER NOT NULL DEFAULT 0;
+    ADD COLUMN payload       INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN entry_shapes  INTEGER NOT NULL DEFAULT 0;

@@ -162,3 +162,135 @@ fn mismatched_address_family_never_matches_a_reserved_or_allowlisted_net() {
     let e = ExclusionEngine::new(allowlist, Vec::new());
     assert!(!e.is_excluded(ip("::a")));
 }
+
+// ---- operator range file (PROPOLIS_FEED_ALLOWLIST_FILE) ----
+
+use feed::AllowlistFileError;
+use feed::exclusion::{ALLOWLIST_FILE_MAX_BYTES, ALLOWLIST_FILE_MAX_ENTRIES, parse_allowlist_text};
+
+#[test]
+fn a_range_file_with_comments_and_blank_lines_excludes_exactly_its_ranges() {
+    let text =
+        "# crawler ranges, checked 2026-10-08\n\n45.10.30.0/24   # v4 block\n2003:aaaa:bbbb::/48\n";
+    let nets = parse_allowlist_text(text).unwrap();
+    assert_eq!(nets.len(), 2);
+    let e = ExclusionEngine::new(nets, Vec::new());
+    assert!(e.is_excluded(ip("45.10.30.77")));
+    assert!(e.is_excluded(ip("2003:aaaa:bbbb::5")));
+    assert!(
+        !e.is_excluded(ip("45.10.31.77")),
+        "outside the listed range"
+    );
+    assert!(!e.is_excluded(ip("2003:aaaa:cccc::5")));
+}
+
+#[test]
+fn a_malformed_line_rejects_the_whole_file_not_just_that_line() {
+    // The valid first line must NOT survive: a partial list from a corrupted file would look valid.
+    let err = parse_allowlist_text("45.10.30.0/24\nnot-a-cidr\n").unwrap_err();
+    assert_eq!(
+        err,
+        AllowlistFileError::InvalidCidr {
+            line: 2,
+            value: "not-a-cidr".into()
+        }
+    );
+}
+
+#[test]
+fn a_bare_address_without_a_prefix_is_rejected() {
+    assert!(matches!(
+        parse_allowlist_text("45.10.30.9\n"),
+        Err(AllowlistFileError::InvalidCidr { line: 1, .. })
+    ));
+}
+
+#[test]
+fn an_all_address_space_entry_is_an_error_not_a_wide_exclusion() {
+    // The failure to rule out: a list that turns into "exclude everything".
+    for wide in ["0.0.0.0/0", "::/0", "0.0.0.0/7", "2000::/15"] {
+        assert!(
+            matches!(
+                parse_allowlist_text(&format!("45.10.30.0/24\n{wide}\n")),
+                Err(AllowlistFileError::TooWide { line: 2, .. })
+            ),
+            "{wide} must be refused"
+        );
+    }
+    // The boundary itself is accepted.
+    assert_eq!(
+        parse_allowlist_text("10.0.0.0/8\n2000::/16\n")
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn the_entry_count_is_bounded() {
+    let at_limit: String = (0..ALLOWLIST_FILE_MAX_ENTRIES)
+        .map(|i| {
+            format!(
+                "{}.{}.{}.{}/32\n",
+                45,
+                (i >> 16) & 255,
+                (i >> 8) & 255,
+                i & 255
+            )
+        })
+        .collect();
+    assert_eq!(
+        parse_allowlist_text(&at_limit).unwrap().len(),
+        ALLOWLIST_FILE_MAX_ENTRIES
+    );
+    let over = format!("{at_limit}46.0.0.0/32\n");
+    assert_eq!(
+        parse_allowlist_text(&over).unwrap_err(),
+        AllowlistFileError::TooManyEntries
+    );
+}
+
+#[test]
+fn an_empty_or_comment_only_file_excludes_nothing() {
+    assert!(parse_allowlist_text("").unwrap().is_empty());
+    assert!(
+        parse_allowlist_text("# nothing yet\n\n")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn loading_a_file_fails_closed_on_unreadable_oversized_and_non_text_input() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let good = dir.path().join("good.txt");
+    std::fs::write(&good, "45.10.30.0/24\n").unwrap();
+    assert_eq!(feed::load_allowlist_file(&good).unwrap().len(), 1);
+
+    assert!(matches!(
+        feed::load_allowlist_file(&dir.path().join("absent.txt")),
+        Err(AllowlistFileError::Unreadable { .. })
+    ));
+
+    let big = dir.path().join("big.txt");
+    std::fs::write(&big, vec![b'#'; ALLOWLIST_FILE_MAX_BYTES + 1]).unwrap();
+    assert_eq!(
+        feed::load_allowlist_file(&big).unwrap_err(),
+        AllowlistFileError::TooLarge
+    );
+
+    let binary = dir.path().join("binary.bin");
+    std::fs::write(&binary, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+    assert_eq!(
+        feed::load_allowlist_file(&binary).unwrap_err(),
+        AllowlistFileError::NotText
+    );
+
+    let bad = dir.path().join("bad.txt");
+    std::fs::write(&bad, "45.10.30.0/24\n<html>\n").unwrap();
+    assert!(matches!(
+        feed::load_allowlist_file(&bad),
+        Err(AllowlistFileError::InvalidCidr { line: 2, .. })
+    ));
+}

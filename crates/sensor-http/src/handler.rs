@@ -139,6 +139,11 @@ pub async fn handle_connection<S>(
             "path": path,
         });
         if !user_agent.is_empty() {
+            // Display annotation only: the header is attacker-controlled, so this label never
+            // feeds scoring or exclusion (see `crawler`).
+            if let Some(label) = crate::crawler::claimed_crawler(&user_agent) {
+                metadata["claimed_crawler"] = serde_json::Value::String(label.to_string());
+            }
             metadata["user_agent"] = serde_json::Value::String(user_agent);
         }
         if !host.is_empty() {

@@ -24,6 +24,7 @@ const ENV_BUILD_INTERVAL_SECS: &str = "PROPOLIS_FEED_BUILD_INTERVAL_SECS";
 const ENV_AGGRESSIVE_TTL_HOURS: &str = "PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS";
 const ENV_STANDARD_TTL_HOURS: &str = "PROPOLIS_FEED_STANDARD_TTL_HOURS";
 const ENV_ALLOWLIST: &str = "PROPOLIS_FEED_ALLOWLIST";
+const ENV_ALLOWLIST_FILE: &str = "PROPOLIS_FEED_ALLOWLIST_FILE";
 const ENV_DELIST: &str = "PROPOLIS_FEED_DELIST";
 const ENV_ASN_ALLOWLIST: &str = "PROPOLIS_FEED_ASN_ALLOWLIST";
 const ENV_GEOIP_DIR: &str = "PROPOLIS_GEOIP_DIR";
@@ -64,6 +65,9 @@ enum ConfigError {
     InvalidIp { field: &'static str, value: String },
     /// A `PROPOLIS_FEED_ASN_ALLOWLIST` entry was not a valid AS number.
     InvalidAsn { field: &'static str, value: String },
+    /// The `PROPOLIS_FEED_ALLOWLIST_FILE` file was unreadable or malformed. Startup refuses
+    /// rather than running with a partial or empty exemption list.
+    AllowlistFile(feed::AllowlistFileError),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -90,6 +94,7 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "{field} entry {value:?} is not a valid AS number (a bare integer, e.g. \"8075\")"
             ),
+            ConfigError::AllowlistFile(e) => write!(f, "{ENV_ALLOWLIST_FILE}: {e}"),
         }
     }
 }
@@ -202,7 +207,13 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         DEFAULT_STANDARD_TTL_HOURS,
         ENV_STANDARD_TTL_HOURS,
     )?;
-    let allowlist = parse_cidr_list(&env::var(ENV_ALLOWLIST).unwrap_or_default(), ENV_ALLOWLIST)?;
+    let mut allowlist =
+        parse_cidr_list(&env::var(ENV_ALLOWLIST).unwrap_or_default(), ENV_ALLOWLIST)?;
+    if let Some(path) = env::var(ENV_ALLOWLIST_FILE).ok().filter(|s| !s.is_empty()) {
+        allowlist.extend(
+            feed::load_allowlist_file(Path::new(&path)).map_err(ConfigError::AllowlistFile)?,
+        );
+    }
     let delist = parse_ip_list(&env::var(ENV_DELIST).unwrap_or_default(), ENV_DELIST)?;
     let asn_allowlist = parse_asn_list(
         &env::var(ENV_ASN_ALLOWLIST).unwrap_or_default(),

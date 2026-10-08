@@ -86,7 +86,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 3626 test functions** (2301 unit + 1325 integration).
+- **Total: 3639 test functions** (2305 unit + 1334 integration).
 - **DB-backed (`sqlx::test`): 245** - console 179, core-scoring 35, review 10,
   intake 8, propolis 7, fleet 6. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -119,7 +119,7 @@ Per-crate breakdown:
 | collector-wire | 9 | 0 | - |
 | console | 147 | 203 | auth_test, campaigns_test, routes_test, samples_transport_test, server_test |
 | core-scoring | 73 | 30 | coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
-| feed | 36 | 58 | builder_test, exclusion_test, export_test, publisher_test |
+| feed | 36 | 66 | builder_test, exclusion_test, export_test, publisher_test |
 | fleet | 23 | 32 | deploy_inventory_test, probe_test, store_test |
 | gateway | 11 | 13 | handshake, spool, verify |
 | geoip | 4 | 0 | - |
@@ -134,7 +134,7 @@ Per-crate breakdown:
 | sensor-dns | 64 | 70 | arrival, env_strict, integration, tls |
 | sensor-framework | 1164 | 161 | arrival_coverage, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, listener_integration, shell_replay, spool_integration, tls_integration |
 | sensor-ftp | 14 | 50 | arrival, env_strict, integration, tls_config |
-| sensor-http | 15 | 40 | arrival, env_strict, integration, tls |
+| sensor-http | 19 | 41 | arrival, env_strict, integration, tls |
 | sensor-mqtt | 65 | 55 | arrival, env_strict, integration, tls |
 | sensor-redis | 89 | 39 | arrival, env_strict, integration, tls |
 | sensor-smtp | 12 | 41 | arrival, env_strict, integration, tls |
@@ -144,7 +144,7 @@ Per-crate breakdown:
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2301** | **1325** | |
+| **Total** | **2305** | **1334** | |
 
 ### Test styles by layer
 

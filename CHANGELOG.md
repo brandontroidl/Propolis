@@ -105,6 +105,22 @@
 
 ### Added
 
+- **Declared crawlers can be kept out of the published feed by address, and the HTTP sensor labels
+  a User-Agent that claims to be one** - research and AI crawlers (ClaudeBot, Claude-User,
+  Claude-SearchBot, Googlebot, CensysInspect and others) reach the HTTP sensor and were
+  published like any other source. `PROPOLIS_FEED_ALLOWLIST_FILE` names a local text file of CIDRs
+  (one per line, `#` comments), merged into the existing `PROPOLIS_FEED_ALLOWLIST`, so an operator
+  can add a crawler operator's published ranges with no code change. The file is read at startup,
+  bounded (1 MiB, 50,000 entries) and all-or-nothing: an unreadable file, a bad line, a bare
+  address, an entry wider than /8 (IPv4) or /16 (IPv6), or non-UTF-8 content refuses to start the
+  daemon, so a corrupted or truncated list can never exclude everything or silently exclude
+  nothing. Nothing is fetched from the network. Separately, an HTTP request whose User-Agent
+  contains a known crawler token gets `claimed_crawler` in its event metadata (a fixed label, not
+  the header text). The label is display only: a User-Agent is attacker-controlled, so it changes
+  no score, queue entry or feed decision, and a ClaudeBot User-Agent from an address that is not in
+  the file is scored and published like any other source
+  (`crates/feed/src/exclusion.rs#load_allowlist_file`, `crates/sensor-http/src/crawler.rs#claimed_crawler`).
+
 - **`deploy/config-check.sh` compares the configuration with what is running** - five faults on
   the production box were each found by accident: a typo in `PROPOLIS_SENSOR_LOGS`, MQTT's log
   absent from that list, sensor-cred's PostgreSQL listener never producing a log (with 5432 open in

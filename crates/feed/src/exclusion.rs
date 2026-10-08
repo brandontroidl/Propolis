@@ -9,9 +9,17 @@
 //! database. ASN ownership is RIR-registered and not per-IP spoofable, unlike a reverse-DNS PTR
 //! record - so this is a safe suppression signal, whereas PTR would be an evasion vector. It stays
 //! opt-in (empty by default) so an operator, not this code, decides what is suppressed.
+//!
+//! Operator range files: `PROPOLIS_FEED_ALLOWLIST_FILE` names a local text file of CIDRs (for
+//! example a declared crawler operator's published ranges) merged into the same allowlist. It is
+//! the only way an address is exempted on a crawler's say-so, and the exemption rests on the
+//! address being in a range the operator put in the file - never on a User-Agent, which any client
+//! can send. See [`load_allowlist_file`].
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 use ipnet::IpNet;
@@ -20,6 +28,94 @@ use ipnet::IpNet;
 /// apply the identical rule - it previously had no such guard at all. This is a delegation, not a
 /// second definition: one list, both outbound paths.
 use core_scoring::is_reserved_ip as is_reserved;
+
+/// Largest allowlist file read. A published crawler range list is a few KiB; anything near this
+/// bound is the wrong file (a download that returned a web page, a log), not a list.
+pub const ALLOWLIST_FILE_MAX_BYTES: usize = 1 << 20;
+/// Most entries one allowlist file may carry.
+pub const ALLOWLIST_FILE_MAX_ENTRIES: usize = 50_000;
+/// Widest accepted IPv4 entry (shortest prefix). A file entry is bulk data an operator pastes or a
+/// scheduled job writes, so a `0.0.0.0/0` (or any prefix that swallows a large share of the
+/// address space) is refused as an error rather than silently excluding every attacker.
+pub const ALLOWLIST_FILE_MIN_PREFIX_V4: u8 = 8;
+/// Widest accepted IPv6 entry; see [`ALLOWLIST_FILE_MIN_PREFIX_V4`].
+pub const ALLOWLIST_FILE_MIN_PREFIX_V6: u8 = 16;
+
+/// Why an allowlist file was rejected. Every variant means NO entry from the file is used: the
+/// caller refuses to start rather than running with a partial or guessed list.
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum AllowlistFileError {
+    #[error("cannot read {path}: {reason}")]
+    Unreadable { path: String, reason: String },
+    #[error("file is larger than {ALLOWLIST_FILE_MAX_BYTES} bytes")]
+    TooLarge,
+    #[error("file is not valid UTF-8 text")]
+    NotText,
+    #[error("more than {ALLOWLIST_FILE_MAX_ENTRIES} entries")]
+    TooManyEntries,
+    #[error(
+        "line {line}: {value:?} is not a valid CIDR (a bare address without a prefix length is rejected)"
+    )]
+    InvalidCidr { line: usize, value: String },
+    #[error(
+        "line {line}: {value:?} is wider than /{ALLOWLIST_FILE_MIN_PREFIX_V4} (IPv4) or /{ALLOWLIST_FILE_MIN_PREFIX_V6} (IPv6) and would exclude a large share of the address space"
+    )]
+    TooWide { line: usize, value: String },
+}
+
+/// Parse allowlist file text: one CIDR per line, blank lines ignored, `#` starts a comment (whole
+/// line or trailing). All-or-nothing: the first bad line fails the whole parse, so a truncated or
+/// corrupted file can never yield a partial list that looks valid. An empty list is valid and
+/// excludes nothing.
+pub fn parse_allowlist_text(text: &str) -> Result<Vec<IpNet>, AllowlistFileError> {
+    let mut nets = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = idx + 1;
+        let entry = raw.split('#').next().unwrap_or("").trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let net: IpNet = entry.parse().map_err(|_| AllowlistFileError::InvalidCidr {
+            line,
+            value: entry.to_string(),
+        })?;
+        let min = match net {
+            IpNet::V4(_) => ALLOWLIST_FILE_MIN_PREFIX_V4,
+            IpNet::V6(_) => ALLOWLIST_FILE_MIN_PREFIX_V6,
+        };
+        if net.prefix_len() < min {
+            return Err(AllowlistFileError::TooWide {
+                line,
+                value: entry.to_string(),
+            });
+        }
+        if nets.len() == ALLOWLIST_FILE_MAX_ENTRIES {
+            return Err(AllowlistFileError::TooManyEntries);
+        }
+        nets.push(net);
+    }
+    Ok(nets)
+}
+
+/// Read and parse an allowlist file (see [`parse_allowlist_text`]). The read is bounded, so a
+/// path pointed at a huge or endless file cannot exhaust memory. This is a local file read only:
+/// nothing here fetches from the network.
+pub fn load_allowlist_file(path: &Path) -> Result<Vec<IpNet>, AllowlistFileError> {
+    let unreadable = |e: std::io::Error| AllowlistFileError::Unreadable {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    };
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let mut bytes = Vec::new();
+    file.take(ALLOWLIST_FILE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() > ALLOWLIST_FILE_MAX_BYTES {
+        return Err(AllowlistFileError::TooLarge);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| AllowlistFileError::NotText)?;
+    parse_allowlist_text(&text)
+}
 
 /// Fail-closed address filter. `is_excluded` is a total, infallible function over
 /// already-validated in-memory data, so there is no "cannot evaluate" outcome at this layer - an

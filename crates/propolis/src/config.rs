@@ -191,6 +191,9 @@ pub enum ConfigError {
     /// operator knows which address this node's connects arrive from. Same shape as the fetcher's
     /// refusal to run with an empty `own_ips` set.
     ProbeEnabledWithoutSources,
+    /// `PROPOLIS_FEED_ALLOWLIST_FILE` was unreadable or malformed. Startup refuses rather than
+    /// running with a partial or empty exemption list.
+    AllowlistFile(feed::AllowlistFileError),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -205,6 +208,7 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "{field}: {reason}, got {value:?}")
             }
             ConfigError::FleetInventory(e) => write!(f, "PROPOLIS_FLEET_LISTENERS: {e}"),
+            ConfigError::AllowlistFile(e) => write!(f, "PROPOLIS_FEED_ALLOWLIST_FILE: {e}"),
             ConfigError::ProbeEnabledWithoutSources => write!(
                 f,
                 "PROPOLIS_FLEET_PROBE_ENABLED is true but PROPOLIS_FLEET_PROBE_SOURCE_IPS is \
@@ -565,7 +569,17 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         "PROPOLIS_FEED_STANDARD_TTL_HOURS",
         DEFAULT_STANDARD_TTL_HOURS,
     )?;
-    let feed_allowlist = parse_cidr_list(&env::var("PROPOLIS_FEED_ALLOWLIST").unwrap_or_default())?;
+    let mut feed_allowlist =
+        parse_cidr_list(&env::var("PROPOLIS_FEED_ALLOWLIST").unwrap_or_default())?;
+    if let Some(path) = env::var("PROPOLIS_FEED_ALLOWLIST_FILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        feed_allowlist.extend(
+            feed::load_allowlist_file(std::path::Path::new(&path))
+                .map_err(ConfigError::AllowlistFile)?,
+        );
+    }
     let feed_asn_allowlist =
         parse_asn_list(&env::var("PROPOLIS_FEED_ASN_ALLOWLIST").unwrap_or_default())?;
     let feed_delist = parse_ip_list(

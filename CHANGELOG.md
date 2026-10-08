@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Changed
+
+- **The review queue reads at a glance** - fifty-six pending rows had become a wall: a notes
+  textarea and three buttons on every row, "honeypot" in every Categories cell, a score bar that
+  hardly varied, and five hosts of one campaign as five full rows. Pending entries now group by
+  campaign: two or more listed members make one expandable row (campaign label, counts, what the
+  group did, the top score and a single "Approve all N", which still goes through the two-step
+  campaign confirmation), and addresses alone in their campaign or in none stay rows. An address
+  in several campaigns is listed under the one with the most pending members, then the most
+  hosts, then the lowest id. The notes field is a "note" toggle inside the row, so decisions post
+  exactly as before. The Categories column is gone from every tab (the data stays on the IP
+  page), the score is a number coloured by feed tier, First seen and Last seen became one Active
+  cell (`10:58-18:11 UTC`, or `2d, last 3 min ago`, exact times on hover) with sort links above
+  the table, and each context line leads with what the address did, dims sensor and session
+  counts, and moves "counts from N of M events" to a tooltip. At 390 px entries stack as cards
+  with no sideways scroll.
+
 ### Fixed
 
 - **The configuration check's `fix:` lines now run when pasted** - observed live 2026-10-08: the
@@ -120,6 +137,15 @@
   no score, queue entry or feed decision, and a ClaudeBot User-Agent from an address that is not in
   the file is scored and published like any other source
   (`crates/feed/src/exclusion.rs#load_allowlist_file`, `crates/sensor-http/src/crawler.rs#claimed_crawler`).
+
+- **Docs: `docs/operations/captured-content-handling.md`** - the operator procedure for a capture
+  that may be illegal material (above all CSAM): what the console and spool already do to limit
+  exposure (hash-named bodies, no rendering, download forced as an attachment), the rules (never
+  open or preview a capture, handle media and archives by hash, keep suspect files out of
+  VirusTotal upload and vendor paths), quarantining one sample by moving it out of the spool,
+  and the reporting process (US 18 U.S.C. 2258A and the CyberTipline, INHOPE hotlines elsewhere),
+  framed as process and not legal advice. It also lists what works against the procedure today
+  (automatic VirusTotal upload when opted in, 30-day deletion with no hold, tmpfs spools).
 
 - **`deploy/config-check.sh` compares the configuration with what is running** - five faults on
   the production box were each found by accident: a typo in `PROPOLIS_SENSOR_LOGS`, MQTT's log

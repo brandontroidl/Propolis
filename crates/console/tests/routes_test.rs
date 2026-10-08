@@ -7679,7 +7679,9 @@ async fn queue_rows_say_where_the_address_came_from_and_what_it_did(pool: PgPool
         "{a}"
     );
     assert!(
-        a.contains(r#"first command</span> <code class="mono">cat &#x2f;proc&#x2f;mounts</code>"#),
+        a.contains(
+            r#"ran</span> <code class="mono ctx-code" title="cat &#x2f;proc&#x2f;mounts">cat &#x2f;proc&#x2f;mounts</code>"#
+        ),
         "{a}"
     );
     assert!(!a.contains("counts from"), "{a}");
@@ -7690,7 +7692,9 @@ async fn queue_rows_say_where_the_address_came_from_and_what_it_did(pool: PgPool
         "{b}"
     );
     assert!(
-        b.contains(r#"uploaded</span> <code class="mono">.i (abababababab..., 5.0 KB)</code>"#),
+        b.contains(
+            r#"uploaded</span> <code class="mono ctx-code" title=".i (abababababab..., 5.0 KB)">.i (abababababab..., 5.0 KB)</code>"#
+        ),
         "{b}"
     );
 }

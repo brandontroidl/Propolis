@@ -111,15 +111,35 @@ struct Neighbor {
     dev: &'static str,
 }
 
-/// A TCP socket in state LISTEN bound to the wildcard address. Its owner is a process of the
-/// modeled table, found by its kernel name when the line is rendered.
+/// A listening TCP socket or a bound UDP one. Its owner is a process of the modeled table, found
+/// by its kernel name when the line is rendered.
 struct Listener {
     v6: bool,
+    /// A UDP socket (`UNCONN` to `ss`) rather than a TCP one in LISTEN.
+    udp: bool,
+    /// The address it is bound to and the interface it is scoped to (`127.0.0.53%lo`), or `None`
+    /// for the wildcard.
+    bind: Option<(V4, &'static str)>,
     port: u16,
     comm: &'static str,
     inode: u32,
     fd: u32,
     backlog: u32,
+}
+
+impl Listener {
+    const fn wildcard(v6: bool, port: u16, comm: &'static str, inode: u32, fd: u32) -> Self {
+        Self {
+            v6,
+            udp: false,
+            bind: None,
+            port,
+            comm,
+            inode,
+            fd,
+            backlog: 128,
+        }
+    }
 }
 
 struct Net {
@@ -159,23 +179,22 @@ impl Net {
     fn ubuntu(telnet: bool) -> Self {
         let comm = if telnet { "telnetd" } else { "sshd" };
         let port = if telnet { 23 } else { 22 };
-        let mut listeners = vec![Listener {
-            v6: false,
-            port,
-            comm,
-            inode: 18_412,
-            fd: 3,
-            backlog: 128,
-        }];
+        // systemd-resolved's stub listener, on UDP and TCP, as on every 22.04 box that runs it
+        // (recorded on the reference: `udp UNCONN 0 0 127.0.0.53%lo:53` and the TCP twin with a
+        // backlog of 4096); it is listed first, as the kernel's tables give it.
+        let stub = |udp: bool, inode: u32, fd: u32| Listener {
+            udp,
+            bind: Some(([127, 0, 0, 53], "lo")),
+            backlog: if udp { 0 } else { 4_096 },
+            ..Listener::wildcard(false, 53, "systemd-resolve", inode, fd)
+        };
+        let mut listeners = vec![
+            stub(true, 17_806, 13),
+            stub(false, 17_807, 14),
+            Listener::wildcard(false, port, comm, 18_412, 3),
+        ];
         if !telnet {
-            listeners.push(Listener {
-                v6: true,
-                port,
-                comm,
-                inode: 18_414,
-                fd: 4,
-                backlog: 128,
-            });
+            listeners.push(Listener::wildcard(true, port, comm, 18_414, 4));
         }
         Self {
             modern: true,
@@ -288,12 +307,8 @@ impl Net {
                 dev: "wlan0",
             }],
             listeners: vec![Listener {
-                v6: true,
-                port: 5555,
-                comm: "adbd",
-                inode: 4_821,
-                fd: 6,
                 backlog: 4,
+                ..Listener::wildcard(true, 5555, "adbd", 4_821, 6)
             }],
         }
     }
@@ -403,6 +418,27 @@ impl FakeShell {
             .find(|route| route.prefix == 0)
             .and_then(|route| route.gateway)
             .unwrap_or([127, 0, 0, 1])
+    }
+
+    /// The addresses of every interface but loopback, as `hostname -I` lists them, from the one
+    /// network model `ip addr` renders.
+    pub(super) fn interface_addresses(&self) -> Vec<String> {
+        self.net_model()
+            .ifaces
+            .iter()
+            .filter(|iface| !iface.loopback)
+            .map(|iface| v4_text(iface.addr))
+            .collect()
+    }
+
+    /// The first non-loopback interface's name, MAC and address, as `ip link` shows them: what
+    /// `lshw -C network` describes, so the two cannot disagree.
+    pub(super) fn primary_interface(&self) -> Option<(&'static str, String, String)> {
+        self.net_model()
+            .ifaces
+            .iter()
+            .find(|iface| !iface.loopback)
+            .map(|iface| (iface.name, mac_text(iface.mac), v4_text(iface.addr)))
     }
 
     /// The pid and name a listener shows: the modeled process of that name, or none if the table
@@ -931,6 +967,7 @@ fn service_name(port: u16) -> Option<&'static str> {
     match port {
         22 => Some("ssh"),
         23 => Some("telnet"),
+        53 => Some("domain"),
         _ => None,
     }
 }
@@ -972,112 +1009,146 @@ fn parse_ss(args: &[&str]) -> Option<SsPlan> {
 }
 
 struct SsRow {
+    netid: &'static str,
     state: &'static str,
     recv_q: String,
     send_q: String,
-    local: String,
-    peer: String,
+    local_addr: String,
+    local_port: String,
+    peer_addr: String,
+    peer_port: String,
+    /// ` users:((...))` with its leading space, or empty.
     process: String,
 }
 
 impl FakeShell {
-    /// `ss [-tulanpH46]` over the modeled listeners; no socket other than a listener exists, so
-    /// without `-l` or `-a` it lists none.
+    /// `ss [-tulanpH46]` over the modeled sockets; no socket other than a listening or bound one
+    /// exists, so without `-l` or `-a` it lists none. UDP sockets come before TCP ones, as the
+    /// kernel's tables give them.
     pub(super) fn cmd_ss(&mut self, parts: &[&str]) -> CommandResult {
         let Some(plan) = parse_ss(parts.get(1..).unwrap_or(&[])) else {
             return nothing();
         };
         let net = self.net_model();
-        let wants_tcp = plan.tcp || !plan.udp;
+        let neither = !plan.tcp && !plan.udp;
+        let (tcp, udp) = (plan.tcp || neither, plan.udp || neither);
         let mut rows = Vec::new();
-        if wants_tcp && (plan.all || plan.listening) {
-            for listener in net
+        if plan.all || plan.listening {
+            let mut sockets: Vec<&Listener> = net
                 .listeners
                 .iter()
                 .filter(|l| plan.family.is_none_or(|v6| v6 == l.v6))
-            {
+                .filter(|l| if l.udp { udp } else { tcp })
+                .collect();
+            sockets.sort_by_key(|l| !l.udp);
+            for listener in sockets {
                 let port = match service_name(listener.port) {
                     Some(name) if !plan.numeric => name.to_string(),
                     _ => listener.port.to_string(),
                 };
-                let (local, peer) = if listener.v6 {
-                    (format!("[::]:{port}"), "[::]:*".to_string())
-                } else {
-                    (format!("0.0.0.0:{port}"), "0.0.0.0:*".to_string())
+                let (local_addr, peer_addr) = match (listener.bind, listener.v6) {
+                    (Some((addr, dev)), _) => (format!("{}%{dev}", v4_text(addr)), "0.0.0.0"),
+                    (None, true) => ("[::]".to_string(), "[::]"),
+                    (None, false) => ("0.0.0.0".to_string(), "0.0.0.0"),
                 };
                 let process = match self.listener_owner(listener) {
                     Some((pid, name)) if plan.program => {
-                        format!("users:((\"{name}\",pid={pid},fd={}))", listener.fd)
+                        format!(" users:((\"{name}\",pid={pid},fd={}))", listener.fd)
                     }
                     _ => String::new(),
                 };
                 rows.push(SsRow {
-                    state: "LISTEN",
+                    netid: if listener.udp { "udp" } else { "tcp" },
+                    state: if listener.udp { "UNCONN" } else { "LISTEN" },
                     recv_q: "0".to_string(),
                     send_q: listener.backlog.to_string(),
-                    local,
-                    peer,
+                    local_addr,
+                    local_port: port,
+                    peer_addr: peer_addr.to_string(),
+                    peer_port: "*".to_string(),
                     process,
                 });
             }
         }
-        CommandResult::stdout(render_ss(&rows, plan.program, !plan.no_header))
+        let netid = tcp && udp;
+        CommandResult::stdout(render_ss(&rows, netid, !plan.no_header))
     }
 }
 
-fn render_ss(rows: &[SsRow], program: bool, header: bool) -> String {
+/// iproute2 5.15's column layout, recorded on Ubuntu 22.04 (2026-10-07, `ss -tuln | cat -A` and
+/// friends): every column as wide as its widest cell or its title, one space between columns, an
+/// address right-aligned and its port left-aligned around the `:`, and the `Process` column glued
+/// to the peer's port, its cells padded out to its width (so a row ends in spaces) and a `users:`
+/// cell carrying its own leading space. `Netid` is shown when both TCP and UDP are listed.
+fn render_ss(rows: &[SsRow], netid: bool, header: bool) -> String {
     let width =
         |title: &str, cells: Vec<usize>| cells.into_iter().chain([title.len()]).max().unwrap_or(0);
     let w_state = width("State", rows.iter().map(|r| r.state.len()).collect());
     let w_recv = width("Recv-Q", rows.iter().map(|r| r.recv_q.len()).collect());
     let w_send = width("Send-Q", rows.iter().map(|r| r.send_q.len()).collect());
-    let w_local = width(
-        "Local Address:Port",
-        rows.iter().map(|r| r.local.len()).collect(),
+    let w_laddr = width(
+        "Local Address",
+        rows.iter().map(|r| r.local_addr.len()).collect(),
     );
-    let w_peer = width(
-        "Peer Address:Port",
-        rows.iter().map(|r| r.peer.len()).collect(),
+    let w_lport = width("Port", rows.iter().map(|r| r.local_port.len()).collect());
+    let w_paddr = width(
+        "Peer Address",
+        rows.iter().map(|r| r.peer_addr.len()).collect(),
     );
-    let line = |netid: &str,
-                state: &str,
-                recv: &str,
-                send: &str,
-                local: &str,
-                peer: &str,
-                process: &str| {
-        let mut text = format!(
-            "{netid:<5} {state:<w_state$} {recv:<w_recv$} {send:<w_send$} {local:>w_local$}  {peer:>w_peer$}"
-        );
-        if program {
-            text.push(' ');
-            text.push_str(process);
+    let w_pport = width("Port", rows.iter().map(|r| r.peer_port.len()).collect());
+    let w_proc = width("Process", rows.iter().map(|r| r.process.len()).collect());
+    let line = |cells: [&str; 10]| {
+        let [
+            id,
+            state,
+            recv,
+            send,
+            laddr,
+            lport,
+            paddr,
+            pport,
+            process,
+            _,
+        ] = cells;
+        let mut text = String::new();
+        if netid {
+            text.push_str(&format!("{id:<5} "));
         }
-        text.push('\n');
+        text.push_str(&format!(
+            "{state:<w_state$} {recv:<w_recv$} {send:<w_send$} {laddr:>w_laddr$}:{lport:<w_lport$} {paddr:>w_paddr$}:{pport:<w_pport$}{process:<w_proc$}\n"
+        ));
         text
     };
     let mut out = String::new();
     if header {
-        out.push_str(&line(
+        // The titles sit in the address columns: `Local Address` right-aligned to its width, the
+        // `Port` titles left-aligned, as the cells are.
+        out.push_str(&line([
             "Netid",
             "State",
             "Recv-Q",
             "Send-Q",
-            "Local Address:Port",
-            "Peer Address:Port",
+            "Local Address",
+            "Port",
+            "Peer Address",
+            "Port",
             "Process",
-        ));
+            "",
+        ]));
     }
     for row in rows {
-        out.push_str(&line(
-            "tcp",
+        out.push_str(&line([
+            row.netid,
             row.state,
             &row.recv_q,
             &row.send_q,
-            &row.local,
-            &row.peer,
+            &row.local_addr,
+            &row.local_port,
+            &row.peer_addr,
+            &row.peer_port,
             &row.process,
-        ));
+            "",
+        ]));
     }
     out
 }
@@ -1175,14 +1246,54 @@ fn proc_net_tcp(net: &Net, v6: bool) -> String {
         (TCP_HEAD, "0".repeat(8))
     };
     let mut out = padded(head, TCP_PAD);
-    for (slot, listener) in net.listeners.iter().filter(|l| l.v6 == v6).enumerate() {
+    for (slot, listener) in net
+        .listeners
+        .iter()
+        .filter(|l| l.v6 == v6 && !l.udp)
+        .enumerate()
+    {
+        let local = listener
+            .bind
+            .map_or_else(|| any.clone(), |(addr, _)| hex_v4(addr));
         let line = format!(
-            "{slot:>4}: {any}:{:04X} {any}:0000 0A 00000000:00000000 00:00000000 00000000 {:>5} {:>8} {} 1 0000000000000000 100 0 0 10 0",
-            listener.port, 0, 0, listener.inode,
+            "{slot:>4}: {local}:{:04X} {any}:0000 0A 00000000:00000000 00:00000000 00000000 {:>5} {:>8} {} 1 0000000000000000 100 0 0 10 0",
+            listener.port,
+            owner_uid(listener),
+            0,
+            listener.inode,
         );
         out.push_str(&padded(&line, TCP_PAD));
     }
     out
+}
+
+/// `/proc/net/udp`: the bound UDP sockets, in the kernel's layout [unverified slot numbers].
+fn proc_net_udp(net: &Net) -> String {
+    let mut out = padded(UDP_HEAD, UDP_PAD);
+    for listener in net.listeners.iter().filter(|l| !l.v6 && l.udp) {
+        let local = listener
+            .bind
+            .map_or_else(|| "00000000".to_string(), |(addr, _)| hex_v4(addr));
+        let slot = u32::from(listener.port) % 1_024;
+        let line = format!(
+            "{slot:>5}: {local}:{:04X} 00000000:0000 07 00000000:00000000 00:00000000 00000000 {:>5} {:>8} {} 2 0000000000000000 0",
+            listener.port,
+            owner_uid(listener),
+            0,
+            listener.inode,
+        );
+        out.push_str(&padded(&line, UDP_PAD));
+    }
+    out
+}
+
+/// The uid of the account a socket's owner runs as: resolved's own, root for the rest.
+fn owner_uid(listener: &Listener) -> u32 {
+    if listener.comm == "systemd-resolve" {
+        102
+    } else {
+        0
+    }
 }
 
 impl FakeShell {
@@ -1196,7 +1307,7 @@ impl FakeShell {
             ("route", proc_net_route(&net)),
             ("tcp", proc_net_tcp(&net, false)),
             ("tcp6", proc_net_tcp(&net, true)),
-            ("udp", padded(UDP_HEAD, UDP_PAD)),
+            ("udp", proc_net_udp(&net)),
             ("udp6", padded(UDP6_HEAD, UDP_PAD)),
         ];
         let mut dir = Node::directory(files.iter().map(|(name, _)| (*name).to_string()).collect());

@@ -412,7 +412,7 @@ fn df_root_row_has_coherent_columns() {
         ]
     );
     let root = table.iter().find(|r| r.last().unwrap() == "/").unwrap();
-    assert_eq!(root[0], "/dev/sda1");
+    assert_eq!(root[0], "/dev/root");
     let (size, used, avail): (u64, u64, u64) = (
         root[1].parse().unwrap(),
         root[2].parse().unwrap(),
@@ -431,12 +431,12 @@ fn df_exact_layout_for_root_in_each_scale() {
     assert_eq!(
         out(&mut sh, "df /"),
         "Filesystem     1K-blocks    Used Available Use% Mounted on\n\
-         /dev/sda1       20134592 4908044  14219818  26% /\n"
+         /dev/root       20134592 4908044  14219818  26% /\n"
     );
     assert_eq!(
         out(&mut sh, "df -h /"),
         "Filesystem      Size  Used Avail Use% Mounted on\n\
-         /dev/sda1        20G  4.7G   14G  26% /\n"
+         /dev/root        20G  4.7G   14G  26% /\n"
     );
     assert_eq!(
         out(&mut sh, "df --human-readable /"),
@@ -445,24 +445,24 @@ fn df_exact_layout_for_root_in_each_scale() {
     assert_eq!(
         out(&mut sh, "df -m /"),
         "Filesystem     1M-blocks  Used Available Use% Mounted on\n\
-         /dev/sda1          19663  4794     13887  26% /\n"
+         /dev/root          19663  4794     13887  26% /\n"
     );
     assert_eq!(out(&mut sh, "df -k /"), out(&mut sh, "df /"));
     // `-H` counts in powers of 1000, so the same blocks read larger.
     assert_eq!(
         out(&mut sh, "df -H /"),
         "Filesystem      Size  Used Avail Use% Mounted on\n\
-         /dev/sda1        21G  5.1G   15G  26% /\n"
+         /dev/root        21G  5.1G   15G  26% /\n"
     );
     assert_eq!(
         out(&mut sh, "df -T /"),
         "Filesystem     Type 1K-blocks    Used Available Use% Mounted on\n\
-         /dev/sda1      ext4  20134592 4908044  14219818  26% /\n"
+         /dev/root      ext4  20134592 4908044  14219818  26% /\n"
     );
     assert_eq!(
         out(&mut sh, "df -P /"),
         "Filesystem     1024-blocks    Used Available Capacity Mounted on\n\
-         /dev/sda1         20134592 4908044  14219818      26% /\n"
+         /dev/root         20134592 4908044  14219818      26% /\n"
     );
 }
 
@@ -507,7 +507,7 @@ fn df_path_shows_the_mount_that_holds_it() {
     };
     assert_eq!(mount_of(&mut sh, "/").last().unwrap(), "/");
     for path in ["/tmp", "/etc/passwd", "/home", "/usr/bin/ls", "/bin/ls"] {
-        assert_eq!(mount_of(&mut sh, path)[0], "/dev/sda1", "{path}");
+        assert_eq!(mount_of(&mut sh, path)[0], "/dev/root", "{path}");
     }
     assert_eq!(mount_of(&mut sh, "/run/lock")[0], "tmpfs");
     assert_eq!(mount_of(&mut sh, "/run/lock").last().unwrap(), "/run/lock");
@@ -523,7 +523,10 @@ fn df_path_shows_the_mount_that_holds_it() {
         ["proc", "0", "0", "0", "-", "/proc"]
     );
     // A device operand names the filesystem on it.
-    assert_eq!(mount_of(&mut sh, "/dev/sda15").last().unwrap(), "/boot/efi");
+    assert_eq!(
+        mount_of(&mut sh, "/dev/xvda15").last().unwrap(),
+        "/boot/efi"
+    );
 }
 
 #[test]
@@ -881,8 +884,11 @@ fn du_of_a_modeled_directory_is_a_bounded_number() {
     let (size, name) = text.trim_end().split_once('\t').unwrap();
     assert_eq!(name, "/etc");
     let kib: u64 = size.parse().unwrap();
-    // Six small files at a block each and a link, under the directory's own block.
-    assert_eq!(kib, 28);
+    // Seven small files at a block each (group, gshadow, hostname, hosts, passwd, resolv.conf,
+    // shadow), the links at none, the alternatives directory at a block, `default` and `netplan`
+    // at a block each plus their one file's, `systemd` with `system`, `user` and the four
+    // `.wants` directories of links at a block each, under the directory's own block.
+    assert_eq!(kib, 7 * 4 + 4 + 2 * 8 + 7 * 4 + 4);
     assert_eq!(out(&mut sh, "du -s /etc"), text, "repeatable");
     // The sum is of what `ls` shows: the directory's block plus each listed name measured alone.
     let listed = out(&mut sh, "ls /etc");

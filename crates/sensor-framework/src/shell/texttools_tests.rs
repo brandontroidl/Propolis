@@ -200,15 +200,7 @@ fn wc_sizes_the_modeled_binaries_by_their_recorded_length() {
 
 #[test]
 fn wc_counts_the_ls_image_the_way_an_independent_scan_does() {
-    let ls = binaries::find("ls").unwrap();
-    let mut image = ls.header().to_vec();
-    for offset in 64..ls.size {
-        image.push(if offset == 409 {
-            0x0a
-        } else {
-            0x80 | u8::try_from(offset & 0x3f).unwrap()
-        });
-    }
+    let image = binaries::find("ls").unwrap().blob().read_range(0, u64::MAX);
     let is_space = |b: &u8| *b == b' ' || (0x09..=0x0d).contains(b);
     let lines = image.iter().filter(|b| **b == b'\n').count();
     let words = image
@@ -368,7 +360,6 @@ fn od_formats_and_options_it_does_not_model_print_nothing() {
     let mut sh = shell();
     put(&mut sh, "/tmp/n", b"abc\n");
     for line in [
-        "od -c /tmp/n",
         "od -An -td1 /tmp/n",
         "od -An -tx2 /tmp/n",
         "od -An -tx1z /tmp/n",
@@ -517,7 +508,7 @@ fn grep_f_with_several_files_names_each_and_reports_errors_with_status_2() {
 }
 
 #[test]
-fn grep_without_a_pattern_is_a_usage_error_and_a_regex_search_is_not_modeled() {
+fn grep_without_a_pattern_is_a_usage_error_and_a_regex_search_matches() {
     let mut sh = shell();
     for line in ["grep", "grep -F"] {
         assert_eq!(
@@ -532,16 +523,19 @@ fn grep_without_a_pattern_is_a_usage_error_and_a_regex_search_is_not_modeled() {
         );
     }
     put(&mut sh, "/tmp/g", b"root\nuser\n");
-    // No regular expression engine: these print nothing and succeed instead of guessing.
-    for line in [
-        "grep root /tmp/g",
-        "grep -E 'root|user' /tmp/g",
-        "grep -c root /tmp/g",
-        "grep -Fn root /tmp/g",
-        "grep -Fe root /tmp/g",
-        "grep -q root /tmp/g",
+    for (line, expected) in [
+        ("grep root /tmp/g", "root\n"),
+        ("grep -E 'root|user' /tmp/g", "root\nuser\n"),
+        ("grep -c root /tmp/g", "1\n"),
+        ("grep -Fn root /tmp/g", "1:root\n"),
+        ("grep -Fe root /tmp/g", "root\n"),
+        ("grep -q root /tmp/g", ""),
     ] {
-        assert_eq!(answer(&mut sh, line), ("".into(), "".into(), 0), "{line}");
+        assert_eq!(
+            answer(&mut sh, line),
+            (expected.into(), "".into(), 0),
+            "{line}"
+        );
     }
 }
 

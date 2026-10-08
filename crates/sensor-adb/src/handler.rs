@@ -1146,6 +1146,7 @@ async fn run_typed_line(
             if after_cr {
                 input.follow_cr();
             }
+            input.per_line();
             held.input = Some(input);
             None
         }
@@ -1191,10 +1192,27 @@ async fn handle_wrte(
                     let fed = input.feed(&data[at..]);
                     at += fed.taken;
                     responses.extend_from_slice(&fed.echo);
+                    // The command may have read what it wanted from this line (`read x`).
+                    let resumed = if fed.ended.is_none() && fed.line {
+                        input
+                            .resume(shell)
+                            .map(|output| (output, input.ended_on_cr()))
+                    } else {
+                        None
+                    };
                     if let Some(end) = fed.ended
                         && let Some(input) = held.input.take()
                     {
                         let output = input.finish(shell, end);
+                        responses.extend_from_slice(&onlcr(output.bytes()));
+                        close_shell = output.close_session;
+                        if !close_shell {
+                            responses.extend_from_slice(&shell_prompt(shell));
+                        }
+                    } else if let Some((output, after_cr)) = resumed {
+                        // Done; the rest of the packet is the shell's.
+                        *prev_cr = after_cr;
+                        held.input = None;
                         responses.extend_from_slice(&onlcr(output.bytes()));
                         close_shell = output.close_session;
                         if !close_shell {

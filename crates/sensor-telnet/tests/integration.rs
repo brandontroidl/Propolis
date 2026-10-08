@@ -1175,3 +1175,32 @@ async fn cat_at_the_telnet_shell_takes_typed_lines_until_ctrl_d_and_captures_the
         b"#!/bin/sh\necho telnet-dropper\n"
     );
 }
+
+/// A `read` at the telnet shell answers when Enter hands it its line, as a terminal's does, and
+/// what was typed after that Enter, in the same write, is the next command.
+#[tokio::test]
+async fn a_read_at_the_telnet_shell_answers_on_its_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = sensor_telnet::start_test_server(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        dir.path().join("spool"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+    )
+    .await
+    .unwrap();
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    login(&mut conn, b"root", b"password").await;
+    conn.write_all(b"read x; echo got=$x\r\0hello\r\0echo after\r\0")
+        .await
+        .unwrap();
+    let reply = read_until_contains(&mut conn, b"after\r\nroot@server01:~# ").await;
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(reply.contains("hello\r\ngot=hello\r\n"), "{reply:?}");
+    conn.write_all(b"exit\r\n").await.unwrap();
+    drop(conn);
+    handle.abort();
+}

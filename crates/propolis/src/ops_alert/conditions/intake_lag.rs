@@ -406,6 +406,7 @@ mod tests {
             feed_marker_path: "/nonexistent".into(),
             feed_push_marker_path: "/nonexistent".into(),
             feed_build_interval: Duration::from_secs(300),
+            rotation: crate::ops_alert::condition::RotationCtx::production(Vec::new()),
             cfg: parse_ops_alert(&|_: &str| None).unwrap(),
         }
     }

@@ -211,6 +211,33 @@ fn they_are_absent_on_the_phone() {
     }
 }
 
+/// A probe that fingerprints a binary by its digest sees one answer in every session: the image
+/// is a pure function of its table row, so a fresh shell (a new connection) hashes it the same,
+/// and that is the digest the image had when it was checked (`binaries.rs#GOLDEN_SHA256` for
+/// busybox; the MD5 of `ls` recorded with it).
+#[test]
+fn a_modeled_binary_hashes_the_same_in_every_session() {
+    let ls_md5 = "0ac03ada31e060acf1fcba3006bec368  /bin/ls\n";
+    let busybox_sha256 =
+        "07a69aaffb5f3e576a2160f81b78286a648007a0a6f0b521f79db2fa7c71ab75  /bin/busybox\n";
+    for _ in 0..2 {
+        let mut sh = shell();
+        assert_eq!(
+            answer(&mut sh, "md5sum /bin/ls"),
+            (ls_md5.into(), "".into(), 0)
+        );
+        assert_eq!(
+            answer(&mut sh, "sha256sum /bin/busybox"),
+            (busybox_sha256.into(), "".into(), 0)
+        );
+        // `true` and `false` share a header and a size, not a digest.
+        assert_ne!(
+            answer(&mut sh, "md5sum < /bin/true").0,
+            answer(&mut sh, "md5sum < /bin/false").0
+        );
+    }
+}
+
 #[test]
 fn a_shell_metacharacter_in_the_data_is_only_bytes() {
     let mut sh = shell();

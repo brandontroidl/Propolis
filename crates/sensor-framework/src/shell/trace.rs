@@ -104,6 +104,10 @@ pub enum HandlerId {
     Wc,
     Grep,
     Od,
+    /// `cut`, `tee` and `awk`: the field, copy and scripting tools a survey pipes through.
+    Cut,
+    Tee,
+    Awk,
     /// `xxd` and `strings`: the hex dumper and the printable-run extractor over modeled bytes.
     Xxd,
     Strings,
@@ -191,11 +195,27 @@ pub enum HandlerId {
     Dig,
     /// `nc`: intent capture. Never connects, listens or runs the `-e` command.
     Nc,
+    /// The `ssh` client: version, usage and a connect that never leaves the box.
+    Ssh,
+    /// `systemctl` and `crontab`: the modeled units and the session's crontab file.
+    Systemctl,
+    Crontab,
+    /// `who` and `w`: the session's own login, from the process table.
+    Who,
+    W,
+    /// `dpkg`, `apt` and `apt-get`: the one modeled package database.
+    Dpkg,
+    Apt,
+    /// `lspci` and `lshw`: the modeled Xen guest's devices.
+    Lspci,
+    Lshw,
     Sleep,
     Cd,
     Su,
     Exit,
     Logout,
+    /// bash's `history`: the interactive login shell's typed lines.
+    History,
     Read,
     Export,
     Unset,

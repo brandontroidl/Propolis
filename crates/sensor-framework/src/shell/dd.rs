@@ -19,9 +19,15 @@
 
 use super::registry::Registry;
 use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
-use crate::fakefs::FsError;
+use crate::fakefs::{Blob, FsError};
 
 const DD_TRY: &str = "Try 'dd --help' for more information.\n";
+
+/// The most `if=/dev/zero of=FILE` writes in one run. The zeros are stored as a fill, in O(1), so
+/// the survey's `dd if=/dev/zero of=/tmp/test bs=1M count=10` disk-speed probe gets the 10 MB a
+/// server with gigabytes free writes, where copying real bytes ran into the per-line allowance and
+/// answered `File too large`.
+const ZERO_FILL_MAX: u64 = 1 << 30;
 
 /// The default block size of both `ibs` and `obs`.
 const DEFAULT_BLOCK: u64 = 512;
@@ -161,6 +167,9 @@ impl FakeShell {
             .map_or(cap, |count| count.saturating_mul(args.ibs))
             .min(cap);
         let start = args.skip.saturating_mul(args.ibs);
+        if let Some(result) = self.dd_zero_fill(&args, busybox) {
+            return result;
+        }
 
         let read = match args.input {
             Some(path) => self.read_operand(parts, path, start, want),
@@ -183,6 +192,9 @@ impl FakeShell {
             }
         };
         let moved = len_u64(data.len());
+        // The copy takes the time the summary line reports, so `time dd` agrees with it.
+        let pid = self.state().pid;
+        self.timing.kernel(elapsed_ns(moved, pid));
 
         let mut acc = CommandResult::silent(0);
         let mut status = 0u8;
@@ -250,33 +262,42 @@ impl FakeShell {
             let end = content.len();
             content.extend(existing.iter().copied().skip(end));
         }
-        match self.traced_write_file(&path, &content) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let reason = match &error {
-                    FsError::ReadOnly => "Read-only file system",
-                    FsError::IsADirectory => "Is a directory",
-                    other => {
-                        super::budget_refusal_text(other).unwrap_or("No such file or directory")
-                    }
-                };
-                let opening = matches!(
-                    error,
-                    FsError::ReadOnly
-                        | FsError::IsADirectory
-                        | FsError::NoSuchDirectory(_)
-                        | FsError::NoSuchFile
-                        | FsError::NotADirectory
-                );
-                Err(if !opening {
-                    format!("dd: error writing '{arg}': {reason}\n")
-                } else if busybox {
-                    format!("dd: can't open '{arg}': {reason}\n")
-                } else {
-                    format!("dd: failed to open '{arg}': {reason}\n")
-                })
-            }
+        self.traced_write_file(&path, &content)
+            .map_err(|error| write_error_text(&error, arg, busybox))
+    }
+
+    /// `if=/dev/zero of=FILE count=N` with nothing to keep from the old file: the zeros are
+    /// written as one fill blob, which costs the connection no content allowance. `None` for any
+    /// other run, which copies real bytes.
+    fn dd_zero_fill(&mut self, args: &DdArgs<'_>, busybox: bool) -> Option<CommandResult> {
+        let (Some(input), Some(output), Some(count)) = (args.input, args.output, args.count) else {
+            return None;
+        };
+        if args.notrunc || args.seek > 0 {
+            return None;
         }
+        let logical = self.normalize_logical(input);
+        if self
+            .fs
+            .stat(&logical, true)
+            .is_none_or(|stat| stat.physical != "/dev/zero")
+        {
+            return None;
+        }
+        let moved = count.saturating_mul(args.ibs).min(ZERO_FILL_MAX);
+        let pid = self.state().pid;
+        self.timing.kernel(elapsed_ns(moved, pid));
+        let path = self.resolve_logical(output);
+        if let Err(error) = self.traced_write_blob(&path, Blob::fill(0, moved), 0o100_644) {
+            return Some(CommandResult::stderr(
+                1,
+                write_error_text(&error, output, busybox),
+            ));
+        }
+        Some(CommandResult::stderr(
+            0,
+            self.dd_report(args, moved, busybox),
+        ))
     }
 
     /// The record lines and, for GNU dd, the summary of a run that moved `moved` bytes.
@@ -296,6 +317,30 @@ impl FakeShell {
     }
 }
 
+/// What dd says when it cannot open or write `of=`.
+fn write_error_text(error: &FsError, arg: &str, busybox: bool) -> String {
+    let reason = match error {
+        FsError::ReadOnly => "Read-only file system",
+        FsError::IsADirectory => "Is a directory",
+        other => super::budget_refusal_text(other).unwrap_or("No such file or directory"),
+    };
+    let opening = matches!(
+        error,
+        FsError::ReadOnly
+            | FsError::IsADirectory
+            | FsError::NoSuchDirectory(_)
+            | FsError::NoSuchFile
+            | FsError::NotADirectory
+    );
+    if !opening {
+        format!("dd: error writing '{arg}': {reason}\n")
+    } else if busybox {
+        format!("dd: can't open '{arg}': {reason}\n")
+    } else {
+        format!("dd: failed to open '{arg}': {reason}\n")
+    }
+}
+
 fn unrecognized(operand: &str) -> String {
     format!("dd: unrecognized operand '{operand}'\n{DD_TRY}")
 }
@@ -310,10 +355,12 @@ fn records(moved: u64, block: u64) -> String {
 const SI_UNITS: [&str; 7] = ["B", "kB", "MB", "GB", "TB", "PB", "EB"];
 const IEC_UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
 
-/// `n` the way GNU dd's summary writes it: the largest unit that fits, one decimal below 100 and
-/// none above. [unverified] beyond what the captures show (`133 kB/s`, `10.8 kB/s`, `36.5 kB/s`);
-/// the parenthesized sizes of transfers of 1000 bytes or more are not captured at all.
-fn human(n: u64, base: u64, units: &[&str; 7]) -> String {
+/// `n` the way GNU dd's summary writes it: the largest unit that fits, then one decimal below
+/// `decimal_below` and none at or above it. gnulib's `human_readable` takes two paths: the rate is
+/// a floating value and keeps a decimal below 100 (captured: `133 kB/s`, `10.8 kB/s`,
+/// `36.5 kB/s`), and a byte count is an integer that keeps one below 10 only (recorded on Ubuntu
+/// 22.04, 2026-10-07: `10485760 bytes (10 MB, 10 MiB) copied`).
+fn human(n: u64, base: u64, units: &[&str; 7], decimal_below: u128) -> String {
     let n = u128::from(n);
     let base = u128::from(base);
     let mut power = 0usize;
@@ -338,7 +385,7 @@ fn human(n: u64, base: u64, units: &[&str; 7]) -> String {
         return format!("{n} {unit}");
     }
     let tenths = round(n.saturating_mul(10), scale);
-    if tenths < 1_000 {
+    if tenths < decimal_below.saturating_mul(10) {
         let whole = tenths.checked_div(10).unwrap_or(0);
         let frac = tenths.checked_rem(10).unwrap_or(0);
         format!("{whole}.{frac} {unit}")
@@ -386,8 +433,8 @@ fn gnu_summary(moved: u64, pid: u32) -> String {
 /// GNU dd's last line for `moved` bytes in `ns` nanoseconds, as captured:
 /// `52 bytes copied, 0.000404895 s, 128 kB/s`.
 pub(super) fn summary_line(moved: u64, ns: u64) -> String {
-    let si = human(moved, 1_000, &SI_UNITS);
-    let iec = human(moved, 1_024, &IEC_UNITS);
+    let si = human(moved, 1_000, &SI_UNITS, 10);
+    let iec = human(moved, 1_024, &IEC_UNITS, 10);
     let noun = if moved == 1 { "byte" } else { "bytes" };
     let copied = if si == iec {
         format!("{moved} {noun} copied")
@@ -402,6 +449,7 @@ pub(super) fn summary_line(moved: u64, ns: u64) -> String {
         u64::try_from(per_second).unwrap_or(u64::MAX),
         1_000,
         &SI_UNITS,
+        100,
     );
     format!("{copied}, {} s, {rate}/s\n", seconds_g(ns))
 }

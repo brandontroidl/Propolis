@@ -461,7 +461,7 @@ mod shell_detection_tests {
             "ubuntu\nBOTNET: applet not found\n"
         );
         let out = run(&mut sh, "cat /proc/mounts; /bin/busybox URUMV");
-        assert!(out.contains("/dev/sda1 / ext4 "), "{out}");
+        assert!(out.contains("/dev/root / ext4 "), "{out}");
         assert!(out.ends_with("URUMV: applet not found\n"), "{out}");
 
         // Writable-directory chains: the marker prints and the shell is left where the chain
@@ -681,13 +681,13 @@ mod shell_detection_tests {
         let mut sh = shell();
         let (out, _) = sh.handle_input("cat /proc/mounts; /bin/busybox URUMV");
         assert!(
-            out.contains("/dev/sda1 / ext4 rw,relatime,discard,errors=remount-ro 0 0\n"),
+            out.contains("/dev/root / ext4 rw,relatime,discard,errors=remount-ro 0 0\n"),
             "{out}"
         );
         assert!(out.ends_with("URUMV: applet not found\n"), "{out}");
         let (mount, _) = sh.handle_input("mount");
         assert!(
-            mount.contains("/dev/sda1 on / type ext4 (rw,relatime,discard,errors=remount-ro)\n"),
+            mount.contains("/dev/root on / type ext4 (rw,relatime,discard,errors=remount-ro)\n"),
             "{mount}"
         );
         assert_eq!(
@@ -1055,7 +1055,8 @@ mod shell_detection_tests {
         assert_eq!(sh.handle_input("cd /var/run").0, "");
         assert_eq!(sh.handle_input("pwd").0, "/var/run\n");
         assert_eq!(sh.handle_input(">.x").0, "");
-        assert_eq!(sh.handle_input("ls -a /run").0, ".x  lock  user\n");
+        assert_eq!(sh.handle_input("ls -A /run").0, ".x  lock  user\n");
+        assert_eq!(sh.handle_input("ls -a /run").0, ".  ..  .x  lock  user\n");
         assert_eq!(sh.handle_input("cd /bin").0, "");
         assert_eq!(sh.handle_input("pwd").0, "/bin\n");
         // The file behind the relative name is the busybox image: its recorded first bytes, and
@@ -1188,11 +1189,9 @@ mod shell_detection_tests {
             download_target(&["ftpget", "-u", "anon", "-p", "x", "198.51.100.9", "f"]).as_deref(),
             Some("ftp://198.51.100.9/f")
         );
-        // A host with no file is still evidence; no host at all is not a fetch.
-        assert_eq!(
-            download_target(&["tftp", "-g", "198.51.100.9"]).as_deref(),
-            Some("tftp://198.51.100.9")
-        );
+        // A host with no file, or a file with no host, is no URL: it is recorded as an unparsed
+        // fetch with the raw command (see tftp_tests), never as a half-built `tftp://HOST`.
+        assert_eq!(download_target(&["tftp", "-g", "198.51.100.9"]), None);
         assert_eq!(download_target(&["tftp", "-g", "-r", "x"]), None);
     }
 
@@ -1458,10 +1457,10 @@ mod shell_detection_tests {
 
     #[test]
     fn uname_a_and_bare_keep_their_historical_output() {
-        // Regression guard: the forms that were already correct must not change.
+        // `-a` carries the kernel's build stamp in the version field, as /proc/version does.
         assert_eq!(
             cmd_uname(&["uname", "-a"], crate::shell::ShellFlavor::Bash),
-            "Linux server01 5.15.0-91-generic #101-Ubuntu SMP x86_64 x86_64 x86_64 GNU/Linux\n"
+            "Linux server01 5.15.0-91-generic #101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023 x86_64 x86_64 x86_64 GNU/Linux\n"
         );
         assert_eq!(
             cmd_uname(&["uname"], crate::shell::ShellFlavor::Bash),

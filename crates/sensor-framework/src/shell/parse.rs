@@ -387,6 +387,31 @@ impl Parser<'_> {
 
     fn pipeline(&mut self) -> PResult<Pipeline> {
         let mut bang = false;
+        let mut timed = None;
+        // bash's `time [-p]` keyword; `time` with nothing after it times an empty pipeline.
+        if self.peek_keyword() == Some("time") {
+            self.pos = self.pos.saturating_add(1);
+            let posix = self.peek_keyword() == Some("-p");
+            if posix {
+                self.pos = self.pos.saturating_add(1);
+            }
+            timed = Some(posix);
+            let ends = match self.peek().map(|t| &t.tok) {
+                None | Some(Tok::Newline) => true,
+                Some(Tok::Op(op)) => matches!(
+                    op,
+                    Op::Semi | Op::Amp | Op::AndIf | Op::OrIf | Op::RParen | Op::DSemi
+                ),
+                _ => false,
+            };
+            if ends {
+                return Ok(Pipeline {
+                    bang,
+                    timed,
+                    stages: Vec::new(),
+                });
+            }
+        }
         if self.peek_keyword() == Some("!") {
             self.pos = self.pos.saturating_add(1);
             bang = true;
@@ -411,7 +436,11 @@ impl Parser<'_> {
             }
             stages.push(self.command()?);
         }
-        Ok(Pipeline { bang, stages })
+        Ok(Pipeline {
+            bang,
+            timed,
+            stages,
+        })
     }
 
     // ---- commands ----------------------------------------------------------------------------

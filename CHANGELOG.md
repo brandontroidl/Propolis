@@ -4,6 +4,33 @@
 
 ### Fixed
 
+- **Modeled binaries survive inspection** - every executable the Ubuntu persona serves was its
+  recorded 64-byte header followed by `0x80 | (offset & 0x3f)` filler, identical for every
+  binary, so `busybox cat /proc/self/exe` flooded two megabytes of U+FFFD and `readelf` found
+  noise where the program headers belong. The body is now generated from the recorded header
+  (`crates/sensor-framework/src/elf_body.rs`): program headers that match the sections,
+  `.interp`, a per-binary build ID, libc imports with their `GLIBC_2.x` versions, relocations,
+  `.dynamic`, usage strings for the program, instruction-shaped `.text` and the section header
+  table at the recorded offset. `readelf -lhSdV --dyn-syms` parses all 84 images without a
+  warning, `file` reports a dynamically linked PIE with the x86-64 loader (busybox, recorded as a
+  static `ET_EXEC`, reports statically linked), and `strings` shows the loader, imports, versions
+  and usage line. Still generated per byte in constant memory at the recorded size; no real
+  binary is shipped. `/bin/ls` keeps its first newline at 409. A whole-file `busybox hexdump -e
+  '16/1 "%c"'` without `-v` of a binary now prints nothing (the image has the zero runs the real
+  tool squeezes to `*`, which is not modeled). The bytes of every image changed, so its digests
+  did: any stored fingerprint of a served binary is stale.
+- **Shell `tftp` downloads are read in every common form** - a telnet dropper's classic
+  `tftp HOST -c get FILE` was recorded as `tftp://HOST:get` (the `-c get` pair taken for a port, the
+  file name lost), while the BusyBox form was right. The shell now parses BusyBox
+  (`-g -r REMOTE [-l LOCAL] HOST [PORT]`, any flag order, `-gr` clusters, attached values),
+  tftp-hpa one-shot (`HOST [PORT] -c get REMOTE`, the server last, or `HOST:FILE`), IPv6 in
+  brackets or bare, and quoted or escaped arguments, into `tftp://HOST[:PORT]/FILE`. A command line
+  whose server or file cannot be read, or whose address, port or file name would not make a sound
+  URL, now emits `honeypot_file_download` with the raw `command` and no `url` instead of a guessed
+  one, so the fetcher is never handed a malformed target (it already skips url-less events). A
+  `tftp` upload (`-p`, `put`) is not a download and emits no download event; the command event
+  still records it. A host with no file no longer yields a bare `tftp://HOST`. No wire or migration
+  change.
 - **SSH bare connects, banner grabs and bad version strings are now recorded** - the SSH sensor
   emitted `honeypot_connection` only after key exchange, so a Shodan/Censys-style scanner that
   read the banner and left, a client that sent a malformed identification line, and a bare TCP
@@ -36,6 +63,21 @@
   stored with their provenance. Embedded credentials are recorded only as present, never their
   value. They are shown on the sample and campaign
   pages and are not published to the feed or vendors.
+- **Propolis rotates its own sensor logs, and alerts when rotation fails** - the policy in
+  `/etc/logrotate.d/propolis-sensors` relied on the distribution's `logrotate.timer`, which was
+  inactive for eleven days on the production box; nothing rotated, one telnet log reached 6.6 GB
+  and `/var` reached 80% used. `propolis-logrotate.timer` (hourly, persistent) now runs
+  `logrotate` on that policy with its own state file, and `install.sh` and `upgrade.sh` install
+  and enable it, so a normal upgrade is the rollout. A `prerotate` free-space guard
+  (`/usr/local/sbin/propolis-logrotate-guard`) refuses to `copytruncate` a log that does not fit
+  on its filesystem, leaving it untouched while the other logs still rotate. Two ops-alert
+  conditions: `sensor-log-oversized` (a configured sensor log over three times the rotation size,
+  or the log filesystem over 85% used; clears below twice the size and 80%) and `rotation-stale`
+  (the rotation state file not rewritten for three hours). The monitor now evaluates fourteen
+  conditions. The hand recovery for a log too large to rotate is in
+  [retention](docs/operations/retention.md#a-log-too-large-to-rotate). A collector host that
+  installs by hand (split deployment) must also install the guard, units and timer; its page lists
+  the commands.
 - **Console log view keeps fields and folds repeats** - the `/logs` ring now keeps each event's
   structured fields (`statement`, `elapsed`, `reason`, `sensor`, ...), so "slow statement" and
   "submission held" say what was slow and why it was held. Values are capped at 512 bytes, 32
@@ -480,6 +522,59 @@
 
 ### Fixed
 
+- **A host survey gets the answers an Ubuntu 22.04 server gives (T9)** - a fingerprinting
+  script run twice against the fleet on 2026-10-07 (45 commands: `nproc`, `/proc/cpuinfo`,
+  `top -bn1 | grep '^%Cpu'`, `free | grep -i '^Mem:' | awk ...`, `cut`, `ip addr`, `which apt`,
+  `time dd ...`) got empty or `command not found` answers no real host gives. Every new format
+  below was recorded the same day from a systemd-booted `ubuntu:22.04` reference (grep 3.7,
+  coreutils 8.32, mawk 1.3.4 20200120); a format that could not be recorded is marked
+  `[unverified]` where it is written. `grep` matches basic, extended and fixed patterns (it
+  printed nothing for anything but `-F`) through a new linear-time POSIX matcher
+  (`shell/regex.rs`) with GNU's options, context lines and compile errors; `cut`, `tee` and
+  `awk`/`mawk` (an interpreter for the language, whose `system()` and command pipes run through
+  the fake shell itself) are new; `od -c` is modeled. `tee` and `mawk` join the recorded binary
+  table, and `/usr/bin/awk` is the alternatives link to `mawk` as on the reference. bash's
+  `time [-p]` keyword reports in bash 5.1's format on the shell's stderr from the time the timed
+  commands claim (`sleep`'s interval, `dd`'s own elapsed figure, a fixed per-process cost), so
+  `time dd` agrees with dd's summary; `history` lists the interactive shell's lines and nothing
+  under `bash -c`. `dd if=/dev/zero of=FILE` writes its zeros as an O(1) fill (the survey's 10 MB
+  probe answered `File too large`), and dd's byte-count sizes keep a decimal below 10 only
+  (`(10 MB, 10 MiB)`, it printed `(10.5 MB, 10.0 MiB)`). The host itself is one model the
+  commands agree on: the process table holds a 22.04 server's kernel threads and services
+  (journald, resolved, networkd, cron, dbus, rsyslogd, logind, the getty pair, the session's
+  `systemd --user`) with their real owners, so `ps aux`, `top -bn1`, `pgrep`, `/proc/PID` and
+  `/proc/loadavg` (now present, as is a ticking `/proc/uptime`) count the same rows; `ss` lists
+  resolved's stub on 127.0.0.53 beside sshd in iproute2 5.15's recorded layout, and
+  `/proc/net/udp` the same socket. `/proc/cpuinfo` lists every field (the `model name` grep was
+  empty), `/etc/shadow`, `/etc/gshadow`, `/etc/group` and the installer's netplan file exist
+  (root's hash is a random yescrypt-shaped string that hashes no password), root's dotfiles
+  are the stock ones, the root disk is `/dev/root` on the Xen `xvda` the CPU implies, `/tmp` is
+  sticky and `/proc`/`/sys` read-only, and `/lib32`/`/libx32` join the usrmerge links. An SSH
+  session's environment carries `SSH_CLIENT`, `SSH_CONNECTION`, `LANG`, `SHLVL`, the `XDG_*`
+  set and, interactively, `SSH_TTY`, `TERM` and `LS_COLORS`, in bash's own hash order (`env` printed
+  four variables); `MAIL` is set over telnet only, because a jammy SSH login has none (recorded).
+  `ls -a` lists `.` and `..` and the short listing is one name a line off a terminal, a file
+  the session writes is dated now rather than 2024, and `uname -a` and `/proc/version` carry the
+  kernel's build date [unverified]. `systemctl`, `crontab`, `apt`/`apt-get`/`dpkg`, `ssh`,
+  `lspci`, `lshw`, `who` and `w` exist (`which apt` and `ssh -V` answered nothing):
+  `systemctl list-units --state=running` lists the services whose processes `ps` shows, `status`
+  reads their PID and memory from the same rows, and enabling is the `.wants` symlink the
+  filesystem holds, so a dropped `kworker.service` is linked with systemd's own `Created
+  symlink` message and never started. `crontab` keeps its table in cron's spool with Debian's
+  header and errors. One package table recorded from a 22.04 server install answers `dpkg -l`,
+  `dpkg -s` and `apt list`, with `openssh-*` at the banner's version; `apt install` of anything
+  not installed cannot be located and nothing is fetched. `ping` prints iputils' report of
+  replies it never sent (it printed BusyBox's layout on Ubuntu) and fails names the box cannot
+  resolve as `getent` does; `ssh` times out on connect. A file the session writes now runs as
+  itself whatever its name (`/tmp/w` used to run `w`), and a copy of a modeled binary runs as
+  that binary; `ls -d` lists a directory operand itself. At an interactive terminal (SSH with a
+  pty, telnet, ADB) `read x` and `head -n 1` answer when Enter hands them their line, where they
+  waited for Ctrl-D: each Enter reruns the waiting line on the input so far (at most 64 times, on
+  at most 64 KiB) and keeps the run only if nothing still wants more, so `cat > f` still reads to
+  Ctrl-D and what is typed after a finished `read` is the next command. An SSH shell without a pty
+  reads a pipe as bash does: a bare `sh` reads the rest of the input as its script (it opened a
+  nested interactive level), there is no prompt, history or terminal variable, and the client's
+  EOF ends the shell with the last command's status (the session used to stay open).
 - **Console labels** - protocols read `TCP` / `UDP` instead of the enum names `Tcp` / `Udp`; the
   feed status tab's build and valid-until times use the console's `YYYY-MM-DD HH:MM UTC` form
   instead of raw RFC 3339; credential-sensor listeners read as their service (`VNC`, `MySQL`,

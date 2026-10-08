@@ -54,39 +54,50 @@ use crate::held_input::StdinCaptures;
 use crate::persona;
 use crate::sanitize_value;
 
+mod admin;
 mod android;
 mod androidsys;
 mod arith;
 mod ast;
+mod awk;
 mod base64;
 mod binview;
 mod builtins;
 mod busybox;
+mod cfmt;
 mod dd;
 mod envtools;
 mod eval;
 mod expand;
 mod fileinfo;
 mod fsops;
+mod grep;
 mod hashing;
 mod hostinfo;
+mod hw;
 mod lex;
 mod loader;
 mod lookup;
 mod multicall;
 mod nameinfo;
 mod netcat;
+mod netclient;
 mod netinfo;
 mod parse;
 mod pathtools;
+mod pkg;
 mod printf;
 mod procs;
 mod read;
 mod readlink;
+mod regex;
 mod registry;
 mod sysres;
 mod test_builtin;
+mod textproc;
 mod texttools;
+mod tftp;
+mod timing;
 mod trace;
 
 use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
@@ -407,7 +418,17 @@ pub struct FakeShell {
     loader_line: loader::LineLoader,
     /// The current line as typed, sanitized and capped like `metadata.command`.
     line_command: String,
+    /// The time the session's commands claim to have taken, for `time`.
+    timing: timing::Timing,
+    /// The interactive login shell's command history, oldest first, as `history` lists it.
+    history: Vec<String>,
+    /// The running command was started by `env`, not by the shell: its environment is the one
+    /// `env` built, with no `_` that only bash adds.
+    env_launch: bool,
 }
+
+/// The most entries `history` keeps: Ubuntu's stock `.bashrc` sets `HISTSIZE=1000`.
+const HISTORY_MAX: usize = 1_000;
 
 /// A line waiting for its input.
 #[derive(Clone)]
@@ -415,7 +436,15 @@ struct HeldLine {
     decoded: String,
     /// The line as typed, sanitized and capped for event metadata.
     command: String,
+    /// [`FakeShell::try_finish_line`] runs made so far.
+    attempts: u32,
 }
+
+/// The most times [`FakeShell::try_finish_line`] reruns one waiting line, and the most input it
+/// reruns it on: enough for the lines a person or a script answers a prompt with, and a bound on
+/// the rework a long paste into `cat > f` can cause.
+pub const RESUME_ATTEMPTS: u32 = 64;
+pub const RESUME_BYTES: usize = 65_536;
 
 /// What [`FakeShell::checkpoint`] saved.
 struct Checkpoint {
@@ -586,8 +615,12 @@ impl FakeShell {
             typed_output: false,
             loader_line: loader::LineLoader::default(),
             line_command: String::new(),
+            timing: timing::Timing::default(),
+            history: Vec::new(),
+            env_launch: false,
         };
         shell.install_processes();
+        shell.install_session_env();
         shell
     }
 
@@ -595,6 +628,7 @@ impl FakeShell {
     /// pipe unless the channel asked for a pty; every other shell reads a terminal.
     pub fn with_terminal_input(mut self, tty: bool) -> Self {
         self.tty_input = tty;
+        self.set_terminal_env(tty);
         self
     }
 
@@ -641,6 +675,9 @@ impl FakeShell {
                 typed_output: self.typed_output,
                 loader_line: self.loader_line.clone(),
                 line_command: self.line_command.clone(),
+                timing: self.timing,
+                history: self.history.clone(),
+                env_launch: self.env_launch,
             }),
         }
     }
@@ -662,6 +699,8 @@ impl FakeShell {
     /// The same shell reading its time from `clock` instead of the system clock.
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        // Files written now carry this clock's date.
+        self.fs.set_clock(clock);
         // The session began now on this clock, and every start time in the process table follows.
         self.session_started = clock();
         self.install_processes();
@@ -786,6 +825,12 @@ impl FakeShell {
         matches!(self.active_level(), ShellLevel::Bash { .. })
     }
 
+    /// Whether the running command writes to the session's terminal: the session has one, and
+    /// the command is not a pipeline stage, a substitution or a script's (which write to a pipe).
+    fn stdout_is_terminal(&self) -> bool {
+        self.tty_input && self.script_depth == 0
+    }
+
     /// What the active shell says for a command it cannot find.
     fn not_found(&self, what: &str) -> String {
         match (self.context, self.active_level()) {
@@ -871,12 +916,21 @@ impl FakeShell {
         self.held = Some(HeldLine {
             decoded,
             command: sanitize_value(&raw, MAX_COMMAND_LEN),
+            attempts: 0,
         });
         self.end_input(&mut events, false);
         self.loader_line.urls = derived;
         self.flush_loader(&mut events);
         self.gate_events(&mut events);
         (LineStep::AwaitingInput, events)
+    }
+
+    /// The status of the last command the login shell ran (`$?`): what the shell exits with
+    /// when its input ends.
+    pub fn last_status(&self) -> u8 {
+        self.frames
+            .first()
+            .map_or(0, |frame| frame.state.last_status)
     }
 
     /// The last step of a line's events: the connection's command-event gate, when it has one,
@@ -905,6 +959,40 @@ impl FakeShell {
         let Some(held) = self.held.take() else {
             return CommandResult::silent(0);
         };
+        self.run_held(held, input, Some(end)).0
+    }
+
+    /// Run the waiting line on the input typed so far, with more still able to come, as a real
+    /// command reading a terminal runs once Enter hands it a line: `read x; echo $x` and
+    /// `head -n 1` answer after the first line, not after Ctrl-D. `Some` is what the line printed
+    /// when it completed on that input; `None` leaves it waiting, exactly as it was, because a
+    /// command on it still wants more (`cat > f` until Ctrl-D, a second `read`). Each attempt
+    /// reruns the line from the start, so only the first [`RESUME_ATTEMPTS`] lines and
+    /// [`RESUME_BYTES`] of input are tried; past them the line waits for its input to end.
+    pub fn try_finish_line(&mut self, input: &[u8]) -> Option<CommandResult> {
+        let held = self.held.as_mut()?;
+        if held.attempts >= RESUME_ATTEMPTS || input.len() > RESUME_BYTES {
+            return None;
+        }
+        held.attempts = held.attempts.saturating_add(1);
+        let saved = self.checkpoint();
+        let held = self.held.take()?;
+        let (output, wants_more) = self.run_held(held, input, None);
+        if wants_more {
+            self.rollback(saved);
+            return None;
+        }
+        Some(output)
+    }
+
+    /// Run `held` on `input`: ended as `end` says, or still open with `None`. Returns the output
+    /// and whether a reader asked for more than `input` held.
+    fn run_held(
+        &mut self,
+        held: HeldLine,
+        input: &[u8],
+        end: Option<InputEnd>,
+    ) -> (CommandResult, bool) {
         self.begin_line();
         self.line_command = held.command.clone();
         self.trace = LineTrace {
@@ -914,13 +1002,17 @@ impl FakeShell {
         self.advance_shell_line();
         self.input_sinks.clear();
         self.input_interrupt = match end {
-            InputEnd::Eof => None,
-            InputEnd::Interrupt => Some(130),
-            InputEnd::Hangup => Some(129),
+            None | Some(InputEnd::Eof) => None,
+            Some(InputEnd::Interrupt) => Some(130),
+            Some(InputEnd::Hangup) => Some(129),
         };
-        self.stdin = Stdin::session(input.to_vec(), end == InputEnd::Eof, self.tty_input);
+        self.stdin = Stdin::session(input.to_vec(), end == Some(InputEnd::Eof), self.tty_input);
         let mut output = self.run_input(&held.decoded);
         let interrupted = self.stdin.is_blocked();
+        if end.is_none() && interrupted {
+            // Still waiting: the caller undoes this run.
+            return (output, true);
+        }
         self.input_interrupt = None;
         self.stdin = Stdin::Terminal;
         // The line's events, a derived URL among them, went out when it was held.
@@ -929,11 +1021,11 @@ impl FakeShell {
         tracing::debug!(target: "propolis::shell::trace", trace = ?self.trace, "shell line");
         // Killed by Ctrl-C, the job leaves the cursor after the `^C` the terminal echoed; an
         // interactive shell moves to a fresh line before its prompt.
-        if interrupted && end == InputEnd::Interrupt && self.context != ShellContext::ExecC {
+        if interrupted && end == Some(InputEnd::Interrupt) && self.context != ShellContext::ExecC {
             output.append(CommandResult::stdout(b"\n".to_vec()));
             output.status = 130;
         }
-        output
+        (output, false)
     }
 
     /// The file that holds what the last line run by [`Self::finish_line`] read from its input:
@@ -962,6 +1054,7 @@ impl FakeShell {
     /// command at all.
     fn begin_input(&mut self, line: &[u8]) -> Option<(String, Vec<SensorEvent>)> {
         let raw = String::from_utf8_lossy(line);
+        self.record_history(&raw);
         self.begin_line();
         self.line_command = sanitize_value(&raw, MAX_COMMAND_LEN);
         if raw.trim().is_empty() {
@@ -1043,7 +1136,7 @@ impl FakeShell {
             let per_line_cap = self.budget().limits().download_per_line;
             let mut recorded_this_line: u64 = 0;
             let mut download_capped = false;
-            for url in download_targets(&decoded) {
+            for fetch in download_targets(&decoded) {
                 // The per-line cap is tested first so a URL refused by it spends none of the
                 // connection's allowance.
                 if recorded_this_line >= per_line_cap {
@@ -1057,7 +1150,16 @@ impl FakeShell {
                 }
                 recorded_this_line = recorded_this_line.saturating_add(1);
                 self.trace.events.push(TraceEventKind::FileDownload);
-                let sanitized_url = sanitize_value(&url, MAX_URL_LEN);
+                let metadata = match &fetch {
+                    Fetch::Url(url) => serde_json::json!({
+                        "protocol_label": self.ctx.protocol_label,
+                        "url": sanitize_value(url, MAX_URL_LEN),
+                    }),
+                    Fetch::Unparsed(raw) => serde_json::json!({
+                        "protocol_label": self.ctx.protocol_label,
+                        "command": sanitize_value(raw, MAX_COMMAND_LEN),
+                    }),
+                };
                 evs.push(SensorEvent {
                     v: WIRE_VERSION,
                     source_ip: self.ctx.source_ip,
@@ -1067,10 +1169,7 @@ impl FakeShell {
                     protocol: PROTO_TCP.into(),
                     authenticated: self.ctx.authenticated,
                     observed_at: (self.clock)(),
-                    metadata: serde_json::json!({
-                        "protocol_label": self.ctx.protocol_label,
-                        "url": sanitized_url,
-                    }),
+                    metadata,
                     sample: None,
                     session_id: self.ctx.session_id,
                     occurrence_id: None,
@@ -1154,6 +1253,7 @@ impl FakeShell {
         self.busybox_depth = 0;
         self.typed_output = false;
         self.loader_line = loader::LineLoader::default();
+        self.refresh_clock_nodes();
     }
 
     /// Run one decoded input as a shell reads it, one physical line at a time: each line joins
@@ -1215,11 +1315,22 @@ impl FakeShell {
     /// `/bin/sh`) - which IoT loaders routinely use - resolves to the same applet a bare invocation
     /// would, the way a real shell finds it on PATH. Only the command token is normalised;
     /// arguments are untouched. A name the registry lacks is a path invocation when the token has
-    /// a slash and not-found otherwise; those two have no handler in the registry.
+    /// a slash and not-found otherwise; those two have no handler in the registry. So is a path to
+    /// a file the session wrote, whatever its name: `/tmp/w` is the attacker's file, not `w`.
     fn resolve(&self, parts: &[&str]) -> (HandlerId, Option<HandlerFn>) {
         let Some(first) = parts.first() else {
             return (HandlerId::Empty, None);
         };
+        if first.contains('/') {
+            let absolute = if first.starts_with('/') {
+                (*first).to_string()
+            } else {
+                format!("{}/{first}", self.cwd().trim_end_matches('/'))
+            };
+            if self.fs.is_session_file(&absolute) {
+                return (HandlerId::PathInvoke, None);
+            }
+        }
         if let Some((id, handler)) =
             Registry::builtin().lookup(command_basename(first), self, parts)
         {
@@ -1248,10 +1359,20 @@ impl FakeShell {
         }
         let (id, handler) = self.resolve(parts);
         if let Some(handler) = handler {
+            if Registry::builtin().kind(command_basename(parts[0]), self)
+                == Some(registry::CommandKind::External)
+            {
+                let seed = self.state().pid;
+                self.timing.process(seed);
+            }
             return handler(self, parts);
         }
         match id {
-            HandlerId::PathInvoke => self.invoke_path(parts),
+            HandlerId::PathInvoke => {
+                let seed = self.state().pid;
+                self.timing.process(seed);
+                self.invoke_path(parts)
+            }
             // An interactive bash on Ubuntu prefixes the message with its own name; the bare form
             // matched no real shell.
             HandlerId::NotFound => {
@@ -1398,8 +1519,42 @@ impl FakeShell {
         CommandResult::silent(0)
     }
 
-    fn builtin_sleep(&mut self, _parts: &[&str]) -> CommandResult {
-        CommandResult::silent(0)
+    /// `sleep N[smhd]...`: returns at once, and the time it would have taken is what `time`
+    /// reports for it. GNU coreutils 8.32's errors for a missing or bad operand.
+    fn builtin_sleep(&mut self, parts: &[&str]) -> CommandResult {
+        let operands: Vec<&str> = parts
+            .get(1..)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .filter(|a| *a != "--")
+            .collect();
+        if operands.is_empty() {
+            return CommandResult::stderr(
+                1,
+                "sleep: missing operand\nTry 'sleep --help' for more information.\n",
+            );
+        }
+        match timing::sleep_ns(&operands) {
+            Some(ns) => {
+                self.timing.wait(ns);
+                CommandResult::silent(0)
+            }
+            None => {
+                let bad = operands
+                    .iter()
+                    .find(|o| timing::sleep_ns(&[o]).is_none())
+                    .copied()
+                    .unwrap_or("");
+                CommandResult::stderr(
+                    1,
+                    format!(
+                        "sleep: invalid time interval '{}'\nTry 'sleep --help' for more information.\n",
+                        sanitize_value(bad, MAX_URL_LEN)
+                    ),
+                )
+            }
+        }
     }
 
     /// Already root on this box, so `su` (and `su -`, `su root`) opens another bash
@@ -1456,13 +1611,33 @@ impl FakeShell {
     /// (`cp /usr/bin/busybox /tmp/.bb && /tmp/.bb PROBE` prints `.bb: applet not found`, status
     /// 127, on the reference system).
     fn run_saved_executable(&mut self, parts: &[&str], path: &str) -> CommandResult {
-        let is_busybox = self
+        let image = self
             .fs
             .content_and_mode(path)
             .ok()
-            .and_then(|(blob, _)| blob.as_elf())
-            .is_some_and(|image| binaries::is_busybox(&image));
+            .and_then(|(blob, _)| blob.as_elf());
+        let is_busybox = image.as_ref().is_some_and(binaries::is_busybox);
         if !is_busybox {
+            // A copy of another modeled binary (`cp /bin/sh /tmp/x; /tmp/x -c ...`) runs as that
+            // binary does.
+            // The command a copy answers to is its binary's, or the alias that runs it (`sh` is
+            // dash, `awk` is mawk).
+            let copied = image.and_then(|image| {
+                let binary = binaries::BINARIES
+                    .iter()
+                    .find(|binary| binary.image() == image)?;
+                Some(
+                    binaries::ALIASES
+                        .iter()
+                        .find(|alias| alias.target == binary.name)
+                        .map_or(binary.name, |alias| alias.name),
+                )
+            });
+            if let Some(name) = copied {
+                let mut argv = vec![name];
+                argv.extend_from_slice(parts.get(1..).unwrap_or(&[]));
+                return self.dispatch_nested(&argv);
+            }
             return CommandResult::silent(0);
         }
         let name = command_basename(parts[0]);
@@ -2259,7 +2434,10 @@ fn command_basename(token: &str) -> &str {
 /// captured. The busybox *applet* token is matched raw, exactly like `cmd_busybox`/`busybox::is_applet`
 /// do: real busybox resolves an applet by bare name only, so `busybox /bin/tftp` is "applet not
 /// found" and must not be recorded as a fetch the persona did not answer in character.
-fn download_target(parts: &[&str]) -> Option<String> {
+///
+/// A `tftp` whose server or file cannot be read (see [`tftp`]) is [`Fetch::Unparsed`], never a
+/// guessed URL; a `tftp` upload (`-p`, `put`) fetches nothing and is not a fetch at all.
+fn fetch_attempt(parts: &[&str]) -> Option<Fetch> {
     const FETCHERS: [&str; 4] = ["wget", "curl", "tftp", "ftpget"];
     // BusyBox ships wget/tftp/ftpget applets but NOT curl, so `busybox curl` is "applet not found"
     // (see `busybox::applets`) and must not be recorded as a fetch the persona did not answer in
@@ -2273,9 +2451,35 @@ fn download_target(parts: &[&str]) -> Option<String> {
         _ => return None,
     };
     match cmd {
-        "tftp" => tftp_url(args),
-        "ftpget" => ftpget_url(args),
-        _ => fetch_url_arg(cmd, args).map(str::to_string),
+        "tftp" => {
+            let request = tftp::parse(args);
+            match (request.op, request.url) {
+                (tftp::Op::Put, _) => None,
+                (tftp::Op::Get, Some(url)) => Some(Fetch::Url(url)),
+                (tftp::Op::Get, None) => Some(Fetch::Unparsed(parts.join(" "))),
+            }
+        }
+        "ftpget" => ftpget_url(args).map(Fetch::Url),
+        _ => fetch_url_arg(cmd, args).map(|url| Fetch::Url(url.to_string())),
+    }
+}
+
+/// A retrieval a command line attempts, as the `honeypot_file_download` event records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Fetch {
+    /// The target parsed into a URL the fetcher may be handed.
+    Url(String),
+    /// A fetch whose server or file could not be read from the command line. The event carries
+    /// the raw command and no `url`, so the fetcher never sees a guessed or malformed target.
+    Unparsed(String),
+}
+
+/// The URL of a fetch, for tests that only care about the target.
+#[cfg(test)]
+fn download_target(parts: &[&str]) -> Option<String> {
+    match fetch_attempt(parts) {
+        Some(Fetch::Url(url)) => Some(url),
+        _ => None,
     }
 }
 
@@ -2353,21 +2557,21 @@ const LONG_OPTIONS_WITH_VALUE: [&str; 18] = [
 /// examined on its own; the fallback pair `wget X || busybox wget X` names one URL and yields
 /// one event. The raw-line scheme scan stays as the last resort for a URL inside quotes
 /// (`sh -c "wget http://h/x; ..."`), where the separators belong to a quoted script.
-fn download_targets(decoded: &str) -> Vec<String> {
-    let mut urls: Vec<String> = Vec::new();
+fn download_targets(decoded: &str) -> Vec<Fetch> {
+    let mut fetches: Vec<Fetch> = Vec::new();
     for tokens in simple_commands(decoded) {
-        if let Some(url) = download_target(&tokens)
-            && !urls.contains(&url)
+        if let Some(fetch) = fetch_attempt(&tokens)
+            && !fetches.contains(&fetch)
         {
-            urls.push(url);
+            fetches.push(fetch);
         }
     }
-    if urls.is_empty()
+    if !fetches.iter().any(|f| matches!(f, Fetch::Url(_)))
         && let Some(url) = url_if_fetch_line(decoded)
     {
-        urls.push(url.to_string());
+        fetches.push(Fetch::Url(url.to_string()));
     }
-    urls
+    fetches
 }
 
 /// Split a line into its simple commands' token lists at `;`, `|`, `||`, `&&`, a background `&`,
@@ -2418,30 +2622,6 @@ pub enum ControlOp {
     And,
     /// `||`: run only if the previous command failed.
     Or,
-}
-
-/// `tftp [-g|-p] [-l LOCAL] [-r REMOTE] HOST [PORT]` (BusyBox) -> `tftp://HOST[:PORT]/REMOTE`.
-/// `-r`/`-l` consume the next token; other flags do not. Flag order varies between loaders
-/// (`-g -r FILE HOST` and `-g HOST -r FILE` are both common), so positionals are collected rather
-/// than indexed. With only `-l` given, BusyBox uses it as the remote name too. No host -> `None`;
-/// a host with no file still yields `tftp://HOST`, since the retrieval host is evidence on its own.
-fn tftp_url(args: &[&str]) -> Option<String> {
-    let mut remote = None;
-    let mut local = None;
-    let mut positional = Vec::new();
-    let mut it = args.iter();
-    while let Some(&a) = it.next() {
-        match a {
-            "-r" => remote = it.next().copied(),
-            "-l" => local = it.next().copied(),
-            _ if a.starts_with('-') => {}
-            _ => positional.push(a),
-        }
-    }
-    let host = *positional.first()?;
-    let port = positional.get(1);
-    let file = remote.or(local);
-    Some(join_fetch_url("tftp", host, port.copied(), file))
 }
 
 /// `ftpget [-c] [-v] [-u USER] [-p PASS] [-P PORT] HOST [LOCAL] REMOTE` (BusyBox) ->
@@ -2847,19 +3027,9 @@ fn download_save_name(cmd: &str, parts: &[&str]) -> Option<String> {
             }
             None
         }
-        // BusyBox `tftp -g -r REMOTE [-l LOCAL] HOST`: the local name wins when given.
-        "tftp" => {
-            let (mut remote, mut local) = (None, None);
-            let mut it = args.iter();
-            while let Some(&a) = it.next() {
-                match a {
-                    "-r" => remote = it.next().copied(),
-                    "-l" => local = it.next().copied(),
-                    _ => {}
-                }
-            }
-            local.or(remote).map(str::to_string)
-        }
+        // Every `tftp` form (see `tftp::parse`): the local name wins when given, an upload saves
+        // nothing.
+        "tftp" => tftp::parse(args).save,
         // BusyBox `ftpget [opts] HOST [LOCAL] REMOTE`: the local name is the second positional
         // when three are given, else the remote name doubles as it.
         "ftpget" => {
@@ -3139,6 +3309,8 @@ fn low_byte(value: u32) -> u8 {
 // reads each file of this module up to its first `#[cfg(test)]` as the production source, and skips
 // the files that hold only tests.
 #[cfg(test)]
+mod admin_tests;
+#[cfg(test)]
 mod android_tests;
 #[cfg(test)]
 mod androidsys_tests;
@@ -3198,4 +3370,10 @@ mod test_builtin_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod textproc_tests;
+#[cfg(test)]
 mod texttools_tests;
+#[cfg(test)]
+mod tftp_tests;
+#[cfg(test)]
+mod timing_tests;

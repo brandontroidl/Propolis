@@ -54,6 +54,8 @@ const MEMBER_LIMIT: i64 = 500;
 pub(crate) const MAX_APPROVE: i64 = 1000;
 /// Indicators listed per section of a campaign or sample page.
 const IOC_LIMIT: i64 = 200;
+/// Most recent members whose command indicators a campaign page reads.
+const IOC_MEMBER_SCAN: i64 = 2000;
 /// Days in the list page's sparkline, and in the detail page's.
 const LIST_SPARK_DAYS: i64 = 14;
 const DETAIL_SPARK_DAYS: i64 = 30;
@@ -452,6 +454,9 @@ pub(crate) struct IocRow {
     pub source_ip: Option<String>,
     pub event_id: Option<i64>,
     pub sightings: i64,
+    /// Members whose commands carried it; a campaign of two hundred hosts running one script
+    /// lists each of its indicators once, not two hundred times.
+    pub hosts: i64,
 }
 
 fn ioc_row(r: &sqlx::postgres::PgRow) -> Result<IocRow, sqlx::Error> {
@@ -464,6 +469,7 @@ fn ioc_row(r: &sqlx::postgres::PgRow) -> Result<IocRow, sqlx::Error> {
         source_ip: r.try_get("source_ip")?,
         event_id: r.try_get("event_id")?,
         sightings: r.try_get("sightings")?,
+        hosts: r.try_get("hosts")?,
     })
 }
 
@@ -471,7 +477,7 @@ fn ioc_row(r: &sqlx::postgres::PgRow) -> Result<IocRow, sqlx::Error> {
 pub(crate) async fn artifact_iocs(pool: &PgPool, sha256: &str) -> Result<Vec<IocRow>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT kind, value, detail, artifact_sha256, NULL::text AS source_ip, \
-                NULL::bigint AS event_id, sightings \
+                NULL::bigint AS event_id, sightings, 1::bigint AS hosts \
          FROM ioc WHERE artifact_sha256 = $1 ORDER BY kind, value LIMIT $2",
     )
     .bind(sha256)
@@ -618,7 +624,7 @@ async fn detail_page(
         async {
             let rows = sqlx::query(
                 "SELECT kind, value, detail, artifact_sha256, NULL::text AS source_ip, \
-                        NULL::bigint AS event_id, sightings \
+                        NULL::bigint AS event_id, sightings, 1::bigint AS hosts \
                  FROM ioc WHERE artifact_sha256 IN \
                      (SELECT sha256 FROM campaign_sample WHERE campaign_id = $1) \
                  ORDER BY kind, value LIMIT $2",
@@ -634,16 +640,24 @@ async fn detail_page(
     let command_iocs = degraded.soft(
         "command indicators",
         async {
+            // One row per indicator, with how many members carried it and the earliest event
+            // that did, read from the most recent members so a huge campaign stays bounded.
             let rows = sqlx::query(
-                "SELECT i.kind, i.value, i.detail, NULL::text AS artifact_sha256, \
-                        host(i.source_ip) AS source_ip, i.event_id, i.sightings \
-                 FROM ioc i JOIN campaign_member m \
-                   ON m.source_ip = i.source_ip AND m.campaign_id = $1 \
+                "SELECT i.kind, i.value, (array_agg(i.detail ORDER BY i.event_id))[1] AS detail, \
+                        NULL::text AS artifact_sha256, \
+                        (array_agg(host(i.source_ip) ORDER BY i.event_id))[1] AS source_ip, \
+                        min(i.event_id) AS event_id, sum(i.sightings)::bigint AS sightings, \
+                        count(DISTINCT i.source_ip) AS hosts \
+                 FROM ioc i JOIN ( \
+                     SELECT source_ip FROM campaign_member WHERE campaign_id = $1 \
+                     ORDER BY last_seen DESC LIMIT $3) m ON m.source_ip = i.source_ip \
                  WHERE i.artifact_sha256 IS NULL \
-                 ORDER BY i.sightings DESC, i.kind, i.value LIMIT $2",
+                 GROUP BY i.kind, i.value \
+                 ORDER BY hosts DESC, sightings DESC, i.kind, i.value LIMIT $2",
             )
             .bind(id)
             .bind(IOC_LIMIT)
+            .bind(IOC_MEMBER_SCAN)
             .fetch_all(&state.db)
             .await?;
             rows.iter().map(ioc_row).collect::<Result<Vec<_>, _>>()

@@ -392,6 +392,29 @@ async fn the_campaign_page_shows_members_representative_and_indicators(pool: PgP
     assert!(page.contains("127.0.0.1 rival.example.net"), "{page}");
     assert!(page.contains("hosts entry"));
 
+    // One indicator carried by three members' commands is one row, not three.
+    for (n, ip) in ["192.0.2.1", "192.0.2.2", "192.0.2.3"].iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO ioc (kind, value, detail, event_id, source_ip, first_seen, last_seen, \
+                              sightings) \
+             VALUES ('url', 'http://198.51.100.70/kswpad', '198.51.100.70', $1, $2::inet, now(), \
+                     now(), 2)",
+        )
+        .bind(1000 + n as i64)
+        .bind(ip)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let (_, page) = console.get(&format!("/campaigns/{sequence}")).await;
+    assert_eq!(
+        page.matches("http://198.51.100.70/kswpad").count(),
+        1,
+        "{page}"
+    );
+    assert!(page.contains("3 hosts, 6&times;"), "{page}");
+    assert!(page.contains("event 1000"), "{page}");
+
     let (status, _) = console.get("/campaigns/999999").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }

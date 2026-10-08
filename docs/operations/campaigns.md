@@ -24,7 +24,7 @@ Cheapest first; an address can be a member of several campaigns.
 |---|---|---|
 | Same sample (`sample`) | every address that uploaded the captured sample, or reported a URL the fetcher retrieved it from | the sample's SHA-256 |
 | Same commands (`command_sequence`) | every address that ran a shell session whose command run has the same fingerprint | the fingerprint |
-| Multi-service scan (`scanner`) | every address that reached 3 distinct sensors within one clock hour | the sorted sensor set |
+| Multi-service scan (`scanner`) | every address that reached 3 distinct sensors within one clock hour | the first 3 sensors it reached in that hour, sorted |
 
 **Fingerprint.** Each command is reduced to a shape: escape runs, long hex and base64 runs and
 whitespace runs replaced the way the sensors' flood gate does it, then IPv4 and bracketed IPv6
@@ -158,6 +158,11 @@ separate decision.
 - A quiet sensor's last sessions are grouped when it next logs anything an hour past them.
 - A node feeding a sensor name while lagging another node by most of an hour can have a run cut
   short by the sweep, so the same session lands in a different campaign than one pass would put it.
+- A scanner campaign is keyed by the first three sensors an address reached in its window, so
+  one tool that sweeps services in a random order shows as several scanner campaigns, one per
+  combination it happened to start with.
+- A campaign page lists the command indicators of its 2,000 most recent members, one row per
+  indicator with the number of members that carried it.
 - Commands without a `session_id` (events from before session ids existed) form no command
   sequences.
 - A catch-up after an upgrade reads the whole ledger once; the console shows how far it has got.

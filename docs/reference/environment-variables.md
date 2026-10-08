@@ -721,7 +721,7 @@ Sensor-specific extras:
   three is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY
   without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
-  (`deploy/fleet-listeners.sh#PROPOLIS_HTTP_TLS_BIND`), a TLS listener never starts implicitly.
+  (`deploy/listeners-lib.sh#PROPOLIS_HTTP_TLS_BIND`), a TLS listener never starts implicitly.
 - **redis**: Redis TLS (all three default off; none has a compiled default):
 
   | Variable | Default | Meaning |
@@ -738,7 +738,7 @@ Sensor-specific extras:
   three is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY
   without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
-  (`deploy/fleet-listeners.sh#PROPOLIS_REDIS_TLS_BIND`), a TLS listener never starts implicitly.
+  (`deploy/listeners-lib.sh#PROPOLIS_REDIS_TLS_BIND`), a TLS listener never starts implicitly.
 - **mqtt**: MQTT TLS (all three default off; none has a compiled default):
 
   | Variable | Default | Meaning |
@@ -755,7 +755,7 @@ Sensor-specific extras:
   three is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY
   without a bind load and validate the pair, start no TLS listener, and log one
   warning. Because the fleet inventory derives from the `*_BIND` variables
-  (`deploy/fleet-listeners.sh#PROPOLIS_MQTT_TLS_BIND`), a TLS listener never starts implicitly.
+  (`deploy/listeners-lib.sh#PROPOLIS_MQTT_TLS_BIND`), a TLS listener never starts implicitly.
   The plain and TLS listeners share one capture-memory budget
   (`PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES`), so the ceiling covers both together.
 - **dns**: DNS TLS (DNS over TLS, RFC 7858; all three default off; none has a compiled default):
@@ -774,7 +774,7 @@ Sensor-specific extras:
   non-UTF-8 value of any of the three is invalid, not unset
   (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY without a bind load and
   validate the pair, start no TLS listener, and log one warning. Because the fleet inventory
-  derives from the `*_BIND` variables (`deploy/fleet-listeners.sh#PROPOLIS_DNS_TLS_BIND`), a TLS
+  derives from the `*_BIND` variables (`deploy/listeners-lib.sh#PROPOLIS_DNS_TLS_BIND`), a TLS
   listener never starts implicitly.
 - **smtp**: SMTP TLS and extra listeners (all four default off; none has a compiled default):
 
@@ -800,8 +800,8 @@ Sensor-specific extras:
   and no implicit-TLS listener starts; unlike the other sensors this logs no warning, because the
   pair is in use. With no TLS variable set the sensor is unchanged: STARTTLS is advertised and
   answered with `454`. Because the fleet inventory derives from the `*_BIND` variables
-  (`deploy/fleet-listeners.sh#PROPOLIS_SMTP_SUBMISSION_BIND`,
-  `deploy/fleet-listeners.sh#PROPOLIS_SMTP_TLS_BIND`), neither extra listener starts implicitly.
+  (`deploy/listeners-lib.sh#PROPOLIS_SMTP_SUBMISSION_BIND`,
+  `deploy/listeners-lib.sh#PROPOLIS_SMTP_TLS_BIND`), neither extra listener starts implicitly.
 - **ftp**: FTPS and AUTH TLS (all three default off; none has a compiled default):
 
   | Variable | Default | Meaning |
@@ -824,7 +824,7 @@ Sensor-specific extras:
   listener starts; unlike the other sensors this logs no warning, because the pair is in use.
   With no TLS variable set the sensor is unchanged: AUTH, PBSZ and PROT answer `500` and FEAT
   does not list them. Because the fleet inventory derives from the `*_BIND` variables
-  (`deploy/fleet-listeners.sh#PROPOLIS_FTP_TLS_BIND`), the implicit listener never starts
+  (`deploy/listeners-lib.sh#PROPOLIS_FTP_TLS_BIND`), the implicit listener never starts
   implicitly. The plain and implicit listeners share one capture-memory budget
   (`PROPOLIS_FTP_CAPTURE_MEMORY_BYTES`), so the ceiling covers both together.
 - **cred**: TLS on the existing PostgreSQL, MySQL, MSSQL and MongoDB ports (both default off;

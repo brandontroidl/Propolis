@@ -180,13 +180,88 @@ auto-restarted into the same failure (`deploy/propolis.service#Unlike the retire
 independent listeners with no such internal supervisor, so they use `always`. Failure
 modes are covered in [concurrency and failure](../architecture/concurrency-and-failure.md).
 
+## Configuration check
+
+`deploy/config-check.sh` compares what is **configured** with what is **running**. It is
+read-only: it changes no file, restarts nothing, edits no firewall rule, and never executes an
+installed binary. Run it after any change to an env file, a unit, the firewall, or after an
+upgrade:
+
+```
+sudo ./deploy/config-check.sh              # table, one row per listener, then findings
+sudo ./deploy/config-check.sh --json       # the same, as one JSON document
+sudo ./deploy/config-check.sh --no-events  # skip the database query
+```
+
+The listener list comes from the same derivation that builds the fleet inventory
+(`deploy/listeners-lib.sh`, used by `deploy/fleet-listeners.sh`), so the two cannot disagree
+about which listeners exist. Each row is one sensor, protocol and bind (`sensor-dns` is two
+rows, `sensor-catchall` two per port, `sensor-cred` one per protocol), and each row answers:
+
+| Column | Question | Failure it catches |
+|---|---|---|
+| UNIT | Is `sensor-<name>.service` installed, enabled and active? | a unit never installed, masked, not enabled, or crash-looping |
+| LISTEN | Is the configured port bound, and by the sensor? | `held by another process <name>` (a host service on the port) versus `nothing listening` (the sensor's bind failed) |
+| FIREWALL | Does the active host firewall (ufw, firewalld or nftables) allow it? | a port nothing can reach, and the dangerous case below |
+| LOG | Does the sensor's log exist, how old is it, how big against the logrotate `size`? | a log never written, silent for a day, or more than 3x the rotation size (warning from 2x) |
+| INTAKE | Is that log path in `PROPOLIS_SENSOR_LOGS`, as the daemon parses it? | a sensor whose events are never ingested |
+| EVENTS | When did the ledger last receive an event from this sensor? | intake not following a log that is growing |
+
+The INTAKE check applies the daemon's own grammar (comma separated `label:path`, entries
+trimmed, blank ones skipped, split at the first colon, both halves non-empty;
+`crates/log-tailer/src/sensor_logs.rs`). A malformed entry makes the daemon refuse to start,
+so it is a failure, reported with the corrected entry where one can be inferred; a repeated
+label is a failure, a repeated path or a relative path a warning, and a misspelled variable
+name (`PROPOLIS_SENSOR_LOG`, `SENSOR_LOGS`, a space before the `=`) is reported by name. The
+EVENTS column is keyed by the name the sensor reports in `event.sensor` (`postgresql`, not the
+`cred-pg` label) and is skipped without a readable `DATABASE_URL`, without `psql`, or when the
+read-only query fails; the password is handed to `psql` through its environment, never on a
+command line.
+
+**The dangerous row.** A port that is open in the firewall and held by a process that is not
+the expected sensor is reported first, as `DANGEROUS`, for example a host PostgreSQL on 5432
+while `sensor-cred` is configured for it and the firewall exposes 5432. Its fix line names the
+firewall command that closes the port. A foreign holder behind a closed firewall is still a
+failure, but not that one.
+
+Below the table, HOST rows cover what no single listener owns: the log rotation timer, its
+state file (older than three hours fails, the daemon's `rotation-stale` threshold) and the
+installed policy and guard; the `INSTALL_BINS` set from `deploy/upgrade.sh` present in
+`/usr/local/bin` and equal to the build in `target/release`, and the deploy stamp's recorded
+`propolis` revision against its own commit and the checkout (an upgrade whose first run
+installed no new binary shows here); `PROPOLIS_SENSOR_LOGS` as a whole; sensor units that are
+enabled with no bind variable set (the look of a misspelled `*_BIND` name); and, where
+`propolis-watch` is installed, `watch.env` against `propolis.env` and the watcher's
+authorized key.
+
+Every finding prints an exact fix line. The exit status is `0` all ok, `1` warnings or checks
+that could not be answered, `2` at least one failure; a usage error is `64`.
+
+**Without root** it still runs, and says what it could not see under `LIMITED CHECKS`. Sensor
+env files are mode 0600 and owned by each sensor's account, so as an ordinary user part of the
+inventory may be unreadable; `ss` cannot name another account's process, so a bound port shows
+`bound, owner unknown (run as root to name it)`; `ufw` and `nft` cannot list rules; and
+`/var/log/propolis/*` is not traversable. These are reported as `?`, which is neither a pass
+nor a failure and raises the exit status to `1`. One case is still proved without root: a
+port bound while the sensor's own unit is not running cannot be the sensor. A missing tool
+(`systemctl`, `ss`, `psql`) makes its checks `?` the same way. The firewall reading handles the
+common rule shapes (ufw `ALLOW IN` rules and default policy, firewalld ports and services of
+the active zones, nftables `dport ... accept` rules in input-hook chains); a rule written another
+way reads as closed, so treat a `closed` warning as a prompt to look, not a verdict.
+
+`upgrade.sh` runs it last, with `--report-only` (full report, exit status always `0`), so a
+finding is for you to read and never fails the upgrade. The sensors were restarted seconds
+earlier; if a LISTEN row shows `nothing listening` straight after an upgrade, run the check
+again once the units have settled.
+
 ## Live upgrade
 
 `deploy/upgrade.sh` (run as root, `sudo ./deploy/upgrade.sh`) performs an in-place upgrade:
 it rebuilds as the repo-owning user, reinstalls the binaries, runs `provision.sh`, reinstalls
 the unit files and logrotate config, runs `daemon-reload`, restarts each **sensor** unit that
 is enabled, then restarts `propolis.service` so sensors reconnect and migrations run against
-the new schema (`deploy/upgrade.sh`). See
+the new schema, and finishes with the report-only [configuration check](#configuration-check)
+(`deploy/upgrade.sh`). See
 [upgrade, rollback, and DR](./upgrade-rollback-and-dr.md).
 
 > **Warning - production impact.** `upgrade.sh` restarts live services and runs migrations.

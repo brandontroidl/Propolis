@@ -28,6 +28,23 @@
 
 ### Added
 
+- **`deploy/config-check.sh` compares the configuration with what is running** - five faults on
+  the production box were each found by accident: a typo in `PROPOLIS_SENSOR_LOGS`, MQTT's log
+  absent from that list, sensor-cred's PostgreSQL listener never producing a log (the host's own
+  PostgreSQL held 5432 while the firewall exposed it), `logrotate.timer` silently dead, and an
+  upgrade whose first run installed no new binary. The check is read-only and prints one row per
+  listener (unit, who holds the port, firewall, log age and size against the rotation size, the
+  `PROPOLIS_SENSOR_LOGS` entry as the daemon parses it, the newest ledger event) and an exact fix
+  line per failure. A firewall-open port held by something that is not the sensor is reported
+  first as `DANGEROUS`. Host rows cover the rotation timer and state file, the installed
+  binaries against the build and the deploy stamp, `watch.env` against `propolis.env`, and enabled
+  sensor units with no bind configured. It works without root and lists what that limited (`?`,
+  exit status `1`, never a pass); `--json` prints one document; exit `0` ok, `1` warnings, `2`
+  failures. `upgrade.sh` now runs it last with `--report-only`, so it can never fail an upgrade.
+  The listener derivation moved into `deploy/listeners-lib.sh`, which `fleet-listeners.sh` now
+  sources too, so the fleet inventory and the check share one table (the generated inventory is
+  byte-identical). No migration or wire change. See
+  [service lifecycle](docs/operations/service-lifecycle.md#configuration-check).
 - **Propolis rotates its own sensor logs, and alerts when rotation fails** - the policy in
   `/etc/logrotate.d/propolis-sensors` relied on the distribution's `logrotate.timer`, which was
   inactive for eleven days on the production box; nothing rotated, one telnet log reached 6.6 GB

@@ -19,6 +19,12 @@ by [Ports and protocols](../reference/ports-and-protocols.md).
 
 ## Nothing is being captured
 
+Run `sudo ./deploy/config-check.sh` first. It checks every step below for every listener at
+once (unit, port and its holder, firewall, log, the `PROPOLIS_SENSOR_LOGS` entry, newest
+ledger event) and prints an exact fix line per failure; see
+[service lifecycle](../operations/service-lifecycle.md#configuration-check). The manual steps
+follow for when you want to see one yourself.
+
 Work outward from the process:
 
 1. **Is the sensor running?** `systemctl status sensor-ssh` (etc.). A crash-loop

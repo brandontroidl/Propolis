@@ -507,8 +507,44 @@ button:hover { border-color: var(--text-muted); }
 .log-viewer { height: 65vh; min-height: 320px; overflow-y: auto; background: var(--bg); padding: 0.4rem 0; }
 .log-lines { display: flex; flex-direction: column; }
 .log-line {
-  display: flex; align-items: baseline; gap: 0.6rem; padding: 0.15rem 0.9rem;
-  font-family: var(--font-mono); font-size: 0.78rem; white-space: pre-wrap; word-break: break-word; border-left: 2px solid transparent;
+  font-family: var(--font-mono); font-size: 0.78rem; border-left: 2px solid transparent;
+}
+.log-summary {
+  display: flex; align-items: baseline; gap: 0.6rem; padding: 0.15rem 0.9rem 0.15rem 1.5rem;
+  white-space: pre-wrap; word-break: break-word; list-style: none;
+}
+/* An expandable row (one with fields, or a fold) carries a hand-drawn caret in the gutter, as the
+   session cards do; a plain row keeps the same indent so the columns still line up. */
+summary.log-summary { cursor: pointer; position: relative; }
+summary.log-summary::-webkit-details-marker { display: none; }
+summary.log-summary::before { content: "\25B8"; position: absolute; left: 0.75rem; color: var(--text-faint); font-size: 0.65rem; transition: transform 120ms ease; }
+.log-entry[open] > summary.log-summary::before { transform: rotate(90deg); }
+summary.log-summary:hover { background: var(--surface-raised); }
+.log-kv { white-space: nowrap; }
+/* Inline on the row each value is cut to a readable width; the expanded row shows it whole. */
+.log-summary .log-v { display: inline-block; max-width: 36ch; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; vertical-align: bottom; }
+.log-k { color: var(--text-faint); }
+.log-v { color: var(--info-text); }
+.log-more { color: var(--text-faint); }
+.log-count { display: inline-block; font-weight: 600; font-size: 0.7rem; color: var(--text); background: var(--surface-raised); border: 1px solid var(--border-bright); border-radius: var(--radius-sm); padding: 0 0.35em; margin-right: 0.2rem; }
+.log-detail { padding: 0.3rem 0.9rem 0.6rem 1.5rem; }
+.log-fields { display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 0.9rem; margin: 0; }
+.log-fields dt { color: var(--text-faint); }
+.log-fields dd { margin: 0; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.log-members { width: auto; }
+.log-members td { padding: 0.1rem 0.9rem 0.1rem 0; border: none; font-size: 0.74rem; vertical-align: top; }
+.log-members .log-kv { white-space: normal; word-break: break-word; }
+.log-hidden { margin: 0; padding: 0.45rem 0.95rem; font-size: 0.76rem; color: var(--text-muted); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 0.75rem; }
+.log-hidden[hidden] { display: none; }
+.log-hidden button { font-size: 0.7rem; padding: 0.15rem 0.55rem; }
+@media (max-width: 640px) {
+  /* Time, level and target share the first line; the message and its fields take the next. */
+  .log-summary { flex-wrap: wrap; gap: 0.1rem 0.5rem; padding-left: 1.3rem; }
+  .log-message { flex-basis: 100%; }
+  .log-target { max-width: 55%; }
+  .log-summary .log-v { max-width: 22ch; }
+  .log-detail { padding-left: 1.3rem; }
+  .log-kv { white-space: normal; }
 }
 .log-line.level-error { background: var(--alert-dim); border-left-color: var(--alert); }
 .log-line.level-warn { background: var(--attention-dim); border-left-color: var(--attention); }

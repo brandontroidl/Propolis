@@ -25,7 +25,7 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use console::auth::{self, PasswordStore, RateLimiter, SessionStore};
-use console::log_buffer::LogEntry;
+use console::log_buffer::{LogEntry, LogField};
 use console::{AppState, routes};
 use core_scoring::{EventInput, Protocol, SignalType, append_event};
 use futures::StreamExt;
@@ -4576,6 +4576,7 @@ async fn logs_page_renders_snapshot_with_level_based_markup(pool: PgPool) {
         level: "ERROR".to_string(),
         target: "propolis::intake".to_string(),
         message: "<script>alert(1)</script>".to_string(),
+        fields: Vec::new(),
     });
     let (_, cookie) = state.sessions.create();
     let app = test_app(state);
@@ -4656,6 +4657,10 @@ async fn logs_stream_is_sse_and_broadcasts_pushed_entries(pool: PgPool) {
         level: "WARN".to_string(),
         target: "propolis::review".to_string(),
         message: "queue scan degraded".to_string(),
+        fields: vec![LogField {
+            key: "reason".to_string(),
+            value: "statement timeout".to_string(),
+        }],
     });
 
     let mut body = response.into_body().into_data_stream();
@@ -4677,6 +4682,12 @@ async fn logs_stream_is_sse_and_broadcasts_pushed_entries(pool: PgPool) {
     assert!(
         text.contains(r#""message":"queue scan degraded""#),
         "expected the pushed entry's message in the SSE frame: {text}"
+    );
+    // The live stream carries the structured fields too, or a live line would lose what the
+    // page's first render shows.
+    assert!(
+        text.contains(r#""fields":[{"key":"reason","value":"statement timeout"}]"#),
+        "expected the pushed entry's fields in the SSE frame: {text}"
     );
 }
 
@@ -7253,4 +7264,95 @@ async fn detail_labels_the_transport_as_an_acronym(pool: PgPool) {
         !body.contains("Tcp") && !body.contains("Udp"),
         "a Rust enum name reached the page: {body}"
     );
+}
+
+fn log_entry(level: &str, target: &str, message: &str, fields: &[(&str, &str)]) -> LogEntry {
+    LogEntry {
+        timestamp: "2026-10-07T22:31:04.512+00:00".to_string(),
+        level: level.to_string(),
+        target: target.to_string(),
+        message: message.to_string(),
+        fields: fields
+            .iter()
+            .map(|(k, v)| LogField {
+                key: k.to_string(),
+                value: v.to_string(),
+            })
+            .collect(),
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_page_shows_fields_and_folds_repeated_info_runs(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let batch = |sensor, n| {
+        log_entry(
+            "INFO",
+            "intake",
+            "batch processed",
+            &[("sensor", sensor), ("ingested", n), ("rejected", "0")],
+        )
+    };
+    for entry in [
+        batch("telnet", "50"),
+        batch("vnc", "12"),
+        batch("telnet", "48"),
+        batch("telnet", "50"),
+        log_entry(
+            "WARN",
+            "sqlx::query",
+            "slow statement",
+            &[
+                ("statement", "SELECT count(*) FROM event"),
+                ("elapsed", "1.52s"),
+            ],
+        ),
+        batch("ssh", "7"),
+        batch("ssh", "9"),
+        log_entry(
+            "WARN",
+            "review::submit",
+            "submission held",
+            &[("reason", "vendor quota reached")],
+        ),
+    ] {
+        state.log_buffer.push(entry);
+    }
+
+    let (status, body) = get_page(state, "/logs").await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Four rows: the run of four, the WARN, the run of two, the second WARN. A fold that ignored
+    // adjacency would make one row of six.
+    assert_eq!(
+        body.matches(r#"<div class="log-line "#).count(),
+        4,
+        "{body}"
+    );
+    assert!(body.contains(">x4<"), "first run's count: {body}");
+    assert!(body.contains(">x2<"), "second run's count: {body}");
+    assert!(!body.contains(">x6<"), "runs across a WARN folded: {body}");
+    assert!(
+        body.contains(r#"<span class="log-v">telnet</span>/<span class="log-v">vnc</span>"#),
+        "the fold names the sensors it covers: {body}"
+    );
+    // Every folded entry's own fields stay reachable in the expanded row.
+    assert_eq!(
+        body.matches(r#"<span class="log-v">50</span>"#).count(),
+        3,
+        "{body}"
+    );
+    for field in [
+        "SELECT count(*) FROM event",
+        "1.52s",
+        "vendor quota reached",
+        ">statement<",
+        ">reason<",
+    ] {
+        assert!(body.contains(field), "missing {field}: {body}");
+    }
+    // Warnings are what the view opens on; the lower rows are counted, not lost.
+    assert!(body.contains(r#"<option value="WARN" selected>"#), "{body}");
+    assert!(body.contains("2 lower-level rows hidden"), "{body}");
 }

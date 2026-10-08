@@ -275,8 +275,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   connection's one `download_cap` marker is emitted and no further `honeypot_file_download` events;
   a refused re-entry, loop or nesting is a silent failure with status 1, never an error string. A connection that has written its 16 MiB is dropped after
   the reply that spent it.
-- A recognized fetch verb additionally emits `honeypot_file_download` with
-  `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell/mod.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
+- A fetch verb the line executes additionally emits `honeypot_file_download` with
+  `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell/mod.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell/fetch.rs#FakeShell::append_downloads`).
 - **Standard input.** The sensors run each line through `start_line`
   (`crates/sensor-framework/src/shell/mod.rs#FakeShell::start_line`), which decides by the
   shell's own model of the commands whether the line reads the session's input: it runs the line
@@ -327,7 +327,9 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   (`( )`, a pipeline stage, `$( )` and `&` get a copy of the working directory and variables;
   `{ }` does not). A trailing `&` runs the command at once and, in an interactive login shell,
   prints `[N] PID`. An unfinished construct waits for more input under the PS2 prompt `> ` (64
-  lines or 64 KiB at most). Constructs outside this subset (`case`, `[[ ]]`, functions, `$'..'`,
+  lines or 64 KiB at most). `case WORD in pat|pat) list ;; ... esac` runs the first arm whose
+  pattern matches (unquoted `*`, `?` and `[..]` glob, a quoted one is literal, a `/` matches);
+  no match is status 0. Constructs outside this subset (`[[ ]]`, functions, `$'..'`,
   `${x##*/}`, brace expansion, `<<<`, arrays) parse and are skipped with status 0 and no output;
   what bash and dash also reject prints their syntax error and status 2. `read`, `export`,
   `unset`, `set`, `shift`, `umask`, `break`, `continue`, `cd`, `exit` act on the shell itself
@@ -413,13 +415,32 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   URL), so none is invented. A name the banner does not list, `curl`
   included (real busybox ships none), gives `applet not found` - matching the real-busybox check
   Mirai/Gafgyt perform.
-- Download capture handles direct, busybox, full-path, and
-  `sh -c "wget ...; ..."` chained forms. A line is split into its simple commands
-  at `;`, `|`, `||`, `&&`, `&`, parentheses, backticks and newlines, each command
-  cut at its first redirection, and every fetcher in the line is examined; one
-  `honeypot_file_download` is emitted per distinct url, so a Mirai
-  `(tftp ... || busybox tftp ...) > t` fallback chain yields one event
-  (`download_targets`, `simple_commands`).
+- Download events come from what a line executes
+  (`crates/sensor-framework/src/shell/fetch.rs`). When the evaluator runs a simple command whose
+  expanded argument vector is a fetch (`wget`, `curl`, `tftp`, `ftpget`, direct, full-path or
+  `busybox` forms, a bare `tftp` the persona has no file for included), the event is built from
+  those arguments, so a fetch in a loop, a script run by `sh FILE` or `sh -c`, a command
+  substitution, or after a variable assignment or a `case` that chose the binary's name reports the
+  URL it named (`for a in mips arm; do wget http://h/$a; done` gives two events). Text that merely
+  holds a fetch (an `echo` or `printf` argument, a here-document body, a quoted assignment) reports
+  nothing; the script a bot writes with `echo ... >> f` is captured as before and reports its
+  fetches on the line that runs it. A URL left holding `$name`, `${..}`, `$(..)` or a backtick, or
+  built from a variable that is not set, is not a url: the event carries the command as written and
+  no `url`. One event per distinct fetch per input line, the whole line (every script it runs)
+  sharing the 8-per-line cap and the connection's 64, so a Mirai `(tftp ... || busybox tftp ...) >
+  t` fallback chain yields one event.
+  A lexical pass over the line's text is kept as a fallback for evidence the evaluator did not
+  reach: a branch the fake's answers skipped (`test -f x && wget URL`), functions and the other
+  constructs outside the grammar subset (functions never run, so a fetch in one is found only
+  here), a syntax error, an exhausted budget. It reads the text with the shell's own tokenizer
+  (quotes and here-documents honoured), looks only at command position (after `if`/`then`/`do`,
+  assignments and `nohup`/`env`/`sudo`/`toybox`-style wrappers) and inside `sh -c 'script'`, and
+  adds nothing for a URL the line also executed; a fallback command holding `$name` is reported
+  only when the line executed no fetch. Text the tokenizer cannot read (an unterminated quote) is
+  scanned by the older whole-line heuristic. A line that only opens a construct (`for ...; do`
+  waiting for `done`, a here-document) reports nothing until the construct completes, and one never
+  completed reports nothing
+  (`crates/sensor-framework/src/shell/fetch.rs#FakeShell::append_downloads`).
 - Echo-loader reassembly (`crates/sensor-framework/src/shell/loader.rs`). A Mirai or Mozi loader
   with no usable `wget` uploads a small downloader as `busybox echo -ne '\xNN...' > .i`, then
   `>> .i` per chunk, makes it executable (`chmod 777 .i`, or `cp /bin/ls .j && cat .i>.j && rm .i

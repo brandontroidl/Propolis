@@ -41,10 +41,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use sensor_wire::{
-    PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_FILE_DOWNLOAD, SensorEvent,
-    WIRE_VERSION,
-};
+use sensor_wire::{PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SensorEvent, WIRE_VERSION};
 
 use crate::binaries;
 use crate::budget::{ConnectionBudget, Resource};
@@ -69,6 +66,9 @@ mod dd;
 mod envtools;
 mod eval;
 mod expand;
+mod fetch;
+#[cfg(test)]
+mod fetch_tests;
 mod fileinfo;
 mod fsops;
 mod grep;
@@ -433,6 +433,10 @@ pub struct FakeShell {
     /// The running command was started by `env`, not by the shell: its environment is the one
     /// `env` built, with no `_` that only bash adds.
     env_launch: bool,
+    /// What the current input line fetched, for its `honeypot_file_download` events.
+    fetches: fetch::LineFetches,
+    /// A word being expanded held a variable that is not set (see `FakeShell::expand_argv_flagged`).
+    unset_seen: bool,
 }
 
 /// The most entries `history` keeps: Ubuntu's stock `.bashrc` sets `HISTSIZE=1000`.
@@ -628,6 +632,8 @@ impl FakeShell {
             timing: timing::Timing::default(),
             history: Vec::new(),
             env_launch: false,
+            fetches: fetch::LineFetches::default(),
+            unset_seen: false,
         };
         shell.install_processes();
         shell.install_session_env();
@@ -690,6 +696,8 @@ impl FakeShell {
                 timing: self.timing,
                 history: self.history.clone(),
                 env_launch: self.env_launch,
+                fetches: self.fetches.clone(),
+                unset_seen: self.unset_seen,
             }),
         }
     }
@@ -883,6 +891,7 @@ impl FakeShell {
             return (CommandResult::silent(0), Vec::new());
         };
         let output = self.run_input(&decoded);
+        self.append_downloads(&mut events);
         self.end_input(&mut events, true);
         self.flush_loader(&mut events);
         self.gate_events(&mut events);
@@ -914,6 +923,7 @@ impl FakeShell {
         let output = self.run_input(&decoded);
         if !self.stdin.is_blocked() {
             self.stdin = Stdin::Terminal;
+            self.append_downloads(&mut events);
             self.end_input(&mut events, true);
             self.flush_loader(&mut events);
             self.gate_events(&mut events);
@@ -921,10 +931,14 @@ impl FakeShell {
         }
         // The run that found the wait is undone, but what it decided still describes the line,
         // and a stage-2 URL it derived goes out with the line's other events now, as they do.
+        // So do the fetches it executed before it waited, with the text of the whole line.
         let trace = std::mem::take(&mut self.trace);
         let derived = std::mem::take(&mut self.loader_line.urls);
+        let fetched = std::mem::take(&mut self.fetches);
         self.rollback(saved);
         self.trace = trace;
+        self.fetches = fetched;
+        self.append_downloads(&mut events);
         self.held = Some(HeldLine {
             decoded,
             command: sanitize_value(&raw, MAX_COMMAND_LEN),
@@ -1141,60 +1155,12 @@ impl FakeShell {
                 );
                 obj.insert("xor_key".to_string(), serde_json::json!(k));
             }
-            let mut evs = vec![self.command_event(metadata)];
+            let evs = vec![self.command_event(metadata)];
             self.trace.events.push(TraceEventKind::CommandExec);
-            // Scanning the line for fetch targets is linear in its length.
+            // The line's download events are built once it has run (see `fetch`); scanning its
+            // text for the ones it did not execute is linear in its length.
             self.charge_work(len_u64(decoded.len()));
-            let per_line_cap = self.budget().limits().download_per_line;
-            let mut recorded_this_line: u64 = 0;
-            let mut download_capped = false;
-            for fetch in download_targets(&decoded) {
-                // The per-line cap is tested first so a URL refused by it spends none of the
-                // connection's allowance.
-                if recorded_this_line >= per_line_cap {
-                    self.record_hit(BudgetHit::DownloadPerLine);
-                    download_capped = true;
-                    break;
-                }
-                if !self.budget().download_allowed() {
-                    download_capped = true;
-                    break;
-                }
-                recorded_this_line = recorded_this_line.saturating_add(1);
-                self.trace.events.push(TraceEventKind::FileDownload);
-                let metadata = match &fetch {
-                    Fetch::Url(url) => serde_json::json!({
-                        "protocol_label": self.ctx.protocol_label,
-                        "url": sanitize_value(url, MAX_URL_LEN),
-                    }),
-                    Fetch::Unparsed(raw) => serde_json::json!({
-                        "protocol_label": self.ctx.protocol_label,
-                        "command": sanitize_value(raw, MAX_COMMAND_LEN),
-                    }),
-                };
-                evs.push(SensorEvent {
-                    v: WIRE_VERSION,
-                    source_ip: self.ctx.source_ip,
-                    wan_ip: self.ctx.wan_ip,
-                    sensor: self.ctx.protocol_label.clone(),
-                    signal_type: SIGNAL_HONEYPOT_FILE_DOWNLOAD.into(),
-                    protocol: PROTO_TCP.into(),
-                    authenticated: self.ctx.authenticated,
-                    observed_at: (self.clock)(),
-                    metadata,
-                    sample: None,
-                    session_id: self.ctx.session_id,
-                    occurrence_id: None,
-                });
-            }
-            if download_capped && self.budget().claim_download_cap_marker() {
-                self.trace.events.push(TraceEventKind::FloodDownloadCap);
-                evs.push(self.command_event(serde_json::json!({
-                    "protocol_label": self.ctx.protocol_label,
-                    "command": "<download cap reached; further download events suppressed>",
-                    "flood": "download_cap",
-                })));
-            }
+            self.enable_fetches();
             evs
         };
         Some((decoded, events))
@@ -1267,6 +1233,8 @@ impl FakeShell {
         self.piped_typed = false;
         self.decoded = None;
         self.loader_line = loader::LineLoader::default();
+        self.fetches = fetch::LineFetches::default();
+        self.unset_seen = false;
         self.import_assembled();
         self.refresh_clock_nodes();
     }
@@ -1284,6 +1252,7 @@ impl FakeShell {
         if self.context == ShellContext::ExecC {
             // An exec request is one complete command string, as `bash -c` gets it: there is no
             // next line to finish an open construct, so it is parsed whole.
+            self.note_unit(decoded);
             return self.run_script_text(decoded);
         }
         let mut result = CommandResult::silent(0);

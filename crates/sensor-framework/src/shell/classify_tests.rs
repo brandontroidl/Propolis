@@ -88,7 +88,7 @@ fn canned_and_unsupported_lines_are_partial() {
     for line in [
         "wget -q http://203.0.113.9/x",
         "curl http://203.0.113.9/x",
-        "echo hi; case x in x) echo hi;; esac",
+        "echo hi; [[ -f /etc/hostname ]]",
     ] {
         assert_eq!(class_of(&mut sh, line), "partial", "{line}");
     }
@@ -237,7 +237,7 @@ fn classify_precedence_is_parse_limit_unknown_partial_supported() {
     parent.reentry.push(unknown());
     assert_eq!(line_of(vec![parent]).classify(), CommandClass::Unknown);
     let mut skipped = CommandTrace::open(&[], ParseNode::Unsupported, HandlerId::Compound);
-    skipped.unsupported = Some(UnsupportedKind::Case);
+    skipped.unsupported = Some(UnsupportedKind::DoubleBracket);
     assert_eq!(line_of(vec![skipped]).classify(), CommandClass::Partial);
 }
 

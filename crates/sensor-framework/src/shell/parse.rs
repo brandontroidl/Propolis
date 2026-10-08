@@ -22,7 +22,7 @@
 )]
 
 use super::ast::{
-    AndOr, AndOrOp, Assign, Command, Line, List, ListItem, Near, Pipeline, Redir, RedirOp,
+    AndOr, AndOrOp, Assign, CaseArm, Command, Line, List, ListItem, Near, Pipeline, Redir, RedirOp,
     RedirTarget, SimpleCommand, SyntaxError, UnsupportedKind, Word, WordPart, word_unsupported,
 };
 use super::eval::LineBudget;
@@ -157,6 +157,8 @@ type PResult<T> = Result<T, PErr>;
 enum Stop {
     Words(&'static [&'static str]),
     RParen,
+    /// The body of a `case` arm: ends at `;;` or at `esac`.
+    CaseArm,
 }
 
 struct Parser<'a> {
@@ -320,6 +322,9 @@ impl Parser<'_> {
             let at_stop = match stop {
                 Stop::Words(words) => keyword(tok).is_some_and(|k| words.contains(&k)),
                 Stop::RParen => matches!(tok.tok, Tok::Op(Op::RParen)),
+                Stop::CaseArm => {
+                    matches!(tok.tok, Tok::Op(Op::DSemi)) || keyword(tok) == Some("esac")
+                }
             };
             if at_stop {
                 if items.is_empty() {
@@ -343,12 +348,14 @@ impl Parser<'_> {
                         }
                         // The stop token itself ends the item: `( a )`.
                         Tok::Op(Op::RParen) if matches!(stop, Stop::RParen) => (false, line),
+                        Tok::Op(Op::DSemi) if matches!(stop, Stop::CaseArm) => (false, line),
                         _ => {
                             let closes = match stop {
                                 Stop::Words(words) => {
                                     self.peek_keyword().is_some_and(|k| words.contains(&k))
                                 }
                                 Stop::RParen => false,
+                                Stop::CaseArm => self.peek_keyword() == Some("esac"),
                             };
                             if !closes {
                                 return Err(self.unexpected());
@@ -456,7 +463,7 @@ impl Parser<'_> {
                 Some("while") => self.while_command(false),
                 Some("until") => self.while_command(true),
                 Some("{") => self.brace_command(),
-                Some("case") => self.skip_case(),
+                Some("case") => self.case_command(),
                 Some("[[") => self.skip_double_bracket(),
                 Some("function") => self.function_keyword(),
                 Some("coproc") => self.skip_coproc(),
@@ -869,33 +876,90 @@ impl Parser<'_> {
         }
     }
 
-    /// `case ... esac`: skipped whole.
-    fn skip_case(&mut self) -> PResult<Command> {
+    fn case_command(&mut self) -> PResult<Command> {
+        self.enter()?;
+        let result = self.case_inner();
+        self.leave();
+        result
+    }
+
+    /// `case WORD in [(] pattern [| pattern]... ) [list] ;; ... esac`. The last arm may end at
+    /// `esac` instead of `;;`.
+    fn case_inner(&mut self) -> PResult<Command> {
         self.pos = self.pos.saturating_add(1);
-        let mut depth = 1u32;
-        let mut previous_ends_item = false;
+        let word = match self.peek().map(|t| &t.tok) {
+            None => return Err(PErr::Need),
+            Some(Tok::Word(word)) => word.clone(),
+            Some(_) => return Err(self.unexpected()),
+        };
+        self.pos = self.pos.saturating_add(1);
+        self.skip_newlines();
+        match self.peek() {
+            None => return Err(PErr::Need),
+            Some(tok) if keyword(tok) == Some("in") => self.pos = self.pos.saturating_add(1),
+            Some(_) => return Err(self.unexpected()),
+        }
+        let mut arms = Vec::new();
         loop {
+            self.skip_newlines();
             let Some(tok) = self.peek() else {
                 return Err(PErr::Need);
             };
-            match keyword(tok) {
-                Some("case") if previous_ends_item => depth = depth.saturating_add(1),
-                Some("esac") if previous_ends_item => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        self.pos = self.pos.saturating_add(1);
-                        self.redirections()?;
-                        return Ok(Command::Unsupported(UnsupportedKind::Case));
-                    }
-                }
-                _ => {}
+            if keyword(tok) == Some("esac") {
+                self.pos = self.pos.saturating_add(1);
+                break;
             }
-            previous_ends_item = matches!(
-                tok.tok,
-                Tok::Newline | Tok::Op(Op::Semi | Op::DSemi | Op::LParen | Op::RParen)
-            );
-            self.pos = self.pos.saturating_add(1);
+            if matches!(tok.tok, Tok::Op(Op::LParen)) {
+                self.pos = self.pos.saturating_add(1);
+            }
+            let mut patterns = Vec::new();
+            loop {
+                match self.peek().map(|t| &t.tok) {
+                    None => return Err(PErr::Need),
+                    Some(Tok::Word(pattern)) => patterns.push(pattern.clone()),
+                    Some(_) => return Err(self.unexpected()),
+                }
+                self.pos = self.pos.saturating_add(1);
+                match self.peek_op() {
+                    Some(Op::Pipe) => self.pos = self.pos.saturating_add(1),
+                    Some(Op::RParen) => {
+                        self.pos = self.pos.saturating_add(1);
+                        break;
+                    }
+                    _ if self.peek().is_none() => return Err(PErr::Need),
+                    _ => return Err(self.unexpected()),
+                }
+            }
+            self.skip_newlines();
+            let ends = |parser: &Self| {
+                matches!(parser.peek_op(), Some(Op::DSemi)) || parser.peek_keyword() == Some("esac")
+            };
+            let body = if self.peek().is_some() && ends(self) {
+                List::default()
+            } else {
+                self.list(Stop::CaseArm)?
+            };
+            arms.push(CaseArm { patterns, body });
+            if matches!(self.peek_op(), Some(Op::DSemi)) {
+                self.pos = self.pos.saturating_add(1);
+            } else if self.peek_keyword() != Some("esac") {
+                return Err(if self.peek().is_none() {
+                    PErr::Need
+                } else {
+                    self.unexpected()
+                });
+            }
         }
+        let redirs = self.redirections()?;
+        let unsupported = word_unsupported(&word).or_else(|| {
+            arms.iter()
+                .flat_map(|arm| arm.patterns.iter())
+                .find_map(word_unsupported)
+        });
+        if let Some(kind) = unsupported {
+            return Ok(Command::Unsupported(kind));
+        }
+        Ok(Command::Case { word, arms, redirs })
     }
 
     /// `[[ ... ]]`: skipped whole.
@@ -980,6 +1044,7 @@ fn add_stderr_merge(command: &mut Command) {
         | Command::Brace { redirs, .. }
         | Command::If { redirs, .. }
         | Command::For { redirs, .. }
+        | Command::Case { redirs, .. }
         | Command::While { redirs, .. } => redirs.push(merge),
         Command::Unsupported(_) => {}
     }
@@ -1167,11 +1232,7 @@ mod tests {
     #[test]
     fn every_unsupported_construct_parses_to_unsupported_without_an_error() {
         for (src, kind) in [
-            ("case x in a) echo;; esac", UnsupportedKind::Case),
-            (
-                "case x in a) case y in b) :;; esac;; esac",
-                UnsupportedKind::Case,
-            ),
+            ("case ${x##*/} in a) :;; esac", UnsupportedKind::ParamOp),
             ("[[ -f x && -d y ]]", UnsupportedKind::DoubleBracket),
             ("f() { echo hi; }", UnsupportedKind::Function),
             ("function f { echo hi; }", UnsupportedKind::Function),
@@ -1185,6 +1246,43 @@ mod tests {
             ("cat <(id)", UnsupportedKind::ProcessSubstitution),
         ] {
             assert_eq!(only_command(src), Command::Unsupported(kind), "{src}");
+        }
+    }
+
+    #[test]
+    fn case_parses_its_arms_in_every_spelling() {
+        for src in [
+            "case x in a) echo;; esac",
+            "case x in (a|b) echo; ;; esac",
+            "case x in a) echo\nesac",
+            "case x\nin\n  a|b)\n    echo\n    ;;\n  *) ;;\nesac",
+            "case x in a) case y in b) :;; esac;; esac",
+            "case x in a)U=1;;b)U=2;; esac",
+        ] {
+            let Command::Case { arms, .. } = only_command(src) else {
+                panic!("{src} is a case");
+            };
+            assert!(!arms.is_empty(), "{src}");
+        }
+        let Command::Case { arms, .. } = only_command("case x in a|b) echo;; *) ;; esac") else {
+            panic!("a case");
+        };
+        assert_eq!(arms[0].patterns.len(), 2);
+        assert!(
+            arms[1].body.items.is_empty(),
+            "an empty arm has no commands"
+        );
+    }
+
+    #[test]
+    fn an_open_case_needs_more_input() {
+        for src in [
+            "case x in",
+            "case x in a)",
+            "case x in a) echo;;",
+            "case x in a) echo",
+        ] {
+            assert_eq!(parse(src).tail, Tail::NeedMore, "{src}");
         }
     }
 

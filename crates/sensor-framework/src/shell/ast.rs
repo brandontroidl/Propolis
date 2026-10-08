@@ -81,7 +81,6 @@ pub(super) struct ParamDefault {
 /// Why a construct is outside the subset. Only the trace reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum UnsupportedKind {
-    Case,
     DoubleBracket,
     Function,
     AnsiCQuote,
@@ -161,8 +160,21 @@ pub(super) enum Command {
         until: bool,
         redirs: Vec<Redir>,
     },
+    Case {
+        word: Word,
+        arms: Vec<CaseArm>,
+        redirs: Vec<Redir>,
+    },
     /// Parsed and skipped: status 0, no output, no diagnostic.
     Unsupported(UnsupportedKind),
+}
+
+/// One `pattern|pattern) list ;;` arm of a `case`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CaseArm {
+    pub patterns: Vec<Word>,
+    /// Empty for an arm with no commands (`x) ;;`).
+    pub body: List,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

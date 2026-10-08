@@ -88,7 +88,13 @@ pub(super) fn parse(args: &[&str]) -> Tftp {
         Some(command) => classic_command(&positional, &command),
         None if op == Op::Put => unparsed(Op::Put),
         None => {
-            let save = local.clone().or_else(|| remote.clone());
+            // BusyBox names the local file after the last component of the remote one
+            // (networking/tftp.c, 1.30: `local_file = strrchr(remote_file, '/') + 1`).
+            let save = local.clone().or_else(|| {
+                remote
+                    .as_deref()
+                    .map(|r| r.rsplit('/').next().unwrap_or(r).to_string())
+            });
             let file = remote.or(local);
             let url = positional.first().and_then(|host| {
                 build_url(host, positional.get(1).map(String::as_str), file.as_deref())

@@ -249,9 +249,10 @@ mod echo_tests {
 mod shell_detection_tests {
     use crate::fakefs::FakeFs;
     use crate::shell::{
-        EmitContext, FakeShell, OutputFd, SIGNAL_HONEYPOT_FILE_DOWNLOAD, busybox::is_applet,
-        cmd_curl, cmd_uname, cmd_wget, download_target, onlcr, simple_commands, url_if_fetch_line,
+        EmitContext, FakeShell, OutputFd, busybox::is_applet, cmd_curl, cmd_uname, cmd_wget,
+        download_target, onlcr, simple_commands, url_if_fetch_line,
     };
+    use sensor_wire::SIGNAL_HONEYPOT_FILE_DOWNLOAD;
 
     fn shell() -> FakeShell {
         FakeShell::new(

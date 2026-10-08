@@ -477,6 +477,23 @@ tr.queue-context:hover td { background: transparent; }
 .ctx-chip { font-family: var(--font-mono); font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: var(--radius-sm); background: var(--surface-raised); border: 1px solid var(--border); color: var(--text); }
 .ctx-item { display: inline-flex; align-items: center; gap: 0.35rem; vertical-align: middle; }
 .ctx-notable code { color: var(--text); font-size: 0.74rem; overflow-wrap: anywhere; }
+.ctx-campaign a { color: var(--link); }
+
+/* Campaigns: labels and indicators are attacker text, so they wrap anywhere rather than widen a table. */
+.campaign-label { overflow-wrap: anywhere; }
+.ioc-value { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text); overflow-wrap: anywhere; }
+.ioc-copy { white-space: nowrap; margin-left: 0.4rem; }
+.copy-btn { font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: var(--radius-sm); background: var(--surface-raised); border: 1px solid var(--border); color: var(--text-muted); cursor: pointer; }
+.copy-btn:hover { color: var(--text); border-color: var(--border-bright); }
+.copy-btn--live { color: var(--alert-text); }
+.offscreen-copy { position: fixed; left: -9999px; top: 0; opacity: 0; }
+.spark { display: block; overflow: visible; }
+.spark rect { fill: var(--chart-line); }
+.spark--wide { margin: 0.4rem 0; }
+.shape-list { margin: 0.4rem 0 0.4rem 1.4rem; padding: 0; font-size: 0.78rem; }
+.shape-list li { overflow-wrap: anywhere; margin: 0.1rem 0; }
+.approve-list { columns: 3 14rem; margin: 0.6rem 0 1rem 1.2rem; padding: 0; font-size: 0.8rem; }
+.campaign-refs { margin: 0.2rem 0 0.2rem 1.2rem; padding: 0; }
 
 /* -- Attackers paging and the tier/score note above the table -- */
 .ips-count { margin-bottom: 0.6rem; }

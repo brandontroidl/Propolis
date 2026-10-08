@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Campaigns - Propolis{% endblock %}
+{% block content %}
+<h1>Campaigns <span class="dim">({{ total }})</span></h1>
+<p class="page-sub">Addresses grouped by what they did: the same captured sample, the same command sequence, or one address reaching several services within an hour. Labels and commands are attacker data, shown as text.</p>
+<div class="tab-bar">
+  <a href="/campaigns" class="tab {% if not kind %}active{% endif %}">All</a>
+  {% for t in tabs %}
+  <a href="/campaigns?kind={{ t.value }}" class="tab {% if kind == t.value %}active{% endif %}">{{ t.label | capitalize }}</a>
+  {% endfor %}
+</div>
+{% if indexer_behind > 0 %}
+<p class="table-note">The campaign indexer has read the ledger through event {{ indexed }} of {{ newest }}; {{ indexer_behind }} newer events are not grouped yet.</p>
+{% endif %}
+{% if total > shown_limit %}
+<p class="table-note">showing the {{ shown_limit }} most recently active of {{ total }}</p>
+{% endif %}
+{% if campaigns %}
+<div class="table-wrap">
+<table class="table-compact">
+  <thead>
+    <tr><th>Campaign</th><th>Rule</th><th class="count">Hosts</th><th>Hosts per day <span class="dim">last {{ spark_days }} days</span></th><th>First seen</th><th>Last seen</th><th>Top sensors</th><th>Samples</th></tr>
+  </thead>
+  <tbody>
+    {% for c in campaigns %}
+    <tr>
+      <td class="campaign-label"><a href="/campaigns/{{ c.id }}">{{ c.label }}</a>{% if c.role == "infected host" %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}</td>
+      <td>{{ c.kind }}</td>
+      <td class="count">{{ c.members }}</td>
+      <td>
+        <svg class="spark" width="{{ spark_width }}" height="{{ spark_height }}" viewBox="0 0 {{ spark_width }} {{ spark_height }}" role="img" aria-label="distinct hosts per day">
+          {% for b in c.spark %}<rect x="{{ b.x }}" y="{{ b.y }}" width="4" height="{{ b.h }}"><title>{{ b.day }}: {{ b.hosts }}</title></rect>{% endfor %}
+        </svg>
+      </td>
+      <td class="seen">{{ c.first_seen }}</td>
+      <td class="seen">{{ c.last_seen }}</td>
+      <td><span class="ctx-sensors">{% for s in c.sensors %}<span class="ctx-chip">{{ s.label }}</span>{% endfor %}</span></td>
+      <td class="mono">
+        {% for s in c.samples %}<a href="/samples/{{ s.sha256 }}" title="{{ s.sha256 }}">{{ s.short }}</a>{% if not loop.last %} {% endif %}{% endfor %}
+        {% if c.more_samples > 0 %}<span class="dim">+{{ c.more_samples }}</span>{% endif %}
+        {% if not c.samples %}<span class="dim">-</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty-line">no campaigns{% if kind %} of this kind{% endif %} yet</p>
+{% endif %}
+{% endblock %}

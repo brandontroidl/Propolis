@@ -25,7 +25,7 @@ defaults live in [../reference/environment-variables.md](../reference/environmen
 The router builds two groups. The **protected** group (dashboard, queue, detail, feed,
 search, ips, integrity, samples, logs) is wrapped with the `require_session` middleware
 via `route_layer`. The **public** group (health, ready, metrics, login, logout, fonts) is
-mounted outside that layer. In total **34 routes: 8 public, 26 session-gated**.
+mounted outside that layer. In total **39 routes: 8 public, 31 session-gated**.
 
 `require_session` reads the `propolis_session` cookie and calls `sessions.validate`; on a
 valid session it continues, and on any missing/invalid session it returns a **302 redirect

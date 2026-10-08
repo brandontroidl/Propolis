@@ -81,6 +81,12 @@ After startup, the daemon spawns each subsystem via `spawn_supervised` under a s
    **Sample retention** - always spawned (`sample-retention`): hourly, deletes spooled
    bodies older than 30 days from every body directory, independent of VirusTotal
    (`crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`).
+   **Campaign indexer** - always spawned (`campaigns`): every 15 s, or every 0.5 s while it
+   works through a backlog, folds up to 25 batches of 2,000 ledger rows into the campaign tables,
+   links downloads to fetched samples and extracts indicators from up to 16 captured artifacts;
+   off the append path, and a shutdown waits for one batch at most
+   (`crates/propolis/src/main.rs#CAMPAIGN_TICK_INTERVAL`, `crates/review/src/campaign/mod.rs#run_tick`;
+   [campaigns](../operations/campaigns.md)).
 5. **Malware fetcher** - if `fetch_enabled`: an SSRF-guarded staging-server fetcher that
    is **fail-closed on an empty `own_ips`**, enforces its per-host and daily caps in the
    database when a cycle claims rows, so they hold across restarts and across nodes

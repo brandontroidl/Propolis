@@ -129,7 +129,39 @@
       e.preventDefault();
       window.history.back();
     }
+    var copyEl = e.target.closest && e.target.closest('[data-copy]');
+    if (copyEl) {
+      e.preventDefault();
+      copyText(copyEl.getAttribute('data-copy'), copyEl);
+    }
   });
+
+  // ---- indicator copy buttons -----------------------------------------------
+  // Copies the button's data-copy text. The clipboard API needs a secure context (loopback or
+  // TLS); anywhere else a selected off-screen textarea and execCommand do the job. The button says
+  // whether it worked rather than failing silently.
+  function copyText(text, button) {
+    function done(ok) {
+      var label = button.getAttribute('data-label') || button.textContent;
+      button.setAttribute('data-label', label);
+      button.textContent = ok ? 'copied' : 'copy failed';
+      setTimeout(function () { button.textContent = label; }, 1500);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+      return;
+    }
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.className = 'offscreen-copy';
+    document.body.appendChild(area);
+    area.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+    document.body.removeChild(area);
+    done(ok);
+  }
 
   // A button that asks for confirmation renders disabled and is enabled only here, once the
   // listener above exists: before that a click would submit without asking, and a delete cannot be

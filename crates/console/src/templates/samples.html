@@ -29,11 +29,11 @@
   {# "Transport" is how the fetcher's connection for this body was authenticated, per source URL:
      an unverified-TLS or plaintext fetch is evidence an on-path party could have altered in
      transit. A sensor upload was not fetched, so it has none. #}
-  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>Source <span class="dim">uploader, or first reporter of a fetched URL</span></th><th>Transport <span class="dim">fetched bodies</span></th><th>VirusTotal</th><th></th></tr></thead>
+  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>Source <span class="dim">uploader, or first reporter of a fetched URL</span></th><th>Transport <span class="dim">fetched bodies</span></th><th>Campaign</th><th>VirusTotal</th><th></th></tr></thead>
   <tbody>
     {% for s in samples %}
     <tr>
-      <td class="mono" title="{{ s.sha256 }}">{{ s.sha256_short }}...</td>
+      <td class="mono" title="{{ s.sha256 }}"><a href="/samples/{{ s.sha256 }}">{{ s.sha256_short }}...</a></td>
       <td class="mono">{{ s.size }}</td>
       <td>{{ s.sensor }}</td>
       <td class="ip">
@@ -49,6 +49,13 @@
           <span class="sev-tags">{% for t in s.transport %}{% if t.sev %}<span class="sev sev--{{ t.sev }}"{% if t.detail %} title="{{ t.detail }}"{% endif %}>{{ t.label }}</span>{% else %}<span class="dim">{{ t.label }}</span>{% endif %}{% endfor %}</span>
         {% else %}
           <span class="dim">not fetched</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if s.campaign %}
+          <a href="/campaigns/{{ s.campaign.id }}">{{ s.campaign.members }} host{% if s.campaign.members != 1 %}s{% endif %}</a>{% if s.campaign.role == "infected host" %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
+        {% else %}
+          <span class="dim">-</span>
         {% endif %}
       </td>
       <td>

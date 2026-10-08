@@ -233,7 +233,8 @@ mod tests {
                 // Spawned only when PROPOLIS_FLEET_PROBE_ENABLED is on, but named here
                 // unconditionally: the classification decides how a give-up pages, and it must not
                 // depend on a config value the ops-monitor cannot see.
-                "listener-probe"
+                "listener-probe",
+                "campaigns"
             ],
         );
         // The real deployed sensor names (INSTALL.md) must all classify as sensors.

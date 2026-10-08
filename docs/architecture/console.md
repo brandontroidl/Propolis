@@ -40,7 +40,7 @@ same router.
   `require_session` middleware via `.route_layer(...)` so every route in it is
   session-gated.
 
-There are **34 routes: 8 public, 26 session-gated**. See
+There are **39 routes: 8 public, 31 session-gated**. See
 [reference/console-routes.md](../reference/console-routes.md) for the table.
 
 ## No in-process TLS

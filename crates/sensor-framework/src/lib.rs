@@ -14,6 +14,7 @@ pub mod command_codec;
 pub mod command_flood;
 pub mod config;
 pub mod coverage;
+pub mod elf_body;
 pub mod emit;
 pub mod env;
 pub mod etc;

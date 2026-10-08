@@ -4,6 +4,21 @@
 
 ### Fixed
 
+- **Modeled binaries survive inspection** - every executable the Ubuntu persona serves was its
+  recorded 64-byte header followed by `0x80 | (offset & 0x3f)` filler, identical for every
+  binary, so `busybox cat /proc/self/exe` flooded two megabytes of U+FFFD and `readelf` found
+  noise where the program headers belong. The body is now generated from the recorded header
+  (`crates/sensor-framework/src/elf_body.rs`): program headers that match the sections,
+  `.interp`, a per-binary build ID, libc imports with their `GLIBC_2.x` versions, relocations,
+  `.dynamic`, usage strings for the program, instruction-shaped `.text` and the section header
+  table at the recorded offset. `readelf -lhSdV --dyn-syms` parses all 84 images without a
+  warning, `file` reports a dynamically linked PIE with the x86-64 loader (busybox, recorded as a
+  static `ET_EXEC`, reports statically linked), and `strings` shows the loader, imports, versions
+  and usage line. Still generated per byte in constant memory at the recorded size; no real
+  binary is shipped. `/bin/ls` keeps its first newline at 409. A whole-file `busybox hexdump -e
+  '16/1 "%c"'` without `-v` of a binary now prints nothing (the image has the zero runs the real
+  tool squeezes to `*`, which is not modeled). The bytes of every image changed, so its digests
+  did: any stored fingerprint of a served binary is stale.
 - **Shell `tftp` downloads are read in every common form** - a telnet dropper's classic
   `tftp HOST -c get FILE` was recorded as `tftp://HOST:get` (the `-c get` pair taken for a port, the
   file name lost), while the BusyBox form was right. The shell now parses BusyBox
@@ -30,8 +45,9 @@
 
 - **`deploy/config-check.sh` compares the configuration with what is running** - five faults on
   the production box were each found by accident: a typo in `PROPOLIS_SENSOR_LOGS`, MQTT's log
-  absent from that list, sensor-cred's PostgreSQL listener never producing a log (the host's own
-  PostgreSQL held 5432 while the firewall exposed it), `logrotate.timer` silently dead, and an
+  absent from that list, sensor-cred's PostgreSQL listener never producing a log (with 5432 open in
+  the firewall; the likely cause, another process holding the port, is exactly what the new check
+  names), `logrotate.timer` silently dead, and an
   upgrade whose first run installed no new binary. The check is read-only and prints one row per
   listener (unit, who holds the port, firewall, log age and size against the rotation size, the
   `PROPOLIS_SENSOR_LOGS` entry as the daemon parses it, the newest ledger event) and an exact fix
@@ -45,6 +61,26 @@
   sources too, so the fleet inventory and the check share one table (the generated inventory is
   byte-identical). No migration or wire change. See
   [service lifecycle](docs/operations/service-lifecycle.md#configuration-check).
+- **Campaigns** - addresses doing the same thing are grouped into one campaign: the same captured
+  sample (a worm copying itself), the same normalized command sequence (addresses, ports, markers
+  and payload runs replaced, repeats collapsed; the w.sh script, the 45-command survey, Mirai
+  loaders), or three sensors reached from one address within an hour. A bounded background
+  indexer (`campaigns` subsystem) builds them from the ledger past a cursor, off the append path
+  (migration `0015`, no backfill; it reads an existing ledger at about 6,000 events a second after
+  the upgrade). New `/campaigns` and `/campaigns/{id}` pages; the review queue, IP and Samples
+  pages link to an address's or sample's campaign; `/samples/{sha256}` shows a sample's
+  campaigns and indicators. Approving a campaign's pending members is one explicit action that
+  lists them first and approves only the listed ones still pending. A sample campaign whose script
+  scans for and copies itself to new hosts shows its members as infected hosts on the console; the
+  vendor submission wording is unchanged. See `docs/operations/campaigns.md`.
+- **Indicators from artifacts and commands** - URLs, `/dev/tcp` endpoints, SSH and PEM key
+  fingerprints, crypt-hash markers (never the hash), IRC servers and channels, `/etc/hosts`
+  sinkholes, cron, systemd, rc.local, init.d, shell-profile and `chattr +i` persistence with their
+  drop paths, and proxy `CONNECT` templates and gateway hosts are extracted from commands, download
+  URLs and captured artifacts (binaries through their printable strings), sanitized, capped and
+  stored with their provenance. Embedded credentials are recorded only as present, never their
+  value. They are shown on the sample and campaign
+  pages and are not published to the feed or vendors.
 - **Propolis rotates its own sensor logs, and alerts when rotation fails** - the policy in
   `/etc/logrotate.d/propolis-sensors` relied on the distribution's `logrotate.timer`, which was
   inactive for eleven days on the production box; nothing rotated, one telnet log reached 6.6 GB

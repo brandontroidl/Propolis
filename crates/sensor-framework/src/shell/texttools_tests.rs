@@ -200,15 +200,7 @@ fn wc_sizes_the_modeled_binaries_by_their_recorded_length() {
 
 #[test]
 fn wc_counts_the_ls_image_the_way_an_independent_scan_does() {
-    let ls = binaries::find("ls").unwrap();
-    let mut image = ls.header().to_vec();
-    for offset in 64..ls.size {
-        image.push(if offset == 409 {
-            0x0a
-        } else {
-            0x80 | u8::try_from(offset & 0x3f).unwrap()
-        });
-    }
+    let image = binaries::find("ls").unwrap().blob().read_range(0, u64::MAX);
     let is_space = |b: &u8| *b == b' ' || (0x09..=0x0d).contains(b);
     let lines = image.iter().filter(|b| **b == b'\n').count();
     let words = image

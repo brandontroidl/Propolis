@@ -255,6 +255,9 @@ const GENERIC_HEADER: [u8; ELF_HEADER_LEN] = [
     0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x38, 0x00, 0x0d, 0x00, 0x40, 0x00, 0x1f, 0x00, 0x1e, 0x00,
 ];
 
+/// Bytes of [`GENERIC_HEADER`]'s section header table: 31 entries of 64.
+const GENERIC_SECTION_TABLE: u64 = 31 * 64;
+
 impl FakeShell {
     /// The login shell's pid and working directory: the first frame, whatever nested shells or
     /// subshells are open above it.
@@ -1016,13 +1019,22 @@ fn link_node(target: &str, mtime: i64) -> Node {
     node
 }
 
-/// A modeled system binary: the generic header and filler out to `len`.
-fn stub_binary(len: u64) -> Node {
+/// A modeled system binary at `path`: the generic header, its section headers moved to the end
+/// of a file of `len` bytes as the linker puts them, then the body generated from it.
+fn stub_binary(path: &'static str, len: u64) -> Node {
+    let mut header = GENERIC_HEADER;
+    if let (Some(shoff), Some(field)) = (
+        len.checked_sub(GENERIC_SECTION_TABLE).map(|end| end & !7),
+        header.get_mut(40..48),
+    ) {
+        field.copy_from_slice(&shoff.to_le_bytes());
+    }
     Node::regular(
         Blob::elf(ElfImage {
-            header: GENERIC_HEADER,
+            header,
             len,
             newline_at: None,
+            name: path.rsplit('/').next().unwrap_or(path),
         }),
         0o100_755,
     )
@@ -1146,7 +1158,7 @@ fn process_nodes(table: &Table, mounts: &[u8], mountinfo: &[u8]) -> HashMap<Stri
     } else {
         // The images behind the daemons' `exe` links. Sizes [unverified]: plausible for jammy's
         // packages, not recorded (sshd's recorded image is in the binaries table and wins).
-        let binaries: [(&str, u64); 19] = [
+        let binaries: [(&'static str, u64); 19] = [
             ("/usr/lib/systemd/systemd", 1_841_488),
             ("/usr/sbin/sshd", 1_070_560),
             ("/usr/sbin/cron", 56_048),
@@ -1169,7 +1181,7 @@ fn process_nodes(table: &Table, mounts: &[u8], mountinfo: &[u8]) -> HashMap<Stri
         ];
         for (path, len) in binaries {
             if table.procs.iter().any(|p| p.exe == path) {
-                let mut node = stub_binary(len);
+                let mut node = stub_binary(path, len);
                 node.meta.mtime = boot;
                 nodes.insert(path.to_string(), node);
             }

@@ -75,6 +75,7 @@ use sqlx::{PgPool, Row};
 
 use crate::AppState;
 use crate::auth::Session;
+use crate::routes::campaigns::{campaigns_by_ip, indexer_progress};
 use crate::routes::context::{BaseContext, base_context};
 use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
@@ -451,6 +452,17 @@ async fn detail(
         detail_daily_series(&state.db, ip, 6).await,
     );
     let current_range = "7d";
+    let campaigns = degraded
+        .soft(
+            "campaigns",
+            campaigns_by_ip(&state.db, &[ip.to_string()]).await,
+        )
+        .remove(&ip.to_string())
+        .unwrap_or_default();
+    let (indexed, newest) = degraded.soft(
+        "campaign indexer progress",
+        indexer_progress(&state.db).await,
+    );
 
     let csrf_token = state
         .sessions
@@ -524,6 +536,8 @@ async fn detail(
         ip_timeline_labels,
         ip_timeline_data,
         current_range,
+        campaigns,
+        campaign_indexer_behind => newest.saturating_sub(indexed),
     })?;
     Ok(Html(html).into_response())
 }

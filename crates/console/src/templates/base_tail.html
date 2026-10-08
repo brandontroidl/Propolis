@@ -6,6 +6,7 @@
 <a href="/"{% if active_nav == "dashboard" %} class="active" aria-current="page"{% endif %}>Dashboard</a>
 <a href="/queue"{% if active_nav == "queue" %} class="active" aria-current="page"{% endif %}>Review{% if pending_count > 0 %} <span class="badge">{{ pending_count }}</span>{% endif %}</a>
 <a href="/ips"{% if active_nav == "ips" %} class="active" aria-current="page"{% endif %}>Attackers</a>
+<a href="/campaigns"{% if active_nav == "campaigns" %} class="active" aria-current="page"{% endif %}>Campaigns</a>
 <a href="/feed"{% if active_nav == "feed" %} class="active" aria-current="page"{% endif %}>Feed</a>
 <a href="/search/events"{% if active_nav == "search" %} class="active" aria-current="page"{% endif %}>Search</a>
 <div class="menu" id="opsmenu">

@@ -1,6 +1,6 @@
 //! The byte readers (`cat`, `head`, `more`, `hexdump`) through `handle_input`, over the F1
-//! `/bin/ls` image. The expected bytes are built here from the recorded 64-byte header and the
-//! filler rule, not read back through the code under test, and the pty capture pins the three
+//! `/bin/ls` image. The expected bytes are the image read directly, not through the commands
+//! under test (the generator has its own tests in `elf_body_tests.rs`), and the pty capture pins the three
 //! lengths: `head -n 1` is `/bin/ls` up to its first `0x0a` at offset 409 (411 wire bytes once
 //! the terminal turns that LF into CR LF), `hexdump ... -n 52` is 52 raw bytes.
 
@@ -29,18 +29,12 @@ fn run(sh: &mut FakeShell, line: &str) -> CommandResult {
     sh.handle_input(line).0
 }
 
-/// `/bin/ls` as Ubuntu 22.04 has it, rebuilt from the recorded header: bytes 64 onward are
-/// `0x80 | (offset & 0x3f)` except the newline planted at 409.
+/// `/bin/ls` as the persona has it: the recorded header and the body generated from it, read
+/// from the image directly rather than through a shell command. The first newline at 409 is
+/// asserted here.
 fn ls_image() -> Vec<u8> {
-    let ls = binaries::find("ls").unwrap();
-    let mut image = ls.header().to_vec();
-    for offset in 64..ls.size {
-        image.push(if offset == 409 {
-            0x0a
-        } else {
-            0x80 | u8::try_from(offset & 0x3f).unwrap()
-        });
-    }
+    let image = binaries::find("ls").unwrap().blob().read_range(0, u64::MAX);
+    assert_eq!(image.iter().position(|b| *b == 0x0a), Some(409));
     image
 }
 
@@ -80,9 +74,13 @@ fn hexdump_of_the_raw_character_format_is_the_first_52_bytes_and_no_newline() {
         assert_eq!(out.status, 0, "{line}");
         assert_eq!(out.bytes(), expected, "{line}");
     }
-    // Without -n the format prints the whole file, still raw.
-    let out = run(&mut shell(), "busybox hexdump -e '16/1 \"%c\"' /bin/ls");
+    // Without -n the format prints the whole file, still raw, under -v. Without -v the image's
+    // zero padding is a run of identical groups the real tool squeezes to `*`, which is not
+    // modeled: no dump at all.
+    let out = run(&mut shell(), "busybox hexdump -v -e '16/1 \"%c\"' /bin/ls");
     assert_eq!(out.bytes(), ls_image().as_slice());
+    let out = run(&mut shell(), "busybox hexdump -e '16/1 \"%c\"' /bin/ls");
+    assert_eq!((out.status, out.bytes()), (0, &b""[..]));
 }
 
 #[test]
@@ -288,8 +286,10 @@ fn tail_counts_lines_and_bytes_of_files_and_of_standard_input() {
 #[test]
 fn tail_of_a_binary_is_its_bounded_bytes_and_never_invents_framing() {
     let image = ls_image();
-    // The one newline in the image is at 409, so the last line is everything after it.
-    let after = &image[410..];
+    // The last line is everything after the image's last newline (it does not end in one).
+    assert_ne!(image.last(), Some(&0x0a));
+    let last = image.iter().rposition(|b| *b == 0x0a).unwrap();
+    let after = &image[last + 1..];
     for line in ["tail -n 1 /bin/ls", "cat /bin/ls | tail -n 1"] {
         assert_eq!(run(&mut shell(), line).bytes(), after, "{line}");
     }

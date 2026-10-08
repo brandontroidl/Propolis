@@ -12,6 +12,17 @@
 <code class="ioc-value">{{ i.defanged }}</code> <span class="ioc-copy"><button type="button" class="copy-btn" data-copy="{{ i.defanged }}" title="Copy the defanged form">copy</button> <button type="button" class="copy-btn copy-btn--live" data-copy="{{ i.value }}" title="Copy the live, followable value">copy original</button></span>
 {%- endmacro %}
 
+{#- The class that colours a score by its feed tier, shared by the pending and history rows. -#}
+{% macro score_class(tier) -%}
+{% if tier == "aggressive" %}score--aggressive{% elif tier == "standard" %}score--standard{% else %}score--none{% endif %}
+{%- endmacro %}
+
+{#- Column widths shared by the pending table and the member tables nested inside campaign groups,
+    so a group's rows line up under the page's column headers. -#}
+{% macro queue_cols() -%}
+<colgroup><col class="qc-ip"><col class="qc-score"><col class="qc-tier"><col class="qc-events"><col class="qc-active"><col class="qc-actions"></colgroup>
+{%- endmacro %}
+
 {% macro ip_evidence_link(ip) -%}
 <a class="insp" href="/ip/{{ ip }}" hx-get="/ip/{{ ip }}?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog">{{ ip }}</a>
 {%- endmacro %}

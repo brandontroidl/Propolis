@@ -105,6 +105,15 @@
 
 ### Added
 
+- **Docs: `docs/operations/captured-content-handling.md`** - the operator procedure for a capture
+  that may be illegal material (above all CSAM): what the console and spool already do to limit
+  exposure (hash-named bodies, no rendering, download forced as an attachment), the rules (never
+  open or preview a capture, handle media and archives by hash, keep suspect files out of
+  VirusTotal upload and vendor paths), quarantining one sample by moving it out of the spool,
+  and the reporting process (US 18 U.S.C. 2258A and the CyberTipline, INHOPE hotlines elsewhere),
+  framed as process and not legal advice. It also lists what works against the procedure today
+  (automatic VirusTotal upload when opted in, 30-day deletion with no hold, tmpfs spools).
+
 - **`deploy/config-check.sh` compares the configuration with what is running** - five faults on
   the production box were each found by accident: a typo in `PROPOLIS_SENSOR_LOGS`, MQTT's log
   absent from that list, sensor-cred's PostgreSQL listener never producing a log (with 5432 open in

@@ -102,3 +102,85 @@ Sensor NDJSON logs under `/var/log/propolis/` are rotated by logrotate at `size 
 size-based, not calendar-based, to bound a flood-driven disk-fill; five compressed generations
 are kept per sensor. This is disk hygiene, not event retention: the authoritative event record
 is the database, not the rotated log files.
+
+### What runs the rotation
+
+Propolis runs logrotate itself and does not depend on the distribution's `logrotate.timer`.
+`propolis-logrotate.timer` fires hourly (`OnCalendar=hourly`, a two-minute random delay,
+`Persistent=true` so a missed hour runs at the next boot, and one run two minutes after the
+timer is enabled) and starts `propolis-logrotate.service`, which runs
+`logrotate --state /var/lib/propolis/logrotate.state /etc/logrotate.d/propolis-sensors`
+(`deploy/propolis-logrotate.timer`, `deploy/propolis-logrotate.service`). Both `install.sh` and
+`upgrade.sh` install the two units and run `systemctl enable --now propolis-logrotate.timer`, so
+a normal upgrade is the whole rollout. The own state file keeps this run independent of the
+distribution's `/var/lib/logrotate/logrotate.status`; logrotate rewrites it on every run, which
+is what the `rotation-stale` alert reads.
+
+This exists because the distribution timer is not Propolis's to keep alive: in October 2026 it
+was inactive for eleven days on the production box, nothing rotated, one telnet log reached
+6.6 GB and `/var` reached 80% used. If the distribution's timer is also active it runs the same
+policy against its own state file. The policy is size-triggered, so neither run touches a log
+under the size; two runs that both find a log over it at the same moment could rotate it twice
+and push a generation out early `[inferred]`.
+
+Check it:
+
+```
+systemctl list-timers propolis-logrotate.timer
+systemctl status propolis-logrotate.service
+journalctl -u propolis-logrotate.service --since -1d
+```
+
+### Free-space guard
+
+`copytruncate` rotates by copying the live log to `events.jsonl.1` before truncating the
+original, so rotating a log needs free space equal to the log. A log that has outgrown its
+filesystem cannot be rotated: the copy fills the volume that also holds the database and every
+other sensor log, fails, and the truncate never happens.
+
+The policy therefore runs `/usr/local/sbin/propolis-logrotate-guard` (`deploy/logrotate-guard.sh`)
+in a `prerotate` hook, once per log that is due. It admits a log only when the space available
+to an unprivileged writer covers the log, a quarter of it more for compressing the previous
+generation, and a 512 MiB reserve (`PROPOLIS_LOGROTATE_RESERVE_BYTES` overrides the reserve). A
+refused log is left untouched, a line naming it and the shortfall goes to the journal, and
+logrotate exits non-zero so the unit shows failed in `systemctl --failed`.
+
+A `prerotate` hook was chosen over an `ExecStartPre` check on the service because logrotate
+documents that a failing `prerotate` script skips only the log it ran for, while an
+`ExecStartPre` check can only allow or block the whole run, which would let one oversized log
+keep every healthy sensor from rotating. The guard stays out of the way of an ordinary log: the
+check is a `stat` and a `statfs`.
+
+### Alerts
+
+With the ops monitor enabled, `sensor-log-oversized` pages when a configured sensor log is more
+than three times the rotation size (300 MiB with the shipped `size 100M`, read from
+`/etc/logrotate.d/propolis-sensors`) or the filesystem under `/var/log/propolis` is over 85% used,
+and `rotation-stale` pages when the state file has not been rewritten for three hours. See
+[health and observability](health-and-observability.md#ops-alert-monitor-opt-in).
+
+### A log too large to rotate
+
+When the guard refuses a log (the journal says `refusing to rotate`) or `sensor-log-oversized`
+names one, archive it and truncate it by hand. This is the recovery used on the production box
+after the October 2026 incident. The archive is compressed as it is written, so it needs a small
+fraction of the log's size, not a full copy; put it on another filesystem if the log volume is
+short on space.
+
+```
+LOG=/var/log/propolis/telnet/events.jsonl
+ARCHIVE=/var/log/propolis/telnet/events.jsonl.archive-$(date -u +%Y%m%dT%H%M%SZ).gz
+df -h /var/log/propolis
+sudo sh -c 'gzip -c "$1" > "$2"' sh "$LOG" "$ARCHIVE"
+gzip -t "$ARCHIVE" && ls -l "$ARCHIVE"
+sudo truncate -s 0 "$LOG"
+sudo systemctl start propolis-logrotate.service
+```
+
+Run `truncate` only after `gzip -t` succeeds: it discards the log. Lines a sensor appends between
+the end of the `gzip` read and the `truncate` are lost, as with `copytruncate` itself. Lines
+intake has not yet read are archived but never reach the ledger (see [intake
+backlog](../troubleshooting/intake-backlog.md#recovering-a-backlog-too-large-to-drain)); if
+intake is keeping up, wait for the fleet pane's `behind:` badge to clear before truncating. The
+intake cursor notices the truncation and resumes at the start of the file. The last command
+confirms the next scheduled run is healthy; delete the archive once you no longer need it.

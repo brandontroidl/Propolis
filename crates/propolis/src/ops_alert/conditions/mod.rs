@@ -8,5 +8,6 @@ pub mod feed;
 pub mod intake;
 pub mod intake_lag;
 pub mod malware;
+pub mod sensor_log;
 pub mod subsystem;
 pub mod vendor;

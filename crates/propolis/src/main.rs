@@ -1100,6 +1100,9 @@ async fn main() {
     let probe_sources = Arc::new(config.fleet_probe_sources.clone());
     let probe_grace = config.fleet_probe_interval.saturating_mul(2);
 
+    // Taken before the loop below consumes the list: the ops-monitor's log-rotation conditions
+    // measure the same files the tailers read.
+    let rotation_logs = config.sensor_logs.clone();
     for sensor in config.sensor_logs {
         let pool = pool.clone();
         let cursor_dir = config.cursor_dir.clone();
@@ -1592,6 +1595,7 @@ async fn main() {
             ops_alert::conditions::feed::push_marker_path(&config.feed_output_dir);
         let feed_build_interval = config.feed_build_interval;
         let intake_poll_interval = config.poll_interval;
+        let ops_rotation = ops_alert::condition::RotationCtx::production(rotation_logs);
 
         handles.push(spawn_supervised_named(
             "ops-monitor",
@@ -1607,6 +1611,7 @@ async fn main() {
                 let spool_dirs = ops_spool_dirs.clone();
                 let feed_marker_path = feed_marker.clone();
                 let feed_push_marker_path = feed_push_marker.clone();
+                let rotation = ops_rotation.clone();
                 async move {
                     // No ntfy target configured: deliver alerts to the local log sink rather than
                     // not alerting at all. Same conditions, same cooldown/dedup policy, different
@@ -1625,6 +1630,7 @@ async fn main() {
                         feed_marker_path,
                         feed_push_marker_path,
                         feed_build_interval,
+                        rotation,
                         cfg: ops_cfg.clone(),
                     };
                     if local_only {

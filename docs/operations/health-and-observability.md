@@ -130,8 +130,8 @@ reference](../reference/scoring-and-feed.md).
 The daemon and sensors log through `tracing` to the systemd journal; read with
 `journalctl -u propolis` (see [service lifecycle](./service-lifecycle.md)). Sensors also
 append captured events as NDJSON to per-sensor log files under `/var/log/propolis/`, rotated
-by logrotate (`size 100M`, `rotate 5`, `copytruncate`; `deploy/logrotate-sensors.conf`).
-Paths are owned by [filesystem paths](../reference/filesystem-paths.md).
+by logrotate (`size 100M`, `rotate 5`, `copytruncate`; `deploy/logrotate-sensors.conf`), run
+hourly by `propolis-logrotate.timer` ([retention](./retention.md#log-rotation)). Paths are owned by [filesystem paths](../reference/filesystem-paths.md).
 
 The console has a session-gated live log viewer at `/logs`, backed by an in-memory ring of the
 **1000** most recent tracing events (`crates/propolis/src/main.rs#LOG_BUFFER_CAPACITY`,
@@ -217,6 +217,34 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
   unfinished last line neither ages nor grows. The thresholds are fixed, not `PROPOLIS_OPS_*`
   variables. While a log has not finished its first poll the condition reads it as unknown, not
   healthy, and the monitor's own stale-probe warning covers a log that never reports;
+- sensor logs outgrowing rotation (`sensor-log-oversized`; Warning, Critical when the disk
+  half holds). It fires, after a two-minute hold, when any log in `PROPOLIS_SENSOR_LOGS` is more
+  than three times the rotation size, or when the filesystem under `/var/log/propolis` is more
+  than 85% used (`df`'s Use%)
+  (`crates/propolis/src/ops_alert/conditions/sensor_log.rs#SensorLogOversized`). The rotation
+  size is the `size` line of `/etc/logrotate.d/propolis-sensors`, read on each poll, so
+  300 MiB with the shipped `100M`; if the file is unreadable or has no `size` line the daemon
+  assumes 100 MiB. A log that does not exist yet is not oversized. Once firing it clears only
+  when every log is back under twice the rotation size and the disk at or under 80% used, so a
+  log hovering at the line does not page and recover in turn. This is the alert that would have
+  caught the October 2026 incident, where the distribution's rotation timer stopped and a telnet
+  log reached 6.6 GB; `capacity` watches the cursor and spool volumes, which are the log volume
+  only when they share a filesystem, and `intake-lagging` watches an intake that falls behind,
+  not a log that grows. The page names each log with
+  its size; recovery is [a log too large to rotate](./retention.md#a-log-too-large-to-rotate).
+  On a control-plane box tailing a collector's gateway spool file, which no policy rotates
+  ([split deployment](./split-deployment.md#disk-space)), a spool past 300 MiB fires it too;
+  that is the spool growing, not rotation failing;
+- log rotation not running (`rotation-stale`, Warning): the logrotate state file
+  `/var/lib/propolis/logrotate.state` has not been rewritten for more than three hours
+  (`crates/propolis/src/ops_alert/conditions/sensor_log.rs#RotationStale`).
+  `propolis-logrotate.service` rewrites it on every hourly run, whether or not a log was due, so
+  its modification time is the last run. The daemon does not ask systemd whether the timer is
+  active; a file that stops moving is a timer that stopped firing. It clears on the next run. A
+  node where the file does not exist yet (the timer never ran) reads as unknown, not firing, and
+  the monitor's stale-probe warning raises it after half an hour. A run that the free-space guard
+  refuses still rewrites the file, so that case surfaces as `sensor-log-oversized` and a failed
+  unit, not as this alert. The thresholds of both are fixed, not `PROPOLIS_OPS_*` variables;
 - vendor submission failure rate over `VENDOR_FAIL_PCT` (50%) within `VENDOR_WINDOW_SECS`
   (3600 s), gated by `VENDOR_MIN_SAMPLES` (20);
 - review backlog over `BACKLOG_MAX` (500) held for `BACKLOG_FOR_SECS` (900 s);

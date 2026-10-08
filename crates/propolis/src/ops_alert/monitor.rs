@@ -195,12 +195,12 @@ impl<P: Poster> Monitor<P> {
     }
 }
 
-/// All twelve operational conditions, in a stable order. Built fresh on each (re)start so per-
+/// All fourteen operational conditions, in a stable order. Built fresh on each (re)start so per-
 /// condition state (backlog history, the chain-verify cache, intake lag tracks) resets cleanly
 /// after a supervised restart.
 pub fn default_conditions() -> Vec<Box<dyn Condition>> {
     use super::conditions::{
-        backlog, capacity, chain, feed, intake, intake_lag, malware, subsystem, vendor,
+        backlog, capacity, chain, feed, intake, intake_lag, malware, sensor_log, subsystem, vendor,
     };
     vec![
         Box::new(subsystem::SubsystemGaveUp),
@@ -215,6 +215,8 @@ pub fn default_conditions() -> Vec<Box<dyn Condition>> {
         Box::new(vendor::VendorFailures),
         Box::new(malware::ScanStale),
         Box::new(malware::FetchStale),
+        Box::new(sensor_log::SensorLogOversized::new()),
+        Box::new(sensor_log::RotationStale),
     ]
 }
 
@@ -300,6 +302,7 @@ mod tests {
             feed_marker_path: "/nonexistent".into(),
             feed_push_marker_path: "/nonexistent".into(),
             feed_build_interval: Duration::from_secs(300),
+            rotation: crate::ops_alert::condition::RotationCtx::production(Vec::new()),
             cfg,
         }
     }
@@ -409,7 +412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_conditions_are_the_twelve_expected_ids() {
+    async fn default_conditions_are_the_fourteen_expected_ids() {
         let ids: Vec<&str> = default_conditions().iter().map(|c| c.id()).collect();
         assert_eq!(
             ids,
@@ -426,6 +429,8 @@ mod tests {
                 "vendor-failures",
                 "scan-stale",
                 "fetch-stale",
+                "sensor-log-oversized",
+                "rotation-stale",
             ]
         );
     }

@@ -22,7 +22,8 @@
 # The listener NAME is the sensor's own self-reported name, which is what lands in `event.sensor` -
 # not the PROPOLIS_SENSOR_LOGS label. sensor-cred reports its five protocols individually, so its
 # names are vnc/mysql/mssql/postgresql/mongodb while its log labels are cred-vnc and so on. The
-# mapping below mirrors crates/sensor-cred/src/main.rs's own table.
+# mapping lives in listeners-lib.sh, which mirrors crates/sensor-cred/src/main.rs's own table and
+# is shared with config-check.sh so the inventory and the configuration check cannot disagree.
 #
 # Usage: fleet-listeners.sh [ENV_DIR] [OUT_FILE]
 #   ENV_DIR    directory holding the sensor env files   (default /etc/propolis)
@@ -40,32 +41,8 @@ ENV_DIR="${1:-/etc/propolis}"
 OUT_FILE="${2:-$ENV_DIR/fleet-listeners.env}"
 COLLECTOR_ID="${PROPOLIS_FLEET_COLLECTOR_ID:-local}"
 
-# The last assignment of NAME across every *.env in ENV_DIR, ignoring commented-out lines and
-# stripping one layer of surrounding quotes. Empty output means "not configured".
-read_env_var() {
-    local name="$1" files value
-    files=("$ENV_DIR"/*.env)
-    if [ "${#files[@]}" -eq 0 ]; then
-        return 0
-    fi
-    value="$(grep -hE "^[[:space:]]*${name}=" "${files[@]}" 2>/dev/null | tail -n 1 || true)"
-    value="${value#*=}"
-    value="${value%\"}"
-    value="${value#\"}"
-    value="${value%\'}"
-    value="${value#\'}"
-    printf '%s' "$value"
-}
-
-# The port half of a bind address. Handles 0.0.0.0:22 and [::]:22 alike by taking everything after
-# the last colon; a value with no colon is not an address and yields nothing.
-port_of() {
-    local addr="$1"
-    case "$addr" in
-        *:*) printf '%s' "${addr##*:}" ;;
-        *) return 0 ;;
-    esac
-}
+# shellcheck source=deploy/listeners-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/listeners-lib.sh"
 
 ENTRIES=()
 
@@ -80,69 +57,9 @@ add_entry() {
     ENTRIES+=("$COLLECTOR_ID/$sensor/$proto/$port")
 }
 
-# One TCP listener per variable: BIND_VAR:sensor-name.
-for pair in \
-    PROPOLIS_SSH_BIND:ssh \
-    PROPOLIS_TELNET_BIND:telnet \
-    PROPOLIS_REDIS_BIND:redis \
-    PROPOLIS_REDIS_TLS_BIND:redis \
-    PROPOLIS_ADB_BIND:adb \
-    PROPOLIS_HTTP_BIND:http \
-    PROPOLIS_HTTP_TLS_BIND:http \
-    PROPOLIS_FTP_BIND:ftp \
-    PROPOLIS_FTP_TLS_BIND:ftp \
-    PROPOLIS_SMTP_BIND:smtp \
-    PROPOLIS_SMTP_SUBMISSION_BIND:smtp \
-    PROPOLIS_SMTP_TLS_BIND:smtp \
-    PROPOLIS_MQTT_BIND:mqtt \
-    PROPOLIS_MQTT_TLS_BIND:mqtt \
-    PROPOLIS_DNS_TLS_BIND:dns \
-    PROPOLIS_CRED_VNC_BIND:vnc \
-    PROPOLIS_CRED_MYSQL_BIND:mysql \
-    PROPOLIS_CRED_MSSQL_BIND:mssql \
-    PROPOLIS_CRED_PG_BIND:postgresql \
-    PROPOLIS_CRED_MONGO_BIND:mongodb; do
-    var="${pair%%:*}"
-    sensor="${pair##*:}"
-    addr="$(read_env_var "$var")"
-    [ -n "$addr" ] || continue
-    add_entry "$sensor" tcp "$(port_of "$addr")"
-done
-
-# sensor-tftp is the one UDP-only listener: a single request socket, so one udp entry.
-addr="$(read_env_var PROPOLIS_TFTP_BIND)"
-if [ -n "$addr" ]; then
-    add_entry tftp udp "$(port_of "$addr")"
-fi
-
-# sensor-dns binds UDP and TCP on the same address (RFC 7766 makes TCP mandatory) and refuses to
-# start unless both bind, so one variable yields two listeners.
-addr="$(read_env_var PROPOLIS_DNS_BIND)"
-if [ -n "$addr" ]; then
-    port="$(port_of "$addr")"
-    add_entry dns udp "$port"
-    add_entry dns tcp "$port"
-fi
-
-# sensor-catchall takes a comma-separated list and binds BOTH TCP and UDP for every entry, so each
-# port yields two listeners. It also still reads the deprecated bare spelling of its own variable
-# (crates/sensor-catchall/src/main.rs's env_var fallback), and a box using that spelling must not
-# silently produce an inventory with no catch-all in it.
-catchall="$(read_env_var PROPOLIS_CATCHALL_BIND_ADDRS)"
-if [ -z "$catchall" ]; then
-    catchall="$(read_env_var CATCHALL_BIND_ADDRS)"
-fi
-if [ -n "$catchall" ]; then
-    IFS=',' read -r -a catchall_addrs <<<"$catchall"
-    for addr in "${catchall_addrs[@]}"; do
-        addr="${addr#"${addr%%[![:space:]]*}"}"
-        addr="${addr%"${addr##*[![:space:]]}"}"
-        [ -n "$addr" ] || continue
-        port="$(port_of "$addr")"
-        add_entry catchall tcp "$port"
-        add_entry catchall udp "$port"
-    done
-fi
+while IFS=$'\t' read -r sensor proto port _addr _var; do
+    add_entry "$sensor" "$proto" "$port"
+done < <(derive_listeners)
 
 TMP_FILE="$OUT_FILE.tmp.$$"
 {

@@ -165,3 +165,9 @@ fi
 echo "==> done. checking status"
 sleep 2
 systemctl --no-pager status propolis.service | head -5
+
+# Last, and report-only: the upgrade has finished by now, so a finding here is something to read
+# and act on, not a reason to call the upgrade failed. config-check.sh compares what is configured
+# with what is running; see docs/operations/service-lifecycle.md, "Configuration check".
+echo "==> configuration check (report only; it cannot fail the upgrade)"
+"$SCRIPT_DIR/config-check.sh" --report-only || echo "warning: config-check.sh itself failed to run; run it by hand: $SCRIPT_DIR/config-check.sh"

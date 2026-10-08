@@ -1189,11 +1189,9 @@ mod shell_detection_tests {
             download_target(&["ftpget", "-u", "anon", "-p", "x", "198.51.100.9", "f"]).as_deref(),
             Some("ftp://198.51.100.9/f")
         );
-        // A host with no file is still evidence; no host at all is not a fetch.
-        assert_eq!(
-            download_target(&["tftp", "-g", "198.51.100.9"]).as_deref(),
-            Some("tftp://198.51.100.9")
-        );
+        // A host with no file, or a file with no host, is no URL: it is recorded as an unparsed
+        // fetch with the raw command (see tftp_tests), never as a half-built `tftp://HOST`.
+        assert_eq!(download_target(&["tftp", "-g", "198.51.100.9"]), None);
         assert_eq!(download_target(&["tftp", "-g", "-r", "x"]), None);
     }
 

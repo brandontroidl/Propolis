@@ -101,6 +101,16 @@ address, spawns an accept loop, enforces `max_concurrent` with a
   `::ffff:a.b.c.d` down to plain IPv4 (port preserved) before WAN resolution, so a
   plain-IPv4 WAN map matches a dual-stack peer.
 - `shutdown_signal()` resolves on SIGINT or (Unix) SIGTERM (`crates/sensor-framework/src/listener.rs#shutdown_signal`).
+- **Shutdown of a capturing sensor** (ssh, telnet, adb, ftp, mqtt, tftp): after the listeners are
+  stopped, `CaptureHandoff::drain` (`crates/sensor-framework/src/handoff.rs#CaptureHandoff::drain`)
+  ends the live connections first, then the queue, inside `SHUTDOWN_DRAIN_TIMEOUT` (10 s). A
+  connection gets a grace of at most 3 s (a quarter of the timeout if smaller) to finish; one
+  still open is cancelled and awaited for at most another quarter, which makes its capture guard
+  submit what it had buffered. That capture is stored and emitted with `complete` false and
+  `end_reason` `session_cancelled`. The rest of the timeout drains the queue. A listener only
+  takes part if it was started with the hand-off's tracker (`run_tcp_listener_tracked`,
+  `run_tls_listener_tracked`, or tftp's own request loop); the drain logs a WARN naming the count
+  when connections or queued jobs could not be finished in time.
 
 ### WAN attribution
 

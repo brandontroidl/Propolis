@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use crate::admission::PerSourceLimiter;
 use crate::arrival::{self, Arrival};
 use crate::bounds::ConnectionBounds;
+use crate::connection_tracker::ConnectionTracker;
 
 /// Maximum size of a single UDP datagram (the IPv4/IPv6 payload ceiling), so `recv_from` never
 /// silently truncates a legitimate maximum-size datagram for lack of buffer space.
@@ -99,6 +100,26 @@ where
     F: Fn(TcpStream, SocketAddr, uuid::Uuid) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    run_tcp_listener_tracked(addr, bounds, per_source_cap, None, handler).await
+}
+
+/// [`run_tcp_listener`] with the connections registered in `tracker`, so the sensor's shutdown can
+/// end them in order (see [`ConnectionTracker::quiesce`]): a sensor with a capture hand-off passes
+/// `handoff.connections()`, which makes `CaptureHandoff::drain` cut and record the uploads still
+/// running instead of losing them. `None` tracks nothing observable (a private tracker nobody
+/// quiesces).
+pub async fn run_tcp_listener_tracked<F, Fut>(
+    addr: SocketAddr,
+    bounds: ConnectionBounds,
+    per_source_cap: Option<u32>,
+    tracker: Option<ConnectionTracker>,
+    handler: F,
+) -> std::io::Result<(SocketAddr, JoinHandle<()>)>
+where
+    F: Fn(TcpStream, SocketAddr, uuid::Uuid) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let tracker = tracker.unwrap_or_default();
     let listener = TcpListener::bind(addr).await?;
     let bound_addr = listener.local_addr()?;
     let semaphore = Arc::new(Semaphore::new(bounds.max_concurrent as usize));
@@ -160,17 +181,27 @@ where
                 .local_addr()
                 .map_or(bound_addr.port(), |local| local.port());
             let fut = arrival::scope(Arrival::new(local_port), handler(stream, peer, session_id));
+            // Registered before the spawn so a connection is never live but uncounted.
+            let tracked = tracker.register();
+            let run_tracker = tracker.clone();
             tokio::spawn(async move {
-                // Held for the connection's whole lifetime; dropped (releasing the permit and the
-                // per-source slot) when this outer task ends, which happens only once the inner
-                // task below has already finished one way or another.
+                // Held for the connection's whole lifetime; dropped (releasing the permit, the
+                // per-source slot and the tracker slot) when this outer task ends, which happens
+                // only once the inner task below has already finished one way or another.
                 let _permit = permit;
                 let _source_guard = source_guard;
-                let inner =
-                    tokio::spawn(async move { tokio::time::timeout(max_duration, fut).await });
+                let _tracked = tracked;
+                let inner = tokio::spawn(async move {
+                    run_tracker
+                        .run(tokio::time::timeout(max_duration, fut))
+                        .await
+                });
                 match inner.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_elapsed)) => {
+                    Ok(Some(Ok(()))) => {}
+                    Ok(None) => {
+                        tracing::debug!(%peer, "connection cancelled by shutdown");
+                    }
+                    Ok(Some(Err(_elapsed))) => {
                         tracing::warn!(%peer, "handler exceeded max_duration; connection dropped");
                     }
                     Err(join_err) if join_err.is_panic() => {
@@ -297,10 +328,10 @@ where
 /// stop` sends - not SIGINT - to the hardened service units `internal/design/02-sensor-framework.
 /// md`'s "Isolation and deployment" section ships). A sensor's `main.rs` races this against
 /// continued serving, then aborts every listener `JoinHandle` it is holding. A sensor that has a
-/// capture worker then calls `CaptureHandoff::drain` so already-queued captures are written before
-/// the process exits. In-flight connection tasks are NOT awaited: the runtime cancels them at
-/// teardown, so a capture a connection had not yet submitted is lost (see `handoff.rs`'s module
-/// doc). This function's only job is to resolve at the right time.
+/// capture worker then calls `CaptureHandoff::drain`, which first lets the tracked connections
+/// finish or cancels them (their Drop-time submit records what they had buffered, marked cut) and
+/// then writes the queue before the process exits (see `handoff.rs`'s module doc). This
+/// function's only job is to resolve at the right time.
 pub async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;

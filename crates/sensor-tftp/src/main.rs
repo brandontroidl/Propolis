@@ -331,7 +331,7 @@ async fn main() {
     {
         tracing::warn!("sensor-tftp: rate-limited summaries not all written before shutdown");
     }
-    // Queued captures only; a transfer cancelled mid-capture never submits (see handoff.rs).
+    // Cuts live transfers (their captures are recorded as truncated), then drains the queue.
     server.handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
 }
 

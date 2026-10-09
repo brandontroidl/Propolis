@@ -2950,9 +2950,20 @@ async fn detail_url_panel_links_each_observed_url_to_its_outcome(pool: PgPool) {
     // The first-reporter panel above still does not credit the later address with the sample.
     let malware_start = body.find("Malware from this IP").unwrap();
     let malware = &body[malware_start..start];
+    // It no longer says "no samples" next to the URL table, but names the sample as reached via
+    // another address's report, never as a row crediting this address.
+    let rows = malware.split("</table>").next().unwrap();
     assert!(
-        !malware.contains(&sha256_hex[..12]),
+        !rows.contains(&sha256_hex[..12]),
         "the first-reporter panel still credits the capture to the first reporter only: {malware}"
+    );
+    assert!(
+        malware.contains("1 sample via a URL first reported by another address"),
+        "{malware}"
+    );
+    assert!(
+        malware.contains(&sha256_hex[..12]),
+        "the note names the sample: {malware}"
     );
 }
 

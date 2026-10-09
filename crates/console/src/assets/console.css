@@ -570,6 +570,58 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .approve-list { columns: 3 14rem; margin: 0.6rem 0 1rem 1.2rem; padding: 0; font-size: 0.8rem; }
 .campaign-refs { margin: 0.2rem 0 0.2rem 1.2rem; padding: 0; }
 
+/* -- Campaigns and Samples lists: the review queue's vocabulary (tier-coloured counts, the Active
+   cell, dotted chips) in one table that becomes cards on a narrow screen. -- */
+.tab-count { color: var(--text-faint); font-family: var(--font-mono); font-size: 0.72rem; margin-left: 0.15rem; }
+.tab.active .tab-count { color: var(--text-muted); }
+.sortbar-gap { flex: 1 1 auto; }
+.filter-toggle { border: 1px solid var(--border-bright); border-radius: 999px; padding: 0.05rem 0.7rem; color: var(--text-muted); }
+.filter-toggle:hover { color: var(--text); text-decoration: none; border-color: var(--text-faint); }
+.filter-toggle.on { color: var(--brand); border-color: var(--brand); background: var(--attention-dim); }
+.campaigns-panel table, .samples-panel table { table-layout: fixed; }
+.campaigns-panel td, .samples-panel td { overflow-wrap: anywhere; }
+.cc-what { width: 36%; } .cc-hosts { width: 8%; } .cc-spark { width: 13%; } .cc-active { width: 16%; } .cc-sensors { width: 14%; } .cc-delivers { width: 13%; }
+.cs-hash { width: 14%; } .cs-hosts { width: 7%; } .cs-spark { width: 11%; } .cs-active { width: 15%; } .cs-by { width: 9%; } .cs-src { width: 15%; } .cs-tr { width: 9%; } .cs-vt { width: 11%; } .cs-dl { width: 9%; }
+.samples-panel td.active-cell { white-space: normal; }
+.c-text { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.8rem; color: var(--text); }
+.c-text:hover { color: var(--brand); }
+.c-meta { display: flex; align-items: baseline; gap: 0.5rem; margin-top: 0.15rem; font-size: 0.72rem; }
+.rule { display: inline-block; font-size: 0.64rem; letter-spacing: 0.05em; text-transform: uppercase; padding: 0 0.4rem; border: 1px solid var(--border-bright); border-radius: var(--radius-sm); color: var(--text-muted); }
+td.c-hosts, td.s-hosts { font-size: 0.95rem; }
+.c-unit { display: none; font-size: 0.74rem; font-weight: 400; color: var(--text-muted); }
+.c-sub { display: block; font-size: 0.72rem; color: var(--text-faint); }
+.s-hash a { color: var(--text); }
+td.score a { color: inherit; }
+.panel-note { padding: 0.6rem 0.9rem 0.2rem; }
+.samples-panel td.ip { white-space: normal; }
+@media (max-width: 640px) {
+  .campaigns-panel table, .campaigns-panel tbody, .campaigns-panel tr, .campaigns-panel td,
+  .samples-panel table, .samples-panel tbody, .samples-panel tr, .samples-panel td { display: block; width: auto; }
+  .campaigns-panel thead, .campaigns-panel colgroup, .samples-panel thead, .samples-panel colgroup { display: none; }
+  tr.crow, tr.srow { display: grid; gap: 0.35rem 0.8rem; align-items: center; padding: 0.7rem 0.75rem; border-bottom: 1px solid var(--border); }
+  tr.crow > td, tr.srow > td { padding: 0; border: none; }
+  tr.crow { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "what what what" "hosts spark active" "sensors sensors delivers"; }
+  tr.crow > td.c-what { grid-area: what; }
+  tr.crow > td.c-hosts { grid-area: hosts; text-align: left; }
+  tr.crow > td.c-spark { grid-area: spark; }
+  tr.crow > td.c-active { grid-area: active; text-align: right; white-space: normal; }
+  tr.crow > td.c-sensors { grid-area: sensors; }
+  tr.crow > td.c-delivers { grid-area: delivers; text-align: right; }
+  .c-unit { display: inline; }
+  .c-text { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  tr.srow { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "hash vt" "hosts active" "spark by" "src src" "tr dl"; }
+  tr.srow > td.s-hash { grid-area: hash; }
+  tr.srow > td.s-vt { grid-area: vt; text-align: right; }
+  tr.srow > td.s-hosts { grid-area: hosts; text-align: left; }
+  tr.srow > td.s-active { grid-area: active; text-align: right; white-space: normal; }
+  tr.srow > td.s-spark { grid-area: spark; }
+  tr.srow > td.s-by { grid-area: by; text-align: right; }
+  tr.srow > td.s-src { grid-area: src; }
+  tr.srow > td.s-tr { grid-area: tr; }
+  tr.srow > td.s-dl { grid-area: dl; text-align: right; }
+  .samples-panel .na { display: none; }
+}
+
 /* -- Attackers paging and the tier/score note above the table -- */
 .ips-count { margin-bottom: 0.6rem; }
 .table-note { font-size: 0.78rem; color: var(--text-muted); margin: 0 0 0.75rem; max-width: 70rem; }

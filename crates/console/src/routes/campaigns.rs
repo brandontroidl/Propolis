@@ -34,7 +34,7 @@ use crate::AppState;
 use crate::auth::Session;
 use crate::routes::context::base_context;
 use crate::routes::error::AppError;
-use crate::routes::format::{format_sensor_label, format_timestamp, group_digits};
+use crate::routes::format::{format_active, format_sensor_label, format_timestamp, group_digits};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -57,7 +57,7 @@ const IOC_LIMIT: i64 = 200;
 /// Most recent members whose command indicators a campaign page reads.
 const IOC_MEMBER_SCAN: i64 = 2000;
 /// Days in the list page's sparkline, and in the detail page's.
-const LIST_SPARK_DAYS: i64 = 14;
+pub(crate) const LIST_SPARK_DAYS: i64 = 14;
 const DETAIL_SPARK_DAYS: i64 = 30;
 
 /// What a campaign's members are called. A sample campaign whose script scans for and copies
@@ -158,6 +158,45 @@ pub(crate) async fn campaigns_by_sample(
     Ok(out)
 }
 
+/// First and last sighting of each of `shas` that has a sample campaign, keyed by digest.
+pub(crate) async fn sample_activity(
+    pool: &PgPool,
+    shas: &[String],
+) -> Result<HashMap<String, (DateTime<Utc>, DateTime<Utc>)>, sqlx::Error> {
+    if shas.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT key, first_seen, last_seen FROM campaign \
+         WHERE kind = 'sample' AND key = ANY($1)",
+    )
+    .bind(shas)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(k, a, b)| (k, (a, b))).collect())
+}
+
+/// The largest command-sequence campaign whose sessions uploaded each of `shas`: the behaviour
+/// that delivers the file. A sample no command sequence links has no entry.
+pub(crate) async fn delivering_campaigns(
+    pool: &PgPool,
+    shas: &[String],
+) -> Result<HashMap<String, (i64, i32)>, sqlx::Error> {
+    if shas.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(String, i64, i32)> = sqlx::query_as(
+        "SELECT DISTINCT ON (s.sha256) s.sha256, c.id, c.member_count \
+         FROM campaign_sample s JOIN campaign c ON c.id = s.campaign_id \
+         WHERE c.kind = 'command_sequence' AND s.sha256 = ANY($1) \
+         ORDER BY s.sha256, c.member_count DESC, c.id",
+    )
+    .bind(shas)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(k, id, n)| (k, (id, n))).collect())
+}
+
 /// Every campaign linked to the sample `sha256`: its own, and the command sequences whose
 /// sessions uploaded it, largest first.
 pub(crate) async fn campaigns_linking_sample(
@@ -190,7 +229,7 @@ pub(crate) async fn campaigns_linking_sample(
 /// One bar of a distinct-addresses-per-day sparkline, laid out in Rust so the template only places
 /// numbers into SVG attributes.
 #[derive(Debug, Serialize)]
-struct Bar {
+pub(crate) struct Bar {
     x: i64,
     y: i64,
     h: i64,
@@ -198,10 +237,14 @@ struct Bar {
     hosts: i64,
 }
 
-const SPARK_HEIGHT: i64 = 20;
-const SPARK_STEP: i64 = 5;
+pub(crate) const SPARK_HEIGHT: i64 = 20;
+pub(crate) const SPARK_STEP: i64 = 5;
 
-fn sparkline(counts: &BTreeMap<NaiveDate, i64>, today: NaiveDate, days: i64) -> Vec<Bar> {
+pub(crate) fn sparkline(
+    counts: &BTreeMap<NaiveDate, i64>,
+    today: NaiveDate,
+    days: i64,
+) -> Vec<Bar> {
     let max = counts.values().copied().max().unwrap_or(0).max(1);
     (0..days)
         .map(|i| {
@@ -223,7 +266,7 @@ fn sparkline(counts: &BTreeMap<NaiveDate, i64>, today: NaiveDate, days: i64) -> 
         .collect()
 }
 
-async fn day_counts(
+pub(crate) async fn day_counts(
     pool: &PgPool,
     ids: &[i64],
     since: NaiveDate,
@@ -303,31 +346,158 @@ async fn linked_samples(
     Ok(out)
 }
 
+/// The two openings `review::campaign::fingerprint::opening` gives the classes keyed as one; a
+/// test pins them to that function, so a reworded phrase fails there rather than silently moving
+/// every HTTP or login-only campaign into "behaviour".
+const OPENING_HTTP: &str = "http request sent to a shell port";
+const OPENING_ENTRY_ONLY: &str = "shell entry only";
+
+/// What the list groups campaigns by. Not the stored `campaign.kind`: command sequences split
+/// by what they were, and the same-sample kind is not listed here at all (a sample's hosts are on
+/// the Samples page; the campaign itself stays reachable at `/campaigns/{id}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Behaviour,
+    Scan,
+    Http,
+    Entry,
+}
+
+impl Class {
+    const ALL: [Class; 4] = [Class::Behaviour, Class::Scan, Class::Http, Class::Entry];
+
+    fn value(self) -> &'static str {
+        match self {
+            Class::Behaviour => "behaviour",
+            Class::Scan => "scan",
+            Class::Http => "http",
+            Class::Entry => "login",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Class> {
+        Class::ALL.into_iter().find(|c| c.value() == s)
+    }
+
+    fn tab_label(self) -> &'static str {
+        match self {
+            Class::Behaviour => "Behaviour",
+            Class::Scan => "Multi-service scans",
+            Class::Http => "HTTP on shell port",
+            Class::Entry => "Login only",
+        }
+    }
+
+    fn badge(self) -> &'static str {
+        match self {
+            Class::Behaviour => "commands",
+            Class::Scan => "scan",
+            Class::Http => "http",
+            Class::Entry => "login only",
+        }
+    }
+}
+
+/// `campaign` rows the list can show, with the class each belongs to computed in SQL so a filter,
+/// a count and a page agree. The opening falls back to the label's text after its count prefix.
+const CLASSED: &str = "SELECT c.*, \
+       CASE WHEN c.kind = 'scanner' THEN 'scan' \
+            WHEN o.opening = $1 THEN 'http' \
+            WHEN o.opening = $2 THEN 'login' \
+            ELSE 'behaviour' END AS class \
+     FROM campaign c, LATERAL (SELECT coalesce(c.representative->>'opening', \
+            regexp_replace(c.label, '^[^:]*: ', '')) AS opening) o \
+     WHERE c.kind <> 'sample'";
+
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     kind: Option<String>,
+    sort: Option<String>,
+    single: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sort {
+    Hosts,
+    LastSeen,
+    FirstSeen,
+}
+
+impl Sort {
+    fn parse(s: Option<&str>) -> Sort {
+        match s {
+            Some("last_seen") => Sort::LastSeen,
+            Some("first_seen") => Sort::FirstSeen,
+            _ => Sort::Hosts,
+        }
+    }
+
+    fn value(self) -> &'static str {
+        match self {
+            Sort::Hosts => "hosts",
+            Sort::LastSeen => "last_seen",
+            Sort::FirstSeen => "first_seen",
+        }
+    }
+
+    /// Fixed text, never built from input. Every order ends in the id so paging is stable.
+    fn order_by(self) -> &'static str {
+        match self {
+            Sort::Hosts => "member_count DESC, last_seen DESC, id DESC",
+            Sort::LastSeen => "last_seen DESC, member_count DESC, id DESC",
+            Sort::FirstSeen => "first_seen DESC, member_count DESC, id DESC",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct ListRow {
     id: i64,
-    kind: &'static str,
-    label: String,
+    /// The commands (or services) that identify the campaign, without the count prefix.
+    text: String,
+    /// "4-16 commands" for a command sequence; empty for the other classes.
+    range: String,
+    badge: &'static str,
     members: i32,
-    sightings: String,
-    first_seen: String,
-    last_seen: String,
-    role: &'static str,
+    /// The score class that colours the host count, shared with the review queue's numbers.
+    tier: &'static str,
+    active: String,
+    active_title: String,
     spark: Vec<Bar>,
     sensors: Vec<SensorCount>,
-    samples: Vec<SampleLink>,
-    more_samples: usize,
+    sample_count: usize,
+    first_sample: Option<SampleLink>,
+    worm: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct KindTab {
     value: &'static str,
     label: &'static str,
+    count: i64,
+}
+
+/// The review queue's tier colours, applied to a host count: a campaign of ten hosts is the kind
+/// an operator acts on, three is worth a look, fewer is background.
+pub(crate) fn hosts_tier(members: i32) -> &'static str {
+    if members >= 10 {
+        "aggressive"
+    } else if members >= 3 {
+        "standard"
+    } else {
+        "none"
+    }
+}
+
+/// A command-sequence label is `{count}: {opening}`; split it for the two-line cell.
+fn split_label(label: &str) -> (String, String) {
+    match label.split_once(": ") {
+        Some((count, rest)) if count.ends_with("command") || count.ends_with("commands") => {
+            (rest.to_string(), count.to_string())
+        }
+        Some((_, rest)) => (rest.to_string(), String::new()),
+        None => (label.to_string(), String::new()),
+    }
 }
 
 /// How far the indexer has read: the cursor against the newest ledger id. Both are primary-key
@@ -345,22 +515,56 @@ async fn list_page(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Html<String>, AppError> {
-    let kind = query.kind.as_deref().and_then(Kind::parse);
-    let kind_text = kind.map(Kind::as_str);
-    let rows = sqlx::query(
-        "SELECT id, kind, label, member_count, sightings, first_seen, last_seen, self_propagating \
-         FROM campaign WHERE ($1::text IS NULL OR kind = $1) \
-         ORDER BY last_seen DESC, id DESC LIMIT $2",
-    )
-    .bind(kind_text)
+    let class = query.kind.as_deref().and_then(Class::parse);
+    let sort = Sort::parse(query.sort.as_deref());
+    let show_single = query.single.as_deref() == Some("1");
+    // Only constants are interpolated: the class query and a fixed ORDER BY chosen by `Sort`.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT id, label, member_count, first_seen, last_seen, class \
+         FROM ({CLASSED}) x WHERE ($3::text IS NULL OR class = $3) \
+           AND ($4 OR member_count > 1) ORDER BY {} LIMIT $5",
+        sort.order_by()
+    )))
+    .bind(OPENING_HTTP)
+    .bind(OPENING_ENTRY_ONLY)
+    .bind(class.map(Class::value))
+    .bind(show_single)
     .bind(LIST_LIMIT)
     .fetch_all(&state.db)
     .await?;
-    let total: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM campaign WHERE ($1::text IS NULL OR kind = $1)")
-            .bind(kind_text)
-            .fetch_one(&state.db)
-            .await?;
+    // Per class, how many campaigns have one host and how many have more.
+    let counts: Vec<(String, bool, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT class, member_count > 1, count(*) FROM ({CLASSED}) x GROUP BY 1, 2"
+    )))
+    .bind(OPENING_HTTP)
+    .bind(OPENING_ENTRY_ONLY)
+    .fetch_all(&state.db)
+    .await?;
+    let in_class = |c: Option<&str>, multi: Option<bool>| -> i64 {
+        counts
+            .iter()
+            .filter(|(k, m, _)| c.is_none_or(|c| k == c) && multi.is_none_or(|x| x == *m))
+            .map(|(_, _, n)| n)
+            .sum()
+    };
+    // What the page lists: every campaign of the class, or only those of more than one host.
+    let listed = if show_single { None } else { Some(true) };
+    let current = class.map(Class::value);
+    let single_hidden = if show_single {
+        0
+    } else {
+        in_class(current, Some(false))
+    };
+    let total = in_class(current, listed);
+    let tabs: Vec<KindTab> = Class::ALL
+        .iter()
+        .map(|c| KindTab {
+            value: c.value(),
+            label: c.tab_label(),
+            count: in_class(Some(c.value()), listed),
+        })
+        .collect();
+    let all_count = in_class(None, listed);
     let ids: Vec<i64> = rows
         .iter()
         .map(|r| r.try_get("id"))
@@ -374,43 +578,58 @@ async fn list_page(
         day_counts(&state.db, &ids, today - Duration::days(LIST_SPARK_DAYS - 1)).await,
     );
     let mut sensors = degraded.soft("campaign sensors", sensor_counts(&state.db, &ids).await);
-    let mut samples = degraded.soft("linked samples", linked_samples(&state.db, &ids, 3).await);
+    let mut samples = degraded.soft("linked samples", linked_samples(&state.db, &ids, 1).await);
+    let first_shas: Vec<String> = samples
+        .values()
+        .filter_map(|(links, _)| links.first().map(|l| l.sha256.clone()))
+        .collect();
+    let sample_campaigns = degraded.soft(
+        "sample campaigns",
+        campaigns_by_sample(&state.db, &first_shas).await,
+    );
     let (indexed, newest) = degraded.soft("indexer progress", indexer_progress(&state.db).await);
 
+    let now = Utc::now();
     let mut campaigns = Vec::with_capacity(rows.len());
     for r in rows {
         let id: i64 = r.try_get("id")?;
-        let kind: String = r.try_get("kind")?;
-        let (sample_links, more_samples) = samples.remove(&id).unwrap_or_default();
+        let class: String = r.try_get("class")?;
+        let label: String = r.try_get("label")?;
+        let members: i32 = r.try_get("member_count")?;
+        let (mut links, more) = samples.remove(&id).unwrap_or_default();
+        let first_sample = (!links.is_empty()).then(|| links.remove(0));
+        let sample_count = usize::from(first_sample.is_some()) + more;
+        let worm = first_sample.as_ref().is_some_and(|s| {
+            sample_campaigns
+                .get(&s.sha256)
+                .is_some_and(|c| c.role == "infected host")
+        });
         let mut top = sensors.remove(&id).unwrap_or_default();
         top.truncate(3);
+        let (text, range) = split_label(&label);
+        let (active, active_title) =
+            format_active(r.try_get("first_seen")?, r.try_get("last_seen")?, now);
         campaigns.push(ListRow {
             id,
-            kind: kind_label(&kind),
-            label: r.try_get("label")?,
-            members: r.try_get("member_count")?,
-            sightings: group_digits(r.try_get("sightings")?),
-            first_seen: format_timestamp(r.try_get("first_seen")?),
-            last_seen: format_timestamp(r.try_get("last_seen")?),
-            role: member_role(&kind, r.try_get("self_propagating")?),
+            text,
+            range,
+            badge: Class::parse(&class).map_or("", Class::badge),
+            members,
+            tier: hosts_tier(members),
+            active,
+            active_title,
             spark: sparkline(
                 &days.get(&id).cloned().unwrap_or_default(),
                 today,
                 LIST_SPARK_DAYS,
             ),
             sensors: top,
-            samples: sample_links,
-            more_samples,
+            sample_count,
+            first_sample,
+            worm,
         });
     }
 
-    let tabs: Vec<KindTab> = Kind::ALL
-        .iter()
-        .map(|k| KindTab {
-            value: k.as_str(),
-            label: k.label(),
-        })
-        .collect();
     let tmpl = state.templates.get_template("campaigns.html")?;
     Ok(Html(tmpl.render(context! {
         active_nav => "campaigns",
@@ -421,7 +640,11 @@ async fn list_page(
         campaigns,
         total,
         shown_limit => LIST_LIMIT,
-        kind => kind_text.unwrap_or(""),
+        kind => current.unwrap_or(""),
+        sort => sort.value(),
+        show_single,
+        single_hidden,
+        all_count,
         tabs,
         indexed,
         newest,
@@ -890,6 +1113,48 @@ mod tests {
         assert_eq!(bars[2].h, 0);
         assert_eq!(bars[0].day, "2026-10-04");
         assert_eq!(bars[3].x, 3 * SPARK_STEP);
+    }
+
+    #[test]
+    fn the_class_phrases_are_the_ones_the_indexer_writes() {
+        use review::campaign::fingerprint::opening;
+        let shapes = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(opening(&shapes(&["GET / HTTP/1.1"])), OPENING_HTTP);
+        assert_eq!(opening(&shapes(&["enable", "system"])), OPENING_ENTRY_ONLY);
+    }
+
+    #[test]
+    fn a_label_splits_into_its_text_and_its_command_range() {
+        assert_eq!(
+            split_label("4-16 commands: uname -a ; nproc"),
+            ("uname -a ; nproc".to_string(), "4-16 commands".to_string())
+        );
+        assert_eq!(
+            split_label("1 command: id"),
+            ("id".to_string(), "1 command".to_string())
+        );
+        // A scanner's label has no count; a colon inside the commands stays in the text.
+        assert_eq!(
+            split_label("multi-service scan: ssh, telnet"),
+            ("ssh, telnet".to_string(), String::new())
+        );
+        assert_eq!(
+            split_label("3 commands: echo a: b"),
+            ("echo a: b".to_string(), "3 commands".to_string())
+        );
+        assert_eq!(
+            split_label("no prefix"),
+            ("no prefix".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn host_counts_take_the_review_queues_tier_colours() {
+        assert_eq!(hosts_tier(10), "aggressive");
+        assert_eq!(hosts_tier(9), "standard");
+        assert_eq!(hosts_tier(3), "standard");
+        assert_eq!(hosts_tier(2), "none");
+        assert_eq!(hosts_tier(1), "none");
     }
 
     #[test]

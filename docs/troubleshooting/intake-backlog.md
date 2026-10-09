@@ -130,7 +130,9 @@ What discarding costs, stated plainly:
 - The archive also holds every line intake had already ingested from that file, so it is not
   the backlog alone.
 - The tailer logs the discard and `intake-rotation-loss` pages for an hour; here that is the
-  record of your decision.
+  record of your decision. If intake was stopped when you truncated, the same is reported on its
+  next start: the generation it was reading is gone, and no older rotated copy is read in its
+  place.
 - There is no re-import tool `[planned]`.
 
 A scheduled rotation of a log intake is behind on does not do this: the lag metrics keep counting

@@ -231,5 +231,7 @@ intake is keeping up, wait for the fleet pane's `behind:` badge to clear before 
 intake cursor notices the truncation and resumes at the start of the file; when it was behind,
 the tailer reports the discarded lines as a rotation loss (a journal WARN and an
 `intake-rotation-loss` page for an hour), which here is the expected record of a decision you
-made. The last command confirms the next scheduled run is healthy; delete the archive once you
-no longer need it.
+made. The same holds if you truncate while intake is stopped: on its next start the generation its
+saved position was in cannot be found, which is reported as a loss, and nothing older is read in
+its place (a rotated `events.jsonl.1` left from an earlier rotation is not re-ingested). The last
+command confirms the next scheduled run is healthy; delete the archive once you no longer need it.

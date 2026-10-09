@@ -154,13 +154,10 @@ original in place, so the sensor's open descriptor never needs to reopen
   offset; expansion is capped at 512 MiB and starts only with that plus a 512 MiB reserve free
   (`statvfs`), otherwise the generation is reported lost as "insufficient disk to expand", as is
   one that runs out of space midway. If the generation cannot be found at all (a truncated or
-  corrupt `.2.gz`, or a copy pushed deeper), the first poll after a start reads an uncompressed
-  `.1`/`.2` from 0 only if it is positively newer: the cursor records the last copy the reader
-  finished (fingerprint, window, inode, time), and the candidate must be a different file written
-  after that time. With no such record, or a candidate that is the finished copy (the case after a
-  manual `truncate` of the live log while the reader is stopped), nothing is read and the loss is
-  reported. A running tailer never reads here: its state follows the live file, so a non-matching
-  copy is an older generation. The guard exists to prevent a second rotation while a copy is
+  corrupt `.2.gz`, a copy pushed deeper, or the live log truncated by hand while the reader was
+  stopped), the loss is reported and no rotated copy is read in its place: nothing says whether a
+  remaining copy is older (already ingested) or newer than the lost generation, and guessing wrong
+  re-ingests a whole generation. The guard exists to prevent a second rotation while a copy is
   unread.
 - **A fingerprint is compared over its own window.** The cursor records how many bytes its
   fingerprint covers (`fingerprint_len`, absent meaning 256), so a position saved while the log

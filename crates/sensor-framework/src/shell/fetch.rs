@@ -28,7 +28,7 @@ use super::eval::LineBudget;
 use super::lex::{Op, Tok, lex};
 use super::{
     BudgetHit, FakeShell, Fetch, MAX_COMMAND_LEN, MAX_URL_LEN, TraceEventKind, command_basename,
-    download_targets, fetch_attempt,
+    download_targets,
 };
 use crate::sanitize_value;
 
@@ -117,6 +117,7 @@ fn static_word(word: &Word) -> String {
 /// The fetches a text would make if every command in it ran, from its tokens: each is the fetch and
 /// whether its URL was left unexpanded.
 fn lexical_fetches(
+    shell: &FakeShell,
     text: &str,
     max_depth: u32,
     budget: &mut LineBudget,
@@ -124,7 +125,7 @@ fn lexical_fetches(
     out: &mut Vec<(Fetch, bool)>,
 ) {
     let Ok(lexed) = lex(text, true, 1, 0, max_depth, budget) else {
-        for fetch in download_targets(text) {
+        for fetch in download_targets(shell, text) {
             out.push(unexpanded_to_command(fetch, text));
         }
         return;
@@ -161,11 +162,12 @@ fn lexical_fetches(
     }
     commands.push(command);
     for words in commands {
-        command_fetches(&words, max_depth, budget, nesting, out);
+        command_fetches(shell, &words, max_depth, budget, nesting, out);
     }
 }
 
 fn command_fetches(
+    shell: &FakeShell,
     words: &[String],
     max_depth: u32,
     budget: &mut LineBudget,
@@ -210,11 +212,11 @@ fn command_fetches(
         if let Some(script) = script
             && nesting < MAX_SCRIPT_NESTING
         {
-            lexical_fetches(script, max_depth, budget, nesting + 1, out);
+            lexical_fetches(shell, script, max_depth, budget, nesting + 1, out);
         }
         return;
     }
-    if let Some(fetch) = fetch_attempt(&refs) {
+    if let Some(fetch) = shell.fetch_attempt(&refs) {
         out.push(unexpanded_to_command(fetch, &refs.join(" ")));
     }
 }
@@ -251,7 +253,7 @@ impl FakeShell {
         if !self.fetches.enabled {
             return;
         }
-        let Some(fetch) = fetch_attempt(argv) else {
+        let Some(fetch) = self.fetch_attempt(argv) else {
             return;
         };
         let fetch = match fetch {
@@ -288,7 +290,7 @@ impl FakeShell {
         let mut budget = LineBudget::new(self.budget().limits().work_per_line);
         for unit in &fetches.units {
             let mut found = Vec::new();
-            lexical_fetches(unit, max_depth, &mut budget, 0, &mut found);
+            lexical_fetches(self, unit, max_depth, &mut budget, 0, &mut found);
             for (fetch, unexpanded) in found {
                 let superseded = unexpanded && executed_any;
                 if !superseded && !all.contains(&fetch) {

@@ -995,8 +995,43 @@ mod syntax_errors {
         let mut sh = shell();
         run(&mut sh, "cat > /tmp/s <<EOF\necho one\n)\necho two\nEOF");
         let (out, _) = sh.handle_input("sh /tmp/s");
-        assert_eq!(out, "one\nsh: 2: Syntax error: \")\" unexpected\n");
+        // dash names the script as it was typed: `/tmp/s: 2: Syntax error: ...`.
+        assert_eq!(out, "one\n/tmp/s: 2: Syntax error: \")\" unexpected\n");
         assert_eq!(out.status, 2);
+    }
+
+    /// The prefix of a dash diagnostic is `$0`: the script as typed (relative, with a directory,
+    /// absolute), the operand after `-c CMD`, and `sh` where dash has no name. Each reply was
+    /// produced by Ubuntu 22.04's dash.
+    #[test]
+    fn a_dash_script_names_itself_as_it_was_typed() {
+        let mut sh = shell();
+        run(&mut sh, "mkdir -p /tmp/d/sub; cd /tmp/d");
+        run(&mut sh, "echo ./nosuch > .s; echo ./nosuch > sub/x.sh");
+        run(
+            &mut sh,
+            "echo 'sh -c ./nosuch3' > outer; echo ./nosuch4 >> outer",
+        );
+        for (line, want) in [
+            ("sh .s", ".s: 1: ./nosuch: not found\n"),
+            ("sh ./.s", "./.s: 1: ./nosuch: not found\n"),
+            ("sh /tmp/d/.s", "/tmp/d/.s: 1: ./nosuch: not found\n"),
+            ("sh sub/x.sh", "sub/x.sh: 1: ./nosuch: not found\n"),
+            ("sh -c ./nosuch", "sh: 1: ./nosuch: not found\n"),
+            ("sh -c ./nosuch myname", "myname: 1: ./nosuch: not found\n"),
+            // A script that starts another keeps each its own name; `sh -c` inside has none.
+            (
+                "sh outer",
+                "sh: 1: ./nosuch3: not found\nouter: 2: ./nosuch4: not found\n",
+            ),
+        ] {
+            assert_eq!(run(&mut sh, line), want, "{line}");
+        }
+        // Standard input is nameless, and so is a script piped in.
+        assert_eq!(
+            run(&mut sh, "echo ./nosuch | sh"),
+            "sh: 1: ./nosuch: not found\n"
+        );
     }
 }
 

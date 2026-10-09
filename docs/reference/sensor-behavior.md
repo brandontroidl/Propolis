@@ -490,8 +490,10 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   22.04, and on the Android persona mksh's `sh: ./x: not executable: 32-bit ELF file` (`64-bit`
   for a 64-bit build), read from the AOSP marshmallow-release `external/mksh/src/exec.c`
   (`scriptexec`). TODO: mksh's status is 1 by that source's `errorf` and the phone's exact prefix
-  has no device capture [unverified]. The script-file form of dash's prefix (`.s: 3:` rather than
-  `sh: 3:`) is a known gap shared with every dash script error. The stage-2 URL it would have
+  has no device capture [unverified]. Every dash error names the script as typed after `sh` (`.s: 3:`,
+  `./x.sh: 1:`, `sub/x.sh: 1:`), or the operand after `sh -c CMD` (`myname: 1:`), and says `sh: 1:`
+  for `-c` without one and for a script on standard input, as Ubuntu 22.04's dash does
+  (`crates/sensor-framework/src/shell/mod.rs#FakeShell::dash_name`). The stage-2 URL it would have
   requested is emitted as a `honeypot_file_download` marked `derived_from: echo_loader_args`, for
   the vetted fetcher only ([attack-surfaces.md](../security/attack-surfaces.md#malware-fetcher-attacker-directed-outbound)).
 - Base64 APK loaders on the Android shell (`crates/sensor-framework/src/shell/loader.rs`,

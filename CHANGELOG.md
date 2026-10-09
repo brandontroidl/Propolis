@@ -21,6 +21,15 @@
 
 ### Fixed
 
+- **A dash script's errors name the script, as dash words them** - every error of a script run
+  with `sh FILE` read `sh: 3: ./x: not found`, where Ubuntu 22.04's dash prints the script as it
+  was typed: `.s: 3: ./x: not found`, `./x.sh: 1: ...`, `sub/x.sh: 1: ...`, `/tmp/x.sh: 2: Syntax
+  error: ...`. `sh -c CMD NAME` names `NAME`, and `-c` without one, a script on standard input and
+  an interactive `sh` stay `sh: 1:`. A script that starts another keeps each its own name. This is
+  the prefix of the not-found, `Exec format error`, syntax and arithmetic errors alike, and the
+  per-architecture dropper fixture now expects `.s: 3: ./.c: Exec format error`. Checked line by
+  line against dash in an `ubuntu:22.04` container.
+
 - **The phone's `tr -C` complements, as `-c` does** - the toybox port treated `-C` as accepted
   and ignored, but toybox 6.0.1's option string is `^>2<1Ccsd[+cC]`: the `[+cC]` group makes each
   of the two set the other's flag, and the applet reads only the `c` flag, so `tr -Cd 'a-c'` keeps

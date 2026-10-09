@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-08
 -->
 
 # Queue and spool behavior
@@ -13,8 +13,9 @@ What happens between a captured malware body and a stored sample, and what an op
 when either stage is overloaded. This is the operational companion to [capacity
 planning](./capacity-planning.md) (the numbers) and [event and sample
 lifecycle](../architecture/event-and-sample-lifecycle.md) (the design). Only the
-`sensor-ssh`, `sensor-ftp`, `sensor-adb`, and `sensor-telnet` sensors spool bodies; the rest
-capture metadata only.
+`sensor-ssh`, `sensor-adb`, `sensor-ftp`, `sensor-telnet`, `sensor-tftp`, and `sensor-mqtt`
+sensors spool bodies (the set is `crates/review/src/spool.rs#BODY_SPOOLERS`); the rest capture
+metadata only.
 
 ## The hand-off path
 

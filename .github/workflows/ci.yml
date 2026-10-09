@@ -182,3 +182,23 @@ jobs:
           rust-version: "1.96.1"
           command: check
           arguments: --all-features
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # The scripts deploy/ ships run as root on the sensor host, so they are linted at every
+      # severity. The tool is the official koalaman/shellcheck v0.11.0 image, pinned to the digest
+      # of its multi-arch index (the runner's apt shellcheck is whatever the image ships that
+      # week). `-x` follows `source`d files. A finding is either fixed or carries an inline
+      # `# shellcheck disable=SCxxxx # reason`.
+      - name: shellcheck deploy and scripts
+        run: |
+          shopt -s globstar nullglob
+          files=(deploy/*.sh scripts/**/*.sh)
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt \
+            koalaman/shellcheck@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d \
+            -x "${files[@]}"

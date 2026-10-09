@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Build and test
@@ -39,6 +39,7 @@ way, a cheap failure cannot hide an expensive one.
 | **tests** | `cargo test --workspace --locked -- --test-threads=1` (under `set -o pipefail`) | yes |
 | **release build** | `cargo build --release --workspace --locked` | no |
 | **dependency policy** | `cargo deny check --all-features` against `deny.toml` (see [supply chain](../security/supply-chain.md#dependency-policy-denytoml)) | no |
+| **shellcheck** | `shellcheck -x deploy/*.sh scripts/**/*.sh`, the `koalaman/shellcheck` v0.11.0 image pinned by digest | no |
 
 The release job compiles the profile `deploy/upgrade.sh` ships. The other three
 compile the dev profile, so a release-only break (the vendored-crate checksum

@@ -25,6 +25,7 @@ reserve="${PROPOLIS_LOGROTATE_RESERVE_BYTES:-536870912}"
 
 size="$(stat -c %s -- "$log")"
 # %a free blocks available to a non-root writer, %S the block size those counts are in.
+# shellcheck disable=SC2046 # splitting the two integers stat prints into $1 and $2 is the point
 set -- $(stat -f -c '%a %S' -- "$log")
 avail=$(($1 * $2))
 need=$((size + size / 4 + reserve))

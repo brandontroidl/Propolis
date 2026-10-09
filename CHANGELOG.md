@@ -87,6 +87,12 @@
 
 ### Fixed
 
+- **A flaky "Text file busy" in the deploy tests** - `deploy_test` wrote fixture scripts and ran
+  them while another test thread's fork could still hold the write descriptor, so
+  `upgrade_guard_skips_the_pull_and_requires_the_carried_timestamp` and
+  `upgrade_reexecs_once_when_the_pull_changes_the_script_and_does_not_pull_again` failed in 7 of
+  200 parallel runs. Writing an executable and spawning a child now share one lock, held across
+  the spawn and never the wait; 0 of 200 afterwards. Test-only.
 - **The fetcher never dials a public DNS resolver** - observed 2026-10-08: a telnet bot tested
   wget, curl, tftp and ftpget against `http://1.1.1.1/wget.sh` and its siblings, and the fetcher
   followed the URLs to Cloudflare. The never-dial check now also refuses the published addresses

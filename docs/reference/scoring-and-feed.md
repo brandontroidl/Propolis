@@ -216,8 +216,12 @@ is_reserved(ip) || allowlist_cidr_contains(ip) || delist_contains(ip) || asn_all
   ASN ownership is RIR-registered, not per-IP spoofable. An empty allowlist
   short-circuits before any DB lookup; a non-empty allowlist with no ASN DB
   loaded means suppression is configured but INERT
-  (`crates/feed/src/exclusion.rs`, `crates/feed/src/exclusion.rs#with_asn_allowlist`,
-  `crates/feed/src/exclusion.rs#lookup_asn`, `crates/feed/src/exclusion.rs#asn_db_loaded`).
+  (`crates/feed/src/exclusion.rs#with_asn_allowlist`, `crates/core-scoring/src/allowlist.rs#lookup_asn`,
+  `crates/feed/src/exclusion.rs#asn_db_loaded`).
+- The CIDR and ASN allowlist is one definition, `OperatorAllowlist`
+  (`crates/core-scoring/src/allowlist.rs#contains`), because the review stage applies it too:
+  `ExclusionEngine` delegates to it for the feed, and the review queue and submission runner use
+  the same value for vendor reporting (see [Declared crawlers](#declared-crawlers)).
 
 The publisher re-validates every entry against exclusions at publish time; the
 FIRST violation rejects the WHOLE build, unlike the builder which drops
@@ -235,8 +239,8 @@ and only the first can change what is published:
   `PROPOLIS_FEED_ALLOWLIST`. To exempt a crawler, copy the address ranges its
   operator publishes into that file and restart; the daemon never fetches them.
   The file is read once at startup and is all-or-nothing
-  (`crates/feed/src/exclusion.rs#parse_allowlist_text`,
-  `crates/feed/src/exclusion.rs#load_allowlist_file`): an unreadable file, a
+  (`crates/core-scoring/src/allowlist.rs#parse_allowlist_text`,
+  `crates/core-scoring/src/allowlist.rs#load_allowlist_file`): an unreadable file, a
   line that is not a CIDR (a bare address is rejected), an entry wider than /8
   (IPv4) or /16 (IPv6), more than 50,000 entries, more than 1 MiB, or non-UTF-8
   content refuses to start the daemon. A corrupted list therefore cannot exclude
@@ -249,9 +253,17 @@ and only the first can change what is published:
   the file is scored and published like any other
   (`crates/feed/tests/builder_test.rs#a_claimed_crawler_is_published_unless_its_address_is_in_an_operator_range_file`).
 
-The allowlist is applied when the feed is built and published. It does not stop
-an address from being scored or queued for review, and the vendor submission
-path does not consult it.
+The allowlist is applied when the feed is built and published, and again by the
+review stage: `ReviewQueue::populate` never queues a listed address,
+`ReviewQueue::withdraw` removes a Pending one (logged with the reason
+`allowlisted`), and `SubmissionRunner::run_once` refuses a listed address before
+any vendor call, as a second line of defence for an entry queued or approved
+before the list covered it
+(`crates/review/src/queue.rs#populate`, `crates/review/src/queue.rs#withdraw`,
+`crates/review/src/submit.rs#run_once`;
+`crates/review/tests/allowlist_test.rs`). It does not change scoring: a listed
+address is still scored and shown in the console. The list is read once at
+startup, so an edit needs a restart.
 
 ## Reserved-range guard (`crates/core-scoring/src/net.rs`)
 

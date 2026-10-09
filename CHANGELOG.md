@@ -4,6 +4,19 @@
 
 ### Changed
 
+- **The operator allowlist now covers vendor reporting, not only the published feed** - an address
+  in `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE` or an ASN in
+  `PROPOLIS_FEED_ASN_ALLOWLIST` was kept out of the feed but still reached the review queue and
+  could be submitted to AbuseIPDB, DShield and OTX on approval, so a declared crawler could be
+  reported as an attacker. The review queue no longer surfaces a listed address, withdraws one that
+  is already Pending (logged with the reason `allowlisted`; the row is deleted, so removing the
+  address from the list surfaces it again), and the submission runner refuses a listed address
+  before any vendor call even if it was approved before the list covered it. Scoring is unchanged
+  and the console still shows the activity. The list is read once at startup, so an edit needs a
+  restart (a standalone `review` unit needs the variables in its own env file). The parser and the
+  matcher moved from `feed` to `core-scoring::allowlist` so the feed and the review stage share one
+  implementation; malformed-file refusal and the width and size caps are unchanged. The console's
+  queue and IP pages do not yet say "allowlisted".
 - **The review queue reads at a glance** - fifty-six pending rows had become a wall: a notes
   textarea and three buttons on every row, "honeypot" in every Categories cell, a score bar that
   hardly varied, and five hosts of one campaign as five full rows. Pending entries now group by
@@ -213,7 +226,7 @@
   the header text). The label is display only: a User-Agent is attacker-controlled, so it changes
   no score, queue entry or feed decision, and a ClaudeBot User-Agent from an address that is not in
   the file is scored and published like any other source
-  (`crates/feed/src/exclusion.rs#load_allowlist_file`, `crates/sensor-http/src/crawler.rs#claimed_crawler`).
+  (`crates/core-scoring/src/allowlist.rs#load_allowlist_file`, `crates/sensor-http/src/crawler.rs#claimed_crawler`).
 
 - **Docs: `docs/operations/captured-content-handling.md`** - the operator procedure for a capture
   that may be illegal material (above all CSAM): what the console and spool already do to limit

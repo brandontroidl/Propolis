@@ -20,7 +20,7 @@ owner of the component inventory and the inter-crate dependency graph.
 | Crate | Kind | Binary | Purpose |
 |---|---|---|---|
 | `sensor-wire` | library (leaf) | none | Frozen sensor->intake NDJSON wire format (`WIRE_VERSION = 1`); the single source of truth imported by every sensor and by intake. |
-| `core-scoring` | library (leaf) | none | Event ledger and scoring engine: append events, chain-hashing, `ip_score`, blocklist eligibility; owns the core migrations. |
+| `core-scoring` | library | none | Event ledger and scoring engine: append events, chain-hashing, `ip_score`, blocklist eligibility; owns the core migrations. Also owns the operator allowlist shared by the feed and the review stage (`allowlist.rs`), so it depends on `geoip`. |
 | `geoip` | library (leaf) | none | Offline MaxMind GeoLite2 City + ASN enrichment (local file reads only, egress-free); both DBs optional. |
 | `sensor-framework` | library | none | Shared sensor harness: TCP/UDP listener lifecycle, WAN attribution, sanitize, event emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds. Also provides per-sensor server-side TLS (`crates/sensor-framework/src/tls.rs`): a fail-closed cert/key loader, an implicit-TLS listener and a plaintext-to-TLS stream for STARTTLS-style upgrades. Seven sensors use it (http, redis, mqtt, smtp, ftp, cred, dns); see [Networking and TLS](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners). |
 | `sensor-catchall` | lib + bin | `sensor-catchall` | Passive protocol-agnostic TCP/UDP catch-all; emits `catchall_probe` for unprompted traffic. |
@@ -77,7 +77,8 @@ config/environment set by the deploy units, not from source. See
 ## Dependency graph
 
 Internal dependencies are declared as `path=` entries. Leaves (no internal deps):
-`sensor-wire`, `core-scoring`, `geoip`, `fleet`, `log-tailer`, `collector-wire`.
+`sensor-wire`, `geoip`, `fleet`, `log-tailer`, `collector-wire`. `core-scoring` depends only
+on `geoip` (for the shared operator allowlist's ASN lookup).
 
 ```mermaid
 graph TD
@@ -99,6 +100,7 @@ graph TD
   certs[provision-certs]
   watchc[watch]
 
+  core --> geoip
   fw --> wire
   sensors --> wire
   sensors --> fw

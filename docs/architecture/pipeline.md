@@ -116,7 +116,8 @@ IP's last event, so an entry cannot slide between tiers between builds.
   and they never reach the tier files.
 - **Exclusions.** Reserved ranges, an operator CIDR allowlist, explicit delisting, and
   optional ASN suppression are applied at build time, using the same reserved-range
-  list the vendor path uses.
+  list the vendor path uses. The same allowlist also keeps listed addresses out of the
+  review queue and vendor submission (section 5).
 - **Timestamps.** Every exported time is rounded to the hour so the feed does not reveal
   exactly when your sensors saw something.
 - **Atomic publish.** Every format (`.txt`, `.json`, `.csv`, `.cidr`, `.ipset`, `.nft`,
@@ -145,6 +146,10 @@ review queue, and the report must pass the gatekeeper.
 
 - **Vendors.** AbuseIPDB, DShield and OTX. A vendor configured with an empty key is
   disabled rather than tried. DShield's wire contract is marked provisional in the code.
+- **Operator allowlist.** An address on the operator allowlist is never added to the
+  review queue, a Pending entry for one is withdrawn, and the runner refuses one before
+  any vendor call even if it was approved before the list covered it. The list is read
+  once at startup.
 - **Gatekeeper.** An ordered sequence of checks that stops at the first hold: reserved
   address, vendor disabled, last seen more than 48 hours ago, a successful report to
   this vendor within the cooldown, the vendor-wide rate limit, the score floor, and the

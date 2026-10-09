@@ -53,6 +53,11 @@
 
 ### Changed
 
+- **The evidence timeline's header says what it counts** - it read "54 events", which looked like
+  the address's total or its commands. It now reads, for example, `newest 200 events: 199
+  commands, 1 session, 1 outside any session`: ledger rows on the page, of which command
+  events, the distinct sessions, and rows that predate session tracking. "newest" appears only
+  when older events wait behind Load more.
 - **Campaigns and Samples say what the bots are doing and what they dropped** - the Campaigns list
   was a wall of "same sample" and "same commands" rows, one per host and per command count, and
   Samples repeated it. The list now sorts by hosts (then last seen; links for last and first

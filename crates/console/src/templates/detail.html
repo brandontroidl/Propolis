@@ -285,7 +285,7 @@
 </div>
 
 <div class="panel">
-  <div class="panel-head">Evidence timeline <span class="dim">{{ total_event_count }} events</span></div>
+  <div class="panel-head">Evidence timeline <span class="dim">{% if has_more_events %}newest {% endif %}{{ timeline_counts.events }} event{% if timeline_counts.events != 1 %}s{% endif %}: {{ timeline_counts.commands }} command{% if timeline_counts.commands != 1 %}s{% endif %}, {{ timeline_counts.sessions }} session{% if timeline_counts.sessions != 1 %}s{% endif %}{% if timeline_counts.ungrouped %}, {{ timeline_counts.ungrouped }} outside any session{% endif %}</span></div>
   <div class="panel-body" id="evidence-timeline">
     {% include "session_cards.html" %}
 

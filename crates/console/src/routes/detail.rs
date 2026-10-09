@@ -138,6 +138,39 @@ struct EventRow {
     metadata: serde_json::Value,
 }
 
+/// What the evidence timeline's first page holds, by unit, for its header. The header used to say
+/// "N events" alone, which read as the address's total (the stat above counts scored events) or as
+/// its commands; it is the number of ledger rows on the page.
+#[derive(Debug, PartialEq, Serialize)]
+struct TimelineCounts {
+    /// Ledger rows on the page.
+    events: usize,
+    /// Of those, `honeypot_command_exec` rows.
+    commands: usize,
+    /// Distinct `session_id`s among them.
+    sessions: usize,
+    /// Rows with no `session_id` (they predate session tracking).
+    ungrouped: usize,
+}
+
+impl TimelineCounts {
+    fn of(events: &[EventRow]) -> Self {
+        let sessions: std::collections::BTreeSet<&str> = events
+            .iter()
+            .filter_map(|e| e.session_id.as_deref())
+            .collect();
+        Self {
+            events: events.len(),
+            commands: events
+                .iter()
+                .filter(|e| e.signal_type_raw == "honeypot_command_exec")
+                .count(),
+            sessions: sessions.len(),
+            ungrouped: events.iter().filter(|e| e.session_id.is_none()).count(),
+        }
+    }
+}
+
 /// One collapsible session card: every `EventRow` sharing a non-null `session_id`, in
 /// chronological (oldest-first) order, plus the summary [`group_into_sessions`] derives from
 /// them for the card header.
@@ -532,7 +565,7 @@ async fn detail(
         "download outcomes",
         attach_fetch_outcomes(&state.db, &mut all_events).await,
     );
-    let total_event_count = all_events.len();
+    let timeline_counts = TimelineCounts::of(&all_events);
     let has_more_events = all_events.len() as i64 == EVIDENCE_PAGE_SIZE;
     let next_cursor = all_events
         .last()
@@ -717,7 +750,7 @@ async fn detail(
         last_seen => format_timestamp(score.last_seen),
         session_folds,
         ungrouped,
-        total_event_count,
+        timeline_counts,
         has_more_events,
         next_cursor,
         per_wan,

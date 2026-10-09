@@ -441,3 +441,80 @@ async fn the_load_more_fragment_carries_outcomes_too(pool: PgPool) {
     let r = row(&fragment, "198.51.100.41");
     assert!(r.contains("refused") && r.contains("Loopback"), "{r}");
 }
+
+/// The timeline header's count line.
+fn header(body: &str) -> String {
+    let at = body.find("Evidence timeline").expect("heading");
+    let from = &body[at..];
+    let open =
+        from.find("<span class=\"dim\">").expect("count span") + "<span class=\"dim\">".len();
+    let close = from[open..].find("</span>").expect("count span end");
+    from[open..open + close].to_string()
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_timeline_header_names_events_commands_and_sessions(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.54";
+    scored(&pool, ip).await; // one event outside any session
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    for (i, s) in [a, a, a, b].into_iter().enumerate() {
+        event(
+            &pool,
+            ip,
+            SignalType::HoneypotCommandExec,
+            300 - i as i64,
+            serde_json::json!({ "command": format!("id {i}") }),
+            Some(s),
+        )
+        .await;
+    }
+    event(
+        &pool,
+        ip,
+        SignalType::HoneypotConnection,
+        290,
+        serde_json::json!({}),
+        Some(a),
+    )
+    .await;
+    event(
+        &pool,
+        ip,
+        SignalType::CatchallProbe,
+        280,
+        serde_json::json!({}),
+        None,
+    )
+    .await;
+
+    let body = page(pool, &format!("/ip/{ip}")).await;
+    assert_eq!(
+        header(&body),
+        "7 events: 4 commands, 2 sessions, 2 outside any session"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_full_first_page_says_it_is_the_newest_events_and_uses_singulars(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.55";
+    scored(&pool, ip).await;
+    let s = Uuid::now_v7();
+    for i in 0..199 {
+        event(
+            &pool,
+            ip,
+            SignalType::HoneypotCommandExec,
+            500 - (i % 400),
+            serde_json::json!({ "command": format!("echo {i}") }),
+            Some(s),
+        )
+        .await;
+    }
+    let body = page(pool, &format!("/ip/{ip}")).await;
+    assert_eq!(
+        header(&body),
+        "newest 200 events: 199 commands, 1 session, 1 outside any session"
+    );
+}

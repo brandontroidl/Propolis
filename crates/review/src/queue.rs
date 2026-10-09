@@ -11,12 +11,13 @@
 //! ("Population" / "Withdrawal").
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row, postgres::PgRow};
 
-use core_scoring::ReviewState;
+use core_scoring::{OperatorAllowlist, ReviewState};
 
 /// Errors from the review queue. Every variant is fail-closed: the caller
 /// gets an error and no partial state change is left behind (each operation
@@ -58,12 +59,23 @@ pub struct QueueEntry {
 /// decisions and the pending listing. Stateless - every method takes the
 /// pool it operates against, so callers can share one instance or build a
 /// fresh one per call.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ReviewQueue;
+#[derive(Debug, Default, Clone)]
+pub struct ReviewQueue {
+    allowlist: Arc<OperatorAllowlist>,
+}
 
 impl ReviewQueue {
     pub fn new() -> Self {
-        ReviewQueue
+        Self::default()
+    }
+
+    /// Honour the operator allowlist: an allowlisted address is never surfaced
+    /// and a Pending one is withdrawn. Scoring is untouched - this only decides
+    /// what is offered for vendor reporting. The default queue has an empty
+    /// allowlist and behaves exactly as before.
+    pub fn with_allowlist(mut self, allowlist: Arc<OperatorAllowlist>) -> Self {
+        self.allowlist = allowlist;
+        self
     }
 
     /// Surface every IP that is currently `eligible` and
@@ -72,24 +84,62 @@ impl ReviewQueue {
     /// re-surfaced; see [`Self::reject`]/[`Self::snooze`]). Returns the
     /// number of newly-inserted Pending entries.
     ///
+    /// An address on the operator allowlist is skipped (and counted in the log
+    /// line), so a declared crawler is never offered to the operator for
+    /// reporting. The allowlist is checked here in Rust rather than in SQL
+    /// because ASN membership needs the GeoLite2 database.
+    ///
     /// A Snoozed entry therefore only comes back because an operator brings it back
     /// ([`Self::unsnooze`], or deciding it directly from the Snoozed listing). That is
     /// deliberate - an entry that re-surfaced on its own would ignore the operator's decision to
     /// defer it - but it means the Snoozed listing is the ONLY route back, so any interface that
     /// can snooze must also be able to act on what it snoozed.
     pub async fn populate(&self, pool: &PgPool) -> Result<usize, ReviewError> {
-        let result = sqlx::query(
-            "INSERT INTO review_queue (source_ip, score_at_surface, categories_at_surface) \
-             SELECT source_ip, raw_score, category_breakdown \
-             FROM ip_score \
-             WHERE recommended_for_vendor = TRUE \
-               AND eligible = TRUE \
-               AND NOT delisted \
-               AND source_ip NOT IN (SELECT source_ip FROM review_queue) \
-             ON CONFLICT (source_ip) DO NOTHING",
-        )
-        .execute(pool)
-        .await?;
+        let result = if self.allowlist.is_empty() {
+            sqlx::query(
+                "INSERT INTO review_queue (source_ip, score_at_surface, categories_at_surface) \
+                 SELECT source_ip, raw_score, category_breakdown \
+                 FROM ip_score \
+                 WHERE recommended_for_vendor = TRUE \
+                   AND eligible = TRUE \
+                   AND NOT delisted \
+                   AND source_ip NOT IN (SELECT source_ip FROM review_queue) \
+                 ON CONFLICT (source_ip) DO NOTHING",
+            )
+            .execute(pool)
+            .await?
+        } else {
+            let candidates: Vec<String> = sqlx::query_scalar(
+                "SELECT host(source_ip) FROM ip_score \
+                 WHERE recommended_for_vendor = TRUE \
+                   AND eligible = TRUE \
+                   AND NOT delisted \
+                   AND source_ip NOT IN (SELECT source_ip FROM review_queue)",
+            )
+            .fetch_all(pool)
+            .await?;
+            let (allowed, allowlisted) = self.partition_allowlisted(candidates)?;
+            if !allowlisted.is_empty() {
+                tracing::debug!(
+                    skipped = allowlisted.len(),
+                    "review queue: skipped allowlisted addresses (operator allowlist)"
+                );
+            }
+            sqlx::query(
+                "INSERT INTO review_queue (source_ip, score_at_surface, categories_at_surface) \
+                 SELECT source_ip, raw_score, category_breakdown \
+                 FROM ip_score \
+                 WHERE recommended_for_vendor = TRUE \
+                   AND eligible = TRUE \
+                   AND NOT delisted \
+                   AND source_ip = ANY($1::text[]::inet[]) \
+                   AND source_ip NOT IN (SELECT source_ip FROM review_queue) \
+                 ON CONFLICT (source_ip) DO NOTHING",
+            )
+            .bind(allowed)
+            .execute(pool)
+            .await?
+        };
         let inserted = result.rows_affected() as usize;
         if inserted > 0 {
             tracing::info!(inserted, "review queue: populated new pending entries");
@@ -102,6 +152,16 @@ impl ReviewQueue {
     /// Approved, Rejected, and Snoozed entries are never touched by this scan;
     /// only a still-open (Pending) decision is withdrawn when its trigger
     /// lapses. Returns the number of rows removed.
+    ///
+    /// A Pending entry for an address on the operator allowlist is withdrawn
+    /// too, whatever its score, and each is logged with the reason
+    /// (`allowlisted`). The allowlist is read once at startup, so an address
+    /// added since it was queued is caught on the next scan after a restart.
+    /// Withdrawal deletes the row rather than marking it Rejected: if the
+    /// address later leaves the allowlist it is surfaced again by
+    /// [`Self::populate`] instead of staying buried under a decision the
+    /// operator never made. Approved, Rejected and Snoozed rows are left alone
+    /// here; the submission runner refuses an allowlisted Approved entry.
     pub async fn withdraw(&self, pool: &PgPool) -> Result<usize, ReviewError> {
         let result = sqlx::query(
             "DELETE FROM review_queue \
@@ -114,11 +174,63 @@ impl ReviewQueue {
         .bind(ReviewState::Pending)
         .execute(pool)
         .await?;
-        let removed = result.rows_affected() as usize;
+        let mut removed = result.rows_affected() as usize;
         if removed > 0 {
             tracing::info!(removed, "review queue: withdrew lapsed pending entries");
         }
+        if !self.allowlist.is_empty() {
+            removed += self.withdraw_allowlisted(pool).await?;
+        }
         Ok(removed)
+    }
+
+    async fn withdraw_allowlisted(&self, pool: &PgPool) -> Result<usize, ReviewError> {
+        let pending: Vec<String> =
+            sqlx::query_scalar("SELECT host(source_ip) FROM review_queue WHERE state = $1")
+                .bind(ReviewState::Pending)
+                .fetch_all(pool)
+                .await?;
+        let (_, allowlisted) = self.partition_allowlisted(pending)?;
+        if allowlisted.is_empty() {
+            return Ok(0);
+        }
+        // Re-check `state` in the DELETE: an operator may have decided the entry since the SELECT,
+        // and a decision is never undone by a background scan.
+        let result = sqlx::query(
+            "DELETE FROM review_queue \
+             WHERE state = $1 AND source_ip = ANY($2::text[]::inet[]) \
+             RETURNING host(source_ip)",
+        )
+        .bind(ReviewState::Pending)
+        .bind(&allowlisted)
+        .fetch_all(pool)
+        .await?;
+        for row in &result {
+            let ip: String = row.try_get(0)?;
+            tracing::info!(%ip, reason = "allowlisted", "review queue: withdrew pending entry");
+        }
+        Ok(result.len())
+    }
+
+    /// Split stored/candidate addresses into (not allowlisted, allowlisted). An unparseable value
+    /// is corrupt state and fails the scan rather than being silently kept or dropped.
+    fn partition_allowlisted(
+        &self,
+        ips: Vec<String>,
+    ) -> Result<(Vec<String>, Vec<String>), ReviewError> {
+        let mut kept = Vec::new();
+        let mut allowlisted = Vec::new();
+        for text in ips {
+            let ip: IpAddr = text
+                .parse()
+                .map_err(|e| ReviewError::Corrupt(format!("stored source_ip {text}: {e}")))?;
+            if self.allowlist.contains(ip) {
+                allowlisted.push(text);
+            } else {
+                kept.push(text);
+            }
+        }
+        Ok((kept, allowlisted))
     }
 
     /// Approve `ip`: the submission daemon (a later task) picks up Approved

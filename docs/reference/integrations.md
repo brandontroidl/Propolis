@@ -140,6 +140,13 @@ that short-circuits on the first hold (`crates/review/src/gatekeeper.rs#check`):
 sequence are owned by
 [rate-limits-and-budgets.md](rate-limits-and-budgets.md#vendor-submission-gatekeeper).
 
+An address on the operator allowlist (`PROPOLIS_FEED_ALLOWLIST`, its file, and
+`PROPOLIS_FEED_ASN_ALLOWLIST`) never reaches this sequence: the review queue does not
+surface it, and `SubmissionRunner::run_once` refuses it before any vendor call even if it was
+queued and approved before the list covered it
+(`crates/review/src/submit.rs#run_once`; see
+[Declared crawlers](scoring-and-feed.md#declared-crawlers)).
+
 ### What is never sent
 
 The `VendorReport` carries only
@@ -173,7 +180,7 @@ GeoLite2 enrichment (including the GeoLite2-ASN reads that back
 **local file reads, not network egress.** The ASN allowlist loads the ASN DB via
 `GeoIp::load_asn_only`; an empty allowlist short-circuits before any lookup
 (`crates/propolis/src/main.rs#main`,
-`crates/feed/src/exclusion.rs#with_asn_allowlist`, `crates/feed/src/exclusion.rs#lookup_asn`). No MaxMind or other host is contacted at
+`crates/feed/src/exclusion.rs#with_asn_allowlist`, `crates/core-scoring/src/allowlist.rs#lookup_asn`). No MaxMind or other host is contacted at
 runtime; keeping the database current is an operator file-management task.
 
 ## See also

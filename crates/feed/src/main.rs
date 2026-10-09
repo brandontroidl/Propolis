@@ -131,16 +131,8 @@ fn parse_positive_u64(
 /// never a bare `IpAddr`, matching this crate's own test fixtures
 /// (`crates/feed/tests/exclusion_test.rs` writes a single host as `"9.9.9.9/32"`, never bare).
 fn parse_cidr_list(raw: &str, field: &'static str) -> Result<Vec<IpNet>, ConfigError> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<IpNet>().map_err(|_| ConfigError::InvalidCidr {
-                field,
-                value: s.to_string(),
-            })
-        })
-        .collect()
+    core_scoring::allowlist::parse_cidr_csv(raw)
+        .map_err(|value| ConfigError::InvalidCidr { field, value })
 }
 
 /// Parses a comma-separated IP list (`PROPOLIS_FEED_DELIST`). An absent or blank-only env var
@@ -165,20 +157,8 @@ fn parse_asn_list(
     raw: &str,
     field: &'static str,
 ) -> Result<std::collections::HashSet<u32>, ConfigError> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let digits = s
-                .strip_prefix("AS")
-                .or_else(|| s.strip_prefix("as"))
-                .unwrap_or(s);
-            digits.parse::<u32>().map_err(|_| ConfigError::InvalidAsn {
-                field,
-                value: s.to_string(),
-            })
-        })
-        .collect()
+    core_scoring::allowlist::parse_asn_csv(raw)
+        .map_err(|value| ConfigError::InvalidAsn { field, value })
 }
 
 /// Loads and validates configuration from environment variables. Fails closed: a missing
@@ -327,31 +307,25 @@ async fn main() {
         }
     };
 
-    let base_exclusions = ExclusionEngine::new(config.allowlist.clone(), config.delist.clone());
-    let exclusions = if config.asn_allowlist.is_empty() {
-        base_exclusions
-    } else {
-        // ASN suppression is configured: load the ASN database off the async worker (a synchronous
-        // file read) and layer it on. A missing dir/DB warns and leaves suppression inert (fail
-        // open - the CIDR allowlist and reserved checks are untouched), never blocks startup.
-        let geoip = match config.geoip_dir.clone() {
-            Some(dir) => tokio::task::spawn_blocking(move || geoip::GeoIp::load_asn_only(&dir))
-                .await
-                .unwrap_or_else(|_| geoip::GeoIp::disabled()),
-            None => {
-                tracing::warn!(
-                    "{ENV_ASN_ALLOWLIST} is set but {ENV_GEOIP_DIR} is not; ASN suppression is inert"
-                );
-                geoip::GeoIp::disabled()
-            }
-        };
-        if !geoip.is_enabled() {
-            tracing::warn!(
-                "{ENV_ASN_ALLOWLIST} is set but the GeoLite2-ASN database did not load; ASN suppression is inert"
-            );
-        }
-        base_exclusions.with_asn_allowlist(config.asn_allowlist.clone(), std::sync::Arc::new(geoip))
+    // The ASN database read is synchronous file I/O, so build the list off the async worker.
+    // `from_config` warns and leaves ASN suppression inert when the database is missing; it never
+    // blocks startup.
+    let operator_allowlist = {
+        let (cidrs, asns, dir) = (
+            config.allowlist.clone(),
+            config.asn_allowlist.clone(),
+            config.geoip_dir.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            core_scoring::OperatorAllowlist::from_config(cidrs, asns, dir.as_deref())
+        })
+        .await
+        .expect("allowlist construction does not panic")
     };
+    let exclusions = ExclusionEngine::from_allowlist(
+        std::sync::Arc::new(operator_allowlist),
+        config.delist.clone(),
+    );
     let feed_config = FeedConfig {
         aggressive_ttl: chrono::Duration::hours(config.aggressive_ttl_hours as i64),
         standard_ttl: chrono::Duration::hours(config.standard_ttl_hours as i64),

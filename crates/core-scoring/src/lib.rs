@@ -21,12 +21,14 @@
 //! `IpScore::raw_score`/`distinct_wan_count` would silently drift from this
 //! crate's constants on the next tuning change).
 
+pub mod allowlist;
 pub mod domain;
 mod hashing;
 pub mod net;
 pub mod repository;
 mod scoring;
 
+pub use allowlist::{AllowlistFileError, OperatorAllowlist, load_allowlist_file};
 pub use domain::enums::{Category, FeedTier, Protocol, ReviewState, SignalType};
 pub use domain::types::{EventInput, IpScore, ValidationError};
 pub use domain::weights::{SignalWeight, signal_weight};

@@ -283,8 +283,12 @@ async fn run_intake_sensor(
 
 /// Queue-maintenance loop: populate newly-recommended IPs, withdraw lapsed entries. Mirrors
 /// `review/src/main.rs`'s `run_queue_scan_loop`.
-async fn run_queue_scan_loop(pool: PgPool, interval: Duration, cancel: CancellationToken) {
-    let queue = ReviewQueue::new();
+async fn run_queue_scan_loop(
+    queue: ReviewQueue,
+    pool: PgPool,
+    interval: Duration,
+    cancel: CancellationToken,
+) {
     loop {
         if cancel.is_cancelled() {
             return;
@@ -1218,12 +1222,32 @@ async fn main() {
         tracing::info!("propolis: listener reachability probe disabled");
     }
 
+    // The operator allowlist is built once and shared: the feed keeps allowlisted addresses out of
+    // the published export, the review stage keeps them out of the vendor-report queue and refuses
+    // to submit them. The ASN database read is synchronous file I/O, so it runs off the async
+    // worker; a missing database warns and leaves ASN matching inert, never blocking startup.
+    let operator_allowlist = {
+        let (cidrs, asns, dir) = (
+            config.feed_allowlist.clone(),
+            config.feed_asn_allowlist.clone(),
+            config.geoip_dir.clone(),
+        );
+        Arc::new(
+            tokio::task::spawn_blocking(move || {
+                core_scoring::OperatorAllowlist::from_config(cidrs, asns, dir.as_deref())
+            })
+            .await
+            .expect("allowlist construction does not panic"),
+        )
+    };
+
     // 6. Spawn review subsystem (queue scan + submission) if enabled.
     if config.review_enabled {
         let pool_r = pool.clone();
         let queue_interval = config.queue_scan_interval;
         let submit_interval = config.submit_poll_interval;
         let vendors = config.vendors.clone();
+        let review_allowlist = operator_allowlist.clone();
 
         handles.push(spawn_supervised_named(
             "review",
@@ -1232,16 +1256,23 @@ async fn main() {
             move |token| {
                 let pool = pool_r.clone();
                 let vendors = vendors.clone();
+                let allowlist = review_allowlist.clone();
                 async move {
                     let client = reqwest::Client::new();
                     let (adapters, gate_configs) = build_adapters(&vendors, client);
-                    let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs);
+                    let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs)
+                        .with_allowlist(allowlist.clone());
+                    let queue = ReviewQueue::new().with_allowlist(allowlist);
 
                     let queue_token = token.child_token();
                     let submit_token = token.child_token();
 
-                    let queue_handle =
-                        tokio::spawn(run_queue_scan_loop(pool, queue_interval, queue_token));
+                    let queue_handle = tokio::spawn(run_queue_scan_loop(
+                        queue,
+                        pool,
+                        queue_interval,
+                        queue_token,
+                    ));
                     let submit_handle =
                         tokio::spawn(run_submission_loop(runner, submit_interval, submit_token));
 
@@ -1266,35 +1297,8 @@ async fn main() {
     // 7. Spawn feed builder if enabled.
     if config.feed_enabled {
         let pool_f = pool.clone();
-        let base_exclusions =
-            ExclusionEngine::new(config.feed_allowlist.clone(), config.feed_delist.clone());
-        let exclusions = if config.feed_asn_allowlist.is_empty() {
-            base_exclusions
-        } else {
-            // ASN suppression configured: load the ASN database off the async worker (a synchronous
-            // file read) and layer it on. A missing dir/DB warns and leaves suppression inert (fail
-            // open - the CIDR allowlist and reserved checks are untouched), never blocks startup.
-            let geoip = match config.geoip_dir.clone() {
-                Some(dir) => tokio::task::spawn_blocking(move || geoip::GeoIp::load_asn_only(&dir))
-                    .await
-                    .unwrap_or_else(|_| geoip::GeoIp::disabled()),
-                None => {
-                    tracing::warn!(
-                        "PROPOLIS_FEED_ASN_ALLOWLIST is set but PROPOLIS_GEOIP_DIR is not; ASN suppression is inert"
-                    );
-                    geoip::GeoIp::disabled()
-                }
-            };
-            if !geoip.is_enabled() {
-                tracing::warn!(
-                    "PROPOLIS_FEED_ASN_ALLOWLIST is set but the GeoLite2-ASN database did not load; ASN suppression is inert"
-                );
-            }
-            base_exclusions.with_asn_allowlist(
-                config.feed_asn_allowlist.clone(),
-                std::sync::Arc::new(geoip),
-            )
-        };
+        let exclusions =
+            ExclusionEngine::from_allowlist(operator_allowlist.clone(), config.feed_delist.clone());
         let feed_config = FeedConfig {
             aggressive_ttl: chrono::Duration::seconds(config.feed_aggressive_ttl.as_secs() as i64),
             standard_ttl: chrono::Duration::seconds(config.feed_standard_ttl.as_secs() as i64),

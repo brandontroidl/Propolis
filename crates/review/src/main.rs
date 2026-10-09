@@ -23,9 +23,13 @@
 //! "Configuration" is the spec this mirrors.
 
 use std::env;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use core_scoring::OperatorAllowlist;
+use core_scoring::allowlist;
 use sqlx::PgPool;
 
 use review::cli::{self, Cli, Command};
@@ -36,6 +40,10 @@ use review::vendor::{AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAda
 const ENV_DATABASE_URL: &str = "DATABASE_URL";
 const ENV_QUEUE_SCAN_INTERVAL_SECS: &str = "PROPOLIS_QUEUE_SCAN_INTERVAL_SECS";
 const ENV_SUBMIT_POLL_INTERVAL_SECS: &str = "PROPOLIS_SUBMIT_POLL_INTERVAL_SECS";
+const ENV_ALLOWLIST: &str = "PROPOLIS_FEED_ALLOWLIST";
+const ENV_ALLOWLIST_FILE: &str = "PROPOLIS_FEED_ALLOWLIST_FILE";
+const ENV_ASN_ALLOWLIST: &str = "PROPOLIS_FEED_ASN_ALLOWLIST";
+const ENV_GEOIP_DIR: &str = "PROPOLIS_GEOIP_DIR";
 
 const DEFAULT_QUEUE_SCAN_INTERVAL_SECS: u64 = 60;
 const DEFAULT_SUBMIT_POLL_INTERVAL_SECS: u64 = 30;
@@ -49,6 +57,7 @@ struct Config {
     queue_scan_interval: Duration,
     submit_poll_interval: Duration,
     vendors: Vec<FullVendorConfig>,
+    allowlist: Arc<OperatorAllowlist>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -57,6 +66,9 @@ enum ConfigError {
     MissingDatabaseUrl,
     /// A bound value failed to parse as the expected integer type.
     InvalidBound { field: String, value: String },
+    /// An operator allowlist variable or file was malformed. Startup refuses rather than running
+    /// with a partial or empty exemption list.
+    InvalidAllowlist { field: &'static str, reason: String },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -69,6 +81,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::InvalidBound { field, value } => {
                 write!(f, "{field} must be a non-negative integer, got {value:?}")
             }
+            ConfigError::InvalidAllowlist { field, reason } => write!(f, "{field}: {reason}"),
         }
     }
 }
@@ -248,7 +261,42 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         queue_scan_interval: Duration::from_secs(queue_scan_interval_secs),
         submit_poll_interval: Duration::from_secs(submit_poll_interval_secs),
         vendors: vec![abuseipdb, dshield, otx],
+        allowlist: Arc::new(load_allowlist_from_env()?),
     })
+}
+
+/// The operator allowlist, from the same variables the feed reads
+/// (`PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE`, `PROPOLIS_FEED_ASN_ALLOWLIST`), so
+/// one list governs both the published feed and vendor reporting. A malformed entry or file
+/// refuses startup, exactly as in the feed. Read once; edits need a restart.
+fn load_allowlist_from_env() -> Result<OperatorAllowlist, ConfigError> {
+    let bad = |field: &'static str, value: String| ConfigError::InvalidAllowlist {
+        field,
+        reason: format!("{value:?} is not valid"),
+    };
+    let mut cidrs = allowlist::parse_cidr_csv(&env::var(ENV_ALLOWLIST).unwrap_or_default())
+        .map_err(|v| bad(ENV_ALLOWLIST, v))?;
+    if let Some(path) = env::var(ENV_ALLOWLIST_FILE).ok().filter(|s| !s.is_empty()) {
+        cidrs.extend(
+            allowlist::load_allowlist_file(Path::new(&path)).map_err(|e| {
+                ConfigError::InvalidAllowlist {
+                    field: ENV_ALLOWLIST_FILE,
+                    reason: e.to_string(),
+                }
+            })?,
+        );
+    }
+    let asns = allowlist::parse_asn_csv(&env::var(ENV_ASN_ALLOWLIST).unwrap_or_default())
+        .map_err(|v| bad(ENV_ASN_ALLOWLIST, v))?;
+    let geoip_dir = env::var(ENV_GEOIP_DIR)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    Ok(OperatorAllowlist::from_config(
+        cidrs,
+        asns,
+        geoip_dir.as_deref(),
+    ))
 }
 
 /// Builds the real vendor adapters from each `FullVendorConfig` plus one
@@ -340,8 +388,7 @@ async fn shutdown_signal() {
 /// database error ... is logged and retried on the next poll cycle"); success
 /// counts are already logged by `ReviewQueue::populate`/`withdraw`
 /// themselves, so this loop only adds the error-path logging they don't do.
-async fn run_queue_scan_loop(pool: PgPool, interval: Duration) {
-    let queue = ReviewQueue::new();
+async fn run_queue_scan_loop(queue: ReviewQueue, pool: PgPool, interval: Duration) {
     loop {
         if let Err(e) = queue.populate(&pool).await {
             tracing::error!(error = %e, "review: queue populate failed");
@@ -395,9 +442,11 @@ async fn run_daemon(pool: PgPool, config: Config) {
 
     let client = reqwest::Client::new();
     let (adapters, gate_configs) = build_adapters(&config.vendors, client);
-    let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs);
+    let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs)
+        .with_allowlist(config.allowlist.clone());
+    let queue = ReviewQueue::new().with_allowlist(config.allowlist.clone());
 
-    let queue_handle = tokio::spawn(run_queue_scan_loop(pool, config.queue_scan_interval));
+    let queue_handle = tokio::spawn(run_queue_scan_loop(queue, pool, config.queue_scan_interval));
     let submit_handle = tokio::spawn(run_submission_loop(runner, config.submit_poll_interval));
 
     shutdown_signal().await;

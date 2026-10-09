@@ -89,14 +89,15 @@ Fail-closed pairings worth noting (all owned by the reference table):
 - `PROPOLIS_FEED_ALLOWLIST_FILE` refuses to start on an unreadable file, a line that is not a
   CIDR, or an entry wider than /8 (IPv4) or /16 (IPv6); see
   [the allowlist file procedure](#keeping-declared-crawlers-out-of-the-feed)
-  (`crates/feed/src/exclusion.rs#load_allowlist_file`).
+  (`crates/core-scoring/src/allowlist.rs#load_allowlist_file`).
 - `PROPOLIS_FEED_ASN_ALLOWLIST` is inert unless `PROPOLIS_GEOIP_DIR` is set and
   the GeoLite2-ASN database loads (`crates/propolis/src/config.rs#parse_asn_list`, `crates/propolis/src/main.rs#main`).
 
 ## Keeping declared crawlers out of the feed
 
 Research and AI crawlers (ClaudeBot, Googlebot, CensysInspect and others) hit the HTTP
-sensor. To keep a crawler operator's addresses out of the published feed, list the ranges
+sensor. To keep a crawler operator's addresses out of the published feed and out of vendor
+reports, list the ranges
 the operator publishes in a local file. A User-Agent never exempts an address: anyone can
 send "ClaudeBot", so a request that claims it from an unlisted address is scored and
 published like any other.
@@ -119,10 +120,22 @@ published like any other.
 
 The daemon fetches nothing: you copy the ranges from the operator's own published list.
 
-What the allowlist covers: it only keeps addresses out of the published feed (build and
-publish). Today it does not stop an address being scored or queued for review, and the
-vendor submission path does not consult it, so a listed crawler can still reach the review
-queue and be submitted to a vendor if you approve it.
+What the allowlist covers: the same list (`PROPOLIS_FEED_ALLOWLIST`, the file, and
+`PROPOLIS_FEED_ASN_ALLOWLIST`) governs two things.
+
+- **The published feed.** A listed address is kept out at build and again at publish.
+- **Vendor reporting.** The review stage never adds a listed address to the review queue,
+  withdraws one that is already Pending (the journal records each withdrawal with the reason
+  `allowlisted`), and the submission runner refuses a listed address even if it was queued
+  and approved before the list covered it. An Approved entry stays in the queue but is never
+  sent to AbuseIPDB, DShield or OTX. A withdrawn entry is deleted rather than rejected, so it
+  is queued again if you later remove the address from the list.
+
+It does not change scoring: a listed address is still scored, and the console still shows its
+activity. The list is read once at startup, in the unified daemon and in the standalone
+`review` and `feed` binaries alike (a standalone `review` unit needs the variables in its own
+env file), so an edit takes effect only after a restart. With the standalone units, a restart
+of `review` is what ends submission of a newly listed address.
 
 ## Sensor binds and WAN attribution
 

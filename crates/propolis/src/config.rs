@@ -105,6 +105,9 @@ pub struct PropolisConfig {
     pub feed_build_interval: Duration,
     pub feed_aggressive_ttl: Duration,
     pub feed_standard_ttl: Duration,
+    /// Operator allowlist ranges. Despite the `FEED` in the variable names, the same list keeps
+    /// these addresses out of the review queue and vendor submission (see
+    /// `core_scoring::allowlist`). Read once at startup; edits need a restart.
     pub feed_allowlist: Vec<IpNet>,
     pub feed_delist: Vec<IpAddr>,
     /// Trusted-org ASNs whose addresses are suppressed from the feed (Phase C), keyed off the
@@ -196,7 +199,7 @@ pub enum ConfigError {
     ProbeEnabledWithoutSources,
     /// `PROPOLIS_FEED_ALLOWLIST_FILE` was unreadable or malformed. Startup refuses rather than
     /// running with a partial or empty exemption list.
-    AllowlistFile(feed::AllowlistFileError),
+    AllowlistFile(core_scoring::AllowlistFileError),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -336,37 +339,21 @@ fn parse_sensor_logs(raw: &str) -> Result<Vec<SensorLogConfig>, ConfigError> {
 }
 
 fn parse_cidr_list(raw: &str) -> Result<Vec<IpNet>, ConfigError> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<IpNet>().map_err(|_| ConfigError::Invalid {
-                field: "PROPOLIS_FEED_ALLOWLIST",
-                value: s.to_string(),
-                reason: "not a valid CIDR",
-            })
-        })
-        .collect()
+    core_scoring::allowlist::parse_cidr_csv(raw).map_err(|value| ConfigError::Invalid {
+        field: "PROPOLIS_FEED_ALLOWLIST",
+        value,
+        reason: "not a valid CIDR",
+    })
 }
 
 /// Parse `PROPOLIS_FEED_ASN_ALLOWLIST` - a comma-separated list of AS numbers (bare, or with a
 /// leading `AS`) whose addresses are suppressed from the feed. Empty by default (opt-in).
 fn parse_asn_list(raw: &str) -> Result<std::collections::HashSet<u32>, ConfigError> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let digits = s
-                .strip_prefix("AS")
-                .or_else(|| s.strip_prefix("as"))
-                .unwrap_or(s);
-            digits.parse::<u32>().map_err(|_| ConfigError::Invalid {
-                field: "PROPOLIS_FEED_ASN_ALLOWLIST",
-                value: s.to_string(),
-                reason: "not a valid AS number",
-            })
-        })
-        .collect()
+    core_scoring::allowlist::parse_asn_csv(raw).map_err(|value| ConfigError::Invalid {
+        field: "PROPOLIS_FEED_ASN_ALLOWLIST",
+        value,
+        reason: "not a valid AS number",
+    })
 }
 
 /// Parse `PROPOLIS_FEED_WINDOWS` - a comma-separated list of `<count><unit>` labels such as
@@ -584,7 +571,7 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         .filter(|s| !s.is_empty())
     {
         feed_allowlist.extend(
-            feed::load_allowlist_file(std::path::Path::new(&path))
+            core_scoring::allowlist::load_allowlist_file(std::path::Path::new(&path))
                 .map_err(ConfigError::AllowlistFile)?,
         );
     }

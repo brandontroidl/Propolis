@@ -9,6 +9,8 @@
 //! 1. [`ReviewQueue::list_approved`] - every operator-approved entry (the
 //!    human-approval gate; this module never reads Pending, Rejected, or
 //!    Snoozed rows).
+//!    An address on the operator allowlist is refused here, before anything else, and counted
+//!    as held for every configured vendor (see [`SubmissionRunner::with_allowlist`]).
 //! 2. For each approved IP, `core_scoring::read_score` - the projection
 //!    decayed to now, not the stale `score_at_surface` snapshot, so both the
 //!    gate's score-floor/category-filter checks and the report's category
@@ -104,11 +106,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use chrono::{NaiveDate, Utc};
 use sqlx::{PgPool, Row};
 
-use core_scoring::{Category, IpScore, read_score};
+use core_scoring::{Category, IpScore, OperatorAllowlist, read_score};
 
 use crate::gatekeeper::{self, GateReason, GateResult, VendorConfig};
 use crate::queue::{ReviewError, ReviewQueue};
@@ -166,6 +169,7 @@ pub struct SubmissionRunner {
     pool: PgPool,
     vendors: Vec<Box<dyn VendorAdapter>>,
     gatekeeper_config: Vec<VendorConfig>,
+    allowlist: Arc<OperatorAllowlist>,
 }
 
 impl SubmissionRunner {
@@ -178,7 +182,18 @@ impl SubmissionRunner {
             pool,
             vendors,
             gatekeeper_config,
+            allowlist: Arc::default(),
         }
+    }
+
+    /// Refuse to submit any address on the operator allowlist, whatever its queue state. This is
+    /// the second line of defence behind [`ReviewQueue`]'s own filtering: the allowlist is read at
+    /// startup and can change after an entry was queued or approved, so the check is repeated
+    /// here, immediately before anything leaves the system. The default runner has an empty
+    /// allowlist.
+    pub fn with_allowlist(mut self, allowlist: Arc<OperatorAllowlist>) -> Self {
+        self.allowlist = allowlist;
+        self
     }
 
     /// Run one pass. See the module doc comment's numbered algorithm.
@@ -189,6 +204,16 @@ impl SubmissionRunner {
         let mut result = SubmitResult::default();
         for entry in approved {
             let ip = entry.source_ip;
+
+            if self.allowlist.contains(ip) {
+                // Steady state for as long as the entry stays Approved, so debug, not warn.
+                tracing::debug!(
+                    %ip,
+                    "approved entry is on the operator allowlist; not submitting to any vendor"
+                );
+                result.held += self.vendors.len();
+                continue;
+            }
 
             let current_score = match read_score(&self.pool, ip).await {
                 Ok(Some(score)) => score,

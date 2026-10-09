@@ -2910,6 +2910,7 @@ dependencies = [
  "chrono",
  "clap",
  "core-scoring",
+ "flate2",
  "futures-util",
  "hmac",
  "rand 0.10.2",

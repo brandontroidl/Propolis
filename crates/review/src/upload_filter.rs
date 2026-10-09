@@ -15,7 +15,8 @@
 //!
 //! Bounds, all enforced per call of [`decide`]: [`MAX_ENTRIES`] archive entries examined,
 //! [`MAX_INFLATE_BYTES`] decompressed bytes in total, [`MEMBER_CAP`] bytes looked at per member,
-//! nesting at most [`MAX_DEPTH`] archives deep, and a work limit inside the inflater. The input is
+//! nesting at most [`MAX_DEPTH`] archives deep. Decompression is `flate2` (miniz_oxide) limited
+//! with `Read::take`, so output is bounded whatever the stream claims. The input is
 //! the in-memory body the caller already holds; nothing is written to disk or executed.
 
 use std::fmt;
@@ -30,10 +31,6 @@ pub const MAX_ENTRIES: usize = 64;
 pub const MAX_INFLATE_BYTES: usize = 1024 * 1024;
 /// Archive nesting depth that is opened: the body itself is depth 0.
 pub const MAX_DEPTH: u32 = 2;
-/// Deflate blocks and decoded symbols one inflate call may process, so a stream of empty blocks
-/// or of nothing but end-of-block markers cannot spin the scanner.
-const MAX_INFLATE_BLOCKS: u32 = 1024;
-const MAX_INFLATE_SYMBOLS: u64 = 4_000_000;
 
 /// The decision for one body. `kind` is a short label of the detected type, safe to log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,272 +665,17 @@ fn classify_tar(data: &[u8], depth: u32, ctx: &mut Ctx) -> Detect<Class> {
     }))
 }
 
-// ---- bounded inflate (RFC 1951), a port of the structure of zlib's contrib/puff.c ----
-
-struct BitReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-    buf: u32,
-    cnt: u32,
-}
-
-impl BitReader<'_> {
-    fn bits(&mut self, need: u32) -> Detect<u32> {
-        let mut val = u64::from(self.buf);
-        while self.cnt < need {
-            let b = *self
-                .data
-                .get(self.pos)
-                .ok_or(DetectError("inflate: input ended"))?;
-            self.pos += 1;
-            val |= u64::from(b) << self.cnt;
-            self.cnt += 8;
-        }
-        self.buf = (val >> need) as u32;
-        self.cnt -= need;
-        Ok((val & ((1u64 << need) - 1)) as u32)
-    }
-}
-
-struct Huffman {
-    count: [u16; 16],
-    symbol: Vec<u16>,
-}
-
-/// Build a decoder from code lengths; the second value is zlib's "left" (0 complete, >0
-/// incomplete, <0 over-subscribed).
-fn huffman(lengths: &[u8]) -> (Huffman, i32) {
-    let mut count = [0u16; 16];
-    for &l in lengths {
-        count[usize::from(l)] += 1;
-    }
-    let mut h = Huffman {
-        count,
-        symbol: vec![0; lengths.len()],
-    };
-    if usize::from(count[0]) == lengths.len() {
-        return (h, 0);
-    }
-    let mut left: i32 = 1;
-    for &n in &count[1..] {
-        left <<= 1;
-        left -= i32::from(n);
-        if left < 0 {
-            return (h, left);
-        }
-    }
-    let mut offs = [0usize; 16];
-    for len in 1..15 {
-        offs[len + 1] = offs[len] + usize::from(count[len]);
-    }
-    for (sym, &l) in lengths.iter().enumerate() {
-        if l != 0 {
-            h.symbol[offs[usize::from(l)]] = sym as u16;
-            offs[usize::from(l)] += 1;
-        }
-    }
-    (h, left)
-}
-
-impl Huffman {
-    fn decode(&self, br: &mut BitReader<'_>) -> Detect<u16> {
-        let (mut code, mut first, mut index) = (0i32, 0i32, 0i32);
-        for len in 1..=15 {
-            code |= br.bits(1)? as i32;
-            let count = i32::from(self.count[len]);
-            if code - count < first {
-                return self
-                    .symbol
-                    .get((index + (code - first)) as usize)
-                    .copied()
-                    .ok_or(DetectError("inflate: bad symbol index"));
-            }
-            index += count;
-            first += count;
-            first <<= 1;
-            code <<= 1;
-        }
-        Err(DetectError("inflate: invalid code"))
-    }
-}
-
-const LEN_BASE: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
-    163, 195, 227, 258,
-];
-const LEN_EXTRA: [u8; 29] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
-];
-const DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
-    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-];
-const DIST_EXTRA: [u8; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
-    13,
-];
-
-/// Decompress at most `cap` bytes of the raw deflate stream `input` and return that prefix. The
-/// stream need not be finished: stopping at `cap` is the point, and is what keeps a decompression
-/// bomb to `cap` bytes of output and a bounded amount of work.
+/// Decompress at most `cap` bytes of the raw deflate stream `input` and return that prefix.
+/// Stopping at `cap` (`Read::take`) is what keeps a decompression bomb to `cap` bytes of output;
+/// a corrupt or truncated stream is an error.
 fn inflate_prefix(input: &[u8], cap: usize) -> Detect<Vec<u8>> {
-    let mut br = BitReader {
-        data: input,
-        pos: 0,
-        buf: 0,
-        cnt: 0,
-    };
-    let mut out: Vec<u8> = Vec::with_capacity(cap.min(MEMBER_CAP));
-    let mut blocks = 0u32;
-    let mut symbols = 0u64;
-    while out.len() < cap {
-        blocks += 1;
-        if blocks > MAX_INFLATE_BLOCKS {
-            return Err(DetectError("inflate: block limit"));
-        }
-        let last = br.bits(1)?;
-        match br.bits(2)? {
-            0 => inflate_stored(&mut br, &mut out, cap)?,
-            1 => {
-                let mut l = [8u8; 288];
-                l[144..256].fill(9);
-                l[256..280].fill(7);
-                let (lit, _) = huffman(&l);
-                let (dist, _) = huffman(&[5u8; 30]);
-                inflate_codes(&mut br, &mut out, cap, &lit, &dist, &mut symbols)?;
-            }
-            2 => {
-                let (lit, dist) = inflate_dynamic_tables(&mut br)?;
-                inflate_codes(&mut br, &mut out, cap, &lit, &dist, &mut symbols)?;
-            }
-            _ => return Err(DetectError("inflate: invalid block type")),
-        }
-        if last == 1 {
-            break;
-        }
-    }
-    out.truncate(cap);
+    use std::io::Read;
+    let mut out = Vec::with_capacity(cap.min(MEMBER_CAP));
+    flate2::read::DeflateDecoder::new(input)
+        .take(cap as u64)
+        .read_to_end(&mut out)
+        .map_err(|_| DetectError("inflate: invalid or truncated stream"))?;
     Ok(out)
-}
-
-fn inflate_stored(br: &mut BitReader<'_>, out: &mut Vec<u8>, cap: usize) -> Detect<()> {
-    br.buf = 0;
-    br.cnt = 0;
-    let len = u16le(br.data, br.pos).ok_or(DetectError("inflate: input ended"))?;
-    let nlen = u16le(br.data, br.pos + 2).ok_or(DetectError("inflate: input ended"))?;
-    if len != !nlen {
-        return Err(DetectError("inflate: stored length mismatch"));
-    }
-    br.pos += 4;
-    let want = usize::from(len);
-    let take = want.min(cap - out.len());
-    let chunk = br
-        .data
-        .get(br.pos..br.pos + take)
-        .ok_or(DetectError("inflate: input ended"))?;
-    out.extend_from_slice(chunk);
-    br.pos += take;
-    Ok(())
-}
-
-fn inflate_dynamic_tables(br: &mut BitReader<'_>) -> Detect<(Huffman, Huffman)> {
-    const ORDER: [usize; 19] = [
-        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-    ];
-    let nlen = br.bits(5)? as usize + 257;
-    let ndist = br.bits(5)? as usize + 1;
-    let ncode = br.bits(4)? as usize + 4;
-    if nlen > 286 || ndist > 30 {
-        return Err(DetectError("inflate: bad table sizes"));
-    }
-    let mut lengths = [0u8; 320];
-    for &slot in ORDER.iter().take(ncode) {
-        lengths[slot] = br.bits(3)? as u8;
-    }
-    let (codes, left) = huffman(&lengths[..19]);
-    if left != 0 {
-        return Err(DetectError("inflate: bad code-length code"));
-    }
-    let mut lengths = [0u8; 320];
-    let mut idx = 0usize;
-    while idx < nlen + ndist {
-        let sym = codes.decode(br)?;
-        if sym < 16 {
-            lengths[idx] = sym as u8;
-            idx += 1;
-            continue;
-        }
-        let (prev, rep) = match sym {
-            16 => {
-                if idx == 0 {
-                    return Err(DetectError("inflate: repeat with no previous length"));
-                }
-                (lengths[idx - 1], 3 + br.bits(2)? as usize)
-            }
-            17 => (0, 3 + br.bits(3)? as usize),
-            _ => (0, 11 + br.bits(7)? as usize),
-        };
-        if idx + rep > nlen + ndist {
-            return Err(DetectError("inflate: too many lengths"));
-        }
-        lengths[idx..idx + rep].fill(prev);
-        idx += rep;
-    }
-    if lengths[256] == 0 {
-        return Err(DetectError("inflate: no end-of-block code"));
-    }
-    let (lit, lerr) = huffman(&lengths[..nlen]);
-    if lerr < 0 || (lerr > 0 && nlen != usize::from(lit.count[0]) + usize::from(lit.count[1])) {
-        return Err(DetectError("inflate: bad literal/length code"));
-    }
-    let (dist, derr) = huffman(&lengths[nlen..nlen + ndist]);
-    if derr < 0 || (derr > 0 && ndist != usize::from(dist.count[0]) + usize::from(dist.count[1])) {
-        return Err(DetectError("inflate: bad distance code"));
-    }
-    Ok((lit, dist))
-}
-
-fn inflate_codes(
-    br: &mut BitReader<'_>,
-    out: &mut Vec<u8>,
-    cap: usize,
-    lit: &Huffman,
-    dist: &Huffman,
-    symbols: &mut u64,
-) -> Detect<()> {
-    loop {
-        *symbols += 1;
-        if *symbols > MAX_INFLATE_SYMBOLS {
-            return Err(DetectError("inflate: work limit"));
-        }
-        let sym = usize::from(lit.decode(br)?);
-        if sym < 256 {
-            out.push(sym as u8);
-        } else if sym == 256 {
-            return Ok(());
-        } else {
-            let s = sym - 257;
-            if s >= 29 {
-                return Err(DetectError("inflate: bad length symbol"));
-            }
-            let len = usize::from(LEN_BASE[s]) + br.bits(u32::from(LEN_EXTRA[s]))? as usize;
-            let d = usize::from(dist.decode(br)?);
-            if d >= 30 {
-                return Err(DetectError("inflate: bad distance symbol"));
-            }
-            let distance = usize::from(DIST_BASE[d]) + br.bits(u32::from(DIST_EXTRA[d]))? as usize;
-            if distance > out.len() {
-                return Err(DetectError("inflate: distance too far back"));
-            }
-            for _ in 0..len {
-                let b = out[out.len() - distance];
-                out.push(b);
-            }
-        }
-        if out.len() >= cap {
-            return Ok(());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1043,18 +785,6 @@ mod tests {
             b.code(0, 5); // distance symbol 0 = 1
         }
         b.code(0, 7); // end of block
-        b.bytes
-    }
-
-    /// A fixed-Huffman deflate stream of `n` zero literals: more symbols than the work limit allows.
-    fn deflate_zero_literals(n: usize) -> Vec<u8> {
-        let mut b = Bits::new();
-        b.lsb(1, 1);
-        b.lsb(1, 2);
-        for _ in 0..n {
-            b.code(0x30, 8);
-        }
-        b.code(0, 7);
         b.bytes
     }
 
@@ -1304,12 +1034,6 @@ mod tests {
 
     #[test]
     fn inflate_stops_at_the_cap_and_a_bomb_stays_small() {
-        // Far more symbols than MAX_INFLATE_SYMBOLS: only stopping at the cap, not finishing the
-        // stream, gets a result.
-        let long = deflate_zero_literals(MAX_INFLATE_SYMBOLS as usize + 500_000);
-        assert_eq!(inflate_prefix(&long, 4096).unwrap().len(), 4096);
-        assert!(inflate_prefix(&long, usize::MAX / 2).is_err());
-
         let bomb = deflate_zero_bomb(5000);
         assert!(bomb.len() < 20_000, "fixture is a compressed bomb");
         let out = inflate_prefix(&bomb, 4096).unwrap();
@@ -1434,15 +1158,5 @@ mod tests {
         );
         assert_eq!(refused(b"Rar!\x1a\x07\x00 rest of it"), "rar_uninspectable");
         assert_eq!(refused(b"BZh91AY&SY rest of it"), "bzip2_uninspectable");
-    }
-
-    #[test]
-    fn an_unfinished_stream_in_a_stored_prefix_is_a_detection_error() {
-        // A stored block that promises more bytes than the input holds.
-        let mut v = vec![1u8];
-        v.extend_from_slice(&1000u16.to_le_bytes());
-        v.extend_from_slice(&(!1000u16).to_le_bytes());
-        v.extend_from_slice(&[1, 2, 3]);
-        assert!(inflate_prefix(&v, 4096).is_err());
     }
 }

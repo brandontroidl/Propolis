@@ -418,6 +418,7 @@ async fn detail(
 
     let malware = fetch_malware_rows(&state.db, ip).await?;
     let urls = fetch_url_rows(&state.db, ip).await?;
+    let via_other_reporters = samples_via_other_reporters(&malware, &urls);
 
     let external_links = external_lookup_links(ip);
 
@@ -529,6 +530,7 @@ async fn detail(
         submissions,
         services,
         malware,
+        via_other_reporters,
         urls,
         external_links,
         geo,
@@ -925,6 +927,35 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
         });
     }
     Ok(malware)
+}
+
+/// A sample the fetcher captured from a URL this address also reported, but which the fetcher
+/// credited to another address (`fetch_attempt` keeps only the first reporter), so the
+/// "Malware from this IP" panel does not list it.
+#[derive(Debug, PartialEq, Serialize)]
+struct ViaOtherReporter {
+    sha256: String,
+    short: String,
+}
+
+/// The distinct captured samples of `urls` whose first reporter was not this address, leaving out
+/// any the malware panel already lists. Without this the panel reads "no samples" next to a URL
+/// table that shows one.
+fn samples_via_other_reporters(malware: &[MalwareRow], urls: &[UrlRow]) -> Vec<ViaOtherReporter> {
+    let mut out: Vec<ViaOtherReporter> = Vec::new();
+    for u in urls {
+        let (Some(sha), Some(_)) = (&u.sha256, &u.first_reporter) else {
+            continue;
+        };
+        let listed = malware.iter().any(|m| m.sha256.as_ref() == Some(sha));
+        if !listed && !out.iter().any(|o| &o.sha256 == sha) {
+            out.push(ViaOtherReporter {
+                sha256: sha.clone(),
+                short: sha.chars().take(12).collect(),
+            });
+        }
+    }
+    out
 }
 
 /// Every URL this IP told a shell to fetch, one row per distinct URL, joined to the fetcher's

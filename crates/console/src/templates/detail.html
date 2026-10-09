@@ -173,7 +173,10 @@
       {% endfor %}
     </tbody>
   </table>
-  {% else %}
+  {% endif %}
+  {% if via_other_reporters %}
+  <p class="{% if malware %}table-note panel-note{% else %}empty-line{% endif %}">{% if not malware %}No sample uploaded by this address. {% endif %}{{ via_other_reporters | length }} sample{% if via_other_reporters | length != 1 %}s{% endif %} via a URL first reported by another address: {% for v in via_other_reporters %}<a class="mono" href="/samples/{{ v.sha256 }}" title="{{ v.sha256 }}">{{ v.short }}</a>{% if not loop.last %} {% endif %}{% endfor %}. This address asked for the same URL later; see the table below.</p>
+  {% elif not malware %}
   <p class="empty-line">no samples linked to this address</p>
   {% endif %}
 </div>

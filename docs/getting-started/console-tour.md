@@ -89,7 +89,9 @@ to its page, `refused` or `failed` with the recorded reason, `pending`, or `not 
 for a scheme the fetcher does not handle. The outcome is the URL's current record, whoever
 reported it first, and carries the date of the last attempt. The timeline's header counts
 what is on the page by unit, for example `newest 200 events: 199 commands, 1 session`;
-"newest" means older events wait behind Load more. Below that,
+"newest" means older events wait behind Load more. A command sent with line breaks reads as a
+numbered list of its lines rather than one fused line (commands recorded before the sensors
+kept the lines still show the fused form). Below that,
 which of your WAN addresses it hit, which services it probed, vendor submissions, and
 the malware linked to it, marked as uploaded directly or fetched from a URL it
 reported. A truncated upload is labelled as such.

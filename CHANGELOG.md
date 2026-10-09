@@ -4,6 +4,15 @@
 
 ### Added
 
+- **A multi-line command is kept as its lines** - SSH exec and the interactive shells recorded a
+  script such as `cd /tmp` / `wget ...` / `sh x` as one line, because the sanitizer folds every
+  line break into a space. A command that had a break now also carries `metadata.command_lines`
+  (each line sanitized, blank lines kept, at most 64 lines and 1024 bytes together, with
+  `command_lines_truncated` when anything was left out). `command` is unchanged, so the campaign
+  indexer, the ATT&CK rules and the fingerprints are unaffected. The evidence timeline renders the
+  lines as a numbered list in place of the fused text; events recorded before the key existed, and
+  single-line commands, show what they showed. No migration: it is an additive metadata key on new
+  events only.
 - **The evidence timeline shows what the fetcher did with each download** - a
   `honeypot_file_download` event now carries a line under its URL: `fetched` with the sample
   hash linked to its page, `refused` (the SSRF guard or hop limit) or `failed` with the recorded

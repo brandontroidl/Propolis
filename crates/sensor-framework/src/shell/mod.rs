@@ -118,6 +118,41 @@ pub use trace::{
 /// attacker-controlled string entering an event.
 const MAX_COMMAND_LEN: usize = 1024;
 
+/// Most lines of a multi-line command kept in `metadata.command_lines`.
+const MAX_COMMAND_LINES: usize = 64;
+
+/// The lines of a command that had a line break, each sanitized, for `metadata.command_lines`.
+///
+/// `metadata.command` collapses every line break into a space (`sanitize_value`), which is what
+/// the campaign indexer, the ATT&CK rules and the fingerprints read and must keep reading. This
+/// keeps the break itself so an analyst reads the script as it was sent. `None` when the command
+/// had no break (one trailing line terminator does not count), so a single-line command carries
+/// nothing extra. The lines together stay within [`MAX_COMMAND_LEN`] bytes and at most
+/// [`MAX_COMMAND_LINES`] lines; the flag says whether anything was left out.
+fn command_lines(raw: &str) -> Option<(Vec<String>, bool)> {
+    let body = raw.trim_end_matches(['\r', '\n']);
+    if !body.contains(['\r', '\n']) {
+        return None;
+    }
+    let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = Vec::new();
+    let mut budget = MAX_COMMAND_LEN;
+    let mut truncated = false;
+    for line in normalized.split('\n') {
+        if lines.len() == MAX_COMMAND_LINES || budget == 0 {
+            truncated = true;
+            break;
+        }
+        let kept = sanitize_value(line, budget);
+        budget = budget.saturating_sub(kept.len());
+        if kept.len() < sanitize_value(line, usize::MAX).len() {
+            truncated = true;
+        }
+        lines.push(kept);
+    }
+    Some((lines, truncated))
+}
+
 /// Cap applied to the `wget`/`curl` target URL echoed back in canned output. Smaller than
 /// `MAX_COMMAND_LEN` since it is one token of the line, not the whole line.
 const MAX_URL_LEN: usize = 512;
@@ -1191,6 +1226,14 @@ impl FakeShell {
                     serde_json::json!(sanitize_value(&decoded, MAX_COMMAND_LEN)),
                 );
                 obj.insert("xor_key".to_string(), serde_json::json!(k));
+            }
+            if let Some((lines, truncated)) = command_lines(&raw)
+                && let Some(obj) = metadata.as_object_mut()
+            {
+                obj.insert("command_lines".to_string(), serde_json::json!(lines));
+                if truncated {
+                    obj.insert("command_lines_truncated".to_string(), true.into());
+                }
             }
             let evs = vec![self.command_event(metadata)];
             self.trace.events.push(TraceEventKind::CommandExec);
@@ -3399,6 +3442,8 @@ mod budget_tests;
 mod busybox_tests;
 #[cfg(test)]
 mod classify_tests;
+#[cfg(test)]
+mod command_lines_tests;
 #[cfg(test)]
 mod dd_tests;
 #[cfg(test)]

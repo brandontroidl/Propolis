@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-08
+last-verified: 2026-10-09
 -->
 
 # Sensor behavior reference
@@ -276,6 +276,15 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `metadata.command`, sanitized and capped at `MAX_COMMAND_LEN = 1024` (`crates/sensor-framework/src/shell/mod.rs#MAX_COMMAND_LEN`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
 - If the line is single-byte-XOR obfuscated, `command_decoded` and `xor_key` are
   added to metadata (`crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
+- `metadata.command` collapses every line break into a space. When the command had a break (a
+  single trailing terminator does not count), the event also carries `command_lines`: the lines,
+  each sanitized, blank lines kept, at most 64 lines and 1024 bytes together
+  (`crates/sensor-framework/src/shell/mod.rs#command_lines`). `command_lines_truncated` is `true`
+  when lines or bytes were left out. `command` is unchanged, so the campaign indexer, the ATT&CK
+  rules and the fingerprints read what they always did; the console renders the lines when the key
+  is present. The key is not written for the XOR-decoded form, and events recorded before it
+  existed show only the collapsed command. A line that is mostly line breaks (over 30% non-printable
+  characters, newlines included) is a `binary` flood marker and carries no lines.
 - One `ConnectionBudget` per connection (`crates/sensor-framework/src/budget.rs#ConnectionBudget`, limits in `crates/sensor-framework/src/budget.rs#BudgetLimits::standard`)
   bounds what a session can make the sensor hold or send: 192 KiB of created file content and 4096
   created nodes (a removed file's slot is not freed), 64 recorded downloads per connection and 8 per

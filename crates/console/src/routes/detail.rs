@@ -119,6 +119,12 @@ struct EventRow {
     /// obfuscation; drives a small "de-obfuscated (xor 0xNN)" badge in the timeline. `None` for a
     /// plaintext command (minijinja has no hex filter, so this is formatted here).
     xor_badge: Option<String>,
+    /// The command's lines when it had a line break (`metadata.command_lines`, which sensors write
+    /// only then); empty for a single-line command and for events recorded before the key existed,
+    /// which show the collapsed `detail` as before.
+    lines: Vec<String>,
+    /// More lines were sent than the sensor kept (`metadata.command_lines_truncated`).
+    lines_truncated: bool,
     /// What the review fetcher did with the URL a `honeypot_file_download` event named; `None` for
     /// every other event and for a download event that carries no `url` (see
     /// [`attach_fetch_outcomes`]).
@@ -456,6 +462,20 @@ fn fetch_outcome(url: &str, record: Option<&FetchRecord>) -> FetchOutcome {
         sample,
         bytes,
     }
+}
+
+/// The lines of a multi-line command, from `metadata.command_lines`. Only strings are taken, and a
+/// value of any other shape yields no lines (the page then shows the collapsed command).
+fn command_lines(metadata: &serde_json::Value) -> Vec<String> {
+    metadata
+        .get("command_lines")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| l.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The trimmed `url` a download event names, when it names one.
@@ -1031,6 +1051,11 @@ async fn fetch_evidence_rows(
                 .get("xor_key")
                 .and_then(|v| v.as_u64())
                 .map(|k| format!("0x{k:02x}")),
+            lines: command_lines(&metadata),
+            lines_truncated: metadata
+                .get("command_lines_truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             fetch: None,
             protocol: protocol_label(protocol).to_string(),
             authenticated: row.try_get("authenticated")?,
@@ -1668,6 +1693,8 @@ mod tests {
             activity: format_activity("ssh", signal_type),
             detail: extract_detail(signal_type, &metadata),
             xor_badge: None,
+            lines: Vec::new(),
+            lines_truncated: false,
             fetch: None,
             protocol: "TCP".into(),
             authenticated: true,

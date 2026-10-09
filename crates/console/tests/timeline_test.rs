@@ -533,3 +533,75 @@ async fn most_active_rows_carry_the_classes_the_narrow_layout_places(pool: PgPoo
         assert!(row.contains(class), "{class} missing: {row}");
     }
 }
+
+#[sqlx::test(migrations = false)]
+async fn a_multi_line_command_renders_one_line_per_li_and_old_events_stay_collapsed(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.57";
+    scored(&pool, ip).await;
+    let s = Uuid::now_v7();
+    // New shape: the sensor kept the lines beside the collapsed command.
+    event(
+        &pool,
+        ip,
+        SignalType::HoneypotCommandExec,
+        60,
+        serde_json::json!({
+            "command": "cd /tmp echo <b>x</b> sh x.sh",
+            "command_lines": ["cd /tmp", "echo <b>x</b>", "", "sh x.sh"],
+            "command_lines_truncated": true,
+        }),
+        Some(s),
+    )
+    .await;
+    // Recorded before the key existed: only the collapsed command.
+    event(
+        &pool,
+        ip,
+        SignalType::HoneypotCommandExec,
+        50,
+        serde_json::json!({ "command": "old one two" }),
+        Some(s),
+    )
+    .await;
+    // A one-line command: no lines key, no list.
+    event(
+        &pool,
+        ip,
+        SignalType::HoneypotCommandExec,
+        40,
+        serde_json::json!({ "command": "uname -a" }),
+        Some(s),
+    )
+    .await;
+
+    let body = page(pool, &format!("/ip/{ip}")).await;
+    let t = timeline(&body);
+    let multi = row(t, "sh x.sh");
+    assert!(
+        multi.contains(r#"<ol class="chunk-lines">"#)
+            && multi.contains("<li>cd &#x2f;tmp</li>")
+            && multi.contains("<li>echo &lt;b&gt;x&lt;&#x2f;b&gt;</li>")
+            && multi.contains("<li></li>")
+            && multi.contains("<li>sh x.sh</li>"),
+        "one escaped li per line, blank lines kept: {multi}"
+    );
+    // The detail cell, not the raw-JSON expander beside it (which holds the collapsed command).
+    let cell = &multi[multi.find(r#"<td class="mono">"#).unwrap()..];
+    let cell = &cell[..cell.find("</td>").unwrap()];
+    assert!(
+        !cell.contains("cd &#x2f;tmp echo"),
+        "the collapsed form is not shown beside the lines: {cell}"
+    );
+    assert!(
+        multi.contains("more lines were sent than are kept"),
+        "{multi}"
+    );
+    let old = row(t, "old one two");
+    assert!(!old.contains("chunk-lines"), "{old}");
+    let single = row(t, "uname -a");
+    assert!(
+        !single.contains("chunk-lines") && !single.contains("more lines"),
+        "{single}"
+    );
+}

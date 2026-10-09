@@ -4,6 +4,19 @@
 
 ### Added
 
+- **Sensor capture counters reach `/metrics`** - the capture hand-off counters and the
+  capture-memory budget each sensor kept only in its own process (queue drops, spool refusals,
+  truncated and refused captures, budget current, high-water and refusals) are now written by the
+  six capturing sensors (ssh, telnet, adb, ftp, mqtt, tftp) as a `sensor_stats` line to their
+  event log every 60 s and once more, with `final` set, at shutdown. It is not an event: its
+  `source_ip` is the sentinel `0.0.0.0`, intake takes it out before conversion and keeps the latest
+  per sensor in a new `sensor_stats` table (`fleet` migration `0002`, additive), so it never
+  reaches the ledger, a score, the feed, a campaign or a vendor submission. Intake refuses, as a
+  rejected line with a WARN, a `sensor_stats` line from any other source, with other than the
+  fixed field set, with a value over 2^53, or naming a sensor other than the log's label. The
+  console publishes the values on `/metrics` as `propolis_sensor_capture_*` series labelled by
+  sensor, with `propolis_sensor_stats_age_seconds`, `_stale` (past 180 s) and `_final`, so a dead
+  sensor reads as stale, not as zeros. No new setting.
 - **Miner and test-key indicators from captured artifacts** - found in a mobile dropper
   analysed 2026-10-08. A script URL on `coinhive.com`, `coin-hive.com` or `authedmine.com`
   (under `/lib/`) is a URL indicator labeled `CoinHive miner script`; a `CoinHive.Anonymous(` or

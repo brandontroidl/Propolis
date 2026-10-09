@@ -21,7 +21,7 @@ Three crates own schema through three independent migration sets:
   enum types.
 - **review** (`crates/review/migrations/*.sql`) owns `review_queue`,
   `vendor_submission`, `fetch_attempt`, `fetch_daily_usage`.
-- **fleet** (`crates/fleet/migrations/*.sql`) owns `listener_probe`.
+- **fleet** (`crates/fleet/migrations/*.sql`) owns `listener_probe` and `sensor_stats`.
 
 The change maps at the end of this page list every migration in each set.
 
@@ -458,5 +458,6 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 | migration | adds |
 |---|---|
 | `0001` | `listener_probe` + `(sensor, attempted_at DESC)` index |
+| `0002` | `sensor_stats`: the latest `sensor_stats` line per sensor (capture counters and budget), outside the ledger |
 
 Migration workflow and conventions: [../development/schema-and-migrations.md](../development/schema-and-migrations.md).

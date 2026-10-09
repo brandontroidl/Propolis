@@ -330,6 +330,7 @@ async fn main() {
     for (bound, _) in &started {
         tracing::info!(local = %bound, "sensor-ftp: listening");
     }
+    handoff.start_stats("ftp");
     shutdown_signal().await;
     tracing::info!("sensor-ftp: shutdown signal received; stopping");
     for (_, handle) in &started {

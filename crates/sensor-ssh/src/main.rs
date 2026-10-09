@@ -390,6 +390,7 @@ async fn main() {
     };
 
     tracing::info!(local = %bound, "sensor-ssh: listening");
+    handoff.start_stats("ssh");
 
     // Host key is already loaded/generated and passed to start_test_server above; drop the
     // local clone so only the server tasks hold it.

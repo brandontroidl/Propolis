@@ -17,6 +17,7 @@
 pub mod health;
 pub mod inventory;
 pub mod probe;
+pub mod stats;
 pub mod store;
 
 pub use health::Level;

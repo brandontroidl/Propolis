@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-09
 -->
 
 # Events and signals reference
@@ -53,6 +53,20 @@ Sensor-emittable constants are provided so literals are not hand-typed:
   `honeypot_session_end` (`crates/sensor-wire/src/lib.rs#SIGNAL_HONEYPOT_SESSION_END`) - recorded in the ledger but never scored;
   only `sensor-mqtt` (every session) and `sensor-ssh` (a connection that ends before key exchange completes) emit it so far. The remaining signal types (Suricata, WAF, port scan,
   and so on) originate from other layers, not sensor-wire.
+- `sensor_stats` (`crates/sensor-wire/src/lib.rs#SIGNAL_SENSOR_STATS`) is **not a ledger signal
+  type** and has no `SignalType` variant. It is a sensor's own health line: the capture hand-off
+  counters (`dropped`, `spool_refused`, `truncated`, `refused`), the capture memory budget
+  (`budget_current`, `budget_high_water`, `budget_refused`), `uptime_secs`, `final` and `sensor`
+  (`crates/sensor-wire/src/lib.rs#SensorStats`). Its `source_ip` is always `0.0.0.0`
+  (`crates/sensor-wire/src/lib.rs#SENSOR_STATS_SOURCE_IP`), a sentinel naming no host. The six
+  capturing sensors (ssh, telnet, adb, ftp, mqtt, tftp) write one every 60 s
+  (`crates/sensor-framework/src/handoff.rs#STATS_INTERVAL`) and one more with `final` true as they
+  shut down. Intake takes it out of the line stream before conversion and stores the latest per
+  sensor in the `sensor_stats` table (`fleet` migration `0002`); it is never in the ledger, so it
+  is never scored, fed, clustered into a campaign or submitted to a vendor. Intake refuses (counts
+  as rejected, WARN) a line whose source is not `0.0.0.0`, whose metadata is not exactly the fixed
+  field set, whose values pass 2^53, or whose sensor name is not the label of the log it was read
+  from. The `propolis-watch` feed prints it like any other line.
 - Protocol (`crates/sensor-wire/src/lib.rs#PROTO_TCP`, `crates/sensor-wire/src/lib.rs#PROTO_UDP`, `crates/sensor-wire/src/lib.rs#PROTO_ICMP`): `tcp`, `udp`, `icmp`.
 
 ### SampleRef

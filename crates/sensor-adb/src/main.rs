@@ -311,6 +311,7 @@ async fn main() {
     };
 
     tracing::info!(local = %bound, "sensor-adb: listening");
+    handoff.start_stats("adb");
 
     shutdown_signal().await;
     tracing::info!("sensor-adb: shutdown signal received; stopping");

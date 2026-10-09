@@ -58,7 +58,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sensor_wire::{SampleRef, SensorEvent};
+use sensor_wire::{SampleRef, SensorEvent, SensorStats};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
@@ -80,6 +80,13 @@ const MAX_ORIG_NAME_LEN: usize = 255;
 /// The bound each sensor's `main` passes to `CaptureHandoff::drain`. Well under systemd's default
 /// 90 s `TimeoutStopSec`, so a wedged spool costs a bounded stop delay rather than a SIGKILL.
 pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often a sensor writes its `sensor_stats` line. The counters are monotonic or slow gauges,
+/// so a coarser interval loses no information, and the console reads a sensor as stale only after
+/// several missed intervals; one short line a minute per sensor is negligible against the event
+/// volume of even an idle honeypot. A constant, not a setting: nothing needs to tune it, and an
+/// operator-set 1 s would be a log amplifier.
+pub const STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The `end_reason` stamped on a capture whose body stopped growing because the process-wide
 /// [`CaptureMemoryBudget`] had no room. It overrides whatever end the sensor itself recorded: the
@@ -337,6 +344,12 @@ pub struct CaptureHandoff {
     /// The sensor's live connections. A listener started with it (`run_tcp_listener_tracked`)
     /// registers every connection here; `drain` ends them before closing the queue.
     connections: ConnectionTracker,
+    /// Process start, for the stats `uptime_secs`.
+    started: std::time::Instant,
+    /// Set by `start_stats`; the sensor name the stats lines carry. `drain` takes it, which is
+    /// what makes the final line exactly once.
+    stats_name: Mutex<Option<String>>,
+    stats_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl CaptureHandoff {
@@ -383,7 +396,56 @@ impl CaptureHandoff {
             stop: Arc::new(Notify::new()),
             worker: Mutex::new(None),
             connections: ConnectionTracker::new(),
+            started: std::time::Instant::now(),
+            stats_name: Mutex::new(None),
+            stats_task: Mutex::new(None),
         }
+    }
+
+    /// The counters and budget as a `sensor_stats` record for `sensor`.
+    pub fn stats_snapshot(&self, sensor: &str, is_final: bool) -> SensorStats {
+        SensorStats {
+            sensor: sensor.to_string(),
+            uptime_secs: self.started.elapsed().as_secs(),
+            is_final,
+            dropped: self.dropped_count(),
+            spool_refused: self.spool_refused_count(),
+            truncated: self.truncated_capture_count(),
+            refused: self.refused_capture_count(),
+            budget_current: self.budget.current_bytes(),
+            budget_high_water: self.budget.high_water_bytes(),
+            budget_refused: self.budget.refused_reservations(),
+        }
+    }
+
+    /// Start writing a `sensor_stats` line to the sensor's event log every [`STATS_INTERVAL`]
+    /// (the first at once, so a fresh sensor is visible), and arrange for `drain` to write a last
+    /// one with `final` set. Call once from the sensor's `main`, not from a constructor: tests
+    /// that count a log's lines build the sensor without it. A second call is a no-op. The task
+    /// holds only a weak reference, and a failed write is logged, never fatal.
+    pub fn start_stats(self: &Arc<Self>, sensor: &str) {
+        let mut name = self.stats_name.lock().unwrap();
+        if name.is_some() {
+            return;
+        }
+        *name = Some(sensor.to_string());
+        let weak = Arc::downgrade(self);
+        let emitter = self.emitter.clone();
+        let sensor = sensor.to_string();
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(STATS_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(handoff) = weak.upgrade() else {
+                    return;
+                };
+                let stats = handoff.stats_snapshot(&sensor, false);
+                drop(handoff);
+                write_stats(&emitter, &stats).await;
+            }
+        });
+        *self.stats_task.lock().unwrap() = Some(task);
     }
 
     /// The tracker a sensor passes to its listener (`run_tcp_listener_tracked`) so `drain` can end
@@ -577,10 +639,36 @@ impl CaptureHandoff {
                 "capture hand-off: connections still live after cancellation; their captures may be lost"
             ),
         }
+        // The last stats line is written after the queue, so its counters include what the drain
+        // stored; its slice of the deadline is reserved up front.
+        let final_stats_slice = (timeout / 8).min(Duration::from_secs(1));
         let queue = self
-            .drain_queue(timeout.saturating_sub(started.elapsed()))
+            .drain_queue(
+                timeout
+                    .saturating_sub(started.elapsed())
+                    .saturating_sub(final_stats_slice),
+            )
             .await;
+        self.write_final_stats(final_stats_slice).await;
         DrainReport { connections, queue }
+    }
+
+    /// Stop the periodic task and write the `final` stats line, once, within `within`.
+    async fn write_final_stats(&self, within: Duration) {
+        if let Some(task) = self.stats_task.lock().unwrap().take() {
+            task.abort();
+        }
+        let Some(sensor) = self.stats_name.lock().unwrap().take() else {
+            return;
+        };
+        let stats = self.stats_snapshot(&sensor, true);
+        let write = write_stats(&self.emitter, &stats);
+        if tokio::time::timeout(within.max(Duration::from_millis(10)), write)
+            .await
+            .is_err()
+        {
+            tracing::warn!("capture hand-off: final sensor_stats line not written in time");
+        }
     }
 
     async fn drain_queue(&self, timeout: Duration) -> DrainOutcome {
@@ -607,6 +695,12 @@ impl CaptureHandoff {
             ),
         }
         outcome
+    }
+}
+
+async fn write_stats(emitter: &EventEmitter, stats: &SensorStats) {
+    if let Err(e) = emitter.append(&stats.to_event(chrono::Utc::now())).await {
+        tracing::warn!(error = %e, "capture hand-off: sensor_stats line not written");
     }
 }
 
@@ -1536,6 +1630,65 @@ mod tests {
                 })
                 .await;
         })
+    }
+
+    fn stats_lines(log: &std::path::Path) -> Vec<sensor_wire::SensorEvent> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|e: &sensor_wire::SensorEvent| e.signal_type == SIGNAL_SENSOR_STATS)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stats_are_written_at_start_and_once_more_as_final_at_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log = dir.path().join("events.jsonl");
+        let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(log.clone());
+        // No worker, queue of one: the second submit is a queue-full drop.
+        let handoff = Arc::new(test_handoff(spool, emitter, 1, dir.path()));
+        handoff.submit(drain_job(b"a".to_vec())).unwrap();
+        assert!(handoff.submit(drain_job(b"b".to_vec())).is_err());
+        handoff.start_stats("ssh");
+        handoff.start_stats("ssh");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while stats_lines(&log).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no start-up line");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let first = SensorStats::from_event(&stats_lines(&log)[0]).unwrap();
+        assert!(!first.is_final);
+        assert_eq!((first.sensor.as_str(), first.dropped), ("ssh", 1));
+
+        handoff.drain(Duration::from_secs(2)).await;
+        handoff.drain(Duration::from_secs(2)).await;
+        let lines = stats_lines(&log);
+        let finals: Vec<_> = lines
+            .iter()
+            .map(|e| SensorStats::from_event(e).unwrap())
+            .filter(|s| s.is_final)
+            .collect();
+        assert_eq!(lines.len(), 2, "one start-up line and one final line");
+        assert_eq!(finals.len(), 1, "exactly one final line across two drains");
+        assert_eq!(finals[0].dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_hand_off_that_never_started_stats_writes_none_at_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log = dir.path().join("events.jsonl");
+        let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(log.clone());
+        let handoff = Arc::new(test_handoff(spool, emitter, 1, dir.path()));
+        handoff.drain(Duration::from_secs(1)).await;
+        assert!(stats_lines(&log).is_empty());
     }
 
     #[tokio::test]

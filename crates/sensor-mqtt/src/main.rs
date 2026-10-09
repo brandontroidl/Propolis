@@ -333,6 +333,7 @@ async fn main() {
         }
     };
     tracing::info!(local = %bound, "sensor-mqtt: listening");
+    handoff.start_stats("mqtt");
 
     let tls_handle = match tls_server {
         Some((Some(tls_addr), server)) => {

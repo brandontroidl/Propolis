@@ -518,3 +518,18 @@ async fn a_full_first_page_says_it_is_the_newest_events_and_uses_singulars(pool:
         "newest 200 events: 199 commands, 1 session, 1 outside any session"
     );
 }
+
+/// Below 640 px the Most active table becomes one card per address (console.css, `tr.arow`): a
+/// row that lost its cell classes would fall back to a five-column table that overflows a phone.
+#[sqlx::test(migrations = false)]
+async fn most_active_rows_carry_the_classes_the_narrow_layout_places(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.56";
+    scored(&pool, ip).await;
+    let body = page(pool, "/").await;
+    let panel = &body[body.find("active-panel").expect("panel class")..];
+    let row = row(panel, ip);
+    for class in ["arow", "a-ip", "a-strip", "a-events", "a-what", "a-last"] {
+        assert!(row.contains(class), "{class} missing: {row}");
+    }
+}

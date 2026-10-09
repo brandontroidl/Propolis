@@ -106,6 +106,10 @@
 
 ### Fixed
 
+- **Most active on the dashboard no longer runs off a phone screen** - at 390 px the table's last
+  two columns (what it did, last seen) were clipped. Below 640 px each row is now a card, the
+  same pattern the queue, campaigns and samples lists use: address and events on top, the 24-hour
+  strip and last seen under, the tags last.
 - **Samples no longer says "not fetched" for every uploaded file** - the Transport column describes
   how the fetcher's connection was authenticated, which means nothing for a body a sensor took
   from the address that sent it. Those rows now read `n/a, uploaded`; a body in the fetcher's

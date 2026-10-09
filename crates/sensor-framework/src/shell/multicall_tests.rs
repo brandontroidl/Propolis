@@ -78,14 +78,31 @@ fn toybox_runs_a_modeled_applet_as_the_plain_command_does() {
 #[test]
 fn toolbox_routes_to_the_same_handlers() {
     let mut sh = android();
+    assert_eq!(out(&mut sh, "toolbox ls /"), out(&mut sh, "ls /"));
+    assert_eq!(out(&mut sh, "toolbox uname -m"), "armv7l\n");
+}
+
+/// `getprop`, `setprop` and `ifconfig` are in toybox's `ALL_TOOLS` at tag `android-6.0.1_r81` and
+/// in no source of that tag's `system/core/toolbox`, so toybox runs them and toolbox does not.
+#[test]
+fn the_property_and_interface_tools_are_toybox_applets() {
+    let mut sh = android();
     assert_eq!(
-        answer(&mut sh, "toolbox getprop ro.product.model"),
+        answer(&mut sh, "toybox getprop ro.product.model"),
         ("Nexus 5\n".into(), "".into(), 0)
     );
-    assert_eq!(out(&mut sh, "toolbox ls /"), out(&mut sh, "ls /"));
-    assert_eq!(answer(&mut sh, "toolbox setprop x.y z").2, 0);
+    assert_eq!(answer(&mut sh, "toybox setprop x.y z").2, 0);
     assert_eq!(out(&mut sh, "getprop x.y"), "z\n");
-    assert_eq!(out(&mut sh, "toolbox uname -m"), "armv7l\n");
+    assert!(out(&mut sh, "toybox ifconfig").contains("wlan0"));
+    for name in ["getprop", "setprop", "ifconfig"] {
+        assert_eq!(
+            answer(&mut sh, &format!("toolbox {name} x")),
+            ("".into(), format!("toolbox: no such tool {name}\n"), 1),
+            "toolbox {name}"
+        );
+        assert!(TOYBOX_APPLETS.contains(&name), "{name}");
+        assert!(!TOOLBOX_APPLETS.contains(&name), "{name}");
+    }
 }
 
 #[test]
@@ -125,6 +142,7 @@ fn a_listed_applet_without_a_model_succeeds_silently() {
         "rm",
         "sha1sum",
         "sha256sum",
+        "setprop",
         "sleep",
         "tail",
         "tr",
@@ -167,11 +185,11 @@ fn a_bare_binary_lists_the_advertised_applets() {
     assert_eq!((err.as_str(), status), ("", 0));
     assert_eq!(
         toybox,
-        "base64\ncat\nchmod\ncp\ncut\ndate\ndf\ndu\nenv\nfind\nfree\nhead\nhostname\nid\nls\nmd5sum\nmkdir\nmount\nmv\nnc\nnetstat\nod\nping\nreboot\nrm\nroute\nsha1sum\nsha256sum\nsleep\nstat\ntail\ntr\numount\nuptime\nwc\nwhich\n"
+        "base64\ncat\nchmod\ncp\ncut\ndate\ndf\ndu\nenv\nfind\nfree\ngetprop\nhead\nhostname\nid\nifconfig\nls\nmd5sum\nmkdir\nmount\nmv\nnc\nnetstat\nod\nping\nreboot\nrm\nroute\nsetprop\nsha1sum\nsha256sum\nsleep\nstat\ntail\ntr\numount\nuptime\nwc\nwhich\n"
     );
     assert_eq!(
         answer(&mut sh, "toolbox"),
-        ("getprop\nsetprop\nps\ntop\nifconfig\n".into(), "".into(), 0)
+        ("ps\ntop\n".into(), "".into(), 0)
     );
 }
 
@@ -321,9 +339,9 @@ fn the_decision_is_recorded_with_the_applet_nested_under_it() {
     assert_eq!(command.resolved, HandlerId::Toybox);
     assert_eq!(command.reentry.len(), 1);
     assert_eq!(command.reentry[0].resolved, HandlerId::Uname);
-    sh.handle_input("toolbox getprop ro.build.id");
+    sh.handle_input("toybox getprop ro.build.id");
     let command = sh.last_trace().segments[0].command.as_ref().unwrap();
-    assert_eq!(command.resolved, HandlerId::Toolbox);
+    assert_eq!(command.resolved, HandlerId::Toybox);
     assert_eq!(command.reentry[0].resolved, HandlerId::Getprop);
 }
 

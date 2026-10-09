@@ -21,6 +21,21 @@
 
 ### Fixed
 
+- **The phone's `getprop`, `setprop` and `ifconfig` are toybox's, not toolbox's** - the persona
+  announces Android 6.0.1, whose `external/toybox/Android.mk` (tag `android-6.0.1_r81`) links all
+  three into `/system/bin` and whose `system/core/toolbox` has no source for any of them, but the
+  shell listed them as toolbox applets and answered in toolbox's words. `toybox getprop` now runs
+  and `toolbox getprop` is `toolbox: no such tool getprop`. `setprop` counts operands as toybox
+  does (`setprop: Need 2 arguments`, `Max 2 arguments`) and makes its checks in its words: a name
+  of 32 bytes or more, a value of 92 or more (a `ro.` value too, which the old code let through),
+  a leading or trailing dot, `..`, and a character outside letters, digits and `_.-`. `ifconfig`
+  prints toybox's `Link encap:` listing (HWaddr, `inet addr:` with `Bcast:` and `Mask:`, the
+  `inet6 addr:` line, flags and MTU, the packet and byte counters) instead of toolbox's one line
+  per interface, fails an unknown interface as `ifconfig: eth9: No such device`, and refuses an
+  action it does not know with the applet's help text first. `df`, `du`, `ls`, `mount` and
+  `uptime` are toolbox's at that tag too and are still listed as toybox's (noted in the module
+  doc of `crates/sensor-framework/src/shell/multicall.rs`).
+
 - **The Ubuntu persona's `tr` exists, as GNU coreutils 8.32** - it answered `tr: command not
   found`, which no Ubuntu server does, so a loader that strips line breaks with `tr -d '\n'` before
   decoding stopped there. It now translates, deletes, squeezes and complements standard input with

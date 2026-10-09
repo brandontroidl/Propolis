@@ -11,10 +11,14 @@
 //!
 //! The persona announces Android 6.0.1, so the reference for what toybox links into `/system/bin`
 //! is toybox's `Android.mk` at tag `android-6.0.1_r81` (`ALL_TOOLS`), and for what its applets
-//! print `toys/*` of that tag, not a newer release. Two things in it differ from the lists below
-//! and are left as they are because they are not part of this change: that file also links
-//! `getprop`, `setprop` and `ifconfig` from toybox, where these lists give the first two and the
-//! third to toolbox. Everything below the persona's own facts and that source is `[unverified]`.
+//! print `toys/*` of that tag, not a newer release. That file links `getprop`, `setprop` and
+//! `ifconfig` from toybox, and `system/core/toolbox` of the same tag has no source for any of
+//! them (its `OUR_TOOLS` are `df getevent iftop ioctl ionice log ls lsof mount nandread
+//! newfs_msdos ps prlimit renice sendevent start stop top uptime watchprops`, plus `dd` and `du`),
+//! so they are toybox applets here and answer in toybox's words. Other names below still differ
+//! from those two files and are not changed: `df`, `du`, `ls`, `mount` and `uptime` are toolbox's
+//! at that tag, and `nc`, `ping` and `reboot` are in neither. Everything below the persona's own
+//! facts and those sources is `[unverified]`.
 #![deny(
     clippy::arithmetic_side_effects,
     clippy::unwrap_used,
@@ -50,7 +54,7 @@ fn android(shell: &FakeShell, _parts: &[&str]) -> bool {
 /// "not found" sends the loader away before it stages anything. `xxd` is linked from 7.0 as well
 /// and is left out; `dd` is a toolbox (NetBSD) tool on this release whose summary line is not
 /// modeled, so it stays "not found".
-pub(super) const TOYBOX_APPLETS: [&str; 36] = [
+pub(super) const TOYBOX_APPLETS: [&str; 39] = [
     "base64",
     "cat",
     "chmod",
@@ -62,9 +66,11 @@ pub(super) const TOYBOX_APPLETS: [&str; 36] = [
     "env",
     "find",
     "free",
+    "getprop",
     "head",
     "hostname",
     "id",
+    "ifconfig",
     "ls",
     "md5sum",
     "mkdir",
@@ -77,6 +83,7 @@ pub(super) const TOYBOX_APPLETS: [&str; 36] = [
     "reboot",
     "rm",
     "route",
+    "setprop",
     "sha1sum",
     "sha256sum",
     "sleep",
@@ -101,9 +108,9 @@ pub(super) fn bare_applet(shell: &FakeShell, parts: &[&str]) -> bool {
     }
 }
 
-/// The toolbox-backed names of the advertised `/system/bin`. `ps`, `top` and `ifconfig` are
-/// toolbox's on Android 6 [unverified]; toybox took them over in a later release.
-pub(super) const TOOLBOX_APPLETS: [&str; 5] = ["getprop", "setprop", "ps", "top", "ifconfig"];
+/// The toolbox-backed names of the advertised `/system/bin`. `ps` and `top` are in `OUR_TOOLS` of
+/// `system/core/toolbox/Android.mk` at tag `android-6.0.1_r81`; toybox took them over later.
+pub(super) const TOOLBOX_APPLETS: [&str; 2] = ["ps", "top"];
 
 /// Shell builtins that toybox also provides as applets and that only print or answer a status,
 /// so running them nested leaves the session's shell untouched. The other builtins (`cd`, `exit`,
@@ -122,6 +129,9 @@ struct Multicall {
     sibling: &'static str,
     /// [unverified] the not-found line for a name that is no applet.
     unknown: fn(&str) -> String,
+    /// Names the shell models that this binary is known not to have: the registry would run them
+    /// from either binary, which only the other one's source justifies.
+    lacks: &'static [&'static str],
 }
 
 /// [unverified] toybox's `Unknown command` wording, from its source, not a capture.
@@ -138,12 +148,15 @@ const TOYBOX: Multicall = Multicall {
     applets: &TOYBOX_APPLETS,
     sibling: "toolbox",
     unknown: toybox_unknown,
+    lacks: &[],
 };
 
 const TOOLBOX: Multicall = Multicall {
     applets: &TOOLBOX_APPLETS,
     sibling: "toybox",
     unknown: toolbox_unknown,
+    // `system/core/toolbox` at tag `android-6.0.1_r81` has no source for these three.
+    lacks: &["getprop", "setprop", "ifconfig"],
 };
 
 impl Multicall {
@@ -170,7 +183,11 @@ impl FakeShell {
     /// resolves by bare name, like busybox) that dispatch answers as a file, or as one of the
     /// builtins in [`PURE_BUILTINS`], and that is not in [`NOT_APPLETS`] or the sibling binary.
     fn runs_as_applet(&self, applet: &str, tool: &Multicall) -> bool {
-        if applet.contains('/') || applet == tool.sibling || NOT_APPLETS.contains(&applet) {
+        if applet.contains('/')
+            || applet == tool.sibling
+            || NOT_APPLETS.contains(&applet)
+            || tool.lacks.contains(&applet)
+        {
             return false;
         }
         match Registry::builtin().kind(applet, self) {

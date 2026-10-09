@@ -27,6 +27,9 @@ fn optstring(applet: &str) -> Option<&'static str> {
         "cut" => "b:|c:|f:|d:sn[!cbf]",
         "tr" => "^>2<1Ccsd[+cC]",
         "od" => "j#vN#xsodcbA:t*",
+        "getprop" => ">2",
+        "setprop" => "<2>2",
+        "ifconfig" => "^?a",
         _ => return None,
     })
 }
@@ -43,6 +46,8 @@ struct Spec {
     opts: Vec<Opt>,
     /// `^`: the first operand ends the options.
     stop_early: bool,
+    /// `?`: an option the string does not name is an operand, not an error.
+    noerror: bool,
     min_args: usize,
     max_args: usize,
     /// `[!xy]` groups: options that may not be given together.
@@ -61,6 +66,7 @@ fn parse_spec(text: &str) -> Spec {
     let mut spec = Spec {
         opts: Vec::new(),
         stop_early: false,
+        noerror: false,
         min_args: 0,
         max_args: usize::MAX,
         exclusive: Vec::new(),
@@ -71,6 +77,7 @@ fn parse_spec(text: &str) -> Spec {
     while let Some(&c) = chars.get(at) {
         match c {
             '^' => spec.stop_early = true,
+            '?' => spec.noerror = true,
             '<' => {
                 at = at.saturating_add(1);
                 spec.min_args = digit(text, at).unwrap_or(0);
@@ -123,6 +130,10 @@ fn parse_spec(text: &str) -> Spec {
         }
         at = at.saturating_add(1);
     }
+    // An option string with no letters makes the first operand end the options (`args.c`).
+    if spec.opts.is_empty() {
+        spec.stop_early = true;
+    }
     spec
 }
 
@@ -168,11 +179,21 @@ pub(super) fn check(applet: &str, args: &[&str]) -> Option<String> {
                 stopped = true;
                 continue;
             }
+            if spec.noerror {
+                operands = operands.saturating_add(1);
+                stopped |= spec.stop_early;
+                continue;
+            }
             return fail(format!("Unknown option {long}"));
         }
         let mut rest = cluster;
         while let Some(letter) = rest.chars().next() {
             let Some(opt) = spec.opts.iter().find(|o| o.letter == letter) else {
+                if spec.noerror {
+                    operands = operands.saturating_add(1);
+                    stopped |= spec.stop_early;
+                    break;
+                }
                 return fail(format!("Unknown option {rest}"));
             };
             rest = rest.get(letter.len_utf8()..).unwrap_or("");
@@ -312,6 +333,33 @@ mod tests {
         assert_eq!(
             check("wc", &["f", "-z"]).as_deref(),
             Some("wc: Unknown option z\n")
+        );
+    }
+
+    #[test]
+    fn a_question_mark_makes_an_unknown_option_an_operand() {
+        // `ifconfig` is `^?a`: `-z` is an interface name, and `-a` is still a flag.
+        assert_eq!(check("ifconfig", &["-z"]), None);
+        assert_eq!(check("ifconfig", &["--zz", "-a"]), None);
+        assert_eq!(check("ifconfig", &["-a", "wlan0", "-q"]), None);
+        // Without the `?`, the same word is refused.
+        assert_eq!(
+            check("wc", &["-z"]).as_deref(),
+            Some("wc: Unknown option z\n")
+        );
+    }
+
+    #[test]
+    fn an_option_string_with_no_letters_ends_the_options_at_the_first_operand() {
+        // `getprop` is `>2`: a dash first is an unknown option, a dash after a name is data.
+        assert_eq!(
+            check("getprop", &["-x"]).as_deref(),
+            Some("getprop: Unknown option x\n")
+        );
+        assert_eq!(check("getprop", &["name", "-x"]), None);
+        assert_eq!(
+            check("setprop", &["a"]).as_deref(),
+            Some("setprop: Need 2 arguments\n")
         );
     }
 

@@ -9,8 +9,12 @@
 //! service is system-wide, so a `setprop` run in a subshell, pipeline stage or `$( )` must survive
 //! it, where frame state is copied and discarded.
 //!
-//! Both commands exist only on the Android shell; on bash they are "not found". They are toolbox
-//! commands, not BusyBox applets. Wording that no capture backs is marked `[unverified]`.
+//! Both commands exist only on the Android shell; on bash they are "not found". They are toybox
+//! applets, not toolbox's or BusyBox's: `toys/android/getprop.c` and `setprop.c` of
+//! `external/toybox` at tag `android-6.0.1_r81` are in its `ALL_TOOLS`, and
+//! `system/core/toolbox` of that tag has no source for either. Their operand counts are
+//! `toyopt`'s (`>2` and `<2>2`); the checks `setprop` makes before asking the property service are
+//! that file's, in its words. Wording that no capture backs is marked `[unverified]`.
 #![deny(
     clippy::arithmetic_side_effects,
     clippy::unwrap_used,
@@ -54,15 +58,13 @@ const INCREMENTAL: &str = "3565761";
 /// not captured from a device.
 const SECURITY_PATCH: &str = "2016-12-01";
 
-/// Android's `PROP_NAME_MAX` and `PROP_VALUE_MAX`: a longer key, or a longer value outside `ro.`,
-/// is refused by the property service.
+/// Bionic's `PROP_NAME_MAX` and `PROP_VALUE_MAX` (`sys/system_properties.h`, tag
+/// `android-6.0.1_r81`): toybox's `setprop` refuses a name of 32 bytes or more and a value of 92 or
+/// more, `ro.` names included.
 const NAME_MAX: usize = 32;
 const VALUE_MAX: usize = 92;
 /// Properties a session may add, so a loop of `setprop` cannot grow the overlay without bound.
 const OVERLAY_MAX: usize = 512;
-
-const SETPROP_USAGE: &str = "usage: setprop <key> <value>\n";
-const SETPROP_FAILED: &str = "could not set property\n";
 
 /// The modeled properties, from the persona alone.
 fn table() -> Vec<(&'static str, String)> {
@@ -115,7 +117,7 @@ impl FakeShell {
 
     /// `getprop` with no argument lists every property as `[name]: [value]`, sorted by name;
     /// `getprop NAME [DEFAULT]` prints the value, or the default (empty if none), for an unset
-    /// name. Status is 0 either way. [unverified] from the AOSP 6.0 toolbox source, not a capture.
+    /// name. Status is 0 either way. From `getprop_main` of toybox 6.0.1, not a capture.
     pub(super) fn cmd_getprop(&mut self, parts: &[&str]) -> CommandResult {
         let args = parts.get(1..).unwrap_or(&[]);
         let Some(name) = args.first() else {
@@ -138,18 +140,58 @@ impl FakeShell {
     }
 
     /// `setprop NAME VALUE` stores the pair in the session overlay. adbd runs as root, so `ro.*`
-    /// is writable here too. A name or value past the property service's limits, or a full
-    /// overlay, fails as the service does. [unverified] wording, from the AOSP 6.0 toolbox.
+    /// is writable here too. The refusals are `setprop_main` of toybox 6.0.1 in order, each
+    /// `setprop: <text>` with status 1; an empty name passes them all and the property service
+    /// ignores it, so it is a silent success that stores nothing. A full overlay is the one
+    /// failure `property_set` itself reports.
     pub(super) fn cmd_setprop(&mut self, parts: &[&str]) -> CommandResult {
         let args = parts.get(1..).unwrap_or(&[]);
-        let (Some(name), Some(value), None) = (args.first(), args.get(1), args.get(2)) else {
-            return CommandResult::stderr(1, SETPROP_USAGE);
+        let (Some(name), Some(value)) = (args.first(), args.get(1)) else {
+            return CommandResult::silent(0);
         };
-        let too_long =
-            name.len() >= NAME_MAX || (value.len() >= VALUE_MAX && !name.starts_with("ro."));
-        let full = !self.props.contains_key(*name) && self.props.len() >= OVERLAY_MAX;
-        if name.is_empty() || too_long || full {
-            return CommandResult::stderr(255, SETPROP_FAILED);
+        let fail = |text: Vec<u8>| {
+            let mut line = b"setprop: ".to_vec();
+            line.extend(text);
+            line.push(b'\n');
+            CommandResult::stderr(1, line)
+        };
+        let clip = |text: &str, max: usize| {
+            text.bytes()
+                .take(max.saturating_sub(1))
+                .collect::<Vec<u8>>()
+        };
+        if name.len() >= NAME_MAX {
+            let mut text = format!("name '{name}' too long; try '").into_bytes();
+            text.extend(clip(name, NAME_MAX));
+            text.push(b'\'');
+            return fail(text);
+        }
+        if value.len() >= VALUE_MAX {
+            let mut text = format!("value '{value}' too long; try '").into_bytes();
+            text.extend(clip(value, VALUE_MAX));
+            text.push(b'\'');
+            return fail(text);
+        }
+        if name.starts_with('.') || name.ends_with('.') {
+            return fail(b"property names must not start or end with '.'".to_vec());
+        }
+        if name.contains("..") {
+            return fail(b"'..' is not allowed in a property name".to_vec());
+        }
+        if let Some(bad) = name
+            .bytes()
+            .find(|b| !b.is_ascii_alphanumeric() && !b"_.-".contains(b))
+        {
+            let mut text = b"invalid character '".to_vec();
+            text.push(bad);
+            text.extend_from_slice(format!("' in name '{name}'").as_bytes());
+            return fail(text);
+        }
+        if name.is_empty() {
+            return CommandResult::silent(0);
+        }
+        if !self.props.contains_key(*name) && self.props.len() >= OVERLAY_MAX {
+            return fail(format!("failed to set property '{name}' to '{value}'").into_bytes());
         }
         self.props.insert((*name).to_string(), (*value).to_string());
         CommandResult::silent(0)

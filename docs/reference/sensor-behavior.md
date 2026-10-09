@@ -524,7 +524,14 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   a stray byte drops the rest of that read and the status stays 0, and `=` ends the decode. The
   names and the source of each applet's presence are in the module doc of `multicall.rs`:
   `base64` and `sha256sum` are linked here although that release links neither, and `xxd`, `dd`,
-  `settings` and `monkey` are not offered.
+  `settings` and `monkey` are not offered. `getprop`, `setprop` and `ifconfig` are toybox's too
+  (in its `ALL_TOOLS` at tag `android-6.0.1_r81`; the release's toolbox has no source for them), so
+  `toybox getprop` runs and `toolbox getprop` is `toolbox: no such tool getprop`; `setprop` counts
+  its operands as toybox does (`setprop: Need 2 arguments`) and refuses a long or malformed name or
+  a long value in toybox's words, and `ifconfig` prints toybox's `Link encap:` listing and
+  refuses an unknown interface (`ifconfig: eth9: No such device`) or action
+  (`crates/sensor-framework/src/shell/android.rs#FakeShell::cmd_setprop`,
+  `crates/sensor-framework/src/shell/netinfo.rs#FakeShell::cmd_ifconfig`).
 
 ### Command-event budget (ssh, telnet, adb)
 

@@ -330,23 +330,77 @@ fn the_phone_ifconfig_agrees_with_ip_on_address_and_mask() {
     let prefix: u32 = prefix.parse().unwrap();
     let mask = u32::MAX << (32 - prefix);
     let mask_text = mask.to_be_bytes().map(|b| b.to_string()).join(".");
-    assert_eq!(
-        out(&mut sh, "ifconfig wlan0"),
-        format!("wlan0: ip {addr} mask {mask_text} flags [up broadcast running multicast]\n")
+    let wlan0 = out(&mut sh, "ifconfig wlan0");
+    assert!(
+        wlan0.contains(&format!(
+            "inet addr:{addr}  Bcast:192.168.1.255  Mask:{mask_text} \n"
+        )),
+        "{wlan0}"
     );
     let all = out(&mut sh, "ifconfig");
     assert_eq!(out(&mut sh, "ifconfig -a"), all);
-    assert_eq!(
-        all,
-        "lo: ip 127.0.0.1 mask 255.0.0.0 flags [up loopback running]\nwlan0: ip 192.168.1.23 mask 255.255.255.0 flags [up broadcast running multicast]\n",
-        "[unverified] toolbox layout"
-    );
-    assert_eq!(
-        answer(&mut sh, "ifconfig eth9"),
-        (String::new(), String::new(), 1)
+    assert!(
+        all.ends_with(&wlan0),
+        "wlan0 is the second block of the listing"
     );
     silent_success(&mut sh, "ifconfig wlan0 down");
     assert_eq!(out(&mut sh, "ifconfig"), all, "configuring changes nothing");
+}
+
+/// Toybox 6.0.1's `display_ifconfig`, every byte of its `xprintf` formats, for the model's two
+/// interfaces. The layout is the source's; the addresses, MAC and counters are the model's.
+#[test]
+fn the_phone_ifconfig_prints_toyboxs_listing() {
+    let mut sh = phone();
+    assert_eq!(
+        out(&mut sh, "ifconfig"),
+        "lo        Link encap:Local Loopback  \n          inet addr:127.0.0.1  Mask:255.0.0.0 \n          inet6 addr: ::1/128 Scope: Host\n          UP LOOPBACK RUNNING  MTU:65536  Metric:1\n          RX packets:61204 errors:0 dropped:0 overruns:0 frame:0 \n          TX packets:61204 errors:0 dropped:0 overruns:0 carrier:0 \n          collisions:0 txqueuelen:0 \n          RX bytes:5612048 TX bytes:5612048 \n\nwlan0     Link encap:Ethernet  HWaddr 10:68:3F:4A:91:C2\n          inet addr:192.168.1.23  Bcast:192.168.1.255  Mask:255.255.255.0 \n          inet6 addr: fe80::1268:3fff:fe4a:91c2/64 Scope: Link\n          UP BROADCAST RUNNING MULTICAST  MTU:1500  Metric:1\n          RX packets:23017 errors:0 dropped:0 overruns:0 frame:0 \n          TX packets:14320 errors:0 dropped:0 overruns:0 carrier:0 \n          collisions:0 txqueuelen:1000 \n          RX bytes:18422901 TX bytes:2908114 \n\n"
+    );
+}
+
+#[test]
+fn the_phone_ifconfig_refuses_in_toyboxs_words() {
+    let mut sh = phone();
+    // An unknown interface: `perror_exit("%s", name)` for one operand, the failed ioctl for more.
+    assert_eq!(
+        answer(&mut sh, "ifconfig eth9"),
+        (String::new(), "ifconfig: eth9: No such device\n".into(), 1)
+    );
+    assert_eq!(
+        answer(&mut sh, "ifconfig eth9 up"),
+        (
+            String::new(),
+            "ifconfig: ioctl 8913: No such device\n".into(),
+            1
+        )
+    );
+    assert_eq!(
+        answer(&mut sh, "ifconfig eth9 192.0.2.5"),
+        (
+            String::new(),
+            "ifconfig: ioctl 8916: No such device\n".into(),
+            1
+        )
+    );
+    // `?` in the option string makes an unknown option an operand: an interface called `-z`.
+    assert_eq!(
+        answer(&mut sh, "ifconfig -z").1,
+        "ifconfig: -z: No such device\n"
+    );
+    // A word it does not know, and a valued word with no value, name the applet's help first.
+    let (stdout, stderr, status) = answer(&mut sh, "ifconfig wlan0 bogus");
+    assert_eq!((stdout.as_str(), status), ("", 1));
+    assert!(stderr.starts_with("usage: ifconfig [-a] [INTERFACE [ACTION...]]\n\n"));
+    assert!(
+        stderr.ends_with("still true\n\nifconfig: bad argument 'bogus'\n"),
+        "{stderr}"
+    );
+    assert_eq!(
+        answer(&mut sh, "ifconfig wlan0 mtu").1,
+        "ifconfig: mtu needs argument\n"
+    );
+    silent_success(&mut sh, "ifconfig wlan0 mtu 1400 up");
+    silent_success(&mut sh, "ifconfig wlan0 192.0.2.5 netmask 255.255.255.0");
 }
 
 // ------------------------------------------------------------------------------------- routing
@@ -791,7 +845,7 @@ fn each_persona_has_the_commands_it_ships() {
 fn the_phone_multicall_binaries_route_to_the_same_handlers() {
     let mut sh = phone();
     assert_eq!(
-        out(&mut sh, "toolbox ifconfig wlan0"),
+        out(&mut sh, "toybox ifconfig wlan0"),
         out(&mut sh, "ifconfig wlan0")
     );
     assert_eq!(out(&mut sh, "toybox route -n"), out(&mut sh, "route -n"));
@@ -804,7 +858,8 @@ fn the_phone_multicall_binaries_route_to_the_same_handlers() {
         out(&mut sh, "ip route")
     );
     assert!(out(&mut sh, "toybox").contains("netstat\n"));
-    assert!(out(&mut sh, "toolbox").contains("ifconfig\n"));
+    assert!(out(&mut sh, "toybox").contains("ifconfig\n"));
+    assert!(!out(&mut sh, "toolbox").contains("ifconfig\n"));
     sh.handle_input("netstat -rn");
     assert_eq!(
         sh.last_trace().segments[0]
@@ -854,7 +909,6 @@ fn what_is_not_modeled_prints_nothing_and_succeeds() {
         "route add default gw 192.168.1.1",
         "route del default",
         "ifconfig wlan0 up",
-        "ifconfig -s",
     ] {
         silent_success(&mut ph, line);
     }

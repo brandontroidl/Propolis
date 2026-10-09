@@ -198,7 +198,7 @@
         <td class="seen">{{ u.seen_count }}&times; <span class="dim">{{ u.first_seen }}{% if u.last_seen != u.first_seen %} to {{ u.last_seen }}{% endif %}</span></td>
         <td>
           {% if u.kind == "captured" %}<span class="state-pill state-rejected">{{ u.outcome }}</span>
-          {% elif u.kind == "failed" or u.kind == "pending" %}<span class="state-pill state-snoozed">{{ u.outcome }}</span>
+          {% elif u.kind == "failed" or u.kind == "refused" or u.kind == "pending" %}<span class="state-pill state-snoozed">{{ u.outcome }}</span>
           {% else %}<span class="dim">{{ u.outcome }}</span>{% endif %}
         </td>
         <td class="mono">{% if u.first_reporter %}<a href="/ip/{{ u.first_reporter }}">{{ u.first_reporter }}</a> <span class="dim">{{ u.queued_at }}</span>{% elif u.queued_at %}<span class="dim">this address, {{ u.queued_at }}</span>{% else %}<span class="dim">-</span>{% endif %}</td>

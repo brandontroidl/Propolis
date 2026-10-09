@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-09
 -->
 
 # Console tour
@@ -83,7 +83,11 @@ evidence timeline grouped into sessions where the sensor recorded one. Consecuti
 sessions that ran the same commands (a loader retrying under a new username) fold into
 one card marked `x3 identical sessions` with the usernames tried, each session still
 inside it, and an echo loader's chunk writes to one file are one row, `40 echo chunks
-to /tmp/.i`, with the lines behind an expander. Below that,
+to /tmp/.i`, with the lines behind an expander. A download attempt carries the review
+fetcher's outcome for its URL on a line under it: `fetched` with the sample's hash linked
+to its page, `refused` or `failed` with the recorded reason, `pending`, or `not fetched`
+for a scheme the fetcher does not handle. The outcome is the URL's current record, whoever
+reported it first, and carries the date of the last attempt. Below that,
 which of your WAN addresses it hit, which services it probed, vendor submissions, and
 the malware linked to it, marked as uploaded directly or fetched from a URL it
 reported. A truncated upload is labelled as such.

@@ -4,6 +4,15 @@
 
 ### Added
 
+- **The evidence timeline shows what the fetcher did with each download** - a
+  `honeypot_file_download` event now carries a line under its URL: `fetched` with the sample
+  hash linked to its page, `refused` (the SSRF guard or hop limit) or `failed` with the recorded
+  reason, `gave up after N attempts`, `pending`, or `not fetched` for a scheme outside the
+  fetcher. The outcome is the URL's current `fetch_attempt` record, matched by the fetcher's own
+  `url_hash`, so a later reporter's download shows the capture the first reporter's produced.
+  Reasons are length-capped and escaped. A failed lookup names "download outcomes" in the
+  page's degraded banner. The "URLs this IP tried to fetch" panel shares the classifier and
+  shows a guard rejection as refused.
 - **Miner and test-key indicators from captured artifacts** - found in a mobile dropper
   analysed 2026-10-08. A script URL on `coinhive.com`, `coin-hive.com` or `authedmine.com`
   (under `/lib/`) is a URL indicator labeled `CoinHive miner script`; a `CoinHive.Anonymous(` or

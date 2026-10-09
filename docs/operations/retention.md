@@ -157,16 +157,19 @@ keep every healthy sensor from rotating. The free-space check is a `stat` and a 
 `copytruncate` moves whatever the reader has not read into `events.jsonl.1`, and the tailer reads
 it from there before the new file
 ([concurrency and failure](../architecture/concurrency-and-failure.md#log-rotation-under-a-reader-that-is-behind)).
-That works only while `.1` is still the uncompressed copy: the next rotation renames it to `.2`
-and compresses it, and the tailer opens only `.1`. After the free-space check, the guard therefore
-reads the reader's saved cursor (read-only; `<cursor dir>/<sha256 of the log path>.json`, in
+That works only while the copy is still uncompressed: the next rotation renames `.1` to `.2` and
+compresses it, and the tailer opens only `.1` and, for a restart after a second rotation that
+skipped the guard, an uncompressed `.2`. After the free-space check, the guard therefore
+reads the reader's saved cursor (read-only; `<cursor dir>/<sha256 of the resolved log path>.json`
+(symlinks, `//` and `..` resolved, as the daemon names it), in
 `PROPOLIS_CURSOR_DIR`, default `/var/lib/propolis/cursors`, and `PROPOLIS_SHIPPER_CURSOR_DIR`,
 default `/var/lib/propolis/shipper/cursors`, so an intake node and a collector node are both
 covered) and skips the log when either holds:
 
 - `.1` has not been fully read: the cursor still carries `.1`'s fingerprint and sits short of its
   size. The tailer keeps its saved cursor in the old content until the drain of `.1` ends, so this
-  is also true for the moment between a rotation and the reader noticing it.
+  is also true for the moment between a rotation and the reader noticing it. A cursor that still
+  carries `.2`'s fingerprint means `.1` was rotated after it and has not been read at all.
 - the live file holds more than 64 MiB the reader has not read
   (`PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES` overrides the bound). The bound is a judgement, not a
   measurement: two thirds of the shipped `size 100M`, so a log is skipped only when its reader has
@@ -175,16 +178,20 @@ covered) and skips the log when either holds:
 A skipped log is left untouched, the journal line names the reason and the cursor file, and
 logrotate exits non-zero so `propolis-logrotate.service` shows failed until the next run rotates
 it (logrotate cannot skip one log and report success). Skipping lets the log grow past its
-`size`; `sensor-log-oversized` is the backstop that pages if intake does not catch up.
+`size`; `sensor-log-oversized` is the backstop that pages if intake does not catch up. The run
+still rewrites the state file, so a skip does not trip `rotation-stale`.
 
 If no cursor can be read for a log (none under either directory, an unreadable or malformed one, or
 one for a different inode of the log, as when a cursor directory was moved off the default and the
 unit does not see the override) the log is **rotated**, as it was before this check existed, and
-the journal says why. That is deliberately the opposite of the free-space check: refusing on a
+the journal says why, at warning priority. `deploy/config-check.sh` flags a log with content and no
+cursor, and a cursor directory set in `propolis.env` that the unit cannot see. That is deliberately the opposite of the free-space check: refusing on a
 missing cursor would turn a misplaced cursor directory, or an intake that never started, into a
 rotation that never runs and a log that fills the disk, which is the October 2026 incident. If you
 move the cursor directory, give `propolis-logrotate.service` the same `PROPOLIS_CURSOR_DIR` in a
-drop-in. The tailer's own check (a verified `.1`) is the second line of defence, and
+drop-in (`/etc/systemd/system/propolis-logrotate.service.d/cursor-dir.conf`, `[Service]` with
+`Environment=PROPOLIS_CURSOR_DIR=...`); the unit deliberately does not read `propolis.env`, which
+holds the database URL. The tailer's own check (a verified `.1`) is the second line of defence, and
 `intake-rotation-loss` reports what slips through.
 
 ### Alerts

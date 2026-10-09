@@ -143,6 +143,18 @@ original in place, so the sensor's open descriptor never needs to reopen
   rotation guard can see `.1` is unread. Before this, a reader that was behind at rotation time
   restarted at offset 0 of the new file and the rest of the old one was never read: the intake
   soak lost 71,150, 442,378 and 822,979 telnet lines in three runs with no error.
+- **Each generation queued while draining keeps its own resume point.** The saved cursor always
+  describes the generation at the front of the drain queue. If a second rotation lands while the
+  first copy is still being read and the process then restarts, the cursor names the first
+  generation, now `.2`: the restart finds it there by fingerprint, reads it from the saved offset,
+  then `.1` (rotated after it, so unread) from 0, then the live file. This needs `.2` to be
+  uncompressed, which the shipped `delaycompress` policy does not give once a second rotation has
+  run; the guard exists to prevent that rotation, and when it happens anyway the generation is
+  found missing and reported as a loss rather than skipped silently.
+- **A committed prefix across a rotation is placed, not replayed.** When a copytruncate lands while
+  a batch is being appended and the append fails partway, the runner accepts the lines that
+  committed. With a verifiable `.1` the read position moves forward over them, so the next read
+  continues `.1` after them and nothing is appended twice.
 
 When `.1` cannot be trusted (it is missing, only `.1.gz` exists, or it is another generation's
 content) it is not read, since reading it would ingest lines the ledger already has. The unread

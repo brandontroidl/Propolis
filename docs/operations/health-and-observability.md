@@ -247,9 +247,10 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
   its modification time is the last run. The daemon does not ask systemd whether the timer is
   active; a file that stops moving is a timer that stopped firing. It clears on the next run. A
   node where the file does not exist yet (the timer never ran) reads as unknown, not firing, and
-  the monitor's stale-probe warning raises it after half an hour. A run that the free-space guard
-  refuses still rewrites the file, so that case surfaces as `sensor-log-oversized` and a failed
-  unit, not as this alert. The thresholds of both are fixed, not `PROPOLIS_OPS_*` variables;
+  the monitor's stale-probe warning raises it after half an hour. A run in which the guard refuses
+  a log (for free space, or because intake has not read it) still rewrites the file, so that case
+  surfaces as `sensor-log-oversized` and a failed unit, not as this alert
+  (`crates/sensor-framework/tests/deploy_test.rs#a_log_skipped_for_unread_input_still_refreshes_the_state_file_and_fails_the_run`). The thresholds of both are fixed, not `PROPOLIS_OPS_*` variables;
 - a rotation that took unread input (`intake-rotation-loss`, Warning;
   `crates/propolis/src/ops_alert/conditions/intake.rs#IntakeRotationLoss`). When a `copytruncate`
   rotation lands while a log is unread, the tailer reads the rest from `<log>.1`

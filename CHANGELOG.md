@@ -49,8 +49,15 @@
   fifteenth) pages on it and holds for an hour. `deploy/logrotate-guard.sh` also skips a log whose
   `.1` the reader has not finished (the next rotation would compress it unread) or whose live file
   has more than 64 MiB unread (`PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES`), reading the reader's
-  cursor read-only from the intake and shipper cursor directories; with no readable cursor it
-  rotates and says why. A skipped log makes `propolis-logrotate.service` show failed until a later
+  cursor read-only from the intake and shipper cursor directories (named by the resolved log
+  path on both sides, so a symlinked spelling finds the same cursor; a cursor still in `.2`
+  also skips); with no readable cursor it rotates and says why, at warning priority in the
+  journal, and `deploy/config-check.sh` flags a log with no cursor and a cursor directory the
+  rotation unit cannot see. Restart safety: a second rotation while the first copy drains no
+  longer loses either generation on a restart (each queued generation keeps a resume point;
+  `.1`/`.2` are searched by fingerprint, an unfindable one is a reported loss); a restart
+  mid-drain with a live file under 256 bytes is no longer read as small-file growth; and a
+  copytruncate during a failed batch no longer re-appends the committed prefix. A skipped log makes `propolis-logrotate.service` show failed until a later
   run rotates it. `logrotate --force` no longer discards a backlog: archive and truncate by hand
   ([intake backlog](docs/troubleshooting/intake-backlog.md#recovering-a-backlog-too-large-to-drain)).
   The "small window" wording in `deploy/logrotate-sensors.conf` and the docs now says what the

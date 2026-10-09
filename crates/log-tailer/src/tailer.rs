@@ -125,12 +125,14 @@ pub struct LogTailer {
     /// read: the size taken at construction is the file as found, not the content the persisted
     /// offset points into, so it cannot size what a truncation then discarded.
     size_observed: bool,
-    /// The inode of a `copytruncate` copy queued in `pending_drains` and the fingerprint of the
-    /// old content it holds. While that copy is the front of the queue, [`Self::persist_cursor`]
-    /// saves the drain's position under this fingerprint instead of the new file's, so a restart
-    /// (or the rotation guard, `deploy/logrotate-guard.sh`) sees the old content as unread until it
-    /// is read. Matched on inode, so a stale entry can never be applied to another drain.
-    resume: Option<(u64, [u8; 32])>,
+    /// The inode and content fingerprint of each `copytruncate` generation queued in
+    /// `pending_drains` (pruned to the queue whenever one is added, so never more than the queue).
+    /// While such a generation is the front of the queue, [`Self::persist_cursor`] saves the
+    /// drain's position under its fingerprint instead of the new file's, so a restart (or the
+    /// rotation guard, `deploy/logrotate-guard.sh`) sees the old content as unread until it is
+    /// read, whichever generation is at the front. Matched on inode, so a stale entry can never be
+    /// applied to another drain.
+    resumes: Vec<(u64, [u8; 32])>,
     loss: RotationLoss,
 }
 
@@ -184,7 +186,7 @@ impl LogTailer {
             last_known_size,
             uncommitted: None,
             size_observed: false,
-            resume: None,
+            resumes: Vec::new(),
             loss: RotationLoss::default(),
         }
     }
@@ -370,7 +372,10 @@ impl LogTailer {
             RotationEvent::Replaced => !self.maybe_false_positive_replaced(),
             RotationEvent::None | RotationEvent::InodeChanged => false,
         };
-        if changed {
+        // A copytruncate whose old content is still in `<log>.1` is accepted: moving the offset
+        // forward over the prefix makes the next read drain `.1` from there, so the committed
+        // prefix is not read again. Without a verifiable copy the prefix cannot be placed.
+        if changed && find_generations(&self.log_path, &self.state).is_err() {
             return false;
         }
         let spans = uncommitted.spans[..lines].to_vec();
@@ -479,16 +484,15 @@ impl LogTailer {
     /// a position in the new file would never go back for it; loaded as saved here, the restart
     /// sees the truncation again and resumes the drain from `<log>.1`.
     pub fn persist_cursor(&self) -> io::Result<()> {
-        let resumable = self.resume.zip(self.pending_drains.front()).and_then(
-            |((ino, fingerprint), (file, offset))| {
-                let front = file.metadata().ok()?.ino();
-                (front == ino).then_some(CursorState {
-                    inode: self.state.inode,
-                    offset: *offset,
-                    fingerprint,
-                })
-            },
-        );
+        let resumable = self.pending_drains.front().and_then(|(file, offset)| {
+            let front = file.metadata().ok()?.ino();
+            let (_, fingerprint) = self.resumes.iter().find(|(ino, _)| *ino == front)?;
+            Some(CursorState {
+                inode: self.state.inode,
+                offset: *offset,
+                fingerprint: *fingerprint,
+            })
+        });
         let state = resumable.unwrap_or(self.state);
         match &self.cursor {
             Some(cursor) => cursor.save(&state),
@@ -514,7 +518,12 @@ impl LogTailer {
             RotationEvent::None => {}
             RotationEvent::Truncated => self.recover_copytruncated(),
             RotationEvent::Replaced => {
-                if self.maybe_false_positive_replaced() {
+                // A rotated copy that carries the stored fingerprint is proof of a copytruncate,
+                // and outranks the growth explanation: a restart mid-drain stores the OLD
+                // fingerprint, so a live file still under 256 bytes always mismatches it.
+                if find_generations(&self.log_path, &self.state).is_err()
+                    && self.maybe_false_positive_replaced()
+                {
                     // Ordinary growth of a still-small file, not a real replacement (see
                     // `maybe_false_positive_replaced`): re-stamp and keep reading from the same
                     // offset rather than discarding it.
@@ -564,17 +573,33 @@ impl LogTailer {
     /// reading the wrong file would ingest another generation's lines; it is reported as a loss
     /// instead. Without a `.1` the new file is simply read from 0, as it always was.
     fn recover_copytruncated(&mut self) {
-        match open_rotated_copy(&self.log_path, &self.state) {
-            Ok(Some(copy)) => {
-                if let Some(uncommitted) = &mut self.uncommitted {
-                    uncommitted.drain_offsets.push(uncommitted.offset);
+        match find_generations(&self.log_path, &self.state) {
+            Ok(found) => {
+                let queued: Vec<u64> = self
+                    .pending_drains
+                    .iter()
+                    .filter_map(|(file, _)| file.metadata().ok().map(|m| m.ino()))
+                    .collect();
+                self.resumes.retain(|(ino, _)| queued.contains(ino));
+                for generation in found.generations {
+                    if let Some(uncommitted) = &mut self.uncommitted {
+                        let rewind_to = if generation.is_stored {
+                            uncommitted.offset
+                        } else {
+                            0
+                        };
+                        uncommitted.drain_offsets.push(rewind_to);
+                    }
+                    if let Ok(meta) = generation.file.metadata() {
+                        self.resumes.push((meta.ino(), generation.fingerprint));
+                    }
+                    self.pending_drains
+                        .push_back((generation.file, generation.offset));
                 }
-                if let Ok(meta) = copy.metadata() {
-                    self.resume = Some((meta.ino(), self.state.fingerprint));
+                if let Some(reason) = found.newer_missing {
+                    self.record_loss(reason);
                 }
-                self.pending_drains.push_back((copy, self.state.offset));
             }
-            Ok(None) => {}
             Err(reason) => self.record_loss(reason),
         }
         self.reset_to_current_file();
@@ -630,14 +655,36 @@ impl LogTailer {
     }
 }
 
-/// Opens `<log>.1` if it is the old content `state` described: `Ok(Some)` with bytes left to
-/// read past the offset, `Ok(None)` when it matches but ends at the offset (nothing was unread),
-/// `Err(reason)` when it cannot be trusted. The fingerprint is taken from the opened handle, so a
-/// rotation that renames `.1` away after the open cannot make the check and the read disagree.
-fn open_rotated_copy(log_path: &Path, state: &CursorState) -> Result<Option<File>, &'static str> {
+/// One rotated generation to read, oldest first.
+struct Generation {
+    file: File,
+    offset: u64,
+    /// First `min(256, size)` bytes' hash: what a cursor names this generation by.
+    fingerprint: [u8; 32],
+    /// The generation the stored state points into (as opposed to a newer one, read from 0).
+    is_stored: bool,
+}
+
+/// What [`find_generations`] found.
+struct Found {
+    /// Generations with bytes to read, oldest first. Empty when the stored one matched but ends at
+    /// the offset and nothing newer was rotated.
+    generations: Vec<Generation>,
+    /// Set when a generation newer than the stored one could not be opened: its lines are lost.
+    newer_missing: Option<&'static str>,
+}
+
+fn rotated_path(log_path: &Path, n: u32) -> PathBuf {
     let mut path = log_path.as_os_str().to_owned();
-    path.push(".1");
-    let path = PathBuf::from(path);
+    path.push(format!(".{n}"));
+    PathBuf::from(path)
+}
+
+/// Opens `<log>.<n>` (uncompressed only) with its size and fingerprint, both taken from the
+/// opened handle so a rotation that renames the file after the open cannot make the check and the
+/// read disagree.
+fn open_generation(log_path: &Path, n: u32) -> Result<(File, u64, [u8; 32]), &'static str> {
+    let path = rotated_path(log_path, n);
     let Ok(file) = File::open(&path) else {
         let mut gz = path.into_os_string();
         gz.push(".gz");
@@ -654,14 +701,70 @@ fn open_rotated_copy(log_path: &Path, state: &CursorState) -> Result<Option<File
     if (&file).take(256).read_to_end(&mut head).is_err() {
         return Err("the rotated copy cannot be read");
     }
-    let fingerprint: [u8; 32] = Sha256::digest(&head).into();
-    if fingerprint != state.fingerprint {
-        return Err("the rotated copy is not the content the read offset points into");
+    Ok((file, size, Sha256::digest(&head).into()))
+}
+
+/// Finds the generation of the log that `state` points into, in `<log>.1` or, when a second
+/// rotation has already pushed it back, `<log>.2`: its first `min(256, size)` bytes must hash to
+/// the stored fingerprint and it must reach the read offset. Every generation rotated after it
+/// (`.1` when it is `.2`) is unread by construction, since the reader works through generations
+/// in order, and is returned too. `Err(reason)` when the stored generation cannot be found; the
+/// reason is `.1`'s, the likelier home.
+fn find_generations(log_path: &Path, state: &CursorState) -> Result<Found, &'static str> {
+    let mut why = "there is no rotated copy";
+    for n in [1u32, 2] {
+        let (file, size, fingerprint) = match open_generation(log_path, n) {
+            Ok(opened) => opened,
+            Err(reason) => {
+                if n == 1 {
+                    why = reason;
+                }
+                continue;
+            }
+        };
+        if fingerprint != state.fingerprint {
+            if n == 1 {
+                why = "the rotated copy is not the content the read offset points into";
+            }
+            continue;
+        }
+        if size < state.offset {
+            if n == 1 {
+                why = "the rotated copy ends before the read offset";
+            }
+            continue;
+        }
+        let mut generations = Vec::new();
+        if size > state.offset {
+            generations.push(Generation {
+                file,
+                offset: state.offset,
+                fingerprint,
+                is_stored: true,
+            });
+        }
+        let mut newer_missing = None;
+        for m in (1..n).rev() {
+            match open_generation(log_path, m) {
+                Ok((file, size, fingerprint)) => {
+                    if size > 0 {
+                        generations.push(Generation {
+                            file,
+                            offset: 0,
+                            fingerprint,
+                            is_stored: false,
+                        });
+                    }
+                }
+                Err(reason) => newer_missing = Some(reason),
+            }
+        }
+        return Ok(Found {
+            generations,
+            newer_missing,
+        });
     }
-    if size < state.offset {
-        return Err("the rotated copy ends before the read offset");
-    }
-    Ok((size > state.offset).then_some(file))
+    Err(why)
 }
 
 /// Hard cap on a single log line intake will buffer. Sensors already bound their captured fields

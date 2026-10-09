@@ -372,6 +372,171 @@ fn the_rotation_guard_reads_the_cursor_the_tailer_saves() {
     assert!(!stderr(&done).contains("no usable"), "{}", stderr(&done));
 }
 
+/// A copytruncate lands while a batch is in flight and the append fails partway: the runner accepts
+/// the committed prefix and rewinds nothing. The next read continues `.1` AFTER that prefix, so
+/// the committed lines are not appended a second time.
+#[test]
+fn a_prefix_committed_across_a_copytruncate_is_not_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let mut tailer = behind_tailer(dir.path(), &log, 13, 3);
+    let batch = tailer.read_batch_bounded(100, u64::MAX);
+    assert_eq!(batch, lines("old", 3..13));
+    copytruncate(&log);
+    append(&log, &text(&lines("new", 0..4)));
+
+    assert!(
+        tailer.commit_batch_through(5),
+        "the copy is verifiable, so the prefix can be placed"
+    );
+    let mut expected = lines("old", 8..13);
+    expected.extend(lines("new", 0..4));
+    assert_eq!(drain(&mut tailer, 100, u64::MAX), expected);
+    assert_eq!(tailer.rotation_loss(), RotationLoss::default());
+}
+
+/// Same, with the prefix ending exactly at, and past, the old/new boundary.
+#[test]
+fn a_prefix_across_the_copy_and_new_file_boundary_is_placed_exactly() {
+    for reached in [7usize, 8, 9] {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let mut tailer = behind_tailer(dir.path(), &log, 10, 3);
+        copytruncate(&log);
+        append(&log, &text(&lines("new", 0..4)));
+        let batch = tailer.read_batch_bounded(100, u64::MAX);
+        assert_eq!(batch.len(), 11);
+        assert!(tailer.commit_batch_through(reached), "reached {reached}");
+        let mut all = lines("old", 3..10);
+        all.extend(lines("new", 0..4));
+        assert_eq!(
+            drain(&mut tailer, 100, u64::MAX),
+            all[reached..].to_vec(),
+            "reached {reached}"
+        );
+    }
+}
+
+/// Without a copy to read the prefix cannot be placed in the new file: still refused, and the
+/// whole batch is replayed (never skipped).
+#[test]
+fn a_prefix_is_still_refused_across_a_copytruncate_with_no_rotated_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let mut tailer = behind_tailer(dir.path(), &log, 13, 3);
+    assert_eq!(tailer.read_batch(10).len(), 10);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&log)
+        .unwrap();
+    append(&log, &text(&lines("new", 0..4)));
+    assert!(!tailer.commit_batch_through(5));
+}
+
+/// A restart mid-drain while the live file is still under 256 bytes and grows before the first
+/// poll: the stored (old) fingerprint never matches a file that small, which looks like growth
+/// of a small file. The rotated copy carrying that fingerprint proves it is a copytruncate.
+#[test]
+fn a_restart_mid_drain_with_a_tiny_growing_live_file_still_resumes_the_copy() {
+    let short = |p: &str, r: std::ops::Range<usize>| -> Vec<String> {
+        r.map(|i| format!("{p}-{i:03}-xxxx")).collect()
+    };
+    for grows in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let cursors = dir.path().join("cursors");
+        std::fs::write(&log, text(&short("o", 0..10))).unwrap(); // 150 bytes, under the window
+        let mut tailer = LogTailer::new(log.clone(), cursors.clone());
+        assert_eq!(tailer.read_batch(2).len(), 2);
+        tailer.commit_batch();
+        tailer.persist_cursor().unwrap();
+        copytruncate(&log);
+        append(&log, &text(&short("n", 0..4)));
+        assert_eq!(tailer.read_batch(1), short("o", 2..3));
+        tailer.commit_batch();
+        tailer.persist_cursor().unwrap();
+        drop(tailer);
+
+        let mut tailer = LogTailer::new(log.clone(), cursors);
+        let mut expected = short("o", 3..10);
+        expected.extend(short("n", 0..4));
+        if grows {
+            append(&log, &text(&short("n", 4..5)));
+            expected.extend(short("n", 4..5));
+        }
+        assert_eq!(drain(&mut tailer, 100, u64::MAX), expected, "grows {grows}");
+        assert_eq!(tailer.rotation_loss(), RotationLoss::default());
+    }
+}
+
+/// A second rotation lands while the first copy is still being drained, then the process
+/// restarts. The saved cursor names the FIRST generation (now `.2`) and the restart reads it
+/// there, then the second generation (`.1`), then the live file: nothing lost, nothing repeated.
+#[test]
+fn a_second_copytruncate_mid_drain_then_a_restart_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let cursors = dir.path().join("cursors");
+    std::fs::write(&log, text(&lines("A", 0..10))).unwrap();
+    let mut tailer = LogTailer::new(log.clone(), cursors.clone());
+    assert_eq!(tailer.read_batch(2), lines("A", 0..2));
+    tailer.commit_batch();
+    // The first generation's copy is `.1`; the tailer starts draining it.
+    copytruncate(&log);
+    append(&log, &text(&lines("B", 0..10)));
+    assert_eq!(tailer.read_batch(1), lines("A", 2..3));
+    tailer.commit_batch();
+    tailer.persist_cursor().unwrap();
+
+    // A second rotation, past the guard: A moves to `.2` uncompressed, B is copied to `.1`.
+    std::fs::rename(rotated_copy(&log), dir.path().join("events.jsonl.2")).unwrap();
+    copytruncate(&log);
+    append(&log, &text(&lines("C", 0..2)));
+    assert_eq!(tailer.read_batch(3), lines("A", 3..6));
+    tailer.commit_batch();
+    tailer.persist_cursor().unwrap();
+    drop(tailer);
+
+    let mut tailer = LogTailer::new(log.clone(), cursors);
+    let mut expected = lines("A", 6..10);
+    expected.extend(lines("B", 0..10));
+    expected.extend(lines("C", 0..2));
+    assert_eq!(drain(&mut tailer, 7, u64::MAX), expected);
+    assert_eq!(tailer.rotation_loss(), RotationLoss::default());
+}
+
+/// The same, but the first generation was compressed by the second rotation (the shipped
+/// `delaycompress` behaviour): it cannot be read, and the restart says so instead of silently
+/// starting at the live file.
+#[test]
+fn a_second_copytruncate_mid_drain_then_a_restart_reports_the_compressed_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let cursors = dir.path().join("cursors");
+    std::fs::write(&log, text(&lines("A", 0..10))).unwrap();
+    let mut tailer = LogTailer::new(log.clone(), cursors.clone());
+    assert_eq!(tailer.read_batch(2).len(), 2);
+    tailer.commit_batch();
+    copytruncate(&log);
+    append(&log, &text(&lines("B", 0..10)));
+    assert_eq!(tailer.read_batch(1), lines("A", 2..3));
+    tailer.commit_batch();
+    tailer.persist_cursor().unwrap();
+    std::fs::rename(rotated_copy(&log), dir.path().join("events.jsonl.2.gz")).unwrap();
+    copytruncate(&log);
+    append(&log, &text(&lines("C", 0..2)));
+    assert_eq!(tailer.read_batch(3).len(), 3);
+    tailer.commit_batch();
+    tailer.persist_cursor().unwrap();
+    drop(tailer);
+
+    let mut tailer = LogTailer::new(log.clone(), cursors);
+    let seen = drain(&mut tailer, 100, u64::MAX);
+    assert_eq!(seen, lines("C", 0..2));
+    assert_eq!(tailer.rotation_loss().events, 1, "the loss is reported");
+}
+
 /// A restart after a truncation with nothing to resume from: the old size was never observed, so
 /// the loss cannot be sized, but it is still reported rather than assumed zero.
 #[test]

@@ -9,11 +9,16 @@ use minijinja::context;
 use serde::Serialize;
 
 use crate::AppState;
+use chrono::{Duration, Utc};
+
 use crate::routes::campaigns::{
-    CampaignRef, artifact_iocs, campaigns_by_sample, campaigns_linking_sample,
+    Bar, CampaignRef, LIST_SPARK_DAYS, SPARK_HEIGHT, SPARK_STEP, artifact_iocs,
+    campaigns_by_sample, campaigns_linking_sample, day_counts, delivering_campaigns, hosts_tier,
+    sample_activity, sparkline,
 };
 use crate::routes::context::base_context;
 use crate::routes::error::AppError;
+use crate::routes::format::format_active;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -40,6 +45,20 @@ struct SampleRow {
     transport: Vec<TransportTag>,
     /// The sample's own campaign: every address that uploaded it or reported a URL serving it.
     campaign: Option<CampaignRef>,
+    /// The host count's score class, and when the sample's hosts were active, from the same
+    /// campaign; empty when no address is linked to the sample.
+    tier: &'static str,
+    active: String,
+    active_title: String,
+    spark: Vec<Bar>,
+    /// The behaviour (command-sequence campaign) whose sessions uploaded it, as `(id, hosts)`.
+    delivered_by: Option<DeliveredBy>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeliveredBy {
+    id: i64,
+    members: i32,
 }
 
 /// One distinct transport-authentication state among the fetches that returned a sample.
@@ -263,6 +282,18 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         "sample campaigns",
         campaigns_by_sample(&state.db, &shas).await,
     );
+    let activity = degraded.soft("sample activity", sample_activity(&state.db, &shas).await);
+    let delivering = degraded.soft(
+        "delivering campaigns",
+        delivering_campaigns(&state.db, &shas).await,
+    );
+    let today = Utc::now().date_naive();
+    let ids: Vec<i64> = campaigns.values().map(|c| c.id).collect();
+    let days = degraded.soft(
+        "activity sparklines",
+        day_counts(&state.db, &ids, today - Duration::days(LIST_SPARK_DAYS - 1)).await,
+    );
+    let now = Utc::now();
     let mut samples = Vec::new();
     {
         for (sensor, file) in files {
@@ -276,10 +307,29 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                 .get(&file.sha256)
                 .cloned()
                 .unwrap_or_default();
+            let campaign = campaigns.get(&file.sha256).cloned();
+            let (active, active_title) = activity
+                .get(&file.sha256)
+                .map(|(first, last)| format_active(*first, *last, now))
+                .unwrap_or_default();
+            let spark = campaign.as_ref().map_or_else(Vec::new, |c| {
+                sparkline(
+                    &days.get(&c.id).cloned().unwrap_or_default(),
+                    today,
+                    LIST_SPARK_DAYS,
+                )
+            });
             samples.push(SampleRow {
                 sha256_short: file.sha256[..12].to_string(),
                 size: format_bytes(file.size),
-                campaign: campaigns.get(&file.sha256).cloned(),
+                tier: campaign.as_ref().map_or("none", |c| hosts_tier(c.members)),
+                delivered_by: delivering
+                    .get(&file.sha256)
+                    .map(|&(id, members)| DeliveredBy { id, members }),
+                active,
+                active_title,
+                spark,
+                campaign,
                 sha256: file.sha256,
                 sensor: sensor.to_string(),
                 vt_detected: vt.map(|(d, _, _)| *d),
@@ -292,7 +342,13 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         }
     }
 
-    samples.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    // The most widely delivered files first, then by digest so the order is stable.
+    samples.sort_by(|a, b| {
+        let hosts = |s: &SampleRow| s.campaign.as_ref().map_or(0, |c| c.members);
+        hosts(b)
+            .cmp(&hosts(a))
+            .then_with(|| a.sha256.cmp(&b.sha256))
+    });
     let total = samples.len();
 
     let status_counts = degraded.soft("fetch status counts", fetch_status_counts(&state.db).await);
@@ -309,6 +365,9 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         total,
         status_counts,
         fetch_attempts_total,
+        spark_days => LIST_SPARK_DAYS,
+        spark_width => LIST_SPARK_DAYS * SPARK_STEP,
+        spark_height => SPARK_HEIGHT,
     })?))
 }
 

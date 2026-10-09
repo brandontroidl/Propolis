@@ -149,6 +149,21 @@ async fn each_sample_row_shows_how_its_fetches_were_authenticated(pool: PgPool) 
     )
     .await;
 
+    // One body in each VirusTotal state: kept local for its type (-2), uploaded awaiting a
+    // verdict (-1), and verdicted.
+    for (digest, detected, total) in [(&verified, -2, -2), (&mixed, -1, -1), (&captured, 3, 70)] {
+        sqlx::query(
+            "INSERT INTO sample_analysis (sha256, detected, total, vt_link, analyzed_at) \
+             VALUES ($1, $2, $3, '', now())",
+        )
+        .bind(hex::encode(digest))
+        .bind(detected)
+        .bind(total)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
     let state = state(pool);
     let (_, cookie) = state.sessions.create();
     let app =
@@ -180,6 +195,18 @@ async fn each_sample_row_shows_how_its_fetches_were_authenticated(pool: PgPool) 
         row.contains("TLS verified") && !row.contains("not fetched"),
         "{row}"
     );
+    assert!(
+        row.contains("not uploaded (type)")
+            && !row.contains("pending")
+            && !row.contains("detections"),
+        "a -2 sample is neither pending nor a zero-detection verdict: {row}"
+    );
+    let pending_row = row_for(&page, &mixed);
+    assert!(
+        pending_row.contains("pending") && !pending_row.contains("not uploaded"),
+        "{pending_row}"
+    );
+    assert!(row_for(&page, &captured).contains("3/70 detected"));
 
     let row = row_for(&page, &mixed);
     assert!(row.contains("TLS unverified"), "{row}");

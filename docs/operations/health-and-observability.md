@@ -90,7 +90,8 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
 - Counter: `propolis_vendor_submissions_total{vendor,status}`.
 - Malware pipeline (the work, not the process): `propolis_fetch_attempts{status}`,
   `propolis_fetch_pending_oldest_age_seconds`, `propolis_sample_analysis{state}`
-  (`pending` = uploaded to VirusTotal, no verdict yet; `scanned`),
+  (`pending` = uploaded to VirusTotal, no verdict yet; `scanned`; `not_uploaded` = kept
+  local because the content is not executable or script content),
   `propolis_sample_analysis_pending_oldest_age_seconds`, and, where the process can read
   the spools (the unified daemon, not the standalone console), `propolis_spool_samples{spool}`
   and `propolis_spool_oldest_sample_age_seconds{spool}`. An age gauge is `0` when nothing

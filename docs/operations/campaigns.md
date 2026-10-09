@@ -148,13 +148,25 @@ runs it against a database in the old state.
 
 - **Campaigns** (top navigation): every campaign with its rule, host count, distinct hosts per
   day over 14 days, first and last seen, top sensors and linked samples, filterable by rule, and
-  the indexer's lag behind the ledger when it has one.
+  the indexer's lag behind the ledger when it has one. It shows what the bots are doing:
+  command-sequence and scanner campaigns, largest first (sort links: hosts, last seen, first
+  seen), each with the opening commands (monospace, cut off with the full text on hover), the
+  command range as `4-16 commands`, the rule as a badge, the host count coloured like the review
+  queue's scores, an Active cell in the queue's format, and the first sample it delivers with
+  the count of the rest. Tabs: behaviour, multi-service scans, HTTP on shell port, login only.
+  Campaigns of one host are hidden until "show single-host groups" is used. The same-sample
+  rule is not listed: its hosts are on the Samples page, and its page (`/campaigns/N`), its
+  approval and the review queue's group links work as before.
 - **A campaign's page**: members with their review state, the representative session's normalized
   commands or the representative sample, linked samples, and indicators with their provenance.
 - **Review queue**: a pending row in a campaign says "part of campaign N, M hosts" and links to
   approving the campaign's pending members.
-- **IP page** and **Samples page**: the campaigns an address or a sample belongs to; each sample
-  has its own page with its indicators.
+- **IP page**: the campaigns an address belongs to. Its malware panel also names a sample the
+  fetcher captured from a URL the address reported after another one (the fetcher credits only
+  the first reporter).
+- **Samples page**: what files were captured, most widely delivered first: host count, hosts per
+  day and Active from the sample's own campaign, and "delivered by campaign N" when a command
+  sequence's sessions uploaded it. Each sample has its own page with its indicators.
 
 Approving a campaign is two steps. The confirmation page lists exactly the pending members it will
 approve and changes nothing; its form carries that list, and the approval applies to the listed

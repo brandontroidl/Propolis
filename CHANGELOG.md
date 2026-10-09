@@ -54,6 +54,50 @@
   their IPv4-mapped, NAT64 and 6to4 forms and any hostname that resolves to one. The attempt is
   recorded as `rejected` with the reason `Forbidden(PublicResolver)`, which the IP page already
   shows beside the status.
+- **A `copytruncate` rotation no longer discards what intake had not yet read** - found by the
+  intake soak: with intake behind when the log rotated, the tailer restarted at offset 0 of the
+  emptied file and every unread line of the old content, which by then existed only in
+  `events.jsonl.1`, was never read (71,150, 442,378 and 822,979 telnet lines in three soak runs,
+  with no error; a reader that was caught up lost only the 48 to 570 lines written between the
+  copy and the truncate). On a truncation, or an in-place replacement, the tailer now opens
+  `<log>.1`, checks that it is the old content (its first 256 bytes hash to the stored
+  fingerprint and it reaches the read offset), drains it from the offset through the same machinery
+  as a rename rotation, then continues the new file. The saved cursor stays inside the old content
+  until that drain ends, so a restart resumes it. The shipper and `propolis-watch` share the fix.
+  Only `.1` is read, which the shipped `delaycompress` policy leaves uncompressed until the next
+  rotation. When `.1` is missing, compressed or another generation's, it is not read and the loss
+  is logged as a WARN and counted; the new `intake-rotation-loss` ops-alert condition (the
+  fifteenth) pages on it and holds for an hour. `deploy/logrotate-guard.sh` also skips a log whose
+  `.1` the reader has not finished (the next rotation would compress it unread) or whose live file
+  has more than 64 MiB unread (`PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES`), reading the reader's
+  cursor read-only from the intake and shipper cursor directories (named by the resolved log
+  path on both sides, so a symlinked spelling finds the same cursor; a cursor still in `.2`
+  also skips); with no readable cursor it rotates and says why, at warning priority in the
+  journal, and `deploy/config-check.sh` flags a log with no cursor and a cursor directory the
+  rotation unit cannot see. Restart safety: a second rotation while the first copy drains no
+  longer loses either generation on a restart (each queued generation keeps a resume point;
+  `.1`, `.2` and, under the shipped compress + delaycompress policy, `.2.gz` are searched by
+  fingerprint, the gzip expanded into an unlinked scratch file in the cursor directory, capped
+  at 512 MiB and only when that plus the guard's 512 MiB reserve is free, otherwise a reported
+  loss "insufficient disk to expand"; a generation that cannot be found is a reported loss and
+  NO rotated copy is read in its place, so the documented manual `truncate` while the reader is
+  stopped does not re-ingest the previous generation);
+  a restart mid-drain with a live file under 256 bytes is no longer read as small-file growth;
+  and a copytruncate during a failed batch no longer re-appends the committed prefix. The
+  rotation guard also skips a cursor still inside `.2.gz`. Cursor files are now named by the
+  resolved log path; a cursor named by the path as configured is moved to the resolved name on
+  first load and the old file removed (a one-time migration, to be deleted once every
+  deployment has restarted on this version), so an upgrade does not re-read such a log from 0.
+  The cursor gains one optional field, written only when set and ignored by older readers:
+  `fingerprint_len` (so a cursor taken while the log was under 256 bytes still matches the grown,
+  rotated copy, in the tailer and the guard; the window is widened as the file grows, so a stamp
+  taken on the start of a first line does not stay that short). When both a
+  resolved-name and an as-configured cursor file exist the newer one wins. `log-tailer` gains
+  `flate2` and `libc` dependencies (both already in the lockfile, vendored). A skipped log makes `propolis-logrotate.service` show failed until a later
+  run rotates it. `logrotate --force` no longer discards a backlog: archive and truncate by hand
+  ([intake backlog](docs/troubleshooting/intake-backlog.md#recovering-a-backlog-too-large-to-drain)).
+  The "small window" wording in `deploy/logrotate-sensors.conf` and the docs now says what the
+  window is: the copy-to-truncate gap, not a reader that is behind.
 - **Command-sequence campaigns are one per tool, not one per session length** - observed on the
   live console 2026-10-08: 947 campaigns, most of them fragments of a few bots. The fingerprint
   keyed on the whole normalized session, so one Mirai-family loader was about 40 campaigns

@@ -180,6 +180,12 @@ impl IntakeRunner {
         self.tailer.backlog_bytes()
     }
 
+    /// Input a `copytruncate` rotation took from this log that the rotated copy could not supply;
+    /// see [`LogTailer::rotation_loss`].
+    pub fn rotation_loss(&self) -> log_tailer::RotationLoss {
+        self.tailer.rotation_loss()
+    }
+
     /// `observed_at` of the last event this runner appended, in log order; `None` until it has
     /// appended one. While the log is behind, the next unread line was written after this one, so
     /// `now` minus this bounds how long that line has waited.

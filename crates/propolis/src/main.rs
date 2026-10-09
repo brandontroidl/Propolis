@@ -212,6 +212,7 @@ async fn run_intake_sensor(
             entry.bytes_behind = Some(bytes_behind);
             entry.last_ingested_observed_at = runner.last_ingested_observed_at();
             entry.wedge = runner.wedged();
+            entry.record_rotation_loss(runner.rotation_loss(), Instant::now());
             // The set only grows, so an unchanged length is an unchanged set.
             if entry.reported_sensors.len() != runner.reported_sensors().len() {
                 entry.reported_sensors = runner.reported_sensors().iter().cloned().collect();

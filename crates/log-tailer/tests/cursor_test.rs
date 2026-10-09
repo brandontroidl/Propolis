@@ -1,4 +1,5 @@
 use log_tailer::*;
+use std::path::PathBuf;
 
 #[test]
 fn save_and_load_round_trip() {
@@ -10,6 +11,7 @@ fn save_and_load_round_trip() {
         inode: 12345,
         offset: 6,
         fingerprint: [0u8; 32],
+        fingerprint_len: None,
     };
     cursor.save(&state).unwrap();
     let loaded = cursor.load().unwrap().unwrap();
@@ -47,6 +49,7 @@ fn detect_truncation_when_offset_exceeds_size() {
         inode: get_inode(&log_path),
         offset: 1000, // way past file size
         fingerprint: compute_fingerprint(&log_path),
+        fingerprint_len: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::Truncated));
@@ -62,6 +65,7 @@ fn detect_no_rotation_when_offset_within_size() {
         inode: get_inode(&log_path),
         offset: 5,
         fingerprint: compute_fingerprint(&log_path),
+        fingerprint_len: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::None));
@@ -78,6 +82,7 @@ fn detect_inode_changed_when_inode_differs() {
         inode: !get_inode(&log_path),
         offset: 5,
         fingerprint: compute_fingerprint(&log_path),
+        fingerprint_len: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::InodeChanged));
@@ -95,6 +100,7 @@ fn detect_replaced_when_same_inode_but_fingerprint_differs() {
         inode: get_inode(&log_path),
         offset: 5, // still within the file's size
         fingerprint: wrong_fingerprint,
+        fingerprint_len: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::Replaced));
@@ -108,6 +114,162 @@ fn cursor_file_path_is_deterministic_per_log_path() {
     let a = DurableCursor::new(log_path.clone(), cursor_dir.clone());
     let b = DurableCursor::new(log_path, cursor_dir);
     assert_eq!(a.cursor_file_path(), b.cursor_file_path());
+}
+
+/// Every spelling of one log shares one cursor file, whether the log exists yet or not: the rotation
+/// guard resolves the path with `readlink -f` and must land on the file the daemon wrote.
+#[test]
+fn cursor_file_path_is_the_same_for_every_spelling_of_a_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+    let cursor_dir = dir.path().join("cursors");
+    let at = |p: PathBuf| DurableCursor::new(p, cursor_dir.clone()).cursor_file_path();
+
+    for exists in [false, true] {
+        if exists {
+            std::fs::write(real.join("events.jsonl"), "x").unwrap();
+        }
+        let canonical = at(real.join("events.jsonl"));
+        assert_eq!(at(dir.path().join("link/events.jsonl")), canonical);
+        assert_eq!(
+            at(PathBuf::from(format!(
+                "{}//real/./events.jsonl",
+                dir.path().display()
+            ))),
+            canonical
+        );
+        assert_eq!(at(dir.path().join("real/../link/events.jsonl")), canonical);
+    }
+    // Nothing resolvable: the path as given, still deterministic.
+    let ghost = PathBuf::from("/nonexistent-ctdrain/x/events.jsonl");
+    assert_eq!(at(ghost.clone()), at(ghost));
+}
+
+/// A cursor written under the name derived from the path as configured (before names were derived
+/// from the resolved path) is picked up once, moved to the resolved name, and the old file removed.
+#[test]
+fn a_cursor_named_by_the_configured_path_is_migrated_not_lost() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+    std::fs::write(real.join("events.jsonl"), "a\nb\nc\nd\n").unwrap();
+    let configured = dir.path().join("link/events.jsonl");
+    let cursor_dir = dir.path().join("cursors");
+    std::fs::create_dir_all(&cursor_dir).unwrap();
+
+    let legacy_hash: String = Sha256::digest(configured.as_os_str().as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let legacy = cursor_dir.join(format!("{legacy_hash}.json"));
+    let inode = get_inode(&configured);
+    let fingerprint = compute_fingerprint(&configured);
+    let state = CursorState {
+        inode,
+        offset: 4,
+        fingerprint,
+        fingerprint_len: None,
+    };
+    std::fs::write(&legacy, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    let mut tailer = LogTailer::new(configured.clone(), cursor_dir.clone());
+    assert_eq!(
+        tailer.read_batch(10),
+        vec!["c", "d"],
+        "resumed, not re-read"
+    );
+    let cursor = DurableCursor::new(configured, cursor_dir);
+    assert!(
+        cursor.cursor_file_path().exists(),
+        "saved under the resolved name"
+    );
+    assert!(!legacy.exists(), "the configured-name file is gone");
+    assert_eq!(cursor.load().unwrap(), Some(state));
+}
+
+/// Both names present (a rollback to the old version after an upgrade wrote a newer
+/// as-configured file): the one written later wins, and the other is removed.
+#[test]
+fn when_both_cursor_names_exist_the_newer_one_wins() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    for legacy_is_newer in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        std::fs::write(real.join("events.jsonl"), "a\nb\nc\nd\n").unwrap();
+        let configured = dir.path().join("link/events.jsonl");
+        let cursor_dir = dir.path().join("cursors");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        let cursor = DurableCursor::new(configured.clone(), cursor_dir.clone());
+        let hash: String = Sha256::digest(configured.as_os_str().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let legacy = cursor_dir.join(format!("{hash}.json"));
+        let canonical = cursor.cursor_file_path();
+        let at = |offset| CursorState {
+            inode: get_inode(&configured),
+            offset,
+            fingerprint: compute_fingerprint(&configured),
+            fingerprint_len: None,
+        };
+        std::fs::write(&legacy, serde_json::to_vec(&at(2)).unwrap()).unwrap();
+        std::fs::write(&canonical, serde_json::to_vec(&at(4)).unwrap()).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let newer = if legacy_is_newer { &legacy } else { &canonical };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(newer)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        let loaded = cursor.load().unwrap().unwrap();
+        assert_eq!(loaded.offset, if legacy_is_newer { 2 } else { 4 });
+        assert!(!legacy.exists(), "one canonical file remains");
+        assert_eq!(cursor.load().unwrap().unwrap().offset, loaded.offset);
+    }
+}
+
+/// The window field round-trips, and a cursor written without it still loads (an older version's
+/// file), with the old meaning: the first 256 bytes. A field this version does not know (a
+/// cursor from a build that has since dropped it) is ignored, not an error.
+#[test]
+fn the_window_field_is_additive() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "x\n").unwrap();
+    let cursor = DurableCursor::new(log_path, dir.path().join("cursors"));
+    let full = CursorState {
+        inode: 7,
+        offset: 2,
+        fingerprint: [3u8; 32],
+        fingerprint_len: Some(51),
+    };
+    cursor.save(&full).unwrap();
+    assert_eq!(cursor.load().unwrap(), Some(full));
+
+    let unknown = r#"{"inode":7,"offset":2,"fingerprint":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],"fingerprint_len":51,"drained":{"inode":9}}"#;
+    std::fs::write(cursor.cursor_file_path(), unknown).unwrap();
+    assert_eq!(cursor.load().unwrap(), Some(full));
+
+    let old = r#"{"inode":7,"offset":2,"fingerprint":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]}"#;
+    std::fs::write(cursor.cursor_file_path(), old).unwrap();
+    let loaded = cursor.load().unwrap().unwrap();
+    assert_eq!(loaded.fingerprint_len, None);
+    cursor.save(&loaded).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(cursor.cursor_file_path()).unwrap(),
+        old,
+        "unset fields are not written, so an older reader still parses the file"
+    );
 }
 
 #[test]
@@ -175,12 +337,14 @@ fn atomic_save_does_not_corrupt_on_partial_write() {
         inode: 1,
         offset: 10,
         fingerprint: [1u8; 32],
+        fingerprint_len: None,
     };
     cursor.save(&state1).unwrap();
     let state2 = CursorState {
         inode: 2,
         offset: 20,
         fingerprint: [2u8; 32],
+        fingerprint_len: None,
     };
     cursor.save(&state2).unwrap();
     let loaded = cursor.load().unwrap().unwrap();

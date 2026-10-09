@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Retention
@@ -150,15 +150,59 @@ logrotate exits non-zero so the unit shows failed in `systemctl --failed`.
 A `prerotate` hook was chosen over an `ExecStartPre` check on the service because logrotate
 documents that a failing `prerotate` script skips only the log it ran for, while an
 `ExecStartPre` check can only allow or block the whole run, which would let one oversized log
-keep every healthy sensor from rotating. The guard stays out of the way of an ordinary log: the
-check is a `stat` and a `statfs`.
+keep every healthy sensor from rotating. The free-space check is a `stat` and a `statfs`.
+
+### Rotation while intake is behind
+
+`copytruncate` moves whatever the reader has not read into `events.jsonl.1`, and the tailer reads
+it from there before the new file
+([concurrency and failure](../architecture/concurrency-and-failure.md#log-rotation-under-a-reader-that-is-behind)).
+The next rotation renames `.1` to `.2` and compresses it, so the copy is only readable in place
+while it is `.1`; the tailer also finds it in `.2` or `.2.gz` when it restarts after a second
+rotation that skipped the guard (a gzip is expanded to a scratch file, capped at 512 MiB). After the free-space check, the guard therefore
+reads the reader's saved cursor (read-only; `<cursor dir>/<sha256 of the resolved log path>.json`
+(symlinks, `//` and `..` resolved, as the daemon names it), in
+`PROPOLIS_CURSOR_DIR`, default `/var/lib/propolis/cursors`, and `PROPOLIS_SHIPPER_CURSOR_DIR`,
+default `/var/lib/propolis/shipper/cursors`, so an intake node and a collector node are both
+covered) and skips the log when either holds:
+
+- `.1` has not been fully read: the cursor still carries `.1`'s fingerprint and sits short of its
+  size. The tailer keeps its saved cursor in the old content until the drain of `.1` ends, so this
+  is also true for the moment between a rotation and the reader noticing it. A cursor that still
+  carries `.2`'s (or `.2.gz`'s, by its first 256 decompressed bytes) fingerprint means `.1` was
+  rotated after it and has not been read at all.
+- the live file holds more than 64 MiB the reader has not read
+  (`PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES` overrides the bound). The bound is a judgement, not a
+  measurement: two thirds of the shipped `size 100M`, so a log is skipped only when its reader has
+  fallen most of a rotation behind, and far under the 300 MiB at which `sensor-log-oversized` pages.
+
+A skipped log is left untouched, the journal line names the reason and the cursor file, and
+logrotate exits non-zero so `propolis-logrotate.service` shows failed until the next run rotates
+it (logrotate cannot skip one log and report success). Skipping lets the log grow past its
+`size`; `sensor-log-oversized` is the backstop that pages if intake does not catch up. The run
+still rewrites the state file, so a skip does not trip `rotation-stale`.
+
+If no cursor can be read for a log (none under either directory, an unreadable or malformed one, or
+one for a different inode of the log, as when a cursor directory was moved off the default and the
+unit does not see the override) the log is **rotated**, as it was before this check existed, and
+the journal says why, at warning priority. `deploy/config-check.sh` flags a log with content and no
+cursor, and a cursor directory set in `propolis.env` that the unit cannot see. That is deliberately the opposite of the free-space check: refusing on a
+missing cursor would turn a misplaced cursor directory, or an intake that never started, into a
+rotation that never runs and a log that fills the disk, which is the October 2026 incident. If you
+move the cursor directory, give `propolis-logrotate.service` the same `PROPOLIS_CURSOR_DIR` in a
+drop-in (`/etc/systemd/system/propolis-logrotate.service.d/cursor-dir.conf`, `[Service]` with
+`Environment=PROPOLIS_CURSOR_DIR=...`); the unit deliberately does not read `propolis.env`, which
+holds the database URL. The tailer's own check (a verified `.1`) is the second line of defence, and
+`intake-rotation-loss` reports what slips through.
 
 ### Alerts
 
 With the ops monitor enabled, `sensor-log-oversized` pages when a configured sensor log is more
 than three times the rotation size (300 MiB with the shipped `size 100M`, read from
 `/etc/logrotate.d/propolis-sensors`) or the filesystem under `/var/log/propolis` is over 85% used,
-and `rotation-stale` pages when the state file has not been rewritten for three hours. See
+`rotation-stale` pages when the state file has not been rewritten for three hours, and
+`intake-rotation-loss` pages when a rotation took lines the intake had not read and `.1` could not
+supply them. See
 [health and observability](health-and-observability.md#ops-alert-monitor-opt-in).
 
 ### A log too large to rotate
@@ -184,5 +228,10 @@ the end of the `gzip` read and the `truncate` are lost, as with `copytruncate` i
 intake has not yet read are archived but never reach the ledger (see [intake
 backlog](../troubleshooting/intake-backlog.md#recovering-a-backlog-too-large-to-drain)); if
 intake is keeping up, wait for the fleet pane's `behind:` badge to clear before truncating. The
-intake cursor notices the truncation and resumes at the start of the file. The last command
-confirms the next scheduled run is healthy; delete the archive once you no longer need it.
+intake cursor notices the truncation and resumes at the start of the file; when it was behind,
+the tailer reports the discarded lines as a rotation loss (a journal WARN and an
+`intake-rotation-loss` page for an hour), which here is the expected record of a decision you
+made. The same holds if you truncate while intake is stopped: on its next start the generation its
+saved position was in cannot be found, which is reported as a loss, and nothing older is read in
+its place (a rotated `events.jsonl.1` left from an earlier rotation is not re-ingested). The last
+command confirms the next scheduled run is healthy; delete the archive once you no longer need it.

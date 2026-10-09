@@ -1320,6 +1320,62 @@ check_rotation() {
     global logrotate "$worst" "$text (rotation size: $ROTATE_SIZE_NOTE)"
 }
 
+# The rotation guard (deploy/logrotate-guard.sh) skips a log whose reader has not caught up by
+# reading the reader's saved cursor, and rotates anyway when it cannot find one. Each log in the
+# intake list therefore needs a cursor file the guard can see: one under the cursor directory, and
+# that directory visible to propolis-logrotate.service.
+check_cursors() {
+    [ "$INTAKE_STATE" = present ] || return 0
+    local default_dir var override cdir configured hash lp i checked=0 missing=() worst=ok text
+    if [ "$INTAKE_VAR" = PROPOLIS_SHIPPER_SENSOR_LOGS ]; then
+        var=PROPOLIS_SHIPPER_CURSOR_DIR
+        default_dir=/var/lib/propolis/shipper/cursors
+    else
+        var=PROPOLIS_CURSOR_DIR
+        default_dir=/var/lib/propolis/cursors
+    fi
+    configured="$(read_env_var_in "$var" "$INTAKE_FILE")"
+    cdir="${PROPOLIS_CC_CURSOR_DIR:-${configured:-$default_dir}}"
+
+    if [ -n "$configured" ] && [ "$configured" != "$default_dir" ]; then
+        override="${PROPOLIS_CC_ROTATE_DROPIN_DIR:-/etc/systemd/system/propolis-logrotate.service.d}"
+        if ! grep -qsF -- "$configured" "$override"/*.conf 2>/dev/null; then
+            worst=warn
+            finding warn "logrotate" "cursor-dir-unseen" \
+                "$var is $configured in $INTAKE_FILE, but propolis-logrotate.service does not read that file, so the rotation guard looks in $default_dir and, finding no cursor, rotates without checking whether intake has read the log" \
+                "create $override/cursor-dir.conf containing [Service] and Environment=$var=$configured, then run: sudo systemctl daemon-reload" manual
+        fi
+    fi
+
+    if [ -d "$cdir" ]; then
+        for ((i = 0; i < ${#IN_PATH[@]}; i++)); do
+            lp="${IN_PATH[$i]}"
+            case "$lp" in /*) ;; *) continue ;; esac
+            # A log that does not exist, or is empty, has had nothing read from it yet.
+            [ -s "$lp" ] || continue
+            checked=$((checked + 1))
+            hash="$(printf '%s' "$(readlink -f -- "$lp" 2>/dev/null || printf '%s' "$lp")" | sha256sum | cut -d' ' -f1)"
+            if [ ! -e "$cdir/$hash.json" ]; then
+                missing+=("${IN_LABEL[$i]}")
+                worst=warn
+                finding warn "logrotate" "cursor-missing:$lp" \
+                    "no cursor file for $lp in $cdir: the rotation guard cannot see how far intake has read it and rotates it without the unread-input check (intake saves a cursor after its first batch, so this means intake has not read the log, or keeps its cursors elsewhere)" \
+                    "check that intake is running and reading this log: journalctl -u propolis.service -n 30 --no-pager" manual
+            fi
+        done
+    fi
+
+    if [ "$checked" -eq 0 ] && [ "$worst" = ok ]; then
+        global cursors skip "no intake log has content or $cdir does not exist yet"
+        return 0
+    fi
+    text="$checked logs checked in $cdir"
+    if [ "${#missing[@]}" -gt 0 ]; then
+        text="$text; no cursor for: ${missing[*]}"
+    fi
+    global cursors "$worst" "$text"
+}
+
 INSTALL_BINS=()
 load_install_bins() {
     local line list
@@ -1649,6 +1705,7 @@ check_env_files
 check_rotation
 check_binaries
 check_intake_list
+check_cursors
 check_unconfigured_units
 check_watcher
 

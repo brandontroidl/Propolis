@@ -233,6 +233,8 @@ mod tests {
             last_ingested_observed_at: last,
             reported_sensors: vec!["telnet".into()],
             wedge: None,
+            rotation_loss: log_tailer::RotationLoss::default(),
+            rotation_loss_at: None,
         }
     }
 

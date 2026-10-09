@@ -316,8 +316,25 @@ impl Fx {
     fn link_tools(&self) {
         std::fs::create_dir_all(self.p("tools")).unwrap();
         for t in [
-            "grep", "sed", "stat", "cat", "cmp", "head", "tail", "mktemp", "date", "id", "dirname",
-            "git", "timeout", "rm", "env", "sort", "cut",
+            "grep",
+            "sed",
+            "stat",
+            "cat",
+            "cmp",
+            "head",
+            "tail",
+            "mktemp",
+            "date",
+            "id",
+            "dirname",
+            "git",
+            "timeout",
+            "rm",
+            "env",
+            "sort",
+            "cut",
+            "sha256sum",
+            "readlink",
         ] {
             let real = ["/usr/bin", "/bin"]
                 .iter()
@@ -400,6 +417,11 @@ cat "$d/psql_out"
             .env(
                 "PROPOLIS_CC_LOGROTATE_GUARD",
                 self.p("sbin/propolis-logrotate-guard"),
+            )
+            .env("PROPOLIS_CC_CURSOR_DIR", self.p("state/cursors"))
+            .env(
+                "PROPOLIS_CC_ROTATE_DROPIN_DIR",
+                self.p("etc-logrotate/dropin"),
             )
             .env("PROPOLIS_CC_WATCH_HOME", self.p("home-watch"));
         for (k, v) in env {
@@ -2367,6 +2389,16 @@ fn fix_scenarios() -> Vec<Scenario> {
             fx.unit("sensor-redis.service", "enabled", "active");
             fx.write("etc/redis.env", "PROPOLIS_REDIS_BNID=0.0.0.0:6379\n");
         }),
+        ("cursor missing for a log with content", |fx| {
+            fx.write("state/cursors/unrelated.json", "{}");
+        }),
+        ("cursor directory the rotation unit cannot see", |fx| {
+            fx.set_env_line(
+                "etc/propolis.env",
+                "PROPOLIS_CURSOR_DIR=",
+                Some("PROPOLIS_CURSOR_DIR=/srv/propolis-cursors"),
+            );
+        }),
         ("no env files", |fx| {
             std::fs::remove_dir_all(fx.p("etc")).unwrap();
             std::fs::create_dir_all(fx.p("etc")).unwrap();
@@ -2726,5 +2758,89 @@ fn upgrade_runs_the_check_last_in_report_only_mode_and_its_failure_cannot_fail_t
             .filter(|l| l.contains("config-check.sh"))
             .count(),
         1
+    );
+}
+
+fn global_state(v: &serde_json::Value, id: &str) -> String {
+    v["global"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == id)
+        .map(|g| g["state"].as_str().unwrap().to_string())
+        .unwrap_or_else(|| "absent".into())
+}
+
+/// Each intake log with content needs a cursor the rotation guard can find, named by the SHA-256 of
+/// the log's resolved path (the same rule the daemon and the guard use).
+#[test]
+fn each_intake_log_with_content_needs_a_cursor_file_and_a_visible_cursor_directory() {
+    use sha2::{Digest, Sha256};
+    let fx = Fx::new();
+    let before = fx.json();
+    assert_eq!(
+        global_state(&before, "cursors"),
+        "skip",
+        "no cursor dir yet"
+    );
+
+    // The directory exists but holds no cursor for the logs: every one is named.
+    fx.write("state/cursors/unrelated.json", "{}");
+    let v = fx.json();
+    assert_eq!(global_state(&v, "cursors"), "warn");
+    let msgs = v["findings"].to_string();
+    for log in ["ssh", "mqtt", "dns", "tftp"] {
+        assert!(
+            msgs.contains(&format!(
+                "no cursor file for {}",
+                fx.p(&format!("logs/{log}/events.jsonl")).display()
+            )),
+            "{log}: {msgs}"
+        );
+    }
+
+    // Cursors in place for all five: green.
+    for rel in [
+        "logs/ssh/events.jsonl",
+        "logs/mqtt/events.jsonl",
+        "logs/dns/events.jsonl",
+        "logs/tftp/events.jsonl",
+        "logs/cred/postgresql.jsonl",
+    ] {
+        let resolved = std::fs::canonicalize(fx.p(rel)).unwrap();
+        let hash: String = Sha256::digest(resolved.to_str().unwrap().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        fx.write(&format!("state/cursors/{hash}.json"), "{}");
+    }
+    let green = fx.json();
+    assert_eq!(
+        global_state(&green, "cursors"),
+        "ok",
+        "{}",
+        green["findings"]
+    );
+
+    // A cursor directory moved off the default is invisible to the rotation unit until a drop-in
+    // names it.
+    fx.set_env_line(
+        "etc/propolis.env",
+        "PROPOLIS_CURSOR_DIR=",
+        Some("PROPOLIS_CURSOR_DIR=/srv/propolis-cursors"),
+    );
+    assert!(
+        fx.json()["findings"]
+            .to_string()
+            .contains("does not read that file")
+    );
+    fx.write(
+        "etc-logrotate/dropin/cursor-dir.conf",
+        "[Service]\nEnvironment=PROPOLIS_CURSOR_DIR=/srv/propolis-cursors\n",
+    );
+    assert!(
+        !fx.json()["findings"]
+            .to_string()
+            .contains("does not read that file")
     );
 }

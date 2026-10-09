@@ -26,6 +26,11 @@ pub struct CursorState {
     /// SHA-256 of the first `min(256, file_size)` bytes at offset 0, computed via
     /// [`compute_fingerprint`].
     pub fingerprint: [u8; 32],
+    /// How many bytes `fingerprint` covers: `min(256, file_size)` when it was taken, so a file
+    /// that has since grown (or been rotated into `<log>.1`) is compared over the same window.
+    /// Absent in a cursor written by an older version, which means "the first 256 bytes".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_len: Option<u16>,
 }
 
 /// What, if anything, changed about the log file since `CursorState` was recorded.
@@ -51,25 +56,48 @@ pub enum RotationEvent {
 /// log path always resolves to the same one across restarts.
 pub struct DurableCursor {
     log_path: PathBuf,
+    /// The path the cursor file name is derived from: `log_path` with symlinks, `.`, `..` and
+    /// repeated slashes resolved, so every spelling of one log shares one cursor (and the rotation
+    /// guard, which resolves the same way with `readlink -f`, finds it). See `canonical_key`.
+    key_path: PathBuf,
     cursor_dir: PathBuf,
+}
+
+/// `log_path` resolved as far as the filesystem allows, fixed once at construction: the whole
+/// path if it exists; otherwise its parent directory resolved with the file name appended (a log
+/// that has not been created yet); otherwise the path exactly as given. The fallbacks mean a
+/// cursor is never refused for want of a file, and agree with `readlink -f`, which the rotation
+/// guard uses.
+fn canonical_key(log_path: &Path) -> PathBuf {
+    if let Ok(path) = std::fs::canonicalize(log_path) {
+        return path;
+    }
+    let resolved_parent = log_path
+        .file_name()
+        .zip(log_path.parent().filter(|p| !p.as_os_str().is_empty()))
+        .and_then(|(name, parent)| Some(std::fs::canonicalize(parent).ok()?.join(name)));
+    resolved_parent.unwrap_or_else(|| log_path.to_path_buf())
 }
 
 impl DurableCursor {
     pub fn new(log_path: PathBuf, cursor_dir: PathBuf) -> Self {
+        let key_path = canonical_key(&log_path);
         Self {
             log_path,
+            key_path,
             cursor_dir,
         }
     }
 
     /// The on-disk path of this instance's persisted cursor file: the cursor directory joined
-    /// with a SHA-256 hex digest of the log path's raw bytes. Hashing rather than reusing the
-    /// log file's own name avoids collisions between sensors whose logs share a basename in
-    /// different directories, and needs no filesystem access, so it works even before the log
-    /// file or the cursor directory exist.
+    /// with a SHA-256 hex digest of the log path, resolved as `canonical_key` describes (the
+    /// bytes of the path as given when nothing of it can be resolved). Hashing rather than
+    /// reusing the log file's own name avoids collisions between sensors whose logs share a
+    /// basename in different directories. Resolution happens once, at construction, so a cursor
+    /// file is stable for the life of the instance.
     pub fn cursor_file_path(&self) -> PathBuf {
         let mut hasher = Sha256::new();
-        hasher.update(self.log_path.as_os_str().as_bytes());
+        hasher.update(self.key_path.as_os_str().as_bytes());
         let digest: [u8; 32] = hasher.finalize().into();
         self.cursor_dir
             .join(format!("{}.json", hex_encode(&digest)))
@@ -80,13 +108,72 @@ impl DurableCursor {
     /// callers always fail closed to offset 0 rather than branching on which happened. An
     /// `Err` is reserved for a read failure that is neither (e.g. permission denied), which is
     /// worth surfacing rather than silently folding into "missing".
+    ///
+    /// One-time migration: cursors written before the file name was derived from the resolved
+    /// path were named by the path exactly as configured. When the resolved name has no cursor and
+    /// the as-configured name does (a symlinked or non-normalized spelling, or a log whose parent
+    /// directory did not exist when the name was first derived), that cursor is loaded, saved under
+    /// the resolved name and the old file removed, so one canonical path remains. Remove this
+    /// fallback (and `legacy_file_path`) once every deployment has restarted on this version.
+    ///
+    /// When both names exist (a rollback to the old version after an upgrade left a newer
+    /// as-configured file beside the resolved one), the one written later wins and the other is
+    /// removed.
     pub fn load(&self) -> io::Result<Option<CursorState>> {
-        let bytes = match std::fs::read(self.cursor_file_path()) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
+        let canonical = self.cursor_file_path();
+        let legacy = self.legacy_file_path();
+        let read = |path: &Path| -> io::Result<Option<Vec<u8>>> {
+            match std::fs::read(path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
         };
-        Ok(serde_json::from_slice(&bytes).ok())
+        let current = read(&canonical)?;
+        if legacy == canonical {
+            return Ok(current.and_then(|b| serde_json::from_slice(&b).ok()));
+        }
+        let old = read(&legacy)?;
+        let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        match (current, old) {
+            (Some(current), None) => Ok(serde_json::from_slice(&current).ok()),
+            (None, None) => Ok(None),
+            (None, Some(old)) => self.adopt_legacy(&legacy, &old),
+            (Some(current), Some(old)) => {
+                if modified(&legacy) > modified(&canonical) {
+                    self.adopt_legacy(&legacy, &old)
+                } else {
+                    let _ = std::fs::remove_file(&legacy);
+                    Ok(serde_json::from_slice(&current).ok())
+                }
+            }
+        }
+    }
+
+    /// The cursor file name derived from the log path as configured, before resolution.
+    fn legacy_file_path(&self) -> PathBuf {
+        let mut hasher = Sha256::new();
+        hasher.update(self.log_path.as_os_str().as_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        self.cursor_dir
+            .join(format!("{}.json", hex_encode(&digest)))
+    }
+
+    fn adopt_legacy(&self, legacy: &Path, bytes: &[u8]) -> io::Result<Option<CursorState>> {
+        let Some(state) = serde_json::from_slice::<CursorState>(bytes).ok() else {
+            return Ok(None);
+        };
+        // Only drop the old file once the new one is durably in place.
+        if self.save(&state).is_ok() {
+            let _ = std::fs::remove_file(legacy);
+        }
+        Ok(Some(state))
+    }
+
+    /// The directory cursor files live in; the tailer also expands a compressed rotated copy
+    /// there (as an unlinked file), the one place it is known to be able to write.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.cursor_dir
     }
 
     /// Persists `state` atomically: write JSON to a temp file in the same directory, fsync it,
@@ -134,10 +221,43 @@ pub(crate) fn detect_rotation(log_path: &Path, state: &CursorState) -> RotationE
     if state.offset > metadata.len() {
         return RotationEvent::Truncated;
     }
-    if compute_fingerprint(log_path) != state.fingerprint {
-        return RotationEvent::Replaced;
+    match read_head(log_path) {
+        // A file that was empty when stamped is unchanged while it is still empty.
+        Some(head) if head_matches(state, &head) => RotationEvent::None,
+        Some(head) if state.fingerprint_len == Some(0) && head.is_empty() => RotationEvent::None,
+        _ => RotationEvent::Replaced,
     }
-    RotationEvent::None
+}
+
+/// The first up to 256 bytes of `path`, or `None` if it can't be read.
+pub(crate) fn read_head(path: &Path) -> Option<Vec<u8>> {
+    let file = File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(256);
+    file.take(256).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Whether `head` (the first up to 256 bytes of a file) carries the fingerprint in `state`, over
+/// the window the fingerprint was taken on. An empty window (a fingerprint of nothing) identifies
+/// no file and matches none.
+pub(crate) fn head_matches(state: &CursorState, head: &[u8]) -> bool {
+    match state.fingerprint_len {
+        None => Sha256::digest(head).as_slice() == state.fingerprint,
+        Some(0) => false,
+        Some(n) => {
+            let n = usize::from(n);
+            head.len() >= n && Sha256::digest(&head[..n]).as_slice() == state.fingerprint
+        }
+    }
+}
+
+/// [`compute_fingerprint`] together with the number of bytes it covered, which is what
+/// [`CursorState::fingerprint_len`] records. An unreadable file is the zero digest over 0 bytes.
+pub(crate) fn fingerprint_with_len(path: &Path) -> ([u8; 32], u16) {
+    match read_head(path) {
+        Some(head) => (Sha256::digest(&head).into(), head.len() as u16),
+        None => ([0u8; 32], 0),
+    }
 }
 
 /// Reads `path`'s inode number, or `0` (never a real inode on Linux) if it can't be stat'd.

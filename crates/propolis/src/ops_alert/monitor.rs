@@ -195,7 +195,7 @@ impl<P: Poster> Monitor<P> {
     }
 }
 
-/// All fourteen operational conditions, in a stable order. Built fresh on each (re)start so per-
+/// All fifteen operational conditions, in a stable order. Built fresh on each (re)start so per-
 /// condition state (backlog history, the chain-verify cache, intake lag tracks) resets cleanly
 /// after a supervised restart.
 pub fn default_conditions() -> Vec<Box<dyn Condition>> {
@@ -217,6 +217,7 @@ pub fn default_conditions() -> Vec<Box<dyn Condition>> {
         Box::new(malware::FetchStale),
         Box::new(sensor_log::SensorLogOversized::new()),
         Box::new(sensor_log::RotationStale),
+        Box::new(intake::IntakeRotationLoss),
     ]
 }
 
@@ -317,6 +318,43 @@ mod tests {
         )
     }
 
+    /// The real condition against the map the intake loops write: a log whose tailer reported a
+    /// rotation loss pages once, a log that lost nothing does not.
+    #[tokio::test]
+    async fn a_reported_rotation_loss_pages_and_a_clean_log_does_not() {
+        use crate::ops_alert::condition::SensorIntake;
+        use crate::ops_alert::conditions::intake::IntakeRotationLoss;
+
+        let rec = Recorder::new();
+        let ctx = test_ctx();
+        let progress = ctx.intake_progress.clone();
+        let mut clean = SensorIntake::started(Instant::now());
+        clean.bytes_behind = Some(0);
+        progress.lock().unwrap().insert("ssh", clean);
+        let mut m = Monitor::new(vec![Box::new(IntakeRotationLoss)], ctx, dispatcher(&rec));
+        let base = Instant::now();
+
+        m.process_tick(base).await;
+        assert_eq!(rec.count(), 0, "no loss, no page");
+
+        let mut lossy = SensorIntake::started(Instant::now());
+        lossy.rotation_loss = log_tailer::RotationLoss {
+            events: 1,
+            bytes_estimated: 4096,
+        };
+        lossy.rotation_loss_at = Some(Instant::now());
+        progress.lock().unwrap().insert("telnet", lossy);
+        m.process_tick(base + Duration::from_secs(1)).await;
+        assert_eq!(rec.count(), 1, "a reported loss pages immediately");
+        let sent = rec.sent.lock().unwrap();
+        let body = &sent[0].body;
+        assert!(
+            body.contains("telnet (1 rotation, at least 4096 bytes)"),
+            "{body}"
+        );
+        assert!(!body.contains("ssh"), "{body}");
+    }
+
     #[tokio::test]
     async fn firing_pages_once_then_repages_after_cooldown_then_recovers() {
         let rec = Recorder::new();
@@ -412,7 +450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_conditions_are_the_fourteen_expected_ids() {
+    async fn default_conditions_are_the_fifteen_expected_ids() {
         let ids: Vec<&str> = default_conditions().iter().map(|c| c.id()).collect();
         assert_eq!(
             ids,
@@ -431,6 +469,7 @@ mod tests {
                 "fetch-stale",
                 "sensor-log-oversized",
                 "rotation-stale",
+                "intake-rotation-loss",
             ]
         );
     }

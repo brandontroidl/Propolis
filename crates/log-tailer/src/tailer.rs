@@ -4,12 +4,15 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::cursor::{
-    CursorState, DurableCursor, RotationEvent, compute_fingerprint, detect_rotation, get_inode,
+    CursorState, DurableCursor, RotationEvent, detect_rotation, fingerprint_with_len, get_inode,
+    head_matches,
 };
 
 /// One item of a batch read, in file order: a complete line, or the place where an over-length
@@ -38,6 +41,18 @@ pub enum StartAt {
 /// append growth alone (no rotation at all), producing a fingerprint "mismatch" that does not
 /// reflect real content replacement. See [`LogTailer::maybe_false_positive_replaced`].
 const FINGERPRINT_STABLE_SIZE: u64 = 256;
+
+/// Input a `copytruncate` rotation took from this reader that it could not recover from the
+/// rotated copy, counted over the life of the tailer. In memory only: the WARN each loss logs is
+/// the durable record. See [`LogTailer::rotation_loss`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RotationLoss {
+    /// Truncations whose unread content could not be recovered and may not have been empty.
+    pub events: u64,
+    /// Lower bound on the bytes lost: what the previous poll saw past the read offset. Zero for a
+    /// loss the tailer could not size (it had not yet polled the old content, as after a restart).
+    pub bytes_estimated: u64,
+}
 
 /// Read positions as they stood at the start of the current uncommitted batch, so a caller that
 /// could not process what it read can put the tailer back and re-read it on the next poll.
@@ -107,6 +122,19 @@ pub struct LogTailer {
     /// the next `read_batch`. Spans every read since the last commit or rewind, not just the
     /// most recent one, so a caller that polls twice before deciding can still undo both.
     uncommitted: Option<UncommittedRead>,
+    /// Whether `last_known_size` was measured by a poll of this instance. False until the first
+    /// read: the size taken at construction is the file as found, not the content the persisted
+    /// offset points into, so it cannot size what a truncation then discarded.
+    size_observed: bool,
+    /// The inode and content fingerprint of each `copytruncate` generation queued in
+    /// `pending_drains` (pruned to the queue whenever one is added, so never more than the queue).
+    /// While such a generation is the front of the queue, [`Self::persist_cursor`] saves the
+    /// drain's position under its fingerprint instead of the new file's, so a restart (or the
+    /// rotation guard, `deploy/logrotate-guard.sh`) sees the old content as unread until it is
+    /// read, whichever generation is at the front. Matched on inode, so a stale entry can never be
+    /// applied to another drain.
+    resumes: Vec<(u64, [u8; 32], u16)>,
+    loss: RotationLoss,
 }
 
 impl LogTailer {
@@ -120,6 +148,7 @@ impl LogTailer {
             // `detect_rotation` call reports `InodeChanged` so we stamp real state below.
             offset: 0,
             fingerprint: [0u8; 32],
+            fingerprint_len: None,
         });
         Self::with_state(log_path, Some(cursor), state)
     }
@@ -136,14 +165,19 @@ impl LogTailer {
                 inode: 0,
                 offset: 0,
                 fingerprint: [0u8; 32],
+                fingerprint_len: None,
             },
             // A file that does not exist yet stamps inode 0 here too, so when it appears its
             // whole content is read: all of it was written after the start.
-            StartAt::End => CursorState {
-                inode: get_inode(&log_path),
-                offset: end_of_last_complete_line(&log_path),
-                fingerprint: compute_fingerprint(&log_path),
-            },
+            StartAt::End => {
+                let (fingerprint, len) = fingerprint_with_len(&log_path);
+                CursorState {
+                    inode: get_inode(&log_path),
+                    offset: end_of_last_complete_line(&log_path),
+                    fingerprint,
+                    fingerprint_len: Some(len),
+                }
+            }
         };
         Self::with_state(log_path, None, state)
     }
@@ -158,7 +192,17 @@ impl LogTailer {
             pending_drains: VecDeque::new(),
             last_known_size,
             uncommitted: None,
+            size_observed: false,
+            resumes: Vec::new(),
+            loss: RotationLoss::default(),
         }
+    }
+
+    /// Input this tailer saw a `copytruncate` take and could not recover, since it started. A
+    /// truncation whose unread content is found in the rotated copy (`<log>.1`) is not a loss and
+    /// is not counted.
+    pub fn rotation_loss(&self) -> RotationLoss {
+        self.loss
     }
 
     /// Reads up to `max_lines` complete (`\n`-terminated) lines starting at the current cursor
@@ -335,7 +379,10 @@ impl LogTailer {
             RotationEvent::Replaced => !self.maybe_false_positive_replaced(),
             RotationEvent::None | RotationEvent::InodeChanged => false,
         };
-        if changed {
+        // A copytruncate whose old content is still in `<log>.1` is accepted: moving the offset
+        // forward over the prefix makes the next read drain `.1` from there, so the committed
+        // prefix is not read again. Without a verifiable copy the prefix cannot be placed.
+        if changed && find_generations(&self.log_path, &self.state, Gz::Probe).is_err() {
             return false;
         }
         let spans = uncommitted.spans[..lines].to_vec();
@@ -437,9 +484,26 @@ impl LogTailer {
 
     /// Persists the current cursor state via `DurableCursor::save`. A [`Self::without_cursor`]
     /// tailer has nowhere to persist to: this returns `ErrorKind::Unsupported` and writes nothing.
+    ///
+    /// While the rotated copy of a `copytruncate` is still being drained, what is saved is the
+    /// drain's position in the OLD content (its fingerprint, the shared inode), not the new
+    /// file's offset 0. The old content is unread until the drain ends, and a restart that loaded
+    /// a position in the new file would never go back for it; loaded as saved here, the restart
+    /// sees the truncation again and resumes the drain from `<log>.1`.
     pub fn persist_cursor(&self) -> io::Result<()> {
+        let resumable = self.pending_drains.front().and_then(|(file, offset)| {
+            let front = file.metadata().ok()?.ino();
+            let (_, fingerprint, len) = self.resumes.iter().find(|(ino, ..)| *ino == front)?;
+            Some(CursorState {
+                inode: self.state.inode,
+                offset: *offset,
+                fingerprint: *fingerprint,
+                fingerprint_len: Some(*len),
+            })
+        });
+        let state = resumable.unwrap_or(self.state);
         match &self.cursor {
-            Some(cursor) => cursor.save(&self.state),
+            Some(cursor) => cursor.save(&state),
             None => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "this tailer was built without a cursor and persists nothing",
@@ -450,6 +514,7 @@ impl LogTailer {
     fn refresh_last_known_size(&mut self) {
         if let Ok(metadata) = std::fs::metadata(&self.log_path) {
             self.last_known_size = metadata.len();
+            self.size_observed = true;
         }
     }
 
@@ -458,16 +523,34 @@ impl LogTailer {
     /// drains to exhaustion before the new file.
     fn handle_rotation(&mut self) {
         match detect_rotation(&self.log_path, &self.state) {
-            RotationEvent::None => {}
-            RotationEvent::Truncated => self.reset_to_current_file(),
+            RotationEvent::None => {
+                // The stored window matched. If it is narrower than a full fingerprint and the
+                // file has grown past it, take the wider one now: a stamp made while only the
+                // start of a first line was visible would otherwise stay that short for the whole
+                // generation, too little to tell a refilled file from the same one, or to match
+                // the rotated copy.
+                if self.state.fingerprint_len.is_some_and(|n| n < 256) {
+                    let (fingerprint, len) = fingerprint_with_len(&self.log_path);
+                    if self.state.fingerprint_len.is_some_and(|n| len > n) {
+                        self.state.fingerprint = fingerprint;
+                        self.state.fingerprint_len = Some(len);
+                    }
+                }
+            }
+            RotationEvent::Truncated => self.recover_copytruncated(),
             RotationEvent::Replaced => {
-                if self.maybe_false_positive_replaced() {
+                // A rotated copy that carries the stored fingerprint is proof of a copytruncate,
+                // and outranks the growth explanation: a restart mid-drain stores the OLD
+                // fingerprint, so a live file still under 256 bytes always mismatches it.
+                if find_generations(&self.log_path, &self.state, Gz::Probe).is_err()
+                    && self.maybe_false_positive_replaced()
+                {
                     // Ordinary growth of a still-small file, not a real replacement (see
                     // `maybe_false_positive_replaced`): re-stamp and keep reading from the same
                     // offset rather than discarding it.
-                    self.state.fingerprint = compute_fingerprint(&self.log_path);
+                    self.stamp_fingerprint();
                 } else {
-                    self.reset_to_current_file();
+                    self.recover_copytruncated();
                 }
             }
             RotationEvent::InodeChanged => {
@@ -499,6 +582,85 @@ impl LogTailer {
         }
     }
 
+    /// The log was emptied or its content replaced under the same inode: `copytruncate`, whose
+    /// copy is `<log>.1` (the deployed policy's `delaycompress` leaves it uncompressed until the
+    /// next rotation). Everything this tailer had not yet read lives only there, so it is queued
+    /// as a drain from the read offset, ahead of the new file, and goes through the same
+    /// machinery as a rename-rotated inode (spans, commits, byte budget, rewind).
+    ///
+    /// Only a copy that is provably the old content is read: its first `min(256, size)` bytes must
+    /// hash to the fingerprint stored for the old file, and it must reach the read offset.
+    /// Anything else (no `.1`, only `.1.gz`, a `.1` from an earlier rotation) is NOT read, since
+    /// reading the wrong file would ingest another generation's lines; it is reported as a loss
+    /// instead. Without a `.1` the new file is simply read from 0, as it always was.
+    fn recover_copytruncated(&mut self) {
+        let dir = self.cursor.as_ref().map(|c| c.dir().to_path_buf());
+        let gz = match &dir {
+            Some(dir) => Gz::Expand(Scratch {
+                dir,
+                free_bytes: &statvfs_free,
+            }),
+            None => Gz::Nowhere,
+        };
+        // A generation that cannot be found is a loss; no rotated copy is read in its place, since
+        // nothing says whether one is older (already ingested) or newer than the lost one.
+        let (generations, lost) = match find_generations(&self.log_path, &self.state, gz) {
+            Ok(found) => (found.generations, found.newer_missing),
+            Err(reason) => (Vec::new(), Some(reason)),
+        };
+        let queued: Vec<u64> = self
+            .pending_drains
+            .iter()
+            .filter_map(|(file, _)| file.metadata().ok().map(|m| m.ino()))
+            .collect();
+        self.resumes.retain(|(ino, ..)| queued.contains(ino));
+        for generation in generations {
+            if let Some(uncommitted) = &mut self.uncommitted {
+                let rewind_to = if generation.is_stored {
+                    uncommitted.offset
+                } else {
+                    0
+                };
+                uncommitted.drain_offsets.push(rewind_to);
+            }
+            if let Ok(meta) = generation.file.metadata() {
+                self.resumes.push((
+                    meta.ino(),
+                    generation.fingerprint,
+                    generation.fingerprint_len,
+                ));
+            }
+            self.pending_drains
+                .push_back((generation.file, generation.offset));
+        }
+        if let Some(reason) = lost {
+            self.record_loss(reason);
+        }
+        self.reset_to_current_file();
+    }
+
+    /// Counts and logs a truncation whose unread content could not be recovered. Stays silent when
+    /// the previous poll had read everything the file held: the bytes in the copy-to-truncate gap
+    /// are not knowable and are the loss the policy accepts, which would otherwise be logged on
+    /// every rotation of an idle sensor.
+    fn record_loss(&mut self, reason: &'static str) {
+        let estimate = self
+            .size_observed
+            .then(|| self.last_known_size.saturating_sub(self.state.offset));
+        if estimate == Some(0) {
+            return;
+        }
+        self.loss.events += 1;
+        self.loss.bytes_estimated += estimate.unwrap_or(0);
+        tracing::warn!(
+            path = %self.log_path.display(),
+            offset = self.state.offset,
+            bytes_skipped_estimate = estimate,
+            reason,
+            "log-tailer: a copytruncate rotation discarded input that was never read and the rotated copy could not supply it"
+        );
+    }
+
     /// Resets the offset to 0 and recomputes the fingerprint against the log file's current
     /// content; the stale file handle (if any) is dropped since it no longer corresponds to
     /// where we're about to read.
@@ -509,8 +671,15 @@ impl LogTailer {
         if let Some(uncommitted) = &mut self.uncommitted {
             uncommitted.offset = 0;
         }
-        self.state.fingerprint = compute_fingerprint(&self.log_path);
+        self.stamp_fingerprint();
         self.file = None;
+    }
+
+    /// Records the log file's current leading bytes as the fingerprint, with the window they cover.
+    fn stamp_fingerprint(&mut self) {
+        let (fingerprint, len) = fingerprint_with_len(&self.log_path);
+        self.state.fingerprint = fingerprint;
+        self.state.fingerprint_len = Some(len);
     }
 
     /// `compute_fingerprint` hashes `min(256, current_size)` bytes: for a file that has never
@@ -525,6 +694,335 @@ impl LogTailer {
                 .map(|m| m.len() > self.last_known_size)
                 .unwrap_or(false)
     }
+}
+
+/// One rotated generation to read, oldest first.
+struct Generation {
+    file: File,
+    offset: u64,
+    /// Hash of its first `fingerprint_len` bytes: what a cursor names this generation by.
+    fingerprint: [u8; 32],
+    fingerprint_len: u16,
+    /// The generation the stored state points into (as opposed to a newer one, read from 0).
+    is_stored: bool,
+}
+
+/// What [`find_generations`] found.
+struct Found {
+    /// Generations with bytes to read, oldest first. Empty when the stored one matched but ends at
+    /// the offset and nothing newer was rotated.
+    generations: Vec<Generation>,
+    /// Set when a generation newer than the stored one could not be opened: its lines are lost.
+    newer_missing: Option<&'static str>,
+}
+
+fn rotated_path(log_path: &Path, n: u32) -> PathBuf {
+    let mut path = log_path.as_os_str().to_owned();
+    path.push(format!(".{n}"));
+    PathBuf::from(path)
+}
+
+/// Opens `<log>.<n>` (uncompressed only) with its size and fingerprint, both taken from the
+/// opened handle so a rotation that renames the file after the open cannot make the check and the
+/// read disagree.
+fn open_generation(log_path: &Path, n: u32) -> Result<(File, u64, Vec<u8>), &'static str> {
+    let path = rotated_path(log_path, n);
+    let Ok(file) = File::open(&path) else {
+        let mut gz = path.into_os_string();
+        gz.push(".gz");
+        return Err(if Path::new(&gz).exists() {
+            "the rotated copy is compressed"
+        } else {
+            "there is no rotated copy"
+        });
+    };
+    let Ok(size) = file.metadata().map(|m| m.len()) else {
+        return Err("the rotated copy cannot be read");
+    };
+    let mut head = Vec::with_capacity(256);
+    if (&file).take(256).read_to_end(&mut head).is_err() {
+        return Err("the rotated copy cannot be read");
+    }
+    Ok((file, size, head))
+}
+
+/// The fingerprint a generation is named by when it is not the one a stored state points into:
+/// its own leading bytes, over the window they cover.
+fn own_fingerprint(head: &[u8]) -> ([u8; 32], u16) {
+    (Sha256::digest(head).into(), head.len() as u16)
+}
+
+/// The fingerprint and window of the generation `state` points into, as a cursor saves them for it.
+fn stored_fingerprint(state: &CursorState, head: &[u8]) -> ([u8; 32], u16) {
+    (
+        state.fingerprint,
+        state.fingerprint_len.unwrap_or(head.len() as u16),
+    )
+}
+
+/// Where a compressed generation is expanded, and how to ask how much room there is. The probe
+/// is a parameter so the refusal is tested without filling a disk.
+struct Scratch<'a> {
+    dir: &'a Path,
+    free_bytes: &'a dyn Fn(&Path) -> io::Result<u64>,
+}
+
+/// What [`find_generations`] may do with a compressed generation.
+enum Gz<'a> {
+    /// Only check whether `.2.gz` is the stored generation (a probe); expand nothing.
+    Probe,
+    /// Expand it.
+    Expand(Scratch<'a>),
+    /// It would have to be expanded and there is nowhere to put it (a tailer with no cursor
+    /// directory): reported as a loss.
+    Nowhere,
+}
+
+/// Finds the generation of the log that `state` points into, in `<log>.1` or, when a second
+/// rotation has already pushed it back, `<log>.2` or `<log>.2.gz` (expanded into `scratch` when
+/// given, see [`match_gzip_generation`]): its first `min(256, size)` bytes must hash to
+/// the stored fingerprint and it must reach the read offset. Every generation rotated after it
+/// (`.1` when it is `.2`) is unread by construction, since the reader works through generations
+/// in order, and is returned too. `Err(reason)` when the stored generation cannot be found; the
+/// reason is `.1`'s, the likelier home.
+fn find_generations(
+    log_path: &Path,
+    state: &CursorState,
+    gz: Gz<'_>,
+) -> Result<Found, &'static str> {
+    let mut why = "there is no rotated copy";
+    for n in [1u32, 2] {
+        let (file, size, head) = match open_generation(log_path, n) {
+            Ok(opened) => opened,
+            Err(reason) => {
+                if n == 1 {
+                    why = reason;
+                }
+                continue;
+            }
+        };
+        if !head_matches(state, &head) {
+            if n == 1 {
+                why = "the rotated copy is not the content the read offset points into";
+            }
+            continue;
+        }
+        if size < state.offset {
+            if n == 1 {
+                why = "the rotated copy ends before the read offset";
+            }
+            continue;
+        }
+        let mut generations = Vec::new();
+        if size > state.offset {
+            let (fingerprint, fingerprint_len) = stored_fingerprint(state, &head);
+            generations.push(Generation {
+                file,
+                offset: state.offset,
+                fingerprint,
+                fingerprint_len,
+                is_stored: true,
+            });
+        }
+        let newer_missing = push_newer(log_path, n, &mut generations);
+        return Ok(Found {
+            generations,
+            newer_missing,
+        });
+    }
+    // The shipped `compress` + `delaycompress` policy compresses a copy at the rotation after the
+    // one that made it, so a second rotation leaves the first generation only as `.2.gz`.
+    match match_gzip_generation(log_path, state, gz) {
+        Ok(GzipMatch::Absent) => {}
+        Ok(GzipMatch::Present) => {
+            return Ok(Found {
+                generations: Vec::new(),
+                newer_missing: None,
+            });
+        }
+        Ok(GzipMatch::Materialized(file, size, head)) => {
+            let mut generations = Vec::new();
+            if size > state.offset {
+                let (fingerprint, fingerprint_len) = stored_fingerprint(state, &head);
+                generations.push(Generation {
+                    file,
+                    offset: state.offset,
+                    fingerprint,
+                    fingerprint_len,
+                    is_stored: true,
+                });
+            }
+            let newer_missing = push_newer(log_path, 2, &mut generations);
+            return Ok(Found {
+                generations,
+                newer_missing,
+            });
+        }
+        Err(reason) => why = reason,
+    }
+    Err(why)
+}
+
+/// Appends the generations rotated after `<log>.<n>`, oldest first, that have bytes to read.
+/// Returns the reason when one cannot be opened.
+fn push_newer(log_path: &Path, n: u32, out: &mut Vec<Generation>) -> Option<&'static str> {
+    let mut missing = None;
+    for m in (1..n).rev() {
+        match open_generation(log_path, m) {
+            Ok((file, size, head)) => {
+                if size > 0 {
+                    let (fingerprint, fingerprint_len) = own_fingerprint(&head);
+                    out.push(Generation {
+                        file,
+                        offset: 0,
+                        fingerprint,
+                        fingerprint_len,
+                        is_stored: false,
+                    });
+                }
+            }
+            Err(reason) => missing = Some(reason),
+        }
+    }
+    missing
+}
+
+/// The most decompressed bytes a `.2.gz` is expanded to when the reader resumes from it: five
+/// times the shipped `size 100M`. A bigger generation (a log the guard let grow while intake was
+/// behind) is reported as a loss rather than expanded without bound.
+const GZIP_EXPANSION_CAP: u64 = 512 * 1024 * 1024;
+
+enum GzipMatch {
+    /// No `<log>.2.gz`, or it is not the stored generation.
+    Absent,
+    /// It is the stored generation; not expanded (a probe, `scratch` was `None`).
+    Present,
+    /// It is the stored generation, expanded into an unlinked scratch file of this many bytes;
+    /// the last field is its first (up to 256) decompressed bytes.
+    Materialized(File, u64, Vec<u8>),
+}
+
+/// Free space required beyond the expansion itself, the same reserve the rotation guard keeps
+/// (`PROPOLIS_LOGROTATE_RESERVE_BYTES`, 512 MiB): expanding a generation must not be what fills a
+/// volume that holds the database and every sensor log.
+const EXPANSION_RESERVE: u64 = 512 * 1024 * 1024;
+
+/// Bytes available to an unprivileged writer on the filesystem holding `dir`.
+fn statvfs_free(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `path` is a valid NUL-terminated string and `stat` is a plain-old-data out
+    // parameter that statvfs fully initialises on success, which is the only case it is read.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+/// The reason given when an expansion is refused for lack of space, or runs out of it midway.
+const NO_SPACE: &str = "insufficient disk to expand the compressed rotated copy";
+
+fn is_out_of_space(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(code) if code == libc::ENOSPC || code == libc::EDQUOT)
+}
+
+/// Whether `<log>.2.gz` decompresses to the generation `state` points into: the first
+/// `min(256, size)` decompressed bytes must hash to the stored fingerprint. With a `scratch`
+/// directory the whole generation is then expanded, streaming, into an unlinked file there (so a
+/// resumed position is simply a decompressed offset into an ordinary seekable file, and a crash
+/// leaves nothing behind); without one this is only the cheap check.
+fn match_gzip_generation(
+    log_path: &Path,
+    state: &CursorState,
+    gz: Gz<'_>,
+) -> Result<GzipMatch, &'static str> {
+    use flate2::read::GzDecoder;
+    let mut path = rotated_path(log_path, 2).into_os_string();
+    path.push(".gz");
+    let Ok(file) = File::open(&path) else {
+        return Ok(GzipMatch::Absent);
+    };
+    let mut head = Vec::with_capacity(256);
+    if GzDecoder::new(&file)
+        .take(256)
+        .read_to_end(&mut head)
+        .is_err()
+        || !head_matches(state, &head)
+    {
+        return Ok(GzipMatch::Absent);
+    }
+    let scratch = match gz {
+        Gz::Probe => return Ok(GzipMatch::Present),
+        Gz::Nowhere => {
+            return Err("there is no directory to expand the compressed rotated copy in");
+        }
+        Gz::Expand(scratch) => scratch,
+    };
+    // Refuse before writing a byte: the worst case is the cap, plus the reserve the guard keeps.
+    let needed = GZIP_EXPANSION_CAP + EXPANSION_RESERVE;
+    match (scratch.free_bytes)(scratch.dir) {
+        Ok(free) if free >= needed => {}
+        Ok(_) => return Err(NO_SPACE),
+        Err(_) => return Err("the free space for the compressed rotated copy cannot be read"),
+    }
+    let Ok(file) = File::open(&path) else {
+        return Err("the compressed rotated copy cannot be read");
+    };
+    let mut out = scratch_file(scratch.dir).map_err(|e| {
+        if is_out_of_space(&e) {
+            NO_SPACE
+        } else {
+            "no scratch space to expand the compressed copy"
+        }
+    })?;
+    let mut decoder = GzDecoder::new(file).take(GZIP_EXPANSION_CAP + 1);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut copied: u64 = 0;
+    loop {
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|_| "the compressed rotated copy is truncated or corrupt")?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n]).map_err(|e| {
+            if is_out_of_space(&e) {
+                NO_SPACE
+            } else {
+                "the compressed rotated copy could not be expanded"
+            }
+        })?;
+        copied += n as u64;
+    }
+    if copied > GZIP_EXPANSION_CAP {
+        return Err("the compressed rotated copy is larger than the expansion cap");
+    }
+    if copied < state.offset {
+        return Err("the rotated copy ends before the read offset");
+    }
+    Ok(GzipMatch::Materialized(out, copied, head))
+}
+
+/// A read-write file in `dir` that is already unlinked: it lives only as long as the descriptor.
+/// There is no fallback directory: the system temp directory can be memory-backed and counted
+/// against the service's memory limit.
+fn scratch_file(dir: &Path) -> io::Result<File> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = dir.join(format!(
+        ".propolis-gzdrain-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
 }
 
 /// Hard cap on a single log line intake will buffer. Sensors already bound their captured fields
@@ -692,5 +1190,103 @@ fn skip_to_newline(reader: &mut impl BufRead) -> io::Result<Option<u64>> {
         if chunk.last() == Some(&b'\n') {
             return Ok(Some(discarded));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `<log>.2.gz` holding `content`, and the state of a reader that had read `offset` bytes of it.
+    fn gzipped_generation(dir: &Path, content: &[u8], offset: u64) -> (PathBuf, CursorState) {
+        let log = dir.join("events.jsonl");
+        let mut gz = rotated_path(&log, 2).into_os_string();
+        gz.push(".gz");
+        let mut encoder = flate2::write::GzEncoder::new(
+            File::create(&gz).unwrap(),
+            flate2::Compression::default(),
+        );
+        encoder.write_all(content).unwrap();
+        encoder.finish().unwrap();
+        let head = &content[..content.len().min(256)];
+        let state = CursorState {
+            inode: 1,
+            offset,
+            fingerprint: Sha256::digest(head).into(),
+            fingerprint_len: Some(head.len() as u16),
+        };
+        (log, state)
+    }
+
+    fn expand(
+        log: &Path,
+        state: &CursorState,
+        free: &dyn Fn(&Path) -> io::Result<u64>,
+    ) -> Result<Found, &'static str> {
+        let dir = log.parent().unwrap();
+        find_generations(
+            log,
+            state,
+            Gz::Expand(Scratch {
+                dir,
+                free_bytes: free,
+            }),
+        )
+    }
+
+    /// The expansion needs the cap plus the reserve free; short of that it is refused before a
+    /// byte is written, with the reason a page can show, and nothing is left behind.
+    #[test]
+    fn a_compressed_copy_is_not_expanded_without_room_for_it_and_the_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, state) = gzipped_generation(dir.path(), &vec![b'x'; 4096], 10);
+        let needed = GZIP_EXPANSION_CAP + EXPANSION_RESERVE;
+
+        assert_eq!(
+            expand(&log, &state, &|_| Ok(needed - 1)).err(),
+            Some(NO_SPACE)
+        );
+        assert_eq!(
+            expand(&log, &state, &|_| Ok(0)).err(),
+            Some(NO_SPACE),
+            "a full disk"
+        );
+        assert!(
+            expand(&log, &state, &|_| Err(io::Error::other("statvfs failed")))
+                .err()
+                .is_some_and(|why| why.contains("free space")),
+            "an unreadable free-space figure is a refusal, not a guess"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("gzdrain"))
+            .collect();
+        assert!(leftovers.is_empty());
+
+        let found = expand(&log, &state, &|_| Ok(needed)).expect("room for it");
+        assert_eq!(found.generations.len(), 1);
+        assert_eq!(found.generations[0].offset, 10);
+    }
+
+    /// A write that runs out of space midway is reported as that, not as a corrupt archive.
+    #[test]
+    fn running_out_of_space_while_expanding_is_reported_as_such() {
+        assert!(is_out_of_space(&io::Error::from_raw_os_error(libc::ENOSPC)));
+        assert!(is_out_of_space(&io::Error::from_raw_os_error(libc::EDQUOT)));
+        assert!(!is_out_of_space(&io::Error::from_raw_os_error(libc::EIO)));
+    }
+
+    /// A tailer with no cursor directory has nowhere to expand to: a reported loss, and nothing
+    /// is written to the system temp directory.
+    #[test]
+    fn a_compressed_copy_is_not_expanded_when_there_is_no_directory_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, state) = gzipped_generation(dir.path(), &vec![b'x'; 4096], 10);
+        assert!(
+            find_generations(&log, &state, Gz::Nowhere)
+                .err()
+                .is_some_and(|why| why.contains("no directory"))
+        );
     }
 }

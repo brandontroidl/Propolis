@@ -4,7 +4,7 @@ audience: evaluator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Limitations
@@ -80,8 +80,12 @@ that sensor's intake at its line, as it did before batching
 ([concurrency and failure](../architecture/concurrency-and-failure.md#serialized-single-writer-append)).
 
 The `intake-lagging` alert and the fleet pane's behind badge make a backlog visible;
-they do not remove it. While intake is behind, a `copytruncate` rotation of the log drops the
-unread part from ingest (it stays in the rotated copy), and the lag readings fall back with it.
+they do not remove it. While intake is behind, a `copytruncate` rotation moves the unread part
+into `events.jsonl.1`, which the tailer reads before the new file, so nothing is dropped and the
+lag readings include it. The rotation guard skips a log that is too far behind or whose `.1` is
+unread ([retention](../operations/retention.md#rotation-while-intake-is-behind)); a log that
+skips for long grows until `sensor-log-oversized` pages. If `.1` cannot be used, the unread part
+is lost and `intake-rotation-loss` pages.
 
 ## Tailer misreads a small rotated log as growth
 

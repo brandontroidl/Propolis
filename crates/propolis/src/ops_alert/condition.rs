@@ -86,6 +86,11 @@ pub struct SensorIntake {
     /// Set while the database keeps refusing the same line of this log (`IntakeRunner::wedged`);
     /// `intake-stalled` quotes it, so the page says why the cursor is not moving.
     pub wedge: Option<String>,
+    /// Input a `copytruncate` rotation took that the rotated copy could not supply, since the
+    /// daemon started (`LogTailer::rotation_loss`); `intake-rotation-loss` reads it.
+    pub rotation_loss: log_tailer::RotationLoss,
+    /// Monitor-clock instant `rotation_loss` last grew; `None` while it never has.
+    pub rotation_loss_at: Option<Instant>,
 }
 
 impl SensorIntake {
@@ -98,7 +103,18 @@ impl SensorIntake {
             last_ingested_observed_at: None,
             reported_sensors: Vec::new(),
             wedge: None,
+            rotation_loss: log_tailer::RotationLoss::default(),
+            rotation_loss_at: None,
         }
+    }
+
+    /// Folds the tailer's running total in, stamping `now` only when it grew so the instant means
+    /// "last loss", not "last poll".
+    pub fn record_rotation_loss(&mut self, total: log_tailer::RotationLoss, now: Instant) {
+        if total.events > self.rotation_loss.events {
+            self.rotation_loss_at = Some(now);
+        }
+        self.rotation_loss = total;
     }
 }
 
@@ -208,6 +224,31 @@ pub trait Condition: Send + Sync {
 mod tests {
     use super::*;
     use crate::ops_alert::debounce::{Action, DebounceMachine};
+
+    #[test]
+    fn the_loss_instant_moves_only_when_the_total_grows() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(5);
+        let t2 = t0 + Duration::from_secs(9);
+        let loss = |events| log_tailer::RotationLoss {
+            events,
+            bytes_estimated: 10 * events,
+        };
+        let mut s = SensorIntake::started(t0);
+        s.record_rotation_loss(loss(0), t0);
+        assert_eq!(s.rotation_loss_at, None, "nothing lost yet");
+        s.record_rotation_loss(loss(1), t1);
+        assert_eq!(s.rotation_loss_at, Some(t1));
+        s.record_rotation_loss(loss(1), t2);
+        assert_eq!(
+            s.rotation_loss_at,
+            Some(t1),
+            "an unchanged total is not a new loss"
+        );
+        assert_eq!(s.rotation_loss, loss(1));
+        s.record_rotation_loss(loss(2), t2);
+        assert_eq!(s.rotation_loss_at, Some(t2));
+    }
 
     #[test]
     fn firing_maps_to_the_firing_signal_and_pages_immediately_at_zero_debounce() {

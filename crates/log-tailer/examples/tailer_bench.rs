@@ -29,6 +29,7 @@ fn main() {
             inode: get_inode(&log),
             offset,
             fingerprint: compute_fingerprint(&log),
+            fingerprint_len: None,
         })
         .expect("seed cursor");
 

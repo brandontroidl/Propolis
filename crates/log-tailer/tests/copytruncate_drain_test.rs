@@ -531,13 +531,12 @@ fn a_second_copytruncate_mid_drain_then_a_restart_reports_the_compressed_generat
     tailer.persist_cursor().unwrap();
     drop(tailer);
 
-    // `.2.gz` here is not gzip at all: the first generation cannot be found. `.1` (B) was rotated
-    // after it, so it is unread and is read rather than skipped; only A's remainder is lost.
+    // `.2.gz` here is not gzip at all: the first generation cannot be found. The cursor records no
+    // finished copy, so `.1` (B) cannot be shown to be newer than what was ingested: nothing is
+    // read from it, and the loss is reported.
     let mut tailer = LogTailer::new(log.clone(), cursors);
     let seen = drain(&mut tailer, 100, u64::MAX);
-    let mut expected = lines("B", 0..10);
-    expected.extend(lines("C", 0..2));
-    assert_eq!(seen, expected);
+    assert_eq!(seen, lines("C", 0..2));
     assert_eq!(tailer.rotation_loss().events, 1, "the loss is reported");
 }
 
@@ -617,10 +616,191 @@ fn a_truncated_gzip_of_the_first_generation_is_a_reported_loss_and_the_rest_is_r
     drop(tailer);
 
     let mut tailer = LogTailer::new(log.clone(), cursors);
+    assert_eq!(drain(&mut tailer, 100, u64::MAX), lines("C", 0..2));
+    assert_eq!(tailer.rotation_loss().events, 1);
+}
+
+/// Sets up a cursor that records a finished earlier copy (Z) and is reading the live file (A),
+/// persisted. Returns the log path and the cursor directory.
+fn reader_that_finished_a_copy(dir: &Path) -> (PathBuf, PathBuf) {
+    let log = dir.join("events.jsonl");
+    let cursors = dir.join("cursors");
+    std::fs::write(&log, text(&lines("Z", 0..6))).unwrap();
+    let mut tailer = LogTailer::new(log.clone(), cursors.clone());
+    assert_eq!(tailer.read_batch(1), lines("Z", 0..1));
+    tailer.commit_batch();
+    copytruncate(&log);
+    append(&log, &text(&lines("A", 0..10)));
+    assert_eq!(tailer.read_batch(5), lines("Z", 1..6));
+    tailer.commit_batch();
+    // The next read finds the copy empty, releases it and moves on to the live file.
+    assert_eq!(tailer.read_batch(2), lines("A", 0..2));
+    tailer.commit_batch();
+    tailer.persist_cursor().unwrap();
+    (log, cursors)
+}
+
+fn set_modified_in_the_future(path: &Path) {
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+}
+
+/// The documented manual recovery, with the reader stopped: `truncate -s 0` leaves `.1` as the
+/// previous generation, which the reader finished long ago. The restart must not read it again.
+#[test]
+fn a_manual_truncate_while_the_reader_is_stopped_re_ingests_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, cursors) = reader_that_finished_a_copy(dir.path());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&log)
+        .unwrap();
+    append(&log, &text(&lines("C", 0..2)));
+
+    let mut tailer = LogTailer::new(log, cursors);
+    assert_eq!(drain(&mut tailer, 100, u64::MAX), lines("C", 0..2));
+    assert_eq!(tailer.rotation_loss().events, 1, "the discard is reported");
+}
+
+/// The finished copy is recognised by what it is, not only by when it was written: a backup
+/// restore or a `touch` that gives it a newer time does not make it unread.
+#[test]
+fn the_finished_copy_is_not_read_again_even_if_its_time_moved_forward() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, cursors) = reader_that_finished_a_copy(dir.path());
+    set_modified_in_the_future(&rotated_copy(&log));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&log)
+        .unwrap();
+    append(&log, &text(&lines("C", 0..2)));
+
+    let mut tailer = LogTailer::new(log, cursors);
+    assert_eq!(drain(&mut tailer, 100, u64::MAX), lines("C", 0..2));
+    assert_eq!(tailer.rotation_loss().events, 1);
+}
+
+/// Without a record of a finished copy (a cursor from an older version) there is nothing to tell a
+/// newer copy from an old one: nothing is read, and the loss is reported.
+#[test]
+fn a_cursor_with_no_finished_copy_reads_no_rotated_copy_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, cursors) = reader_that_finished_a_copy(dir.path());
+    // Strip the record, as an older version would have written the cursor.
+    let cursor = DurableCursor::new(log.clone(), cursors.clone());
+    let mut state = cursor.load().unwrap().unwrap();
+    assert!(
+        state.drained.is_some(),
+        "the reader recorded the finished copy"
+    );
+    state.drained = None;
+    cursor.save(&state).unwrap();
+    std::fs::write(rotated_copy(&log), text(&lines("B", 0..10))).unwrap();
+    set_modified_in_the_future(&rotated_copy(&log));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&log)
+        .unwrap();
+    append(&log, &text(&lines("C", 0..2)));
+
+    let mut tailer = LogTailer::new(log, cursors);
+    assert_eq!(drain(&mut tailer, 100, u64::MAX), lines("C", 0..2));
+    assert_eq!(tailer.rotation_loss().events, 1);
+}
+
+/// Positive identification: the reader recorded the copy it finished, the generation it was in is
+/// gone, and `.1` is a different file written after that copy was finished. It is newer, so it is
+/// read from 0; the loss of the generation that cannot be found is still reported.
+#[test]
+fn a_copy_written_after_the_finished_one_is_read_when_the_current_generation_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, cursors) = reader_that_finished_a_copy(dir.path());
+    std::fs::write(rotated_copy(&log), text(&lines("B", 0..10))).unwrap();
+    set_modified_in_the_future(&rotated_copy(&log));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&log)
+        .unwrap();
+    append(&log, &text(&lines("C", 0..2)));
+
+    let mut tailer = LogTailer::new(log, cursors);
     let mut expected = lines("B", 0..10);
     expected.extend(lines("C", 0..2));
     assert_eq!(drain(&mut tailer, 100, u64::MAX), expected);
     assert_eq!(tailer.rotation_loss().events, 1);
+}
+
+/// A copy that is not the finished one but was last written before it was finished is an older
+/// generation: not read, even though it is a different file.
+#[test]
+fn a_different_copy_older_than_the_finished_one_is_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, cursors) = reader_that_finished_a_copy(dir.path());
+    std::fs::write(rotated_copy(&log), text(&lines("old", 0..10))).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(rotated_copy(&log))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&log)
+        .unwrap();
+    append(&log, &text(&lines("C", 0..2)));
+
+    let mut tailer = LogTailer::new(log, cursors);
+    assert_eq!(drain(&mut tailer, 100, u64::MAX), lines("C", 0..2));
+    assert_eq!(tailer.rotation_loss().events, 1);
+}
+
+/// A cursor saved while the live file was under 256 bytes names a shorter window. After the file
+/// grew and was rotated, `.1` is compared over that window: the rest of it is read from the
+/// offset, nothing twice, no loss. The real guard sees `.1` as unread by the same rule.
+#[test]
+fn a_cursor_saved_on_a_small_file_still_finds_the_grown_and_rotated_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let cursors = dir.path().join("cursors");
+    std::fs::write(&log, text(&lines("S", 0..1))).unwrap(); // 45 bytes: under the window
+    let mut tailer = LogTailer::new(log.clone(), cursors.clone());
+    assert_eq!(tailer.read_batch(100), lines("S", 0..1));
+    tailer.commit_batch();
+    tailer.persist_cursor().unwrap();
+    drop(tailer);
+
+    append(&log, &text(&lines("S", 1..20)));
+    copytruncate(&log);
+    append(&log, &text(&lines("T", 0..2)));
+
+    let guard = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/logrotate-guard.sh"
+    ))
+    .arg(&log)
+    .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "0")
+    .env("PROPOLIS_CURSOR_DIR", &cursors)
+    .env("PROPOLIS_SHIPPER_CURSOR_DIR", dir.path().join("none"))
+    .output()
+    .unwrap();
+    assert_eq!(guard.status.code(), Some(1), "{guard:?}");
+    assert!(String::from_utf8_lossy(&guard.stderr).contains("not fully read"));
+
+    let mut tailer = LogTailer::new(log, cursors);
+    let mut expected = lines("S", 1..20);
+    expected.extend(lines("T", 0..2));
+    assert_eq!(drain(&mut tailer, 100, u64::MAX), expected);
+    assert_eq!(tailer.rotation_loss(), RotationLoss::default());
 }
 
 /// A stale `.1` is not read by a RUNNING tailer when the generation it follows is unfindable (it

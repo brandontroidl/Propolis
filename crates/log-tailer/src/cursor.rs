@@ -26,6 +26,30 @@ pub struct CursorState {
     /// SHA-256 of the first `min(256, file_size)` bytes at offset 0, computed via
     /// [`compute_fingerprint`].
     pub fingerprint: [u8; 32],
+    /// How many bytes `fingerprint` covers: `min(256, file_size)` when it was taken, so a file
+    /// that has since grown (or been rotated into `<log>.1`) is compared over the same window.
+    /// Absent in a cursor written by an older version, which means "the first 256 bytes".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_len: Option<u16>,
+    /// The last rotated copy this reader read to its end, if it has finished one. After a restart
+    /// that cannot find the generation it was reading, this is what lets it tell a rotated copy
+    /// that is newer (and unread) from an older one it already ingested. Absent in a cursor
+    /// written by an older version, or before any copy was finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drained: Option<DrainedCopy>,
+}
+
+/// Identity of a rotated copy that has been read to its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainedCopy {
+    /// The copy's content fingerprint over `fingerprint_len` bytes.
+    pub fingerprint: [u8; 32],
+    pub fingerprint_len: u16,
+    /// The copy's inode, which survives the renames rotation does to it.
+    pub inode: u64,
+    /// When the reader finished it, in milliseconds since the Unix epoch. A copy modified after
+    /// this was written after the reader was done with that one, so it is newer.
+    pub drained_at_ms: u64,
 }
 
 /// What, if anything, changed about the log file since `CursorState` was recorded.
@@ -110,13 +134,39 @@ impl DurableCursor {
     /// directory did not exist when the name was first derived), that cursor is loaded, saved under
     /// the resolved name and the old file removed, so one canonical path remains. Remove this
     /// fallback (and `legacy_file_path`) once every deployment has restarted on this version.
+    ///
+    /// When both names exist (a rollback to the old version after an upgrade left a newer
+    /// as-configured file beside the resolved one), the one written later wins and the other is
+    /// removed.
     pub fn load(&self) -> io::Result<Option<CursorState>> {
-        let bytes = match std::fs::read(self.cursor_file_path()) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return self.migrate_legacy(),
-            Err(e) => return Err(e),
+        let canonical = self.cursor_file_path();
+        let legacy = self.legacy_file_path();
+        let read = |path: &Path| -> io::Result<Option<Vec<u8>>> {
+            match std::fs::read(path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
         };
-        Ok(serde_json::from_slice(&bytes).ok())
+        let current = read(&canonical)?;
+        if legacy == canonical {
+            return Ok(current.and_then(|b| serde_json::from_slice(&b).ok()));
+        }
+        let old = read(&legacy)?;
+        let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        match (current, old) {
+            (Some(current), None) => Ok(serde_json::from_slice(&current).ok()),
+            (None, None) => Ok(None),
+            (None, Some(old)) => self.adopt_legacy(&legacy, &old),
+            (Some(current), Some(old)) => {
+                if modified(&legacy) > modified(&canonical) {
+                    self.adopt_legacy(&legacy, &old)
+                } else {
+                    let _ = std::fs::remove_file(&legacy);
+                    Ok(serde_json::from_slice(&current).ok())
+                }
+            }
+        }
     }
 
     /// The cursor file name derived from the log path as configured, before resolution.
@@ -128,22 +178,13 @@ impl DurableCursor {
             .join(format!("{}.json", hex_encode(&digest)))
     }
 
-    fn migrate_legacy(&self) -> io::Result<Option<CursorState>> {
-        let legacy = self.legacy_file_path();
-        if legacy == self.cursor_file_path() {
-            return Ok(None);
-        }
-        let bytes = match std::fs::read(&legacy) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let Some(state) = serde_json::from_slice::<CursorState>(&bytes).ok() else {
+    fn adopt_legacy(&self, legacy: &Path, bytes: &[u8]) -> io::Result<Option<CursorState>> {
+        let Some(state) = serde_json::from_slice::<CursorState>(bytes).ok() else {
             return Ok(None);
         };
         // Only drop the old file once the new one is durably in place.
         if self.save(&state).is_ok() {
-            let _ = std::fs::remove_file(&legacy);
+            let _ = std::fs::remove_file(legacy);
         }
         Ok(Some(state))
     }
@@ -199,10 +240,43 @@ pub(crate) fn detect_rotation(log_path: &Path, state: &CursorState) -> RotationE
     if state.offset > metadata.len() {
         return RotationEvent::Truncated;
     }
-    if compute_fingerprint(log_path) != state.fingerprint {
-        return RotationEvent::Replaced;
+    match read_head(log_path) {
+        // A file that was empty when stamped is unchanged while it is still empty.
+        Some(head) if head_matches(state, &head) => RotationEvent::None,
+        Some(head) if state.fingerprint_len == Some(0) && head.is_empty() => RotationEvent::None,
+        _ => RotationEvent::Replaced,
     }
-    RotationEvent::None
+}
+
+/// The first up to 256 bytes of `path`, or `None` if it can't be read.
+pub(crate) fn read_head(path: &Path) -> Option<Vec<u8>> {
+    let file = File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(256);
+    file.take(256).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Whether `head` (the first up to 256 bytes of a file) carries the fingerprint in `state`, over
+/// the window the fingerprint was taken on. An empty window (a fingerprint of nothing) identifies
+/// no file and matches none.
+pub(crate) fn head_matches(state: &CursorState, head: &[u8]) -> bool {
+    match state.fingerprint_len {
+        None => Sha256::digest(head).as_slice() == state.fingerprint,
+        Some(0) => false,
+        Some(n) => {
+            let n = usize::from(n);
+            head.len() >= n && Sha256::digest(&head[..n]).as_slice() == state.fingerprint
+        }
+    }
+}
+
+/// [`compute_fingerprint`] together with the number of bytes it covered, which is what
+/// [`CursorState::fingerprint_len`] records. An unreadable file is the zero digest over 0 bytes.
+pub(crate) fn fingerprint_with_len(path: &Path) -> ([u8; 32], u16) {
+    match read_head(path) {
+        Some(head) => (Sha256::digest(&head).into(), head.len() as u16),
+        None => ([0u8; 32], 0),
+    }
 }
 
 /// Reads `path`'s inode number, or `0` (never a real inode on Linux) if it can't be stat'd.

@@ -11,6 +11,8 @@ fn save_and_load_round_trip() {
         inode: 12345,
         offset: 6,
         fingerprint: [0u8; 32],
+        fingerprint_len: None,
+        drained: None,
     };
     cursor.save(&state).unwrap();
     let loaded = cursor.load().unwrap().unwrap();
@@ -48,6 +50,8 @@ fn detect_truncation_when_offset_exceeds_size() {
         inode: get_inode(&log_path),
         offset: 1000, // way past file size
         fingerprint: compute_fingerprint(&log_path),
+        fingerprint_len: None,
+        drained: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::Truncated));
@@ -63,6 +67,8 @@ fn detect_no_rotation_when_offset_within_size() {
         inode: get_inode(&log_path),
         offset: 5,
         fingerprint: compute_fingerprint(&log_path),
+        fingerprint_len: None,
+        drained: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::None));
@@ -79,6 +85,8 @@ fn detect_inode_changed_when_inode_differs() {
         inode: !get_inode(&log_path),
         offset: 5,
         fingerprint: compute_fingerprint(&log_path),
+        fingerprint_len: None,
+        drained: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::InodeChanged));
@@ -96,6 +104,8 @@ fn detect_replaced_when_same_inode_but_fingerprint_differs() {
         inode: get_inode(&log_path),
         offset: 5, // still within the file's size
         fingerprint: wrong_fingerprint,
+        fingerprint_len: None,
+        drained: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::Replaced));
@@ -168,6 +178,8 @@ fn a_cursor_named_by_the_configured_path_is_migrated_not_lost() {
         inode,
         offset: 4,
         fingerprint,
+        fingerprint_len: None,
+        drained: None,
     };
     std::fs::write(&legacy, serde_json::to_vec(&state).unwrap()).unwrap();
 
@@ -184,6 +196,88 @@ fn a_cursor_named_by_the_configured_path_is_migrated_not_lost() {
     );
     assert!(!legacy.exists(), "the configured-name file is gone");
     assert_eq!(cursor.load().unwrap(), Some(state));
+}
+
+/// Both names present (a rollback to the old version after an upgrade wrote a newer
+/// as-configured file): the one written later wins, and the other is removed.
+#[test]
+fn when_both_cursor_names_exist_the_newer_one_wins() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    for legacy_is_newer in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        std::fs::write(real.join("events.jsonl"), "a\nb\nc\nd\n").unwrap();
+        let configured = dir.path().join("link/events.jsonl");
+        let cursor_dir = dir.path().join("cursors");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        let cursor = DurableCursor::new(configured.clone(), cursor_dir.clone());
+        let hash: String = Sha256::digest(configured.as_os_str().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let legacy = cursor_dir.join(format!("{hash}.json"));
+        let canonical = cursor.cursor_file_path();
+        let at = |offset| CursorState {
+            inode: get_inode(&configured),
+            offset,
+            fingerprint: compute_fingerprint(&configured),
+            fingerprint_len: None,
+            drained: None,
+        };
+        std::fs::write(&legacy, serde_json::to_vec(&at(2)).unwrap()).unwrap();
+        std::fs::write(&canonical, serde_json::to_vec(&at(4)).unwrap()).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let newer = if legacy_is_newer { &legacy } else { &canonical };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(newer)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        let loaded = cursor.load().unwrap().unwrap();
+        assert_eq!(loaded.offset, if legacy_is_newer { 2 } else { 4 });
+        assert!(!legacy.exists(), "one canonical file remains");
+        assert_eq!(cursor.load().unwrap().unwrap().offset, loaded.offset);
+    }
+}
+
+/// The additive fields round-trip, and a cursor written without them still loads (an older
+/// version's file), with the old meaning: the first 256 bytes, no finished copy.
+#[test]
+fn the_window_and_finished_copy_fields_are_additive() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "x\n").unwrap();
+    let cursor = DurableCursor::new(log_path, dir.path().join("cursors"));
+    let full = CursorState {
+        inode: 7,
+        offset: 2,
+        fingerprint: [3u8; 32],
+        fingerprint_len: Some(51),
+        drained: Some(DrainedCopy {
+            fingerprint: [4u8; 32],
+            fingerprint_len: 200,
+            inode: 9,
+            drained_at_ms: 1_700_000_000_000,
+        }),
+    };
+    cursor.save(&full).unwrap();
+    assert_eq!(cursor.load().unwrap(), Some(full));
+
+    let old = r#"{"inode":7,"offset":2,"fingerprint":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]}"#;
+    std::fs::write(cursor.cursor_file_path(), old).unwrap();
+    let loaded = cursor.load().unwrap().unwrap();
+    assert_eq!((loaded.fingerprint_len, loaded.drained), (None, None));
+    cursor.save(&loaded).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(cursor.cursor_file_path()).unwrap(),
+        old,
+        "unset fields are not written, so an older reader still parses the file"
+    );
 }
 
 #[test]
@@ -251,12 +345,16 @@ fn atomic_save_does_not_corrupt_on_partial_write() {
         inode: 1,
         offset: 10,
         fingerprint: [1u8; 32],
+        fingerprint_len: None,
+        drained: None,
     };
     cursor.save(&state1).unwrap();
     let state2 = CursorState {
         inode: 2,
         offset: 20,
         fingerprint: [2u8; 32],
+        fingerprint_len: None,
+        drained: None,
     };
     cursor.save(&state2).unwrap();
     let loaded = cursor.load().unwrap().unwrap();

@@ -3049,6 +3049,63 @@ fn the_guard_logs_a_warning_when_it_rotates_without_a_cursor() {
     assert!(logged.contains("no usable intake cursor"), "{logged}");
 }
 
+/// A cursor that names its fingerprint window (`fingerprint_len`) and records a finished copy
+/// (`drained`, whose own `inode` and `fingerprint` must not be mistaken for the cursor's): `.1` is
+/// compared over the named window, and the top-level inode is the cursor's.
+#[test]
+fn the_guard_reads_a_cursor_with_a_fingerprint_window_and_a_finished_copy() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    std::fs::create_dir_all(&cursors).unwrap();
+    let log = dir.path().join("events.jsonl");
+    let copy = dir.path().join("events.jsonl.1");
+    let content = vec![b'q'; 4096];
+    std::fs::write(&log, vec![b'b'; 300]).unwrap();
+    std::fs::write(&copy, &content).unwrap();
+    // The cursor was saved when the log held only 51 bytes of what `.1` now starts with.
+    let window = 51usize;
+    let fp: Vec<String> = Sha256::digest(&content[..window])
+        .iter()
+        .map(|b| b.to_string())
+        .collect();
+    let name: String = Sha256::digest(log.as_os_str().as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let json = |len: &str| {
+        format!(
+            "{{\"inode\":{},\"offset\":51,\"fingerprint\":[{}]{len},\"drained\":{{\"fingerprint\":[1,2],\"fingerprint_len\":200,\"inode\":999999999,\"drained_at_ms\":1}}}}",
+            inode_of(&log),
+            fp.join(",")
+        )
+    };
+
+    std::fs::write(
+        cursors.join(format!("{name}.json")),
+        json(&format!(",\"fingerprint_len\":{window}")),
+    )
+    .unwrap();
+    let out = run_guard_reading(&log, &cursors, "67108864");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("not fully read"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    // Without the window the same fingerprint is read as 256 bytes and matches nothing: rotate.
+    std::fs::write(cursors.join(format!("{name}.json")), json("")).unwrap();
+    let out = run_guard_reading(&log, &cursors, "67108864");
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        !stderr_of(&out).contains("is for inode"),
+        "the drained inode must not be read as the cursor's: {}",
+        stderr_of(&out)
+    );
+}
+
 /// A skip is an error exit to logrotate, but logrotate still writes its state file, which is what
 /// the daemon's `rotation-stale` alert reads: skipping for unread input is not "rotation stopped".
 #[test]

@@ -100,28 +100,30 @@ if [ -z "$path_hash" ]; then
 fi
 
 copy2="$log.2"
-copy2_hash=""
-if [ -f "$copy2" ]; then
-    copy2_hash="$(head -c 256 -- "$copy2" | sha256sum | cut -d' ' -f1)"
-fi
-
-# Under compress + delaycompress a second rotation leaves the first generation only as `.2.gz`.
-# Only the first 256 decompressed bytes are read (head closes the pipe, gzip stops). The hash of
-# nothing is not a match: an unreadable archive, or a cursor over an empty file, would equal it.
-copy2gz_hash=""
-if [ -f "$copy2.gz" ] && command -v gzip >/dev/null 2>&1; then
-    copy2gz_hash="$(gzip -dc -- "$copy2.gz" 2>/dev/null | head -c 256 | sha256sum | cut -d' ' -f1)"
-    if [ "$copy2gz_hash" = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ]; then
-        copy2gz_hash=""
-    fi
-fi
-
 copy_size=0
-copy_hash=""
 if [ -f "$copy" ]; then
     copy_size="$(stat -c %s -- "$copy")"
-    copy_hash="$(head -c 256 -- "$copy" | sha256sum | cut -d' ' -f1)"
 fi
+
+# The hash of the first $2 bytes of $1, or of nothing when $1 is absent. A cursor names a file by
+# the hash of its first `fingerprint_len` bytes (256 when the cursor does not say), so a file is
+# compared over the window the cursor used; a file shorter than the window cannot match.
+head_hash() {
+    [ -f "$1" ] || return 0
+    head -c "$2" -- "$1" | sha256sum | cut -d' ' -f1
+}
+
+# The same for the decompressed start of a gzip. Under compress + delaycompress a second rotation
+# leaves the first generation only as `.2.gz`. Only the first bytes are read (head closes the pipe,
+# gzip stops); an absent gzip tool or archive gives nothing.
+gz_head_hash() {
+    [ -f "$1" ] && command -v gzip >/dev/null 2>&1 || return 0
+    gzip -dc -- "$1" 2>/dev/null | head -c "$2" | sha256sum | cut -d' ' -f1
+}
+
+# The hash of nothing. An unreadable archive, or a cursor over an empty file, would equal it, and
+# it identifies no file.
+empty_hash=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 
 usable=0
 for dir in "$intake_dir" "$shipper_dir"; do
@@ -131,9 +133,13 @@ for dir in "$intake_dir" "$shipper_dir"; do
         note "cursor $file is unreadable"
         continue
     fi
-    c_inode="$(printf '%s' "$json" | sed -n 's/.*"inode":\([0-9][0-9]*\).*/\1/p')"
-    c_offset="$(printf '%s' "$json" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p')"
-    c_fp="$(printf '%s' "$json" | sed -n 's/.*"fingerprint":\[\([0-9][0-9,]*\)\].*/\1/p')"
+    # The optional trailing "drained" object repeats the field names of the cursor itself; it is
+    # the last field and holds no nested braces, so dropping it leaves the top-level fields alone.
+    top="$(printf '%s' "$json" | sed 's/,"drained":{[^}]*}//')"
+    c_inode="$(printf '%s' "$top" | sed -n 's/.*"inode":\([0-9][0-9]*\).*/\1/p')"
+    c_offset="$(printf '%s' "$top" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p')"
+    c_fp="$(printf '%s' "$top" | sed -n 's/.*"fingerprint":\[\([0-9][0-9,]*\)\].*/\1/p')"
+    c_len="$(printf '%s' "$top" | sed -n 's/.*"fingerprint_len":\([0-9][0-9]*\).*/\1/p')"
     if [ -z "$c_inode" ] || [ -z "$c_offset" ] || [ -z "$c_fp" ]; then
         note "cursor $file is malformed"
         continue
@@ -144,6 +150,18 @@ for dir in "$intake_dir" "$shipper_dir"; do
     fi
     usable=$((usable + 1))
     c_hash="$(printf '%s' "$c_fp" | tr ',' ' ' | awk '{ for (i = 1; i <= NF; i++) printf "%02x", $i }')"
+    window="${c_len:-256}"
+    copy2_hash=""
+    copy2gz_hash=""
+    copy_hash=""
+    if [ "$window" -gt 0 ]; then
+        copy2_hash="$(head_hash "$copy2" "$window")"
+        copy2gz_hash="$(gz_head_hash "$copy2.gz" "$window")"
+        copy_hash="$(head_hash "$copy" "$window")"
+        [ "$copy2_hash" != "$empty_hash" ] || copy2_hash=""
+        [ "$copy2gz_hash" != "$empty_hash" ] || copy2gz_hash=""
+        [ "$copy_hash" != "$empty_hash" ] || copy_hash=""
+    fi
 
     if [ -n "$copy2_hash" ] && [ "$c_hash" = "$copy2_hash" ]; then
         # A second rotation already pushed the generation the cursor names back to `.2`, and `.1`

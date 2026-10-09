@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Split deployment
@@ -465,8 +465,12 @@ gateway's state directory is not in the archive), steps 3.6 and 3.7, and reset t
   sensor has used its 100 MB budget, its later captures are refused
   ([queue and spool](queue-and-spool.md)). Rebuild the collector periodically, or delete files
   older than your retention window from those directories. The sensor logs rotate by
-  `copytruncate` at 100 MB, and the shipper reads only the live file, so lines it had not sent when
-  a log was rotated, for example during a gateway outage, are never sent.
+  `copytruncate` at 100 MB. The shipper uses the same tailer as intake, so lines it had not sent
+  when a log was rotated, for example during a gateway outage, are read from `events.jsonl.1`
+  before the new file, and the rotation guard skips a log whose `.1` it has not finished (it reads
+  the shipper's cursor under `PROPOLIS_SHIPPER_CURSOR_DIR`). Only a `.1` that is missing,
+  compressed or another generation's loses them, with a journal WARN from the shipper and no
+  alert on a collector, which does not run the ops monitor.
 
 ## Troubleshooting
 

@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Concurrency and failure modes
@@ -122,6 +122,35 @@ Concurrent NDJSON log appends (multiple connections through one `EventEmitter` b
 on a local filesystem, so lines are never interleaved or overwritten. This guarantee
 **does not extend to NFS** (the client kernel simulates `O_APPEND` and can race) - the
 log directory must be local storage.
+
+### Log rotation under a reader that is behind
+
+Logs rotate by `copytruncate`: logrotate copies the log to `events.jsonl.1`, then empties the
+original in place, so the sensor's open descriptor never needs to reopen
+(`deploy/logrotate-sensors.conf`). Two things can lose lines, and they are different in kind.
+
+- **The copy-to-truncate gap.** A line the sensor appends after the copy and before the truncate
+  is in neither file. This is the only loss when the reader is caught up (48 to 570 lines per
+  rotation in the intake soak), it is not bounded by anything the reader does, and it is the
+  accepted trade for a sensor with no rotation code.
+- **The unread part of the old file.** Everything the reader had not read when the log was emptied
+  exists only in `.1`. The tailer reads it from there: on a truncation (the read offset past the
+  new size) or an in-place replacement it opens `<log>.1`, checks that it is the old content (its
+  first 256 bytes hash to the fingerprint stored for the old file, and it is at least as long as
+  the read offset), reads it from the offset to its end through the same drain that follows a
+  rename rotation, then continues the new file from 0 (`crates/log-tailer/src/tailer.rs#LogTailer`).
+  Until that drain ends, the saved cursor stays in the old content, so a restart resumes it and the
+  rotation guard can see `.1` is unread. Before this, a reader that was behind at rotation time
+  restarted at offset 0 of the new file and the rest of the old one was never read: the intake
+  soak lost 71,150, 442,378 and 822,979 telnet lines in three runs with no error.
+
+When `.1` cannot be trusted (it is missing, only `.1.gz` exists, or it is another generation's
+content) it is not read, since reading it would ingest lines the ledger already has. The unread
+bytes are then lost; the tailer logs `a copytruncate rotation discarded input that was never read`
+with the path, offset and an estimate, and the `intake-rotation-loss` alert pages
+([health and observability](../operations/health-and-observability.md)). The guard that runs
+before each rotation keeps this from happening in normal operation
+([retention](../operations/retention.md#rotation-while-intake-is-behind)).
 
 ## Failure modes and posture
 

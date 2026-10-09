@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Queue and spool
@@ -98,13 +98,19 @@ and restart that sensor; zero or a non-number refuses to start
 A backlog that already exists does not shrink by itself; draining or archiving it is a separate
 step ([intake backlog](intake-backlog.md#recovering-a-backlog-too-large-to-drain)).
 
-## Log rotation can lose a small window of events
+## Log rotation can lose the events written between the copy and the truncate
 
 Sensor event logs (`events.jsonl`) rotate via logrotate with `copytruncate`
 (`deploy/logrotate-sensors.conf`). `copytruncate` was chosen so the sensor's
-append-only file descriptor keeps writing without a reopen, at the cost of a
-small copy-to-truncate window in which events can be lost - a documented
-trade-off, not a fault. Rotation is `size 100M`, `rotate 5`, size-based (not
+append-only file descriptor keeps writing without a reopen, at the cost of the
+lines written after logrotate copies the file and before it truncates it: they
+are in neither the rotated copy nor the new file. That is a documented
+trade-off, not a fault, and it is all a rotation costs while intake is caught
+up. Input intake had not yet read is not part of that window: the tailer reads
+it from `events.jsonl.1`
+([concurrency and failure](../architecture/concurrency-and-failure.md#log-rotation-under-a-reader-that-is-behind)).
+An `intake-rotation-loss` page means that recovery failed for a log.
+Rotation is `size 100M`, `rotate 5`, size-based (not
 calendar) specifically to bound a flood-driven disk-fill. If logs are rotating
 constantly, the box is under sustained flood; that is the signal, not the log
 config.

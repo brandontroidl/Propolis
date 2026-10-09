@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # A sensor shows its last event days ago
@@ -113,30 +113,31 @@ That cuts the rate a loop writes; it does not drain a backlog that already exist
 ## Recovering a backlog too large to drain
 
 If intake cannot catch up in a time you can accept, archive the backlog and truncate the log so
-intake starts over at its end. Forcing the shipped rotation policy does exactly that:
+intake starts over at its end, by hand: archive it with `gzip`, check the archive, then
+`truncate -s 0` the log
+([retention](../operations/retention.md#a-log-too-large-to-rotate) has the commands).
 
-```
-sudo logrotate --force /etc/logrotate.d/propolis-sensors
-```
+Forcing the shipped rotation policy (`logrotate --force`) no longer does this. Rotation moves the
+unread part into `events.jsonl.1`, which the tailer reads before the new file, so nothing is
+dropped and the lag does not fall; and the rotation guard skips a log whose reader is far behind
+(`deploy/logrotate-guard.sh`, [retention](../operations/retention.md#rotation-while-intake-is-behind)),
+even under `--force`, because `--force` runs the same `prerotate` hook.
 
-The policy uses `copytruncate` (`deploy/logrotate-sensors.conf`): logrotate copies the log to
-`events.jsonl.1` beside it (compressed at the next rotation) and truncates the original in
-place. The tailer sees its offset past the end of the file and resumes from the start of the
-now-empty file (`crates/log-tailer/src/cursor.rs#detect_rotation`), so lag falls to zero within a
-poll and the badge, the metrics and the alert clear.
-
-What this costs, stated plainly:
+What discarding costs, stated plainly:
 
 - **The unread lines never reach the ledger.** They are in the archive only, unscored and absent
   from every console view, the feed and vendor reports. Keep the archive.
 - The archive also holds every line intake had already ingested from that file, so it is not
   the backlog alone.
+- The tailer logs the discard and `intake-rotation-loss` pages for an hour; here that is the
+  record of your decision.
 - There is no re-import tool `[planned]`.
 
-The same happens without anyone asking: a scheduled `copytruncate` rotation of a log intake is
-behind on drops the unread part from ingest in the same way, and the lag metrics then read
-small again because the new file is short. A badge or page that clears right after a rotation,
-on a sensor that had been behind, is that.
+A scheduled rotation of a log intake is behind on does not do this: the lag metrics keep counting
+the unread part (now in `.1`) until it is read. A badge or page that clears right after a
+rotation, on a sensor that had been behind, means the unread part was lost: look for the
+`intake-rotation-loss` page or the WARN `a copytruncate rotation discarded input that was never
+read`.
 
 ## See also
 

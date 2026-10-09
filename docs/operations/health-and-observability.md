@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Health and observability
@@ -250,6 +250,19 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
   the monitor's stale-probe warning raises it after half an hour. A run that the free-space guard
   refuses still rewrites the file, so that case surfaces as `sensor-log-oversized` and a failed
   unit, not as this alert. The thresholds of both are fixed, not `PROPOLIS_OPS_*` variables;
+- a rotation that took unread input (`intake-rotation-loss`, Warning;
+  `crates/propolis/src/ops_alert/conditions/intake.rs#IntakeRotationLoss`). When a `copytruncate`
+  rotation lands while a log is unread, the tailer reads the rest from `<log>.1`
+  ([concurrency and failure](../architecture/concurrency-and-failure.md#log-rotation-under-a-reader-that-is-behind)).
+  This pages, immediately, when it could not: `.1` was missing, only `.1.gz` existed, or `.1` was
+  not the old content, so the unread lines are gone. The page names each log with the number of
+  such rotations and a lower bound on the bytes lost (`at least 0 bytes` when the tailer had not
+  yet polled the old content, as after a restart). It holds for one hour after the last loss and
+  then recovers by itself, since a loss does not clear; the journal WARN `a copytruncate rotation
+  discarded input that was never read` is the permanent record, and the counts reset when the
+  daemon restarts. A rotation that finds the reader caught up and no `.1` is silent: the lines
+  written between the copy and the truncate are the accepted loss. A truncation you made by hand
+  while intake was behind also raises it. The hold is fixed, not a `PROPOLIS_OPS_*` variable;
 - vendor submission failure rate over `VENDOR_FAIL_PCT` (50%) within `VENDOR_WINDOW_SECS`
   (3600 s), gated by `VENDOR_MIN_SAMPLES` (20);
 - review backlog over `BACKLOG_MAX` (500) held for `BACKLOG_FOR_SECS` (900 s);

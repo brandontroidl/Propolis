@@ -4679,8 +4679,11 @@ async fn metrics_publish_the_intake_backlog_the_daemon_reports(pool: PgPool) {
             .unwrap(),
     )
     .await;
+    // The quarantine counter is a process total that reads 0 honestly, so it is published
+    // regardless; only the per-log backlog gauges must be absent when nothing is measured.
     assert!(
-        !standalone.contains("propolis_intake_"),
+        !standalone.contains("propolis_intake_bytes_behind")
+            && !standalone.contains("propolis_intake_oldest_unread_age_seconds"),
         "nothing measured must mean no series: {standalone}"
     );
 }

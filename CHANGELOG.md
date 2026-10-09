@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added
+
+- **Telnet closes the door on a source whose infection finished** - Mirai-family loaders repeat
+  the identical infection every 60-90 s for as long as the target answers (one source: 14
+  identical sessions, 252 events in 22 minutes), because a real device's bot replaces telnetd and
+  the port closes. When a telnet session ends having run a file it fetched (`wget`, `curl`,
+  `tftp`, `ftpget`) or assembled from typed bytes natively, the sensor resets new connections
+  from that source (an IPv4 address or an IPv6 /64) for `PROPOLIS_TELNET_INFECTED_HOLD_SECS`
+  (default 21600; `0` turns it off; malformed or above 604800 refuses to start). A build for
+  another CPU (Exec format error), a download never run and an assembled downloader that cannot
+  reach its server do not count, so a per-architecture loop is held only once its native build
+  runs. The first session is recorded as before; refusals are counted per source and summarized
+  in one journal line a minute. The table holds 4096 sources and a restart clears it. The
+  handshake still completes before the reset (a closed port answers the SYN with an RST).
+  `FakeShell::infection_completed` exposes the signal to any sensor.
+
 ### Changed
 
 - **The review queue reads at a glance** - fifty-six pending rows had become a wall: a notes

@@ -879,6 +879,7 @@ sensor's `main.rs`:
 | `PROPOLIS_FTP_CAPTURE_MEMORY_BYTES` | no | `107374182` (40% of `MemoryMax=256M`, `sensor-framework/src/capture_budget.rs#DEFAULT_CAPTURE_BUDGET_BYTES_256M`) | positive u64 bytes; zero or unparseable aborts startup |
 | `PROPOLIS_ADB_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
 | `PROPOLIS_TELNET_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_TELNET_INFECTED_HOLD_SECS` | no | `21600` (`sensor-telnet/src/infected_hold.rs#DEFAULT_HOLD_SECS`) | whole seconds, `0` to `604800`; `0` turns the infected-source hold off (the startup log says so); anything else aborts startup. See [sensor-behavior](sensor-behavior.md#sensor-telnet) |
 | `PROPOLIS_TFTP_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
 | `PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
 

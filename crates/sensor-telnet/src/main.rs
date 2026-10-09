@@ -19,6 +19,7 @@ use sensor_framework::{
     ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EnvError, EventEmitter,
     SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal, strict_env_var,
 };
+use sensor_telnet::infected_hold::{HoldConfigError, InfectedHold, parse_hold_secs};
 
 const ENV_BIND: &str = "PROPOLIS_TELNET_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_TELNET_WAN_MAP";
@@ -42,6 +43,9 @@ const ENV_OUTBOX_DIR: &str = "PROPOLIS_TELNET_OUTBOX_DIR";
 /// Ceiling, in bytes, on capture bodies buffered in memory across every connection. Defaults to
 /// 40% of the unit's 256M `MemoryMax` (see `deploy/sensor-telnet.service`).
 const ENV_CAPTURE_MEMORY_BYTES: &str = "PROPOLIS_TELNET_CAPTURE_MEMORY_BYTES";
+/// Seconds a source whose infection finished is refused; `0` turns the refusal off. See
+/// [`sensor_telnet::infected_hold`].
+const ENV_INFECTED_HOLD_SECS: &str = "PROPOLIS_TELNET_INFECTED_HOLD_SECS";
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/telnet/events.jsonl";
 const DEFAULT_SPOOL_DIR: &str = "/var/spool/propolis/telnet";
@@ -63,6 +67,7 @@ struct Config {
     outbox_dir: PathBuf,
     capture_memory_bytes: u64,
     command_events: CommandEventConfig,
+    infected_hold_secs: u64,
 }
 
 /// The sensor name in `PROPOLIS_TELNET_COMMAND_EVENT_RATE_PER_MIN` and `..._BURST`.
@@ -86,6 +91,14 @@ enum ConfigError {
     Env(EnvError),
     /// The command-event rate or burst was zero or not a positive integer.
     CommandEvents(CommandEventConfigError),
+    /// The infected-source hold was not a whole number of seconds within its bound.
+    InfectedHold(HoldConfigError),
+}
+
+impl From<HoldConfigError> for ConfigError {
+    fn from(e: HoldConfigError) -> Self {
+        ConfigError::InfectedHold(e)
+    }
 }
 
 impl From<EnvError> for ConfigError {
@@ -105,6 +118,7 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::Env(e) => write!(f, "{e}"),
             ConfigError::CommandEvents(e) => write!(f, "{e}"),
+            ConfigError::InfectedHold(e) => write!(f, "{e}"),
             ConfigError::NoBind => {
                 write!(f, "{ENV_BIND} must be set to a single ip:port bind address")
             }
@@ -254,6 +268,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     )?;
 
     let command_events = CommandEventConfig::from_env(COMMAND_EVENT_SENSOR)?;
+    let infected_hold_secs = parse_hold_secs(strict_env_var(ENV_INFECTED_HOLD_SECS)?.as_deref())?;
 
     Ok(Config {
         bind_addr,
@@ -264,6 +279,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         outbox_dir,
         capture_memory_bytes,
         command_events,
+        infected_hold_secs,
         bounds: ConnectionBounds {
             read_timeout: Duration::from_millis(read_timeout_ms),
             idle_timeout: Duration::from_millis(idle_timeout_ms),
@@ -289,6 +305,17 @@ async fn main() {
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
     let command_events = Arc::new(CommandEventGate::new(config.command_events));
     let summary_emitter = EventEmitter::new(config.log_path.clone());
+    let infected_hold = Arc::new(InfectedHold::new(config.infected_hold_secs));
+    match infected_hold.hold() {
+        Some(hold) => tracing::info!(
+            hold_secs = hold.as_secs(),
+            "sensor-telnet: sources whose infection finishes are refused for the hold"
+        ),
+        None => tracing::info!(
+            "sensor-telnet: infected-source hold disabled ({ENV_INFECTED_HOLD_SECS}=0); \
+             every source is served for as many sessions as it opens"
+        ),
+    }
 
     let (bound, handle, handoff) = match sensor_telnet::start_test_server_with_handoff(
         config.bind_addr,
@@ -300,6 +327,7 @@ async fn main() {
         config.outbox_dir,
         Arc::new(CaptureMemoryBudget::new(config.capture_memory_bytes)),
         command_events.clone(),
+        infected_hold,
     )
     .await
     {

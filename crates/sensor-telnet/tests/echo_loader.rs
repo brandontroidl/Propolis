@@ -353,6 +353,7 @@ async fn a_looping_loader_past_its_command_budget_is_summarized_not_silenced() {
         dir.path().join("outbox"),
         Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES_256M)),
         gate.clone(),
+        Arc::new(sensor_telnet::infected_hold::InfectedHold::disabled()),
     )
     .await
     .unwrap();

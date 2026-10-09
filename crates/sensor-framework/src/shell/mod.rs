@@ -419,6 +419,9 @@ pub struct FakeShell {
     origins: std::collections::BTreeMap<String, arch::Origin>,
     /// The origin of the one file `cat` just read, for the redirection that writes its output.
     cat_origin: Option<arch::Origin>,
+    /// A file the session fetched or assembled was run and started (status 0): the loader's
+    /// infection finished, as far as this host can tell. Sticky for the session.
+    infection_completed: bool,
     /// The command running right now wrote bytes the attacker typed (`echo`, `printf`).
     typed_output: bool,
     /// The standard input of the command running right now is the typed output of the pipeline
@@ -631,6 +634,7 @@ impl FakeShell {
             assembled: std::collections::BTreeMap::new(),
             origins: std::collections::BTreeMap::new(),
             cat_origin: None,
+            infection_completed: false,
             typed_output: false,
             piped_typed: false,
             decoded: None,
@@ -697,6 +701,7 @@ impl FakeShell {
                 assembled: self.assembled.clone(),
                 origins: self.origins.clone(),
                 cat_origin: self.cat_origin.clone(),
+                infection_completed: self.infection_completed,
                 typed_output: self.typed_output,
                 piped_typed: self.piped_typed,
                 decoded: self.decoded.clone(),
@@ -717,6 +722,15 @@ impl FakeShell {
         self.fs.rollback(fs);
         std::mem::swap(&mut shell.fs, &mut self.fs);
         *self = *shell;
+    }
+
+    /// Whether a file this session fetched (`wget`, `curl`, `tftp`, `ftpget`) or assembled from
+    /// typed bytes (`echo`, `cat`) has been run and started natively. A build for another CPU is
+    /// refused with Exec format error and does not count, so a per-architecture loop is not
+    /// complete until its native build runs. Read by a sensor that closes its door behind a
+    /// finished infection, as a real device does when the bot replaces its telnet daemon.
+    pub fn infection_completed(&self) -> bool {
+        self.infection_completed
     }
 
     /// What the engine decided while running the most recent non-blank input line. For tests and
@@ -1605,7 +1619,14 @@ impl FakeShell {
                 // A downloader that cannot reach its server: see `loader_exec`.
                 return CommandResult::silent(1);
             }
-            self.run_saved_executable(parts, &path)
+            // Fetched or assembled by this session, and started: a loader's last step. A refused
+            // foreign build and an assembled downloader that cannot reach its server returned above.
+            let from_session = self.origin_of(&path).is_some() || self.assembled_program(&path);
+            let result = self.run_saved_executable(parts, &path);
+            if from_session && result.status == 0 {
+                self.infection_completed = true;
+            }
+            result
         } else if self.fs.file_exists(&path) {
             CommandResult::stderr(
                 126,

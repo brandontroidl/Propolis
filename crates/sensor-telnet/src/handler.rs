@@ -26,6 +26,7 @@ use sensor_wire::{
     SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
 };
 
+use crate::infected_hold::InfectedHold;
 use crate::telnet::{IacFilter, negotiation_preamble};
 
 /// This sensor's identity on both the wire `sensor` field and every event's
@@ -72,6 +73,7 @@ pub async fn handle_connection<S>(
     bounds: ConnectionBounds,
     handoff: Arc<CaptureHandoff>,
     command_events: Arc<CommandEventGate>,
+    infected_hold: Arc<InfectedHold>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -199,6 +201,7 @@ pub async fn handle_connection<S>(
     let max_stdin_bytes = reader.bounds.max_captured_bytes;
     // A file the shell sees assembled from typed `echo` chunks is captured through the same set.
     let mut shell = shell.with_captures(stdin_captures.clone());
+    let mut hold_on_end = HoldOnEnd::new(infected_hold, source_ip);
 
     loop {
         let Some(line) = reader.read_line(&mut stream, true).await else {
@@ -237,6 +240,7 @@ pub async fn handle_connection<S>(
                 }
             }
         };
+        hold_on_end.note(&shell);
         let close_session = output.close_session;
 
         if close_session {
@@ -265,6 +269,8 @@ pub async fn handle_connection<S>(
             break;
         }
     }
+    // A line cut short by the session's end may still have finished the infection.
+    hold_on_end.note(&shell);
     // A file assembled and never run is captured as the session leaves it, ended this way.
     stdin_captures.end_session(reader.session_end);
 
@@ -274,6 +280,37 @@ pub async fn handle_connection<S>(
     // "complete" for all of them alike. The capture itself is submitted by `LineReader`'s `Drop`
     // (see `arm_capture_submit`), the only code that also runs when the listener cancels this
     // future at `max_duration`.
+}
+
+/// Holds the session's source at the session's end when a file the session fetched or assembled
+/// ran natively. Done from `Drop` for the reason the capture is: the listener cancels the
+/// handler at `max_duration`, and a loader that finishes and then idles is that session.
+struct HoldOnEnd {
+    hold: Arc<InfectedHold>,
+    source_ip: IpAddr,
+    completed: bool,
+}
+
+impl HoldOnEnd {
+    fn new(hold: Arc<InfectedHold>, source_ip: IpAddr) -> Self {
+        Self {
+            hold,
+            source_ip,
+            completed: false,
+        }
+    }
+
+    fn note(&mut self, shell: &FakeShell) {
+        self.completed |= shell.infection_completed();
+    }
+}
+
+impl Drop for HoldOnEnd {
+    fn drop(&mut self) {
+        if self.completed {
+            self.hold.mark(self.source_ip);
+        }
+    }
 }
 
 /// Encode application data in the one order a Telnet client observes it: terminal newlines,

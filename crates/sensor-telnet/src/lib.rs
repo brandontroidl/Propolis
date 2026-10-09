@@ -5,18 +5,31 @@
 //! suite exercises exactly the capture logic the binary runs in production.
 
 pub mod handler;
+pub mod infected_hold;
 pub mod telnet;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{
     Arrival, CaptureHandoff, CaptureMemoryBudget, CommandEventConfig, CommandEventGate,
     ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EventEmitter, OutboxManifest,
     QuarantineSpool, WanResolver, command_flood, run_tcp_listener,
 };
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+
+use infected_hold::InfectedHold;
+
+/// Close `stream` so the peer sees a reset: `SO_LINGER` of zero makes the close send an RST
+/// instead of a FIN, as a closed port's answer does.
+fn reset(stream: TcpStream) {
+    // A socket that already failed has nothing left to reset.
+    let _ = stream.set_zero_linger();
+    drop(stream);
+}
 
 /// Start the Telnet honeypot server on `addr` (use `:0` for an ephemeral port - every test in
 /// `tests/integration.rs` relies on this), appending events to `log_path`. `spool_dir` is the
@@ -45,6 +58,7 @@ pub async fn start_test_server(
         outbox_dir,
         Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES_256M)),
         Arc::new(CommandEventGate::new(CommandEventConfig::default())),
+        Arc::new(InfectedHold::disabled()),
     )
     .await?;
     Ok((bound, handle))
@@ -55,6 +69,8 @@ pub async fn start_test_server(
 /// per-source command-event budget, which `main` flushes on shutdown. A separate function rather
 /// than a wider return type so the many callers that never shut down (every integration test) are
 /// unchanged. The returned handle stops the listener and the command-summary writer together.
+/// `infected_hold` refuses the sources whose infection a session finished (see `infected_hold`);
+/// `start_test_server` passes a disabled one so a test may open as many sessions as it likes.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_test_server_with_handoff(
     addr: SocketAddr,
@@ -66,10 +82,12 @@ pub async fn start_test_server_with_handoff(
     outbox_dir: PathBuf,
     capture_budget: Arc<CaptureMemoryBudget>,
     command_events: Arc<CommandEventGate>,
+    infected_hold: Arc<InfectedHold>,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>, Arc<CaptureHandoff>)> {
     let emitter = Arc::new(EventEmitter::new(log_path.clone()));
     let summary_emitter = emitter.clone();
     let summary_gate = command_events.clone();
+    let hold_for_sessions = infected_hold.clone();
 
     // Ensure the spool directory exists.
     std::fs::create_dir_all(&spool_dir)?;
@@ -103,7 +121,14 @@ pub async fn start_test_server_with_handoff(
             let wan_resolver = wan_resolver.clone();
             let bounds = bounds.clone();
             let command_events = command_events.clone();
+            let infected_hold = hold_for_sessions.clone();
             async move {
+                // Before anything is written or logged: a held source sees a closed door, not a
+                // login prompt, and the refusal is counted by the hold.
+                if infected_hold.refuses(normalize_dual_stack(peer).ip()) {
+                    reset(stream);
+                    return;
+                }
                 handler::handle_connection(
                     stream,
                     peer,
@@ -114,6 +139,7 @@ pub async fn start_test_server_with_handoff(
                     bounds,
                     handoff,
                     command_events,
+                    infected_hold,
                 )
                 .await;
             }
@@ -121,9 +147,11 @@ pub async fn start_test_server_with_handoff(
     )
     .await?;
     let writer = summary_gate.spawn_writer(summary_emitter, Arrival::new(bound.port()));
+    let refusal_writer =
+        infected_hold::spawn_summary_writer(infected_hold, infected_hold::SUMMARY_INTERVAL);
     Ok((
         bound,
-        command_flood::with_writer(handle, writer),
+        command_flood::with_writer(command_flood::with_writer(handle, writer), refusal_writer),
         drain_handle,
     ))
 }

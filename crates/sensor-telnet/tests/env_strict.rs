@@ -21,6 +21,7 @@ const VARS: &[&str] = &[
     "PROPOLIS_TELNET_CAPTURE_MEMORY_BYTES",
     "PROPOLIS_TELNET_COMMAND_EVENT_RATE_PER_MIN",
     "PROPOLIS_TELNET_COMMAND_EVENT_BURST",
+    "PROPOLIS_TELNET_INFECTED_HOLD_SECS",
     "PROPOLIS_COLLECTOR_ID",
     "COLLECTOR_ID",
 ];
@@ -88,6 +89,41 @@ fn a_zero_or_garbage_command_event_budget_exits_1_before_any_listener_binds() {
             );
         }
     }
+}
+
+#[test]
+fn a_malformed_or_oversized_infected_hold_exits_1_before_any_listener_binds() {
+    let var = "PROPOLIS_TELNET_INFECTED_HOLD_SECS";
+    // A blank value is unset for every sensor variable (`strict_env_var`), so it is not here.
+    for bad in ["-1", "6h", "1.5", "604801"] {
+        let (code, text) = run(Some((var, bad.as_bytes())), Duration::from_secs(10));
+        assert_eq!(code, Some(1), "{var}={bad:?}: {text}");
+        assert!(
+            text.contains(var) && text.contains("0 disables the hold"),
+            "{var}={bad:?}: {text}"
+        );
+        assert!(
+            !text.contains("listening"),
+            "{var}={bad:?}: bound first: {text}"
+        );
+    }
+}
+
+#[test]
+fn a_zero_infected_hold_starts_and_says_the_feature_is_off() {
+    let (code, text) = run(
+        Some(("PROPOLIS_TELNET_INFECTED_HOLD_SECS", b"0")),
+        Duration::from_millis(1500),
+    );
+    assert_eq!(code, None, "zero is a valid setting: {text}");
+    assert!(text.contains("infected-source hold disabled"), "{text}");
+}
+
+#[test]
+fn the_default_infected_hold_is_six_hours_and_the_startup_log_says_so() {
+    let (code, text) = run(None, Duration::from_millis(1500));
+    assert_eq!(code, None, "{text}");
+    assert!(text.contains("hold_secs=21600"), "{text}");
 }
 
 #[test]

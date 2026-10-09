@@ -305,6 +305,12 @@ fn signing_certs(text: &str, out: &mut Collector) {
     }
 }
 
+/// The `detail` of a `url` indicator that is a CoinHive-family miner script, and the `value` of the
+/// `credentials` indicator that says a miner is configured. `attack` tags resource hijacking from
+/// exactly these two, so they are named once here.
+pub const MINER_SCRIPT_DETAIL: &str = "CoinHive miner script";
+pub const MINER_SITE_KEY: &str = "CoinHive site key";
+
 /// Hosts that served CoinHive's browser miner and its opt-in variant.
 const MINER_HOSTS: [&str; 3] = ["coinhive.com", "coin-hive.com", "authedmine.com"];
 
@@ -339,17 +345,13 @@ fn miner(text: &str, out: &mut Collector) {
                 .iter()
                 .find(|p| lower[..host_start].ends_with(**p))
                 .map_or(host_start, |p| host_start - p.len());
-            out.push(IocKind::Url, &text[start..end], "CoinHive miner script");
+            out.push(IocKind::Url, &text[start..end], MINER_SCRIPT_DETAIL);
         }
     }
     for call in ["CoinHive.Anonymous", "CoinHive.User"] {
         for (at, _) in text.match_indices(call) {
             if text[at + call.len()..].trim_start().starts_with('(') {
-                out.push(
-                    IocKind::Credentials,
-                    "CoinHive site key",
-                    CREDENTIALS_DETAIL,
-                );
+                out.push(IocKind::Credentials, MINER_SITE_KEY, CREDENTIALS_DETAIL);
             }
         }
     }

@@ -4,6 +4,22 @@
 
 ### Added
 
+- **ATT&CK technique tags on sessions, sources and campaigns** - deterministic rules over exact
+  evidence, no model: a shell line is parsed into commands and a rule reads a command's name,
+  operands and redirection targets, so `echo crontab` and a URL containing `cron` are not tagged.
+  Eighteen rules cover brute force (the `ssh_brute_force` signal), ingress tool transfer (downloads,
+  `wget`/`curl`/`tftp`/`ftpget`, uploads), Unix shell, cron, systemd units, rc scripts, authorized
+  keys, system, file and process discovery, permission changes, file deletion, miner indicators
+  and impaired defenses. Each tag keeps its rule, the event and the matched token. Checked against
+  ATT&CK Enterprise v19.2, which moved Impair Defenses: security-tool kills are T1685 and firewall
+  flushes T1686. T1078 and T1110.001 are not tagged (the honeypot accepts every credential and
+  stores no password). Migration `0017` adds `attack_tag`, `campaign_attack_tag` and
+  `campaign_session.attack_pending`; a command-sequence campaign carries the union of its runs'
+  tags. Read through `review::attack::{campaign_tags, source_tags, session_tags}`; the console
+  does not show them yet. No backfill: events indexed before the migration are tagged by the full
+  rebuild. Not published to the feed or to vendors.
+  See [ATT&CK tagging](docs/reference/attack-tagging.md).
+
 - **Miner and test-key indicators from captured artifacts** - found in a mobile dropper
   analysed 2026-10-08. A script URL on `coinhive.com`, `coin-hive.com` or `authedmine.com`
   (under `/lib/`) is a URL indicator labeled `CoinHive miner script`; a `CoinHive.Anonymous(` or

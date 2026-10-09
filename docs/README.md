@@ -46,6 +46,7 @@ for everything else.
   [filesystem paths](reference/filesystem-paths.md),
   [database](reference/database.md),
   [events and signals](reference/events-and-signals.md),
+  [ATT&CK tagging](reference/attack-tagging.md),
   [sensor behavior](reference/sensor-behavior.md),
   [console routes](reference/console-routes.md),
   [scoring and feed](reference/scoring-and-feed.md),

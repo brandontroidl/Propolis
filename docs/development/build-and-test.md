@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Build and test
@@ -39,6 +39,7 @@ way, a cheap failure cannot hide an expensive one.
 | **tests** | `cargo test --workspace --locked -- --test-threads=1` (under `set -o pipefail`) | yes |
 | **release build** | `cargo build --release --workspace --locked` | no |
 | **dependency policy** | `cargo deny check --all-features` against `deny.toml` (see [supply chain](../security/supply-chain.md#dependency-policy-denytoml)) | no |
+| **shellcheck** | `shellcheck -x deploy/*.sh scripts/**/*.sh`, the `koalaman/shellcheck` v0.11.0 image pinned by digest | no |
 
 The release job compiles the profile `deploy/upgrade.sh` ships. The other three
 compile the dev profile, so a release-only break (the vendored-crate checksum
@@ -86,7 +87,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 3736 test functions** (2357 unit + 1379 integration).
+- **Total: 3751 test functions** (2372 unit + 1379 integration).
 - **DB-backed (`sqlx::test`): 283** - console 194, core-scoring 44, review 19,
   intake 13, propolis 7, fleet 6. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -127,7 +128,7 @@ Per-crate breakdown:
 | log-tailer | 3 | 54 | cursor_test, cursorless_test, tailer_test |
 | propolis | 133 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
-| review | 147 | 90 | campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
+| review | 162 | 90 | campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
 | sensor-adb | 61 | 44 | arrival, env_strict, integration |
 | sensor-catchall | 18 | 9 | arrival, env_strict, integration |
 | sensor-cred | 32 | 40 | arrival, env_strict, integration, tls_integration |
@@ -144,7 +145,7 @@ Per-crate breakdown:
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2357** | **1379** | |
+| **Total** | **2372** | **1379** | |
 
 ### Test styles by layer
 

@@ -461,6 +461,7 @@ listen_probe() {
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         state="" rq="" sq="" laddr="" peer="" rest=""
+        # shellcheck disable=SC2034 # rq, sq and peer only keep the ss columns aligned so laddr lands in the right field
         read -r state rq sq laddr peer rest <<<"$line" || true
         case "$laddr" in *:*) ;; *) continue ;; esac
         if [ "${laddr##*:}" != "$port" ]; then
@@ -935,7 +936,10 @@ ledger_psql() {
         esac
     done
     (
-        export PGUSER="$(pg_urldecode "$user")" PGPASSWORD="$(pg_urldecode "$pass")" PGDATABASE="$(pg_urldecode "$db")"
+        PGUSER="$(pg_urldecode "$user")"
+        PGPASSWORD="$(pg_urldecode "$pass")"
+        PGDATABASE="$(pg_urldecode "$db")"
+        export PGUSER PGPASSWORD PGDATABASE
         export PGHOST="$host" PGCONNECT_TIMEOUT=5 PGAPPNAME=propolis-config-check
         export PGOPTIONS='-c statement_timeout=3000 -c default_transaction_read_only=on'
         if [ -n "$port" ]; then export PGPORT="$port"; fi
@@ -1259,7 +1263,7 @@ check_listener() {
 # ---- host-wide checks ----------------------------------------------------------------------
 
 check_rotation() {
-    local e a st mtime age parts=() worst=ok
+    local e a mtime age parts=() worst=ok
     if [ "$SYSTEMCTL" -eq 1 ]; then
         e="$(sysq is-enabled propolis-logrotate.timer)"
         a="$(sysq is-active propolis-logrotate.timer)"
@@ -1760,7 +1764,7 @@ emit_text() {
             vals=("${R_SENSOR[$i]}/${R_PROTO[$i]}" "${R_ADDR[$i]}" "$(cell_text "$i" unit)" "$(cell_text "$i" listen)" \
                 "$(cell_text "$i" firewall)" "$(cell_text "$i" log)" "$(cell_text "$i" intake)" "$(cell_text "$i" events)")
             for ((w = 0; w < 8; w++)); do
-                if [ "${#vals[$w]}" -gt "${widths[$w]}" ]; then widths[$w]="${#vals[$w]}"; fi
+                if [ "${#vals[w]}" -gt "${widths[w]}" ]; then widths[w]="${#vals[w]}"; fi
             done
         done
         printf "%-${widths[0]}s  %-${widths[1]}s  %-${widths[2]}s  %-${widths[3]}s  %-${widths[4]}s  %-${widths[5]}s  %-${widths[6]}s  %-${widths[7]}s  %s\n" \

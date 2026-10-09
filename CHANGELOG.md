@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- **Miner and test-key indicators from captured artifacts** - found in a mobile dropper
+  analysed 2026-10-08. A script URL on `coinhive.com`, `coin-hive.com` or `authedmine.com`
+  (under `/lib/`) is a URL indicator labeled `CoinHive miner script`; a `CoinHive.Anonymous(` or
+  `CoinHive.User(` call is an embedded-credentials flag `CoinHive site key`, never the key
+  itself; and a zip carrying the public AOSP test key certificate (SHA-256 `A4:0D:A8:0A...:F5:DC`)
+  is an RSA-key indicator naming it. The certificate is seen when it is stored uncompressed, as
+  in the APK Signing Block of v2 and later; a deflated `META-INF/*.RSA` of a v1-only APK is not.
+  No schema change: the three reuse existing indicator kinds.
+- **CI lints the shell scripts** - a `shellcheck` job (the v0.11.0 image, pinned by digest) runs
+  over `deploy/*.sh` and `scripts/**/*.sh`. Its nine findings in `deploy/config-check.sh` and
+  `deploy/logrotate-guard.sh` are fixed or annotated in place with the reason.
+
 ### Changed
 
 - **Campaigns and Samples say what the bots are doing and what they dropped** - the Campaigns list
@@ -33,6 +47,13 @@
 
 ### Fixed
 
+- **The fetcher never dials a public DNS resolver** - observed 2026-10-08: a telnet bot tested
+  wget, curl, tftp and ftpget against `http://1.1.1.1/wget.sh` and its siblings, and the fetcher
+  followed the URLs to Cloudflare. The never-dial check now also refuses the published addresses
+  of Cloudflare, Google Public DNS, Quad9 and OpenDNS, IPv4 and IPv6 (sixteen in all), including
+  their IPv4-mapped, NAT64 and 6to4 forms and any hostname that resolves to one. The attempt is
+  recorded as `rejected` with the reason `Forbidden(PublicResolver)`, which the IP page already
+  shows beside the status.
 - **Command-sequence campaigns are one per tool, not one per session length** - observed on the
   live console 2026-10-08: 947 campaigns, most of them fragments of a few bots. The fingerprint
   keyed on the whole normalized session, so one Mirai-family loader was about 40 campaigns

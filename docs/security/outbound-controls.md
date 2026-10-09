@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-09-28
+last-verified: 2026-10-08
 -->
 
 # Outbound controls
@@ -194,6 +194,12 @@ own-host and reserved destinations before any connection:
   [scoring and feed](../reference/scoring-and-feed.md)). `in_extra_egress_deny`
   repeats `0.0.0.0/8`, CGNAT `100.64/10` and `::` so the never-dial set cannot
   shrink if the shared never-publish list is ever narrowed.
+- **Public DNS resolvers** (`PUBLIC_RESOLVERS`, reason `PublicResolver`) - the
+  published addresses of Cloudflare, Google Public DNS, Quad9 and OpenDNS, v4 and
+  v6. Bots probe wget/curl/tftp against dummy URLs on them; there is nothing to
+  collect and a fetch is only traffic to a third party. Matched after
+  canonicalization, so mapped, NAT64 and 6to4 forms and rebinding hostnames are
+  caught; the attempt is recorded `rejected` with this reason.
 - **IPv6 canonicalization first** (`canonicalize`) - v4-mapped `::ffff:`, NAT64
   `64:ff9b::/96`, 6to4 `2002::/16`, Teredo/`2001::/32`, and deprecated v4-compat
   forms are folded or rejected so a mapped-loopback cannot slip past the base

@@ -2027,10 +2027,11 @@ mod own_ips_public_address_tests {
     #[test]
     fn a_single_public_address_clears_the_warning() {
         // One real public address (e.g. from PROPOLIS_FETCH_OWN_IPS) alongside the usual
-        // loopback/private noise is enough - the node has a public address covered. 8.8.8.8 is
-        // the same canonical "definitely public" fixture `guard.rs`'s own tests use (not
-        // 203.0.113.x - RFC5737 documentation space is itself in the reserved ranges).
-        let own_ips: HashSet<IpAddr> = [ip("127.0.0.1"), ip("10.20.30.109"), ip("8.8.8.8")]
+        // loopback/private noise is enough - the node has a public address covered. 93.184.216.34
+        // is the same "definitely public" fixture `guard.rs`'s own tests use (not 203.0.113.x -
+        // RFC5737 documentation space is itself in the reserved ranges - and not a public DNS
+        // resolver, which the fetcher also refuses to dial).
+        let own_ips: HashSet<IpAddr> = [ip("127.0.0.1"), ip("10.20.30.109"), ip("93.184.216.34")]
             .into_iter()
             .collect();
         assert!(

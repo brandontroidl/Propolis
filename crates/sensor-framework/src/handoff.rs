@@ -39,15 +39,20 @@
 //! isolating a panic does not reintroduce concurrent `store` calls and undo the previous
 //! paragraph's guarantee.
 //!
-//! **Shutdown drains the queue, bounded by a deadline.** `start_worker` keeps the worker's
-//! `JoinHandle` inside the `CaptureHandoff`, and `drain` is the one call a sensor's `main` makes on
-//! SIGTERM: it stops `submit` from enqueuing, tells the worker to close the channel and finish what
-//! is already buffered, and waits for it up to a timeout so a wedged spool cannot hold the process
-//! past the service manager's stop timeout. Without it the runtime teardown killed the detached
-//! worker with accepted captures still queued. This drains the QUEUE only: a connection task that
-//! the runtime cancels at teardown never runs its Drop-time `submit`, so a capture still being
-//! assembled on a live connection at SIGTERM is lost (a documented residual; closing it needs
-//! per-connection task tracking in the listener, which is out of scope here).
+//! **Shutdown ends the live connections, then drains the queue, all inside one deadline.**
+//! `start_worker` keeps the worker's `JoinHandle` inside the `CaptureHandoff`, and `drain` is the
+//! one call a sensor's `main` makes on SIGTERM. Phase 1 quiesces the [`ConnectionTracker`] the
+//! sensor's listener registered its connections in: they get a short grace to finish, then are
+//! cancelled and awaited. A cancelled connection drops its capture guard, whose Drop-time `submit`
+//! enqueues what it had buffered marked cut (`end_reason` `session_cancelled`, `complete` false),
+//! so an upload in progress at SIGTERM is recorded as a truncated sample rather than lost. Phase 2
+//! stops `submit` from enqueuing, tells the worker to close the channel and finish what is
+//! buffered (including those cut captures), and waits for it. The phases share the one `timeout`
+//! (grace and cancel wait are each at most a quarter of it; phase 2 gets the remainder), so a
+//! wedged spool or a stuck connection cannot hold the process past the service manager's stop
+//! timeout. Without phase 2 the runtime teardown killed the detached worker with accepted captures
+//! still queued; without phase 1 it dropped connection futures after the queue had closed, so
+//! their Drop-time submit was refused.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,6 +64,7 @@ use tokio::task::JoinHandle;
 
 use crate::arrival::{self, Arrival};
 use crate::capture_budget::{CaptureBody, CaptureMemoryBudget};
+use crate::connection_tracker::{CONNECTION_GRACE, ConnectionTracker, QuiesceOutcome};
 use crate::emit::EventEmitter;
 use crate::outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
 use crate::sanitize::sanitize_value;
@@ -111,8 +117,9 @@ struct Queued {
 /// those complete tells an analyst a fragment is a whole sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureEnd {
-    /// Nothing recorded an end: the listener dropped the handler future at `max_duration`. It is
-    /// the initial value because a cancelled future runs no code that could set anything else.
+    /// Nothing recorded an end: the listener dropped the handler future at `max_duration`, or
+    /// shutdown cancelled the connection (`CaptureHandoff::drain`). It is the initial value
+    /// because a cancelled future runs no code that could set anything else.
     Cancelled,
     /// The peer closed the connection (or, for a file transfer, the channel or stream carrying
     /// it). Whatever it meant to send on the session, it finished sending.
@@ -273,6 +280,22 @@ impl DrainOutcome {
     }
 }
 
+/// How `CaptureHandoff::drain` ended, per phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainReport {
+    /// What happened to the live connections (and so to their in-flight captures).
+    pub connections: QuiesceOutcome,
+    /// What happened to the queue.
+    pub queue: DrainOutcome,
+}
+
+impl DrainReport {
+    /// Whether nothing buffered, queued or in flight was left behind.
+    pub fn is_clean(self) -> bool {
+        self.connections.is_clean() && self.queue.is_clean()
+    }
+}
+
 /// Owns the queue, the drop counter, and the spool/emitter every enqueued job is eventually
 /// processed against. Cheap to share: construct one per sensor process, wrap it in an `Arc`, and
 /// clone that into every connection handler - `submit` and `dropped_count` take `&self`, and
@@ -311,6 +334,9 @@ pub struct CaptureHandoff {
     /// The worker task, retained so `drain` can await it (a detached handle is killed by runtime
     /// teardown before it empties the queue).
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// The sensor's live connections. A listener started with it (`run_tcp_listener_tracked`)
+    /// registers every connection here; `drain` ends them before closing the queue.
+    connections: ConnectionTracker,
 }
 
 impl CaptureHandoff {
@@ -356,7 +382,15 @@ impl CaptureHandoff {
             closing: AtomicBool::new(false),
             stop: Arc::new(Notify::new()),
             worker: Mutex::new(None),
+            connections: ConnectionTracker::new(),
         }
+    }
+
+    /// The tracker a sensor passes to its listener (`run_tcp_listener_tracked`) so `drain` can end
+    /// the connections that hold in-flight captures. A listener that does not use it is invisible
+    /// to `drain`, and its in-flight captures are lost at shutdown.
+    pub fn connections(&self) -> &ConnectionTracker {
+        &self.connections
     }
 
     /// Enqueue a capture job. Never blocks: backed by `try_send`, which returns immediately
@@ -522,12 +556,34 @@ impl CaptureHandoff {
         *self.worker.lock().unwrap() = Some(handle);
     }
 
-    /// Stop accepting captures and finish the ones already queued, waiting at most `timeout`.
-    /// Call once at shutdown, after the listeners are stopped. `submit` refuses from the moment
-    /// this is called. On timeout the worker is aborted (a wedged spool or emitter must not hold
-    /// the process past the service manager's stop timeout) and the unprocessed jobs are lost; the
-    /// outcome says which happened so the caller can log it.
-    pub async fn drain(&self, timeout: Duration) -> DrainOutcome {
+    /// End the live connections, then stop accepting captures and finish the ones queued, all
+    /// within `timeout`. Call once at shutdown, after the listeners are stopped. See the module doc
+    /// for the two phases and how the budget is split. `submit` refuses once phase 2 starts. On
+    /// timeout the worker is aborted (a wedged spool or emitter must not hold the process past the
+    /// service manager's stop timeout) and the unprocessed jobs are lost; the report says which
+    /// happened so the caller can log it.
+    pub async fn drain(&self, timeout: Duration) -> DrainReport {
+        let started = std::time::Instant::now();
+        let phase = (timeout / 4).min(CONNECTION_GRACE);
+        let connections = self.connections.quiesce(phase, timeout / 4).await;
+        match connections {
+            QuiesceOutcome::Idle => {}
+            QuiesceOutcome::Cancelled(n) => tracing::info!(
+                connections = n,
+                "capture hand-off: live connections cut at shutdown; their captures are recorded as truncated"
+            ),
+            QuiesceOutcome::Stuck(n) => tracing::warn!(
+                connections = n,
+                "capture hand-off: connections still live after cancellation; their captures may be lost"
+            ),
+        }
+        let queue = self
+            .drain_queue(timeout.saturating_sub(started.elapsed()))
+            .await;
+        DrainReport { connections, queue }
+    }
+
+    async fn drain_queue(&self, timeout: Duration) -> DrainOutcome {
         self.closing.store(true, Ordering::SeqCst);
         let handle = self.worker.lock().unwrap().take();
         let Some(mut handle) = handle else {
@@ -1456,6 +1512,128 @@ mod tests {
         }
     }
 
+    /// Stands in for a capture guard on a live connection: submits what it holds when dropped.
+    struct SubmitOnDrop(Arc<CaptureHandoff>, Vec<u8>);
+
+    impl Drop for SubmitOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.submit(drain_job(std::mem::take(&mut self.1)));
+        }
+    }
+
+    /// Spawn a tracked "connection" that holds a capture until cancelled, the way a listener task
+    /// does: the slot is registered before the spawn and the future runs under `tracker.run`.
+    fn spawn_connection(handoff: &Arc<CaptureHandoff>, body: &[u8]) -> JoinHandle<()> {
+        let tracker = handoff.connections().clone();
+        let guard = tracker.register();
+        let held = SubmitOnDrop(handoff.clone(), body.to_vec());
+        tokio::spawn(async move {
+            let _guard = guard;
+            tracker
+                .run(async move {
+                    let _held = held;
+                    std::future::pending::<()>().await;
+                })
+                .await;
+        })
+    }
+
+    #[tokio::test]
+    async fn drain_cuts_a_live_connection_before_closing_the_queue() {
+        // The in-flight loss this exists to close: the capture's Drop-time submit only lands if the
+        // connection is dropped while the queue still accepts work. Order matters, so the
+        // assertions read the spool and log straight after `drain` returns.
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let spool = crate::spool::QuarantineSpool::new(spool_dir.clone(), 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(log_path.clone());
+        let handoff = Arc::new(test_handoff(spool, emitter, 8, dir.path()));
+        handoff.start_worker();
+        let connection = spawn_connection(&handoff, b"half-an-upload");
+
+        let report = handoff.drain(Duration::from_secs(4)).await;
+        assert_eq!(report.connections, QuiesceOutcome::Cancelled(1));
+        assert_eq!(report.queue, DrainOutcome::Drained);
+        assert!(report.is_clean());
+        connection.await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap().lines().count(),
+            1,
+            "the cut connection's capture is emitted"
+        );
+        let bodies: Vec<Vec<u8>> = std::fs::read_dir(&spool_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| crate::spool::is_canonical_sha256_hex(&e.file_name().to_string_lossy()))
+            .map(|e| std::fs::read(e.path()).unwrap())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![b"half-an-upload".to_vec()],
+            "and its body is spooled"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_leaves_a_connection_that_finishes_inside_the_grace_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(dir.path().join("events.jsonl"));
+        let handoff = Arc::new(test_handoff(spool, emitter, 8, dir.path()));
+        handoff.start_worker();
+        let guard = handoff.connections().register();
+        let finishing = tokio::spawn(async move {
+            let _guard = guard;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let report = handoff.drain(Duration::from_secs(8)).await;
+        assert_eq!(report.connections, QuiesceOutcome::Idle);
+        finishing.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_stays_inside_its_deadline_when_a_connection_cannot_be_cut() {
+        // A task wedged in blocking code ignores the cancel signal. The whole drain, both phases,
+        // must still return inside the one timeout, and the queued job must still be written.
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let spool = crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(log_path.clone());
+        let handoff = Arc::new(test_handoff(spool, emitter, 8, dir.path()));
+        handoff.start_worker();
+        let guard = handoff.connections().register();
+        let wedged = tokio::spawn(async move {
+            let _guard = guard;
+            std::thread::sleep(Duration::from_millis(2500));
+        });
+        handoff.submit(drain_job(b"queued".to_vec())).unwrap();
+
+        let deadline = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let report = handoff.drain(deadline).await;
+        assert!(
+            started.elapsed() < deadline,
+            "took {:?} against a {deadline:?} deadline",
+            started.elapsed()
+        );
+        assert_eq!(report.connections, QuiesceOutcome::Stuck(1));
+        assert!(!report.is_clean());
+        assert_eq!(report.queue, DrainOutcome::Drained);
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap().lines().count(),
+            1
+        );
+        wedged.await.unwrap();
+    }
+
     #[tokio::test]
     async fn drain_returns_only_after_every_queued_job_is_stored_and_emitted() {
         // The shutdown loss this exists to close: jobs accepted into the queue but not yet
@@ -1479,7 +1657,7 @@ mod tests {
                 .submit(drain_job(format!("queued-body-{i}").into_bytes()))
                 .unwrap();
         }
-        let outcome = handoff.drain(Duration::from_secs(15)).await;
+        let outcome = handoff.drain(Duration::from_secs(15)).await.queue;
         assert_eq!(outcome, DrainOutcome::Drained);
 
         let lines = std::fs::read_to_string(&log_path).unwrap().lines().count();
@@ -1522,7 +1700,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let started = std::time::Instant::now();
-        let outcome = handoff.drain(Duration::from_millis(200)).await;
+        let outcome = handoff.drain(Duration::from_millis(200)).await.queue;
         let elapsed = started.elapsed();
         assert_eq!(outcome, DrainOutcome::TimedOut);
         assert!(!outcome.is_clean());
@@ -1546,7 +1724,7 @@ mod tests {
         let handoff = test_handoff(spool, emitter, 4, dir.path());
         handoff.start_worker();
         assert_eq!(
-            handoff.drain(Duration::from_secs(5)).await,
+            handoff.drain(Duration::from_secs(5)).await.queue,
             DrainOutcome::Drained
         );
 
@@ -1568,18 +1746,18 @@ mod tests {
         let emitter = crate::emit::EventEmitter::new(dir.path().join("events.jsonl"));
         let handoff = test_handoff(spool, emitter, 4, dir.path());
 
-        let outcome = handoff.drain(Duration::from_secs(1)).await;
+        let outcome = handoff.drain(Duration::from_secs(1)).await.queue;
         assert_eq!(outcome, DrainOutcome::NotRunning);
         assert!(outcome.is_clean());
         assert!(handoff.submit(drain_job(b"x".to_vec())).is_err());
         // A second drain after a real one is also a no-op.
         handoff.start_worker();
         assert_eq!(
-            handoff.drain(Duration::from_secs(5)).await,
+            handoff.drain(Duration::from_secs(5)).await.queue,
             DrainOutcome::Drained
         );
         assert_eq!(
-            handoff.drain(Duration::from_secs(5)).await,
+            handoff.drain(Duration::from_secs(5)).await.queue,
             DrainOutcome::NotRunning
         );
     }
@@ -1743,7 +1921,7 @@ mod tests {
         // Nothing was queued: drain finishes with an empty event log.
         drop(hog);
         assert_eq!(
-            rig.handoff.drain(Duration::from_secs(5)).await,
+            rig.handoff.drain(Duration::from_secs(5)).await.queue,
             DrainOutcome::Drained
         );
         assert!(!rig.log_path.exists() || events(&rig.log_path).is_empty());
@@ -1797,7 +1975,7 @@ mod tests {
 
         // After drain begins, a shutdown refusal is not counted either.
         assert_eq!(
-            handoff.drain(Duration::from_secs(1)).await,
+            handoff.drain(Duration::from_secs(1)).await.queue,
             DrainOutcome::NotRunning
         );
         assert!(handoff.submit(job(mk(&budget))).is_err());
@@ -1809,7 +1987,7 @@ mod tests {
     async fn dropped_or_refused_jobs_still_refund_their_reservation() {
         let rig = budget_rig(8 * CAPTURE_CHUNK_BYTES);
         assert_eq!(
-            rig.handoff.drain(Duration::from_secs(5)).await,
+            rig.handoff.drain(Duration::from_secs(5)).await.queue,
             DrainOutcome::Drained
         );
         // After drain `submit` refuses; the refused job's body must still give its room back.

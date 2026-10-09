@@ -77,7 +77,9 @@ disturbs prior hashes (`crates/core-scoring/src/hashing.rs#canonical_bytes` - no
 
 A "sample" is a captured file body: an attacker upload (SCP/SFTP, FTP `STOR`, ADB
 `sync`) or a payload a dropper script referenced and the malware fetcher retrieved.
-Only **SSH, FTP, and ADB** sensors spool bodies; the fetcher spools what it pulls.
+Only the **SSH, FTP, ADB, TFTP, telnet and MQTT** sensors spool bodies (telnet when its shell
+phase sees a binary payload, MQTT when a PUBLISH payload looks binary); the fetcher spools what
+it pulls.
 
 ```mermaid
 flowchart TD

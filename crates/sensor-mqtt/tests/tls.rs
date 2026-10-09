@@ -60,6 +60,7 @@ struct TlsServerFixture {
     log_path: PathBuf,
     spool_dir: PathBuf,
     handle: JoinHandle<()>,
+    handoff: Arc<sensor_framework::CaptureHandoff>,
     client_config: Arc<ClientConfig>,
     _dir: tempfile::TempDir,
 }
@@ -74,7 +75,7 @@ impl TlsServerFixture {
         let log_path = dir.path().join("events.jsonl");
         let spool_dir = dir.path().join("spool");
         let (server, client_config) = test_tls();
-        let (addr, handle, _handoff) = sensor_mqtt::start_test_server_tls_with_handoff(
+        let (addr, handle, handoff) = sensor_mqtt::start_test_server_tls_with_handoff(
             "127.0.0.1:0".parse().unwrap(),
             log_path.clone(),
             spool_dir.clone(),
@@ -92,6 +93,7 @@ impl TlsServerFixture {
             log_path,
             spool_dir,
             handle,
+            handoff,
             client_config,
             _dir: dir,
         }
@@ -211,6 +213,25 @@ fn assert_all_tagged(events: &[SensorEvent]) {
         assert!(is_tls(e), "event not tagged tls: {e:?}");
         assert_eq!(e.sensor, "mqtt");
     }
+}
+
+/// The TLS listener is a separate tracked-listener call from the plaintext one: an open MQTTS
+/// connection must be registered so a shutdown `drain` can cut it.
+#[tokio::test]
+async fn an_open_mqtts_connection_is_tracked_and_cut_by_drain() {
+    let srv = TlsServerFixture::start().await;
+    let _raw = TcpStream::connect(srv.addr).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while srv.handoff.connections().live() != 1 {
+        assert!(std::time::Instant::now() < deadline, "connection untracked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    srv.handle.abort();
+    let report = srv.handoff.drain(Duration::from_secs(2)).await;
+    assert_eq!(
+        report.connections,
+        sensor_framework::QuiesceOutcome::Cancelled(1)
+    );
 }
 
 #[tokio::test]

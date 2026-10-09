@@ -855,10 +855,10 @@ Sensor-specific extras:
 
 #### Outbox manifest (SP-B-1b)
 
-Every sensor that spools captured file bodies (ssh, ftp, adb, telnet, tftp) also writes a durable
-per-capture custody manifest row under its outbox directory as soon as the body is sealed - see
-`sensor_framework::outbox` and `sensor_framework::handoff::process_job`. Two variables govern it,
-read identically by each of those five sensors' `main.rs`:
+Every sensor that spools captured file bodies (ssh, ftp, adb, telnet, tftp, mqtt) also writes a
+durable per-capture custody manifest row under its outbox directory as soon as the body is
+sealed - see `sensor_framework::outbox` and `sensor_framework::handoff::process_job`. Two
+variables govern it, read identically by each of those six sensors' `main.rs`:
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use sensor_framework::{
     Arrival, CaptureHandoff, CaptureMemoryBudget, CommandEventConfig, CommandEventGate,
     ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EventEmitter, OutboxManifest,
-    QuarantineSpool, WanResolver, command_flood, run_tcp_listener,
+    QuarantineSpool, WanResolver, command_flood, run_tcp_listener_tracked,
 };
 use tokio::task::JoinHandle;
 
@@ -101,10 +101,12 @@ pub async fn start_test_server_with_handoff(
         bounds.max_concurrent,
     ));
     let drain_handle = handoff.clone();
-    let (bound, handle) = run_tcp_listener(
+    let tracker = handoff.connections().clone();
+    let (bound, handle) = run_tcp_listener_tracked(
         addr,
         bounds.clone(),
         per_source_cap,
+        Some(tracker),
         move |stream, peer, session_id| {
             let emitter = emitter.clone();
             let wan_resolver = wan_resolver.clone();

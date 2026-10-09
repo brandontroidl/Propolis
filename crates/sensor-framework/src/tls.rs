@@ -24,7 +24,8 @@ use tokio_rustls::rustls::{
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 use crate::bounds::ConnectionBounds;
-use crate::listener::run_tcp_listener;
+use crate::connection_tracker::ConnectionTracker;
+use crate::listener::run_tcp_listener_tracked;
 
 /// Upper bound on a cert or key PEM file read. A real chain/key is a few KiB; a larger file is a
 /// misconfiguration (or a wrong path such as a device or log), refused rather than slurped.
@@ -273,12 +274,33 @@ where
         + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    run_tls_listener_tracked(addr, bounds, per_source_cap, None, tls, handler).await
+}
+
+/// [`run_tls_listener`] with the connections registered in `tracker`; see
+/// [`crate::listener::run_tcp_listener_tracked`].
+pub async fn run_tls_listener_tracked<F, Fut>(
+    addr: SocketAddr,
+    bounds: ConnectionBounds,
+    per_source_cap: Option<u32>,
+    tracker: Option<ConnectionTracker>,
+    tls: TlsServer,
+    handler: F,
+) -> io::Result<(SocketAddr, JoinHandle<()>)>
+where
+    F: Fn(TlsStream<TcpStream>, SocketAddr, Option<SocketAddr>, uuid::Uuid) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let handler = Arc::new(handler);
     let handshake_timeout = bounds.read_timeout;
-    run_tcp_listener(
+    run_tcp_listener_tracked(
         addr,
         bounds,
         per_source_cap,
+        tracker,
         move |tcp, peer, session_id| {
             let local = tcp.local_addr().ok();
             let tls = tls.clone();

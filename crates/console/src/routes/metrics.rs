@@ -178,15 +178,19 @@ async fn metrics(
         age_seconds(fetch_pending_oldest),
     );
 
-    let (analysis_pending, analysis_scanned): (i64, i64) = sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE detected < 0), count(*) FILTER (WHERE detected >= 0) \
-         FROM sample_analysis",
-    )
-    .fetch_one(&state.db)
-    .await?;
+    // -1 is "uploaded, no verdict yet" and -2 is "kept local, not uploaded for its type"
+    // (`review::virustotal`); neither is a verdict, and only -1 is waiting on anything.
+    let (analysis_pending, analysis_scanned, analysis_not_uploaded): (i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE detected = -1), count(*) FILTER (WHERE detected >= 0), \
+             count(*) FILTER (WHERE detected = -2) \
+             FROM sample_analysis",
+        )
+        .fetch_one(&state.db)
+        .await?;
     writeln!(
         out,
-        "# HELP propolis_sample_analysis Captured samples by analysis state: scanned (a verdict recorded) or pending (uploaded, no verdict yet)."
+        "# HELP propolis_sample_analysis Captured samples by analysis state: scanned (a verdict recorded), pending (uploaded, no verdict yet) or not_uploaded (kept local because the content is not executable or script content)."
     )
     .unwrap();
     writeln!(out, "# TYPE propolis_sample_analysis gauge").unwrap();
@@ -200,9 +204,14 @@ async fn metrics(
         "propolis_sample_analysis{{state=\"scanned\"}} {analysis_scanned}"
     )
     .unwrap();
+    writeln!(
+        out,
+        "propolis_sample_analysis{{state=\"not_uploaded\"}} {analysis_not_uploaded}"
+    )
+    .unwrap();
     let analysis_pending_oldest: Option<f64> = sqlx::query_scalar(
         "SELECT EXTRACT(EPOCH FROM now() - min(analyzed_at))::float8 \
-         FROM sample_analysis WHERE detected < 0",
+         FROM sample_analysis WHERE detected = -1",
     )
     .fetch_one(&state.db)
     .await?;

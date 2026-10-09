@@ -53,8 +53,11 @@ empty key forces it off, fail-closed (`vt_enabled`/`vt_api_key` in
   `detected = malicious + suspicious`;
   `total = malicious + suspicious + undetected + harmless`
   (`crates/review/src/virustotal.rs#lookup_hash`).
-- **Upload** (only if `PROPOLIS_VT_UPLOAD`) - `POST /api/v3/files` multipart;
-  stores a pending row with `detected = -1, total = -1`
+- **Upload** (only if `PROPOLIS_VT_UPLOAD`, and only for executable or script content, see
+  [malware custody](../security/malware-custody.md#virustotal-path-lookup-and-an-opt-in-type-filtered-upload))
+  - `POST /api/v3/files` multipart;
+  stores a pending row with `detected = -1, total = -1`; a body kept local for its type
+  gets `detected = -2, total = -2` and is never uploaded
   (`crates/review/src/virustotal.rs#scan_spool`, `crates/review/src/virustotal.rs#upload_sample`, `crates/review/src/virustotal.rs#pending_result`).
 
 The documented free-tier limit is 4 req/min, 500/day, verified live against the

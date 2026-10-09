@@ -3032,6 +3032,36 @@ async fn detail_renders_a_pending_vt_upload_as_pending_not_clean(pool: PgPool) {
     );
 }
 
+/// A sample VirusTotal was asked about by hash but never sent, because its content is not
+/// executable or script content, is stored as `-2/-2`. It is not pending and not a verdict.
+#[sqlx::test(migrations = false)]
+async fn detail_renders_a_sample_kept_local_for_its_type_as_not_uploaded(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.84", 60).await;
+    seed_fetch_attempt_with_analysis(&pool, 3, "203.0.113.84", -2, -2).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.84",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let start = body.find("Malware from this IP").expect("malware panel");
+    let panel = &body[start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    assert!(panel.contains("not uploaded (type)"), "{panel}");
+    assert!(!panel.contains("pending VT analysis"), "{panel}");
+    assert!(!panel.contains("detections"), "{panel}");
+}
+
 #[sqlx::test(migrations = false)]
 async fn detail_shows_linked_malware_fetched_from_this_ips_urls(pool: PgPool) {
     migrate(&pool).await;
@@ -4381,13 +4411,17 @@ async fn metrics_report_malware_pipeline_depth_and_oldest_age(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
-    // One VT upload still awaiting its verdict (-1/-1), stamped an hour ago, and one verdicted.
+    // One VT upload still awaiting its verdict (-1/-1), stamped an hour ago, one verdicted, and
+    // one kept local for its type (-2/-2), stamped three hours ago: older than the pending
+    // upload, so a gauge that counted it as pending would read ~3h instead of ~1h.
     sqlx::query(
         "INSERT INTO sample_analysis (sha256, detected, total, vt_link, analyzed_at) VALUES \
-         ($1, -1, -1, '', now() - interval '1 hour'), ($2, 3, 70, '', now())",
+         ($1, -1, -1, '', now() - interval '1 hour'), ($2, 3, 70, '', now()), \
+         ($3, -2, -2, '', now() - interval '3 hours')",
     )
     .bind("c".repeat(64))
     .bind("d".repeat(64))
+    .bind("e".repeat(64))
     .execute(&pool)
     .await
     .unwrap();
@@ -4417,6 +4451,10 @@ async fn metrics_report_malware_pipeline_depth_and_oldest_age(pool: PgPool) {
     assert!(
         body.contains("propolis_sample_analysis{state=\"scanned\"} 1\n"),
         "scanned analysis: {body}"
+    );
+    assert!(
+        body.contains("propolis_sample_analysis{state=\"not_uploaded\"} 1\n"),
+        "a -2 row is counted as not uploaded, neither pending nor scanned: {body}"
     );
     let vt_age = gauge_value(&body, "propolis_sample_analysis_pending_oldest_age_seconds");
     assert!(

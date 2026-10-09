@@ -10,6 +10,8 @@ base64 = "0.22.1"
 clap = { version = "4.6.4", features = ["derive"] }
 core-scoring = { path = "../core-scoring" }
 chrono = { version = "0.4.45", features = ["serde"] }
+# Already in the lockfile and vendor/ (via russh); bounded with Read::take on attacker input.
+flate2 = "1.1.9"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hmac = "0.13.0"
 rand = "0.10.2"

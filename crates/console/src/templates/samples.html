@@ -72,6 +72,8 @@
         {% if s.vt_detected is defined and s.vt_detected is not none %}
           {% if s.vt_detected == -1 %}
             <span class="dim">pending</span>
+          {% elif s.vt_detected == -2 %}
+            <span class="dim" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>
           {% elif s.vt_detected > 0 %}
             <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" class="text-alert">{{ s.vt_detected }}/{{ s.vt_total }} detected</a>
           {% else %}

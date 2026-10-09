@@ -110,7 +110,7 @@ flowchart TD
    sample's hash, writing a verdict to `sample_analysis`
    (`crates/review/src/virustotal.rs#store_result`). A hash lookup
    sends only the hash. **Uploading an unknown sample body off-box is opt-in
-   (`PROPOLIS_VT_UPLOAD`, default off).** The daily-budget cap and wiring are owned by
+   (`PROPOLIS_VT_UPLOAD`, default off) and limited to executable or script content.** The daily-budget cap and wiring are owned by
    [`reference/integrations.md`](../reference/integrations.md) and
    [`reference/rate-limits-and-budgets.md`](../reference/rate-limits-and-budgets.md).
 

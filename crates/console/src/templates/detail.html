@@ -157,8 +157,10 @@
           {% if m.detected is defined and m.detected is not none %}
             {% if m.detected > 0 %}
             <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-rejected">{{ m.detected }}/{{ m.total }} detected</a>
-            {% elif m.detected < 0 %}
+            {% elif m.detected == -1 %}
             <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-snoozed">pending VT analysis</a>
+            {% elif m.detected == -2 %}
+            <span class="state-pill state-snoozed" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>
             {% else %}
             <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved" title="No engine flagged it. That is not proof the file is harmless.">0/{{ m.total }} detections</a>
             {% endif %}
@@ -205,8 +207,10 @@
           {% if u.detected is defined and u.detected is not none %}
             {% if u.detected > 0 %}
             <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-rejected">{{ u.detected }}/{{ u.total }} detected</a>
-            {% elif u.detected < 0 %}
+            {% elif u.detected == -1 %}
             <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-snoozed">pending VT analysis</a>
+            {% elif u.detected == -2 %}
+            <span class="state-pill state-snoozed" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>
             {% else %}
             <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved" title="No engine flagged it. That is not proof the file is harmless.">0/{{ u.total }} detections</a>
             {% endif %}

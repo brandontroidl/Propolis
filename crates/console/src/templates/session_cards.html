@@ -1,8 +1,13 @@
+{#- What the review fetcher did with the URL a download event named, beside that event. -#}
+{% macro fetch_line(f) -%}
+<span class="c-sub"><span class="sev sev--{% if f.kind == "captured" %}high{% elif f.kind == "unsupported" or f.kind == "unqueued" %}low{% else %}watch{% endif %}">{{ f.label }}</span>{% if f.reason %} {{ f.reason }}{% endif %}{% if f.sample %} <a href="/samples/{{ f.sample.sha256 }}" title="{{ f.sample.sha256 }}">{{ f.sample.short }}...</a>{% if f.bytes %}, {{ f.bytes }}{% endif %}{% endif %}{% if f.when %}, {{ f.when }}{% endif %}</span>
+{%- endmacro %}
+
 {% macro event_row(event) -%}
 <tr>
   <td class="seen dim">{{ event.relative_time }}</td>
   <td>{{ event.activity }}</td>
-  <td class="mono">{{ event.detail }}{% if event.xor_badge %} <span class="dim" title="command recovered from single-byte-XOR obfuscation; raw bytes in the raw view">(de-obfuscated, xor {{ event.xor_badge }})</span>{% endif %}</td>
+  <td class="mono">{{ event.detail }}{% if event.xor_badge %} <span class="dim" title="command recovered from single-byte-XOR obfuscation; raw bytes in the raw view">(de-obfuscated, xor {{ event.xor_badge }})</span>{% endif %}{% if event.fetch %}{{ fetch_line(event.fetch) }}{% endif %}</td>
   <td>
     <details class="raw-toggle">
       <summary>raw</summary>
@@ -85,7 +90,7 @@
         <td class="seen">{{ event.observed_at }}</td>
         <td class="seen dim">{{ event.relative_time }}</td>
         <td>{{ event.activity }}</td>
-        <td class="mono">{{ event.detail }}{% if event.xor_badge %} <span class="dim" title="command recovered from single-byte-XOR obfuscation; raw bytes in the raw view">(de-obfuscated, xor {{ event.xor_badge }})</span>{% endif %}</td>
+        <td class="mono">{{ event.detail }}{% if event.xor_badge %} <span class="dim" title="command recovered from single-byte-XOR obfuscation; raw bytes in the raw view">(de-obfuscated, xor {{ event.xor_badge }})</span>{% endif %}{% if event.fetch %}{{ fetch_line(event.fetch) }}{% endif %}</td>
         <td>{{ event.protocol }}</td>
         <td>{% if event.authenticated %}yes{% else %}no{% endif %}</td>
         <td class="ip">{{ event.wan_ip }}</td>

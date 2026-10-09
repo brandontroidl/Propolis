@@ -497,7 +497,7 @@ mod tests {
             .unwrap()
             .render(minijinja::context! {
                 active_nav => "samples", pending_count => 0, uptime => "1m", version => "0.0.0",
-                degraded => Vec::<&str>::new(), total => 2, status_counts => Vec::<()>::new(),
+                degraded => Vec::<&str>::new(), total => 3, status_counts => Vec::<()>::new(),
                 fetch_attempts_total => 0,
                 samples => vec![
                     minijinja::context! {
@@ -512,7 +512,12 @@ mod tests {
                     minijinja::context! {
                         sha256 => "b".repeat(64), sha256_short => "bbbbbbbbbbbb", size => "1 B",
                         sensor => "ssh", source_ips => Vec::<&str>::new(), more_source_ips => 0,
-                        transport => Vec::<()>::new(),
+                        transport => Vec::<()>::new(), uploaded => true,
+                    },
+                    minijinja::context! {
+                        sha256 => "c".repeat(64), sha256_short => "cccccccccccc", size => "1 B",
+                        sensor => "fetched", source_ips => Vec::<&str>::new(),
+                        more_source_ips => 0, transport => Vec::<()>::new(), uploaded => false,
                     },
                 ],
             })
@@ -520,8 +525,12 @@ mod tests {
         assert!(html.contains(r#"<span class="sev sev--watch" title="invalid peer certificate: &quot;&gt;&lt;script&gt;x()&lt;&#x2f;script&gt;">TLS unverified</span>"#), "{html}");
         assert!(html.contains(r#"<span class="sev sev--low">plaintext</span>"#));
         assert!(
-            html.contains("not fetched"),
-            "a sensor upload has no fetch transport"
+            html.contains("n/a, uploaded") && !html.contains("not fetched"),
+            "a sensor upload is labelled as one, not as a fetch that did not happen"
+        );
+        assert!(
+            html.contains("not recorded"),
+            "a fetched body with no fetch record says the record is missing"
         );
         assert!(!html.contains("<script>x()"));
     }
@@ -539,6 +548,9 @@ mod tests {
             distinct_wan_count => 0, distinct_sensor_count => 0, active_days => 0,
             persistence_bonus => "0", max_confidence => "0.000",
             first_seen => "-", last_seen => "-",
+            timeline_counts => minijinja::context! {
+                events => 0, commands => 0, sessions => 0, ungrouped => 0,
+            },
         }
     }
 

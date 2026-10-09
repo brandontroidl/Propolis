@@ -35,6 +35,7 @@ use crate::AppState;
 use crate::routes::context::base_context;
 use crate::routes::error::AppError;
 use crate::routes::format::{format_relative_time, format_timestamp, group_digits};
+use crate::routes::rowcount::{COUNT_CAP, Count, capped_total};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/ips", get(ip_list))
@@ -42,9 +43,6 @@ pub fn router() -> Router<AppState> {
 
 /// Rows per page.
 const PAGE_SIZE: usize = 500;
-
-/// The most rows a count reads before it stops and falls back to an estimate.
-const COUNT_CAP: i64 = 100_000;
 
 /// The score sort's order key: equal in order to the live effective score at every instant, but
 /// constant over time (module doc comment). The literals are `LIVE_EFFECTIVE_SCORE_SQL`'s: the
@@ -123,13 +121,6 @@ struct IpRow {
     last_seen: String,
     last_seen_relative: String,
     eligible: bool,
-}
-
-/// A row count that is exact up to [`COUNT_CAP`] and an estimate past it.
-#[derive(Debug, Clone, Copy)]
-struct Count {
-    value: i64,
-    exact: bool,
 }
 
 async fn ip_list(
@@ -313,29 +304,9 @@ async fn rows_ahead(db: &PgPool, sort: SortKey, desc: bool, ip: &str) -> Result<
     })
 }
 
-/// Scored addresses in total: an exact count up to [`COUNT_CAP`], past it the planner's estimate
-/// (`pg_class.reltuples`, refreshed by autovacuum), which costs nothing to read.
+/// Scored addresses in total: exact up to [`COUNT_CAP`], past it the planner's estimate.
 async fn total_count(db: &PgPool) -> Result<Count, AppError> {
-    let counted: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT count(*) FROM (SELECT 1 FROM ip_score LIMIT {}) s",
-        COUNT_CAP + 1
-    )))
-    .fetch_one(db)
-    .await?;
-    if counted <= COUNT_CAP {
-        return Ok(Count {
-            value: counted,
-            exact: true,
-        });
-    }
-    let estimate: f32 =
-        sqlx::query_scalar("SELECT reltuples FROM pg_class WHERE oid = 'ip_score'::regclass")
-            .fetch_one(db)
-            .await?;
-    Ok(Count {
-        value: (estimate as i64).max(counted),
-        exact: false,
-    })
+    Ok(capped_total(db, "ip_score").await?)
 }
 
 #[derive(sqlx::FromRow)]

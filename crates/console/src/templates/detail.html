@@ -198,7 +198,7 @@
         <td class="seen">{{ u.seen_count }}&times; <span class="dim">{{ u.first_seen }}{% if u.last_seen != u.first_seen %} to {{ u.last_seen }}{% endif %}</span></td>
         <td>
           {% if u.kind == "captured" %}<span class="state-pill state-rejected">{{ u.outcome }}</span>
-          {% elif u.kind == "failed" or u.kind == "pending" %}<span class="state-pill state-snoozed">{{ u.outcome }}</span>
+          {% elif u.kind == "failed" or u.kind == "refused" or u.kind == "pending" %}<span class="state-pill state-snoozed">{{ u.outcome }}</span>
           {% else %}<span class="dim">{{ u.outcome }}</span>{% endif %}
         </td>
         <td class="mono">{% if u.first_reporter %}<a href="/ip/{{ u.first_reporter }}">{{ u.first_reporter }}</a> <span class="dim">{{ u.queued_at }}</span>{% elif u.queued_at %}<span class="dim">this address, {{ u.queued_at }}</span>{% else %}<span class="dim">-</span>{% endif %}</td>
@@ -285,7 +285,7 @@
 </div>
 
 <div class="panel">
-  <div class="panel-head">Evidence timeline <span class="dim">{{ total_event_count }} events</span></div>
+  <div class="panel-head">Evidence timeline <span class="dim">{% if has_more_events %}newest {% endif %}{{ timeline_counts.events }} event{% if timeline_counts.events != 1 %}s{% endif %}: {{ timeline_counts.commands }} command{% if timeline_counts.commands != 1 %}s{% endif %}, {{ timeline_counts.sessions }} session{% if timeline_counts.sessions != 1 %}s{% endif %}{% if timeline_counts.ungrouped %}, {{ timeline_counts.ungrouped }} outside any session{% endif %}</span></div>
   <div class="panel-body" id="evidence-timeline">
     {% include "session_cards.html" %}
 

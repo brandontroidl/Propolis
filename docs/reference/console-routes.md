@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-09
 -->
 
 # Console routes and APIs
@@ -72,8 +72,8 @@ login rate limiting) are owned by [authentication and authorization](../security
 | POST | `/ip/{ip}/delist` | `delist` | CSRF required | `routes/queue.rs` |
 | POST | `/ip/{ip}/relist` | `relist` | CSRF required | `routes/queue.rs` |
 | POST | `/ip/{ip}/delete` | `delete_ip` | CSRF required | `routes/queue.rs` |
-| GET | `/ip/{ip}` | `detail` | drawer mode via `?drawer=1` + `HX-Request`; missing IP -> `404`; identical consecutive sessions and echo-loader chunk runs fold; the malware panel names samples captured from a URL this address reported after another address | `crates/console/src/routes/detail.rs#detail`, `crates/console/src/routes/detail.rs#fold_repeated_sessions`, `crates/console/src/routes/detail.rs#timeline_items` |
-| GET | `/ip/{ip}/events` | `events_fragment` | HTMX keyset pagination | `crates/console/src/routes/detail.rs#events_fragment` |
+| GET | `/ip/{ip}` | `detail` | drawer mode via `?drawer=1` + `HX-Request`; missing IP -> `404`; identical consecutive sessions and echo-loader chunk runs fold; the malware panel names samples captured from a URL this address reported after another address; each `honeypot_file_download` event shows the fetcher's outcome for its URL | `crates/console/src/routes/detail.rs#detail`, `crates/console/src/routes/detail.rs#fold_repeated_sessions`, `crates/console/src/routes/detail.rs#timeline_items`, `crates/console/src/routes/detail.rs#attach_fetch_outcomes` |
+| GET | `/ip/{ip}/events` | `events_fragment` | HTMX keyset pagination; rows carry the same download outcomes | `crates/console/src/routes/detail.rs#events_fragment` |
 | GET | `/ip/{ip}/chart` | `chart_fragment` | HTMX | `crates/console/src/routes/detail.rs#chart_fragment` |
 | GET | `/feed` | `feed_page` | `?tab=status\|entries` | `crates/console/src/routes/feed.rs#feed_page` |
 | GET | `/feed/download/{tier}/{format}` | `download_feed` | see feed downloads below | `crates/console/src/routes/feed.rs#download_feed` |

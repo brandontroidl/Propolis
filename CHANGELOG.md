@@ -17,6 +17,15 @@
   console publishes the values on `/metrics` as `propolis_sensor_capture_*` series labelled by
   sensor, with `propolis_sensor_stats_age_seconds`, `_stale` (past 180 s) and `_final`, so a dead
   sensor reads as stale, not as zeros. No new setting.
+- **The evidence timeline shows what the fetcher did with each download** - a
+  `honeypot_file_download` event now carries a line under its URL: `fetched` with the sample
+  hash linked to its page, `refused` (the SSRF guard or hop limit) or `failed` with the recorded
+  reason, `gave up after N attempts`, `pending`, or `not fetched` for a scheme outside the
+  fetcher. The outcome is the URL's current `fetch_attempt` record, matched by the fetcher's own
+  `url_hash`, so a later reporter's download shows the capture the first reporter's produced.
+  Reasons are length-capped and escaped. A failed lookup names "download outcomes" in the
+  page's degraded banner. The "URLs this IP tried to fetch" panel shares the classifier and
+  shows a guard rejection as refused.
 - **ATT&CK technique tags on sessions, sources and campaigns** - deterministic rules over exact
   evidence, no model: a shell line is parsed into commands and a rule reads a command's name,
   operands and redirection targets, so `echo crontab` and a URL containing `cron` are not tagged.
@@ -73,6 +82,17 @@
 
 ### Changed
 
+- **The fleet page's Ledger panel no longer scans the event table on every refresh** - it ran
+  `count(*)` and `max(ingested_at)` (no index, so a full read) over the whole ledger each 30 s.
+  The count is exact up to 100,000 events and shown bare; past that it is the planner's row
+  estimate, shown as `about N` and labelled `(estimate)`. The newest ingest is read off the
+  newest row by `id`. The Attackers total shares the rule (`routes::rowcount`) and skips its
+  bounded scan once statistics put the table past the cap. The integrity page still counts on load.
+- **The evidence timeline's header says what it counts** - it read "54 events", which looked like
+  the address's total or its commands. It now reads, for example, `newest 200 events: 199
+  commands, 1 session, 1 outside any session`: ledger rows on the page, of which command
+  events, the distinct sessions, and rows that predate session tracking. "newest" appears only
+  when older events wait behind Load more.
 - **Campaigns and Samples say what the bots are doing and what they dropped** - the Campaigns list
   was a wall of "same sample" and "same commands" rows, one per host and per command count, and
   Samples repeated it. The list now sorts by hosts (then last seen; links for last and first
@@ -115,6 +135,15 @@
 
 ### Fixed
 
+- **Most active on the dashboard no longer runs off a phone screen** - at 390 px the table's last
+  two columns (what it did, last seen) were clipped. Below 640 px each row is now a card, the
+  same pattern the queue, campaigns and samples lists use: address and events on top, the 24-hour
+  strip and last seen under, the tags last.
+- **Samples no longer says "not fetched" for every uploaded file** - the Transport column describes
+  how the fetcher's connection was authenticated, which means nothing for a body a sensor took
+  from the address that sent it. Those rows now read `n/a, uploaded`; a body in the fetcher's
+  bucket with no successful fetch record reads `not recorded`; fetched files show their
+  transport as before.
 - **The soak harness counts rejected lines from the ledger** - the intake child's rejected
   counter reached the harness only through a status file written once a second, so a SIGKILL
   lost the last increments (one kill run printed "rejected 112 of 113 malformed" with nothing

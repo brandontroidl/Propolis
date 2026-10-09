@@ -23,6 +23,7 @@ pub mod login;
 pub mod logs;
 pub mod metrics;
 pub mod queue;
+pub(crate) mod rowcount;
 pub mod samples;
 pub mod search;
 

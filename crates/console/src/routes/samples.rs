@@ -27,6 +27,9 @@ pub fn router() -> Router<AppState> {
         .route("/samples/download/{sha256}", get(download_sample))
 }
 
+/// The fetcher's bucket among `review::spool::all_body_dirs`; every other entry is a sensor's spool.
+const FETCHED_BUCKET: &str = "fetched";
+
 #[derive(Debug, Serialize)]
 struct SampleRow {
     sha256: String,
@@ -43,6 +46,9 @@ struct SampleRow {
     /// How the fetcher's transport was authenticated for each URL that returned this body; empty
     /// for a body no fetch produced (a sensor upload). See `sample_transport`.
     transport: Vec<TransportTag>,
+    /// The body sits in a sensor's spool rather than the fetcher's bucket, so a sensor took it from
+    /// the address that sent it and the Transport column has nothing to say about it.
+    uploaded: bool,
     /// The sample's own campaign: every address that uploaded it or reported a URL serving it.
     campaign: Option<CampaignRef>,
     /// The host count's score class, and when the sample's hosts were active, from the same
@@ -338,6 +344,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                 source_ips,
                 more_source_ips,
                 transport,
+                uploaded: sensor != FETCHED_BUCKET,
             });
         }
     }

@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-09
 -->
 
 # Console tour
@@ -83,7 +83,13 @@ evidence timeline grouped into sessions where the sensor recorded one. Consecuti
 sessions that ran the same commands (a loader retrying under a new username) fold into
 one card marked `x3 identical sessions` with the usernames tried, each session still
 inside it, and an echo loader's chunk writes to one file are one row, `40 echo chunks
-to /tmp/.i`, with the lines behind an expander. Below that,
+to /tmp/.i`, with the lines behind an expander. A download attempt carries the review
+fetcher's outcome for its URL on a line under it: `fetched` with the sample's hash linked
+to its page, `refused` or `failed` with the recorded reason, `pending`, or `not fetched`
+for a scheme the fetcher does not handle. The outcome is the URL's current record, whoever
+reported it first, and carries the date of the last attempt. The timeline's header counts
+what is on the page by unit, for example `newest 200 events: 199 commands, 1 session`;
+"newest" means older events wait behind Load more. Below that,
 which of your WAN addresses it hit, which services it probed, vendor submissions, and
 the malware linked to it, marked as uploaded directly or fetched from a URL it
 reported. A truncated upload is labelled as such.
@@ -103,7 +109,9 @@ ten formats, from plain text to nftables, pf and RPZ.
 ## Samples
 
 Captured files by SHA-256, with size, which sensor took them, the addresses they are
-linked to, and the VirusTotal verdict if one exists. Downloads are served as opaque
+linked to, how the fetcher's connection was authenticated (a column that reads `n/a,
+uploaded` for a file a sensor took from the address that sent it, since nothing was
+fetched), and the VirusTotal verdict if one exists. Downloads are served as opaque
 attachments. Above the table, a strip shows the dropper fetcher's outcomes by status.
 
 ## Search

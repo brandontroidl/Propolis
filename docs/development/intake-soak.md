@@ -166,7 +166,7 @@ sample whose lag is within `--lag-p95-secs`; everything after it is judged, so a
 | no unexplained loss | every line written is in the ledger, a designed absence, behind a poison line, or inside a copytruncate window; no designed line was ingested | |
 | duplicates within at-least-once | ledger duplicates per sensor do not exceed restarts times the allowance | `--dup-per-restart` 1000 |
 | copytruncate loss within window | lines lost per copytruncate rotation do not exceed this many seconds of that sensor's traffic | `--rotation-loss-secs` 5 |
-| rejects are the designed ones | the runner rejected no more lines than the malformed ones written | |
+| rejects are the designed ones | the malformed lines the intake rejected are counted from the ledger (each sits alone between ingested neighbours; one inside a stretch of lost lines, or behind a poison line, is not counted), because the intake's own counter reaches the harness through a status file written once a second and a SIGKILL loses the increments since. The counter must not exceed the malformed lines it could have read, and may fall short only after a restart | |
 | final drain | after the writers stop, every log is read to its end | `--drain-secs` 120 |
 | chain verifies | `core_scoring::verify_chain` is intact at the end and at every mid-run walk | |
 | submission passes keep flowing | at least one pass, and none overdue by more than this | `--submit-gap-secs` 120 |

@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-09
 -->
 
 # Events and signals reference
@@ -323,7 +323,8 @@ The [campaign indexer](../operations/campaigns.md) reads these persisted keys an
 SampleRef), `capture_reason`, and `url` on `honeypot_file_download`. It groups command events by
 `session_id`, so a sensor that sends none produces no command-sequence campaigns
 (`crates/review/src/campaign/mod.rs#command_of`). `honeypot_session_end` is telemetry and is
-skipped by every rule.
+skipped by every rule. The [ATT&CK tag rules](attack-tagging.md) read the same keys, plus the
+event's `sensor` and `signal_type`; the `command_decoded` text replaces `command` when present.
 
 ## Signal types
 

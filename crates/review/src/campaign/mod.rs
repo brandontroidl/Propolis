@@ -58,6 +58,7 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
+use crate::attack::{self, Evidence, Match};
 use crate::fetcher::store::{parse_url_parts, url_hash};
 use crate::ioc::{self, Indicator};
 use fingerprint::RunDigest;
@@ -99,6 +100,26 @@ pub const PENDING_FETCHES_PER_TICK: i64 = 500;
 pub const PENDING_FETCH_TTL_DAYS: i64 = 7;
 /// Attempts to find a queued artifact in the spools before it is recorded as missing.
 pub const ARTIFACT_ATTEMPTS: i32 = 6;
+
+/// The `attack_tag` upsert for one of its two partial unique indexes.
+macro_rules! attack_tag_upsert {
+    ($target:literal) => {
+        concat!(
+            "INSERT INTO attack_tag (source_ip, session_id, technique_id, rule_id, event_id, \
+                                     matched, first_seen, last_seen, sightings) \
+             VALUES ($1::inet, $2::uuid, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT ",
+            $target,
+            " DO UPDATE SET \
+               matched = CASE WHEN EXCLUDED.event_id < attack_tag.event_id \
+                              THEN EXCLUDED.matched ELSE attack_tag.matched END, \
+               event_id = LEAST(attack_tag.event_id, EXCLUDED.event_id), \
+               first_seen = LEAST(attack_tag.first_seen, EXCLUDED.first_seen), \
+               last_seen = GREATEST(attack_tag.last_seen, EXCLUDED.last_seen), \
+               sightings = attack_tag.sightings + EXCLUDED.sightings"
+        )
+    };
+}
 
 /// Serializes indexers sharing one database. Distinct from core-scoring's append lock.
 const CAMPAIGN_LOCK_KEY: i64 = 7_265_646_772_697_400_015;
@@ -387,6 +408,23 @@ fn encoded_lines(metadata: &[Value]) -> Vec<Value> {
     out
 }
 
+/// Remember that `rule` matched in `event_id`, keeping only the lowest event per rule. At most one
+/// entry per rule in the table, so a run's pending tags stay bounded.
+fn merge_pending(pending: &mut Vec<Evidence>, rule: &str, event_id: i64, matched: &str) {
+    match pending.iter_mut().find(|e| e.rule == rule) {
+        Some(e) if event_id < e.event_id => {
+            e.event_id = event_id;
+            e.matched = matched.to_string();
+        }
+        Some(_) => {}
+        None => pending.push(Evidence {
+            rule: rule.to_string(),
+            event_id,
+            matched: matched.to_string(),
+        }),
+    }
+}
+
 fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
@@ -420,6 +458,8 @@ struct Session {
     campaign_key: Option<String>,
     closed: bool,
     pending_samples: Vec<String>,
+    /// ATT&CK tags the run has collected, the lowest event per rule, until it joins a campaign.
+    pending_tags: Vec<Evidence>,
 }
 
 impl Session {
@@ -438,8 +478,19 @@ impl Session {
             campaign_key: None,
             closed: false,
             pending_samples: Vec::new(),
+            pending_tags: Vec::new(),
         }
     }
+}
+
+/// An ATT&CK tag's change in one batch: the lowest event that satisfied the rule, and how many did.
+#[derive(Debug, Clone)]
+struct TagDelta {
+    event_id: i64,
+    matched: String,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+    sightings: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -540,6 +591,10 @@ struct Batch {
     ioc_room: HashMap<String, i64>,
     pending_fetches: BTreeMap<(Vec<u8>, String), PendingFetch>,
     artifact_scans: BTreeSet<String>,
+    /// `(source, session, rule)` -> change, for `attack_tag`.
+    tags: BTreeMap<(String, Option<String>, String), TagDelta>,
+    /// `(kind, key)` -> rule -> lowest `(event, matched)`, for `campaign_attack_tag`.
+    campaign_tags: BTreeMap<(Kind, String), BTreeMap<String, (i64, String)>>,
     /// Rebuilding command-sequence state from events the sample, scanner and indicator passes
     /// have already read: only the command rules run.
     replay: bool,
@@ -575,9 +630,16 @@ impl Batch {
             "honeypot_command_exec" => {
                 if let Some(command) = command_of(&event.metadata) {
                     self.command(tx, event, command).await?;
+                    let found = ioc::extract_from_command(command);
                     if !self.replay {
-                        self.record_iocs(tx, event, &ioc::extract_from_command(command))
-                            .await?;
+                        self.record_iocs(tx, event, &found).await?;
+                    }
+                    // Protocol commands (an SMTP DATA, a Redis CONFIG) share this event shape and
+                    // are not shell lines.
+                    if attack::is_shell_sensor(&event.sensor) {
+                        let mut hits = attack::tag_command(command);
+                        hits.extend(attack::tag_indicators(&found));
+                        self.tag(tx, event, hits).await?;
                     }
                 }
             }
@@ -589,16 +651,38 @@ impl Batch {
                     .filter(|s| is_sha256_hex(s))
                 {
                     self.upload(tx, event, sha).await?;
+                    // The ADB sensor's shell is Android's, outside the Enterprise matrix.
+                    if event.sensor != "adb" {
+                        let hits = attack::tag_upload(sha);
+                        if !self.replay {
+                            for h in &hits {
+                                self.campaign_tag(Kind::Sample, sha, h.rule, event.id, &h.matched);
+                            }
+                        }
+                        self.tag(tx, event, hits).await?;
+                    }
                 }
             }
-            "honeypot_file_download" if !self.replay => {
-                if let Some(url) = event.metadata.get("url").and_then(Value::as_str) {
-                    self.record_iocs(tx, event, &ioc::extract_from_command(url))
-                        .await?;
+            "honeypot_file_download" => {
+                let url = event.metadata.get("url").and_then(Value::as_str);
+                let found = url.map(ioc::extract_from_command).unwrap_or_default();
+                if !self.replay
+                    && let Some(url) = url
+                {
+                    self.record_iocs(tx, event, &found).await?;
                     self.download(tx, event, url).await?;
                 }
+                if attack::is_shell_sensor(&event.sensor) {
+                    let command = event.metadata.get("command").and_then(Value::as_str);
+                    let mut hits = attack::tag_download(url, command);
+                    hits.extend(attack::tag_indicators(&found));
+                    self.tag(tx, event, hits).await?;
+                }
             }
-            _ => {}
+            other => {
+                let hits = attack::tag_signal(other);
+                self.tag(tx, event, hits).await?;
+            }
         }
         let mark = self
             .watermarks
@@ -667,7 +751,7 @@ impl Batch {
         let row = sqlx::query(
             "SELECT host(source_ip) AS source_ip, sensor, run, first_seen, last_seen, \
                     first_event_id, last_event_id, shapes, shape_chars, payload, entry_shapes, last_shape, \
-                    chain, campaign_key, closed, pending_samples \
+                    chain, campaign_key, closed, pending_samples, attack_pending \
              FROM campaign_session WHERE session_id = $1::uuid",
         )
         .bind(session_id)
@@ -679,6 +763,78 @@ impl Batch {
     fn put_session(&mut self, session_id: &str, session: Session) {
         self.sessions_dirty.insert(session_id.to_string());
         self.sessions.insert(session_id.to_string(), session);
+    }
+
+    /// Record that `rule` matched in `event_id` for the campaign `(kind, key)`, keeping the lowest
+    /// event, so the result does not depend on where batch boundaries fall.
+    fn campaign_tag(&mut self, kind: Kind, key: &str, rule: &str, event_id: i64, matched: &str) {
+        let slot = self
+            .campaign_tags
+            .entry((kind, key.to_string()))
+            .or_default()
+            .entry(rule.to_string())
+            .or_insert_with(|| (event_id, matched.to_string()));
+        if event_id < slot.0 {
+            *slot = (event_id, matched.to_string());
+        }
+    }
+
+    /// Store the ATT&CK tags `hits` that `event` earned: on its source and session, and on the
+    /// campaign its session's run joins (now if it already has, else when it does).
+    async fn tag(
+        &mut self,
+        tx: &mut Transaction<'_, Postgres>,
+        event: &EventRow,
+        hits: Vec<Match>,
+    ) -> Result<(), sqlx::Error> {
+        if hits.is_empty() {
+            return Ok(());
+        }
+        // A rebuild reads events the tag pass has already counted; it only restores the
+        // command-sequence campaigns, which are below.
+        if !self.replay {
+            for h in &hits {
+                let delta = self
+                    .tags
+                    .entry((
+                        event.source_ip.clone(),
+                        event.session_id.clone(),
+                        h.rule.to_string(),
+                    ))
+                    .or_insert_with(|| TagDelta {
+                        event_id: event.id,
+                        matched: h.matched.clone(),
+                        first_seen: event.observed_at,
+                        last_seen: event.observed_at,
+                        sightings: 0,
+                    });
+                if event.id < delta.event_id {
+                    delta.event_id = event.id;
+                    delta.matched = h.matched.clone();
+                }
+                delta.first_seen = delta.first_seen.min(event.observed_at);
+                delta.last_seen = delta.last_seen.max(event.observed_at);
+                delta.sightings += 1;
+            }
+        }
+        let Some(session_id) = event.session_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(mut s) = self.session(tx, session_id).await? else {
+            return Ok(());
+        };
+        for h in hits {
+            match (&s.campaign_key, s.closed) {
+                (Some(key), _) => {
+                    let key = key.clone();
+                    self.campaign_tag(Kind::CommandSequence, &key, h.rule, event.id, &h.matched);
+                }
+                (None, false) => merge_pending(&mut s.pending_tags, h.rule, event.id, &h.matched),
+                (None, true) => {}
+            }
+        }
+        self.put_session(session_id, s);
+        Ok(())
     }
 
     async fn command(
@@ -730,6 +886,7 @@ impl Batch {
         }
         s.closed = true;
         s.pending_samples.clear();
+        s.pending_tags.clear();
     }
 
     fn materialize(&mut self, session_id: &str, s: &mut Session) {
@@ -757,6 +914,9 @@ impl Batch {
         });
         for sha in s.pending_samples.drain(..) {
             self.links.insert((Kind::CommandSequence, key.clone(), sha));
+        }
+        for e in s.pending_tags.drain(..) {
+            self.campaign_tag(Kind::CommandSequence, &key, &e.rule, e.event_id, &e.matched);
         }
         s.campaign_key = Some(key);
     }
@@ -973,6 +1133,11 @@ impl Batch {
         self.links
             .insert((Kind::Sample, sha.to_string(), sha.to_string()));
         self.artifact_scans.insert(sha.to_string());
+        if attack::is_shell_sensor(sensor) {
+            for h in attack::tag_download(Some(url), None) {
+                self.campaign_tag(Kind::Sample, sha, h.rule, event_id, &h.matched);
+            }
+        }
     }
 
     async fn scan_window(
@@ -1208,6 +1373,54 @@ impl Batch {
             .execute(&mut **tx)
             .await?;
         }
+        for ((source_ip, session_id, rule), d) in &self.tags {
+            let Some(technique) = attack::rule(rule).map(|r| r.technique) else {
+                continue;
+            };
+            // The unique index differs with and without a session, so the conflict target does.
+            let sql = if session_id.is_some() {
+                attack_tag_upsert!("(source_ip, session_id, rule_id) WHERE session_id IS NOT NULL")
+            } else {
+                attack_tag_upsert!("(source_ip, rule_id) WHERE session_id IS NULL")
+            };
+            sqlx::query(sql)
+                .bind(source_ip)
+                .bind(session_id)
+                .bind(technique)
+                .bind(rule)
+                .bind(d.event_id)
+                .bind(&d.matched)
+                .bind(d.first_seen)
+                .bind(d.last_seen)
+                .bind(d.sightings)
+                .execute(&mut **tx)
+                .await?;
+        }
+        for ((kind, key), rules) in &self.campaign_tags {
+            for (rule, (event_id, matched)) in rules {
+                let Some(technique) = attack::rule(rule).map(|r| r.technique) else {
+                    continue;
+                };
+                sqlx::query(
+                    "INSERT INTO campaign_attack_tag (campaign_id, technique_id, rule_id, \
+                                                      event_id, matched) \
+                     SELECT id, $3, $4, $5, $6 FROM campaign WHERE kind = $1 AND key = $2 \
+                     ON CONFLICT (campaign_id, technique_id, rule_id) DO UPDATE SET \
+                       matched = EXCLUDED.matched, event_id = EXCLUDED.event_id, \
+                       artifact_sha256 = NULL \
+                     WHERE campaign_attack_tag.event_id IS NULL \
+                        OR EXCLUDED.event_id < campaign_attack_tag.event_id",
+                )
+                .bind(kind.as_str())
+                .bind(key)
+                .bind(technique)
+                .bind(rule)
+                .bind(event_id)
+                .bind(matched)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
         Ok(())
     }
 }
@@ -1239,6 +1452,9 @@ fn session_from_row(r: &sqlx::postgres::PgRow) -> Result<Session, sqlx::Error> {
         campaign_key: r.try_get("campaign_key")?,
         closed: r.try_get("closed")?,
         pending_samples: r.try_get("pending_samples")?,
+        // A value this build cannot read is dropped, not fatal: the tags are labels.
+        pending_tags: serde_json::from_value(r.try_get::<Value, _>("attack_pending")?)
+            .unwrap_or_default(),
     })
 }
 
@@ -1250,9 +1466,9 @@ async fn write_session(
     sqlx::query(
         "INSERT INTO campaign_session (session_id, source_ip, sensor, run, first_seen, last_seen, \
              first_event_id, last_event_id, shapes, shape_chars, last_shape, chain, campaign_key, \
-             closed, pending_samples, payload, entry_shapes) \
+             closed, pending_samples, payload, entry_shapes, attack_pending) \
          VALUES ($1::uuid, $2::inet, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                 $16, $17) \
+                 $16, $17, $18) \
          ON CONFLICT (session_id) DO UPDATE SET \
            run = EXCLUDED.run, first_seen = EXCLUDED.first_seen, last_seen = EXCLUDED.last_seen, \
            first_event_id = EXCLUDED.first_event_id, last_event_id = EXCLUDED.last_event_id, \
@@ -1260,7 +1476,7 @@ async fn write_session(
            payload = EXCLUDED.payload, entry_shapes = EXCLUDED.entry_shapes, \
            last_shape = EXCLUDED.last_shape, chain = EXCLUDED.chain, \
            campaign_key = EXCLUDED.campaign_key, closed = EXCLUDED.closed, \
-           pending_samples = EXCLUDED.pending_samples",
+           pending_samples = EXCLUDED.pending_samples, attack_pending = EXCLUDED.attack_pending",
     )
     .bind(session_id)
     .bind(&s.source_ip)
@@ -1279,6 +1495,7 @@ async fn write_session(
     .bind(&s.pending_samples)
     .bind(s.digest.payload)
     .bind(s.digest.entry_shapes)
+    .bind(serde_json::to_value(&s.pending_tags).unwrap_or_else(|_| json!([])))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1639,6 +1856,23 @@ pub async fn scan_artifacts(
                     .bind(&i.value)
                     .bind(&i.detail)
                     .bind(&sha)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                for h in attack::tag_indicators(&found) {
+                    let Some(technique) = attack::rule(h.rule).map(|r| r.technique) else {
+                        continue;
+                    };
+                    sqlx::query(
+                        "INSERT INTO campaign_attack_tag (campaign_id, technique_id, rule_id, \
+                                                          artifact_sha256, matched) \
+                         SELECT id, $2, $3, $1, $4 FROM campaign WHERE kind = 'sample' AND key = $1 \
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&sha)
+                    .bind(technique)
+                    .bind(h.rule)
+                    .bind(&h.matched)
                     .execute(&mut *tx)
                     .await?;
                 }

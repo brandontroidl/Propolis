@@ -21,6 +21,11 @@
 
 ### Fixed
 
+- **The phone's `tr -C` complements, as `-c` does** - the toybox port treated `-C` as accepted
+  and ignored, but toybox 6.0.1's option string is `^>2<1Ccsd[+cC]`: the `[+cC]` group makes each
+  of the two set the other's flag, and the applet reads only the `c` flag, so `tr -Cd 'a-c'` keeps
+  `a`, `b` and `c` (`crates/sensor-framework/src/shell/tr.rs`).
+
 - **The phone's `getprop`, `setprop` and `ifconfig` are toybox's, not toolbox's** - the persona
   announces Android 6.0.1, whose `external/toybox/Android.mk` (tag `android-6.0.1_r81`) links all
   three into `/system/bin` and whose `system/core/toolbox` has no source for any of them, but the

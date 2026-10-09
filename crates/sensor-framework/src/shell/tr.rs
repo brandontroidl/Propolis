@@ -2,7 +2,8 @@
 //! (`tr -d '\n' < part > joined`) before it decodes it.
 //!
 //! Ported from toybox 6.0.1's `toys/pending/tr.c` (tag `android-6.0.1_r81`), quirks included: it
-//! reads only standard input, `-C` is accepted and does nothing (only `-c` complements), a `-s`
+//! reads only standard input, `-C` is `-c` (the `[+cC]` group of its option string makes the two
+//! set each other's flag, and only `FLAG_c` is read), a `-s`
 //! squeeze compares the previous output byte's whole map entry, a SET2 shorter than SET1 repeats
 //! its last byte, and a `[=c=]` class leaves `c` in the set twice. The option and operand
 //! refusals (`Needs 1 argument`, `Unknown option`) are `toyopt`'s. The Ubuntu shell's `tr` is
@@ -189,7 +190,7 @@ impl FakeShell {
             } else if options && arg.starts_with('-') && arg.len() > 1 {
                 for flag in arg.chars().skip(1) {
                     match flag {
-                        'c' => complement = true,
+                        'c' | 'C' => complement = true,
                         'd' => delete = true,
                         's' => squeeze = true,
                         _ => {}
@@ -328,10 +329,10 @@ mod tests {
             run(&mut sh, &format!("tr -cd 'a-c' {f}")),
             ("abc".into(), 0)
         );
-        // `-C` is accepted and complements nothing in this release, so this deletes a-c.
+        // `-C` sets `-c`'s flag too (`[+cC]` in the option string), so it complements as well.
         assert_eq!(
             run(&mut sh, &format!("tr -Cd 'a-c' {f}")),
-            ("\nd\n".into(), 0)
+            ("abc".into(), 0)
         );
     }
 

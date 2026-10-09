@@ -7,8 +7,8 @@
 //!
 //! - Options: `-c`/`-C`/`--complement`, `-d`/`--delete`, `-s`/`--squeeze-repeats`,
 //!   `-t`/`--truncate-set1`, the undocumented `-A`, `--help` and `--version`, with `getopt_long`
-//!   abbreviations. Option parsing stops at the first operand. Toybox accepts `-C` and ignores it,
-//!   and has no long options or `-t`.
+//!   abbreviations. Option parsing stops at the first operand. Toybox has no long options, `-t` or
+//!   `-A`.
 //! - Escapes: `\NNN` (one to three octal digits, a value above `\377` stops after two digits with
 //!   a warning), `\\`, `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`; any other backslash pair is the
 //!   second byte alone. Toybox adds `\xHH` and `\e` and keeps an unknown escape's backslash.

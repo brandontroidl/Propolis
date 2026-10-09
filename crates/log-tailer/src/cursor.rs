@@ -51,25 +51,48 @@ pub enum RotationEvent {
 /// log path always resolves to the same one across restarts.
 pub struct DurableCursor {
     log_path: PathBuf,
+    /// The path the cursor file name is derived from: `log_path` with symlinks, `.`, `..` and
+    /// repeated slashes resolved, so every spelling of one log shares one cursor (and the rotation
+    /// guard, which resolves the same way with `readlink -f`, finds it). See `canonical_key`.
+    key_path: PathBuf,
     cursor_dir: PathBuf,
+}
+
+/// `log_path` resolved as far as the filesystem allows, fixed once at construction: the whole
+/// path if it exists; otherwise its parent directory resolved with the file name appended (a log
+/// that has not been created yet); otherwise the path exactly as given. The fallbacks mean a
+/// cursor is never refused for want of a file, and agree with `readlink -f`, which the rotation
+/// guard uses.
+fn canonical_key(log_path: &Path) -> PathBuf {
+    if let Ok(path) = std::fs::canonicalize(log_path) {
+        return path;
+    }
+    let resolved_parent = log_path
+        .file_name()
+        .zip(log_path.parent().filter(|p| !p.as_os_str().is_empty()))
+        .and_then(|(name, parent)| Some(std::fs::canonicalize(parent).ok()?.join(name)));
+    resolved_parent.unwrap_or_else(|| log_path.to_path_buf())
 }
 
 impl DurableCursor {
     pub fn new(log_path: PathBuf, cursor_dir: PathBuf) -> Self {
+        let key_path = canonical_key(&log_path);
         Self {
             log_path,
+            key_path,
             cursor_dir,
         }
     }
 
     /// The on-disk path of this instance's persisted cursor file: the cursor directory joined
-    /// with a SHA-256 hex digest of the log path's raw bytes. Hashing rather than reusing the
-    /// log file's own name avoids collisions between sensors whose logs share a basename in
-    /// different directories, and needs no filesystem access, so it works even before the log
-    /// file or the cursor directory exist.
+    /// with a SHA-256 hex digest of the log path, resolved as `canonical_key` describes (the
+    /// bytes of the path as given when nothing of it can be resolved). Hashing rather than
+    /// reusing the log file's own name avoids collisions between sensors whose logs share a
+    /// basename in different directories. Resolution happens once, at construction, so a cursor
+    /// file is stable for the life of the instance.
     pub fn cursor_file_path(&self) -> PathBuf {
         let mut hasher = Sha256::new();
-        hasher.update(self.log_path.as_os_str().as_bytes());
+        hasher.update(self.key_path.as_os_str().as_bytes());
         let digest: [u8; 32] = hasher.finalize().into();
         self.cursor_dir
             .join(format!("{}.json", hex_encode(&digest)))

@@ -1,4 +1,5 @@
 use log_tailer::*;
+use std::path::PathBuf;
 
 #[test]
 fn save_and_load_round_trip() {
@@ -108,6 +109,37 @@ fn cursor_file_path_is_deterministic_per_log_path() {
     let a = DurableCursor::new(log_path.clone(), cursor_dir.clone());
     let b = DurableCursor::new(log_path, cursor_dir);
     assert_eq!(a.cursor_file_path(), b.cursor_file_path());
+}
+
+/// Every spelling of one log shares one cursor file, whether the log exists yet or not: the rotation
+/// guard resolves the path with `readlink -f` and must land on the file the daemon wrote.
+#[test]
+fn cursor_file_path_is_the_same_for_every_spelling_of_a_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+    let cursor_dir = dir.path().join("cursors");
+    let at = |p: PathBuf| DurableCursor::new(p, cursor_dir.clone()).cursor_file_path();
+
+    for exists in [false, true] {
+        if exists {
+            std::fs::write(real.join("events.jsonl"), "x").unwrap();
+        }
+        let canonical = at(real.join("events.jsonl"));
+        assert_eq!(at(dir.path().join("link/events.jsonl")), canonical);
+        assert_eq!(
+            at(PathBuf::from(format!(
+                "{}//real/./events.jsonl",
+                dir.path().display()
+            ))),
+            canonical
+        );
+        assert_eq!(at(dir.path().join("real/../link/events.jsonl")), canonical);
+    }
+    // Nothing resolvable: the path as given, still deterministic.
+    let ghost = PathBuf::from("/nonexistent-ctdrain/x/events.jsonl");
+    assert_eq!(at(ghost.clone()), at(ghost));
 }
 
 #[test]

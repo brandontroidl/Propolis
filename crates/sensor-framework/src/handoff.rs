@@ -1678,6 +1678,63 @@ mod tests {
         assert_eq!(finals[0].dropped, 1);
     }
 
+    /// Every counter lands in its own field. Each source holds a different value so a crossed
+    /// pair (truncated and refused, current and high-water) cannot pass.
+    #[test]
+    fn the_stats_snapshot_maps_every_counter_to_its_own_field() {
+        use crate::capture_budget::CAPTURE_CHUNK_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let handoff = CaptureHandoff::new(
+            crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000),
+            crate::emit::EventEmitter::new(dir.path().join("events.jsonl")),
+            1,
+            "test".to_string(),
+            crate::outbox::OutboxManifest::new(dir.path().join("outbox")),
+            Arc::new(CaptureMemoryBudget::new(2 * CAPTURE_CHUNK_BYTES)),
+        );
+        handoff.dropped.store(5, Ordering::Relaxed);
+        handoff.spool_refused.store(6, Ordering::Relaxed);
+        handoff.truncated_captures.store(7, Ordering::Relaxed);
+        handoff.refused_captures.store(8, Ordering::Relaxed);
+
+        let chunk = vec![0u8; CAPTURE_CHUNK_BYTES as usize];
+        let mut a = handoff.new_capture_body();
+        a.extend_from_slice(&chunk).unwrap();
+        a.extend_from_slice(&chunk).unwrap();
+        drop(a); // high water 2 chunks, current back to 0
+        let mut held = handoff.new_capture_body();
+        held.extend_from_slice(&chunk).unwrap(); // current 1 chunk
+        let mut starved = handoff.new_capture_body();
+        starved.extend_from_slice(&chunk).unwrap(); // takes the last chunk
+        assert!(starved.extend_from_slice(&chunk).is_err()); // one refused reservation
+        drop(starved);
+
+        let stats = handoff.stats_snapshot("ssh", true);
+        let chunk = CAPTURE_CHUNK_BYTES;
+        assert_eq!(
+            (
+                stats.dropped,
+                stats.spool_refused,
+                stats.truncated,
+                stats.refused
+            ),
+            (5, 6, 7, 8)
+        );
+        assert_eq!(
+            (
+                stats.budget_current,
+                stats.budget_high_water,
+                stats.budget_refused
+            ),
+            (chunk, 2 * chunk, 1)
+        );
+        assert!(stats.is_final);
+        assert_eq!(stats.sensor, "ssh");
+        drop(held);
+    }
+
     #[tokio::test]
     async fn a_hand_off_that_never_started_stats_writes_none_at_drain() {
         let dir = tempfile::tempdir().unwrap();

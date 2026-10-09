@@ -622,8 +622,11 @@ mod tests {
         let now: chrono::DateTime<chrono::Utc> = "2026-10-09T12:10:00Z".parse().unwrap();
         let rows = [
             stats_row("ssh", "2026-10-09T12:09:30Z", false),
-            // Last heard 6 minutes ago, and it was a shutdown line.
-            stats_row("telnet", "2026-10-09T12:04:00Z", true),
+            // Silent for 6 minutes with no shutdown line: stale, and not a clean stop.
+            stats_row("telnet", "2026-10-09T12:04:00Z", false),
+            // A shutdown line 10 s ago: a clean stop that is not yet stale. The two rows differ in
+            // BOTH flags, so a swap of stale and final cannot pass.
+            stats_row("ftp", "2026-10-09T12:09:50Z", true),
         ];
         let mut out = String::new();
         push_sensor_stats(&mut out, &rows, now);
@@ -641,7 +644,10 @@ mod tests {
             "propolis_sensor_stats_final{sensor=\"ssh\"} 0",
             "propolis_sensor_stats_age_seconds{sensor=\"telnet\"} 360",
             "propolis_sensor_stats_stale{sensor=\"telnet\"} 1",
-            "propolis_sensor_stats_final{sensor=\"telnet\"} 1",
+            "propolis_sensor_stats_final{sensor=\"telnet\"} 0",
+            "propolis_sensor_stats_age_seconds{sensor=\"ftp\"} 10",
+            "propolis_sensor_stats_stale{sensor=\"ftp\"} 0",
+            "propolis_sensor_stats_final{sensor=\"ftp\"} 1",
             // A stale sensor keeps its last values; staleness is what says they are history.
             "propolis_sensor_capture_queue_dropped_total{sensor=\"telnet\"} 11",
         ] {
@@ -677,8 +683,16 @@ mod tests {
                 .parse::<chrono::DateTime<chrono::Utc>>()
                 .unwrap(),
         );
-        assert!(out.contains("sensor=\"a\\\"b\\nc\""));
-        assert!(!out.lines().any(|l| l == "c\"} 11"));
+        // Every series line, of every metric, carries the escaped name on one line; a raw newline
+        // or quote in any one of them would leave a line that is neither a comment nor a series.
+        let series: Vec<&str> = out.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(series.len(), 11, "one series per metric:\n{out}");
+        for line in series {
+            assert!(
+                line.starts_with("propolis_sensor_") && line.contains("{sensor=\"a\\\"b\\nc\"} "),
+                "malformed series line `{line}`"
+            );
+        }
     }
 
     #[sqlx::test(migrations = false)]

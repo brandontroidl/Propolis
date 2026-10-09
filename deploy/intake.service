@@ -27,10 +27,12 @@
 #     configuration. Env vars (crates/intake/src/main.rs): DATABASE_URL (required, PostgreSQL
 #     connection string), PROPOLIS_SENSOR_LOGS (required, comma-separated name:path pairs, e.g.
 #     "catchall:/var/log/propolis/catchall/events.jsonl,ssh:/var/log/propolis/ssh/events.jsonl"),
-#     PROPOLIS_CURSOR_DIR (default /var/lib/propolis/cursors), PROPOLIS_POLL_INTERVAL_MS
-#     (default 1000).
-#   - /var/lib/propolis/cursors, owned by propolis-intake (matches PROPOLIS_CURSOR_DIR's
-#     default and the ReadWritePaths entry below).
+#     PROPOLIS_CURSOR_DIR (default /var/lib/propolis/cursors), PROPOLIS_QUARANTINE_DIR (default
+#     /var/lib/propolis/quarantine), PROPOLIS_POLL_INTERVAL_MS (default 1000).
+#   - /var/lib/propolis/cursors and /var/lib/propolis/quarantine, owned by propolis-intake (match
+#     PROPOLIS_CURSOR_DIR's and PROPOLIS_QUARANTINE_DIR's defaults and the ReadWritePaths entry
+#     below). The quarantine holds log lines the database always refuses; this standalone unit has
+#     no ops monitor, so it only logs when one is set aside (see docs/operations/retention.md).
 #   - PostgreSQL reachable at DATABASE_URL - provisioned and managed independently of this unit.
 #   - the built binary at /usr/local/bin/intake (crates/intake, bin target "intake").
 
@@ -69,8 +71,11 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # entry covers every sensor subdirectory under it (today: catchall, ssh) without needing an
 # update each time a sensor is added.
 ReadOnlyPaths=/var/log/propolis
-# The cursor directory is the only writable path besides /tmp (PrivateTmp above).
-ReadWritePaths=/var/lib/propolis/cursors
+# The cursor and quarantine directories are the only writable paths besides /tmp (PrivateTmp above).
+# The quarantine entry carries systemd's `-` prefix (a missing path is skipped, not a NAMESPACE
+# failure) so an existing install of this unit still starts after an upgrade; without the directory
+# a refused line cannot be set aside and intake stays on it, reporting why in its log.
+ReadWritePaths=/var/lib/propolis/cursors -/var/lib/propolis/quarantine
 
 # --- No privileged port binding ---
 # Intake binds no port at all - it is a consumer of sensor logs and a PostgreSQL client, not a

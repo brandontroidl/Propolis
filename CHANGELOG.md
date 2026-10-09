@@ -28,6 +28,19 @@
   in one journal line a minute. The table holds 4096 sources and a restart clears it. The
   handshake still completes before the reset (a closed port answers the SYN with an RST).
   `FakeShell::infection_completed` exposes the signal to any sensor.
+- **A log line the database always refuses is quarantined and intake moves on** - such a line
+  (a NUL in a captured command, which `jsonb` cannot hold, for one) used to hold its sensor's
+  intake at that line until an operator edited the log. After the same line is refused on three
+  polls in a row, for a reason that is the line's own (never a lost connection), intake appends it
+  to `/var/lib/propolis/quarantine/<sensor-label>.jsonl` (`PROPOLIS_QUARANTINE_DIR`; sensor, log
+  path, byte offset, SHA-256, SQLSTATE, a capped error, and the line itself, base64 when it is not
+  UTF-8), fsyncs the record, and only then moves past exactly that line and saves the cursor. If
+  the record cannot be written, or the directory is at its cap (64 MiB, 10,000 records), intake
+  stays on the line and the `intake-stalled` text says why. New ops alert `intake-line-quarantined`
+  (the monitor now has sixteen conditions), a `propolis_intake_lines_quarantined_total` counter on
+  `/metrics`, and a WARN log line in both the daemon and the standalone `intake`.
+  `deploy/provision.sh` creates the directory; `deploy/intake.service` gains it as an optional
+  `ReadWritePaths` entry. The directory is never cleaned automatically.
 
 ### Changed
 

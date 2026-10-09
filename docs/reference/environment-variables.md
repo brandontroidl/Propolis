@@ -140,6 +140,7 @@ variable in this section plus the universal ones above.
 |---|---|---|---|
 | `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, split on the first colon of each entry (`crates/log-tailer/src/sensor_logs.rs#parse_sensor_logs`, the one parser the daemon, standalone `intake`, `shipper`'s `SENSOR_LOGS` and `propolis-watch` share). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
 | `PROPOLIS_CURSOR_DIR` | no | `/var/lib/propolis/cursors` (`crates/propolis/src/config.rs#DEFAULT_CURSOR_DIR`) | any path; no validation |
+| `PROPOLIS_QUARANTINE_DIR` | no | `/var/lib/propolis/quarantine` (`crates/propolis/src/config.rs#DEFAULT_QUARANTINE_DIR`; standalone `intake`: `crates/intake/src/main.rs#DEFAULT_QUARANTINE_DIR`) | any path; blank = default. One `<sensor-label>.jsonl` per log holds each line the database refused on three polls in a row; created `0750` if missing (the default's parent is root-owned, so `deploy/provision.sh` creates it). Fixed caps of 64 MiB and 10,000 records, never cleaned; see [quarantined intake lines](../operations/health-and-observability.md#quarantined-intake-lines) |
 | `PROPOLIS_POLL_INTERVAL_MS` | no | `1000` (`crates/propolis/src/config.rs#DEFAULT_POLL_INTERVAL_MS`) | positive u64 ms; zero/unparseable → abort. Three intervals, if longer than ten minutes, become the `intake-lagging` age threshold (`crates/propolis/src/ops_alert/conditions/intake_lag.rs#age_threshold`) |
 
 ### Review

@@ -6,10 +6,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::converter::convert;
+use crate::quarantine::{Quarantine, QuarantinedLine};
 use chrono::{DateTime, Utc};
 use core_scoring::{EventInput, append_events};
 use log_tailer::LogTailer;
@@ -38,6 +40,10 @@ pub struct RunBatchResult {
     /// every failure. See `run_batch`'s doc comment for why the batch stops instead of skipping
     /// past it.
     pub errors: usize,
+    /// 1 when the line this batch failed on had been refused on [`WEDGE_POLLS`] polls in a row and
+    /// was set aside in the quarantine, so the tailer moved past it. Counts as forward progress
+    /// but not as ingestion or rejection. The batch still reports the database error in `errors`.
+    pub quarantined: usize,
 }
 
 impl RunBatchResult {
@@ -47,7 +53,38 @@ impl RunBatchResult {
     /// including after a partial commit, so a restart (an operator's response to a wedge page)
     /// does not replay what already committed. An idle failure moved nothing and is skipped.
     pub fn cursor_moved(&self) -> bool {
-        self.errors == 0 || self.ingested > 0 || self.rejected > 0 || self.probe_confirmations > 0
+        self.errors == 0
+            || self.ingested > 0
+            || self.rejected > 0
+            || self.probe_confirmations > 0
+            || self.quarantined > 0
+    }
+}
+
+/// A line set aside in the quarantine, for the operator-facing alert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineNotice {
+    pub sensor: String,
+    /// The log the line was read from.
+    pub log_path: PathBuf,
+    /// Offset of the line in the file it was read from.
+    pub byte_offset: u64,
+    pub sqlstate: Option<String>,
+    /// The quarantine file holding the record.
+    pub file: PathBuf,
+}
+
+impl std::fmt::Display for QuarantineNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: the line at byte offset {} of {} was refused by the database (SQLSTATE {}) and quarantined to {}",
+            self.sensor,
+            self.byte_offset,
+            self.log_path.display(),
+            self.sqlstate.as_deref().unwrap_or("none"),
+            self.file.display()
+        )
     }
 }
 
@@ -65,6 +102,15 @@ pub struct IntakeRunner {
     batch_size: usize,
     /// Which line the last failed poll stopped at, how many polls in a row it has, and why.
     wedge: Option<Wedge>,
+    /// Where a wedged line is set aside; `None` leaves it to the operator (reported, not skipped).
+    quarantine: Option<Quarantine>,
+    /// Why the wedged line could not be quarantined on the latest attempt.
+    quarantine_block: Option<String>,
+    quarantined_total: u64,
+    last_quarantine: Option<QuarantineNotice>,
+    /// Runs right after the append returns, before anything is decided from its outcome. Lets a
+    /// test land a `copytruncate` at the one moment production can: while the append is in flight.
+    after_append: Option<Box<dyn FnMut() + Send>>,
 }
 
 /// The same line refused on consecutive polls.
@@ -171,7 +217,36 @@ impl IntakeRunner {
             reported_sensors: BTreeSet::new(),
             batch_size: MIN_BATCH_LINES,
             wedge: None,
+            quarantine: None,
+            quarantine_block: None,
+            quarantined_total: 0,
+            last_quarantine: None,
+            after_append: None,
         }
+    }
+
+    /// Sets aside a line the database refuses on [`WEDGE_POLLS`] polls in a row, in `quarantine`,
+    /// and moves past it. Without this a wedged line is only reported (`wedged`). Both production
+    /// binaries call it; it is a builder step, not a constructor parameter, because the many
+    /// test and tool callers of `new` have no directory to write to and must not skip lines.
+    pub fn with_quarantine(mut self, quarantine: Quarantine) -> Self {
+        self.quarantine = Some(quarantine);
+        self
+    }
+
+    /// Lines this runner has quarantined since it started.
+    pub fn quarantined_total(&self) -> u64 {
+        self.quarantined_total
+    }
+
+    /// The most recent line this runner quarantined.
+    pub fn last_quarantine(&self) -> Option<&QuarantineNotice> {
+        self.last_quarantine.as_ref()
+    }
+
+    #[doc(hidden)]
+    pub fn set_after_append_hook(&mut self, hook: impl FnMut() + Send + 'static) {
+        self.after_append = Some(Box::new(hook));
     }
 
     /// How many bytes of this sensor's log are still unread; see
@@ -203,12 +278,19 @@ impl IntakeRunner {
 
     /// A description of the line this log is stuck on, once the database has refused the SAME
     /// line on [`WEDGE_POLLS`] consecutive polls for a reason that is the line's own (not a lost
-    /// connection). The runner does not skip or quarantine such a line: that is an operator
-    /// decision. It reports it, so the stall that follows has a cause attached.
+    /// connection). With a quarantine configured the runner sets such a line aside and moves on
+    /// in the same batch that reaches the threshold, so this stays `Some` only while that could
+    /// not be done, and then says why. Without one, the line is only reported: skipping it is an
+    /// operator decision. Either way the stall that follows has a cause attached.
     pub fn wedged(&self) -> Option<String> {
         let w = self.wedge.as_ref().filter(|w| w.polls >= WEDGE_POLLS)?;
+        let blocked = self
+            .quarantine_block
+            .as_deref()
+            .map(|why| format!("; the line was NOT quarantined, so intake stays on it: {why}"))
+            .unwrap_or_default();
         Some(format!(
-            "intake wedged at {}: the line observed {} was refused on {} consecutive polls (SQLSTATE {}): {}",
+            "intake wedged at {}: the line observed {} was refused on {} consecutive polls (SQLSTATE {}): {}{blocked}",
             self.sensor_name,
             w.observed_at.to_rfc3339(),
             w.polls,
@@ -264,9 +346,9 @@ impl IntakeRunner {
         let mut probes: Vec<(usize, String)> = Vec::new();
         let mut bytes_read = 0usize;
 
-        for (index, line) in lines.into_iter().enumerate() {
+        for (index, line) in lines.iter().enumerate() {
             bytes_read += line.len();
-            let event: SensorEvent = match serde_json::from_str(&line) {
+            let event: SensorEvent = match serde_json::from_str(line) {
                 Ok(event) => event,
                 Err(e) => {
                     tracing::warn!(
@@ -312,7 +394,7 @@ impl IntakeRunner {
                 line: index,
                 observed_at: input.observed_at,
                 sensor: input.sensor.clone(),
-                line_hash: hash_line(&line),
+                line_hash: hash_line(line),
             });
             events.push(input);
         }
@@ -321,6 +403,9 @@ impl IntakeRunner {
         // `append_events` routes each event to the scored or telemetry path the way the
         // single-event functions do, and on failure reports how many leading events are durable.
         let outcome = append_events(&self.pool, events).await;
+        if let Some(hook) = self.after_append.as_mut() {
+            hook();
+        }
         for p in &pending[..outcome.appended] {
             result.ingested += 1;
             self.last_ingested_observed_at = Some(p.observed_at);
@@ -355,6 +440,7 @@ impl IntakeRunner {
         match outcome.failure {
             None => {
                 self.wedge = None;
+                self.quarantine_block = None;
                 self.tailer.commit_batch();
             }
             Some(e) => {
@@ -365,13 +451,23 @@ impl IntakeRunner {
                     appended = outcome.appended,
                     "append failed, stopping batch"
                 );
-                self.note_failure(&e, pending.get(outcome.appended));
-                // Accept exactly the lines reached, computed from the lengths recorded when they
-                // were read; never by reading them again, which would go through rotation
-                // handling and could return a different file's lines (a `copytruncate` landing
-                // while the append was in flight). If the tailer cannot do that safely, the whole
-                // batch is read again: replayed, never skipped.
-                if reached == 0 || !self.tailer.commit_batch_through(reached) {
+                let failed = pending.get(outcome.appended);
+                let wedged_now = self.note_failure(&e, failed);
+                // A line refused on enough polls in a row is set aside and passed in this same
+                // call: the record is durable before the tailer moves (`quarantine_line`).
+                let quarantined = match failed {
+                    Some(p) if wedged_now => self.quarantine_line(p, &lines[p.line], &e),
+                    _ => false,
+                };
+                if quarantined {
+                    result.quarantined += 1;
+                }
+                // Otherwise accept exactly the lines reached, computed from the lengths recorded
+                // when they were read; never by reading them again, which would go through
+                // rotation handling and could return a different file's lines (a `copytruncate`
+                // landing while the append was in flight). If the tailer cannot do that safely,
+                // the whole batch is read again: replayed, never skipped.
+                if !quarantined && (reached == 0 || !self.tailer.commit_batch_through(reached)) {
                     if reached > 0 {
                         tracing::warn!(
                             sensor = %self.sensor_name,
@@ -388,17 +484,22 @@ impl IntakeRunner {
         result
     }
 
-    /// Tracks how many polls in a row the same line was refused for a reason of its own.
-    fn note_failure(&mut self, error: &core_scoring::RepoError, at: Option<&Pending>) {
+    /// Tracks how many polls in a row the same line was refused for a reason of its own, and
+    /// says whether THIS failure is one of those at or past [`WEDGE_POLLS`]. Only such a failure
+    /// may lead to quarantining: a connection error on the same line is not evidence about it.
+    fn note_failure(&mut self, error: &core_scoring::RepoError, at: Option<&Pending>) -> bool {
         // A failure that is not about one line (a dropped connection) says nothing about whether
         // the wedged line is still refused, so it neither counts toward nor clears the streak:
         // a database that blips between refusals must not keep the report from ever appearing.
         let Some(p) = at.filter(|_| error.is_event_specific()) else {
-            return;
+            return false;
         };
         let polls = match &self.wedge {
             Some(w) if w.line_hash == p.line_hash => w.polls + 1,
-            _ => 1,
+            _ => {
+                self.quarantine_block = None;
+                1
+            }
         };
         let wedge = Wedge {
             line_hash: p.line_hash,
@@ -411,6 +512,87 @@ impl IntakeRunner {
         if let Some(description) = self.wedged() {
             tracing::error!(sensor = %self.sensor_name, "{description}");
         }
+        polls >= WEDGE_POLLS
+    }
+
+    /// Writes the wedged line to the quarantine, then moves the tailer past exactly that line.
+    /// Returns whether it did both.
+    ///
+    /// The order is the guarantee: the record is fsynced (`Quarantine::append`) before the
+    /// tailer's position moves, and the position is persisted only after that, so no crash leaves
+    /// the cursor past a line that is not on disk. A write that fails leaves everything as it
+    /// was, wedged, with the reason in [`Self::wedged`] (fail closed); it is retried on the next
+    /// poll, so fixing the directory or freeing space unsticks intake without a restart.
+    ///
+    /// The tailer moves by the lengths recorded when the batch was read
+    /// (`LogTailer::commit_batch_through`), never by reading again: a read goes through rotation
+    /// handling, and a `copytruncate` that landed while the append was in flight would return the
+    /// new file's first line in place of this one. If the tailer refuses because the log changed
+    /// under the batch, the record already written stays (it is a true record of a refused line),
+    /// the batch is read again, and nothing is skipped.
+    fn quarantine_line(
+        &mut self,
+        p: &Pending,
+        line: &str,
+        error: &core_scoring::RepoError,
+    ) -> bool {
+        let Some(store) = self.quarantine.clone() else {
+            return false;
+        };
+        let Some(at) = self.tailer.uncommitted_line(p.line) else {
+            self.quarantine_block =
+                Some("the tailer cannot say where the line sits in its batch".into());
+            return false;
+        };
+        let sqlstate = error.sqlstate();
+        let text = error.to_string();
+        let written = store.append(&QuarantinedLine {
+            sensor: &self.sensor_name,
+            log_path: self.tailer.log_path(),
+            byte_offset: at.offset,
+            sqlstate: sqlstate.as_deref(),
+            error: &text,
+            raw: at.raw.as_deref().unwrap_or(line.as_bytes()),
+        });
+        let file = match written {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::error!(
+                    sensor = %self.sensor_name,
+                    error = %e,
+                    "intake: wedged line could not be quarantined; staying on it"
+                );
+                self.quarantine_block = Some(e.to_string());
+                return false;
+            }
+        };
+        if !self.tailer.commit_batch_through(p.line + 1) {
+            tracing::warn!(
+                sensor = %self.sensor_name,
+                "the log changed under the batch after its line was quarantined; it will be read again from the start"
+            );
+            return false;
+        }
+        if let Err(e) = self.tailer.persist_cursor() {
+            tracing::error!(
+                sensor = %self.sensor_name,
+                error = %e,
+                "intake: cursor persist after quarantining a line failed"
+            );
+        }
+        let notice = QuarantineNotice {
+            sensor: self.sensor_name.clone(),
+            log_path: self.tailer.log_path().to_path_buf(),
+            byte_offset: at.offset,
+            sqlstate,
+            file,
+        };
+        tracing::warn!(sensor = %self.sensor_name, "intake: line quarantined, {notice}");
+        self.wedge = None;
+        self.quarantine_block = None;
+        self.quarantined_total += 1;
+        self.last_quarantine = Some(notice);
+        true
     }
 
     /// Durably saves the tailer's current read position.
@@ -512,23 +694,31 @@ mod tests {
 
     #[test]
     fn the_cursor_is_persisted_whenever_the_position_moved() {
-        let moved = |ingested, rejected, probe_confirmations, errors| {
+        let moved = |ingested, rejected, probe_confirmations, errors, quarantined| {
             RunBatchResult {
                 ingested,
                 rejected,
                 probe_confirmations,
                 errors,
+                quarantined,
             }
             .cursor_moved()
         };
-        assert!(moved(0, 0, 0, 0), "a clean empty batch");
-        assert!(moved(5, 0, 0, 0));
-        assert!(moved(12, 0, 0, 1), "a partial commit before a refused line");
+        assert!(moved(0, 0, 0, 0, 0), "a clean empty batch");
+        assert!(moved(5, 0, 0, 0, 0));
         assert!(
-            moved(0, 3, 0, 1),
+            moved(12, 0, 0, 1, 0),
+            "a partial commit before a refused line"
+        );
+        assert!(
+            moved(0, 3, 0, 1, 0),
             "rejected lines committed before a refused line"
         );
-        assert!(!moved(0, 0, 0, 1), "an idle failure moved nothing");
+        assert!(!moved(0, 0, 0, 1, 0), "an idle failure moved nothing");
+        assert!(
+            moved(0, 0, 0, 1, 1),
+            "a quarantined line moved the position past it"
+        );
     }
 
     #[test]

@@ -77,10 +77,43 @@ struct UncommittedRead {
     /// bytes it consumed there, discards before it included. What lets
     /// [`LogTailer::commit_batch_through`] move the positions over a prefix without reading.
     spans: Vec<(usize, u64)>,
+    /// For each line the batch returned, in order: its own length including the `\n`. A span
+    /// minus this is the over-length bytes discarded just before the line, so together they give
+    /// the line's exact start offset.
+    lens: Vec<u64>,
+    /// The raw bytes of each returned line that was not valid UTF-8 (keyed by its position in the
+    /// batch), whose `String` form is lossy. Held only so a caller that must preserve a line
+    /// faithfully can; empty for ordinary logs.
+    raw_lossy: Vec<(usize, Vec<u8>)>,
     /// Number of drains queued before the batch; the source index of the current file.
     snapshot_drains: usize,
     /// False once a second read joined the batch: the spans no longer describe all of it.
     spans_valid: bool,
+}
+
+impl UncommittedRead {
+    /// Notes the lines one read returned, from the source they were read from.
+    fn record_read(&mut self, source: usize, read: &LineRead) {
+        let first = self.spans.len();
+        self.spans.extend(read.spans.iter().map(|&b| (source, b)));
+        self.lens.extend(read.lens.iter().copied());
+        self.raw_lossy.extend(
+            read.raw_lossy
+                .iter()
+                .map(|(i, raw)| (first + i, raw.clone())),
+        );
+    }
+}
+
+/// Where a line of the uncommitted batch came from, for a caller that sets a line aside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchLine {
+    /// Byte offset of the line's first byte in the file it was read from. That is the rotated-out
+    /// file when the line came from one still being drained.
+    pub offset: u64,
+    /// The line's exact bytes when they are not valid UTF-8 (the `String` the batch returned is
+    /// then lossy); `None` when the returned `String` is the line.
+    pub raw: Option<Vec<u8>>,
 }
 
 /// Tails one sensor's NDJSON log file. Holds the in-memory [`CursorState`] for the lifetime of
@@ -254,6 +287,8 @@ impl LogTailer {
                 drain_offsets: self.pending_drains.iter().map(|&(_, off)| off).collect(),
                 exhausted: VecDeque::new(),
                 spans: Vec::new(),
+                lens: Vec::new(),
+                raw_lossy: Vec::new(),
                 snapshot_drains: self.pending_drains.len(),
                 spans_valid: true,
             });
@@ -283,7 +318,7 @@ impl LogTailer {
                             budget_hit = read.budget_hit;
                             if let Some(u) = &mut self.uncommitted {
                                 let source = u.exhausted.len();
-                                u.spans.extend(read.spans.iter().map(|&b| (source, b)));
+                                u.record_read(source, &read);
                             }
                             entries.extend(read.entries);
                             // Fewer than requested means this old inode has no more lines,
@@ -324,7 +359,7 @@ impl LogTailer {
             self.advance(read.consumed as usize);
             if let Some(u) = &mut self.uncommitted {
                 let source = u.snapshot_drains;
-                u.spans.extend(read.spans.iter().map(|&b| (source, b)));
+                u.record_read(source, &read);
             }
             entries.extend(read.entries);
         }
@@ -398,6 +433,40 @@ impl LogTailer {
             }
         }
         true
+    }
+
+    /// Where line `index` of the uncommitted batch started, from the lengths recorded while it
+    /// was read (no read happens here, so rotation handling cannot substitute another file's
+    /// line). `None` when the batch has no such line or more than one read joined it.
+    pub fn uncommitted_line(&self, index: usize) -> Option<BatchLine> {
+        let u = self.uncommitted.as_ref()?;
+        if !u.spans_valid || index >= u.spans.len() || u.lens.len() != u.spans.len() {
+            return None;
+        }
+        let (source, span) = u.spans[index];
+        let before: u64 = u.spans[..index]
+            .iter()
+            .filter(|(s, _)| *s == source)
+            .map(|(_, bytes)| bytes)
+            .sum();
+        let base = if source < u.snapshot_drains {
+            *u.drain_offsets.get(source)?
+        } else {
+            u.offset
+        };
+        Some(BatchLine {
+            offset: base + before + (span - u.lens[index]),
+            raw: u
+                .raw_lossy
+                .iter()
+                .find(|(i, _)| *i == index)
+                .map(|(_, raw)| raw.clone()),
+        })
+    }
+
+    /// The log file this tailer follows.
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
     }
 
     /// Puts every read since the last commit back, so the next [`Self::read_batch`] returns the
@@ -1064,6 +1133,8 @@ fn read_lines_from(
     let mut line_bytes: u64 = 0;
     let mut budget_hit = false;
     let mut spans: Vec<u64> = Vec::new();
+    let mut lens: Vec<u64> = Vec::new();
+    let mut raw_lossy: Vec<(usize, Vec<u8>)> = Vec::new();
     // Bytes of discarded over-length lines since the last accepted line, charged to the next one.
     let mut discarded: u64 = 0;
 
@@ -1111,11 +1182,16 @@ fn read_lines_from(
         consumed += bytes_read as u64;
         line_bytes += bytes_read as u64;
         spans.push(discarded + bytes_read as u64);
+        lens.push(bytes_read as u64);
         discarded = 0;
         buf.pop(); // drop the trailing '\n'
         // Lossy rather than a hard error: a corrupt line should not crash the tailer. The
         // converter (Task 1) applies the real, fail-closed NDJSON validation downstream.
-        entries.push(TailEntry::Line(String::from_utf8_lossy(&buf).into_owned()));
+        let text = String::from_utf8_lossy(&buf);
+        if matches!(text, std::borrow::Cow::Owned(_)) {
+            raw_lossy.push((lines, buf.clone()));
+        }
+        entries.push(TailEntry::Line(text.into_owned()));
         lines += 1;
     }
 
@@ -1125,6 +1201,8 @@ fn read_lines_from(
         line_bytes,
         budget_hit,
         spans,
+        lens,
+        raw_lossy,
     })
 }
 
@@ -1145,6 +1223,10 @@ struct LineRead {
     budget_hit: bool,
     /// Bytes consumed by each accepted line, discards before it included.
     spans: Vec<u64>,
+    /// Each accepted line's own length, newline included.
+    lens: Vec<u64>,
+    /// Raw bytes of each accepted line that was not valid UTF-8, by its index in this read.
+    raw_lossy: Vec<(usize, Vec<u8>)>,
 }
 
 /// The offset just past the last `\n` in `path`, so a reader starting there never begins inside

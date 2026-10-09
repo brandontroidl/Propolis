@@ -98,7 +98,10 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
   is waiting; a spool series is absent, not zero, when unreadable.
 - Feed (from `manifest.json` when a feed dir is configured): `propolis_feed_entries{tier}`,
   `propolis_feed_window_entries{window}`, `propolis_feed_last_build_timestamp`.
-- In-memory process counters: `propolis_events_ingested_total`, `propolis_events_rejected_total`.
+- In-memory process counters: `propolis_events_ingested_total`, `propolis_events_rejected_total`,
+  and `propolis_intake_lines_quarantined_total` (lines intake set aside in the quarantine
+  directory, see [Quarantined intake lines](#quarantined-intake-lines); zero in the standalone
+  console, which tails nothing).
 - Intake backlog, one series per intake log, labelled `sensor` with its `PROPOLIS_SENSOR_LOGS`
   name, from what each intake loop recorded after its latest poll (unified daemon only; the
   standalone console tails nothing and publishes neither, rather than a zero that would claim a
@@ -204,9 +207,11 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
   a sensor's cursor stops moving with input waiting. When the database refused the same line on
   three consecutive polls, its detail quotes `intake wedged at <sensor>` with that event's
   `observed_at` and the SQLSTATE: one line the ledger will not accept (for example a NUL
-  character in a command, which `jsonb` cannot store) is holding that sensor, and intake does
-  not skip or quarantine it, so the line has to be removed from the log by the operator. An
-  intake that keeps moving but more slowly
+  character in a command, which `jsonb` cannot store). Intake sets such a line aside and moves
+  past it in that same poll ([`intake-line-quarantined`](#quarantined-intake-lines) below), so
+  `intake-stalled` quoting a wedge means the line could NOT be quarantined: the quoted text ends
+  with the reason (the quarantine directory is not writable, or it is full), and intake stays on
+  the line, skipping nothing, until that is fixed. An intake that keeps moving but more slowly
   than its sensor writes never trips it, and that is how a telnet log once grew to 6.6 GB over
   eleven days unnoticed. `intake-lagging` reads the two intake metrics above and fires when
   either rule holds for a log
@@ -265,6 +270,14 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
   daemon restarts. A rotation that finds the reader caught up and no `.1` is silent: the lines
   written between the copy and the truncate are the accepted loss. A truncation you made by hand
   while intake was behind also raises it. The hold is fixed, not a `PROPOLIS_OPS_*` variable;
+- a log line quarantined (`intake-line-quarantined`, Warning): intake set aside a line the
+  database refused on three polls in a row and moved past it, so a real sensor line is not in
+  the ledger. It fires on the next monitor poll with no hold, naming the sensor, the line's byte
+  offset, the SQLSTATE and the quarantine file, and clears (with a recovered notice) once
+  `REPAGE_COOLDOWN_SECS` has passed with no further quarantine, so one line pages once and a
+  second line inside that window extends it
+  (`crates/propolis/src/ops_alert/conditions/intake_quarantine.rs#IntakeLineQuarantined`). What
+  to do: [Quarantined intake lines](#quarantined-intake-lines);
 - vendor submission failure rate over `VENDOR_FAIL_PCT` (50%) within `VENDOR_WINDOW_SECS`
   (3600 s), gated by `VENDOR_MIN_SAMPLES` (20);
 - review backlog over `BACKLOG_MAX` (500) held for `BACKLOG_FOR_SECS` (900 s);
@@ -279,3 +292,62 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
 `PROPOLIS_OPS_NTFY_TOKEN` is an optional bearer token for a protected topic. See
 [integrations](../reference/integrations.md) and [troubleshooting: integrations and
 feed](../troubleshooting/integrations-and-feed.md).
+
+### Quarantined intake lines
+
+The ledger can refuse a line for a reason of the line itself: a NUL character in a captured
+command (`jsonb` cannot store it, SQLSTATE `22P05`), a value out of range, a constraint
+violation. Retrying never helps, and before this existed such a line held its sensor's intake
+at that line until an operator removed it from the log. Now, when the database has refused the
+same line on three polls in a row (`WEDGE_POLLS`) with an error that belongs to the line
+(SQLSTATE class 22 or 23, a failed validation, a stored-state decode failure; never a lost
+connection or a timeout), intake:
+
+1. appends one JSON record to `/var/lib/propolis/quarantine/<sensor-label>.jsonl`
+   (`PROPOLIS_QUARANTINE_DIR`; the label is the `PROPOLIS_SENSOR_LOGS` name, with anything
+   outside letters, digits, `_` and `-` replaced by `_`) and fsyncs it;
+2. only then moves its read position past exactly that line and saves the cursor
+   (`crates/intake/src/runner.rs#quarantine_line`). The position moves by the line lengths
+   recorded when the batch was read, never by reading again, so a `copytruncate` landing at that
+   moment cannot make it step over a line of the new file;
+3. logs `intake: line quarantined` at WARN, increments the `propolis_intake_lines_quarantined_total`
+   counter on `/metrics` (process lifetime, all logs), and raises `intake-line-quarantined`.
+
+If step 1 fails (the disk is full, the directory is not writable) intake does NOT skip: it stays
+on the line, `intake-stalled` quotes the write error, and the next poll tries again, so fixing
+the directory unsticks it without a restart. The store is bounded at 64 MiB and 10,000 records
+across all its files (`crates/intake/src/quarantine.rs#MAX_QUARANTINE_BYTES`,
+`crates/intake/src/quarantine.rs#MAX_QUARANTINE_RECORDS`); at the cap nothing more is quarantined
+and the next refused line wedges intake as above, with the cap in the alert text. The standalone
+`intake` binary does the same but has no ops monitor, so there the WARN log line is the only
+signal.
+
+Each record is one line of JSON:
+
+| Field | Meaning |
+|---|---|
+| `quarantined_at` | UTC time the line was set aside |
+| `sensor` | the `PROPOLIS_SENSOR_LOGS` label |
+| `log_path` | the log it was read from |
+| `byte_offset` | offset of the line's first byte in the file it was read from (the rotated-out file if rotation had already moved the log) |
+| `line_sha256` | SHA-256 of the line's exact bytes, newline excluded |
+| `sqlstate` | the database's SQLSTATE, or `null` when the refusal was not a database error |
+| `error` | the error text, flattened to one line and capped at 512 characters |
+| `line_encoding` | `utf8`, or `base64` when the line is not valid UTF-8 (the bytes are kept exactly) |
+| `line_truncated` | true when the line passed the tailer's 1 MiB line cap and `line` holds only its first MiB |
+| `line` | the line, in `line_encoding` |
+
+To look at them (the directory is `0750 propolis`):
+
+```sh
+sudo -u propolis tail -n 5 /var/lib/propolis/quarantine/telnet.jsonl
+sudo -u propolis jq -r '[.quarantined_at, .sqlstate, .byte_offset] | @tsv' /var/lib/propolis/quarantine/*.jsonl
+```
+
+The skipped event is not in the ledger and nothing re-reads it. To ingest it after all, correct
+whatever the database refused (for the NUL case, delete the `\u0000` escape from the line text),
+check the result is still one valid sensor event, and append it as one more line, with its
+newline, to that sensor's log as the sensor's own user or root; intake reads it as a new line and
+the event keeps its original `observed_at`. Editing a captured value is the operator's decision,
+and a line quarantined as `base64` has to be decoded first (`jq -r .line | base64 -d`). Records
+are never removed by Propolis: see [retention](./retention.md#quarantined-intake-lines).

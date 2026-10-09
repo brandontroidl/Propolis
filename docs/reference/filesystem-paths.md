@@ -89,6 +89,7 @@ for the full variable reference.
 |---|---|---|---|
 | SSH host key (generated first run, reused) | `PROPOLIS_SSH_HOST_KEY_PATH` | `/var/lib/propolis/ssh/host_key` (`sensor-ssh/src/main.rs#DEFAULT_HOST_KEY_PATH`) | `/var/lib/propolis/ssh` 0750 propolis-ssh (`deploy/provision.sh#ensure_dir /var/lib/propolis/ssh`) |
 | intake cursors (log tail position) | `PROPOLIS_CURSOR_DIR` | `/var/lib/propolis/cursors` (`intake/src/main.rs#DEFAULT_CURSOR_DIR`; `propolis/src/config.rs#DEFAULT_CURSOR_DIR`) | 0750 propolis (`deploy/provision.sh#ensure_dir /var/lib/propolis/cursors`) |
+| intake quarantine (log lines the database always refuses) | `PROPOLIS_QUARANTINE_DIR` | `/var/lib/propolis/quarantine` (`intake/src/main.rs#DEFAULT_QUARANTINE_DIR`; `propolis/src/config.rs#DEFAULT_QUARANTINE_DIR`) | 0750 propolis (`deploy/provision.sh#ensure_dir /var/lib/propolis/quarantine`); files 0640, never cleaned, capped at 64 MiB / 10,000 records |
 | feed publish output | `PROPOLIS_FEED_OUTPUT_DIR` | `/var/lib/propolis/feed/current` (`feed/src/main.rs#DEFAULT_OUTPUT_DIR`; `propolis/src/config.rs#DEFAULT_FEED_OUTPUT_DIR`) | `/var/lib/propolis/feed` 0755 propolis (`deploy/provision.sh#ensure_dir /var/lib/propolis/feed`) |
 | GeoIP databases | `PROPOLIS_GEOIP_DIR` | **no default - enrichment disabled when unset** (`geoip_dir` parse, `console/src/main.rs#load_config_from_env`; `feed/src/main.rs#load_config_from_env`) | not created by install.sh |
 | aggregated-node writable state | (unit grant) | `/var/lib/propolis` (`deploy/propolis.service#ReadWritePaths=/var/lib/propolis`) | `/var/lib/propolis` 0755 root (`deploy/provision.sh#root-owned, NOT propolis`) |
@@ -101,8 +102,8 @@ for the full variable reference.
   reads, not network requests**. Not created by `install.sh`; the operator
   provisions the files.
 - The aggregated node's `ReadWritePaths=/var/lib/propolis` is deliberately wider
-  than intake's cursors-only grant, because the single process owns cursors,
-  feed output, and spool together.
+  than intake's cursors-and-quarantine grant, because the single process owns cursors,
+  quarantine, feed output, and spool together.
 
 ## TLS material (per sensor)
 

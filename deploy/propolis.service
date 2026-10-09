@@ -57,7 +57,8 @@
 #     configuration" has the full example. Env vars (crates/propolis/src/config.rs):
 #     DATABASE_URL (required), PROPOLIS_DB_MAX_CONNECTIONS (default 10),
 #     PROPOLIS_SENSOR_LOGS (required, comma-separated name:path pairs),
-#     PROPOLIS_CURSOR_DIR (default /var/lib/propolis/cursors),
+#     PROPOLIS_CURSOR_DIR (default /var/lib/propolis/cursors), PROPOLIS_QUARANTINE_DIR (default
+#     /var/lib/propolis/quarantine - where intake sets aside a log line the database always refuses),
 #     PROPOLIS_POLL_INTERVAL_MS (default 1000), PROPOLIS_REVIEW_ENABLED (default true),
 #     PROPOLIS_QUEUE_SCAN_INTERVAL_SECS (default 60), PROPOLIS_SUBMIT_POLL_INTERVAL_SECS
 #     (default 30), PROPOLIS_VENDOR_{ABUSEIPDB,DSHIELD,OTX}_{KEY,URL,ENABLED,COOLDOWN_HOURS,
@@ -95,7 +96,7 @@
 #     PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS (default 21600 - 6h).
 #   - /var/log/propolis/{catchall,ssh}, owned by their respective sensor users (unchanged from
 #     deploy/sensor-catchall.service / deploy/sensor-ssh.service).
-#   - /var/lib/propolis/{cursors,feed,spool}, owned by propolis.
+#   - /var/lib/propolis/{cursors,quarantine,feed,spool}, owned by propolis.
 #   - /var/spool/propolis/fetched, owned by propolis (the malware fetcher's quarantine spool -
 #     unlike /var/spool/propolis/{catchall,ssh,adb,ftp}, which are each written by their OWN
 #     standalone sensor process and only READ here for VT scanning, this one is written by this

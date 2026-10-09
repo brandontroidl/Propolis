@@ -89,7 +89,7 @@ Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = u
 
 - **Total: 3754 test functions** (2372 unit + 1382 integration).
 - **DB-backed (`sqlx::test`): 284** - console 195, core-scoring 44, review 19,
-  intake 13, propolis 7, fleet 6. These provision a fresh database per test.
+  intake 18, propolis 7, fleet 6. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
   default suite stays offline-deterministic; run it manually with
@@ -124,7 +124,7 @@ Per-crate breakdown:
 | fleet | 23 | 32 | deploy_inventory_test, probe_test, store_test |
 | gateway | 11 | 13 | handshake, spool, verify |
 | geoip | 4 | 0 | - |
-| intake | 18 | 26 | audit_regressions, batched_runner, converter_test, end_to_end, probe_filter |
+| intake | 29 | 32 | audit_regressions, batched_runner, converter_test, end_to_end, probe_filter, quarantine |
 | log-tailer | 6 | 84 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
 | propolis | 137 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |

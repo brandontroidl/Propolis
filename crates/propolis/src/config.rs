@@ -15,6 +15,7 @@ use review::vendor::{FullVendorConfig, abuseipdb, dshield, otx};
 
 const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_CURSOR_DIR: &str = "/var/lib/propolis/cursors";
+const DEFAULT_QUARANTINE_DIR: &str = "/var/lib/propolis/quarantine";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_QUEUE_SCAN_INTERVAL_SECS: u64 = 60;
 const DEFAULT_SUBMIT_POLL_INTERVAL_SECS: u64 = 30;
@@ -81,6 +82,8 @@ pub struct PropolisConfig {
     // Intake
     pub sensor_logs: Vec<SensorLogConfig>,
     pub cursor_dir: PathBuf,
+    /// Where a log line the database always refuses is set aside so intake can move past it.
+    pub quarantine_dir: PathBuf,
     pub poll_interval: Duration,
     // Review
     pub review_enabled: bool,
@@ -509,6 +512,11 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
     let cursor_dir = env::var("PROPOLIS_CURSOR_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_CURSOR_DIR));
+    let quarantine_dir = env::var("PROPOLIS_QUARANTINE_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_QUARANTINE_DIR));
     let poll_interval_ms =
         parse_positive_u64("PROPOLIS_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL_MS)?;
 
@@ -708,6 +716,7 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         db_max_connections,
         sensor_logs,
         cursor_dir,
+        quarantine_dir,
         poll_interval: Duration::from_millis(poll_interval_ms),
         review_enabled,
         queue_scan_interval: Duration::from_secs(queue_scan_interval_secs),

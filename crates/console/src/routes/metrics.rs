@@ -322,6 +322,12 @@ async fn metrics(
     writeln!(out, "propolis_events_rejected_total {rejected}").unwrap();
 
     push_intake_lag(&mut out, (state.intake_lag)());
+    push_counter(
+        &mut out,
+        "propolis_intake_lines_quarantined_total",
+        "Log lines the database kept refusing that intake set aside in the quarantine directory and skipped, since process start.",
+        crate::intake_lag::LINES_QUARANTINED.load(std::sync::atomic::Ordering::Relaxed),
+    );
 
     // Console saturation: each of these moves only when a bound refused work, so a non-zero rate
     // is a login spray or a connection flood, not ordinary use.

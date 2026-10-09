@@ -7,7 +7,13 @@
 //! the metrics are absent rather than zero: zero would claim a log nobody measured is caught up.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
+
+/// Log lines the daemon's intake loops have set aside in the quarantine since process start,
+/// published as `propolis_intake_lines_quarantined_total`. A process-wide counter the daemon
+/// increments, like `server::STATS`, rather than a field on every `AppState`.
+pub static LINES_QUARANTINED: AtomicU64 = AtomicU64::new(0);
 
 /// One intake log's backlog after its latest poll.
 #[derive(Debug, Clone, PartialEq, Eq)]

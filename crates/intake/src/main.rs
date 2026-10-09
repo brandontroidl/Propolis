@@ -15,18 +15,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use intake::quarantine::Quarantine;
 use intake::runner::IntakeRunner;
 use log_tailer::LogTailer;
 use sqlx::PgPool;
 
 const ENV_DATABASE_URL: &str = "DATABASE_URL";
 const ENV_CURSOR_DIR: &str = "PROPOLIS_CURSOR_DIR";
+const ENV_QUARANTINE_DIR: &str = "PROPOLIS_QUARANTINE_DIR";
 const ENV_POLL_INTERVAL_MS: &str = "PROPOLIS_POLL_INTERVAL_MS";
 const ENV_SENSOR_LOGS: &str = "PROPOLIS_SENSOR_LOGS";
 const ENV_PROBE_SOURCE_IPS: &str = "PROPOLIS_FLEET_PROBE_SOURCE_IPS";
 const ENV_PROBE_INTERVAL: &str = "PROPOLIS_FLEET_PROBE_INTERVAL";
 
 const DEFAULT_CURSOR_DIR: &str = "/var/lib/propolis/cursors";
+/// Mirrored from `propolis::config`'s own default, same as the cursor directory.
+const DEFAULT_QUARANTINE_DIR: &str = "/var/lib/propolis/quarantine";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
 /// Mirrored from `propolis::config`'s own default; the two must stay equal or the window intake
 /// confirms in and the window the console trusts a confirmation in drift apart.
@@ -38,6 +42,7 @@ use log_tailer::SensorLogConfig;
 struct Config {
     database_url: String,
     cursor_dir: PathBuf,
+    quarantine_dir: PathBuf,
     poll_interval: Duration,
     sensor_logs: Vec<SensorLogConfig>,
     probe_sources: Arc<HashSet<IpAddr>>,
@@ -137,6 +142,11 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     let cursor_dir = env::var(ENV_CURSOR_DIR)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_CURSOR_DIR));
+    let quarantine_dir = env::var(ENV_QUARANTINE_DIR)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_QUARANTINE_DIR));
     let poll_interval_ms = parse_positive_u64(
         env::var(ENV_POLL_INTERVAL_MS).ok().as_deref(),
         DEFAULT_POLL_INTERVAL_MS,
@@ -159,6 +169,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
     Ok(Config {
         database_url,
         cursor_dir,
+        quarantine_dir,
         poll_interval: Duration::from_millis(poll_interval_ms),
         sensor_logs,
         probe_sources: Arc::new(probe_sources),
@@ -240,10 +251,12 @@ async fn run_sensor_loop(
     poll_interval: Duration,
     probe_sources: Arc<HashSet<IpAddr>>,
     probe_grace: Duration,
+    quarantine_dir: PathBuf,
 ) {
     let SensorLogConfig { name, log_path } = sensor;
     let tailer = LogTailer::new(log_path, cursor_dir);
-    let mut runner = IntakeRunner::new(tailer, pool, name.clone(), probe_sources, probe_grace);
+    let mut runner = IntakeRunner::new(tailer, pool, name.clone(), probe_sources, probe_grace)
+        .with_quarantine(Quarantine::new(quarantine_dir));
     tracing::info!(sensor = %name, "intake: tailer started");
 
     loop {
@@ -260,6 +273,7 @@ async fn run_sensor_loop(
                 rejected = result.rejected,
                 probe_confirmations = result.probe_confirmations,
                 errors = result.errors,
+                quarantined = result.quarantined,
                 "intake: batch processed"
             );
         }
@@ -271,7 +285,12 @@ async fn run_sensor_loop(
         }
 
         // A batch of nothing but probe lines still consumed input, so there may be more waiting.
-        if result.ingested == 0 && result.rejected == 0 && result.probe_confirmations == 0 {
+        // Same for a quarantined line: the lines behind it are waiting.
+        if result.ingested == 0
+            && result.rejected == 0
+            && result.probe_confirmations == 0
+            && result.quarantined == 0
+        {
             tokio::time::sleep(poll_interval).await;
         }
     }
@@ -313,6 +332,7 @@ async fn main() {
         let poll_interval = config.poll_interval;
         let probe_sources = config.probe_sources.clone();
         let probe_grace = config.probe_grace;
+        let quarantine_dir = config.quarantine_dir.clone();
         handles.push(tokio::spawn(async move {
             run_sensor_loop(
                 sensor,
@@ -321,6 +341,7 @@ async fn main() {
                 poll_interval,
                 probe_sources,
                 probe_grace,
+                quarantine_dir,
             )
             .await;
         }));

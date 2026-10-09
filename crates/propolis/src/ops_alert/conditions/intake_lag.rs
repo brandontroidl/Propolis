@@ -235,6 +235,7 @@ mod tests {
             wedge: None,
             rotation_loss: log_tailer::RotationLoss::default(),
             rotation_loss_at: None,
+            last_quarantine: None,
         }
     }
 

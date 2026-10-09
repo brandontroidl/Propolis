@@ -50,6 +50,7 @@ worth backing up:
 | `/var/spool/propolis/<sensor>` | Per-sensor capture spool | No (raw capture) |
 | `/var/spool/propolis/fetched` | Fetched malware samples (quarantine, 1 GB global budget) | No (custody evidence) |
 | `/var/lib/propolis/cursors` | Per-sensor log-read cursors | Rebuilds by re-reading logs, which records their events a second time |
+| `/var/lib/propolis/quarantine` | Log lines the database refused and intake set aside ([quarantined lines](health-and-observability.md#quarantined-intake-lines)) | No (the refused line may be gone from the log; the only copy) |
 | `/var/lib/propolis/ssh` | Persistent SSH host key | Regenerates, but changes the honeypot fingerprint |
 | `/var/lib/propolis/feed/current` | Published feed output | Rebuilds from the database on the next feed cycle |
 

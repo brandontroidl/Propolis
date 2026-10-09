@@ -97,6 +97,26 @@ Consequences for an operator:
   ([breadth sets](../reference/database.md#breadth-sets)), or later appends keep counting the
   deleted events' WANs and sensors.
 
+## Quarantined intake lines
+
+When the database refuses the same log line on three polls in a row, intake appends it to
+`/var/lib/propolis/quarantine/<sensor-label>.jsonl` and moves on
+(`PROPOLIS_QUARANTINE_DIR`; what the records hold and how to inspect or re-ingest one:
+[health and observability](./health-and-observability.md#quarantined-intake-lines)). These
+files are **never cleaned automatically**: nothing rotates, prunes or compresses them, and
+nothing but you reads them. They are bounded instead: once the directory holds 64 MiB or 10,000
+records, nothing more is quarantined, and the next refused line holds that sensor's intake until
+you make room (`crates/intake/src/quarantine.rs#MAX_QUARANTINE_BYTES`,
+`crates/intake/src/quarantine.rs#MAX_QUARANTINE_RECORDS`; both fixed, not variables). A line is
+typically a few hundred bytes to a few KiB, so the cap is a sign something is producing refused
+lines in bulk, not ordinary use. To make room, look at what is there first, then move or delete
+the files you are done with (`sudo -u propolis`, since the directory is `0750 propolis`); the
+next poll of a held sensor picks up the freed space without a restart. The records carry
+attacker-supplied text, so treat the files as captured evidence and keep them off any shared
+share. They are listed with the other on-disk state under [backup and
+restore](./backup-and-restore.md); do not confuse this directory with the malware fetcher's
+`fetched` spool, which has its own budget and cleanup above.
+
 ## Log rotation
 
 Sensor NDJSON logs under `/var/log/propolis/` are rotated by logrotate at `size 100M`,

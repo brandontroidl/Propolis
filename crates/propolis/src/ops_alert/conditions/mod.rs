@@ -7,6 +7,7 @@ pub mod chain;
 pub mod feed;
 pub mod intake;
 pub mod intake_lag;
+pub mod intake_quarantine;
 pub mod malware;
 pub mod sensor_log;
 pub mod subsystem;

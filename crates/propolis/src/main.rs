@@ -27,6 +27,7 @@ use console::AppState;
 use console::auth::{PasswordStore, RateLimiter, SessionStore};
 use console::log_buffer::LogBuffer;
 use feed::{ExclusionEngine, FeedBuilder, FeedConfig, Publisher};
+use intake::quarantine::Quarantine;
 use intake::runner::IntakeRunner;
 use log_tailer::LogTailer;
 use review::fetcher::{self, FetchDeps, guard::SystemResolver, http::FetchLimits};
@@ -166,10 +167,12 @@ async fn run_intake_sensor(
     intake_progress: IntakeProgress,
     probe_sources: Arc<HashSet<IpAddr>>,
     probe_grace: Duration,
+    quarantine_dir: PathBuf,
 ) {
     let SensorLogConfig { name, log_path } = sensor;
     let tailer = LogTailer::new(log_path, cursor_dir);
-    let mut runner = IntakeRunner::new(tailer, pool, name.clone(), probe_sources, probe_grace);
+    let mut runner = IntakeRunner::new(tailer, pool, name.clone(), probe_sources, probe_grace)
+        .with_quarantine(Quarantine::new(quarantine_dir));
     tracing::info!(sensor = %name, "intake: tailer started");
 
     // Seed the liveness entry so a sensor that never ingests still reads as "recently alive" until
@@ -193,9 +196,11 @@ async fn run_intake_sensor(
 
         // Publish intake liveness and lag for the ops-monitor's intake-stalled and intake-lagging
         // conditions, `/metrics` and the fleet pane.
+        // A quarantined line moved the cursor past a line the database refuses: progress, which
+        // counts like a rejected line here and nowhere else (the ingest counters below leave it out).
         let (advanced, backlog) = progress_from_batch(
             result.ingested,
-            result.rejected,
+            result.rejected + result.quarantined,
             result.probe_confirmations,
             result.errors,
         );
@@ -213,6 +218,11 @@ async fn run_intake_sensor(
             entry.last_ingested_observed_at = runner.last_ingested_observed_at();
             entry.wedge = runner.wedged();
             entry.record_rotation_loss(runner.rotation_loss(), Instant::now());
+            if result.quarantined > 0
+                && let Some(notice) = runner.last_quarantine()
+            {
+                entry.last_quarantine = Some((Instant::now(), notice.to_string()));
+            }
             // The set only grows, so an unchanged length is an unchanged set.
             if entry.reported_sensors.len() != runner.reported_sensors().len() {
                 entry.reported_sensors = runner.reported_sensors().iter().cloned().collect();
@@ -222,6 +232,13 @@ async fn run_intake_sensor(
         // The probe confirmations are logged but deliberately left out of the two counters
         // `/metrics` publishes as ingest volume: they are this node's own synthetic traffic, and
         // folding them in would inflate the number an operator reads as attacker activity.
+        if result.quarantined > 0 {
+            console::intake_lag::LINES_QUARANTINED.fetch_add(
+                result.quarantined as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
         if result.ingested > 0
             || result.rejected > 0
             || result.probe_confirmations > 0
@@ -237,6 +254,7 @@ async fn run_intake_sensor(
                 rejected = result.rejected,
                 probe_confirmations = result.probe_confirmations,
                 errors = result.errors,
+                quarantined = result.quarantined,
                 "intake: batch processed"
             );
         }
@@ -248,8 +266,13 @@ async fn run_intake_sensor(
         }
 
         // A batch of nothing but probe lines still consumed input, so there may be more waiting:
-        // sleeping here would halve the drain rate of a log the probe is writing into.
-        if result.ingested == 0 && result.rejected == 0 && result.probe_confirmations == 0 {
+        // sleeping here would halve the drain rate of a log the probe is writing into. Same for a
+        // quarantined line: the lines behind it are waiting.
+        if result.ingested == 0
+            && result.rejected == 0
+            && result.probe_confirmations == 0
+            && result.quarantined == 0
+        {
             tokio::select! {
                 _ = tokio::time::sleep(poll_interval) => {}
                 _ = cancel.cancelled() => {}
@@ -1114,6 +1137,7 @@ async fn main() {
     for sensor in config.sensor_logs {
         let pool = pool.clone();
         let cursor_dir = config.cursor_dir.clone();
+        let quarantine_dir = config.quarantine_dir.clone();
         let poll_interval = config.poll_interval;
         let cancel = cancel.clone();
         let sensor_name: &'static str = Box::leak(sensor.name.clone().into_boxed_str());
@@ -1130,6 +1154,7 @@ async fn main() {
                 let sensor = sensor.clone();
                 let pool = pool.clone();
                 let cursor_dir = cursor_dir.clone();
+                let quarantine_dir = quarantine_dir.clone();
                 let ing = ing.clone();
                 let rej = rej.clone();
                 let progress = progress.clone();
@@ -1147,6 +1172,7 @@ async fn main() {
                         progress,
                         probe_sources,
                         probe_grace,
+                        quarantine_dir,
                     )
                     .await;
                 }
@@ -2142,6 +2168,7 @@ mod intake_lag_source_tests {
             progress.clone(),
             Arc::new(HashSet::new()),
             Duration::from_secs(600),
+            dir.path().join("quarantine"),
         ));
 
         let drained = tokio::time::timeout(Duration::from_secs(10), async {

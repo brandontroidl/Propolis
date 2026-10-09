@@ -91,6 +91,9 @@ pub struct SensorIntake {
     pub rotation_loss: log_tailer::RotationLoss,
     /// Monitor-clock instant `rotation_loss` last grew; `None` while it never has.
     pub rotation_loss_at: Option<Instant>,
+    /// When this log's intake last set a refused line aside (`IntakeRunner::last_quarantine`) and
+    /// what it said about it; `intake-line-quarantined` fires on it for a while after.
+    pub last_quarantine: Option<(Instant, String)>,
 }
 
 impl SensorIntake {
@@ -105,6 +108,7 @@ impl SensorIntake {
             wedge: None,
             rotation_loss: log_tailer::RotationLoss::default(),
             rotation_loss_at: None,
+            last_quarantine: None,
         }
     }
 

@@ -146,11 +146,17 @@ original in place, so the sensor's open descriptor never needs to reopen
 - **Each generation queued while draining keeps its own resume point.** The saved cursor always
   describes the generation at the front of the drain queue. If a second rotation lands while the
   first copy is still being read and the process then restarts, the cursor names the first
-  generation, now `.2`: the restart finds it there by fingerprint, reads it from the saved offset,
-  then `.1` (rotated after it, so unread) from 0, then the live file. This needs `.2` to be
-  uncompressed, which the shipped `delaycompress` policy does not give once a second rotation has
-  run; the guard exists to prevent that rotation, and when it happens anyway the generation is
-  found missing and reported as a loss rather than skipped silently.
+  generation, now `.2` or, under the shipped `compress` + `delaycompress` policy, `.2.gz`: the
+  restart finds it there by fingerprint (for the gzip, the hash of the first 256 decompressed
+  bytes), reads it from the saved offset, then `.1` (rotated after it, so unread) from 0, then the
+  live file. A gzip is expanded, streaming, into an unlinked scratch file (in the cursor
+  directory) so the saved position stays a plain decompressed offset; expansion is capped at
+  512 MiB, past which the generation is reported lost. If the generation cannot be found at all
+  (a truncated or corrupt `.2.gz`, or a copy pushed deeper), the first poll after a start reads
+  the newer uncompressed copies from 0 rather than skipping them, accepting a repeat of anything a
+  stale `.1` holds over losing it, and reports the loss. A running tailer never does this: its
+  state follows the live file, so a non-matching copy is an older generation. The guard exists to
+  prevent a second rotation while a copy is unread.
 - **A committed prefix across a rotation is placed, not replayed.** When a copytruncate lands while
   a batch is being appended and the append fails partway, the runner accepts the lines that
   committed. With a verifiable `.1` the read position moves forward over them, so the next read

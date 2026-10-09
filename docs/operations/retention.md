@@ -157,9 +157,9 @@ keep every healthy sensor from rotating. The free-space check is a `stat` and a 
 `copytruncate` moves whatever the reader has not read into `events.jsonl.1`, and the tailer reads
 it from there before the new file
 ([concurrency and failure](../architecture/concurrency-and-failure.md#log-rotation-under-a-reader-that-is-behind)).
-That works only while the copy is still uncompressed: the next rotation renames `.1` to `.2` and
-compresses it, and the tailer opens only `.1` and, for a restart after a second rotation that
-skipped the guard, an uncompressed `.2`. After the free-space check, the guard therefore
+The next rotation renames `.1` to `.2` and compresses it, so the copy is only readable in place
+while it is `.1`; the tailer also finds it in `.2` or `.2.gz` when it restarts after a second
+rotation that skipped the guard (a gzip is expanded to a scratch file, capped at 512 MiB). After the free-space check, the guard therefore
 reads the reader's saved cursor (read-only; `<cursor dir>/<sha256 of the resolved log path>.json`
 (symlinks, `//` and `..` resolved, as the daemon names it), in
 `PROPOLIS_CURSOR_DIR`, default `/var/lib/propolis/cursors`, and `PROPOLIS_SHIPPER_CURSOR_DIR`,
@@ -169,7 +169,8 @@ covered) and skips the log when either holds:
 - `.1` has not been fully read: the cursor still carries `.1`'s fingerprint and sits short of its
   size. The tailer keeps its saved cursor in the old content until the drain of `.1` ends, so this
   is also true for the moment between a rotation and the reader noticing it. A cursor that still
-  carries `.2`'s fingerprint means `.1` was rotated after it and has not been read at all.
+  carries `.2`'s (or `.2.gz`'s, by its first 256 decompressed bytes) fingerprint means `.1` was
+  rotated after it and has not been read at all.
 - the live file holds more than 64 MiB the reader has not read
   (`PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES` overrides the bound). The bound is a judgement, not a
   measurement: two thirds of the shipped `size 100M`, so a log is skipped only when its reader has

@@ -55,9 +55,17 @@
   journal, and `deploy/config-check.sh` flags a log with no cursor and a cursor directory the
   rotation unit cannot see. Restart safety: a second rotation while the first copy drains no
   longer loses either generation on a restart (each queued generation keeps a resume point;
-  `.1`/`.2` are searched by fingerprint, an unfindable one is a reported loss); a restart
-  mid-drain with a live file under 256 bytes is no longer read as small-file growth; and a
-  copytruncate during a failed batch no longer re-appends the committed prefix. A skipped log makes `propolis-logrotate.service` show failed until a later
+  `.1`, `.2` and, under the shipped compress + delaycompress policy, `.2.gz` are searched by
+  fingerprint, the gzip expanded into an unlinked scratch file capped at 512 MiB; a generation
+  that cannot be found is a reported loss, and the first poll after a start then reads the
+  newer `.1`/`.2` from 0 instead of skipping them, which can repeat lines a stale `.1` holds);
+  a restart mid-drain with a live file under 256 bytes is no longer read as small-file growth;
+  and a copytruncate during a failed batch no longer re-appends the committed prefix. The
+  rotation guard also skips a cursor still inside `.2.gz`. Cursor files are now named by the
+  resolved log path; a cursor named by the path as configured is moved to the resolved name on
+  first load and the old file removed (a one-time migration, to be deleted once every
+  deployment has restarted on this version), so an upgrade does not re-read such a log from 0.
+  `log-tailer` gains a `flate2` dependency (the version already in the lockfile, vendored). A skipped log makes `propolis-logrotate.service` show failed until a later
   run rotates it. `logrotate --force` no longer discards a backlog: archive and truncate by hand
   ([intake backlog](docs/troubleshooting/intake-backlog.md#recovering-a-backlog-too-large-to-drain)).
   The "small window" wording in `deploy/logrotate-sensors.conf` and the docs now says what the

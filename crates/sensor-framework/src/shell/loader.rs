@@ -203,6 +203,14 @@ impl FakeShell {
         Some((bytes, known))
     }
 
+    /// Whether the file at `path` holds a program this session assembled from typed bytes: an ELF,
+    /// or something built by more than one write. A short script typed in one `echo` (a probe of
+    /// whether a directory is writable and executable) is an assembly of one chunk and no program.
+    pub(super) fn assembled_program(&self, path: &str) -> bool {
+        self.assembled_content(path)
+            .is_some_and(|(bytes, known)| bytes.starts_with(b"\x7fELF") || known.chunks > 1)
+    }
+
     /// `path` was made executable or is being run. When it is an assembled file it is handed to
     /// the capture once the line has run, and its bytes come back.
     pub(super) fn loader_trigger(&mut self, path: &str) -> Option<Vec<u8>> {

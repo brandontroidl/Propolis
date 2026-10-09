@@ -812,6 +812,28 @@ credential, then presents the fake shell.
   (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`). A timed-out or failed write ends the session (recorded as
   `TransportError` where a capture is armed), so a client that stops reading cannot
   hold the handler on a blocked `write_all`.
+- **Infected-source hold** (`crates/sensor-telnet/src/infected_hold.rs#InfectedHold`): a
+  Mirai-family loader repeats its infection every minute or two for as long as the target keeps
+  answering; on a real device the bot replaces telnetd, so the port closes and the loader moves
+  on. When a session ends having run a file it fetched (`wget`, `curl`, `tftp`, `ftpget`) or
+  assembled from typed bytes (an ELF, or a file of more than one write) natively, its source
+  is held (`crates/sensor-framework/src/shell/mod.rs#FakeShell::infection_completed`: status 0 from
+  a file with a fetch origin or an assembled-program digest). A build for another CPU
+  (Exec format error), a download never run, a one-`echo` script and an assembled downloader that
+  cannot reach its stage-2 server (status 1) do not count, so a per-architecture loop is held only
+  once its native build runs. For the hold, default 6 h, new connections from that source are
+  closed with `SO_LINGER` 0, so the peer reads a reset, before any banner, event or session
+  slot is spent (`crates/sensor-telnet/src/lib.rs#reset`). Other sources are served as ever; the
+  first session is recorded exactly as without the hold. A source is an IPv4 address or an IPv6
+  /64; the table holds 4096 sources, evicting the one expiring soonest, lives in memory only and is
+  empty after a restart. The hold is marked when the session ends or is cut off at
+  `max_duration`. `PROPOLIS_TELNET_INFECTED_HOLD_SECS` sets it (`0` to `604800`; `0` turns the
+  hold off and the startup log says so; anything else refuses to start). Refusals are counted
+  per source and in total, and one journal line a minute names the count, the distinct sources
+  and the five most refused; no event is written for a refusal. **Residual difference from a
+  closed port:** the kernel completes the handshake (a SYN-ACK is sent) before the reset, where a
+  closed port answers the SYN itself with an RST; a scanner that judges the port by the handshake
+  alone can tell.
 - **Bounds:** common defaults, `max_concurrent` 256. Spools only shell-phase evidence: a binary
   shell payload and the standard input a command read; there is no file-transfer protocol.
 - **Emits:** `honeypot_connection`, `honeypot_login_attempt`,

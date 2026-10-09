@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- **Miner and test-key indicators from captured artifacts** - found in a mobile dropper
+  analysed 2026-10-08. A script URL on `coinhive.com`, `coin-hive.com` or `authedmine.com`
+  (under `/lib/`) is a URL indicator labeled `CoinHive miner script`; a `CoinHive.Anonymous(` or
+  `CoinHive.User(` call is an embedded-credentials flag `CoinHive site key`, never the key
+  itself; and a zip carrying the public AOSP test key certificate (SHA-256 `A4:0D:A8:0A...:F5:DC`)
+  is an RSA-key indicator naming it. The certificate is seen when it is stored uncompressed, as
+  in the APK Signing Block of v2 and later; a deflated `META-INF/*.RSA` of a v1-only APK is not.
+  No schema change: the three reuse existing indicator kinds.
+
 ### Changed
 
 - **The review queue reads at a glance** - fifty-six pending rows had become a wall: a notes

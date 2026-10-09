@@ -517,8 +517,9 @@ async fn shutdown_drain_leaves_the_captured_body_in_the_spool_and_its_event_in_t
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     server.abort();
-    let outcome = server.handoff.drain(Duration::from_secs(10)).await;
-    assert_eq!(outcome, sensor_framework::DrainOutcome::Drained);
+    let report = server.handoff.drain(Duration::from_secs(10)).await;
+    assert!(report.is_clean());
+    assert_eq!(report.queue, sensor_framework::DrainOutcome::Drained);
 
     let on_disk = std::fs::read(spool_dir.join(sha_hex(&body))).expect("body is in the spool");
     assert_eq!(on_disk, body);
@@ -526,6 +527,60 @@ async fn shutdown_drain_leaves_the_captured_body_in_the_spool_and_its_event_in_t
     assert!(
         log.contains(SIGNAL_HONEYPOT_MALWARE_UPLOAD),
         "the upload event is in the log"
+    );
+}
+
+/// A transfer still open at shutdown (a full block received, no short final block yet) is cut by
+/// the drain and recorded as an incomplete sample, inside the deadline. TFTP runs its own request
+/// loop rather than `run_tcp_listener`, so this guards its separate wiring to the tracker.
+#[tokio::test]
+async fn a_transfer_in_flight_at_shutdown_is_recorded_as_truncated_within_the_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let spool_dir = dir.path().join("spool");
+    let server = sensor_tftp::start_test_server_with_capture_budget(
+        "127.0.0.1:0".parse().unwrap(),
+        log_path.clone(),
+        spool_dir.clone(),
+        Arc::new(WanResolver::new(HashMap::new())),
+        test_bounds(),
+        "test".to_string(),
+        dir.path().join("outbox"),
+        Arc::new(CaptureMemoryBudget::new(DEFAULT_CAPTURE_BUDGET_BYTES_256M)),
+        unlimited(),
+    )
+    .await
+    .unwrap();
+
+    let mut client = Client::new().await;
+    let transfer = client.begin_write(server.addr, "slow.bin", "octet").await;
+    let block = [9u8; BLOCK];
+    client.send_block(transfer, 1, &block).await;
+    client.expect_ack(transfer, 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    server.abort();
+    let deadline = Duration::from_secs(4);
+    let started = std::time::Instant::now();
+    let report = server.handoff.drain(deadline).await;
+    assert!(started.elapsed() < deadline, "drain exceeded its deadline");
+    assert_eq!(
+        report.connections,
+        sensor_framework::QuiesceOutcome::Cancelled(1)
+    );
+
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let upload: sensor_wire::SensorEvent = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<sensor_wire::SensorEvent>(l).ok())
+        .find(|e| e.signal_type == SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .expect("the in-flight transfer was recorded");
+    assert_eq!(upload.metadata["complete"], false);
+    assert_eq!(upload.metadata["end_reason"], "session_cancelled");
+    assert_eq!(upload.sample.as_ref().unwrap().size, BLOCK as u64);
+    assert_eq!(
+        std::fs::read(spool_dir.join(sha_hex(&block))).unwrap(),
+        block
     );
 }
 

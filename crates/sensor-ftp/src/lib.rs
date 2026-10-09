@@ -7,7 +7,7 @@ use std::sync::Arc;
 use sensor_framework::{
     CaptureHandoff, CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
     EventEmitter, MaybeTlsStream, OutboxManifest, QuarantineSpool, TlsServer, WanResolver,
-    listener_start_error, run_tcp_listener, run_tls_listener,
+    listener_start_error, run_tcp_listener_tracked, run_tls_listener_tracked,
 };
 use tokio::task::JoinHandle;
 
@@ -130,13 +130,15 @@ pub async fn start_listeners(
         let emitter = emitter.clone();
         let wan_resolver = wan_resolver.clone();
         let conn_bounds = bounds.clone();
+        let tracker = handoff.connections().clone();
         let handoff = handoff.clone();
         let result = match kind {
             ListenerKind::Plain { tls } => {
-                run_tcp_listener(
+                run_tcp_listener_tracked(
                     addr,
                     bounds.clone(),
                     per_source_cap,
+                    Some(tracker),
                     move |stream, peer, session_id| {
                         let local_addr = stream.local_addr().ok();
                         let (emitter, wan_resolver) = (emitter.clone(), wan_resolver.clone());
@@ -162,10 +164,11 @@ pub async fn start_listeners(
             }
             ListenerKind::Implicit { tls } => {
                 let session_tls = tls.clone();
-                run_tls_listener(
+                run_tls_listener_tracked(
                     addr,
                     bounds.clone(),
                     per_source_cap,
+                    Some(tracker),
                     tls,
                     move |stream, peer, local_addr, session_id| {
                         let (emitter, wan_resolver) = (emitter.clone(), wan_resolver.clone());

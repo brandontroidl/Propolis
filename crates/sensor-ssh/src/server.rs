@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
-use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener};
+use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener_tracked};
 use sensor_framework::{
     Arrival, BudgetLimits, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody,
     CaptureEnd, CaptureHandoff, CaptureJob, CaptureMemoryBudget, CaptureSource, CommandEventConfig,
@@ -356,10 +356,12 @@ pub async fn serve_with_handoff(
     let per_source_cap = Some(sensor_framework::default_per_source_cap(
         bounds.max_concurrent,
     ));
-    let (bound_addr, handle) = run_tcp_listener(
+    let tracker = handoff.connections().clone();
+    let (bound_addr, handle) = run_tcp_listener_tracked(
         addr,
         bounds,
         per_source_cap,
+        Some(tracker),
         move |stream, peer_addr, session_id| {
             let host_key = host_key.clone();
             let emitter = emitter.clone();

@@ -409,7 +409,7 @@ async fn main() {
     {
         tracing::warn!("sensor-ssh: command summaries not all written before shutdown");
     }
-    // Queued captures only; a connection cancelled mid-capture never submits (see handoff.rs).
+    // Cuts live connections (their captures are recorded as truncated), then drains the queue.
     handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
 }
 

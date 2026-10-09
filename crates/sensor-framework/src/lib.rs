@@ -13,6 +13,7 @@ pub mod capture_budget;
 pub mod command_codec;
 pub mod command_flood;
 pub mod config;
+pub mod connection_tracker;
 pub mod coverage;
 pub mod elf_body;
 pub mod emit;
@@ -49,10 +50,11 @@ pub use command_flood::{
     command_summary_event,
 };
 pub use config::SensorConfig;
+pub use connection_tracker::{CONNECTION_GRACE, ConnectionTracker, QuiesceOutcome};
 pub use emit::EventEmitter;
 pub use env::{EnvError, env_with_legacy, strict_env_var};
 pub use handoff::{
-    CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome,
+    CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome, DrainReport,
     END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, UploadEnd, session_end_metadata,
     upload_metadata,
 };
@@ -60,7 +62,10 @@ pub use held_input::{
     CAPTURE_REASON_ECHO_LOADER, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN,
     CaptureSource, Fed, HeldEnd, HeldInput, InputMode, MAX_HELD_CAPTURES, StdinCaptures,
 };
-pub use listener::{listener_start_error, run_tcp_listener, run_udp_listener, shutdown_signal};
+pub use listener::{
+    listener_start_error, run_tcp_listener, run_tcp_listener_tracked, run_udp_listener,
+    shutdown_signal,
+};
 pub use logging::init_logging;
 pub use outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
 pub use rate_limit::{
@@ -72,7 +77,7 @@ pub use sanitize::{sanitize_value, to_hex_bounded};
 pub use spool::{QuarantineSpool, SpoolError};
 pub use tls::{
     MaybeTlsStream, TlsConfigError, TlsServer, load_server_config, run_tls_listener,
-    server_config_from_pem, upgrade_buffered,
+    run_tls_listener_tracked, server_config_from_pem, upgrade_buffered,
 };
 pub use uuid::Uuid;
 pub use wan::WanResolver;

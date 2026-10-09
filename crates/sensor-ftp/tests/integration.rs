@@ -719,6 +719,105 @@ async fn stor_cut_off_by_max_duration_is_recorded_as_session_cancelled() {
     srv.stop();
 }
 
+/// SIGTERM while an upload is still arriving: `drain` cuts the connection after its grace period,
+/// the capture's destructor submits what it had buffered, and the drain writes it out. The sample
+/// and event exist the moment `drain` returns (no polling), the event says the upload was cut by
+/// the cancellation, and the whole thing stays inside the deadline.
+#[tokio::test]
+async fn stor_in_flight_at_shutdown_is_recorded_as_truncated_within_the_deadline() {
+    let srv = TestServer::start().await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    client.login("root", "toor").await;
+    let data_addr = client.pasv().await;
+    let r = client.send("STOR /tmp/inflight.bin").await;
+    assert!(r.starts_with("150"), "{r}");
+    let fragment = b"MZ-upload-still-arriving-at-sigterm";
+    let mut data = TcpStream::connect(data_addr).await.unwrap();
+    data.write_all(fragment).await.unwrap();
+    // The handler has to have read the bytes before the shutdown starts.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    srv.handle.abort();
+    let deadline = Duration::from_secs(4);
+    let started = std::time::Instant::now();
+    let report = srv.handoff.drain(deadline).await;
+    assert!(started.elapsed() < deadline, "drain exceeded its deadline");
+    assert_eq!(
+        report.connections,
+        sensor_framework::QuiesceOutcome::Cancelled(1)
+    );
+    assert!(report.is_clean());
+
+    let uploads = srv.uploads().await;
+    assert_eq!(uploads.len(), 1, "the in-flight upload was recorded");
+    assert_eq!(uploads[0].metadata["complete"], false);
+    assert_eq!(uploads[0].metadata["end_reason"], "session_cancelled");
+    assert_eq!(uploads[0].metadata["wire_size"], fragment.len() as u64);
+    let sample = uploads[0].sample.as_ref().unwrap();
+    assert_eq!(sample.size, fragment.len() as u64);
+    let on_disk = std::fs::read(srv.spool_dir.join(&sample.sha256)).expect("fragment is spooled");
+    assert_eq!(on_disk, fragment);
+    drop(data);
+}
+
+/// The implicit-FTPS listener is a separate `run_tls_listener_tracked` call from the plain one, so
+/// its connections need their own proof of registration. A TCP connection that never starts the
+/// handshake is enough: the slot is taken at accept.
+#[tokio::test]
+async fn an_implicit_ftps_connection_is_tracked_and_cut_by_drain() {
+    let srv = TestServer::start_tls().await;
+    let _raw = TcpStream::connect(srv.implicit_addr.unwrap())
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while srv.handoff.connections().live() != 1 {
+        assert!(std::time::Instant::now() < deadline, "connection untracked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    for h in &srv.extra_handles {
+        h.abort();
+    }
+    srv.handle.abort();
+    let report = srv.handoff.drain(Duration::from_secs(2)).await;
+    assert_eq!(
+        report.connections,
+        sensor_framework::QuiesceOutcome::Cancelled(1)
+    );
+}
+
+/// An upload that finishes inside the grace period is not cut: it is recorded complete, and the
+/// drain reports the connections idle.
+#[tokio::test]
+async fn stor_that_finishes_inside_the_shutdown_grace_is_recorded_complete() {
+    let srv = TestServer::start().await;
+    let mut client = FtpClient::connect(srv.addr).await;
+    client.login("root", "toor").await;
+    let data_addr = client.pasv().await;
+    let r = client.send("STOR /tmp/finishing.bin").await;
+    assert!(r.starts_with("150"), "{r}");
+    let mut data = TcpStream::connect(data_addr).await.unwrap();
+    data.write_all(b"first-half-").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    srv.handle.abort();
+    let script = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        data.write_all(b"second-half").await.unwrap();
+        drop(data);
+        let r = client.read_reply().await;
+        assert!(r.starts_with("226"), "{r}");
+        client.send("QUIT").await;
+    };
+    let (report, ()) = tokio::join!(srv.handoff.drain(Duration::from_secs(8)), script);
+    assert_eq!(report.connections, sensor_framework::QuiesceOutcome::Idle);
+
+    let uploads = srv.uploads().await;
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].metadata["complete"], true);
+    assert_eq!(uploads[0].sample.as_ref().unwrap().size, 22);
+}
+
 /// LIST with no data connection sent nothing; "Directory send OK" claimed otherwise.
 #[tokio::test]
 async fn list_without_a_data_connection_is_425() {

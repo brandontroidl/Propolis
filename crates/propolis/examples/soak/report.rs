@@ -54,8 +54,19 @@ pub struct SensorAccount {
     /// (rotation, lines lost) for every rotation, copytruncate or rename.
     pub per_rotation: Vec<(Rotation, u64)>,
     pub unexplained_ranges: Vec<(i64, i64)>,
+    /// The intake child's own rejected counter. It lives in the child's memory and reaches the
+    /// harness through a status file replaced once a second, so a SIGKILL loses what the last
+    /// write predates. Informational; the figures below come from the ledger.
     pub rejected_by_runner: u64,
     pub malformed_written: u64,
+    /// Malformed lines the intake read and rejected, derived from the ledger: those not behind a
+    /// poison line and not inside a stretch where valid lines went missing too.
+    pub malformed_passed: u64,
+    /// Malformed lines inside a stretch where valid lines are also missing (a copytruncate, or a
+    /// loss already reported as unexplained): the ledger cannot say whether they were read first.
+    pub malformed_lost: u64,
+    /// Malformed lines behind a poison line, which the intake never reached.
+    pub malformed_blocked: u64,
     pub rate_lps: f64,
 }
 
@@ -93,9 +104,11 @@ fn classify(acc: &mut SensorAccount, ledger: &WriterLedger, missing: &[(i64, i64
         .copied()
         .collect();
     designed.sort_unstable();
+    let mut malformed = ledger.malformed.clone();
+    malformed.sort_unstable();
     let g = Gaps {
         designed,
-        malformed: ledger.malformed.clone(),
+        malformed,
         poison_first: ledger.poison.iter().copied().min(),
     };
     acc.designed_written = g.designed.len() as u64;
@@ -108,10 +121,20 @@ fn classify(acc: &mut SensorAccount, ledger: &WriterLedger, missing: &[(i64, i64
             Some(p) => {
                 let lo = a.max(p as i64 + 1);
                 acc.blocked_behind_poison += non_designed(&g, lo, b);
+                acc.malformed_blocked += count_in(&g.malformed, lo, b);
                 b.min(p as i64)
             }
             None => b,
         };
+        // A malformed line is never in the ledger, so it always sits in a missing range. The
+        // intake read it unless valid lines around it are missing too; with nothing but designed
+        // lines in the range, both neighbours were ingested and it was read between them.
+        let malformed_here = count_in(&g.malformed, a, before_poison_end);
+        if non_designed(&g, a, before_poison_end) > 0 {
+            acc.malformed_lost += malformed_here;
+        } else {
+            acc.malformed_passed += malformed_here;
+        }
         let mut rotation_nd = 0;
         for (rotation, lost) in acc.per_rotation.iter_mut() {
             let lo = a.max(rotation.first_seq as i64);
@@ -464,6 +487,7 @@ pub fn evaluate(th: &Thresholds, f: &RunFacts) -> Vec<Check> {
     let mut rot_ok = true;
     let mut rot_lines = Vec::new();
     let mut rejected_ok = true;
+    let mut reject_lines = Vec::new();
     let dup_allow = f.restarts as u64 * th.dup_per_restart;
     for a in &f.accounts {
         let present_designed = a.designed_written - a.designed_missing.min(a.designed_written);
@@ -473,13 +497,42 @@ pub fn evaluate(th: &Thresholds, f: &RunFacts) -> Vec<Check> {
         if a.duplicates > dup_allow {
             dup_ok = false;
         }
-        let rejected_limit = a.malformed_written + dup_allow;
-        if a.rejected_by_runner > rejected_limit {
+        // The intake's counter can fall short of the ledger-derived figure only for a reason the
+        // run records: a restart (a SIGKILL loses the increments since its last status write), or
+        // a copytruncate that fell on a malformed line alone, which the ledger reads as passed.
+        let counter_shortfall = a.malformed_passed.saturating_sub(a.rejected_by_runner);
+        let shortfall_allowed = if f.restarts > 0 {
+            u64::MAX
+        } else {
+            a.per_rotation
+                .iter()
+                .filter(|(r, _)| r.copytruncate)
+                .count() as u64
+        };
+        let rejected_limit = a.malformed_passed + a.malformed_lost + dup_allow;
+        let counter_ok =
+            a.rejected_by_runner <= rejected_limit && counter_shortfall <= shortfall_allowed;
+        if !counter_ok {
             rejected_ok = false;
         }
+        reject_lines.push(format!(
+            "{}: {} of {} malformed lines rejected by the intake ({} lost with their neighbours, \
+             {} behind a poison line); the intake's own counter reads {}{}",
+            a.name,
+            a.malformed_passed,
+            a.malformed_written,
+            a.malformed_lost,
+            a.malformed_blocked,
+            a.rejected_by_runner,
+            if counter_shortfall > 0 && counter_ok {
+                format!(" ({counter_shortfall} short: its last status write predates a restart)")
+            } else {
+                String::new()
+            }
+        ));
         acct_lines.push(format!(
             "{}: written {} = ledger {} + designed-absent {} + rotation-lost {} + behind-poison {} + unexplained {} \
-             (duplicates {}, designed lines ingested {}, runner rejected {} of {} malformed)",
+             (duplicates {}, designed lines ingested {})",
             a.name,
             a.written,
             a.distinct,
@@ -489,8 +542,6 @@ pub fn evaluate(th: &Thresholds, f: &RunFacts) -> Vec<Check> {
             a.unexplained,
             a.duplicates,
             present_designed,
-            a.rejected_by_runner,
-            a.malformed_written,
         ));
         if a.unexplained > 0 {
             acct_lines.push(format!(
@@ -559,7 +610,11 @@ pub fn evaluate(th: &Thresholds, f: &RunFacts) -> Vec<Check> {
     push(
         "rejects are the designed ones",
         rejected_ok,
-        "the runner rejected no more lines than the malformed ones the writers produced".into(),
+        format!(
+            "rejected lines are counted from the ledger, not from the intake's counter, which a \
+             kill truncates: {}",
+            reject_lines.join("; ")
+        ),
     );
 
     push(
@@ -747,28 +802,8 @@ mod tests {
         assert_eq!(acc.unexplained, 4);
     }
 
-    #[test]
-    fn the_threshold_names_every_check_in_the_report() {
-        let facts = RunFacts {
-            points: Vec::new(),
-            final_point: None,
-            sensors: vec!["telnet".into()],
-            restarts: 0,
-            accounts: Vec::new(),
-            chain: "Intact".into(),
-            chain_ok: true,
-            mid_chain: Vec::new(),
-            child_unexpected_exit: false,
-            harness_errors: Vec::new(),
-            drained: true,
-            drain_took_secs: 1.0,
-            faults: Vec::new(),
-            duration_secs: 1.0,
-            generated_lps: 0.0,
-            rotations_copytruncate: 0,
-            rotations_rename: 0,
-        };
-        let th = Thresholds {
+    fn thresholds() -> Thresholds {
+        Thresholds {
             lag_p95_secs: 10.0,
             lag_max_secs: 60.0,
             catchup_secs: 600.0,
@@ -782,7 +817,117 @@ mod tests {
             submit_gap_secs: 120.0,
             dup_per_restart: 1000,
             drain_secs: 120.0,
+        }
+    }
+
+    fn facts(restarts: u32, accounts: Vec<SensorAccount>) -> RunFacts {
+        RunFacts {
+            points: Vec::new(),
+            final_point: None,
+            sensors: vec!["telnet".into()],
+            restarts,
+            accounts,
+            chain: "Intact".into(),
+            chain_ok: true,
+            mid_chain: Vec::new(),
+            child_unexpected_exit: false,
+            harness_errors: Vec::new(),
+            drained: true,
+            drain_took_secs: 1.0,
+            faults: Vec::new(),
+            duration_secs: 1.0,
+            generated_lps: 0.0,
+            rotations_copytruncate: 0,
+            rotations_rename: 0,
+        }
+    }
+
+    fn reject_check(restarts: u32, acc: SensorAccount) -> Check {
+        evaluate(&thresholds(), &facts(restarts, vec![acc]))
+            .into_iter()
+            .find(|c| c.name == "rejects are the designed ones")
+            .unwrap()
+    }
+
+    #[test]
+    fn malformed_lines_between_ingested_neighbours_were_rejected_by_the_intake() {
+        // Lines 120 and 70 are malformed; the ledger has everything else, so each sits alone in
+        // a gap. The last one is at the very end of the log, past the last ingested line.
+        let ledger = WriterLedger {
+            malformed: vec![70, 120, 199],
+            ..Default::default()
         };
+        let acc = classified(&ledger, &[(70, 70), (120, 120), (199, 199)]);
+        assert_eq!(
+            (
+                acc.malformed_passed,
+                acc.malformed_lost,
+                acc.malformed_blocked
+            ),
+            (3, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_malformed_line_inside_a_loss_or_behind_poison_is_not_counted_as_rejected() {
+        let ledger = WriterLedger {
+            malformed: vec![30, 120, 160],
+            poison: vec![150],
+            rotations: vec![rotation(true, 100, 150)],
+            ..Default::default()
+        };
+        // 30 stands alone; 120 shares a gap with valid lines lost to a copytruncate; 160 is
+        // behind the poison line.
+        let acc = classified(&ledger, &[(30, 30), (110, 130), (150, 199)]);
+        assert_eq!(
+            (
+                acc.malformed_passed,
+                acc.malformed_lost,
+                acc.malformed_blocked
+            ),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn a_kill_that_loses_the_last_status_write_does_not_read_as_a_missed_reject() {
+        // The shape of the 2026-10 kill run: all 113 malformed lines were rejected, the child's
+        // counter reached the status file for 112 of them before the SIGKILL.
+        let acc = SensorAccount {
+            name: "telnet".into(),
+            malformed_written: 113,
+            malformed_passed: 113,
+            rejected_by_runner: 112,
+            ..Default::default()
+        };
+        let check = reject_check(1, acc.clone());
+        assert!(check.pass, "{}", check.detail);
+        assert!(
+            check.detail.contains("113 of 113 malformed lines rejected"),
+            "{}",
+            check.detail
+        );
+        // With no restart nothing explains the missing increment.
+        let check = reject_check(0, acc);
+        assert!(!check.pass, "{}", check.detail);
+    }
+
+    #[test]
+    fn a_counter_above_what_the_malformed_lines_can_explain_fails() {
+        let acc = SensorAccount {
+            name: "telnet".into(),
+            malformed_written: 10,
+            malformed_passed: 10,
+            rejected_by_runner: 11,
+            ..Default::default()
+        };
+        assert!(!reject_check(0, acc).pass);
+    }
+
+    #[test]
+    fn the_threshold_names_every_check_in_the_report() {
+        let facts = facts(0, Vec::new());
+        let th = thresholds();
         // A run that never sampled anything must not read as healthy.
         let checks = evaluate(&th, &facts);
         let failed: Vec<&str> = checks.iter().filter(|c| !c.pass).map(|c| c.name).collect();

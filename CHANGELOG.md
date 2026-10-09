@@ -87,6 +87,12 @@
 
 ### Fixed
 
+- **The soak harness counts rejected lines from the ledger** - the intake child's rejected
+  counter reached the harness only through a status file written once a second, so a SIGKILL
+  lost the last increments (one kill run printed "rejected 112 of 113 malformed" with nothing
+  lost; a 2026-10-09 kill run showed 171 against 180). The report now derives the rejected
+  malformed lines from the ledger and shows the child's counter beside it, short only after a
+  restart. Harness only.
 - **A flaky "Text file busy" in the deploy tests** - `deploy_test` wrote fixture scripts and ran
   them while another test thread's fork could still hold the write descriptor, so
   `upgrade_guard_skips_the_pull_and_requires_the_carried_timestamp` and

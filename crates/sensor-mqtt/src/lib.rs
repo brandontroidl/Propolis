@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use sensor_framework::{
     CaptureHandoff, CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
-    EventEmitter, OutboxManifest, QuarantineSpool, TlsServer, WanResolver, run_tcp_listener,
-    run_tls_listener,
+    EventEmitter, OutboxManifest, QuarantineSpool, TlsServer, WanResolver,
+    run_tcp_listener_tracked, run_tls_listener_tracked,
 };
 use tokio::task::JoinHandle;
 
@@ -75,10 +75,12 @@ pub async fn start_plain_listener(
     let per_source_cap = Some(sensor_framework::default_per_source_cap(
         bounds.max_concurrent,
     ));
-    run_tcp_listener(
+    let tracker = handoff.connections().clone();
+    run_tcp_listener_tracked(
         addr,
         bounds.clone(),
         per_source_cap,
+        Some(tracker),
         move |stream, peer, session_id| {
             let local_addr = stream.local_addr().ok();
             let emitter = emitter.clone();
@@ -119,10 +121,12 @@ pub async fn start_tls_listener(
     let per_source_cap = Some(sensor_framework::default_per_source_cap(
         bounds.max_concurrent,
     ));
-    run_tls_listener(
+    let tracker = handoff.connections().clone();
+    run_tls_listener_tracked(
         addr,
         bounds.clone(),
         per_source_cap,
+        Some(tracker),
         tls,
         move |stream, peer, local_addr, session_id| {
             let emitter = emitter.clone();

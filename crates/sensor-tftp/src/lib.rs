@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
-    Arrival, CaptureHandoff, CaptureMemoryBudget, ConnectionBounds,
+    Arrival, CaptureHandoff, CaptureMemoryBudget, ConnectionBounds, ConnectionTracker,
     DEFAULT_CAPTURE_BUDGET_BYTES_256M, EventEmitter, FloodLedger, OutboxManifest, PerSourceLimiter,
     QuarantineSpool, RateDecision, RateLimitConfig, ReplyRateLimiter, WanResolver, arrival,
     default_per_source_cap,
@@ -155,6 +155,7 @@ pub async fn start_test_server_with_capture_budget(
         semaphore,
         limiter,
         flood.clone(),
+        handoff.connections().clone(),
     ));
     let summary_handle = tokio::spawn(arrival::scope(
         arrival,
@@ -188,6 +189,7 @@ async fn serve(
     semaphore: Arc<Semaphore>,
     limiter: PerSourceLimiter,
     flood: Arc<RequestFlood>,
+    tracker: ConnectionTracker,
 ) {
     let max_duration = sensor.bounds.max_duration;
     let mut buf = vec![0u8; RECV_BUFFER];
@@ -230,14 +232,19 @@ async fn serve(
             continue;
         };
         let sensor = sensor.clone();
+        // Registered before the spawn so a transfer is never live but uncounted.
+        let tracked = tracker.register();
+        let run_tracker = tracker.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let _source_guard = source_guard;
-            let handled = tokio::time::timeout(
+            let _tracked = tracked;
+            let handled = run_tracker.run(tokio::time::timeout(
                 max_duration,
                 arrival::scope(arrival, sensor.handle_request(peer, request)),
-            );
-            if handled.await.is_err() {
+            ));
+            // `None` is a shutdown cancellation: dropping the transfer submitted its capture.
+            if let Some(Err(_elapsed)) = handled.await {
                 tracing::warn!(%peer, "tftp: transfer exceeded max_duration; dropped");
             }
         });

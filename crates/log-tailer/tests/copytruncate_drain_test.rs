@@ -308,6 +308,70 @@ fn the_saved_cursor_stays_in_the_old_content_until_the_copy_is_drained() {
     assert_eq!(done.offset, std::fs::metadata(&log).unwrap().len());
 }
 
+/// The real guard (`deploy/logrotate-guard.sh`) reading what the real tailer saves, at each point
+/// of a rotation: rotation is skipped while the saved position is short of the end of `.1`, with
+/// the truncation not yet noticed or noticed and the copy half drained, and allowed once the copy
+/// is drained. Neither side is stubbed: the file format and the fingerprint rule are the contract.
+#[test]
+fn the_rotation_guard_reads_the_cursor_the_tailer_saves() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let cursors = dir.path().join("cursors");
+    let guard = |max_unread: &str| {
+        std::process::Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/logrotate-guard.sh"
+        ))
+        .arg(&log)
+        .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "0")
+        .env("PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES", max_unread)
+        .env("PROPOLIS_CURSOR_DIR", &cursors)
+        .env("PROPOLIS_SHIPPER_CURSOR_DIR", dir.path().join("none"))
+        .output()
+        .unwrap()
+    };
+    let stderr = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).into_owned();
+
+    let mut tailer = behind_tailer(dir.path(), &log, 40, 10);
+    tailer.persist_cursor().unwrap();
+    // Live log, 30 lines unread (about 1.4 KB): over a 100 byte bound, under a 1 MiB one.
+    let behind = guard("100");
+    assert_eq!(behind.status.code(), Some(1), "{}", stderr(&behind));
+    let fine = guard("1048576");
+    assert!(fine.status.success(), "{}", stderr(&fine));
+    assert!(!stderr(&fine).contains("no usable"), "{}", stderr(&fine));
+
+    // Rotated, the tailer not yet aware: its saved cursor is inside what is now `.1`.
+    copytruncate(&log);
+    append(&log, &text(&lines("new", 0..4)));
+    let unnoticed = guard("1048576");
+    assert_eq!(unnoticed.status.code(), Some(1), "{}", stderr(&unnoticed));
+    assert!(
+        stderr(&unnoticed).contains("not fully read"),
+        "{}",
+        stderr(&unnoticed)
+    );
+
+    // Noticed, half drained.
+    assert_eq!(tailer.read_batch(8).len(), 8);
+    tailer.commit_batch();
+    tailer.persist_cursor().unwrap();
+    let half = guard("1048576");
+    assert_eq!(half.status.code(), Some(1), "{}", stderr(&half));
+    assert!(
+        stderr(&half).contains("not fully read"),
+        "{}",
+        stderr(&half)
+    );
+
+    // Drained: the saved cursor is the new file's, and the guard lets the next rotation run.
+    drain(&mut tailer, 8, u64::MAX);
+    tailer.persist_cursor().unwrap();
+    let done = guard("1048576");
+    assert!(done.status.success(), "{}", stderr(&done));
+    assert!(!stderr(&done).contains("no usable"), "{}", stderr(&done));
+}
+
 /// A restart after a truncation with nothing to resume from: the old size was never observed, so
 /// the loss cannot be sized, but it is still reported rather than assumed zero.
 #[test]

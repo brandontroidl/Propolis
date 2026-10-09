@@ -2581,3 +2581,321 @@ fn logrotate_skips_only_the_log_the_guard_refuses() {
         "logrotate still writes its state file after a refusal"
     );
 }
+
+// ---- the guard's unread-input check ----
+//
+// `copytruncate` moves what the reader has not read into `<log>.1`, and the tailer drains it
+// from there. The guard reads the tailer's saved cursor (`DurableCursor::save`: JSON in
+// `<cursor dir>/<sha256 of the log path>.json`) and skips a rotation that would compress an
+// unread `.1` or hand the next drain too much. The other end of this contract, the real tailer's
+// saved cursor read by the real guard, is `crates/log-tailer/tests/copytruncate_drain_test.rs`.
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn fingerprint_of(path: &Path) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).unwrap();
+    Sha256::digest(&bytes[..bytes.len().min(256)]).to_vec()
+}
+
+/// Writes the cursor file the daemon would have saved for `log` into `dir`.
+fn save_cursor(dir: &Path, log: &Path, inode: u64, offset: u64, fingerprint: &[u8]) {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let name = sha256_hex(log.as_os_str().as_bytes());
+    let fp: Vec<String> = fingerprint.iter().map(|b| b.to_string()).collect();
+    std::fs::write(
+        dir.join(format!("{name}.json")),
+        format!(
+            "{{\"inode\":{inode},\"offset\":{offset},\"fingerprint\":[{}]}}",
+            fp.join(",")
+        ),
+    )
+    .unwrap();
+}
+
+fn inode_of(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).unwrap().ino()
+}
+
+/// The guard with its cursor directories pointed into the test, no free-space reserve, and the
+/// unread bound given (bytes).
+fn run_guard_reading(log: &Path, cursors: &Path, max_unread: &str) -> std::process::Output {
+    std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/logrotate-guard.sh"
+    ))
+    .arg(log)
+    .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "0")
+    .env("PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES", max_unread)
+    .env("PROPOLIS_CURSOR_DIR", cursors)
+    .env(
+        "PROPOLIS_SHIPPER_CURSOR_DIR",
+        cursors.join("shipper-unused"),
+    )
+    .output()
+    .expect("failed to run deploy/logrotate-guard.sh")
+}
+
+fn stderr_of(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// A log with a previous generation: `.1` of 4096 bytes and a live log.
+fn log_with_copy(dir: &Path) -> (PathBuf, PathBuf) {
+    let log = dir.join("events.jsonl");
+    let copy = dir.join("events.jsonl.1");
+    std::fs::write(&copy, vec![b'a'; 4096]).unwrap();
+    std::fs::write(&log, vec![b'b'; 300]).unwrap();
+    (log, copy)
+}
+
+/// The reader's cursor is still inside `.1` and short of its end: rotating again would compress
+/// `.1` into `.2.gz` before the reader got to the rest of it, so the log is skipped.
+#[test]
+fn the_guard_skips_a_log_whose_rotated_copy_is_not_fully_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let (log, copy) = log_with_copy(dir.path());
+    save_cursor(&cursors, &log, inode_of(&log), 1000, &fingerprint_of(&copy));
+
+    let out = run_guard_reading(&log, &cursors, "67108864");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("skipping rotation"), "{stderr}");
+    assert!(stderr.contains("not fully read"), "{stderr}");
+    assert!(stderr.contains("byte 1000 of 4096"), "{stderr}");
+}
+
+/// Rotation proceeds once the copy is read to its end, and once the reader has moved on into the
+/// new file (its cursor no longer carries `.1`'s fingerprint).
+#[test]
+fn the_guard_rotates_a_log_whose_rotated_copy_has_been_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let (log, copy) = log_with_copy(dir.path());
+
+    save_cursor(&cursors, &log, inode_of(&log), 4096, &fingerprint_of(&copy));
+    let at_end = run_guard_reading(&log, &cursors, "67108864");
+    assert!(at_end.status.success(), "{}", stderr_of(&at_end));
+
+    save_cursor(&cursors, &log, inode_of(&log), 120, &fingerprint_of(&log));
+    let moved_on = run_guard_reading(&log, &cursors, "67108864");
+    assert!(moved_on.status.success(), "{}", stderr_of(&moved_on));
+    assert!(
+        !stderr_of(&moved_on).contains("no usable"),
+        "the cursor was usable: {}",
+        stderr_of(&moved_on)
+    );
+}
+
+/// The bound is on bytes unread in the live file: over it skips, at it rotates.
+#[test]
+fn the_guard_skips_a_log_the_reader_is_too_far_behind_on_and_rotates_at_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let log = dir.path().join("events.jsonl");
+    std::fs::write(&log, vec![b'x'; 10_000]).unwrap();
+    let fp = fingerprint_of(&log);
+
+    // 2000 read, 8000 unread against a 5000 bound.
+    save_cursor(&cursors, &log, inode_of(&log), 2000, &fp);
+    let behind = run_guard_reading(&log, &cursors, "5000");
+    assert_eq!(behind.status.code(), Some(1), "{}", stderr_of(&behind));
+    assert!(
+        stderr_of(&behind).contains("8000 unread bytes"),
+        "{}",
+        stderr_of(&behind)
+    );
+
+    // Exactly the bound: rotates. One byte over: skips.
+    save_cursor(&cursors, &log, inode_of(&log), 5000, &fp);
+    assert!(run_guard_reading(&log, &cursors, "5000").status.success());
+    save_cursor(&cursors, &log, inode_of(&log), 4999, &fp);
+    assert_eq!(
+        run_guard_reading(&log, &cursors, "5000").status.code(),
+        Some(1)
+    );
+
+    // Caught up.
+    save_cursor(&cursors, &log, inode_of(&log), 10_000, &fp);
+    assert!(run_guard_reading(&log, &cursors, "5000").status.success());
+}
+
+/// A cursor past the end of the log means the reader has not yet seen a truncation: all of the
+/// current file is what it will read next.
+#[test]
+fn the_guard_counts_a_log_shorter_than_the_cursor_as_entirely_unread() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let log = dir.path().join("events.jsonl");
+    std::fs::write(&log, vec![b'x'; 8000]).unwrap();
+    save_cursor(&cursors, &log, inode_of(&log), 50_000, &[7u8; 32]);
+
+    let out = run_guard_reading(&log, &cursors, "5000");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("8000 unread bytes"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(run_guard_reading(&log, &cursors, "9000").status.success());
+}
+
+/// The shipper's cursor directory is read too (a collector node has a shipper, not an intake).
+#[test]
+fn the_guard_reads_the_shipper_cursor_directory_as_well() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    std::fs::write(&log, vec![b'x'; 8000]).unwrap();
+    let shipper = dir.path().join("shipper");
+    save_cursor(&shipper, &log, inode_of(&log), 0, &fingerprint_of(&log));
+
+    let out = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/logrotate-guard.sh"
+    ))
+    .arg(&log)
+    .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "0")
+    .env("PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES", "5000")
+    .env("PROPOLIS_CURSOR_DIR", dir.path().join("no-intake"))
+    .env("PROPOLIS_SHIPPER_CURSOR_DIR", &shipper)
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+}
+
+/// No cursor to read is not a reason to leave a log growing: it rotates, as before the check
+/// existed, and says why. A malformed cursor, an unreadable one and one for another inode are
+/// the same case.
+#[test]
+fn the_guard_rotates_and_says_why_when_no_cursor_can_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let (log, copy) = log_with_copy(dir.path());
+    // A `.1` and a huge live backlog would both skip a log with a readable cursor.
+    let behind = |c: &Path| run_guard_reading(&log, c, "1");
+
+    let absent = behind(&cursors);
+    assert!(absent.status.success(), "{}", stderr_of(&absent));
+    assert!(
+        stderr_of(&absent).contains("no usable intake cursor"),
+        "{}",
+        stderr_of(&absent)
+    );
+
+    save_cursor(&cursors, &log, inode_of(&log), 0, &fingerprint_of(&copy));
+    let name = std::fs::read_dir(&cursors)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(&name, "{ not json").unwrap();
+    let malformed = behind(&cursors);
+    assert!(malformed.status.success(), "{}", stderr_of(&malformed));
+    assert!(
+        stderr_of(&malformed).contains("malformed"),
+        "{}",
+        stderr_of(&malformed)
+    );
+    assert!(stderr_of(&malformed).contains("no usable intake cursor"));
+
+    save_cursor(
+        &cursors,
+        &log,
+        inode_of(&log) + 1,
+        0,
+        &fingerprint_of(&copy),
+    );
+    let other = behind(&cursors);
+    assert!(other.status.success(), "{}", stderr_of(&other));
+    assert!(
+        stderr_of(&other).contains("is for inode"),
+        "{}",
+        stderr_of(&other)
+    );
+
+    use std::os::unix::fs::PermissionsExt;
+    save_cursor(&cursors, &log, inode_of(&log), 0, &fingerprint_of(&copy));
+    std::fs::set_permissions(&name, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Running as root reads it anyway; only assert the unreadable path where it applies.
+    let unreadable = behind(&cursors);
+    if std::fs::read(&name).is_err() {
+        assert!(unreadable.status.success(), "{}", stderr_of(&unreadable));
+        assert!(
+            stderr_of(&unreadable).contains("unreadable"),
+            "{}",
+            stderr_of(&unreadable)
+        );
+    }
+}
+
+/// The default bound is 64 MiB: a log with more than that unread is skipped with no override.
+/// Skipped where the volume cannot hold the copy the free-space check demands.
+#[test]
+fn the_guards_default_unread_bound_is_sixty_four_mebibytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let log = dir.path().join("events.jsonl");
+    let f = std::fs::File::create(&log).unwrap();
+    f.set_len(160 * 1024 * 1024).unwrap();
+    drop(f);
+    let guard = |offset: u64| {
+        save_cursor(&cursors, &log, inode_of(&log), offset, &[7u8; 32]);
+        std::process::Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/logrotate-guard.sh"
+        ))
+        .arg(&log)
+        .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "0")
+        .env_remove("PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES")
+        .env("PROPOLIS_CURSOR_DIR", &cursors)
+        .env(
+            "PROPOLIS_SHIPPER_CURSOR_DIR",
+            cursors.join("shipper-unused"),
+        )
+        .output()
+        .unwrap()
+    };
+    let over = guard(96 * 1024 * 1024 - 1);
+    if stderr_of(&over).contains("refusing to rotate") {
+        eprintln!("this volume cannot hold a 160 MiB copy; skipping");
+        return;
+    }
+    assert_eq!(over.status.code(), Some(1), "{}", stderr_of(&over));
+    assert!(guard(96 * 1024 * 1024).status.success());
+}
+
+/// The check changes nothing about free space: a log that cannot be copied is refused for that
+/// before any cursor is consulted, with the existing message.
+#[test]
+fn the_guard_still_refuses_for_free_space_before_reading_a_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let log = dir.path().join("events.jsonl");
+    std::fs::write(&log, vec![b'x'; 4096]).unwrap();
+    save_cursor(&cursors, &log, inode_of(&log), 4096, &fingerprint_of(&log));
+    let out = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/logrotate-guard.sh"
+    ))
+    .arg(&log)
+    .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "999999999999999")
+    .env("PROPOLIS_CURSOR_DIR", &cursors)
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("refusing to rotate"),
+        "{}",
+        stderr_of(&out)
+    );
+}

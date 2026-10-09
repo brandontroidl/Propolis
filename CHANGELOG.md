@@ -106,6 +106,11 @@
 
 ### Fixed
 
+- **Samples no longer says "not fetched" for every uploaded file** - the Transport column describes
+  how the fetcher's connection was authenticated, which means nothing for a body a sensor took
+  from the address that sent it. Those rows now read `n/a, uploaded`; a body in the fetcher's
+  bucket with no successful fetch record reads `not recorded`; fetched files show their
+  transport as before.
 - **The fetcher never dials a public DNS resolver** - observed 2026-10-08: a telnet bot tested
   wget, curl, tftp and ftpget against `http://1.1.1.1/wget.sh` and its siblings, and the fetcher
   followed the URLs to Cloudflare. The never-dial check now also refuses the published addresses

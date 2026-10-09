@@ -5,6 +5,7 @@
 //! `src/main.rs` (the `review` binary) composes them into the submission
 //! daemon and CLI dispatch.
 
+pub mod attack;
 pub mod campaign;
 pub mod cli;
 pub mod fetcher;

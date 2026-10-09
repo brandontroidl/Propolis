@@ -17,13 +17,29 @@
   console publishes the values on `/metrics` as `propolis_sensor_capture_*` series labelled by
   sensor, with `propolis_sensor_stats_age_seconds`, `_stale` (past 180 s) and `_final`, so a dead
   sensor reads as stale, not as zeros. No new setting.
+- **ATT&CK technique tags on sessions, sources and campaigns** - deterministic rules over exact
+  evidence, no model: a shell line is parsed into commands and a rule reads a command's name,
+  operands and redirection targets, so `echo crontab` and a URL containing `cron` are not tagged.
+  Eighteen rules cover brute force (the `ssh_brute_force` signal), ingress tool transfer (downloads,
+  `wget`/`curl`/`tftp`/`ftpget`, uploads), Unix shell, cron, systemd units, rc scripts, authorized
+  keys, system, file and process discovery, permission changes, file deletion, miner indicators
+  and impaired defenses. Each tag keeps its rule, the event and the matched token. Checked against
+  ATT&CK Enterprise v19.2, which moved Impair Defenses: security-tool kills are T1685 and firewall
+  flushes T1686. T1078 and T1110.001 are not tagged (the honeypot accepts every credential and
+  stores no password). Migration `0017` adds `attack_tag`, `campaign_attack_tag` and
+  `campaign_session.attack_pending`; a command-sequence campaign carries the union of its runs'
+  tags. Read through `review::attack::{campaign_tags, source_tags, session_tags}`; the console
+  does not show them yet. No backfill: events indexed before the migration are tagged by the full
+  rebuild. Not published to the feed or to vendors.
+  See [ATT&CK tagging](docs/reference/attack-tagging.md).
 - **Miner and test-key indicators from captured artifacts** - found in a mobile dropper
   analysed 2026-10-08. A script URL on `coinhive.com`, `coin-hive.com` or `authedmine.com`
   (under `/lib/`) is a URL indicator labeled `CoinHive miner script`; a `CoinHive.Anonymous(` or
   `CoinHive.User(` call is an embedded-credentials flag `CoinHive site key`, never the key
   itself; and a zip carrying the public AOSP test key certificate (SHA-256 `A4:0D:A8:0A...:F5:DC`)
   is an RSA-key indicator naming it. The certificate is seen when it is stored uncompressed, as
-  in the APK Signing Block of v2 and later; a deflated `META-INF/*.RSA` of a v1-only APK is not.
+  in the APK Signing Block of v2 and later, and inside a deflated `META-INF/*.RSA` entry of a
+  v1-signed APK, which is inflated in memory up to 256 KiB (a signature block is a few KiB).
   No schema change: the three reuse existing indicator kinds.
 - **CI lints the shell scripts** - a `shellcheck` job (the v0.11.0 image, pinned by digest) runs
   over `deploy/*.sh` and `scripts/**/*.sh`. Its nine findings in `deploy/config-check.sh` and
@@ -99,6 +115,18 @@
 
 ### Fixed
 
+- **The soak harness counts rejected lines from the ledger** - the intake child's rejected
+  counter reached the harness only through a status file written once a second, so a SIGKILL
+  lost the last increments (one kill run printed "rejected 112 of 113 malformed" with nothing
+  lost; a 2026-10-09 kill run showed 171 against 180). The report now derives the rejected
+  malformed lines from the ledger and shows the child's counter beside it, short only after a
+  restart. Harness only.
+- **A flaky "Text file busy" in the deploy tests** - `deploy_test` wrote fixture scripts and ran
+  them while another test thread's fork could still hold the write descriptor, so
+  `upgrade_guard_skips_the_pull_and_requires_the_carried_timestamp` and
+  `upgrade_reexecs_once_when_the_pull_changes_the_script_and_does_not_pull_again` failed in 7 of
+  200 parallel runs. Writing an executable and spawning a child now share one lock, held across
+  the spawn and never the wait; 0 of 200 afterwards. Test-only.
 - **An upload in flight at SIGTERM is recorded, not dropped** - the capture shutdown drain only
   wrote jobs already queued; a capture still being assembled on a live connection was lost when
   the runtime dropped the connection after the queue had closed. Each capturing sensor (ssh,
@@ -119,7 +147,10 @@
   of Cloudflare, Google Public DNS, Quad9 and OpenDNS, IPv4 and IPv6 (sixteen in all), including
   their IPv4-mapped, NAT64 and 6to4 forms and any hostname that resolves to one. The attempt is
   recorded as `rejected` with the reason `Forbidden(PublicResolver)`, which the IP page already
-  shows beside the status.
+  shows beside the status. All sixteen addresses were checked on 2026-10-09 against the
+  operators' own pages, and each table entry now carries its source URL (the OpenDNS IPv6 pair
+  against Cisco's Umbrella IPv6 article); none was wrong. The operators also publish filtered
+  variants (Cloudflare `1.1.1.2`/`1.1.1.3`, Quad9 `9.9.9.10`/`9.9.9.11`), which are not blocked.
 - **A `copytruncate` rotation no longer discards what intake had not yet read** - found by the
   intake soak: with intake behind when the log rotated, the tailer restarted at offset 0 of the
   emptied file and every unread line of the old content, which by then existed only in

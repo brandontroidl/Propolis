@@ -133,13 +133,10 @@ for dir in "$intake_dir" "$shipper_dir"; do
         note "cursor $file is unreadable"
         continue
     fi
-    # The optional trailing "drained" object repeats the field names of the cursor itself; it is
-    # the last field and holds no nested braces, so dropping it leaves the top-level fields alone.
-    top="$(printf '%s' "$json" | sed 's/,"drained":{[^}]*}//')"
-    c_inode="$(printf '%s' "$top" | sed -n 's/.*"inode":\([0-9][0-9]*\).*/\1/p')"
-    c_offset="$(printf '%s' "$top" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p')"
-    c_fp="$(printf '%s' "$top" | sed -n 's/.*"fingerprint":\[\([0-9][0-9,]*\)\].*/\1/p')"
-    c_len="$(printf '%s' "$top" | sed -n 's/.*"fingerprint_len":\([0-9][0-9]*\).*/\1/p')"
+    c_inode="$(printf '%s' "$json" | sed -n 's/.*"inode":\([0-9][0-9]*\).*/\1/p')"
+    c_offset="$(printf '%s' "$json" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p')"
+    c_fp="$(printf '%s' "$json" | sed -n 's/.*"fingerprint":\[\([0-9][0-9,]*\)\].*/\1/p')"
+    c_len="$(printf '%s' "$json" | sed -n 's/.*"fingerprint_len":\([0-9][0-9]*\).*/\1/p')"
     if [ -z "$c_inode" ] || [ -z "$c_offset" ] || [ -z "$c_fp" ]; then
         note "cursor $file is malformed"
         continue

@@ -31,25 +31,6 @@ pub struct CursorState {
     /// Absent in a cursor written by an older version, which means "the first 256 bytes".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint_len: Option<u16>,
-    /// The last rotated copy this reader read to its end, if it has finished one. After a restart
-    /// that cannot find the generation it was reading, this is what lets it tell a rotated copy
-    /// that is newer (and unread) from an older one it already ingested. Absent in a cursor
-    /// written by an older version, or before any copy was finished.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drained: Option<DrainedCopy>,
-}
-
-/// Identity of a rotated copy that has been read to its end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DrainedCopy {
-    /// The copy's content fingerprint over `fingerprint_len` bytes.
-    pub fingerprint: [u8; 32],
-    pub fingerprint_len: u16,
-    /// The copy's inode, which survives the renames rotation does to it.
-    pub inode: u64,
-    /// When the reader finished it, in milliseconds since the Unix epoch. A copy modified after
-    /// this was written after the reader was done with that one, so it is newer.
-    pub drained_at_ms: u64,
 }
 
 /// What, if anything, changed about the log file since `CursorState` was recorded.

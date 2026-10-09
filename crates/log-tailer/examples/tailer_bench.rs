@@ -30,7 +30,6 @@ fn main() {
             offset,
             fingerprint: compute_fingerprint(&log),
             fingerprint_len: None,
-            drained: None,
         })
         .expect("seed cursor");
 

@@ -3049,11 +3049,10 @@ fn the_guard_logs_a_warning_when_it_rotates_without_a_cursor() {
     assert!(logged.contains("no usable intake cursor"), "{logged}");
 }
 
-/// A cursor that names its fingerprint window (`fingerprint_len`) and records a finished copy
-/// (`drained`, whose own `inode` and `fingerprint` must not be mistaken for the cursor's): `.1` is
-/// compared over the named window, and the top-level inode is the cursor's.
+/// A cursor that names its fingerprint window (`fingerprint_len`): `.1` is compared over that
+/// window, and over 256 bytes when the cursor names none.
 #[test]
-fn the_guard_reads_a_cursor_with_a_fingerprint_window_and_a_finished_copy() {
+fn the_guard_reads_a_cursor_with_a_fingerprint_window() {
     use sha2::{Digest, Sha256};
     use std::os::unix::ffi::OsStrExt;
     let dir = tempfile::tempdir().unwrap();
@@ -3076,7 +3075,7 @@ fn the_guard_reads_a_cursor_with_a_fingerprint_window_and_a_finished_copy() {
         .collect();
     let json = |len: &str| {
         format!(
-            "{{\"inode\":{},\"offset\":51,\"fingerprint\":[{}]{len},\"drained\":{{\"fingerprint\":[1,2],\"fingerprint_len\":200,\"inode\":999999999,\"drained_at_ms\":1}}}}",
+            "{{\"inode\":{},\"offset\":51,\"fingerprint\":[{}]{len}}}",
             inode_of(&log),
             fp.join(",")
         )
@@ -3099,11 +3098,6 @@ fn the_guard_reads_a_cursor_with_a_fingerprint_window_and_a_finished_copy() {
     std::fs::write(cursors.join(format!("{name}.json")), json("")).unwrap();
     let out = run_guard_reading(&log, &cursors, "67108864");
     assert!(out.status.success(), "{}", stderr_of(&out));
-    assert!(
-        !stderr_of(&out).contains("is for inode"),
-        "the drained inode must not be read as the cursor's: {}",
-        stderr_of(&out)
-    );
 }
 
 /// A skip is an error exit to logrotate, but logrotate still writes its state file, which is what

@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::cursor::{
-    CursorState, DrainedCopy, DurableCursor, RotationEvent, detect_rotation, fingerprint_with_len,
-    get_inode, head_matches,
+    CursorState, DurableCursor, RotationEvent, detect_rotation, fingerprint_with_len, get_inode,
+    head_matches,
 };
 
 /// One item of a batch read, in file order: a complete line, or the place where an over-length
@@ -149,7 +149,6 @@ impl LogTailer {
             offset: 0,
             fingerprint: [0u8; 32],
             fingerprint_len: None,
-            drained: None,
         });
         Self::with_state(log_path, Some(cursor), state)
     }
@@ -167,7 +166,6 @@ impl LogTailer {
                 offset: 0,
                 fingerprint: [0u8; 32],
                 fingerprint_len: None,
-                drained: None,
             },
             // A file that does not exist yet stamps inode 0 here too, so when it appears its
             // whole content is read: all of it was written after the start.
@@ -178,7 +176,6 @@ impl LogTailer {
                     offset: end_of_last_complete_line(&log_path),
                     fingerprint,
                     fingerprint_len: Some(len),
-                    drained: None,
                 }
             }
         };
@@ -350,9 +347,7 @@ impl LogTailer {
     /// Committing is not persisting. It only says the caller has taken responsibility for these
     /// lines; [`Self::persist_cursor`] is still what makes the position survive a restart.
     pub fn commit_batch(&mut self) {
-        if let Some(uncommitted) = self.uncommitted.take() {
-            self.note_finished_copies(uncommitted.exhausted);
-        }
+        self.uncommitted = None;
     }
 
     /// Accepts only the first `lines` lines of the uncommitted batch and puts the positions back
@@ -504,7 +499,6 @@ impl LogTailer {
                 offset: *offset,
                 fingerprint: *fingerprint,
                 fingerprint_len: Some(*len),
-                drained: self.state.drained,
             })
         });
         let state = resumable.unwrap_or(self.state);
@@ -529,7 +523,20 @@ impl LogTailer {
     /// drains to exhaustion before the new file.
     fn handle_rotation(&mut self) {
         match detect_rotation(&self.log_path, &self.state) {
-            RotationEvent::None => {}
+            RotationEvent::None => {
+                // The stored window matched. If it is narrower than a full fingerprint and the
+                // file has grown past it, take the wider one now: a stamp made while only the
+                // start of a first line was visible would otherwise stay that short for the whole
+                // generation, too little to tell a refilled file from the same one, or to match
+                // the rotated copy.
+                if self.state.fingerprint_len.is_some_and(|n| n < 256) {
+                    let (fingerprint, len) = fingerprint_with_len(&self.log_path);
+                    if self.state.fingerprint_len.is_some_and(|n| len > n) {
+                        self.state.fingerprint = fingerprint;
+                        self.state.fingerprint_len = Some(len);
+                    }
+                }
+            }
             RotationEvent::Truncated => self.recover_copytruncated(),
             RotationEvent::Replaced => {
                 // A rotated copy that carries the stored fingerprint is proof of a copytruncate,
@@ -595,9 +602,11 @@ impl LogTailer {
             }),
             None => Gz::Nowhere,
         };
+        // A generation that cannot be found is a loss; no rotated copy is read in its place, since
+        // nothing says whether one is older (already ingested) or newer than the lost one.
         let (generations, lost) = match find_generations(&self.log_path, &self.state, gz) {
             Ok(found) => (found.generations, found.newer_missing),
-            Err(reason) => (self.unread_copies_after_restart(), Some(reason)),
+            Err(reason) => (Vec::new(), Some(reason)),
         };
         let queued: Vec<u64> = self
             .pending_drains
@@ -628,70 +637,6 @@ impl LogTailer {
             self.record_loss(reason);
         }
         self.reset_to_current_file();
-    }
-
-    /// The rotated copies that are positively newer than anything this reader finished, for the
-    /// first poll after a start that cannot find the generation its cursor names.
-    ///
-    /// A copy is read from 0 only if the cursor records the last copy the reader FINISHED
-    /// (`drained`), the candidate is not that copy (same fingerprint, window and inode), and it was
-    /// modified after the reader finished that one, so it was written afterwards. That is exactly
-    /// the copies a second rotation pushed past the lost generation. Without the record (a cursor
-    /// from an older version, or a reader that never finished a copy), or for a copy it cannot
-    /// place, nothing is read: the usual case for a copy that is not provably newer is the
-    /// previous, fully ingested generation left by a manual `truncate` while the reader was
-    /// stopped, and reading it would re-ingest all of it. A running tailer never reads here: its
-    /// state follows the live file, so a non-matching copy is an older generation.
-    fn unread_copies_after_restart(&self) -> Vec<Generation> {
-        let Some(done) = self.state.drained.filter(|_| !self.size_observed) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for n in [2u32, 1] {
-            let Ok((file, size, head)) = open_generation(&self.log_path, n) else {
-                continue;
-            };
-            let Ok(meta) = file.metadata() else { continue };
-            let modified_ms = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64);
-            let (fingerprint, fingerprint_len) = own_fingerprint(&head);
-            let is_the_finished_copy = fingerprint == done.fingerprint
-                && fingerprint_len == done.fingerprint_len
-                && meta.ino() == done.inode;
-            let is_newer = modified_ms.is_some_and(|ms| ms > done.drained_at_ms);
-            if size > 0 && !is_the_finished_copy && is_newer {
-                out.push(Generation {
-                    file,
-                    offset: 0,
-                    fingerprint,
-                    fingerprint_len,
-                    is_stored: false,
-                });
-            }
-        }
-        out
-    }
-
-    /// Records that the copy whose drain was just released was read to its end.
-    fn note_finished_copies(&mut self, finished: VecDeque<File>) {
-        for file in finished {
-            let Ok(meta) = file.metadata() else { continue };
-            if let Some(&(_, fingerprint, fingerprint_len)) =
-                self.resumes.iter().find(|(ino, ..)| *ino == meta.ino())
-            {
-                self.state.drained = Some(DrainedCopy {
-                    fingerprint,
-                    fingerprint_len,
-                    inode: meta.ino(),
-                    drained_at_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_millis() as u64),
-                });
-            }
-        }
     }
 
     /// Counts and logs a truncation whose unread content could not be recovered. Stays silent when
@@ -1269,7 +1214,6 @@ mod tests {
             offset,
             fingerprint: Sha256::digest(head).into(),
             fingerprint_len: Some(head.len() as u16),
-            drained: None,
         };
         (log, state)
     }

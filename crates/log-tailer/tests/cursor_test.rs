@@ -12,7 +12,6 @@ fn save_and_load_round_trip() {
         offset: 6,
         fingerprint: [0u8; 32],
         fingerprint_len: None,
-        drained: None,
     };
     cursor.save(&state).unwrap();
     let loaded = cursor.load().unwrap().unwrap();
@@ -51,7 +50,6 @@ fn detect_truncation_when_offset_exceeds_size() {
         offset: 1000, // way past file size
         fingerprint: compute_fingerprint(&log_path),
         fingerprint_len: None,
-        drained: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::Truncated));
@@ -68,7 +66,6 @@ fn detect_no_rotation_when_offset_within_size() {
         offset: 5,
         fingerprint: compute_fingerprint(&log_path),
         fingerprint_len: None,
-        drained: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::None));
@@ -86,7 +83,6 @@ fn detect_inode_changed_when_inode_differs() {
         offset: 5,
         fingerprint: compute_fingerprint(&log_path),
         fingerprint_len: None,
-        drained: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::InodeChanged));
@@ -105,7 +101,6 @@ fn detect_replaced_when_same_inode_but_fingerprint_differs() {
         offset: 5, // still within the file's size
         fingerprint: wrong_fingerprint,
         fingerprint_len: None,
-        drained: None,
     };
     let rotation = cursor.detect_rotation(&state);
     assert!(matches!(rotation, RotationEvent::Replaced));
@@ -179,7 +174,6 @@ fn a_cursor_named_by_the_configured_path_is_migrated_not_lost() {
         offset: 4,
         fingerprint,
         fingerprint_len: None,
-        drained: None,
     };
     std::fs::write(&legacy, serde_json::to_vec(&state).unwrap()).unwrap();
 
@@ -225,7 +219,6 @@ fn when_both_cursor_names_exist_the_newer_one_wins() {
             offset,
             fingerprint: compute_fingerprint(&configured),
             fingerprint_len: None,
-            drained: None,
         };
         std::fs::write(&legacy, serde_json::to_vec(&at(2)).unwrap()).unwrap();
         std::fs::write(&canonical, serde_json::to_vec(&at(4)).unwrap()).unwrap();
@@ -245,10 +238,11 @@ fn when_both_cursor_names_exist_the_newer_one_wins() {
     }
 }
 
-/// The additive fields round-trip, and a cursor written without them still loads (an older
-/// version's file), with the old meaning: the first 256 bytes, no finished copy.
+/// The window field round-trips, and a cursor written without it still loads (an older version's
+/// file), with the old meaning: the first 256 bytes. A field this version does not know (a
+/// cursor from a build that has since dropped it) is ignored, not an error.
 #[test]
-fn the_window_and_finished_copy_fields_are_additive() {
+fn the_window_field_is_additive() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("events.jsonl");
     std::fs::write(&log_path, "x\n").unwrap();
@@ -258,20 +252,18 @@ fn the_window_and_finished_copy_fields_are_additive() {
         offset: 2,
         fingerprint: [3u8; 32],
         fingerprint_len: Some(51),
-        drained: Some(DrainedCopy {
-            fingerprint: [4u8; 32],
-            fingerprint_len: 200,
-            inode: 9,
-            drained_at_ms: 1_700_000_000_000,
-        }),
     };
     cursor.save(&full).unwrap();
+    assert_eq!(cursor.load().unwrap(), Some(full));
+
+    let unknown = r#"{"inode":7,"offset":2,"fingerprint":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],"fingerprint_len":51,"drained":{"inode":9}}"#;
+    std::fs::write(cursor.cursor_file_path(), unknown).unwrap();
     assert_eq!(cursor.load().unwrap(), Some(full));
 
     let old = r#"{"inode":7,"offset":2,"fingerprint":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]}"#;
     std::fs::write(cursor.cursor_file_path(), old).unwrap();
     let loaded = cursor.load().unwrap().unwrap();
-    assert_eq!((loaded.fingerprint_len, loaded.drained), (None, None));
+    assert_eq!(loaded.fingerprint_len, None);
     cursor.save(&loaded).unwrap();
     assert_eq!(
         std::fs::read_to_string(cursor.cursor_file_path()).unwrap(),
@@ -346,7 +338,6 @@ fn atomic_save_does_not_corrupt_on_partial_write() {
         offset: 10,
         fingerprint: [1u8; 32],
         fingerprint_len: None,
-        drained: None,
     };
     cursor.save(&state1).unwrap();
     let state2 = CursorState {
@@ -354,7 +345,6 @@ fn atomic_save_does_not_corrupt_on_partial_write() {
         offset: 20,
         fingerprint: [2u8; 32],
         fingerprint_len: None,
-        drained: None,
     };
     cursor.save(&state2).unwrap();
     let loaded = cursor.load().unwrap().unwrap();

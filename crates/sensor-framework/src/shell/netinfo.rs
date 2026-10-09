@@ -21,7 +21,8 @@
 //! recording has `iproute2` but not `net-tools` (`ifconfig` answers "not found, but can be
 //! installed with: apt install net-tools"), so `ifconfig`, `netstat` and `route` are not Ubuntu
 //! files and `ip` and `ss` are. The phone ships toolbox and toybox, so it has `ifconfig`,
-//! `netstat` and `route` (toolbox's one-line `ifconfig`) and `ip`, and no `ss` or `arp`. The
+//! `netstat` and `route` (toybox's, as is `ifconfig`, in its net-tools style listing, ported from
+//! `toys/other/ifconfig.c` at tag `android-6.0.1_r81`) and `ip`, and no `ss` or `arp`. The
 //! neighbor table is reachable through `ip neigh` and `/proc/net/arp`; there is no `arp` command
 //! on either persona.
 //!
@@ -698,40 +699,192 @@ fn ip_neigh(net: &Net, family: Family) -> String {
 
 // ------------------------------------------------------------------------------------------ ifconfig
 
+/// `help_ifconfig` of toybox at tag `android-6.0.1_r81` (`generated/help.h`), which `show_help`
+/// prints to standard error before an `ifconfig` refusal that sets `toys.exithelp`.
+const IFCONFIG_HELP: &str = "usage: ifconfig [-a] [INTERFACE [ACTION...]]\n\nDisplay or configure network interface.\n\nWith no arguments, display active interfaces. First argument is interface\nto operate on, one argument by itself displays that interface.\n\n-a\tShow all interfaces, not just active ones\n\nAdditional arguments are actions to perform on the interface:\n\nADDRESS[/NETMASK] - set IPv4 address (1.2.3.4/5)\ndefault - unset ipv4 address\nadd|del ADDRESS[/PREFIXLEN] - add/remove IPv6 address (1111::8888/128)\nup - enable interface\ndown - disable interface\n\nnetmask|broadcast|pointopoint ADDRESS - set more IPv4 characteristics\nhw ether|infiniband ADDRESS - set LAN hardware address (AA:BB:CC...)\ntxqueuelen LEN - number of buffered packets before output blocks\nmtu LEN - size of outgoing packets (Maximum Transmission Unit)\n\nFlags you can set on an interface (or -remove by prefixing with -):\narp - don't use Address Resolution Protocol to map LAN routes\npromisc - don't discard packets that aren't to this LAN hardware address\nmulticast - force interface into multicast mode if the driver doesn't\nallmulti - promisc for multicast packets\n\nObsolete fields included for historical purposes:\nirq|io_addr|mem_start ADDR - micromanage obsolete hardware\noutfill|keepalive INTEGER - SLIP analog dialup line quality monitoring\nmetric INTEGER - added to Linux 0.9.10 with comment \"never used\", still true\n\n";
+
+/// A refusal of `ifconfig`: `ifconfig: TEXT` on standard error, status 1, after the help text
+/// when the applet asked for it (`toys.exithelp++`).
+fn ifconfig_refusal(help: bool, text: &str) -> CommandResult {
+    let help = if help { IFCONFIG_HELP } else { "" };
+    CommandResult::stderr(1, format!("{help}ifconfig: {text}\n"))
+}
+
+/// The `ioctl` request a configuring word issues first, which is what fails with `No such device`
+/// when the interface does not exist: `SIOCGIFFLAGS` (0x8913) for the flag words, else the
+/// `SIOCSIF*` request of the word.
+fn ifconfig_request(word: &str) -> u32 {
+    match word {
+        "netmask" => 0x891c,
+        "broadcast" => 0x891a,
+        "pointopoint" | "dstaddr" => 0x8918,
+        "mtu" => 0x8922,
+        "metric" => 0x891e,
+        "txqueuelen" => 0x8943,
+        "mem_start" | "io_addr" | "irq" => 0x8971,
+        "keepalive" => 0x89f0,
+        "outfill" => 0x89f2,
+        w if w == "default" || w.starts_with(|c: char| c.is_ascii_digit()) => 0x8916,
+        _ => 0x8913,
+    }
+}
+
+/// One interface as toybox's `display_ifconfig` prints it, with the counters of `/proc/net/dev`.
+fn ifconfig_block(iface: &Iface) -> String {
+    let (title, hw) = if iface.loopback {
+        ("Local Loopback", String::new())
+    } else {
+        let octets: Vec<String> = iface.mac.iter().map(|b| format!("{b:02X}")).collect();
+        ("Ethernet", format!("HWaddr {}", octets.join(":")))
+    };
+    let mut out = format!("{:<9} Link encap:{title}  {hw}\n", iface.name);
+    let mask = v4_text(mask_of(iface.prefix));
+    out.push_str(&format!("{:10}inet addr:{} ", "", v4_text(iface.addr)));
+    if !iface.loopback {
+        out.push_str(&format!(
+            " Bcast:{} ",
+            v4_text(broadcast_of(iface.addr, iface.prefix))
+        ));
+    }
+    out.push_str(&format!(" Mask:{mask} \n"));
+    let scope = if iface.loopback { "Host" } else { "Link" };
+    out.push_str(&format!(
+        "{:10}inet6 addr: {}/{} Scope: {scope}\n",
+        "", iface.v6, iface.v6_prefix
+    ));
+    let flags = if iface.loopback {
+        "UP LOOPBACK RUNNING "
+    } else {
+        "UP BROADCAST RUNNING MULTICAST "
+    };
+    let pad = " ".repeat(10);
+    out.push_str(&format!(
+        "{pad}{flags} MTU:{}  Metric:1\n{pad}RX packets:{} errors:0 dropped:0 overruns:0 frame:0 \n{pad}TX packets:{} errors:0 dropped:0 overruns:0 carrier:0 \n{pad}collisions:0 txqueuelen:{} \n{pad}RX bytes:{} TX bytes:{} \n\n",
+        iface.mtu, iface.rx.packets, iface.tx.packets, iface.qlen, iface.rx.bytes, iface.tx.bytes,
+    ));
+    out
+}
+
 impl FakeShell {
-    /// Toolbox's `ifconfig [-a] [IFACE]`: one line per interface, `NAME: ip A mask M flags [...]`.
-    /// Configuring an interface (`ifconfig wlan0 down`) succeeds silently and changes nothing
-    /// [unverified], and an unknown name fails without text.
+    /// Toybox's `ifconfig [-a] [INTERFACE [ACTION...]]` (`toys/other/ifconfig.c`, tag
+    /// `android-6.0.1_r81`; toolbox has no `ifconfig` at that tag). No operand lists the active
+    /// interfaces (all of them with `-a`), one operand shows that interface or fails with
+    /// `NAME: No such device`, more configure it. Configuring succeeds silently and changes
+    /// nothing [unverified]; a word it does not know, or one missing its argument, is refused
+    /// with the applet's help text first. Addresses are not validated.
     pub(super) fn cmd_ifconfig(&mut self, parts: &[&str]) -> CommandResult {
         let net = self.net_model();
         let args = parts.get(1..).unwrap_or(&[]);
-        let wanted = match args {
-            [] | ["-a"] => None,
-            [name] if !name.starts_with('-') => Some(*name),
-            _ => return nothing(),
+        // `^?a`: `-a` only chooses to list every interface, and all of them are up here; an
+        // unknown option and everything after the first operand is an operand.
+        let mut operands: Vec<&str> = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            if *arg == "-a" && operands.is_empty() {
+                continue;
+            }
+            if *arg == "--" && operands.is_empty() {
+                continue;
+            }
+            operands.extend(args.get(index..).unwrap_or(&[]));
+            break;
+        }
+        let Some((&name, actions)) = operands.split_first() else {
+            let shown: String = net.ifaces.iter().map(ifconfig_block).collect();
+            return CommandResult::stdout(shown);
         };
-        let mut out = String::new();
-        for iface in net
-            .ifaces
-            .iter()
-            .filter(|i| wanted.is_none_or(|w| w == i.name))
-        {
-            let flags = if iface.loopback {
-                "up loopback running"
-            } else {
-                "up broadcast running multicast"
+        let iface = net.ifaces.iter().find(|i| i.name == name);
+        if actions.is_empty() {
+            return match iface {
+                Some(iface) => CommandResult::stdout(ifconfig_block(iface)),
+                None => ifconfig_refusal(false, &format!("{name}: No such device")),
             };
-            out.push_str(&format!(
-                "{}: ip {} mask {} flags [{flags}]\n",
-                iface.name,
-                v4_text(iface.addr),
-                v4_text(mask_of(iface.prefix)),
-            ));
         }
-        if out.is_empty() {
-            return CommandResult::silent(1);
+        let no_device =
+            |request: u32| ifconfig_refusal(false, &format!("ioctl {request:x}: No such device"));
+        let valued = [
+            "pointopoint",
+            "broadcast",
+            "netmask",
+            "dstaddr",
+            "mtu",
+            "keepalive",
+            "outfill",
+            "metric",
+            "txqueuelen",
+            "mem_start",
+            "io_addr",
+            "irq",
+        ];
+        let plain = [
+            "up",
+            "down",
+            "arp",
+            "promisc",
+            "allmulti",
+            "multicast",
+            "inet",
+            "inet6",
+        ];
+        let mut at = 0usize;
+        while let Some(&word) = actions.get(at) {
+            at = at.saturating_add(1);
+            let (rev, bare) = match word.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, word),
+            };
+            if word == "hw" {
+                let Some(&kind) = actions.get(at) else {
+                    return ifconfig_refusal(true, "bad hw 'hw'");
+                };
+                at = at.saturating_add(1);
+                let Some(&address) = actions
+                    .get(at)
+                    .filter(|_| kind == "ether" || kind == "infiniband")
+                else {
+                    return ifconfig_refusal(true, &format!("bad hw '{kind}'"));
+                };
+                at = at.saturating_add(1);
+                let octets: Vec<&str> = address.split(':').collect();
+                let valid = kind != "ether"
+                    || (octets.len() == 6
+                        && octets.iter().all(|o| {
+                            (1..=2).contains(&o.len()) && o.bytes().all(|b| b.is_ascii_hexdigit())
+                        }));
+                if !valid {
+                    return ifconfig_refusal(false, &format!("bad hw-addr '{address}'"));
+                }
+                if iface.is_none() {
+                    return no_device(0x8924);
+                }
+            } else if word == "add" || word == "del" {
+                if actions.get(at).is_none() {
+                    return ifconfig_refusal(true, word);
+                }
+                at = at.saturating_add(1);
+                if iface.is_none() {
+                    return no_device(0x8933);
+                }
+            } else if word == "default" || word.starts_with(|c: char| c.is_ascii_digit()) {
+                if iface.is_none() {
+                    return no_device(ifconfig_request(word));
+                }
+            } else if valued.contains(&bare) || plain.contains(&bare) {
+                if valued.contains(&bare) && !rev {
+                    if actions.get(at).is_none() {
+                        return ifconfig_refusal(false, &format!("{bare} needs argument"));
+                    }
+                    at = at.saturating_add(1);
+                    if iface.is_none() {
+                        return no_device(ifconfig_request(bare));
+                    }
+                } else if !matches!(bare, "inet" | "inet6") && iface.is_none() {
+                    return no_device(0x8913);
+                }
+            } else {
+                return ifconfig_refusal(true, &format!("bad argument '{word}'"));
+            }
         }
-        CommandResult::stdout(out)
+        CommandResult::silent(0)
     }
 }
 

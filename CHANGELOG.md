@@ -152,6 +152,55 @@
   counts as pending in the metrics and the pending-oldest-age gauge, and
   `propolis_sample_analysis{state="not_uploaded"}` counts the `-2` rows. The malware custody page no longer implies nothing
   leaves without approval: it now describes the opt-in, type-filtered upload and the hash lookups.
+- **The phone's toybox applets print their help before an option refusal** - read from the
+  source of Android 6.0.1's toybox (not captured from a device): `get_optflags` raises
+  `toys.exithelp` before it parses, `error_exit` then calls `show_help`, and the build has
+  `CFG_TOYBOX_HELP 1`, so `tr` with no operand writes `usage: tr [-cds] SET1 [SET2]` and its
+  description to standard error before `tr: Needs 1 argument`. Done for `tr`, `wc`, `base64`,
+  `md5sum`, `sha1sum`, `cut`, `od`, `which`, `getprop` and `setprop`, with the strings of
+  `generated/help.h`. Errors raised after parsing print no help.
+
+- **A dash script's errors name the script, as dash words them** - every error of a script run
+  with `sh FILE` read `sh: 3: ./x: not found`, where Ubuntu 22.04's dash prints the script as it
+  was typed: `.s: 3: ./x: not found`, `./x.sh: 1: ...`, `sub/x.sh: 1: ...`, `/tmp/x.sh: 2: Syntax
+  error: ...`. `sh -c CMD NAME` names `NAME`, and `-c` without one, a script on standard input and
+  an interactive `sh` stay `sh: 1:`. A script that starts another keeps each its own name. This is
+  the prefix of the not-found, `Exec format error`, syntax and arithmetic errors alike, and the
+  per-architecture dropper fixture now expects `.s: 3: ./.c: Exec format error`. Checked line by
+  line against dash in an `ubuntu:22.04` container.
+
+- **The phone's `tr -C` complements, as `-c` does** - the toybox port treated `-C` as accepted
+  and ignored, but toybox 6.0.1's option string is `^>2<1Ccsd[+cC]`: the `[+cC]` group makes each
+  of the two set the other's flag, and the applet reads only the `c` flag, so `tr -Cd 'a-c'` keeps
+  `a`, `b` and `c` (`crates/sensor-framework/src/shell/tr.rs`).
+
+- **The phone's `getprop`, `setprop` and `ifconfig` are toybox's, not toolbox's** - the persona
+  announces Android 6.0.1, whose `external/toybox/Android.mk` (tag `android-6.0.1_r81`) links all
+  three into `/system/bin` and whose `system/core/toolbox` has no source for any of them, but the
+  shell listed them as toolbox applets and answered in toolbox's words. `toybox getprop` now runs
+  and `toolbox getprop` is `toolbox: no such tool getprop`. `setprop` counts operands as toybox
+  does (`setprop: Need 2 arguments`, `Max 2 arguments`) and makes its checks in its words: a name
+  of 32 bytes or more, a value of 92 or more (a `ro.` value too, which the old code let through),
+  a leading or trailing dot, `..`, and a character outside letters, digits and `_.-`. `ifconfig`
+  prints toybox's `Link encap:` listing (HWaddr, `inet addr:` with `Bcast:` and `Mask:`, the
+  `inet6 addr:` line, flags and MTU, the packet and byte counters) instead of toolbox's one line
+  per interface, fails an unknown interface as `ifconfig: eth9: No such device`, and refuses an
+  action it does not know with the applet's help text first. `df`, `du`, `ls`, `mount` and
+  `uptime` are toolbox's at that tag too and are still listed as toybox's (noted in the module
+  doc of `crates/sensor-framework/src/shell/multicall.rs`).
+
+- **The Ubuntu persona's `tr` exists, as GNU coreutils 8.32** - it answered `tr: command not
+  found`, which no Ubuntu server does, so a loader that strips line breaks with `tr -d '\n'` before
+  decoding stopped there. It now translates, deletes, squeezes and complements standard input with
+  GNU's rules: `-c -C -d -s -t`, the long options and their abbreviations, `\NNN` and the C
+  escapes, ranges, the twelve classes, `[=c=]`, `[c*n]` repeats and `[:lower:]`/`[:upper:]` case
+  conversion; `--help` and `--version` print 8.32's text; and every refusal is GNU's (`tr: missing
+  operand`, `tr: extra operand ‘c’`, `Try 'tr --help' for more information.`, the set errors and
+  the octal and trailing-backslash warnings), with the typographic quotes the persona's
+  `LANG=C.UTF-8` gives. Checked line by line against `/usr/bin/tr` of an `ubuntu:22.04` container,
+  including 16,000 generated option and set combinations, none differing. The phone's toybox `tr`
+  is unchanged; where the two differ (`\x41`, `\e`, repeats, `-t`, the classes' order) is listed in
+  the module doc of `crates/sensor-framework/src/shell/tr_gnu.rs`.
 - **Command-sequence campaigns are one per tool, not one per session length** - observed on the
   live console 2026-10-08: 947 campaigns, most of them fragments of a few bots. The fingerprint
   keyed on the whole normalized session, so one Mirai-family loader was about 40 campaigns

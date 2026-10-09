@@ -2,12 +2,14 @@
 //! (`tr -d '\n' < part > joined`) before it decodes it.
 //!
 //! Ported from toybox 6.0.1's `toys/pending/tr.c` (tag `android-6.0.1_r81`), quirks included: it
-//! reads only standard input, `-C` is accepted and does nothing (only `-c` complements), a `-s`
+//! reads only standard input, `-C` is `-c` (the `[+cC]` group of its option string makes the two
+//! set each other's flag, and only `FLAG_c` is read), a `-s`
 //! squeeze compares the previous output byte's whole map entry, a SET2 shorter than SET1 repeats
 //! its last byte, and a `[=c=]` class leaves `c` in the set twice. The option and operand
-//! refusals (`Needs 1 argument`, `Unknown option`) are `toyopt`'s. The Ubuntu shell has no `tr`
-//! here. `reverse colating order` is printed by `perror_exit`, whose errno text is not known;
-//! `Success` is [unverified].
+//! refusals (`Needs 1 argument`, `Unknown option`) are `toyopt`'s. The Ubuntu shell's `tr` is
+//! GNU coreutils 8.32 and lives in `tr_gnu.rs`; the two share only the registry name and the
+//! bounded read of standard input. `reverse colating order` is printed by `perror_exit`, whose
+//! errno text is not known; `Success` is [unverified].
 //!
 //! Output is never longer than the input, so reading through the shared bounded reader bounds it.
 #![deny(
@@ -22,10 +24,17 @@ use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
 
 pub(super) fn register(r: &mut Registry) {
     r.register_if("tr", android, HandlerId::Tr, FakeShell::cmd_tr);
+    r.register_if("tr", ubuntu, HandlerId::Tr, FakeShell::cmd_tr_gnu);
 }
 
 fn android(shell: &FakeShell, _parts: &[&str]) -> bool {
     shell.flavor == ShellFlavor::AndroidSh
+}
+
+/// Bash has the coreutils file; `busybox tr` is BusyBox's applet, whose usage and refusals are
+/// not captured, so under `busybox` the name stays a silent success as every uncaptured applet.
+fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {
+    shell.flavor == ShellFlavor::Bash && shell.busybox_depth == 0
 }
 
 const DELETE: u16 = 0x100;
@@ -181,7 +190,7 @@ impl FakeShell {
             } else if options && arg.starts_with('-') && arg.len() > 1 {
                 for flag in arg.chars().skip(1) {
                     match flag {
-                        'c' => complement = true,
+                        'c' | 'C' => complement = true,
                         'd' => delete = true,
                         's' => squeeze = true,
                         _ => {}
@@ -320,24 +329,30 @@ mod tests {
             run(&mut sh, &format!("tr -cd 'a-c' {f}")),
             ("abc".into(), 0)
         );
-        // `-C` is accepted and complements nothing in this release, so this deletes a-c.
+        // `-C` sets `-c`'s flag too (`[+cC]` in the option string), so it complements as well.
         assert_eq!(
             run(&mut sh, &format!("tr -Cd 'a-c' {f}")),
-            ("\nd\n".into(), 0)
+            ("abc".into(), 0)
         );
     }
 
     #[test]
     fn it_refuses_in_toyboxs_words() {
         let mut sh = phone();
+        let help = crate::shell::toyopt::help_text("tr");
+        // The first three are option-parsing refusals, which print the applet's help first; the
+        // last two come from the applet itself, after parsing, and do not.
         for (line, want) in [
-            ("tr", "tr: Needs 1 argument\n"),
-            ("tr a b c", "tr: Max 2 arguments\n"),
-            ("tr -z a", "tr: Unknown option z\n"),
-            ("tr a ''", "tr: set2 can't be empty string\n"),
-            ("tr z-a b", "tr: reverse colating order: Success\n"),
+            ("tr", format!("{help}tr: Needs 1 argument\n")),
+            ("tr a b c", format!("{help}tr: Max 2 arguments\n")),
+            ("tr -z a", format!("{help}tr: Unknown option z\n")),
+            ("tr a ''", "tr: set2 can't be empty string\n".to_string()),
+            (
+                "tr z-a b",
+                "tr: reverse colating order: Success\n".to_string(),
+            ),
         ] {
-            assert_eq!(run(&mut sh, line), (want.into(), 1), "{line}");
+            assert_eq!(run(&mut sh, line), (want, 1), "{line}");
         }
     }
 

@@ -101,6 +101,7 @@ mod tftp;
 mod timing;
 mod toyopt;
 mod tr;
+mod tr_gnu;
 mod trace;
 
 use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
@@ -847,9 +848,20 @@ impl FakeShell {
             (ShellContext::ExecC, ShellLevel::Bash { .. }) => "bash: line 1".to_string(),
             (_, ShellLevel::Bash { login: true }) => "-bash".to_string(),
             (_, ShellLevel::Bash { login: false }) => "bash".to_string(),
-            (_, ShellLevel::Dash { line }) => format!("sh: {line}"),
+            (_, ShellLevel::Dash { line }) => format!("{}: {line}", self.dash_name()),
             (_, ShellLevel::AndroidMksh) => "sh".to_string(),
         }
+    }
+
+    /// What dash calls itself in a diagnostic: `$0`, which is the script as it was typed for
+    /// `sh FILE` (`.s: 3: ./x: not found`) and the operand after the script for `sh -c CMD NAME`,
+    /// and `sh` for `-c` without one, a script on standard input and a shell that was just
+    /// started. Verified on Ubuntu 22.04's dash.
+    fn dash_name(&self) -> String {
+        self.state()
+            .argv0
+            .clone()
+            .unwrap_or_else(|| "sh".to_string())
     }
 
     fn shell_error(&self, detail: impl std::fmt::Display) -> String {
@@ -883,7 +895,9 @@ impl FakeShell {
             (_, ShellLevel::Bash { .. }) => login_command_not_found(what)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{what}: command not found\n")),
-            (_, ShellLevel::Dash { line }) => format!("sh: {line}: {what}: not found\n"),
+            (_, ShellLevel::Dash { line }) => {
+                format!("{}: {line}: {what}: not found\n", self.dash_name())
+            }
             (_, ShellLevel::AndroidMksh) => format!("sh: {what}: not found\n"),
         }
     }
@@ -3437,3 +3451,5 @@ mod texttools_tests;
 mod tftp_tests;
 #[cfg(test)]
 mod timing_tests;
+#[cfg(test)]
+mod tr_gnu_tests;

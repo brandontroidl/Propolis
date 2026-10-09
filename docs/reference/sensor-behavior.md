@@ -366,6 +366,15 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   -h -H -m -e -f -A -B -C -r -Z -a`, GNU's compile-error wordings and status 0/1/2,
   `crates/sensor-framework/src/shell/grep.rs#FakeShell::cmd_grep`, `crates/sensor-framework/src/shell/regex.rs#Regex`),
   `cut` (`-b -c -f -d -s --complement --output-delimiter`, `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_cut`),
+  `tr` (GNU coreutils 8.32 over standard input: `-c -C -d -s -t`, the long options and their
+  abbreviations, `-A`, `--help` and `--version`; `\NNN` and the C escapes, ranges, the twelve
+  `[:class:]` names, `[=c=]`, `[c*n]` and `[c*]` repeats, `[:lower:]`/`[:upper:]` case conversion;
+  `-s` squeezes what the last SET names after translation or deletion; every refusal in GNU's words
+  with typographic quotes, as the persona's `LANG=C.UTF-8` gives, and the tool names itself as it was
+  run. Checked against `/usr/bin/tr` of an `ubuntu:22.04` container. It differs from the phone's
+  toybox `tr` in the escapes (`\x41`, `\e`), the classes' order, repeats, `-t` and the wording;
+  `crates/sensor-framework/src/shell/tr_gnu.rs#FakeShell::cmd_tr_gnu`; under `busybox` it stays a
+  silent success because that applet's refusals are not captured),
   `tee` (`-a`; its files are written like a redirection, so a body it saves from the session input is captured,
   `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_tee`), `awk`/`mawk` (an interpreter for mawk 1.3.4's
   language: patterns, `BEGIN`/`END`, fields, arrays, user functions, the string and math built-ins, `printf` through
@@ -481,8 +490,10 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   22.04, and on the Android persona mksh's `sh: ./x: not executable: 32-bit ELF file` (`64-bit`
   for a 64-bit build), read from the AOSP marshmallow-release `external/mksh/src/exec.c`
   (`scriptexec`). TODO: mksh's status is 1 by that source's `errorf` and the phone's exact prefix
-  has no device capture [unverified]. The script-file form of dash's prefix (`.s: 3:` rather than
-  `sh: 3:`) is a known gap shared with every dash script error. The stage-2 URL it would have
+  has no device capture [unverified]. Every dash error names the script as typed after `sh` (`.s: 3:`,
+  `./x.sh: 1:`, `sub/x.sh: 1:`), or the operand after `sh -c CMD` (`myname: 1:`), and says `sh: 1:`
+  for `-c` without one and for a script on standard input, as Ubuntu 22.04's dash does
+  (`crates/sensor-framework/src/shell/mod.rs#FakeShell::dash_name`). The stage-2 URL it would have
   requested is emitted as a `honeypot_file_download` marked `derived_from: echo_loader_args`, for
   the vetted fetcher only ([attack-surfaces.md](../security/attack-surfaces.md#malware-fetcher-attacker-directed-outbound)).
 - Base64 APK loaders on the Android shell (`crates/sensor-framework/src/shell/loader.rs`,
@@ -515,7 +526,22 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   a stray byte drops the rest of that read and the status stays 0, and `=` ends the decode. The
   names and the source of each applet's presence are in the module doc of `multicall.rs`:
   `base64` and `sha256sum` are linked here although that release links neither, and `xxd`, `dd`,
-  `settings` and `monkey` are not offered.
+  `settings` and `monkey` are not offered. A refusal from that parser is preceded by the applet's
+  own help text on standard error (`tr: Needs 1 argument` follows `usage: tr [-cds] SET1 [SET2]`
+  and its description), because `get_optflags` raises `toys.exithelp` before parsing and
+  `error_exit` then calls `show_help`; the strings are `generated/help.h` at the tag
+  (`crates/sensor-framework/src/shell/toyopt.rs#help_text`). This is source-verified (`lib/args.c`
+  `get_optflags`, `lib/lib.c` `error_exit`, `generated/config.h` `CFG_TOYBOX_HELP 1`), not
+  captured from a device; `sha256sum`, which that release lacks, borrows `sha1sum`'s text
+  [unverified]. Errors an applet raises after parsing (`tr: set2 can't be empty string`) print no
+  help. `getprop`, `setprop` and `ifconfig` are toybox's too
+  (in its `ALL_TOOLS` at tag `android-6.0.1_r81`; the release's toolbox has no source for them), so
+  `toybox getprop` runs and `toolbox getprop` is `toolbox: no such tool getprop`; `setprop` counts
+  its operands as toybox does (`setprop: Need 2 arguments`) and refuses a long or malformed name or
+  a long value in toybox's words, and `ifconfig` prints toybox's `Link encap:` listing and
+  refuses an unknown interface (`ifconfig: eth9: No such device`) or action
+  (`crates/sensor-framework/src/shell/android.rs#FakeShell::cmd_setprop`,
+  `crates/sensor-framework/src/shell/netinfo.rs#FakeShell::cmd_ifconfig`).
 
 ### Command-event budget (ssh, telnet, adb)
 

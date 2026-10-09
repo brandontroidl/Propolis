@@ -622,11 +622,22 @@ fn the_phones_wc_reports_a_missing_file_in_toyboxs_words_and_goes_on() {
     );
     assert_eq!(
         answer(&mut sh, "wc -z"),
-        ("".into(), "wc: Unknown option z\n".into(), 1)
+        (
+            "".into(),
+            format!("{}wc: Unknown option z\n", super::toyopt::help_text("wc")),
+            1
+        )
     );
     assert_eq!(
         answer(&mut sh, "wc --bytes"),
-        ("".into(), "wc: Unknown option bytes\n".into(), 1)
+        (
+            "".into(),
+            format!(
+                "{}wc: Unknown option bytes\n",
+                super::toyopt::help_text("wc")
+            ),
+            1
+        )
     );
 }
 

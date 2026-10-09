@@ -175,37 +175,93 @@ fn setprop_is_read_back_by_getprop_and_listed() {
 }
 
 #[test]
-fn setprop_with_the_wrong_argument_count_prints_the_usage() {
+fn the_property_tools_count_operands_in_toyboxs_words() {
     let mut sh = android();
-    for line in ["setprop", "setprop only.name", "setprop a b c"] {
-        assert_eq!(
-            answer(&mut sh, line),
-            ("".into(), "usage: setprop <key> <value>\n".into(), 1),
-            "{line}"
-        );
+    for (line, want) in [
+        ("setprop", "setprop: Need 2 arguments\n"),
+        ("setprop only.name", "setprop: Need 2 arguments\n"),
+        ("setprop a b c", "setprop: Max 2 arguments\n"),
+        ("getprop a b c", "getprop: Max 2 arguments\n"),
+        ("getprop -x", "getprop: Unknown option x\n"),
+        ("setprop -x a b", "setprop: Unknown option x\n"),
+    ] {
+        // Each is an option-parsing refusal, so the applet's help text comes first.
+        let applet = line.split(' ').next().unwrap();
+        let want = format!("{}{want}", super::toyopt::help_text(applet));
+        assert_eq!(answer(&mut sh, line), ("".into(), want, 1), "{line}");
     }
+    // With no option letters the first operand ends the options, so a later dash is data.
+    assert_eq!(out(&mut sh, "getprop ro.nonesuch -x"), "-x\n");
     assert_eq!(out(&mut sh, "getprop only.name"), "\n");
 }
 
 #[test]
-fn setprop_past_the_property_limits_fails_and_stores_nothing() {
+fn setprop_checks_the_name_and_value_as_toybox_does() {
     let mut sh = android();
-    let long_name = "n".repeat(32);
+    let long_name = format!("a.{}", "n".repeat(30));
     let long_value = "v".repeat(92);
-    assert_eq!(
-        answer(&mut sh, &format!("setprop {long_name} 1")),
-        ("".into(), "could not set property\n".into(), 255)
-    );
-    assert_eq!(answer(&mut sh, &format!("setprop a.b {long_value}")).2, 255);
+    for (line, want) in [
+        (
+            format!("setprop {long_name} 1"),
+            format!(
+                "setprop: name '{long_name}' too long; try '{}'\n",
+                &long_name[..31]
+            ),
+        ),
+        (
+            format!("setprop a.b {long_value}"),
+            format!(
+                "setprop: value '{long_value}' too long; try '{}'\n",
+                &long_value[..91]
+            ),
+        ),
+        // Unlike the property service, toybox refuses a long `ro.` value too.
+        (
+            format!("setprop ro.a.b {long_value}"),
+            format!(
+                "setprop: value '{long_value}' too long; try '{}'\n",
+                &long_value[..91]
+            ),
+        ),
+        (
+            "setprop .a b".into(),
+            "setprop: property names must not start or end with '.'\n".into(),
+        ),
+        (
+            "setprop a. b".into(),
+            "setprop: property names must not start or end with '.'\n".into(),
+        ),
+        (
+            "setprop a..b c".into(),
+            "setprop: '..' is not allowed in a property name\n".into(),
+        ),
+        (
+            "setprop 'a b' c".into(),
+            "setprop: invalid character ' ' in name 'a b'\n".into(),
+        ),
+    ] {
+        assert_eq!(answer(&mut sh, &line), ("".into(), want, 1), "{line}");
+    }
     assert_eq!(out(&mut sh, "getprop a.b"), "\n");
-    // `ro.` values are exempt from the value limit.
-    assert_eq!(
-        answer(&mut sh, &format!("setprop ro.a.b {long_value}")).2,
-        0
-    );
+    // An empty name gets past every check and the property service ignores it.
+    assert_eq!(answer(&mut sh, "setprop '' x"), ("".into(), "".into(), 0));
+    assert_eq!(out(&mut sh, "getprop ''"), "\n");
+}
+
+#[test]
+fn a_full_overlay_is_the_failure_property_set_reports() {
+    let mut sh = android();
     for i in 0..600 {
         sh.handle_input(format!("setprop p.{i} 1"));
     }
+    assert_eq!(
+        answer(&mut sh, "setprop p.599 1"),
+        (
+            "".into(),
+            "setprop: failed to set property 'p.599' to '1'\n".into(),
+            1
+        )
+    );
     assert_eq!(out(&mut sh, "getprop p.0"), "1\n");
     assert_eq!(out(&mut sh, "getprop p.599"), "\n");
     // An existing property can still be rewritten once the overlay is full.

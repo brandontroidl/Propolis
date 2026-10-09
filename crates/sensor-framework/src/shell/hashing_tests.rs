@@ -232,7 +232,14 @@ fn the_phones_sums_take_only_dash_b() {
     );
     assert_eq!(
         answer(&mut phone, "sha1sum -c /data/local/tmp/g"),
-        ("".into(), "sha1sum: Unknown option c\n".into(), 1)
+        (
+            "".into(),
+            format!(
+                "{}sha1sum: Unknown option c\n",
+                super::toyopt::help_text("sha1sum")
+            ),
+            1
+        )
     );
     assert_eq!(
         answer(&mut phone, "md5sum /nope"),

@@ -27,6 +27,9 @@ fn optstring(applet: &str) -> Option<&'static str> {
         "cut" => "b:|c:|f:|d:sn[!cbf]",
         "tr" => "^>2<1Ccsd[+cC]",
         "od" => "j#vN#xsodcbA:t*",
+        "getprop" => ">2",
+        "setprop" => "<2>2",
+        "ifconfig" => "^?a",
         _ => return None,
     })
 }
@@ -43,6 +46,8 @@ struct Spec {
     opts: Vec<Opt>,
     /// `^`: the first operand ends the options.
     stop_early: bool,
+    /// `?`: an option the string does not name is an operand, not an error.
+    noerror: bool,
     min_args: usize,
     max_args: usize,
     /// `[!xy]` groups: options that may not be given together.
@@ -61,6 +66,7 @@ fn parse_spec(text: &str) -> Spec {
     let mut spec = Spec {
         opts: Vec::new(),
         stop_early: false,
+        noerror: false,
         min_args: 0,
         max_args: usize::MAX,
         exclusive: Vec::new(),
@@ -71,6 +77,7 @@ fn parse_spec(text: &str) -> Spec {
     while let Some(&c) = chars.get(at) {
         match c {
             '^' => spec.stop_early = true,
+            '?' => spec.noerror = true,
             '<' => {
                 at = at.saturating_add(1);
                 spec.min_args = digit(text, at).unwrap_or(0);
@@ -123,6 +130,10 @@ fn parse_spec(text: &str) -> Spec {
         }
         at = at.saturating_add(1);
     }
+    // An option string with no letters makes the first operand end the options (`args.c`).
+    if spec.opts.is_empty() {
+        spec.stop_early = true;
+    }
     spec
 }
 
@@ -146,11 +157,58 @@ fn atolx(text: &str) -> Option<i64> {
     scaled.map(|v| v.saturating_mul(sign))
 }
 
+/// `help_<applet>` of `generated/help.h` at tag `android-6.0.1_r81`, which `show_help` writes to
+/// standard error ahead of an option-parsing refusal. Source-verified (`lib/args.c#get_optflags`
+/// sets `toys.exithelp`; `lib/lib.c#error_exit` calls `show_help` when
+/// `CFG_TOYBOX_HELP` of `generated/config.h` is 1), not captured from a device. `sha256sum` is no
+/// applet of that release; it gets `sha1sum`'s text with its name [unverified].
+pub(super) fn help_text(applet: &str) -> String {
+    let text = match applet {
+        "setprop" => "usage: setprop NAME VALUE\n\nSets an Android system property.\n\n",
+        "getprop" => {
+            "usage: getprop [NAME [DEFAULT]]\n\nGets an Android system property, or lists them all.\n\n"
+        }
+        "sha1sum" | "sha256sum" => {
+            "usage: sha1sum [FILE]...\n\ncalculate sha1 hash for each input file, reading from stdin if none.\nOutput one hash (20 hex digits) for each input file, followed by\nfilename.\n\n-b\tbrief (hash only, no filename)\n\n"
+        }
+        "md5sum" => {
+            "usage: md5sum [FILE]...\n\nCalculate md5 hash for each input file, reading from stdin if none.\nOutput one hash (16 hex digits) for each input file, followed by\nfilename.\n\n-b\tbrief (hash only, no filename)\n\n"
+        }
+        "which" => {
+            "usage: which [-a] filename ...\n\nSearch $PATH for executable files matching filename(s).\n\n-a\tShow all matches\n\n"
+        }
+        "base64" => {
+            "usage: base64 [-di] [-w COLUMNS] [FILE...]\n\nEncode or decode in base64.\n\n-d\tdecode\n-i\tignore non-alphabetic characters\n-w\twrap output at COLUMNS (default 76)\n\n"
+        }
+        "tr" => {
+            "usage: tr [-cds] SET1 [SET2]\n\nTranslate, squeeze, or delete characters from stdin, writing to stdout\n\n-c/-C  Take complement of SET1\n-d     Delete input characters coded SET1\n-s     Squeeze multiple output characters of SET2 into one character\n\n"
+        }
+        "wc" => {
+            "usage: wc -lwcm [FILE...]\n\nCount lines, words, and characters in input.\n\n-l\tshow lines\n-w\tshow words\n-c\tshow bytes\n-m\tshow characters\n\nBy default outputs lines, words, bytes, and filename for each\nargument (or from stdin if none). Displays only either bytes\nor characters.\n\n"
+        }
+        "od" => {
+            "usage: od [-bcdosxv] [-j #] [-N #] [-A doxn] [-t acdfoux[#]]\n\n-A\tAddress base (decimal, octal, hexdecimal, none)\n-j\tSkip this many bytes of input\n-N\tStop dumping after this many bytes\n-t\toutput type a(scii) c(har) d(ecimal) f(loat) o(ctal) u(nsigned) (he)x\n\tplus optional size in bytes\n\taliases: -b=-t o1, -c=-t c, -d=-t u2, -o=-t o2, -s=-t d2, -x=-t x2\n-v\tDon't collapse repeated lines together\n\n"
+        }
+        "cut" => {
+            "usage: cut OPTION... [FILE]...\n\nPrint selected parts of lines from each FILE to standard output.\n\n-b LIST\tselect only these bytes from LIST.\n-c LIST\tselect only these characters from LIST.\n-f LIST\tselect only these fields.\n-d DELIM\tuse DELIM instead of TAB for field delimiter.\n-s\tdo not print lines not containing delimiters.\n-n\tdon't split multibyte characters (Ignored).\n\n"
+        }
+        _ => return String::new(),
+    };
+    if applet == "sha256sum" {
+        text.replace("sha1", "sha256")
+    } else {
+        text.to_string()
+    }
+}
+
 /// The refusal toybox prints for `args` given to `applet`, or `None` when the arguments parse
 /// (or the applet is not one this module checks).
 pub(super) fn check(applet: &str, args: &[&str]) -> Option<String> {
     let spec = parse_spec(optstring(applet)?);
-    let fail = |text: String| Some(format!("{applet}: {text}\n"));
+    // `get_optflags` raises `toys.exithelp` before it parses, so `error_exit` calls `show_help`
+    // and the applet's help text precedes every refusal below.
+    let help = help_text(applet);
+    let fail = |text: String| Some(format!("{help}{applet}: {text}\n"));
     let mut given: Vec<char> = Vec::new();
     let mut operands = 0usize;
     let mut stopped = false;
@@ -168,11 +226,21 @@ pub(super) fn check(applet: &str, args: &[&str]) -> Option<String> {
                 stopped = true;
                 continue;
             }
+            if spec.noerror {
+                operands = operands.saturating_add(1);
+                stopped |= spec.stop_early;
+                continue;
+            }
             return fail(format!("Unknown option {long}"));
         }
         let mut rest = cluster;
         while let Some(letter) = rest.chars().next() {
             let Some(opt) = spec.opts.iter().find(|o| o.letter == letter) else {
+                if spec.noerror {
+                    operands = operands.saturating_add(1);
+                    stopped |= spec.stop_early;
+                    break;
+                }
                 return fail(format!("Unknown option {rest}"));
             };
             rest = rest.get(letter.len_utf8()..).unwrap_or("");
@@ -226,6 +294,40 @@ pub(super) fn check(applet: &str, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal line alone: the tests below are about which refusal, and
+    /// `a_refusal_is_preceded_by_the_applets_help_text` pins the help that precedes it.
+    fn check(applet: &str, args: &[&str]) -> Option<String> {
+        let full = super::check(applet, args)?;
+        let help = help_text(applet);
+        Some(full.strip_prefix(&help).unwrap_or(&full).to_string())
+    }
+
+    #[test]
+    fn a_refusal_is_preceded_by_the_applets_help_text() {
+        // `help_tr` and `help_wc` of `generated/help.h`, tag `android-6.0.1_r81`.
+        assert_eq!(
+            super::check("tr", &[]).as_deref(),
+            Some(
+                "usage: tr [-cds] SET1 [SET2]\n\nTranslate, squeeze, or delete characters from stdin, writing to stdout\n\n-c/-C  Take complement of SET1\n-d     Delete input characters coded SET1\n-s     Squeeze multiple output characters of SET2 into one character\n\ntr: Needs 1 argument\n"
+            )
+        );
+        for applet in [
+            "tr", "wc", "base64", "md5sum", "sha1sum", "cut", "od", "which",
+        ] {
+            let full = super::check(applet, &["-@"]).unwrap_or_default();
+            assert!(
+                full.starts_with(&format!("usage: {applet}")),
+                "{applet}: {full:?}"
+            );
+            assert!(
+                full.ends_with(&format!("{applet}: Unknown option @\n")),
+                "{applet}"
+            );
+        }
+        // An argument list that parses prints nothing, help included.
+        assert_eq!(super::check("tr", &["a", "b"]), None);
+    }
 
     #[test]
     fn an_unknown_short_option_names_the_rest_of_its_cluster() {
@@ -312,6 +414,33 @@ mod tests {
         assert_eq!(
             check("wc", &["f", "-z"]).as_deref(),
             Some("wc: Unknown option z\n")
+        );
+    }
+
+    #[test]
+    fn a_question_mark_makes_an_unknown_option_an_operand() {
+        // `ifconfig` is `^?a`: `-z` is an interface name, and `-a` is still a flag.
+        assert_eq!(check("ifconfig", &["-z"]), None);
+        assert_eq!(check("ifconfig", &["--zz", "-a"]), None);
+        assert_eq!(check("ifconfig", &["-a", "wlan0", "-q"]), None);
+        // Without the `?`, the same word is refused.
+        assert_eq!(
+            check("wc", &["-z"]).as_deref(),
+            Some("wc: Unknown option z\n")
+        );
+    }
+
+    #[test]
+    fn an_option_string_with_no_letters_ends_the_options_at_the_first_operand() {
+        // `getprop` is `>2`: a dash first is an unknown option, a dash after a name is data.
+        assert_eq!(
+            check("getprop", &["-x"]).as_deref(),
+            Some("getprop: Unknown option x\n")
+        );
+        assert_eq!(check("getprop", &["name", "-x"]), None);
+        assert_eq!(
+            check("setprop", &["a"]).as_deref(),
+            Some("setprop: Need 2 arguments\n")
         );
     }
 

@@ -320,7 +320,9 @@ fn toybox_refuses_options_it_does_not_have_in_its_own_words() {
         ("base64 -w x /x", "base64: not integer: x\n"),
         ("base64 -d -w 5 /x", "base64: No 'w' with 'd'\n"),
     ] {
-        assert_eq!(answer(&mut sh, line), ("".into(), want.into(), 1), "{line}");
+        // An option-parsing refusal is preceded by the applet's help text (`toyopt::help_text`).
+        let want = format!("{}{want}", super::toyopt::help_text("base64"));
+        assert_eq!(answer(&mut sh, line), ("".into(), want, 1), "{line}");
     }
     assert_eq!(
         answer(&mut sh, "base64 -d /nope"),

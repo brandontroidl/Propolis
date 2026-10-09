@@ -9,6 +9,42 @@ pub enum EgressReject {
     OwnHost,
     Teredo,
     V4Compat,
+    /// A well-known public anycast resolver. Bots probe wget/curl/tftp/ftpget against dummy URLs on
+    /// these (observed: `http://1.1.1.1/wget.sh`); no malware is hosted there, so a fetch is only
+    /// traffic to a third party's service.
+    PublicResolver,
+}
+
+/// Addresses the operators publish as their public resolver service: Cloudflare
+/// (developers.cloudflare.com/1.1.1.1/ip-addresses/), Google Public DNS
+/// (developers.google.com/speed/public-dns/docs/using), Quad9
+/// (quad9.net/service/service-addresses-and-features/), and OpenDNS/Cisco Umbrella
+/// (208.67.222.222, 208.67.220.220, 2620:119:35::35, 2620:119:53::53).
+const PUBLIC_RESOLVERS: [&str; 16] = [
+    "1.1.1.1",
+    "1.0.0.1",
+    "8.8.8.8",
+    "8.8.4.4",
+    "9.9.9.9",
+    "149.112.112.112",
+    "208.67.222.222",
+    "208.67.220.220",
+    "2606:4700:4700::1111",
+    "2606:4700:4700::1001",
+    "2001:4860:4860::8888",
+    "2001:4860:4860::8844",
+    "2620:fe::fe",
+    "2620:fe::9",
+    "2620:119:35::35",
+    "2620:119:53::53",
+];
+
+/// Matches against the canonicalized address, so v4-mapped, 6to4 and NAT64 forms of a resolver
+/// are caught as well.
+fn is_public_resolver(ip: IpAddr) -> bool {
+    PUBLIC_RESOLVERS
+        .iter()
+        .any(|s| s.parse::<IpAddr>().is_ok_and(|r| r == ip))
 }
 
 fn canonicalize(ip: IpAddr) -> Result<IpAddr, EgressReject> {
@@ -63,6 +99,9 @@ pub fn is_forbidden_egress_target(ip: IpAddr, own: &HashSet<IpAddr>) -> Option<E
     }
     if in_extra_egress_deny(c) {
         return Some(EgressReject::ExtraRange);
+    }
+    if is_public_resolver(c) {
+        return Some(EgressReject::PublicResolver);
     }
     None
 }
@@ -275,10 +314,12 @@ mod tests {
     fn public_targets_including_mapped_are_allowed() {
         let own = HashSet::new();
         for ok in [
-            "8.8.8.8",
-            "1.1.1.1",
-            "::ffff:8.8.8.8",
-            "2606:4700:4700::1111",
+            "93.184.216.34",
+            "1.1.1.2", // next to a resolver, not one
+            "9.9.9.10",
+            "::ffff:93.184.216.34",
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "2606:4700:4700::1112",
         ] {
             assert!(
                 is_forbidden_egress_target(ip(ok), &own).is_none(),
@@ -524,10 +565,10 @@ mod tests {
     #[test]
     fn vet_tftp_literal_pins_default_port_69() {
         let own = HashSet::new();
-        let p = vet("tftp://8.8.8.8/mal", &own, &PanicResolver, true).unwrap();
+        let p = vet("tftp://93.184.216.34/mal", &own, &PanicResolver, true).unwrap();
         assert!(matches!(p.scheme, Scheme::Tftp));
         assert_eq!(p.port, 69);
-        assert_eq!(p.ip, ip("8.8.8.8"));
+        assert_eq!(p.ip, ip("93.184.216.34"));
     }
 
     // Fix round 1, #4 (important): spec section 7 - force destination port 69, reject any
@@ -537,7 +578,7 @@ mod tests {
     fn vet_tftp_explicit_non69_port_is_rejected() {
         let own = HashSet::new();
         assert!(matches!(
-            vet("tftp://8.8.8.8:6900/mal", &own, &PanicResolver, true),
+            vet("tftp://93.184.216.34:6900/mal", &own, &PanicResolver, true),
             Err(GuardReject::TftpPortForbidden)
         ));
     }
@@ -545,8 +586,118 @@ mod tests {
     #[test]
     fn vet_tftp_explicit_port_69_is_allowed() {
         let own = HashSet::new();
-        let p = vet("tftp://8.8.8.8:69/mal", &own, &PanicResolver, true).unwrap();
+        let p = vet("tftp://93.184.216.34:69/mal", &own, &PanicResolver, true).unwrap();
         assert_eq!(p.port, 69);
+    }
+
+    const RESOLVER_V4: [&str; 8] = [
+        "1.1.1.1",
+        "1.0.0.1",
+        "8.8.8.8",
+        "8.8.4.4",
+        "9.9.9.9",
+        "149.112.112.112",
+        "208.67.222.222",
+        "208.67.220.220",
+    ];
+    const RESOLVER_V6: [&str; 8] = [
+        "2606:4700:4700::1111",
+        "2606:4700:4700::1001",
+        "2001:4860:4860::8888",
+        "2001:4860:4860::8844",
+        "2620:fe::fe",
+        "2620:fe::9",
+        "2620:119:35::35",
+        "2620:119:53::53",
+    ];
+
+    fn is_resolver_reject(r: Result<Pinned, GuardReject>) -> bool {
+        matches!(r, Err(GuardReject::Forbidden(EgressReject::PublicResolver)))
+    }
+
+    #[test]
+    fn every_public_resolver_is_forbidden_with_its_own_reason() {
+        let own = HashSet::new();
+        for a in RESOLVER_V4.iter().chain(RESOLVER_V6.iter()) {
+            assert_eq!(
+                is_forbidden_egress_target(ip(a), &own),
+                Some(EgressReject::PublicResolver),
+                "{a}"
+            );
+        }
+        assert_eq!(
+            PUBLIC_RESOLVERS.len(),
+            RESOLVER_V4.len() + RESOLVER_V6.len()
+        );
+    }
+
+    #[test]
+    fn resolver_probe_urls_from_a_telnet_bot_are_rejected_for_http_and_tftp() {
+        let own = HashSet::new();
+        for url in [
+            "http://1.1.1.1/wget.sh",
+            "http://1.1.1.1/curl.sh",
+            "tftp://1.1.1.1/tftp.sh",
+            "http://[2606:4700:4700::1111]/wget.sh",
+            "tftp://8.8.4.4/tftp.sh",
+        ] {
+            assert!(
+                is_resolver_reject(vet(url, &own, &PanicResolver, true)),
+                "{url}"
+            );
+        }
+        // ftp:// is not an allowed scheme at all.
+        assert!(matches!(
+            vet("ftp://1.1.1.1/ftpget.sh", &own, &PanicResolver, true),
+            Err(GuardReject::BadScheme)
+        ));
+    }
+
+    #[test]
+    fn ipv4_mapped_nat64_and_6to4_forms_of_a_resolver_are_forbidden() {
+        let own = HashSet::new();
+        for url in [
+            "http://[::ffff:1.1.1.1]/x",
+            "http://[::ffff:808:808]/x",
+            "http://[64:ff9b::808:808]/x",
+            "http://[2002:808:808::]/x",
+            "tftp://[::ffff:9.9.9.9]/x",
+        ] {
+            assert!(
+                is_resolver_reject(vet(url, &own, &PanicResolver, true)),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hostname_resolving_to_a_resolver_is_forbidden_dns_rebinding_style() {
+        let own = HashSet::new();
+        for a in ["1.1.1.1", "2001:4860:4860::8888", "208.67.220.220"] {
+            let r = MockResolver(vec![ip(a)]);
+            assert!(
+                is_resolver_reject(vet("http://payload.example/x", &own, &r, true)),
+                "{a}"
+            );
+        }
+        // A public address first and a resolver second still rejects the whole host.
+        let mixed = MockResolver(vec![ip("93.184.216.34"), ip("9.9.9.9")]);
+        assert!(is_resolver_reject(vet(
+            "http://payload.example/x",
+            &own,
+            &mixed,
+            true
+        )));
+    }
+
+    #[test]
+    fn a_neighbour_of_a_resolver_address_is_still_fetchable() {
+        let own = HashSet::new();
+        let r = MockResolver(vec![ip("1.1.1.3")]);
+        assert_eq!(
+            vet("http://payload.example/x", &own, &r, true).unwrap().ip,
+            ip("1.1.1.3")
+        );
     }
 
     struct EmptyResolver;

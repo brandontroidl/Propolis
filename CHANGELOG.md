@@ -21,6 +21,13 @@
 
 ### Fixed
 
+- **The fetcher never dials a public DNS resolver** - observed 2026-10-08: a telnet bot tested
+  wget, curl, tftp and ftpget against `http://1.1.1.1/wget.sh` and its siblings, and the fetcher
+  followed the URLs to Cloudflare. The never-dial check now also refuses the published addresses
+  of Cloudflare, Google Public DNS, Quad9 and OpenDNS, IPv4 and IPv6 (sixteen in all), including
+  their IPv4-mapped, NAT64 and 6to4 forms and any hostname that resolves to one. The attempt is
+  recorded as `rejected` with the reason `Forbidden(PublicResolver)`, which the IP page already
+  shows beside the status.
 - **Command-sequence campaigns are one per tool, not one per session length** - observed on the
   live console 2026-10-08: 947 campaigns, most of them fragments of a few bots. The fingerprint
   keyed on the whole normalized session, so one Mirai-family loader was about 40 campaigns

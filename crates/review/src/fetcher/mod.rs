@@ -1026,6 +1026,62 @@ mod orchestration_tests {
         assert!(entries.is_empty());
     }
 
+    // A bot's dummy probe URLs on a public resolver go through the real fetcher: recorded as
+    // rejected with the PublicResolver reason, never dialed, nothing spooled.
+    #[tokio::test]
+    async fn public_resolver_probe_urls_are_recorded_as_rejected_and_never_fetched() {
+        let pool = test_pool().await;
+        reset_all(&pool).await;
+        let urls = [
+            "http://1.1.1.1/wget.sh",
+            "tftp://1.1.1.1/tftp.sh",
+            "http://[2606:4700:4700::1111]/curl.sh",
+        ];
+        // reset_all only clears the fetch8*.example hosts, and these rows are keyed by IP literal.
+        for url in urls {
+            sqlx::query("DELETE FROM fetch_attempt WHERE url = $1")
+                .bind(url)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for url in urls {
+            append_event(
+                &pool,
+                download_event("203.0.113.12", "sensor-b", url, "2026-08-22T00:00:00Z"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let spool_dir = TempDir::new().unwrap();
+        let deps = test_deps(pool.clone(), &spool_dir, 100);
+        let stats = run_cycle(&deps, 10).await;
+        assert_eq!(stats.rejected, urls.len());
+
+        for url in urls {
+            let (status, reason): (String, Option<String>) = sqlx::query_as(
+                "SELECT status, reject_reason FROM fetch_attempt WHERE url_hash = $1",
+            )
+            .bind(store::url_hash(url))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(status, "rejected", "{url}");
+            assert_eq!(
+                reason.as_deref(),
+                Some("Forbidden(PublicResolver)"),
+                "{url}"
+            );
+        }
+        assert!(
+            std::fs::read_dir(spool_dir.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
     // (c) a failed URL writes a backoff row and is not re-selected before next_attempt; terminal
     // after 3 attempts.
     #[tokio::test]

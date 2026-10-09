@@ -8,6 +8,8 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::cursor::{
     CursorState, DurableCursor, RotationEvent, compute_fingerprint, detect_rotation, get_inode,
 };
@@ -38,6 +40,18 @@ pub enum StartAt {
 /// append growth alone (no rotation at all), producing a fingerprint "mismatch" that does not
 /// reflect real content replacement. See [`LogTailer::maybe_false_positive_replaced`].
 const FINGERPRINT_STABLE_SIZE: u64 = 256;
+
+/// Input a `copytruncate` rotation took from this reader that it could not recover from the
+/// rotated copy, counted over the life of the tailer. In memory only: the WARN each loss logs is
+/// the durable record. See [`LogTailer::rotation_loss`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RotationLoss {
+    /// Truncations whose unread content could not be recovered and may not have been empty.
+    pub events: u64,
+    /// Lower bound on the bytes lost: what the previous poll saw past the read offset. Zero for a
+    /// loss the tailer could not size (it had not yet polled the old content, as after a restart).
+    pub bytes_estimated: u64,
+}
 
 /// Read positions as they stood at the start of the current uncommitted batch, so a caller that
 /// could not process what it read can put the tailer back and re-read it on the next poll.
@@ -107,6 +121,17 @@ pub struct LogTailer {
     /// the next `read_batch`. Spans every read since the last commit or rewind, not just the
     /// most recent one, so a caller that polls twice before deciding can still undo both.
     uncommitted: Option<UncommittedRead>,
+    /// Whether `last_known_size` was measured by a poll of this instance. False until the first
+    /// read: the size taken at construction is the file as found, not the content the persisted
+    /// offset points into, so it cannot size what a truncation then discarded.
+    size_observed: bool,
+    /// The inode of a `copytruncate` copy queued in `pending_drains` and the fingerprint of the
+    /// old content it holds. While that copy is the front of the queue, [`Self::persist_cursor`]
+    /// saves the drain's position under this fingerprint instead of the new file's, so a restart
+    /// (or the rotation guard, `deploy/logrotate-guard.sh`) sees the old content as unread until it
+    /// is read. Matched on inode, so a stale entry can never be applied to another drain.
+    resume: Option<(u64, [u8; 32])>,
+    loss: RotationLoss,
 }
 
 impl LogTailer {
@@ -158,7 +183,17 @@ impl LogTailer {
             pending_drains: VecDeque::new(),
             last_known_size,
             uncommitted: None,
+            size_observed: false,
+            resume: None,
+            loss: RotationLoss::default(),
         }
+    }
+
+    /// Input this tailer saw a `copytruncate` take and could not recover, since it started. A
+    /// truncation whose unread content is found in the rotated copy (`<log>.1`) is not a loss and
+    /// is not counted.
+    pub fn rotation_loss(&self) -> RotationLoss {
+        self.loss
     }
 
     /// Reads up to `max_lines` complete (`\n`-terminated) lines starting at the current cursor
@@ -437,9 +472,26 @@ impl LogTailer {
 
     /// Persists the current cursor state via `DurableCursor::save`. A [`Self::without_cursor`]
     /// tailer has nowhere to persist to: this returns `ErrorKind::Unsupported` and writes nothing.
+    ///
+    /// While the rotated copy of a `copytruncate` is still being drained, what is saved is the
+    /// drain's position in the OLD content (its fingerprint, the shared inode), not the new
+    /// file's offset 0. The old content is unread until the drain ends, and a restart that loaded
+    /// a position in the new file would never go back for it; loaded as saved here, the restart
+    /// sees the truncation again and resumes the drain from `<log>.1`.
     pub fn persist_cursor(&self) -> io::Result<()> {
+        let resumable = self.resume.zip(self.pending_drains.front()).and_then(
+            |((ino, fingerprint), (file, offset))| {
+                let front = file.metadata().ok()?.ino();
+                (front == ino).then_some(CursorState {
+                    inode: self.state.inode,
+                    offset: *offset,
+                    fingerprint,
+                })
+            },
+        );
+        let state = resumable.unwrap_or(self.state);
         match &self.cursor {
-            Some(cursor) => cursor.save(&self.state),
+            Some(cursor) => cursor.save(&state),
             None => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "this tailer was built without a cursor and persists nothing",
@@ -450,6 +502,7 @@ impl LogTailer {
     fn refresh_last_known_size(&mut self) {
         if let Ok(metadata) = std::fs::metadata(&self.log_path) {
             self.last_known_size = metadata.len();
+            self.size_observed = true;
         }
     }
 
@@ -459,7 +512,7 @@ impl LogTailer {
     fn handle_rotation(&mut self) {
         match detect_rotation(&self.log_path, &self.state) {
             RotationEvent::None => {}
-            RotationEvent::Truncated => self.reset_to_current_file(),
+            RotationEvent::Truncated => self.recover_copytruncated(),
             RotationEvent::Replaced => {
                 if self.maybe_false_positive_replaced() {
                     // Ordinary growth of a still-small file, not a real replacement (see
@@ -467,7 +520,7 @@ impl LogTailer {
                     // offset rather than discarding it.
                     self.state.fingerprint = compute_fingerprint(&self.log_path);
                 } else {
-                    self.reset_to_current_file();
+                    self.recover_copytruncated();
                 }
             }
             RotationEvent::InodeChanged => {
@@ -499,6 +552,56 @@ impl LogTailer {
         }
     }
 
+    /// The log was emptied or its content replaced under the same inode: `copytruncate`, whose
+    /// copy is `<log>.1` (the deployed policy's `delaycompress` leaves it uncompressed until the
+    /// next rotation). Everything this tailer had not yet read lives only there, so it is queued
+    /// as a drain from the read offset, ahead of the new file, and goes through the same
+    /// machinery as a rename-rotated inode (spans, commits, byte budget, rewind).
+    ///
+    /// Only a copy that is provably the old content is read: its first `min(256, size)` bytes must
+    /// hash to the fingerprint stored for the old file, and it must reach the read offset.
+    /// Anything else (no `.1`, only `.1.gz`, a `.1` from an earlier rotation) is NOT read, since
+    /// reading the wrong file would ingest another generation's lines; it is reported as a loss
+    /// instead. Without a `.1` the new file is simply read from 0, as it always was.
+    fn recover_copytruncated(&mut self) {
+        match open_rotated_copy(&self.log_path, &self.state) {
+            Ok(Some(copy)) => {
+                if let Some(uncommitted) = &mut self.uncommitted {
+                    uncommitted.drain_offsets.push(uncommitted.offset);
+                }
+                if let Ok(meta) = copy.metadata() {
+                    self.resume = Some((meta.ino(), self.state.fingerprint));
+                }
+                self.pending_drains.push_back((copy, self.state.offset));
+            }
+            Ok(None) => {}
+            Err(reason) => self.record_loss(reason),
+        }
+        self.reset_to_current_file();
+    }
+
+    /// Counts and logs a truncation whose unread content could not be recovered. Stays silent when
+    /// the previous poll had read everything the file held: the bytes in the copy-to-truncate gap
+    /// are not knowable and are the loss the policy accepts, which would otherwise be logged on
+    /// every rotation of an idle sensor.
+    fn record_loss(&mut self, reason: &'static str) {
+        let estimate = self
+            .size_observed
+            .then(|| self.last_known_size.saturating_sub(self.state.offset));
+        if estimate == Some(0) {
+            return;
+        }
+        self.loss.events += 1;
+        self.loss.bytes_estimated += estimate.unwrap_or(0);
+        tracing::warn!(
+            path = %self.log_path.display(),
+            offset = self.state.offset,
+            bytes_skipped_estimate = estimate,
+            reason,
+            "log-tailer: a copytruncate rotation discarded input that was never read and the rotated copy could not supply it"
+        );
+    }
+
     /// Resets the offset to 0 and recomputes the fingerprint against the log file's current
     /// content; the stale file handle (if any) is dropped since it no longer corresponds to
     /// where we're about to read.
@@ -525,6 +628,40 @@ impl LogTailer {
                 .map(|m| m.len() > self.last_known_size)
                 .unwrap_or(false)
     }
+}
+
+/// Opens `<log>.1` if it is the old content `state` described: `Ok(Some)` with bytes left to
+/// read past the offset, `Ok(None)` when it matches but ends at the offset (nothing was unread),
+/// `Err(reason)` when it cannot be trusted. The fingerprint is taken from the opened handle, so a
+/// rotation that renames `.1` away after the open cannot make the check and the read disagree.
+fn open_rotated_copy(log_path: &Path, state: &CursorState) -> Result<Option<File>, &'static str> {
+    let mut path = log_path.as_os_str().to_owned();
+    path.push(".1");
+    let path = PathBuf::from(path);
+    let Ok(file) = File::open(&path) else {
+        let mut gz = path.into_os_string();
+        gz.push(".gz");
+        return Err(if Path::new(&gz).exists() {
+            "the rotated copy is compressed"
+        } else {
+            "there is no rotated copy"
+        });
+    };
+    let Ok(size) = file.metadata().map(|m| m.len()) else {
+        return Err("the rotated copy cannot be read");
+    };
+    let mut head = Vec::with_capacity(256);
+    if (&file).take(256).read_to_end(&mut head).is_err() {
+        return Err("the rotated copy cannot be read");
+    }
+    let fingerprint: [u8; 32] = Sha256::digest(&head).into();
+    if fingerprint != state.fingerprint {
+        return Err("the rotated copy is not the content the read offset points into");
+    }
+    if size < state.offset {
+        return Err("the rotated copy ends before the read offset");
+    }
+    Ok((size > state.offset).then_some(file))
 }
 
 /// Hard cap on a single log line intake will buffer. Sensors already bound their captured fields

@@ -91,6 +91,7 @@ const POSITIVE: &[(&str, &[&str])] = &[
             "cp k /home/u/.ssh/authorized_keys",
             "tee -a .ssh/authorized_keys",
             "echo k > .ssh/authorized_keys2",
+            "dd if=k of=/root/.ssh/authorized_keys",
         ],
     ),
     (
@@ -196,6 +197,8 @@ const NEGATIVE: &[(&str, &[&str])] = &[
             "wget",
             "curl localhost",
             "tftp 198.51.100.7",
+            "ftpget",
+            "ftpget -v",
             "ls wget.sh",
             "cat curl http://198.51.100.7/x",
         ],
@@ -219,6 +222,10 @@ const NEGATIVE: &[(&str, &[&str])] = &[
             "crontab -l",
             "crontab -r",
             "crontab -e",
+            // A listing, removal or edit flag wins over a stray operand.
+            "crontab -l mycron",
+            "crontab -r -",
+            "crontab -u root -l",
             "crontab",
             "cat /etc/crontab",
             "ls /etc/cron.d",
@@ -239,6 +246,7 @@ const NEGATIVE: &[(&str, &[&str])] = &[
             "cat /etc/systemd/system/x.service",
             "echo systemctl enable x",
             "echo x > /etc/systemd/system/x.conf",
+            "echo x > /etc/systemd/system/backup.timer",
             "echo x > /tmp/x.service",
             "echo x > /etc/systemd/system/.service",
         ],
@@ -252,6 +260,9 @@ const NEGATIVE: &[(&str, &[&str])] = &[
             "echo x > /tmp/rc.local",
             "echo rc.local",
             "grep exit /etc/rc.local",
+            "sed 's/exit 0/x/' /etc/rc.local",
+            "sed -n p /etc/rc.local",
+            "dd if=/etc/rc.local of=/tmp/a",
             "echo x > /home/u/rc.local",
         ],
     ),
@@ -330,7 +341,12 @@ const NEGATIVE: &[(&str, &[&str])] = &[
     ),
     (
         "miner-configured",
-        &["echo CoinHive.Anonymous", "echo CoinHive.Other(1)"],
+        &[
+            "echo CoinHive.Anonymous",
+            "echo CoinHive.Other(1)",
+            // Another credentials indicator is not a configured miner.
+            "wget http://user:pw@198.51.100.7/x",
+        ],
     ),
     (
         "firewall-disable",

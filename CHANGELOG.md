@@ -4,6 +4,18 @@
 
 ### Changed
 
+- **Campaigns and Samples say what the bots are doing and what they dropped** - the Campaigns list
+  was a wall of "same sample" and "same commands" rows, one per host and per command count, and
+  Samples repeated it. The list now sorts by hosts (then last seen; links for last and first
+  seen), hides single-host groups behind a "show single-host groups (N)" toggle, no longer lists
+  the same-sample kind (its page, approval and the queue's group links still work), and gives
+  each row the opening commands, the command range as secondary text, a rule badge, a host count
+  coloured like queue scores, the hosts-per-day sparkline, an Active cell in the queue's format,
+  top sensors and one "delivers" sample link with a count. Tabs are behaviour, multi-service
+  scans, HTTP on shell port and login only. Samples rows gain host count, sparkline, Active and
+  "delivered by campaign N", sorted by hosts. Both lists are cards at 390 px with no sideways
+  scroll. Grouping, indexer, approval and what is submitted are unchanged. The IP page's malware
+  panel no longer says "no samples" beside a captured sample first reported by another address.
 - **The review queue reads at a glance** - fifty-six pending rows had become a wall: a notes
   textarea and three buttons on every row, "honeypot" in every Categories cell, a score bar that
   hardly varied, and five hosts of one campaign as five full rows. Pending entries now group by

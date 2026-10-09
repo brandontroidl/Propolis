@@ -86,8 +86,8 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 3727 test functions** (2354 unit + 1373 integration).
-- **DB-backed (`sqlx::test`): 277** - console 188, core-scoring 44, review 19,
+- **Total: 3736 test functions** (2357 unit + 1379 integration).
+- **DB-backed (`sqlx::test`): 283** - console 194, core-scoring 44, review 19,
   intake 13, propolis 7, fleet 6. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
@@ -117,7 +117,7 @@ Per-crate breakdown:
 | Crate | Unit | Integration | Integration files |
 |---|---|---|---|
 | collector-wire | 9 | 0 | - |
-| console | 156 | 212 | auth_test, campaigns_test, routes_test, samples_transport_test, server_test |
+| console | 159 | 218 | auth_test, campaigns_test, routes_test, samples_transport_test, server_test |
 | core-scoring | 74 | 38 | batch_equivalence, coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 36 | 66 | builder_test, exclusion_test, export_test, publisher_test |
 | fleet | 23 | 32 | deploy_inventory_test, probe_test, store_test |
@@ -144,7 +144,7 @@ Per-crate breakdown:
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2354** | **1373** | |
+| **Total** | **2357** | **1379** | |
 
 ### Test styles by layer
 
@@ -154,7 +154,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (43 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (231 uses) - needed wherever a test needs more than
+  applies migrations manually (237 uses) - needed wherever a test needs more than
   one migration history in one database, a history that keeps its own
   bookkeeping table (review, fleet), or a history applied only part of the way
   (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`

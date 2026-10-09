@@ -150,13 +150,22 @@ original in place, so the sensor's open descriptor never needs to reopen
   restart finds it there by fingerprint (for the gzip, the hash of the first 256 decompressed
   bytes), reads it from the saved offset, then `.1` (rotated after it, so unread) from 0, then the
   live file. A gzip is expanded, streaming, into an unlinked scratch file (in the cursor
-  directory) so the saved position stays a plain decompressed offset; expansion is capped at
-  512 MiB, past which the generation is reported lost. If the generation cannot be found at all
-  (a truncated or corrupt `.2.gz`, or a copy pushed deeper), the first poll after a start reads
-  the newer uncompressed copies from 0 rather than skipping them, accepting a repeat of anything a
-  stale `.1` holds over losing it, and reports the loss. A running tailer never does this: its
-  state follows the live file, so a non-matching copy is an older generation. The guard exists to
-  prevent a second rotation while a copy is unread.
+  directory, never the system temp directory) so the saved position stays a plain decompressed
+  offset; expansion is capped at 512 MiB and starts only with that plus a 512 MiB reserve free
+  (`statvfs`), otherwise the generation is reported lost as "insufficient disk to expand", as is
+  one that runs out of space midway. If the generation cannot be found at all (a truncated or
+  corrupt `.2.gz`, or a copy pushed deeper), the first poll after a start reads an uncompressed
+  `.1`/`.2` from 0 only if it is positively newer: the cursor records the last copy the reader
+  finished (fingerprint, window, inode, time), and the candidate must be a different file written
+  after that time. With no such record, or a candidate that is the finished copy (the case after a
+  manual `truncate` of the live log while the reader is stopped), nothing is read and the loss is
+  reported. A running tailer never reads here: its state follows the live file, so a non-matching
+  copy is an older generation. The guard exists to prevent a second rotation while a copy is
+  unread.
+- **A fingerprint is compared over its own window.** The cursor records how many bytes its
+  fingerprint covers (`fingerprint_len`, absent meaning 256), so a position saved while the log
+  was under 256 bytes still identifies the same leading bytes of the grown, rotated copy; the
+  tailer and the rotation guard both compare that window.
 - **A committed prefix across a rotation is placed, not replayed.** When a copytruncate lands while
   a batch is being appended and the append fails partway, the runner accepts the lines that
   committed. With a verifiable `.1` the read position moves forward over them, so the next read

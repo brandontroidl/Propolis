@@ -56,16 +56,24 @@
   rotation unit cannot see. Restart safety: a second rotation while the first copy drains no
   longer loses either generation on a restart (each queued generation keeps a resume point;
   `.1`, `.2` and, under the shipped compress + delaycompress policy, `.2.gz` are searched by
-  fingerprint, the gzip expanded into an unlinked scratch file capped at 512 MiB; a generation
-  that cannot be found is a reported loss, and the first poll after a start then reads the
-  newer `.1`/`.2` from 0 instead of skipping them, which can repeat lines a stale `.1` holds);
+  fingerprint, the gzip expanded into an unlinked scratch file in the cursor directory, capped
+  at 512 MiB and only when that plus the guard's 512 MiB reserve is free, otherwise a reported
+  loss "insufficient disk to expand"; a generation that cannot be found is a reported loss, and
+  the first poll after a start then reads a `.1`/`.2` from 0 only when the cursor's record of the
+  last copy it finished shows that copy is a different file written earlier, so the documented
+  manual `truncate` while the reader is stopped no longer re-ingests the previous generation, and
+  a cursor with no such record reads nothing);
   a restart mid-drain with a live file under 256 bytes is no longer read as small-file growth;
   and a copytruncate during a failed batch no longer re-appends the committed prefix. The
   rotation guard also skips a cursor still inside `.2.gz`. Cursor files are now named by the
   resolved log path; a cursor named by the path as configured is moved to the resolved name on
   first load and the old file removed (a one-time migration, to be deleted once every
   deployment has restarted on this version), so an upgrade does not re-read such a log from 0.
-  `log-tailer` gains a `flate2` dependency (the version already in the lockfile, vendored). A skipped log makes `propolis-logrotate.service` show failed until a later
+  The cursor gains two optional fields, written only when set and ignored by older readers:
+  `fingerprint_len` (so a cursor taken while the log was under 256 bytes still matches the grown,
+  rotated copy, in the tailer and the guard) and `drained` (the last finished copy). When both a
+  resolved-name and an as-configured cursor file exist the newer one wins. `log-tailer` gains
+  `flate2` and `libc` dependencies (both already in the lockfile, vendored). A skipped log makes `propolis-logrotate.service` show failed until a later
   run rotates it. `logrotate --force` no longer discards a backlog: archive and truncate by hand
   ([intake backlog](docs/troubleshooting/intake-backlog.md#recovering-a-backlog-too-large-to-drain)).
   The "small window" wording in `deploy/logrotate-sensors.conf` and the docs now says what the

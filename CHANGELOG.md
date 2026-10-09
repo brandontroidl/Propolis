@@ -105,7 +105,10 @@
   of Cloudflare, Google Public DNS, Quad9 and OpenDNS, IPv4 and IPv6 (sixteen in all), including
   their IPv4-mapped, NAT64 and 6to4 forms and any hostname that resolves to one. The attempt is
   recorded as `rejected` with the reason `Forbidden(PublicResolver)`, which the IP page already
-  shows beside the status.
+  shows beside the status. All sixteen addresses were checked on 2026-10-09 against the
+  operators' own pages, and each table entry now carries its source URL (the OpenDNS IPv6 pair
+  against Cisco's Umbrella IPv6 article); none was wrong. The operators also publish filtered
+  variants (Cloudflare `1.1.1.2`/`1.1.1.3`, Quad9 `9.9.9.10`/`9.9.9.11`), which are not blocked.
 - **A `copytruncate` rotation no longer discards what intake had not yet read** - found by the
   intake soak: with intake behind when the log rotated, the tailer restarted at offset 0 of the
   emptied file and every unread line of the old content, which by then existed only in

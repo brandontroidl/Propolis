@@ -87,7 +87,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 3902 test functions** (2449 unit + 1453 integration).
+- **Total: 3903 test functions** (2450 unit + 1453 integration).
 - **DB-backed (`sqlx::test`): 289** - console 195, core-scoring 44, review 19,
   intake 18, propolis 7, fleet 6. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -131,7 +131,7 @@ Per-crate breakdown:
 | log-tailer | 7 | 88 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
 | propolis | 140 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
-| review | 181 | 96 | allowlist_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
+| review | 182 | 96 | allowlist_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
 | sensor-adb | 61 | 44 | arrival, env_strict, integration |
 | sensor-catchall | 18 | 9 | arrival, env_strict, integration |
 | sensor-cred | 32 | 40 | arrival, env_strict, integration, tls_integration |
@@ -148,7 +148,7 @@ Per-crate breakdown:
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2449** | **1453** | |
+| **Total** | **2450** | **1453** | |
 
 ### Test styles by layer
 
